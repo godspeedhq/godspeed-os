@@ -142,6 +142,21 @@ fn serve_radio(
     let mut link_mac: Option<[u8; 6]> = None;
     // Pairwise rekeys seen after the join (the unanswered half of `backlog/64`), for one log line.
     let mut rekey_seen: u32 = 0;
+    // The network last JOINED this boot - name, length, security - so `radio on` after `radio off` can
+    // go back to it without being asked (`utilities/56_wifi.md` 2). Set on every successful join, cleared
+    // by `wifi leave` (an explicit leave means "not this one") and by `forget` of that name.
+    let mut last_joined: Option<([u8; join::MAX_SSID], u8, u8)> = None;
+    /// The reply status for a join outcome - one table, used by `wifi join` and by the rejoin.
+    fn reply_of(outcome: join::Outcome) -> u8 {
+        match outcome {
+            join::Outcome::Joined => scan::reply::JOINED,
+            join::Outcome::NotFound => scan::reply::NOT_FOUND,
+            join::Outcome::PassphraseRefused => scan::reply::PASSPHRASE_REFUSED,
+            join::Outcome::Failed => scan::reply::JOIN_FAILED,
+            join::Outcome::Timeout => scan::reply::JOIN_TIMEOUT,
+            join::Outcome::HandshakeUnimplemented => scan::reply::HANDSHAKE_UNIMPLEMENTED,
+        }
+    }
     // The keys a WPA2 join keeps for the rekeys to come (`join::Keys`); `None` on an open network and
     // after any end of the association.
     let mut keys: Option<join::Keys> = None;
@@ -351,6 +366,7 @@ fn serve_radio(
                 // and a stale belief here must not stop the operator leaving a network.
                 let _ = ctrl::disassoc(h, w, session, ctx);
                 joined = None;
+                last_joined = None;
                 join::forget(&mut keys);
                 rxq.clear();
                 out[0] = scan::reply::OK;
@@ -358,8 +374,12 @@ fn serve_radio(
                 2
             }
             (scan::reply::OP_RADIO, Some(session)) => {
+                // Reply: `[status, was_joined, changed]`. `changed` is 0 when the radio was already in the
+                // state asked for - and then NOTHING is sent to the firmware, because a DOWN to a radio that
+                // is down is not a no-op on every firmware and an UP chain re-run resets a live interface.
                 let on = payload.get(1).copied().unwrap_or(1) != 0;
                 let was_joined = joined.is_some();
+                out[2] = (on != radio_on) as u8;
                 if on {
                     if !radio_on {
                         if !ctrl::interface_up(h, w, session, ctx) {
@@ -371,11 +391,56 @@ fn serve_radio(
                             radio_on = true;
                             out[0] = scan::reply::OK;
                             out[1] = 0;
+                            // BACK ON THE NETWORK IT WAS ON. Reply bytes 3.. carry the rejoin: `[status,
+                            // ssid_len, ssid[32]]`, status 0 when there was nothing to rejoin. The key
+                            // is the held one - the passphrase is never asked for here - and an open
+                            // network is rejoined open. A `forget` of the name leaves nothing to rejoin
+                            // with, and the reply says so by attempting nothing.
+                            out[3] = 0;
+                            if let Some((name, len, sec)) = last_joined {
+                                let ssid = &name[..len as usize];
+                                let mut pmk_buf = [0u8; crypto::PMK_LEN];
+                                let secret = if sec == scan::sec::OPEN {
+                                    Some(join::Secret::Open)
+                                } else {
+                                    match slot_of(&stored, ssid).and_then(|i| stored[i].as_ref()) {
+                                        Some(st) => {
+                                            pmk_buf = st.pmk;
+                                            Some(join::Secret::Pmk(&pmk_buf))
+                                        }
+                                        None => None,
+                                    }
+                                };
+                                if let Some(secret) = secret {
+                                    ctx.log("wifi-driver: radio back on - rejoining the network last joined");
+                                    let outcome = join::join(h, w, session, ssid, secret, &mut keys, ctx);
+                                    if outcome == join::Outcome::Joined {
+                                        joined = Some((name, len));
+                                        joined_at_secs = ctx.epoch_secs_monotonic();
+                                        joined_security = sec;
+                                        rxq.clear();
+                                        if let Some(st) = slot_of(&stored, ssid).and_then(|i| stored[i].as_mut()) {
+                                            st.used_at = ctx.epoch_secs_monotonic();
+                                        }
+                                    } else {
+                                        joined = None;
+                                        let _ = ctrl::disassoc(h, w, session, ctx);
+                                    }
+                                    out[3] = reply_of(outcome);
+                                    out[4] = len;
+                                    out[5..5 + join::MAX_SSID].copy_from_slice(&name);
+                                }
+                                pmk_buf.fill(0);
+                            }
                         }
                     } else {
                         out[0] = scan::reply::OK;
                         out[1] = 0;
                     }
+                } else if !radio_on {
+                    // Already off: nothing to stop, nothing to send.
+                    out[0] = scan::reply::OK;
+                    out[1] = 0;
                 } else {
                     // `off` disconnects first (`utilities/56_wifi.md` 2), then takes the interface down.
                     if let Some(s) = sweep.take() {
@@ -399,7 +464,7 @@ fn serve_radio(
                     }
                     out[1] = was_joined as u8;
                 }
-                2
+                5 + join::MAX_SSID
             }
             (scan::reply::OP_SCAN_START, Some(session)) => match &sweep {
                 Some(s) => {
@@ -628,6 +693,7 @@ fn serve_radio(
                                 joined = Some((name_of(ssid), ssid_len as u8));
                                 joined_at_secs = ctx.epoch_secs_monotonic();
                                 rxq.clear();
+                                last_joined = Some((name_of(ssid), ssid_len as u8, if matches!(secret, join::Secret::Open) { scan::sec::OPEN } else { scan::sec::WPA2 }));
                                 joined_security = if matches!(secret, join::Secret::Open) {
                                     scan::sec::OPEN
                                 } else {
@@ -668,14 +734,7 @@ fn serve_radio(
                                 // association to leave, exactly as `leave` is.
                                 let _ = ctrl::disassoc(h, w, session, ctx);
                             }
-                            out[0] = match outcome {
-                                join::Outcome::Joined => scan::reply::JOINED,
-                                join::Outcome::NotFound => scan::reply::NOT_FOUND,
-                                join::Outcome::PassphraseRefused => scan::reply::PASSPHRASE_REFUSED,
-                                join::Outcome::Failed => scan::reply::JOIN_FAILED,
-                                join::Outcome::Timeout => scan::reply::JOIN_TIMEOUT,
-                                join::Outcome::HandshakeUnimplemented => scan::reply::HANDSHAKE_UNIMPLEMENTED,
-                            };
+                            out[0] = reply_of(outcome);
                             // The working copy of the key does not outlive the join it was for.
                             pmk_buf.fill(0);
                             1

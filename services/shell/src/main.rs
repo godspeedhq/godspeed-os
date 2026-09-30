@@ -8525,7 +8525,9 @@ fn wifi_leave(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 /// `wifi radio on|off` - power the radio. `off` disconnects first and says so.
 fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError> {
     use wifi_wire::*;
-    const REPLY_MS: u64 = 5000;
+    // `on` may carry a whole join behind it (a few seconds on hardware, bounded by the driver's own join
+    // wait), so its bound is the join's.
+    const REPLY_MS: u64 = 15000;
     let r = match wifi_ask(ctx, &[OP_RADIO, on as u8], REPLY_MS) {
         Some(r) => r,
         None => return wifi_not_answering(ctx, out),
@@ -8534,10 +8536,23 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
     match p.first().copied() {
         Some(OK) => {
             let was_joined = p.get(1).copied().unwrap_or(0) != 0;
-            match (on, was_joined) {
-                (true, _) => out.line_fmt(ctx, format_args!("radio on")),
-                (false, true) => out.line_fmt(ctx, format_args!("left the network, then radio off")),
-                (false, false) => out.line_fmt(ctx, format_args!("radio off")),
+            // The third byte says whether anything changed; a driver that does not send one is read as
+            // "changed", which is what the two-byte reply always meant.
+            let changed = p.get(2).copied().unwrap_or(1) != 0;
+            match (on, changed, was_joined) {
+                (true, false, _) => out.line_fmt(ctx, format_args!("radio already on")),
+                (false, false, _) => out.line_fmt(ctx, format_args!("radio already off")),
+                (true, true, _) => out.line_fmt(ctx, format_args!("radio on")),
+                (false, true, true) => out.line_fmt(ctx, format_args!("left the network, then radio off")),
+                (false, true, false) => out.line_fmt(ctx, format_args!("radio off")),
+            }
+            // Bytes 3.. of an `on` reply: the rejoin of the network last joined, `[status, len, name]`,
+            // status 0 when there was none. Its sentence is `wifi join`'s own, from the same table.
+            if on && p.len() >= 5 + SSID_MAX && p[3] != 0 {
+                let len = core::cmp::min(p[4] as usize, SSID_MAX);
+                let mut shown = [0u8; SSID_MAX];
+                let name = wifi_ssid_text(&p[5..5 + len], &mut shown);
+                return wifi_join_outcome(ctx, out, name, ReqOutcome::Reply(Message::from_bytes(&[p[3]])));
             }
             Ok(())
         }

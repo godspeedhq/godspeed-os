@@ -36,7 +36,8 @@ What every verb does, and what was seen:
   apart, and reported the deauthentication (reason 15) as the driver's inability, not the passphrase's - the state
   before the handshake was built; the not-met list below has the build and what its first boot must show. A
   second `connect` of the same name **asked nothing** and joined with the held key. `wifi stored` named it.
-- `wifi leave`, `wifi radio on|off`, `wifi forget` - built as sections 2 and 6 say; not typed this boot.
+- `wifi leave`, `wifi radio on|off`, `wifi forget` - built as sections 2 and 6 say; `radio off` and `on`
+  typed 2026-09-30 15:05 (off dropped the link, on brought the radio back and a join after it worked).
 - `wifi help`, `wifi <verb> help`, `wifi version`, tab completion, and a row in `help`.
 - Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one that will
   not answer says that after a bounded wait, never a guess.
@@ -130,7 +131,7 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi debug [events\|stats\|firmware\|transport\|trace]` | the driver's own account of itself: counters, the firmware's words, the last 64 frames. Section 4g |
 | `wifi forget <ssid>` | drop the held key for that network. Does not leave the network |
 | `wifi stored` | the networks a key is held for, one per line. Names, never secrets. Sixty-four at most - section 6 |
-| `wifi radio on` / `wifi radio off` | power the radio. `off` disconnects first and says so |
+| `wifi radio on` / `wifi radio off` | power the radio. `off` disconnects first and says so. `on` then REJOINS the network last joined this boot, with the key it holds and without asking, and says `joined <name>` (asked for by the operator 2026-09-30); a `wifi leave` before the `off` cancels that, and a `wifi forget` of the name leaves nothing to rejoin with. Asking for the state it is already in says `radio already on` / `radio already off`, and sends the radio nothing |
 | `wifi help` | usage, with one real example per row |
 | `wifi version` | version number plus the collective copyright line |
 
