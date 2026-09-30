@@ -125,7 +125,7 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi scan` | ask the radio to sweep. Rows appear as they are heard; when the sweep ends the rows become a numbered picker. `q` stops the sweep, `b` leaves it running and returns the prompt |
 | `wifi list` | print the last complete scan: SSID, signal, band, security. Instant, records only, never scans |
 | `wifi join <ssid>` | join a network by name. Asks the passphrase once if one is needed and none is held; `already joined` if you are on it |
-| `wifi leave` | leave the current network. The radio stays up |
+| `wifi leave` (says `left <name>`, or `nothing to leave - not joined`) | leave the current network. The radio stays up |
 | `wifi status` | the human answer: radio, network and band, signal, security, time joined, last scan. Read live. Section 4f |
 | `wifi info` | the link in detail: bssid, band, channel, signal, security, time joined, scan facts - and where addressing lives. Section 4f |
 | `wifi debug [events\|stats\|firmware\|transport\|trace]` | the driver's own account of itself: counters, the firmware's words, the last 64 frames. Section 4g |

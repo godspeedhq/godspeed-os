@@ -8510,11 +8510,20 @@ fn wifi_leave(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let p = r.payload_bytes();
     match p.first().copied() {
         Some(OK) if p.get(1).copied().unwrap_or(0) != 0 => {
-            out.line_fmt(ctx, format_args!("left - the radio stays up"));
+            // `[OK, 1, len, name]` from a driver that names what it left; an older two-byte reply is
+            // still a leave, just an unnamed one.
+            if p.len() >= 3 + SSID_MAX && p[2] != 0 {
+                let len = core::cmp::min(p[2] as usize, SSID_MAX);
+                let mut shown = [0u8; SSID_MAX];
+                let name = wifi_ssid_text(&p[3..3 + len], &mut shown);
+                out.line_fmt(ctx, format_args!("left {}", name));
+            } else {
+                out.line_fmt(ctx, format_args!("left the network"));
+            }
             Ok(())
         }
         Some(OK) => {
-            out.line_fmt(ctx, format_args!("not joined - nothing to leave (the radio was told anyway)"));
+            out.line_fmt(ctx, format_args!("nothing to leave - not joined"));
             Ok(())
         }
         Some(s) => wifi_radio_unavailable(ctx, out, s),

@@ -361,7 +361,7 @@ fn serve_radio(
                         s.scan.count()
                     ));
                 }
-                let was_joined = joined.is_some();
+                let left = joined;
                 // Sent whether or not this driver believes it is associated: the firmware's state is the truth,
                 // and a stale belief here must not stop the operator leaving a network.
                 let _ = ctrl::disassoc(h, w, session, ctx);
@@ -369,9 +369,16 @@ fn serve_radio(
                 last_joined = None;
                 join::forget(&mut keys);
                 rxq.clear();
+                // `[OK, was_joined, len, name[32]]` - the name of what was left, so the shell can say it.
                 out[0] = scan::reply::OK;
-                out[1] = was_joined as u8;
-                2
+                out[1] = left.is_some() as u8;
+                out[2] = 0;
+                out[3..3 + join::MAX_SSID].fill(0);
+                if let Some((name, len)) = left {
+                    out[2] = len;
+                    out[3..3 + join::MAX_SSID].copy_from_slice(&name);
+                }
+                3 + join::MAX_SSID
             }
             (scan::reply::OP_RADIO, Some(session)) => {
                 // Reply: `[status, was_joined, changed]`. `changed` is 0 when the radio was already in the
@@ -380,6 +387,13 @@ fn serve_radio(
                 let on = payload.get(1).copied().unwrap_or(1) != 0;
                 let was_joined = joined.is_some();
                 out[2] = (on != radio_on) as u8;
+                // EVERY byte the reply carries is written on EVERY path. `out` is one buffer reused for
+                // every request, and the "already on" branch left byte 3 - the rejoin status - holding
+                // whatever the previous reply put there. The shell read it as a rejoin outcome it had no
+                // words for. Boot 2026-09-30 15:17: `radio already on` followed by "a reply this shell
+                // does not understand".
+                out[3] = 0;
+                out[4] = 0;
                 if on {
                     if !radio_on {
                         if !ctrl::interface_up(h, w, session, ctx) {
@@ -396,7 +410,6 @@ fn serve_radio(
                             // is the held one - the passphrase is never asked for here - and an open
                             // network is rejoined open. A `forget` of the name leaves nothing to rejoin
                             // with, and the reply says so by attempting nothing.
-                            out[3] = 0;
                             if let Some((name, len, sec)) = last_joined {
                                 let ssid = &name[..len as usize];
                                 let mut pmk_buf = [0u8; crypto::PMK_LEN];
