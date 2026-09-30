@@ -476,3 +476,17 @@ ni_replaycnt                       # OpenBSD net80211 node field - the last acce
 scb_val_t                          # Broadcom wlioctl.h - `int32 val; struct ether_addr ea;`, the GET_RSSI structure, sizeof 12 not 10; ctrl.rs sends it as a byte array - external, 26.14
 iproc_rng200_restart               # Linux drivers/char/hw_random/iproc-rng200.c - the disable / clear / RBG reset / RNG reset / enable sequence `arch/aarch64::hw_random` performs inline on a fail bit - external, 26.14
 cpu_do_idle                        # Linux arch/arm64/kernel/process.c - the idle sequence (wfi under the mask, then unmask) `arch/aarch64::wait_for_interrupt` follows - external, 26.14
+sdio_reset                         # Linux drivers/mmc/core/sdio_ops.c - the CCCR IO_ABORT RES write before every SDIO probe, which `sdio::identify` performs first for a card an earlier instance left initialised - external, 26.14
+D11_BCMA_IOCTL_PHYRESET            # Linux drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c - the 802.11 core IOCTL bit `aicore::D11_PHYRESET` mirrors - external, 26.14
+D11_BCMA_IOCTL_PHYCLOCKEN          # Linux brcmfmac chip.c - the 802.11 core IOCTL bit `aicore::D11_PHYCLOCKEN` mirrors - external, 26.14
+SDIO_WAIT_F2RDY                    # Linux brcmfmac sdio.c - the 3000 ms function-2 ready timeout `sdio::enable_function` waits by - external, 26.14
+brcmf_chip_cr4_set_passive         # Linux brcmfmac chip.c - disable the ARM CR4, reset the 802.11 core: the passive step a firmware upload follows - external, 26.14
+BCMA_CC_WATCHDOG                   # Linux drivers/bcma/ - the chipcommon watchdog register (0x80) `sdio::CC_WATCHDOG` mirrors; a nonzero tick count resets the whole chip - external, 26.14
+SDPCM_SHARED_TRAP                  # Linux brcmfmac sdio.c - the shared-structure flag bit `upload::TRAP` mirrors: the firmware took a trap - external, 26.14
+brcmf_pcie_reset_device            # Linux brcmfmac pcie.c - arms the chipcommon watchdog with 4 to reset the dongle; the mechanism `sdio::chip_reset` borrows - external, 26.14
+brcmf_sdio_bus_reset               # Linux brcmfmac sdio.c - the SDIO bus reset: remove, mmc_hw_reset (a power cycle), probe - the remedy this driver cannot use without the kernel - external, 26.14
+brcmf_trap_info                    # Linux brcmfmac sdio.c - the trap record (type, epc, cpsr, spsr, r0-r7, pc, sp, lr) `upload` reads out when the firmware reports a trap - external, 26.14
+mmc_hw_reset                       # Linux drivers/mmc/core - power-cycles a card through its power sequencer; on the Pi 4 that is the WLAN regulator on the GPIO expander - external, 26.14
+trap_addr                          # Linux brcmfmac sdio.c `sdpcm_shared_le.trap_addr` - the word after `flags` in the shared structure, the trap record pointer - external, 26.14
+si_watchdog                        # Broadcom DHD siutils.c - arms the PMU watchdog on a PMU chip, the chipcommon watchdog otherwise; the register choice `sdio::PMU_WATCHDOG` follows - external, 26.14
+pmuwatchdog                        # Broadcom chipcregs - the PMU watchdog register at chipcommon + 0x634 `sdio::PMU_WATCHDOG` names - external, 26.14

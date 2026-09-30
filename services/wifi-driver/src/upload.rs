@@ -274,6 +274,8 @@ pub fn nvram_prepare(text: &[u8], out: &mut [u8]) -> Option<usize> {
 fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, ctx: &ServiceContext) -> bool {
     /// `SDPCM_SHARED_VERSION_MASK`.
     const VERSION_MASK: u32 = 0x0000_00FF;
+    /// `SDPCM_SHARED_TRAP` - the firmware took a trap and filled in the record `trap_addr` points at.
+    const TRAP: u32 = 0x0000_0400;
     /// `SDPCM_SHARED_VERSION` - the newest the reference understands.
     const VERSION: u32 = 0x0003;
     const LIVENESS_TRIES: u32 = 20;
@@ -311,6 +313,24 @@ fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, ctx: &Service
                                     "wifi-driver: that version is NEWER than the layout this driver \
                                      knows, so the structure's fields past `flags` are not safe to read",
                                 );
+                            } else if f & TRAP != 0 {
+                                // THE FIRMWARE TRAPPED, and it says where. `SDPCM_SHARED_TRAP` in the
+                                // flags means `trap_addr` (the word after `flags`) points at a
+                                // `brcmf_trap_info`: type, epc, cpsr, spsr, r0-r7, pc, sp, lr. Every
+                                // respawn under `chaos max-carnage` came alive with this bit set and
+                                // the boot never did; reading it out is what turns "function 2 never
+                                // came ready" into an address.
+                                let ta = w.read32(h, v + 4, ctx).unwrap_or(0);
+                                let mut rd = |off: u32| w.read32(h, ta + off, ctx).unwrap_or(0xFFFF_FFFF);
+                                if ta >= ram.base && ta < ram.base + ram.size {
+                                    ctx.log_fmt(format_args!(
+                                        "wifi-driver: THE FIRMWARE TRAPPED AT START - trap type {:#x}, epc {:#010x}, pc {:#010x}, lr {:#010x}, sp {:#010x} (trap info at {:#010x})",
+                                        rd(0), rd(4), rd(48), rd(56), rd(52), ta));
+                                } else {
+                                    ctx.log_fmt(format_args!(
+                                        "wifi-driver: THE FIRMWARE TRAPPED AT START, and its trap pointer {:#010x} is outside RAM, so there is nothing more to read",
+                                        ta));
+                                }
                             }
                             return true;
                         }
@@ -418,6 +438,7 @@ pub fn run(
     w: &mut Window,
     arm_wrapper: u32,
     ram: &Ram,
+    warm: bool,
     ctx: &ServiceContext,
 ) -> bool {
     // 1. HALT THE CPU, but leave the CORE OUT OF RESET - which is not the same thing, and getting it
@@ -483,6 +504,32 @@ pub fn run(
         nv_at,
         top
     ));
+    // A WARM CHIP'S RAM IS WIPED WHERE THE UPLOAD DOES NOT WRITE IT. A power cycle clears the chip's
+    // RAM; the PMU watchdog reset does not, and firmware started after that reset trapped in ROM before
+    // it had a stack (`type 0x1, epc 0x9384c, sp 0` - backlog/69), which is what cold-boot code finding
+    // the previous run's state looks like. DHD clears the top word of RAM before every download for
+    // its shared-structure pointer; this clears every word between the image and the NVRAM, which is
+    // all of RAM the two writes above and below do not cover. Warm only: a fresh boot's upload stays
+    // byte-for-byte what it was, so this is one change on its own.
+    if warm {
+        let gap_from = ram.base + firmware::IMAGE.len() as u32;
+        let gap_to = nv_at;
+        if gap_to > gap_from {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: warm chip - zeroing the {} KiB of RAM between the image and the NVRAM ({:#08x}..{:#08x}) so the firmware starts on what a power-on would leave",
+                (gap_to - gap_from) / 1024, gap_from, gap_to));
+            const ZEROS: [u8; CHUNK] = [0u8; CHUNK];
+            let mut at = gap_from;
+            while at < gap_to {
+                let n = ((gap_to - at) as usize).min(CHUNK);
+                if !write_bytes(h, w, at, &ZEROS[..n], "RAM clear", ctx) {
+                    ctx.log("wifi-driver: the RAM clear failed part way - continuing, the firmware may find stale state");
+                    break;
+                }
+                at += n as u32;
+            }
+        }
+    }
     if !write_bytes(h, w, nv_at, &nv[..len], "NVRAM", ctx) {
         return false;
     }

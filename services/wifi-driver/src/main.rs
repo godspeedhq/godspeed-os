@@ -1317,7 +1317,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // reference keeps in a table rather than a formula.
             ctx.log("wifi-driver: stage 9 - asking the ARM core how much TCM it has");
             match cores.as_ref().and_then(|c| c.arm) {
-                Some(arm) => match armcr4::probe(&h, &mut window, arm.base, id.id, &ctx) {
+                Some(arm) => match {
+                    // THE CORE IS RESET AND RELEASED WITH ITS CPU HALTED BEFORE IT IS ASKED. A chip a
+                    // dead instance left running its firmware answers `ARMCR4_CAP` with zero - 50
+                    // respawns under `chaos max-carnage`, 50 times "ZERO memory banks", radio down for
+                    // the life of each - and so does a core HELD in reset, which the first attempt at
+                    // this (a plain `aicore::disable`) found out on a fresh boot. The register reads
+                    // with the core clocked, out of reset and halted: the state brcmfmac's
+                    // `brcmf_chip_recognition` puts the chip in before it sizes the RAM ("assure chip
+                    // is passive for core register access" - for a CR4, a reset-core with CPUHALT,
+                    // not a disable). `aicore::reset(halt = true)` is that sequence and stage 11
+                    // already performs it for the upload; here it happens first, where the read needs
+                    // it. A fresh chip happens to answer unhalted; one running firmware does not, and
+                    // asking in the reference's state serves both (26.14).
+                    if let Some(wrap) = arm.wrapper() {
+                        if !aicore::reset(&h, &mut window, wrap, true, &ctx) {
+                            ctx.log(
+                                "wifi-driver: the ARM core could not be reset and halted before its \
+                                 memory is sized - the read below may say zero",
+                            );
+                        }
+                    }
+                    armcr4::probe(&h, &mut window, arm.base, id.id, &ctx)
+                } {
                     Some(ram) => {
                         ram.report(&ctx);
                         // ---- Stage 10: what this build actually carries. ----------------------------
@@ -1335,8 +1357,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // `upload::run` halts first and refuses to continue unless the halt confirms.
                         match arm.wrapper() {
                             Some(wrap) => {
+                                // THE 802.11 CORE IS RESET BEFORE THE FIRMWARE GOES IN. This is the
+                                // other half of the reference's passive step for a CR4 chip
+                                // (`brcmf_chip_cr4_set_passive`: disable the ARM, then reset the D11
+                                // core with PHYRESET|PHYCLOCKEN going in and PHYCLOCKEN coming out). A
+                                // fresh chip has never run anything, so the firmware finds the D11 as
+                                // the reset left it; a RESPAWN finds it as the dead instance's firmware
+                                // left it, mid-whatever, and the new firmware came alive over that
+                                // state and never brought function 2 ready (26.14). The log says which
+                                // state the core was found in, so a boot can tell whether it mattered.
+                                if let Some(dw) = cores.as_ref().and_then(|c| c.wlan).and_then(|d| d.wrapper()) {
+                                    ctx.log("wifi-driver: resetting the 802.11 core before the upload");
+                                    if !aicore::reset_bits(
+                                        &h, &mut window, dw,
+                                        aicore::D11_PHYRESET | aicore::D11_PHYCLOCKEN,
+                                        aicore::D11_PHYCLOCKEN,
+                                        aicore::D11_PHYCLOCKEN,
+                                        &ctx,
+                                    ) {
+                                        ctx.log("wifi-driver: the 802.11 core did not come out of its reset cleanly - continuing, the firmware may not bring its functions up");
+                                    }
+                                }
                                 ctx.log("wifi-driver: stage 11 - uploading the firmware");
-                                if upload::run(&h, &mut window, wrap, &ram, &ctx) {
+                                if upload::run(&h, &mut window, wrap, &ram, card.warm, &ctx) {
                                     ctx.log(
                                         "wifi-driver: PHASE 2 COMPLETE - firmware and NVRAM are in the \
                                          chip and its processor is running them",

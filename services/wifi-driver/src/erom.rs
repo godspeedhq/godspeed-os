@@ -192,6 +192,10 @@ pub struct Cores {
     /// the SDIOD core's base" as a limitation, which the same log disproved. Kept now, so the claim cannot
     /// be made again.
     pub sdiod: Option<Core>,
+    /// The 802.11 core (`0x812`, `core_id::WLAN`), kept because a RESPAWN has to reset it before the
+    /// firmware upload: the dead instance's firmware left it running, and the reference's passive
+    /// step resets it alongside the ARM (`aicore::D11_PHYRESET`).
+    pub wlan: Option<Core>,
     /// How many cores the table described in total.
     pub count: u32,
     /// `(id, base, wrapper AS PUBLISHED)` for each core found, for the derivation self-check.
@@ -348,6 +352,7 @@ pub fn scan(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
         arm: None,
         mem: None,
         sdiod: None,
+        wlan: None,
         count: 0,
         seen: [(0, 0, 0); MAX_CORES as usize],
     };
@@ -430,6 +435,9 @@ pub fn scan(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
         }
         if out.sdiod.is_none() && id == core_id::SDIO_DEV {
             out.sdiod = Some(core);
+        }
+        if out.wlan.is_none() && id == core_id::WLAN {
+            out.wlan = Some(core);
         }
     }
 

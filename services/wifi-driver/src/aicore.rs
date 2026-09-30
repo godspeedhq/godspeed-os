@@ -151,6 +151,97 @@ pub fn disable(
     false
 }
 
+/// The 802.11 core's `IOCTRL` bits the reference names (`D11_BCMA_IOCTL_PHYRESET`,
+/// `D11_BCMA_IOCTL_PHYCLOCKEN` in brcmfmac's chip.c). Its passive step for a CR4 chip resets the D11
+/// core with PHYRESET|PHYCLOCKEN going in, PHYCLOCKEN held in reset, PHYCLOCKEN coming out.
+pub const D11_PHYRESET: u32 = 0x0004;
+pub const D11_PHYCLOCKEN: u32 = 0x0008;
+
+/// `reset`, with the `IOCTRL` bits spelled out per phase instead of derived from `halt` - the
+/// reference's `brcmf_chip_resetcore(core, prereset, reset, postreset)`, which is how it resets a core
+/// that is not the ARM. The sequence is `disable` then release, the same one `reset` performs; it is
+/// written out rather than shared so that `reset`, which every boot has exercised, is not edited to
+/// grow a parameter. Used for the 802.11 core before a firmware upload (`D11_PHYRESET`).
+pub fn reset_bits(
+    h: &Host,
+    w: &mut Window,
+    wrapper: u32,
+    prereset: u32,
+    reset: u32,
+    postreset: u32,
+    ctx: &ServiceContext,
+) -> bool {
+    // Into reset, or already there (the reference's `in_reset_configure` shortcut).
+    match w.read32(h, wrapper + off::RESETCTRL, ctx) {
+        Some(rc) if rc & bit::AIRC_RESET != 0 => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: core wrapper {:#010x} was already in reset (RESETCTRL {:#010x})",
+                wrapper, rc
+            ));
+        }
+        Some(_) => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: core wrapper {:#010x} was RUNNING - putting it in reset first",
+                wrapper
+            ));
+            if w.write32(h, wrapper + off::IOCTRL, prereset | bit::FGC | bit::CLOCK_EN, ctx).is_none() {
+                return false;
+            }
+            let _ = w.read32(h, wrapper + off::IOCTRL, ctx);
+            if w.write32(h, wrapper + off::RESETCTRL, bit::AIRC_RESET, ctx).is_none() {
+                return false;
+            }
+            const RESET_TRIES: u32 = 100;
+            let mut held = false;
+            for _ in 0..RESET_TRIES {
+                match w.read32(h, wrapper + off::RESETCTRL, ctx) {
+                    Some(rc) if rc & bit::AIRC_RESET != 0 => { held = true; break; }
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+            if !held {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: core wrapper {:#010x} never reported itself in reset across {} reads",
+                    wrapper, RESET_TRIES
+                ));
+                return false;
+            }
+        }
+        None => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: could not read RESETCTRL at {:#010x}, so the core's state is unknown",
+                wrapper + off::RESETCTRL
+            ));
+            return false;
+        }
+    }
+    // In-reset configure, then out, then the settled clock - the reference's order and waits.
+    if w.write32(h, wrapper + off::IOCTRL, reset | bit::FGC | bit::CLOCK_EN, ctx).is_none() {
+        return false;
+    }
+    let _ = w.read32(h, wrapper + off::IOCTRL, ctx);
+    if w.write32(h, wrapper + off::RESETCTRL, 0, ctx).is_none() {
+        return false;
+    }
+    ctx.sleep_ms(1);
+    if w.write32(h, wrapper + off::IOCTRL, postreset | bit::CLOCK_EN, ctx).is_none() {
+        return false;
+    }
+    let final_ioctrl = w.read32(h, wrapper + off::IOCTRL, ctx);
+    ctx.sleep_ms(1);
+    let rc = w.read32(h, wrapper + off::RESETCTRL, ctx);
+    let up = matches!(rc, Some(v) if v & bit::AIRC_RESET == 0);
+    ctx.log_fmt(format_args!(
+        "wifi-driver: core wrapper {:#010x} out of reset: RESETCTRL {:#010x}, IOCTRL {:#010x} - {}",
+        wrapper,
+        rc.unwrap_or(0xFFFF_FFFF),
+        final_ioctrl.unwrap_or(0xFFFF_FFFF),
+        if up { "CORE RUNNING" } else { "STILL IN RESET" }
+    ));
+    up
+}
+
 /// Take a core out of reset. `halt` keeps the CPU halted while its clock runs.
 ///
 /// The sequence is the reference's, in its order, including both read-backs and both 1 ms waits.

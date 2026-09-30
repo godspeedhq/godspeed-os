@@ -2056,8 +2056,9 @@ The duplicate-constant check refused this work twice, both times correctly. `DAT
 `bus.rs` and `ctrl.rs` with the same value, so it now lives once in `sdio.rs`, where a fact about the SDIO
 card belongs. And `TRIES` existed in three files with two different values - "two facts wearing one name".
 They are now `RESET_TRIES`, `HT_TRIES`, `REPLY_TRIES` and `LIVENESS_TRIES`, which is better code than what
-the gate rejected. A third pair inside `sdio.rs` that the cross-file rule could not see (`READY_TRIES` at
-two values, 100 and 500) was found while fixing the first two and split into `OCR_TRIES` and `READY_TRIES`.
+the gate rejected. A third pair inside `sdio.rs` that the cross-file rule could not see (one name for the
+OCR poll count and the function-ready count, 100 and 500) was found while fixing the first two and split
+into `OCR_TRIES` and a ready count - which section 45 later replaced with `READY_MS`, a duration.
 
 A general `read_extended` also had to be written: the read side of CMD53 stopped at four bytes, because every
 backplane read is a single word. A reply header is twelve.
@@ -3234,3 +3235,105 @@ So the VisionFive radio is a real third port and a second driver, not a variant 
 recorded here as the answer to section 1's question, and as scope that is NOT part of this branch
 (section 9). The riscv64 kernel's `hw_random` is still a stub; the JH7110 has a hardware generator of its
 own, and filling that seam would help `net-stack` on the board whether or not the radio is ever driven.
+
+## 45. The first chaos run with the radio: 397 respawns, one join (2026-09-30)
+
+`chaos max-carnage` on the Pi 4, 826 rounds, with the radio carrying the link. The kernel did not
+panic and nothing wedged. The radio was dead from round one.
+
+**The numbers, before any theory.** 397 kills of `wifi-driver`, 397 respawns, 397 times `no SDIO card
+answered on this bus`, and ONE `JOINED` in the whole log - the boot's. Every respawn failed at the
+same step, so this is not a race and not the storm: the first kill was enough, and the board stayed
+without a radio until power-cycled. `nic-driver` saw it as the driver's one-byte "radio down" answer
+to every request (`answered 0x02 while we asked 0x10`), and `net` said `the radio is not joined`,
+which was true.
+
+**Why.** A respawn re-runs identification from CMD0, as section 43 says, and CMD0 is the wrong reset
+for this. `GO_IDLE` returns a MEMORY card to its idle state; the SDIO specification leaves an I/O
+card's function side untouched. The CYW43455 the dead instance left behind is initialised - RCA
+assigned, selected, 4-bit, firmware running on its ARM - and from that state it does not answer CMD5.
+A fresh power-up is the state `identify` was written against, and it was the only state it had ever
+seen, because until tonight nothing had killed the driver.
+
+**The reset the card actually needs** is the `RES` bit of CCCR `IO_ABORT` (function 0, address 6, bit
+3), written through CMD52. That is what Linux's `sdio_reset` does before every SDIO probe
+(`drivers/mmc/core/sdio_ops.c`): read-modify-write the abort register with `RES` set, then go idle,
+then CMD5. It is a property of the device, not of their design (26.14), so `identify` now does it
+first. On a fresh boot there is no initialised card to accept the write and it fails silently; it is
+logged only when accepted, because that is the line that says an earlier instance was here.
+
+**The second half, found by the next boot.** With the reset in, a 100-round storm gave 50 respawns and
+50 identifications - and 50 times `ARMCR4_CAP 0x00000000 - ZERO memory banks` at stage 9, radio down
+for the life of every instance. Same shape, one stage later: on a fresh boot the CR4 is in reset from
+power-on and its capability register reads; on a respawn the dead instance's firmware is running on
+it, and the register reads zero. brcmfmac makes the chip passive before it sizes the RAM
+(`brcmf_chip_recognition`: "assure chip is passive for core register access"), and for the CR4 that
+is a reset-core with the CPU halted - the core ends clocked, out of reset and halted, which is the
+state its registers read in. The first attempt at this held the core IN reset, and a fresh boot
+answered with the same zero, which is how that distinction was learned. `aicore::reset(halt = true)`,
+the sequence stage 11 already performs for the upload, now runs before the stage 9 read as well. A
+fresh chip happens to answer unhalted; one running firmware does not.
+
+**The third stage, found by the boot after that.** Memory sized, firmware uploaded, `THE FIRMWARE IS
+ALIVE` - and then `function 2 was enabled but never reported ready across 500 reads of IOR`. Two
+differences from a fresh boot, both handled by the reference: brcmfmac's passive step for a CR4 chip
+resets the 802.11 core too (`brcmf_chip_cr4_set_passive`), so the firmware never starts over a D11 the
+previous firmware left running - done now, before the upload, with the state the core was found in
+logged; and brcmfmac waits up to three seconds (`SDIO_WAIT_F2RDY`) for function 2 after the download,
+where this driver asked 500 times and gave up in tens of milliseconds. The wait is by time now and
+reports how long it took. A count is not a duration, and this is the second place in this driver that
+lesson had to be paid for.
+
+**The fourth stage, and the one the other three were symptoms of.** With all of the above in, every
+respawn under a storm uploaded and the firmware came alive - reporting shared-structure flags `0x0401`
+where the boot's firmware reports `0x0001`. Bit `0x0400` is the firmware's own TRAP flag: it crashes at
+start on the state the previous firmware left in the chip, and a crashed firmware never brings function
+2 ready, in 500 reads or in three seconds. brcmfmac's remedy for a warm chip is a power cycle through
+the WLAN regulator, which on this board is a GPIO-expander pin behind the firmware mailbox that only the
+kernel drives. Its remedy where it cannot cut power is a watchdog reset of the whole chip. So when the
+RES write is accepted - an earlier instance was here - the driver opens the backplane just far enough to
+arm the watchdog, waits, and identifies the card again as one just powered up; the second RES write says
+whether the reset took. And when a firmware does report a trap, its trap record (type, epc, pc, lr, sp)
+is logged, so the next such failure says where.
+
+**Which watchdog, learned the expensive way.** brcmfmac's PCIe path arms the chipcommon `watchdog`
+(0x80). Armed on the 43455, it reset the chip HALF WAY: the SDIO core went on answering CMD52 and never
+answered CMD5 again, on that respawn and on the 46 after it, until the next power-on - strictly worse
+than the warm chip it was meant to cure. Broadcom's own SDIO driver (DHD, `si_watchdog`) arms the PMU
+watchdog (`pmuwatchdog`, 0x634) on a chip with a PMU and the chipcommon one only without. The 43455 has a
+PMU. The driver arms 0x634 now, and the 0x80 result is kept in the code beside it so it is not tried
+twice.
+
+**Where it stands (2026-10-01, 00:02).** The PMU watchdog resets the chip whole: 52 armed under a storm,
+48 confirmed by the card answering as freshly powered, every one re-identified, no CMD5 death. And the
+firmware started on that chip still trapped, and said where: `trap type 0x1, epc 0x0009384c, pc
+0x00000025, lr 0x00000025, sp 0x00000000`. A reset-class trap, in ROM below the RAM base, before the
+firmware had a stack. The power-on boot never does this, so a watchdog reset is still not a power-on for
+this part - something the ROM sets up from cold is not restored by it - and Broadcom's SDIO driver never
+depends on it because it can cut power. **The radio does not survive a respawn of its driver on this
+board without a power cycle of the WLAN regulator**, which is a GPIO-expander pin behind the firmware
+mailbox that the kernel already drives once at boot. That is `backlog/69`; the five host-side steps above
+are each right, each moved the failure one stage later, and each stays.
+
+**One more, before any kernel change - the operator's call.** A power cycle wipes the chip's RAM and a
+watchdog reset does not, and a reset-class trap before the firmware has a stack is the shape of cold-boot
+code finding the previous run's state. DHD clears the top word of RAM before every download. On a warm
+chip the driver now zeroes every word between the image and the NVRAM - all of RAM the upload itself does
+not rewrite - before the NVRAM goes in. A fresh boot is untouched.
+
+**Result (00:22 and 00:23, two post-storm instances):** 203 KiB zeroed each time, `0x22cc1d..0x25f92c`,
+and the firmware trapped identically - `type 0x1, epc 0x0009384c, pc 0x00000025, lr 0x00000025`, the
+trap record at `0x0025ff08`, the only change `sp` reading 4 where it read 0. The difference between a
+watchdog reset and a power-on is not in the RAM the host can reach. The clear stays, because a warm chip
+should not start on stale data whatever else is wrong, and because it cost one boot to learn that it is
+not the answer. That is the end of the host-side chain: six steps, each a correct reading of the
+reference, each one stage further, and the last one inside the chip's ROM. `backlog/69` is the record
+and the remedy is the power cycle.
+
+The rule all four stages obey: a respawn inherits a chip the previous instance left RUNNING, and every
+step written against the power-on state has to say what it does with a running one.
+
+**What stays open from the same run**, recorded rather than folded in: the console after the storm
+(`backlog/68`), and the parked lag showing through the post-storm ping as expected (`backlog/66`).
+Section 43's claim that a respawn "rejoins the network last joined" is true only once identification
+succeeds, which this section is the missing half of.
