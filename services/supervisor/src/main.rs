@@ -563,7 +563,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // the paragraph above about `map_fixed_driver_mmio`.
     #[cfg(has_wifi_driver)]
     ("wifi-driver", WIFI_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     16 * 1024 * 1024, 3, &[], 0, 0, 0),
+     16 * 1024 * 1024, 3, &["fs"], 0, 0, 0),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -1617,8 +1617,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // fifth backend, docs/wifi.md 2) and a peer already in the name-cap map wires at spawn; one that is
     // not costs a round of failure and reacquire (services/CLAUDE.md, the spawn order is a dependency
     // order). The radio's own bring-up runs in its task and holds nobody up.
+    // Wired to `fs` for `/wifi.keys` (the storage chain is up by here, so the cap wires at spawn).
     #[cfg(has_wifi_driver)]
-    ensure_mapped(&ctx, &mut name_map, "wifi-driver", 0xFFFF);
+    ensure_wired(&ctx, &mut name_map, "wifi-driver", &["fs"]);
 
    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 

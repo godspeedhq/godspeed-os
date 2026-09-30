@@ -3140,3 +3140,47 @@ wifi-driver: group key N re-installed and acknowledged (replay R) - the access p
 
 and `ping` continuing past it. If instead the link drops at the router's interval with a refusal logged
 just before, the refusal names the step.
+
+## 43. The keys on disk: `/wifi.keys`, and the radio ready at boot (2026-09-30)
+
+Section 6 designed a keyring service and was superseded by the operator's decision to keep keys in the
+driver's memory and lose them with it. This is the slice that decision pointed at, and it was asked for
+in these words: *"save passphrase on filesystem so that when the machine starts up, if there's wifi, it
+auto joins with that passphrase and ready to go."* With the exposure named by the operator before it was
+built: *"if I were to unplug the usbstick and put it on another machine, that machine will have access to
+wifi passphrase (I'm ok with that for now)."*
+
+**What is saved is the derived key, not the passphrase.** The driver has never kept the passphrase text
+past the moment it becomes a key; the file holds what the driver holds. A key joins the network exactly
+as the passphrase would, so the card's holder can join it - that is the accepted exposure - but it does
+not give up the passphrase itself, which people reuse for other things, and that difference costs
+nothing. Names are in plain text. Nothing is encrypted at rest, because there is no per-machine secret
+to encrypt with; a file that looked encrypted and was not would be the silent substitution 26.4 names.
+
+**The shape section 6's superseding note fixed in advance, built as fixed.** The in-memory table stays
+the working set. `keyfile.rs` loads `/wifi.keys` once the radio is up - through `fs`, the driver's one
+send peer, each request bounded and matched to its reply, reacquired by name if `fs` restarts - and
+writes it after every change: a join that added or re-ordered a key, a `forget`. While `fs` is still
+mounting the load is retried between requests, fifteen times two seconds apart, and then given up with
+a line; the driver runs on the table alone, exactly as it did before the file existed. The file is at
+most 48 entries, most recently used first, in one `fs` write; the table's 64 is the larger bound and the
+sixteen least recent are simply not saved. Open networks hold no key and are not saved.
+
+**At boot the radio joins what it last joined.** The first entry is the most recent, and once the file
+is read the driver joins it without being asked - the same code path as the rejoin after `radio on`
+(`join_known`), so a refusal or an out-of-range network ends in the same words. The cable still wins for
+the link; a machine that boots with its cable in is joined and standing by.
+
+**What the earlier decision still governs.** *"If anything restarts that driver, the user will put in
+their creds again. Better that than the kernel crashing"* was about the CRASH case, and it still is:
+nothing above the kernel must survive, and a respawned driver carries nothing across its own death. It
+reads the file back instead, which is the difference between surviving and recovering.
+
+**Format** (`keyfile.rs`): `"GSWK"`, a version byte, a count byte, then `[len, ssid[32], security, pmk[32]]`
+per entry. A file of another version is ignored with a line and rewritten by the next join.
+
+**Prediction for the boot.** Boot with the cable out: the log shows `/wifi.keys loaded - 1 network(s)
+known` - or `no /wifi.keys` the first time, then `wifi join`, then `/wifi.keys written - 1 network(s)` -
+and on the boot after that, `joining the network last joined, from /wifi.keys`, `JOINED`, and `ping`
+answering with nothing typed. `wifi forget <name>` rewrites the file with the name gone, and the next boot
+does not join.

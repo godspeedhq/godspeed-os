@@ -48,6 +48,7 @@ mod crypto;
 mod ctrl;
 mod eapol;
 mod frames;
+mod keyfile;
 mod scan;
 mod firmware;
 mod erom;
@@ -157,6 +158,93 @@ fn serve_radio(
             join::Outcome::HandshakeUnimplemented => scan::reply::HANDSHAKE_UNIMPLEMENTED,
         }
     }
+    // THE KEY FILE (`keyfile.rs`, `/wifi.keys`). Loaded once the radio is up - retried a bounded number
+    // of times while `fs` is still coming up, then given up with a line - and the most recent entry is
+    // joined without being asked. Written after every change to the table.
+    let mut keyfile_settled = false;
+    let mut keyfile_tries: u32 = 0;
+    const KEYFILE_TRIES: u32 = 15;
+    let mut auto_join: Option<([u8; join::MAX_SSID], u8, u8)> = None;
+    /// Join a network this driver holds a key for - the rejoin after `radio on`, and the auto-join at boot
+    /// from `/wifi.keys`. `None` when there is no key for a WPA2 name (nothing was attempted); otherwise
+    /// the join's outcome, with the driver's memory of the link updated either way.
+    fn join_known(
+        h: &host::Host,
+        w: &mut backplane::Window,
+        session: &mut ctrl::Session,
+        name: &[u8; join::MAX_SSID],
+        len: u8,
+        sec: u8,
+        stored: &mut [Option<Stored>],
+        keys: &mut Option<join::Keys>,
+        joined: &mut Option<([u8; join::MAX_SSID], u8)>,
+        joined_at_secs: &mut i64,
+        joined_security: &mut u8,
+        rxq: &mut frames::RxQueue,
+        ctx: &ServiceContext,
+    ) -> Option<join::Outcome> {
+        let ssid = &name[..len as usize];
+        let mut pmk_buf = [0u8; crypto::PMK_LEN];
+        let secret = if sec == scan::sec::OPEN {
+            Some(join::Secret::Open)
+        } else {
+            match slot_of(stored, ssid).and_then(|i| stored[i].as_ref()) {
+                Some(st) => {
+                    pmk_buf = st.pmk;
+                    Some(join::Secret::Pmk(&pmk_buf))
+                }
+                None => None,
+            }
+        };
+        let secret = secret?;
+        let outcome = join::join(h, w, session, ssid, secret, keys, ctx);
+        if outcome == join::Outcome::Joined {
+            *joined = Some((*name, len));
+            *joined_at_secs = ctx.epoch_secs_monotonic();
+            *joined_security = sec;
+            rxq.clear();
+            if let Some(st) = slot_of(stored, ssid).and_then(|i| stored[i].as_mut()) {
+                st.used_at = ctx.epoch_secs_monotonic();
+            }
+        } else {
+            *joined = None;
+            let _ = ctrl::disassoc(h, w, session, ctx);
+        }
+        pmk_buf.fill(0);
+        Some(outcome)
+    }
+    /// Write the table to `/wifi.keys`, most recently used first. Called after any change to it.
+    fn save_keys(ctx: &ServiceContext, stored: &[Option<Stored>]) {
+        let mut entries = [keyfile::Entry::EMPTY; keyfile::MAX_SAVED];
+        let mut n = 0usize;
+        // Selection by recency into a bounded array: the table is 64 slots and this is 48 picks of it.
+        let mut taken = [false; CREDENTIAL_SLOTS];
+        while n < keyfile::MAX_SAVED {
+            let mut best: Option<usize> = None;
+            for (i, s) in stored.iter().enumerate() {
+                if taken[i] {
+                    continue;
+                }
+                if let Some(st) = s {
+                    if best.map_or(true, |b| stored[b].as_ref().map_or(true, |bs| st.used_at > bs.used_at)) {
+                        best = Some(i);
+                    }
+                }
+            }
+            let Some(i) = best else { break };
+            taken[i] = true;
+            if let Some(st) = stored[i].as_ref() {
+                entries[n] = keyfile::Entry { ssid: st.ssid, len: st.len, sec: scan::sec::WPA2, pmk: st.pmk };
+                n += 1;
+            }
+        }
+        if keyfile::save(ctx, &entries[..n]) {
+            ctx.log_fmt(format_args!("wifi-driver: /wifi.keys written - {} network(s)", n));
+        }
+        for e in entries.iter_mut() {
+            e.pmk.fill(0);
+        }
+    }
     // The keys a WPA2 join keeps for the rekeys to come (`join::Keys`); `None` on an open network and
     // after any end of the association.
     let mut keys: Option<join::Keys> = None;
@@ -263,6 +351,56 @@ fn serve_radio(
     let mut reply_failed: u32 = 0;
 
     loop {
+        if !keyfile_settled && radio.is_some() {
+            let mut entries = [keyfile::Entry::EMPTY; keyfile::MAX_SAVED];
+            match keyfile::load(ctx, &mut entries) {
+                keyfile::Load::Loaded(n) => {
+                    keyfile_settled = true;
+                    let now = ctx.epoch_secs_monotonic();
+                    for (i, e) in entries.iter().take(n).enumerate() {
+                        let ssid = &e.ssid[..e.len as usize];
+                        let slot = slot_for(&stored, ssid);
+                        // Most recent first in the file, so the first keeps the highest `used_at`.
+                        stored[slot] = Some(Stored { ssid: e.ssid, len: e.len, pmk: e.pmk, used_at: now - i as i64 });
+                    }
+                    ctx.log_fmt(format_args!("wifi-driver: /wifi.keys loaded - {} network(s) known", n));
+                    if n > 0 {
+                        auto_join = Some((entries[0].ssid, entries[0].len, entries[0].sec));
+                    }
+                }
+                keyfile::Load::NoFile => {
+                    keyfile_settled = true;
+                    ctx.log("wifi-driver: no /wifi.keys - nothing to rejoin; the first join writes it");
+                }
+                keyfile::Load::Unreachable => {
+                    keyfile_tries += 1;
+                    if keyfile_tries >= KEYFILE_TRIES {
+                        keyfile_settled = true;
+                        ctx.log_fmt(format_args!(
+                            "wifi-driver: fs did not answer for /wifi.keys in {} tries - running on the table in memory alone this boot",
+                            keyfile_tries
+                        ));
+                    }
+                }
+            }
+            for e in entries.iter_mut() {
+                e.pmk.fill(0);
+            }
+        }
+        if let (Some((name, len, sec)), Some(session)) = (auto_join.take(), radio.as_mut()) {
+            if radio_on && sweep.is_none() && joined.is_none() {
+                ctx.log("wifi-driver: joining the network last joined, from /wifi.keys");
+                match join_known(h, w, session, &name, len, sec, &mut stored, &mut keys, &mut joined,
+                                 &mut joined_at_secs, &mut joined_security, &mut rxq, ctx) {
+                    Some(join::Outcome::Joined) => {
+                        last_joined = Some((name, len, sec));
+                        save_keys(ctx, &stored);
+                    }
+                    Some(_) => ctx.log("wifi-driver: the network last joined did not take us back - not joined; `wifi join` when it is in range"),
+                    None => {}
+                }
+            }
+        }
         // ---- 1. One frame of the running sweep, if there is one. ----
         if let (Some(s), Some(session)) = (sweep.as_mut(), radio.as_mut()) {
             match scan::step(h, w, session, &mut s.scan, &mut frame, ctx) {
@@ -297,6 +435,13 @@ fn serve_radio(
         // ---- 2. A request. Blocking when idle - there is nothing else to do - and a look when sweeping. ----
         let req = if sweep.is_some() {
             match ctx.try_recv() {
+                Some(m) => m,
+                None => continue,
+            }
+        } else if !keyfile_settled {
+            // `fs` may still be mounting when the radio comes up: wait for a request, but not forever, so
+            // the load above gets its next try.
+            match ctx.recv_timeout(ctx.duration_cycles(2_000)) {
                 Some(m) => m,
                 None => continue,
             }
@@ -411,39 +556,17 @@ fn serve_radio(
                             // network is rejoined open. A `forget` of the name leaves nothing to rejoin
                             // with, and the reply says so by attempting nothing.
                             if let Some((name, len, sec)) = last_joined {
-                                let ssid = &name[..len as usize];
-                                let mut pmk_buf = [0u8; crypto::PMK_LEN];
-                                let secret = if sec == scan::sec::OPEN {
-                                    Some(join::Secret::Open)
-                                } else {
-                                    match slot_of(&stored, ssid).and_then(|i| stored[i].as_ref()) {
-                                        Some(st) => {
-                                            pmk_buf = st.pmk;
-                                            Some(join::Secret::Pmk(&pmk_buf))
-                                        }
-                                        None => None,
-                                    }
-                                };
-                                if let Some(secret) = secret {
-                                    ctx.log("wifi-driver: radio back on - rejoining the network last joined");
-                                    let outcome = join::join(h, w, session, ssid, secret, &mut keys, ctx);
-                                    if outcome == join::Outcome::Joined {
-                                        joined = Some((name, len));
-                                        joined_at_secs = ctx.epoch_secs_monotonic();
-                                        joined_security = sec;
-                                        rxq.clear();
-                                        if let Some(st) = slot_of(&stored, ssid).and_then(|i| stored[i].as_mut()) {
-                                            st.used_at = ctx.epoch_secs_monotonic();
-                                        }
-                                    } else {
-                                        joined = None;
-                                        let _ = ctrl::disassoc(h, w, session, ctx);
-                                    }
+                                ctx.log("wifi-driver: radio back on - rejoining the network last joined");
+                                if let Some(outcome) = join_known(h, w, session, &name, len, sec, &mut stored, &mut keys,
+                                                                  &mut joined, &mut joined_at_secs, &mut joined_security,
+                                                                  &mut rxq, ctx) {
                                     out[3] = reply_of(outcome);
                                     out[4] = len;
                                     out[5..5 + join::MAX_SSID].copy_from_slice(&name);
+                                    if outcome == join::Outcome::Joined {
+                                        save_keys(ctx, &stored);
+                                    }
                                 }
-                                pmk_buf.fill(0);
                             }
                         }
                     } else {
@@ -722,6 +845,9 @@ fn serve_radio(
                                         if replaced { " (replacing the one used longest ago)" } else { "" }
                                     ));
                                 }
+                                if !matches!(secret, join::Secret::Open) {
+                                    save_keys(ctx, &stored);
+                                }
                             } else {
                                 joined = None;
                                 if fresh {
@@ -867,6 +993,9 @@ fn serve_radio(
                     }
                     None => false,
                 };
+                if dropped {
+                    save_keys(ctx, &stored);
+                }
                 out[0] = scan::reply::OK;
                 out[1] = dropped as u8;
                 2

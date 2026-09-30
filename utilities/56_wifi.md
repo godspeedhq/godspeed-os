@@ -478,18 +478,25 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
   the one JOINED LONGEST AGO is replaced. The number is a bound (CLAUDE.md §26.6) chosen so that nobody
   reaches it, not a fit to the 16 MiB the driver may use - a table that grew to fill what was available
   would be the elastic growth §26.6.1 says to resist, and its limit would be readable nowhere.
-- **Not on disk, on purpose.** No `fs` under a join; no "not encrypted at rest" caveat; no network name of
-  the operator's written to a card. The table dies with the driver - a reboot, a crash, a `kill`, a
-  `chaos` run, ANY respawn empties it, and the respawned driver is off the network besides, since its
-  bring-up resets the radio - and `wifi join` simply asks again. **Decided by the operator on
-  2026-09-29, in these words: "if anything restarts that driver, the user will put in their creds again.
-  Better that than the kernel crashing."** That is the constitution's own ranking (CLAUDE.md §25):
-  nothing above the kernel may be the thing that must survive, and a key that had to survive would be
-  exactly that. Persistence across restarts is a later slice, on top of this one, through `fs`: a respawned
-  driver reads its keys back and the question above goes away. Its shape is already fixed by this design -
-  the in-memory table stays the working set, disk is where it is loaded from and written to, and where `fs`
-  is absent or mid-restart the driver runs on the table alone, exactly as it does today. Its caveats (not
-  encrypted at rest; network names on the card) are stated when it is built, not before.
+- **On disk since 2026-09-30, in `/wifi.keys`, by the operator's decision** - *"save passphrase on
+  filesystem so that when the machine starts up, if there's wifi, it auto joins ... and ready to go"*,
+  with the exposure named and accepted: *"if I were to unplug the usbstick and put it on another machine,
+  that machine will have access to wifi passphrase (I'm ok with that for now)."* What the file holds is the
+  DERIVED KEY of each network, never the passphrase text: it joins the network exactly as the passphrase
+  would, so the card's holder can join it, but it does not reveal the passphrase itself, which people reuse
+  elsewhere. Network names are in plain text. Nothing is encrypted at rest - there is no per-machine secret
+  to encrypt with, and pretending otherwise would be a silent substitution (CLAUDE.md §26.4).
+  The in-memory table stays the working set: the file is loaded once when the radio comes up and written
+  after every change to the table (a join that added or re-ordered a key, a `forget`); where `fs` is absent
+  or mid-restart the driver retries a bounded number of times, says so, and runs on the table alone, as it
+  did before. At most 48 networks are saved, most recently used first. Open networks hold no key and are not
+  saved. The previous decision - the table dying with the driver, *"better that than the kernel crashing"* -
+  still governs the CRASH case: nothing above the kernel must survive, and a respawned driver reads the file
+  back rather than carrying anything across its own death.
+- **At boot the radio joins the network it last joined**, from the file, without being asked, and the cable
+  still wins for the link. The log says `joining the network last joined, from /wifi.keys`, then the same
+  lines a `wifi join` prints; if that network is out of range or refuses, `not joined` and the prompt is
+  yours. `wifi radio on` after `radio off` does the same from memory (section 2).
 - **`wifi join <ssid>` asks for a passphrase only when one is needed.** The shell sends the name
   alone first; the driver joins with the stored key if the slot holds that name, joins open if the last
   sweep heard the network as open, and otherwise answers *needs a passphrase* - at which point, and only
