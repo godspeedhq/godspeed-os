@@ -70,6 +70,7 @@ clock at all.
 
 | File | Lines | Why |
 |------|-------|-----|
+| `arch/aarch64/mod.rs` | 70 -> 71 (+1) | `hw_random` (2026-09-30): the BCM2711 RNG200 behind `InspectKernel` query 19 - one block of 32-bit volatile reads and writes of six registers at a fixed address inside the Device-nGnRnE peripheral window, through `mmio()` so it holds on both sides of the jump to the high half. Registers, masks and the restart sequence are Linux's `iproc-rng200` quoted at the function (26.14). Enabled once behind an atomic swap; the restart runs only on a fail bit the block reported, once per read as Linux allows; the wait is a bound in reads of the count register and returns `None` rather than holding the core. No kernel memory is touched. It replaces a stub that returned `None` on every call, which left the wifi driver hashing its handshake nonce from a cycle counter (`docs/wifi.md` 40). |
 | `arch/aarch64/sdio.rs` | 2 -> 3 (+1) | `route_pins_to_arasan` - a read-modify-write of the BCM2711 GPIO block's `GPFSEL3` and `GPIO_PUP_PDN_CNTRL_REG2`, touching only GPIO34-39's fields in each, on the single-threaded boot path, through the kernel's Device peripheral mapping (`mmio()`, so it holds on both sides of the jump to the high half). One block covering both registers plus the read-back that is logged before either write; it carries its own SAFETY comment. No allocation, no loop bound to anything device-supplied, and the six pins are a compile-time range. |
 
 ---
@@ -2548,7 +2549,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 70 | permitted |
+| arch/aarch64/mod.rs | 71 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |

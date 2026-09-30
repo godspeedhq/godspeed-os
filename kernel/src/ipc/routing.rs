@@ -341,9 +341,29 @@ fn enqueue_locked(
     check_live(&table[idx], cap_gen)?;
 
     if let Some(slot) = table[idx].blocked_receiver.take() {
-        // Queue was empty; a receiver was waiting - deliver directly.
-        table[idx].queue.enqueue(msg).ok();
-        return Ok(Some(slot));
+        match table[idx].queue.enqueue(msg) {
+            // The usual case: the queue was empty, a receiver was waiting - deliver and wake it.
+            Ok(()) => return Ok(Some(slot)),
+            Err(msg) => {
+                // A blocked receiver whose queue is FULL. Impossible on a plain `recv`, which blocks only
+                // on an empty queue - and routine on a `Call` (§8.2): the caller waits for one specific
+                // reply while every other message sent to it fills its queue behind it. This branch used
+                // to `.ok()` the failed enqueue and return `Ok` - the message dropped, the sender told it
+                // was delivered, the receiver woken for nothing. That is a silent fallback at the kernel
+                // boundary (invariant 12; §21), seen on the Pi 4 as `nic-driver BlockRecv 16/16!` with
+                // every exchange timing out at exactly its bound (`backlog/65`). The interrupt path
+                // (`enqueue_from_interrupt`) already put the receiver back and reported the loss; this,
+                // the path every userspace `send` takes, did not. The receiver is still waiting, so it
+                // stays recorded as blocked; the sender is refused exactly as it is below, and recorded
+                // as blocked if it asked to be.
+                table[idx].blocked_receiver = Some(slot);
+                if let Some(s) = blocked_sender_slot {
+                    table[idx].blocked_sender = Some(s);
+                    table[idx].pending_send   = Some(msg);
+                }
+                return Err(IpcError::QueueFull);
+            }
+        }
     }
 
     match table[idx].queue.enqueue(msg) {
@@ -615,8 +635,18 @@ pub fn enqueue_from_kernel_blocking(
         return Err(IpcError::EndpointDead);
     }
     if let Some(slot) = table[idx].blocked_receiver.take() {
-        table[idx].queue.enqueue(msg).ok();
-        return Ok(Some(slot));
+        match table[idx].queue.enqueue(msg) {
+            Ok(()) => return Ok(Some(slot)),
+            Err(msg) => {
+                // A blocked receiver whose queue is full - a `Call` waiting behind a full inbox (see
+                // `enqueue_locked`, `backlog/65`). The receiver keeps waiting; the writer is blocked
+                // exactly as it is on the plain full path below.
+                table[idx].blocked_receiver = Some(slot);
+                table[idx].blocked_sender = Some(sender_slot);
+                table[idx].pending_send = Some(msg);
+                return Err(IpcError::QueueFull);
+            }
+        }
     }
     match table[idx].queue.enqueue(msg) {
         Ok(()) => Ok(None),

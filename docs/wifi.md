@@ -2955,7 +2955,8 @@ after any answer. Nothing else produces that pattern.
 `hw_random` is a stub. Until it is not, the nonce is SHA-1 over the cycle counter, the monotonic clock, the
 access point's nonce and our address, and the driver logs that sentence on every handshake. The Pi 4 has an
 RNG (`iproc-rng200`, five registers, read from Linux's driver); wiring it into `arch/aarch64` is the next
-kernel change and is small.
+kernel change and is small. *Done 2026-09-30: `arch/aarch64::hw_random` reads the RNG200 behind query 19,
+and the driver's fallback and its log line remain for the day the block answers nothing.*
 
 Not yet run on hardware. What the first boot must show is in the spec's status section. *(It was run
 that evening and refused the key by two bytes - "The first run", above - and joined the next morning;

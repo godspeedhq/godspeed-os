@@ -1291,7 +1291,93 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
 pub fn net_frame_tx(_frame: &[u8]) -> bool {
     false
 }
-// No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
+/// One 32-bit word from the BCM2711's hardware random number generator - the RNG200 block, `rng@7e104000`
+/// in the device tree, `iproc-rng200` in Linux - or `None` when it has produced nothing inside a bounded
+/// wait or is locked out and one reset did not clear it. Serves `InspectKernel` query 19; the wifi
+/// driver's handshake nonce is what asked for it (`docs/wifi.md` 40: until this existed the nonce was
+/// hashed from the cycle counter and the driver said so on every join).
+///
+/// Registers and sequence as Linux's driver names them (26.14: the silicon's requirement, not its model):
+/// `CTRL` +0x00 (bits 0x1FFF are the generator enable field, 1 = on), `RNG_SOFT_RESET` +0x04 and
+/// `RBG_SOFT_RESET` +0x08 (write 1 then 0), `INT_STATUS` +0x18 (0x8000_0000 master-fail lockout, 0x20
+/// NIST fail; writing clears), `FIFO_DATA` +0x20, `FIFO_COUNT` +0x24 (low byte = words waiting). Linux
+/// allows one restart per read on a fail bit and then gives up; so does this. The block is inside the
+/// 0xFC00_0000+ window `mmu.rs` maps Device-nGnRnE, and is reached through `mmio()` so it holds on both
+/// sides of the jump to the high half.
+///
+/// The wait is a bound in READS of the count register, not a duration: it is there so a block that never
+/// fills - unclocked, or absent on a board this feature was built for by mistake - returns `None` rather
+/// than holding the core, and `None` is the honest answer the caller already handles.
+#[cfg(feature = "pi4")]
+pub fn hw_random() -> Option<u32> {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    const RNG200_BASE: usize = 0xFE10_4000;
+    const CTRL: usize = 0x00;
+    const RNG_SOFT_RESET: usize = 0x04;
+    const RBG_SOFT_RESET: usize = 0x08;
+    const INT_STATUS: usize = 0x18;
+    const FIFO_DATA: usize = 0x20;
+    const FIFO_COUNT: usize = 0x24;
+    const CTRL_RBGEN_MASK: u32 = 0x0000_1FFF;
+    const CTRL_ENABLE: u32 = 0x0000_0001;
+    const INT_MASTER_FAIL_LOCKOUT: u32 = 0x8000_0000;
+    const INT_NIST_FAIL: u32 = 0x0000_0020;
+    const FIFO_COUNT_MASK: u32 = 0x0000_00FF;
+    /// Reads of the count register before giving up. A word is ready within microseconds when the block
+    /// runs at all; this is thousands of times that.
+    const WAIT_READS: u32 = 200_000;
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    // SAFETY: the RNG200's registers, at a fixed BCM2711 address inside the Device-nGnRnE peripheral
+    // window `mmu.rs` maps, through `mmio()` like every other peripheral in this file. Each access is a
+    // 32-bit volatile read or write of one register the datasheet (Linux's driver, quoted above) defines;
+    // no memory the kernel owns is touched. The enable is done once (the swap) and the restart sequence
+    // only on a fail bit the block itself reported. Two cores calling at once each read their own word
+    // from the FIFO; the block serialises the FIFO pop. Every loop is bounded.
+    unsafe {
+        let ctrl = mmio(RNG200_BASE + CTRL) as *mut u32;
+        let rng_reset = mmio(RNG200_BASE + RNG_SOFT_RESET) as *mut u32;
+        let rbg_reset = mmio(RNG200_BASE + RBG_SOFT_RESET) as *mut u32;
+        let int_status = mmio(RNG200_BASE + INT_STATUS) as *mut u32;
+        let fifo_data = mmio(RNG200_BASE + FIFO_DATA) as *const u32;
+        let fifo_count = mmio(RNG200_BASE + FIFO_COUNT) as *const u32;
+
+        if !ENABLED.swap(true, Ordering::Relaxed) {
+            ctrl.write_volatile((ctrl.read_volatile() & !CTRL_RBGEN_MASK) | CTRL_ENABLE);
+        }
+        let mut restarted = false;
+        let mut reads = 0u32;
+        loop {
+            let status = int_status.read_volatile();
+            if status & (INT_MASTER_FAIL_LOCKOUT | INT_NIST_FAIL) != 0 {
+                if restarted {
+                    return None;
+                }
+                restarted = true;
+                // `iproc_rng200_restart`: disable, clear every status bit, RBG reset, RNG reset, enable.
+                ctrl.write_volatile(ctrl.read_volatile() & !CTRL_RBGEN_MASK);
+                int_status.write_volatile(0xFFFF_FFFF);
+                rbg_reset.write_volatile(1);
+                rbg_reset.write_volatile(0);
+                rng_reset.write_volatile(1);
+                rng_reset.write_volatile(0);
+                ctrl.write_volatile((ctrl.read_volatile() & !CTRL_RBGEN_MASK) | CTRL_ENABLE);
+                continue;
+            }
+            if fifo_count.read_volatile() & FIFO_COUNT_MASK != 0 {
+                return Some(fifo_data.read_volatile());
+            }
+            reads += 1;
+            if reads > WAIT_READS {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+/// Without the `pi4` feature this port names no board, so there is no RNG to reach. `None` is the honest
+/// answer and the caller (query 19) already reports it as unavailable.
+#[cfg(not(feature = "pi4"))]
 pub fn hw_random() -> Option<u32> { None }
 
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
