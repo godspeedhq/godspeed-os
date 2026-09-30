@@ -1,6 +1,8 @@
 # 64. The wifi driver does not answer a group-key rekey, so the link drops at the access point's rekey interval
 
-**Status: OPEN - recorded with phase 5 rather than closed (CLAUDE.md 26.7).**
+**Status: OPEN, narrowed 2026-09-30 - the GROUP-key half is BUILT (`frames::group_rekey`, awaiting the first
+rekey on hardware to be closed); the PAIRWISE half (an access point restarting the four-way handshake after
+the join) is what remains.**
 **Opened:** 2026-09-29, with phase 5 of `docs/wifi.md` (the frame path).
 
 ## What happens
@@ -25,19 +27,26 @@ without its up bit, or a deauthentication) and forgets the join loudly, so `wifi
 and `net` says the link is down; nothing hangs and nothing pretends. `wifi join <ssid>` rejoins with the
 key it holds.
 
+## What was built (2026-09-30)
+
+The join keeps `join::Keys` - the KCK, the KEK, the last replay counter and our address - for the life of
+the association, zeroed on leave, radio off, a dropped link and at the start of the next join. The frame
+pull hands any EAPOL-Key frame that arrives after the join to `frames::group_rekey`, which follows
+`ieee80211_recv_rsn_group_msg1` step by step: not pairwise, `KEYMIC | KEYACK`, replay above the last
+accepted, MIC under the KCK, key data `ENCRYPTED` and unwrapped under the KEK, the GTK KDE found, the key
+installed FIRST (an acknowledgement for a key the firmware refused would tell the access point to use a
+key we do not have), then `ieee80211_send_group_msg2`'s frame: `KEYMIC | SECURE`, the replay copied, no
+key data, signed. Every refusal is logged with its reason. `docs/wifi.md` 42.
+
 ## What closing it takes
 
-- Keep the KCK (and the KEK) after the join, per joined network, in the driver's memory alongside the
-  PMK - about 32 bytes more per credential slot.
-- In `frames::pull`, recognise the group-key message 1 (`info` with `GROUP` set and `PAIRWISE` clear,
-  `KEYACK | KEYMIC | ENCRYPTED`), verify its MIC with the KCK, unwrap its key data with the KEK, find the
-  GTK KDE (`eapol::find_gtk` already does this for message 3 of the four-way), install it with
-  `ctrl::install_key` at its key id with `PRIMARY_KEY`, and send message 2 (`GROUP | KEYMIC | SECURE`,
-  empty, MIC'd) with `eapol::build_key_frame`. OpenBSD's `ieee80211_recv_group_msg1` and
-  `ieee80211_send_group_msg2` (`net80211/ieee80211_pae_input.c`, `ieee80211_pae_output.c`) are the
-  reference, and every primitive it needs is already in `eapol.rs` and `crypto.rs`.
+- ~~The group half~~ - built, above. To CLOSE it: one rekey observed on hardware, the log showing
+  `group key N re-installed and acknowledged (replay R) - the access point rekeyed` and the link staying
+  up past it.
 - The PTK rekey (a full four-way handshake initiated by the access point after the join) is the same
-  work one step larger: `join.rs`'s message-1 path run from the pull rather than from a join.
+  work one step larger: `join.rs`'s message-1 path run from the pull rather than from a join, with the
+  PMK - which the credential slot holds - and a fresh SNonce. Seen as `the access point began a NEW
+  four-way handshake after the join` in the log, once per join.
 
 ## Why it is recorded and not done in the same change
 

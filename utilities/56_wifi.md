@@ -43,6 +43,11 @@ What every verb does, and what was seen:
 
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
+- **The group-key rekey is answered (built 2026-09-30, `docs/wifi.md` 42) and not yet seen on hardware** -
+  it happens when the access point decides, commonly hourly, and cannot be provoked. A pairwise rekey (the
+  access point restarting the four-way handshake) is still not answered; the log says so once, and `wifi
+  join` recovers the link (`backlog/64`).
+
 - **The frame path is hardware-verified through DHCP over the radio (2026-09-30, 08:17) and not yet
   through a `ping` over it.** The first boot configured the stack over the radio on the guest network's
   own subnet - discover, offer, acknowledge, ARP and an echo to the gateway, all through the radio - and

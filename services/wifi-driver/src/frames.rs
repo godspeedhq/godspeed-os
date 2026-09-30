@@ -11,6 +11,13 @@
 //! deauthentication, means the access point dropped us, and the join is forgotten then and there rather
 //! than at the next `wifi status`.
 //!
+//! The pull is also where the access point's GROUP-KEY REKEY is answered (`docs/wifi.md` 42). A WPA2
+//! access point replaces the group key on a timer - an EAPOL-Key frame with the new key wrapped under the
+//! KEK - and a station that does not answer is deauthenticated at its retry budget. The join keeps the
+//! confirmation and encryption halves of its PTK (`join::Keys`) for exactly this; the frame is verified,
+//! unwrapped, the key installed and the acknowledgement sent, all with the same primitives the four-way
+//! handshake used, and each step from OpenBSD's `ieee80211_recv_rsn_group_msg1` / `ieee80211_send_group_msg2`.
+//!
 //! Transmit is `ctrl::send_data`, the path the handshake proved. Credit for it comes back on RECEIVED
 //! frames (`Session::tx_max_seq`), so a stack that only sends would run dry; a dry window pulls first.
 
@@ -18,8 +25,9 @@ use godspeed_sdk::ServiceContext;
 
 use crate::backplane::Window;
 use crate::ctrl::{self, Session};
+use crate::eapol::{self, info};
 use crate::host::Host;
-use crate::join::EVENT_MSG_LINK;
+use crate::join::{Keys, EVENT_MSG_LINK};
 use crate::scan::{self, code, ev, CHANNEL_DATA, CHANNEL_EVENT, CHANNEL_MASK};
 
 /// `[0x10]` -> `[0x10, ok, mac(6), link]`.
@@ -103,29 +111,37 @@ impl RxQueue {
 pub struct Pulled {
     /// Data frames queued for the stack.
     pub data: u32,
-    /// EAPOL-Key frames that arrived after the join: the access point rekeying the group key. Counted
-    /// here and answered nowhere yet (`backlog/64`).
-    pub rekey: u32,
+    /// Group-key rekeys answered: the new group key verified, installed and acknowledged.
+    pub rekeyed: u32,
+    /// Group-key frames that could not be answered - no keys held, a stale replay counter, a bad MIC, key
+    /// data that would not unwrap, no group key inside, or a refused install. Each is logged where it
+    /// happens; the count is for the caller.
+    pub rekey_failed: u32,
+    /// EAPOL-Key frames of the PAIRWISE kind after the join: the access point starting a new four-way
+    /// handshake. Not answered here (`backlog/64`, the half that remains).
+    pub pairwise_after_join: u32,
     /// The link went down: `(event code, reason)`. A `LINK` event without the up bit, or a
     /// deauthentication or disassociation, in either direction.
     pub dropped_link: Option<(u32, u32)>,
 }
 
-/// Read what the chip has waiting, queueing data frames and watching the link.
+/// Read what the chip has waiting, queueing data frames, answering a group-key rekey, and watching the
+/// link.
 ///
 /// The same walk as the join loop's: every frame is noted for the trace and stats, split into its
 /// sub-frames if it is a superframe, and each one is either a DATA frame (an ethernet frame behind a BDC
-/// header - queued, unless it is EAPOL) or an EVENT (read for the link). Anything else is counted by
-/// `note_frame` and left.
+/// header - queued, unless it is EAPOL, which is the rekey path) or an EVENT (read for the link). Anything
+/// else is counted by `note_frame` and left.
 pub fn pull(
     h: &Host,
     w: &mut Window,
     s: &mut Session,
     q: &mut RxQueue,
     frame: &mut [u8; ctrl::FRAME],
+    mut keys: Option<&mut Keys>,
     ctx: &ServiceContext,
 ) -> Pulled {
-    let mut got = Pulled { data: 0, rekey: 0, dropped_link: None };
+    let mut got = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_after_join: 0, dropped_link: None };
     let mut reads = 0u32;
     while reads < PULL_MAX_READS && q.has_room() {
         let f = match ctrl::read_frame(h, w, frame, ctx) {
@@ -136,6 +152,12 @@ pub fn pull(
         s.note_frame(ctx, &f, &frame[..], false);
         let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
         let nsubs = ctrl::subframes(&f, &frame[..], s.glom_descriptor(), &mut subs, ctx);
+        // The rekey answers with frames of its own, and `send_data` needs the session - so an EAPOL frame
+        // is copied out of the read buffer and handled after the walk, once per pull. One is all a rekey
+        // ever carries; a second in the same read is left for the next pull by being counted, not lost:
+        // the access point retries.
+        let mut eapol_frame = [0u8; eapol::MAX_KEY_FRAME];
+        let mut eapol_len = 0usize;
         for sub in subs.iter().take(nsubs) {
             let channel = sub.chanflag & CHANNEL_MASK;
             let body = &frame[sub.off..sub.off + sub.len];
@@ -149,8 +171,11 @@ pub fn pull(
                     continue;
                 }
                 let ethertype = u16::from_be_bytes([eth_frame[ev::ETHERTYPE], eth_frame[ev::ETHERTYPE + 1]]);
-                if ethertype == crate::eapol::ETHERTYPE_EAPOL {
-                    got.rekey += 1;
+                if ethertype == eapol::ETHERTYPE_EAPOL {
+                    if eapol_len == 0 && eth_frame.len() <= eapol_frame.len() {
+                        eapol_frame[..eth_frame.len()].copy_from_slice(eth_frame);
+                        eapol_len = eth_frame.len();
+                    }
                     continue;
                 }
                 if q.push(eth_frame) {
@@ -172,6 +197,130 @@ pub fn pull(
                 }
             }
         }
+        if eapol_len > 0 {
+            match group_rekey(h, w, s, &eapol_frame[..eapol_len], keys.as_deref_mut(), ctx) {
+                Rekey::Answered => got.rekeyed += 1,
+                Rekey::Refused => got.rekey_failed += 1,
+                Rekey::Pairwise => got.pairwise_after_join += 1,
+                Rekey::NotAKey => {}
+            }
+        }
     }
     got
+}
+
+enum Rekey {
+    Answered,
+    Refused,
+    Pairwise,
+    NotAKey,
+}
+
+/// Answer one EAPOL-Key frame that arrived after the join - `ieee80211_eapol_key_input`'s dispatch, and
+/// `ieee80211_recv_rsn_group_msg1` for the case that matters:
+///
+/// ```c
+/// } else {                         /* Group Key Handshake */
+///     if (!(info & EAPOL_KEY_KEYMIC)) goto done;
+///     if (info & EAPOL_KEY_KEYACK) ieee80211_recv_rsn_group_msg1(ic, key, ni);
+/// }
+/// ...
+/// if (BE_READ_8(key->replaycnt) <= ni->ni_replaycnt) return;         /* replay */
+/// if (ieee80211_eapol_key_check_mic(key, ni->ni_ptk.kck) != 0) return;
+/// if (!(info & EAPOL_KEY_ENCRYPTED) || ieee80211_eapol_key_decrypt(key, ni->ni_ptk.kek) != 0) return;
+/// ... find the GTK KDE, kid = gtk[6] & 3, install with IEEE80211_KEY_GROUP ...
+/// (void)ieee80211_send_group_msg2(ic, ni, NULL);   /* info = KEYMIC | SECURE, replay copied, no data */
+/// ```
+fn group_rekey(
+    h: &Host,
+    w: &mut Window,
+    s: &mut Session,
+    eth_frame: &[u8],
+    keys: Option<&mut Keys>,
+    ctx: &ServiceContext,
+) -> Rekey {
+    let key = match eapol::describe(eth_frame, ctx) {
+        Some(k) => k,
+        None => return Rekey::NotAKey,
+    };
+    if key.info & info::PAIRWISE != 0 {
+        return Rekey::Pairwise;
+    }
+    if key.info & info::KEYMIC == 0 || key.info & info::KEYACK == 0 {
+        // A group frame that is not message 1 of the group handshake: nothing to answer.
+        return Rekey::NotAKey;
+    }
+    let keys = match keys {
+        Some(k) => k,
+        None => {
+            ctx.log("wifi-driver: a group-key rekey arrived and this driver holds no keys for it (an open network, or a join that left none) - not answered");
+            return Rekey::Refused;
+        }
+    };
+    if key.replay <= keys.replay {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a group-key frame with replay counter {} at or below the last accepted {} - a replay, ignored",
+            key.replay, keys.replay
+        ));
+        return Rekey::Refused;
+    }
+    let eapol_body = &eth_frame[ev::ETHHDR..];
+    if !eapol::check_mic(eapol_body, &keys.kck) {
+        ctx.log("wifi-driver: a group-key frame whose MIC does not verify under our KCK - ignored");
+        return Rekey::Refused;
+    }
+    if key.info & info::ENCRYPTED == 0 {
+        ctx.log("wifi-driver: a group-key frame with its key data in the clear - refused");
+        return Rekey::Refused;
+    }
+    let wrapped = &eth_frame[key.key_data_at..key.key_data_at + key.key_data_len];
+    let mut key_data = [0u8; 512];
+    if wrapped.len() < 24 || wrapped.len() > key_data.len() + 8
+        || !crate::crypto::aes_key_unwrap(&keys.kek, wrapped, &mut key_data)
+    {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a group-key frame's {} bytes of key data did not unwrap under our KEK - refused",
+            wrapped.len()
+        ));
+        return Rekey::Refused;
+    }
+    let plain = &key_data[..wrapped.len() - 8];
+    let (kid, gtk_tx, gtk) = match eapol::find_gtk(plain) {
+        Some(g) => g,
+        None => {
+            ctx.log("wifi-driver: a group-key frame carried no group key - refused");
+            return Rekey::Refused;
+        }
+    };
+    if gtk.len() != 16 {
+        ctx.log_fmt(format_args!("wifi-driver: the new group key is {} bytes, not the 16 of CCMP - refused", gtk.len()));
+        return Rekey::Refused;
+    }
+    let mut gtk16 = [0u8; 16];
+    gtk16.copy_from_slice(gtk);
+    // Install FIRST, then acknowledge: an acknowledgement for a key the firmware refused would tell the
+    // access point to start using a key we do not have.
+    if !ctrl::install_key(h, w, s, kid as u32, &gtk16, None, ctx) {
+        ctx.log("wifi-driver: the firmware refused the new group key - the rekey is not acknowledged");
+        return Rekey::Refused;
+    }
+    // The acknowledgement is an ethernet header and a 99-byte key descriptor with no key data: 113 bytes.
+    let mut tx = [0u8; 128];
+    let n = eapol::build_key_frame(
+        &mut tx, &key.from, &keys.mac,
+        info::KEYMIC | info::SECURE,
+        key.replay, &[0u8; 32], &[], Some(&keys.kck),
+    );
+    if n == 0 || !ctrl::send_data(h, w, s, &tx[..n], ctx) {
+        ctx.log("wifi-driver: the group-key acknowledgement could not be sent - the access point will retry");
+        return Rekey::Refused;
+    }
+    keys.replay = key.replay;
+    ctx.log_fmt(format_args!(
+        "wifi-driver: group key {} re-installed{} and acknowledged (replay {}) - the access point rekeyed",
+        kid,
+        if gtk_tx { " (tx)" } else { "" },
+        key.replay
+    ));
+    Rekey::Answered
 }

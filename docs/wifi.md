@@ -3088,3 +3088,47 @@ Plug the cable back: `the cable carries the link; the radio stands by`, another 
 dance, and `ping` answers over the cable. If the address change is logged but DHCP gets no offer over the
 radio, the first suspect is TX credit (`wifi debug stats`, `tx_no_credit`) and the second is the source
 address the frames carry.
+
+## 42. The group-key rekey, answered (2026-09-30)
+
+Phase 5's first boot (section 41) proved the link and left one thing that would take it down again on a
+timer: a WPA2 access point replaces its group temporal key periodically - an hour on many routers - and
+does it with a two-message handshake the station must answer, or be deauthenticated. The driver counted
+those frames and said what would happen. Now it answers them.
+
+**What the join keeps.** `join::Keys`: the KCK and KEK halves of the pairwise transient key, the last
+replay counter the access point used, and our address. Not the temporal key - that lives in the firmware
+from the moment `wsec_key` installs it and is never needed again by the host. Zeroed on `leave`, on
+`radio off`, on a dropped link, and at the start of the next join (`join::forget`). Forty bytes, on the
+serve loop's stack, for the life of one association.
+
+**What the pull does with an EAPOL-Key frame** (`frames::group_rekey`, each step from OpenBSD's
+`ieee80211_recv_rsn_group_msg1`, quoted at the function):
+
+1. Pairwise bit set: not a group rekey but a new four-way handshake, counted and said once - the half of
+   `backlog/64` that remains.
+2. `KEYMIC` and `KEYACK` both set, or it is not message 1 and there is nothing to answer.
+3. The replay counter must exceed the last accepted (`ni_replaycnt`); at or below is a replay, ignored.
+4. The MIC must verify under our KCK.
+5. The key data must be `ENCRYPTED` and must unwrap under our KEK (RFC 3394, the same unwrap as message 3
+   of the four-way).
+6. The GTK KDE is found inside (`eapol::find_gtk`, the same as message 3), 16 bytes for CCMP.
+7. **Install first, then acknowledge.** An acknowledgement for a key the firmware had refused would tell
+   the access point to start using a key this station does not hold.
+8. The acknowledgement is `ieee80211_send_group_msg2`'s frame: `KEYMIC | SECURE`, the access point's
+   replay counter copied back, an empty key data field, signed under the KCK. The replay counter is then
+   remembered.
+
+Every refusal logs its reason. The frame is copied out of the read buffer and handled after the walk of
+that read, once per pull, because answering needs the session that the walk is borrowing; an access
+point retries, so a second key frame in one read is not lost by being left for the next pull.
+
+**Not yet run on hardware**, because it cannot be made to happen: the access point decides when to rekey.
+What the log will show, when it does:
+
+```
+wifi-driver: group key N re-installed and acknowledged (replay R) - the access point rekeyed
+```
+
+and `ping` continuing past it. If instead the link drops at the router's interval with a refusal logged
+just before, the refusal names the step.

@@ -106,6 +106,31 @@ pub enum Outcome {
     HandshakeUnimplemented,
 }
 
+/// What a WPA2 join KEEPS for the life of the association, and nothing more: the confirmation and
+/// encryption halves of the pairwise transient key, the last replay counter the access point used, and
+/// the two addresses the answers carry. The temporal key itself lives in the firmware from the moment it
+/// is installed and is not kept here. These exist for one reason - the access point rekeys the group key
+/// on a timer and each rekey is a signed, wrapped frame that must be verified and answered
+/// (`frames::group_rekey`) - and they are zeroed the moment the association ends (`forget`).
+pub struct Keys {
+    pub kck: [u8; 16],
+    pub kek: [u8; 16],
+    /// The highest replay counter accepted; a frame at or below it is a replay (`ni_replaycnt`).
+    pub replay: u64,
+    /// Our address, for the frames we send.
+    pub mac: [u8; 6],
+}
+
+/// Zero and drop the kept keys. Called on leave, radio off, a dropped link, and at the start of a join.
+pub fn forget(keys: &mut Option<Keys>) {
+    if let Some(k) = keys.as_mut() {
+        k.kck.fill(0);
+        k.kek.fill(0);
+        k.replay = 0;
+    }
+    *keys = None;
+}
+
 /// What the station joins WITH. The passphrase never reaches this module: it is turned into the pairwise
 /// master key the moment it arrives (`crypto::psk`) and only the key is kept.
 #[derive(Clone, Copy)]
@@ -160,8 +185,11 @@ pub fn join(
     s: &mut Session,
     ssid: &[u8],
     secret: Secret,
+    keys: &mut Option<Keys>,
     ctx: &ServiceContext,
 ) -> Outcome {
+    // Whatever the last association left is gone before the next one starts.
+    forget(keys);
     if ssid.is_empty() || ssid.len() > MAX_SSID {
         ctx.log("wifi-driver: join refused before sending - the name length is out of range");
         return Outcome::Failed;
@@ -395,6 +423,8 @@ pub fn join(
                         kid,
                         if gtk_tx { " (tx)" } else { "" }
                     ));
+                    // Kept for the rekeys to come (`Keys`); the PTK on this stack goes with the frame.
+                    *keys = Some(Keys { kck: p.kck, kek: p.kek, replay: key.replay, mac: our_mac });
                     return Outcome::Joined;
                 }
                 ctx.log_fmt(format_args!(

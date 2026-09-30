@@ -141,12 +141,17 @@ fn serve_radio(
     // and on this stack; the address is asked of the chip once; the rekey count is for the log.
     let mut rxq = frames::RxQueue::new();
     let mut link_mac: Option<[u8; 6]> = None;
+    // Pairwise rekeys seen after the join (the unanswered half of `backlog/64`), for one log line.
     let mut rekey_seen: u32 = 0;
-    /// What a pull saw about the link, applied to the driver's memory of the join - here, so the frame
-    /// module need not know what a join is.
+    // The keys a WPA2 join keeps for the rekeys to come (`join::Keys`); `None` on an open network and
+    // after any end of the association.
+    let mut keys: Option<join::Keys> = None;
+    /// What a pull saw, applied to the driver's memory of the join - here, so the frame module need not
+    /// know what a join is.
     fn note_pull(
         p: &frames::Pulled,
         joined: &mut Option<([u8; join::MAX_SSID], u8)>,
+        keys: &mut Option<join::Keys>,
         rekey_seen: &mut u32,
         ctx: &ServiceContext,
     ) {
@@ -158,13 +163,16 @@ fn serve_radio(
                 ));
             }
             *joined = None;
+            join::forget(keys);
         }
-        if p.rekey > 0 {
+        if p.pairwise_after_join > 0 {
+            // The other half of `backlog/64`: a new four-way handshake, begun by the access point. Not
+            // answered; said once per join.
             let first = *rekey_seen == 0;
-            *rekey_seen = rekey_seen.wrapping_add(p.rekey);
+            *rekey_seen = rekey_seen.wrapping_add(p.pairwise_after_join);
             if first {
                 ctx.log(
-                    "wifi-driver: an EAPOL-Key frame arrived AFTER the join - the access point is rekeying the group                      key, which this driver does not answer yet; the link drops at its rekey interval and `wifi join`                      brings it back (backlog/64)",
+                    "wifi-driver: the access point began a NEW four-way handshake after the join (a pairwise                      rekey) - not answered yet; if it insists, the link drops and `wifi join` brings it back                      (backlog/64)",
                 );
             }
         }
@@ -340,6 +348,7 @@ fn serve_radio(
                 // and a stale belief here must not stop the operator leaving a network.
                 let _ = ctrl::disassoc(h, w, session, ctx);
                 joined = None;
+                join::forget(&mut keys);
                 rxq.clear();
                 out[0] = scan::reply::OK;
                 out[1] = was_joined as u8;
@@ -377,6 +386,7 @@ fn serve_radio(
                         let _ = ctrl::disassoc(h, w, session, ctx);
                     }
                     joined = None;
+                    join::forget(&mut keys);
                     if ctrl::radio_down(h, w, session, ctx) {
                         radio_on = false;
                         out[0] = scan::reply::OK;
@@ -474,6 +484,7 @@ fn serve_radio(
                         if joined.is_some() {
                             ctx.log("wifi-driver: the firmware reports no association - the remembered join is dropped");
                             joined = None;
+                            join::forget(&mut keys);
                         }
                         (false, [0u8; 6], 0, 0)
                     }
@@ -609,7 +620,7 @@ fn serve_radio(
                             1
                         }
                         Some(secret) => {
-                            let outcome = join::join(h, w, session, ssid, secret, ctx);
+                            let outcome = join::join(h, w, session, ssid, secret, &mut keys, ctx);
                             if outcome == join::Outcome::Joined {
                                 joined = Some((name_of(ssid), ssid_len as u8));
                                 joined_at_secs = ctx.epoch_secs_monotonic();
@@ -822,8 +833,8 @@ fn serve_radio(
                 if radio_on && joined.is_some() && sweep.is_none() && eth.len() >= scan::ev::ETHHDR {
                     if !session.tx_ok() {
                         // Credit comes back on received frames; a stack that only sends runs dry.
-                        let p = frames::pull(h, w, session, &mut rxq, &mut frame, ctx);
-                        note_pull(&p, &mut joined, &mut rekey_seen, ctx);
+                        let p = frames::pull(h, w, session, &mut rxq, &mut frame, keys.as_mut(), ctx);
+                        note_pull(&p, &mut joined, &mut keys, &mut rekey_seen, ctx);
                     }
                     if joined.is_some() {
                         sent = ctrl::send_data(h, w, session, eth, ctx);
@@ -837,8 +848,8 @@ fn serve_radio(
                 // The chip is read only when the queue is empty and the radio has a link to read.
                 out[0] = frames::OP_NET_RX;
                 if rxq.is_empty() && radio_on && joined.is_some() && sweep.is_none() {
-                    let p = frames::pull(h, w, session, &mut rxq, &mut frame, ctx);
-                    note_pull(&p, &mut joined, &mut rekey_seen, ctx);
+                    let p = frames::pull(h, w, session, &mut rxq, &mut frame, keys.as_mut(), ctx);
+                    note_pull(&p, &mut joined, &mut keys, &mut rekey_seen, ctx);
                 }
                 let n = rxq.pop(&mut out[3..]);
                 out[1..3].copy_from_slice(&(n as u16).to_le_bytes());

@@ -470,3 +470,6 @@ ieee80211_recv_4way_msg1           # OpenBSD net80211/ieee80211_pae_input.c - me
 ieee80211_send_4way_msg2           # OpenBSD net80211/ieee80211_pae_output.c - message 2: PAIRWISE|KEYMIC, the AP`s replay counter, the SNonce, the RSN element, MIC`d - external, 26.14
 ieee80211_send_4way_msg4           # OpenBSD net80211/ieee80211_pae_output.c - message 4: PAIRWISE|KEYMIC|SECURE, empty key data, MIC`d - external, 26.14
 ieee80211_send_eapol_key           # OpenBSD net80211/ieee80211_pae_output.c - the frame builder: ethernet header, descriptor version by cipher, key->len and paylen, then the MIC; eapol::build_key_frame is that - external, 26.14
+ieee80211_recv_rsn_group_msg1      # OpenBSD net80211 ieee80211_pae_input.c - the group-key message 1 receiver `frames::group_rekey` follows step by step - external, 26.14
+ieee80211_send_group_msg2          # OpenBSD net80211 ieee80211_pae_output.c - the group-key acknowledgement (KEYMIC | SECURE, replay copied, no key data) - external, 26.14
+ni_replaycnt                       # OpenBSD net80211 node field - the last accepted EAPOL replay counter; `join::Keys::replay` is its counterpart - external, 26.14
