@@ -90,16 +90,15 @@ fn serve_unavailable(ctx: &ServiceContext) -> ! {
     }
 }
 
-/// Serve the shell: sweeps as a state the loop advances, the cache, joins, keys, status, debug. Without
-/// a radio, every request is answered "radio down" - the same loud fact `serve_unavailable` gives, so a
-/// shell can never tell the two apart by waiting.
+/// Serve the shell and `nic-driver`: sweeps as a state the loop advances, the cache, joins, keys, status,
+/// debug - and the frame interface (`frames.rs`), over which the radio carries the stack's traffic when
+/// the cable is out. Without a radio, every request is answered "radio down" - the same loud fact
+/// `serve_unavailable` gives, so a shell can never tell the two apart by waiting.
 ///
-/// **What this does NOT do, recorded rather than faked (§26.7):** `utilities/56_wifi.md` rule 11 says
-/// that `q` at the prompt must stop the SCAN, not just the shell's interest in it. This loop is single-
-/// threaded and sits inside `collect` while the radio sweeps, so it cannot hear an abort until the sweep
-/// ends. The shell's `q` therefore abandons its wait while the radio finishes (about 2.6 s on hardware),
-/// and the late reply is dropped by the shell's request matching. Meeting rule 11 needs the collect loop
-/// to poll the endpoint between frames; that is real work and is written down here rather than half done.
+/// The loop never sits inside a sweep: `scan::step` advances it one frame at a time and `try_recv`
+/// answers requests between frames, which is what lets `q` stop a sweep (`utilities/56_wifi.md` rule 11)
+/// and `wifi list` answer during one. It DOES sit inside a join (`join::join`, a few seconds), and
+/// `nic-driver`'s bound on it is short for exactly that reason.
 fn serve_radio(
     ctx: &ServiceContext,
     h: &host::Host,

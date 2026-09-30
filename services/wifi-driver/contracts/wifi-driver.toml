@@ -22,23 +22,27 @@ hw_mmio     = ["0xfe300000+0x1000"]
 ipc_receive = ["wifi-driver"]
 log_write   = true
 #
-# NO `ipc_send`, and the omission is the point. Every other driver here declares `events` - the
-# observability sink - which turns automatic IPC tracing on. This service makes almost no IPC calls in
-# this phase, and everything it reports goes through `log_write` above, which reaches the kernel ring
-# and the serial line and depends on no service at all (§11.4). So the grant would buy nothing while
-# being standing authority a compromise inherits (§3.1, §26.9), and it would be a send cap with no
-# reacquisition path for a peer chaos restarts (Commandment IX). It arrives with the phase that has
-# traffic worth tracing.
+# NO `ipc_send`, and the omission is the point. This service SENDS nothing on its own: it answers - the
+# shell's `wifi` requests and `nic-driver`'s frame ops (0x10 INFO / 0x11 TX / 0x12 RX) - through the
+# reply cap each request carries, and everything it reports goes through `log_write` above, which
+# reaches the kernel ring and the serial line and depends on no service at all (§11.4). Every other
+# driver declares `events` for automatic IPC tracing; here the grant would be standing authority a
+# compromise inherits (§3.1, §26.9) and a send cap with no reacquisition path for a peer chaos restarts
+# (Commandment IX), for traffic that is traced from the other end (`nic-driver` measures every exchange).
 #
-# NO `hw_interrupt`, deliberately. The driver POLLS: every command in phase 1 rides the CMD line and
-# completes in microseconds, and the SDIO card interrupt is what a FIRMWARE-driven control channel needs
-# rather than what identification needs. Asking for a vector this service would not service is the
-# failure invariant 12 exists to prevent, and a capability granted to nobody's benefit is standing
-# authority a compromise inherits (§3.1, §26.9).
+# NO `hw_interrupt`, deliberately. The driver POLLS, and so does everything above it: control commands
+# complete in microseconds on the CMD line, the scan and the join read frames one at a time between
+# requests, and the data path is pulled - `nic-driver` asks on `net-stack`'s pace and each ask reads what
+# the chip has waiting (`frames::pull`). A frame the access point sends waits in the chip until then; a
+# card interrupt would let it be read sooner, and would be the first thing to add if that wait ever
+# shows in a measurement. Asking for a vector this service would not service is the failure invariant 12
+# exists to prevent, and a capability granted to nobody's benefit is standing authority a compromise
+# inherits (§3.1, §26.9).
 #
-# NO DMA arena either. CMD52 carries its single byte in the response on the command line; there is no
-# data transfer in this phase at all. The block transfers a firmware upload needs (CMD53) arrive with
-# that phase, and the arena with them.
+# NO DMA arena either, and this stays true: the firmware upload (CMD53, 600 KiB), every control frame
+# and every data frame go through the host controller's data port by programmed I/O. The SDIO host on
+# this board can master DMA; this driver does not ask it to, so it holds no physical memory to point a
+# device at (§6.4).
 
 [placement]
 # Core 3, which on this four-core board is the one the boot roster leaves quietest: the shell and the

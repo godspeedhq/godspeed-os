@@ -1670,3 +1670,65 @@ handed. It cost one boot, to the oldest bug in the notes: a peer spawned after y
 name before the first request has anywhere to go. Phase 3's deliverable - *`wifi list` lists the SSIDs in
 the room* - is met as written. Security stays `unknown` until the beacon's information elements are read,
 and quitting does not yet stop the radio's sweep; both are recorded in the driver rather than pretended.
+
+## 2026-09-29 to 2026-09-30 - The day the radio joined, and the cable learned to step aside
+
+The scan had shown the room. Joining a network in it was supposed to be the firmware's job - phase 4's
+row in the plan says "firmware-offloaded" - and the firmware said no, three ways: the switch that hands it
+the WPA2 handshake does not exist on this build. So the host runs the handshake, as OpenBSD's does, and
+the driver grew the cryptography a station needs and nothing more: SHA-1, HMAC, PBKDF2, the 802.11 PRF,
+AES-128 with a computed S-box, the RFC 3394 unwrap, every one checked against a published vector at boot.
+Then the four messages, each quoted from net80211 at the line where it is answered.
+
+### Two bytes, twice
+
+The first run of the handshake verified message 3 - which settles that the passphrase, the key derivation
+and the signature path were all right, since the access point's MIC is computed with a key derived from
+the same passphrase - and was refused at the key install. The key structure had been sized by adding up
+its fields: 162. `sizeof` is 164, because C pads a 4-aligned struct's tail, and the firmware checks
+`sizeof`. The operator had rechecked the passphrase several times; the log says it was never in question.
+The next morning the signal reading fell to the same lesson: ten bytes of fields, twelve of `sizeof`,
+refused for a day as `BADARG`. A hand count of a C struct cannot see the padding. Read `sizeof` off a
+compiler.
+
+### A key is kept only once it has joined
+
+The driver kept the derived key the moment the passphrase arrived, so a join that failed left behind a
+key nothing had proved, and the next `wifi join` used it without asking. The operator had to `forget`
+between every attempt. Now a typed passphrase becomes a key in a working buffer, enters the table after
+`JOINED` and not before, and is zeroed either way. Store on success, never on receipt.
+
+### The cable always wins
+
+With the join working the operator pulled the ethernet cable and expected `ping` to follow the radio. It
+did not, because nothing above the join existed - and when asked which link should carry the frames when
+both are there, the answer was five words: "cable always wins. unplug the cable, switch to wifi
+automatically." So the radio became the fifth backend of `nic-driver`, the link front end, over the same
+three frame ops the Pi 2's USB adapter answers, and the cable decides: while the PHY reports a link the
+frames go over it, when it does not they go to the radio if it is joined, and back when it returns.
+`net-stack` needed one rule the design had not foreseen - a link whose address changes is a different
+link, and a cable never did that - and re-configures when the address under it moves.
+
+### The first boot proved it and then went deaf
+
+Cable out, the stack configured itself over the radio on the first try: discover, offer, acknowledge, ARP,
+an echo to the gateway, all through the air. Then every exchange with the radio began timing out at
+exactly its bound, and `observe` showed the shape: `nic-driver` blocked with sixteen stale requests behind
+it, the radio idle with an empty queue. The radio was answering nothing because it had nothing to answer
+on: the driver had never released a reply cap, a task holds sixty-four, and from the fiftieth request on
+the kernel could install no more. Three lines. The `wifi` commands alone had never reached sixty-four in a
+boot; the stack's polling reached it in seconds. The same shape exposed two more things, both recorded:
+a one-second bound on the radio lets a caller's inbox fill behind the call, so it is a hundred
+milliseconds now; and the kernel, handed a message for a blocked receiver whose queue is full, drops it
+and says it was delivered - a silent fallback in the IPC path, held for the next kernel change.
+
+### Works beautifully
+
+The second boot: `ping` over the radio, 36 of 38 with the two lost being the switch itself, then none;
+cable in, a new lease, `ping` over the cable; out again, over the radio with no new join; twice round.
+The radio answers in under a millisecond. The operator's words were "Works beautifully (ethernet cable
+plugged and unplugged)", and the sentence after the join, which had four quote marks in it, was rewritten
+to have none. Later that day the driver learned to answer the access point's periodic group-key rekey,
+which would otherwise have taken the link down on the router's timer; it cannot be provoked and has not
+yet been seen. The network's name and the access point's addresses are in the operator's captures and
+not in this repository.

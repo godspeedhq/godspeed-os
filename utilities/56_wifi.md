@@ -41,6 +41,13 @@ What every verb does, and what was seen:
 - Absence is told apart from a wedge (section 5): no live `wifi-driver` means no radio; a live one that will
   not answer says that after a bounded wait, never a guess.
 
+- **The frame path, both ways - hardware-verified 2026-09-30, 08:50.** Cable out, `ping` over the radio
+  (36 of 38, the two lost being the switch itself, then 0 lost); cable in, the address change, a new
+  lease, `ping` over the cable; out again, over the radio with no new `wifi join`; twice round. `net`
+  said `link  up via wifi (the cable is out)` and `link  up via the cable`. The operator: "Works
+  beautifully". The first boot that morning had proved the same path through DHCP and then gone deaf to a
+  leaked reply cap (`docs/wifi.md` 41).
+
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
 - **The group-key rekey is answered (built 2026-09-30, `docs/wifi.md` 42) and not yet seen on hardware** -
@@ -48,20 +55,10 @@ What every verb does, and what was seen:
   access point restarting the four-way handshake) is still not answered; the log says so once, and `wifi
   join` recovers the link (`backlog/64`).
 
-- **The frame path is hardware-verified through DHCP over the radio (2026-09-30, 08:17) and not yet
-  through a `ping` over it.** The first boot configured the stack over the radio on the guest network's
-  own subnet - discover, offer, acknowledge, ARP and an echo to the gateway, all through the radio - and
-  then went deaf: the driver never reclaimed a reply cap, its table filled after some fifty requests, and
-  every request after that had nothing to be answered on (`docs/wifi.md` 41, "The first boot"). Fixed
-  the same morning. What the next boot must show: cable out, `ping 8.8.8.8` answers over the radio for
-  as long as it runs, and `net` says `link  up via wifi`.
-
-- **The WPA2 handshake is hardware-verified through message 4 (2026-09-29, 19:44) and not yet through the
-  key install.** Three joins with the right passphrase: message 2 went out, message 3 arrived and its MIC
-  verified (so the PMK, the PTK derivation and the MIC path are right), the group key unwrapped, message 4
-  went out - and the firmware refused `wsec_key` with `BCME_BUFTOOSHORT`, because the driver sent the 162
-  bytes the struct's fields add up to and `sizeof` is 164 (`docs/wifi.md` 40, "The first run"). The
-  constant is fixed; the boot that shows `JOINED` is the next one. As built, the driver answers
+- **The WPA2 handshake joins - hardware-verified 2026-09-29, 20:01** (`joined` first try, `already
+  joined` twice, the keys installed; the previous evening's boot had verified it through message 4 and
+  been refused at the key install by two bytes of struct padding, `docs/wifi.md` 40). Kept in this list
+  only for what remains of it: the driver answers
   message 1 with message 2 (its nonce, the RSN element, MIC'd with the confirmation key derived by
   PRF-384 from the PMK), verifies message 3 (ANonce, MIC, AES-key-unwraps the group key), sends message 4,
   and installs the pairwise and group keys through `wsec_key` - every step from OpenBSD's net80211 and
@@ -88,9 +85,10 @@ What every verb does, and what was seen:
   to send. Section 4 says Esc or `^Q` leaves; that is a change to the reader.
 - The BSSID and band in the `joined` sentence (section 4b) are not yet read from the association event;
   the sentence names the network only. `wifi info` reads both live, so they are one command away.
-- An access point that drops the station is noticed only when `wifi status` or `wifi info` next reads the
-  link (section 4f), not the moment it happens; the driver does not yet watch `LINK` events outside a join
-  or a sweep.
+- An access point that drops the station is noticed by the frame pull - the next time the stack asks for
+  frames, which is every hundred milliseconds while there is a link - and by `wifi status` or `wifi
+  info` reading the link. It is NOT noticed while the radio is standing by behind a cable that is in,
+  because nobody is pulling then; the driver still does not watch `LINK` events on its own.
 
 One limitation of the record format, recorded rather than left for a pipe to find: SSIDs may contain
 spaces, and `ssid` is the first field, so a positional filter on the second field will misread such a row.

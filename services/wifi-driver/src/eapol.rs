@@ -6,7 +6,8 @@
 //! `ieee80211_eapol_key_input`. This module is the frame layer of that: recognising a key frame and
 //! reading its header (`describe`), deriving the pairwise transient key (`derive_ptk`), building and
 //! signing our own messages (`build_key_frame`), verifying the access point's (`check_mic`), and finding
-//! the group key inside message 3 (`find_gtk`). The state machine that orders them is `join.rs`.
+//! the group key inside message 3 (`find_gtk`). The state machine that orders them is `join.rs` for the
+//! four-way handshake and `frames::group_rekey` for the group-key rekeys that follow it.
 //!
 //! ## The frame, quoted
 //!

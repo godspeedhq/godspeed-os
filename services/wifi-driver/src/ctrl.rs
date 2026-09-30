@@ -311,7 +311,8 @@ pub mod trace_kind {
     pub const RX_DATA_GLOMMED: u8 = 8;
     /// The glom descriptor: a list of lengths, not a frame with content.
     pub const RX_GLOMDESC: u8 = 9;
-    /// A data frame this driver SENT - an EAPOL handshake message, so far.
+    /// A data frame this driver SENT: a handshake message, a rekey acknowledgement, or any frame the stack
+    /// handed down through `nic-driver` (`frames::OP_NET_TX`).
     pub const TX_DATA: u8 = 10;
 }
 

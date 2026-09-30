@@ -339,7 +339,9 @@ ends at a thing you can see on a screen, because this is bench-only work with no
 | **2** | Firmware upload and the control channel. **Prints the firmware version string the chip reports** | The blob decision (section 8) |
 | **3** | **`wifi scan` lists the SSIDs in the room.** First user-visible win, and it needs no cryptography and no credential | A shell command, an event path |
 | **4** | **Associated, WPA2-PSK, firmware-offloaded. DHCP lease from the existing `net-stack`** | The credential path (section 6) |
+| | *Done 2026-09-29 - except "firmware-offloaded", which this firmware cannot do (37): the host runs the handshake (40). The lease came with phase 5.* | |
 | **5** | The frame interface: ops `0x10`/`0x11`/`0x12`. **`ping` over WiFi, `net-stack` unmodified** | Nothing above the driver |
+| | *Done 2026-09-30 - except "unmodified": `net-stack` needed one rule, for a link whose address changes (41).* | |
 | **6** | The Pi 2 dongle, soft-MAC | A real 802.11 MAC and real crypto. **Deferred, with section 3 as the reason** |
 
 Phase 3 is deliberately placed before any credential handling. A scan is the cheapest proof that the
@@ -2955,11 +2957,13 @@ access point's nonce and our address, and the driver logs that sentence on every
 RNG (`iproc-rng200`, five registers, read from Linux's driver); wiring it into `arch/aarch64` is the next
 kernel change and is small.
 
-Not yet run on hardware. What the first boot must show is in the spec's status section.
+Not yet run on hardware. What the first boot must show is in the spec's status section. *(It was run
+that evening and refused the key by two bytes - "The first run", above - and joined the next morning;
+section 41 opens with it.)*
 
 ## 41. Phase 5, built: the frame path, and the one rule `net-stack` needed after all (2026-09-29)
 
-**The join works.** Boot 20:01: `wifi join` with the right passphrase printed `joined ogundero_guest` on
+**The join works.** Boot 20:01: `wifi join` with the right passphrase printed `joined <the network>` on
 the first try, the log showed `setting wsec_key - 164 byte value` twice with no refusal and `JOINED -
 handshake complete, pairwise key installed, group key 2 installed`, and two more `wifi join`s answered
 `already joined` with nothing sent. The 162 was the whole of the previous boot's failure (section 40).
@@ -3010,7 +3014,7 @@ is the silent substitution 26.4 names.
 
 - **Group-key rekey is not answered** (`backlog/64`). The access point will drop the link at its rekey
   interval; the driver sees it, says so, and `wifi join` brings it back. The log line will say what this
-  router's interval is.
+  router's interval is. *Answered later the same day - section 42; the pairwise rekey is what remains.*
 - Data frames that arrive DURING A SWEEP are still dropped by the sweep's own reader; RX answers zero
   frames while a sweep runs. A sweep is a moment of no link either way.
 - `GET_RSSI` is refused (`BCME_BADARG`) even when joined, so `wifi status` says `signal unknown`. Honest,
@@ -3029,7 +3033,7 @@ nic-driver: the cable is out - the radio carries the link (MAC 98:fe:54:1c:dc:54
 net-stack: DHCP reply - 320 bytes, type 2 (2=OFFER 5=ACK), server 192.168.11.1
 net-stack: DHCP - offered 192.168.11.20, gw 192.168.11.1, dns 194.168.4.100
 net-stack: DHCP - ACK, 192.168.11.20 is ours (server 192.168.11.1)
-net-stack: ARP - 192.168.11.1 is at 00:ab:48:da:1b:0c
+net-stack: ARP - 192.168.11.1 is at <the access point>
 net-stack: ICMP - 192.168.11.1 echo reply (ping OK)
 ```
 
