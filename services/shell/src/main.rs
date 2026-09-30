@@ -5507,7 +5507,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi status", "radio, network and band, signal as a word then dBm, security, time joined, last scan", "wifi status"),
         ], false),
         ("wifi", "info") => help_block(ctx, "wifi info", "the link in detail", &[
-            ("wifi info", "bssid, band, channel, signal, security, time joined, scan facts; addressing is `net status`'s", "wifi info"),
+            ("wifi info", "bssid, band, channel, signal, security, time joined, scan facts; addressing is `net`'s", "wifi info"),
         ], false),
         ("wifi", "stored") => help_block(ctx, "wifi stored", "which networks a key is held for", &[
             ("wifi stored", "names only, never a key; empty after a reboot or a driver restart", "wifi stored"),
@@ -7973,7 +7973,7 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
         ReqOutcome::Reply(r) => match r.payload_bytes().first().copied() {
             Some(JOINED) => {
                 out.line_fmt(ctx, format_args!("joined {}", name));
-                out.line_fmt(ctx, format_args!("  (addressing is `net`'s to report: `net status`)"));
+                out.line_fmt(ctx, format_args!("  (addressing is `net`'s to report: type `net`)"));
                 Ok(())
             }
             Some(ALREADY_JOINED) => {
@@ -8190,7 +8190,7 @@ fn wifi_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     } else {
         out.line_fmt(ctx, format_args!("last scan   none - run wifi scan"));
     }
-    out.line_fmt(ctx, format_args!("addressing  see net status (an IP address has one owner, and it is not this command)"));
+    out.line_fmt(ctx, format_args!("addressing  see `net` (an IP address has one owner, and it is not this command)"));
     Ok(())
 }
 
@@ -8911,6 +8911,17 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // bit1 ping ok). Formatting is the shell's job; net-stack reports raw facts.
     // Reflect the LIVE link, not the frozen record. If the cable is out, EVERY net-stack line is degraded -
     // showing the stale (often fallback, e.g. 10.0.2.x) IP/gateway/DNS as if current is the "stale info" bug.
+    // net-stack's status while it has never had a link is a SENTINEL, nineteen bytes of text rather
+    // than nineteen bytes of addresses, and printing it as numbers gave `ip 108.105.110.107` - the
+    // word "link" - with a gateway at "32.100.111.119". Seen the first time a machine booted
+    // unplugged and joined a radio before the stack looked again.
+    if p.len() >= 19 && &p[..19] == b"link down (no cable" {
+        out.line(ctx, "ip       unassigned (net-stack has had no link since boot - it configures on the next request once one is up)");
+        out.line(ctx, "gateway  unresolved");
+        out.line(ctx, "ping     no");
+        out.line(ctx, "lease    NONE");
+        return Ok(());
+    }
     if nic_link_up {
         let flags = p[14];
         out.line_fmt(ctx, format_args!("ip       {}.{}.{}.{}", p[0], p[1], p[2], p[3]));

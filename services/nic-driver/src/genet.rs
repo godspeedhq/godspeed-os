@@ -1293,10 +1293,19 @@ enum Carrier {
 /// pay it for nothing, and a switch half a second late is not something a person can see.
 const CABLE_RECHECK_MS: u64 = 500;
 
-/// The bound on one exchange with `wifi-driver`. Its serve loop answers between frames, but a JOIN holds
-/// it for seconds, and `net-stack` budgets its own wait at a second - so this loses that race rather than
-/// winning it, and a silent radio reads as no link for one poll, never as a hang.
-const RADIO_SECS: i64 = 1;
+/// The bound on one exchange with `wifi-driver`, in milliseconds - and it is SHORT on purpose. This was a
+/// second, and the first boot showed what a second costs: `net-stack` gives up on this service well inside
+/// it and sends its next request, which queues behind the one still waiting; sixteen of those and this
+/// service's inbox is full, at which point the radio's answer cannot land in it and every exchange times
+/// out - a livelock that reads as "the radio stopped responding". The radio answers in about a
+/// millisecond when it answers at all (a pull of eight frames is a few), so a hundred is generous for a
+/// real answer and short enough that this service keeps pace with its callers while the radio is busy
+/// (a JOIN holds it for seconds; every request in that window fails fast instead of piling up).
+const RADIO_MS: u64 = 100;
+/// An answer slower than this is logged: the cost of the radio path, measured from the side that pays it.
+const RADIO_SLOW_MS: u64 = 20;
+/// Unanswered requests in a row before the radio's cap is reacquired by name (see `Radio::rpc`).
+const RADIO_REACQUIRE_AFTER: u32 = 3;
 
 /// The radio as a backend: `wifi-driver` reached over the frame ops, the way the Pi 2's `nic-driver`
 /// reaches `dwc2` (`main.rs`, `kernel_net_main`) - one bounded request, one reacquire-and-retry when the
@@ -1304,7 +1313,10 @@ const RADIO_SECS: i64 = 1;
 /// checked against the op it answers, because the radio's endpoint also serves the `wifi` utility and a
 /// late reply would otherwise be read as the next answer.
 struct Radio {
+    answered: u32,
+    slow: u32,
     timeouts: u32,
+    silent_run: u32,
     mismatch: u32,
     sendfail: u32,
     restale: u32,
@@ -1312,41 +1324,58 @@ struct Radio {
 
 impl Radio {
     fn new() -> Self {
-        Radio { timeouts: 0, mismatch: 0, sendfail: 0, restale: 0 }
+        Radio { answered: 0, slow: 0, timeouts: 0, silent_run: 0, mismatch: 0, sendfail: 0, restale: 0 }
     }
 
     fn rpc(&mut self, ctx: &ServiceContext, msg: &Message) -> Option<Message> {
         let want = msg.payload_bytes().first().copied().unwrap_or(0);
-        let got = match ctx.request_with_reply_call_err("wifi-driver", msg, RADIO_SECS) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                self.timeouts = self.timeouts.saturating_add(1);
-                return None;
+        let t0 = ctx.read_tsc();
+        let got = ctx.request_with_reply_ms("wifi-driver", msg, RADIO_MS);
+        let took_ms = ctx.read_tsc().wrapping_sub(t0) / ctx.duration_cycles(1).max(1);
+        let got = match got {
+            Some(r) => {
+                self.answered = self.answered.saturating_add(1);
+                self.silent_run = 0;
+                // The latency, from this side, which is the side that pays it: the first few always,
+                // then only the slow ones, so the log shows what the radio path costs without becoming
+                // a per-frame flood.
+                if self.answered <= 3 || took_ms >= RADIO_SLOW_MS {
+                    if took_ms >= RADIO_SLOW_MS {
+                        self.slow = self.slow.saturating_add(1);
+                    }
+                    if self.answered <= 3 || self.slow <= 3 || self.slow % 64 == 0 {
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio answered {:#04x} in {} ms ({} answered, {} slow, {} unanswered)",
+                            want, took_ms, self.answered, self.slow, self.timeouts));
+                    }
+                }
+                r
             }
-            Err(_) => {
-                if !ctx.reacquire_by_name("wifi-driver") {
-                    self.sendfail = self.sendfail.saturating_add(1);
-                    return None;
+            None => {
+                // No answer inside the bound. A millisecond bound cannot tell a silent peer from a
+                // stale cap (only the seconds form does), so after a few in a row the cap is reacquired
+                // by name - which is harmless when it was not stale, and is the only recovery when it
+                // was (the radio is respawned by the supervisor and may come back after us). Nothing is
+                // re-SENT: a request this driver stopped waiting for must not go out twice.
+                self.timeouts = self.timeouts.saturating_add(1);
+                self.silent_run = self.silent_run.saturating_add(1);
+                if self.timeouts <= 3 || self.timeouts % 64 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: the radio did not answer {:#04x} within {} ms (x{}, {} in a row)",
+                        want, RADIO_MS, self.timeouts, self.silent_run));
                 }
-                match ctx.request_with_reply_call_err("wifi-driver", msg, RADIO_SECS) {
-                    Ok(Some(r)) => {
+                if self.silent_run == RADIO_REACQUIRE_AFTER {
+                    if ctx.reacquire_by_name("wifi-driver") {
                         self.restale = self.restale.saturating_add(1);
-                        if self.restale == 1 || self.restale % 128 == 0 {
-                            ctx.log_fmt(format_args!(
-                                "nic-driver: wifi-driver cap was stale - reacquired by name and the request went through ({} so far)",
-                                self.restale));
-                        }
-                        r
-                    }
-                    Ok(None) => {
-                        self.timeouts = self.timeouts.saturating_add(1);
-                        return None;
-                    }
-                    Err(_) => {
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio was silent {} times running - its cap reacquired by name ({} so far); the next request tells",
+                            self.silent_run, self.restale));
+                    } else {
                         self.sendfail = self.sendfail.saturating_add(1);
-                        return None;
+                        ctx.log("nic-driver: the radio was silent and its name does not resolve - wifi-driver is not running");
                     }
                 }
+                return None;
             }
         };
         if got.payload_bytes().first().copied() != Some(want) {
@@ -1355,7 +1384,7 @@ impl Radio {
             self.mismatch = self.mismatch.saturating_add(1);
             if self.mismatch == 1 || self.mismatch % 128 == 0 {
                 ctx.log_fmt(format_args!(
-                    "nic-driver: wifi-driver answered {:#04x} while we asked {:#04x} - not our reply ({} mismatched, {} timed out, {} never sent)",
+                    "nic-driver: wifi-driver answered {:#04x} while we asked {:#04x} - not our reply ({} mismatched, {} unanswered, {} never sent)",
                     got.payload_bytes().first().copied().unwrap_or(0), want,
                     self.mismatch, self.timeouts, self.sendfail));
             }
@@ -1446,7 +1475,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
         let Some(reply_cap) = ctx.take_pending_cap() else {
             if !capless_logged {
                 capless_logged = true;
-                ctx.log("nic-driver: request had no reply cap - dropping (cannot answer without one)");
+                ctx.log("nic-driver: a message with no reply cap - dropping (a request nobody can be answered on, or a late reply from the radio after this driver stopped waiting for it)");
             }
             continue;
         };

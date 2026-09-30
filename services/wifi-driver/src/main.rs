@@ -81,9 +81,11 @@ fn serve_unavailable(ctx: &ServiceContext) -> ! {
         let _req = ctx.recv();
         // No reply cap means there is nothing to answer on, and dropping is all that is left.
         if let Some(reply) = ctx.take_pending_cap() {
+            // The reply cap is RECLAIMED after use (26.6): see the serve loop for what not doing so cost.
             // One byte, not an empty message: the kernel refuses a zero-length send, so an "empty
             // reply" is no reply at all and the caller waits out its deadline.
             let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&[scan::reply::RADIO_DOWN]));
+            ctx.remove_cap(reply);
         }
     }
 }
@@ -234,6 +236,9 @@ fn serve_radio(
     // fails, passphrases are refused HERE, with the reason, rather than there, without one.
     let crypto_ok = crypto::selftest(ctx);
     let mut frame = [0u8; ctrl::FRAME];
+    // Requests that could not be answered, and answers that could not be delivered - both loud.
+    let mut capless: u32 = 0;
+    let mut reply_failed: u32 = 0;
 
     loop {
         // ---- 1. One frame of the running sweep, if there is one. ----
@@ -278,7 +283,21 @@ fn serve_radio(
         };
         let reply = match ctx.take_pending_cap() {
             Some(r) => r,
-            None => continue, // nothing to answer on
+            None => {
+                // No cap to answer on. Once, this was the WHOLE failure of the first frame-path boot:
+                // reply caps were never reclaimed (below), the 64-slot table filled after some fifty
+                // requests, the kernel could install no more, and every request after that landed here
+                // and was dropped without a word - `net-stack` saw a radio that "stopped responding
+                // after a while", `observe` saw this driver idle with an empty queue. Counted and said.
+                capless = capless.saturating_add(1);
+                if capless == 1 || capless % 64 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver: a request arrived with no reply cap - dropped (x{}); if this repeats,                          the cap table is full and every answer is being lost",
+                        capless
+                    ));
+                }
+                continue;
+            }
         };
         let payload = req.payload_bytes();
         let op = payload.first().copied().unwrap_or(0);
@@ -832,8 +851,22 @@ fn serve_radio(
         };
         // `try_send`, never `send`: the shell may have given up on this reply (`q`, or its own deadline),
         // and a blocking send toward a peer that is not receiving is the mutual-blocking anti-pattern §8.9
-        // names. A failed reply here means nobody was waiting, which is not this driver's failure.
-        let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n]));
+        // names. A failed reply usually means nobody was waiting - but it can also mean the caller's
+        // queue is FULL while it waits (`nic-driver` blocked on this very answer with sixteen stale
+        // requests behind it), and that one is worth seeing, so it is counted and reported sparingly.
+        if ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n])).is_err() {
+            reply_failed = reply_failed.saturating_add(1);
+            if reply_failed == 1 || reply_failed % 64 == 0 {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: an answer (op {:#04x}) could not be delivered (x{}) - the caller gave up, or its queue is full",
+                    op, reply_failed
+                ));
+            }
+        }
+        // RECLAIM THE REPLY CAP. A one-shot cap the caller derived for this answer; used or not, it is
+        // this task's slot until released, and a task holds 64. This line was missing, and the driver
+        // went deaf after its first fifty requests - see the `capless` arm above.
+        ctx.remove_cap(reply);
     }
 }
 

@@ -3016,6 +3016,68 @@ is the silent substitution 26.4 names.
 - `GET_RSSI` is refused (`BCME_BADARG`) even when joined, so `wifi status` says `signal unknown`. Honest,
   not blocking; the Linux driver's form of the query is the next thing to read.
 
+### The first boot (2026-09-30, 08:16): the frame path WORKED, then went deaf after fifty requests
+
+The machine booted with the cable out. `wifi join` joined. On the next network request the stack saw the
+radio's link and configured itself OVER THE RADIO, on the guest network's own subnet:
+
+```
+nic-driver: the cable is out - the radio carries the link (MAC 98:fe:54:1c:dc:54)
+net-stack: DHCP reply - 320 bytes, type 2 (2=OFFER 5=ACK), server 192.168.11.1
+net-stack: DHCP - offered 192.168.11.20, gw 192.168.11.1, dns 194.168.4.100
+net-stack: DHCP - ACK, 192.168.11.20 is ours (server 192.168.11.1)
+net-stack: ARP - 192.168.11.1 is at 00:ab:48:da:1b:0c
+net-stack: ICMP - 192.168.11.1 echo reply (ping OK)
+```
+
+Discover, offer, request, acknowledge, ARP and an echo through the radio, on the first attempt: every op
+of the frame interface, the transmit credit, the pull, the address-change rule and the DHCP exchange all
+proved at once. Plugging the cable back in later did the other half - `the link's address changed
+(98:fe:54:1c:dc:54 -> 02:00:00:00:00:01) - re-configuring`, a new lease from 192.168.4.1, and `ping`
+answering over the cable within a second.
+
+**Then the radio stopped answering, and `ping` over it never happened.** The operator's words: "wifi
+radio didn't respond after a while. All successful pings is when the ethernet cable was connected." The
+log showed every exchange between `nic-driver` and the radio timing out at exactly its one-second bound,
+`net-stack`'s serve passes taking exactly 1000 ms, and `observe now` showed the shape of it:
+
+```
+10   wifi-driver      C3   BlockRecv   ...   0/16
+11   nic-driver       C1   BlockRecv   ...  16/16!
+12   net-stack        C1   BlockSend   ...   0/16
+```
+
+`nic-driver` blocked on a reply with sixteen stale requests behind it; the radio idle with nothing
+queued. The radio was ANSWERING NOTHING, and `observe` says why it looked idle: it had nothing to answer
+on. **`wifi-driver` never released a reply cap.** Every request carries a one-shot cap the caller derives
+for its answer; the kernel installs it in the receiver's table, and the receiver must `remove_cap` it
+after use - `nic-driver`, `dwc2`, `net-stack` all do, and this driver did not, anywhere. A task holds
+sixty-four. `wifi` commands alone never reached that in a boot; `net-stack`'s drains reach it in seconds.
+From the fifty-somethingth request on, the kernel had no slot to install a cap into, the request arrived
+without one, and the serve loop's `None => continue` dropped it - silently, since that arm said nothing.
+
+**Fixed:** the cap is reclaimed after every answer (and in the no-radio server), a request with no cap is
+counted and logged, an answer that cannot be delivered is counted and logged. Three lines were the fault;
+the rest is so that the next such fault says its name.
+
+**Two things the failure's SHAPE taught, both acted on.**
+
+- **`nic-driver`'s bound on the radio was a second, and a second is a livelock.** `net-stack` gives up
+  well inside it and sends its next request, which queues behind the one still waiting; sixteen of those
+  and `nic-driver`'s inbox is full, and now the radio's answer cannot land in it either - so every
+  exchange times out whether or not the radio is fine. The bound is 100 ms now (`RADIO_MS`), well over
+  the millisecond a real answer takes and short enough that `nic-driver` keeps pace with its callers
+  while the radio is busy (a join holds it for seconds; those requests fail fast instead of piling up).
+  With a millisecond bound the cap cannot be told stale from silent, so three silences in a row reacquire
+  it by name - harmless when it was not stale, the only recovery when it was. The round trip is now
+  measured and logged from the side that pays it.
+- **The kernel drops a message for a blocked receiver whose queue is full, and says `Ok`.** That is the
+  branch the shape above went through, it is a silent fallback at the kernel boundary, and it is
+  `backlog/65` - one branch to fix, held for the next kernel change rather than folded into this flash.
+
+Also seen and fixed: `net` printed the stack's never-had-a-link sentinel as addresses
+(`ip 108.105.110.107` is the word "link"); and three places said `net status`, which is not a command.
+
 ### Prediction for the boot
 
 Cable in, `wifi join <ssid>`: `joined <ssid>`, and `net` shows `link  up via the cable` - nothing else

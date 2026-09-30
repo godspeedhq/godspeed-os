@@ -43,11 +43,13 @@ What every verb does, and what was seen:
 
 **Things this file specifies that are NOT met yet, said here rather than discovered:**
 
-- **The frame path is BUILT (2026-09-29, phase 5) and not yet run on hardware.** The driver serves the
-  frame interface to `nic-driver` (`docs/wifi.md` 41), which carries `net-stack`'s frames over the radio
-  whenever the cable is out and the radio is joined - and back over the cable when it returns (section
-  10). What the first boot must show: pull the cable with the radio joined, and `ping` answers; `net`
-  says `link  up via wifi`.
+- **The frame path is hardware-verified through DHCP over the radio (2026-09-30, 08:17) and not yet
+  through a `ping` over it.** The first boot configured the stack over the radio on the guest network's
+  own subnet - discover, offer, acknowledge, ARP and an echo to the gateway, all through the radio - and
+  then went deaf: the driver never reclaimed a reply cap, its table filled after some fifty requests, and
+  every request after that had nothing to be answered on (`docs/wifi.md` 41, "The first boot"). Fixed
+  the same morning. What the next boot must show: cable out, `ping 8.8.8.8` answers over the radio for
+  as long as it runs, and `net` says `link  up via wifi`.
 
 - **The WPA2 handshake is hardware-verified through message 4 (2026-09-29, 19:44) and not yet through the
   key install.** Three joins with the right passphrase: message 2 went out, message 3 arrived and its MIC
