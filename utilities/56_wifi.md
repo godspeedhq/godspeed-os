@@ -280,7 +280,7 @@ join: 1
 passphrase (not shown):
 joining Maple-House  [q] quit
 joined Maple-House on 5GHz, bssid 02:1a:7e:c4:09:51 - the link is up and the handshake completed
-  (addressing is `net`'s to report: `net status`)
+  (for the address, type net)
 ```
 
 The BSSID and band in the last line come from the association event, not from the row - the row said
@@ -376,7 +376,7 @@ security    WPA2
 joined      3 min ago
 last scan   42 s ago
 networks    11
-addressing  see net status (an IP address has one owner, and it is not this command)
+addressing  type net (an IP address has one owner, and it is not this command)
 ```
 
 `info` deliberately ends where `net` begins. Section 1 gives an IP address exactly one owner so that two

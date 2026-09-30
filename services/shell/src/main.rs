@@ -5236,7 +5236,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wifi join <ssid>", "join a network (asks the passphrase once if needed; never takes it as an argument)", "wifi join Bankole-WiFi"),
             ("wifi leave", "leave the current network; the radio stays up", "wifi leave"),
             ("wifi status", "what is true now: radio, network, signal, security, time joined, last scan", "wifi status"),
-            ("wifi info", "the link in detail: bssid, band, channel, signal, security; addressing is `net`'s", "wifi info"),
+            ("wifi info", "the link in detail: bssid, band, channel, signal, security; for the address, type net", "wifi info"),
             ("wifi debug [events|stats|firmware|transport|trace]", "the driver's own account: counters, the firmware's words, the last 64 frames", "wifi debug trace"),
             ("wifi stored", "which networks a passphrase is held for (names only, never secrets)", "wifi stored"),
             ("wifi forget <ssid>", "delete a stored passphrase; does not disconnect", "wifi forget Bankole-WiFi"),
@@ -5507,7 +5507,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi status", "radio, network and band, signal as a word then dBm, security, time joined, last scan", "wifi status"),
         ], false),
         ("wifi", "info") => help_block(ctx, "wifi info", "the link in detail", &[
-            ("wifi info", "bssid, band, channel, signal, security, time joined, scan facts; addressing is `net`'s", "wifi info"),
+            ("wifi info", "bssid, band, channel, signal, security, time joined, scan facts; for the address, type net", "wifi info"),
         ], false),
         ("wifi", "stored") => help_block(ctx, "wifi stored", "which networks a key is held for", &[
             ("wifi stored", "names only, never a key; empty after a reboot or a driver restart", "wifi stored"),
@@ -7973,7 +7973,7 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
         ReqOutcome::Reply(r) => match r.payload_bytes().first().copied() {
             Some(JOINED) => {
                 out.line_fmt(ctx, format_args!("joined {}", name));
-                out.line_fmt(ctx, format_args!("  (addressing is `net`'s to report: type `net`)"));
+                out.line_fmt(ctx, format_args!("  (for the address, type net)"));
                 Ok(())
             }
             Some(ALREADY_JOINED) => {
@@ -8190,7 +8190,7 @@ fn wifi_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     } else {
         out.line_fmt(ctx, format_args!("last scan   none - run wifi scan"));
     }
-    out.line_fmt(ctx, format_args!("addressing  see `net` (an IP address has one owner, and it is not this command)"));
+    out.line_fmt(ctx, format_args!("addressing  type net (an IP address has one owner, and it is not this command)"));
     Ok(())
 }
 
