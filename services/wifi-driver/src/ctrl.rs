@@ -1372,7 +1372,11 @@ pub fn link_now(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext)
     if !link.associated() {
         return Some(link);
     }
-    let mut scb = [0u8; 10];
+    // `scb_val_t` is `int32 val; struct ether_addr ea;` - ten bytes of fields and TWELVE of `sizeof`,
+    // because the struct is 4-aligned and the tail is padded. Ten was refused `BCME_BADARG` on every
+    // boot from the first join on; the same lesson as `WSEC_KEY_SIZE` (162 -> 164), one struct later.
+    // Linux sends `sizeof(struct brcmf_scb_val_le)`, which is twelve.
+    let mut scb = [0u8; 12];
     match query_cmd(h, w, s, CMD_GET_RSSI, &mut scb, "rssi", ctx) {
         Some(n) if n >= 4 => link.rssi = i32::from_le_bytes([scb[0], scb[1], scb[2], scb[3]]),
         _ => ctx.log("wifi-driver: the firmware gave no RSSI - reported as 0"),

@@ -473,3 +473,4 @@ ieee80211_send_eapol_key           # OpenBSD net80211/ieee80211_pae_output.c - t
 ieee80211_recv_rsn_group_msg1      # OpenBSD net80211 ieee80211_pae_input.c - the group-key message 1 receiver `frames::group_rekey` follows step by step - external, 26.14
 ieee80211_send_group_msg2          # OpenBSD net80211 ieee80211_pae_output.c - the group-key acknowledgement (KEYMIC | SECURE, replay copied, no key data) - external, 26.14
 ni_replaycnt                       # OpenBSD net80211 node field - the last accepted EAPOL replay counter; `join::Keys::replay` is its counterpart - external, 26.14
+scb_val_t                          # Broadcom wlioctl.h - `int32 val; struct ether_addr ea;`, the GET_RSSI structure, sizeof 12 not 10; ctrl.rs sends it as a byte array - external, 26.14

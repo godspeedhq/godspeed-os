@@ -3014,7 +3014,10 @@ is the silent substitution 26.4 names.
 - Data frames that arrive DURING A SWEEP are still dropped by the sweep's own reader; RX answers zero
   frames while a sweep runs. A sweep is a moment of no link either way.
 - `GET_RSSI` is refused (`BCME_BADARG`) even when joined, so `wifi status` says `signal unknown`. Honest,
-  not blocking; the Linux driver's form of the query is the next thing to read.
+  not blocking; the Linux driver's form of the query is the next thing to read. *Read, 2026-09-30: Linux
+  sends the same zeroed `scb_val` - but `sizeof` it, which is twelve bytes, not the ten its fields add up
+  to (`int32` and a six-byte address, 4-aligned). The same padding lesson as `wsec_key` (section 40), one
+  struct later; the driver sends twelve now.*
 
 ### The first boot (2026-09-30, 08:16): the frame path WORKED, then went deaf after fifty requests
 
