@@ -7620,12 +7620,63 @@ mod wifi_wire {
 /// hardware as "not answering" in 15 ms. The name directory resolves the driver that is running now; a
 /// driver that is genuinely dead fails the reacquire and the caller's loud sentence stays true.
 fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
+    // THE REPLY IS MATCHED TO THE REQUEST, AND A DEADLINE IS NEVER RE-SENT. This used `request_with_reply_ms`,
+    // which takes the next message in this shell's queue whatever it answers, and on its deadline
+    // reacquired the driver and SENT THE REQUEST AGAIN. Boot 2026-09-30 14:51: the driver took three
+    // seconds over the first `wifi scan`, the shell gave up and sent a second, the driver answered both -
+    // one sweep started, one "already scanning" - and from then on every reply the shell read was the
+    // answer to the PREVIOUS command: `wifi scan` said "refused" while the driver logged "accepted", `wifi
+    // list` got a reply it did not understand, `wifi radio on` was told the power command was not taken.
+    // A late answer is not a refusal, and a re-sent request is a second request. The `Call` form dequeues
+    // only the reply carrying its own reply cap (CLAUDE.md 8.2), so a late answer to an abandoned request
+    // is left where it is; it is cleared below rather than read as the next command's answer.
     let msg = Message::from_bytes(req);
-    match ctx.request_with_reply_ms(WIFI_DRIVER, &msg, max_ms) {
-        Some(r) => Some(r),
-        None if ctx.reacquire_by_name(WIFI_DRIVER) => ctx.request_with_reply_ms(WIFI_DRIVER, &msg, max_ms),
-        None => None,
+    let secs = ((max_ms + 999) / 1000).max(1) as i64;
+    let t0 = ctx.read_tsc();
+    let got = match ctx.request_with_reply_call_err(WIFI_DRIVER, &msg, secs) {
+        Ok(r) => r,
+        // The send itself failed: the driver was respawned and this cap is stale. Reacquire and send ONCE -
+        // nothing is in flight, so this is a first request, not a repeat.
+        Err(_) => {
+            if !ctx.reacquire_by_name(WIFI_DRIVER) {
+                return None;
+            }
+            match ctx.request_with_reply_call_err(WIFI_DRIVER, &msg, secs) {
+                Ok(r) => r,
+                Err(_) => None,
+            }
+        }
+    };
+    let took_ms = ctx.read_tsc().wrapping_sub(t0) / ctx.duration_cycles(1).max(1);
+    match &got {
+        Some(_) if took_ms >= 1000 => {
+            ctx.log_fmt(format_args!("shell: the radio driver answered op {:#04x} after {} ms", req.first().copied().unwrap_or(0), took_ms));
+        }
+        None => {
+            let stale = wifi_drain_stale(ctx);
+            ctx.log_fmt(format_args!(
+                "shell: the radio driver did not answer op {:#04x} within {} s ({} stale message(s) cleared from this shell's queue)",
+                req.first().copied().unwrap_or(0), secs, stale));
+        }
+        _ => {}
     }
+    got
+}
+
+/// Clear whatever is queued on this shell's endpoint. Called after a wifi request the shell stopped waiting
+/// for: its answer, if it ever comes, would otherwise sit in the queue - a `Call` never dequeues it - and
+/// sixteen of those is a full queue nothing can be answered on. Everything queued here is stale by
+/// construction: the shell asks one thing at a time and reads console input from the kernel ring, not from
+/// its endpoint, and a late `net-stack` reply is discarded by its own tag check either way.
+fn wifi_drain_stale(ctx: &ShellCtx) -> u32 {
+    let mut n = 0u32;
+    while ctx.try_recv().is_some() {
+        n = n.saturating_add(1);
+        while let Some(c) = ctx.take_pending_cap() {
+            ctx.remove_cap(c);
+        }
+    }
+    n
 }
 
 /// The printable form of an SSID. The name is whatever the access point beacons and is NOT trusted to be
@@ -7716,7 +7767,7 @@ fn wifi_not_answering(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 /// The two states in which nothing can be asked of the radio, said the same way by every verb.
 fn wifi_radio_unavailable(ctx: &ShellCtx, out: &mut Out, status: u8) -> Result<(), ShellError> {
     match status {
-        wifi_wire::RADIO_DOWN => out.line_fmt(ctx, format_args!("wifi: the radio is not up - it did not come up at boot, and the driver's log says which stage stopped it")),
+        wifi_wire::RADIO_DOWN => out.line_fmt(ctx, format_args!("wifi: the radio is not up - it did not come up at boot")),
         wifi_wire::RADIO_OFF => out.line_fmt(ctx, format_args!("wifi: the radio is off - `wifi radio on` powers it")),
         _ => out.line_fmt(ctx, format_args!("wifi: the radio driver gave a reply this shell does not understand")),
     }
@@ -7744,7 +7795,7 @@ fn wifi_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         Some(OK) => {}
         Some(SCANNING) => out.line_fmt(ctx, format_args!("a sweep is already running - attaching to it")),
         Some(SCAN_FAILED) => {
-            out.line_fmt(ctx, format_args!("wifi: the radio refused to start a sweep - the driver's log says why"));
+            out.line_fmt(ctx, format_args!("wifi: the radio refused to start a sweep"));
             return Err(ShellError::Unknown);
         }
         Some(s) => return wifi_radio_unavailable(ctx, out, s),
@@ -7804,7 +7855,7 @@ fn wifi_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                 }
             }
             SCAN_FAILED => {
-                out.line_fmt(ctx, format_args!("wifi: the sweep fell silent and the driver discarded it - the driver's log has the count; the last complete scan stands"));
+                out.line_fmt(ctx, format_args!("wifi: the sweep fell silent and was discarded; the last complete scan stands"));
                 return Err(ShellError::Unknown);
             }
             NO_SCAN_YET => {
@@ -7936,10 +7987,15 @@ fn wifi_join(ctx: &ShellCtx, out: &mut Out, ssid: &[u8], pass: &[u8]) -> Result<
         req[3 + SSID_MAX..3 + SSID_MAX + pass.len()].copy_from_slice(pass);
 
         out.line_fmt(ctx, format_args!("joining {}  [q] quit", name));
-        // Reacquire on a failed send, then ask once more - the same shape as `wifi_ask` and `ns_abortable`.
+        // Reacquire and ask once more ONLY for a send that failed - which the abortable form reports as a
+        // `Timeout` that returns at once, since it cannot tell the two apart. A timeout that took its full
+        // thirty seconds is the driver not answering, and re-sending a join to it would be a second join
+        // whose answer arrives when nobody is listening (see `wifi_ask`).
+        let t0 = ctx.read_tsc();
         let first = ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS);
+        let at_once = ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(250);
         let outcome = match first {
-            ReqOutcome::Timeout if ctx.reacquire_by_name(WIFI_DRIVER) => {
+            ReqOutcome::Timeout if at_once && ctx.reacquire_by_name(WIFI_DRIVER) => {
                 ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS)
             }
             other => other,
@@ -7995,11 +8051,11 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
                 Err(ShellError::Unknown)
             }
             Some(JOIN_FAILED) => {
-                out.line_fmt(ctx, format_args!("not joined - a step of joining {} failed (the driver's log names the command the firmware refused)", name));
+                out.line_fmt(ctx, format_args!("not joined - the radio refused a step of joining {}", name));
                 Err(ShellError::Unknown)
             }
             Some(JOIN_TIMEOUT) => {
-                out.line_fmt(ctx, format_args!("not joined - no decision from {} (the driver's log has what it heard)", name));
+                out.line_fmt(ctx, format_args!("not joined - no decision from {} within the wait", name));
                 Err(ShellError::Unknown)
             }
             Some(HANDSHAKE_UNIMPLEMENTED) => {
@@ -8487,7 +8543,7 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
         }
         Some(RADIO_DOWN) => wifi_radio_unavailable(ctx, out, RADIO_DOWN),
         Some(_) => {
-            out.line_fmt(ctx, format_args!("wifi: the radio did not take the power command - the driver's log names it"));
+            out.line_fmt(ctx, format_args!("wifi: the radio did not take the power command"));
             Err(ShellError::Unknown)
         }
         None => wifi_not_answering(ctx, out),

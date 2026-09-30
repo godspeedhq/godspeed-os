@@ -308,6 +308,10 @@ fn serve_radio(
         };
         let payload = req.payload_bytes();
         let op = payload.first().copied().unwrap_or(0);
+        // How long this request takes to serve, so a slow one is named from THIS side too: the shell and
+        // `nic-driver` both bound their waits, and a driver that quietly took three seconds over a sweep
+        // start (boot 2026-09-30 14:51) left neither of them able to say where the time went.
+        let served_t0 = ctx.read_tsc();
         let n = match (op, radio.as_mut()) {
             // No radio: every question has the same answer, and the log said at boot which stage stopped it.
             (_, None) => {
@@ -864,6 +868,10 @@ fn serve_radio(
         // names. A failed reply usually means nobody was waiting - but it can also mean the caller's
         // queue is FULL while it waits (`nic-driver` blocked on this very answer with sixteen stale
         // requests behind it), and that one is worth seeing, so it is counted and reported sparingly.
+        let served_ms = ctx.read_tsc().wrapping_sub(served_t0) / ctx.duration_cycles(1).max(1);
+        if served_ms >= 500 {
+            ctx.log_fmt(format_args!("wifi-driver: op {:#04x} took {} ms to serve", op, served_ms));
+        }
         if ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n])).is_err() {
             reply_failed = reply_failed.saturating_add(1);
             if reply_failed == 1 || reply_failed % 64 == 0 {
