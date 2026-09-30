@@ -2867,9 +2867,19 @@ pub mod interrupts {
         //
         // Hot-plug is the driver's own outer `'reenum` loop, which is preemptible because it is a
         // task rather than the idle path of a core. Nothing to poll here.
+        //
+        // CALLED WITH INTERRUPTS MASKED (`idle_mask_before_halt` answers yes below), so this is the
+        // arm64 idle sequence Linux's `cpu_do_idle` uses: `wfi` under the mask, then unmask. WFI wakes on
+        // an interrupt that is PENDING whether or not PSTATE.I masks it - that is the architectural
+        // property the sequence rests on - and the interrupt is then taken the instant the mask clears.
+        // A wake that landed between the scheduler's "nothing to run" and this instruction is therefore
+        // still pending when `wfi` executes and returns at once, instead of being consumed by the
+        // handler beforehand and slept through. Unmasking when already unmasked is harmless, so this
+        // holds for a caller that did not mask.
         // SAFETY: WFI at EL1 is always valid. It returns on any pending interrupt (or spuriously),
         // so every caller must re-check its condition rather than assume a wake means progress.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        enable_interrupts();
     }
     #[cfg(feature = "pi4")]
     /// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
@@ -2886,13 +2896,22 @@ pub mod interrupts {
     /// executing it cannot lose an interrupt raised in between - it is latched while masked and taken
     /// the instant `sti` retires.
     ///
-    /// ARM says NO, and this is the reason the guard is a question rather than a rule: both ARM ports do
-    /// real work inside `wait_for_interrupt` (draining the UART so a keystroke can wake a blocked shell,
-    /// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
-    /// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
-    /// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
-    /// narrower window; it is recorded here rather than silently left (26.7).
-    pub fn idle_mask_before_halt() -> bool { false }
+    /// This port said NO when the question was written, for a reason that was true then: both ARM ports
+    /// did real work inside `wait_for_interrupt` (draining the UART so a keystroke could wake a blocked
+    /// shell, watching hub ports so a replug was noticed), and that work needed interrupts enabled.
+    /// On the Pi 4 that work is gone - the USB stack and the terminal are services now, and the halt
+    /// above is a bare `wfi` whose own comment says "nothing to poll here" - but the answer was never
+    /// revisited, and on 2026-09-30 the window it leaves was measured: `net-stack` in its polling mode
+    /// blocks and wakes every 20-100 ms on core 1, the core idles hundreds of times a minute, and a
+    /// cross-core wake (the radio answering `nic-driver` from core 3, or core 0's deadline scan waking
+    /// `net-stack`) fell into the gap almost every time. `nic-driver` woke to serve each request about
+    /// 950 ms after it was sent, every wake on a one-second grid, and `ping` over the radio ran at one
+    /// echo every three seconds - the x86 "slow filesystem" of August, on this board, one core over.
+    ///
+    /// So this port says YES now, by the arm64 idiom rather than x86's: mask, re-check, `wfi` (which
+    /// wakes on a pending interrupt even under the mask), unmask - see `wait_for_interrupt`. The Pi 2
+    /// (`arch/arm`) still polls its UART in the halt and keeps its own answer.
+    pub fn idle_mask_before_halt() -> bool { true }
 
     /// The idle loop may `wfi`: the generic timer keeps ticking through it, so a halted core is woken
     /// by its own 100 Hz tick even if nothing else ever targets it.

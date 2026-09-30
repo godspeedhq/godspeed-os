@@ -475,3 +475,4 @@ ieee80211_send_group_msg2          # OpenBSD net80211 ieee80211_pae_output.c - t
 ni_replaycnt                       # OpenBSD net80211 node field - the last accepted EAPOL replay counter; `join::Keys::replay` is its counterpart - external, 26.14
 scb_val_t                          # Broadcom wlioctl.h - `int32 val; struct ether_addr ea;`, the GET_RSSI structure, sizeof 12 not 10; ctrl.rs sends it as a byte array - external, 26.14
 iproc_rng200_restart               # Linux drivers/char/hw_random/iproc-rng200.c - the disable / clear / RBG reset / RNG reset / enable sequence `arch/aarch64::hw_random` performs inline on a fail bit - external, 26.14
+cpu_do_idle                        # Linux arch/arm64/kernel/process.c - the idle sequence (wfi under the mask, then unmask) `arch/aarch64::wait_for_interrupt` follows - external, 26.14
