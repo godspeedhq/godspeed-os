@@ -192,6 +192,21 @@ const NIC_BUSY_MS: u64 = 2;
 const NIC_BUSY_TRIES: u32 = 8;
 
 fn nic_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
+    // Timed from the side that pays: an exchange with the NIC that takes over 300 ms is named with the
+    // op it asked, because every client request that arrives meanwhile is held behind it.
+    let t0 = ctx.read_tsc();
+    let r = nic_req_inner(ctx, pending, msg, secs);
+    let took_ms = ctx.read_tsc().wrapping_sub(t0) / ctx.duration_cycles(1).max(1);
+    if took_ms >= 300 {
+        ctx.log_fmt(format_args!(
+            "net-stack: the NIC exchange for op {} took {} ms ({})",
+            msg.payload_bytes().first().copied().unwrap_or(0), took_ms,
+            if r.is_some() { "answered" } else { "no answer" }));
+    }
+    r
+}
+
+fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
     // `request_with_reply_deadline_outcome`, NOT the `Call` primitive. Switching this to `Call`
     // during the x86 work is what stopped Pi 2 networking, and it was isolated by elimination on
     // hardware: with `Call`, nic-driver answers with an EMPTY status - no MAC, no link - so
@@ -403,6 +418,8 @@ pub struct Displaced {
     /// Said-once latch for the one SILENT way a client request can be lost - see the `None` arm of
     /// `sifted_req`'s closure.
     ate_client_said: bool,
+    /// Requests stashed over this service's life, for the throttled line in `note`.
+    noted: u32,
 
     /// Client requests displaced by a conversation with `nic-driver`, kept in arrival order.
     ///
@@ -486,6 +503,7 @@ impl Displaced {
         Displaced {
             n: 0,
             ate_client_said: false,
+            noted: 0,
             held: [const { None }; STASH_N],
             head: 0,
             live: 0,
@@ -528,6 +546,16 @@ impl Displaced {
         h.body[..pl.len()].copy_from_slice(pl);
         self.held[slot] = Some(h);
         self.live += 1;
+        // INSTRUMENT (Pi 4, 2026-09-30): a continuous ping fell to one echo every three seconds after the
+        // clock was set, with a one-byte capped request dropped from this stash each cycle and nothing
+        // else in the log. Which requests land here, how big they are, and how long they sit is what
+        // the next boot has to say; the first eight and every 64th after that.
+        self.noted = self.noted.saturating_add(1);
+        if self.noted <= 8 || self.noted % 64 == 0 {
+            ctx.log_fmt(format_args!(
+                "net-stack: held a client request ({} byte(s), tag {:#04x}, patience {} ms, op {}) - an exchange was in progress (#{}, {} held)",
+                pl.len(), pl.first().copied().unwrap_or(0), hold_ms, pl.get(2).copied().unwrap_or(0), self.noted, self.live));
+        }
     }
 
     /// Is a displaced client request waiting to be served?
@@ -569,6 +597,12 @@ impl Displaced {
                 continue;
             }
             out[..h.len].copy_from_slice(&h.body[..h.len]);
+            let age_ms = now.wrapping_sub(h.at) / ctx.duration_cycles(1).max(1);
+            if age_ms >= 300 {
+                ctx.log_fmt(format_args!(
+                    "net-stack: serving a held client request (op {}) after {} ms in the stash",
+                    h.body.get(2).copied().unwrap_or(0), age_ms));
+            }
             return Some((h.len, h.badge, h.reply));
         }
         None

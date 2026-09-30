@@ -7261,7 +7261,14 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         sent += 1;
         // ABORTABLE per echo, so q quits DURING the wait for a reply, not only in the pace between echoes
         // (a blocking request_with_reply here left q feeling unresponsive). Reacquire once on a timeout.
+        let echo_t0 = ctx.read_tsc();
         let outcome = ns_abortable(ctx, &[3, ip[0], ip[1], ip[2], ip[3], bl[0], bl[1]], 5);
+        let echo_ms = ctx.read_tsc().wrapping_sub(echo_t0) / ctx.duration_cycles(1).max(1);
+        if echo_ms >= 1000 {
+            // The echo's own round trip is tens of milliseconds; a second here is the request waiting
+            // somewhere, and the log should say so next to net-stack's own account of it.
+            ctx.log_fmt(format_args!("shell: ping echo {} was answered after {} ms", sent, echo_ms));
+        }
         match outcome {
             ReqOutcome::Reply(r) => {
                 let p = r.payload_bytes();
