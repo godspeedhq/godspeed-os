@@ -2217,13 +2217,37 @@ impl ServiceContext {
             };
         }
         let t0 = self.epoch_secs_monotonic();
+        // INSTRUMENT (Pi 4, 2026-09-30, backlog/66): a wait that the caller measured at ~990 ms, ending
+        // on the integer-second boundary, on a request the peer answers in milliseconds. Whether each
+        // slice below BLOCKS for its 20 ms or returns at once is the one fact the stamps at either end
+        // cannot give, so a wait over half a second reports its slice count and the shortest and
+        // longest slice. Fires only in that pathology; costs two counter reads per slice otherwise.
+        let start = self.read_tsc();
+        let per_ms = self.duration_cycles(1).max(1);
+        let mut slices: u32 = 0;
+        let mut longest: u64 = 0;
+        let mut shortest: u64 = u64::MAX;
         loop {
-            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) {
+            let s0 = self.read_tsc();
+            let got = self.await_slice(Self::AWAIT_SLICE_MS);
+            let took = self.read_tsc().wrapping_sub(s0);
+            slices = slices.saturating_add(1);
+            if took > longest { longest = took; }
+            if took < shortest { shortest = took; }
+            if let Some(r) = got {
                 // Asked at the moment of arrival, so `take_pending_cap` and `last_recv_badge` inside
                 // it still describe THIS message. A `false` hands ownership to the caller and the
                 // wait goes on; the deadline below is unchanged by how many arrive, so a flood of
                 // other traffic cannot extend it.
-                if mine(&r) { return DeadlineOutcome::Reply(r); }
+                if mine(&r) {
+                    let total = self.read_tsc().wrapping_sub(start) / per_ms;
+                    if total >= 500 {
+                        self.log_fmt(format_args!(
+                            "sdk: a sifted wait took {} ms over {} slice(s) of {} ms - shortest slice {} ms, longest {} ms",
+                            total, slices, Self::AWAIT_SLICE_MS, shortest / per_ms, longest / per_ms));
+                    }
+                    return DeadlineOutcome::Reply(r);
+                }
             }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
@@ -2231,6 +2255,16 @@ impl ServiceContext {
                 // or not anyone is still listening, and that answer will arrive later. A caller that
                 // times out must expect to meet it - here, `mine` will simply be asked about it and
                 // can say no.
+                //
+                // INSTRUMENT (backlog/66): the first slow boot with the instrument above in place
+                // showed the answered path never reaching 500 ms while the caller measured 960 ms per
+                // exchange - so the time is in a wait that ENDS HERE and a retry that answers. A
+                // timeout is exceptional by construction, so this reports every time.
+                let total = self.read_tsc().wrapping_sub(start) / per_ms;
+                self.log_fmt(format_args!(
+                    "sdk: a sifted wait TIMED OUT after {} ms over {} slice(s) of {} ms - shortest slice {} ms, longest {} ms",
+                    total, slices, Self::AWAIT_SLICE_MS,
+                    if shortest == u64::MAX { 0 } else { shortest / per_ms }, longest / per_ms));
                 return DeadlineOutcome::Timeout;
             }
             self.yield_cpu();

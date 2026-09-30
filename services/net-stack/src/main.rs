@@ -249,13 +249,32 @@ fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, s
             // §14.3 puts reacquisition on the client, and the shell needed exactly this for its own
             // net-stack and nic-driver queries. Once per call, and only after the deadline has
             // already passed, so a healthy path is untouched: this is recovery, not a retry loop.
-            _ => {
+            first => {
+                // INSTRUMENT (backlog/66): this branch was silent, and the wrapper above it reports
+                // only the total - so an exchange whose FIRST attempt timed out and whose RETRY
+                // answered looked like one slow answer. Name both halves.
+                let what = match first {
+                    DeadlineOutcome::Timeout => "timed out",
+                    DeadlineOutcome::SendFailed => "could not be sent",
+                    _ => "was refused",
+                };
+                let op = msg.payload_bytes().first().copied().unwrap_or(0);
                 if ctx.reacquire_by_name("nic-driver") {
                     return match sifted_req(ctx, pending, msg, secs) {
-                        DeadlineOutcome::Reply(r) => Some(r),
-                        _ => None,
+                        DeadlineOutcome::Reply(r) => {
+                            ctx.log_fmt(format_args!(
+                                "net-stack: op {} to nic-driver {} on the first attempt - reacquired, and the retry was answered", op, what));
+                            Some(r)
+                        }
+                        _ => {
+                            ctx.log_fmt(format_args!(
+                                "net-stack: op {} to nic-driver {} on the first attempt - reacquired, and the retry failed too", op, what));
+                            None
+                        }
                     };
                 }
+                ctx.log_fmt(format_args!(
+                    "net-stack: op {} to nic-driver {} on the first attempt - and nic-driver could not be reacquired by name", op, what));
                 return None;
             }
         }

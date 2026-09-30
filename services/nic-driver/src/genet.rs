@@ -39,7 +39,7 @@
 //! doctrine in `kernel/src/arch/CLAUDE.md`: the C driver says what the silicon wants, and we implement
 //! that want as a capability service.
 
-use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
 
 // ---------------------------------------------------------------------------------------------
 // Register map. Byte offsets into the 64 KiB window `ctx.mmio()` hands us, which the spawn path
@@ -1320,17 +1320,67 @@ struct Radio {
     mismatch: u32,
     sendfail: u32,
     restale: u32,
+    /// CLIENT REQUESTS THAT ARRIVED WHILE THIS DRIVER WAS WAITING ON THE RADIO. The wait in `rpc`
+    /// used to take whatever landed next as the radio's answer, and a request from net-stack that
+    /// landed in that window was checked against the op it was not, discarded, and its reply cap
+    /// with it. net-stack waited out its whole deadline, reacquired and retried, and over the radio -
+    /// where net-stack sends back to back - that collision repeated every cycle: the three-second
+    /// ping of `backlog/66`. A message with a reply cap is a request, never the radio's reply, so it
+    /// is kept here and served before the next `recv`. Two slots, because one `serve` iteration can
+    /// ask the radio more than once; a third is dropped loudly with its cap reclaimed, and the client
+    /// times out and re-asks, which is defined (26.6, 26.7).
+    held: [Option<(Message, CapHandle)>; RADIO_HELD_MAX],
+    rescued: u32,
+    held_dropped: u32,
 }
+
+/// How many client requests the radio wait can keep for the serve loop. See `Radio::held`.
+const RADIO_HELD_MAX: usize = 2;
 
 impl Radio {
     fn new() -> Self {
-        Radio { answered: 0, slow: 0, timeouts: 0, silent_run: 0, mismatch: 0, sendfail: 0, restale: 0 }
+        Radio {
+            answered: 0, slow: 0, timeouts: 0, silent_run: 0, mismatch: 0, sendfail: 0, restale: 0,
+            held: [None, None], rescued: 0, held_dropped: 0,
+        }
+    }
+
+    /// The oldest held request, if any - served before the next `recv`, because it arrived first.
+    fn take_held(&mut self) -> Option<(Message, CapHandle)> {
+        let first = self.held[0].take()?;
+        self.held[0] = self.held[1].take();
+        Some(first)
     }
 
     fn rpc(&mut self, ctx: &ServiceContext, msg: &Message) -> Option<Message> {
         let want = msg.payload_bytes().first().copied().unwrap_or(0);
         let t0 = ctx.read_tsc();
-        let got = ctx.request_with_reply_ms("wifi-driver", msg, RADIO_MS);
+        // SIFTED, not the first thing that lands. A message carrying a reply cap is a client's
+        // request - net-stack asking for a frame or the link - and is kept for the serve loop; the
+        // wait goes on for the radio's actual answer. `take_pending_cap` reads and CLEARS the cap the
+        // kernel installed for THIS message, so it must be asked here, at arrival (see `held`).
+        let got = ctx.request_with_reply_ms_sifted("wifi-driver", msg, RADIO_MS, |m| {
+            let Some(cap) = ctx.take_pending_cap() else { return true; };
+            let op = m.payload_bytes().first().copied().unwrap_or(0);
+            if let Some(slot) = self.held.iter_mut().find(|s| s.is_none()) {
+                *slot = Some((Message::from_bytes(m.payload_bytes()), cap));
+                self.rescued = self.rescued.saturating_add(1);
+                if self.rescued == 1 || self.rescued % 16 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: a client's request (op {}) arrived while this driver waited on the radio - kept, served next (#{})",
+                        op, self.rescued));
+                }
+            } else {
+                ctx.remove_cap(cap);
+                self.held_dropped = self.held_dropped.saturating_add(1);
+                if self.held_dropped == 1 || self.held_dropped % 16 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: a client's request (op {}) arrived while this driver waited on the radio and both held slots were full - dropped, the client times out (#{})",
+                        op, self.held_dropped));
+                }
+            }
+            false
+        });
         let took_ms = ctx.read_tsc().wrapping_sub(t0) / ctx.duration_cycles(1).max(1);
         let got = match got {
             Some(r) => {
@@ -1437,6 +1487,25 @@ impl Radio {
     }
 }
 
+/// A reply that could not be sent, said WITH ITS REASON. The two reasons are different faults: a full
+/// queue means the requester is alive and behind, a dead capability means the requester already gave
+/// up (timed out and reclaimed its reply cap) before this driver was scheduled to answer - which is
+/// the shape backlog/66 is chasing. The old line latched once and named neither. First failure and
+/// every sixteenth after, so a run of them is a count and not a flood.
+fn reply_failed(ctx: &ServiceContext, e: godspeed_sdk::ipc::IpcError, n: &mut u32) {
+    *n = n.saturating_add(1);
+    if *n == 1 || *n % 16 == 0 {
+        let why = match e {
+            godspeed_sdk::ipc::IpcError::QueueFull => "the requester's queue is full",
+            godspeed_sdk::ipc::IpcError::EndpointDead | godspeed_sdk::ipc::IpcError::CapError(_) =>
+                "the reply cap is dead - the requester stopped waiting before this reply",
+            _ => "another error",
+        };
+        ctx.log_fmt(format_args!(
+            "nic-driver: a reply send FAILED (#{}) - {} - the requester times out", *n, why));
+    }
+}
+
 fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     let mut tx_next: u32 = 0;
     // Bounds the post-transmit counter report, so a diagnostic cannot become a console flood (§26.6).
@@ -1460,25 +1529,33 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets on
     // every iteration and reports every time, which is the flood it exists to prevent.
     let mut capless_logged = false;
-    let mut reply_failed_logged = false;
+    let mut reply_failures: u32 = 0;
     loop {
-        let req = ctx.recv();
-        // The reply cap is the ONLY authority to answer net-stack (§8.5).
-        //
-        // A request that carries none cannot be answered, and dropping it SILENTLY leaves no evidence
-        // anywhere: net-stack waits out its deadline and reports the driver unresponsive, while the
-        // driver's log shows a clean run. The sibling backend (`main.rs`) already logs this; GENET is
-        // the backend that actually runs on the Pi 4 and was the one that forgot (Commandment III -
-        // two implementations of one rule).
-        //
-        // Rate-limited to once, because the condition repeats per request and the report must not
-        // become the flood it is reporting.
-        let Some(reply_cap) = ctx.take_pending_cap() else {
-            if !capless_logged {
-                capless_logged = true;
-                ctx.log("nic-driver: a message with no reply cap - dropping (a request nobody can be answered on, or a late reply from the radio after this driver stopped waiting for it)");
+        // A REQUEST THE RADIO WAIT KEPT IS SERVED FIRST - it arrived before anything the recv below
+        // could return (`Radio::held`).
+        let (req, reply_cap) = match radio.take_held() {
+            Some(h) => h,
+            None => {
+                let req = ctx.recv();
+                // The reply cap is the ONLY authority to answer net-stack (§8.5).
+                //
+                // A request that carries none cannot be answered, and dropping it SILENTLY leaves no evidence
+                // anywhere: net-stack waits out its deadline and reports the driver unresponsive, while the
+                // driver's log shows a clean run. The sibling backend (`main.rs`) already logs this; GENET is
+                // the backend that actually runs on the Pi 4 and was the one that forgot (Commandment III -
+                // two implementations of one rule).
+                //
+                // Rate-limited to once, because the condition repeats per request and the report must not
+                // become the flood it is reporting.
+                let Some(reply_cap) = ctx.take_pending_cap() else {
+                    if !capless_logged {
+                        capless_logged = true;
+                        ctx.log("nic-driver: a message with no reply cap - dropping (a request nobody can be answered on, or a late reply from the radio after this driver stopped waiting for it)");
+                    }
+                    continue;
+                };
+                (req, reply_cap)
             }
-            continue;
         };
         let p = req.payload_bytes();
 
@@ -1550,17 +1627,11 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                 }
                 carrier = next;
             }
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)).is_err() && !reply_failed_logged {
-                reply_failed_logged = true;
-                ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-            }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
             let n = if cable { g.receive(&mut rxbuf) } else { radio.rx(ctx, &mut rxbuf) };
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-        }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes]. Bounded three ways - by
             // BATCH_MAX, by the reply buffer, and by the ring emptying - so it always terminates.
@@ -1586,20 +1657,14 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                 count += 1;
             }
             out[0] = count;
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-        }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
             // UNSUPPORTED on this backend - answered `[0]`, not `[1]`. Ops 6/7/8 are the chaos
             // force-link override and op 5 is a Realtek/e1000-shaped register dump; acking any of them
             // with success would make `chaos link-flap` print that it had exercised link recovery
             // having exercised nothing. A test that cannot fail is worse than absent when it reads as
             // passing. The caller needs an ANSWER, and "not supported here" is one.
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-        }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
         } else {
             // TX FRAME (any multi-byte payload) : transmit and acknowledge. The frame is NOT coupled to a receive - see below.
             if !cable {
@@ -1648,10 +1713,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             // the shared path was changed to match and THIS backend was not, so the Pi 4 kept the old
             // coupled behaviour under the new caller. Frames stay in the ring for the drain (ops 4
             // and 9), which is the path whose job that is.
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-        }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
         }
         ctx.remove_cap(reply_cap);
     }
