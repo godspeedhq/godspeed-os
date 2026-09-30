@@ -196,12 +196,16 @@ fn nic_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i
     // op it asked, because every client request that arrives meanwhile is held behind it.
     let t0 = ctx.read_tsc();
     let r = nic_req_inner(ctx, pending, msg, secs);
-    let took_ms = ctx.read_tsc().wrapping_sub(t0) / ctx.duration_cycles(1).max(1);
+    let t1 = ctx.read_tsc();
+    let per_ms = ctx.duration_cycles(1).max(1);
+    let took_ms = t1.wrapping_sub(t0) / per_ms;
     if took_ms >= 300 {
+        // Both ends print the same clock (cycles since boot, in ms) so the log can say whether the
+        // request arrived at nic-driver late or its answer came back late.
         ctx.log_fmt(format_args!(
-            "net-stack: the NIC exchange for op {} took {} ms ({})",
+            "net-stack: the NIC exchange for op {} took {} ms ({}) - sent at {} ms, answered at {} ms",
             msg.payload_bytes().first().copied().unwrap_or(0), took_ms,
-            if r.is_some() { "answered" } else { "no answer" }));
+            if r.is_some() { "answered" } else { "no answer" }, t0 / per_ms, t1 / per_ms));
     }
     r
 }

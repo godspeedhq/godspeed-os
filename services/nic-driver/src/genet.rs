@@ -1455,6 +1455,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
     let mut radio = Radio::new();
     let mut radio_tx_fail: u32 = 0;
+    let mut status_served: u32 = 0;
 
     // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets on
     // every iteration and reports every time, which is the flood it exists to prevent.
@@ -1503,6 +1504,14 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
         }
 
         if p.len() == 1 && p[0] == 3 {
+            // INSTRUMENT (2026-09-30): net-stack sees its STATUS answered ~950 ms after asking while this
+            // side answers in nothing; the same clock on both sides says which side the wait is on.
+            status_served = status_served.wrapping_add(1);
+            if status_served <= 5 || status_served % 50 == 0 {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: serving STATUS #{} at {} ms",
+                    status_served, ctx.read_tsc() / ctx.duration_cycles(1).max(1)));
+            }
             // STATUS: [ok, mac(6), link, carrier] - net-stack reads the MAC at [1..7] and the link at
             // [7]. The ninth byte names the carrier for `net` (1 the cable, 2 the radio, 0 neither), and
             // is what makes this reply nine bytes where every other backend's is eight or more, so a
