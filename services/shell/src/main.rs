@@ -7663,6 +7663,35 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     got
 }
 
+/// A wifi request whose wait may be long enough to want a way out: `[q] quit` appears once the wait passes
+/// `hint_secs` (a power command carries a whole join behind it, three seconds on hardware; a leave is a
+/// disassociate and a DOWN), and `q` stops the WAIT - the driver finishes what it was asked regardless, and
+/// `wifi status` has the outcome. A "timeout" that comes back at once is a failed send (a respawned driver);
+/// it is reacquired and asked once more, as `wifi_ask` does. A real timeout is never re-sent.
+fn wifi_ask_q(ctx: &ShellCtx, req: &[u8], hint_secs: i64, max_secs: i64) -> ReqOutcome {
+    let msg = Message::from_bytes(req);
+    let t0 = ctx.read_tsc();
+    let first = ctx.request_with_reply_qhint(WIFI_DRIVER, &msg, hint_secs, max_secs, || ctx.console_writeln("  [q] quit"));
+    let at_once = ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(250);
+    match first {
+        ReqOutcome::Timeout if at_once && ctx.reacquire_by_name(WIFI_DRIVER) => {
+            ctx.request_with_reply_qhint(WIFI_DRIVER, &msg, hint_secs, max_secs, || ctx.console_writeln("  [q] quit"))
+        }
+        other => other,
+    }
+}
+
+/// The two ways a `wifi_ask_q` wait ends without an answer, said the same way everywhere.
+fn wifi_no_answer(ctx: &ShellCtx, out: &mut Out, outcome: &ReqOutcome, doing: &str) -> Result<(), ShellError> {
+    match outcome {
+        ReqOutcome::Aborted => {
+            out.line_fmt(ctx, format_args!("stopped waiting - the radio is still {}; `wifi status` has the outcome", doing));
+            Err(ShellError::Unknown)
+        }
+        _ => wifi_not_answering(ctx, out),
+    }
+}
+
 /// Clear whatever is queued on this shell's endpoint. Called after a wifi request the shell stopped waiting
 /// for: its answer, if it ever comes, would otherwise sit in the queue - a `Call` never dequeues it - and
 /// sixteen of those is a full queue nothing can be answered on. Everything queued here is stale by
@@ -8502,10 +8531,12 @@ fn wifi_forget(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellErr
 /// `wifi leave` - leave the current network. The radio stays up.
 fn wifi_leave(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use wifi_wire::*;
-    const REPLY_MS: u64 = 5000;
-    let r = match wifi_ask(ctx, &[OP_DISCONNECT], REPLY_MS) {
-        Some(r) => r,
-        None => return wifi_not_answering(ctx, out),
+    const HINT_SECS: i64 = 1;
+    const MAX_SECS: i64 = 10;
+    let outcome = wifi_ask_q(ctx, &[OP_DISCONNECT], HINT_SECS, MAX_SECS);
+    let r = match outcome {
+        ReqOutcome::Reply(r) => r,
+        other => return wifi_no_answer(ctx, out, &other, "leaving"),
     };
     let p = r.payload_bytes();
     match p.first().copied() {
@@ -8535,11 +8566,13 @@ fn wifi_leave(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError> {
     use wifi_wire::*;
     // `on` may carry a whole join behind it (a few seconds on hardware, bounded by the driver's own join
-    // wait), so its bound is the join's.
-    const REPLY_MS: u64 = 15000;
-    let r = match wifi_ask(ctx, &[OP_RADIO, on as u8], REPLY_MS) {
-        Some(r) => r,
-        None => return wifi_not_answering(ctx, out),
+    // wait), so its bound is the join's - and past a second the wait shows `[q] quit`, as a join does.
+    const HINT_SECS: i64 = 1;
+    const MAX_SECS: i64 = 15;
+    let outcome = wifi_ask_q(ctx, &[OP_RADIO, on as u8], HINT_SECS, MAX_SECS);
+    let r = match outcome {
+        ReqOutcome::Reply(r) => r,
+        other => return wifi_no_answer(ctx, out, &other, if on { "coming on (and rejoining, if it was joined)" } else { "going off" }),
     };
     let p = r.payload_bytes();
     match p.first().copied() {

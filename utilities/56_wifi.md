@@ -131,7 +131,7 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi debug [events\|stats\|firmware\|transport\|trace]` | the driver's own account of itself: counters, the firmware's words, the last 64 frames. Section 4g |
 | `wifi forget <ssid>` | drop the held key for that network. Does not leave the network |
 | `wifi stored` | the networks a key is held for, one per line. Names, never secrets. Sixty-four at most - section 6 |
-| `wifi radio on` / `wifi radio off` | power the radio. `off` disconnects first and says so. `on` then REJOINS the network last joined this boot, with the key it holds and without asking, and says `joined <name>` (asked for by the operator 2026-09-30); a `wifi leave` before the `off` cancels that, and a `wifi forget` of the name leaves nothing to rejoin with. Asking for the state it is already in says `radio already on` / `radio already off`, and sends the radio nothing |
+| `wifi radio on` / `wifi radio off` | power the radio. `off` disconnects first and says so. `on` then REJOINS the network last joined this boot, with the key it holds and without asking, and says `joined <name>` (asked for by the operator 2026-09-30); a `wifi leave` before the `off` cancels that, and a `wifi forget` of the name leaves nothing to rejoin with. Asking for the state it is already in says `radio already on` / `radio already off`, and sends the radio nothing. A wait past a second shows `[q] quit` (rule 11); `q` stops the wait, not the radio |
 | `wifi help` | usage, with one real example per row |
 | `wifi version` | version number plus the collective copyright line |
 
