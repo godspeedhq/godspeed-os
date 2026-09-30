@@ -23,7 +23,7 @@ one is still open.
 |---|---|---|---|---|
 | **Raspberry Pi 4** | **Onboard** | **SDIO** (Arasan `mmc1`) | Cypress **CYW43455** | **Full-MAC** |
 | **Raspberry Pi 2** | USB dongle | USB (via `dwc2`) | Realtek **RTL8188CUS**, `0bda:8176` | **Soft-MAC** |
-| **VisionFive 2 Lite** | **Believed NONE** - see below | (n/a) | (n/a) | (n/a) |
+| **VisionFive 2 Lite** | **Onboard** (settled 2026-09-30, section 44) | **SDIO** (DesignWare `dw_mmc` at `16020000`, `mmc1`, non-removable) | AICSemi **AIC8800D80**, SDIO `C8A1:0082` + `C8A1:0182` | **Full-MAC** (its Linux driver is `fmac`) |
 | **Dell Wyse 5070** | None | - | - | - |
 | **HP T630** | None | - | - | - |
 
@@ -33,13 +33,12 @@ ethernet at `0424:ec00`, and **port 5 is a Realtek WiFi dongle at `0bda:8176`**.
 along, as a high-speed device needing no SPLIT transaction. So there is no unknown here and nothing to
 plug in and look up: the chip is an RTL8188CUS (the RTL8192CU family).
 
-**The VisionFive 2 is the open question, and it is the one fact I will not assert.** Nothing in this
-repository claims it has WiFi. What the repository *does* record for that board is 2x gigabit ethernet
-(DWMAC, zero packet loss), an SD card it boots from, USB through an onboard hub, and HDMI. The JH7110
-carries an M.2 M-key slot intended for NVMe, and a PCIe WiFi card in it would be a different project
-from either of the two above. **Settle this by booting the board** rather than by reading a spec sheet:
-`hw-enumerator` already walks PCI on riscv64, and the device tree names any SDIO WiFi node. Until then
-this document plans for two radios, not three.
+**The VisionFive 2 was the open question, and it is settled - by the board, as this paragraph asked.**
+When this was written nothing in the repository claimed the board had WiFi, and the paragraph refused
+to assert it from a spec sheet. The vendor's own Linux boot log from the board (2026-09-07, kept in the
+operator's captures) answers it: an AICSemi AIC8800D80 WiFi/Bluetooth combo on SDIO, the third radio.
+Section 44 has the evidence and what it means for a port. This document now plans for three radios, two
+of them full-MAC.
 
 **Neither x86 box has WiFi, which is a convenience.** It means the QEMU-first development pattern that
 carried the whole network stack (`e1000` in QEMU, RTL8168 on the bench) **does not transfer here**.
@@ -530,7 +529,7 @@ someone reading it fresh.
 ## 11. Open questions, for sign-off before any code
 
 1. **Does the VisionFive 2 Lite have WiFi at all?** Settle on the board. It changes the radio count and
-   nothing else in this plan.
+   nothing else in this plan. *Settled 2026-09-30, section 44: yes, an AIC8800D80 on SDIO.*
 2. **Firmware blob: in the repo, or supplied by the user?** A licensing call, not a technical one.
 3. **Is the Pi 4 radio behind the Arasan controller, with the SD card on `emmc2`?** Section 4's whole
    argument rests on it. Confirm against the device tree before writing code.
@@ -3184,3 +3183,45 @@ known` - or `no /wifi.keys` the first time, then `wifi join`, then `/wifi.keys w
 and on the boot after that, `joining the network last joined, from /wifi.keys`, `JOINED`, and `ping`
 answering with nothing typed. `wifi forget <name>` rewrites the file with the name gone, and the next boot
 does not join.
+
+## 44. The VisionFive 2 Lite has a radio, and its own boot log says which (2026-09-30)
+
+Section 1 refused to assert this from a spec sheet and asked for the board to settle it. The board did,
+in the vendor Linux boot log captured on 2026-09-07 while bringing up the RISC-V port (`build/`, not in
+the repository). Read from that log, in order:
+
+- U-Boot: `WIFI/BT support: 1`.
+- The second DesignWare MMC host, `dwmmc_starfive 16020000.mmc` (`mmc1`), reports `card is non-removable`
+  and then `mmc1: new high speed SDIO card at address 390b` at 49.5 MHz. The first host, `16010000.mmc`
+  (`mmc0`), is the SD card the board boots from. Same shape as the Pi 4: the radio is a soldered SDIO
+  function on its own host, and the boot medium is on the other.
+- The vendor driver identifies it: `aicbsp_sdio_probe:1 vid:0xC8A1 did:0x0082`, `:2 vid:0xC8A1
+  did:0x0182` (two SDIO functions, WiFi and Bluetooth), `aicwf_sdio_chipmatch USE AIC8800D80`, `chip rev: 7`.
+  The SDIO clock is first set to 5 MHz for the firmware load.
+- The firmware is loaded FROM THE HOST, in pieces, from `/lib/firmware/aic8800_sdio/`: a patch table
+  (`fw_patch_table_8800d80_u02.bin`), an ADID blob (`fw_adid_8800d80_u02.bin`), a patch and an extension
+  patch (`fw_patch_8800d80_u02.bin`, `_ext0.bin`), a Bluetooth patch table, and then the WiFi firmware
+  proper, `fmacfw_8800d80_u02.bin` - "fmac", full-MAC. Then `wlan0` and `p2p-dev-wlan0` appear.
+
+**What this means for a port, said before anyone plans one.** It is the Pi 4's SHAPE - an SDIO
+full-MAC radio whose firmware the host uploads - with none of the Pi 4's PARTS:
+
+- **The SDIO host is a DesignWare MMC block, not an Arasan/SDHCI.** `arch/riscv64` would need a
+  `dw_mmc` host layer; nothing in `arch/aarch64/sdio.rs` carries over except the shape of CMD52/CMD53.
+- **The chip is AICSemi's, not Broadcom's.** Everything in `services/wifi-driver` from the backplane up
+  - the CR4 upload, SDPCM, BCDC, the `escan` protocol, the event codes, the `wsec_key` structure - is the
+  Broadcom firmware's language and does not apply. The AIC8800's control protocol is whatever its vendor
+  driver speaks; that driver (an out-of-tree Linux module, `aic8800_sdio` / `rwnx`) would be the
+  executable datasheet (26.14), and it is large.
+- **The firmware is proprietary vendor blobs**, four of them for WiFi alone, and the section 8 question
+  - in the repository or supplied by the user - is asked again for a different vendor with a different
+  licence. Not answered here.
+- **What DOES carry over is everything above the firmware:** `crypto.rs`, `eapol.rs`, the join state
+  machine, the credential table and `/wifi.keys`, the frame interface and `nic-driver`'s carrier rule,
+  and the `wifi` utility. A full-MAC radio with a host-side handshake needs exactly those, and none of
+  them names Broadcom.
+
+So the VisionFive radio is a real third port and a second driver, not a variant of the first. It is
+recorded here as the answer to section 1's question, and as scope that is NOT part of this branch
+(section 9). The riscv64 kernel's `hw_random` is still a stub; the JH7110 has a hardware generator of its
+own, and filling that seam would help `net-stack` on the board whether or not the radio is ever driven.

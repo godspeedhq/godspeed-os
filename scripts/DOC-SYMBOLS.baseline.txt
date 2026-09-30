@@ -90,3 +90,5 @@ bwfm_sdio_rx_glom                  # OpenBSD if_bwfm_sdio.c - reads one chunk pe
 ieee80211_eapol_key_decrypt        # OpenBSD net80211/ieee80211_crypto.c - opens message 3`s key data: AES key unwrap under the KEK for descriptor v2, 8 bytes shorter than it arrived; crypto::aes_key_unwrap is the unwrap - external, 26.14
 ieee80211_recv_group_msg1          # OpenBSD net80211 ieee80211_pae_input.c - the group-key message 1 receiver; backlog/64 names it as the reference for the rekey answer this driver does not give yet - external, 26.14
 ieee80211_send_group_msg2          # OpenBSD net80211 ieee80211_pae_output.c - the group-key message 2 sender; the other half of backlog/64 - external, 26.14
+aic8800_sdio                       # docs/wifi.md 44 - the AICSemi vendor Linux module for the VisionFive 2 Lite radio, named as the executable datasheet a riscv64 port would read - external, 26.14
+dw_mmc                             # docs/wifi.md 44 - the DesignWare MMC host block (Linux dwmmc_starfive) the VisionFive radio hangs off; no host layer for it exists here yet - external, 26.14
