@@ -1175,6 +1175,30 @@ impl ServiceContext {
         n
     }
 
+    /// Wait, bounded by `max_ms`, for up to `owed` replies to arrive in the reply MAILBOX, and discard
+    /// them. Returns how many were discarded, or `None` when this service has no mailbox - in which case
+    /// owed-reply accounting cannot work (replies land on the shared endpoint) and the caller must fall
+    /// back. For a synchronous caller that gave up on `owed` requests whose answers are still in flight:
+    /// `drain_stale_replies` clears what has ARRIVED; this also waits for what has not.
+    pub fn drain_owed_replies(&self, owed: usize, max_ms: u64) -> Option<usize> {
+        let (recv, _) = self.reply_mailbox()?;
+        let t0 = self.read_tsc();
+        let limit = self.duration_cycles(max_ms);
+        let mut n = 0usize;
+        while n < owed {
+            match crate::ipc::try_recv(recv) {
+                Ok(Some(_)) => n += 1,
+                _ => {
+                    if self.read_tsc().wrapping_sub(t0) >= limit {
+                        break;
+                    }
+                    self.sleep_ms(10);
+                }
+            }
+        }
+        Some(n)
+    }
+
     pub fn recv_handle(&self) -> Option<crate::capability::CapHandle> {
         let slot = Self::ctx().recv_slot;
         if slot == u32::MAX { None } else { Some(crate::capability::CapHandle(slot)) }

@@ -463,8 +463,23 @@ pub mod reply {
     pub const OK: u8 = 0;
     /// The scan ran and failed; the driver's log says where.
     pub const SCAN_FAILED: u8 = 1;
-    /// The radio never came up at boot, so there is nothing to scan with.
+    /// The radio is not up (at boot or after a respawn), so there is nothing to scan with; byte 1 says why.
     pub const RADIO_DOWN: u8 = 2;
+    /// Byte 1 of a `RADIO_DOWN` answer: WHY the radio is down, so the shell can say it rather than guess.
+    /// 0 means a driver too old to say.
+    ///
+    /// `DOWN_TRAPPED`: the firmware was loaded and trapped at start (`SDPCM_SHARED_TRAP`).
+    pub const DOWN_TRAPPED: u8 = 1;
+    /// The bring-up stopped at a stage other than the firmware's start; the serial log names the stage.
+    pub const DOWN_BRINGUP: u8 = 2;
+    /// No working radio answered on this driver's bus.
+    pub const DOWN_NO_RADIO: u8 = 3;
+    /// Byte 3 of an `off` / `off hard` answer: the driver checked, and the radio IS off.
+    pub const OFF_VERIFIED: u8 = 1;
+    /// The check could not be made (the firmware did not answer the question); the off was not confirmed.
+    pub const OFF_UNVERIFIED: u8 = 2;
+    /// The check CONTRADICTS the off: the firmware still says it is up, or the chip still answers its bus.
+    pub const OFF_CONTRADICTED: u8 = 3;
     /// Not a request this driver understands.
     pub const UNKNOWN_OP: u8 = 3;
 

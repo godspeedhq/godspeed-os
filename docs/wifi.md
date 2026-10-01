@@ -3362,12 +3362,15 @@ restart loop is closed in userspace**, with no reset of any kind and no power cy
 volatile, the firmware is not, and a respawn converges on the firmware it finds. `backlog/69` is
 resolved by this section. What stays true from section 45: a firmware that has STOPPED - killed
 mid-upload, or trapped - cannot be restarted on this chip without power, and that case is reported
-rather than retried; when this was written it cost a reboot, and section 47 closes that - the driver power-cycles the chip and starts from cold, for as many attempts as it takes.
+rather than retried; when this was written it cost a reboot, and section 47 closes that - the driver power-cycles the chip ONCE; if the chip
+still comes up warm the driver serves `radio down` with its reason, and `wifi radio powercycle` (three
+cycles per run, re-runnable, section 48) is the way out. No reboot.
 
 The PMU watchdog and the RAM clear are gone from the code, recorded above as tried. They were the reset
 path's last two steps, and the reset path no longer runs on a chip with a live firmware. If the adopted
-firmware does not answer, the driver says so and serves `radio down` until a reboot rather than
-restarting a firmware the ROM will not boot.
+firmware does not answer, the driver says so and serves `radio down` with its reason (section 49)
+rather than restarting a firmware the ROM will not boot; `wifi radio on` and `wifi radio powercycle`
+take it from there.
 
 The rule all four stages obey: a respawn inherits a chip the previous instance left RUNNING, and every
 step written against the power-on state has to say what it does with a running one.
@@ -3401,7 +3404,11 @@ for the two cases where there is no firmware to adopt: a card that answers CMD52
 Both now cut the power, identify the card as one just powered up, redo the SDIO-side bring-up, and
 take the boot's own upload path from stage 9. On a machine with no control over the device's power the
 SDK call returns `false`, the CCCR RES path of section 45 remains, and the honest line about ROM traps
-is what the log says. No reboot in any case the driver can reach.
+is what the log says. Two further uses came later the same day: a driver whose stage 3 finds no card
+on its bus at all asserts the chip's power and identifies once more (section 49), and `wifi radio off
+hard` cuts the power and leaves it cut. A power cycle is not a guaranteed power-on: it may still come up
+warm (section 48), and the driver's own cycle runs once before it reports the radio down with its
+reason. No reboot in any case the driver can reach.
 
 **The operator's form: `wifi radio powercycle`.** The same cycle on request, composed from authority both
 sides already hold. The shell asks the driver, which holds `DEVICE_POWER`, to cut and restore the chip's
@@ -3410,8 +3417,10 @@ kills it. The respawn finds a card that does not answer the CCCR - the boot's ow
 comes up from power-on and rejoins. The order is the point: power first, then the kill, because a
 respawn onto a chip whose firmware still runs would adopt it (46), which is the opposite of a power cycle.
 
-**What a power cycle costs, and the first run's lesson.** The chip comes up from cold in about thirty
-seconds and the new instance serves nothing meanwhile. On the first run nic-driver kept asking it, the
+**What a power cycle costs, and the first run's lesson.** On that first run the radio took about thirty
+seconds from the cut to the join, which included nic-driver's backlog described next; the cold bring-up
+itself, power-on to joined, is about twelve to fifteen seconds, and that is the figure the rest of this
+document uses. The new instance serves nothing meanwhile. On the first run nic-driver kept asking it, the
 full bound per request, and net-stack's exchanges queued behind that for fifteen seconds; ping was dead
 for a minute after the join. nic-driver now treats a radio that has gone silent three requests running as
 DOWN for a second between probes and answers net-stack at once, so the link reads honestly as down for
@@ -3438,7 +3447,9 @@ chips, three firmware traps at start. A hold-off is a power-on only sometimes, a
 predicts which. So `wifi radio powercycle` verifies: a driver that comes back reporting its radio down is
 a warm chip, and the shell cycles again with the power off twice as long, up to sixteen seconds, for as
 many attempts as it takes, saying which one succeeded - counted, never bounded, because a bound ends in
-the one word nothing above the kernel gets to print. And the upload now zeroes the chip's vector area
+the one word nothing above the kernel gets to print. (Superseded by section 48: the operator ruled the
+unbounded loop out, and the hold-off doubling went with it - three cycles per invocation, a fixed hold-off,
+and the command can be run again.) And the upload now zeroes the chip's vector area
 (0x0..0x400, where the reset vector goes) before the reset vector: a power-on leaves it zero, a warm chip
 keeps the previous firmware's entries there, and every warm start trapped at `pc 0x25`, inside it. The hold-off travels in the request, so the policy is the shell's and the mechanism
 the driver's; the driver serves the op from its "radio down" loop, which is where a trap leaves it.
@@ -3452,9 +3463,10 @@ stay soft. `wifi radio off hard` is one rung down: the driver leaves the network
 still say so, cuts the chip's power through its own grant, and stays alive to answer "powered down".
 `wifi radio on` converges from either off: the soft switch when the firmware is up, and after `off hard`
 it restores the power, restarts the driver, and watches the cold path to `radio on succeeded - joined`.
-`powercycle` is off-hard-and-on in one act, with the retries above. Each word names what it does to the
-chip; `on` is the one the operator can always type without knowing the state. `off hard` is also the first
-deterministic way this work has had to produce a cold chip on demand.
+`powercycle` is off-hard-and-on in one act, three cycles at most per run (section 48). Each word names
+what it does to the chip; `on` is the one the operator can always type without knowing the state. `off
+hard` cuts the power and verifies the cut (section 49); it does NOT produce a cold chip on demand - `on`
+after it trapped at 09:44 and again at 14:43, so `on` hands a warm chip over to the powercycle loop.
 
 `wifi radio powercycle` is also re-runnable from every state the driver can be in: serving normally
 (cut, restart, watch), in its radio-down loop (the op is served there), powered down after `off hard`
@@ -3476,12 +3488,14 @@ did the soft switch and nothing else, is now the HARD ON when the radio is down:
 warm it hands over to the powercycle loop rather than telling the operator which command to type next.
 `on` is the one word that always converges; the operator does not need to know the rung.
 
-`off hard` blocks until the kernel has read the pin back low, and the key it offers while it does is
-`[b] background`, not `[q] quit`. The convention gives `q` to a task that stops when the operator leaves
-and `b` to one that keeps running; the driver finishes the cut whether or not the shell waits, so `q`
-would promise a stop that cannot happen. The SDK's abortable wait had `q`/`Q`/Esc hard-coded; it takes
-the leave keys from the caller now, and the q-hint wrapper every other command uses passes the same three
-it always did.
+`off hard` blocks until the kernel has read the pin back low. As first written it offered `[b]
+background` while it waited, on the reasoning that the driver finishes the cut whether or not the shell
+waits, so `q` would promise a stop that cannot happen. **The key was removed on 2026-10-01:** the
+request is a blocking kernel `Call`, and a shell blocked in a `Call` cannot read the console, so no key
+could have been noticed until the reply had already arrived. `off hard` now blocks for about three
+seconds and offers no key, and says so, rather than printing a hint it cannot honour. The soft `on` and
+`off` went the same way and offer no `[q]` (section 49). The SDK's abortable wait still takes its leave
+keys from the caller, and the q-hint wrapper every other command uses passes the same three it always did.
 
 **And the hold-off was never the variable.** Seventy-five seconds powered down is longer than any
 capacitor on that rail holds, and the chip still came up warm. What differs between this driver's power-on
@@ -3489,14 +3503,140 @@ and a board power-on is not the chip's side but the HOST's: Linux's `mmc_power_u
 with the clock at ZERO and starts the init clock only after the power-on delay, and a Broadcom part samples
 its boot straps - some of them on the SDIO data lines - at the rising edge of WL_REG_ON. This driver left
 its 25 MHz clock running on those lines through the edge, which is a coin flip on the boot mode and matches
-the one-in-two warm starts above better than any theory about residual charge did. The card clock is now
-stopped (`Host::stop_clock`) before every power-on - the cycle, the adopt-failure cycle, and `on` after
-`off hard` - and the respawned instance re-initialises the host from reset and sets the clock itself.
-Whether this is THE cause is for the next boots to say: the prediction is that cold starts stop trapping,
-and a trap with the clock stopped refutes it cleanly.
+the one-in-two warm starts above better than any theory about residual charge did. The card clock was
+then stopped just before every power-on, and the respawned instance re-initialised the host from reset.
+The prediction was that cold starts would stop trapping, and that a trap with the clock stopped would
+refute it cleanly. **It was refuted:** section 48.
+
+## 48. The host parked across the cut, and a bounded powercycle (2026-10-01)
+
+**The clock-only change was refuted, and may have made it worse.** Boot 2026-10-01 11:17 ran with the card
+clock stopped before every power-on. Seven firmware loads completed on warm restarts and all seven
+trapped (`flags 0x0401`, `pc 0x25`). The documented rate before the change was about four cold in seven
+(section 47: one of one, then three of six). Seven of seven is not proof of a regression at these sample
+sizes, but it is no improvement, and the change is removed. The shell's retry counter in that run read
+higher than seven because several of its cycles were cut short before a firmware load finished; only
+completed loads are samples.
+
+**What no build had tested: a host that is silent for the whole off window.** In every build before this
+one the 25 MHz card clock kept toggling into the unpowered chip from the cut to the power-on - two
+seconds in a powercycle, seventy-five in the `off hard` test - and the clock-only change touched only the
+last instant. At mains boot the VideoCore raises WL_ON with the Arasan untouched, and boot comes up cold
+every time. Two causal readings fit that, and the same change tests both: the toggling lines back-power
+the chip through its I/O pads while its rail is nominally off, and the lines are not in their boot state
+at the rising edge where the chip samples its straps. So the driver now PARKS its host - a full software
+reset (SRST_HC), card and internal clocks off, nothing in flight - immediately after the kernel accepts
+the cut, and again just before it restores the power, and nothing re-enables a clock until the next user
+of the host brings it back from reset after the power-on delay (refuted the same afternoon - see
+**Result** below; the park stays in the code, as the host's honest state while the chip is
+unpowered, but it is not the fix). The respawned instance does that at stage
+2; the two in-place paths (`sdio::identify` and the adopt-failure branch) do it before CMD0, because
+`identify_once` sets no clock. The park follows the accepted cut rather than preceding it, so a cut the
+kernel refused leaves the host and a live session untouched; the gap is the mailbox's return, well under
+a millisecond of a two-second quiet window.
+
+**What a userspace park cannot reach.** The SDIO pads' pull resistors live in the GPIO block, which the
+kernel muxes at boot and this driver cannot touch. If the parked host still comes up warm, the next
+experiment is the kernel's: park the pads themselves (input, pulls off) inside `DevicePower` for the off
+window. That is a wider kernel change than section 47's and needs the operator's word before it is made.
+**That condition is now met** (see the result below): the parked host still comes up warm. The pad
+experiment is the next one, and it waits on the operator's word; it has not been made.
+
+**`wifi radio powercycle` is bounded.** Three cycles per invocation, then the prompt, saying how each
+ended; the command can be run again, and nothing needs a reboot. The hold-off is fixed at two seconds.
+
+**The prediction, specific enough to be wrong.** Ten `wifi radio powercycle` runs, each from a joined
+radio: if the park is the fix, every run ends `powercycle succeeded - joined` on its first attempt and the
+driver log shows `flags 0x00000001` for each load. Near half cold means the park changed nothing that
+matters and the pads are next. None cold means the park made it worse, and that is information too.
+
+**Result: refuted.** The parked host did not stop the warm starts. Boots of 2026-10-01: at 13:58 the
+radio came up cold; at 14:30:39 and again at 14:30:54 a `powercycle` cycle trapped at start - one cold in
+three across those three samples, no better than the unparked rate. At 14:43:49 `wifi radio off hard`
+followed by `on` trapped as well, and the 09:44 boot (section 47) had already shown seventy-five seconds
+powered down trapping without the park. For comparison, the clock-only change before it got none of
+seven. The samples are small and said as such, but the prediction was "every run cold on its first
+attempt", and three of four warm is a clean refutation of that. What the park rules out is the host's
+clock and controller state across the off window; what it cannot rule out is the pads, which is the
+kernel experiment above, and that waits on the operator's word. Until then the warm chip is a reported,
+recoverable state rather than a fixed one: the driver serves `radio down` with its reason (section 49)
+and `wifi radio powercycle` is re-run until it comes up cold. One caution on the 14:30 run: its
+attempts 2 and 3 reported "came up warm" within 150 ms of the power-on, which no chip does - that was a
+stale `radio down` reply, not the chip (section 49). As in the 11:17 count above, only completed firmware
+loads that logged a trap are counted as samples.
 
 **On other radios.** The adopt test of section 46 is SDIO-standard - the CCCR, `IO_ENABLE`, `IO_READY`
 - and transfers to any full-MAC SDIO radio whose firmware the host loads; the protocol used to ask that
 firmware whether it is alive does not (BCDC/SDPCM is Broadcom's), and neither does the power pin, which
 is a board fact the arch layer answers per device. The VisionFive 2 Lite's AIC8800D80 (44) would reuse
 the shape of both and none of the code.
+
+## 49. Replies matched by sender, a verified off, and why the radio is down (2026-10-01)
+
+**The stale reply, found by what it broke.** Every shell radio command goes through one helper,
+`wifi_ask`, which sends the request and waits in a kernel `Call` for the answer. The kernel matches a
+`Call`'s reply by SENDER, not by request: any message from the driver that lands in the shell's reply
+mailbox is taken as the answer to whatever the shell asked last. A request the shell had stopped waiting
+for - a bound that expired, a watch that moved on - still gets its answer eventually, and that answer
+then sits in the REPLY MAILBOX until the next request collects it as its own. Two boots showed what that
+costs. At 13:59 (boot 13:58) a stale `OK` was read as the answer to a power request, the shell went on to
+kill the driver mid power cycle, and the chip was left unpowered with nobody holding it. At 14:30 a late
+`radio down` was collected by `powercycle`'s attempts 2 and 3, which therefore reported the chip "came up
+warm" 150 ms after the power-on - a time no chip comes up in - and counted two cycles that measured
+nothing (section 48 excludes them).
+
+**Two earlier fixes cleared nothing, and said so.** The first drained stale messages at the start of each
+command; the second skipped unmatched replies in a loop. Both read the shell's MAIN endpoint, and the
+stale replies were never there - they were in the mailbox. The serial log at 14:43 printed `0 stale
+message(s) cleared` on every line, and the powercycle watch was blind for 90 s behind replies it could
+not see. A drain that reports zero every time is an instrument that never fires.
+
+**The fix now in the code** (image `2f4a1e32`, on the card, NOT yet run on hardware): `drain_stale_replies`
+empties the reply mailbox itself; the shell counts the replies it is still OWED (requests whose bound
+expired before the answer came); `drain_owed_replies` waits for those in the mailbox before anything new
+is asked; nothing is sent while any are owed; and a debt older than 30 s is forgiven, because a driver
+that died owes nothing and the shell must not wait for it forever.
+
+**Known gap, recorded rather than fixed.** While replies are owed, `wifi_ask` returns "no answer" WITHOUT
+sending the request. Every caller reads "no answer" as the driver not answering. So `powercycle` can take
+it for a silent driver and restart the driver without the power ever having been cut - a respawn that
+adopts the running firmware rather than a power cycle - and an ordinary verb can print "not answering"
+about a request that was never sent. The honest fix is a distinct outcome for "not sent, replies still
+owed"; until it exists, a `not answering` within 30 s of an abandoned command may be this rather than the
+driver.
+
+**Why the radio is down, said by the driver.** `wifi status` with the radio down used to print one line,
+"did not come up at boot", which was wrong after a respawn and silent about the cause. The driver's
+`RADIO_DOWN` reply now carries the reason in byte 1, and the shell says it:
+
+- `DOWN_TRAPPED` - "wifi: the radio is down - its firmware trapped at start (the chip came up warm); `wifi radio powercycle` cuts its power and tries again"
+- `DOWN_NO_RADIO` - "wifi: the radio is down - the driver found no working radio on its bus; `wifi radio powercycle` restores the chip's power and tries again"
+- `DOWN_BRINGUP` - "wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again"
+
+After `wifi radio off hard`, status says `radio off (hard - the chip is powered down; wifi radio on powers
+it up)`. "Did not come up at boot" is gone.
+
+**An off that is checked, not assumed.** The soft `wifi radio off` used to report success when the
+firmware accepted the command; it now asks the firmware back with `WLC_GET_UP` (162) and reports what it
+says. `off hard` verifies the cut from the bus: 50 ms after the kernel accepts it, the driver sends a CMD52
+and expects nothing to answer. Reply byte 3 carries the verdict - 1 verified, 2 unverified (the check could
+not be made), 3 contradicted (the chip still answered) - and the shell prints `... - verified: ...` for the
+first and `... FAILED ...` for a contradiction, never a bare "done". `off hard` blocks for about three
+seconds and offers no key; the soft `on` and `off` block too and offer no `[q]`, because a shell blocked in
+a `Call` cannot read the console (section 47). A soft `on` that rejoins can take up to 15 s.
+
+**A bus with no card on it gets the power asserted.** A driver whose stage 3 finds no card at all - not a
+card with a dead firmware, but nothing answering CMD5 - used to report "no working radio" and stop. A
+chip left unpowered (13:59 above is how) looks exactly like that. The driver now asserts the chip's power
+through `DevicePower` and identifies once more; only if the bus is still empty does it serve `radio down`
+with `DOWN_NO_RADIO`.
+
+**Known gap: the loop for a driver that never reached its firmware.** `serve_unavailable` is where the
+driver waits when it has no window, the host failed, the card was still missing after the retry, or the
+backplane would not open. It serves `powercycle` and nothing else: `off hard` is answered with
+`RADIO_DOWN`, and the shell, reading that as a driver that cannot act, suggests `kill wifi-driver` - which
+is the wrong advice for a request the driver could have honoured. Recorded here and in the driver's
+comment; `powercycle` works from that state.
+
+**Not on hardware yet.** The verified off, the bus check after `off hard` and the mailbox fix are in
+image `2f4a1e32` on the card and have not been run. Each claim above about them is what the code does, not what a boot showed.

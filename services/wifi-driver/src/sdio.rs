@@ -273,6 +273,13 @@ pub fn read_reg(h: &Host, func: u8, addr: u32) -> Option<u8> {
     read_reg_detail(h, func, addr).ok()
 }
 
+/// Does an INITIALISED card answer on this bus? A CMD52 read of its CCCR revision: a chip whose power
+/// was never cut keeps its SDIO state and answers with its nonzero revision; one whose power was cut is
+/// silent (or uninitialised, and so silent to CMD52). The test `wifi radio off hard` verifies with.
+pub fn initialised_card_answers(h: &Host) -> bool {
+    read_reg(h, 0, cccr::REVISION).map_or(false, |r| r != 0)
+}
+
 /// Write one register byte through CMD52. `None` means the card did not answer or refused.
 pub fn write_reg(h: &Host, func: u8, addr: u32, val: u8) -> Option<()> {
     let arg = (1 << 31) | ((func as u32 & 0x7) << 28) | ((addr & 0x1_FFFF) << 9) | val as u32;
@@ -329,6 +336,11 @@ pub fn identify(h: &Host, ctx: &ServiceContext) -> Option<Card> {
         // false and the CCCR RES path below is what remains.
         if crate::power_cycle_device(ctx, h) {
             ctx.log("wifi-driver: the radio was power-cycled - identifying it as a card just powered up");
+            // The host was PARKED across the cut; CMD0 below needs a clock, and `identify_once` sets none.
+            if !h.reset(ctx) {
+                ctx.log("wifi-driver: the host did not come back from its park after the power cycle");
+                return None;
+            }
         } else if write_reg(h, 0, CCCR_IO_ABORT, CCCR_IO_ABORT_RES).is_none() {
             ctx.log("wifi-driver: no power control here, and the CCCR RES write was refused by a card that answers CMD52 - identifying anyway");
         } else {

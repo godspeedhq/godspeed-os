@@ -363,3 +363,51 @@ from the live set, so no single kill-ordering is special-cased. Result on hardwa
 and `ping` resumes after every round, with no kernel panic - *"not even a blip."* This is the networking
 half of the same restartability story the storage stack tells (`docs/persistence.md` §6.16,
 `docs/naming-design.md` §8 risk #11): the system reconverges from any perturbation.
+
+## 16. The clock is not the network's (2026-10-01)
+
+**Status:** fixed in code; passed the x86 shell suite 215/0 and a Pi 4 QEMU boot. NOT yet run on Pi 4
+hardware - the card carries the old `net-stack`.
+
+**The coupling.** `net-stack` fetched the wall clock (SNTP: a DNS resolve, then up to three
+send-and-drain tries, up to about fifteen seconds when the server or resolver was silent) INSIDE its single serve loop, and started it three
+ways while the clock was unset: at the end of the dance that configures the network, on the `time`
+service's nudge every twenty seconds, and on ordinary client requests - status, DNS, ping and ARP each
+could start one. For the whole exchange the loop served nobody. Boot 2026-10-01 11:17-11:18 on the Pi 4 shows the
+cost: `ping echo 2 was answered after 7092 ms`, while that same echo's wire round trip was 39 ms. `date sync`
+appeared to cure it only because a success latched the clock and quietened the nudges.
+
+**The decoupling.**
+
+- No client request starts clock work. The per-request retry is gone.
+- Configuring the network does not fetch the clock. The dance ends when the network is configured.
+- `time` pursues the clock, as it owns it: its nudge (op 11) starts a BACKGROUND query. `net-stack` sends it
+  and returns to the loop; the poll step, which already drains frames every `POLL_MS`, records the
+  answer; the loop hands it to `time`, or after a deadline resends or gives up - and says so.
+- The nudge is recorded where it used to be lost. It is one capless byte, `[11]`, and it used to be
+  dropped by the dance and taken for the driver's answer by every driver wait (orphaning the real
+  reply). It is now recorded as owed by the sifted driver waits (`nic_req`, `nic_req_ms`,
+  `nic_drain_ms`), the dance's serve pass and the capless arm, and the loop serves it between requests.
+  A nudge that finds no network stays wanted, and is served on the first pass after the network is
+  configured. **Still NOT covered:** `nic_status_req`'s `try_recv` clear (used by `link_is_up`) discards
+  capless messages, and the unsifted waits in `dns_resolve` (its ARP and its rx-only drain, which would
+  parse the nudge as a frame batch) and the ping drain's ARP acknowledgement eat it. A nudge there is
+  lost, and `time` re-sends it 20 s later.
+- `date sync` (op 10) stays synchronous, because the operator asked and is waiting - the only
+  synchronous fetch apart from the fallback below. On an unleased, unconfigured stack it can run the whole dance first.
+- Where the poll cannot run - `net-stack`'s cycle counter never calibrated - a nudge falls back to the
+  old synchronous fetch, and the log says so: a background query there could never be answered.
+- A nudge that finds the cable in but the stack unconfigured runs the dance first, and the dance still
+  blocks the loop (below).
+- The background query goes straight to the anycast fallback (162.159.200.123, time.cloudflare.com),
+  with no DNS: a DNS lookup would block the loop. A network that blocks that address but allows
+  pool.ntp.org gets a clock only from `date sync`, which resolves the pool first. And a reply that lands
+  while another operation is draining frames is not recorded by the job; it is recovered only by the
+  resend.
+
+**What this does not fix, recorded rather than smoothed over.** Two things still hold the serve loop.
+The dance itself (DHCP and ARP) blocks it while the network is being configured - `backlog/28` and
+`backlog/29` describe the incremental dance that would fix that. And on the Pi 4 every exchange with
+`nic-driver` can cost a second, because the first send does not wake it: `backlog/66`, a lost wake-up in
+the kernel's blocked-receiver path, measured and parked. The decoupling should remove the multi-second
+stalls the clock caused - not yet run on hardware; it does not touch that one-second tax, and a slow `ping` after this change is that.

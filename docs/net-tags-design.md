@@ -351,6 +351,21 @@ BLOCKS THE SERVE LOOP, which `docs/tcp-design.md` already quotes this service's 
 rework of the state machine rather than a constant"). The hold covers the common case and reports the
 uncommon one; it does not pretend to have fixed the loop.
 
+**2026-10-01: the nudge no longer runs SNTP inline.** The query is sent and the loop goes on, and the
+answer is caught by the poll step (`docs/networking.md` 16), so the loss this section measured should no
+longer happen on that path - not yet re-measured with `tcp_qemu_test.py`, and not yet run on hardware.
+The nudge itself, which the driver waits took for the driver's answer, is now recognised and kept by
+the sifted driver waits (`nic_req`, `nic_req_ms`, `nic_drain_ms`), the dance's serve pass and the
+capless arm. Not everywhere: `nic_status_req`'s clear and the unsifted waits in `dns_resolve` and the
+ping drain still lose one, and `time`'s re-send 20 s later is the backstop. Two exceptions keep SNTP or
+the dance in the loop: with no calibrated cycle counter the nudge falls back to a synchronous fetch, and
+a nudge on an up-but-unconfigured link runs the dance first. The dance still blocks the serve loop;
+that half of this paragraph stands.
+
+**The hold has since become the general stash.** What this section scoped to the nudge is now a bounded
+stash of `STASH_N` (4) displaced requests, each held up to `HOLD_MS` (1500 ms), serving requests
+displaced by the dance and by every driver exchange (`backlog/28`).
+
 ---
 
 ## 8. The CLIENT hop is tagged now (2026-09-14)

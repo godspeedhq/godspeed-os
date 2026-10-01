@@ -1336,6 +1336,8 @@ pub fn set_cmd(
 /// issues this during bring-up before anything else touches the radio.
 /// `BWFM_C_DOWN` - take the interface down. `bwfm_stop`: `bwfm_fwvar_cmd_set_int(sc, BWFM_C_DOWN, 1)`.
 const CMD_DOWN: u32 = 3;
+/// `WLC_GET_UP` (162, Broadcom wlioctl.h): is the interface up? 0 is down.
+const CMD_GET_UP: u32 = 162;
 /// `BWFM_C_DISASSOC` - leave the network. `bwfm_newstate`, on the way back to SCAN:
 /// `bwfm_fwvar_cmd_set_data(sc, BWFM_C_DISASSOC, NULL, 0)` - no payload at all.
 const CMD_DISASSOC: u32 = 52;
@@ -1525,6 +1527,13 @@ pub fn disassoc(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext)
 /// `bwfm_stop` does too (DOWN, then UP again with the mode commands between).
 pub fn radio_down(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
     set_cmd_int(h, w, s, CMD_DOWN, 1, "down", ctx)
+}
+
+/// Ask the firmware whether its interface is up: `Some(false)` is down, `None` no answer.
+pub fn is_up(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> Option<bool> {
+    let mut v = [0u8; 4];
+    query_cmd(h, w, s, CMD_GET_UP, &mut v, "is the interface up", ctx)?;
+    Some(u32::from_le_bytes(v) != 0)
 }
 
 pub fn interface_up(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {

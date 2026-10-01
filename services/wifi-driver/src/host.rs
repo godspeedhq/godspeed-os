@@ -303,20 +303,42 @@ impl<'a> Host<'a> {
         }
     }
 
-    /// Program the card clock. Returns false if it never reports stable.
-    /// Stop the card clock and leave it stopped. Called before the chip's power is restored: Linux's
-    /// `mmc_power_up` raises the power with the clock at zero and starts the init clock only after the
-    /// power-on delay, and a Broadcom part samples its boot straps - some of them on the SDIO data lines -
-    /// at the rising edge of WL_REG_ON. A clock running on those lines at that moment is a coin flip on the
-    /// boot mode, which is the one-in-two warm starts of docs/wifi.md 47. The next instance of this
-    /// driver re-initialises the host from reset and sets the clock itself.
-    pub fn stop_clock(&self) {
-        self.wr(CONTROL1, self.rd(CONTROL1) & !C1_CLK_EN);
-        for _ in 0..5 {
-            spin();
+    /// PARK the controller across a cut of the chip's power: a full software reset (SRST_HC), which
+    /// leaves the card clock and the internal clock off and no command or data transfer in flight, so
+    /// nothing this host does drives the SDIO lines into the chip while its rail is down, or at the
+    /// instant WL_REG_ON rises - the edge at which a Broadcom part samples its boot straps. At mains boot
+    /// the VideoCore raises WL_ON with this controller untouched and the chip comes up cold every time;
+    /// every earlier power cycle here left the 25 MHz card clock toggling into the unpowered chip for the
+    /// whole off window and came up cold only some of the time, and gating the clock alone just before
+    /// power-on came up cold in none of seven (docs/wifi.md 48).
+    /// Parking across the whole window was then tried and came up cold in one of three loads - it did not
+    /// fix the warm start either; docs/wifi.md 48 names the pads (GPIO pulls, kernel-owned) as next.
+    ///
+    /// Nothing here re-enables a clock. The next user of the host - the respawned instance's stage 2, or
+    /// `reset` in this one after an in-place cycle - brings it back from reset after the power-on delay,
+    /// which is also Linux's order (`mmc_power_up`: power with the clock at zero, the init clock after).
+    /// `false` if the reset never completed; it is said, and the caller proceeds - a host that will not
+    /// reset is no reason to keep a dead firmware's chip powered.
+    pub fn park(&self, ctx: &ServiceContext) -> bool {
+        // How long SRST_HC may take to self-clear. A bound in TIME, not in reads: a read count is a
+        // different duration on every core clock.
+        const PARK_MS: u64 = 100;
+        self.wr(CONTROL1, self.rd(CONTROL1) | C1_SRST_HC);
+        let t0 = ctx.read_tsc();
+        let limit = ctx.duration_cycles(PARK_MS);
+        while self.rd(CONTROL1) & C1_SRST_HC != 0 {
+            if ctx.read_tsc().wrapping_sub(t0) > limit {
+                ctx.log("wifi-driver: SRST_HC did not clear while parking the host - its lines may still be driven across the power edge");
+                return false;
+            }
         }
+        // SRST_HC returns CONTROL1 to its reset value, clocks off. Cleared explicitly as well, so the
+        // parked state does not rest on one controller's reading of "reset".
+        self.wr(CONTROL1, self.rd(CONTROL1) & !(C1_CLK_EN | C1_CLK_INTLEN));
+        true
     }
 
+    /// Program the card clock. Returns false if it never reports stable.
     fn set_clock(&self, divisor: u32, ctx: &ServiceContext) -> bool {
         self.wr(CONTROL1, self.rd(CONTROL1) & !C1_CLK_EN);
         for _ in 0..5 {

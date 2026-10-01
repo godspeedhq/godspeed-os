@@ -82,10 +82,8 @@ const OPERATING_HZ: u32 = 25_000_000;
 /// firmware then trapped at start with the section-45 signature - reset, not power-cycled. The pin is
 /// driven by the VideoCore over I2C at its own pace, and the chip's internal supplies take time to
 /// drain; half a second removes the margin and costs an operator's `powercycle` nothing it notices.
-/// EXPERIMENT (2026-10-01): two seconds, up from 500, with the pin read back by the kernel after each
-/// write. 50 ms and 500 ms both gave a chip whose SDIO side reset and whose firmware then trapped at
-/// start; if two seconds does the same with the pin reading low throughout, the hold-off is not the
-/// variable and the warm state lives in a domain this pin does not cut.
+/// Two seconds (2026-10-01). 50 ms, 500 ms, 2 s and 75 s all produced warm starts, so the hold-off is
+/// not the variable; this only has to exceed the chip's own discharge.
 const POWER_OFF_MS: u64 = 2_000;
 /// How long after WL_REG_ON goes high before the SDIO side is asked anything. `identify_once` also
 /// retries CMD5, so this only has to be close.
@@ -100,13 +98,35 @@ pub(crate) fn power_cycle_device(ctx: &ServiceContext, h: &host::Host) -> bool {
     power_cycle_device_ms(ctx, h, POWER_OFF_MS)
 }
 
-/// Restore the chip's power the way a board power-on would: with the card clock STOPPED. Linux's
-/// `mmc_power_up` does exactly this - power with the clock at zero, the init clock only after the delay -
-/// and a Broadcom part samples its boot straps at the rising edge of WL_REG_ON, some of them on the SDIO
-/// data lines a running clock toggles. Seventy-five seconds powered down and a trap at start (boot
-/// 2026-10-01 09:46) is what said the hold-off was never the variable. `false` means the kernel refused.
+/// After a cut: is the chip really unpowered? It waits for the rail to fall, brings the host back long
+/// enough for one CMD52, and parks it again. `true` means the chip still answers - the cut did NOT take.
+fn chip_still_answers(ctx: &ServiceContext, h: &host::Host) -> bool {
+    const RAIL_FALL_MS: u64 = 50;
+    ctx.sleep_ms(RAIL_FALL_MS);
+    let answers = h.reset(ctx) && sdio::initialised_card_answers(h);
+    h.park(ctx);
+    answers
+}
+
+/// The verdict on a hard off, said in the log and returned for reply byte 3.
+fn verify_hard_off(ctx: &ServiceContext, h: &host::Host) -> u8 {
+    if chip_still_answers(ctx, h) {
+        ctx.log("wifi-driver: `wifi radio off hard` - the pin was driven low but the chip STILL ANSWERS on its bus: its power did not go off");
+        scan::reply::OFF_CONTRADICTED
+    } else {
+        ctx.log("wifi-driver: `wifi radio off hard` - verified: the chip no longer answers on its bus");
+        scan::reply::OFF_VERIFIED
+    }
+}
+
+/// Restore the chip's power the way a board power-on would: with the host PARKED (`host::Host::park`),
+/// nothing driving the SDIO lines at the rising edge of WL_REG_ON, where the chip samples its boot straps.
+/// The park is repeated here although the cut already parked it, so the edge is quiet whatever touched the
+/// host while the power was off. The host is left parked: its next user brings it back from reset after
+/// this delay, which is Linux's order (power first, the init clock after). `false` means the kernel refused.
+/// (docs/wifi.md 48: the park did not by itself make the start cold.)
 pub(crate) fn power_on_device(ctx: &ServiceContext, h: &host::Host) -> bool {
-    h.stop_clock();
+    h.park(ctx);
     if !ctx.device_power(true) {
         return false;
     }
@@ -114,12 +134,19 @@ pub(crate) fn power_on_device(ctx: &ServiceContext, h: &host::Host) -> bool {
     true
 }
 
-/// `power_cycle_device` with the hold-off chosen by the caller. `wifi radio powercycle` doubles it on each
-/// attempt after a chip that came up warm (docs/wifi.md 47): the shell decides how long, this decides how.
+/// `power_cycle_device` with the hold-off chosen by the caller (`wifi radio powercycle` asks for a fixed
+/// 2 s): the shell decides how long, this decides how.
 pub(crate) fn power_cycle_device_ms(ctx: &ServiceContext, h: &host::Host, off_ms: u64) -> bool {
     if !ctx.device_power(false) {
         return false;
     }
+    // THE HOST GOES QUIET FOR THE WHOLE OFF WINDOW (docs/wifi.md 48). Every earlier cycle left the card
+    // clock toggling into the unpowered chip from here to the power-on. Parked after the cut is accepted,
+    // not before: a refused cut then leaves the host and any live session untouched, and the gap between
+    // the pin going low and the park is the mailbox's return - well under a millisecond of a long quiet.
+    // Tried as the warm-start fix and it was not one (one cold start in three loads, docs/wifi.md 48); kept,
+    // because a quiet host across the edge is still the reference's order.
+    h.park(ctx);
     ctx.sleep_ms(off_ms);
     if !power_on_device(ctx, h) {
         ctx.log("wifi-driver: the radio's power was cut and could NOT be restored - the kernel refused the second request");
@@ -149,10 +176,15 @@ fn serve_unavailable(ctx: &ServiceContext, h: Option<&host::Host>) -> ! {
             // One byte, not an empty message: the kernel refuses a zero-length send, so an "empty
             // reply" is no reply at all and the caller waits out its deadline.
             let p = req.payload_bytes();
-            // THE ONE REQUEST THIS LOOP SERVES FOR REAL: `wifi radio powercycle`. A radio that did not
-            // come up is exactly the case a power cycle exists for, and a firmware that trapped at start
-            // on a warm chip is how this loop is usually reached (docs/wifi.md 47). The hold-off is the
-            // caller's; the shell doubles it on each attempt. Reply shape matches `serve_radio`'s.
+            // THE ONE REQUEST THIS LOOP SERVES FOR REAL: `wifi radio powercycle`. This loop is reached
+            // when the radio never got as far as its firmware - no SDIO window, the host failed, no card
+            // on the bus even after the power was asserted, a backplane that would not open. A firmware
+            // that trapped at start does NOT come here: it goes to `serve_radio` with DOWN_TRAPPED. The
+            // hold-off is the caller's (the shell asks for a fixed 2 s). Reply shape matches `serve_radio`'s.
+            //
+            // KNOWN GAP (recorded, not fixed - docs/wifi.md 49): everything else, `wifi radio off hard`
+            // included, is answered RADIO_DOWN below, and the shell reads that as a driver that cannot
+            // act and suggests `kill wifi-driver` - wrong advice for a cut this loop could have made.
             if p.first().copied() == Some(scan::reply::OP_RADIO)
                 && p.get(1).copied() == Some(scan::reply::RADIO_POWERCYCLE)
             {
@@ -168,7 +200,7 @@ fn serve_unavailable(ctx: &ServiceContext, h: Option<&host::Host>) -> ! {
                 let out = [if cycled { scan::reply::OK } else { scan::reply::NO_POWER_CONTROL }, 0, cycled as u8, 0, 0];
                 let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&out));
             } else {
-                let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&[scan::reply::RADIO_DOWN]));
+                let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&[scan::reply::RADIO_DOWN, scan::reply::DOWN_NO_RADIO]));
             }
             ctx.remove_cap(reply);
         }
@@ -189,6 +221,7 @@ fn serve_radio(
     h: &host::Host,
     w: &mut backplane::Window,
     mut radio: Option<ctrl::Session>,
+    down_reason: u8,
 ) -> ! {
     // Bounded: 2 status bytes plus 32 records of 44 is 1410 for a list, and 2 plus 64 names of 33 is 2114 for
     // `stored` - both inside this fixed buffer, inside a 4 KiB message.
@@ -612,11 +645,16 @@ fn serve_radio(
                 out[3] = 0;
                 out[4] = 0;
                 if ctx.device_power(false) {
+                    // Quiet for as long as the power stays off - and while it is off nothing in this loop
+                    // touches the bus after the one-CMD52 check below that the cut took: auto-join needs `radio_on`, the sweep was stopped above, and every
+                    // request is answered from the powered-off arms (docs/wifi.md 48).
+                    h.park(ctx);
                     powered_off = true;
                     radio_on = false;
                     ctx.log("wifi-driver: `wifi radio off hard` - the chip's power is cut and stays cut until `wifi radio on`");
                     out[0] = scan::reply::OK;
                     out[2] = 1;
+                    out[3] = verify_hard_off(ctx, h);
                 } else {
                     ctx.log("wifi-driver: `wifi radio off hard` asked, and this machine has no control over the radio's power - the radio stays as it was");
                     out[0] = scan::reply::NO_POWER_CONTROL;
@@ -645,23 +683,28 @@ fn serve_radio(
             }
             (scan::reply::OP_RADIO, None) if payload.get(1).copied() == Some(scan::reply::RADIO_HARD_OFF) => {
                 if ctx.device_power(false) {
+                    h.park(ctx);
                     powered_off = true;
                     radio_on = false;
                     ctx.log("wifi-driver: `wifi radio off hard` on a radio that is down - the chip's power is cut and stays cut until `wifi radio on`");
                     out[0] = scan::reply::OK;
                     out[2] = 1;
+                    out[3] = verify_hard_off(ctx, h);
                 } else {
                     out[0] = scan::reply::NO_POWER_CONTROL;
                     out[2] = 0;
+                    out[3] = 0;
                 }
                 out[1] = 0;
-                out[3] = 0;
                 out[4] = 0;
                 5
             }
             (_, None) => {
+                // Byte 1 says WHY (scan::reply::DOWN_*), so `wifi status` can tell a firmware that
+                // trapped from a bring-up that stopped, instead of guessing.
                 out[0] = scan::reply::RADIO_DOWN;
-                1
+                out[1] = down_reason;
+                2
             }
             (scan::reply::OP_LIST, Some(_)) => match (&sweep, &cache) {
                 (Some(s), _) => {
@@ -805,6 +848,18 @@ fn serve_radio(
                     if ctrl::radio_down(h, w, session, ctx) {
                         radio_on = false;
                         out[0] = scan::reply::OK;
+                        // VERIFIED, as `on` is: ask the firmware whether it is still up.
+                        out[3] = match ctrl::is_up(h, w, session, ctx) {
+                            Some(false) => scan::reply::OFF_VERIFIED,
+                            Some(true) => {
+                                ctx.log("wifi-driver: `wifi radio off` - DOWN was accepted but the firmware still says it is up");
+                                scan::reply::OFF_CONTRADICTED
+                            }
+                            None => {
+                                ctx.log("wifi-driver: `wifi radio off` - the firmware did not answer whether it is up, so the off is unverified");
+                                scan::reply::OFF_UNVERIFIED
+                            }
+                        };
                     } else {
                         ctx.log("wifi-driver: the firmware refused DOWN - the radio stays on");
                         out[0] = scan::reply::JOIN_FAILED;
@@ -1357,12 +1412,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut card = match sdio::identify(&h, &ctx) {
         Some(c) => c,
         None => {
-            ctx.log(
-                "wifi-driver: no SDIO card answered on this bus. The controller is ours and came up, \
-                 so the remaining suspects are the ones the kernel reports at boot: the SD power \
-                 domain and the GPIO34-39 mux",
-            );
-            serve_unavailable(&ctx, Some(&h));
+            // NO ANSWER MAY MEAN NO POWER. An instance that died with the chip's power cut - killed in the
+            // middle of a power cycle, or while `wifi radio off hard` held it down - leaves WL_ON low, and
+            // its respawn finds an empty bus. Boot 2026-10-01 13:59: three respawns in a row, each "no SDIO
+            // card answered", and `wifi radio on` could not bring it back. Where this service holds the
+            // power, it is restored the boot's way - host parked across the edge, `power_on_device` - and
+            // the bus is asked once more. A pin that is already high makes no edge, so a powered chip that
+            // truly does not answer costs one more identification and the settle, then is reported as
+            // before. Stated consequence: a driver that dies during `off hard` comes back with the radio
+            // powered; the alternative was a radio no command short of a power cycle could reach.
+            let retried = if power_on_device(&ctx, &h) {
+                ctx.log("wifi-driver: no SDIO card answered - the chip's power is now asserted (a dead instance may have left it cut), and the bus is asked again");
+                if h.reset(&ctx) { sdio::identify(&h, &ctx) } else { None }
+            } else {
+                None
+            };
+            match retried {
+                Some(c) => c,
+                None => {
+                    ctx.log(
+                        "wifi-driver: no SDIO card answered on this bus. The controller is ours and came up, \
+                         so the remaining suspects are the ones the kernel reports at boot: the SD power \
+                         domain and the GPIO34-39 mux",
+                    );
+                    serve_unavailable(&ctx, Some(&h));
+                }
+            }
         }
     };
     ctx.log_fmt(format_args!(
@@ -1470,6 +1545,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The radio's session, if boot brings it up. The serving loop scans on it when the shell asks; `None`
     // means every such request is answered "radio down" - loudly, and without pretending (§26.7).
     let mut radio: Option<ctrl::Session> = None;
+    // Set when the firmware is seen to trap at start; it decides what `radio down` tells the shell.
+    let mut trapped = false;
     // The proper read first - one CMD53, one 32-bit fetch by the bridge. If it fails, fall back to four
     // CMD52 byte reads, which is NOT how this should be done and is the command known to work on this
     // bus: whichever answers tells us something we do not have yet. See `chip_id_via_cmd52`.
@@ -1555,7 +1632,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // from the EROM walk is the same silicon and stands. Then `card.warm` is
                             // cleared and the boot's own path, stage 9 on, takes over.
                             ctx.log("wifi-driver: the running firmware did not answer - the radio was power-cycled, and this instance starts it from cold");
-                            match sdio::identify_once(&h, &ctx) {
+                            // The host was PARKED across the cut and has no clock; `identify_once` sets
+                            // none. Back from reset first, at the identification clock - power, then the
+                            // init clock (docs/wifi.md 48).
+                            let fresh_card = if h.reset(&ctx) {
+                                sdio::identify_once(&h, &ctx)
+                            } else {
+                                ctx.log("wifi-driver: the host did not come back from its park after the power cycle");
+                                None
+                            };
+                            match fresh_card {
                                 Some(fresh) => {
                                     card = fresh;
                                     if !h.set_operating_clock(OPERATING_HZ, &ctx) {
@@ -1575,7 +1661,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 }
                             }
                         } else {
-                            ctx.log("wifi-driver: the running firmware did not answer, this machine has no control over the radio's power, and a firmware restarted on a warm chip traps in its ROM (docs/wifi.md 45) - the radio stays down until a reboot");
+                            ctx.log("wifi-driver: the running firmware did not answer, this machine has no control over the radio's power, and a firmware restarted on a warm chip traps in its ROM (docs/wifi.md 45) - the radio stays down: this machine cannot restart a firmware that stopped without cutting the chip's power");
                         }
                     }
                     None => ctx.log(
@@ -1656,7 +1742,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     }
                                 }
                                 ctx.log("wifi-driver: stage 11 - uploading the firmware");
-                                if upload::run(&h, &mut window, wrap, &ram, &ctx) {
+                                if upload::run(&h, &mut window, wrap, &ram, &mut trapped, &ctx) {
                                     ctx.log(
                                         "wifi-driver: PHASE 2 COMPLETE - firmware and NVRAM are in the \
                                          chip and its processor is running them",
@@ -1742,5 +1828,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
              radio did NOT come up, so every `wifi` request will be answered `radio down` rather than left waiting"
         },
     );
-    serve_radio(&ctx, &h, &mut window, radio)
+    let down_reason = if trapped { scan::reply::DOWN_TRAPPED } else { scan::reply::DOWN_BRINGUP };
+    serve_radio(&ctx, &h, &mut window, radio, down_reason)
 }

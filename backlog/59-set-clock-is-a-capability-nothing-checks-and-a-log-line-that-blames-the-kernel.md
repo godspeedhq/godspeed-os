@@ -1,7 +1,7 @@
 # 59 - `SET_CLOCK` is granted and never checked, and net-stack blames the kernel for the `time` service
 
-**Status:** OPEN - two findings from one dead seam. The second is operator-visible and is the same
-instrument defect as `backlog/57`, on a different service.
+**Status:** OPEN - two findings from one dead seam. The second (the log line) is FIXED IN CODE
+2026-10-01, not yet run on hardware; the first (the kernel half) is still open. See "2026-10-01" below.
 **Found:** 2026-09-26, by following a stale comment: three comments named a `SetClock` syscall, and
 there is no such syscall.
 
@@ -66,3 +66,17 @@ They are one seam read from both ends. The kernel side is dead authority; the us
 message that still describes the dead path as if it were live. Fixing either alone leaves the other
 telling the same wrong story, and the kernel half cannot be removed without checking that nothing in
 userspace still expects to be refused by it.
+
+## 2026-10-01: the log half is fixed in code, not yet on hardware
+
+**The false line is gone.** `net-stack` now hands the SNTP result to `time` through `adopt_ntp_time`,
+which keeps the three outcomes apart and says which one it saw, each ending "clock unchanged":
+
+- `time` replied 0: "the `time` service refused the network time (its plausibility check or floor)";
+- no reply within `ADOPT_SECS` (2 s): "`time` did not answer within 2 s";
+- unreachable even after a reacquire: "`time` could not be reached".
+
+Nothing blames the kernel any more. This went in with the clock decoupling (`docs/networking.md` 16),
+which passed the x86 shell suite 215/0 and a Pi 4 QEMU boot; it has NOT run on Pi 4 hardware (the card
+carries the old `net-stack`). **The kernel half (section 1) is untouched and still open** - the dead
+capability, the two privbits and the seven `set_wall_clock` stubs.

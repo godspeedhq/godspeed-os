@@ -186,6 +186,7 @@ SLOT_INT_STATUS                    # SDHCI SPEC register (2.2.25); cited beside 
 bcm2835_data                       # Linux sdhci-iproc platform data, cited because its .missing_caps=true is WHY the Arasan CAPABILITIES register reads 0 - external, 26.14
 CISTPL_MANFID                      # SDIO SPEC tuple code (CIS encoding) - the manufacturer/device pair that proves WHICH part is on the bus; external, 26.14
 mmc_power_up                       # Linux mmc core, cited because it raises the card power with the CLOCK AT ZERO and starts the init clock only after the power-on delay - the order services/wifi-driver copies before restoring the chip power - external, 26.14
+WLC_GET_UP                         # Broadcom wlioctl.h command 162 (is the interface up?), cited because services/wifi-driver verifies `wifi radio off` with it - external, 26.14
 mmc_attach_sdio                    # Linux's SDIO attach sequence, cited because its ORDER is what services/wifi-driver reimplements (CMD5 ask, CMD5 commit, CMD3, CMD7) - external, 26.14
 CMD_ISDATA                         # SDHCI SPEC CMDTM field (bit 21, "this command has a data phase") - the spec's name for a bit we set numerically; external, 26.14
 TM_DAT_DIR                         # SDHCI SPEC CMDTM field (bit 4, transfer direction) - ditto, and cited beside CMD_ISDATA because one CMD53 word sets both

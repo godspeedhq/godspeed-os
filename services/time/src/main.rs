@@ -193,13 +193,15 @@ const FLOOR_RETRY_MS: u64 = 2_000;
 /// PURSUING THE TIME IS THIS SERVICE'S JOB. It did not do it: `net-stack` pushed a result in when its
 /// own dance happened to run, and otherwise the clock sat unset until an operator typed `date sync`.
 /// That put resolution in the shell's hands and made the answer depend on somebody asking twice.
+/// (The dance no longer fetches the clock since 2026-10-01; this nudge is how it is fetched.)
 ///
 /// The nudge carries NO reply cap, which is what keeps it legal: `net-stack` calls this service after
 /// SNTP, so a request in this direction would be two single-threaded services blocked on each other.
 /// One-way, `try_send`, nothing awaited - so a full or dead `net-stack` cannot stall the clock (§8.9).
 ///
-/// Bounded by its own success: the nudging stops the moment the clock is network-set, so a machine that
-/// syncs at boot sends one or two and never another.
+/// Bounded by its own success: once the clock is network-set the nudging falls back from every 20 s to
+/// every `RESYNC_SECS` (an hour), so a machine that syncs at boot sends one or two and then one an hour.
+/// Since 2026-10-01 the nudge is the ONLY automatic path to the clock - the dance no longer fetches it.
 const SYNC_NUDGE_SECS: i64 = 20;
 /// How long between network syncs once we already HAVE one.
 ///
@@ -650,7 +652,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let ok = clock.set_network(&ctx, i64::from_le_bytes(b));
                 reply(&ctx, cap, &[u8::from(ok)]);
                 // The clock just became known: record the floor so the next boot starts no earlier
-                // than now. Answer the caller FIRST - `net-stack` is blocked on that reply, and it
+                // than now. Answer the caller FIRST - `net-stack` waits on that reply (bounded, 2 s), and it
                 // must not wait on a disk write to learn its own result.
                 if ok {
                     // Hand the write to the loop rather than doing it here. The caller (`net-stack`) has

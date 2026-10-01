@@ -271,7 +271,7 @@ pub fn nvram_prepare(text: &[u8], out: &mut [u8]) -> Option<usize> {
 /// reaches this point late in a longer sequence, while here it is milliseconds after release, so a
 /// firmware still starting would be called dead. If the word never changes that is REPORTED as a fact -
 /// a loaded chip whose firmware did not start is precisely the state worth naming (§26.7).
-fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, ctx: &ServiceContext) -> bool {
+fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, trapped: &mut bool, ctx: &ServiceContext) -> bool {
     /// `SDPCM_SHARED_VERSION_MASK`.
     const VERSION_MASK: u32 = 0x0000_00FF;
     /// `SDPCM_SHARED_TRAP` - the firmware took a trap and filled in the record `trap_addr` points at.
@@ -314,6 +314,8 @@ fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, ctx: &Service
                                      knows, so the structure's fields past `flags` are not safe to read",
                                 );
                             } else if f & TRAP != 0 {
+                                // Said to the operator too: `wifi status` reports it (scan::reply::DOWN_TRAPPED).
+                                *trapped = true;
                                 // THE FIRMWARE TRAPPED, and it says where. `SDPCM_SHARED_TRAP` in the
                                 // flags means `trap_addr` (the word after `flags`) points at a
                                 // `brcmf_trap_info`: type, epc, cpsr, spsr, r0-r7, pc, sp, lr. Every
@@ -438,6 +440,7 @@ pub fn run(
     w: &mut Window,
     arm_wrapper: u32,
     ram: &Ram,
+    trapped: &mut bool,
     ctx: &ServiceContext,
 ) -> bool {
     // 1. HALT THE CPU, but leave the CORE OUT OF RESET - which is not the same thing, and getting it
@@ -598,7 +601,7 @@ pub fn run(
     //    fetching; it does not mean the firmware booted, and a CPU fetching garbage reports the same
     //    thing. The firmware overwrites the NVRAM token at the last word of RAM once it has consumed it,
     //    so that word is the answer.
-    if !firmware_alive(h, w, ram, token, ctx) {
+    if !firmware_alive(h, w, ram, token, trapped, ctx) {
         ctx.log(
             "wifi-driver: the image and the NVRAM are in the chip and its CPU is out of reset, but \
              nothing confirms the firmware is running - so this is NOT reported as a working radio",

@@ -334,8 +334,10 @@ pub fn run(image_path: &Path, smp: u32) {
            "wifi: an unknown subcommand is refused by name, not silently treated as status");
     send(&mut write_half, b"wifi radio sideways\r");
     let wifi_radio = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
-    check!(wifi_radio.contains("radio takes `on` or `off`"),
-           "wifi: radio takes on or off and says so");
+    // The radio ladder (docs/wifi.md 47-48): four words, and the refusal names every one of them, so an
+    // operator who mistyped is told the whole vocabulary rather than half of it.
+    check!(wifi_radio.contains("radio takes `on`, `off`, `off hard` or `powercycle`"),
+           "wifi: radio takes on, off, off hard or powercycle and says so");
 
     // Conventions rules 1 and 5: every utility self-documents.
     send(&mut write_half, b"wifi version\r");

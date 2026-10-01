@@ -93,7 +93,7 @@ a subtler bug:
 wait, not net-stack's transaction, which keeps working its own 8 s budget out. It does not wedge the
 next command (the late reply is discarded by its tag), but a `tcp` issued immediately after an abort
 can wait behind the one abandoned. Driving the transaction step-by-step from the shell is the full
-fix, and it is the same rework `backlog/28` describes for the SNTP dance.
+fix, and it is the same rework `backlog/28` describes for the blocking dance.
 
 ## Verification
 
@@ -218,7 +218,7 @@ net-stack: DHCP - ACK ...          <- the dance
 net-stack: SNTP - querying ...     <- the SNTP exchange
 ```
 
-net-stack is single-threaded and runs the dance, SNTP and a ping sequence INSIDE its serve loop. While
+net-stack is single-threaded and ran (until 2026-10-01) the dance, SNTP and a ping sequence INSIDE its serve loop. While
 one runs it does not ask for client requests, so a request arriving during it waits for the whole
 thing. That is exactly the limitation `backlog/28` records and `docs/tcp-design.md` already states
 about this service - **the fix is making the dance incremental, a state-machine rework rather than a
@@ -227,7 +227,9 @@ change the fix.
 
 **Confirmed by chaos on hardware.** After `chaos 100 rounds` the operator reported `big` slow again -
 as predicted here before the run: chaos restarts net-stack repeatedly, every restart re-runs the
-DHCP + ARP + SNTP dance, and the dance is precisely what blocks the loop.
+DHCP + ARP + SNTP dance, and the dance is precisely what blocks the loop. (Since 2026-10-01 the dance no
+longer ends in SNTP - it is DHCP, ARP and the ICMP check; the clock comes from a background query `time`
+asks for, `docs/networking.md` 16. Not yet re-run on the Wyse. The rest of this holds.)
 
 ## The instrument that settled it, and the one added after
 

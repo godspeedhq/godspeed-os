@@ -7,7 +7,9 @@
 
 After `time` sets the wall clock from the network, `net-stack` leaves its blocking `recv` for its
 polling mode (`poll_step` plus `recv_timeout(POLL_MS)`). From that moment every STATUS query (op 3) it
-makes to `nic-driver` takes 890-990 ms, which is its one-second deadline, and a ping makes three of them:
+makes to `nic-driver` takes 890-990 ms, which is its one-second deadline, and a ping makes three of them
+(Corrected below, 2026-10-01: polling starts when the network is configured; the clock being set was a
+correlate.):
 
 ```
 net-stack: the NIC exchange for op 3 took 979 ms (answered) - sent at 59257 ms, answered at 60236 ms
@@ -121,3 +123,26 @@ such gap through `InspectKernel` (or print it once when it exceeds 100 ms). That
 `nic-driver` was Ready for a second and not picked (a `pick_next` / run-queue question) or was never
 woken (a `blocked_receiver` / enqueue question). The cheaper check this paragraph used to end with -
 place both services on core 0 for one boot - has been run and is recorded above.
+
+### Two causes, and a correction to this item's own reading (2026-10-01)
+
+**The lag had two causes, and this item measured one of them.** A causal trace of boot 2026-10-01
+11:17-11:18 (five readers over the services involved, three adversarial adjudicators) separated them:
+
+- **The multi-second spikes** - `ping echo 2 was answered after 7092 ms` with a wire round trip of 39 ms -
+  were `net-stack` running SNTP inside its single serve loop while the clock was unset: at the end of the
+  link-up dance, on `time`'s nudge every 20 s, and on ordinary client requests. Each exchange held every
+  client for up to about fifteen seconds when the server or resolver was silent. `date sync` ended them
+  only because its success latched the clock and quietened the nudges. FIXED IN CODE by taking SNTP out
+  of the loop (`docs/networking.md` 16): x86 shell suite 215/0 and a Pi 4 QEMU boot, NOT yet on the Pi 4.
+  Closed when a Pi 4 boot with an unset clock shows no multi-second echo.
+- **The steady one-second tax** is what the slot log above measured, and it stands: the first send of
+  each exchange does not wake `nic-driver`. Still open, still parked, still the kernel path named above.
+
+**A correction to "after `time` sets the wall clock, net-stack leaves its blocking `recv` for its polling
+mode".** The poll gate is `gw_known && tcpst.have_clock()`, and `have_clock` is `net-stack`'s cycle-counter
+calibration, taken once at startup against the kernel's monotonic seconds - on the Pi 4 those are
+`secs_since_boot()`, which advance from power-on whatever `time` has set. So polling begins when the
+network is CONFIGURED. It coincided with the clock being set because the dance that configured the
+network used to end in an SNTP exchange: the clock was a correlate of the onset, not its cause. The
+index row is corrected to match.
