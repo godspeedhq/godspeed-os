@@ -1434,6 +1434,33 @@ hw_mmio      = ["0xfee00000+0x1000"]      # MMIO region
 
 The kernel validates these at spawn time and grants caps only for the specified resources.
 
+> **Amendment 2026-10-01 (`DevicePower`, syscall 54): the device grant is RENEWABLE - a service granted a
+> device's window may ask the kernel to cut and restore that device's power.** This is not a seventh
+> responsibility. The grant above already includes power: on the Pi 4 the kernel powers the SD domain
+> through the firmware mailbox at boot BEFORE it can hand `wifi-driver` the radio's window, because a
+> window to an unpowered device is not a grant. What the kernel could not do was renew it, and the
+> CYW43455 made that matter: six host-side resets - I/O reset, core halt, 802.11 reset, chipcommon and
+> PMU watchdogs, a RAM clear - each left a chip whose ROM will not boot a new firmware (`docs/wifi.md`
+> 45). Only cutting its power is a power-on, and every reference driver's recovery path cuts power.
+>
+> **What the kernel learns, and what it does not.** It mints `DEVICE_POWER` at spawn to the one service
+> it hands a fixed peripheral window to, where the arch layer can power the device behind it
+> (`arch::imp::device_power_control`) - derived from the grant, not from a privilege bit the spawner
+> passes, and never to anyone else, because a window has exactly one holder. `DevicePower(on)` checks
+> that holding and drives the pin the arch layer names for the CALLER'S device (`device_power`): on the
+> Pi 4, `WL_ON` on the firmware's GPIO expander, through the mailbox `SET_GPIO_STATE` tag - the pin
+> Linux's `mmc-pwrseq-simple` toggles for the same chip. The kernel does not know what the device is,
+> what firmware it runs, whether it is alive, or when its power should be cut: those are the driver's
+> (§26.10), and the hold-off and settle times are the device's and live in the driver with it. Every
+> other port answers the seam with `false`, and the syscall reports that honestly rather than pretending.
+>
+> **Why it is recorded.** A new syscall and a new resource widen the surface Commandment I pins, and
+> the gate refused this change until this paragraph existed - which is the gate working. The service
+> that uses it does so as its LAST resort, after adopting the firmware it finds running (`docs/wifi.md`
+> 46); the power cycle is for a firmware that has stopped, and it is what turns "reboot the machine" into
+> "the driver recovers in a few seconds" (`docs/wifi.md` 47). It is also the first brick of a shutdown:
+> the grants run in reverse, with power the last thing taken.
+
 ---
 
 ## 13. Service Contracts
@@ -1821,8 +1848,15 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. There are currently no
-amendments to the grandfathered floors.
+stayed at their floors with **no amendment needed**. One amendment to the grandfathered floors stands:
+
+> **Amendment 2026-10-01 (`DevicePower`): `sdk/rust/src/service_context.rs` 82 -> 83.** One more
+> `unsafe { raw_syscall(54, ..) }` call site, the wrapper `device_power` behind the §12.3 amendment of
+> the same date. It is the same single design consequence the 2026-09-12 amendment describes - the
+> SDK IS the wrapper layer, so a new syscall is one more block here and zero in any service - and the
+> safe `raw_syscall` that would collapse all of them remains the recorded route. Necessity: a service
+> cannot reach a syscall any other way. Safety: the kernel validates the capability before touching
+> any pin, and the call passes two integers.
 
 ---
 

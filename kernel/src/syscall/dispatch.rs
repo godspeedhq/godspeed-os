@@ -93,6 +93,12 @@ pub enum SyscallNumber {
     /// whichever register the other selected. Atomic here, that window does not exist - and a caller
     /// can no longer WRITE anything at all, which is strictly less authority than the pair carried.
     PciCfgRead             = 53,
+    /// Cut (`arg0 = 0`) or restore (`arg0 = 1`) the power of the one device whose fixed peripheral
+    /// window the caller holds. Gated by `DEVICE_POWER`, which only the holder of such a window is
+    /// minted. The kernel resolves the device behind the caller's grant in `arch/` and drives its
+    /// power there; it learns nothing about what the device is or why the holder asked. Mechanism:
+    /// the grant the kernel made at spawn, made renewable (§12.3 amendment 2026-10-01).
+    DevicePower            = 54,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -165,6 +171,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ResourceRevoke as u64 => handle_resource_revoke(arg0),
         n if n == SyscallNumber::LastRecvBadge  as u64 => scheduler::take_last_recv_badge() as i64,
         n if n == SyscallNumber::PciCfgRead as u64 => handle_pci_cfg_read(arg0, arg1),
+        n if n == SyscallNumber::DevicePower as u64 => handle_device_power(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -2624,6 +2631,32 @@ const NET_FRAME_MAX: usize = 1600;
 /// A REFUSAL IS LOUD (invariant 12) but not fatal to the caller: an enumerator walking a bus is
 /// told where its authority ends and stops there, rather than being handed a plausible zero it would
 /// report as an empty machine.
+/// DevicePower (54): `arg0` = 0 to cut the power of the caller's device, 1 to restore it. Gated by
+/// `DEVICE_POWER_RESOURCE` + WRITE, which is minted only to a service granted a fixed peripheral window
+/// whose device the arch layer can power - so the device is identified by the GRANT, through the
+/// caller's own name in the same table the window came from, never by an argument. Returns 0 when the
+/// firmware or pin took the request, -1 when this machine has no power control for that device.
+///
+/// WHY THIS IS MECHANISM AND NOT A SEVENTH RESPONSIBILITY: the kernel already owns the device grant
+/// (§12.3), and a grant includes power - it powers the Pi 4's SD domain at boot before the radio's
+/// window can mean anything. What it could not do was renew that grant. The decision to cut power -
+/// when, and whether at all - is the driver's (26.10); what the kernel learns is which pin, in `arch/`.
+fn handle_device_power(on: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::DEVICE_POWER_RESOURCE, Rights::WRITE) {
+        crate::kprintln!("device-power: refused - caller does not hold DEVICE_POWER");
+        return CapError::CapNotHeld as i64;
+    }
+    let name = scheduler::task_name(scheduler::current_task_slot());
+    if crate::arch::imp::device_power(name, on != 0) {
+        crate::kprintln!("device-power: '{}' turned its device {}", name, if on != 0 { "ON" } else { "OFF" });
+        0
+    } else {
+        crate::kprintln!("device-power: '{}' asked for its device {} and this machine has no control over it",
+                         name, if on != 0 { "ON" } else { "OFF" });
+        -1
+    }
+}
+
 fn handle_pci_cfg_read(sel: u64, offset: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::READ) {
         crate::kprintln!("pci-cfg: read sel {:#010x} refused - caller does not hold PCI_CFG",

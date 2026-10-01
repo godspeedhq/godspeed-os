@@ -1055,6 +1055,12 @@ pub fn init(_boot_info: &BootInfo) {}
 /// reads it back through `ctx.mmio()`.
 pub const DRIVER_MMIO_VA: u32 = 0x6000_0000;
 
+/// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
+/// one board with it is the Pi 4 (`arch/aarch64`), whose radio returns to power-on only when WL_ON is
+/// cut. `false` is the honest answer; the syscall reports it as "no control over it".
+pub fn device_power_control(_name: &str) -> bool { false }
+pub fn device_power(_name: &str, _on: bool) -> bool { false }
+
 /// Map a fixed-physical peripheral MMIO window into a driver SERVICE's page table and return
 /// `(va, byte_len)`, or `None` if this service needs no fixed MMIO. This is the §12.3 MMIO-cap grant for
 /// ARM's non-PCI peripherals (x86 grants PCI BARs from the scan; the Pi's peripherals are at fixed

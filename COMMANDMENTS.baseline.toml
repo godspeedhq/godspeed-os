@@ -456,6 +456,14 @@ IMAGE_SPAWN        = 15
 # worse than a refused one. The kernel itself drives that pair on its spawn and kill paths, so this
 # was never hypothetical: a split interface raced the kernel, not just other services.
 PCI_CFG            = 16
+# DEVICE POWER - cut or restore the power of the ONE device whose fixed peripheral window the holder
+# was granted (`DevicePower`, syscall 54). Derived from the device GRANT, not from a privilege bit: the
+# kernel mints it at spawn to the service it hands such a window to, where `arch/` can power the device
+# behind it, and to nobody else - a window has one holder. Power is already the kernel's (it powers the
+# SD domain at boot before the window can mean anything); this is the grant made renewable. Added for
+# the Pi 4 radio: six host-side resets each left a chip whose ROM will not boot a new firmware, and only
+# cutting its power is a power-on (docs/wifi.md 45-47). CLAUDE.md 12.3 amendment, 2026-10-01.
+DEVICE_POWER       = 17
 
 
 [kernel.arch_roles]
@@ -602,6 +610,14 @@ FireIrq                  = 51
 # which is exactly why none is. Widening this to allow writes (destructive BAR sizing is the obvious
 # temptation) requires a different mechanism designed on its own terms, never this one relaxed.
 PciCfgRead               = 53
+# DEVICE POWER - cut or restore the power of the ONE device whose fixed peripheral window the caller
+# holds (`DevicePower`, syscall 54). Why isn't this a service? Because power is the kernel's already: the
+# device GRANT (12.3) includes powering the domain at boot before the window can mean anything, and this
+# is that grant made renewable. The kernel resolves the pin in `arch/` from the caller's own grant and
+# learns nothing about the device; when to cut power is the driver's decision (26.10). Added for the
+# Pi 4 radio, whose firmware cannot be restarted on a chip the host merely reset (docs/wifi.md 45-47).
+# Gated by DEVICE_POWER, minted at spawn with the window and to nobody else. CLAUDE.md 12.3, 2026-10-01.
+DevicePower              = 54
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47

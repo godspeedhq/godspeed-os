@@ -554,6 +554,24 @@ pub fn run(
          the CR4 fetches from there on release, not from {:#08x}",
         rstvec, ram.base
     ));
+    // THE VECTOR AREA IS ZEROED FIRST. Address 0 is the one word this driver writes below the image, and it
+    // is writable, so the region around it is RAM: the CR4's exception vectors and their literal pool.
+    // A true power-on leaves that area zero. A chip the host reset - or power-cycled for too short a time
+    // to lose its state - keeps the PREVIOUS firmware's entries there, and every one of six warm starts
+    // trapped with `pc 0x25`, an address inside this area, from the ROM's own startup (docs/wifi.md 45,
+    // 47). One kilobyte of zeros costs a fresh chip a few CMD53s and gives a warm one the vector area a
+    // power-on would have given it. A failed clear is said and the upload goes on; it was never required.
+    {
+        const LOW_RAM_CLEAR: usize = 0x400;
+        const ZEROS: [u8; LOW_RAM_CLEAR] = [0u8; LOW_RAM_CLEAR];
+        if write_bytes(h, w, 0, &ZEROS, "vector area clear", ctx) {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: low RAM 0x0..{:#x} (the exception vectors and literal pool) zeroed before the reset vector - a warm chip keeps the previous firmware's",
+                LOW_RAM_CLEAR));
+        } else {
+            ctx.log("wifi-driver: the vector area clear did not complete - continuing; a warm chip may keep its previous vectors");
+        }
+    }
     if rstvec == 0 {
         // The reference guards on this too (`if (rstvec)`), and a zero vector would mean the image does
         // not begin with a branch - worth saying rather than writing a zero and wondering later.

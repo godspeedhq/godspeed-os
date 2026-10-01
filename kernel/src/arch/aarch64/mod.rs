@@ -1380,6 +1380,40 @@ pub fn hw_random() -> Option<u32> {
 #[cfg(not(feature = "pi4"))]
 pub fn hw_random() -> Option<u32> { None }
 
+/// Whether the device behind `name`'s fixed peripheral window can have its power cut and restored by
+/// this port. The one such device is the Pi 4's radio: the CYW43455 behind the Arasan SDIO host, powered
+/// through WL_ON on the firmware's GPIO expander. Answered at spawn, so `DEVICE_POWER` is minted only to
+/// the service that holds that window, and only where the boot census saw the radio's controller.
+#[cfg(feature = "pi4")]
+pub fn device_power_control(name: &str) -> bool { name == "wifi-driver" && sdio::radio_present() }
+
+/// Cut (`on = false`) or restore (`on = true`) the power of the device behind `name`'s window. The
+/// `DevicePower` syscall has already checked the caller holds `DEVICE_POWER`; this resolves WHICH pin
+/// and drives it - the same WL_ON that Linux's `mmc-pwrseq-simple` toggles to power-cycle this chip. How
+/// long to hold it off and how long to wait after is the driver's to decide, in the driver (26.10).
+#[cfg(feature = "pi4")]
+pub fn device_power(name: &str, on: bool) -> bool {
+    if name != "wifi-driver" { return false; }
+    let took = mailbox::set_expander_gpio(mailbox::EXPGPIO_WL_ON, on);
+    // READ IT BACK, because the SET tag answers "accepted" whether or not the pin moved, and three
+    // reloads on hardware (2026-10-01) gave one cold chip and two that reset without losing their warm
+    // state. What the firmware says the pin is NOW is the one fact that separates "the write did not
+    // take" from "the chip keeps state in a domain this pin does not cut".
+    match mailbox::get_expander_gpio(mailbox::EXPGPIO_WL_ON) {
+        Some(level) => crate::kprintln!("device-power: WL_ON asked {} - the firmware reads the pin back as {}",
+                                        if on { 1 } else { 0 }, level),
+        None => crate::kprintln!("device-power: WL_ON asked {} - the firmware did not answer the read-back",
+                                 if on { 1 } else { 0 }),
+    }
+    took
+}
+
+/// Without the `pi4` feature this port names no board, so no device's power is reachable.
+#[cfg(not(feature = "pi4"))]
+pub fn device_power_control(_name: &str) -> bool { false }
+#[cfg(not(feature = "pi4"))]
+pub fn device_power(_name: &str, _on: bool) -> bool { false }
+
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.

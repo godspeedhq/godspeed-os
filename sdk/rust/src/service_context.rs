@@ -1702,8 +1702,24 @@ impl ServiceContext {
         &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
         on_linger: impl FnOnce(),
     ) -> ReqOutcome {
+        self.request_with_reply_keyhint(peer, msg, hint_after_secs, max_secs, Self::QUIT_KEYS, on_linger)
+    }
+
+    /// The keys [`Self::request_with_reply_qhint`] leaves on: `q`, `Q` and Escape.
+    pub const QUIT_KEYS: &'static [u8] = &[b'q', b'Q', 0x1b];
+
+    /// [`Self::request_with_reply_qhint`] with the LEAVE KEYS chosen by the caller. The convention
+    /// (`utilities/0_conventions.md`) gives `q` to a task that STOPS when the operator leaves and `b` to
+    /// one that keeps running; a request whose peer finishes the work whether or not this caller waits -
+    /// `wifi radio off hard`, where the driver cuts the chip's power either way - is the second kind, and
+    /// offering `q` for it would promise a stop that cannot happen. `Aborted` means one of `leave_keys`
+    /// was pressed; what that means for the task is the caller's to say.
+    pub fn request_with_reply_keyhint(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        leave_keys: &[u8], on_linger: impl FnOnce(),
+    ) -> ReqOutcome {
         let op = self.trace_in(peer, msg);
-        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, on_linger);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger);
         self.trace_out(peer, op, match &out {
             ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
             ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
@@ -2353,6 +2369,7 @@ impl ServiceContext {
         msg:  &crate::ipc::Message,
         hint_after_secs: i64,
         max_secs: i64,
+        leave_keys: &[u8],
         on_linger: impl FnOnce(),
     ) -> ReqOutcome {
         // Drain any stale reply a prior INSTANT-abort left in our endpoint (see the abortable variant).
@@ -2390,7 +2407,7 @@ impl ServiceContext {
                 return ReqOutcome::Reply(r);
             }
             while let Some(b) = self.try_console_read() {
-                if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
+                if leave_keys.contains(&b) { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
             }
             let elapsed = self.epoch_secs_monotonic() - t0;
             if elapsed >= hint_after_secs {
@@ -3513,6 +3530,18 @@ impl ServiceContext {
         // SAFETY: a plain syscall; the kernel validates the capability and the access before any I/O.
         let r = unsafe { crate::syscall::raw_syscall(53, sel as u64, offset as u64, 0) };
         if r < 0 { None } else { Some(r as u32) }
+    }
+
+    /// Cut (`false`) or restore (`true`) the power of the device this service was granted a fixed
+    /// peripheral window to (`DevicePower`, syscall 54). Needs `DEVICE_POWER`, which the kernel mints
+    /// with the window wherever the machine can power the device; everywhere else, and for every
+    /// service without such a window, this returns `false` and the kernel says why on the serial log.
+    /// How long to hold the device off and how long to wait after restoring it are the caller's to know
+    /// - they are properties of the device, not of the kernel (`docs/wifi.md` 47).
+    pub fn device_power(&self, on: bool) -> bool {
+        // SAFETY: a plain syscall; the kernel validates the capability before touching any pin.
+        let r = unsafe { crate::syscall::raw_syscall(54, if on { 1 } else { 0 }, 0, 0) };
+        r == 0
     }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.

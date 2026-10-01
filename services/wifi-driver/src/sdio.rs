@@ -306,7 +306,11 @@ pub fn identify(h: &Host, ctx: &ServiceContext) -> Option<Card> {
     // that died before its firmware ran (mid-upload, ARM halted); its I/O side is reset (CCCR RES,
     // Linux's `sdio_reset`) and it is identified from CMD0 like a fresh card, because the state it is
     // in is the one the boot's own upload starts from.
-    if let Some(rev) = read_reg(h, 0, cccr::REVISION) {
+    // REVISION ZERO IS NOT A CARD. The SDIO specification gives every card a nonzero CCCR format version
+    // in this register (the CYW43455 says 0x32), and a host that answers a CMD52 read with zeros when
+    // nothing is on the bus - QEMU's does, boot 2026-10-01 01:50 - would otherwise read as an initialised
+    // card with nothing up, and be power-cycled for it. The fresh path below is what handles "nothing".
+    if let Some(rev) = read_reg(h, 0, cccr::REVISION).filter(|r| *r != 0) {
         let ioe = read_reg(h, 0, cccr::IO_ENABLE).unwrap_or(0);
         let ior = read_reg(h, 0, cccr::IO_READY).unwrap_or(0);
         if ioe & 0x04 != 0 && ior & 0x04 != 0 {
@@ -316,17 +320,27 @@ pub fn identify(h: &Host, ctx: &ServiceContext) -> Option<Card> {
             return Some(Card { rca: 0, funcs: 3, memory: false, ocr: 0, warm: true });
         }
         ctx.log_fmt(format_args!(
-            "wifi-driver: an earlier instance left the card initialised (CCCR rev {:#04x}, IOE {:#04x}, IOR {:#04x}) but function 2 is not up - it died before its firmware ran. Resetting the I/O side (CCCR RES) and identifying from CMD0",
+            "wifi-driver: an earlier instance left the card initialised (CCCR rev {:#04x}, IOE {:#04x}, IOR {:#04x}) but function 2 is not up - it died before its firmware ran",
             rev, ioe, ior));
-        if write_reg(h, 0, CCCR_IO_ABORT, CCCR_IO_ABORT_RES).is_none() {
-            ctx.log("wifi-driver: the CCCR RES write was refused by a card that answers CMD52 - identifying anyway");
+        // POWER, where the machine has it. A chip the host can only reset is a chip whose ROM will not
+        // boot a new firmware (docs/wifi.md 45); a chip whose power was cut is a chip as after power-on,
+        // and the boot's own path handles that. The kernel minted this service `DEVICE_POWER` with its
+        // window where the board can do this (docs/wifi.md 47); where it cannot, the SDK call returns
+        // false and the CCCR RES path below is what remains.
+        if crate::power_cycle_device(ctx, h) {
+            ctx.log("wifi-driver: the radio was power-cycled - identifying it as a card just powered up");
+        } else if write_reg(h, 0, CCCR_IO_ABORT, CCCR_IO_ABORT_RES).is_none() {
+            ctx.log("wifi-driver: no power control here, and the CCCR RES write was refused by a card that answers CMD52 - identifying anyway");
+        } else {
+            ctx.log("wifi-driver: no power control here - the I/O side is reset (CCCR RES) and identification starts from CMD0; a firmware that ran before will not boot again this way (docs/wifi.md 45)");
         }
     }
     identify_once(h, ctx)
 }
 
-/// The identification proper, from CMD0: a fresh card, or one whose I/O side `identify` just reset.
-fn identify_once(h: &Host, ctx: &ServiceContext) -> Option<Card> {
+/// The identification proper, from CMD0: a fresh card, one just power-cycled, or one whose I/O side
+/// `identify` just reset. Public because the adopt path in `main` re-identifies after a power cycle.
+pub fn identify_once(h: &Host, ctx: &ServiceContext) -> Option<Card> {
     // CMD0 has no response, so its "success" says only that the controller accepted it. Its value is
     // putting a card that some earlier owner left mid-transaction back into the idle state.
     if h.cmd(CMD_GO_IDLE, 0).is_none() {

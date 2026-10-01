@@ -1010,7 +1010,7 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("chaos",  "max-carnage",  CHAOS_RESTARTABLE),
     ("trace",  "deps",         CHAOS_RESTARTABLE),
     ("trace",  "chain",        CHAOS_RESTARTABLE),
-    ("wifi",   "radio",        &["on", "off"]),
+    ("wifi",   "radio",        &["on", "off", "powercycle"]),
     ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
 ];
 
@@ -5240,7 +5240,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wifi debug [events|stats|firmware|transport|trace]", "the driver's own account: counters, the firmware's words, the last 64 frames", "wifi debug trace"),
             ("wifi stored", "which networks a passphrase is held for (names only, never secrets)", "wifi stored"),
             ("wifi forget <ssid>", "delete a stored passphrase; does not disconnect", "wifi forget Bankole-WiFi"),
-            ("wifi radio on|off", "power the radio; `off` disconnects first and says so", "wifi radio off"),
+            ("wifi radio on|off|off hard|powercycle", "the radio's switch and the chip's power: `off` is the firmware's switch, `off hard` cuts the chip's power, `on` brings it back from either (cold from `off hard`), `powercycle` is off hard and on in one", "wifi radio off"),
         ], true),
         "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
             ("ping <ip>", "ping continuously (round-trip time + TTL per reply); q quits, then stats", "ping 192.168.4.1"),
@@ -5516,7 +5516,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi forget <ssid>", "the key is wiped; the link, if any, is not touched", "wifi forget Bankole-WiFi"),
         ], false),
         ("wifi", "radio") => help_block(ctx, "wifi radio", "power the radio", &[
-            ("wifi radio on|off", "off disconnects first and says so", "wifi radio off"),
+            ("wifi radio on|off", "the firmware's switch: off disconnects first and says so; on rejoins", "wifi radio off"),
+            ("wifi radio off hard", "cut the CHIP's power and stay powered down; `wifi radio on` brings it back cold (~20 s)", "wifi radio off hard"),
+            ("wifi radio powercycle", "cut and restore the CHIP's power and restart the driver on it - the radio comes back from power-on and rejoins", "wifi radio powercycle"),
         ], false),
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
@@ -7503,7 +7505,7 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             return Err(ShellError::Unknown);
         }
         "radio" => {
-            out.line_fmt(ctx, format_args!("wifi: usage: wifi radio on   or   wifi radio off"));
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi radio on | off | off hard | powercycle"));
             return Err(ShellError::Unknown);
         }
         _ => {}
@@ -7525,8 +7527,8 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     }
     if let Some(word) = arg.strip_prefix("radio ") {
         let word = word.trim();
-        if word != "on" && word != "off" {
-            out.line_fmt(ctx, format_args!("wifi: radio takes `on` or `off`, not '{}'", word));
+        if word != "on" && word != "off" && word != "off hard" && word != "powercycle" {
+            out.line_fmt(ctx, format_args!("wifi: radio takes `on`, `off`, `off hard` or `powercycle`, not '{}'", word));
             return Err(ShellError::Unknown);
         }
     }
@@ -7537,7 +7539,7 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     if !known {
         out.line_fmt(ctx, format_args!(
             "wifi: unknown subcommand - try wifi, wifi scan, wifi list, wifi join <ssid>, wifi leave,"));
-        out.line_fmt(ctx, format_args!("      wifi stored, wifi forget <ssid>, wifi radio on|off, or wifi help"));
+        out.line_fmt(ctx, format_args!("      wifi stored, wifi forget <ssid>, wifi radio on|off|off hard|powercycle, or wifi help"));
         return Err(ShellError::Unknown);
     }
 
@@ -7560,6 +7562,8 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
                 "leave" => return wifi_leave(ctx, out),
                 "radio on" => return wifi_radio(ctx, out, true),
                 "radio off" => return wifi_radio(ctx, out, false),
+                "radio off hard" => return wifi_radio_hard_off(ctx, out),
+                "radio powercycle" => return wifi_radio_powercycle(ctx, out),
                 _ => {}
             }
             if let Some(ssid) = arg.strip_prefix("join ") {
@@ -7596,6 +7600,18 @@ mod wifi_wire {
     pub const OP_STATUS: u8 = 6;
     pub const OP_DISCONNECT: u8 = 7;
     pub const OP_RADIO: u8 = 8;
+    /// `OP_RADIO` mode 2: cut and restore the chip's power (`wifi radio powercycle`).
+    pub const RADIO_POWERCYCLE: u8 = 2;
+    /// `OP_RADIO` mode 3: cut the chip's power and stay powered down (`wifi radio off hard`).
+    pub const RADIO_HARD_OFF: u8 = 3;
+    /// Status while the chip is powered down: every op but status and the radio op answers this.
+    pub const RADIO_POWERED_OFF: u8 = 18;
+    /// `OP_RADIO` reply byte 3 after `on` on a powered-down chip: power restored, driver to be restarted.
+    pub const COLD_START: u8 = 19;
+    /// The KERNEL refused to drive the chip's power: this machine has no control over it. Distinct from
+    /// `RADIO_DOWN`, which says only that the radio is down - the two were one byte until 2026-10-01, and
+    /// a down radio was reported as a powerless machine.
+    pub const NO_POWER_CONTROL: u8 = 20;
     pub const OP_STORED: u8 = 9;
     pub const OP_FORGET: u8 = 10;
     pub const OP_DEBUG: u8 = 11;
@@ -7818,6 +7834,7 @@ fn wifi_radio_unavailable(ctx: &ShellCtx, out: &mut Out, status: u8) -> Result<(
     match status {
         wifi_wire::RADIO_DOWN => out.line_fmt(ctx, format_args!("wifi: the radio is not up - it did not come up at boot")),
         wifi_wire::RADIO_OFF => out.line_fmt(ctx, format_args!("wifi: the radio is off - `wifi radio on` powers it")),
+        wifi_wire::RADIO_POWERED_OFF => out.line_fmt(ctx, format_args!("wifi: the chip is powered down (`wifi radio off hard`) - `wifi radio on` powers it up and starts the driver cold")),
         _ => out.line_fmt(ctx, format_args!("wifi: the radio driver gave a reply this shell does not understand")),
     }
     Err(ShellError::Unknown)
@@ -8195,7 +8212,11 @@ fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         None => return wifi_not_answering(ctx, out),
     }
     if p[9] == 0 {
-        out.line_fmt(ctx, format_args!("radio      off"));
+        if p.get(61).copied() == Some(0) {
+            out.line_fmt(ctx, format_args!("radio      off (hard - the chip is powered down; wifi radio on powers it up)"));
+        } else {
+            out.line_fmt(ctx, format_args!("radio      off"));
+        }
     } else {
         out.line_fmt(ctx, format_args!("radio      on"));
     }
@@ -8260,7 +8281,7 @@ fn wifi_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         Some(s) => return wifi_radio_unavailable(ctx, out, s),
         None => return wifi_not_answering(ctx, out),
     }
-    out.line_fmt(ctx, format_args!("radio       {}", if p[9] == 0 { "off" } else { "on" }));
+    out.line_fmt(ctx, format_args!("radio       {}", if p[9] != 0 { "on" } else if p.get(61).copied() == Some(0) { "off (hard - powered down)" } else { "off" }));
     if p[10] == 0 {
         out.line_fmt(ctx, format_args!("network     none (not associated)"));
     } else {
@@ -8607,6 +8628,18 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
             // The third byte says whether anything changed; a driver that does not send one is read as
             // "changed", which is what the two-byte reply always meant.
             let changed = p.get(2).copied().unwrap_or(1) != 0;
+            if on && p.get(3).copied() == Some(COLD_START) {
+                // The chip was powered down (`off hard`) and the driver has restored its power. It has no
+                // firmware to serve and cannot bring a cold chip up in place; restart it, and watch the
+                // respawn take the boot's own path - the same watch `powercycle` uses.
+                out.line_fmt(ctx, format_args!("radio powered up - starting the driver on the cold chip"));
+                if let Err(e) = cmd_kill(&**ctx, "wifi-driver") {
+                    out.line_fmt(ctx, format_args!("radio on failed - the chip is powered but the driver could not be restarted; `kill wifi-driver` by hand brings it back"));
+                    return Err(e);
+                }
+                let outcome = wifi_powercycle_watch(ctx, out, "radio on");
+                return wifi_radio_on_outcome(ctx, out, outcome);
+            }
             match (on, changed, was_joined) {
                 (true, false, _) => out.line_fmt(ctx, format_args!("radio already on")),
                 (false, false, _) => out.line_fmt(ctx, format_args!("radio already off")),
@@ -8624,7 +8657,20 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
             }
             Ok(())
         }
+        // THE HARD ON. The driver is up and its radio is not - the firmware trapped at start, or never
+        // ran - so the soft switch has nothing to switch. `on` is the one word the operator can always
+        // type without knowing the state (docs/wifi.md 47), so it does the hard thing here: restart the
+        // driver, which adopts a live firmware or power-cycles a dead one, and watch it join. `off` on a
+        // down radio stays a statement of fact: there is nothing to switch off.
+        Some(RADIO_DOWN) if on => {
+            let outcome = wifi_restart_and_watch(ctx, out, "radio on", "the radio is down (no firmware behind it)")?;
+            wifi_radio_on_outcome(ctx, out, outcome)
+        }
         Some(RADIO_DOWN) => wifi_radio_unavailable(ctx, out, RADIO_DOWN),
+        Some(NO_POWER_CONTROL) => {
+            out.line_fmt(ctx, format_args!("radio on failed - the chip is powered down and the kernel refused to restore its power: this machine has no control over it"));
+            Err(ShellError::Unknown)
+        }
         Some(_) => {
             out.line_fmt(ctx, format_args!("wifi: the radio did not take the power command"));
             Err(ShellError::Unknown)
@@ -8633,8 +8679,290 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
     }
 }
 
+/// The end of a `wifi radio on` that went the hard way (a cold or a down chip, watched back up). A chip
+/// that came up warm is not left with the operator: `on` hands over to the powercycle loop, which holds
+/// the power off longer each time and does not give up (docs/wifi.md 47). The operator asked for the radio
+/// on; which rung of the ladder gets there is this shell's to climb.
+fn wifi_radio_on_outcome(ctx: &ShellCtx, out: &mut Out, outcome: WatchOutcome) -> Result<(), ShellError> {
+    match outcome {
+        WatchOutcome::Joined | WatchOutcome::Left => Ok(()),
+        WatchOutcome::Warm => {
+            out.line_fmt(ctx, format_args!("the chip came up warm - its firmware trapped at start; power-cycling it"));
+            wifi_radio_powercycle(ctx, out)
+        }
+        WatchOutcome::TimedOut => Err(ShellError::Unknown),
+    }
+}
+
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
 /// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
+/// `wifi radio powercycle`: the chip's power, cut and restored, then the driver restarted on the cold
+/// chip - VERIFIED, and repeated when the chip came up warm.
+///
+/// Two principals, each with what it already holds. The DRIVER holds `DEVICE_POWER` and cuts the power
+/// when asked (the radio op's third mode, with the hold-off in the request). This shell holds restart
+/// authority and kills the driver once the chip is cold; the supervisor's respawn finds a card that does
+/// not answer the CCCR, which is the boot's own path, and the radio comes up from power-on and rejoins
+/// from `/wifi.keys` (docs/wifi.md 47). The order is the point: power first, then the kill - a respawn
+/// onto a chip whose firmware still runs would ADOPT it (46), which is the opposite of a power cycle.
+///
+/// VERIFIED, because six cycles on hardware with the pin read back low gave three cold chips and three
+/// firmware traps at start: a hold-off is a power-on only sometimes. The watch below reads the outcome,
+/// and a driver that comes back with its radio down means a warm chip - so the shell cycles again with
+/// the power held off twice as long, up to POWERCYCLE_ATTEMPTS, and says which attempt succeeded.
+fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const HINT_SECS: i64 = 1;
+    const MAX_SECS: i64 = 30;
+    /// Hold-off on the first attempt, in the request's 100 ms units; doubled on each attempt after a warm
+    /// chip, up to `MAX_OFF_UNITS`. The ATTEMPTS ARE NOT BOUNDED, deliberately: a bound would end in the one
+    /// sentence this system does not print - "reboot" - and the hold-off cap keeps each attempt bounded in
+    /// time, which is what 26.6 asks. A count grows; a count is not a resource (the supervisor's own
+    /// reasoning for respawning forever). The operator can leave with `q` at any time.
+    const FIRST_OFF_UNITS: u8 = 20;
+    const MAX_OFF_UNITS: u8 = 160;
+    let mut off_units: u8 = FIRST_OFF_UNITS;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let outcome = wifi_ask_q(ctx, &[OP_RADIO, RADIO_POWERCYCLE, off_units], HINT_SECS, MAX_SECS);
+        let r = match outcome {
+            ReqOutcome::Reply(r) => r,
+            _ => {
+                // A driver that does not answer is mid-bring-up or wedged: restart it and watch.
+                match wifi_restart_and_watch(ctx, out, "powercycle", "the radio driver is not answering")? {
+                    WatchOutcome::Joined | WatchOutcome::Left => return Ok(()),
+                    WatchOutcome::Warm => {
+                        off_units = off_units.saturating_mul(2).min(MAX_OFF_UNITS);
+                        out.line_fmt(ctx, format_args!(
+                            "  the chip came up warm - its firmware trapped at start; cycling again with the power off for {}.{} s (attempt {})",
+                            off_units / 10, off_units % 10, attempt + 1));
+                        continue;
+                    }
+                    WatchOutcome::TimedOut => return Err(ShellError::Unknown),
+                }
+            }
+        };
+        let p = r.payload_bytes();
+        match p.first().copied() {
+            Some(OK) => {}
+            Some(RADIO_DOWN) => {
+                // The driver is up and its radio is not: no firmware behind it. The driver serves the
+                // power ops in that state too, so reaching here means an older driver - or one whose
+                // radio went down between the question and the answer. Either way the act is the same.
+                match wifi_restart_and_watch(ctx, out, "powercycle", "the radio is down (no firmware behind it)")? {
+                    WatchOutcome::Joined | WatchOutcome::Left => return Ok(()),
+                    WatchOutcome::Warm => {
+                        off_units = off_units.saturating_mul(2).min(MAX_OFF_UNITS);
+                        out.line_fmt(ctx, format_args!(
+                            "  the chip came up warm - its firmware trapped at start; cycling again with the power off for {}.{} s (attempt {})",
+                            off_units / 10, off_units % 10, attempt + 1));
+                        continue;
+                    }
+                    WatchOutcome::TimedOut => return Err(ShellError::Unknown),
+                }
+            }
+            Some(NO_POWER_CONTROL) => {
+                out.line_fmt(ctx, format_args!("powercycle failed - the kernel refused: this machine has no control over the radio's power"));
+                return Err(ShellError::Unknown);
+            }
+            Some(_) => {
+                out.line_fmt(ctx, format_args!("powercycle failed - the radio driver did not take the powercycle command"));
+                return Err(ShellError::Unknown);
+            }
+            None => return wifi_not_answering(ctx, out),
+        }
+        let was_joined = p.get(1).copied().unwrap_or(0) != 0;
+        out.line_fmt(ctx, format_args!(
+            "radio power cut for {}.{} s and restored{} - restarting the driver on the cold chip",
+            off_units / 10, off_units % 10,
+            if was_joined { " (the network is left)" } else { "" }));
+        if let Err(e) = cmd_kill(&**ctx, "wifi-driver") {
+            out.line_fmt(ctx, format_args!("powercycle failed - the chip was power-cycled but the driver could not be restarted; `kill wifi-driver` by hand brings it back"));
+            return Err(e);
+        }
+        match wifi_powercycle_watch(ctx, out, "powercycle") {
+            WatchOutcome::Joined => {
+                if attempt > 1 {
+                    out.line_fmt(ctx, format_args!("  (on attempt {})", attempt));
+                }
+                return Ok(());
+            }
+            WatchOutcome::Left => return Ok(()),
+            WatchOutcome::Warm => {
+                off_units = off_units.saturating_mul(2).min(MAX_OFF_UNITS);
+                out.line_fmt(ctx, format_args!(
+                    "  the chip came up warm - its firmware trapped at start; cycling again with the power off for {}.{} s (attempt {})",
+                    off_units / 10, off_units % 10, attempt + 1));
+            }
+            WatchOutcome::TimedOut => return Err(ShellError::Unknown),
+        }
+    }
+}
+
+/// Restart the radio driver and watch it come back. The one act this shell has for a driver that is
+/// not answering (mid-bring-up or wedged) and for one that answers RADIO_DOWN (up, with no firmware
+/// behind it - the firmware trapped at start, or never ran): this shell holds restart authority, and the
+/// respawn does the right thing by itself - it adopts a firmware that is alive and power-cycles one that
+/// is dead (docs/wifi.md 46-47). `verb` names the command for the lines the watch prints.
+fn wifi_restart_and_watch(ctx: &ShellCtx, out: &mut Out, verb: &str, why: &str) -> Result<WatchOutcome, ShellError> {
+    out.line_fmt(ctx, format_args!("{} - restarting the driver (its respawn adopts a live firmware or power-cycles a dead one)", why));
+    if let Err(e) = cmd_kill(&**ctx, "wifi-driver") {
+        out.line_fmt(ctx, format_args!("{} failed - the driver could not be restarted; `kill wifi-driver` by hand brings it back", verb));
+        return Err(e);
+    }
+    Ok(wifi_powercycle_watch(ctx, out, verb))
+}
+
+/// What the watch saw the radio do after a power cycle.
+enum WatchOutcome {
+    /// Joined, and the join is younger than the watch: the new instance's.
+    Joined,
+    /// The operator pressed `q` or `b`; the power cycle continues unwatched.
+    Left,
+    /// The driver came back and reports its radio DOWN: the firmware trapped at start on a warm chip.
+    Warm,
+    /// Nothing conclusive within the bound; said on the way out.
+    TimedOut,
+}
+
+/// Watch the radio come back after a power cycle, blocking until it has rejoined. `b` backgrounds, `q`
+/// quits the watch; neither stops the power cycle, because there is nothing to stop once the power has
+/// been cut - the driver is being respawned and will join on its own - and the line each prints says so
+/// (rule 11 applies to a task that can be stopped; the hint keeps the convention, `[q] quit`).
+///
+/// Progress is what the driver answers to its status question, asked once a second with a one-second
+/// bound: no answer while it brings the chip up from cold (~12 s), `radio_on` 0 while the bus is coming up,
+/// `associated` 0 while it joins, then the name. SUCCESS IS A JOIN YOUNGER THAN THIS WATCH: the status
+/// reply carries how long ago the join happened, and a stale reply from before the kill - which the
+/// second cycle of 2026-10-01 08:29 produced, "succeeded" 157 ms after the ON write - reports a join that is
+/// minutes old. The shell's queue is also drained of stale replies first. A driver that answers RADIO_DOWN
+/// came back and found its firmware trapped: a warm chip, which the caller cycles again. Bounded at
+/// POWERCYCLE_WATCH_SECS, after which it says where the radio got to rather than waiting forever (26.6).
+fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutcome {
+    use wifi_wire::*;
+    const POWERCYCLE_WATCH_SECS: i64 = 90;
+    const POLL_MS: u64 = 1_000;
+    let stale = wifi_drain_stale(ctx);
+    if stale > 0 {
+        ctx.log_fmt(format_args!("shell: {} stale message(s) cleared before watching the power cycle", stale));
+    }
+    out.line_fmt(ctx, format_args!("the radio is coming back from power-on  [q] quit  [b] background"));
+    let t0 = ctx.epoch_secs_monotonic();
+    let mut last = "";
+    loop {
+        while let Some(b) = ctx.try_console_read() {
+            match b {
+                b'q' | b'Q' | 0x1b => {
+                    out.line_fmt(ctx, format_args!("quit - the driver is still coming back; `wifi status` says where it is, and `wifi radio powercycle` can be run again"));
+                    return WatchOutcome::Left;
+                }
+                b'b' | b'B' => {
+                    out.line_fmt(ctx, format_args!("[backgrounded] the driver is still coming back; `wifi status` says where it is, and `wifi radio powercycle` can be run again"));
+                    return WatchOutcome::Left;
+                }
+                _ => {}
+            }
+        }
+        let elapsed = (ctx.epoch_secs_monotonic() - t0).max(0) as u32;
+        let state = match wifi_ask(ctx, &[OP_STATUS], POLL_MS) {
+            None => "waiting for the driver (identifying the chip, uploading its firmware)",
+            Some(r) => {
+                let p = r.payload_bytes();
+                if p.first().copied() == Some(RADIO_DOWN) {
+                    return WatchOutcome::Warm;
+                }
+                if p.len() < 29 || p[0] != OK {
+                    "the driver answers, radio not up yet"
+                } else if p[9] == 0 {
+                    "radio coming up"
+                } else if p[10] == 0 {
+                    "radio up, joining"
+                } else {
+                    let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+                    if since > elapsed + 2 {
+                        // A join older than this watch is the OLD instance's answer, not the new one's.
+                        "an answer from before the power cycle - waiting for the new driver"
+                    } else {
+                        let jlen = core::cmp::min(p[28] as usize, SSID_MAX);
+                        let mut shown = [0u8; SSID_MAX];
+                        let name = wifi_ssid_text(&p[29..29 + jlen], &mut shown);
+                        out.line_fmt(ctx, format_args!("{} succeeded - joined {}", verb, name));
+                        return WatchOutcome::Joined;
+                    }
+                }
+            }
+        };
+        if state != last {
+            out.line_fmt(ctx, format_args!("  {}", state));
+            last = state;
+        }
+        if ctx.epoch_secs_monotonic() - t0 >= POWERCYCLE_WATCH_SECS {
+            // Not a warm chip - that returns above - so not a case for another cycle: the radio is up and
+            // did not join, or the driver never answered. Both are the radio's or the network's to say.
+            out.line_fmt(ctx, format_args!(
+                "{} failed - the radio did not rejoin within {} s (last seen: {}). `wifi status` says where it is; `wifi radio powercycle` can be run again",
+                verb, POWERCYCLE_WATCH_SECS, state));
+            return WatchOutcome::TimedOut;
+        }
+        ctx.sleep_ms(POLL_MS);
+    }
+}
+
+/// `wifi radio off hard`: the chip's power, cut and left cut. The driver leaves the network first (the
+/// firmware can still send), then asks the kernel to cut the power through its own grant, and stays alive
+/// to answer `wifi status` with "powered down" and every other request with RADIO_POWERED_OFF. `wifi radio
+/// on` restores the power and restarts the driver onto the cold chip (docs/wifi.md 47).
+fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    // The wait is the driver leaving the network, cutting the power and the kernel reading the pin back
+    // low - two or three seconds - and the line below says so from the start, with the one key the wait
+    // accepts. It is `b`, not `q`: `q` stops a task and `b` leaves it running (`utilities/0_conventions.md`),
+    // and the driver finishes the cut whether or not this shell waits, so a `q` here would promise a stop
+    // that cannot happen. The SDK's own hint is pushed past the bound so it is not printed a second time.
+    const MAX_SECS: i64 = 15;
+    out.line_fmt(ctx, format_args!("cutting the chip's power - leaving the network first, then the pin is read back low  [b] background"));
+    let msg = Message::from_bytes(&[OP_RADIO, RADIO_HARD_OFF]);
+    let outcome = ctx.request_with_reply_keyhint(WIFI_DRIVER, &msg, MAX_SECS, MAX_SECS, &[b'b', b'B', 0x1b], || {});
+    let r = match outcome {
+        ReqOutcome::Reply(r) => r,
+        ReqOutcome::Aborted => {
+            out.line_fmt(ctx, format_args!("[backgrounded] the cut completes in the driver; `wifi status` says `radio off (hard ...)` once the chip is powered down"));
+            return Ok(());
+        }
+        other => return wifi_no_answer(ctx, out, &other, "cutting the chip's power"),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) => {
+            let was_joined = p.get(1).copied().unwrap_or(0) != 0;
+            let changed = p.get(2).copied().unwrap_or(1) != 0;
+            if !changed {
+                out.line_fmt(ctx, format_args!("radio already off (hard)"));
+            } else if was_joined {
+                out.line_fmt(ctx, format_args!("left the network, then radio off (hard) - the chip is powered down; `wifi radio on` powers it up"));
+            } else {
+                out.line_fmt(ctx, format_args!("radio off (hard) - the chip is powered down; `wifi radio on` powers it up"));
+            }
+            Ok(())
+        }
+        Some(NO_POWER_CONTROL) => {
+            out.line_fmt(ctx, format_args!("radio off hard failed - the kernel refused: this machine has no control over the radio's power; the radio is as it was"));
+            Err(ShellError::Unknown)
+        }
+        Some(RADIO_DOWN) => {
+            // An older driver that does not serve the power ops with its radio down. Nothing was cut.
+            out.line_fmt(ctx, format_args!("radio off hard failed - the radio is down and the driver did not cut the power; `kill wifi-driver` restarts it, and the respawn serves the command"));
+            Err(ShellError::Unknown)
+        }
+        Some(_) => {
+            out.line_fmt(ctx, format_args!("radio off hard failed - the radio driver did not take the command"));
+            Err(ShellError::Unknown)
+        }
+        None => wifi_not_answering(ctx, out),
+    }
+}
+
 fn net_renew(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway)  [q] quit"));
     let outcome = ns_abortable(ctx, &[8u8], 30);

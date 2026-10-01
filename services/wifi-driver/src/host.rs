@@ -304,6 +304,19 @@ impl<'a> Host<'a> {
     }
 
     /// Program the card clock. Returns false if it never reports stable.
+    /// Stop the card clock and leave it stopped. Called before the chip's power is restored: Linux's
+    /// `mmc_power_up` raises the power with the clock at zero and starts the init clock only after the
+    /// power-on delay, and a Broadcom part samples its boot straps - some of them on the SDIO data lines -
+    /// at the rising edge of WL_REG_ON. A clock running on those lines at that moment is a coin flip on the
+    /// boot mode, which is the one-in-two warm starts of docs/wifi.md 47. The next instance of this
+    /// driver re-initialises the host from reset and sets the clock itself.
+    pub fn stop_clock(&self) {
+        self.wr(CONTROL1, self.rd(CONTROL1) & !C1_CLK_EN);
+        for _ in 0..5 {
+            spin();
+        }
+    }
+
     fn set_clock(&self, divisor: u32, ctx: &ServiceContext) -> bool {
         self.wr(CONTROL1, self.rd(CONTROL1) & !C1_CLK_EN);
         for _ in 0..5 {

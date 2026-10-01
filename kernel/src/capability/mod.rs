@@ -164,6 +164,17 @@ pub const IMAGE_SPAWN_RESOURCE: ResourceId = ResourceId(15);
 /// and it lives in the service (§26.10).
 pub const PCI_CFG_RESOURCE: ResourceId = ResourceId(16);
 
+/// Authority to cut and restore the power of the ONE device whose fixed peripheral window the holder
+/// was granted (`DevicePower`, syscall 54). Derived from the device grant rather than from a privilege
+/// bit: the kernel mints it at spawn for a service it hands such a window to, when the arch layer can
+/// power the device behind it (`arch::imp::device_power_control`), and for no one else - a window has
+/// exactly one holder. It is the grant made renewable: the kernel already powers the Pi 4's SD domain
+/// at boot before it can grant the radio's window, and this lets the holder ask for that again. Why a
+/// driver needs it is `docs/wifi.md` 45-46: the CYW43455 returns to its power-on state only when its
+/// power is cut, and every host-side reset leaves a chip whose ROM will not boot a new firmware. The
+/// kernel learns which pin; the driver decides when (§12.3 amendment 2026-10-01).
+pub const DEVICE_POWER_RESOURCE: ResourceId = ResourceId(17);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -183,5 +194,9 @@ pub fn init() {
     table::register_resource(SET_CLOCK_RESOURCE);
     table::register_resource(IMAGE_SPAWN_RESOURCE);
     table::register_resource(PCI_CFG_RESOURCE);
+    // The device grant made renewable (12.3 amendment 2026-10-01). Registered like every other kernel
+    // authority, because `mint_cap` refuses - by panic - a resource the table has never heard of, and the
+    // first boot without this line proved it at wifi-driver's spawn.
+    table::register_resource(DEVICE_POWER_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

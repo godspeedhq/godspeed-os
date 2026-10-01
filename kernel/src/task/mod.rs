@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE, DEVICE_POWER_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -1871,6 +1871,20 @@ fn spawn_service_with_image(
         let pc_cap = mint_cap(PCI_CFG_RESOURCE, Rights::READ);
         caps.insert(pc_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // DEVICE_POWER: derived from the DEVICE GRANT, not from a privilege bit the spawner passes. A service
+    // this spawn hands a fixed peripheral window - and whose device the arch layer can power - also
+    // receives the authority to cut and restore that device's power (`DevicePower`, syscall 54). The
+    // grant, renewable: the kernel powered the domain at boot to make the window mean anything, and a
+    // chip that only returns to power-on when its power is cut needs the holder able to ask for that
+    // again (`docs/wifi.md` 45-46). One holder per window, so one holder per device; the arch layer
+    // answers which devices it can power, and today that is the Pi 4 radio behind the SDIO host.
+    if crate::arch::imp::device_power_control(name) {
+        let dp_cap = mint_cap(DEVICE_POWER_RESOURCE, Rights::WRITE);
+        caps.insert(dp_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+        crate::kprintln!("spawn[power]: '{}' may cut and restore its device's power (DEVICE_POWER)", name);
     }
 
     // USB_DISK: the ARM `block-driver` reads/writes a USB stick through the in-kernel Bulk-Only stack

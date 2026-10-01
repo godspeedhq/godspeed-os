@@ -333,6 +333,12 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
 pub fn hw_random() -> Option<u32> { None }
 
+/// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
+/// one board with it is the Pi 4 (`arch/aarch64`), whose radio returns to power-on only when WL_ON is
+/// cut. `false` is the honest answer; the syscall reports it as "no control over it".
+pub fn device_power_control(_name: &str) -> bool { false }
+pub fn device_power(_name: &str, _on: bool) -> bool { false }
+
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.

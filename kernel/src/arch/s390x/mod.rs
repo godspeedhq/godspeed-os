@@ -90,6 +90,12 @@ pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> O
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
 pub fn hw_random() -> Option<u32> { None }
+
+/// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
+/// one board with it is the Pi 4 (`arch/aarch64`), whose radio returns to power-on only when WL_ON is
+/// cut. `false` is the honest answer; the syscall reports it as "no control over it".
+pub fn device_power_control(_name: &str) -> bool { false }
+pub fn device_power(_name: &str, _on: bool) -> bool { false }
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
 pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }

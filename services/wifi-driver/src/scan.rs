@@ -494,8 +494,27 @@ pub mod reply {
     pub const OP_STATUS: u8 = 6;
     /// Request op byte: leave the current network; the radio stays up. Reply `[OK, was_joined(0|1)]`.
     pub const OP_DISCONNECT: u8 = 7;
-    /// Request op byte: `[8, on(0|1)]` - power the radio. `off` disconnects first. Reply `[OK, was_joined]`.
+    /// Request op byte: `[8, mode]` - power the radio. `mode` 0 = off (disconnects first), 1 = on (rejoins
+    /// the network last joined), `RADIO_POWERCYCLE` = cut and restore the CHIP's power through the kernel's
+    /// `DevicePower` and leave this instance to be killed and respawned onto the cold chip. Reply
+    /// `[status, was_joined, changed, rejoin_status, len, name...]`.
     pub const OP_RADIO: u8 = 8;
+    /// The third `OP_RADIO` mode: `wifi radio powercycle`. Not a radio switch at all - the chip's power.
+    /// `[8, 2, units]`: `units` of 100 ms to hold the power off, 0 for the driver's default.
+    pub const RADIO_POWERCYCLE: u8 = 2;
+    /// `OP_RADIO` mode 3: `wifi radio off hard` - cut the chip's power and stay powered down. `on` or
+    /// `powercycle` restores the power and answers `COLD_START`.
+    pub const RADIO_HARD_OFF: u8 = 3;
+    /// Reply status while the chip is powered down: every op except status and the radio op gets this one
+    /// byte. `wifi radio on` powers the chip up.
+    pub const RADIO_POWERED_OFF: u8 = 18;
+    /// `OP_RADIO` reply byte 3 after `on` on a powered-down chip: the power is back and this instance has
+    /// no firmware to serve, so the caller restarts the driver and the respawn takes the boot's cold path.
+    pub const COLD_START: u8 = 19;
+    /// Reply status when the KERNEL refused to drive the device's power - this machine has no control
+    /// over it. Distinct from `RADIO_DOWN`, which says the radio is down and nothing about power; the two
+    /// were one byte on 2026-10-01 and a shell read a down radio as a powerless machine.
+    pub const NO_POWER_CONTROL: u8 = 20;
     /// The radio was powered off by `wifi radio off`; a sweep or a join is refused until `radio on`. Distinct
     /// from `RADIO_DOWN`, which is a radio that never came up.
     pub const RADIO_OFF: u8 = 7;

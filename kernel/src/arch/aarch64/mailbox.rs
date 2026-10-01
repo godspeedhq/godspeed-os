@@ -12,9 +12,10 @@
 //! GPU then reads stale data - or worse, reads a half-written message and acts on it.
 //!
 //! Two ways out: map the buffer non-cacheable, or make the call before the MMU and caches are enabled.
-//! The second is free and is what the 32-bit port settled on, so the boot asks its questions early and
-//! keeps the answers. A later call, after `mmu::enable`, would need explicit cache maintenance around
-//! the buffer - noted here so that whoever adds one does not discover it as a heisenbug.
+//! The boot asks its questions early and keeps the answers. Calls AFTER `mmu::enable` exist now too -
+//! `notify_xhci_reset`, and `set_expander_gpio` behind `DevicePower` - and `call` handles them: it
+//! translates the buffer's address itself and does the cache maintenance on both sides of the exchange,
+//! and the one syscall-time caller takes a lock that the pre-MMU callers must not.
 //!
 //! ## Bus addresses
 //!
@@ -58,6 +59,56 @@ const TAG_ARM_MEMORY: u32 = 0x0001_0005;
 struct MboxBuf([u32; 36]);
 
 static mut MBOX: MboxBuf = MboxBuf([0; 36]);
+static MBOX_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
+/// The firmware's GPIO expander pins the Pi 4 routes board control through (`bcm2711-rpi-4-b.dts`,
+/// `expgpio`): 0 BT_ON, 1 WL_ON, 2 PWR_LED_OFF, 3 GLOBAL_RESET, 4 VDD_SD_IO_SEL, 5 CAM_GPIO,
+/// 6 SD_PWR_ON, 7 SD_OC_N. Linux's `mmc-pwrseq-simple` for the radio is `reset-gpios = <&expgpio 1>`.
+pub const EXPGPIO_WL_ON: u32 = 1;
+
+/// Drive one firmware-expander GPIO through the `SET_GPIO_STATE` property tag (`0x00038041`). The
+/// expander's pins are numbered from 128 on the mailbox side, which is why Linux's `gpio-raspberrypi-exp`
+/// adds the same offset. `state` is the PHYSICAL level: for WL_ON, 1 is powered and 0 is off/reset.
+/// Returns whether the firmware took the request; it is a runtime caller of `property_call`, which does
+/// its own address translation and cache maintenance around the shared buffer.
+/// Read one firmware-expander GPIO back through `GET_GPIO_STATE` (`0x00030041`): the PHYSICAL level the
+/// firmware reports for the pin, or `None` if it did not answer. The instrument that says whether a
+/// `set_expander_gpio` took, because the SET tag answers "accepted" whether or not the pin moved.
+pub fn get_expander_gpio(pin: u32) -> Option<u32> {
+    const TAG_GET_GPIO_STATE: u32 = 0x0003_0041;
+    const EXPANDER_BASE: u32 = 128;
+    let _one = MBOX_LOCK.lock();
+    let mut req = [0u32; 8];
+    req[0] = 8 * 4;
+    req[1] = 0;
+    req[2] = TAG_GET_GPIO_STATE;
+    req[3] = 8;
+    req[4] = 4;
+    req[5] = EXPANDER_BASE + pin;
+    req[6] = 0;
+    req[7] = 0;
+    property_call(&mut req)?;
+    Some(req[6])
+}
+
+pub fn set_expander_gpio(pin: u32, on: bool) -> bool {
+    // ONE RUNTIME CALLER AT A TIME. `MBOX` is one buffer and the channel is one register pair. This is
+    // reached from a syscall with the MMU on, where a lock is sound and another core may be in a boot
+    // call; the boot callers themselves cannot take it (see `property_call`).
+    let _one = MBOX_LOCK.lock();
+    const TAG_SET_GPIO_STATE: u32 = 0x0003_8041;
+    const EXPANDER_BASE: u32 = 128;
+    let mut req = [0u32; 8];
+    req[0] = 8 * 4;
+    req[1] = 0;
+    req[2] = TAG_SET_GPIO_STATE;
+    req[3] = 8;
+    req[4] = 8;
+    req[5] = EXPANDER_BASE + pin;
+    req[6] = if on { 1 } else { 0 };
+    req[7] = 0;
+    property_call(&mut req).is_some()
+}
 
 /// What the firmware told us about the machine. `None` for anything it declined to answer - never a
 /// guess, because a wrong memory size is worse than a known-absent one.
@@ -135,6 +186,10 @@ pub fn property_call(req: &mut [u32]) -> Option<()> {
     if req.len() > 36 {
         return None; // larger than the shared buffer; a caller bug, refused rather than truncated
     }
+    // NO LOCK HERE, on purpose. The boot-time callers run BEFORE `mmu::enable`, and a spinlock's
+    // exclusive-access atomics never succeed on AArch64 with the MMU off - the first attempt at a lock
+    // here spun forever on the framebuffer's query (boot 2026-10-01 01:33, hung after the memory map).
+    // The one caller that reaches this from a syscall, `set_expander_gpio`, takes `MBOX_LOCK` itself.
     // SAFETY: single-threaded boot, caches off, and MBOX is this module's static. The length is
     // checked above, so neither copy can run past either end.
     unsafe {
