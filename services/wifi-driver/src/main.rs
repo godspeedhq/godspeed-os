@@ -1310,13 +1310,45 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ),
             }
 
+            // ---- ADOPT: the firmware an earlier instance loaded is running; attach to it. -------------
+            // `identify` found the card initialised with function 2 up, which only a running firmware
+            // holds up. Everything that would disturb that firmware is skipped - no halt, no core reset,
+            // no upload (stages 9-11) - and the bus is brought up on it as it stands. Any transfer the
+            // dead instance left in flight is aborted per function first (IO_ABORT, not RES). The
+            // firmware is then asked the same first question the boot asks; if it answers, this instance
+            // carries on with it, joins from `/wifi.keys` as a fresh one would, and the kill cost
+            // seconds. If it does not answer there is nothing left to try on this chip short of cutting
+            // its power (`backlog/69`), and the radio says so rather than restarting a firmware the ROM
+            // will not boot.
+            if card.warm {
+                ctx.log("wifi-driver: ADOPT - stages 9 to 11 are skipped: no halt, no reset, no upload. The running firmware is asked to answer");
+                sdio::abort(&h, 1, &ctx);
+                sdio::abort(&h, 2, &ctx);
+                match cores.as_ref().and_then(|c| c.sdiod.as_ref()) {
+                    Some(sdiod) => {
+                        if bus::bring_up(&h, &mut window, sdiod.base, &ctx) && ctrl::report_mac(&h, &mut window, &ctx) {
+                            ctx.log("wifi-driver: ADOPTED - the firmware the earlier instance loaded answers; this instance carries on with it");
+                            radio = scan::run(&h, &mut window, true, &ctx);
+                        } else {
+                            ctx.log("wifi-driver: the running firmware did not answer, and a firmware restarted on a warm chip traps in its ROM (backlog/69) - the radio stays down until a reboot");
+                        }
+                    }
+                    None => ctx.log(
+                        "wifi-driver: the EROM described no SDIO device core, so the running firmware cannot be reached - the radio stays down until a reboot",
+                    ),
+                }
+            }
+
             // ---- Stage 9: how much RAM, and where the firmware goes. ---------------------------------
             // The upload needs an address and a size. The CR4 reports its TCM as a set of BANKS through
             // its own registers - reached by the core's BASE, not its wrapper, which is why a wrapper of
             // 0 does not block this - and the firmware's start address is a per-part constant the
-            // reference keeps in a table rather than a formula.
-            ctx.log("wifi-driver: stage 9 - asking the ARM core how much TCM it has");
-            match cores.as_ref().and_then(|c| c.arm) {
+            // reference keeps in a table rather than a formula. NOT on an adopted firmware: the read
+            // below halts the core it would size.
+            if !card.warm {
+                ctx.log("wifi-driver: stage 9 - asking the ARM core how much TCM it has");
+            }
+            match if card.warm { None } else { cores.as_ref().and_then(|c| c.arm) } {
                 Some(arm) => match {
                     // THE CORE IS RESET AND RELEASED WITH ITS CPU HALTED BEFORE IT IS ASKED. A chip a
                     // dead instance left running its firmware answers `ARMCR4_CAP` with zero - 50
@@ -1379,7 +1411,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     }
                                 }
                                 ctx.log("wifi-driver: stage 11 - uploading the firmware");
-                                if upload::run(&h, &mut window, wrap, &ram, card.warm, &ctx) {
+                                if upload::run(&h, &mut window, wrap, &ram, &ctx) {
                                     ctx.log(
                                         "wifi-driver: PHASE 2 COMPLETE - firmware and NVRAM are in the \
                                          chip and its processor is running them",
@@ -1407,7 +1439,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                     // against a channel that has never
                                                     // replied would confuse "the scan is
                                                     // wrong" with "nothing works yet".
-                                                    radio = scan::run(&h, &mut window, &ctx);
+                                                    radio = scan::run(&h, &mut window, false, &ctx);
                                                 }
                                             }
                                         }
@@ -1433,7 +1465,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     None => ctx.log("wifi-driver: the ARM core memory could not be sized, so the upload has no destination yet"),
                 },
-                None => ctx.log("wifi-driver: no ARM core was found, so there is nothing to ask about TCM"),
+                None => if !card.warm {
+                    ctx.log("wifi-driver: no ARM core was found, so there is nothing to ask about TCM")
+                },
             }
         }
         None => ctx.log(

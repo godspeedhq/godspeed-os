@@ -490,3 +490,4 @@ mmc_hw_reset                       # Linux drivers/mmc/core - power-cycles a car
 trap_addr                          # Linux brcmfmac sdio.c `sdpcm_shared_le.trap_addr` - the word after `flags` in the shared structure, the trap record pointer - external, 26.14
 si_watchdog                        # Broadcom DHD siutils.c - arms the PMU watchdog on a PMU chip, the chipcommon watchdog otherwise; the register choice `sdio::PMU_WATCHDOG` follows - external, 26.14
 pmuwatchdog                        # Broadcom chipcregs - the PMU watchdog register at chipcommon + 0x634 `sdio::PMU_WATCHDOG` names - external, 26.14
+mmc_sdio_resume                    # Linux drivers/mmc/core/sdio.c - resume reinitialises nothing for a powered, non-removable card; the model `sdio::identify` adopts a running firmware by - external, 26.14

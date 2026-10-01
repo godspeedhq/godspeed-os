@@ -93,3 +93,7 @@ ieee80211_send_group_msg2          # OpenBSD net80211 ieee80211_pae_output.c - t
 aic8800_sdio                       # docs/wifi.md 44 - the AICSemi vendor Linux module for the VisionFive 2 Lite radio, named as the executable datasheet a riscv64 port would read - external, 26.14
 dw_mmc                             # docs/wifi.md 44 - the DesignWare MMC host block (Linux dwmmc_starfive) the VisionFive radio hangs off; no host layer for it exists here yet - external, 26.14
 WL_REG_ON                          # the Pi 4 WLAN regulator enable, a firmware GPIO-expander pin driven through the mailbox - hardware, named in backlog/69 as the power cycle a respawn needs - external
+brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+brcmf_pcie_reset_device            # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+si_watchdog                        # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14

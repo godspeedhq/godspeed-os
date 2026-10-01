@@ -438,7 +438,6 @@ pub fn run(
     w: &mut Window,
     arm_wrapper: u32,
     ram: &Ram,
-    warm: bool,
     ctx: &ServiceContext,
 ) -> bool {
     // 1. HALT THE CPU, but leave the CORE OUT OF RESET - which is not the same thing, and getting it
@@ -504,32 +503,6 @@ pub fn run(
         nv_at,
         top
     ));
-    // A WARM CHIP'S RAM IS WIPED WHERE THE UPLOAD DOES NOT WRITE IT. A power cycle clears the chip's
-    // RAM; the PMU watchdog reset does not, and firmware started after that reset trapped in ROM before
-    // it had a stack (`type 0x1, epc 0x9384c, sp 0` - backlog/69), which is what cold-boot code finding
-    // the previous run's state looks like. DHD clears the top word of RAM before every download for
-    // its shared-structure pointer; this clears every word between the image and the NVRAM, which is
-    // all of RAM the two writes above and below do not cover. Warm only: a fresh boot's upload stays
-    // byte-for-byte what it was, so this is one change on its own.
-    if warm {
-        let gap_from = ram.base + firmware::IMAGE.len() as u32;
-        let gap_to = nv_at;
-        if gap_to > gap_from {
-            ctx.log_fmt(format_args!(
-                "wifi-driver: warm chip - zeroing the {} KiB of RAM between the image and the NVRAM ({:#08x}..{:#08x}) so the firmware starts on what a power-on would leave",
-                (gap_to - gap_from) / 1024, gap_from, gap_to));
-            const ZEROS: [u8; CHUNK] = [0u8; CHUNK];
-            let mut at = gap_from;
-            while at < gap_to {
-                let n = ((gap_to - at) as usize).min(CHUNK);
-                if !write_bytes(h, w, at, &ZEROS[..n], "RAM clear", ctx) {
-                    ctx.log("wifi-driver: the RAM clear failed part way - continuing, the firmware may find stale state");
-                    break;
-                }
-                at += n as u32;
-            }
-        }
-    }
     if !write_bytes(h, w, nv_at, &nv[..len], "NVRAM", ctx) {
         return false;
     }

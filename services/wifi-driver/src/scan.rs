@@ -989,7 +989,7 @@ pub const MAX_EMPTY_POLLS: u32 = 500;
 /// Split out of the boot self-test because `wifi scan` starts a sweep on request, and re-sending the CLM
 /// blob and the UP chain on every request would be wrong - the interface is already up. The bring-up
 /// happens here, once; `start` and `step` do the part that repeats, from the serve loop.
-pub fn bring_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::Session> {
+pub fn bring_up(h: &Host, w: &mut Window, adopted: bool, ctx: &ServiceContext) -> Option<ctrl::Session> {
     let mut session = ctrl::Session::new(ctx);
 
     // THE CLM BLOB FIRST, and it is first for a reason rather than by habit. `bwfm_init` is preceded by
@@ -997,7 +997,16 @@ pub fn bring_up(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::
     // the Country Locale Matrix - which channels may be used at what power - and a radio with no regulatory
     // data cannot lawfully transmit or scan. That is why every configuration command was accepted and
     // `escan` still answered `BCME_NOTUP`.
-    if !ctrl::download_blob(
+    //
+    // ONCE PER FIRMWARE, and an ADOPTED firmware has had it. The blob is accepted only while the
+    // interface is down; a fresh firmware starts down, and the firmware an earlier instance loaded is
+    // up and associated - which is exactly why it is worth adopting. Sent again it is refused with
+    // `BCME_NOTDOWN` (boot 2026-10-01 00:53, the first successful adoption), and taking that refusal
+    // as "no channel rules" threw away a working radio. Everything after this point is idempotent on
+    // a running firmware and runs either way.
+    if adopted {
+        ctx.log("wifi-driver: adopted firmware - its CLM was loaded by the instance that started it and is not sent again (refused while up)");
+    } else if !ctrl::download_blob(
         h,
         w,
         &mut session,
@@ -1088,12 +1097,12 @@ pub fn scan_once(
 /// Returns the session on ANY outcome past bring-up, because a scan that found nothing - or whose results
 /// did not parse - is still a radio that is up and can be asked again by the shell. Only a failed bring-up
 /// returns `None`, and then there is genuinely nothing to serve.
-pub fn run(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ctrl::Session> {
+pub fn run(h: &Host, w: &mut Window, adopted: bool, ctx: &ServiceContext) -> Option<ctrl::Session> {
     // The "UNVERIFIED ON HARDWARE" banner that stood here was true when written and would have been a
     // lie from the first successful boot on. Ten networks, names and all, on 2026-09-28.
     ctx.log("wifi-driver: stage 14 - scanning");
 
-    let mut session = bring_up(h, w, ctx)?;
+    let mut session = bring_up(h, w, adopted, ctx)?;
     let scan = match scan_once(h, w, &mut session, ctx) {
         Some(s) => s,
         None => return Some(session),

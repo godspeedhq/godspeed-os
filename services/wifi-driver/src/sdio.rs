@@ -291,89 +291,41 @@ pub fn write_reg(h: &Host, func: u8, addr: u32, val: u8) -> Option<()> {
 /// answering but never becoming ready means the voltage window was refused. CMD3 failing after a ready
 /// CMD5 means the card is listening and the bus is marginal.
 pub fn identify(h: &Host, ctx: &ServiceContext) -> Option<Card> {
-    // RESET THE CARD'S I/O SIDE FIRST, for the card an EARLIER INSTANCE left running. CMD0 puts a
-    // memory card back in idle; the SDIO specification leaves an I/O card's function side exactly where
-    // it was, and a CYW43455 that a dead instance left initialised - RCA assigned, selected, 4-bit,
-    // firmware up - does not answer CMD5 from that state. `chaos max-carnage` on the Pi 4 showed it as
-    // 397 respawns and 397 `no SDIO card answered`, with the one join of the whole run at boot. The
-    // reset is the RES bit of CCCR `IO_ABORT`, written through CMD52 to function 0, which is what
-    // Linux's `sdio_reset` does before every SDIO probe (`drivers/mmc/core/sdio_ops.c`) - the same
-    // requirement of the same silicon (26.14). On a fresh boot there is no initialised card to answer
-    // the write, so its failure is expected and silent; it is only ever REPORTED when it was accepted,
-    // because that says a previous instance was here.
-    let warm = write_reg(h, 0, CCCR_IO_ABORT, CCCR_IO_ABORT_RES).is_some();
-    if warm {
-        ctx.log("wifi-driver: the card was left initialised by an earlier instance - its I/O side is reset (CCCR RES) before identification");
+    // A CARD AN EARLIER INSTANCE LEFT RUNNING IS ADOPTED, NOT RESET. Six host-side resets were tried
+    // on such a chip (`docs/wifi.md` 45, `backlog/69`) and each ended the same way: a firmware started
+    // on a chip the host reset traps in the chip's ROM before it has a stack. Only a power cycle is a
+    // power-on for this part, and only the kernel can drive that. But a kill of this SERVICE does
+    // nothing to the CHIP - the firmware the dead instance loaded is still running, associated, alive -
+    // and brcmfmac's resume-with-power-kept path re-attaches to exactly such a firmware without
+    // touching the card (`mmc_sdio_resume` reinitialises nothing for a powered, non-removable card).
+    //
+    // A CMD52 read of the CCCR answers only on an initialised card: a fresh one is not selected and
+    // stays silent, so silence is the boot's path. An initialised card with function 2 ENABLED and
+    // READY was brought up by an earlier instance and its firmware asserts the ready bit, so that
+    // firmware is alive: it is adopted. An initialised card WITHOUT function 2 belongs to an instance
+    // that died before its firmware ran (mid-upload, ARM halted); its I/O side is reset (CCCR RES,
+    // Linux's `sdio_reset`) and it is identified from CMD0 like a fresh card, because the state it is
+    // in is the one the boot's own upload starts from.
+    if let Some(rev) = read_reg(h, 0, cccr::REVISION) {
+        let ioe = read_reg(h, 0, cccr::IO_ENABLE).unwrap_or(0);
+        let ior = read_reg(h, 0, cccr::IO_READY).unwrap_or(0);
+        if ioe & 0x04 != 0 && ior & 0x04 != 0 {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: an earlier instance left the card initialised (CCCR rev {:#04x}, IOE {:#04x}, IOR {:#04x}) with function 2 up - its firmware is running. ADOPTING it: no reset, no re-enumeration, no upload; the firmware is asked to answer further on",
+                rev, ioe, ior));
+            return Some(Card { rca: 0, funcs: 3, memory: false, ocr: 0, warm: true });
+        }
+        ctx.log_fmt(format_args!(
+            "wifi-driver: an earlier instance left the card initialised (CCCR rev {:#04x}, IOE {:#04x}, IOR {:#04x}) but function 2 is not up - it died before its firmware ran. Resetting the I/O side (CCCR RES) and identifying from CMD0",
+            rev, ioe, ior));
+        if write_reg(h, 0, CCCR_IO_ABORT, CCCR_IO_ABORT_RES).is_none() {
+            ctx.log("wifi-driver: the CCCR RES write was refused by a card that answers CMD52 - identifying anyway");
+        }
     }
-    let mut card = identify_once(h, ctx)?;
-    card.warm = warm;
-    if !warm {
-        return Some(card);
-    }
-    // THE WHOLE CHIP IS RESET, not only its SDIO side. The I/O reset above, the ARM halt at stage 9
-    // and the 802.11 reset before the upload each bought one more stage, and the firmware still
-    // came alive with its TRAP flag set on every respawn - it crashes at start on the state the
-    // previous firmware left in the chip. brcmfmac's remedy for a warm chip is a power cycle
-    // (`brcmf_sdio_bus_reset` -> `mmc_hw_reset`), which on this board is the WLAN regulator on the
-    // GPIO expander behind the firmware mailbox, and only the kernel drives that. Its remedy where it
-    // cannot cut power is a watchdog reset of the whole chip: `brcmf_pcie_reset_device` arms the
-    // chipcommon `watchdog`, and DHD's `si_watchdog` arms the PMU watchdog on a chip that has a PMU -
-    // which this one does, and which is the register that matters here (`PMU_WATCHDOG` says what the
-    // other one did). So the backplane is opened just far enough to write it, the chip is given
-    // time, and identification runs again against what should now be a chip as after power-up - which
-    // the RES write below tells: refused means fresh, accepted means the watchdog did not take.
-    if !chip_reset(h, ctx) {
-        ctx.log("wifi-driver: the chip reset could not be issued - continuing on the warm chip, whose firmware is likely to trap");
-        return Some(card);
-    }
-    if write_reg(h, 0, CCCR_IO_ABORT, CCCR_IO_ABORT_RES).is_some() {
-        ctx.log("wifi-driver: the chip did NOT reset - the card still answers as an initialised one. Continuing on it, and the watchdog register is the thing to question");
-    } else {
-        ctx.log("wifi-driver: the chip reset took - the card answers as one just powered up, and identification starts over");
-    }
-    let mut card = identify_once(h, ctx)?;
-    card.warm = true;
-    Some(card)
+    identify_once(h, ctx)
 }
 
-/// The PMU watchdog (`pmuwatchdog`, chipcommon + 0x634): a nonzero count of ILP-clock ticks after which
-/// the whole chip resets. Broadcom's own SDIO driver (DHD, `si_watchdog`) writes THIS register on a chip
-/// with a PMU and the chipcommon `watchdog` (`BCMA_CC_WATCHDOG`, 0x80) only on one without; brcmfmac's
-/// PCIe path writes 0x80 on parts where that is whole-chip. On the 43455 - a PMU chip - 0x80 was tried
-/// first (boot 2026-09-30 23:47) and reset the chip HALF WAY: the SDIO core still answered CMD52 and
-/// never answered CMD5 again, on that respawn and on the 46 after it, until the next power-on. DHD
-/// raises a count of 1 to 2; 4 is what the PCIe path uses and is kept.
-const PMU_WATCHDOG: u32 = 0x634;
-const PMU_WATCHDOG_TICKS: u32 = 4;
-
-/// Reset the whole chip through the chipcommon watchdog, for a chip an earlier instance left running.
-/// Needs function 1 open and the backplane awake, which is stage 6 and 7's work done early and briefly;
-/// after the reset the card is re-identified from CMD0 and those stages run again for real.
-fn chip_reset(h: &Host, ctx: &ServiceContext) -> bool {
-    set_block_size(h, 1, 64, ctx);
-    if !enable_function(h, 1, ctx) {
-        ctx.log("wifi-driver: function 1 would not open on the warm chip, so the watchdog cannot be reached");
-        return false;
-    }
-    if !crate::backplane::wake(h, ctx) {
-        ctx.log("wifi-driver: the warm chip's backplane did not wake, so the watchdog cannot be reached");
-        return false;
-    }
-    let mut w = crate::backplane::Window::new();
-    if w.write32(h, crate::backplane::CHIPCOMMON_BASE + PMU_WATCHDOG, PMU_WATCHDOG_TICKS, ctx).is_none() {
-        ctx.log("wifi-driver: the write to the PMU watchdog was refused");
-        return false;
-    }
-    ctx.log_fmt(format_args!(
-        "wifi-driver: PMU watchdog armed ({} tick(s)) - the whole chip resets; waiting for it",
-        PMU_WATCHDOG_TICKS
-    ));
-    // The reference waits 100 ms after the write; twice that costs nothing here and covers a slower part.
-    ctx.sleep_ms(200);
-    true
-}
-
-/// The identification proper, from CMD0. `identify` runs it once on a fresh chip and twice on a warm one.
+/// The identification proper, from CMD0: a fresh card, or one whose I/O side `identify` just reset.
 fn identify_once(h: &Host, ctx: &ServiceContext) -> Option<Card> {
     // CMD0 has no response, so its "success" says only that the controller accepted it. Its value is
     // putting a card that some earlier owner left mid-transaction back into the idle state.

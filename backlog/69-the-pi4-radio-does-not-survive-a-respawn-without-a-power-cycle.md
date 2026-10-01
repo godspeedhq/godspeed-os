@@ -1,6 +1,8 @@
 # 69. The Pi 4 radio does not survive a respawn of its driver: the firmware traps on any chip the host can reset, and only a power cycle is a power-on
 
-**Status: OPEN - established 2026-09-30/10-01 over seven boots under `chaos max-carnage`, the last one the operator's own choice of experiment (zero the RAM) before any kernel change; the remedy is a kernel-side action the operator has not authorised. `docs/wifi.md` 45 has the full chain.**
+**Status: RESOLVED 2026-10-01 in userspace, by not restarting the firmware at all (`docs/wifi.md` 46).** A respawn ADOPTS the firmware the dead instance left running: the card answers CMD52 with function 2 up, so the firmware is alive; stages 9-11 are skipped, the bus is brought up on it, the CLM is not re-sent (refused while up), and it joins from `/wifi.keys`. Hardware: post-storm instance adopted, scanned, joined, pinged 5/5; the kill cost the link ~7 s. No reset, no power cycle. The chain below stands as the record of why a firmware RESTART needs power on this chip - that is now the rare case (a firmware killed mid-upload, or trapped), reported honestly and costing a reboot, rather than every respawn.
+
+**Original status: OPEN - established 2026-09-30/10-01 over seven boots under `chaos max-carnage`, the last one the operator's own choice of experiment (zero the RAM) before any kernel change; the remedy is a kernel-side action the operator has not authorised. `docs/wifi.md` 45 has the full chain.**
 
 ## What a respawn now does, and where it ends
 

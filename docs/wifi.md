@@ -3330,6 +3330,45 @@ not the answer. That is the end of the host-side chain: six steps, each a correc
 reference, each one stage further, and the last one inside the chip's ROM. `backlog/69` is the record
 and the remedy is the power cycle.
 
+## 46. Adopt, do not restart: a respawn attaches to the firmware that is already running (2026-10-01)
+
+Section 45 tried six ways to give a new firmware a chip it would boot on, and learned that only power
+does that. The question it never asked was why a new firmware was wanted at all. A kill of the SERVICE
+does nothing to the CHIP: the firmware the dead instance loaded is still running, still associated,
+still asserting function 2 ready. brcmfmac's resume path with power kept re-attaches to exactly such a
+firmware and reinitialises nothing on the card.
+
+So `identify` now decides three ways from two CMD52 reads. A card that does not answer the CCCR is
+fresh: the boot's path. A card that answers with function 2 enabled and ready was brought up by an
+earlier instance and its firmware is alive: it is ADOPTED - no CCCR reset, no CMD0, no halt, no core
+reset, no upload. Stages 9 to 11 are skipped; any transfer the dead instance left in flight is aborted
+per function; the bus is brought up on the running firmware and it is asked the same first question the
+boot asks. If it answers, the instance carries on: it scans, loads `/wifi.keys`, and joins as a fresh
+one would, and the kill cost seconds. A card that answers the CCCR but has no function 2 belongs to an
+instance that died before its firmware ran, mid-upload with the ARM halted; that is the state the boot's
+own upload starts from, so it gets the RES reset and the fresh path.
+
+**First result (00:53):** the firmware the dead instance loaded ANSWERED the new one - five adoptions
+in a storm of eleven kills, the other six killed mid-attach - and the next step refused: `clmload`,
+`BCME_NOTDOWN`. The regulatory blob is accepted only while the interface is down, a fresh firmware starts
+down, and an adopted one is up and associated, which is the whole point of adopting it. The blob is sent
+once per firmware now; an adopted firmware has had it. The rest of the bring-up - event mask, version
+report, interface up - is idempotent on a running firmware and runs either way.
+
+**Result (01:00, hardware):** a storm of five kills; the post-storm instance ADOPTED the running
+firmware, skipped the CLM, scanned (12 networks), loaded `/wifi.keys`, joined, and `net` said `up via
+wifi (the cable is out)`; `ping` 5 of 5. The kill cost the link about seven seconds. **The driver's
+restart loop is closed in userspace**, with no reset of any kind and no power cycle: the service is
+volatile, the firmware is not, and a respawn converges on the firmware it finds. `backlog/69` is
+resolved by this section. What stays true from section 45: a firmware that has STOPPED - killed
+mid-upload, or trapped - cannot be restarted on this chip without power, and that case is reported
+rather than retried; it costs a reboot, and it is the rare case now rather than every case.
+
+The PMU watchdog and the RAM clear are gone from the code, recorded above as tried. They were the reset
+path's last two steps, and the reset path no longer runs on a chip with a live firmware. If the adopted
+firmware does not answer, the driver says so and serves `radio down` until a reboot rather than
+restarting a firmware the ROM will not boot.
+
 The rule all four stages obey: a respawn inherits a chip the previous instance left RUNNING, and every
 step written against the power-on state has to say what it does with a running one.
 
