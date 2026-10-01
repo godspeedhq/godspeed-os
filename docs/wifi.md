@@ -3903,3 +3903,24 @@ fast time (about 3 s), and `powercycle` - well past the first minute, several ti
 `flags 0x00000001` and joins, exactly as it did under `force_turbo`. Between loads the clock reads its
 minimum. A load that is slow while the log says the lease was granted would mean the firmware did not
 honour the rate, and the `cpu-clock:` read-back line would say so.
+
+**Result: confirmed on the card (boot 2026-10-01 20:29, commit `3dd21a66`, no `force_turbo`).** Five loads,
+every one `flags 0x00000001` and joined, no trap, no lease expired, no panic:
+
+| load | after boot | upload |
+|---|---|---|
+| boot | 8 s | 3.19 s |
+| `powercycle` | 2 min 35 s | 3.25 s |
+| `powercycle` | 2 min 58 s | 3.25 s |
+| `powercycle` | 3 min 17 s | 3.25 s |
+| `off hard`, then `on` | 3 min 48 s | 3.24 s |
+
+`power` put the clock at its minimum at start-up - **600 MHz** on this Pi 4 - and each load took a lease,
+ran at **1500 MHz**, and handed it back when the driver started serving, about ten seconds later; the clock
+read back at its minimum again every time. So the radio is fast only while it loads, and every power
+cycle is a power-on. `backlog/69` is closed with this: a respawned driver adopts a running firmware (46),
+and a stopped one is power-cycled cold, every time.
+
+**Still open, and recorded rather than chased:** why a firmware uploaded with the cores at their minimum
+traps at `pc 0x25`. The fix does not depend on it - the dependence is measured and the lease removes it -
+but a board whose cores run slow for any other reason would show it again.
