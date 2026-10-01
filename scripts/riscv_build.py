@@ -65,6 +65,9 @@ SERVICES = [
     "hw-enumerator",
     "ping", "pong", "greet", "upper", "roster", "counter", "reply-server", "asker",
     "resource-server", "holder", "block-driver", "fs", "nic-driver", "net-stack",
+    # The power policy (docs/power.md). Arch-neutral; on this board the OS has no clock control, so it
+    # says so once at start and answers every lease "no control".
+    "power",
     # `xhci` was missing, and that is the whole of "supervisor: spawn xhci FAILED" - the supervisor
     # holds every service's image and cannot spawn one it was never given. The kernel had found the
     # controller, resolved its window and offered it; the driver simply was not in the build.

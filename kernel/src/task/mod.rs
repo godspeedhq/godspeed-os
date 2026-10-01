@@ -13,7 +13,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE, DEVICE_POWER_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE, DEVICE_POWER_RESOURCE, CPU_CLOCK_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -950,11 +950,16 @@ pub mod privbits {
     /// offer. Held by ONE service (`hw-enumerator`), because the pair is stateful - two holders do
     /// not merely race, they silently read each other's device.
     pub const PCI_CFG:         u32 = 1 << 12;
+    /// CPU_CLOCK: set the Arm cores to the platform's minimum or maximum clock (`CpuClock`, syscall 55).
+    /// Held by ONE service, `power`, which owns the policy - who may ask for speed and for how long.
+    /// One holder because the clock is one machine-wide setting: two holders would simply overwrite
+    /// each other, and the second would never know (`docs/power.md`).
+    pub const CPU_CLOCK:       u32 = 1 << 13;
     /// Every bit this kernel understands. Anything outside it is refused, so a newer spawner cannot
     /// quietly ask for a privilege this kernel would ignore.
     pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
                          | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT
-                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK | NET_DEVICE | PCI_CFG;
+                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK | NET_DEVICE | PCI_CFG | CPU_CLOCK;
 }
 
 /// Which requested privilege the CALLING task does not itself hold, if any.
@@ -964,7 +969,7 @@ pub mod privbits {
 pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
     use crate::capability::*;
     if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
-    let checks: [(u32, ResourceId, &'static str); 13] = [
+    let checks: [(u32, ResourceId, &'static str); 14] = [
         (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
         (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
         (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
@@ -978,6 +983,7 @@ pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
         (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE,       "SET_CLOCK"),
         (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE,      "NET_DEVICE"),
         (privbits::PCI_CFG,         PCI_CFG_RESOURCE,         "PCI_CFG"),
+        (privbits::CPU_CLOCK,       CPU_CLOCK_RESOURCE,       "CPU_CLOCK"),
     ];
     for (bit, res, label) in checks {
         // GRANT, not WRITE. Delegating an authority and EXERCISING it are different rights (7.4), and
@@ -1015,6 +1021,7 @@ const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
     (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE),
     (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE),
     (privbits::PCI_CFG,         PCI_CFG_RESOURCE),
+    (privbits::CPU_CLOCK,       CPU_CLOCK_RESOURCE),
 ];
 
 struct Privileges {
@@ -1027,6 +1034,7 @@ struct Privileges {
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
     net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
     pci_cfg:         bool, // PCI_CFG: read PCI config space via CF8/CFC (hw-enumerator, step D2)
+    cpu_clock:       bool, // CPU_CLOCK: set the Arm cores to their minimum or maximum rate (power)
     usb_disk:        bool, // USB_DISK: read/write blocks on the in-kernel USB mass-storage device (ARM block-driver)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
     set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock from SNTP (RTC-less ARM; net-stack)
@@ -1114,6 +1122,9 @@ fn service_privileges(name: &str) -> Privileges {
         // kernel grants only because the supervisor itself holds a GRANT cap for it. That is step C's
         // shape and the reason this reads `false` rather than naming a service (§7.4).
         pci_cfg: false,
+        // CPU_CLOCK: the same shape as PCI_CFG above - `power` is a supervisor-owned service, which asks
+        // for the bit in its spawn request; nothing in the kernel's own catalogue holds it.
+        cpu_clock: false,
         // USB_DISK: `block-driver` reaches a USB stick through syscalls 46-48 rather than MMIO, on
         // the port where the USB stack is IN THE KERNEL - which is now ARM32 (Pi 2) ONLY. On aarch64
         // the in-kernel driver was deleted (CLAUDE.md §6.4, 2026-08-09) and block-driver goes through
@@ -1609,6 +1620,7 @@ fn spawn_service_with_image(
             set_clock:       bits & privbits::SET_CLOCK       != 0,
             net_device:      bits & privbits::NET_DEVICE      != 0,
             pci_cfg:         bits & privbits::PCI_CFG         != 0,
+            cpu_clock:       bits & privbits::CPU_CLOCK       != 0,
             // NO BIT, and none is coming. A spawner cannot pass on the authority to spawn arbitrary
             // images: that is exactly the widening this capability exists to close, and a wire bit
             // for it would re-open the hole one grant later.
@@ -1871,6 +1883,16 @@ fn spawn_service_with_image(
         let pc_cap = mint_cap(PCI_CFG_RESOURCE, Rights::READ);
         caps.insert(pc_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+    }
+
+    // CPU_CLOCK: `power` sets the Arm cores to their minimum or maximum rate (`CpuClock`, syscall 55).
+    // WHO holds it is the spawn request's privilege word; here it is only minted. WRITE alone - there
+    // is no read of the authority to grant, since the syscall reports the rate it set either way.
+    if privs.cpu_clock {
+        let cc_cap = mint_cap(CPU_CLOCK_RESOURCE, Rights::WRITE);
+        caps.insert(cc_cap)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
+        crate::kprintln!("spawn[clock]: '{}' may set the Arm clock (CPU_CLOCK)", name);
     }
 
     // DEVICE_POWER: derived from the DEVICE GRANT, not from a privilege bit the spawner passes. A service

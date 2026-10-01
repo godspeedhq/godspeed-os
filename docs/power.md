@@ -404,3 +404,85 @@ of the win first.
   is a missed preemption (a busy task starves) or a stalled timed wake - serious, so build it behind
   care and iterate on hardware, exactly like the driver work. The watchdog-coupling constraint
   (§14.2) is the one invariant that must not be violated.
+
+## 15. The `power` service: leases on the Arm clock (2026-10-01)
+
+**Status (2026-10-01):** built - the `power` SERVICE, the first piece of this document's strategy that lives
+in its own service rather than inside a driver or the scheduler. One responsibility so far: the Arm
+cores' clock. QEMU-booted; the hardware result is recorded in `docs/wifi.md` 57.
+
+### 15.1 Why it exists
+
+The Raspberry Pi firmware owns the Arm clock. With no operating system asking it for a rate, it runs
+the cores at turbo for `initial_turbo` seconds after boot (60 by default since the November 2024
+firmware) "or until cpufreq sets a frequency", and then at their minimum for good. GodspeedOS had no
+way to ask, so every Pi 4 ran at its minimum clock from one minute after boot onward.
+
+That mattered the first time something needed speed. The WiFi chip's firmware traps at start when
+the driver uploads it with the cores at their minimum - every load after the first minute did, every
+load inside it did not, and holding the cores at turbo with `force_turbo=1` made every power cycle
+come up cold (`docs/wifi.md` 55). Holding them at turbo forever fixes that and wastes power the rest of
+the time. The machine should be fast exactly when something needs it to be.
+
+### 15.2 The split: mechanism in the kernel, policy here
+
+**The kernel** sets the clock to the firmware's minimum or its maximum, and reports what the clock
+reads back (`CpuClock`, syscall 55). It cannot name any other rate, and it learns nothing about why a
+rate is wanted. It is in the kernel at all because the only way to ask the firmware is its mailbox, and
+the kernel already owns that channel - the SD power, the GPIO expander and the radio's power cut all
+go through it. A channel with one owner cannot be shared with a service without two parties writing to
+it and nothing ordering them. This is the same shape as `DevicePower` (CLAUDE.md 12.3).
+
+**This service** holds `CPU_CLOCK`, the authority to make that syscall, and is the only service that
+does: the clock is one machine-wide setting, so a second holder would silently overwrite the first.
+Everything else asks this service over IPC. It owns the rule - who may ask for speed, for how long,
+and when to go back (26.10).
+
+The kernel's part is per board. On the Pi 4 the arch layer asks the firmware; on every other port it
+answers "no control", the service says so once at start, and every lease is answered `ST_NO_CONTROL`,
+which a caller treats as "proceed at whatever the clock is".
+
+### 15.3 The rule: leases
+
+A service that needs the cores fast asks for a lease of N seconds:
+
+| Request | Reply | Meaning |
+|---|---|---|
+| `[1, secs]` (HOLD) | `[status, lease, hz:u32 LE]` | open a lease; `secs` 0 means 15, capped at 30 |
+| `[2, lease]` (RELEASE) | `[status]` | close it early |
+
+Status: 0 OK, 1 every slot is open (8), 2 this machine has no clock control, 3 no such lease (already
+expired, already released, or from before this service restarted), 4 a malformed request.
+
+While any lease is open the clock is at its maximum. When none is, it is at its minimum. The `hz` in a
+HOLD reply is the rate the clock read back when that lease raised it, or 0 when it joined one already
+open.
+
+**A lease that nobody releases expires.** That is the whole answer to "what if the holder dies or
+hangs while holding it": the clock comes back down within 30 seconds at most, and the expiry is said in
+the log, so a holder that keeps letting leases run out is visible. No death notification is involved,
+which is why this service needs none.
+
+### 15.4 Restart
+
+A respawned instance knows of no lease, so it puts the clock at its minimum - the honest state for
+"nobody has asked". A holder whose lease died with the old instance runs slower until it asks again;
+nothing is left stuck fast with nobody to bring it down. This is also what it does at first boot, which
+ends the firmware's minute of turbo early: from that point the machine is fast when something says it
+needs to be, and not otherwise.
+
+### 15.5 Who holds leases today
+
+`wifi-driver`, across its bring-up: from the moment it holds the SDIO window, through the firmware
+upload and the first scan, to the moment it starts serving (about 6 s). Optional on its side: a `power`
+that is absent or refuses costs one log line and the load goes ahead at whatever the clock is.
+
+### 15.6 What is not here yet, and is not promised
+
+- **Load-based scaling.** A governor that reads per-core load and sets the clock is the obvious next
+  rule, and it belongs here. It is not built, because nothing needs it yet (26.2) - and because the WiFi
+  chip's dependence on host speed is not understood, a governor that slowed the cores mid-load would
+  bring the trap back unless the load held a lease. It does.
+- **Rates between the two ends.** The kernel offers the firmware's minimum and maximum and nothing in
+  between. Widening that is a kernel change and needs a reason.
+- **Other power: device power-down, shutdown, thermal.** This is where they would live. None exists.

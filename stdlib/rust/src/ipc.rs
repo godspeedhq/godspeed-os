@@ -152,6 +152,28 @@ pub fn recv_within(ctx: &ServiceContext, secs: i64) -> Option<Message> {
     ctx.recv_timeout(ctx.duration_cycles((secs.max(0) as u64) * 1000))
 }
 
+/// [`recv_within`], bounded in MILLISECONDS.
+///
+/// For a driver or a poller whose rhythm is shorter than a second. Same contract: `None` is the
+/// deadline passing, and the wait takes whatever arrives next - see [`recv`] on why that matters to a
+/// task that also awaits replies.
+pub fn recv_within_ms(ctx: &ServiceContext, ms: u64) -> Option<Message> {
+    ctx.recv_timeout(ctx.duration_cycles(ms))
+}
+
+/// Answer a request on the reply capability its client sent, then give that capability back.
+///
+/// Both halves, every time, which is why this is one call. A reply capability is ONE-SHOT and occupies
+/// a slot in this task's table until it is removed: answered and kept, it leaks a slot per request
+/// until the table is full and the service can no longer receive one (CLAUDE.md 8.5). Non-blocking,
+/// because a client that stopped waiting must never stall the server that answers it; the result says
+/// whether the answer was queued, and either way the capability is gone afterwards.
+pub fn reply(ctx: &ServiceContext, reply_cap: Cap, msg: &Message) -> Result<(), Error> {
+    let sent = try_send_to(ctx, reply_cap, msg);
+    crate::cap::remove(ctx, reply_cap);
+    sent
+}
+
 /// The capability that arrived embedded in the message just received, if any.
 ///
 /// Call it directly after the receive that carried it: it reports the LAST receive, so anything in

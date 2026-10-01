@@ -482,13 +482,11 @@ pub fn run(
         return false;
     }
 
-    // 3. THE DOWNLOAD RUNS ON HT, as Linux's does (`brcmf_sdio_download_firmware` opens with
-    //    `brcmf_sdio_clkctl(bus, CLK_AVAIL, false)` - the HT request, `alp_only` false for this chip). This
-    //    driver used to download with ALP forced and release the ARM with it still forced, so the firmware
-    //    started with the host holding its clock source (docs/wifi.md 54).
-    backplane::download_clock(h, ctx);
-
-    // The image, at the load address the chip's family table gives.
+    // 3. The image, at the load address the chip's family table gives. ON ALP, deliberately diverging from
+    //    Linux, whose `brcmf_sdio_download_firmware` requests HT first (`clkctl(CLK_AVAIL)`, `alp_only`
+    //    false for this chip): measured on this chip, HT is never granted while the CPU is halted - 0x69 ->
+    //    0x50 after 100 ms, every load, cold or warm - so the request only cost 1.3 s per load (docs/wifi.md
+    //    54, 56). The release and the HT request after the ARM starts, below, are kept: those work.
     if !write_bytes(h, w, ram.base, firmware::IMAGE, "firmware", ctx) {
         return false;
     }
@@ -610,7 +608,7 @@ pub fn run(
     // brings its own clocks up. Then the HT request again, which is the reference's next step before it
     // touches the backplane (`brcmf_sdio_firmware_callback`'s `clkctl(CLK_AVAIL)`).
     backplane::release_clock(h, ctx);
-    backplane::download_clock(h, ctx);
+    backplane::request_ht(h, ctx);
     // 7. ASK THE CHIP, rather than asserting from the reset controller. `RESETCTRL 0` means the CPU is
     //    fetching; it does not mean the firmware booted, and a CPU fetching garbage reports the same
     //    thing. The firmware overwrites the NVRAM token at the last word of RAM once it has consumed it,

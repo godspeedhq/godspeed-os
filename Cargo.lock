@@ -1155,6 +1155,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "power"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1909,6 +1917,7 @@ dependencies = [
 name = "wifi-driver"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 

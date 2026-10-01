@@ -1,10 +1,10 @@
 [package]
-name = "wifi-driver"
+name = "power"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "wifi-driver"
+name = "power"
 path = "src/main.rs"
 
 [dependencies]

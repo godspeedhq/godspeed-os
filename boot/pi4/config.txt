@@ -4,7 +4,7 @@
 # build/config.txt; deploy by copying it and build/kernel8.img to the FAT boot
 # partition of a card that already carries the Pi firmware (start4.elf /
 # fixup4.dat - written by the Raspberry Pi Imager, or restored from a backup).
-# This is the Pi 4 twin of boot/pi2/config.txt; the two ports differ in the four
+# This is the Pi 4 twin of boot/pi2/config.txt; the two ports differ in the three
 # lines below and nowhere else.
 
 # Load OUR image under a NAME OF OUR OWN, not `kernel8.img`. The firmware's default
@@ -27,12 +27,3 @@ enable_uart=1
 # console is silent or garbled and the board looks dead. This is a Pi 4 line with no
 # Pi 2 equivalent: on the Pi 2 there is no Bluetooth to lose the UART to.
 dtoverlay=disable-bt
-
-# EXPERIMENT (2026-10-01, docs/wifi.md 55): hold the Arm cores at their turbo clock.
-# The firmware runs them at turbo for `initial_turbo` seconds after boot - 60 by
-# default since the November 2024 firmware - "or until cpufreq sets a frequency".
-# GodspeedOS has no cpufreq, so after a minute the cores drop to their minimum clock
-# and stay there. Every firmware upload to the WiFi chip inside that first minute
-# came up cold; every one after it was 2.3x slower and trapped. No `over_voltage_*`
-# is set, which is the condition under which force_turbo can set the warranty bit.
-force_turbo=1

@@ -112,6 +112,11 @@ pub fn hw_random() -> Option<u32> { None }
 pub fn device_power_control(_name: &str) -> bool { false }
 pub fn device_power(_name: &str, _on: bool) -> bool { false }
 
+/// The Arm cores' clock (`CpuClock`, syscall 55): no control on this port. The one board with it is the
+/// Pi 4 (`arch/aarch64`), whose firmware takes a rate request over the mailbox. `None` is the honest
+/// answer; the syscall reports it as "no control over its clock".
+pub fn cpu_clock(_max: bool) -> Option<u32> { None }
+
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.

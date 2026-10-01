@@ -19,10 +19,10 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 8 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **83** | **grandfathered floor** (§18.5; +1 by the 2026-10-01 amendment, `device_power`) |
+| `sdk/rust/src/service_context.rs` | **84** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
-**The 91 are not 91 defects.** 87 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
+**The 92 are not 92 defects.** 88 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
 is an `unsafe fn` because it issues the trap instruction, so every caller must open a block - and
 these two files *are* the wrapper layer whose whole purpose is to keep services `unsafe`-free. That
 worked: `services/` is at **zero**. The isolation simply stopped one layer short of itself.
@@ -40,6 +40,17 @@ Both floors are enforced: a new `unsafe` in any other `sdk/` file FAILS, and eit
 FAILS. They may decrease freely.
 
 ---
+
+## 2026-10-01 - CpuClock: the Arm clock, for the `power` service (feat/wifi-driver)
+
+A new syscall (55) and a new resource (`CPU_CLOCK`, 18), with the constitution amended at 12.3 and the
+floor at 18.5. The kernel side adds NO unsafe: the handler checks a holding and calls the arch seam; the
+aarch64 rate request goes through the mailbox's existing `property_call` under `MBOX_LOCK`, exactly as
+the expander GPIO calls do. The six other ports answer the seam with safe stubs returning `None`.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 83 -> 84 (+1) | `cpu_clock`: one more `unsafe { raw_syscall(55, ..) }` call site, the same single design consequence as `device_power` below. One integer to a validating kernel; the capability is checked before the firmware is asked anything. Floor amended at CLAUDE.md 18.5, 2026-10-01. |
 
 ## 2026-10-01 - DevicePower: the device grant made renewable (feat/wifi-driver)
 

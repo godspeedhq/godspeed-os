@@ -2517,7 +2517,9 @@ pub fn kill_task_by_slot(slot: usize) {
             // listed unconditionally, exactly as `dwc2` is: a name that never runs here never dies
             // here, so the cost is nothing, and the alternative is a board-specific omission in a
             // neutral file.
-            | "wifi-driver")
+            | "wifi-driver"
+            // power: MANAGED (docs/power.md). Counted and notified like every other restartable service.
+            | "power")
         {
             bump_name_restart(task_name);
         }
@@ -2569,7 +2571,7 @@ pub fn kill_task_by_slot(slot: usize) {
             // wifi-driver: see the restart-counter list above. Both halves or neither - a death that
             // notifies but is not counted, or is counted but does not notify, is the exact split that
             // cost `time` and `control` a hardware session each.
-            | "wifi-driver") {
+            | "wifi-driver" | "power") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

@@ -414,10 +414,13 @@ pub fn wake(h: &Host, ctx: &ServiceContext) -> bool {
 /// Ask for the HT clock with no force bits, and wait for it - Linux's `brcmf_sdio_htclk(bus, true, ..)`,
 /// which writes `HT_AVAIL_REQ` alone (`alp_only` is false for the 43455) and polls for `HT_AVAIL`.
 ///
+/// Called once the firmware's ARM is running, where the chip grants HT after one poll. NOT before the
+/// download: there, with the CPU halted, this chip never grants it (docs/wifi.md 54, 56).
+///
 /// Bounded at 100 polls a millisecond apart, and the outcome is said either way. If HT never comes, the
 /// ALP word `wake` wrote goes back, so the backplane keeps the clock it has always had and the caller
 /// carries on exactly as before - a slower clock is not a reason to stop (docs/wifi.md 54).
-pub fn download_clock(h: &Host, ctx: &ServiceContext) -> bool {
+pub fn request_ht(h: &Host, ctx: &ServiceContext) -> bool {
     const HT_TRIES: u32 = 100;
     let before = sdio::read_reg(h, 1, f1::CHIPCLKCSR);
     if sdio::write_reg(h, 1, f1::CHIPCLKCSR, clk::HT_AVAIL_REQ).is_none() {

@@ -464,6 +464,12 @@ PCI_CFG            = 16
 # the Pi 4 radio: six host-side resets each left a chip whose ROM will not boot a new firmware, and only
 # cutting its power is a power-on (docs/wifi.md 45-47). CLAUDE.md 12.3 amendment, 2026-10-01.
 DEVICE_POWER       = 17
+# CPU CLOCK - set the Arm cores to the firmware's minimum or maximum rate (`CpuClock`, syscall 55). A
+# privilege bit, delegatable, held by ONE service: `power`, which owns the policy - leases of bounded
+# length, the clock at its maximum while any is open (docs/power.md). One holder because the clock is one
+# machine-wide setting. Added because the Pi firmware drops the cores to their minimum a minute after
+# boot and the WiFi chip's firmware traps when loaded that slowly (docs/wifi.md 55). CLAUDE.md 12.3.
+CPU_CLOCK          = 18
 
 
 [kernel.arch_roles]
@@ -618,6 +624,12 @@ PciCfgRead               = 53
 # Pi 4 radio, whose firmware cannot be restarted on a chip the host merely reset (docs/wifi.md 45-47).
 # Gated by DEVICE_POWER, minted at spawn with the window and to nobody else. CLAUDE.md 12.3, 2026-10-01.
 DevicePower              = 54
+# CPU CLOCK - the Arm cores to the firmware's own minimum or maximum, and the rate read back. Why isn't
+# this a service? It is, above the kernel: the kernel owns the firmware mailbox (the SD power, the GPIO
+# expander, the radio's power cut), and the only way to ask the firmware for a rate is a request on it.
+# Two rates are on offer and the caller cannot name a third. Who may be fast and for how long is the
+# `power` service's (26.10, docs/power.md). Gated by CPU_CLOCK. CLAUDE.md 12.3, 2026-10-01.
+CpuClock                 = 55
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47
@@ -713,12 +725,13 @@ SpawnImage               = 52
 "observe-live" = ["priv:INTROSPECT"]
 "observe-now" = ["priv:INTROSPECT"]
 "ping" = ["peer:pong"]
+"power" = ["priv:CPU_CLOCK"]
 "recorder" = ["peer:events", "peer:fs"]
 "resource-server" = ["peer:holder", "priv:RESOURCE_MINT"]
 "shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
 "supervisor" = ["kernel-priv:acquire_any", "kernel-priv:image_spawn", "kernel-priv:introspect", "kernel-priv:recv_endpoint", "kernel-priv:service_control", "kernel-priv:spawn"]
 "time" = ["peer:events", "peer:fs", "peer:net-stack"]
-"wifi-driver" = ["peer:fs"]
+"wifi-driver" = ["peer:fs", "peer:power"]
 "xhci" = ["hw:XHCI", "hw:pci_irq", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
 
 # --------------------------------------------------------------------------------------------------
@@ -746,6 +759,7 @@ SpawnImage               = 52
 service_control = "SERVICE_CONTROL"
 resource_mint = "RESOURCE_MINT"
 pci_cfg = "PCI_CFG"
+cpu_clock = "CPU_CLOCK"
 
 # Commandment X - which utility spec covers which VERBS, where the filename is not the verb.
 # Read by `X-user-vocabulary`. Two specs each cover a set:

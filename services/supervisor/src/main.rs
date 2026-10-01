@@ -217,6 +217,7 @@ static FS_ELF: &[u8] = include_bytes!(env!("SVC_FS_ELF"));
 static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_BLOCK_DRIVER_ELF"));
 static NET_STACK_ELF: &[u8] = include_bytes!(env!("SVC_NET_STACK_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
+static POWER_ELF: &[u8] = include_bytes!(env!("SVC_POWER_ELF"));
 /// Hardware discovery in userspace (step D2), on a board where configuration space is REACHABLE:
 /// x86 through the CF8/CFC ports, aarch64 through the Pi 4's memory-mapped INDEX/DATA window,
 /// riscv64 through a flat ECAM window. Not the Pi 2, which has no PCI bus at all, so the service
@@ -341,6 +342,11 @@ mod board {
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),
     ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack", "events"], 0, 0, 0),
+    // The power policy (docs/power.md). Carries CPU_CLOCK, which sets the Arm cores to the firmware's
+    // minimum or maximum and nothing else; ONE holder, because the clock is one machine-wide setting and
+    // a second holder would silently overwrite this one. No peers: it only ever answers.
+    ("power", POWER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::CPU_CLOCK, 0, 0),
     // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one
     // operation: READ one configuration register, select-and-fetch indivisibly. It cannot write
     // config space at all - that would be write access to every BAR and command register of every
@@ -563,7 +569,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // the paragraph above about `map_fixed_driver_mmio`.
     #[cfg(has_wifi_driver)]
     ("wifi-driver", WIFI_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     16 * 1024 * 1024, 3, &["fs"], 0, 0, 0),
+     16 * 1024 * 1024, 3, &["fs", "power"], 0, 0, 0),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -1068,7 +1074,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 14;
+const MANAGED_N: usize = 15;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -1088,7 +1094,10 @@ const MANAGED: [&str; MANAGED_N] =
      // reconcile skips any name absent from the name-cap map, so a service only one board spawns costs
      // the others nothing - and being absent from this list is what left arm32's storage, keyboard and
      // network down with no backstop when a death notification was dropped.
-     "wifi-driver"];
+     "wifi-driver",
+     // The power policy (docs/power.md). A respawn knows of no lease and puts the clock at its minimum,
+     // which is why its absence from this list would matter: dead, nothing would answer a lease at all.
+     "power"];
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -1355,6 +1364,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // neither can delay the prompt the way a driver bring-up would.
     ensure_mapped(&ctx, &mut name_map, "time", 0xFFFF);
     ensure_mapped(&ctx, &mut name_map, "control", 0xFFFF);
+    // power: the clock policy (docs/power.md). Early, and before every service that leases the clock -
+    // `wifi-driver` wires to it at spawn, and a peer not yet in the name-cap map costs a failed lease.
+    ensure_mapped(&ctx, &mut name_map, "power", 0xFFFF);
     // hw-enumerator: hardware discovery in userspace (step D2). Started here because it holds no
     // device and blocks nothing - it reads PCI config space once, reports, then answers questions.
     //
@@ -1619,7 +1631,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // order). The radio's own bring-up runs in its task and holds nobody up.
     // Wired to `fs` for `/wifi.keys` (the storage chain is up by here, so the cap wires at spawn).
     #[cfg(has_wifi_driver)]
-    ensure_wired(&ctx, &mut name_map, "wifi-driver", &["fs"]);
+    ensure_wired(&ctx, &mut name_map, "wifi-driver", &["fs", "power"]);
 
    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 
@@ -1768,6 +1780,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("supervisor: wifi-driver died, restarting");
                 if respawn_retry(&ctx, &mut name_map, "wifi-driver") { ctx.log("supervisor: wifi-driver restarted"); }
                 else { ctx.log("supervisor: wifi-driver restart FAILED"); }
+            }
+            // The power policy. A respawn knows of no lease and puts the clock at its minimum; a holder
+            // whose lease died with it runs slower until it asks again (docs/power.md).
+            "power" => {
+                ctx.log("supervisor: power died, restarting");
+                if respawn_retry(&ctx, &mut name_map, "power") { ctx.log("supervisor: power restarted"); }
+                else { ctx.log("supervisor: power restart FAILED"); }
             }
             _ => {}
         }

@@ -1086,6 +1086,11 @@ pub fn hw_random() -> Option<u32> { None }
 pub fn device_power_control(_name: &str) -> bool { false }
 pub fn device_power(_name: &str, _on: bool) -> bool { false }
 
+/// The Arm cores' clock (`CpuClock`, syscall 55): no control on this port. The one board with it is the
+/// Pi 4 (`arch/aarch64`), whose firmware takes a rate request over the mailbox. `None` is the honest
+/// answer; the syscall reports it as "no control over its clock".
+pub fn cpu_clock(_max: bool) -> Option<u32> { None }
+
 /// Who made this CPU - see the x86 implementation for what this is for. RISC-V reports its vendor in
 /// `mvendorid`, which is an M-mode CSR: this port runs under OpenSBI in S-mode and cannot read it, so
 /// the ISA is all that can be said honestly here.

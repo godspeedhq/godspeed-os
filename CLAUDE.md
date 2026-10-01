@@ -1461,6 +1461,37 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > "the driver recovers in a few seconds" (`docs/wifi.md` 47). It is also the first brick of a shutdown:
 > the grants run in reverse, with power the last thing taken.
 >
+> **Amendment 2026-10-01 (later still): the paragraph two above overstates what was shown.** It says six
+> host-side resets "each left a chip whose ROM will not boot a new firmware" and that "only cutting its
+> power is a power-on". Every one of those resets, and every warm power-up after them, ran with the Arm cores
+> at their minimum clock - the Pi firmware drops them a minute after boot when no cpufreq sets one - and
+> with the cores held at turbo (`force_turbo=1`, `docs/wifi.md` 55) every power cycle comes up cold. So the
+> power cut is shown to WORK, not shown to be the only thing that would; whether the resets alone recover a
+> fast host's chip is open (`docs/wifi.md` 56). The grant itself stands on its own: cutting a device's
+> power is still the one recovery that cannot depend on the device's cooperation.
+>
+> **Amendment 2026-10-01 (`CpuClock`, syscall 55): the kernel sets the Arm clock to one of the firmware's
+> two ends, and a SERVICE decides which.** The Pi firmware owns the Arm clock and, with no OS asking it
+> for a rate, drops the cores to their minimum a minute after boot and leaves them there. The CYW43455's
+> firmware traps when it is uploaded that slowly (`docs/wifi.md` 55), so something has to be able to ask
+> for speed. The only way to ask is the firmware mailbox, which the kernel already owns - the SD power,
+> the GPIO expander and the radio's power cut all go through it - and a channel with one owner cannot be
+> handed to a service as well.
+>
+> **What the kernel learns, and what it does not.** `CpuClock(max)` sets the clock to the firmware's own
+> `GET_MIN_CLOCK_RATE` or `GET_MAX_CLOCK_RATE` and returns what it reads back. The caller cannot name a
+> rate. It is gated by `CPU_CLOCK` (resource 18), a privilege bit the supervisor may delegate and grants to
+> ONE service, `power`, because the clock is one machine-wide setting and a second holder would silently
+> overwrite the first. Who may be fast, for how long, and when to go back are `power`'s: a LEASE of at
+> most 30 s, the clock at its maximum while any is open and its minimum otherwise, and a lease nobody
+> releases expiring on its own, so a holder that dies cannot pin the machine fast (`docs/power.md` 15,
+> 26.10). Every port but the Pi 4 answers the seam with `None` and the syscall says so.
+>
+> **Why it is recorded.** A new syscall, a new resource and a new privilege bit widen the surface
+> Commandment I pins. This is mechanism on a channel the kernel already owns, not a seventh responsibility
+> - the same argument as `DevicePower` above - and the `power` service is where the policy, and any future
+> power policy, lives.
+>
 > **Amendment 2026-10-01 (later): the result follows the pin's READ-BACK.** `DevicePower` used to report
 > success whenever the firmware accepted the `SET_GPIO_STATE` request, which it does whether or not the pin
 > moved - and in QEMU, where the expander is not emulated, a cut that never happened was reported as done.
@@ -1857,6 +1888,12 @@ kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsa
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
 stayed at their floors with **no amendment needed**. One amendment to the grandfathered floors stands:
 
+> **Amendment 2026-10-01 (`CpuClock`): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
+> `unsafe { raw_syscall(55, ..) }` call site, the wrapper `cpu_clock` behind the §12.3 amendment of the
+> same date - the same single design consequence as the `DevicePower` amendment below. Necessity: a
+> service cannot reach a syscall any other way. Safety: one integer to a kernel that checks the
+> capability before asking the firmware anything.
+>
 > **Amendment 2026-10-01 (`DevicePower`): `sdk/rust/src/service_context.rs` 82 -> 83.** One more
 > `unsafe { raw_syscall(54, ..) }` call site, the wrapper `device_power` behind the §12.3 amendment of
 > the same date. It is the same single design consequence the 2026-09-12 amendment describes - the

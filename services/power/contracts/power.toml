@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The machine's power policy, as a service (docs/power.md).
+#
+# Today it owns one thing: the Arm cores' clock. The kernel can set the clock to the firmware's minimum
+# or maximum and nothing else (`CpuClock`, syscall 55); this service decides which. The rule is a LEASE:
+# a service that needs the cores fast for a while asks for N seconds, gets a lease id, and releases it
+# when done. While any lease is open the clock is at its maximum; when none is, at its minimum. A lease
+# that is never released - its holder died or hung - expires on its own, so nothing can pin the machine
+# at full power by dying.
+#
+# `cpu_clock` is the one authority, and it is held here alone: the clock is one machine-wide setting, so
+# a second holder would silently overwrite this one's choice. Everyone else asks over IPC.
+name    = "power"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["power"]
+log_write   = true
+cpu_clock   = true

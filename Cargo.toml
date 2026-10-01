@@ -15,6 +15,7 @@ members = [
     "services/block-driver",
     "services/nic-driver",
     "services/wifi-driver",
+    "services/power",
     "services/net-stack",
     "services/fs",
     "sdk/rust",

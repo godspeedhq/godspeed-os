@@ -19,7 +19,7 @@ fn main() {
     // The images this supervisor carries.
     const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure",
         "ping", "time", "events", "recorder", "copier", "asker", "resource-server", "chaos", "control", "observe", "greet",
-        "counter", "shell", "fs", "net-stack", "block-driver", "console", "nic-driver"];
+        "counter", "shell", "fs", "net-stack", "block-driver", "console", "nic-driver", "power"];
 
     // The USB host drivers exist only where their controller does, so they are embedded PER ARCH -
     // the same split, for the same reasons, that `scripts/service_embed_check.py` spells out:

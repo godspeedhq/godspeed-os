@@ -150,6 +150,71 @@ fn linux_pre_download(h: &host::Host, w: &mut backplane::Window, cores: Option<&
     }
 }
 
+/// How long the Arm clock lease asks for. The bring-up through the upload and the first scan takes about
+/// 6 s with the cores fast; the margin is for a slow card, and `power` caps any lease at 30 s anyway.
+const CLOCK_LEASE_SECS: u8 = 20;
+/// How long to wait for `power` to answer. It answers from memory, so this is a dead-or-alive bound.
+const POWER_SECS: i64 = 2;
+
+/// Ask `power` to hold the Arm clock at its maximum while this instance loads the chip (`docs/power.md`).
+///
+/// WHY: the CYW43455's firmware traps at start when it is uploaded with the cores at their minimum clock -
+/// every load after the Pi firmware's first minute did, every load inside it did not (`docs/wifi.md` 55).
+/// The mechanism is not known; the dependence is measured, so it is asked for rather than assumed.
+///
+/// OPTIONAL by design: a `power` that is absent, dead or refusing costs one line and the load goes ahead at
+/// whatever the clock is - the same as before this existed. `gs::call::request_within` does the one retry
+/// that is safe - reacquire by name and resend when the send itself failed (a `power` respawned since this
+/// driver was wired, Commandment IX) - and never resends after a deadline.
+///
+/// A deadline is `OutcomeUnknown`, which here means a lease MAY be open with no id to release it by. That
+/// is said rather than hidden, and it is bounded: the lease expires on its own within 30 s.
+fn clock_lease(ctx: &ServiceContext) -> Option<u8> {
+    let msg = Message::from_bytes(&[1, CLOCK_LEASE_SECS]);
+    let r = match godspeed::call::request_within(ctx, "power", &msg, POWER_SECS) {
+        Ok(r) => r,
+        Err(godspeed::Error::OutcomeUnknown) => {
+            ctx.log("wifi-driver: `power` did not answer the clock lease in time - a lease may be open with no id to release it by, and expires on its own; loading at whatever the Arm clock is");
+            return None;
+        }
+        Err(e) => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: no clock lease ({}) - loading at whatever the Arm clock is (docs/power.md)", e.as_str()));
+            return None;
+        }
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(0) if p.len() >= 6 => {
+            let hz = u32::from_le_bytes([p[2], p[3], p[4], p[5]]);
+            if hz > 0 {
+                ctx.log_fmt(format_args!("wifi-driver: Arm clock held at {} MHz for the load (lease {})", hz / 1_000_000, p[1]));
+            } else {
+                ctx.log_fmt(format_args!("wifi-driver: Arm clock lease {} joined one already open", p[1]));
+            }
+            Some(p[1])
+        }
+        Some(2) => {
+            ctx.log("wifi-driver: this machine gives the OS no control over its clock - loading at whatever it is");
+            None
+        }
+        other => {
+            ctx.log_fmt(format_args!("wifi-driver: `power` refused the clock lease ({:?}) - loading at whatever the Arm clock is", other));
+            None
+        }
+    }
+}
+
+/// Hand the lease back. A failure here is said and otherwise harmless: the lease expires on its own.
+fn clock_release(ctx: &ServiceContext, lease: Option<u8>) {
+    let Some(id) = lease else { return };
+    let msg = Message::from_bytes(&[2, id]);
+    if let Err(e) = godspeed::call::request_within(ctx, "power", &msg, POWER_SECS) {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: could not hand clock lease {} back to `power` ({}) - it expires on its own", id, e.as_str()));
+    }
+}
+
 /// After a cut: is the chip really unpowered? It waits for the rail to fall, brings the host back long
 /// enough for one CMD52, and parks it again. `true` means the chip still answers - the cut did NOT take.
 fn chip_still_answers(ctx: &ServiceContext, h: &host::Host) -> bool {
@@ -1439,6 +1504,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         "wifi-driver: stage 1 - granted {} byte(s) of SDIO host registers",
         mmio.len()
     ));
+    // THE CLOCK, BEFORE ANYTHING TOUCHES THE CHIP: a lease from `power` holds the Arm cores fast for the
+    // bring-up, and every exit below hands it back (docs/power.md, docs/wifi.md 55).
+    let lease = clock_lease(&ctx);
 
     // ---- Stage 2: the host controller. -----------------------------------------------------------
     // The base clock comes from the platform, not from the controller: the Arasan reports it wrongly
@@ -1457,7 +1525,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ));
     if !h.reset(&ctx) {
         ctx.log("wifi-driver: the host controller did not come up, so nothing further was attempted");
-        serve_unavailable(&ctx, Some(&h));
+        { clock_release(&ctx, lease); serve_unavailable(&ctx, Some(&h)) }
     }
 
     // ---- Stage 3: what is on the bus. ------------------------------------------------------------
@@ -1487,7 +1555,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                          so the remaining suspects are the ones the kernel reports at boot: the SD power \
                          domain and the GPIO34-39 mux",
                     );
-                    serve_unavailable(&ctx, Some(&h));
+                    { clock_release(&ctx, lease); serve_unavailable(&ctx, Some(&h)) }
                 }
             }
         }
@@ -1574,7 +1642,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             "wifi-driver: function 1 (the backplane) is not open, so no firmware could be written \
              through it. Identification succeeded, so the card is there and reachable for reads",
         );
-        serve_unavailable(&ctx, Some(&h));
+        { clock_release(&ctx, lease); serve_unavailable(&ctx, Some(&h)) }
     }
 
     // ---- Stage 7: ask the SILICON what it is. -----------------------------------------------------
@@ -1591,7 +1659,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
              Everything through stage 6 stands: the card is on the bus, identified, and function 1 \
              reported ready",
         );
-        serve_unavailable(&ctx, Some(&h));
+        { clock_release(&ctx, lease); serve_unavailable(&ctx, Some(&h)) }
     }
     let mut window = backplane::Window::new();
     // The radio's session, if boot brings it up. The serving loop scans on it when the shell asks; `None`
@@ -1886,5 +1954,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         },
     );
     let down_reason = if trapped { scan::reply::DOWN_TRAPPED } else { scan::reply::DOWN_BRINGUP };
+    clock_release(&ctx, lease);
     serve_radio(&ctx, &h, &mut window, radio, down_reason)
 }

@@ -1435,6 +1435,26 @@ pub fn device_power_control(_name: &str) -> bool { false }
 #[cfg(not(feature = "pi4"))]
 pub fn device_power(_name: &str, _on: bool) -> bool { false }
 
+/// Set the Arm cores to the firmware's minimum (`max = false`) or maximum (`max = true`) rate, and return
+/// what they read back in Hz. The two rates are the FIRMWARE'S - `GET_MIN_CLOCK_RATE` and
+/// `GET_MAX_CLOCK_RATE` for the ARM clock - so the caller can only choose between the firmware's own ends
+/// of the range, never name a frequency. `None` when the firmware does not answer.
+///
+/// Why a board needs this at all: with no OS asking for a rate, the Pi firmware holds the cores at turbo
+/// for `initial_turbo` seconds after boot (60 by default) and then at their minimum for good
+/// (`docs/wifi.md` 55). The `power` service decides which end, and when (`docs/power.md`).
+#[cfg(feature = "pi4")]
+pub fn cpu_clock(max: bool) -> Option<u32> {
+    let target = mailbox::arm_clock(if max { mailbox::TAG_GET_MAX_CLOCK_RATE } else { mailbox::TAG_GET_MIN_CLOCK_RATE })?;
+    let set = mailbox::set_arm_clock(target)?;
+    let now = mailbox::arm_clock(mailbox::TAG_GET_CLOCK_RATE);
+    crate::kprintln!("cpu-clock: {} rate {} Hz asked - the firmware set {} Hz, the clock reads back {:?}",
+                     if max { "maximum" } else { "minimum" }, target, set, now);
+    Some(now.unwrap_or(set))
+}
+#[cfg(not(feature = "pi4"))]
+pub fn cpu_clock(_max: bool) -> Option<u32> { None }
+
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.

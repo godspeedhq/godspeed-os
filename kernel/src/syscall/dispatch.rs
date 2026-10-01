@@ -99,6 +99,10 @@ pub enum SyscallNumber {
     /// power there; it learns nothing about what the device is or why the holder asked. Mechanism:
     /// the grant the kernel made at spawn, made renewable (§12.3 amendment 2026-10-01).
     DevicePower            = 54,
+    /// Set the Arm cores to the platform's minimum (`arg0 = 0`) or maximum (`arg0 = 1`) clock, and return
+    /// the rate they read back in Hz. Gated by `CPU_CLOCK`, which the `power` service alone is spawned
+    /// with. The kernel learns two rates and nothing about why one is wanted (`docs/power.md`).
+    CpuClock               = 55,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -172,6 +176,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::LastRecvBadge  as u64 => scheduler::take_last_recv_badge() as i64,
         n if n == SyscallNumber::PciCfgRead as u64 => handle_pci_cfg_read(arg0, arg1),
         n if n == SyscallNumber::DevicePower as u64 => handle_device_power(arg0),
+        n if n == SyscallNumber::CpuClock as u64 => handle_cpu_clock(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -2654,6 +2659,29 @@ fn handle_device_power(on: u64) -> i64 {
         crate::kprintln!("device-power: '{}' asked for its device {} and this machine has no control over it",
                          name, if on != 0 { "ON" } else { "OFF" });
         -1
+    }
+}
+
+/// CpuClock (55): `arg0` = 0 for the platform's minimum Arm clock, 1 for its maximum. Gated by
+/// `CPU_CLOCK_RESOURCE` + WRITE. Returns the rate the cores read back afterwards, in Hz, or -1 where this
+/// machine gives the OS no control over its clock (every port but the Pi 4 today).
+///
+/// MECHANISM, NOT A SEVENTH RESPONSIBILITY: the kernel already owns the firmware mailbox - the SD power,
+/// the GPIO expander, the radio's power cut - and this is one more request on it. Only two rates are on
+/// offer, the firmware's own minimum and maximum, so the caller cannot ask for a value the firmware did
+/// not choose. When to be fast and for how long is the `power` service's (26.10).
+fn handle_cpu_clock(max: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::CPU_CLOCK_RESOURCE, Rights::WRITE) {
+        crate::kprintln!("cpu-clock: refused - caller does not hold CPU_CLOCK");
+        return CapError::CapNotHeld as i64;
+    }
+    match crate::arch::imp::cpu_clock(max != 0) {
+        Some(hz) => hz as i64,
+        None => {
+            crate::kprintln!("cpu-clock: asked for the {} rate and this machine has no control over its clock",
+                             if max != 0 { "maximum" } else { "minimum" });
+            -1
+        }
     }
 }
 

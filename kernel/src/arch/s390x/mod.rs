@@ -96,6 +96,11 @@ pub fn hw_random() -> Option<u32> { None }
 /// cut. `false` is the honest answer; the syscall reports it as "no control over it".
 pub fn device_power_control(_name: &str) -> bool { false }
 pub fn device_power(_name: &str, _on: bool) -> bool { false }
+
+/// The Arm cores' clock (`CpuClock`, syscall 55): no control on this port. The one board with it is the
+/// Pi 4 (`arch/aarch64`), whose firmware takes a rate request over the mailbox. `None` is the honest
+/// answer; the syscall reports it as "no control over its clock".
+pub fn cpu_clock(_max: bool) -> Option<u32> { None }
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
 pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }

@@ -3238,6 +3238,12 @@ own, and filling that seam would help `net-stack` on the board whether or not th
 
 ## 45. The first chaos run with the radio: 397 respawns, one join (2026-09-30)
 
+> **Note (2026-10-01, later): read this section against section 55.** The "warm chip" below - a chip
+> that came up with its firmware trapping at `pc 0x25` - was measured to be a SLOW HOST: every load that
+> trapped ran after the Arm cores dropped to their minimum clock a minute after boot, and with the cores
+> held at turbo every load comes up cold. What follows is kept as the record of what was tried and why;
+> its conclusions about the chip's state are not established by it.
+
 `chaos max-carnage` on the Pi 4, 826 rounds, with the radio carrying the link. The kernel did not
 panic and nothing wedged. The radio was dead from round one.
 
@@ -3382,6 +3388,12 @@ succeeds, which this section is the missing half of.
 
 ## 47. Power, at last: the kernel's grant made renewable, and the dead-firmware case closes (2026-10-01)
 
+> **Note (2026-10-01, later): read this section against section 55.** The "warm chip" below - a chip
+> that came up with its firmware trapping at `pc 0x25` - was measured to be a SLOW HOST: every load that
+> trapped ran after the Arm cores dropped to their minimum clock a minute after boot, and with the cores
+> held at turbo every load comes up cold. What follows is kept as the record of what was tried and why;
+> its conclusions about the chip's state are not established by it.
+
 Section 45 ended on the one thing the host could not do, and section 46 made it the rare case rather
 than every case. This closes the rare case. Every reference driver's recovery path for this chip cuts
 its power; on the Pi 4 that is `WL_ON`, pin 1 of the firmware's GPIO expander, reachable only through
@@ -3509,6 +3521,12 @@ The prediction was that cold starts would stop trapping, and that a trap with th
 refute it cleanly. **It was refuted:** section 48.
 
 ## 48. The host parked across the cut, and a bounded powercycle (2026-10-01)
+
+> **Note (2026-10-01, later): read this section against section 55.** The "warm chip" below - a chip
+> that came up with its firmware trapping at `pc 0x25` - was measured to be a SLOW HOST: every load that
+> trapped ran after the Arm cores dropped to their minimum clock a minute after boot, and with the cores
+> held at turbo every load comes up cold. What follows is kept as the record of what was tried and why;
+> its conclusions about the chip's state are not established by it.
 
 **The clock-only change was refuted, and may have made it worse.** Boot 2026-10-01 11:17 ran with the card
 clock stopped before every power-on. Seven firmware loads completed on warm restarts and all seven
@@ -3645,6 +3663,12 @@ four power-ups that followed were real attempts. All four trapped at start - see
 
 ## 50. The radio's pins, parked as boot leaves them (2026-10-01)
 
+> **Note (2026-10-01, later): read this section against section 55.** The "warm chip" below - a chip
+> that came up with its firmware trapping at `pc 0x25` - was measured to be a SLOW HOST: every load that
+> trapped ran after the Arm cores dropped to their minimum clock a minute after boot, and with the cores
+> held at turbo every load comes up cold. What follows is kept as the record of what was tried and why;
+> its conclusions about the chip's state are not established by it.
+
 **What the verified off settled.** With the chip's power cut, verified silent on its bus 50 ms later, and
 the host held in reset for the whole window, the chip still came up warm: one cold start in eight loads.
 So the warm state is not the chip staying powered and not the host controller.
@@ -3673,6 +3697,12 @@ it was reverted rather than kept, because a widened syscall that did not earn it
 
 ## 51. What Linux and OpenBSD do, read from their source (2026-10-01)
 
+> **Note (2026-10-01, later): read this section against section 55.** The "warm chip" below - a chip
+> that came up with its firmware trapping at `pc 0x25` - was measured to be a SLOW HOST: every load that
+> trapped ran after the Arm cores dropped to their minimum clock a minute after boot, and with the cores
+> held at turbo every load comes up cold. What follows is kept as the record of what was tried and why;
+> its conclusions about the chip's state are not established by it.
+
 Read from Linux master and OpenBSD `a5d3ee8e` the same day, not recalled.
 
 **Linux (brcmfmac).** `ip link set wlan0 down` and an rfkill soft block only disassociate and stop
@@ -3700,6 +3730,12 @@ the prediction is the same as before: after `off hard` / `on` and `powercycle`, 
 back as written. They are kept - they are what the reference does, and harmless - but they are not it.
 
 ## 52. Time on, not time off, and one attempt (2026-10-01)
+
+> **Note (2026-10-01, later): read this section against section 55.** The "warm chip" below - a chip
+> that came up with its firmware trapping at `pc 0x25` - was measured to be a SLOW HOST: every load that
+> trapped ran after the Arm cores dropped to their minimum clock a minute after boot, and with the cores
+> held at turbo every load comes up cold. What follows is kept as the record of what was tried and why;
+> its conclusions about the chip's state are not established by it.
 
 **The registers are the same cold and warm.** The same boot logged the chip's state just before each
 download: SLEEPCSR `0x03`, CARDCTRL `0x01`, PMU control `0x01770181` - identical on the cold boot that
@@ -3828,3 +3864,42 @@ slow host.
 **What is still not known** is the mechanism - why an upload paced at about 40% speed leaves a firmware that
 traps at `pc 0x25`. It is a timing property of the chip's start-up, and the fix does not depend on knowing
 it, but it is recorded as open rather than guessed at.
+
+## 56. What section 55 changes about the record (2026-10-01)
+
+**The HT request before the download is gone.** This chip never grants HT while its CPU is halted - 0x69 ->
+0x50 after 100 ms on all eight loads of the confirming boot - so the request did nothing and cost 1.3 s per
+load. That is a recorded divergence from Linux's `brcmf_sdio_download_firmware`; the clock release and the
+HT request after the ARM starts are kept, because those are granted at once.
+
+**Sections 45, 47, 48, 50, 51 and 52 now open with a note.** Each tested a theory of a "warm chip" - state the chip kept
+through a reset or a cut - and each warm load in them ran on the slow clock. What they record as tried is
+true; what they conclude about the chip's state is not established. In particular, section 45's six
+host-side resets were never tried on a fast host: whether any of them alone would recover a dead firmware
+is OPEN, not refuted. The power cycle stays the recovery the driver uses, because it is now shown to work
+every time, but it is no longer shown to be the only one.
+
+**What section 55 does not settle.** Why an upload paced at about 40% speed leaves a firmware that traps at
+`pc 0x25`. And the fix is a `config.txt` line: the driver still depends on the host's speed, which is
+recorded rather than hidden, and any board whose cores run slow would show it again.
+
+## 57. A lease on the clock instead of `force_turbo` (2026-10-01)
+
+**The change.** `force_turbo=1` held the cores at turbo for the machine's whole life to make one driver's
+three-second load work. It comes out of `boot/pi4/config.txt`. In its place a new `power` service holds
+the authority to set the Arm clock to the firmware's minimum or maximum (`CpuClock`, syscall 55, CLAUDE.md
+12.3) and hands out leases (`docs/power.md` 15). It puts the clock at its minimum when it starts; this
+driver asks it for a 20 s lease as soon as it holds the SDIO window, and hands it back when it starts
+serving, on every exit. A `power` that is absent or refuses costs one log line and the load goes ahead at
+whatever the clock is.
+
+**QEMU.** The whole path ran: the kernel minted `CPU_CLOCK` to `power`, `power` set the minimum at start,
+the driver took lease 1, the clock went to its maximum, the release brought it back down. QEMU reports
+the same 700 MHz at both ends, so the real range is the card's to show.
+
+**The prediction.** At boot `power` logs the clock going to its minimum; each load logs `Arm clock held at
+... MHz for the load` at the Pi 4's maximum, and the release logs the minimum again. Every upload takes the
+fast time (about 3 s), and `powercycle` - well past the first minute, several times - comes up
+`flags 0x00000001` and joins, exactly as it did under `force_turbo`. Between loads the clock reads its
+minimum. A load that is slow while the log says the lease was granted would mean the firmware did not
+honour the rate, and the `cpu-clock:` read-back line would say so.

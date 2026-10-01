@@ -112,6 +112,51 @@ pub fn set_expander_gpio(pin: u32, on: bool) -> bool {
     property_call(&mut req).is_some()
 }
 
+/// The firmware's ARM clock (clock id 3) and the property tags that read and set it, from the firmware's
+/// mailbox property interface: get rate `0x00030002`, get max `0x00030004`, get min `0x00030007`, set
+/// rate `0x00038002`. Reached from `cpu_clock` behind the `CpuClock` syscall, so at runtime with the MMU
+/// on, and therefore under `MBOX_LOCK` like the expander GPIO calls.
+const CLOCK_ID_ARM: u32 = 3;
+pub const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002;
+pub const TAG_GET_MAX_CLOCK_RATE: u32 = 0x0003_0004;
+pub const TAG_GET_MIN_CLOCK_RATE: u32 = 0x0003_0007;
+
+/// Read one of the ARM clock's rates (`tag` is one of the three GET tags above), in Hz.
+pub fn arm_clock(tag: u32) -> Option<u32> {
+    let _one = MBOX_LOCK.lock();
+    let mut req = [0u32; 8];
+    req[0] = 8 * 4;
+    req[1] = 0;
+    req[2] = tag;
+    req[3] = 8;
+    req[4] = 4;
+    req[5] = CLOCK_ID_ARM;
+    req[6] = 0;
+    req[7] = 0;
+    property_call(&mut req)?;
+    if req[6] == 0 { None } else { Some(req[6]) }
+}
+
+/// Ask the firmware to run the ARM clock at `hz`; returns the rate it says it set. `skip setting turbo` is
+/// 0, so above the default rate the firmware also raises the voltage it needs - the setting the
+/// documentation describes as the default, and the one that keeps a fast clock stable.
+pub fn set_arm_clock(hz: u32) -> Option<u32> {
+    const TAG_SET_CLOCK_RATE: u32 = 0x0003_8002;
+    let _one = MBOX_LOCK.lock();
+    let mut req = [0u32; 9];
+    req[0] = 9 * 4;
+    req[1] = 0;
+    req[2] = TAG_SET_CLOCK_RATE;
+    req[3] = 12;
+    req[4] = 12;
+    req[5] = CLOCK_ID_ARM;
+    req[6] = hz;
+    req[7] = 0;
+    req[8] = 0;
+    property_call(&mut req)?;
+    Some(req[6])
+}
+
 /// What the firmware told us about the machine. `None` for anything it declined to answer - never a
 /// guess, because a wrong memory size is worse than a known-absent one.
 #[derive(Clone, Copy, Default)]
@@ -191,7 +236,8 @@ pub fn property_call(req: &mut [u32]) -> Option<()> {
     // NO LOCK HERE, on purpose. The boot-time callers run BEFORE `mmu::enable`, and a spinlock's
     // exclusive-access atomics never succeed on AArch64 with the MMU off - the first attempt at a lock
     // here spun forever on the framebuffer's query (boot 2026-10-01 01:33, hung after the memory map).
-    // The one caller that reaches this from a syscall, `set_expander_gpio`, takes `MBOX_LOCK` itself.
+    // The callers that reach this from a syscall - the expander GPIO pair and the ARM clock pair - take
+    // `MBOX_LOCK` themselves.
     // SAFETY: single-threaded boot, caches off, and MBOX is this module's static. The length is
     // checked above, so neither copy can run past either end.
     unsafe {

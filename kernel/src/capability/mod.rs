@@ -175,6 +175,15 @@ pub const PCI_CFG_RESOURCE: ResourceId = ResourceId(16);
 /// kernel learns which pin; the driver decides when (§12.3 amendment 2026-10-01).
 pub const DEVICE_POWER_RESOURCE: ResourceId = ResourceId(17);
 
+/// Authority to set the Arm cores' clock to the platform's minimum or maximum rate (`CpuClock`, syscall
+/// 55). Held by ONE service, `power`, which the supervisor names in the spawn request - a privilege bit,
+/// delegatable, exactly like `PCI_CFG`. The kernel learns two rates, the lowest and the highest the
+/// firmware offers, and nothing about WHY: who may ask for speed, for how long, and when to go back to
+/// saving power are the service's (26.10). Added because the Pi firmware drops the cores to their
+/// minimum a minute after boot when no OS sets a rate, and the WiFi chip's firmware traps when it is
+/// loaded that slowly (`docs/wifi.md` 55, `docs/power.md`).
+pub const CPU_CLOCK_RESOURCE: ResourceId = ResourceId(18);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -198,5 +207,6 @@ pub fn init() {
     // authority, because `mint_cap` refuses - by panic - a resource the table has never heard of, and the
     // first boot without this line proved it at wifi-driver's spawn.
     table::register_resource(DEVICE_POWER_RESOURCE);
+    table::register_resource(CPU_CLOCK_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

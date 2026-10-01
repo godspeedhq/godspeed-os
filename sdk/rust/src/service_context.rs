@@ -379,6 +379,9 @@ pub mod privbits {
     /// Read PCI configuration space through the legacy CF8/CFC ports (step D2). READ-ONLY and held
     /// by ONE service - see `docs/service-ownership.md` D2 for why the write side is not on offer.
     pub const PCI_CFG:         u32 = 1 << 12;
+    /// Set the Arm cores to the platform's minimum or maximum clock (`CpuClock`, syscall 55). Held by
+    /// ONE service, `power`, because the clock is one machine-wide setting (`docs/power.md`).
+    pub const CPU_CLOCK:       u32 = 1 << 13;
 }
 
 /// Device classes a spawner can name in `SpawnRequest::hw_flags`. The kernel resolves the class to
@@ -3566,6 +3569,16 @@ impl ServiceContext {
         // SAFETY: a plain syscall; the kernel validates the capability before touching any pin.
         let r = unsafe { crate::syscall::raw_syscall(54, if on { 1 } else { 0 }, 0, 0) };
         r == 0
+    }
+
+    /// Set the Arm cores to the platform's maximum (`true`) or minimum (`false`) clock, and return the rate
+    /// they read back in Hz (`CpuClock`, syscall 55). Needs `CPU_CLOCK`, which only the `power` service is
+    /// spawned with; everyone else asks `power` for a lease over IPC. `None` is a refusal or a machine with
+    /// no control over its clock, and the kernel says which on the serial log.
+    pub fn cpu_clock(&self, max: bool) -> Option<u32> {
+        // SAFETY: a plain syscall; the kernel validates the capability before asking the firmware.
+        let r = unsafe { crate::syscall::raw_syscall(55, if max { 1 } else { 0 }, 0, 0) };
+        if r > 0 { Some(r as u32) } else { None }
     }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.

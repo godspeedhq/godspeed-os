@@ -9,6 +9,8 @@
 
 AIRC_RESET                         # docs/wifi.md - cyw43-driver/BCMA name for the reset-control bit, EXTERNAL; not yet a constant here
 HMB_DATA_FWHALT                    # docs/wifi.md - Linux brcmfmac, EXTERNAL; the to-host mailbox bit that triggers its automatic recovery
+initial_turbo                      # docs/wifi.md - Raspberry Pi firmware config.txt option, EXTERNAL; seconds of Arm turbo after boot (default 60), quoted from its documentation
+force_turbo                        # docs/wifi.md - Raspberry Pi firmware config.txt option, EXTERNAL; holds the Arm cores at turbo, used 2026-10-01 and replaced by the power service (wifi.md 55, 57)
 brcmf_chip_cr4_set_active          # docs/wifi.md - Linux brcmfmac, EXTERNAL; the release path, likewise
 brcmf_chip_disable_arm             # docs/wifi.md - Linux brcmfmac, EXTERNAL; the halt path that needs the core wrapper
 brcmf_chip_tcm_rambase             # docs/wifi.md - Linux brcmfmac, EXTERNAL; the per-part table giving 0x198000 for the 4345

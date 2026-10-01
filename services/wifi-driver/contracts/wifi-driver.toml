@@ -26,7 +26,11 @@ log_write   = true
 # table. Reacquired by name when `fs` restarts (Commandment IX), and every request to it is bounded:
 # an `fs` that is absent or mid-restart costs the driver a line in the log and nothing else - it runs
 # on the table in memory, as it did before the file existed.
-ipc_send    = ["fs"]
+# `power` - for a LEASE on the Arm clock while the firmware loads (`docs/power.md`, `docs/wifi.md` 55):
+# the chip's firmware traps when it is uploaded with the cores at their minimum clock. Bounded both
+# ways - the request has a deadline, and the lease expires on its own if this driver dies holding it -
+# and optional: a `power` that is absent or refuses costs a line in the log, and the load goes ahead.
+ipc_send    = ["fs", "power"]
 #
 # NOTHING ELSE is sent. The shell's `wifi` requests and `nic-driver`'s frame ops (0x10 INFO / 0x11 TX /
 # 0x12 RX) are answered through the reply cap each request carries, and everything this service reports

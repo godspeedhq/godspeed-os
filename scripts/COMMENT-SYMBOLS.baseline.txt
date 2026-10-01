@@ -192,6 +192,7 @@ brcmf_sdio_probe_attach            # Linux brcmfmac sdio.c, cited for the order 
 brcmf_sdio_download_firmware       # Linux brcmfmac sdio.c, cited because it requests the HT clock before the download and releases it once the ARM runs - the clock order services/wifi-driver copies - external, 26.14
 brcmf_sdio_firmware_callback       # Linux brcmfmac sdio.c, cited for re-requesting HT after the download, before the bus is brought up - external, 26.14
 alp_only                           # a field of Linux brcmfmac's struct brcmf_sdio, cited because it is false for the 43455 so the HT clock is what gets requested - external, 26.14
+initial_turbo                      # Raspberry Pi firmware config.txt option, cited because it is why the Arm clock drops a minute after boot with no OS setting a rate - external, 26.14
 mmc_rescan_try_freq                # Linux mmc core, cited because it sends an SDIO I/O reset before CMD0 on every power-up, which services/wifi-driver copies - external, 26.14
 mmc_attach_sdio                    # Linux's SDIO attach sequence, cited because its ORDER is what services/wifi-driver reimplements (CMD5 ask, CMD5 commit, CMD3, CMD7) - external, 26.14
 CMD_ISDATA                         # SDHCI SPEC CMDTM field (bit 21, "this command has a data phase") - the spec's name for a bit we set numerically; external, 26.14

@@ -100,6 +100,10 @@
           "type": "boolean",
           "description": "This driver takes an interrupt, so the kernel allocates a vector and programs MSI/MSI-X at spawn. Without it the driver polls. Reconciled against the supervisor's spawn row: a contract that stops declaring it while the row still asks for a vector is a FAIL, not a silent downgrade."
         },
+        "cpu_clock": {
+          "type": "boolean",
+          "description": "Authority to set the Arm cores to the platform's minimum or maximum clock (syscall 55). Held by `power` alone, because the clock is one machine-wide setting and a second holder would silently overwrite the first; everyone else asks `power` for a lease over IPC (docs/power.md)."
+        },
         "pci_cfg": {
           "type": "boolean",
           "description": "Authority to READ PCI configuration space (syscall 53). Held by `hw-enumerator` alone: the kernel keeps the privileged access (x86 port I/O, the Pi 4's memory-mapped INDEX/DATA window, riscv64's flat ECAM window) and this service owns what the read MEANS - which is how bus enumeration left the kernel (step D2)."
