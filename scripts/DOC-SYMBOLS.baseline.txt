@@ -8,6 +8,7 @@
 # somebody deciding the new entry is one of those two things.
 
 AIRC_RESET                         # docs/wifi.md - cyw43-driver/BCMA name for the reset-control bit, EXTERNAL; not yet a constant here
+HMB_DATA_FWHALT                    # docs/wifi.md - Linux brcmfmac, EXTERNAL; the to-host mailbox bit that triggers its automatic recovery
 brcmf_chip_cr4_set_active          # docs/wifi.md - Linux brcmfmac, EXTERNAL; the release path, likewise
 brcmf_chip_disable_arm             # docs/wifi.md - Linux brcmfmac, EXTERNAL; the halt path that needs the core wrapper
 brcmf_chip_tcm_rambase             # docs/wifi.md - Linux brcmfmac, EXTERNAL; the per-part table giving 0x198000 for the 4345

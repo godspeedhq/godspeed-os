@@ -353,6 +353,15 @@ pub fn identify(h: &Host, ctx: &ServiceContext) -> Option<Card> {
 /// The identification proper, from CMD0: a fresh card, one just power-cycled, or one whose I/O side
 /// `identify` just reset. Public because the adopt path in `main` re-identifies after a power cycle.
 pub fn identify_once(h: &Host, ctx: &ServiceContext) -> Option<Card> {
+    // LINUX'S ORDER: an SDIO I/O reset before CMD0, on every power-up (`mmc_rescan_try_freq` ->
+    // `sdio_reset`: read the CCCR ABORT register, write it back with RES). A fresh card is not yet selected
+    // and does not answer CMD52, so this fails quietly there - as it does in Linux - and resets the I/O side
+    // of any card that does answer. Said either way, so a boot shows whether the card heard it.
+    let abort = read_reg(h, 0, CCCR_IO_ABORT).unwrap_or(0);
+    match write_reg(h, 0, CCCR_IO_ABORT, abort | CCCR_IO_ABORT_RES) {
+        Some(()) => ctx.log("wifi-driver: SDIO I/O reset (CCCR RES) before CMD0 - the card heard it"),
+        None => ctx.log("wifi-driver: SDIO I/O reset (CCCR RES) before CMD0 - no answer, as a fresh card gives"),
+    }
     // CMD0 has no response, so its "success" says only that the controller accepted it. Its value is
     // putting a card that some earlier owner left mid-transaction back into the idle state.
     if h.cmd(CMD_GO_IDLE, 0).is_none() {

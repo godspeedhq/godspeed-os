@@ -85,9 +85,15 @@ const OPERATING_HZ: u32 = 25_000_000;
 /// Two seconds (2026-10-01). 50 ms, 500 ms, 2 s and 75 s all produced warm starts, so the hold-off is
 /// not the variable; this only has to exceed the chip's own discharge.
 const POWER_OFF_MS: u64 = 2_000;
-/// How long after WL_REG_ON goes high before the SDIO side is asked anything. `identify_once` also
-/// retries CMD5, so this only has to be close.
-const POWER_ON_SETTLE_MS: u64 = 300;
+/// How long after WL_REG_ON goes high before the SDIO side is asked anything.
+///
+/// EXPERIMENT (2026-10-01): FIVE SECONDS, up from 300 ms, to give the chip the time on that boot gives it.
+/// At boot the VideoCore raises WL_ON seconds before this driver's first command, and boot always comes
+/// up cold; after a cycle the driver started 300 ms after, and came up warm almost every time. The OFF time
+/// was varied from 50 ms to 75 s and never mattered; the ON time never was varied. Linux's four pre-download
+/// steps changed nothing, and the chip's registers read identically cold and warm (docs/wifi.md 52), which
+/// leaves the chip's own power-on initialisation, still running when the driver halts it, as the suspect.
+const POWER_ON_SETTLE_MS: u64 = 5_000;
 
 /// Cut the radio's power and restore it, through the kernel's `DevicePower` (docs/wifi.md 47). The
 /// two waits are the DEVICE'S - WL_REG_ON low long enough for the CYW43455 to lose its state, then the
@@ -96,6 +102,51 @@ const POWER_ON_SETTLE_MS: u64 = 300;
 /// this device's power on this machine - the caller then does what it can without.
 pub(crate) fn power_cycle_device(ctx: &ServiceContext, h: &host::Host) -> bool {
     power_cycle_device_ms(ctx, h, POWER_OFF_MS)
+}
+
+/// The three settings Linux's brcmfmac writes after making the cores passive and before downloading the
+/// firmware (`brcmf_sdio_probe_attach`, read 2026-10-01). Each is read back and said; none is fatal.
+fn linux_pre_download(h: &host::Host, w: &mut backplane::Window, cores: Option<&erom::Cores>, ctx: &ServiceContext) {
+    // KSO, keep-SDIO-on (`brcmf_sdio_kso_init`): SDIO device core rev >= 12 only; F1 SLEEPCSR bit 0.
+    const SLEEPCSR: u32 = 0x1_001F;
+    const KSO_EN: u8 = 0x01;
+    let sdio_rev = cores.and_then(|c| c.sdiod).map(|c| c.rev).unwrap_or(0);
+    if sdio_rev >= 12 {
+        match sdio::read_reg(h, 1, SLEEPCSR) {
+            Some(v) if v & KSO_EN != 0 => ctx.log_fmt(format_args!("wifi-driver: KSO already set (SLEEPCSR {:#04x})", v)),
+            Some(v) => {
+                let ok = sdio::write_reg(h, 1, SLEEPCSR, v | KSO_EN).is_some();
+                let after = sdio::read_reg(h, 1, SLEEPCSR);
+                ctx.log_fmt(format_args!("wifi-driver: KSO set (SLEEPCSR {:#04x} -> {:?}, write {})", v, after, if ok { "ok" } else { "refused" }));
+            }
+            None => ctx.log("wifi-driver: KSO - SLEEPCSR did not answer"),
+        }
+    } else {
+        ctx.log_fmt(format_args!("wifi-driver: KSO skipped - SDIO core rev {} is below 12", sdio_rev));
+    }
+    // CCCR_BRCM_CARDCTRL (F0 0xF1) |= WLANRESET: "so an SDIO card reset does a WLAN backplane reset".
+    const CARDCTRL: u32 = 0xF1;
+    const WLANRESET: u8 = 0x02;
+    match sdio::read_reg(h, 0, CARDCTRL) {
+        Some(v) => {
+            let ok = sdio::write_reg(h, 0, CARDCTRL, v | WLANRESET).is_some();
+            ctx.log_fmt(format_args!("wifi-driver: CARDCTRL {:#04x} -> {:?} (WLANRESET, write {})",
+                v, sdio::read_reg(h, 0, CARDCTRL), if ok { "ok" } else { "refused" }));
+        }
+        None => ctx.log("wifi-driver: CARDCTRL did not answer"),
+    }
+    // PMU pmucontrol |= RES_RELOAD << RES_SHIFT: "so a backplane reset does PMU state reload". No separate
+    // PMU core in this chip's table, so pmucontrol is chipcommon's, at 0x18000600.
+    const PMUCONTROL: u32 = 0x1800_0600;
+    const RES_RELOAD: u32 = 0x2 << 13;
+    match w.read32(h, PMUCONTROL, ctx) {
+        Some(v) => {
+            let ok = w.write32(h, PMUCONTROL, v | RES_RELOAD, ctx).is_some();
+            ctx.log_fmt(format_args!("wifi-driver: PMU control {:#010x} -> {:?} (RES_RELOAD, write {})",
+                v, w.read32(h, PMUCONTROL, ctx), if ok { "ok" } else { "refused" }));
+        }
+        None => ctx.log("wifi-driver: PMU control did not answer"),
+    }
 }
 
 /// After a cut: is the chip really unpowered? It waits for the rail to fall, brings the host back long
@@ -1741,6 +1792,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                         ctx.log("wifi-driver: the 802.11 core did not come out of its reset cleanly - continuing, the firmware may not bring its functions up");
                                     }
                                 }
+                                // LINUX'S PRE-DOWNLOAD STEPS (`brcmf_sdio_probe_attach`, after the cores are
+                                // passive): KSO, CARDCTRL WLANRESET and PMU RES_RELOAD. This driver never did
+                                // them; the chip comes up warm after most power cuts here, and Linux's recovery
+                                // rests on the same WL_ON cut plus these (docs/wifi.md 51).
+                                linux_pre_download(&h, &mut window, cores.as_ref(), &ctx);
                                 ctx.log("wifi-driver: stage 11 - uploading the firmware");
                                 if upload::run(&h, &mut window, wrap, &ram, &mut trapped, &ctx) {
                                     ctx.log(

@@ -8801,16 +8801,15 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
 }
 
 /// The end of a `wifi radio on` that went the hard way (a cold or a down chip, watched back up). A chip
-/// that came up warm is not left with the operator: `on` hands over to `wifi radio powercycle` - up to
-/// three cycles with a fixed 2 s hold-off, after which it reports a warm chip and returns the prompt; the
-/// command can be run again (docs/wifi.md 48). The operator asked for the radio on; which rung of the
-/// ladder gets there is this shell's to climb.
+/// that came up warm is reported, not retried: a second cycle on the same chip gives the same result
+/// (docs/wifi.md 52), and `wifi radio powercycle` is there to try once more by hand.
 fn wifi_radio_on_outcome(ctx: &ShellCtx, out: &mut Out, outcome: WatchOutcome) -> Result<(), ShellError> {
     match outcome {
         WatchOutcome::Joined | WatchOutcome::Left => Ok(()),
+        // ONE attempt, as `powercycle` makes: a second cycle on the same chip gives the same result.
         WatchOutcome::Warm => {
-            out.line_fmt(ctx, format_args!("the chip came up warm - its firmware trapped at start; power-cycling it"));
-            wifi_radio_powercycle(ctx, out)
+            out.line_fmt(ctx, format_args!("radio on failed - the chip came up warm (its firmware trapped at start; docs/wifi.md 52); `wifi radio powercycle` tries once more"));
+            Err(ShellError::Unknown)
         }
         WatchOutcome::TimedOut => Err(ShellError::Unknown),
     }
@@ -8836,13 +8835,16 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
     use wifi_wire::*;
     // The power-off hold, in the request's 100 ms units.
     const OFF_UNITS: u8 = 20;
-    // Cycles per invocation before the shell reports a warm chip and returns the prompt.
-    const MAX_ATTEMPTS: u32 = 3;
+    // ONE cycle per invocation. The attempts were not independent - the same steps on the same chip gave
+    // the same result, three warm out of three, run after run - so a retry only hid the cause (the
+    // operator's call, 2026-10-01). The command can be run again.
+    const MAX_ATTEMPTS: u32 = 1;
     // The request (through `wifi_ask`, queue drained first) blocks until the driver has cut, held and
     // restored the power: the hold plus the settle, with margin. Acting on a STALE OK here is what killed
     // the driver mid-cycle (boot 2026-10-01 13:58, at 13:59) and left the chip unpowered. `q` belongs to
     // the watch below, which is where the long wait is.
-    const OP_MAX_MS: u64 = 10_000;
+    // The hold (2 s) plus the driver's power-on settle (5 s, docs/wifi.md 52) plus margin.
+    const OP_MAX_MS: u64 = 15_000;
     for attempt in 1..=MAX_ATTEMPTS {
         let outcome = match wifi_ask(ctx, &[OP_RADIO, RADIO_POWERCYCLE, OFF_UNITS], OP_MAX_MS) {
             // A driver that does not answer is mid-bring-up or wedged: restart it and watch.
@@ -8896,8 +8898,8 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
         }
     }
     out.line_fmt(ctx, format_args!(
-        "powercycle failed - the chip came up warm {} times running (its firmware trapped at start; docs/wifi.md 48). The driver is up and answering; `wifi radio powercycle` can be run again",
-        MAX_ATTEMPTS));
+        "powercycle failed - the chip came up warm (its firmware trapped at start; docs/wifi.md 52). The driver is up and answering; `wifi radio powercycle` can be run again{}",
+        if MAX_ATTEMPTS > 1 { " (every attempt came up warm)" } else { "" }));
     Err(ShellError::Unknown)
 }
 

@@ -3638,5 +3638,91 @@ backplane would not open. It serves `powercycle` and nothing else: `off hard` is
 is the wrong advice for a request the driver could have honoured. Recorded here and in the driver's
 comment; `powercycle` works from that state.
 
-**Not on hardware yet.** The verified off, the bus check after `off hard` and the mailbox fix are in
-image `2f4a1e32` on the card and have not been run. Each claim above about them is what the code does, not what a boot showed.
+**On hardware (boot 2026-10-01 16:36, image `0b24562a`).** `wifi radio off` printed "verified: the
+firmware reports it is down" and `on` rejoined; `off hard` printed "verified: the chip no longer answers on
+its bus"; the shell cleared one late reply before each request instead of reading it as an answer, and all
+four power-ups that followed were real attempts. All four trapped at start - see section 50.
+
+## 50. The radio's pins, parked as boot leaves them (2026-10-01)
+
+**What the verified off settled.** With the chip's power cut, verified silent on its bus 50 ms later, and
+the host held in reset for the whole window, the chip still came up warm: one cold start in eight loads.
+So the warm state is not the chip staying powered and not the host controller.
+
+**The one difference left.** Every boot log reads `sdio: GPIO34-39 fsel=000000`: when the VideoCore powers
+the radio at boot, its six SDIO pins are plain GPIO inputs, and only afterwards does the kernel route them
+to the Arasan (ALT3) with pull-ups. Boot always comes up cold. Every power cycle runs with the pins routed
+and pulled up - through the off window and at the rising edge of WL_REG_ON, where the chip samples its
+straps, and where a pull-up can hold an unpowered chip's I/O up through its clamp diodes. Boot now also
+logs the pulls it found (`sdio: GPIO34-39 pulls at boot=`), so the boot state is measured rather than
+assumed.
+
+**The change.** The `DevicePower` grant gains a second half (CLAUDE.md 12.3, amendment of the same day):
+park the radio's pins (input, no pull) and restore them (ALT3, pull-up, as at boot). The kernel only moves
+the pins; the driver decides when. Its order: cut the power; verify the chip is silent (a CMD52, so the
+pins must still be routed); park the pins for the off window; raise the power with the pins parked; wait
+50 ms past the edge; restore the pins; settle; identify. `device_power` also now reports failure when the
+pin reads back the wrong level, instead of success.
+
+**Result: refuted, and reverted (boot 2026-10-01 17:02).** Seven loads after a cut with the pins parked
+and every step read back as asked: seven traps. Worse, the boot log measured what this section assumed:
+`sdio: GPIO34-39 pulls at boot=111111` - at boot the pins are inputs WITH pull-ups on all six, so the
+"no pull" park did not reproduce boot either, and boot has pull-ups on those lines and still comes up cold.
+The pins are not the variable. The kernel change (two more `DevicePower` operations) was never committed;
+it was reverted rather than kept, because a widened syscall that did not earn its place should not stay.
+
+## 51. What Linux and OpenBSD do, read from their source (2026-10-01)
+
+Read from Linux master and OpenBSD `a5d3ee8e` the same day, not recalled.
+
+**Linux (brcmfmac).** `ip link set wlan0 down` and an rfkill soft block only disassociate and stop
+scanning - not even the firmware's DOWN; the chip stays powered. The radio's power is `WL_ON` through
+`mmc-pwrseq-simple` (`reset-gpios = <&expgpio 1 GPIO_ACTIVE_LOW>`), which drives it LOW when it probes, so
+every Linux boot starts with a real power cycle. A firmware that reports its own halt (`HMB_DATA_FWHALT`)
+is recovered automatically: the card is removed and rescanned, which cuts and restores `WL_ON` (held low
+about 12 ms, clock stopped through the edge), re-enumerates, and re-downloads - no reboot. A firmware that
+hangs silently, or fails to load at probe, gets no automatic recovery (the driver unbinds). `BT_ON`
+(expander pin 0) belongs to the Bluetooth driver and WiFi recovery never touches it.
+
+**OpenBSD (bwfm).** `ifconfig bwfm0 down` sends DOWN and then UP again, leaving the firmware running in
+power-save. It never controls the radio's power on a Pi 4 - the SD driver for that controller never runs
+a power sequence and there is no driver for the firmware GPIO expander. A missing firmware file is retried
+by the next `ifconfig up`; a firmware that crashes after loading is recovered only by an OS reboot.
+
+**What Linux does that this driver did not.** Four steps, in Linux's places: an SDIO I/O reset (CCCR RES)
+before CMD0 on every power-up; and, after the cores are passive and before the download, KSO (keep SDIO
+on), CARDCTRL WLANRESET, and PMU RES_RELOAD. Linux's recovery rests on the same `WL_ON` cut plus these, so
+they are the next suspect - and they are driver-only, no kernel change. Added together as one change;
+the prediction is the same as before: after `off hard` / `on` and `powercycle`, loads come up
+`flags 0x00000001` and join.
+
+**Result: no change (boot 2026-10-01 17:30).** Four loads after a cut, four traps. The steps ran and read
+back as written. They are kept - they are what the reference does, and harmless - but they are not it.
+
+## 52. Time on, not time off, and one attempt (2026-10-01)
+
+**The registers are the same cold and warm.** The same boot logged the chip's state just before each
+download: SLEEPCSR `0x03`, CARDCTRL `0x01`, PMU control `0x01770181` - identical on the cold boot that
+worked and on every power-up that trapped. Whatever differs is not in those registers.
+
+**What still differs is time.** At boot the VideoCore raises `WL_ON` seconds before this driver's first
+command; after a cycle the driver began 300 ms after. The OFF time was varied from 50 ms to 75 s and never
+mattered; the ON time never was. If the chip's own power-on initialisation is still running in ROM when the
+driver halts it and loads the firmware, a trap in ROM is what that would look like. `POWER_ON_SETTLE_MS`
+goes from 300 ms to 5 s.
+
+**One attempt.** The operator's observation, and the data's: the attempts were not independent - the same
+steps on the same chip gave the same result, three warm out of three, run after run. A retry only hid the
+cause. `wifi radio powercycle` makes one cycle and reports, and a hard `on` that comes up warm reports and
+stops rather than handing over to a loop.
+
+**The prediction.** `off hard` then `on`, and `powercycle`: with five seconds on, the loads come up
+`flags 0x00000001` and join. Still trapping means time on is not it either, and what remains is `BT_ON`
+(a log-only kernel check first) and the SD I/O supply rail.
+
+**Result: refuted (boot 2026-10-01 17:42).** Three loads after a cut, each with five seconds on before the
+first command - `off hard` then `on`, `on` from a radio that was down (the respawn cut and restored the
+power itself), and `powercycle` - all three trapped. Time on is not the variable. One attempt each, each
+reported and returned: the one-attempt behaviour stays. Ruled out so far, each by a boot: time off (50 ms
+to 75 s), the host controller's state, the pins, Linux's four pre-download steps, time on, and the chip's
+registers before the download. What remains untested is `BT_ON`.
