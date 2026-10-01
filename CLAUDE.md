@@ -1460,6 +1460,13 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > 46); the power cycle is for a firmware that has stopped, and it is what turns "reboot the machine" into
 > "the driver recovers in a few seconds" (`docs/wifi.md` 47). It is also the first brick of a shutdown:
 > the grants run in reverse, with power the last thing taken.
+>
+> **Amendment 2026-10-01 (later): the result follows the pin's READ-BACK.** `DevicePower` used to report
+> success whenever the firmware accepted the `SET_GPIO_STATE` request, which it does whether or not the pin
+> moved - and in QEMU, where the expander is not emulated, a cut that never happened was reported as done.
+> It now returns success only when `WL_ON` reads back at the level asked for. The spawn also logs `BT_ON`,
+> the same chip's Bluetooth enable: it reads 0 on this board, so `WL_ON` really is the whole of the radio's
+> power and nothing else needs cutting (`docs/wifi.md` 53). No syscall, resource or authority changes.
 
 ---
 

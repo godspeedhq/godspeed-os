@@ -65,6 +65,8 @@ static MBOX_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
 /// `expgpio`): 0 BT_ON, 1 WL_ON, 2 PWR_LED_OFF, 3 GLOBAL_RESET, 4 VDD_SD_IO_SEL, 5 CAM_GPIO,
 /// 6 SD_PWR_ON, 7 SD_OC_N. Linux's `mmc-pwrseq-simple` for the radio is `reset-gpios = <&expgpio 1>`.
 pub const EXPGPIO_WL_ON: u32 = 1;
+/// The same chip's Bluetooth power enable (docs/wifi.md 53): the other half of the CYW43455's power.
+pub const EXPGPIO_BT_ON: u32 = 0;
 
 /// Drive one firmware-expander GPIO through the `SET_GPIO_STATE` property tag (`0x00038041`). The
 /// expander's pins are numbered from 128 on the mailbox side, which is why Linux's `gpio-raspberrypi-exp`

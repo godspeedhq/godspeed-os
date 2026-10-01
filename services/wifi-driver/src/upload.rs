@@ -56,6 +56,7 @@
 use godspeed_sdk::ServiceContext;
 
 use crate::aicore;
+use crate::backplane;
 use crate::armcr4::Ram;
 use crate::backplane::{Window, ACCESS_WIDE, OFFSET_MASK};
 use crate::firmware;
@@ -89,6 +90,7 @@ pub fn write_bytes(
     let mut buf = [0u32; CHUNK / 4];
     let mut off = 0usize;
     let mut commands = 0u32;
+    let _ = h.take_waits();
 
     while off < data.len() {
         let at = addr + off as u32;
@@ -144,9 +146,10 @@ pub fn write_bytes(
         commands += 1;
         off += n;
     }
+    let (ready, done) = h.take_waits();
     ctx.log_fmt(format_args!(
-        "wifi-driver: {} written - {} bytes to {:#08x} in {} command(s)",
-        what, data.len(), addr, commands
+        "wifi-driver: {} written - {} bytes to {:#08x} in {} command(s); waits on the card: {} polls for the FIFO, {} for completion",
+        what, data.len(), addr, commands, ready, done
     ));
     true
 }
@@ -479,7 +482,13 @@ pub fn run(
         return false;
     }
 
-    // 3. The image, at the load address the chip's family table gives.
+    // 3. THE DOWNLOAD RUNS ON HT, as Linux's does (`brcmf_sdio_download_firmware` opens with
+    //    `brcmf_sdio_clkctl(bus, CLK_AVAIL, false)` - the HT request, `alp_only` false for this chip). This
+    //    driver used to download with ALP forced and release the ARM with it still forced, so the firmware
+    //    started with the host holding its clock source (docs/wifi.md 54).
+    backplane::download_clock(h, ctx);
+
+    // The image, at the load address the chip's family table gives.
     if !write_bytes(h, w, ram.base, firmware::IMAGE, "firmware", ctx) {
         return false;
     }
@@ -597,6 +606,11 @@ pub fn run(
         );
         return false;
     }
+    // AND LET GO OF THE CLOCK, as Linux does once the ARM is running (`clkctl(CLK_SDONLY)`): the firmware
+    // brings its own clocks up. Then the HT request again, which is the reference's next step before it
+    // touches the backplane (`brcmf_sdio_firmware_callback`'s `clkctl(CLK_AVAIL)`).
+    backplane::release_clock(h, ctx);
+    backplane::download_clock(h, ctx);
     // 7. ASK THE CHIP, rather than asserting from the reset controller. `RESETCTRL 0` means the CPU is
     //    fetching; it does not mean the firmware booted, and a CPU fetching garbage reports the same
     //    thing. The firmware overwrites the NVRAM token at the last word of RAM once it has consumed it,

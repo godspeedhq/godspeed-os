@@ -3726,3 +3726,105 @@ power itself), and `powercycle` - all three trapped. Time on is not the variable
 reported and returned: the one-attempt behaviour stays. Ruled out so far, each by a boot: time off (50 ms
 to 75 s), the host controller's state, the pins, Linux's four pre-download steps, time on, and the chip's
 registers before the download. What remains untested is `BT_ON`.
+
+## 53. BT_ON - the other half of the chip's power (2026-10-01)
+
+**The hypothesis.** The CYW43455 is a WiFi + Bluetooth combo with two power enables on the expander:
+`WL_ON` (pin 1), which every cut has driven, and `BT_ON` (pin 0), which nothing in GodspeedOS had touched.
+On Broadcom combo chips the shared regulators and power management stay up while EITHER enable is high. At
+boot both start low and the VideoCore raises them, so the whole chip comes up from nothing - and boot is
+always cold. If `BT_ON` stays high through a cut, the shared domain never loses power, and that fits every
+result in sections 48-52: the WLAN side goes silent on its bus, and nothing the host or the timing changes
+makes a difference. Linux also cuts only `WL_ON`; nothing found shows its recovery working on a Pi 4.
+
+**The change (kernel, arch only).** The driver's spawn logs `BT_ON`'s level. A cut drops BOTH enables,
+remembering whether `BT_ON` was high; a power-up raises `BT_ON` first (only if it was high), then `WL_ON`,
+and logs both. `device_power`'s result follows the `WL_ON` read-back again. The power-on settle goes back
+to 300 ms.
+
+**The prediction.** If the spawn log shows `BT_ON reads 0`, the hypothesis is dead without further work.
+If it reads 1, a cut now takes it to 0 (`BT_ON was Some(1), now reads Some(0)`), and loads after `off
+hard` / `on` and `powercycle` come up `flags 0x00000001` and join.
+
+**Result: refuted (boot 2026-10-01 18:01).** `BT_ON` reads 0 at spawn. Nothing holds the shared domain up,
+and the cut never touched the pin. The cut code is removed; the spawn log stays, and so does the read-back
+result (`CLAUDE.md` 12.3). One power cycle in that session came up cold and joined, and every later one
+trapped - section 54 is what told them apart.
+
+## 54. The upload's speed, and the clock it runs on (2026-10-01)
+
+**A difference at last.** The same boot's log, read stage by stage: the cold upload took 3.26 s, and every
+upload after a cut took 7.19 s (plus or minus 0.01, five times). Each 32 KiB window: about 157 ms cold,
+about 370 ms warm. The bus is the same in every run - 1-bit, 25 MHz, `CONTROL0` 0, CCCR bus 0x40 - and the
+stages that are mostly host work run at the same speed, so the host is not slower. Single-register reads of
+the card (the CIS walk) are slower too, 0.36 s against 0.61 s. Each 1 KiB write costs 4.9 ms cold and 11.6
+ms warm against 0.33 ms on the wire; the time is spent waiting on the card. The one power cycle that came up
+cold had a boot-speed upload. After alive, `CHIPCLKCSR` reads 0x69 cold and 0xe9 warm - HT already up.
+
+**What Linux does that this driver did not** (`brcmf_sdio_download_firmware`, read from master the same
+day). It opens with `brcmf_sdio_clkctl(bus, CLK_AVAIL, false)` - `HT_AVAIL_REQ` written alone, HT waited
+for, `alp_only` false for this chip - so the download runs on HT. Once the ARM is running it calls
+`clkctl(CLK_SDONLY)`, which writes 0: the firmware boots with its clocks its own. This driver downloaded
+with `FORCE_ALP` held and released the ARM with it still held.
+
+**The change (driver only).** HT is requested and waited for (bounded, said either way) before the upload;
+0 goes to `CHIPCLKCSR` after the release, then the HT request again before the alive check, which is the
+reference's next step. Every block write now counts the polls spent waiting on the card, so the log says
+where an upload's time goes.
+
+**The prediction.** Uploads get faster, cold and warm. Then either the trap is gone - loads after `off hard`
+/ `on` and `powercycle` come up `flags 0x00000001` and join - or the HT request is slow or refused after a
+cut, which would put the PLL and PMU state that survives the cut on record. Faster and still trapping means
+the clock is not it.
+
+**Result (boot 2026-10-01 18:25): the clock is not it, and the counters found what is.** The chip never
+grants HT before the download - `CHIPCLKCSR` 0x69 -> 0x50 after 100 ms, every time, cold or warm - so the
+upload stayed on ALP; releasing the clocks and re-requesting HT after the ARM starts works (HT after one
+poll). Two power cycles came up cold and joined: the boot load and the FIRST `powercycle`. Four more
+trapped. The new counters split them cleanly:
+
+| load | time after boot | upload | polls waiting on the card (FIFO / completion) | result |
+|---|---|---|---|---|
+| boot | ~4 s | 3.0 s | 8925 / 186739 | cold |
+| powercycle 1 | 41 s | 3.0 s | 8925 / 186757 | cold, joined |
+| powercycle 2-5 | 85 s on | 6.9 s | ~3800 / ~90580 | trapped |
+
+A slower upload that spends FEWER polls waiting on the card is a slower HOST: each poll takes longer, the
+card's own time is unchanged, and the host's fixed per-command work doubles. The card is not the variable;
+the Arm cores' clock is.
+
+## 55. The Arm cores slow down a minute after boot (2026-10-01)
+
+**Read from the firmware's documentation** (`config.txt`, the same day): `initial_turbo` "enables turbo mode
+from boot for the given value in seconds, or until `cpufreq` sets a frequency", and its default became 60
+in the November 2024 firmware. GodspeedOS has no cpufreq, so a minute after boot the cores drop to their
+minimum clock and stay there. Every load inside that minute came up cold - the boot's, and the first
+`powercycle` in this session and in the earlier one that worked - and every load after it was slower and
+trapped. The 2.3x matches a turbo-to-minimum drop on a loop that is mostly the host's own work. This also
+corrects section 54's reading that the host was not slower: the stages compared there are paced by the
+serial port, not the CPU.
+
+**Why a slower host could make the chip trap** is not known yet, and is not claimed. The test is the
+direct one.
+
+**The change (board config only, no code).** `force_turbo=1` in `boot/pi4/config.txt` keeps the cores at
+their turbo clock. No `over_voltage_*` is set, which is the condition under which it can set the warranty
+bit.
+
+**The prediction.** Every upload takes about 3 s, however long after boot, and `powercycle` - run well
+past the first minute, several times - comes up `flags 0x00000001` and joins every time. Fast uploads that
+still trap would mean the speed was a fellow traveller of something else that changes a minute after boot.
+If it holds, the lasting fix is the kernel asking the firmware for the clock it wants rather than a
+`config.txt` line, and that is a separate change.
+
+**Result: confirmed (boot 2026-10-01 18:30).** Eight loads from 18:31 to 18:36 - the boot's, six
+`powercycle`s, and `off hard` then `on` - every one `flags 0x00000001`, every one joined, none trapped,
+out to six minutes after boot. Every stage 11 took 4.27 s (plus or minus 0.01; it includes the 1.3 s spent
+on the HT request that the chip never grants before the download), and every one waited about 191,100
+polls on the card, the cold figure. The soft `off` / `on` and `off hard` / `on` both verified and rejoined.
+With the cores held at their turbo clock there is no warm start: the "warm chip" of sections 45-54 was a
+slow host.
+
+**What is still not known** is the mechanism - why an upload paced at about 40% speed leaves a firmware that
+traps at `pc 0x25`. It is a timing property of the chip's start-up, and the fix does not depend on knowing
+it, but it is recorded as open rather than guessed at.

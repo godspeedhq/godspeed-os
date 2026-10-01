@@ -87,13 +87,14 @@ const OPERATING_HZ: u32 = 25_000_000;
 const POWER_OFF_MS: u64 = 2_000;
 /// How long after WL_REG_ON goes high before the SDIO side is asked anything.
 ///
-/// EXPERIMENT (2026-10-01): FIVE SECONDS, up from 300 ms, to give the chip the time on that boot gives it.
+/// 300 ms. Five seconds was tried (2026-10-01) to give the chip the time on that boot gives it, and changed
+/// nothing - docs/wifi.md 52 - so the reasoning below is the experiment's, kept as its record.
 /// At boot the VideoCore raises WL_ON seconds before this driver's first command, and boot always comes
 /// up cold; after a cycle the driver started 300 ms after, and came up warm almost every time. The OFF time
 /// was varied from 50 ms to 75 s and never mattered; the ON time never was varied. Linux's four pre-download
 /// steps changed nothing, and the chip's registers read identically cold and warm (docs/wifi.md 52), which
 /// leaves the chip's own power-on initialisation, still running when the driver halts it, as the suspect.
-const POWER_ON_SETTLE_MS: u64 = 5_000;
+const POWER_ON_SETTLE_MS: u64 = 300;
 
 /// Cut the radio's power and restore it, through the kernel's `DevicePower` (docs/wifi.md 47). The
 /// two waits are the DEVICE'S - WL_REG_ON low long enough for the CYW43455 to lose its state, then the

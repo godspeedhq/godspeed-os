@@ -203,6 +203,12 @@ pub struct Host<'a> {
     /// that: the command completes, the card answers with its flags set, and no data comes. Same shape
     /// as `last_int` and kept for the same reason.
     last_resp: core::cell::Cell<u32>,
+    /// Poll iterations spent waiting on the CARD across data commands since the last `take_waits`: for
+    /// the FIFO to accept a block, and for the transfer to complete. Where an upload's time goes - the
+    /// host's own work is fixed per command, so a slower upload with the same counts is the host, and
+    /// a slower one with larger counts is the chip (docs/wifi.md 54).
+    wait_ready: core::cell::Cell<u64>,
+    wait_done: core::cell::Cell<u64>,
 }
 
 impl<'a> Host<'a> {
@@ -219,7 +225,14 @@ impl<'a> Host<'a> {
             seen_status: core::cell::Cell::new(0),
             dat_first: core::cell::Cell::new(0),
             dat_last: core::cell::Cell::new(0),
+            wait_ready: core::cell::Cell::new(0),
+            wait_done: core::cell::Cell::new(0),
         }
+    }
+
+    /// The card-wait poll counts accumulated since the last call (FIFO ready, transfer complete), reset.
+    pub fn take_waits(&self) -> (u64, u64) {
+        (self.wait_ready.replace(0), self.wait_done.replace(0))
     }
 
     fn rd(&self, off: usize) -> u32 {
@@ -667,6 +680,7 @@ impl<'a> Host<'a> {
                     return Err("the FIFO never became ready - the command completed and no data came");
                 }
             }
+            self.wait_ready.set(self.wait_ready.get() + t as u64);
             // CLEARED BEFORE THE BLOCK MOVES, as the reference does, not after each word.
             self.wr(INTERRUPT, ready);
             // THEN THE WHOLE BLOCK, with no further checks. This is the part that was missing.
@@ -703,6 +717,7 @@ impl<'a> Host<'a> {
                 return Err("the data moved and the transfer never reported complete");
             }
         }
+        self.wait_done.set(self.wait_done.get() + t as u64);
         self.wr(INTERRUPT, INT_DATA_DONE);
         for _ in 0..10 {
             spin(); // Ncc, as in `cmd`

@@ -1385,7 +1385,19 @@ pub fn hw_random() -> Option<u32> { None }
 /// through WL_ON on the firmware's GPIO expander. Answered at spawn, so `DEVICE_POWER` is minted only to
 /// the service that holds that window, and only where the boot census saw the radio's controller.
 #[cfg(feature = "pi4")]
-pub fn device_power_control(name: &str) -> bool { name == "wifi-driver" && sdio::radio_present() }
+pub fn device_power_control(name: &str) -> bool {
+    let ok = name == "wifi-driver" && sdio::radio_present();
+    // THE OTHER HALF OF THE CHIP'S POWER, measured once per spawn (docs/wifi.md 53): BT_ON as the firmware
+    // left it. A cut that drops WL_ON alone leaves the chip's shared domain powered if this is high.
+    #[cfg(feature = "pi4")]
+    if ok {
+        match mailbox::get_expander_gpio(mailbox::EXPGPIO_BT_ON) {
+            Some(l) => crate::kprintln!("device-power: BT_ON (the same chip's Bluetooth enable) reads {}", l),
+            None => crate::kprintln!("device-power: BT_ON did not answer the read"),
+        }
+    }
+    ok
+}
 
 /// Cut (`on = false`) or restore (`on = true`) the power of the device behind `name`'s window. The
 /// `DevicePower` syscall has already checked the caller holds `DEVICE_POWER`; this resolves WHICH pin
@@ -1394,18 +1406,27 @@ pub fn device_power_control(name: &str) -> bool { name == "wifi-driver" && sdio:
 #[cfg(feature = "pi4")]
 pub fn device_power(name: &str, on: bool) -> bool {
     if name != "wifi-driver" { return false; }
+    // WL_ON ALONE. BT_ON - the same chip's Bluetooth enable - reads 0 on this board (logged at spawn), so
+    // there is no second enable holding the chip's shared domain up through a cut (docs/wifi.md 53).
     let took = mailbox::set_expander_gpio(mailbox::EXPGPIO_WL_ON, on);
     // READ IT BACK, because the SET tag answers "accepted" whether or not the pin moved, and three
     // reloads on hardware (2026-10-01) gave one cold chip and two that reset without losing their warm
     // state. What the firmware says the pin is NOW is the one fact that separates "the write did not
     // take" from "the chip keeps state in a domain this pin does not cut".
+    // And the RESULT follows the read-back: a pin that reads back the wrong level is a request that did not
+    // happen, and reporting success for it - which this did, in QEMU, where the pin is not emulated - would
+    // let the caller verify a cut that never occurred.
+    let want = if on { 1 } else { 0 };
     match mailbox::get_expander_gpio(mailbox::EXPGPIO_WL_ON) {
-        Some(level) => crate::kprintln!("device-power: WL_ON asked {} - the firmware reads the pin back as {}",
-                                        if on { 1 } else { 0 }, level),
-        None => crate::kprintln!("device-power: WL_ON asked {} - the firmware did not answer the read-back",
-                                 if on { 1 } else { 0 }),
+        Some(level) => {
+            crate::kprintln!("device-power: WL_ON asked {} - the firmware reads the pin back as {}", want, level);
+            took && level == want
+        }
+        None => {
+            crate::kprintln!("device-power: WL_ON asked {} - the firmware did not answer the read-back", want);
+            false
+        }
     }
-    took
 }
 
 /// Without the `pi4` feature this port names no board, so no device's power is reachable.

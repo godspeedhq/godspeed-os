@@ -411,6 +411,52 @@ pub fn wake(h: &Host, ctx: &ServiceContext) -> bool {
     false
 }
 
+/// Ask for the HT clock with no force bits, and wait for it - Linux's `brcmf_sdio_htclk(bus, true, ..)`,
+/// which writes `HT_AVAIL_REQ` alone (`alp_only` is false for the 43455) and polls for `HT_AVAIL`.
+///
+/// Bounded at 100 polls a millisecond apart, and the outcome is said either way. If HT never comes, the
+/// ALP word `wake` wrote goes back, so the backplane keeps the clock it has always had and the caller
+/// carries on exactly as before - a slower clock is not a reason to stop (docs/wifi.md 54).
+pub fn download_clock(h: &Host, ctx: &ServiceContext) -> bool {
+    const HT_TRIES: u32 = 100;
+    let before = sdio::read_reg(h, 1, f1::CHIPCLKCSR);
+    if sdio::write_reg(h, 1, f1::CHIPCLKCSR, clk::HT_AVAIL_REQ).is_none() {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: the HT request was refused (CHIPCLKCSR was {:?}) - staying on ALP", before));
+        let _ = sdio::write_reg(h, 1, f1::CHIPCLKCSR, clk::INIT);
+        return false;
+    }
+    let mut last = None;
+    for attempt in 0..HT_TRIES {
+        last = sdio::read_reg(h, 1, f1::CHIPCLKCSR);
+        if let Some(v) = last {
+            if v & clk::HT_AVAIL != 0 {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: HT requested - CHIPCLKCSR {:?} -> {:#04x}, HT available after {} poll(s)",
+                    before, v, attempt + 1));
+                return true;
+            }
+        }
+        ctx.sleep_ms(1);
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: HT never became available - CHIPCLKCSR {:?} -> {:?} after {} polls ~1 ms apart. The ALP \
+         word goes back and the work continues on ALP, as it always did",
+        before, last, HT_TRIES));
+    let _ = sdio::write_reg(h, 1, f1::CHIPCLKCSR, clk::INIT);
+    false
+}
+
+/// Withdraw every clock request and force - Linux's `brcmf_sdio_htclk(bus, false, ..)`, which writes 0,
+/// reached from `clkctl(CLK_SDONLY)` once the ARM is running. The firmware owns its clocks from here.
+pub fn release_clock(h: &Host, ctx: &ServiceContext) {
+    let before = sdio::read_reg(h, 1, f1::CHIPCLKCSR);
+    let ok = sdio::write_reg(h, 1, f1::CHIPCLKCSR, 0).is_some();
+    ctx.log_fmt(format_args!(
+        "wifi-driver: clock requests released for the firmware - CHIPCLKCSR {:?} -> {:?} (write {})",
+        before, sdio::read_reg(h, 1, f1::CHIPCLKCSR), if ok { "ok" } else { "refused" }));
+}
+
 /// Read the identity register as FOUR single-byte CMD52 reads. **A diagnostic, not the way to do this.**
 ///
 /// The wide-access flag exists precisely so the bridge performs one 32-bit fetch, and a byte read may or
