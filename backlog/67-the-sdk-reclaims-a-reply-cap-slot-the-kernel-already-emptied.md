@@ -1,6 +1,8 @@
 # 67. After a wait times out, the SDK removes a cap slot the kernel already emptied at send - and destroys the cap that arrived in it since
 
-**Status: OPEN - found 2026-09-30 while chasing `backlog/66`, by reading; the onset of every slow phase in that item matches it. Not fixed: the change touches thirteen sites on every service's request path and the operator parked the investigation.**
+**Status: FIXED 2026-10-02 in the SDK and the shell, verified in QEMU; the boot on each board is still owed.** The reclaim is gone from every path where the send succeeded (nine send-then-receive waits, and the three `CallDeadline` `Ok(None)` arms, where it was dead code); the failed-send paths keep it. The `Call` ERROR arms keep it too, and the reason is not the one their comments gave ("idempotent"): during a `Call` the kernel inserts no received cap into the caller's table - it takes only the reply and leaves everything else queued - so the slot holds either the unsent cap or nothing. One more site was found outside the SDK, the shell's `fcap` wait (`resource_invoke`, then `recv_abortable_deadline`), which removed the slot on an abort or a timeout after a DELIVERED invoke. x86 QEMU after the change: shell 215/0, identity 24/24, chaos 8/8, reply-dead 5/5, reply-server 4/4, peer-storm 7/7, adopt-storm 7/7, fs-restart 11/11.
+
+**Previous status: OPEN - found 2026-09-30 while chasing `backlog/66`, by reading; the onset of every slow phase in that item matches it. Not fixed: the change touches thirteen sites on every service's request path and the operator parked the investigation.**
 
 ## The two kernel facts
 

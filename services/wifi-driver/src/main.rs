@@ -285,42 +285,94 @@ fn requested_off_ms(payload: &[u8]) -> u64 {
 }
 
 fn serve_unavailable(ctx: &ServiceContext, h: Option<&host::Host>) -> ! {
+    // `wifi radio off hard` from here leaves the chip powered down, and from then on this loop answers the
+    // way `serve_radio`'s powered-off arms do, so the shell sees one shape for one state whichever loop
+    // holds it. `h` is `None` only where no SDIO window was granted, and there no power op can be made.
+    let mut powered_off = false;
+    let mut out = [0u8; 30 + join::MAX_SSID];
     loop {
         let req = ctx.recv();
         // No reply cap means there is nothing to answer on, and dropping is all that is left.
-        if let Some(reply) = ctx.take_pending_cap() {
-            // The reply cap is RECLAIMED after use (26.6): see the serve loop for what not doing so cost.
-            // One byte, not an empty message: the kernel refuses a zero-length send, so an "empty
-            // reply" is no reply at all and the caller waits out its deadline.
-            let p = req.payload_bytes();
-            // THE ONE REQUEST THIS LOOP SERVES FOR REAL: `wifi radio powercycle`. This loop is reached
-            // when the radio never got as far as its firmware - no SDIO window, the host failed, no card
-            // on the bus even after the power was asserted, a backplane that would not open. A firmware
-            // that trapped at start does NOT come here: it goes to `serve_radio` with DOWN_TRAPPED. The
-            // hold-off is the caller's (the shell asks for a fixed 2 s). Reply shape matches `serve_radio`'s.
-            //
-            // KNOWN GAP (recorded, not fixed - docs/wifi.md 49): everything else, `wifi radio off hard`
-            // included, is answered RADIO_DOWN below, and the shell reads that as a driver that cannot
-            // act and suggests `kill wifi-driver` - wrong advice for a cut this loop could have made.
-            if p.first().copied() == Some(scan::reply::OP_RADIO)
-                && p.get(1).copied() == Some(scan::reply::RADIO_POWERCYCLE)
-            {
-                let cycled = match h {
-                    Some(h) => power_cycle_device_ms(ctx, h, requested_off_ms(p)),
-                    None => false,
-                };
-                ctx.log(if cycled {
-                    "wifi-driver: `wifi radio powercycle` on a radio that is down - the chip's power was cut and restored; this instance expects to be restarted onto the cold chip"
-                } else {
-                    "wifi-driver: `wifi radio powercycle` on a radio that is down, and this machine has no control over the radio's power - nothing changed"
-                });
-                let out = [if cycled { scan::reply::OK } else { scan::reply::NO_POWER_CONTROL }, 0, cycled as u8, 0, 0];
-                let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&out));
+        let Some(reply) = ctx.take_pending_cap() else { continue };
+        // The reply cap is RECLAIMED after use (26.6): see the serve loop for what not doing so cost.
+        // One byte at least, not an empty message: the kernel refuses a zero-length send, so an "empty
+        // reply" is no reply at all and the caller waits out its deadline.
+        let p = req.payload_bytes();
+        // THIS LOOP IS REACHED when the radio never got as far as its firmware - no SDIO window, the host
+        // failed, no card on the bus even after the power was asserted, a backplane that would not open. A
+        // firmware that trapped at start does NOT come here: it goes to `serve_radio` with DOWN_TRAPPED.
+        //
+        // THE POWER OPS ARE SERVED FOR REAL, because they are the way out of this state and the chip's
+        // power is still this driver's to command. `off hard` was answered RADIO_DOWN here until
+        // 2026-10-02, and the shell read that as a driver that could not act and advised `kill
+        // wifi-driver` - wrong advice for a cut this loop could have made (docs/wifi.md 49). Reply shapes
+        // match `serve_radio`'s; everything else stays "radio down".
+        let op = p.first().copied().unwrap_or(0);
+        let mode = p.get(1).copied().unwrap_or(1);
+        out[..5].fill(0);
+        let n = if op == scan::reply::OP_STATUS && powered_off {
+            // The powered-down status `serve_radio` gives: all zero, the trailing power byte included.
+            out.fill(0);
+            out[0] = scan::reply::OK;
+            out.len()
+        } else if op == scan::reply::OP_RADIO && mode == scan::reply::RADIO_POWERCYCLE {
+            // The hold-off is the caller's (the shell asks for a fixed 2 s).
+            let cycled = match h {
+                Some(h) => power_cycle_device_ms(ctx, h, requested_off_ms(p)),
+                None => false,
+            };
+            ctx.log(if cycled {
+                "wifi-driver: `wifi radio powercycle` on a radio that is down - the chip's power was cut and restored; this instance expects to be restarted onto the cold chip"
             } else {
-                let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&[scan::reply::RADIO_DOWN, scan::reply::DOWN_NO_RADIO]));
+                "wifi-driver: `wifi radio powercycle` on a radio that is down, and this machine has no control over the radio's power - nothing changed"
+            });
+            if cycled {
+                powered_off = false;
             }
-            ctx.remove_cap(reply);
-        }
+            out[0] = if cycled { scan::reply::OK } else { scan::reply::NO_POWER_CONTROL };
+            out[2] = cycled as u8;
+            5
+        } else if op == scan::reply::OP_RADIO && powered_off {
+            if mode == 0 || mode == scan::reply::RADIO_HARD_OFF {
+                // Already as asked.
+                out[0] = scan::reply::OK;
+            } else if h.is_some_and(|h| power_on_device(ctx, h)) {
+                powered_off = false;
+                ctx.log("wifi-driver: `wifi radio on` on a powered-down chip - the power is restored; this instance has no firmware to serve and expects to be restarted onto the cold chip");
+                out[0] = scan::reply::OK;
+                out[2] = 1;
+                out[3] = scan::reply::COLD_START;
+            } else {
+                ctx.log("wifi-driver: `wifi radio on` on a powered-down chip, and the kernel refused to restore the power");
+                out[0] = scan::reply::NO_POWER_CONTROL;
+            }
+            5
+        } else if op == scan::reply::OP_RADIO && mode == scan::reply::RADIO_HARD_OFF {
+            match h {
+                Some(h) if ctx.device_power(false) => {
+                    h.park(ctx);
+                    powered_off = true;
+                    ctx.log("wifi-driver: `wifi radio off hard` on a radio that is down - the chip's power is cut and stays cut until `wifi radio on`");
+                    out[0] = scan::reply::OK;
+                    out[2] = 1;
+                    out[3] = verify_hard_off(ctx, h);
+                }
+                _ => {
+                    ctx.log("wifi-driver: `wifi radio off hard` asked, and this machine has no control over the radio's power - the radio stays as it was");
+                    out[0] = scan::reply::NO_POWER_CONTROL;
+                }
+            }
+            5
+        } else if powered_off {
+            out[0] = scan::reply::RADIO_POWERED_OFF;
+            1
+        } else {
+            out[0] = scan::reply::RADIO_DOWN;
+            out[1] = scan::reply::DOWN_NO_RADIO;
+            2
+        };
+        let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n]));
+        ctx.remove_cap(reply);
     }
 }
 

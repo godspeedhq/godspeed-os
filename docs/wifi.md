@@ -3632,7 +3632,9 @@ driver.
 - `DOWN_BRINGUP` - "wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again"
 
 After `wifi radio off hard`, status says `radio off (hard - the chip is powered down; wifi radio on powers
-it up)`. "Did not come up at boot" is gone.
+it up)`; after the soft `wifi radio off`, `radio off (soft - the firmware's switch; the chip stays powered;
+wifi radio on turns it back on)` (2026-10-02 - it said a bare `radio off` until then, which could not be told
+from the hard one). "Did not come up at boot" is gone.
 
 **An off that is checked, not assumed.** The soft `wifi radio off` used to report success when the
 firmware accepted the command; it now asks the firmware back with `WLC_GET_UP` (162) and reports what it
@@ -3655,6 +3657,15 @@ backplane would not open. It serves `powercycle` and nothing else: `off hard` is
 `RADIO_DOWN`, and the shell, reading that as a driver that cannot act, suggests `kill wifi-driver` - which
 is the wrong advice for a request the driver could have honoured. Recorded here and in the driver's
 comment; `powercycle` works from that state.
+
+> **Closed 2026-10-02.** `serve_unavailable` now serves `off hard` and, once powered down, `on`, a
+> repeated `off`, and the powered-down status, with the reply shapes of `serve_radio`'s powered-off arms -
+> so the shell sees one shape for one state whichever loop holds it. Where there is no SDIO window (QEMU's
+> `raspi4b`, any board without the radio) there is nothing to cut, and `off hard` answers
+> `NO_POWER_CONTROL`: "this machine has no control over the radio's power", which is true, instead of
+> advice to kill the driver. In the same change `wifi status` says which OFF a radio is in both ways - the
+> soft one printed a bare `radio      off`, and now says `off (soft - the firmware's switch; the chip stays
+> powered; ...)`.
 
 **On hardware (boot 2026-10-01 16:36, image `0b24562a`).** `wifi radio off` printed "verified: the
 firmware reports it is down" and `on` rejoined; `off hard` printed "verified: the chip no longer answers on

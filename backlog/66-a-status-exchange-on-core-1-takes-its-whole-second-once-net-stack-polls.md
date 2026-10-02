@@ -3,6 +3,14 @@
 **Status: OPEN - PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well. The mechanism is measured to the point of naming the kernel path (below, "What the slot log said"); the fix is not attempted. The card carries the build that ran well (`kernel8.img` sha `e319dae6`), which is this tree.**
 **Found:** 2026-09-30 on the Pi 4, as `ping` over the radio running at one echo every three seconds.
 
+**2026-10-02, the symptom is mostly gone, and nobody fixed it on purpose.** The boot of commit `5dd1f1b8`
+(the clock out of `net-stack`, which `time` now asks through op 12) pinged 8.8.8.8 over the radio at one
+echo a SECOND, 5 of 5 and 19 of 19, 0% loss. Five STATUS exchanges were still slow - 303, 335, 496, 658
+and 711 ms, against 890-990 before - and none landed on the one-second grid. The same boot logged
+`nic-driver: a reply send FAILED - the reply cap is dead` twice, which is `backlog/67`'s signature, and
+67 is fixed in the SDK since (not yet booted). What changed the timing is not shown; the clock leaving
+`net-stack`'s serve loop is the obvious candidate and is a guess. Left parked, with the new numbers.
+
 ## The measurement, which is exact
 
 After `time` sets the wall clock from the network, `net-stack` leaves its blocking `recv` for its

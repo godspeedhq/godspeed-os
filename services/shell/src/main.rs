@@ -414,6 +414,9 @@ pub struct ShellCtx {
     wifi_owed: core::cell::Cell<u32>,
     /// When the oldest still-owed reply was given up on (monotonic seconds); see `wifi_ask`.
     wifi_owed_since: core::cell::Cell<i64>,
+    /// Non-zero when the last `wifi_ask` returned nothing WITHOUT SENDING, because the driver still owed
+    /// this many earlier answers. `wifi_not_answering` reads it to say so instead of "not answering".
+    wifi_unsent: core::cell::Cell<u32>,
     /// Byte 1 of the last `radio down` answer - WHY the driver says it is down (0 = it did not say).
     wifi_down_reason: core::cell::Cell<u8>,
     /// The job table: what `background` started, what `jobs` lists, what `foreground` attaches to.
@@ -451,6 +454,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         fs_unknown: core::cell::Cell::new(false),
         wifi_owed: core::cell::Cell::new(0),
         wifi_owed_since: core::cell::Cell::new(0),
+        wifi_unsent: core::cell::Cell::new(0),
         wifi_down_reason: core::cell::Cell::new(0),
         jobs: core::cell::RefCell::new(JobTable::new()),
     };
@@ -7708,11 +7712,12 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // `powercycle` kill the driver in the middle of its power cycle, leaving the chip unpowered. The shell
     // asks one thing at a time and reads keys from the kernel ring, so anything queued before a request
     // is stale by construction (`wifi_drain_stale`).
-    let stale = wifi_drain_stale(ctx);
-    if stale > 0 {
+    ctx.wifi_unsent.set(0);
+    let (stale, other) = wifi_drain_stale(ctx);
+    if stale + other > 0 {
         ctx.log_fmt(format_args!(
             "shell: {} stale message(s) from earlier radio requests cleared before op {:#04x}",
-            stale, req.first().copied().unwrap_or(0)));
+            stale + other, req.first().copied().unwrap_or(0)));
     }
     // THE DRAIN CANNOT CLEAR A REPLY STILL IN FLIGHT, so the shell also COUNTS what it is owed. A request
     // that timed out is answered later by the driver, in order (it serves FIFO), and the matched-by-sender
@@ -7738,7 +7743,10 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
             Some(got) => {
                 owed -= (got as u32).min(owed);
                 if owed > 0 {
+                    // NOTHING WAS SENT, and the caller must not say the driver failed to answer it: the
+                    // request never left. `wifi_not_answering` reads this and says what happened.
                     ctx.wifi_owed.set(owed);
+                    ctx.wifi_unsent.set(owed);
                     return None;
                 }
             }
@@ -7787,12 +7795,13 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
             ctx.log_fmt(format_args!("shell: the radio driver answered op {:#04x} after {} ms", req.first().copied().unwrap_or(0), took_ms));
         }
         None => {
-            let stale = wifi_drain_stale(ctx);
-            // Anything that arrived just now is an owed answer, not a new one.
+            let (stale, other) = wifi_drain_stale(ctx);
+            // A REPLY that arrived just now is an owed answer, not a new one. Only replies: see
+            // `wifi_drain_stale` for what counting the rest did.
             ctx.wifi_owed.set(ctx.wifi_owed.get().saturating_sub(stale));
             ctx.log_fmt(format_args!(
                 "shell: the radio driver did not answer op {:#04x} within {} s ({} stale message(s) cleared from this shell's queue)",
-                req.first().copied().unwrap_or(0), secs, stale));
+                req.first().copied().unwrap_or(0), secs, stale + other));
         }
         _ => {}
     }
@@ -7834,18 +7843,30 @@ fn wifi_no_answer(ctx: &ShellCtx, out: &mut Out, outcome: &ReqOutcome, doing: &s
 /// Call matches by sender), and it holds a slot of a 16-deep queue. Everything queued here is stale by
 /// construction: the shell asks one thing at a time and reads console input from the kernel ring, not from
 /// its endpoint, and a late `net-stack` reply is discarded by its own tag check either way.
-fn wifi_drain_stale(ctx: &ShellCtx) -> u32 {
+///
+/// Returns `(replies, other)`: what came out of the mailbox, and what came off the main endpoint. Only
+/// `replies` may be set against `wifi_owed` - a message on the main endpoint is never an answer to a Call.
+///
+/// KNOWN GAP (backlog/70): `replies` is not "the driver's answers" either. The mailbox takes the replies
+/// of EVERY peer this shell asks - `time`, `fs`, `net-stack` - and a message carries no sender this
+/// shell can read, so a late answer from any of them is counted as one the driver owed. QEMU raspi4b,
+/// 2026-10-02, a driver made to answer `wifi status` 8 s late: a 2-byte `[1, 4]` from another peer was in
+/// the mailbox at the timeout, cancelled the owed answer, the next `wifi status` was sent behind it, and
+/// the Call (matched by sender) read the FIRST request's late answer as the second's - the desync the
+/// count exists to prevent.
+fn wifi_drain_stale(ctx: &ShellCtx) -> (u32, u32) {
     // The REPLY MAILBOX first: that is where answers to this shell's requests land (`reply_mailbox` in
     // the SDK). Draining only the main endpoint, as this did, found nothing - "0 stale message(s)
     // cleared" on every line of boot 2026-10-01 14:43 - while the stale answers sat in the mailbox.
-    let mut n = ctx.drain_stale_replies() as u32;
+    let replies = ctx.drain_stale_replies() as u32;
+    let mut other = 0u32;
     while ctx.try_recv().is_some() {
-        n = n.saturating_add(1);
+        other = other.saturating_add(1);
         while let Some(c) = ctx.take_pending_cap() {
             ctx.remove_cap(c);
         }
     }
-    n
+    (replies, other)
 }
 
 /// The printable form of an SSID. The name is whatever the access point beacons and is NOT trusted to be
@@ -7929,7 +7950,17 @@ fn wifi_header(ctx: &ShellCtx, out: &mut Out) {
 
 /// The sentence for a driver that did not answer at all - the same one everywhere it can happen.
 fn wifi_not_answering(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("wifi: the radio driver is not answering"));
+    // Unless the request was never SENT: the driver still owed this shell answers to earlier requests, and
+    // asking again behind them is how a late answer gets read as a new one (`wifi_ask`). "Not answering"
+    // was the wrong sentence for that - the driver had not been asked.
+    let owed = ctx.wifi_unsent.get();
+    if owed > 0 {
+        out.line_fmt(ctx, format_args!(
+            "wifi: not sent - the radio driver still owes {} answer(s) to earlier requests (it is busy, typically bringing the chip up); try again in a few seconds",
+            owed));
+    } else {
+        out.line_fmt(ctx, format_args!("wifi: the radio driver is not answering"));
+    }
     Err(ShellError::Unknown)
 }
 
@@ -8338,7 +8369,7 @@ fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         if p.get(61).copied() == Some(0) {
             out.line_fmt(ctx, format_args!("radio      off (hard - the chip is powered down; wifi radio on powers it up)"));
         } else {
-            out.line_fmt(ctx, format_args!("radio      off"));
+            out.line_fmt(ctx, format_args!("radio      off (soft - the firmware's switch; the chip stays powered; wifi radio on turns it back on)"));
         }
     } else {
         out.line_fmt(ctx, format_args!("radio      on"));
@@ -8404,7 +8435,7 @@ fn wifi_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         Some(s) => return wifi_radio_unavailable(ctx, out, s),
         None => return wifi_not_answering(ctx, out),
     }
-    out.line_fmt(ctx, format_args!("radio       {}", if p[9] != 0 { "on" } else if p.get(61).copied() == Some(0) { "off (hard - powered down)" } else { "off" }));
+    out.line_fmt(ctx, format_args!("radio       {}", if p[9] != 0 { "on" } else if p.get(61).copied() == Some(0) { "off (hard - powered down)" } else { "off (soft - the chip stays powered)" }));
     if p[10] == 0 {
         out.line_fmt(ctx, format_args!("network     none (not associated)"));
     } else {
@@ -8962,9 +8993,9 @@ fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutc
     use wifi_wire::*;
     const POWERCYCLE_WATCH_SECS: i64 = 90;
     const POLL_MS: u64 = 1_000;
-    let stale = wifi_drain_stale(ctx);
-    if stale > 0 {
-        ctx.log_fmt(format_args!("shell: {} stale message(s) cleared before watching the power cycle", stale));
+    let (stale, other) = wifi_drain_stale(ctx);
+    if stale + other > 0 {
+        ctx.log_fmt(format_args!("shell: {} stale message(s) cleared before watching the power cycle", stale + other));
     }
     out.line_fmt(ctx, format_args!("the radio is coming back from power-on  [q] quit  [b] background"));
     let t0 = ctx.epoch_secs_monotonic();
@@ -16272,12 +16303,12 @@ fn fc_invoke(ctx: &ShellCtx, file: CapHandle, right: u8, payload: &[u8]) -> Opti
         return None;
     }
     // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` here would hang forever if fs
-    // died after receiving the badged invocation but before replying. Reclaim the reply slot on every
-    // outcome (the reply cap is one-shot; Aborted/Timeout means it was never consumed).
-    // Same rule as the SDK: on a REPLY the cap is already gone (the send embedded it, and §8.5 removes
-    // an embedded cap from the sender's table), so removing it here removes whatever the kernel has
-    // since placed in that slot - which is how the file cap was being deleted. Reclaim it only on the
-    // paths where the send never delivered it.
+    // died after receiving the badged invocation but before replying.
+    // Same rule as the SDK: once the invoke above SUCCEEDED the cap is already gone (the send embedded
+    // it, and §8.5 removes an embedded cap from the sender's table), so removing it here removes
+    // whatever the kernel has since placed in that slot - which is how the file cap was being deleted.
+    // That holds on EVERY outcome below, an abort or a timeout included: they are waits after a
+    // delivered invoke, not sends that failed. Only the failed invoke above reclaims (backlog/67).
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
     match outcome {
         ReqOutcome::Reply(m) => {
@@ -16287,7 +16318,7 @@ fn fc_invoke(ctx: &ShellCtx, file: CapHandle, right: u8, payload: &[u8]) -> Opti
             if b.first() != Some(&tag) { return None; }
             Some(Message::from_bytes(&b[1..]))
         }
-        _ => { ctx.remove_cap(reply); None }
+        _ => None,
     }
 }
 

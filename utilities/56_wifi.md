@@ -366,7 +366,8 @@ last scan  42 s ago, 11 networks
 
 The word before the dBm is the same stated rule as the scan rows (section 3): -50 dBm or stronger
 `excellent`, to -60 `good`, to -70 `fair`, weaker `weak`. Not associated: `network    none (not
-associated)` and no signal, security or joined lines. Radio off: `radio      off` and the same. The last
+associated)` and no signal, security or joined lines. Radio off by the soft
+switch: `radio      off (soft - the firmware's switch; the chip stays powered; wifi radio on turns it back on)` and the same. The last
 line is one of `scan       running - N heard so far`, `last scan  N s ago, M networks`, or `last scan
 none - run wifi scan`.
 
@@ -466,6 +467,7 @@ look like "no internet":
 | Driver running, no working radio on its bus | `wifi: the radio is down - the driver found no working radio on its bus; `wifi radio powercycle` restores the chip's power and tries again` |
 | Driver running, bring-up stopped early | `wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again` |
 | Chip powered down by `wifi radio off hard` | `radio off (hard - the chip is powered down; wifi radio on powers it up)` |
+| Radio switched off by `wifi radio off` | `radio off (soft - the firmware's switch; the chip stays powered; wifi radio on turns it back on)` |
 | SSID not found in a scan | `not joined - no network named <ssid> in range` - naming what was searched for |
 | Wrong passphrase | `not joined - incorrect passphrase` - never "connection failed", which hides it |
 | Associated, no lease | association reported as good; `net` owns the lease and says its own piece |
