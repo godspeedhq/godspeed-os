@@ -172,13 +172,25 @@ invisible-entry path (`input secret`, `docs/scripting.md` §8), which is already
 
 ## 3. Output is a pipeable structure (rule 12)
 
-`wifi list` is a producer. One record per network, so the existing pipes work with no special case:
+`wifi list` is a producer. In a pipe it is RECORDS - one per network, with the columns `network`, `band`,
+`signal` (the word), `dbm` (the reading, a signed number), `security` and `note` - so the record stages
+work on it with no special case:
 
 ```
-wifi list | match WPA2
+wifi list | where security=WPA2
+wifi list | sort reverse dbm          strongest first
+wifi list | where dbm>-60
+wifi list | select network dbm
+wifi list | max dbm                   the strongest signal heard
 wifi list | count
+wifi list | to json
 wifi list | write /networks.txt
 ```
+
+On the screen, bare `wifi list` prints the fixed-width lines below; the records are the same facts, decoded
+once for both. `match`, `first` and `last` are text stages and refuse a record stream with a pointer to
+`where` - the same rule as `dir` and `observe now`. (It was text in a pipe for one morning, 2026-10-02,
+and `wifi list | match WPA2` worked then; `where security=WPA2` is its record form. `docs/wifi.md` 58.)
 
 **The reports pipe; the actions do not.** `list`, `stored`, `status`, `info`, `debug` and `version` can start
 a pipe. `scan`, `join`, `leave`, `forget` and `radio ...` are actions, and refuse with a sentence that names
@@ -222,7 +234,7 @@ dot rather than reaching the terminal as a control code. `security` is one of `o
 network on 2.4 GHz and 5 GHz is the usual case, and both are listed because both were heard.
 
 Rows are in the order the radio heard them, and `list` prints the cache in that order every time. A
-sorted view is one pipe away (`wifi list | sort`), and keeping the producer unsorted is what lets the
+sorted view is one pipe away (`wifi list | sort reverse dbm`), and keeping the producer unsorted is what lets the
 picker's numbers in section 4 stay put.
 
 **`wifi list` never scans, and says so when there is nothing to print:**

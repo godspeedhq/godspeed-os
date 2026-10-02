@@ -39,8 +39,11 @@ assert fails wifi nonsense
 # written to /.gsh_history, so `connect` takes an SSID and nothing else. If this ever starts passing,
 # somebody has added a convenience that leaks a secret to disk.
 assert fails wifi join SomeSSID hunter2
-# And the radio itself, reported rather than asserted (see the note above).
-for line in (wifi) { echo $line }
+# And the radio itself, reported rather than asserted (see the note above). Under `if`, so its words
+# print and a radio that is down - or absent - counts as nothing. This was `for line in (wifi) { ... }`,
+# which failed every run since bare `wifi` became its usage (rule 1) and was never capturable anyway:
+# the ONE failure of the whole suite, which the summary could not even name (2026-10-02).
+if wifi status { echo 'wifi: reported above' } else { echo 'wifi: reported above (the radio is not up, or not here - not a selfcheck failure)' }
 
 # ---- network: RECEIVE must work, checked without sending anything ----------------------------
 #

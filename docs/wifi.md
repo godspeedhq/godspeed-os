@@ -3968,3 +3968,11 @@ passphrase from the console, and piped its prompt would vanish into the pipe), a
 its words on the console and stops the pipe, and an empty scan is zero rows in a pipe, not a row saying
 so. QEMU, with a test-only driver serving three canned networks: `wifi list | count` 3 lines, `| match
 WPA2` two, `| sort` sorted, the pipe at 29% of the shell's stack.
+
+**Later the same day: `wifi list` is records in a pipe.** The text form could filter and count but not
+order by signal - `sort` on text is alphabetical. In a pipe `wifi list` is now a record table (`network`,
+`band`, `signal`, `dbm`, `security`, `note`), built from the same decode as the screen's rows, so `wifi
+list | sort reverse dbm`, `| where dbm>-60`, `| max dbm` and `| to json` work. The record model had no
+negative number, so it gained one (`Value::Signed`, `docs/records.md`). `match` on a record stream points
+at `where`, as it does for `dir`. QEMU, three canned networks at -41, -80 and -9: `sort reverse dbm`
+ordered -9, -41, -80; `where dbm>-60` kept two; `max` -9, `min` -80, `avg` -43.

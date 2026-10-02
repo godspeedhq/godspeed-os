@@ -39,7 +39,12 @@ is therefore a **typed value**, with text/JSON as *renderings* of it - never the
 ## The model - a bounded `Table`
 
 The canonical value is a **table**: static column names + rows of typed `Value`
-(`Str` interned in a byte arena, `Int`, …). Most introspection output is naturally tabular
+(`Str` interned in a byte arena, `Int` unsigned, `Signed`, `Empty`). `Signed` arrived on 2026-10-02 for
+`wifi list`'s `dbm`, a reading that is always below zero: the magnitude would be a different number and a
+string sorts by bytes. It is its own variant rather than a change to `Int`, so every count and size kept
+its type; `sort`, `where` and the reducers compare the two kinds numerically, JSON writes it as a number,
+and the wire codec carries it as cell tag 3 (`Empty` 0, `Int` 1, `Str` 2). `from json` now reads a
+negative integer as `Signed` - it used to arrive as `null`. Most introspection output is naturally tabular
 (`status`, `dir`, `find`, `caps` are all uniform rows), so a table covers the realistic cases and
 is simpler than arbitrary records. It is **bounded** (§26.6): `REC_MAX_COLS`, `REC_MAX_ROWS`, a
 fixed `REC_ARENA` - all on the stack, no heap, loud on overflow. Heterogeneous (differently

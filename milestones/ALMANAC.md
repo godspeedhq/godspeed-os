@@ -58,6 +58,9 @@
 - [2026-09-12 to 2026-09-13 - The day "it boots" stopped being the standard](#2026-09-12-to-2026-09-13---the-day-it-boots-stopped-being-the-standard)
 - [2026-09-13 to 2026-09-14 - The day the enforcement layer was pointed at itself](#2026-09-13-to-2026-09-14---the-day-the-enforcement-layer-was-pointed-at-itself)
 - [2026-09-26 to 2026-09-27 - The day a rule nobody could read stopped counting as enforced](#2026-09-26-to-2026-09-27---the-day-a-rule-nobody-could-read-stopped-counting-as-enforced)
+- [2026-09-27 to 2026-09-28 - The day the radio scanned the room](#2026-09-27-to-2026-09-28---the-day-the-radio-scanned-the-room)
+- [2026-09-29 to 2026-09-30 - The day the radio joined, and the cable learned to step aside](#2026-09-29-to-2026-09-30---the-day-the-radio-joined-and-the-cable-learned-to-step-aside)
+- [2026-09-30 to 2026-10-02 - The day the warm chip turned out to be a slow host](#2026-09-30-to-2026-10-02---the-day-the-warm-chip-turned-out-to-be-a-slow-host)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -1732,3 +1735,104 @@ to have none. Later that day the driver learned to answer the access point's per
 which would otherwise have taken the link down on the router's timer; it cannot be provoked and has not
 yet been seen. The network's name and the access point's addresses are in the operator's captures and
 not in this repository.
+
+## 2026-09-30 to 2026-10-02 - The day the warm chip turned out to be a slow host
+
+The radio joined, and then the operator ran `chaos` with it carrying the link: 826 rounds, the kernel never
+panicked, nothing wedged, and the radio was dead from the first round. Every one of 397 respawns of
+`wifi-driver` found a chip that would not take a new firmware. Three days later the same test ran 100
+rounds and 50 rounds with the radio up at the end of both, and a power cycle came up cold every time. Most
+of what lay between was learning which of the things the logs said were true. `docs/wifi.md` 45 to 58 is
+the record, kept with its wrong turns in it.
+
+### Adopt, do not restart
+
+The first fix was to stop doing the thing that broke. A kill of the SERVICE does nothing to the CHIP: the
+firmware the dead instance loaded is still running, still associated. The respawn was resetting the chip
+and loading a new firmware over a live one, which is the case the chip's ROM will not boot. So a respawn
+now looks first, with two register reads, and a firmware found running is ADOPTED - its keys are read back
+and the link is back in about seven seconds. The best recovery is often to notice there is nothing to
+recover.
+
+### Power, granted twice
+
+For a firmware that has truly stopped, every reference driver cuts the chip's power, and on the Pi 4 the
+pin that does it lives behind the firmware mailbox the kernel owns. The kernel was already powering the
+SD domain at boot, because a window onto an unpowered device is not a grant. What it could not do was
+grant it again. So `DevicePower` is the device grant made renewable: given only to the service holding
+that device's window, and it reports what the pin READS BACK, not that the request was accepted. In QEMU,
+where the pin is not emulated, the first version reported a cut that never happened.
+
+### The chip was never warm
+
+Six host-side resets, a RAM clear, and the "warm chip" theory with every one of them: whatever survived
+a reset, it made the next firmware trap at `pc 0x25`. The number that ended it was a stopwatch, not a
+register. A cold upload took 3.26 s and every upload after a cut took 7.19 s, five times out of five, on
+the same bus. The reason was in the firmware's own documentation: `initial_turbo` holds the Arm cores fast
+for the first minute after boot, "or until `cpufreq` sets a frequency" - and nothing in GodspeedOS had
+ever set one. So a minute in, the cores dropped to their minimum and stayed there. Every load inside that
+minute came up cold; every load after it was slow, and trapped. `force_turbo=1` proved it on the card: five
+power cycles, every one cold. Six resets had been tested against a host running at a fraction of its
+speed, and the chip was blamed for it.
+
+Why a slow upload makes the firmware trap is still not known, and is written down as not known.
+
+### Mechanism here, policy there
+
+`force_turbo` holds the cores fast forever to make a three-second load work. The operator asked whether
+the kernel had to own the clock at all, and whether a fast clock could be left stuck on if the service
+asking for it died. Both questions shaped the answer. The kernel learned one thing, `CpuClock`: set the
+clock to the firmware's own minimum or maximum, and read back what it is. It cannot name a rate and never
+decides when. A new service, `power`, owns that: it hands out LEASES of up to 30 seconds, holds the clock
+at its maximum while any is open and at its minimum when none is, and a lease nobody returns expires on
+its own. The driver takes one for each load. On the card: 600 MHz between loads, 1500 MHz during them,
+five loads, every one cold. A grant that can outlive its holder needs a deadline, and the deadline
+belongs with the policy, not the mechanism.
+
+### The clock left the network stack
+
+`net-stack` used to fetch the time itself, inside its serve loop, so a `ping` could queue behind a time
+server. Now `net-stack` knows nothing about clocks. It offers one general operation, "send this datagram
+and answer me when the reply comes", and serves everyone else while it waits. `time` builds its own
+query with a random nonce and checks it comes back. Testing that in the emulator found two bugs that the
+real board could never show. The emulated Pi 4 has no random-number block, so the first `time` service
+that asked for a nonce took the KERNEL down from an unprivileged call; the kernel now probes the block at
+boot like any other device. And a deliberately unanswerable time server showed `net-stack`'s "no reply"
+arriving eight seconds late, because its deadlines were checked only when some unrelated message woke it.
+On real hardware the server always answers, and neither would ever have been seen.
+
+### An answer is not a reply to the question you just asked
+
+The kernel's `Call` takes the oldest reply FROM the peer, not the reply to the request just sent. So an
+answer the shell had stopped waiting for was read as the next command's: a stale `OK` made `powercycle`
+kill the driver mid-cycle and leave the chip unpowered, and late `radio down`s were counted as chips that
+"came up warm" in 150 ms. The first fix drained the queue; the second COUNTED what the driver still owed
+and skipped that many. QEMU then showed why the count could never be right: it was counted by watching the
+reply mailbox, every peer's replies land there, and nothing on a message says who sent it. A stray
+two-byte answer from another service cancelled an owed radio answer, and the next `wifi status` printed
+the previous one's. Now every request carries a tag the driver hands back, and every wait takes only the
+reply with its own tag. A fact carried in the reply beats a count kept beside it.
+
+The same hunt found the SDK destroying other services' capabilities. After a request is sent, the kernel
+moves the reply capability to the peer and empties the sender's slot, and the next capability the sender
+receives lands in that slot. On a timeout the SDK "reclaimed" the slot by number, and so deleted whatever
+had arrived in it - another client's way to be answered. It was on every service's request path, on every
+port. The boot that morning logged `reply cap is dead` twice; the boot after the fix, through a 50-round
+chaos run, logged it none. A slot number is not a name for what is in it.
+
+### Chaos, again
+
+`chaos max-carnage`, 100 rounds and 701 kills with the radio carrying the link, every service restarted
+between 45 and 56 times, and at the end the radio rejoined, `time` set the clock from the network, and 19
+pings out of 19 came back. Fifty more rounds two boots later, with the same ending. The chip is a second
+computer that chaos cannot touch; the driver is Godspeed's, and it recovers the way everything else does.
+
+### And it pipes
+
+The specification had said `wifi list | count` worked; the shell refused it, because `wifi` had never been
+added to its list of things that can start a pipe. Now the reports pipe and the actions refuse with a
+sentence - `join` asks for a passphrase, and in a pipe its prompt would vanish. Then `wifi list` became
+RECORDS in a pipe, so `wifi list | sort reverse dbm` puts the strongest network first. That needed a
+number the record model did not have: signal is measured in dBm, always below zero, and every number in a
+table had been unsigned. Writing the magnitude would be a different fact, and text sorts `-9` after `-80`.
+So the record model gained a signed number, pulled into existence by the one column that needed it.

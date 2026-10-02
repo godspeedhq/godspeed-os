@@ -151,6 +151,29 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     emits either a typed record `Table` (`docs/records.md`, so `| where` / `| select` /
     `| to json` compose) or plain labelled lines (so `| match` / `| count` compose). Piping is
     the composition model; output that cannot flow onward is a dead end.
+
+    **Which utilities start a pipe, and why the rest do not** (counted 2026-10-02 against the shell's
+    `UTILS` and its three producer lists, `is_producer_builtin`, `is_record_producer` and
+    `is_pipe_producer_service`). Of the shell's utilities (its `UTILS` list), 27 start a pipe (two, `wifi` and `churn`, for some verbs only): the record sources (`status`, `dir`,
+    `find`, `caps`, `drives`, `observe now`, `uptime`, `events`, `trace`, `jobs`, and `wifi list`), the
+    text sources (`echo`, `read`, `tree`, `input`, `about`, `version`, `whatis`, `mem`, `cores`, `date`,
+    `net`, `ping`, `sock`, `help`, `wifi`'s other reports, `churn verify`), and the `roster` service; plus
+    `random` and `tcp` (made sources that day) and the `greet` example, which are not in `UTILS`. Seventeen more are pipe STAGES or SINKS rather than
+    sources - `match`, `count`, `sort`, `first`, `last`, `where`, `select`, `to`, `from`, `sum`, `min`,
+    `max`, `avg`, `paginate`, `write`, `assert`, `result` - and `result`/`assert` refuse to start a pipe
+    with a sentence that names the idiom they belong to. The other 22, each for a reason rather than an
+    omission (the library scripts are not in `UTILS` and are listed with them):
+
+    | Not a pipe source | Why |
+    |---|---|
+    | `run`, `selfcheck` | Orchestrators: they run their own sub-pipelines, so capturing one nests a pipe inside a pipe on a 256 KiB stack - a hardware-proven crash. They write their own output with `save <path>` instead |
+    | `health`, `online`, `size`, `busiest`, `watch` (the library) | Scripts, run by the interpreter: the same class as `run`, refused inside another script for the same stack reason. Their contents pipe directly - `busiest` IS `status \| sort reverse mem` |
+    | `docs`, `scrollback`, `edit`, bare `observe` | Full-screen: a pipe cannot carry a screen you scroll. `scrollback save` and `observe now` are the capturable forms |
+    | `clear`, `wait`, `cd`, `mkdir`, `copy`, `move`, `rename`, `delete`, `seal`, `spawn`, `kill`, `restart`, `reboot`, `background`, `foreground` | Actions: the value is the effect, and what they print is a confirmation, not data |
+    | `wifi scan`, `join`, `leave`, `forget`, `radio ...` | Actions; `join` also reads a passphrase from the console, and piped its prompt would vanish. Refused with a sentence naming the reports |
+    | `churn <seconds>`, `churn tear`, `churn reset` | Actions; `churn verify` is the report and pipes |
+    | `chaos`, `fcap` | Exercisers whose value is what they prove while running; `chaos` writes its report with `save` |
+    | `serve`, `gpio` | `serve` runs until stopped; `gpio` drives pins - the one read it offers is a single line on the Pi 2 only |
 13. **If it does not fit the common pipes, `write` still captures it.** Any producer's output
     snapshots to a file with `| write <path>` (redirection is `| write`; there is no `>`, see
     `19_write.md`). So even a utility that is not a record source is never trapped on screen -

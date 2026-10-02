@@ -2067,7 +2067,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
         "serve"   => cmd_serve(ctx, &args[..argc], out),
         "uptime"  => cmd_uptime(ctx),
-        "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }),
+        "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "gpio"    => cmd_gpio(ctx, if argc >= 2 { args[1] } else { "" }, if argc >= 3 { args[2] } else { "" }),
         "wait"    => cmd_wait(ctx, if argc >= 2 { args[1] } else { "" }),
         "whatis"  => cmd_whatis(ctx, if argc >= 2 { args[1] } else { "" }, out),
@@ -8001,31 +8001,49 @@ fn wifi_security_word(sec: u8) -> &'static str {
 /// `wifi scan` surface only; `wifi list` prints the same columns without the number, so a pipe never sees
 /// a number it did not ask for.
 fn wifi_row(ctx: &ShellCtx, out: &mut Out, number: Option<usize>, rec: &[u8]) {
+    let d = wifi_decode(rec);
+    let mut shown = [b'.'; wifi_wire::SSID_MAX];
+    let name = wifi_ssid_text(&d.ssid[..d.ssid_len], &mut shown);
+    let (band, word, rssi, security, note) = (d.band, d.word, d.rssi, d.security, d.note);
+    // NETWORK 32, BAND 6, SIGNAL as word then dBm (the header carries the unit once), SECURITY 8, NOTE.
+    // 78 columns with the number, so a serial terminal does not wrap.
+    match number {
+        Some(n) => out.line_fmt(ctx, format_args!("{:>2}  {:<32}  {:<6}  {:<9} {:>4}  {:<8}  {}", n, name, band, word, rssi, security, note)),
+        None => out.line_fmt(ctx, format_args!("{:<32}  {:<6}  {:<9} {:>4}  {:<8}  {}", name, band, word, rssi, security, note)),
+    }
+}
+
+/// One network record from the driver, decoded: the facts both the text row and the record row show.
+struct WifiRec {
+    ssid: [u8; wifi_wire::SSID_MAX],
+    ssid_len: usize,
+    band: &'static str,
+    word: &'static str,
+    rssi: i16,
+    security: &'static str,
+    note: &'static str,
+}
+
+/// Decode `bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security note` (`wifi_wire::RECORD`).
+fn wifi_decode(rec: &[u8]) -> WifiRec {
     let rssi = i16::from_le_bytes([rec[6], rec[7]]);
     let chanspec = u16::from_le_bytes([rec[8], rec[9]]);
     let len = core::cmp::min(rec[10] as usize, wifi_wire::SSID_MAX);
-    let mut shown = [b'.'; wifi_wire::SSID_MAX];
-    let name = wifi_ssid_text(&rec[11..11 + len], &mut shown);
+    let mut ssid = [0u8; wifi_wire::SSID_MAX];
+    ssid[..len].copy_from_slice(&rec[11..11 + len]);
     // chanspec band bits 15:14 - 0 is 2.4 GHz, 3 is 5 GHz - and every value seen on hardware decodes under it.
     let band = match chanspec >> 14 {
         0 => "2.4GHz",
         3 => "5GHz",
         _ => "band?",
     };
-    let security = wifi_security_word(rec[43]);
     // NOTE: what a person picking this row most needs to know - is it the network we are on, is its key held.
     let note = match rec[44] & (wifi_wire::NOTE_JOINED | wifi_wire::NOTE_SAVED) {
         n if n & wifi_wire::NOTE_JOINED != 0 => "joined",
         n if n & wifi_wire::NOTE_SAVED != 0 => "saved",
         _ => "",
     };
-    // NETWORK 32, BAND 6, SIGNAL as word then dBm (the header carries the unit once), SECURITY 8, NOTE.
-    // 78 columns with the number, so a serial terminal does not wrap.
-    let word = wifi_signal_word(rssi as i32);
-    match number {
-        Some(n) => out.line_fmt(ctx, format_args!("{:>2}  {:<32}  {:<6}  {:<9} {:>4}  {:<8}  {}", n, name, band, word, rssi, security, note)),
-        None => out.line_fmt(ctx, format_args!("{:<32}  {:<6}  {:<9} {:>4}  {:<8}  {}", name, band, word, rssi, security, note)),
-    }
+    WifiRec { ssid, ssid_len: len, band, word: wifi_signal_word(rssi as i32), rssi, security: wifi_security_word(rec[43]), note }
 }
 
 /// The header above the numbered rows of `wifi scan`. `wifi list` prints none, so its output is records only.
@@ -8384,25 +8402,8 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
 /// (`utilities/56_wifi.md` 3).
 fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use wifi_wire::*;
-    const REPLY_MS: u64 = 3000;
-    let r = match wifi_ask(ctx, &[OP_LIST], REPLY_MS) {
-        Some(r) => r,
-        None => return wifi_not_answering(ctx, out),
-    };
+    let r = wifi_list_fetch(ctx, out)?;
     let p = r.payload_bytes();
-    match p.first().copied() {
-        Some(OK) => {}
-        Some(SCANNING) => {
-            out.line_fmt(ctx, format_args!("scanning - {} heard so far; wifi list when it finishes", p.get(1).copied().unwrap_or(0)));
-            return Err(ShellError::Unknown);
-        }
-        Some(NO_SCAN_YET) => {
-            out.line_fmt(ctx, format_args!("no scan yet - run wifi scan"));
-            return Err(ShellError::Unknown);
-        }
-        Some(s) => return wifi_radio_unavailable(ctx, out, s),
-        None => return wifi_not_answering(ctx, out),
-    }
     let count = p.get(1).copied().unwrap_or(0) as usize;
     if count == 0 {
         // Not a row: `wifi list | count` must say 0. On the console it is the answer; in a pipe it is a note.
@@ -8421,6 +8422,70 @@ fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         wifi_row(ctx, out, None, &p[at..at + RECORD]);
     }
     Ok(())
+}
+
+/// The driver's answer to `wifi list`, or the reason there is none said on `out` - a scan running, no scan
+/// yet, the radio down, no answer. Both forms of `wifi list` go through here, so they fail the same way.
+fn wifi_list_fetch(ctx: &ShellCtx, out: &mut Out) -> Result<Message, ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    let r = match wifi_ask(ctx, &[OP_LIST], REPLY_MS) {
+        Some(r) => r,
+        None => return Err(wifi_not_answering(ctx, out).err().unwrap_or(ShellError::Unknown)),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) => Ok(r),
+        Some(SCANNING) => {
+            out.line_fmt(ctx, format_args!("scanning - {} heard so far; wifi list when it finishes", p.get(1).copied().unwrap_or(0)));
+            Err(ShellError::Unknown)
+        }
+        Some(NO_SCAN_YET) => {
+            out.line_fmt(ctx, format_args!("no scan yet - run wifi scan"));
+            Err(ShellError::Unknown)
+        }
+        Some(s) => Err(wifi_radio_unavailable(ctx, out, s).err().unwrap_or(ShellError::Unknown)),
+        None => Err(wifi_not_answering(ctx, out).err().unwrap_or(ShellError::Unknown)),
+    }
+}
+
+/// `wifi list` in a pipe: one RECORD per network - `network`, `band`, `signal` (the word), `dbm` (the raw
+/// reading, a signed integer, so `sort reverse dbm` is strongest first and `where dbm>-60` works), `security`,
+/// `note` (`joined`, `saved`, or empty). The same decode as the text row (`wifi_decode`), so the two forms
+/// cannot disagree. A failure says why on the CONSOLE and builds nothing: an error is not a row.
+#[inline(never)]
+fn build_wifi_table(ctx: &ShellCtx) -> Option<Table> {
+    use wifi_wire::*;
+    let r = wifi_list_fetch(ctx, &mut Out::Console).ok()?;
+    let p = r.payload_bytes();
+    let count = p.get(1).copied().unwrap_or(0) as usize;
+    let mut t = Table::new(&["network", "band", "signal", "dbm", "security", "note"]);
+    if count == 0 {
+        ctx.console_writeln("wifi: no networks in range");
+    }
+    for i in 0..count {
+        let at = 2 + i * RECORD;
+        if at + RECORD > p.len() {
+            ctx.console_writeln_fmt(format_args!("wifi: the reply ended after {} of {} network(s)", i, count));
+            break;
+        }
+        let d = wifi_decode(&p[at..at + RECORD]);
+        let mut shown = [b'.'; SSID_MAX];
+        let name = wifi_ssid_text(&d.ssid[..d.ssid_len], &mut shown);
+        let row = [
+            t.intern(name.as_bytes()),
+            t.intern(d.band.as_bytes()),
+            t.intern(d.word.as_bytes()),
+            Value::Signed(d.rssi as i64),
+            t.intern(d.security.as_bytes()),
+            if d.note.is_empty() { Value::Empty } else { t.intern(d.note.as_bytes()) },
+        ];
+        t.add_row(&row);
+    }
+    if t.overflow() {
+        ctx.console_writeln("wifi: the network list did not fit in a record table - rows are missing");
+    }
+    Some(t)
 }
 
 /// `wifi status` - what is true NOW, as labelled lines so it pipes (`wifi status | match signal`).
@@ -10165,20 +10230,20 @@ fn cmd_uptime(ctx: &ServiceContext) -> Result<(), ShellError> {
 
 /// `random [n]` - one (or n, bounded 1..64) hardware-random u32 from the SoC RNG (the BCM2835 RNG on the
 /// Pi 2), printed as hex + decimal. Reports loudly if the machine exposes no hardware RNG.
-fn cmd_random(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn cmd_random(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     // Bare `random` = 1; a given count must be a number - reject junk LOUDLY, not silently as 1
     // (userspace-audit Audit 5, A5-U3; matches cmd_gpio's loud rejection).
     let a = arg.trim();
     let n = if a.is_empty() { 1 } else {
         match a.parse::<u32>() {
             Ok(v) => v.clamp(1, 64),
-            Err(_) => { ctx.console_writeln("random: count must be a number 1..64"); return Ok(()); }
+            Err(_) => { out.line(ctx, "random: count must be a number 1..64"); return Ok(()); }
         }
     };
     for _ in 0..n {
         match ctx.hw_random() {
-            Some(v) => ctx.console_writeln_fmt(format_args!("{:#010x}  {}", v, v)),
-            None => { ctx.console_writeln("random: no hardware RNG on this machine"); break; }
+            Some(v) => out.line_fmt(ctx, format_args!("{:#010x}  {}", v, v)),
+            None => { out.line(ctx, "random: no hardware RNG on this machine"); break; }
         }
     }
     Ok(())
@@ -10549,7 +10614,9 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
 
     // Stage 1 - produce a Stream.
     let (c0, _) = split_first(stages[0]);
-    let mut s = if is_record_producer(c0) {
+    // `wifi list` is the one `wifi` verb that is a table; `status`, `info` and the rest are labelled lines.
+    let wifi_records = c0 == "wifi" && split_first(stages[0]).1.trim() == "list";
+    let mut s = if is_record_producer(c0) || wifi_records {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
             "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -10559,6 +10626,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
             "jobs"    => build_jobs_table(ctx),
+            "wifi"    => match build_wifi_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
             // `events ipc` / `events failures` are record sources; the other subcommands are readers
             // of live kernel state that print a tree, and a tree is not a table. Piping one of those
             // is refused loudly rather than quietly yielding the wrong thing.
@@ -10608,11 +10676,9 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             Err(why) => { ctx.console_writeln_fmt(format_args!("{}: bad record stream - {}", c0, why)); return Err(ShellError::Unknown); }
         }
     } else if is_producer_builtin(c0) {
-        if c0 == "wifi" {
-            if let Some(why) = wifi_pipe_refusal(split_first(stages[0]).1) {
-                ctx.console_writeln(why);
-                return Err(ShellError::Unknown);
-            }
+        if let Some(why) = producer_refusal(c0, split_first(stages[0]).1) {
+            ctx.console_writeln(why);
+            return Err(ShellError::Unknown);
         }
         let mut cap = Cap::new();
         if !run_producer(ctx, cwd, stages[0], &mut Out::Capture(&mut cap)) {
@@ -13545,7 +13611,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
                  | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help"
-                 | "wifi")
+                 | "wifi" | "random" | "tcp" | "churn")
 }
 
 /// Which `wifi` verbs may start a pipe: the REPORTS, whose value is their output (`utilities/56_wifi.md`
@@ -13558,6 +13624,18 @@ fn wifi_pipe_refusal(arg: &str) -> Option<&'static str> {
         "list" | "stored" | "status" | "info" | "debug" | "version" => None,
         "" => Some("pipe: bare 'wifi' prints its usage, which is not data - pipe a report: wifi list, stored, status, info or debug"),
         _ => Some("pipe: that 'wifi' verb is an action, not a report, so it cannot start a pipe - the reports are: wifi list, stored, status, info and debug"),
+    }
+}
+
+/// A producer whose verbs are not all reports: the sentence refusing this one, or `None` to run it. `wifi`
+/// and `churn` are the two - `churn <seconds>`, `tear` and `reset` change the disk and narrate it, while
+/// `churn verify` is the verdict a power-cut test exists to read (`churn verify | write /verdict.txt`).
+fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
+    match cmd {
+        "wifi" => wifi_pipe_refusal(arg),
+        "churn" if arg.split_whitespace().next() == Some("verify") => None,
+        "churn" => Some("pipe: only 'churn verify' is a report - 'churn <seconds>', 'tear' and 'reset' are actions and cannot start a pipe"),
+        _ => None,
     }
 }
 
@@ -13596,6 +13674,14 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) -> bool
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
         "wifi"         => return cmd_wifi(ctx, arg, out).is_ok(),
+        "random"       => { let _ = cmd_random(ctx, arg, out); }
+        "tcp"          => {
+            let mut a = [""; MAX_ARGS];
+            let n = tokenize(cmdline, &mut a);
+            let _ = cmd_tcp(ctx, &a[..n], out);
+        }
+        // Only `verify` gets here (`producer_refusal`).
+        "churn"        => { let _ = cmd_churn_verify(ctx, out); }
         "ping"         => { let _ = cmd_ping(ctx, arg, out); }
         "sock"         => { let _ = cmd_sock(ctx, out); }
         "help"         => help_to_out(ctx, out),
@@ -13625,11 +13711,9 @@ fn run_captured(ctx: &ShellCtx, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
     }
     let (c0, rest) = split_first(inner);
     if is_producer_builtin(c0) {
-        if c0 == "wifi" {
-            if let Some(why) = wifi_pipe_refusal(rest) {
-                ctx.console_writeln(why);
-                return false;
-            }
+        if let Some(why) = producer_refusal(c0, rest) {
+            ctx.console_writeln(why);
+            return false;
         }
         return run_producer(ctx, cwd, inner, out);
     }

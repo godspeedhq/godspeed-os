@@ -55,6 +55,13 @@ pub enum Value {
     Str { off: u32, len: u32 },
     /// An unsigned integer.
     Int(u64),
+    /// A SIGNED integer: a reading that can be below zero. Pulled into existence by `wifi list`, whose
+    /// signal is in dBm - always negative - and is the raw fact (`utilities/0_conventions.md` rule 7):
+    /// the magnitude would be a different number, and a string would sort by bytes, which orders
+    /// `-9` after `-80`. Its own variant rather than a change to `Int`, so every count, size and tick
+    /// keeps the type it had. Compares numerically with `Int` (`sort`, `where`); not summed by the
+    /// aggregators unless it is non-negative.
+    Signed(i64),
     /// An absent / null cell.
     Empty,
 }
@@ -244,6 +251,7 @@ impl Table {
     fn cell_num(&self, v: Value) -> Option<u64> {
         match v {
             Value::Int(n) => Some(n),
+            Value::Signed(n) => u64::try_from(n).ok(),
             Value::Str { off, len } => {
                 let b = &self.arena[off as usize..(off + len) as usize];
                 if b.is_empty() { return None; }
@@ -258,15 +266,39 @@ impl Table {
         }
     }
 
+    /// A cell as a number for the aggregators, signed or not: `i128` holds every `u64` and every `i64`
+    /// exactly. A `Str` of ASCII digits, with an optional leading `-`, counts; anything else is `None`.
+    fn cell_num_wide(&self, v: Value) -> Option<i128> {
+        match v {
+            Value::Int(n) => Some(n as i128),
+            Value::Signed(n) => Some(n as i128),
+            Value::Str { off, len } => {
+                let b = &self.arena[off as usize..(off + len) as usize];
+                let (neg, digits) = match b.split_first() {
+                    Some((b'-', rest)) => (true, rest),
+                    _ => (false, b),
+                };
+                if digits.is_empty() || !digits.iter().all(|c| c.is_ascii_digit()) { return None; }
+                let mut acc: i128 = 0;
+                for &c in digits {
+                    acc = acc.saturating_mul(10).saturating_add((c - b'0') as i128);
+                }
+                Some(if neg { -acc } else { acc })
+            }
+            Value::Empty => None,
+        }
+    }
+
     /// Reduce a numeric column to a scalar (§5). Loud: `NoColumn` if `col` is not a column,
     /// `NonNumeric` if any cell is not a number - never a silent 0. Empty table reduces to 0.
-    /// `avg` is integer (floor).
-    pub fn aggregate(&self, col: &str, op: AggOp) -> Result<u64, AggErr> {
+    /// `avg` is integer, truncated toward zero. Signed columns reduce too (`wifi list | max dbm` is the
+    /// strongest signal), which is why the result is wide.
+    pub fn aggregate(&self, col: &str, op: AggOp) -> Result<i128, AggErr> {
         let ci = self.col_index(col).ok_or(AggErr::NoColumn)?;
         if self.nrows == 0 { return Ok(0); }
-        let (mut sum, mut mn, mut mx) = (0u64, u64::MAX, 0u64);
+        let (mut sum, mut mn, mut mx) = (0i128, i128::MAX, i128::MIN);
         for r in 0..self.nrows {
-            let n = self.cell_num(self.rows[r][ci]).ok_or(AggErr::NonNumeric)?;
+            let n = self.cell_num_wide(self.rows[r][ci]).ok_or(AggErr::NonNumeric)?;
             sum = sum.saturating_add(n);
             if n < mn { mn = n; }
             if n > mx { mx = n; }
@@ -275,7 +307,7 @@ impl Table {
             AggOp::Sum => sum,
             AggOp::Min => mn,
             AggOp::Max => mx,
-            AggOp::Avg => sum / self.nrows as u64,
+            AggOp::Avg => sum / self.nrows as i128,
         })
     }
 
@@ -342,7 +374,7 @@ impl Table {
                 out.put(self.col_name(c));
                 out.put(b"\": ");
                 match self.rows[r][c] {
-                    Value::Int(_) => {
+                    Value::Int(_) | Value::Signed(_) => {
                         let mut b = [0u8; 24];
                         let n = fmt_cell(self, self.rows[r][c], &mut b);
                         out.put(&b[..n]);
@@ -426,8 +458,13 @@ impl Table {
                             while i < b.len() && !matches!(b[i], b',' | b'}' | b' ' | b'\t' | b'\n' | b'\r') { i += 1; }
                             v = t.intern(&b[s..i]);
                         } else {
-                            v = core::str::from_utf8(&b[s..i]).ok().and_then(|x| x.parse::<u64>().ok())
-                                .map(Value::Int).unwrap_or(Value::Empty);
+                            // A negative integer is a Signed cell; it used to fail the u64 parse and
+                            // arrive as null, silently.
+                            let txt = core::str::from_utf8(&b[s..i]).ok();
+                            v = match txt.and_then(|x| x.parse::<u64>().ok()) {
+                                Some(n) => Value::Int(n),
+                                None => txt.and_then(|x| x.parse::<i64>().ok()).map(Value::Signed).unwrap_or(Value::Empty),
+                            };
                         }
                     } else {
                         return Err("unsupported value (nested objects/arrays not supported)");
@@ -485,6 +522,7 @@ impl Table {
                 match self.rows[r][c] {
                     Value::Empty => out.put(&[0u8]),
                     Value::Int(i) => { out.put(&[1u8]); out.put(&i.to_le_bytes()); }
+                    Value::Signed(i) => { out.put(&[3u8]); out.put(&i.to_le_bytes()); }
                     Value::Str { .. } => {
                         let s = self.cell_str(self.rows[r][c]);
                         out.put(&[2u8]);
@@ -528,6 +566,12 @@ impl Table {
                         let mut a = [0u8; 8];
                         a.copy_from_slice(&b[p..p + 8]); p += 8;
                         Value::Int(u64::from_le_bytes(a))
+                    }
+                    3 => {
+                        if p + 8 > b.len() { return Err("truncated record (signed int)"); }
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(&b[p..p + 8]); p += 8;
+                        Value::Signed(i64::from_le_bytes(a))
                     }
                     2 => {
                         if p + 2 > b.len() { return Err("truncated record (string length)"); }
@@ -586,24 +630,35 @@ fn fmt_cell(t: &Table, v: Value, buf: &mut [u8; 24]) -> usize {
             buf[..n].copy_from_slice(&s[..n]);
             n
         }
-        Value::Int(i) => {
-            let mut tmp = [0u8; 20];
-            let mut p = tmp.len();
-            let mut x = i;
-            loop { p -= 1; tmp[p] = b'0' + (x % 10) as u8; x /= 10; if x == 0 { break; } }
-            let n = tmp.len() - p;
-            buf[..n].copy_from_slice(&tmp[p..]);
-            n
+        Value::Int(i) => fmt_u64(i, buf),
+        Value::Signed(i) if i < 0 => {
+            buf[0] = b'-';
+            let mut rest = [0u8; 24];
+            let n = fmt_u64(i.unsigned_abs(), &mut rest);
+            buf[1..1 + n].copy_from_slice(&rest[..n]);
+            1 + n
         }
+        Value::Signed(i) => fmt_u64(i as u64, buf),
         Value::Empty => 0,
     }
+}
+
+/// `x` in decimal at the front of `buf`; returns the length.
+fn fmt_u64(x: u64, buf: &mut [u8; 24]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut p = tmp.len();
+    let mut x = x;
+    loop { p -= 1; tmp[p] = b'0' + (x % 10) as u8; x /= 10; if x == 0 { break; } }
+    let n = tmp.len() - p;
+    buf[..n].copy_from_slice(&tmp[p..]);
+    n
 }
 
 /// Display width of a cell: a string's full arena length, else its formatted (numeric) length.
 fn cell_width(t: &Table, v: Value) -> usize {
     match v {
         Value::Str { len, .. } => len as usize,
-        Value::Int(_) => { let mut b = [0u8; 24]; fmt_cell(t, v, &mut b) }
+        Value::Int(_) | Value::Signed(_) => { let mut b = [0u8; 24]; fmt_cell(t, v, &mut b) }
         Value::Empty => 0,
     }
 }
@@ -611,12 +666,13 @@ fn cell_width(t: &Table, v: Value) -> usize {
 /// Does row `r`'s column `ci` satisfy `<op> val`? Numeric if both are numbers, else textual.
 fn row_matches(t: &Table, r: usize, ci: usize, op: &str, val: &str) -> bool {
     let cell = t.rows[r][ci];
-    let cell_num = match cell {
-        Value::Int(i) => Some(i),
-        Value::Str { .. } => core::str::from_utf8(t.cell_str(cell)).ok().and_then(|s| s.parse::<u64>().ok()),
+    let cell_num: Option<i128> = match cell {
+        Value::Int(i) => Some(i as i128),
+        Value::Signed(i) => Some(i as i128),
+        Value::Str { .. } => core::str::from_utf8(t.cell_str(cell)).ok().and_then(|s| s.parse::<i128>().ok()),
         Value::Empty => None,
     };
-    if let (Some(cn), Ok(vn)) = (cell_num, val.parse::<u64>()) {
+    if let (Some(cn), Ok(vn)) = (cell_num, val.parse::<i128>()) {
         return match op {
             "=" | "==" => cn == vn,
             "!=" => cn != vn,
@@ -642,10 +698,15 @@ fn val_str<'a>(v: Value, arena: &'a [u8]) -> &'a [u8] {
     match v { Value::Str { off, len } => &arena[off as usize..(off + len) as usize], _ => &[] }
 }
 
-/// Order two cells: numeric when both are ints, else by bytes.
+/// Order two cells: numeric when both are integers (signed or not), else by bytes.
 fn cmp_values(a: Value, b: Value, arena: &[u8]) -> Ordering {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(&y),
+    let num = |v: Value| match v {
+        Value::Int(x) => Some(x as i128),
+        Value::Signed(x) => Some(x as i128),
+        _ => None,
+    };
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
         _ => val_str(a, arena).cmp(val_str(b, arena)),
     }
 }
