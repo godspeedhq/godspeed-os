@@ -41,7 +41,7 @@
 
 use godspeed_sdk::ServiceContext;
 
-use crate::host::Host;
+use godspeed_wifi::sdio::SdioHost;
 use crate::sdio;
 
 /// Function 1's own control registers. Above the window, so reaching them never disturbs it.
@@ -213,7 +213,7 @@ impl Window {
     /// Writes only the bytes that CHANGE, which is what `brcmf_sdiod_set_backplane_window` does and
     /// for the same reason: each one is a command on a bus, and three commands per register read would
     /// dominate a firmware upload made of thousands of them.
-    fn set(&mut self, h: &Host, addr: u32, ctx: &ServiceContext) -> bool {
+    fn set(&mut self, h: &dyn SdioHost, addr: u32, ctx: &ServiceContext) -> bool {
         let base = addr & WINDOW_MASK;
         if self.0 == Some(base) {
             return true;
@@ -289,7 +289,7 @@ impl Window {
     }
 
     /// Read one 32-bit backplane register.
-    pub fn read32(&mut self, h: &Host, addr: u32, ctx: &ServiceContext) -> Option<u32> {
+    pub fn read32(&mut self, h: &dyn SdioHost, addr: u32, ctx: &ServiceContext) -> Option<u32> {
         if !self.set(h, addr, ctx) {
             return None;
         }
@@ -302,7 +302,7 @@ impl Window {
     /// `brcmf_sdiod_ramrw` and `cyw43_download_resource` both do. `set` is private because the window is an
     /// implementation detail of a read or a write; this is the one caller that legitimately needs it on its
     /// own, and it says so by name.
-    pub fn set_for(&mut self, h: &Host, addr: u32, ctx: &ServiceContext) -> bool {
+    pub fn set_for(&mut self, h: &dyn SdioHost, addr: u32, ctx: &ServiceContext) -> bool {
         self.set(h, addr, ctx)
     }
 
@@ -310,7 +310,7 @@ impl Window {
     ///
     /// Same window discipline as the read, and the same wide-access flag: the bridge is being asked for a
     /// four-byte access rather than a single byte.
-    pub fn write32(&mut self, h: &Host, addr: u32, val: u32, ctx: &ServiceContext) -> Option<()> {
+    pub fn write32(&mut self, h: &dyn SdioHost, addr: u32, val: u32, ctx: &ServiceContext) -> Option<()> {
         if !self.set(h, addr, ctx) {
             return None;
         }
@@ -327,7 +327,7 @@ impl Window {
 ///
 /// Bounded, and the bound is reported. A chip that never grants the clock is a real condition and
 /// silently continuing into a register read would produce a number that means nothing.
-pub fn wake(h: &Host, ctx: &ServiceContext) -> bool {
+pub fn wake(h: &dyn SdioHost, ctx: &ServiceContext) -> bool {
     if sdio::write_reg(h, 1, f1::CHIPCLKCSR, clk::INIT).is_none() {
         ctx.log_fmt(format_args!(
             "wifi-driver: the write to CHIPCLKCSR was refused - INT={:#010x}. Function 1 reported \
@@ -420,7 +420,7 @@ pub fn wake(h: &Host, ctx: &ServiceContext) -> bool {
 /// Bounded at 100 polls a millisecond apart, and the outcome is said either way. If HT never comes, the
 /// ALP word `wake` wrote goes back, so the backplane keeps the clock it has always had and the caller
 /// carries on exactly as before - a slower clock is not a reason to stop (docs/wifi.md 54).
-pub fn request_ht(h: &Host, ctx: &ServiceContext) -> bool {
+pub fn request_ht(h: &dyn SdioHost, ctx: &ServiceContext) -> bool {
     const HT_TRIES: u32 = 100;
     let before = sdio::read_reg(h, 1, f1::CHIPCLKCSR);
     if sdio::write_reg(h, 1, f1::CHIPCLKCSR, clk::HT_AVAIL_REQ).is_none() {
@@ -452,7 +452,7 @@ pub fn request_ht(h: &Host, ctx: &ServiceContext) -> bool {
 
 /// Withdraw every clock request and force - Linux's `brcmf_sdio_htclk(bus, false, ..)`, which writes 0,
 /// reached from `clkctl(CLK_SDONLY)` once the ARM is running. The firmware owns its clocks from here.
-pub fn release_clock(h: &Host, ctx: &ServiceContext) {
+pub fn release_clock(h: &dyn SdioHost, ctx: &ServiceContext) {
     let before = sdio::read_reg(h, 1, f1::CHIPCLKCSR);
     let ok = sdio::write_reg(h, 1, f1::CHIPCLKCSR, 0).is_some();
     ctx.log_fmt(format_args!(
@@ -474,7 +474,7 @@ pub fn release_clock(h: &Host, ctx: &ServiceContext) {
 ///
 /// Note the address has NO wide-access flag: these are genuine single-byte reads at consecutive window
 /// offsets, which is the only shape CMD52 has.
-pub fn chip_id_via_cmd52(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ChipId> {
+pub fn chip_id_via_cmd52(h: &dyn SdioHost, w: &mut Window, ctx: &ServiceContext) -> Option<ChipId> {
     if !w.set(h, CHIPCOMMON_BASE, ctx) {
         return None;
     }
@@ -532,7 +532,7 @@ pub fn chip_id_via_cmd52(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Opti
 }
 
 /// Read the chipcommon core's identity register - the answer this whole module is for.
-pub fn chip_id(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<ChipId> {
+pub fn chip_id(h: &dyn SdioHost, w: &mut Window, ctx: &ServiceContext) -> Option<ChipId> {
     let raw = match w.read32(h, CHIPCOMMON_BASE, ctx) {
         Some(v) => v,
         None => {

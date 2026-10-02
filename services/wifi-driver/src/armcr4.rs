@@ -39,7 +39,7 @@
 use godspeed_sdk::ServiceContext;
 
 use crate::backplane::Window;
-use crate::host::Host;
+use godspeed_wifi::sdio::SdioHost;
 
 /// Register offsets from the CR4 core's base, quoted from `chip.c`.
 mod reg {
@@ -101,7 +101,7 @@ pub struct Ram {
 /// `core_base` is the CR4's register base from the EROM walk - **not** its wrapper, which this does not
 /// need and which that walk did not find.
 pub fn probe(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     core_base: u32,
     chip_id: u16,

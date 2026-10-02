@@ -25,7 +25,7 @@
 use godspeed_sdk::ServiceContext;
 
 use crate::backplane::Window;
-use crate::host::Host;
+use godspeed_wifi::sdio::SdioHost;
 
 /// `eromptr` in chipcommon: the backplane address at which the core table lives.
 ///
@@ -209,7 +209,7 @@ pub struct Cores {
 ///
 /// Returns `None` if the read itself failed, which is different from a descriptor that says EOT - a caller
 /// must not treat a dead bus as the end of a table.
-fn get_desc(h: &Host, w: &mut Window, at: &mut u32, ctx: &ServiceContext) -> Option<(u32, u8)> {
+fn get_desc(h: &dyn SdioHost, w: &mut Window, at: &mut u32, ctx: &ServiceContext) -> Option<(u32, u8)> {
     /// A bound, because the loop below is driven by values the CHIP supplies. An EMPTY run longer than
     /// this is a table that is not a table.
     const MAX_EMPTY: u32 = 64;
@@ -229,7 +229,7 @@ fn get_desc(h: &Host, w: &mut Window, at: &mut u32, ctx: &ServiceContext) -> Opt
 ///
 /// Returns `None` when the entry has no usable address pair, which the reference treats as "skip this
 /// core" rather than as a failure - so a caller continues.
-fn get_regaddr(h: &Host, w: &mut Window, at: &mut u32, ctx: &ServiceContext) -> Option<(u32, u32)> {
+fn get_regaddr(h: &dyn SdioHost, w: &mut Window, at: &mut u32, ctx: &ServiceContext) -> Option<(u32, u32)> {
     let (_, d) = get_desc(h, w, at, ctx)?;
     let wraptype = if d == desc::MASTER_PORT {
         slave::TYPE_MWRAP
@@ -329,7 +329,7 @@ fn get_regaddr(h: &Host, w: &mut Window, at: &mut u32, ctx: &ServiceContext) -> 
 }
 
 /// Walk the EROM and report every core, returning the two a firmware upload needs.
-pub fn scan(h: &Host, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
+pub fn scan(h: &dyn SdioHost, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
     let eromaddr_reg = crate::backplane::CHIPCOMMON_BASE + CC_EROMPTR;
     let mut at = match w.read32(h, eromaddr_reg, ctx) {
         Some(v) if v != 0 && v != 0xFFFF_FFFF => v,

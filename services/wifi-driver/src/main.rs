@@ -58,6 +58,7 @@ use godspeed_sdk::{Message, ServiceContext};
 // The chip-independent half, shared with every radio driver (`sdk/wifi`). Imported at the root so the
 // modules here keep writing `crate::crypto` and friends.
 use godspeed_wifi::{crypto, eapol, keyfile};
+use godspeed_wifi::sdio::SdioHost;
 
 /// Once identification is over, this is the clock to run at.
 ///
@@ -101,13 +102,13 @@ const POWER_ON_SETTLE_MS: u64 = 300;
 /// chip's own power-on before its SDIO side answers - and live here and not in the kernel because they
 /// are facts about this chip, not about power (26.10). `false` means the kernel has no control over
 /// this device's power on this machine - the caller then does what it can without.
-pub(crate) fn power_cycle_device(ctx: &ServiceContext, h: &host::Host) -> bool {
+pub(crate) fn power_cycle_device(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
     power_cycle_device_ms(ctx, h, POWER_OFF_MS)
 }
 
 /// The three settings Linux's brcmfmac writes after making the cores passive and before downloading the
 /// firmware (`brcmf_sdio_probe_attach`, read 2026-10-01). Each is read back and said; none is fatal.
-fn linux_pre_download(h: &host::Host, w: &mut backplane::Window, cores: Option<&erom::Cores>, ctx: &ServiceContext) {
+fn linux_pre_download(h: &dyn SdioHost, w: &mut backplane::Window, cores: Option<&erom::Cores>, ctx: &ServiceContext) {
     // KSO, keep-SDIO-on (`brcmf_sdio_kso_init`): SDIO device core rev >= 12 only; F1 SLEEPCSR bit 0.
     const SLEEPCSR: u32 = 0x1_001F;
     const KSO_EN: u8 = 0x01;
@@ -217,7 +218,7 @@ fn clock_release(ctx: &ServiceContext, lease: Option<u8>) {
 
 /// After a cut: is the chip really unpowered? It waits for the rail to fall, brings the host back long
 /// enough for one CMD52, and parks it again. `true` means the chip still answers - the cut did NOT take.
-fn chip_still_answers(ctx: &ServiceContext, h: &host::Host) -> bool {
+fn chip_still_answers(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
     const RAIL_FALL_MS: u64 = 50;
     ctx.sleep_ms(RAIL_FALL_MS);
     let answers = h.reset(ctx) && sdio::initialised_card_answers(h);
@@ -226,7 +227,7 @@ fn chip_still_answers(ctx: &ServiceContext, h: &host::Host) -> bool {
 }
 
 /// The verdict on a hard off, said in the log and returned for reply byte 3.
-fn verify_hard_off(ctx: &ServiceContext, h: &host::Host) -> u8 {
+fn verify_hard_off(ctx: &ServiceContext, h: &dyn SdioHost) -> u8 {
     if chip_still_answers(ctx, h) {
         ctx.log("wifi-driver: `wifi radio off hard` - the pin was driven low but the chip STILL ANSWERS on its bus: its power did not go off");
         scan::reply::OFF_CONTRADICTED
@@ -242,7 +243,7 @@ fn verify_hard_off(ctx: &ServiceContext, h: &host::Host) -> u8 {
 /// host while the power was off. The host is left parked: its next user brings it back from reset after
 /// this delay, which is Linux's order (power first, the init clock after). `false` means the kernel refused.
 /// (docs/wifi.md 48: the park did not by itself make the start cold.)
-pub(crate) fn power_on_device(ctx: &ServiceContext, h: &host::Host) -> bool {
+pub(crate) fn power_on_device(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
     h.park(ctx);
     if !ctx.device_power(true) {
         return false;
@@ -253,7 +254,7 @@ pub(crate) fn power_on_device(ctx: &ServiceContext, h: &host::Host) -> bool {
 
 /// `power_cycle_device` with the hold-off chosen by the caller (`wifi radio powercycle` asks for a fixed
 /// 2 s): the shell decides how long, this decides how.
-pub(crate) fn power_cycle_device_ms(ctx: &ServiceContext, h: &host::Host, off_ms: u64) -> bool {
+pub(crate) fn power_cycle_device_ms(ctx: &ServiceContext, h: &dyn SdioHost, off_ms: u64) -> bool {
     if !ctx.device_power(false) {
         return false;
     }
@@ -284,7 +285,7 @@ fn requested_off_ms(payload: &[u8]) -> u64 {
     }
 }
 
-fn serve_unavailable(ctx: &ServiceContext, h: Option<&host::Host>) -> ! {
+fn serve_unavailable(ctx: &ServiceContext, h: Option<&dyn SdioHost>) -> ! {
     // `wifi radio off hard` from here leaves the chip powered down, and from then on this loop answers the
     // way `serve_radio`'s powered-off arms do, so the shell sees one shape for one state whichever loop
     // holds it. `h` is `None` only where no SDIO window was granted, and there no power op can be made.
@@ -409,7 +410,7 @@ fn tagged_reply(tag: Option<u8>, body: &[u8]) -> Message {
 /// `nic-driver`'s bound on it is short for exactly that reason.
 fn serve_radio(
     ctx: &ServiceContext,
-    h: &host::Host,
+    h: &dyn SdioHost,
     w: &mut backplane::Window,
     mut radio: Option<ctrl::Session>,
     down_reason: u8,
@@ -481,7 +482,7 @@ fn serve_radio(
     /// from `/wifi.keys`. `None` when there is no key for a WPA2 name (nothing was attempted); otherwise
     /// the join's outcome, with the driver's memory of the link updated either way.
     fn join_known(
-        h: &host::Host,
+        h: &dyn SdioHost,
         w: &mut backplane::Window,
         session: &mut ctrl::Session,
         name: &[u8; join::MAX_SSID],

@@ -102,7 +102,7 @@
 use godspeed_sdk::ServiceContext;
 
 use crate::backplane::{Window, ACCESS_WIDE, CHIPCOMMON_BASE, OFFSET_MASK};
-use crate::host::{blk_block_mode, blk_byte_mode, Host};
+use godspeed_wifi::sdio::{blk_block_mode, blk_byte_mode, Geometry, SdioHost};
 use crate::sdio;
 use crate::sdio::{DATA_BLOCK, DATA_FUNC};
 
@@ -678,7 +678,7 @@ fn frame_offset() -> u32 {
 ///
 /// `round_to` already pads anything over 512 to a multiple of 512 - that is the reference's own rule - so a
 /// large frame is block-aligned before it gets here and only needs asking for correctly.
-fn transfer_mode(bytes: usize) -> (u32, Option<u32>, usize) {
+fn transfer_mode(bytes: usize) -> (Geometry, Option<u32>, usize) {
     if bytes > DATA_BLOCK as usize {
         // ROUNDED UP. Block mode cannot express a partial block, and a frame is not a block multiple: a
         // 1436-byte body is 2.8 blocks, and `bytes / DATA_BLOCK` truncates to 2 and silently loses 412
@@ -716,7 +716,7 @@ fn round_to(len: usize) -> usize {
 /// `name` is the iovar, NUL-terminated on the wire. `out` receives the payload the firmware returns,
 /// which for a query begins with the value asked for.
 pub fn query_iovar(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     name: &str,
@@ -738,7 +738,7 @@ pub fn query_iovar(
 /// payload sent is the structure the answer is written back into (`brcmf_fil_cmd_data_get`). `inout` goes
 /// out as sent and comes back overwritten. Returns the reply payload length.
 pub fn query_cmd(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     cmd: u32,
@@ -760,7 +760,7 @@ pub fn query_cmd(
 /// length. `payload` is what goes out after the 16-byte dcmd header; `want` is the room the firmware is told
 /// it has for the answer, which lands in `out`. The two GET forms above are thin wrappers over this.
 fn query_raw(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     cmd: u32,
@@ -1050,7 +1050,7 @@ fn describe_frame(which: u32, f: &Frame, buf: &[u8], ctx: &ServiceContext) {
 /// FIFO looks, and the reference treats it the same way. It is therefore SILENT - logging every empty poll
 /// would bury the frames that do arrive.
 pub fn read_frame(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     buf: &mut [u8; FRAME],
     ctx: &ServiceContext,
@@ -1178,7 +1178,7 @@ pub fn read_frame(
 /// The reply is read and its request id checked, because a set that the firmware refuses must not look like
 /// one it accepted (§26.7) - the whole point of asking is to find out.
 pub fn set_iovar(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     name: &str,
@@ -1216,7 +1216,7 @@ pub fn set_iovar(
 /// **The reply decides.** A command whose refusal is discarded is a silent failure (§26.7), and these
 /// commands are the ones that put the radio into a state - so "accepted" has to mean the firmware said so.
 pub fn set_cmd(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     cmd: u32,
@@ -1368,7 +1368,7 @@ impl Link {
 /// Three GETs that together are the truth of the link: BSSID, RSSI, chanspec. `None` only if the firmware
 /// would not answer the first; the other two degrade to zero with a log line, since an address with no
 /// signal reading is still an association.
-pub fn link_now(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> Option<Link> {
+pub fn link_now(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> Option<Link> {
     let mut bssid = [0u8; 6];
     query_cmd(h, w, s, CMD_GET_BSSID, &mut bssid, "bssid", ctx)?;
     let mut link = Link { bssid, rssi: 0, chanspec: 0 };
@@ -1409,7 +1409,7 @@ const BCDC_FLAGS_TX: u8 = 2 << 4;
 ///
 /// The frame goes only if the firmware has given credit (`tx_ok`); without it the reference queues, and
 /// this driver - which sends one frame at a time and only when a reply is due - refuses loudly instead.
-pub fn send_data(h: &Host, w: &mut Window, s: &mut Session, eth: &[u8], ctx: &ServiceContext) -> bool {
+pub fn send_data(h: &dyn SdioHost, w: &mut Window, s: &mut Session, eth: &[u8], ctx: &ServiceContext) -> bool {
     const BCDC: usize = 4;
     let len = HWHDR + SWHDR + BCDC + eth.len();
     if len > FRAME {
@@ -1489,7 +1489,7 @@ const WSEC_KEY_SIZE: usize = 164;
 /// address. `struct bwfm_wsec_key` is 164 bytes (162 of fields, 2 of tail padding), laid out as `bwfmreg.h`
 /// declares it; `ea` sits at 156.
 pub fn install_key(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     index: u32,
@@ -1519,24 +1519,24 @@ const CMD_SET_WSEC_AFTER_KEY: u32 = 134;
 
 /// Leave whatever network the radio is on. The reference sends the bare command with nothing after it, so
 /// so does this; the radio stays up and can scan or join again at once.
-pub fn disassoc(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
+pub fn disassoc(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
     set_cmd(h, w, s, CMD_DISASSOC, &[], "disassociate", ctx)
 }
 
 /// Power the radio down. `interface_up` is its opposite and re-runs the whole UP chain, which is what
 /// `bwfm_stop` does too (DOWN, then UP again with the mode commands between).
-pub fn radio_down(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
+pub fn radio_down(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
     set_cmd_int(h, w, s, CMD_DOWN, 1, "down", ctx)
 }
 
 /// Ask the firmware whether its interface is up: `Some(false)` is down, `None` no answer.
-pub fn is_up(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> Option<bool> {
+pub fn is_up(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> Option<bool> {
     let mut v = [0u8; 4];
     query_cmd(h, w, s, CMD_GET_UP, &mut v, "is the interface up", ctx)?;
     Some(u32::from_le_bytes(v) != 0)
 }
 
-pub fn interface_up(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
+pub fn interface_up(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
     // UP takes the VALUE 0, which reads oddly and is what the reference passes.
     if !set_cmd_int(h, w, s, CMD_UP, 0, "interface up", ctx) {
         return false;
@@ -1564,7 +1564,7 @@ pub fn interface_up(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceCont
 /// well-formed command carrying no value and did nothing with it - accepted, status 0, no effect, and a scan
 /// still refused with `BCME_NOTUP`. An integer command without its integer is not the command.
 pub fn set_cmd_int(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     cmd: u32,
@@ -1607,7 +1607,7 @@ pub fn set_cmd_int(
 /// is chunked either way. `DL_BEGIN` marks the first chunk and `DL_END` the last; a blob small enough for one
 /// chunk carries both, which is what the reference does too.
 pub fn download_blob(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     iovar: &str,
@@ -1720,7 +1720,7 @@ pub const DL_TYPE_CLM: u16 = 2;
 /// This is why the event channel has produced nothing so far, and it would have kept a correctly-accepted
 /// scan silent.
 pub fn enable_events(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     codes: &[u32],
@@ -1763,7 +1763,7 @@ pub fn enable_events(
 /// Returns true when a plausible address came back. All-zero and all-`0xFF` are rejected: both are what a
 /// successful exchange that returned nothing looks like, and reporting one as the radio's address would be
 /// exactly the silent wrong answer this driver keeps being built to avoid.
-pub fn report_mac(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
+pub fn report_mac(h: &dyn SdioHost, w: &mut Window, ctx: &ServiceContext) -> bool {
     ctx.log("wifi-driver: stage 13 - the first question put to the firmware");
 
     let mut session = Session::new(ctx);
@@ -1814,7 +1814,7 @@ pub fn report_mac(h: &Host, w: &mut Window, ctx: &ServiceContext) -> bool {
 /// refused -23 on this board, while Pi OS on the same chip family has the feature ON (its users turn it
 /// off with `feature_disable=0x2000`). So either this build lacks it or the SET differs from the GET Linux
 /// rests on. This asks the exact question, and prints the answer rather than deciding anything from it.
-pub fn report_firmware(h: &Host, w: &mut Window, s: &mut Session, ctx: &ServiceContext) {
+pub fn report_firmware(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) {
     /// Print a firmware string in pieces `log_fmt`'s fixed buffer can hold.
     fn log_text(label: &str, buf: &[u8], ctx: &ServiceContext) {
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());

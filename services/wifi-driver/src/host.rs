@@ -118,19 +118,7 @@ const C1_SRST_DATA: u32 = 1 << 26;
 /// implementations that puts something different there is not a position worth defending.
 const BLK_BOUNDARY: u32 = 7 << 12;
 
-/// `BLKSIZECNT` for a BYTE-mode transfer: one block of `bytes`.
-pub const fn blk_byte_mode(bytes: u32) -> u32 {
-    (1 << 16) | BLK_BOUNDARY | (bytes & 0xFFF)
-}
 
-/// `BLKSIZECNT` for a multi-BLOCK transfer: `blocks` blocks of `size` bytes.
-///
-/// Named rather than assembled at each call site. Building a register word out of parts is precisely the
-/// habit that cost this driver six boots on the chip clock CSR, and a block transfer has two fields where
-/// a byte transfer has one.
-pub const fn blk_block_mode(blocks: u32, size: u32) -> u32 {
-    ((blocks & 0xFFFF) << 16) | BLK_BOUNDARY | (size & 0xFFF)
-}
 
 /// A short delay. Spins rather than sleeps because these are microsecond-scale hardware settling gaps
 /// on a path that holds no lock and serves nobody yet; a count is not a duration (`arch/CLAUDE.md`),
@@ -494,7 +482,7 @@ impl<'a> Host<'a> {
     /// was applied to every command through one shared template. **R5 carries both**, and Linux sets
     /// both for it from `MMC_RSP_R5 = PRESENT | CRC | OPCODE` - see the per-command constants in
     /// `sdio.rs`, which now carry the values `sdhci_send_command` computes.
-    pub fn cmd(&self, code: u32, arg: u32) -> Option<u32> {
+    pub fn cmd_word(&self, code: u32, arg: u32) -> Option<u32> {
         self.cmd_inner(code, arg, None)
     }
 
@@ -585,7 +573,7 @@ impl<'a> Host<'a> {
     /// PIO, not DMA, for the two reasons `block-driver`'s backend gives: DMA on this SoC is not cache
     /// coherent without explicit maintenance, and these transfers are four bytes. Whether a firmware
     /// upload wants DMA is a MEASUREMENT for the phase that does one, not a guess for this one.
-    pub fn cmd_data(&self, code: u32, arg: u32, blk: u32, buf: &mut [u32], read: bool)
+    pub fn cmd_data_word(&self, code: u32, arg: u32, blk: u32, buf: &mut [u32], read: bool)
         -> Result<(), &'static str>
     {
         let bytes = buf.len() * 4;
@@ -738,5 +726,116 @@ impl<'a> Host<'a> {
             }
         }
         self.wr(INTERRUPT, self.rd(INTERRUPT));
+    }
+}
+
+// ------------------------------------------------------------- the shared protocol's host, on SDHCI
+
+use godspeed_wifi::sdio::{Cmd, Geometry, Resp, SdioHost, Xfer};
+
+/// A command in this controller's terms: the SDHCI `CMDTM` word, `index << 24 | flags << 16 | mode`.
+///
+/// flags: response type (0 none, 2 = 48-bit, 3 = 48-bit + busy) | `CMD_CRC` 0x08 | `CMD_INDEX` 0x10 |
+/// CMD_DATA 0x20. mode, for a data command: `TM_BLKCNT_EN` (the spec's `BLK_CNT_EN`) 0x02 | `TM_DAT_DIR` read 0x10 |
+/// `TM_MULTI_BLOCK` 0x20.
+///
+/// **Every field here was read off Linux rather than reasoned about, after two flashes lost to
+/// reasoning.** `sdhci_send_command` builds the flags from the mmc response flags and
+/// `sdhci_set_transfer_mode` the transfer mode. `TM_BLKCNT_EN` is set for ANY data command, single block
+/// included: the spec invites leaving it off for one block, and on hardware the card then ACCEPTED the
+/// transfer (R5 clean) while the controller ran no data phase at all. `CMD_CRC` and `CMD_INDEX` come from
+/// `MMC_RSP_R5 = PRESENT | CRC | OPCODE`; CMD5's R4 has neither, which is why they are per command (`godspeed_wifi::sdio::Cmd`).
+/// Were CMD3, CMD7 and CMD52 to turn their checks on, their words would be `0x031A_0000`, `0x071B_0000`
+/// and `0x341A_0000` - recorded so the choice is visible.
+const fn cmdtm(c: Cmd, x: Option<Xfer>) -> u32 {
+    let mut flags = match c.resp {
+        Resp::None => 0,
+        Resp::Short => 2,
+        Resp::ShortBusy => 3,
+    };
+    if c.check_crc {
+        flags |= 0x08;
+    }
+    if c.check_index {
+        flags |= 0x10;
+    }
+    let mut mode = 0;
+    if let Some(x) = x {
+        flags |= 0x20;
+        mode = 0x02;
+        if x.read {
+            mode |= 0x10;
+        }
+        if x.multi {
+            mode |= 0x20;
+        }
+    }
+    ((c.index as u32) << 24) | (flags << 16) | mode
+}
+
+/// A geometry in this controller's terms: `BLKSIZECNT`, `count << 16 | boundary | size`.
+const fn blksizecnt(g: Geometry) -> u32 {
+    ((g.count & 0xFFFF) << 16) | BLK_BOUNDARY | (g.size & 0xFFF)
+}
+
+// PINNED TO THE WORDS THIS DRIVER USED BEFORE THE TRAIT EXISTED, so moving to it changed nothing the
+// controller sees. Each is the value that worked on the Pi 4.
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::GO_IDLE, None) == 0x0000_0000);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_SEND_OP_COND, None) == 0x0502_0000);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::SEND_REL_ADDR, None) == 0x0302_0000);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::SELECT_CARD, None) == 0x0703_0000);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_DIRECT, None) == 0x3402_0000);
+const PIN_GEOM: Geometry = godspeed_wifi::sdio::blk_byte_mode(4);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_EXTENDED,
+    Some(Xfer { geom: PIN_GEOM, read: true, multi: false })) == 0x353A_0012);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_EXTENDED,
+    Some(Xfer { geom: PIN_GEOM, read: true, multi: true })) == 0x353A_0032);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_EXTENDED,
+    Some(Xfer { geom: PIN_GEOM, read: false, multi: false })) == 0x353A_0002);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_EXTENDED,
+    Some(Xfer { geom: PIN_GEOM, read: false, multi: true })) == 0x353A_0022);
+const _: () = assert!(blksizecnt(godspeed_wifi::sdio::blk_byte_mode(4)) == (1 << 16) | BLK_BOUNDARY | 4);
+const _: () = assert!(blksizecnt(godspeed_wifi::sdio::blk_block_mode(3, 512))
+    == (3 << 16) | BLK_BOUNDARY | 512);
+
+impl SdioHost for Host<'_> {
+    fn reset(&self, ctx: &ServiceContext) -> bool {
+        Host::reset(self, ctx)
+    }
+    fn park(&self, ctx: &ServiceContext) -> bool {
+        Host::park(self, ctx)
+    }
+    fn set_operating_clock(&self, hz: u32, ctx: &ServiceContext) -> bool {
+        Host::set_operating_clock(self, hz, ctx)
+    }
+    fn cmd(&self, c: Cmd, arg: u32) -> Option<u32> {
+        self.cmd_word(cmdtm(c, None), arg)
+    }
+    fn cmd_data(&self, c: Cmd, arg: u32, x: Xfer, buf: &mut [u32]) -> Result<(), &'static str> {
+        self.cmd_data_word(cmdtm(c, Some(x)), arg, blksizecnt(x.geom), buf, x.read)
+    }
+    fn status(&self) -> u32 {
+        Host::status(self)
+    }
+    fn last_int(&self) -> u32 {
+        Host::last_int(self)
+    }
+    fn last_resp(&self) -> u32 {
+        Host::last_resp(self)
+    }
+    fn last_setup(&self) -> (u32, u32) {
+        Host::last_setup(self)
+    }
+    fn last_ctrl0(&self) -> u32 {
+        Host::last_ctrl0(self)
+    }
+    fn seen(&self) -> (u32, u32) {
+        Host::seen(self)
+    }
+    fn dat_window(&self) -> (u32, u32) {
+        Host::dat_window(self)
+    }
+    fn take_waits(&self) -> (u64, u64) {
+        Host::take_waits(self)
     }
 }

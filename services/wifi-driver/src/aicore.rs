@@ -60,7 +60,7 @@
 use godspeed_sdk::ServiceContext;
 
 use crate::backplane::Window;
-use crate::host::Host;
+use godspeed_wifi::sdio::SdioHost;
 
 /// Register offsets inside a core's wrapper, quoted above.
 mod off {
@@ -84,7 +84,7 @@ mod bit {
 /// Returns false if the core does not report itself in reset afterwards, because every step after this one
 /// writes into memory that a running core also owns.
 pub fn disable(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     wrapper: u32,
     halt: bool,
@@ -163,7 +163,7 @@ pub const D11_PHYCLOCKEN: u32 = 0x0008;
 /// written out rather than shared so that `reset`, which every boot has exercised, is not edited to
 /// grow a parameter. Used for the 802.11 core before a firmware upload (`D11_PHYRESET`).
 pub fn reset_bits(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     wrapper: u32,
     prereset: u32,
@@ -246,7 +246,7 @@ pub fn reset_bits(
 ///
 /// The sequence is the reference's, in its order, including both read-backs and both 1 ms waits.
 pub fn reset(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     wrapper: u32,
     halt: bool,

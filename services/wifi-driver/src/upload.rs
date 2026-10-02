@@ -60,7 +60,7 @@ use crate::backplane;
 use crate::armcr4::Ram;
 use crate::backplane::{Window, ACCESS_WIDE, OFFSET_MASK};
 use crate::firmware;
-use crate::host::{blk_block_mode, blk_byte_mode, Host};
+use godspeed_wifi::sdio::{blk_block_mode, blk_byte_mode, SdioHost};
 use crate::sdio;
 
 /// Function 1's block size, as set in step 2 and as `SDIO_FUNC1_BLOCKSIZE` in brcmfmac.
@@ -80,7 +80,7 @@ const WINDOW: u32 = 0x8000;
 /// bounded chunk is the honest way to bridge that, rather than casting a `&[u8]` whose alignment nobody
 /// promised.
 pub fn write_bytes(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     addr: u32,
     data: &[u8],
@@ -274,7 +274,7 @@ pub fn nvram_prepare(text: &[u8], out: &mut [u8]) -> Option<usize> {
 /// reaches this point late in a longer sequence, while here it is milliseconds after release, so a
 /// firmware still starting would be called dead. If the word never changes that is REPORTED as a fact -
 /// a loaded chip whose firmware did not start is precisely the state worth naming (§26.7).
-fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, trapped: &mut bool, ctx: &ServiceContext) -> bool {
+fn firmware_alive(h: &dyn SdioHost, w: &mut Window, ram: &Ram, token: u32, trapped: &mut bool, ctx: &ServiceContext) -> bool {
     /// `SDPCM_SHARED_VERSION_MASK`.
     const VERSION_MASK: u32 = 0x0000_00FF;
     /// `SDPCM_SHARED_TRAP` - the firmware took a trap and filled in the record `trap_addr` points at.
@@ -369,7 +369,7 @@ fn firmware_alive(h: &Host, w: &mut Window, ram: &Ram, token: u32, trapped: &mut
     false
 }
 
-fn ladder(h: &Host, w: &mut Window, addr: u32, ctx: &ServiceContext) -> bool {
+fn ladder(h: &dyn SdioHost, w: &mut Window, addr: u32, ctx: &ServiceContext) -> bool {
     // Distinct per rung, so a read-back cannot pass on a stale value another rung left behind.
     const MARKS: [u32; 4] = [0xA1A1_0001, 0xB2B2_0002, 0xC3C3_0003, 0xD4D4_0004];
     // (name, blocks-or-none, words, what a failure here means)
@@ -439,7 +439,7 @@ fn ladder(h: &Host, w: &mut Window, addr: u32, ctx: &ServiceContext) -> bool {
 }
 
 pub fn run(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     arm_wrapper: u32,
     ram: &Ram,

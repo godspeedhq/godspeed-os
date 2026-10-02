@@ -13,6 +13,8 @@
 //!   against its published vector at start.
 //! - [`eapol`]: the WPA2 four-way handshake and the group-key rekey, run by the HOST on every radio.
 //! - [`keyfile`]: the credentials a join earned, kept in `/wifi.keys` across a restart.
+//! - [`sdio`]: the SDIO card protocol and the [`sdio::SdioHost`] trait every SDIO controller implements,
+//!   so the radios' code runs on the Pi 4's Arasan and the VisionFive 2's DesignWare host alike.
 //! - [`wire`]: the request/reply vocabulary between a radio driver and its clients (the shell's `wifi`,
 //!   `nic-driver`), so the shell and the driver read ONE definition rather than two copies of it.
 //!
@@ -32,4 +34,5 @@
 pub mod crypto;
 pub mod eapol;
 pub mod keyfile;
+pub mod sdio;
 pub mod wire;

@@ -72,7 +72,7 @@ use godspeed_sdk::ServiceContext;
 
 use crate::backplane::Window;
 use crate::ctrl;
-use crate::host::Host;
+use godspeed_wifi::sdio::SdioHost;
 
 /// `BWFM_SDIO_SWHDR_CHANNEL_MASK`.
 pub const CHANNEL_MASK: u8 = 0x0F;
@@ -757,7 +757,7 @@ pub enum Step {
 /// lets `wifi list`, `wifi status` and an abort be heard mid-sweep (rule 11), and a background sweep exist
 /// at all. `frame` is the caller's buffer, so the serve loop does not put 2 KiB on its stack per turn.
 pub fn step(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut ctrl::Session,
     scan: &mut Scan,
@@ -813,7 +813,7 @@ pub fn step(
 
 /// Ask the firmware to begin a sweep. True when `escan` was accepted; the results then arrive as events,
 /// which `step` reads. The decoded refusal, if any, is logged by `set_iovar` one line above this one's.
-pub fn start(h: &Host, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceContext) -> bool {
+pub fn start(h: &dyn SdioHost, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceContext) -> bool {
     let mut request = [0u8; req::SIZE];
     build_request(&mut request);
     if !ctrl::set_iovar(h, w, s, "escan", &request, ctx) {
@@ -834,7 +834,7 @@ pub fn start(h: &Host, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceConte
 /// Stop a running sweep, the way Linux does (`CMD_SCAN`): the escan params with `channel_num` 1 and a single
 /// channel of -1. True when the firmware accepted the command. The results heard so far are the caller's
 /// to discard - and it does, because a half-heard room is not the room.
-pub fn abort(h: &Host, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceContext) -> bool {
+pub fn abort(h: &dyn SdioHost, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceContext) -> bool {
     let mut full = [0u8; req::SIZE];
     build_request(&mut full);
     let mut params = [0u8; ABORT_SIZE];
@@ -846,7 +846,7 @@ pub fn abort(h: &Host, w: &mut Window, s: &mut ctrl::Session, ctx: &ServiceConte
 }
 
 pub fn collect(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut ctrl::Session,
     scan: &mut Scan,
@@ -897,7 +897,7 @@ pub const MAX_EMPTY_POLLS: u32 = 500;
 /// Split out of the boot self-test because `wifi scan` starts a sweep on request, and re-sending the CLM
 /// blob and the UP chain on every request would be wrong - the interface is already up. The bring-up
 /// happens here, once; `start` and `step` do the part that repeats, from the serve loop.
-pub fn bring_up(h: &Host, w: &mut Window, adopted: bool, ctx: &ServiceContext) -> Option<ctrl::Session> {
+pub fn bring_up(h: &dyn SdioHost, w: &mut Window, adopted: bool, ctx: &ServiceContext) -> Option<ctrl::Session> {
     let mut session = ctrl::Session::new(ctx);
 
     // THE CLM BLOB FIRST, and it is first for a reason rather than by habit. `bwfm_init` is preceded by
@@ -981,7 +981,7 @@ pub fn bring_up(h: &Host, w: &mut Window, adopted: bool, ctx: &ServiceContext) -
 /// Returns the `Scan` whatever it holds - an empty room is a result, not a failure - and `None` only when
 /// the firmware refused to start the scan at all, which its decoded error explains one line above.
 pub fn scan_once(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut ctrl::Session,
     ctx: &ServiceContext,
@@ -1005,7 +1005,7 @@ pub fn scan_once(
 /// Returns the session on ANY outcome past bring-up, because a scan that found nothing - or whose results
 /// did not parse - is still a radio that is up and can be asked again by the shell. Only a failed bring-up
 /// returns `None`, and then there is genuinely nothing to serve.
-pub fn run(h: &Host, w: &mut Window, adopted: bool, ctx: &ServiceContext) -> Option<ctrl::Session> {
+pub fn run(h: &dyn SdioHost, w: &mut Window, adopted: bool, ctx: &ServiceContext) -> Option<ctrl::Session> {
     // The "UNVERIFIED ON HARDWARE" banner that stood here was true when written and would have been a
     // lie from the first successful boot on. Ten networks, names and all, on 2026-09-28.
     ctx.log("wifi-driver: stage 14 - scanning");

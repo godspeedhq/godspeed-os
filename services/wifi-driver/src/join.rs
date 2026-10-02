@@ -61,7 +61,7 @@ use godspeed_sdk::ServiceContext;
 use crate::backplane::Window;
 use crate::ctrl::{self, Session};
 use crate::eapol::{self, info};
-use crate::host::Host;
+use godspeed_wifi::sdio::SdioHost;
 use crate::scan::{self, code, ev, status, CHANNEL_DATA, CHANNEL_EVENT, CHANNEL_MASK};
 
 /// `WLC_SET_AUTH` / `BRCMF_C_SET_AUTH`.
@@ -220,7 +220,7 @@ impl Handshake {
     /// One EAPOL-Key frame (a whole ethernet frame), from the access point.
     pub fn on_key_frame(
         &mut self,
-        h: &Host,
+        h: &dyn SdioHost,
         w: &mut Window,
         s: &mut Session,
         eth_frame: &[u8],
@@ -352,7 +352,7 @@ impl Handshake {
 
 /// Join `ssid`, run the handshake if there is one, install the keys, and say how it went.
 pub fn join(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     ssid: &[u8],

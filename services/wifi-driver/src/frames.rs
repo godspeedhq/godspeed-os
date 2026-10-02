@@ -26,7 +26,7 @@ use godspeed_sdk::ServiceContext;
 use crate::backplane::Window;
 use crate::ctrl::{self, Session};
 use crate::eapol::{self, info};
-use crate::host::Host;
+use godspeed_wifi::sdio::SdioHost;
 use crate::join::{Handshake, Keys, Step, EVENT_MSG_LINK};
 use crate::scan::{self, code, ev, CHANNEL_DATA, CHANNEL_EVENT, CHANNEL_MASK};
 
@@ -136,7 +136,7 @@ pub struct Pulled {
 /// header - queued, unless it is EAPOL, which is the rekey path) or an EVENT (read for the link). Anything
 /// else is counted by `note_frame` and left.
 pub fn pull(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     q: &mut RxQueue,
@@ -244,7 +244,7 @@ enum Rekey {
 /// (void)ieee80211_send_group_msg2(ic, ni, NULL);   /* info = KEYMIC | SECURE, replay copied, no data */
 /// ```
 fn group_rekey(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     eth_frame: &[u8],
@@ -346,7 +346,7 @@ const REKEY_EMPTY_POLLS: u32 = 2_000;
 /// association was made with. The keys are replaced in place on success; the access point drops the link
 /// on failure and the log names the step.
 fn pairwise_rekey(
-    h: &Host,
+    h: &dyn SdioHost,
     w: &mut Window,
     s: &mut Session,
     q: &mut RxQueue,

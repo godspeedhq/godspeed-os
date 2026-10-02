@@ -4007,3 +4007,14 @@ redistribution licence. For the AIC8800 it is not, and that is recorded rather t
 licence from AICSemi itself was found, only a packager's blanket claim (Radxa's `debian/copyright`) and a
 distribution's `freedist` label. And only one of Radxa's five copies matches what the board loads, so the
 files will come from the board's own vendor image when that phase arrives, with their provenance beside them.
+
+**Step 2a (the same day): the SDIO protocol is shared, and the host is a trait.** `sdk/wifi/src/sdio.rs`
+holds CMD52, CMD53, identification and the CIS walk, and an `SdioHost` trait the protocol speaks to in SDIO
+terms - a command index, a response type, whether to check CRC and index, a transfer's block size, count
+and direction. The Pi 4's Arasan implements it by encoding those into its own `CMDTM` and `BLKSIZECNT`,
+and the eleven words the driver used before are pinned at compile time, so the controller sees exactly
+what it saw. What stayed in the driver is what is Broadcom's: the data function and its block size, and
+the adopt-or-reset decision a respawn makes, which turns on the Broadcom firmware asserting function 2.
+One failure line in the shared code had compared the controller's words against SDHCI values; it prints
+the host's own words now. QEMU raspi4b: the driver's 27 log lines through identification and the power
+commands are identical to the run before.

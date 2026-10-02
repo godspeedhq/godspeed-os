@@ -58,7 +58,7 @@
 use godspeed_sdk::ServiceContext;
 
 use crate::backplane::{clk, f1, Window};
-use crate::host::Host;
+use godspeed_wifi::sdio::SdioHost;
 use crate::sdio;
 use crate::sdio::{DATA_BLOCK, DATA_FUNC};
 
@@ -83,7 +83,7 @@ const PROT_VERSION_SHIFT: u32 = 16;
 ///
 /// No `Window` here on purpose: `CHIPCLKCSR` is a function 1 register reached by CMD52, not a backplane
 /// address, so it needs no window at all.
-fn ht_clock(h: &Host, ctx: &ServiceContext) -> bool {
+fn ht_clock(h: &dyn SdioHost, ctx: &ServiceContext) -> bool {
     const HT_TRIES: u32 = 100;
 
     let before = match sdio::read_reg(h, 1, f1::CHIPCLKCSR) {
@@ -135,7 +135,7 @@ fn ht_clock(h: &Host, ctx: &ServiceContext) -> bool {
 ///
 /// `sdiod_base` is the SDIO device core's register base, which the EROM walk reports (`0x18004000` on this
 /// part). Both writes go through the backplane window like any other.
-fn announce_protocol(h: &Host, w: &mut Window, sdiod_base: u32, ctx: &ServiceContext) -> bool {
+fn announce_protocol(h: &dyn SdioHost, w: &mut Window, sdiod_base: u32, ctx: &ServiceContext) -> bool {
     // The reference clears INTSTATUS first, discarding bits the firmware's own start-up left set.
     if w.write32(h, sdiod_base + sdpcmd::INTSTATUS, 0xFFFF_FFFF, ctx).is_none() {
         ctx.log_fmt(format_args!(
@@ -168,7 +168,7 @@ fn announce_protocol(h: &Host, w: &mut Window, sdiod_base: u32, ctx: &ServiceCon
 /// Returns true only when function 2 reports itself READY, because that is the one outcome that makes a
 /// frame possible. The HT clock is reported but not required: the entire upload ran on ALP, so a chip that
 /// will not raise HT is degraded rather than dead, and refusing to continue would hide that distinction.
-pub fn bring_up(h: &Host, w: &mut Window, sdiod_base: u32, ctx: &ServiceContext) -> bool {
+pub fn bring_up(h: &dyn SdioHost, w: &mut Window, sdiod_base: u32, ctx: &ServiceContext) -> bool {
     ctx.log("wifi-driver: stage 12 - bringing the bus up for frames");
 
     let ht = ht_clock(h, ctx);
