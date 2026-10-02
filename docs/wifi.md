@@ -3935,3 +3935,36 @@ and a stopped one is power-cycled cold, every time.
 **Still open, and recorded rather than chased:** why a firmware uploaded with the cores at their minimum
 traps at `pc 0x25`. The fix does not depend on it - the dependence is measured and the lease removes it -
 but a board whose cores run slow for any other reason would show it again.
+
+## 58. Every request to the radio carries a tag, and the wifi reports pipe (2026-10-02)
+
+**Why.** A `Call` takes the oldest reply FROM the driver, not the reply to the request just sent, so an
+answer the shell had stopped waiting for was read as the next request's (sections 47 and 49 record the
+boots where that broke `powercycle`). The shell guarded against it by counting what the driver owed and
+skipping that many - and counted them by watching its reply mailbox, which takes every peer's replies.
+In QEMU a stray 2-byte reply from another service cancelled an owed radio answer, and the next `wifi
+status` printed the previous one's answer (`backlog/70`).
+
+**The tag.** The shell now sends `[0xE7, tag, op, ...]` (`scan::reply::TAGGED`), and the driver serves
+`[op, ...]` as before and sends its reply back as `[0xE7, tag, status, ...]` - stripped and re-applied in
+one place in each serve loop, so no arm changed. An untagged request is served exactly as it was, which is
+what `nic-driver`'s frame ops are. Every radio wait in the shell is a SIFTED wait on its main endpoint
+(`wifi_sift`): the reply carrying this request's tag ends it, a reply carrying an older tag is a late
+answer and is counted off what is owed, and anything else is dropped with any cap it carries released.
+The owed count is therefore exact, and a request held back while answers are owed says so: `wifi: not
+sent - the radio driver still owes 1 answer(s) to earlier requests`. Tab completion uses tag 0, which the
+shell's counter never hands out. No kernel change; the SDK gained the sifted form of its key-abortable
+wait (`request_with_reply_keyhint_sifted`), for the join and the power verbs.
+
+**QEMU** (`raspi4b`, a test-only driver answering `wifi status` 8 s late): the first request timed out and
+was owed, the second was held back with the `not sent` line, the third cleared the late answer by its tag
+(`1 of them late radio answers`) and was sent. **On the card** (boot 2026-10-02): every wifi verb as before,
+`chaos max-carnage` 50 rounds recovered, and none of the `reply cap is dead` lines `backlog/67` left.
+
+**The reports pipe.** `utilities/56_wifi.md` section 3 said `wifi list | count` worked; the shell refused
+it, because `wifi` was never on its list of pipe producers. It is now, for the REPORT verbs - `list`,
+`stored`, `status`, `info`, `debug`, `version`. The actions refuse with a sentence (`join` reads a
+passphrase from the console, and piped its prompt would vanish into the pipe), a report that fails puts
+its words on the console and stops the pipe, and an empty scan is zero rows in a pipe, not a row saying
+so. QEMU, with a test-only driver serving three canned networks: `wifi list | count` 3 lines, `| match
+WPA2` two, `| sort` sorted, the pipe at 29% of the shell's stack.

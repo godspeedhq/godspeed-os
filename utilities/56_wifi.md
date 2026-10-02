@@ -180,6 +180,14 @@ wifi list | count
 wifi list | write /networks.txt
 ```
 
+**The reports pipe; the actions do not.** `list`, `stored`, `status`, `info`, `debug` and `version` can start
+a pipe. `scan`, `join`, `leave`, `forget` and `radio ...` are actions, and refuse with a sentence that names
+the reports: their output is a conversation, not data - `join` reads a passphrase from the console, and in
+a pipe its prompt would disappear while it waited. A report that fails (no scan yet, a scan running, the
+radio down) says why on the CONSOLE and stops the pipe, and an empty scan gives a pipe no rows at all, so
+`wifi list | count` says 0 rather than counting the sentence. (Until 2026-10-02 this section described
+pipes the shell refused: `wifi` was not on its list of producers - `docs/wifi.md` 58.)
+
 Fields, in order: network, band, signal, security, note. Signal is the **dBm, a raw fact** (rule 7), with a
 word beside it that is a STATED RULE over the number, so a reader can check it: -50 dBm or stronger is
 `excellent`, to -60 `good`, to -70 `fair`, weaker is `weak`. The number is always printed; a reader given

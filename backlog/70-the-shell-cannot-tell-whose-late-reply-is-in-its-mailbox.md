@@ -1,7 +1,13 @@
 # 70. The shell counts what the radio driver owes it by counting replies in its mailbox, and every peer's replies land there
 
-**Status: OPEN - found 2026-10-02 in QEMU, reproduced on purpose. Not fixed: each fix is a change to a
-surface (the kernel's, or the driver's reply protocol) that the operator should choose.**
+**Status: CLOSED 2026-10-02 - fix 2 below, chosen by the operator.** Every shell request to the radio
+carries a tag and the driver echoes it (`docs/wifi.md` 58); every radio wait sifts by it, so a late answer
+is recognised as late and the owed count is exact. The reproduction below now holds the second request
+back (`not sent - ... still owes 1 answer`) and clears the late answer by its tag. On the card the same
+day: every wifi verb, and `chaos max-carnage` 50 rounds recovered.
+
+**Previous status: OPEN - found 2026-10-02 in QEMU, reproduced on purpose. Not fixed: each fix is a change
+to a surface (the kernel's, or the driver's reply protocol) that the operator should choose.**
 
 ## What the count is for
 

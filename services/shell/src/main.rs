@@ -417,6 +417,8 @@ pub struct ShellCtx {
     /// Non-zero when the last `wifi_ask` returned nothing WITHOUT SENDING, because the driver still owed
     /// this many earlier answers. `wifi_not_answering` reads it to say so instead of "not answering".
     wifi_unsent: core::cell::Cell<u32>,
+    /// The radio request correlation tag (see `next_wifi_tag`).
+    wifi_tag: core::cell::Cell<u8>,
     /// Byte 1 of the last `radio down` answer - WHY the driver says it is down (0 = it did not say).
     wifi_down_reason: core::cell::Cell<u8>,
     /// The job table: what `background` started, what `jobs` lists, what `foreground` attaches to.
@@ -455,6 +457,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         wifi_owed: core::cell::Cell::new(0),
         wifi_owed_since: core::cell::Cell::new(0),
         wifi_unsent: core::cell::Cell::new(0),
+        wifi_tag: core::cell::Cell::new(0),
         wifi_down_reason: core::cell::Cell::new(0),
         jobs: core::cell::RefCell::new(JobTable::new()),
     };
@@ -1046,13 +1049,16 @@ fn complete_wifi_stored(ctx: &ServiceContext, line: &mut Line, tok_start: usize)
     let mut store = [0u8; MAX * 32];
     let mut lens = [0usize; MAX];
     let mut count = 0usize;
-    let msg = Message::from_bytes(&[9u8]);
-    let reply = match ctx.request_with_reply_ms(WIFI_DRIVER, &msg, 1500) {
+    // Tagged and sifted like every radio request (`wifi_sift`), with the completion's own tag.
+    let msg = wifi_tagged(&[9u8], wifi_wire::COMPLETION_TAG);
+    let ours = |m: &Message| wifi_is_answer(m, Some(wifi_wire::COMPLETION_TAG));
+    let reply = match ctx.request_with_reply_ms_sifted(WIFI_DRIVER, &msg, 1500, ours) {
         Some(r) => Some(r),
-        None if ctx.reacquire_by_name(WIFI_DRIVER) => ctx.request_with_reply_ms(WIFI_DRIVER, &msg, 1500),
+        None if ctx.reacquire_by_name(WIFI_DRIVER) => ctx.request_with_reply_ms_sifted(WIFI_DRIVER, &msg, 1500, ours),
         None => None,
     };
     if let Some(r) = reply {
+        let r = wifi_untag(&r);
         let p = r.payload_bytes();
         if p.first() == Some(&0) && p.len() >= 2 {
             let n = core::cmp::min(p[1] as usize, MAX);
@@ -7626,6 +7632,12 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
 /// The `wifi-driver` request/reply vocabulary. The values are the driver's (`services/wifi-driver/src/scan.rs`,
 /// `mod reply`); these mirror them, one name each, so a byte is never written twice in this file.
 mod wifi_wire {
+    /// A tagged request is `[TAGGED, tag, op, ...]`, and its answer comes back `[TAGGED, tag, status, ...]`
+    /// (`scan::reply::TAGGED`): the tag is how a wait tells its own answer from a late one (`wifi_sift`).
+    pub const TAGGED: u8 = 0xE7;
+    /// The tag tab completion asks with. It runs without the shell's state, so it cannot draw from
+    /// `next_wifi_tag` - which never hands out 0, so the two cannot collide.
+    pub const COMPLETION_TAG: u8 = 0;
     pub const OP_LIST: u8 = 1;
     pub const OP_CONNECT: u8 = 2;
     pub const OP_SCAN_START: u8 = 3;
@@ -7712,77 +7724,68 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // `powercycle` kill the driver in the middle of its power cycle, leaving the chip unpowered. The shell
     // asks one thing at a time and reads keys from the kernel ring, so anything queued before a request
     // is stale by construction (`wifi_drain_stale`).
+    //
+    // AND EVERY ANSWER IS RECOGNISED BY ITS TAG (backlog/70). The drain could not clear an answer still in
+    // flight, so the shell COUNTED what it was owed and skipped that many - and counted them by watching
+    // its reply mailbox, which takes every peer's replies: a late `time` or `fs` answer cancelled an owed
+    // radio answer, and the next request read the old one (reproduced in QEMU, 2026-10-02). The tag is a
+    // fact in the reply itself. A request goes out as `[TAGGED, tag, op...]`, the wait takes only the reply
+    // carrying that tag, and a reply carrying an OLDER tag is the late answer it is - counted off `owed`
+    // by `wifi_sift`, which is now exact. The wait is the sifted one on the main endpoint, not the Call:
+    // a Call can only take the oldest reply FROM the driver, which is the very thing that is wrong.
     ctx.wifi_unsent.set(0);
-    let (stale, other) = wifi_drain_stale(ctx);
-    if stale + other > 0 {
+    let (late, other) = wifi_drain_stale(ctx);
+    if late + other > 0 {
         ctx.log_fmt(format_args!(
-            "shell: {} stale message(s) from earlier radio requests cleared before op {:#04x}",
-            stale + other, req.first().copied().unwrap_or(0)));
+            "shell: {} stale message(s) cleared before op {:#04x} ({} of them late radio answers)",
+            late + other, req.first().copied().unwrap_or(0), late));
     }
-    // THE DRAIN CANNOT CLEAR A REPLY STILL IN FLIGHT, so the shell also COUNTS what it is owed. A request
-    // that timed out is answered later by the driver, in order (it serves FIFO), and the matched-by-sender
-    // Call below would take that late answer as this request's. Boot 2026-10-01 14:30: the powercycle watch
-    // gave up on status polls while the driver brought a cold chip up, and the next requests read the late
-    // `radio down` as their own - attempts 2 and 3 "came up warm" within 150 ms of a respawn that had not
-    // even identified the chip. So: skip `owed` of the driver's replies, in order, then take ours.
-    let mut owed = ctx.wifi_owed.get().saturating_sub(stale);
-    // WAIT FOR WHAT IS STILL OWED, in the reply mailbox where it will land, and do not ask again until it
-    // has come. A driver that still owes answers is busy (bringing a chip up, typically) - queueing
-    // another request behind them is how this shell came to read a late `radio down` as a fresh answer.
-    // FORGIVEN AFTER A BOUND. An answer that never comes - the driver crashed and the supervisor, not this
-    // shell, respawned it; or it dropped the request - would hold `owed` above zero for ever, and no radio
-    // request would be sent again. Longer than a cold bring-up (~12-15 s), so a busy driver is not forgiven.
+    // WAIT FOR WHAT IS STILL OWED, and do not ask again until it has come. A driver that still owes answers
+    // is busy (bringing a chip up, typically), and a request queued behind them waits as long anyway while
+    // holding a slot of the driver's queue, which `nic-driver`'s frames share. Boot 2026-10-01 14:30: the
+    // powercycle watch gave up on status polls while the driver brought a cold chip up. FORGIVEN AFTER A
+    // BOUND: an answer that never comes - the driver crashed and the supervisor, not this shell, respawned
+    // it; or it dropped the request - would hold `owed` above zero for ever. Longer than a cold bring-up
+    // (~12-15 s), so a busy driver is not forgiven.
     const OWED_MAX_SECS: i64 = 30;
+    let owed = ctx.wifi_owed.get();
     if owed > 0 && ctx.epoch_secs_monotonic() - ctx.wifi_owed_since.get() > OWED_MAX_SECS {
         ctx.log_fmt(format_args!(
             "shell: {} radio answer(s) owed for over {} s never came - forgotten; asking afresh", owed, OWED_MAX_SECS));
-        owed = 0;
+        ctx.wifi_owed.set(0);
     }
-    if owed > 0 {
-        match ctx.drain_owed_replies(owed as usize, max_ms) {
-            Some(got) => {
-                owed -= (got as u32).min(owed);
-                if owed > 0 {
-                    // NOTHING WAS SENT, and the caller must not say the driver failed to answer it: the
-                    // request never left. `wifi_not_answering` reads this and says what happened.
-                    ctx.wifi_owed.set(owed);
-                    ctx.wifi_unsent.set(owed);
-                    return None;
-                }
-            }
-            // No mailbox: replies land on the shared endpoint and cannot be told apart; the drain above
-            // is all there is, and the count is meaningless.
-            None => owed = 0,
-        }
+    if ctx.wifi_owed.get() > 0 && !wifi_await_owed(ctx, max_ms) {
+        // NOTHING WAS SENT, and the caller must not say the driver failed to answer it: the request never
+        // left. `wifi_not_answering` reads this and says what happened.
+        ctx.wifi_unsent.set(ctx.wifi_owed.get());
+        return None;
     }
-    let msg = Message::from_bytes(req);
+    let tag = next_wifi_tag(ctx);
+    let msg = wifi_tagged(req, tag);
     let secs = ((max_ms + 999) / 1000).max(1) as i64;
     let t0 = ctx.read_tsc();
-    let got = match ctx.request_with_reply_call_err(WIFI_DRIVER, &msg, secs) {
-        Ok(r) => r,
-        // No send slot, or the driver died (EndpointDead / ReplyDead): either way this instance will never
-        // answer. Reacquire and send ONCE - nothing is in flight to a live driver, so this is a first
-        // request, not a repeat.
-        Err(_) => {
-            // A respawned driver owes nothing: its dead predecessor's answers will never come.
-            owed = 0;
-            if !ctx.reacquire_by_name(WIFI_DRIVER) {
-                ctx.wifi_owed.set(0);
-                return None;
-            }
-            match ctx.request_with_reply_call_err(WIFI_DRIVER, &msg, secs) {
-                Ok(r) => r,
-                Err(_) => None,
-            }
-        }
+    // One attempt: the answer, and whether the request LEFT. A `None` that comes back at once is a send
+    // that failed (no send slot, or a dead driver), never a deadline.
+    let attempt = || {
+        let s0 = ctx.read_tsc();
+        let got = ctx.request_with_reply_ms_sifted(WIFI_DRIVER, &msg, max_ms, |m| wifi_sift(ctx, m, Some(tag)));
+        let left = got.is_some() || ctx.read_tsc().wrapping_sub(s0) >= ctx.duration_cycles(250);
+        (got, left)
     };
-    if got.is_none() {
-        if owed == 0 {
-            ctx.wifi_owed_since.set(ctx.epoch_secs_monotonic());
+    let (mut got, mut left) = attempt();
+    if !left {
+        // Reacquire and send ONCE - nothing is in flight to a live driver, so this is a first request, not
+        // a repeat. A respawned driver owes nothing: its dead predecessor's answers will never come.
+        ctx.wifi_owed.set(0);
+        if !ctx.reacquire_by_name(WIFI_DRIVER) {
+            return None;
         }
-        owed += 1;
+        (got, left) = attempt();
     }
-    ctx.wifi_owed.set(owed);
+    if got.is_none() && left {
+        wifi_owe(ctx);
+    }
+    let got = got.map(|r| wifi_untag(&r));
     if let Some(r) = got.as_ref() {
         let p = r.payload_bytes();
         if p.first().copied() == Some(wifi_wire::RADIO_DOWN) {
@@ -7794,18 +7797,86 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
         Some(_) if took_ms >= 1000 => {
             ctx.log_fmt(format_args!("shell: the radio driver answered op {:#04x} after {} ms", req.first().copied().unwrap_or(0), took_ms));
         }
-        None => {
-            let (stale, other) = wifi_drain_stale(ctx);
-            // A REPLY that arrived just now is an owed answer, not a new one. Only replies: see
-            // `wifi_drain_stale` for what counting the rest did.
-            ctx.wifi_owed.set(ctx.wifi_owed.get().saturating_sub(stale));
+        None if left => {
             ctx.log_fmt(format_args!(
-                "shell: the radio driver did not answer op {:#04x} within {} s ({} stale message(s) cleared from this shell's queue)",
-                req.first().copied().unwrap_or(0), secs, stale + other));
+                "shell: the radio driver did not answer op {:#04x} within {} s - its answer is owed ({} owed)",
+                req.first().copied().unwrap_or(0), secs, ctx.wifi_owed.get()));
         }
         _ => {}
     }
     got
+}
+
+/// The radio request correlation tag. Its own counter in `ShellCtx`, for the reason `fs_tag` and `net_tag`
+/// have theirs (Invariant 9). Never 0: that one is `wifi_wire::COMPLETION_TAG`.
+fn next_wifi_tag(ctx: &ShellCtx) -> u8 {
+    let t = ctx.wifi_tag.get().wrapping_add(1);
+    let t = if t == 0 { 1 } else { t };
+    ctx.wifi_tag.set(t);
+    t
+}
+
+/// `req` as a tagged request: `[TAGGED, tag, req...]`.
+fn wifi_tagged(req: &[u8], tag: u8) -> Message {
+    let mut m = Message::from_bytes(&[wifi_wire::TAGGED, tag]);
+    let k = req.len().min(m.payload.len() - 2);
+    m.payload[2..2 + k].copy_from_slice(&req[..k]);
+    m.payload_len = 2 + k;
+    m
+}
+
+/// A tagged answer without its tag: the reply as the driver wrote it.
+fn wifi_untag(r: &Message) -> Message {
+    let p = r.payload_bytes();
+    Message::from_bytes(p.get(2..).unwrap_or(&[]))
+}
+
+/// Is this an answer from the radio driver - and, when `tag` is given, the answer carrying it?
+fn wifi_is_answer(m: &Message, tag: Option<u8>) -> bool {
+    match m.payload_bytes() {
+        [wifi_wire::TAGGED, t, ..] => tag.map_or(true, |want| *t == want),
+        _ => false,
+    }
+}
+
+/// THE ONE PLACE A MESSAGE ON THIS SHELL'S ENDPOINT IS JUDGED while it waits on the radio. `true` for the
+/// answer carrying `tag`. A radio answer carrying any OTHER tag is late - a request this shell gave up on
+/// - and is counted off `wifi_owed`, which is how that count stays exact. Anything else is not the
+/// radio's, and is dropped with any cap it carries released (the shell reads keys from the kernel ring,
+/// not from this endpoint, so nothing it needs arrives here unasked).
+fn wifi_sift(ctx: &ShellCtx, m: &Message, tag: Option<u8>) -> bool {
+    if tag.is_some() && wifi_is_answer(m, tag) {
+        return true;
+    }
+    if wifi_is_answer(m, None) {
+        ctx.wifi_owed.set(ctx.wifi_owed.get().saturating_sub(1));
+    } else {
+        while let Some(c) = ctx.take_pending_cap() {
+            ctx.remove_cap(c);
+        }
+    }
+    false
+}
+
+/// One more answer the driver owes: a request that LEFT and was not answered in time.
+fn wifi_owe(ctx: &ShellCtx) {
+    if ctx.wifi_owed.get() == 0 {
+        ctx.wifi_owed_since.set(ctx.epoch_secs_monotonic());
+    }
+    ctx.wifi_owed.set(ctx.wifi_owed.get() + 1);
+}
+
+/// Wait up to `max_ms` for the driver's owed answers to arrive, discarding them (`wifi_sift`). `true` when
+/// nothing is owed any more.
+fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64) -> bool {
+    let t0 = ctx.read_tsc();
+    let limit = ctx.duration_cycles(max_ms);
+    while ctx.wifi_owed.get() > 0 && ctx.read_tsc().wrapping_sub(t0) < limit {
+        if let Some(m) = ctx.recv_timeout(ctx.duration_cycles(20)) {
+            wifi_sift(ctx, &m, None);
+        }
+    }
+    ctx.wifi_owed.get() == 0
 }
 
 /// A wifi request whose wait may be long enough to want a way out: `[q] quit` appears once the wait passes
@@ -7814,15 +7885,34 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
 /// `wifi status` has the outcome. A "timeout" that comes back at once is a failed send (a respawned driver);
 /// it is reacquired and asked once more, as `wifi_ask` does. A real timeout is never re-sent.
 fn wifi_ask_q(ctx: &ShellCtx, req: &[u8], hint_secs: i64, max_secs: i64) -> ReqOutcome {
-    let msg = Message::from_bytes(req);
-    let t0 = ctx.read_tsc();
-    let first = ctx.request_with_reply_qhint(WIFI_DRIVER, &msg, hint_secs, max_secs, || ctx.console_writeln("  [q] quit"));
-    let at_once = ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(250);
-    match first {
-        ReqOutcome::Timeout if at_once && ctx.reacquire_by_name(WIFI_DRIVER) => {
-            ctx.request_with_reply_qhint(WIFI_DRIVER, &msg, hint_secs, max_secs, || ctx.console_writeln("  [q] quit"))
+    wifi_ask_keys(ctx, req, hint_secs, max_secs, || ctx.console_writeln("  [q] quit"))
+}
+
+/// The tagged, key-abortable radio request behind `wifi_ask_q` and the join. The answer is the one carrying
+/// this request's tag (`wifi_sift`); a request that LEFT and got none - abandoned with a key, or timed out
+/// - is owed, so its late answer is counted off when it comes.
+fn wifi_ask_keys(ctx: &ShellCtx, req: &[u8], hint_secs: i64, max_secs: i64, on_linger: impl Fn()) -> ReqOutcome {
+    let _ = wifi_drain_stale(ctx);
+    let tag = next_wifi_tag(ctx);
+    let msg = wifi_tagged(req, tag);
+    let ask = || {
+        let t0 = ctx.read_tsc();
+        let out = ctx.request_with_reply_keyhint_sifted(WIFI_DRIVER, &msg, hint_secs, max_secs,
+            ServiceContext::QUIT_KEYS, &on_linger, |m| wifi_sift(ctx, m, Some(tag)));
+        (out, ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(250))
+    };
+    let (mut outcome, mut at_once) = ask();
+    if matches!(outcome, ReqOutcome::Timeout) && at_once && ctx.reacquire_by_name(WIFI_DRIVER) {
+        ctx.wifi_owed.set(0);
+        (outcome, at_once) = ask();
+    }
+    match outcome {
+        ReqOutcome::Reply(r) => ReqOutcome::Reply(wifi_untag(&r)),
+        ReqOutcome::Timeout if at_once => ReqOutcome::Timeout,
+        other => {
+            wifi_owe(ctx);
+            other
         }
-        other => other,
     }
 }
 
@@ -7844,29 +7934,24 @@ fn wifi_no_answer(ctx: &ShellCtx, out: &mut Out, outcome: &ReqOutcome, doing: &s
 /// construction: the shell asks one thing at a time and reads console input from the kernel ring, not from
 /// its endpoint, and a late `net-stack` reply is discarded by its own tag check either way.
 ///
-/// Returns `(replies, other)`: what came out of the mailbox, and what came off the main endpoint. Only
-/// `replies` may be set against `wifi_owed` - a message on the main endpoint is never an answer to a Call.
-///
-/// KNOWN GAP (backlog/70): `replies` is not "the driver's answers" either. The mailbox takes the replies
-/// of EVERY peer this shell asks - `time`, `fs`, `net-stack` - and a message carries no sender this
-/// shell can read, so a late answer from any of them is counted as one the driver owed. QEMU raspi4b,
-/// 2026-10-02, a driver made to answer `wifi status` 8 s late: a 2-byte `[1, 4]` from another peer was in
-/// the mailbox at the timeout, cancelled the owed answer, the next `wifi status` was sent behind it, and
-/// the Call (matched by sender) read the FIRST request's late answer as the second's - the desync the
-/// count exists to prevent.
+/// Returns `(late, other)`: late radio answers - recognised by their tag, and counted off `wifi_owed` by
+/// `wifi_sift` - and everything else. Until the tag (backlog/70) the count was set against every reply in
+/// the mailbox, which takes EVERY peer's replies: in QEMU a stray `[1, 4]` from another service cancelled
+/// an owed radio answer, the next `wifi status` was sent behind it, and it read the first one's answer.
 fn wifi_drain_stale(ctx: &ShellCtx) -> (u32, u32) {
-    // The REPLY MAILBOX first: that is where answers to this shell's requests land (`reply_mailbox` in
-    // the SDK). Draining only the main endpoint, as this did, found nothing - "0 stale message(s)
-    // cleared" on every line of boot 2026-10-01 14:43 - while the stale answers sat in the mailbox.
-    let replies = ctx.drain_stale_replies() as u32;
-    let mut other = 0u32;
-    while ctx.try_recv().is_some() {
-        other = other.saturating_add(1);
-        while let Some(c) = ctx.take_pending_cap() {
-            ctx.remove_cap(c);
+    // The REPLY MAILBOX: no radio answer lands there any more (the radio waits are on the main endpoint,
+    // so they can sift), but other peers' late replies do, and they hold slots of a 16-deep queue.
+    let mut other = ctx.drain_stale_replies() as u32;
+    let mut late = 0u32;
+    while let Some(m) = ctx.try_recv() {
+        if wifi_is_answer(&m, None) {
+            late = late.saturating_add(1);
+        } else {
+            other = other.saturating_add(1);
         }
+        wifi_sift(ctx, &m, None);
     }
-    (replies, other)
+    (late, other)
 }
 
 /// The printable form of an SSID. The name is whatever the access point beacons and is NOT trusted to be
@@ -8217,15 +8302,9 @@ fn wifi_join(ctx: &ShellCtx, out: &mut Out, ssid: &[u8], pass: &[u8]) -> Result<
         // `Timeout` that returns at once, since it cannot tell the two apart. A timeout that took its full
         // thirty seconds is the driver not answering, and re-sending a join to it would be a second join
         // whose answer arrives when nobody is listening (see `wifi_ask`).
-        let t0 = ctx.read_tsc();
-        let first = ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS);
-        let at_once = ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(250);
-        let outcome = match first {
-            ReqOutcome::Timeout if at_once && ctx.reacquire_by_name(WIFI_DRIVER) => {
-                ctx.request_with_reply_abortable(WIFI_DRIVER, &Message::from_bytes(&req), MAX_SECS)
-            }
-            other => other,
-        };
+        // Tagged like every radio request (`wifi_ask_keys`); the "joining ... [q] quit" line above is the
+        // hint, so none is printed on a linger.
+        let outcome = wifi_ask_keys(ctx, &req, MAX_SECS + 1, MAX_SECS, || {});
         for b in req.iter_mut() { *b = 0; }
 
         let status = match &outcome {
@@ -8326,7 +8405,11 @@ fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     }
     let count = p.get(1).copied().unwrap_or(0) as usize;
     if count == 0 {
-        out.line_fmt(ctx, format_args!("no networks in range"));
+        // Not a row: `wifi list | count` must say 0. On the console it is the answer; in a pipe it is a note.
+        match out {
+            Out::Console => out.line_fmt(ctx, format_args!("no networks in range")),
+            _ => ctx.console_writeln("wifi: no networks in range"),
+        }
         return Ok(());
     }
     for i in 0..count {
@@ -10525,8 +10608,19 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             Err(why) => { ctx.console_writeln_fmt(format_args!("{}: bad record stream - {}", c0, why)); return Err(ShellError::Unknown); }
         }
     } else if is_producer_builtin(c0) {
+        if c0 == "wifi" {
+            if let Some(why) = wifi_pipe_refusal(split_first(stages[0]).1) {
+                ctx.console_writeln(why);
+                return Err(ShellError::Unknown);
+            }
+        }
         let mut cap = Cap::new();
-        run_producer(ctx, cwd, stages[0], &mut Out::Capture(&mut cap));
+        if !run_producer(ctx, cwd, stages[0], &mut Out::Capture(&mut cap)) {
+            // What the producer said goes to the CONSOLE, where the person is, and the pipe stops:
+            // an error is not a row.
+            Out::Console.put_bytes(ctx, cap.bytes());
+            return Err(ShellError::Unknown);
+        }
         if cap.overflow { ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)"); }
         Stream::Bytes(cap)
     } else if is_pipe_producer_service(c0) {
@@ -13450,7 +13544,21 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
+                 | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help"
+                 | "wifi")
+}
+
+/// Which `wifi` verbs may start a pipe: the REPORTS, whose value is their output (`utilities/56_wifi.md`
+/// section 3 - `wifi list | match WPA2`, `wifi list | count`). The ACTIONS refuse, because their value is
+/// their effect and their output is a conversation: `scan` draws a picker and waits on a key, `join` reads a
+/// passphrase from the console - piped, its prompt would vanish into the pipe while it waited - and the
+/// power verbs print progress. `None` when the verb may be piped, else the sentence that says why not.
+fn wifi_pipe_refusal(arg: &str) -> Option<&'static str> {
+    match arg.split_whitespace().next().unwrap_or("") {
+        "list" | "stored" | "status" | "info" | "debug" | "version" => None,
+        "" => Some("pipe: bare 'wifi' prints its usage, which is not data - pipe a report: wifi list, stored, status, info or debug"),
+        _ => Some("pipe: that 'wifi' verb is an action, not a report, so it cannot start a pipe - the reports are: wifi list, stored, status, info and debug"),
+    }
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -13468,7 +13576,11 @@ fn is_record_producer_service(name: &str) -> bool {
 }
 
 /// Run a producer built-in (`cmd args`) with its output going to `out`.
-fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
+/// `false` when the producer FAILED - said only by `wifi`, whose failures (no scan yet, a scan running, the
+/// radio down) must not reach a pipe as data: an empty `count` would say "no networks" about a radio
+/// nobody could ask (`utilities/56_wifi.md` section 3, "an error goes to nobody's pipe"). The other
+/// producers have always written their errors into the stream, and still do.
+fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) -> bool {
     let (cmd, arg) = split_first(cmdline);
     match cmd {
         "echo"         => { let _ = cmd_echo(ctx, arg, out); }
@@ -13483,13 +13595,14 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "cores"        => { let _ = cmd_cores(ctx, "", out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
-        "wifi"         => { let _ = cmd_wifi(ctx, arg, out); }
+        "wifi"         => return cmd_wifi(ctx, arg, out).is_ok(),
         "ping"         => { let _ = cmd_ping(ctx, arg, out); }
         "sock"         => { let _ = cmd_sock(ctx, out); }
         "help"         => help_to_out(ctx, out),
         "input"        => run_input(ctx, arg, out),
         _ => {}
     }
+    true
 }
 
 /// Run `inner` (a command or pipeline) with its output written to `out` - the machinery behind
@@ -13510,10 +13623,15 @@ fn run_captured(ctx: &ShellCtx, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
         ctx.console_writeln("gsh: $( ) cannot capture a pipeline (bounded stack). Stage it: 'greet | count | write /t.txt' then 'let n = $(read /t.txt)'");
         return false;
     }
-    let (c0, _) = split_first(inner);
+    let (c0, rest) = split_first(inner);
     if is_producer_builtin(c0) {
-        run_producer(ctx, cwd, inner, out);
-        return true;
+        if c0 == "wifi" {
+            if let Some(why) = wifi_pipe_refusal(rest) {
+                ctx.console_writeln(why);
+                return false;
+            }
+        }
+        return run_producer(ctx, cwd, inner, out);
     }
     if is_pipe_producer_service(c0) {
         // A bare producer service has no coexisting pipe_run Stream, so a 16 KiB drain Cap fits.

@@ -297,7 +297,7 @@ fn serve_unavailable(ctx: &ServiceContext, h: Option<&host::Host>) -> ! {
         // The reply cap is RECLAIMED after use (26.6): see the serve loop for what not doing so cost.
         // One byte at least, not an empty message: the kernel refuses a zero-length send, so an "empty
         // reply" is no reply at all and the caller waits out its deadline.
-        let p = req.payload_bytes();
+        let (tag, p) = untag(req.payload_bytes());
         // THIS LOOP IS REACHED when the radio never got as far as its firmware - no SDIO window, the host
         // failed, no card on the bus even after the power was asserted, a backplane that would not open. A
         // firmware that trapped at start does NOT come here: it goes to `serve_radio` with DOWN_TRAPPED.
@@ -371,8 +371,30 @@ fn serve_unavailable(ctx: &ServiceContext, h: Option<&host::Host>) -> ! {
             out[1] = scan::reply::DOWN_NO_RADIO;
             2
         };
-        let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n]));
+        let _ = ctx.try_send_by_handle(reply, &tagged_reply(tag, &out[..n]));
         ctx.remove_cap(reply);
+    }
+}
+
+/// A request's correlation tag, if it carries one (`scan::reply::TAGGED`), and the request without it.
+fn untag(raw: &[u8]) -> (Option<u8>, &[u8]) {
+    match raw {
+        [scan::reply::TAGGED, tag, rest @ ..] => (Some(*tag), rest),
+        _ => (None, raw),
+    }
+}
+
+/// The reply to send: `body` as it is for an untagged request, `[TAGGED, tag, body...]` for a tagged one.
+fn tagged_reply(tag: Option<u8>, body: &[u8]) -> Message {
+    match tag {
+        None => Message::from_bytes(body),
+        Some(t) => {
+            let mut m = Message::from_bytes(&[scan::reply::TAGGED, t]);
+            let k = body.len().min(m.payload.len() - 2);
+            m.payload[2..2 + k].copy_from_slice(&body[..k]);
+            m.payload_len = 2 + k;
+            m
+        }
     }
 }
 
@@ -752,7 +774,7 @@ fn serve_radio(
                 continue;
             }
         };
-        let payload = req.payload_bytes();
+        let (tag, payload) = untag(req.payload_bytes());
         let op = payload.first().copied().unwrap_or(0);
         // How long this request takes to serve, so a slow one is named from THIS side too: the shell and
         // `nic-driver` both bound their waits, and a driver that quietly took three seconds over a sweep
@@ -1511,7 +1533,7 @@ fn serve_radio(
         if served_ms >= 500 {
             ctx.log_fmt(format_args!("wifi-driver: op {:#04x} took {} ms to serve", op, served_ms));
         }
-        if ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n])).is_err() {
+        if ctx.try_send_by_handle(reply, &tagged_reply(tag, &out[..n])).is_err() {
             reply_failed = reply_failed.saturating_add(1);
             if reply_failed == 1 || reply_failed % 64 == 0 {
                 ctx.log_fmt(format_args!(

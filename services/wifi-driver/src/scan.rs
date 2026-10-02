@@ -459,6 +459,17 @@ impl Scan {
 
 /// Reply status bytes for a `wifi list` request. One byte, first in the reply, read by the shell.
 pub mod reply {
+    /// A TAGGED request: `[TAGGED, tag, op, ...]`. The driver serves `[op, ...]` as usual and its reply
+    /// goes back as `[TAGGED, tag, status, ...]`, so the asker can tell its own answer from a late one.
+    /// The shell tags every request; `nic-driver`'s frame ops do not, and are served as they always were.
+    ///
+    /// Why it exists (backlog/70): a `Call` takes the oldest reply FROM this driver, not the reply to the
+    /// request just sent, so an answer the shell had stopped waiting for was read as the next request's.
+    /// The shell tried to count what it was owed, and could not: its reply mailbox takes every peer's
+    /// replies, and nothing on a message says who sent it. A tag is a fact in the reply itself. Chosen
+    /// outside every request op (1-11 here, 0x10-0x12 in `frames`).
+    pub const TAGGED: u8 = 0xE7;
+
     /// Networks follow.
     pub const OK: u8 = 0;
     /// The scan ran and failed; the driver's log says where.

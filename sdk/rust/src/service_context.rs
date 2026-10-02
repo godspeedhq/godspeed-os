@@ -1749,7 +1749,30 @@ impl ServiceContext {
         leave_keys: &[u8], on_linger: impl FnOnce(),
     ) -> ReqOutcome {
         let op = self.trace_in(peer, msg);
-        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, |_| true);
+        self.trace_out(peer, op, match &out {
+            ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
+            ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
+            ReqOutcome::Timeout  => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
+    /// [`Self::request_with_reply_keyhint`] that SIFTS what arrives, as
+    /// [`Self::request_with_reply_deadline_sifted`] does for the unabortable wait. `mine` is asked about
+    /// each message as it lands; `true` ends the wait with it, `false` hands it to the caller - who must
+    /// release any cap it carries - and the wait goes on, its deadline unchanged by how many arrive.
+    ///
+    /// For a peer whose replies the caller can recognise (a correlation tag) on an endpoint that also
+    /// takes other traffic: the unsifted form returns the first message whatever it is, so a late
+    /// answer to a request this caller already gave up on is read as the answer to this one.
+    pub fn request_with_reply_keyhint_sifted(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        leave_keys: &[u8], on_linger: impl FnOnce(),
+        mine: impl FnMut(&crate::ipc::Message) -> bool,
+    ) -> ReqOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine);
         self.trace_out(peer, op, match &out {
             ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
             ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
@@ -2417,6 +2440,7 @@ impl ServiceContext {
         max_secs: i64,
         leave_keys: &[u8],
         on_linger: impl FnOnce(),
+        mut mine: impl FnMut(&crate::ipc::Message) -> bool,
     ) -> ReqOutcome {
         // Drain any stale reply a prior INSTANT-abort left in our endpoint (see the abortable variant).
         while self.try_recv().is_some() {}
@@ -2450,7 +2474,12 @@ impl ServiceContext {
                 // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
                 // fcap - and the abort and timeout paths below are no different: the send DID deliver
                 // there too, so the slot is not ours either, and they leave it alone (backlog/67).
-                return ReqOutcome::Reply(r);
+                //
+                // Asked at the moment of arrival, so a cap the message carries is still pending for
+                // `mine` to take; `false` hands the message to the caller and the wait goes on.
+                if mine(&r) {
+                    return ReqOutcome::Reply(r);
+                }
             }
             while let Some(b) = self.try_console_read() {
                 if leave_keys.contains(&b) { return ReqOutcome::Aborted; }
