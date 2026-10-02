@@ -39,6 +39,7 @@
 //! doctrine in `kernel/src/arch/CLAUDE.md`: the C driver says what the silicon wants, and we implement
 //! that want as a capability service.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
 
 // ---------------------------------------------------------------------------------------------
@@ -365,14 +366,11 @@ const BATCH_MSG_MAX: usize = 3072;
 
 /// How long the MDIO controller gets to clear `START_BUSY`. The kernel driver spent 10,000 iterations
 /// of a 10 us delay here; this is the same 100 ms, said as a duration.
-const MDIO_TIMEOUT_US: u64 = 100_000;
+const MDIO_WAIT: Budget = Budget::ms(100);
 /// How long a DMA engine gets to report itself started.
-const DMA_START_TIMEOUT_US: u64 = 100_000;
-/// The fallback ceiling for a machine that reports no timer calibration, where a real deadline cannot
-/// be computed. It is an iteration count and it is named as one: it bounds the loop, it does not
-/// promise a duration. Every caller that hits it reports the failure the same way, so a machine in this
-/// state is loud rather than merely slow.
-const UNCALIBRATED_POLLS: u32 = 200_000;
+const DMA_START_WAIT: Budget = Budget::ms(100);
+// On a machine with no timer calibration a deadline cannot be computed, and the bound is
+// `godspeed::driver::wait::UNCALIBRATED_POLLS` looks - the same 200,000 this file used to name itself.
 
 /// The GENET controller, as a userspace driver sees it: a register window, a DMA arena, and the
 /// service context that provides logging and the clock the waits are bounded by.
@@ -434,32 +432,10 @@ impl<'a> Genet<'a> {
         }
     }
 
-    /// Spin until `read32(off) & mask` matches `want`, or the budget expires. Returns whether the
-    /// condition was reached, so every caller can report its own failure in its own words (§26.7).
-    fn wait_mask(&self, off: usize, mask: u32, want: bool, us: u64) -> bool {
-        let budget = self.cycles_for_us(us);
-        let start = self.ctx.read_tsc();
-        let mut polls: u32 = 0;
-        loop {
-            if ((self.rd(off) & mask) != 0) == want {
-                return true;
-            }
-            if self.per_10ms != 0 {
-                if self.ctx.read_tsc().wrapping_sub(start) >= budget {
-                    return false;
-                }
-            } else {
-                polls += 1;
-                if polls >= UNCALIBRATED_POLLS {
-                    return false;
-                }
-            }
-            core::hint::spin_loop();
-        }
-    }
-
-    fn wait_clear(&self, off: usize, mask: u32, us: u64) -> bool {
-        self.wait_mask(off, mask, false, us)
+    /// Spin until `read32(off) & mask` is clear, or the budget expires (`godspeed::driver::wait`).
+    /// Returns whether it cleared, so every caller can report its own failure in its own words (§26.7).
+    fn wait_clear(&self, off: usize, mask: u32, budget: Budget) -> bool {
+        wait::until(self.ctx, budget, || self.rd(off) & mask == 0).is_ok()
     }
 
     // --- MDIO ---------------------------------------------------------------------------------
@@ -481,7 +457,7 @@ impl<'a> Genet<'a> {
         };
         self.wr(UMAC_MDIO_CMD, cmd);
 
-        if !self.wait_clear(UMAC_MDIO_CMD, MDIO_START_BUSY, MDIO_TIMEOUT_US) {
+        if !self.wait_clear(UMAC_MDIO_CMD, MDIO_START_BUSY, MDIO_WAIT) {
             return None; // the bus never went idle
         }
         let done = self.rd(UMAC_MDIO_CMD);
@@ -932,7 +908,7 @@ impl<'a> Genet<'a> {
 
         // Confirm the engine actually started. `DMA_STATUS` bit 0 reads SET while it is stopped, so a
         // controller that ignored the enable says so here rather than by silently moving nothing.
-        if !self.wait_clear(dma_reg(block, DMA_STATUS), DMA_DISABLED, DMA_START_TIMEOUT_US) {
+        if !self.wait_clear(dma_reg(block, DMA_STATUS), DMA_DISABLED, DMA_START_WAIT) {
             // Back out rather than leave a half-enabled engine pointing at our buffers.
             self.wr(dma_reg(block, DMA_CTRL), 0);
             self.wr(dma_reg(block, DMA_RING_CFG), 0);

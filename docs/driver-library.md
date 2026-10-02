@@ -89,7 +89,7 @@ Then audio, as the independent test.
 ## Step 1: `gs::driver::wait` (2026-10-02)
 
 **What was repeated.** Every driver waits for a register. Six of them wrote that loop by hand -
-`xhci`'s `spin`, `dwc2`'s `wait_until`, `genet`'s `wait_mask`, `dwmac`'s `wait_clear` and `mdio_idle`,
+`xhci`'s `spin`, `dwc2`'s `wait_until`, `genet`'s mask wait, `dwmac`'s `wait_clear` and `mdio_idle`,
 `wifi-driver`'s host - and the copies disagreed:
 
 - **`wifi-driver`'s SDIO host bounded eight of its nine waits by an ITERATION COUNT**
@@ -130,9 +130,35 @@ many fit in it, as predicted. The FIFO was ready at the first look every time, w
 checks before it loops reports as zero. No wait expired. `chaos max-carnage all-services` (50 rounds)
 recovered the radio and the network on the new waits.
 
-**Not converted yet, deliberately.** The other five drivers' copies (one change at a time), and
-`sdk/wifi`'s function-ready wait in `sdio.rs`, which builds its deadline by hand - converting it makes
-`sdk/wifi` depend on `gs`, which is the intended direction but a dependency change of its own.
+## Step 1b: `genet` on `wait` (2026-10-02)
+
+The first driver converted that `wait` was not built from, and the right one to go second: the Pi 4's
+ethernet MAC, on the board at hand, and already the closest copy to what `wait` became - a time budget
+with a 200,000-look fallback when the clock is uncalibrated. Its two waits (MDIO `START_BUSY`, 100 ms;
+a DMA engine reporting itself started, 100 ms) are `wait::until` now, their budgets unchanged, and the
+file's own `UNCALIBRATED_POLLS` is gone in favour of the library's identical one. It fitted without
+bending: a register, a mask, a budget, and the driver saying in its own words what did not happen.
+
+What did NOT move is worth saying, because it is the next candidate rather than an oversight:
+`delay_us` waits a fixed time for nothing in particular ("give the PHY a moment"), which is a different
+mechanism from waiting for a condition. It is not repeated: it is the only hand-rolled delay among the
+drivers, and the others that need to pause (`xhci`'s port-power settle) call the SDK's `sleep`. So it
+stays in the driver, which is the rule working rather than a gap.
+
+**Verified:** builds for every port (`nic-driver` is one crate on all four), and on the Pi 4 the same
+day: no MDIO or DMA-start wait expired, cable ping 0% loss, the cable and the radio stepping in and out
+for each other, and `chaos max-carnage all-services` (50 rounds) bringing `genet` up again on all 26 of
+`nic-driver`'s restarts.
+
+**Not converted yet, deliberately, one change at a time:**
+
+| Driver | Board | Its wait | Note |
+|---|---|---|---|
+| `block-driver` (`sdhci.rs`) | Pi 2 | six `t > 1_000_000` loops | **count-bounded, the same defect `wifi-driver` had** - missed by the first census, which looked for named helpers and this one has none |
+| `dwc2` | Pi 2 | `wait_until` | one-look budget when uncalibrated |
+| `xhci` | Pi 4, VisionFive, x86 | `spin` | one-look budget when uncalibrated; takes a name to log, which `wait` deliberately does not |
+| `nic-driver` `dwmac` | VisionFive | `wait_clear`, `mdio_idle` | 200,000 and 20,000 looks when uncalibrated |
+| `sdk/wifi` (`sdio.rs`) | Pi 4 | function-ready | builds its deadline by hand; converting makes `sdk/wifi` depend on `gs`, a dependency change of its own |
 
 ## What this supersedes
 

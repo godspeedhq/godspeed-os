@@ -963,6 +963,7 @@ dependencies = [
 name = "nic-driver"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 

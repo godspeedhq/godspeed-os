@@ -343,7 +343,6 @@ duplicate_const_debt = [
   "svc/nic-driver:RX_RING_OFF",
   "svc/nic-driver:TX_BUF_OFF",
   "svc/nic-driver:TX_RING_OFF",
-  "svc/nic-driver:UNCALIBRATED_POLLS",
 ]
 # Verbs the shell answers that no spec in utilities/ describes, as of 2026-09-14. SHRINK ONLY;
 # a stale entry is itself a violation. utilities/0_conventions.md calls itself canonical for EVERY
