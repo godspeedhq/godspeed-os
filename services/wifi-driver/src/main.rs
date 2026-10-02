@@ -43,6 +43,7 @@
 mod aicore;
 mod armcr4;
 mod backplane;
+mod bcm;
 mod bus;
 mod ctrl;
 mod frames;
@@ -59,6 +60,7 @@ use godspeed_sdk::{Message, ServiceContext};
 // modules here keep writing `crate::crypto` and friends.
 use godspeed_wifi::{crypto, eapol, keyfile};
 use godspeed_wifi::sdio::SdioHost;
+use godspeed_wifi::station::Station;
 
 /// Once identification is over, this is the clock to run at.
 ///
@@ -412,9 +414,13 @@ fn serve_radio(
     ctx: &ServiceContext,
     h: &dyn SdioHost,
     w: &mut backplane::Window,
-    mut radio: Option<ctrl::Session>,
+    radio: Option<ctrl::Session>,
     down_reason: u8,
 ) -> ! {
+    // THE RADIO, AS A STATION. Everything the loop below asks of the chip goes through this; the loop
+    // itself is the policy every radio shares (`godspeed_wifi::station`).
+    let mut bcm = radio.map(|s| bcm::Bcm::new(h, w, s));
+    let mut radio: Option<&mut dyn Station> = bcm.as_mut().map(|b| b as &mut dyn Station);
     // Bounded: 2 status bytes plus 32 records of 44 is 1410 for a list, and 2 plus 64 names of 33 is 2114 for
     // `stored` - both inside this fixed buffer, inside a 4 KiB message.
     let mut out = [0u8; 2560];
@@ -482,14 +488,11 @@ fn serve_radio(
     /// from `/wifi.keys`. `None` when there is no key for a WPA2 name (nothing was attempted); otherwise
     /// the join's outcome, with the driver's memory of the link updated either way.
     fn join_known(
-        h: &dyn SdioHost,
-        w: &mut backplane::Window,
-        session: &mut ctrl::Session,
+        session: &mut dyn Station,
         name: &[u8; join::MAX_SSID],
         len: u8,
         sec: u8,
         stored: &mut [Option<Stored>],
-        keys: &mut Option<join::Keys>,
         joined: &mut Option<([u8; join::MAX_SSID], u8)>,
         joined_at_secs: &mut i64,
         joined_security: &mut u8,
@@ -510,7 +513,7 @@ fn serve_radio(
             }
         };
         let secret = secret?;
-        let outcome = join::join(h, w, session, ssid, secret, keys, ctx);
+        let outcome = session.join(ssid, secret, ctx);
         if outcome == join::Outcome::Joined {
             *joined = Some((*name, len));
             *joined_at_secs = ctx.epoch_secs_monotonic();
@@ -521,7 +524,7 @@ fn serve_radio(
             }
         } else {
             *joined = None;
-            let _ = ctrl::disassoc(h, w, session, ctx);
+            let _ = session.disassoc(ctx);
         }
         pmk_buf.fill(0);
         Some(outcome)
@@ -558,15 +561,14 @@ fn serve_radio(
             e.pmk.fill(0);
         }
     }
-    // The keys a WPA2 join keeps for the rekeys to come (`join::Keys`); `None` on an open network and
-    // after any end of the association.
-    let mut keys: Option<join::Keys> = None;
+    // The keys a WPA2 join keeps for the rekeys to come live inside the station now
+    // (`Station::forget_keys` drops them at every end of an association).
     /// What a pull saw, applied to the driver's memory of the join - here, so the frame module need not
     /// know what a join is.
     fn note_pull(
+        session: &mut dyn Station,
         p: &frames::Pulled,
         joined: &mut Option<([u8; join::MAX_SSID], u8)>,
-        keys: &mut Option<join::Keys>,
         rekey_seen: &mut u32,
         ctx: &ServiceContext,
     ) {
@@ -574,11 +576,11 @@ fn serve_radio(
             if joined.is_some() {
                 ctx.log_fmt(format_args!(
                     "wifi-driver: the access point dropped the link (event {} - {}, reason {}) - not joined; `wifi join` returns",
-                    event, scan::code::name(event), reason
+                    event, session.event_name(event), reason
                 ));
             }
             *joined = None;
-            join::forget(keys);
+            session.forget_keys();
         }
         if p.pairwise_failed > 0 {
             // The pull answered a restarted four-way handshake and it did not complete; the step is in
@@ -654,7 +656,6 @@ fn serve_radio(
     // would be refused by every access point in a way indistinguishable from a wrong passphrase, so if this
     // fails, passphrases are refused HERE, with the reason, rather than there, without one.
     let crypto_ok = crypto::selftest(ctx);
-    let mut frame = [0u8; ctrl::FRAME];
     // Requests that could not be answered, and answers that could not be delivered - both loud.
     let mut capless: u32 = 0;
     let mut reply_failed: u32 = 0;
@@ -696,10 +697,10 @@ fn serve_radio(
                 e.pmk.fill(0);
             }
         }
-        if let (Some((name, len, sec)), Some(session)) = (auto_join.take(), radio.as_mut()) {
+        if let (Some((name, len, sec)), Some(session)) = (auto_join.take(), radio.as_deref_mut()) {
             if radio_on && sweep.is_none() && joined.is_none() {
                 ctx.log("wifi-driver: joining the network last joined, from /wifi.keys");
-                match join_known(h, w, session, &name, len, sec, &mut stored, &mut keys, &mut joined,
+                match join_known(session, &name, len, sec, &mut stored, &mut joined,
                                  &mut joined_at_secs, &mut joined_security, &mut rxq, ctx) {
                     Some(join::Outcome::Joined) => {
                         last_joined = Some((name, len, sec));
@@ -711,13 +712,13 @@ fn serve_radio(
             }
         }
         // ---- 1. One frame of the running sweep, if there is one. ----
-        if let (Some(s), Some(session)) = (sweep.as_mut(), radio.as_mut()) {
-            match scan::step(h, w, session, &mut s.scan, &mut frame, ctx) {
+        if let (Some(s), Some(session)) = (sweep.as_mut(), radio.as_deref_mut()) {
+            match session.scan_step(&mut s.scan, ctx) {
                 scan::Step::Frame => {}
                 scan::Step::Empty => {
                     s.empty += 1;
                     ctx.sleep_ms(1);
-                    if s.empty >= scan::MAX_EMPTY_POLLS {
+                    if s.empty >= session.scan_empty_bound() {
                         ctx.log_fmt(format_args!(
                             "wifi-driver: the sweep fell silent for {} empty polls without the firmware saying it \
                              was over - discarded ({} heard); the last complete scan stands",
@@ -781,7 +782,7 @@ fn serve_radio(
         // `nic-driver` both bound their waits, and a driver that quietly took three seconds over a sweep
         // start (boot 2026-09-30 14:51) left neither of them able to say where the time went.
         let served_t0 = ctx.read_tsc();
-        let n = match (op, radio.as_mut()) {
+        let n = match (op, radio.as_deref_mut()) {
             // ---- Powered down (`wifi radio off hard`): these four arms come first, so nothing below talks
             // to a chip that has no power. ----
             (scan::reply::OP_STATUS, _) if powered_off => {
@@ -823,16 +824,16 @@ fn serve_radio(
                 // association; `/wifi.keys` stays, and the cold start after `on` rejoins from it.
                 let was_joined = joined.is_some();
                 if let Some(s) = sweep.take() {
-                    let _ = scan::abort(h, w, session, ctx);
+                    let _ = session.scan_abort(ctx);
                     ctx.log_fmt(format_args!(
                         "wifi-driver: hard off mid-sweep - the sweep is stopped ({} heard, not kept)",
                         s.scan.count()));
                 }
                 if was_joined {
-                    let _ = ctrl::disassoc(h, w, session, ctx);
+                    let _ = session.disassoc(ctx);
                 }
                 joined = None;
-                join::forget(&mut keys);
+                session.forget_keys();
                 out[1] = was_joined as u8;
                 out[3] = 0;
                 out[4] = 0;
@@ -920,7 +921,7 @@ fn serve_radio(
             }
             (scan::reply::OP_DISCONNECT, Some(session)) => {
                 if let Some(s) = sweep.take() {
-                    let _ = scan::abort(h, w, session, ctx);
+                    let _ = session.scan_abort(ctx);
                     ctx.log_fmt(format_args!(
                         "wifi-driver: a disconnect was asked for mid-sweep - the sweep is stopped ({} heard, not kept)",
                         s.scan.count()
@@ -929,10 +930,10 @@ fn serve_radio(
                 let left = joined;
                 // Sent whether or not this driver believes it is associated: the firmware's state is the truth,
                 // and a stale belief here must not stop the operator leaving a network.
-                let _ = ctrl::disassoc(h, w, session, ctx);
+                let _ = session.disassoc(ctx);
                 joined = None;
                 last_joined = None;
-                join::forget(&mut keys);
+                session.forget_keys();
                 rxq.clear();
                 // `[OK, was_joined, len, name[32]]` - the name of what was left, so the shell can say it.
                 out[0] = scan::reply::OK;
@@ -952,14 +953,14 @@ fn serve_radio(
             // instance, and the respawn finds a card that does not answer the CCCR - the boot's own path.
             // The reply goes out before the kill arrives, so the operator is told the cycle happened (or
             // that this machine cannot do it) rather than left with a prompt that went quiet.
-            (scan::reply::OP_RADIO, Some(_)) if payload.get(1).copied() == Some(scan::reply::RADIO_POWERCYCLE) => {
+            (scan::reply::OP_RADIO, Some(session)) if payload.get(1).copied() == Some(scan::reply::RADIO_POWERCYCLE) => {
                 let was_joined = joined.is_some();
                 let cycled = power_cycle_device_ms(ctx, h, requested_off_ms(payload));
                 if cycled {
                     ctx.log("wifi-driver: `wifi radio powercycle` - the chip's power was cut and restored; this instance has no firmware to serve and expects to be restarted onto the cold chip");
                     joined = None;
                     last_joined = None;
-                    join::forget(&mut keys);
+                    session.forget_keys();
                     radio_on = false;
                 } else {
                     ctx.log("wifi-driver: `wifi radio powercycle` asked, and this machine has no control over the radio's power - nothing changed");
@@ -987,7 +988,7 @@ fn serve_radio(
                 out[4] = 0;
                 if on {
                     if !radio_on {
-                        if !ctrl::interface_up(h, w, session, ctx) {
+                        if !session.radio_up(ctx) {
                             ctx.log("wifi-driver: the radio would not come back up - it stays off");
                             out[0] = scan::reply::JOIN_FAILED;
                             out[1] = 0;
@@ -1003,7 +1004,7 @@ fn serve_radio(
                             // with, and the reply says so by attempting nothing.
                             if let Some((name, len, sec)) = last_joined {
                                 ctx.log("wifi-driver: radio back on - rejoining the network last joined");
-                                if let Some(outcome) = join_known(h, w, session, &name, len, sec, &mut stored, &mut keys,
+                                if let Some(outcome) = join_known(session, &name, len, sec, &mut stored,
                                                                   &mut joined, &mut joined_at_secs, &mut joined_security,
                                                                   &mut rxq, ctx) {
                                     out[3] = reply_of(outcome);
@@ -1026,22 +1027,22 @@ fn serve_radio(
                 } else {
                     // `off` disconnects first (`utilities/56_wifi.md` 2), then takes the interface down.
                     if let Some(s) = sweep.take() {
-                        let _ = scan::abort(h, w, session, ctx);
+                        let _ = session.scan_abort(ctx);
                         ctx.log_fmt(format_args!(
                             "wifi-driver: radio off mid-sweep - the sweep is stopped ({} heard, not kept)",
                             s.scan.count()
                         ));
                     }
                     if was_joined {
-                        let _ = ctrl::disassoc(h, w, session, ctx);
+                        let _ = session.disassoc(ctx);
                     }
                     joined = None;
-                    join::forget(&mut keys);
-                    if ctrl::radio_down(h, w, session, ctx) {
+                    session.forget_keys();
+                    if session.radio_down(ctx) {
                         radio_on = false;
                         out[0] = scan::reply::OK;
                         // VERIFIED, as `on` is: ask the firmware whether it is still up.
-                        out[3] = match ctrl::is_up(h, w, session, ctx) {
+                        out[3] = match session.is_up(ctx) {
                             Some(false) => scan::reply::OFF_VERIFIED,
                             Some(true) => {
                                 ctx.log("wifi-driver: `wifi radio off` - DOWN was accepted but the firmware still says it is up");
@@ -1069,7 +1070,7 @@ fn serve_radio(
                     2
                 }
                 None => {
-                    if scan::start(h, w, session, ctx) {
+                    if session.scan_start(ctx) {
                         sweep = Some(Sweep { scan: scan::Scan::new(), empty: 0 });
                         sweep_failed = false;
                         out[0] = scan::reply::OK;
@@ -1105,7 +1106,7 @@ fn serve_radio(
             (scan::reply::OP_SCAN_ABORT, Some(session)) => {
                 let heard = match sweep.take() {
                     Some(s) => {
-                        if !scan::abort(h, w, session, ctx) {
+                        if !session.scan_abort(ctx) {
                             ctx.log("wifi-driver: the firmware did not take the abort - the sweep's events will be drained and discarded as they arrive");
                         }
                         ctx.log_fmt(format_args!(
@@ -1139,14 +1140,14 @@ fn serve_radio(
                 // frames off the bus and skips the ones that are not its reply, which mid-sweep would be the
                 // scan's own results. During a sweep the status is the driver's memory, and says the sweep is
                 // running, which is the fact that matters then.
-                let link = if radio_on && sweep.is_none() { ctrl::link_now(h, w, session, ctx) } else { None };
+                let link = if radio_on && sweep.is_none() { session.link(ctx) } else { None };
                 let (assoc, bssid, rssi, chanspec) = match &link {
                     Some(l) if l.associated() => (true, l.bssid, l.rssi, l.chanspec),
                     Some(_) => {
                         if joined.is_some() {
                             ctx.log("wifi-driver: the firmware reports no association - the remembered join is dropped");
                             joined = None;
-                            join::forget(&mut keys);
+                            session.forget_keys();
                         }
                         (false, [0u8; 6], 0, 0)
                     }
@@ -1177,7 +1178,7 @@ fn serve_radio(
             (scan::reply::OP_CONNECT, Some(session)) => {
                 // A join and a sweep cannot share the radio. The sweep goes, and says so; the cache stays.
                 if let Some(s) = sweep.take() {
-                    let _ = scan::abort(h, w, session, ctx);
+                    let _ = session.scan_abort(ctx);
                     ctx.log_fmt(format_args!(
                         "wifi-driver: a join was asked for mid-sweep - the sweep is stopped ({} heard, not kept)",
                         s.scan.count()
@@ -1220,7 +1221,7 @@ fn serve_radio(
                         .map(|(j, jl)| *jl as usize == ssid_len && &j[..ssid_len] == ssid)
                         .unwrap_or(false);
                     let already = on_this
-                        && matches!(ctrl::link_now(h, w, session, ctx), Some(l) if l.associated());
+                        && matches!(session.link(ctx), Some(l) if l.associated());
                     if on_this && !already {
                         ctx.log("wifi-driver: the remembered join is not on the air any more - joining afresh");
                         joined = None;
@@ -1285,7 +1286,7 @@ fn serve_radio(
                             1
                         }
                         Some(secret) => {
-                            let outcome = join::join(h, w, session, ssid, secret, &mut keys, ctx);
+                            let outcome = session.join(ssid, secret, ctx);
                             if outcome == join::Outcome::Joined {
                                 joined = Some((name_of(ssid), ssid_len as u8));
                                 joined_at_secs = ctx.epoch_secs_monotonic();
@@ -1332,7 +1333,7 @@ fn serve_radio(
                                 // ago` to a `(hidden)` network after `wsec_key` was refused. The firmware's
                                 // state is made to match this driver's answer. Harmless when there was no
                                 // association to leave, exactly as `leave` is.
-                                let _ = ctrl::disassoc(h, w, session, ctx);
+                                let _ = session.disassoc(ctx);
                             }
                             out[0] = reply_of(outcome);
                             // The working copy of the key does not outlive the join it was for.
@@ -1345,84 +1346,8 @@ fn serve_radio(
             }
             (scan::reply::OP_DEBUG, Some(session)) => {
                 let sub = payload.get(1).copied().unwrap_or(scan::reply::dbg::STATS);
-                out[0] = scan::reply::OK;
-                match sub {
-                    scan::reply::dbg::TRACE => {
-                        let held = session.trace.held();
-                        out[1] = held as u8;
-                        let mut at = 2;
-                        for i in 0..held {
-                            let e = session.trace.entry(i);
-                            out[at..at + 4].copy_from_slice(&e.ms.to_le_bytes());
-                            out[at + 4] = e.kind;
-                            out[at + 5] = e.chanflag;
-                            out[at + 6..at + 8].copy_from_slice(&e.id.to_le_bytes());
-                            out[at + 8..at + 12].copy_from_slice(&e.what.to_le_bytes());
-                            out[at + 12..at + 16].copy_from_slice(&e.status.to_le_bytes());
-                            // Entry stride is 18: len takes the last two bytes.
-                            out[at + 16..at + 18].copy_from_slice(&e.len.to_le_bytes());
-                            at += 18;
-                        }
-                        at
-                    }
-                    scan::reply::dbg::FIRMWARE => {
-                        // Asked of the firmware now, not remembered from boot - but not mid-sweep, for the
-                        // reason `OP_STATUS` gives.
-                        let mut at = 1;
-                        let mut ver = [0u8; 128];
-                        let mut cap = [0u8; 512];
-                        let mut mac = [0u8; 6];
-                        if sweep.is_none() && radio_on {
-                            let _ = ctrl::query_iovar(h, w, session, "ver", &mut ver, ctx);
-                            let _ = ctrl::query_iovar(h, w, session, "cap", &mut cap, ctx);
-                            let _ = ctrl::query_iovar(h, w, session, "cur_etheraddr", &mut mac, ctx);
-                        }
-                        let vlen = ver.iter().position(|&b| b == 0).unwrap_or(ver.len());
-                        let clen = cap.iter().position(|&b| b == 0).unwrap_or(cap.len());
-                        out[at] = vlen as u8;
-                        at += 1;
-                        out[at..at + 128].copy_from_slice(&ver);
-                        at += 128;
-                        out[at..at + 2].copy_from_slice(&(clen as u16).to_le_bytes());
-                        at += 2;
-                        out[at..at + 512].copy_from_slice(&cap);
-                        at += 512;
-                        out[at..at + 6].copy_from_slice(&mac);
-                        at + 6
-                    }
-                    _ => {
-                        let st = &session.stats;
-                        let words: [u32; 20] = [
-                            st.ctrl_sent, st.ctrl_accepted, st.ctrl_refused, st.ctrl_unanswered,
-                            st.rx_ctrl, st.rx_event, st.rx_data, st.rx_glom, st.rx_header_only, st.rx_other,
-                            st.tx_bytes, st.rx_bytes, st.rx_skipped_in_ctrl_wait,
-                            st.events[0], st.events[1], st.events[2], st.events[3], st.events[4],
-                            st.events[5], st.events[6],
-                        ];
-                        let mut at = 1;
-                        for w32 in words.iter() {
-                            out[at..at + 4].copy_from_slice(&w32.to_le_bytes());
-                            at += 4;
-                        }
-                        // The last three event buckets, then the last-seen facts.
-                        for w32 in [st.events[7], st.events[8], st.events[9]].iter() {
-                            out[at..at + 4].copy_from_slice(&w32.to_le_bytes());
-                            at += 4;
-                        }
-                        out[at..at + 4].copy_from_slice(&st.last_event_code.to_le_bytes());
-                        out[at + 4..at + 8].copy_from_slice(&st.last_event_status.to_le_bytes());
-                        out[at + 8..at + 12].copy_from_slice(&st.last_refused_cmd.to_le_bytes());
-                        out[at + 12..at + 16].copy_from_slice(&st.last_refused_status.to_le_bytes());
-                        at += 16;
-                        // And the driver's clock, so the shell can say how long the session has run.
-                        out[at..at + 4].copy_from_slice(&session.now_ms(ctx).to_le_bytes());
-                        at += 4;
-                        out[at..at + 4].copy_from_slice(&session.trace.total().to_le_bytes());
-                        at += 4;
-                        out[at..at + 4].copy_from_slice(&st.rx_glom_sub.to_le_bytes());
-                        at + 4
-                    }
-                }
+                // Not mid-sweep and not with the radio off, for the reason `OP_STATUS` gives.
+                session.debug(sub, sweep.is_none() && radio_on, &mut out, ctx)
             }
             (scan::reply::OP_STORED, Some(_)) => {
                 // `[OK, count, (len, ssid[32]) * count]` - names only, in slot order.
@@ -1471,8 +1396,7 @@ fn serve_radio(
                 // control exchange would eat the sweep's frames, and a sweep is a moment of no link.
                 out[0] = frames::OP_NET_INFO;
                 if link_mac.is_none() && sweep.is_none() {
-                    let mut mac = [0u8; 6];
-                    if matches!(ctrl::query_iovar(h, w, session, "cur_etheraddr", &mut mac, ctx), Some(n) if n >= 6) {
+                    if let Some(mac) = session.mac(ctx) {
                         link_mac = Some(mac);
                     }
                 }
@@ -1498,11 +1422,11 @@ fn serve_radio(
                 if radio_on && joined.is_some() && sweep.is_none() && eth.len() >= scan::ev::ETHHDR {
                     if !session.tx_ok() {
                         // Credit comes back on received frames; a stack that only sends runs dry.
-                        let p = frames::pull(h, w, session, &mut rxq, &mut frame, keys.as_mut(), ctx);
-                        note_pull(&p, &mut joined, &mut keys, &mut rekey_seen, ctx);
+                        let p = session.pull(&mut rxq, ctx);
+                        note_pull(session, &p, &mut joined, &mut rekey_seen, ctx);
                     }
                     if joined.is_some() {
-                        sent = ctrl::send_data(h, w, session, eth, ctx);
+                        sent = session.send(eth, ctx);
                     }
                 }
                 out[1] = sent as u8;
@@ -1513,8 +1437,8 @@ fn serve_radio(
                 // The chip is read only when the queue is empty and the radio has a link to read.
                 out[0] = frames::OP_NET_RX;
                 if rxq.is_empty() && radio_on && joined.is_some() && sweep.is_none() {
-                    let p = frames::pull(h, w, session, &mut rxq, &mut frame, keys.as_mut(), ctx);
-                    note_pull(&p, &mut joined, &mut keys, &mut rekey_seen, ctx);
+                    let p = session.pull(&mut rxq, ctx);
+                    note_pull(session, &p, &mut joined, &mut rekey_seen, ctx);
                 }
                 let n = rxq.pop(&mut out[3..]);
                 out[1..3].copy_from_slice(&(n as u16).to_le_bytes());

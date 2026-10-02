@@ -4018,3 +4018,13 @@ the adopt-or-reset decision a respawn makes, which turns on the Broadcom firmwar
 One failure line in the shared code had compared the controller's words against SDHCI values; it prints
 the host's own words now. QEMU raspi4b: the driver's 27 log lines through identification and the power
 commands are identical to the run before.
+
+**Step 2b-i (the same day): the serve loop talks to a `Station`.** `sdk/wifi/src/station.rs` holds the trait
+- start, step and abort a sweep; join; forget the keys; disassociate; the radio switch and its state; the
+link; the station's address; frames in and out; the event names and the debug account - and the types it
+speaks in, with `bss.rs` (the network list, its security classification and the `wifi list` records) and
+`rxq.rs` (the received-frame queue). The driver's new `bcm.rs` is the Broadcom implementation: each method
+is the call the loop used to make directly, with the bus, the backplane window, the firmware session, the
+join's keys and the frame buffer held there instead of threaded through the loop. The loop is otherwise
+unchanged, every log line included; it moves to the shared crate in 2b-ii, with the handshake runner.
+QEMU cannot reach the loop - it has no radio - so this one is the card's to prove.

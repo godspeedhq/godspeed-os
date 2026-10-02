@@ -5,6 +5,9 @@ The chip-independent half of every WiFi driver, as a library: `godspeed-wifi` (`
 
 | Module | What it is |
 |---|---|
+| `station.rs` | The `Station` trait - what the serve loop asks of a radio (scan, join, keys, up/down, link, frames, debug) - and the types it speaks in: `ScanStep`, `Outcome`, `Secret`, `Link`, `Pulled` |
+| `bss.rs` | A scan's networks: `Network`, `Scan`, the beacon security classification, and the `wifi list` record encoding |
+| `rxq.rs` | The bounded queue of received frames between a radio and `nic-driver` |
 | `crypto.rs` | SHA-1, HMAC, PBKDF2, the 802.11 PRF, AES-128, the RFC 3394 unwrap - each checked against its published vector at start (`selftest`) |
 | `eapol.rs` | The WPA2 four-way handshake and the group-key rekey, run by the HOST on every radio |
 | `keyfile.rs` | The credentials a join earned, in `/wifi.keys` |
@@ -25,7 +28,7 @@ all live in one service - a USB radio's driver sits behind the USB host service 
 ## The plan it is step 1 of (`docs/wifi.md` 59)
 
 1. The chip-independent code moves here (done).
-2. a. `SdioHost`, and the SDIO protocol moves here (done). b. `Station`: the serve loop talks to a `Station`, the Broadcom code becomes one.
+2. a. `SdioHost`, and the SDIO protocol moves here (done). b-i. `Station`: the serve loop talks to a `Station`, the Broadcom code is the first (done). b-ii. The loop and the WPA2 handshake runner move here.
 3. The VisionFive: a DesignWare `SdioHost` and an AIC8800 `Station`.
 4. The Pi 2: a `RawRadio` for the Realtek dongle and a shared host-side MLME that makes it a `Station`.
 

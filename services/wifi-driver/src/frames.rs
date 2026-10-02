@@ -37,96 +37,15 @@ pub const OP_NET_TX: u8 = 0x11;
 /// `[0x12]` -> `[0x12, len_lo, len_hi, ethernet frame...]`; a length of 0 is "nothing waiting".
 pub const OP_NET_RX: u8 = 0x12;
 
-/// The largest ethernet frame handed up - `nic-driver`'s own `FRAME_MAX`, so a reply always fits its
-/// buffer and a 4 KiB message.
-pub const FRAME_MAX: usize = 1600;
-/// Frames the queue holds. Eight is one `nic-driver` batch drain; `net-stack` drains every hundred
-/// milliseconds when it has a link, and what does not fit stays in the chip for the next pull.
-pub const RX_SLOTS: usize = 8;
+// The received-frame queue and what a pull reports are every radio's (`godspeed_wifi::rxq`, `::station`).
+pub use godspeed_wifi::rxq::RxQueue;
+pub use godspeed_wifi::station::Pulled;
+
 /// Frames read off the chip in one pull. A bound in READS, not time: each read is one SDIO header fetch
 /// and, when a frame is there, its body; the queue's room bounds it again from the other side.
 pub const PULL_MAX_READS: u32 = 8;
 
-/// A bounded ring of received ethernet frames, oldest first. About 13 KiB on the serve loop's stack.
-pub struct RxQueue {
-    slots: [[u8; FRAME_MAX]; RX_SLOTS],
-    lens: [u16; RX_SLOTS],
-    head: usize,
-    count: usize,
-    /// Frames queued and handed up over the driver's life, for `wifi debug stats`.
-    pub queued: u32,
-    pub handed: u32,
-}
 
-impl RxQueue {
-    pub fn new() -> Self {
-        RxQueue { slots: [[0; FRAME_MAX]; RX_SLOTS], lens: [0; RX_SLOTS], head: 0, count: 0, queued: 0, handed: 0 }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    pub fn has_room(&self) -> bool {
-        self.count < RX_SLOTS
-    }
-
-    /// Forget what is queued - on `leave`, on `radio off`, and on a fresh join, because a frame from the
-    /// old link handed to the stack on the new one is a frame from nowhere.
-    pub fn clear(&mut self) {
-        self.head = 0;
-        self.count = 0;
-    }
-
-    fn push(&mut self, frame: &[u8]) -> bool {
-        if !self.has_room() || frame.len() > FRAME_MAX {
-            return false;
-        }
-        let i = (self.head + self.count) % RX_SLOTS;
-        self.slots[i][..frame.len()].copy_from_slice(frame);
-        self.lens[i] = frame.len() as u16;
-        self.count += 1;
-        self.queued = self.queued.wrapping_add(1);
-        true
-    }
-
-    /// The oldest frame, copied into `out`; 0 when nothing is queued or `out` cannot hold it.
-    pub fn pop(&mut self, out: &mut [u8]) -> usize {
-        if self.count == 0 {
-            return 0;
-        }
-        let n = self.lens[self.head] as usize;
-        if n > out.len() {
-            return 0;
-        }
-        out[..n].copy_from_slice(&self.slots[self.head][..n]);
-        self.head = (self.head + 1) % RX_SLOTS;
-        self.count -= 1;
-        self.handed = self.handed.wrapping_add(1);
-        n
-    }
-}
-
-/// What one pull saw, so the serve loop can act on it without this module knowing the join state.
-pub struct Pulled {
-    /// Data frames queued for the stack.
-    pub data: u32,
-    /// Group-key rekeys answered: the new group key verified, installed and acknowledged.
-    pub rekeyed: u32,
-    /// Group-key frames that could not be answered - no keys held, a stale replay counter, a bad MIC, key
-    /// data that would not unwrap, no group key inside, or a refused install. Each is logged where it
-    /// happens; the count is for the caller.
-    pub rekey_failed: u32,
-    /// Pairwise rekeys answered: the access point restarted the four-way handshake on the live link, and
-    /// it ran to message 4 with new keys installed.
-    pub pairwise_rekeyed: u32,
-    /// Pairwise rekeys that did not complete - the log names the step; the access point will drop the
-    /// link and `wifi join` brings it back.
-    pub pairwise_failed: u32,
-    /// The link went down: `(event code, reason)`. A `LINK` event without the up bit, or a
-    /// deauthentication or disassociation, in either direction.
-    pub dropped_link: Option<(u32, u32)>,
-}
 
 /// Read what the chip has waiting, queueing data frames, answering a group-key rekey, and watching the
 /// link.

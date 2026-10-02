@@ -1349,21 +1349,9 @@ const CMD_GET_BSSID: u32 = 23;
 /// our own station; the firmware writes the RSSI, in dBm, into `val`.
 const CMD_GET_RSSI: u32 = 127;
 
-/// What the firmware says about the link RIGHT NOW - not what this driver remembers of its last join.
-pub struct Link {
-    /// The access point, or all zeros when the radio is not associated.
-    pub bssid: [u8; 6],
-    /// dBm. Meaningful only when associated.
-    pub rssi: i32,
-    /// The `chanspec` iovar: band in bits 15:14, channel in the low 8.
-    pub chanspec: u16,
-}
+/// The link as a `Station` reports it (`godspeed_wifi::station::Link`).
+pub use godspeed_wifi::station::Link;
 
-impl Link {
-    pub fn associated(&self) -> bool {
-        self.bssid.iter().any(|&b| b != 0)
-    }
-}
 
 /// Three GETs that together are the truth of the link: BSSID, RSSI, chanspec. `None` only if the firmware
 /// would not answer the first; the other two degrade to zero with a log line, since an address with no

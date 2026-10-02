@@ -88,23 +88,15 @@ const MFP_NONE: [u8; 4] = [0, 0, 0, 0];
 
 /// `CYW43_WPA_MAX_PASSWORD_LEN` - the longest passphrase the request carries.
 pub const MAX_PASSPHRASE: usize = 64;
+
+// How a join ended and what it joins with are every radio's (`godspeed_wifi::station`).
+pub use godspeed_wifi::station::{Outcome, Secret};
 /// The SSID limit lives in `scan`; re-exported so `join::MAX_SSID` reads naturally at the request site.
 pub use crate::scan::MAX_SSID;
 
 /// `BRCMF_EVENT_MSG_LINK`: in a `LINK` event's flags, the link is up.
 pub(crate) const EVENT_MSG_LINK: u16 = 0x01;
 
-/// How a join ended. Mirrors `scan::reply`'s connect statuses one for one.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    Joined,
-    NotFound,
-    PassphraseRefused,
-    Failed,
-    Timeout,
-    /// Kept for the reply table; no path produces it now that the handshake is answered.
-    HandshakeUnimplemented,
-}
 
 /// What a WPA2 join KEEPS for the life of the association, and nothing more: the confirmation and
 /// encryption halves of the pairwise transient key, the last replay counter the access point used, and
@@ -135,16 +127,6 @@ pub fn forget(keys: &mut Option<Keys>) {
     *keys = None;
 }
 
-/// What the station joins WITH. The passphrase never reaches this module: it is turned into the pairwise
-/// master key the moment it arrives (`crypto::psk`) and only the key is kept.
-#[derive(Clone, Copy)]
-pub enum Secret<'a> {
-    /// No key at all - `bwfm_connect`'s final `else`: `wpa_auth` DISABLED, `wsec` NONE, no RSN element, and
-    /// no handshake to wait for. The link coming up IS the join.
-    Open,
-    /// WPA2-PSK with this pairwise master key.
-    Pmk(&'a [u8; crate::crypto::PMK_LEN]),
-}
 
 /// The station's nonce for one handshake. The hardware RNG where the kernel exposes one (`hw_random`);
 /// where it does not - the aarch64 kernel's is a stub today - the cycle counter, the access point's own
