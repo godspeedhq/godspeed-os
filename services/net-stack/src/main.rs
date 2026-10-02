@@ -2938,6 +2938,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
                         poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
                     }
+                    // AND THE ASK DEADLINES, HERE AS WELL AS AT THE TOP. This wait goes round without
+                    // returning to the top of the serve loop for as long as no message arrives, so a
+                    // deadline checked only up there fired when some UNRELATED message happened along:
+                    // in QEMU, an NTP query nobody answered got its "no reply" eight seconds late, after
+                    // `time` had already given up on it (2026-10-02).
+                    asks.expire(&ctx);
                     if let Some(m) = ctx.recv_timeout(ctx.duration_cycles(POLL_MS)) { break m; }
                     // ---- DO NOT SLEEP ON WORK WE ALREADY HAVE ----
                     //
