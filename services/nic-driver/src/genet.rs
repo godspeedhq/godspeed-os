@@ -1468,8 +1468,9 @@ impl Radio {
         Some(got)
     }
 
-    /// `[0x10]` -> `(mac, link up)`, or `None` when the radio did not answer or has no address yet.
-    fn info(&mut self, ctx: &ServiceContext) -> Option<([u8; 6], bool)> {
+    /// `[0x10]` -> `(mac, link up, access point)`, or `None` when the radio did not answer or has no
+    /// address yet. The access point is zeros when the radio does not know it.
+    fn info(&mut self, ctx: &ServiceContext) -> Option<([u8; 6], bool, [u8; 6])> {
         let r = self.rpc(ctx, &Message::from_bytes(&[0x10]))?;
         let p = r.payload_bytes();
         if p.len() < 9 || p[1] == 0 {
@@ -1477,7 +1478,11 @@ impl Radio {
         }
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&p[2..8]);
-        Some((mac, p[8] != 0))
+        let mut peer = [0u8; 6];
+        if p.len() >= 15 {
+            peer.copy_from_slice(&p[9..15]);
+        }
+        Some((mac, p[8] != 0, peer))
     }
 
     fn tx(&mut self, ctx: &ServiceContext, frame: &[u8]) -> bool {
@@ -1628,7 +1633,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                 Carrier::Cable
             } else {
                 match radio.info(ctx) {
-                    Some((rmac, true)) => {
+                    Some((rmac, true, _)) => {
                         out[1..7].copy_from_slice(&rmac);
                         out[7] = 1;
                         out[8] = 2;
@@ -1651,6 +1656,19 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                     Carrier::None => ctx.log("nic-driver: the cable is out and the radio is not joined - no link"),
                 }
                 carrier = next;
+            }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
+        } else if p.len() == 1 && p[0] == 10 {
+            // WHICH ACCESS POINT carries the radio's link: `[ok, peer(6)]`, ok 0 while the cable carries
+            // the frames or the radio is not joined. `net-stack` asks only after STATUS has said the
+            // radio carries the link, which only this backend ever says - every other backend would take
+            // a one-byte request it does not know for a frame to send.
+            let mut out = [0u8; 7];
+            if !cable {
+                if let Some((_, true, peer)) = radio.info(ctx) {
+                    out[0] = 1;
+                    out[1..7].copy_from_slice(&peer);
+                }
             }
             if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 4 {

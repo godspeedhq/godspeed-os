@@ -2624,7 +2624,7 @@ fn link_is_up(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
 
 /// The link's state AND address from one status query: `(up, mac)`. `None` is a timeout or an
 /// unreadable answer, not a reading - the caller must not act on it.
-fn link_addr(ctx: &ServiceContext, pending: &mut Displaced) -> Option<(bool, [u8; 6])> {
+fn link_addr(ctx: &ServiceContext, pending: &mut Displaced) -> Option<(bool, [u8; 6], bool)> {
     let r = nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS)?;
     let p = r.payload_bytes();
     if p.len() < 8 || p[0] == 0 {
@@ -2632,7 +2632,23 @@ fn link_addr(ctx: &ServiceContext, pending: &mut Displaced) -> Option<(bool, [u8
     }
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&p[1..7]);
-    Some((p[7] != 0, mac))
+    // The third value says the RADIO carries the link. Only the Pi 4's genet backend answers nine bytes,
+    // and its ninth is the carrier, 2 for the radio (nic-driver's `Carrier`).
+    Some((p[7] != 0, mac, p.len() == 9 && p[8] == 2))
+}
+
+/// The access point the radio's link goes through (nic-driver op 10), or `None` when it is not known.
+/// Asked only once `link_addr` has said the radio carries the link: no other backend answers op 10, and
+/// every other backend would take the one byte for a frame to send.
+fn link_peer(ctx: &ServiceContext, pending: &mut Displaced) -> Option<[u8; 6]> {
+    let r = nic_status_req(ctx, pending, &Message::from_bytes(&[10u8]), LINK_SECS)?;
+    let p = r.payload_bytes();
+    if p.len() < 7 || p[0] == 0 || p[1..7].iter().all(|&b| b == 0) {
+        return None;
+    }
+    let mut peer = [0u8; 6];
+    peer.copy_from_slice(&p[1..7]);
+    Some(peer)
 }
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
@@ -2813,6 +2829,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // gateway retry cannot consume each other's budget.
     let mut last_gw_arp_at: i64 = -RESYNC_SECS;
     let mut last_addr_check_at: i64 = 0;
+    // The access point the radio's link went through when last asked (`link_peer`), or `None` when the
+    // radio is not the carrier or has not said. See the address check in the serve loop.
+    let mut link_peer_seen: Option<[u8; 6]> = None;
     // Labelled so the wait below can hand control back here when the poll step displaces a client
     // request into the stash - `pending.take()` at the top of this loop is the only thing that
     // drains it. See the `has_work` call site.
@@ -3166,12 +3185,39 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             && ctx.epoch_secs_monotonic() - last_addr_check_at >= ADDR_CHECK_SECS
         {
             last_addr_check_at = ctx.epoch_secs_monotonic();
-            if let Some((true, mac)) = link_addr(&ctx, pending) {
+            if let Some((true, mac, radio)) = link_addr(&ctx, pending) {
+                // A DIFFERENT ACCESS POINT IS A DIFFERENT LINK TOO, and our address cannot show it: the
+                // radio keeps its address when it rejoins somewhere else. Seen on a mesh where each
+                // access point and band served its own subnet - a power cycle rejoined the next one along,
+                // this stack kept the old lease and gateway, and every ping timed out until `net renew`
+                // (`docs/wifi.md` 60). A rejoin to the SAME access point keeps the lease, as a cable put
+                // back does. An unknown access point is no evidence, and the first one seen is only
+                // remembered.
+                let peer = if radio && mac == our_mac { link_peer(&ctx, pending) } else { None };
+                let roamed_from = match (peer, link_peer_seen) {
+                    (Some(now), Some(was)) if now != was => Some(was),
+                    _ => None,
+                };
+                if !radio {
+                    link_peer_seen = None;
+                } else if peer.is_some() {
+                    link_peer_seen = peer;
+                }
                 if mac != [0u8; 6] && mac != our_mac {
                     ctx.log_fmt(format_args!(
                         "net-stack: the link's address changed ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) - a different link carries the frames now; re-configuring",
                         our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5],
                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+                    let d = run_dance(&ctx, pending, Some(&status));
+                    asks.abandon(&ctx);
+                    our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
+                    // The access point is asked afresh on the new link, not compared with the old one's.
+                    link_peer_seen = None;
+                } else if let (Some(was), Some(now)) = (roamed_from, peer) {
+                    ctx.log_fmt(format_args!(
+                        "net-stack: the radio rejoined through a different access point ({:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}) - its lease and gateway may not hold there; re-configuring",
+                        was[0], was[1], was[2], was[3], was[4], was[5],
+                        now[0], now[1], now[2], now[3], now[4], now[5]));
                     let d = run_dance(&ctx, pending, Some(&status));
                     asks.abandon(&ctx);
                     our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;

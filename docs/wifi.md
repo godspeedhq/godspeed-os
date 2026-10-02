@@ -4035,3 +4035,49 @@ is the call the loop used to make directly, with the bus, the backplane window, 
 join's keys and the frame buffer held there instead of threaded through the loop. The loop is otherwise
 unchanged, every log line included; it moves to the shared crate in 2b-ii, with the handshake runner.
 QEMU cannot reach the loop - it has no radio - so this one is the card's to prove.
+
+## 60. A rejoin through a different access point is a different link (2026-10-02)
+
+**The symptom.** After `wifi radio powercycle` the radio rejoined, `wifi status` said joined with a strong
+signal, `net` said `ping ok` and `lease ok` - and every ping timed out, with `net-stack` reporting `0 frames
+seen`. `net renew` fixed it at once. It was not reproducible on demand, and the reason is the finding.
+
+**The cause, measured across three sessions.** The network is a mesh, and each access point and band serves
+its own subnet. The radio's own address was the same throughout:
+
+| joined through | lease | gateway answered ARP as |
+|---|---|---|
+| main node, 5 GHz | 192.168.11.23 from 192.168.11.1 | the main node's 5 GHz address |
+| main node, 2.4 GHz | 192.168.10.21 from 192.168.10.1 | the main node's 2.4 GHz address |
+| satellite, 5 GHz | 192.168.11.29 from 192.168.11.1 | the satellite's address |
+
+A rejoin to the same access point kept working, always. A rejoin to a different one (once from the
+satellite to the main node, once from 2.4 GHz to 5 GHz on the main node after `chaos`) left `net-stack`
+holding the old lease and the old gateway's hardware address, so every frame went to a gateway that was
+not on the link. Which access point the firmware picks is not ours to choose, which is why it would not
+reproduce when asked.
+
+**Why `net-stack` missed it.** It already re-configures when the link changes, and it decides that the
+link changed by our OWN address changing - which is right for the cable stepping in for the radio (section
+41) and cannot see this: the radio keeps its address wherever it joins. CLAUDE.md 14.3 says a client must
+re-derive everything that hung off the old instance, and the old instance here was an access point.
+
+**The fix, as one fact carried three hops.** `wifi-driver`'s INFO reply (`0x10`) gains the access point
+the join reached, asked of the firmware once per join. `nic-driver`'s genet backend passes it on as a new
+one-byte query, op 10, rather than growing STATUS: the shell tells the boards' STATUS replies apart by
+length, and a Pi 4 reply grown to fifteen bytes would have read as another board's counters. `net-stack`
+asks op 10 only after STATUS has said the radio carries the link, which only this backend says, so no
+other board's driver ever receives it. When the access point differs from the one last seen, `net-stack`
+re-runs DHCP and ARP and says so: `the radio rejoined through a different access point (was -> now)`. A
+rejoin to the same access point changes nothing, as a cable put back changes nothing. An access point
+the radio does not know (zeros) is no evidence either way.
+
+**What it costs.** One more exchange with `nic-driver`, and through it one with `wifi-driver`, on the
+address check `net-stack` already makes every two seconds of network use - only while the radio carries
+the link. The firmware is asked once per join, not per check.
+
+**Verified on the Pi 4, the same day.** With the cable out, a power cycle moved the radio from the main
+node's 2.4 GHz access point to its 5 GHz one. Six seconds later `net-stack` printed the rejoin line, took
+192.168.11.23 in place of 192.168.10.21, and ping answered 17 of 17 with no `net renew`. The cable
+stepping in and out around it re-configured on our own address changing, as before.
+

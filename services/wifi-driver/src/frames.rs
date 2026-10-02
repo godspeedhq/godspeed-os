@@ -30,7 +30,7 @@ use godspeed_wifi::sdio::SdioHost;
 use crate::join::{Handshake, Keys, Step, EVENT_MSG_LINK};
 use crate::scan::{self, code, ev, CHANNEL_DATA, CHANNEL_EVENT, CHANNEL_MASK};
 
-/// `[0x10]` -> `[0x10, ok, mac(6), link]`.
+/// `[0x10]` -> `[0x10, ok, mac(6), link, peer(6)]`; `peer` is the access point, zeros when not known.
 pub const OP_NET_INFO: u8 = 0x10;
 /// `[0x11, ethernet frame...]` -> `[0x11, sent]`.
 pub const OP_NET_TX: u8 = 0x11;

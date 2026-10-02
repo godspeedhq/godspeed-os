@@ -460,6 +460,11 @@ fn serve_radio(
     // rekey count is for the log.
     let mut rxq = frames::RxQueue::new();
     let mut link_mac: Option<[u8; 6]> = None;
+    // The access point of the current join, for INFO: asked of the firmware once per join, keyed by
+    // `joined_at_secs`. A join takes seconds, so two joins cannot share one. Zeros mean "not known",
+    // which `net-stack` reads as no evidence either way.
+    let mut link_peer: [u8; 6] = [0; 6];
+    let mut link_peer_for: Option<i64> = None;
     // Pairwise rekeys that did not complete, for the log.
     let mut rekey_seen: u32 = 0;
     // The network last JOINED this boot - name, length, security - so `radio on` after `radio off` can
@@ -1392,9 +1397,14 @@ fn serve_radio(
             // protocol. Every reply is tagged with its op, because the caller bounds its wait and a late
             // answer must not be read as the next one. ----
             (frames::OP_NET_INFO, Some(session)) => {
-                // `[op, ok, mac(6), link]`. The address is the chip's, asked once; the link is this
-                // driver's memory of the join, which every pull keeps honest. Not asked mid-sweep: a
+                // `[op, ok, mac(6), link, peer(6)]`. The address is the chip's, asked once; the link is
+                // this driver's memory of the join, which every pull keeps honest. Not asked mid-sweep: a
                 // control exchange would eat the sweep's frames, and a sweep is a moment of no link.
+                //
+                // `peer` is the access point the join reached. Our own address does not change when the
+                // radio rejoins somewhere else, so without it `net-stack` cannot tell a rejoin to the same
+                // access point (the lease still holds) from one to another, where it may not
+                // (`docs/wifi.md` 60).
                 out[0] = frames::OP_NET_INFO;
                 if link_mac.is_none() && sweep.is_none() {
                     if let Some(mac) = session.mac(ctx) {
@@ -1412,7 +1422,23 @@ fn serve_radio(
                     }
                 }
                 out[8] = (radio_on && joined.is_some() && sweep.is_none()) as u8;
-                9
+                if joined.is_none() {
+                    link_peer = [0; 6];
+                    link_peer_for = None;
+                } else if link_peer_for != Some(joined_at_secs) && radio_on && sweep.is_none() {
+                    if let Some(l) = session.link(ctx) {
+                        if l.associated() {
+                            link_peer = l.bssid;
+                            link_peer_for = Some(joined_at_secs);
+                        }
+                    }
+                }
+                if link_peer_for == Some(joined_at_secs) {
+                    out[9..15].copy_from_slice(&link_peer);
+                } else {
+                    out[9..15].fill(0);
+                }
+                15
             }
             (frames::OP_NET_TX, Some(session)) => {
                 // `[op, sent]`. Refused, not queued, when there is no link to send on: the stack retries
