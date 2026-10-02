@@ -97,7 +97,9 @@ def parse_audit() -> dict[str, int]:
 # reach the raw ABI could quietly grow a capability the system does not have.
 #
 # The attribute was already there; nothing checked it, so deleting it failed no gate.
-DENY_ROOTS = ("services", "examples", "osdev", "stdlib")
+# `sdk/wifi` is a crate directory itself, which the walk below accepts as one crate. It is the one SDK
+# crate that is NOT the audited hardware/ABI layer (18.1), so it carries no `unsafe` and says so.
+DENY_ROOTS = ("services", "examples", "osdev", "stdlib", "sdk/wifi")
 DENY_ATTR = "#![deny(unsafe_code)]"
 
 

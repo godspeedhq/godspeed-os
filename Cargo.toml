@@ -19,6 +19,7 @@ members = [
     "services/net-stack",
     "services/fs",
     "sdk/rust",
+    "sdk/wifi",
     "stdlib/rust",
     "osdev",
     "examples/ping",

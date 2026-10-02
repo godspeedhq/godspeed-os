@@ -7629,70 +7629,11 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     }
 }
 
-/// The `wifi-driver` request/reply vocabulary. The values are the driver's (`services/wifi-driver/src/scan.rs`,
-/// `mod reply`); these mirror them, one name each, so a byte is never written twice in this file.
+/// The `wifi-driver` request/reply vocabulary: ONE definition, in the shared crate (`godspeed_wifi::wire`),
+/// read by this shell and by every radio driver. It used to be a hand-kept mirror of the driver's
+/// constants here - the same fact twice, kept equal by hope.
 mod wifi_wire {
-    /// A tagged request is `[TAGGED, tag, op, ...]`, and its answer comes back `[TAGGED, tag, status, ...]`
-    /// (`scan::reply::TAGGED`): the tag is how a wait tells its own answer from a late one (`wifi_sift`).
-    pub const TAGGED: u8 = 0xE7;
-    /// The tag tab completion asks with. It runs without the shell's state, so it cannot draw from
-    /// `next_wifi_tag` - which never hands out 0, so the two cannot collide.
-    pub const COMPLETION_TAG: u8 = 0;
-    pub const OP_LIST: u8 = 1;
-    pub const OP_CONNECT: u8 = 2;
-    pub const OP_SCAN_START: u8 = 3;
-    pub const OP_SCAN_POLL: u8 = 4;
-    pub const OP_SCAN_ABORT: u8 = 5;
-    pub const OP_STATUS: u8 = 6;
-    pub const OP_DISCONNECT: u8 = 7;
-    pub const OP_RADIO: u8 = 8;
-    /// `OP_RADIO` mode 2: cut and restore the chip's power (`wifi radio powercycle`).
-    pub const RADIO_POWERCYCLE: u8 = 2;
-    /// `OP_RADIO` mode 3: cut the chip's power and stay powered down (`wifi radio off hard`).
-    pub const RADIO_HARD_OFF: u8 = 3;
-    /// Status while the chip is powered down: every op but status and the radio op answers this.
-    pub const RADIO_POWERED_OFF: u8 = 18;
-    /// `OP_RADIO` reply byte 3 after `on` on a powered-down chip: power restored, driver to be restarted.
-    pub const COLD_START: u8 = 19;
-    /// The KERNEL refused to drive the chip's power: this machine has no control over it. Distinct from
-    /// `RADIO_DOWN`, which says only that the radio is down - the two were one byte until 2026-10-01, and
-    /// a down radio was reported as a powerless machine.
-    pub const NO_POWER_CONTROL: u8 = 20;
-    pub const OP_STORED: u8 = 9;
-    pub const OP_FORGET: u8 = 10;
-    pub const OP_DEBUG: u8 = 11;
-
-    pub const OK: u8 = 0;
-    pub const SCAN_FAILED: u8 = 1;
-    pub const RADIO_DOWN: u8 = 2;
-    pub const SCANNING: u8 = 4;
-    pub const NO_SCAN_YET: u8 = 5;
-    pub const SCAN_DONE: u8 = 6;
-    pub const RADIO_OFF: u8 = 7;
-    pub const JOINED: u8 = 10;
-    pub const NOT_FOUND: u8 = 11;
-    pub const PASSPHRASE_REFUSED: u8 = 12;
-    pub const JOIN_FAILED: u8 = 13;
-    pub const JOIN_TIMEOUT: u8 = 14;
-    pub const HANDSHAKE_UNIMPLEMENTED: u8 = 15;
-    pub const NEEDS_PASSPHRASE: u8 = 16;
-    pub const ALREADY_JOINED: u8 = 17;
-
-    /// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security note.
-    pub const RECORD: usize = 45;
-    /// The record's NOTE byte: a key is held for this name / this is the network joined.
-    pub const NOTE_SAVED: u8 = 1;
-    pub const NOTE_JOINED: u8 = 2;
-    /// The most records the driver holds, and so the most a sweep can number.
-    pub const MAX_RECORDS: usize = 32;
-    /// `IEEE80211_MAX_SSID_LEN`.
-    pub const SSID_MAX: usize = 32;
-    /// `CYW43_WPA_MAX_PASSWORD_LEN`, the longest passphrase the request carries.
-    pub const PASS_MAX: usize = 64;
-    /// Request layout for a join: `[op, ssid_len, ssid[32], pass_len, pass[64]]`.
-    pub const JOIN_REQ: usize = 1 + 1 + SSID_MAX + 1 + PASS_MAX;
-    /// Security bytes, the driver's reading of the beacon.
-    pub const SEC_WEP: u8 = 1;
+    pub use godspeed_wifi::wire::*;
 }
 
 /// One bounded question to the driver, reacquiring it by name once if the send never left.

@@ -537,6 +537,13 @@ name = "godspeed-sdk"
 version = "0.21.0"
 
 [[package]]
+name = "godspeed-wifi"
+version = "0.1.0"
+dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "greet"
 version = "0.1.0"
 dependencies = [
@@ -1485,6 +1492,7 @@ version = "0.21.0"
 dependencies = [
  "godspeed",
  "godspeed-sdk",
+ "godspeed-wifi",
 ]
 
 [[package]]
@@ -1919,6 +1927,7 @@ version = "0.1.0"
 dependencies = [
  "godspeed",
  "godspeed-sdk",
+ "godspeed-wifi",
 ]
 
 [[package]]

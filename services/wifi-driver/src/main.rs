@@ -44,11 +44,8 @@ mod aicore;
 mod armcr4;
 mod backplane;
 mod bus;
-mod crypto;
 mod ctrl;
-mod eapol;
 mod frames;
-mod keyfile;
 mod scan;
 mod firmware;
 mod erom;
@@ -58,6 +55,9 @@ mod sdio;
 mod upload;
 
 use godspeed_sdk::{Message, ServiceContext};
+// The chip-independent half, shared with every radio driver (`sdk/wifi`). Imported at the root so the
+// modules here keep writing `crate::crypto` and friends.
+use godspeed_wifi::{crypto, eapol, keyfile};
 
 /// Once identification is over, this is the clock to run at.
 ///

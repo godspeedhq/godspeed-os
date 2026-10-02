@@ -26,7 +26,7 @@ pub const PATH: &[u8] = b"/wifi.keys";
 const MAGIC: [u8; 4] = *b"GSWK";
 const FILE_VERSION: u8 = 1;
 pub use crate::crypto::PMK_LEN;
-pub use crate::join::MAX_SSID as SSID_MAX;
+pub use crate::wire::SSID_MAX;
 pub const MAX_SAVED: usize = 48;
 const HEADER: usize = 6;
 const ENTRY: usize = 1 + SSID_MAX + 1 + PMK_LEN;

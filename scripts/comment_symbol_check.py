@@ -41,7 +41,7 @@ can never come back without a deliberate edit - and may not GROW without one. Th
 on every run so a drop is visible, and entries that are no longer needed are named so the ratchet
 can be tightened rather than quietly carried.
 
-SCOPE. Rust under `kernel/src`, `services`, `sdk/rust/src`, `stdlib/rust/src`, `osdev/src` and
+SCOPE. Rust under `kernel/src`, `services`, `sdk/rust/src`, `sdk/wifi/src`, `stdlib/rust/src`, `osdev/src` and
 `examples`. Names are matched only in backticks and only when they carry an underscore, because a
 single bare word in a comment is prose far more often than it is an identifier - the same rule
 `doc_symbols_check` settled on for the same reason.
@@ -56,7 +56,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "COMMENT-SYMBOLS.baseline.txt")
 
 # Scanned for comments AND contributing to the code corpus.
-SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "stdlib/rust/src", "osdev/src", "examples"]
+SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "sdk/wifi/src", "stdlib/rust/src", "osdev/src", "examples"]
 
 # Contribute to the CODE corpus only. A comment may legitimately name the checker that enforces it
 # (`util_help_coverage_problems`), and a driver comment may name a declared CONTRACT field

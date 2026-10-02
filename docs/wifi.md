@@ -3976,3 +3976,34 @@ list | sort reverse dbm`, `| where dbm>-60`, `| max dbm` and `| to json` work. T
 negative number, so it gained one (`Value::Signed`, `docs/records.md`). `match` on a record stream points
 at `where`, as it does for `dir`. QEMU, three canned networks at -41, -80 and -9: `sort reverse dbm`
 ordered -9, -41, -80; `where dbm>-60` kept two; `max` -9, `min` -80, `avg` -43.
+
+## 59. One station, three radios: the shared half moves to `sdk/wifi` (2026-10-02)
+
+**Why now.** A second radio is on the bench - the VisionFive 2 Lite's AIC8800D80 (section 44) - and a third
+is identified, the Pi 2's RTL8188CUS. Read against each other (`build/vf2wifi/`, the AIC8800 vendor driver
+and the JH7110 sources), they differ in the bus, the firmware upload and the firmware's language, and in
+nothing above that: every one has the HOST run the WPA2 handshake, keep the keys, and answer the same
+`wifi` and `nic-driver` requests. The one real split is full-MAC (Broadcom, AIC: the chip scans and
+associates) against soft-MAC (Realtek: the host builds the 802.11 frames). The AIC sits nearer the
+soft-MAC than expected - its scan results and received data are raw 802.11 frames - so beacon parsing and
+the 802.11-to-Ethernet conversion are shared work too.
+
+**The shape.** `sdk/wifi` (`godspeed-wifi`), a `no_std` library with no `unsafe`, holds what every radio
+shares. Below it, a `Station` trait - scan, connect, add a key, open the control port, disconnect, link,
+frames, power, recover - that each full-MAC chip implements and that a shared host-side MLME will
+implement over a soft-MAC `RawRadio`; and an `SdioHost` trait under the two SDIO chips, so the Broadcom
+code runs on any SDIO host and the AIC gets a DesignWare one. Not in the SDK: that is the operating
+system's interface and its audited `unsafe`, and 802.11 is neither (`sdk/wifi/CLAUDE.md`).
+
+**Step 1, this change.** `crypto`, `eapol` and `keyfile` moved as they were (their history followed), and
+the wire protocol became one module, `wire`, that the driver's `scan::reply` and the shell's `wifi_wire`
+both re-export - the shell had kept a hand mirror of the driver's constants. No behaviour changed. Three
+gates listed their source directories by hand and missed the new crate (two symbol checkers and the
+`unsafe` deny rule); they cover it now.
+
+**Firmware, decided the same day by the operator: ship it, as the Broadcom blobs are shipped (section 8).**
+For the Realtek that is the same footing: its firmware is in upstream `linux-firmware` under Realtek's
+redistribution licence. For the AIC8800 it is not, and that is recorded rather than smoothed over: no
+licence from AICSemi itself was found, only a packager's blanket claim (Radxa's `debian/copyright`) and a
+distribution's `freedist` label. And only one of Radxa's five copies matches what the board loads, so the
+files will come from the board's own vendor image when that phase arrives, with their provenance beside them.

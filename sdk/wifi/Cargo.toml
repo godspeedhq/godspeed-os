@@ -1,0 +1,13 @@
+[package]
+name = "godspeed-wifi"
+version = "0.1.0"
+edition = "2021"
+
+# The chip-independent half of every WiFi driver, and the wire protocol the shell shares with them.
+# A library, not a service: no entry point, nothing spawned.
+[lib]
+name = "godspeed_wifi"
+path = "src/lib.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../rust" }

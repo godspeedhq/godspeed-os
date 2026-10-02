@@ -36,7 +36,8 @@
 
 use godspeed_sdk::ServiceContext;
 
-use crate::scan::ev;
+/// An Ethernet header: the EAPOL frame follows it (Linux names this length ETH_HLEN).
+const ETHHDR: usize = 14;
 
 /// `ETHERTYPE_EAPOL`.
 pub const ETHERTYPE_EAPOL: u16 = 0x888E;
@@ -156,7 +157,7 @@ pub fn build_key_frame(
     key_data: &[u8],
     kck: Option<&[u8; 16]>,
 ) -> usize {
-    let total = ev::ETHHDR + at::KEY_HEADER + key_data.len();
+    let total = ETHHDR + at::KEY_HEADER + key_data.len();
     if out.len() < total {
         return 0;
     }
@@ -164,7 +165,7 @@ pub fn build_key_frame(
     out[0..6].copy_from_slice(to);
     out[6..12].copy_from_slice(from);
     out[12..14].copy_from_slice(&ETHERTYPE_EAPOL.to_be_bytes());
-    let k = &mut out[ev::ETHHDR..total];
+    let k = &mut out[ETHHDR..total];
     k[at::PKT_VERSION] = 1;
     k[at::PKT_TYPE] = TYPE_KEY;
     let body_len = (at::KEY_HEADER - 4 + key_data.len()) as u16;
@@ -261,16 +262,16 @@ impl Key {
 /// `frame` starts at the ethernet header. Returns `None`, with the reason logged, for anything that is not
 /// a key descriptor this driver knows - which is reported, never silently skipped.
 pub fn describe(frame: &[u8], ctx: &ServiceContext) -> Option<Key> {
-    if frame.len() < ev::ETHHDR + at::KEY_HEADER {
+    if frame.len() < ETHHDR + at::KEY_HEADER {
         ctx.log_fmt(format_args!(
             "wifi-driver:   an EAPOL frame of {} bytes is shorter than the {} its ethernet and key headers \
              need - not read",
             frame.len(),
-            ev::ETHHDR + at::KEY_HEADER
+            ETHHDR + at::KEY_HEADER
         ));
         return None;
     }
-    let k = &frame[ev::ETHHDR..];
+    let k = &frame[ETHHDR..];
     let be16 = |o: usize| u16::from_be_bytes([k[o], k[o + 1]]);
     let version = k[at::PKT_VERSION];
     let ptype = k[at::PKT_TYPE];
@@ -295,7 +296,7 @@ pub fn describe(frame: &[u8], ctx: &ServiceContext) -> Option<Key> {
     nonce.copy_from_slice(&k[at::KEY_NONCE..at::KEY_NONCE + 32]);
     let mut from = [0u8; 6];
     from.copy_from_slice(&frame[6..12]);
-    let key_data_at = ev::ETHHDR + at::KEY_HEADER;
+    let key_data_at = ETHHDR + at::KEY_HEADER;
     let key_data_len = core::cmp::min(pay_len as usize, frame.len().saturating_sub(key_data_at));
     let key = Key {
         desc,
