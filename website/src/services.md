@@ -190,7 +190,9 @@ The kernel gains nothing from networking: it routes messages, and a socket is a 
 capability owned by `net-stack`. There is no ambient network any more than there is an ambient
 filesystem.
 
-**Peers:** `net-stack` → `nic-driver`, `time`.
+The clock is not the network's: `net-stack` never calls the clock service, which fetches its own NTP answer through `net-stack`'s op 12, a UDP datagram answered when the reply arrives.
+
+**Peers:** `net-stack` → `nic-driver`.
 
 ### `console` - the terminal
 
@@ -209,7 +211,7 @@ cannot ask a service to report it (§11.4).
 ### `time` - the wall clock
 
 ```
-   shell ──▶ time ──▶ net-stack (SNTP)
+   shell ──▶ time ──▶ net-stack (op 12: one NTP datagram, answered when it arrives)
                  └──▶ fs (persist a clock floor across boots)
 ```
 

@@ -411,3 +411,37 @@ The dance itself (DHCP and ARP) blocks it while the network is being configured 
 `nic-driver` can cost a second, because the first send does not wake it: `backlog/66`, a lost wake-up in
 the kernel's blocked-receiver path, measured and parked. The decoupling should remove the multi-second
 stalls the clock caused - not yet run on hardware; it does not touch that one-second tax, and a slow `ping` after this change is that.
+
+### 16.1 Later the same day: the clock leaves `net-stack` entirely
+
+The decoupling above still left clock work inside `net-stack`: the SNTP query and its parsing, the nudge
+and the four places that had to catch it, a bounded wait on `time` for every result it pushed (up to two
+seconds, twice, with every client queued behind it), and `date sync` running the whole exchange in the
+loop. The operator's call: "I don't want it in the way of a ping. We have a time service right?"
+
+**What `net-stack` has now: no clock code, and one generic operation.** Op 12, a UDP ask:
+`[wait_secs, ip(4), port(2), datagram..]`. The datagram goes out at once from a random source port, the
+asker's reply capability is held in a four-slot table (`UdpAsk`), and the loop goes on serving. The poll
+step, which reads every frame anyway, hands the first datagram back from that address and port to that
+source port straight to the asker - `[ASK_OK, payload]` - and a deadline (at most 10 s) answers
+`[ASK_TIMEOUT]`. A reconfigured network answers every open ask `[ASK_ABANDONED]`. It knows nothing about
+what is inside, and it needs no more authority than opening a socket. Op 10 is retired and says so;
+the nudge (op 11), `SET_CLOCK` and the send capability to `time` are gone.
+
+**What `time` has now: the whole NTP client.** It builds the 48-byte query with a hardware-random nonce
+in the transmit timestamp, sends it with op 12 through its existing non-blocking send, and matches the
+answer in its loop by tag - exactly as it already matched `fs` replies. It checks what `net-stack` used
+to check (server mode, a synchronised server, a real stratum, and its own nonce echoed as the originate
+timestamp), and `Clock::set_network` judges plausibility as before. A query with no answer after 8 s is
+given up on, and a late answer to it is refused by its nonce. `OP_SET` is retired: it let any client set
+the clock, and the only caller was `net-stack`. `OP_SYNC` (5) is `date sync`: `time` sends a query at once
+and answers immediately, and the shell watches the sync age in `OP_NOW` drop - bounded at 10 s, `q` quits.
+
+**Why a late answer is safe here** when it was not for the stash (`docs/net-tags-design.md` 7.2): the
+client can tell. A reply that arrives after `time` gave up and asked again carries the old nonce, and
+the new question's check refuses it.
+
+**What is lost, said plainly:** `date sync` no longer resolves `pool.ntp.org` first - every query goes to
+the anycast address (162.159.200.123), because a DNS lookup would block `net-stack`'s loop. A network
+that blocks that address and allows the pool gets no clock. And an NTP answer that lands while another
+operation is draining frames is not delivered by the poll step; `time` gives up after 8 s and asks again.

@@ -338,15 +338,6 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
             // (backlog/29). Every other candidate was eliminated by reading; this one cannot be, so it
             // is being measured rather than assumed.
             None => {
-                // `time`'s clock nudge, met mid-question: EXACTLY one byte, 11, which no driver reply is -
-                // its one-byte answers are 0 and 1, and a frame batch that counts 11 carries its frames.
-                // Not this wait's answer: recorded and served between requests (docs/networking.md 16).
-                // Taken for the answer, it was parsed as a frame batch and the real reply orphaned.
-                if m.payload_bytes() == [11u8] {
-                    pending.note_nudge();
-                    ctx.log("net-stack: `time`'s clock nudge arrived during a driver exchange - kept, served between requests");
-                    return false;
-                }
                 if matches!(m.payload_bytes().first(), Some(&21) | Some(&22))
                     && !pending.ate_client_said
                 {
@@ -450,9 +441,6 @@ pub struct Displaced {
     /// Said-once latch for the one SILENT way a client request can be lost - see the `None` arm of
     /// `sifted_req`'s closure.
     ate_client_said: bool,
-    /// `time`'s clock nudge (op 11) met somewhere other than the serve loop's own receive - inside a
-    /// driver wait or a dance - and owed. The loop serves it between requests (docs/networking.md 16).
-    nudge_owed: bool,
     /// Requests stashed over this service's life, for the throttled line in `note`.
     noted: u32,
 
@@ -538,7 +526,6 @@ impl Displaced {
         Displaced {
             n: 0,
             ate_client_said: false,
-            nudge_owed: false,
             noted: 0,
             held: [const { None }; STASH_N],
             head: 0,
@@ -594,17 +581,11 @@ impl Displaced {
         }
     }
 
-    /// Is there owed work - a displaced client request or `time`'s nudge - that the loop should serve
+    /// Is there owed work - a displaced client request - that the loop should serve
     /// before sleeping?
     ///
     /// The wait loop asks this so it does not SLEEP on work it already has - see its call site.
-    fn has_work(&self) -> bool { self.live > 0 || self.nudge_owed }
-
-    /// Record `time`'s clock nudge, wherever it was met; served at the top of the serve loop.
-    fn note_nudge(&mut self) { self.nudge_owed = true; }
-
-    /// Take the recorded nudge, if there is one.
-    fn take_nudge(&mut self) -> bool { core::mem::replace(&mut self.nudge_owed, false) }
+    fn has_work(&self) -> bool { self.live > 0 }
 
     /// Take the oldest request still worth answering, for the serve loop.
     ///
@@ -683,15 +664,7 @@ fn serve_while_dancing(ctx: &ServiceContext, pending: &mut Displaced, serve_stat
     // 16 = the per-endpoint queue depth (§8.5); draining at most that many bounds this pass.
     for _ in 0..16 {
         let Some(req) = ctx.try_recv() else { return };
-        let Some(reply) = ctx.take_pending_cap() else {
-            // `time`'s clock nudge carries no reply cap by design, so it used to be dropped here without a
-            // word, and a boot's first sync waited out `time`'s next twenty seconds. Kept instead.
-            if req.payload_bytes() == [11u8] {
-                pending.note_nudge();
-                ctx.log("net-stack: `time`'s clock nudge arrived during the dance - kept, served once it ends");
-            }
-            continue;
-        };
+        let Some(reply) = ctx.take_pending_cap() else { continue };
         let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(status));
         ctx.remove_cap(reply);
     }
@@ -1325,9 +1298,10 @@ const COP_STAT: u8 = 3;
 
 /// Send a UDP datagram (src_port -> dest_ip:dest_port carrying `data`) THROUGH nic-driver and copy the
 /// response's UDP payload into `out`. Returns the payload length, or None (no gateway / no reply).
-fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
-                 src_port: u16, dest_ip: &[u8; 4], dest_port: u16, data: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut frame = [0u8; 1600];
+/// Build one UDP datagram from `src_port` to `dest_ip:dest_port`, addressed through `gw_mac`, into `frame`.
+/// Returns the frame's length. The UDP checksum is left zero, which IPv4 permits.
+fn build_udp(frame: &mut [u8; 1600], gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
+             src_port: u16, dest_ip: &[u8; 4], dest_port: u16, data: &[u8]) -> usize {
     let dlen = data.len().min(frame.len() - 42);
     frame[0..6].copy_from_slice(gw_mac);
     frame[6..12].copy_from_slice(our_mac);
@@ -1345,7 +1319,14 @@ fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6]
     let ulen = (8 + dlen) as u16;
     frame[38] = (ulen >> 8) as u8; frame[39] = ulen as u8;
     frame[42..42 + dlen].copy_from_slice(&data[..dlen]);
-    let req = Message::from_bytes(&frame[..42 + dlen]);
+    42 + dlen
+}
+
+fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
+                 src_port: u16, dest_ip: &[u8; 4], dest_port: u16, data: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut frame = [0u8; 1600];
+    let n = build_udp(&mut frame, gw_mac, our_ip, our_mac, src_port, dest_ip, dest_port, data);
+    let req = Message::from_bytes(&frame[..n]);
 
     // SEND ONCE, THEN RX-POLL. This used to re-transmit the datagram on every pass and read whatever
     // came back from the SEND, which is the shape the DNS path above was fixed out of and for the same
@@ -1661,7 +1642,7 @@ const _: () = assert!(POLL_BUDGET_MS < HOLD_MS,
 /// table. Returns whether anything arrived, so the caller can keep polling while the wire is busy
 /// instead of sleeping through a burst.
 fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
-             t: &mut tcp::Tcp, net: &tcp::Net, sntp: &mut Option<SntpJob>) -> bool {
+             t: &mut tcp::Tcp, net: &tcp::Net, asks: &mut UdpAsks) -> bool {
     // THE BUDGET. Everything below checks it before issuing more driver work, so this step cannot
     // outlast its own interval and starve the client the service exists to answer.
     let t0 = ctx.read_tsc();
@@ -1705,15 +1686,10 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
             }
             continue;
         }
-        // The answer to a background SNTP query (`sntp_job_start`). Recorded, not acted on: adopting it is
-        // an IPC to `time`, and this step's budget is for frames.
-        if let Some(j) = sntp.as_mut() {
-            if j.got.is_none() {
-                if let Some(u) = sntp_reply_epoch(&j.q, f) {
-                    j.got = Some(u);
-                    continue;
-                }
-            }
+        // The answer to a UDP ask (op 12): handed straight to the client that asked, whose reply cap
+        // has been held for exactly this. One try_send, so it costs this step nothing to deliver.
+        if asks.deliver(ctx, f) {
+            continue;
         }
         // Anything else that is TCP for one of our connections. `on_frame` never transmits - it
         // records what is owed and `poll_one` below sends it, which is the separation that took a
@@ -1803,301 +1779,126 @@ fn feed_tx(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net:
     }
 }
 
-/// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
-const NTP_UNIX_OFFSET: u32 = 2_208_988_800;
-/// A fixed anycast NTP server (time.cloudflare.com): used by `date sync` if DNS cannot resolve a pool
-/// name - so a DNS hiccup never blocks the clock - and ALWAYS by the background query (`sntp_job_start`),
-/// which cannot do a DNS lookup without blocking the loop. Anycast: routed to the nearest instance.
-const NTP_FALLBACK_IP: [u8; 4] = [162, 159, 200, 123];
-/// A plausible "now" window - reject a garbage/stale/hostile SNTP timestamp outside it rather than adopt
-/// it as this machine's time. Floor = 2020-01-01, ceiling = 2100-01-01 (both fit a u32 epoch).
-const SNTP_MIN_PLAUSIBLE: u32 = 1_577_836_800;
-const SNTP_MAX_PLAUSIBLE: u32 = 4_102_444_800;
-/// Tries for the SNTP exchange. Deliberately FEWER than DANCE_TRIES: each try costs a DANCE_SECS drain, and
-/// this runs inside net-stack's single-threaded serve loop, so a silent NTP server must not hold every
-/// other client op (net/ping/dns) behind it for the full 6-try budget. The background query reuses the
-/// same count as its resend budget, but there each try is a deadline the loop checks, not a wait.
-const SNTP_TRIES: u32 = 3;
-
 /// How long to leave between automatic re-DHCP and gateway-ARP retries while the stack is unconfigured.
 ///
 /// A minute: long enough that a silent DHCP server or gateway costs one exchange a minute rather than
-/// one per request. (It used to space SNTP retries too; the clock is no longer fetched on a client's
-/// request at all - see the note above `SntpQuery`.)
+/// one per request. (It used to space SNTP retries too; this service no longer fetches the clock at
+/// all - the `time` service does, through op 12, `UdpAsk`.)
 const RESYNC_SECS: i64 = 60;
+
 /// How often a configured stack re-reads the link's ADDRESS (op 3) to notice that a different link is
 /// carrying its frames. Seconds rather than a minute because a person who pulled a cable is waiting.
 const ADDR_CHECK_SECS: i64 = 2;
 
-// SNTP: fetch the current time from an NTP server and hand it to the clock's owner, `time`. Two callers,
-// two shapes, and the difference IS the decoupling (docs/networking.md 16):
-//
-// - `date sync` (op 10) waits for its answer, because the operator asked and is waiting at the prompt:
-//   `sntp_sync`, synchronous, resolving pool.ntp.org first.
-// - `time`'s nudge (op 11) normally waits for nothing: `sntp_job_start` sends the query and returns to
-//   the loop, the poll step records the reply among the frames it drains every `POLL_MS`, and
-//   `sntp_job_tick` adopts it or, past its deadline, resends or gives up. No client is held behind a
-//   time server. Two exceptions, both logged: with no calibrated cycle counter the poll step never
-//   runs, so the nudge falls back to `sntp_sync`, synchronously; and a nudge that finds the link up
-//   but unconfigured runs the (blocking) dance first.
-//
-// Network configuration never fetches the clock and no ordinary client request starts it. That
-// coupling cost a `ping` 7092 ms for an echo whose wire round trip was 39 ms, queued behind an SNTP
-// exchange (boot 2026-10-01 11:17-11:18) - every request queued behind one exchange in this
-// single-threaded loop.
-
-/// One SNTP request, built once: the frame, and the nonce and source port that bind its reply to it.
-struct SntpQuery {
-    frame: [u8; 90],
-    nonce: [u8; 8],
+/// A UDP EXCHANGE ANSWERED WHEN ITS REPLY ARRIVES (op 12), held while this service goes on serving.
+///
+/// **Why it exists.** Every other UDP path here waits for its reply inside the serve loop (`udp_roundtrip`,
+/// up to six tries of two seconds), and while it waits nobody else is served - a `ping` typed during a
+/// clock sync sat behind a time server. This sends the datagram, keeps the asker's reply capability, and
+/// returns to the loop at once. The poll step, which reads every frame anyway, hands the matching reply
+/// straight to the asker; a deadline answers "no reply" instead. Nothing waits.
+///
+/// **What it knows: nothing about what is inside.** It was built so that NTP could leave this service -
+/// the `time` service now builds, sends and checks its own queries (docs/networking.md 16) - but it is
+/// generic: an address, a port, some bytes, and the first datagram that comes back from there to the
+/// port this chose.
+///
+/// **A late answer is safe ONLY because the client checks it.** A reply delivered after the client gave
+/// up and asked again would otherwise be read as the answer to the NEW question - the hazard that killed
+/// the first stash (`docs/net-tags-design.md` 7.2). So the client must be able to tell: the request
+/// header's tag is echoed, and the payload should carry its own proof (NTP's originate timestamp echoes
+/// the client's nonce). This service promises nothing beyond "this came from where you sent".
+///
+/// **Authority:** the same as opening a UDP socket - a send capability to this service - and no more.
+/// The source port is chosen here, at random, so an off-path sender cannot guess where to aim a forgery.
+struct UdpAsk {
     src_port: u16,
-    ntp_ip: [u8; 4],
+    dest_ip: [u8; 4],
+    dest_port: u16,
+    reply: Reply,
+    /// Monotonic second after which the asker is told no reply came.
+    until_secs: i64,
 }
 
-/// Build an SNTP request for `ntp_ip`, addressed through the gateway in `st`.
-fn sntp_query(ctx: &ServiceContext, st: &NetState, ntp_ip: [u8; 4]) -> SntpQuery {
-    // A NONCE binds the reply to THIS request (RFC 4330 §5): the client puts it in the TRANSMIT timestamp
-    // (SNTP bytes 40..48 = frame 82..90) and the server echoes it back in the ORIGINATE timestamp (SNTP
-    // bytes 24..32 = frame 66..74). Without it every match field is a compile-time constant, so ANY host
-    // could spray one UDP packet and set this machine's wall clock - the capability system would have
-    // granted net-stack the right to set the clock, and net-stack would have handed the VALUE to a
-    // stranger (a confused deputy: §3.1/§26.9, authority reached by a principal that holds none).
-    let nonce: [u8; 8] = {
-        let hi = ctx.hw_random().unwrap_or((ctx.read_tsc() >> 13) as u32);
-        let lo = ctx.hw_random().unwrap_or(ctx.read_tsc() as u32);
-        let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
-        [h[0], h[1], h[2], h[3], l[0], l[1], l[2], l[3]]
-    };
-    // The source port is derived from the nonce too, so it is not a constant an off-path spoofer can assume.
-    let src_port: u16 = 40_000 + (u16::from_be_bytes([nonce[0], nonce[1]]) % 20_000);
-    // Build the request frame ONCE: eth(14) + IPv4(20) + UDP(8) + SNTP(48) = 90 bytes.
-    let mut frame = [0u8; 90];
-    frame[0..6].copy_from_slice(&st.gw_mac);
-    frame[6..12].copy_from_slice(&st.our_mac);
-    frame[12] = 0x08; frame[13] = 0x00;                  // IPv4
-    frame[14] = 0x45;
-    let total: u16 = 20 + 8 + 48;
-    frame[16] = (total >> 8) as u8; frame[17] = total as u8;
-    frame[22] = 64; frame[23] = 17;                      // TTL, UDP
-    frame[26..30].copy_from_slice(&st.our_ip);
-    frame[30..34].copy_from_slice(&ntp_ip);
-    let ip_ck = checksum(&frame[14..34]);
-    frame[24] = (ip_ck >> 8) as u8; frame[25] = ip_ck as u8;
-    frame[34] = (src_port >> 8) as u8; frame[35] = src_port as u8;
-    frame[36] = 0; frame[37] = 123;                      // dest port 123
-    frame[38] = 0; frame[39] = 8 + 48;                   // UDP length
-    frame[42] = 0x1B;                                    // SNTP: LI 0, VN 3, Mode 3 (client)
-    frame[82..90].copy_from_slice(&nonce);               // transmit timestamp = our nonce
-    SntpQuery { frame, nonce, src_port, ntp_ip }
+/// Outstanding asks. Small on purpose: the one client today asks once at a time, and a full table is
+/// refused loudly (`ASK_BUSY`) rather than grown.
+const UDP_ASK_SLOTS: usize = 4;
+/// The longest an ask may wait for its reply, whatever the client asked for.
+const UDP_ASK_MAX_SECS: i64 = 10;
+
+/// Op 12's reply status, the first byte after the echoed tag.
+const ASK_BAD: u8 = 0;
+const ASK_OK: u8 = 1;
+const ASK_TIMEOUT: u8 = 2;
+const ASK_NO_ROUTE: u8 = 3;
+const ASK_BUSY: u8 = 4;
+const ASK_ABANDONED: u8 = 5;
+const ASK_NOT_SENT: u8 = 6;
+
+struct UdpAsks {
+    slots: [Option<UdpAsk>; UDP_ASK_SLOTS],
 }
 
-/// The Unix time in `f` if it is the server's answer to `q`, else `None`.
-fn sntp_reply_epoch(q: &SntpQuery, f: &[u8]) -> Option<u32> {
-    let (ntp_ip, src_port, nonce) = (q.ntp_ip, q.src_port, q.nonce);
-    // A UDP reply FROM ntp_ip:123 TO our source port, ECHOING our nonce. `f[14] == 0x45` pins a
-    // 20-byte IP header, without which every offset below (ports at 34/36, SNTP at 42+) would be
-    // read from the wrong place on a packet carrying IP options.
-    if f.len() >= 90 && f[12] == 0x08 && f[13] == 0x00 && f[14] == 0x45 && f[23] == 17
-        && f[26..30] == ntp_ip[..] && f[34] == 0 && f[35] == 123
-        && f[36] == (src_port >> 8) as u8 && f[37] == src_port as u8
-        && f[66..74] == nonce[..]                        // originate == our nonce: this is OUR reply
-        && f[42] & 0x07 == 4                             // mode 4 = server
-        && f[42] >> 6 != 3                               // LI 3 = unsynchronized clock
-        && f[43] >= 1 && f[43] <= 15                     // stratum (0 = kiss-of-death, no time)
-    {
-        let ntp_secs = u32::from_be_bytes([f[82], f[83], f[84], f[85]]);
-        if ntp_secs > NTP_UNIX_OFFSET {
-            let u = ntp_secs - NTP_UNIX_OFFSET;
-            // Bounded BOTH ways: a garbage or hostile timestamp outside a plausible window is
-            // refused rather than becoming this machine's idea of now.
-            if (SNTP_MIN_PLAUSIBLE..=SNTP_MAX_PLAUSIBLE).contains(&u) { return Some(u); }
+impl UdpAsks {
+    const fn new() -> Self { Self { slots: [None, None, None, None] } }
+
+    fn free_slot(&self) -> Option<usize> { self.slots.iter().position(|s| s.is_none()) }
+
+    /// A source port no open ask is using, chosen at random in 50000..59999 (sockets use 40000 + n).
+    fn pick_port(&self, ctx: &ServiceContext) -> u16 {
+        loop {
+            let r = ctx.hw_random().unwrap_or(ctx.read_tsc() as u32);
+            let p = 50_000 + (r % 10_000) as u16;
+            if !self.slots.iter().flatten().any(|a| a.src_port == p) { return p; }
         }
     }
-    None
-}
 
-/// Hand `u` to `time`, which owns the wall clock and decides whether to believe it. `None` if it refused,
-/// did not answer within `ADOPT_SECS`, or could not be reached - each SAID, because they are three
-/// different faults. BOUNDED: this runs inside the serve loop, from `date sync` and from the poll's
-/// background path alike, and an unbounded wait on another service is exactly the coupling this file
-/// removed.
-fn adopt_ntp_time(ctx: &ServiceContext, u: u32) -> Option<u32> {
-    // `time` answers OP_SET from memory; two seconds is generous, and a bound is what matters.
-    const ADOPT_SECS: i64 = 2;
-    // Clock slice 2: the wall clock belongs to the `time` service, not to a kernel syscall. SNTP is a
-    // NETWORK fact, so net-stack fetches it; deciding whether to believe it - plausibility, the floor,
-    // provenance - is the clock's own policy, and it says no by replying 0.
-    let mut req = [0u8; 9];
-    req[0] = 2; // OP_SET
-    req[1..9].copy_from_slice(&(u as i64).to_le_bytes());
-    let msg = Message::from_bytes(&req);
-    // A SEND that failed means the cap is stale - `time` restarted, or started after us - so reacquire
-    // by name and ask once more (`find_send_slot` does not resolve a name; learned in arm32 3c). A
-    // DEADLINE is not retried: the request was delivered, and a second copy would be a second request.
-    let outcome = match ctx.request_with_reply_call_err("time", &msg, ADOPT_SECS) {
-        Err(_) => {
-            let _ = ctx.reacquire_by_name("time");
-            ctx.request_with_reply_call_err("time", &msg, ADOPT_SECS)
-        }
-        other => other,
-    };
-    match outcome {
-        Ok(Some(r)) => {
-            let p = r.payload_bytes();
-            if !p.is_empty() && p[0] != 0 {
-                return Some(u);
+    /// If `f` is the reply to an open ask - UDP, from the address and port it went to, to the port it came
+    /// from - hand its payload to the asker and close the ask. Returns whether it was one.
+    fn deliver(&mut self, ctx: &ServiceContext, f: &[u8]) -> bool {
+        if f.len() < 42 || f[12] != 0x08 || f[13] != 0x00 || f[23] != 17 { return false; }
+        let src_ip = [f[26], f[27], f[28], f[29]];
+        let src_port = u16::from_be_bytes([f[34], f[35]]);
+        let dst_port = u16::from_be_bytes([f[36], f[37]]);
+        let Some(i) = self.slots.iter().position(|s| matches!(s, Some(a)
+            if a.src_port == dst_port && a.dest_port == src_port && a.dest_ip == src_ip)) else { return false };
+        let Some(a) = self.slots[i].take() else { return false };
+        let payload_len = (((f[38] as usize) << 8) | (f[39] as usize)).saturating_sub(8);
+        let n = payload_len.min(f.len() - 42).min(2048);
+        let mut out = [0u8; 2049];
+        out[0] = ASK_OK;
+        out[1..1 + n].copy_from_slice(&f[42..42 + n]);
+        a.reply.send(ctx, &out[..1 + n]);
+        a.reply.done(ctx);
+        true
+    }
+
+    /// Tell every asker whose deadline has passed that no reply came. Run on every serve pass.
+    fn expire(&mut self, ctx: &ServiceContext) {
+        let now = ctx.epoch_secs_monotonic();
+        for s in self.slots.iter_mut() {
+            if matches!(s, Some(a) if now >= a.until_secs) {
+                if let Some(a) = s.take() {
+                    a.reply.send(ctx, &[ASK_TIMEOUT]);
+                    a.reply.done(ctx);
+                }
             }
-            ctx.log("net-stack: SNTP - the `time` service refused the network time (its plausibility check or floor) - clock unchanged");
-            None
-        }
-        Ok(None) => {
-            ctx.log_fmt(format_args!(
-                "net-stack: SNTP - `time` did not answer within {} s - clock unchanged", ADOPT_SECS));
-            None
-        }
-        Err(_) => {
-            ctx.log("net-stack: SNTP - `time` could not be reached - clock unchanged");
-            None
         }
     }
-}
 
-/// `date sync`: resolve a server, query it, and WAIT for the answer - bounded by `SNTP_TRIES` sends of
-/// `DANCE_SECS` each. The operator's own request does this; so does `time`'s nudge, but only when no
-/// calibrated cycle counter lets the background query run (logged at the call). See the note above
-/// `SntpQuery`.
-fn sntp_sync(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState) -> Option<u32> {
-    if !st.gw_known { return None; }                     // no gateway MAC - nothing to send through
-    // Resolve an NTP server by name; fall back to the fixed anycast IP if DNS is down - but say so. A
-    // recovery that hides the failure it recovered from is a silent fallback (§26.7): without this line an
-    // operator cannot tell a resolved pool address from a broken resolver.
-    let (mut gf, mut fr, mut ud, mut to) = (false, 0u16, 0u16, 0u16);
-    // The operator is waiting at the prompt (`date sync`), and every other client waits behind this
-    // loop while it runs, so the resolve gets the default budget rather than a long one.
-    let sntp_dns_deadline = ctx.read_tsc()
-        .wrapping_add(ctx.duration_cycles(((CLIENT_MIN_DEADLINE_SECS - DNS_REPLY_MARGIN_SECS).max(1) as u64) * 1000));
-    let ntp_ip = match dns_resolve(ctx, pending, sntp_dns_deadline, b"pool.ntp.org", &st.gw_mac, &st.our_ip, &st.our_mac,
-                                   &st.dns_server, &mut gf, &mut fr, &mut ud, &mut to) {
-        Some(ip) => ip,
-        None => {
-            ctx.log("net-stack: SNTP - DNS could not resolve pool.ntp.org - using the fixed anycast NTP IP");
-            NTP_FALLBACK_IP
-        }
-    };
-    let q = sntp_query(ctx, st, ntp_ip);
-    ctx.log_fmt(format_args!("net-stack: SNTP - querying {}.{}.{}.{}:123",
-        ntp_ip[0], ntp_ip[1], ntp_ip[2], ntp_ip[3]));
-    let req = Message::from_bytes(&q.frame);
-
-    // Send the request, then DRAIN + SCAN the RX ring for the reply until it arrives or the deadline - the
-    // same pattern DHCP/ARP use, so a WAN reply that lands tens of ms after the send (which a single-frame
-    // rx would have raced and lost) is caught. Retry past stray frames.
-    let mut unix: Option<u32> = None;
-    let mut arp_out = [0u8; 42];
-    let mut send_fail = 0u32;
-    for _ in 0..SNTP_TRIES {
-        // A query that never left is not a silent time server - see `dhcp_discover`.
-        if nic_req(ctx, pending, &req, LINK_SECS).is_none() { send_fail += 1; }
-        drain_scan(ctx, pending, DANCE_SECS, None, |f, pending| {
-            if let Some(u) = sntp_reply_epoch(&q, f) { unix = Some(u); return true; }
-            // Answer an ARP for us in the meantime so the gateway can keep addressing our unicast replies.
-            if build_arp_reply(f, &st.our_ip, &st.our_mac, &mut arp_out) {
-                // DECIDED, not overlooked: this is a courtesy reply to somebody else's ARP, sent
-                // while we are draining for our own answer. If it fails, that host re-ARPs a moment
-                // later and gets another chance - so the outcome carries no information we would act
-                // on, and logging it from inside a scan loop would flood the console the moment
-                // `nic-driver` is being restarted. Named here so it reads as a decision (§26.7).
-                let _ = nic_req(ctx, pending, &Message::from_bytes(&arp_out), LINK_SECS);
+    /// The network was reconfigured: an ask in flight went out with the old addresses, so its reply
+    /// cannot be matched. Each asker is told, and may ask again.
+    fn abandon(&mut self, ctx: &ServiceContext) {
+        let mut n = 0u32;
+        for s in self.slots.iter_mut() {
+            if let Some(a) = s.take() {
+                a.reply.send(ctx, &[ASK_ABANDONED]);
+                a.reply.done(ctx);
+                n += 1;
             }
-            false
-        });
-        if unix.is_some() { break; }
-    }
-    if unix.is_none() && send_fail > 0 {
-        ctx.log_fmt(format_args!(
-            "net-stack: SNTP got no timestamp, and {} of {} queries never left the host - the driver refused them, so this is not a silent time server",
-            send_fail, SNTP_TRIES));
-    }
-    adopt_ntp_time(ctx, unix?)
-}
-
-/// A BACKGROUND SNTP query in flight - `time`'s nudge, never a client's request. Nothing waits for its
-/// answer: the poll step records it (`got`) among the frames it drains every `POLL_MS`, and the serve
-/// loop adopts it in `sntp_job_tick`. A reply that lands during another operation's drain - a `ping`
-/// waiting for its echo - is consumed there, the same loss TCP recovers from by retransmission, and the
-/// deadline resends; on a healthy network such a drain ends the moment its own reply arrives.
-struct SntpJob {
-    q: SntpQuery,
-    /// When the query last went out, in the kernel's monotonic SECONDS - the clock `drain_scan` measures
-    /// against. Not cycles: the kernel's cycle calibration can disagree with this service's own (it
-    /// reads 0 on the T630), and a deadline of one cycle would expire the job the moment it started.
-    sent_at_secs: i64,
-    tries_left: u32,
-    got: Option<u32>,
-}
-
-/// How long one background query waits for its answer before it is resent. Whole seconds, so between one
-/// and two of them in practice.
-const SNTP_BG_WAIT_SECS: i64 = 2;
-
-/// Start a background SNTP query unless one is already in flight. It goes straight to the anycast server
-/// `sntp_sync` falls back to: a DNS lookup is a blocking exchange in this loop, and the point of the
-/// background path is that nothing here blocks on a time server. `date sync` still resolves pool.ntp.org.
-fn sntp_job_start(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState, job: &mut Option<SntpJob>) {
-    if job.is_some() {
-        ctx.log("net-stack: `time` asked for the clock - a query is already in flight");
-        return;
-    }
-    let q = sntp_query(ctx, st, NTP_FALLBACK_IP);
-    ctx.log_fmt(format_args!(
-        "net-stack: SNTP - querying {}.{}.{}.{}:123 in the background (nothing waits for the answer)",
-        q.ntp_ip[0], q.ntp_ip[1], q.ntp_ip[2], q.ntp_ip[3]));
-    if nic_req(ctx, pending, &Message::from_bytes(&q.frame), LINK_SECS).is_none() {
-        // A query that never left is not a silent time server - see `dhcp_discover`.
-        ctx.log("net-stack: SNTP - the background query never left the host (the driver refused it); `time` will ask again");
-        return;
-    }
-    *job = Some(SntpJob { q, sent_at_secs: ctx.epoch_secs_monotonic(), tries_left: SNTP_TRIES - 1, got: None });
-}
-
-/// The network was reconfigured: a query in flight carries the old addresses in its frame, and if the
-/// new configuration leaves the stack unconfigured the poll that would answer or expire it stops - the job
-/// would sit, silent, contradicting the promise that a nudge which got nowhere is SAID. So it is dropped
-/// here, and said; `time` asks again on its own cadence.
-fn sntp_job_abandon(ctx: &ServiceContext, job: &mut Option<SntpJob>) {
-    if job.take().is_some() {
-        ctx.log("net-stack: the network was reconfigured - the background clock query in flight is abandoned; `time` will ask again");
-    }
-}
-
-/// Advance the background query, once per poll: adopt an answer the poll step recorded, or, past the
-/// deadline, resend or give up - LOUDLY, because a nudge that got nowhere is a different fault from a
-/// nudge that never arrived.
-fn sntp_job_tick(ctx: &ServiceContext, pending: &mut Displaced, job: &mut Option<SntpJob>) {
-    let (got, expired, tries_left) = match job.as_ref() {
-        None => return,
-        Some(j) => (j.got,
-                    ctx.epoch_secs_monotonic() - j.sent_at_secs >= SNTP_BG_WAIT_SECS,
-                    j.tries_left),
-    };
-    if let Some(u) = got {
-        *job = None;
-        if let Some(u) = adopt_ntp_time(ctx, u) {
-            ctx.log_fmt(format_args!("net-stack: clock resolved at `time`'s request ({})", u));
         }
-        return;
-    }
-    if !expired { return; }
-    if tries_left == 0 {
-        *job = None;
-        ctx.log("net-stack: `time` asked for the clock - no SNTP answer");
-        return;
-    }
-    if let Some(j) = job.as_mut() {
-        j.tries_left -= 1;
-        j.sent_at_secs = ctx.epoch_secs_monotonic();
-        if nic_req(ctx, pending, &Message::from_bytes(&j.q.frame), LINK_SECS).is_none() {
-            ctx.log("net-stack: SNTP - a background resend never left the host (the driver refused it)");
+        if n > 0 {
+            ctx.log_fmt(format_args!("net-stack: the network was reconfigured - {} UDP ask(s) in flight abandoned, their askers told", n));
         }
     }
 }
@@ -2693,7 +2494,7 @@ fn run_dance(ctx: &ServiceContext, pending: &mut Displaced, serve_status: Option
     status[15..19].copy_from_slice(&dns_server);
     // CONFIGURING THE NETWORK DOES NOT FETCH THE CLOCK. This dance used to end in an SNTP exchange, a
     // multi-second wait for a time server inside the loop every client is queued behind. The clock is
-    // `time`'s to pursue: its nudge starts a background query once this configuration exists (op 11).
+    // `time`'s to pursue, and it does so itself through op 12 (`UdpAsk`), which never waits in this loop.
     NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status }
 }
 
@@ -2773,12 +2574,6 @@ fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: 
         let badge = ctx.last_recv_badge();
         match ctx.take_pending_cap() {
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
-            // `time`'s clock nudge is not the driver's answer - see `sifted_req`.
-            None if m.payload_bytes() == [11u8] => {
-                pending.note_nudge();
-                ctx.log("net-stack: `time`'s clock nudge arrived during a driver exchange - kept, served between requests");
-                false
-            }
             None => true,
         }
     })
@@ -2792,12 +2587,6 @@ fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Optio
         let badge = ctx.last_recv_badge();
         match ctx.take_pending_cap() {
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
-            // `time`'s clock nudge is not the driver's answer - see `sifted_req`.
-            None if m.payload_bytes() == [11u8] => {
-                pending.note_nudge();
-                ctx.log("net-stack: `time`'s clock nudge arrived during a driver exchange - kept, served between requests");
-                false
-            }
             None => true,
         }
     })
@@ -3010,11 +2799,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets every
     // iteration and reports every time, which is the flood it exists to prevent.
     let mut capless_logged = false;
-    // The background SNTP query `time`'s nudge started, if one is in flight. See `SntpJob`.
-    let mut sntp_job: Option<SntpJob> = None;
-    // `time` asked for the clock and the network was not ready to fetch it: fetched on the first pass after
-    // the stack is configured. See "`time`'S CLOCK NUDGE" at the top of the serve loop.
-    let mut clock_wanted = false;
+    // UDP asks in flight (op 12), answered by the poll step when their replies arrive. See `UdpAsk`.
+    let mut asks = UdpAsks::new();
     // Did DHCP grant `our_ip`, or is it the fallback guess? See `NetState::leased`.
     let mut leased = d.leased;
     // When the last automatic re-DHCP ran, so an unleased stack retries without dancing per request.
@@ -3051,68 +2837,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // carries one recv_slot.
         // A REQUEST DISPLACED BY OUR OWN WORK IS SERVED FIRST, and only then the endpoint.
         //
-        // The one case this covers, measured rather than imagined: `time` nudges this service for the
-        // network clock (op 11, one-way, no reply cap), net-stack runs an SNTP exchange inline, and a
-        // client that spoke during it used to be lost - the shell then waited out its whole deadline
+        // The case that first proved it, measured rather than imagined: a client that spoke while this
+        // service ran an exchange inline used to be lost - the shell then waited out its whole deadline
         // before retrying, and on a slow host the QEMU TCP test failed about one run in three because
-        // of it, both before and after this service learned to sift. (Since 2026-10-01 the nudge
-        // normally sends one SNTP query and returns - `sntp_job_start`. It still runs the dance when the
-        // link is up but unconfigured, and SNTP inline when the poll step cannot run (no calibrated
-        // cycle counter); the stash serves requests displaced by those and by every other driver
-        // conversation.)
+        // of it. (That exchange was `time`'s SNTP query, which no longer runs here at all - the clock
+        // left this service on 2026-10-01; the stash serves requests displaced by the dance and by
+        // every other driver conversation.)
         //
         // The three things a request needs are the same whichever way it got here, so from `pl`
         // downwards this loop cannot tell the difference - which is what keeps this from needing a
         // second copy of every op.
-        // ---- `time`'S CLOCK NUDGE (op 11), HOWEVER IT ARRIVED ----
-        //
-        // Straight onto the endpoint (the capless arm below records it), or met in the middle of a driver
-        // exchange or a dance, where it used to be taken for the driver's answer or dropped without a
-        // word. It is the one automatic path to the clock now, so it may not be lost (docs/networking.md
-        // 16). Not yet everywhere: `nic_status_req`'s clear and the unsifted waits in `dns_resolve` and
-        // the ping drain still eat one; `time`'s 20 s re-send is the backstop. Served here, between requests, and never by waiting: the query goes out and the loop goes
-        // on (the note above `SntpQuery`). A nudge that finds no network stays WANTED and is served on the
-        // first pass after the stack is configured, so a cable plugged in later does not wait out `time`'s
-        // next twenty seconds.
-        let nudged = pending.take_nudge();
-        if nudged {
-            clock_wanted = true;
-            // CONFIGURE FIRST IF THERE IS A CABLE BUT NO ROUTE. A machine booted unplugged and then plugged
-            // in would otherwise sit unconfigured until somebody typed a network command, while `time` was
-            // told "no route yet" every twenty seconds - true, and useless. Asking for the clock IS a
-            // request that needs the network, so it gets the same self-configure as every other.
-            if !gw_known && link_is_up(&ctx, pending) {
-                ctx.log("net-stack: `time` asked for the clock and the cable is in - configuring");
-                let d = run_dance(&ctx, pending, Some(&status));
-                sntp_job_abandon(&ctx, &mut sntp_job);
-                our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac;
-                gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server;
-                status = d.status;
-            }
-        }
-        if clock_wanted {
-            if gw_known && link_is_up(&ctx, pending) {
-                clock_wanted = false;
-                let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
-                if tcpst.have_clock() {
-                    sntp_job_start(&ctx, pending, &st, &mut sntp_job);
-                } else {
-                    // The poll step that answers a background query runs only with this service's cycle
-                    // counter calibrated, and this one never calibrated - `calibrate_tsc_hz` said why when
-                    // it gave up. A job could never be answered, so this one query waits in the loop: the
-                    // old behaviour, kept for this case alone so the clock is still fetched, and SAID,
-                    // because it holds every client while it runs.
-                    ctx.log("net-stack: `time` asked for the clock and the poll step is not running (no calibrated cycle counter) - this query waits in the loop");
-                    match sntp_sync(&ctx, pending, &st) {
-                        Some(u) => ctx.log_fmt(format_args!(
-                            "net-stack: clock resolved at `time`'s request ({})", u)),
-                        None => ctx.log("net-stack: `time` asked for the clock - no SNTP answer"),
-                    }
-                }
-            } else if nudged {
-                ctx.log("net-stack: `time` asked for the clock - no route yet; it stays wanted and is fetched once the network is configured");
-            }
-        }
+        // UDP ASKS PAST THEIR DEADLINE are answered "no reply" here, on every pass, so an asker is told
+        // even when the poll step is not running (no calibrated counter, or no configuration).
+        asks.expire(&ctx);
         let req;
         // Which door the request came in by. A request served from the stash was displaced by a
         // driver conversation and is arriving LATE; one from the queue arrived directly. When a
@@ -3199,8 +2936,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // every established connection carries its own peer MAC on the `Conn`,
                         // so `poll_one` addresses its frames correctly whatever is passed here.
                         let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
-                        poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut sntp_job);
-                        sntp_job_tick(&ctx, pending, &mut sntp_job);
+                        poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
                     }
                     if let Some(m) = ctx.recv_timeout(ctx.duration_cycles(POLL_MS)) { break m; }
                     // ---- DO NOT SLEEP ON WORK WE ALREADY HAVE ----
@@ -3232,24 +2968,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // clean run. Say it once (the condition repeats per request, and the report must not
                     // become the flood), then drop it.
                     None => {
-                        // OP_SYNC_NOW (11): a ONE-WAY nudge from `time`, deliberately carrying no reply cap.
-                        //
-                        // `time` owns the wall clock and must be the thing that pursues it, but it cannot ASK
-                        // for a sync in the ordinary way: this service calls `time` after SNTP, so a request in
-                        // the other direction would have two single-threaded services blocked on each other -
-                        // which is why `time`'s contract says it may never send here. A message with nothing to
-                        // answer breaks that: `time` sends and forgets, this service records the nudge and later
-                        // pushes the result with a bounded OP_SET call (`adopt_ntp_time`), so neither waits on
-                        // the other unboundedly (§8.9 - one direction non-blocking is the whole requirement).
-                        //
-                        // It sits in the capless arm because that is precisely what identifies it. There is no
-                        // reply to send, so there is no cap, and no legitimate request can be confused with it.
-                        if req.payload_bytes().first() == Some(&11) {
-                            // Recorded, and served at the top of the loop with every other way a nudge can
-                            // arrive - see "`time`'S CLOCK NUDGE" there.
-                            pending.note_nudge();
-                            continue;
-                        }
                         if !capless_logged {
                             capless_logged = true;
                             ctx.log("net-stack: request had no reply cap - dropping (cannot answer without one)");
@@ -3337,7 +3055,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // persists, so a later unplug/replug just resumes (the ICMP flows again) without re-dancing.
         // NO CLIENT REQUEST STARTS CLOCK WORK. A retry used to live here: while the clock was unset, any
         // status, DNS, ping or ARP request could start a full SNTP exchange, and every other client queued
-        // behind it. The clock is `time`'s to pursue, through op 11 (see the note above `SntpQuery`).
+        // behind it. The clock is `time`'s to pursue, through op 12 (`UdpAsk`), which never waits here.
         // RE-DHCP WHILE RUNNING ON THE FALLBACK ADDRESS.
         //
         // `gw_known` alone is the wrong test for "configured", in BOTH directions - which is why the
@@ -3366,7 +3084,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             last_redhcp_at = ctx.epoch_secs_monotonic();
             ctx.log("net-stack: running on the fallback address without a lease - retrying DHCP");
             let d = run_dance(&ctx, pending, Some(&status));
-            sntp_job_abandon(&ctx, &mut sntp_job);
+            asks.abandon(&ctx);
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
             if leased {
                 ctx.log_fmt(format_args!("net-stack: DHCP recovered - address {}.{}.{}.{}",
@@ -3394,7 +3112,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // space it like the block above, because "no DHCP server on this link" is a steady state, and an
         // unspaced re-dance in a steady state is a blocking storm that starves every other request.
         if badge.is_none() && !leased && !gw_known
-            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&12))
             && ctx.epoch_secs_monotonic() - last_redhcp_at >= RESYNC_SECS
             && link_is_up(&ctx, pending)
         {
@@ -3406,7 +3124,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // a problem that did not exist, so it only postponed every hot-plug configure.
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx, pending, Some(&status));
-            sntp_job_abandon(&ctx, &mut sntp_job);
+            asks.abandon(&ctx);
             our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
         }
         // RETRY THE GATEWAY ALONE WHEN WE HOLD A LEASE BUT ARP NEVER ANSWERED.
@@ -3438,7 +3156,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // change: the FRAME protocol is untouched, but no cable ever changed its address under the
         // stack, and a radio does.
         if badge.is_none() && our_mac != [0u8; 6]
-            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&12))
             && ctx.epoch_secs_monotonic() - last_addr_check_at >= ADDR_CHECK_SECS
         {
             last_addr_check_at = ctx.epoch_secs_monotonic();
@@ -3449,13 +3167,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         our_mac[0], our_mac[1], our_mac[2], our_mac[3], our_mac[4], our_mac[5],
                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
                     let d = run_dance(&ctx, pending, Some(&status));
-                    sntp_job_abandon(&ctx, &mut sntp_job);
+                    asks.abandon(&ctx);
                     our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
                 }
             }
         }
         if badge.is_none() && leased && !gw_known
-            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&10))
+            && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&12))
             && ctx.epoch_secs_monotonic() - last_gw_arp_at >= RESYNC_SECS
             && link_is_up(&ctx, pending)
         {
@@ -3863,7 +3581,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // recovers like any restartable thing. Re-assign the mutable state, reply the FRESH status.
             ctx.log("net-stack: renew - re-running DHCP/ARP/ICMP");
             let d = run_dance(&ctx, pending, Some(&status));
-            sntp_job_abandon(&ctx, &mut sntp_job);
+            asks.abandon(&ctx);
             our_ip = d.our_ip;
             our_mac = d.our_mac;
             gw_mac = d.gw_mac;
@@ -3872,24 +3590,43 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             status = d.status;
             reply.send(&ctx, &status);
         } else if pl.first() == Some(&10) {
-            // SYNC (op 10): re-fetch the time from the network (SNTP) and set the wall clock - the shell
-            // `date sync`. Reply: [1, epoch(4 LE)] on success, [0] on failure (no NIC / server silent).
-            // SYNCHRONOUS: the operator asked and is waiting at the prompt. (The only other synchronous
-            // fetch is the nudge's no-calibrated-counter fallback, which logs itself; and on an
-            // up-but-unconfigured link a nudge runs the blocking dance first.)
-            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
-            match sntp_sync(&ctx, pending, &st) {
-                Some(unix) => {
-                    // The clock is set; a background query still in flight would only report "no SNTP
-                    // answer" later about a clock that is already right.
-                    sntp_job = None;
-                    let mut r = [0u8; 5];
-                    r[0] = 1;
-                    r[1..5].copy_from_slice(&unix.to_le_bytes());
-                    ctx.log_fmt(format_args!("net-stack: SNTP - wall clock set (epoch {})", unix));
-                    reply.send(&ctx, &r);
+            // Op 10 was `date sync`, and it is GONE: the clock is the `time` service's, and it fetches the
+            // network time itself through op 12 below (docs/networking.md 16). Answered rather than left to
+            // fall through to the status reply, which an old caller would misread as a time.
+            ctx.log("net-stack: op 10 (date sync) is retired - the `time` service syncs the clock itself now");
+            reply.send(&ctx, &[0]);
+        } else if pl.first() == Some(&12) {
+            // UDP ASK (op 12): [wait_secs, dest_ip(4), dest_port(2), data...]. The datagram goes out now and
+            // the ANSWER COMES LATER - [ASK_OK, payload] when the reply arrives, [ASK_TIMEOUT] at the
+            // deadline - while this loop goes on serving everyone else. See `UdpAsk`.
+            if pl.len() < 8 {
+                reply.send(&ctx, &[ASK_BAD]);
+            } else if !gw_known {
+                reply.send(&ctx, &[ASK_NO_ROUTE]);
+            } else if let Some(slot) = asks.free_slot() {
+                let wait = (pl[1] as i64).clamp(1, UDP_ASK_MAX_SECS);
+                let dest_ip = [pl[2], pl[3], pl[4], pl[5]];
+                let dest_port = u16::from_be_bytes([pl[6], pl[7]]);
+                let src_port = asks.pick_port(&ctx);
+                let mut frame = [0u8; 1600];
+                let n = build_udp(&mut frame, &gw_mac, &our_ip, &our_mac, src_port, &dest_ip, dest_port, &pl[8..]);
+                if nic_req(&ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS).is_none() {
+                    // Never left the host - a different fault from nobody answering, so it gets its own word.
+                    reply.send(&ctx, &[ASK_NOT_SENT]);
+                } else {
+                    // HELD, NOT ANSWERED: the reply capability now belongs to the ask, and `deliver`,
+                    // `expire` or `abandon` is what answers it and gives it back. So this arm skips the
+                    // `reply.done` below - that would hand back a cap the ask still needs.
+                    asks.slots[slot] = Some(UdpAsk {
+                        src_port, dest_ip, dest_port,
+                        reply: Reply { cap: reply.cap, tag: reply.tag },
+                        until_secs: ctx.epoch_secs_monotonic() + wait,
+                    });
+                    continue;
                 }
-                None => { reply.send(&ctx, &[0]); }
+            } else {
+                ctx.log("net-stack: every UDP ask slot is in use - refusing one more");
+                reply.send(&ctx, &[ASK_BUSY]);
             }
         } else {
             // Status request (default): reply the CURRENT state, not just the frozen record. Read the link

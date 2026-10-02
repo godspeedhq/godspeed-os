@@ -149,8 +149,9 @@ method").
 - **No RTC on the Pi 2** (and QEMU raspi2b emulates none) - the x86 MC146818 CMOS RTC has no Pi
   equivalent. Both consequences are now **fixed rather than accepted**: `uptime` reads the monotonic
   generic timer (not a wall-clock delta from a frozen stamp), and the wall clock is set from the network
-  by **SNTP** - net-stack fetches it and hands it to the **`time` SERVICE** over IPC (`OP_SET`), which
-  owns plausibility, provenance and the floor and can refuse it. (This used to be a gated `SetClock`
+  by **NTP** - the **`time` SERVICE** fetches it itself, through `net-stack`'s op 12 (a UDP datagram
+  answered when the reply arrives; `docs/networking.md` 16.1), and owns plausibility, provenance and the
+  floor. (Until 2026-10-01 net-stack fetched it and pushed it in with `OP_SET`.) (This used to be a gated `SetClock`
   syscall; that syscall and `kernel/src/clock.rs`/`wallclock.rs` are deleted - the wall clock is not a
   kernel responsibility.) With no cable, `date` reads zeros and
   says so rather than inventing a time.

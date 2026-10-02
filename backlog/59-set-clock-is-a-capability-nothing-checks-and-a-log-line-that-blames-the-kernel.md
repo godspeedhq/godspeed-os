@@ -1,7 +1,8 @@
 # 59 - `SET_CLOCK` is granted and never checked, and net-stack blames the kernel for the `time` service
 
-**Status:** OPEN - two findings from one dead seam. The second (the log line) is FIXED IN CODE
-2026-10-01, not yet run on hardware; the first (the kernel half) is still open. See "2026-10-01" below.
+**Status:** OPEN - two findings from one dead seam. The second (the log line) is GONE with the code that
+printed it: `net-stack` no longer handles the clock at all (2026-10-01, later, below). The first - the
+kernel half - is still open, though `net-stack` no longer holds the capability.
 **Found:** 2026-09-26, by following a stale comment: three comments named a `SetClock` syscall, and
 there is no such syscall.
 
@@ -69,14 +70,18 @@ userspace still expects to be refused by it.
 
 ## 2026-10-01: the log half is fixed in code, not yet on hardware
 
-**The false line is gone.** `net-stack` now hands the SNTP result to `time` through `adopt_ntp_time`,
-which keeps the three outcomes apart and says which one it saw, each ending "clock unchanged":
-
-- `time` replied 0: "the `time` service refused the network time (its plausibility check or floor)";
-- no reply within `ADOPT_SECS` (2 s): "`time` did not answer within 2 s";
-- unreachable even after a reacquire: "`time` could not be reached".
+**The false line is gone.** `net-stack` handed the SNTP result to `time` through a push that kept the
+three outcomes apart and said which one it saw, each ending "clock unchanged": `time` refused it, `time`
+did not answer within 2 s, or `time` could not be reached.
 
 Nothing blames the kernel any more. This went in with the clock decoupling (`docs/networking.md` 16),
 which passed the x86 shell suite 215/0 and a Pi 4 QEMU boot; it has NOT run on Pi 4 hardware (the card
 carries the old `net-stack`). **The kernel half (section 1) is untouched and still open** - the dead
 capability, the two privbits and the seven `set_wall_clock` stubs.
+
+## 2026-10-01, later: `net-stack` has no clock code and no clock capability
+
+The clock left `net-stack` entirely (`docs/networking.md` 16.1): `time` fetches its own NTP answer through
+op 12, so the push - and the log lines above with it - no longer exist, and the supervisor no longer asks
+for `SET_CLOCK` when it spawns `net-stack`. That leaves the shell's `SET_CLOCK_FLOOR` as the only holder
+of the resource, still checked by nothing. The kernel half of this entry is unchanged.

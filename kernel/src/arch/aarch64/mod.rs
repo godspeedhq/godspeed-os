@@ -912,6 +912,11 @@ extern "C" fn boot_high() -> ! {
         // rather than an in-repo fact, and it is labelled as such in the log.
         #[cfg(feature = "pi4")]
         sdio::census();
+        // The random-number generator, probed like every other device a model of this board may lack:
+        // query 19 reaches it from ANY service with no capability, so an absent block must answer
+        // "unavailable" rather than abort the kernel (see `rng_probe`).
+        #[cfg(feature = "pi4")]
+        rng_probe();
         if genet::probe().is_some() {
             // The controller answered, and that is the LAST thing this kernel does about ethernet.
             // Commandment I: an ethernet driver is not the kernel's business (§4.4). The kernel
@@ -1308,10 +1313,43 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool {
 /// The wait is a bound in READS of the count register, not a duration: it is there so a block that never
 /// fills - unclocked, or absent on a board this feature was built for by mistake - returns `None` rather
 /// than holding the core, and `None` is the honest answer the caller already handles.
+/// The BCM2711's RNG200 block.
+#[cfg(feature = "pi4")]
+const RNG200_BASE: usize = 0xFE10_4000;
+
+/// Whether the RNG200 ANSWERED the boot probe (`rng_probe`). `hw_random` touches the block only if it
+/// did. On the board it always does; QEMU's `raspi4b` models no RNG200, and there the first read is an
+/// external abort that halts the kernel - reached from an unprivileged syscall (query 19), so any
+/// service could take the machine down with one call. Found when the `time` service began asking for a
+/// nonce on every boot (2026-10-01); until then only a configured `net-stack` asked, which never happens
+/// in that emulator. The same posture as `GENET_PRESENT` and the PCIe root complex: probe once, then
+/// believe the answer.
+#[cfg(feature = "pi4")]
+static RNG_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Probe the RNG200 once at boot, inside the probe window, and record whether it is there. Said either
+/// way, so a missing `rng:` line means this never ran rather than that the block is absent.
+#[cfg(feature = "pi4")]
+fn rng_probe() {
+    // SAFETY: 4-byte aligned (the block's CTRL register), inside the peripheral Device mapping the
+    // kernel built; `probe_read32` survives the external abort an absent block raises.
+    let answered = unsafe { uaccess::probe_read32(mmio(RNG200_BASE) as u64) }.is_some();
+    RNG_PRESENT.store(answered, core::sync::atomic::Ordering::Release);
+    put_str(if answered {
+        b"rng: RNG200 present - hardware random numbers available" as &[u8]
+    } else {
+        b"rng: no RNG200 at 0xFE104000 (this machine has none) - hardware random numbers unavailable" as &[u8]
+    });
+    put_str(b"\r\n");
+}
+
 #[cfg(feature = "pi4")]
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
-    const RNG200_BASE: usize = 0xFE10_4000;
+    // Never touch a block the boot probe did not find - see `RNG_PRESENT`.
+    if !RNG_PRESENT.load(Ordering::Acquire) {
+        return None;
+    }
     const CTRL: usize = 0x00;
     const RNG_SOFT_RESET: usize = 0x04;
     const RBG_SOFT_RESET: usize = 0x08;

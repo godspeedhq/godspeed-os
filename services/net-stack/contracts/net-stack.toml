@@ -11,26 +11,21 @@ limit   = "16MiB"
 # sends frames to nic-driver and reads back what arrived (request/reply, §8.2), so its authority is
 # just: log, a SEND cap to nic-driver, and its own endpoint for the reply.
 log_write   = true
-# `time` (clock slice 2): SNTP is a network fact this service fetches, and the `time` service decides
-# whether to believe it - plausibility, the floor, provenance. Declared here because a communication
-# path that exists in the kernel and not in the contract is what Commandment IV forbids.
+# NOT `time` (2026-10-01). This service fetched the network time and pushed it to `time`, waiting for
+# the answer inside the loop every client is queued behind. The clock left: `time` asks for its own
+# NTP datagram through op 12 (a UDP exchange answered when the reply arrives) and this service never
+# calls `time` at all. A peer that is never sent to is a capability that buys nothing (§3.1).
 # `events` - the observability sink: automatic IPC traces, plus the metric samples this service
 # publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
-ipc_send    = ["nic-driver", "time", "events"]
+ipc_send    = ["nic-driver", "events"]
 ipc_receive = ["net-stack"]
 # net-stack mints a delegated SOCKET capability per open socket (§7.10, the same mechanism fs uses for
 # files). resource_mint is that authority; the kernel grants it from this declaration (service_hw, T1 B).
 resource_mint = true
-# ARM NOTE (BOTH ARM ports - arm32 Pi 2 and aarch64 Pi 4) (userspace-audit U15 / A5-U1 doctrine): the Pi 2 has no battery-backed RTC, so the wall
-# clock has no hardware source and `date` reads zero until something sets it. net-stack runs the SNTP
-# exchange, so on ARM the kernel additionally grants this service the SET_CLOCK capability BY NAME
-# (`SetClock`, syscall 50 - `service_privileges` in kernel `task/mod.rs`, arch-gated to `arm` AND `aarch64`; x86's CMOS RTC
-# is the authority there, so nothing holds it and the syscall is refused). SET_CLOCK is a kernel-only
-# by-name grant and is deliberately NOT a contract capability - `contract_check.py` does not reconcile it.
-# So on ARM the real authority of this service is the four capabilities above PLUS SET_CLOCK (set the
-# machine's time of day). Stated here so a contract reader is not misled about what net-stack can reach.
+# NO CLOCK AUTHORITY (2026-10-01). This service used to be spawned with SET_CLOCK, for an SNTP exchange it
+# no longer runs and a syscall that never existed (`backlog/59`). The supervisor no longer asks for it.
 
 # PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
 #

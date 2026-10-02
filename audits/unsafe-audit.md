@@ -41,6 +41,18 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-10-01 - the RNG200 is probed before it is read (feat/wifi-driver)
+
+`hw_random` read the BCM2711's RNG200 unconditionally, behind `InspectKernel` query 19, which is UNGATED.
+QEMU's `raspi4b` models no RNG200, so there the first read is an external abort that halts the kernel -
+one unprivileged syscall from any service. Found when the `time` service began asking for an NTP nonce on
+every boot. The fix is the posture the PCIe root complex and GENET already have: probe once at boot with
+`uaccess::probe_read32`, record the answer, and never touch a block that did not answer.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/mod.rs` | 71 -> 72 (+1) | `rng_probe`: one `uaccess::probe_read32` of the RNG200's CTRL register at its fixed address inside the Device peripheral mapping, 4-byte aligned. `probe_read32` is the existing one-instruction fixup that turns the external abort of an absent device into `None`; a fault anywhere else still halts loudly. Runs once, on the boot path, inside the probe window. |
+
 ## 2026-10-01 - CpuClock: the Arm clock, for the `power` service (feat/wifi-driver)
 
 A new syscall (55) and a new resource (`CPU_CLOCK`, 18), with the constitution amended at 12.3 and the
@@ -2574,7 +2586,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 71 | permitted |
+| arch/aarch64/mod.rs | 72 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |

@@ -7070,50 +7070,64 @@ fn clock_floor_seed(ctx: &ShellCtx) {
 /// floor is recorded at explicit moments only (`date sync`, and before `reboot`).
 fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
+    // `date sync` - have the `time` service fetch the time from the network (NTP) now. The Pi 2
     // has no battery-backed RTC, so the clock is unset until the network sets it: automatically when
-    // `time`'s nudge reaches a configured net-stack (about every 20 s), or immediately by this command.
+    // `time` reaches the network on its own (about every 20 s until it has the time), or immediately by
+    // this command.
     if arg == "sync" {
         // Seed the floor HERE, where it is used: it exists to let the kernel refuse a fetched time from
         // before we last ran, so the moment we are about to fetch one is exactly when it must be known.
         // Reading it at boot instead put fs I/O on the startup path at fs's slowest moment - see the note
         // in service_main for what that cost.
         clock_floor_seed(ctx);
-        out.line_fmt(ctx, format_args!("Asking the network for the time now (SNTP)... (q aborts)"));
-        // The budget must cover net-stack's WORST case, not a guess: op 10 can run SNTP_TRIES rounds of a
-        // DANCE_SECS drain (plus a DNS attempt) before it can honestly answer "no time". Timing out early
-        // and RE-SENDING would queue a second full sync behind the first, and net-stack's serve loop is
-        // single-threaded - so every other client op (net/ping/dns) would block behind our own retry.
-        // Recorded, not covered: on an UNLEASED, unconfigured stack op 10 can run the whole dance and THEN a full
-        // `sntp_sync`, which can outlast SYNC_SECS; the shell then reports no time while net-stack is
-        // still working. (`net renew` no longer fetches the clock - the dance stopped doing SNTP on
-        // 2026-10-01.)
-        const SYNC_SECS: i64 = 30;
-        let outcome = ns_abortable(ctx, &[10u8], SYNC_SECS);
-        // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
-        if let ReqOutcome::Aborted = outcome {
-            out.line_fmt(ctx, format_args!("date sync: aborted"));
-            return Ok(());
-        }
-        let synced = match &outcome {
-            ReqOutcome::Reply(r) if r.payload_bytes().first() == Some(&1) && r.payload_bytes().len() >= 5 => {
-                let p = r.payload_bytes();
-                Some(u32::from_le_bytes([p[1], p[2], p[3], p[4]]))
-            }
-            _ => None,
-        };
-        let epoch = match synced {
-            Some(e) => e,
-            None => {
-                out.line_fmt(ctx, format_args!("date sync: no time from the network (is the cable in?)"));
+        out.line_fmt(ctx, format_args!("Asking the network for the time now (NTP, by the time service)... (q aborts)"));
+        // ASK `time`, THEN WATCH THE CLOCK (2026-10-01). The clock is the `time` service's, and so is
+        // fetching it: `net-stack` no longer runs the exchange, so a `ping` never waits behind a time
+        // server. `time` answers at once - "a query is on its way" - and the result shows up as the
+        // sync age in `OP_NOW` dropping to (about) zero. So this waits on a FACT about the clock rather
+        // than on any one reply, which is what lets nobody in the path block: `time` keeps answering
+        // `date` from memory, `net-stack` keeps serving, and only this command waits, bounded, with `q`.
+        //
+        // The bound covers `time`'s give-up (8 s) with room: a query lost in transit is retried by
+        // `time` itself, and the next sync on its own cadence still sets the clock.
+        const SYNC_WAIT_SECS: i64 = 10;
+        const SYNC_POLL_MS: u64 = 250;
+        match time_rpc(ctx, &[5]) {                  // OP_SYNC -> [1] query on its way, [0] could not send
+            Some(r) if r.payload_bytes().first() == Some(&1) => {}
+            Some(_) => {
+                out.line_fmt(ctx, format_args!("date sync: the clock service could not send the query (is net-stack running?)"));
                 return Ok(());
             }
-        };
-        // The floor is NOT recorded here. `net-stack` hands the epoch to `time`, and `time` persists
-        // its own floor at the moment the clock is set - it owns the clock, so it owns the clock's
-        // state (§3.8). The shell writing it as well was a second owner for one piece of state, and a
-        // second owner is how the two drift.
-        let _ = epoch;
+            None => {
+                out.line_fmt(ctx, format_args!("date sync: the clock service did not answer"));
+                return Ok(());
+            }
+        }
+        let t0 = ctx.epoch_secs_monotonic();
+        let mut synced = false;
+        loop {
+            let waited = ctx.epoch_secs_monotonic() - t0;
+            // Synced SINCE WE ASKED: an age no older than the wait so far. An older sync is not this one.
+            if matches!(time_synced_secs_ago(ctx), Some(age) if age <= waited) {
+                synced = true;
+                break;
+            }
+            if waited >= SYNC_WAIT_SECS { break; }
+            if let Some(b) = ctx.try_console_read() {
+                // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
+                if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
+                    out.line_fmt(ctx, format_args!("date sync: aborted (the clock service may still finish the sync)"));
+                    return Ok(());
+                }
+            }
+            ctx.sleep_ms(SYNC_POLL_MS);
+        }
+        if !synced {
+            out.line_fmt(ctx, format_args!("date sync: no time from the network (is the cable in?)"));
+            return Ok(());
+        }
+        // The floor is NOT recorded here. `time` persists its own floor at the moment the clock is set -
+        // it owns the clock, so it owns the clock's state (§3.8).
         // fall through to display the freshly-set time
     }
     let dt = Datetime::from_epoch_secs(time_now(ctx).unwrap_or(0));

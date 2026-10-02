@@ -45,9 +45,14 @@ use godspeed_sdk::{ServiceContext, Message};
 /// The protocol. One byte of opcode, because the reply shape differs per op and a shared opcode space
 /// is how two protocols on one endpoint collide (the lesson from `dwc2` serving block and frames).
 pub const OP_NOW: u8 = 1; // -> [ok, epoch(8, le), source, age(8, le)]  age = -1 when never synced
-pub const OP_SET: u8 = 2; // [epoch(8, le)] -> [ok]      network time (SNTP)
+/// RETIRED 2026-10-01, answered `[0]`. It let any client of this service set the clock; the only caller was
+/// `net-stack` pushing an SNTP result, and this service now fetches and checks that result itself.
+pub const OP_SET: u8 = 2;
 pub const OP_FLOOR_GET: u8 = 3; // -> [ok, floor(8, le)]
 pub const OP_FLOOR_SET: u8 = 4; // [floor(8, le)] -> [ok]
+/// Fetch the network time NOW (`date sync`). -> `[1]` once a query is on its way (or already was), `[0]` if it
+/// could not be sent. The answer is NOT waited for: the caller watches the sync age in `OP_NOW` change.
+pub const OP_SYNC: u8 = 5;
 
 pub const SRC_UNSET: u8 = 0;
 pub const SRC_RTC: u8 = 1;
@@ -184,24 +189,90 @@ const FS_OK: u8 = 0;
 /// Mirrors `FS_CLOCK_PUSH` in `fs`, where the reasoning for it being a push is written out.
 const FS_CLOCK_PUSH: u8 = 0xC1;
 
+/// Our NTP query's correlation tag, echoed by `net-stack` at byte 0 of its op-12 answer. Distinct from the
+/// floor tags and from 0, for the same reasons they are.
+const TAG_NTP: u8 = 0xE1;
+
+/// `net-stack`'s UDP ask (op 12): `[tag, patience_secs, 12, wait_secs, ip(4), port(2), datagram..]`, answered
+/// `[tag, status, payload..]` when the reply arrives - while it goes on serving everyone else.
+const NS_OP_UDP_ASK: u8 = 12;
+const NS_ASK_OK: u8 = 1;
+/// How long `net-stack` holds the ask open for the server's answer.
+const NTP_WAIT_SECS: u8 = 3;
+/// How long WE wait before treating the query as lost - `net-stack` restarted and took the ask with it, or
+/// its answer was dropped. Past this a new query may go out; an answer to the old one is then refused by
+/// its nonce, so a late arrival cannot be mistaken for the new question's answer.
+const NTP_GIVE_UP_SECS: i64 = 8;
+/// A fixed anycast NTP server (time.cloudflare.com, 162.159.200.123). A name would need a DNS lookup, and
+/// `net-stack` runs those inside its loop; an address costs it nothing.
+const NTP_SERVER: [u8; 4] = [162, 159, 200, 123];
+/// Seconds between the NTP epoch (1900) and the Unix epoch (1970).
+const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
+
+/// One NTP query in flight. The NONCE binds the answer to this question (RFC 4330 section 5): it goes out
+/// in the transmit timestamp and a real server echoes it in the originate timestamp, so a stray or forged
+/// datagram, or the late answer to a question already given up on, does not set the clock.
+#[derive(Clone, Copy)]
+struct NtpAsk {
+    nonce: [u8; 8],
+    sent_at: i64,
+}
+
+/// Send an NTP query through `net-stack`, without waiting. `Some` if it went.
+fn ntp_ask(ctx: &ServiceContext) -> Option<NtpAsk> {
+    let nonce: [u8; 8] = {
+        let hi = ctx.hw_random().unwrap_or((ctx.read_tsc() >> 13) as u32);
+        let lo = ctx.hw_random().unwrap_or(ctx.read_tsc() as u32);
+        let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
+        [h[0], h[1], h[2], h[3], l[0], l[1], l[2], l[3]]
+    };
+    let mut req = [0u8; 10 + 48];
+    req[0] = TAG_NTP;
+    req[1] = NTP_WAIT_SECS + 2;                   // our patience, for net-stack's stash
+    req[2] = NS_OP_UDP_ASK;
+    req[3] = NTP_WAIT_SECS;
+    req[4..8].copy_from_slice(&NTP_SERVER);
+    req[8..10].copy_from_slice(&123u16.to_be_bytes());
+    let ntp = &mut req[10..];
+    ntp[0] = 0x23;                                // LI 0, version 4, mode 3 (client)
+    ntp[40..48].copy_from_slice(&nonce);          // transmit timestamp = the nonce
+    if send_noblock(ctx, "net-stack", &req) {
+        Some(NtpAsk { nonce, sent_at: ctx.epoch_secs_monotonic() })
+    } else {
+        None
+    }
+}
+
+/// The Unix time in an NTP answer to `ask`, or why there is none. The checks are the ones `net-stack`
+/// made when it ran this exchange, moved here with it: a server reply (mode 4), a synchronised clock
+/// (LI != 3), a real stratum (1..15, 0 is a kiss-of-death), and OUR nonce echoed as the originate
+/// timestamp. Plausibility is `Clock::set_network`'s, as it always was.
+fn ntp_answer(ask: &NtpAsk, ntp: &[u8]) -> Result<i64, &'static str> {
+    if ntp.len() < 48 { return Err("too short to be NTP"); }
+    if ntp[0] & 0x07 != 4 { return Err("not a server reply"); }
+    if ntp[0] >> 6 == 3 { return Err("the server says its own clock is unsynchronised"); }
+    if ntp[1] == 0 || ntp[1] > 15 { return Err("a kiss-of-death or impossible stratum"); }
+    if ntp[24..32] != ask.nonce { return Err("not the answer to our question (nonce mismatch)"); }
+    let secs = u32::from_be_bytes([ntp[40], ntp[41], ntp[42], ntp[43]]) as u64;
+    if secs <= NTP_UNIX_OFFSET { return Err("a transmit time before 1970"); }
+    Ok((secs - NTP_UNIX_OFFSET) as i64)
+}
+
 const TAG_FLOOR_READ: u8 = 0xF1;
 const TAG_FLOOR_WRITE: u8 = 0xF2;
 /// How often to retry loading the floor while it has not been loaded yet.
 const FLOOR_RETRY_MS: u64 = 2_000;
-/// How long between asking `net-stack` to fetch the network time, while we still have none.
+/// How long between NTP queries, while we still have no network time.
 ///
-/// PURSUING THE TIME IS THIS SERVICE'S JOB. It did not do it: `net-stack` pushed a result in when its
-/// own dance happened to run, and otherwise the clock sat unset until an operator typed `date sync`.
-/// That put resolution in the shell's hands and made the answer depend on somebody asking twice.
-/// (The dance no longer fetches the clock since 2026-10-01; this nudge is how it is fetched.)
+/// PURSUING THE TIME IS THIS SERVICE'S JOB, and since 2026-10-01 it does all of it. `net-stack` used to
+/// run the exchange and push the result here, waiting for our answer inside the loop every one of its
+/// clients is queued behind - a `ping` could sit behind a time server. Now this service builds the
+/// query, sends it through `net-stack`'s op 12 (a UDP datagram whose answer comes back when it arrives),
+/// and checks the answer itself. Neither service waits on the other: the query is a non-blocking send
+/// with a reply cap, `net-stack` never calls this service, and so there is no cycle for §8.9 to forbid.
 ///
-/// The nudge carries NO reply cap, which is what keeps it legal: `net-stack` calls this service after
-/// SNTP, so a request in this direction would be two single-threaded services blocked on each other.
-/// One-way, `try_send`, nothing awaited - so a full or dead `net-stack` cannot stall the clock (§8.9).
-///
-/// Bounded by its own success: once the clock is network-set the nudging falls back from every 20 s to
+/// Bounded by its own success: once the clock is network-set the queries fall back from every 20 s to
 /// every `RESYNC_SECS` (an hour), so a machine that syncs at boot sends one or two and then one an hour.
-/// Since 2026-10-01 the nudge is the ONLY automatic path to the clock - the dance no longer fetches it.
 const SYNC_NUDGE_SECS: i64 = 20;
 /// How long between network syncs once we already HAVE one.
 ///
@@ -267,6 +338,13 @@ const R_READ_DATA: usize = 6;
 /// and is handled there. If `fs` is absent, slow, or never answers at all, the only consequence is that
 /// the floor is not written - the clock keeps answering instantly throughout.
 fn fs_send_noblock(ctx: &ServiceContext, req: &[u8]) -> bool {
+    send_noblock(ctx, "fs", req)
+}
+
+/// [`fs_send_noblock`] to any peer: the request goes out carrying a reply cap and nothing waits for the
+/// answer, which arrives tagged in the main loop. `SendWithCap` answers `QueueFull` rather than blocking,
+/// so a busy peer costs a failed attempt, never a stall.
+fn send_noblock(ctx: &ServiceContext, peer: &str, req: &[u8]) -> bool {
     // ACQUIRE `fs` BY NAME, do not expect it to have been wired at spawn.
     //
     // This service starts BEFORE `fs` does (the supervisor spawns the clock early, because everything
@@ -277,11 +355,11 @@ fn fs_send_noblock(ctx: &ServiceContext, req: &[u8]) -> bool {
     // The kernel name directory is the answer to exactly this (§14.3): ask for the peer when you need
     // it, not when you started. Cached by the SDK after the first success, and re-acquired for free if
     // `fs` is restarted under us.
-    let target = match ctx.send_peer_handle("fs") {
+    let target = match ctx.send_peer_handle(peer) {
         Some(t) => t,
         None => {
-            if !ctx.reacquire_by_name("fs") { return false; }
-            match ctx.send_peer_handle("fs") { Some(t) => t, None => return false }
+            if !ctx.reacquire_by_name(peer) { return false; }
+            match ctx.send_peer_handle(peer) { Some(t) => t, None => return false }
         }
     };
     let Some(self_grant) = ctx.self_grant_handle() else { return false };
@@ -302,10 +380,10 @@ fn fs_send_noblock(ctx: &ServiceContext, req: &[u8]) -> bool {
         // §14.3 is explicit that a client reacquires by name after a restart. Doing it only on absence
         // covers the peer that never existed and misses the peer that came back, which is the far more
         // common case under chaos.
-        if !ctx.reacquire_by_name("fs") {
+        if !ctx.reacquire_by_name(peer) {
             return false;
         }
-        let Some(target) = ctx.send_peer_handle("fs") else { return false };
+        let Some(target) = ctx.send_peer_handle(peer) else { return false };
         let Some(reply_cap) = ctx.derive_cap(self_grant) else { return false };
         if ctx.send_with_cap_by_handle(target, reply_cap, &Message::from_bytes(req)).is_err() {
             ctx.remove_cap(reply_cap);
@@ -405,14 +483,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut store_left = 0u32;                    // writes still owed (0 = nothing to persist)
     let mut store_epoch = 0i64;                   // the value those writes are for
     let mut tries_left = 15u32;                   // ~30 s of asking, then stop
-    let mut last_nudge = i64::MIN / 2;            // monotonic second of the last sync nudge
-    let mut nudge_ok: Option<bool> = None;        // did the last nudge reach net-stack? None = never tried
+    let mut last_nudge = i64::MIN / 2;            // monotonic second the last NTP query went out
+    let mut nudge_ok: Option<bool> = None;        // did the last query reach net-stack? None = never tried
+    let mut ntp: Option<NtpAsk> = None;           // the NTP query in flight, if any
+    let mut ntp_said: Option<&'static str> = None; // the last NTP outcome logged, so a repeat stays quiet
     let mut no_cap: u32 = 0;                      // capless messages seen (a flood, usually)
     loop {
         // Wake on a timer only while there is still housekeeping OUTSTANDING - a floor to read, or a
         // floor to write that has not been acknowledged. Once both are settled this is a plain blocking
         // `recv` and the service costs nothing at all.
-        // Keep waking while the clock is still unresolved, so the nudge below can go out. This is
+        // Keep waking while the clock is still unresolved, so the NTP query below can go out. This is
         // bounded by success - once the network sets the clock, `unsynced` is false and this service
         // goes back to blocking on `recv` with no timer at all.
         let unsynced = clock.source != SRC_NTP;
@@ -493,49 +573,34 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             let _ = floor_store(&ctx, store_epoch);
                         }
                     }
-                    // ASK FOR THE TIME, since nobody else will. See `SYNC_NUDGE_SECS`.
-                    if sync_due {
-                        {
-                            // ACQUIRE BY NAME FIRST, and SAY whether it worked.
-                            //
-                            // `net-stack` is spawned AFTER this service, so at spawn time there was no
-                            // endpoint to wire and `find_send_slot` finds nothing - forever. The first
-                            // version of this sent into that hole every twenty seconds and reported
-                            // nothing, so a clock that never resolved looked identical to a network
-                            // that never answered. `nic-driver` documents this exact trap and I did not
-                            // apply it here.
-                            //
-                            // The outcome is logged ONCE per state change rather than per attempt: a
-                            // nudge every twenty seconds must not become a log every twenty seconds,
-                            // but a send that never leaves must not be invisible either (§26.7).
-                            let ok = ctx.try_send("net-stack", &Message::from_bytes(&[11u8])).is_ok()
-                                || (ctx.reacquire_by_name("net-stack")
-                                    && ctx.try_send("net-stack", &Message::from_bytes(&[11u8])).is_ok());
-                            // ONLY A SENT NUDGE COUNTS AGAINST THE INTERVAL. This used to stamp
-                            // `last_nudge` before the attempt, so a nudge that never left still bought
-                            // twenty seconds of silence - and after a respawn the first attempt always
-                            // fails (the peer's cap is stale), so a fresh `time` sat on a stale floor
-                            // for twenty seconds before trying again. A failure should be retried at
-                            // the heartbeat, not rewarded with the full interval.
-                            if ok {
-                                last_nudge = ctx.epoch_secs_monotonic();
+                    // A QUERY NOBODY ANSWERED is given up on, so a new one can go - see `NTP_GIVE_UP_SECS`.
+                    if let Some(a) = ntp {
+                        if ctx.epoch_secs_monotonic() - a.sent_at >= NTP_GIVE_UP_SECS {
+                            ntp = None;
+                            if ntp_said != Some("lost") {
+                                ntp_said = Some("lost");
+                                ctx.log("time: the NTP query got no answer at all (net-stack restarted, or the answer was lost) - asking again");
                             }
-                            // `Option`, so the FIRST outcome always speaks. A plain bool starting at
-                            // `false` made a nudge that failed from the very first attempt log nothing
-                            // at all - no transition - which is precisely the silence this line exists
-                            // to break, and it hid this bug for a boot.
-                            if nudge_ok != Some(ok) {
-                                nudge_ok = Some(ok);
-                                ctx.log(if ok {
-                                    "time: asking net-stack for the network clock"
-                                } else {
-                                    "time: cannot reach net-stack to ask for the clock - retrying"
-                                });
-                            }
-                            // One way, and the outcome is not awaited - there is nothing to await.
-                            // `net-stack` pushes the answer back through OP_SET when it has
-                            // one, which is the path that already works.
-
+                        }
+                    }
+                    // ASK FOR THE TIME, since nobody else will - see `SYNC_NUDGE_SECS`. Through `net-stack`'s
+                    // op 12, which sends the datagram and goes on serving: nothing waits on the answer, here or
+                    // there, so a `ping` never queues behind a time server.
+                    if sync_due && ntp.is_none() {
+                        ntp = ntp_ask(&ctx);
+                        let ok = ntp.is_some();
+                        // ONLY A SENT QUERY COUNTS AGAINST THE INTERVAL: a failed send is retried at the
+                        // heartbeat, not rewarded with the full twenty seconds (see `SYNC_NUDGE_SECS`).
+                        if ok {
+                            last_nudge = ctx.epoch_secs_monotonic();
+                        }
+                        if nudge_ok != Some(ok) {
+                            nudge_ok = Some(ok);
+                            ctx.log(if ok {
+                                "time: asking the network for the time (NTP, through net-stack)"
+                            } else {
+                                "time: cannot reach net-stack to ask for the network time - retrying"
+                            });
                         }
                     }
                     if store_left > 0 && !floor_store(&ctx, store_epoch) {
@@ -569,6 +634,48 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match p.first().copied() {
                     Some(TAG_FLOOR_READ) => {
                         floor_settled = floor_adopt(&ctx, &mut clock, p);
+                    }
+                    // THE ANSWER TO OUR NTP QUERY, from `net-stack`'s op 12: `[tag, status, datagram..]`.
+                    Some(TAG_NTP) => {
+                        let Some(a) = ntp else {
+                            // A query we already gave up on. Its nonce could not match a new one anyway;
+                            // dropping it here just says so earlier.
+                            continue;
+                        };
+                        ntp = None;
+                        let status = p.get(1).copied().unwrap_or(0);
+                        let outcome: Result<i64, &'static str> = if status != NS_ASK_OK {
+                            Err(match status {
+                                2 => "no NTP answer in time",
+                                3 => "no route yet (the network is not configured)",
+                                4 => "net-stack had no free slot for the query",
+                                5 => "the network was reconfigured while the query was out",
+                                6 => "the query never left the host",
+                                _ => "net-stack refused the query",
+                            })
+                        } else {
+                            ntp_answer(&a, &p[2..])
+                        };
+                        match outcome {
+                            Ok(epoch) => {
+                                ntp_said = None;
+                                if clock.set_network(&ctx, epoch) {
+                                    // The clock just became known: persist the floor, handed to the loop so
+                                    // nothing waits on the disk (see `floor_store`).
+                                    store_epoch = clock.now(&ctx);
+                                    store_left = FLOOR_STORE_TRIES;
+                                    let _ = floor_store(&ctx, store_epoch);
+                                    floor_settled = true;
+                                    last_nudge = ctx.epoch_secs_monotonic();
+                                }
+                            }
+                            // SAID ONCE PER CHANGE: a cable left out answers "no route" every twenty
+                            // seconds, and the log should say it once, not three times a minute.
+                            Err(why) => if ntp_said != Some(why) {
+                                ntp_said = Some(why);
+                                ctx.log_fmt(format_args!("time: no network time - {}; asking again", why));
+                            },
+                        }
                     }
                     Some(TAG_FLOOR_WRITE) => {
                         if p.len() > R_STATUS && p[R_STATUS] == FS_OK {
@@ -643,30 +750,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 out[10..18].copy_from_slice(&age.to_le_bytes());
                 reply(&ctx, cap, &out);
             }
-            // Persisting here, not in a client, is the whole point: the clock's owner records the
-            // clock's floor at the moment it learns the time. `net-stack` PUSHES the SNTP result to
-            // this op - the direction that avoids a call cycle between two single-threaded services.
-            OP_SET if p.len() >= 9 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&p[1..9]);
-                let ok = clock.set_network(&ctx, i64::from_le_bytes(b));
-                reply(&ctx, cap, &[u8::from(ok)]);
-                // The clock just became known: record the floor so the next boot starts no earlier
-                // than now. Answer the caller FIRST - `net-stack` waits on that reply (bounded, 2 s), and it
-                // must not wait on a disk write to learn its own result.
-                if ok {
-                    // Hand the write to the loop rather than doing it here. The caller (`net-stack`) has
-                    // its answer already and must not wait behind a disk, and neither must the next
-                    // `date`. The loop sends it, watches for the acknowledgement, and retries on the
-                    // timer if `fs` is not reachable yet - reliable, but never blocking.
-                    // `now()`, not `last`: `last` is the BASE the clock advances from, not the current
-                    // reading. They are equal at this instant because the sync just re-based, and
-                    // writing the one that means "the time" keeps it correct if that ever changes.
-                    store_epoch = clock.now(&ctx);
-                    store_left = FLOOR_STORE_TRIES;
-                    let _ = floor_store(&ctx, store_epoch);
-                    floor_settled = true;        // the clock is set; the stored floor no longer matters
+            OP_SET => {
+                ctx.log("time: OP_SET is retired - this service fetches and checks the network time itself");
+                reply(&ctx, cap, &[0]);
+            }
+            OP_SYNC => {
+                // `date sync`: ask NOW rather than at the next twenty-second tick. Answered at once - the
+                // caller watches the sync age in `OP_NOW` change, so nothing here waits on the network.
+                if ntp.is_none() {
+                    ntp = ntp_ask(&ctx);
+                    if ntp.is_some() {
+                        last_nudge = ctx.epoch_secs_monotonic();
+                        ntp_said = None;     // an operator asked: say the outcome again even if it repeats
+                    }
                 }
+                reply(&ctx, cap, &[u8::from(ntp.is_some())]);
             }
             OP_FLOOR_GET => {
                 let mut out = [0u8; 9];

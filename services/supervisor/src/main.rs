@@ -449,9 +449,10 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
     ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
-    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, 1, &["nic-driver", "time", "events"],
-     godspeed_sdk::service_context::privbits::RESOURCE_MINT
-     | godspeed_sdk::service_context::privbits::SET_CLOCK, 0, 0),
+    // No `time` peer and no SET_CLOCK: the clock left net-stack on 2026-10-01 (`time` asks for its own NTP
+    // datagram through net-stack's op 12, and net-stack never calls `time`).
+    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, 1, &["nic-driver", "events"],
+     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
     // FIRST DRIVER to move. AHCI: an MMIO BAR, a DMA arena and a PCI BDF for the bus-master enable -
     // and no IRQ line, which is why it is the right one to prove the path on.
     // block-driver reaches the disk THROUGH A USB HOST-CONTROLLER SERVICE on both ARM targets:

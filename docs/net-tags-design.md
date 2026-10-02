@@ -362,6 +362,12 @@ the dance in the loop: with no calibrated cycle counter the nudge falls back to 
 a nudge on an up-but-unconfigured link runs the dance first. The dance still blocks the serve loop;
 that half of this paragraph stands.
 
+**2026-10-01, later: there is no nudge.** The clock left `net-stack` altogether (`docs/networking.md`
+16.1): `time` sends its own NTP query through op 12, a UDP ask answered when the reply arrives, and
+`net-stack` holds no clock work to displace anyone with. Op 12 IS a deferred answer, and it is safe for
+the reason this section gives the stash's was not: its client carries its own correlation - the tag,
+and NTP's nonce - so a late answer to a question already given up on is recognised and refused.
+
 **The hold has since become the general stash.** What this section scoped to the nudge is now a bounded
 stash of `STASH_N` (4) displaced requests, each held up to `HOLD_MS` (1500 ms), serving requests
 displaced by the dance and by every driver exchange (`backlog/28`).
