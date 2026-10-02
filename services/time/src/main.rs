@@ -314,8 +314,8 @@ const FLOOR_REFRESH_SECS: i64 = 600;
 
 /// `fs` replies `[tag, status, ...]`: the correlation tag it was given, THEN the status byte.
 ///
-/// Both indices matter and getting them wrong is silent, because the tag this service sends is 0 and
-/// `FS_OK` is also 0 - so reading the tag as the status "succeeds" no matter what actually happened.
+/// Both indices matter and getting them wrong is silent, because a tag of 0 - which this service once sent -
+/// equals `FS_OK` - so reading the tag as the status "succeeds" no matter what actually happened.
 /// That is exactly what the first version did, in both directions.
 const R_TAG: usize = 0;
 const R_STATUS: usize = 1;

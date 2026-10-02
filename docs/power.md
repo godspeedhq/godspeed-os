@@ -474,7 +474,7 @@ needs to be, and not otherwise.
 ### 15.5 Who holds leases today
 
 `wifi-driver`, across its bring-up: from the moment it holds the SDIO window, through the firmware
-upload and the first scan, to the moment it starts serving (about 6 s). Optional on its side: a `power`
+upload and the first scan, to the moment it starts serving (about ten seconds measured on the card, `docs/wifi.md` 57). Optional on its side: a `power`
 that is absent or refuses costs one log line and the load goes ahead at whatever the clock is.
 
 ### 15.6 What is not here yet, and is not promised

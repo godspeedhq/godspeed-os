@@ -226,8 +226,14 @@ def check_services_covered():
     """A service the supervisor manages should be on the page describing the services."""
     page = read(os.path.join(SITE, "services.md"))
     sched = read(os.path.join(ROOT, "kernel", "src", "task", "scheduler.rs"))
-    m = re.search(r'if matches!\(task_name,(.{0,600}?)\)\s*\{', sched, re.S)
-    managed = set(re.findall(r'"([a-z0-9-]+)"', m.group(1))) if m else set()
+    # TO THE BRACE, NOT A FIXED LENGTH. This was `.{0,600}?`, and when the list grew past 600 characters
+    # (936 with `power` and `wifi-driver`) the pattern stopped matching, `managed` became the empty set, and
+    # the check passed while checking nothing - the page went on omitting both services (2026-10-02 audit).
+    m = re.search(r'if matches!\(task_name,(.*?)\)\s*\{', sched, re.S)
+    if not m:
+        return ["site_check: cannot find the restart set (`if matches!(task_name, ...)`) in "
+                "kernel/src/task/scheduler.rs - refusing to call a check passed that read nothing"]
+    managed = set(re.findall(r'"([a-z0-9-]+)"', m.group(1)))
     managed -= {"counter", "supervisor"}          # a test service, and the page's own subject
     return ["services.md does not mention `%s`, which the kernel manages (scheduler.rs restart set)"
             % n for n in sorted(managed) if "`%s`" % n not in page]

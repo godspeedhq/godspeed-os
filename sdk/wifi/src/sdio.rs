@@ -219,9 +219,9 @@ pub struct Card {
     pub memory: bool,
     /// The I/O OCR the card reported - the voltage window it can work in.
     pub ocr: u32,
-    /// Whether an EARLIER INSTANCE of this driver was here: the CCCR RES write was accepted, which only
-    /// an initialised card does. Everything downstream that has to treat a warm chip differently from a
-    /// fresh one reads this rather than guessing (`upload::run` zeroes the RAM the upload leaves alone).
+    /// Whether a firmware an EARLIER INSTANCE of the radio driver loaded is still running, so the driver
+    /// adopts it rather than uploading. `identify_once` always says `false`; only a radio driver's own
+    /// adopt decision sets it (the Broadcom's: function 2 enabled and ready).
     pub warm: bool,
 }
 
@@ -329,7 +329,7 @@ pub fn write_reg(h: &dyn SdioHost, func: u8, addr: u32, val: u8) -> Option<()> {
 }
 
 /// The identification proper, from CMD0: a fresh card, one just power-cycled, or one whose I/O side
-/// `identify` just reset. Public because the adopt path in `main` re-identifies after a power cycle.
+/// `identify` just reset. Public because a radio driver's adopt path re-identifies after a power cycle.
 pub fn identify_once(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<Card> {
     // LINUX'S ORDER: an SDIO I/O reset before CMD0, on every power-up (`mmc_rescan_try_freq` ->
     // `sdio_reset`: read the CCCR ABORT register, write it back with RES). A fresh card is not yet selected

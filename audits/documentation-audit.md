@@ -891,3 +891,37 @@ comment fixes are welcome, and a comment audit that finds four dead names in `ke
 to fix them has not done its job. All four are restored. The property the rule protects is checked by
 filtering the diff for non-comment lines, which returns 0. What stands from the revert is the part
 that was actually the failure: the commit ASSERTED the check passed without running it.
+
+## Audit 8 - documents and code comments, `feat/wifi-driver` since `50325b96` (2026-10-02)
+
+Scope: every document and Rust file the branch changed in its last three days - the clock leaving
+`net-stack`, the reply-cap and tag fixes, the wifi pipes and records, `Value::Signed`, and the WiFi code
+moving into `sdk/wifi` (steps 1, 2a, 2b-i). Two read-only audits, one of documents against the code, one of
+comments against the code beside them; every finding was checked against the source before it was fixed.
+
+**The finding that matters most was a gate, not a sentence.** `site_check`'s services coverage check read
+the kernel's restart set with `.{0,600}?`. The list is 936 characters now, so the pattern matched nothing,
+the set came back empty, and the check passed while checking nothing - and the services page went on
+omitting `wifi-driver` and `power`. It parses to the brace now and fails loudly if it cannot find the list,
+and it was PROVED to fire: with `wifi-driver` removed from a copy of the page it reports
+"services.md does not mention `wifi-driver`". The page has both sections.
+
+**Stale after the code moved** (comments): the credential table "not on disk" (it is the working set behind
+`/wifi.keys`); the shell's radio wait described as a sender-matched `Call` after it became a tag-sifted wait;
+`Card::warm` said to mean "the CCCR RES write was accepted" (only a driver's adopt path sets it); four SDK
+comments still promising a reply-cap reclaim that `backlog/67` removed; `Value::Signed` "not summed" after the
+aggregators learned to; the record size (32 x 45 + 2 is 1442, not 1410) and the security byte (43, not the
+last); shared-crate comments naming driver modules as if they lived beside them; host comments naming `cmd()`
+after it became `cmd_inner` and the trait.
+
+**Stale after the hardware said otherwise** (documents): `utilities/56_wifi.md` still described a five-second
+power-on wait (300 ms), a ten-second bound (15 s) and warm starts "one in three" (a slow host, gone with the
+clock lease); `services/CLAUDE.md` still said only a power cycle recovers the chip (open, `docs/wifi.md` 56);
+`backlog/66` and `67` still said their fixes were not yet booted; `docs/records.md` counted ten producers
+without `wifi list`; `docs/wifi.md` 59 described the `Station` trait as planned rather than as built.
+
+**Recorded, not changed:** the shared crate's log lines say `wifi-driver:`, true while that is the only radio
+service; a radio behind `dwc2` will need the prefix passed in (`sdk/wifi/src/lib.rs`, "Known gap").
+
+Verified rather than asserted: the Rust part of this audit is comments only - the uncommitted diff's
+non-comment Rust lines are the ten of the separate `keyfile` fix, counted, not assumed.

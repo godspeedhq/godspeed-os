@@ -9,7 +9,8 @@
 //! plain text. Nothing is encrypted at rest. There is no per-machine secret to encrypt with, and pretending
 //! otherwise would be the silent substitution 26.4 names.
 //!
-//! **The in-memory table stays the working set** (`main.rs`, `Stored`). This file is where it is loaded
+//! **The in-memory table stays the working set** (the radio driver's credential table; the Broadcom's is
+//! `Stored` in `services/wifi-driver/src/main.rs`). This file is where it is loaded
 //! from when the radio comes up and written to after every change - a join that added or re-ordered a key,
 //! a `forget` - and where `fs` is absent or mid-restart the driver runs on the table alone, exactly as it
 //! did before the file existed. A load that cannot reach `fs` is retried a bounded number of times and
@@ -36,6 +37,10 @@ const ENTRY: usize = 1 + SSID_MAX + 1 + PMK_LEN;
 const FS_OP_WRITE: u8 = 10;
 const FS_OP_READ: u8 = 11;
 const FS_OK: u8 = 0;
+/// `fs`'s "no such file" - the one answer that means there is nothing to load (`services/fs`, `FS_NOTFOUND`).
+const FS_NOTFOUND: u8 = 2;
+/// `fs`'s "no filesystem on this disk" - nothing to load either, and asking again will not make one.
+const FS_NOFS: u8 = 3;
 const TAG: u8 = 0xA7;
 /// One exchange with `fs`. A read of a 3 KiB file is milliseconds; two seconds is the loud floor.
 const FS_SECS: i64 = 2;
@@ -55,9 +60,11 @@ impl Entry {
 pub enum Load {
     /// This many entries read, most recent first.
     Loaded(usize),
-    /// `fs` answered and there is no file, or one this version cannot read: settled, nothing to adopt.
+    /// `fs` answered and there is no file, no filesystem, or a file this version cannot read: settled,
+    /// nothing to adopt.
     NoFile,
-    /// `fs` did not answer: not settled, worth asking again.
+    /// `fs` did not answer, or answered that its storage is in trouble (unavailable, an I/O error): not
+    /// settled, worth asking again.
     Unreachable,
 }
 
@@ -90,8 +97,16 @@ pub fn load(ctx: &ServiceContext, out: &mut [Entry; MAX_SAVED]) -> Load {
         None => return Load::Unreachable,
     };
     let p = r.payload_bytes();
-    if p.len() < 6 || p[1] != FS_OK {
-        return Load::NoFile;
+    // ONLY "NO SUCH FILE" AND "NO FILESYSTEM" SETTLE IT. Every other refusal is storage in trouble - `fs`
+    // answers `FS_UNAVAIL` while its block driver is being respawned - and reading that as "no file"
+    // settled the load and gave up on it for the life of this instance, so a driver started then never
+    // rejoined from `/wifi.keys` (Pi 4, chaos max-carnage, 2026-10-02: "no /wifi.keys - nothing to
+    // rejoin" logged one millisecond after `fs: re-mount after I/O error FAILED`). The caller's retry is
+    // bounded, so a disk that never comes back is still given up on, and says so.
+    match p.get(1).copied() {
+        Some(FS_OK) if p.len() >= 6 => {}
+        Some(FS_NOTFOUND) | Some(FS_NOFS) => return Load::NoFile,
+        _ => return Load::Unreachable,
     }
     let n = u32::from_le_bytes([p[2], p[3], p[4], p[5]]) as usize;
     let data = &p[6..core::cmp::min(p.len(), 6 + n)];

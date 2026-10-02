@@ -8,7 +8,7 @@
 echo a SECOND, 5 of 5 and 19 of 19, 0% loss. Five STATUS exchanges were still slow - 303, 335, 496, 658
 and 711 ms, against 890-990 before - and none landed on the one-second grid. The same boot logged
 `nic-driver: a reply send FAILED - the reply cap is dead` twice, which is `backlog/67`'s signature, and
-67 is fixed in the SDK since (not yet booted). What changed the timing is not shown; the clock leaving
+67 is fixed in the SDK since, and the Pi 4 boot after the fix logged no such line through a 50-round chaos run. What changed the timing is not shown; the clock leaving
 `net-stack`'s serve loop is the obvious candidate and is a guess. Left parked, with the new numbers.
 
 ## The measurement, which is exact

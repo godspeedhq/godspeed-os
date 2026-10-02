@@ -1793,7 +1793,7 @@ const ADDR_CHECK_SECS: i64 = 2;
 /// A UDP EXCHANGE ANSWERED WHEN ITS REPLY ARRIVES (op 12), held while this service goes on serving.
 ///
 /// **Why it exists.** Every other UDP path here waits for its reply inside the serve loop (`udp_roundtrip`,
-/// up to six tries of two seconds), and while it waits nobody else is served - a `ping` typed during a
+/// one send, then up to `UDP_RX_TRIES` receive polls of up to `LINK_SECS` each), and while it waits nobody else is served - a `ping` typed during a
 /// clock sync sat behind a time server. This sends the datagram, keeps the asker's reply capability, and
 /// returns to the loop at once. The poll step, which reads every frame anyway, hands the matching reply
 /// straight to the asker; a deadline answers "no reply" instead. Nothing waits.

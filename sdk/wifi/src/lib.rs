@@ -17,8 +17,8 @@
 //!   speaks in; [`bss`] (a scan's networks and their wire records) and [`rxq`] (received frames) with it.
 //! - [`sdio`]: the SDIO card protocol and the [`sdio::SdioHost`] trait every SDIO controller implements,
 //!   so the radios' code runs on the Pi 4's Arasan and the VisionFive 2's DesignWare host alike.
-//! - [`wire`]: the request/reply vocabulary between a radio driver and its clients (the shell's `wifi`,
-//!   `nic-driver`), so the shell and the driver read ONE definition rather than two copies of it.
+//! - [`wire`]: the request/reply vocabulary between a radio driver and the shell's `wifi`, so the shell
+//!   and the driver read ONE definition rather than two copies of it.
 //!
 //! # Why it is not in the SDK
 //!
@@ -30,6 +30,12 @@
 //! It is a crate rather than one service with vendor backends because the radios will not all live in one
 //! service: on the Pi 2 a USB device's driver sits behind the `dwc2` host service (the `smsc95xx` does),
 //! and a library serves both shapes.
+//!
+//! # Known gap
+//!
+//! Log lines in this crate are prefixed `wifi-driver:`. That is the only radio service today; a radio
+//! driven from another service (the Pi 2's, behind `dwc2`) will need the prefix passed in rather than
+//! assumed. Recorded here rather than solved before there is a second caller (26.2).
 #![no_std]
 #![deny(unsafe_code)]
 

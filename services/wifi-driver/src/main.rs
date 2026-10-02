@@ -421,7 +421,7 @@ fn serve_radio(
     // itself is the policy every radio shares (`godspeed_wifi::station`).
     let mut bcm = radio.map(|s| bcm::Bcm::new(h, w, s));
     let mut radio: Option<&mut dyn Station> = bcm.as_mut().map(|b| b as &mut dyn Station);
-    // Bounded: 2 status bytes plus 32 records of 44 is 1410 for a list, and 2 plus 64 names of 33 is 2114 for
+    // Bounded: 2 status bytes plus 32 records of 45 is 1442 for a list, and 2 plus 64 names of 33 is 2114 for
     // `stored` - both inside this fixed buffer, inside a 4 KiB message.
     let mut out = [0u8; 2560];
 
@@ -450,14 +450,14 @@ fn serve_radio(
     // set, status and the radio op are served and everything else is answered RADIO_POWERED_OFF; `on`
     // restores the power and asks to be restarted, because a cold chip needs the boot's own path.
     let mut powered_off = false;
-    // The network the firmware last reported JOINED, cleared by a disconnect or a power-off. Only an open
-    // network can reach that state until the host supplicant exists - see `join.rs`.
+    // The network the firmware last reported JOINED, cleared by a disconnect or a power-off.
     let mut joined: Option<([u8; join::MAX_SSID], u8)> = None;
     // When the join was reported, and with what security - for `status`'s `joined N s ago` and `security`.
     let mut joined_at_secs: i64 = 0;
     let mut joined_security: u8 = scan::sec::OPEN;
-    // THE FRAME PATH (`frames.rs`): what `nic-driver` asks once the cable is out. The queue is bounded
-    // and on this stack; the address is asked of the chip once; the rekey count is for the log.
+    // THE FRAME PATH (`frames.rs`, with the shared queue `godspeed_wifi::rxq`): what `nic-driver` asks once
+    // the cable is out. The queue is bounded and on this stack; the address is asked of the chip once; the
+    // rekey count is for the log.
     let mut rxq = frames::RxQueue::new();
     let mut link_mac: Option<[u8; 6]> = None;
     // Pairwise rekeys that did not complete, for the log.
@@ -593,8 +593,9 @@ fn serve_radio(
 
     // THE CREDENTIAL SLOTS (`utilities/56_wifi.md` 6): a network name and the pairwise master key derived
     // from its passphrase, sixty-four of them. The passphrase itself is gone the moment the key exists. When
-    // every slot is held, the one JOINED LONGEST AGO is replaced. They live here and nowhere else - not on
-    // disk, so they need no `fs` and never write a network name to the card - and die with this instance.
+    // every slot is held, the one JOINED LONGEST AGO is replaced. This table is the WORKING SET; the 48 most
+    // recent keys and their names are also on disk in `/wifi.keys` (`godspeed_wifi::keyfile`), loaded when
+    // the radio comes up and rewritten after every change.
     // About 70 bytes each, some 4.5 KiB in all, against a 16 MiB limit: the count is a BOUND (26.6), chosen
     // so that nobody reaches it, not a fit to the memory - a table that grew to fill what is available is
     // the elastic growth 26.6.1 says to resist.
@@ -687,7 +688,7 @@ fn serve_radio(
                     if keyfile_tries >= KEYFILE_TRIES {
                         keyfile_settled = true;
                         ctx.log_fmt(format_args!(
-                            "wifi-driver: fs did not answer for /wifi.keys in {} tries - running on the table in memory alone this boot",
+                            "wifi-driver: fs could not give /wifi.keys in {} tries (no answer, or its storage unavailable) - running on the table in memory alone this boot",
                             keyfile_tries
                         ));
                     }

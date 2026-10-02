@@ -1651,7 +1651,7 @@ impl ServiceContext {
     /// - a client request carries a reply cap, a driver reply does not.
     ///
     /// Everything else matches [`Self::request_with_reply_deadline_outcome`] exactly, including the
-    /// reply-cap reclaim on every failure path and the warning attached to `Timeout`: the request was
+    /// reply-cap reclaim on a failed send (a delivered request's cap is the peer's - backlog/67) and the warning attached to `Timeout`: the request was
     /// SENT, so a late reply is still coming and re-sending desyncs the protocol.
     #[inline]
     pub fn request_with_reply_deadline_sifted(
@@ -1762,6 +1762,8 @@ impl ServiceContext {
     /// [`Self::request_with_reply_deadline_sifted`] does for the unabortable wait. `mine` is asked about
     /// each message as it lands; `true` ends the wait with it, `false` hands it to the caller - who must
     /// release any cap it carries - and the wait goes on, its deadline unchanged by how many arrive.
+    /// Messages ALREADY queued when it is called are drained first without being asked (the stale-reply
+    /// drain every abortable wait opens with), so a caller that counts late answers drains before calling.
     ///
     /// For a peer whose replies the caller can recognise (a correlation tag) on an endpoint that also
     /// takes other traffic: the unsifted form returns the first message whatever it is, so a late
@@ -1871,7 +1873,7 @@ impl ServiceContext {
     /// buffers, and only a length is returned.
     ///
     /// Same deadline discipline as `request_with_reply_deadline` - block on the endpoint in slices,
-    /// give up when the caller's time is spent, and reclaim the reply cap either way (§8.5).
+    /// give up when the caller's time is spent, and reclaim the reply cap only when the send failed (§8.5, backlog/67).
     /// Send `req` to `peer` and receive the reply into `buf`, bounded by `max_secs`.
     ///
     /// **This used to be send + `recv_timeout_into`, and that was wrong in a way that cost days.**
@@ -2257,7 +2259,7 @@ impl ServiceContext {
                 // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
                 // into a dead cap (backlog/67). The peer removes the cap after answering.
                 // CALLER BEWARE: the request was already SENT, so the peer will reply into our endpoint
-                // whether we are listening or not. Reclaiming the reply CAP does not remove that message
+                // whether we are listening or not. Leaving the reply cap alone does not remove that message
                 // from the queue - the NEXT `try_recv` on this endpoint may return the ABANDONED reply
                 // instead of the answer it expects. That has bitten for real: a timed-out fs read left a
                 // 1-byte `[FS_NOTFOUND]` behind, and the next command consumed it and reported a healthy
@@ -2504,7 +2506,7 @@ impl ServiceContext {
     /// [`Self::request_with_reply_abortable`] (which does its own send) does not fit. This is the wait
     /// half of the abortable request, factored out: a peer that received our invocation but died before
     /// replying, or a filter that wedges mid-stream, can no longer hang us (Commandment VIII - wait on
-    /// truth *including failure*). The caller owns any reply cap it derived and reclaims it on every
+    /// truth *including failure*). The caller owns any reply cap it derived and reclaims it only when the send failed (backlog/67), not on every
     /// outcome. A service with no console foreground never sees input, so this degrades to a plain
     /// deadline wait. Does NOT drain a stale reply first - a caller that can be re-entered after an
     /// abort should `while self.try_recv().is_some() {}` before it sends (as the request variants do).

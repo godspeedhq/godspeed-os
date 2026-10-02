@@ -4,7 +4,7 @@
 //! station is associated the radio is a frame source, `nic-driver` is the link front end, and this is its
 //! fifth backend. Nothing above it changes shape.
 //!
-//! What lives here is the RECEIVE QUEUE and the pull that fills it. The driver blocks in `recv` when it is
+//! What lives here is the pull that fills the shared receive queue (`godspeed_wifi::rxq`). The driver blocks in `recv` when it is
 //! idle, so a frame the access point sends waits in the chip until somebody asks. `nic-driver` asks on
 //! `net-stack`'s pace, and each ask reads what the chip has waiting - at most `PULL_MAX_READS` frames -
 //! into a bounded queue (26.6.1), watching the link as it goes: a `LINK` event without its up bit, or a

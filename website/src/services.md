@@ -208,6 +208,32 @@ cannot ask a service to report it (§11.4).
 
 **Peers:** `events` only - everything else writes *to* it.
 
+### `wifi-driver` - the radio
+
+```
+   shell (wifi) ──▶ wifi-driver ──▶ SDIO host ──▶ the radio chip (its own firmware, uploaded at start)
+   nic-driver   ──▶ wifi-driver     (frames, once the cable is out - the cable always wins)
+                      ├──▶ fs     (/wifi.keys: the keys a join earned)
+                      └──▶ power  (a lease on the Arm clock while it loads the chip)
+```
+
+The Pi 4's onboard radio. The chip-independent half - the handshake, the key file, the wire protocol, the
+SDIO protocol and the `Station` a serve loop drives - is a library, `sdk/wifi`, shared with the radios to
+come. A respawn adopts a firmware still running; a stopped one is power-cycled cold.
+
+**Peers:** `fs`, `power`.
+
+### `power` - the machine's power policy
+
+```
+   wifi-driver ──lease──▶ power ──CpuClock──▶ kernel ──▶ firmware mailbox (the Arm clock)
+```
+
+Holds `CPU_CLOCK` alone. Leases of up to 30 s keep the Arm clock at its maximum while any is open; a
+lease nobody returns expires on its own, so a holder that dies cannot pin the machine fast.
+
+**Peers:** none - it answers, it does not ask.
+
 ### `time` - the wall clock
 
 ```

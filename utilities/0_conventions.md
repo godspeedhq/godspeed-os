@@ -162,7 +162,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     sources - `match`, `count`, `sort`, `first`, `last`, `where`, `select`, `to`, `from`, `sum`, `min`,
     `max`, `avg`, `paginate`, `write`, `assert`, `result` - and `result`/`assert` refuse to start a pipe
     with a sentence that names the idiom they belong to. The other 22, each for a reason rather than an
-    omission (the library scripts are not in `UTILS` and are listed with them):
+    omission (the library scripts, `serve` and `gpio` are not in `UTILS` and are listed with them):
 
     | Not a pipe source | Why |
     |---|---|

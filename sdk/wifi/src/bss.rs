@@ -11,7 +11,7 @@ use crate::wire::{self as reply, SSID_MAX as MAX_SSID};
 /// How many networks to keep. Bounded on purpose: a fixed array whose limit is readable here (§26.6.1).
 pub const MAX_RESULTS: usize = 32;
 
-/// What a network's beacon says about how it is secured. Wire value in a `wifi list` record's last byte.
+/// What a network's beacon says about how it is secured. Wire value in a `wifi list` record's byte 43.
 pub mod sec {
     /// No Privacy bit, no RSN element, no WPA element.
     pub const OPEN: u8 = 0;
@@ -99,11 +99,12 @@ pub struct Scan {
     pub count: usize,
     /// Results the firmware reported that did not fit. Counted rather than dropped silently (§26.7).
     pub dropped: u32,
-    /// Events seen, so rung A is reportable even when nothing parses.
+    /// The DRIVER'S tallies of what its firmware sent during the sweep, for its own log; their meaning is
+    /// the driver's (on the Broadcom: events seen, escan results among them, glommed superframes not read).
     pub events: u32,
-    /// Escan-result events specifically.
+    /// Result events specifically (the Broadcom's escan results).
     pub results: u32,
-    /// Glommed frames seen and not read. See `CHANNEL_GLOM`.
+    /// Frames seen and not read (the Broadcom's glommed superframes).
     pub glom: u32,
     /// Frames on a channel this driver does not read at all.
     pub other: u32,
@@ -163,7 +164,7 @@ impl Scan {
 /// Serialise a scan into a reply: `[status, count, record * count]`. Returns the bytes written.
 ///
 /// A FIXED layout with no framing to parse on the far side - the shell indexes into it. 32 records of 44
-/// bytes plus two is 1410 bytes, well inside a 4096-byte message, and `Scan` already bounds the count.
+/// bytes plus two is 1442 bytes, well inside a 4096-byte message, and `Scan` already bounds the count.
 pub fn write_reply(scan: &Scan, note: &dyn Fn(&Network) -> u8, out: &mut [u8]) -> usize {
     write_records(scan, 0, reply::OK, note, out)
 }
@@ -187,7 +188,7 @@ pub fn write_records(scan: &Scan, from: usize, status: u8, note: &dyn Fn(&Networ
         out[at + 8..at + 10].copy_from_slice(&n.chanspec.to_le_bytes());
         out[at + 10] = n.ssid_len;
         out[at + 11..at + 11 + MAX_SSID].copy_from_slice(&n.ssid);
-        // The last byte was a pad; it carries the `sec::` value now. Same record size, same offsets.
+        // Byte 43, once a pad, carries the `sec::` value; byte 44, the last, is the note.
         out[at + 43] = n.security;
         out[at + 44] = note(n);
         at += reply::RECORD;

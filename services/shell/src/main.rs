@@ -7643,9 +7643,9 @@ mod wifi_wire {
 /// hardware as "not answering" in 15 ms. The name directory resolves the driver that is running now; a
 /// driver that is genuinely dead fails the reacquire and the caller's loud sentence stays true.
 fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
-    // A DEADLINE IS NEVER RE-SENT, AND THE REPLY IS TAKEN FROM THE DRIVER ONLY - matched by SENDER, not by
-    // request, so the drain and the owed count below are what keep a late answer from being read as this
-    // one's. This used `request_with_reply_ms`,
+    // A DEADLINE IS NEVER RE-SENT, AND THE REPLY IS THE ONE CARRYING THIS REQUEST'S TAG (`wifi_sift`); the
+    // drain clears what is already queued, and late tagged answers are counted off `owed`. This used
+    // `request_with_reply_ms`,
     // which takes the next message in this shell's queue whatever it answers, and on its deadline
     // reacquired the driver and SENT THE REQUEST AGAIN. Boot 2026-09-30 14:51: the driver took three
     // seconds over the first `wifi scan`, the shell gave up and sent a second, the driver answered both -
@@ -7654,10 +7654,10 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // list` got a reply it did not understand, `wifi radio on` was told the power command was not taken.
     // A late answer is not a refusal, and a re-sent request is a second request.
     //
-    // THE QUEUE IS DRAINED FIRST, because the `Call` form does NOT tell one request's answer from
-    // another's. It takes "the oldest queued message SENT BY" the driver (the kernel's
-    // `dequeue_reply_locked`) - it matches by SENDER - so a late answer to a request this shell already
-    // gave up on is read as the answer to whatever is asked next. Draining only after a deadline, as this
+    // THE QUEUE IS DRAINED FIRST: anything queued before a request is stale by construction. History, and
+    // why the tag below exists: this used the `Call` form, which takes "the oldest queued message SENT BY"
+    // the driver (the kernel's `dequeue_reply_locked`) - it matches by SENDER - so a late answer to a request
+    // this shell already gave up on was read as the answer to whatever was asked next. Draining only after a deadline, as this
     // did, is too early: the abandoned answer has not arrived yet. Boot 2026-10-01 13:58: the powercycle
     // watch gave up on six status polls while the driver brought a cold chip up, the driver answered all
     // six once it was serving, and every later command read the next one - `wifi radio on` said "already
@@ -7868,10 +7868,9 @@ fn wifi_no_answer(ctx: &ShellCtx, out: &mut Out, outcome: &ReqOutcome, doing: &s
     }
 }
 
-/// Clear stale replies: the reply MAILBOX first (`drain_stale_replies`), where answers to this shell's
-/// requests land, then the main endpoint. Called around wifi requests the shell stopped waiting for: a late
-/// answer left in the mailbox would be taken by the next Call to the driver as that request's answer (the
-/// Call matches by sender), and it holds a slot of a 16-deep queue. Everything queued here is stale by
+/// Clear stale replies: the reply MAILBOX first (`drain_stale_replies`), where other peers' late replies land
+/// and hold slots of a 16-deep queue, then the main endpoint, where radio answers arrive and are judged by
+/// their tag (`wifi_sift`). Everything queued here is stale by
 /// construction: the shell asks one thing at a time and reads console input from the kernel ring, not from
 /// its endpoint, and a late `net-stack` reply is discarded by its own tag check either way.
 ///

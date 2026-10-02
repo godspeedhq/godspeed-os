@@ -3226,6 +3226,9 @@ full-MAC radio whose firmware the host uploads - with none of the Pi 4's PARTS:
 - **The firmware is proprietary vendor blobs**, four of them for WiFi alone, and the section 8 question
   - in the repository or supplied by the user - is asked again for a different vendor with a different
   licence. Not answered here.
+- (2026-10-02: this is what `sdk/wifi` became - section 59 - and the SDIO protocol, CMD52/CMD53 and
+  identification included, is shared there behind an `SdioHost` trait; the host itself is not
+  `arch/aarch64/sdio.rs`, which only census-checks the controller, but `services/wifi-driver/src/host.rs`.)
 - **What DOES carry over is everything above the firmware:** `crypto.rs`, `eapol.rs`, the join state
   machine, the credential table and `/wifi.keys`, the frame interface and `nic-driver`'s carrier rule,
   and the `wifi` utility. A full-MAC radio with a host-side handshake needs exactly those, and none of
@@ -3989,11 +3992,15 @@ soft-MAC than expected - its scan results and received data are raw 802.11 frame
 the 802.11-to-Ethernet conversion are shared work too.
 
 **The shape.** `sdk/wifi` (`godspeed-wifi`), a `no_std` library with no `unsafe`, holds what every radio
-shares. Below it, a `Station` trait - scan, connect, add a key, open the control port, disconnect, link,
+shares. Below it, a `Station` trait - planned as scan, connect, add a key, open the control port, disconnect, link,
 frames, power, recover - that each full-MAC chip implements and that a shared host-side MLME will
 implement over a soft-MAC `RawRadio`; and an `SdioHost` trait under the two SDIO chips, so the Broadcom
 code runs on any SDIO host and the AIC gets a DesignWare one. Not in the SDK: that is the operating
 system's interface and its audited `unsafe`, and 802.11 is neither (`sdk/wifi/CLAUDE.md`).
+
+(As built in step 2b-i the trait has no add-key, control-port or recover methods: keys and the port are
+inside `join`, and recovery stays in the serve loop with the SDIO host and the power pin. The 2b-i paragraph
+below lists it.)
 
 **Step 1, this change.** `crypto`, `eapol` and `keyfile` moved as they were (their history followed), and
 the wire protocol became one module, `wire`, that the driver's `scan::reply` and the shell's `wifi_wire`

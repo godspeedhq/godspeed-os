@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! EAPOL-Key frames: the four messages of the WPA2 handshake, as they arrive on the data channel.
 //!
-//! This firmware has no supplicant (`docs/wifi.md` §37), so the handshake is the host's - as it is for
+//! The radios' firmware does not run the supplicant (the Broadcom's: `docs/wifi.md` §37), so the handshake is the host's - as it is for
 //! OpenBSD, whose `bwfm_rx` hands every frame with ethertype `ETHERTYPE_EAPOL` to
 //! `ieee80211_eapol_key_input`. This module is the frame layer of that: recognising a key frame and
 //! reading its header (`describe`), deriving the pairwise transient key (`derive_ptk`), building and
 //! signing our own messages (`build_key_frame`), verifying the access point's (`check_mic`), and finding
-//! the group key inside message 3 (`find_gtk`). The state machine that orders them is `join.rs` for the
-//! four-way handshake and `frames::group_rekey` for the group-key rekeys that follow it.
+//! the group key inside message 3 (`find_gtk`). The state machine that orders them is the radio driver's
+//! (the Broadcom's: `services/wifi-driver/src/join.rs` for the four-way handshake and its
+//! `frames::group_rekey` for the group-key rekeys that follow it).
 //!
 //! ## The frame, quoted
 //!

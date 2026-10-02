@@ -59,8 +59,8 @@ pub enum Value {
     /// signal is in dBm - always negative - and is the raw fact (`utilities/0_conventions.md` rule 7):
     /// the magnitude would be a different number, and a string would sort by bytes, which orders
     /// `-9` after `-80`. Its own variant rather than a change to `Int`, so every count, size and tick
-    /// keeps the type it had. Compares numerically with `Int` (`sort`, `where`); not summed by the
-    /// aggregators unless it is non-negative.
+    /// keeps the type it had. Compares numerically with `Int` (`sort`, `where`) and is reduced by the
+    /// aggregators through `cell_num_wide` (i128); only the u64 `cell_int` accessor refuses a negative.
     Signed(i64),
     /// An absent / null cell.
     Empty,

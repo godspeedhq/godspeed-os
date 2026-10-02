@@ -24,7 +24,7 @@ pub enum ScanStep {
     Ended(&'static str),
 }
 
-/// How a join ended. Mirrors `scan::reply`'s connect statuses one for one.
+/// How a join ended. Mirrors `crate::wire`'s connect statuses one for one.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Joined,

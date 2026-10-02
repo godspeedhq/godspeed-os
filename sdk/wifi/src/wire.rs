@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The request/reply vocabulary between a radio driver and the services that ask it things: the shell's
-//! `wifi` utility, and `nic-driver`'s frame ops. One definition, read by both sides - it used to be the
+//! The request/reply vocabulary between a radio driver and the shell's `wifi` utility. One definition, read
+//! by both sides (the frame ops `nic-driver` uses, 0x10-0x12, are the Broadcom driver's own, in its
+//! `frames.rs`) - it used to be the
 //! driver's `scan::reply` and a hand-kept mirror of it in the shell (`wifi_wire`), the same fact twice.
 //!
 //! A reply's first byte is its status. A request may be TAGGED (`TAGGED`): see that constant.
