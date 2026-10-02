@@ -1515,7 +1515,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // answers - silently, and on hardware only. 0 means the platform declined to say, and the host
     // layer refuses rather than guessing.
     let base = ctx.emmc_base_clock_hz();
-    let h = host::Host::new(&mmio, base);
+    let h = host::Host::new(&ctx, &mmio, base);
     // Print the version register the KERNEL identified this controller by. If the two numbers
     // disagree, the grant is pointed somewhere other than where the census looked, and this is the one
     // line where both are visible.

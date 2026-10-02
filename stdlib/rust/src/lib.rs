@@ -60,6 +60,9 @@
 
 pub mod addr;
 pub mod error;
+/// Device-neutral mechanisms for drivers (`docs/driver-library.md`). Not gated on the host test build:
+/// its pure arithmetic is unit-tested there, and the SDK-dependent half gates itself.
+pub mod driver;
 
 // THE SDK-DEPENDENT HALF, and why it is not in the host test build.
 //

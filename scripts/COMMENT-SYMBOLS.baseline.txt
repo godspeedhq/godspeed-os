@@ -500,3 +500,5 @@ trap_addr                          # Linux brcmfmac sdio.c `sdpcm_shared_le.trap
 si_watchdog                        # Broadcom DHD siutils.c - arms the PMU watchdog on a PMU chip, the chipcommon watchdog otherwise; the register choice `sdio::PMU_WATCHDOG` follows - external, 26.14
 pmuwatchdog                        # Broadcom chipcregs - the PMU watchdog register at chipcommon + 0x634 `sdio::PMU_WATCHDOG` names - external, 26.14
 mmc_sdio_resume                    # Linux drivers/mmc/core/sdio.c - resume reinitialises nothing for a powered, non-removable card; the model `sdio::identify` adopts a running firmware by - external, 26.14
+sdhci_reset                        # Linux sdhci.c, cited for its 100 ms bound on the same reset bits wifi-driver host.rs waits on - external, 26.14
+sdhci_enable_clk                   # Linux sdhci.c, cited for its 150 ms bound on the clock-stable bit - external, 26.14

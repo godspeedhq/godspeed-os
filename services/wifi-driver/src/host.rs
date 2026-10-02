@@ -34,6 +34,7 @@
 //! `INTERRUPT` after a failure always reads 0 and cannot tell a timeout from an error.
 
 use godspeed_sdk::{Mmio, ServiceContext};
+use godspeed::driver::wait::{self, Budget};
 
 // Register offsets from the controller base. SDHCI-standard; the BCM2711's Arasan is a conforming
 // implementation of the parts used here.
@@ -120,6 +121,21 @@ const BLK_BOUNDARY: u32 = 7 << 12;
 
 
 
+/// How long a CONTROLLER-side wait may take: a reset bit clearing, the clock stabilising, the command
+/// and data lines leaving inhibit.
+///
+/// These were iteration counts (`t > 1_000_000`), which is a duration only on the machine it was tried
+/// on. Measured on the Pi 4 at the Arm clock's maximum, one look at a register here costs about 250 ns
+/// (the firmware upload: ~320 completion looks per command, ~5 ms per 1 KiB command), so a million looks
+/// was about a quarter of a second. The budget is twice that, so no wait that succeeded under the count
+/// can expire under the clock, and expiry now means the same thing on every core clock. Linux's own
+/// bounds for the same waits are shorter (`sdhci_reset` 100 ms, `sdhci_enable_clk` 150 ms).
+const CONTROL_WAIT: Budget = Budget::ms(500);
+
+/// How long a CARD-side wait may take: the command completing, the FIFO becoming ready, the transfer
+/// completing. Twice `CONTROL_WAIT`, as the two million looks it replaces were twice the million.
+const CARD_WAIT: Budget = Budget::ms(1_000);
+
 /// A short delay. Spins rather than sleeps because these are microsecond-scale hardware settling gaps
 /// on a path that holds no lock and serves nobody yet; a count is not a duration (`arch/CLAUDE.md`),
 /// which is why nothing here uses one as a TIMEOUT - the timeouts below are separate bounded loops on
@@ -158,6 +174,8 @@ fn write_settle() {
 }
 
 pub struct Host<'a> {
+    /// For the clock that bounds every wait on this controller (`godspeed::driver::wait`).
+    ctx: &'a ServiceContext,
     m: &'a Mmio,
     /// The controller's base clock in Hz, from the platform. **0 means refuse**, never guess: every
     /// card clock derives from this, the Arasan reports it wrongly in CAPS on this family, and a
@@ -200,8 +218,9 @@ pub struct Host<'a> {
 }
 
 impl<'a> Host<'a> {
-    pub fn new(m: &'a Mmio, base_clock: u32) -> Self {
+    pub fn new(ctx: &'a ServiceContext, m: &'a Mmio, base_clock: u32) -> Self {
         Host {
+            ctx,
             m,
             base_clock,
             last_int: core::cell::Cell::new(0),
@@ -325,13 +344,9 @@ impl<'a> Host<'a> {
         // different duration on every core clock.
         const PARK_MS: u64 = 100;
         self.wr(CONTROL1, self.rd(CONTROL1) | C1_SRST_HC);
-        let t0 = ctx.read_tsc();
-        let limit = ctx.duration_cycles(PARK_MS);
-        while self.rd(CONTROL1) & C1_SRST_HC != 0 {
-            if ctx.read_tsc().wrapping_sub(t0) > limit {
-                ctx.log("wifi-driver: SRST_HC did not clear while parking the host - its lines may still be driven across the power edge");
-                return false;
-            }
+        if wait::until(ctx, Budget::ms(PARK_MS), || self.rd(CONTROL1) & C1_SRST_HC == 0).is_err() {
+            ctx.log("wifi-driver: SRST_HC did not clear while parking the host - its lines may still be driven across the power edge");
+            return false;
         }
         // SRST_HC returns CONTROL1 to its reset value, clocks off. Cleared explicitly as well, so the
         // parked state does not rest on one controller's reading of "reset".
@@ -357,17 +372,13 @@ impl<'a> Host<'a> {
         for _ in 0..40 {
             spin();
         }
-        let mut t = 0u32;
-        while self.rd(CONTROL1) & C1_CLK_STABLE == 0 {
-            t += 1;
-            if t > 1_000_000 {
-                ctx.log_fmt(format_args!(
-                    "wifi-driver: card clock never reported stable (divisor={}, CONTROL1={:#010x})",
-                    divisor,
-                    self.rd(CONTROL1)
-                ));
-                return false;
-            }
+        if wait::until(ctx, CONTROL_WAIT, || self.rd(CONTROL1) & C1_CLK_STABLE != 0).is_err() {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: card clock never reported stable (divisor={}, CONTROL1={:#010x})",
+                divisor,
+                self.rd(CONTROL1)
+            ));
+            return false;
         }
         self.wr(CONTROL1, self.rd(CONTROL1) | C1_CLK_EN);
         for _ in 0..40 {
@@ -384,13 +395,9 @@ impl<'a> Host<'a> {
     /// debugging session (invariant 12).
     pub fn reset(&self, ctx: &ServiceContext) -> bool {
         self.wr(CONTROL1, self.rd(CONTROL1) | C1_SRST_HC);
-        let mut t = 0u32;
-        while self.rd(CONTROL1) & C1_SRST_HC != 0 {
-            t += 1;
-            if t > 1_000_000 {
-                ctx.log("wifi-driver: SRST_HC never cleared - the controller did not leave reset");
-                return false;
-            }
+        if wait::until(ctx, CONTROL_WAIT, || self.rd(CONTROL1) & C1_SRST_HC == 0).is_err() {
+            ctx.log("wifi-driver: SRST_HC never cleared - the controller did not leave reset");
+            return false;
         }
         if self.base_clock == 0 {
             ctx.log(
@@ -481,7 +488,7 @@ impl<'a> Host<'a> {
     /// - R4 from CMD5 and R3 - carry neither a CRC7 nor a command index". That is true of CMD5, and it
     /// was applied to every command through one shared template. **R5 carries both**, and Linux sets
     /// both for it from `MMC_RSP_R5 = PRESENT | CRC | OPCODE` - see the per-command constants in
-    /// `sdio.rs`, which now carry the values `sdhci_send_command` computes.
+    /// `godspeed_wifi::sdio` (`Cmd`), encoded by `cmdtm` below into the values `sdhci_send_command` computes.
     pub fn cmd_word(&self, code: u32, arg: u32) -> Option<u32> {
         self.cmd_inner(code, arg, None)
     }
@@ -495,13 +502,9 @@ impl<'a> Host<'a> {
     /// argument. Both are before the write that starts the transfer, so this is unlikely to matter - it
     /// is here because matching the reference where there is no reason to differ is the method.
     fn cmd_inner(&self, code: u32, arg: u32, blk: Option<u32>) -> Option<u32> {
-        let mut t = 0u32;
-        while self.rd(STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) != 0 {
-            t += 1;
-            if t > 1_000_000 {
-                self.last_int.set(self.rd(INTERRUPT));
-                return None;
-            }
+        if wait::until(self.ctx, CONTROL_WAIT, || self.rd(STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) == 0).is_err() {
+            self.last_int.set(self.rd(INTERRUPT));
+            return None;
         }
         self.wr(INTERRUPT, self.rd(INTERRUPT)); // clear stale status
         self.wr(ARG1, arg);
@@ -526,7 +529,7 @@ impl<'a> Host<'a> {
         // when a command with Data Present Select completes, so a controller that started nothing either
         // has a zero block size or does not have that bit set.
         self.last_cmdtm.set(self.rd(CMDTM));
-        let mut t = 0u32;
+        let mut d = wait::Deadline::start(self.ctx, CARD_WAIT);
         loop {
             let i = self.rd(INTERRUPT);
             if i & INT_CMD_DONE != 0 {
@@ -539,8 +542,7 @@ impl<'a> Host<'a> {
                 self.reset_cmd_dat();
                 return None;
             }
-            t += 1;
-            if t > 2_000_000 {
+            if d.expired() {
                 self.last_int.set(self.rd(INTERRUPT));
                 self.reset_cmd_dat();
                 return None;
@@ -564,11 +566,11 @@ impl<'a> Host<'a> {
     /// while waiting for the FIFO is exactly what a healthy command looks like. "The command never
     /// issued" and "the command was fine and no data came" need different fixes.
     ///
-    /// **The command phase is `cmd()`**, the same function CMD0, CMD3, CMD5, CMD7 and CMD52 all go
+    /// **The command phase is `cmd_inner`**, the same function CMD0, CMD3, CMD5, CMD7 and CMD52 all go
     /// through. This used to inline its own copy of that logic - the inhibit wait, the stale-status
     /// clear, the ARG1/CMDTM writes, the CMD_DONE poll - which is four chances to differ subtly from
     /// code already proven on this silicon. `block-driver`'s backend has the shape that works on this
-    /// controller and this now matches it: wait DAT, set the block registers, `cmd()`, then the data.
+    /// controller and this now matches it: wait DAT, set the block registers, `cmd_inner`, then the data.
     ///
     /// PIO, not DMA, for the two reasons `block-driver`'s backend gives: DMA on this SoC is not cache
     /// coherent without explicit maintenance, and these transfers are four bytes. Whether a firmware
@@ -588,13 +590,9 @@ impl<'a> Host<'a> {
         self.dat_first.set(0);
         self.dat_last.set(0);
         // The DAT line before the block registers, which is the order the working backend uses.
-        let mut t = 0u32;
-        while self.rd(STATUS) & SR_DAT_INHIBIT != 0 {
-            t += 1;
-            if t > 1_000_000 {
-                self.last_int.set(self.rd(INTERRUPT));
-                return Err("the DAT line never came out of inhibit");
-            }
+        if wait::until(self.ctx, CONTROL_WAIT, || self.rd(STATUS) & SR_DAT_INHIBIT == 0).is_err() {
+            self.last_int.set(self.rd(INTERRUPT));
+            return Err("the DAT line never came out of inhibit");
         }
         // THE BLOCK REGISTERS COME FROM THE CALLER, because byte mode and block mode need different
         // words and only the caller knows which it is issuing (`blk_byte_mode` / `blk_block_mode`). It is
@@ -640,8 +638,9 @@ impl<'a> Host<'a> {
             if done >= buf.len() {
                 break;
             }
-            // WAIT ONCE PER BLOCK.
+            // WAIT ONCE PER BLOCK. `t` counts looks for the instruments; the bound is the clock.
             let mut t = 0u32;
+            let mut d = wait::Deadline::start(self.ctx, CARD_WAIT);
             loop {
                 let i = self.rd(INTERRUPT);
                 let s = self.rd(STATUS);
@@ -661,8 +660,8 @@ impl<'a> Host<'a> {
                     self.reset_cmd_dat();
                     return Err("the controller reported an error during the data phase");
                 }
-                t += 1;
-                if t > 2_000_000 {
+                t = t.saturating_add(1);
+                if d.expired() {
                     self.last_int.set(self.rd(INTERRUPT));
                     self.reset_cmd_dat();
                     return Err("the FIFO never became ready - the command completed and no data came");
@@ -688,6 +687,7 @@ impl<'a> Host<'a> {
         // transaction - the controller still has to finish on the bus - and issuing the next command
         // before it does is a line conflict.
         let mut t = 0u32;
+        let mut d = wait::Deadline::start(self.ctx, CARD_WAIT);
         loop {
             let i = self.rd(INTERRUPT);
             if i & INT_DATA_DONE != 0 {
@@ -698,8 +698,8 @@ impl<'a> Host<'a> {
                 self.reset_cmd_dat();
                 return Err("the controller reported an error after the data moved");
             }
-            t += 1;
-            if t > 2_000_000 {
+            t = t.saturating_add(1);
+            if d.expired() {
                 self.last_int.set(self.rd(INTERRUPT));
                 self.reset_cmd_dat();
                 return Err("the data moved and the transfer never reported complete");
@@ -718,13 +718,9 @@ impl<'a> Host<'a> {
     /// the driver.
     fn reset_cmd_dat(&self) {
         self.wr(CONTROL1, self.rd(CONTROL1) | C1_SRST_CMD | C1_SRST_DATA);
-        let mut t = 0u32;
-        while self.rd(CONTROL1) & (C1_SRST_CMD | C1_SRST_DATA) != 0 {
-            t += 1;
-            if t > 1_000_000 {
-                break;
-            }
-        }
+        // Not reported HERE: this runs on a path already returning its own failure, and a line reset
+        // that did not finish shows up as the NEXT command's inhibit wait expiring, which is reported.
+        let _ = wait::until(self.ctx, CONTROL_WAIT, || self.rd(CONTROL1) & (C1_SRST_CMD | C1_SRST_DATA) == 0);
         self.wr(INTERRUPT, self.rd(INTERRUPT));
     }
 }
