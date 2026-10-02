@@ -115,7 +115,20 @@ are an instrument now, not the bound.
 
 **Verified:** QEMU (Pi 4 machine): the host resets, its clock stabilises and commands complete through
 the new waits; no radio is emulated, so the firmware path is for the board.
-**Not yet verified on hardware.**
+
+**Verified on hardware, 2026-10-02 (Pi 4).** Two sessions, nine firmware uploads (boot, six
+`wifi radio powercycle`, chaos recoveries), against a session on the count-bounded waits the same day:
+
+| | count-bounded (before) | `gs::driver::wait` (after) |
+|---|---|---|
+| upload, `rung 4 ok` to `firmware written` | ~3.0 s | 3.03-3.05 s |
+| completion looks per upload | 186,815 - 192,020 | 44,069 - 44,663 |
+| FIFO looks per upload | ~8,925 | 0 |
+
+The time is the card's, so it did not move; each look now also reads the clock, so about a quarter as
+many fit in it, as predicted. The FIFO was ready at the first look every time, which a `Deadline` that
+checks before it loops reports as zero. No wait expired. `chaos max-carnage all-services` (50 rounds)
+recovered the radio and the network on the new waits.
 
 **Not converted yet, deliberately.** The other five drivers' copies (one change at a time), and
 `sdk/wifi`'s function-ready wait in `sdio.rs`, which builds its deadline by hand - converting it makes
