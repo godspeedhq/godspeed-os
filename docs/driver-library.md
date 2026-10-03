@@ -141,9 +141,9 @@ bending: a register, a mask, a budget, and the driver saying in its own words wh
 
 What did NOT move is worth saying, because it is the next candidate rather than an oversight:
 `delay_us` waits a fixed time for nothing in particular ("give the PHY a moment"), which is a different
-mechanism from waiting for a condition. It is not repeated: it is the only hand-rolled delay among the
-drivers, and the others that need to pause (`xhci`'s port-power settle) call the SDK's `sleep`. So it
-stays in the driver, which is the rule working rather than a gap.
+mechanism from waiting for a condition, so it stays in the driver until it is moved as its own step.
+(This said it was the only hand-rolled delay among the drivers. It is not: step 1c found two in `xhci`,
+so a fixed pause IS repeated, and is the next candidate - see below.)
 
 **Verified:** builds for every port (`nic-driver` is one crate on all four), and on the Pi 4 the same
 day: no MDIO or DMA-start wait expired, cable ping 0% loss, the cable and the radio stepping in and out
@@ -156,9 +156,39 @@ for each other, and `chaos max-carnage all-services` (50 rounds) bringing `genet
 |---|---|---|---|
 | `block-driver` (`sdhci.rs`) | Pi 2 | six `t > 1_000_000` loops | **count-bounded, the same defect `wifi-driver` had** - missed by the first census, which looked for named helpers and this one has none |
 | `dwc2` | Pi 2 | `wait_until` | one-look budget when uncalibrated |
-| `xhci` | Pi 4, VisionFive, x86 | `spin` | one-look budget when uncalibrated; takes a name to log, which `wait` deliberately does not |
 | `nic-driver` `dwmac` | VisionFive | `wait_clear`, `mdio_idle` | 200,000 and 20,000 looks when uncalibrated |
 | `sdk/wifi` (`sdio.rs`) | Pi 4 | function-ready | builds its deadline by hand; converting makes `sdk/wifi` depend on `gs`, a dependency change of its own |
+
+## Step 1c: `xhci` on `wait` (2026-10-02)
+
+The test the second driver could not give: a wait that LOGS. `xhci`'s `spin` takes the register
+condition in words and prints it when the wait expires, and `wait` deliberately never logs. It fitted
+anyway, and the shape it fitted in is the one the module intends: `spin` stays as `xhci`'s own thin
+wrapper - `wait::until` underneath, the driver's line on `Err` - so the five waits that call it
+(`PORTSC.PED`, `USBSTS.HCH` both ways, `USBSTS.CNR`, `USBCMD.HCRST`) are unchanged at the call site.
+
+It fixed one case. `spin` built its budget from `duration_cycles`, which on an uncalibrated clock floors
+to one tick, so every one of those waits gave up after a single look - a controller reset that never
+waited for the reset. The library bounds that case by `UNCALIBRATED_POLLS` looks.
+
+**What `xhci` showed that is NOT converted, and why.**
+
+- **Two fixed busy-pauses** (a 2 ms settle after `HCRST`, the reset-recovery hold after a root-port
+  reset), spinning on `read_tsc` for a set time. With `genet`'s `delay_us` that is three, in two
+  drivers: a fixed pause is repeated, and it is the next mechanism. It is a different one from `wait` -
+  nothing is being waited FOR - and on an uncalibrated clock a pause has no honest bound at all, which
+  is a question to settle when it is built, not to answer by folding it into `wait`.
+- **Three deadline loops that SLEEP between polls** (the hub port probe, mass-storage spin-up, a disk
+  transfer). `Deadline` would measure them, but its uncalibrated fallback counts LOOKS, and 200,000
+  looks with a sleep between each is not the bound it is for a loop that spins. They stay hand-written
+  until that is resolved rather than converted into something that is quietly wrong.
+
+**Verified:** builds for every port (`xhci` is one crate on three), and on the Pi 4 on 2026-10-03: no
+`spin` wait expired anywhere in the session; the controller reset cleanly all 28 times it was asked
+(boot, hot-plug of the keyboard and the stick, and every restart); `chaos max-carnage all-services` (50
+rounds, 344 kills) brought the keyboard and the disk back. One `dir /` just after chaos waited out
+`block-driver`'s 10 s while `xhci` was re-enumerating a replugged stick - none of its own waits
+expired, and the next `dir /` answered; that is the driver being busy, not a wait giving up.
 
 ## What this supersedes
 

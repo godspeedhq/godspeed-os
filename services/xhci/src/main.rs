@@ -15,6 +15,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 /// USB mass storage (Bulk-Only Transport + SCSI). Split out because it is a self-contained protocol
@@ -537,19 +538,22 @@ const TRB_PORT_STATUS_CHANGE: u32 = 34;
 /// not ready - a failure discovered several registers later, as nonsense. §26.7 asks for the
 /// opposite, so expiry now says which wait gave up. `what` is the register condition in words; a
 /// caller passing something vague is passing up the whole point.
+///
+/// The wait itself is `godspeed::driver::wait` (`docs/driver-library.md`), and the line is still this
+/// driver's: the library never logs, because only the driver knows which wait it was. Moving it there
+/// fixed the one case this got wrong - on an uncalibrated clock `duration_cycles` floors to one tick,
+/// so every wait here gave up after a single look; the library bounds that case by a count of looks.
 fn spin<F: Fn() -> bool>(ctx: &ServiceContext, what: &str, ms: u64, cond: F) -> bool {
-    let budget = ctx.duration_cycles(ms);
-    let t0 = ctx.read_tsc();
-    while !cond() {
-        if ctx.read_tsc().wrapping_sub(t0) >= budget {
+    match wait::until(ctx, Budget::ms(ms), cond) {
+        Ok(_) => true,
+        Err(wait::TimedOut) => {
             ctx.log_fmt(format_args!(
                 "xhci: TIMEOUT after ~{} ms waiting for {} - the controller did not answer",
                 ms, what
             ));
-            return false;
+            false
         }
     }
-    true
 }
 
 // Timing budgets, in milliseconds, converted per machine at the point of use.
