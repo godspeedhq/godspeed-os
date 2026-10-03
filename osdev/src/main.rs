@@ -1601,6 +1601,7 @@ fn cmd_test(suite: &str) {
         "fs-journal"   => run_fs_journal_test(),
         "fs-djournal"  => run_fs_djournal_test(),
         "fs-restart"   => run_fs_restart_test(),
+        "audio"        => run_audio_test(),
         "peer-storm"   => run_peer_storm_test(),
         "adopt-storm"  => run_adopt_storm_test(),
         "counter"      => run_counter_test(),
@@ -2793,6 +2794,25 @@ fn run_peer_storm_test() {
     let persist = "build/tests/persist_peer_storm.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
     crate::shell_test::run_peer_storm(&image_path, persist, 4);
+}
+
+/// `osdev test audio` (`utilities/57_audio.md`, `docs/audio.md`): the `audio` utility, the driver behind it
+/// and the sound, on the bare-metal image with QEMU's HD Audio device and a data disk formatted here, so
+/// `/audio.settings` has somewhere to live from the first boot.
+fn run_audio_test() {
+    println!("
+=== audio: the utility, the driver, and the sound it makes ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_audio.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    format_superblock(persist);
+    crate::shell_test::run_audio(&image_path, persist, 4);
 }
 
 fn run_fs_restart_test() {

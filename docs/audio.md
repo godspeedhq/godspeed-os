@@ -50,7 +50,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A1** | Reset, find the codecs, walk the widget graph, report an output path. Immediate Command registers; no DMA, no interrupt | QEMU - **built** |
 | **A2** | CORB/RIRB, the command rings the spec requires (Immediate Command is optional, and unknown on the T630's FCH). The first DMA - used only on QEMU's codec until A6, for the T630's own reasons | QEMU - **built** |
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
-| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone) and `/audio.settings` built**; outputs, debug and system sounds to come |
+| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built**; outputs, debug and system sounds to come |
 | A5 | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU |
 | A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
@@ -682,6 +682,23 @@ boot 2: audio-driver: settings read from /audio.settings - volume 30, muted
 And with no data disk (`build/audio_settings0_qemu.log`): `fs` answers "storage unavailable", the driver
 says so once at the load and once at the first failed write - not again on the next change - and the
 volume keeps working in memory.
+
+## Step A4, `osdev test audio` (2026-10-03)
+
+The checks every step above ran by hand, as one command: **`osdev test audio`**, 33 checks over two boots
+on one disk formatted host-side. Boot 1 drives every built verb at the prompt and checks each answer
+against `utilities/57_audio.md`; kills the driver over the control channel and checks the kernel stopped
+its DMA, the supervisor restarted it and it read its settings back; then quits QEMU through its monitor,
+so the WAV is whole, and READS it - about 3.2 s of tone, every block at 1000 Hz by zero crossings, a level
+in the range volume 50 gives and another in the range volume 100 gives, and the muted tone silent. Boot 2
+checks the volume came back from `/audio.settings` across a reboot.
+
+**First run: 33 of 33** (`build/tests/audio_test_serial.log`, `build/tests/audio_test.wav`). It also said,
+twice, that QEMU ignored `quit` and was killed instead - so the WAV might have lost its tail. The cause
+was the harness, not QEMU: the monitor connection was dropped the moment `quit` was written, before
+QEMU acted on it. Held open until QEMU exits, the second run quit cleanly both times, with the same 33 and
+the same capture (32 sounding blocks, 9 silent) - so nothing had been lost the first time either, which
+is now known rather than assumed.
 
 ## Found while preparing
 

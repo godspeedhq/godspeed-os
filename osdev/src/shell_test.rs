@@ -9937,3 +9937,224 @@ pub fn run_fs_hostile_case(image_path: &Path, persist_path: &str, what: &str, sm
     }
     (true, "answered every command, no panic, bystander intact".into())
 }
+
+// ---- osdev test audio --------------------------------------------------------------------------------
+
+/// QEMU for the audio test: the boot image, the formatted data disk, the HD Audio device with its sound
+/// to `wav`, the shell on a TCP serial port (QEMU waits for it), the control channel on another, and a
+/// monitor - so the run ends with `quit`, which FLUSHES the WAV. Killing QEMU loses its tail.
+fn boot_audio(image_path: &Path, persist_path: &str, wav: &str, smp: u32)
+    -> (std::process::Child, Arc<Mutex<Vec<u8>>>, TcpStream, u16, u16)
+{
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let (shell_port, ctrl_port, mon_port) = (pick_free_port(), pick_free_port(), pick_free_port());
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive", &format!("format=raw,file={image_str},if=ide"),
+        "-device", "ich9-ahci,id=ahci",
+        "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device", "ide-hd,drive=data,bus=ahci.0",
+        "-smp", &smp.to_string(), "-m", "512M",
+        "-serial", &format!("tcp::{shell_port},server"),
+        "-serial", &format!("tcp::{ctrl_port},server,nowait"),
+        "-monitor", &format!("tcp::{mon_port},server,nowait"),
+        // The same audio device `osdev run` and `osdev shell` attach (`qemu.rs`): `mixer=on`, so the
+        // codec has an amplifier and QEMU applies the volume to the samples the WAV holds.
+        "-audiodev", &format!("wav,id=snd0,path={wav},out.frequency=48000,out.channels=2,out.format=s16"),
+        "-device", "intel-hda", "-device", "hda-output,audiodev=snd0,mixer=on",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("audio-test: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("audio-test: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+    (child, buf, stream, ctrl_port, mon_port)
+}
+
+/// End QEMU through its monitor, so the WAV writer closes its file; kill it only if `quit` is ignored.
+fn quit_qemu(child: &mut std::process::Child, mon_port: u16) {
+    // The connection is held open until QEMU exits: dropped straight after the write, the monitor never
+    // acted on it. And a pause after connecting, before the monitor is reading.
+    let mon = retry_tcp_connect(mon_port, Duration::from_secs(5));
+    if let Some(mut m) = mon.as_ref().and_then(|m| m.try_clone().ok()) {
+        thread::sleep(Duration::from_millis(500));
+        send(&mut m, b"quit\n");
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() { drop(mon); return; }
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(mon);
+    println!("audio-test: QEMU ignored `quit` - killed, so the WAV may be missing its tail");
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// The left channel of a QEMU WAV, as 100 ms blocks of (RMS, frequency by zero crossings). The header's
+/// sizes are not trusted - QEMU writes them only on a clean exit - so the data runs to the end of the file.
+fn wav_blocks(path: &str) -> Vec<(u32, u32)> {
+    let raw = match std::fs::read(path) { Ok(r) => r, Err(_) => return Vec::new() };
+    let start = raw.windows(4).position(|w| w == b"data").map_or(44, |i| i + 8);
+    let data = &raw[start.min(raw.len())..];
+    let left: Vec<i32> = data.chunks_exact(4).map(|f| i16::from_le_bytes([f[0], f[1]]) as i32).collect();
+    left.chunks_exact(4800).map(|b| {
+        let rms = ((b.iter().map(|&s| (s as i64) * (s as i64)).sum::<i64>() / b.len() as i64) as f64).sqrt() as u32;
+        let zc = b.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count() as u32;
+        (rms, zc * 10 / 2) // crossings in 100 ms -> Hz
+    }).collect()
+}
+
+/// `osdev test audio` - the `audio` utility, the driver behind it, and the sound itself.
+///
+/// Two boots on one disk. Boot 1 drives every built verb at the prompt and checks each answer against
+/// `utilities/57_audio.md`; kills the driver over the control channel and checks the supervisor brings it
+/// back with the settings it had written; then quits QEMU cleanly and READS THE WAV: the tones must be
+/// there, at the frequency asked, at a level that follows the volume, and silent when muted. Boot 2 checks
+/// the volume came back from `/audio.settings` across a reboot.
+pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("audio-test: two boots on one disk; the shell on COM1, the control channel on COM2");
+    let _ = std::fs::create_dir_all("build/tests");
+    let wav = "build/tests/audio_test.wav";
+    let _ = std::fs::remove_file(wav);
+    let (mut pass, mut fail) = (0usize, 0usize);
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("audio-test: PASS - {}", $label); pass += 1; }
+        else   { println!("audio-test: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // ---- Boot 1 ----
+    let (mut child, buf, mut w, ctrl_port, mon_port) = boot_audio(image_path, persist_path, wav, smp);
+    let mut cur = 0usize;
+    macro_rules! run { ($c:expr) => {{
+        send(&mut w, $c);
+        collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default()
+    }}; }
+    let booted = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(120)).is_some()
+        && collect_until(&buf, &mut 0usize, b"audio-driver: ready", Duration::from_secs(60)).is_some();
+    check!(booted, "booted to a prompt with audio-driver ready");
+    if !booted {
+        let _ = std::fs::write("build/tests/audio_test_serial.log", &buf.lock().unwrap()[..]);
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+    let log = |buf: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(log(&buf).contains("audio-driver: ready - serving requests; playback refills on the stream's interrupt"),
+        "the driver refills on its interrupt, not by polling");
+    check!(log(&buf).contains("no /audio.settings yet"), "a fresh disk starts at the defaults");
+
+    let r = run!(b"audio status\r");
+    check!(r.contains("audio      on") && r.contains("volume     50") && r.contains("muted      no"),
+        "status: on, volume 50, not muted");
+    let r = run!(b"audio info\r");
+    check!(r.contains("1af4:0012") && r.contains("on the stream's interrupt"), "info: QEMU's codec, interrupt-driven");
+    let r = run!(b"audio tone 1000 1\r");
+    check!(r.contains("played 1000 Hz for 1.0 s"), "tone at volume 50 played");
+    let r = run!(b"audio volume 100\r");
+    check!(r.contains("volume 100 - verified"), "volume 100 read back from the codec");
+    let r = run!(b"audio tone 1000 1\r");
+    check!(r.contains("played 1000 Hz for 1.0 s"), "tone at volume 100 played");
+    let r = run!(b"audio mute\r");
+    check!(r.contains("muted - verified"), "mute read back");
+    let r = run!(b"audio tone 1000 1\r");
+    check!(r.contains("muted - nothing will be heard") && r.contains("played"), "a muted tone says nothing will be heard, and plays");
+    let r = run!(b"audio unmute\r");
+    check!(r.contains("unmuted - volume 100 - verified"), "unmute returns to the volume");
+    let r = run!(b"audio volume 101\r");
+    check!(r.contains("volume is 0 to 100"), "volume 101 refused");
+    let r = run!(b"audio tone 440 | count\r");
+    check!(r.contains("cannot start a pipe"), "an action refuses to start a pipe");
+    let r = run!(b"audio status | match volume\r");
+    check!(r.contains("volume     100"), "status pipes as labelled lines");
+    let r = run!(b"audio off\r");
+    check!(r.contains("audio off - the codec is powered down"), "off");
+    let r = run!(b"audio tone 440 1\r");
+    check!(r.contains("`audio on` first"), "a tone while off is refused");
+    let r = run!(b"audio on\r");
+    check!(r.contains("audio on - volume 100, unmuted") && r.contains("- verified"), "on re-applies the volume");
+    let r = run!(b"audio off hard\r");
+    check!(r.contains("held in reset") && r.contains("- verified"), "off hard holds the controller in reset");
+    let r = run!(b"audio on\r");
+    check!(r.contains("audio on - volume 100") && r.contains("- verified"), "on after off hard brings the codec back");
+    send(&mut w, b"audio tone 1000 3\r");
+    thread::sleep(Duration::from_millis(1200));
+    send(&mut w, b"q");
+    let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(r.contains("stopped after"), "q stops a tone (rule 11)");
+    let r = run!(b"audio volume 30\r");
+    check!(r.contains("volume 30 - verified"), "volume 30");
+    let r = run!(b"read /audio.settings\r");
+    check!(r.contains("volume 30") && r.contains("muted no"), "/audio.settings holds what was set");
+
+    // The driver killed: the kernel quiesces its DMA, the supervisor restarts it, and it reads its
+    // settings back from the file it wrote.
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => {
+            thread::sleep(Duration::from_millis(100));
+            send(&mut ctrl, b"\nKILL audio-driver\n");
+            let back = collect_until(&buf, &mut cur, b"supervisor: audio-driver restarted", Duration::from_secs(30));
+            check!(back.is_some(), "the supervisor restarted audio-driver after a kill");
+            let read = collect_until(&buf, &mut cur, b"settings read from /audio.settings - volume 30", Duration::from_secs(30));
+            check!(read.is_some(), "the restarted driver read its settings back");
+            let _ = collect_until(&buf, &mut cur, b"audio-driver: ready", Duration::from_secs(30));
+            check!(log(&buf).contains("bus-master DISABLED on driver death"), "the kernel stopped the controller's DMA on the death");
+            drop(ctrl);
+        }
+        None => { println!("audio-test: FAIL - no control channel"); fail += 1; }
+    }
+    let r = run!(b"audio status\r");
+    check!(r.contains("volume     30"), "status after the restart says volume 30");
+    let _ = std::fs::write("build/tests/audio_test_serial.log", &buf.lock().unwrap()[..]);
+    quit_qemu(&mut child, mon_port);
+
+    // ---- The sound ----
+    // Played in boot 1, in order: 1 s at volume 50, 1 s at 100, 1 s muted (silence), about 1.2 s at 100
+    // before q. QEMU's WAV grows only while a stream runs, so the gaps between tones are not in it.
+    let blocks = wav_blocks(wav);
+    let sounding: Vec<&(u32, u32)> = blocks.iter().filter(|(rms, _)| *rms > 500).collect();
+    let silent = blocks.iter().filter(|(rms, _)| *rms <= 50).count();
+    println!("audio-test: the capture is {} block(s) of 100 ms: {} sounding, {} silent", blocks.len(), sounding.len(), silent);
+    check!((29..=36).contains(&sounding.len()), "about 3.2 s of tone in the capture");
+    check!(silent >= 9, "the muted tone is silence");
+    let mid: Vec<u32> = sounding.iter().filter(|(rms, _)| (4000..7500).contains(rms)).map(|(_, hz)| *hz).collect();
+    let loud: Vec<u32> = sounding.iter().filter(|(rms, _)| *rms >= 9500).map(|(_, hz)| *hz).collect();
+    check!(mid.len() >= 8, "a tone at the level volume 50 gives (RMS 4000-7500)");
+    check!(loud.len() >= 18, "tones at the level volume 100 gives (RMS 9500 and up)");
+    let near = |hz: &u32| (980..=1020).contains(hz);
+    check!(sounding.iter().filter(|(_, hz)| near(hz)).count() * 10 >= sounding.len() * 9,
+        "the tones are 1000 Hz, by zero crossings");
+
+    // ---- Boot 2: the settings across a reboot ----
+    let (mut child, buf, mut w, _ctrl, mon_port) = boot_audio(image_path, persist_path, "build/tests/audio_test_boot2.wav", smp);
+    let mut cur = 0usize;
+    let booted = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(120)).is_some()
+        && collect_until(&buf, &mut 0usize, b"audio-driver: ready", Duration::from_secs(60)).is_some();
+    check!(booted && log(&buf).contains("settings read from /audio.settings - volume 30, unmuted"),
+        "after a reboot the driver reads volume 30 back");
+    send(&mut w, b"audio status\r");
+    let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(r.contains("volume     30"), "and status says so");
+    let _ = std::fs::write("build/tests/audio_test_boot2_serial.log", &buf.lock().unwrap()[..]);
+    quit_qemu(&mut child, mon_port);
+
+    println!("\naudio-test: {pass} passed, {fail} failed (serial: build/tests/audio_test_serial.log, sound: {wav})");
+    if fail > 0 { std::process::exit(1); }
+}
