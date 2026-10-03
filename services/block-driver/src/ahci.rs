@@ -12,6 +12,8 @@
 
 use core::cell::Cell;
 
+use godspeed::driver::delay;
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
 
 // HBA Generic Host Control registers (offsets from ABAR).
@@ -64,14 +66,11 @@ const ATA_FLUSH_EXT: u8 = 0xEA;
 /// op is reported as failed. Bounded (§26.6); never an infinite retry loop.
 const MAX_IO_ATTEMPTS: u32 = 3;
 
-/// COMRESET DET-hold delay (`port_comreset` step 2), in `read_tsc` cycles. The AHCI spec wants DET
-/// held asserted >= 1 ms; ~4M cycles is ~2 ms at ~2 GHz (the T630), comfortably over the minimum on
-/// real silicon. A TSC delay (the ehci `delay_cycles` idiom) is used, NOT an MMIO-read spin: an
-/// MMIO read costs microseconds on real hardware AND under QEMU TCG, so a fixed read-count over- or
-/// under-shoots wildly; a TSC bound is the portable way to hold for a real interval. Under TCG the
-/// guest TSC races ahead so the wall-clock hold is shorter, which is fine - QEMU's emulated COMRESET
-/// is instant, it needs no real hold. read_tsc is hardware-proven to advance (perf §22).
-const COMRESET_HOLD_CYCLES: u64 = 4_000_000;
+/// COMRESET DET-hold (`port_comreset` step 2). The AHCI spec wants DET held asserted >= 1 ms; this is
+/// twice that. A HOLD, not a wait - nothing reports that the reset has been held long enough - so it is
+/// `gs::driver::delay::hold`. It was `4_000_000` raw counter cycles, which is 2 ms only on the T630's
+/// ~2 GHz counter and a different time on every other board.
+const COMRESET_HOLD: Budget = Budget::ms(2);
 /// C8-1: how long to wait for the SATA PHY to report a live link, and for the task file to go ready.
 ///
 /// A DURATION, not a read count. These were `for _ in 0..2_000_000u32` loops over an MMIO register,
@@ -81,7 +80,24 @@ const COMRESET_HOLD_CYCLES: u64 = 4_000_000;
 /// front of someone. Commandment VIII: wait on truth, bounded by a clock.
 ///
 /// The truth is the register; the clock only bounds how long we will believe it might still arrive.
-const LINK_WAIT_CYCLES: u64 = 400_000_000;
+///
+/// It then became `400_000_000` raw counter cycles - a duration only on the board it was worked out on:
+/// 200 ms on the T630's ~2 GHz counter, longer on a slower one. 300 ms keeps every board at or above
+/// what it had (`gs::driver::wait`).
+const LINK_WAIT: Budget = Budget::ms(300);
+/// How long the command engine has to stop once ST or FRE is cleared (PxCMD.CR / PxCMD.FR). AHCI
+/// 1.3.1 10.1.2 gives the controller 500 ms for each. These were 1,000,000 MMIO reads.
+const ENGINE_STOP_WAIT: Budget = Budget::ms(500);
+/// How long a command may take: the port going idle before it is issued, and its slot clearing after.
+///
+/// **Derived from the caller's deadline, not chosen by feel.** `fs` gives every block request 30 s
+/// (`BLOCK_RPC_SECS`) and `issue_io` makes up to `MAX_IO_ATTEMPTS` (3) with `recover_port` between
+/// them, so one attempt - idle, command, and a recovery that may COMRESET the port - must fit in under
+/// ten seconds, or a failing disk is reported to nobody: `fs` has given up and the answer arrives late.
+/// 1 s idle + 5 s command + about 1.6 s of recovery is about 7.6 s an attempt, 23 s for all three.
+/// They were 2,000,000 and 5,000,000 MMIO reads, which at a microsecond a read could already overrun.
+const CMD_IDLE_WAIT: Budget = Budget::ms(1_000);
+const CMD_DONE_WAIT: Budget = Budget::ms(5_000);
 
 /// Blocks the cache holds. `TXN_CAP` in `fs` is 56, so 64 holds a whole journal transaction and the
 /// model does not spill in the middle of one - a cache that evicts mid-transaction would be testing
@@ -168,12 +184,9 @@ impl<'a> Ahci<'a> {
         self.hba.write32(self.preg(off), v);
     }
 
-    /// DET-hold delay for COMRESET: spin on `read_tsc` until `COMRESET_HOLD_CYCLES` elapse. A real
-    /// timed hold (the ehci `delay_cycles` idiom), portable across real hardware and QEMU TCG -
-    /// unlike a fixed MMIO-read count, which costs seconds at microseconds-per-read. Bounded (§26.6).
+    /// DET-hold delay for COMRESET: `COMRESET_HOLD`, held by `gs::driver::delay`. Bounded (§26.6).
     fn comreset_delay(&self, ctx: &ServiceContext) {
-        let start = ctx.read_tsc();
-        while ctx.read_tsc().wrapping_sub(start) < COMRESET_HOLD_CYCLES {}
+        delay::hold(ctx, COMRESET_HOLD);
     }
 
     /// Hard PORT RESET (COMRESET) - what a cold boot does. A wedged port (a controller left BSY
@@ -195,11 +208,7 @@ impl<'a> Ahci<'a> {
         //    so the device's post-reset initial D2H FIS is captured and PxTFD clears BSY.
         let cmd = self.pread(PX_CMD);
         self.pwrite(PX_CMD, (cmd & !CMD_ST) | CMD_FRE);
-        for _ in 0..1_000_000u32 {
-            if self.pread(PX_CMD) & CMD_CR == 0 {
-                break;
-            }
-        }
+        let _ = wait::until(ctx, ENGINE_STOP_WAIT, || self.pread(PX_CMD) & CMD_CR == 0);
         // 2. Assert COMRESET: PxSCTL.DET = 1, hold >= 1 ms.
         let sctl = self.pread(PX_SCTL);
         self.pwrite(PX_SCTL, (sctl & !0xF) | 0x1);
@@ -208,20 +217,14 @@ impl<'a> Ahci<'a> {
         let sctl = self.pread(PX_SCTL);
         self.pwrite(PX_SCTL, sctl & !0xF);
         // 4. Wait for the PHY to (re)establish communication: PxSSTS.DET == 3.
-        for _ in 0..1_000_000u32 {
-            if self.pread(PX_SSTS) & 0xF == 3 {
-                break;
-            }
-        }
+        let _ = wait::until(ctx, LINK_WAIT, || self.pread(PX_SSTS) & 0xF == 3);
         // 5. Clear latched SATA error + interrupt status (write-1-to-clear).
         self.pwrite(PX_SERR, 0xFFFF_FFFF);
         self.pwrite(PX_IS, 0xFFFF_FFFF);
         // 6. Wait for the device's initial D2H FIS to clear PxTFD.BSY, then restart the engine (ST).
-        for _ in 0..1_000_000u32 {
-            if self.pread(PX_TFD) & TFD_BSY == 0 {
-                break;
-            }
-        }
+        //    Each wait here proceeds after its bound, as before: a port that does not answer is left
+        //    to the command that follows, which reports it.
+        let _ = wait::until(ctx, LINK_WAIT, || self.pread(PX_TFD) & TFD_BSY == 0);
         let cmd = self.pread(PX_CMD);
         self.pwrite(PX_CMD, cmd | CMD_ST);
     }
@@ -231,11 +234,7 @@ impl<'a> Ahci<'a> {
         // Idle: clear ST + FRE, wait for CR + FR to clear.
         let cmd = self.pread(PX_CMD);
         self.pwrite(PX_CMD, cmd & !(CMD_ST | CMD_FRE));
-        for _ in 0..1_000_000u32 {
-            if self.pread(PX_CMD) & (CMD_CR | CMD_FR) == 0 {
-                break;
-            }
-        }
+        let _ = wait::until(ctx, ENGINE_STOP_WAIT, || self.pread(PX_CMD) & (CMD_CR | CMD_FR) == 0);
         // Program the command-list + received-FIS base (physical addresses) BEFORE the reset, so
         // the device's post-COMRESET initial D2H FIS lands in a valid receive area and PxTFD clears
         // BSY (AHCI 10.1.2 port-init order: arm FB/CLB before bringing the engine up).
@@ -255,6 +254,7 @@ impl<'a> Ahci<'a> {
     /// arena's data buffer. Builds the command header, command table FIS, and PRDT.
     fn issue(
         &self,
+        ctx: &ServiceContext,
         ata_cmd: u8,
         lba: u64,
         count: u16,
@@ -262,14 +262,7 @@ impl<'a> Ahci<'a> {
         data_bytes: u32,
     ) -> Result<(), &'static str> {
         // Wait until the port is idle (BSY + DRQ clear).
-        let mut idle = false;
-        for _ in 0..2_000_000u32 {
-            if self.pread(PX_TFD) & (TFD_BSY | TFD_DRQ) == 0 {
-                idle = true;
-                break;
-            }
-        }
-        if !idle {
+        if wait::until(ctx, CMD_IDLE_WAIT, || self.pread(PX_TFD) & (TFD_BSY | TFD_DRQ) == 0).is_err() {
             return Err("port busy before issue");
         }
 
@@ -319,16 +312,14 @@ impl<'a> Ahci<'a> {
 
         // Issue command slot 0 and wait for it to clear.
         self.pwrite(PX_CI, 1);
-        for _ in 0..5_000_000u32 {
-            if self.pread(PX_CI) & 1 == 0 {
-                // Check the task-file error bit.
-                if self.pread(PX_TFD) & 1 != 0 {
-                    return Err("ATA error (TFD.ERR)");
-                }
-                return Ok(());
-            }
+        if wait::until(ctx, CMD_DONE_WAIT, || self.pread(PX_CI) & 1 == 0).is_err() {
+            return Err("command timeout (CI stuck)");
         }
-        Err("command timeout (CI stuck)")
+        // Check the task-file error bit.
+        if self.pread(PX_TFD) & 1 != 0 {
+            return Err("ATA error (TFD.ERR)");
+        }
+        Ok(())
     }
 
     /// Clear the port's error state so a retried command can run: clear PxSERR + PxIS
@@ -341,9 +332,7 @@ impl<'a> Ahci<'a> {
         if cmd & CMD_ST != 0 && cmd & CMD_CR == 0 {
             // Engine halted on the error - stop fully, then restart.
             self.pwrite(PX_CMD, cmd & !CMD_ST);
-            for _ in 0..1_000_000u32 {
-                if self.pread(PX_CMD) & CMD_CR == 0 { break; }
-            }
+            let _ = wait::until(ctx, ENGINE_STOP_WAIT, || self.pread(PX_CMD) & CMD_CR == 0);
             self.pwrite(PX_SERR, 0xFFFF_FFFF);
             let cmd2 = self.pread(PX_CMD);
             self.pwrite(PX_CMD, cmd2 | CMD_ST);
@@ -383,7 +372,7 @@ impl<'a> Ahci<'a> {
         let mut last = "unknown error";
         for attempt in 1..=MAX_IO_ATTEMPTS {
             let r = self.maybe_inject(ata_cmd)
-                .unwrap_or_else(|| self.issue(ata_cmd, lba, count, write, data_bytes));
+                .unwrap_or_else(|| self.issue(ctx, ata_cmd, lba, count, write, data_bytes));
             match r {
                 Ok(()) => {
                     if attempt > 1 {
@@ -408,8 +397,8 @@ impl<'a> Ahci<'a> {
     }
 
     /// IDENTIFY DEVICE → (model string bytes, total sectors).
-    fn identify(&self) -> Result<([u8; 40], u64), &'static str> {
-        self.issue(ATA_IDENTIFY, 0, 0, false, 512)?;
+    fn identify(&self, ctx: &ServiceContext) -> Result<([u8; 40], u64), &'static str> {
+        self.issue(ctx, ATA_IDENTIFY, 0, 0, false, 512)?;
         // Model: words 27..47, each word's two bytes ATA-swapped.
         let mut model = [b' '; 40];
         for w in 0..20 {
@@ -755,26 +744,19 @@ impl<'a> Ahci<'a> {
 fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
     // 1. Fast path + slow-establish: a healthy, already-up link returns on the first read (zero added
     //    latency); a slow one gets a bounded window (read-count poll, the port_comreset DET idiom).
-    let start = ctx.read_tsc();
-    while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
-        if hba.read32(base + PX_SSTS) & 0xF == 3 {
-            return true;
-        }
+    if wait::until(ctx, LINK_WAIT, || hba.read32(base + PX_SSTS) & 0xF == 3).is_ok() {
+        return true;
     }
     // 2. Still not up - force a COMRESET to re-run OOB: assert PxSCTL.DET = 1, hold >= 1 ms, de-assert.
     let sctl = hba.read32(base + PX_SCTL);
     hba.write32(base + PX_SCTL, (sctl & !0xF) | 0x1);
-    let start = ctx.read_tsc();
-    while ctx.read_tsc().wrapping_sub(start) < COMRESET_HOLD_CYCLES {}
+    delay::hold(ctx, COMRESET_HOLD);
     let sctl = hba.read32(base + PX_SCTL);
     hba.write32(base + PX_SCTL, sctl & !0xF);
     // 3. Wait (bounded) for the PHY to (re)establish, then clear the error bits the reset latched.
-    let start = ctx.read_tsc();
-    while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
-        if hba.read32(base + PX_SSTS) & 0xF == 3 {
-            hba.write32(base + PX_SERR, 0xFFFF_FFFF); // W1C - init_port's COMRESET clears again
-            return true;
-        }
+    if wait::until(ctx, LINK_WAIT, || hba.read32(base + PX_SSTS) & 0xF == 3).is_ok() {
+        hba.write32(base + PX_SERR, 0xFFFF_FFFF); // W1C - init_port's COMRESET clears again
+        return true;
     }
     false
 }
@@ -850,10 +832,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         // Wait (bounded) for the task file to go ready, THEN read the signature. A healthy port has
         // BSY already clear so this returns on the first read (zero added latency); an empty port never
         // reaches here (wait_port_ready fails DET first), so no empty-port waste.
-        let start = ctx.read_tsc();
-        while ctx.read_tsc().wrapping_sub(start) < LINK_WAIT_CYCLES {
-            if hba.read32(base + PX_TFD) & (TFD_BSY | TFD_DRQ) == 0 { break; }
-        }
+        let _ = wait::until(ctx, LINK_WAIT, || hba.read32(base + PX_TFD) & (TFD_BSY | TFD_DRQ) == 0);
         let sig = hba.read32(base + PX_SIG);
         ctx.log_fmt(format_args!(
             "block-driver: AHCI port {}: device present (DET=3) sig={:#010x}{}",
@@ -863,7 +842,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             disk_port = Some(p);
             // block-driver uses exactly ONE disk, so stop at the first SATA port. Probing further is
             // pure waste - and on an empty port `wait_port_ready` spends its full slow-establish budget
-            // (2M reads -> COMRESET -> 2M reads) before returning false. That budget exists to catch a
+            // (LINK_WAIT -> COMRESET -> LINK_WAIT) before returning false. That budget exists to catch a
             // *disk* whose PHY is slow to come up (warm reboot / chaos soak); an empty port has no
             // device to wait for. On real hardware an MMIO read is ~ns so the waste is invisible, but
             // under QEMU TCG each read is a VM exit: an HBA that implements 6 ports (PI=0x3f) would burn
@@ -898,7 +877,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
                       tap_seq: Cell::new(0) };
     ahci.init_port(ctx);
 
-    match ahci.identify() {
+    match ahci.identify(ctx) {
         Ok((model, sectors)) => {
             ahci.sectors.set(sectors); // served on OP_CAPACITY so `fs` sizes a flash to the disk
             let model_str = core::str::from_utf8(&model).unwrap_or("?");

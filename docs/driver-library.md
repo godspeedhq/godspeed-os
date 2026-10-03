@@ -295,7 +295,7 @@ shape a long hold should have; it is one driver, and when a second does it, it b
 
 | Driver | Board | Its hold | Note |
 |---|---|---|---|
-| `block-driver` (`ahci.rs`) | x86 | `COMRESET_HOLD_CYCLES`, `LINK_WAIT_CYCLES`, and seven `0..1_000_000` loops | **raw cycle counts and iteration counts** - the census missed the loops |
+| ~~`block-driver` (`ahci.rs`)~~ | x86 | two raw-cycle holds and seven iteration-count loops | done in step 1k |
 | `ehci` | x86 | `delay_cycles` | parks then spins; takes cycles, not a duration |
 
 **Verified:** builds for every port, and on the Pi 4 on 2026-10-03, with the cable in so both paths ran:
@@ -434,6 +434,41 @@ time bound there is right, but choosing it needs that deadline and a measurement
 for a step of its own rather than guessed.
 
 **Verified:** builds for every port, and in QEMU on 2026-10-03 for the e1000: `osdev test shell` 215 passed, 0 failed (the two skips are the EHCI flood, which this QEMU has no controller for); the e1000 came up 6 times, its reset never failed to self-clear, and ARP, ping to the gateway and continuous `ping` passed through it, as did `chaos max-carnage`. And on the T630 (RTL8168) the same day: the RTL8168 reset self-cleared on all 20 starts (boot and `chaos max-carnage all-services`, 50 rounds, 337 kills), no transmit timed out, and `ping 8.8.8.8` answered 4 of 4 before chaos and after it.
+
+## Step 1k: `ahci` on `wait` and `delay` (2026-10-03)
+
+The x86 SATA disk, and the first conversion where the budgets had to be DERIVED rather than kept,
+because most of what it had were not durations at all:
+
+| Wait | Before | Now |
+|---|---|---|
+| command engine stopping (CR, FR) - three sites | 1,000,000 MMIO reads | `until`, `ENGINE_STOP_WAIT` 500 ms (AHCI 1.3.1 10.1.2) |
+| PHY link up after COMRESET, BSY clear after it | 1,000,000 reads each | `until`, `LINK_WAIT` |
+| port idle before a command | 2,000,000 reads | `until`, `CMD_IDLE_WAIT` 1 s |
+| command slot clearing | 5,000,000 reads | `until`, `CMD_DONE_WAIT` 5 s |
+| boot link waits and task-file ready (three) | `400_000_000` raw counter cycles | `until`, `LINK_WAIT` 300 ms |
+| COMRESET DET hold (two) | `4_000_000` raw counter cycles | `delay::hold`, `COMRESET_HOLD` 2 ms |
+
+**The command budgets come from the caller's deadline.** `fs` gives every block request 30 s and
+`issue_io` makes up to three attempts with a port recovery between them, so one attempt has to fit in
+under ten seconds or a failing disk is reported to nobody - `fs` has already given up. 1 s idle, 5 s
+command and about 1.6 s of recovery (an engine stop and a full COMRESET) is about 7.6 s an attempt and
+23 s for three. The counts they replace could not promise that: at a microsecond an MMIO read, three
+attempts of seven million reads is 21 s before any recovery.
+
+**The raw cycle counts were durations only on the T630.** 400,000,000 cycles is 200 ms on its ~2 GHz
+counter and longer on a slower one; `LINK_WAIT` is 300 ms, which keeps every board at or above what it
+had. The COMRESET hold is 2 ms, twice the spec's minimum, as the old count was on the T630.
+
+`issue` and `identify` now take a `ServiceContext`; every caller already held one. Expiry behaves as
+before everywhere: the port-bring-up waits proceed after their bound and leave the command that follows
+to report the port, and the command waits return the same errors they did.
+
+**Not converted here:** `block-driver`'s `xhciblk.rs` (the Pi 4 and VisionFive disk, through `xhci`)
+builds its capacity deadline by hand. It is the same crate on other boards, so it is left for a step
+that is tested on them.
+
+**Verified:** builds for every port, and in QEMU on 2026-10-03 on an `ich9-ahci` disk: `osdev test fs-restart` 11 passed, 0 failed - GSFS flashed, a file written and read, `fs` killed, re-mounted and the file read back. (`osdev test shell` passed too, 215 of 215, but it attaches no SATA disk, so it does not count here.) And on the T630 the same day, on its Samsung SATA SSD: `block-driver` brought the port up and IDENTIFYd the disk on all 24 starts (boot and `chaos max-carnage all-services`, 50 rounds, 347 kills), no command timed out, waited on a busy port, failed or needed a retry, and after chaos `selfcheck` ran 524 with 0 failed, its filesystem check finding 17 files consistent with nothing to repair.
 
 ## What this supersedes
 

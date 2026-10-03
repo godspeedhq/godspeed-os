@@ -118,8 +118,8 @@ arena. Then `fs` timed out seven times at 30 s each and reported `capacity 0 sec
 **`services/block-driver/build.rs` maps `"aarch64" | "riscv64" => Some("xhci")`, and `main.rs` gates
 `#[cfg(not(storage_is_usb))] mod ahci`. `ahci.rs` is not compiled on this port at all.** The kernel
 had dutifully granted a driver an ABAR it would never read. A whole diagnosis was built on top of
-that grant - including a measured, arithmetically correct argument that `LINK_WAIT_CYCLES`
-(400,000,000) is ~200 ms at the T630's 2 GHz and 40 SECONDS at this machine's `timebase 10000000 Hz`,
+that grant - including a measured, arithmetically correct argument that the AHCI link wait, then
+400,000,000 raw counter cycles (a duration since, `LINK_WAIT`), is ~200 ms at the T630's 2 GHz and 40 SECONDS at this machine's `timebase 10000000 Hz`,
 which is true, and is about code that does not exist here. The fix made from it changed nothing,
 because there was nothing to change.
 
