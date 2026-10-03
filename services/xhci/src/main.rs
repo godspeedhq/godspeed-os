@@ -15,6 +15,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
@@ -2450,10 +2451,9 @@ fn enumerate_one(
         // Reset-recovery hold before we address the device (Fix 3): PED asserting does not mean the
         // device is ready for the SET_ADDRESS of Address Device. A high-speed root-port device (the
         // Wyse's port 6) returns a Transaction Error (completion=4) without this; the behind-a-hub path
-        // already holds here. Bounded, TSC-paced.
-        let t0 = ctx.read_tsc();
-        let hold = ctx.duration_cycles(RESET_RECOVERY_MS);
-        while ctx.read_tsc().wrapping_sub(t0) < hold {}
+        // already holds here. A hold, not a wait: nothing reports the recovery is over
+        // (`gs::driver::delay`, which on an uncalibrated clock sleeps rather than holding for nothing).
+        delay::hold(ctx, Budget::ms(RESET_RECOVERY_MS));
     }
     let psc = mmio.read32(portsc_off);
     let speed = (psc >> 10) & 0xF;
@@ -3388,10 +3388,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // the platform; touching a register the HC forbids mid-reset was ours to fix. So: settle briefly
         // (let CNR assert), wait for CNR to clear reading ONLY USBSTS, THEN read USBCMD to confirm HCRST
         // cleared - USBCMD is never touched while the controller is not ready.
-        let t0 = ctx.read_tsc();
         // A REAL duration. This was `< 2_000_000` raw cycles commented "~1-2 ms" - true only on the
         // machine it was measured on, and the sixth instance of that class found on this port.
-        while ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(2) {}
+        delay::hold(&ctx, Budget::ms(2));
         spin(&ctx, "USBSTS.CNR to clear after HCRST", 500, || {
             mmio.read32(op + OP_USBSTS) & STS_CNR == 0
         });

@@ -39,6 +39,7 @@
 //! doctrine in `kernel/src/arch/CLAUDE.md`: the C driver says what the silicon wants, and we implement
 //! that want as a capability service.
 
+use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
 
@@ -369,6 +370,9 @@ const BATCH_MSG_MAX: usize = 3072;
 const MDIO_WAIT: Budget = Budget::ms(100);
 /// How long a DMA engine gets to report itself started.
 const DMA_START_WAIT: Budget = Budget::ms(100);
+/// The gap Linux leaves after the MAC's reset writes for the bit to land. No register says when it has,
+/// so it is a hold (`gs::driver::delay`), not a wait.
+const REG_SETTLE: Budget = Budget::us(10);
 // On a machine with no timer calibration a deadline cannot be computed, and the bound is
 // `godspeed::driver::wait::UNCALIBRATED_POLLS` looks - the same 200,000 this file used to name itself.
 
@@ -410,26 +414,6 @@ impl<'a> Genet<'a> {
 
     fn wr(&self, off: usize, v: u32) {
         self.m.write32(off, v);
-    }
-
-    /// Counter ticks in `us` microseconds, floored at 1 so a bound is never zero.
-    fn cycles_for_us(&self, us: u64) -> u64 {
-        (self.per_10ms.saturating_mul(us) / 10_000).max(1)
-    }
-
-    /// Busy-wait `us` microseconds of REAL time. Terminates by construction: the counter is monotonic.
-    fn delay_us(&self, us: u64) {
-        if self.per_10ms == 0 {
-            // No calibration to convert with. Yielding once is an honest "give the hardware a moment"
-            // and, unlike a spin of guessed length, cannot silently become either nothing or minutes.
-            self.ctx.yield_cpu();
-            return;
-        }
-        let budget = self.cycles_for_us(us);
-        let start = self.ctx.read_tsc();
-        while self.ctx.read_tsc().wrapping_sub(start) < budget {
-            core::hint::spin_loop();
-        }
     }
 
     /// Spin until `read32(off) & mask` is clear, or the budget expires (`godspeed::driver::wait`).
@@ -581,7 +565,7 @@ impl<'a> Genet<'a> {
     /// [`SYS_RBUF_FLUSH_CTRL`].
     fn release_sw_reset(&self) {
         self.wr(SYS_RBUF_FLUSH_CTRL, 0);
-        self.delay_us(10);
+        delay::hold(self.ctx, REG_SETTLE);
     }
 
     /// Reset the MAC and put it in a known, quiet state.
@@ -593,9 +577,9 @@ impl<'a> Genet<'a> {
         self.release_sw_reset();
 
         self.wr(UMAC_CMD, CMD_SW_RESET);
-        self.delay_us(10);
+        delay::hold(self.ctx, REG_SETTLE);
         self.wr(UMAC_CMD, 0);
-        self.delay_us(10);
+        delay::hold(self.ctx, REG_SETTLE);
 
         // Prove the release worked rather than trusting it. A register that cannot hold a bit is the
         // exact failure this function exists to clear, and it is invisible until frames fail to arrive

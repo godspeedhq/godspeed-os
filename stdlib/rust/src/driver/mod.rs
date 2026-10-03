@@ -33,4 +33,5 @@
 //! The kernel. Nothing here is a new kernel responsibility or a new syscall; these are the mechanisms
 //! the kernel already offers, put in the one shape a driver should reach for.
 
+pub mod delay;
 pub mod wait;

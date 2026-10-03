@@ -143,7 +143,7 @@ What did NOT move is worth saying, because it is the next candidate rather than 
 `delay_us` waits a fixed time for nothing in particular ("give the PHY a moment"), which is a different
 mechanism from waiting for a condition, so it stays in the driver until it is moved as its own step.
 (This said it was the only hand-rolled delay among the drivers. It is not: step 1c found two in `xhci`,
-so a fixed pause IS repeated, and is the next candidate - see below.)
+so a fixed pause IS repeated, and is the next candidate - see below. Step 1f moved it.)
 
 **Verified:** builds for every port (`nic-driver` is one crate on all four), and on the Pi 4 the same
 day: no MDIO or DMA-start wait expired, cable ping 0% loss, the cable and the radio stepping in and out
@@ -262,6 +262,47 @@ of a minute to the hub segment, against a few hundred milliseconds in earlier se
 pass timer is not restarted across a re-enumeration, so the whole of one is charged to the hub segment
 of the pass after it. The 5.9 s is the 6 s the devices were out. It is an accounting fact about the
 heartbeat that predates this step, not time spent in a probe.
+
+## Step 1f: `gs::driver::delay` - a hold, waiting for nothing (2026-10-03)
+
+The second mechanism, and the first that is not `wait`. Some hardware needs a gap no register reports
+the end of: let a reset bit land before the next write, give a port the recovery time a specification
+demands before addressing it. There is no condition to look at, so it is not a wait with a budget; it
+is a duration, and `delay::hold(ctx, Budget)` holds for it.
+
+It was repeated, three times in two drivers on the Pi 4, and the copies disagreed about the
+uncalibrated clock in the direction that matters:
+
+| Hold | Length | Uncalibrated, before |
+|---|---|---|
+| `genet`, after each MAC reset write (three) | 10 us | yielded once - nothing at all when nothing else was runnable |
+| `xhci`, settle after `HCRST` | 2 ms | `duration_cycles` floored to one tick: no hold |
+| `xhci`, reset recovery after a root-port reset | `RESET_RECOVERY_MS` | the same: no hold |
+
+A hold is a MINIMUM - the device needs at least this long - so the safe error is too long, never too
+short, and both copies erred short. That settles the question step 1c left open, "a pause has no honest
+bound on an uncalibrated clock": it does not need one, because it is not bounded above, it is bounded
+BELOW. `hold` spins on a calibrated clock, measured by the counter as before; on an uncalibrated one it
+sleeps as many scheduler quanta as the hold needs at the constitution's nominal 10 ms (CLAUDE.md 9.1),
+at least one, because the quantum is the one duration the kernel can still measure there.
+
+It does not sleep on a calibrated clock even for `xhci`'s 55 ms recovery hold, deliberately, in this
+step: the kernel's sleep floors at a quantum, so a sleeping hold changes the timing the hardware was
+verified with. `ehci` already parks for the bulk of a long hold and spins the remainder, which is the
+shape a long hold should have; it is one driver, and when a second does it, it belongs here.
+
+**Not converted, and why:**
+
+| Driver | Board | Its hold | Note |
+|---|---|---|---|
+| `block-driver` (`ahci.rs`) | x86 | `COMRESET_HOLD_CYCLES`, `LINK_WAIT_CYCLES` | **raw cycle counts**, the same class `xhci`'s settle was before it was a duration |
+| `ehci` | x86 | `delay_cycles` | parks then spins; takes cycles, not a duration |
+
+**Verified:** builds for every port, and on the Pi 4 on 2026-10-03, with the cable in so both paths ran:
+`genet` configured its MAC 22 times (boot and 21 `nic-driver` restarts under `chaos max-carnage`, 50
+rounds, 343 kills) with no reset or MDIO failure, and the cable took a lease and answered ping before and
+after; `xhci` reset its controller 36 times and found the disk 25 times, with no `TIMEOUT` and no
+Transaction Error addressing a device, and the keyboard and stick came back from hot-plug after chaos.
 
 ## What this supersedes
 
