@@ -155,7 +155,7 @@ for each other, and `chaos max-carnage all-services` (50 rounds) bringing `genet
 | Driver | Board | Its wait | Note |
 |---|---|---|---|
 | `block-driver` (`sdhci.rs`) | none | ten count-bounded loops | **not a candidate: the file is not compiled.** `block-driver`'s `main.rs` deliberately has no `mod sdhci`, because on the Pi 2 the SD card is the boot medium and using it as storage destroyed two boot cards. Code that is never built cannot be converted and verified, so it stays as it is; this row said otherwise until 2026-10-03 |
-| ~~`dwc2`~~ | Pi 2 | `wait_until` and nine more | done in step 1g, except `chan::halt` |
+| ~~`dwc2`~~ | Pi 2 | `wait_until` and ten more | done in steps 1g and 1h |
 | `nic-driver` `dwmac` | VisionFive | `wait_clear`, `mdio_idle` | 200,000 and 20,000 looks when uncalibrated |
 | ~~`sdk/wifi` (`sdio.rs`)~~ | Pi 4 | function-ready | done in step 1d |
 
@@ -335,7 +335,7 @@ one look.
 
 - **`chan::halt`** spins on a COUNT (`t > 100_000`), the defect itself. It takes no `ServiceContext`,
   because it runs from `program` / `program_ping` before every transfer, so converting it means threading
-  `ctx` through the channel API. That is a change of its own and is left for one.
+  `ctx` through the channel API. That is a change of its own and is left for one. (Step 1h made it.)
 - **The complete-split NYET retry** counts 500 attempts with a 1 ms sleep between. It is a retry budget
   on the keyboard's control path, and the count is of sleeps, not of spins.
 - **Plain sleeps, rate timers and the heartbeat** (`core.rs` settles, `hub.rs` and `enumerate.rs`
@@ -348,6 +348,32 @@ not finish its reset, no channel that never halted, no split given up. The keybo
 smsc95xx all came back: `dir /` and `ping 8.8.8.8` (0% loss) after chaos, and again after the keyboard
 and the stick were unplugged and replugged. The three "dwc2 answered op 0x01 while we asked 0x12" lines
 `nic-driver` prints when the stick is pulled are older than this step (the 2026-10-02 Pi 2 log has them).
+
+## Step 1h: `dwc2`'s `chan::halt` on `wait` (2026-10-03)
+
+The one `dwc2` wait step 1g left: `halt` spun until the core retired a channel, bounded by 100,000
+register reads - a count, the defect itself. It runs from `program` / `program_ping` before every
+transfer, which is why it had no `ServiceContext`; those two, `halt` and `net::arm_in` now take one, and
+every caller already held it.
+
+**The budget is chosen not to be shorter than the count.** How long 100,000 peripheral reads take on the
+Pi 2 was never measured, and a budget that ran out before a halt that used to land would abandon the
+channel - the exact failure `halt` exists to prevent (a request left in the core's few-entry queue,
+which once stopped transmit forever). So `HALT_WAIT` is 50 ms: the count at about 0.5 us a read, an
+upper estimate. The change can only wait longer, and only when a halt is not landing anyway. A shorter
+figure needs a measurement.
+
+Expiry stays quiet, as it was: this runs before every transfer, and the transfer that follows reports
+the channel's state itself. Making it loud is a separate decision about a hot path.
+
+`wait::until` looks at the condition before it starts the deadline, so a channel already idle (the usual
+case) or one that retires at the first look costs no clock read at all.
+
+**Verified:** builds for every port, and on the Pi 2 on 2026-10-03: `dwc2` came up 22 times (boot and
+`chaos max-carnage all-services`, 50 rounds, 285 kills) with no channel that never halted, no split
+given up and no hub reset left unfinished; `ping 8.8.8.8` answered with 0% loss before chaos, after it
+(14 of 14) and after the keyboard and the stick were unplugged and replugged both before and after
+chaos, and `dir /` listed the stick each time.
 
 ## What this supersedes
 

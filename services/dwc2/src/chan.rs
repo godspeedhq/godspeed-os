@@ -100,7 +100,7 @@ pub const HCTSIZ_DOPNG: u32 = 1 << 31;
 /// high-speed OUT endpoint and must be false for everything else.
 #[allow(clippy::too_many_arguments)]
 pub fn program_ping(
-    mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
     len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, ping: bool,
 ) {
     let mps = t.mps as u32;
@@ -109,7 +109,7 @@ pub fn program_ping(
     // Channel-reuse hygiene: if a prior transaction left the channel ENABLED - a timeout that never
     // truly halted, or a split phase re-arm - disable it cleanly before reprogramming. Never reuse a
     // half-live channel.
-    halt(mmio, ch);
+    halt(ctx, mmio, ch);
 
     mmio.write32(hcint_at(ch), 0xFFFF_FFFF);
     let dopng = if ping { HCTSIZ_DOPNG } else { 0 };
@@ -145,10 +145,10 @@ pub fn program_ping(
 /// Program a channel with no PING. The shape every caller but a high-speed bulk OUT wants.
 #[allow(clippy::too_many_arguments)]
 pub fn program(
-    mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
     len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32,
 ) {
-    program_ping(mmio, t, ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false);
+    program_ping(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false);
 }
 
 /// The data PID the controller has advanced to, read back from HCTSIZ [30:29].
@@ -179,7 +179,12 @@ pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
 ///
 /// Bounded, and it waits for the halt to actually land: an abort that returns before the core has
 /// finished is the same abandoned-channel bug in a smaller window.
-pub fn halt(mmio: &Mmio, ch: u32) {
+///
+/// Bounded by the CLOCK (`gs::driver::wait`, `docs/driver-library.md`). It was 100,000 reads, a count
+/// - however long that many peripheral reads take, which nobody measured on this board.
+/// [`HALT_WAIT`] is chosen so it cannot be SHORTER than the count was: a budget that ran out before a
+/// halt that used to land would abandon the channel, the failure this function exists to prevent.
+pub fn halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32) {
     let hcchar = mmio.read32(hcchar_at(ch));
     if hcchar & HCCHAR_CHENA == 0 {
         return;                       // already idle - nothing queued to retire
@@ -187,15 +192,16 @@ pub fn halt(mmio: &Mmio, ch: u32) {
     mmio.write32(hcchar_at(ch), hcchar | HCCHAR_CHENA | HCCHAR_CHDIS);
     // Spin for the core to retire it. This is a register handshake with the controller, not a wait on
     // a device, so a bounded spin is the right shape - and if it ever expires the channel is left
-    // exactly as an unbounded wait would leave it, minus the hang.
-    let mut t = 0u32;
-    while mmio.read32(hcchar_at(ch)) & HCCHAR_CHENA != 0 {
-        t += 1;
-        if t > 100_000 {
-            break;
-        }
-    }
+    // exactly as an unbounded wait would leave it, minus the hang. Expiry stays quiet as it was: this
+    // runs before every transfer, and the transfer that follows reports the channel's state itself.
+    let _ = wait::until(ctx, HALT_WAIT, || mmio.read32(hcchar_at(ch)) & HCCHAR_CHENA == 0);
 }
+
+/// How long [`halt`] waits for the core to retire a channel. 100,000 reads at the slowest a Pi 2
+/// peripheral read is likely to be (about 0.5 us) - an upper estimate of the count it replaced, so the
+/// change can only wait longer, and only when a halt is not landing anyway. A shorter figure needs a
+/// measurement of how long a halt really takes.
+const HALT_WAIT: Budget = Budget::ms(50);
 
 pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(ms));
@@ -209,7 +215,7 @@ pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<
             // failure this driver's channel-per-stream split exists to prevent. `halt` is what makes
             // that true: it retires the core's outstanding request, which the old open-coded disable
             // did not.
-            halt(mmio, ch);
+            halt(ctx, mmio, ch);
             return None;
         }
     }
@@ -221,7 +227,7 @@ fn stage(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, what: &str,
 ) -> bool {
-    program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, 0);
+    program(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, 0);
     match wait_halt(ctx, mmio, ch, 100) {
         None => {
             // SAY WHAT THE CORE LOOKED LIKE, not just that we gave up.
@@ -359,7 +365,7 @@ fn stage_split_one(
         // STATE 1 - the Start-Split (CompleteSplit = 0). The hub's transaction translator legitimately
         // NAKs or transaction-errors while busy, and USB 2.0 11.17.5 says the host re-issues the whole
         // start-split rather than treating it as a failure.
-        program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt);
+        program(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt);
         let ss = match wait_halt(ctx, mmio, ch, 50) {
             Some(v) => v,
             None => continue,
@@ -380,7 +386,7 @@ fn stage_split_one(
         // STATE 2 - poll the Complete-Split for the low/full-speed device's answer.
         let mut nyet = 0u32;
         loop {
-            program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt | (1 << 16));
+            program(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt | (1 << 16));
             let cs = match wait_halt(ctx, mmio, ch, 50) {
                 Some(v) => v,
                 None => break,
@@ -541,7 +547,7 @@ pub fn interrupt_in(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32,
 ) -> u32 {
-    program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, 0); // ep_type 3 = interrupt, no HCSPLT
+    program(ctx, mmio, t, ch, true, pid, len, buf_phys, ep, 3, 0); // ep_type 3 = interrupt, no HCSPLT
     wait_halt(ctx, mmio, ch, 5).unwrap_or(0)
 }
 
@@ -593,7 +599,7 @@ pub fn periodic_split_in(
         }
         return 0;   // could not reach the boundary - skip this poll rather than send a malformed split
     }
-    program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
+    program(ctx, mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
     let ss = match wait_halt(ctx, mmio, ch, 5) {
         Some(v) => v,
         None => return 0,
@@ -653,7 +659,7 @@ pub fn periodic_split_in(
             return last;
         }
         let cs_uf = uframe_now(mmio) & 7;
-        program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
+        program(ctx, mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
         let cs = match wait_halt(ctx, mmio, ch, 5) {
             Some(v) => v,
             None => {

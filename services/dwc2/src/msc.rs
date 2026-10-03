@@ -206,7 +206,7 @@ fn bulk_xfer(
     let mut deadline = wait::Deadline::paced(ctx, Budget::ms(budget_ms), Budget::ms(1));
     let mut xact_errs = 0u32;
     loop {
-        chan::program(mmio, &bt, chan::CH_BULK, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
+        chan::program(ctx, mmio, &bt, chan::CH_BULK, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
         match chan::wait_halt(ctx, mmio, chan::CH_BULK, 100) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
                 // HCTSIZ counts DOWN the bytes still outstanding, so what moved is the difference.
