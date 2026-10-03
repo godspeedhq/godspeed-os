@@ -41,6 +41,7 @@
 //!   buffer on any keypress, regardless of which driver code thinks it holds the device. The disk's
 //!   CBW/CSW page here is the disk's alone - see `DISK_BASE`.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::{next_event, EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
@@ -253,7 +254,11 @@ fn await_on_slot(
     ev_cycle: &mut u32,
     eaten: &mut EvMail,
 ) -> Option<u32> {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(XFER_TIMEOUT_MS));
+    // `gs::driver::wait`'s deadline. It does not sleep: a completion is looked for every poll window.
+    // On an uncalibrated clock the hand-built one was a single tick, so a transfer got one window of
+    // 4096 reads and was declared dead; the library's look count applies instead, and a look here is
+    // a whole window - a long bound, but one that ends.
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(XFER_TIMEOUT_MS));
     let mut unrelated = 0u32;
     // Our answer may already be in hand: another consumer of the shared event ring can have
     // dequeued it and filed it for us. Check the mailbox before touching the ring, or we would wait
@@ -287,7 +292,7 @@ fn await_on_slot(
             Some(_) => {} // port change or command completion; not ours
             None => {}    // this poll window saw nothing; the clock below decides whether to stop
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             ctx.log_fmt(format_args!(
                 "xhci: disk transfer got no completion in {} s - the device stopped answering",
                 XFER_TIMEOUT_MS / 1000

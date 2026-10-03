@@ -181,7 +181,9 @@ waited for the reset. The library bounds that case by `UNCALIBRATED_POLLS` looks
 - **Three deadline loops that SLEEP between polls** (the hub port probe, mass-storage spin-up, a disk
   transfer). `Deadline` would measure them, but its uncalibrated fallback counts LOOKS, and 200,000
   looks with a sleep between each is not the bound it is for a loop that spins. They stay hand-written
-  until that is resolved rather than converted into something that is quietly wrong.
+  until that is resolved rather than converted into something that is quietly wrong. (This census was
+  wrong, corrected in step 1e: of the three, only the hub probe sleeps, and two that DO sleep were
+  missed. `xhci` built five deadlines by hand.)
 
 **Verified:** builds for every port (`xhci` is one crate on three), and on the Pi 4 on 2026-10-03: no
 `spin` wait expired anywhere in the session; the controller reset cleanly all 28 times it was asked
@@ -213,7 +215,7 @@ kernel's sleep is itself only approximate, so that is a count of pauses, not a d
 `sdk/wifi` now depends on the stdlib, which is the layering above: a radio is a driver and reaches for
 `gs::driver` like any other. Nothing in the stdlib depends on `sdk/wifi`, so there is no cycle.
 
-`xhci`'s three sleeping loops can now move, and are the next step rather than part of this one.
+`xhci`'s sleeping loops can now move, and are the next step rather than part of this one.
 
 **Verified:** builds for every port, and on the Pi 4 on 2026-10-03: 49 function-ready waits (boot,
 five `wifi radio powercycle`s, and the chaos restarts), every one READY at the first read in 1-2 ms -
@@ -221,6 +223,45 @@ the same figures as the sessions before it - and the card ready at its first CMD
 new pace was never needed. No wait expired. `chaos max-carnage all-services` (50 rounds, 364 kills)
 recovered the radio, which rejoined and took its lease; a power cycle after it rejoined and `ping
 8.8.8.8` answered 5 of 5.
+
+## Step 1e: `xhci`'s hand-built deadlines on `wait` (2026-10-03)
+
+Looking at them to convert them corrected step 1c's census. `xhci` built FIVE deadlines by hand, each
+from `read_tsc` and `duration_cycles`, and three of them sleep:
+
+| Loop | Budget | Sleeps | Now |
+|---|---|---|---|
+| hub port-status probe | `PROBE_ANSWER_MS` | 1 ms | `Deadline::paced` |
+| root ports settling after a reset | `ROOT_PORT_SETTLE_MS` | 1 ms | `until_paced` |
+| back-port re-scan while no keyboard is bound | `HUB_RESCAN_MS` | `IDLE_WAIT_MS` | `Deadline::paced` |
+| mass storage spinning up, across `TEST UNIT READY` attempts | 20 s | no | `Deadline::start` |
+| a disk transfer's completion (`msc.rs`) | `XFER_TIMEOUT_MS` | no | `Deadline::start` |
+
+On a calibrated clock nothing changes: the budgets and the paces are the ones the loops already had.
+On an uncalibrated one, each had the defect step 1c fixed in `spin` - `duration_cycles` floors to one
+tick - and in two it was worse than giving up early: the spin-up deadline had passed before its first
+check, so a stick was dropped without being asked once, and a disk transfer got one poll window before
+it was declared dead.
+
+One bound is long and is recorded rather than hidden: a look in the transfer wait is a whole poll window
+of 4096 event-ring reads, so on an uncalibrated clock its `UNCALIBRATED_POLLS` looks are far more than
+30 s. It ends, which the one-window version also did, but it ended wrongly.
+
+`xhci` now has no hand-built deadline. What is left by hand is the two fixed busy-pauses, which wait for
+nothing and are the next mechanism.
+
+**Verified:** builds for every port, and on the Pi 4 on 2026-10-03: none of the five expired - no
+spin-up give-up, no transfer without a completion, no `TIMEOUT` line - across boot, the keyboard and the
+stick unplugged and replugged before and after chaos, the controller resetting 42 times, the disk
+found again 24 times, and `chaos max-carnage all-services` (50 rounds, 348 kills). Hub probes answered
+401 of 404, as before.
+
+One number looked like a regression and is not: the first `xhci: alive` line after chaos charged 5.9 s
+of a minute to the hub segment, against a few hundred milliseconds in earlier sessions. That minute held
+5 re-enumerations (the stick and keyboard out for about 6 s, re-scanned every `HUB_RESCAN_MS`), and the
+pass timer is not restarted across a re-enumeration, so the whole of one is charged to the hub segment
+of the pass after it. The 5.9 s is the 6 s the devices were out. It is an accounting fact about the
+heartbeat that predates this step, not time spent in a probe.
 
 ## What this supersedes
 

@@ -1124,11 +1124,16 @@ fn hub_port_status(
         // 5 ms is generous for a hub that answers in about one, and it is the same 5 ms on a fast
         // board and a slow one. It stays SHORT deliberately: this runs per port per pass, and a long
         // wait on a hub that will never answer is what made typing lag while the stick was out.
-        let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(PROBE_ANSWER_MS));
+        //
+        // The deadline is `gs::driver::wait`'s, PACED: it sleeps the millisecond itself (`pause`), so
+        // on an uncalibrated clock the bound is the ten looks that fit the budget. Built by hand from
+        // `duration_cycles` it floored to one tick there, and the probe gave up after one look.
+        let mut deadline =
+            wait::Deadline::paced(ctx, Budget::ms(PROBE_ANSWER_MS), Budget::ms(1));
         let mut ev;
         loop {
             ev = next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, 4_096);
-            if ev.is_some() || ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+            if ev.is_some() || deadline.expired() {
                 break;
             }
             // SLEEP between polls - not yield, and not spin.
@@ -1160,7 +1165,7 @@ fn hub_port_status(
             // and still returns the same answers (Commandment VIII) - while letting the core run
             // something else, or idle. The same fix this driver already received once, on the Wyse,
             // where a busy-spin held a core at 100%.
-            ctx.sleep(ctx.duration_cycles(1));
+            deadline.pause();
         }
         match ev {
             // SLOT AND TRB, not slot alone. A hub's four downstream ports are probed one after
@@ -2178,9 +2183,13 @@ fn bind_msc(
     // up to EIGHT MINUTES of a driver that answers nothing - and this driver owns the keyboard. A
     // per-attempt bound multiplied by a retry count is a total, and the total is what the user waits.
     // 20 s covers a stick that is genuinely still spinning up; past that it is not coming.
-    let spinup_deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(20_000));
+    //
+    // Checked between attempts, so it does not sleep. On an uncalibrated clock the hand-built deadline
+    // was one tick and had passed before the first check, so a stick was given up on without being
+    // asked once; `gs::driver::wait` bounds that case by its look count, and the 16 attempts bind first.
+    let mut spinup_deadline = wait::Deadline::start(ctx, Budget::ms(20_000));
     for _ in 0..16 {
-        if ctx.read_tsc().wrapping_sub(spinup_deadline) < (1u64 << 63) {
+        if spinup_deadline.expired() {
             ctx.log("xhci: mass storage still not ready after 20s - giving up on this bind");
             break;
         }
@@ -3492,12 +3501,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0
                 })
             };
-            let t0 = ctx.read_tsc();
-            while !any_connected()
-                && ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(ROOT_PORT_SETTLE_MS)
-            {
-                ctx.sleep(ctx.duration_cycles(1));
-            }
+            // Paced a millisecond apart. A port still empty at the end is the census's to report, so
+            // the expiry is not an error here and is deliberately discarded.
+            let _ = wait::until_paced(&ctx, Budget::ms(ROOT_PORT_SETTLE_MS), Budget::ms(1), any_connected);
         }
 
         // --- Port census (diagnostic) ---
@@ -3744,7 +3750,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         base_ports |= 1 << p;
                     }
                 }
-                let t0 = ctx.read_tsc();
+                // Paced by `gs::driver::wait`, which sleeps `IDLE_WAIT_MS` between looks itself, so an
+                // uncalibrated clock still re-walks after the looks that fit HUB_RESCAN_MS.
+                let mut rescan =
+                    wait::Deadline::paced(&ctx, Budget::ms(HUB_RESCAN_MS), Budget::ms(IDLE_WAIT_MS));
                 loop {
                     {
                         // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
@@ -3773,10 +3782,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if new_root {
                         break;
                     } // a front/root-port device appeared - re-walk now
-                    if ctx.read_tsc().wrapping_sub(t0) >= ctx.duration_cycles(HUB_RESCAN_MS) {
+                    if rescan.expired() {
                         break;
                     } // periodic re-walk
-                    ctx.sleep(ctx.duration_cycles(IDLE_WAIT_MS));
+                    rescan.pause();
                 }
                 announce = true; // whatever we bind on the re-walk is a real plug event
                 continue 'reenum;
