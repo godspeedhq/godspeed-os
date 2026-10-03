@@ -295,7 +295,7 @@ shape a long hold should have; it is one driver, and when a second does it, it b
 
 | Driver | Board | Its hold | Note |
 |---|---|---|---|
-| `block-driver` (`ahci.rs`) | x86 | `COMRESET_HOLD_CYCLES`, `LINK_WAIT_CYCLES` | **raw cycle counts**, the same class `xhci`'s settle was before it was a duration |
+| `block-driver` (`ahci.rs`) | x86 | `COMRESET_HOLD_CYCLES`, `LINK_WAIT_CYCLES`, and seven `0..1_000_000` loops | **raw cycle counts and iteration counts** - the census missed the loops |
 | `ehci` | x86 | `delay_cycles` | parks then spins; takes cycles, not a duration |
 
 **Verified:** builds for every port, and on the Pi 4 on 2026-10-03, with the cable in so both paths ran:
@@ -404,6 +404,36 @@ every time, with no MDIO wait that did not go idle; the 8 starts that lived long
 reset all cleared it in 1 us; no transmit failed, and `ping 8.8.8.8` answered with 0% loss before chaos
 and after it. The other 20 starts were killed while waiting up to 5 s for the PHY to renegotiate after
 its own reset, which comes before the DMA reset by design (`wait_for_link`), not a wait that failed.
+
+## Step 1j: the x86 `nic-driver` (RTL8168 and e1000) on `wait` and `delay` (2026-10-03)
+
+The first x86 driver, and the first of three there, done one at a time (`ahci` and `ehci` follow). Five
+of its six waits:
+
+| Wait | Before | Now |
+|---|---|---|
+| RTL8168 reset self-clearing | 300,000 yields - a count | `until`, `RESET_WAIT` |
+| e1000 reset self-clearing | 1,000,000 yields - a count, and its expiry silent | `until`, `RESET_WAIT`, expiry logged |
+| RTL8168 quiesce before the reset | yields until `read_tsc() < end` | `delay::hold` |
+| RTL8168 and e1000 transmit confirmed | yields until `read_tsc() < end` | `await_tx`: `Deadline::start`, yielding between looks |
+
+**The reset budget is Linux's, with headroom.** A count of yields is no time at all - on the T630 50,000
+of them took over two seconds, so the RTL bound was minutes - and `r8169` polls the same bit 100 times
+100 us apart. `RESET_WAIT` is 100 ms, ten times that. The three timed loops compared the counter with a
+plain `<`, which a counter wrapping mid-wait ends at once; the library compares a wrapping difference.
+
+`await_tx` keeps the yield between looks, because a send that has not landed at the first look is
+usually microseconds away and the core is better given back. On an uncalibrated machine its bound is
+the library's look count, and a look a yield apart is not a time either; recorded, as the sleeping
+loops were before the pace existed.
+
+**Not converted: the RX poll** (`RX_POLL_MAX`, 8,000 yields, in two places). It does not wait on the
+hardware for a condition it will reach - it waits for TRAFFIC, which may never come, and the figure was
+tuned on the T630 to stay under `net-stack`'s request deadline (50,000 yields took longer than it). A
+time bound there is right, but choosing it needs that deadline and a measurement together, so it is left
+for a step of its own rather than guessed.
+
+**Verified:** builds for every port, and in QEMU on 2026-10-03 for the e1000: `osdev test shell` 215 passed, 0 failed (the two skips are the EHCI flood, which this QEMU has no controller for); the e1000 came up 6 times, its reset never failed to self-clear, and ARP, ping to the gateway and continuous `ping` passed through it, as did `chaos max-carnage`. And on the T630 (RTL8168) the same day: the RTL8168 reset self-cleared on all 20 starts (boot and `chaos max-carnage all-services`, 50 rounds, 337 kills), no transmit timed out, and `ping 8.8.8.8` answered 4 of 4 before chaos and after it.
 
 ## What this supersedes
 

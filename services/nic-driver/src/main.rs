@@ -29,6 +29,8 @@
 #![no_std]
 #![no_main]
 
+use godspeed::driver::delay;
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
@@ -118,7 +120,12 @@ const TALLY_OFF:     usize = 0x7000;
 
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
-const RESET_POLL_MAX: u32 = 1_000_000;
+//
+// How long a controller reset may take to self-clear, for both chips. It was a COUNT - 1,000,000
+// yields here and 300,000 in the RTL8168 path - and a count of yields is no time at all: on the T630
+// 50,000 of them took over two seconds, so the RTL bound was minutes. Linux's r8169 polls the same bit
+// 100 times 100 us apart, 10 ms; this allows ten times that (`gs::driver::wait`).
+const RESET_WAIT: Budget = Budget::ms(100);
 // A healthy RTL8168 clears the TX descriptor's OWN bit in ~us (the first few poll iterations). The old
 // 1_000_000-yield bound meant a NIC that FAILED to complete a transmit froze the whole ping for ~1s per
 // send. Bound it TIGHT so a stuck TX fails FAST and is recovered (§26.6 bounded, §26.7 loud), instead of
@@ -236,12 +243,24 @@ const RTL_QUIESCE_MS: u64 = 10;
 /// (IDR0-5) and link (PHYSTATUS), and log them - proving the MMIO BAR + register access work on real
 /// hardware. TX/RX descriptor rings are Stage B; until then it serves the frame interface with EMPTY
 /// replies so net-stack degrades rather than hanging (§26.7). Never returns.
+/// Wait, up to `TX_CONFIRM_MS`, for the NIC to say a transmit is done, yielding between looks: a send
+/// that has not landed at the first look is usually microseconds away, and the core is better given
+/// back than spun. Both chips call it; the caller reads the descriptor again for the answer.
+///
+/// `gs::driver::wait`'s deadline. The loops it replaced compared `read_tsc() < end`, which a counter
+/// wrapping mid-wait ends at once. On an uncalibrated machine the bound is the library's look count,
+/// and with a yield between looks that is not a time either.
+fn await_tx(ctx: &ServiceContext, mut done: impl FnMut() -> bool) {
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(TX_CONFIRM_MS));
+    while !done() && !deadline.expired() {
+        ctx.yield_cpu();
+    }
+}
+
 fn realtek_main(ctx: ServiceContext) -> ! {
     const R_CR:        usize = 0x37; // Command: RST=0x10, RE=0x08, TE=0x04
     const R_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
     const CR_RST:      u8    = 0x10;
-
-    const REALTEK_RESET_MAX: u32 = 300_000; // SMALL - a wedged chip must not freeze the box for minutes
 
     let mmio = match ctx.mmio() {
         Some(m) => m,
@@ -262,16 +281,15 @@ fn realtek_main(ctx: ServiceContext) -> ! {
     // that path was correct and this one was not, on the same machine, for the same cause.
     mmio.write16(RTL_IMR, 0x0000);              // no interrupts while we take the chip down
     mmio.write8(R_CR, 0x00);                    // Rx and Tx OFF - stop the engine before resetting it
-    let t_quiesce = ctx.read_tsc().wrapping_add(ctx.duration_cycles(RTL_QUIESCE_MS));
-    while ctx.read_tsc() < t_quiesce { ctx.yield_cpu(); }
+    // A hold, not a wait: nothing reports the burst has retired (`gs::driver::delay`). It was a yield
+    // loop against `read_tsc() < end`, which a counter wrapping mid-wait ends at once.
+    delay::hold(&ctx, Budget::ms(RTL_QUIESCE_MS));
     mmio.write16(RTL_ISR, 0xFFFF);              // drop anything latched by the work we just stopped
 
     // Reset: set CR.RST, wait on the bit self-clearing (bounded SMALL + loud). If MMIO is not reaching
     // the chip (D3 / no memory-space) every read is 0xff, so RST never clears - we TIME OUT, not spin.
     mmio.write8(R_CR, CR_RST);
-    let mut spins = 0u32;
-    while spins < REALTEK_RESET_MAX && mmio.read8(R_CR) & CR_RST != 0 { ctx.yield_cpu(); spins += 1; }
-    let reset_ok = spins < REALTEK_RESET_MAX;
+    let reset_ok = wait::until(&ctx, RESET_WAIT, || mmio.read8(R_CR) & CR_RST == 0).is_ok();
     // MAC = IDR0-5 (two 32-bit reads); link = PHYSTATUS bit 1.
     let lo = mmio.read32(0x00);
     let hi = mmio.read32(0x04);
@@ -669,10 +687,8 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         let o1 = RTL_DESC_OWN | RTL_DESC_EOR | RTL_DESC_FS | RTL_DESC_LS | (flen as u32 & 0x3FFF);
         arena.write32(td, o1);
         mmio.write8(RTL_TPPOLL, RTL_TPPOLL_NPQ);
-        let mut ts = 0u32;
         // Same clock bound as the e1000 path - see TX_CONFIRM_MS for why a yield COUNT was wrong.
-        let t_end = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TX_CONFIRM_MS));
-        while arena.read32(td) & RTL_DESC_OWN != 0 && ctx.read_tsc() < t_end { ctx.yield_cpu(); ts += 1; }
+        await_tx(&ctx, || arena.read32(td) & RTL_DESC_OWN == 0);
         let tx_done = arena.read32(td) & RTL_DESC_OWN == 0;
         if !tx_done {
             // With a single descriptor a ring desync is impossible, so a timeout here is a genuine NIC
@@ -1180,8 +1196,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         // Reset to a known state (bring-up on EVERY spawn - Commandments V + IX), wait on the bit.
         m.write32(REG_CTRL, m.read32(REG_CTRL) | CTRL_RST);
-        let mut spins = 0u32;
-        while spins < RESET_POLL_MAX && m.read32(REG_CTRL) & CTRL_RST != 0 { ctx.yield_cpu(); spins += 1; }
+        if wait::until(&ctx, RESET_WAIT, || m.read32(REG_CTRL) & CTRL_RST == 0).is_err() {
+            ctx.log_fmt(format_args!(
+                "nic-driver: e1000 reset did not self-clear in {} ms - continuing from whatever state it is in",
+                RESET_WAIT.as_us() / 1000));
+        }
         // Bring the link UP (else nothing flows back on the wire).
         m.write32(REG_CTRL, m.read32(REG_CTRL) | CTRL_SLU | CTRL_ASDE);
 
@@ -1414,8 +1433,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             a.write8(td + 11, TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS);
             a.write8(td + 12, 0); // clear DD
             m.write32(REG_TDT, ((tx_idx + 1) % TX_RING_COUNT) as u32);
-            let t_end = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TX_CONFIRM_MS));
-            while a.read8(td + 12) & TXD_STA_DD == 0 && ctx.read_tsc() < t_end { ctx.yield_cpu(); }
+            await_tx(&ctx, || a.read8(td + 12) & TXD_STA_DD != 0);
             tx_confirmed = a.read8(td + 12) & TXD_STA_DD != 0;
             tx_idx = (tx_idx + 1) % TX_RING_COUNT;
 
