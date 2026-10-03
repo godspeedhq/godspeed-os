@@ -2058,7 +2058,9 @@ card belongs. And `TRIES` existed in three files with two different values - "tw
 They are now `RESET_TRIES`, `HT_TRIES`, `REPLY_TRIES` and `LIVENESS_TRIES`, which is better code than what
 the gate rejected. A third pair inside `sdio.rs` that the cross-file rule could not see (one name for the
 OCR poll count and the function-ready count, 100 and 500) was found while fixing the first two and split
-into `OCR_TRIES` and a ready count - which section 45 later replaced with `READY_MS`, a duration.
+into an OCR try count and a ready count. Both are durations now: section 45 made the ready count three
+seconds, and `gs::driver` step 1d (`docs/driver-library.md`) made the OCR count a second, as
+`OCR_WAIT` and `READY_WAIT`.
 
 A general `read_extended` also had to be written: the read side of CMD53 stopped at four bytes, because every
 backplane read is a single word. A reply header is twelve.

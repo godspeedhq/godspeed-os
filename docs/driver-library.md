@@ -157,7 +157,7 @@ for each other, and `chaos max-carnage all-services` (50 rounds) bringing `genet
 | `block-driver` (`sdhci.rs`) | Pi 2 | six `t > 1_000_000` loops | **count-bounded, the same defect `wifi-driver` had** - missed by the first census, which looked for named helpers and this one has none |
 | `dwc2` | Pi 2 | `wait_until` | one-look budget when uncalibrated |
 | `nic-driver` `dwmac` | VisionFive | `wait_clear`, `mdio_idle` | 200,000 and 20,000 looks when uncalibrated |
-| `sdk/wifi` (`sdio.rs`) | Pi 4 | function-ready | builds its deadline by hand; converting makes `sdk/wifi` depend on `gs`, a dependency change of its own |
+| ~~`sdk/wifi` (`sdio.rs`)~~ | Pi 4 | function-ready | done in step 1d |
 
 ## Step 1c: `xhci` on `wait` (2026-10-02)
 
@@ -189,6 +189,38 @@ waited for the reset. The library bounds that case by `UNCALIBRATED_POLLS` looks
 rounds, 344 kills) brought the keyboard and the disk back. One `dir /` just after chaos waited out
 `block-driver`'s 10 s while `xhci` was re-enumerating a replugged stick - none of its own waits
 expired, and the next `dir /` answered; that is the driver being busy, not a wait giving up.
+
+## Step 1d: a PACED wait, and `sdk/wifi` on it (2026-10-03)
+
+Step 1c left a question open: a wait that sleeps between looks. `xhci` has three such loops and
+`sdk/wifi` a fourth (the SDIO function-ready wait, a look a millisecond for up to three seconds), so the
+shape is repeated, and it is not a new mechanism - it is `wait` with a pace. `Deadline::paced(budget,
+pace)` and `until_paced` sleep the pace between looks themselves, through `Deadline::pause`, and that
+is what answers the question: when the wait owns the pace, its uncalibrated bound can be the number of
+paces that fit the budget rather than 200,000 looks that are each a sleep apart. On such a machine the
+kernel's sleep is itself only approximate, so that is a count of pauses, not a duration; it still ends.
+
+`sdk/wifi`'s two waits are on it:
+
+- **Function ready**: three seconds, a look a millisecond, unchanged. It built its deadline by hand from
+  `duration_cycles`, which on an uncalibrated clock floored to one tick: one read, then give up, and a
+  reported elapsed time in ticks rather than milliseconds.
+- **The card's CMD5 ready**: this was 100 asks back to back, a COUNT, however long 100 commands take on
+  this bus. It is now the reference's duration - Linux's `mmc_send_io_op_cond` asks 100 times 10 ms
+  apart, a second - paced the same way. A card that is ready at once, as this one has been, sees no
+  difference.
+
+`sdk/wifi` now depends on the stdlib, which is the layering above: a radio is a driver and reaches for
+`gs::driver` like any other. Nothing in the stdlib depends on `sdk/wifi`, so there is no cycle.
+
+`xhci`'s three sleeping loops can now move, and are the next step rather than part of this one.
+
+**Verified:** builds for every port, and on the Pi 4 on 2026-10-03: 49 function-ready waits (boot,
+five `wifi radio powercycle`s, and the chaos restarts), every one READY at the first read in 1-2 ms -
+the same figures as the sessions before it - and the card ready at its first CMD5 every time, so the
+new pace was never needed. No wait expired. `chaos max-carnage all-services` (50 rounds, 364 kills)
+recovered the radio, which rejoined and took its lease; a power cycle after it rejoined and `ping
+8.8.8.8` answered 5 of 5.
 
 ## What this supersedes
 

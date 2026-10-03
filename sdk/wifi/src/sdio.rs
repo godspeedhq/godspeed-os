@@ -28,6 +28,7 @@
 //! code. Reading those off the bus is the difference between believing a device tree and having asked
 //! the part.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
 
 // ------------------------------------------------------------------------------- the command model
@@ -392,7 +393,13 @@ pub fn identify_once(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<Card> {
     // CMD5 again, now WITH a voltage window, repeatedly until the card reports ready. A card still
     // powering up is entitled to answer not-ready; the spec's sequence is to repeat. Bounded, and the
     // bound is reported (a silent give-up here is indistinguishable from success on the next line).
-    const OCR_TRIES: u32 = 100;
+    //
+    // The bound is a DURATION, the reference's: Linux's `mmc_send_io_op_cond` asks 100 times 10 ms
+    // apart, a second in all. This used to be 100 asks back to back - a count, which is however long
+    // 100 commands take on this bus (CLAUDE.md 26.6), and much less than a second.
+    const OCR_WAIT: Budget = Budget::ms(1_000);
+    const OCR_PACE: Budget = Budget::ms(10);
+    let mut d = wait::Deadline::paced(ctx, OCR_WAIT, OCR_PACE);
     let mut tries = 0u32;
     let ready = loop {
         match h.cmd(IO_SEND_OP_COND, OCR_3V3 & ocr) {
@@ -409,15 +416,17 @@ pub fn identify_once(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<Card> {
             }
         }
         tries += 1;
-        if tries >= OCR_TRIES {
+        if d.expired() {
             ctx.log_fmt(format_args!(
-                "wifi-driver: the card never reported READY across {} CMD5 attempts. It is on the bus \
+                "wifi-driver: the card never reported READY in {} ms ({} CMD5 attempts). It is on the bus \
                  and answering, so the voltage window ({:#08x}) is the suspect",
-                OCR_TRIES,
+                OCR_WAIT.as_us() / 1000,
+                tries,
                 OCR_3V3 & ocr
             ));
             break None;
         }
+        d.pause();
     };
     ready?;
     if tries > 0 {
@@ -868,10 +877,13 @@ pub fn enable_function(h: &dyn SdioHost, func: u8, ctx: &ServiceContext) -> bool
     /// restarted over a warm 802.11 core did not answer in 500 - `chaos max-carnage`, Pi 4, every
     /// respawn that got this far. The elapsed time is reported on success so a slow answer is seen
     /// as slow rather than as lucky.
-    const READY_MS: u64 = 3_000;
-    let t0 = ctx.read_tsc();
-    let per_ms = ctx.duration_cycles(1).max(1);
-    let budget = ctx.duration_cycles(READY_MS);
+    ///
+    /// Paced a millisecond apart by `gs::driver::wait`, so three seconds of waiting is not three seconds
+    /// of hammering the CMD line the firmware is bringing up. It used to build that deadline by hand from
+    /// `duration_cycles`, which floors to one tick on an uncalibrated clock: one read, then give up.
+    const READY_WAIT: Budget = Budget::ms(3_000);
+    const READY_PACE: Budget = Budget::ms(1);
+    let mut d = wait::Deadline::paced(ctx, READY_WAIT, READY_PACE);
     let mut reads: u32 = 0;
     loop {
         reads = reads.saturating_add(1);
@@ -884,7 +896,7 @@ pub fn enable_function(h: &dyn SdioHost, func: u8, ctx: &ServiceContext) -> bool
                     current,
                     current | bit,
                     reads,
-                    ctx.read_tsc().wrapping_sub(t0) / per_ms
+                    d.elapsed_us() / 1000
                 ));
                 return true;
             }
@@ -898,17 +910,17 @@ pub fn enable_function(h: &dyn SdioHost, func: u8, ctx: &ServiceContext) -> bool
                 return false;
             }
         }
-        if ctx.read_tsc().wrapping_sub(t0) >= budget {
+        if d.expired() {
             break;
         }
-        // Not ready yet: a millisecond between asks, so three seconds of waiting is not three seconds
-        // of hammering the CMD line the firmware is bringing up.
-        ctx.sleep_ms(1);
+        d.pause();
     }
     ctx.log_fmt(format_args!(
         "wifi-driver: function {} was enabled but never reported ready in {} ms ({} reads of IOR). The \
          write was accepted, so the function exists and is not coming up",
-        func, READY_MS, reads
+        func,
+        READY_WAIT.as_us() / 1000,
+        reads
     ));
     false
 }

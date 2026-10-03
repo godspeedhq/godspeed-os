@@ -16,7 +16,7 @@
 //!
 //! This is the one loop, written once.
 //!
-//! # The two shapes
+//! # The shapes
 //!
 //! ```ignore
 //! use godspeed::driver::wait::{self, Budget};
@@ -34,6 +34,14 @@
 //!     if i & ERR != 0 { return Err("the device reported an error"); }
 //!     if d.expired() { return Err("the device never reported done"); }
 //! }
+//!
+//! // A wait measured in seconds, which should not hammer the device: the same, PACED.
+//! let mut d = wait::Deadline::paced(ctx, Budget::ms(3_000), Budget::ms(1));
+//! loop {
+//!     if ready() { break; }
+//!     if d.expired() { return Err("the function never reported ready"); }
+//!     d.pause();
+//! }
 //! ```
 //!
 //! # What it will not do for you
@@ -42,14 +50,21 @@
 //! `Result`), and the caller reports it - because "the controller never left reset" and "the clock
 //! never stabilised" are different faults, and only the driver knows which wait this was (26.7).
 //!
-//! **It does not sleep.** It polls. A wait measured in microseconds cannot afford a scheduler quantum,
-//! and one measured in seconds should be pacing itself with `ctx.sleep_ms` between looks, which a
-//! caller can do inside its own `Deadline` loop.
+//! **It sleeps only when asked to.** [`until`] and [`Deadline::start`] poll: a wait measured in
+//! microseconds cannot afford a scheduler quantum. A wait measured in seconds should not spend them
+//! hammering the device, and [`until_paced`] and [`Deadline::paced`] sleep a PACE between looks.
 //!
-//! **On an uncalibrated machine the bound is a count.** There is no other bound to have. It is
-//! [`UNCALIBRATED_POLLS`] looks, the figure the network drivers had already settled on; the wait still
-//! ends, it just does not end on time. [`calibrated`] says which case this machine is in, for a caller
-//! that wants to report it.
+//! The pace is the wait's, not the caller's, and that is the point of having it here: a caller sleeping
+//! inside its own `Deadline` loop (as `xhci` and `sdk/wifi` did) leaves the uncalibrated count below
+//! measuring looks it does not know are seconds apart.
+//!
+//! **On an uncalibrated machine the bound is a count.** There is no other bound to have. A polling wait
+//! gets [`UNCALIBRATED_POLLS`] looks, the figure the network drivers had already settled on. A paced
+//! wait gets as many looks as its pace fits into its budget, because 200,000 looks with a sleep between
+//! each is not a bound anyone meant; and since the kernel's sleep is itself only approximate on such a
+//! machine (`sleep_ms` floors to one scheduler quantum), that is a count of pauses, not a duration.
+//! Either way the wait still ends, it just does not end on time. [`calibrated`] says which case this
+//! machine is in, for a caller that wants to report it.
 
 #[cfg(not(test))]
 use godspeed_sdk::service_context::ServiceContext;
@@ -85,6 +100,13 @@ pub(crate) fn ticks_for(per_10ms: u64, us: u64) -> u64 {
     (per_10ms.saturating_mul(us) / 10_000).max(1)
 }
 
+/// Looks an uncalibrated paced wait gets: as many paces as fit in the budget, rounded up, never zero.
+pub(crate) fn paced_looks(budget_us: u64, pace_us: u64) -> u32 {
+    let pace = pace_us.max(1);
+    let looks = budget_us / pace + (budget_us % pace != 0) as u64;
+    looks.clamp(1, u32::MAX as u64) as u32
+}
+
 /// Microseconds in `ticks` at `per_10ms` ticks per 10 ms. 0 when uncalibrated, which is "unknown".
 pub(crate) fn us_for(per_10ms: u64, ticks: u64) -> u64 {
     if per_10ms == 0 { 0 } else { ticks.saturating_mul(10_000) / per_10ms }
@@ -107,6 +129,8 @@ pub struct Deadline<'a> {
     per_10ms: u64,
     /// Looks remaining, counted only when uncalibrated.
     polls_left: u32,
+    /// Milliseconds [`Deadline::pause`] sleeps; 0 for a polling deadline, whose pause is a spin hint.
+    pace_ms: u64,
 }
 
 #[cfg(not(test))]
@@ -119,6 +143,27 @@ impl<'a> Deadline<'a> {
             ticks: ticks_for(per_10ms, budget.as_us()),
             per_10ms,
             polls_left: UNCALIBRATED_POLLS,
+            pace_ms: 0,
+        }
+    }
+
+    /// A deadline whose looks are `pace` apart: call [`Deadline::pause`] between them. The pace is in
+    /// whole milliseconds, the kernel's sleep resolution, and at least one. On an uncalibrated machine
+    /// the budget becomes as many looks as the pace fits into it.
+    pub fn paced(ctx: &'a ServiceContext, budget: Budget, pace: Budget) -> Self {
+        let pace_ms = (pace.as_us() / 1000).max(1);
+        let mut d = Deadline::start(ctx, budget);
+        d.pace_ms = pace_ms;
+        d.polls_left = paced_looks(budget.as_us(), pace_ms.saturating_mul(1000));
+        d
+    }
+
+    /// Wait out one pace between looks: a sleep for a paced deadline, a spin hint for a polling one.
+    pub fn pause(&self) {
+        if self.pace_ms == 0 {
+            core::hint::spin_loop();
+        } else {
+            self.ctx.sleep_ms(self.pace_ms);
         }
     }
 
@@ -162,6 +207,30 @@ pub fn until(ctx: &ServiceContext, budget: Budget, mut cond: impl FnMut() -> boo
     }
 }
 
+/// [`until`], sleeping `pace` between looks: for a wait measured in seconds, where a look every
+/// moment would only hammer the device. See [`Deadline::paced`].
+#[cfg(not(test))]
+pub fn until_paced(
+    ctx: &ServiceContext,
+    budget: Budget,
+    pace: Budget,
+    mut cond: impl FnMut() -> bool,
+) -> Result<u64, TimedOut> {
+    if cond() {
+        return Ok(0);
+    }
+    let mut d = Deadline::paced(ctx, budget, pace);
+    loop {
+        d.pause();
+        if cond() {
+            return Ok(d.elapsed_us());
+        }
+        if d.expired() {
+            return Err(TimedOut);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +257,16 @@ mod tests {
         // A ~2 GHz x86 TSC.
         assert_eq!(ticks_for(20_000_000, 1_000), 2_000_000);
         assert_eq!(ticks_for(u64::MAX, u64::MAX), u64::MAX / 10_000);
+    }
+
+    #[test]
+    fn paced_looks_fit_the_budget() {
+        assert_eq!(paced_looks(3_000_000, 1_000), 3_000); // 3 s at 1 ms
+        assert_eq!(paced_looks(1_000_000, 10_000), 100); // 1 s at 10 ms - the mmc core's CMD5 retry
+        assert_eq!(paced_looks(1_500, 1_000), 2); // a partial pace still gets its look
+        assert_eq!(paced_looks(0, 1_000), 1); // never zero: the condition is always looked at
+        assert_eq!(paced_looks(5, 0), 5); // a zero pace is read as one microsecond, not a division by zero
+        assert_eq!(paced_looks(u64::MAX, 1), u32::MAX);
     }
 
     #[test]

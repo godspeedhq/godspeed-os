@@ -540,6 +540,7 @@ version = "0.21.0"
 name = "godspeed-wifi"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 
