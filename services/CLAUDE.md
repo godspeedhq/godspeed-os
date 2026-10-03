@@ -40,15 +40,16 @@ is the kernel itself** (`{kernel}`). Pinned by §22 Test 15.
 | `console/`   | The terminal - owns the display (`docs/console-service.md` §9). A respawn re-maps the framebuffer grant, clears it, and renders from the next byte on; scrollback is lost because it lived in the dead instance's grid (a re-init, not a resume). While it is dead the kernel's `bootcon` floor takes the screen back, so the machine is never mute |
 
 `block-driver` must respawn before `fs` (fs's send-peer cap to it wires at spawn). The kernel notifies
-the supervisor only for this **named set** (not probes), so ordinary probe/app churn never floods it.
+the supervisor only for tasks spawned **watched** (not probes), so ordinary probe/app churn never floods it.
 
-**This table is the set, and it is checkable.** The authority is the `matches!` on `task_name` in
-`kernel/src/task/scheduler.rs` that bumps the restart count; a name missing from THERE dies without
-accruing a restart, so `observe` reports 0 for a service that died repeatedly - which is exactly how
-`time` and `control` were found missing. A name missing from the table HERE is the same drift one
-layer up: five managed services (`time`, `control`, `hw-enumerator`, `nic-driver`, `net-stack`) were
-absent from this list while the kernel had been restarting them all along. If you add a service to
-that `matches!`, add a row here.
+**The supervisor's `MANAGED` is the set, and it is the only copy.** Every service in it is spawned with
+`SPAWN_FLAG_WATCHED`, and the kernel reports and counts the death of exactly those tasks - it keeps no
+list of service names (`docs/audio.md`, "No service names in the kernel"). It used to keep two, and they
+drifted: `time` and `control` were missing from the restart counter, so `observe` reported 0 for services
+that died repeatedly. `V-managed-watched` in `scripts/commandments.py` checks the whole chain. A service
+missing from the table HERE is the same drift one layer up - five managed services (`time`, `control`,
+`hw-enumerator`, `nic-driver`, `net-stack`) were once absent from it. If you add a service to `MANAGED`,
+add a row here.
 
 A respawn is always a **fresh instance**: the supervisor spawns a new task with a *new* endpoint
 (generation bumped) and *fresh* caps minted from the contract - never the dead instance's. The dead

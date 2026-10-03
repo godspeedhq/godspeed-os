@@ -326,7 +326,7 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 /// Non-PCI fixed-physical peripheral MMIO grant (the ARM Pi path). x86 discovers driver MMIO from the
 /// PCI scan (handled in the spawn path via `HwClass::mmio_bar`), so there is never a fixed-physical
 /// window to grant here - always `None`.
-pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
+pub fn map_fixed_device(_pt: &mut page_tables::PageTable, _kind: u32) -> Option<(u64, u64)> { None }
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
@@ -336,8 +336,8 @@ pub fn hw_random() -> Option<u32> { None }
 /// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
 /// one board with it is the Pi 4 (`arch/aarch64`), whose radio returns to power-on only when WL_ON is
 /// cut. `false` is the honest answer; the syscall reports it as "no control over it".
-pub fn device_power_control(_name: &str) -> bool { false }
-pub fn device_power(_name: &str, _on: bool) -> bool { false }
+pub fn device_power_control(_kind: u32) -> bool { false }
+pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 
 /// The Arm cores' clock (`CpuClock`, syscall 55): no control on this port. The one board with it is the
 /// Pi 4 (`arch/aarch64`), whose firmware takes a rate request over the mailbox. `None` is the honest
@@ -1235,8 +1235,9 @@ pub fn pci_cfg_read32(sel: u32, off: u16) -> Option<u32> {
 /// SoC one", and a machine has whichever it has. Merging them into one static was what put a
 /// non-PCI device's presence into a variable called `pci::NIC_FOUND`.
 pub fn soc_nic_present() -> bool { false }
-/// Does this board drive an audio jack by PWM (`HwClass::AudioPwm`, `docs/audio.md`)? Not here.
-pub fn audio_pwm_present() -> bool { false }
+/// Is a device of this fixed kind (`task::kind`) on this board? None here: the arch answers by KIND,
+/// never by the name of a service (`docs/audio.md`, "No service names in the kernel").
+pub fn fixed_device_present(_kind: u32) -> bool { false }
 
 /// Who made this CPU, and which one - written into a caller-supplied buffer, returning its length.
 ///

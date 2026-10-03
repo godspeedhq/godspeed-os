@@ -5,7 +5,7 @@
 # Not on any bus that enumerates, so named by its device kind: the kernel, granting it, routes the jack's
 # two pins to the PWM and starts the PWM clock - both in SHARED blocks, so they are part of the grant and
 # never this service's to touch (CLAUDE.md 12.3, as amended for audio) - then maps the PWM page and the
-# DMA engine's page side by side (`map_fixed_driver_mmio`) and grants a DMA arena. The DMA page holds
+# DMA engine's page side by side (`map_fixed_device`, by kind `AUDIO_PWM`) and grants a DMA arena. The DMA page holds
 # every channel, which is more than this service needs and is recorded as such; on these boards, with no
 # IOMMU, it is no more reach than any DMA-capable driver has.
 name    = "pwm-audio"

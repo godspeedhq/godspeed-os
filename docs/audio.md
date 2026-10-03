@@ -765,11 +765,12 @@ reach than the driver already has, but it is still more than the grant names. A 
 ### Built: `pwm-audio` and the kernel's part (2026-10-03, on the operator's go-ahead)
 
 **The kernel** (CLAUDE.md 12.3, the 2026-10-03 amendment): a new device kind, `HwClass::AudioPwm`, that
-every port answers through the seam (`audio_pwm_present`) - true on the Pi 2, true on the Pi 4 only where a
+every port answers through the seam (`fixed_device_present`) - true on the Pi 2, true on the Pi 4 only where a
 boot probe found PWM1 answering. Granting it, the Pi's arch layer routes the jack's two pins to the PWM
 (pulls off) and starts the PWM clock from PLLD (/2 on the Pi 2, /6 on the Pi 4), then maps the PWM page
 at +0 and the DMA engine's page at +0x1000 as one 8 KiB window, and grants a 36-page DMA arena kept across
-respawns. `pwm-audio` joins the two restart lists. `hw_class_known` is now DERIVED from the class decoder:
+respawns. `pwm-audio` joined the two restart lists - and that is what the operator stopped, the same
+day: see "No service names in the kernel" below. `hw_class_known` is now DERIVED from the class decoder:
 it read `class <= 7`, a second copy of the decoder's range, and refused every spawn of the eighth kind
 until the first boot showed it.
 
@@ -824,6 +825,47 @@ controller, its clocks, a power domain and two PMIC rails brought up first, on I
 vendor kernel. Weeks, not days, and with nothing working on the board to compare against. A USB audio
 dongle is the realistic route there - and it would work on every board - but it needs isochronous
 transfers, which no USB driver here does yet.
+
+## No service names in the kernel (2026-10-03)
+
+Writing the Pis' jack, the kernel learned one more service name: `pwm-audio` went into the Pis'
+fixed-window table and into two lists in the death path, which is how `wifi-driver`, `dwc2`, `nic-driver`
+and `block-driver` had got their windows before it. The operator asked whether that was normal, given that
+the only service the kernel is supposed to know is the supervisor. It was not, and "the existing practice"
+was the debt rather than a licence for it. `docs/service-ownership.md` had already said why: once the
+supervisor supplies the images, a table that grants authority BY NAME cannot be enforced, because any
+image the supervisor starts under a matching name gets the device.
+
+So everything the kernel decided by a service's name is now decided by something the spawn request
+carries:
+
+| What | Was decided by | Now decided by |
+|---|---|---|
+| A fixed device's window (Pi 2 `dwc2`, audio; Pi 4 GENET, the radio, audio) | the name, in map_fixed_driver_mmio (removed) | the device KIND in the request (`HwClass` -> `task::kind`), in `arch::imp::map_fixed_device` |
+| Whether the device is there | audio_pwm_present (removed) | `arch::imp::fixed_device_present(kind)` |
+| Who may cut a device's power (`DevicePower`) | the caller's name, `wifi-driver` | the kind the caller was granted, `WIFI_SDIO` |
+| Whose death is reported to the supervisor | a list of 19 names | `SPAWN_FLAG_WATCHED`, set by the supervisor from `MANAGED` |
+| Whose death counts as a restart | a second list of names | the same flag |
+| Who gets the display back on death, and where console output goes | the name `console` | the task granted the `FRAMEBUFFER` kind |
+
+**The radio got a kind of its own**, `WIFI_SDIO`, because it had none: its supervisor row said
+`hwclass::NONE` and the kernel recognised it by name. A kind is the same trust as a PCI class code (step
+D): it says what DEVICE a driver is for, which is what the grant is about.
+
+**Two grants were removed rather than converted**, because nothing used them. `block-driver` was given the
+Pi 2's Arasan EMMC window by name, and on that board it never reads it - the disk is a USB stick behind
+`dwc2`, and the EMMC is the boot card, which writing to destroyed two of them. And `console_push` was
+minted by matching a list of names that no longer named anything that spawned through that path, so it
+granted nothing; the drivers hold the privilege bit `CONSOLE_PUSH` from their rows, as before.
+
+**What the kernel still knows by name: `supervisor`**, because it spawns and respawns it, and a kernel
+that is the recovery anchor must be able to name the one thing it recovers. The catalogue entries that
+still exist for a direct spawn are the same exception.
+
+**The gate followed the fact.** `V-managed-watched` compared three lists; there is one now, so it checks
+the chain instead - `MANAGED` parses, `is_watched` answers from it, the spawn request sets the flag from
+it, the syscall carries it, the spawn records it, the death path guards both actions on the record, and
+no list of service names is back in that path. Each link has a probe that breaks it.
 
 ## Found while preparing
 

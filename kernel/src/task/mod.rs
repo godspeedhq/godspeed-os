@@ -428,6 +428,10 @@ enum HwClass {
     // An audio jack driven by PWM and fed by the SoC's DMA engine (the Pis, `docs/audio.md`): soldered
     // to the SoC, so named, like the DWC2.
     AudioPwm,
+    // A WiFi radio on an SDIO host at a fixed SoC address (the Pi 4's CYW43455 behind the Arasan). A
+    // kind, so the kernel grants the window and the power control to what the spawn request ASKED FOR,
+    // never to whatever is called `wifi-driver`.
+    WifiSdio,
     Framebuffer,
     TestIrq,
     /// ---- ANY PCI DEVICE, named by what the BUS says it is rather than by what the kernel was
@@ -463,6 +467,31 @@ static PCI_DMA_PHYS: [portable_atomic::AtomicU64; crate::arch::imp::pci::MAX_DEV
     [const { portable_atomic::AtomicU64::new(0) }; crate::arch::imp::pci::MAX_DEVICES];
 
 impl HwClass {
+    /// The named kind, for a device at a FIXED address the arch layer grants by kind (the Pis' SoC
+    /// blocks). `None` for a PCI device - its window comes from its BAR - and for no device.
+    fn fixed_kind(self) -> Option<u32> {
+        match self {
+            HwClass::Dwc2 => Some(kind::DWC2),
+            HwClass::Nic => Some(kind::NIC),
+            HwClass::AudioPwm => Some(kind::AUDIO_PWM),
+            HwClass::WifiSdio => Some(kind::WIFI_SDIO),
+            _ => None,
+        }
+    }
+    /// The kind code recorded per task (`scheduler::set_task_hw_kind`); 0 for none or a PCI device.
+    fn kind_code(self) -> u32 {
+        match self {
+            HwClass::Nic => kind::NIC,
+            HwClass::Xhci => kind::XHCI,
+            HwClass::Ehci => kind::EHCI,
+            HwClass::Dwc2 => kind::DWC2,
+            HwClass::Framebuffer => kind::FRAMEBUFFER,
+            HwClass::TestIrq => kind::TEST_IRQ,
+            HwClass::AudioPwm => kind::AUDIO_PWM,
+            HwClass::WifiSdio => kind::WIFI_SDIO,
+            HwClass::Pci { .. } | HwClass::None => 0,
+        }
+    }
     /// Did the PCI scan find this class of controller?
     fn found(self) -> bool {
         use crate::arch::imp::pci;
@@ -474,8 +503,9 @@ impl HwClass {
             // one HwClass whose answer is not a scan result, which is why it is a seam member and not
             // a `pci::` scan like the three below it.
             HwClass::Dwc2 => pci::dwc2_present(),
-            // An audio jack driven by PWM, soldered to the SoC like the DWC2: the ARCH answers (the Pis).
-            HwClass::AudioPwm => crate::arch::imp::audio_pwm_present(),
+            // Soldered to the SoC like the DWC2, so the ARCH answers, by kind.
+            HwClass::AudioPwm => crate::arch::imp::fixed_device_present(kind::AUDIO_PWM),
+            HwClass::WifiSdio => crate::arch::imp::fixed_device_present(kind::WIFI_SDIO),
             // Not a bus device at all: the display is found at boot (a Limine descriptor on x86, a GPU
             // mailbox call on the Pi) and the floor that brought it up is the one that knows.
             HwClass::Framebuffer => crate::bootcon::grant().is_some(),
@@ -510,7 +540,7 @@ impl HwClass {
             //   spawn[mmio]: 'dwc2' BAR 0x3f980000 -> VA 0x100000000
             //   task: spawn 'dwc2' failed: MapFailed
             //
-            // ARM's fixed-address peripherals have their own path - `map_fixed_driver_mmio`, which
+            // ARM's fixed-address peripherals have their own path - `map_fixed_device`, by kind, which
             // the spawn logic calls precisely WHEN THE BAR IS 0, and which maps at a 32-bit VA with
             // Device/uncached + USER so the service reaches the registers through the SDK's safe
             // `Mmio` wrapper. The DWC2's address therefore belongs there, not here. Returning 0 is
@@ -566,8 +596,9 @@ impl HwClass {
         if let HwClass::Pci { dma_pages, .. } = self {
             return dma_pages > 0 && self.found();
         }
+        // The radio has no arena: every command it issues rides the SDIO command line (`docs/wifi.md`).
         self != HwClass::None && self != HwClass::Framebuffer && self != HwClass::TestIrq
-            && self.found()
+            && self != HwClass::WifiSdio && self.found()
     }
     /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
     fn dma_pages(self) -> u64 {
@@ -602,7 +633,7 @@ impl HwClass {
                     // absent. Returns a real slot rather than panicking, as the arms below do.
                     _ => &PCI_DMA_PHYS[0],
                 },
-            HwClass::None | HwClass::Framebuffer | HwClass::TestIrq => &XHCI_DMA_PHYS,
+            HwClass::None | HwClass::Framebuffer | HwClass::TestIrq | HwClass::WifiSdio => &XHCI_DMA_PHYS,
         }
     }
     /// Confine this DMA-capable driver via the IOMMU? Only xHCI qualifies today (§6.4; ehci + block-driver
@@ -623,6 +654,7 @@ impl HwClass {
         match self {
             HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
             HwClass::AudioPwm => 0xFFFF, // the same: an SoC block, not a PCI device
+            HwClass::WifiSdio => 0xFFFF,
             HwClass::Framebuffer => 0xFFFF, // not a PCI device
             HwClass::TestIrq     => 0xFFFF, // not a device at all - a software-raised vector
             // A SUPPLIED BDF WINS, because it is the caller saying WHICH device rather than the
@@ -830,16 +862,31 @@ fn hw_pci_of(class: u32, dma_pages: u32, bdf: u32) -> HwClass {
 pub fn hw_class_is_pci(class: u32) -> bool { class & HW_PCI_FLAG != 0 }
 
 /// Resolve a spawn request's device class to the kernel's own scan results.
+/// The named device kinds a spawn request may carry (the SDK's `hwclass` constants), shared with the
+/// arch layer: it answers by KIND - is this kind present, map its window, can its power be cut - and
+/// never by the name of the service that drives it (`docs/audio.md`, "No service names in the kernel").
+pub mod kind {
+    pub const NIC: u32 = 2;
+    pub const XHCI: u32 = 3;
+    pub const EHCI: u32 = 4;
+    pub const DWC2: u32 = 5;
+    pub const FRAMEBUFFER: u32 = 6;
+    pub const TEST_IRQ: u32 = 7;
+    pub const AUDIO_PWM: u32 = 8;
+    pub const WIFI_SDIO: u32 = 9;
+}
+
 fn hw_class_of(class: u32) -> HwClass {
     if class & HW_PCI_FLAG != 0 { return hw_pci_of(class, 0, 0); }
     match class {
-        2 => HwClass::Nic,
-        3 => HwClass::Xhci,
-        4 => HwClass::Ehci,
-        5 => HwClass::Dwc2,
-        6 => HwClass::Framebuffer,
-        7 => HwClass::TestIrq,
-        8 => HwClass::AudioPwm,
+        kind::NIC => HwClass::Nic,
+        kind::XHCI => HwClass::Xhci,
+        kind::EHCI => HwClass::Ehci,
+        kind::DWC2 => HwClass::Dwc2,
+        kind::FRAMEBUFFER => HwClass::Framebuffer,
+        kind::TEST_IRQ => HwClass::TestIrq,
+        kind::AUDIO_PWM => HwClass::AudioPwm,
+        kind::WIFI_SDIO => HwClass::WifiSdio,
         _ => HwClass::None,
     }
 }
@@ -883,7 +930,7 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
         HwClass::Framebuffer | HwClass::None => &[],
         // No vector: the DMA engine's interrupt lines are shared between channels, and routing one
         // would hand over the others'. The driver polls its ring, which `gs::driver::irq` supports.
-        HwClass::AudioPwm => &[],
+        HwClass::AudioPwm | HwClass::WifiSdio => &[],
         // NO VECTOR YET, and this is the honest edge of step D1 rather than an oversight.
         //
         // The named classes above return a vector the KERNEL assigned and programmed into the
@@ -1085,7 +1132,11 @@ fn service_privileges(name: &str) -> Privileges {
         // faithfully-decoded key-press from a synthesized one. That is inherent to being a keyboard
         // driver and is why the grant is enumerated here by name rather than implied by holding a
         // USB controller.
-        console_push: matches!(name, "xhci" | "ehci" | "dwc2"),
+        // NOT BY NAME. This read `matches!(name, "xhci" | "ehci" | "dwc2")`, and it could never fire:
+        // this table answers only for a CATALOGUE spawn, and the catalogue is `supervisor` alone. The
+        // USB drivers' CONSOLE_PUSH arrives in their spawn rows, checked against what the supervisor may
+        // delegate. Removed with the kernel's other service names (`docs/audio.md`).
+        console_push: false,
         // THE PREFIX HOLE IS CLOSED. This used to read
         //     `matches!(name, "supervisor") || name.starts_with("prop-") || name.starts_with("stress-")`
         // and was recorded here as a known one (26.7): probe names are caller-supplied, so a service
@@ -1301,7 +1352,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
     }
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
         cfg.has_recv_endpoint, &pipe_peers[..np], cfg.probe_mode, cfg.send_peers_grant,
-        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None, None, None);
+        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None, None, None, false);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
     }
@@ -1354,6 +1405,9 @@ pub fn spawn_from_image(
     bdf:               u32,
     // Mint the name-wired peer caps with GRANT so the child may re-delegate them (§22 Test 5A).
     peers_grant:       bool,
+    // The spawner asks to hear of this task's death and to have it counted as a restart
+    // (`SPAWN_FLAG_WATCHED`). The supervisor sets it for what it manages; the kernel holds no list.
+    watched:           bool,
 ) -> Result<Option<EndpointId>, SpawnError> {
     if service_config(name).is_some() {
         crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
@@ -1381,7 +1435,7 @@ pub fn spawn_from_image(
     let irqs: &[u8] = if pci_irq[0] != 0 { &pci_irq } else { hw_irqs_for(hw) };
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
                                           peers_grant, mem, irqs, has_console_read,
-                                          Some(privileges), Some(hw), installs);
+                                          Some(privileges), Some(hw), installs, watched);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
     }
@@ -1420,7 +1474,7 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, None, None, None);
+                              cfg.has_console_read, None, None, None, false);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
     }
@@ -1443,7 +1497,7 @@ pub fn spawn_service_by_name_with_installs(
     let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
                               cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
                               cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, None, None, Some(installs));
+                              cfg.has_console_read, None, None, Some(installs), false);
     if let Err(ref e) = result {
         crate::kprintln!("task: spawn '{}' (with installs) failed: {:?}", name, e);
     }
@@ -1544,6 +1598,8 @@ fn spawn_service_with_image(
     // metadata, so the child's `ctx.capability(label)` resolves exactly as it does on the old path.
     // `None` = the old name-resolution path (unchanged).
     installs:          Option<&[InstallCap]>,
+    // Report this task's death to the supervisor and count it as a restart (`SPAWN_FLAG_WATCHED`).
+    watched:           bool,
 ) -> Result<Option<EndpointId>, SpawnError> {
     // The declared hardware class + mint authority for this service (audit M7 / T1 Phase B). Every
     // MMIO / DMA / IOMMU / bus-master / RESOURCE_MINT grant below is driven off these, not a `name ==`
@@ -1926,7 +1982,7 @@ fn spawn_service_with_image(
     // chip that only returns to power-on when its power is cut needs the holder able to ask for that
     // again (`docs/wifi.md` 45-46). One holder per window, so one holder per device; the arch layer
     // answers which devices it can power, and today that is the Pi 4 radio behind the SDIO host.
-    if crate::arch::imp::device_power_control(name) {
+    if hw.fixed_kind().is_some_and(|k| crate::arch::imp::device_power_control(k)) {
         let dp_cap = mint_cap(DEVICE_POWER_RESOURCE, Rights::WRITE);
         caps.insert(dp_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
@@ -2220,7 +2276,9 @@ fn spawn_service_with_image(
                 // get a window it cannot use.
                 None => (0, 0),
             }
-        } else if let Some((va, len)) = crate::arch::imp::map_fixed_driver_mmio(&mut page_table, name) {
+        } else if let Some((va, len)) = hw.fixed_kind()
+            .and_then(|k| crate::arch::imp::map_fixed_device(&mut page_table, k))
+        {
             // Non-PCI fixed-physical peripheral MMIO grant (§12.3 for a bus with no PCI scan - the Pi's
             // peripherals are at fixed addresses). The arch layer maps the window Device+USER and returns
             // its (VA, len); on x86 this is always None (PCI BARs handle it above).
@@ -2485,6 +2543,11 @@ fn spawn_service_with_image(
     // 10. Finalise the reserved task slot (ctx + metadata -> Ready). The budget above is already in
     // place, so a task scheduled the instant Ready publishes sees its own quota, never a stale one.
     // SAFETY: task_slot reserved above; CapTable initialised; IF=0.
+    // What this task IS to the death path, recorded on EVERY spawn so a reused slot never inherits a
+    // previous holder's: whether its death is reported and counted, and the device kind it was granted.
+    // They replace two lists of service names and four name checks (`docs/audio.md`).
+    scheduler::set_task_watched(task_slot, watched);
+    scheduler::set_task_hw_kind(task_slot, hw.kind_code());
     unsafe {
         scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
     }
@@ -2509,7 +2572,7 @@ fn spawn_service_with_image(
 // supervisor up, which is the thing that has to work anyway. If that ever proves too large a first
 // step, the answer is a smaller supervisor - not a second spawn path in the kernel.
 pub fn spawn_supervisor() {
-    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None, None, None) {
+    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None, None, None, false) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
     }
@@ -2612,7 +2675,7 @@ pub fn poll_supervisor_respawn() {
     // the pressure eases. (Only the BOOT-time spawn_supervisor keeps its fatal panic - §22 Test 1B.)
     match spawn_service_with_image(
         "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,
-        64 * 1024 * 1024, &[], false, None, None, None,
+        64 * 1024 * 1024, &[], false, None, None, None, false,
     ) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => {

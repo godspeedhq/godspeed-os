@@ -402,6 +402,44 @@ pub fn task_hw_bdf(slot: usize) -> u32 {
     if slot < MAX_TASKS { TASK_HW_BDF[slot].load(Ordering::Relaxed) } else { 0xFFFF }
 }
 
+/// Whether this task's death is reported to the supervisor and counted as a restart - the SPAWNER's
+/// request (`SPAWN_FLAG_WATCHED`), recorded at every spawn. This replaced two lists of service names: the
+/// kernel no longer knows which services matter, only which tasks it was asked to watch.
+static TASK_WATCHED: [core::sync::atomic::AtomicBool; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TASKS];
+
+/// The device kind this task was granted (`task::kind`, 0 for none or a PCI device), recorded at every
+/// spawn. Lets the kernel find "the task granted the display" without a name for it.
+static TASK_HW_KIND: [core::sync::atomic::AtomicU32; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TASKS];
+
+pub fn set_task_watched(slot: usize, watched: bool) {
+    if slot < MAX_TASKS { TASK_WATCHED[slot].store(watched, Ordering::Release); }
+}
+pub fn task_watched(slot: usize) -> bool {
+    slot < MAX_TASKS && TASK_WATCHED[slot].load(Ordering::Acquire)
+}
+pub fn set_task_hw_kind(slot: usize, kind: u32) {
+    if slot < MAX_TASKS { TASK_HW_KIND[slot].store(kind, Ordering::Release); }
+}
+pub fn task_hw_kind(slot: usize) -> u32 {
+    if slot < MAX_TASKS { TASK_HW_KIND[slot].load(Ordering::Acquire) } else { 0 }
+}
+
+/// The receive endpoint of the live task granted device `kind`, if there is one. A device kind has at
+/// most one holder - a window is granted once - so the first live match is the only one.
+pub fn live_endpoint_of_kind(kind: u32) -> Option<EndpointId> {
+    for i in 0..MAX_TASKS {
+        if TASK_VALID[i].load(Ordering::Acquire)
+            && TASK_HW_KIND[i].load(Ordering::Acquire) == kind
+            && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
+        {
+            return ep_from_u64(TASK_ENDPOINT[i].load(Ordering::Relaxed));
+        }
+    }
+    None
+}
+
 /// The device this task was given, READ AND RESET to `0xFFFF` in one step.
 ///
 /// The record is written only by a DMA driver's spawn, so a slot later reused by any other task would
@@ -2517,22 +2555,13 @@ pub fn kill_task_by_slot(slot: usize) {
         // symptom: even once their deaths notify the supervisor, a name absent from THIS set never
         // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
         // only view of recovery said nothing happened.
-        if matches!(task_name,
-            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console" | "supervisor"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
-            // hw-enumerator is MANAGED, so its death is a restart like any other - and a restart that
-            // is not COUNTED cannot be observed: `observe` would report 0 for a service that died.
-            | "hw-enumerator"
-            // wifi-driver: the Pi 4's radio, MANAGED like every other driver. Present on one board and
-            // listed unconditionally, exactly as `dwc2` is: a name that never runs here never dies
-            // here, so the cost is nothing, and the alternative is a board-specific omission in a
-            // neutral file.
-            | "wifi-driver"
-            // power: MANAGED (docs/power.md). Counted and notified like every other restartable service.
-            | "power"
-            // audio-driver / pwm-audio: MANAGED (docs/audio.md) - the HD Audio driver on x86 and the
-            // PWM jack driver on the Pis. Both halves, as for wifi-driver below.
-            | "audio-driver" | "pwm-audio")
+        // WATCHED, NOT NAMED. This was a list of nineteen service names, and every service added to the
+        // supervisor's roster had to be added here too - `time` and `control` were missed once, and a
+        // storm that killed them 41 times showed 0 restarts in `observe`. The SUPERVISOR now says, in the
+        // spawn request, which tasks it manages (`SPAWN_FLAG_WATCHED`), so the kernel holds no roster and
+        // cannot disagree with one. The supervisor itself is the one name the kernel knows, because the
+        // kernel spawns and respawns it.
+        if task_watched(slot) || task_name == "supervisor"
         {
             bump_name_restart(task_name);
         }
@@ -2572,19 +2601,14 @@ pub fn kill_task_by_slot(slot: usize) {
         // The terminal died, so nothing is rendering the display any more. Hand the screen back to the
         // kernel's boot floor until the respawned instance takes it, or the machine goes dark with no
         // way to say why (invariant 12).
-        if task_name == "console" {
+        // The task granted the DISPLAY, not whatever is called `console`: the kernel gave it the framebuffer
+        // and takes it back from the same record.
+        if task_hw_kind(slot) == crate::task::kind::FRAMEBUFFER {
             crate::bootcon::reclaim_on_death();
         }
-        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
-            // hw-enumerator: MANAGED, so its death must REACH the supervisor. Without this it would
-            // still come back - on the next reconcile sweep - which is exactly why the omission hides:
-            // not dead forever, just dead for a while, and nothing says so.
-            | "hw-enumerator"
-            // wifi-driver: see the restart-counter list above. Both halves or neither - a death that
-            // notifies but is not counted, or is counted but does not notify, is the exact split that
-            // cost `time` and `control` a hardware session each.
-            | "wifi-driver" | "power" | "audio-driver" | "pwm-audio") {
+        // Reported to the supervisor because the supervisor ASKED, at spawn, to hear of this task's death -
+        // not because its name is on a list here. See the restart counter above.
+        if task_watched(slot) {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

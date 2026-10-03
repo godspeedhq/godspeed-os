@@ -904,7 +904,7 @@ extern "C" fn boot_high() -> ! {
         // The machine can be asked, and asking is both safer and more honest than believing a
         // specification.
         //
-        // READS AND PRINTS, GRANTS NOTHING. `map_fixed_driver_mmio` is untouched until the boot log says
+        // READS AND PRINTS, GRANTS NOTHING. `map_fixed_device` is untouched until the boot log says
         // which window to name, because that table's comment records what getting it wrong costs: a
         // service handed a range whose first read aborts dies on that read, forever.
         //
@@ -1243,12 +1243,16 @@ pub const DRIVER_MMIO_VA: u64 = 0x6000_0000;
 ///
 /// Mapped Device-nGnRnE via `PCD` (`ptables::map_raw` reads that as the device attribute) and
 /// NO_EXEC - a register window is never code. USER because the point is for EL0 to reach it.
-pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Option<(u64, u64)> {
+///
+/// **BY DEVICE KIND, NEVER BY SERVICE NAME** (`docs/audio.md`, "No service names in the kernel"). Keyed
+/// on the name, this was the name-keyed authority table `docs/service-ownership.md` says cannot be
+/// enforced once the supervisor holds the images. The kind is what the spawn request asks for.
+pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u64, u64)> {
     #[cfg(not(feature = "pi4"))]
     {
         // No fixed peripheral windows on the QEMU `virt` variant: it has no GENET and no Pi
-        // peripherals at all, so there is nothing to name.
-        let _ = (pt, name);
+        // peripherals at all, so there is nothing to grant.
+        let _ = (pt, kind);
         None
     }
 
@@ -1259,11 +1263,12 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
 
         // One entry per device this port knows how to grant. A name that is not here gets NOTHING,
         // which is the default that keeps this a grant rather than an ambient window.
-        let (phys, pages): (u64, u64) = match name {
+        use crate::task::kind as k;
+        let (phys, pages): (u64, u64) = match kind {
             // The GENET v5 ethernet MAC. 64 KiB covers the SYS/EXT/RBUF/UMAC/MDIO blocks, both DMA
             // register files (the RDMA/TDMA rings sit at +0x2000 and +0x4000), and the hardware
             // filter block at +0x8000 that has to be cleared before a frame can reach the DMA.
-            "nic-driver" if genet::present() => (0xFD58_0000, 16),
+            k::NIC if genet::present() => (0xFD58_0000, 16),
             // The Arasan SD host controller, which on THIS board is the CYW43455 WiFi radio's SDIO
             // bus - the vendor device tree's `mmcnr@7e300000` (bus-width 4, `sdio_pins`), the same
             // controller as `sdhci@7e300000` under a different driver's name. 0x100 of registers, so
@@ -1273,13 +1278,13 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
             // and QEMU makes concrete: `raspi4b` emulates no Arasan, so an ungated grant would hand
             // the service a window whose first read aborts, and the supervisor would respawn it
             // forever. The census runs earlier in the same boot (`sdio::census`).
-            "wifi-driver" if sdio::radio_present() => (0xFE30_0000, 1),
+            k::WIFI_SDIO if sdio::radio_present() => (0xFE30_0000, 1),
             // The audio jack (`docs/audio.md`): TWO pages that are not adjacent, mapped side by side -
             // the PWM block at +0 (PWM1 is at +0x800 within it) and the DMA engine at +0x1000. The DMA
             // page holds all fifteen channels and their shared status, so granting it grants every
             // channel: no more DMA reach than an unconfined driver has on this board anyway (6.4), and
             // more than the grant names, which is recorded.
-            "pwm-audio" if audio_pwm_present() => {
+            k::AUDIO_PWM if fixed_device_present(k::AUDIO_PWM) => {
                 if !audio_jack_prepare() {
                     crate::kprintln!("audio: the PWM clock did not report stopping - started anyway; the driver will say what it hears");
                 }
@@ -1460,13 +1465,12 @@ pub fn hw_random() -> Option<u32> {
 #[cfg(not(feature = "pi4"))]
 pub fn hw_random() -> Option<u32> { None }
 
-/// Whether the device behind `name`'s fixed peripheral window can have its power cut and restored by
-/// this port. The one such device is the Pi 4's radio: the CYW43455 behind the Arasan SDIO host, powered
+/// Whether the device of fixed `kind` can have its power cut and restored by this port. The one such device is the Pi 4's radio: the CYW43455 behind the Arasan SDIO host, powered
 /// through WL_ON on the firmware's GPIO expander. Answered at spawn, so `DEVICE_POWER` is minted only to
 /// the service that holds that window, and only where the boot census saw the radio's controller.
 #[cfg(feature = "pi4")]
-pub fn device_power_control(name: &str) -> bool {
-    let ok = name == "wifi-driver" && sdio::radio_present();
+pub fn device_power_control(kind: u32) -> bool {
+    let ok = kind == crate::task::kind::WIFI_SDIO && sdio::radio_present();
     // THE OTHER HALF OF THE CHIP'S POWER, measured once per spawn (docs/wifi.md 53): BT_ON as the firmware
     // left it. A cut that drops WL_ON alone leaves the chip's shared domain powered if this is high.
     #[cfg(feature = "pi4")]
@@ -1479,13 +1483,13 @@ pub fn device_power_control(name: &str) -> bool {
     ok
 }
 
-/// Cut (`on = false`) or restore (`on = true`) the power of the device behind `name`'s window. The
+/// Cut (`on = false`) or restore (`on = true`) the power of the device of fixed `kind`. The
 /// `DevicePower` syscall has already checked the caller holds `DEVICE_POWER`; this resolves WHICH pin
 /// and drives it - the same WL_ON that Linux's `mmc-pwrseq-simple` toggles to power-cycle this chip. How
 /// long to hold it off and how long to wait after is the driver's to decide, in the driver (26.10).
 #[cfg(feature = "pi4")]
-pub fn device_power(name: &str, on: bool) -> bool {
-    if name != "wifi-driver" { return false; }
+pub fn device_power(kind: u32, on: bool) -> bool {
+    if kind != crate::task::kind::WIFI_SDIO { return false; }
     // WL_ON ALONE. BT_ON - the same chip's Bluetooth enable - reads 0 on this board (logged at spawn), so
     // there is no second enable holding the chip's shared domain up through a cut (docs/wifi.md 53).
     let took = mailbox::set_expander_gpio(mailbox::EXPGPIO_WL_ON, on);
@@ -1511,9 +1515,9 @@ pub fn device_power(name: &str, on: bool) -> bool {
 
 /// Without the `pi4` feature this port names no board, so no device's power is reachable.
 #[cfg(not(feature = "pi4"))]
-pub fn device_power_control(_name: &str) -> bool { false }
+pub fn device_power_control(_kind: u32) -> bool { false }
 #[cfg(not(feature = "pi4"))]
-pub fn device_power(_name: &str, _on: bool) -> bool { false }
+pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 
 /// Set the Arm cores to the firmware's minimum (`max = false`) or maximum (`max = true`) rate, and return
 /// what they read back in Hz. The two rates are the FIRMWARE'S - `GET_MIN_CLOCK_RATE` and
@@ -3175,15 +3179,20 @@ pub mod rtc {
 /// conflation step D removes.
 pub fn soc_nic_present() -> bool { GENET_PRESENT.load(core::sync::atomic::Ordering::Acquire) }
 
-/// Does this board drive an audio jack by PWM (`HwClass::AudioPwm`, `docs/audio.md`)? The Pi 4 does:
+/// Is a device of this fixed kind (`task::kind`) on this board - answered by KIND, never by the name of a
+/// service (`docs/audio.md`, "No service names in the kernel"). The audio jack (`AUDIO_PWM`): the Pi 4 has
 /// PWM1's two channels on GPIO 40 (right) and 41 (left), through the board's filter to the 3.5 mm jack.
 /// Only where the boot probe found PWM1 answering (`pwm_probe`): not QEMU's `raspi4b`, which models
 /// none, and not the `virt` variant, which has no Pi peripherals at all.
-pub fn audio_pwm_present() -> bool {
-    #[cfg(feature = "pi4")]
-    { PWM_PRESENT.load(core::sync::atomic::Ordering::Acquire) }
-    #[cfg(not(feature = "pi4"))]
-    { false }
+pub fn fixed_device_present(kind: u32) -> bool {
+    use crate::task::kind as k;
+    match kind {
+        #[cfg(feature = "pi4")]
+        k::AUDIO_PWM => PWM_PRESENT.load(core::sync::atomic::Ordering::Acquire),
+        #[cfg(feature = "pi4")]
+        k::WIFI_SDIO => sdio::radio_present(),
+        _ => false,
+    }
 }
 
 /// The clock manager's PWM pair and the GPIO registers the jack needs (BCM2711 peripherals). Every

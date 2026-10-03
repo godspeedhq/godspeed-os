@@ -1527,7 +1527,8 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > them as part of the grant, at spawn, exactly as it powers the SD domain before granting the radio's
 > window - routes the jack's two pins to the PWM and starts the PWM clock at a fixed rate - and the driver
 > (`pwm-audio`) is granted the PWM page and the DMA engine's page, mapped side by side, and a DMA arena.
-> The device is a new kind (`HwClass::AudioPwm`), present where the arch says so (`audio_pwm_present`).
+> The device is a new kind (`HwClass::AudioPwm`), present where the arch says so (`fixed_device_present`,
+> renamed from audio_pwm_present by the amendment below).
 >
 > **What this is not.** No syscall, no privilege bit, no runtime role: the kernel acts once at spawn and
 > holds no policy - the sample rate (the PWM's range), the volume and when to play are the driver's
@@ -1541,7 +1542,32 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > names. The alternative, a kernel-mediated "start this channel" syscall, would grow the kernel to narrow
 > a grant that confers nothing new, and was declined for that reason. The kernel also learns one more
 > service name (`pwm-audio`, in the Pis' fixed-window table and the two restart lists), the existing
-> name-keyed practice that step D's classes are replacing.
+> name-keyed practice that step D's classes are replacing. **[Superseded the same day by the amendment
+> below: the kernel learns no service name for audio, or for any other driver.]**
+>
+> **Amendment 2026-10-03 (later): the kernel knows ONE service by name, the supervisor, and nothing it
+> grants or reports is keyed on a name any more.** The amendment above recorded the kernel learning
+> `pwm-audio` as "the existing practice". The operator asked whether that was normal, and it was not: it
+> was debt, and `docs/service-ownership.md` had already said why it cannot be enforced - once the
+> supervisor supplies the images, any image started under a matching name inherits whatever a name-keyed
+> table grants that name. Six decisions moved off the name:
+>
+> - **Fixed device windows** (the Pis' SoC blocks) are granted by the device KIND the spawn request names
+>   (`arch::imp::map_fixed_device(pt, kind)`, `fixed_device_present(kind)`), the same trust as a PCI class
+>   code. The Pi 4 radio gained the kind it lacked, `WIFI_SDIO`.
+> - **`DevicePower`** reaches the pin of the kind the caller was GRANTED, not of the name it has.
+> - **Death notification and the restart count** follow `SPAWN_FLAG_WATCHED`, set by the supervisor from
+>   its `MANAGED` roster. The kernel's two lists of nineteen names are gone, and with them the drift that
+>   once left `time` and `control` uncounted; `V-managed-watched` checks the chain that replaced them.
+> - **The display** is reclaimed from, and console output delivered to, the task granted the
+>   `FRAMEBUFFER` kind, not whatever is called `console`.
+> - **Two grants were removed** because nothing used them: the Pi 2 `block-driver`'s EMMC window (its disk
+>   is USB; the EMMC is the boot card) and a name-matched `console_push` mint that matched nothing.
+>
+> **No responsibility moves and no authority widens**: every change narrows who a grant reaches, from
+> "anything with this name" to "the request that names this device". One spawn flag is added to a
+> request the kernel already validates. The name the kernel still knows is `supervisor`, because the
+> kernel spawns and respawns it (6.2). `docs/audio.md`, "No service names in the kernel".
 
 ---
 

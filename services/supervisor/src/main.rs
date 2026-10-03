@@ -557,12 +557,13 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
          godspeed_sdk::service_context::hwclass::pci(
              0x02_00_00, godspeed_sdk::service_context::hwclass::BAR_AUTO, false)
      } else { godspeed_sdk::service_context::hwclass::NIC }),
-    // The Pi 4's onboard CYW43455 radio, over SDIO (docs/wifi.md). `hwclass::NONE` is not an
-    // omission: the Arasan SD host controller this drives is at a FIXED SoC address on no enumerable
-    // bus, so the window comes from `map_fixed_driver_mmio` - which the spawn path consults BY NAME
-    // whenever the class path yields nothing - and only where the kernel's boot census saw that
-    // controller answer. A new hardware class would be a kernel enum arm, an SDK constant and a schema
-    // enum member all to restate what the name already says.
+    // The Pi 4's onboard CYW43455 radio, over SDIO (docs/wifi.md). Named by its device KIND,
+    // `hwclass::WIFI_SDIO`: the Arasan SD host controller it drives is at a FIXED SoC address on no
+    // enumerable bus, so the kernel grants the window - and the radio's power control - by that kind,
+    // and only where its boot census saw the controller answer. This row said `NONE` and the kernel
+    // granted both BY NAME, which is the name-keyed authority table step D removes: any service the
+    // supervisor spawned as `wifi-driver` got the radio (`docs/audio.md`, "No service names in the
+    // kernel").
     //
     // No DMA arena and no interrupt, deliberately: every command this phase issues rides the SDIO
     // command line and completes in microseconds. Both arrive with the firmware upload that needs
@@ -575,11 +576,12 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // path - Commandment IX - for a peer chaos restarts. It comes back with the phase that has traffic
     // worth tracing, and with the reacquire-and-retry that then means something.
     //
-    // `0` for the device class, like every other row with no class to name. It is not an omission: see
-    // the paragraph above about `map_fixed_driver_mmio`.
+    // Its device class is `WIFI_SDIO`, the kind the kernel grants the radio's window and power by (see
+    // the paragraph above).
     #[cfg(has_wifi_driver)]
     ("wifi-driver", WIFI_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     16 * 1024 * 1024, 3, &["fs", "power"], 0, 0, 0),
+     16 * 1024 * 1024, 3, &["fs", "power"], 0, 0,
+     godspeed_sdk::service_context::hwclass::WIFI_SDIO),
     // The HD Audio controller (docs/audio.md). Named by the bus, like every PCI driver since step D:
     // 0x040300 is class 0x04 multimedia, subclass 0x03 HD Audio, and the registers are in BAR0.
     //
@@ -692,7 +694,8 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // spawn at all on a 2-core machine instead of landing on another core.
     let caller_chose = !(core == 0xFFFF || core == u32::MAX);
     req.core         = if caller_chose { core } else { table_core };
-    req.flags        = flags | if caller_chose { godspeed_sdk::service_context::SPAWN_FLAG_CORE_STRICT } else { 0 };
+    req.flags        = flags | if caller_chose { godspeed_sdk::service_context::SPAWN_FLAG_CORE_STRICT } else { 0 }
+                     | if is_watched(name) { godspeed_sdk::service_context::SPAWN_FLAG_WATCHED } else { 0 };
     req.memory_limit = mem;
     // Privileges the supervisor asks the child be given. The kernel refuses any bit the SUPERVISOR
     // does not itself hold, so this passes authority on rather than minting it.
@@ -1140,6 +1143,15 @@ const MANAGED: [&str; MANAGED_N] =
      // The audio drivers (docs/audio.md): HD Audio on x86, the PWM jack on the Pis. Listed
      // unconditionally for the reason above.
      "audio-driver", "pwm-audio"];
+
+/// Does this supervisor want the kernel to report `name`'s death and count it as a restart? Every service
+/// it MANAGES, and `counter` (an example with its own death-loop arm). Said in the spawn request as
+/// `SPAWN_FLAG_WATCHED`, so this roster is the ONLY list of watched services in the system: the kernel's
+/// two copies of it (death notification, restart count) are gone, and with them the drift that cost `time`
+/// and `control` their restarts (`docs/audio.md`, "No service names in the kernel").
+fn is_watched(name: &str) -> bool {
+    MANAGED.contains(&name) || name == "counter"
+}
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live

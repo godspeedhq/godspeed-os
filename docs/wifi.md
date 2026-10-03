@@ -735,9 +735,9 @@ numbers this got wrong. Nothing in THIS section is a result.
 | where | what |
 |---|---|
 | `kernel/src/arch/aarch64/sdio.rs` | the census now also asks the firmware to power the SD domain, asks it for the Arasan's base clock, and routes GPIO34-39 to ALT3 (the Arasan's SD1 interface, which is the only path to the radio). It caches whether the Arasan answered |
-| `kernel/src/arch/aarch64/mod.rs` | `map_fixed_driver_mmio` gains one arm - `"wifi-driver" => (0xFE30_0000, 1)`, gated on the census having seen the controller answer - and `emmc_base_clock_hz` returns the clock instead of a flat 0 |
+| `kernel/src/arch/aarch64/mod.rs` | the fixed-window table gains one arm - `"wifi-driver" => (0xFE30_0000, 1)` (keyed on the device kind `WIFI_SDIO` since 2026-10-03, `docs/audio.md`), gated on the census having seen the controller answer - and `emmc_base_clock_hz` returns the clock instead of a flat 0 |
 | `services/wifi-driver/` | the service: `host.rs` (the SDHCI host controller, reset/clock/`cmd`) and `sdio.rs` (CMD0, CMD5 twice, CMD3, CMD7, CMD52, the CIS walk, function enable) |
-| registration | workspace member, `aarch64_built`, the supervisor's embed list and `has_wifi_driver` cfg, its `IMAGES` row, `MANAGED`, the boot spawn, the death-notification arm, and the kernel's two restart lists |
+| registration | workspace member, `aarch64_built`, the supervisor's embed list and `has_wifi_driver` cfg, its `IMAGES` row, `MANAGED`, the boot spawn, the death-notification arm, and the kernel's two restart lists (all three replaced since 2026-10-03 by the supervisor's `SPAWN_FLAG_WATCHED`) |
 
 ### Why the pin mux and the clock are in the kernel
 
