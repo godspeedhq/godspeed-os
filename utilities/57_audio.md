@@ -13,9 +13,9 @@ short (`docs/audio.md`, "Step A4, first half"). Not run
 on hardware: on the T630 the driver surveys the codec and stops before playback, and every verb below
 answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
 
-The verbs in section 1 are built. The rest of the surface the operator agreed - `outputs`, `output`,
-`play`, `debug`, `system sounds`, the settings kept in `/audio.settings` and the keyboard shortcuts - is
-designed in `docs/audio.md` and not built; each of those words answers `not built yet` rather than being
+The verbs in section 1 are built, and the volume and the mute survive a reboot (section 5). The rest of
+the surface the operator agreed - `outputs`, `output`, `play`, `debug`, `system sounds` and the keyboard
+shortcuts - is designed in `docs/audio.md` and not built; each of those words answers `not built yet` rather than being
 mistaken for a fault.
 
 ## 1. Verbs
@@ -87,7 +87,27 @@ An absent, wedged or restarting driver makes `audio` return with a loud sentence
 is bounded, and every answer is immediate by design - a tone is started and answered, then followed with
 `status` (`sdk/audio`'s wire protocol, which is tagged so a late answer is never read as the next one).
 
-## 5. Tab completion and words from elsewhere (rules 8 and 9)
+## 5. Settings that survive a reboot: `/audio.settings`
+
+**The volume and the mute are kept on disk**, in plain labelled lines, readable with `read /audio.settings`:
+
+```
+volume 60
+muted no
+```
+
+- **The driver owns the file.** It reads it once when it comes up and writes it after a change the codec
+  did not contradict - a setting the codec refused is not written. `on` and `off` are NOT kept: audio
+  comes up on at every boot.
+- **Never written while a tone plays.** A write blocks the driver, and a slow one mid-tone would starve
+  the sound; a change made during a tone is written when it ends.
+- **Bounded and tolerant.** The file is read in one piece, at most 256 bytes; a line the driver does not
+  know is ignored and said once in the log; no file means the defaults (volume 50, unmuted). Where `fs`
+  is absent - no data disk - or does not answer, the driver says so once, carries on with what it holds,
+  and says a failed write once rather than on every change.
+- `output` joins the file with `audio output`, when that is built.
+
+## 6. Tab completion and words from elsewhere (rules 8 and 9)
 
 `audio` completes its BUILT verbs, and `off` completes `hard`. The words people bring from other systems
 are hints, never aliases: `beep` and `speaker-test` point to `audio tone`, `amixer` and `alsamixer` to

@@ -9,8 +9,8 @@
 # What it holds (docs/audio.md): the register window; a DMA arena for the command rings, the buffer
 # descriptor list and the ring of sound, confined behind the IOMMU where there is one; and an INTERRUPT,
 # because the stream interrupts as each period plays and the driver refills then. On its death the
-# kernel stops the device's bus mastering and releases the confinement. No peers yet: each grant arrives
-# with the step that uses it (3.1).
+# kernel stops the device's bus mastering and releases the confinement. One peer, `fs`, for
+# `/audio.settings`: the volume and the mute, kept across a restart.
 name    = "audio-driver"
 version = "0.1.0"
 
@@ -28,5 +28,6 @@ hw_pci_bar = 0
 # NO VECTOR NUMBER: the driver declares only that it needs an interrupt, and the kernel allocates one
 # from its MSI pool at spawn (routing a vector is authority - see the same line in xhci's contract).
 hw_pci_irq = true
+ipc_send    = ["fs"]
 ipc_receive = ["audio-driver"]
 log_write   = true

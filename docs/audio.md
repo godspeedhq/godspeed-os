@@ -4,8 +4,9 @@
 `feat/audio`. The driver resets an Intel High Definition Audio controller, finds its codec and output
 path, moves codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's
 `audio` sets the volume, mutes, powers the codec down and up and plays tones (`utilities/57_audio.md`),
-each checked against the WAV QEMU wrote. Interrupt-driven, IOMMU-confined, restartable. Not yet:
-`/audio.settings`, `outputs`, `play`, `debug`, system sounds, the shortcuts; not run on hardware (A6).**
+each checked against the WAV QEMU wrote; the volume and the mute survive a reboot in `/audio.settings`.
+Interrupt-driven, IOMMU-confined, restartable. Not yet: `outputs`, `play`, `debug`, system sounds, the
+shortcuts; not run on hardware (A6).**
 
 Audio is two things at once here. It is the system's first sound, and it is the planned **independent
 test of `gs::driver`** (`docs/driver-library.md`, "Wi-Fi discovers; audio tests"): a second kind of
@@ -49,7 +50,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A1** | Reset, find the codecs, walk the widget graph, report an output path. Immediate Command registers; no DMA, no interrupt | QEMU - **built** |
 | **A2** | CORB/RIRB, the command rings the spec requires (Immediate Command is optional, and unknown on the T630's FCH). The first DMA - used only on QEMU's codec until A6, for the T630's own reasons | QEMU - **built** |
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
-| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol and the first verbs built** (status, info, volume, mute, unmute, on, off, off hard, tone); settings, outputs, debug and system sounds to come |
+| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone) and `/audio.settings` built**; outputs, debug and system sounds to come |
 | A5 | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU |
 | A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
@@ -655,6 +656,32 @@ about QEMU's model, recorded so a hardware run is not compared against it.
 - **The new utility met every gate it should**, each one adding a registration: Commandment X (no spec
   under `utilities/` for a verb the shell answers), the per-verb `help` check, and `site_check` (a page and
   its counts on the website). That is the eight-sites table in `utilities/0_conventions.md` working.
+
+## Step A4, `/audio.settings` (2026-10-03)
+
+The volume and the mute are kept in `/audio.settings` (`utilities/57_audio.md` section 5), through
+`gs::fs` rather than a third hand-built `fs` client: its wait is the kernel's `CallDeadline`, which takes
+the matching reply and leaves everything else queued - so a stream interrupt or a client's request that
+arrives during a settings write is still there afterwards. The driver gained one peer, `fs`, wired by the
+supervisor and pinned in `COMMANDMENTS.baseline.toml` with its reason.
+
+**Not written while a tone plays.** A write blocks the serve loop for as long as `fs` takes, and the ring
+holds 341 ms of sound; a change made during a tone marks the settings dirty and is written when it ends.
+
+**Verified in QEMU** with a formatted AHCI data disk (`build/audio_settings1_qemu.log`,
+`build/audio_settings2_qemu.log`), as predicted before the runs:
+
+```
+boot 1: audio-driver: no /audio.settings yet - starting at the defaults; it is written at the first change
+        audio volume 30 / audio mute / read /audio.settings  ->  volume 30, muted yes
+boot 2: audio-driver: settings read from /audio.settings - volume 30, muted
+        audio-driver: volume 30, muted, on node 0x02 (74 steps) - verified
+        audio status -> volume 30, muted yes; unmute and volume 75 rewrote the file
+```
+
+And with no data disk (`build/audio_settings0_qemu.log`): `fs` answers "storage unavailable", the driver
+says so once at the load and once at the first failed write - not again on the next change - and the
+volume keeps working in memory.
 
 ## Found while preparing
 

@@ -579,8 +579,8 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // A2 ADDS A DMA ARENA (`dma_pages` below): the command rings and a ring of sound. On this driver's
     // death the kernel clears its device's bus mastering, keyed on the device it was given
     // (`kernel/src/task/scheduler.rs`). WITH an interrupt (`pci_irq`): the stream interrupts as each
-    // period is played and the driver refills then; the kernel picks the vector from its MSI pool. No
-    // peers: grants arrive with the step that uses them (§3.1).
+    // period is played and the driver refills then; the kernel picks the vector from its MSI pool.
+    // One peer, `fs`, for `/audio.settings` - the volume and the mute kept across a restart (A4).
     //
     // CONFINED behind the IOMMU (§6.4), where there is one: every DMA the controller makes - the command
     // rings, the buffer descriptor list, the ring of sound - is inside the arena, so nothing it does
@@ -589,7 +589,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // device it was given, not its name (`kernel/src/task/scheduler.rs`).
     #[cfg(has_audio_driver)]
     ("audio-driver", AUDIO_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     16 * 1024 * 1024, 2, &[], 0, 0,
+     16 * 1024 * 1024, 2, &["fs"], 0, 0,
      godspeed_sdk::service_context::hwclass::pci_irq(0x04_03_00, 0, true)),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -1661,9 +1661,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // audio-driver (docs/audio.md). MANAGED: the kernel stops a dead driver's bus mastering by the
     // device it was given (not by name), so a death is quiesced and restarted like any other driver's.
-    // `ensure_mapped` adopts a running instance on a supervisor respawn.
+    // Wired to `fs` for `/audio.settings` (the storage chain is up by here, so the cap wires at spawn);
+    // `ensure_wired` adopts a running instance on a supervisor respawn.
     #[cfg(has_audio_driver)]
-    ensure_mapped(&ctx, &mut name_map, "audio-driver", 0xFFFF);
+    ensure_wired(&ctx, &mut name_map, "audio-driver", &["fs"]);
 
    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 

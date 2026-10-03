@@ -630,6 +630,127 @@ fn fill(d: &Dma, from: usize, bytes: usize, tone: &mut Sine, tone_left: &mut usi
     }
 }
 
+// ---- A4: settings that survive a restart (`/audio.settings`) ------------------------------------------
+
+/// Where the volume and the mute are kept (`utilities/57_audio.md`). Plain labelled lines, readable with
+/// `read /audio.settings`. The driver owns the file: it reads it once when it comes up and writes it after
+/// a change. `on` and `off` are deliberately NOT kept - audio comes up on at every boot.
+const SETTINGS_PATH: &str = "/audio.settings";
+/// The whole file is read in one piece into this many bytes. Two lines need about twenty; a file larger
+/// than this is not one this driver wrote, and is ignored with a line rather than half-read.
+const SETTINGS_MAX: usize = 256;
+/// How long one `fs` exchange may take before it counts as unanswered, and how many times the load asks.
+/// At boot `fs` may still be mounting; a few seconds of patience, then the defaults and a line - never a
+/// wait the driver cannot get out of.
+const SETTINGS_PATIENCE_SECS: i64 = 2;
+const SETTINGS_TRIES: u32 = 3;
+const SETTINGS_RETRY_PAUSE: Budget = Budget::ms(1000);
+
+/// What the file holds.
+#[derive(Clone, Copy)]
+struct Settings {
+    volume: u8,
+    muted: bool,
+}
+
+/// Read the settings, or `None` for the defaults - with the reason said once in the log either way.
+fn load_settings(ctx: &ServiceContext) -> Option<Settings> {
+    use gs::Error;
+    for attempt in 1..=SETTINGS_TRIES {
+        let mut fs = gs::fs::Fs::new(ctx).patience_secs(SETTINGS_PATIENCE_SECS);
+        let mut buf = [0u8; SETTINGS_MAX];
+        match fs.read_into(SETTINGS_PATH, &mut buf) {
+            Ok(n) => return parse_settings(ctx, &buf[..n]),
+            Err(Error::NotFound) => {
+                ctx.log("audio-driver: no /audio.settings yet - starting at the defaults; it is written at the first change");
+                return None;
+            }
+            Err(Error::NoFilesystem) => {
+                ctx.log("audio-driver: no filesystem on this machine's disk - settings are kept in memory only");
+                return None;
+            }
+            Err(Error::BufferTooSmall) => {
+                ctx.log_fmt(format_args!(
+                    "audio-driver: /audio.settings is larger than {} bytes - not a file this driver wrote; ignored, starting at the defaults",
+                    SETTINGS_MAX));
+                return None;
+            }
+            Err(e) if attempt < SETTINGS_TRIES && e.retry_is_safe() => {
+                delay::hold_parked(ctx, SETTINGS_RETRY_PAUSE);
+            }
+            Err(e) => {
+                ctx.log_fmt(format_args!(
+                    "audio-driver: could not read /audio.settings ({}) after {} attempt(s) - starting at the defaults",
+                    e.as_str(), attempt));
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// `volume N` and `muted yes|no`, one per line. A line this driver does not know is ignored and said once;
+/// a value out of range keeps the default for that setting and is said too.
+fn parse_settings(ctx: &ServiceContext, text: &[u8]) -> Option<Settings> {
+    let mut s = Settings { volume: DEFAULT_VOLUME, muted: false };
+    let mut ignored = 0u32;
+    for line in text.split(|&b| b == b'\n') {
+        let line = core::str::from_utf8(line).unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line.split_once(' ').map_or((line, ""), |(k, v)| (k, v.trim()));
+        match (key, value) {
+            ("volume", v) => match v.parse::<u8>() {
+                Ok(n) if n <= wire::VOLUME_MAX => s.volume = n,
+                _ => ignored += 1,
+            },
+            ("muted", "yes") => s.muted = true,
+            ("muted", "no") => s.muted = false,
+            _ => ignored += 1,
+        }
+    }
+    if ignored > 0 {
+        ctx.log_fmt(format_args!("audio-driver: /audio.settings has {} line(s) this driver does not understand - ignored", ignored));
+    }
+    ctx.log_fmt(format_args!(
+        "audio-driver: settings read from /audio.settings - volume {}, {}", s.volume, if s.muted { "muted" } else { "unmuted" }));
+    Some(s)
+}
+
+/// A line of text into a fixed buffer, for the settings file. Truncation is impossible at this size; if
+/// it ever happened the write would be refused rather than a cut file saved.
+struct Line {
+    buf: [u8; 64],
+    len: usize,
+    overflow: bool,
+}
+
+impl core::fmt::Write for Line {
+    fn write_str(&mut self, t: &str) -> core::fmt::Result {
+        let b = t.as_bytes();
+        if self.len + b.len() > self.buf.len() {
+            self.overflow = true;
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+        self.len += b.len();
+        Ok(())
+    }
+}
+
+/// Write the settings. A failure is returned for the caller to report; `OutcomeUnknown` means the file may
+/// or may not hold them, and is never re-sent as though it had not happened.
+fn save_settings(ctx: &ServiceContext, s: Settings) -> Result<(), gs::Error> {
+    use core::fmt::Write;
+    let mut l = Line { buf: [0; 64], len: 0, overflow: false };
+    let _ = write!(l, "volume {}\nmuted {}\n", s.volume, if s.muted { "yes" } else { "no" });
+    if l.overflow {
+        return Err(gs::Error::InvalidInput);
+    }
+    gs::fs::Fs::new(ctx).patience_secs(SETTINGS_PATIENCE_SECS).write(SETTINGS_PATH, &l.buf[..l.len])
+}
+
 // ---- A4: the driver as a service -----------------------------------------------------------------------
 
 /// A tone that is playing: what is left to generate, and how far the stream has read.
@@ -675,6 +796,11 @@ struct Player<'a> {
     muted: bool,
     tone: Option<Tone>,
     underruns_total: u32,
+    /// A change to the volume or the mute not yet written to `/audio.settings`. Written when nothing is
+    /// playing: an `fs` write blocks the serve loop, and a slow one mid-tone would starve the ring.
+    settings_dirty: bool,
+    /// The last write failed and said so; the next failure is not said again until one succeeds.
+    settings_failing: bool,
 }
 
 /// Why there is nothing to play on, when there is not (`wire::no_device`).
@@ -968,6 +1094,8 @@ impl<'a> Player<'a> {
                 out[0] = wire::OK;
                 out[1] = v;
                 out[2] = if on { self.apply_volume() } else { wire::UNVERIFIED };
+                // Kept on disk unless the codec CONTRADICTED it - a setting it refused is not written.
+                self.settings_dirty |= out[2] != wire::CONTRADICTED;
                 3
             }
             wire::OP_MUTE => {
@@ -982,6 +1110,7 @@ impl<'a> Player<'a> {
                 out[0] = wire::OK;
                 out[1] = self.volume;
                 out[2] = if on { self.apply_volume() } else { wire::UNVERIFIED };
+                self.settings_dirty |= out[2] != wire::CONTRADICTED;
                 3
             }
             wire::OP_POWER => {
@@ -1140,12 +1269,17 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
         h, d, path, pin_device, amp,
         sd: SD_BASE + iss * SD_STRIDE, // the first output stream follows the input streams
         power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false, tone: None, underruns_total: 0,
+        settings_dirty: false, settings_failing: false,
     };
+    if let Some(s) = load_settings(ctx) {
+        p.volume = s.volume;
+        p.muted = s.muted;
+    }
     let v = p.apply_volume();
     match amp {
         Some(a) => ctx.log_fmt(format_args!(
-            "audio-driver: volume {} on node {:#04x} ({} steps) - {}",
-            DEFAULT_VOLUME, a.node, a.steps, verdict_word(v))),
+            "audio-driver: volume {}{} on node {:#04x} ({} steps) - {}",
+            p.volume, if p.muted { ", muted," } else { "" }, a.node, a.steps, verdict_word(v))),
         None => ctx.log("audio-driver: the output path has no amplifier - volume cannot be set on this codec"),
     }
     Device::Ready(p)
@@ -1249,6 +1383,20 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
         }
         if let Device::Ready(p) = &mut dev {
             p.service(irq);
+            if p.settings_dirty && p.tone.is_none() {
+                p.settings_dirty = false;
+                match save_settings(ctx, Settings { volume: p.volume, muted: p.muted }) {
+                    Ok(()) => p.settings_failing = false,
+                    Err(e) if !p.settings_failing => {
+                        p.settings_failing = true;
+                        ctx.log_fmt(format_args!(
+                            "audio-driver: could not write /audio.settings ({}) - the setting holds until this driver restarts{}",
+                            e.as_str(),
+                            if e == gs::Error::OutcomeUnknown { "; the file may or may not have it" } else { "" }));
+                    }
+                    Err(_) => {}
+                }
+            }
         }
     }
 }
