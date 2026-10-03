@@ -7554,7 +7554,14 @@ fn cmd_net(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
 
 // ---- audio (utilities/57_audio.md) ----------------------------------------------------------------------
 
-const AUDIO_DRIVER: &str = "audio-driver";
+/// The audio drivers, one per kind of device, all speaking `sdk/audio`'s protocol: HD Audio on x86, the
+/// PWM jack on the Pis. A machine runs at most one; `audio` asks whichever it is.
+const AUDIO_DRIVERS: [&str; 2] = ["audio-driver", "pwm-audio"];
+
+/// The audio driver this machine runs, or `None` when it runs none.
+fn audio_driver(ctx: &ShellCtx) -> Option<&'static str> {
+    AUDIO_DRIVERS.iter().copied().find(|n| slot_of(ctx, n).is_some())
+}
 
 /// The `audio-driver` request/reply vocabulary: ONE definition, in the shared crate (`godspeed_audio::wire`),
 /// read by this shell and by the driver - the shape `wifi_wire` arrived at after a hand-kept mirror drifted.
@@ -7591,13 +7598,14 @@ fn audio_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     };
     // A send that fails at once is a stale capability (the driver restarted since this shell wired it),
     // never a deadline: reacquire by name and send ONCE. A real timeout is never re-sent.
+    let driver = audio_driver(ctx)?;
     let s0 = ctx.read_tsc();
-    let mut got = ctx.request_with_reply_ms_sifted(AUDIO_DRIVER, &msg, max_ms, sift);
+    let mut got = ctx.request_with_reply_ms_sifted(driver, &msg, max_ms, sift);
     if got.is_none() && ctx.read_tsc().wrapping_sub(s0) < ctx.duration_cycles(250) {
-        if !ctx.reacquire_by_name(AUDIO_DRIVER) {
+        if !ctx.reacquire_by_name(driver) {
             return None;
         }
-        got = ctx.request_with_reply_ms_sifted(AUDIO_DRIVER, &msg, max_ms, sift);
+        got = ctx.request_with_reply_ms_sifted(driver, &msg, max_ms, sift);
     }
     got.map(|r| Message::from_bytes(r.payload_bytes().get(2..).unwrap_or(&[])))
 }
@@ -7664,9 +7672,9 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
     };
 
     // Then the hardware question, which every verb shares.
-    if slot_of(ctx, AUDIO_DRIVER).is_none() {
+    if audio_driver(ctx).is_none() {
         out.line_fmt(ctx, format_args!("no audio hardware on this machine"));
-        out.line_fmt(ctx, format_args!("  (no `{}` is running - this machine has no HD Audio controller, or none is driven yet)", AUDIO_DRIVER));
+        out.line_fmt(ctx, format_args!("  (no audio driver is running - `audio-driver` on x86, `pwm-audio` on the Pis - so there is none to ask)"));
         return Ok(());
     }
     match verb {
@@ -7701,7 +7709,7 @@ fn audio_reply(ctx: &ShellCtx, out: &mut Out, r: Option<Message>, len: usize) ->
                 no_device::NO_PATH => "the codec offers no output this driver can use",
                 no_device::UNVERIFIED_CODEC => "this codec has not had playback verified yet - the driver surveyed it and stopped (docs/audio.md, A6)",
                 no_device::NO_ARENA => "the driver has no DMA memory to play from",
-                _ => "the driver could not bring the codec up - the serial log says where",
+                _ => "the driver could not bring the device up - the serial log says why",
             }));
             Err(ShellError::Unknown)
         }
@@ -7768,6 +7776,17 @@ fn audio_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use audio_wire::*;
     let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_INFO], AUDIO_REPLY_MS), INFO_LEN)?;
     let p = r.payload_bytes();
+    if p[26] == KIND_PWM {
+        // A jack driven by PWM: no codec to name, and the resolution is the PWM's own.
+        let (rate, ring, range) = (get_u32(p, 11), get_u32(p, 15), get_u16(p, 27) as u32);
+        let bits = 31 - range.max(1).leading_zeros();
+        out.line_fmt(ctx, format_args!("controller PWM, driving the 3.5 mm jack through the board's filter"));
+        out.line_fmt(ctx, format_args!("resolution {} steps per sample (about {} bits) at {} Hz", range, bits, rate));
+        out.line_fmt(ctx, format_args!("volume     applied to the samples by the driver - there is no amplifier"));
+        out.line_fmt(ctx, format_args!("ring       {} ms", ring as u64 * 1000 / (rate.max(1) as u64 * 4)));
+        out.line_fmt(ctx, format_args!("refill     by polling the DMA engine's position"));
+        return Ok(());
+    }
     out.line_fmt(ctx, format_args!("controller HD Audio {}.{}", p[24], p[25]));
     out.line_fmt(ctx, format_args!("codec      {:04x}:{:04x} at address {}", get_u16(p, 1), get_u16(p, 3), p[5]));
     out.line_fmt(ctx, format_args!("path       converter {:#04x} -> pin {:#04x} ({})", p[6], p[7], device_name(p[8] as u32)));

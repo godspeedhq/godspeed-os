@@ -258,6 +258,13 @@ static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 static WIFI_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_WIFI_DRIVER_ELF"));
 #[cfg(has_audio_driver)]
 static AUDIO_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_AUDIO_DRIVER_ELF"));
+#[cfg(has_pwm_audio)]
+static PWM_AUDIO_ELF: &[u8] = include_bytes!(env!("SVC_PWM_AUDIO_ELF"));
+/// Which Pi `pwm-audio` runs on, as its `mode` (2 = Pi 2, 4 = Pi 4): a board fact from `build.rs`.
+#[cfg(all(has_pwm_audio, pwm_audio_pi4))]
+const PWM_AUDIO_BOARD: u32 = 4;
+#[cfg(all(has_pwm_audio, not(pwm_audio_pi4)))]
+const PWM_AUDIO_BOARD: u32 = 2;
 
 /// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
 /// every service whose image the supervisor holds.
@@ -591,6 +598,14 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("audio-driver", AUDIO_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      16 * 1024 * 1024, 2, &["fs"], 0, 0,
      godspeed_sdk::service_context::hwclass::pci_irq(0x04_03_00, 0, true)),
+    // The Pis' 3.5 mm jack (docs/audio.md, "The Pis"): PWM fed by the SoC's DMA engine. Named by its
+    // device kind - the kernel routes the jack's pins and starts the PWM clock as part of the grant,
+    // then maps the PWM and DMA pages and grants a DMA arena. `mode` says which Pi. One peer, `fs`, for
+    // `/audio.settings`.
+    #[cfg(has_pwm_audio)]
+    ("pwm-audio", PWM_AUDIO_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 2, &["fs"], 0, PWM_AUDIO_BOARD,
+     godspeed_sdk::service_context::hwclass::AUDIO_PWM),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -1098,7 +1113,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 16;
+const MANAGED_N: usize = 17;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -1122,8 +1137,9 @@ const MANAGED: [&str; MANAGED_N] =
      // The power policy (docs/power.md). A respawn knows of no lease and puts the clock at its minimum,
      // which is why its absence from this list would matter: dead, nothing would answer a lease at all.
      "power",
-     // The HD Audio driver (docs/audio.md). x86-only today; listed unconditionally for the reason above.
-     "audio-driver"];
+     // The audio drivers (docs/audio.md): HD Audio on x86, the PWM jack on the Pis. Listed
+     // unconditionally for the reason above.
+     "audio-driver", "pwm-audio"];
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -1665,6 +1681,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // `ensure_wired` adopts a running instance on a supervisor respawn.
     #[cfg(has_audio_driver)]
     ensure_wired(&ctx, &mut name_map, "audio-driver", &["fs"]);
+    // The Pis' jack, the same way (docs/audio.md).
+    #[cfg(has_pwm_audio)]
+    ensure_wired(&ctx, &mut name_map, "pwm-audio", &["fs"]);
 
    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 
@@ -1828,6 +1847,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("supervisor: audio-driver died, restarting");
                 if respawn_retry(&ctx, &mut name_map, "audio-driver") { ctx.log("supervisor: audio-driver restarted"); }
                 else { ctx.log("supervisor: audio-driver restart FAILED"); }
+            }
+            // The Pis' jack. Its DMA engine keeps reading the ring while it is dead - a short loop of
+            // whatever was last written, until the respawn resets the channel and silences the ring.
+            "pwm-audio" => {
+                ctx.log("supervisor: pwm-audio died, restarting");
+                if respawn_retry(&ctx, &mut name_map, "pwm-audio") { ctx.log("supervisor: pwm-audio restarted"); }
+                else { ctx.log("supervisor: pwm-audio restart FAILED"); }
             }
             _ => {}
         }

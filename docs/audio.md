@@ -730,8 +730,13 @@ serial port, where the driver's own log line ("0 ms of silence") also arrives. T
 blocks at frequencies nobody asked for, and found five. Measured before changing anything: each of the
 five is the 100 ms block that straddles a JOIN - 1000 Hz to silence, 1000 to 660, 660 to 330, 330 to 660 -
 so its crossings come from two sounds. The check now requires every such block to sit at a join.
+A later run found the rule still too narrow, again measured before it was changed: a join between the
+volume-50 and volume-100 tones (the same frequency, a different LEVEL, phases not lined up) and a
+660-to-330 join that spread over two blocks. A sound is now (frequency, level), and an odd block passes
+only in a run of at most two between sounds that differ; a glitch planted inside a steady 660 Hz run is
+still caught - checked by replaying the rule over the capture with one block altered.
 
-## The Pis and the VisionFive (researched 2026-10-03, nothing built)
+## The Pis and the VisionFive (researched 2026-10-03; the Pis' jack BUILT the same day, not yet heard)
 
 Researched from Circle (a bare-metal Raspberry Pi library), the BCM2835 and BCM2711 datasheets, the
 Raspberry Pi device trees and StarFive's vendor kernel. The full notes, each item marked quoted or
@@ -756,6 +761,56 @@ Pi 4's `DevicePower` already set: the kernel does the shared parts (the pin mux,
 of the grant, at spawn, and the driver is granted the PWM page and the DMA arena. The DMA channel page is
 the open item: granting it hands over every channel, which on these boards (no IOMMU) is no more DMA
 reach than the driver already has, but it is still more than the grant names. A proposal, not made.
+
+### Built: `pwm-audio` and the kernel's part (2026-10-03, on the operator's go-ahead)
+
+**The kernel** (CLAUDE.md 12.3, the 2026-10-03 amendment): a new device kind, `HwClass::AudioPwm`, that
+every port answers through the seam (`audio_pwm_present`) - true on the Pi 2, true on the Pi 4 only where a
+boot probe found PWM1 answering. Granting it, the Pi's arch layer routes the jack's two pins to the PWM
+(pulls off) and starts the PWM clock from PLLD (/2 on the Pi 2, /6 on the Pi 4), then maps the PWM page
+at +0 and the DMA engine's page at +0x1000 as one 8 KiB window, and grants a 36-page DMA arena kept across
+respawns. `pwm-audio` joins the two restart lists. `hw_class_known` is now DERIVED from the class decoder:
+it read `class <= 7`, a second copy of the decoder's range, and refused every spawn of the eighth kind
+until the first boot showed it.
+
+**The driver** (`services/pwm-audio`) speaks `sdk/audio`'s protocol, so `audio` is the same on every
+board, and shares the test tone and `/audio.settings` with `audio-driver` - both moved into `sdk/audio`
+when the second driver needed them. The DMA engine loops a 16-period ring (about 370 ms at 44.1 kHz)
+that holds mid-scale silence when nothing plays, so sound starts and stops without a click; the driver
+writes ahead of the engine's source address, polled every 10 ms. Volume is a square law applied to the
+samples. A stream begins half a ring ahead of the engine, the cushion `audio-driver` gets by not starting
+until half its ring is full. Which Pi it runs on comes from the supervisor's spawn row (`mode` 2 or 4),
+declared once in the supervisor's per-board build facts.
+
+**The PACING CHECK, which QEMU found.** Before looping the ring, the driver plays ONE period through a
+control block that ends, and times it: a PWM that asks for its words at the sample rate takes about 23 ms.
+That one measurement proves the clock, the pins, the DMA request line and the engine together, at the
+right rate. Too fast means the engine is not paced at all and no ring is looped into it; never finishing
+means the PWM never asked for data (its clock is not running).
+
+**Verified in QEMU, which is all QEMU can verify here** (`raspi4b` and `raspi2b` model no working PWM
+audio):
+
+- **Pi 4:** the boot probe finds no PWM1 (`audio: no PWM1 at 0xFE20C800 ... no audio jack`), nothing is
+  granted, the driver serves "no device" and `audio status` says `no audio hardware on this machine`. The
+  first boot, before the probe existed, showed why it is needed: the driver's first write to the absent
+  block was an external abort, and the supervisor respawned it forever.
+- **Pi 2:** `raspi2b`'s PWM holds its registers (CTL reads back `0xa1e1`), but its DMA model runs a
+  transfer to its end inside the write that starts it. The first boot looped a ring into it and the whole
+  emulated machine froze at that write - found by trace lines, one per step, the last one printed being
+  "writing CS START". With the pacing check the driver measures `one period went in 0 us where a paced
+  PWM takes 23219 us`, refuses, and the machine boots to its prompt.
+- Every port builds with every check; the x86 identity suite and `osdev test audio` pass on the changed
+  kernel.
+
+**What only the hardware can show, predicted before it is flashed.** On a real Pi 4 the boot log should
+read `audio: PWM1 present`, then `jack pins 40/41 on PWM1, PWM clock PLLD/6`, then `pwm-audio: paced - one
+period of 1024 frames took` about 23,200 us, then `Pi 4 jack up - PWM at 44100 Hz, range 2834 (about 11
+bits)`. `audio tone 440 2` should be heard in headphones or powered speakers in the 3.5 mm jack, with no
+click at its start or end; `audio volume 20` audibly quieter; `audio play` of a WAV on the disk heard
+whole. On the Pi 2 the same, with pins 40/45, PLLD/2 and range 5669 (about 12 bits). If the pacing check
+measures a period far from 23 ms, the PWM clock is not what the driver assumes, and the number says by
+how much.
 
 **HDMI on the Pis** - the operator's TV is a better test than headphones. The firmware sets HDMI up at
 boot (our console uses it), and Circle drives HDMI audio bare-metal on Pi 1 to 4 by feeding the HDMI

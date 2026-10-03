@@ -397,6 +397,10 @@ pub mod hwclass {
     /// Not a device: the software-raised test interrupt (§22 IR1). A class, so that the probe which
     /// receives it names a CLASS like any driver and the kernel states the vector.
     pub const TEST_IRQ:    u32 = 7;
+    /// An audio jack driven by PWM and fed by the SoC's DMA engine (the Pis, `docs/audio.md`). The kernel
+    /// routes the jack's pins and starts the PWM clock as part of the grant, then maps the PWM block and
+    /// the DMA engine side by side and grants a DMA arena.
+    pub const AUDIO_PWM:   u32 = 8;
 
     /// Bit 31: the value is a PCI CLASS CODE, not one of the named kinds above.
     pub const PCI:         u32 = 1 << 31;

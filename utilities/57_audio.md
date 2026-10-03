@@ -9,7 +9,9 @@ service over IPC. The driver owns the controller; the shell owns the words.
 **Built and run in QEMU only** (`intel-hda` with the `hda-output` codec, `mixer=on`), on branch
 `feat/audio`: every verb in section 1 answered as section 2 says, and the WAV QEMU wrote agrees - the
 level follows the volume, volume 0 and mute are silent, a tone lasts as long as asked and `q` cuts it
-short (`docs/audio.md`, "Step A4, first half"). Not run
+short (`docs/audio.md`, "Step A4, first half"). **On the Pis** the same verbs reach `pwm-audio`, which
+drives the 3.5 mm jack by PWM - built, run in QEMU (which can only show that it refuses an emulator that
+does not pace its DMA), and not yet heard on a board. Not run
 on hardware: on the T630 the driver surveys the codec and stops before playback, and every verb below
 answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
 

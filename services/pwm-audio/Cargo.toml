@@ -1,0 +1,14 @@
+[package]
+name = "pwm-audio"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pwm-audio"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }
+# The request protocol, the test tone and `/audio.settings`, shared with `audio-driver` (sdk/audio).
+godspeed-audio = { path = "../../sdk/audio" }

@@ -917,6 +917,11 @@ extern "C" fn boot_high() -> ! {
         // "unavailable" rather than abort the kernel (see `rng_probe`).
         #[cfg(feature = "pi4")]
         rng_probe();
+        // The audio jack's PWM block, the same way: QEMU's `raspi4b` models none, and a driver granted
+        // a block that aborts on its first write dies and is respawned forever (found that way,
+        // 2026-10-03). Probed here, so `pwm-audio` is granted the jack only where it answers.
+        #[cfg(feature = "pi4")]
+        pwm_probe();
         if genet::probe().is_some() {
             // The controller answered, and that is the LAST thing this kernel does about ethernet.
             // Commandment I: an ethernet driver is not the kernel's business (§4.4). The kernel
@@ -1269,6 +1274,22 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
             // the service a window whose first read aborts, and the supervisor would respawn it
             // forever. The census runs earlier in the same boot (`sdio::census`).
             "wifi-driver" if sdio::radio_present() => (0xFE30_0000, 1),
+            // The audio jack (`docs/audio.md`): TWO pages that are not adjacent, mapped side by side -
+            // the PWM block at +0 (PWM1 is at +0x800 within it) and the DMA engine at +0x1000. The DMA
+            // page holds all fifteen channels and their shared status, so granting it grants every
+            // channel: no more DMA reach than an unconfined driver has on this board anyway (6.4), and
+            // more than the grant names, which is recorded.
+            "pwm-audio" if audio_pwm_present() => {
+                if !audio_jack_prepare() {
+                    crate::kprintln!("audio: the PWM clock did not report stopping - started anyway; the driver will say what it hears");
+                }
+                let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+                    | PageFlags::NO_EXEC | PageFlags::PCD;
+                pt.map(VirtAddr(DRIVER_MMIO_VA), PhysAddr(0xFE20_C000), flags).ok()?;
+                pt.map(VirtAddr(DRIVER_MMIO_VA + 0x1000), PhysAddr(0xFE00_7000), flags).ok()?;
+                crate::kprintln!("audio: jack pins 40/41 on PWM1, PWM clock PLLD/{} - granting PWM + DMA", AUDIO_PWM_DIVI);
+                return Some((DRIVER_MMIO_VA, 0x2000));
+            }
             _ => return None,
         };
 
@@ -1326,6 +1347,27 @@ const RNG200_BASE: usize = 0xFE10_4000;
 /// believe the answer.
 #[cfg(feature = "pi4")]
 static RNG_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the audio jack's PWM block (PWM1) answered the boot probe - see `pwm_probe`.
+#[cfg(feature = "pi4")]
+static PWM_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Probe PWM1 once at boot and record whether it is there, said either way. The posture of `rng_probe`
+/// and GENET: probe once, then believe the answer.
+#[cfg(feature = "pi4")]
+fn pwm_probe() {
+    // SAFETY: 4-byte aligned (PWM1's CTL register), inside the peripheral Device mapping the kernel
+    // built; `probe_read32` survives the external abort an absent block raises.
+    let answered = unsafe { uaccess::probe_read32(mmio(0xFE20_C800) as u64) }.is_some();
+    PWM_PRESENT.store(answered, core::sync::atomic::Ordering::Release);
+    put_str(if answered {
+        b"audio: PWM1 present - the 3.5 mm jack can be driven" as &[u8]
+    } else {
+        b"audio: no PWM1 at 0xFE20C800 (this machine has none) - no audio jack" as &[u8]
+    });
+    put_str(b"
+");
+}
 
 /// Probe the RNG200 once at boot, inside the probe window, and record whether it is there. Said either
 /// way, so a missing `rng:` line means this never ran rather than that the block is absent.
@@ -3132,6 +3174,71 @@ pub mod rtc {
 /// set was `pci::NIC_FOUND`, which put a non-PCI device into a PCI variable and is exactly the
 /// conflation step D removes.
 pub fn soc_nic_present() -> bool { GENET_PRESENT.load(core::sync::atomic::Ordering::Acquire) }
+
+/// Does this board drive an audio jack by PWM (`HwClass::AudioPwm`, `docs/audio.md`)? The Pi 4 does:
+/// PWM1's two channels on GPIO 40 (right) and 41 (left), through the board's filter to the 3.5 mm jack.
+/// Only where the boot probe found PWM1 answering (`pwm_probe`): not QEMU's `raspi4b`, which models
+/// none, and not the `virt` variant, which has no Pi peripherals at all.
+pub fn audio_pwm_present() -> bool {
+    #[cfg(feature = "pi4")]
+    { PWM_PRESENT.load(core::sync::atomic::Ordering::Acquire) }
+    #[cfg(not(feature = "pi4"))]
+    { false }
+}
+
+/// The clock manager's PWM pair and the GPIO registers the jack needs (BCM2711 peripherals). Every
+/// clock-manager write carries the password in the top byte, or the block ignores it.
+#[cfg(feature = "pi4")]
+const CM_PWMCTL: usize = 0xFE10_10A0;
+#[cfg(feature = "pi4")]
+const CM_PWMDIV: usize = 0xFE10_10A4;
+#[cfg(feature = "pi4")]
+const CM_PASSWORD: u32 = 0x5A << 24;
+/// PLLD, 750 MHz on this board: the steady source. PLLC is the core clock and moves with it.
+#[cfg(feature = "pi4")]
+const CM_SRC_PLLD: u32 = 6;
+/// PLLD / 6 = 125 MHz, the PWM clock `pwm-audio` divides into its sample rate (`probe_mode` 4).
+#[cfg(feature = "pi4")]
+const AUDIO_PWM_DIVI: u32 = 6;
+
+/// Make the audio jack usable, as part of granting it: route its two pins to PWM1 and start the PWM
+/// clock. Both live in SHARED blocks - every pin's function in the GPIO page, every clock in the clock
+/// manager's - so the kernel does them here, as it powers the SD domain before granting the radio's
+/// window, and the driver is granted only the PWM block and the DMA engine (CLAUDE.md 12.3, as amended
+/// for audio). The PWM1 DMA request is muxed with DSI0, and its reset value already selects PWM1.
+///
+/// Circle's sequence (`lib/gpioclock.cpp`): kill the clock and wait for BUSY to clear, set the divider,
+/// set the source, then enable. The BUSY wait is bounded and its failure reported, not fatal.
+#[cfg(feature = "pi4")]
+fn audio_jack_prepare() -> bool {
+    // SAFETY: GPFSEL4, GPIO_PUP_PDN_CNTRL_REG2 and the clock manager's PWM pair are BCM2711 MMIO reached
+    // through `mmio()`. Read-modify-write of GPFSEL4 and the pull register changes only pins 40 and 41;
+    // CM_PWMCTL/DIV belong to the PWM clock alone.
+    unsafe {
+        let fsel4 = mmio(GPIO_BASE + 0x10) as *mut u32;
+        let mut v = fsel4.read_volatile();
+        v = (v & !((7 << 0) | (7 << 3))) | (4 << 0) | (4 << 3); // GPIO40, GPIO41 -> ALT0 = PWM1
+        fsel4.write_volatile(v);
+        // No pull on either: outputs now. REG2 covers GPIO32-47, two bits a pin.
+        let pud2 = mmio(GPIO_BASE + 0xEC) as *mut u32;
+        let p = pud2.read_volatile() & !((3 << 16) | (3 << 18));
+        pud2.write_volatile(p);
+
+        let ctl = mmio(CM_PWMCTL) as *mut u32;
+        let div = mmio(CM_PWMDIV) as *mut u32;
+        ctl.write_volatile(CM_PASSWORD | (1 << 5)); // KILL
+        let mut stopped = false;
+        for _ in 0..1_000_000 {
+            if ctl.read_volatile() & (1 << 7) == 0 { stopped = true; break; } // BUSY clear
+        }
+        div.write_volatile(CM_PASSWORD | (AUDIO_PWM_DIVI << 12));
+        for _ in 0..1000 { core::hint::spin_loop(); }
+        ctl.write_volatile(CM_PASSWORD | CM_SRC_PLLD);
+        for _ in 0..1000 { core::hint::spin_loop(); }
+        ctl.write_volatile(CM_PASSWORD | CM_SRC_PLLD | (1 << 4)); // ENAB
+        stopped
+    }
+}
 static GENET_PRESENT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

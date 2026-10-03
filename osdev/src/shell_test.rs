@@ -10167,16 +10167,36 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(loud >= 18, "tones at the level volume 100 gives (RMS 9500 and up)");
     check!((30..=40).contains(&k660), "about 3.5 s of /song.wav at 660 Hz - the whole file, then the part before q");
     check!((8..=12).contains(&k330), "about 1 s of /mono.wav at 330 Hz");
-    // A 100 ms block that straddles the join between two sounds counts crossings from both, so it reads
-    // as neither. Every block that is none of the three must therefore sit at a JOIN: its neighbours
-    // differ (in frequency, or one is silent). Measured on the first run: five such blocks, each at one.
-    let class = |b: &(u32, u32)| -> u32 {
-        if b.0 <= 500 { 0 } else if (980..=1020).contains(&b.1) { 1000 } else if (647..=673).contains(&b.1) { 660 }
-        else if (323..=337).contains(&b.1) { 330 } else { u32::MAX }
+    // A 100 ms block that straddles the JOIN between two sounds counts crossings from both, so it reads
+    // as neither - and where the two sounds' phases do not line up it loses crossings even when they are
+    // the same frequency. So a sound is (frequency, level), and an odd block is accepted only as part of
+    // a run of at most TWO that sits between sounds that DIFFER in either. A glitch INSIDE a steady sound
+    // - an odd block between two of the same sound - still fails. Measured, not assumed: the first runs
+    // found every odd block at a join, including one between the volume-50 and volume-100 tones (same
+    // frequency, different level) and a 660-to-330 join that spread over two blocks.
+    let sound = |b: &(u32, u32)| -> (u32, u32) {
+        let f = if b.0 <= 500 { 0 } else if (980..=1020).contains(&b.1) { 1000 }
+            else if (647..=673).contains(&b.1) { 660 } else if (323..=337).contains(&b.1) { 330 } else { u32::MAX };
+        let level = if b.0 <= 500 { 0 } else if b.0 < 7500 { 1 } else { 2 };
+        (f, level)
     };
-    let stray = (1..blocks.len().saturating_sub(1)).filter(|&j| {
-        class(&blocks[j]) == u32::MAX && class(&blocks[j - 1]) == class(&blocks[j + 1])
-    }).count();
+    let mut stray = 0usize;
+    let mut j = 1;
+    while j + 1 < blocks.len() {
+        if sound(&blocks[j]).0 != u32::MAX {
+            j += 1;
+            continue;
+        }
+        let start = j;
+        while j + 1 < blocks.len() && sound(&blocks[j]).0 == u32::MAX {
+            j += 1;
+        }
+        let (before, after) = (sound(&blocks[start - 1]), sound(&blocks[j]));
+        if j - start > 2 || before == after {
+            println!("audio-test: odd block(s) {}..{} between {:?} and {:?}", start, j - 1, before, after);
+            stray += 1;
+        }
+    }
     check!(stray == 0, "nothing in the capture but the three frequencies asked for, and the joins between them");
 
     // ---- Boot 2: the settings across a reboot ----

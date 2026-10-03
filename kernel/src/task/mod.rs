@@ -200,6 +200,9 @@ pub const XHCI_DMA_VA:     u64 = 0x2_0000_0000;
 pub static XHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// The arm32 DWC2's permanent DMA reservation, reused across respawns like every other class.
 pub static DWC2_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// The PWM audio driver's arena, kept across its respawns like every other (the DMA engine may still be
+/// reading the ring when a driver dies; the reservation keeps that harmless).
+pub static AUDIO_PWM_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static EHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// Pages of contiguous DMA memory for the **xHCI** driver. The first 32 pages
@@ -222,6 +225,9 @@ const XHCI_DMA_PAGES:      u64 = 32 + 256 + 4;
 /// control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
 /// one constant) regressed back-port enumeration. Keep it small and separate.
 const EHCI_DMA_PAGES:      u64 = 16;
+/// `pwm-audio`: a page of DMA control blocks and a 128 KiB ring of PWM words - 16 periods of 8 KiB,
+/// about 370 ms at 44.1 kHz, which is the margin a POLLED refill needs (no interrupt is routed).
+const AUDIO_PWM_DMA_PAGES: u64 = 36;
 
 /// Maximum named send peers per service.
 /// Send peers a service may be wired with.
@@ -419,6 +425,9 @@ enum HwClass {
     // they stay named. `Dwc2` is soldered to the BCM283x, the framebuffer is a Limine/mailbox
     // handoff, and the test IRQ is software. A name is the only way to refer to them.
     Dwc2,
+    // An audio jack driven by PWM and fed by the SoC's DMA engine (the Pis, `docs/audio.md`): soldered
+    // to the SoC, so named, like the DWC2.
+    AudioPwm,
     Framebuffer,
     TestIrq,
     /// ---- ANY PCI DEVICE, named by what the BUS says it is rather than by what the kernel was
@@ -465,6 +474,8 @@ impl HwClass {
             // one HwClass whose answer is not a scan result, which is why it is a seam member and not
             // a `pci::` scan like the three below it.
             HwClass::Dwc2 => pci::dwc2_present(),
+            // An audio jack driven by PWM, soldered to the SoC like the DWC2: the ARCH answers (the Pis).
+            HwClass::AudioPwm => crate::arch::imp::audio_pwm_present(),
             // Not a bus device at all: the display is found at boot (a Limine descriptor on x86, a GPU
             // mailbox call on the Pi) and the floor that brought it up is the one that knows.
             HwClass::Framebuffer => crate::bootcon::grant().is_some(),
@@ -565,6 +576,7 @@ impl HwClass {
             // xHCI-needs-more special case was the last per-class size in the kernel.
             HwClass::Pci { dma_pages, .. } => dma_pages as u64,
             HwClass::Xhci => XHCI_DMA_PAGES,
+            HwClass::AudioPwm => AUDIO_PWM_DMA_PAGES,
             _ => EHCI_DMA_PAGES,
         }
     }
@@ -572,6 +584,7 @@ impl HwClass {
     fn dma_phys_slot(self) -> &'static portable_atomic::AtomicU64 {
         match self {
             HwClass::Dwc2 => &DWC2_DMA_PHYS,
+            HwClass::AudioPwm => &AUDIO_PWM_DMA_PHYS,
             HwClass::Xhci => &XHCI_DMA_PHYS,
             HwClass::Ehci => &EHCI_DMA_PHYS,
             HwClass::Nic  => &NIC_DMA_PHYS,
@@ -609,6 +622,7 @@ impl HwClass {
         use core::sync::atomic::Ordering::Relaxed;
         match self {
             HwClass::Dwc2 => 0xFFFF, // no PCI on this board, so no bus-master enable to perform
+            HwClass::AudioPwm => 0xFFFF, // the same: an SoC block, not a PCI device
             HwClass::Framebuffer => 0xFFFF, // not a PCI device
             HwClass::TestIrq     => 0xFFFF, // not a device at all - a software-raised vector
             // A SUPPLIED BDF WINS, because it is the caller saying WHICH device rather than the
@@ -682,7 +696,10 @@ pub fn hw_class_known(class: u32) -> bool {
     // acceptable BY DESIGN - that is the whole of step D1. The kernel does not have a list of the
     // ones it knows, because having one is what forced a kernel rebuild per driver.
     if class & HW_PCI_FLAG != 0 { return true; }
-    class <= 7
+    // DERIVED from the decoder, not a second copy of its range: this read `class <= 7`, so adding the
+    // eighth kind (`AudioPwm`) to `hw_class_of` left every spawn of it refused with InvalidArgument -
+    // found by the first boot that tried, in QEMU (`pwm-audio`, 2026-10-03).
+    class == 0 || hw_class_of(class) != HwClass::None
 }
 
 /// `hw_flags` bit 31: the low bits describe a PCI device rather than a named kind.
@@ -822,6 +839,7 @@ fn hw_class_of(class: u32) -> HwClass {
         5 => HwClass::Dwc2,
         6 => HwClass::Framebuffer,
         7 => HwClass::TestIrq,
+        8 => HwClass::AudioPwm,
         _ => HwClass::None,
     }
 }
@@ -863,6 +881,9 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
         // that receives it stop being a kernel-known name.
         HwClass::TestIrq => &[33],
         HwClass::Framebuffer | HwClass::None => &[],
+        // No vector: the DMA engine's interrupt lines are shared between channels, and routing one
+        // would hand over the others'. The driver polls its ring, which `gs::driver::irq` supports.
+        HwClass::AudioPwm => &[],
         // NO VECTOR YET, and this is the honest edge of step D1 rather than an oversight.
         //
         // The named classes above return a vector the KERNEL assigned and programmed into the

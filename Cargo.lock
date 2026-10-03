@@ -547,6 +547,10 @@ dependencies = [
 [[package]]
 name = "godspeed-audio"
 version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-sdk",
+]
 
 [[package]]
 name = "godspeed-sdk"
@@ -1235,6 +1239,15 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "pwm-audio"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-audio",
+ "godspeed-sdk",
 ]
 
 [[package]]

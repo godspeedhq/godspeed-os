@@ -8,8 +8,13 @@
 //! the SDK, which is the operating system's interface, and not in `gs::driver`, which holds no device
 //! classes (`docs/driver-library.md`); it is a family's protocol, beside them.
 //!
-//! No `unsafe`, no dependencies, and `no_std`: it is constants and byte layouts.
+//! It also holds what the drivers share beyond the protocol, found repeated when the second driver (the
+//! Pis' PWM jack) arrived: the test tone (`sine`) and the settings file (`settings`).
+//!
+//! No `unsafe`, and `no_std`.
 #![no_std]
 #![deny(unsafe_code)]
 
+pub mod settings;
+pub mod sine;
 pub mod wire;

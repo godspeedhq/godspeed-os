@@ -2530,8 +2530,9 @@ pub fn kill_task_by_slot(slot: usize) {
             | "wifi-driver"
             // power: MANAGED (docs/power.md). Counted and notified like every other restartable service.
             | "power"
-            // audio-driver: MANAGED (docs/audio.md). Both halves, as for wifi-driver below.
-            | "audio-driver")
+            // audio-driver / pwm-audio: MANAGED (docs/audio.md) - the HD Audio driver on x86 and the
+            // PWM jack driver on the Pis. Both halves, as for wifi-driver below.
+            | "audio-driver" | "pwm-audio")
         {
             bump_name_restart(task_name);
         }
@@ -2583,7 +2584,7 @@ pub fn kill_task_by_slot(slot: usize) {
             // wifi-driver: see the restart-counter list above. Both halves or neither - a death that
             // notifies but is not counted, or is counted but does not notify, is the exact split that
             // cost `time` and `control` a hardware session each.
-            | "wifi-driver" | "power" | "audio-driver") {
+            | "wifi-driver" | "power" | "audio-driver" | "pwm-audio") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),

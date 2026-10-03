@@ -197,6 +197,9 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         // Networking on the Pi 2: nic-driver's ARM backend bridges the frame IPC to the in-kernel DWC2
         // CDC-ECM USB-net device (NET_DEVICE syscalls); net-stack is arch-neutral and rides on it.
         "nic-driver", "net-stack",
+        // The audio jack, driven by PWM (docs/audio.md): the kernel routes its pins and starts its clock
+        // as part of the grant; the service drives the PWM block and the DMA engine.
+        "pwm-audio",
         // The power policy (docs/power.md). Arch-neutral: on a board whose clock the OS cannot set it
         // says so once and answers every lease "no control", which costs a holder nothing.
         "power",
@@ -247,6 +250,8 @@ const ARM_ONLY: &[&str] = &["dwc2"];
           "wifi-driver",
           // The power policy, which holds the Arm clock fast while the radio loads (docs/power.md).
           "power",
+          // The audio jack, driven by PWM (docs/audio.md).
+          "pwm-audio",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
@@ -256,7 +261,7 @@ const ARM_ONLY: &[&str] = &["dwc2"];
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           // See the demo arm above. Present in BOTH arms because both can ship, which is the trap
           // `service_embed_check.embedded_arms` refuses to union away.
-          "wifi-driver", "power",
+          "wifi-driver", "power", "pwm-audio",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
     let aarch64_dir = workspace

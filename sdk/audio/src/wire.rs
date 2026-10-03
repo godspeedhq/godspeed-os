@@ -101,11 +101,16 @@ pub const PLAYING_STREAM: u8 = 2;
 
 /// The detail a fault needs. Answer `[OK, vendor u16, device u16, codec_addr, dac_node, pin_node,
 /// pin_device, amp_steps, amp_step_now, rate u32, ring_bytes u32, interrupts u8, interrupts_seen u32,
-/// version_major, version_minor]` - `INFO_LEN` bytes. `pin_device` is the pin's default-device field
+/// version_major, version_minor, kind u8, pwm_range u16]` - `INFO_LEN` bytes. `kind` is a `KIND_*`; for
+/// `KIND_PWM` the codec fields are zero and `pwm_range` is the PWM's steps per sample at this rate. `pin_device` is the pin's default-device field
 /// (0 line out, 1 speaker, 2 headphone, ...); `amp_steps` 0 means the path has no amplifier to set.
 /// Or `[NO_DEVICE, reason]`.
 pub const OP_INFO: u8 = 2;
-pub const INFO_LEN: usize = 26;
+pub const INFO_LEN: usize = 29;
+/// An Intel High Definition Audio controller and codec (x86).
+pub const KIND_HDA: u8 = 0;
+/// A jack driven by PWM and fed by the SoC's DMA engine (the Pis).
+pub const KIND_PWM: u8 = 1;
 
 /// `[3, volume]`, 0 to 100. Answer `[OK, volume, verify]`. 0 is silent and is NOT mute: the two stay
 /// separate states (docs/audio.md, "Volume is 0 to 100").

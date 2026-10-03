@@ -1084,6 +1084,21 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
         // because this controller is driven in DMA mode - the CPU never reads or writes a FIFO, so
         // granting that window would hand the driver reach it has no use for.
         "dwc2" => (PERIPHERAL_BASE as u32 + 0x98_0000, 1),
+        // The audio jack (`docs/audio.md`): TWO pages that are not adjacent, mapped side by side - the PWM
+        // block at +0 and the DMA engine at +0x1000. The DMA page holds all fifteen channels and their
+        // shared status, so granting it grants every channel: no more DMA reach than an unconfined
+        // driver has on this board anyway (6.4), and more than the grant names, which is recorded.
+        "pwm-audio" => {
+            if !audio_jack_prepare() {
+                crate::kprintln!("audio: the PWM clock did not report stopping - started anyway; the driver will say what it hears");
+            }
+            let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+                | PageFlags::NO_EXEC | PageFlags::PCD;
+            pt.map(VirtAddr(DRIVER_MMIO_VA as u64), PhysAddr(PERIPHERAL_BASE as u64 + 0x20_C000), flags).ok()?;
+            pt.map(VirtAddr(DRIVER_MMIO_VA as u64 + 0x1000), PhysAddr(PERIPHERAL_BASE as u64 + 0x7000), flags).ok()?;
+            crate::kprintln!("audio: jack pins 40/45 on PWM0, PWM clock PLLD/{} - granting PWM + DMA", AUDIO_PWM_DIVI);
+            return Some((DRIVER_MMIO_VA as u64, 0x2000));
+        }
         _ => return None,
     };
     let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
@@ -2641,6 +2656,62 @@ pub mod rtc {
 /// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
 /// See the x86 original for why this is not a second source for `pci::nic()`.
 pub fn soc_nic_present() -> bool { false }
+
+/// Does this board drive an audio jack by PWM (`HwClass::AudioPwm`, `docs/audio.md`)? The Pi 2 does:
+/// PWM0's two channels on GPIO 40 (right) and 45 (left), through the board's filter to the 3.5 mm jack.
+pub fn audio_pwm_present() -> bool { true }
+
+/// The clock manager, and the PWM clock's two registers in it (BCM2835 peripherals, 6.3). Every write
+/// carries the password in the top byte, or the block ignores it.
+const CM_BASE: usize = PERIPHERAL_BASE + 0x10_1000;
+const CM_PWMCTL: *mut u32 = (CM_BASE + 0xA0) as *mut u32;
+const CM_PWMDIV: *mut u32 = (CM_BASE + 0xA4) as *mut u32;
+const CM_PASSWORD: u32 = 0x5A << 24;
+const CM_BUSY: u32 = 1 << 7;
+const CM_KILL: u32 = 1 << 5;
+const CM_ENAB: u32 = 1 << 4;
+/// PLLD, 500 MHz on this board: the steady source. PLLC is the core clock and moves with it.
+const CM_SRC_PLLD: u32 = 6;
+/// PLLD / 2 = 250 MHz, the PWM clock `pwm-audio` divides into its sample rate (`probe_mode` 2).
+const AUDIO_PWM_DIVI: u32 = 2;
+
+/// Make the audio jack usable, as part of granting it: route its two pins to PWM0 and start the PWM
+/// clock. Both live in SHARED blocks - every pin's function in the GPIO page, every clock in the clock
+/// manager's - so the kernel does them here, as it routes the SD pins for `block-driver`, and the driver
+/// is granted only the PWM block and the DMA engine (CLAUDE.md 12.3, as amended for audio).
+///
+/// The sequence is Circle's (`lib/gpioclock.cpp`), checked against the datasheet: kill the clock and
+/// wait for BUSY to clear, set the divider, set the source, then enable. The BUSY wait is bounded; a
+/// clock that will not stop is reported, and the window is still granted, so the driver says what it
+/// finds rather than the spawn failing silently.
+fn audio_jack_prepare() -> bool {
+    // SAFETY: GPFSEL4, the pull registers and the clock manager's PWM pair are BCM2835 MMIO inside the
+    // Device-mapped peripheral window. Read-modify-write of GPFSEL4 changes only pins 40 and 45; the
+    // pull strobe clocks only those two pins; CM_PWMCTL/DIV belong to the PWM clock alone.
+    unsafe {
+        let mut r4 = GPFSEL4.read_volatile();
+        r4 = (r4 & !((7 << 0) | (7 << 15))) | (4 << 0) | (4 << 15); // GPIO40, GPIO45 -> ALT0 = PWM0
+        GPFSEL4.write_volatile(r4);
+        // No pull on either pin: they are outputs now. GPPUDCLK1 bit N is GPIO 32+N.
+        GPPUD.write_volatile(0);
+        for _ in 0..150 { core::arch::asm!("nop", options(nomem, nostack)); }
+        GPPUDCLK1.write_volatile((1 << 8) | (1 << 13));
+        for _ in 0..150 { core::arch::asm!("nop", options(nomem, nostack)); }
+        GPPUDCLK1.write_volatile(0);
+
+        CM_PWMCTL.write_volatile(CM_PASSWORD | CM_KILL);
+        let mut stopped = false;
+        for _ in 0..1_000_000 {
+            if CM_PWMCTL.read_volatile() & CM_BUSY == 0 { stopped = true; break; }
+        }
+        CM_PWMDIV.write_volatile(CM_PASSWORD | (AUDIO_PWM_DIVI << 12));
+        for _ in 0..1000 { core::arch::asm!("nop", options(nomem, nostack)); }
+        CM_PWMCTL.write_volatile(CM_PASSWORD | CM_SRC_PLLD);
+        for _ in 0..1000 { core::arch::asm!("nop", options(nomem, nostack)); }
+        CM_PWMCTL.write_volatile(CM_PASSWORD | CM_SRC_PLLD | CM_ENAB);
+        stopped
+    }
+}
 
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};

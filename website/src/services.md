@@ -247,7 +247,20 @@ the ring is played and the driver refills it then; its DMA is confined behind th
 one. On its death the kernel stops the controller's DMA and releases the confinement, keyed on the
 device it was given rather than its name. The `audio` command is not built yet (`docs/audio.md`).
 
-**Peers:** none yet.
+**Peers:** `fs`, for `/audio.settings`.
+
+### `pwm-audio` - sound on the Pis
+
+```
+   shell (audio) ──▶ pwm-audio ──▶ DMA engine ──▶ PWM FIFO ──▶ the 3.5 mm jack
+                         └──▶ fs (/audio.settings)
+```
+
+The same protocol as `audio-driver`, for a different device: the Pis have no codec, so each sample is a
+PWM duty cycle, moved by the DMA engine as the PWM asks. The kernel routes the jack's pins and starts the
+PWM clock when it grants the device, because both live in blocks shared with every other pin and clock.
+
+**Peers:** `fs`, for `/audio.settings`.
 
 ### `time` - the wall clock
 

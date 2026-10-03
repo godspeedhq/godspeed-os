@@ -64,6 +64,9 @@ ARCH_EXEMPT = {
         "ehci": "x86-only USB2 controller driver; the VisionFive 2's USB host is a Cadence USB3 "
                 "whose host half is an xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver",
+        "pwm-audio": "the Pis' PWM-driven 3.5 mm jack; the VisionFive 2 Lite has no analog audio at all - "
+                     "its PWM-DAC is disabled in the vendor device tree and its Linux finds no sound "
+                     "card (docs/audio.md)",
         "audio-driver": "Intel High Definition Audio, a PCI controller the VisionFive 2 Lite does not "
                         "have; this tree drives no audio hardware on it (docs/audio.md)",
     },

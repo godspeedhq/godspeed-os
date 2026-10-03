@@ -33,6 +33,8 @@ use godspeed as gs;
 use godspeed::driver::delay;
 use godspeed::driver::irq::{Irq, Woke};
 use godspeed::driver::wait::{self, Budget};
+use godspeed_audio::settings::{self, Settings};
+use godspeed_audio::sine::Sine;
 use godspeed_audio::wire;
 use godspeed_sdk::mmio::Mmio;
 use godspeed_sdk::{Dma, Message, ServiceContext};
@@ -596,38 +598,6 @@ fn configure_path(h: &mut Hda, p: &OutPath) -> bool {
         && h.verb(cad, dac, SET_CHANNEL_STREAMID, STREAM_TAG << 4).is_some()
 }
 
-/// A sine wave from a phase accumulator, in fixed point - no floating point and no table. One full turn
-/// of the phase is 2^32. The polynomial is sin's Taylor series to x^7 over a quarter turn, folded to
-/// the other three: worst error about 1.6e-4, some 76 dB down, past what 16 bits can tell.
-struct Sine {
-    phase: u32,
-    step: u32,
-}
-
-impl Sine {
-    fn new(hz: u32) -> Self {
-        Sine { phase: 0, step: (((hz as u64) << 32) / RATE as u64) as u32 }
-    }
-
-    /// The next sample, at half of full scale.
-    fn next(&mut self) -> i16 {
-        const ONE: i64 = 1 << 30;
-        const HALF_PI: i64 = 1_686_629_713; // pi/2 in Q30
-        let quadrant = self.phase >> 30;
-        let frac = (self.phase & 0x3FFF_FFFF) as i64; // a quarter turn, in Q30
-        let x = (frac * HALF_PI) >> 30;
-        let x = if quadrant & 1 == 1 { HALF_PI - x } else { x };
-        let x2 = (x * x) >> 30;
-        let mut t = ONE - x2 / 42;
-        t = ONE - ((x2 * t) >> 30) / 20;
-        t = ONE - ((x2 * t) >> 30) / 6;
-        let s = (x * t) >> 30; // sin(x), Q30
-        let s = if quadrant >= 2 { -s } else { s };
-        self.phase = self.phase.wrapping_add(self.step);
-        ((s * 16_383) >> 30) as i16
-    }
-}
-
 /// Fill `bytes` of the ring from absolute offset `from`, with tone while any remains and silence after.
 fn fill(d: &Dma, from: usize, bytes: usize, tone: &mut Sine, tone_left: &mut usize) {
     let mut at = from;
@@ -642,127 +612,6 @@ fn fill(d: &Dma, from: usize, bytes: usize, tone: &mut Sine, tone_left: &mut usi
         d.write32(PCM_OFF + at % PCM_LEN, v | v << 16);
         at += FRAME_BYTES;
     }
-}
-
-// ---- A4: settings that survive a restart (`/audio.settings`) ------------------------------------------
-
-/// Where the volume and the mute are kept (`utilities/57_audio.md`). Plain labelled lines, readable with
-/// `read /audio.settings`. The driver owns the file: it reads it once when it comes up and writes it after
-/// a change. `on` and `off` are deliberately NOT kept - audio comes up on at every boot.
-const SETTINGS_PATH: &str = "/audio.settings";
-/// The whole file is read in one piece into this many bytes. Two lines need about twenty; a file larger
-/// than this is not one this driver wrote, and is ignored with a line rather than half-read.
-const SETTINGS_MAX: usize = 256;
-/// How long one `fs` exchange may take before it counts as unanswered, and how many times the load asks.
-/// At boot `fs` may still be mounting; a few seconds of patience, then the defaults and a line - never a
-/// wait the driver cannot get out of.
-const SETTINGS_PATIENCE_SECS: i64 = 2;
-const SETTINGS_TRIES: u32 = 3;
-const SETTINGS_RETRY_PAUSE: Budget = Budget::ms(1000);
-
-/// What the file holds.
-#[derive(Clone, Copy)]
-struct Settings {
-    volume: u8,
-    muted: bool,
-}
-
-/// Read the settings, or `None` for the defaults - with the reason said once in the log either way.
-fn load_settings(ctx: &ServiceContext) -> Option<Settings> {
-    use gs::Error;
-    for attempt in 1..=SETTINGS_TRIES {
-        let mut fs = gs::fs::Fs::new(ctx).patience_secs(SETTINGS_PATIENCE_SECS);
-        let mut buf = [0u8; SETTINGS_MAX];
-        match fs.read_into(SETTINGS_PATH, &mut buf) {
-            Ok(n) => return parse_settings(ctx, &buf[..n]),
-            Err(Error::NotFound) => {
-                ctx.log("audio-driver: no /audio.settings yet - starting at the defaults; it is written at the first change");
-                return None;
-            }
-            Err(Error::NoFilesystem) => {
-                ctx.log("audio-driver: no filesystem on this machine's disk - settings are kept in memory only");
-                return None;
-            }
-            Err(Error::BufferTooSmall) => {
-                ctx.log_fmt(format_args!(
-                    "audio-driver: /audio.settings is larger than {} bytes - not a file this driver wrote; ignored, starting at the defaults",
-                    SETTINGS_MAX));
-                return None;
-            }
-            Err(e) if attempt < SETTINGS_TRIES && e.retry_is_safe() => {
-                delay::hold_parked(ctx, SETTINGS_RETRY_PAUSE);
-            }
-            Err(e) => {
-                ctx.log_fmt(format_args!(
-                    "audio-driver: could not read /audio.settings ({}) after {} attempt(s) - starting at the defaults",
-                    e.as_str(), attempt));
-                return None;
-            }
-        }
-    }
-    None
-}
-
-/// `volume N` and `muted yes|no`, one per line. A line this driver does not know is ignored and said once;
-/// a value out of range keeps the default for that setting and is said too.
-fn parse_settings(ctx: &ServiceContext, text: &[u8]) -> Option<Settings> {
-    let mut s = Settings { volume: DEFAULT_VOLUME, muted: false };
-    let mut ignored = 0u32;
-    for line in text.split(|&b| b == b'\n') {
-        let line = core::str::from_utf8(line).unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (key, value) = line.split_once(' ').map_or((line, ""), |(k, v)| (k, v.trim()));
-        match (key, value) {
-            ("volume", v) => match v.parse::<u8>() {
-                Ok(n) if n <= wire::VOLUME_MAX => s.volume = n,
-                _ => ignored += 1,
-            },
-            ("muted", "yes") => s.muted = true,
-            ("muted", "no") => s.muted = false,
-            _ => ignored += 1,
-        }
-    }
-    if ignored > 0 {
-        ctx.log_fmt(format_args!("audio-driver: /audio.settings has {} line(s) this driver does not understand - ignored", ignored));
-    }
-    ctx.log_fmt(format_args!(
-        "audio-driver: settings read from /audio.settings - volume {}, {}", s.volume, if s.muted { "muted" } else { "unmuted" }));
-    Some(s)
-}
-
-/// A line of text into a fixed buffer, for the settings file. Truncation is impossible at this size; if
-/// it ever happened the write would be refused rather than a cut file saved.
-struct Line {
-    buf: [u8; 64],
-    len: usize,
-    overflow: bool,
-}
-
-impl core::fmt::Write for Line {
-    fn write_str(&mut self, t: &str) -> core::fmt::Result {
-        let b = t.as_bytes();
-        if self.len + b.len() > self.buf.len() {
-            self.overflow = true;
-            return Err(core::fmt::Error);
-        }
-        self.buf[self.len..self.len + b.len()].copy_from_slice(b);
-        self.len += b.len();
-        Ok(())
-    }
-}
-
-/// Write the settings. A failure is returned for the caller to report; `OutcomeUnknown` means the file may
-/// or may not hold them, and is never re-sent as though it had not happened.
-fn save_settings(ctx: &ServiceContext, s: Settings) -> Result<(), gs::Error> {
-    use core::fmt::Write;
-    let mut l = Line { buf: [0; 64], len: 0, overflow: false };
-    let _ = write!(l, "volume {}\nmuted {}\n", s.volume, if s.muted { "yes" } else { "no" });
-    if l.overflow {
-        return Err(gs::Error::InvalidInput);
-    }
-    gs::fs::Fs::new(ctx).patience_secs(SETTINGS_PATIENCE_SECS).write(SETTINGS_PATH, &l.buf[..l.len])
 }
 
 // ---- A4: the driver as a service -----------------------------------------------------------------------
@@ -1026,7 +875,7 @@ impl<'a> Player<'a> {
         }
         let bytes = (RATE as usize * ms as usize / 1000) * FRAME_BYTES;
         let mut t = Tone {
-            sine: Sine::new(hz), hz, ms, left: bytes, bytes, filled: PCM_LEN, played: 0, last: 0,
+            sine: Sine::new(hz, RATE), hz, ms, left: bytes, bytes, filled: PCM_LEN, played: 0, last: 0,
             underruns: 0, started: 0, watchdog: 0, interrupts_at_start: irq.seen(), rate: RATE, feed: None,
             silence: 0,
         };
@@ -1077,7 +926,7 @@ impl<'a> Player<'a> {
             out[1] = wire::no_device::BRINGUP_FAILED;
             return 2;
         }
-        let mut quiet = Sine::new(1);
+        let mut quiet = Sine::new(1, RATE);
         let mut none = 0usize;
         fill(self.d, 0, PCM_LEN, &mut quiet, &mut none); // silence, until the sender writes over it
         let ctx = self.h.ctx;
@@ -1168,7 +1017,7 @@ impl<'a> Player<'a> {
                 f.ended = true;
             }
             let ended = f.ended;
-            let mut quiet = Sine::new(1);
+            let mut quiet = Sine::new(1, RATE);
             let mut none = 0usize;
             if ended {
                 let free = (t.played + PCM_LEN).saturating_sub(t.filled);
@@ -1289,6 +1138,8 @@ impl<'a> Player<'a> {
         wire::put_u32(out, 20, irq.seen().min(u32::MAX as u64) as u32);
         out[24] = m.read8(VMAJ);
         out[25] = m.read8(VMIN);
+        out[26] = wire::KIND_HDA;
+        wire::put_u16(out, 27, 0);
         wire::INFO_LEN
     }
 
@@ -1503,7 +1354,7 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
         last_silence_ms: 0,
         settings_dirty: false, settings_failing: false,
     };
-    if let Some(s) = load_settings(ctx) {
+    if let Some(s) = settings::load(ctx, &mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), "audio-driver", DEFAULT_VOLUME) {
         p.volume = s.volume;
         p.muted = s.muted;
     }
@@ -1617,7 +1468,7 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
             p.service(irq);
             if p.settings_dirty && p.tone.is_none() {
                 p.settings_dirty = false;
-                match save_settings(ctx, Settings { volume: p.volume, muted: p.muted }) {
+                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted }) {
                     Ok(()) => p.settings_failing = false,
                     Err(e) if !p.settings_failing => {
                         p.settings_failing = true;

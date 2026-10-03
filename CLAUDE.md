@@ -1519,6 +1519,29 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > It now returns success only when `WL_ON` reads back at the level asked for. The spawn also logs `BT_ON`,
 > the same chip's Bluetooth enable: it reads 0 on this board, so `WL_ON` really is the whole of the radio's
 > power and nothing else needs cutting (`docs/wifi.md` 53). No syscall, resource or authority changes.
+>
+> **Amendment 2026-10-03 (audio on the Pis): a grant may include routing the device's pins and starting
+> its clock, and the Pis' DMA page is granted whole.** The Pis' 3.5 mm jack is two PWM channels fed by the
+> SoC's DMA engine (`docs/audio.md`, "The Pis"). Two of the steps that make it usable live in SHARED
+> blocks: every pin's function in the GPIO page, every clock in the clock manager's. So the kernel does
+> them as part of the grant, at spawn, exactly as it powers the SD domain before granting the radio's
+> window - routes the jack's two pins to the PWM and starts the PWM clock at a fixed rate - and the driver
+> (`pwm-audio`) is granted the PWM page and the DMA engine's page, mapped side by side, and a DMA arena.
+> The device is a new kind (`HwClass::AudioPwm`), present where the arch says so (`audio_pwm_present`).
+>
+> **What this is not.** No syscall, no privilege bit, no runtime role: the kernel acts once at spawn and
+> holds no policy - the sample rate (the PWM's range), the volume and when to play are the driver's
+> (26.10). Not a seventh responsibility: it is the grant made usable, the reasoning of the `DevicePower`
+> amendment above.
+>
+> **What it costs, recorded rather than hidden (26.7).** The DMA engine's page holds all fifteen channels
+> and their shared status, so the driver is granted more than the one channel it uses. It is no more
+> REACH than it already has - on these boards no IOMMU confines any DMA-capable driver (6.4), so a driver
+> that can point one channel anywhere can already reach all of memory - but it is more than the grant
+> names. The alternative, a kernel-mediated "start this channel" syscall, would grow the kernel to narrow
+> a grant that confers nothing new, and was declined for that reason. The kernel also learns one more
+> service name (`pwm-audio`, in the Pis' fixed-window table and the two restart lists), the existing
+> name-keyed practice that step D's classes are replacing.
 
 ---
 

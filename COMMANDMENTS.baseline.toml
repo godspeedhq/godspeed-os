@@ -701,6 +701,12 @@ SpawnImage               = 52
 # the stream interrupts as each period plays and the driver refills then. The kernel picks the vector.
 # peer:fs - `/audio.settings`, the volume and the mute kept across a restart (utilities/57_audio.md).
 "audio-driver" = ["hw:pci_irq", "peer:fs"]
+# pwm-audio: the Pis' 3.5 mm jack (docs/audio.md, "The Pis"). hw:AUDIO_PWM - the PWM block and the DMA
+# engine's page, mapped side by side, and a DMA arena; the kernel routes the jack's pins and starts the
+# PWM clock as part of the grant (CLAUDE.md 12.3). The DMA page holds every channel: more than the
+# driver needs, recorded in docs/audio.md, and no more reach than an unconfined driver has on these
+# boards. peer:fs - `/audio.settings`, the volume and the mute kept across a restart.
+"pwm-audio" = ["hw:AUDIO_PWM", "peer:fs"]
 "block-driver" = ["hw:pci", "peer:dwc2", "peer:events", "peer:xhci"]
 # examples/cap-grant, examples-test build only. ACQUIRE_ANY so its lookup of "receiver" reaches the
 # kernel name directory: with no such service present the lookup MISSES, which is the standalone

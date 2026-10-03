@@ -1235,6 +1235,8 @@ pub fn pci_cfg_read32(sel: u32, off: u16) -> Option<u32> {
 /// SoC one", and a machine has whichever it has. Merging them into one static was what put a
 /// non-PCI device's presence into a variable called `pci::NIC_FOUND`.
 pub fn soc_nic_present() -> bool { false }
+/// Does this board drive an audio jack by PWM (`HwClass::AudioPwm`, `docs/audio.md`)? Not here.
+pub fn audio_pwm_present() -> bool { false }
 
 /// Who made this CPU, and which one - written into a caller-supplied buffer, returning its length.
 ///

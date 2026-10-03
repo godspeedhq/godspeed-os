@@ -1,7 +1,7 @@
 # 1. `PlacementInvalid` is never constructed - a contracted core is silently ignored
 
 **Status: STILL OPEN 2026-09-20, and the TITLE is now the wrong complaint.** `PlacementInvalid`
-IS constructed (`kernel/src/task/mod.rs:1218`) - but only for a core requested with
+IS constructed (`resolve_spawn_core` in `kernel/src/task/mod.rs`) - but only for a core requested with
 `SPAWN_FLAG_CORE_STRICT`, which is an operator's `--core N` or a restart's `placement_override`. A
 CONTRACT's `placement.core` still arrives as a PREFERENCE and is still rerouted. The decision this
 entry asks for below has not been made; what happened is that a third option was built for a

@@ -478,6 +478,8 @@ pub mod rtc {
 /// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
 /// See the x86 original for why this is not a second source for `pci::nic()`.
 pub fn soc_nic_present() -> bool { false }
+/// Does this board drive an audio jack by PWM (`HwClass::AudioPwm`, `docs/audio.md`)? Not here.
+pub fn audio_pwm_present() -> bool { false }
 
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
