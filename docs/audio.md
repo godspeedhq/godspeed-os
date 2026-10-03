@@ -25,8 +25,8 @@ to a WAV file - and it is what the HP T630 has.
 | QEMU | `intel-hda` (ICH6, `8086:2668`), codec `hda-output` (`1af4:0012`) | DAC node 2 -> line-out pin node 3. Immediate Command registers implemented. Sound to `build/qemu_audio.wav` (`osdev run`) |
 | HP T630 | `00:09.2` AMD FCH Azalia (`1022:157a`), codec Realtek ALC255 (`10ec:0255`, subsystem `103c:8158`) | internal speaker, front headset jack, rear line-out. Linux: snoop via PCI config 0x42, trust LPIB, 40-bit DMA |
 | HP T630 | `00:01.1` Radeon HDMI audio (`1002:9840`) | a SECOND class-0x0403 controller - see "Found while preparing" |
-| Pi 2 / Pi 4 | 3.5 mm jack driven by PWM (GPIO 40/45, Pi 4 40/41 on PWM1) | not HDA. Needs GPIO pinmux and the clock manager, both SHARED SoC blocks; no QEMU model. Later, and an authority question first |
-| VisionFive 2 Lite | no analog output | nothing to drive |
+| Pi 2 / Pi 4 | 3.5 mm jack driven by PWM, fed by the BCM DMA engine (section "The Pis and the VisionFive") | not HDA. Needs the GPIO pinmux and the clock manager, both SHARED SoC blocks; no QEMU model. A kernel proposal first |
+| VisionFive 2 Lite | no analog output; HDMI only | confirmed three ways: the board's port list, the vendor device tree disabling its PWM-DAC, and the board's own Linux log (`build/serial_output_risc_v_original.log`): `ALSA device list: No soundcards found` |
 
 Sources: the HDA specification rev 1.0a; QEMU `hw/audio/intel-hda.c`, `hda-codec.c`; Linux
 `sound/hda/controllers/intel.c`, `sound/hda/core/controller.c`, `stream.c`, `codecs/realtek/alc269.c`;
@@ -51,7 +51,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A2** | CORB/RIRB, the command rings the spec requires (Immediate Command is optional, and unknown on the T630's FCH). The first DMA - used only on QEMU's codec until A6, for the T630's own reasons | QEMU - **built** |
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
 | **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built**; outputs, debug and system sounds to come |
-| A5 | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU |
+| **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
 | A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
 
@@ -699,6 +699,76 @@ was the harness, not QEMU: the monitor connection was dropped the moment `quit` 
 QEMU acted on it. Held open until QEMU exits, the second run quit cleanly both times, with the same 33 and
 the same capture (32 sounding blocks, 9 silent) - so nothing had been lost the first time either, which
 is now known rather than assumed.
+
+## Step A5: `audio play` (2026-10-03)
+
+**The protocol** gains three requests (`sdk/audio`): `OP_OPEN` (rate, channels, bits, length - answered
+with the room in the ring), `OP_PCM` (up to 3,556 bytes of whole frames - answered at once with how many
+were taken and the room left; frames past the room are not taken and the shell sends them again), and
+`OP_END`. Every answer is still immediate: the shell waits on the RING, in 20 ms sleeps when it is full,
+never on the driver.
+
+**The driver** plays the stream through the same ring and interrupt as a tone. It does not start until
+half the ring is written (or the end arrives), so a sender's first moments of jitter are absorbed rather
+than heard. If the sender falls behind, the driver writes SILENCE ahead of the position and counts it,
+rather than letting the ring replay stale sound; at the end it silences the free ring so nothing stale
+plays while it drains. Mono is written to both sides. 44.1 and 48 kHz are accepted where the converter
+says it takes them (its PCM parameter: QEMU's reads `0x000201fc`), and the converter and the stream are
+set to the same rate, or the sound would play at the wrong speed. A stream nobody feeds for five seconds
+is ended - a shell killed mid-file must not hold the device.
+
+**The shell** reads the WAV header (`RIFF`/`WAVE`, `fmt `, `data`; PCM or extensible-PCM), refuses
+anything it cannot play with the reason, and streams the file in `IO_CHUNK` reads. `q` sends `stop`.
+
+**Verified by `osdev test audio`** (now 42 checks): `/song.wav` (2 s, 48 kHz stereo, 660 Hz) and
+`/mono.wav` (1 s, 44.1 kHz mono, 330 Hz), generated by the test and baked onto its disk, played with 0
+underruns and 0 ms of silence; a 24-bit and an 8 kHz file were refused with their reasons; `q` stopped a
+file mid-way. The capture holds 32 blocks at 660 Hz and 10 at 330 Hz as well as the tones.
+
+**Two of my checks were wrong on the first run, not the sound.** One looked for the word "silence" on the
+serial port, where the driver's own log line ("0 ms of silence") also arrives. The other allowed only two
+blocks at frequencies nobody asked for, and found five. Measured before changing anything: each of the
+five is the 100 ms block that straddles a JOIN - 1000 Hz to silence, 1000 to 660, 660 to 330, 330 to 660 -
+so its crossings come from two sounds. The check now requires every such block to sit at a join.
+
+## The Pis and the VisionFive (researched 2026-10-03, nothing built)
+
+Researched from Circle (a bare-metal Raspberry Pi library), the BCM2835 and BCM2711 datasheets, the
+Raspberry Pi device trees and StarFive's vendor kernel. The full notes, each item marked quoted or
+inferred, were the input to the kernel proposal below.
+
+**Pi 2 and Pi 4 share one PWM driver with three values changed:**
+
+| | Pi 2 | Pi 4 |
+|---|---|---|
+| PWM block | PWM0, ARM `0x3F20C000` | PWM1, ARM `0xFE20C800` |
+| Jack pins, alt 0 | GPIO 40 right, GPIO 45 left | GPIO 40 right, GPIO 41 left |
+| PWM clock | PLLD 500 MHz / 2 = 250 MHz | PLLD 750 MHz / 6 = 125 MHz |
+| DMA request line | 5 | 1 |
+
+The DMA engine sees RAM at `0xC0000000 | phys` on both, so the arena must be below 1 GiB on the Pi 4.
+The resolution is about 12.5 bits on the Pi 2 and 11.5 on the Pi 4 at 44.1 kHz - the jack's own limit.
+
+**What a driver would need is the authority question.** Four 4 KiB pages are involved and three are
+SHARED: the DMA page holds all fifteen channels and their common interrupt status; the GPIO page every
+pin; the clock manager page every clock. Only the PWM page is audio's alone. So the shape is the one the
+Pi 4's `DevicePower` already set: the kernel does the shared parts (the pin mux, the PWM clock) as part
+of the grant, at spawn, and the driver is granted the PWM page and the DMA arena. The DMA channel page is
+the open item: granting it hands over every channel, which on these boards (no IOMMU) is no more DMA
+reach than the driver already has, but it is still more than the grant names. A proposal, not made.
+
+**HDMI on the Pis** - the operator's TV is a better test than headphones. The firmware sets HDMI up at
+boot (our console uses it), and Circle drives HDMI audio bare-metal on Pi 1 to 4 by feeding the HDMI
+audio block by DMA. Same DMA engine, so the same authority question; to be researched as closely as PWM
+was before anything is proposed.
+
+**VisionFive 2 Lite: no analog audio at all.** The vendor device tree disables its PWM-DAC and reuses the
+old left-channel pin as the Wi-Fi enable, and StarFive's own Linux on this board registers no sound card.
+HDMI is the only path - an I2S transmitter feeding the Inno HDMI transmitter - and it needs the display
+controller, its clocks, a power domain and two PMIC rails brought up first, on IP documented only in the
+vendor kernel. Weeks, not days, and with nothing working on the board to compare against. A USB audio
+dongle is the realistic route there - and it would work on every board - but it needs isochronous
+transfers, which no USB driver here does yet.
 
 ## Found while preparing
 

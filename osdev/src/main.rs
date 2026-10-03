@@ -2812,7 +2812,43 @@ fn run_audio_test() {
     let persist = "build/tests/persist_audio.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
     format_superblock(persist);
+    // Files for `audio play`, made here so the test needs nothing from outside the repository: two it
+    // must play (48 kHz stereo, 44.1 kHz mono), and two it must refuse with the reason (24-bit, 8 kHz).
+    gsfs_add_file(persist, "song.wav", &wav_sine(48_000, 2, 16, 660, 2000));
+    gsfs_add_file(persist, "mono.wav", &wav_sine(44_100, 1, 16, 330, 1000));
+    gsfs_add_file(persist, "deep.wav", &wav_sine(48_000, 2, 24, 440, 100));
+    gsfs_add_file(persist, "phone.wav", &wav_sine(8_000, 1, 16, 440, 100));
     crate::shell_test::run_audio(&image_path, persist, 4);
+}
+
+/// A WAV file holding a sine at half scale - the shape QEMU's capture is then read back for.
+fn wav_sine(rate: u32, channels: u16, bits: u16, hz: u32, ms: u32) -> Vec<u8> {
+    let frames = rate as u64 * ms as u64 / 1000;
+    let bps = bits as u32 / 8;
+    let data_len = frames as u32 * channels as u32 * bps;
+    let mut v = Vec::with_capacity(44 + data_len as usize);
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&(36 + data_len).to_le_bytes());
+    v.extend_from_slice(b"WAVEfmt ");
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&channels.to_le_bytes());
+    v.extend_from_slice(&rate.to_le_bytes());
+    v.extend_from_slice(&(rate * channels as u32 * bps).to_le_bytes());
+    v.extend_from_slice(&(channels * bits / 8).to_le_bytes());
+    v.extend_from_slice(&bits.to_le_bytes());
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&data_len.to_le_bytes());
+    for i in 0..frames {
+        let s = (16_383.0 * (2.0 * std::f64::consts::PI * hz as f64 * i as f64 / rate as f64).sin()) as i32;
+        for _ in 0..channels {
+            match bits {
+                24 => v.extend_from_slice(&(s << 8).to_le_bytes()[..3]),
+                _ => v.extend_from_slice(&(s as i16).to_le_bytes()),
+            }
+        }
+    }
+    v
 }
 
 fn run_fs_restart_test() {

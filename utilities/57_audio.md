@@ -14,7 +14,7 @@ on hardware: on the T630 the driver surveys the codec and stops before playback,
 answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
 
 The verbs in section 1 are built, and the volume and the mute survive a reboot (section 5). The rest of
-the surface the operator agreed - `outputs`, `output`, `play`, `debug`, `system sounds` and the keyboard
+the surface the operator agreed - `outputs`, `output`, `debug`, `system sounds` and the keyboard
 shortcuts - is designed in `docs/audio.md` and not built; each of those words answers `not built yet` rather than being
 mistaken for a fault.
 
@@ -32,6 +32,7 @@ mistaken for a fault.
 | `audio off` | action | stop anything playing and put the codec in its lowest power state; the controller stays up |
 | `audio off hard` | action | stop anything playing and hold the whole controller in reset - the closest HD Audio has to cutting the power. `audio on` brings it back |
 | `audio tone <hz> [seconds]` | action | play a sine the driver generates itself, 20 to 20000 Hz, 2 s unless told (tenths allowed: `0.5`, up to 600). Blocks with `[q] quit`; `q` STOPS the tone (rule 11) |
+| `audio play <path>` | action | play a WAV file from disk: 16-bit PCM, mono or stereo, 44100 or 48000 Hz where the codec offers it. Blocks with `[q] quit`; `q` STOPS it. Anything else is refused with the reason |
 | `audio help` | | usage, one real example per row |
 | `audio version` | | the version and the collective copyright line (rules 5 and 6) |
 
@@ -63,12 +64,18 @@ something else` when it disagrees.
 | `audio tone 440 2` | `playing 440 Hz for 2.0 s  [q] quit`, then `played 440 Hz for 2.0 s` or `stopped after 1.2 s` |
 | `audio tone` while off | ``audio is off - `audio on` first`` |
 | `audio tone` muted, or at volume 0 | plays, and says first: `muted - nothing will be heard` / `volume is 0 - nothing will be heard` |
+| `audio play /song.wav` | `playing /song.wav (48000 Hz, 16-bit, stereo, 0:02)  [q] quit`, then `played 0:02`, or `stopped after 1.4 s` |
+| `audio play` that ran dry | `played 0:02, 180 ms of silence where the samples did not arrive in time` - never hidden |
+| `audio play /x.wav`, 24-bit | `audio: /x.wav is 24-bit - this plays 16-bit PCM` |
+| `audio play /x.wav`, 8000 Hz | `audio: /x.wav is 8000 Hz - this codec plays 44100 or 48000 Hz` |
+| `audio play /x.mp3` | `audio: /x.mp3 is not a WAV file`; compressed WAV: `is compressed - this plays uncompressed PCM` |
 
 ## 3. Pipes (rule 12)
 
 `status` and `info` start pipes, as labelled lines: `audio status | match volume`, `audio info | write
 /audio-info.txt`. The actions refuse with a sentence naming the reports. Piping sound IN will be refused
-when `play` exists: a pipe carries 16 KiB, a tenth of a second of sound (`docs/audio.md`).
+in the design: a pipe carries 16 KiB, a tenth of a second of sound, so `play` takes a PATH and the file is
+the adapter (`docs/audio.md`).
 
 ## 4. Failure says which half failed
 
@@ -111,4 +118,5 @@ muted no
 
 `audio` completes its BUILT verbs, and `off` completes `hard`. The words people bring from other systems
 are hints, never aliases: `beep` and `speaker-test` point to `audio tone`, `amixer` and `alsamixer` to
-`audio volume`. `aplay` joins with `audio play`.
+`audio volume`, and `aplay` to `audio play`. `audio play ` completes a PATH, which is why `audio` is not
+among the commands whose arguments are keywords only.

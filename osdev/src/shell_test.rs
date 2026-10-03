@@ -10099,6 +10099,28 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     send(&mut w, b"q");
     let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
     check!(r.contains("stopped after"), "q stops a tone (rule 11)");
+    // `audio play`: two files it plays, two it refuses with the reason, one that does not exist, and q.
+    let r = run!(b"audio play /song.wav\r");
+    check!(r.contains("playing /song.wav (48000 Hz, 16-bit, stereo, 0:02)") && r.contains("played 0:02"),
+        "play: a 48 kHz stereo WAV played");
+    // The shell's own sentence for a stream that ran dry, and the driver's count - not the bare word
+    // "silence", which the driver's log line carries on the same serial port even when it is zero.
+    check!(!r.contains("where the samples did not arrive") && r.contains("0 underrun(s), 0 ms of silence"),
+        "play: the feed kept up - no silence written in its place");
+    let r = run!(b"audio play /mono.wav\r");
+    check!(r.contains("playing /mono.wav (44100 Hz, 16-bit, mono, 0:01)") && r.contains("played 0:01"),
+        "play: a 44.1 kHz mono WAV played");
+    let r = run!(b"audio play /deep.wav\r");
+    check!(r.contains("is 24-bit - this plays 16-bit PCM"), "play: a 24-bit file is refused, and says why");
+    let r = run!(b"audio play /phone.wav\r");
+    check!(r.contains("is 8000 Hz - this codec plays 44100 or 48000 Hz"), "play: an 8 kHz file is refused, and says why");
+    let r = run!(b"audio play /nothere.wav\r");
+    check!(r.contains("not found"), "play: a missing file is not found");
+    send(&mut w, b"audio play /song.wav\r");
+    thread::sleep(Duration::from_millis(1500));
+    send(&mut w, b"q");
+    let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(r.contains("stopped after"), "play: q stops the file (rule 11)");
     let r = run!(b"audio volume 30\r");
     check!(r.contains("volume 30 - verified"), "volume 30");
     let r = run!(b"read /audio.settings\r");
@@ -10126,21 +10148,36 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     quit_qemu(&mut child, mon_port);
 
     // ---- The sound ----
-    // Played in boot 1, in order: 1 s at volume 50, 1 s at 100, 1 s muted (silence), about 1.2 s at 100
-    // before q. QEMU's WAV grows only while a stream runs, so the gaps between tones are not in it.
+    // Played in boot 1, in order: tones of 1 s at volume 50, 1 s at 100, 1 s muted (silence), about 1.2 s
+    // at 100 before q; then, at 100, /song.wav (2 s of 660 Hz), /mono.wav (1 s of 330 Hz, resampled by
+    // QEMU to 48 kHz) and /song.wav again until q at about 1.5 s. QEMU's WAV grows only while a stream
+    // runs, so the gaps between them are not in it.
     let blocks = wav_blocks(wav);
     let sounding: Vec<&(u32, u32)> = blocks.iter().filter(|(rms, _)| *rms > 500).collect();
     let silent = blocks.iter().filter(|(rms, _)| *rms <= 50).count();
-    println!("audio-test: the capture is {} block(s) of 100 ms: {} sounding, {} silent", blocks.len(), sounding.len(), silent);
-    check!((29..=36).contains(&sounding.len()), "about 3.2 s of tone in the capture");
+    let at = |lo: u32, hi: u32| sounding.iter().filter(|(_, hz)| (lo..=hi).contains(hz)).count();
+    let (k1000, k660, k330) = (at(980, 1020), at(647, 673), at(323, 337));
+    println!("audio-test: the capture is {} block(s) of 100 ms: {} sounding ({} at 1000 Hz, {} at 660 Hz, {} at 330 Hz), {} silent",
+        blocks.len(), sounding.len(), k1000, k660, k330, silent);
+    check!((29..=36).contains(&k1000), "about 3.2 s of the 1000 Hz tones");
     check!(silent >= 9, "the muted tone is silence");
-    let mid: Vec<u32> = sounding.iter().filter(|(rms, _)| (4000..7500).contains(rms)).map(|(_, hz)| *hz).collect();
-    let loud: Vec<u32> = sounding.iter().filter(|(rms, _)| *rms >= 9500).map(|(_, hz)| *hz).collect();
-    check!(mid.len() >= 8, "a tone at the level volume 50 gives (RMS 4000-7500)");
-    check!(loud.len() >= 18, "tones at the level volume 100 gives (RMS 9500 and up)");
-    let near = |hz: &u32| (980..=1020).contains(hz);
-    check!(sounding.iter().filter(|(_, hz)| near(hz)).count() * 10 >= sounding.len() * 9,
-        "the tones are 1000 Hz, by zero crossings");
+    let mid = sounding.iter().filter(|(rms, hz)| (4000..7500).contains(rms) && (980..=1020).contains(hz)).count();
+    let loud = sounding.iter().filter(|(rms, hz)| *rms >= 9500 && (980..=1020).contains(hz)).count();
+    check!(mid >= 8, "a tone at the level volume 50 gives (RMS 4000-7500)");
+    check!(loud >= 18, "tones at the level volume 100 gives (RMS 9500 and up)");
+    check!((30..=40).contains(&k660), "about 3.5 s of /song.wav at 660 Hz - the whole file, then the part before q");
+    check!((8..=12).contains(&k330), "about 1 s of /mono.wav at 330 Hz");
+    // A 100 ms block that straddles the join between two sounds counts crossings from both, so it reads
+    // as neither. Every block that is none of the three must therefore sit at a JOIN: its neighbours
+    // differ (in frequency, or one is silent). Measured on the first run: five such blocks, each at one.
+    let class = |b: &(u32, u32)| -> u32 {
+        if b.0 <= 500 { 0 } else if (980..=1020).contains(&b.1) { 1000 } else if (647..=673).contains(&b.1) { 660 }
+        else if (323..=337).contains(&b.1) { 330 } else { u32::MAX }
+    };
+    let stray = (1..blocks.len().saturating_sub(1)).filter(|&j| {
+        class(&blocks[j]) == u32::MAX && class(&blocks[j - 1]) == class(&blocks[j + 1])
+    }).count();
+    check!(stray == 0, "nothing in the capture but the three frequencies asked for, and the joins between them");
 
     // ---- Boot 2: the settings across a reboot ----
     let (mut child, buf, mut w, _ctrl, mon_port) = boot_audio(image_path, persist_path, "build/tests/audio_test_boot2.wav", smp);

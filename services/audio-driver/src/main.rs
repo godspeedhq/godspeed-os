@@ -118,6 +118,11 @@ const PARAM_PIN_CAP: u32 = 0x0C;
 const PARAM_CONN_LIST_LEN: u32 = 0x0E;
 const PARAM_OUT_AMP_CAP: u32 = 0x12;
 const PARAM_SUPPORTED_POWER_STATES: u32 = 0x0F;
+/// Supported PCM sizes and rates: bit 5 44.1 kHz, bit 6 48 kHz, bit 17 16-bit samples.
+const PARAM_PCM: u32 = 0x0A;
+const PCM_RATE_44K1: u32 = 1 << 5;
+const PCM_RATE_48K: u32 = 1 << 6;
+const PCM_BITS_16: u32 = 1 << 17;
 
 const FG_AUDIO: u32 = 0x01;
 const WCAP_OUT_AMP: u32 = 1 << 2;
@@ -195,6 +200,15 @@ const ARENA_NEEDED: usize = PCM_OFF + PCM_LEN;
 const RATE: u32 = 48_000;
 /// SDnFMT and the converter format: 48 kHz base, x1, /1, 16 bits, 2 channels (HDA 1.0a 3.7.1).
 const FMT_48K_16_STEREO: u32 = 0x0011;
+/// The same at the 44.1 kHz base (bit 14).
+const FMT_44K1_16_STEREO: u32 = 0x4011;
+/// A stream's sender has this long between sends before the stream is ended for it: the shell that
+/// opened it may have been killed mid-file, and a stream nobody feeds must not hold the device.
+const FEED_TIMEOUT_MS: u32 = 5000;
+/// How far ahead of the stream's position the driver keeps written: the DMA engine reads ahead of
+/// LPIB in bursts, so the bytes just past it are not safe to change, and a feed that falls behind this
+/// has silence written instead.
+const GUARD: usize = 1024;
 const FRAME_BYTES: usize = 4; // two 16-bit channels
 /// The stream tag the converter listens for. 1..=15; tag 0 is reserved. NOT the descriptor's index.
 const STREAM_TAG: u32 = 1;
@@ -772,6 +786,24 @@ struct Tone {
     started: u64,
     watchdog: u32,
     interrupts_at_start: u64,
+    /// The sample rate the stream runs at: 48000 for a tone, the file's for a stream.
+    rate: u32,
+    /// `Some` when the samples come from a sender (`OP_OPEN`) rather than the sine.
+    feed: Option<Feed>,
+    /// Bytes of silence written because the sender fell behind.
+    silence: usize,
+}
+
+/// A stream fed by a sender, through `OP_PCM`.
+struct Feed {
+    channels: u8,
+    /// `OP_END` arrived: nothing more is coming, play out what is in the ring.
+    ended: bool,
+    /// RUN is set. A stream starts once half the ring is written, or at the end.
+    running: bool,
+    /// Counter at the last `OP_PCM`, for `FEED_TIMEOUT_MS`.
+    last_feed: u64,
+    frames: u32,
 }
 
 /// Where the volume is set: the output amplifier on the path nearest the converter, and its range.
@@ -796,6 +828,8 @@ struct Player<'a> {
     muted: bool,
     tone: Option<Tone>,
     underruns_total: u32,
+    /// The silence the last stream had written in its place, for `status` after it ends.
+    last_silence_ms: u32,
     /// A change to the volume or the mute not yet written to `/audio.settings`. Written when nothing is
     /// playing: an `fs` write blocks the serve loop, and a slow one mid-tone would starve the ring.
     settings_dirty: bool,
@@ -930,11 +964,11 @@ impl<'a> Player<'a> {
         }
     }
 
-    /// Start a tone: the stream reset and set up over the ring, the ring filled, RUN, and the interrupt
-    /// for this stream on. Returns at once; [`Player::service`] keeps the ring filled as it plays.
-    fn start_tone(&mut self, irq: &Irq, hz: u32, ms: u32) -> bool {
+    /// Reset the output stream and set it up over the ring at `rate`, the converter with it - everything
+    /// short of RUN. The BDL: the ring as BDL_ENTRIES equal periods, each asking for an interrupt.
+    fn prepare_stream(&mut self, rate: u32) -> bool {
         let (ctx, m, d, sd) = (self.h.ctx, self.h.m, self.d, self.sd);
-        // Reset the stream: RUN off first, then SRST set and read back, then cleared and read back.
+        // RUN off first, then SRST set and read back, then cleared and read back.
         m.write32(sd + SD_CTL, m.read32(sd + SD_CTL) & 0x00FF_FFFD);
         let _ = wait::until(ctx, STREAM_WAIT, || m.read32(sd + SD_CTL) & SD_RUN == 0);
         m.write32(sd + SD_CTL, (m.read32(sd + SD_CTL) & 0x00FF_FFFF) | SD_SRST);
@@ -947,7 +981,6 @@ impl<'a> Player<'a> {
             ctx.log("audio-driver: the output stream did not leave reset");
             return false;
         }
-        // The BDL: the ring as BDL_ENTRIES equal periods, each asking for an interrupt when it is done.
         let period = PCM_LEN / BDL_ENTRIES;
         for i in 0..BDL_ENTRIES {
             let e = BDL_OFF + i * 16;
@@ -955,38 +988,209 @@ impl<'a> Player<'a> {
             d.write32(e + 8, period as u32);
             d.write32(e + 12, BDL_IOC);
         }
-        let bytes = (RATE as usize * ms as usize / 1000) * FRAME_BYTES;
-        let mut t = Tone {
-            sine: Sine::new(hz), hz, ms, left: bytes, bytes, filled: PCM_LEN, played: 0, last: 0,
-            underruns: 0, started: 0, watchdog: 0, interrupts_at_start: irq.seen(),
-        };
-        fill(d, 0, PCM_LEN, &mut t.sine, &mut t.left); // the whole ring before RUN; the BDL is read at RUN
+        let fmt = if rate == 44_100 { FMT_44K1_16_STEREO } else { FMT_48K_16_STEREO };
+        // The converter must agree with the stream, or it plays at the wrong speed.
+        let (cad, dac) = (self.cad(), self.path.nodes[self.path.len - 1]);
+        if self.h.verb16(cad, dac, SET_CONVERTER_FORMAT, fmt).is_none() {
+            return false;
+        }
         let bdl = d.phys_at(BDL_OFF);
         m.write32(sd + SD_BDPL, bdl as u32);
         m.write32(sd + SD_BDPU, (bdl >> 32) as u32);
         m.write32(sd + SD_CBL, PCM_LEN as u32);
         m.write16(sd + SD_LVI, (BDL_ENTRIES - 1) as u16);
-        m.write16(sd + SD_FMT, FMT_48K_16_STEREO as u16);
+        m.write16(sd + SD_FMT, fmt as u16);
         m.write32(sd + SD_CTL, (STREAM_TAG << 20) | (SD_STS_ALL as u32) << SD_STS_SHIFT); // the tag; clear status
-        // The controller's interrupt for this stream only: GIE, and this descriptor's SIE bit. The codec
-        // command interrupt (CIE) stays off - the rings are waited on by polling, and are quick.
-        m.write32(INTCTL, INTCTL_GIE | 1 << (sd - SD_BASE) / SD_STRIDE);
-        t.started = ctx.read_tsc();
-        m.write32(sd + SD_CTL, (STREAM_TAG << 20) | SD_IOCE | SD_RUN);
-        ctx.log_fmt(format_args!("audio-driver: playing {} Hz for {} ms", hz, ms));
-        self.tone = Some(t);
         true
     }
 
-    /// Keep a playing tone fed: read how far the stream has got, refill the ring behind it, and end the
-    /// tone when it has played out - or when it has taken a second longer than it should, which means
-    /// the stream is not playing at the rate it was set to.
+    /// RUN, with the controller's interrupt for this stream only: GIE and this descriptor's SIE bit.
+    /// The codec command interrupt (CIE) stays off - the rings are waited on by polling, and are quick.
+    fn run_stream(&mut self) {
+        let (ctx, m, sd) = (self.h.ctx, self.h.m, self.sd);
+        m.write32(INTCTL, INTCTL_GIE | 1 << (sd - SD_BASE) / SD_STRIDE);
+        if let Some(t) = self.tone.as_mut() {
+            t.started = ctx.read_tsc();
+            if let Some(f) = t.feed.as_mut() {
+                f.running = true;
+            }
+        }
+        m.write32(sd + SD_CTL, (STREAM_TAG << 20) | SD_IOCE | SD_RUN);
+    }
+
+    /// Start a tone: the stream set up over the ring, the ring filled with sine, RUN. Returns at once;
+    /// [`Player::service`] keeps the ring filled as it plays.
+    fn start_tone(&mut self, irq: &Irq, hz: u32, ms: u32) -> bool {
+        if !self.prepare_stream(RATE) {
+            return false;
+        }
+        let bytes = (RATE as usize * ms as usize / 1000) * FRAME_BYTES;
+        let mut t = Tone {
+            sine: Sine::new(hz), hz, ms, left: bytes, bytes, filled: PCM_LEN, played: 0, last: 0,
+            underruns: 0, started: 0, watchdog: 0, interrupts_at_start: irq.seen(), rate: RATE, feed: None,
+            silence: 0,
+        };
+        fill(self.d, 0, PCM_LEN, &mut t.sine, &mut t.left); // the whole ring before RUN; the BDL is read at RUN
+        self.tone = Some(t);
+        self.run_stream();
+        self.h.ctx.log_fmt(format_args!("audio-driver: playing {} Hz for {} ms", hz, ms));
+        true
+    }
+
+    /// The rates and sizes the converter says it takes (its own PCM parameter, or the function group's
+    /// default when it has none).
+    fn pcm_caps(&mut self) -> u32 {
+        let (cad, dac, afg) = (self.cad(), self.path.nodes[self.path.len - 1], self.path.afg);
+        match self.h.param(cad, dac, PARAM_PCM) {
+            Some(0) | None => self.h.param(cad, afg, PARAM_PCM).unwrap_or(0),
+            Some(c) => c,
+        }
+    }
+
+    /// Open a stream the caller will feed with `OP_PCM`. The ring starts silent and nothing plays yet.
+    fn open_stream(&mut self, irq: &Irq, rate: u32, channels: u8, bits: u8, frames: u32, out: &mut [u8]) -> usize {
+        if bits != 16 {
+            out[0] = wire::FORMAT;
+            out[1] = wire::format::BITS;
+            return 2;
+        }
+        if channels != 1 && channels != 2 {
+            out[0] = wire::FORMAT;
+            out[1] = wire::format::CHANNELS;
+            return 2;
+        }
+        let caps = self.pcm_caps();
+        let rate_ok = match rate {
+            48_000 => caps & PCM_RATE_48K != 0,
+            44_100 => caps & PCM_RATE_44K1 != 0,
+            _ => false,
+        };
+        if !rate_ok || caps & PCM_BITS_16 == 0 {
+            self.h.ctx.log_fmt(format_args!(
+                "audio-driver: a {} Hz stream was refused - the converter offers PCM {:#010x}", rate, caps));
+            out[0] = wire::FORMAT;
+            out[1] = wire::format::RATE;
+            return 2;
+        }
+        if !self.prepare_stream(rate) {
+            out[0] = wire::NO_DEVICE;
+            out[1] = wire::no_device::BRINGUP_FAILED;
+            return 2;
+        }
+        let mut quiet = Sine::new(1);
+        let mut none = 0usize;
+        fill(self.d, 0, PCM_LEN, &mut quiet, &mut none); // silence, until the sender writes over it
+        let ctx = self.h.ctx;
+        self.tone = Some(Tone {
+            sine: quiet, hz: 0, ms: (frames as u64 * 1000 / rate as u64) as u32, left: 0,
+            bytes: frames as usize * FRAME_BYTES, filled: 0, played: 0, last: 0, underruns: 0, started: 0,
+            watchdog: 0, interrupts_at_start: irq.seen(), rate, silence: 0,
+            feed: Some(Feed { channels, ended: false, running: false, last_feed: ctx.read_tsc(), frames }),
+        });
+        ctx.log_fmt(format_args!("audio-driver: stream opened - {} Hz, {} channel(s), {} frames", rate, channels, frames));
+        out[0] = wire::OK;
+        wire::put_u32(out, 1, self.free_frames());
+        5
+    }
+
+    /// Room for frames in the ring: everything the stream has already read, less a guard behind it.
+    fn free_frames(&self) -> u32 {
+        let Some(t) = self.tone.as_ref() else { return 0 };
+        let running = t.feed.as_ref().is_some_and(|f| f.running);
+        let limit = if running { t.played + PCM_LEN - GUARD } else { PCM_LEN };
+        (limit.saturating_sub(t.filled) / FRAME_BYTES) as u32
+    }
+
+    /// Take whole frames from a sender into the ring; as many as fit. Mono is written to both sides.
+    fn feed_pcm(&mut self, data: &[u8], out: &mut [u8]) -> usize {
+        let d = self.d;
+        let free = self.free_frames() as usize;
+        let ctx = self.h.ctx;
+        let Some(t) = self.tone.as_mut() else { out[0] = wire::NOT_OPEN; return 1 };
+        let Some(f) = t.feed.as_mut() else { out[0] = wire::NOT_OPEN; return 1 };
+        let per = 2 * f.channels as usize;
+        let n = (data.len() / per).min(free);
+        for i in 0..n {
+            let l = u16::from_le_bytes([data[i * per], data[i * per + 1]]) as u32;
+            let r = if f.channels == 2 { u16::from_le_bytes([data[i * per + 2], data[i * per + 3]]) as u32 } else { l };
+            d.write32(PCM_OFF + (t.filled + i * FRAME_BYTES) % PCM_LEN, l | r << 16);
+        }
+        t.filled += n * FRAME_BYTES;
+        f.last_feed = ctx.read_tsc();
+        let start = !f.running && t.filled >= PCM_LEN / 2;
+        if start {
+            self.run_stream();
+        }
+        out[0] = wire::OK;
+        wire::put_u32(out, 1, n as u32);
+        wire::put_u32(out, 5, self.free_frames());
+        9
+    }
+
+    /// Nothing more is coming: play out what is in the ring, then stop.
+    fn end_feed(&mut self, out: &mut [u8]) -> usize {
+        let Some(t) = self.tone.as_mut() else { out[0] = wire::NOT_OPEN; return 1 };
+        let Some(f) = t.feed.as_mut() else { out[0] = wire::NOT_OPEN; return 1 };
+        f.ended = true;
+        let start = !f.running && t.filled > 0;
+        let empty = t.filled == 0;
+        if start {
+            self.run_stream();
+        } else if empty {
+            self.end_stream();
+        }
+        out[0] = wire::OK;
+        1
+    }
+
+    /// Keep what is playing fed. A tone: refill the ring behind the stream's position with sine, and end
+    /// it when it has played out - or a second late, which means the stream is not playing at the rate it
+    /// was set to. A stream: when it has run dry, write silence ahead of the position and count it; when
+    /// the sender has ended, silence the free ring so nothing stale plays, and stop once all is played.
     fn service(&mut self, irq: &Irq) {
-        let (m, d, sd) = (self.h.m, self.d, self.sd);
+        let (m, d, sd, ctx) = (self.h.m, self.d, self.sd, self.h.ctx);
         let Some(t) = self.tone.as_mut() else { return };
+        if let Some(f) = t.feed.as_mut() {
+            if !f.running {
+                if ms_since(ctx, f.last_feed) > FEED_TIMEOUT_MS {
+                    ctx.log("audio-driver: a stream was opened and never fed - closed");
+                    self.end_stream();
+                }
+                return;
+            }
+        }
         let lpib = m.read32(sd + SD_LPIB) as usize % PCM_LEN;
         t.played += (lpib + PCM_LEN - t.last) % PCM_LEN;
         t.last = lpib;
+        if let Some(f) = t.feed.as_mut() {
+            if !f.ended && ms_since(ctx, f.last_feed) > FEED_TIMEOUT_MS {
+                ctx.log("audio-driver: the stream's sender stopped sending - playing out what it sent");
+                f.ended = true;
+            }
+            let ended = f.ended;
+            let mut quiet = Sine::new(1);
+            let mut none = 0usize;
+            if ended {
+                let free = (t.played + PCM_LEN).saturating_sub(t.filled);
+                fill(d, t.filled, free, &mut quiet, &mut none);
+                if t.played >= t.filled {
+                    let (frames, rate, u, sil, took, n) = (f.frames, t.rate, t.underruns,
+                        (t.silence / FRAME_BYTES * 1000 / t.rate as usize) as u32, ms_since(ctx, t.started),
+                        irq.seen() - t.interrupts_at_start);
+                    self.end_stream();
+                    ctx.log_fmt(format_args!(
+                        "audio-driver: played a stream of {} frames at {} Hz in {} ms by the clock, {} underrun(s), {} ms of silence; {} interrupt(s)",
+                        frames, rate, took, u, sil, n));
+                }
+            } else if t.filled < t.played + GUARD {
+                let pad = t.played + GUARD - t.filled;
+                fill(d, t.filled, pad, &mut quiet, &mut none);
+                t.filled += pad;
+                t.silence += pad;
+                t.underruns += 1;
+            }
+            return;
+        }
         if t.played > t.filled {
             t.underruns += 1;
             t.filled = t.played;
@@ -994,7 +1198,6 @@ impl<'a> Player<'a> {
         let room = t.played + PCM_LEN - t.filled;
         fill(d, t.filled, room, &mut t.sine, &mut t.left);
         t.filled += room;
-        let ctx = self.h.ctx;
         if t.played >= t.bytes {
             let (hz, ms, u, took, w, n) = (t.hz, t.ms, t.underruns, ms_since(ctx, t.started), t.watchdog,
                 irq.seen() - t.interrupts_at_start);
@@ -1011,7 +1214,8 @@ impl<'a> Player<'a> {
         }
     }
 
-    /// RUN and the interrupt off, the status cleared, and the tone forgotten. Its underruns are kept.
+    /// RUN and the interrupt off, the status cleared, and the tone or stream forgotten. Its underruns,
+    /// and a stream's silence, are kept for `status`.
     fn end_stream(&mut self) {
         let (ctx, m, sd) = (self.h.ctx, self.h.m, self.sd);
         m.write32(sd + SD_CTL, STREAM_TAG << 20);
@@ -1022,16 +1226,22 @@ impl<'a> Player<'a> {
         }
         if let Some(t) = self.tone.take() {
             self.underruns_total = self.underruns_total.saturating_add(t.underruns);
+            if t.feed.is_some() {
+                self.last_silence_ms = (t.silence / FRAME_BYTES * 1000 / t.rate as usize) as u32;
+            }
         }
     }
 
-    /// Stop a tone early. Returns whether one was playing and how many milliseconds of it had played.
+    /// Stop what is playing early. Returns whether anything was, and how many milliseconds had played.
     fn stop_tone(&mut self, why: &str) -> (bool, u32) {
         let Some(t) = self.tone.as_ref() else { return (false, 0) };
-        let played_ms = (t.played / FRAME_BYTES * 1000 / RATE as usize) as u32;
-        let hz = t.hz;
+        let played_ms = (t.played / FRAME_BYTES * 1000 / t.rate as usize) as u32;
+        let what = if t.feed.is_some() { 0 } else { t.hz };
         self.end_stream();
-        self.h.ctx.log_fmt(format_args!("audio-driver: {} Hz stopped after {} ms ({})", hz, played_ms, why));
+        match what {
+            0 => self.h.ctx.log_fmt(format_args!("audio-driver: stream stopped after {} ms ({})", played_ms, why)),
+            hz => self.h.ctx.log_fmt(format_args!("audio-driver: {} Hz stopped after {} ms ({})", hz, played_ms, why)),
+        }
         (true, played_ms)
     }
 
@@ -1040,9 +1250,12 @@ impl<'a> Player<'a> {
         out[1] = self.power;
         out[2] = self.muted as u8;
         out[3] = self.volume;
-        let (playing, hz, len, elapsed, under) = match self.tone.as_ref() {
-            Some(t) => (1, t.hz, t.ms, ms_since(self.h.ctx, t.started), t.underruns),
-            None => (0, 0, 0, 0, 0),
+        let (playing, hz, len, elapsed, under, sil) = match self.tone.as_ref() {
+            Some(t) if t.feed.is_some() => (wire::PLAYING_STREAM, 0, t.ms,
+                (t.played / FRAME_BYTES * 1000 / t.rate as usize) as u32, t.underruns,
+                (t.silence / FRAME_BYTES * 1000 / t.rate as usize) as u32),
+            Some(t) => (wire::PLAYING_TONE, t.hz, t.ms, ms_since(self.h.ctx, t.started), t.underruns, 0),
+            None => (wire::PLAYING_NOTHING, 0, 0, 0, 0, self.last_silence_ms),
         };
         out[4] = playing;
         wire::put_u16(out, 5, hz as u16);
@@ -1051,6 +1264,7 @@ impl<'a> Player<'a> {
         wire::put_u32(out, 15, self.underruns_total.saturating_add(under));
         out[19] = irq.routed() as u8;
         out[20] = self.pin_device as u8;
+        wire::put_u32(out, 21, sil);
         wire::STATUS_LEN
     }
 
@@ -1157,6 +1371,23 @@ impl<'a> Player<'a> {
                 }
                 1
             }
+            wire::OP_OPEN => {
+                if !on {
+                    out[0] = wire::AUDIO_OFF;
+                    return 1;
+                }
+                if self.tone.is_some() {
+                    out[0] = wire::BUSY;
+                    return 1;
+                }
+                if args.len() < 10 {
+                    return bad(out);
+                }
+                let (rate, ch, bits, frames) = (wire::get_u32(args, 0), args[4], args[5], wire::get_u32(args, 6));
+                self.open_stream(irq, rate, ch, bits, frames, out)
+            }
+            wire::OP_PCM => self.feed_pcm(args, out),
+            wire::OP_END => self.end_feed(out),
             wire::OP_STOP => {
                 let (was, ms) = self.stop_tone("asked to stop");
                 out[0] = wire::OK;
@@ -1269,6 +1500,7 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
         h, d, path, pin_device, amp,
         sd: SD_BASE + iss * SD_STRIDE, // the first output stream follows the input streams
         power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false, tone: None, underruns_total: 0,
+        last_silence_ms: 0,
         settings_dirty: false, settings_failing: false,
     };
     if let Some(s) = load_settings(ctx) {

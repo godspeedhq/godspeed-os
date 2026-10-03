@@ -34,6 +34,20 @@ pub const BUSY: u8 = 4;
 pub const NO_DEVICE: u8 = 5;
 /// Already in the state asked for: nothing was sent to the codec.
 pub const ALREADY: u8 = 6;
+/// A format this driver or this codec does not play; byte 1 is a `format` reason.
+pub const FORMAT: u8 = 7;
+/// `OP_PCM` or `OP_END` with no stream open.
+pub const NOT_OPEN: u8 = 8;
+
+/// Byte 1 of a `FORMAT` answer.
+pub mod format {
+    /// Only 16-bit samples are played.
+    pub const BITS: u8 = 1;
+    /// One or two channels.
+    pub const CHANNELS: u8 = 2;
+    /// A rate the codec does not offer; this driver plays 44100 and 48000 Hz where the codec has them.
+    pub const RATE: u8 = 3;
+}
 
 /// Byte 1 of a `NO_DEVICE` answer: why there is nothing to drive.
 pub mod no_device {
@@ -73,12 +87,17 @@ pub const POWER_HARD_OFF: u8 = 2;
 // ---- Ops ----------------------------------------------------------------------------------------------
 
 /// What audio is doing now. Answer `[OK, power, muted, volume, playing, hz u16, length_ms u32,
-/// elapsed_ms u32, underruns u32, interrupts u8, output u8]` - `STATUS_LEN` bytes. `interrupts` is 1
-/// when the driver refills on its interrupt, 0 when it polls. `underruns` counts since the driver
-/// started. `output` is the output pin's default-device field, as in `OP_INFO`.
+/// elapsed_ms u32, underruns u32, interrupts u8, output u8, silence_ms u32]` - `STATUS_LEN` bytes.
+/// `playing` is a `PLAYING_*`; `hz` is the tone's, 0 for a stream. `interrupts` is 1 when the driver
+/// refills on its interrupt, 0 when it polls. `underruns` counts since the driver started, and
+/// `silence_ms` is the silence a stream that ran dry has had written in its place, for the stream
+/// playing or last played. `output` is the output pin's default-device field, as in `OP_INFO`.
 /// Or `[NO_DEVICE, reason]`.
 pub const OP_STATUS: u8 = 1;
-pub const STATUS_LEN: usize = 21;
+pub const STATUS_LEN: usize = 25;
+pub const PLAYING_NOTHING: u8 = 0;
+pub const PLAYING_TONE: u8 = 1;
+pub const PLAYING_STREAM: u8 = 2;
 
 /// The detail a fault needs. Answer `[OK, vendor u16, device u16, codec_addr, dac_node, pin_node,
 /// pin_device, amp_steps, amp_step_now, rate u32, ring_bytes u32, interrupts u8, interrupts_seen u32,
@@ -110,6 +129,22 @@ pub const TONE_MS_MAX: u32 = 600_000;
 
 /// Stop what is playing. Answer `[OK, was_playing, played_ms u32]`.
 pub const OP_STOP: u8 = 7;
+
+/// `[8, rate u32, channels u8, bits u8, frames u32]` - open a stream of samples the caller will send.
+/// Answer `[OK, free_frames u32]`, or `FORMAT` with a reason, `AUDIO_OFF`, `BUSY`. Nothing plays yet:
+/// the stream starts once half the ring is filled, or at `OP_END`, so a sender's first moments of
+/// jitter are absorbed rather than heard.
+pub const OP_OPEN: u8 = 8;
+/// `[9, samples...]` - whole frames of 16-bit little-endian samples, interleaved if stereo, at most
+/// `PCM_MAX` bytes. Answer `[OK, accepted_frames u32, free_frames u32]` at once; frames past the free
+/// space are NOT taken, and the caller sends them again. An empty `[9]` asks only how much is free.
+/// A stream that runs dry has silence written in its place, counted as an underrun.
+pub const OP_PCM: u8 = 9;
+pub const PCM_MAX: usize = 3556;
+/// `[10]` - nothing more is coming: the ring plays out and the stream stops. Answer `[OK]`.
+pub const OP_END: u8 = 10;
+/// The rates a stream may be opened at, where the codec offers them.
+pub const STREAM_RATES: [u32; 2] = [44_100, 48_000];
 
 /// What a pin's default-device field (bits 23:20 of its configuration default) names, as the driver's log
 /// and the shell's `audio` both say it.

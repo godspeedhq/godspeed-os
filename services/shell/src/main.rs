@@ -974,8 +974,9 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
     ("wifi",    &["scan", "list", "join", "leave", "status", "info", "debug", "forget", "stored", "radio"]),
     // Only the verbs that are BUILT: completing one that answers "not built yet" would teach a word
-    // the utility cannot act on. `outputs`, `output`, `play`, `debug` and `system` join as they land.
-    ("audio",   &["status", "info", "volume", "mute", "unmute", "on", "off", "tone"]),
+    // the utility cannot act on. `outputs`, `output`, `debug` and `system` join as they land. `play`
+    // takes a PATH, which is why `audio` is not in NO_PATH_CMDS: Tab after `audio play ` offers files.
+    ("audio",   &["status", "info", "volume", "mute", "unmute", "on", "off", "tone", "play"]),
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
@@ -2069,7 +2070,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "wifi"    => cmd_wifi(ctx, s["wifi".len()..].trim(), out),
-        "audio"   => cmd_audio(ctx, s["audio".len()..].trim(), out),
+        "audio"   => cmd_audio(ctx, cwd, s["audio".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -5029,7 +5030,8 @@ const FOREIGN_HINTS: &[(&str, &str)] = &[
     ("uname", "about"),
     ("man",   "help"),
     ("which", "whatis"),
-    // Sound (utilities/57_audio.md). `aplay` joins with `audio play`, when that is built.
+    // Sound (utilities/57_audio.md).
+    ("aplay", "audio play"),
     ("beep",  "audio tone"),
     ("speaker-test", "audio tone"),
     ("amixer", "audio volume"),
@@ -5286,6 +5288,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio mute | unmute", "silence the output, keeping the volume; unmute returns to it", "audio mute"),
             ("audio on | off | off hard", "the codec's power: off powers it down, off hard holds the controller in reset, on brings either back", "audio off"),
             ("audio tone <hz> [seconds]", "play a sine the driver makes itself, 2 s unless told; q stops it", "audio tone 440 2"),
+            ("audio play <path>", "play a WAV file: 16-bit PCM, mono or stereo, 44100 or 48000 Hz; q stops it", "audio play /music/test.wav"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
         "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
@@ -5588,6 +5591,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("audio", "off") => help_block(ctx, "audio off", "power the codec down", &[
             ("audio off", "stops anything playing; the codec goes to its lowest power state", "audio off"),
             ("audio off hard", "the whole controller held in reset - the closest HD Audio has to cutting power", "audio off hard"),
+        ], false),
+        ("audio", "play") => help_block(ctx, "audio play", "play a WAV file from disk", &[
+            ("audio play <path>", "16-bit PCM, mono or stereo, 44100 or 48000 Hz; anything else is refused and the reason said; q STOPS it", "audio play /music/test.wav"),
         ], false),
         ("audio", "tone") => help_block(ctx, "audio tone", "a sine the driver generates itself", &[
             ("audio tone <hz> [seconds]", "20 to 20000 Hz, 2 s unless told, tenths allowed; q STOPS it", "audio tone 440 2"),
@@ -7601,7 +7607,7 @@ fn audio_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
 const AUDIO_REPLY_MS: u64 = 3000;
 
 /// `audio` - sound: what is playing, the volume, the codec's power, and a test tone.
-fn cmd_audio(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let arg = arg.trim();
     // A bare utility name prints usage (`0_conventions.md` rule 1).
     if arg.is_empty() {
@@ -7628,16 +7634,20 @@ fn cmd_audio(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
             out.line_fmt(ctx, format_args!("audio: usage: audio tone <hz> [seconds]  (e.g. audio tone 440 2)"));
             return Err(ShellError::Unknown);
         }
-        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" => {}
+        "play" if rest.is_empty() => {
+            out.line_fmt(ctx, format_args!("audio: usage: audio play <path>  (e.g. audio play /music/test.wav)"));
+            return Err(ShellError::Unknown);
+        }
+        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" => {}
         // Agreed and not built: said as such, never as a fault (docs/audio.md has the plan).
-        "outputs" | "output" | "play" | "debug" | "system" => {
+        "outputs" | "output" | "debug" | "system" => {
             out.line_fmt(ctx, format_args!("audio: `audio {}` is not built yet - docs/audio.md has where it comes in", verb));
             return Err(ShellError::Unknown);
         }
         _ => {
             out.line_fmt(ctx, format_args!(
                 "audio: unknown subcommand - try audio status, info, volume <0-100>, mute, unmute, on, off,"));
-            out.line_fmt(ctx, format_args!("       off hard, tone <hz> [seconds], or audio help"));
+            out.line_fmt(ctx, format_args!("       off hard, tone <hz> [seconds], play <path>, or audio help"));
             return Err(ShellError::Unknown);
         }
     }
@@ -7668,6 +7678,7 @@ fn cmd_audio(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         "on" => audio_power(ctx, out, audio_wire::POWER_ON),
         "off" if rest == "hard" => audio_power(ctx, out, audio_wire::POWER_HARD_OFF),
         "off" => audio_power(ctx, out, audio_wire::POWER_OFF),
+        "play" => audio_play(ctx, cwd, out, rest),
         _ => audio_tone(ctx, out, rest),
     }
 }
@@ -7932,6 +7943,228 @@ fn parse_tenths(w: &str) -> Option<u32> {
     let whole: u32 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
     let tenth: u32 = frac.parse().ok()?;
     whole.checked_mul(10)?.checked_add(tenth)
+}
+
+/// A WAV file's format and where its samples are, from its header.
+struct WavInfo {
+    rate: u32,
+    channels: u8,
+    bits: u16,
+    /// Byte offset of the samples in the file, and how many bytes of them there are (whole frames).
+    data_at: u64,
+    data_len: u64,
+}
+
+/// Read a WAV header from the first bytes of a file: `RIFF` / `WAVE`, then chunks until `fmt ` and
+/// `data` have both been seen. PCM only (format 1, or WAVE_FORMAT_EXTENSIBLE carrying PCM). `Err` is the
+/// sentence that says why not, ready to print.
+fn wav_parse(head: &[u8], file_len: u64) -> Result<WavInfo, &'static str> {
+    let le16 = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    if head.len() < 12 || &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return Err("is not a WAV file");
+    }
+    let mut at = 12usize;
+    let mut fmt: Option<(u16, u8, u32, u16)> = None;
+    while at + 8 <= head.len() {
+        let id = &head[at..at + 4];
+        let size = le32(head, at + 4) as u64;
+        let body = at + 8;
+        if id == b"fmt " {
+            if body + 16 > head.len() {
+                return Err("has a format chunk this reader cannot see whole");
+            }
+            let tag = le16(head, body);
+            // WAVE_FORMAT_EXTENSIBLE: the real format is the first two bytes of its sub-format GUID.
+            let tag = if tag == 0xFFFE && body + 26 <= head.len() { le16(head, body + 24) } else { tag };
+            fmt = Some((tag, le16(head, body + 2) as u8, le32(head, body + 4), le16(head, body + 14)));
+        } else if id == b"data" {
+            let Some((tag, channels, rate, bits)) = fmt else { return Err("has its samples before its format") };
+            if tag != 1 {
+                return Err("is compressed - this plays uncompressed PCM");
+            }
+            let frame = (bits as u64 / 8) * channels.max(1) as u64;
+            let avail = file_len.saturating_sub(body as u64);
+            let len = size.min(avail) / frame.max(1) * frame.max(1);
+            return Ok(WavInfo { rate, channels, bits, data_at: body as u64, data_len: len });
+        }
+        // Chunks are padded to an even length.
+        at = body + size as usize + (size as usize & 1);
+    }
+    Err("has no samples in the first 3.5 KiB - a header this large is not one this reader follows")
+}
+
+/// `m:ss` for a number of milliseconds.
+fn audio_clock(ms: u64) -> (u64, u64) {
+    let s = ms / 1000;
+    (s / 60, s % 60)
+}
+
+/// `audio play <path>`: read the file's header, open a stream at its format, then send the samples as
+/// the driver makes room, watching for `q` - which STOPS the sound (rule 11). The driver answers every
+/// send at once with the room it has left, so this never waits on the driver for longer than one
+/// answer; it waits on the RING, in 20 ms sleeps, when the ring is full.
+fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let mut pbuf = [0u8; PATH_MAX];
+    let Some(path) = resolve_or_err(ctx, cwd, arg, &mut pbuf) else { return Err(ShellError::Unknown) };
+    let size = match fs_stat_r(ctx, path) {
+        Ok(st) if !st.is_dir => st.size,
+        Ok(_) => {
+            out.line_fmt(ctx, format_args!("audio: {} is a directory", str_of(path)));
+            return Err(ShellError::Unknown);
+        }
+        Err(gs::Error::NotFound) => {
+            out.line_fmt(ctx, format_args!("audio: not found: {}", str_of(path)));
+            return Err(ShellError::FileNotFound);
+        }
+        Err(_) => {
+            out.line_fmt(ctx, format_args!("audio: storage unavailable"));
+            return Err(ShellError::Unknown);
+        }
+    };
+    let mut chunk = [0u8; IO_CHUNK];
+    let n = match fs_read_at(ctx, path, 0, &mut chunk) {
+        Some(n) => n,
+        None => {
+            out.line_fmt(ctx, format_args!("audio: storage error reading {}", str_of(path)));
+            return Err(ShellError::Unknown);
+        }
+    };
+    let w = match wav_parse(&chunk[..n], size) {
+        Ok(w) => w,
+        Err(why) => {
+            out.line_fmt(ctx, format_args!("audio: {} {}", str_of(path), why));
+            return Err(ShellError::Unknown);
+        }
+    };
+    if w.bits != 16 {
+        out.line_fmt(ctx, format_args!("audio: {} is {}-bit - this plays 16-bit PCM", str_of(path), w.bits));
+        return Err(ShellError::Unknown);
+    }
+    if w.channels != 1 && w.channels != 2 {
+        out.line_fmt(ctx, format_args!("audio: {} has {} channels - this plays mono or stereo", str_of(path), w.channels));
+        return Err(ShellError::Unknown);
+    }
+    let frame = 2 * w.channels as u64;
+    let frames = (w.data_len / frame).min(u32::MAX as u64) as u32;
+    let length_ms = frames as u64 * 1000 / w.rate.max(1) as u64;
+
+    // Nothing is ever silent without saying why.
+    audio_say_if_silent(ctx, out)?;
+    let mut req = [OP_OPEN, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    put_u32(&mut req, 1, w.rate);
+    req[5] = w.channels;
+    req[6] = 16;
+    put_u32(&mut req, 7, frames);
+    let r = audio_ask(ctx, &req, AUDIO_REPLY_MS);
+    if let Some(p) = r.as_ref().map(|m| m.payload_bytes()) {
+        if p.first() == Some(&FORMAT) {
+            out.line_fmt(ctx, format_args!("audio: {} is {} Hz - this codec plays 44100 or 48000 Hz", str_of(path), w.rate));
+            return Err(ShellError::Unknown);
+        }
+    }
+    let r = audio_reply(ctx, out, r, 5)?;
+    let mut free = get_u32(r.payload_bytes(), 1) as u64;
+    let (mm, ss) = audio_clock(length_ms);
+    ctx.console_writeln_fmt(format_args!("playing {} ({} Hz, 16-bit, {}, {}:{:02})  [q] quit",
+        str_of(path), w.rate, if w.channels == 2 { "stereo" } else { "mono" }, mm, ss));
+
+    // Send. A chunk is whole frames, at most one file read and one message.
+    let per_msg = (PCM_MAX.min(IO_CHUNK) as u64 / frame) * frame;
+    let mut sent = 0u64;
+    let mut msg = [0u8; 1 + PCM_MAX];
+    msg[0] = OP_PCM;
+    // Bounded: the file's own length twice over, plus ten seconds - a driver that stops taking samples
+    // costs this shell a bounded wait, never the prompt.
+    let t0 = ctx.read_tsc();
+    let limit = ctx.duration_cycles(length_ms * 2 + 10_000);
+    while sent < w.data_len {
+        if let Some(k) = ctx.try_console_read() {
+            if k == b'q' || k == b'Q' || k == 0x1b {
+                return audio_stop_said(ctx, out);
+            }
+        }
+        if ctx.read_tsc().wrapping_sub(t0) >= limit {
+            let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
+            out.line_fmt(ctx, format_args!("audio: the driver stopped taking samples - stopped"));
+            return Err(ShellError::Unknown);
+        }
+        // Send when a whole chunk fits; otherwise the ring is full.
+        let want = per_msg.min(w.data_len - sent);
+        if free * frame < want {
+            // The ring is full: wait for it to drain, and ask how much it has room for.
+            ctx.sleep_ms(20);
+            let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_PCM], AUDIO_REPLY_MS), 9)?;
+            free = get_u32(r.payload_bytes(), 5) as u64;
+            continue;
+        }
+        let got = match fs_read_at(ctx, path, w.data_at + sent, &mut msg[1..1 + want as usize]) {
+            Some(g) if g > 0 => (g as u64 / frame) * frame,
+            _ => {
+                let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
+                out.line_fmt(ctx, format_args!("audio: storage error reading {} - stopped", str_of(path)));
+                return Err(ShellError::Unknown);
+            }
+        };
+        let r = audio_reply(ctx, out, audio_ask(ctx, &msg[..1 + got as usize], AUDIO_REPLY_MS), 9)?;
+        let p = r.payload_bytes();
+        // Frames the driver did not take are sent again next time round, from where it stopped.
+        sent += get_u32(p, 1) as u64 * frame;
+        free = get_u32(p, 5) as u64;
+    }
+    audio_reply(ctx, out, audio_ask(ctx, &[OP_END], AUDIO_REPLY_MS), 1)?;
+
+    // Played out: watch status until the stream has stopped.
+    loop {
+        if let Some(k) = ctx.try_console_read() {
+            if k == b'q' || k == b'Q' || k == 0x1b {
+                return audio_stop_said(ctx, out);
+            }
+        }
+        ctx.sleep_ms(100);
+        let s = audio_reply(ctx, out, audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS), STATUS_LEN)?;
+        let p = s.payload_bytes();
+        if p[4] == PLAYING_NOTHING {
+            let sil = get_u32(p, 21);
+            if sil == 0 {
+                out.line_fmt(ctx, format_args!("played {}:{:02}", mm, ss));
+            } else {
+                out.line_fmt(ctx, format_args!("played {}:{:02}, {} ms of silence where the samples did not arrive in time", mm, ss, sil));
+            }
+            return Ok(());
+        }
+        if ctx.read_tsc().wrapping_sub(t0) >= limit {
+            let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
+            out.line_fmt(ctx, format_args!("audio: the stream was still playing long after it should have ended - stopped"));
+            return Err(ShellError::Unknown);
+        }
+    }
+}
+
+/// `q`: stop the sound, and say how far it got.
+fn audio_stop_said(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[audio_wire::OP_STOP], AUDIO_REPLY_MS), 6)?;
+    let played = audio_wire::get_u32(r.payload_bytes(), 2);
+    out.line_fmt(ctx, format_args!("stopped after {}.{} s", played / 1000, played % 1000 / 100));
+    Ok(())
+}
+
+/// Before playing: refuse if audio is off, and say so if nothing will be heard.
+fn audio_say_if_silent(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let before = audio_reply(ctx, out, audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS), STATUS_LEN)?;
+    let b = before.payload_bytes();
+    if b[1] != POWER_ON {
+        out.line_fmt(ctx, format_args!("audio is off - `audio on` first"));
+        return Err(ShellError::Unknown);
+    }
+    if b[2] != 0 {
+        out.line_fmt(ctx, format_args!("muted - nothing will be heard"));
+    } else if b[3] == 0 {
+        out.line_fmt(ctx, format_args!("volume is 0 - nothing will be heard"));
+    }
+    Ok(())
 }
 
 /// Which `audio` verbs may start a pipe: the REPORTS. The actions refuse, naming the reports (rule 12).
@@ -14063,7 +14296,7 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) -> bool
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
         "wifi"         => return cmd_wifi(ctx, arg, out).is_ok(),
-        "audio"        => return cmd_audio(ctx, arg, out).is_ok(),
+        "audio"        => return cmd_audio(ctx, cwd, arg, out).is_ok(),
         "random"       => { let _ = cmd_random(ctx, arg, out); }
         "tcp"          => {
             let mut a = [""; MAX_ARGS];
