@@ -736,7 +736,7 @@ volume-50 and volume-100 tones (the same frequency, a different LEVEL, phases no
 only in a run of at most two between sounds that differ; a glitch planted inside a steady 660 Hz run is
 still caught - checked by replaying the rule over the capture with one block altered.
 
-## The Pis and the VisionFive (researched 2026-10-03; the Pis' jack BUILT the same day, not yet heard)
+## The Pis and the VisionFive (researched 2026-10-03; the Pis' jack built the same day and HEARD on a Pi 4 that night)
 
 Researched from Circle (a bare-metal Raspberry Pi library), the BCM2835 and BCM2711 datasheets, the
 Raspberry Pi device trees and StarFive's vendor kernel. The full notes, each item marked quoted or
@@ -812,6 +812,28 @@ click at its start or end; `audio volume 20` audibly quieter; `audio play` of a 
 whole. On the Pi 2 the same, with pins 40/45, PLLD/2 and range 5669 (about 12 bits). If the pacing check
 measures a period far from 23 ms, the PWM clock is not what the driver assumes, and the number says by
 how much.
+
+**Heard on a Pi 4, 2026-10-03, at `fd55d331`.** Headphones in the jack, every verb as predicted: `audio
+tone 440 2` audible with no click at either end, `audio volume` audibly changing the level, `audio mute` and
+`audio unmute` silencing and restoring it. The boot log read exactly the four predicted lines, and the
+pacing check measured `one period of 1024 frames took 23102 us (expected 23219 us)` - the PWM runs 0.5%
+fast, about 442 Hz for a 440 Hz tone, which is below what an ear notices and is the PLLD/6 divider being
+an integer rather than anything wrong. The 2 s tone took 2014 ms by the clock with 1 underrun. After `kill
+pwm-audio` the respawned driver read `volume 20` back from `/audio.settings`. The Pi 2's jack is built
+the same way and has not yet been heard.
+
+**Found the same night, not explained yet.** In the `chaos max-carnage` that followed, the SHELL took two
+EL0 faults in four rounds - an instruction abort, then a write to a read-only page in its own text - each
+1 to 7 ms after another service finished spawning, which ended the storm. Neither is the `0x2020...`
+fingerprint of the four earlier Pi 4 shell sightings, and the Pi 4 had thrown one such fault per 100
+rounds in August, before any audio code existed. The jack's DMA is RULED OUT by construction rather than
+by assumption: its arena is reserved once and never recycled, `start` resets the channel and waits for it
+before touching a control block, and every control block's destination is the PWM FIFO, so the engine
+reads only its own arena and writes only to one peripheral register. **Not audio's, and not yet explained.** A
+first hypothesis - the AArch64 context switch skipping its TLB flush when a respawn was handed a recycled
+page-table root - was fixed and tested on the card, and the faults continued. `backlog/72` carries the
+evidence, what is ruled out (the CPU clock, with `force_turbo=1`; this DMA; that TLB flush), and the
+instrument that comes next.
 
 **HDMI on the Pis** - the operator's TV is a better test than headphones. The firmware sets HDMI up at
 boot (our console uses it), and Circle drives HDMI audio bare-metal on Pi 1 to 4 by feeding the HDMI
