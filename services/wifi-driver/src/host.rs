@@ -174,7 +174,8 @@ fn write_settle() {
 }
 
 pub struct Host<'a> {
-    /// For the clock that bounds every wait on this controller (`godspeed::driver::wait`).
+    /// For the clock that bounds the command and data waits (`godspeed::driver::wait`), which take no
+    /// `ctx` of their own. `park`, `reset` and `set_clock` are handed one and use that.
     ctx: &'a ServiceContext,
     m: &'a Mmio,
     /// The controller's base clock in Hz, from the platform. **0 means refuse**, never guess: every
@@ -203,8 +204,8 @@ pub struct Host<'a> {
     last_cmdtm: core::cell::Cell<u32>,
     /// `RESP0` from the last command a DATA transfer issued.
     ///
-    /// **This was being thrown away, and it is the answer to the failure it was hiding.** `cmd_data`
-    /// calls `cmd()`, which returns the response, and discarded it - so when a CMD53 completed and no
+    /// **This was being thrown away, and it is the answer to the failure it was hiding.** `cmd_data_word`
+    /// calls `cmd_inner`, which returns the response, and discarded it - so when a CMD53 completed and no
     /// data followed there was no way to see whether the CARD had refused. A refusal looks exactly like
     /// that: the command completes, the card answers with its flags set, and no data comes. Same shape
     /// as `last_int` and kept for the same reason.
@@ -708,7 +709,7 @@ impl<'a> Host<'a> {
         self.wait_done.set(self.wait_done.get() + t as u64);
         self.wr(INTERRUPT, INT_DATA_DONE);
         for _ in 0..10 {
-            spin(); // Ncc, as in `cmd`
+            spin(); // Ncc, as in `cmd_inner`
         }
         Ok(())
     }

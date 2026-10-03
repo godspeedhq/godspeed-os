@@ -27,11 +27,14 @@
 //! m.write32(CMD, 0);
 //! ```
 //!
-//! **On a calibrated machine it spins** for the duration, measured by the counter. It does not sleep:
-//! the kernel's sleep floors at a scheduler quantum, nominally 10 ms (CLAUDE.md 9.1), which would turn a
-//! 10 us hold into a thousand times that.
+//! **On a calibrated machine [`hold`] spins** for the duration, measured by the counter. It does not
+//! sleep: the kernel's sleep floors at a scheduler quantum, nominally 10 ms (CLAUDE.md 9.1), which would
+//! turn a 10 us hold into a thousand times that. **[`hold_parked`] sleeps first and spins out the
+//! rest**, for holds of tens of milliseconds where the core matters more than the microsecond: it can
+//! run up to a quantum long, which a minimum allows, and is never short. It has ONE caller (`ehci`), so
+//! it is in on probation: `docs/driver-library.md` 1l says why.
 //!
-//! **On an uncalibrated one it sleeps whole quanta**, as many as the duration needs at the nominal
+//! **On an uncalibrated one both sleep whole quanta**, as many as the duration needs at the nominal
 //! 10 ms: the quantum is measured by the kernel's tick rather than the counter nobody could calibrate,
 //! so it is the one duration left, and it errs long. [`super::wait::calibrated`] says which case this
 //! machine is in.
@@ -67,7 +70,34 @@ pub fn hold(ctx: &ServiceContext, d: Budget) {
     }
     let ticks = super::wait::ticks_for(per_10ms, d.as_us());
     let start = ctx.read_tsc();
-    // `wrapping_sub` so a counter that wraps mid-hold still measures the interval correctly.
+    spin_until(ctx, start, ticks);
+}
+
+/// Hold for at least `d`, PARKED: sleep through it, then spin out whatever the sleep left. For holds of
+/// tens of milliseconds - a USB reset, a debounce - where the core matters more than waking on the
+/// microsecond.
+///
+/// A [`hold`] that long spins the whole time, and a driver that holds often pays for it: `ehci`, which
+/// holds 50 and 100 ms on every turn of its rescan loop, read 100% of a core in `observe` with nothing
+/// plugged in until it learned to park. The sleep can wake late by up to a quantum, which a MINIMUM
+/// allows; the spin covers a sleep that woke early, so the hold is never short on a calibrated machine.
+/// On an uncalibrated one it is [`hold`]'s whole quanta.
+#[cfg(not(test))]
+pub fn hold_parked(ctx: &ServiceContext, d: Budget) {
+    let per_10ms = ctx.tsc_ticks_per_10ms();
+    if per_10ms == 0 {
+        return hold(ctx, d);
+    }
+    let ticks = super::wait::ticks_for(per_10ms, d.as_us());
+    let start = ctx.read_tsc();
+    ctx.sleep(ticks);
+    spin_until(ctx, start, ticks);
+}
+
+/// Spin until `ticks` have passed since `start`. `wrapping_sub` so a counter that wraps mid-hold still
+/// measures the interval correctly.
+#[cfg(not(test))]
+fn spin_until(ctx: &ServiceContext, start: u64, ticks: u64) {
     while ctx.read_tsc().wrapping_sub(start) < ticks {
         core::hint::spin_loop();
     }

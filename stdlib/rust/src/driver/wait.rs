@@ -118,7 +118,8 @@ pub fn calibrated(ctx: &ServiceContext) -> bool {
     ctx.tsc_ticks_per_10ms() != 0
 }
 
-/// A running bound. Start it, then ask [`Deadline::expired`] once per look.
+/// A running bound. Make it with [`Deadline::start`] (polling) or [`Deadline::paced`] (sleeping), ask
+/// [`Deadline::expired`] once per look, and call [`Deadline::pause`] between looks.
 #[cfg(not(test))]
 pub struct Deadline<'a> {
     ctx: &'a ServiceContext,
@@ -135,6 +136,8 @@ pub struct Deadline<'a> {
 
 #[cfg(not(test))]
 impl<'a> Deadline<'a> {
+    /// A polling deadline: [`Deadline::pause`] is only a spin hint. On an uncalibrated machine the
+    /// budget becomes [`UNCALIBRATED_POLLS`] looks.
     pub fn start(ctx: &'a ServiceContext, budget: Budget) -> Self {
         let per_10ms = ctx.tsc_ticks_per_10ms();
         Deadline {

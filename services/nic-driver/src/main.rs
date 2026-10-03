@@ -120,16 +120,15 @@ const TALLY_OFF:     usize = 0x7000;
 
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
+// `RESET_WAIT` and `TX_CONFIRM_MS` are clocks (`gs::driver::wait`). `RX_POLL_MAX` is still a count of
+// yields, and a miss there is an ordinary empty reply, not a failure (`docs/driver-library.md` 1j).
 //
 // How long a controller reset may take to self-clear, for both chips. It was a COUNT - 1,000,000
 // yields here and 300,000 in the RTL8168 path - and a count of yields is no time at all: on the T630
-// 50,000 of them took over two seconds, so the RTL bound was minutes. Linux's r8169 polls the same bit
-// 100 times 100 us apart, 10 ms; this allows ten times that (`gs::driver::wait`).
+// 50,000 of them took over two seconds, so the RTL bound was over twelve seconds and the e1000's over
+// forty. Linux's r8169 polls the same bit 100 times 100 us apart, 10 ms; this allows ten times that
+// (`gs::driver::wait`).
 const RESET_WAIT: Budget = Budget::ms(100);
-// A healthy RTL8168 clears the TX descriptor's OWN bit in ~us (the first few poll iterations). The old
-// 1_000_000-yield bound meant a NIC that FAILED to complete a transmit froze the whole ping for ~1s per
-// send. Bound it TIGHT so a stuck TX fails FAST and is recovered (§26.6 bounded, §26.7 loud), instead of
-// stalling the box. 30_000 is ~30x headroom over a us-scale success but ~ms, not seconds, on failure.
 /// How long to wait for the NIC to confirm a transmit, IN MILLISECONDS.
 ///
 /// It used to be a count - 30,000 yields - and a count is not a duration: the same loop is a
@@ -239,10 +238,6 @@ const RTL_MTPS_VALUE: u8 = 0x3B;
 /// in-flight DMA burst time to retire instead of being reset underneath itself.
 const RTL_QUIESCE_MS: u64 = 10;
 
-/// Realtek RTL8168 (the T630's NIC). Networking Phase 4, STAGE A: reset the controller, read the MAC
-/// (IDR0-5) and link (PHYSTATUS), and log them - proving the MMIO BAR + register access work on real
-/// hardware. TX/RX descriptor rings are Stage B; until then it serves the frame interface with EMPTY
-/// replies so net-stack degrades rather than hanging (§26.7). Never returns.
 /// Wait, up to `TX_CONFIRM_MS`, for the NIC to say a transmit is done, yielding between looks: a send
 /// that has not landed at the first look is usually microseconds away, and the core is better given
 /// back than spun. Both chips call it; the caller reads the descriptor again for the answer.
@@ -257,6 +252,10 @@ fn await_tx(ctx: &ServiceContext, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Realtek RTL8168 (the T630's NIC). Networking Phase 4, STAGE A: reset the controller, read the MAC
+/// (IDR0-5) and link (PHYSTATUS), and log them - proving the MMIO BAR + register access work on real
+/// hardware. TX/RX descriptor rings are Stage B; until then it serves the frame interface with EMPTY
+/// replies so net-stack degrades rather than hanging (§26.7). Never returns.
 fn realtek_main(ctx: ServiceContext) -> ! {
     const R_CR:        usize = 0x37; // Command: RST=0x10, RE=0x08, TE=0x04
     const R_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02

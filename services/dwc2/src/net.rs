@@ -1545,8 +1545,9 @@ fn bulk(
 ) -> Option<u32> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
     // `gs::driver::wait`'s deadline. A look is a whole channel attempt (up to `wait_halt`'s 50 ms), so
-    // on an uncalibrated clock the library's look count is a long bound - but one that ends, where the
-    // one-tick deadline built from `duration_cycles` allowed a single attempt.
+    // on an uncalibrated clock the library's 200,000 looks are 200,000 attempts, which can be hours: it
+    // ends, where the one-tick deadline built from `duration_cycles` allowed a single attempt. Recorded
+    // in `docs/driver-library.md` as an open gap, not a bound anyone chose.
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(budget_ms));
     let mut last = 0u32;
     let mut halted = 0u32;

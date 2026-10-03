@@ -389,8 +389,8 @@ pub struct Dwmac {
 impl Dwmac {
     /// Spin until `reg & bit` clears, or the budget expires. Returns whether it cleared, and how
     /// many microseconds it took - the second half matters because "cleared in 900 ms" and "cleared
-    /// instantly" are the same success with very different meanings for the next person. The time is
-    /// 0 on an uncalibrated machine, where it cannot be known.
+    /// instantly" are the same success with very different meanings for the next person. On success
+    /// the time is 0 on an uncalibrated machine, where it cannot be known; on expiry it is the budget.
     ///
     /// The wait is `gs::driver::wait` (`docs/driver-library.md`), which also owns the uncalibrated
     /// ceiling this file used to declare for itself.

@@ -1,7 +1,8 @@
 # The driver library: `gs::driver`
 
-**Status: adopted 2026-10-02, from the operator's design guidance. One mechanism built (`wait`), one
-driver converted (`wifi-driver`). Everything else below is the method, not a list of things to build.**
+**Status: adopted 2026-10-02, from the operator's design guidance. Two mechanisms built (`wait`,
+`delay`); nine drivers converted across all four ports. "Current state" below says what exists; the
+method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
 
@@ -30,6 +31,55 @@ A driver reaches for `gs::driver` wherever a safe, stable mechanism exists there
 where one does not yet. **Nothing here adds a kernel responsibility.** `gs::driver` is the mechanisms
 the kernel already offers, in the one shape a driver should use; MISCIS (CLAUDE.md 4.3) does not move.
 
+### What this supersedes
+
+`docs/stdlib-design.md` ("MMIO and DMA stay in the SDK, permanently") drew the line between `gs` and
+the SDK at hardware. That line is moved, not erased: hardware AUTHORITY still comes only through the
+SDK's audited layer, and `unsafe` still lives only there (18.1). What moves into `gs` is the safe,
+device-neutral machinery a driver builds on - one mechanism at a time, each one found in real drivers
+first. `backlog/71` (the path to a v1 promise) depends on this shape: it puts `gs::driver` OUTSIDE the
+first covered surface, because hardware support keeps growing.
+
+## Current state (2026-10-03)
+
+What exists now. The dated steps after the method sections are the record of how each piece got here,
+and why; read them for the reasoning, not to find out what the library contains.
+
+**Built.**
+
+- **`wait`** - bounded waits for a condition. `Budget` (`us` / `ms`); `until` and `until_paced`;
+  `Deadline::start` (polling) and `Deadline::paced` (sleeping a pace between looks), each with
+  `expired`, `pause` and `elapsed_us`; `calibrated`. On an uncalibrated clock a polling wait gets
+  `UNCALIBRATED_POLLS` (200,000) looks and a paced one the paces that fit its budget. It never logs.
+- **`delay`** - holds, for gaps nothing reports the end of. `hold` spins on a calibrated clock;
+  `hold_parked` sleeps first and spins the rest, for holds of tens of milliseconds. On an uncalibrated
+  clock both sleep whole scheduler quanta, erring long, because a hold is a minimum.
+  **`hold_parked` has one caller (`ehci`)** and is in on probation - step 1l says why.
+
+**Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f), `sdk/wifi`
+(1d), `dwc2` (1g, 1h), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l - **not yet
+verified on hardware**).
+
+**Left by hand, each with its reason in its step.**
+
+| Site | Board | Why | Step |
+|---|---|---|---|
+| `nic-driver` `RX_POLL_MAX` | x86 | waits for traffic, tuned against `net-stack`'s deadline; needs a measurement | 1j |
+| `block-driver` `xhciblk.rs` capacity deadline | Pi 4, VisionFive | same crate on other boards; its own step | 1k |
+| `dwc2`'s complete-split NYET retry | Pi 2 | a retry count of sleeps on the keyboard path | 1g |
+| `dwmac`'s `rgmii_loopback_sweep` | VisionFive | compiled but never run | 1i |
+| `block-driver` `sdhci.rs` | none | not compiled | 1b |
+
+**Open gaps, recorded rather than hidden.**
+
+- Where one LOOK is a whole transfer - `dwc2`'s hub reset and `net::bulk`, `xhci`'s disk transfer - the
+  uncalibrated bound of 200,000 looks can be hours. It ends, which the one-look deadlines it replaced
+  did not do correctly; but no one chose it as a bound.
+- `xhci`'s 55 ms reset-recovery hold still spins (`delay::hold`). It is the candidate to make
+  `hold_parked` a mechanism two drivers use.
+- None of the boards this work was tested on is uncalibrated, so every uncalibrated path above is
+  reasoned and unit-tested, not observed.
+
 ## What goes in, and what never does
 
 The question for every part of a driver is the one that decides membership:
@@ -38,7 +88,8 @@ The question for every part of a driver is the one that decides membership:
 
 | Describes the device: stays in the driver | A mechanism: candidate for `gs::driver` |
 |-------------------------------------------|------------------------------------------|
-| The Broadcom control protocol (BCDC)      | Waiting for hardware, bounded by time (**built: `wait`**) |
+| The Broadcom control protocol (BCDC)      | Waiting for hardware, bounded by time (**built: `wait`, polling or paced**) |
+|                                           | Holding still for a set minimum time (**built: `delay::hold`, `delay::hold_parked`**) |
 | BDC framing, firmware command ids         | Interrupt waiting                        |
 | The CLM blob, escan, `bss_info`           | DMA and buffer facilities                |
 | A chip's recovery sequence                | Bus access                               |
@@ -88,7 +139,8 @@ Then audio, as the independent test.
 
 ## Step 1: `gs::driver::wait` (2026-10-02)
 
-**What was repeated.** Every driver waits for a register. Six of them wrote that loop by hand -
+**What was repeated.** Every driver waits for a register. Five drivers wrote that loop by hand, six
+times -
 `xhci`'s `spin`, `dwc2`'s `wait_until`, `genet`'s mask wait, `dwmac`'s `wait_clear` and `mdio_idle`,
 `wifi-driver`'s host - and the copies disagreed:
 
@@ -150,7 +202,7 @@ day: no MDIO or DMA-start wait expired, cable ping 0% loss, the cable and the ra
 for each other, and `chaos max-carnage all-services` (50 rounds) bringing `genet` up again on all 26 of
 `nic-driver`'s restarts.
 
-**Not converted yet, deliberately, one change at a time:**
+**Not converted at the time, deliberately, one change at a time (since: see the later steps):**
 
 | Driver | Board | Its wait | Note |
 |---|---|---|---|
@@ -177,7 +229,8 @@ waited for the reset. The library bounds that case by `UNCALIBRATED_POLLS` looks
   reset), spinning on `read_tsc` for a set time. With `genet`'s `delay_us` that is three, in two
   drivers: a fixed pause is repeated, and it is the next mechanism. It is a different one from `wait` -
   nothing is being waited FOR - and on an uncalibrated clock a pause has no honest bound at all, which
-  is a question to settle when it is built, not to answer by folding it into `wait`.
+  is a question to settle when it is built, not to answer by folding it into `wait`. (Step 1f built
+  it.)
 - **Three deadline loops that SLEEP between polls** (the hub port probe, mass-storage spin-up, a disk
   transfer). `Deadline` would measure them, but its uncalibrated fallback counts LOOKS, and 200,000
   looks with a sleep between each is not the bound it is for a loop that spins. They stay hand-written
@@ -215,7 +268,8 @@ kernel's sleep is itself only approximate, so that is a count of pauses, not a d
 `sdk/wifi` now depends on the stdlib, which is the layering above: a radio is a driver and reaches for
 `gs::driver` like any other. Nothing in the stdlib depends on `sdk/wifi`, so there is no cycle.
 
-`xhci`'s sleeping loops can now move, and are the next step rather than part of this one.
+`xhci`'s sleeping loops can now move, and are the next step rather than part of this one. (Step 1e
+moved them.)
 
 **Verified:** builds for every port, and on the Pi 4 on 2026-10-03: 49 function-ready waits (boot,
 five `wifi radio powercycle`s, and the chaos restarts), every one READY at the first read in 1-2 ms -
@@ -248,7 +302,7 @@ of 4096 event-ring reads, so on an uncalibrated clock its `UNCALIBRATED_POLLS` l
 30 s. It ends, which the one-window version also did, but it ended wrongly.
 
 `xhci` now has no hand-built deadline. What is left by hand is the two fixed busy-pauses, which wait for
-nothing and are the next mechanism.
+nothing and are the next mechanism. (Step 1f moved them.)
 
 **Verified:** builds for every port, and on the Pi 4 on 2026-10-03: none of the five expired - no
 spin-up give-up, no transfer without a completion, no `TIMEOUT` line - across boot, the keyboard and the
@@ -296,7 +350,7 @@ shape a long hold should have; it is one driver, and when a second does it, it b
 | Driver | Board | Its hold | Note |
 |---|---|---|---|
 | ~~`block-driver` (`ahci.rs`)~~ | x86 | two raw-cycle holds and seven iteration-count loops | done in step 1k |
-| `ehci` | x86 | `delay_cycles` | parks then spins; takes cycles, not a duration |
+| ~~`ehci`~~ | x86 | its reset delay, `wait`, the control transfer | done in step 1l |
 
 **Verified:** builds for every port, and on the Pi 4 on 2026-10-03, with the cable in so both paths ran:
 `genet` configured its MAC 22 times (boot and 21 `nic-driver` restarts under `chaos max-carnage`, 50
@@ -418,8 +472,8 @@ of its six waits:
 | RTL8168 and e1000 transmit confirmed | yields until `read_tsc() < end` | `await_tx`: `Deadline::start`, yielding between looks |
 
 **The reset budget is Linux's, with headroom.** A count of yields is no time at all - on the T630 50,000
-of them took over two seconds, so the RTL bound was minutes - and `r8169` polls the same bit 100 times
-100 us apart. `RESET_WAIT` is 100 ms, ten times that. The three timed loops compared the counter with a
+of them took over two seconds, so the RTL bound was over twelve seconds and the e1000's over forty -
+and `r8169` polls the same bit 100 times 100 us apart. `RESET_WAIT` is 100 ms, ten times that. The three timed loops compared the counter with a
 plain `<`, which a counter wrapping mid-wait ends at once; the library compares a wrapping difference.
 
 `await_tx` keeps the yield between looks, because a send that has not landed at the first look is
@@ -470,11 +524,38 @@ that is tested on them.
 
 **Verified:** builds for every port, and in QEMU on 2026-10-03 on an `ich9-ahci` disk: `osdev test fs-restart` 11 passed, 0 failed - GSFS flashed, a file written and read, `fs` killed, re-mounted and the file read back. (`osdev test shell` passed too, 215 of 215, but it attaches no SATA disk, so it does not count here.) And on the T630 the same day, on its Samsung SATA SSD: `block-driver` brought the port up and IDENTIFYd the disk on all 24 starts (boot and `chaos max-carnage all-services`, 50 rounds, 347 kills), no command timed out, waited on a busy port, failed or needed a retry, and after chaos `selfcheck` ran 524 with 0 failed, its filesystem check finding 17 files consistent with nothing to repair.
 
-## What this supersedes
+## Step 1l: `ehci` on `wait`, and `delay::hold_parked` (2026-10-03)
 
-`docs/stdlib-design.md` ("MMIO and DMA stay in the SDK, permanently") drew the line between `gs` and
-the SDK at hardware. That line is moved, not erased: hardware AUTHORITY still comes only through the
-SDK's audited layer, and `unsafe` still lives only there (18.1). What moves into `gs` is the safe,
-device-neutral machinery a driver builds on - one mechanism at a time, each one found in real drivers
-first. `backlog/71` (the path to a v1 promise) depends on this shape: it puts `gs::driver` OUTSIDE the
-first covered surface, because hardware support keeps growing.
+The last x86 driver. It also adds `delay::hold_parked` with ONE caller, which departs from step 1f's
+condition ("when a second does it, it belongs here") and from this library's own rule that a mechanism
+is found written out more than once. Recorded rather than hidden: it was moved so `ehci` could drop its
+last hand-built timing loop, and it is on probation until a second driver parks. `xhci`'s 55 ms
+recovery hold is the candidate. (This step first said `ehci` was the second driver to need a long hold
+and so met step 1f's condition. `xhci` is the other long hold, and it still spins; the 2026-10-03 audit
+caught the claim.)
+
+**`delay::hold_parked`.** `ehci`'s own reset delay (delay_cycles, now gone) slept through a USB
+reset timing (100 ms reset hold, 20 ms recovery, 50 ms debounce) and spun out only what the sleep left, because spinning all of it read
+100% of a core in `observe` with nothing plugged in - the rescan loop holds on every turn. A MINIMUM
+allows the late wake a sleep can give; the spin covers an early one. That is now
+`delay::hold_parked`, and `ehci`'s eleven reset timings call it. It is a separate call from `hold`
+rather than a change to it, so `xhci`'s 55 ms recovery hold, verified spinning on the Pi 4, keeps the
+timing it was verified with; moving it to the parked hold is a step of its own.
+
+| Wait | Before | Now |
+|---|---|---|
+| reset hold, recovery, debounce (eleven sites) | `200_000_000` / `40_000_000` / `100_000_000` raw counter cycles | `delay::hold_parked`, 100 / 20 / 50 ms |
+| `wait` - a register bit | 250 ms, ended by `read_tsc() >= end` | `await_hw` |
+| a control transfer's status qTD | `2_000_000_000` raw cycles (~1 s on the T630), ended by `>=` | `await_hw`, 1 s |
+
+`await_hw` keeps the shape both waits already had - yield for the first 2 ms, then park between looks
+(a 1 ms sleep, one scheduler quantum in practice) - on two PACED deadlines, one for the budget and one
+for the spin phase. The spin phase's has to be paced: as first written it was a polling deadline,
+which on an uncalibrated clock never expires, so every look was a yield and the budget's 250 or 1,000
+paced looks were spent yielding - ending the wait far short of its budget. The audit caught it before
+any hardware ran it; paced, the spin phase ends after two looks and the rest park. The comparisons it
+replaced were `read_tsc() >= end` against a `wrapping_add`, which a counter wrapping mid-wait ends at
+once. The raw cycle counts were the intended times only on the T630's ~2 GHz counter; they are those
+times now on every board.
+
+**Verified:** builds for every port. On the T630, NOT YET.

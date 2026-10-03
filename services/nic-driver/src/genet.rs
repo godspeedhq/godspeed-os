@@ -30,10 +30,9 @@
 //!   `dc civac` writing a stale line back over a freshly-DMA'd frame). An uncached mapping removes the
 //!   question rather than resting on the driver author remembering, which is exactly what SEC-28 asks
 //!   a non-coherent port to do.
-//! - **Waits are bounded by real time**, read from the same counter the kernel's `delay_us` used, but
-//!   through `ctx.read_tsc()`. A bound has to mean what it says: an iteration count is not a duration,
-//!   and the only place one appears here is the fallback for a machine that reports no calibration -
-//!   where it is named as what it is.
+//! - **Waits are bounded by real time**, through `gs::driver::wait`. A bound has to mean what it says:
+//!   an iteration count is not a duration, and the only place one applies is the library's fallback for
+//!   a machine that reports no calibration - which bring-up says out loud.
 //!
 //! Written against Linux's `drivers/net/ethernet/broadcom/genet/` as an executable datasheet, per the
 //! doctrine in `kernel/src/arch/CLAUDE.md`: the C driver says what the silicon wants, and we implement
@@ -382,8 +381,8 @@ pub struct Genet<'a> {
     ctx: &'a ServiceContext,
     m: Mmio,
     a: Dma,
-    /// Counter ticks in 10 ms, from the kernel's own calibration. Zero means uncalibrated, which the
-    /// wait helpers handle explicitly rather than by dividing by it.
+    /// Counter ticks in 10 ms, from the kernel's own calibration, read once so bring-up can say when it
+    /// is 0 and the waits are counted rather than measured. The waits themselves are `gs::driver`'s.
     per_10ms: u64,
 }
 

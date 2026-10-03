@@ -8,7 +8,8 @@
 //! membership is the one `docs/driver-library.md` opens with - **does this part describe the device,
 //! or a reusable Godspeed mechanism?** A register sequence, a command set, a firmware's quirks and a
 //! chip's recovery dance describe the device and stay in its driver. How long to wait for a register,
-//! and how to say the wait gave up, describe neither - so they are here.
+//! how to say the wait gave up, and how long to hold still when no register can say, describe neither -
+//! so they are here (`wait` and `delay`).
 //!
 //! **There are no device CLASSES here, and there will not be.** No driver::wifi, driver::audio or
 //! driver::usb: a class API is a guess about what every device of that kind will need, made before

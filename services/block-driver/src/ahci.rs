@@ -97,6 +97,7 @@ const ENGINE_STOP_WAIT: Budget = Budget::ms(500);
 /// 1 s idle + 5 s command + about 1.6 s of recovery is about 7.6 s an attempt, 23 s for all three.
 /// They were 2,000,000 and 5,000,000 MMIO reads, which at a microsecond a read could already overrun.
 const CMD_IDLE_WAIT: Budget = Budget::ms(1_000);
+/// The command's half of the budget above.
 const CMD_DONE_WAIT: Budget = Budget::ms(5_000);
 
 /// Blocks the cache holds. `TXN_CAP` in `fs` is 56, so 64 holds a whole journal transaction and the
@@ -743,7 +744,7 @@ impl<'a> Ahci<'a> {
 /// are left to `init_port`, which runs a full `port_comreset` on the chosen port afterwards.
 fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
     // 1. Fast path + slow-establish: a healthy, already-up link returns on the first read (zero added
-    //    latency); a slow one gets a bounded window (read-count poll, the port_comreset DET idiom).
+    //    latency); a slow one gets `LINK_WAIT` (a clock, `gs::driver::wait`).
     if wait::until(ctx, LINK_WAIT, || hba.read32(base + PX_SSTS) & 0xF == 3).is_ok() {
         return true;
     }
@@ -844,10 +845,10 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             // pure waste - and on an empty port `wait_port_ready` spends its full slow-establish budget
             // (LINK_WAIT -> COMRESET -> LINK_WAIT) before returning false. That budget exists to catch a
             // *disk* whose PHY is slow to come up (warm reboot / chaos soak); an empty port has no
-            // device to wait for. On real hardware an MMIO read is ~ns so the waste is invisible, but
-            // under QEMU TCG each read is a VM exit: an HBA that implements 6 ports (PI=0x3f) would burn
-            // ~4M reads x 5 empty ports and blow the boot window, so `fs` never mounts. Breaking here
-            // keeps the full slow-establish robustness for the disk's own port and skips the rest.
+            // device to wait for. That budget is time now and the same on every machine, about 0.6 s a
+            // port (`LINK_WAIT`, `COMRESET_HOLD`, `LINK_WAIT`), so an HBA implementing 6 ports (PI=0x3f)
+            // would spend about 3 s on 5 empty ones before `fs` could mount. Breaking here keeps the full
+            // slow-establish robustness for the disk's own port and skips the rest.
             break;
         }
     }

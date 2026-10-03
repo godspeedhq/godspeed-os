@@ -562,8 +562,9 @@ fn spin<F: Fn() -> bool>(ctx: &ServiceContext, what: &str, ms: u64, cond: F) -> 
 // These were raw TSC-cycle literals chosen for a ~2 GHz x86 (`100_000_000` meaning "~50 ms"). A
 // cycle is not a portable unit - the AArch64 generic timer runs at 54 MHz on a Pi 4, where that same
 // literal asks for nearly two seconds and `HUB_RESCAN` asks for the better part of a minute. So the
-// numbers below are DURATIONS and `ctx.duration_cycles` does the conversion through the kernel's own
-// calibration, which is the portable path the SDK already documents for exactly this mistake.
+// numbers below are DURATIONS, converted through the kernel's own calibration - by `gs::driver::wait`
+// and `delay` for waits and holds, and by `ctx.duration_cycles` for the remaining sleeps and report
+// intervals, the portable path the SDK already documents for exactly this mistake.
 //
 /// Recovery hold after a root-port reset before addressing the device. USB 2.0 requires a
 /// reset-recovery interval (TRSTRCY >= 10 ms) before a device can accept transactions; without it a
@@ -1122,7 +1123,7 @@ fn hub_port_status(
         // competing traffic. It also explains why `chaos max-carnage` fixed it - a re-init quiets
         // the ring long enough for 64k spins to once again outlast a 1 ms transfer.
         //
-        // 5 ms is generous for a hub that answers in about one, and it is the same 5 ms on a fast
+        // 10 ms is generous for a hub that answers in about one, and it is the same 10 ms on a fast
         // board and a slow one. It stays SHORT deliberately: this runs per port per pass, and a long
         // wait on a hub that will never answer is what made typing lag while the stick was out.
         //
@@ -1149,20 +1150,20 @@ fn hub_port_status(
             // per iteration, and the task charged for every tick it is scheduled. It measured WORSE
             // than the busy-wait it replaced, which is the honest reason this comment exists.
             //
-            // `sleep` blocks on the timed wake until the deadline, so the core is genuinely free.
-            // The floor is one 10 ms tick (`cycles_to_ticks` clamps sub-quantum requests), which
-            // against a 50 ms budget is about five polls - ample, because a probe that is going to
-            // answer answers in about a millisecond, and one that is not was going to burn the whole
-            // budget either way.
+            // `pause` sleeps one 1 ms pace, which the kernel floors to one 10 ms tick
+            // (`cycles_to_ticks` clamps sub-quantum requests), so the core is genuinely free. Against
+            // the 10 ms budget a hub gets a look before the sleep and one after - ample, because a probe
+            // that is going to answer answers in about a millisecond, and one that is not was going to
+            // burn the whole budget either way.
             //
             // Measured, after four measurements that each refuted something else: of 10064 ms of work
             // in 60 s, the hub segment held 10061 - 99.97% - at ~60 ms per pass, which is
             // PROBE_ANSWER_MS plus overhead. So a probe that does not get an immediate answer spins
-            // its ENTIRE 50 ms budget at full tilt, on nearly every pass. That is the 13-16% CPU, and
+            // its ENTIRE budget (50 ms then) at full tilt, on nearly every pass. That is the 13-16% CPU, and
             // it is why adjusting wake rates never moved it: the cost was never how OFTEN the loop
             // ran, it was one busy-wait inside it.
             //
-            // Yielding keeps the deadline exactly as it was - the wait is still bounded by the clock
+            // Sleeping keeps the deadline exactly as it was - the wait is still bounded by the clock
             // and still returns the same answers (Commandment VIII) - while letting the core run
             // something else, or idle. The same fix this driver already received once, on the Wyse,
             // where a busy-spin held a core at 100%.

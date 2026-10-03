@@ -26,6 +26,8 @@
 #![no_std]
 #![no_main]
 
+use godspeed::driver::delay;
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
 
 // EHCI capability registers (at the MMIO base; EHCI spec §2.2).
@@ -161,11 +163,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // them by accident.
         let keep = mmio.read32(off) & !PORTSC_W1C & !PORTSC_PED;
         mmio.write32(off, keep | PORTSC_RESET);
-        delay_cycles(&ctx, RESET_HOLD_CYCLES); // hold reset >= 50 ms (USB 2.0 §7.1.7.5)
+        delay::hold_parked(&ctx, RESET_HOLD); // hold reset >= 50 ms (USB 2.0 §7.1.7.5)
         // End reset.
         mmio.write32(off, mmio.read32(off) & !PORTSC_W1C & !PORTSC_RESET);
         wait(&ctx, &mmio, off, PORTSC_RESET, false); // controller finishes (~2 ms)
-        delay_cycles(&ctx, RECOVERY_CYCLES);   // reset-recovery settle (~10 ms)
+        delay::hold_parked(&ctx, RECOVERY);   // reset-recovery settle (RECOVERY, 20 ms)
 
         let psc = mmio.read32(off);
         let enabled = psc & PORTSC_PED != 0;
@@ -208,7 +210,10 @@ const DATA_BUF:   usize = 0x200; // control-transfer data buffer
 
 // qTD token bits.
 /// C8-1: how long a control transfer may take before we stop waiting. A DURATION, not a read count.
-const CTRL_XFER_CYCLES: u64 = 2_000_000_000;
+///
+/// It was `2_000_000_000` raw counter cycles - a duration only on the board it was worked out on, ~1 s
+/// at the T630's ~2 GHz. One second, now on every board (`gs::driver::wait`).
+const CTRL_XFER_WAIT: Budget = Budget::ms(1_000);
 /// One-shot guard for the control-transfer timeout notice.
 static TIMED_OUT_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 const QTD_ACTIVE: u32 = 1 << 7;
@@ -338,29 +343,22 @@ fn control(
     // different wall-clock wait on every machine, and nobody picked it against the device's timing.
     // The truth is still the ACTIVE bit going clear; the clock only bounds how long we keep believing
     // it might.
-    let mut done = false;
-    let start = ctx.read_tsc();
     // YIELD BRIEFLY, THEN PARK - the transfer completes in DMA memory, so waiting costs nothing but
     // the core, and this loop had no yield and no sleep at all.
     //
-    // `CTRL_XFER_CYCLES` is ~1 SECOND at 2 GHz, and it is spent in full whenever the transfer does not
+    // `CTRL_XFER_WAIT` is one SECOND, and it is spent in full whenever the transfer does not
     // complete. That is the unplugged case exactly: `wait_for_connection` asks each hub port for its
     // status every 50 ms, every one of those control transfers runs the whole budget, and the driver
     // holds the core continuously. `observe` reads `ehci` at 100% unplugged and 0% plugged in - the
-    // cable is the switch. Two earlier fixes (`delay_cycles`, then `wait`) were the same shape one
+    // cable is the switch. Two earlier fixes (the reset-timing delay, then `wait`) were the same shape one
     // and two layers further out, and neither was on this path: a control transfer completes on a
     // qTD bit in DMA, so it never reaches `wait`, which polls MMIO.
     //
-    // A transfer that is going to succeed completes in about a millisecond, so the first 2 ms are
-    // still spun and the fast path is unchanged. Past that it is either slow or never coming, and
-    // 10 ms of park costs nothing that matters against a one-second budget.
-    let spin_until = start.wrapping_add(ctx.duration_cycles(2));
-    while ctx.read_tsc().wrapping_sub(start) < CTRL_XFER_CYCLES {
-        if dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0 { done = true; break; }
-        if ctx.read_tsc() >= spin_until {
-            ctx.sleep_ms(1);   // floors to one scheduler quantum
-        }
-    }
+    // A transfer that is going to succeed completes in about a millisecond, so the first 2 ms
+    // (`AWAIT_SPIN`) are yielded rather than parked and the fast path is unchanged. Past that it is
+    // either slow or never coming, and 10 ms of park costs nothing that matters against a one-second
+    // budget.
+    let done = await_hw(ctx, CTRL_XFER_WAIT, || dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0);
     // Say so ONCE. A transfer that burns the full budget is the difference between a driver that is
     // waiting and one that is eating the machine, and nothing in the log distinguished them - which
     // is why this took three attempts to place. Bounded to one line so an unplugged hub cannot
@@ -413,7 +411,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     if control(ctx, mmio, &dma, op, &Ep::hs(0, mps0), &setup, 0, false).is_none() {
         ctx.log("ehci: Set_Address failed"); return;
     }
-    delay_cycles(ctx, RECOVERY_CYCLES); // SetAddress recovery (>= 2 ms)
+    delay::hold_parked(ctx, RECOVERY); // SetAddress recovery (>= 2 ms)
     ctx.log("ehci: hub addressed (1)");
 
     // Get the configuration descriptor (first 9 bytes) for bConfigurationValue.
@@ -477,7 +475,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
                 ctx.log_fmt(format_args!(
                     "ehci: a connected device did not come up - re-scanning ({} of {})",
                     failed_rescans, MAX_FAILED_RESCANS));
-                delay_cycles(ctx, DEBOUNCE_CYCLES);
+                delay::hold_parked(ctx, DEBOUNCE);
                 continue;
             }
             ctx.log("ehci: no boot keyboard/mouse attached - waiting for a connection");
@@ -495,7 +493,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         let gone = poll_devices(ctx, mmio, &dma, op, &devs[..ndev]);
         notify(ctx, if devs[gone].is_mouse { "mouse disconnected (ehci)" } else { "keyboard disconnected (ehci)" });
         announce = true; // the next connect (after re-scan) is a real plug event
-        delay_cycles(ctx, DEBOUNCE_CYCLES); // let the port status settle before re-scan
+        delay::hold_parked(ctx, DEBOUNCE); // let the port status settle before re-scan
     }
 }
 
@@ -514,7 +512,7 @@ fn scan_devices(
         let setup = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_POWER)
         let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 0, false);
     }
-    delay_cycles(ctx, RESET_HOLD_CYCLES); // power-on-to-power-good settle (generous)
+    delay::hold_parked(ctx, RESET_HOLD); // power-on-to-power-good settle (generous)
 
     let mut devs = [HidDev { addr: 0, port: 0, ep_num: 0, is_mouse: false }; MAX_HID];
     let mut ndev = 0usize;
@@ -552,13 +550,13 @@ fn scan_devices(
         let mut got = false;
         let mut high_speed = false; // device enabled at high speed after reset
         for attempt in 1..=3u32 {
-            delay_cycles(ctx, DEBOUNCE_CYCLES); // connect-debounce before reset
+            delay::hold_parked(ctx, DEBOUNCE); // connect-debounce before reset
             let s = [0x23, 0x03, 0x04, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET)
             let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 0, false);
-            delay_cycles(ctx, RESET_HOLD_CYCLES);
+            delay::hold_parked(ctx, RESET_HOLD);
             let s = [0x23, 0x01, 0x14, 0x00, port, 0x00, 0x00, 0x00]; // Clear_Feature(C_PORT_RESET)
             let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 0, false);
-            delay_cycles(ctx, RESET_HOLD_CYCLES); // generous post-reset recovery
+            delay::hold_parked(ctx, RESET_HOLD); // generous post-reset recovery
 
             let s = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
             let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 4, true);
@@ -721,7 +719,7 @@ fn wait_for_connection(
         }
         // SLEEP THE POLL INTERVAL, DO NOT SPIN IT.
         //
-        // This paced with `delay_cycles(DEBOUNCE_CYCLES)` - a hard `while read_tsc() ...` spin, 50 ms
+        // This paced with the 50 ms debounce delay - a hard `while read_tsc() ...` spin, 50 ms
         // of it - and then slept one 10 ms quantum below. Fifty spinning against ten sleeping is about
         // 83% of a core, held for as long as nothing is plugged in. Observed on hardware: move the
         // keyboard off EHCI and `observe` shows ehci at 100% with the port empty - directly above a
@@ -729,7 +727,7 @@ fn wait_for_connection(
         //
         // The 50 ms is PACING, not hardware timing; the comment said as much ("~50 ms between
         // polls"). Nothing in the silicon needs the core held while it elapses, so sleeping satisfies
-        // it exactly and costs nothing. `delay_cycles` stays where it IS hardware timing - the reset
+        // it exactly and costs nothing. The parked hold stays where it IS hardware timing - the reset
         // hold, the recovery settle, the connect-debounce before a port reset - which are one-shot
         // steps rather than a loop.
         // Drain our IPC endpoint while we idle here with no HID attached (the active path drains in
@@ -752,7 +750,7 @@ fn control_retry(
         if let Some(n) = control(ctx, mmio, dma, op, ep, setup, data_len, in_dir) {
             return Some(n);
         }
-        delay_cycles(ctx, RECOVERY_CYCLES); // let the TT settle before retrying
+        delay::hold_parked(ctx, RECOVERY); // let the TT settle before retrying
     }
     None
 }
@@ -772,7 +770,7 @@ fn setup_hid(
     if control_retry(ctx, mmio, dma, op, &Ep::low(0, 8, 1, port), &s, 0, false, 5).is_none() {
         ctx.log_fmt(format_args!("ehci: {} Set_Address failed (5 tries)", what)); return false;
     }
-    delay_cycles(ctx, RECOVERY_CYCLES); // SetAddress recovery
+    delay::hold_parked(ctx, RECOVERY); // SetAddress recovery
     // Set_Configuration (at the new address).
     let s = [0x00, 0x09, cfg_val, 0x00, 0x00, 0x00, 0x00, 0x00];
     if control_retry(ctx, mmio, dma, op, &Ep::low(addr, 8, 1, port), &s, 0, false, 5).is_none() {
@@ -1071,35 +1069,26 @@ fn notify(ctx: &ServiceContext, msg: &str) {
     ctx.console_push(b'\n');
 }
 
-/// Busy-wait roughly `cycles` TSC ticks. Used for the millisecond-scale USB reset
-/// timings. Overestimated against the T630's ~2 GHz so the >= 50 ms reset hold is
-/// always satisfied even if the TSC runs faster.
-fn delay_cycles(ctx: &ServiceContext, cycles: u64) {
-    let start = ctx.read_tsc();
-    // PARK FOR THE BULK, then top up. This was a bare `while read_tsc() < deadline {}` - a hard spin
-    // holding the core for the WHOLE delay, with no yield and no sleep.
-    //
-    // It is only a few of these per plug event, so it hid completely while a device was attached: the
-    // driver's own heartbeat measures 35 ms of work per 60 s there, 0.058% of a core. UNPLUG the
-    // device and the rescan loop runs continuously, and each turn spends `DEBOUNCE_CYCLES` (~50 ms)
-    // plus `RESET_HOLD_CYCLES` (~100 ms) spinning - which is `observe` reporting `ehci` at 100% with
-    // nothing plugged in, and back to 0% the moment the device returns. Both halves of that were
-    // observed on the T630, and the second is what ruled out the measurement artefact I had assumed.
-    //
-    // The top-up spin stays because the CONTRACT is a MINIMUM: USB 2.0 7.1.7.5 wants the reset held
-    // at least 50 ms, and `sleep` granularity is a whole scheduler quantum which can round DOWN when
-    // the TSC is uncalibrated. So sleep for the requested span, then spin out whatever is left. On a
-    // calibrated machine the remainder is under one quantum and usually zero; the spin becomes the
-    // exception rather than the mechanism, and the hardware guarantee is unchanged.
-    ctx.sleep(cycles);
-    while ctx.read_tsc().wrapping_sub(start) < cycles {}
-}
-/// ~100 ms at 2 GHz - comfortably over the 50 ms minimum reset hold.
-const RESET_HOLD_CYCLES: u64 = 200_000_000;
-/// ~20 ms at 2 GHz - reset-recovery settle before reading the port.
-const RECOVERY_CYCLES:   u64 = 40_000_000;
-/// ~50 ms at 2 GHz - connect-debounce before resetting a hub downstream port.
-const DEBOUNCE_CYCLES:   u64 = 100_000_000;
+// THE USB RESET TIMINGS are held PARKED by `gs::driver::delay::hold_parked`, which is this driver's
+// own reset-timing delay moved into the library (`docs/driver-library.md` 1l) - the reason it parks is
+// below, and is why it is a separate call from `delay::hold`, which spins. The three durations were raw
+// counter cycles, right only on the T630's ~2 GHz counter; they are the times they were meant to be.
+//
+// They are PARKED rather than spun because of what spinning cost. The delay this replaced was once a
+// bare `while read_tsc() < deadline {}` for the whole span. It hid while a device was attached - the
+// driver's own heartbeat measured 35 ms of work per 60 s there - and showed the moment one was
+// unplugged: the rescan loop spends `DEBOUNCE` (50 ms) plus `RESET_HOLD` (100 ms) on every turn, and
+// `observe` read `ehci` at 100% with nothing plugged in and 0% when it came back. Both halves were
+// observed on the T630, and the second is what ruled out a measurement artefact.
+//
+// How `hold_parked` still keeps the MINIMUM USB 2.0 7.1.7.5 asks for - on a calibrated clock and an
+// uncalibrated one - is in its own documentation.
+/// 100 ms - comfortably over the 50 ms minimum reset hold.
+const RESET_HOLD: Budget = Budget::ms(100);
+/// 20 ms - reset-recovery settle before reading the port.
+const RECOVERY:   Budget = Budget::ms(20);
+/// 50 ms - connect-debounce before resetting a hub downstream port.
+const DEBOUNCE:   Budget = Budget::ms(50);
 
 // --- EHCI operational registers (offsets from base + CAPLENGTH) + bit fields ---
 const OP_USBCMD:     usize = 0x00;
@@ -1182,16 +1171,31 @@ fn wait(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, 
     // Generous, because a controller coming out of BIOS ownership can be slow, and a timeout that
     // fires early turns a working controller into a reported fault.
     const TIMEOUT_MS: u64 = 250;
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TIMEOUT_MS));
-    // How long to busy-yield before parking between polls. Covers the common case (hardware answers
-    // in a millisecond or two) without holding the core through a timeout that is not going to end.
-    const SPIN_MS: u64 = 2;
-    let spin_until = ctx.read_tsc().wrapping_add(ctx.duration_cycles(SPIN_MS));
+    await_hw(ctx, Budget::ms(TIMEOUT_MS), || (mmio.read32(off) & mask != 0) == want_set)
+}
+
+/// Look until `cond` holds or `budget` runs out: yield for the first `AWAIT_SPIN`, then park between
+/// looks (a 1 ms sleep, which floors to one scheduler quantum). Both of this driver's condition waits -
+/// a register (`wait`) and a control transfer's qTD - have this shape, and the reason is below.
+///
+/// `gs::driver::wait`'s deadlines. The loops this replaced compared `read_tsc() >= end`, which a counter
+/// wrapping mid-wait ends at once.
+///
+/// BOTH deadlines are paced, and the spin phase's has to be. On an uncalibrated machine a paced
+/// deadline's bound is the paces that fit its budget, and every look counts against it. A polling spin
+/// phase never expires there (200,000 looks), so every look would be a yield and the 250 or 1,000
+/// looks of the main deadline would be spent yielding - ending the wait far short of its budget, the
+/// defect this library exists to remove. Paced, the spin phase ends after two looks and the rest park,
+/// so the wait errs long instead. On a calibrated machine both are measured by the counter and nothing
+/// changes.
+fn await_hw(ctx: &ServiceContext, budget: Budget, mut cond: impl FnMut() -> bool) -> bool {
+    let mut deadline = wait::Deadline::paced(ctx, budget, Budget::ms(1));
+    let mut spin = wait::Deadline::paced(ctx, AWAIT_SPIN, Budget::ms(1));
     loop {
-        if (mmio.read32(off) & mask != 0) == want_set {
+        if cond() {
             return true;
         }
-        if ctx.read_tsc() >= deadline {
+        if deadline.expired() {
             return false;
         }
         // YIELD BRIEFLY, THEN PARK. The register is changed by HARDWARE, not by anything this service
@@ -1201,8 +1205,8 @@ fn wait(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, 
         //
         // That is invisible while the hardware answers quickly, which is every path this function was
         // written for. It stops being invisible when the hardware does NOT answer: pull the device and
-        // the rescan loop asks each hub port for its status, every one of those control transfers
-        // waits out the full 250 ms, and the driver holds the core continuously. `observe` shows
+        // the rescan loop asks each hub port for its status, every one of those waits runs out its
+        // full budget, and the driver holds the core continuously. `observe` shows
         // `ehci` at 100% unplugged and 0% the moment it is plugged back in - the cable is the switch,
         // which is what says the cost is here and not in the paced poll.
         //
@@ -1211,10 +1215,14 @@ fn wait(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, 
         // enumeration. After that the answer is evidently not imminent, and a 10 ms park costs at
         // most one quantum of extra latency on an operation already measured in tens of milliseconds
         // - while cutting thousands of yields down to about two dozen polls.
-        if ctx.read_tsc() >= spin_until {
-            ctx.sleep_ms(1);   // floors to one scheduler quantum
+        if spin.expired() {
+            deadline.pause(); // a millisecond, which floors to one scheduler quantum
         } else {
             ctx.yield_cpu();
         }
     }
 }
+
+/// How long `await_hw` busy-yields before parking between polls. Covers the common case (hardware
+/// answers in a millisecond or two) without holding the core through a timeout that is not going to end.
+const AWAIT_SPIN: Budget = Budget::ms(2);

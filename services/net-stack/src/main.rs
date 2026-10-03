@@ -2622,8 +2622,9 @@ fn link_is_up(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
     }
 }
 
-/// The link's state AND address from one status query: `(up, mac)`. `None` is a timeout or an
-/// unreadable answer, not a reading - the caller must not act on it.
+/// The link's state, address and carrier from one status query: `(up, mac, radio)`, `radio` true when
+/// the Pi 4's genet backend says the radio carries the link. `None` is a timeout or an unreadable
+/// answer, not a reading - the caller must not act on it.
 fn link_addr(ctx: &ServiceContext, pending: &mut Displaced) -> Option<(bool, [u8; 6], bool)> {
     let r = nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS)?;
     let p = r.payload_bytes();

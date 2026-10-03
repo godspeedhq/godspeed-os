@@ -870,7 +870,7 @@ pub fn enable_function(h: &dyn SdioHost, func: u8, ctx: &ServiceContext) -> bool
         return false;
     }
 
-    /// How long to wait for the function to report ready, in MILLISECONDS - the reference's
+    /// How long to wait for the function to report ready - the reference's
     /// `SDIO_WAIT_F2RDY`, which brcmfmac sets as function 2's enable timeout after the firmware
     /// download. This used to be 500 CMD52s, which is a few tens of milliseconds and a count rather
     /// than a duration: a fresh chip answers on the first read, and a chip whose firmware was just

@@ -34,7 +34,7 @@ The proposal was first written here as a wholesale re-export of the SDK's safe h
 adopted in `docs/driver-library.md`:** `gs::driver` holds DEVICE-NEUTRAL mechanisms only (never a
 device-class API), each one added after it is found repeated in real drivers, with Wi-Fi discovering and
 audio as the independent test; a driver that seems to need `unsafe` asks which safe mechanism is missing.
-Step 1 is built (`gs::driver::wait`, `wifi-driver` converted). The end state is the same one this item
+Two mechanisms are built (`gs::driver::wait`, `gs::driver::delay`) and nine drivers converted to them (`docs/driver-library.md`). The end state is the same one this item
 needs - drivers on `gs`, the SDK an internal layer free to change - reached one mechanism at a time rather
 than by re-export. Domain libraries like `sdk/wifi` stay outside the standard library and build on
 `gs::driver`. The `stdlib-design.md` section it moves is marked superseded in part, which is a recorded

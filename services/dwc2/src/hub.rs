@@ -281,8 +281,9 @@ pub fn reset_port(
     // USB 2.0 requires at least 10 ms of reset; the hub drives it and clears PORT_RESET when done.
     // Poll for that rather than assuming a duration - the hub is the authority on when it finished.
     // `gs::driver::wait`'s deadline. A look here is a whole control transfer, so on an uncalibrated
-    // clock the library's look count is far longer than 200 ms - long, but it ends, where the one-tick
-    // deadline built from `duration_cycles` allowed a single look.
+    // clock the library's 200,000 looks are 200,000 control transfers, which can be hours: it ends,
+    // where the one-tick deadline built from `duration_cycles` allowed a single look. Recorded in
+    // `docs/driver-library.md` as an open gap, not a bound anyone chose.
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(200));
     loop {
         let st = port_status(ctx, mmio, dma, t, port)?;

@@ -182,8 +182,9 @@ pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
 ///
 /// Bounded by the CLOCK (`gs::driver::wait`, `docs/driver-library.md`). It was 100,000 reads, a count
 /// - however long that many peripheral reads take, which nobody measured on this board.
-/// [`HALT_WAIT`] is chosen so it cannot be SHORTER than the count was: a budget that ran out before a
-/// halt that used to land would abandon the channel, the failure this function exists to prevent.
+/// [`HALT_WAIT`] is an upper estimate of the time the count took, so it should not be SHORTER than the
+/// count was (uncalibrated it is 200,000 looks, which is not): a budget that ran out before a halt that
+/// used to land would abandon the channel, the failure this function exists to prevent.
 pub fn halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32) {
     let hcchar = mmio.read32(hcchar_at(ch));
     if hcchar & HCCHAR_CHENA == 0 {
@@ -288,8 +289,8 @@ pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
     (hub_port as u32 & 0x7F) | ((hub_addr as u32 & 0x7F) << 7) | (0b11 << 14) | (1 << 31)
 }
 
-/// Wait until the controller reports the given microframe. Bounded: one full frame is 8 microframes
-/// at 125 us, so a whole sweep cannot take more than a millisecond even if the target never appears.
+/// Wait until the controller reports the given microframe. Bounded by a 2 ms deadline: a whole sweep of
+/// 8 microframes is 1 ms, so the target is either reached or gone.
 // The microframe/halt cycle counters that lived here are REMOVED, along with the three
 // `pub static ...: Atomic*` they used. They answered the question they were added for - the
 // channel-halt wait is ~97% of the keyboard's CPU and the microframe wait ~3%, which is why
@@ -307,6 +308,8 @@ fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
     // PACED, though it sleeps its own sub-millisecond gaps below rather than calling `pause`: what the
     // pace buys is the uncalibrated bound. That sleep is a whole scheduler quantum on such a machine, so
     // the polling bound of 200,000 looks would be minutes; paced, it is the two looks a 2 ms budget holds.
+    // Every look counts, the spun last microframe included, so uncalibrated this can return before the
+    // target; a missed microframe is a missed split, which every caller already handles.
     let mut deadline = wait::Deadline::paced(ctx, Budget::ms(2), Budget::ms(1));
     loop {
         let cur = mmio.read32(HFNUM) & 7;

@@ -9,3 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+# `gs::driver` (docs/driver-library.md): the bounded waits and the parked hold.
+godspeed = { path = "../../stdlib/rust" }
