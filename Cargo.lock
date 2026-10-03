@@ -108,6 +108,7 @@ name = "audio-driver"
 version = "0.1.0"
 dependencies = [
  "godspeed",
+ "godspeed-audio",
  "godspeed-sdk",
 ]
 
@@ -542,6 +543,10 @@ version = "0.21.0"
 dependencies = [
  "godspeed-sdk",
 ]
+
+[[package]]
+name = "godspeed-audio"
+version = "0.1.0"
 
 [[package]]
 name = "godspeed-sdk"
@@ -1504,6 +1509,7 @@ name = "shell"
 version = "0.21.0"
 dependencies = [
  "godspeed",
+ "godspeed-audio",
  "godspeed-sdk",
  "godspeed-wifi",
 ]

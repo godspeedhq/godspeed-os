@@ -1,0 +1,10 @@
+[package]
+name = "godspeed-audio"
+version = "0.1.0"
+edition = "2021"
+
+# The wire protocol between the audio driver and the shell's `audio` utility, read by both sides.
+# A library, not a service: no entry point, nothing spawned, no dependencies.
+[lib]
+name = "godspeed_audio"
+path = "src/lib.rs"

@@ -1,10 +1,11 @@
 # Audio
 
-**Status: steps A1-A3 built and run in QEMU (2026-10-03), on branch `feat/audio`. The driver resets an
-Intel High Definition Audio controller, finds its codec and output path, moves codec commands onto the
-CORB and RIRB, and plays a tone - a 1 kHz self-test at start, checked by reading back the WAV QEMU wrote.
-Restartable: the kernel stops its controller's DMA on its death and the supervisor restarts it. No
-request protocol or `audio` utility yet (A4); not run on hardware (A6).**
+**Status: steps A1-A3 and the first half of A4 built and run in QEMU (2026-10-03), on branch
+`feat/audio`. The driver resets an Intel High Definition Audio controller, finds its codec and output
+path, moves codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's
+`audio` sets the volume, mutes, powers the codec down and up and plays tones (`utilities/57_audio.md`),
+each checked against the WAV QEMU wrote. Interrupt-driven, IOMMU-confined, restartable. Not yet:
+`/audio.settings`, `outputs`, `play`, `debug`, system sounds, the shortcuts; not run on hardware (A6).**
 
 Audio is two things at once here. It is the system's first sound, and it is the planned **independent
 test of `gs::driver`** (`docs/driver-library.md`, "Wi-Fi discovers; audio tests"): a second kind of
@@ -48,7 +49,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A1** | Reset, find the codecs, walk the widget graph, report an output path. Immediate Command registers; no DMA, no interrupt | QEMU - **built** |
 | **A2** | CORB/RIRB, the command rings the spec requires (Immediate Command is optional, and unknown on the T630's FCH). The first DMA - used only on QEMU's codec until A6, for the T630's own reasons | QEMU - **built** |
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
-| A4 | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU |
+| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol and the first verbs built** (status, info, volume, mute, unmute, on, off, off hard, tone); settings, outputs, debug and system sounds to come |
 | A5 | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU |
 | A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
@@ -67,8 +68,10 @@ step that first needs each (A3 for the arena, the interrupt step for the other).
 
 ## The `audio` utility (specification, agreed 2026-10-03)
 
-**Not built.** This is the surface the operator agreed before any of it exists. It lives here, not in
-`utilities/`, until the shell answers `audio`: Commandment X fails a `utilities/` spec for a verb the
+**Partly built (2026-10-03).** The verbs the shell answers are specified in `utilities/57_audio.md`,
+which is now the authority for them; this section stays the agreed design for the rest - `outputs`,
+`output`, `play`, `debug`, `system sounds`, `/audio.settings` and the shortcuts. What follows was written
+before any of it existed. It lived here, not in `utilities/`, until the shell answered `audio`: Commandment X fails a `utilities/` spec for a verb the
 shell does not have, and the reverse (`utilities/0_conventions.md` 2a). On the day it is built it moves
 to a numbered spec of its own under `utilities/`, with the shell's eight registration sites. Modelled on `utilities/56_wifi.md`,
 which is the closest device-control utility, and held to the fourteen rules of `0_conventions.md`.
@@ -603,6 +606,55 @@ Test 12, `xhci`) still passes on the changed kernel.
 the driver working through the confined domain. And the controller uses plain MSI, so its interrupt
 message sits in configuration space, out of the driver's reach (`docs/iommu.md`). On the T630 the
 driver does not use DMA yet (A6), so confinement there is untested.
+
+## Step A4, first half: the protocol and the `audio` verbs (2026-10-03)
+
+**The protocol** is `sdk/audio`'s `wire`, read by both sides, as `sdk/wifi`'s is for the radio. Every
+request is tagged (`[TAGGED, tag, op, ...]`, answered `[TAGGED, tag, status, ...]`), so a late answer is
+never read as the next request's (backlog/70) - in the protocol from its first byte rather than added
+after. And **every answer is immediate**: `tone` starts the sound and answers, the shell follows it with
+`status` every 200 ms, and `q` sends `stop`. The driver can do that because its one wait is
+`gs::driver::irq`'s, which hands a request back mid-tone, so the radio's machinery for answers the shell is
+OWED a slow driver has no work to do here.
+
+**The driver became a service with state**: the path, the power, the volume, the mute, a tone if one
+plays, and a serve loop in which an interrupt refills the ring and a request is answered. The start-up
+self-test tone is gone; `audio tone` replaced it. The volume goes on the output amplifier nearest the
+converter, as a gain linear in the amplifier's steps (which on a real codec are even steps of decibels),
+and every change is read back with the matching GET verb before it is reported. Volume 0 sets the
+amplifier's own mute while `muted` stays false - two states, as agreed.
+
+**QEMU's codec changed to `mixer=on`** (`1af4:0012`), which gives it an amplifier - `mixer=off` has none, so
+there was no volume to set. QEMU applies it to the samples, so the WAV shows the volume as well as the tone.
+
+**Verified in QEMU** (`build/audio_shell_qemu.log`; the shell driven over a TCP serial port, QEMU quit
+through its monitor): every verb in `utilities/57_audio.md` answered as that file says, including the
+refusals (`volume 101`, `tone 5`, an unknown verb, `tone | count`, `play`, `tone` while off) and `beep`'s
+hint. The capture, as runs of 100 ms:
+
+| Asked | In the WAV |
+|---|---|
+| `tone 1000 1` at volume 50 (the start) | 1.0 s, RMS about 5,600 |
+| `tone 1000 1` at volume 100 | 1.0 s, RMS about 11,400 - the unscaled half-scale sine |
+| `tone 1000 1` at volume 0, then muted | 2.0 s of zeros |
+| `tone 440 1.5` at volume 60 | 1.5 s at 440 Hz, RMS about 6,800 |
+| `tone 1000 3`, `q` after about 1.2 s | 1.2 s, then nothing: `stopped after 1.2 s` |
+
+QEMU scales the samples LINEARLY with the amplifier step (step 37 of 74 is about half the amplitude),
+not in decibels as a real codec does, so its scale is louder at low volumes than hardware will be. A fact
+about QEMU's model, recorded so a hardware run is not compared against it.
+
+**Two findings on the way:**
+
+- **QEMU's codec models no power states.** `audio off` first said FAILED: the function group was told D3
+  and still read D0. Logging what it reported settled it rather than a guess - it reports supported power
+  states 0, and D0 whatever it is told. So `off` now answers `unconfirmed (this codec does not report it)`
+  where the codec offers no D3, a verdict of its own (`wire::UNSUPPORTED`): not a failure, and not
+  claimed as verified either. `off hard` holds the controller in reset, which the controller DOES
+  report, and is verified.
+- **The new utility met every gate it should**, each one adding a registration: Commandment X (no spec
+  under `utilities/` for a verb the shell answers), the per-verb `help` check, and `site_check` (a page and
+  its counts on the website). That is the eight-sites table in `utilities/0_conventions.md` working.
 
 ## Found while preparing
 

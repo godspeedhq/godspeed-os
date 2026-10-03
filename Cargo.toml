@@ -21,6 +21,7 @@ members = [
     "services/fs",
     "sdk/rust",
     "sdk/wifi",
+    "sdk/audio",
     "stdlib/rust",
     "osdev",
     "examples/ping",
