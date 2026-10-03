@@ -156,7 +156,7 @@ for each other, and `chaos max-carnage all-services` (50 rounds) bringing `genet
 |---|---|---|---|
 | `block-driver` (`sdhci.rs`) | none | ten count-bounded loops | **not a candidate: the file is not compiled.** `block-driver`'s `main.rs` deliberately has no `mod sdhci`, because on the Pi 2 the SD card is the boot medium and using it as storage destroyed two boot cards. Code that is never built cannot be converted and verified, so it stays as it is; this row said otherwise until 2026-10-03 |
 | ~~`dwc2`~~ | Pi 2 | `wait_until` and ten more | done in steps 1g and 1h |
-| `nic-driver` `dwmac` | VisionFive | `wait_clear`, `mdio_idle` | 200,000 and 20,000 looks when uncalibrated |
+| ~~`nic-driver` `dwmac`~~ | VisionFive | `wait_clear`, `mdio_idle`, transmit | done in step 1i |
 | ~~`sdk/wifi` (`sdio.rs`)~~ | Pi 4 | function-ready | done in step 1d |
 
 ## Step 1c: `xhci` on `wait` (2026-10-02)
@@ -374,6 +374,36 @@ case) or one that retires at the first look costs no clock read at all.
 given up and no hub reset left unfinished; `ping 8.8.8.8` answered with 0% loss before chaos, after it
 (14 of 14) and after the keyboard and the stick were unplugged and replugged both before and after
 chaos, and `dir /` listed the stick each time.
+
+## Step 1i: `dwmac` on `wait` (2026-10-03)
+
+The VisionFive 2 Lite's ethernet MAC - a third ISA (RISC-V 64) and a second MAC after `genet`. Like
+`genet` it was already time-bounded and already honest about the uncalibrated case; unlike `genet` it
+wrote that case out three times, as a separate loop beside each timed one, with two different ceilings:
+
+| Wait | Budget | Uncalibrated, before | Now |
+|---|---|---|---|
+| `mdio_idle` - the MDIO master idle | `MDIO_US` | its own 20,000 looks | `until` |
+| `wait_clear` - the DMA soft reset clearing | `RESET_US` | 200,000 looks | `until`, its time from `Ok` |
+| transmit - the engine handing a descriptor back | `TX_US` | 200,000 looks, and the write-back NOT kept | `Deadline::start` |
+
+The file's own two uncalibrated ceilings, the `per_10ms` field and the tick helper
+are gone; the bring-up line that says the machine is uncalibrated now asks `wait::calibrated`. One
+behaviour changed, on an uncalibrated machine only: the transmit wait now records the descriptor's
+write-back there too, which the separate loop had dropped, so a failed send can say why on every
+machine. MDIO's uncalibrated ceiling rises from 20,000 looks to the library's 200,000; on such a
+machine either is a count, not a time.
+
+**Not converted:** the turnaround wait in `rgmii_loopback_sweep` counts 20,000 spins, but the sweep is
+compiled and deliberately not run (`let _ = rgmii_loopback_sweep;`). Code that is not run cannot be
+converted and verified, so it is left, with a note at the place it is not called.
+
+**Verified:** builds for every port, and on the VisionFive 2 Lite on 2026-10-03: `nic-driver` started
+28 times (boot and `chaos max-carnage all-services`, 50 rounds, 339 kills) and found its PHY over MDIO
+every time, with no MDIO wait that did not go idle; the 8 starts that lived long enough to reach the DMA
+reset all cleared it in 1 us; no transmit failed, and `ping 8.8.8.8` answered with 0% loss before chaos
+and after it. The other 20 starts were killed while waiting up to 5 s for the PHY to renegotiate after
+its own reset, which comes before the DMA reset by design (`wait_for_link`), not a wait that failed.
 
 ## What this supersedes
 

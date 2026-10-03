@@ -30,6 +30,7 @@
 //! 0x20 instead and read here as absent.
 
 use crate::dwmac_ring::Dwmac;
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Message, Mmio, ServiceContext};
 
 // ---- MAC block. `dwmac4.h`. ---------------------------------------------------------------------
@@ -95,35 +96,13 @@ const PHY_ID2: u32 = 3;
 /// can be microseconds and under load it can be seconds, and neither is what the datasheet meant.
 const MDIO_US: u64 = 10_000;
 
-/// Iterations to allow when the machine reports no counter calibration. A plain ceiling whose only
-/// job is to terminate, and not dressed up as a time.
-const MDIO_UNCALIBRATED_POLLS: u32 = 20_000;
-
 /// Wait, bounded in REAL TIME, for the MDIO master to report itself idle.
+///
+/// The wait is `gs::driver::wait` (`docs/driver-library.md`). This file had its own copy, with its own
+/// uncalibrated ceiling of 20,000 looks; the library's is the 200,000 the network drivers settled on,
+/// and on such a machine either is a count of looks, not a time.
 fn mdio_idle(ctx: &ServiceContext, m: &Mmio) -> bool {
-    let per_10ms = ctx.tsc_ticks_per_10ms();
-    if per_10ms == 0 {
-        let mut polls = 0u32;
-        while polls < MDIO_UNCALIBRATED_POLLS {
-            if m.read32(GMAC_MDIO_ADDR) & MDIO_BUSY == 0 {
-                return true;
-            }
-            polls += 1;
-            core::hint::spin_loop();
-        }
-        return false;
-    }
-    let budget = (per_10ms.saturating_mul(MDIO_US) / 10_000).max(1);
-    let start = ctx.read_tsc();
-    loop {
-        if m.read32(GMAC_MDIO_ADDR) & MDIO_BUSY == 0 {
-            return true;
-        }
-        if ctx.read_tsc().wrapping_sub(start) >= budget {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
+    wait::until(ctx, Budget::us(MDIO_US), || m.read32(GMAC_MDIO_ADDR) & MDIO_BUSY == 0).is_ok()
 }
 
 /// Read one clause-22 register out of one PHY, or `None` if the master never went idle.
@@ -360,7 +339,9 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
     // Kept rather than deleted because the reasoning behind it is sound and the fix is small - if
     // the receive ring turns out not to be the whole story, this is the next instrument and it
     // wants one addition, not a rewrite. Running it now would cost a second of every boot to print
-    // four zeros nobody should read.
+    // four zeros nobody should read. Its turnaround wait is still a count of spins: code that is not
+    // run cannot be converted and verified (`docs/driver-library.md` 1i), so it is left for whoever
+    // runs it next.
     let _ = rgmii_loopback_sweep;
 
     ctx.log("nic-driver: serving the frame interface");
