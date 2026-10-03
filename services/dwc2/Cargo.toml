@@ -14,3 +14,5 @@ qemu = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+# `gs::driver` (docs/driver-library.md): the bounded waits.
+godspeed = { path = "../../stdlib/rust" }

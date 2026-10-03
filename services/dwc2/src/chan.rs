@@ -12,6 +12,7 @@
 //! memory directly and the device's writes are visible without an invalidate. Ring-0 cache ops are
 //! not available to a service, and this is why they are not needed.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::regs::*;
@@ -197,13 +198,13 @@ pub fn halt(mmio: &Mmio, ch: u32) {
 }
 
 pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(ms));
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(ms));
     loop {
         let hcint = mmio.read32(hcint_at(ch));
         if hcint & HCINT_CHHLTD != 0 {
             return Some(hcint);
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             // Leave the channel clean for the next user rather than abandoning it enabled - the
             // failure this driver's channel-per-stream split exists to prevent. `halt` is what makes
             // that true: it retires the core's outstanding request, which the old open-coded disable
@@ -297,13 +298,16 @@ pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
 // a measurement worth keeping would need its own home rather than a parameter on a shared path.
 
 fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    // PACED, though it sleeps its own sub-millisecond gaps below rather than calling `pause`: what the
+    // pace buys is the uncalibrated bound. That sleep is a whole scheduler quantum on such a machine, so
+    // the polling bound of 200,000 looks would be minutes; paced, it is the two looks a 2 ms budget holds.
+    let mut deadline = wait::Deadline::paced(ctx, Budget::ms(2), Budget::ms(1));
     loop {
         let cur = mmio.read32(HFNUM) & 7;
         if cur == target {
             return;
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             return;
         }
         // SLEEP THE BULK OF THE WAIT, SPIN ONLY THE LAST MICROFRAME.
@@ -447,14 +451,14 @@ fn uframe_now(mmio: &Mmio) -> u32 {
 /// still holds the result for a few) while waiting for an exact value we have already gone by would
 /// cost a whole frame. False means too far past to be worth asking.
 fn wait_until_at_least(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> bool {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(2));
     loop {
         let ahead = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
         if ahead == 0 || ahead > 0x2000 {
             // At it, or past it. Past is only useful while the TT still holds the result.
             return ahead == 0 || (0x4000 - ahead) <= 6;
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             return false;
         }
         core::hint::spin_loop();
@@ -487,7 +491,7 @@ enum Uframe {
 fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
     // Bounded: a few microframes is all a legitimate wait ever needs; anything longer means the target
     // is gone and spinning cannot bring it back.
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(2));
     loop {
         let delta = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
         if delta == 0 {
@@ -496,7 +500,7 @@ fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
         if delta > 0x2000 {
             return Uframe::Missed;      // target is behind us
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             return Uframe::Missed;      // could not get there in time - say so
         }
         core::hint::spin_loop();

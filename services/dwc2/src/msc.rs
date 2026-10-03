@@ -8,6 +8,7 @@
 //! needs a split. That is worth stating rather than assuming - if a full-speed stick ever appears on
 //! a hub port, `bind` takes the split descriptor exactly as `hid::bind` does and the rest follows.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::chan::{self, Target};
@@ -201,7 +202,8 @@ fn bulk_xfer(
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
 ) -> Result<u32, XferErr> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    // Paced a millisecond apart by `gs::driver::wait`, which sleeps the pace itself (`pause`).
+    let mut deadline = wait::Deadline::paced(ctx, Budget::ms(budget_ms), Budget::ms(1));
     let mut xact_errs = 0u32;
     loop {
         chan::program(mmio, &bt, chan::CH_BULK, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
@@ -241,14 +243,14 @@ fn bulk_xfer(
                 return Err(XferErr::Failed);
             }
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             // Out of time with NO transport error is the device pacing us, not failing. It is
             // returned as BUSY and deliberately NOT logged: logging it printed 564 lines in one
             // selfcheck for entirely normal flow control, and loud is a budget - spending it on the
             // expected case is how a real line gets ignored.
             return Err(if xact_errs == 0 { XferErr::Busy } else { XferErr::Failed });
         }
-        ctx.sleep(ctx.duration_cycles(1));
+        deadline.pause();
     }
 }
 
@@ -509,15 +511,17 @@ pub fn write_block(
 fn with_busy_retry(
     ctx: &ServiceContext, budget_ms: u64, mut attempt: impl FnMut() -> bool,
 ) -> bool {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    // Paced 5 ms apart by `gs::driver::wait`, which owns the sleep and so bounds an uncalibrated clock
+    // by the paces that fit the budget.
+    let mut deadline = wait::Deadline::paced(ctx, Budget::ms(budget_ms), Budget::ms(5));
     loop {
         if attempt() {
             return true;
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             return false;
         }
-        ctx.sleep(ctx.duration_cycles(5));
+        deadline.pause();
     }
 }
 

@@ -9,6 +9,7 @@
 //! means that when splits are attempted, the port they are attempted through is already known to
 //! report the right thing.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 
@@ -279,7 +280,10 @@ pub fn reset_port(
     }
     // USB 2.0 requires at least 10 ms of reset; the hub drives it and clears PORT_RESET when done.
     // Poll for that rather than assuming a duration - the hub is the authority on when it finished.
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(200));
+    // `gs::driver::wait`'s deadline. A look here is a whole control transfer, so on an uncalibrated
+    // clock the library's look count is far longer than 200 ms - long, but it ends, where the one-tick
+    // deadline built from `duration_cycles` allowed a single look.
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(200));
     loop {
         let st = port_status(ctx, mmio, dma, t, port)?;
         if st.status & PORT_RESET == 0 && st.enabled() {
@@ -289,7 +293,7 @@ pub fn reset_port(
             let _ = port_feature(ctx, mmio, dma, t, false, FEAT_C_PORT_CONNECTION, port);
             return Some(st);
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             ctx.log_fmt(format_args!(
                 "dwc2-svc: hub port {} did not finish reset within 200 ms (status={:#06x})",
                 port, st.status));

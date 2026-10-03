@@ -8,6 +8,7 @@
 //! device class `0xff` (vendor-specific), which is why the endpoint walk does NOT filter by class:
 //! there is no standard class to match, only bulk endpoints to find.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::chan::{self, Target};
@@ -1543,7 +1544,10 @@ fn bulk(
     why: Option<&mut (u32, u32)>, ping: Option<&mut bool>,
 ) -> Option<u32> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    // `gs::driver::wait`'s deadline. A look is a whole channel attempt (up to `wait_halt`'s 50 ms), so
+    // on an uncalibrated clock the library's look count is a long bound - but one that ends, where the
+    // one-tick deadline built from `duration_cycles` allowed a single attempt.
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(budget_ms));
     let mut last = 0u32;
     let mut halted = 0u32;
     // PING applies to an OUT endpoint only; an IN never pings (Linux: `ep_is_in` => do_ping = 0).
@@ -1591,7 +1595,7 @@ fn bulk(
             }
             None => {}
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             break;
         }
     }

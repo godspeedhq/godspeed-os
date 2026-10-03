@@ -154,8 +154,8 @@ for each other, and `chaos max-carnage all-services` (50 rounds) bringing `genet
 
 | Driver | Board | Its wait | Note |
 |---|---|---|---|
-| `block-driver` (`sdhci.rs`) | Pi 2 | six `t > 1_000_000` loops | **count-bounded, the same defect `wifi-driver` had** - missed by the first census, which looked for named helpers and this one has none |
-| `dwc2` | Pi 2 | `wait_until` | one-look budget when uncalibrated |
+| `block-driver` (`sdhci.rs`) | none | ten count-bounded loops | **not a candidate: the file is not compiled.** `block-driver`'s `main.rs` deliberately has no `mod sdhci`, because on the Pi 2 the SD card is the boot medium and using it as storage destroyed two boot cards. Code that is never built cannot be converted and verified, so it stays as it is; this row said otherwise until 2026-10-03 |
+| ~~`dwc2`~~ | Pi 2 | `wait_until` and nine more | done in step 1g, except `chan::halt` |
 | `nic-driver` `dwmac` | VisionFive | `wait_clear`, `mdio_idle` | 200,000 and 20,000 looks when uncalibrated |
 | ~~`sdk/wifi` (`sdio.rs`)~~ | Pi 4 | function-ready | done in step 1d |
 
@@ -303,6 +303,51 @@ shape a long hold should have; it is one driver, and when a second does it, it b
 rounds, 343 kills) with no reset or MDIO failure, and the cable took a lease and answered ping before and
 after; `xhci` reset its controller 36 times and found the disk 25 times, with no `TIMEOUT` and no
 Transaction Error addressing a device, and the keyboard and stick came back from hot-plug after chaos.
+
+## Step 1g: `dwc2` on `wait` - the first driver off the Pi 4 (2026-10-03)
+
+The Pi 2's USB host: keyboard, hub, mass storage and the smsc95xx network adapter. The first conversion
+on another board and another ISA (ARMv7), and the largest: ten hand-built deadlines, every one from
+`read_tsc` and `duration_cycles`, so every one gave up after a single look on an uncalibrated clock.
+
+| Wait | Budget | Now |
+|---|---|---|
+| `core::wait_until` - core reset, host mode, FIFO flushes (eight callers) | 100-500 ms | `until` |
+| `chan::wait_halt` - a channel retiring its transfer | caller's | `Deadline::start` |
+| `chan::wait_for_uframe` - a microframe boundary, sleeping sub-ms gaps itself | 2 ms | `Deadline::paced` |
+| `chan::wait_until_at_least`, `chan::wait_uframe_abs` - the periodic split's schedule | 2 ms | `Deadline::start` |
+| `hub` - a hub port finishing its reset | 200 ms | `Deadline::start` |
+| `msc::bulk_xfer` - a bulk transfer, 1 ms between attempts | caller's | `Deadline::paced` |
+| `msc::with_busy_retry` - a busy stick, 5 ms between attempts | caller's | `Deadline::paced` |
+| `net::bulk` - an adapter transfer | caller's | `Deadline::start` |
+
+On a calibrated clock nothing changes: the budgets and the paces are the ones the loops had.
+`wait_for_uframe` is paced although it sleeps its own sub-millisecond gaps rather than calling
+`pause`: on an uncalibrated clock each of those sleeps is a whole scheduler quantum, and the pace is what
+keeps its bound to the two looks a 2 ms budget holds rather than 200,000 of them.
+
+Two bounds are long on an uncalibrated clock and recorded rather than hidden, as `xhci`'s transfer wait
+was: in the hub reset wait a look is a whole control transfer, and in `net::bulk` a whole channel
+attempt, so the library's look count is far more than their budgets. They end; before, they ended after
+one look.
+
+**Not converted, and why:**
+
+- **`chan::halt`** spins on a COUNT (`t > 100_000`), the defect itself. It takes no `ServiceContext`,
+  because it runs from `program` / `program_ping` before every transfer, so converting it means threading
+  `ctx` through the channel API. That is a change of its own and is left for one.
+- **The complete-split NYET retry** counts 500 attempts with a 1 ms sleep between. It is a retry budget
+  on the keyboard's control path, and the count is of sleeps, not of spins.
+- **Plain sleeps, rate timers and the heartbeat** (`core.rs` settles, `hub.rs` and `enumerate.rs`
+  address gaps, `main.rs`'s pass budget and back-offs) wait for no condition and are not waits.
+
+**Verified:** builds for every port (`dwc2` is the Pi 2's alone), and on the Pi 2 on 2026-10-03: `dwc2`
+came up 25 times (boot and the restarts under `chaos max-carnage all-services`, 50 rounds, 301 kills),
+each through the converted core reset; no wait expired - no core-reset failure, no hub port that did
+not finish its reset, no channel that never halted, no split given up. The keyboard, the stick and the
+smsc95xx all came back: `dir /` and `ping 8.8.8.8` (0% loss) after chaos, and again after the keyboard
+and the stick were unplugged and replugged. The three "dwc2 answered op 0x01 while we asked 0x12" lines
+`nic-driver` prints when the stick is pulled are older than this step (the 2026-10-02 Pi 2 log has them).
 
 ## What this supersedes
 
