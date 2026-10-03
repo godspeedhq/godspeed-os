@@ -514,6 +514,10 @@ fn cmd_conform(check: bool, selftest: bool, list: bool, explain: Option<&str>) {
 }
 
 fn commandment_check() {
+    // Once per run: `osdev test` gates on entry and then some suites build through `cmd_build`, which
+    // gates again. The checks take seconds and their answer cannot change within one invocation.
+    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
     for extra in EXTRA_CHECKS {
         match std::process::Command::new("python").arg(extra).status() {
             Ok(st) if st.success() => {}
@@ -675,7 +679,7 @@ const SERVICE_CRATES: &[&str] = &[
     "events", "recorder", "copier", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
     "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
     "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
-    "resource-server", "holder", "power",
+    "resource-server", "holder", "power", "audio-driver",
 ];
 
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
@@ -1561,6 +1565,10 @@ fn cmd_caps(service: &str) {
 }
 
 fn cmd_test(suite: &str) {
+    // GATED, like `build` and `image`. Many suites build through `cmd_build_bare_metal` and friends,
+    // which run no checkers, so a contract that disagreed with its spawn row was tested in QEMU and
+    // passed on 2026-10-03 while the ARM build scripts refused it.
+    commandment_check();
     match suite {
         "identity"        => crate::validator::run_identity_tests(),
         "identity-brutal" => crate::validator::run_brutal_identity_tests(),
@@ -1652,6 +1660,8 @@ fn cmd_test(suite: &str) {
 /// receives bytes typed in the terminal, and shell output (via ctx.log) appears
 /// on stdout. The control port (COM2) is still on TCP:5555 for `osdev restart`.
 fn cmd_shell(smp: u32) {
+    // Gated for the reason `cmd_test` is: this builds through `cmd_build_bare_metal`, which runs none.
+    commandment_check();
     cmd_build_bare_metal();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1807,7 +1817,7 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         let _ = std::process::Command::new("cargo")
             .args(["clean", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none"]).status();
     }
-    let non_supervisor = ["events", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["events", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder", "audio-driver"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
         if *crate_name == "block-driver" && !bd_features.is_empty() {

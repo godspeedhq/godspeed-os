@@ -50,6 +50,16 @@ pub fn run(image_path: &Path, smp: u32) {
         "e1000,netdev=n0",
         "-netdev",
         "user,id=n0",
+        // Audio (docs/audio.md): an Intel HD Audio controller with an output codec, its sound written
+        // to a WAV file so a run can be checked by reading the samples back rather than by ear.
+        // 48 kHz 16-bit stereo, the driver's own format, so QEMU does not resample; `mixer=off` so the
+        // codec does not scale the samples - the WAV holds what the driver wrote.
+        "-audiodev",
+        "wav,id=snd0,path=build/qemu_audio.wav,out.frequency=48000,out.channels=2,out.format=s16",
+        "-device",
+        "intel-hda",
+        "-device",
+        "hda-output,audiodev=snd0,mixer=off",
         "-no-reboot",
         "-no-shutdown",
         "-d",
@@ -129,6 +139,14 @@ pub fn run_shell(image_path: &Path, smp: u32) {
         // COM2 → TCP control channel for `osdev restart`.
         "-serial",
         "tcp::5555,server,nowait",
+        // Audio (docs/audio.md), as in `run` above: the sound goes to a WAV file, at the driver's own
+        // format and unscaled, so what it played can be read back.
+        "-audiodev",
+        "wav,id=snd0,path=build/qemu_audio.wav,out.frequency=48000,out.channels=2,out.format=s16",
+        "-device",
+        "intel-hda",
+        "-device",
+        "hda-output,audiodev=snd0,mixer=off",
         "-display",
         "none",
         "-nographic",

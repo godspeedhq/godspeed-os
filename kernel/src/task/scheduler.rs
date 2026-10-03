@@ -402,6 +402,16 @@ pub fn task_hw_bdf(slot: usize) -> u32 {
     if slot < MAX_TASKS { TASK_HW_BDF[slot].load(Ordering::Relaxed) } else { 0xFFFF }
 }
 
+/// The device this task was given, READ AND RESET to `0xFFFF` in one step.
+///
+/// The record is written only by a DMA driver's spawn, so a slot later reused by any other task would
+/// otherwise INHERIT the device of whoever held it before. While the kill path quiesced by service name
+/// that was invisible; keyed on the record, a probe dying in a slot `xhci` once held would stop the LIVE
+/// `xhci` controller. So the kill path takes the record, and a failed spawn takes it too.
+pub fn take_task_hw_bdf(slot: usize) -> u32 {
+    if slot < MAX_TASKS { TASK_HW_BDF[slot].swap(0xFFFF, Ordering::Relaxed) } else { 0xFFFF }
+}
+
 /// `now_epoch_monotonic()` seconds captured at each task's spawn. Per-service uptime = `now_epoch_monotonic()
 /// - this` (surfaced by `task_stat`), both on the one deglitched monotonic timeline. It was a packed RTC
 /// datetime, which needed an `epoch_secs()` conversion and - fatally - read 0 on a board with no RTC (the
@@ -2519,7 +2529,9 @@ pub fn kill_task_by_slot(slot: usize) {
             // neutral file.
             | "wifi-driver"
             // power: MANAGED (docs/power.md). Counted and notified like every other restartable service.
-            | "power")
+            | "power"
+            // audio-driver: MANAGED (docs/audio.md). Both halves, as for wifi-driver below.
+            | "audio-driver")
         {
             bump_name_restart(task_name);
         }
@@ -2571,7 +2583,7 @@ pub fn kill_task_by_slot(slot: usize) {
             // wifi-driver: see the restart-counter list above. Both halves or neither - a death that
             // notifies but is not counted, or is counted but does not notify, is the exact split that
             // cost `time` and `control` a hardware session each.
-            | "wifi-driver" | "power") {
+            | "wifi-driver" | "power" | "audio-driver") {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
@@ -2635,25 +2647,27 @@ pub fn kill_task_by_slot(slot: usize) {
         // so nothing else stops the stray write. We clear PCI Bus-Master-Enable BEFORE the frame reclaim
         // below (the controller cannot start new DMA; any in-flight transaction drains during the kill's
         // remaining work + the spin-wait); the respawned driver re-enables bus-mastering during init.
-        // block-driver (AHCI) is included; xhci is confined (its stray DMA would fault, not corrupt) but
-        // quiescing it too is harmless + correct on a no-IOMMU machine where it is passthrough as well.
-        if task_name == "xhci" || task_name == "ehci" || task_name == "block-driver"
-            || task_name == "nic-driver"
-        {
-            use core::sync::atomic::Ordering::Relaxed;
+        // xhci is confined (its stray DMA would fault, not corrupt) but quiescing it too is harmless +
+        // correct on a no-IOMMU machine where it is passthrough as well.
+        //
+        // KEYED ON THE DEVICE THIS TASK WAS GIVEN, not on its name. This was a list of four names (xhci,
+        // ehci, block-driver, nic-driver), so a fifth DMA driver - audio-driver - died with its
+        // controller still mastering until somebody remembered to add it. The record is written only by
+        // a DMA driver's spawn, so it IS the question, and the kernel learns nothing it did not hold.
+        let bdf = take_task_hw_bdf(slot);
+        if bdf != 0xFFFF {
             use crate::arch::imp::pci;
             // THE DEVICE THIS TASK WAS GIVEN, remembered from its own spawn - not a table of which
-            // service drives which controller. See `TASK_HW_BDF`. A task that drives nothing reports
-            // 0xFFFF and the quiesce below is skipped, which is also the fix for the old default arm
-            // quiescing the DISK on the death of any service it did not recognise.
-            let bdf = task_hw_bdf(slot);
+            // service drives which controller. See `TASK_HW_BDF`. TAKEN, not read: see
+            // `take_task_hw_bdf` for what a stale record in a reused slot would otherwise stop.
             pci::clear_bus_master(bdf);
             // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
-            // cleanly (no-op if the device wasn't confined). Confined USB drivers (xhci/ehci) only; AHCI
-            // + nic-driver run in IOMMU passthrough, so there is no DTE to revert.
-            if task_name == "xhci" || task_name == "ehci" {
-                crate::arch::imp::iommu::release_device(bdf);
-            }
+            // cleanly. For ANY device, not by name: this was `xhci`/`ehci` only, so a third confined
+            // driver (audio-driver) would have leaked its I/O page table on every restart, the respawn
+            // overwriting the record that pointed at it. `release_device` looks the device up in its
+            // own table of confined devices and does nothing for one that was never confined (AHCI and
+            // nic-driver run in passthrough), so asking for every device is exact, not approximate.
+            let _ = crate::arch::imp::iommu::release_device(bdf);
         }
 
         // SMP safety: spin until no other core has CORE_CURRENT[c] == slot.

@@ -90,6 +90,11 @@ fn main() {
     // controller, so an embedded-but-radioless build reports "no radio" and serves rather than dying.
     let radio: &[&str] = if arch == "aarch64" { &["wifi-driver"] } else { &[] };
 
+    // The audio driver (docs/audio.md): an Intel High Definition Audio controller, which this project
+    // meets only on x86 - the T630's chipset audio, and QEMU's `intel-hda`. A BOARD fact like `radio`:
+    // the Pis drive their jack by PWM and the VisionFive has no audio out, so neither embeds it.
+    let audio: &[&str] = if arch == "x86_64" { &["audio-driver"] } else { &[] };
+
     // ---- ONE CFG PER IMAGE THIS BUILD ACTUALLY EMBEDS. ------------------------------------------
     //
     // Derived from the SAME two lists that decide the embedding, three lines above - so `main.rs`
@@ -111,11 +116,11 @@ fn main() {
     // a board that has never had an EHCI image embedded.
     //
     // `values(none())` because these are bare flags: `#[cfg(has_xhci)]`, never `has_xhci = "..."`.
-    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver",
+    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver", "has_audio_driver",
                  "xhci_msi", "nic_on_pci"] {
         println!("cargo::rustc-check-cfg=cfg({flag}, values(none()))");
     }
-    for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()) {
+    for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()).chain(audio.iter()) {
         println!("cargo:rustc-cfg=has_{}", name.replace('-', "_"));
     }
     // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides
@@ -156,7 +161,7 @@ fn main() {
                                    cannot locate the profile directory"))
         .to_path_buf();
 
-    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(radio.iter())
+    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(radio.iter()).chain(audio.iter())
                         .chain(probe.iter()).chain(examples.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing

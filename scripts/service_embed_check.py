@@ -50,10 +50,12 @@ ARCH_EXEMPT = {
                          "enumerator for this board would reach devices by device tree instead, "
                          "which is a different implementation behind the same service contract "
                          "(docs/service-ownership.md, D2).",
+        "audio-driver": "Intel High Definition Audio, a PCI controller this board does not have; its sound is the Pi's PWM headphone jack, a different driver not yet written (docs/audio.md, the hardware table)",
     },
     "aarch64": {
         "ehci": "x86-only USB2 controller driver; the Pi 4's USB host is the VL805 xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 drives xhci over PCIe",
+        "audio-driver": "Intel High Definition Audio, a PCI controller this board does not have; its sound is the Pi's PWM headphone jack, a different driver not yet written (docs/audio.md, the hardware table)",
     },
     "riscv64": {
         "wifi-driver": "the VisionFive 2 Lite has no onboard radio wired up in this tree; its WiFi "
@@ -62,6 +64,8 @@ ARCH_EXEMPT = {
         "ehci": "x86-only USB2 controller driver; the VisionFive 2's USB host is a Cadence USB3 "
                 "whose host half is an xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver",
+        "audio-driver": "Intel High Definition Audio, a PCI controller the VisionFive 2 Lite does not "
+                        "have; this tree drives no audio hardware on it (docs/audio.md)",
     },
 }
 

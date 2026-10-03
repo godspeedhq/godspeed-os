@@ -1455,6 +1455,9 @@ const SPAWN_TRACE: bool = false;
 /// `own_endpoint` is `None` for a service with no recv endpoint (and at the pre-endpoint cap
 /// inserts), in which case only the task slot is released - identical to the prior behaviour.
 fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<EndpointId>) {
+    // The device record too: a spawn can fail after recording it, and the kill path quiesces whatever
+    // device a slot's record names, so a stale one would be inherited by the next task in this slot.
+    let _ = crate::task::scheduler::take_task_hw_bdf(task_slot);
     // A spawn that fails half-way must give back BOTH endpoints, for the same reason death must:
     // a leaked endpoint is permanent, and enough of them fill the routing table and take the kernel
     // down. Read-and-clear, so a later kill of this slot cannot reclaim the same one twice.
@@ -2283,7 +2286,8 @@ fn spawn_service_with_image(
                     if CONFINE_USB_DRIVERS && hw.iommu_confine() {
                         // THIS driver's device, not "the xHCI". This read `pci::XHCI_BDF`, so it
                         // confined the xHCI controller whenever ANY driver asked to be confined -
-                        // harmless only because `xhci` is the sole one that does today, and the same
+                        // harmless only while `xhci` was the sole one that did (`audio-driver` asks
+                        // too, since 2026-10-03), and the same
                         // by-class assumption the kill path carried until D3b. `hw.bdf()` is the
                         // device this spawn actually resolved.
                         crate::arch::imp::iommu::confine_device(hw.bdf(), phys, len);

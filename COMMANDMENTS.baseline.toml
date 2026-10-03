@@ -697,6 +697,9 @@ SpawnImage               = 52
 # shell's trust perimeter, because keystrokes are commands).
 [kernel.service_grants]
 "asker" = ["peer:reply-server"]
+# audio-driver: its HD Audio controller, WITH an interrupt (docs/audio.md, "Interrupt-driven refill"):
+# the stream interrupts as each period plays and the driver refills then. The kernel picks the vector.
+"audio-driver" = ["hw:pci_irq"]
 "block-driver" = ["hw:pci", "peer:dwc2", "peer:events", "peer:xhci"]
 # examples/cap-grant, examples-test build only. ACQUIRE_ANY so its lookup of "receiver" reaches the
 # kernel name directory: with no such service present the lookup MISSES, which is the standalone

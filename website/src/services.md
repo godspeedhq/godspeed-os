@@ -234,6 +234,21 @@ lease nobody returns expires on its own, so a holder that dies cannot pin the ma
 
 **Peers:** none - it answers, it does not ask.
 
+### `audio-driver` - sound
+
+```
+   HD Audio controller ──MSI──▶ audio-driver ──▶ CORB/RIRB ──▶ codec (power, amps, pin, converter)
+                                     │
+                                     └──▶ a ring of sound in its DMA arena, refilled per period
+```
+
+Intel High Definition Audio, x86 only, built so far in QEMU. The stream interrupts as each period of
+the ring is played and the driver refills it then; its DMA is confined behind the IOMMU where there is
+one. On its death the kernel stops the controller's DMA and releases the confinement, keyed on the
+device it was given rather than its name. The `audio` command is not built yet (`docs/audio.md`).
+
+**Peers:** none yet.
+
 ### `time` - the wall clock
 
 ```

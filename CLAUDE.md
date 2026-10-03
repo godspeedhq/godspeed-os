@@ -722,6 +722,27 @@ official, not the runtime behaviour.
 > on effort. `docs/networking.md` and `docs/ahci.md` each carried the opposite claim for their own
 > driver and are corrected in the same change.
 
+> **Amendment 2026-10-03 (audio): there are TWO confined drivers now, and the kernel releases a
+> confinement by the device, not by name.** The amendment above says `xhci` is the only confined driver
+> in the system. `audio-driver` (Intel High Definition Audio, `docs/audio.md`) is spawned confined as
+> well: every DMA its controller makes - the command rings, the buffer descriptor list, the ring of
+> sound - is inside its arena, so confinement refuses nothing it does legitimately. Verified in QEMU on
+> q35 with `amd-iommu`: the confinement selftest passes, the tone plays through the confined domain, and
+> a kill and restart releases and re-confines the device (`build/audio_iommu_qemu.log`). Its controller
+> uses plain MSI, so the interrupt message is in configuration space, out of the driver's reach.
+>
+> **The kernel change it needed adds no responsibility.** On a driver's death the kernel reverted the
+> device's confinement only for `xhci` and `ehci`, named; a third confined driver would have leaked its
+> I/O page table on every restart. It now releases for ANY task that holds a device, which is exact
+> because the release does nothing for a device that was never confined. The bus-master clear beside it
+> moved from a list of four names to the same per-task device record in the same change. Both are
+> memory isolation the kernel already enforced (§4.3), now keyed on what a task holds.
+>
+> **What does not change:** AMD-Vi is still x86-only, `ehci`, `block-driver` and `nic-driver` are still
+> in passthrough, and on the T630 the audio driver does not yet use DMA at all (`docs/audio.md`, A6), so
+> on real hardware `xhci` is still the one confined device. The mechanism now bounds two devices, on one
+> architecture, one of them in QEMU only.
+
 > **Amendment 2026-07-16 (SEC-2): a confined USB driver's least-privilege claim is bounded by the
 > console it drives.** A USB *keyboard* driver is, by function, the machine's input path: it delivers
 > keystrokes to the shell via `CONSOLE_PUSH`, and keystrokes *are* commands. The kernel cannot

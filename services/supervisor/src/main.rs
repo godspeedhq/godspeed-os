@@ -256,6 +256,8 @@ static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 // second copy of it.
 #[cfg(has_wifi_driver)]
 static WIFI_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_WIFI_DRIVER_ELF"));
+#[cfg(has_audio_driver)]
+static AUDIO_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_AUDIO_DRIVER_ELF"));
 
 /// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
 /// every service whose image the supervisor holds.
@@ -571,6 +573,24 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     #[cfg(has_wifi_driver)]
     ("wifi-driver", WIFI_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      16 * 1024 * 1024, 3, &["fs", "power"], 0, 0, 0),
+    // The HD Audio controller (docs/audio.md). Named by the bus, like every PCI driver since step D:
+    // 0x040300 is class 0x04 multimedia, subclass 0x03 HD Audio, and the registers are in BAR0.
+    //
+    // A2 ADDS A DMA ARENA (`dma_pages` below): the command rings and a ring of sound. On this driver's
+    // death the kernel clears its device's bus mastering, keyed on the device it was given
+    // (`kernel/src/task/scheduler.rs`). WITH an interrupt (`pci_irq`): the stream interrupts as each
+    // period is played and the driver refills then; the kernel picks the vector from its MSI pool. No
+    // peers: grants arrive with the step that uses them (§3.1).
+    //
+    // CONFINED behind the IOMMU (§6.4), where there is one: every DMA the controller makes - the command
+    // rings, the buffer descriptor list, the ring of sound - is inside the arena, so nothing it does
+    // legitimately is refused, and a driver that pointed it elsewhere would fault instead of writing.
+    // The second confined driver after `xhci`; the kernel releases the confinement on its death by the
+    // device it was given, not its name (`kernel/src/task/scheduler.rs`).
+    #[cfg(has_audio_driver)]
+    ("audio-driver", AUDIO_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 2, &[], 0, 0,
+     godspeed_sdk::service_context::hwclass::pci_irq(0x04_03_00, 0, true)),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -687,6 +707,9 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
         "xhci" => 32 + 256 + 4,
         // 64 KiB - the `_ => EHCI_DMA_PAGES` default the NIC used to fall through to.
         "nic-driver" => 16,
+        // 68 KiB used, rounded up: the command rings (CORB 1 KiB, RIRB 2 KiB), the buffer descriptor
+        // list, and a 64 KiB ring of sound - about a third of a second at 48 kHz stereo (docs/audio.md).
+        "audio-driver" => 24,
         _ => 0,
     };
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
@@ -1075,7 +1098,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 15;
+const MANAGED_N: usize = 16;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -1098,7 +1121,9 @@ const MANAGED: [&str; MANAGED_N] =
      "wifi-driver",
      // The power policy (docs/power.md). A respawn knows of no lease and puts the clock at its minimum,
      // which is why its absence from this list would matter: dead, nothing would answer a lease at all.
-     "power"];
+     "power",
+     // The HD Audio driver (docs/audio.md). x86-only today; listed unconditionally for the reason above.
+     "audio-driver"];
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -1634,6 +1659,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(has_wifi_driver)]
     ensure_wired(&ctx, &mut name_map, "wifi-driver", &["fs", "power"]);
 
+    // audio-driver (docs/audio.md). MANAGED: the kernel stops a dead driver's bus mastering by the
+    // device it was given (not by name), so a death is quiesced and restarted like any other driver's.
+    // `ensure_mapped` adopts a running instance on a supervisor respawn.
+    #[cfg(has_audio_driver)]
+    ensure_mapped(&ctx, &mut name_map, "audio-driver", 0xFFFF);
+
    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 
     // net-stack: the model-agnostic half of networking (docs/networking.md). Speaks ARP/IP over raw
@@ -1788,6 +1819,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("supervisor: power died, restarting");
                 if respawn_retry(&ctx, &mut name_map, "power") { ctx.log("supervisor: power restarted"); }
                 else { ctx.log("supervisor: power restart FAILED"); }
+            }
+            // The HD Audio driver (docs/audio.md). The kernel cleared its controller's bus mastering on
+            // the death; the respawn resets the controller and re-runs everything from the survey, so a
+            // sound that was playing stops rather than resumes (§14.2).
+            "audio-driver" => {
+                ctx.log("supervisor: audio-driver died, restarting");
+                if respawn_retry(&ctx, &mut name_map, "audio-driver") { ctx.log("supervisor: audio-driver restarted"); }
+                else { ctx.log("supervisor: audio-driver restart FAILED"); }
             }
             _ => {}
         }
