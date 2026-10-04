@@ -121,6 +121,45 @@ fn alloc_table() -> Option<u64> {
     Some(pa)
 }
 
+/// Every live address space's root, for the user-fault instrument (`fault_report`, `backlog/72`).
+///
+/// Recorded where a root is allocated (`PageTable::new`) and cleared where one is freed (`free_all`, which
+/// both `Drop` and `free_page_table_root` go through), so the set is exactly the address spaces that
+/// exist. It answers two questions a fault report otherwise cannot: whether the root the CPU is walking
+/// belongs to ANY live address space, and which other address space holds a frame the faulting walk
+/// reached. Nothing reads it except the report; spawn and kill pay one compare-and-swap each.
+const LIVE_ROOT_SLOTS: usize = 256;
+static LIVE_ROOTS: [portable_atomic::AtomicU64; LIVE_ROOT_SLOTS] =
+    [const { portable_atomic::AtomicU64::new(0) }; LIVE_ROOT_SLOTS];
+static LIVE_ROOTS_FULL_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn root_born(root: u64) {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+    for s in LIVE_ROOTS.iter() {
+        if s.compare_exchange(0, root, AcqRel, Acquire).is_ok() {
+            return;
+        }
+    }
+    // Said once: a full table makes the instrument blind to some address spaces, never wrong about the
+    // ones it sees, and a line per spawn would bury the report it exists for.
+    if !LIVE_ROOTS_FULL_SAID.swap(true, AcqRel) {
+        crate::kprintln!("ptables: live-root table full ({} slots) - a fault report cannot see every address space", LIVE_ROOT_SLOTS);
+    }
+}
+
+fn root_died(root: u64) {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+    for s in LIVE_ROOTS.iter() {
+        if s.compare_exchange(root, 0, AcqRel, Acquire).is_ok() {
+            return;
+        }
+    }
+}
+
+fn root_is_live(root: u64) -> bool {
+    LIVE_ROOTS.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == root)
+}
+
 /// One task's address space.
 pub struct PageTable {
     root: u64,
@@ -140,6 +179,7 @@ impl PageTable {
     /// collide with a task's own pages, so a task may use any address the architecture gives it.
     pub fn new() -> Result<Self, MapError> {
         let root = alloc_table().ok_or(MapError::FrameAllocFailed)?;
+        root_born(root);
         Ok(PageTable { root })
     }
 
@@ -390,6 +430,9 @@ pub unsafe fn map_in_root(root: u64, virt: u64, phys: u64, flags: PageFlags) -> 
 /// `root` must be an address space no core is executing under - the caller has already switched
 /// `TTBR0_EL1` away and invalidated - and it must not be freed twice.
 pub unsafe fn free_all(root: u64) {
+    // Out of the live set BEFORE the frames go back: a fault report that ran after the free would
+    // otherwise call a recycled root live.
+    root_died(root);
     // SAFETY: caller's contract; the tables are identity-mapped RAM.
     unsafe {
         for i in 0..ENTRIES {
@@ -488,6 +531,153 @@ pub unsafe fn reclaim_pages(root: u64) -> usize {
         }
     }
     freed
+}
+
+/// Where a frame turns up in some OTHER live address space - as its root, one of its tables, or a page it
+/// maps - or `None`. The first hit only: one is enough to say a frame has two owners.
+fn held_elsewhere(frame: u64, except: u64) -> Option<(u64, &'static [u8])> {
+    for s in LIVE_ROOTS.iter() {
+        let r = s.load(core::sync::atomic::Ordering::Acquire);
+        if r == 0 || r == except {
+            continue;
+        }
+        if r == frame {
+            return Some((r, b"the ROOT"));
+        }
+        // SAFETY: read-only walk of a live root's tables through the direct map; `get` refuses any
+        // address that is not RAM, so a corrupt descriptor is skipped rather than followed.
+        unsafe {
+            for i in 0..ENTRIES {
+                let l1e = get(r, i);
+                if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE { continue; }
+                let l2 = l1e & ADDR_MASK;
+                if l2 == frame { return Some((r, b"an L2 table")); }
+                for j in 0..ENTRIES {
+                    let l2e = get(l2, j);
+                    if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE { continue; }
+                    let l3 = l2e & ADDR_MASK;
+                    if l3 == frame { return Some((r, b"an L3 table")); }
+                    for k in 0..ENTRIES {
+                        let l3e = get(l3, k);
+                        if l3e & DESC_VALID != 0 && l3e & ADDR_MASK == frame {
+                            return Some((r, b"a PAGE"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One frame the faulting walk passed through: what the allocator thinks of it, and who else holds it.
+fn report_frame(what: &[u8], pa: u64, root: u64) {
+    super::put_str(b"\r\n      ");
+    super::put_str(what);
+    super::put_str(b" pa ");
+    super::put_hex(pa);
+    super::put_str(match crate::memory::allocator::frame_is_free(pa) {
+        None => b" (not RAM)",
+        Some(true) => b" - the allocator calls it FREE",
+        Some(false) => b" - allocated",
+    });
+    match held_elsewhere(pa, root) {
+        Some((r, how)) => {
+            super::put_str(b" - ALSO ");
+            super::put_str(how);
+            super::put_str(b" of live root ");
+            super::put_hex(r);
+        }
+        None => super::put_str(b" - no other address space holds it"),
+    }
+}
+
+fn report_desc(level: &[u8], index: usize, d: u64) {
+    super::put_str(b"\r\n      ");
+    super::put_str(level);
+    super::put_str(b"[");
+    super::put_dec(index as u64);
+    super::put_str(b"] = ");
+    super::put_hex(d);
+}
+
+/// Walk the faulting address through the table the CPU had installed, and say what the walk found.
+///
+/// **Why it exists (`backlog/72`).** On the Pi 4, live tasks take instruction aborts and permission
+/// faults on their OWN code - the shell on the first instruction of `service_main` - with the TLB already
+/// flushed on every switch, so the translation must have come from the task's current tables. Two
+/// explanations were left: a table frame with a second owner (freed by one task's death, or handed out
+/// twice, and then written by its other owner), or tables that are correct but reached another core late.
+/// This separates them in one fault:
+///
+/// - the ROOT the CPU walked, and whether any live address space owns it at all;
+/// - every descriptor on the way down, and each table frame's state - FREE in the allocator, or ALSO held
+///   by another live root, is the first explanation caught in the act;
+/// - the final descriptor decoded. A walk that ALLOWS the access that faulted means the table is right
+///   now and the core used something else - the second explanation.
+///
+/// Read-only, lock-free and bounded: every descriptor is read through `get`, which refuses an address that
+/// is not RAM, and the scan of other roots is three nested loops over at most 512 entries each.
+pub fn fault_report(far: u64, instruction_fetch: bool) {
+    let ttbr: u64;
+    // SAFETY: reading TTBR0_EL1 at EL1 is a side-effect-free system-register read.
+    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack)) };
+    let root = ttbr & ADDR_MASK;
+    super::put_str(b"\r\n    page walk at FAR (backlog/72):");
+    super::put_str(b"\r\n      TTBR0 root ");
+    super::put_hex(root);
+    super::put_str(if root_is_live(root) {
+        b" - a live address space"
+    } else {
+        b" - NOT A LIVE ADDRESS SPACE: the core is walking a root nothing owns"
+    });
+    report_frame(b"root   ", root, root);
+    if far >> 39 != 0 {
+        super::put_str(b"\r\n      FAR is above the 39-bit user range - nothing to walk");
+        return;
+    }
+    // SAFETY: read-only walk through the direct map; `get` refuses non-RAM addresses.
+    unsafe {
+        let l1e = get(root, idx(far, 1));
+        report_desc(b"L1", idx(far, 1), l1e);
+        if l1e & DESC_VALID == 0 || l1e & 0b11 != DESC_TABLE {
+            super::put_str(b" - not a table: the address is unmapped at L1");
+            return;
+        }
+        let l2 = l1e & ADDR_MASK;
+        report_frame(b"L2 table", l2, root);
+        let l2e = get(l2, idx(far, 2));
+        report_desc(b"L2", idx(far, 2), l2e);
+        if l2e & DESC_VALID == 0 || l2e & 0b11 != DESC_TABLE {
+            super::put_str(b" - not a table: the address is unmapped at L2");
+            return;
+        }
+        let l3 = l2e & ADDR_MASK;
+        report_frame(b"L3 table", l3, root);
+        let l3e = get(l3, idx(far, 3));
+        report_desc(b"L3", idx(far, 3), l3e);
+        if l3e & DESC_VALID == 0 {
+            super::put_str(b" - INVALID: the table itself says this page is unmapped");
+            return;
+        }
+        report_frame(b"page    ", l3e & ADDR_MASK, root);
+        let el0 = l3e & DESC_AP_EL0 != 0;
+        let exec = l3e & DESC_UXN == 0;
+        super::put_str(b"\r\n      leaf: EL0 access ");
+        super::put_str(if el0 { b"yes" } else { b"NO" });
+        super::put_str(b", ");
+        super::put_str(if l3e & DESC_AP_RO != 0 { b"read-only" } else { b"writable" });
+        super::put_str(b", EL0 execute ");
+        super::put_str(if exec { b"yes" } else { b"NO" });
+        super::put_str(b", access flag ");
+        super::put_str(if l3e & DESC_AF != 0 { b"set" } else { b"CLEAR" });
+        let allows = el0 && l3e & DESC_AF != 0 && (!instruction_fetch || exec);
+        super::put_str(if allows {
+            b"\r\n      verdict: the table ALLOWS this access now - the core used a translation the table does not hold"
+        } else {
+            b"\r\n      verdict: the table REFUSES this access - the fault is the table's own content"
+        });
+    }
 }
 
 impl Drop for PageTable {

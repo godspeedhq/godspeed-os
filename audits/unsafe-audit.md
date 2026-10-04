@@ -41,6 +41,18 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-10-04 - Pi 4: a page walk in the user-fault report (feat/wifi-driver)
+
+`backlog/72`: Pi 4 tasks take instruction aborts and permission faults on their own code - the shell on the
+first instruction of `service_main` - with the TLB flushed on every switch. The fault report now walks the
+faulting address through the table the core had installed and says whether each frame on the way has a
+second owner. Read-only throughout; nothing is written to any table or to the allocator.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/ptables.rs` | 24 -> 27 (+3) | `held_elsewhere`: a read-only walk of every OTHER live root's tables through the existing `get` accessor, which refuses any address that is not RAM, so a corrupt descriptor is skipped rather than followed. `fault_report`: one `mrs ttbr0_el1` (side-effect-free) and one read-only walk of the faulting address through `get`. The live-root set they consult is plain atomics, no `unsafe`. |
+| `memory/allocator.rs` | 47 -> 48 (+1) | `frame_is_free`: one read of the free bitmap through the existing `bitmap()` accessor, deliberately WITHOUT the allocator lock - it runs in a fault report, where taking a lock another core may hold would wedge the machine over a dead service. `phys_in_ram` bounds the index below `max_ram_frame`, which the bitmap was sized to cover. A racing read is at most one allocation stale, which is acceptable for a diagnostic. |
+
 ## 2026-10-03 - the Pis' audio jack, prepared as part of its grant (feat/audio)
 
 `pwm-audio` drives the Pis' 3.5 mm jack: PWM fed by the SoC's DMA engine (`docs/audio.md`, "The Pis").
@@ -2611,7 +2623,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 24 | permitted |
+| arch/aarch64/ptables.rs | 27 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
@@ -2662,7 +2674,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 16 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 47 | permitted |
+| memory/allocator.rs | 48 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |

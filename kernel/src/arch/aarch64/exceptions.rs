@@ -1209,6 +1209,15 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         }
     }
 
+    // THE PAGE WALK, for an EL0 instruction or data abort (`backlog/72`): what the table the core had
+    // installed says about the faulting address, and whether its frames have a second owner. Skipped for
+    // the null page, which is where the DESIGNED faults land - a service panicking on `EndpointDead` faults
+    // at address 0 on purpose, dozens of times in a storm, and walking each would bury the faults this is for.
+    let ec = (esr >> 26) & 0x3F;
+    if from_el0 && (ec == 0b100000 || ec == 0b100100) && far >= 0x1000 {
+        super::ptables::fault_report(far, ec == 0b100000);
+    }
+
     if from_el0 && slot < crate::task::scheduler::MAX_TASKS {
         super::put_str(b"\r\n    EL0 fault - killing the task; the kernel and every other service continue.\r\n");
         crate::task::kill_current();
