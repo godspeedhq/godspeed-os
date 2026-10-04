@@ -37,6 +37,22 @@ DESIGNED kind - a service panics on `EndpointDead` and its panic handler faults 
 before it). Only hardware shows the other kind. The August Pi 4 storm (`build/pi4a.log`, `e9a6878d`) had
 one such fault in 100 rounds, so the class predates this work; the rate is much higher now.
 
+## It happens WITHOUT chaos (2026-10-04, `f7061574`)
+
+A plain Pi 4 boot, WiFi joined, nothing being killed: at 02:05:53 the shell took the same fault -
+`ESR 0x82000007`, instruction abort, translation fault - four seconds after `observe` spawned its live
+painter (`observe-live`, core 3). The supervisor restarted the shell in 30 ms. So the storms only raise the
+rate; the trigger is not a kill. "Within moments of a spawn" still fits: `observe-live` was the spawn.
+
+A side effect worth naming because it looks like a separate bug: the crashed shell was the one polling `q`
+for the live view, so the respawned shell never reaped `observe-live` and it painted on unowned, deaf to
+`q`. `kill observe-live` (or starting `observe` again, which kills a stale painter first) clears it; a
+respawned shell should reap it itself.
+
+**Ruled out from this capture:** `x22 = 0xd05dead5` (also in run 1's dump) looked like a poison
+fingerprint. It is a constant the shell's own code builds (`mov`/`movk` at several sites), so a register
+holding it says nothing.
+
 ## What is RULED OUT
 
 - **The CPU clock** (run 3). `force_turbo=1` held the Arm clock at 1500 MHz - `power`'s "minimum" read back
