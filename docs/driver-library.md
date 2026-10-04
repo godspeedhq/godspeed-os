@@ -58,13 +58,13 @@ and why; read them for the reasoning, not to find out what the library contains.
 - **`irq`** - waiting for a device's interrupt on the endpoint its clients also send to. `Irq::granted`,
   `routed`, `seen`; `wait(budget)` returns `Interrupt`, `Request(message)` or `Timeout`, so a request is
   handed back to be served and never dropped; `rearm` re-opens a level-triggered line (a no-op for MSI).
-  With no interrupt routed the same loop is a timed wait that still serves requests. Its first user is
-  `audio-driver` (step 2); `xhci`, `ehci` and `dwc2`, whose hand-written copies it was built from, are
+  With no interrupt routed the same loop is a timed wait that still serves requests. Its users are
+  `audio-driver` (step 2) and `pwm-audio`, which runs on the no-interrupt path; `xhci`, `ehci` and `dwc2`, whose hand-written copies it was built from, are
   not converted yet.
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f), `sdk/wifi`
 (1d), `dwc2` (1g, 1h), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l - **not yet
-verified on hardware**). `audio-driver` was written on the library from the start (`wait`, `delay`, `irq`).
+verified on hardware**). `audio-driver` and `pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
 
 **Left by hand, each with its reason in its step.**
 

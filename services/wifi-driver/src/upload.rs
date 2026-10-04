@@ -21,8 +21,8 @@
 //!
 //! **And it must be F1_BLOCK mode, for an arithmetic reason.** A byte-mode CMD53 carries at most 512 bytes, and
 //! the `write32` this driver had moves four - 609 KB that way is about 152,000 transactions. Block mode
-//! moves `blocks x 64` bytes in one command, so a 2 KiB chunk is one transaction and the whole image is
-//! about 300. Function 1's 64-byte block size was set in step 2 for exactly this.
+//! moves `blocks x 64` bytes in one command, so a 1 KiB chunk (`CHUNK`, sixteen blocks) is one transaction
+//! and the whole image is about 600. Function 1's 64-byte block size was set in step 2 for exactly this.
 //!
 //! ## The RAM layout, from two references that agree
 //!

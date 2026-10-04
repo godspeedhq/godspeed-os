@@ -142,8 +142,10 @@ place both services on core 0 for one boot - has been run and is recorded above.
   link-up dance, on `time`'s nudge every 20 s, and on ordinary client requests. Each exchange held every
   client for up to about fifteen seconds when the server or resolver was silent. `date sync` ended them
   only because its success latched the clock and quietened the nudges. FIXED IN CODE by taking SNTP out
-  of the loop (`docs/networking.md` 16): x86 shell suite 215/0 and a Pi 4 QEMU boot, NOT yet on the Pi 4.
-  Closed when a Pi 4 boot with an unset clock shows no multi-second echo.
+  of the loop (`docs/networking.md` 16): x86 shell suite 215/0, a Pi 4 QEMU boot, and on the Pi 4 the boot
+  of `5dd1f1b8` (2026-10-02, above: one echo a second, 19 of 19). That boot does not record whether its
+  clock was unset, so the closing condition is still unproven: closed when a Pi 4 boot with an UNSET
+  clock shows no multi-second echo.
 - **The steady one-second tax** is what the slot log above measured, and it stands: the first send of
   each exchange does not wake `nic-driver`. Still open, still parked, still the kernel path named above.
 

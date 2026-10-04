@@ -2690,7 +2690,7 @@ const AUDIO_PWM_DIVI: u32 = 2;
 
 /// Make the audio jack usable, as part of granting it: route its two pins to PWM0 and start the PWM
 /// clock. Both live in SHARED blocks - every pin's function in the GPIO page, every clock in the clock
-/// manager's - so the kernel does them here, as it routes the SD pins for `block-driver`, and the driver
+/// manager's - so the kernel does them here, as part of the grant, and the driver
 /// is granted only the PWM block and the DMA engine (CLAUDE.md 12.3, as amended for audio).
 ///
 /// The sequence is Circle's (`lib/gpioclock.cpp`), checked against the datasheet: kill the clock and

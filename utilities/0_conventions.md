@@ -137,6 +137,13 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     waiting returns the machine to its operator. The `events` channel (`trace_ask`) had the same shape
     and was worse for it, since `events failures` is the instrument you reach for WHEN something is
     wedged; an instrument that can hang on the thing it is measuring takes the prompt with it.
+
+    **Recorded exception: the `wifi` radio power requests.** `wifi radio on`, `wifi radio off`,
+    `wifi radio off hard` and the power request at the start of `wifi radio powercycle` block in a
+    kernel `Call` with no `q`, because a shell blocked in one cannot read the console. Each is
+    BOUNDED at 15 s (`MAX_SECS` in `wifi_radio` and `wifi_radio_hard_off`, `OP_MAX_MS` in
+    `wifi_radio_powercycle`), and the usual wait is two to three seconds. The long waits that follow
+    - the watch after a restart of the driver - keep `q`. `56_wifi.md` section 2 records this per verb.
 11. **Quitting stops the TASK, not just the shell.** When a utility is escaped (rule 10), the
     escape must abort the actual WORK the utility set in motion - not merely stop the shell from
     *waiting* on it. If the utility handed a long job to a peer service and the escape only stops

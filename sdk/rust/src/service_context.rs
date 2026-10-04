@@ -405,7 +405,8 @@ pub mod hwclass {
     /// routes the jack's pins and starts the PWM clock as part of the grant, then maps the PWM block and
     /// the DMA engine side by side and grants a DMA arena.
     pub const AUDIO_PWM:   u32 = 8;
-    /// A WiFi radio on an SDIO host at a fixed SoC address (the Pi 4's CYW43455 behind the Arasan). The
+    /// A WiFi radio on an SDIO host at a fixed SoC address (the Pi 4's CYW43455 behind the Arasan, the
+    /// VisionFive 2 Lite's AIC8800 behind a DesignWare `dw_mmc`). The
     /// kernel grants the host's window - and, where it can, the radio's power control - to the service
     /// whose request names this kind, never to a service because of its name.
     pub const WIFI_SDIO:   u32 = 9;

@@ -4,7 +4,8 @@
 //! **This is the Arasan SDHCI block at `0xFE30_0000`** - the BCM2711's older SD controller, which on a
 //! Raspberry Pi 4 is wired not to the card slot but to the CYW43455 radio (the vendor device tree's
 //! `mmcnr@7e300000`, bus-width 4, `sdio_pins`). The kernel grants this service that one page of
-//! registers at spawn, by name and only when its boot census saw the controller answer, so every
+//! registers at spawn, by device kind (`WIFI_SDIO`) and only when its boot census saw the controller
+//! answer, so every
 //! access below goes through the SDK's safe `Mmio` wrapper and this crate contains no `unsafe`
 //! (§18.1/§18.2).
 //!

@@ -227,8 +227,8 @@ pub unsafe fn switch(current: *mut TaskContext, next: *const TaskContext) {
 /// **The address-space half is an obligation, not an optimisation (SEC-26).** The neutral kill path
 /// elides a cross-core TLB shootdown for a pinned task on the grounds that "a CR3 reload flushes
 /// non-global TLB entries" - an *x86* semantic. Writing `TTBR0_EL1` flushes nothing on AArch64, so
-/// this port takes route (a) from `arch/CLAUDE.md`: the context switch itself invalidates on an
-/// address-space change. Omitting it would leave a dead task's translations live for the next one,
+/// this port takes route (a) from `arch/CLAUDE.md`: the context switch itself invalidates - on every
+/// switch, as the next paragraph explains. Omitting it would leave a dead task's translations live for the next one,
 /// which is the same use-after-free class as SEC-1 and would not show up until something reused the
 /// frames.
 ///

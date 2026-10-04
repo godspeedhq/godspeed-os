@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # `audio` - sound: what is playing, the volume, the codec's power, a test tone
 
-Version reported by `audio version`. Implementation shape: **shell built-in**, asking the `audio-driver`
-service over IPC. The driver owns the controller; the shell owns the words.
+Version reported by `audio version`. Implementation shape: **shell built-in**, asking the board's audio
+driver over IPC - `audio-driver` on x86, `pwm-audio` on the Pis. The driver owns the controller; the shell owns the words.
 
 ## Status, as built and honest (2026-10-03)
 
@@ -11,8 +11,8 @@ service over IPC. The driver owns the controller; the shell owns the words.
 level follows the volume, volume 0 and mute are silent, a tone lasts as long as asked and `q` cuts it
 short (`docs/audio.md`, "Step A4, first half"). **On the Pis** the same verbs reach `pwm-audio`, which
 drives the 3.5 mm jack by PWM - built, run in QEMU (which can only show that it refuses an emulator that
-does not pace its DMA), and not yet heard on a board. Not run
-on hardware: on the T630 the driver surveys the codec and stops before playback, and every verb below
+does not pace its DMA), and **heard on a Pi 4** (2026-10-03: tone, volume, mute and unmute through the
+jack); the Pi 2 is built and not yet heard. Not run on hardware on x86: on the T630 the driver surveys the codec and stops before playback, and every verb below
 answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
 
 The verbs in section 1 are built, and the volume and the mute survive a reboot (section 5). The rest of
@@ -42,8 +42,10 @@ mistaken for a fault.
 does not apply.
 
 **Volume is 0 to 100, and 0 is not mute.** Both are silent, and they stay separate states: `mute` keeps
-the volume and `unmute` returns to it. The scale is linear in the codec's own amplifier steps, which are
-even steps of decibels, so equal steps of volume sound like equal changes; `audio info` shows the step.
+the volume and `unmute` returns to it. On x86 the scale is linear in the codec's own amplifier steps, which
+are even steps of decibels, so equal steps of volume sound like equal changes; `audio info` shows the step.
+The Pis have no amplifier: `pwm-audio` scales the samples by the square of the volume, for the same
+reason.
 
 ## 2. What each action answers
 
@@ -83,7 +85,7 @@ the adapter (`docs/audio.md`).
 
 | Situation | What `audio` says |
 |---|---|
-| No `audio-driver` running (every port but x86) | `no audio hardware on this machine` - not an error to ask |
+| No audio driver running (the VisionFive, which has no audio output, or a board whose jack was not found) | `no audio hardware on this machine` - not an error to ask |
 | The driver is running and did not answer | `audio: the audio driver is not answering` |
 | No HD Audio controller | `audio: no audio hardware on this machine` |
 | The controller did not leave reset | `audio: the controller is there and did not come out of reset - the serial log says more` |

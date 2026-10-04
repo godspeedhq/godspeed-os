@@ -179,9 +179,10 @@ the granted DMA arena and they leave the trusted computing base entirely (§6.4)
 ```
    net-stack ──frames──▶ nic-driver ──▶ e1000 / RTL8168 (x86, own MMIO cap)
        │                            └──▶ dwc2 (Pi 2, USB ethernet)
-       │                            └──▶ GENET (Pi 4, on the SoC)
+       │                            └──▶ GENET (Pi 4, on the SoC; the radio when the cable is out)
+       │                            └──▶ dwmac (VisionFive 2, on the SoC)
        ▼
-   ARP · IPv4 · ICMP · UDP · DHCP · DNS · SNTP
+   ARP · IPv4 · ICMP · UDP · DHCP · DNS
        │
        └──▶ a socket is a capability (the same mechanism as a file)
 ```
@@ -217,7 +218,8 @@ cannot ask a service to report it (§11.4).
                       └──▶ power  (a lease on the Arm clock while it loads the chip)
 ```
 
-The Pi 4's onboard radio. The chip-independent half - the handshake, the key file, the wire protocol, the
+The Pi 4's onboard radio; on the VisionFive 2 Lite, the AIC8800 radio's driver in progress (phase V0:
+its SD host granted and its power pin proven; `docs/wifi-aic8800.md`). The chip-independent half - the handshake, the key file, the wire protocol, the
 SDIO protocol and the `Station` a serve loop drives - is a library, `sdk/wifi`, shared with the radios to
 come. A respawn adopts a firmware still running; a stopped one is power-cycled cold.
 
@@ -245,7 +247,7 @@ lease nobody returns expires on its own, so a holder that dies cannot pin the ma
 Intel High Definition Audio, x86 only, built so far in QEMU. The stream interrupts as each period of
 the ring is played and the driver refills it then; its DMA is confined behind the IOMMU where there is
 one. On its death the kernel stops the controller's DMA and releases the confinement, keyed on the
-device it was given rather than its name. The `audio` command is not built yet (`docs/audio.md`).
+device it was given rather than its name.
 
 **Peers:** `fs`, for `/audio.settings`.
 

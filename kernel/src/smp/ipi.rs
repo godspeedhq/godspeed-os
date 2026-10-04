@@ -107,7 +107,11 @@ fn this_core() -> usize {
     crate::smp::core::lapic_to_core_id(lapic) as usize
 }
 
-/// Invalidate `addr` on THIS core - a single-page `invlpg`, or a full CR3 reload for the `!0` sentinel.
+/// Invalidate `addr` on THIS core - a single-page invalidate, or a base reload for the `!0` sentinel.
+///
+/// **The reload flushes on x86 (a CR3 write) and riscv64 (`sfence.vma`) only.** On arm32 and aarch64 `write_page_table_base` is a
+/// bare TTBR0 write and flushes nothing (`arch/CLAUDE.md`, SEC-27), so the `!0` path is a no-op there.
+/// Nothing calls `broadcast_full_tlb_flush` today; see that function.
 #[inline]
 fn invalidate(addr: u64) {
     if addr == !0u64 {
@@ -286,7 +290,8 @@ pub unsafe fn broadcast_full_tlb_flush() {
     // Save the interrupt flag and disable interrupts for the shootdown protocol.
     let was_enabled = crate::arch::imp::local_irq_save();
 
-    // Flush locally (CR3 reload invalidates all non-global TLB entries on this core).
+    // Flush locally (on x86 the CR3 reload invalidates all non-global TLB entries on this core; on the
+    // ARM ports it flushes nothing - see `invalidate`. No caller exists yet).
     invalidate(!0u64);
 
     // Broadcast a full-flush request (addr = !0) to every other core via the per-core path; remote

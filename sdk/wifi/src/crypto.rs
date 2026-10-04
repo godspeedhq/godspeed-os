@@ -6,7 +6,9 @@
 //! The first of them is the pairwise master key: `PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`
 //! (IEEE 802.11-2020 §12.7.1.2). It is derived ONCE, when a passphrase arrives, and the passphrase is then
 //! gone; the PMK is what the driver keeps and what every later step (the PTK, the handshake MIC) is built
-//! from. Nothing here is clever, and none of it is exposed outside this crate.
+//! from. Nothing here is clever. The primitives are public, because a driver uses them directly - the
+//! Broadcom driver calls `psk`, `Sha1`, `aes_key_unwrap` and `selftest` - and only internals such as the
+//! AES field arithmetic stay private to this crate.
 //!
 //! **Every primitive is checked against a published vector at boot** (`selftest`), because a wrong hash does
 //! not fail - it produces a key the access point silently refuses, which would look exactly like a wrong

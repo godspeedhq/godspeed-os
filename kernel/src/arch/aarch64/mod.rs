@@ -609,7 +609,7 @@ fn allocator_selftest() {
 ///    so the walk allocates a fresh L2 and L3 rather than colliding with a kernel block. See `ptables`
 ///    for why a VA *below* 4 GiB cannot be used yet: it would shadow the kernel's identity mapping.
 /// 3. **The switch actually takes**: install the new TTBR0, and read back a value written through the
-///    new mapping. This is the first time the address-space branch of `switch_context` is exercised.
+///    new mapping. This is the first time `switch_context`'s TTBR0 install is exercised.
 /// 4. **The kernel survived the switch** - it is still executing, printing, and its own data reads
 ///    back correctly under the task's table.
 /// 5. **Switching back and reclaiming** returns every table frame, checked against the free count.
@@ -1227,8 +1227,8 @@ pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tl
 /// Chosen well above any service image and below the 39-bit VA ceiling this MMU translates.
 pub const DRIVER_MMIO_VA: u64 = 0x6000_0000;
 
-/// Grant a named driver service the MMIO window its device lives at - by NAME, at spawn, and nothing
-/// else (§3.1: authority is granted deliberately or not at all).
+/// Grant a driver the MMIO window its device lives at - by the device KIND its spawn request names, at
+/// spawn, and nothing else (§3.1: authority is granted deliberately or not at all).
 ///
 /// This returned `None`, which is why `genet` and `xhci` were still IN the kernel: a service cannot
 /// drive a device whose registers it cannot name. Step 2 of getting them out (step 1 was routing the
@@ -1261,7 +1261,7 @@ pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u
         use crate::memory::frame::PhysAddr;
         use page_tables::{PageFlags, VirtAddr};
 
-        // One entry per device this port knows how to grant. A name that is not here gets NOTHING,
+        // One entry per device this port knows how to grant. A kind that is not here gets NOTHING,
         // which is the default that keeps this a grant rather than an ambient window.
         use crate::task::kind as k;
         let (phys, pages): (u64, u64) = match kind {
@@ -1322,23 +1322,6 @@ pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u
 pub fn net_frame_tx(_frame: &[u8]) -> bool {
     false
 }
-/// One 32-bit word from the BCM2711's hardware random number generator - the RNG200 block, `rng@7e104000`
-/// in the device tree, `iproc-rng200` in Linux - or `None` when it has produced nothing inside a bounded
-/// wait or is locked out and one reset did not clear it. Serves `InspectKernel` query 19; the wifi
-/// driver's handshake nonce is what asked for it (`docs/wifi.md` 40: until this existed the nonce was
-/// hashed from the cycle counter and the driver said so on every join).
-///
-/// Registers and sequence as Linux's driver names them (26.14: the silicon's requirement, not its model):
-/// `CTRL` +0x00 (bits 0x1FFF are the generator enable field, 1 = on), `RNG_SOFT_RESET` +0x04 and
-/// `RBG_SOFT_RESET` +0x08 (write 1 then 0), `INT_STATUS` +0x18 (0x8000_0000 master-fail lockout, 0x20
-/// NIST fail; writing clears), `FIFO_DATA` +0x20, `FIFO_COUNT` +0x24 (low byte = words waiting). Linux
-/// allows one restart per read on a fail bit and then gives up; so does this. The block is inside the
-/// 0xFC00_0000+ window `mmu.rs` maps Device-nGnRnE, and is reached through `mmio()` so it holds on both
-/// sides of the jump to the high half.
-///
-/// The wait is a bound in READS of the count register, not a duration: it is there so a block that never
-/// fills - unclocked, or absent on a board this feature was built for by mistake - returns `None` rather
-/// than holding the core, and `None` is the honest answer the caller already handles.
 /// The BCM2711's RNG200 block.
 #[cfg(feature = "pi4")]
 const RNG200_BASE: usize = 0xFE10_4000;
@@ -1390,6 +1373,23 @@ fn rng_probe() {
     put_str(b"\r\n");
 }
 
+/// One 32-bit word from the BCM2711's hardware random number generator - the RNG200 block, `rng@7e104000`
+/// in the device tree, `iproc-rng200` in Linux - or `None` when it has produced nothing inside a bounded
+/// wait or is locked out and one reset did not clear it. Serves `InspectKernel` query 19; the wifi
+/// driver's handshake nonce is what asked for it (`docs/wifi.md` 40: until this existed the nonce was
+/// hashed from the cycle counter and the driver said so on every join).
+///
+/// Registers and sequence as Linux's driver names them (26.14: the silicon's requirement, not its model):
+/// `CTRL` +0x00 (bits 0x1FFF are the generator enable field, 1 = on), `RNG_SOFT_RESET` +0x04 and
+/// `RBG_SOFT_RESET` +0x08 (write 1 then 0), `INT_STATUS` +0x18 (0x8000_0000 master-fail lockout, 0x20
+/// NIST fail; writing clears), `FIFO_DATA` +0x20, `FIFO_COUNT` +0x24 (low byte = words waiting). Linux
+/// allows one restart per read on a fail bit and then gives up; so does this. The block is inside the
+/// 0xFC00_0000+ window `mmu.rs` maps Device-nGnRnE, and is reached through `mmio()` so it holds on both
+/// sides of the jump to the high half.
+///
+/// The wait is a bound in READS of the count register, not a duration: it is there so a block that never
+/// fills - unclocked, or absent on a board this feature was built for by mistake - returns `None` rather
+/// than holding the core, and `None` is the honest answer the caller already handles.
 #[cfg(feature = "pi4")]
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -2615,20 +2615,22 @@ pub mod page_tables {
     /// Free a task's page-table root and the structure below it, at task death.
     ///
     /// # Safety
-    /// `root` must belong to a task already marked Dead, after a TLB shootdown, so no page-walker can
-    /// still reach it.
+    /// `root` must belong to a task already marked Dead, and no core may be RUNNING it. A core that last
+    /// ran it may still hold it in `TTBR0_EL1` while it idles and walk it speculatively; that is tolerated
+    /// because the flush below drops what it cached, and the next `switch_context` on that core installs
+    /// a live root and flushes again before anything runs (`context.rs`, `backlog/72`).
     #[cfg(feature = "pi4")]
     pub unsafe fn free_page_table_root(root: u64) {
         // Invalidate every translation this address space owned, on EVERY core, BEFORE its frames go
         // back to the allocator.
         //
-        // Without this a respawn can inherit the dead space's TLB. `switch_context` skips the TTBR
-        // install when the incoming base equals the outgoing one - a sound optimisation only while a
-        // TTBR value identifies an address space, and it stops identifying one the moment root frames
-        // are recycled. The allocator hands a just-freed frame straight back, so a service that dies
-        // and respawns can get the SAME root physical address with entirely different contents: the
-        // switch is skipped as a no-op, and the new task runs on the dead task's mappings, whose frames
-        // have already been reclaimed and handed to somebody else.
+        // Without this a respawn could inherit the dead space's TLB. `switch_context` USED TO skip the
+        // TTBR install when the incoming base equalled the outgoing one - sound only while a TTBR value
+        // identifies an address space, which stops being true the moment root frames are recycled: the
+        // allocator hands a just-freed frame straight back, so a respawn can get the SAME root physical
+        // address with entirely different contents. It now installs and flushes on every switch
+        // (`context.rs`); this flush is still owed, because it drops the dead space's entries on cores
+        // that will not switch again soon.
         //
         // That is what killed `chaos kill-storm supervisor` on this port. Seven fresh boot spawns were
         // fine - all distinct roots - and the first RESPAWN took an instruction abort (ESR 0x82000007,

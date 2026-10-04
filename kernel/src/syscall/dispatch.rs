@@ -2632,21 +2632,11 @@ const NET_FRAME_MAX: usize = 1600;
 // (§26.10, docs/service-ownership.md D2). This is the whole of the kernel's involvement.
 // ---------------------------------------------------------------------------
 
-/// PciCfgRead (53): `arg0` = configuration selector, `arg1` = register offset. Gated by
-/// `PCI_CFG_RESOURCE` + READ.
-///
-/// Returns the 32-bit value read (as a positive i64 - a full u32 always widens non-negative, so
-/// 0xFFFFFFFF is data and not an error), `CapNotHeld` without the capability, or `-1` for an access
-/// the arch will not admit.
-///
-/// A REFUSAL IS LOUD (invariant 12) but not fatal to the caller: an enumerator walking a bus is
-/// told where its authority ends and stops there, rather than being handed a plausible zero it would
-/// report as an empty machine.
 /// DevicePower (54): `arg0` = 0 to cut the power of the caller's device, 1 to restore it. Gated by
 /// `DEVICE_POWER_RESOURCE` + WRITE, which is minted only to a service granted a fixed peripheral window
-/// whose device the arch layer can power - so the device is identified by the GRANT, through the
-/// caller's own name in the same table the window came from, never by an argument. Returns 0 when the
-/// firmware or pin took the request, -1 when this machine has no power control for that device.
+/// whose device the arch layer can power - so the device is identified by the GRANT, through the device
+/// KIND this task was granted, never by an argument or a name. Returns 0 only when the pin reads back at
+/// the level asked for, -1 otherwise (no power control for that device, or a request that did not take).
 ///
 /// WHY THIS IS MECHANISM AND NOT A SEVENTH RESPONSIBILITY: the kernel already owns the device grant
 /// (§12.3), and a grant includes power - it powers the Pi 4's SD domain at boot before the radio's
@@ -2694,6 +2684,16 @@ fn handle_cpu_clock(max: u64) -> i64 {
     }
 }
 
+/// PciCfgRead (53): `arg0` = configuration selector, `arg1` = register offset. Gated by
+/// `PCI_CFG_RESOURCE` + READ.
+///
+/// Returns the 32-bit value read (as a positive i64 - a full u32 always widens non-negative, so
+/// 0xFFFFFFFF is data and not an error), `CapNotHeld` without the capability, or `-1` for an access
+/// the arch will not admit.
+///
+/// A REFUSAL IS LOUD (invariant 12) but not fatal to the caller: an enumerator walking a bus is
+/// told where its authority ends and stops there, rather than being handed a plausible zero it would
+/// report as an empty machine.
 fn handle_pci_cfg_read(sel: u64, offset: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::READ) {
         crate::kprintln!("pci-cfg: read sel {:#010x} refused - caller does not hold PCI_CFG",

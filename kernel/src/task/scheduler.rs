@@ -2551,11 +2551,8 @@ pub fn kill_task_by_slot(slot: usize) {
         // restart when it dies + gets respawned. A transient utility the shell re-invokes (observe-*,
         // greet, ...) is never bumped, so it never shows a restart - RESTARTS means "blew up and was
         // recovered", not "legitimately closed". The respawn reads the new count via next_restart_count.
-        // `time` and `control` were missing here too, which is the SECOND half of the same hardware
-        // symptom: even once their deaths notify the supervisor, a name absent from THIS set never
-        // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
-        // only view of recovery said nothing happened.
-        // WATCHED, NOT NAMED. This was a list of nineteen service names, and every service added to the
+        // WATCHED, NOT NAMED. This was a list of service names (two lists, this and the notification set
+        // below, about nineteen names between them), and every service added to the
         // supervisor's roster had to be added here too - `time` and `control` were missed once, and a
         // storm that killed them 41 times showed 0 restarts in `observe`. The SUPERVISOR now says, in the
         // spawn request, which tasks it manages (`SPAWN_FLAG_WATCHED`), so the kernel holds no roster and
@@ -2569,14 +2566,12 @@ pub fn kill_task_by_slot(slot: usize) {
         // Restartable-service death notification. These are restartable userspace services (not
         // trusted root): when one dies, notify the supervisor over its death-notification endpoint so
         // it respawns the service IMMEDIATELY - its own death, not only a lucky supervisor respawn.
-        // The set: `fs` + `block-driver` (Phase D); `shell` (the user's prompt); and the drivers
-        // `xhci` / `ehci` + `events`. Without the drivers here, a `chaos max-carnage` that killed
-        // them in its last rounds left them dead until the supervisor happened to be respawned (it
-        // re-runs its boot sequence and re-spawns them) - so the keyboard could stay dead. Now their
-        // own death respawns them. `fs` re-mounts via its journal (Phase C); clients reacquire by
-        // name via the kernel directory (§14.3). "Nothing escapes" - every service recovers; the
-        // kernel is the only unkillable thing.
-        // Gated to this NAMED set so ordinary probe/app churn never floods the supervisor.
+        // The set is every task spawned `SPAWN_FLAG_WATCHED` - the supervisor's `MANAGED` roster - and
+        // the kernel names none of them. It was once a named set (`fs`, `block-driver`, `shell`, the USB
+        // drivers, `events`), and a driver missing from it stayed dead after a storm until a lucky
+        // supervisor respawn. `fs` re-mounts via its journal (Phase C); clients reacquire by name via the
+        // kernel directory (§14.3). "Nothing escapes" - every service recovers; the kernel is the only
+        // unkillable thing. Gated to WATCHED tasks so ordinary probe/app churn never floods the supervisor.
         // `enqueue_from_interrupt` is the kernel→endpoint path (no cap needed); wake the supervisor.
         // `counter` (examples/counter) is restartable too: it persists its state to `fs` and
         // reconstructs it on respawn (§14/§15), so its own death notifies the supervisor, which
@@ -2595,9 +2590,9 @@ pub fn kill_task_by_slot(slot: usize) {
         // both, because the counter tracks the notification path. A service that recovers by luck reads
         // as a service that never fell over.
         //
-        // The rule is now DERIVED and enforced (`V-managed-watched`): every name the supervisor manages
-        // must appear here. Two lists describing one fact is the shape that caused this, and it is the
-        // third time this session (ARM_SERVICES vs arm_built was the second).
+        // The rule is now one fact in one place: the supervisor marks what it manages WATCHED, and
+        // `V-managed-watched` checks that chain. Two lists describing one fact is the shape that caused
+        // this, and it was the third time (ARM_SERVICES vs arm_built was the second).
         // The terminal died, so nothing is rendering the display any more. Hand the screen back to the
         // kernel's boot floor until the respawned instance takes it, or the machine goes dark with no
         // way to say why (invariant 12).

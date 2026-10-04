@@ -15,7 +15,8 @@
 //! The boot asks its questions early and keeps the answers. Calls AFTER `mmu::enable` exist now too -
 //! `notify_xhci_reset`, and `set_expander_gpio` behind `DevicePower` - and `call` handles them: it
 //! translates the buffer's address itself and does the cache maintenance on both sides of the exchange,
-//! and the one syscall-time caller takes a lock that the pre-MMU callers must not.
+//! and the syscall-time callers (the expander GPIO pair behind `DevicePower`, the Arm clock pair behind
+//! `CpuClock`) take a lock that the pre-MMU callers must not.
 //!
 //! ## Bus addresses
 //!

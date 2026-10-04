@@ -226,7 +226,8 @@ const XHCI_DMA_PAGES:      u64 = 32 + 256 + 4;
 /// one constant) regressed back-port enumeration. Keep it small and separate.
 const EHCI_DMA_PAGES:      u64 = 16;
 /// `pwm-audio`: a page of DMA control blocks and a 128 KiB ring of PWM words - 16 periods of 8 KiB,
-/// about 370 ms at 44.1 kHz, which is the margin a POLLED refill needs (no interrupt is routed).
+/// about 370 ms at 44.1 kHz, which is the margin a POLLED refill needs (no interrupt is routed). That is
+/// 33 pages (`ARENA_NEEDED` in `services/pwm-audio`); 36 leaves three spare, and nothing records why.
 const AUDIO_PWM_DMA_PAGES: u64 = 36;
 
 /// Maximum named send peers per service.
@@ -281,7 +282,7 @@ struct ServiceContextData {
     console_push_slot:  u32, // u32::MAX = none; else CONSOLE_PUSH cap slot (input driver)
     self_grant_slot:    u32, // u32::MAX = none; else SEND|GRANT cap to this service's OWN
                              // endpoint, so it can register its name in the kernel directory.
-    // --- Framebuffer grant (the `console` service only) ---
+    // --- Framebuffer grant (whichever task's request names the FRAMEBUFFER kind - in practice `console`) ---
     // The kernel maps the display's framebuffer into this service's address space Normal NON-cacheable
     // + USER, as a driver's MMIO BAR is mapped, and describes it here. Deliberately PIXEL geometry only:
     // no rows, no columns, no cell size. Character geometry belongs to the terminal, and the terminal is
@@ -428,7 +429,8 @@ enum HwClass {
     // An audio jack driven by PWM and fed by the SoC's DMA engine (the Pis, `docs/audio.md`): soldered
     // to the SoC, so named, like the DWC2.
     AudioPwm,
-    // A WiFi radio on an SDIO host at a fixed SoC address (the Pi 4's CYW43455 behind the Arasan). A
+    // A WiFi radio on an SDIO host at a fixed SoC address (the Pi 4's CYW43455 behind the Arasan, the
+    // VisionFive 2 Lite's AIC8800 behind a DesignWare `dw_mmc`). A
     // kind, so the kernel grants the window and the power control to what the spawn request ASKED FOR,
     // never to whatever is called `wifi-driver`.
     WifiSdio,
@@ -636,8 +638,9 @@ impl HwClass {
             HwClass::None | HwClass::Framebuffer | HwClass::TestIrq | HwClass::WifiSdio => &XHCI_DMA_PHYS,
         }
     }
-    /// Confine this DMA-capable driver via the IOMMU? Only xHCI qualifies today (§6.4; ehci + block-driver
-    /// keep a stale firmware DMA pointer that confinement would fault, so they stay in passthrough).
+    /// Confine this DMA-capable driver via the IOMMU? xHCI, plus any PCI spawn whose request asks for it
+    /// (`audio-driver` does; CLAUDE.md 6.4, the 2026-10-03 amendment). Not ehci + block-driver, which
+    /// keep a stale firmware DMA pointer that confinement would fault, so they stay in passthrough.
     fn iommu_confine(self) -> bool {
         match self {
             // Policy, so the caller states it (§6.4). `ehci` and `block-driver` keep a stale
@@ -861,7 +864,6 @@ fn hw_pci_of(class: u32, dma_pages: u32, bdf: u32) -> HwClass {
 /// one for those is a caller error worth refusing rather than ignoring.
 pub fn hw_class_is_pci(class: u32) -> bool { class & HW_PCI_FLAG != 0 }
 
-/// Resolve a spawn request's device class to the kernel's own scan results.
 /// The named device kinds a spawn request may carry (the SDK's `hwclass` constants), shared with the
 /// arch layer: it answers by KIND - is this kind present, map its window, can its power be cut - and
 /// never by the name of the service that drives it (`docs/audio.md`, "No service names in the kernel").
@@ -876,6 +878,7 @@ pub mod kind {
     pub const WIFI_SDIO: u32 = 9;
 }
 
+/// Resolve a spawn request's device class to the kernel's own scan results.
 fn hw_class_of(class: u32) -> HwClass {
     if class & HW_PCI_FLAG != 0 { return hw_pci_of(class, 0, 0); }
     match class {
@@ -1981,7 +1984,8 @@ fn spawn_service_with_image(
     // grant, renewable: the kernel powered the domain at boot to make the window mean anything, and a
     // chip that only returns to power-on when its power is cut needs the holder able to ask for that
     // again (`docs/wifi.md` 45-46). One holder per window, so one holder per device; the arch layer
-    // answers which devices it can power, and today that is the Pi 4 radio behind the SDIO host.
+    // answers which devices it can power: today the radio behind the SDIO host on the Pi 4 and on the
+    // VisionFive 2 Lite.
     if hw.fixed_kind().is_some_and(|k| crate::arch::imp::device_power_control(k)) {
         let dp_cap = mint_cap(DEVICE_POWER_RESOURCE, Rights::WRITE);
         caps.insert(dp_cap)
@@ -2184,7 +2188,8 @@ fn spawn_service_with_image(
             crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
             (XHCI_MMIO_VA, XHCI_MMIO_PAGES * PAGE_SIZE as u64)
         } else if hw == HwClass::Framebuffer {
-            // The display's framebuffer, for the `console` service (docs/console-service.md 9).
+            // The display's framebuffer, for the task that asked for the FRAMEBUFFER kind - the `console`
+            // service in practice (docs/console-service.md 9).
             //
             // `PCD | PWT` = Normal NON-cacheable: uncached, but the write buffer may still gather a run
             // of pixel stores into a burst. A framebuffer store has no side effect - it is memory the

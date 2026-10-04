@@ -45,10 +45,12 @@
 //! The census stays, because a document is not a board: it now CONFIRMS what the device tree says, and
 //! a disagreement between the two would be the most interesting thing this probe could find.
 //!
-//! **NOTHING IS GRANTED BY THIS FILE**, deliberately. It reads, it prints, it returns. The
-//! `map_fixed_device` table stays as it is until the boot log says which window to name, because
-//! that table's own comment records the cost of getting this wrong: a service handed a range whose first
-//! register read is an external abort dies on that read, and the supervisor respawns it forever.
+//! **This file grants nothing itself; it GATES the grant.** It started as a read-only census, held so
+//! until the boot log said which window to name, because a service handed a range whose first register
+//! read is an external abort dies on that read and the supervisor respawns it forever. The log settled
+//! it: the census now also does the board-level setup the grant needs - the GPIO mux and the SD power
+//! domain - and `radio_present` is what `map_fixed_device` (the `WIFI_SDIO` window) and
+//! `device_power_control` (`DEVICE_POWER`) both ask before granting anything.
 //!
 //! **THE RESIDUAL RISK, stated rather than glossed.** An abort-safe read protects against an address
 //! that decodes to nothing. It does not protect against an address that decodes to a DIFFERENT
@@ -79,8 +81,8 @@ static RADIO_CTRL: AtomicBool = AtomicBool::new(false);
 /// - so nothing ever answers, on hardware only, while emulation ignores clocks and passes.
 static BASE_CLOCK: AtomicU32 = AtomicU32::new(0);
 
-/// Whether a controller that could be the radio answered at boot. The spawn path's MMIO grant reads
-/// this; nothing else should.
+/// Whether a controller that could be the radio answered at boot. The spawn path's MMIO grant and the
+/// `DEVICE_POWER` mint read this; nothing else should.
 pub fn radio_present() -> bool { RADIO_CTRL.load(Ordering::Acquire) }
 
 /// The Arasan's base clock in Hz (0 = the firmware said nothing, and the driver must refuse).
@@ -383,7 +385,8 @@ fn read_base_clock() {
     }
 }
 
-/// Census both candidates at boot and print what each says. Grants nothing.
+/// Census both candidates at boot and print what each says, routing pins and power for the radio's. Grants
+/// nothing itself - its answer gates the `WIFI_SDIO` grant.
 ///
 /// Called from the pi4 boot path beside the GENET and PCIe probes, and gated to that board: the QEMU
 /// `virt` variant has no Pi peripherals at all, so there is nothing to ask.

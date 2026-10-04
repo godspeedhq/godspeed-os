@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The request/reply vocabulary between `audio-driver` and the shell's `audio`.
+//! The request/reply vocabulary between the audio drivers (`audio-driver`, `pwm-audio`) and the shell's
+//! `audio`.
 //!
 //! # Every request is TAGGED, and every answer is immediate
 //!
@@ -51,7 +52,7 @@ pub mod format {
 
 /// Byte 1 of a `NO_DEVICE` answer: why there is nothing to drive.
 pub mod no_device {
-    /// No HD Audio controller was granted to this driver.
+    /// No audio device (an HD Audio controller, or the Pis' PWM jack) was granted to this driver.
     pub const NO_CONTROLLER: u8 = 1;
     /// The controller did not come out of reset.
     pub const RESET_FAILED: u8 = 2;

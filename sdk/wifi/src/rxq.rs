@@ -14,7 +14,8 @@ pub struct RxQueue {
     lens: [u16; RX_SLOTS],
     head: usize,
     count: usize,
-    /// Frames queued and handed up over the driver's life, for `wifi debug stats`.
+    /// Frames queued and handed up over the driver's life. Kept for diagnostics; nothing reports them yet
+    /// (`wifi debug stats` does not read them).
     pub queued: u32,
     pub handed: u32,
 }

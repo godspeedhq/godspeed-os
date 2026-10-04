@@ -1,6 +1,6 @@
 # 65. The kernel drops a message sent to a blocked receiver whose queue is full, and tells the sender it was delivered
 
-**Status: FIXED 2026-09-30 in `ipc/routing.rs` (the branch returns `QueueFull` and leaves the receiver blocked), with the Pi 4 RNG in the same kernel change; CLOSED once the identity suite and a Pi 4 boot have run on it.**
+**Status: CLOSED 2026-10-04. FIXED 2026-09-30 in `ipc/routing.rs` (the branch returns `QueueFull` and leaves the receiver blocked), with the Pi 4 RNG in the same kernel change. Both closing conditions met on later kernels that carry it: the identity suite 24/24 (recorded in `backlog/67`, 2026-10-02) and Pi 4 boots through 50-round chaos runs (`backlog/67`, `backlog/72`).**
 **Found:** 2026-09-30, on the Pi 4, while explaining why every exchange between `nic-driver` and the
 radio was timing out at exactly its bound.
 

@@ -1129,9 +1129,9 @@ const MANAGED: [&str; MANAGED_N] =
      // reconcile list at all - so a DROPPED notification left the Pi's storage, keyboard and network
      // down with no backstop to notice.
      "time", "control", "dwc2",
-     // Hardware discovery in userspace (step D2). x86-only in practice - the image is embedded only
-     // there - and reconcile skips any name absent from the map, so listing it unconditionally costs
-     // the ARM ports nothing, exactly as `dwc2` above costs x86 nothing.
+     // Hardware discovery in userspace (step D2). Embedded where configuration space is reachable
+     // (x86_64, aarch64, riscv64 - `enumerator` in build.rs), and reconcile skips any name absent from
+     // the map, so listing it unconditionally costs the Pi 2 nothing, exactly as `dwc2` costs x86 nothing.
      "hw-enumerator",
      // The Pi 4's radio. Listed unconditionally for the reason `dwc2` and `hw-enumerator` above are:
      // reconcile skips any name absent from the name-cap map, so a service only one board spawns costs

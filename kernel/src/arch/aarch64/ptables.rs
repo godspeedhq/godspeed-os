@@ -427,8 +427,8 @@ pub unsafe fn map_in_root(root: u64, virt: u64, phys: u64, flags: PageFlags) -> 
 /// the neutral kill path, which knows which of them it handed out.
 ///
 /// # Safety
-/// `root` must be an address space no core is executing under - the caller has already switched
-/// `TTBR0_EL1` away and invalidated - and it must not be freed twice.
+/// `root` must be an address space no core is RUNNING, already invalidated on every core, and it must
+/// not be freed twice. An idle core may still hold it in `TTBR0_EL1`; see `free_page_table_root`.
 pub unsafe fn free_all(root: u64) {
     // Out of the live set BEFORE the frames go back: a fault report that ran after the free would
     // otherwise call a recycled root live.
@@ -601,23 +601,6 @@ fn report_desc(level: &[u8], index: usize, d: u64) {
     super::put_hex(d);
 }
 
-/// Walk the faulting address through the table the CPU had installed, and say what the walk found.
-///
-/// **Why it exists (`backlog/72`).** On the Pi 4, live tasks take instruction aborts and permission
-/// faults on their OWN code - the shell on the first instruction of `service_main` - with the TLB already
-/// flushed on every switch, so the translation must have come from the task's current tables. Two
-/// explanations were left: a table frame with a second owner (freed by one task's death, or handed out
-/// twice, and then written by its other owner), or tables that are correct but reached another core late.
-/// This separates them in one fault:
-///
-/// - the ROOT the CPU walked, and whether any live address space owns it at all;
-/// - every descriptor on the way down, and each table frame's state - FREE in the allocator, or ALSO held
-///   by another live root, is the first explanation caught in the act;
-/// - the final descriptor decoded. A walk that ALLOWS the access that faulted means the table is right
-///   now and the core used something else - the second explanation.
-///
-/// Read-only, lock-free and bounded: every descriptor is read through `get`, which refuses an address that
-/// is not RAM, and the scan of other roots is three nested loops over at most 512 entries each.
 /// Ask THIS core's MMU to translate `va` as an EL0 read, then flush this core's TLB and ask again.
 /// Returns the two `PAR_EL1` values.
 ///
@@ -680,6 +663,23 @@ fn report_par(what: &[u8], par: u64) {
     }
 }
 
+/// Walk the faulting address through the table the CPU had installed, and say what the walk found.
+///
+/// **Why it exists (`backlog/72`).** On the Pi 4, live tasks take instruction aborts and permission
+/// faults on their OWN code - the shell on the first instruction of `service_main` - with the TLB already
+/// flushed on every switch, so the translation must have come from the task's current tables. Two
+/// explanations were left: a table frame with a second owner (freed by one task's death, or handed out
+/// twice, and then written by its other owner), or tables that are correct but reached another core late.
+/// This separates them in one fault:
+///
+/// - the ROOT the CPU walked, and whether any live address space owns it at all;
+/// - every descriptor on the way down, and each table frame's state - FREE in the allocator, or ALSO held
+///   by another live root, is the first explanation caught in the act;
+/// - the final descriptor decoded. A walk that ALLOWS the access that faulted means the table is right
+///   now and the core used something else - the second explanation.
+///
+/// Read-only, lock-free and bounded: every descriptor is read through `get`, which refuses an address that
+/// is not RAM, and the scan of other roots is three nested loops over at most 512 entries each.
 pub fn fault_report(far: u64, instruction_fetch: bool, at: (u64, u64)) {
     let ttbr: u64;
     // SAFETY: reading TTBR0_EL1 at EL1 is a side-effect-free system-register read.

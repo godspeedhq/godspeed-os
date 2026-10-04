@@ -163,7 +163,7 @@ impl Scan {
 
 /// Serialise a scan into a reply: `[status, count, record * count]`. Returns the bytes written.
 ///
-/// A FIXED layout with no framing to parse on the far side - the shell indexes into it. 32 records of 44
+/// A FIXED layout with no framing to parse on the far side - the shell indexes into it. 32 records of 45
 /// bytes plus two is 1442 bytes, well inside a 4096-byte message, and `Scan` already bounds the count.
 pub fn write_reply(scan: &Scan, note: &dyn Fn(&Network) -> u8, out: &mut [u8]) -> usize {
     write_records(scan, 0, reply::OK, note, out)

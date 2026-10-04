@@ -8,9 +8,9 @@
 //!
 //! On this board the alternative would have been markedly worse. `block-driver` is built `storage_is_usb`,
 //! so the disk is behind the **`xhci` service**: reading firmware through `fs` would make the radio depend
-//! on the USB stack coming up and on a stick being present, for a file already in this repository. It would
-//! also need an `fs` send peer - new authority for a driver that currently has none - where embedding needs
-//! no capability at all.
+//! on the USB stack coming up and on a stick being present, for a file already in this repository. The driver
+//! does hold an `fs` send peer now (the supervisor wires it to `fs` and `power`), but for `/wifi.keys`; the
+//! firmware never travels through it, and embedding needs no capability at all.
 //!
 //! **What the two blobs are.** `brcmfmac43455-sdio.bin` is the program the chip's own processor runs; the
 //! part has no ROM firmware for its MAC, so until this is uploaded there is no 802.11 inside to talk to.
@@ -18,9 +18,8 @@
 //! the chip's RAM rather than to the start. Both are vendored under `nonfree/brcm43455/` with their licence
 //! and a SHA-256 that `scripts/nonfree_check.py` verifies on every build (`docs/licensing.md` 5a).
 //!
-//! The CLM blob in that directory is deliberately NOT embedded yet: it is delivered to the running firmware
-//! through an iovar rather than written into RAM, and that path does not exist. Embedding it now would be
-//! 2.6 KiB of image for nothing (§26.2).
+//! The CLM blob in that directory is embedded too (`CLM`, below), but it is not written into RAM: it is
+//! delivered to the running firmware through the `clmload` iovar.
 
 /// The firmware image the chip's processor runs. Written to the start of its RAM.
 ///

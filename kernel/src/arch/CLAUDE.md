@@ -211,8 +211,15 @@ on `write_page_table_base` to flush. (kernel-audit Audit 5, Findings 3/4 - doc c
 
 **Every `arch::imp` primitive owes a documented SEMANTIC, not just a signature (SEC-27).** When you add
 `arch/<isa>/`, treat each primitive's memory-ordering, TLB, and broadcast behaviour as part of the
-contract: `write_page_table_base` flushes the old ASID's non-global TLB; `invalidate_tlb_page` covers the
-VA on the required cores; the atomics keep the ordering item 1 assumes. Matching the x86 *signature* is
+contract: `invalidate_tlb_page` covers the VA on the required cores, and an address-space switch drops
+the outgoing space's translations. **Where that drop happens differs, and the difference is a trap.** On
+x86 `write_page_table_base` is a CR3 write that flushes as a side effect, and on riscv64 it is a `satp`
+write followed by `sfence.vma`; on arm32 and aarch64 it is a bare
+`TTBR0` write plus `isb` and flushes NOTHING - those ports flush in `switch_context` instead (aarch64
+writes TTBR0, then `isb`, then `tlbi`, on every switch: `backlog/72`). So `smp/ipi.rs`'s full-flush
+sentinel, which reloads the base through `write_page_table_base`, flushes on x86 and riscv64 only.
+`broadcast_full_tlb_flush` has no callers today; a weak-arch caller must not rely on it until the
+sentinel calls a real flush seam; the atomics keep the ordering item 1 assumes. Matching the x86 *signature* is
 necessary but not sufficient - the seam pins names, and this section pins the semantics behind them.
 
 **3. DMA cache coherence (SEC-28).** The SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) maps the arena

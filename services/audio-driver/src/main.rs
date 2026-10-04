@@ -16,8 +16,9 @@
 //! - **A2** moves codec commands onto the CORB and RIRB, the command rings in memory the spec requires
 //!   (the Immediate Command registers are OPTIONAL, HDA 1.0a 3.4, and unknown on the T630's controller).
 //! - **A3** configures the output path and plays a tone the driver generates itself: one output stream,
-//!   a buffer descriptor list, a cyclic ring of sound in the DMA arena, refilled by polling the
-//!   stream's position. Played once at start, as the step's self-test, until A4 gives it a request.
+//!   a buffer descriptor list, a cyclic ring of sound in the DMA arena. As first built it was refilled by
+//!   polling and played once at start as a self-test; both are gone - the ring is refilled on the stream's
+//!   interrupt (with a watchdog for a lost one), and a tone plays only when a request asks for it (A4).
 //!
 //! **DMA is used only on the codec A2 and A3 were verified on - QEMU's (`1af4`).** On any other codec the
 //! driver stops after A1's survey and says so: on the T630 the class lookup hands it the HDMI

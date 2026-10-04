@@ -5,8 +5,9 @@
 path, moves codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's
 `audio` sets the volume, mutes, powers the codec down and up and plays tones (`utilities/57_audio.md`),
 each checked against the WAV QEMU wrote; the volume and the mute survive a reboot in `/audio.settings`.
-Interrupt-driven, IOMMU-confined, restartable. Not yet: `outputs`, `play`, `debug`, system sounds, the
-shortcuts; not run on hardware (A6).**
+Interrupt-driven, IOMMU-confined, restartable; `play` streams PCM (A5). The Pis' 3.5 mm jack is driven by
+`pwm-audio` and was HEARD on a Pi 4 (2026-10-03); the Pi 2 is built and not yet heard. Not yet: `outputs`,
+`debug`, system sounds, the shortcuts; the HDA driver not run on hardware past the codec survey (A6).**
 
 Audio is two things at once here. It is the system's first sound, and it is the planned **independent
 test of `gs::driver`** (`docs/driver-library.md`, "Wi-Fi discovers; audio tests"): a second kind of
@@ -25,7 +26,7 @@ to a WAV file - and it is what the HP T630 has.
 | QEMU | `intel-hda` (ICH6, `8086:2668`), codec `hda-output` (`1af4:0012`) | DAC node 2 -> line-out pin node 3. Immediate Command registers implemented. Sound to `build/qemu_audio.wav` (`osdev run`) |
 | HP T630 | `00:09.2` AMD FCH Azalia (`1022:157a`), codec Realtek ALC255 (`10ec:0255`, subsystem `103c:8158`) | internal speaker, front headset jack, rear line-out. Linux: snoop via PCI config 0x42, trust LPIB, 40-bit DMA |
 | HP T630 | `00:01.1` Radeon HDMI audio (`1002:9840`) | a SECOND class-0x0403 controller - see "Found while preparing" |
-| Pi 2 / Pi 4 | 3.5 mm jack driven by PWM, fed by the BCM DMA engine (section "The Pis and the VisionFive") | not HDA. Needs the GPIO pinmux and the clock manager, both SHARED SoC blocks; no QEMU model. A kernel proposal first |
+| Pi 2 / Pi 4 | 3.5 mm jack driven by PWM, fed by the BCM DMA engine (section "The Pis and the VisionFive") | not HDA. Needs the GPIO pinmux and the clock manager, both SHARED SoC blocks; no QEMU model. BUILT: the kernel prepares both as part of the grant (`pwm-audio`); heard on a Pi 4, the Pi 2 not yet |
 | VisionFive 2 Lite | no analog output; HDMI only | confirmed three ways: the board's port list, the vendor device tree disabling its PWM-DAC, and the board's own Linux log (`build/serial_output_risc_v_original.log`): `ALSA device list: No soundcards found` |
 
 Sources: the HDA specification rev 1.0a; QEMU `hw/audio/intel-hda.c`, `hda-codec.c`; Linux
@@ -71,7 +72,7 @@ step that first needs each (A3 for the arena, the interrupt step for the other).
 
 **Partly built (2026-10-03).** The verbs the shell answers are specified in `utilities/57_audio.md`,
 which is now the authority for them; this section stays the agreed design for the rest - `outputs`,
-`output`, `play`, `debug`, `system sounds`, `/audio.settings` and the shortcuts. What follows was written
+`output`, `debug`, `system sounds` and the shortcuts (`play` and `/audio.settings` are built since). What follows was written
 before any of it existed. It lived here, not in `utilities/`, until the shell answered `audio`: Commandment X fails a `utilities/` spec for a verb the
 shell does not have, and the reverse (`utilities/0_conventions.md` 2a). On the day it is built it moves
 to a numbered spec of its own under `utilities/`, with the shell's eight registration sites. Modelled on `utilities/56_wifi.md`,
@@ -505,10 +506,10 @@ change is re-verification).
 
 **As made.** In `kernel/src/task/scheduler.rs` the death path's name check became
 `take_task_hw_bdf(slot) != 0xFFFF`; the IOMMU revert inside it stays keyed on `xhci` and `ehci`, which
-is a separate fact (only they are confined). `take_task_hw_bdf` reads the record and resets it in one
+is a separate fact (only they are confined) - superseded below: the release is now for any device. `take_task_hw_bdf` reads the record and resets it in one
 step, and a failed spawn (`cleanup_partial_spawn` in `kernel/src/task/mod.rs`) takes it too, since a
-spawn can fail after recording its device. `audio-driver` joined both death lists in the kernel, the
-supervisor's `MANAGED` roster and its death loop (`services/supervisor/src/main.rs`).
+spawn can fail after recording its device. `audio-driver` joined both death lists in the kernel (superseded below: the kernel keeps no lists, and
+death follows `SPAWN_FLAG_WATCHED`), the supervisor's `MANAGED` roster and its death loop (`services/supervisor/src/main.rs`).
 
 **Verified in QEMU** (`build/audio_kill_qemu.log`, bare-metal image), killing three services over the
 control channel:

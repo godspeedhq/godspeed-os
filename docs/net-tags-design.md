@@ -369,7 +369,7 @@ the reason this section gives the stash's was not: its client carries its own co
 and NTP's nonce - so a late answer to a question already given up on is recognised and refused.
 
 **The hold has since become the general stash.** What this section scoped to the nudge is now a bounded
-stash of `STASH_N` (4) displaced requests, each held up to `HOLD_MS` (1500 ms), serving requests
+stash of `STASH_N` (4) displaced requests, each held for the deadline its client states (`HOLD_MS`, 1500 ms, only when it states none), serving requests
 displaced by the dance and by every driver exchange (`backlog/28`).
 
 ---
