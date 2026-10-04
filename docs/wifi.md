@@ -3238,7 +3238,7 @@ full-MAC radio whose firmware the host uploads - with none of the Pi 4's PARTS:
   and the `wifi` utility. A full-MAC radio with a host-side handshake needs exactly those, and none of
   them names Broadcom.
 
-So the VisionFive radio is a real third port and a second driver, not a variant of the first. It is
+(2026-10-04: the design is `docs/wifi-aic8800.md`.) So the VisionFive radio is a real third port and a second driver, not a variant of the first. It is
 recorded here as the answer to section 1's question, and as scope that is NOT part of this branch
 (section 9). The riscv64 kernel's `hw_random` is still a stub; the JH7110 has a hardware generator of its
 own, and filling that seam would help `net-stack` on the board whether or not the radio is ever driven.
