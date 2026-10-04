@@ -1524,6 +1524,42 @@ pub fn is_up(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceCon
     Some(u32::from_le_bytes(v) != 0)
 }
 
+/// `BRCMF_C_GET_PM` / `BWFM_C_GET_PM` - the same number in Linux's `fwil.h` and OpenBSD's `bwfmreg.h`.
+const CMD_GET_PM: u32 = 85;
+
+/// The firmware's power-save mode: 0 constantly awake, 1 power-save (PS-Poll), 2 fast power-save. `None` is
+/// no answer.
+///
+/// READ ONLY, and here because nobody knew the answer. `interface_up` below deliberately never SETS it, so
+/// the chip runs whatever its firmware defaults to - while both references set it explicitly: OpenBSD's
+/// `bwfm_init` always uses fast power-save for a station, and Linux's `brcmfmac` uses `PM_FAST` when power
+/// saving is on, its default. The first idle soak (`backlog/64`) lost the link six minutes after the join
+/// to the access point's inactivity disassociation (802.11 reason 4), which is what an AP does when its
+/// poll of an idle station goes unanswered - so the mode the station is dozing in is the first fact to
+/// read, before anything is set.
+pub fn power_mode(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> Option<u32> {
+    let mut v = [0u8; 4];
+    query_cmd(h, w, s, CMD_GET_PM, &mut v, "power-save mode", ctx)?;
+    Some(u32::from_le_bytes(v))
+}
+
+/// Log the power-save mode once, after a join - see `power_mode`.
+pub fn report_power_mode(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) {
+    match power_mode(h, w, s, ctx) {
+        Some(m) => ctx.log_fmt(format_args!(
+            "wifi-driver: the firmware's power-save mode after the join is {} ({})",
+            m,
+            match m {
+                0 => "constantly awake",
+                1 => "power-save, PS-Poll",
+                2 => "fast power-save",
+                _ => "not a mode either reference names",
+            }
+        )),
+        None => ctx.log("wifi-driver: the firmware did not answer the power-save mode query after the join"),
+    }
+}
+
 pub fn interface_up(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
     // UP takes the VALUE 0, which reads oddly and is what the reference passes.
     if !set_cmd_int(h, w, s, CMD_UP, 0, "interface up", ctx) {

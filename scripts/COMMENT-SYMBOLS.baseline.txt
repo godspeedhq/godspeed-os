@@ -503,3 +503,6 @@ mmc_sdio_resume                    # Linux drivers/mmc/core/sdio.c - resume rein
 sdhci_reset                        # Linux sdhci.c, cited for its 100 ms bound on the same reset bits wifi-driver host.rs waits on - external, 26.14
 sdhci_enable_clk                   # Linux sdhci.c, cited for its 150 ms bound on the clock-stable bit - external, 26.14
 mmc_send_io_op_cond                # Linux drivers/mmc/core/sdio_ops.c, cited for its CMD5 retry - 100 asks 10 ms apart, the one-second bound sdk/wifi sdio.rs paces its OCR wait to - external, 26.14
+BRCMF_C_GET_PM                     # Linux brcmfmac fwil.h, cited as the source of command 85 that services/wifi-driver reads after a join - external, 26.14
+BWFM_C_GET_PM                      # OpenBSD bwfmreg.h, the same command 85, cited so the two references agree in the comment - external, 26.14
+PM_FAST                            # Linux brcmfmac power-save mode constant, cited for what that driver sets by default - external, 26.14

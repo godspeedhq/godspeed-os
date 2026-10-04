@@ -70,6 +70,24 @@ Broadcom firmware has a periodic keep-alive frame facility, which Linux's brcmfm
 default), or simply no traffic at all from `net-stack` on an idle link - and whether the driver should
 rejoin on its own after an inactivity drop rather than wait for `wifi join`. Then the soak again.
 
+**What the references do, read 2026-10-04.** Both SET the power-save mode explicitly and this driver
+never has (`ctrl::interface_up` defers it): OpenBSD's `bwfm_init` uses fast power-save for every station,
+Linux's `brcmfmac` uses `PM_FAST` when power saving is on (its default). Linux's null-frame keep-alive
+(`mkeep_alive`) is configured only for suspend, so it is not what keeps a Linux station associated - a
+Linux machine is simply never silent for five minutes. Reason 4 after ~300 s idle is the shape of an access
+point (hostapd's `ap_max_inactivity` defaults to 300 s) polling a silent station with a null frame and
+getting no acknowledgement.
+
+**The next soak, one change, prediction first.** The driver now logs the firmware's power-save mode after
+every join (`ctrl::report_power_mode`, read only - nothing is set). Join, then keep a trickle of traffic
+going at the prompt:
+
+    loop { ping count 1 192.168.11.1; if !wait 60 { break } }
+
+Prediction, if inactivity is the whole story: the link outlives the six-minute mark and the soak reaches the
+rekey. If it drops anyway with reason 4, traffic is not what the access point wants and the mode the log
+printed is the next thing to change - to fast power-save, as both references do.
+
 ## Why it is recorded and not done in the same change
 
 Phase 5 is the frame path, one change per flash, with a prediction that can be wrong. A rekey answer is

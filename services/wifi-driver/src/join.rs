@@ -321,6 +321,7 @@ impl Handshake {
                 kid,
                 if gtk_tx { " (tx)" } else { "" }
             ));
+            ctrl::report_power_mode(h, w, s, ctx);
             return Step::Joined(Keys { kck: p.kck, kek: p.kek, pmk: self.pmk, replay: key.replay, mac: self.our_mac });
         }
 
@@ -490,6 +491,7 @@ pub fn join(
                     if open {
                         // No keys, no handshake: on an open network the link coming up is the whole join.
                         ctx.log("wifi-driver: JOINED - the link is up on an open network");
+                        ctrl::report_power_mode(h, w, s, ctx);
                         return Outcome::Joined;
                     }
                     ctx.log("wifi-driver:   ASSOCIATED - the link is up at the 802.11 layer; the handshake is now the access point's move");
