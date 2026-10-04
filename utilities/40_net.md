@@ -73,6 +73,9 @@ dns      192.168.4.1
 - **ip** - the address `net-stack` holds (learned by DHCP, or the fallback if there was no offer).
 - **gateway** - the gateway IP and the MAC ARP resolved for it, or `unresolved` if ARP got no answer.
 - **ping** - `ok` if the gateway answered an ICMP echo; `no` otherwise.
+- **lease** - `ok (DHCP)` when the address was granted, `NONE` when the link is up but the stack is on
+  its fallback address (the one genuinely wrong case), and `n/a` when there is no link to lease on.
+  `net lease` answers the same question in one word for scripts, and says `ok` for no link.
 - **dns** - the DNS server `net-stack` will use (DHCP option 6, or the gateway as a fallback).
 
 On QEMU's e1000 the `[3]` status reply is shorter, so only `nic`, `nic-mac` and `link` show (no

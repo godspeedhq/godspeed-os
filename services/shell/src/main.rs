@@ -10363,7 +10363,9 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         out.line(ctx, "ip       unassigned (net-stack has had no link since boot - it configures on the next request once one is up)");
         out.line(ctx, "gateway  unresolved");
         out.line(ctx, "ping     no");
-        out.line(ctx, "lease    NONE");
+        // The same two lines as the link-lost branch below: NONE is for a live link with no lease.
+        out.line(ctx, "lease    n/a (no link - nothing to lease)");
+        out.line(ctx, "dns      unresolved");
         return Ok(());
     }
     if nic_link_up {
@@ -10394,7 +10396,8 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         // it passes when a lease is held AND when there is no link to get one on, and fails only in the
         // case that is genuinely wrong, a live link with no lease. A machine without a cable is not a
         // failing machine.
-        out.line(ctx, "lease    ok (no link - nothing to lease)");
+        // `selfcheck` itself asks `net lease`, which still answers `ok` here; this line is for a person.
+        out.line(ctx, "lease    n/a (no link - nothing to lease)");
         out.line(ctx, "dns      unresolved");
     }
     Ok(())
