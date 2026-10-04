@@ -406,7 +406,10 @@ wifi: this board's radio is there, but its driver is not written yet (the AIC880
 ```
 
 The fourth is reason 4 (`DOWN_NOT_BUILT`), the VisionFive 2 Lite's radio, which this driver identifies and
-cannot yet run. A reason the shell does not know (0, or one added later) prints the generic `wifi: the radio
+cannot yet run. `wifi radio on` and `wifi radio powercycle` print the same sentence there and restart
+nothing, since a restart would identify the same chip and stop at the same place. `wifi radio off hard` does
+cut its power, and `wifi radio on` after it restores the power, restarts the driver and ends with this
+sentence. Only reason 1 is ever reported as a chip that came up warm. A reason the shell does not know (0, or one added later) prints the generic `wifi: the radio
 is down; `wifi radio powercycle` tries again`.
 
 The earlier single line, "did not come up at boot", is gone: it was wrong after a respawn and named no cause.

@@ -9618,6 +9618,9 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
         // type without knowing the state (docs/wifi.md 47), so it does the hard thing here: restart the
         // driver, which adopts a live firmware or power-cycles a dead one, and watch it join. `off` on a
         // down radio stays a statement of fact: there is nothing to switch off.
+        // A radio this driver does not drive yet: a restart would run the same identification and come
+        // back down for the same reason, so say the reason and do nothing.
+        Some(RADIO_DOWN) if on && p.get(1).copied() == Some(DOWN_NOT_BUILT) => wifi_radio_unavailable(ctx, out, RADIO_DOWN),
         Some(RADIO_DOWN) if on => {
             let outcome = wifi_restart_and_watch(ctx, out, "radio on", "the radio is down (no firmware behind it)")?;
             wifi_radio_on_outcome(ctx, out, outcome)
@@ -9646,6 +9649,7 @@ fn wifi_radio_on_outcome(ctx: &ShellCtx, out: &mut Out, outcome: WatchOutcome) -
             out.line_fmt(ctx, format_args!("radio on failed - the chip came up warm (its firmware trapped at start; docs/wifi.md 52); `wifi radio powercycle` tries once more"));
             Err(ShellError::Unknown)
         }
+        WatchOutcome::Down => wifi_radio_unavailable(ctx, out, wifi_wire::RADIO_DOWN),
         WatchOutcome::TimedOut => Err(ShellError::Unknown),
     }
 }
@@ -9702,7 +9706,9 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
                     }
                     // The driver is up and its radio is not - no firmware behind it. It serves the power
                     // ops in that state, so this is an older driver or a radio that went down between the
-                    // question and the answer; the act is the same.
+                    // question and the answer; the act is the same. The exception is a radio this driver
+                    // does not drive yet, whose driver refuses the cycle: nothing a restart could change.
+                    Some(RADIO_DOWN) if p.get(1).copied() == Some(DOWN_NOT_BUILT) => return wifi_radio_unavailable(ctx, out, RADIO_DOWN),
                     Some(RADIO_DOWN) => wifi_restart_and_watch(ctx, out, "powercycle", "the radio is down (no firmware behind it)")?,
                     Some(NO_POWER_CONTROL) => {
                         out.line_fmt(ctx, format_args!("powercycle failed - the kernel refused: this machine has no control over the radio's power"));
@@ -9730,6 +9736,7 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
                     attempt + 1, MAX_ATTEMPTS));
             }
             WatchOutcome::Warm => {}
+            WatchOutcome::Down => return wifi_radio_unavailable(ctx, out, RADIO_DOWN),
             WatchOutcome::TimedOut => return Err(ShellError::Unknown),
         }
     }
@@ -9759,10 +9766,14 @@ enum WatchOutcome {
     Joined,
     /// The operator pressed `q` or `b`; the power cycle continues unwatched.
     Left,
-    /// The driver came back and reports its radio DOWN - usually the firmware trapped at start on a warm
-    /// chip (reason byte 1); the reason is in `wifi_down_reason`, and any DOWN is treated as a case for
-    /// another cycle.
+    /// The driver came back and reports its firmware trapped at start (`DOWN_TRAPPED`): a warm chip, the
+    /// one DOWN that another power cycle is for.
     Warm,
+    /// The driver came back and reports its radio DOWN for any OTHER reason - the bring-up stopped, no
+    /// radio on the bus, a radio this driver does not drive yet, or a driver too old to say. It is not a
+    /// warm chip and is not called one; the reason is in `wifi_down_reason` and `wifi_radio_unavailable`
+    /// says it.
+    Down,
     /// Nothing conclusive within the bound; said on the way out.
     TimedOut,
 }
@@ -9778,7 +9789,8 @@ enum WatchOutcome {
 /// reply carries how long ago the join happened, and a stale reply from before the kill - which the
 /// second cycle of 2026-10-01 08:29 produced, "succeeded" 157 ms after the ON write - reports a join that is
 /// minutes old. The shell's queue is also drained of stale replies first. A driver that answers RADIO_DOWN
-/// came back and found its firmware trapped: a warm chip, which the caller cycles again. Bounded at
+/// with `DOWN_TRAPPED` came back and found its firmware trapped: a warm chip (`Warm`). Any other reason is
+/// `Down`, and the caller says that reason rather than calling it warm. Bounded at
 /// POWERCYCLE_WATCH_SECS, after which it says where the radio got to rather than waiting forever (26.6).
 fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutcome {
     use wifi_wire::*;
@@ -9811,7 +9823,10 @@ fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutc
             Some(r) => {
                 let p = r.payload_bytes();
                 if p.first().copied() == Some(RADIO_DOWN) {
-                    return WatchOutcome::Warm;
+                    // `wifi_ask` has recorded the reason. Only a trapped firmware is a warm chip; calling
+                    // every DOWN one told the VisionFive's operator its AIC8800 "came up warm" when its
+                    // driver is simply not written yet.
+                    return if p.get(1).copied() == Some(DOWN_TRAPPED) { WatchOutcome::Warm } else { WatchOutcome::Down };
                 }
                 if p.len() < 29 || p[0] != OK {
                     "the driver answers, radio not up yet"

@@ -1,6 +1,6 @@
 # WiFi on the VisionFive 2 Lite: the AIC8800D80 (design, 2026-10-04)
 
-**Status: DESIGN; phase V0 DONE and verified on the board 2026-10-04; V1 BUILT, not yet run on the board.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver serves `no radio`. V2 onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
+**Status: DESIGN; phases V0 and V1 DONE and verified on the board 2026-10-04.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver answers `radio down` with the reason `DOWN_NOT_BUILT`. V2 onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
 second WiFi driver. `docs/wifi.md` section 44 identified the chip from the board's own boot log; the
 firmware is in `nonfree/aic8800d80/` (byte for byte what the board's vendor image loaded, with its
 licence position recorded there and in `docs/licensing.md` 5a). What follows is the hardware as the
@@ -125,6 +125,19 @@ clear and does NOT wait on `STATUS` busy: Linux's `dw_mci_wait_while_busy` does 
 with a data phase, and after an R1b (CMD7) the host waits out DAT0 busy. A failed command returns no
 response and leaves the interrupt word in `last_int`, which the shared identification code prints; there
 is no mapping to named reasons.
+
+**V1 on the board (2026-10-04), first run.** Every line predicted, in order: the enable driven 0 then 1 and
+read back each time, `FIFO depth 128 words`, the identification clock at 399,193 Hz (div 62), CMD5's R4
+`0x20ffff00` (two functions, no memory), RCA `0x2abd`, CCCR rev `0x43` (SDIO 4, caps `0x1f`), and a CIS of
+three tuples ending properly, FUNCID `0x0c` and MANFID `0xc8a1` / `0x0082`. About 330 ms from the driver's
+start to `V1 done`. Afterwards the radio verbs were made to agree with the status sentence: `wifi radio on`
+and `powercycle` on a radio that is not built say so and restart nothing, and the shell's radio watch calls
+a chip warm only for `DOWN_TRAPPED`.
+
+**The radio verbs on the board (2026-10-04, second run).** All five predictions held: `wifi radio on` and
+`powercycle` gave the not-built sentence and restarted nothing; `off hard` cut the power and verified the
+chip silent; `on` restored it, restarted the driver onto the cold chip, V1 ran again to `V1 done`, and
+the watch ended on the same sentence. Nothing said `came up warm`.
 
 ## 5. The AIC8800 bus and the firmware upload
 

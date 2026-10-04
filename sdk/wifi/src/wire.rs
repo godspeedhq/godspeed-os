@@ -34,10 +34,10 @@ pub const DOWN_BRINGUP: u8 = 2;
 pub const DOWN_NO_RADIO: u8 = 3;
 /// The board has a radio this driver does not drive YET: the VisionFive's AIC8800 while its protocol is
 /// being built (`docs/wifi-aic8800.md`). Nothing the operator can do changes it, so the shell's sentence
-/// for this reason suggests nothing - a power cycle advised here would be advice that cannot work. That is
-/// the sentence only: `wifi radio on` and `wifi radio powercycle` on this state still restart the driver,
-/// and the shell's radio watch reads any `RADIO_DOWN` as a chip that came up warm, so it reports a warm
-/// chip here too. A known wording gap, recorded for phase V1.
+/// for this reason suggests nothing - a power cycle advised here would be advice that cannot work. The
+/// verbs match the sentence: `wifi radio on` says it and restarts nothing, the driver answers a
+/// `powercycle` with this reason instead of cycling (unless the chip is powered down by `off hard`, when
+/// restoring the power is the point), and the shell's radio watch calls only `DOWN_TRAPPED` a warm chip.
 pub const DOWN_NOT_BUILT: u8 = 4;
 /// Byte 3 of an `off` / `off hard` answer: the driver checked, and the radio IS off.
 pub const OFF_VERIFIED: u8 = 1;

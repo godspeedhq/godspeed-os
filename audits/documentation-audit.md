@@ -92,7 +92,8 @@ none was marked. They are now, each pointing at the section that changed it.
    on those ports calls it.
 4. **`wifi` on the VisionFive** (reason `DOWN_NOT_BUILT`): `wifi radio on` and `powercycle` still restart
    the driver, and the radio watch reports any down radio as a chip that "came up warm". Code, in the
-   uncommitted V1 work; it is to be fixed with V1.
+   uncommitted V1 work; it is to be fixed with V1. **Closed the same day**, after V1 passed on the board:
+   both verbs now say the reason and restart nothing, and the watch calls only `DOWN_TRAPPED` warm.
 5. **`kernel/build.rs`** lists `pwm-audio` and `power` in `arm_built`, inert because neither is in the
    services table above it - and whether that table still matters now the supervisor holds the images
    (step C) is a larger question than a comment.

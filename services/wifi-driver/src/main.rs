@@ -24,8 +24,8 @@
 //!
 //! **VisionFive 2 Lite (riscv64, `wifi_host_dw_mmc`): the AIC8800, phase V1** (`docs/wifi-aic8800.md`).
 //! `dwmmc.rs` drives the DesignWare host on the CMD line only: the radio is power-cycled, the card
-//! identified and its CIS read. Nothing is uploaded yet (V2), so it then serves `no radio` with the reason
-//! `DOWN_NOT_BUILT`.
+//! identified and its CIS read. Nothing is uploaded yet (V2), so it then answers `radio down` with the reason
+//! `DOWN_NOT_BUILT`, and refuses a power cycle that could not change that.
 //!
 //! ## Reference
 //!
@@ -284,7 +284,7 @@ fn requested_off_ms(payload: &[u8]) -> u64 {
 
 /// The VisionFive 2 Lite's radio, phases V0 and V1 (`docs/wifi-aic8800.md` 7): the grant proven, then the
 /// card IDENTIFIED - CMD5 answered, its function count, and the manufacturer and device codes read out of
-/// its own CIS. Nothing is uploaded; that is V2. Then it serves `no radio`, saying the driver is not built.
+/// its own CIS. Nothing is uploaded; that is V2. Then it answers `radio down`, saying the driver is not built.
 ///
 /// The power-up is the vendor glue's (`aic8800_bsp`): the enable LOW for 10 ms, HIGH, 10 ms before the
 /// first command - with the host's card clock stopped across the edge, so the card powers up into a quiet
@@ -335,7 +335,7 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
         }
         None => ctx.log("wifi-driver: stage 4 - the card answered but its CIS could not be walked to a MANFID tuple"),
     }
-    ctx.log("wifi-driver: the AIC8800 firmware upload (V2) is not built yet, so this serves `no radio`");
+    ctx.log("wifi-driver: the AIC8800 firmware upload (V2) is not built yet, so this answers `radio down`, reason 4 (DOWN_NOT_BUILT)");
     serve_unavailable_why(ctx, Some(&h), why)
 }
 
@@ -375,7 +375,11 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
             out.fill(0);
             out[0] = scan::reply::OK;
             out.len()
-        } else if op == scan::reply::OP_RADIO && mode == scan::reply::RADIO_POWERCYCLE {
+        } else if op == scan::reply::OP_RADIO && mode == scan::reply::RADIO_POWERCYCLE && (powered_off || why != scan::reply::DOWN_NOT_BUILT) {
+            // A radio this driver does not drive yet (`DOWN_NOT_BUILT`) is NOT cycled while it is powered:
+            // the respawn would identify it again and come back down for the same reason, so the request
+            // falls through to the RADIO_DOWN answer below and the shell says why. From `off hard` it IS
+            // cycled, since restoring a cut power is what the operator asked for.
             // The hold-off is the caller's (the shell asks for a fixed 2 s).
             let cycled = match h {
                 Some(h) => power_cycle_device_ms(ctx, h, requested_off_ms(p)),
