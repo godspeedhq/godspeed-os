@@ -27,7 +27,6 @@ EMMC_DATA
 ETH_P_8021Q
 FB_READBACK_CHEAP
 GET_BOARD_MAC_ADDRESS
-GET_CLOCK_RATE
 GMAC0_RMII_RTX
 GMAC_CONFIG_ACS
 IA32_KERNEL_GS_BASE
@@ -45,7 +44,6 @@ RBUF_FLUSH_CTRL_V1
 REQ_SCROLL
 RGMII_RXID
 RXPBL_MASK
-SET_POWER_STATE
 SP_EL1
 TCR_EL1
 TLB_ACK
@@ -195,7 +193,6 @@ alp_only                           # a field of Linux brcmfmac's struct brcmf_sd
 initial_turbo                      # Raspberry Pi firmware config.txt option, cited because it is why the Arm clock drops a minute after boot with no OS setting a rate - external, 26.14
 mmc_rescan_try_freq                # Linux mmc core, cited because it sends an SDIO I/O reset before CMD0 on every power-up, which services/wifi-driver copies - external, 26.14
 mmc_attach_sdio                    # Linux's SDIO attach sequence, cited because its ORDER is what services/wifi-driver reimplements (CMD5 ask, CMD5 commit, CMD3, CMD7) - external, 26.14
-CMD_ISDATA                         # SDHCI SPEC CMDTM field (bit 21, "this command has a data phase") - the spec's name for a bit we set numerically; external, 26.14
 TM_DAT_DIR                         # SDHCI SPEC CMDTM field (bit 4, transfer direction) - ditto, and cited beside CMD_ISDATA because one CMD53 word sets both
 brcmf_sdiod_set_backplane_window   # Linux brcmfmac, cited because its write-only-what-CHANGED behaviour is what services/wifi-driver copies and WHY - external, 26.14
 sdhci_set_transfer_mode            # Linux sdhci.c, cited because it sets SDHCI_TRNS_BLK_CNT_EN for ANY data command - the bit CMD53 was missing - external, 26.14
@@ -203,7 +200,6 @@ TM_BLKCNT_EN                       # SDHCI SPEC CMDTM field (bit 1, block count 
 brcmf_sdiod_abort                  # Linux brcmfmac, cited because IO_ABORT after a failed transfer is the write this driver was missing - external, 26.14
 sdhci_iproc_writew                 # Linux sdhci-iproc, cited for the SHADOW-FLUSH ORDER it imposes (block regs written when COMMAND is) - external, 26.14
 sdhci_send_command                 # Linux sdhci.c, cited because it is where the command FLAGS come from - CMD_CRC and CMD_INDEX were missing - external, 26.14
-mmc_io_rw_extended                 # Linux mmc core, cited for the CMD53 argument and byte-mode block registers this driver reimplements - external, 26.14
 sdio_io_rw_ext_helper              # Linux mmc core, cited because it is what chooses BYTE mode for a 4-byte SDIO read - external, 26.14
 CMD_CRC                            # SDHCI SPEC command-register flag (check the response CRC7); the spec's name for a bit set numerically - external, 26.14
 CMD_INDEX                          # SDHCI SPEC command-register flag (check the response index) - ditto, cited beside CMD_CRC because one word sets both
@@ -216,17 +212,9 @@ SDHCI_DATA_AVAILABLE               # u-boot/SDHCI name for PRESENT_STATE bit 11,
 DATA_AVAIL                         # SDHCI SPEC interrupt-status bit 5 (SDHCI_INT_DATA_AVAIL); quoted from u-boot beside SDHCI_DATA_AVAILABLE, which is the DIFFERENT register it cross-checks
 brcmf_sdiod_probe                  # Linux brcmfmac bcmsdh.c - the ordered sequence from card-present to chip access; cited because it sets BOTH function block sizes before enabling F1 - external, 26.14
 sdio_max_byte_size                 # Linux mmc core - cited because it clamps a BYTE-mode transfer by the function block size, which is why the two are not independent - external, 26.14
-sdio_set_block_size                # Linux mmc core - cited for the FBR addresses this driver reimplements (base + 0x10, two bytes) - external, 26.14
-sdio_enable_func                   # Linux mmc core - cited for WHERE in the order function 1 is enabled, which is AFTER the block sizes - external, 26.14
 SBSDIO_FUNC1_CHIPCLKCSR            # Linux brcmfmac name for function-1 register 0x1000E, quoted from its sdio.h - external, 26.14
 SDIO_CHIP_CLOCK_CSR                # cyw43-driver (Infineon, same chip family) name for the SAME register; both cited so the two references can be compared
 SDIO_PULL_UP                       # cyw43-driver name for function-1 register 0x1000F, which brcmfmac calls SBSDIO_FUNC1_SDIOPULLUP and writes 0
-SBSDIO_FORCE_ALP                   # cyw43-driver/brcmfmac bit 0x01 of the chip clock CSR - FORCE the ALP clock on, the bit this driver was missing
-SBSDIO_ALP_AVAIL_REQ               # cyw43-driver/brcmfmac bit 0x08 - REQUEST that ALP become available, which is not the same as running it
-SBSDIO_FORCE_HW_CLKREQ_OFF         # cyw43-driver/brcmfmac bit 0x20 - take the hardware clock request out of play
-SBSDIO_ALP_AVAIL                   # cyw43-driver/brcmfmac bit 0x40 - hardware STATUS saying ALP is available
-CYW43_USE_SPI                      # cyw43-driver build switch; cited because the SDIO branch of that #if writes a DIFFERENT clock word from the SPI branch, which is the whole finding
-buscoreprep                        # Linux brcmfmac function (brcmf_sdio_buscoreprep) that brings the backplane clock up and clears the SDIO pull-ups - external, 26.14
 is_expected_radio                  # REMOVED - it compared the CIS device code, which is not the field that identifies the part. The comment records what went and why, which is exactly what this baseline is for
 brcmf_chip_dmp_erom_scan           # Linux brcmfmac chip.c - the EROM walk services/wifi-driver/src/erom.rs reimplements - external, 26.14
 brcmf_chip_dmp_get_regaddr         # Linux brcmfmac chip.c - how a core entry yields its register and wrapper bases - external, 26.14
@@ -238,37 +226,19 @@ DMP_COMP_REVISION                  # Linux brcmfmac chip.c mask name, cited beca
 brcmf_chip_disable_arm             # Linux brcmfmac chip.c - the CR4/CA7 path reads wrapbase + BCMA_IOCTL, which is WHY a wrapper of 0 blocks the upload - external, 26.14
 brcmf_chip_ai_coredisable          # Linux brcmfmac chip.c - computes wrapbase + BCMA_RESET_CTL and + BCMA_IOCTL throughout - external, 26.14
 brcmf_chip_ai_resetcore            # Linux brcmfmac chip.c - as above; both are why wrapbase is load-bearing rather than informational
-brcmf_chip_add_core                # Linux brcmfmac chip.c - stores a wrapbase of 0 with NO validation, so the reference relies on the EROM supplying one
 BCMA_IOCTL                         # BCMA SPEC register offset inside a core wrapper (io control); external, named as the reference does
 BCMA_RESET_CTL                     # BCMA SPEC register offset inside a core wrapper (reset control); external, named as the reference does
 brcmf_chip_get_raminfo             # Linux brcmfmac chip.c - its CR4 branch reads through the core BASE, which is why a zero wrapper does not block sizing the RAM - external, 26.14
 brcmf_chip_tcm_ramsize             # Linux brcmfmac chip.c - the bank walk services/wifi-driver/src/armcr4.rs reimplements - external, 26.14
-brcmf_chip_tcm_rambase             # Linux brcmfmac chip.c - a per-part TABLE of firmware load addresses, not a formula; 0x198000 for the 4345 - external, 26.14
 brcmf_chip_core_read32             # Linux brcmfmac chip.c - `core->pub.base + reg`, which is the fact that settles the wrapper question
-brcmf_chip_cores_check             # Linux brcmfmac chip.c - logs wrapbase and does nothing with it, checked before blaming the walk
 brcmf_chip_recognition             # Linux brcmfmac chip.c - the caller of the EROM scan; read to confirm no post-scan wrapbase fixup exists
 INVALID_RAMBASE                    # Linux brcmfmac chip.c sentinel for "no RAM base known for this part"; ours returns None instead
-ARMCR4_CAP                         # ARM CR4 core register 0x04 (bank counts) - external, named as the reference does
-ARMCR4_BANKIDX                     # ARM CR4 core register 0x40 (selects the bank BANKINFO describes) - external
-ARMCR4_BANKINFO                    # ARM CR4 core register 0x44 (the selected bank size and flags) - external
 BRCM_CC_4345_CHIP_ID               # Linux brcm80211 chip-id constant (0x4345); cited beside our literal so the table entry is traceable to its source line - external, 26.14
 cyw43_download_resource            # cyw43-driver (vendor) - the chunked firmware write services/wifi-driver/src/upload.rs follows, including setting the backplane window per chunk - external, 26.14
-cyw43_set_backplane_window         # cyw43-driver (vendor) - the per-chunk window set, the vendor twin of brcmf_sdiod_set_backplane_window
-cyw43_write_backplane              # cyw43-driver (vendor) - its backplane write, cited where the NVRAM length token is placed
-reset_device_core                  # cyw43-driver (vendor) - the core halt/release sequence services/wifi-driver/src/aicore.rs reimplements - external, 26.14
-disable_device_core                # cyw43-driver (vendor) - the half of that sequence which puts a core INTO reset and checks it got there
 device_core_is_up                  # cyw43-driver (vendor) - the post-condition after release, which aicore::reset checks rather than assuming
 in_reset_configure                 # Linux brcmf_chip_ai_coredisable LABEL - cited because the already-in-reset path still configures IOCTRL, which is easy to skip
 is_nvram_char                      # Linux brcmf_fw_nvram_strip helper - defines which characters survive the NVRAM transform - external, 26.14
 brcmf_fw_nvram_strip               # Linux brcmfmac firmware.c - the NVRAM transform (comments out, entries NUL-terminated, padded, token appended) that upload::nvram_prepare reimplements
-brcmf_sdio_download_nvram          # Linux brcmfmac - gives the NVRAM address as rambase + ramsize - varsz, i.e. the top of RAM
-AI_IOCTRL_OFFSET                   # cyw43-driver name for wrapper offset 0x408 (BCMA_IOCTL) - external
-AI_RESETCTRL_OFFSET                # cyw43-driver name for wrapper offset 0x800 (BCMA_RESET_CTL) - external
-SICF_CLOCK_EN                      # cyw43-driver AI_IOCTRL bit 0x01 - external
-SICF_FGC                           # cyw43-driver AI_IOCTRL bit 0x02, force gated clock - external
-SICF_CPUHALT                       # cyw43-driver AI_IOCTRL bit 0x20, hold the CPU halted - external
-CYW43_RAM_SIZE                     # cyw43-driver constant, cited where the NVRAM top-of-RAM placement is quoted
-CYW43_BUS_MAX_BLOCK_SIZE           # cyw43-driver chunk size for a resource download - external
 SDIO_FUNC1_BLOCKSIZE               # Linux brcmfmac constant 64, function 1 block size - external
 TM_MULTI_BLOCK                     # SDHCI SPEC transfer-mode bit 5; cited beside the multi-block command word
 SDHCI_TRNS_MULTI                   # SDHCI SPEC transfer-mode bit; sdhci_set_transfer_mode adds it whenever data->blocks > 1 - external, 26.14
@@ -284,34 +254,17 @@ TRANSFER_COMPLETE                  # SDHCI SPEC interrupt-status bit 1; this dri
 SDPCM_SHARED_VERSION               # Linux brcmfmac sdio.c - 0x0003, the newest SDPCM shared-structure layout it understands; this driver names the constant VERSION - external, 26.14
 SDPCM_SHARED_VERSION_MASK          # Linux brcmfmac sdio.c - 0x00FF, the version field inside the shared structure flags word; this driver names it VERSION_MASK - external, 26.14
 brcmf_chip_cr4_set_active          # Linux brcmfmac chip.c - calls activate(rstvec) and only THEN resetcore, which is where the reset-vector ORDER in upload::run comes from - external, 26.14
-bwfm_sdio_buscore_activate         # OpenBSD bwfm (clean-room brcmfmac reimplementation) - the body Linux sdio.c truncates before; the reset-vector write to backplane address 0 - external, 26.14
-bwfm_sdio_ram_read_write           # OpenBSD bwfm - its windowed backplane write, the twin of brcmf_sdiod_ramrw; cited in the quoted reset-vector call - external, 26.14
-bwfm_chip_set_active               # OpenBSD bwfm - passes *(uint32_t *)ucode, confirming the reset vector is the image first four bytes - external, 26.14
-BWFM_SDPCMD_INTSTATUS              # OpenBSD bwfm - the SDIO device core INTSTATUS the reference clears first; deliberately NOT written here (this driver is polled) - external, 26.14
 SDPCMD_INTSTATUS                   # OpenBSD bwfm - offset 0x020 in the SDIO device core register block; this driver names it sdpcmd::INTSTATUS - external, 26.14
 SDPCMD_TOSBMAILBOXDATA             # OpenBSD bwfm - offset 0x048, the host-to-chip mailbox; this driver names it sdpcmd::TOSBMAILBOXDATA - external, 26.14
 SDPCM_PROT_VERSION                 # OpenBSD bwfm - 4, the SDPCM FRAMING version the host announces (not the shared-structure layout version); named PROT_VERSION here - external, 26.14
 SDPCM_PROT_VERSION_SHIFT           # OpenBSD bwfm - 16, the shift for the mailbox word; named PROT_VERSION_SHIFT here - external, 26.14
-sdmmc_io_set_blocklen              # OpenBSD sdmmc core - sets a function block size; the twin of this driver set_block_size, cited in the quoted bring-up sequence - external, 26.14
-sdmmc_io_function_enable           # OpenBSD sdmmc core - enables an SDIO function; the twin of this driver enable_function - external, 26.14
-bwfm_sdio_clkctl                   # OpenBSD bwfm - its clock request helper, the source of the HT-clock step in bus::ht_clock - external, 26.14
 BCDC_DCMD_ERROR                    # Linux brcmfmac bcdc.c - 0x01, the BCDC flag meaning the firmware refused a command; named DCMD_ERROR here - external, 26.14
 BCDC_DCMD_ID_MASK                  # Linux brcmfmac bcdc.c - 0xFFFF0000, the request-id field used to match a reply to its request; named DCMD_ID_MASK here - external, 26.14
 BCDC_DCMD_ID_SHIFT                 # Linux brcmfmac bcdc.c - 16, the shift for that field; named DCMD_ID_SHIFT here - external, 26.14
 BCDC_DCMD_SET                      # Linux brcmfmac bcdc.c - 0x02, set rather than get; not used here because this driver only queries so far - external, 26.14
-BCDC_DCMD_IF_MASK                  # Linux brcmfmac bcdc.c - 0xF000, the interface index field; zero here (one interface) - external, 26.14
-BCDC_DCMD_IF_SHIFT                 # Linux brcmfmac bcdc.c - 12, the shift for that field - external, 26.14
 BRCMF_C_GET_VAR                    # Linux brcmfmac fwil.h - 262, the dongle command that reads an iovar; named GET_VAR here - external, 26.14
 BWFM_SDIO_SWHDR_CHANNEL_CONTROL    # OpenBSD bwfm - 0x00, the SDPCM channel a control frame rides; named CHANNEL_CONTROL here - external, 26.14
 brcmf_proto_bcdc_dcmd              # Linux brcmfmac bcdc.c - the 16-byte BCDC command header (cmd/len/flags/status) ctrl.rs builds by hand - external, 26.14
-bwfm_sdio_hwhdr                    # OpenBSD bwfm - the 4-byte SDIO hardware header (frmlen + its complement) - external, 26.14
-bwfm_sdio_swhdr                    # OpenBSD bwfm - the 8-byte SDPCM software header (seqnr/chanflag/nextlen/dataoff/flowctl/maxseqnr/res0) - external, 26.14
-bwfm_sdio_tx_ctrlframe             # OpenBSD bwfm - how a control frame is assembled and padded; the source of ctrl::query_iovar - external, 26.14
-bwfm_sdio_frame_read_write         # OpenBSD bwfm - proves a frame goes to FUNCTION 2 with the window at CHIPCOMMON, not to address 0 - external, 26.14
-bwfm_sdio_buf_write                # OpenBSD bwfm - asserts 4-byte alignment of both pointer and size, which is why ctrl.rs pads to a word - external, 26.14
-bwfm_sdio_backplane                # OpenBSD bwfm - its window setter, the twin of this driver Window::set_for - external, 26.14
-BWFM_SDIO_SB_OFT_ADDR_MASK         # OpenBSD bwfm - the 15-bit window offset mask; named OFFSET_MASK here - external, 26.14
-BWFM_SDIO_SB_ACCESS_2_4B_FLAG      # OpenBSD bwfm - the wide-access flag 0x8000; named ACCESS_WIDE here - external, 26.14
 BRCMF_C_SET_VAR                    # Linux brcmfmac fwil.h - 263, writing an iovar; not used yet, cited beside GET_VAR - external, 26.14
 BWFM_ETHERTYPE_LINK_CTL            # OpenBSD bwfm - 0x886c, the ethertype marking a frame as an event rather than traffic; named ETHERTYPE_LINK_CTL here - external, 26.14
 BWFM_E_ASSOC                       # OpenBSD bwfm - event code 7; named code::ASSOC here - external, 26.14
@@ -319,7 +272,6 @@ BWFM_E_ESCAN_RESULT                # OpenBSD bwfm - event code 69, a scan result
 BWFM_E_LINK                        # OpenBSD bwfm - event code 16; named code::LINK here - external, 26.14
 BWFM_E_SET_SSID                    # OpenBSD bwfm - event code 0; named code::SET_SSID here - external, 26.14
 BWFM_MAX_SSID_LEN                  # OpenBSD bwfm - 32; named MAX_SSID here - external, 26.14
-BWFM_MCSSET_LEN                    # OpenBSD bwfm - 16, the basic_mcs array length; only used to COMPUTE the bss_info offsets - external, 26.14
 BWFM_SCANTYPE_ACTIVE               # OpenBSD bwfm - 0; named SCANTYPE_ACTIVE here - external, 26.14
 BWFM_SDIO_SWHDR_CHANNEL_DATA       # OpenBSD bwfm - SDPCM channel 2; named CHANNEL_DATA here - external, 26.14
 BWFM_SDIO_SWHDR_CHANNEL_EVENT      # OpenBSD bwfm - SDPCM channel 1; named CHANNEL_EVENT here - external, 26.14
@@ -329,71 +281,32 @@ WL_ESCAN_ACTION_START              # OpenBSD bwfm - 1, start a scan; named ACTIO
 brcmf_escan_prep                   # Linux brcmfmac cfg80211.c - where the scan parameter DEFAULTS are quoted from - external, 26.14
 bwfm_ethhdr                        # OpenBSD bwfm - the 10-byte packed header between the ethernet header and the event message - external, 26.14
 bwfm_event_msg                     # OpenBSD bwfm - the 48-byte packed event message; scan.rs reads it by offset rather than as a struct - external, 26.14
-bwfm_escan_results                 # OpenBSD bwfm - the escan result payload header (buflen/version/sync_id/bss_count) - external, 26.14
-bwfm_bss_info                      # OpenBSD bwfm - the per-network record; scan.rs reads it by offset and steps by its own length field - external, 26.14
-bwfm_scan_params_v0                # OpenBSD bwfm - the v0 scan parameter layout scan.rs builds - external, 26.14
-bwfm_escan_params_v0               # OpenBSD bwfm - version/action/sync_id wrapping the v0 scan params - external, 26.14
-bwfm_ssid                          # OpenBSD bwfm - u32 len plus a 32-byte array, 36 bytes, which fixes every offset after it - external, 26.14
-channel_num                        # OpenBSD bwfm scan params field - 0 means every channel; scan.rs names the offset req::CHANNEL_NUM - external, 26.14
 ether_header                       # the standard 14-byte BSD ethernet header struct, which an event frame begins with; scan.rs reads it by offset - external, 26.14
 sync_id                            # OpenBSD bwfm scan params/result field, echoed back in every result; scan.rs names the constant SYNC_ID and the offset req::SYNC_ID - external, 26.14
 bcm2835_mmc_writel                 # Raspberry Pi bcm2835-mmc.c - the DELAYING register write accessor for this exact controller; the source of write_settle - external, 26.14
 mmc_raw_writel                     # Raspberry Pi bcm2835-mmc.c - the NON-delaying accessor its PIO block writer uses for SDHCI_BUFFER; the source of wr_raw - external, 26.14
 SDHCI_TIMEOUT_CONTROL              # SDHCI SPEC offset 0x2E, which on this family lives inside CONTROL1 as DATA_TOUNIT bits 19:16 - external, 26.14
-BCM2835_SDHCI_WRITE_DELAY          # Raspberry Pi bcm2835-mmc.c - ((2 * 1000000) / f) + 1, the settling gap formula - external, 26.14
-MIN_FREQ                           # Raspberry Pi bcm2835-mmc.c - 400000, the clock floor the settling-gap formula is evaluated at, giving the 6 us worst case - external, 26.14
-TIMEOUT_VAL                        # Raspberry Pi bcm2835-mmc.c - the value it writes to SDHCI_TIMEOUT_CONTROL for a data command - external, 26.14
-bcm2835_mmc_writeb                 # Raspberry Pi bcm2835-mmc.c - wraps writel, which is why writing the timeout byte sets CONTROL1 bits 19:16 - external, 26.14
-SDHCI_BUFFER                       # SDHCI SPEC offset 0x20, the FIFO data port; this driver names it DATA - external, 26.14
 brcmf_fil_errstr                   # Linux brcmfmac fwil.c - the firmware error table the negative status indexes; the source of err_name - external, 26.14
-BCME_NOTUP                         # Linux brcmfmac - error -4, the interface is down; what the firmware answered a scan with before BRCMF_C_UP - external, 26.14
-BCME_BADLEN                        # Linux brcmfmac - error -24, which is what a wrong dataoff produced when the firmware read an iovar name as a header - external, 26.14
-BCME_OK                            # Linux brcmfmac - 0 - external, 26.14
-BCME_BADARG                        # Linux brcmfmac - error -2 - external, 26.14
-BCME_BADOPTION                     # Linux brcmfmac - error -3 - external, 26.14
-BCME_NOTREADY                      # Linux brcmfmac - error -26 - external, 26.14
-BCME_EPERM                         # Linux brcmfmac - error -27 - external, 26.14
-BCME_NOMEM                         # Linux brcmfmac - error -28 - external, 26.14
 BWFM_E_LAST                        # OpenBSD bwfm - the event-code count its mask length derives from; deliberately NOT needed here because the mask is read from the firmware before it is written - external, 26.14
 BWFM_EVENT_MASK_LEN                # OpenBSD bwfm - roundup(BWFM_E_LAST, 8) / 8; cited to explain why the mask is read rather than sized from a constant - external, 26.14
 BWFM_C_SET_INFRA                   # OpenBSD bwfm - command 20, infrastructure mode; named CMD_SET_INFRA here - external, 26.14
 BWFM_C_SET_AP                      # OpenBSD bwfm - command 118, access-point mode; named CMD_SET_AP here - external, 26.14
 BWFM_C_SET_PM                      # OpenBSD bwfm - command 86, power management; deliberately not sent (26.2) - external, 26.14
 BWFM_C_UP                          # OpenBSD bwfm - command 2, raise the interface, sent with the value 0 - external, 26.14
-bwfm_fwvar_cmd_set_data            # OpenBSD bwfm - what its int setter calls with sizeof(data), proving an integer command carries FOUR bytes - external, 26.14
-bwfm_fwvar_cmd_set_int             # OpenBSD bwfm - the integer-command helper; the source of set_cmd_int - external, 26.14
-bwfm_fwvar_var_set_data            # OpenBSD bwfm - how it writes the event_msgs mask back - external, 26.14
 brcmf_c_preinit_dcmds              # Linux brcmfmac common.c - the bring-up command sequence read to find what precedes a scan - external, 26.14
 brcmf_c_process_clm_blob           # Linux brcmfmac common.c - downloads the CLM regulatory blob via the clmload iovar; the step this driver was missing - external, 26.14
-brcmf_c_download_blob              # Linux brcmfmac - the chunked blob download download_blob reimplements - external, 26.14
-brcmf_dload_data_le                # Linux brcmfmac fwil_types.h - the 12-byte download header (flag/dload_type/len/crc) - external, 26.14
 bwfm_init                          # OpenBSD bwfm - the bring-up function whose FULL order showed that UP comes after the event mask - external, 26.14
 bwfm_preinit                       # OpenBSD bwfm - what runs before bwfm_init; its brcmfmac twin downloads the CLM blob - external, 26.14
 join_pref                          # OpenBSD bwfm iovar - RSSI-based AP preference; deliberately not sent (26.2) - external, 26.14
 MAX_CHUNK_LEN                      # Linux brcmfmac - 1400, its download buffer limit; this driver chunks to its own 512-byte frame instead - external, 26.14
 SET_PM                             # OpenBSD bwfm BWFM_C_SET_PM - power management; deliberately not sent (26.2) - external, 26.14
-DL_TYPE_CLM                        # Linux brcmfmac fwil_types.h - 2, the download type for a CLM blob - external, 26.14
-DL_BEGIN                           # Linux brcmfmac fwil_types.h - 0x0002, first chunk of a blob download - external, 26.14
-DL_END                             # Linux brcmfmac fwil_types.h - 0x0004, last chunk of a blob download - external, 26.14
-clmload_status                     # Linux brcmfmac - the companion iovar its blob download reads afterwards; not read here - external, 26.14
-mpc                                # OpenBSD bwfm iovar - minimum power consumption; deliberately not sent (26.2) - external, 26.14
-txbf                               # OpenBSD bwfm iovar - transmit beamforming; deliberately not sent (26.2) - external, 26.14
 BWFM_DLOAD_FLAG_HANDLER_VER_1      # OpenBSD bwfm - (1 << 12), the download-handler protocol version set on EVERY chunk; named DL_HANDLER_VER_1 here - external, 26.14
 BWFM_DLOAD_FLAG_HANDLER_VER_MASK   # OpenBSD bwfm - (0xf << 12), which is what proves the flag high nibble is a version field rather than spare bits - external, 26.14
 BWFM_DLOAD_FLAG_BEGIN              # OpenBSD bwfm - (1 << 1), the same value brcmfmac calls DL_BEGIN - external, 26.14
 BWFM_DLOAD_FLAG_END                # OpenBSD bwfm - (1 << 2), the same value brcmfmac calls DL_END - external, 26.14
-BWFM_DLOAD_TYPE_CLM                # OpenBSD bwfm - 2, agreeing with brcmfmac DL_TYPE_CLM - external, 26.14
 BWFM_DLOAD_MAX_LEN                 # OpenBSD bwfm - 1400, its chunk limit; this driver chunks to its own 512-byte frame - external, 26.14
-bwfm_process_blob                  # OpenBSD bwfm - the chunked blob download whose flag construction showed the missing handler version - external, 26.14
-bwfm_dload_data                    # OpenBSD bwfm - the packed download header (flag/type/len/crc/data) - external, 26.14
 BWFM_SDIO_SWHDR_CHANNEL_GLOM       # OpenBSD bwfm - SDPCM channel 3, firmware-aggregated frames; its receive switch has NO case for it and drops them, so this driver counts and ignores them too - external, 26.14
-MAX_RX_DATASZ                      # Linux brcmfmac sdio.c - 2048, the receive frame size; the source of FRAME - external, 26.14
-bus:txglom                         # Linux brcmfmac - the TX-only glom iovar; cited to say there is no RX equivalent to turn aggregation off - external, 26.14
-bus:rxglom                         # Linux brcmfmac - does NOT exist; cited where this driver explains why glom cannot be disabled by the host - external, 26.14
 BCDC_HEADER_LEN                    # Linux brcmfmac bcdc.c - 4, the DATA/EVENT frame header (distinct from the 16-byte dcmd a CONTROL reply carries); named BDC_HEADER here - external, 26.14
-brcmf_proto_bcdc_header            # Linux brcmfmac bcdc.c - flags/priority/flags2/data_offset, the 4-byte header before an ethernet frame - external, 26.14
-brcmf_proto_bcdc_hdrpull           # Linux brcmfmac bcdc.c - the receive path that pulls BCDC_HEADER_LEN and then data_offset << 2 - external, 26.14
-skb_pull                           # Linux kernel - advances past a header; quoted to show the DATA frame needs TWO pulls - external, 26.14
 brcmf_escan_result_le              # Linux brcmfmac fwil_types.h - the LITTLE-endian escan result body (buflen/version/sync_id/bss_count), which is why only the event header flips byte order - external, 26.14
 brcmf_bss_info_le                  # Linux brcmfmac fwil_types.h - the little-endian per-network record; its natural alignment lands on the same offsets as OpenBSD bwfm_bss_info - external, 26.14
 BWFM_E_STATUS_SUCCESS              # OpenBSD bwfm event status 0, the scan is over; this driver names it status::SUCCESS and stops listening on it - external, 26.14
@@ -405,16 +318,7 @@ BWFM_E_STATUS_PARTIAL              # OpenBSD bwfm event status 8, one batch of r
 BRCMF_C_SET_AUTH                   # Linux brcmfmac fwil.h - 22, agreeing with cyw43 WLC_SET_AUTH - external, 26.14
 BRCMF_C_SET_SSID                   # Linux brcmfmac fwil.h - 26, the join command - external, 26.14
 BRCMF_C_SET_WSEC                   # Linux brcmfmac fwil.h - 134 - external, 26.14
-BRCMF_C_SET_WSEC_PMK               # Linux brcmfmac fwil.h - 268, the passphrase/PMK command - external, 26.14
-BRCMF_E_REASON_FWSUP_WPA_PSK_TMO   # Linux brcmfmac fweh.h - 15, the 4-way handshake timed out: how a wrong passphrase presents - external, 26.14
-BRCMF_E_REASON_FWSUP_WPA_PSK_M1_TMO # Linux brcmfmac fweh.h - 16 - external, 26.14
-BRCMF_E_REASON_FWSUP_WPA_PSK_M3_TMO # Linux brcmfmac fweh.h - 17 - external, 26.14
-BRCMF_E_STATUS_FWSUP_COMPLETED     # Linux brcmfmac fweh.h - 6, the firmware supplicant finished the handshake - external, 26.14
-BRCMF_E_STATUS_FWSUP_TIMEOUT       # Linux brcmfmac fweh.h - 7 - external, 26.14
 BRCMF_EVENT_MSG_LINK               # Linux brcmfmac fweh.h - 0x01 in a LINK event flags: link up - external, 26.14
-brcmf_set_auth_type                # Linux brcmfmac cfg80211.c - sets auth to 0 for open system - external, 26.14
-BRCMF_WSEC_PASSPHRASE              # Linux brcmfmac fwil_types.h - BIT(0): the key field holds a passphrase, not a derived PMK - external, 26.14
-brcmf_wsec_pmk_le                  # Linux brcmfmac fwil_types.h - { le16 key_len; le16 flags; u8 key[] } - external, 26.14
 BWFM_E_AUTH                        # OpenBSD bwfm - event 3 - external, 26.14
 BWFM_E_DEAUTH                      # OpenBSD bwfm - event 5 - external, 26.14
 BWFM_E_DEAUTH_IND                  # OpenBSD bwfm - event 6, the AP deauthenticated us - external, 26.14
@@ -422,7 +326,6 @@ BWFM_E_DISASSOC                    # OpenBSD bwfm - event 11 - external, 26.14
 BWFM_E_DISASSOC_IND                # OpenBSD bwfm - event 12 - external, 26.14
 BWFM_E_JOIN                        # OpenBSD bwfm - event 1 - external, 26.14
 BWFM_E_PSK_SUP                     # OpenBSD bwfm - event 46, the supplicant reporting - external, 26.14
-cyw43_ll_wifi_join                 # cyw43-driver (Pico W) - the passphrase-based join a host with no crypto uses; the reference of record for that one step - external, 26.14
 CYW43_WPA_MAX_PASSWORD_LEN         # cyw43-driver - 64, the passphrase buffer the firmware takes - external, 26.14
 IEEE80211_CAPINFO_PRIVACY          # OpenBSD net80211 ieee80211.h - 0x0010, the Privacy capability bit - external, 26.14
 IEEE80211_ELEMID_RSN               # OpenBSD net80211 ieee80211.h - 48, the RSN (WPA2) element - external, 26.14
@@ -432,7 +335,6 @@ WLC_SET_AUTH                       # cyw43-driver - 22 - external, 26.14
 WLC_SET_SSID                       # cyw43-driver - 26 - external, 26.14
 WLC_SET_WPA_AUTH                   # cyw43-driver - 165; Linux uses the wpa_auth iovar for the same setting - external, 26.14
 WLC_SET_WSEC                       # cyw43-driver - 134 - external, 26.14
-WLC_SET_WSEC_PMK                   # cyw43-driver - 268 - external, 26.14
 ie_length                          # OpenBSD bwfm bss_info field - the IE run length; this driver names the offset bss::IE_LENGTH - external, 26.14
 ie_offset                          # OpenBSD bwfm bss_info field - where the beacon IEs start, from the START of the record (the reference copies bss + iesoff); this driver names the offset bss::IE_OFFSET - external, 26.14
 brcmf_feat_attach                  # Linux brcmfmac feature.c - where firmware features are detected, after preinit and before UP; this driver asks its three questions at the same point - external, 26.14
@@ -446,7 +348,6 @@ EAPOL_KEY                          # OpenBSD net80211/ieee80211.h - EAPOL packet
 EAPOL_KEY_DESC_IEEE80211           # OpenBSD net80211/ieee80211.h - descriptor type 2, RSN; this driver names it DESC_RSN - external, 26.14
 EAPOL_KEY_DESC_WPA                 # OpenBSD net80211/ieee80211.h - descriptor type 254, pre-standard WPA; this driver names it DESC_WPA - external, 26.14
 bwfm_connect                       # OpenBSD bwfm.c - the join sequence (wpaie, wpa_auth, wsec, auth, mfp, SET_SSID) join.rs follows - external, 26.14
-bwfm_join_params                   # OpenBSD bwfmreg.h - SSID plus assoc params (a BSSID) for SET_SSID; the numbered picker will use it - external, 26.14
 bwfm_proto_bcdc_rx                 # OpenBSD bwfm.c - strips the BCDC header plus data_offset words; scan::ethernet_at is the same arithmetic - external, 26.14
 bwfm_rx                            # OpenBSD bwfm.c - the data receive path; hands EAPOL frames to net80211 - external, 26.14
 ieee80211_add_rsn                  # OpenBSD net80211 - builds the RSN element bwfm_connect sets as wpaie; eapol::RSN_IE is that element for CCMP/PSK - external, 26.14
@@ -490,15 +391,9 @@ D11_BCMA_IOCTL_PHYRESET            # Linux drivers/net/wireless/broadcom/brcm802
 D11_BCMA_IOCTL_PHYCLOCKEN          # Linux brcmfmac chip.c - the 802.11 core IOCTL bit `aicore::D11_PHYCLOCKEN` mirrors - external, 26.14
 SDIO_WAIT_F2RDY                    # Linux brcmfmac sdio.c - the 3000 ms function-2 ready timeout `sdio::enable_function` waits by - external, 26.14
 brcmf_chip_cr4_set_passive         # Linux brcmfmac chip.c - disable the ARM CR4, reset the 802.11 core: the passive step a firmware upload follows - external, 26.14
-BCMA_CC_WATCHDOG                   # Linux drivers/bcma/ - the chipcommon watchdog register (0x80) `sdio::CC_WATCHDOG` mirrors; a nonzero tick count resets the whole chip - external, 26.14
 SDPCM_SHARED_TRAP                  # Linux brcmfmac sdio.c - the shared-structure flag bit `upload::TRAP` mirrors: the firmware took a trap - external, 26.14
-brcmf_pcie_reset_device            # Linux brcmfmac pcie.c - arms the chipcommon watchdog with 4 to reset the dongle; the mechanism `sdio::chip_reset` borrows - external, 26.14
-brcmf_sdio_bus_reset               # Linux brcmfmac sdio.c - the SDIO bus reset: remove, mmc_hw_reset (a power cycle), probe - the remedy this driver cannot use without the kernel - external, 26.14
 brcmf_trap_info                    # Linux brcmfmac sdio.c - the trap record (type, epc, cpsr, spsr, r0-r7, pc, sp, lr) `upload` reads out when the firmware reports a trap - external, 26.14
-mmc_hw_reset                       # Linux drivers/mmc/core - power-cycles a card through its power sequencer; on the Pi 4 that is the WLAN regulator on the GPIO expander - external, 26.14
 trap_addr                          # Linux brcmfmac sdio.c `sdpcm_shared_le.trap_addr` - the word after `flags` in the shared structure, the trap record pointer - external, 26.14
-si_watchdog                        # Broadcom DHD siutils.c - arms the PMU watchdog on a PMU chip, the chipcommon watchdog otherwise; the register choice `sdio::PMU_WATCHDOG` follows - external, 26.14
-pmuwatchdog                        # Broadcom chipcregs - the PMU watchdog register at chipcommon + 0x634 `sdio::PMU_WATCHDOG` names - external, 26.14
 mmc_sdio_resume                    # Linux drivers/mmc/core/sdio.c - resume reinitialises nothing for a powered, non-removable card; the model `sdio::identify` adopts a running firmware by - external, 26.14
 sdhci_reset                        # Linux sdhci.c, cited for its 100 ms bound on the same reset bits wifi-driver host.rs waits on - external, 26.14
 sdhci_enable_clk                   # Linux sdhci.c, cited for its 150 ms bound on the clock-stable bit - external, 26.14
@@ -510,6 +405,7 @@ PAR_EL1                            # AArch64 system register: the Physical Addre
 aic8800_bsp                        # AICSemi's out-of-tree bus/upload driver (radxa-pkg/aic8800 at 09c65d61), cited in services/wifi-driver for the radio's power hold-offs - external, 26.14
 gpio_wl_reg_on                     # StarFive vendor device-tree property naming GPIO 33 as the VisionFive radio's enable, cited in arch/riscv64/sdio.rs and mod.rs - external, 26.14
 mmc1_pins                          # Linux jh7110-common.dtsi pinctrl node whose pad settings arch/riscv64/sdio.rs copies for the radio's SD host - external, 26.14
+dw_mci_probe                       # Linux dw_mmc.c, whose FIFO-depth warning dwmmc.rs follows (take the depth from the device tree) - external, 26.14
 dw_mci_ctrl_reset                  # Linux drivers/mmc/host/dw_mmc.c, the controller reset services/wifi-driver/src/dwmmc.rs copies - external, 26.14
 dw_mci_prepare_command             # Linux dw_mmc.c, the command-flag rules dwmmc.rs copies (STOP for CMD0 and the CCCR abort, HOLD_REG) - external, 26.14
 dw_mci_setup_bus                   # Linux dw_mmc.c, the clock-change sequence dwmmc.rs copies - external, 26.14

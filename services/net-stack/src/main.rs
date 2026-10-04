@@ -1593,6 +1593,10 @@ const POLL_BUDGET_MS: u64 = 250;
 /// second is four times the worst legitimate pass and cannot fire on an ordinary busy moment. A
 /// `nic_req` waiting out its full `LINK_SECS` is exactly the kind of pass worth hearing about.
 const SLOW_PASS_MS: u64 = 1_000;
+/// The status a stack that has never had a link reports: TEXT, not a record, and the shell matches all
+/// nineteen bytes of it to say "no link since boot" rather than print it as addresses. So nothing may
+/// edit it in place - see the status reply.
+const NO_LINK_STATUS: [u8; 19] = *b"link down (no cable";
 const _: () = assert!(SLOW_PASS_MS > POLL_MS + POLL_BUDGET_MS,
     "a healthy pass must not trip the slow-pass report, or the report is noise");
 
@@ -2786,7 +2790,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             gw_known: false,
             leased: false,     // no cable, so certainly no lease
             dns_server: [0; 4],
-            status: *b"link down (no cable",
+            status: NO_LINK_STATUS,
         }
     };
     let mut our_ip = d.our_ip;
@@ -2926,7 +2930,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         }
                     }
                     last_pass = now_pass;
-                    if !gw_known || !tcpst.have_clock() { break ctx.recv(); }
+                    if !gw_known || !tcpst.have_clock() {
+                        // IDLE IS NOT A SLOW PASS. Unconfigured, this blocks until a client speaks, and
+                        // with no cable that is `time` every 20 s. The gap above was measured from BEFORE
+                        // this wait, so every such idle stretch was logged as "a serve pass took 20535
+                        // ms ... not asking for client requests during it" - while it was blocked doing
+                        // exactly that (VisionFive, 2026-10-04). The clock restarts when the wait ends,
+                        // so the gap is the serving, which is what the line claims to measure.
+                        let m = ctx.recv();
+                        last_pass = ctx.read_tsc();
+                        break m;
+                    }
                     // ---- THE POLL IS A PERIODIC OBLIGATION, NOT AN IDLE-TIME FILLER ----
                     //
                     // Checked BEFORE the wait, and on every pass, so it happens at least every
@@ -3686,8 +3700,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // and, if it is down (cable out), clear the "gateway resolved / ping OK" flags so `net` reflects
             // reality instead of stale boot-time info - as adaptable as `ping`. gw_known is NOT cleared (the
             // gateway MAC persists, so `net`/`ping` resume on replug without re-dancing).
+            //
+            // NOT the never-linked sentinel, which is text and has no flags byte: its byte 14 is the `c`
+            // of "cable", and zeroing it broke the 19-byte match the shell uses to recognise it, so `net`
+            // on a machine booted unplugged printed `ip 108.105.110.107` and `dns 97.98.108.101` - the
+            // words "link" and "able" (QEMU riscv64 with no NIC, 2026-10-04).
             let mut s = status;
-            if !link_is_up(&ctx, pending) { s[14] = 0; }
+            if s != NO_LINK_STATUS && !link_is_up(&ctx, pending) { s[14] = 0; }
             reply.send(&ctx, &s);
         }
         reply.done(&ctx);

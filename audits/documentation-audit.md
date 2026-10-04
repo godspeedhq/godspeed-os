@@ -98,9 +98,10 @@ none was marked. They are now, each pointing at the section that changed it.
    services table above it - and whether that table still matters now the supervisor holds the images
    (step C) is a larger question than a comment.
 6. **The `pwm-audio` arena** is granted 36 pages and needs 33; nothing records why.
-7. **`backlog/README.md`** rows 55-73 are out of numeric order. Cosmetic.
+7. **`backlog/README.md`** rows 55-73 are out of numeric order. Cosmetic. **Closed the same day**: sorted.
 8. **Stale baseline entries** in `scripts/DOC-SYMBOLS.baseline.txt` and `COMMENT-SYMBOLS.baseline.txt`
-   (`sdio_io_rw_ext_helper`, `txbf`, and the others the doc gate lists): the ratchet can tighten.
+   (`sdio_io_rw_ext_helper`, `txbf`, and the others the doc gate lists): the ratchet can tighten. **Closed the same day**: 31 and 105 entries removed
+   (127 to 96, 509 to 404), each named by its own gate as no longer needed.
 
 ### What came back clean
 

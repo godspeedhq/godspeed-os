@@ -117,9 +117,9 @@ never points a DMA engine at memory at all.
   references guard against.
 
 **V1 as built (2026-10-04), where it differs from the plan above.** Commands only: `cmd_data` refuses by
-name, and the data phase and the CMD53 abort arrive with the upload (V2). The FIFO depth is read from
-`FIFOTH`'s reset value, not assumed to be 32, and the thresholds written are the probe's (`depth/2 - 1`,
-`depth/2`, burst code 2). The host does not read `HCON` or `VERID` for itself - the kernel census prints
+name, and the data phase and the CMD53 abort arrive with the upload (V2). The FIFO depth was first read
+from `FIFOTH`'s reset value rather than taken as the device tree's 32; that was wrong, and it is now the
+device tree's (below). The thresholds written are the probe's (`depth/2 - 1`, `depth/2`, burst code 2). The host does not read `HCON` or `VERID` for itself - the kernel census prints
 both, and V2's FIFO access is where the offset is needed. Before a command it waits for `CMD` bit 31 to
 clear and does NOT wait on `STATUS` busy: Linux's `dw_mci_wait_while_busy` does that only for commands
 with a data phase, and after an R1b (CMD7) the host waits out DAT0 busy. A failed command returns no
@@ -137,7 +137,13 @@ a chip warm only for `DOWN_TRAPPED`.
 **The radio verbs on the board (2026-10-04, second run).** All five predictions held: `wifi radio on` and
 `powercycle` gave the not-built sentence and restarted nothing; `off hard` cut the power and verified the
 chip silent; `on` restored it, restarted the driver onto the cold chip, V1 ran again to `V1 done`, and
-the watch ended on the same sentence. Nothing said `came up warm`.
+the watch ended on the same sentence. Nothing said `came up warm`. The same run found a bug: the FIFO
+depth read 128, then 64, then 32 across the three resets, because the driver read the depth from the
+`FIFOTH` watermark it had itself written at depth/2 - 1, and no reset restores that register. Linux's
+`dw_mci_probe` warns of exactly this and takes the depth from the device tree, which says
+`fifo-depth = <32>` on both `jh7110-mmc` nodes; the driver now does the same. The first read implied 128,
+so whether this host's FIFO is really 32 or 128 is open, and 32 is safe either way. V1 sends no data, so
+nothing depended on the wrong value yet; V2 would have.
 
 ## 5. The AIC8800 bus and the firmware upload
 

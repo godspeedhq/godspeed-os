@@ -39,6 +39,15 @@ const DW_FIFOTH: usize = 0x04c;
 const DW_VERID: usize = 0x06c;
 const DW_HCON: usize = 0x070;
 
+/// The FIFO depth in 32-bit words: the board's device tree, `fifo-depth = <32>` on both `jh7110-mmc`
+/// nodes. NOT read from `DW_FIFOTH`, which is what V1 first did: the RX watermark's power-on value is
+/// depth - 1, but this driver writes depth/2 - 1 there and no reset restores it, so each re-init read
+/// the last one's write and halved - 128, 64, 32 across three resets on the board (2026-10-04). Linux
+/// gives the same warning in `dw_mci_probe` and takes the depth from the device tree for that reason.
+/// The first read on the board implied 128; if that is the real depth, 32 is conservative, and if it is
+/// not, 32 is the only safe answer. V2's data phase is where the difference would show.
+const FIFO_DEPTH_WORDS: u32 = 32;
+
 const CTRL_RESET: u32 = 1 << 0;
 const CTRL_FIFO_RESET: u32 = 1 << 1;
 const CTRL_DMA_RESET: u32 = 1 << 2;
@@ -175,11 +184,15 @@ impl<'a> Host<'a> {
         self.wr(DW_RINTSTS, 0xffff_ffff);
         self.wr(DW_INTMASK, 0);
         self.wr(DW_TMOUT, 0xffff_ffff);
-        // FIFO thresholds as the probe sets them: depth read from DW_FIFOTH's reset value, RX mark at half
-        // minus one, TX mark at half, burst size code 2.
-        let depth = 1 + ((self.rd(DW_FIFOTH) >> 16) & 0xfff);
+        // FIFO thresholds as the probe sets them: RX mark at half minus one, TX mark at half, burst size
+        // code 2. The depth is the device tree's (`FIFO_DEPTH_WORDS`); what `DW_FIFOTH` held before this
+        // write is logged only as a record, since after the first reset it is a previous write.
+        let held = 1 + ((self.rd(DW_FIFOTH) >> 16) & 0xfff);
+        let depth = FIFO_DEPTH_WORDS;
         self.wr(DW_FIFOTH, (2 << 28) | (((depth / 2 - 1) & 0xfff) << 16) | ((depth / 2) & 0xfff));
-        ctx.log_fmt(format_args!("wifi-driver: dw_mmc reset, FIFO depth {} words", depth));
+        ctx.log_fmt(format_args!(
+            "wifi-driver: dw_mmc reset, FIFO depth {} words (the device tree's; FIFOTH held a watermark implying {})",
+            depth, held));
         self.need_init.set(true);
         self.setup_bus(IDENT_HZ)
     }

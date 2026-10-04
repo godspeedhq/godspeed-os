@@ -7,23 +7,12 @@
 # This file may SHRINK freely - the checker says so when it can. It may not grow without
 # somebody deciding the new entry is one of those two things.
 
-AIRC_RESET                         # docs/wifi.md - cyw43-driver/BCMA name for the reset-control bit, EXTERNAL; not yet a constant here
 HMB_DATA_FWHALT                    # docs/wifi.md - Linux brcmfmac, EXTERNAL; the to-host mailbox bit that triggers its automatic recovery
-initial_turbo                      # docs/wifi.md - Raspberry Pi firmware config.txt option, EXTERNAL; seconds of Arm turbo after boot (default 60), quoted from its documentation
 force_turbo                        # docs/wifi.md - Raspberry Pi firmware config.txt option, EXTERNAL; holds the Arm cores at turbo, used 2026-10-01 and replaced by the power service (wifi.md 55, 57)
-brcmf_chip_cr4_set_active          # docs/wifi.md - Linux brcmfmac, EXTERNAL; the release path, likewise
-brcmf_chip_disable_arm             # docs/wifi.md - Linux brcmfmac, EXTERNAL; the halt path that needs the core wrapper
-brcmf_chip_tcm_rambase             # docs/wifi.md - Linux brcmfmac, EXTERNAL; the per-part table giving 0x198000 for the 4345
-brcmf_sdio_buscore_activate        # docs/wifi.md - Linux brcmfmac, EXTERNAL; named as the reset-vector handoff still to be read
-brcmf_sdiod_ramrw                  # docs/wifi.md - Linux brcmfmac, EXTERNAL; cited for how a large backplane transfer is chunked
-brcmf_sdiod_set_backplane_window   # docs/wifi.md - Linux brcmfmac, EXTERNAL; cited for caching the window between transfers
 CONSOLE_RENDER                     # docs/console-service.md
 FILE_FLAG_NO_BUFFERING             # backlog/26-visionfive-uboot-cannot-load-large-files.md
 MAX_FILES                          # docs/persistence.md
 mmc_io_rw_extended                 # docs/wifi.md - Linux mmc core, EXTERNAL; cited for the CMD53 argument this driver reimplements
-request_firmware                   # docs/wifi.md - Linux firmware loader, EXTERNAL; cited for how a live distro finds a blob in RAM
-SBSDIO_SB_OFT_ADDR_LIMIT           # docs/wifi.md - Linux brcmfmac chunk bound (the 32 KiB window), EXTERNAL; not yet a constant here
-sdio_io_rw_ext_helper              # docs/wifi.md - Linux mmc core, EXTERNAL; cited for why a 4-byte read uses BYTE mode
 USE_FUA                            # CLAUDE.md, docs/arm32-usb-userspace.md, docs/pi2-deploy.md
 async_bulk_watchdog                # docs/arm32-usb-userspace.md
 bot_command                        # docs/arm32-status.md, docs/arm32-usb-userspace.md
@@ -69,36 +58,21 @@ ns_request                         # backlog/29 + docs/stdlib-design.md + utilit
 sock_invoke                        # docs/stdlib-design.md 16 - DELETED by 00b273ea, replaced by gs::resource's held-not-drained invoke; the section records the design it had
 split_txn                          # docs/arm32-usb-userspace.md - the IN-KERNEL dwc2 driver's split path, deleted with arch/arm/dwc2.rs; the port journal names what it was read against
 split_txn_periodic                 # docs/arm32-usb-userspace.md - ditto; `periodic_split_in` in services/dwc2 is what it became
-DATA_TIMEOUT                       # SDHCI SPEC interrupt-status bit 20 - this driver has no constant for it because INT_ERR (0x017E_8000) covers it as a mask; cited to say WHY a data timeout would have been reported - external, 26.14
 WRITE_TRANSFER_ACTIVE              # SDHCI SPEC present-state bit 8 - this driver has no constant for it and reads it only as part of the measured STATUS word; cited by its spec name where that word is decoded - external, 26.14
-brcmf_sdio_download_firmware       # Linux brcmfmac sdio.c - the whole download sequence; cited as where to look next if the reset vector proves necessary but not sufficient - external, 26.14
-BRCMF_C_UP                         # Linux brcmfmac fwil.h - 2, the dongle command that brings the firmware up; not implemented here, cited as what to read next if the firmware does not answer a query - external, 26.14
 active_time                        # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
 bss_type                           # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
 home_time                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
 passive_time                       # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
 scan_type                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
-ie_length                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
-ie_offset                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
 bwfm_scan_v0                       # OpenBSD bwfm - the v0 scan path this driver targets; cited in the recorded v0-vs-v2 conflict - external, 26.14
 bwfm_scan_v2                       # OpenBSD bwfm - the v2 scan path, the first thing to try if a v0 scan returns nothing - external, 26.14
-brcmf_proto_bcdc_query_dcmd        # Linux brcmfmac bcdc.c - where the request-id convention and the reply validation are quoted from - external, 26.14
 brcmf_create_bsscfg                # Linux brcmfmac fwil.c - builds the `bsscfg:<name>` iovar payload (prefix, name, NUL, index u32, value); docs/wifi.md 37 quotes its 23-byte layout - external, 26.14
 brcmf_fwcap_map                    # Linux brcmfmac feature.c - the table the `cap` string is matched against (`sae `, `sae_ext`, `idauth`, ...) - external, 26.14
-bwfm_rx                            # OpenBSD bwfm.c - the data receive path; hands EAPOL frames to net80211 - external, 26.14
-ieee80211_eapol_key_input          # OpenBSD net80211 - the 4-way handshake receive entry point bwfm_rx calls - external, 26.14
 sae_ext                            # a word in the firmware `cap` string (and brcmf_fwcap_map): WPA3 authentication done by the HOST; read off this board 2026-09-29 - external, 26.14
-brcmf_sdio_rxglom                  # Linux brcmfmac sdio.c - reads a glommed superframe: walks the descriptor list of sub-frame lengths and delivers each; the prerequisite this driver has not built (docs/wifi.md 38) - external, 26.14
 bwfm_sdio_rx_glom                  # OpenBSD if_bwfm_sdio.c - reads one chunk per descriptor entry, strips the superframe header from the first, then parses each sub-frame by its own header; ctrl::subframes does the parsing half - external, 26.14
-ieee80211_eapol_key_decrypt        # OpenBSD net80211/ieee80211_crypto.c - opens message 3`s key data: AES key unwrap under the KEK for descriptor v2, 8 bytes shorter than it arrived; crypto::aes_key_unwrap is the unwrap - external, 26.14
-ieee80211_recv_group_msg1          # OpenBSD net80211 ieee80211_pae_input.c - the group-key message 1 receiver; backlog/64 names it as the reference for the rekey answer this driver does not give yet - external, 26.14
-ieee80211_send_group_msg2          # OpenBSD net80211 ieee80211_pae_output.c - the group-key message 2 sender; the other half of backlog/64 - external, 26.14
 aic8800_sdio                       # docs/wifi.md 44 - the AICSemi vendor Linux module for the VisionFive 2 Lite radio, named as the executable datasheet a riscv64 port would read - external, 26.14
-dw_mmc                             # docs/wifi.md 44 - the DesignWare MMC host block (Linux dwmmc_starfive) the VisionFive radio hangs off; no host layer for it exists here yet - external, 26.14
-WL_REG_ON                          # the Pi 4 WLAN regulator enable, a firmware GPIO-expander pin driven through the mailbox - hardware, named in backlog/69 as the power cycle a respawn needs - external
 brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
-brcmf_pcie_reset_device            # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 si_watchdog                        # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 ME_CHAN_CONFIG_REQ                 # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
 ME_CONFIG_REQ                      # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
@@ -122,15 +96,10 @@ SM_DISCONNECT_REQ                  # docs/wifi-aic8800.md - AICSemi aic8800 driv
 MM_CONNECTION_LOSS_IND             # docs/wifi-aic8800.md - AICSemi aic8800 driver, EXTERNAL; cited because the vendor driver ignores it
 CHIP_REV_U03                       # docs/wifi-aic8800.md - AICSemi aic8800_bsp chip_rev enum, EXTERNAL; revision 7
 lmac_msg                           # docs/wifi-aic8800.md, docs/CLAUDE.md - AICSemi/RivieraWaves message header struct, EXTERNAL
-aic8800_bsp                        # docs/wifi-aic8800.md - AICSemi's bus/firmware-load Linux module, EXTERNAL
 aic8800_fdrv                       # docs/wifi-aic8800.md - AICSemi's full-MAC Linux module, EXTERNAL
 set_pmk                            # docs/wifi-aic8800.md - Linux cfg80211 op, EXTERNAL; cited as the handshake offload this firmware lacks
 dw_mci_probe                       # docs/wifi-aic8800.md - Linux dw_mmc.c, EXTERNAL; the init order followed
-dw_mci_setup_bus                   # docs/wifi-aic8800.md - Linux dw_mmc.c, EXTERNAL; the clock-change sequence followed
 dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXTERNAL; the second init order compared
-gpio_wl_reg_on                     # docs/wifi-aic8800.md - StarFive vendor device-tree property, EXTERNAL; names the radio's GPIO 33 power pin
-SDIO1_AHB                          # docs/wifi-aic8800.md - JH7110 clock/reset name from Linux's starfive bindings, EXTERNAL
-SDIO1_SDCARD                       # docs/wifi-aic8800.md - JH7110 clock name from Linux's starfive bindings, EXTERNAL
 ap_max_inactivity                  # backlog/64 - hostapd configuration option, EXTERNAL; the access point idle timer that matches reason 4 after ~300 s
 mkeep_alive                        # backlog/64 - Broadcom firmware iovar Linux brcmfmac sets only for suspend, EXTERNAL
 dw_mci_wait_while_busy             # docs/wifi-aic8800.md - Linux drivers/mmc/host/dw_mmc.c, cited for when the reference waits on STATUS busy, EXTERNAL
