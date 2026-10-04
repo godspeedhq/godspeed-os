@@ -19,7 +19,7 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 8 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **84** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments) |
+| `sdk/rust/src/service_context.rs` | **83** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
 **The 92 are not 92 defects.** 88 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`

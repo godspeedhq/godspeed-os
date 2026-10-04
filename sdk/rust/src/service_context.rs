@@ -638,7 +638,23 @@ const _: () = assert!(
 // Safe: each service is a single-threaded process with its own BSS.
 // ---------------------------------------------------------------------------
 
-const CACHE_SIZE: usize = 8;
+/// How many reacquired peers a service can hold at once.
+///
+/// **It must cover every peer a service names, because a peer that does not fit used to be dropped in
+/// silence.** It was 8. The shell is wired at spawn with `fs` alone and reaches every other peer through
+/// this cache, and it names more than eight - net-stack, wifi-driver, events, time, console, block-driver,
+/// power, supervisor, nic-driver, recorder and more. After a chaos storm the respawned shell's `selfcheck`
+/// filled the cache before reaching the network, so `reacquire_by_name("net-stack")` returned `true` while
+/// storing nothing: every `ping` then found no send slot, reported `net-stack not responding` at once, and
+/// leaked the capability it had just acquired - and killing net-stack could not help (Pi 4, 2026-10-04).
+///
+/// 32 is above the supervisor's whole managed roster. A full cache now EVICTS (see `reacquire_cap_detail`)
+/// and says so, rather than refusing the newcomer quietly.
+const CACHE_SIZE: usize = 32;
+
+/// The next entry to evict when the cache is full - round robin, so no one peer is always the victim.
+// SAFETY: single-threaded service process; no concurrent access.
+static mut CACHE_NEXT_EVICT: usize = 0;
 
 struct CacheEntry {
     slot:     u32,
@@ -735,30 +751,6 @@ pub enum AllocError {
 // ---------------------------------------------------------------------------
 // ServiceContext.
 // ---------------------------------------------------------------------------
-
-/// Point the dynamic send-cap cache entry for `name` at `new_slot`, so the next
-/// `find_send_slot(name)` resolves to the freshly-acquired cap. Mirrors the inline
-/// update in `reacquire_cap`.
-fn cache_send_slot(name: &str, new_slot: u32) {
-    let bytes = name.as_bytes();
-    let len   = bytes.len().min(PEER_NAME_BYTES);
-    // SAFETY: single-threaded service process; no concurrent cache writers.
-    // addr_of_mut! avoids materialising a &mut to the `static mut` directly
-    // (silences the static_mut_refs lint).
-    unsafe {
-        for entry in (*core::ptr::addr_of_mut!(SEND_CAP_CACHE)).iter_mut() {
-            if entry.slot == u32::MAX
-                || (entry.name_len as usize == len && &entry.name[..len] == &bytes[..len])
-            {
-                entry.slot     = new_slot;
-                entry.name_len = len as u8;
-                entry.name     = [0u8; PEER_NAME_BYTES];
-                entry.name[..len].copy_from_slice(&bytes[..len]);
-                break;
-            }
-        }
-    }
-}
 
 /// These wait helpers POLL (`try_recv` + `yield_cpu`); they do not block. That is deliberate, and it is
 /// a REVERSAL - they were made to block earlier on this branch, and the change was wrong twice over.
@@ -1079,7 +1071,13 @@ impl ServiceContext {
         // entry first also prevents creating a duplicate entry when a free slot precedes it.
         // SAFETY: single-threaded service; no concurrent cache writes. addr_of_mut! avoids a direct
         // &mut to the static (static_mut_refs lint).
+        //
+        // NEVER DROP THE NEW CAP. If the peer has no entry and no entry is free, an existing one is
+        // evicted - its cap reclaimed, its peer reacquired on next use - and the eviction is logged. This
+        // used to fall through doing nothing and still return Ok: the caller believed the peer was
+        // reacquired, `find_send_slot` could not find it, and the cap just acquired leaked (CACHE_SIZE).
         let mut stale: Option<u32> = None;
+        let mut evicted: Option<([u8; PEER_NAME_BYTES], usize)> = None;
         let mut placed = false;
         unsafe {
             let cache = &mut *core::ptr::addr_of_mut!(SEND_CAP_CACHE);
@@ -1092,18 +1090,32 @@ impl ServiceContext {
                 }
             }
             if !placed {
-                for entry in cache.iter_mut() {
-                    if entry.slot == u32::MAX {
-                        entry.slot     = new_slot;
-                        entry.name_len = len as u8;
-                        entry.name     = [0u8; PEER_NAME_BYTES];
-                        entry.name[..len].copy_from_slice(bytes);
-                        break;
+                let free = cache.iter().position(|e| e.slot == u32::MAX);
+                let i = match free {
+                    Some(i) => i,
+                    None => {
+                        let next = &mut *core::ptr::addr_of_mut!(CACHE_NEXT_EVICT);
+                        let i = *next % CACHE_SIZE;
+                        *next = next.wrapping_add(1);
+                        stale = Some(cache[i].slot);
+                        evicted = Some((cache[i].name, cache[i].name_len as usize));
+                        i
                     }
-                }
+                };
+                let entry = &mut cache[i];
+                entry.slot     = new_slot;
+                entry.name_len = len as u8;
+                entry.name     = [0u8; PEER_NAME_BYTES];
+                entry.name[..len].copy_from_slice(bytes);
             }
         }
         if let Some(old) = stale { self.remove_cap(CapHandle(old)); }
+        if let Some((name, nlen)) = evicted {
+            let gone = core::str::from_utf8(&name[..nlen.min(PEER_NAME_BYTES)]).unwrap_or("?");
+            self.log_fmt(format_args!(
+                "sdk: the send-cap cache is full ({} peers) - dropped the cap to '{}' to hold '{}'; '{}' is reacquired when next used",
+                CACHE_SIZE, gone, peer, gone));
+        }
 
         Ok(CapHandle(new_slot))
     }
