@@ -1187,8 +1187,9 @@ impl ServiceContext {
     /// the mailbox was granted.
     ///
     /// Measured rather than assumed: an arm32 Pi 2 run logged ZERO refusals, so `fs` had its mailbox
-    /// and the repair was live on that port. `routing: reply endpoint refused` in a log is how you
-    /// know a machine is in the other case.
+    /// and the repair was live on that port. `spawn[ipc]: '<name>' gets no reply mailbox` in a log
+    /// names each service in the other case (it read `routing: reply endpoint refused`, unnamed, until
+    /// `backlog/74`).
     pub fn drain_stale_replies(&self) -> usize {
         let Some((recv, _)) = self.reply_mailbox() else { return 0 };
         let mut n = 0usize;
