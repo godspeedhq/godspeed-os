@@ -287,6 +287,33 @@ fn requested_off_ms(payload: &[u8]) -> u64 {
     }
 }
 
+/// Phase V0 on the VisionFive 2 Lite (`docs/wifi-aic8800.md` 7): prove the GRANT, then serve "no radio".
+///
+/// Three things, each printed, because V0's whole deliverable is what the log says. The window arrived
+/// (stage 1, above). It reaches the controller the kernel's census saw: the same `VERID` and `HCON`, read
+/// through the grant this time. And the power pin answers: one cycle through `DevicePower`, LOW for 10 ms
+/// and HIGH again with 10 ms to settle - the hold-offs the vendor glue uses (`aic8800_bsp`), and the
+/// driver's to choose rather than the kernel's (26.10). Nothing is sent to the chip; that is V1.
+#[cfg(wifi_host_dw_mmc)]
+fn v0_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
+    const VERID: usize = 0x6c;
+    const HCON: usize = 0x70;
+    const POWER_HOLD_MS: u64 = 10;
+    ctx.log_fmt(format_args!(
+        "wifi-driver: stage 2 (dw_mmc) - VERID={:#010x} HCON={:#010x} through the grant (the kernel's census read these same registers)",
+        mmio.read32(VERID), mmio.read32(HCON)));
+    let off = ctx.device_power(false);
+    ctx.sleep_ms(POWER_HOLD_MS);
+    let on = ctx.device_power(true);
+    ctx.sleep_ms(POWER_HOLD_MS);
+    ctx.log_fmt(format_args!(
+        "wifi-driver: the radio's power was cycled through DevicePower - off {}, on {} (the kernel prints what the pin read back)",
+        if off { "confirmed" } else { "REFUSED" }, if on { "confirmed" } else { "REFUSED" }));
+    ctx.log("wifi-driver: V0 done on this board - the SD host is granted and the radio's power answers. The AIC8800 \
+             driver itself (V1 onward, docs/wifi-aic8800.md) is not built yet, so this serves `no radio`");
+    serve_unavailable(ctx, None)
+}
+
 fn serve_unavailable(ctx: &ServiceContext, h: Option<&dyn SdioHost>) -> ! {
     // `wifi radio off hard` from here leaves the chip powered down, and from then on this loop answers the
     // way `serve_radio`'s powered-off arms do, so the shell sees one shape for one state whichever loop
@@ -1530,6 +1557,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         "wifi-driver: stage 1 - granted {} byte(s) of SDIO host registers",
         mmio.len()
     ));
+    // THE VISIONFIVE'S RADIO STOPS HERE FOR NOW (docs/wifi-aic8800.md 7, V0). Everything below drives the
+    // Pi 4's Arasan host and CYW43455; this board's AIC8800 needs its own host and protocol (V1 onward).
+    #[cfg(wifi_host_dw_mmc)]
+    v0_dw_mmc(&ctx, &mmio);
     // THE CLOCK, BEFORE ANYTHING TOUCHES THE CHIP: a lease from `power` holds the Arm cores fast for the
     // bring-up, and every exit below hands it back (docs/power.md, docs/wifi.md 55).
     let lease = clock_lease(&ctx);

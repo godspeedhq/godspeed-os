@@ -87,7 +87,7 @@ inherits it rather than rediscovering it.
 
 ## The edges: what you will touch anyway
 
-Zero was the goal and zero is not reached: there are **46 arch-conditional sites outside `arch/`**. They
+Zero was the goal and zero is not reached: there are **55 arch-conditional sites outside `arch/`**. They
 are listed here by kind, with what each would take to close, because a number without a reason is
 just a number. The per-file counts are `SHARED-SURFACE.baseline.txt`, which the ratchet owns.
 
@@ -163,7 +163,7 @@ godspeed/
 │   └── ipc.rs                              [ 1 ]   - nothing. Keys on register width, not on you.
 │
 └── services/                                       above the kernel, where the real work is left
-    ├── supervisor/build.rs                 [ 9 ]   + ONE ARM per table. The designed place to
+    ├── supervisor/build.rs                 [16 ]   + ONE ARM per table. The designed place to
     │                                                 answer; it sets has_xhci / has_dwc2 /
     │                                                 has_hw_enumerator so main.rs needs nothing.
     ├── supervisor/src/main.rs              [ 4 ]   + one arm IF your storage or NIC sits behind a
@@ -179,6 +179,8 @@ godspeed/
     ├── shell/build.rs                      [ 2 ]   - nothing. Derived from CARGO_CFG_TARGET_ARCH.
     │                                                 Add a line only for a project-specific name,
     │                                                 as arm32 has.
+    ├── wifi-driver/build.rs                [ 2 ]   + one arm IF your board has a radio: which SD
+    │                                                 host it sits behind (dw_mmc or Arasan).
     ├── net-stack/src/main.rs               [ 1 ]   - nothing. The default is the wall-clock TSC
     │                                                 floor, which every non-x86 port has needed.
     └── every other service                 [ 0 ]   - do not touch.
@@ -187,8 +189,8 @@ godspeed/
 **Legend.** `★` write it. `+` add to it, and the guide above says what. `-` do not, and if you find
 yourself doing so, that is [the rule](#adding-an-isa-the-seam-the-edges-and-the-rule).
 
-**Totals, and they are the honest ones.** 46 arch-conditional sites outside `arch/`: 2 in the neutral
-kernel and 44 above it. Of the 44, **15 are "add one arm to a build table"** - designed, expected,
+**Totals, and they are the honest ones.** 55 arch-conditional sites outside `arch/`: 2 in the neutral
+kernel and 53 above it. Of the 53, **24 are "add one arm to a build table"** - designed, expected,
 and cheap. The other 29 split into the SDK's syscall body you will write anyway (4), the seam the SDK
 is designated for (7), and 18 across FOUR service files - `nic-driver` (10), `supervisor/src/main.rs`
 (4), `hw-enumerator` (3) and `net-stack` (1). Two of those four have an open backlog entry saying what

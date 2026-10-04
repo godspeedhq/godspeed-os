@@ -507,3 +507,6 @@ BRCMF_C_GET_PM                     # Linux brcmfmac fwil.h, cited as the source 
 BWFM_C_GET_PM                      # OpenBSD bwfmreg.h, the same command 85, cited so the two references agree in the comment - external, 26.14
 PM_FAST                            # Linux brcmfmac power-save mode constant, cited for what that driver sets by default - external, 26.14
 PAR_EL1                            # AArch64 system register: the Physical Address Register that an AT instruction writes its result to; arch/aarch64/ptables.rs at_probe reads it in a user-fault report - external, 26.14
+aic8800_bsp                        # AICSemi's out-of-tree bus/upload driver (radxa-pkg/aic8800 at 09c65d61), cited in services/wifi-driver for the radio's power hold-offs - external, 26.14
+gpio_wl_reg_on                     # StarFive vendor device-tree property naming GPIO 33 as the VisionFive radio's enable, cited in arch/riscv64/sdio.rs and mod.rs - external, 26.14
+mmc1_pins                          # Linux jh7110-common.dtsi pinctrl node whose pad settings arch/riscv64/sdio.rs copies for the radio's SD host - external, 26.14

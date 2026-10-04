@@ -339,9 +339,10 @@ mod board {
     /// every other board's NIC is on a bus its driver reaches directly.
     pub const NIC_PEERS: &[&str] = if cfg!(target_arch = "arm") {
         &["dwc2", "events"]
-    } else if cfg!(has_wifi_driver) {
+    } else if cfg!(nic_radio_bridge) {
         // The radio is the link's other backend where there is one (docs/wifi.md 2): the cable always
-        // wins, and when it is out nic-driver carries the frames to wifi-driver over the frame ops.
+        // wins, and when it is out nic-driver carries the frames to wifi-driver over the frame ops. A
+        // board fact of its own (build.rs): the VisionFive has the radio's driver but no such bridge.
         &["wifi-driver", "events"]
     } else {
         &["events"]

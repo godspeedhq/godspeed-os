@@ -1,6 +1,6 @@
 # WiFi on the VisionFive 2 Lite: the AIC8800D80 (design, 2026-10-04)
 
-**Status: DESIGN, nothing built.** This is the plan for the third radio in `docs/wifi.md`'s table and the
+**Status: DESIGN; phase V0 DONE and verified on the board 2026-10-04.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`) and a `wifi-driver` that proves it and then serves `no radio`; V1 onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
 second WiFi driver. `docs/wifi.md` section 44 identified the chip from the board's own boot log; the
 firmware is in `nonfree/aic8800d80/` (byte for byte what the board's vendor image loaded, with its
 licence position recorded there and in `docs/licensing.md` 5a). What follows is the hardware as the
@@ -236,7 +236,12 @@ command from a chip nobody has powered before. Everything after it is protocol.
 
 ## 9. UNVERIFIED - what the first cards must settle
 
-- The controller's `VERID` (so the FIFO offset) and `HCON` FIFO width - read at run time, printed at V0.
+- ~~The controller's `VERID` (so the FIFO offset) and `HCON` FIFO width.~~ **Settled by V0 (2026-10-04):**
+  `VERID = 0x5342290a` - version `0x290a`, so the FIFO is at `+0x200` - and `HCON = 0x00c43cc1`, whose
+  bits 9:7 read 1: a 32-bit FIFO. The same two values came back through the service's grant. The card
+  clock register read `0x80000002` (gate on, divider 2) after the census enabled it, so whether U-Boot left
+  it on is still not known; V1 sets the identification clock itself either way. GPIO 33 read 1 after the
+  census drove it, and the driver's power cycle read back 0 then 1.
 - Whether U-Boot leaves `mmc1`'s clocks, reset and pins configured. The design does all three itself, and
   all three are idempotent, so the answer only explains a result.
 - The exact load addresses - they come from parsing the patch table, which is the point of parsing it.

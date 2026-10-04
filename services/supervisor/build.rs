@@ -88,7 +88,10 @@ fn main() {
     // would want this empty, and would get that by saying so here rather than by becoming an exception
     // inside `main.rs`. The kernel still refuses the MMIO grant on a board whose census found no
     // controller, so an embedded-but-radioless build reports "no radio" and serves rather than dying.
-    let radio: &[&str] = if arch == "aarch64" { &["wifi-driver"] } else { &[] };
+    // riscv64 joined on 2026-10-04: the VisionFive 2 Lite's AIC8800D80 sits on its second SD host
+    // (docs/wifi-aic8800.md). Phase V0 grants the host and its power pin and the driver serves `no radio`
+    // until the AIC8800 protocol exists; on QEMU's `virt` no window is granted at all.
+    let radio: &[&str] = if arch == "aarch64" || arch == "riscv64" { &["wifi-driver"] } else { &[] };
 
     // The audio driver (docs/audio.md), a BOARD fact like `radio`: an Intel High Definition Audio
     // controller on x86 (the T630's chipset audio, QEMU's `intel-hda`), and on the Pis a 3.5 mm jack
@@ -123,11 +126,18 @@ fn main() {
     // `values(none())` because these are bare flags: `#[cfg(has_xhci)]`, never `has_xhci = "..."`.
     for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver", "has_audio_driver",
                  "has_pwm_audio", "pwm_audio_pi4",
-                 "xhci_msi", "nic_on_pci"] {
+                 "xhci_msi", "nic_on_pci", "nic_radio_bridge"] {
         println!("cargo::rustc-check-cfg=cfg({flag}, values(none()))");
     }
     for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()).chain(audio.iter()) {
         println!("cargo:rustc-cfg=has_{}", name.replace('-', "_"));
+    }
+    // Whether `nic-driver` carries frames to the radio when the cable is out (docs/wifi.md 2). Only its
+    // Pi 4 backend (GENET) has that bridge, so only there does it get `wifi-driver` as a peer. A separate
+    // fact from `has_wifi_driver`: the VisionFive embeds the radio's driver and has no bridge, and a peer
+    // nic-driver never calls would be standing authority for nothing (3.1).
+    if arch == "aarch64" {
+        println!("cargo:rustc-cfg=nic_radio_bridge");
     }
     // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides
     // between the `pci_irq` hardware class and the plain one. NOT the same question as "is it on

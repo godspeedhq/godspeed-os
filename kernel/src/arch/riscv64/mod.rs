@@ -13,6 +13,7 @@ pub mod sv39;
 pub mod context_switch;
 pub mod display;
 mod net;
+mod sdio;
 mod usb;
 pub mod syscall;
 pub mod trap;
@@ -781,6 +782,26 @@ riscv64: S-mode entered, 16550 UART alive
             net::set_bases(aon, sys.unwrap_or(0), mac, net_syscon);
             net::init();
         }
+
+        // THE RADIO'S SD HOST, last of all and for the same reason: a read into an unclocked block on
+        // this interconnect stalls, so it goes where a stall still leaves the whole boot log readable
+        // (docs/wifi-aic8800.md 3, V0). The SECOND `jh7110-mmc` node is the board's fact - the first is
+        // the SD card this board boots from, which is never touched - and `sdio::init` prints the address
+        // it found so the log shows which one it took.
+        {
+            let mut w15: [Option<u32>; 0] = [];
+            let host = tree
+                .find_compatible_nth("starfive,jh7110-mmc", 1, &[], &mut w15)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            let mut w16: [Option<u32>; 0] = [];
+            let pinctrl = tree
+                .find_compatible("starfive,jh7110-sys-pinctrl", &[], &mut w16)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            sdio::set_bases(sys.unwrap_or(0), pinctrl, host);
+            sdio::init();
+        }
     }
 
     // What the firmware beneath us offers. Probed rather than assumed: the two machines disagree
@@ -1072,19 +1093,45 @@ pub fn ap_init(core_id: u32) { unimplemented!("riscv64::ap_init") }
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
-/// Non-PCI fixed-physical peripheral MMIO grant (ARM Pi path); no fixed windows on this arch stub.
-pub fn map_fixed_device(_pt: &mut page_tables::PageTable, _kind: u32) -> Option<(u64, u64)> { None }
+/// Where a fixed peripheral window is mapped in the service that is granted it - the same address the
+/// Pi ports use, between the heap and the DMA arena.
+pub const DRIVER_MMIO_VA: u64 = 0x6000_0000;
+
+/// A fixed-physical peripheral window, granted BY DEVICE KIND, never by service name (`docs/audio.md`,
+/// "No service names in the kernel"). One on this port: the VisionFive's WiFi radio's SD host, `mmc1`,
+/// and only where the boot census saw it answer (`sdio::present`) - QEMU's `virt` has none, so it gets
+/// nothing. One page: the `dw_mmc` registers and its FIFO window (at +0x100 or +0x200) both fit in it.
+pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u64, u64)> {
+    use crate::memory::frame::PhysAddr;
+    use page_tables::{PageFlags, VirtAddr};
+    if kind != crate::task::kind::WIFI_SDIO {
+        return None;
+    }
+    let phys = sdio::window();
+    if phys == 0 {
+        return None;
+    }
+    let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+        | PageFlags::NO_EXEC | PageFlags::PCD;
+    pt.map(VirtAddr(DRIVER_MMIO_VA), PhysAddr(phys), flags).ok()?;
+    Some((DRIVER_MMIO_VA, 0x1000))
+}
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
 pub fn hw_random() -> Option<u32> { None }
 
-/// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
-/// one board with it is the Pi 4 (`arch/aarch64`), whose radio returns to power-on only when WL_ON is
-/// cut. `false` is the honest answer; the syscall reports it as "no control over it".
-pub fn device_power_control(_kind: u32) -> bool { false }
-pub fn device_power(_kind: u32, _on: bool) -> bool { false }
+/// Device power behind a fixed peripheral window (`DevicePower`, syscall 54). On the VisionFive it is the
+/// radio's enable, GPIO 33 (`gpio_wl_reg_on` in the vendor tree), and only where the census saw the
+/// radio's SD host answer. How long to hold it off, and how long to wait after, is the driver's (26.10).
+pub fn device_power_control(kind: u32) -> bool {
+    kind == crate::task::kind::WIFI_SDIO && sdio::present()
+}
+/// Drive that pin. The result follows the pad's READ-BACK, as the Pi 4's does (CLAUDE.md 12.3).
+pub fn device_power(kind: u32, on: bool) -> bool {
+    kind == crate::task::kind::WIFI_SDIO && sdio::set_radio_power(on)
+}
 
 /// The Arm cores' clock (`CpuClock`, syscall 55): no control on this port. The one board with it is the
 /// Pi 4 (`arch/aarch64`), whose firmware takes a rate request over the mailbox. `None` is the honest
@@ -2418,9 +2465,12 @@ pub mod rtc {
 /// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
 /// See the x86 original for why this is not a second source for `pci::nic()`.
 pub fn soc_nic_present() -> bool { false }
-/// Is a device of this fixed kind (`task::kind`) on this board? None here: the arch answers by KIND,
-/// never by the name of a service (`docs/audio.md`, "No service names in the kernel").
-pub fn fixed_device_present(_kind: u32) -> bool { false }
+/// Is a device of this fixed kind (`task::kind`) on this board? The arch answers by KIND, never by the
+/// name of a service (`docs/audio.md`, "No service names in the kernel"). One on this port: the
+/// VisionFive's WiFi radio's SD host, where the boot census saw it answer.
+pub fn fixed_device_present(kind: u32) -> bool {
+    kind == crate::task::kind::WIFI_SDIO && sdio::present()
+}
 
 // PCI seam. QEMU `virt` DOES have a PCIe host bridge (ECAM at 0x3000_0000, described in the FDT), and
 // the VisionFive 2 has one too - so unlike arm32 this is a stub by STAGE, not by platform. Everything

@@ -38,6 +38,15 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ld.display());
     println!("cargo:rustc-link-arg=--entry=service_main");
 
+    // WHICH SD HOST this build drives - a BOARD fact, stated once here, so the service never infers its
+    // board from its instruction set at a call site. riscv64 is the VisionFive 2 Lite, whose radio (an
+    // AIC8800D80) sits on a DesignWare `dw_mmc` (docs/wifi-aic8800.md); aarch64 is the Pi 4's Arasan and
+    // the CYW43455. On QEMU's `virt` the kernel grants no window, and the service reports no radio.
+    println!("cargo::rustc-check-cfg=cfg(wifi_host_dw_mmc, values(none()))");
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv64") {
+        println!("cargo:rustc-cfg=wifi_host_dw_mmc");
+    }
+
     // The vendored blobs, whose licence and provenance `scripts/nonfree_check.py` enforces on every build.
     // Named here rather than reached with a relative `include_bytes!` path for the reason the supervisor
     // does the same for service ELFs: the path is computed once, in one place, and `rerun-if-changed`

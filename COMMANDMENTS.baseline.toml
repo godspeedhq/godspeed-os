@@ -523,6 +523,11 @@ CPU_CLOCK          = 18
 "riscv64/display.rs"          = "console"
 "riscv64/usb.rs"              = "discovery"
 "riscv64/net.rs"              = "discovery"
+# The VisionFive's WiFi radio's SD host (docs/wifi-aic8800.md, V0): clocks, reset and pins in the
+# SHARED clock and GPIO blocks, the radio's enable pin, and a census read of VERID/HCON before the
+# window is granted by kind. Discovery, like net.rs beside it: it sends nothing to the card, and the
+# AIC8800 driver is `services/wifi-driver`.
+"riscv64/sdio.rs"             = "discovery"
 "riscv64/fdt.rs"              = "discovery"
 "riscv64/sbi.rs"              = "clock"
 "riscv64/sv39.rs"             = "mmu"

@@ -221,8 +221,11 @@ These are the laws that bound every design choice. Any change that violates an i
 > (`shared_surface_check.py`); the neutral kernel had none.
 >
 > It does now - the same one, which is the honest shape since it is one property asked of two layers.
-> **The standing figure is 46 arch-conditional sites outside `arch/`: 2 in the neutral kernel, 44
-> above it.** It may fall freely and may not rise without a recorded reason. What is left is listed
+> **The standing figure is 55 arch-conditional sites outside `arch/`: 2 in the neutral kernel, 53
+> above it** (46 and 44 when this was written; the rise is board facts in `services/supervisor/build.rs` and
+> `services/wifi-driver/build.rs` - the Pi 4's radio (+1), the audio drivers (+4) and, on 2026-10-04,
+> the VisionFive's radio and nic-driver's radio bridge as its own fact (+4) - blessed together that day; `docs/porting.md` has the per-file tree). It may fall freely and may not rise without a
+> recorded reason. What is left is listed
 > rather than implied. **The neutral kernel is down to 2**, and both are `target_pointer_width` on
 > one constant - a 32-bit address space genuinely cannot hold a 4 GiB virtual address, so the width
 > IS the question rather than an ISA standing in for one. Above the kernel, `nic-driver` picks its MAC by ISA on three
