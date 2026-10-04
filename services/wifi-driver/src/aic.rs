@@ -165,17 +165,27 @@ fn free_buffers(h: &dyn SdioHost, ctx: &ServiceContext) -> u8 {
     }
 }
 
+/// The largest frame the vendor driver sends, `CMD_BUF_MAX`: a block write's 1032 parameter bytes and its
+/// headers, rounded to three 512-byte blocks.
+const FRAME_MAX: usize = 1536;
+
 /// Build and send one host-to-chip message (`rwnx_set_cmd_tx` + `aicwf_sdio_tx_msg`): the 4-byte bus header
 /// `[len lo, len hi (4 bits), 0x11, crc8]` where `len` counts what follows it, a zero word, the 8-byte
-/// message header `{id, dest, src, param_len}`, the parameters, then zeros to a whole 512-byte block.
-fn send_msg(h: &dyn SdioHost, id: u16, dest: u16, param: &[u8], ctx: &ServiceContext) -> bool {
-    let msg_len = 8 + param.len();
-    let len = msg_len + 4; // the dummy word, then the message
-    let mut frame = [0u8; BLOCK as usize];
-    if 4 + len + 4 > frame.len() {
-        ctx.log("wifi-driver: AIC message too long for one block - not sent");
+/// message header `{id, dest, src, param_len}`, the parameters; then, if that is not a whole number of
+/// 512-byte blocks, a 4-byte zero tail and zeros up to the next whole block. A frame of one block goes in
+/// byte mode and a longer one in block mode (`sd::write_fifo`, the Linux core's choice). `quiet` drops the
+/// per-message line, for the upload's hundreds of blocks.
+fn send_msg(h: &dyn SdioHost, id: u16, dest: u16, param: &[u8], quiet: bool, ctx: &ServiceContext) -> bool {
+    let len = 4 + 8 + param.len(); // the dummy word, the message header, the parameters
+    let mut total = (4 + len + 3) & !3;
+    if total % BLOCK as usize != 0 {
+        total = (total + 4).div_ceil(BLOCK as usize) * BLOCK as usize;
+    }
+    if total > FRAME_MAX || len > 0xfff {
+        ctx.log_fmt(format_args!("wifi-driver: AIC message {:#06x} is {} bytes, past the {}-byte frame - not sent", id, total, FRAME_MAX));
         return false;
     }
+    let mut frame = [0u8; FRAME_MAX];
     frame[0] = (len & 0xff) as u8;
     frame[1] = ((len >> 8) & 0x0f) as u8;
     frame[2] = TYPE_CMD;
@@ -187,26 +197,32 @@ fn send_msg(h: &dyn SdioHost, id: u16, dest: u16, param: &[u8], ctx: &ServiceCon
     frame[m + 6..m + 8].copy_from_slice(&(param.len() as u16).to_le_bytes());
     frame[m + 8..m + 8 + param.len()].copy_from_slice(param);
 
+    // Sent only when the chip has MORE room than the frame: `len < buffer_cnt * BUFFER_SIZE`, strictly, so
+    // a three-block frame needs two free buffers.
     let n = free_buffers(h, ctx);
-    if n == 0 || BLOCK >= n as u32 * FW_BUFFER {
+    if n == 0 || total as u32 >= n as u32 * FW_BUFFER {
         ctx.log_fmt(format_args!(
-            "wifi-driver: AIC flow control reports {} free firmware buffer(s) after 20 ms - the message was not sent", n));
+            "wifi-driver: AIC flow control reports {} free firmware buffer(s) after 20 ms, {} needed for {} bytes - message {:#06x} was not sent",
+            n, total / FW_BUFFER as usize + 1, total, id));
         return false;
     }
-    let mut words = [0u32; BLOCK as usize / 4];
-    for (i, w) in words.iter_mut().enumerate() {
+    if !quiet {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: AIC sending message {:#06x} to task {} ({} parameter byte(s); header {:02x} {:02x} {:02x} {:02x}; {} free buffer(s))",
+            id, dest, param.len(), frame[0], frame[1], frame[2], frame[3], n));
+    }
+    // The frame becomes words in place of a second buffer: the FIFO takes them little-endian.
+    let mut words = [0u32; FRAME_MAX / 4];
+    for (i, w) in words[..total / 4].iter_mut().enumerate() {
         *w = u32::from_le_bytes([frame[4 * i], frame[4 * i + 1], frame[4 * i + 2], frame[4 * i + 3]]);
     }
-    ctx.log_fmt(format_args!(
-        "wifi-driver: AIC sending message {:#06x} to task {} ({} parameter byte(s); header {:02x} {:02x} {:02x} {:02x}; {} free buffer(s))",
-        id, dest, param.len(), frame[0], frame[1], frame[2], frame[3], n));
-    sd::write_fifo(h, F1, REG_WR_FIFO, &mut words, BLOCK, ctx)
+    sd::write_fifo(h, F1, REG_WR_FIFO, &mut words[..total / 4], BLOCK, ctx)
 }
 
 /// Poll for what the chip has to say, as `aicwf_sdio_hal_irqhandler` would on an interrupt: read the status
 /// register; acknowledge a soft interrupt; and when it names a length, read that much from the read FIFO.
 /// Returns the number of bytes read into `buf`, 0 when nothing came within `budget`.
-fn receive(h: &dyn SdioHost, buf: &mut [u32; RX_MAX_BLOCKS * BLOCK as usize / 4], budget: Budget, ctx: &ServiceContext) -> usize {
+fn receive(h: &dyn SdioHost, buf: &mut [u32; RX_MAX_BLOCKS * BLOCK as usize / 4], budget: Budget, quiet: bool, ctx: &ServiceContext) -> usize {
     let mut d = wait::Deadline::paced(ctx, budget, Budget::ms(1));
     let mut looks = 0u32;
     loop {
@@ -230,8 +246,10 @@ fn receive(h: &dyn SdioHost, buf: &mut [u32; RX_MAX_BLOCKS * BLOCK as usize / 4]
             } else {
                 (st & 0x7f) as usize * BLOCK as usize
             };
-            ctx.log_fmt(format_args!(
-                "wifi-driver: AIC status {:#04x} after {} look(s) - {} byte(s) to read", st, looks, bytes));
+            if !quiet {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: AIC status {:#04x} after {} look(s) - {} byte(s) to read", st, looks, bytes));
+            }
             if bytes == 0 || bytes > buf.len() * 4 || bytes % 4 != 0 {
                 ctx.log("wifi-driver: AIC reply length is not one this first exchange reads - left unread");
                 return 0;
@@ -249,11 +267,12 @@ fn receive(h: &dyn SdioHost, buf: &mut [u32; RX_MAX_BLOCKS * BLOCK as usize / 4]
     }
 }
 
+
 /// Find the confirm `want` among the packets in `bytes` (`aicwf_process_rxframes`): each packet starts with
 /// a 16-bit length and a type byte; a configuration packet's message sits right after its 4-byte header as
 /// `{id, dest, src, param_len, pattern, param...}`, and a data packet is skipped with its hardware header.
-/// Returns the message's parameters.
-fn find_cfm(bytes: &[u8], want: u16, ctx: &ServiceContext) -> Option<[u8; 8]> {
+/// Returns the confirm's parameter length and its first eight parameter bytes (zero past its length).
+fn find_cfm(bytes: &[u8], want: u16, quiet: bool, ctx: &ServiceContext) -> Option<(usize, [u8; 8])> {
     let mut at = 0usize;
     let mut packets = 0u32;
     while at + 4 <= bytes.len() && packets < 16 {
@@ -272,48 +291,75 @@ fn find_cfm(bytes: &[u8], want: u16, ctx: &ServiceContext) -> Option<[u8; 8]> {
         if ty & 0x7f == TYPE_CFG_CMD_RSP && m + 12 <= bytes.len() {
             let id = u16::from_le_bytes([bytes[m], bytes[m + 1]]);
             let param_len = u16::from_le_bytes([bytes[m + 6], bytes[m + 7]]) as usize;
-            ctx.log_fmt(format_args!(
-                "wifi-driver: AIC receive - message {:#06x} with {} parameter byte(s) (packet type {:#04x}, length {})",
-                id, param_len, ty, plen));
-            if id == want && param_len >= 8 && m + 12 + 8 <= bytes.len() {
+            if !quiet || id != want {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: AIC receive - message {:#06x} with {} parameter byte(s) (packet type {:#04x}, length {})",
+                    id, param_len, ty, plen));
+            }
+            if id == want {
                 let mut p = [0u8; 8];
-                p.copy_from_slice(&bytes[m + 12..m + 20]);
-                return Some(p);
+                let n = param_len.min(8).min(bytes.len().saturating_sub(m + 12));
+                p[..n].copy_from_slice(&bytes[m + 12..m + 12 + n]);
+                return Some((param_len, p));
             }
         } else {
             ctx.log_fmt(format_args!("wifi-driver: AIC receive - a configuration packet of type {:#04x}, length {}", ty, plen));
         }
         at += ((plen + 3) & !3) + 4;
     }
+    if !quiet {
+        ctx.log_fmt(format_args!("wifi-driver: AIC receive - no {:#06x} confirm among {} packet(s)", want, packets));
+    }
     None
 }
 
-/// Read one 32-bit word of the chip's memory through its ROM: `DBG_MEM_READ_REQ` out, `DBG_MEM_READ_CFM`
-/// back with `{memaddr, memdata}`. `None` when any step failed, which the lines before it name.
-pub fn mem_read(h: &dyn SdioHost, addr: u32, ctx: &ServiceContext) -> Option<u32> {
-    if !send_msg(h, DBG_MEM_READ_REQ, TASK_DBG, &addr.to_le_bytes(), ctx) {
+/// One request to the chip's ROM and its confirm: send `id` with `param`, poll for the reply, find `cfm`.
+/// Returns the confirm's parameter length and first eight bytes. `quiet` keeps a successful exchange off
+/// the log; a failure always says which step it was.
+fn request(h: &dyn SdioHost, id: u16, param: &[u8], cfm: u16, quiet: bool, ctx: &ServiceContext) -> Option<(usize, [u8; 8])> {
+    if !send_msg(h, id, TASK_DBG, param, quiet, ctx) {
         return None;
     }
     let mut buf = [0u32; RX_MAX_BLOCKS * BLOCK as usize / 4];
-    let n = receive(h, &mut buf, Budget::ms(1_000), ctx);
+    let n = receive(h, &mut buf, Budget::ms(1_000), quiet, ctx);
     if n == 0 {
+        if quiet {
+            ctx.log_fmt(format_args!("wifi-driver: AIC request {:#06x} got no reply", id));
+        }
         return None;
     }
     let mut bytes = [0u8; RX_MAX_BLOCKS * BLOCK as usize];
     for (i, w) in buf[..n / 4].iter().enumerate() {
         bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
     }
-    ctx.log_fmt(format_args!(
-        "wifi-driver: AIC receive - first 16 bytes {:02x?}", &bytes[..16.min(n)]));
-    let p = find_cfm(&bytes[..n], DBG_MEM_READ_CFM, ctx)?;
-    let got_addr = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-    let data = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
-    if got_addr != addr {
+    if !quiet {
+        ctx.log_fmt(format_args!("wifi-driver: AIC receive - first 16 bytes {:02x?}", &bytes[..16.min(n)]));
+    }
+    let r = find_cfm(&bytes[..n], cfm, quiet, ctx);
+    if r.is_none() && quiet {
         ctx.log_fmt(format_args!(
-            "wifi-driver: AIC memory read confirm names {:#010x}, not the {:#010x} asked for", got_addr, addr));
+            "wifi-driver: AIC request {:#06x} - the reply held no {:#06x} confirm (first 16 bytes {:02x?})",
+            id, cfm, &bytes[..16.min(n)]));
+    }
+    r
+}
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// Read one 32-bit word of the chip's memory through its ROM: `DBG_MEM_READ_REQ` out, `DBG_MEM_READ_CFM`
+/// back with `{memaddr, memdata}`. `None` when any step failed, which the lines before it name.
+pub fn mem_read(h: &dyn SdioHost, addr: u32, quiet: bool, ctx: &ServiceContext) -> Option<u32> {
+    let (len, p) = request(h, DBG_MEM_READ_REQ, &addr.to_le_bytes(), DBG_MEM_READ_CFM, quiet, ctx)?;
+    let got_addr = le32(&p, 0);
+    if len < 8 || got_addr != addr {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: AIC memory read confirm names {:#010x} with {} parameter byte(s), not {:#010x} with 8",
+            got_addr, len, addr));
         return None;
     }
-    Some(data)
+    Some(le32(&p, 4))
 }
 
 /// Phase V2's first exchange: set up, wake, read the chip id. Returns the word at `CHIP_ID_ADDR`.
@@ -321,5 +367,139 @@ pub fn first_exchange(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<u32> {
     if !setup(h, ctx) || !wake(h, ctx) {
         return None;
     }
-    mem_read(h, CHIP_ID_ADDR, ctx)
+    mem_read(h, CHIP_ID_ADDR, false, ctx)
+}
+
+// ------------------------------------------------------------------------------ the upload (V2)
+
+const DBG_MEM_BLOCK_WRITE_REQ: u16 = 0x040B;
+const DBG_MEM_BLOCK_WRITE_CFM: u16 = 0x040C;
+/// A block write's data field: always sent whole, the real size in `memsize` (`dbg_mem_block_write_req`).
+const BLOCK_WRITE_DATA: usize = 1024;
+
+/// Where the patch table says the patches go: its first group, `AICBT_PINF_T` (type 0), read as
+/// `aicbt_patch_info_unpack` reads it - the ADID's address in its first pair's value, the ROM patch's in
+/// the second's, the extension patch count in the fifth's, then `(id, address)` per extension patch.
+pub struct PatchInfo {
+    pub adid: u32,
+    pub patch: u32,
+    pub ext0: u32,
+}
+
+/// The table's groups as `(name, type, pairs)`, walked as `aicbt_patch_table_alloc` walks them: a 16-byte
+/// file tag, then `name[16], type u32, len u32, len * (addr u32, value u32)` to the end of the file.
+pub struct Groups<'t> {
+    t: &'t [u8],
+    at: usize,
+}
+
+impl<'t> Groups<'t> {
+    pub fn new(t: &'t [u8]) -> Option<Self> {
+        if t.len() < 16 || &t[..12] != b"AICBT_PT_TAG" {
+            return None;
+        }
+        Some(Groups { t, at: 16 })
+    }
+}
+
+impl<'t> Iterator for Groups<'t> {
+    /// `(name, type, the pairs' bytes)`.
+    type Item = (&'t [u8], u32, &'t [u8]);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at + 24 > self.t.len() {
+            return None;
+        }
+        let name = &self.t[self.at..self.at + 16];
+        let ty = le32(self.t, self.at + 16);
+        let len = le32(self.t, self.at + 20) as usize;
+        let start = self.at + 24;
+        let end = start.checked_add(len.checked_mul(8)?)?;
+        if end > self.t.len() {
+            return None;
+        }
+        self.at = end;
+        let name_len = name.iter().position(|&b| b == 0).unwrap_or(16);
+        Some((&name[..name_len], ty, &self.t[start..end]))
+    }
+}
+
+/// Read the load addresses out of the table's first group, refusing a table that does not have the shape
+/// this file's has: a type-0 group first, at least six pairs, exactly one extension patch, id 0.
+pub fn patch_info(table: &[u8], ctx: &ServiceContext) -> Option<PatchInfo> {
+    let Some(mut g) = Groups::new(table) else {
+        ctx.log("wifi-driver: AIC patch table does not start with its AICBT_PT_TAG - not used");
+        return None;
+    };
+    let Some((name, ty, d)) = g.next() else {
+        ctx.log("wifi-driver: AIC patch table has no first group");
+        return None;
+    };
+    let w = |i: usize| le32(d, 4 * i);
+    if ty != 0 || d.len() < 6 * 8 || w(9) != 1 || w(10) != 0 {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: AIC patch table's first group is {:?} type {} with {} pair(s) - not the information group this driver reads",
+            core::str::from_utf8(name).unwrap_or("?"), ty, d.len() / 8));
+        return None;
+    }
+    let info = PatchInfo { adid: w(1), patch: w(3), ext0: w(11) };
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC patch table - ADID at {:#010x}, patch at {:#010x}, extension patch 0 at {:#010x}",
+        info.adid, info.patch, info.ext0));
+    Some(info)
+}
+
+/// Write `bytes` into the chip's memory at `addr` in 1 KiB block writes, each confirmed
+/// (`rwnx_plat_bin_fw_upload_android`): every chunk 1024 bytes but the last, which carries its real size.
+pub fn upload(h: &dyn SdioHost, what: &str, addr: u32, bytes: &[u8], ctx: &ServiceContext) -> bool {
+    let mut param = [0u8; 8 + BLOCK_WRITE_DATA];
+    let mut off = 0usize;
+    let mut blocks = 0u32;
+    let d = wait::Deadline::start(ctx, Budget::ms(600_000));
+    while off < bytes.len() {
+        let n = (bytes.len() - off).min(BLOCK_WRITE_DATA);
+        param[..4].copy_from_slice(&(addr + off as u32).to_le_bytes());
+        param[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        param[8..8 + n].copy_from_slice(&bytes[off..off + n]);
+        param[8 + n..].fill(0);
+        match request(h, DBG_MEM_BLOCK_WRITE_REQ, &param, DBG_MEM_BLOCK_WRITE_CFM, true, ctx) {
+            Some((_, p)) if le32(&p, 0) == 0 => {}
+            Some((len, p)) => {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: AIC upload of {} - block {} at {:#010x} confirmed with status {:#010x} ({} parameter bytes), not 0; stopped",
+                    what, blocks, addr + off as u32, le32(&p, 0), len));
+                return false;
+            }
+            None => {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: AIC upload of {} stopped at block {} ({:#010x}), {} of {} bytes sent",
+                    what, blocks, addr + off as u32, off, bytes.len()));
+                return false;
+            }
+        }
+        off += n;
+        blocks += 1;
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC uploaded {} - {} bytes to {:#010x} in {} block write(s), every one confirmed, {} ms",
+        what, bytes.len(), addr, blocks, d.elapsed_us() / 1000));
+    true
+}
+
+/// Read the first word back from where a file went and compare it with the file's. A confirm says the ROM
+/// took the write; this says the memory holds it.
+pub fn check_first_word(h: &dyn SdioHost, what: &str, addr: u32, bytes: &[u8], ctx: &ServiceContext) -> bool {
+    let want = le32(bytes, 0);
+    match mem_read(h, addr, true, ctx) {
+        Some(got) if got == want => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: AIC {} reads back {:#010x} at {:#010x} - the file's first word", what, got, addr));
+            true
+        }
+        Some(got) => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: AIC {} reads back {:#010x} at {:#010x}, the file says {:#010x}", what, got, addr, want));
+            false
+        }
+        None => false,
+    }
 }

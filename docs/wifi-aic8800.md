@@ -1,6 +1,6 @@
 # WiFi on the VisionFive 2 Lite: the AIC8800D80 (design, 2026-10-04)
 
-**Status: DESIGN; phases V0 and V1 DONE and verified on the board 2026-10-04, and V2's first exchange (the data phase and one message to the chip's ROM, revision 7 read back) the same day.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver answers `radio down` with the reason `DOWN_NOT_BUILT`. The rest of V2 (the upload) onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
+**Status: DESIGN; phases V0 and V1 DONE and verified on the board 2026-10-04, and V2's first two cards the same day: the data phase and a message to the chip's ROM (revision 7 read back), then the three patches uploaded where the patch table says and read back.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver answers `radio down` with the reason `DOWN_NOT_BUILT`. The rest of V2 (the upload) onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
 second WiFi driver. `docs/wifi.md` section 44 identified the chip from the board's own boot log; the
 firmware is in `nonfree/aic8800d80/` (byte for byte what the board's vendor image loaded, with its
 licence position recorded there and in `docs/licensing.md` 5a). What follows is the hardware as the
@@ -163,6 +163,24 @@ untested part of the exchange. **The framing is right on both sides**: the chip 
 and the message layout, and the receive side has no dummy word (the message starts right after the
 4-byte header, with the vendor's extra `pattern` word before the parameters). Still at the identification clock;
 whether the upload needs the vendor's 5 MHz or tolerates more is the next card's question.
+
+**V2's second card: the three patches (2026-10-04).** The five files are embedded in the riscv64 build
+(`aic_fw.rs`, hashed against the build's measurement at boot, as the CYW43455's are), the load addresses
+are read from the patch table's information group rather than assumed, and each file goes in 1 KiB
+`DBG_MEM_BLOCK_WRITE_REQ` messages - three-block CMD53s, the first multi-block transfers this host has
+made. Every line predicted: the table gave ADID `0x00201940`, patch `0x001e0000`, extension patch
+`0x0020b43c`; 2 + 31 + 13 block writes, every confirm status 0; and the first word read back from each
+address matched its file (`0x000ee5fd`, `0x00004770`, `0x4c05b510`). About one second from the first
+block to the last read-back.
+
+**One number this card got wrong, recorded rather than explained (26.7).** The prediction was 2-3 s, and
+it was ~1 s: the patch's 31 blocks took 651 ms, 21 ms each. Each is 1536 bytes out and a 512-byte reply in,
+about 41 ms of bit time on ONE data line at 400 kHz - so either the card clock is higher than the 399,193 Hz
+the driver computes, or something else is not as believed (`CTYPE` is 0 and the CCCR's bus interface reads
+1-bit, so it is not a wider bus that nobody set). The likeliest is that `CIU_HZ` is not 49.5 MHz: that
+figure is the vendor kernel's arithmetic from the device tree, never a measurement. If so, identification
+also runs above the 400 kHz the SD specification allows before a card is selected - which this chip has
+tolerated on every boot, and another might not. Open until something measures the card clock itself.
 
 ## 5. The AIC8800 bus and the firmware upload
 

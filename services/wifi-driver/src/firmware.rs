@@ -60,7 +60,7 @@ pub static CLM: &[u8] = include_bytes!(env!("WIFI_FW_CLM"));
 ///
 /// It is also why the bytes survive linking at all: dead data is dropped, and this makes them not dead.
 /// That is a real use rather than a trick - the same pass that retains them is the one that verifies them.
-fn fnv1a(bytes: &[u8]) -> u32 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for b in bytes {
         h ^= *b as u32;
@@ -80,7 +80,7 @@ const CLM_FNV: u32 = konst_u32(env!("WIFI_FW_CLM_FNV"));
 
 /// Parse a decimal `u32` at compile time, since `env!` yields a string and `no_std` has no `parse` in
 /// const context.
-const fn konst_u32(s: &str) -> u32 {
+pub(crate) const fn konst_u32(s: &str) -> u32 {
     let b = s.as_bytes();
     let mut i = 0;
     let mut v: u32 = 0;

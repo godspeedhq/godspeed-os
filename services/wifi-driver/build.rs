@@ -103,4 +103,40 @@ fn main() {
         }
         println!("cargo:rustc-env={}_FNV={}", var, h);
     }
+
+    // THE VISIONFIVE'S RADIO, the AIC8800D80 (`docs/wifi-aic8800.md` 5, phase V2): the patch table, the two
+    // ROM patches, the extension patch and the full-MAC firmware, embedded for the reason the CYW43455's
+    // are (`firmware.rs`). Only where that radio is driven - the riscv64 build - so the Pi 4's image does
+    // not carry 375 KB it never uploads. Same refusal, same length and hash, read by `aic_fw.rs`.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv64") {
+        let dir = workspace.join("nonfree").join("aic8800d80");
+        for (var, name) in [
+            ("AIC_FW_TABLE", "fw_patch_table_8800d80_u02.bin"),
+            ("AIC_FW_ADID", "fw_adid_8800d80_u02.bin"),
+            ("AIC_FW_PATCH", "fw_patch_8800d80_u02.bin"),
+            ("AIC_FW_EXT0", "fw_patch_8800d80_u02_ext0.bin"),
+            ("AIC_FW_FMAC", "fmacfw_8800d80_u02.bin"),
+        ] {
+            let path = dir.join(name);
+            if !path.exists() {
+                panic!(
+                    "wifi-driver: {} is missing ({}). It is the AIC8800D80's firmware, vendored in this \
+                     repository - see nonfree/aic8800d80/PROVENANCE. Without it the VisionFive's radio \
+                     cannot be started.",
+                    name,
+                    path.display()
+                );
+            }
+            println!("cargo:rustc-env={}={}", var, path.display());
+            println!("cargo:rerun-if-changed={}", path.display());
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("wifi-driver: cannot read {}: {}", path.display(), e));
+            let mut h: u32 = 0x811c_9dc5;
+            for b in &bytes {
+                h ^= *b as u32;
+                h = h.wrapping_mul(0x0100_0193);
+            }
+            println!("cargo:rustc-env={}_FNV={}", var, h);
+        }
+    }
 }

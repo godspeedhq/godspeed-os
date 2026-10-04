@@ -46,6 +46,8 @@ mod bus;
 #[cfg(wifi_host_dw_mmc)]
 mod aic;
 #[cfg(wifi_host_dw_mmc)]
+mod aic_fw;
+#[cfg(wifi_host_dw_mmc)]
 mod dwmmc;
 mod ctrl;
 mod frames;
@@ -343,14 +345,43 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
         }
     };
     // ---- Stage 5 (V2, first exchange): one message to the chip's ROM and its answer. -------------------
-    if is_d80 {
+    let rev = if is_d80 {
         match aic::first_exchange(&h, ctx) {
-            Some(w) => ctx.log_fmt(format_args!(
-                "wifi-driver: stage 5 - the chip's ROM answered: {:#010x} at {:#010x}, chip revision {} ({}){}",
-                w, aic::CHIP_ID_ADDR, (w >> 16) & 0x3f,
-                match (w >> 16) & 0x3f { 1 => "U01", 3 => "U02", 7 => "U03", _ => "not one the vendor driver names" },
-                if (w >> 16) & 0xc0 == 0xc0 { ", the H variant" } else { "" })),
-            None => ctx.log("wifi-driver: stage 5 - the first message to the chip's ROM got no confirm; the lines above say which step"),
+            Some(w) => {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: stage 5 - the chip's ROM answered: {:#010x} at {:#010x}, chip revision {} ({}){}",
+                    w, aic::CHIP_ID_ADDR, (w >> 16) & 0x3f,
+                    match (w >> 16) & 0x3f { 1 => "U01", 3 => "U02", 7 => "U03", _ => "not one the vendor driver names" },
+                    if (w >> 16) & 0xc0 == 0xc0 { ", the H variant" } else { "" }));
+                Some((w >> 16) & 0xff)
+            }
+            None => {
+                ctx.log("wifi-driver: stage 5 - the first message to the chip's ROM got no confirm; the lines above say which step");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // ---- Stage 6 (V2, second card): the three patches, to where the patch table says. ----------------
+    // The `u02` files serve revisions 3 and 7 of the non-H part (`aicbsp_driver_fw_init`); anything else
+    // would need files this directory does not carry, so it is not attempted.
+    if matches!(rev, Some(3) | Some(7)) && aic_fw::verify(ctx) {
+        if let Some(pi) = aic::patch_info(aic_fw::TABLE, ctx) {
+            let parts: [(&str, u32, &[u8]); 3] =
+                [("ADID", pi.adid, aic_fw::ADID), ("patch", pi.patch, aic_fw::PATCH), ("ext0", pi.ext0, aic_fw::EXT0)];
+            let mut ok = true;
+            for (what, addr, bytes) in parts {
+                if !aic::upload(&h, what, addr, bytes, ctx) || !aic::check_first_word(&h, what, addr, bytes, ctx) {
+                    ok = false;
+                    break;
+                }
+            }
+            ctx.log(if ok {
+                "wifi-driver: stage 6 - the ADID, patch and extension patch are in the chip's memory where its table says"
+            } else {
+                "wifi-driver: stage 6 - the patch upload stopped; the line above names the block"
+            });
         }
     }
     ctx.log("wifi-driver: the AIC8800 firmware upload (the rest of V2) is not built yet, so this answers `radio down`, reason 4 (DOWN_NOT_BUILT)");

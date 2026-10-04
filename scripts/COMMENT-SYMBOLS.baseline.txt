@@ -431,3 +431,9 @@ crc8_ponl_107                      # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c
 rwnx_set_cmd_tx                    # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the message frame layout aic.rs builds - external, 26.14
 sdio_readsb                        # Linux sdio_io.c, the fixed-address CMD53 read sdio.rs read_fifo mirrors - external, 26.14
 sdio_writesb                       # Linux sdio_io.c, the fixed-address CMD53 write sdio.rs write_fifo mirrors - external, 26.14
+AICBT_PINF_T                       # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the patch table group aic.rs reads the load addresses from (a tag in the vendor file, not code) - external, 26.14
+CMD_BUF_MAX                        # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the largest frame the vendor driver sends, which aic.rs FRAME_MAX matches - external, 26.14
+aicbt_patch_info_unpack            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), how aic.rs patch_info reads the information group - external, 26.14
+aicbt_patch_table_alloc            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the table walk aic.rs Groups follows - external, 26.14
+dbg_mem_block_write_req            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the block-write message aic.rs upload sends - external, 26.14
+rwnx_plat_bin_fw_upload_android    # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the 1 KiB chunking aic.rs upload follows - external, 26.14
