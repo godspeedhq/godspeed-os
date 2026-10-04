@@ -1,8 +1,8 @@
 # 72. Pi 4 tasks fault on their own code under `chaos max-carnage`
 
-**Status: OPEN - recorded 2026-10-04. Mechanism shown on the card, fix ON TRIAL: a fault-time `AT` shows the
-core holding a stale cached translation that a local flush clears, and the context switch let it be
-refilled after its flush (no `isb` after the `TTBR0` write). One hypothesis (a skipped TLB flush on a recycled page-table root) was tested on hardware and
+**Status: FIXED 2026-10-04 (`f587acbe`), verified on the card: a fault-time `AT` showed the core holding a
+stale cached translation that a local flush clears, refilled after the switch's flush because no `isb`
+followed the `TTBR0` write. With the `isb`, a 50-round storm and two `selfcheck`s ran with no user fault. One hypothesis (a skipped TLB flush on a recycled page-table root) was tested on hardware and
 FALSIFIED; the change it produced is kept because it is strictly more correct.**
 
 ## Evidence
@@ -150,6 +150,30 @@ Every TTBR0 write that is followed by a flush now has an `isb` straight after it
 changes, and no new `unsafe`. QEMU: a 15-round storm, no kernel panic, storm complete - which shows only
 that nothing broke, since QEMU never reproduced the fault. The card decides: `selfcheck` should finish with
 no shell fault. The walk and `AT` report stay, so a fault that survives the fix is caught the same way.
+
+## Verified on the card (2026-10-04, `f587acbe`)
+
+One boot, with the walk and `AT` report still in:
+
+- `selfcheck`: ran 526, failed 0 (before any chaos).
+- `chaos max-carnage all-services 50 yes`: all 50 rounds, 358 kills, kernel alive, and **no user fault at
+  all** - not one `EXCEPTION` and so not one walk in the whole capture. Every earlier storm on this board
+  ended with the shell dead, and four of them gave dozens of faults each.
+- `chaos kill-storm supervisor` and `chaos kill-storm events`: recovered 1/1 each.
+- `selfcheck` again, after all of it: ran 529, failed 0, skipped 3 (the network checks - see below).
+
+**The Pi 2 port had this right all along**, with a comment saying why: `arch/arm/context_switch.rs` writes
+TTBR0, then `isb`, then `TLBIALL` - "the TTBR0 write must be IN EFFECT before the TLB operation". AArch64
+was written without it. RISC-V is a different shape (`csrw satp` then `sfence.vma`, where the fence both
+orders and invalidates) and has shown nothing.
+
+**Left open, and not this bug:** after the storm the network did not come back on its own. `net-stack`
+stayed unconfigured after a respawn while the radio was down ("no link at boot ... will configure when the
+link comes up") and never did, and something kept using a capability to endpoint 104 one generation behind
+(`cap::get: ResourceId(104) gen mismatch cap=729 rec=759 liveness=Alive`). A manual `kill net-stack`
+brought DHCP and the gateway back at once, but the shell's `ping 8.8.8.8` still said `net-stack not
+responding`. Both look like the stale-peer-cap class (a client that does not reacquire after a peer
+respawns); they need their own entry.
 
 ## Related, latent
 
