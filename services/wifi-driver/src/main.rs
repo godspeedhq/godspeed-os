@@ -5,29 +5,27 @@
 // declaration is itself covered by this lint (a colliding symbol is a soundness hole). `forbid` cannot
 // be relaxed even there.
 #![deny(unsafe_code)]
-//! `wifi-driver` - the Raspberry Pi 4's onboard radio, as a userspace service.
+//! `wifi-driver` - a board's onboard radio, as a userspace service (`docs/wifi.md`).
 //!
-//! **Phase 1 step 1 of `docs/wifi.md`: reach the radio and name it.** This service owns the Arasan SD
-//! host controller at `0xFE30_0000`, which on this board is not a card slot - it is the SDIO bus the
-//! CYW43455 WiFi part sits on. The kernel grants that one page of registers at spawn, by name, and
-//! only where its boot census saw the controller answer. Nothing here does networking yet: it brings
-//! the controller up, identifies what is on the bus, reads the card's own CIS, and says whether the
-//! manufacturer and device codes are the ones this board is documented to carry.
+//! The kernel grants it the radio's SDIO host registers at spawn by device KIND (`WIFI_SDIO`), only where
+//! its boot census saw the controller answer, and `DEVICE_POWER` over the radio's enable pin where the board
+//! can drive it.
+//! Where no window is granted (QEMU, a board with no radio) it says so and serves `no radio`.
 //!
-//! That is a deliberately small step, and it is the one that answers a question no amount of reading
-//! settles. The device tree says the radio is on this controller; the kernel census says a controller
-//! is there; **only CMD5 and the CIS say a radio is.** If they say it is not, one boot log names which
-//! of the three board-level preconditions failed - the power domain, the pin mux, or the bus itself -
-//! because the kernel prints all three before this service starts.
+//! **Raspberry Pi 4 (aarch64): the Broadcom CYW43455, on the Arasan host (`host.rs`).** It identifies the
+//! card, uploads the firmware and CLM blob (`upload.rs`, `firmware.rs`) while holding a lease on the Arm
+//! clock from `power` (the chip's firmware traps when uploaded with the cores slow), and then serves the
+//! shell's `wifi`: scans, WPA2 joins with the four-way handshake run on the host (`join.rs`; the firmware
+//! has no supplicant), pairwise and group rekeys, and the radio's power through `DevicePower` - `radio off
+//! hard`, `powercycle`, and the recovery of a firmware that has stopped. It serves `nic-driver` the frame
+//! path (`frames.rs`) for when the cable is out. A respawn ADOPTS a firmware the dead instance left
+//! running rather than reloading it, and rejoins from `/wifi.keys`. A radio that cannot be brought up is
+//! served as `radio down` with its reason (`wire::DOWN_*`) - answered loudly, never left to time out.
 //!
-//! ## What this service deliberately does NOT do yet
-//!
-//! No firmware upload, so no 802.11 of any kind. The CYW43455 carries its own processor with no ROM
-//! firmware for the MAC: until a host uploads `nonfree/brcm43455/brcmfmac43455-sdio.bin` into it there
-//! is nothing inside to talk to (`docs/wifi.md` section 8, `docs/licensing.md` section 5a). It also
-//! serves no frames: `net-stack` reaches the link through `nic-driver`, and this service is not in
-//! that path yet. So every request it receives is ANSWERED with "unavailable" rather than queued or
-//! dropped - a missing capability must return loudly, never hang (the rule above the rules).
+//! **VisionFive 2 Lite (riscv64, `wifi_host_dw_mmc`): the AIC8800, phase V1** (`docs/wifi-aic8800.md`).
+//! `dwmmc.rs` drives the DesignWare host on the CMD line only: the radio is power-cycled, the card
+//! identified and its CIS read. Nothing is uploaded yet (V2), so it then serves `no radio` with the reason
+//! `DOWN_NOT_BUILT`.
 //!
 //! ## Reference
 //!
@@ -45,6 +43,8 @@ mod armcr4;
 mod backplane;
 mod bcm;
 mod bus;
+#[cfg(wifi_host_dw_mmc)]
+mod dwmmc;
 mod ctrl;
 mod frames;
 mod scan;
@@ -69,24 +69,19 @@ use godspeed_wifi::station::Station;
 /// enabled is how a working bus becomes an intermittent one.
 const OPERATING_HZ: u32 = 25_000_000;
 
-/// Serve forever, answering every request with one byte that means "not available".
-///
-/// **Answering matters more than what is answered.** A registered service that recv's and never
-/// replies leaves its caller waiting out a deadline for a request already decided against, and a
-/// service that never recv's at all sits at 16/16 on its queue forever - the flood-endpoint disease.
-/// `recv` BLOCKS, so the core still reaches its idle path between messages and this costs nothing
-/// while nobody is calling.
-/// Serve with NO radio: every request is answered "radio down", loudly and at once, so a shell that asks
-/// gets a fact rather than a timeout. This is where the driver goes when any stage before the radio came
-/// up has failed - identification, upload, bus - and it is the rule above the rules (Commandment VIII): a
-/// dependency that cannot do the thing must RETURN with a loud unavailable, never hang.
-/// How long WL_REG_ON is held low. Fifty milliseconds was tried first and was MARGINAL: of two power cycles on
-/// hardware (2026-10-01) one gave a cold chip and one gave a chip whose SDIO side had reset but whose
-/// firmware then trapped at start with the section-45 signature - reset, not power-cycled. The pin is
-/// driven by the VideoCore over I2C at its own pace, and the chip's internal supplies take time to
-/// drain; half a second removes the margin and costs an operator's `powercycle` nothing it notices.
-/// Two seconds (2026-10-01). 50 ms, 500 ms, 2 s and 75 s all produced warm starts, so the hold-off is
-/// not the variable; this only has to exceed the chip's own discharge.
+// (`serve_unavailable` and `serve_unavailable_why`, below, are the serve-with-no-radio loop: every request
+// is answered "radio down", loudly and at once, so a shell that asks gets a fact rather than a timeout.
+// Answering matters more than what is answered - a service that recv's and never replies leaves its caller
+// waiting out a deadline, and one that never recv's sits at 16/16 on its queue forever. `recv` BLOCKS, so
+// the loop costs nothing while nobody is calling. Commandment VIII: a dependency that cannot do the thing
+// RETURNS with a loud unavailable, never hangs.)
+
+/// How long WL_REG_ON is held low by a power cycle the driver makes for itself: two seconds (2026-10-01).
+/// Fifty milliseconds was tried first and was MARGINAL: of two power cycles on hardware one gave a cold
+/// chip and one a chip whose SDIO side had reset but whose firmware then trapped at start with the
+/// section-45 signature - reset, not power-cycled. The pin is driven by the VideoCore over I2C at its own
+/// pace, and the chip's internal supplies take time to drain. 50 ms, 500 ms, 2 s and 75 s all produced warm
+/// starts, so the hold-off is not the variable; this only has to exceed the chip's own discharge.
 const POWER_OFF_MS: u64 = 2_000;
 /// How long after WL_REG_ON goes high before the SDIO side is asked anything.
 ///
@@ -287,34 +282,69 @@ fn requested_off_ms(payload: &[u8]) -> u64 {
     }
 }
 
-/// Phase V0 on the VisionFive 2 Lite (`docs/wifi-aic8800.md` 7): prove the GRANT, then serve "no radio".
+/// The VisionFive 2 Lite's radio, phases V0 and V1 (`docs/wifi-aic8800.md` 7): the grant proven, then the
+/// card IDENTIFIED - CMD5 answered, its function count, and the manufacturer and device codes read out of
+/// its own CIS. Nothing is uploaded; that is V2. Then it serves `no radio`, saying the driver is not built.
 ///
-/// Three things, each printed, because V0's whole deliverable is what the log says. The window arrived
-/// (stage 1, above). It reaches the controller the kernel's census saw: the same `VERID` and `HCON`, read
-/// through the grant this time. And the power pin answers: one cycle through `DevicePower`, LOW for 10 ms
-/// and HIGH again with 10 ms to settle - the hold-offs the vendor glue uses (`aic8800_bsp`), and the
-/// driver's to choose rather than the kernel's (26.10). Nothing is sent to the chip; that is V1.
+/// The power-up is the vendor glue's (`aic8800_bsp`): the enable LOW for 10 ms, HIGH, 10 ms before the
+/// first command - with the host's card clock stopped across the edge, so the card powers up into a quiet
+/// bus. The hold-offs are the device's and live here, not in the kernel (26.10).
 #[cfg(wifi_host_dw_mmc)]
-fn v0_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
-    const VERID: usize = 0x6c;
-    const HCON: usize = 0x70;
+fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
+    use godspeed_wifi::sdio as sd;
     const POWER_HOLD_MS: u64 = 10;
+    let h = dwmmc::Host::new(ctx, mmio);
     ctx.log_fmt(format_args!(
         "wifi-driver: stage 2 (dw_mmc) - VERID={:#010x} HCON={:#010x} through the grant (the kernel's census read these same registers)",
-        mmio.read32(VERID), mmio.read32(HCON)));
+        h.verid(), h.hcon()));
+    let why = scan::reply::DOWN_NOT_BUILT;
+    h.park(ctx);
     let off = ctx.device_power(false);
     ctx.sleep_ms(POWER_HOLD_MS);
     let on = ctx.device_power(true);
     ctx.sleep_ms(POWER_HOLD_MS);
     ctx.log_fmt(format_args!(
-        "wifi-driver: the radio's power was cycled through DevicePower - off {}, on {} (the kernel prints what the pin read back)",
+        "wifi-driver: radio power cycled for a clean power-up - off {}, on {}",
         if off { "confirmed" } else { "REFUSED" }, if on { "confirmed" } else { "REFUSED" }));
-    ctx.log("wifi-driver: V0 done on this board - the SD host is granted and the radio's power answers. The AIC8800 \
-             driver itself (V1 onward, docs/wifi-aic8800.md) is not built yet, so this serves `no radio`");
-    serve_unavailable(ctx, None)
+    if !h.reset(ctx) {
+        ctx.log("wifi-driver: the dw_mmc host did not come up (reset or clock update never completed), so nothing was sent to the card");
+        serve_unavailable_why(ctx, Some(&h), why)
+    }
+    // ---- Stage 3: what is on the bus. -------------------------------------------------------------
+    let Some(card) = sd::identify_once(&h, ctx) else {
+        ctx.log("wifi-driver: no SDIO card identified on the VisionFive's radio bus - the lines above name the command that failed and the host's interrupt word");
+        serve_unavailable_why(ctx, Some(&h), why)
+    };
+    ctx.log_fmt(format_args!(
+        "wifi-driver: stage 3 - an SDIO card answered: {} I/O function(s), memory {}, OCR {:#010x}, RCA {:#06x}",
+        card.funcs, card.memory, card.ocr, card.rca));
+    sd::report_cccr(&h, ctx);
+    // ---- Stage 4: ask the PART what it is. --------------------------------------------------------
+    match sd::cis_pointer(&h, ctx).and_then(|p| sd::walk_cis(&h, p, ctx)) {
+        Some(m) => {
+            const AIC_VENDOR: u16 = 0xC8A1;
+            const AIC8800D80: u16 = 0x0082;
+            ctx.log_fmt(format_args!(
+                "wifi-driver: stage 4 - the card's CIS says manufacturer {:#06x}, device {:#06x}{}",
+                m.manf, m.device,
+                if m.manf == AIC_VENDOR && m.device == AIC8800D80 {
+                    " - an AICSemi AIC8800D80, as the board's vendor image said. V1 done"
+                } else {
+                    " - NOT the AIC8800D80 (C8A1:0082) the design expects; stopping here"
+                }));
+        }
+        None => ctx.log("wifi-driver: stage 4 - the card answered but its CIS could not be walked to a MANFID tuple"),
+    }
+    ctx.log("wifi-driver: the AIC8800 firmware upload (V2) is not built yet, so this serves `no radio`");
+    serve_unavailable_why(ctx, Some(&h), why)
 }
 
 fn serve_unavailable(ctx: &ServiceContext, h: Option<&dyn SdioHost>) -> ! {
+    serve_unavailable_why(ctx, h, scan::reply::DOWN_NO_RADIO)
+}
+
+/// `serve_unavailable`, saying WHY the radio is down in the status answer (`wire::DOWN_*`).
+fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8) -> ! {
     // `wifi radio off hard` from here leaves the chip powered down, and from then on this loop answers the
     // way `serve_radio`'s powered-off arms do, so the shell sees one shape for one state whichever loop
     // holds it. `h` is `None` only where no SDIO window was granted, and there no power op can be made.
@@ -398,7 +428,7 @@ fn serve_unavailable(ctx: &ServiceContext, h: Option<&dyn SdioHost>) -> ! {
             1
         } else {
             out[0] = scan::reply::RADIO_DOWN;
-            out[1] = scan::reply::DOWN_NO_RADIO;
+            out[1] = why;
             2
         };
         let _ = ctx.try_send_by_handle(reply, &tagged_reply(tag, &out[..n]));
@@ -1557,10 +1587,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         "wifi-driver: stage 1 - granted {} byte(s) of SDIO host registers",
         mmio.len()
     ));
-    // THE VISIONFIVE'S RADIO STOPS HERE FOR NOW (docs/wifi-aic8800.md 7, V0). Everything below drives the
-    // Pi 4's Arasan host and CYW43455; this board's AIC8800 needs its own host and protocol (V1 onward).
+    // THE VISIONFIVE'S RADIO LEAVES THE PI 4'S PATH HERE (docs/wifi-aic8800.md 7, phase V1): `v1_dw_mmc`
+    // identifies the AIC8800 on the DesignWare host and never returns. Everything below drives the Pi 4's
+    // Arasan host and CYW43455; the AIC8800's own protocol starts at V2.
     #[cfg(wifi_host_dw_mmc)]
-    v0_dw_mmc(&ctx, &mmio);
+    v1_dw_mmc(&ctx, &mmio);
     // THE CLOCK, BEFORE ANYTHING TOUCHES THE CHIP: a lease from `power` holds the Arm cores fast for the
     // bring-up, and every exit below hands it back (docs/power.md, docs/wifi.md 55).
     let lease = clock_lease(&ctx);

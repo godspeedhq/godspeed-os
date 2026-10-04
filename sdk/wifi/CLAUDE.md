@@ -11,8 +11,8 @@ The chip-independent half of every WiFi driver, as a library: `godspeed-wifi` (`
 | `crypto.rs` | SHA-1, HMAC, PBKDF2, the 802.11 PRF, AES-128, the RFC 3394 unwrap - each checked against its published vector at start (`selftest`) |
 | `eapol.rs` | The WPA2 four-way handshake and the group-key rekey, run by the HOST on every radio |
 | `keyfile.rs` | The credentials a join earned, in `/wifi.keys` |
-| `sdio.rs` | The SDIO card protocol (CMD52, CMD53, identification, the CIS) and the `SdioHost` trait every SDIO controller implements - the Pi 4's Arasan today, the VisionFive 2's DesignWare next |
-| `wire.rs` | The request/reply vocabulary between a radio driver and its clients - the shell's `wifi` and `nic-driver`. ONE definition, read by both sides |
+| `sdio.rs` | The SDIO card protocol (CMD52, CMD53, identification, the CIS) and the `SdioHost` trait every SDIO controller implements - the Pi 4's Arasan (`host.rs`) and the VisionFive 2's DesignWare (`dwmmc.rs`, phase V1: commands only, the data phase arrives in V2) |
+| `wire.rs` | The request/reply vocabulary between a radio driver and the shell's `wifi`. ONE definition, read by both sides. The frame ops `nic-driver` uses (0x10-0x12) are not here: they are the Broadcom driver's own, in `services/wifi-driver/src/frames.rs`, and `nic-driver` does not link this crate |
 
 ## Why a crate, and why not in the SDK
 
@@ -29,7 +29,7 @@ all live in one service - a USB radio's driver sits behind the USB host service 
 
 1. The chip-independent code moves here (done).
 2. a. `SdioHost`, and the SDIO protocol moves here (done). b-i. `Station`: the serve loop talks to a `Station`, the Broadcom code is the first (done). b-ii. The loop and the WPA2 handshake runner move here.
-3. The VisionFive: a DesignWare `SdioHost` and an AIC8800 `Station`.
+3. The VisionFive: a DesignWare `SdioHost` and an AIC8800 `Station`. Started: the `SdioHost` is `services/wifi-driver/src/dwmmc.rs` (phase V1, identification over the CMD line only; the data phase is V2, `docs/wifi-aic8800.md`). The `Station` is not begun.
 4. The Pi 2: a `RawRadio` for the Realtek dongle and a shared host-side MLME that makes it a `Station`.
 
 Anything added here must be true of every radio. A name, a structure or a constant from one vendor's

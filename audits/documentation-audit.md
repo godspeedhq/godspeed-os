@@ -8,6 +8,108 @@
 > First audit: 2026-07-15.
 
 
+## Audit 9 - the `feat/wifi-driver` branch: does the prose match what shipped? (2026-10-04)
+
+**Scope:** `feat/wifi-driver` against `main` - 206 files, +34,281 lines, about 9,000 of them documentation:
+the Pi 4 radio end to end, the audio branch merged in (the HD Audio driver and the Pis' PWM jack), the
+kernel learning no service name but the supervisor, the `power` service and the CPU clock lease, the
+`gs::driver` library, the Pi 4 page-table fault (`backlog/72`) and the VisionFive AIC8800 phases V0-V1.
+Docs, per-directory `CLAUDE.md` files, utility specs and CODE COMMENTS. Run while the operator was away.
+The whole range against `main`, so it includes what Audit 8 (2026-10-02, at the end of this file) covered.
+
+**Method.** Six read-only reviewers in parallel, one slice each (`docs/wifi.md`; the `wifi` spec, `sdk/wifi`
+and the driver's comments; audio and the "no service names" claims; kernel comments and the arch docs;
+the driver library, power, networking and the services tables; the backlog, the almanac, the AIC8800
+design and `nonfree/`), each asked for contradictions WITH EVIDENCE and a list of what checked out. Every
+finding was confirmed against the code before it was fixed. One was partly wrong: the reviewer said
+`drain_stale_replies` and `drain_owed_replies` do not exist; they do, in the SDK - the shell simply no
+longer calls the second - and the fix says that instead.
+
+**Verdict: about 90 findings, 22 HIGH. All fixed but the eight recorded below.** No Commandment
+violation. Afterwards everything passes: the x86 build with every gate, the Pi 4 and VisionFive builds,
+`unsafe_check`, `shared_surface_check` and `commandments.py`.
+
+### The shape worth naming: a mechanism moves, and the sentences that described it keep its old name
+
+Audit 7's lesson was a behaviour changed and its three descriptions left behind. This branch's is the
+same at a larger scale, with one phrase doing most of the damage: **"by name"**. The kernel stopped
+granting by service name on 2026-10-03 (CLAUDE.md 12.3), and "granted by name" survived in a syscall's
+doc, the Pi 4 radio's grant function, the services table, the driver's module header, its host's header
+and `docs/wifi.md` section 47 - six places, four of them in the kernel, each beside code that now says
+`kind`. Nothing could fail: the grant is right, and no gate reads what a comment means.
+
+The second shape is a design document written in the future tense and read in the present. `docs/wifi.md`
+section 5 said "no crypto exists in this tree" and that the firmware would run the handshake; section 8
+said a restart re-uploads the firmware from a file. All three were true when written and all three are
+now false - the handshake is the host's, the firmware is embedded, a respawn adopts the running one - and
+none was marked. They are now, each pointing at the section that changed it.
+
+### Findings, by kind (all FIXED unless listed under "Left open")
+
+- **Grants and deaths by name** (HIGH): `syscall/dispatch.rs` `handle_device_power` (which also claimed
+  success when the firmware took the request; it is when the pin reads back), `arch/aarch64/mod.rs`
+  `map_fixed_device`, `services/CLAUDE.md` (the `wifi-driver`, `counter` and `recorder` rows),
+  `services/wifi-driver` `main.rs` and `host.rs`, `docs/wifi.md` 47, and the scheduler's comments on the
+  removed name lists.
+- **The page-table fault's own fix outdated its neighbours** (HIGH): `free_page_table_root` still explained
+  a skip `switch_context` no longer makes, and the safety contracts of it and `free_all` claimed TTBR0 had
+  been switched away, which an idling core does not do. `arch/CLAUDE.md` SEC-27 stated that
+  `write_page_table_base` flushes - true on x86 and riscv64, false on arm32 and aarch64 - which leaves
+  `smp/ipi.rs`'s full-flush sentinel a no-op there (latent: nothing calls it; recorded below).
+- **Shipped but documented as not** (HIGH): `utilities/57_audio.md` said the Pis' jack was never heard (the
+  Pi 4 was) and that only x86 has an audio driver; `docs/audio.md` said `play` and the Pi grant were not
+  built; the website said the `audio` command was not built; `backlog/65` still waited on closing
+  conditions both of which had been met.
+- **The `wifi` utility spec described an architecture that was never built** (HIGH): standalone services
+  holding an introspection-only capability, and a hidden network joinable by BSSID. Every verb is a shell
+  built-in on one send cap, and a hidden row cannot be joined. The status reply layout in
+  `sdk/wifi/src/wire.rs` - the shared definition both sides are meant to read - was wrong byte by byte.
+- **Stale user-visible text** (HIGH): the shell's `wifi` help offered `connect`, which it refuses, and said
+  stored keys die with a reboot (they persist in `/wifi.keys`).
+- **Doc blocks attached to the wrong item** (MED): later insertions had split `fault_report`'s,
+  `handle_pci_cfg_read`'s, `hw_class_of`'s and `hw_random`'s docs from their functions, so rustdoc attached
+  each to its neighbour.
+- **The services table and spawn order** (MED): the `events` row said a respawn drains the kernel ring
+  (nothing does), caps were "minted from the contract" (from the spawn request, 13.6), the riscv64 storage
+  caveat described an order the supervisor fixed, the radio and audio drivers were missing from the spawn
+  order, and step 1 of adding a service was the unimplemented `osdev new`.
+- **Counts and pointers** (LOW): `join::Keys` 40 -> 78 bytes, a record 44 -> 45 bytes, an upload chunk 2 KiB
+  -> 1 KiB, the website's SNTP in net-stack, `HOLD_MS` described as a fixed hold.
+- **Records**: `docs/wifi.md` gained section 61 (an idle link dropped for inactivity, reason 4, about six
+  minutes in; one echo a minute kept it up), the AIC8800 design a "V1 as built" note, the almanac the
+  same-day fix of the IPC silent fallback, and `backlog/66` the honest form of its SNTP line (run on the
+  Pi 4, not yet with an unset clock).
+
+### Left open, recorded rather than fixed
+
+1. **CLAUDE.md 12.3** (the `DevicePower` amendment) says every port but the Pi 4 answers the seam with
+   `false`; riscv64 now answers `true` for the VisionFive's radio. The constitution is the operator's to
+   amend.
+2. **CLAUDE.md 6.4** (the audio amendment) says the bus-master clear moved off names "in the same change";
+   `docs/audio.md` records it as a separate, earlier one. Same reason.
+3. **`smp/ipi.rs`'s full-flush sentinel flushes nothing on arm32 and aarch64.** Latent - nothing calls
+   `broadcast_full_tlb_flush` - and now documented at both ends; a real flush seam is owed before anything
+   on those ports calls it.
+4. **`wifi` on the VisionFive** (reason `DOWN_NOT_BUILT`): `wifi radio on` and `powercycle` still restart
+   the driver, and the radio watch reports any down radio as a chip that "came up warm". Code, in the
+   uncommitted V1 work; it is to be fixed with V1.
+5. **`kernel/build.rs`** lists `pwm-audio` and `power` in `arm_built`, inert because neither is in the
+   services table above it - and whether that table still matters now the supervisor holds the images
+   (step C) is a larger question than a comment.
+6. **The `pwm-audio` arena** is granted 36 pages and needs 33; nothing records why.
+7. **`backlog/README.md`** rows 55-73 are out of numeric order. Cosmetic.
+8. **Stale baseline entries** in `scripts/DOC-SYMBOLS.baseline.txt` and `COMMENT-SYMBOLS.baseline.txt`
+   (`sdio_io_rw_ext_helper`, `txbf`, and the others the doc gate lists): the ratchet can tighten.
+
+### What came back clean
+
+The kernel acts on only one service name at runtime, `supervisor` (spawn privileges, the death path, the
+directory); death notification and restart counting follow `SPAWN_FLAG_WATCHED`; the display keys on the
+framebuffer kind; the two removed grants are gone. Every constant `docs/wifi.md` quotes for the frame path,
+the key file, power and the clock lease; the `power` lease rules; `networking.md` 16; the driver library's
+API; `backlog/67`, 72 and 73 as fixed; every `nonfree/` hash; the AIC8800 design's clock, reset, pin and
+census facts.
+
 ## Audit 7 - the `feat/gsfs` branch: does the prose match what shipped? (2026-09-23)
 
 **Scope:** `feat/gsfs` against `main` - 145 files, +19,879 lines. The filesystem carnage program, the

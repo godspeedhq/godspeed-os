@@ -5559,7 +5559,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi info", "bssid, band, channel, signal, security, time joined, scan facts; for the address, type net", "wifi info"),
         ], false),
         ("wifi", "stored") => help_block(ctx, "wifi stored", "which networks a key is held for", &[
-            ("wifi stored", "names only, never a key; empty after a reboot or a driver restart", "wifi stored"),
+            ("wifi stored", "names only, never a key; kept across reboots in /wifi.keys", "wifi stored"),
         ], false),
         ("wifi", "forget") => help_block(ctx, "wifi forget", "drop a held key", &[
             ("wifi forget <ssid>", "the key is wiped; the link, if any, is not touched", "wifi forget Bankole-WiFi"),
@@ -5752,7 +5752,7 @@ static HELP: &[HelpRow] = &[
     Row("whatis <name>", "what a name is: built-in / library script / pipe stage / service"),
     Row("net", "network status: IP, gateway, ping"),
     Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
-    Row("wifi [list|connect <ssid>]", "wireless: what is in range, and join one"),
+    Row("wifi [scan|list|join <ssid>|status]", "wireless: what is in range, and join one"),
     Row("audio [status|volume <0-100>|tone <hz>]", "sound: what is playing, the volume, a test tone"),
     Gap,
     Sec("Services"),
@@ -8203,7 +8203,7 @@ const WIFI_DRIVER: &str = "wifi-driver";
 /// design and the bring-up record).
 ///
 /// Every verb here is a question put to `wifi-driver` over IPC, by name, and the answers are the driver's
-/// (`services/wifi-driver/src/scan.rs`, `mod reply`); this file formats them and asks for a passphrase where
+/// (`sdk/wifi/src/wire.rs`, which the driver re-exports as `scan::reply`); this file formats them and asks for a passphrase where
 /// the driver says one is needed. The vocabulary lives once, in `wifi_wire`.
 ///
 /// **On three of the five machines the absence line is not a stub, it is the answer.** The T630 and the
@@ -8727,6 +8727,8 @@ fn wifi_radio_unavailable(ctx: &ShellCtx, out: &mut Out, status: u8) -> Result<(
                 "wifi: the radio is down - the driver found no working radio on its bus; `wifi radio powercycle` restores the chip's power and tries again")),
             2 => out.line_fmt(ctx, format_args!(
                 "wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again")),
+            4 => out.line_fmt(ctx, format_args!(
+                "wifi: this board's radio is there, but its driver is not written yet (the AIC8800 - docs/wifi-aic8800.md); nothing here can bring it up")),
             _ => out.line_fmt(ctx, format_args!(
                 "wifi: the radio is down; `wifi radio powercycle` tries again")),
         },
@@ -9275,7 +9277,7 @@ fn wifi_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError> {
     use wifi_wire::*;
     const REPLY_MS: u64 = 3000;
-    /// Sub-codes the driver answers (`scan::reply::dbg`).
+    /// Sub-codes the driver answers (`wire::dbg` in `sdk/wifi`; restated here, not imported).
     const DBG_STATS: u8 = 0;
     const DBG_TRACE: u8 = 1;
     const DBG_FIRMWARE: u8 = 2;
@@ -9450,7 +9452,7 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
 }
 
 /// `wifi stored` - the networks a key is held for, one per line. Names, never secrets; the table
-/// (`utilities/56_wifi.md` 6) is empty after a reboot or a driver restart.
+/// (`utilities/56_wifi.md` 6) persists in `/wifi.keys`, which the driver reads back when the radio comes up.
 fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use wifi_wire::*;
     const REPLY_MS: u64 = 3000;
@@ -9464,7 +9466,7 @@ fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             // `[OK, count, (len, ssid[32]) * count]` - one name per line, so it pipes like any list.
             let count = p[1] as usize;
             if count == 0 {
-                out.line_fmt(ctx, format_args!("no stored networks - a passphrase is kept from wifi join until reboot"));
+                out.line_fmt(ctx, format_args!("no stored networks - `wifi join` keeps a passphrase, in /wifi.keys"));
                 return Ok(());
             }
             let mut at = 2;
@@ -9649,7 +9651,8 @@ fn wifi_radio_on_outcome(ctx: &ShellCtx, out: &mut Out, outcome: WatchOutcome) -
 }
 
 /// `wifi radio powercycle`: the chip's power, cut and restored, then the driver restarted on the cold
-/// chip - VERIFIED by watching it rejoin, and tried again a bounded number of times when it comes up warm.
+/// chip - VERIFIED by watching it rejoin. One cycle per run (`MAX_ATTEMPTS`, docs/wifi.md 52): a chip that
+/// comes up warm is reported, and `wifi radio powercycle` again is the operator's to choose.
 ///
 /// Two principals, each with what it already holds. The DRIVER holds `DEVICE_POWER` and cuts the power
 /// when asked (the radio op's third mode), parking its SDIO host for the whole off window. This shell
@@ -9676,7 +9679,7 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
     // restored the power: the hold plus the settle, with margin. Acting on a STALE OK here is what killed
     // the driver mid-cycle (boot 2026-10-01 13:58, at 13:59) and left the chip unpowered. `q` belongs to
     // the watch below, which is where the long wait is.
-    // The hold (2 s) plus the driver's power-on settle (5 s, docs/wifi.md 52) plus margin.
+    // The hold (2 s) plus the driver's power-on settle (`POWER_ON_SETTLE_MS`, 300 ms) plus a wide margin.
     const OP_MAX_MS: u64 = 15_000;
     for attempt in 1..=MAX_ATTEMPTS {
         let outcome = match wifi_ask(ctx, &[OP_RADIO, RADIO_POWERCYCLE, OFF_UNITS], OP_MAX_MS) {
@@ -14255,7 +14258,7 @@ fn is_producer_builtin(name: &str) -> bool {
 }
 
 /// Which `wifi` verbs may start a pipe: the REPORTS, whose value is their output (`utilities/56_wifi.md`
-/// section 3 - `wifi list | match WPA2`, `wifi list | count`). The ACTIONS refuse, because their value is
+/// section 3 - `wifi list | where security=WPA2`, `wifi list | count`). The ACTIONS refuse, because their value is
 /// their effect and their output is a conversation: `scan` draws a picker and waits on a key, `join` reads a
 /// passphrase from the console - piped, its prompt would vanish into the pipe while it waited - and the
 /// power verbs print progress. `None` when the verb may be piped, else the sentence that says why not.

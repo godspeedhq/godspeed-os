@@ -510,3 +510,10 @@ PAR_EL1                            # AArch64 system register: the Physical Addre
 aic8800_bsp                        # AICSemi's out-of-tree bus/upload driver (radxa-pkg/aic8800 at 09c65d61), cited in services/wifi-driver for the radio's power hold-offs - external, 26.14
 gpio_wl_reg_on                     # StarFive vendor device-tree property naming GPIO 33 as the VisionFive radio's enable, cited in arch/riscv64/sdio.rs and mod.rs - external, 26.14
 mmc1_pins                          # Linux jh7110-common.dtsi pinctrl node whose pad settings arch/riscv64/sdio.rs copies for the radio's SD host - external, 26.14
+dw_mci_ctrl_reset                  # Linux drivers/mmc/host/dw_mmc.c, the controller reset services/wifi-driver/src/dwmmc.rs copies - external, 26.14
+dw_mci_prepare_command             # Linux dw_mmc.c, the command-flag rules dwmmc.rs copies (STOP for CMD0 and the CCCR abort, HOLD_REG) - external, 26.14
+dw_mci_setup_bus                   # Linux dw_mmc.c, the clock-change sequence dwmmc.rs copies - external, 26.14
+dw_mci_start_command               # Linux dw_mmc.c, how dwmmc.rs issues a command - external, 26.14
+mci_send_cmd                       # Linux dw_mmc.c, the controller-only (clock update) command dwmmc.rs copies - external, 26.14
+DW_MMC_CARD_NEED_INIT              # Linux dw_mmc.h flag, cited for the INIT bit on a card's first command (dwmmc.rs) - external, 26.14
+DW_MMC_CARD_NO_LOW_PWR             # Linux dw_mmc.h flag, cited for never using the low-power clock with an SDIO card (dwmmc.rs) - external, 26.14

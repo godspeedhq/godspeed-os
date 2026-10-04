@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # `wifi` - join and inspect a wireless network
 
-Version reported by `wifi version`. Implementation shape: **shell built-in for `scan` and `join`,
-standalone service for everything else** - see section 7, where the reason is a constraint rather than
-a preference.
+Version reported by `wifi version`. Implementation shape: **shell built-in, every verb** (`cmd_wifi` in
+`services/shell/src/main.rs`), each a question put to `wifi-driver` over one send cap - see section 7,
+where the reason for `scan` and `join` is a constraint rather than a preference.
 
 ## Status, as built and honest (2026-09-29)
 
@@ -132,9 +132,9 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi debug [events\|stats\|firmware\|transport\|trace]` | the driver's own account of itself: counters, the firmware's words, the last 64 frames. Section 4g |
 | `wifi forget <ssid>` | drop the held key for that network. Does not leave the network |
 | `wifi stored` | the networks a key is held for, one per line. Names, never secrets. Sixty-four at most - section 6 |
-| `wifi radio on` / `wifi radio off` | the FIRMWARE's radio switch: the chip stays powered. `off` disconnects first and says so. `on` converges from whichever state the radio is in - soft off, it is the two-second switch below; after `off hard`, it is the cold start described in that row; and with the radio DOWN (its firmware trapped at start, or never ran) it is the hard on: the driver is restarted (the respawn adopts a live firmware or power-cycles a dead one) and watched to `radio on succeeded - joined <name>`, and a chip that comes up warm is handed to `powercycle`'s retry loop rather than back to the operator. `on` never answers "no control over the radio's power" unless the kernel refused. `on` then REJOINS the network last joined this boot, with the key it holds and without asking, and says `joined <name>` (asked for by the operator 2026-09-30); a `wifi leave` before the `off` cancels that, and a `wifi forget` of the name leaves nothing to rejoin with. Asking for the state it is already in says `radio already on` / `radio already off`, and sends the radio nothing. Both BLOCK and offer no key - no `[q]` since 2026-10-01, because the request is a kernel `Call` and a shell blocked in one cannot read the console - for about two seconds, and up to fifteen when `on` rejoins. `off` is VERIFIED: the driver asks the firmware back (`WLC_GET_UP`) and the shell prints `... - verified: ...` when it reads down, says unverified when it could not ask, and `... FAILED ...` when the firmware still reads up (`docs/wifi.md` 49; not yet run on hardware) |
-| `wifi radio off hard` | the CHIP's power, cut and left cut. BLOCKS for about three seconds with NO key, until the driver has left the network, cut the power and the kernel has read the pin back low; the driver then checks the cut on its own bus (a CMD52 50 ms later that nothing should answer) and the shell prints `... - verified: ...`, says unverified when the check could not be made, or `... FAILED ...` when the chip still answered (`docs/wifi.md` 49; not yet run on hardware). There is no `q`, because this cannot be stopped once asked, and no `b` either: it offered `[b] background` until 2026-10-01, but the request is a kernel `Call` and a shell blocked in one cannot read the console, so the key could never have been seen in time. The driver stays alive to answer: `wifi status` says `radio off (hard - the chip is powered down; wifi radio on powers it up)`, every other request answers that the chip is powered down. `wifi radio on` from this state restores the power, prints `radio powered up - starting the driver on the cold chip`, restarts the driver, and watches the cold path like `powercycle` does, ending `radio on succeeded - joined <name>`. About twenty seconds; the soft `off`/`on` stay the two-second switch. `on` after `off hard` can still come up WARM - it did at 09:44 and 14:43 on 2026-10-01 - and then hands over to `powercycle`'s loop; `off hard` cuts and verifies the power, it does not produce a cold chip on demand (`docs/wifi.md` 47, 48) |
-| `wifi radio powercycle` | the CHIP's power, not the firmware's radio switch: the driver cuts and restores it through the kernel's `DevicePower` (its own grant, renewable - CLAUDE.md 12.3), and the shell then restarts the driver, which comes up from power-on and rejoins from `/wifi.keys`. The power request itself is bounded at fifteen seconds before the watch begins. Then it says `radio power cut and restored - restarting the driver on the cold chip`, and BLOCKS with `[q] quit  [b] background`, printing each change of state as the driver answers its status question - `waiting for the driver`, `radio coming up`, `radio up, joining` - and ends in one of two lines: `powercycle succeeded - joined <name>`, or `powercycle failed - <why>` (the driver did not answer, this machine has no control over the radio's power, the driver could not be restarted, or the radio did not rejoin within 90 s and where it got to). VERIFIED: success is a join younger than the watch itself, so a stale answer from before the restart cannot pass for one; and a driver that comes back with its radio down means the chip came up warm - its firmware trapped at start - and the shell reports it and stops: ONE cycle per invocation (attempts on the same chip were not independent, so a retry only hid the cause; `docs/wifi.md` 52), re-runnable by hand. The driver waits 300 ms after power-on before its first command (`POWER_ON_SETTLE_MS`; five seconds was tried in section 52, changed nothing, and was reverted). BOUNDED at the operator's word: a warm chip ends `powercycle failed - the chip came up warm (its firmware trapped at start; ...)`, returns the prompt, and can be run again - nothing needs a reboot. The driver parks its SDIO host for the whole off window. The "warm starts" this paragraph once expected were a slow host - the Arm cores at their minimum clock - and with the `power` service's lease every power cycle has come up cold (`docs/wifi.md` 55-57). `q` leaves the watch. `q` and `b` both return to the prompt and say the power cycle continues in the driver: once the power is cut there is nothing to stop (`docs/wifi.md` 47) |
+| `wifi radio on` / `wifi radio off` | the FIRMWARE's radio switch: the chip stays powered. `off` disconnects first and says so. `on` converges from whichever state the radio is in - soft off, it is the two-second switch below; after `off hard`, it is the cold start described in that row; and with the radio DOWN (its firmware trapped at start, or never ran) it is the hard on: the driver is restarted (the respawn adopts a live firmware or power-cycles a dead one) and watched to `radio on succeeded - joined <name>`, and a chip that comes up warm is reported, not retried: ONE attempt, then the prompt and ``radio on failed - the chip came up warm (...); `wifi radio powercycle` tries once more``. `on` never answers "no control over the radio's power" unless the kernel refused. `on` then REJOINS the network last joined this boot, with the key it holds and without asking, and says `joined <name>` (asked for by the operator 2026-09-30); a `wifi leave` before the `off` cancels that, and a `wifi forget` of the name leaves nothing to rejoin with. Asking for the state it is already in says `radio already on` / `radio already off`, and sends the radio nothing. Both BLOCK and offer no key - no `[q]` since 2026-10-01, because the request is a kernel `Call` and a shell blocked in one cannot read the console - for about two seconds, and up to fifteen when `on` rejoins. `off` is VERIFIED: the driver asks the firmware back (`WLC_GET_UP`) and the shell prints `... - verified: ...` when it reads down, says unverified when it could not ask, and `... FAILED ...` when the firmware still reads up (`docs/wifi.md` 49; not yet run on hardware) |
+| `wifi radio off hard` | the CHIP's power, cut and left cut. BLOCKS for about three seconds with NO key, until the driver has left the network, cut the power and the kernel has read the pin back low; the driver then checks the cut on its own bus (a CMD52 50 ms later that nothing should answer) and the shell prints `... - verified: ...`, says unverified when the check could not be made, or `... FAILED ...` when the chip still answered (`docs/wifi.md` 49; not yet run on hardware). There is no `q`, because this cannot be stopped once asked, and no `b` either: it offered `[b] background` until 2026-10-01, but the request is a kernel `Call` and a shell blocked in one cannot read the console, so the key could never have been seen in time. The driver stays alive to answer: `wifi status` says `radio off (hard - the chip is powered down; wifi radio on powers it up)`, every other request answers that the chip is powered down. `wifi radio on` from this state restores the power, prints `radio powered up - starting the driver on the cold chip`, restarts the driver, and watches the cold path like `powercycle` does, ending `radio on succeeded - joined <name>`. About twenty seconds; the soft `off`/`on` stay the two-second switch. `on` after `off hard` can still come up WARM - it did at 09:44 and 14:43 on 2026-10-01 - and then, after its one attempt, returns to the prompt saying `wifi radio powercycle` tries once more; `off hard` cuts and verifies the power, it does not produce a cold chip on demand (`docs/wifi.md` 47, 48) |
+| `wifi radio powercycle` | the CHIP's power, not the firmware's radio switch: the driver cuts and restores it through the kernel's `DevicePower` (its own grant, renewable - CLAUDE.md 12.3), and the shell then restarts the driver, which comes up from power-on and rejoins from `/wifi.keys`. The power request itself is bounded at fifteen seconds before the watch begins. Then it says `radio power cut for 2.0 s and restored - restarting the driver on the cold chip` (with ` (the network is left)` before the dash when it was joined), and BLOCKS with `[q] quit  [b] background`, printing each change of state as the driver answers its status question - `waiting for the driver`, `radio coming up`, `radio up, joining` - and ends in one of two lines: `powercycle succeeded - joined <name>`, or `powercycle failed - <why>` (the driver did not answer, this machine has no control over the radio's power, the driver could not be restarted, or the radio did not rejoin within 90 s and where it got to). VERIFIED: success is a join younger than the watch itself, so a stale answer from before the restart cannot pass for one; and a driver that comes back with its radio down means the chip came up warm - its firmware trapped at start - and the shell reports it and stops: ONE cycle per invocation (attempts on the same chip were not independent, so a retry only hid the cause; `docs/wifi.md` 52), re-runnable by hand. The driver waits 300 ms after power-on before its first command (`POWER_ON_SETTLE_MS`; five seconds was tried in section 52, changed nothing, and was reverted). BOUNDED at the operator's word: a warm chip ends `powercycle failed - the chip came up warm (its firmware trapped at start; ...)`, returns the prompt, and can be run again - nothing needs a reboot. The driver parks its SDIO host for the whole off window. The "warm starts" this paragraph once expected were a slow host - the Arm cores at their minimum clock - and with the `power` service's lease every power cycle has come up cold (`docs/wifi.md` 55-57). `q` leaves the watch. `q` and `b` both return to the prompt and say the power cycle continues in the driver: once the power is cut there is nothing to stop (`docs/wifi.md` 47) |
 | `wifi help` | usage, with one real example per row |
 | `wifi version` | version number plus the collective copyright line |
 
@@ -245,7 +245,7 @@ picker's numbers in section 4 stay put.
 | a completed scan | its records, as above |
 | no scan since boot | `no scan yet - run wifi scan` (an error, not an empty list) |
 | a scan is running | `scanning - 9 heard so far; wifi list when it finishes` (an error, not the OLD cache) |
-| the radio is down | one of the three `wifi: the radio is down - ...` lines, each naming why (section 5) |
+| the radio is down | one of the four radio-down lines, each naming why (section 4f and section 5) |
 
 The two error rows are Commandment III: the cache is a derived view of the air at a past moment, and a
 derived view is never served as current when it is not. An empty list would say "no networks" about a
@@ -315,9 +315,10 @@ which network was asked for, the event says which access point answered, and whe
 event is the truth. `wifi status` repeats it.
 
 An `open` network skips the passphrase prompt. A `WEP` network is refused at the pick with `WEP is
-not supported` (section 9) rather than asked for a key it will not use. A `(hidden)` row can be picked
-- the radio knows the BSSID even though the name was withheld - but joining by name with `wifi
-join` cannot reach it, and that is the one thing the picker can do that the name path cannot.
+not supported` (section 9) rather than asked for a key it will not use. A `(hidden)` row **cannot be
+joined from the picker**: the join request carries the SSID and no BSSID (`sdk/wifi/src/wire.rs`), a
+hidden row's SSID is empty, and the shell refuses an empty one with `wifi: the name or passphrase is out
+of range - nothing was sent`. `wifi join` cannot reach it either, since it needs the name.
 
 The passphrase prompt is a typing surface, so `q` is a letter there. Esc or `^Q` abandons it (rule
 10a), and `wifi status` then reports not associated. A prompt abandoned sends nothing.
@@ -330,7 +331,7 @@ the scan and the radio stops. The rows already on screen were a partial hearing 
 lies about how much of the room it saw. It says so:
 
 ```
-scan stopped - 4 heard, not kept; the last complete scan (11 networks, 3 min ago) stands
+scan stopped - 4 heard, not kept; the last complete scan (11 networks, 180 s ago) stands
 ```
 
 **`b` returns the prompt and leaves the radio sweeping.** The same key `foreground` uses for the same
@@ -381,7 +382,7 @@ radio      on
 network    Maple-House  5GHz
 signal     excellent  -41 dBm
 security   WPA2
-joined     3 min ago
+joined     180 s ago
 last scan  42 s ago, 11 networks
 ```
 
@@ -401,7 +402,12 @@ driver is alive but its radio is not up, at boot or after a respawn - the driver
 wifi: the radio is down - its firmware trapped at start (the chip came up warm); `wifi radio powercycle` cuts its power and tries again
 wifi: the radio is down - the driver found no working radio on its bus; `wifi radio powercycle` restores the chip's power and tries again
 wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again
+wifi: this board's radio is there, but its driver is not written yet (the AIC8800 - docs/wifi-aic8800.md); nothing here can bring it up
 ```
+
+The fourth is reason 4 (`DOWN_NOT_BUILT`), the VisionFive 2 Lite's radio, which this driver identifies and
+cannot yet run. A reason the shell does not know (0, or one added later) prints the generic `wifi: the radio
+is down; `wifi radio powercycle` tries again`.
 
 The earlier single line, "did not come up at boot", is gone: it was wrong after a respawn and named no cause.
 
@@ -414,7 +420,7 @@ band        5GHz
 channel     44
 signal      excellent  -41 dBm
 security    WPA2
-joined      3 min ago
+joined      180 s ago
 last scan   42 s ago
 networks    11
 addressing  type net (an IP address has one owner, and it is not this command)
@@ -482,18 +488,19 @@ look like "no internet":
 
 | Situation | What `wifi` says |
 |---|---|
-| No radio on this machine | `no wireless hardware on this machine` - and it is not an error to ask |
-| Radio present, driver not running | `wifi: the radio driver is not answering` (peer is dead; not a timeout guess) |
+| No `wifi-driver` running (no radio on this machine, or none driven yet) | `no wireless radio on this machine`, then ``(no `wifi-driver` is running - this machine has no radio, or none is driven yet)`` - and it is not an error to ask |
+| Driver running, not answering | `wifi: the radio driver is not answering`, after a bounded wait - or, when it still owes answers to earlier requests, `wifi: not sent - the radio driver still owes N answer(s) ...` |
 | Driver running, firmware trapped at start | `wifi: the radio is down - its firmware trapped at start (the chip came up warm); `wifi radio powercycle` cuts its power and tries again` |
 | Driver running, no working radio on its bus | `wifi: the radio is down - the driver found no working radio on its bus; `wifi radio powercycle` restores the chip's power and tries again` |
 | Driver running, bring-up stopped early | `wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again` |
+| Driver running, the radio's driver not written yet (the VisionFive 2 Lite's AIC8800) | `wifi: this board's radio is there, but its driver is not written yet (the AIC8800 - docs/wifi-aic8800.md); nothing here can bring it up` |
 | Chip powered down by `wifi radio off hard` | `radio off (hard - the chip is powered down; wifi radio on powers it up)` |
 | Radio switched off by `wifi radio off` | `radio off (soft - the firmware's switch; the chip stays powered; wifi radio on turns it back on)` |
 | SSID not found in a scan | `not joined - no network named <ssid> in range` - naming what was searched for |
 | Wrong passphrase | `not joined - incorrect passphrase` - never "connection failed", which hides it |
 | Associated, no lease | association reported as good; `net` owns the lease and says its own piece |
 
-The fourth row is the one worth being careful about. A wrong passphrase and a missing DHCP server both
+The wrong-passphrase row is the one worth being careful about. A wrong passphrase and a missing DHCP server both
 end with "no network", and conflating them costs a user an hour. `wifi` reports association; `net`
 reports addressing; neither editorialises about the other.
 
@@ -558,11 +565,13 @@ in this design.
 ## 7. Built-in or service, and why it is both
 
 `0_conventions.md` §2 says to prefer a standalone service whenever a command would otherwise run
-beside dangerous authority. That is the right default here and it is followed for every read-only
-verb: `list`, `status`, `stored` hold an introspection-shaped cap to the radio service and nothing
-more, so they cannot join, forget or power anything *by construction*.
+beside dangerous authority. **That default is not followed here today.** Every verb is a shell built-in
+routed through `cmd_wifi`, and every one asks the driver over the same send cap (`wifi_ask`), so
+`list`, `status` and `stored` hold exactly the authority `join`, `forget` and `radio` do. Nothing
+separates the read-only verbs from the others by construction; a read-only view with a narrower cap
+would be a standalone service, and none has been built.
 
-**`join` cannot follow it, for a mechanical reason.** There is one console input ring with one
+**`join` could not follow the default anyway, for a mechanical reason.** There is one console input ring with one
 reader slot (`docs/console-service.md` §5a), and the shell is the reader. A spawned service cannot
 prompt for a passphrase: it would have to take the input ring, and while it held it the shell could
 not field the take/release messages. So the invisible-entry prompt has to happen **in the shell**,
@@ -577,16 +586,17 @@ passphrase (section 6) - and drops its own copy.
 
 `wifi` completes from the command table; its subcommands from `SUBCMD_FIRST` in
 `services/shell/src/main.rs`, which is also what `doc_command_check.py` reads - so this document
-cannot come to show a subcommand the shell does not offer. `radio` completes one level further, to
-`on` and `off`. An SSID argument completes from `wifi stored`, never from the last scan, because
+cannot come to show a subcommand the shell does not offer. Two subcommands complete one level further,
+from `SUBCMD_SECOND`: `radio` to `on`, `off` and `powercycle` (`off hard` is typed, not completed), and
+`debug` to `events`, `stats`, `firmware`, `transport` and `trace`. An SSID argument completes from `wifi stored`, never from the last scan, because
 completing from a scan would leak the names of networks in range into a shell's history.
 
 ## 9. Not in scope
 
 Following `docs/wifi.md` §9, and for the same reasons: no enterprise or 802.1X, no WPA3, no WEP ever
 (a WEP row is listed because it was heard, and refused at the pick), no access-point mode, no manual
-channel selection, no hidden-SSID entry by name in the first version (the picker reaches one by
-BSSID; `wifi join <ssid>` does not), and no signal-strength monitor - `observe` is where live views
+channel selection, no joining a hidden network in the first version (the join request carries only an
+SSID, so neither the picker nor `wifi join <ssid>` can reach one), and no signal-strength monitor - `observe` is where live views
 live, and a second one here would be the duplication rule 7 exists to prevent.
 
 ## 10. Which link carries the frames: the cable always wins

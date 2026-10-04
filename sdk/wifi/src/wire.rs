@@ -32,6 +32,13 @@ pub const DOWN_TRAPPED: u8 = 1;
 pub const DOWN_BRINGUP: u8 = 2;
 /// No working radio answered on this driver's bus.
 pub const DOWN_NO_RADIO: u8 = 3;
+/// The board has a radio this driver does not drive YET: the VisionFive's AIC8800 while its protocol is
+/// being built (`docs/wifi-aic8800.md`). Nothing the operator can do changes it, so the shell's sentence
+/// for this reason suggests nothing - a power cycle advised here would be advice that cannot work. That is
+/// the sentence only: `wifi radio on` and `wifi radio powercycle` on this state still restart the driver,
+/// and the shell's radio watch reads any `RADIO_DOWN` as a chip that came up warm, so it reports a warm
+/// chip here too. A known wording gap, recorded for phase V1.
+pub const DOWN_NOT_BUILT: u8 = 4;
 /// Byte 3 of an `off` / `off hard` answer: the driver checked, and the radio IS off.
 pub const OFF_VERIFIED: u8 = 1;
 /// The check could not be made (the firmware did not answer the question); the off was not confirmed.
@@ -62,8 +69,16 @@ pub const OP_SCAN_POLL: u8 = 4;
 /// Request op byte: stop the sweep. The partial hearing is DISCARDED - the cache keeps the last complete
 /// scan. Reply `[OK, heard]`.
 pub const OP_SCAN_ABORT: u8 = 5;
-/// Request op byte: what the radio is doing. Reply `[OK, sweeping(0|1), heard, has_cache(0|1),
-/// cache_count, age_secs u32 LE, radio_on(0|1), joined_len, joined_ssid[32]]`.
+/// Request op byte: what the radio is doing. Reply, 62 bytes, by offset:
+/// - 0 `OK`; 1 sweeping (0|1); 2 heard so far in the sweep; 3 has_cache (0|1); 4 cache_count;
+/// - 5..9 the cache's age in seconds, u32 LE (`u32::MAX` with no cache); 9 radio_on (0|1);
+/// - 10 associated (0|1); 11..17 bssid[6]; 17..21 rssi i32 LE (0 when the firmware gave none);
+/// - 21..23 chanspec u16 LE; 23 security of the joined network; 24..28 seconds joined, u32 LE;
+/// - 28 joined ssid_len; 29..61 joined ssid[32];
+/// - 61 power: 1 when the chip is powered, 0 after `wifi radio off hard`, when every other byte is 0 too.
+///
+/// The link fields (10..23) are read from the firmware when asked, except while a sweep runs, when they
+/// are the driver's memory and the bssid, rssi and chanspec are zero.
 pub const OP_STATUS: u8 = 6;
 /// Request op byte: leave the current network; the radio stays up. Reply `[OK, was_joined(0|1)]`.
 pub const OP_DISCONNECT: u8 = 7;

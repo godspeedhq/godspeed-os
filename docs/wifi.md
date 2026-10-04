@@ -3,10 +3,16 @@
 
 **Status:** sections 1-12 are the design, written on `feat/wifi-driver` before any code, deliberately,
 because the sizing conclusion below would have been discovered four weeks late otherwise. Sections 13
-onward are the bring-up record, dated: as of 2026-09-29 the Pi 4 radio scans, associates, and (built, not
-yet run) answers the WPA2 handshake; `utilities/56_wifi.md` is the command surface and its status section is
-the current truth. Where a design section below and a later dated section disagree, the later one is what
-was built.
+onward are the bring-up record, dated. As of 2026-10-04 the Pi 4 radio scans, joins WPA2 networks with the
+handshake run on the host (hardware 2026-09-29, sections 40-41), and carries `net-stack`'s frames behind
+`nic-driver` with the cable winning (41); it answers a group-key rekey and has pairwise rekey code (42,
+neither yet seen on hardware, `backlog/64`), keeps derived keys in `/wifi.keys` (43), adopts a running
+firmware on respawn (46), cuts and restores the chip's power through its own grant (47-52), holds a lease
+on the Arm clock for the upload (57), and shares its station half with other radios through `sdk/wifi`
+(59). The VisionFive 2 Lite's AIC8800 is a second driver in progress: the kernel grant (phase V0) and the
+userspace `dw_mmc` host's identification (V1) are built, `docs/wifi-aic8800.md` (44). `utilities/56_wifi.md`
+is the command surface and its status section is the current truth. Where a design section below and a
+later dated section disagree, the later one is what was built.
 
 **The one-line answer.** Once a station is associated, a WiFi link is a frame source, and this project
 already has a NIC-agnostic frame interface that two unrelated drivers speak. `net-stack` needs no
@@ -231,6 +237,13 @@ When crypto is eventually needed - a soft-MAC radio, or a decision to do our own
 existence). A `crypto` module inside the supplicant service, promoted to `sdk/` only when something
 else needs it.
 
+**Superseded (sections 37, 40, 59):** crypto now exists, and the host runs the handshake. The Broadcom
+firmware has no supplicant (37), so the driver performs the WPA2 four-way handshake itself
+(`join::Handshake` in `services/wifi-driver/src/join.rs`, section 40) and the passphrase never reaches the
+firmware - only the derived temporal key does. The crypto (`sdk/wifi/src/crypto.rs`: SHA-1, HMAC, PBKDF2,
+the 802.11 PRF, AES-128, the RFC 3394 unwrap) moved into the SDK when a second radio became its second
+consumer (59), exactly as the paragraph above said it would.
+
 ---
 
 ## 6. Where the credential lives, which is the interesting Godspeed question
@@ -448,6 +461,11 @@ hanging. The rule above the rules applies - no missing dependency may wedge the 
 What the vendoring removed is the SETUP problem, not the runtime one: nobody has to find the file, but it
 still has to reach a disk the OS can read.
 
+**Superseded (section 21):** the firmware does not come from a disk. It is embedded in the driver's image
+at build time (`include_bytes!` in `services/wifi-driver/src/firmware.rs`), so bringing the radio up does
+not depend on `fs` at all and no bake verb was needed. `fs` is still a send peer, for `/wifi.keys` only
+(section 43), and a missing `fs` costs the saved keys, never the radio.
+
 **Getting the file onto a Godspeed disk needs one small addition**, and this is a correction to an earlier
 draft of this section: `osdev mkfs` only FORMATS an empty GSFS image. The host-side bake path does exist -
 `gsfs_add_file`, which `osdev script-disk` uses to put a `.gsh` script on a flashable disk - but no CLI
@@ -465,6 +483,11 @@ on a machine with no other link, merely awkward on a Pi 4, which has ethernet.
 `net-stack` sees a dead peer. That is acceptable, and it is exactly the `EndpointDead`,
 reacquire-by-name, retry path (§14.3). But it must be measured rather than assumed, and
 `chaos max-carnage` will find out.
+
+**Superseded (section 46):** a respawn does not re-upload. The firmware outlives the service, so the new
+instance adopts the firmware that is already running, rescans, reloads `/wifi.keys` and rejoins - measured
+at about seven seconds of lost link, with no upload and no power cycle. Only a firmware that has stopped
+needs the upload again, after a power cycle (section 47).
 
 ---
 
@@ -531,14 +554,18 @@ someone reading it fresh.
 1. **Does the VisionFive 2 Lite have WiFi at all?** Settle on the board. It changes the radio count and
    nothing else in this plan. *Settled 2026-09-30, section 44: yes, an AIC8800D80 on SDIO.*
 2. **Firmware blob: in the repo, or supplied by the user?** A licensing call, not a technical one.
+   *Settled, section 8: in the repository, `nonfree/brcm43455/`, with its provenance.*
 3. **Is the Pi 4 radio behind the Arasan controller, with the SD card on `emmc2`?** Section 4's whole
-   argument rests on it. Confirm against the device tree before writing code.
+   argument rests on it. Confirm against the device tree before writing code. *Settled, section 14.*
 4. **Does the passphrase persist across reboots**, and if so where and under what capability? "Retype it
-   each boot" is a legitimate phase-4 answer and avoids the question entirely.
+   each boot" is a legitimate phase-4 answer and avoids the question entirely. *Settled, section 43:
+   derived keys, never passphrases, in `/wifi.keys` through `fs`.*
 5. **One service or two** - `wifi` alone, or `wifi` plus `supplicant`? Section 6 argues two for the
-   interface even though the full-MAC shortcut sends the secret through the driver anyway.
+   interface even though the full-MAC shortcut sends the secret through the driver anyway. *Settled,
+   section 6's superseding note: one service, the driver, which also runs the handshake.*
 6. **Is `ping` over WiFi on the Pi 4 the finish line for v1 of this work?** Naming the finish line now is
    what stopped the networking effort sprawling, and phases 0-5 are already a substantial body of work.
+   *Reached, section 41: ping over the radio on the Pi 4.*
 
 ---
 
@@ -2991,7 +3018,9 @@ nothing above the join existed yet - phase 5 in section 7's table. This section 
   `Carrier`: the cable, re-read at most every 500 ms on whatever request arrives, or the radio.
 - **The supervisor** wires `nic-driver` to `wifi-driver` where the image is embedded (`NIC_PEERS` on the
   `has_wifi_driver` board fact, not the ISA), and spawns the radio BEFORE `nic-driver` so the peer is in
-  the name-cap map when it wires. The contract, the authority pin and the send-peer list all say the
+  the name-cap map when it wires. (Now keyed on the `nic_radio_bridge` board fact, split off
+`has_wifi_driver` in `services/supervisor/build.rs` because the VisionFive embeds the radio's driver but
+has no bridge to it.) The contract, the authority pin and the send-peer list all say the
   same thing, and `contract_check` and Commandment VII hold them to it.
 - **`net` names the carrier**: `link  up via the cable`, `up via wifi (the cable is out)`, or `down`.
 
@@ -3017,7 +3046,8 @@ is the silent substitution 26.4 names.
 
 - **Group-key rekey is not answered** (`backlog/64`). The access point will drop the link at its rekey
   interval; the driver sees it, says so, and `wifi join` brings it back. The log line will say what this
-  router's interval is. *Answered later the same day - section 42; the pairwise rekey is what remains.*
+  router's interval is. *Answered later the same day - section 42, which now answers a pairwise rekey too
+(`frames::pairwise_rekey`); what remains is seeing either on hardware.*
 - Data frames that arrive DURING A SWEEP are still dropped by the sweep's own reader; RX answers zero
   frames while a sweep runs. A sweep is a moment of no link either way.
 - `GET_RSSI` is refused (`BCME_BADARG`) even when joined, so `wifi status` says `signal unknown`. Honest,
@@ -3109,14 +3139,17 @@ those frames and said what would happen. Now it answers them.
 **What the join keeps.** `join::Keys`: the KCK and KEK halves of the pairwise transient key, the last
 replay counter the access point used, and our address. Not the temporal key - that lives in the firmware
 from the moment `wsec_key` installs it and is never needed again by the host. Zeroed on `leave`, on
-`radio off`, on a dropped link, and at the start of the next join (`join::forget`). Forty bytes, on the
-serve loop's stack, for the life of one association.
+`radio off`, on a dropped link, and at the start of the next join (`join::forget`). Seventy-eight bytes,
+on the serve loop's stack, for the life of one association - forty as first written, before the PMK joined
+them for the pairwise rekey.
 
 **What the pull does with an EAPOL-Key frame** (`frames::group_rekey`, each step from OpenBSD's
 `ieee80211_recv_rsn_group_msg1`, quoted at the function):
 
-1. Pairwise bit set: not a group rekey but a new four-way handshake, counted and said once - the half of
-   `backlog/64` that remains.
+1. Pairwise bit set: not a group rekey but a new four-way handshake. `group_rekey` returns
+   `Rekey::Pairwise` and the pull answers it with `frames::pairwise_rekey`, deriving a new PTK from the
+   kept PMK. (As first written this case was only counted and said once; the code has since closed it.
+   Neither rekey has yet been seen on hardware, `backlog/64`.)
 2. `KEYMIC` and `KEYACK` both set, or it is not message 1 and there is nothing to answer.
 3. The replay counter must exceed the last accepted (`ni_replaycnt`); at or below is a replay, ignored.
 4. The MIC must verify under our KCK.
@@ -3169,8 +3202,8 @@ nothing. Names are in plain text. Nothing is encrypted at rest, because there is
 to encrypt with; a file that looked encrypted and was not would be the silent substitution 26.4 names.
 
 **The shape section 6's superseding note fixed in advance, built as fixed.** The in-memory table stays
-the working set. `keyfile.rs` loads `/wifi.keys` once the radio is up - through `fs`, the driver's one
-send peer, each request bounded and matched to its reply, reacquired by name if `fs` restarts - and
+the working set. `keyfile.rs` (now `sdk/wifi/src/keyfile.rs`, section 59) loads `/wifi.keys` once the radio is up - through `fs`, one of the driver's two
+send peers (the other is `power`, section 57), each request bounded and matched to its reply, reacquired by name if `fs` restarts - and
 writes it after every change: a join that added or re-ordered a key, a `forget`. While `fs` is still
 mounting the load is retried between requests, fifteen times two seconds apart, and then given up with
 a line; the driver runs on the table alone, exactly as it did before the file existed. The file is at
@@ -3240,7 +3273,14 @@ full-MAC radio whose firmware the host uploads - with none of the Pi 4's PARTS:
 
 (2026-10-04: the design is `docs/wifi-aic8800.md`.) So the VisionFive radio is a real third port and a second driver, not a variant of the first. It is
 recorded here as the answer to section 1's question, and as scope that is NOT part of this branch
-(section 9). The riscv64 kernel's `hw_random` is still a stub; the JH7110 has a hardware generator of its
+(section 9).
+
+**Superseded (2026-10-04, `docs/wifi-aic8800.md`):** the VisionFive radio is now being built on this
+branch. The `dw_mmc` host is in USERSPACE, not in `arch/riscv64`: phase V0, the kernel's side, is a census
+of the radio's SD host and a grant of its window and power pin by the `WIFI_SDIO` kind
+(`kernel/src/arch/riscv64/sdio.rs`), and is committed; phase V1, the userspace host
+(`services/wifi-driver/src/dwmmc.rs`), is built and reaches identification only. Everything above
+identification is the plan in that document. The riscv64 kernel's `hw_random` is still a stub; the JH7110 has a hardware generator of its
 own, and filling that seam would help `net-stack` on the board whether or not the radio is ever driven.
 
 ## 45. The first chaos run with the radio: 397 respawns, one join (2026-09-30)
@@ -3376,8 +3416,8 @@ volatile, the firmware is not, and a respawn converges on the firmware it finds.
 resolved by this section. What stays true from section 45: a firmware that has STOPPED - killed
 mid-upload, or trapped - cannot be restarted on this chip without power, and that case is reported
 rather than retried; when this was written it cost a reboot, and section 47 closes that - the driver power-cycles the chip ONCE; if the chip
-still comes up warm the driver serves `radio down` with its reason, and `wifi radio powercycle` (three
-cycles per run, re-runnable, section 48) is the way out. No reboot.
+still comes up warm the driver serves `radio down` with its reason, and `wifi radio powercycle` (one
+cycle per run since section 52, re-runnable, section 48) is the way out. No reboot.
 
 The PMU watchdog and the RAM clear are gone from the code, recorded above as tried. They were the reset
 path's last two steps, and the reset path no longer runs on a chip with a live firmware. If the adopted
@@ -3412,7 +3452,8 @@ SD domain through this mailbox at boot, before it can grant this driver its wind
 unpowered device is not a grant. The grant was never renewable. Now it is: the kernel mints
 `DEVICE_POWER` with the window, to this service and nobody else, where the arch layer can power the
 device behind it, and `DevicePower(on)` drives that device's pin - resolved from the caller's own grant,
-in `arch/aarch64`, by the same name the window came from. The kernel learns which pin. It does not
+in `arch/aarch64`, by the device kind (`WIFI_SDIO`) the window was granted by (CLAUDE.md 12.3, 2026-10-03
+amendment); `arch/riscv64` answers the same seam for the VisionFive's radio. The kernel learns which pin. It does not
 learn what the device is, whether its firmware is alive, or when to cut power. Those are this driver's,
 and the two waits - WL_REG_ON held low, then the chip's own power-on before its SDIO side answers - are
 facts about the chip and live here (`power_cycle_device`).
@@ -3482,10 +3523,12 @@ stay soft. `wifi radio off hard` is one rung down: the driver leaves the network
 still say so, cuts the chip's power through its own grant, and stays alive to answer "powered down".
 `wifi radio on` converges from either off: the soft switch when the firmware is up, and after `off hard`
 it restores the power, restarts the driver, and watches the cold path to `radio on succeeded - joined`.
-`powercycle` is off-hard-and-on in one act, three cycles at most per run (section 48). Each word names
+`powercycle` is off-hard-and-on in one act, one cycle per run (section 52; three as first built,
+section 48). Each word names
 what it does to the chip; `on` is the one the operator can always type without knowing the state. `off
 hard` cuts the power and verifies the cut (section 49); it does NOT produce a cold chip on demand - `on`
-after it trapped at 09:44 and again at 14:43, so `on` hands a warm chip over to the powercycle loop.
+after it trapped at 09:44 and again at 14:43. When `on` meets a warm chip it reports it and stops,
+naming `wifi radio powercycle` as the one more try (section 52).
 
 `wifi radio powercycle` is also re-runnable from every state the driver can be in: serving normally
 (cut, restart, watch), in its radio-down loop (the op is served there), powered down after `off hard`
@@ -3505,6 +3548,9 @@ state is exactly what the power ops exist for - and the kernel's refusal has its
 did the soft switch and nothing else, is now the HARD ON when the radio is down: it restarts the driver
 (the respawn adopts a live firmware or power-cycles a dead one) and watches it join; if the chip comes up
 warm it hands over to the powercycle loop rather than telling the operator which command to type next.
+**Superseded (section 52):** it no longer hands over. A second cycle on the same chip gives the same
+result, so `on` reports the warm chip and stops, and its line names `wifi radio powercycle` as the one
+more try.
 `on` is the one word that always converges; the operator does not need to know the rung.
 
 `off hard` blocks until the kernel has read the pin back low. As first written it offered `[b]
@@ -3629,6 +3675,15 @@ adopts the running firmware rather than a power cycle - and an ordinary verb can
 about a request that was never sent. The honest fix is a distinct outcome for "not sent, replies still
 owed"; until it exists, a `not answering` within 30 s of an abandoned command may be this rather than the
 driver.
+
+**Superseded (section 58).** The two names above are SDK methods (`ServiceContext`), and the shell's
+radio path no longer rests on them: `drain_owed_replies` is not called by the shell at all, and
+`drain_stale_replies` is only the first step of the shell's own `wifi_drain_stale`, which clears the reply
+mailbox of OTHER peers' late replies. Radio answers now arrive on the shell's main endpoint, every request
+carries its own tag, and `wifi_sift` keeps only the reply that carries it, counting a late answer to an
+abandoned request off what is owed rather than waiting for it. The known gap is closed: a request held back while answers are still owed is counted
+(`wifi_unsent`) and reported as its own line, `wifi: not sent - the radio driver still owes ...`, never
+as "no answer".
 
 **Why the radio is down, said by the driver.** `wifi status` with the radio down used to print one line,
 "did not come up at boot", which was wrong after a respawn and silent about the cause. The driver's
@@ -4085,3 +4140,15 @@ node's 2.4 GHz access point to its 5 GHz one. Six seconds later `net-stack` prin
 192.168.11.23 in place of 192.168.10.21, and ping answered 17 of 17 with no `net renew`. The cable
 stepping in and out around it re-configured on our own address changing, as before.
 
+## 61. An idle link is dropped for inactivity, not for a failed rekey (2026-10-04)
+
+**What the Pi 4 soaks showed.** Twice, an idle joined link - nothing sent after the join - was
+disassociated by the access point about six minutes after the join, with 802.11 reason 4: inactivity.
+The firmware's power-save mode read 0 at the time (`report_power_mode` in `ctrl.rs`), so the chip was
+constantly awake; the radio was not asleep through the access point's traffic. With one echo a minute to
+the gateway, the same link stayed up past fifteen minutes, 14 of 14 echoes answered.
+
+**What a reader should take from it.** The first drop to expect on an idle link is the access point's
+inactivity timer, not a failed rekey. A keep-alive is the fix, and it belongs in `net-stack`, which knows
+whether the link is in use, not in the driver; it is not built. The rekey itself (section 42) is still
+waiting for a hardware sighting, `backlog/64`.

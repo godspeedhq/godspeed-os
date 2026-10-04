@@ -1,6 +1,6 @@
 # WiFi on the VisionFive 2 Lite: the AIC8800D80 (design, 2026-10-04)
 
-**Status: DESIGN; phase V0 DONE and verified on the board 2026-10-04.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`) and a `wifi-driver` that proves it and then serves `no radio`; V1 onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
+**Status: DESIGN; phase V0 DONE and verified on the board 2026-10-04; V1 BUILT, not yet run on the board.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver serves `no radio`. V2 onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
 second WiFi driver. `docs/wifi.md` section 44 identified the chip from the board's own boot log; the
 firmware is in `nonfree/aic8800d80/` (byte for byte what the board's vendor image loaded, with its
 licence position recorded there and in `docs/licensing.md` 5a). What follows is the hardware as the
@@ -59,7 +59,8 @@ Pi's audio pins (CLAUDE.md 12.3, the 2026-10-03 amendment):
   when released). Clocks on BEFORE the release - the reset driver notes a release can otherwise hang;
 - pins: GPIO 10 CLK, 9 CMD, 11/12/7/8 D0-D3, function numbers in the table the SDIO-host research
   produced (CLK 55; CMD out 57, OE 19, in 44; D0 58/20/45; D1 59/21/46; D2 60/22/47; D3 61/23/48),
-  pull-up, 12 mA, input enabled, Schmitt on the data pins;
+  pull-up and 12 mA on all six; input and Schmitt enabled on CMD and the data pins, both OFF on CLK
+  (`jh7110-common.dtsi`'s `mmc1_pins`);
 - **the radio's power: GPIO 33, the old left-channel audio pin** (the Pi audio research noted it; StarFive's
   vendor device tree confirms it as `gpio_wl_reg_on`, and disables the PWM-DAC that used it). The vendor
   glue drives it LOW for 10 ms, then HIGH, then waits 10 ms before the first command. Mainline Linux has
@@ -114,6 +115,16 @@ never points a DMA engine at memory at all.
   CMD52 write to the CCCR abort register, as Linux does. Every wait bounded (`gs::driver::wait`).
 - **Never write `CMD` while bit 31 is still set** - that is the hardware-locked error (`HLE`) both
   references guard against.
+
+**V1 as built (2026-10-04), where it differs from the plan above.** Commands only: `cmd_data` refuses by
+name, and the data phase and the CMD53 abort arrive with the upload (V2). The FIFO depth is read from
+`FIFOTH`'s reset value, not assumed to be 32, and the thresholds written are the probe's (`depth/2 - 1`,
+`depth/2`, burst code 2). The host does not read `HCON` or `VERID` for itself - the kernel census prints
+both, and V2's FIFO access is where the offset is needed. Before a command it waits for `CMD` bit 31 to
+clear and does NOT wait on `STATUS` busy: Linux's `dw_mci_wait_while_busy` does that only for commands
+with a data phase, and after an R1b (CMD7) the host waits out DAT0 busy. A failed command returns no
+response and leaves the interrupt word in `last_int`, which the shared identification code prints; there
+is no mapping to named reasons.
 
 ## 5. The AIC8800 bus and the firmware upload
 
@@ -212,7 +223,7 @@ prediction written first.
 | Phase | Deliverable | What the log says when it works |
 |---|---|---|
 | **V0** | The grant: clocks, reset, pins, GPIO 33, the census | `VERID`/`HCON` printed; the window granted to `wifi-driver` by kind |
-| **V1** | `dw_mmc` behind `SdioHost`; identification | `CMD5` answered, function count, CIS `C8A1:0082` - the card is there |
+| **V1** | `dw_mmc` behind `SdioHost` (commands only; the data phase moves to V2); identification | `CMD5` answered, function count, CIS `C8A1:0082` - the card is there |
 | **V2** | The upload | chip revision 7, firmware version `06090101`, the start confirmed |
 | **V3** | Bring-up messages | `wifi info` shows the efuse MAC and the firmware version |
 | **V4** | Scan | `wifi scan` lists the networks in the room |

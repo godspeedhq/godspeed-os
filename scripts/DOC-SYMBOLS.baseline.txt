@@ -133,3 +133,4 @@ SDIO1_AHB                          # docs/wifi-aic8800.md - JH7110 clock/reset n
 SDIO1_SDCARD                       # docs/wifi-aic8800.md - JH7110 clock name from Linux's starfive bindings, EXTERNAL
 ap_max_inactivity                  # backlog/64 - hostapd configuration option, EXTERNAL; the access point idle timer that matches reason 4 after ~300 s
 mkeep_alive                        # backlog/64 - Broadcom firmware iovar Linux brcmfmac sets only for suspend, EXTERNAL
+dw_mci_wait_while_busy             # docs/wifi-aic8800.md - Linux drivers/mmc/host/dw_mmc.c, cited for when the reference waits on STATUS busy, EXTERNAL
