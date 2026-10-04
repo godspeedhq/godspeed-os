@@ -11,6 +11,14 @@ and 711 ms, against 890-990 before - and none landed on the one-second grid. The
 67 is fixed in the SDK since, and the Pi 4 boot after the fix logged no such line through a 50-round chaos run. What changed the timing is not shown; the clock leaving
 `net-stack`'s serve loop is the obvious candidate and is a guess. Left parked, with the new numbers.
 
+**2026-10-04, gone on the current tree, and the mailboxes are not why.** `backlog/74` found that
+`nic-driver` and `net-stack` never had reply mailboxes on the radio boards and tested it as a cause: two
+Pi 4 boots over the radio (cable pulled), 20 echoes to 8.8.8.8 each, one with the mailboxes granted by a
+test image and one on the committed build (`5f501775`) without them. Both 20/20, and NEITHER logged a
+STATUS exchange of 300 ms or more; the VisionFive's cable path gave the same pair of answers. So on this
+tree the tax does not appear at all, with or without the mailboxes. Still parked rather than closed: no
+change has been shown to have removed it, and the mechanism above was never explained.
+
 ## The measurement, which is exact
 
 After `time` sets the wall clock from the network, `net-stack` leaves its blocking `recv` for its

@@ -1,7 +1,7 @@
 # 74. On every board image the last services spawned get no reply mailbox, and `net-stack` is always one of them
 
-**Status: OPEN - found 2026-10-04 from a VisionFive boot, confirmed in a Pi 4 log. Option 3 (every refusal
-named) is DONE, below; the reserve itself is unchanged until the measurement this item names has been made.**
+**Status: OPEN, low priority - found 2026-10-04 from a VisionFive boot, confirmed in a Pi 4 log. Measured on both radio boards the same day: the mailboxes make no measurable difference (below). Option 3 (every refusal
+named) is DONE; the reserve stays at 72.**
 
 ## What was seen
 
@@ -96,3 +96,41 @@ The decision and the threshold are unchanged; only who is named, and how often, 
 `routing: reply endpoint refused`, is gone. Verified in QEMU (riscv64, Pi 4) and on the VisionFive 2 Lite
 the same day: `nic-driver` (1) and `net-stack` (2) at boot, and `wifi-driver` (3) when `wifi radio on`
 restarted it, the numbers as predicted. Next: the measurement above.
+
+## The measurement on the VisionFive (2026-10-04): inconclusive, because this board shows no tax
+
+Two boots with the cable in, the same commands (`net`, `ping count 20 8.8.8.8`, `wifi radio off hard`,
+`wifi radio on`): a test image with the reserve at 48 (never committed; `build/vf_measure_reserve48.log`),
+then the committed build at 72. The test image refused nothing; the committed one refused `nic-driver`,
+`net-stack` and `wifi-driver`, as predicted. Both pinged 8.8.8.8 at 19-31 ms, one echo a second, 0% loss,
+and NEITHER logged a NIC exchange of 300 ms or more during the pings. The only slow exchange in each was
+the boot-time link query (748 ms with mailboxes, 840 ms without), one sample each.
+
+So the one-second tax of `backlog/66` does not appear on this board's cable path at all, mailbox or none,
+and this board cannot say whether the mailboxes cause it. The Pi 4, where 66 was found and where
+`pwm-audio` is refused as well, is the board that can.
+
+## The measurement on the Pi 4 (2026-10-04): the mailboxes make no measurable difference
+
+The same pair on the Pi 4, over the RADIO with the cable pulled after boot, which is how 66 was found:
+`net`, one `ping 8.8.8.8`, then `ping count 20 8.8.8.8`. Test image at reserve 48
+(`build/pi4_measure_reserve48.log`), then the committed build at 72 (`build/pi4_baseline_reserve72.log`).
+
+| | reserve 48 | reserve 72 (committed) |
+|---|---|---|
+| refused | none | `pwm-audio`, `nic-driver`, `net-stack` (1, 2, 3), as predicted |
+| `ping count 20 8.8.8.8` over the radio | 20/20, 29-66 ms | 20/20, 22-39 ms |
+| NIC exchanges of 300 ms or more | none | none |
+| the first echo after the switch to the radio | answered after 1185 ms, in a 1277 ms serve pass | answered after 1645 ms, in a 1737 ms serve pass |
+
+**Verdict.** With or without the mailboxes, today's code shows no slow STATUS exchange on either radio
+board, so the mailboxes are not shown to be the cause of 66 and the one-second tax itself did not
+appear. The reserve stays at 72: options 1 and 2 would change the kernel to fix a cost nobody can now
+measure. This item stays OPEN for the structural hazard alone (two services that serve and await replies
+on one endpoint, with the drain repair off), at low priority, and option 3 means any respawn that loses
+its mailbox is named in the log.
+
+**Not this item, recorded so it is not lost.** In BOTH boots the first `ping 8.8.8.8` after the radio
+took over waited in a net-stack serve pass of 1.3-1.7 s before its echo went out (the echo itself took
+about 30 ms), and every later echo was prompt. Same place, both reserves, so it is not the mailboxes.
+Two samples; not diagnosed.
