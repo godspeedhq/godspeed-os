@@ -41,6 +41,20 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-10-04 - Pi 4: ask the faulting core's own MMU (feat/wifi-driver)
+
+`backlog/72`: the page walk above came back the same way in four faults - every frame allocated and owned
+by the faulting task alone, the leaf valid and executable, and the core had nonetheless taken an L3
+translation fault. The software walk reads the tables through memory and cannot see what the core had
+cached, so the report now also asks the core: `AT S1E0R` on the faulting address at the very top of the
+trap report, then a local TLB flush and the same `AT` again. Stale cached state fails then succeeds; an
+entry that was briefly invalid succeeds at once.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/ptables.rs` | 27 -> 28 (+1) | `at_probe`: two `AT S1E0R` (write only `PAR_EL1`) and one `tlbi vmalle1` (drops only this core's cached translations). Touches no memory and no table. The faulting task is about to be killed, so the flush costs every other task on this core nothing but refills from tables that have not changed. |
+| `arch/aarch64/context.rs` | 9 -> 8 (-1) | Locked in: the reduction from `5ee446d2`, when `switch_context` stopped reading `TTBR0` to compare it with the incoming base (it now installs and flushes on every switch). |
+
 ## 2026-10-04 - Pi 4: a page walk in the user-fault report (feat/wifi-driver)
 
 `backlog/72`: Pi 4 tasks take instruction aborts and permission faults on their own code - the shell on the
@@ -2617,13 +2631,13 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/sdio.rs | 3 | permitted |
 | arch/aarch64/exceptions.rs | 17 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
-| arch/aarch64/context.rs | 9 | permitted |
+| arch/aarch64/context.rs | 8 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 27 | permitted |
+| arch/aarch64/ptables.rs | 28 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |

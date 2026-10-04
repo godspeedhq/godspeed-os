@@ -1,8 +1,9 @@
 # 72. Pi 4 tasks fault on their own code under `chaos max-carnage`
 
-**Status: OPEN - recorded 2026-10-04. Cause NOT found. One hypothesis (a skipped TLB flush on a recycled
-page-table root) was tested on hardware and FALSIFIED; the change it produced is kept because it is
-strictly more correct, not because it fixed anything.**
+**Status: OPEN - recorded 2026-10-04. Cause NOT found, but narrowed: the fault-path page walk shows the
+table is right and owned by the faulting task alone, so the core used a translation the table does not
+hold. One hypothesis (a skipped TLB flush on a recycled page-table root) was tested on hardware and
+FALSIFIED; the change it produced is kept because it is strictly more correct.**
 
 ## Evidence
 
@@ -81,14 +82,46 @@ entry says "not executable" when the fetch happens. Two explanations survive:
 2. **The table is right but published late.** Another core walks it before the stores that built it are
    visible. `finalize_service_address_space` issues `dsb ishst`, but only on the spawning core.
 
+## The walk, on the card (2026-10-04, `5883978b`)
+
+The instrument above shipped as `fault_report` and ran on the Pi 4 the same morning: four shell faults,
+one fifteen minutes into an idle WiFi soak (the shell resuming from a `ping` waiting for its reply) and
+three in a row on the respawned shell running `selfcheck`. All four read the same:
+
+```text
+ESR_EL1 = 0x82000007 (instruction abort, lower EL), translation fault L3
+TTBR0 root 0x5af0000 - a live address space
+root / L2 table / L3 table / page - allocated - no other address space holds it
+L3[86] = 0x20000005db87c7
+leaf: EL0 access yes, read-only, EL0 execute yes, access flag set
+verdict: the table ALLOWS this access now - the core used a translation the table does not hold
+```
+
+- **Explanation (1) is ruled out for these faults.** Every frame on the walk is allocated and held by the
+  faulting task alone, and the descriptors are the ones a loader writes, not garbage.
+- **But the core faulted at L3 with a TRANSLATION fault** - its walker found that entry invalid - while the
+  same entry, read through memory moments later, is valid and executable. The walker read something the
+  table does not hold now.
+- `TCR_EL1` is right on every core (walks inner write-back, inner shareable), and the kernel writes tables
+  through a matching cacheable, inner-shareable direct map. Not an attribute mismatch.
+- Each fault is on the first fetch after the shell RESUMES from a blocking call, so just after a switch back
+  to it, and the respawned shell got the same root, `0x5af0000`, each time.
+
+Two explanations are left, and they now mean something narrower than (2) above:
+
+- **A stale cached translation.** The core walked with a TLB or walk-cache entry - an upper-level pointer to
+  an old L3 table - that the table no longer holds. Every address space uses ASID 0, so an entry cached
+  from any of them is usable by all of them.
+- **An entry briefly invalid.** Something wrote that descriptor to invalid and back.
+
 ## Next step
 
-An instrument, not another fix. On a user instruction or permission abort, have the kernel walk the
-faulting task's table at `FAR`, print the L1/L2/L3 descriptors and each table's physical frame, and report
-which task the frame allocator believes owns those frames. A garbage descriptor, or a frame owned by
-someone else, is (1) and names the culprit; a correct descriptor that walks to the right page is (2).
-Print-only and in the fault path alone. It is a kernel change: the operator's go-ahead, a QEMU boot, then
-one storm on the card.
+`at_probe`: at the very top of the trap report, before anything prints, the kernel asks the faulting
+core's own MMU to translate `FAR` (`AT S1E0R`), flushes that core's TLB, and asks again. The software walk
+reads memory; `AT` reads what the core has cached. Fails-then-succeeds is the stale cached translation;
+succeeds at once is the briefly invalid entry. Verified in QEMU (a 15-round storm, the null-page filter
+removed for the run: 18 faults, both answers "translation fault at level 2", matching the walk, no panic).
+`selfcheck` on the card reproduces the fault within seconds, so one boot answers it.
 
 ## Related, latent
 

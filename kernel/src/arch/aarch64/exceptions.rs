@@ -676,6 +676,13 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // SAFETY: `frame` is the trap frame the vector assembly just built on the current stack; it is
     // valid for the life of this call and nothing else aliases it.
     let f = unsafe { &*frame };
+    // Ask this core's own MMU about the faulting address BEFORE anything else runs (`backlog/72`): every
+    // line printed below can evict or refill the TLB, and the question is what the core held at the
+    // fault. Same gate as the page walk that prints the answer.
+    let ec = (esr >> 26) & 0x3F;
+    let lower_el0 = (8..=11).contains(&vector) && (f.spsr & 0x1F) == 0;
+    let walk = lower_el0 && (ec == 0b100000 || ec == 0b100100) && far >= 0x1000;
+    let at = if walk { super::ptables::at_probe(far) } else { (0, 0) };
 
     super::put_str(b"\r\n*** aarch64 EXCEPTION: ");
     super::put_str(vector_name(vector));
@@ -1213,9 +1220,8 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // installed says about the faulting address, and whether its frames have a second owner. Skipped for
     // the null page, which is where the DESIGNED faults land - a service panicking on `EndpointDead` faults
     // at address 0 on purpose, dozens of times in a storm, and walking each would bury the faults this is for.
-    let ec = (esr >> 26) & 0x3F;
-    if from_el0 && (ec == 0b100000 || ec == 0b100100) && far >= 0x1000 {
-        super::ptables::fault_report(far, ec == 0b100000);
+    if walk {
+        super::ptables::fault_report(far, ec == 0b100000, at);
     }
 
     if from_el0 && slot < crate::task::scheduler::MAX_TASKS {

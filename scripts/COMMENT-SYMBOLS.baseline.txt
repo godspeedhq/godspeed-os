@@ -506,3 +506,4 @@ mmc_send_io_op_cond                # Linux drivers/mmc/core/sdio_ops.c, cited fo
 BRCMF_C_GET_PM                     # Linux brcmfmac fwil.h, cited as the source of command 85 that services/wifi-driver reads after a join - external, 26.14
 BWFM_C_GET_PM                      # OpenBSD bwfmreg.h, the same command 85, cited so the two references agree in the comment - external, 26.14
 PM_FAST                            # Linux brcmfmac power-save mode constant, cited for what that driver sets by default - external, 26.14
+PAR_EL1                            # AArch64 system register: the Physical Address Register that an AT instruction writes its result to; arch/aarch64/ptables.rs at_probe reads it in a user-fault report - external, 26.14

@@ -618,7 +618,69 @@ fn report_desc(level: &[u8], index: usize, d: u64) {
 ///
 /// Read-only, lock-free and bounded: every descriptor is read through `get`, which refuses an address that
 /// is not RAM, and the scan of other roots is three nested loops over at most 512 entries each.
-pub fn fault_report(far: u64, instruction_fetch: bool) {
+/// Ask THIS core's MMU to translate `va` as an EL0 read, then flush this core's TLB and ask again.
+/// Returns the two `PAR_EL1` values.
+///
+/// The software walk in [`fault_report`] reads the tables through memory; it cannot see what the core
+/// itself had cached. `AT` can: it translates through the TLB and the walk caches exactly as an access
+/// would. So the pair separates the two explanations `backlog/72` has left once the walk says the table
+/// ALLOWS the access:
+/// - the first fails and the second succeeds: the core held stale translation state, which the flush
+///   discarded;
+/// - the first succeeds: the core translates correctly now, so whatever the faulting walk read had
+///   changed by the time of the fault report - an entry briefly invalid.
+///
+/// Must run FIRST in the trap report, before printing, so as little as possible has disturbed the TLB.
+/// The local flush costs only refills: the faulting task is about to be killed, and every other task's
+/// translations are re-walked from tables that have not changed.
+pub fn at_probe(va: u64) -> (u64, u64) {
+    let (before, after): (u64, u64);
+    // SAFETY: `AT S1E0R` writes only PAR_EL1, and `tlbi vmalle1` drops only this core's cached
+    // translations; neither touches memory or any table. The `isb` after each `AT` is what makes its
+    // PAR_EL1 result visible to the `mrs` that follows.
+    unsafe {
+        core::arch::asm!(
+            "at s1e0r, {va}",
+            "isb",
+            "mrs {before}, par_el1",
+            "dsb ish",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            "at s1e0r, {va}",
+            "isb",
+            "mrs {after}, par_el1",
+            va = in(reg) va,
+            before = out(reg) before,
+            after = out(reg) after,
+            options(nostack),
+        );
+    }
+    (before, after)
+}
+
+/// One `PAR_EL1` value, decoded: the physical page it translated to, or the fault it reports.
+fn report_par(what: &[u8], par: u64) {
+    super::put_str(what);
+    if par & 1 == 0 {
+        super::put_str(b"translates, to pa ");
+        super::put_hex(par & 0x0000_FFFF_FFFF_F000);
+    } else {
+        let fst = (par >> 1) & 0x3F;
+        super::put_str(b"FAULTS, status ");
+        super::put_hex(fst);
+        super::put_str(match fst & 0b111100 {
+            0b000100 => b" (translation fault)",
+            0b001000 => b" (access flag fault)",
+            0b001100 => b" (permission fault)",
+            _ => b" (other)",
+        });
+        super::put_str(b" at level ");
+        super::put_hex(fst & 0b11);
+    }
+}
+
+pub fn fault_report(far: u64, instruction_fetch: bool, at: (u64, u64)) {
     let ttbr: u64;
     // SAFETY: reading TTBR0_EL1 at EL1 is a side-effect-free system-register read.
     unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack)) };
@@ -632,6 +694,10 @@ pub fn fault_report(far: u64, instruction_fetch: bool) {
         b" - NOT A LIVE ADDRESS SPACE: the core is walking a root nothing owns"
     });
     report_frame(b"root   ", root, root);
+    // What the faulting core's own MMU said, taken at the top of the trap report (`at_probe`). Printed
+    // here, before the walk, because the walk stops early at an unmapped level.
+    report_par(b"\r\n      this core's MMU at the fault:   ", at.0);
+    report_par(b"\r\n      after flushing this core's TLB: ", at.1);
     if far >> 39 != 0 {
         super::put_str(b"\r\n      FAR is above the 39-bit user range - nothing to walk");
         return;
@@ -677,6 +743,14 @@ pub fn fault_report(far: u64, instruction_fetch: bool) {
         } else {
             b"\r\n      verdict: the table REFUSES this access - the fault is the table's own content"
         });
+        // Only where the table allows the access is there anything for the core's answers to explain.
+        if allows {
+            super::put_str(match (at.0 & 1 == 0, at.1 & 1 == 0) {
+                (false, true) => b"\r\n      AT verdict: STALE CACHED TRANSLATION - the core's TLB or walk cache held state the table does not, and the flush cleared it",
+                (true, _) => b"\r\n      AT verdict: the core translates correctly already - the walk that faulted read an entry that has since changed",
+                (false, false) => b"\r\n      AT verdict: the core still fails after a flush - it reads the table differently from this walk",
+            });
+        }
     }
 }
 
