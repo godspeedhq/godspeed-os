@@ -19,6 +19,8 @@
 >    `kernel/src/task/mod.rs`), and `nic-driver` is
 >    spawned `confine=false`. "Confinement is applied per driver" (§6.4) is doing
 >    more work in that sentence than it looks: today it selects exactly one.
+>    *(2026-10-03: two - `audio-driver` is confined too, verified in QEMU only; on the
+>    T630 it does not use DMA yet, so there `xhci` is still the one. CLAUDE.md §6.4.)*
 
 This is the narrative behind H1, the flagship trusted-base reduction. The spec
 (`CLAUDE.md`) is the authority; this document explains the *why* and the *how*.
@@ -276,7 +278,8 @@ amendment fixed:
      iommu: confined BDF 00:10.0 -> domain 1 arena 0x1cf9000..0x1e1d000 (292 pages); DTE invalidated
      ```
 
-     So the only confined driver in the system holds no path to its own MSI message.
+     So the only driver confined on the T630 holds no path to its own MSI message. (`audio-driver`,
+     confined in QEMU since 2026-10-03, is the same case: QEMU's HD Audio controller uses plain MSI.)
    - **MSI-X (capability 0x11)** keeps the message table in **MMIO inside a BAR** (`bir=0` on
      every controller observed here, so BAR0 - the window a driver is granted), and the driver
      holds that BAR. A compromised driver could point its own interrupt elsewhere. Observed on

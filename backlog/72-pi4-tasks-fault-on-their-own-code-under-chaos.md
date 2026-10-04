@@ -1,0 +1,83 @@
+# 72. Pi 4 tasks fault on their own code under `chaos max-carnage`
+
+**Status: OPEN - recorded 2026-10-04. Cause NOT found. One hypothesis (a skipped TLB flush on a recycled
+page-table root) was tested on hardware and FALSIFIED; the change it produced is kept because it is
+strictly more correct, not because it fixed anything.**
+
+## Evidence
+
+Pi 4 (AArch64), `chaos max-carnage all-services 50 yes`, 2026-10-03/04, build `fd55d331` (plus the
+context-switch change below for the last run). Four storms:
+
+| Run | Storm reached | User faults with no `PANIC in service` before them |
+|---|---|---|
+| 1 | round 4 | 2 |
+| 2 | round 8 | at least 4 (of 7; three dumps were garbled by serial interleaving) |
+| 3, `force_turbo=1` | round 1 | 10 |
+| 4, with the context-switch change | round 22 | 8 |
+
+Each storm ends when the SHELL dies, because `chaos` runs as its foreground job. The kernel never panicked,
+and the supervisor restarted everything that died (0 `restart FAILED`).
+
+The faults repeat at FIXED addresses, which random corruption would not:
+
+- `ELR 0x44a3c8` = `service_main`, the shell's FIRST instruction - an instruction abort, permission fault
+  level 3 (`ESR 0x8200000f`), in runs 2, 3 and 4;
+- `0x424960` in `console_write_chunked` (runs 3 and 4), `0x457fb8` in `sleep_ms`, `0x40fdc8` in
+  `chaos_launch`;
+- `hw-enumerator` "executing" at kernel address `0xffffff800008086c`; `control` and others taking data
+  aborts at odd addresses (`0x80000008`, `0x8e002970`).
+
+Each lands within milliseconds of a spawn. The first fault of run 2 came straight after `kill_task ...
+'mem-pressure' freed 7236 frames`.
+
+**QEMU does not reproduce it:** a 30-round Pi 4 storm gave 64 and then 50 exceptions, every one the
+DESIGNED kind - a service panics on `EndpointDead` and its panic handler faults at address 0 on purpose
+(see `project-chaos-service-data-aborts` in the session notes; the tell is the `PANIC in service` line
+before it). Only hardware shows the other kind. The August Pi 4 storm (`build/pi4a.log`, `e9a6878d`) had
+one such fault in 100 rounds, so the class predates this work; the rate is much higher now.
+
+## What is RULED OUT
+
+- **The CPU clock** (run 3). `force_turbo=1` held the Arm clock at 1500 MHz - `power`'s "minimum" read back
+  1500 MHz - and the storm faulted MORE.
+- **The audio jack's DMA.** Its arena is reserved once and never recycled, `start` resets the channel and
+  waits before touching a control block, and every control block's destination is the PWM FIFO: it reads
+  its own arena and writes one peripheral register.
+- **A stale TLB from a recycled root** (run 4, the falsified hypothesis). `switch_context` installed the
+  incoming root, and flushed, only when it differed from the live one; roots are recycled, and a core
+  idling on a dead task's root can refill its TLB speculatively from frames being freed. The switch now
+  installs and flushes on EVERY switch to a task (`arch/aarch64/context.rs`). The faults continued,
+  including `service_main` again. Since the TLB is now flushed before every task runs, a fault's
+  translation comes from the faulting task's CURRENT page tables.
+- **Writes by the page-table walker.** `TCR_EL1` enables no hardware access-flag updates, and the A72
+  cannot do them: a walk reads, never writes.
+- **The service-name changes of 2026-10-03.** They touch no page table, and the class predates them.
+
+## What is left
+
+A permission fault on the first instruction of a fresh task, with a flushed TLB, means that task's own L3
+entry says "not executable" when the fetch happens. Two explanations survive:
+
+1. **The table's contents are wrong.** A frame holding a live task's page table is also in use by another
+   owner - freed by a different task's death, or allocated twice - and that owner's data reads as
+   descriptors. Garbage descriptors explain both the permission faults and the wild addresses.
+2. **The table is right but published late.** Another core walks it before the stores that built it are
+   visible. `finalize_service_address_space` issues `dsb ishst`, but only on the spawning core.
+
+## Next step
+
+An instrument, not another fix. On a user instruction or permission abort, have the kernel walk the
+faulting task's table at `FAR`, print the L1/L2/L3 descriptors and each table's physical frame, and report
+which task the frame allocator believes owns those frames. A garbage descriptor, or a frame owned by
+someone else, is (1) and names the culprit; a correct descriptor that walks to the right page is (2).
+Print-only and in the fault path alone. It is a kernel change: the operator's go-ahead, a QEMU boot, then
+one storm on the card.
+
+## Related, latent
+
+ARMv7 (`arch/arm/context_switch.rs`) and x86 (`arch/x86_64/context_switch.rs`) still skip the root install
+when it matches the live one. That skip turned out not to be this bug, but it is the same unsound
+assumption - equal roots mean the same address space - that recycling breaks. Neither port has a sighting:
+the Pi 2's storms and three 50-round T630 and Wyse storms the same night ran clean. Changing x86 touches the
+context-switch path, so CLAUDE.md 20 asks for B10 and B1 before and after.

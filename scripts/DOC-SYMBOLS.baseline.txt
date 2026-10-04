@@ -131,4 +131,3 @@ dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXT
 gpio_wl_reg_on                     # docs/wifi-aic8800.md - StarFive vendor device-tree property, EXTERNAL; names the radio's GPIO 33 power pin
 SDIO1_AHB                          # docs/wifi-aic8800.md - JH7110 clock/reset name from Linux's starfive bindings, EXTERNAL
 SDIO1_SDCARD                       # docs/wifi-aic8800.md - JH7110 clock name from Linux's starfive bindings, EXTERNAL
-WIFI_SDIO                          # docs/wifi-aic8800.md - PROPOSAL on this branch: the device kind exists on feat/audio (4f34ab63), not here

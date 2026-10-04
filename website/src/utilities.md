@@ -82,6 +82,7 @@ fails.
 | [`cores`](utilities/cores.md) | the cores that came up |
 | [`uptime`](utilities/uptime.md) | how long since boot |
 | [`date`](utilities/date.md) | the wall clock |
+| [`audio`](utilities/audio.md) | sound: what is playing, the volume, a test tone |
 | [`about`](utilities/about.md) | what this system is |
 | [`version`](utilities/version.md) | version, of anything |
 | [`clear`](utilities/clear.md) | clear the screen |

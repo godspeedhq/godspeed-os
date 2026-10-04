@@ -1,0 +1,14 @@
+[package]
+name = "audio-driver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "audio-driver"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }
+# The request protocol, shared with the shell's `audio` (sdk/audio).
+godspeed-audio = { path = "../../sdk/audio" }

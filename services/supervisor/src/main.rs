@@ -256,6 +256,15 @@ static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 // second copy of it.
 #[cfg(has_wifi_driver)]
 static WIFI_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_WIFI_DRIVER_ELF"));
+#[cfg(has_audio_driver)]
+static AUDIO_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_AUDIO_DRIVER_ELF"));
+#[cfg(has_pwm_audio)]
+static PWM_AUDIO_ELF: &[u8] = include_bytes!(env!("SVC_PWM_AUDIO_ELF"));
+/// Which Pi `pwm-audio` runs on, as its `mode` (2 = Pi 2, 4 = Pi 4): a board fact from `build.rs`.
+#[cfg(all(has_pwm_audio, pwm_audio_pi4))]
+const PWM_AUDIO_BOARD: u32 = 4;
+#[cfg(all(has_pwm_audio, not(pwm_audio_pi4)))]
+const PWM_AUDIO_BOARD: u32 = 2;
 
 /// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
 /// every service whose image the supervisor holds.
@@ -548,12 +557,13 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
          godspeed_sdk::service_context::hwclass::pci(
              0x02_00_00, godspeed_sdk::service_context::hwclass::BAR_AUTO, false)
      } else { godspeed_sdk::service_context::hwclass::NIC }),
-    // The Pi 4's onboard CYW43455 radio, over SDIO (docs/wifi.md). `hwclass::NONE` is not an
-    // omission: the Arasan SD host controller this drives is at a FIXED SoC address on no enumerable
-    // bus, so the window comes from `map_fixed_driver_mmio` - which the spawn path consults BY NAME
-    // whenever the class path yields nothing - and only where the kernel's boot census saw that
-    // controller answer. A new hardware class would be a kernel enum arm, an SDK constant and a schema
-    // enum member all to restate what the name already says.
+    // The Pi 4's onboard CYW43455 radio, over SDIO (docs/wifi.md). Named by its device KIND,
+    // `hwclass::WIFI_SDIO`: the Arasan SD host controller it drives is at a FIXED SoC address on no
+    // enumerable bus, so the kernel grants the window - and the radio's power control - by that kind,
+    // and only where its boot census saw the controller answer. This row said `NONE` and the kernel
+    // granted both BY NAME, which is the name-keyed authority table step D removes: any service the
+    // supervisor spawned as `wifi-driver` got the radio (`docs/audio.md`, "No service names in the
+    // kernel").
     //
     // No DMA arena and no interrupt, deliberately: every command this phase issues rides the SDIO
     // command line and completes in microseconds. Both arrive with the firmware upload that needs
@@ -566,11 +576,38 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // path - Commandment IX - for a peer chaos restarts. It comes back with the phase that has traffic
     // worth tracing, and with the reacquire-and-retry that then means something.
     //
-    // `0` for the device class, like every other row with no class to name. It is not an omission: see
-    // the paragraph above about `map_fixed_driver_mmio`.
+    // Its device class is `WIFI_SDIO`, the kind the kernel grants the radio's window and power by (see
+    // the paragraph above).
     #[cfg(has_wifi_driver)]
     ("wifi-driver", WIFI_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     16 * 1024 * 1024, 3, &["fs", "power"], 0, 0, 0),
+     16 * 1024 * 1024, 3, &["fs", "power"], 0, 0,
+     godspeed_sdk::service_context::hwclass::WIFI_SDIO),
+    // The HD Audio controller (docs/audio.md). Named by the bus, like every PCI driver since step D:
+    // 0x040300 is class 0x04 multimedia, subclass 0x03 HD Audio, and the registers are in BAR0.
+    //
+    // A2 ADDS A DMA ARENA (`dma_pages` below): the command rings and a ring of sound. On this driver's
+    // death the kernel clears its device's bus mastering, keyed on the device it was given
+    // (`kernel/src/task/scheduler.rs`). WITH an interrupt (`pci_irq`): the stream interrupts as each
+    // period is played and the driver refills then; the kernel picks the vector from its MSI pool.
+    // One peer, `fs`, for `/audio.settings` - the volume and the mute kept across a restart (A4).
+    //
+    // CONFINED behind the IOMMU (§6.4), where there is one: every DMA the controller makes - the command
+    // rings, the buffer descriptor list, the ring of sound - is inside the arena, so nothing it does
+    // legitimately is refused, and a driver that pointed it elsewhere would fault instead of writing.
+    // The second confined driver after `xhci`; the kernel releases the confinement on its death by the
+    // device it was given, not its name (`kernel/src/task/scheduler.rs`).
+    #[cfg(has_audio_driver)]
+    ("audio-driver", AUDIO_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 2, &["fs"], 0, 0,
+     godspeed_sdk::service_context::hwclass::pci_irq(0x04_03_00, 0, true)),
+    // The Pis' 3.5 mm jack (docs/audio.md, "The Pis"): PWM fed by the SoC's DMA engine. Named by its
+    // device kind - the kernel routes the jack's pins and starts the PWM clock as part of the grant,
+    // then maps the PWM and DMA pages and grants a DMA arena. `mode` says which Pi. One peer, `fs`, for
+    // `/audio.settings`.
+    #[cfg(has_pwm_audio)]
+    ("pwm-audio", PWM_AUDIO_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 2, &["fs"], 0, PWM_AUDIO_BOARD,
+     godspeed_sdk::service_context::hwclass::AUDIO_PWM),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -657,7 +694,8 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // spawn at all on a 2-core machine instead of landing on another core.
     let caller_chose = !(core == 0xFFFF || core == u32::MAX);
     req.core         = if caller_chose { core } else { table_core };
-    req.flags        = flags | if caller_chose { godspeed_sdk::service_context::SPAWN_FLAG_CORE_STRICT } else { 0 };
+    req.flags        = flags | if caller_chose { godspeed_sdk::service_context::SPAWN_FLAG_CORE_STRICT } else { 0 }
+                     | if is_watched(name) { godspeed_sdk::service_context::SPAWN_FLAG_WATCHED } else { 0 };
     req.memory_limit = mem;
     // Privileges the supervisor asks the child be given. The kernel refuses any bit the SUPERVISOR
     // does not itself hold, so this passes authority on rather than minting it.
@@ -687,6 +725,9 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
         "xhci" => 32 + 256 + 4,
         // 64 KiB - the `_ => EHCI_DMA_PAGES` default the NIC used to fall through to.
         "nic-driver" => 16,
+        // 68 KiB used, rounded up: the command rings (CORB 1 KiB, RIRB 2 KiB), the buffer descriptor
+        // list, and a 64 KiB ring of sound - about a third of a second at 48 kHz stereo (docs/audio.md).
+        "audio-driver" => 24,
         _ => 0,
     };
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
@@ -1075,7 +1116,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 15;
+const MANAGED_N: usize = 17;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -1098,7 +1139,19 @@ const MANAGED: [&str; MANAGED_N] =
      "wifi-driver",
      // The power policy (docs/power.md). A respawn knows of no lease and puts the clock at its minimum,
      // which is why its absence from this list would matter: dead, nothing would answer a lease at all.
-     "power"];
+     "power",
+     // The audio drivers (docs/audio.md): HD Audio on x86, the PWM jack on the Pis. Listed
+     // unconditionally for the reason above.
+     "audio-driver", "pwm-audio"];
+
+/// Does this supervisor want the kernel to report `name`'s death and count it as a restart? Every service
+/// it MANAGES, and `counter` (an example with its own death-loop arm). Said in the spawn request as
+/// `SPAWN_FLAG_WATCHED`, so this roster is the ONLY list of watched services in the system: the kernel's
+/// two copies of it (death notification, restart count) are gone, and with them the drift that cost `time`
+/// and `control` their restarts (`docs/audio.md`, "No service names in the kernel").
+fn is_watched(name: &str) -> bool {
+    MANAGED.contains(&name) || name == "counter"
+}
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -1634,6 +1687,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(has_wifi_driver)]
     ensure_wired(&ctx, &mut name_map, "wifi-driver", &["fs", "power"]);
 
+    // audio-driver (docs/audio.md). MANAGED: the kernel stops a dead driver's bus mastering by the
+    // device it was given (not by name), so a death is quiesced and restarted like any other driver's.
+    // Wired to `fs` for `/audio.settings` (the storage chain is up by here, so the cap wires at spawn);
+    // `ensure_wired` adopts a running instance on a supervisor respawn.
+    #[cfg(has_audio_driver)]
+    ensure_wired(&ctx, &mut name_map, "audio-driver", &["fs"]);
+    // The Pis' jack, the same way (docs/audio.md).
+    #[cfg(has_pwm_audio)]
+    ensure_wired(&ctx, &mut name_map, "pwm-audio", &["fs"]);
+
    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 
     // net-stack: the model-agnostic half of networking (docs/networking.md). Speaks ARP/IP over raw
@@ -1680,122 +1743,77 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     loop {
         let msg = ctx.recv();
-        // A command, or a death notification? The first byte decides (see supcmd::MARKER).
-        if handle_command(&ctx, &mut name_map, msg.payload_bytes()) { continue; }
-        let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
-        // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
-        // ALREADY respawned this service before its queued death notification reached us. If it is
-        // already alive, a restart here hits the kernel singleton guard ("already running") and logs a
-        // FALSE "restart FAILED" - a loud non-failure that erodes trust in the signal (§26.4). Skip the
-        // doomed restart quietly (log "already recovered"); still run the reconcile backstop below so a
-        // genuinely-dropped OTHER death is caught this iteration. Same `task_stat` liveness the
-        // convergence uses, so the two paths agree on "alive".
-        if !name.is_empty() && name_alive(&ctx, name) {
-            ctx.log_fmt(format_args!("supervisor: {} already recovered (reconcile won the race)", name));
-            reconcile(&ctx, &mut name_map);
-            continue;
+        handle_message(&ctx, &mut name_map, &msg);
+        // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
+        // multi-kill it found the services whose notifications were still QUEUED behind this one, respawned
+        // them, and logged "missed death notification" for each - and then each notification arrived and
+        // logged that it had already recovered. On the T630 a 50-round storm printed 174 of
+        // the first and 293 of the second, with the kernel reporting no notification lost at all. Handling
+        // the queue first makes the sweep what it says it is: a backstop for a death nobody was told about.
+        //
+        // BOUNDED, because a flood can keep this endpoint full: after DRAIN_MAX the sweep runs anyway, so
+        // a storm cannot starve the backstop (26.6). 64 is four queue-fulls.
+        const DRAIN_MAX: u32 = 64;
+        let mut drained = 0;
+        while drained < DRAIN_MAX {
+            let Some(next) = ctx.try_recv() else { break };
+            handle_message(&ctx, &mut name_map, &next);
+            drained += 1;
         }
-        // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
-        // respawn WIRED FROM THE MAP - same peers as at boot - and the spawn refreshes the map with
-        // the new instance's cap (record updates in place, so a kill-storm can't grow the map). The
-        // restarted service is supervisor-wired just like at boot; clients reacquire it by name via
-        // the kernel directory (§14.3). The "died/restarted" log lines are kept (tests gate on them).
-        match name {
-            "block-driver" => {
-                ctx.log("supervisor: block-driver died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "block-driver") { ctx.log("supervisor: block-driver restarted"); }
-                else { ctx.log("supervisor: block-driver restart FAILED"); }
-            }
-            "fs" => {
-                ctx.log("supervisor: fs died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "fs") { ctx.log("supervisor: fs restarted"); }
-                else { ctx.log("supervisor: fs restart FAILED"); }
-            }
-            "shell" => {
-                // The user's interface is restartable too ("nothing escapes"): a crash or a
-                // deliberate `kill shell` respawns a FRESH prompt. spawn_wired spawns a new instance
-                // (the singleton guard only blocks a LIVE duplicate), re-granting its console-read +
-                // service_control caps and wiring its `fs` peer from the map. The in-flight command
-                // is lost (state is not resumed, §14.2/§25) but the session recovers.
-                ctx.log("supervisor: shell died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "shell") { ctx.log("supervisor: shell restarted"); }
-                else { ctx.log("supervisor: shell restart FAILED"); }
-            }
-            // The USB host drivers + events are directly restartable now: their OWN death respawns
-            // them immediately (re-granting MMIO/DMA/IRQ caps + re-initialising the controller),
-            // instead of waiting for a lucky supervisor respawn. This is what keeps a `chaos
-            // max-carnage` that kills `xhci`/`ehci` in its last rounds from leaving the keyboard dead.
-            "xhci" => {
-                ctx.log("supervisor: xhci died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "xhci") { ctx.log("supervisor: xhci restarted"); }
-                else { ctx.log("supervisor: xhci restart FAILED"); }
-            }
-            "ehci" => {
-                ctx.log("supervisor: ehci died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "ehci") { ctx.log("supervisor: ehci restarted"); }
-                else { ctx.log("supervisor: ehci restart FAILED"); }
-            }
-            // dwc2 (ARM32 only): the Pi 2's USB host. block-driver and nic-driver both name it as a
-            // peer, so its permanent death takes storage, the keyboard and networking with it - which
-            // is exactly why nothing may be exempt from restart (C5-1). Its respawn re-grants the
-            // DWC2 MMIO window, DMA arena and IRQ, re-initialises the controller and re-enumerates;
-            // clients reacquire it by name and retry (§14.3).
-            "dwc2" => {
-                ctx.log("supervisor: dwc2 died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "dwc2") { ctx.log("supervisor: dwc2 restarted"); }
-                else { ctx.log("supervisor: dwc2 restart FAILED"); }
-            }
-            "events" => {
-                ctx.log("supervisor: events died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "events") { ctx.log("supervisor: events restarted"); }
-                else { ctx.log("supervisor: events restart FAILED"); }
-            }
-            // counter (examples/counter, counter-test build): respawn it wired to `fs` - the fresh
-            // instance reconstructs its count from /counter.dat (§14/§15). The "died/restarted" lines
-            // are what `osdev test counter` gates on. (Only ever sent when counter is actually live.)
-            "counter" => {
-                ctx.log("supervisor: counter died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "counter") { ctx.log("supervisor: counter restarted"); }
-                else { ctx.log("supervisor: counter restart FAILED"); }
-            }
-            // The NIC stack is restartable too: nic-driver re-grants its MMIO/DMA/IRQ (its DMA arena is
-            // reserved once and reused, NIC_DMA_PHYS) + re-inits the controller; net-stack re-runs its
-            // DHCP/ARP/ICMP dance and re-registers. Clients (the shell's net/ping) reacquire net-stack by
-            // name (§14.3). net-stack also reacquires nic-driver by name, so either death order recovers.
-            "nic-driver" => {
-                ctx.log("supervisor: nic-driver died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "nic-driver") { ctx.log("supervisor: nic-driver restarted"); }
-                else { ctx.log("supervisor: nic-driver restart FAILED"); }
-            }
-            "net-stack" => {
-                ctx.log("supervisor: net-stack died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "net-stack") { ctx.log("supervisor: net-stack restarted"); }
-                else { ctx.log("supervisor: net-stack restart FAILED"); }
-            }
-            // The radio is restartable like any other driver: the respawn re-grants its SDIO register
-            // window (by name, subject to the same census gate) and the service re-runs identification
-            // from CMD0, which is a re-init rather than a resume - the card is put back into the idle
-            // state and re-selected, so a half-finished transaction on the old instance is not
-            // inherited (§14.2).
-            "wifi-driver" => {
-                ctx.log("supervisor: wifi-driver died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "wifi-driver") { ctx.log("supervisor: wifi-driver restarted"); }
-                else { ctx.log("supervisor: wifi-driver restart FAILED"); }
-            }
-            // The power policy. A respawn knows of no lease and puts the clock at its minimum; a holder
-            // whose lease died with it runs slower until it asks again (docs/power.md).
-            "power" => {
-                ctx.log("supervisor: power died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "power") { ctx.log("supervisor: power restarted"); }
-                else { ctx.log("supervisor: power restart FAILED"); }
-            }
-            _ => {}
-        }
-        // Reconcile backstop: catch any managed service whose death notification was DROPPED under the
-        // storm (our 16-deep endpoint overflowed, or a flood clogged it) - it would otherwise stay dead
-        // forever (the "fs gone from observe after a storm" bug). A storm always has a next death to
-        // ride, so a dropped one is recovered on the following notification. Cheap when nothing is dead.
+        // Reconcile backstop: catch any managed service whose death notification never reached us - our
+        // 16-deep endpoint overflowed under a storm, or we were ourselves dead and respawning when it was
+        // sent (the kernel says which, `UNHEARD` / dropped). It would otherwise stay dead forever (the "fs
+        // gone from observe after a storm" bug). Cheap when nothing is dead.
         reconcile(&ctx, &mut name_map);
+    }
+}
+
+/// One message on the supervisor's endpoint: an operator command, or a death notification. Taken out of
+/// the main loop so the loop can drain its queue before the reconcile sweep (see there).
+fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, msg: &Message) {
+    // A command, or a death notification? The first byte decides (see supcmd::MARKER).
+    if handle_command(ctx, name_map, msg.payload_bytes()) { return; }
+    let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
+    // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
+    // ALREADY respawned this service before its queued death notification reached us. If it is
+    // already alive, a restart here hits the kernel singleton guard ("already running") and logs a
+    // FALSE "restart FAILED" - a loud non-failure that erodes trust in the signal (§26.4). Skip the
+    // doomed restart quietly (log that it was already respawned); the main loop still runs the reconcile backstop so a
+    // genuinely-dropped OTHER death is caught this iteration. Same `task_stat` liveness the
+    // convergence uses, so the two paths agree on "alive".
+    if !name.is_empty() && name_alive(ctx, name) {
+        // WHO won is said honestly: since the loop drains its queue before sweeping, the sweep almost
+        // never gets here first. What does is a NEW supervisor's startup convergence, which restores
+        // every dead service before it reads the notices that queued for it while it was down - on the
+        // T630 all 152 of these in a 50-round storm followed one of its 27 respawns, and none other.
+        ctx.log_fmt(format_args!("supervisor: {} already respawned when its death notice was read", name));
+        return;
+    }
+    // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
+    // respawn WIRED FROM THE MAP - same peers as at boot - and the spawn refreshes the map with
+    // the new instance's cap (record updates in place, so a kill-storm can't grow the map). The
+    // restarted service is supervisor-wired just like at boot; clients reacquire it by name via
+    // the kernel directory (§14.3). The "died/restarted" log lines are kept (tests gate on them).
+    // ONE ARM FOR EVERY WATCHED SERVICE. This was fourteen arms, each the same three lines, and so a
+    // third copy of the `MANAGED` roster - which drifted exactly as the kernel's two copies did:
+    // `console`, `control`, `time` and `hw-enumerator` had none. Their notification ARRIVED, matched
+    // nothing, and the reconcile sweep below respawned them and logged "missed death notification",
+    // which was false - the T630 showed it for a single `kill console` with nothing else happening.
+    // The roster is `is_watched` now, the same answer the spawn request gives the kernel.
+    //
+    // What the respawn does is the service's, not this arm's, and is the same for every one: the
+    // kernel re-grants what the spawn row names (MMIO, DMA arena, IRQ, display, power control), the
+    // fresh instance re-initialises its device or reconstructs its state (fs replays its journal,
+    // counter re-reads /counter.dat, net-stack re-runs DHCP, a USB host re-enumerates, the shell
+    // gives a fresh prompt), and clients reacquire it by name and retry (14.2, 14.3). An in-flight
+    // operation is lost, never resumed (25). The "died/restarted" lines are what tests gate on.
+    if !name.is_empty() && is_watched(name) {
+        ctx.log_fmt(format_args!("supervisor: {} died, restarting", name));
+        if respawn_retry(ctx, name_map, name) {
+            ctx.log_fmt(format_args!("supervisor: {} restarted", name));
+        } else {
+            ctx.log_fmt(format_args!("supervisor: {} restart FAILED", name));
+        }
     }
 }
 

@@ -55,10 +55,16 @@ and why; read them for the reasoning, not to find out what the library contains.
   `hold_parked` sleeps first and spins the rest, for holds of tens of milliseconds. On an uncalibrated
   clock both sleep whole scheduler quanta, erring long, because a hold is a minimum.
   **`hold_parked` has one caller (`ehci`)** and is in on probation - step 1l says why.
+- **`irq`** - waiting for a device's interrupt on the endpoint its clients also send to. `Irq::granted`,
+  `routed`, `seen`; `wait(budget)` returns `Interrupt`, `Request(message)` or `Timeout`, so a request is
+  handed back to be served and never dropped; `rearm` re-opens a level-triggered line (a no-op for MSI).
+  With no interrupt routed the same loop is a timed wait that still serves requests. Its first user is
+  `audio-driver` (step 2); `xhci`, `ehci` and `dwc2`, whose hand-written copies it was built from, are
+  not converted yet.
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f), `sdk/wifi`
 (1d), `dwc2` (1g, 1h), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l - **not yet
-verified on hardware**).
+verified on hardware**). `audio-driver` was written on the library from the start (`wait`, `delay`, `irq`).
 
 **Left by hand, each with its reason in its step.**
 
@@ -90,7 +96,7 @@ The question for every part of a driver is the one that decides membership:
 |-------------------------------------------|------------------------------------------|
 | The Broadcom control protocol (BCDC)      | Waiting for hardware, bounded by time (**built: `wait`, polling or paced**) |
 |                                           | Holding still for a set minimum time (**built: `delay::hold`, `delay::hold_parked`**) |
-| BDC framing, firmware command ids         | Interrupt waiting                        |
+| BDC framing, firmware command ids         | Interrupt waiting (**built: `irq`**)      |
 | The CLM blob, escan, `bss_info`           | DMA and buffer facilities                |
 | A chip's recovery sequence                | Bus access                               |
 | A controller's register map and its errata | Power leases and device power/reset authority |
@@ -559,3 +565,41 @@ once. The raw cycle counts were the intended times only on the T630's ~2 GHz cou
 times now on every board.
 
 **Verified:** builds for every port. On the T630, NOT YET.
+
+## Step 2: `gs::driver::irq` - interrupt waiting, tested by audio (2026-10-03)
+
+**Where it came from.** Three drivers wait for their interrupt by hand - `xhci`, `ehci` and `dwc2` - and
+each idles the same way: a timed receive on its endpoint, then a decision about what woke it. The
+kernel's notification is a one-byte message naming the vector; anything else on the endpoint is a
+client's request. The copies' own comments record what getting that wrong cost:
+
+- **`dwc2` took a request and dropped it** whenever it had no disk, so `block-driver` - blocked in
+  request/reply - hung before its first log line, and `fs` with it. A receive consumes; it does not peek.
+- **`xhci` counted every wake as an interrupt**, so with a disk attached its "waking on interrupts" line
+  was set by disk requests and proved nothing about MSI.
+- **A receive deadline of zero blocks forever**, so a budget that rounds to zero turns the watchdog
+  into a hang.
+
+`irq::Irq::wait` is that loop once: it returns `Interrupt`, `Request(message)` or `Timeout`, and a
+request comes back to the caller to be served. Its deadline is never zero (a host test pins it, with
+the uncalibrated case floored to one scheduler quantum, the answer `duration_cycles` already gives).
+With no interrupt routed it is a timed wait that still serves requests, so a driver keeps one loop.
+
+**The test was audio, which none of the three resembles.** `audio-driver` refills a ring of sound when
+the HD Audio stream says a period has played: each buffer descriptor asks for an interrupt on
+completion, and the driver asks for a vector in its spawn row (`hwclass::pci_irq`). It fit without
+bending - the refill loop's wait became `irq.wait(watchdog)`, and the three outcomes are three arms: the
+interrupt clears the stream's status and re-arms, a request is refused (the driver has no protocol
+until A4), a timeout counts a watchdog wake. The idle loop uses the same wait, which also passes over a
+late interrupt raised while the stream was stopping instead of treating it as a request.
+
+**Verified in QEMU** (`build/audio_irq_qemu.log`): the kernel routed MSI vector `0x30` to the HD Audio
+controller, the tone played with 0 underruns, and the refill ran on **13 interrupts and 0 watchdog
+wakes** - the same in the instance the supervisor restarted after a kill, which got the same vector
+back. The prediction was 12, the periods the tone fills (11.7, rounded up); 13 twice is not explained
+yet. The likely cause is the stream's position lagging its interrupt, so the twelfth look reads just
+short of the tone, and that is a hypothesis until the position at each interrupt is logged.
+
+**Not done: `xhci`, `ehci` and `dwc2` are still hand-written.** Converting them is the step that proves
+the library replaced its sources rather than joined them, and each needs its own hardware (the T630
+and the Pi 2), so it is its own work, one driver per step.

@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# X86 ONLY. An Intel High Definition Audio controller (docs/audio.md): QEMU's `intel-hda`, and the
+# T630's chipset audio.
+#
+# Named by the bus, as every PCI driver is since step D (docs/service-ownership.md 5): class 0x04
+# multimedia, subclass 0x03 HD Audio, prog-if 0x00. The kernel resolves the device and its register
+# window from its own scan; the driver never names an address.
+#
+# What it holds (docs/audio.md): the register window; a DMA arena for the command rings, the buffer
+# descriptor list and the ring of sound, confined behind the IOMMU where there is one; and an INTERRUPT,
+# because the stream interrupts as each period plays and the driver refills then. On its death the
+# kernel stops the device's bus mastering and releases the confinement. One peer, `fs`, for
+# `/audio.settings`: the volume and the mute, kept across a restart.
+name    = "audio-driver"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[placement]
+core = 2
+
+[capabilities]
+# `hw_pci_bar` is an INDEX, not an address: HD Audio puts its registers in BAR0.
+hw_pci_class = "040300"
+hw_pci_bar = 0
+# NO VECTOR NUMBER: the driver declares only that it needs an interrupt, and the kernel allocates one
+# from its MSI pool at spawn (routing a vector is authority - see the same line in xhci's contract).
+hw_pci_irq = true
+ipc_send    = ["fs"]
+ipc_receive = ["audio-driver"]
+log_write   = true

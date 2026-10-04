@@ -234,6 +234,34 @@ lease nobody returns expires on its own, so a holder that dies cannot pin the ma
 
 **Peers:** none - it answers, it does not ask.
 
+### `audio-driver` - sound
+
+```
+   HD Audio controller ──MSI──▶ audio-driver ──▶ CORB/RIRB ──▶ codec (power, amps, pin, converter)
+                                     │
+                                     └──▶ a ring of sound in its DMA arena, refilled per period
+```
+
+Intel High Definition Audio, x86 only, built so far in QEMU. The stream interrupts as each period of
+the ring is played and the driver refills it then; its DMA is confined behind the IOMMU where there is
+one. On its death the kernel stops the controller's DMA and releases the confinement, keyed on the
+device it was given rather than its name. The `audio` command is not built yet (`docs/audio.md`).
+
+**Peers:** `fs`, for `/audio.settings`.
+
+### `pwm-audio` - sound on the Pis
+
+```
+   shell (audio) ──▶ pwm-audio ──▶ DMA engine ──▶ PWM FIFO ──▶ the 3.5 mm jack
+                         └──▶ fs (/audio.settings)
+```
+
+The same protocol as `audio-driver`, for a different device: the Pis have no codec, so each sample is a
+PWM duty cycle, moved by the DMA engine as the PWM asks. The kernel routes the jack's pins and starts the
+PWM clock when it grants the device, because both live in blocks shared with every other pin and clock.
+
+**Peers:** `fs`, for `/audio.settings`.
+
 ### `time` - the wall clock
 
 ```

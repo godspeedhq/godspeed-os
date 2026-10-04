@@ -124,85 +124,102 @@ def matches_line(ln, rx, sk):
 def check_managed_watched(check, pins):
     """Every service the supervisor MANAGES must be watched for death AND counted when it restarts.
 
-    THREE lists describe one fact - "these services must recover from their own death, visibly":
-    the supervisor's MANAGED list (the slow reconcile sweep), the kernel's death-notification set
-    (immediate respawn), and the kernel's restart-COUNTER set (what `observe` reports). When they
-    disagree, the loser still comes back on the next sweep, so nothing is dead forever and nothing
-    looks broken - and if it is missing from the counter too, the only view an operator has of recovery
-    reports that nothing ever happened.
+    The fact once lived in THREE lists - the supervisor's MANAGED roster, the kernel's death-notification
+    set, the kernel's restart-counter set - and this check compared them, because they drifted: a
+    100-round storm killed `time` 41 times and `control` 47, emitted not one "died, restarting", and
+    `observe` showed ZERO restarts for both.
 
-    Hardware showed both halves at once. A 100-round storm killed `time` 41 times and `control` 47,
-    emitted not one "died, restarting", and `observe` showed ZERO restarts for both.
+    Since 2026-10-03 the fact lives in ONE list. The supervisor says, in each spawn request, which tasks
+    it manages (`SPAWN_FLAG_WATCHED`, from MANAGED), and the kernel reports and counts the deaths of
+    exactly the tasks it was asked to - it holds no roster of service names (`docs/audio.md`, "No service
+    names in the kernel"). So the property is now a CHAIN, and this checks every link:
 
-    Derived from all three sources: nothing to declare, nothing to keep in step by hand. The reverse
-    direction is deliberately NOT an error - the kernel sets may name services that exist in only one
-    build (`counter`, `dwc2`, `supervisor`), and naming an absent service costs nothing.
+      1. MANAGED parses, and is not empty.
+      2. The supervisor's `is_watched` answers from MANAGED.
+      3. Its spawn request sets `SPAWN_FLAG_WATCHED` from `is_watched(name)`.
+      4. The kernel's syscall carries the flag into the spawn, and the spawn records it before commit.
+      5. The kernel's death path guards BOTH the notification and the restart count on that record -
+         and no list of service names guards either. A name list coming back is the regression.
+      6. The supervisor ACTS on every notification it is sent: its death handler answers from
+         `is_watched`, not from per-name arms. Fourteen identical arms were a third copy of the roster,
+         and four services had none - their deaths arrived, matched nothing, and were respawned by the
+         reconcile sweep under a false "missed death notification".
     """
+    import re
     sup = pins.get("_managed_src")
     if sup is None:
         sup = read(os.path.join(ROOT, "services/supervisor/src/main.rs"))
     ker = pins.get("_notify_src")
     if ker is None:
         ker = read(os.path.join(ROOT, "kernel/src/task/scheduler.rs"))
+    flag = pins.get("_flag_src")
+    if flag is None:
+        flag = (read(os.path.join(ROOT, "kernel/src/syscall/dispatch.rs"))
+                + read(os.path.join(ROOT, "kernel/src/task/mod.rs")))
 
-    # Strip line comments FIRST. A prose semicolon inside the MANAGED array truncated this parse and
+    # Strip line comments FIRST. A prose semicolon inside the MANAGED array once truncated this parse and
     # returned a plausible short list rather than failing - the exact shape this check exists to catch.
-    decomment = lambda s: re.sub(r"//[^\n]*", "", s)
-    sup_code, ker_code = decomment(sup), decomment(ker)
+    decomment = lambda t: re.sub(r"//[^\n]*", "", t)
+    sup_code, ker_code, flag_code = decomment(sup), decomment(ker), decomment(flag)
 
     m = re.search(r"const MANAGED:\s*\[&str;[^\]]*\]\s*=\s*\[(.*?)\]\s*;", sup_code, re.S)
     if not m:
         return [Violation("services/supervisor/src/main.rs", 0,
                           "cannot find `const MANAGED`: the managed set cannot be derived, and a "
                           "derivation that cannot be performed is a FAILURE, never a pass")]
-    managed = re.findall(r'"([a-z0-9-]+)"', m.group(1))
-    if not managed:
+    if not re.findall(r'"([a-z0-9-]+)"', m.group(1)):
         return [Violation("services/supervisor/src/main.rs", 0,
                           "`const MANAGED` parsed EMPTY - an empty managed set would permit every "
                           "service to go unwatched, so it fails rather than passing vacuously")]
 
-    # There is more than one `matches!(task_name, ...)` in this file, so identify each by the code it
-    # guards rather than by position. `[^)]*` cannot run past its own block, unlike a lazy `.*?`.
-    spans = list(re.finditer(r"matches!\(task_name,([^)]*)\)", ker_code, re.S))
-    blocks = []
-    for i, mm in enumerate(spans):
-        names = set(re.findall(r'"([a-z0-9-]+)"', mm.group(1)))
-        # The window ENDS at the next block, never runs into it. Reading a fixed 400 chars ahead let
-        # one block claim the marker belonging to the next one whenever the two sat close together -
-        # true in the probe corpus, false in the real file, so the check passed while broken.
-        stop = spans[i + 1].start() if i + 1 < len(spans) else len(ker_code)
-        blocks.append((names, ker_code[mm.end():min(stop, mm.end() + 400)]))
-
-    def find(marker, human):
-        for names, after in blocks:
-            if marker in after:
-                return names, None
-        return None, Violation("kernel/src/task/scheduler.rs", 0,
-                               f"cannot find the {human} set (no `matches!(task_name, ...)` guarding "
-                               f"`{marker}`): it cannot be derived, and that is a FAILURE, never a pass")
-
-    notified, e1 = find("ipc::names::lookup", "death-notification")
-    counted, e2 = find("bump_name_restart", "restart-counter")
-    if e1 or e2:
-        return [e for e in (e1, e2) if e]
-    if not notified or not counted:
-        return [Violation("kernel/src/task/scheduler.rs", 0,
-                          "a kernel service set parsed EMPTY - that would mean nothing is watched or "
-                          "nothing is counted, so it fails rather than passing vacuously")]
-
     out = []
-    for name in managed:
-        if name not in notified:
+    w = re.search(r"fn is_watched\(name:\s*&str\)\s*->\s*bool\s*\{(.*?)\n\}", sup_code, re.S)
+    if not w or "MANAGED.contains(" not in w.group(1):
+        out.append(Violation("services/supervisor/src/main.rs", 0,
+                             "`is_watched` is missing or does not answer from MANAGED: a managed service "
+                             "would be spawned unwatched, so its death would never reach the supervisor "
+                             "and its restarts would never be counted"))
+    if not re.search(r"if is_watched\(name\)\s*\{\s*[\w:]*SPAWN_FLAG_WATCHED", sup_code):
+        out.append(Violation("services/supervisor/src/main.rs", 0,
+                             "the spawn request does not set `SPAWN_FLAG_WATCHED` from `is_watched(name)`: "
+                             "the kernel watches only what it is asked to, so nothing would be watched"))
+    if not re.search(r"if !name\.is_empty\(\)\s*&&\s*is_watched\(name\)\s*\{.{0,160}?died, restarting", sup_code, re.S):
+        out.append(Violation("services/supervisor/src/main.rs", 0,
+                             "the death handler does not restart every watched service through "
+                             "`is_watched(name)`: a watched service with no arm is notified, ignored, and "
+                             "left to the reconcile sweep, which then logs a notification it says was missed"))
+    arms = [n for n in re.findall(r'^\s*"([a-z0-9-]+)"\s*=>\s*\{\s*ctx\.log\("supervisor: [a-z0-9-]+ died, restarting', sup_code, re.M)]
+    if arms:
+        out.append(Violation("services/supervisor/src/main.rs", 0,
+                             f"per-service death arms are back ({', '.join(arms[:4])}{', ...' if len(arms) > 4 else ''}): "
+                             f"a list of names beside `MANAGED` is the copy that drifts"))
+    if not re.search(r"req\.flags\s*&\s*SPAWN_FLAG_WATCHED\s*!=\s*0", flag_code):
+        out.append(Violation("kernel/src/syscall/dispatch.rs", 0,
+                             "the SpawnImage syscall does not carry `SPAWN_FLAG_WATCHED` into the spawn"))
+    if "set_task_watched(task_slot, watched)" not in flag_code:
+        out.append(Violation("kernel/src/task/mod.rs", 0,
+                             "the spawn does not record the watched flag (`set_task_watched`) for the "
+                             "task it creates"))
+
+    # The death path: each of the two actions must be guarded by the RECORD, within a short window.
+    def guarded(marker, human):
+        for g in re.finditer(r"if task_watched\(slot\)", ker_code):
+            if marker in ker_code[g.end():g.end() + 900]:
+                return True
+        out.append(Violation("kernel/src/task/scheduler.rs", 0,
+                             f"the {human} is not guarded by `task_watched(slot)`: the kernel must "
+                             f"{human.split()[0]} exactly the tasks the supervisor asked it to watch"))
+        return False
+    guarded("bump_name_restart", "restart count")
+    guarded("ipc::names::lookup", "death notification")
+    for mm in re.finditer(r"matches!\(task_name,([^)]*)\)", ker_code, re.S):
+        names = re.findall(r'"([a-z0-9-]+)"', mm.group(1))
+        if names:
             out.append(Violation("kernel/src/task/scheduler.rs", 0,
-                                 f"'{name}' is MANAGED by the supervisor but is NOT in the kernel's "
-                                 f"death-notification set, so its own death never reaches the "
-                                 f"supervisor. It still returns on the next reconcile sweep, which is "
-                                 f"why this hides: not dead forever, just dead for a while."))
-        if name not in counted:
-            out.append(Violation("kernel/src/task/scheduler.rs", 0,
-                                 f"'{name}' is MANAGED but is NOT in the restart-counter set, so a "
-                                 f"restart is never recorded and `observe` reports 0 for a service "
-                                 f"that died. Recovery that is not counted cannot be observed."))
+                                 f"a list of service names is back in the death path ({', '.join(names[:4])}"
+                                 f"{', ...' if len(names) > 4 else ''}): the supervisor's roster is the one "
+                                 f"list, carried in the spawn request; a second copy is how `time` and "
+                                 f"`control` once went uncounted"))
     return out
 
 def check_syscall_surface(check, pins):
@@ -1629,53 +1646,42 @@ CHECKS = [
     dict(nature="rule", id="V-managed-watched", commandment="V",
          title="a managed service must be watched for its own death",
          kind="custom", fn=check_managed_watched,
-         scope="supervisor MANAGED vs the kernel's death-notification matches!",
-         proves="no service the supervisor manages depends on a slow reconcile sweep to come back "
-                "from its own death",
-         does_not_prove="that the supervisor MANAGES everything it should - a service in neither list "
-                        "is invisible to this check, which is how `dwc2` hid (C5-1)",
+         scope="supervisor MANAGED -> is_watched -> SPAWN_FLAG_WATCHED -> the kernel's per-task record -> "
+               "the death path's notification and restart count",
+         proves="every service the supervisor manages is spawned watched, and the kernel reports and counts "
+                "exactly the deaths of watched tasks, with no list of service names of its own",
+         does_not_prove="that the supervisor MANAGES everything it should - a service absent from MANAGED is "
+                        "invisible to this check, which is how `dwc2` once hid (C5-1)",
          probes=[
-             dict(why="a managed service missing from the notify set must be caught",
-                  pins={"_managed_src": 'const MANAGED: [&str; 2] = ["fs", "time"];',
-                        "_notify_src": 'matches!(task_name, "fs") { ipc::names::lookup(x) } '
-                                       'matches!(task_name, "fs" | "time") { bump_name_restart(n) }'},
-                  expect=True),
-             dict(why="a managed service missing from the restart COUNTER must be caught too",
-                  pins={"_managed_src": 'const MANAGED: [&str; 2] = ["fs", "time"];',
-                        "_notify_src": 'matches!(task_name, "fs" | "time") { ipc::names::lookup(x) } '
-                                       'matches!(task_name, "fs") { bump_name_restart(n) }'},
-                  expect=True),
-             dict(why="a SEMICOLON inside a comment in the array must not truncate the parse - it did, "
-                      "and the two names it dropped were the two under test",
-                  pins={"_managed_src": 'const MANAGED: [&str; 2] =\n    ["fs",\n     // owns the clock; '
-                                        'and the channel\n     "time"];',
-                        "_notify_src": 'matches!(task_name, "fs") { ipc::names::lookup(x) } '
-                                       'matches!(task_name, "fs") { bump_name_restart(n) }'},
-                  expect=True),
-             dict(why="the FIRST matches! in the file is a different gate - picking it by position "
-                      "reads the wrong set, which is how this check first passed while broken",
-                  pins={"_managed_src": 'const MANAGED: [&str; 1] = ["time"];',
-                        "_notify_src": 'matches!(task_name, "time") { bump_name_restart(n) } '
-                                       'matches!(task_name, "fs") { ipc::names::lookup(x) }'},
-                  expect=True),
-             dict(why="a fully-watched, fully-counted managed set must pass",
-                  pins={"_managed_src": 'const MANAGED: [&str; 2] = ["fs", "time"];',
-                        "_notify_src": 'matches!(task_name, "fs" | "time") { ipc::names::lookup(x) } '
-                                       'matches!(task_name, "fs" | "time") { bump_name_restart(n) }'},
+             dict(why="a fully wired chain must pass",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }", "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"},
                   expect=False),
-             dict(why="an extra name in a kernel set is NOT an error (build-specific services)",
-                  pins={"_managed_src": 'const MANAGED: [&str; 1] = ["fs"];',
-                        "_notify_src": 'matches!(task_name, "fs" | "counter") { ipc::names::lookup(x) } '
-                                       'matches!(task_name, "fs" | "dwc2") { bump_name_restart(n) }'},
-                  expect=False),
+             dict(why="is_watched that does not answer from MANAGED must be caught",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }".replace("MANAGED.contains(&name)", "name == \"fs\""),
+                        "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"}, expect=True),
+             dict(why="a spawn request that never sets the flag must be caught",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }".replace("SPAWN_FLAG_WATCHED", "0"),
+                        "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"}, expect=True),
+             dict(why="a syscall that drops the flag must be caught",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }", "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }",
+                        "_flag_src": "set_task_watched(task_slot, watched);"}, expect=True),
+             dict(why="a restart count not guarded by the record must be caught",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);",
+                        "_notify_src": "bump_name_restart(task_name); if task_watched(slot) { ipc::names::lookup(x) }"},
+                  expect=True),
+             dict(why="a NAME LIST coming back into the death path must be caught",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);",
+                        "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }" + ' if matches!(task_name, "fs" | "time") { x() }'},
+                  expect=True),
              dict(why="an unfindable MANAGED must fail, not pass vacuously",
-                  pins={"_managed_src": 'fn main() {}',
-                        "_notify_src": 'matches!(task_name, "fs") { ipc::names::lookup(x) } '
-                                       'matches!(task_name, "fs") { bump_name_restart(n) }'},
+                  pins={"_managed_src": "fn main() {}", "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"},
                   expect=True),
-             dict(why="an unfindable notify set must fail, not pass vacuously",
-                  pins={"_managed_src": 'const MANAGED: [&str; 1] = ["fs"];',
-                        "_notify_src": 'fn schedule() {}'}, expect=True),
+             dict(why="a death handler that does not answer from is_watched must be caught",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }".replace("is_watched(name) { log_fmt", "name == \"fs\" { log_fmt"),
+                        "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"}, expect=True),
+             dict(why="per-service death arms coming back must be caught",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }" + "\n    \"fs\" => {\n        ctx.log(\"supervisor: fs died, restarting\");",
+                        "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"}, expect=True),
              dict(why="the real tree must pass",
                   pins={}, expect=False),
          ]),

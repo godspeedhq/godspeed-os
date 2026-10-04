@@ -402,6 +402,54 @@ pub fn task_hw_bdf(slot: usize) -> u32 {
     if slot < MAX_TASKS { TASK_HW_BDF[slot].load(Ordering::Relaxed) } else { 0xFFFF }
 }
 
+/// Whether this task's death is reported to the supervisor and counted as a restart - the SPAWNER's
+/// request (`SPAWN_FLAG_WATCHED`), recorded at every spawn. This replaced two lists of service names: the
+/// kernel no longer knows which services matter, only which tasks it was asked to watch.
+static TASK_WATCHED: [core::sync::atomic::AtomicBool; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TASKS];
+
+/// The device kind this task was granted (`task::kind`, 0 for none or a PCI device), recorded at every
+/// spawn. Lets the kernel find "the task granted the display" without a name for it.
+static TASK_HW_KIND: [core::sync::atomic::AtomicU32; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TASKS];
+
+pub fn set_task_watched(slot: usize, watched: bool) {
+    if slot < MAX_TASKS { TASK_WATCHED[slot].store(watched, Ordering::Release); }
+}
+pub fn task_watched(slot: usize) -> bool {
+    slot < MAX_TASKS && TASK_WATCHED[slot].load(Ordering::Acquire)
+}
+pub fn set_task_hw_kind(slot: usize, kind: u32) {
+    if slot < MAX_TASKS { TASK_HW_KIND[slot].store(kind, Ordering::Release); }
+}
+pub fn task_hw_kind(slot: usize) -> u32 {
+    if slot < MAX_TASKS { TASK_HW_KIND[slot].load(Ordering::Acquire) } else { 0 }
+}
+
+/// The receive endpoint of the live task granted device `kind`, if there is one. A device kind has at
+/// most one holder - a window is granted once - so the first live match is the only one.
+pub fn live_endpoint_of_kind(kind: u32) -> Option<EndpointId> {
+    for i in 0..MAX_TASKS {
+        if TASK_VALID[i].load(Ordering::Acquire)
+            && TASK_HW_KIND[i].load(Ordering::Acquire) == kind
+            && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
+        {
+            return ep_from_u64(TASK_ENDPOINT[i].load(Ordering::Relaxed));
+        }
+    }
+    None
+}
+
+/// The device this task was given, READ AND RESET to `0xFFFF` in one step.
+///
+/// The record is written only by a DMA driver's spawn, so a slot later reused by any other task would
+/// otherwise INHERIT the device of whoever held it before. While the kill path quiesced by service name
+/// that was invisible; keyed on the record, a probe dying in a slot `xhci` once held would stop the LIVE
+/// `xhci` controller. So the kill path takes the record, and a failed spawn takes it too.
+pub fn take_task_hw_bdf(slot: usize) -> u32 {
+    if slot < MAX_TASKS { TASK_HW_BDF[slot].swap(0xFFFF, Ordering::Relaxed) } else { 0xFFFF }
+}
+
 /// `now_epoch_monotonic()` seconds captured at each task's spawn. Per-service uptime = `now_epoch_monotonic()
 /// - this` (surfaced by `task_stat`), both on the one deglitched monotonic timeline. It was a packed RTC
 /// datetime, which needed an `epoch_secs()` conversion and - fatally - read 0 on a board with no RTC (the
@@ -2507,19 +2555,13 @@ pub fn kill_task_by_slot(slot: usize) {
         // symptom: even once their deaths notify the supervisor, a name absent from THIS set never
         // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
         // only view of recovery said nothing happened.
-        if matches!(task_name,
-            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console" | "supervisor"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
-            // hw-enumerator is MANAGED, so its death is a restart like any other - and a restart that
-            // is not COUNTED cannot be observed: `observe` would report 0 for a service that died.
-            | "hw-enumerator"
-            // wifi-driver: the Pi 4's radio, MANAGED like every other driver. Present on one board and
-            // listed unconditionally, exactly as `dwc2` is: a name that never runs here never dies
-            // here, so the cost is nothing, and the alternative is a board-specific omission in a
-            // neutral file.
-            | "wifi-driver"
-            // power: MANAGED (docs/power.md). Counted and notified like every other restartable service.
-            | "power")
+        // WATCHED, NOT NAMED. This was a list of nineteen service names, and every service added to the
+        // supervisor's roster had to be added here too - `time` and `control` were missed once, and a
+        // storm that killed them 41 times showed 0 restarts in `observe`. The SUPERVISOR now says, in the
+        // spawn request, which tasks it manages (`SPAWN_FLAG_WATCHED`), so the kernel holds no roster and
+        // cannot disagree with one. The supervisor itself is the one name the kernel knows, because the
+        // kernel spawns and respawns it.
+        if task_watched(slot) || task_name == "supervisor"
         {
             bump_name_restart(task_name);
         }
@@ -2559,19 +2601,14 @@ pub fn kill_task_by_slot(slot: usize) {
         // The terminal died, so nothing is rendering the display any more. Hand the screen back to the
         // kernel's boot floor until the respawned instance takes it, or the machine goes dark with no
         // way to say why (invariant 12).
-        if task_name == "console" {
+        // The task granted the DISPLAY, not whatever is called `console`: the kernel gave it the framebuffer
+        // and takes it back from the same record.
+        if task_hw_kind(slot) == crate::task::kind::FRAMEBUFFER {
             crate::bootcon::reclaim_on_death();
         }
-        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
-            // hw-enumerator: MANAGED, so its death must REACH the supervisor. Without this it would
-            // still come back - on the next reconcile sweep - which is exactly why the omission hides:
-            // not dead forever, just dead for a while, and nothing says so.
-            | "hw-enumerator"
-            // wifi-driver: see the restart-counter list above. Both halves or neither - a death that
-            // notifies but is not counted, or is counted but does not notify, is the exact split that
-            // cost `time` and `control` a hardware session each.
-            | "wifi-driver" | "power") {
+        // Reported to the supervisor because the supervisor ASKED, at spawn, to hear of this task's death -
+        // not because its name is on a list here. See the restart counter above.
+        if task_watched(slot) {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
@@ -2635,25 +2672,27 @@ pub fn kill_task_by_slot(slot: usize) {
         // so nothing else stops the stray write. We clear PCI Bus-Master-Enable BEFORE the frame reclaim
         // below (the controller cannot start new DMA; any in-flight transaction drains during the kill's
         // remaining work + the spin-wait); the respawned driver re-enables bus-mastering during init.
-        // block-driver (AHCI) is included; xhci is confined (its stray DMA would fault, not corrupt) but
-        // quiescing it too is harmless + correct on a no-IOMMU machine where it is passthrough as well.
-        if task_name == "xhci" || task_name == "ehci" || task_name == "block-driver"
-            || task_name == "nic-driver"
-        {
-            use core::sync::atomic::Ordering::Relaxed;
+        // xhci is confined (its stray DMA would fault, not corrupt) but quiescing it too is harmless +
+        // correct on a no-IOMMU machine where it is passthrough as well.
+        //
+        // KEYED ON THE DEVICE THIS TASK WAS GIVEN, not on its name. This was a list of four names (xhci,
+        // ehci, block-driver, nic-driver), so a fifth DMA driver - audio-driver - died with its
+        // controller still mastering until somebody remembered to add it. The record is written only by
+        // a DMA driver's spawn, so it IS the question, and the kernel learns nothing it did not hold.
+        let bdf = take_task_hw_bdf(slot);
+        if bdf != 0xFFFF {
             use crate::arch::imp::pci;
             // THE DEVICE THIS TASK WAS GIVEN, remembered from its own spawn - not a table of which
-            // service drives which controller. See `TASK_HW_BDF`. A task that drives nothing reports
-            // 0xFFFF and the quiesce below is skipped, which is also the fix for the old default arm
-            // quiescing the DISK on the death of any service it did not recognise.
-            let bdf = task_hw_bdf(slot);
+            // service drives which controller. See `TASK_HW_BDF`. TAKEN, not read: see
+            // `take_task_hw_bdf` for what a stale record in a reused slot would otherwise stop.
             pci::clear_bus_master(bdf);
             // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
-            // cleanly (no-op if the device wasn't confined). Confined USB drivers (xhci/ehci) only; AHCI
-            // + nic-driver run in IOMMU passthrough, so there is no DTE to revert.
-            if task_name == "xhci" || task_name == "ehci" {
-                crate::arch::imp::iommu::release_device(bdf);
-            }
+            // cleanly. For ANY device, not by name: this was `xhci`/`ehci` only, so a third confined
+            // driver (audio-driver) would have leaked its I/O page table on every restart, the respawn
+            // overwriting the record that pointed at it. `release_device` looks the device up in its
+            // own table of confined devices and does nothing for one that was never confined (AHCI and
+            // nic-driver run in passthrough), so asking for every device is exact, not approximate.
+            let _ = crate::arch::imp::iommu::release_device(bdf);
         }
 
         // SMP safety: spin until no other core has CORE_CURRENT[c] == slot.

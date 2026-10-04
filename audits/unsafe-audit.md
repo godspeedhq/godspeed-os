@@ -41,6 +41,19 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-10-03 - the Pis' audio jack, prepared as part of its grant (feat/audio)
+
+`pwm-audio` drives the Pis' 3.5 mm jack: PWM fed by the SoC's DMA engine (`docs/audio.md`, "The Pis").
+Two of the steps live in SHARED blocks - every pin's function in the GPIO page, every clock in the clock
+manager's - so the kernel does them when it grants the jack, and the driver is granted only the PWM and
+DMA pages (CLAUDE.md 12.3, the 2026-10-03 amendment). One block per port.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/mod.rs` | 73 -> 74 (+1) | `pwm_probe` (Pi 4): one `uaccess::probe_read32` of PWM1's CTL register at its fixed address inside the Device peripheral mapping, 4-byte aligned - the `rng_probe` pattern. QEMU's `raspi4b` models no PWM, and the first boot that granted the jack there saw the driver's first write abort and the driver respawned forever. Probed once at boot; the jack is granted only where it answered. |
+| `arch/aarch64/mod.rs` | 72 -> 73 (+1) | `audio_jack_prepare` (Pi 4): read-modify-writes of GPFSEL4 (GPIO40/41 to ALT0, PWM1) and GPIO_PUP_PDN_CNTRL_REG2 (their pulls off) changing only those two pins' fields, then the clock manager's CM_PWMCTL/CM_PWMDIV with the 0x5A password: kill, a BOUNDED wait for BUSY, divider PLLD/6, source, enable - Circle's sequence (`gpioclock.cpp`), checked against the datasheet. All fixed BCM2711 registers reached through `mmio()`, all owned by the PWM clock or these two pins. No kernel memory touched. Runs at `pwm-audio`'s spawn, from `map_fixed_driver_mmio`. |
+| `arch/arm/mod.rs` | 52 -> 53 (+1) | `audio_jack_prepare` (Pi 2): the same for the BCM2836 - GPFSEL4 (GPIO40/45 to ALT0, PWM0), the GPPUD/GPPUDCLK1 strobe that clears only those two pins' pulls (the sequence `sd_route_to_emmc` already uses), and the PWM clock at PLLD/2, with the same bounded BUSY wait. Fixed registers in the Device-mapped peripheral window. |
+
 ## 2026-10-01 - the RNG200 is probed before it is read (feat/wifi-driver)
 
 `hw_random` read the BCM2711's RNG200 unconditionally, behind `InspectKernel` query 19, which is UNGATED.
@@ -2586,7 +2599,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 72 | permitted |
+| arch/aarch64/mod.rs | 74 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |
@@ -2622,7 +2635,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 52 | permitted |
+| arch/arm/mod.rs | 53 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |

@@ -104,6 +104,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audio-driver"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-audio",
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -532,6 +541,14 @@ dependencies = [
 name = "godspeed"
 version = "0.21.0"
 dependencies = [
+ "godspeed-sdk",
+]
+
+[[package]]
+name = "godspeed-audio"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 
@@ -1225,6 +1242,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pwm-audio"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-audio",
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1496,6 +1522,7 @@ name = "shell"
 version = "0.21.0"
 dependencies = [
  "godspeed",
+ "godspeed-audio",
  "godspeed-sdk",
  "godspeed-wifi",
 ]

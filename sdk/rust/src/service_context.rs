@@ -356,6 +356,10 @@ pub const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 /// As a request bit it is checked the same way every privilege is - the spawner may ask for it only
 /// because it could transfer such a cap itself.
 pub const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
+/// Report this task's death to the spawner's death-notification endpoint and count it as a restart. The
+/// supervisor sets it for every service it manages; the kernel keeps no list of which services those are
+/// (`docs/audio.md`, "No service names in the kernel").
+pub const SPAWN_FLAG_WATCHED:     u32 = 1 << 4;
 
 /// Bits for `SpawnRequest::privileges`. A spawner may only request what it HOLDS ITSELF - the kernel
 /// checks, and refuses otherwise - so this passes authority on, it never mints it (3.1, 7.3).
@@ -397,6 +401,14 @@ pub mod hwclass {
     /// Not a device: the software-raised test interrupt (§22 IR1). A class, so that the probe which
     /// receives it names a CLASS like any driver and the kernel states the vector.
     pub const TEST_IRQ:    u32 = 7;
+    /// An audio jack driven by PWM and fed by the SoC's DMA engine (the Pis, `docs/audio.md`). The kernel
+    /// routes the jack's pins and starts the PWM clock as part of the grant, then maps the PWM block and
+    /// the DMA engine side by side and grants a DMA arena.
+    pub const AUDIO_PWM:   u32 = 8;
+    /// A WiFi radio on an SDIO host at a fixed SoC address (the Pi 4's CYW43455 behind the Arasan). The
+    /// kernel grants the host's window - and, where it can, the radio's power control - to the service
+    /// whose request names this kind, never to a service because of its name.
+    pub const WIFI_SDIO:   u32 = 9;
 
     /// Bit 31: the value is a PCI CLASS CODE, not one of the named kinds above.
     pub const PCI:         u32 = 1 << 31;

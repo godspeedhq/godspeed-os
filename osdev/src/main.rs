@@ -514,6 +514,10 @@ fn cmd_conform(check: bool, selftest: bool, list: bool, explain: Option<&str>) {
 }
 
 fn commandment_check() {
+    // Once per run: `osdev test` gates on entry and then some suites build through `cmd_build`, which
+    // gates again. The checks take seconds and their answer cannot change within one invocation.
+    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
     for extra in EXTRA_CHECKS {
         match std::process::Command::new("python").arg(extra).status() {
             Ok(st) if st.success() => {}
@@ -675,7 +679,7 @@ const SERVICE_CRATES: &[&str] = &[
     "events", "recorder", "copier", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
     "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
     "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
-    "resource-server", "holder", "power",
+    "resource-server", "holder", "power", "audio-driver",
 ];
 
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
@@ -1561,6 +1565,10 @@ fn cmd_caps(service: &str) {
 }
 
 fn cmd_test(suite: &str) {
+    // GATED, like `build` and `image`. Many suites build through `cmd_build_bare_metal` and friends,
+    // which run no checkers, so a contract that disagreed with its spawn row was tested in QEMU and
+    // passed on 2026-10-03 while the ARM build scripts refused it.
+    commandment_check();
     match suite {
         "identity"        => crate::validator::run_identity_tests(),
         "identity-brutal" => crate::validator::run_brutal_identity_tests(),
@@ -1593,6 +1601,7 @@ fn cmd_test(suite: &str) {
         "fs-journal"   => run_fs_journal_test(),
         "fs-djournal"  => run_fs_djournal_test(),
         "fs-restart"   => run_fs_restart_test(),
+        "audio"        => run_audio_test(),
         "peer-storm"   => run_peer_storm_test(),
         "adopt-storm"  => run_adopt_storm_test(),
         "counter"      => run_counter_test(),
@@ -1652,6 +1661,8 @@ fn cmd_test(suite: &str) {
 /// receives bytes typed in the terminal, and shell output (via ctx.log) appears
 /// on stdout. The control port (COM2) is still on TCP:5555 for `osdev restart`.
 fn cmd_shell(smp: u32) {
+    // Gated for the reason `cmd_test` is: this builds through `cmd_build_bare_metal`, which runs none.
+    commandment_check();
     cmd_build_bare_metal();
 
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
@@ -1807,7 +1818,7 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         let _ = std::process::Command::new("cargo")
             .args(["clean", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none"]).status();
     }
-    let non_supervisor = ["events", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder"];
+    let non_supervisor = ["events", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder", "audio-driver"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
         if *crate_name == "block-driver" && !bd_features.is_empty() {
@@ -2783,6 +2794,61 @@ fn run_peer_storm_test() {
     let persist = "build/tests/persist_peer_storm.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
     crate::shell_test::run_peer_storm(&image_path, persist, 4);
+}
+
+/// `osdev test audio` (`utilities/57_audio.md`, `docs/audio.md`): the `audio` utility, the driver behind it
+/// and the sound, on the bare-metal image with QEMU's HD Audio device and a data disk formatted here, so
+/// `/audio.settings` has somewhere to live from the first boot.
+fn run_audio_test() {
+    println!("
+=== audio: the utility, the driver, and the sound it makes ===");
+    cmd_build_bare_metal();
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_audio.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    format_superblock(persist);
+    // Files for `audio play`, made here so the test needs nothing from outside the repository: two it
+    // must play (48 kHz stereo, 44.1 kHz mono), and two it must refuse with the reason (24-bit, 8 kHz).
+    gsfs_add_file(persist, "song.wav", &wav_sine(48_000, 2, 16, 660, 2000));
+    gsfs_add_file(persist, "mono.wav", &wav_sine(44_100, 1, 16, 330, 1000));
+    gsfs_add_file(persist, "deep.wav", &wav_sine(48_000, 2, 24, 440, 100));
+    gsfs_add_file(persist, "phone.wav", &wav_sine(8_000, 1, 16, 440, 100));
+    crate::shell_test::run_audio(&image_path, persist, 4);
+}
+
+/// A WAV file holding a sine at half scale - the shape QEMU's capture is then read back for.
+fn wav_sine(rate: u32, channels: u16, bits: u16, hz: u32, ms: u32) -> Vec<u8> {
+    let frames = rate as u64 * ms as u64 / 1000;
+    let bps = bits as u32 / 8;
+    let data_len = frames as u32 * channels as u32 * bps;
+    let mut v = Vec::with_capacity(44 + data_len as usize);
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&(36 + data_len).to_le_bytes());
+    v.extend_from_slice(b"WAVEfmt ");
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&channels.to_le_bytes());
+    v.extend_from_slice(&rate.to_le_bytes());
+    v.extend_from_slice(&(rate * channels as u32 * bps).to_le_bytes());
+    v.extend_from_slice(&(channels * bits / 8).to_le_bytes());
+    v.extend_from_slice(&bits.to_le_bytes());
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&data_len.to_le_bytes());
+    for i in 0..frames {
+        let s = (16_383.0 * (2.0 * std::f64::consts::PI * hz as f64 * i as f64 / rate as f64).sin()) as i32;
+        for _ in 0..channels {
+            match bits {
+                24 => v.extend_from_slice(&(s << 8).to_le_bytes()[..3]),
+                _ => v.extend_from_slice(&(s as i16).to_le_bytes()),
+            }
+        }
+    }
+    v
 }
 
 fn run_fs_restart_test() {

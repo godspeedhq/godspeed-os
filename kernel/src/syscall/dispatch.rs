@@ -298,12 +298,14 @@ const CONSOLE_LOSS_REPORT: u64 = 100;
 fn deliver_to_console_service(bytes: &[u8]) -> i64 {
     // Never feed the console's own output back to it. Nothing does this today (the service logs through
     // the serial log path, not the console path), but the loop it would make is unbounded and silent.
-    if scheduler::task_stat(scheduler::current_task_slot()).name == "console" {
+    // THE CONSOLE IS THE TASK GRANTED THE DISPLAY, not whatever is called `console`: the kernel granted
+    // that task the framebuffer, so it already knows who renders it, and needs no name for it.
+    if scheduler::task_hw_kind(scheduler::current_task_slot()) == crate::task::kind::FRAMEBUFFER {
         return 0;
     }
     // No terminal on this machine (or not up yet): serial already has the bytes, which is the whole
     // guarantee. Return without blocking - there is nothing to wait for.
-    let Some(ep) = crate::ipc::names::lookup("console") else { return 0 };
+    let Some(ep) = scheduler::live_endpoint_of_kind(crate::task::kind::FRAMEBUFFER) else { return 0 };
     let Ok(msg) = crate::ipc::message::Message::new(bytes) else { return 0 };
 
     let my_slot = scheduler::current_task_slot();
@@ -873,6 +875,9 @@ const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 /// `core` is a STRICT placement (a restart's `--core N`), not a table's PREFERRED core. See §9.2 and
 /// the SDK constant of the same name for why conflating the two stops a machine booting.
 const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
+/// Report this task's death to the supervisor and count it as a restart. The SPAWNER says so; the kernel
+/// keeps no list of which services matter (`docs/audio.md`, "No service names in the kernel").
+const SPAWN_FLAG_WATCHED: u32 = 1 << 4;
 /// Mint the child's peer caps with GRANT (§22 Test 5A). See the SDK constant.
 const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 /// Ceiling on a caller-requested DMA arena, in 4 KiB pages. 2048 = 8 MiB, comfortably above the
@@ -1120,6 +1125,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.dma_pages,
         req.bdf,
         req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
+        req.flags & SPAWN_FLAG_WATCHED     != 0,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it
@@ -2651,8 +2657,11 @@ fn handle_device_power(on: u64) -> i64 {
         crate::kprintln!("device-power: refused - caller does not hold DEVICE_POWER");
         return CapError::CapNotHeld as i64;
     }
-    let name = scheduler::task_name(scheduler::current_task_slot());
-    if crate::arch::imp::device_power(name, on != 0) {
+    // BY THE DEVICE KIND THIS TASK WAS GRANTED, not by its name: this resolved the pin from the caller's
+    // name, so any task called `wifi-driver` that held the capability reached the radio's power pin.
+    let slot = scheduler::current_task_slot();
+    let name = scheduler::task_name(slot);
+    if crate::arch::imp::device_power(scheduler::task_hw_kind(slot), on != 0) {
         crate::kprintln!("device-power: '{}' turned its device {}", name, if on != 0 { "ON" } else { "OFF" });
         0
     } else {

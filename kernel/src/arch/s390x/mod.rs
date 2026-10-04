@@ -84,7 +84,7 @@ pub fn ap_init(core_id: u32) { unimplemented!("aarch64::ap_init") }
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
 /// Non-PCI fixed-physical peripheral MMIO grant (ARM Pi path); no fixed windows on this arch stub.
-pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
+pub fn map_fixed_device(_pt: &mut page_tables::PageTable, _kind: u32) -> Option<(u64, u64)> { None }
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
@@ -94,8 +94,8 @@ pub fn hw_random() -> Option<u32> { None }
 /// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
 /// one board with it is the Pi 4 (`arch/aarch64`), whose radio returns to power-on only when WL_ON is
 /// cut. `false` is the honest answer; the syscall reports it as "no control over it".
-pub fn device_power_control(_name: &str) -> bool { false }
-pub fn device_power(_name: &str, _on: bool) -> bool { false }
+pub fn device_power_control(_kind: u32) -> bool { false }
+pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 
 /// The Arm cores' clock (`CpuClock`, syscall 55): no control on this port. The one board with it is the
 /// Pi 4 (`arch/aarch64`), whose firmware takes a rate request over the mailbox. `None` is the honest
@@ -423,6 +423,9 @@ pub mod rtc {
 /// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
 /// See the x86 original for why this is not a second source for `pci::nic()`.
 pub fn soc_nic_present() -> bool { false }
+/// Is a device of this fixed kind (`task::kind`) on this board? None here: the arch answers by KIND,
+/// never by the name of a service (`docs/audio.md`, "No service names in the kernel").
+pub fn fixed_device_present(_kind: u32) -> bool { false }
 
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};

@@ -222,7 +222,7 @@ pub unsafe fn switch(current: *mut TaskContext, next: *const TaskContext) {
     unsafe { aarch64_switch_context(current, next) }
 }
 
-/// The neutral scheduler's switch: swap the address space if it changes, then swap registers.
+/// The neutral scheduler's switch: install the incoming task's address space, then swap registers.
 ///
 /// **The address-space half is an obligation, not an optimisation (SEC-26).** The neutral kill path
 /// elides a cross-core TLB shootdown for a pinned task on the grounds that "a CR3 reload flushes
@@ -232,10 +232,25 @@ pub unsafe fn switch(current: *mut TaskContext, next: *const TaskContext) {
 /// which is the same use-after-free class as SEC-1 and would not show up until something reused the
 /// frames.
 ///
-/// **The invalidate is not yet exercised**, and that is stated rather than glossed: every task on this
-/// port currently shares the kernel identity map, so `next.cr3` always equals the live `TTBR0_EL1` and
-/// the branch is not taken. It must be proven when per-task page tables land - which is precisely the
-/// milestone that makes it load-bearing. Recorded per §26.3 rather than assumed correct.
+/// **ALWAYS, NOT ONLY WHEN `TTBR0` CHANGES (2026-10-03).** This compared the incoming base with the
+/// live one and skipped the install and the invalidate when they matched. That was sound while a base
+/// identified an address space, and it stopped being sound when root frames began to be recycled: a
+/// respawn can be handed the very root a task just died with. `free_page_table_root` flushes every core
+/// before freeing the dead space, but that is not enough. A core that last ran the dead task keeps its
+/// root in `TTBR0` while it idles, and AArch64 may walk page tables SPECULATIVELY through whatever base
+/// is installed - so after the flush that core CAN refill its TLB from frames being freed and handed to
+/// other tasks. A respawn arriving with the same base would then pass the compare as "no change" and run
+/// on those translations.
+///
+/// **This was a HYPOTHESIS for the Pi 4's chaos faults, and the card falsified it** (`backlog/72`): with
+/// this change the shell still faulted on the first instruction of `service_main`. It stays because the
+/// argument above holds on its own - the skip assumed something recycling made false - not because it
+/// fixed anything. The walker only reads here (no hardware access-flag updates in `TCR_EL1`, and the A72
+/// cannot do them), so a stale entry could only ever crash a task, never corrupt another's memory.
+///
+/// A switch always changes TASK, and two tasks never legitimately share a base, so equal bases mean a
+/// recycled root and never "the same space". The local invalidate is the price - what x86 pays on every
+/// CR3 write without being asked.
 ///
 /// # Safety
 /// As [`switch`], plus: `next.cr3` must be a live page-table base, since it is installed before the
@@ -244,24 +259,21 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
     // SAFETY: `next` is a valid context per the caller's contract.
     let next_ttbr = unsafe { (*next).cr3 };
     if next_ttbr != 0 {
-        let cur: u64;
-        // SAFETY: reading TTBR0_EL1 at EL1 is a side-effect-free system-register read.
-        unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) cur, options(nomem, nostack)) };
-        if cur != next_ttbr {
-            // SAFETY: installing a live page-table base, then invalidating the stale translations it
-            // replaces. `dsb ish` before the invalidate orders the TTBR write ahead of it; `isb` after
-            // ensures the next instruction fetch uses the new map.
-            unsafe {
-                core::arch::asm!(
-                    "msr ttbr0_el1, {t}",
-                    "dsb ish",
-                    "tlbi vmalle1",
-                    "dsb ish",
-                    "isb",
-                    t = in(reg) next_ttbr,
-                    options(nostack),
-                );
-            }
+        // SAFETY: installing a live page-table base, then invalidating the stale translations it
+        // replaces - including any a core walked speculatively through a recycled base while it idled,
+        // which is why this runs even when the base is unchanged (see above). `dsb ish` before the
+        // invalidate orders the TTBR write ahead of it; `isb` after ensures the next instruction fetch
+        // uses the new map.
+        unsafe {
+            core::arch::asm!(
+                "msr ttbr0_el1, {t}",
+                "dsb ish",
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                t = in(reg) next_ttbr,
+                options(nostack),
+            );
         }
     }
     // SAFETY: the caller's contract.

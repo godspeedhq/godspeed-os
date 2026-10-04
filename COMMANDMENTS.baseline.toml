@@ -697,6 +697,16 @@ SpawnImage               = 52
 # shell's trust perimeter, because keystrokes are commands).
 [kernel.service_grants]
 "asker" = ["peer:reply-server"]
+# audio-driver: its HD Audio controller, WITH an interrupt (docs/audio.md, "Interrupt-driven refill"):
+# the stream interrupts as each period plays and the driver refills then. The kernel picks the vector.
+# peer:fs - `/audio.settings`, the volume and the mute kept across a restart (utilities/57_audio.md).
+"audio-driver" = ["hw:pci_irq", "peer:fs"]
+# pwm-audio: the Pis' 3.5 mm jack (docs/audio.md, "The Pis"). hw:AUDIO_PWM - the PWM block and the DMA
+# engine's page, mapped side by side, and a DMA arena; the kernel routes the jack's pins and starts the
+# PWM clock as part of the grant (CLAUDE.md 12.3). The DMA page holds every channel: more than the
+# driver needs, recorded in docs/audio.md, and no more reach than an unconfined driver has on these
+# boards. peer:fs - `/audio.settings`, the volume and the mute kept across a restart.
+"pwm-audio" = ["hw:AUDIO_PWM", "peer:fs"]
 "block-driver" = ["hw:pci", "peer:dwc2", "peer:events", "peer:xhci"]
 # examples/cap-grant, examples-test build only. ACQUIRE_ANY so its lookup of "receiver" reaches the
 # kernel name directory: with no such service present the lookup MISSES, which is the standalone
@@ -709,8 +719,8 @@ SpawnImage               = 52
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "copier" = ["peer:fs"]
 "counter" = ["peer:fs"]
-"dwc2" = ["hw:DWC2", "hw:PCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
-"ehci" = ["hw:EHCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
+"dwc2" = ["hw:DWC2", "hw:PCI", "peer:events", "priv:CONSOLE_PUSH"]
+"ehci" = ["hw:EHCI", "peer:events", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]
 # examples/stdlib-hello, examples-test build only. It reads a file through `gs::fs`, which is
@@ -730,8 +740,10 @@ SpawnImage               = 52
 "shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
 "supervisor" = ["kernel-priv:acquire_any", "kernel-priv:image_spawn", "kernel-priv:introspect", "kernel-priv:recv_endpoint", "kernel-priv:service_control", "kernel-priv:spawn"]
 "time" = ["peer:events", "peer:fs", "peer:net-stack"]
-"wifi-driver" = ["peer:fs", "peer:power"]
-"xhci" = ["hw:XHCI", "hw:pci_irq", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
+# wifi-driver: hw:WIFI_SDIO - the Arasan SDIO host the radio sits on, and its power control, granted by
+# device KIND since 2026-10-03 (they were granted by NAME before, so the pin did not see them).
+"wifi-driver" = ["hw:WIFI_SDIO", "peer:fs", "peer:power"]
+"xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "priv:CONSOLE_PUSH"]
 
 # --------------------------------------------------------------------------------------------------
 # Commandment IV - which contract capability key corresponds to which privilege bit. Read by

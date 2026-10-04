@@ -90,6 +90,16 @@ fn main() {
     // controller, so an embedded-but-radioless build reports "no radio" and serves rather than dying.
     let radio: &[&str] = if arch == "aarch64" { &["wifi-driver"] } else { &[] };
 
+    // The audio driver (docs/audio.md), a BOARD fact like `radio`: an Intel High Definition Audio
+    // controller on x86 (the T630's chipset audio, QEMU's `intel-hda`), and on the Pis a 3.5 mm jack
+    // driven by PWM - a different driver for a different device, speaking the same protocol. The
+    // VisionFive 2 Lite has no audio output at all, so it embeds neither.
+    let audio: &[&str] = match arch.as_str() {
+        "x86_64" => &["audio-driver"],
+        "arm" | "aarch64" => &["pwm-audio"],
+        _ => &[],
+    };
+
     // ---- ONE CFG PER IMAGE THIS BUILD ACTUALLY EMBEDS. ------------------------------------------
     //
     // Derived from the SAME two lists that decide the embedding, three lines above - so `main.rs`
@@ -111,11 +121,12 @@ fn main() {
     // a board that has never had an EHCI image embedded.
     //
     // `values(none())` because these are bare flags: `#[cfg(has_xhci)]`, never `has_xhci = "..."`.
-    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver",
+    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver", "has_audio_driver",
+                 "has_pwm_audio", "pwm_audio_pi4",
                  "xhci_msi", "nic_on_pci"] {
         println!("cargo::rustc-check-cfg=cfg({flag}, values(none()))");
     }
-    for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()) {
+    for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()).chain(audio.iter()) {
         println!("cargo:rustc-cfg=has_{}", name.replace('-', "_"));
     }
     // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides
@@ -123,6 +134,12 @@ fn main() {
     // PCI": the Pi 4's VL805 is a PCIe device and still takes the plain class, because what it lacks
     // is the routable vector, not the bus. Asking for an interrupt that can never arrive is the
     // failure invariant 12 exists to prevent, which is why this is its own fact.
+    // WHICH Pi the jack is on, for `pwm-audio`'s `mode`: the PWM block, its DMA request line and the
+    // PWM clock differ between the Pi 2 and the Pi 4 (docs/audio.md, "The Pis"). Stated here, once,
+    // as the board fact it is, so the service never infers its board from its instruction set.
+    if arch == "aarch64" {
+        println!("cargo:rustc-cfg=pwm_audio_pi4");
+    }
     if arch == "x86_64" {
         println!("cargo:rustc-cfg=xhci_msi");
         // This board's ethernet controller is on the PCI bus, so `nic-driver` is addressed by CLASS
@@ -156,7 +173,7 @@ fn main() {
                                    cannot locate the profile directory"))
         .to_path_buf();
 
-    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(radio.iter())
+    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(radio.iter()).chain(audio.iter())
                         .chain(probe.iter()).chain(examples.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing

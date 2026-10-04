@@ -46,7 +46,7 @@
 //! a disagreement between the two would be the most interesting thing this probe could find.
 //!
 //! **NOTHING IS GRANTED BY THIS FILE**, deliberately. It reads, it prints, it returns. The
-//! `map_fixed_driver_mmio` table stays as it is until the boot log says which window to name, because
+//! `map_fixed_device` table stays as it is until the boot log says which window to name, because
 //! that table's own comment records the cost of getting this wrong: a service handed a range whose first
 //! register read is an external abort dies on that read, and the supervisor respawns it forever.
 //!
@@ -65,7 +65,7 @@ use super::uaccess;
 const PERIPHERAL_BASE: u64 = 0xFE00_0000;
 
 /// Did the Arasan answer the census? **This is what gates the MMIO grant**, and it is the whole reason
-/// the census runs before `map_fixed_driver_mmio` is ever consulted: that table's comment records what
+/// the census runs before `map_fixed_device` is ever consulted: that table's comment records what
 /// granting a window on a board without the device costs - the service's first register read is an
 /// external abort, it dies on it, and the supervisor respawns it forever. A probe result is the only
 /// honest gate, because QEMU's `raspi4b` emulates no Arasan at all.
@@ -430,7 +430,7 @@ pub fn census() {
     }
     // WHAT THIS BOOT WILL AND WILL NOT DO, said plainly, because the honest scope of the grant is
     // narrow and easy to overstate. The census no longer grants NOTHING - the Arasan answering is what
-    // lets `map_fixed_driver_mmio` name that window to `wifi-driver`, which is the change this line
+    // lets `map_fixed_device` grant that window by kind `WIFI_SDIO` (to `wifi-driver`), which is the change this line
     // used to deny. What is still unproven is the RADIO: a controller answering its version register
     // says a host controller is there, not that a CYW43455 is behind it. CMD5 is what says that, and
     // it happens in the service.

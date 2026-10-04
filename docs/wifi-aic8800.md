@@ -72,10 +72,9 @@ name, not the revision.
 
 ## 3. The grant (kernel side) - no new responsibility
 
-A fourth fixed device on a Pi-shaped seam, keyed by KIND, never by name ("No service names in the
-kernel", in `feat/audio`'s audio design note): the VisionFive radio is `WIFI_SDIO`, the kind `feat/audio`
-gave the Pi 4's radio. At boot
-the riscv64 arch layer's census does what `net.rs` does for the ethernet MAC - enables the two clocks,
+A fourth fixed device on a Pi-shaped seam, keyed by KIND, never by name (`docs/audio.md`, "No service
+names in the kernel"): the VisionFive radio is `WIFI_SDIO`, the kind the Pi 4's radio already has. At
+boot the riscv64 arch layer's census does what `net.rs` does for the ethernet MAC - enables the two clocks,
 releases the reset, routes the six pins - and then checks that the controller ANSWERS by reading its
 `VERID` (`0x6C`) and `HCON` (`0x70`) registers and printing both. Only a controller that answered is
 granted: `fixed_device_present(WIFI_SDIO)`, `map_fixed_device(.., WIFI_SDIO)` -> one 4 KiB page at
@@ -86,11 +85,9 @@ answers true on this board and `device_power(WIFI_SDIO, on)` drives GPIO 33, rea
 Pi 4's does. The 10 ms hold-offs are the device's and live in the driver.
 
 **MISCIS is unchanged**: no syscall, no privilege bit, no runtime role - the same argument as the Pi
-audio grant. One honest caveat for the design: **the device-kind seam lives on `feat/audio`**
-(`4f34ab63`), and `feat/wifi-driver` predates it - on this branch riscv64's fixed-window function is still
-the name-keyed stub that grants nothing. `feat/wifi-driver` is an ancestor of `feat/audio`, so the seam
-can be brought here without conflict; which branch the VisionFive work happens on is the operator's
-call, and nothing below depends on the answer except where it lands.
+audio grant. The seam itself is in place (`4f34ab63`, merged into this branch from `feat/audio` on
+2026-10-04): riscv64 answers it today with `false` and `None`, and V0 is the change that makes it answer
+for this board.
 
 ## 4. The SDIO host: `dw_mmc` behind `SdioHost`
 

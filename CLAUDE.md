@@ -722,6 +722,27 @@ official, not the runtime behaviour.
 > on effort. `docs/networking.md` and `docs/ahci.md` each carried the opposite claim for their own
 > driver and are corrected in the same change.
 
+> **Amendment 2026-10-03 (audio): there are TWO confined drivers now, and the kernel releases a
+> confinement by the device, not by name.** The amendment above says `xhci` is the only confined driver
+> in the system. `audio-driver` (Intel High Definition Audio, `docs/audio.md`) is spawned confined as
+> well: every DMA its controller makes - the command rings, the buffer descriptor list, the ring of
+> sound - is inside its arena, so confinement refuses nothing it does legitimately. Verified in QEMU on
+> q35 with `amd-iommu`: the confinement selftest passes, the tone plays through the confined domain, and
+> a kill and restart releases and re-confines the device (`build/audio_iommu_qemu.log`). Its controller
+> uses plain MSI, so the interrupt message is in configuration space, out of the driver's reach.
+>
+> **The kernel change it needed adds no responsibility.** On a driver's death the kernel reverted the
+> device's confinement only for `xhci` and `ehci`, named; a third confined driver would have leaked its
+> I/O page table on every restart. It now releases for ANY task that holds a device, which is exact
+> because the release does nothing for a device that was never confined. The bus-master clear beside it
+> moved from a list of four names to the same per-task device record in the same change. Both are
+> memory isolation the kernel already enforced (§4.3), now keyed on what a task holds.
+>
+> **What does not change:** AMD-Vi is still x86-only, `ehci`, `block-driver` and `nic-driver` are still
+> in passthrough, and on the T630 the audio driver does not yet use DMA at all (`docs/audio.md`, A6), so
+> on real hardware `xhci` is still the one confined device. The mechanism now bounds two devices, on one
+> architecture, one of them in QEMU only.
+
 > **Amendment 2026-07-16 (SEC-2): a confined USB driver's least-privilege claim is bounded by the
 > console it drives.** A USB *keyboard* driver is, by function, the machine's input path: it delivers
 > keystrokes to the shell via `CONSOLE_PUSH`, and keystrokes *are* commands. The kernel cannot
@@ -1498,6 +1519,55 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > It now returns success only when `WL_ON` reads back at the level asked for. The spawn also logs `BT_ON`,
 > the same chip's Bluetooth enable: it reads 0 on this board, so `WL_ON` really is the whole of the radio's
 > power and nothing else needs cutting (`docs/wifi.md` 53). No syscall, resource or authority changes.
+>
+> **Amendment 2026-10-03 (audio on the Pis): a grant may include routing the device's pins and starting
+> its clock, and the Pis' DMA page is granted whole.** The Pis' 3.5 mm jack is two PWM channels fed by the
+> SoC's DMA engine (`docs/audio.md`, "The Pis"). Two of the steps that make it usable live in SHARED
+> blocks: every pin's function in the GPIO page, every clock in the clock manager's. So the kernel does
+> them as part of the grant, at spawn, exactly as it powers the SD domain before granting the radio's
+> window - routes the jack's two pins to the PWM and starts the PWM clock at a fixed rate - and the driver
+> (`pwm-audio`) is granted the PWM page and the DMA engine's page, mapped side by side, and a DMA arena.
+> The device is a new kind (`HwClass::AudioPwm`), present where the arch says so (`fixed_device_present`,
+> renamed from audio_pwm_present by the amendment below).
+>
+> **What this is not.** No syscall, no privilege bit, no runtime role: the kernel acts once at spawn and
+> holds no policy - the sample rate (the PWM's range), the volume and when to play are the driver's
+> (26.10). Not a seventh responsibility: it is the grant made usable, the reasoning of the `DevicePower`
+> amendment above.
+>
+> **What it costs, recorded rather than hidden (26.7).** The DMA engine's page holds all fifteen channels
+> and their shared status, so the driver is granted more than the one channel it uses. It is no more
+> REACH than it already has - on these boards no IOMMU confines any DMA-capable driver (6.4), so a driver
+> that can point one channel anywhere can already reach all of memory - but it is more than the grant
+> names. The alternative, a kernel-mediated "start this channel" syscall, would grow the kernel to narrow
+> a grant that confers nothing new, and was declined for that reason. The kernel also learns one more
+> service name (`pwm-audio`, in the Pis' fixed-window table and the two restart lists), the existing
+> name-keyed practice that step D's classes are replacing. **[Superseded the same day by the amendment
+> below: the kernel learns no service name for audio, or for any other driver.]**
+>
+> **Amendment 2026-10-03 (later): the kernel knows ONE service by name, the supervisor, and nothing it
+> grants or reports is keyed on a name any more.** The amendment above recorded the kernel learning
+> `pwm-audio` as "the existing practice". The operator asked whether that was normal, and it was not: it
+> was debt, and `docs/service-ownership.md` had already said why it cannot be enforced - once the
+> supervisor supplies the images, any image started under a matching name inherits whatever a name-keyed
+> table grants that name. Six decisions moved off the name:
+>
+> - **Fixed device windows** (the Pis' SoC blocks) are granted by the device KIND the spawn request names
+>   (`arch::imp::map_fixed_device(pt, kind)`, `fixed_device_present(kind)`), the same trust as a PCI class
+>   code. The Pi 4 radio gained the kind it lacked, `WIFI_SDIO`.
+> - **`DevicePower`** reaches the pin of the kind the caller was GRANTED, not of the name it has.
+> - **Death notification and the restart count** follow `SPAWN_FLAG_WATCHED`, set by the supervisor from
+>   its `MANAGED` roster. The kernel's two lists of nineteen names are gone, and with them the drift that
+>   once left `time` and `control` uncounted; `V-managed-watched` checks the chain that replaced them.
+> - **The display** is reclaimed from, and console output delivered to, the task granted the
+>   `FRAMEBUFFER` kind, not whatever is called `console`.
+> - **Two grants were removed** because nothing used them: the Pi 2 `block-driver`'s EMMC window (its disk
+>   is USB; the EMMC is the boot card) and a name-matched `console_push` mint that matched nothing.
+>
+> **No responsibility moves and no authority widens**: every change narrows who a grant reaches, from
+> "anything with this name" to "the request that names this device". One spawn flag is added to a
+> request the kernel already validates. The name the kernel still knows is `supervisor`, because the
+> kernel spawns and respawns it (6.2). `docs/audio.md`, "No service names in the kernel".
 
 ---
 

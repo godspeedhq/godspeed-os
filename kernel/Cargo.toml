@@ -138,7 +138,7 @@ visionfive = []
 #
 # With it on, the kernel's whole involvement with ethernet is the boot probe: it establishes that the
 # controller answers, sets `NIC_FOUND` so the spawn path grants the arena, and stops. The service gets
-# the register window (`map_fixed_driver_mmio`) and the DMA arena, and drives the MAC itself through
+# the register window (`map_fixed_device`, by kind `NIC`) and the DMA arena, and drives the MAC itself through
 # the SDK's `Mmio`/`Dma` wrappers with no `unsafe` of its own.
 #
 # It is a feature rather than the default for one reason: the in-kernel driver is HARDWARE-VERIFIED on

@@ -483,8 +483,8 @@ with, and the drivers the ordinary QEMU config does spawn take no pool vector. S
 reached first by chaos ON HARDWARE, which does kill `xhci`. Both changes are reasoned, not measured,
 and this says so (§26.7).
 
-**`xhci` is the caller, chosen as the strictest test available.** It is the only IOMMU-CONFINED
-driver, it needs the largest arena (292 pages), and §22 Test 12 checks the entire chain end to end
+**`xhci` is the caller, chosen as the strictest test available.** It was then the only IOMMU-CONFINED
+driver (`audio-driver` joined it on 2026-10-03), it needs the largest arena (292 pages), and §22 Test 12 checks the entire chain end to end
 rather than any one link: confined to its arena, the page past it unmapped, and a keyboard actually
 enumerated THROUGH the confined domain - on a pool vector, with the kernel holding no name for the
 device. That test passes.
