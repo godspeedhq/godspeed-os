@@ -50,6 +50,26 @@ key data, signed. Every refusal is logged with its reason. `docs/wifi.md` 42.
   and queueing any data frames among them. Success replaces the keys in place; the log says `pairwise
   rekey complete - new pairwise and group keys installed, the link continues`.
 
+## The first soak, 2026-10-04: the link died of IDLENESS before any rekey
+
+The handlers had never run because no session had stayed joined long enough: the longest of 68 logs since
+the driver was built stayed joined 16.5 minutes, and access points commonly rekey hourly. So a Pi 4 was
+joined at boot (`a92808f6`) and left idle at the prompt to wait for one.
+
+It did not get there. **Six minutes after the join the access point dropped the station** - `wifi-driver:
+the access point dropped the link (event 12 - DISASSOC_IND, reason 4)` at 00:50:18 against `JOINED` at
+00:44:10. 802.11 reason 4 is "disassociated due to inactivity": the access point decided this station was
+gone. It is NOT a rekey failure - that would be reason 16, the group-key handshake timing out - and no
+EAPOL-Key frame arrived before it. The driver then stayed unjoined (`wifi join` returns) until the board
+was switched off at 01:28; the machine itself ran normally throughout.
+
+So the rekey handlers are still unexercised, and there is a NEW prerequisite in front of them: **an idle
+link has to survive past the access point's inactivity timer** (about five minutes on this one). Next: find
+what the access point expected from an idle station and did not get - the firmware's own keep-alive (the
+Broadcom firmware has a periodic keep-alive frame facility, which Linux's brcmfmac does not configure by
+default), or simply no traffic at all from `net-stack` on an idle link - and whether the driver should
+rejoin on its own after an inactivity drop rather than wait for `wifi join`. Then the soak again.
+
 ## Why it is recorded and not done in the same change
 
 Phase 5 is the frame path, one change per flash, with a prediction that can be wrong. A rekey answer is
