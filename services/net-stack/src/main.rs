@@ -2729,7 +2729,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // hold something that is normally not there.
     let mut heldbuf = [0u8; HELD_BYTES];
 
-    let mut tcpst = tcp::Tcp::new(calibrate_tsc_hz(&ctx), ctx.read_tsc());
+    // ONE calibration, shared: TCP's clock and ping's RTT and window both read it (see `tsc_hz` below).
+    let boot_tsc_hz = calibrate_tsc_hz(&ctx);
+    let mut tcpst = tcp::Tcp::new(boot_tsc_hz, ctx.read_tsc());
     tcpst.warn_if_no_clock(&ctx);
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
@@ -2801,12 +2803,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut status = d.status;
     let mut sockets = [Socket { rid: 0, port: 0 }; MAX_SOCKETS];
     let mut ping_seq: u16 = 0;                    // unique ICMP seq per ping - see ping() (RTT accuracy)
-    // LAZY, because calibrating costs two full seconds of spinning and only `ping` needs it.
-    // `calibrate_tsc_hz` aligns to a wall-clock second boundary and then waits out another whole
-    // second, yielding the entire time - so as a startup step it was two more seconds during which
-    // this service answered nobody, and two seconds of a permanently-runnable task on the core it
-    // shares with `fs` and `block-driver`. Paid now by whoever actually asks for an RTT, once.
-    let mut tsc_hz: u64 = 0;
+    // FROM THE STARTUP CALIBRATION, not a second one of its own. This was lazy, on the argument that
+    // calibrating costs one to two seconds and only `ping` needed it - but TCP's clock (above) was
+    // later given a calibration at startup anyway, so the cost was paid twice: once at boot, and
+    // again by the first ping of every boot, inside the serve pass that sends the echo. Measured
+    // 2026-10-04 on the Pi 4 (1185 and 1645 ms) and the VisionFive (1383 ms) as a first echo answered
+    // that late with a wire round trip of 20-33 ms. A boot whose startup calibration failed still
+    // retries lazily below, bounded, as before.
+    let mut tsc_hz: u64 = boot_tsc_hz;
     // BOUNDED (26.6). `calibrate_tsc_hz` costs two full seconds of spinning, and the call site below
     // re-ran it on EVERY ping while it kept returning 0 - so on a port whose floor was wrong, each
     // ping paid two seconds to fail again. That is a second, larger cause of the "ping feels slow"

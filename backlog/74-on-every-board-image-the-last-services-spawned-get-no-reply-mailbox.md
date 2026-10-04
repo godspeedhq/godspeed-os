@@ -134,3 +134,11 @@ its mailbox is named in the log.
 took over waited in a net-stack serve pass of 1.3-1.7 s before its echo went out (the echo itself took
 about 30 ms), and every later echo was prompt. Same place, both reserves, so it is not the mailboxes.
 Two samples; not diagnosed.
+
+**Diagnosed and fixed the same day: it was the first ping of the boot, not the radio.** The VisionFive
+showed it over the cable (answered after 1383 ms, a 21 ms round trip), which ruled the switch out. Before
+its first echo, `net-stack` calibrated its cycle counter (`calibrate_tsc_hz`), which waits for a
+wall-clock second to turn and then a whole second more - and it had already done exactly that at startup
+for TCP's clock and kept the result there. Ping now starts from the startup measurement and calibrates
+lazily only if that one failed. The Pi 4 boot after the fix: first echo over the cable 24 ms, first over
+the radio 37 ms, no slow pass logged.
