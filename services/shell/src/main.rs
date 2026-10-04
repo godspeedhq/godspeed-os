@@ -10252,10 +10252,21 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // KERNEL discovered - vendor:device and which register BAR it mapped. This is which chip nic-driver
     // should be driving (Phase 4).
     let vd = ctx.nic_vendor_device();
-    let chip = if vd == 0x8168_10EC { "RTL8168" } else if vd == 0x100E_8086 { "e1000" }
-               else if vd == 0 { "none" } else { "unknown" };
-    out.line_fmt(ctx, format_args!(
-        "nic      {:04x}:{:04x}  mmio {:#x}  ({})", vd & 0xFFFF, vd >> 16, ctx.nic_mmio_base(), chip));
+    // vendor:device is a PCI fact, so a controller built into the SoC (the VisionFive's dwmac, the Pi 4's
+    // GENET) has none, and this line used to print `(none)` above a driver that was working. Say what
+    // the zero means instead: no PCI card, and where the kernel granted a window, a built-in controller.
+    let mmio = ctx.nic_mmio_base();
+    if vd == 0 {
+        if mmio != 0 {
+            out.line_fmt(ctx, format_args!("nic      built in, not on PCI  mmio {:#x}", mmio));
+        } else {
+            out.line(ctx, "nic      no PCI network card - a built-in or USB one, if driven, answers below");
+        }
+    } else {
+        let chip = if vd == 0x8168_10EC { "RTL8168" } else if vd == 0x100E_8086 { "e1000" } else { "unknown" };
+        out.line_fmt(ctx, format_args!(
+            "nic      {:04x}:{:04x}  mmio {:#x}  ({})", vd & 0xFFFF, vd >> 16, mmio, chip));
+    }
 
     // Query nic-driver directly (the shell holds ACQUIRE_ANY) for its MAC + link/TX/RX - proves whether
     // MMIO reaches the NIC (Phase 4). Abortable: press q if it stalls.
@@ -10271,6 +10282,13 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                     "nic-mac  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  reset {}",
                     p[1], p[2], p[3], p[4], p[5], p[6],
                     if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
+            }
+            // An EIGHT-byte answer ([ok, mac(6), link]) is every backend with one link: e1000, smsc95xx,
+            // dwmac. Its link byte went unprinted, so on those boards `net` never said whether the cable
+            // was up. It also ties the address lines below to the live link, as the 15-byte answer does.
+            if p.len() == 8 {
+                nic_link_up = p[7] != 0;
+                out.line(ctx, if nic_link_up { "link     up via the cable" } else { "link     down - no cable" });
             }
             // A nine-byte answer is the Pi 4's, and its last byte says which link carries the frames
             // (`Carrier` in nic-driver's genet backend): 1 the cable, 2 the radio, 0 neither. The cable

@@ -55,7 +55,14 @@ ping     ok
 dns      192.168.4.1
 ```
 
-- **nic** - PCI vendor:device, the MMIO register base, and the chip name (from the kernel).
+- **nic** - PCI vendor:device, the MMIO register base, and the chip name (from the kernel). A
+  controller built into the SoC has no PCI identity, so there it reads `built in, not on PCI` with its
+  register window (the VisionFive's dwmac), or `no PCI network card` where the kernel granted none
+  (the Pis, whose driver reaches its controller another way).
+- **link** - which link is up, on the boards whose driver answers with one: `up via the cable` or
+  `down - no cable` (every single-link backend: e1000, the Pi 2's smsc95xx, the VisionFive's dwmac),
+  and on the Pi 4 `up via the cable`, `up via wifi (the cable is out)` or `down`. When it says down,
+  the address lines below say so too rather than showing the last address held.
 - **nic-mac** - the MAC read off the chip, and whether the chip reset succeeded (queries
   `nic-driver`; `TIMEOUT` here means MMIO is not reaching the chip).
 - **nic-link** - link up/down, negotiated speed/duplex, and the driver's TX/RX request counts.
@@ -68,7 +75,8 @@ dns      192.168.4.1
 - **ping** - `ok` if the gateway answered an ICMP echo; `no` otherwise.
 - **dns** - the DNS server `net-stack` will use (DHCP option 6, or the gateway as a fallback).
 
-On QEMU's e1000 the `[3]` status reply is shorter, so only `nic` + `nic-mac` show (no link/hw lines);
+On QEMU's e1000 the `[3]` status reply is shorter, so only `nic`, `nic-mac` and `link` show (no
+`nic-link`/`nic-hw` lines);
 and when there is no drivable NIC, `nic-driver` serves empty replies and `net-stack` reports
 `gateway unresolved` / `ping no` plainly rather than faking it.
 
