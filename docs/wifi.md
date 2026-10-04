@@ -3227,7 +3227,9 @@ full-MAC radio whose firmware the host uploads - with none of the Pi 4's PARTS:
   executable datasheet (26.14), and it is large.
 - **The firmware is proprietary vendor blobs**, four of them for WiFi alone, and the section 8 question
   - in the repository or supplied by the user - is asked again for a different vendor with a different
-  licence. Not answered here.
+  licence. (Answered 2026-10-04: in the repository, `nonfree/aic8800d80/`, on the operator's decision and
+  as a recorded exception - AICSemi publishes no licence, `docs/licensing.md` 5a says what that means, and
+  the copies are the exact bytes the board's own vendor image loaded.)
 - (2026-10-02: this is what `sdk/wifi` became - section 59 - and the SDIO protocol, CMD52/CMD53 and
   identification included, is shared there behind an `SdioHost` trait; the host itself is not
   `arch/aarch64/sdio.rs`, which only census-checks the controller, but `services/wifi-driver/src/host.rs`.)

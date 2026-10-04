@@ -1,0 +1,60 @@
+LICENCE - nonfree/aic8800d80
+
+READ THIS FIRST. Unlike nonfree/brcm43455, these files arrive WITHOUT a licence from the company that
+wrote them. AICSemi (Beijing Aicxin Semiconductor) has published no terms for this firmware that this
+project could find. This file says what IS known, and does not pretend to more. docs/licensing.md
+section 5a records the decision to carry them anyway, and why it is an exception.
+
+What is known, and from where:
+
+1. The files were taken from Radxa's packaging repository, https://github.com/radxa-pkg/aic8800, at
+   commit 09c65d618f5ccde3233f8f41ef2f55b205ef11db ("feat: update to
+   aic8800d_linux_sdk_V4.0_2025_0410_b99ca8b6"), path src/SDIO/driver_fw/fw/aic8800D80/. That
+   repository's debian/copyright, at the same commit, has a single stanza covering every file in it,
+   firmware included. It is reproduced here verbatim:
+
+     Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+     Upstream-Name: aic8800
+     Source: https://github.com/radxa-pkg/aic8800
+
+     Files: *
+     Copyright: © 2025 Radxa Computer Co., Ltd
+     License: GPL-3+
+
+     License: GPL-3+
+      This program is free software; you can redistribute it and/or modify
+      it under the terms of the GNU General Public License as published by
+      the Free Software Foundation; either version 3, or (at your option)
+      any later version.
+      .
+      This program is distributed in the hope that it will be useful, but
+      WITHOUT ANY WARRANTY; without even the implied warranty of
+      MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+      General Public License for more details.
+      .
+      You should have received a copy of the GNU General Public License
+      along with this program; if not, write to the Free Software
+      Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
+      02110-1301, USA.
+      .
+      On Debian systems, the complete text of the GNU General Public License
+      can be found in /usr/share/common-licenses/GPL-3.
+
+   This project does NOT read that stanza as AICSemi granting anything. A GPL grant on a binary with no
+   source offered is not a coherent licence, and Radxa is not the author of this firmware. It is
+   recorded because it is the only written term these files travel under, and the terms must travel
+   with every copy.
+
+2. Gentoo packages the same firmware (net-wireless/aic8800) under the licence label "freedist" -
+   freely redistributable. That is a distribution's classification, not a text from the vendor.
+
+3. StarFive ships these exact files, byte for byte, in the official Debian image for the VisionFive 2
+   Lite, the board this project drives them on. The board's own boot log recorded an MD5 for each file
+   as its driver loaded it, and all five match the copies here (see PROVENANCE).
+
+What GodspeedOS does with them: uploads them, unmodified, to the AIC8800D80's own processor over SDIO,
+and speaks to the firmware through the protocol it exposes. It does not modify, decompile or
+disassemble them.
+
+If AICSemi, StarFive or Radxa publish terms for this firmware, they replace this file, and if those terms
+forbid redistribution the files leave this repository for scripts/get_firmware.py.
