@@ -477,6 +477,7 @@ pub unsafe fn drop_low_map() {
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, xzr",
+            "isb",
             "dsb ish",
             "tlbi vmalle1",
             "dsb ish",

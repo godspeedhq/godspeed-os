@@ -261,12 +261,20 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
     if next_ttbr != 0 {
         // SAFETY: installing a live page-table base, then invalidating the stale translations it
         // replaces - including any a core walked speculatively through a recycled base while it idled,
-        // which is why this runs even when the base is unchanged (see above). `dsb ish` before the
-        // invalidate orders the TTBR write ahead of it; `isb` after ensures the next instruction fetch
-        // uses the new map.
+        // which is why this runs even when the base is unchanged (see above).
+        //
+        // The `isb` straight after the write is the one that matters (`backlog/72`). A system-register
+        // write takes effect only at a context synchronization event, and a `dsb` is not one, so without
+        // it the core may go on walking SPECULATIVELY through the OUTGOING root while the invalidate runs
+        // and after it - refilling its walk cache with the old task's table pointers just after they were
+        // flushed. Every address space is ASID 0, so the incoming task then walks with them: the Pi 4's
+        // translation faults on mapped pages, which a fault-time `AT` showed clearing on a flush. The
+        // `dsb ish` orders earlier table stores ahead of the invalidate; the final `isb` makes the next
+        // fetch use the clean state.
         unsafe {
             core::arch::asm!(
                 "msr ttbr0_el1, {t}",
+                "isb",
                 "dsb ish",
                 "tlbi vmalle1",
                 "dsb ish",

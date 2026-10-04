@@ -677,7 +677,7 @@ fn page_table_selftest() {
     // TTBR0 flushes nothing on AArch64 (SEC-26).
     unsafe {
         core::arch::asm!(
-            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            "msr ttbr0_el1, {t}", "isb", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
             t = in(reg) new_ttbr, options(nostack),
         );
     }
@@ -692,7 +692,7 @@ fn page_table_selftest() {
     // SAFETY: `old_ttbr` is the boot L1 that was live a moment ago.
     unsafe {
         core::arch::asm!(
-            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            "msr ttbr0_el1, {t}", "isb", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
             t = in(reg) old_ttbr, options(nostack),
         );
     }

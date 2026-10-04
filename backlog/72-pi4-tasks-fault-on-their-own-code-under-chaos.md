@@ -1,8 +1,8 @@
 # 72. Pi 4 tasks fault on their own code under `chaos max-carnage`
 
-**Status: OPEN - recorded 2026-10-04. Cause NOT found, but narrowed: the fault-path page walk shows the
-table is right and owned by the faulting task alone, so the core used a translation the table does not
-hold. One hypothesis (a skipped TLB flush on a recycled page-table root) was tested on hardware and
+**Status: OPEN - recorded 2026-10-04. Mechanism shown on the card, fix ON TRIAL: a fault-time `AT` shows the
+core holding a stale cached translation that a local flush clears, and the context switch let it be
+refilled after its flush (no `isb` after the `TTBR0` write). One hypothesis (a skipped TLB flush on a recycled page-table root) was tested on hardware and
 FALSIFIED; the change it produced is kept because it is strictly more correct.**
 
 ## Evidence
@@ -122,6 +122,34 @@ reads memory; `AT` reads what the core has cached. Fails-then-succeeds is the st
 succeeds at once is the briefly invalid entry. Verified in QEMU (a 15-round storm, the null-page filter
 removed for the run: 18 faults, both answers "translation fault at level 2", matching the walk, no panic).
 `selfcheck` on the card reproduces the fault within seconds, so one boot answers it.
+
+## The core answered: stale cached translation (2026-10-04, `c5aec65d`)
+
+`selfcheck` on the card, two faults with a walk, both the same:
+
+| task | FAR | the core at the fault | after flushing its own TLB |
+|---|---|---|---|
+| supervisor | data `0x874020` | translation fault, level 2 | translates, to pa `0x4058000` |
+| shell | code `0x424960` | translation fault, level 3 | translates, to pa `0x5c28000` |
+
+A level-2 or level-3 fault against a correct table means the core walked with a cached upper-level pointer
+to an OLD table, and a local flush cleared it. The entry came from another address space and survived the
+flush every switch performs, so it was cached AFTER that flush.
+
+**The candidate cause, and the fix on trial.** `switch_context` wrote `TTBR0_EL1` and went straight to
+`dsb ish; tlbi vmalle1; dsb ish; isb`. A system-register write takes effect only at a context
+synchronization event and a `dsb` is not one, so between the write and the final `isb` the core could still
+walk SPECULATIVELY through the outgoing root - refilling its walk cache with the old task's pointers after
+the invalidate had dropped them. ASID 0 everywhere lets the incoming task use them. That explains each
+property recorded above: hardware only (QEMU models no speculative walks), rare (a window of a few
+instructions), on the first fetch after a switch back in, and untouched by the earlier always-flush change
+(the flush was there; the refill came after it).
+
+Every TTBR0 write that is followed by a flush now has an `isb` straight after it: `switch_context`,
+`drop_low_map`, the EL0 entry, and the boot selftests. No responsibility, authority or service name
+changes, and no new `unsafe`. QEMU: a 15-round storm, no kernel panic, storm complete - which shows only
+that nothing broke, since QEMU never reproduced the fault. The card decides: `selfcheck` should finish with
+no shell fault. The walk and `AT` report stay, so a fault that survives the fix is caught the same way.
 
 ## Related, latent
 
