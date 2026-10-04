@@ -1,6 +1,6 @@
 # WiFi on the VisionFive 2 Lite: the AIC8800D80 (design, 2026-10-04)
 
-**Status: DESIGN; phases V0 and V1 DONE and verified on the board 2026-10-04.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver answers `radio down` with the reason `DOWN_NOT_BUILT`. V2 onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
+**Status: DESIGN; phases V0 and V1 DONE and verified on the board 2026-10-04, and V2's first exchange (the data phase and one message to the chip's ROM, revision 7 read back) the same day.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver answers `radio down` with the reason `DOWN_NOT_BUILT`. The rest of V2 (the upload) onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
 second WiFi driver. `docs/wifi.md` section 44 identified the chip from the board's own boot log; the
 firmware is in `nonfree/aic8800d80/` (byte for byte what the board's vendor image loaded, with its
 licence position recorded there and in `docs/licensing.md` 5a). What follows is the hardware as the
@@ -144,6 +144,25 @@ depth read 128, then 64, then 32 across the three resets, because the driver rea
 `fifo-depth = <32>` on both `jh7110-mmc` nodes; the driver now does the same. The first read implied 128,
 so whether this host's FIFO is really 32 or 128 is open, and 32 is safe either way. V1 sends no data, so
 nothing depended on the wrong value yet; V2 would have.
+
+**V2's first exchange on the board (2026-10-04).** The data phase is built: PIO through the FIFO at
+`+0x200`, polled, every wait bounded, the FIFO reset after an error and the card told to abort by the
+shared CMD53 code. Two fixed-address CMD53 helpers (`read_fifo` / `write_fifo`, Linux's `sdio_readsb` /
+`sdio_writesb`) went into `sdk/wifi`, since a message FIFO register is plain SDIO. Then `aic.rs` set up
+function 1 as `aicwf_sdiov3_func_init` and `aicwf_sdio_bus_start` do, woke the chip, and sent one
+`DBG_MEM_READ_REQ` for `0x4050_0000`. Every line predicted, first card: block size 512 held, function 1
+ready on the first read, awake on the first wake attempt (`F1 0x01 = 0x10`), header `10 00 11 d5` (so the
+CRC-8 is right), 4 free buffers, then status `0x01` on the FIRST look - one block - and a configuration
+packet of type `0x11`, length 20, carrying `0x0401` with 8 parameter bytes. The word is `0xf3078820`:
+**revision 7 (U03), not the H variant**, so the `u02` files this directory carries are the set the
+vendor driver would pick. 79 ms from `V1 done` to the answer, at the 400 kHz identification clock.
+
+Two things this settles. **Polling works**: the vendor driver reads only from its SDIO interrupt, and this
+host takes none, yet the status register named the reply on the first look - the substitution was the one
+untested part of the exchange. **The framing is right on both sides**: the chip accepted the header CRC
+and the message layout, and the receive side has no dummy word (the message starts right after the
+4-byte header, with the vendor's extra `pattern` word before the parameters). Still at the identification clock;
+whether the upload needs the vendor's 5 MHz or tolerates more is the next card's question.
 
 ## 5. The AIC8800 bus and the firmware upload
 

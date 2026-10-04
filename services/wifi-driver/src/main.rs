@@ -44,6 +44,8 @@ mod backplane;
 mod bcm;
 mod bus;
 #[cfg(wifi_host_dw_mmc)]
+mod aic;
+#[cfg(wifi_host_dw_mmc)]
 mod dwmmc;
 mod ctrl;
 mod frames;
@@ -320,22 +322,38 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
         card.funcs, card.memory, card.ocr, card.rca));
     sd::report_cccr(&h, ctx);
     // ---- Stage 4: ask the PART what it is. --------------------------------------------------------
-    match sd::cis_pointer(&h, ctx).and_then(|p| sd::walk_cis(&h, p, ctx)) {
+    let is_d80 = match sd::cis_pointer(&h, ctx).and_then(|p| sd::walk_cis(&h, p, ctx)) {
         Some(m) => {
             const AIC_VENDOR: u16 = 0xC8A1;
             const AIC8800D80: u16 = 0x0082;
+            let ok = m.manf == AIC_VENDOR && m.device == AIC8800D80;
             ctx.log_fmt(format_args!(
                 "wifi-driver: stage 4 - the card's CIS says manufacturer {:#06x}, device {:#06x}{}",
                 m.manf, m.device,
-                if m.manf == AIC_VENDOR && m.device == AIC8800D80 {
+                if ok {
                     " - an AICSemi AIC8800D80, as the board's vendor image said. V1 done"
                 } else {
                     " - NOT the AIC8800D80 (C8A1:0082) the design expects; stopping here"
                 }));
+            ok
         }
-        None => ctx.log("wifi-driver: stage 4 - the card answered but its CIS could not be walked to a MANFID tuple"),
+        None => {
+            ctx.log("wifi-driver: stage 4 - the card answered but its CIS could not be walked to a MANFID tuple");
+            false
+        }
+    };
+    // ---- Stage 5 (V2, first exchange): one message to the chip's ROM and its answer. -------------------
+    if is_d80 {
+        match aic::first_exchange(&h, ctx) {
+            Some(w) => ctx.log_fmt(format_args!(
+                "wifi-driver: stage 5 - the chip's ROM answered: {:#010x} at {:#010x}, chip revision {} ({}){}",
+                w, aic::CHIP_ID_ADDR, (w >> 16) & 0x3f,
+                match (w >> 16) & 0x3f { 1 => "U01", 3 => "U02", 7 => "U03", _ => "not one the vendor driver names" },
+                if (w >> 16) & 0xc0 == 0xc0 { ", the H variant" } else { "" })),
+            None => ctx.log("wifi-driver: stage 5 - the first message to the chip's ROM got no confirm; the lines above say which step"),
+        }
     }
-    ctx.log("wifi-driver: the AIC8800 firmware upload (V2) is not built yet, so this answers `radio down`, reason 4 (DOWN_NOT_BUILT)");
+    ctx.log("wifi-driver: the AIC8800 firmware upload (the rest of V2) is not built yet, so this answers `radio down`, reason 4 (DOWN_NOT_BUILT)");
     serve_unavailable_why(ctx, Some(&h), why)
 }
 

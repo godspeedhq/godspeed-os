@@ -413,3 +413,21 @@ dw_mci_start_command               # Linux dw_mmc.c, how dwmmc.rs issues a comma
 mci_send_cmd                       # Linux dw_mmc.c, the controller-only (clock update) command dwmmc.rs copies - external, 26.14
 DW_MMC_CARD_NEED_INIT              # Linux dw_mmc.h flag, cited for the INIT bit on a card's first command (dwmmc.rs) - external, 26.14
 DW_MMC_CARD_NO_LOW_PWR             # Linux dw_mmc.h flag, cited for never using the low-power clock with an SDIO card (dwmmc.rs) - external, 26.14
+DATA_240A_OFFSET                   # Linux dw_mmc.h, the FIFO window from controller version 0x240A that dwmmc.rs reads from VERID - external, 26.14
+DW_MCI_DATA_ERROR_FLAGS            # Linux dw_mmc.c, the data error bits dwmmc.rs ends a PIO transfer on - external, 26.14
+dw_mci_read_data_pio               # Linux dw_mmc.c, the PIO receive loop dwmmc.rs polls instead of taking its interrupt - external, 26.14
+dw_mci_write_data_pio              # Linux dw_mmc.c, the PIO transmit loop dwmmc.rs polls instead of taking its interrupt - external, 26.14
+dw_mci_submit_data                 # Linux dw_mmc.c, the data-phase setup (DMA off, BLKSIZ, BYTCNT) dwmmc.rs follows - external, 26.14
+dw_mci_wait_while_busy             # Linux dw_mmc.c, the wait for DAT0 busy before a data command (dwmmc.rs) - external, 26.14
+aicbsp_driver_fw_init              # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the chip-revision read aic.rs makes first - external, 26.14
+aicwf_process_rxframes             # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the receive packet walk aic.rs follows - external, 26.14
+aicwf_sdio_bus_start               # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the interrupt enables aic.rs sets - external, 26.14
+aicwf_sdio_flow_ctrl               # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the free-buffer check before a send (aic.rs) - external, 26.14
+aicwf_sdio_hal_irqhandler          # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the receive handler whose status register aic.rs polls instead - external, 26.14
+aicwf_sdio_tx_msg                  # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the frame padding and send aic.rs follows - external, 26.14
+aicwf_sdio_wakeup                  # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the wake sequence aic.rs copies - external, 26.14
+aicwf_sdiov3_func_init             # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the D80 function-1 setup aic.rs follows - external, 26.14
+crc8_ponl_107                      # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the bus header CRC-8 aic.rs computes - external, 26.14
+rwnx_set_cmd_tx                    # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the message frame layout aic.rs builds - external, 26.14
+sdio_readsb                        # Linux sdio_io.c, the fixed-address CMD53 read sdio.rs read_fifo mirrors - external, 26.14
+sdio_writesb                       # Linux sdio_io.c, the fixed-address CMD53 write sdio.rs write_fifo mirrors - external, 26.14

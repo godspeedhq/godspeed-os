@@ -626,6 +626,57 @@ pub fn write_extended(
     true
 }
 
+/// Move `words` to or from a card FIFO register by CMD53 at a FIXED address (OP code 0, `sdio_writesb` /
+/// `sdio_readsb` in Linux): every byte goes to or comes from the one register, which is how a card exposes
+/// a message FIFO. The incrementing-address forms above are for memory-like windows and would walk past it.
+///
+/// The mode is the Linux core's choice (`sdio_io_rw_ext_helper`): up to `block` bytes is ONE byte-mode
+/// transfer (a count of `block` bytes is sent as 0 when it is 512, which the card reads as 512); more is
+/// block mode in whole blocks of `block`, so the length must then be a multiple of it.
+fn fifo_xfer(h: &dyn SdioHost, func: u8, addr: u32, words: &mut [u32], block: u32, write: bool, ctx: &ServiceContext) -> bool {
+    let bytes = (words.len() * 4) as u32;
+    if bytes == 0 || (bytes > block && bytes % block != 0) || block == 0 || block > 512 {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a FIFO transfer of {} byte(s) in blocks of {} is not one this driver makes", bytes, block));
+        return false;
+    }
+    let (block_bit, count, geom, multi) = if bytes <= block {
+        (0u32, bytes, blk_byte_mode(bytes), false)
+    } else {
+        (1u32 << 27, bytes / block, blk_block_mode(bytes / block, block), true)
+    };
+    let arg = if write { 1u32 << 31 } else { 0 }
+        | ((func as u32 & 0x7) << 28)
+        | block_bit
+        | ((addr & 0x1_FFFF) << 9)
+        | (count & 0x1FF);
+    if let Err(phase) = h.cmd_data(IO_RW_EXTENDED, arg, Xfer { geom, read: !write, multi }, words) {
+        let resp = h.last_resp();
+        let (rb, cmdw) = h.last_setup();
+        let (si, ss) = h.seen();
+        let (df, dl) = h.dat_window();
+        ctx.log_fmt(format_args!(
+            "wifi-driver: CMD53 FIFO {} of {} byte(s) at function {} register {:#04x} failed - {} (arg={:#010x} \
+             block word={:#010x} command word={:#010x} R5 flags {:#04x}; INT seen {:#010x}, STATUS seen {:#010x}, \
+             data busy at poll {}..{})",
+            if write { "write" } else { "read" }, bytes, func, addr, phase, arg, rb, cmdw,
+            (resp >> 8) & 0xFF, si, ss, df, dl));
+        abort(h, func, ctx);
+        return false;
+    }
+    true
+}
+
+/// Write `words` to a card FIFO register (fixed address). See `fifo_xfer`.
+pub fn write_fifo(h: &dyn SdioHost, func: u8, addr: u32, words: &mut [u32], block: u32, ctx: &ServiceContext) -> bool {
+    fifo_xfer(h, func, addr, words, block, true, ctx)
+}
+
+/// Read `words` from a card FIFO register (fixed address). See `fifo_xfer`.
+pub fn read_fifo(h: &dyn SdioHost, func: u8, addr: u32, words: &mut [u32], block: u32, ctx: &ServiceContext) -> bool {
+    fifo_xfer(h, func, addr, words, block, false, ctx)
+}
+
 /// Tell the card to abandon a transfer on `func` - CCCR `IO_ABORT`, written to function 0.
 ///
 /// **Without this, one failed data transfer poisons every command after it.** A CMD53 the card ACCEPTS

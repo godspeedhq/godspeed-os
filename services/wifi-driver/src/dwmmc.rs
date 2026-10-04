@@ -11,9 +11,9 @@
 //! What is ours is the model: polled, bounded, no interrupts and NO DMA - the host never points a DMA
 //! engine at memory, which is what keeps it safe on a non-coherent machine with no IOMMU.
 //!
-//! **V1 issues commands only.** Identification, CMD52 register access and the CIS walk all travel on the
-//! CMD line. The data phase (`cmd_data`, PIO through the FIFO) arrives with the firmware upload that
-//! needs it (V2), and until then it refuses by name rather than half-working.
+//! **V1 issued commands only; V2 adds the data phase.** Identification, CMD52 register access and the CIS
+//! walk all travel on the CMD line. CMD53 (`cmd_data`) moves its words by PIO through the FIFO, polled -
+//! the firmware upload is what needs it.
 
 use core::cell::Cell;
 
@@ -29,6 +29,8 @@ const DW_CLKSRC: usize = 0x00c;
 const DW_CLKENA: usize = 0x010;
 const DW_TMOUT: usize = 0x014;
 const DW_CTYPE: usize = 0x018;
+const DW_BLKSIZ: usize = 0x01c;
+const DW_BYTCNT: usize = 0x020;
 const DW_INTMASK: usize = 0x024;
 const DW_CMDARG: usize = 0x028;
 const DW_CMD: usize = 0x02c;
@@ -38,6 +40,12 @@ const DW_STATUS: usize = 0x048;
 const DW_FIFOTH: usize = 0x04c;
 const DW_VERID: usize = 0x06c;
 const DW_HCON: usize = 0x070;
+/// The data FIFO's window. `0x100` below controller version `0x240A`, `0x200` from it on (`DATA_OFFSET` /
+/// `DATA_240A_OFFSET` in `dw_mmc.h`); this host is version `0x290A` (V0's census, `docs/wifi-aic8800.md`
+/// 9), so `0x200`. Read per transfer from `VERID` rather than assumed, so a different revision of the
+/// controller cannot silently move it.
+const DW_DATA_OLD: usize = 0x100;
+const DW_DATA_240A: usize = 0x200;
 
 /// The FIFO depth in 32-bit words: the board's device tree, `fifo-depth = <32>` on both `jh7110-mmc`
 /// nodes. NOT read from `DW_FIFOTH`, which is what V1 first did: the RX watermark's power-on value is
@@ -52,6 +60,10 @@ const CTRL_RESET: u32 = 1 << 0;
 const CTRL_FIFO_RESET: u32 = 1 << 1;
 const CTRL_DMA_RESET: u32 = 1 << 2;
 const CTRL_ALL_RESET: u32 = CTRL_RESET | CTRL_FIFO_RESET | CTRL_DMA_RESET;
+/// `CTRL` bits that hand the FIFO to a DMA engine. Cleared before every data phase, as
+/// `dw_mci_submit_data` does for PIO: this host never points a DMA engine at memory.
+const CTRL_DMA_ENABLE: u32 = 1 << 5;
+const CTRL_USE_IDMAC: u32 = 1 << 25;
 
 /// `DW_CLKENA`: the card clock on. NEVER the low-power bit (16): it stops the card clock while the bus is
 /// idle, and an SDIO card's interrupt needs a running clock - Linux sets `DW_MMC_CARD_NO_LOW_PWR` for
@@ -64,17 +76,40 @@ const CMD_UPD_CLK: u32 = 1 << 21;
 const CMD_INIT: u32 = 1 << 15;
 const CMD_STOP: u32 = 1 << 14;
 const CMD_PRV_DAT_WAIT: u32 = 1 << 13;
+const CMD_DAT_WR: u32 = 1 << 10;
+const CMD_DAT_EXP: u32 = 1 << 9;
 const CMD_RESP_CRC: u32 = 1 << 8;
 const CMD_RESP_EXP: u32 = 1 << 6;
 
 const INT_RE: u32 = 1 << 1;
 const INT_CMD_DONE: u32 = 1 << 2;
+const INT_DATA_OVER: u32 = 1 << 3;
+const INT_TXDR: u32 = 1 << 4;
+const INT_RXDR: u32 = 1 << 5;
 const INT_RCRC: u32 = 1 << 6;
+const INT_DCRC: u32 = 1 << 7;
 const INT_RTO: u32 = 1 << 8;
+const INT_DRTO: u32 = 1 << 9;
+const INT_HTO: u32 = 1 << 10;
+const INT_FRUN: u32 = 1 << 11;
 const INT_HLE: u32 = 1 << 12;
+const INT_SBE: u32 = 1 << 13;
+const INT_EBE: u32 = 1 << 15;
 const INT_CMD_ERRORS: u32 = INT_RE | INT_RCRC | INT_RTO | INT_HLE;
+/// `DW_MCI_DATA_ERROR_FLAGS`, plus the FIFO under/overrun a PIO loop can cause itself.
+const INT_DATA_ERRORS: u32 = INT_DRTO | INT_DCRC | INT_HTO | INT_SBE | INT_EBE | INT_FRUN;
 
 const STATUS_BUSY: u32 = 1 << 9;
+/// `STATUS[29:17]`, the words the FIFO holds now.
+const fn status_fifo_count(s: u32) -> u32 {
+    (s >> 17) & 0x1fff
+}
+
+/// A data phase's budget, end to end. The data timeout in `TMOUT` is set to its maximum, so the
+/// controller will not end a slow transfer for us; this is the bound that does (26.6). At the 400 kHz
+/// identification clock a 512-byte block is ~10 ms on one data line, so a second is generous for the
+/// largest transfer V2 makes and still short enough that a stuck one is seen.
+const DATA_WAIT: Budget = Budget::ms(1_000);
 
 /// The identification clock: at most 400 kHz, as the SD specification requires before a card is known.
 const IDENT_HZ: u32 = 400_000;
@@ -99,11 +134,40 @@ pub struct Host<'a> {
     need_init: Cell<bool>,
     last_int: Cell<u32>,
     last_cmd: Cell<u32>,
+    /// `(BLKSIZ, BYTCNT)` packed as `BLKSIZ << 16 | BYTCNT` for the last data command, for `last_setup`.
+    last_blk: Cell<u32>,
+    /// The instruments the shared CMD53 failure lines print (`SdioHost::seen`, `dat_window`): every
+    /// `RINTSTS` and `STATUS` bit seen during the last data phase, and the polls at which the data path
+    /// was first and last seen busy. Reset at the start of each transfer, so they describe that one.
+    seen_int: Cell<u32>,
+    seen_status: Cell<u32>,
+    dat_first: Cell<u32>,
+    dat_last: Cell<u32>,
+    /// Polls spent waiting for the FIFO and for data-over since the last `take_waits`.
+    waits_ready: Cell<u64>,
+    waits_done: Cell<u64>,
 }
 
 impl<'a> Host<'a> {
     pub fn new(ctx: &'a ServiceContext, m: &'a Mmio) -> Self {
-        Host { ctx, m, need_init: Cell::new(true), last_int: Cell::new(0), last_cmd: Cell::new(0) }
+        Host {
+            ctx,
+            m,
+            need_init: Cell::new(true),
+            last_int: Cell::new(0),
+            last_cmd: Cell::new(0),
+            last_blk: Cell::new(0),
+            seen_int: Cell::new(0),
+            seen_status: Cell::new(0),
+            dat_first: Cell::new(0),
+            dat_last: Cell::new(0),
+            waits_ready: Cell::new(0),
+            waits_done: Cell::new(0),
+        }
+    }
+
+    fn data_reg(&self) -> usize {
+        if self.rd(DW_VERID) & 0xffff < 0x240a { DW_DATA_OLD } else { DW_DATA_240A }
     }
 
     fn rd(&self, off: usize) -> u32 {
@@ -199,8 +263,10 @@ impl<'a> Host<'a> {
 
     /// One command on the CMD line: `dw_mci_prepare_command` for the flags, `dw_mci_start_command` to
     /// issue it, then a bounded poll of `DW_RINTSTS` for done or an error.
-    fn cmd_inner(&self, c: Cmd, arg: u32) -> Option<u32> {
-        let mut flags = c.index as u32 & 0x3f;
+    /// `data` carries the data-phase bits (`DAT_EXP`, `DAT_WR`, `PRV_DAT_WAIT`) for `cmd_data`, and is 0
+    /// for a command on the CMD line alone.
+    fn cmd_inner(&self, c: Cmd, arg: u32, data: u32) -> Option<u32> {
+        let mut flags = (c.index as u32 & 0x3f) | data;
         let abort = c.index == 52 && (arg >> 9) & 0x1_ffff == CCCR_ABORT;
         if c.index == 0 || abort {
             flags |= CMD_STOP;
@@ -232,7 +298,10 @@ impl<'a> Host<'a> {
         // Wait for CMD_DONE even after an error bit, briefly: the controller raises it after the error.
         let _ = wait::until(self.ctx, Budget::ms(10), || self.rd(DW_RINTSTS) & INT_CMD_DONE != 0);
         ints |= self.rd(DW_RINTSTS);
-        self.wr(DW_RINTSTS, ints);
+        // With a data phase to follow, clear only the COMMAND's bits: a receive-ready or data-over that
+        // has already landed belongs to `cmd_data_inner`'s loop, and clearing it here would leave that loop
+        // waiting for an event that already happened.
+        self.wr(DW_RINTSTS, if data != 0 { ints & (INT_CMD_DONE | INT_CMD_ERRORS) } else { ints });
         if done.is_err() || ints & INT_CMD_ERRORS != 0 {
             self.last_int.set(ints);
             return None;
@@ -242,6 +311,137 @@ impl<'a> Host<'a> {
             let _ = wait::until(self.ctx, CARD_WAIT, || self.rd(DW_STATUS) & STATUS_BUSY == 0);
         }
         Some(if c.resp == Resp::None { 0 } else { self.rd(DW_RESP0) })
+    }
+
+    /// A command with a data phase, by PIO through the FIFO: `dw_mci_submit_data` for the setup (DMA off,
+    /// `BLKSIZ`, `BYTCNT`), the command with `DAT_EXP` (and `DAT_WR` for a write), then `dw_mci_read_data_pio`
+    /// / `dw_mci_write_data_pio`'s loop polled instead of interrupt-driven: on receive-ready or data-over,
+    /// take what `STATUS` says the FIFO holds; on transmit-ready, give it what fits. Data-over ends it.
+    ///
+    /// Every error ends it too, with the FIFO reset so the next transfer starts from an empty one; telling
+    /// the CARD to abandon the transfer is the protocol's job (`sdio::abort`), which every CMD53 caller in
+    /// `sdio.rs` already does on `Err`.
+    fn cmd_data_inner(&self, c: Cmd, arg: u32, x: Xfer, buf: &mut [u32]) -> Result<(), &'static str> {
+        let bytes = x.geom.size.max(1) * x.geom.count.max(1);
+        // Byte mode's size 0 means 512 bytes to the card; this host is never asked for that, and refusing
+        // it keeps `BYTCNT` and the buffer provably the same length.
+        if buf.is_empty() || x.geom.size == 0 || bytes as usize != buf.len() * 4 {
+            return Err("dw_mmc: the transfer's geometry does not match its buffer");
+        }
+        self.seen_int.set(0);
+        self.seen_status.set(0);
+        self.dat_first.set(0);
+        self.dat_last.set(0);
+        // The card may still hold DAT0 busy from the last transfer (`dw_mci_wait_while_busy`, for commands
+        // with data only).
+        if wait::until(self.ctx, CARD_WAIT, || self.rd(DW_STATUS) & STATUS_BUSY == 0).is_err() {
+            self.last_int.set(self.rd(DW_RINTSTS));
+            return Err("dw_mmc: the data path stayed busy from the previous transfer");
+        }
+        if !self.ctrl_reset(CTRL_FIFO_RESET) {
+            return Err("dw_mmc: the FIFO reset did not clear");
+        }
+        let ctrl = self.rd(DW_CTRL);
+        self.wr(DW_CTRL, ctrl & !(CTRL_DMA_ENABLE | CTRL_USE_IDMAC));
+        self.wr(DW_BLKSIZ, x.geom.size);
+        self.wr(DW_BYTCNT, bytes);
+        self.last_blk.set((x.geom.size << 16) | (bytes & 0xffff));
+
+        let dir = if x.read { 0 } else { CMD_DAT_WR };
+        if self.cmd_inner(c, arg, CMD_DAT_EXP | dir | CMD_PRV_DAT_WAIT).is_none() {
+            let _ = self.ctrl_reset(CTRL_FIFO_RESET);
+            return Err("the command was not answered (no data phase was attempted)");
+        }
+
+        let fifo = self.data_reg();
+        let mut done = 0usize; // words moved
+        let mut polls = 0u32;
+        let mut d = wait::Deadline::start(self.ctx, DATA_WAIT);
+        let result = loop {
+            polls = polls.wrapping_add(1);
+            let ints = self.rd(DW_RINTSTS);
+            let st = self.rd(DW_STATUS);
+            self.seen_int.set(self.seen_int.get() | ints);
+            self.seen_status.set(self.seen_status.get() | st);
+            if st & STATUS_BUSY != 0 {
+                if self.dat_first.get() == 0 {
+                    self.dat_first.set(polls);
+                }
+                self.dat_last.set(polls);
+            }
+            if ints & INT_DATA_ERRORS != 0 {
+                self.wr(DW_RINTSTS, ints);
+                self.last_int.set(ints);
+                break Err(if ints & INT_DCRC != 0 {
+                    "data CRC error"
+                } else if ints & INT_DRTO != 0 {
+                    "the card sent no data (data read timeout)"
+                } else if ints & INT_FRUN != 0 {
+                    "the FIFO under- or overran"
+                } else {
+                    "a data error (start bit, end bit or host timeout)"
+                });
+            }
+            if x.read && ints & (INT_RXDR | INT_DATA_OVER) != 0 {
+                let mut n = status_fifo_count(self.rd(DW_STATUS)) as usize;
+                while n > 0 && done < buf.len() {
+                    buf[done] = self.rd(fifo);
+                    done += 1;
+                    n -= 1;
+                }
+                self.wr(DW_RINTSTS, INT_RXDR);
+            }
+            if !x.read && ints & INT_TXDR != 0 {
+                let room = FIFO_DEPTH_WORDS.saturating_sub(status_fifo_count(self.rd(DW_STATUS))) as usize;
+                let mut n = room;
+                while n > 0 && done < buf.len() {
+                    self.wr(fifo, buf[done]);
+                    done += 1;
+                    n -= 1;
+                }
+                self.wr(DW_RINTSTS, INT_TXDR);
+            }
+            if ints & INT_DATA_OVER != 0 {
+                self.wr(DW_RINTSTS, INT_DATA_OVER);
+                if done == buf.len() {
+                    break Ok(());
+                }
+                // Data-over with words still owed: one more look at the FIFO for a read (the last words can
+                // land with it), then the shortfall is the answer.
+                if x.read {
+                    let mut n = status_fifo_count(self.rd(DW_STATUS)) as usize;
+                    while n > 0 && done < buf.len() {
+                        buf[done] = self.rd(fifo);
+                        done += 1;
+                        n -= 1;
+                    }
+                }
+                break if done == buf.len() { Ok(()) } else { Err("data-over came before every word moved") };
+            }
+            if d.expired() {
+                self.last_int.set(ints);
+                break Err(if done == 0 {
+                    "no word moved before the data phase's budget ran out"
+                } else {
+                    "the data phase stalled part-way and its budget ran out"
+                });
+            }
+        };
+        if done < buf.len() || result.is_err() {
+            self.waits_ready.set(self.waits_ready.get() + polls as u64);
+        } else {
+            self.waits_done.set(self.waits_done.get() + polls as u64);
+        }
+        if result.is_err() {
+            let _ = self.ctrl_reset(CTRL_FIFO_RESET);
+            return result;
+        }
+        // A write leaves the card busy on DAT0 while it takes the block; the next command waits on that
+        // anyway, but a transfer that ends with the card still busy is reported as such rather than as done.
+        if !x.read && wait::until(self.ctx, CARD_WAIT, || self.rd(DW_STATUS) & STATUS_BUSY == 0).is_err() {
+            return Err("the card stayed busy after the write");
+        }
+        Ok(())
     }
 }
 
@@ -257,10 +457,10 @@ impl SdioHost for Host<'_> {
         self.setup_bus(hz)
     }
     fn cmd(&self, c: Cmd, arg: u32) -> Option<u32> {
-        self.cmd_inner(c, arg)
+        self.cmd_inner(c, arg, 0)
     }
-    fn cmd_data(&self, _c: Cmd, _arg: u32, _x: Xfer, _buf: &mut [u32]) -> Result<(), &'static str> {
-        Err("dw_mmc: the data phase arrives with the firmware upload (V2); this host issues commands only")
+    fn cmd_data(&self, c: Cmd, arg: u32, x: Xfer, buf: &mut [u32]) -> Result<(), &'static str> {
+        self.cmd_data_inner(c, arg, x, buf)
     }
     fn status(&self) -> u32 {
         self.rd(DW_STATUS)
@@ -271,19 +471,20 @@ impl SdioHost for Host<'_> {
     fn last_resp(&self) -> u32 {
         self.rd(DW_RESP0)
     }
+    /// `(BLKSIZ << 16 | BYTCNT, CMD)` for the last data command.
     fn last_setup(&self) -> (u32, u32) {
-        (0, self.last_cmd.get())
+        (self.last_blk.get(), self.last_cmd.get())
     }
     fn last_ctrl0(&self) -> u32 {
         self.rd(DW_CTRL)
     }
     fn seen(&self) -> (u32, u32) {
-        (0, 0)
+        (self.seen_int.get(), self.seen_status.get())
     }
     fn dat_window(&self) -> (u32, u32) {
-        (0, 0)
+        (self.dat_first.get(), self.dat_last.get())
     }
     fn take_waits(&self) -> (u64, u64) {
-        (0, 0)
+        (self.waits_ready.replace(0), self.waits_done.replace(0))
     }
 }

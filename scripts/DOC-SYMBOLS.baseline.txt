@@ -98,8 +98,6 @@ CHIP_REV_U03                       # docs/wifi-aic8800.md - AICSemi aic8800_bsp 
 lmac_msg                           # docs/wifi-aic8800.md, docs/CLAUDE.md - AICSemi/RivieraWaves message header struct, EXTERNAL
 aic8800_fdrv                       # docs/wifi-aic8800.md - AICSemi's full-MAC Linux module, EXTERNAL
 set_pmk                            # docs/wifi-aic8800.md - Linux cfg80211 op, EXTERNAL; cited as the handshake offload this firmware lacks
-dw_mci_probe                       # docs/wifi-aic8800.md - Linux dw_mmc.c, EXTERNAL; the init order followed
 dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXTERNAL; the second init order compared
 ap_max_inactivity                  # backlog/64 - hostapd configuration option, EXTERNAL; the access point idle timer that matches reason 4 after ~300 s
 mkeep_alive                        # backlog/64 - Broadcom firmware iovar Linux brcmfmac sets only for suspend, EXTERNAL
-dw_mci_wait_while_busy             # docs/wifi-aic8800.md - Linux drivers/mmc/host/dw_mmc.c, cited for when the reference waits on STATUS busy, EXTERNAL
