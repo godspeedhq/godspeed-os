@@ -503,3 +503,146 @@ pub fn check_first_word(h: &dyn SdioHost, what: &str, addr: u32, bytes: &[u8], c
         None => false,
     }
 }
+
+const DBG_MEM_WRITE_REQ: u16 = 0x0402;
+const DBG_MEM_WRITE_CFM: u16 = 0x0403;
+const DBG_START_APP_REQ: u16 = 0x040D;
+const DBG_START_APP_CFM: u16 = 0x040E;
+
+/// Write one 32-bit word of the chip's memory through its ROM: `DBG_MEM_WRITE_REQ` `{memaddr, memdata}`,
+/// confirmed by `DBG_MEM_WRITE_CFM` naming the same address.
+pub fn mem_write(h: &dyn SdioHost, addr: u32, val: u32, ctx: &ServiceContext) -> bool {
+    let mut p = [0u8; 8];
+    p[..4].copy_from_slice(&addr.to_le_bytes());
+    p[4..].copy_from_slice(&val.to_le_bytes());
+    match request(h, DBG_MEM_WRITE_REQ, &p, DBG_MEM_WRITE_CFM, true, ctx) {
+        Some((_, c)) if le32(&c, 0) == addr => true,
+        Some((len, c)) => {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: AIC memory write of {:#010x} to {:#010x} confirmed for {:#010x} ({} parameter bytes)",
+                val, addr, le32(&c, 0), len));
+            false
+        }
+        None => {
+            ctx.log_fmt(format_args!("wifi-driver: AIC memory write of {:#010x} to {:#010x} failed", val, addr));
+            false
+        }
+    }
+}
+
+/// Group types in the patch table (`aicbt_patch_table_alloc`): the information group, the trap and patch
+/// tables, the Bluetooth mode block, the power-on writes, a second patch table, and version text.
+const GROUP_BTMODE: u32 = 3;
+const GROUP_POWER_ON: u32 = 4;
+const GROUP_VERSION: u32 = 6;
+
+/// The values the vendor driver puts in the Bluetooth mode group before writing it, slot by slot, for the
+/// D80 with this build's defaults (`aicbt_patch_table_load`): no hardware info (so "none" and `-1`), no
+/// second chip flag, Bluetooth-only co-antenna mode 5, the UART port 2, 1.5 Mbaud, flow control on, low
+/// power off, and the vendor's fixed final word. The radio's Bluetooth is not driven here; the group is
+/// written because the ROM patches read it.
+const BTMODE_VALUES: [u32; 9] = [1, 0xFFFF_FFFF, 0, 5, 2, 1_500_000, 1, 0, 0x6f2f];
+
+/// Every group of the patch table but the version text, as `(address, value)` memory writes, in file
+/// order, with the Bluetooth mode values replaced and a 500 us pause after the power-on group - the
+/// INFORMATION group included, as `aicbt_patch_table_load` writes it (its last two pairs land at
+/// addresses 1 and 0; the reference does it and the chip accepts it, so this does too).
+pub fn table_writes(h: &dyn SdioHost, table: &[u8], ctx: &ServiceContext) -> bool {
+    let Some(groups) = Groups::new(table) else { return false };
+    let mut total = 0u32;
+    let d = wait::Deadline::start(ctx, Budget::ms(600_000));
+    for (name, ty, pairs) in groups {
+        if ty == GROUP_VERSION {
+            continue;
+        }
+        let n = pairs.len() / 8;
+        if ty == GROUP_BTMODE && n != BTMODE_VALUES.len() {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: AIC patch table's Bluetooth mode group has {} pairs, not the {} this driver fills - stopped",
+                n, BTMODE_VALUES.len()));
+            return false;
+        }
+        for i in 0..n {
+            let addr = le32(pairs, 8 * i);
+            let val = if ty == GROUP_BTMODE { BTMODE_VALUES[i] } else { le32(pairs, 8 * i + 4) };
+            if !mem_write(h, addr, val, ctx) {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: AIC patch table write {} of group {:?} failed - stopped",
+                    i, core::str::from_utf8(name).unwrap_or("?")));
+                return false;
+            }
+            total += 1;
+        }
+        if ty == GROUP_POWER_ON {
+            delay::hold(ctx, Budget::us(500));
+        }
+    }
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC patch table written - {} memory writes, every one confirmed, {} ms", total, d.elapsed_us() / 1000));
+    true
+}
+
+/// Where `fmacfw` goes and starts (`RAM_FMAC_FW_ADDR`).
+pub const FMAC_ADDR: u32 = 0x0012_0000;
+
+/// `aicwifi_patch_config_8800d80`: read three pointers and the version out of the uploaded `fmacfw`, then
+/// write its patch header and three `(offset, value)` pairs where the image says. The pointers are READ
+/// from the chip, not taken from the file, as the reference does; the file's values are logged beside
+/// them so a difference shows.
+pub fn patch_config(h: &dyn SdioHost, fmac: &[u8], ctx: &ServiceContext) -> bool {
+    let rd = |addr: u32| mem_read(h, addr, true, ctx);
+    let file = |addr: u32| le32(fmac, (addr - FMAC_ADDR) as usize);
+    let (Some(config_base), Some(patch_str), Some(version)) =
+        (rd(FMAC_ADDR + 0x198), rd(FMAC_ADDR + 0x1A0), rd(FMAC_ADDR + 0x1C))
+    else {
+        ctx.log("wifi-driver: AIC patch configuration - a pointer read from fmacfw failed");
+        return false;
+    };
+    let start = if version > 0x0609_0100 {
+        match rd(FMAC_ADDR + 0x1A4) {
+            Some(v) => v,
+            None => return false,
+        }
+    } else {
+        0x0016_F800
+    };
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC fmacfw version {:#010x}, config base {:#010x}, patch header {:#010x}, pairs at {:#010x} (the file says {:#010x} {:#010x} {:#010x} {:#010x})",
+        version, config_base, patch_str, start,
+        file(FMAC_ADDR + 0x1C), file(FMAC_ADDR + 0x198), file(FMAC_ADDR + 0x1A0), file(FMAC_ADDR + 0x1A4)));
+    const PAIRS: [(u32, u32); 3] = [(0x00b4, 0xf301_0000), (0x0170, 0x0100_000a), (0x0188, 0x0000_0003)];
+    let mut writes: [(u32, u32); 4 + 2 * 3 + 4] = [(0, 0); 14];
+    writes[0] = (patch_str, 0x4843_5450); // "PTCH"
+    writes[1] = (patch_str + 8, 0x5054_4348);
+    writes[2] = (patch_str + 4, start);
+    writes[3] = (patch_str + 0xC, PAIRS.len() as u32);
+    for (n, (off, val)) in PAIRS.iter().enumerate() {
+        writes[4 + 2 * n] = (start + 8 * n as u32, off + config_base);
+        writes[5 + 2 * n] = (start + 8 * n as u32 + 4, *val);
+    }
+    for k in 0..4u32 {
+        writes[10 + k as usize] = (patch_str + 0x30 + 4 * k, 0);
+    }
+    for (addr, val) in writes {
+        if !mem_write(h, addr, val, ctx) {
+            return false;
+        }
+    }
+    ctx.log("wifi-driver: AIC fmacfw patch configuration written (PTCH header, 3 pairs, block sizes cleared)");
+    true
+}
+
+/// `aicwifi_start_from_bootrom`: `DBG_START_APP_REQ {bootaddr, boottype 1 (auto)}`, and its confirm's
+/// boot status. Then `F1 0x02 = 4`, which the vendor driver writes once the firmware is started.
+pub fn start_app(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<u32> {
+    let mut p = [0u8; 8];
+    p[..4].copy_from_slice(&FMAC_ADDR.to_le_bytes());
+    p[4..].copy_from_slice(&1u32.to_le_bytes());
+    let (len, c) = request(h, DBG_START_APP_REQ, &p, DBG_START_APP_CFM, false, ctx)?;
+    let status = le32(&c, 0);
+    let handed = wr(h, F1, REG_TO_DEVICE, 4);
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC start confirmed - boot status {:#010x} ({} parameter bytes); F1 0x02 = 4 {}",
+        status, len, if handed { "written" } else { "REFUSED" }));
+    Some(status)
+}

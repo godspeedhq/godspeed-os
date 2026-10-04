@@ -437,3 +437,8 @@ aicbt_patch_info_unpack            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c
 aicbt_patch_table_alloc            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the table walk aic.rs Groups follows - external, 26.14
 dbg_mem_block_write_req            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the block-write message aic.rs upload sends - external, 26.14
 rwnx_plat_bin_fw_upload_android    # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the 1 KiB chunking aic.rs upload follows - external, 26.14
+RAM_FMAC_FW_ADDR                   # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), where fmacfw is loaded and started, aic.rs FMAC_ADDR - external, 26.14
+aicbt_patch_table_load             # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the patch table writes aic.rs table_writes follows - external, 26.14
+aicwifi_init                       # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the fmacfw load sequence the driver stage 7 follows - external, 26.14
+aicwifi_patch_config_8800d80       # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the fmacfw patch configuration aic.rs patch_config follows - external, 26.14
+aicwifi_start_from_bootrom         # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the start message aic.rs start_app sends - external, 26.14

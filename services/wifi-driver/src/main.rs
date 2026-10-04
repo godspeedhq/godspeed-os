@@ -382,9 +382,24 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
             } else {
                 "wifi-driver: stage 6 - the patch upload stopped; the line above names the block"
             });
+            // ---- Stage 7 (V2, third card): the table's writes, fmacfw, its patch configuration, start. --
+            // In the vendor driver's order: `aicbt_patch_table_load` after the patches, then
+            // `aicwifi_init`'s upload, `aicwifi_patch_config_8800d80` and `aicwifi_start_from_bootrom`.
+            if ok {
+                let started = aic::table_writes(&h, aic_fw::TABLE, ctx)
+                    && aic::upload(&h, "fmacfw", aic::FMAC_ADDR, aic_fw::FMAC, ctx)
+                    && aic::check_first_word(&h, "fmacfw", aic::FMAC_ADDR, aic_fw::FMAC, ctx)
+                    && aic::patch_config(&h, aic_fw::FMAC, ctx)
+                    && aic::start_app(&h, ctx).is_some();
+                ctx.log(if started {
+                    "wifi-driver: stage 7 - fmacfw is uploaded, configured and STARTED; talking to it is V3, so this still answers radio down"
+                } else {
+                    "wifi-driver: stage 7 - the firmware was not started; the line above names the step"
+                });
+            }
         }
     }
-    ctx.log("wifi-driver: the AIC8800 firmware upload (the rest of V2) is not built yet, so this answers `radio down`, reason 4 (DOWN_NOT_BUILT)");
+    ctx.log("wifi-driver: talking to the AIC8800's firmware (phase V3 on) is not built yet, so this answers `radio down`, reason 4 (DOWN_NOT_BUILT)");
     serve_unavailable_why(ctx, Some(&h), why)
 }
 

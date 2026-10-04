@@ -1,6 +1,6 @@
 # WiFi on the VisionFive 2 Lite: the AIC8800D80 (design, 2026-10-04)
 
-**Status: DESIGN; phases V0 and V1 DONE and verified on the board 2026-10-04, and V2's first two cards the same day: the data phase and a message to the chip's ROM (revision 7 read back), then the three patches uploaded where the patch table says and read back.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver answers `radio down` with the reason `DOWN_NOT_BUILT`. The rest of V2 (the upload) onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
+**Status: DESIGN; phases V0 and V1 DONE and verified on the board 2026-10-04, and V2 DONE the same day in three cards: the data phase and a message to the chip's ROM (revision 7 read back); the three patches; then the table's writes, `fmacfw`, its patch configuration and the start, confirmed. V3 on is not built.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver answers `radio down` with the reason `DOWN_NOT_BUILT`. V3 onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
 second WiFi driver. `docs/wifi.md` section 44 identified the chip from the board's own boot log; the
 firmware is in `nonfree/aic8800d80/` (byte for byte what the board's vendor image loaded, with its
 licence position recorded there and in `docs/licensing.md` 5a). What follows is the hardware as the
@@ -181,6 +181,18 @@ the driver computes, or something else is not as believed (`CTYPE` is 0 and the 
 figure is the vendor kernel's arithmetic from the device tree, never a measurement. If so, identification
 also runs above the 400 kHz the SD specification allows before a card is selected - which this chip has
 tolerated on every boot, and another might not. Open until something measures the card clock itself.
+
+**V2's third card: the firmware started (2026-10-04).** The patch table's groups written as
+`aicbt_patch_table_load` writes them (127 confirmed memory writes, the version group skipped, the
+Bluetooth mode group's values replaced with the vendor driver's, 500 us after the power-on group, and the
+information group's pairs to addresses 1 and 0 included because the reference includes them), then
+`fmacfw` to `0x0012_0000` in 320 block writes, its first word read back, the patch configuration, and
+`DBG_START_APP_REQ {0x0012_0000, 1}`. Every line predicted: the pointers read back from the chip matched
+the file (`0x06090101`, `0x0016fb48`, `0x00174000`, `0x0017b57c`); the start was confirmed with boot
+status 0; `F1 0x02 = 4` written. 1.1 s of table writes, 6.5 s of `fmacfw` (the same 20 ms a block as the
+patches, so the clock question above stands), about 9 s from `V1 done` to the start. The started firmware
+sent nothing unprompted before the driver stopped looking; whether it announces itself is V3's first
+question.
 
 ## 5. The AIC8800 bus and the firmware upload
 
