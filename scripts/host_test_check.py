@@ -30,6 +30,10 @@ FILES = [
     "services/wifi-usb/src/rtl_fw.rs",
     # Its transmit queues: the endpoint-to-queue map, the page reservation and the priority word (R2).
     "services/wifi-usb/src/rtl_queues.rs",
+    # Its bulk IN transfers: the receive descriptor, the 128-byte packet walk and the signal (R3b).
+    "services/wifi-usb/src/rtl_rx.rs",
+    # A beacon or probe response read from the raw frame, for every radio that forwards frames.
+    "sdk/wifi/src/mgmt.rs",
 ]
 
 

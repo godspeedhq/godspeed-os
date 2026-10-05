@@ -7,6 +7,7 @@ The chip-independent half of every WiFi driver, as a library: `godspeed-wifi` (`
 |---|---|
 | `station.rs` | The `Station` trait - what the serve loop asks of a radio (scan, join, keys, up/down, link, frames, debug) - and the types it speaks in: `ScanStep`, `Outcome`, `Secret`, `Link`, `Pulled` |
 | `bss.rs` | A scan's networks: `Network`, `Scan`, the beacon security classification, and the `wifi list` record encoding |
+| `mgmt.rs` | A beacon or probe response read from the raw 802.11 frame: BSSID, capability, SSID and the DS-parameter channel, every length from the air distrusted. For every radio that forwards frames (the RTL8188CUS; the AIC8800 still reads its own, recorded debt in `docs/wifi-usb.md` 9). Pure, host-tested by `scripts/host_test_check.py` |
 | `rxq.rs` | The bounded queue of received frames between a radio and `nic-driver` |
 | `crypto.rs` | SHA-1, HMAC, PBKDF2, the 802.11 PRF, AES-128, the RFC 3394 unwrap - each checked against its published vector at start (`selftest`) |
 | `eapol.rs` | EAPOL-Key frames: recognised, the PTK derived, our messages built and signed, the AP's verified, the group key found |

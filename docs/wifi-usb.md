@@ -243,3 +243,33 @@ thermal meter.
 path - the one register that only a working RF serial interface can answer - and its channel field must read
 1. Prediction, after R2's lines: `MAC, baseband and RF set up in ... ms (137 RF registers); RF_MODE_AG reads
 0x.....  - channel 1, as asked`. A wrong channel, or all ones, says the RF path is not answering.
+
+## 9. R3b, the half that needs no hardware (2026-10-05): reading what the chip hands up - host-tested, no card
+
+R3b is two halves. The `dwc2` half - a bulk IN channel of its own, armed in the background and harvested
+on the USB interrupt - changes the driver that carries the Pi 2's keyboard and disk, so it waits for R1 and
+R2 to run. The other half is pure and is done: given a bulk IN transfer, find the frames in it.
+
+**`services/wifi-usb/src/rtl_rx.rs`** reads a transfer as `rtl8xxxu_parse_rxdesc16` does, from the source:
+a 24-byte descriptor (`struct rtl8xxxu_rxdesc16`: the frame's length, CRC and ICV errors, the PHY status's
+size in 8-byte units, the shift, the packet count - taken from the FIRST descriptor only - the rate, and
+`rpt_sel`), then the PHY status, the shift, and the frame; the next packet on the next 128-byte boundary;
+the walk stopping at the first descriptor's count or when what is left cannot hold a descriptor. The
+signal is `rtl8723au_rx_parse_phystats`: for a CCK rate, `rtl8723a_cck_rssi` (the 8192C family's `fops`
+name it; it lives in `8723a.c`), the LNA index picking one of four offsets; for OFDM, `pwdb / 2 - 110`. A
+frame the transfer cut short is passed up marked, not dropped silently. Five tests, on every build.
+
+**`sdk/wifi/src/mgmt.rs`** reads the frame: a beacon or probe response (frame control 0x80 or 0x50), its
+BSSID, capability, SSID (at most 32 bytes) and the channel from its DS Parameter Set - the network's own
+channel, which is not the tuned one when a neighbour's beacon leaks across. Every length is from the air,
+and an element walk that would run past the end stops. Four tests, on every build. It is in `sdk/wifi`
+because it is true of every radio that forwards raw frames.
+
+**One-way debt, recorded:** the AIC8800 forwards raw beacons too, and its scan reads them with
+`aic_wire::ResultInd`'s own accessors (`bssid`, `capability`, `ies`, `ssid`), written before `mgmt.rs`
+existed. Two readings of one frame is what the one-way rule forbids. Moving the AIC8800 onto `mgmt.rs` is
+a change to a hardware-verified scan, so it waits for the VisionFive to be on the bench, with a scan as
+its card - not done unattended.
+
+Nothing in the image calls `rtl_rx.rs` yet; `wifi-usb` declares it `#[allow(dead_code)]` until the `dwc2`
+half hands it a transfer, and that attribute goes with the change that does.

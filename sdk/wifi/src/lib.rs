@@ -15,6 +15,8 @@
 //! - [`supplicant`]: the WPA2 four-way handshake and the group-key rekey, run by the HOST on every radio,
 //!   over the [`supplicant::KeyPath`] each radio supplies.
 //! - [`keyfile`]: the credentials a join earned, kept in `/wifi.keys` across a restart.
+//! - [`mgmt`]: a beacon or probe response read from the raw 802.11 frame - BSSID, capability, SSID and
+//!   channel - for every radio whose firmware forwards the frames rather than digesting them.
 //! - [`station`]: the [`station::Station`] trait - what the serve loop asks of a radio - and the types it
 //!   speaks in; [`bss`] (a scan's networks and their wire records) and [`rxq`] (received frames) with it.
 //! - [`sdio`]: the SDIO card protocol and the [`sdio::SdioHost`] trait every SDIO controller implements,
@@ -32,8 +34,8 @@
 //! radio drivers use. This is an ordinary library beside it, with no `unsafe` at all.
 //!
 //! It is a crate rather than one service with vendor backends because the radios will not all live in one
-//! service: on the Pi 2 a USB device's driver sits behind the `dwc2` host service (the `smsc95xx` does),
-//! and a library serves both shapes.
+//! service: the Pi 2's USB dongle has its own, `wifi-usb`, reaching the chip through the `dwc2` host service
+//! (`docs/wifi-usb.md`), and a library serves both shapes.
 //!
 //! # Known gap
 //!
@@ -47,6 +49,7 @@ pub mod bss;
 pub mod crypto;
 pub mod eapol;
 pub mod keyfile;
+pub mod mgmt;
 pub mod rxq;
 pub mod sdio;
 pub mod station;

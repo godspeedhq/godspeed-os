@@ -31,6 +31,9 @@ use godspeed_wifi::usbfn;
 mod rtl8188;
 mod rtl_fw;
 mod rtl_queues;
+// Read by R3b, once `dwc2` has a bulk IN path to hand it transfers; host-tested until then.
+#[allow(dead_code)]
+mod rtl_rx;
 mod rtl_tables;
 
 /// The 8051's firmware, embedded (`build.rs`, `nonfree/rtl8192cu/PROVENANCE`), and the hash the build measured

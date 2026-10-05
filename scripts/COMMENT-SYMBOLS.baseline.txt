@@ -520,3 +520,8 @@ rtl8xxxu_init_rf_regs              # Linux rtl8xxxu (core.c, 8192c.c, regs.h), c
 rtl8xxxu_read_rfreg                # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
 rtl8xxxu_start                     # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
 rtl8xxxu_write_rfreg               # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+cck_agc_rpt_ofdm_cfosho_a          # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+cck_sig_qual_ofdm_pwdb_all         # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+drvinfo_sz                         # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+rtl8723au_rx_parse_phystats        # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+rtl8xxxu_parse_rxdesc16            # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
