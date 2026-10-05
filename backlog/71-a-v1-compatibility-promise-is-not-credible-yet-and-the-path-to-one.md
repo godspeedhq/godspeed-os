@@ -56,6 +56,9 @@ design change, not a constitutional amendment: no `unsafe` moves.
 3. **Make the promise a gate**, as this project enforces everything else: a checked-in snapshot of the public
    `gs` surface and the utility vocabulary, and a checker that fails the build when something is REMOVED or
    CHANGED rather than added. A breaking change then needs a recorded reason, the way an amendment does.
+   **Begun 2026-10-05 for the "one way" half:** `scripts/one_way_check.py` ratchets each crate's raw-SDK
+   calls that `gs` already covers (1138 across 28 crates at the start, a new crate held to zero), so the
+   reshape in step 2 can only move forward. The snapshot of the public `gs` surface is still to build.
 4. **Write the compatibility policy down**, with its exceptions: security and soundness fixes may break;
    anything removed is deprecated for one release first.
 5. **Soak**: a stretch of real work - the VisionFive and Pi 2 radios are the obvious candidates - with no

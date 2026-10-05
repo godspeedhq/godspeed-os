@@ -463,6 +463,10 @@ const EXTRA_CHECKS: &[&str] = &[
     // `riscv64` a second time in `services/wifi-driver/build.rs`, took the count to 57, and every
     // `osdev build` after it passed. A checker on one build path is a checker on none.
     "scripts/shared_surface_check.py",
+    // ONE WAY TO WRITE A SERVICE (backlog/71): raw-SDK calls the standard library already covers may fall
+    // and may not rise, per crate, and a new crate starts at zero. On the build path from its first day, so
+    // it is never a release-time surprise the way the shared-surface ratchet was.
+    "scripts/one_way_check.py",
 
     // ---- AND THE COMMENTS, which the audit above could not finish ------------------------------
     //

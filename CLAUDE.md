@@ -376,6 +376,10 @@ os/
                          #   exercises the claim, because a count is a proxy and a build is not
     shared_surface_check.py #  ratchets arch-conditional code ABOVE the kernel (the other axis:
                          #   `target_arch` there is usually "which BOARD am I on")
+    one_way_check.py     #   ONE way to write a service or a driver: `gs`. Ratchets, per crate, the raw
+                         #   SDK calls the standard library already covers - may fall, may not rise, and
+                         #   a NEW crate starts at zero. Counts only methods with a `gs` replacement, which
+                         #   it names; a gap in `gs` is closed in `gs` (backlog/71, 2026-10-05)
     port_scope_check.py  #   ...and the one the other four cannot answer: did the port EDIT anything
                          #   outside `arch/<isa>/` and the eleven files `docs/porting.md` marks `+`.
                          #   They all ask whether a RULE was broken; an ordinary edit to a neutral
