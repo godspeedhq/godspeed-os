@@ -260,8 +260,8 @@ AIC8800's own files, both of them moves rather than new behaviour:
   suffice, because a group key is a key install with no peer.
 
 Both change the Pi 4's hardware-verified path, so the Pi 4 has a card of its own for them, whose prediction
-is that NOTHING in its log changes. It has NOT RUN: the Pi 4 is checked when it is next on the bench, with
-V6's move of the radio bridge out of `genet.rs` on the same card.
+is that NOTHING in its log changes. It ran on 2026-10-05 with V6's move of the radio bridge out of
+`genet.rs` on the same card, and nothing did (section 10).
 
 The AIC8800's `Station` (`aic_station.rs`), what each method sends, and where it departs from the vendor
 driver on purpose (the module's header has the full reasoning):
@@ -483,14 +483,20 @@ it waits on replaced by a bounded poll of the same status bits. On the board: se
 161 times in 315 steps (157.5 expected) and uncorrelated step to step. A first 48 had looked ordered (27
 rises in 42); the larger sample says that was chance.
 
+**The Pi 4 after this branch's two moves of shared code - verified (2026-10-05, built from `c87b1521`).**
+The handshake now in `sdk/wifi` and the radio bridge now in `radio.rs` ran on the Pi 4 unchanged: the join
+from `/wifi.keys` at boot, the cable taking the link and giving it back with a `ping` either way, `wifi
+radio off`/`on` twice, `radio off hard` and `powercycle` each restarting onto the cold chip and rejoining,
+and `wifi forget` then a join with the passphrase. Its access point sends message 1 twice on every join and
+both are answered (`replay 1`, `replay 2`), exactly as in every Pi 4 log from before the move. The one new
+line is the serve loop's own read while the cable carries the frames (`still joined - the loop read the
+radio ...`), which is the point of it: the radio in standby still answers a rekey.
+
 **Left open, recorded rather than closed (26.7):**
 
 - **V7, a group rekey answered on this radio.** It needs the board joined past the access point's rekey
   interval, which no run so far lasted; the code is the shared `group_rekey`, hardware-verified on the Pi 4
   (`backlog/64`), reached here by the same `pull` that carried DHCP and ping. Not seen is not shown.
-- **The Pi 4 after this branch's two moves of shared code** - the handshake into `sdk/wifi`, and the radio
-  bridge out of `genet.rs` - built (`build/kernel8-V6.img`) and NOT run. Its prediction is that nothing in
-  its log changes.
 - Section 9's clock question, and `SCANU_CANCEL_REQ`, known only by its place in the source's enum.
 - `STAT` bit 27 (`SRVC_RQST` in Linux, which never reads it) is set after the TRNG's first seed; nothing
   here acts on it, and nothing has gone wrong for its being set.
