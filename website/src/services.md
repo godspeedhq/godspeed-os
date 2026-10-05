@@ -218,12 +218,25 @@ cannot ask a service to report it (§11.4).
                       └──▶ power  (a lease on the Arm clock while it loads the chip)
 ```
 
-The Pi 4's onboard radio; on the VisionFive 2 Lite, the AIC8800 radio's driver in progress (phase V0:
-its SD host granted and its power pin proven; `docs/wifi-aic8800.md`). The chip-independent half - the handshake, the key file, the wire protocol, the
+The Pi 4's onboard radio, and the VisionFive 2 Lite's AIC8800 (`docs/wifi-aic8800.md`: scan, WPA2 join,
+DHCP and ping over it, the cable taking the link back). The chip-independent half - the handshake, the key file, the wire protocol, the
 SDIO protocol and the `Station` a serve loop drives - is a library, `sdk/wifi`, shared with the radios to
 come. A respawn adopts a firmware still running; a stopped one is power-cycled cold.
 
 **Peers:** `fs`, `power`.
+
+### `wifi-usb` - a USB WiFi dongle
+
+```
+   wifi-usb ──usbfn──▶ USB host (dwc2) ──▶ the dongle it bound (a Realtek RTL8188CUS)
+```
+
+The driver for a WiFi dongle, separate from `wifi-driver` so a board with an onboard radio can run both.
+It holds no hardware: the USB host that enumerated the dongle binds it as the radio and answers
+`godspeed_wifi::usbfn` for that one device - who it is, and its control transfers. On the Pi 2 today,
+behind `dwc2`; reading the chip's registers through it is as far as it goes so far (`docs/wifi-usb.md`).
+
+**Peers:** `dwc2`.
 
 ### `power` - the machine's power policy
 

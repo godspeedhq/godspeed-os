@@ -203,6 +203,8 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         // The power policy (docs/power.md). Arch-neutral: on a board whose clock the OS cannot set it
         // says so once and answers every lease "no control", which costs a holder nothing.
         "power",
+        // The USB WiFi dongle's driver (docs/wifi-usb.md), reached through dwc2; idle until a dongle is bound.
+        "wifi-usb",
     ];
     let arm_dir = workspace
         .join("target")

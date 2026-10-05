@@ -473,3 +473,13 @@ rwnx_rxdataind_aicwf               # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09
 rwnx_send_get_sta_info_req         # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the MM_GET_STA_INFO_REQ sender (aic_wire.rs) - external, 26.14
 rwnx_tx_push                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the transmit push that marks EAPOL for a confirm (aic_station.rs) - external, 26.14
 starfive_trng_init                 # Linux drivers/char/hw_random/jh7110-trng.c, the init sequence the riscv64 TRNG bring-up follows (arch/riscv64/mod.rs) - external, 26.14
+TRP_VAUX_EN                        # Linux rtl8xxxu (8192c.c / core.c / rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS register access and SYS_CFG decode - external, 26.14
+rtl8192cu_identify_chip            # Linux rtl8xxxu (8192c.c / core.c / rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS register access and SYS_CFG decode - external, 26.14
+rtl8192cu_load_firmware            # Linux rtl8xxxu (8192c.c / core.c / rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS register access and SYS_CFG decode - external, 26.14
+rtl8xxxu_read32                    # Linux rtl8xxxu (8192c.c / core.c / rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS register access and SYS_CFG decode - external, 26.14
+EFUSE_REAL_CONTENT_LEN_8192C       # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+PFM_ALDN                           # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+rtl8192cu_power_on                 # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+rtl8xxxu_init_device               # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+rtl8xxxu_read_efuse                # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+rtl8xxxu_read_efuse8               # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14

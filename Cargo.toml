@@ -15,6 +15,7 @@ members = [
     "services/block-driver",
     "services/nic-driver",
     "services/wifi-driver",
+    "services/wifi-usb",
     "services/power",
     "services/audio-driver",
     "services/pwm-audio",

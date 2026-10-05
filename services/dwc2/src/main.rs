@@ -148,8 +148,9 @@ fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
     ctx: &ServiceContext, m: &godspeed_sdk::Mmio, d: &godspeed_sdk::Dma,
-    dt: &chan::Target, dk: &mut msc::Disk, nic: Option<&mut (net::Nic, chan::Target)>,
-    msg: &godspeed_sdk::Message, sectors: u64, capless: &mut bool,
+    disk: Option<&mut (msc::Disk, chan::Target, u64)>, nic: Option<&mut (net::Nic, chan::Target)>,
+    radio: Option<&(chan::Target, u16, u16)>,
+    msg: &godspeed_sdk::Message, capless: &mut bool,
 ) -> bool {
     let p = msg.payload_bytes();
     if p.is_empty() {
@@ -165,6 +166,12 @@ fn dispatch(
             return true;
         }
     };
+    // The radio's function protocol FIRST: its ops (0x20 up) are above the net ops' floor, so the net
+    // test below would take them.
+    if (godspeed_wifi::usbfn::OP_INFO..=godspeed_wifi::usbfn::OP_CONTROL).contains(&p[0]) {
+        rtl::serve(ctx, m, d, radio, msg, reply);
+        return true;
+    }
     if p[0] >= net::OP_NET_INFO {
         if let Some((n, nt)) = nic {
             return net::serve(ctx, m, d, nt, n, msg, reply);
@@ -175,7 +182,18 @@ fn dispatch(
         ctx.remove_cap(reply);
         return true;
     }
-    msc::serve(ctx, m, d, dt, dk, msg, sectors, reply, capless)
+    match disk {
+        Some((dk, dt, sectors)) => msc::serve(ctx, m, d, dt, dk, msg, *sectors, reply, capless),
+        // A BLOCK request with no disk bound: the one-byte error `answer_no_disk` gives, on the cap this
+        // function already took. Only block requests reach here now - before, a diskless dwc2 answered
+        // EVERY request this way, net and radio included, because the no-disk paths never routed by
+        // op: `wifi-usb`'s first QEMU boot got a disk error back to its INFO (2026-10-05).
+        None => {
+            let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
+            ctx.remove_cap(reply);
+            true
+        }
+    }
 }
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
@@ -243,6 +261,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut kbd_port: u8 = 0;
     let mut disk_port: u8 = 0;
     let mut nic_port: u8 = 0;
+    // THE RADIO, bound by VID:PID and served to `wifi-usb` over `godspeed_wifi::usbfn` (rtl.rs): its target,
+    // VID and PID, and the port it came from so a removal can drop it.
+    let mut radio: Option<(chan::Target, u16, u16)> = None;
+    let mut radio_port: u8 = 0;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -384,12 +406,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // the same reason the LAN9514 above is: it reports
                                                 // class 0xff, so there is no class to match on.
                                                 //
-                                                // MILESTONE 1 ONLY - this reads two registers and says
-                                                // whether the chip answers. It binds nothing and serves
-                                                // nothing; `wifi` still reports no radio,
-                                                // correctly, because no driver claims this device
-                                                // yet (docs/wifi.md has the phases above it).
+                                                // Milestone 1's two reads, then BOUND as the radio:
+                                                // from here `wifi-usb` reaches it over usbfn (rtl.rs).
+                                                // Bound whether or not the reads answered - the
+                                                // driver asks again and says what it got.
                                                 let _ = rtl::probe(&ctx, &m, &d, &dt);
+                                                radio_port = p;
+                                                radio = Some((dt, dvid, dpid));
+                                                rtl::notify_driver(&ctx);
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver does:
                                                 // ask the device its size, then read block 0. Capacity
@@ -438,6 +462,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
     }
+    // The radio's driver is told the boot enumeration is over, whatever it found (rtl.rs).
+    rtl::notify_driver_at_start(&ctx);
 
     // Interrupts arrive as ordinary IPC on this service's receive endpoint: the kernel's neutral
     // router enqueues a one-byte message carrying the vector. That is the same delivery the `xhci`
@@ -552,16 +578,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // either way.
             if disk.is_none() {
                 let mut drained = 0u32;
-                while ctx.try_recv().is_some() {
+                while let Some(msg) = ctx.try_recv() {
                     drained += 1;
-                    answer_no_disk(&ctx, &mut capless);
+                    // Routed by op, not answered as a block request: net and radio requests do not
+                    // need a disk (see `dispatch`).
+                    if !dispatch(&ctx, &m, &d, None, nic.as_mut(), radio.as_ref(), &msg, &mut capless) {
+                        answer_no_disk(&ctx, &mut capless);
+                    }
                     if drained >= MSG_DRAIN_MAX {
                         ctx.log("dwc2-svc: no-disk drain hit its bound - a sender is enqueuing as fast as we retire");
                         break;
                     }
                 }
             }
-            if let Some((dk, dt, sectors)) = disk.as_mut() {
+            if let Some(bound_disk) = disk.as_mut() {
                 let mut drained = 0u32;
                 // TIME-BOUND THE DRAIN, not just its length - and test it BEFORE taking a message.
                 //
@@ -636,7 +666,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             continue;
                         }
                     }
-                    if dispatch(&ctx, &m, &d, dt, dk, nic.as_mut(), &msg, *sectors, &mut capless) {
+                    if dispatch(&ctx, &m, &d, Some(&mut *bound_disk), nic.as_mut(), radio.as_ref(), &msg, &mut capless) {
                         served = served.wrapping_add(1);
                         served_this_pass += 1;
                     }
@@ -670,10 +700,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             .unwrap_or(false);
                         if connected {
                             ctx.log_fmt(format_args!("dwc2-svc: port {} - device CONNECTED", port));
-                            if let Some((_, _, _, dt, dsplt)) =
+                            if let Some((hvid, hpid, _, dt, dsplt)) =
                                 hub::enumerate_downstream(&ctx, &m, &d, &ht, port, &mut next_addr)
                             {
-                                if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
+                                if hvid == rtl::VID && hpid == rtl::PID {
+                                    // The radio, plugged in after boot: bound as at boot, and said.
+                                    let _ = rtl::probe(&ctx, &m, &d, &dt);
+                                    notify(&ctx, format_args!("usb: WiFi dongle connected (port {})", port));
+                                    radio_port = port;
+                                    radio = Some((dt, hvid, hpid));
+                                    rtl::notify_driver(&ctx);
+                                } else if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
                                     notify(&ctx, format_args!("usb: keyboard connected (port {}) - ready", port));
                                     kbd_port = port;
                                     state = hid::KeyState::new(&ctx);
@@ -721,6 +758,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 nic = None;
                                 notify(&ctx, format_args!(
                                     "usb: network adapter removed (port {})", port));
+                            }
+                            if radio.is_some() && radio_port == port {
+                                radio = None;
+                                rtl::notify_driver(&ctx);
+                                notify(&ctx, format_args!("usb: WiFi dongle removed (port {})", port));
                             }
                         }
                     }
@@ -1071,14 +1113,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let t_sleep = ctx.read_tsc();
                 if let Some(msg) = ctx.recv_timeout(ctx.duration_cycles(period_ms)) {
                     match disk.as_mut() {
-                        Some((dk, dt, sectors)) => {
-                            if dispatch(&ctx, &m, &d, dt, dk, nic.as_mut(), &msg, *sectors, &mut capless) {
+                        Some(bound_disk) => {
+                            if dispatch(&ctx, &m, &d, Some(&mut *bound_disk), nic.as_mut(), radio.as_ref(), &msg, &mut capless) {
                                 served = served.wrapping_add(1);
                             }
                         }
                         // No disk: ANSWER anyway. Dropping it here is what hung `block-driver` before
-                        // its first log line, and `fs` behind it.
-                        None => answer_no_disk(&ctx, &mut capless),
+                        // its first log line, and `fs` behind it. Routed by op, so a net or radio
+                        // request gets its own answer and only a block request the no-disk one.
+                        None => {
+                            if !dispatch(&ctx, &m, &d, None, nic.as_mut(), radio.as_ref(), &msg, &mut capless) {
+                                answer_no_disk(&ctx, &mut capless);
+                            }
+                        }
                     }
                 }
                 seg_sleep = seg_sleep.wrapping_add(ctx.read_tsc().wrapping_sub(t_sleep));

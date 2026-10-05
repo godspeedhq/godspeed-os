@@ -1,0 +1,14 @@
+[package]
+name = "wifi-usb"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wifi-usb"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }
+# The chip-independent WiFi half, and `usbfn`: the protocol the USB host answers for the bound radio.
+godspeed-wifi = { path = "../../sdk/wifi" }

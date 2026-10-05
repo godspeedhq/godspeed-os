@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Realtek RTL8188CUS / RTL8192CU USB WiFi - **milestone 1: does the chip answer at all.**
+//! Realtek RTL8188CUS / RTL8192CU USB WiFi - **the host's side: bind the dongle, answer for it.**
+//!
+//! Since U1 (`docs/wifi-usb.md`) the driver is the `wifi-usb` service, and this file is what the USB host
+//! owes it: the dongle matched by VID:PID and bound as THE radio, and `godspeed_wifi::usbfn` served for
+//! that one device - who it is, and its control transfers - and for nothing else on the bus. The chip's
+//! registers, firmware and 802.11 are `wifi-usb`'s; this file builds no Realtek request of its own except
+//! milestone 1's two reads at bind, kept because they are the line a board log is checked against.
+//!
+//! The host TELLS the driver when the binding changes (`usbfn::NOTE_RADIO`, `notify_driver`), so the
+//! driver blocks rather than asking on a timer (U1b).
+//!
+//! What follows is milestone 1's account, as it was written. Its "likely end state" - a separate driver
+//! service and a narrow USB-transfer protocol in `dwc2` - is what U1 built; "not built now" is history.
 //!
 //! `docs/wifi.md` is the design and `utilities/56_wifi.md` the command surface. This file is the very
 //! first step of the Pi 2 (soft-MAC) path that document defers as phase 6, and it deliberately claims
@@ -31,7 +43,10 @@
 //! of that interface (rtlwifi's `_usbctrl_vendorreq` and rtl8xxxu's equivalent are the reference for
 //! WHAT the silicon wants, per 26.14); no code copied, and the model here is ours.
 
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
+use godspeed as gs;
+use gs::driver::{delay, wait::Budget};
+use godspeed_wifi::usbfn;
 
 use crate::chan::{self, Target};
 
@@ -73,9 +88,105 @@ fn read32(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, reg: u16) ->
         if chan::control(ctx, mmio, dma, t, &setup, &mut buf, true, 4) {
             return Some(u32::from_le_bytes(buf));
         }
-        ctx.sleep(ctx.duration_cycles(5));
+        delay::hold(ctx, Budget::ms(5));
     }
     None
+}
+
+/// Tell the radio's driver its binding changed (`usbfn::NOTE_RADIO`): `try_send`, never blocking on a driver
+/// that is behind, and reacquired by name once if the cap is stale - `wifi-usb` is spawned after this
+/// service, so at the first bind it may not have been in the name map yet. Said in the log when it cannot be
+/// delivered at all: the driver then learns at its next start, which is the bound on how stale it can be.
+pub fn notify_driver(ctx: &ServiceContext) {
+    if !tell(ctx) {
+        ctx.log("dwc2-svc: could not tell wifi-usb the radio's binding changed (not running, or its queue is full)");
+    }
+}
+
+/// The same notice, once, at the end of this service's boot enumeration - bound or not. On a respawn it is
+/// the only way the driver learns the dongle is gone if it did not come back: nothing was bound, so nothing
+/// else would say. QUIET when it cannot be delivered, because on a first boot the driver is not running
+/// yet - it is spawned after this service - and its own `OP_INFO` at start covers that case.
+pub fn notify_driver_at_start(ctx: &ServiceContext) {
+    let _ = tell(ctx);
+}
+
+fn tell(ctx: &ServiceContext) -> bool {
+    let msg = Message::from_bytes(&[usbfn::NOTE_RADIO]);
+    gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
+        || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok())
+}
+
+/// The radio's driver, the one service this host tells about the radio.
+const DRIVER: &str = "wifi-usb";
+
+/// Control transfers tried before the host says FAILED. The reason `read32` gives: this controller sequences
+/// transfers in software, so one XACTERR is a transient on a contended bus, not a verdict.
+const CONTROL_TRIES: u32 = 4;
+
+/// Serve one `usbfn` request for the bound radio - `radio` is its target, VID and PID, or `None` when none is
+/// bound - and answer on `reply`, which this reclaims. Every op is answered, a request for a radio that is
+/// not here included, so a client is never left to time out against a clean log.
+pub fn serve(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, radio: Option<&(Target, u16, u16)>,
+    msg: &Message, reply: CapHandle,
+) {
+    let p = msg.payload_bytes();
+    let op = p.first().copied().unwrap_or(0);
+    let mut out = [0u8; 2 + usbfn::CONTROL_MAX];
+    out[0] = op;
+    let n = match (op, radio) {
+        (_, None) => {
+            out[1] = usbfn::ST_NO_DEVICE;
+            2
+        }
+        (usbfn::OP_INFO, Some((_, vid, pid))) => {
+            out[1] = usbfn::ST_OK;
+            out[2..4].copy_from_slice(&vid.to_le_bytes());
+            out[4..6].copy_from_slice(&pid.to_le_bytes());
+            6
+        }
+        (usbfn::OP_CONTROL, Some((t, _, _))) => control(ctx, mmio, dma, t, p, &mut out),
+        _ => {
+            out[1] = usbfn::ST_BAD_REQUEST;
+            2
+        }
+    };
+    let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n]));
+    ctx.remove_cap(reply);
+}
+
+/// One control transfer: `p` is `[op, setup(8), data out...]`. Fills `out[1..]` and returns its length.
+fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], out: &mut [u8]) -> usize {
+    if p.len() < 9 {
+        out[1] = usbfn::ST_BAD_REQUEST;
+        return 2;
+    }
+    let mut setup = [0u8; 8];
+    setup.copy_from_slice(&p[1..9]);
+    let len = u16::from_le_bytes([setup[6], setup[7]]) as usize;
+    let data_in = setup[0] & 0x80 != 0;
+    if len > usbfn::CONTROL_MAX || (!data_in && p.len() < 9 + len) {
+        out[1] = usbfn::ST_BAD_REQUEST;
+        return 2;
+    }
+    let mut buf = [0u8; usbfn::CONTROL_MAX];
+    if !data_in {
+        buf[..len].copy_from_slice(&p[9..9 + len]);
+    }
+    for _ in 0..CONTROL_TRIES {
+        if chan::control(ctx, mmio, dma, t, &setup, &mut buf, data_in, len) {
+            out[1] = usbfn::ST_OK;
+            if data_in {
+                out[2..2 + len].copy_from_slice(&buf[..len]);
+                return 2 + len;
+            }
+            return 2;
+        }
+        delay::hold(ctx, Budget::ms(5));
+    }
+    out[1] = usbfn::ST_FAILED;
+    2
 }
 
 /// Milestone 1: prove the chip answers. Returns true only if BOTH reads came back with a value that

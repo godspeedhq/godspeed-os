@@ -356,6 +356,7 @@ version = "0.1.0"
 dependencies = [
  "godspeed",
  "godspeed-sdk",
+ "godspeed-wifi",
 ]
 
 [[package]]
@@ -1955,6 +1956,15 @@ dependencies = [
 
 [[package]]
 name = "wifi-driver"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-sdk",
+ "godspeed-wifi",
+]
+
+[[package]]
+name = "wifi-usb"
 version = "0.1.0"
 dependencies = [
  "godspeed",

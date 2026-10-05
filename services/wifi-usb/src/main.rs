@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
+// `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
+// grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than
+// `forbid` for exactly one reason: the exported `service_main` symbol needs
+// `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
+// lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
+#![deny(unsafe_code)]
+#![no_std]
+#![no_main]
+//! `wifi-usb` - the USB WiFi dongle's driver (`docs/wifi-usb.md`).
+//!
+//! A Realtek RTL8188CUS today: a soft-MAC radio whose register file is reached by a vendor control
+//! request. This service holds no hardware at all. The USB host service that enumerated the dongle -
+//! `dwc2` on the Pi 2 - bound it as the radio, and answers `godspeed_wifi::usbfn` for that one device;
+//! every register read, and later the firmware and the frames, is a request to it.
+//!
+//! **U1, this card: the plumbing.** Wait for the host to report the dongle, then read the same two
+//! registers milestone 1 read inside `dwc2` (`docs/wifi.md`), now through two services, and decode
+//! `SYS_CFG` from Linux's `rtl8xxxu` (26.14). Then R1: the efuse and the power-on (`rtl8188.rs`).
+//!
+//! **Told, not polled (U1b).** The service asks the host once at start whether a dongle is bound, then
+//! blocks; the host sends `usbfn::NOTE_RADIO` when a dongle is bound or removed, and only then is it asked
+//! again. The waits inside a bring-up are polls of the chip's own status bits, which it reports only when
+//! read; frames, from R3, will come the same way the binding does - the host told by its interrupt.
+
+use godspeed as gs;
+use godspeed_sdk::{Message, ServiceContext};
+use godspeed_wifi::usbfn;
+
+mod rtl8188;
+use rtl8188::{read32, REG_SYS_CFG, REG_SYS_ISO_CTRL};
+
+/// The host this board's dongle sits behind. One today; `xhci` joins when it serves `usbfn` (U2), and the
+/// spawn row then gives this service whichever the board has.
+const HOST: &str = "dwc2";
+/// The bound on one request to the host. A control transfer takes milliseconds; the host retries a
+/// transient itself, so a request still unanswered after this is a host that is not serving.
+const HOST_SECS: i64 = 2;
+
+/// `SYS_CFG` fields, as `rtl8192cu_identify_chip` reads them (`rtl8xxxu.h`): the cut in bits 15:12,
+/// UMC (1) or TSMC (0) in bit 19, a TEST chip in bit 23 (`TRP_VAUX_EN`), and 8192C (1) or 8188C (0) in bit 27.
+const SYS_CFG_CHIP_VER_SHIFT: u32 = 12;
+const SYS_CFG_VENDOR_UMC: u32 = 1 << 19;
+const SYS_CFG_TEST_CHIP: u32 = 1 << 23;
+const SYS_CFG_TYPE_92C: u32 = 1 << 27;
+
+/// One request to the host, bounded: `gs::call::request_within`, which reacquires the host's cap once if
+/// the send failed - the host is spawned by the supervisor and may be respawned after us (14.3) - and never
+/// re-sends after a deadline. The failure as the stdlib words it.
+pub(crate) fn host(ctx: &ServiceContext, body: &[u8]) -> Result<Message, &'static str> {
+    gs::call::request_within(ctx, HOST, &Message::from_bytes(body), HOST_SECS).map_err(|e| e.as_str())
+}
+
+/// What the host says about the radio: `Some((vid, pid))` when one is bound, `None` when none is or the
+/// host did not answer - the second said once by the caller.
+fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16)>, &'static str> {
+    let r = host(ctx, &[usbfn::OP_INFO])?;
+    let p = r.payload_bytes();
+    if p.len() < 2 || p[0] != usbfn::OP_INFO {
+        return Err("answered something other than INFO - not speaking usbfn");
+    }
+    match p[1] {
+        usbfn::ST_OK if p.len() >= 6 => Ok(Some((u16::from_le_bytes([p[2], p[3]]), u16::from_le_bytes([p[4], p[5]])))),
+        usbfn::ST_NO_DEVICE => Ok(None),
+        _ => Err("answered INFO with an error"),
+    }
+}
+
+/// U1's reads, logged and decoded. `true` when both came back as a register file could.
+fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> bool {
+    ctx.log_fmt(format_args!("wifi-usb: {} has bound a radio at {:04x}:{:04x}", HOST, vid, pid));
+    let cfg = read32(ctx, REG_SYS_CFG);
+    let iso = read32(ctx, REG_SYS_ISO_CTRL);
+    match (cfg, iso) {
+        (Ok(c), Ok(i)) => {
+            ctx.log_fmt(format_args!(
+                "wifi-usb: SYS_CFG(0xF0)={:#010x} ISO_CTRL(0x00)={:#010x}, read through {}", c, i, HOST));
+            let plausible = |v: u32| v != 0 && v != 0xFFFF_FFFF;
+            if !(plausible(c) && plausible(i)) {
+                ctx.log("wifi-usb: all-zeros or all-ones - a bus or power fault, not a register file");
+                return false;
+            }
+            ctx.log_fmt(format_args!(
+                "wifi-usb: the chip is an RTL{} ({}), cut {}, made by {} - a {} chip, so its firmware is {}",
+                if c & SYS_CFG_TYPE_92C != 0 { "8192C" } else { "8188C" },
+                if c & SYS_CFG_TYPE_92C != 0 { "2T2R" } else { "1T1R" },
+                (b'A' + ((c >> SYS_CFG_CHIP_VER_SHIFT) & 0xF) as u8) as char,
+                if c & SYS_CFG_VENDOR_UMC != 0 { "UMC" } else { "TSMC" },
+                if c & SYS_CFG_TEST_CHIP != 0 { "TEST" } else { "normal" },
+                // `rtl8192cu_load_firmware`'s choice: not UMC -> _TMSC; UMC and (a later cut or a 92C) -> _B; else _A.
+                if c & SYS_CFG_VENDOR_UMC == 0 {
+                    "rtl8192cufw_TMSC.bin"
+                } else if (c >> SYS_CFG_CHIP_VER_SHIFT) & 0xF != 0 || c & SYS_CFG_TYPE_92C != 0 {
+                    "rtl8192cufw_B.bin"
+                } else {
+                    "rtl8192cufw_A.bin"
+                }));
+            ctx.log("wifi-usb: U1 done - the dongle answers through the host");
+            bring_up(ctx);
+            true
+        }
+        (c, i) => {
+            ctx.log_fmt(format_args!(
+                "wifi-usb: the register reads did not complete - SYS_CFG: {}, ISO_CTRL: {}",
+                c.err().unwrap_or("ok"), i.err().unwrap_or("ok")));
+            false
+        }
+    }
+}
+
+/// The ceiling on a bring-up step's REPORTED duration; see `bring_up`.
+const REPORT_CEILING_MS: u64 = 60_000;
+
+/// R1 (`docs/wifi-usb.md`): the efuse, then the power-on - Linux's order (`rtl8xxxu_init_device`).
+fn bring_up(ctx: &ServiceContext) {
+    // How long each half took, for the log - `Deadline::elapsed_us` is the stdlib's measure of a wait. The
+    // bound is a ceiling for the report only; every wait inside the efuse walk and the power-on is
+    // bounded on its own (`rtl8188.rs`).
+    let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
+    match rtl8188::read_efuse(ctx) {
+        Ok(e) => {
+            let m = e.mac;
+            ctx.log_fmt(format_args!(
+                "wifi-usb: efuse ID {:#06x} ({}), VID:PID {:04x}:{:04x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} - {} physical bytes, {} sections, {} ms",
+                e.id, if rtl8188::efuse_id_ok(&e) { "as expected" } else { "NOT the 0x8129 this family carries" },
+                e.vid, e.pid, m[0], m[1], m[2], m[3], m[4], m[5], e.walked, e.sections,
+                clock.elapsed_us() / 1000));
+        }
+        Err(why) => {
+            ctx.log_fmt(format_args!("wifi-usb: the efuse read stopped - {}", why));
+            return;
+        }
+    }
+    let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
+    match rtl8188::power_on(ctx) {
+        Ok(cr) => ctx.log_fmt(format_args!(
+            "wifi-usb: powered on in {} ms - CR={:#06x}; R1 done, no firmware yet (R2, docs/wifi-usb.md)",
+            clock.elapsed_us() / 1000, cr)),
+        Err(why) => ctx.log_fmt(format_args!("wifi-usb: the power-on stopped at {}", why)),
+    }
+}
+
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
+#[no_mangle]
+pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    ctx.trace_as("wifi-usb");
+    ctx.log("wifi-usb: starting - the USB WiFi dongle's driver; asks its USB host once whether a dongle is bound, then waits to be told");
+    // What was last said, so each change is said once: none yet, bound (vid, pid), gone, or a host fault.
+    let mut said: Option<Result<Option<(u16, u16)>, &'static str>> = None;
+    loop {
+        let now = bound(&ctx);
+        if said != Some(now) {
+            match now {
+                Ok(Some((vid, pid))) => {
+                    identify(&ctx, vid, pid);
+                }
+                Ok(None) => ctx.log_fmt(format_args!(
+                    "wifi-usb: {} has no dongle bound - waiting to be told when one is", HOST)),
+                Err(why) => ctx.log_fmt(format_args!(
+                    "wifi-usb: asking {} about the radio: {} - waiting to be told when its binding changes", HOST, why)),
+            }
+            said = Some(now);
+        }
+        // BLOCK until something arrives - no timer (U1b). The host sends `NOTE_RADIO`, with no reply cap,
+        // when the radio's binding changes, and the loop goes round to ask `OP_INFO`. Nothing else asks
+        // this service anything yet; a request that does is answered `[0]` - not known - rather than left
+        // to time out, and its reply cap given back, and then waited on again.
+        loop {
+            let m = gs::ipc::recv(&ctx);
+            match gs::ipc::take_sent_cap(&ctx) {
+                Some(cap) => {
+                    let _ = gs::ipc::reply(&ctx, cap, &Message::from_bytes(&[0u8]));
+                }
+                None if m.payload_bytes() == [usbfn::NOTE_RADIO] => break,
+                None => {}
+            }
+        }
+    }
+}

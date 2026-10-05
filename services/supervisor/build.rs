@@ -93,6 +93,13 @@ fn main() {
     // until the AIC8800 protocol exists; on QEMU's `virt` no window is granted at all.
     let radio: &[&str] = if arch == "aarch64" || arch == "riscv64" { &["wifi-driver"] } else { &[] };
 
+    // The USB WiFi dongle's driver (docs/wifi-usb.md), embedded where a USB host serves the radio
+    // function protocol (`godspeed_wifi::usbfn`) for a dongle it has bound. Derived from the `usb` list, so
+    // it names no instruction set: `dwc2` serves it since U1; `xhci` joins this condition when it does (U2),
+    // which is what brings the dongle to the Pi 4, the VisionFive and the PCs. Its own list rather than part
+    // of `radio`, because a board may have both - an onboard radio and a dongle - as separate services.
+    let usb_radio: &[&str] = if usb.contains(&"dwc2") { &["wifi-usb"] } else { &[] };
+
     // The audio driver (docs/audio.md), a BOARD fact like `radio`: an Intel High Definition Audio
     // controller on x86 (the T630's chipset audio, QEMU's `intel-hda`), and on the Pis a 3.5 mm jack
     // driven by PWM - a different driver for a different device, speaking the same protocol. The
@@ -124,12 +131,12 @@ fn main() {
     // a board that has never had an EHCI image embedded.
     //
     // `values(none())` because these are bare flags: `#[cfg(has_xhci)]`, never `has_xhci = "..."`.
-    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver", "has_audio_driver",
+    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver", "has_wifi_usb", "has_audio_driver",
                  "has_pwm_audio", "pwm_audio_pi4",
                  "xhci_msi", "nic_on_pci", "nic_radio_bridge"] {
         println!("cargo::rustc-check-cfg=cfg({flag}, values(none()))");
     }
-    for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()).chain(audio.iter()) {
+    for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()).chain(usb_radio.iter()).chain(audio.iter()) {
         println!("cargo:rustc-cfg=has_{}", name.replace('-', "_"));
     }
     // Whether `nic-driver` carries frames to the radio when the cable is out (docs/wifi.md 2). Its Pi 4
@@ -187,7 +194,7 @@ fn main() {
                                    cannot locate the profile directory"))
         .to_path_buf();
 
-    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(radio.iter()).chain(audio.iter())
+    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(radio.iter()).chain(usb_radio.iter()).chain(audio.iter())
                         .chain(probe.iter()).chain(examples.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing

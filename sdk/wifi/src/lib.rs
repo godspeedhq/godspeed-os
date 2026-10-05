@@ -21,6 +21,8 @@
 //!   so the radios' code runs on the Pi 4's Arasan and the VisionFive 2's DesignWare host alike.
 //! - [`wire`]: the request/reply vocabulary between a radio driver and the shell's `wifi`, so the shell
 //!   and the driver read ONE definition rather than two copies of it.
+//! - [`usbfn`]: what a USB host service answers for the one device it has bound as a radio, and what
+//!   `wifi-usb` asks - again one definition for both sides.
 //!
 //! # Why it is not in the SDK
 //!
@@ -49,4 +51,5 @@ pub mod rxq;
 pub mod sdio;
 pub mod station;
 pub mod supplicant;
+pub mod usbfn;
 pub mod wire;

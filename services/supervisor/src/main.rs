@@ -256,6 +256,9 @@ static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
 // second copy of it.
 #[cfg(has_wifi_driver)]
 static WIFI_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_WIFI_DRIVER_ELF"));
+// The USB WiFi dongle's driver, where a USB host serves its function protocol (`build.rs`, `usb_radio`).
+#[cfg(has_wifi_usb)]
+static WIFI_USB_ELF: &[u8] = include_bytes!(env!("SVC_WIFI_USB_ELF"));
 #[cfg(has_audio_driver)]
 static AUDIO_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_AUDIO_DRIVER_ELF"));
 #[cfg(has_pwm_audio)]
@@ -337,6 +340,9 @@ mod board {
 
     /// The USB host this board's NIC sits behind. Only the Pi 2 puts ethernet on USB (the LAN9514);
     /// every other board's NIC is on a bus its driver reaches directly.
+    /// `dwc2`'s send peers: `events`, and the dongle's driver wherever it is embedded (see the IMAGES row).
+    pub const DWC2_PEERS: &[&str] = if cfg!(has_wifi_usb) { &["events", "wifi-usb"] } else { &["events"] };
+
     pub const NIC_PEERS: &[&str] = if cfg!(target_arch = "arm") {
         &["dwc2", "events"]
     } else if cfg!(nic_radio_bridge) {
@@ -661,11 +667,22 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      godspeed_sdk::service_context::hwclass::EHCI),
     // arm32's USB host: keyboard, mass storage and USB-net all sit behind it, which is why
     // `nic-driver` and `block-driver` both name it as a peer on that port.
+    //
+    // `wifi-usb` is its second peer where that service exists: the host TELLS the dongle's driver when it
+    // binds or loses the dongle (`godspeed_wifi::usbfn::NOTE_RADIO`), so the driver blocks instead of
+    // asking on a timer. One message kind, no reply expected, sent with `try_send` (docs/wifi-usb.md, U1b).
     #[cfg(has_dwc2)]
     ("dwc2", DWC2_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 0, &["events"],
+     64 * 1024 * 1024, 0, board::DWC2_PEERS,
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::DWC2),
+    // The USB WiFi dongle's driver (docs/wifi-usb.md). NO hardware grant - no window, no arena, no
+    // interrupt, no device class: everything it does to the chip is a request to the USB host that bound
+    // the dongle, which answers for that one device only (`godspeed_wifi::usbfn`). Its one peer is that
+    // host. Unplaced: it is idle until a dongle is there, and a radio's work is milliseconds at a time.
+    #[cfg(has_wifi_usb)]
+    ("wifi-usb", WIFI_USB_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     8 * 1024 * 1024, u32::MAX, &["dwc2"], 0, 0, 0),
 ];
 
 /// A build that EMBEDDED a USB host image must have a row to spawn it with.
@@ -1118,7 +1135,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 17;
+const MANAGED_N: usize = 18;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -1139,6 +1156,8 @@ const MANAGED: [&str; MANAGED_N] =
      // the others nothing - and being absent from this list is what left arm32's storage, keyboard and
      // network down with no backstop when a death notification was dropped.
      "wifi-driver",
+     // The USB WiFi dongle's driver: listed unconditionally for the same reason.
+     "wifi-usb",
      // The power policy (docs/power.md). A respawn knows of no lease and puts the clock at its minimum,
      // which is why its absence from this list would matter: dead, nothing would answer a lease at all.
      "power",
@@ -1512,6 +1531,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ensure_mapped(&ctx, &mut name_map, host, 0xFFFF);
         }
     }
+
+    // The dongle's driver, once its USB host is up (above), so its one peer wires at spawn. Nothing waits
+    // on it: it asks the host itself, and says when there is no dongle.
+    #[cfg(has_wifi_usb)]
+    ensure_wired(&ctx, &mut name_map, "wifi-usb", &["dwc2"]);
 
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.

@@ -301,7 +301,12 @@ reacquire_api = [
 #
 # Recorded rather than fixed because the fix is Rust in five services, and that is the operator's
 # call. Each is small: reacquire `events` on `Err` from the emit path.
-peer_reacquire_debt = ["console", "dwc2", "ehci", "hw-enumerator", "xhci"]
+# `dwc2` LEFT this list on 2026-10-05 because its source now reaches `gs::cap::reacquire` - for its NEW
+# peer, `wifi-usb` (`rtl::notify_driver`, docs/wifi-usb.md U1b). Its `events` emission is NOT fixed by that
+# and still stops after the first time `events` dies. The check is coarse by design (any reacquisition
+# path at all, see `IX-peer-reacquire`), so it cannot keep an entry that is half paid; this line is where
+# the unpaid half is kept instead.
+peer_reacquire_debt = ["console", "ehci", "hw-enumerator", "xhci"]
 # Commandment III - constants declared in two files of one crate, as of 2026-09-14. Read by
 # `III-duplicate-constants`. SHRINK ONLY; a stale entry is itself a violation.
 #
@@ -726,7 +731,7 @@ SpawnImage               = 52
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "copier" = ["peer:fs"]
 "counter" = ["peer:fs"]
-"dwc2" = ["hw:DWC2", "peer:events", "priv:CONSOLE_PUSH"]
+"dwc2" = ["hw:DWC2", "peer:events", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
 "ehci" = ["hw:EHCI", "peer:events", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]
@@ -750,6 +755,7 @@ SpawnImage               = 52
 # wifi-driver: hw:WIFI_SDIO - the Arasan SDIO host the radio sits on, and its power control, granted by
 # device KIND since 2026-10-03 (they were granted by NAME before, so the pin did not see them).
 "wifi-driver" = ["hw:WIFI_SDIO", "peer:fs", "peer:power"]
+"wifi-usb" = ["peer:dwc2"]
 "xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "priv:CONSOLE_PUSH"]
 
 # --------------------------------------------------------------------------------------------------

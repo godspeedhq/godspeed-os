@@ -688,7 +688,7 @@ const SERVICE_CRATES: &[&str] = &[
     "events", "recorder", "copier", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
     "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
     "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
-    "resource-server", "holder", "power", "audio-driver",
+    "resource-server", "holder", "power", "audio-driver", "wifi-usb",
 ];
 
 /// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,

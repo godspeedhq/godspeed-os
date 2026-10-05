@@ -355,6 +355,7 @@ ends at a thing you can see on a screen, because this is bench-only work with no
 | **5** | The frame interface: ops `0x10`/`0x11`/`0x12`. **`ping` over WiFi, `net-stack` unmodified** | Nothing above the driver |
 | | *Done 2026-09-30 - except "unmodified": `net-stack` needed one rule, for a link whose address changes (41).* | |
 | **6** | The Pi 2 dongle, soft-MAC | A real 802.11 MAC and real crypto. **Deferred, with section 3 as the reason** |
+| | *Taken up 2026-10-05 as its own service, `wifi-usb`, behind any USB host - `docs/wifi-usb.md`. The crypto exists by now (`sdk/wifi`).* | |
 
 Phase 3 is deliberately placed before any credential handling. A scan is the cheapest proof that the
 transport, the firmware and the event channel all work, and it is worth having that proof standing
