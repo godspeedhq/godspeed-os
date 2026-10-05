@@ -113,8 +113,9 @@ during a bring-up - the efuse's ready bit, `MAC_ENABLE`, later the firmware's re
 only when read, as Linux reads them. Frames, from R3, come the way the binding does: the host is driven by
 its USB interrupt and tells the driver.
 
-**One way of writing a service (the operator, 2026-10-05: "only hardware-touching code uses the raw
-SDK").** `wifi-usb` is written on the standard library throughout: requests through
+**One way of writing a service or a driver, for v1 (the operator, 2026-10-05): `gs`.** Where `gs` lacks a
+mechanism a driver needs, `gs::driver` gains it (`backlog/71`, `docs/driver-library.md`); the raw SDK is not
+the alternative. `wifi-usb` is written on the standard library throughout: requests through
 `gs::call::request_within` (which reacquires a stale cap once and never re-sends after a deadline), its
 receive loop on `gs::ipc::recv`, `take_sent_cap` and `reply`, its holds on `gs::driver::delay`, its waits and
 its timings on `gs::driver::wait`. It holds no hardware, so it touches no hardware API at all; the SDK

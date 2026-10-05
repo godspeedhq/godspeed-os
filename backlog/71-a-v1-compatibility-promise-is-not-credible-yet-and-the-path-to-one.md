@@ -23,11 +23,16 @@ soundness and security fixes, and `backlog/67` was exactly one of those.
 
 ## The stdlib/SDK question it depends on
 
-Asked the same day: why can drivers not use the standard library? They can, for everything but hardware -
-`wifi-driver` already calls `godspeed::call::request_within` for its clock lease. Only MMIO, DMA, interrupts
-and the device grants force the SDK, because the audited `unsafe` behind them lives there (CLAUDE.md 18.1)
-and `gs` is `#![deny(unsafe_code)]`. `docs/stdlib-design.md` ("MMIO and DMA stay in the SDK, permanently")
-keeps that line on purpose: an SDK import marks code that touches hardware.
+Asked the same day: why can drivers not use the standard library? **The answer the operator settled on
+(2026-10-05): they must - there is one way to write a service or a driver, and it is `gs`.** A driver is
+written on `gs` like any other service, and where it needs a hardware mechanism `gs::driver` does not have
+yet, that is a gap in `gs::driver` to close (`docs/driver-library.md`), not a reason to reach past it. The
+SDK stays the internal layer that holds the audited `unsafe` (CLAUDE.md 18.1) - `gs` is
+`#![deny(unsafe_code)]` - and is free to change underneath. Today MMIO and DMA accessors are still reached
+through the SDK because `gs::driver` has no safe mechanism for them yet; that is recorded as the gap, not
+as the rule. (This paragraph used to say the opposite - that hardware forces the SDK and an SDK import marks
+hardware code - and that reading steered new code toward the raw SDK, so it is replaced rather than kept.
+`docs/stdlib-design.md`'s "MMIO and DMA stay in the SDK, permanently" is superseded in part, below.)
 
 The proposal was first written here as a wholesale re-export of the SDK's safe hardware wrappers under
 `gs::driver`. **The operator's guidance the same day replaced that with a slower and better method, now
