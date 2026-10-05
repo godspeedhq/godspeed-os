@@ -121,7 +121,8 @@ fn tell(ctx: &ServiceContext) -> bool {
 const DRIVER: &str = "wifi-usb";
 
 /// Control transfers tried before the host says FAILED. The reason `read32` gives: this controller sequences
-/// transfers in software, so one XACTERR is a transient on a contended bus, not a verdict.
+/// transfers in software, so one XACTERR is a transient on a contended bus, not a verdict. `OP_CONTROL_ONCE`
+/// gets one: a transfer the client must not have reach the device twice, whose failure the client handles.
 const CONTROL_TRIES: u32 = 4;
 
 /// Serve one `usbfn` request for the bound radio - `radio` is its target, VID and PID, or `None` when none is
@@ -146,7 +147,8 @@ pub fn serve(
             out[4..6].copy_from_slice(&pid.to_le_bytes());
             6
         }
-        (usbfn::OP_CONTROL, Some((t, _, _))) => control(ctx, mmio, dma, t, p, &mut out),
+        (usbfn::OP_CONTROL, Some((t, _, _))) => control(ctx, mmio, dma, t, p, CONTROL_TRIES, &mut out),
+        (usbfn::OP_CONTROL_ONCE, Some((t, _, _))) => control(ctx, mmio, dma, t, p, 1, &mut out),
         _ => {
             out[1] = usbfn::ST_BAD_REQUEST;
             2
@@ -157,7 +159,7 @@ pub fn serve(
 }
 
 /// One control transfer: `p` is `[op, setup(8), data out...]`. Fills `out[1..]` and returns its length.
-fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], out: &mut [u8]) -> usize {
+fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], tries: u32, out: &mut [u8]) -> usize {
     if p.len() < 9 {
         out[1] = usbfn::ST_BAD_REQUEST;
         return 2;
@@ -174,7 +176,10 @@ fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], o
     if !data_in {
         buf[..len].copy_from_slice(&p[9..9 + len]);
     }
-    for _ in 0..CONTROL_TRIES {
+    for i in 0..tries {
+        if i > 0 {
+            delay::hold(ctx, Budget::ms(5));
+        }
         if chan::control(ctx, mmio, dma, t, &setup, &mut buf, data_in, len) {
             out[1] = usbfn::ST_OK;
             if data_in {
@@ -183,7 +188,6 @@ fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], o
             }
             return 2;
         }
-        delay::hold(ctx, Budget::ms(5));
     }
     out[1] = usbfn::ST_FAILED;
     2

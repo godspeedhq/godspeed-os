@@ -34,11 +34,13 @@ is due when a scan exists, not before.
 |---|---|---|
 | `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2)]` |
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
+| `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
 | `NOTE_RADIO` 0x2F | sent by the HOST to the driver, `[note]`, no reply cap | none |
 
 Every reply starts `[op, status]`, so an answer to the wrong op, or a host that does not speak this, is
 told apart from an answer. A control transfer carries at most 256 bytes either way, and the host retries a
-transient failure itself (`dwc2` sequences transfers in software, so one bus error is not a verdict).
+transient failure itself (`dwc2` sequences transfers in software, so one bus error is not a verdict) -
+except `OP_CONTROL_ONCE`, for a transfer that must not reach the device twice: a firmware block (section 6).
 
 `NOTE_RADIO` runs the other way: the host tells the driver the binding changed, with `try_send`, and the
 driver asks `OP_INFO`. It is what lets the driver block rather than poll (section 5).
@@ -90,7 +92,7 @@ so a diskless Pi 2's `nic-driver` and now `wifi-usb` both got a disk error back.
 as optional now: radio and net requests are answered whether or not a stick is in, and only a block
 request gets the no-disk answer.
 
-## 5. R1 and U1b (2026-10-05) - built, NOT YET RUN
+## 5. R1 and U1b (2026-10-05) - hardware-verified on the Pi 2
 
 **R1 (`services/wifi-usb/src/rtl8188.rs`).** After U1's identification: the efuse, then the power-on, in
 `rtl8xxxu`'s order. The efuse loader is enabled as Linux enables it, the physical efuse is walked into its
@@ -143,7 +145,7 @@ is the stdlib-dogfood branch's work, not this one's.
   both ways and checked. The R1 card already on the SD card was checked the same way: it embeds the
   hardware `dwc2`.
 
-## 6. R2 (2026-10-05): the firmware - built, NOT YET RUN
+## 6. R2 (2026-10-05): the firmware - hardware-verified on the Pi 2 at boot; a replug found R2b
 
 The 8051's program is `rtl8192cufw_TMSC.bin` from upstream `linux-firmware`, in `nonfree/rtl8192cu` with
 Realtek's licence and its digest (`PROVENANCE`): binary redistribution is permitted with the notice
@@ -179,6 +181,31 @@ Its prediction, after R1's lines: `the MAC is cold; transmit queues: ...` before
 up` after it, then `firmware rtl8192cufw_TMSC.bin VERIFIES - signature 0x88c1, version 88.2,
 16094 bytes of code`, then `firmware downloaded - 126 blocks`, then `the firmware is RUNNING - MCU_FW_DL=...`
 with bit 6 (`WINT_INIT_READY`) set.
+
+**What the Pi 2 showed (2026-10-05, three cards in a row).** R1: efuse ID `0x8129`, VID:PID `0bda:8176`, a
+MAC, 31 sections in about 1.2 s (each byte a round trip through `dwc2`; a batched read is a later card), and
+`powered on in 16 ms - CR=0x00ff`. U1b: the dongle unplugged and replugged twice, `wifi-usb` told each time
+and brought it up again. R2, at boot: queues set up, 126 blocks in 145 ms, `the firmware is RUNNING -
+MCU_FW_DL=0x000300c6`.
+
+**R2b: a block must reach the chip once.** On two replugs in the R2 run, `dwc2` logged `STATUS stage FAILED
+(XACTERR NAK)` during the download - one in the first, five in the second - and both downloads then
+reported `126 blocks ... (1 try)` and failed at `the chip never reported the download's checksum`. The
+download that ran clean, at boot, did not fail. The cause is in our design, not the chip's: `dwc2` retries
+a failed control transfer up to four times itself, so a block whose data had arrived and whose status
+stage failed was SENT AGAIN, and the driver above never saw a failure. `rtl8xxxu_download_firmware` sends
+each block once and returns `-EAGAIN` when one fails, and `rtl8xxxu_init_device` then restarts the whole
+download, checksum reset included, up to six times. `wifi-usb` already had that loop; it never ran. So a
+block now goes as `OP_CONTROL_ONCE`, which the host attempts exactly once, and a failure stops the download
+and restarts it. Register writes keep the host's retries: a register written twice holds the same value.
+That a repeated block is what spoils the checksum is the reading of the log, not yet a measurement: the
+card's prediction is a replug whose download fails a block and logs `the download stopped (the transfer did
+not complete) - try 1 of 6`, then completes and runs. A download that fails its checksum with no block
+failing would refute it.
+
+One more thing the R2 run settled: on the U1b run the third replug came up at full speed through the hub's
+transaction translator, and every vendor read failed. In the R2 run both replugs came up at high speed and
+read the chip at once, so that was the insertion; it is recorded here in case it returns.
 
 ## 7. U2: `xhci` - the design, from a reading of the driver (2026-10-05), NOT BUILT
 

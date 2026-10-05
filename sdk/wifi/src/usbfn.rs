@@ -17,6 +17,12 @@ pub const OP_INFO: u8 = 0x20;
 /// 8-byte setup packet as USB defines it; for an OUT transfer the data follows it, `wLength` bytes; for an
 /// IN transfer the reply carries what the device returned.
 pub const OP_CONTROL: u8 = 0x21;
+/// `OP_CONTROL`, attempted EXACTLY ONCE: the host does not retry it, and a failure is `ST_FAILED`. For a
+/// transfer that must not reach the device twice. A firmware block is one: the host retrying a block whose
+/// data arrived and whose status stage failed sends it again, and the chip's checksum is then never
+/// reported (seen on a Pi 2 replug, R2). Linux sends each block once and restarts the whole download on a
+/// failure (`rtl8xxxu_download_firmware`'s `-EAGAIN`), which needs the failure to be seen.
+pub const OP_CONTROL_ONCE: u8 = 0x22;
 
 /// `[NOTE_RADIO]`, sent BY the host TO the driver, with no reply expected: the radio's binding changed -
 /// a dongle was bound or removed - so ask `OP_INFO`. The host sends it with `try_send`, so it never blocks

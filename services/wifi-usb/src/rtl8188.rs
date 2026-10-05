@@ -47,24 +47,39 @@ pub fn write(ctx: &ServiceContext, reg: u16, width: u8, val: u32) -> Result<(), 
     write_bytes(ctx, reg, &val.to_le_bytes()[..width as usize])
 }
 
-/// `bytes` written from register `reg` in ONE control transfer - a register's 1, 2 or 4, or one block of the
-/// firmware download (`rtl8xxxu_writeN`, 128 at a time for this family).
+/// `bytes` written from register `reg` in ONE control transfer - a register's 1, 2 or 4 - which the host
+/// may retry, since a register written twice holds the same value.
 pub fn write_bytes(ctx: &ServiceContext, reg: u16, bytes: &[u8]) -> Result<(), &'static str> {
+    write_op(ctx, usbfn::OP_CONTROL, reg, bytes)
+}
+
+/// One block of the firmware download (`rtl8xxxu_writeN`, 128 at a time for this family), sent EXACTLY
+/// ONCE. A block the host retried could reach the chip twice, and the chip then never reports the
+/// download's checksum (a Pi 2 replug, R2); Linux sends each block once and restarts the whole download
+/// when one fails, which `download_firmware`'s caller does.
+pub fn write_block(ctx: &ServiceContext, reg: u16, bytes: &[u8]) -> Result<(), &'static str> {
+    write_op(ctx, usbfn::OP_CONTROL_ONCE, reg, bytes)
+}
+
+fn write_op(ctx: &ServiceContext, op: u8, reg: u16, bytes: &[u8]) -> Result<(), &'static str> {
     let [lo, hi] = reg.to_le_bytes();
     let [nlo, nhi] = (bytes.len() as u16).to_le_bytes();
     let mut req = [0u8; 9 + crate::rtl_fw::BLOCK];
     if bytes.len() > crate::rtl_fw::BLOCK {
         return Err("a write longer than one 128-byte block");
     }
-    req[..9].copy_from_slice(&[usbfn::OP_CONTROL, DIR_OUT, VENDOR_REQ, lo, hi, 0, 0, nlo, nhi]);
+    req[..9].copy_from_slice(&[op, DIR_OUT, VENDOR_REQ, lo, hi, 0, 0, nlo, nhi]);
     req[9..9 + bytes.len()].copy_from_slice(bytes);
     let r = host(ctx, &req[..9 + bytes.len()])?;
     let p = r.payload_bytes();
-    match (p.first().copied(), p.get(1).copied()) {
-        (Some(usbfn::OP_CONTROL), Some(usbfn::ST_OK)) => Ok(()),
-        (Some(usbfn::OP_CONTROL), Some(usbfn::ST_NO_DEVICE)) => Err("the dongle is no longer bound"),
-        (Some(usbfn::OP_CONTROL), Some(usbfn::ST_FAILED)) => Err("the transfer did not complete"),
-        _ => Err("the host refused the write or answered something else"),
+    if p.first().copied() != Some(op) {
+        return Err("the host answered something other than this write");
+    }
+    match p.get(1).copied() {
+        Some(usbfn::ST_OK) => Ok(()),
+        Some(usbfn::ST_NO_DEVICE) => Err("the dongle is no longer bound"),
+        Some(usbfn::ST_FAILED) => Err("the transfer did not complete"),
+        _ => Err("the host refused the write as malformed"),
     }
 }
 
@@ -601,7 +616,7 @@ pub fn download_firmware(ctx: &ServiceContext, code: &[u8]) -> Result<usize, &'s
                 write8(ctx, REG_MCU_FW_DL + 2, (p & 0xF8) | b.page)?;
                 page = b.page;
             }
-            write_bytes(ctx, b.addr, b.bytes)?;
+            write_block(ctx, b.addr, b.bytes)?;
             n += 1;
         }
         Ok(n)

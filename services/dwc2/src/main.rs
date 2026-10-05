@@ -168,7 +168,7 @@ fn dispatch(
     };
     // The radio's function protocol FIRST: its ops (0x20 up) are above the net ops' floor, so the net
     // test below would take them.
-    if (godspeed_wifi::usbfn::OP_INFO..=godspeed_wifi::usbfn::OP_CONTROL).contains(&p[0]) {
+    if (godspeed_wifi::usbfn::OP_INFO..=godspeed_wifi::usbfn::OP_CONTROL_ONCE).contains(&p[0]) {
         rtl::serve(ctx, m, d, radio, msg, reply);
         return true;
     }
