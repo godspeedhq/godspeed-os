@@ -170,3 +170,36 @@ the MAC's setup.
 Its prediction, after R1's lines: `firmware rtl8192cufw_TMSC.bin VERIFIES - signature 0x88c1, version 88.2,
 16094 bytes of code`, then `firmware downloaded - 126 blocks`, then `the firmware is RUNNING - MCU_FW_DL=...`
 with bit 6 (`WINT_INIT_READY`) set.
+
+## 7. U2: `xhci` - the design, from a reading of the driver (2026-10-05), NOT BUILT
+
+`wifi-usb` already asks whichever host it was wired to (`HOSTS`, `gs::ipc::peer`), so on the driver's side U2
+is a spawn row. On `xhci`'s side it is real work, because that driver was written around keyboards and one
+disk, and five of its properties stand in the way:
+
+1. **Nothing survives a hot-plug.** Every arrival or removal re-initialises the controller and re-enumerates
+   from scratch (`'reenum`). A radio binding is rebuilt each pass, and whether to send `NOTE_RADIO` is a
+   comparison against the previous pass - the way `disk_was_bound` and `prev_sigs` already work.
+2. **Its control transfer has no OUT data stage** (`control`, IN or none only), and every register write
+   is one. It needs TRT=2 on the setup TRB and DIR=0 on the data TRB.
+3. **That transfer is safe only during enumeration.** It keeps no ring cursor or cycle state and takes
+   the first transfer event from ANY slot. A control transfer served at runtime needs what
+   `hub_port_status` has: a persistent cursor and cycle, a Link-TRB wrap, and the event matched to its own
+   TRB - with any HID report it consumes re-armed (`eaten`).
+4. **Nothing watches a device it did not bind as a keyboard or a disk.** The radio's root port needs the
+   CCS watch the keyboard has; behind a hub, the `GET_STATUS` watch.
+5. **Requests are dropped unanswered on two idle paths** (the rescan drain, `wait_for_port`), and a pass
+   with no keyboard and no disk never reaches the serve loop - which is exactly the pass a radio alone
+   produces. Both must answer, as `dwc2`'s no-disk fix made it answer.
+
+The binding point is where the VID and PID are read (`enumerate_one` for a root port, `address_downstream`
+behind a hub), before the class decision; the slot and its DMA slice are kept instead of released, and the
+configuration set by hand. `MAX_SLICES` (6) and the early stop at two keyboards and a disk must count it.
+The serve branch goes beside `serve_if_block`'s allow-list, named op by op as its own comment asks, and the
+crate gains `godspeed-wifi` for the `usbfn` constants. Then: the supervisor's `usb_radio` fact derives from
+`xhci` as well as `dwc2`, `xhci` gains `wifi-usb` as a peer, and `wifi-usb`'s row and contract name the
+host its board has.
+
+**Why it was not built unattended:** it is the driver that carries the keyboard and the disk on the Pi 4,
+the VisionFive and both PCs, hardware-verified on all four, and the dongle path cannot be shown in QEMU. It
+is a card per board with the operator present.

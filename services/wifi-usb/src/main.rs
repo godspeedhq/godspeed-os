@@ -39,9 +39,16 @@ const FIRMWARE_FNV: u32 = rtl_fw::decimal(env!("RTL_FW_TMSC_FNV"));
 const DOWNLOAD_TRIES: u32 = 6;
 use rtl8188::{read32, REG_SYS_CFG, REG_SYS_ISO_CTRL};
 
-/// The host this board's dongle sits behind. One today; `xhci` joins when it serves `usbfn` (U2), and the
-/// spawn row then gives this service whichever the board has.
-const HOST: &str = "dwc2";
+/// The USB host services that serve `usbfn`. This service is wired at spawn to the one its board has - the
+/// supervisor's spawn row decides, from the board's facts - so it asks whichever of these it holds, and
+/// names no board itself (U2).
+const HOSTS: [&str; 2] = ["dwc2", "xhci"];
+
+/// The host this service was given: the first of `HOSTS` it was wired to. `dwc2` when none is, which only a
+/// broken spawn row could produce, and whose requests then fail and say so.
+fn host_name(ctx: &ServiceContext) -> &'static str {
+    HOSTS.iter().copied().find(|h| gs::ipc::peer(ctx, h).is_some()).unwrap_or(HOSTS[0])
+}
 /// The bound on one request to the host. A control transfer takes milliseconds; the host retries a
 /// transient itself, so a request still unanswered after this is a host that is not serving.
 const HOST_SECS: i64 = 2;
@@ -57,7 +64,7 @@ const SYS_CFG_TYPE_92C: u32 = 1 << 27;
 /// the send failed - the host is spawned by the supervisor and may be respawned after us (14.3) - and never
 /// re-sends after a deadline. The failure as the stdlib words it.
 pub(crate) fn host(ctx: &ServiceContext, body: &[u8]) -> Result<Message, &'static str> {
-    gs::call::request_within(ctx, HOST, &Message::from_bytes(body), HOST_SECS).map_err(|e| e.as_str())
+    gs::call::request_within(ctx, host_name(ctx), &Message::from_bytes(body), HOST_SECS).map_err(|e| e.as_str())
 }
 
 /// What the host says about the radio: `Some((vid, pid))` when one is bound, `None` when none is or the
@@ -77,13 +84,13 @@ fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16)>, &'static str> {
 
 /// U1's reads, logged and decoded. `true` when both came back as a register file could.
 fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> bool {
-    ctx.log_fmt(format_args!("wifi-usb: {} has bound a radio at {:04x}:{:04x}", HOST, vid, pid));
+    ctx.log_fmt(format_args!("wifi-usb: {} has bound a radio at {:04x}:{:04x}", host_name(ctx), vid, pid));
     let cfg = read32(ctx, REG_SYS_CFG);
     let iso = read32(ctx, REG_SYS_ISO_CTRL);
     match (cfg, iso) {
         (Ok(c), Ok(i)) => {
             ctx.log_fmt(format_args!(
-                "wifi-usb: SYS_CFG(0xF0)={:#010x} ISO_CTRL(0x00)={:#010x}, read through {}", c, i, HOST));
+                "wifi-usb: SYS_CFG(0xF0)={:#010x} ISO_CTRL(0x00)={:#010x}, read through {}", c, i, host_name(ctx)));
             let plausible = |v: u32| v != 0 && v != 0xFFFF_FFFF;
             if !(plausible(c) && plausible(i)) {
                 ctx.log("wifi-usb: all-zeros or all-ones - a bus or power fault, not a register file");
@@ -212,9 +219,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     identify(&ctx, vid, pid);
                 }
                 Ok(None) => ctx.log_fmt(format_args!(
-                    "wifi-usb: {} has no dongle bound - waiting to be told when one is", HOST)),
+                    "wifi-usb: {} has no dongle bound - waiting to be told when one is", host_name(&ctx))),
                 Err(why) => ctx.log_fmt(format_args!(
-                    "wifi-usb: asking {} about the radio: {} - waiting to be told when its binding changes", HOST, why)),
+                    "wifi-usb: asking {} about the radio: {} - waiting to be told when its binding changes", host_name(&ctx), why)),
             }
             said = Some(now);
         }
