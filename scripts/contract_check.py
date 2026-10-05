@@ -209,7 +209,12 @@ def _supervisor_row(name: str):
     needle = '"' + name + '"' + ","
     for row in src.split('\n' + "    ("):
         if row.startswith(needle) and "_ELF" in row:
-            return row
+            # Cut at the end of the TABLE as well as at the next row. The last row of `IMAGES` otherwise
+            # runs on through the code below it, and took a `hwclass::pci(..)` from there as its own device
+            # class - found when `wifi-usb`, which has none, became the last row (2026-10-05). The same
+            # boundary bug was in `commandments.py`'s grant parser, fixed the same day.
+            end = row.find("\n];")
+            return row if end == -1 else row[:end]
     return None
 
 

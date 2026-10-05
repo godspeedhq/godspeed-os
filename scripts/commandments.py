@@ -987,6 +987,22 @@ def check_stdlib_delegates_reacquire(pins):
             "restore the reacquire, or remove `gs::call::*` from `reacquire_api` so the services "
             "that rely on it are held to IX themselves. A credit nothing verifies is worse than no "
             "credit."))
+    # `gs::cap::reacquire` IS credited too (2026-10-05): it is the stdlib's way to reacquire by name, and a
+    # service written the one consistent way - on the stdlib - reached the IX check with no SDK name in
+    # its source and failed it for having done the right thing. Same rule as `call.rs`: the credit stands
+    # only while the function's own body reaches a real reacquisition API.
+    cap_path = os.path.join(ROOT, "stdlib", "rust", "src", "cap.rs")
+    if "gs::cap::reacquire" in (pins.get("reacquire_api", []) or []) and os.path.exists(cap_path):
+        with open(cap_path, encoding="utf-8", errors="replace") as fh:
+            cap_text = fh.read()
+        at = cap_text.find("pub fn reacquire(")
+        body = cap_text[at:cap_text.find("\n}\n", at)] if at != -1 else ""
+        if not any(api in body for api in apis):
+            out.append(Violation(
+                "stdlib/rust/src/cap.rs", 0,
+                "`gs::cap::reacquire` is listed in `reacquire_api`, so a service calling it is credited "
+                "with a recovery path - and its body no longer reaches a reacquisition API. Restore it, "
+                "or remove it from `reacquire_api`."))
     # WHICH ARM IS THE REACQUIRE IN? This used to be `"DeadlineOutcome::SendFailed" in text`, which
     # is a weaker question than it looks: it passes on a file that names the variant in a COMMENT and
     # reacquires on the deadline, and it fails a file that is entirely correct in a different shape.
@@ -1091,7 +1107,15 @@ def _service_grants():
     rows = list(re.finditer(r'\(\s*"([a-z0-9-]+)"\s*,\s*[A-Z0-9_]+_ELF\b', sup))
     for i, m in enumerate(rows):
         name = m.group(1)
+        # A row ends at the next row or at the end of ITS TABLE (`];`), whichever is first. It used to run
+        # to the next row or the end of the FILE, so the last row of the last table was credited with every
+        # `privbits::` and `hwclass::` written anywhere below it: `dwc2`, last for months, was pinned as
+        # holding `hw:PCI`, which nothing grants it - found when `wifi-usb` became the last row and
+        # inherited the phantom instead (2026-10-05).
         end = rows[i + 1].start() if i + 1 < len(rows) else len(sup)
+        table_end = sup.find("];", m.end())
+        if table_end != -1:
+            end = min(end, table_end)
         span = sup[m.end():end]
         for priv in re.findall(r'privbits::([A-Z_0-9]+)', span):
             add(name, f"priv:{priv}", sup_path)
@@ -1586,6 +1610,8 @@ CHECKS = [
              dict(why="the real library against the real tree must pass", pins=None, expect=False),
              dict(why="a library that stopped reacquiring must be caught",
                   pins={"reacquire_api": ["nothing_that_appears_in_the_file"]}, expect=True),
+             dict(why="a credited `gs::cap::reacquire` whose body reaches no listed API must be caught",
+                  pins={"reacquire_api": ["reacquire_cap", "gs::cap::reacquire"]}, expect=True),
          ]),
     dict(nature="rule", id="IX-peer-reacquire", commandment="IX",
          title="a service that sends to a peer can reacquire it after the peer restarts",

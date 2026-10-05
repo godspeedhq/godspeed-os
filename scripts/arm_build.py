@@ -78,7 +78,7 @@ def run(cmd):
 _ALIAS_SIG = bytes([0x03, 0x21, 0x82])
 
 
-def verify_image(img_path, want_qemu):
+def verify_image(img_path, dwc2_elf_path, want_qemu):
     """Assert the built image embeds the DWC2 variant that was actually asked for.
 
     This exists because the failure it catches is SILENT and reaches hardware: the kernel embeds each
@@ -88,9 +88,22 @@ def verify_image(img_path, want_qemu):
 
     Checking the ARTIFACT rather than the build steps is the point: it is the only thing that cannot be
     fooled by a caching or ordering mistake in the steps above.
+
+    IN TWO HALVES, because the whole image is not the right place to look for the alias. It searched the
+    IMAGE for the instruction, and since `pwm-audio` (2026-10-03) - which applies the same VideoCore alias
+    to ITS DMA addresses, correctly - every `--qemu` build failed here whatever `dwc2` held: a check that
+    could no longer pass, found on 2026-10-05 when the identity `dwc2` was built and the image still
+    "embedded the hardware DWC2". So: the alias is looked for in `dwc2`'s own ELF, and the image must
+    carry that exact ELF - which is still the artifact, and is the half that catches a stale embed.
     """
     img = io.open(img_path, "rb").read()
-    found = _ALIAS_SIG in img
+    elf = io.open(dwc2_elf_path, "rb").read()
+    if elf not in img:
+        raise SystemExit(
+            "BUILD VERIFY FAILED: the image does not embed the dwc2 ELF this build just produced "
+            "(%s) - the embedded service ELF is stale." % dwc2_elf_path
+        )
+    found = _ALIAS_SIG in elf
     if want_qemu and found:
         raise SystemExit(
             "BUILD VERIFY FAILED: --qemu was requested but the image embeds the HARDWARE DWC2 "
@@ -192,6 +205,14 @@ def main():
         elif svc == "fs" and args.crash_window:
             feats = ["--features", "crash-window"]
         run(["cargo", "build", "-p", svc, "--target", TARGET] + feats + rel)
+        # A SERVICE BUILT IN TWO VARIANTS IS STAMPED NOW, so the supervisor re-embeds the one just built.
+        # Cargo keeps each variant's build apart and, when the one asked for is already up to date, only
+        # copies it back into place - keeping its OLD time. The supervisor re-embeds on
+        # `rerun-if-changed`, which compares times, so after a `--qemu` build a hardware build kept the
+        # QEMU `dwc2` inside the supervisor: an image that would have DMAd to the wrong addresses on a Pi.
+        # Caught by `verify_image` on 2026-10-05, the first build after it looked in dwc2's own ELF.
+        if svc in ("dwc2", "fs"):
+            os.utime(os.path.join(ROOT, "target", TARGET, profile, svc), None)
 
     if args.crash_window:
         print("")
@@ -268,7 +289,7 @@ def main():
         shutil.copyfile(cfg_src, os.path.join(out_dir, "config-pi2.txt"))
 
     # Verify the ARTIFACT, not the steps: a stale embed is silent and reaches hardware (verify_image).
-    verify_image(img, args.qemu)
+    verify_image(img, os.path.join(ROOT, "target", TARGET, profile, "dwc2"), args.qemu)
 
     size = os.path.getsize(img)
     print(f"\nOK  build/kernel7.img  ({size} bytes, feature={kfeatures}, profile={profile})")

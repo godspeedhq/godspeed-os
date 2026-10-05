@@ -285,6 +285,8 @@ reacquire_api = [
   # credit given here is verified rather than assumed. Without that second half this list would be a
   # hole - "calls something that used to recover" is not the property IX is about.
   "gs::call::request", "call::request_within", "gs::fs::Fs",
+  # `gs::cap::reacquire`, verified the same way (its body must reach one of the five above).
+  "gs::cap::reacquire",
 ]
 
 # Services that send to a peer and have NO reacquisition path, as of 2026-09-14. SHRINK ONLY, and a
@@ -724,7 +726,7 @@ SpawnImage               = 52
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "copier" = ["peer:fs"]
 "counter" = ["peer:fs"]
-"dwc2" = ["hw:DWC2", "hw:PCI", "peer:events", "priv:CONSOLE_PUSH"]
+"dwc2" = ["hw:DWC2", "peer:events", "priv:CONSOLE_PUSH"]
 "ehci" = ["hw:EHCI", "peer:events", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]
