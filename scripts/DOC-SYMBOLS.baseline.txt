@@ -74,7 +74,6 @@ aic8800_sdio                       # docs/wifi.md 44 - the AICSemi vendor Linux 
 brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 si_watchdog                        # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
-MM_CONNECTION_LOSS_IND             # docs/wifi-aic8800.md - AICSemi aic8800 driver, EXTERNAL; cited because the vendor driver ignores it
 CHIP_REV_U03                       # docs/wifi-aic8800.md - AICSemi aic8800_bsp chip_rev enum, EXTERNAL; revision 7
 set_pmk                            # docs/wifi-aic8800.md - Linux cfg80211 op, EXTERNAL; cited as the handshake offload this firmware lacks
 dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXTERNAL; the second init order compared

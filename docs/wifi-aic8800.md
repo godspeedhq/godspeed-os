@@ -194,7 +194,7 @@ patches, so the clock question above stands), about 9 s from `V1 done` to the st
 sent nothing unprompted before the driver stopped looking; whether it announces itself is V3's first
 question.
 
-**V3, prepared in two cards and NOT YET RUN (2026-10-05).** Built from the vendor runtime driver
+**V3, in two cards - both verified on the board (2026-10-05, section 4's results below).** Built from the vendor runtime driver
 (`aic8800_fdrv` at the same commit), in its order:
 
 - **Card 1** (stage 8): the runtime driver's own wake check; the sub-id at `0x20`; `MM_SET_STACK_START_REQ`
@@ -222,7 +222,7 @@ compiles it with `rustc --test` on every `osdev build` (it is in `EXTRA_CHECKS`)
 values the board has already confirmed - the header CRCs the chip accepted, the patch table's addresses -
 so a later edit that moves a byte fails a build rather than a flash.
 
-**V4's first card, prepared and NOT YET RUN (2026-10-05): one scan at bring-up, logged.** Stage 10 sends
+**V4's first card, verified (2026-10-05): one scan at bring-up, logged.** Stage 10 sends
 `SCANU_START_REQ` (`0x1000`, task 4) for every channel in the list stage 9 sent, with one empty SSID and
 the broadcast BSSID, and reads until the scan ENDS. The vendor driver's order, which is not what the
 names suggest: the request's own confirm is `SCANU_START_CFM_ADDITIONAL` (`0x1009`; the vendor spells it `ADDTIONAL`), each network
@@ -245,7 +245,7 @@ type `0x00` packet with a 60-byte hardware header before a raw 802.11 frame, its
 a protected frame, the CCMP header the firmware leaves in place. No message between the scan and the
 connect for WPA2-PSK. An open network sets neither connect flag and offers no element.
 
-**V4's second card, prepared and NOT YET RUN (2026-10-05): the radio as a `Station`, under the shared serve
+**V4's second card, verified (2026-10-05): the radio as a `Station`, under the shared serve
 loop.** After stage 10 the driver no longer answers `radio down`: stage 11 builds `aic_station::Aic` and
 enters `serve_radio`, the loop the Pi 4 runs under, so `wifi scan`, `wifi list`, `wifi status`, `wifi
 join`, the credential table and `/wifi.keys` are the loop's from here. It took two changes outside the
@@ -259,8 +259,9 @@ AIC8800's own files, both of them moves rather than new behaviour:
   and on the AIC8800 is the data frame and `MM_KEY_ADD_REQ`. Section 6 planned three methods; two
   suffice, because a group key is a key install with no peer.
 
-Both change the Pi 4's hardware-verified path, so the Pi 4 has a card of its own for them
-(`build/kernel8-STATION.img`), and its prediction is that NOTHING in its log changes.
+Both change the Pi 4's hardware-verified path, so the Pi 4 has a card of its own for them, whose prediction
+is that NOTHING in its log changes. It has NOT RUN: the Pi 4 is checked when it is next on the bench, with
+V6's move of the radio bridge out of `genet.rs` on the same card.
 
 The AIC8800's `Station` (`aic_station.rs`), what each method sends, and where it departs from the vendor
 driver on purpose (the module's header has the full reasoning):
@@ -276,11 +277,19 @@ driver on purpose (the module's header has the full reasoning):
 | `link` | the BSSID of the last `SM_CONNECT_IND`, cleared by any `SM_DISCONNECT_IND` read; the RSSI asked each time (`MM_GET_STA_INFO_REQ`) | |
 | `send` / `pull` | the 28-byte host descriptor out; in, the 60-byte header, then 802.11 to ethernet (DA = address 1, SA = address 3) | only frames with the header's `upload` flag; the CCMP header is skipped when `decr_status` says CCMP, not by the frame's protected bit |
 
-**What this card cannot show: traffic.** `nic-driver` bridges to the radio only where `nic_radio_bridge` is
-set, and on the VisionFive it is not (`services/supervisor/build.rs`). So a join here associates and runs
-the handshake, and `wifi status` reports the link and its signal, but no frame is pulled except during a
-join - which also means a group-key rekey, answered from `pull`, is not answered on this board yet, and
-the access point will drop the link at its rekey interval (often an hour). The bridge is phase V6.
+**V6: the frame path, through the bridge the Pi 4 already had.** `nic-driver`'s radio bridge - the cable
+always wins, and with the cable out its frames go to `wifi-driver` over the frame ops - lived inside the Pi
+4's GENET serve loop. It is `services/nic-driver/src/radio.rs` now, moved whole and included by both GENET
+and the VisionFive's `dwmac`, so the rule and the radio's bounded exchange are written once. The
+supervisor's `nic_radio_bridge` fact is derived from the radio fact rather than asked of the instruction
+set a second time, which took the shared-surface count from 55 to 54 (CLAUDE.md 4.1).
+
+**The loop reads a radio nobody reads.** Before V6, nothing pulled frames on this board, and the first
+link was found DOWN within 2.5 minutes (`SM_DISCONNECT_IND`, reason 1), seen only at the next `wifi
+status`. `serve_radio` now waits at most 250 ms while joined, and if no frame op has read the chip in that
+time it reads it itself (`IDLE_PULL_MS`): the same `pull` NET_RX makes, so a group rekey is answered and a
+drop is logged when it happens. With it the link held for the whole of each run (235 reads a minute,
+logged once a minute). Where `nic-driver` pulls, as on the Pi 4, it never fires.
 
 **The receive layout, from the source (2026-10-05).** A data packet has no separate bus header: its first
 word is `hw_rxhdr`'s, whose low 16 bits are the length of the frame AFTER the header. The header is 56
@@ -290,6 +299,34 @@ place; whether its MIC is counted in the length the source does not show (the li
 commented out), so a body may carry 8 trailing bytes, which EAPOL and IP bound by their own lengths.
 Transmit confirms come back as type `0x12` packets and are the vendor driver's bookkeeping only; nothing
 goes back to the chip.
+
+### What the board showed (2026-10-05)
+
+Every card ran one change and its written prediction; the network names stay in the local logs.
+
+- **V3** - the firmware's version text is `di Mar 14 2025 11:20:38 - g5c3af771` (the `di` is in the file
+  itself), the MAC came from the chip, 5 GHz is supported; the radio core reports LMAC 6.9.1.1, 32
+  stations and 4 interfaces; capabilities HT/VHT/HE, 14 + 25 channels; one station interface at index 0.
+  Every confirm arrived first time; RF calibration takes about 1.1 s.
+- **V4** - a sweep of 39 channels ends in 1.6 s with status 0. The firmware sends one `0x004f` per channel
+  when not joined and a `0x0044`/`0x0045` pair per channel when joined (39 of each, every time); neither
+  name is confirmed from the source, so they are numbered (`PER_CHANNEL_IND`, `JOINED_CHANNEL_OUT`/`_BACK`)
+  and read without a line each. `wifi scan` and `wifi list` from the shell; a scan while joined keeps the
+  link.
+- **V5** - the join from `/wifi.keys` at boot and `wifi join` from the shell: connect, association on 5180
+  MHz, the four-way handshake from `sdk/wifi`, both keys, the control port - 0.4 s from the connect request
+  to `JOINED`.
+- **V6** - DHCP, ARP and `ping 8.8.8.8` over the radio at 24 ms, `net-stack` unchanged; so the transmit
+  descriptor and the CCMP receive path are both right, and the possible 8 MIC bytes do no harm. `wifi
+  radio off`/`on` rejoined by itself, `hard` off and `powercycle` restarted the driver onto a cold chip and
+  rejoined, and a 50-round `chaos max-carnage` (374 kills, the radio's driver among them) ended with the
+  kernel alive and the link back, unprompted, about 14 s after the storm.
+- **A lost link is `SM_DISCONNECT_IND`** - reason 1 for the unread link, 0 for the host's own `radio off`
+  (section 9's question).
+
+Still open: **V7**, a group rekey answered on this radio, which needs the board joined past the access
+point's rekey interval; the cable-pull test (the cable taking the link back from the radio); and section
+9's clock question.
 
 ## 5. The AIC8800 bus and the firmware upload
 
@@ -423,9 +460,10 @@ command from a chip nobody has powered before. Everything after it is protocol.
 - The byte offsets of the firmware messages: computed from the C structs assuming natural alignment.
   The first exchange (V2's memory read of the chip id) checks the framing; V3's confirms check the rest.
 - Whether a received data frame keeps its 8-byte CCMP MIC at the end (the vendor driver trims nothing
-  visible).
-- How the firmware reports a lost link: `aic8800_fdrv` ignores `MM_CONNECTION_LOSS_IND`; presumably the
-  loss surfaces as `SM_DISCONNECT_IND`. V6's cable-pull and AP-off tests will say.
+  visible). Harmless either way, shown by V6: DHCP, ARP and ICMP all bound themselves by their own lengths.
+- ~~How the firmware reports a lost link.~~ **Settled (2026-10-05): `SM_DISCONNECT_IND`**, reason 1 when the
+  unread link was dropped and 0 after the host's own `radio off`. An access point switched off has not
+  been tried.
 - The `5 MHz` versus `150 MHz` clock question in section 5.
 
 ## 10. Also worth doing on this board
