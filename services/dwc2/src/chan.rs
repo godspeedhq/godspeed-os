@@ -222,12 +222,75 @@ pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<
     }
 }
 
-/// One stage of a control transfer: program, wait for the halt, decide success from HCINT.
+/// A single-packet stage that halts on a transaction error is run again, up to this many errors in all -
+/// Linux's `dwc2_hc_xacterr_intr` and `dwc2_release_channel`, read from the source: an XACTERR halts the
+/// channel, the control phase is NOT advanced (it moves only on transfer-complete), and the transfer is
+/// failed with `-EPROTO` at the third error. So Linux re-runs the STAGE, never the whole transfer.
+///
+/// Before this, one XACTERR failed the whole control transfer, and the caller retried it from SETUP - which
+/// re-sent a DATA stage the device had already taken. On a Pi 2 a firmware block whose STATUS stage
+/// failed that way reached the RTL8188CUS twice and its checksum was never reported; refusing the re-send
+/// (`OP_CONTROL_ONCE`) instead left the chip NAKing every read after it until it was unplugged
+/// (`docs/wifi-usb.md` 6, R2b and R2c). Re-running the stage is what neither tried.
+///
+/// Only a stage of at most ONE packet is re-run: a SETUP, a STATUS, a register's few bytes. A longer DATA
+/// stage that errors part-way has moved packets Linux resumes from (`dwc2_update_urb_state_abn` and the
+/// saved toggle), and this driver programs a stage from its start, so such a stage still fails at once.
+const STAGE_XACTERR_TRIES: u32 = 3;
+
+/// One stage of a control transfer: program, wait for the halt, decide success from HCINT. A
+/// single-packet stage that halts on a transaction error alone is run again (`STAGE_XACTERR_TRIES`).
 #[allow(clippy::too_many_arguments)]
 fn stage(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, what: &str,
 ) -> bool {
+    let one_packet = len <= t.mps as u32;
+    let mut errors = 0;
+    loop {
+        match stage_once(ctx, mmio, t, ch, dir_in, pid, buf_phys, len, what) {
+            Ok(()) => {
+                if errors > 0 {
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: {} stage completed after {} transaction error(s), re-run as Linux does", what, errors));
+                }
+                return true;
+            }
+            Err(Some(hcint)) if one_packet && hcint & HCINT_XACTERR != 0 && hcint & HCINT_STALL == 0 => {
+                errors += 1;
+                if errors >= STAGE_XACTERR_TRIES {
+                    log_failed(ctx, what, hcint);
+                    ctx.log_fmt(format_args!("dwc2-svc: {} stage gave up after {} transaction errors", what, errors));
+                    return false;
+                }
+            }
+            Err(Some(hcint)) => {
+                log_failed(ctx, what, hcint);
+                return false;
+            }
+            Err(None) => return false,
+        }
+    }
+}
+
+fn log_failed(ctx: &ServiceContext, what: &str, hcint: u32) {
+    // XFERCOMPL is the only success. A halt with anything else latched is a real failure and is named,
+    // because "the transfer did not work" and "the device STALLed" want different responses and a single
+    // false would merge them.
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: {} stage FAILED (HCINT={:#010x}{}{}{})", what, hcint,
+        if hcint & HCINT_STALL != 0 { " STALL" } else { "" },
+        if hcint & HCINT_XACTERR != 0 { " XACTERR" } else { "" },
+        if hcint & HCINT_NAK != 0 { " NAK" } else { "" }));
+}
+
+/// One attempt at a stage: `Ok` on transfer-complete, `Err(Some(hcint))` on a halt with anything else
+/// latched, `Err(None)` when the channel never halted (already logged, with the core's state).
+#[allow(clippy::too_many_arguments)]
+fn stage_once(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, what: &str,
+) -> Result<(), Option<u32>> {
     program(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, 0);
     match wait_halt(ctx, mmio, ch, 100) {
         None => {
@@ -257,23 +320,10 @@ fn stage(
                 nptx, (nptx >> 16) & 0xFF,
                 mmio.read32(crate::regs::GINTSTS),
                 mmio.read32(hcchar_at(ch))));
-            false
+            Err(None)
         }
-        Some(hcint) => {
-            // XFERCOMPL is the only success. A halt with anything else latched is a real failure and
-            // is named, because "the transfer did not work" and "the device STALLed" want different
-            // responses and a single false would merge them.
-            if hcint & HCINT_XFERCOMPL != 0 {
-                true
-            } else {
-                ctx.log_fmt(format_args!(
-                    "dwc2-svc: {} stage FAILED (HCINT={:#010x}{}{}{})", what, hcint,
-                    if hcint & HCINT_STALL != 0 { " STALL" } else { "" },
-                    if hcint & HCINT_XACTERR != 0 { " XACTERR" } else { "" },
-                    if hcint & HCINT_NAK != 0 { " NAK" } else { "" }));
-                false
-            }
-        }
+        Some(hcint) if hcint & HCINT_XFERCOMPL != 0 => Ok(()),
+        Some(hcint) => Err(Some(hcint)),
     }
 }
 

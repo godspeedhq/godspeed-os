@@ -145,7 +145,7 @@ is the stdlib-dogfood branch's work, not this one's.
   both ways and checked. The R1 card already on the SD card was checked the same way: it embeds the
   hardware `dwc2`.
 
-## 6. R2 (2026-10-05): the firmware - hardware-verified on the Pi 2 at boot; a replug found R2b
+## 6. R2 (2026-10-05): the firmware - hardware-verified on the Pi 2 at boot; replugs found R2b and R2c
 
 The 8051's program is `rtl8192cufw_TMSC.bin` from upstream `linux-firmware`, in `nonfree/rtl8192cu` with
 Realtek's licence and its digest (`PROVENANCE`): binary redistribution is permitted with the notice
@@ -202,6 +202,31 @@ That a repeated block is what spoils the checksum is the reading of the log, not
 card's prediction is a replug whose download fails a block and logs `the download stopped (the transfer did
 not complete) - try 1 of 6`, then completes and runs. A download that fails its checksum with no block
 failing would refute it.
+
+**What R2b showed (2026-10-05): the loop runs, and cannot help, because the chip is stuck.** Seven
+downloads in one boot and six replugs: two clean (126 blocks, RUNNING, R3a's channel 1 after them), five
+with one `STATUS stage FAILED (XACTERR NAK)` on a block. In each of the five the download stopped, as it
+now should, and then every read after it - the `MCU_FW_DL` read on the abort path, and each of the five
+restarts - timed out: `DATA-IN stage timed out (channel never halted)`, the chip NAKing the data stage of
+every read until it was unplugged. So the explanation R2b was built on stands half-tested: no download
+failed its checksum without a block failing, but neither did a restarted download run, so whether a
+repeated block is what spoiled the checksum was never measured. What WAS shown is sharper. In the R2 run
+the host re-sent the whole block at once and the chip answered reads afterwards; here nothing was re-sent
+and it never answered again. A control transfer whose STATUS stage is abandoned leaves this chip waiting.
+
+**R2c: re-run the stage, as Linux's `dwc2` does.** Read from `drivers/usb/dwc2/hcd_intr.c` (fetched,
+SHA-256 `4f3af1392c83d309...`): `dwc2_hc_xacterr_intr` counts the error and halts the channel "so the
+transfer can be re-started from the appropriate point"; the control phase advances only on
+transfer-complete; `dwc2_release_channel` fails the transfer with `-EPROTO` at the third error. Linux never
+abandons a stage on one error and never re-sends a completed DATA stage. Our `dwc2` did one or the other.
+`chan::stage` now re-runs a single-packet stage - a SETUP, a STATUS, a register's bytes - up to three
+transaction errors, and says so when it does. A longer DATA stage still fails at once: Linux resumes one
+from the packet it reached, with the saved toggle, and this driver programs a stage from its start. The
+`OP_CONTROL_ONCE` of R2b stays: a block whose transfer fails outright is still not re-sent by the host.
+
+The card (`build/kernel7-R2c.img`) predicts, on a replug where a block's STATUS errors: `STATUS stage
+completed after 1 transaction error(s), re-run as Linux does`, the download `(1 try)`, RUNNING, channel 1.
+Refuted by: `STATUS stage gave up after 3 transaction errors` followed by the same wall of timed-out reads.
 
 One more thing the R2 run settled: on the U1b run the third replug came up at full speed through the hub's
 transaction translator, and every vendor read failed. In the R2 run both replugs came up at high speed and

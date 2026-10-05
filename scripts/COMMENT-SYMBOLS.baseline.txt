@@ -87,6 +87,8 @@ dwc2_get_actual_xfer_length
 dwc2_hc_halt
 dwc2_hc_nak_intr
 dwc2_hc_nyet_intr
+dwc2_hc_xacterr_intr               # Linux drivers/usb/dwc2/hcd_intr.c, cited by dwc2 chan::stage for re-running a stage on a transaction error (R2c) - external, 26.14
+dwc2_update_urb_state_abn          # Linux drivers/usb/dwc2/hcd_intr.c, same citation - external, 26.14
 dwc2_release_channel
 dwmac4_dma_axi
 dwmac4_dma_init
