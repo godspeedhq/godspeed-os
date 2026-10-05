@@ -51,7 +51,7 @@ const FS_TAG: u8 = 0xE1;
 
 /// One streaming chunk, matching the `fs` `MAX_FILE_BYTES` (7 data-block payloads of 508 bytes).
 ///
-/// Offsets handed to `WRITE_AT` must stay block-aligned or `fs` has to read-modify-write, so this
+/// Offsets handed to `OP_WRITE_AT` must stay block-aligned or `fs` has to read-modify-write, so this
 /// service only flushes at multiples of this. The one short flush - the tail on STOP - is still at an
 /// aligned offset, and nothing follows it.
 const IO_CHUNK: usize = 7 * 508;

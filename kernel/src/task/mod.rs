@@ -1372,7 +1372,7 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
 /// What it still refuses, and why the refusal is not a leftover: a caller may not claim a name the
 /// kernel's own catalogue still uses. While ANY name-keyed policy remains, letting a caller pick
 /// such a name would let it inherit that policy for arbitrary code - the same squatting hole
-/// `spawn_probe` closes, and for the same reason (the kernel name directory is the recovery anchor).
+/// the kernel's own probe spawn closed until the probe image left it (`dd5d176b`), and for the same reason (the kernel name directory is the recovery anchor).
 /// When the catalogue reaches its single `supervisor` entry this check narrows to that one name,
 /// which must never be claimable by anything.
 pub fn spawn_from_image(

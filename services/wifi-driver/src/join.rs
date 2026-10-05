@@ -41,7 +41,7 @@
 //! KCK, and its key data - AES-key-wrapped under the KEK - holds the group key as a KDE
 //! (`ieee80211_recv_4way_msg3`). Message 4 is `PAIRWISE | KEYMIC | SECURE`, empty, MIC'd
 //! (`ieee80211_send_4way_msg4`). Then the pairwise key (index 0, the access point's address) and the
-//! group key (its key id, `PRIMARY_KEY`) are installed (`bwfm_set_key_cb`).
+//! group key (its key id, `WSEC_PRIMARY_KEY`) are installed (`bwfm_set_key_cb`).
 //!
 //! ## How a wrong passphrase presents
 //!

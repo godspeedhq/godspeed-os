@@ -3,7 +3,7 @@
 //!
 //! Everything the campaign built converges here. This takes the ARM `events` ELF (embedded by
 //! `build.rs`, built in increment 4), loads it with the neutral loader (5) into a fresh address space
-//! (page tables from 3, frames from 1), sets up a task with a `LOG_WRITE` capability, and enters it at
+//! (page tables from 3, frames from 1), sets up a task with a `LOG_WRITE_RESOURCE` capability, and enters it at
 //! PL0 (3). The service runs its own compiled `service_main`, calls `ctx.log("events: ready")`, which
 //! issues a real `svc` (2) into the neutral syscall dispatcher, which validates the capability and
 //! writes to the kernel log - and the line appears on the console.
@@ -101,7 +101,7 @@ fn map_stack_and_ctx(pt: &mut PageTable) -> Option<u32> {
     Some(ctx_frame)
 }
 
-/// A service loaded into a fresh address space with a task slot reserved, its `LOG_WRITE` cap at
+/// A service loaded into a fresh address space with a task slot reserved, its `LOG_WRITE_RESOURCE` cap at
 /// cap-slot 0, and each `extra_caps` entry inserted at slots 1.. (in order). The service-context page
 /// is mapped but **left for the caller to fill** (so an IPC service can wire its recv/send slots), and
 /// `fill_kernel_identity` is **not** yet applied - the caller does both, then `clean_invalidate_dcache_all`.
@@ -113,7 +113,7 @@ pub(super) struct RawService {
 }
 
 /// Load an arbitrary service ELF into a fresh address space, reserve a task slot, install its
-/// `LOG_WRITE` cap (slot 0) and any `extra_caps` (slots 1..). See [`RawService`] for what the caller
+/// `LOG_WRITE_RESOURCE` cap (slot 0) and any `extra_caps` (slots 1..). See [`RawService`] for what the caller
 /// still owes (ctx write, `fill_kernel_identity`). Returns `None` (having logged) on any failure.
 pub(super) fn load_service_raw(elf: &[u8], extra_caps: &[Capability]) -> Option<RawService> {
     if elf.len() < 64 { pl011_write(b"arm32: spawn SKIP - empty service ELF\r\n"); return None; }

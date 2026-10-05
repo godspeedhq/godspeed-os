@@ -804,7 +804,7 @@ impl<'a> Fs<'a> {
             self.call(OP_WRITE_FILE, path.as_ref(), data, self.secs())?;
             return Ok(());
         }
-        // Larger than one message: create it, then fill it positionally. `WRITE_AT` at a fixed
+        // Larger than one message: create it, then fill it positionally. `OP_WRITE_AT` at a fixed
         // offset is positionally idempotent: the same bytes at the same offset land the same way twice (`services/fs` does not enumerate such a pair - this cited one that does not exist),
         // which is what makes a chunked write safe to resume at all.
         self.call(OP_WRITE_FILE, path.as_ref(), &data[..IO_CHUNK], self.secs())?;

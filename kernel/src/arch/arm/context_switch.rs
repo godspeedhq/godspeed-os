@@ -18,7 +18,7 @@
 //! ARM-shaped - eight callee-saved registers, `sp`, `lr` - as long as `cr3` survives as the
 //! address-space handle. On ARM that handle is **TTBR0**, stored in the low half of the `u64` `cr3`
 //! field. Keeping the x86 field *name* is the documented leak (`arch/CLAUDE.md`); renaming it to
-//! `page_table_base` is a neutral-scheduler change deferred to when a second arch forces it.
+//! page_table_base (the seam's `read_page_table_base` already says it) is a neutral-scheduler change deferred to when a second arch forces it.
 //!
 //! **No per-task address spaces yet.** Every kernel task shares the one identity map from `mmu.rs`,
 //! so `cr3` is identical across tasks and the switch compare-and-skips the `TTBR0` write - which also

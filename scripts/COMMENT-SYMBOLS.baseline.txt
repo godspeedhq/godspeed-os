@@ -525,3 +525,44 @@ cck_sig_qual_ofdm_pwdb_all         # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h
 drvinfo_sz                         # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
 rtl8723au_rx_parse_phystats        # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
 rtl8xxxu_parse_rxdesc16            # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+
+# Added 2026-10-05 when names stopped resolving by SUBSTRING (comment_symbol_check.py): each was
+# cited on purpose and had been satisfied only by a longer name in the code. External, 26.14.
+AUTO_AGE                           # JH7110 TRNG register bits (CTRL/ISTAT), cited by riscv64 hw_random - external, 26.14
+AUTO_RQSTS                         # JH7110 TRNG register bits (CTRL/ISTAT), cited by riscv64 hw_random - external, 26.14
+SEC_AHB                            # JH7110 STG clock/reset names from the device tree, cited by riscv64 hw_random - external, 26.14
+SEC_MISC_AHB                       # JH7110 STG clock/reset names from the device tree, cited by riscv64 hw_random - external, 26.14
+GMAC0_GTXCLK                       # JH7110 SYSCRG clock name from the device tree, cited by riscv64 net - external, 26.14
+GET_CLOCK_RATE                     # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+GET_GPIO_STATE                     # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+GET_MAX_CLOCK_RATE                 # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+GET_MIN_CLOCK_RATE                 # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+SET_GPIO_STATE                     # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+SET_PHYS_WH                        # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+CMD_DONE                           # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DATA_TOUNIT                        # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DATA_OFFSET                        # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DAT_EXP                            # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DAT_WR                             # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+PRV_DAT_WAIT                       # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DMA_CONTROL_ST                     # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+FRAMECOUNT_G                       # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+FRAMECOUNT_GB                      # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+OCTETCOUNT_G                       # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+OCTETCOUNT_GB                      # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+HW_FEATURE1                        # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+RTC_64                             # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+READ_FAIL                          # Broadcom GENET UniMAC MDIO bits (Linux bcmgenet), cited by nic-driver - external, 26.14
+START_BUSY                         # Broadcom GENET UniMAC MDIO bits (Linux bcmgenet), cited by nic-driver - external, 26.14
+RX_FIFO_INF                        # SMSC LAN95xx register names (Linux smsc95xx), cited by dwc2 - external, 26.14
+TX_FIFO_INF                        # SMSC LAN95xx register names (Linux smsc95xx), cited by dwc2 - external, 26.14
+cur_ether                          # Broadcom firmware iovar cur_etheraddr, split by markup in the comment, cited by wifi-driver - external, 26.14
+WRITE_RDY                          # SDHCI interrupt-status bit by its datasheet name (code has INT_WRITE_RDY), cited by wifi-driver - external, 26.14
+BUFFER_SIZE                        # AICSemi aic8800 (Linux) names, cited by wifi-driver - external, 26.14
+MM_STA                             # AICSemi aic8800 (Linux) names, cited by wifi-driver - external, 26.14
+EFUSE_CTRL                         # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
+EFUSE_TEST                         # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
+SYS_CLKR                           # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
+SYS_FUNC                           # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
+rtl8723a_cck_rssi                  # Linux rtl8xxxu (8723a.c), cited by wifi-usb for the CCK signal (R3b) - external, 26.14
+sort_unstable                      # Rust core slice method, cited by the shell for its ordering - external, 26.14

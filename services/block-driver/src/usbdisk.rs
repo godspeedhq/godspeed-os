@@ -8,7 +8,7 @@
 //! **Why it does not touch the hardware.** The USB stack - controller, enumeration, Bulk-Only transport
 //! - is the `dwc2` SERVICE (`services/dwc2`). It used to be in the kernel, because ARM did not route
 //! device IRQs to userspace; it does now (`USB_VECTOR`, `arch/arm/irq.rs`), and `kernel/src/arch/arm/dwc2.rs`
-//! is deleted. This driver therefore holds the `USB_DISK` capability and moves blocks over IPC, exactly
+//! is deleted. This driver therefore holds the `USB_DISK_RESOURCE` capability and moves blocks over IPC, exactly
 //! as the ARM `nic-driver` bridges USB ethernet frames to `net-stack`. The block protocol above them - the same one `fs` speaks to the AHCI
 //! and EMMC backends - is this driver's own, so `fs` cannot tell which disk it is talking to.
 //!

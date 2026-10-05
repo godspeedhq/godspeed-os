@@ -786,7 +786,7 @@ pub struct ServiceContext {
 ///
 /// Outside the capability-error range (-2..-7) ON PURPOSE, and this must stay in step with the kernel's
 /// `USB_DISK_BUSY` (`kernel/src/syscall/dispatch.rs`). It was originally `-2`, which is `CapNotHeld`, so
-/// a driver missing its `USB_DISK` capability was indistinguishable from a busy device and got retried
+/// a driver missing its `USB_DISK_RESOURCE` capability was indistinguishable from a busy device and got retried
 /// thousands of times before being reported as a device that "stayed busy" - a cap failure wearing an
 /// I/O failure's name.
 pub const USB_DISK_BUSY: i64 = -20;
@@ -2729,7 +2729,7 @@ impl ServiceContext {
     }
 
     /// Capacity of the in-kernel USB mass-storage device in 512-byte sectors, 0 if none is attached.
-    /// Requires the `USB_DISK` capability. Syscall 46.
+    /// Requires the `USB_DISK_RESOURCE` capability. Syscall 46.
     pub fn usb_disk_sectors(&self) -> u64 {
         // SAFETY: syscall(46) = UsbDiskInfo; no arguments, gated by the USB_DISK capability.
         let ret = unsafe { raw_syscall(46, 0, 0, 0) };
@@ -2737,7 +2737,7 @@ impl ServiceContext {
     }
 
     /// Read the 512-byte block at `lba` from the USB mass-storage device into `dst`. Returns false if
-    /// there is no device, the LBA is past the end, or the transfer failed. Requires `USB_DISK`.
+    /// there is no device, the LBA is past the end, or the transfer failed. Requires `USB_DISK_RESOURCE`.
     /// Syscall 47.
     #[must_use = "the destination buffer is NOT valid data if this is false"]
     pub fn usb_disk_read(&self, lba: u64, dst: &mut [u8; 512]) -> bool {
@@ -2748,7 +2748,7 @@ impl ServiceContext {
         ret == 0
     }
 
-    /// Write `src` as the 512-byte block at `lba` on the USB mass-storage device. Requires `USB_DISK`.
+    /// Write `src` as the 512-byte block at `lba` on the USB mass-storage device. Requires `USB_DISK_RESOURCE`.
     /// Syscall 48.
     #[must_use = "the block did NOT reach the medium if this is false"]
     pub fn usb_disk_write(&self, lba: u64, src: &[u8; 512]) -> bool {
@@ -2777,7 +2777,7 @@ impl ServiceContext {
     }
 
     /// Make previously written blocks durable on the USB mass-storage device (SCSI SYNCHRONIZE CACHE).
-    /// Requires `USB_DISK` WRITE. Syscall 49.
+    /// Requires `USB_DISK_RESOURCE` WRITE. Syscall 49.
     ///
     /// A write is only ACKNOWLEDGED when `usb_disk_write` returns - the device may still be holding the
     /// bytes in a volatile buffer. Anything that promises durability (a format, a journal commit) has to

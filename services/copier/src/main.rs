@@ -310,8 +310,8 @@ fn fs_write_at(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8], off: u64,
 /// ONLY TWO OPERATIONS MAY USE THIS, and the rule is not "reads are safe": it is that re-sending
 /// must not be able to produce a different outcome than sending once.
 ///
-///   - `READ_AT` changes nothing.
-///   - `WRITE_AT` writes known bytes at a FIXED offset into an extent that is already allocated.
+///   - `OP_READ_AT` changes nothing.
+///   - `OP_WRITE_AT` writes known bytes at a FIXED offset into an extent that is already allocated.
 ///     Doing it twice writes the same bytes to the same place. It is idempotent in the strict
 ///     sense, which is what makes the re-send safe.
 ///
@@ -320,7 +320,7 @@ fn fs_write_at(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8], off: u64,
 /// a mutating request" is otherwise the house rule. Those operations are relative to a state that
 /// the first attempt may already have changed - a second `rename` finds nothing where the first
 /// left nothing - so a re-send can turn a success into a reported failure. A positional overwrite
-/// has no such dependence. `WRITE_NEW` and `DELETE` are NOT idempotent in this sense and do not
+/// has no such dependence. `OP_WRITE_NEW` and `OP_DELETE` are NOT idempotent in this sense and do not
 /// come through here.
 fn fs_idempotent(ctx: &ServiceContext, mut attempt: impl FnMut() -> Fs) -> Fs {
     let mut slow = 0u32;
@@ -802,7 +802,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     fresh.total = size;
                     let mut sink = [0u8; 8];
-                    // NOT idempotent: a second `WRITE_NEW` for the same path fails because the
+                    // NOT idempotent: a second `OP_WRITE_NEW` for the same path fails because the
                     // first one succeeded, so it does not go through `fs_idempotent`.
                     if !matches!(fs_write_new(&ctx, &mut gfs, &fresh.dst[..dlen], size), Fs::Ok(_)) {
                         fresh.state = ST_FAILED;

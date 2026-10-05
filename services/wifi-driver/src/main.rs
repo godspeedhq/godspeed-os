@@ -1443,7 +1443,7 @@ fn serve_radio(
                         name
                     };
                     // ALREADY ON IT? Asked of the firmware, not remembered: `joined` names the network and
-                    // `GET_BSSID` says whether the link is still up. A join of the network we are on sends
+                    // `CMD_GET_BSSID` says whether the link is still up. A join of the network we are on sends
                     // nothing and says so; a stale memory of one is cleared and the join proceeds.
                     let on_this = joined
                         .as_ref()

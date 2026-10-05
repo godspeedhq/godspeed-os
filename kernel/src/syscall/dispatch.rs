@@ -1562,7 +1562,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 /// rights - never wider - and the GRANT gate means the caller could already transfer
 /// the whole cap wholesale, so duplicating it grants no authority it lacked. Endpoint
 /// caps already permit many concurrent senders, so duplication matches the IPC model.
-/// The generation check inside `lookup_cap` also forbids deriving from a stale cap.
+/// The generation check inside `current_task_lookup_cap` also forbids deriving from a stale cap.
 fn handle_derive_cap(held_slot: u64, _a1: u64, _a2: u64) -> i64 {
     let held = match scheduler::current_task_lookup_cap(held_slot as usize, Rights::GRANT) {
         Ok(c)  => c,
@@ -2790,7 +2790,7 @@ fn handle_usb_disk_info() -> i64 {
 /// A USB-disk syscall's "the device NAKed, re-ask" answer.
 ///
 /// Deliberately OUTSIDE the capability-error range (-2..-7, `cap_err_to_i64`). BUSY was first given
-/// `-2`, which is `CapNotHeld` - so a task calling these syscalls WITHOUT the `USB_DISK` capability got
+/// `-2`, which is `CapNotHeld` - so a task calling these syscalls WITHOUT the `USB_DISK_RESOURCE` capability got
 /// the same answer as one whose device was merely occupied. `block-driver` believes the second reading
 /// and re-asks 6000 times before reporting "the device stayed busy, it did not fail", which is a false
 /// diagnosis of an authority failure, and `fs` then degrades storage on the strength of it (Invariant

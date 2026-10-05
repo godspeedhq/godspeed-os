@@ -1473,7 +1473,7 @@ const WSEC_KEY_SIZE: usize = 164;
 /// bwfm_fwvar_var_get_int(sc, "wsec", &wsec); wsec |= BWFM_WSEC_AES; bwfm_fwvar_var_set_int(sc, "wsec", wsec);
 /// ```
 ///
-/// A pairwise key names the peer (`ea`) and is index 0; a group key is `PRIMARY_KEY` at its key id with no
+/// A pairwise key names the peer (`ea`) and is index 0; a group key is `WSEC_PRIMARY_KEY` at its key id with no
 /// address. `struct bwfm_wsec_key` is 164 bytes (162 of fields, 2 of tail padding), laid out as `bwfmreg.h`
 /// declares it; `ea` sits at 156.
 pub fn install_key(

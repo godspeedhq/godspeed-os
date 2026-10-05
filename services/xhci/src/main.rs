@@ -561,7 +561,7 @@ fn spin<F: Fn() -> bool>(ctx: &ServiceContext, what: &str, ms: u64, cond: F) -> 
 //
 // These were raw TSC-cycle literals chosen for a ~2 GHz x86 (`100_000_000` meaning "~50 ms"). A
 // cycle is not a portable unit - the AArch64 generic timer runs at 54 MHz on a Pi 4, where that same
-// literal asks for nearly two seconds and `HUB_RESCAN` asks for the better part of a minute. So the
+// literal asks for nearly two seconds and the hub rescan's (now `HUB_RESCAN_MS`) asks for the better part of a minute. So the
 // numbers below are DURATIONS, converted through the kernel's own calibration - by `gs::driver::wait`
 // and `delay` for waits and holds, and by `ctx.duration_cycles` for the remaining sleeps and report
 // intervals, the portable path the SDK already documents for exactly this mistake.

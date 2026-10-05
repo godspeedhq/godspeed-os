@@ -183,7 +183,13 @@ def scan():
                     # `#` comments in a contract are prose and are stripped for the same reason.
                     code_corpus.append("\n".join(
                         ln.split("#", 1)[0] for ln in read(p).split("\n")))
-    code_text = "\n".join(code_corpus)
+    # A name resolves only as a WHOLE identifier. This was a substring test (`tok not in code_text`),
+    # which let a cited name be satisfied by any longer one containing it: `lookup_cap` by
+    # `current_task_lookup_cap`, a deleted kernel probe spawn by the supervisor's `spawn_probe_row`,
+    # and a stale `is_probe` by a new, unrelated method - which is how it was found (2026-10-05).
+    # Fifty names were resolving that way; the ones naming this tree were corrected, and the rest -
+    # registers, firmware and Linux names cited on purpose - baselined with what they are.
+    code_text = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", "\n".join(code_corpus)))
 
     hits = collections.defaultdict(list)
     for p, comments in per_file:

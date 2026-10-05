@@ -17530,7 +17530,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // log's integrity rested on the writer being well-behaved. A capability that cannot write
     // backwards makes it unrewritable by construction instead (§7.3).
     //
-    // Shaped like a real log, because that is what it is for: `WRITE_NEW` allocates the whole extent
+    // Shaped like a real log, because that is what it is for: `OP_WRITE_NEW` allocates the whole extent
     // up front and chunks go in at block-aligned offsets, exactly as `recorder` does it. So the rule
     // is against the resource's own HIGH-WATER MARK, not against end-of-file - the file is its final
     // size from the first moment.

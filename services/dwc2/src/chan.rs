@@ -523,7 +523,7 @@ fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
 ///
 ///   1. START-SPLIT in microframe (current+1)&7, SKIPPING microframe 6: too little of the frame is
 ///      left after it for the complete-split at +2. ODDFRM must match that microframe's parity, which
-///      `program` derives from HFNUM - correct only because the channel is enabled AFTER `wait_uframe`
+///      `program` derives from HFNUM - correct only because the channel is enabled AFTER `wait_uframe_abs`
 ///      has reached the scheduled microframe.
 ///   2. COMPLETE-SPLIT at +2, retrying NYET in the following microframes (3 tries).
 ///
