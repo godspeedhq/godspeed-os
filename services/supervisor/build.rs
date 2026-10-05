@@ -132,11 +132,15 @@ fn main() {
     for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()).chain(audio.iter()) {
         println!("cargo:rustc-cfg=has_{}", name.replace('-', "_"));
     }
-    // Whether `nic-driver` carries frames to the radio when the cable is out (docs/wifi.md 2). Only its
-    // Pi 4 backend (GENET) has that bridge, so only there does it get `wifi-driver` as a peer. A separate
-    // fact from `has_wifi_driver`: the VisionFive embeds the radio's driver and has no bridge, and a peer
-    // nic-driver never calls would be standing authority for nothing (3.1).
-    if arch == "aarch64" {
+    // Whether `nic-driver` carries frames to the radio when the cable is out (docs/wifi.md 2). Its Pi 4
+    // backend (GENET) has had that bridge since the radio worked, and its VisionFive backend (`dwmac`)
+    // since phase V6 (`docs/wifi-aic8800.md`); both share `services/nic-driver/src/radio.rs`. A separate
+    // fact by NAME, so a reader of `main.rs` sees which question it asks; derived from `radio` because
+    // the two now agree on every board, and a second arch test for the same answer is how the counts
+    // drift. It was its own test while the VisionFive drove a radio its NIC could not reach - a peer
+    // nic-driver never called, standing authority for nothing (3.1). A future board with a radio and
+    // no bridge splits them again, here.
+    if radio.contains(&"wifi-driver") {
         println!("cargo:rustc-cfg=nic_radio_bridge");
     }
     // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides

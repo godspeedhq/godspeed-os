@@ -33,6 +33,13 @@ use crate::dwmac_ring::Dwmac;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Message, Mmio, ServiceContext};
 
+// The radio as the link's second backend (`radio.rs`), shared with the Pi 4's GENET - see the note where
+// `genet.rs` includes it. The VisionFive gained it in phase V6 (`docs/wifi-aic8800.md`): its AIC8800
+// joined and held a link with no way for a frame to reach it.
+#[path = "radio.rs"]
+mod radio;
+use radio::{Carrier, Radio, CABLE_RECHECK_MS};
+
 // ---- MAC block. `dwmac4.h`. ---------------------------------------------------------------------
 /// Synopsys release and user version. Confirmed on hardware: 0x4152 = release 5.20.
 const GMAC_VERSION: usize = 0x0110;
@@ -373,34 +380,45 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
     // Seeded from the link as it is now, so a cable already present at bring-up is not treated as a
     // fresh arrival - its settings have just been applied.
     let mut link_was_up = link(ctx, &d.m, 0).0;
+    // WHICH LINK CARRIES THE FRAMES - the cable always wins (`radio::Carrier`). Between re-reads, `cable`
+    // is the answer, re-read at most every `CABLE_RECHECK_MS` on whatever request arrives.
+    let mut cable = link_was_up;
+    let mut cable_read_at = ctx.read_tsc();
+    let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
+    let mut radio = Radio::new();
+    let mut radio_tx_fail: u32 = 0;
 
     loop {
-        let req = ctx.recv();
-        let Some(reply_cap) = ctx.take_pending_cap() else {
-            if !capless_logged {
-                capless_logged = true;
-                ctx.log("nic-driver: request had no reply cap - dropping (cannot answer without one)");
+        // A request the radio wait kept is served first: it arrived before anything `recv` could return.
+        let (req, reply_cap) = match radio.take_held() {
+            Some(h) => h,
+            None => {
+                let req = ctx.recv();
+                let Some(reply_cap) = ctx.take_pending_cap() else {
+                    if !capless_logged {
+                        capless_logged = true;
+                        ctx.log("nic-driver: request had no reply cap - dropping (cannot answer without one, or a late reply from the radio after this driver stopped waiting for it)");
+                    }
+                    continue;
+                };
+                (req, reply_cap)
             }
-            continue;
         };
         let p = req.payload_bytes();
 
-        if p.len() == 1 && p[0] == 3 {
-            // STATUS: [ok, mac(6), link]. Eight bytes exactly - net-stack and the shell both require
-            // that length before reading the link byte, so a shorter answer is UNREADABLE rather
-            // than a report of "down".
+        // THE CABLE, re-read on a request at most every CABLE_RECHECK_MS. A cable that arrived after
+        // bring-up has its speed re-applied, because a MAC left at the wrong clock receives nothing at
+        // all - and the edge is consumed only if the re-apply took, so one unlucky MDIO read cannot
+        // leave the receiver dead until a physical replug.
+        if ctx.read_tsc().wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
+            cable_read_at = ctx.read_tsc();
             let (up, speed, fd) = link(ctx, &d.m, 0);
             if up && !link_was_up {
-                // A cable arrived after bring-up. Re-apply the speed, because a MAC left at the
-                // wrong clock receives nothing at all - and consume the edge only if the re-apply
-                // actually took, so one unlucky MDIO read cannot leave the receiver dead until a
-                // physical replug.
                 ctx.log_fmt(format_args!(
                     "nic-driver: dwmac link came up at {} Mbit/s - re-applying MAC speed", speed));
                 if speed != 0 {
-                    // The clock edge is speed-dependent, so it is re-applied here for the same
-                    // reason the MAC speed is: this may be the first speed this boot has seen, or a
-                    // different one from the last cable.
+                    // The clock edge is speed-dependent, so it is re-applied for the same reason the MAC
+                    // speed is: this may be the first speed this boot has seen, or a different one.
                     configure_tx_clk_edge(ctx, &d.m, 0, speed);
                     d.set_link(speed, fd);
                     link_was_up = true;
@@ -408,14 +426,23 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             } else {
                 link_was_up = up;
             }
-            let mut out = [0u8; 8];
-            out[0] = 1;
-            out[1..7].copy_from_slice(&d.mac);
-            out[7] = up as u8;
+            cable = up;
+        }
+
+        if p.len() == 1 && p[0] == 3 {
+            // STATUS: [ok, mac(6), link, carrier] - the radio's address and its join when the cable is
+            // out. Nine bytes, as GENET's: net-stack and the shell read eight and take the ninth as the
+            // carrier for `net` (1 the cable, 2 the radio, 0 neither).
+            let out = radio::status(ctx, &mut radio, cable, d.mac, &mut carrier);
+            crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), ctx, &mut fails);
+        } else if p.len() == 1 && p[0] == 10 {
+            // WHICH ACCESS POINT carries the radio's link. Until the radio, a one-byte 10 here was
+            // taken for a frame to send; net-stack asks it only after STATUS has named the radio.
+            let out = radio::peer(ctx, &mut radio, cable);
             crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), ctx, &mut fails);
         } else if p.len() == 1 && p[0] == 4 {
             asked += 1;
-            let n = d.receive(&mut rxbuf);
+            let n = if cable { d.receive(&mut rxbuf) } else { radio.rx(ctx, &mut rxbuf) };
             if n == 0 { empty += 1 } else { handed += 1 }
             crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), ctx, &mut fails);
         } else if p.len() == 1 && p[0] == 9 {
@@ -429,7 +456,7 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
                 if opos + 2 + crate::FRAME_MAX > out.len() {
                     break;
                 }
-                let n = d.receive(&mut rxbuf);
+                let n = if cable { d.receive(&mut rxbuf) } else { radio.rx(ctx, &mut rxbuf) };
                 if n == 0 {
                     if count == 0 { empty += 1 }
                     break;
@@ -453,6 +480,22 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
             // send with a received frame hands it to a caller that did not ask for one (destroying
             // it), and when no frame is waiting the reply is empty, which cannot be delivered at
             // all, so the caller waits out its whole deadline. That pair was the Pi 4's ping loss.
+            if !cable {
+                // The radio's turn: the frame goes to `wifi-driver` as op 0x11 and its answer is the word.
+                // A refusal is counted and said sparingly - a radio that is not joined refuses every
+                // frame, correctly, and the stack retries on its own pace.
+                if !radio.tx(ctx, p) {
+                    radio_tx_fail = radio_tx_fail.saturating_add(1);
+                    if radio_tx_fail == 1 || radio_tx_fail % 64 == 0 {
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio did not send a {} byte frame (x{}) - not joined, no credit, or no answer",
+                            p.len(), radio_tx_fail));
+                    }
+                }
+                crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
+                ctx.remove_cap(reply_cap);
+                continue;
+            }
             let sent = d.transmit(ctx, p);
             if !sent {
                 ctx.log_fmt(format_args!(

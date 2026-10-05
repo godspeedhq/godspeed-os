@@ -19,6 +19,6 @@
     1  services/net-stack/src/main.rs
    10  services/nic-driver/src/main.rs
     2  services/shell/build.rs
-   16  services/supervisor/build.rs
+   15  services/supervisor/build.rs
     4  services/supervisor/src/main.rs
     2  services/wifi-driver/build.rs

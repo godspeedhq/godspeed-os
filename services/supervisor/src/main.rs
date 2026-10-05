@@ -342,7 +342,8 @@ mod board {
     } else if cfg!(nic_radio_bridge) {
         // The radio is the link's other backend where there is one (docs/wifi.md 2): the cable always
         // wins, and when it is out nic-driver carries the frames to wifi-driver over the frame ops. A
-        // board fact of its own (build.rs): the VisionFive has the radio's driver but no such bridge.
+        // board fact of its own (build.rs), held by the Pi 4's GENET and, since phase V6, the VisionFive's
+        // dwmac - both through `services/nic-driver/src/radio.rs`.
         &["wifi-driver", "events"]
     } else {
         &["events"]
