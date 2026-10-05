@@ -538,14 +538,13 @@ fn tagged_reply(tag: Option<u8>, body: &[u8]) -> Message {
 fn serve_radio(
     ctx: &ServiceContext,
     h: &dyn SdioHost,
-    w: &mut backplane::Window,
-    radio: Option<ctrl::Session>,
+    mut radio: Option<&mut dyn Station>,
     down_reason: u8,
 ) -> ! {
-    // THE RADIO, AS A STATION. Everything the loop below asks of the chip goes through this; the loop
-    // itself is the policy every radio shares (`godspeed_wifi::station`).
-    let mut bcm = radio.map(|s| bcm::Bcm::new(h, w, s));
-    let mut radio: Option<&mut dyn Station> = bcm.as_mut().map(|b| b as &mut dyn Station);
+    // THE RADIO, AS A STATION. Everything the loop below asks of the chip goes through `radio`; the loop
+    // itself is the policy every radio shares (`godspeed_wifi::station`). `h` is here only for the power
+    // operations, which are the host's and the kernel's, not the chip's. The caller builds the station -
+    // the Broadcom's at the end of `service_main`, the AIC8800's at the end of `v1_dw_mmc`.
     // Bounded: 2 status bytes plus 32 records of 45 is 1442 for a list, and 2 plus 64 names of 33 is 2114 for
     // `stored` - both inside this fixed buffer, inside a 4 KiB message.
     let mut out = [0u8; 2560];
@@ -2111,5 +2110,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     );
     let down_reason = if trapped { scan::reply::DOWN_TRAPPED } else { scan::reply::DOWN_BRINGUP };
     clock_release(&ctx, lease);
-    serve_radio(&ctx, &h, &mut window, radio, down_reason)
+    let mut bcm = radio.map(|s| bcm::Bcm::new(&h, &mut window, s));
+    serve_radio(&ctx, &h, bcm.as_mut().map(|b| b as &mut dyn Station), down_reason)
 }

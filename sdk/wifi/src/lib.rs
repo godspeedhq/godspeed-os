@@ -11,7 +11,9 @@
 //!
 //! - [`crypto`]: SHA-1, HMAC, PBKDF2, the 802.11 PRF, AES-128 and the RFC 3394 key unwrap, each checked
 //!   against its published vector at start.
-//! - [`eapol`]: the WPA2 four-way handshake and the group-key rekey, run by the HOST on every radio.
+//! - [`eapol`]: EAPOL-Key frames - recognised, signed, verified, unwrapped.
+//! - [`supplicant`]: the WPA2 four-way handshake and the group-key rekey, run by the HOST on every radio,
+//!   over the [`supplicant::KeyPath`] each radio supplies.
 //! - [`keyfile`]: the credentials a join earned, kept in `/wifi.keys` across a restart.
 //! - [`station`]: the [`station::Station`] trait - what the serve loop asks of a radio - and the types it
 //!   speaks in; [`bss`] (a scan's networks and their wire records) and [`rxq`] (received frames) with it.
@@ -46,4 +48,5 @@ pub mod keyfile;
 pub mod rxq;
 pub mod sdio;
 pub mod station;
+pub mod supplicant;
 pub mod wire;
