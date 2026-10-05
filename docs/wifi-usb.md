@@ -162,12 +162,21 @@ download disabled whatever happened; then the chip's checksum report, `READY` se
 starts from RAM, and `WINT_INIT_READY` - the firmware's own word that it runs. The download is tried up to
 six times, `rtl8xxxu_init_device`'s figure.
 
-**Where it departs from Linux, on purpose:** `rtl8xxxu` sets up the reserved pages and queue priority
-before the download when the MAC was cold; `rtlwifi` does not, and neither treats them as the download's
-prerequisite, so R2 does the download straight after the power-on and leaves those to R3 with the rest of
-the MAC's setup.
+**The transmit queues come first - corrected the same day.** As first written, this section said R2 could
+skip the page reservation and queue priority `rtl8xxxu` sets before the download, "since `rtlwifi` does not
+set them before the download either". That was asserted, not read, and it is false: `rtlwifi`'s
+`_rtl92cu_init_mac` does the power-on, the link-list table, the page reservation and the queue priority,
+and runs BEFORE `rtl92c_download_fw`. Both drivers set the queues up first, so R2 does too, in
+`rtl8xxxu`'s order and before it reached a board: whether the MAC is cold, and which transmit queues the
+dongle's endpoints serve (`NORMAL_SIE_EP_TX`, or the bulk OUT endpoints in its configuration descriptor where
+that reads 0), are asked BEFORE the power-on; after it, a cold MAC gets its 0xF8 pages reserved
+(`RQPN`), every MAC gets the queue priority (`TRXDMA_CTRL`) and the receive FIFO's boundary (0x27FF). The
+values are `rtl_queues.rs`, pure and host-tested against `rtl8xxxu`'s own examples (`0x80E9020C`, `0xF5F0`).
+`rtl8xxxu` builds the link-list table after the firmware rather than before it, as `rtlwifi` does; that is
+left to R3 with the rest of the MAC's setup.
 
-Its prediction, after R1's lines: `firmware rtl8192cufw_TMSC.bin VERIFIES - signature 0x88c1, version 88.2,
+Its prediction, after R1's lines: `the MAC is cold; transmit queues: ...` before the power-on, `transmit queues set
+up` after it, then `firmware rtl8192cufw_TMSC.bin VERIFIES - signature 0x88c1, version 88.2,
 16094 bytes of code`, then `firmware downloaded - 126 blocks`, then `the firmware is RUNNING - MCU_FW_DL=...`
 with bit 6 (`WINT_INIT_READY`) set.
 

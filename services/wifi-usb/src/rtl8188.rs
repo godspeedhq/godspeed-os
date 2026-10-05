@@ -14,6 +14,7 @@ use godspeed_sdk::ServiceContext;
 use godspeed_wifi::usbfn;
 
 use crate::host;
+use crate::rtl_queues::{self, TxQueues};
 
 /// The register access (`rtl8xxxu_read32` and friends): vendor request 0x05, register in `wValue`.
 const VENDOR_REQ: u8 = 0x05;
@@ -104,6 +105,16 @@ const REG_CR: u16 = 0x0100;
 const REG_APSD_CTRL: u16 = 0x0600;
 const REG_USB_UNDOCUMENTED: u16 = 0xFE10;
 const REG_MCU_FW_DL: u16 = 0x0080;
+const REG_TRXDMA_CTRL: u16 = 0x010C;
+const REG_TRXFF_BNDY: u16 = 0x0114;
+const REG_RQPN: u16 = 0x0200;
+const REG_RQPN_NPQ: u16 = 0x0214;
+const REG_NORMAL_SIE_EP_TX: u16 = 0xFE66;
+/// The MAC's clock in `SYS_CLKR` (`SYS_CLK_MAC_CLK_ENABLE`), and the value `CR` reads on a MAC never set up.
+const SYS_CLK_MAC_CLK_ENABLE: u16 = 1 << 11;
+const CR_COLD: u8 = 0xEA;
+/// The receive FIFO's boundary, `trxff_boundary` for this family, written at `TRXFF_BNDY + 2`.
+const RX_BOUNDARY: u16 = 0x27FF;
 /// `MCU_FW_DL` bits (`rtl8xxxu_regs.h`).
 const MCU_FW_DL_ENABLE: u32 = 1 << 0;
 const MCU_FW_DL_READY: u32 = 1 << 1;
@@ -217,6 +228,73 @@ pub fn read_efuse(ctx: &ServiceContext) -> Result<Efuse, &'static str> {
 
 pub fn efuse_id_ok(e: &Efuse) -> bool {
     e.id == EFUSE_ID
+}
+
+/// Whether the MAC is COLD - never set up since power came on - asked BEFORE the power-on, as
+/// `rtl8xxxu_init_device` asks it: `CR` reading `0xEA`, or the MAC's clock off. A cold MAC has its page
+/// reservation written; a warm one keeps what it has.
+pub fn mac_is_cold(ctx: &ServiceContext) -> Result<bool, &'static str> {
+    Ok(read8(ctx, REG_CR)? == CR_COLD || read16(ctx, REG_SYS_CLKR)? & SYS_CLK_MAC_CLK_ENABLE == 0)
+}
+
+/// The dongle's transmit queues (`rtl8xxxu_config_endpoints_sie`): from `NORMAL_SIE_EP_TX`, or, where that
+/// reads nothing, from the count of bulk OUT endpoints in its configuration descriptor - asked of the dongle
+/// with a standard `GET_DESCRIPTOR` through the host. The queues, and the endpoint count when it was needed.
+pub fn tx_queues(ctx: &ServiceContext) -> Result<(TxQueues, Option<u8>), &'static str> {
+    let q = rtl_queues::from_sie(read16(ctx, REG_NORMAL_SIE_EP_TX)?);
+    if q.count() > 0 {
+        return Ok((q, None));
+    }
+    let n = rtl_queues::out_endpoints(&config_descriptor(ctx)?);
+    rtl_queues::from_out_endpoints(n)
+        .map(|q| (q, Some(n)))
+        .ok_or("the dongle reports no transmit queue and declares no bulk OUT endpoint")
+}
+
+/// The configuration descriptor, whole (up to `CONTROL_MAX`): `GET_DESCRIPTOR(CONFIGURATION, 0)`, a standard
+/// request every USB device answers, asked twice - nine bytes for its total length, then the total.
+fn config_descriptor(ctx: &ServiceContext) -> Result<[u8; usbfn::CONTROL_MAX], &'static str> {
+    let mut out = [0u8; usbfn::CONTROL_MAX];
+    let head = control_in(ctx, [0x80, 0x06, 0x00, 0x02, 0, 0, 9, 0], &mut out)?;
+    if head < 4 {
+        return Err("the configuration descriptor's header came back short");
+    }
+    let total = (u16::from_le_bytes([out[2], out[3]]) as usize).min(usbfn::CONTROL_MAX);
+    let [lo, hi] = (total as u16).to_le_bytes();
+    control_in(ctx, [0x80, 0x06, 0x00, 0x02, 0, 0, lo, hi], &mut out)?;
+    Ok(out)
+}
+
+/// One control transfer IN with the given setup packet; the bytes returned are copied into `out`.
+fn control_in(ctx: &ServiceContext, setup: [u8; 8], out: &mut [u8]) -> Result<usize, &'static str> {
+    let mut req = [0u8; 9];
+    req[0] = usbfn::OP_CONTROL;
+    req[1..9].copy_from_slice(&setup);
+    let r = host(ctx, &req)?;
+    let p = r.payload_bytes();
+    match (p.first().copied(), p.get(1).copied()) {
+        (Some(usbfn::OP_CONTROL), Some(usbfn::ST_OK)) => {
+            let n = (p.len() - 2).min(out.len());
+            out[..n].copy_from_slice(&p[2..2 + n]);
+            Ok(n)
+        }
+        _ => Err("a standard request to the dongle did not complete"),
+    }
+}
+
+/// The transmit queues set up, after the power-on and BEFORE the firmware download, as both Linux drivers
+/// order it (`rtl8xxxu_init_device`; `rtlwifi`'s `_rtl92cu_init_mac` runs before `rtl92c_download_fw` too):
+/// the page reservation on a cold MAC, the queue priority, and the receive FIFO's boundary.
+pub fn init_queues(ctx: &ServiceContext, q: TxQueues, cold: bool) -> Result<(), &'static str> {
+    if cold {
+        let (npq, rqpn) = rtl_queues::reserved_pages(q);
+        write32(ctx, REG_RQPN_NPQ, npq)?;
+        write32(ctx, REG_RQPN, rqpn)?;
+    }
+    let old = read16(ctx, REG_TRXDMA_CTRL)?;
+    let p = rtl_queues::priority(q, old).ok_or("no queue priority for this set of transmit queues")?;
+    write16(ctx, REG_TRXDMA_CTRL, p)?;
+    write16(ctx, REG_TRXFF_BNDY + 2, RX_BOUNDARY)
 }
 
 /// `rtl8xxxu_reset_8051`: the 8051 held and released - `RSV_CTRL + 1` bit 0 and the CPU enable, off then on.

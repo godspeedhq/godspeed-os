@@ -489,3 +489,12 @@ rtl8xxxu_download_firmware         # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h)
 rtl8xxxu_load_firmware             # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
 rtl8xxxu_reset_8051                # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
 rtl8xxxu_start_firmware            # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+RQPN_LOAD                          # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl8xxxu_config_endpoints_no_sie   # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl8xxxu_config_endpoints_sie      # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl8xxxu_init_queue_priority       # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl8xxxu_init_queue_reserved_page  # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl92c_download_fw                 # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+trxff_boundary                     # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+TX_TOTAL_PAGE_NUM                  # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+GET_DESCRIPTOR                     # the USB standard request (USB 2.0 9.4.3), cited by wifi-usb for the dongle's configuration descriptor - external

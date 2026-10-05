@@ -30,6 +30,7 @@ use godspeed_wifi::usbfn;
 
 mod rtl8188;
 mod rtl_fw;
+mod rtl_queues;
 
 /// The 8051's firmware, embedded (`build.rs`, `nonfree/rtl8192cu/PROVENANCE`), and the hash the build measured
 /// on disk, which `bring_up` recomputes over what the binary actually holds.
@@ -147,6 +148,27 @@ fn bring_up(ctx: &ServiceContext) {
             return;
         }
     }
+    // Asked BEFORE the power-on, as Linux asks them: whether the MAC is cold, and which transmit queues the
+    // dongle's endpoints serve - both decide how the queues are set up after it (R2).
+    let (cold, queues) = match (rtl8188::mac_is_cold(ctx), rtl8188::tx_queues(ctx)) {
+        (Ok(c), Ok((q, eps))) => {
+            ctx.log_fmt(format_args!(
+                "wifi-usb: the MAC is {}; transmit queues: high {}, normal {}, low {} ({})",
+                if c { "cold" } else { "warm - set up since power came on" },
+                q.high, q.normal, q.low,
+                match eps {
+                    None => "from NORMAL_SIE_EP_TX",
+                    Some(_) => "NORMAL_SIE_EP_TX read 0 - from the bulk OUT endpoints in its configuration descriptor",
+                }));
+            (c, q)
+        }
+        (c, q) => {
+            ctx.log_fmt(format_args!(
+                "wifi-usb: could not read the MAC's state or the dongle's queues - {}",
+                c.err().or(q.err()).unwrap_or("?")));
+            return;
+        }
+    };
     let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
     match rtl8188::power_on(ctx) {
         Ok(cr) => ctx.log_fmt(format_args!(
@@ -156,6 +178,11 @@ fn bring_up(ctx: &ServiceContext) {
             return;
         }
     }
+    if let Err(why) = rtl8188::init_queues(ctx, queues, cold) {
+        ctx.log_fmt(format_args!("wifi-usb: the transmit queues were not set up - {}", why));
+        return;
+    }
+    ctx.log("wifi-usb: transmit queues set up - priority, the receive boundary, and the page reservation where the MAC was cold");
     firmware(ctx);
 }
 

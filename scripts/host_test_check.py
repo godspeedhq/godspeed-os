@@ -28,6 +28,8 @@ FILES = [
     # The RTL8188CUS firmware file: its header, its hash, and the page/block plan of its download
     # (docs/wifi-usb.md, R2).
     "services/wifi-usb/src/rtl_fw.rs",
+    # Its transmit queues: the endpoint-to-queue map, the page reservation and the priority word (R2).
+    "services/wifi-usb/src/rtl_queues.rs",
 ]
 
 
