@@ -324,9 +324,14 @@ Every card ran one change and its written prediction; the network names stay in 
 - **A lost link is `SM_DISCONNECT_IND`** - reason 1 for the unread link, 0 for the host's own `radio off`
   (section 9's question).
 
+- **The cable always wins, both ways** - with a `ping` running, the cable in took the link at once
+  (`the cable carries the link; the radio stands by`, a new lease on the wired network, 21 ms) and the
+  cable out gave it back to the radio (a new lease on the radio's network, 24 ms), several times over.
+  A switch costs one or two pings: 37 answered and 9 lost across them. The radio stays joined while the
+  cable carries the frames, read by the loop's own pull, so a rekey is answered either way.
+
 Still open: **V7**, a group rekey answered on this radio, which needs the board joined past the access
-point's rekey interval; the cable-pull test (the cable taking the link back from the radio); and section
-9's clock question.
+point's rekey interval; and section 9's clock question.
 
 ## 5. The AIC8800 bus and the firmware upload
 
