@@ -212,3 +212,34 @@ host its board has.
 **Why it was not built unattended:** it is the driver that carries the keyboard and the disk on the Pi 4,
 the VisionFive and both PCs, hardware-verified on all four, and the dongle path cannot be shown in QEMU. It
 is a card per board with the operator present.
+
+## 8. R3a (2026-10-05): the MAC, the baseband and the RF, tuned to one channel - built, NOT YET RUN
+
+R3 is two cards. **R3a** is everything `rtl8xxxu_init_device` does after the firmware that bears on
+receiving, `rtl8xxxu_start`'s RF enable, filters and gain, and `rtl8xxxu_gen1_config_channel` for channel 1
+at 20 MHz - register writes only, all in `wifi-usb`, nothing in `dwc2`. **R3b** is the bulk IN path in `dwc2`
+(its own host channel and buffer, armed in the background and harvested on the USB interrupt, with a notice
+to `wifi-usb` as the binding has) and the receive descriptor: beacons. R3b waits for R1 and R2 to run.
+
+**The tables are generated, not typed.** `rtl_tables.rs` was produced by a script that reads each table from
+Linux's source between its declaration and its terminator: the MAC defaults (87 entries), the 1T baseband
+(186), the standard AGC (160) and RF path A (141, four of them 50 ms pauses), duplicates kept, every entry in
+order, the source files' SHA-256 in its header.
+
+**Written from the source, function by function** - after R2's correction, nothing here rests on a summary:
+`rtl8xxxu_init_mac` (and `MAX_AGGR_NUM`), `rtl8xxxu_gen1_init_phy_bb`, `rtl8xxxu_init_phy_rf` with
+`rtl8xxxu_init_rf_regs`, `rtl8xxxu_write_rfreg` and `rtl8xxxu_read_rfreg` (path A, LSSI and HSSI), the switch
+words (0x870 = 0x07000760, 0x860), the transmit boundaries, `PBP`, `rtl8xxxu_init_llt_table` (pure and
+host-tested in `rtl_queues.rs`), `rtl8xxxu_gen1_usb_quirks`, the receive configuration (`RCR` without the
+BSSID checks, so any network's beacons pass), aggregation off, CCK and OFDM on, `rtl8723a_phy_lc_calibrate`,
+`rtl8xxxu_gen1_enable_rf`, the receive filter maps and gain.
+
+**Left out, on purpose, and why:** the transmit power, the response rate set and retry limits, the EDCA, ACK
+and beacon timings (transmit, which R5 needs and R3 does not), the IQ calibration (it improves image
+rejection and EVM; the baseband table loads default matrices, and a 1 Mb/s beacon does not need it), and the
+thermal meter.
+
+**Its check is the RF chip itself.** After the channel is set, `RF_MODE_AG` is read back through the HSSI
+path - the one register that only a working RF serial interface can answer - and its channel field must read
+1. Prediction, after R2's lines: `MAC, baseband and RF set up in ... ms (137 RF registers); RF_MODE_AG reads
+0x.....  - channel 1, as asked`. A wrong channel, or all ones, says the RF path is not answering.

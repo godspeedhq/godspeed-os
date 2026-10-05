@@ -103,6 +103,26 @@ pub fn priority(q: TxQueues, old: u16) -> Option<u16> {
     Some((old & 0x7) | (m.0 << 4) | (m.1 << 6) | (m.2 << 8) | (m.3 << 10) | (m.4 << 12) | (m.5 << 14))
 }
 
+/// The link-list table (`rtl8xxxu_init_llt_table`), as (entry, next) pairs in the order written: the transmit
+/// pages chained `0..TOTAL_PAGES`, the last of them ending the chain (`0xFF`), and every page after it a ring
+/// for the receive buffer, the last entry pointing back to the ring's first.
+pub fn llt_entries() -> impl Iterator<Item = (u8, u8)> {
+    let last_tx = TOTAL_PAGES as u16;
+    let last_entry: u16 = 255;
+    (0..=last_entry).map(move |i| {
+        let next = if i < last_tx {
+            i + 1
+        } else if i == last_tx {
+            0xFF
+        } else if i < last_entry {
+            i + 1
+        } else {
+            last_tx + 1
+        };
+        (i as u8, next as u8)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +146,21 @@ mod tests {
         assert_eq!(reserved_pages(all), (0x02, 0x80E7_020C));
         assert_eq!(priority(all, 0), Some((3 << 4) | (2 << 6) | (1 << 8) | (1 << 10) | (3 << 12) | (3 << 14)));
         assert_eq!(priority(TxQueues { high: false, normal: false, low: false }, 0), None);
+    }
+
+    #[test]
+    fn the_link_list_table() {
+        let mut e = [(0u8, 0u8); 256];
+        for (i, x) in llt_entries().enumerate() {
+            e[i] = x;
+        }
+        assert_eq!(llt_entries().count(), 256);
+        assert_eq!(e[0], (0x00, 0x01));
+        assert_eq!(e[0xF7], (0xF7, 0xF8));
+        assert_eq!(e[0xF8], (0xF8, 0xFF));
+        assert_eq!(e[0xF9], (0xF9, 0xFA));
+        assert_eq!(e[0xFE], (0xFE, 0xFF));
+        assert_eq!(e[0xFF], (0xFF, 0xF9));
     }
 
     #[test]

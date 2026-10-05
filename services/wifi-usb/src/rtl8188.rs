@@ -15,6 +15,7 @@ use godspeed_wifi::usbfn;
 
 use crate::host;
 use crate::rtl_queues::{self, TxQueues};
+use crate::rtl_tables;
 
 /// The register access (`rtl8xxxu_read32` and friends): vendor request 0x05, register in `wValue`.
 const VENDOR_REQ: u8 = 0x05;
@@ -295,6 +296,270 @@ pub fn init_queues(ctx: &ServiceContext, q: TxQueues, cold: bool) -> Result<(), 
     let p = rtl_queues::priority(q, old).ok_or("no queue priority for this set of transmit queues")?;
     write16(ctx, REG_TRXDMA_CTRL, p)?;
     write16(ctx, REG_TRXFF_BNDY + 2, RX_BOUNDARY)
+}
+
+// ---- R3a: the MAC, the baseband and the RF, after the firmware (`rtl8xxxu_init_device`, then
+// `rtl8xxxu_start`, then `rtl8xxxu_gen1_config_channel`). Registers by Linux's names (`rtl8xxxu_regs.h`). ----
+const REG_LDOA15_CTRL: u16 = 0x0020;
+const REG_AFE_XTAL_CTRL: u16 = 0x0024;
+const REG_AFE_PLL_CTRL: u16 = 0x0028;
+const REG_RF_CTRL: u16 = 0x001F;
+const REG_LEDCFG2: u16 = 0x004E;
+const REG_PBP: u16 = 0x0104;
+const REG_LLT_INIT: u16 = 0x01E0;
+const REG_TDECTRL: u16 = 0x0208;
+const REG_TXDMA_OFFSET_CHK: u16 = 0x020C;
+const REG_HIMR: u16 = 0x0120;
+const REG_HISR: u16 = 0x0124;
+const REG_HWSEQ_CTRL: u16 = 0x0423;
+const REG_TXPKTBUF_BCNQ_BDNY: u16 = 0x0424;
+const REG_TXPKTBUF_MGQ_BDNY: u16 = 0x0425;
+const REG_TXPKTBUF_WMAC_LBK_BF_HD: u16 = 0x045D;
+const REG_FAST_EDCA_CTRL: u16 = 0x0460;
+const REG_MAX_AGGR_NUM: u16 = 0x04CA;
+const REG_BAR_MODE_CTRL: u16 = 0x04CC;
+const REG_SIFS_CCK: u16 = 0x0514;
+const REG_SIFS_OFDM: u16 = 0x0516;
+const REG_TXPAUSE: u16 = 0x0522;
+const REG_BW_OPMODE: u16 = 0x0603;
+const REG_RCR: u16 = 0x0608;
+const REG_RX_DRVINFO_SZ: u16 = 0x060F;
+const REG_MAR: u16 = 0x0620;
+const REG_R2T_SIFS: u16 = 0x063C;
+const REG_T2T_SIFS: u16 = 0x063E;
+const REG_CAM_CMD: u16 = 0x0670;
+const REG_RXFLTMAP0: u16 = 0x06A0;
+const REG_RXFLTMAP2: u16 = 0x06A4;
+const REG_FPGA0_RF_MODE: u16 = 0x0800;
+const REG_FPGA0_TX_INFO: u16 = 0x0804;
+const REG_FPGA0_XA_HSSI_PARM1: u16 = 0x0820;
+const REG_FPGA0_XA_HSSI_PARM2: u16 = 0x0824;
+const REG_FPGA0_XA_LSSI_PARM: u16 = 0x0840;
+const REG_FPGA0_XA_RF_INT_OE: u16 = 0x0860;
+const REG_FPGA0_XA_RF_SW_CTRL: u16 = 0x0870;
+const REG_FPGA0_XAB_RF_PARM: u16 = 0x0878;
+const REG_FPGA0_ANALOG2: u16 = 0x0884;
+const REG_FPGA0_XA_LSSI_READBACK: u16 = 0x08A0;
+const REG_HSPI_XA_READBACK: u16 = 0x08B8;
+const REG_FPGA1_RF_MODE: u16 = 0x0900;
+const REG_OFDM0_TRX_PATH_ENABLE: u16 = 0x0C04;
+const REG_OFDM0_XA_AGC_CORE1: u16 = 0x0C50;
+const REG_OFDM1_LSTF: u16 = 0x0D00;
+const REG_RX_WAIT_CCA: u16 = 0x0E70;
+const REG_USB_SPECIAL_OPTION: u16 = 0xFE55;
+/// RF registers (`RF6052_REG_*`): the mode and channel word, and the receive/transmit mode.
+const RF_MODE_AG: u8 = 0x18;
+const RF_AC: u8 = 0x00;
+/// The bits of `RF_MODE_AG` a channel and a 20 MHz width occupy (`MODE_AG_CHANNEL_MASK`, `MODE_AG_BW_MASK`).
+pub const RF_CHANNEL_MASK: u32 = 0x3FF;
+const RF_BW_MASK: u32 = (1 << 10) | (1 << 11);
+const RF_BW_20MHZ: u32 = 1 << 10;
+/// The receive configuration while scanning (`init_device`'s `RCR`): accept frames to us, multicast,
+/// broadcast and management, append the PHY status and the decryption results - and NOT the BSSID checks, so
+/// any network's beacons pass.
+const RCR_SCAN: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 13) | (1 << 14) | (1 << 28) | (1 << 29) | (1 << 30);
+/// The RF table's pseudo-register for a 50 ms pause (`rtl8xxxu_init_rf_regs`); the others are unused by this table.
+const RF_TABLE_PAUSE_50MS: u8 = 0xFE;
+
+fn set32(ctx: &ServiceContext, reg: u16, set: u32, clear: u32) -> Result<(), &'static str> {
+    let v = read32(ctx, reg)?;
+    write32(ctx, reg, (v & !clear) | set)
+}
+
+/// One RF register on path A (`rtl8xxxu_write_rfreg`): address and 20 bits of data through the LSSI parameter
+/// register, which serialises them to the RF chip. No read-back, as Linux.
+pub fn write_rf(ctx: &ServiceContext, reg: u8, data: u32) -> Result<(), &'static str> {
+    write32(ctx, REG_FPGA0_XA_LSSI_PARM, ((reg as u32) << 20) | (data & 0xF_FFFF))?;
+    delay::hold(ctx, Budget::us(1));
+    Ok(())
+}
+
+/// One RF register on path A read back (`rtl8xxxu_read_rfreg`): the address put in HSSI parameter 2 with an
+/// edge on its read bit, then the value from the HSPI or the LSSI read-back register, as parameter 1 says.
+pub fn read_rf(ctx: &ServiceContext, reg: u8) -> Result<u32, &'static str> {
+    let hssia = read32(ctx, REG_FPGA0_XA_HSSI_PARM2)?;
+    let v = (hssia & !0x7F80_0000) | ((reg as u32) << 23) | (1 << 31);
+    write32(ctx, REG_FPGA0_XA_HSSI_PARM2, hssia & !(1 << 31))?;
+    delay::hold(ctx, Budget::us(10));
+    write32(ctx, REG_FPGA0_XA_HSSI_PARM2, v)?;
+    delay::hold(ctx, Budget::us(100));
+    write32(ctx, REG_FPGA0_XA_HSSI_PARM2, hssia | (1 << 31))?;
+    delay::hold(ctx, Budget::us(10));
+    let from = if read32(ctx, REG_FPGA0_XA_HSSI_PARM1)? & (1 << 8) != 0 { REG_HSPI_XA_READBACK } else { REG_FPGA0_XA_LSSI_READBACK };
+    Ok(read32(ctx, from)? & 0xF_FFFF)
+}
+
+/// `rtl8xxxu_gen1_init_phy_bb`, then the 1T tables: the PLL, the baseband out of reset, the RF gate open, the
+/// RF enabled, the baseband and AGC tables, the LDO.
+fn init_phy_bb(ctx: &ServiceContext) -> Result<(), &'static str> {
+    let p = read8(ctx, REG_AFE_PLL_CTRL)?;
+    delay::hold(ctx, Budget::us(2));
+    write8(ctx, REG_AFE_PLL_CTRL, p | (1 << 1))?;
+    delay::hold(ctx, Budget::us(2));
+    write8(ctx, REG_AFE_PLL_CTRL + 1, 0xFF)?;
+    delay::hold(ctx, Budget::us(2));
+    let f = read16(ctx, REG_SYS_FUNC)?;
+    write16(ctx, REG_SYS_FUNC, f | 0x03)?;
+    set32(ctx, REG_AFE_XTAL_CTRL, 0, 1 << 14)?;
+    write8(ctx, REG_RF_CTRL, 0x07)?;
+    for (reg, val) in rtl_tables::PHY_1T.iter().chain(rtl_tables::AGC_STANDARD.iter()) {
+        write32(ctx, *reg, *val)?;
+        delay::hold(ctx, Budget::us(1));
+    }
+    write32(ctx, REG_LDOA15_CTRL, 0x0157_2505)
+}
+
+/// `rtl8xxxu_init_phy_rf` on path A: the RF environment saved, the interface's output enables and its 3-wire
+/// address and data lengths set, the radio table written (its 0xFE entries are 50 ms pauses), the environment
+/// restored. The number of RF registers written.
+fn init_phy_rf(ctx: &ServiceContext) -> Result<usize, &'static str> {
+    let rfenv = read16(ctx, REG_FPGA0_XA_RF_SW_CTRL)? & (1 << 4);
+    set32(ctx, REG_FPGA0_XA_RF_INT_OE, 1 << 20, 0)?;
+    delay::hold(ctx, Budget::us(1));
+    set32(ctx, REG_FPGA0_XA_RF_INT_OE, 1 << 4, 0)?;
+    delay::hold(ctx, Budget::us(1));
+    set32(ctx, REG_FPGA0_XA_HSSI_PARM2, 0, 0x400)?;
+    delay::hold(ctx, Budget::us(1));
+    set32(ctx, REG_FPGA0_XA_HSSI_PARM2, 0, 0x800)?;
+    delay::hold(ctx, Budget::us(1));
+    let mut n = 0usize;
+    for (reg, val) in rtl_tables::RADIO_A_1T.iter() {
+        if *reg == RF_TABLE_PAUSE_50MS {
+            delay::hold_parked(ctx, Budget::ms(50));
+            continue;
+        }
+        write_rf(ctx, *reg, *val)?;
+        n += 1;
+    }
+    let s = read16(ctx, REG_FPGA0_XA_RF_SW_CTRL)?;
+    write16(ctx, REG_FPGA0_XA_RF_SW_CTRL, (s & !(1 << 4)) | rfenv)?;
+    Ok(n)
+}
+
+/// The link-list table, entry by entry, each confirmed by the chip clearing its operation bits.
+fn init_llt(ctx: &ServiceContext) -> Result<(), &'static str> {
+    for (entry, next) in rtl_queues::llt_entries() {
+        write32(ctx, REG_LLT_INIT, (1 << 30) | ((entry as u32) << 8) | next as u32)?;
+        if poll(ctx, REG_LLT_INIT, 4, 20, |v| v & (0x3 << 30) == 0)?.is_none() {
+            return Err("a link-list entry was never taken (LLT_INIT stayed busy)");
+        }
+    }
+    Ok(())
+}
+
+/// `rtl8xxxu_gen1_usb_quirks`: the USB PHY writes Linux makes for the interface's interference, the second
+/// block because this part is not a UMC A-cut.
+fn usb_quirks(ctx: &ServiceContext) -> Result<(), &'static str> {
+    for (a, b) in [(0xE0, 0x8D)] {
+        write8(ctx, 0xFE40, a)?;
+        write8(ctx, 0xFE41, b)?;
+        write8(ctx, 0xFE42, 0x80)?;
+    }
+    write32(ctx, REG_TXDMA_OFFSET_CHK, 0x00FD_0320)?;
+    for (a, b) in [(0xE6, 0x94), (0xE0, 0x19), (0xE5, 0x91), (0xE2, 0x81)] {
+        write8(ctx, 0xFE40, a)?;
+        write8(ctx, 0xFE41, b)?;
+        write8(ctx, 0xFE42, 0x80)?;
+    }
+    Ok(())
+}
+
+/// `rtl8723a_phy_lc_calibrate`: transmit paused, the synthesiser's LC calibration started in `RF_MODE_AG` and
+/// given 100 ms, transmit resumed. (The continuous-transmit branch cannot apply: nothing has transmitted.)
+fn lc_calibrate(ctx: &ServiceContext) -> Result<(), &'static str> {
+    let lstf = read32(ctx, REG_OFDM1_LSTF)?;
+    if lstf & 0x7000_0000 != 0 {
+        return Err("continuous transmit is on before calibration - not a state this driver puts the chip in");
+    }
+    write8(ctx, REG_TXPAUSE, 0xFF)?;
+    let m = read_rf(ctx, RF_MODE_AG)?;
+    write_rf(ctx, RF_MODE_AG, m | 0x0_8000)?;
+    delay::hold_parked(ctx, Budget::ms(100));
+    write8(ctx, REG_TXPAUSE, 0x00)
+}
+
+/// `rtl8xxxu_gen1_enable_rf`: the regulator, the RF parameter word, path A as the transmit path, Japan mode
+/// off, the CCA wait, and RF register 0 into its receive mode.
+fn enable_rf(ctx: &ServiceContext) -> Result<(), &'static str> {
+    let s = read8(ctx, REG_SPS0_CTRL)?;
+    write8(ctx, REG_SPS0_CTRL, s | 0x09)?;
+    set32(ctx, REG_FPGA0_XAB_RF_PARM, 1 << 3, (1 << 4) | (1 << 5))?;
+    set32(ctx, REG_OFDM0_TRX_PATH_ENABLE, 1 << 4, 0xF0)?;
+    set32(ctx, REG_FPGA0_RF_MODE, 0, 1 << 1)?;
+    write32(ctx, REG_RX_WAIT_CCA, 0x631B_25A0)?;
+    write_rf(ctx, RF_AC, 0x3_2D95)?;
+    write8(ctx, REG_TXPAUSE, 0x00)
+}
+
+/// `rtl8xxxu_gen1_config_channel` for a 20 MHz HT channel: the band width registers, the channel into
+/// `RF_MODE_AG`, the SIFS timings, the 20 MHz bit. `channel` is 1 to 14.
+pub fn set_channel(ctx: &ServiceContext, channel: u8) -> Result<(), &'static str> {
+    let o = read8(ctx, REG_BW_OPMODE)?;
+    write8(ctx, REG_BW_OPMODE, o | (1 << 2))?;
+    set32(ctx, REG_FPGA0_RF_MODE, 0, 1 << 0)?;
+    set32(ctx, REG_FPGA1_RF_MODE, 0, 1 << 0)?;
+    set32(ctx, REG_FPGA0_ANALOG2, 1 << 10, 0)?;
+    let m = read_rf(ctx, RF_MODE_AG)?;
+    write_rf(ctx, RF_MODE_AG, (m & !RF_CHANNEL_MASK) | channel as u32)?;
+    write8(ctx, REG_SIFS_CCK + 1, 0x0E)?;
+    write8(ctx, REG_SIFS_OFDM + 1, 0x0E)?;
+    write16(ctx, REG_R2T_SIFS, 0x0808)?;
+    write16(ctx, REG_T2T_SIFS, 0x0A0A)?;
+    let m = read_rf(ctx, RF_MODE_AG)?;
+    write_rf(ctx, RF_MODE_AG, (m & !RF_BW_MASK) | RF_BW_20MHZ)
+}
+
+/// R3a: everything `rtl8xxxu_init_device` does after the firmware that bears on RECEIVING, then
+/// `rtl8xxxu_start`'s RF enable, filters and gain, then `channel`. Left out, and recorded in
+/// `docs/wifi-usb.md`: the transmit side (power, the response rate set and retry limits, the EDCA, ACK and
+/// beacon timings), the IQ calibration and the thermal meter - none decides whether a beacon is heard.
+/// `RF_MODE_AG` read back after the channel is set, for the caller to check.
+pub fn init_radio(ctx: &ServiceContext, cold: bool, channel: u8) -> Result<(usize, u32), &'static str> {
+    for (reg, val) in rtl_tables::MAC_INIT.iter() {
+        write8(ctx, *reg, *val)?;
+    }
+    write8(ctx, REG_MAX_AGGR_NUM, 0x0A)?;
+    init_phy_bb(ctx)?;
+    let rf = init_phy_rf(ctx)?;
+    write32(ctx, REG_FPGA0_TX_INFO, 0x0000_0003)?;
+    // The T/R and antenna switches, and the PA enable (`no_pape` is 0 for this part): 0x07000760.
+    write32(ctx, REG_FPGA0_XA_RF_SW_CTRL, 0x0700_0760)?;
+    write32(ctx, REG_FPGA0_XA_RF_INT_OE, 0x66F6_0210)?;
+    if cold {
+        for reg in [REG_TXPKTBUF_BCNQ_BDNY, REG_TXPKTBUF_MGQ_BDNY, REG_TXPKTBUF_WMAC_LBK_BF_HD, REG_TRXFF_BNDY, REG_TDECTRL + 1] {
+            write8(ctx, reg, 0xF9)?;
+        }
+    }
+    write8(ctx, REG_PBP, 0x11)?;
+    if cold {
+        init_llt(ctx)?;
+        usb_quirks(ctx)?;
+    }
+    write8(ctx, REG_RX_DRVINFO_SZ, 4)?;
+    write32(ctx, REG_HISR, 0xFFFF_FFFF)?;
+    write32(ctx, REG_HIMR, 0xFFFF_FFFF)?;
+    write32(ctx, REG_RCR, RCR_SCAN)?;
+    write32(ctx, REG_MAR, 0xFFFF_FFFF)?;
+    write32(ctx, REG_MAR + 4, 0xFFFF_FFFF)?;
+    // Receive aggregation OFF (`rtl8xxxu_gen1_init_aggregation`, its default): one frame per bulk transfer.
+    let u = read8(ctx, REG_USB_SPECIAL_OPTION)?;
+    write8(ctx, REG_USB_SPECIAL_OPTION, u & !(1 << 3))?;
+    let t = read8(ctx, REG_TRXDMA_CTRL)?;
+    write8(ctx, REG_TRXDMA_CTRL, t & !(1 << 2))?;
+    set32(ctx, REG_FPGA0_RF_MODE, (1 << 24) | (1 << 25), 0)?;
+    write32(ctx, REG_CAM_CMD, (1 << 31) | (1 << 30))?;
+    let l = read8(ctx, REG_LEDCFG2)?;
+    write8(ctx, REG_LEDCFG2, l | (1 << 7))?;
+    write8(ctx, REG_HWSEQ_CTRL, 0xFF)?;
+    write32(ctx, REG_BAR_MODE_CTRL, 0x0201_FFFF)?;
+    write16(ctx, REG_FAST_EDCA_CTRL, 0)?;
+    lc_calibrate(ctx)?;
+    enable_rf(ctx)?;
+    write16(ctx, REG_RXFLTMAP2, 0xFFFF)?;
+    write16(ctx, REG_RXFLTMAP0, 0xFFFF)?;
+    set32(ctx, REG_OFDM0_XA_AGC_CORE1, 0x1E, 0x7F)?;
+    set_channel(ctx, channel)?;
+    Ok((rf, read_rf(ctx, RF_MODE_AG)?))
 }
 
 /// `rtl8xxxu_reset_8051`: the 8051 held and released - `RSV_CTRL + 1` bit 0 and the CPU enable, off then on.

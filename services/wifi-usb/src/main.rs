@@ -31,6 +31,7 @@ use godspeed_wifi::usbfn;
 mod rtl8188;
 mod rtl_fw;
 mod rtl_queues;
+mod rtl_tables;
 
 /// The 8051's firmware, embedded (`build.rs`, `nonfree/rtl8192cu/PROVENANCE`), and the hash the build measured
 /// on disk, which `bring_up` recomputes over what the binary actually holds.
@@ -183,24 +184,43 @@ fn bring_up(ctx: &ServiceContext) {
         return;
     }
     ctx.log("wifi-usb: transmit queues set up - priority, the receive boundary, and the page reservation where the MAC was cold");
-    firmware(ctx);
+    if !firmware(ctx) {
+        return;
+    }
+    // R3a: the MAC, the baseband and the RF set up, tuned to one channel, and the channel read back out of
+    // the RF chip itself - the one register here that only a working RF path can answer.
+    let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
+    match rtl8188::init_radio(ctx, cold, FIRST_CHANNEL) {
+        Ok((rf, mode)) => {
+            let on = (mode & rtl8188::RF_CHANNEL_MASK) as u8;
+            ctx.log_fmt(format_args!(
+                "wifi-usb: MAC, baseband and RF set up in {} ms ({} RF registers); RF_MODE_AG reads {:#07x} - channel {}{}",
+                clock.elapsed_us() / 1000, rf, mode, on,
+                if on == FIRST_CHANNEL { ", as asked; R3a done, no frames yet (R3b, docs/wifi-usb.md)" } else { " - NOT the channel asked for" }));
+        }
+        Err(why) => ctx.log_fmt(format_args!("wifi-usb: the radio's set-up stopped - {}", why)),
+    }
 }
+
+/// The channel R3a tunes to: 1, the first in every regulatory domain, so a beacon heard on it proves the
+/// receive path without a scan.
+const FIRST_CHANNEL: u8 = 1;
 
 /// R2: the embedded firmware checked, its header read, downloaded (up to `DOWNLOAD_TRIES` times, as Linux
 /// tries), and started; the chip's own `WINT_INIT_READY` is the word that it runs.
-fn firmware(ctx: &ServiceContext) {
+fn firmware(ctx: &ServiceContext) -> bool {
     let fnv = rtl_fw::fnv1a(FIRMWARE);
     if fnv != FIRMWARE_FNV {
         ctx.log_fmt(format_args!(
             "wifi-usb: the embedded firmware does NOT match the file the build read (fnv {:#010x}, the build measured {:#010x}) - not downloading it",
             fnv, FIRMWARE_FNV));
-        return;
+        return false;
     }
     let h = match rtl_fw::header(FIRMWARE) {
         Ok(h) => h,
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the embedded firmware is refused - {}", why));
-            return;
+            return false;
         }
     };
     ctx.log_fmt(format_args!(
@@ -217,7 +237,7 @@ fn firmware(ctx: &ServiceContext) {
                 "wifi-usb: the download stopped ({}) - try {} of {}", why, tries, DOWNLOAD_TRIES)),
             Err(why) => {
                 ctx.log_fmt(format_args!("wifi-usb: the download did not complete in {} tries - {}", tries, why));
-                return;
+                return false;
             }
         }
     };
@@ -225,9 +245,14 @@ fn firmware(ctx: &ServiceContext) {
         "wifi-usb: firmware downloaded - {} blocks of up to {} bytes in {} ms ({} {})",
         blocks, rtl_fw::BLOCK, clock.elapsed_us() / 1000, tries, if tries == 1 { "try" } else { "tries" }));
     match rtl8188::start_firmware(ctx) {
-        Ok(dl) => ctx.log_fmt(format_args!(
-            "wifi-usb: the firmware is RUNNING - MCU_FW_DL={:#010x}; R2 done, no radio yet (R3, docs/wifi-usb.md)", dl)),
-        Err(why) => ctx.log_fmt(format_args!("wifi-usb: the firmware did not start - {}", why)),
+        Ok(dl) => {
+            ctx.log_fmt(format_args!("wifi-usb: the firmware is RUNNING - MCU_FW_DL={:#010x}; R2 done", dl));
+            true
+        }
+        Err(why) => {
+            ctx.log_fmt(format_args!("wifi-usb: the firmware did not start - {}", why));
+            false
+        }
     }
 }
 

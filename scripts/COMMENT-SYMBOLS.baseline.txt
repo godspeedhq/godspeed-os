@@ -498,3 +498,25 @@ rtl92c_download_fw                 # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, 
 trxff_boundary                     # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
 TX_TOTAL_PAGE_NUM                  # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
 GET_DESCRIPTOR                     # the USB standard request (USB 2.0 9.4.3), cited by wifi-usb for the dongle's configuration descriptor - external
+init_device                        # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+MODE_AG_BW_MASK                    # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+MODE_AG_CHANNEL_MASK               # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+no_pape                            # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8192cu_mac_init_table           # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8192cu_radioa_1t_init_table     # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8723a_phy_1t_init_table         # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8723a_phy_lc_calibrate          # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxx_agc_standard_table         # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_config_channel       # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_enable_rf            # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_init_aggregation     # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_init_phy_bb          # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_usb_quirks           # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_llt_table            # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_mac                  # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_phy_regs             # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_phy_rf               # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_rf_regs              # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_read_rfreg                # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_start                     # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_write_rfreg               # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
