@@ -43,7 +43,8 @@ fn main() {
     // AIC8800D80) sits on a DesignWare `dw_mmc` (docs/wifi-aic8800.md); aarch64 is the Pi 4's Arasan and
     // the CYW43455. On QEMU's `virt` the kernel grants no window, and the service reports no radio.
     println!("cargo::rustc-check-cfg=cfg(wifi_host_dw_mmc, values(none()))");
-    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv64") {
+    let dw_mmc = std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv64");
+    if dw_mmc {
         println!("cargo:rustc-cfg=wifi_host_dw_mmc");
     }
 
@@ -106,9 +107,11 @@ fn main() {
 
     // THE VISIONFIVE'S RADIO, the AIC8800D80 (`docs/wifi-aic8800.md` 5, phase V2): the patch table, the two
     // ROM patches, the extension patch and the full-MAC firmware, embedded for the reason the CYW43455's
-    // are (`firmware.rs`). Only where that radio is driven - the riscv64 build - so the Pi 4's image does
-    // not carry 375 KB it never uploads. Same refusal, same length and hash, read by `aic_fw.rs`.
-    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv64") {
+    // are (`firmware.rs`). Only where that radio is driven - the board fact above, `dw_mmc` - so the Pi 4's
+    // image does not carry 375 KB it never uploads. Same refusal, same length and hash, read by `aic_fw.rs`.
+    // The fact is ASKED once and reused: a second `riscv64` test here raised the shared-surface count
+    // from 2 to 4 (804f317c) for one question already answered.
+    if dw_mmc {
         let dir = workspace.join("nonfree").join("aic8800d80");
         for (var, name) in [
             ("AIC_FW_TABLE", "fw_patch_table_8800d80_u02.bin"),

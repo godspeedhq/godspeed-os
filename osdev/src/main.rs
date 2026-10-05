@@ -458,6 +458,11 @@ const EXTRA_CHECKS: &[&str] = &[
     // `#[cfg(test)]` module in one never runs; this compiles each listed dependency-free file with
     // `rustc --test` and runs it, so a wrong byte offset fails a build instead of costing a flash.
     "scripts/host_test_check.py",
+    // The ratchet on arch-conditional code above the kernel (CLAUDE.md 4.1, the figure of 55). It ran
+    // only in `release.yml`, on a tag, so a rise was caught at release or never: `804f317c` asked
+    // `riscv64` a second time in `services/wifi-driver/build.rs`, took the count to 57, and every
+    // `osdev build` after it passed. A checker on one build path is a checker on none.
+    "scripts/shared_surface_check.py",
 
     // ---- AND THE COMMENTS, which the audit above could not finish ------------------------------
     //
