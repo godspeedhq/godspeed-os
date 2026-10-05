@@ -97,6 +97,10 @@ struct Stats {
     inds: u32,
     data: u32,
     data_dropped: u32,
+    /// Data packets on the running link that `data_to_eth` turned away, and whether the first since the
+    /// join has been shown (`refusal`).
+    data_refused: u32,
+    refusal_shown: bool,
     other: u32,
     tx_bytes: u32,
     rx_bytes: u32,
@@ -123,6 +127,24 @@ fn data_to_eth(pkt: &[u8], out: &mut [u8; ETH_MAX]) -> usize {
         Some(d) => to_ethernet(&d, out),
         None => 0,
     }
+}
+
+/// Why `data_to_eth` turned `pkt` away, for the log. A packet refused here was dropped without a word,
+/// and the first boot with the loop reading the link (2026-10-05 10:23) read ten minutes of a joined
+/// network and queued no frame at all - so every refusal is counted and the first one is shown.
+fn refusal(pkt: &[u8]) -> &'static str {
+    let Some(h) = rx_header(pkt) else { return "shorter than the receive header" };
+    if !h.upload {
+        return "upload flag clear";
+    }
+    if h.mpdu {
+        return "a management frame (mpdu flag)";
+    }
+    let f = &pkt[RX_DATA_HDR.min(pkt.len())..];
+    if f.len() < 24 || f[0] & 0x0c != 0x08 {
+        return "not an 802.11 data frame";
+    }
+    if h.ccmp { "no LLC/SNAP after the CCMP header" } else { "no LLC/SNAP (decr_status did not say CCMP)" }
 }
 
 fn is_eapol(eth: &[u8]) -> bool {
@@ -179,7 +201,8 @@ impl<'a> Aic<'a> {
                     ctx.log_fmt(format_args!("wifi-driver: AIC the firmware reports the link DOWN (SM_DISCONNECT_IND, reason {})", reason));
                 }
             }
-            aic::SCANU_RESULT_IND | aic::SCANU_START_CFM | aic::SCANU_START_CFM_ADDITIONAL => {}
+            aic::SCANU_RESULT_IND | aic::SCANU_START_CFM | aic::SCANU_START_CFM_ADDITIONAL | aic::PER_CHANNEL_IND
+            | aic::JOINED_CHANNEL_OUT | aic::JOINED_CHANNEL_BACK => {}
             _ => ctx.log_fmt(format_args!(
                 "wifi-driver: AIC message {:#06x} ({} parameter bytes) that nothing here waits for - read and left", id, p.len())),
         }
@@ -604,6 +627,7 @@ impl Station for Aic<'_> {
                 }
                 let b = c.bssid;
                 self.assoc = Some(Assoc { bssid: c.bssid, ap_idx: c.ap_idx, freq: c.freq });
+                self.st.refusal_shown = false;
                 ctx.log_fmt(format_args!(
                     "wifi-driver:   ASSOCIATED with {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} at {} MHz (station index {}, AID {})",
                     b[0], b[1], b[2], b[3], b[4], b[5], c.freq, c.ap_idx, c.aid));
@@ -747,11 +771,19 @@ impl Station for Aic<'_> {
             let mut ninds = 0usize;
             let mut queued = 0u32;
             let mut no_room = 0u32;
+            let mut refused = 0u32;
+            let mut first_refused = [0u8; 96];
+            let mut first_refused_len = 0usize;
             aic::walk_packets(&bytes[..n], &mut |p| match p {
                 Packet::Data(pkt) => {
                     let mut eth = [0u8; ETH_MAX];
                     let k = data_to_eth(pkt, &mut eth);
                     if k == 0 {
+                        if refused == 0 {
+                            first_refused_len = pkt.len().min(96);
+                            first_refused[..first_refused_len].copy_from_slice(&pkt[..first_refused_len]);
+                        }
+                        refused += 1;
                         return;
                     }
                     if is_eapol(&eth[..k]) {
@@ -775,6 +807,14 @@ impl Station for Aic<'_> {
             got.data += queued;
             self.st.data += queued;
             self.st.data_dropped += no_room;
+            self.st.data_refused = self.st.data_refused.wrapping_add(refused);
+            if refused > 0 && !self.st.refusal_shown {
+                self.st.refusal_shown = true;
+                let p = &first_refused[..first_refused_len];
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: AIC a received data packet was not handed on - {}; header bytes 32..52 {:02x?}, frame begins {:02x?} (the first since the join; all are counted)",
+                    refusal(p), &p[32.min(p.len())..52.min(p.len())], &p[RX_DATA_HDR.min(p.len())..]));
+            }
             for (mid, w) in inds.iter().take(ninds) {
                 self.note_ind(*mid, &w.to_le_bytes(), ctx);
             }
@@ -840,7 +880,7 @@ impl Station for Aic<'_> {
                 let s = &self.st;
                 let words: [u32; 30] = [
                     s.sent, s.confirmed, s.refused, s.unanswered,
-                    s.msgs, s.inds, s.data, 0, 0, s.other,
+                    s.msgs, s.inds, s.data, s.data_refused, 0, s.other,
                     s.tx_bytes, s.rx_bytes, s.data_dropped,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     s.last_ind, s.last_ind_status, 0, 0,

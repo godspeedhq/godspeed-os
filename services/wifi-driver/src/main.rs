@@ -156,6 +156,13 @@ fn linux_pre_download(h: &dyn SdioHost, w: &mut backplane::Window, cores: Option
     }
 }
 
+/// How long a joined radio may go unread before the serve loop reads it itself. `nic-driver` reads the chip
+/// through NET_RX many times a second where it is bridged to the radio; where it is not (the VisionFive
+/// until phase V6), nothing did, and the first AIC8800 link was found dropped within 2.5 minutes with its
+/// frames unread (boot 2026-10-05 10:05). The read is the same `pull` NET_RX makes, so a group rekey is
+/// answered and a dropped link is seen when it happens rather than at the next `wifi status`.
+const IDLE_PULL_MS: u64 = 250;
+
 /// How long the Arm clock lease asks for. The bring-up through the upload and the first scan takes about
 /// 6 s with the cores fast; the margin is for a slow card, and `power` caps any lease at 30 s anyway.
 const CLOCK_LEASE_SECS: u8 = 20;
@@ -643,6 +650,15 @@ fn serve_radio(
     let mut link_peer_for: Option<i64> = None;
     // Pairwise rekeys that did not complete, for the log.
     let mut rekey_seen: u32 = 0;
+    // When a frame op (NET_RX or NET_TX) last read the chip, and the frames the loop's own idle read threw
+    // away because nobody took them (`IDLE_PULL_MS`). Discarded, not kept: a frame nobody asked for in a
+    // quarter of a second has nobody waiting for it, and the queue holds eight.
+    let mut last_frame_op = ctx.read_tsc();
+    let mut idle_discarded: u32 = 0;
+    // The loop's own reads, said once a minute while joined: proof that they happen, which ten quiet
+    // minutes of log (2026-10-05 10:23) could not give.
+    let mut idle_reads: u32 = 0;
+    let mut idle_said_at = ctx.read_tsc();
     // The network last JOINED this boot - name, length, security - so `radio on` after `radio off` can
     // go back to it without being asked (`utilities/56_wifi.md` 2). Set on every successful join, cleared
     // by `wifi leave` (an explicit leave means "not this one") and by `forget` of that name.
@@ -936,6 +952,37 @@ fn serve_radio(
             match ctx.recv_timeout(ctx.duration_cycles(2_000)) {
                 Some(m) => m,
                 None => continue,
+            }
+        } else if let (true, true, Some(session)) = (joined.is_some(), radio_on, radio.as_deref_mut()) {
+            // Joined: wait, but not forever, so a radio nobody reads is read here (`IDLE_PULL_MS`).
+            match ctx.recv_timeout(ctx.duration_cycles(IDLE_PULL_MS)) {
+                Some(m) => m,
+                None => {
+                    if ctx.read_tsc().wrapping_sub(last_frame_op) >= ctx.duration_cycles(IDLE_PULL_MS) {
+                        rxq.clear();
+                        let p = session.pull(&mut rxq, ctx);
+                        note_pull(session, &p, &mut joined, &mut rekey_seen, ctx);
+                        rxq.clear();
+                        if p.data > 0 && idle_discarded == 0 {
+                            ctx.log("wifi-driver: nothing is taking received frames - the loop reads the radio itself every 250 ms and discards them, so the chip never fills and group rekeys are answered");
+                        }
+                        idle_discarded = idle_discarded.saturating_add(p.data);
+                        idle_reads = idle_reads.saturating_add(1);
+                        if ctx.read_tsc().wrapping_sub(idle_said_at) >= ctx.duration_cycles(60_000) {
+                            idle_said_at = ctx.read_tsc();
+                            ctx.log_fmt(format_args!(
+                                "wifi-driver: still joined - the loop read the radio {} time(s) this minute; {} frame(s) discarded unread this boot",
+                                idle_reads, idle_discarded));
+                            idle_reads = 0;
+                        }
+                        if p.rekeyed > 0 {
+                            ctx.log_fmt(format_args!(
+                                "wifi-driver: group rekey answered by the loop's own read ({} frame(s) discarded unread so far)",
+                                idle_discarded));
+                        }
+                    }
+                    continue;
+                }
             }
         } else {
             ctx.recv()
@@ -1617,6 +1664,7 @@ fn serve_radio(
                 15
             }
             (frames::OP_NET_TX, Some(session)) => {
+                last_frame_op = ctx.read_tsc();
                 // `[op, sent]`. Refused, not queued, when there is no link to send on: the stack retries
                 // on its own pace and a refusal is a fact it can act on.
                 out[0] = frames::OP_NET_TX;
@@ -1636,6 +1684,7 @@ fn serve_radio(
                 2
             }
             (frames::OP_NET_RX, Some(session)) => {
+                last_frame_op = ctx.read_tsc();
                 // `[op, len_lo, len_hi, frame...]`, oldest first; a length of 0 is "nothing waiting".
                 // The chip is read only when the queue is empty and the radio has a link to read.
                 out[0] = frames::OP_NET_RX;

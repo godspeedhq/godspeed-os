@@ -463,7 +463,6 @@ SCANU_START_CFM_ADDTIONAL          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09
 WLAN_REASON_DEAUTH_LEAVING         # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), Linux's 802.11 reason code 3, which rwnx_close sends (aic_station.rs) - external, 26.14
 aic8800_fdrv                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor's full-MAC runtime driver, the reference aic_station.rs follows - external, 26.14
 aicwf_sdio_send                    # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the bus send under flow control that push_frame follows (aic.rs) - external, 26.14
-decr_status                        # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's decrypt-status field (aic_wire.rs) - external, 26.14
 flags_is_80211_mpdu                # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's management-frame flag (aic_wire.rs) - external, 26.14
 flags_upload                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's hand-it-up flag (aic_wire.rs) - external, 26.14
 hw_rxhdr                           # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header struct (aic_wire.rs) - external, 26.14

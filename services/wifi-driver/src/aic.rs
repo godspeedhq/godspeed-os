@@ -731,6 +731,15 @@ pub(crate) const SCANU_START_CFM: u16 = 0x1001;
 pub(crate) const SCANU_RESULT_IND: u16 = 0x1004;
 /// The scan request's own confirm, which the vendor driver waits for and discards (`_ADDTIONAL`, sic).
 pub(crate) const SCANU_START_CFM_ADDITIONAL: u16 = 0x1009;
+/// A message that arrives once per channel swept: 39 in a sweep of 14 + 25 channels, on every scan the
+/// board has run (2026-10-05). Its name is not confirmed from the vendor source, so it is numbered, not
+/// named; nothing waits for it, and it is read and left without a line each, which was 39 lines a scan.
+pub(crate) const PER_CHANNEL_IND: u16 = 0x004f;
+/// The pair that replaces it when a JOINED radio scans: 39 of each in one sweep (2026-10-05 10:23), one pair
+/// per channel - consistent with the radio leaving its own channel and coming back, which is what the
+/// names here say. Not confirmed from the vendor source, so numbered, and read without a line each.
+pub(crate) const JOINED_CHANNEL_OUT: u16 = 0x0044;
+pub(crate) const JOINED_CHANNEL_BACK: u16 = 0x0045;
 
 /// The largest read the scan takes at once, in blocks: results queue up while the radio sweeps, and each
 /// carries a whole beacon.
@@ -852,6 +861,7 @@ pub fn scan_once(h: &dyn SdioHost, vif: u8, five_ghz: bool, scan: &mut godspeed_
                     }
                 }
                 SCANU_START_CFM => end.ended = Some((p.get(1).copied().unwrap_or(0xff), p.get(2).copied().unwrap_or(0))),
+                PER_CHANNEL_IND => {}
                 other => ctx.log_fmt(format_args!(
                     "wifi-driver: AIC during the scan - message {:#06x} ({} parameter bytes), not a scan message", other, p.len())),
             }, ctx);
