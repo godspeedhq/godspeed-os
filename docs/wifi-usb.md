@@ -142,3 +142,31 @@ is the stdlib-dogfood branch's work, not this one's.
   now stamps the two services built in variants (`dwc2`, `fs`), and a QEMU-then-hardware flip was rebuilt
   both ways and checked. The R1 card already on the SD card was checked the same way: it embeds the
   hardware `dwc2`.
+
+## 6. R2 (2026-10-05): the firmware - built, NOT YET RUN
+
+The 8051's program is `rtl8192cufw_TMSC.bin` from upstream `linux-firmware`, in `nonfree/rtl8192cu` with
+Realtek's licence and its digest (`PROVENANCE`): binary redistribution is permitted with the notice
+attached, the footing `docs/wifi.md` 59 already decided for this chip. `build.rs` embeds it and passes its
+FNV-1a hash through; the service recomputes the hash over what the binary holds before trusting it, the
+check `wifi-driver` learned it needs (a length is a constant whether or not the bytes are kept).
+
+The file is a 32-byte header - signature `0x88C1` (an A-cut 8188C), version 88.2, 16094 bytes of code - and
+the code goes to the chip in 4 KiB pages, each selected in `MCU_FW_DL`'s third byte and written through the
+window at `0x1000` in 128-byte control transfers: 126 transfers in all. That plan is `rtl_fw.rs`, which names
+nothing outside `core`, so `scripts/host_test_check.py` runs its tests on every build - including the one
+that caught its author's own arithmetic, the last block at `0x1E80`. The download and the start are
+`rtl8xxxu_download_firmware` and `rtl8xxxu_start_firmware` step for step: the 8051 enabled, a firmware
+already running from RAM reset first, the download enabled and its checksum report reset, the blocks, the
+download disabled whatever happened; then the chip's checksum report, `READY` set, the 8051 reset so it
+starts from RAM, and `WINT_INIT_READY` - the firmware's own word that it runs. The download is tried up to
+six times, `rtl8xxxu_init_device`'s figure.
+
+**Where it departs from Linux, on purpose:** `rtl8xxxu` sets up the reserved pages and queue priority
+before the download when the MAC was cold; `rtlwifi` does not, and neither treats them as the download's
+prerequisite, so R2 does the download straight after the power-on and leaves those to R3 with the rest of
+the MAC's setup.
+
+Its prediction, after R1's lines: `firmware rtl8192cufw_TMSC.bin VERIFIES - signature 0x88c1, version 88.2,
+16094 bytes of code`, then `firmware downloaded - 126 blocks`, then `the firmware is RUNNING - MCU_FW_DL=...`
+with bit 6 (`WINT_INIT_READY`) set.

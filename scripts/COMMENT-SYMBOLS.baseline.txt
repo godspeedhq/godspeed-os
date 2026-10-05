@@ -483,3 +483,9 @@ rtl8192cu_power_on                 # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, 
 rtl8xxxu_init_device               # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
 rtl8xxxu_read_efuse                # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
 rtl8xxxu_read_efuse8               # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+REG_FW_START_ADDRESS               # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+RTL_FW_PAGE_SIZE                   # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+rtl8xxxu_download_firmware         # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+rtl8xxxu_load_firmware             # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+rtl8xxxu_reset_8051                # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+rtl8xxxu_start_firmware            # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14

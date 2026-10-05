@@ -42,12 +42,21 @@ pub fn read(ctx: &ServiceContext, reg: u16, width: u8) -> Result<u32, &'static s
 
 /// One register write of `width` bytes.
 pub fn write(ctx: &ServiceContext, reg: u16, width: u8, val: u32) -> Result<(), &'static str> {
+    write_bytes(ctx, reg, &val.to_le_bytes()[..width as usize])
+}
+
+/// `bytes` written from register `reg` in ONE control transfer - a register's 1, 2 or 4, or one block of the
+/// firmware download (`rtl8xxxu_writeN`, 128 at a time for this family).
+pub fn write_bytes(ctx: &ServiceContext, reg: u16, bytes: &[u8]) -> Result<(), &'static str> {
     let [lo, hi] = reg.to_le_bytes();
-    let v = val.to_le_bytes();
-    let mut req = [0u8; 9 + 4];
-    req[..9].copy_from_slice(&[usbfn::OP_CONTROL, DIR_OUT, VENDOR_REQ, lo, hi, 0, 0, width, 0]);
-    req[9..9 + width as usize].copy_from_slice(&v[..width as usize]);
-    let r = host(ctx, &req[..9 + width as usize])?;
+    let [nlo, nhi] = (bytes.len() as u16).to_le_bytes();
+    let mut req = [0u8; 9 + crate::rtl_fw::BLOCK];
+    if bytes.len() > crate::rtl_fw::BLOCK {
+        return Err("a write longer than one 128-byte block");
+    }
+    req[..9].copy_from_slice(&[usbfn::OP_CONTROL, DIR_OUT, VENDOR_REQ, lo, hi, 0, 0, nlo, nhi]);
+    req[9..9 + bytes.len()].copy_from_slice(bytes);
+    let r = host(ctx, &req[..9 + bytes.len()])?;
     let p = r.payload_bytes();
     match (p.first().copied(), p.get(1).copied()) {
         (Some(usbfn::OP_CONTROL), Some(usbfn::ST_OK)) => Ok(()),
@@ -62,6 +71,7 @@ pub fn read16(ctx: &ServiceContext, reg: u16) -> Result<u16, &'static str> { rea
 pub fn read32(ctx: &ServiceContext, reg: u16) -> Result<u32, &'static str> { read(ctx, reg, 4) }
 pub fn write8(ctx: &ServiceContext, reg: u16, v: u8) -> Result<(), &'static str> { write(ctx, reg, 1, v as u32) }
 pub fn write16(ctx: &ServiceContext, reg: u16, v: u16) -> Result<(), &'static str> { write(ctx, reg, 2, v as u32) }
+pub fn write32(ctx: &ServiceContext, reg: u16, v: u32) -> Result<(), &'static str> { write(ctx, reg, 4, v) }
 
 /// Poll `reg` (of `width`) until `done(value)`, for at most `ms`; the value that satisfied it, or `None`.
 fn poll(ctx: &ServiceContext, reg: u16, width: u8, ms: u64, done: impl Fn(u32) -> bool) -> Result<Option<u32>, &'static str> {
@@ -93,6 +103,15 @@ const REG_EFUSE_TEST: u16 = 0x00CF;
 const REG_CR: u16 = 0x0100;
 const REG_APSD_CTRL: u16 = 0x0600;
 const REG_USB_UNDOCUMENTED: u16 = 0xFE10;
+const REG_MCU_FW_DL: u16 = 0x0080;
+/// `MCU_FW_DL` bits (`rtl8xxxu_regs.h`).
+const MCU_FW_DL_ENABLE: u32 = 1 << 0;
+const MCU_FW_DL_READY: u32 = 1 << 1;
+const MCU_FW_DL_CSUM_REPORT: u32 = 1 << 2;
+const MCU_WINT_INIT_READY: u32 = 1 << 6;
+const MCU_FW_RAM_SEL: u32 = 1 << 7;
+/// The 8051's enable in `SYS_FUNC` (`SYS_FUNC_CPU_ENABLE`).
+const SYS_FUNC_CPU_ENABLE: u16 = 1 << 10;
 
 /// The logical efuse is 512 bytes on this family (`EFUSE_MAP_LEN`), built from a physical stream of
 /// headers and words; the physical stream is walked at most this far (`EFUSE_REAL_CONTENT_LEN_8192C`).
@@ -198,6 +217,71 @@ pub fn read_efuse(ctx: &ServiceContext) -> Result<Efuse, &'static str> {
 
 pub fn efuse_id_ok(e: &Efuse) -> bool {
     e.id == EFUSE_ID
+}
+
+/// `rtl8xxxu_reset_8051`: the 8051 held and released - `RSV_CTRL + 1` bit 0 and the CPU enable, off then on.
+fn reset_8051(ctx: &ServiceContext) -> Result<(), &'static str> {
+    let r = read8(ctx, REG_RSV_CTRL + 1)?;
+    write8(ctx, REG_RSV_CTRL + 1, r & !0x01)?;
+    let f = read16(ctx, REG_SYS_FUNC)? & !SYS_FUNC_CPU_ENABLE;
+    write16(ctx, REG_SYS_FUNC, f)?;
+    let r = read8(ctx, REG_RSV_CTRL + 1)?;
+    write8(ctx, REG_RSV_CTRL + 1, r | 0x01)?;
+    write16(ctx, REG_SYS_FUNC, f | SYS_FUNC_CPU_ENABLE)
+}
+
+/// `rtl8xxxu_download_firmware`: the 8051 enabled, a running firmware reset, the download enabled and the
+/// checksum report reset, then every block of `code` (the file after its header) into its page, and the
+/// download DISABLED whatever happened - as Linux does on its abort path. The number of blocks written.
+pub fn download_firmware(ctx: &ServiceContext, code: &[u8]) -> Result<usize, &'static str> {
+    let f = read8(ctx, REG_SYS_FUNC + 1)?;
+    write8(ctx, REG_SYS_FUNC + 1, f | 0x04)?;
+    let f = read16(ctx, REG_SYS_FUNC)?;
+    write16(ctx, REG_SYS_FUNC, f | SYS_FUNC_CPU_ENABLE)?;
+    if read8(ctx, REG_MCU_FW_DL)? as u32 & MCU_FW_RAM_SEL != 0 {
+        ctx.log("wifi-usb: a firmware is already running from RAM - resetting the 8051 first, as Linux does");
+        write8(ctx, REG_MCU_FW_DL, 0x00)?;
+        reset_8051(ctx)?;
+    }
+    let d = read8(ctx, REG_MCU_FW_DL)?;
+    write8(ctx, REG_MCU_FW_DL, d | MCU_FW_DL_ENABLE as u8)?;
+    let d = read32(ctx, REG_MCU_FW_DL)?;
+    write32(ctx, REG_MCU_FW_DL, d & !(1 << 19))?;
+    let d = read8(ctx, REG_MCU_FW_DL)?;
+    write8(ctx, REG_MCU_FW_DL, d | MCU_FW_DL_CSUM_REPORT as u8)?;
+    let written = (|| -> Result<usize, &'static str> {
+        let mut n = 0usize;
+        let mut page = u8::MAX;
+        for b in crate::rtl_fw::blocks(code) {
+            if b.page != page {
+                let p = read8(ctx, REG_MCU_FW_DL + 2)?;
+                write8(ctx, REG_MCU_FW_DL + 2, (p & 0xF8) | b.page)?;
+                page = b.page;
+            }
+            write_bytes(ctx, b.addr, b.bytes)?;
+            n += 1;
+        }
+        Ok(n)
+    })();
+    let d = read16(ctx, REG_MCU_FW_DL)?;
+    write16(ctx, REG_MCU_FW_DL, d & !(MCU_FW_DL_ENABLE as u16))?;
+    written
+}
+
+/// `rtl8xxxu_start_firmware`: the checksum the chip computed must be reported, then READY set and
+/// `WINT_INIT_READY` cleared, the 8051 reset so it starts from RAM, and `WINT_INIT_READY` waited for - the
+/// firmware's own word that it is running. `MCU_FW_DL` as it read then.
+pub fn start_firmware(ctx: &ServiceContext) -> Result<u32, &'static str> {
+    if poll(ctx, REG_MCU_FW_DL, 4, 200, |v| v & MCU_FW_DL_CSUM_REPORT != 0)?.is_none() {
+        return Err("the chip never reported the download's checksum (MCU_FW_DL bit 2)");
+    }
+    let d = read32(ctx, REG_MCU_FW_DL)?;
+    write32(ctx, REG_MCU_FW_DL, (d | MCU_FW_DL_READY) & !MCU_WINT_INIT_READY)?;
+    reset_8051(ctx)?;
+    match poll(ctx, REG_MCU_FW_DL, 4, 500, |v| v & MCU_WINT_INIT_READY != 0)? {
+        Some(v) => Ok(v),
+        None => Err("the firmware never reported it was running (MCU_FW_DL bit 6, WINT_INIT_READY)"),
+    }
 }
 
 /// `rtl8192cu_power_on`, step by step; `Err` names the step that did not complete.

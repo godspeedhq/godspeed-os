@@ -1,0 +1,35 @@
+# PROVENANCE - nonfree/rtl8192cu
+
+Realtek RTL8192CU-family firmware, for the RTL8188CUS USB WiFi dongle (`0bda:8176`) that `wifi-usb` drives
+(`docs/wifi-usb.md`, phase R2).
+
+**Why this is here at all, and why it is not source.** The chip carries an 8051 microcontroller that runs
+the MAC's low-level functions from RAM; until a host downloads this code into it, the 8051 runs only its
+ROM, and Linux's drivers - both `rtl8xxxu` and `rtlwifi` - download it before anything else. The 8051's
+program is Realtek's, in binary only, the same footing as the Broadcom firmware in `nonfree/brcm43455`
+(`docs/wifi.md` sections 8 and 59).
+
+**Which file.** The chip reports a TSMC-made, normal, A-cut RTL8188C (`SYS_CFG = 0x04400735`, read on the
+board 2026-10-05). Linux's `rtl8192cu_load_firmware` picks `rtl8192cufw_TMSC.bin` for any chip not made by
+UMC, and `rtlwifi` agrees; the `_A` and `_B` files are for UMC parts and are not carried.
+
+**Licence.** `LICENCE` in this directory, fetched from the same commit. It permits redistribution and use
+in binary form, without modification, provided the copyright notice and disclaimer travel with it - which
+is what that file is - and forbids reverse engineering, decompilation and disassembly. GodspeedOS does
+none of those: it downloads the file to the chip unmodified and speaks to the result.
+
+**Retrieved** 2026-10-05 from upstream `linux-firmware`
+(`git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git`), commit
+`d947e4e8e314e9254a1242dc1a5d9cede2cce33d`. Its `WHENCE` says the file is extracted from Realtek's
+`rtl8188C_8192C_usb_linux_v4.0.1_6911.20130308` driver (`Rtl8192CUFwTSMCImgArray`), licence
+`LicenseRef-LICENCE.rtlwifi_firmware.txt`. A copy fetched independently the same day from another mirror
+for research had the same SHA-256.
+
+| file here | bytes | sha256 | upstream path | what it is |
+|---|---|---|---|---|
+| `rtl8192cufw_TMSC.bin` | 16126 | `c083f2db36ef33d0ffffc979aba1d40f55fa9dc38dce50f26e0108a21c080286` | `rtlwifi/rtl8192cufw_TMSC.bin` | the 8051's program: a 32-byte header (signature `0x88C1`, version 88.2) and 16094 bytes downloaded to the chip |
+
+**To verify a copy**, fetch
+`https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/rtlwifi/rtl8192cufw_TMSC.bin?id=d947e4e8e314e9254a1242dc1a5d9cede2cce33d`
+and compare the SHA-256. The licence is at `LICENSES/LICENCE.rtlwifi_firmware.txt` in the same tree.
+Nothing here has to be trusted on this project's word.

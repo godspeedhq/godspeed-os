@@ -25,6 +25,9 @@ import tempfile
 FILES = [
     # The AIC8800D80's frames, patch table walk and message parameter blocks (docs/wifi-aic8800.md).
     "services/wifi-driver/src/aic_wire.rs",
+    # The RTL8188CUS firmware file: its header, its hash, and the page/block plan of its download
+    # (docs/wifi-usb.md, R2).
+    "services/wifi-usb/src/rtl_fw.rs",
 ]
 
 

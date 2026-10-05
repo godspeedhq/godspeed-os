@@ -29,6 +29,14 @@ use godspeed_sdk::{Message, ServiceContext};
 use godspeed_wifi::usbfn;
 
 mod rtl8188;
+mod rtl_fw;
+
+/// The 8051's firmware, embedded (`build.rs`, `nonfree/rtl8192cu/PROVENANCE`), and the hash the build measured
+/// on disk, which `bring_up` recomputes over what the binary actually holds.
+static FIRMWARE: &[u8] = include_bytes!(env!("RTL_FW_TMSC"));
+const FIRMWARE_FNV: u32 = rtl_fw::decimal(env!("RTL_FW_TMSC_FNV"));
+/// How many times the download is tried before giving up - `rtl8xxxu_init_device`'s figure.
+const DOWNLOAD_TRIES: u32 = 6;
 use rtl8188::{read32, REG_SYS_CFG, REG_SYS_ISO_CTRL};
 
 /// The host this board's dongle sits behind. One today; `xhci` joins when it serves `usbfn` (U2), and the
@@ -135,9 +143,57 @@ fn bring_up(ctx: &ServiceContext) {
     let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
     match rtl8188::power_on(ctx) {
         Ok(cr) => ctx.log_fmt(format_args!(
-            "wifi-usb: powered on in {} ms - CR={:#06x}; R1 done, no firmware yet (R2, docs/wifi-usb.md)",
-            clock.elapsed_us() / 1000, cr)),
-        Err(why) => ctx.log_fmt(format_args!("wifi-usb: the power-on stopped at {}", why)),
+            "wifi-usb: powered on in {} ms - CR={:#06x}; R1 done", clock.elapsed_us() / 1000, cr)),
+        Err(why) => {
+            ctx.log_fmt(format_args!("wifi-usb: the power-on stopped at {}", why));
+            return;
+        }
+    }
+    firmware(ctx);
+}
+
+/// R2: the embedded firmware checked, its header read, downloaded (up to `DOWNLOAD_TRIES` times, as Linux
+/// tries), and started; the chip's own `WINT_INIT_READY` is the word that it runs.
+fn firmware(ctx: &ServiceContext) {
+    let fnv = rtl_fw::fnv1a(FIRMWARE);
+    if fnv != FIRMWARE_FNV {
+        ctx.log_fmt(format_args!(
+            "wifi-usb: the embedded firmware does NOT match the file the build read (fnv {:#010x}, the build measured {:#010x}) - not downloading it",
+            fnv, FIRMWARE_FNV));
+        return;
+    }
+    let h = match rtl_fw::header(FIRMWARE) {
+        Ok(h) => h,
+        Err(why) => {
+            ctx.log_fmt(format_args!("wifi-usb: the embedded firmware is refused - {}", why));
+            return;
+        }
+    };
+    ctx.log_fmt(format_args!(
+        "wifi-usb: firmware rtl8192cufw_TMSC.bin VERIFIES - signature {:#06x}, version {}.{}, {} bytes of code",
+        h.signature, h.major, h.minor, h.code_len));
+    let code = &FIRMWARE[rtl_fw::HEADER_LEN..];
+    let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
+    let mut tries = 0;
+    let blocks = loop {
+        tries += 1;
+        match rtl8188::download_firmware(ctx, code) {
+            Ok(n) => break n,
+            Err(why) if tries < DOWNLOAD_TRIES => ctx.log_fmt(format_args!(
+                "wifi-usb: the download stopped ({}) - try {} of {}", why, tries, DOWNLOAD_TRIES)),
+            Err(why) => {
+                ctx.log_fmt(format_args!("wifi-usb: the download did not complete in {} tries - {}", tries, why));
+                return;
+            }
+        }
+    };
+    ctx.log_fmt(format_args!(
+        "wifi-usb: firmware downloaded - {} blocks of up to {} bytes in {} ms ({} {})",
+        blocks, rtl_fw::BLOCK, clock.elapsed_us() / 1000, tries, if tries == 1 { "try" } else { "tries" }));
+    match rtl8188::start_firmware(ctx) {
+        Ok(dl) => ctx.log_fmt(format_args!(
+            "wifi-usb: the firmware is RUNNING - MCU_FW_DL={:#010x}; R2 done, no radio yet (R3, docs/wifi-usb.md)", dl)),
+        Err(why) => ctx.log_fmt(format_args!("wifi-usb: the firmware did not start - {}", why)),
     }
 }
 
