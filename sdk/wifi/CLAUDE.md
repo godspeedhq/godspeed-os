@@ -30,7 +30,7 @@ all live in one service - a USB radio's driver sits behind the USB host service 
 
 1. The chip-independent code moves here (done).
 2. a. `SdioHost`, and the SDIO protocol moves here (done). b-i. `Station`: the serve loop talks to a `Station`, the Broadcom code is the first (done). b-ii. The WPA2 handshake runner moves here (done, `supplicant.rs`); the loop itself is still `services/wifi-driver`'s `serve_radio`, which now takes any `Station`.
-3. The VisionFive: a DesignWare `SdioHost` and an AIC8800 `Station`. Started: the `SdioHost` is `services/wifi-driver/src/dwmmc.rs` (identification over the CMD line since V1; the PIO data phase since V2, `docs/wifi-aic8800.md`), and the chip's message bus and firmware upload are `services/wifi-driver/src/aic.rs` (the firmware is uploaded and started; talking to it is V3). The `Station` is not begun.
+3. The VisionFive: a DesignWare `SdioHost` and an AIC8800 `Station`. Started: the `SdioHost` is `services/wifi-driver/src/dwmmc.rs` (identification over the CMD line since V1; the PIO data phase since V2, `docs/wifi-aic8800.md`), and the chip's message bus and firmware upload are `services/wifi-driver/src/aic.rs` (the firmware is uploaded and started, hardware-verified). Its bring-up, scan and `Station` (`aic_station.rs`) are built and not yet run on the board.
 4. The Pi 2: a `RawRadio` for the Realtek dongle and a shared host-side MLME that makes it a `Station`.
 
 Anything added here must be true of every radio. A name, a structure or a constant from one vendor's

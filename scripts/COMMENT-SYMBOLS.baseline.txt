@@ -431,7 +431,6 @@ crc8_ponl_107                      # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c
 rwnx_set_cmd_tx                    # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the message frame layout aic.rs builds - external, 26.14
 sdio_readsb                        # Linux sdio_io.c, the fixed-address CMD53 read sdio.rs read_fifo mirrors - external, 26.14
 sdio_writesb                       # Linux sdio_io.c, the fixed-address CMD53 write sdio.rs write_fifo mirrors - external, 26.14
-AICBT_PINF_T                       # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the patch table group aic.rs reads the load addresses from (a tag in the vendor file, not code) - external, 26.14
 CMD_BUF_MAX                        # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the largest frame the vendor driver sends, which aic.rs FRAME_MAX matches - external, 26.14
 aicbt_patch_info_unpack            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), how aic.rs patch_info reads the information group - external, 26.14
 aicbt_patch_table_alloc            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the table walk aic.rs Groups follows - external, 26.14
@@ -442,3 +441,35 @@ aicbt_patch_table_load             # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c
 aicwifi_init                       # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the fmacfw load sequence the driver stage 7 follows - external, 26.14
 aicwifi_patch_config_8800d80       # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the fmacfw patch configuration aic.rs patch_config follows - external, 26.14
 aicwifi_start_from_bootrom         # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the start message aic.rs start_app sends - external, 26.14
+aicwf_sdio_probe                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the runtime driver probe whose wake check aic.rs bring_up repeats - external, 26.14
+aicwf_set_rf_config_8800d80        # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the RF messages aic.rs bring_up sends with the defaults - external, 26.14
+cmd_mgr_msgind                     # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), how a confirm is told from an indication (aic.rs find_cfm) - external, 26.14
+mm_set_rf_calib_req                # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the RF calibration message aic.rs rf_calib builds - external, 26.14
+rwnx_cfg80211_init                 # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the bring-up order aic.rs bring_up follows - external, 26.14
+rwnx_rx_handle_print               # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the firmware print packet aic.rs logs - external, 26.14
+txpwr_idx_lvl_v3                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the transmit power layout aic.rs txpwr_lvl_v3 fills - external, 26.14
+userconfig_info                    # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor defaults aic.rs sends with no user configuration file - external, 26.14
+regdom_00                          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor world regulatory domain whose 20 dBm aic_wire.rs CHAN_TX_POWER_DBM states - external, 26.14
+rwnx_handle_dynparams              # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the capability defaults ME_CONFIG in aic_wire.rs carries - external, 26.14
+rwnx_open                          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the start, coexistence and interface messages aic.rs bring_up_station sends - external, 26.14
+rwnx_send_me_chan_config_req       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the channel list aic_wire.rs chan_config builds - external, 26.14
+rwnx_send_me_config_req            # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the capability message aic_wire.rs ME_CONFIG is - external, 26.14
+rwnx_send_scanu_req                # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the scan request aic_wire.rs scanu_start builds - external, 26.14
+aicwf_sdio_aggr                    # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the data frame layout aic_wire.rs build_data_frame follows - external, 26.14
+rwnx_send_sm_connect_req           # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the connect request aic_wire.rs sm_connect builds - external, 26.14
+RWNX_RX_HD_DECR_CCMP128            # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's decrypt status for CCMP (aic_wire.rs) - external, 26.14
+SCANU_CANCEL_REQ                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the scan cancel aic_station.rs deliberately does not send - external, 26.14
+SCANU_START_CFM_ADDTIONAL          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor's own spelling of the scan request's confirm (aic.rs names it ..._ADDITIONAL) - external, 26.14
+WLAN_REASON_DEAUTH_LEAVING         # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), Linux's 802.11 reason code 3, which rwnx_close sends (aic_station.rs) - external, 26.14
+aic8800_fdrv                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor's full-MAC runtime driver, the reference aic_station.rs follows - external, 26.14
+aicwf_sdio_send                    # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the bus send under flow control that push_frame follows (aic.rs) - external, 26.14
+decr_status                        # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's decrypt-status field (aic_wire.rs) - external, 26.14
+flags_is_80211_mpdu                # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's management-frame flag (aic_wire.rs) - external, 26.14
+flags_upload                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's hand-it-up flag (aic_wire.rs) - external, 26.14
+hw_rxhdr                           # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header struct (aic_wire.rs) - external, 26.14
+rwnx_cfg80211_add_key              # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the key install aic_station.rs follows - external, 26.14
+rwnx_cfg80211_get_station          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the signal query aic_wire.rs reads - external, 26.14
+rwnx_rx_mgmt_any                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), where the vendor driver sends management frames (aic_wire.rs) - external, 26.14
+rwnx_rxdataind_aicwf               # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the data receive path aic_wire.rs follows - external, 26.14
+rwnx_send_get_sta_info_req         # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the MM_GET_STA_INFO_REQ sender (aic_wire.rs) - external, 26.14
+rwnx_tx_push                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the transmit push that marks EAPOL for a confirm (aic_station.rs) - external, 26.14

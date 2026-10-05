@@ -454,6 +454,10 @@ const EXTRA_CHECKS: &[&str] = &[
     // (rule 9). 22 first-level words had no help and `chaos kill-storm help` read `help` as a service
     // name; nothing checked. Reads `SUBCMD_FIRST`/`UTILS`/`sub_help` from the shell, so it cannot drift.
     "scripts/subcmd_help_check.py",
+    // A driver's WIRE FORMAT tested on the host. A service builds only for its target, so a
+    // `#[cfg(test)]` module in one never runs; this compiles each listed dependency-free file with
+    // `rustc --test` and runs it, so a wrong byte offset fails a build instead of costing a flash.
+    "scripts/host_test_check.py",
 
     // ---- AND THE COMMENTS, which the audit above could not finish ------------------------------
     //

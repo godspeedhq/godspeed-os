@@ -74,29 +74,8 @@ aic8800_sdio                       # docs/wifi.md 44 - the AICSemi vendor Linux 
 brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 si_watchdog                        # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
-ME_CHAN_CONFIG_REQ                 # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-ME_CONFIG_REQ                      # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-ME_SET_CONTROL_PORT_REQ            # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_ADD_IF_REQ                      # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_GET_FW_VERSION_REQ              # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_GET_MAC_ADDR_REQ                # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_KEY_ADD_REQ                     # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_RESET_REQ                       # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_SET_RF_CALIB_REQ                # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_SET_STACK_START_REQ             # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_START_REQ                       # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-MM_VERSION_REQ                     # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-SCANU_RESULT_IND                   # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-SCANU_START_CFM                    # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-SCANU_START_REQ                    # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-SM_CONNECT_IND                     # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-SM_CONNECT_REQ                     # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-SM_DISCONNECT_IND                  # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
-SM_DISCONNECT_REQ                  # docs/wifi-aic8800.md - AICSemi aic8800 driver (radxa-pkg/aic8800 @ 09c65d61), EXTERNAL; becomes a constant when the AIC8800 station is built
 MM_CONNECTION_LOSS_IND             # docs/wifi-aic8800.md - AICSemi aic8800 driver, EXTERNAL; cited because the vendor driver ignores it
 CHIP_REV_U03                       # docs/wifi-aic8800.md - AICSemi aic8800_bsp chip_rev enum, EXTERNAL; revision 7
-lmac_msg                           # docs/wifi-aic8800.md, docs/CLAUDE.md - AICSemi/RivieraWaves message header struct, EXTERNAL
-aic8800_fdrv                       # docs/wifi-aic8800.md - AICSemi's full-MAC Linux module, EXTERNAL
 set_pmk                            # docs/wifi-aic8800.md - Linux cfg80211 op, EXTERNAL; cited as the handshake offload this firmware lacks
 dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXTERNAL; the second init order compared
 ap_max_inactivity                  # backlog/64 - hostapd configuration option, EXTERNAL; the access point idle timer that matches reason 4 after ~300 s

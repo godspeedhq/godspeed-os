@@ -194,6 +194,103 @@ patches, so the clock question above stands), about 9 s from `V1 done` to the st
 sent nothing unprompted before the driver stopped looking; whether it announces itself is V3's first
 question.
 
+**V3, prepared in two cards and NOT YET RUN (2026-10-05).** Built from the vendor runtime driver
+(`aic8800_fdrv` at the same commit), in its order:
+
+- **Card 1** (stage 8): the runtime driver's own wake check; the sub-id at `0x20`; `MM_SET_STACK_START_REQ`
+  (`0x7B`, the confirm says whether 5 GHz is supported); `MM_GET_FW_VERSION_REQ` (`0x80`); the two RF
+  messages the defaults send - the 95-byte transmit power table (`0x77`) and the RF calibration (`0x69`);
+  then `MM_GET_MAC_ADDR_REQ` (`0x73`). The transmit power offset and level adjustment are not sent, because
+  the vendor's defaults leave both disabled.
+- **Card 2** (stage 9): `MM_RESET_REQ`, `MM_VERSION_REQ`, `ME_CONFIG_REQ` (the 112 capability bytes - one
+  stream, 80 MHz, HT/VHT/HE), `ME_CHAN_CONFIG_REQ` (14 + 25 channels), `MM_START_REQ` (PHY configuration
+  all zero, as the vendor's is: its PHY configuration step is compiled out), `MM_SET_COEX_REQ`, and
+  `MM_ADD_IF_REQ` for one station at the firmware's own MAC.
+
+Three differences from the vendor driver, each deliberate. **It stops at a failed confirm**: the vendor's
+message sender returns 0 whatever happens, so its bring-up never stops, and a step that failed is the
+next thing to look at. **It reads past what it did not ask for**: the receive now logs the firmware's
+print packets (type `0x13`) as text and any unrequested message as an indication, and keeps reading for
+the confirm for up to 2 s. **The channel list's transmit power is 20 dBm, not the 30 the vendor's table
+holds**: Linux's regulatory code lowers 30 to the 20 its world domain allows before the list is built, and
+this driver has no regulatory code, so it states the result - the lower value, which is the safe direction
+to be wrong in. The vendor may also send a second channel list from its regulatory notifier; this sends one.
+
+**The bytes are tested on the host before any card.** The frame builder, the patch table walk and every
+parameter block are in `aic_wire.rs`, which names nothing outside `core`; `scripts/host_test_check.py`
+compiles it with `rustc --test` on every `osdev build` (it is in `EXTRA_CHECKS`). Its vectors include the
+values the board has already confirmed - the header CRCs the chip accepted, the patch table's addresses -
+so a later edit that moves a byte fails a build rather than a flash.
+
+**V4's first card, prepared and NOT YET RUN (2026-10-05): one scan at bring-up, logged.** Stage 10 sends
+`SCANU_START_REQ` (`0x1000`, task 4) for every channel in the list stage 9 sent, with one empty SSID and
+the broadcast BSSID, and reads until the scan ENDS. The vendor driver's order, which is not what the
+names suggest: the request's own confirm is `SCANU_START_CFM_ADDITIONAL` (`0x1009`; the vendor spells it `ADDTIONAL`), each network
+arrives as `SCANU_RESULT_IND` (`0x1004`) carrying the whole beacon or probe response, and the end is
+`SCANU_START_CFM` (`0x1001`), unsolicited. Each result goes into `sdk/wifi`'s `Scan` (deduplicated by
+BSSID, the strongest kept) with its security classified from the beacon's own elements by `classify` -
+the shared code applies unchanged, as section 6 expected. Up to 8 KB is read at once, since results
+queue while the radio sweeps; 15 s is the bound.
+
+**V5's bytes, written and host-tested ahead of the cards (2026-10-05), and called since by the `Station`
+below.** From
+the vendor runtime driver: `SM_CONNECT_REQ` (320 bytes; flags `CONTROL_PORT_HOST | WPA_WPA2_IN_USE`, the
+control port's ethertype `88 8e`, the host's RSN element in its buffer), the parse of `SM_CONNECT_IND`
+(852 bytes; its `ap_idx` is the AP's station index that the keys, the transmit descriptor and the control
+port all name), `MM_KEY_ADD_REQ` (44 bytes, CCMP = 2, pairwise against `ap_idx`, group against `0xff`),
+`ME_SET_CONTROL_PORT_REQ` (sent by the host once the keys are in - the vendor sends it only when its
+supplicant authorizes the station), `SM_DISCONNECT_REQ`, and the data path the EAPOL frames ride: out as
+a type `0x01` frame with the 28-byte host descriptor and the payload without its Ethernet header; in as a
+type `0x00` packet with a 60-byte hardware header before a raw 802.11 frame, its LLC/SNAP header and, on
+a protected frame, the CCMP header the firmware leaves in place. No message between the scan and the
+connect for WPA2-PSK. An open network sets neither connect flag and offers no element.
+
+**V4's second card, prepared and NOT YET RUN (2026-10-05): the radio as a `Station`, under the shared serve
+loop.** After stage 10 the driver no longer answers `radio down`: stage 11 builds `aic_station::Aic` and
+enters `serve_radio`, the loop the Pi 4 runs under, so `wifi scan`, `wifi list`, `wifi status`, `wifi
+join`, the credential table and `/wifi.keys` are the loop's from here. It took two changes outside the
+AIC8800's own files, both of them moves rather than new behaviour:
+
+- **`serve_radio` takes a `Station`** rather than the Broadcom's bus, backplane window and session, which
+  were only ever used to build one. The Pi 4 builds its `Bcm` in `service_main` and passes it in.
+- **The WPA2 handshake moved to `sdk/wifi`** (`supplicant.rs`: `Handshake`, `group_rekey`, `Keys`), with
+  the steps and every log line unchanged. A radio supplies a two-method `KeyPath` - send an EAPOL frame,
+  install a key - which on the Broadcom is `ctrl::send_data` and `ctrl::install_key` (`join::BcmPath`)
+  and on the AIC8800 is the data frame and `MM_KEY_ADD_REQ`. Section 6 planned three methods; two
+  suffice, because a group key is a key install with no peer.
+
+Both change the Pi 4's hardware-verified path, so the Pi 4 has a card of its own for them
+(`build/kernel8-STATION.img`), and its prediction is that NOTHING in its log changes.
+
+The AIC8800's `Station` (`aic_station.rs`), what each method sends, and where it departs from the vendor
+driver on purpose (the module's header has the full reasoning):
+
+| Method | Here | Note |
+|---|---|---|
+| `scan_start` / `scan_step` | `SCANU_START_REQ`; one non-blocking look per turn, every result in the read kept | the loop sleeps between empty looks; 15,000 empty looks give up |
+| `scan_abort` | nothing sent; answers `false` | `SCANU_CANCEL_REQ` is known only by its place in the source's enum; the sweep finishes on the chip and is discarded |
+| `join` | `SM_CONNECT_REQ` to the BSSID and channel a sweep heard; `SM_CONNECT_IND`; the shared handshake; `ME_SET_CONTROL_PORT_REQ` | a name the last sweep did not hear is swept for first, and not heard means NOT FOUND - the vendor's broadcast-BSSID form is not used, because nothing has shown the firmware accepts it |
+| keys | `MM_KEY_ADD_REQ`: pairwise against `ap_idx` at index 0, group against `0xff` at its key id | as `rwnx_cfg80211_add_key` |
+| `disassoc` | `SM_DISCONNECT_REQ`, reason 3 | as `rwnx_close` |
+| `radio_down` / `radio_up` | `MM_REMOVE_IF_REQ` and `MM_RESET_REQ`; then the stage-9 bring-up again | the vendor driver has no radio switch; this is what `rwnx_close` and `rwnx_open` do |
+| `link` | the BSSID of the last `SM_CONNECT_IND`, cleared by any `SM_DISCONNECT_IND` read; the RSSI asked each time (`MM_GET_STA_INFO_REQ`) | |
+| `send` / `pull` | the 28-byte host descriptor out; in, the 60-byte header, then 802.11 to ethernet (DA = address 1, SA = address 3) | only frames with the header's `upload` flag; the CCMP header is skipped when `decr_status` says CCMP, not by the frame's protected bit |
+
+**What this card cannot show: traffic.** `nic-driver` bridges to the radio only where `nic_radio_bridge` is
+set, and on the VisionFive it is not (`services/supervisor/build.rs`). So a join here associates and runs
+the handshake, and `wifi status` reports the link and its signal, but no frame is pulled except during a
+join - which also means a group-key rekey, answered from `pull`, is not answered on this board yet, and
+the access point will drop the link at its rekey interval (often an hour). The bridge is phase V6.
+
+**The receive layout, from the source (2026-10-05).** A data packet has no separate bus header: its first
+word is `hw_rxhdr`'s, whose low 16 bits are the length of the frame AFTER the header. The header is 56
+bytes plus 4 of SDIO alignment, 60 in all; `flags_upload` is bit 6 of byte 48, `flags_is_80211_mpdu` bit 1,
+`decr_status` bits 2..4 of byte 36. The payload is a raw 802.11 frame. A CCMP frame's IV is still in
+place; whether its MIC is counted in the length the source does not show (the line that would strip it is
+commented out), so a body may carry 8 trailing bytes, which EAPOL and IP bound by their own lengths.
+Transmit confirms come back as type `0x12` packets and are the vendor driver's bookkeeping only; nothing
+goes back to the chip.
+
 ## 5. The AIC8800 bus and the firmware upload
 
 **Function 1 registers** (the D80's "V3" map, all CMD52): `0x00` interrupt enable, `0x01` pending (bit
@@ -270,10 +367,9 @@ runs over EAPOL data frames, the keys go in with `MM_KEY_ADD_REQ` (`0x24`: pairw
 index, group against `0xFF`, cipher 2 = CCMP), and **`ME_SET_CONTROL_PORT_REQ` (`0x1404`) opens the port** -
 a step the Broadcom firmware does implicitly. Leaving: `SM_DISCONNECT_REQ` / `_IND`.
 
-**The handshake moves to `sdk/wifi`** in step V5 below. Today `Handshake::on_key_frame` reaches the chip
-through exactly two Broadcom calls, `ctrl::send_data` and `ctrl::install_key`, at four sites. Behind a
-three-method interface (send an EAPOL frame, install a pairwise key for a peer, install a group key) it
-serves both chips, and the rekey work (`backlog/64`) comes with it rather than being redone.
+**The handshake is in `sdk/wifi`** (`supplicant.rs`, moved 2026-10-05). It reached the chip through
+exactly two Broadcom calls, `ctrl::send_data` and `ctrl::install_key`; behind a two-method `KeyPath` it
+serves both chips, and the rekey work (`backlog/64`) came with it rather than being redone.
 
 **Data**: transmit is 802.3-shaped - a 28-byte descriptor carrying the destination, source and ethertype,
 then the payload - and the firmware does the 802.11 encapsulation and the encryption. **Receive is not**:

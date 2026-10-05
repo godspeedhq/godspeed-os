@@ -48,6 +48,10 @@ mod aic;
 #[cfg(wifi_host_dw_mmc)]
 mod aic_fw;
 #[cfg(wifi_host_dw_mmc)]
+mod aic_station;
+#[cfg(wifi_host_dw_mmc)]
+mod aic_wire;
+#[cfg(wifi_host_dw_mmc)]
 mod dwmmc;
 mod ctrl;
 mod frames;
@@ -392,14 +396,62 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
                     && aic::patch_config(&h, aic_fw::FMAC, ctx)
                     && aic::start_app(&h, ctx).is_some();
                 ctx.log(if started {
-                    "wifi-driver: stage 7 - fmacfw is uploaded, configured and STARTED; talking to it is V3, so this still answers radio down"
+                    "wifi-driver: stage 7 - fmacfw is uploaded, configured and STARTED"
                 } else {
                     "wifi-driver: stage 7 - the firmware was not started; the line above names the step"
                 });
+                // ---- Stage 8 (V3, first card): the running firmware's bring-up, to its version and MAC. ----
+                if started {
+                    match aic::bring_up(&h, ctx) {
+                        Some(f) => {
+                            let m = f.mac;
+                            ctx.log_fmt(format_args!(
+                                "wifi-driver: stage 8 - the firmware answers: version \"{}\", MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, 5 GHz {}",
+                                core::str::from_utf8(&f.version[..f.version_len]).unwrap_or("(not text)"),
+                                m[0], m[1], m[2], m[3], m[4], m[5],
+                                if f.five_ghz { "yes" } else { "no" }));
+                            // ---- Stage 9 (V3, second card): configured, started, one station interface. ----
+                            match aic::bring_up_station(&h, f.mac, f.five_ghz, ctx) {
+                                Some(i) => {
+                                    ctx.log_fmt(format_args!(
+                                        "wifi-driver: stage 9 - the firmware is up with a station interface (index {}) at its own MAC. V3 done",
+                                        i.index));
+                                    // ---- Stage 10 (V4, first card): one scan, logged. Not yet `wifi scan` - that is
+                                    // the serve loop's, through a `Station`, and comes once this has worked. --------
+                                    let mut scan = godspeed_wifi::bss::Scan::new();
+                                    let e = aic::scan_once(&h, i.index, f.five_ghz, &mut scan, godspeed::driver::wait::Budget::ms(15_000), ctx);
+                                    for n in scan.networks() {
+                                        let b = n.bssid;
+                                        ctx.log_fmt(format_args!(
+                                            "wifi-driver:   {:<32}  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  ch {:>3}  {:>4} dBm  security {}",
+                                            core::str::from_utf8(&n.ssid[..n.ssid_len as usize]).unwrap_or("(not text)"),
+                                            b[0], b[1], b[2], b[3], b[4], b[5], n.chanspec, n.rssi, n.security));
+                                    }
+                                    match e.ended {
+                                        Some((status, count)) => ctx.log_fmt(format_args!(
+                                            "wifi-driver: stage 10 - the scan ENDED (status {}, the firmware counts {} result(s)) after {} ms: {} indication(s), {} network(s), {} unreadable, {} not kept",
+                                            status, count, e.ms, e.results, scan.count(), e.unreadable, scan.dropped)),
+                                        None => ctx.log_fmt(format_args!(
+                                            "wifi-driver: stage 10 - the scan did not end within {} ms: {} indication(s), {} network(s) so far, {} unreadable",
+                                            e.ms, e.results, scan.count(), e.unreadable)),
+                                    }
+                                    // ---- Stage 11 (V4, second card): the radio as a `Station`, under the serve loop
+                                    // the Pi 4's runs under - `wifi scan`, `wifi join`, `/wifi.keys` and the frame
+                                    // path are the loop's from here (`aic_station.rs`). It does not return. ----
+                                    ctx.log("wifi-driver: stage 11 - the AIC8800 is a station; serving `wifi` and the frame path");
+                                    let mut station = aic_station::Aic::new(&h, i.index, &f);
+                                    serve_radio(ctx, &h, Some(&mut station as &mut dyn Station), scan::reply::DOWN_NO_RADIO);
+                                }
+                                None => ctx.log("wifi-driver: stage 9 - the station bring-up stopped; the line above names the message"),
+                            }
+                        }
+                        None => ctx.log("wifi-driver: stage 8 - the running firmware's bring-up stopped; the line above names the message"),
+                    }
+                }
             }
         }
     }
-    ctx.log("wifi-driver: talking to the AIC8800's firmware (phase V3 on) is not built yet, so this answers `radio down`, reason 4 (DOWN_NOT_BUILT)");
+    ctx.log("wifi-driver: the AIC8800 did not come up as far as a station interface - the line above names the step - so this answers `radio down`, reason 4 (DOWN_NOT_BUILT)");
     serve_unavailable_why(ctx, Some(&h), why)
 }
 

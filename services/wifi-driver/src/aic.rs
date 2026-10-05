@@ -18,10 +18,16 @@ use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
 use godspeed_wifi::sdio::{self as sd, SdioHost};
 
+use crate::aic_wire::{
+    add_if, build_frame, chan_config, channel_of, parse_result, scanu_start, le32, mm_start, rf_calib, txpwr_lvl_v3, Groups, BLOCK, CHAN_TX_POWER_DBM, COEX,
+    FRAME_MAX, ME_CONFIG,
+};
+
+/// `BLOCK` as the SDIO layer takes it.
+const BLOCK_U32: u32 = BLOCK as u32;
+
 /// Function 1 is the whole bus on the D80: the vendor driver assigns no message function for this part.
 const F1: u8 = 1;
-/// The block size the vendor driver gives function 1, and the unit its transfers are padded to.
-const BLOCK: u32 = 512;
 
 // Function 1's registers, the D80's "V3" map (`aicsdio.h`).
 const REG_INTR_ENABLE: u32 = 0x00;
@@ -49,7 +55,6 @@ const STATUS_BYTE_MODE: u8 = 120;
 const FW_BUFFER: u32 = 1536;
 
 /// The bus header's type byte for a host-to-chip command, and the receive side's for a command response.
-const TYPE_CMD: u8 = 0x11;
 const TYPE_CFG_CMD_RSP: u8 = 0x11;
 /// Receive: type bit 4 set is a configuration packet (a message); clear is a data packet.
 const TYPE_CFG: u8 = 0x10;
@@ -60,35 +65,13 @@ const RX_HW_HDR: usize = 60;
 const DBG_MEM_READ_REQ: u16 = 0x0400;
 const DBG_MEM_READ_CFM: u16 = 0x0401;
 const TASK_DBG: u16 = 1;
-const DRV_TASK_ID: u16 = 100;
 
 /// The register whose value carries the chip revision, read first by `aicbsp_driver_fw_init`.
 pub const CHIP_ID_ADDR: u32 = 0x4050_0000;
 
-/// The largest reply this first exchange reads: four blocks. A memory-read confirm is a 24-byte packet,
-/// so anything near this is a surprise worth reporting rather than a buffer to grow.
-const RX_MAX_BLOCKS: usize = 4;
-
-/// CRC-8 over the bus header's first three bytes: polynomial `0x07`, initial 0, as `crc8_ponl_107` writes
-/// it. The D80 checks it; a wrong one is refused by the chip without a word.
-fn crc8(bytes: &[u8]) -> u8 {
-    let mut crc: u8 = 0;
-    for &b in bytes {
-        let mut i: u8 = 0x80;
-        while i > 0 {
-            if crc & 0x80 != 0 {
-                crc = (crc << 1) ^ 0x07;
-            } else {
-                crc <<= 1;
-            }
-            if b & i != 0 {
-                crc ^= 0x07;
-            }
-            i >>= 1;
-        }
-    }
-    crc
-}
+/// The largest reply read at once: eight blocks. A confirm is a few dozen bytes; the room is for the
+/// running firmware's print packets arriving alongside one. Anything larger is reported and left unread.
+const RX_MAX_BLOCKS: usize = 8;
 
 fn rd(h: &dyn SdioHost, reg: u32) -> Option<u8> {
     sd::read_reg(h, F1, reg)
@@ -102,7 +85,7 @@ fn wr(h: &dyn SdioHost, func: u8, reg: u32, v: u8) -> bool {
 /// this host never takes, but the chip may gate the status register's reporting on them, so they are
 /// set exactly as the reference sets them.
 fn setup(h: &dyn SdioHost, ctx: &ServiceContext) -> bool {
-    if !sd::set_block_size(h, F1, BLOCK as u16, ctx) || !sd::enable_function(h, F1, ctx) {
+    if !sd::set_block_size(h, F1, BLOCK_U32 as u16, ctx) || !sd::enable_function(h, F1, ctx) {
         return false;
     }
     let steps: [(u8, u32, u8, &str); 4] = [
@@ -165,64 +148,54 @@ fn free_buffers(h: &dyn SdioHost, ctx: &ServiceContext) -> u8 {
     }
 }
 
-/// The largest frame the vendor driver sends, `CMD_BUF_MAX`: a block write's 1032 parameter bytes and its
-/// headers, rounded to three 512-byte blocks.
-const FRAME_MAX: usize = 1536;
-
 /// Build and send one host-to-chip message (`rwnx_set_cmd_tx` + `aicwf_sdio_tx_msg`): the 4-byte bus header
 /// `[len lo, len hi (4 bits), 0x11, crc8]` where `len` counts what follows it, a zero word, the 8-byte
 /// message header `{id, dest, src, param_len}`, the parameters; then, if that is not a whole number of
 /// 512-byte blocks, a 4-byte zero tail and zeros up to the next whole block. A frame of one block goes in
 /// byte mode and a longer one in block mode (`sd::write_fifo`, the Linux core's choice). `quiet` drops the
 /// per-message line, for the upload's hundreds of blocks.
-fn send_msg(h: &dyn SdioHost, id: u16, dest: u16, param: &[u8], quiet: bool, ctx: &ServiceContext) -> bool {
-    let len = 4 + 8 + param.len(); // the dummy word, the message header, the parameters
-    let mut total = (4 + len + 3) & !3;
-    if total % BLOCK as usize != 0 {
-        total = (total + 4).div_ceil(BLOCK as usize) * BLOCK as usize;
-    }
-    if total > FRAME_MAX || len > 0xfff {
-        ctx.log_fmt(format_args!("wifi-driver: AIC message {:#06x} is {} bytes, past the {}-byte frame - not sent", id, total, FRAME_MAX));
-        return false;
-    }
+pub(crate) fn send_msg(h: &dyn SdioHost, id: u16, dest: u16, param: &[u8], quiet: bool, ctx: &ServiceContext) -> bool {
     let mut frame = [0u8; FRAME_MAX];
-    frame[0] = (len & 0xff) as u8;
-    frame[1] = ((len >> 8) & 0x0f) as u8;
-    frame[2] = TYPE_CMD;
-    frame[3] = crc8(&frame[0..3]);
-    let m = 8; // after the header and the zero word
-    frame[m..m + 2].copy_from_slice(&id.to_le_bytes());
-    frame[m + 2..m + 4].copy_from_slice(&dest.to_le_bytes());
-    frame[m + 4..m + 6].copy_from_slice(&DRV_TASK_ID.to_le_bytes());
-    frame[m + 6..m + 8].copy_from_slice(&(param.len() as u16).to_le_bytes());
-    frame[m + 8..m + 8 + param.len()].copy_from_slice(param);
+    let Some(total) = build_frame(id, dest, param, &mut frame) else {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: AIC message {:#06x} with {} parameter bytes does not fit the {}-byte frame - not sent",
+            id, param.len(), FRAME_MAX));
+        return false;
+    };
+    if !quiet {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: AIC sending message {:#06x} to task {} ({} parameter byte(s); header {:02x} {:02x} {:02x} {:02x})",
+            id, dest, param.len(), frame[0], frame[1], frame[2], frame[3]));
+    }
+    push_frame(h, &frame, total, id, ctx)
+}
+
+/// Put one built frame on the bus - a message or a data frame, the same way (`aicwf_sdio_send`): only when
+/// the chip has room for it, then through the write FIFO. `what` names it in a refusal: a message id, or
+/// `0xffff` for data.
+pub(crate) fn push_frame(h: &dyn SdioHost, frame: &[u8; FRAME_MAX], total: usize, what: u16, ctx: &ServiceContext) -> bool {
 
     // Sent only when the chip has MORE room than the frame: `len < buffer_cnt * BUFFER_SIZE`, strictly, so
     // a three-block frame needs two free buffers.
     let n = free_buffers(h, ctx);
     if n == 0 || total as u32 >= n as u32 * FW_BUFFER {
         ctx.log_fmt(format_args!(
-            "wifi-driver: AIC flow control reports {} free firmware buffer(s) after 20 ms, {} needed for {} bytes - message {:#06x} was not sent",
-            n, total / FW_BUFFER as usize + 1, total, id));
+            "wifi-driver: AIC flow control reports {} free firmware buffer(s) after 20 ms, {} needed for {} bytes - frame {:#06x} was not sent",
+            n, total / FW_BUFFER as usize + 1, total, what));
         return false;
-    }
-    if !quiet {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: AIC sending message {:#06x} to task {} ({} parameter byte(s); header {:02x} {:02x} {:02x} {:02x}; {} free buffer(s))",
-            id, dest, param.len(), frame[0], frame[1], frame[2], frame[3], n));
     }
     // The frame becomes words in place of a second buffer: the FIFO takes them little-endian.
     let mut words = [0u32; FRAME_MAX / 4];
     for (i, w) in words[..total / 4].iter_mut().enumerate() {
         *w = u32::from_le_bytes([frame[4 * i], frame[4 * i + 1], frame[4 * i + 2], frame[4 * i + 3]]);
     }
-    sd::write_fifo(h, F1, REG_WR_FIFO, &mut words[..total / 4], BLOCK, ctx)
+    sd::write_fifo(h, F1, REG_WR_FIFO, &mut words[..total / 4], BLOCK_U32, ctx)
 }
 
 /// Poll for what the chip has to say, as `aicwf_sdio_hal_irqhandler` would on an interrupt: read the status
 /// register; acknowledge a soft interrupt; and when it names a length, read that much from the read FIFO.
 /// Returns the number of bytes read into `buf`, 0 when nothing came within `budget`.
-fn receive(h: &dyn SdioHost, buf: &mut [u32; RX_MAX_BLOCKS * BLOCK as usize / 4], budget: Budget, quiet: bool, ctx: &ServiceContext) -> usize {
+pub(crate) fn receive(h: &dyn SdioHost, buf: &mut [u32], budget: Budget, quiet: bool, ctx: &ServiceContext) -> usize {
     let mut d = wait::Deadline::paced(ctx, budget, Budget::ms(1));
     let mut looks = 0u32;
     loop {
@@ -244,20 +217,24 @@ fn receive(h: &dyn SdioHost, buf: &mut [u32; RX_MAX_BLOCKS * BLOCK as usize / 4]
                     "wifi-driver: AIC status {:#04x} falls in the vendor driver's function-2 branch, which the D80 has no function for - not read", st));
                 return 0;
             } else {
-                (st & 0x7f) as usize * BLOCK as usize
+                (st & 0x7f) as usize * BLOCK
             };
             if !quiet {
                 ctx.log_fmt(format_args!(
                     "wifi-driver: AIC status {:#04x} after {} look(s) - {} byte(s) to read", st, looks, bytes));
             }
             if bytes == 0 || bytes > buf.len() * 4 || bytes % 4 != 0 {
-                ctx.log("wifi-driver: AIC reply length is not one this first exchange reads - left unread");
+                ctx.log_fmt(format_args!("wifi-driver: AIC has {} bytes waiting, more than the {}-byte read - left unread", bytes, buf.len() * 4));
                 return 0;
             }
             let words = &mut buf[..bytes / 4];
-            return if sd::read_fifo(h, F1, REG_RD_FIFO, words, BLOCK, ctx) { bytes } else { 0 };
+            return if sd::read_fifo(h, F1, REG_RD_FIFO, words, BLOCK_U32, ctx) { bytes } else { 0 };
         }
         if d.expired() {
+            // Silence is the caller's to report when it is quiet: a scan polls through quiet stretches.
+            if quiet {
+                return 0;
+            }
             ctx.log_fmt(format_args!(
                 "wifi-driver: AIC said nothing in {} ms ({} looks at F1 0x04; F1 0x01 = {:#04x}, F1 0x03 = {:#04x})",
                 budget.as_us() / 1000, looks, rd(h, REG_PENDING).unwrap_or(0), rd(h, REG_FLOW_CTRL).unwrap_or(0)));
@@ -268,14 +245,23 @@ fn receive(h: &dyn SdioHost, buf: &mut [u32; RX_MAX_BLOCKS * BLOCK as usize / 4]
 }
 
 
-/// Find the confirm `want` among the packets in `bytes` (`aicwf_process_rxframes`): each packet starts with
-/// a 16-bit length and a type byte; a configuration packet's message sits right after its 4-byte header as
-/// `{id, dest, src, param_len, pattern, param...}`, and a data packet is skipped with its hardware header.
-/// Returns the confirm's parameter length and its first eight parameter bytes (zero past its length).
-fn find_cfm(bytes: &[u8], want: u16, quiet: bool, ctx: &ServiceContext) -> Option<(usize, [u8; 8])> {
+/// How many parameter bytes of a confirm are kept: the firmware version's `{len, str[63]}` is the largest
+/// this driver reads.
+pub const CFM_MAX: usize = 64;
+
+/// A configuration packet carrying the firmware's own print text (`rwnx_rx_handle_print`, "FWLOG").
+const TYPE_CFG_PRINT: u8 = 0x13;
+
+/// Walk the packets in `bytes` (`aicwf_process_rxframes`): each starts with a 16-bit length and a type byte;
+/// a configuration packet's message sits right after its 4-byte header as `{id, dest, src, param_len,
+/// pattern, param...}`, a print packet carries text, and a data packet is skipped with its hardware header.
+/// Returns the confirm `want` - its parameter length and up to `CFM_MAX` parameter bytes - if one is there.
+/// Every other message is an indication, as `cmd_mgr_msgind` treats one, and is logged.
+fn find_cfm(bytes: &[u8], want: u16, quiet: bool, ctx: &ServiceContext) -> Option<(usize, [u8; CFM_MAX])> {
     let mut at = 0usize;
     let mut packets = 0u32;
-    while at + 4 <= bytes.len() && packets < 16 {
+    let mut found = None;
+    while at + 4 <= bytes.len() && packets < 32 {
         packets += 1;
         let plen = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
         let ty = bytes[at + 2];
@@ -288,64 +274,79 @@ fn find_cfm(bytes: &[u8], want: u16, quiet: bool, ctx: &ServiceContext) -> Optio
             continue;
         }
         let m = at + 4;
-        if ty & 0x7f == TYPE_CFG_CMD_RSP && m + 12 <= bytes.len() {
+        let end = (m + plen).min(bytes.len());
+        if ty & 0x7f == TYPE_CFG_PRINT {
+            let text = &bytes[m..end];
+            let text = &text[..text.iter().position(|&b| b == 0).unwrap_or(text.len())];
+            let text = core::str::from_utf8(text).unwrap_or("(not text)");
+            ctx.log_fmt(format_args!("wifi-driver: AIC firmware says: {}", text.trim_end()));
+        } else if ty & 0x7f == TYPE_CFG_CMD_RSP && m + 12 <= bytes.len() {
             let id = u16::from_le_bytes([bytes[m], bytes[m + 1]]);
             let param_len = u16::from_le_bytes([bytes[m + 6], bytes[m + 7]]) as usize;
-            if !quiet || id != want {
-                ctx.log_fmt(format_args!(
-                    "wifi-driver: AIC receive - message {:#06x} with {} parameter byte(s) (packet type {:#04x}, length {})",
-                    id, param_len, ty, plen));
-            }
-            if id == want {
-                let mut p = [0u8; 8];
-                let n = param_len.min(8).min(bytes.len().saturating_sub(m + 12));
+            if id == want && found.is_none() {
+                if !quiet {
+                    ctx.log_fmt(format_args!(
+                        "wifi-driver: AIC receive - message {:#06x} with {} parameter byte(s) (packet type {:#04x}, length {})",
+                        id, param_len, ty, plen));
+                }
+                let mut p = [0u8; CFM_MAX];
+                let n = param_len.min(CFM_MAX).min(bytes.len().saturating_sub(m + 12));
                 p[..n].copy_from_slice(&bytes[m + 12..m + 12 + n]);
-                return Some((param_len, p));
+                found = Some((param_len, p));
+            } else {
+                ctx.log_fmt(format_args!(
+                    "wifi-driver: AIC receive - message {:#06x} with {} parameter byte(s) that nothing asked for (an indication)",
+                    id, param_len));
             }
         } else {
             ctx.log_fmt(format_args!("wifi-driver: AIC receive - a configuration packet of type {:#04x}, length {}", ty, plen));
         }
         at += ((plen + 3) & !3) + 4;
     }
-    if !quiet {
-        ctx.log_fmt(format_args!("wifi-driver: AIC receive - no {:#06x} confirm among {} packet(s)", want, packets));
-    }
-    None
+    found
 }
 
-/// One request to the chip's ROM and its confirm: send `id` with `param`, poll for the reply, find `cfm`.
-/// Returns the confirm's parameter length and first eight bytes. `quiet` keeps a successful exchange off
-/// the log; a failure always says which step it was.
-fn request(h: &dyn SdioHost, id: u16, param: &[u8], cfm: u16, quiet: bool, ctx: &ServiceContext) -> Option<(usize, [u8; 8])> {
-    if !send_msg(h, id, TASK_DBG, param, quiet, ctx) {
+/// One request and its confirm: send `id` to task `dest` with `param`, then read what the chip has to say
+/// until the confirm `cfm` is among it or `CFM_WAIT` runs out - a reply that holds only a firmware print or
+/// an indication is read past, not taken for a missing confirm. Returns the confirm's parameter length and
+/// first `CFM_MAX` bytes. `quiet` keeps a successful exchange off the log; a failure always says which step.
+fn request_to(h: &dyn SdioHost, id: u16, dest: u16, param: &[u8], cfm: u16, quiet: bool, ctx: &ServiceContext) -> Option<(usize, [u8; CFM_MAX])> {
+    /// The vendor driver waits six seconds for a confirm; a ROM or firmware that has answered every
+    /// request in milliseconds is given two.
+    const CFM_WAIT: Budget = Budget::ms(2_000);
+    if !send_msg(h, id, dest, param, quiet, ctx) {
         return None;
     }
-    let mut buf = [0u32; RX_MAX_BLOCKS * BLOCK as usize / 4];
-    let n = receive(h, &mut buf, Budget::ms(1_000), quiet, ctx);
-    if n == 0 {
-        if quiet {
-            ctx.log_fmt(format_args!("wifi-driver: AIC request {:#06x} got no reply", id));
+    let mut d = wait::Deadline::start(ctx, CFM_WAIT);
+    let mut reads = 0u32;
+    loop {
+        let mut buf = [0u32; RX_MAX_BLOCKS * BLOCK / 4];
+        let n = receive(h, &mut buf, Budget::ms(1_000), quiet, ctx);
+        if n > 0 {
+            reads += 1;
+            let mut bytes = [0u8; RX_MAX_BLOCKS * BLOCK];
+            for (i, w) in buf[..n / 4].iter().enumerate() {
+                bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            if !quiet {
+                ctx.log_fmt(format_args!("wifi-driver: AIC receive - first 16 bytes {:02x?}", &bytes[..16.min(n)]));
+            }
+            if let Some(r) = find_cfm(&bytes[..n], cfm, quiet, ctx) {
+                return Some(r);
+            }
         }
-        return None;
+        if d.expired() {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: AIC request {:#06x} - no {:#06x} confirm in {} ms ({} read(s))",
+                id, cfm, CFM_WAIT.as_us() / 1000, reads));
+            return None;
+        }
     }
-    let mut bytes = [0u8; RX_MAX_BLOCKS * BLOCK as usize];
-    for (i, w) in buf[..n / 4].iter().enumerate() {
-        bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    if !quiet {
-        ctx.log_fmt(format_args!("wifi-driver: AIC receive - first 16 bytes {:02x?}", &bytes[..16.min(n)]));
-    }
-    let r = find_cfm(&bytes[..n], cfm, quiet, ctx);
-    if r.is_none() && quiet {
-        ctx.log_fmt(format_args!(
-            "wifi-driver: AIC request {:#06x} - the reply held no {:#06x} confirm (first 16 bytes {:02x?})",
-            id, cfm, &bytes[..16.min(n)]));
-    }
-    r
 }
 
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+/// A request to the debug task, which every ROM exchange is.
+fn request(h: &dyn SdioHost, id: u16, param: &[u8], cfm: u16, quiet: bool, ctx: &ServiceContext) -> Option<(usize, [u8; CFM_MAX])> {
+    request_to(h, id, TASK_DBG, param, cfm, quiet, ctx)
 }
 
 /// Read one 32-bit word of the chip's memory through its ROM: `DBG_MEM_READ_REQ` out, `DBG_MEM_READ_CFM`
@@ -384,43 +385,6 @@ pub struct PatchInfo {
     pub adid: u32,
     pub patch: u32,
     pub ext0: u32,
-}
-
-/// The table's groups as `(name, type, pairs)`, walked as `aicbt_patch_table_alloc` walks them: a 16-byte
-/// file tag, then `name[16], type u32, len u32, len * (addr u32, value u32)` to the end of the file.
-pub struct Groups<'t> {
-    t: &'t [u8],
-    at: usize,
-}
-
-impl<'t> Groups<'t> {
-    pub fn new(t: &'t [u8]) -> Option<Self> {
-        if t.len() < 16 || &t[..12] != b"AICBT_PT_TAG" {
-            return None;
-        }
-        Some(Groups { t, at: 16 })
-    }
-}
-
-impl<'t> Iterator for Groups<'t> {
-    /// `(name, type, the pairs' bytes)`.
-    type Item = (&'t [u8], u32, &'t [u8]);
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.at + 24 > self.t.len() {
-            return None;
-        }
-        let name = &self.t[self.at..self.at + 16];
-        let ty = le32(self.t, self.at + 16);
-        let len = le32(self.t, self.at + 20) as usize;
-        let start = self.at + 24;
-        let end = start.checked_add(len.checked_mul(8)?)?;
-        if end > self.t.len() {
-            return None;
-        }
-        self.at = end;
-        let name_len = name.iter().position(|&b| b == 0).unwrap_or(16);
-        Some((&name[..name_len], ty, &self.t[start..end]))
-    }
 }
 
 /// Read the load addresses out of the table's first group, refusing a table that does not have the shape
@@ -645,4 +609,260 @@ pub fn start_app(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<u32> {
         "wifi-driver: AIC start confirmed - boot status {:#010x} ({} parameter bytes); F1 0x02 = 4 {}",
         status, len, if handed { "written" } else { "REFUSED" }));
     Some(status)
+}
+
+// ------------------------------------------------------------------------- the running firmware (V3)
+
+/// The firmware's own tasks: the MAC management task most requests go to.
+pub(crate) const TASK_MM: u16 = 0;
+
+// `enum mm_msg_tag` (`lmac_msg.h`), `LMAC_FIRST_MSG(TASK_MM)` = 0, each confirm one past its request.
+const MM_SET_RF_CALIB_REQ: u16 = 0x0069;
+const MM_GET_MAC_ADDR_REQ: u16 = 0x0073;
+const MM_SET_TXPWR_IDX_LVL_REQ: u16 = 0x0077;
+const MM_SET_STACK_START_REQ: u16 = 0x007B;
+const MM_GET_FW_VERSION_REQ: u16 = 0x0080;
+
+/// What the running firmware said about itself.
+pub struct FwFacts {
+    pub version: [u8; 63],
+    pub version_len: usize,
+    pub mac: [u8; 6],
+    pub five_ghz: bool,
+}
+
+/// The running firmware's bring-up, as `aicwf_sdio_probe` and `rwnx_cfg80211_init` begin it for the D80,
+/// up to the MAC address: the wake check the runtime driver adds, the sub-id read, stack start, firmware
+/// version, the two RF messages the defaults send (`aicwf_set_rf_config_8800d80`), then the MAC. The vendor
+/// driver goes on past any confirm that fails; this one stops and says which, because a step that failed is
+/// the next thing to look at.
+pub fn bring_up(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<FwFacts> {
+    // The runtime driver's own wake check: write the wake value, 5 ms, read the awake bit. It only logs.
+    let _ = wr(h, F1, REG_TO_DEVICE, WAKE);
+    delay::hold(ctx, Budget::ms(5));
+    let p = rd(h, REG_PENDING).unwrap_or(0);
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC after the start - F1 0x01 = {:#04x} ({})",
+        p, if p & AWAKE_BIT != 0 { "awake" } else { "NOT showing awake; the vendor driver logs this and goes on" }));
+
+    let sub = mem_read(h, 0x0000_0020, false, ctx)?;
+    ctx.log_fmt(format_args!("wifi-driver: AIC chip sub-id {:#04x} (the word at 0x20 is {:#010x})", sub & 0xff, sub));
+
+    let (_, c) = request_to(h, MM_SET_STACK_START_REQ, TASK_MM, &[1, 0, 0x20, 0], MM_SET_STACK_START_REQ + 1, false, ctx)?;
+    let five_ghz = c[0] != 0;
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC stack started - 5 GHz {}, vendor info {:#04x}", if five_ghz { "supported" } else { "not supported" }, c[1]));
+
+    let (len, c) = request_to(h, MM_GET_FW_VERSION_REQ, TASK_MM, &[0], MM_GET_FW_VERSION_REQ + 1, false, ctx)?;
+    let mut version = [0u8; 63];
+    let vlen = (c[0] as usize).min(63).min(len.saturating_sub(1));
+    version[..vlen].copy_from_slice(&c[1..1 + vlen]);
+
+    let (_, c) = request_to(h, MM_SET_TXPWR_IDX_LVL_REQ, TASK_MM, &txpwr_lvl_v3(), MM_SET_TXPWR_IDX_LVL_REQ + 1, false, ctx)?;
+    ctx.log_fmt(format_args!("wifi-driver: AIC transmit power table taken (confirm starts {:02x?})", &c[..4]));
+    let (_, c) = request_to(h, MM_SET_RF_CALIB_REQ, TASK_MM, &rf_calib(), MM_SET_RF_CALIB_REQ + 1, false, ctx)?;
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC RF calibrated - rx gain tables at {:#010x} / {:#010x}, tx at {:#010x} / {:#010x}",
+        le32(&c, 0), le32(&c, 4), le32(&c, 8), le32(&c, 12)));
+
+    let (_, c) = request_to(h, MM_GET_MAC_ADDR_REQ, TASK_MM, &1u32.to_le_bytes(), MM_GET_MAC_ADDR_REQ + 1, false, ctx)?;
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&c[..6]);
+    Some(FwFacts { version, version_len: vlen, mac, five_ghz })
+}
+
+/// The firmware's station-management task, which the `ME_*` messages go to.
+pub(crate) const TASK_ME: u16 = 5;
+
+pub(crate) const MM_RESET_REQ: u16 = 0x0000;
+const MM_START_REQ: u16 = 0x0002;
+const MM_VERSION_REQ: u16 = 0x0004;
+const MM_ADD_IF_REQ: u16 = 0x0006;
+const MM_SET_COEX_REQ: u16 = 0x0065;
+const ME_CONFIG_REQ: u16 = 0x1400;
+const ME_CHAN_CONFIG_REQ: u16 = 0x1402;
+
+/// The interface the firmware made for this driver: its index, which every later message names.
+pub struct Interface {
+    pub index: u8,
+}
+
+/// The rest of the bring-up, in the vendor runtime driver's order (`rwnx_cfg80211_init`, then `rwnx_open`
+/// for the first interface): reset, version, the capability and channel configuration, start, Bluetooth
+/// coexistence, and one station interface at the firmware's own MAC address. Each confirm is required;
+/// the vendor driver checks only the last one's status, this one stops at whichever fails and says so.
+pub fn bring_up_station(h: &dyn SdioHost, mac: [u8; 6], five_ghz: bool, ctx: &ServiceContext) -> Option<Interface> {
+    request_to(h, MM_RESET_REQ, TASK_MM, &[], MM_RESET_REQ + 1, false, ctx)?;
+    ctx.log("wifi-driver: AIC firmware reset");
+
+    let (len, c) = request_to(h, MM_VERSION_REQ, TASK_MM, &[], MM_VERSION_REQ + 1, false, ctx)?;
+    let lmac = le32(&c, 0);
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC LMAC {}.{}.{}.{}, MAC hardware {:#010x} {:#010x}, PHY {:#010x} {:#010x}, features {:#010x}, {} stations, {} interfaces ({} bytes)",
+        lmac >> 24, (lmac >> 16) & 0xff, (lmac >> 8) & 0xff, lmac & 0xff,
+        le32(&c, 4), le32(&c, 8), le32(&c, 12), le32(&c, 16), le32(&c, 20),
+        u16::from_le_bytes([c[24], c[25]]), c[26], len));
+
+    request_to(h, ME_CONFIG_REQ, TASK_ME, &ME_CONFIG, ME_CONFIG_REQ + 1, false, ctx)?;
+    ctx.log("wifi-driver: AIC capabilities configured (HT, VHT, HE; one stream, 80 MHz)");
+    let chans = chan_config(five_ghz);
+    request_to(h, ME_CHAN_CONFIG_REQ, TASK_ME, &chans, ME_CHAN_CONFIG_REQ + 1, false, ctx)?;
+    ctx.log_fmt(format_args!(
+        "wifi-driver: AIC channel list taken - {} at 2.4 GHz, {} at 5 GHz, {} dBm", chans[252], chans[253], CHAN_TX_POWER_DBM));
+
+    request_to(h, MM_START_REQ, TASK_MM, &mm_start(), MM_START_REQ + 1, false, ctx)?;
+    ctx.log("wifi-driver: AIC MAC started");
+    request_to(h, MM_SET_COEX_REQ, TASK_MM, &COEX, MM_SET_COEX_REQ + 1, false, ctx)?;
+
+    let (_, c) = request_to(h, MM_ADD_IF_REQ, TASK_MM, &add_if(mac), MM_ADD_IF_REQ + 1, false, ctx)?;
+    if c[0] != 0 {
+        ctx.log_fmt(format_args!("wifi-driver: AIC refused the station interface - status {:#04x}", c[0]));
+        return None;
+    }
+    Some(Interface { index: c[1] })
+}
+
+// ------------------------------------------------------------------------------------------ scan (V4)
+
+pub(crate) const TASK_SCANU: u16 = 4;
+pub(crate) const SCANU_START_REQ: u16 = 0x1000;
+/// The END of a scan: it arrives unsolicited after the last result, as `{vif_idx, status, result_cnt}`.
+pub(crate) const SCANU_START_CFM: u16 = 0x1001;
+pub(crate) const SCANU_RESULT_IND: u16 = 0x1004;
+/// The scan request's own confirm, which the vendor driver waits for and discards (`_ADDTIONAL`, sic).
+pub(crate) const SCANU_START_CFM_ADDITIONAL: u16 = 0x1009;
+
+/// The largest read the scan takes at once, in blocks: results queue up while the radio sweeps, and each
+/// carries a whole beacon.
+const SCAN_RX_BLOCKS: usize = 16;
+/// The bytes one read takes at most: the scan's 16 blocks, which is also the most a burst of data frames
+/// queues before it is read.
+pub(crate) const RX_BYTES: usize = SCAN_RX_BLOCKS * BLOCK;
+
+/// `receive`, into bytes: what the chip had waiting within `budget`, little-endian as the FIFO gives it.
+pub(crate) fn receive_bytes(h: &dyn SdioHost, bytes: &mut [u8; RX_BYTES], budget: Budget, quiet: bool, ctx: &ServiceContext) -> usize {
+    let mut buf = [0u32; RX_BYTES / 4];
+    let n = receive(h, &mut buf, budget, quiet, ctx);
+    for (i, w) in buf[..n / 4].iter().enumerate() {
+        bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    n
+}
+
+/// One packet out of a read: a message (id and its FULL parameters), or a data packet (the whole packet,
+/// its 60-byte receive header first).
+pub(crate) enum Packet<'a> {
+    Msg(u16, &'a [u8]),
+    Data(&'a [u8]),
+}
+
+/// Walk every packet in `bytes` as `aicwf_process_rxframes` does, handing each message (id and FULL
+/// parameters) and each data packet to `on`; firmware prints are logged, and the transmit confirms (type
+/// 0x12, the vendor driver's own bookkeeping, nothing owed to the chip) are passed over. Returns how many
+/// packets were handed on.
+pub(crate) fn walk_packets(bytes: &[u8], on: &mut dyn FnMut(Packet), ctx: &ServiceContext) -> u32 {
+    let mut at = 0usize;
+    let mut handed = 0u32;
+    let mut packets = 0u32;
+    while at + 4 <= bytes.len() && packets < 64 {
+        packets += 1;
+        let plen = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let ty = bytes[at + 2];
+        if plen == 0 {
+            break;
+        }
+        if ty & TYPE_CFG != TYPE_CFG {
+            // A data packet: the length counts the frame AFTER the 60-byte receive header.
+            let end = (at + RX_HW_HDR + plen).min(bytes.len());
+            on(Packet::Data(&bytes[at..end]));
+            handed += 1;
+            at += (plen + RX_HW_HDR + 3) & !3;
+            continue;
+        }
+        let m = at + 4;
+        let end = (m + plen).min(bytes.len());
+        if ty & 0x7f == TYPE_CFG_PRINT {
+            let text = &bytes[m..end];
+            let text = &text[..text.iter().position(|&b| b == 0).unwrap_or(text.len())];
+            ctx.log_fmt(format_args!(
+                "wifi-driver: AIC firmware says: {}", core::str::from_utf8(text).unwrap_or("(not text)").trim_end()));
+        } else if ty & 0x7f == TYPE_CFG_CMD_RSP && m + 12 <= end {
+            let id = u16::from_le_bytes([bytes[m], bytes[m + 1]]);
+            let param_len = u16::from_le_bytes([bytes[m + 6], bytes[m + 7]]) as usize;
+            let p_end = (m + 12 + param_len).min(end);
+            on(Packet::Msg(id, &bytes[m + 12..p_end]));
+            handed += 1;
+        }
+        at += ((plen + 3) & !3) + 4;
+    }
+    handed
+}
+
+/// `walk_packets`, messages only.
+fn walk_messages(bytes: &[u8], on: &mut dyn FnMut(u16, &[u8]), ctx: &ServiceContext) -> u32 {
+    walk_packets(bytes, &mut |p| if let Packet::Msg(id, params) = p { on(id, params) }, ctx)
+}
+
+/// What one sweep heard, and how it ended.
+pub struct SweepEnd {
+    /// The scan's own end message arrived (`SCANU_START_CFM`), with its status and result count.
+    pub ended: Option<(u8, u8)>,
+    /// Result indications received, and those that could not be read as a beacon.
+    pub results: u32,
+    pub unreadable: u32,
+    pub ms: u64,
+}
+
+/// One wildcard scan of every channel, start to end, outside the serve loop: the request, its confirm,
+/// every result into `scan` (deduplicated by BSSID, the strongest kept, security classified from the
+/// beacon's own elements by `sdk/wifi`), until the end message or `budget`. Polled, like everything here.
+pub fn scan_once(h: &dyn SdioHost, vif: u8, five_ghz: bool, scan: &mut godspeed_wifi::bss::Scan, budget: Budget, ctx: &ServiceContext) -> SweepEnd {
+    let mut end = SweepEnd { ended: None, results: 0, unreadable: 0, ms: 0 };
+    if !send_msg(h, SCANU_START_REQ, TASK_SCANU, &scanu_start(vif, five_ghz), false, ctx) {
+        return end;
+    }
+    let mut d = wait::Deadline::start(ctx, budget);
+    let mut confirmed = false;
+    while end.ended.is_none() {
+        let mut buf = [0u32; SCAN_RX_BLOCKS * BLOCK / 4];
+        let n = receive(h, &mut buf, Budget::ms(500), true, ctx);
+        if n > 0 {
+            let mut bytes = [0u8; SCAN_RX_BLOCKS * BLOCK];
+            for (i, w) in buf[..n / 4].iter().enumerate() {
+                bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            walk_messages(&bytes[..n], &mut |id, p| match id {
+                SCANU_START_CFM_ADDITIONAL => confirmed = true,
+                SCANU_RESULT_IND => {
+                    end.results += 1;
+                    match parse_result(p) {
+                        Some(r) => {
+                            let mut net = godspeed_wifi::bss::Network::blank();
+                            net.bssid = r.bssid();
+                            if let Some(s) = r.ssid() {
+                                net.ssid[..s.len()].copy_from_slice(s);
+                                net.ssid_len = s.len() as u8;
+                            }
+                            net.chanspec = channel_of(r.freq) as u16;
+                            net.rssi = r.rssi as i16;
+                            net.security = godspeed_wifi::bss::classify(r.ies(), r.capability());
+                            scan.keep(net);
+                        }
+                        None => end.unreadable += 1,
+                    }
+                }
+                SCANU_START_CFM => end.ended = Some((p.get(1).copied().unwrap_or(0xff), p.get(2).copied().unwrap_or(0))),
+                other => ctx.log_fmt(format_args!(
+                    "wifi-driver: AIC during the scan - message {:#06x} ({} parameter bytes), not a scan message", other, p.len())),
+            }, ctx);
+        }
+        if d.expired() {
+            break;
+        }
+    }
+    end.ms = d.elapsed_us() / 1000;
+    if !confirmed {
+        ctx.log("wifi-driver: AIC scan - the request's own confirm (0x1009) never came");
+    }
+    end
 }
