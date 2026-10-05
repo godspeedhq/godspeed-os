@@ -472,3 +472,4 @@ rwnx_rx_mgmt_any                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09
 rwnx_rxdataind_aicwf               # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the data receive path aic_wire.rs follows - external, 26.14
 rwnx_send_get_sta_info_req         # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the MM_GET_STA_INFO_REQ sender (aic_wire.rs) - external, 26.14
 rwnx_tx_push                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the transmit push that marks EAPOL for a confirm (aic_station.rs) - external, 26.14
+starfive_trng_init                 # Linux drivers/char/hw_random/jh7110-trng.c, the init sequence the riscv64 TRNG bring-up follows (arch/riscv64/mod.rs) - external, 26.14

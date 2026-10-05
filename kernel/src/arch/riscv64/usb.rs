@@ -69,8 +69,8 @@ const STGRST_USB: [(u32, &str); 5] =
 /// The system-top generator keeps its resets here - the same shape as the other two generators on
 /// this SoC: one bit per id in an assert word, and a status word that follows once the hardware
 /// agrees.
-const STGCRG_RESET_ASSERT: usize = 0x74;
-const STGCRG_RESET_STATUS: usize = 0x78;
+pub(super) const STGCRG_RESET_ASSERT: usize = 0x74;
+pub(super) const STGCRG_RESET_STATUS: usize = 0x78;
 
 /// The register that decides what the port IS. Both the syscon and this offset are named by the
 /// device tree (`starfive,stg-syscon = <phandle 0x4>`), so neither is a constant here by choice.

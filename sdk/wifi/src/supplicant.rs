@@ -76,7 +76,7 @@ pub fn forget(keys: &mut Option<Keys>) {
 }
 
 /// The station's nonce for one handshake. The hardware RNG where the kernel exposes one (`hw_random`: the
-/// Pi 4's RNG200 on aarch64); where it does not - riscv64 answers `None` today - the cycle counter, the
+/// Pi 4's RNG200, the VisionFive's JH7110 TRNG); where it does not, or it fails, the cycle counter, the
 /// access point's own nonce and our address hashed together, and the log SAYS SO, because a nonce from a
 /// counter is a real weakening that must not pass unremarked.
 fn snonce(ctx: &ServiceContext, anonce: &[u8; 32], mac: &[u8; 6]) -> [u8; 32] {

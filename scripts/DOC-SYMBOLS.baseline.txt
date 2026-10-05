@@ -79,3 +79,4 @@ set_pmk                            # docs/wifi-aic8800.md - Linux cfg80211 op, E
 dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXTERNAL; the second init order compared
 ap_max_inactivity                  # backlog/64 - hostapd configuration option, EXTERNAL; the access point idle timer that matches reason 4 after ~300 s
 mkeep_alive                        # backlog/64 - Broadcom firmware iovar Linux brcmfmac sets only for suspend, EXTERNAL
+SRVC_RQST                          # docs/wifi-aic8800.md - Linux jh7110-trng.c, STAT bit 27, EXTERNAL; cited because it is set after the first seed and nothing reads it

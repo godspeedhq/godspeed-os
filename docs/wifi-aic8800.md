@@ -471,9 +471,26 @@ command from a chip nobody has powered before. Everything after it is protocol.
   been tried.
 - The `5 MHz` versus `150 MHz` clock question in section 5.
 
-## 10. Also worth doing on this board
+## 10. Also done on this board, and what is left
 
-**A real random number generator.** The riscv64 kernel's `hw_random` is a stub, so the handshake's
-SNonce falls back to a hash of the time and the nonces, as the Pi 4's did until its RNG200 is wired
-(`docs/wifi.md` 40). The JH7110 has a hardware TRNG; filling that seam helps `net-stack` (TCP initial
-sequence numbers) as much as WiFi, and is a separate, small kernel change for the operator to decide on.
+**The random number generator - done (2026-10-05).** riscv64's `hw_random` reads the JH7110's TRNG
+(`arch/riscv64/mod.rs`), so the handshake's SNonce comes from hardware, as the Pi 4's does from its
+RNG200 (`docs/wifi.md` 40), and `net-stack`'s TCP initial sequence numbers with it. The device tree gave
+the block (`rng@1600c000`), its two system-top clocks and its reset; Linux's `jh7110-trng.c` gave the
+registers and the sequence - seed once at boot, then one generate command per word - with the interrupt
+it waits on replaced by a bounded poll of the same status bits. On the board: seeded in 30 us, the
+`NO HARDWARE RNG` line gone from the join, and 320 words from `random 64` all distinct, 50.65% ones, rising
+161 times in 315 steps (157.5 expected) and uncorrelated step to step. A first 48 had looked ordered (27
+rises in 42); the larger sample says that was chance.
+
+**Left open, recorded rather than closed (26.7):**
+
+- **V7, a group rekey answered on this radio.** It needs the board joined past the access point's rekey
+  interval, which no run so far lasted; the code is the shared `group_rekey`, hardware-verified on the Pi 4
+  (`backlog/64`), reached here by the same `pull` that carried DHCP and ping. Not seen is not shown.
+- **The Pi 4 after this branch's two moves of shared code** - the handshake into `sdk/wifi`, and the radio
+  bridge out of `genet.rs` - built (`build/kernel8-V6.img`) and NOT run. Its prediction is that nothing in
+  its log changes.
+- Section 9's clock question, and `SCANU_CANCEL_REQ`, known only by its place in the source's enum.
+- `STAT` bit 27 (`SRVC_RQST` in Linux, which never reads it) is set after the TRNG's first seed; nothing
+  here acts on it, and nothing has gone wrong for its being set.
