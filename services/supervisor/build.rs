@@ -94,11 +94,16 @@ fn main() {
     let radio: &[&str] = if arch == "aarch64" || arch == "riscv64" { &["wifi-driver"] } else { &[] };
 
     // The USB WiFi dongle's driver (docs/wifi-usb.md), embedded where a USB host serves the radio
-    // function protocol (`godspeed_wifi::usbfn`) for a dongle it has bound. Derived from the `usb` list, so
-    // it names no instruction set: `dwc2` serves it since U1; `xhci` joins this condition when it does (U2),
-    // which is what brings the dongle to the Pi 4, the VisionFive and the PCs. Its own list rather than part
-    // of `radio`, because a board may have both - an onboard radio and a dongle - as separate services.
-    let usb_radio: &[&str] = if usb.contains(&"dwc2") { &["wifi-usb"] } else { &[] };
+    // function protocol (`godspeed_wifi::usbfn`) for a dongle it has bound. Derived from the `usb` and
+    // `radio` lists, so it names no instruction set: `dwc2` serves it since U1, and `xhci` since U2a - on a
+    // board with no onboard radio, which today is the PCs. A board with both (the Pi 4, the VisionFive)
+    // joins when `wifi hardware use` exists to choose between them (`utilities/56_wifi.md` 11). Its own
+    // list rather than part of `radio`, because a board may have both as separate services.
+    let usb_radio: &[&str] = if usb.contains(&"dwc2") || (usb.contains(&"xhci") && radio.is_empty()) {
+        &["wifi-usb"]
+    } else {
+        &[]
+    };
 
     // The audio driver (docs/audio.md), a BOARD fact like `radio`: an Intel High Definition Audio
     // controller on x86 (the T630's chipset audio, QEMU's `intel-hda`), and on the Pis a 3.5 mm jack

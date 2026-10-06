@@ -306,7 +306,9 @@ reacquire_api = [
 # and still stops after the first time `events` dies. The check is coarse by design (any reacquisition
 # path at all, see `IX-peer-reacquire`), so it cannot keep an entry that is half paid; this line is where
 # the unpaid half is kept instead.
-peer_reacquire_debt = ["console", "ehci", "hw-enumerator", "xhci"]
+# `xhci` LEFT on 2026-10-06 the same way: `radio::notify_driver` reaches `gs::cap::reacquire` for its new
+# peer, `wifi-usb` (U2a, docs/wifi-usb.md 7). Its `events` emission is the same unpaid half as `dwc2`'s.
+peer_reacquire_debt = ["console", "ehci", "hw-enumerator"]
 # Commandment III - constants declared in two files of one crate, as of 2026-09-14. Read by
 # `III-duplicate-constants`. SHRINK ONLY; a stale entry is itself a violation.
 #
@@ -761,8 +763,12 @@ SpawnImage               = 52
 # wifi-usb: peer:dwc2 - the USB host that bound the dongle and answers `usbfn` for it. peer:fs (R4,
 # 2026-10-06) - `/wifi.keys`, which the serve loop every radio shares (`godspeed_wifi::serve`) loads and
 # writes; the same grant wifi-driver carries for the same reason, now that both run that loop.
-"wifi-usb" = ["peer:dwc2", "peer:fs"]
-"xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "priv:CONSOLE_PUSH"]
+# peer:xhci (U2a, 2026-10-06) - the same host role on the boards where `xhci` binds the dongle; one of the
+# two per board (`board::WIFI_USB_PEERS`), and `xhci` answers for that one device only, as `dwc2` does.
+"wifi-usb" = ["peer:dwc2", "peer:fs", "peer:xhci"]
+# xhci: peer:wifi-usb (U2a, 2026-10-06) - the one notice the host sends the dongle's driver, `NOTE_RADIO`,
+# when the binding changes; `try_send`, no reply expected - the grant `dwc2` carries for the same notice.
+"xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
 
 # --------------------------------------------------------------------------------------------------
 # Commandment IV - which contract capability key corresponds to which privilege bit. Read by

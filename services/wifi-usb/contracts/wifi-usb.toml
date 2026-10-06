@@ -16,4 +16,4 @@ limit   = "8MiB"
 [capabilities]
 ipc_receive = ["wifi-usb"]
 log_write   = true
-ipc_send    = ["dwc2", "fs"]
+ipc_send    = ["dwc2", "xhci", "fs"]

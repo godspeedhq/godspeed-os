@@ -23,6 +23,8 @@ use godspeed_sdk::{Dma, Mmio, ServiceContext};
 /// on top of the bulk endpoints this file configures - and because it is the capability whose absence
 /// kept a USB stack in the kernel.
 mod msc;
+/// The USB WiFi dongle, bound by VID:PID and served to `wifi-usb` (U2, `docs/wifi-usb.md` 7).
+mod radio;
 
 /// Shadow topology model - observation only, see docs/xhci-topology.md.
 mod topo;
@@ -159,10 +161,10 @@ const MAX_HID: usize = 2;
 // the cycle counts they were could not survive leaving x86. See `RESET_RECOVERY_MS` and friends.
 const DEV_BASE: usize = 0x7000;
 const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
-fn device_ctx_off(i: usize) -> usize {
+pub(crate) fn device_ctx_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE
 }
-fn ep0_tr_off(i: usize) -> usize {
+pub(crate) fn ep0_tr_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x1000
 }
 
@@ -213,7 +215,7 @@ const EP0_RING_BYTES: usize = 0x1000;
 fn int_tr_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x2000
 }
-fn report_off(i: usize) -> usize {
+pub(crate) fn report_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x3000
 }
 
@@ -360,7 +362,7 @@ fn deliver_hid_report(
 /// skipped; Set TR Dequeue is what makes the ring coherent again. The caller must reset ITS cursor to
 /// match the pointer set here, or the two disagree about where the ring starts and it wedges again.
 #[allow(clippy::too_many_arguments)]
-fn reset_endpoint(
+pub(crate) fn reset_endpoint(
     ctx: &ServiceContext,
     dma: &Dma,
     mmio: &Mmio,
@@ -494,9 +496,9 @@ const EVENT_RING_TRBS: usize = 16;
 pub(crate) const TRB_SIZE: usize = 16;
 
 pub(crate) const TRB_NORMAL: u32 = 1;
-const TRB_SETUP_STAGE: u32 = 2;
-const TRB_DATA_STAGE: u32 = 3;
-const TRB_STATUS_STAGE: u32 = 4;
+pub(crate) const TRB_SETUP_STAGE: u32 = 2;
+pub(crate) const TRB_DATA_STAGE: u32 = 3;
+pub(crate) const TRB_STATUS_STAGE: u32 = 4;
 pub(crate) const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
@@ -744,7 +746,9 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
         {
             // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
             let mut drained = 0u32;
-            while ctx.try_recv().is_some() {
+            while let Some(m) = ctx.try_recv() {
+                // A radio request is answered "no device" - nothing is enumerated here (U2a).
+                radio::answer_absent(ctx, &m);
                 drained += 1;
                 if drained >= MSG_DRAIN_MAX {
                     ctx.log("xhci: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
@@ -787,7 +791,9 @@ fn idle(ctx: &ServiceContext) -> ! {
         {
             // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
             let mut drained = 0u32;
-            while ctx.try_recv().is_some() {
+            while let Some(m) = ctx.try_recv() {
+                // A radio request is answered "no device" - nothing is enumerated here (U2a).
+                radio::answer_absent(ctx, &m);
                 drained += 1;
                 if drained >= MSG_DRAIN_MAX {
                     ctx.log("xhci: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
@@ -1568,10 +1574,12 @@ fn read_config_and_bind(
     parent_slot: u32,
     parent_port: u32,
     ttt: u32,
+    // The device descriptor's ID word (VID low, PID high): the WiFi dongle is bound by it (U2a).
+    ids: u32,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
-) -> (Option<Hid>, Option<msc::Disk>, u8) {
+) -> (Option<Hid>, Option<msc::Disk>, Option<radio::Radio>, u8) {
     // Get Configuration Descriptor (64 bytes) at EP0 ring offset 48 - contiguous after the 3-TRB
     // device-descriptor read at offset 0 - then walk it for the boot-HID interrupt-IN endpoint.
     let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
@@ -1602,7 +1610,7 @@ fn read_config_and_bind(
     }
     if !cfg_ok {
         ctx.log("xhci: Get Config Descriptor failed");
-        return (None, None, 0);
+        return (None, None, None, 0);
     }
     // Walk config -> interface -> endpoint; bind the boot keyboard (class 3, proto 1) or mouse
     // (proto 2) interface's interrupt-IN endpoint, not whichever endpoint comes last.
@@ -1653,6 +1661,22 @@ fn read_config_and_bind(
         i += blen;
     }
     if ep_addr == 0 {
+        // THE WIFI DONGLE (U2a), by its VID:PID - a vendor-class device has no class to match on. It is
+        // configured and KEPT, its slot and slice with it, and served to `wifi-usb` (`radio.rs`). Only its
+        // EP0 is driven so far: the bulk endpoints are U2b and U2c.
+        if radio::is_radio(ids) {
+            if control(
+                dma, mmio, dboff, ir0, slot, dev_idx, 96, ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
+            ) {
+                ctx.log_fmt(format_args!(
+                    "xhci: the WiFi dongle {:04x}:{:04x} on port {} (slot {}) - configured, bound as the radio for wifi-usb (U2a)",
+                    ids & 0xFFFF, ids >> 16, port, slot));
+                return (None, None, Some(radio::Radio::new(slot, dev_idx, port, ids)), cfg_val);
+            }
+            ctx.log_fmt(format_args!(
+                "xhci: the WiFi dongle on port {} (slot {}) did not take Set Configuration - not bound", port, slot));
+            return (None, None, None, cfg_val);
+        }
         // No boot-HID interrupt-IN endpoint. Before giving up on the device, check whether it is a
         // MASS-STORAGE one - that is the capability whose absence kept a USB stack in the kernel, so
         // "not a keyboard" must no longer mean "not ours".
@@ -1678,7 +1702,7 @@ fn read_config_and_bind(
                 ev_cycle,
                 cmd_idx,
             );
-            return (None, disk, cfg_val);
+            return (None, disk, None, cfg_val);
         }
         // A hub (the caller walks it with cfg_val) or a device this driver does not speak for.
         //
@@ -1707,7 +1731,7 @@ fn read_config_and_bind(
             None => ctx.log_fmt(format_args!(
                 "xhci: port {} (slot {}) exposed no interface descriptor", port, slot)),
         }
-        return (None, None, cfg_val);
+        return (None, None, None, cfg_val);
     }
     let is_mouse = hid_proto == 2;
     let ep_num = (ep_addr & 0x0F) as u32;
@@ -1871,6 +1895,7 @@ fn read_config_and_bind(
             hub_off: 0,
             hub_nports: 0,
         }),
+        None,
         None,
         cfg_val,
     )
@@ -2407,6 +2432,8 @@ fn enumerate_one(
     // The bound mass-storage device, if this port produced one. An out-param rather than a return
     // value because a port can yield a HID *and* (behind a hub) a disk - one pass, two results.
     disk: &mut Option<msc::Disk>,
+    // The bound WiFi dongle, if this port produced it (U2a) - an out-param for the reason `disk` is one.
+    radio: &mut Option<radio::Radio>,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
@@ -2618,10 +2645,23 @@ fn enumerate_one(
     ));
 
     // Read the config descriptor and bind if it's a boot HID (root device: route=0, parent_*=0).
-    let (bound, found_disk, cfg_val) = read_config_and_bind(
-        ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, port, 0, port, 0, 0, 0, ev_idx,
+    let (bound, found_disk, found_radio, cfg_val) = read_config_and_bind(
+        ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, port, 0, port, 0, 0, 0, ids, ev_idx,
         ev_cycle, cmd_idx,
     );
+    // The WiFi dongle keeps its slice and its slot, as the disk does. One per host for now: a second
+    // is released and said (`utilities/56_wifi.md` 11 - more than one dongle is named, not yet built).
+    if let Some(r) = found_radio {
+        if radio.is_none() {
+            *radio = Some(r);
+        } else {
+            ctx.log_fmt(format_args!(
+                "xhci: a second WiFi dongle on port {} - one radio per host for now; releasing it", port));
+            sa.free(dev_idx);
+            disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+        }
+        return;
+    }
     // First disk wins. A second one is left unbound rather than silently replacing the first, which
     // would swap the filesystem's device out from under it.
     if disk.is_none() {
@@ -2977,7 +3017,7 @@ fn enumerate_one(
                 }
                 // Bind it exactly like a root-port HID, but with the route string + parent-TT so its
                 // slot context keeps routing through the hub.
-                let (dbound, d_disk, _) = read_config_and_bind(
+                let (dbound, d_disk, d_radio, _) = read_config_and_bind(
                     ctx,
                     dma,
                     mmio,
@@ -2993,10 +3033,23 @@ fn enumerate_one(
                     slot,
                     dp as u32,
                     ttt,
+                    vid as u32 | (pid as u32) << 16,
                     ev_idx,
                     ev_cycle,
                     cmd_idx,
                 );
+                // The WiFi dongle behind a hub keeps its slice and slot (U2a); a second is released.
+                if let Some(r) = d_radio {
+                    if radio.is_none() {
+                        *radio = Some(r);
+                    } else {
+                        ctx.log_fmt(format_args!(
+                            "xhci: a second WiFi dongle on hub port {} - one radio per host for now; releasing it", dp));
+                        sa.free(d_idx);
+                        disable_slot(ctx, dma, mmio, dboff, ir0, dslot, ev_idx, ev_cycle, cmd_idx);
+                    }
+                    continue;
+                }
                 if disk.is_none() {
                     // Record WHERE it is, not just that it exists: the hot-plug scan needs the hub
                     // coordinates to stop reading this disk as a newly-arrived device every pass.
@@ -3187,6 +3240,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Whether a disk was bound at the END of the previous enumeration pass, so "storage connected"
     // can be gated on an actual not-bound -> bound transition (see its use below).
     let mut disk_was_bound = false;
+    // The radio bound at the end of the previous pass, by its ID word, for the same transition rule (U2a).
+    let mut radio_was_bound: Option<u32> = None;
     let mut signaled = false; // signal_input_ready (boot-screen clear) exactly once
     let mut prev_sigs: [u32; MAX_HID] = [u32::MAX; MAX_HID]; // per-device position sigs bound last pass (u32::MAX = empty)
     let mut rescan_noted = false; // "periodic back-port re-scan" logged once per idle spell
@@ -3557,6 +3612,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // the previous one is gone. Carrying a Disk across would leave it pointing at a slot the
         // controller no longer has.
         let mut disk: Option<msc::Disk> = None;
+        // The WiFi dongle (U2a), re-bound every pass for the reason the disk is: the controller re-init
+        // took its slot and rings with it.
+        let mut radio: Option<radio::Radio> = None;
         let mut hc_wedged = false;
         let mut enum_failed = false;
         // TWO SWEEPS: every USB2 root port first, then every USB3 (SuperSpeed) one.
@@ -3606,6 +3664,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut ndev,
                     &mut saw_hub,
                     &mut disk,
+                    &mut radio,
                     &mut ev_idx,
                     &mut ev_cycle,
                     &mut cmd_idx,
@@ -3635,7 +3694,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     while strikes < PORT_FAIL_LIMIT && !hc_wedged {
                         enumerate_one(
                             &ctx, &dma, &mmio, dboff, ir0, op, ctx_size, p, &mut sa, &mut devs,
-                            &mut ndev, &mut saw_hub, &mut disk, &mut ev_idx, &mut ev_cycle,
+                            &mut ndev, &mut saw_hub, &mut disk, &mut radio, &mut ev_idx, &mut ev_cycle,
                             &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed,
                         );
                         if !enum_failed { break; }
@@ -3681,6 +3740,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             notify(&ctx, "storage connected (xhci)");
         }
         disk_was_bound = disk.is_some();
+        // The radio's binding changed: tell `wifi-usb`, which asks `OP_INFO` (U2a). Compared with the
+        // previous pass, as the disk's announce is, so a pass that rebinds the same dongle says nothing.
+        let radio_now = radio.as_ref().map(|r| r.ids);
+        if radio_now != radio_was_bound {
+            radio::notify_driver(&ctx);
+            if announce {
+                notify(&ctx, if radio_now.is_some() { "WiFi dongle connected (xhci)" } else { "WiFi dongle removed (xhci)" });
+            }
+        }
+        radio_was_bound = radio_now;
         if let Some(d) = disk.as_mut() {
             let mut eaten = EvMail::new();
             if msc::read10(
@@ -3723,8 +3792,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Guarding on `ndev` alone was the same "usable means HID" assumption that cost the two
         // fixes before this one, at the third and last level it appears. With a disk bound we fall
         // through to the poll loop, which is where block requests are served.
-        if ndev == 0 && disk.is_none() {
-            // Nothing usable attached. Still report input-ready once so the shell's
+        if ndev == 0 && disk.is_none() && radio.is_none() {
+            // Nothing usable attached - a WiFi dongle counts, as a disk does: its requests are served from
+            // the poll loop below. Still report input-ready once so the shell's
             // boot-screen clear fires (the keyboard may be on the other controller).
             if !signaled {
                 ctx.signal_input_ready();
@@ -3758,7 +3828,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     {
                         // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
                         let mut drained = 0u32;
-                        while ctx.try_recv().is_some() {
+                        while let Some(m) = ctx.try_recv() {
+                // A radio request is answered "no device" - nothing is enumerated here (U2a).
+                radio::answer_absent(&ctx, &m);
                             drained += 1;
                             if drained >= MSG_DRAIN_MAX {
                                 ctx.log("xhci: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
@@ -4364,11 +4436,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             if is_irq { irq_seen = true; }
             if let Some(m) = woke {
-                if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops) {
-                    ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
-                    notify(&ctx, "storage disconnected (xhci)");
-                    disk = None;
-                    continue 'reenum;
+                // The radio's requests first (U2a): they carry their own op range, and anything else is
+                // the block server's to judge.
+                let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
+                match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
+                    radio::Served::Reenumerate => {
+                        ctx.log("xhci: the WiFi dongle's control endpoint could not be repaired - re-scanning (unplugged?)");
+                        continue 'reenum;
+                    }
+                    radio::Served::Done => {}
+                    radio::Served::NotOurs => {
+                        if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops) {
+                            ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
+                            notify(&ctx, "storage disconnected (xhci)");
+                            disk = None;
+                            continue 'reenum;
+                        }
+                    }
                 }
             }
             // Drain any further queued interrupt-event IPCs (an MSI-X mid-processing must not pile up).
@@ -4416,7 +4500,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             while served < 1 {
                 let Some(m) = ctx.try_recv() else { break };
                 served += 1;
-                disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops);
+                let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
+                match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
+                    radio::Served::Reenumerate => {
+                        ctx.log("xhci: the WiFi dongle's control endpoint could not be repaired - re-scanning (unplugged?)");
+                        continue 'reenum;
+                    }
+                    radio::Served::Done => {}
+                    radio::Served::NotOurs => {
+                        disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops);
+                    }
+                }
             }
             if !disk_alive {
                 ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");

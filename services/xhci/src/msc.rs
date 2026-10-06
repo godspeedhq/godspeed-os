@@ -94,7 +94,7 @@ const XFER_TIMEOUT_MS: u64 = 30_000;
 
 /// Poll iterations per `next_event` call. Small on purpose: it is only the granularity at which the
 /// CLOCK is re-checked, never the bound itself.
-const POLL_GRANULARITY: u32 = 4096;
+pub(crate) const POLL_GRANULARITY: u32 = 4096;
 
 /// Unrelated transfer events tolerated while waiting for ours. Bounds an event storm (a keyboard
 /// held down) without bounding the WAIT, which is the clock's job.

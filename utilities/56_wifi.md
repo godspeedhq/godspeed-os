@@ -662,9 +662,40 @@ frames when the cable is out. It is an action and does not pipe.
 - **Refused, with a sentence:**
   - a name that is not in the report: `no radio called 'usb-9999' - wifi hardware lists them`;
   - plain `usb` when there are two dongles: `there are two USB radios - usb-1a0d or usb-77e2`.
-- **The default** is today's order: the onboard radio, else the dongle. Whether a choice survives a reboot
-  (kept beside `/wifi.keys`) is not decided; until it is, a reboot returns to the default, and that is
-  said in `wifi hardware use`'s own answer.
+- **The default** is today's order: the onboard radio, else the dongle - so on a machine with no onboard
+  radio (the PCs) the dongle is the default.
+- **A choice is saved, by its owner.** `nic-driver` holds the choice, so `nic-driver` keeps it, in
+  `/wifi.radio`, as `wifi-driver` keeps `/wifi.keys`, and reads it back at boot and on every respawn. That
+  gives `nic-driver` `fs` as a peer, a grant pinned with this reason. The shell saving it and telling
+  `nic-driver` at each start was the alternative, and it splits one fact across two services.
+- **The file holds the full name** (`usb-1a0d`), even while the report shows plain `usb` because there is
+  one dongle, so a second dongle plugged in later does not make the saved choice ambiguous.
+- **A saved choice is a preference, not a requirement.** When the chosen radio is not there (the dongle is
+  unplugged), the default order carries the link and `wifi hardware` says so on the chosen radio's row;
+  when it comes back, the link returns to it. Unplugging a dongle must not leave a machine without its
+  other radio, and plugging it back must not need choosing again. `wifi hardware use onboard` (or the
+  radio the default would pick) clears the file rather than writing the default into it.
+
+**What `use` does, walked through on a Pi 4 with its onboard radio joined and a dongle plugged in.**
+1. The dongle is already up before anyone types `use`: `wifi-usb` runs from boot, and plugging the dongle
+   in is what binds it and brings the chip up (a few seconds). `use` on a radio still coming up waits for
+   it, bounded, and says so.
+2. `use usb` records the choice in `nic-driver` and `/wifi.radio`.
+3. `nic-driver` asks the radio in use what it is joined to, and asks the chosen one to join that network.
+   The key is read from `/wifi.keys`, which both radio drivers share, so nothing is typed.
+4. Only once the chosen radio reports JOINED do the frames move to it - so a join that fails loses
+   nothing: `use` says why, and the other radio keeps the link.
+5. The new radio has its own address, so the stack asks for a lease again: the same second or two a ping
+   loses across a cable-to-radio switch (section 10).
+6. The other radio then leaves the network and idles, powered, so `use` back is steps 3 to 5 again.
+
+**What that needs, beyond the report and the choice:**
+- **Only the radio in use auto-joins.** Today each radio driver rejoins the last network from
+  `/wifi.keys` at boot; with two, both would join the same access point. A radio auto-joins only when
+  `nic-driver` says it is the one in use.
+- **`/wifi.keys` gets two writers.** Each driver rewrites the file from its own table, so one radio's save
+  could drop a key the other added. A save re-reads the file and merges before writing.
+- **`nic-driver` asks a radio what it is joined to**, which it does not do today.
 
 **More than one dongle is named now and built later.** Today each USB host binds one radio, and one
 `wifi-usb` drives one dongle. Two need either a `wifi-usb` per dongle or one serving several, plus a host

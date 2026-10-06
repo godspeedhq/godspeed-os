@@ -342,15 +342,20 @@ mod board {
     /// every other board's NIC is on a bus its driver reaches directly.
     /// `dwc2`'s send peers: `events`, and the dongle's driver wherever it is embedded (see the IMAGES row).
     pub const DWC2_PEERS: &[&str] = if cfg!(has_wifi_usb) { &["events", "wifi-usb"] } else { &["events"] };
+    /// `xhci`'s send peers: `events`, and the dongle's driver where it is embedded (U2a) - the same notice
+    /// `dwc2` sends, `NOTE_RADIO`.
+    pub const XHCI_PEERS: &[&str] = if cfg!(has_wifi_usb) { &["events", "wifi-usb"] } else { &["events"] };
+    /// The dongle driver's peers: the USB host that serves its dongle, and `fs` for `/wifi.keys`. `dwc2` on
+    /// the board that has it, `xhci` on the others (U2a).
+    pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
 
-    pub const NIC_PEERS: &[&str] = if cfg!(has_wifi_usb) {
-        // The Pi 2: its ethernet is behind `dwc2`, and the USB WiFi dongle's driver - embedded only where
-        // `dwc2` serves the dongle, which is the Pi 2 - is the link's other backend (`docs/wifi-usb.md`,
-        // R6), the same rule as the radio below: the cable always wins. Tested first and flat, because
-        // `contract_check.py` reads this chain as text and does not follow a nested `if`.
+    pub const NIC_PEERS: &[&str] = if cfg!(has_dwc2) {
+        // The Pi 2: its ethernet is behind `dwc2`, and the USB WiFi dongle's driver - always embedded with
+        // `dwc2` - is the link's other backend (`docs/wifi-usb.md`, R6), the same rule as the radio below:
+        // the cable always wins. Keyed on `dwc2`, not on `wifi-usb`, since `wifi-usb` is embedded on the
+        // PCs too (U2a) and their NIC has no USB host for a peer. Flat, because `contract_check.py` reads
+        // this chain as text and does not follow a nested `if`.
         &["dwc2", "events", "wifi-usb"]
-    } else if cfg!(target_arch = "arm") {
-        &["dwc2", "events"]
     } else if cfg!(nic_radio_bridge) {
         // The radio is the link's other backend where there is one (docs/wifi.md 2): the cable always
         // wins, and when it is out nic-driver carries the frames to wifi-driver over the frame ops. A
@@ -645,7 +650,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
 const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     #[cfg(has_xhci)]
     ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 2, &["events"],
+     64 * 1024 * 1024, 2, board::XHCI_PEERS,
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      // Named by the bus, and WITH an interrupt where the kernel can route one (step D1b). 0x0C0330
      // is the industry-standard class code for an xHCI controller - class 0x0C serial bus, subclass
@@ -690,7 +695,7 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // work is milliseconds at a time.
     #[cfg(has_wifi_usb)]
     ("wifi-usb", WIFI_USB_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     8 * 1024 * 1024, u32::MAX, &["dwc2", "fs"], 0, 0, 0),
+     8 * 1024 * 1024, u32::MAX, board::WIFI_USB_PEERS, 0, 0, 0),
 ];
 
 /// A build that EMBEDDED a USB host image must have a row to spawn it with.
@@ -1548,7 +1553,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The dongle's driver, once its USB host (above) and `fs` are up, so both its peers wire at spawn.
     // Nothing waits on it: it asks the host itself, and says when there is no dongle.
     #[cfg(has_wifi_usb)]
-    ensure_wired(&ctx, &mut name_map, "wifi-usb", &["dwc2", "fs"]);
+    ensure_wired(&ctx, &mut name_map, "wifi-usb", board::WIFI_USB_PEERS);
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests here) and full builds;
     // excluded from test-specific builds. Its `fs` peer is wired from the supervisor's map.

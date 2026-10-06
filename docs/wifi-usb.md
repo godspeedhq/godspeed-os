@@ -1403,3 +1403,64 @@ hot-plug, restarts with the reply mailbox kept, chaos. **Two things remain unsee
 nothing here can cause:** the access point's group rekey (R7, on its timer, often hourly), and `dwc2`'s
 STATUS-stage retry on a replug that happens to hit a transient error (R2c's replug case). Each is built
 and will say so in the log the first time it happens.
+
+## 25. U2a (2026-10-06): the dongle behind `xhci` - bound, identified, brought up to the channel - built, not yet run
+
+Section 7's design, first card, on the T630 (no onboard radio, so nothing to choose between yet;
+`utilities/56_wifi.md` 11 has the choosing for a board with both).
+
+**`xhci` (`services/xhci/src/radio.rs`, new):**
+- **Bound by VID:PID** where the device descriptor is read: on a root port (`enumerate_one`) and behind a
+  hub (`address_downstream`'s caller). Before the class decision, since a vendor-class device has no class
+  to match on.
+  - It is configured (Set Configuration) and KEPT, its slot and slice with it, as the disk is.
+  - A second dongle is released and said: one radio per host for now.
+- **Its control transfers, both directions,** on its own EP0 ring with a persistent cursor, cycle bit
+  and Link-TRB wrap, as `hub_port_status` keeps one. Before this, `xhci`'s control transfer had no OUT data
+  stage and ran only during enumeration.
+  - The data stage uses the slice's report page, which a dongle has no interrupt endpoint to use. No new
+    arena, so no kernel change.
+  - `OP_CONTROL` tries 4 times and `OP_CONTROL_ONCE` once, as `dwc2` does.
+  - A failed transfer clears the ring and repairs EP0 (`reset_endpoint`). The repairs are bounded per
+    pass; past the bound the dongle is re-enumerated.
+- **Matched by slot.** Exact while EP0 is the only endpoint driven on the dongle. U2b's armed bulk IN on
+  the same slot is where matching must take the endpoint too.
+- **Served from the poll loop** before the block server, and a dongle alone now reaches that loop, as a
+  disk alone does. The three idle drains answer a radio request `ST_NO_DEVICE` instead of dropping it, so
+  `wifi-usb` hears "no dongle" at once.
+- **`NOTE_RADIO` to `wifi-usb`** when the binding changes from one pass to the next. `xhci` thereby gains
+  a reacquisition path, and leaves `peer_reacquire_debt`.
+- `OP_BULK_IN` and `OP_BULK_OUT` answer `ST_FAILED` until U2b and U2c.
+
+**The supervisor:**
+- `wifi-usb` is embedded where `xhci` serves it on a board with no onboard radio (`build.rs`, derived from
+  the `usb` and `radio` lists, no ISA named).
+- Its host peer is a board fact (`WIFI_USB_PEERS`: `dwc2` on the Pi 2, `xhci` elsewhere), and `xhci` gains
+  `wifi-usb` as a peer (`XHCI_PEERS`). Both grants are pinned with their reasons.
+- `NIC_PEERS` now keys the Pi 2 on `dwc2` rather than on `wifi-usb`, which the PCs embed too.
+
+**Checked before the card:** the x86, Pi 4, VisionFive and Pi 2 images build. `osdev test iommu`
+(q35, a confined `xhci`, a USB keyboard) passes, so a keyboard still enumerates and works through the
+changed driver.
+
+**Not handled yet, and recorded.** Every `xhci` re-enumeration (a keyboard replug, for one) resets and
+re-addresses every device, the dongle included. `NOTE_RADIO` is sent only when the binding CHANGES, so
+`wifi-usb` is not told about a re-enumeration that rebinds the same dongle, and whether the chip's state
+survives the reset is not known. That is hot-plug, a later card.
+
+**Prediction, T630, dongle on a front port at boot:**
+- `xhci: DEVICE DESCRIPTOR class=0x00 VID=0x0bda PID=0x8176`, then `the WiFi dongle 0bda:8176 on port N
+  (slot M) - configured, bound as the radio for wifi-usb (U2a)`.
+- `wifi-usb: xhci has bound a radio at 0bda:8176`, `SYS_CFG ... read through xhci`, `U1 done`, the efuse
+  with the dongle's MAC, `powered on`, the firmware `RUNNING`, `R3a done` on channel 1, and the transmit
+  power from the efuse (R11).
+- Then `receive did not start - the host has no bulk IN for this dongle` - U2b's work - so `wifi status`
+  says the radio is down because its bring-up stopped. Expected at this card.
+- The keyboard, on `ehci` on this machine, is unaffected.
+
+**Refuted by:**
+- no binding line (the VID:PID not matched, or the slice released);
+- `wifi-usb` hearing nothing from `xhci` (`asking xhci about the radio: ...`);
+- the bring-up stopping before `R3a done`: a control transfer this host gets wrong, which the step that
+  stopped names;
+- `could not be repaired` lines.
