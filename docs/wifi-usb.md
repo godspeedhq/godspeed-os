@@ -1507,7 +1507,7 @@ the same dongle `xhci` was about twice as fast as `dwc2`:
 The log ends a second after the bring-up, so it cannot say whether the first run's port drop recurs; the
 `PORTSC` line is in place for a longer run.
 
-## 26. The dongle's driver started by the dongle, on the Pi 2 (2026-10-06) - built, checked in QEMU, not yet on hardware
+## 26. The dongle's driver started by the dongle, on the Pi 2 (2026-10-06) - hardware-verified on the Pi 2
 
 The first card of `docs/usb-device-drivers.md`, at the operator's direction: *"I would like the connected
 device to be recognised and the appropriate driver/service loaded"*.
@@ -1562,8 +1562,28 @@ attached` twice - `dwc2`'s boot report and its answer to the ask - and `wifi-usb
 longer spawns at boot after `fs`; it spawns from the main loop, after `net-stack`, past the reply-mailbox
 reserve with no credit banked yet (`backlog/74`). So the first instance is likely to log `spawn[ipc]:
 'wifi-usb' gets no reply mailbox` and to run on the `OP_SYNC` fallback (section 19), with `syncs` above 0.
-Its stop on an unplug banks a credit, which the next instance takes back. Found by the documentation audit
-from the spawn order, not yet seen in a log.
+Found by the documentation audit from the spawn order. (This paragraph first said an unplug's stop
+banks a credit for the next instance. It cannot: an instance with no mailbox has none to release. The
+card refuted it, below.)
 
 **Refuted by:** a `wifi-usb` started with no dongle; a `wifi-usb` restarted after an unplug; `could not
 report the WiFi dongle to the supervisor`; a second `wifi-usb` after the supervisor's respawn.
+
+**The card (Pi 2, 2026-10-06, `build/pi2_ondemand_pass.log`): as predicted, step by step.** The operator:
+*"well done. The hotplug wifi usb dongle works."*
+1. Boot without the dongle: `supervisor: USB host reports no device with a driver here attached` twice
+   (`dwc2`'s boot report and its answer to the ask), and no `wifi-usb` at all.
+2. Plugged in: `usb: WiFi dongle connected (port 4)`, then `supervisor: USB 0bda:8176 attached (binding 1)
+   - starting wifi-usb`, and `JOINED` 6 s later.
+3. Unplugged: `wifi-usb stopped - its USB device 0bda:8176 is not attached`, then `wifi-usb ended - not
+   restarted`, both within 16 ms of `dongle removed`.
+4. Plugged into another port: `binding 2`, `JOINED` 5 s later.
+5. `kill wifi-usb` with the dongle in: `died, restarting`, `restarted`, `JOINED` 5 s later.
+6. `kill supervisor`: the kernel respawned it, the new supervisor asked, and `dwc2`'s answer read
+   `attached (binding 2) - wifi-usb running`. Nothing was started twice.
+7. Unplugged and plugged in once more: stopped, then `binding 3` and `JOINED`.
+
+**Every one of the five `wifi-usb` instances ran without a reply mailbox** (`gets no reply mailbox - 70
+of 96 routing slots free, reserve 72`), as the audit expected - and none ever took one back, which is the
+part of the prediction the card refuted (above). Each still joined in 5 to 6 s on the `OP_SYNC`
+fallback, so this costs nothing visible today; giving an on-demand driver a mailbox is `backlog/74`'s.

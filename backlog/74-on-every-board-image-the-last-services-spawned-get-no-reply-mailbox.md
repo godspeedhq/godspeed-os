@@ -152,7 +152,9 @@ no tax on the radio boards, and for a service whose only messages from a peer ar
 from it carry requests, both on one endpoint when there is no mailbox. The kernel matches a call's reply
 by sender, so a notice can be taken as the answer. Boot gave `wifi-usb` a mailbox while it was spawned after `fs`; EVERY respawn was
 refused one (`71 of 96 routing slots free, reserve 72`). Since it is started on demand on the Pi 2
-(`docs/wifi-usb.md` 26) it spawns after `net-stack` and is expected to be refused one at first.
+(`docs/wifi-usb.md` 26) it spawns after `net-stack` and is refused one - every instance, five of five on the card
+(`docs/wifi-usb.md` 26): an instance that never held one banks nothing when it is stopped. Each still
+joined in 5 to 6 s on the `OP_SYNC` fallback.
 
 The first respawn after R9's power cycle stopped dead: every answer one behind. `usbfn::OP_SYNC`, a
 request `dwc2` never answers, now recovers it without a kernel change, and the operator's run that day

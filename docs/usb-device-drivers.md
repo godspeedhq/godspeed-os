@@ -1,4 +1,4 @@
-# USB device drivers on demand - BUILT ON THE PI 2 (`dwc2`), not yet on `xhci` (2026-10-06)
+# USB device drivers on demand - HARDWARE-VERIFIED ON THE PI 2 (`dwc2`), not yet on `xhci` (2026-10-06)
 
 Agreed with the operator on 2026-10-06, while the USB WiFi dongle was being brought to `xhci`
 (`docs/wifi-usb.md` section 7, U2): *"I would like the connected device to be recognised and the
@@ -100,7 +100,7 @@ alone; a bulk IN qTD kept armed, with its completion taken on the interrupt; a b
 ## 5. Order of work
 
 1. **Finish U2a on the T630:** the dongle's bring-up through `xhci`, the card in progress.
-2. **On-demand drivers, on the Pi 2 first** (BUILT 2026-10-06, `docs/wifi-usb.md` 26; its card is owed), because `dwc2` + `wifi-usb` is the hardware-verified path:
+2. **On-demand drivers, on the Pi 2 first** (DONE 2026-10-06, hardware-verified on the Pi 2: plug, unplug, replug, a kill and a supervisor respawn, `docs/wifi-usb.md` 26), because `dwc2` + `wifi-usb` is the hardware-verified path:
    the reports, the match table, stop-on-detach, the generation. Then the same on `xhci` (T630), with
    the dongle's port watched.
 3. **U2b and U2c:** receive and transmit through `xhci`, then `nic-driver`'s radio bridge on x86 (the
