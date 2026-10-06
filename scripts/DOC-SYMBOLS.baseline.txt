@@ -80,3 +80,6 @@ dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXT
 ap_max_inactivity                  # backlog/64 - hostapd configuration option, EXTERNAL; the access point idle timer that matches reason 4 after ~300 s
 mkeep_alive                        # backlog/64 - Broadcom firmware iovar Linux brcmfmac sets only for suspend, EXTERNAL
 SRVC_RQST                          # docs/wifi-aic8800.md - Linux jh7110-trng.c, STAT bit 27, EXTERNAL; cited because it is set after the first seed and nothing reads it
+rtl8xxxu_gen1_set_tx_power         # docs/wifi-usb.md - Linux rtl8xxxu core.c, EXTERNAL; the calibrated transmit power R5a does not set yet
+IEEE80211_AUTH_MAX_TRIES           # docs/wifi-usb.md - Linux mac80211 mlme.c, EXTERNAL; the authentication retries R5b matches
+GENERATE_IV                        # docs/wifi-usb.md - Linux mac80211 key flag (IEEE80211_KEY_FLAG_GENERATE_IV), EXTERNAL; why the CCMP header is written by the host (R6)

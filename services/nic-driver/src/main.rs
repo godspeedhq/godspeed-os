@@ -1012,7 +1012,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // The cable: the USB ethernet's own link bit (`dev_info`), re-read at most every `CABLE_RECHECK_MS`
     // on whatever request arrives, and on every STATUS. With no USB ethernet at all there is no cable.
     let mut cable = { let mut ni = [0u8; 7]; dev_info(&ctx, &mut ni) && ni[6] != 0 };
-    let mut cable_read_at = ctx.read_tsc();
+    let mut cable_read_at = wait::Since::now(&ctx);
 
     // Poll the bulk IN endpoint up to RX_TRIES times for one received frame; returns its length (0 = none).
     let rx_one = |ctx: &ServiceContext, buf: &mut [u8]| -> usize {
@@ -1032,16 +1032,15 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         let (_req, reply_cap) = match radio.take_held() {
             Some(h) => h,
             None => {
-                let r = ctx.recv();
-                match ctx.take_pending_cap() { Some(c) => (r, c), None => continue }
+                let r = godspeed::ipc::recv(&ctx);
+                match godspeed::ipc::take_sent_cap(&ctx) { Some(c) => (r, c.handle()), None => continue }
             }
         };
         let p = _req.payload_bytes();
 
         // THE CABLE, re-read at most every CABLE_RECHECK_MS (`Carrier`).
-        let now = ctx.read_tsc();
-        if now.wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
-            cable_read_at = now;
+        if cable_read_at.passed(&ctx, Budget::ms(CABLE_RECHECK_MS)) {
+            cable_read_at = wait::Since::now(&ctx);
             let mut ni = [0u8; 7];
             cable = dev_info(&ctx, &mut ni) && ni[6] != 0;
         }
@@ -1052,7 +1051,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             let mut ni = [0u8; 7];
             let have = dev_info(&ctx, &mut ni);
             cable = have && ni[6] != 0;
-            cable_read_at = ctx.read_tsc();
+            cable_read_at = wait::Since::now(&ctx);
             let mut mac = [0u8; 6];
             if have {
                 mac.copy_from_slice(&ni[0..6]);

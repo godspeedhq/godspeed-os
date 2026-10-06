@@ -17,7 +17,7 @@
     4  services/hw-enumerator
     1  services/mem-pressure
   101  services/net-stack
-   95  services/nic-driver
+   94  services/nic-driver
     9  services/observe
     5  services/power
   270  services/probe
@@ -26,5 +26,5 @@
   194  services/shell
    17  services/supervisor
    28  services/time
-   55  services/wifi-driver
+   25  services/wifi-driver
    45  services/xhci
