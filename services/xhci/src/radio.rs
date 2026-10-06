@@ -229,7 +229,17 @@ fn repair(
     }
     r.cur = 0;
     r.pcs = 1;
+    // What the repair left, measured: on the Pi 4 (2026-10-06) every transfer after one timed out with
+    // the controller's dequeue still at the ring's start.
+    ctx.log_fmt(format_args!(
+        "xhci: the WiFi dongle's EP0 repaired ({} this pass) - endpoint state {}, dequeue {:?}",
+        r.repairs, ep0_state(hc, r), ep0_hw_dequeue(hc.dma, r.dev_idx, hc.ctx_size, EP0_RING_BYTES)));
     true
+}
+
+/// EP0's state field (xHCI 6.2.3): 0 disabled, 1 running, 2 halted, 3 stopped, 4 error.
+fn ep0_state(hc: &Hc, r: &Radio) -> u32 {
+    hc.dma.read32(device_ctx_off(r.dev_idx) + hc.ctx_size) & 0x7
 }
 
 /// `OP_CONTROL` / `OP_CONTROL_ONCE`, as `dwc2` answers them: `p` is `[op, setup(8), data out...]`, the
@@ -272,11 +282,11 @@ fn control(
         // the Error state, which the T630 never showed. The completion code, the request and where on the
         // ring its TD sat say whether the controller rejected a TRB or the device refused the request.
         // The first few per pass only (`repairs` is per pass).
-        if !matches!(got, Some(1) | Some(13)) && r.repairs < 3 {
+        if !matches!(got, Some(1) | Some(13)) && r.repairs < 4 {
             ctx.log_fmt(format_args!(
-                "xhci: the WiFi dongle's control transfer failed - cc={} (0 = no event within {} ms), setup={:02x?}, {} {} byte(s), TD at ring offset {:#x} pcs={}; the controller stopped at {:?} (offset, cycle)",
+                "xhci: the WiFi dongle's control transfer failed - cc={} (0 = no event within {} ms), setup={:02x?}, {} {} byte(s), TD at ring offset {:#x} pcs={}; the controller stopped at {:?} (offset, cycle), endpoint state {} (1 running, 2 halted, 3 stopped, 4 error)",
                 got.unwrap_or(0), CONTROL_MS, setup, if data_in { "IN" } else { "OUT" }, len, at, r.pcs,
-                ep0_hw_dequeue(hc.dma, r.dev_idx, hc.ctx_size, EP0_RING_BYTES)));
+                ep0_hw_dequeue(hc.dma, r.dev_idx, hc.ctx_size, EP0_RING_BYTES), ep0_state(hc, r)));
         }
         match got {
             Some(1) | Some(13) => {

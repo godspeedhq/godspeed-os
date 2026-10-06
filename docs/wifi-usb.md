@@ -1745,3 +1745,19 @@ controller accepts) was considered and not taken: `xhci`'s command ring is one p
 wrap, and a bring-up would spend two commands every eighty transfers. **Prediction:** no `cc=5`, and the
 bring-up reaches `no bulk IN`. **Refuted by** a `cc=5` at the new wrap (offset 0 after the Link, or
 wherever the dequeue says).
+
+**The eager Link passed the wrap (Pi 4, 2026-10-06, `build/pi4_xhci_eagerlink.log`): confirmed.** No
+`cc=5`. The efuse read completed (the dongle's MAC, 31 sections, 236 ms), the chip powered on (`R1
+done`) and the transmit queues were set up - all through the Pi 4's `xhci` and past the ring's end.
+Where the cause sits is still not proven - the Link written lazily, with the controller idling on its
+slot, is what changed - but the fix is.
+
+**The next fault, on the firmware download:** the first 128-byte block (`setup=[40, 05, 00, 11, ...]`,
+an OUT of two 64-byte packets, the first transfer this bring-up makes that is larger than eight bytes)
+failed with `cc=4`, a USB Transaction Error, after the controller's own three retries (`CErr` is 3). EP0's
+maximum packet is 64 for a high-speed device, as it should be. Then, after `radio.rs` repaired EP0, every
+transfer timed out with the controller's dequeue still at the ring's start: the repair leaves an endpoint
+the doorbell does not restart. The first error may be the dongle's own - `dwc2` met errors in this
+download too, which is why it re-runs a failed stage (R2c) - but the dead endpoint after the repair is
+this host's. **The next card measures it:** every logged failure gives the endpoint's state, and every
+repair says what it left.
