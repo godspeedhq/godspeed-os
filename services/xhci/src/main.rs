@@ -1671,6 +1671,17 @@ fn read_config_and_bind(
                 ctx.log_fmt(format_args!(
                     "xhci: the WiFi dongle {:04x}:{:04x} on port {} (slot {}) - configured, bound as the radio for wifi-usb (U2a)",
                     ids & 0xFFFF, ids >> 16, port, slot));
+                // THE PAGE AFTER ITS EP0 RING IS ZEROED, because the dongle's EP0 ring wraps (every other
+                // device's runs a few transfers and never reaches its end) and the VL805 reads past a
+                // ring's end: up to four TRBs from the next page, even past a Link TRB on a page boundary,
+                // and may use them later without reading them again. Linux enables a quirk for exactly
+                // this on the VL805 (`XHCI_TRB_OVERFETCH`, a dummy page after every ring segment). Here the
+                // next page is this slice's interrupt ring, which the dongle does not use and an earlier
+                // device's TRBs may still fill: on the Pi 4 (2026-10-06) the first transfer after the
+                // wrap failed with a TRB Error, five starts in five; the T630's controller never showed it.
+                for i in (0..0x1000).step_by(4) {
+                    dma.write32(int_tr_off(dev_idx) + i, 0);
+                }
                 return (None, None, Some(radio::Radio::new(slot, dev_idx, port, ids)), cfg_val);
             }
             ctx.log_fmt(format_args!(

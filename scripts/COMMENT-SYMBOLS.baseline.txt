@@ -644,3 +644,4 @@ SMPS_OFF                           # Linux mac80211 / rtl8xxxu (mlme.c, core.c, 
 TXDESC32_QOS                       # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
 TXDESC32_SHORT_GI                  # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
 WLAN_STATUS_REQUEST_DECLINED       # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+XHCI_TRB_OVERFETCH                 # Linux xhci.h - the quirk (BIT_ULL 45) giving every ring segment a dummy page after it, enabled for the VIA VL805 - external, 26.14

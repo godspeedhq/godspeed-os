@@ -1665,3 +1665,24 @@ starts in five. The T630's controller took the same TRBs to R11 (section 25), so
 refusing something the T630's AMD controller accepts. NOT diagnosed: the next card logs the failed
 transfer's completion code, its setup packet and where its TD sat on the ring, so it is read rather than
 guessed.
+
+**The instrumented run (Pi 4, 2026-10-06, `build/pi4_xhci_cc5.log`): a TRB Error, at the ring's wrap.**
+`xhci: the WiFi dongle's control transfer failed - cc=5 ..., setup=[40, 05, 33, 00, 00, 00, 01, 00], OUT
+1 byte(s), TD at ring offset 0xff0`. Completion code 5 is a TRB Error: the controller rejected a TRB.
+The request is a one-byte register write and the OUT data stage is not the cause - it is WHERE: offset
+0xff0 is the last TRB of the dongle's one-page EP0 ring, so this transfer is the one that wrote the Link
+TRB and wrapped. Every device's EP0 ring is one page, but only the dongle's runs long enough to wrap.
+
+**A property of the VL805, read rather than guessed.** Linux enables `XHCI_TRB_OVERFETCH` for the VIA
+VL805: at the end of a ring segment it prefetches up to four TRBs from the next page, even past a Link
+TRB on a page boundary, and may use them later without reading them again; Linux puts a dummy page after
+every segment ([the patch](https://lkml.iu.edu/hypermail/linux/kernel/2501.0/05457.html)). In the
+dongle's slice the next page is its interrupt ring, which the dongle does not use and which an earlier
+device's TRBs may fill. **The fix, Linux's mitigation:** that page is zeroed when the dongle is bound.
+
+**Prediction:** the bring-up passes the wrap and reaches U2a's end on the T630 - R1, R2, R3a, R11, then
+`receive did not start - the host has no bulk IN for this dongle`. **Refuted by** another `cc=5` near a
+wrap, which would mean a zero page is not enough here and the Link TRB must move away from the page end.
+
+**Recorded for U2b:** the bulk IN ring will want a page of the slice, and must not be the page after the
+EP0 ring, or this returns with live TRBs in it.
