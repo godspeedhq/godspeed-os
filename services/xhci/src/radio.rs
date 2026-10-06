@@ -6,8 +6,9 @@
 //! **U2a (2026-10-06): who it is, and its control transfers, both directions.** That is everything
 //! `wifi-usb`'s bring-up asks of a host up to and including the firmware, the MAC, baseband and RF tables
 //! and the channel (R1 to R3a). **U2b: the bulk IN** that carries received frames - one transfer kept
-//! armed, held when it completes, `NOTE_BULK_IN` told, collected by `OP_BULK_IN`, as `dwc2` does. The bulk
-//! OUT that carries sent frames is U2c; until then it answers `ST_FAILED`, which `wifi-usb` reports.
+//! armed, held when it completes, `NOTE_BULK_IN` told, collected by `OP_BULK_IN`, as `dwc2` does. **U2c:
+//! the bulk OUTs** that carry sent frames - `OP_BULK_OUT`, one frame at a time, waited for, as `dwc2`
+//! sends them.
 //!
 //! **Where it lives in the arena.** In the device slice it was enumerated into, kept as a keyboard's is:
 //! the EP0 ring is the slice's EP0 page, and a control transfer's data stage uses the slice's report page,
@@ -29,6 +30,7 @@ use gs::driver::wait::{self, Budget};
 use crate::msc::POLL_GRANULARITY;
 use crate::{
     device_ctx_off, ep0_hw_dequeue, ep0_tr_off, EP0_RING_BYTES, int_tr_off, next_event_at, report_off, reset_endpoint, EvMail,
+    DATA_BUF_OFF,
     TRB_DATA_STAGE, TRB_LINK, TRB_NORMAL, TRB_SETUP_STAGE, TRB_SIZE, TRB_STATUS_STAGE, TRB_TRANSFER_EVENT,
 };
 
@@ -38,8 +40,25 @@ use crate::{
 /// does no harm.
 pub const IN_RING_AT: usize = 0x800;
 pub const IN_RING_BYTES: usize = 0x800;
-const _: () = assert!(usbfn::CONTROL_MAX <= IN_RING_AT);
 const _: () = assert!(usbfn::BULK_IN_MAX <= 0x1000);
+
+/// The bulk OUT rings (U2c): up to three, in the report page between EP0's data stage and the IN ring,
+/// each followed by a 64-byte gap. The VL805 reads the 64 bytes after any TRB it fetches; past a ring's
+/// Link that lands in the gap, never in the next ring, so nothing live is ever read ahead and served stale
+/// (`XHCI_TRB_OVERFETCH`, section 27 of `docs/wifi-usb.md`).
+pub const OUT_RING_BYTES: usize = 0x1C0;
+const OUT_STRIDE: usize = OUT_RING_BYTES + 0x40;
+const OUT_RINGS_AT: usize = 0x100;
+pub const MAX_OUT: usize = 3;
+pub fn out_ring_at(i: usize) -> usize {
+    OUT_RINGS_AT + i * OUT_STRIDE
+}
+const _: () = assert!(usbfn::CONTROL_MAX <= OUT_RINGS_AT);
+const _: () = assert!(OUT_RINGS_AT + MAX_OUT * OUT_STRIDE <= IN_RING_AT);
+/// A frame is staged in `DATA_BUF_OFF`, one page.
+const OUT_FRAME_MAX: usize = if usbfn::BULK_OUT_MAX < 0x1000 { usbfn::BULK_OUT_MAX } else { 0x1000 };
+/// How long one frame may take to send - `dwc2`'s budget for the same frame (`RADIO_TX_BUDGET_MS`).
+const OUT_MS: u64 = 200;
 
 /// The dongle's bulk endpoints, read from its configuration descriptor: the first bulk IN, and the bulk
 /// OUTs in descriptor order (U2c's, recorded now so the walk is done once).
@@ -135,13 +154,24 @@ pub struct Radio {
     /// Transfers received and failed, for the log.
     rx_frames: u32,
     rx_failed: u32,
+    /// The bulk OUTs (U2c), in configuration-descriptor order as `wifi-usb` names them: DCI, ring cursor
+    /// and cycle each; repairs this pass; frames sent and failed.
+    out_dci: [u32; MAX_OUT],
+    n_out: usize,
+    out_cur: [usize; MAX_OUT],
+    out_pcs: [u32; MAX_OUT],
+    out_repairs: u32,
+    tx_frames: u32,
+    tx_failed: u32,
 }
 
 impl Radio {
     pub fn new(slot: u32, dev_idx: usize, port: u32, ids: u32) -> Self {
         Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0, checked: false,
                 in_dci: 0, in_mps: 0, in_cur: 0, in_pcs: 1, rx: Rx::Off, note_owed: false, in_repairs: 0,
-                rx_frames: 0, rx_failed: 0 }
+                rx_frames: 0, rx_failed: 0,
+                out_dci: [0; MAX_OUT], n_out: 0, out_cur: [0; MAX_OUT], out_pcs: [1; MAX_OUT], out_repairs: 0,
+                tx_frames: 0, tx_failed: 0 }
     }
 
     /// The bulk IN configured at bind (U2b), its ring zeroed there.
@@ -151,6 +181,14 @@ impl Radio {
         self.in_cur = 0;
         self.in_pcs = 1;
         self.rx = Rx::Off;
+    }
+
+    /// The bulk OUTs configured at bind (U2c), in descriptor order, their rings zeroed there.
+    pub fn set_bulk_out(&mut self, dci: &[u32]) {
+        self.n_out = dci.len().min(MAX_OUT);
+        self.out_dci[..self.n_out].copy_from_slice(&dci[..self.n_out]);
+        self.out_cur = [0; MAX_OUT];
+        self.out_pcs = [1; MAX_OUT];
     }
 
     pub fn vid(&self) -> u16 {
@@ -476,7 +514,10 @@ pub fn serve(
                 }
             }
         }
-        // U2c: the bulk OUT is not configured yet on this host.
+        (usbfn::OP_BULK_OUT, Some(r)) => {
+            out[1] = bulk_out(ctx, hc, r, p, ev_idx, ev_cycle, cmd_idx, eaten);
+            2
+        }
         (_, Some(_)) => {
             out[1] = usbfn::ST_FAILED;
             2
@@ -680,5 +721,112 @@ fn repair_in(
     }
     r.in_cur = 0;
     r.in_pcs = 1;
+    true
+}
+
+/// `OP_BULK_OUT`: `p` is `[op, out, transfer...]`, `out` the OUT endpoint's position in the configuration
+/// descriptor. The frame is staged in `DATA_BUF_OFF`, one Normal TRB queued on that endpoint's ring (the
+/// Link written eagerly), and its completion waited for, up to `OUT_MS` - one frame at a time, as `dwc2`
+/// sends. A failed or unanswered transfer leaves the endpoint repaired (its ring cleared, the endpoint
+/// reset to the ring's start) before the status goes back, so the next frame starts clean; a TD that never
+/// completed must not be left queued ahead of it. A status byte.
+#[allow(clippy::too_many_arguments)]
+fn bulk_out(
+    ctx: &ServiceContext, hc: &Hc, r: &mut Radio, p: &[u8],
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize, eaten: &mut EvMail,
+) -> u8 {
+    let idx = p.get(1).copied().unwrap_or(u8::MAX) as usize;
+    let data = p.get(2..).unwrap_or(&[]);
+    if idx >= r.n_out || data.is_empty() || data.len() > OUT_FRAME_MAX {
+        return usbfn::ST_BAD_REQUEST;
+    }
+    for (i, &b) in data.iter().enumerate() {
+        hc.dma.write8(DATA_BUF_OFF + i, b);
+    }
+    let dci = r.out_dci[idx];
+    let ring = report_off(r.dev_idx) + out_ring_at(idx);
+    let bp = hc.dma.phys_at(DATA_BUF_OFF);
+    let t = ring + r.out_cur[idx];
+    hc.dma.write32(t, bp as u32);
+    hc.dma.write32(t + 4, (bp >> 32) as u32);
+    hc.dma.write32(t + 8, data.len() as u32);
+    hc.dma.write32(t + 12, r.out_pcs[idx] | (1 << 5) | (TRB_NORMAL << 10));
+    r.out_cur[idx] += TRB_SIZE;
+    if r.out_cur[idx] + 2 * TRB_SIZE > OUT_RING_BYTES {
+        let base = hc.dma.phys_at(ring);
+        let l = ring + r.out_cur[idx];
+        hc.dma.write32(l, base as u32);
+        hc.dma.write32(l + 4, (base >> 32) as u32);
+        hc.dma.write32(l + 8, 0);
+        hc.dma.write32(l + 12, (TRB_LINK << 10) | (1 << 1) | r.out_pcs[idx]);
+        r.out_cur[idx] = 0;
+        r.out_pcs[idx] ^= 1;
+    }
+    hc.mmio.write32(hc.dboff + r.slot as usize * 4, dci);
+
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(OUT_MS));
+    let mut unrelated = 0u32;
+    let cc = loop {
+        match next_event_at(hc.dma, hc.mmio, hc.ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, _)) if sid == r.slot && ep == dci => break Some(cc),
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) if sid == r.slot && ep == r.in_dci && r.in_dci != 0 => {
+                bulk_done(ctx, r, cc, res);
+            }
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) => {
+                eaten.put(sid, ep, cc, res);
+                unrelated += 1;
+                if unrelated >= MAX_UNRELATED {
+                    break None;
+                }
+            }
+            Some(_) | None => {}
+        }
+        if deadline.expired() {
+            break None;
+        }
+    };
+    if cc == Some(1) {
+        r.tx_frames = r.tx_frames.wrapping_add(1);
+        if r.tx_frames == 1 {
+            ctx.log_fmt(format_args!("xhci: the WiFi dongle's first bulk OUT transfer - {} bytes (U2c)", data.len()));
+        }
+        return usbfn::ST_OK;
+    }
+    r.tx_failed = r.tx_failed.wrapping_add(1);
+    if r.tx_failed <= 3 {
+        ctx.log_fmt(format_args!(
+            "xhci: the WiFi dongle's bulk OUT {} failed - cc={} (0 = no completion within {} ms), {} byte(s); endpoint state {} ({} so far)",
+            idx, cc.unwrap_or(0), OUT_MS, data.len(),
+            hc.dma.read32(device_ctx_off(r.dev_idx) + dci as usize * hc.ctx_size) & 0x7, r.tx_failed));
+    }
+    if !repair_out(ctx, hc, r, idx, ev_idx, ev_cycle, cmd_idx) && r.tx_failed <= 3 {
+        ctx.log("xhci: the WiFi dongle's bulk OUT could not be repaired - the next frame may not go out");
+    }
+    usbfn::ST_FAILED
+}
+
+/// A bulk OUT after a failed or unanswered frame: its ring cleared and the endpoint reset to the ring's
+/// start (`reset_endpoint` stops a running endpoint first), bounded per pass - the command ring is one page
+/// per pass and does not wrap.
+fn repair_out(
+    ctx: &ServiceContext, hc: &Hc, r: &mut Radio, idx: usize, ev_idx: &mut usize, ev_cycle: &mut u32,
+    cmd_idx: &mut usize,
+) -> bool {
+    if r.out_repairs >= MAX_REPAIRS {
+        return false;
+    }
+    r.out_repairs += 1;
+    let ring = report_off(r.dev_idx) + out_ring_at(idx);
+    for off in (0..OUT_RING_BYTES).step_by(4) {
+        hc.dma.write32(ring + off, 0);
+    }
+    if !reset_endpoint(
+        ctx, hc.dma, hc.mmio, hc.dboff, hc.ir0, r.slot, r.out_dci[idx], ring, device_ctx_off(r.dev_idx),
+        hc.ctx_size, ev_idx, ev_cycle, cmd_idx,
+    ) {
+        return false;
+    }
+    r.out_cur[idx] = 0;
+    r.out_pcs[idx] = 1;
     true
 }

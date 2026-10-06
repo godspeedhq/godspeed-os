@@ -1793,8 +1793,8 @@ completion that another consumer dequeued by endpoint as well as by slot (`take_
 the disk's wait, the hub probe, the poll drain, the dongle's control transfer - passes the endpoint.
 
 **The bulk IN** (`radio.rs`): found in the configuration descriptor already read at bind (`parse_eps`;
-every length distrusted) and added with one Configure Endpoint (`configure_radio_in`, built as
-`bind_msc` builds the disk's). Its ring is the second half of the slice's report page, whose first half
+every length distrusted) and added with one Configure Endpoint (`configure_radio_bulk` since U2c, which adds the OUTs in the
+same command; built as `bind_msc` builds the disk's). Its ring is the second half of the slice's report page, whose first half
 is EP0's data stage; its 3584-byte buffer (`usbfn::BULK_IN_MAX`, seven packets) is the slice's
 interrupt-ring page. That keeps every RING away from the page after the EP0 ring, which the VL805 reads
 into (section 27); a data buffer there does no harm. The Link is written eagerly, as EP0's is.
@@ -1819,3 +1819,43 @@ Endpoint and Set TR Dequeue to the ring's start, bounded per pass). The bulk OUT
 
 **Refuted by:** a Configure Endpoint failure; no first bulk IN transfer; a `bulk IN transfer failed` that
 recurs; EP0 transfers failing where section 27's did not (the endpoint matching wrong).
+
+## 29. U2c (2026-10-06): the bulk OUTs through `xhci` - built, not yet on hardware
+
+Built while the operator was away, on top of U2b, and held off the card until U2b has run, so each flash
+still tests one change.
+
+**What it adds** (`radio.rs`, `configure_radio_bulk`):
+- The dongle's bulk OUTs, read from the configuration descriptor in the walk U2b added (`parse_eps`, in
+  descriptor order, as `wifi-usb` names them), are added in the SAME Configure Endpoint as the IN: one
+  command, so the device's context is never half-configured.
+- **Where the rings live.** Up to three OUT rings of 28 TRBs, in the slice's report page between EP0's
+  data stage and the IN ring, each followed by a 64-byte gap. The VL805 reads the 64 bytes after any TRB
+  it fetches, and past a ring's Link that lands in the gap rather than in the next ring.
+- **Where the frame lives.** In `DATA_BUF_OFF`, the arena page enumeration uses for its control data,
+  borrowed for one synchronous send at a time. Nothing else touches it inside the poll loop, and a send
+  never overlaps an enumeration, since both run on one task. That needs no kernel change. A dedicated page
+  would (`XHCI_DMA_PAGES`), which is the cleaner answer if this one is ever contended.
+- **`OP_BULK_OUT`, as `dwc2` sends.** One Normal TRB, the Link written eagerly, the completion waited for
+  up to 200 ms (`dwc2`'s budget), matched by slot AND endpoint. A completion for the IN or for another
+  consumer met while waiting is handed on, not taken.
+- **A failed or unanswered frame.** The endpoint is repaired before the status goes back (its ring
+  cleared, `reset_endpoint` to the ring's start, bounded per pass). A TD that never completed must not
+  stay queued ahead of the next frame.
+
+**Not handled, recorded:** a frame whose length is an exact multiple of the 512-byte packet gets no
+zero-length packet after it. Whether the chip needs one is not checked against Linux, and no frame on
+this path has had that length yet.
+
+**Checked:** the Pi 4, x86 and VisionFive images build and x86 passes every gate.
+
+**Prediction, Pi 4, once U2b's card has passed:**
+- `xhci: ... bulk OUT(s) [...] configured - receive and send ready (U2b, U2c)`.
+- `xhci: the WiFi dongle's first bulk OUT transfer`, then `wifi-usb: the FIRST probe response addressed to
+  us ... R5a done`.
+- The auto-join from `/wifi.keys` through authentication, association and the WPA2 handshake to `JOINED`
+  (R5b, R5c), on the dongle, beside the onboard radio, which keeps carrying the link (the shell and
+  `nic-driver` still use `wifi-driver` until `wifi hardware use` exists).
+
+**Refuted by:** a Configure Endpoint failure; `bulk OUT ... failed` lines; no probe response; U2b's
+receive breaking.

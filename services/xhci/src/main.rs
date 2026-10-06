@@ -75,7 +75,10 @@ const CMD_RING_OFF: usize = 0x1000;
 const EVENT_RING_OFF: usize = 0x2000;
 const ERST_OFF: usize = 0x3000;
 const INPUT_CTX_OFF: usize = 0x4000; // transient: built per device for Address/Configure
-const DATA_BUF_OFF: usize = 0x5000; // transient: control-transfer data during enumeration
+/// Transient: control-transfer data during enumeration - and, inside the poll loop, the WiFi dongle's
+/// outgoing frame for the length of one synchronous send (U2c). Only the enumeration functions touch it
+/// otherwise, and a send never overlaps an enumeration: both run on this one task, each to completion.
+pub(crate) const DATA_BUF_OFF: usize = 0x5000;
 const CONFIG_BUF_OFF: usize = 0x6000; // transient: config descriptor during enumeration
 /// The hub port-status probe's OWN 4-byte landing area.
 ///
@@ -498,15 +501,17 @@ pub(crate) fn reset_endpoint(
     true
 }
 
-/// Configure the WiFi dongle's bulk IN endpoint (U2b): one Configure Endpoint adding it, its ring in the
-/// second half of the slice's report page (`radio::IN_RING_AT`). Not the page after the EP0 ring: the
+/// Configure the WiFi dongle's bulk IN endpoint (U2b) and its bulk OUTs (U2c): one Configure Endpoint
+/// adding them all. The IN ring is the second half of the slice's report page (`radio::IN_RING_AT`); each
+/// OUT ring sits in its middle (`radio::out_ring_at`), with a gap after it. Not the page after the EP0 ring: the
 /// VL805 reads up to four TRBs past a ring's end into the next page (`XHCI_TRB_OVERFETCH`), and a live
 /// ring there could be served from that stale read. The page after this ring is the next slice's device
 /// context, which no endpoint fetches TRBs from. The slot context is built as `bind_msc` builds it.
 #[allow(clippy::too_many_arguments)]
-fn configure_radio_in(
+fn configure_radio_bulk(
     ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, ctx_size: usize,
     slot: u32, dev_idx: usize, speed: u32, route: u32, root_port: u32, in_dci: u32, mps: u16,
+    out_dci: &[u32], out_mps: u16,
     ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
 ) -> bool {
     let ring = report_off(dev_idx) + radio::IN_RING_AT;
@@ -516,8 +521,14 @@ fn configure_radio_in(
     let islot = INPUT_CTX_OFF + ctx_size;
     clear_input_ctx(dma, ctx_size);
     dma.write32(INPUT_CTX_OFF, 0); // Drop flags
-    dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << in_dci));
-    dma.write32(islot, (in_dci << 27) | (speed << 20) | (route & 0xFFFFF));
+    let mut add = 1 | (1 << in_dci);
+    let mut max_dci = in_dci;
+    for &d in out_dci {
+        add |= 1 << d;
+        max_dci = max_dci.max(d);
+    }
+    dma.write32(INPUT_CTX_OFF + 4, add);
+    dma.write32(islot, (max_dci << 27) | (speed << 20) | (route & 0xFFFFF));
     dma.write32(islot + 4, root_port << 16);
     dma.write32(islot + 8, 0); // a high-speed device: no transaction translator
     let rp = dma.phys_at(ring);
@@ -527,6 +538,20 @@ fn configure_radio_in(
     dma.write32(iep + 8, (rp as u32 & !0xF) | 1);
     dma.write32(iep + 12, (rp >> 32) as u32);
     dma.write32(iep + 16, mps as u32);
+    // The OUTs: bulk OUT is endpoint type 2 (xHCI 6.2.3). Each ring zeroed, its cycle starting at 1.
+    for (i, &d) in out_dci.iter().enumerate() {
+        let oring = report_off(dev_idx) + radio::out_ring_at(i);
+        for b in (0..radio::OUT_RING_BYTES).step_by(4) {
+            dma.write32(oring + b, 0);
+        }
+        let op = dma.phys_at(oring);
+        let oep = INPUT_CTX_OFF + (1 + d as usize) * ctx_size;
+        dma.write32(oep, 0);
+        dma.write32(oep + 4, (3 << 1) | (2 << 3) | ((out_mps as u32) << 16));
+        dma.write32(oep + 8, (op as u32 & !0xF) | 1);
+        dma.write32(oep + 12, (op >> 32) as u32);
+        dma.write32(oep + 16, out_mps as u32);
+    }
     let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
@@ -538,7 +563,7 @@ fn configure_radio_in(
     .unwrap_or(0);
     if ce != 1 {
         ctx.log_fmt(format_args!(
-            "xhci: the WiFi dongle's bulk IN Configure Endpoint failed (completion={}) - receive will not start", ce));
+            "xhci: the WiFi dongle's bulk Configure Endpoint failed (completion={}) - receive and send will not start", ce));
         return false;
     }
     true
@@ -1786,17 +1811,24 @@ fn read_config_and_bind(
                 // U2b: its bulk IN, found in the configuration descriptor read above and configured, so
                 // frames can be received. Bound either way: `wifi-usb` reaches the chip over EP0 without
                 // it, and says itself that receive did not start.
+                // U2c: and its bulk OUTs, in the same Configure Endpoint, so frames can be sent.
                 let eps = radio::parse_eps(dma, CONFIG_BUF_OFF, 64);
                 if eps.in_addr == 0 {
                     ctx.log("xhci: the WiFi dongle's configuration names no bulk IN - receive will not start");
                 } else {
                     let in_dci = (eps.in_addr & 0xF) as u32 * 2 + 1;
-                    if configure_radio_in(ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, route,
-                                          root_port, in_dci, eps.in_mps, ev_idx, ev_cycle, cmd_idx) {
+                    let mut out_dci = [0u32; 3];
+                    for (i, &a) in eps.outs[..eps.n_out].iter().enumerate() {
+                        out_dci[i] = (a & 0xF) as u32 * 2;
+                    }
+                    if configure_radio_bulk(ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, route,
+                                            root_port, in_dci, eps.in_mps, &out_dci[..eps.n_out], eps.out_mps,
+                                            ev_idx, ev_cycle, cmd_idx) {
                         r.set_bulk_in(in_dci, eps.in_mps);
+                        r.set_bulk_out(&out_dci[..eps.n_out]);
                         ctx.log_fmt(format_args!(
-                            "xhci: the WiFi dongle's bulk IN {:#04x} configured (DCI {}, mps {}) - receive ready (U2b)",
-                            eps.in_addr, in_dci, eps.in_mps));
+                            "xhci: the WiFi dongle's bulk IN {:#04x} (DCI {}, mps {}) and {} bulk OUT(s) {:?} (mps {}) configured - receive and send ready (U2b, U2c)",
+                            eps.in_addr, in_dci, eps.in_mps, eps.n_out, &out_dci[..eps.n_out], eps.out_mps));
                     }
                 }
                 return (None, None, Some(r), cfg_val);
