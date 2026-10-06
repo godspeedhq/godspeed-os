@@ -533,7 +533,7 @@ impl Station for Dongle<'_> {
         };
         if outcome == Outcome::Joined {
             self.pn = 0;
-            self.link.borrow_mut().bssid = Some(a.bssid);
+            self.link.borrow_mut().joined(a.bssid);
             ctx.log("wifi-usb: join - JOINED; frames to and from the network go through nic-driver when the cable is out (R6)");
         } else {
             self.leave(ctx, &a.bssid);

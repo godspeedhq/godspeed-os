@@ -53,11 +53,30 @@ pub struct Link {
     pub dropped: u32,
     pub undecrypted: u32,
     pub rekeys: u32,
+    /// REPLAY PROTECTION: the highest CCMP packet number accepted under the pairwise key, and under each
+    /// group key id. The chip decrypts and does not check them; a frame whose number is not above the last
+    /// one accepted for its key is a replay - an old frame sent again - and is dropped. mac80211 keeps one
+    /// per TID for the pairwise key; this association is non-QoS, so it has one.
+    pub pairwise_pn: u64,
+    pub group_pn: [u64; 4],
+    pub replays: u32,
 }
 
 impl Link {
     pub fn new() -> Self {
-        Link { bssid: None, frames: RxQueue::new(), data_in: 0, dropped: 0, undecrypted: 0, rekeys: 0 }
+        Link {
+            bssid: None, frames: RxQueue::new(), data_in: 0, dropped: 0, undecrypted: 0, rekeys: 0,
+            pairwise_pn: 0, group_pn: [0; 4], replays: 0,
+        }
+    }
+
+    /// A join completed with fresh keys: take its network's frames from now, every replay counter at zero
+    /// (a new key starts its packet numbers again) and nothing left queued from before.
+    pub fn joined(&mut self, bssid: [u8; 6]) {
+        self.bssid = Some(bssid);
+        self.pairwise_pn = 0;
+        self.group_pn = [0; 4];
+        self.frames.clear();
     }
 }
 
@@ -274,6 +293,26 @@ fn data_frame(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
                 f[1] & 0x40 != 0, pk.desc.security, pk.desc.swdec));
         }
         return;
+    }
+    // REPLAY: the packet number must climb, per key - the pairwise one for a frame to us, the group key
+    // its header names for a frame to a group.
+    let Some((pn, key_id)) = data::ccmp_pn(f) else { return };
+    let group = f[4] & 1 != 0;
+    let k = key_id as usize & 3;
+    let last = if group { l.group_pn[k] } else { l.pairwise_pn };
+    if pn <= last {
+        l.replays = l.replays.wrapping_add(1);
+        if l.replays == 1 || l.replays % 64 == 0 {
+            ctx.log_fmt(format_args!(
+                "wifi-usb: a data frame replayed - packet number {} not above the {} already accepted (x{}) - dropped",
+                pn, last, l.replays));
+        }
+        return;
+    }
+    if group {
+        l.group_pn[k] = pn;
+    } else {
+        l.pairwise_pn = pn;
     }
     let Some(d) = data::llc_payload(f, true) else { return };
     if d.ethertype == eapol::ETHERTYPE_EAPOL {

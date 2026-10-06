@@ -62,6 +62,23 @@ pub fn llc_payload(frame: &[u8], ccmp: bool) -> Option<DataIn<'_>> {
     Some(DataIn { ethertype: u16::from_be_bytes([frame[at + 6], frame[at + 7]]), da, sa, body: &frame[at + 8..] })
 }
 
+/// The packet number and key id in a protected data frame's CCMP header - what a receiver checks for
+/// replay. A radio that decrypts in hardware does not check it for the host: `rtl8xxxu` never marks a frame
+/// `RX_FLAG_PN_VALIDATED`, so mac80211 checks it in software (`ieee80211_crypto_ccmp_decrypt`), and a host
+/// that hands such frames up must do the same. `None` when `frame` is not a protected data frame long enough
+/// to carry the header. The header is where `llc_payload` steps over it: after 24 bytes, 26 with QoS, 4
+/// more with the order bit; its bytes 0-1 and 4-7 are the packet number, low first, and byte 3's top two
+/// bits the key id (`ccmp_hdr2pn`).
+pub fn ccmp_pn(frame: &[u8]) -> Option<(u64, u8)> {
+    if frame.len() < 24 || frame[0] & 0x0c != 0x08 || frame[1] & 0x40 == 0 {
+        return None;
+    }
+    let at = 24 + if frame[0] & 0x80 != 0 { 2 } else { 0 } + if frame[1] & 0x80 != 0 { 4 } else { 0 };
+    let h = frame.get(at..at + CCMP_HEADER)?;
+    let pn = u64::from_le_bytes([h[0], h[1], h[4], h[5], h[6], h[7], 0, 0]);
+    Some((pn, h[3] >> 6))
+}
+
 /// `d` as an ethernet frame into `out`: DA, SA, ethertype, body. 0 when `out` cannot hold it.
 pub fn to_ethernet(d: &DataIn, out: &mut [u8]) -> usize {
     let n = ETH_HEADER + d.body.len();
@@ -188,5 +205,10 @@ mod tests {
         assert_eq!(&f[24..32], &[0x01, 0x02, 0, 0x60, 0x03, 0x04, 0x05, 0x06]);
         let d = llc_payload(&f[..n], true).map(|d| (d.ethertype, d.body.len()));
         assert_eq!(d, Some((0x0800, 4)));
+        // And the packet number and key id read back out of it, as a receiver checks them for replay.
+        assert_eq!(ccmp_pn(&f[..n]), Some((0x0605_0403_0201, 1)));
+        assert_eq!(ccmp_pn(&f[..23]), None, "too short");
+        f[1] = 0x01;
+        assert_eq!(ccmp_pn(&f[..n]), None, "not protected");
     }
 }

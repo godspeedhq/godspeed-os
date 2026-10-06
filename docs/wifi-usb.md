@@ -804,6 +804,14 @@ appends (`RCR_APPEND_MIC`) is trimmed, as mac80211 trims it for a frame marked d
 (`rx::Link`, a `RefCell` `main.rs` owns), and the station's `pull` hands it to the serve loop's frame path.
 A key frame on the joined link is the access point's group rekey: counted and said, not answered (R7).
 
+**Replay protection, added after a review of the R6 commit.** The chip decrypts, but it does not check the
+CCMP packet number, and `rtl8xxxu` never marks a frame `RX_FLAG_PN_VALIDATED`, so mac80211 checks it in
+software. Without that check, an old frame sent again would be decrypted and handed up as new.
+`data::ccmp_pn` (host-tested) reads the packet number and key id out of the CCMP header, and `rx::Link`
+keeps the highest accepted under the pairwise key and under each group key id, all reset at each join.
+A frame whose number does not climb is dropped, counted and said. A frame that failed its ICV never gets
+this far: the receive side drops it first.
+
 **A comment that was wrong, corrected.** `rtl_rx::Desc::pkt_len` said "FCS included". The chip's `RCR`
 appends the PHY status, the ICV and the MIC (bits 28 to 30, as Linux sets them), not the FCS (bit 31), so the
 length has no FCS in it. Nothing used the claim, and the MIC trim depends on the truth of it.
