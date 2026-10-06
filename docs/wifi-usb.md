@@ -522,7 +522,7 @@ if the answer differs from the binding the loop was entered for. Predicted on th
 `/wifi.keys loaded` and one auto-join line at boot, and a replug still bringing the dongle back.
 
 **Not exercised on this card:** `wifi list` and `wifi status` were not typed, and the dongle was not
-replugged. Both are on the next card.
+replugged. Both were on the next card, R4b.
 
 **A limit the fix inherits, recorded rather than fixed.** "Changed" means a different `(vid, pid)`, or
 bound against not bound - the same test `main.rs` made since U1b. A dongle pulled and put back before
@@ -535,3 +535,12 @@ firmware refused DOWN" after the dongle's own line says the off is not built. An
 `powercycle` with "the kernel refused: this machine has no control over the radio's power", which is the
 `wire::NO_POWER_CONTROL` sentence; for the dongle the kernel was never asked. Both are true in outcome and
 loose in cause. Left for the cards that build those verbs.
+
+**R4b (2026-10-06, `build/kernel7-R4b.img`): passed.** `/wifi.keys loaded` and the auto-join appeared ONCE
+at boot, and once more after a replug - one per bind, as predicted, where R4 gave three. `wifi status`:
+radio on, not associated, the last scan's age and count. `wifi scan`: 16 networks in 2 s; after the replug,
+22 in 3 s (a replug starts a new loop, so `wifi status` between the two said "last scan none": the cache is the loop's, and a new bind is a new radio). `wifi list` printed the cache, the saved network marked `saved`. After the replug the dongle came
+back to `R3b done` with no STATUS-stage error, and the join stayed refused naming R5. `dir` worked, and
+turned up something that is not WiFi's: two entries with one name in `/` (`backlog/75`).
+
+R4 is done on the Pi 2. Owed elsewhere: the Pi 4 and the VisionFive check card for the shared loop (above).
