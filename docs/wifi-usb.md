@@ -622,3 +622,62 @@ two), and the probe responses to us as before.
 the heartbeat `tx - 26 frames 1924 bytes, 0 failed` - 74 bytes a frame, the 32-byte descriptor and the
 42-byte probe request; 15 probe responses addressed to the dongle; 20 and 18 networks. The first transmit is
 done: the frame is built right, the host sends it, it reaches the air, and the host now says so.
+
+## 12. R5b (2026-10-06): authentication and association - built, NOT YET RUN
+
+The join up to the keys. R5c is the WPA2 four-way handshake, whose runner already exists and is every
+radio's (`godspeed_wifi::supplicant`); R5b is what comes before it, and it is the first exchange with ONE
+access point rather than a broadcast to all of them.
+
+**The steps** (`services/wifi-usb/src/station.rs`, `Station::join`):
+
+1. **Find.** A probe request that NAMES the network, on each channel, then 60 ms listening for a beacon
+   or probe response that carries the name. The strongest is kept, because several access points may share
+   a name. Its BSSID, its own channel (from its channel element), its capability and its RSN element are
+   noted. Naming the network is also what finds a hidden one.
+2. **Check what it takes.** The supplicant's message 2 repeats a fixed RSN element, `eapol::RSN_IE` (CCMP
+   for both ciphers, PSK). So a WPA2 network whose group or pairwise cipher is not CCMP is refused before
+   anything is sent (`mgmt::rsn_is_ccmp`), and so is a key offered to an open network or none to a WPA2 one.
+3. **Tune there and set the BSSID**: `rtl8188::set_bssid`, `rtl8xxxu_set_bssid` for port 0, which mac80211
+   has the driver do before authenticating.
+4. **Authenticate.** Open System, transaction 1 out, transaction 2 back.
+5. **Associate.** The capability is mac80211's (`net/mac80211/mlme.c`, read 2026-10-06): ESS, short
+   preamble and short slot time on 2.4 GHz, and Privacy when the network's capability has it. Then the
+   listen interval (10, CHOSEN: mac80211 takes it from the driver's configuration), the SSID, the rates and
+   the RSN element.
+
+Each answer is awaited 200 ms and each request tried 3 times, mac80211's `IEEE80211_AUTH_TIMEOUT` (`HZ /
+5`) and `IEEE80211_AUTH_MAX_TRIES`, and the same for association. The frames and their two answers are
+`mgmt.rs`'s, to IEEE 802.11-2020 9.3.3, host-tested.
+
+**Then it leaves.** With no keys an association carries nothing, so reporting the join as done would be the
+lie. It says `ASSOCIATED, association ID n; R5b done`, sends a deauthentication (reason 3, leaving), clears
+the BSSID, goes back to channel 1, and reports the join failed. The shell prints its "not joined" line.
+
+**The one place this service asks instead of being told.** A join is a run of exchanges inside one
+`Station::join` call, and while it runs the serve loop is not receiving. So `NOTE_BULK_IN` cannot reach the
+code waiting for an answer. `rx::wait_frames` asks the host for held transfers itself, 2 ms apart, only for
+as long as one answer window or one find dwell. The notices sent meanwhile are queued and taken afterwards,
+and each finds nothing held, which is harmless.
+
+**Not done here, recorded.** Linux's post-association steps - the rate mask and the "connected" report to
+the firmware (`update_rate_mask`, `report_connect`), `REG_BCN_PSR_RPT` with the association ID - happen
+only after the association succeeds and serve the data path, so they are R5c's or R6's. No HT capabilities
+are offered, so the association is 802.11g; an access point that admits only HT stations would refuse it,
+and the status code would say so.
+
+**Prediction for the card** (the Pi 2, the dongle in, a WPA2 network with its key stored):
+
+1. **At boot, the auto-join runs it unasked.** `/wifi.keys` names a network, so:
+   `join - '<name>' found at <bssid> on channel n, -NN dBm, WPA2 with CCMP`, then `AUTHENTICATED (Open
+   System, status 0)`, then `ASSOCIATED, association ID n; R5b done`. After that the serve loop's line that
+   the network last joined did not take us back.
+2. `wifi join <that name>`: the same lines again, then the shell's "not joined".
+3. `radio rx`: `tx` frames grow by the find's 13 probes plus about three frames (authentication,
+   association, deauthentication), and `0 failed`.
+
+**Refuted by:** `no access point answered a probe` for a network that is in range (the directed probe or the
+find's receive); `no authentication answer` (the unicast frame not reaching it, or its answer not reaching
+us: `REG_MACID`, `REG_BSSID`, or the chip not acknowledging); a refusal with a status code, which names the
+reason itself (17 is the access point full, 18 rates, 40 to 46 the RSN element); or the prompt stalling
+during a join longer than a few seconds.

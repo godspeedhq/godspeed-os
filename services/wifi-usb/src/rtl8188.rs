@@ -525,6 +525,18 @@ pub fn set_station(ctx: &ServiceContext, mac: &[u8; 6]) -> Result<(), &'static s
     Ok(())
 }
 
+/// `REG_BSSID`: the network the station is joining, six bytes.
+const REG_BSSID: u16 = 0x0618;
+
+/// R5b: the network being joined - `rtl8xxxu_set_bssid` for port 0, a byte at a time, which mac80211 has
+/// the driver do before the authentication (`BSS_CHANGED_BSSID`).
+pub fn set_bssid(ctx: &ServiceContext, bssid: &[u8; 6]) -> Result<(), &'static str> {
+    for (i, &b) in bssid.iter().enumerate() {
+        write8(ctx, REG_BSSID + i as u16, b)?;
+    }
+    Ok(())
+}
+
 /// `rtl8xxxu_gen1_config_channel` for a 20 MHz HT channel: the band width registers, the channel into
 /// `RF_MODE_AG`, the SIFS timings, the 20 MHz bit. `channel` is 1 to 14.
 pub fn set_channel(ctx: &ServiceContext, channel: u8) -> Result<(), &'static str> {

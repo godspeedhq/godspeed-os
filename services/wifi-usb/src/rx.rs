@@ -8,6 +8,7 @@
 //! loop answers the shell, and hands the host's notices here. `NOTE_RADIO` - the dongle bound or
 //! removed - ends the loop, so `main.rs` can bring up whatever is there now.
 
+use godspeed as gs;
 use godspeed_sdk::ServiceContext;
 use godspeed_wifi::bss::{self, Network, Scan};
 use godspeed_wifi::serve::{Host, Notice};
@@ -102,6 +103,42 @@ impl Host for Heard {
     }
     // No power operations: the dongle's power is its USB port's, and not this service's to cut. The loop
     // answers `wifi radio off hard` and `powercycle` "no control over the radio's power", which is true.
+}
+
+/// How far apart the join's own asks are (`wait_frames`): often enough that a 200 ms answer window holds
+/// dozens of looks, rarely enough that the host is not asked for nothing hundreds of times a second.
+const JOIN_PACE_MS: u64 = 2;
+
+/// THE ONE PLACE THIS SERVICE ASKS RATHER THAN IS TOLD. A join (R5b) is a sequence of exchanges with an
+/// access point inside ONE `Station::join` call, and while it runs the serve loop is not receiving, so the
+/// host's `NOTE_BULK_IN` cannot reach the code waiting for the answer. So the join asks the host for held
+/// transfers itself, `JOIN_PACE_MS` apart, for at most `budget_ms`, and hands each good packet to `f` until
+/// `f` says it has what it was waiting for. The notices the host sends meanwhile stay queued, and the loop
+/// takes them afterwards as it would any notice - a collection that finds nothing held, which is harmless.
+/// `true` when `f` said so before the budget ran out.
+pub fn wait_frames(ctx: &ServiceContext, budget_ms: u64, f: &mut dyn FnMut(&rtl_rx::Packet) -> bool) -> bool {
+    let since = gs::driver::wait::Since::now(ctx);
+    let budget = gs::driver::wait::Budget::ms(budget_ms);
+    loop {
+        match ask(ctx) {
+            Ok(Some(m)) => {
+                let mut done = false;
+                rtl_rx::walk(&m.payload_bytes()[2..], &mut |pk| {
+                    if !done && pk.desc.rpt_sel == 0 && !pk.desc.crc_err && !pk.desc.icv_err && !pk.truncated {
+                        done = f(&pk);
+                    }
+                });
+                if done {
+                    return true;
+                }
+            }
+            Ok(None) => gs::task::sleep_ms(ctx, JOIN_PACE_MS),
+            Err(_) => return false,
+        }
+        if since.passed(ctx, budget) {
+            return false;
+        }
+    }
 }
 
 /// `NOTE_BULK_IN` arrived: collect what the host holds, up to `PER_NOTICE` transfers, keeping each beacon
