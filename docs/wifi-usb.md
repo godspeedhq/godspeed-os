@@ -321,7 +321,7 @@ registers); RF_MODE_AG reads 0x07401 - channel 1, as asked`. The low byte, 0x01,
 rest is the band and bandwidth field the table loaded. Repeated after every clean download since,
 including the R2c card's boot (2026-10-06).
 
-## 9. R3b, the half that needs no hardware (2026-10-05): reading what the chip hands up - host-tested, no card
+## 9. R3b (2026-10-05/06): reading what the chip hands up - hardware-verified on the Pi 2
 
 R3b is two halves. The `dwc2` half - a bulk IN channel of its own, armed in the background and harvested
 on the USB interrupt - changes the driver that carries the Pi 2's keyboard and disk, so it waits for R1 and
@@ -351,7 +351,7 @@ its card - not done unattended.
 Nothing in the image called `rtl_rx.rs` until the `dwc2` half below; the `#[allow(dead_code)]` it carried
 went with that change.
 
-### The `dwc2` half (2026-10-06): built, the card is `build/kernel7-R3b.img` - NOT YET RUN
+### The `dwc2` half (2026-10-06): hardware-verified on the Pi 2 (`build/kernel7-R3b.img`)
 
 **At bind, the dongle is configured.** `dwc2` never sent the radio SET_CONFIGURATION: control transfers on
 endpoint 0 work in the Addressed state, and every card from U1 to R3a ran that way. A bulk endpoint exists
@@ -397,3 +397,32 @@ errors; and the keyboard and the disk unaffected. **Refuted by:** no bulk IN or 
 bind; `receive started` and then nothing, with `radio rx` at 0 transfers (the IN never completes - the chip's
 receive, or the queue); transfers climbing with no beacons and every frame failing its CRC (the descriptor
 read); or a keyboard or disk that stalls once receive starts (the stand-aside).
+
+**Result (2026-10-06): passed, at boot and on five replugs.** Every predicted line appeared. At bind,
+`configured (1) - bulk IN endpoint 1, 512 bytes, received on channel 5`. Receive started 3.0 s after the
+dongle was bound, and the first frame was a beacon on channel 1, 15 ms later. Eight networks were named
+in the next 80 ms, between -40 and -84 dBm. In the first 80 seconds, `wifi-usb` walked 7680 transfers,
+one frame each, about 100 a second and almost all beacons. **None failed its CRC and none was cut
+short.** `dwc2`'s `radio rx` line showed 0 errors throughout. It also showed 50 asides, so the IN stood
+aside for other transfers and came back each time. Eleven notices were late, all in the first burst: the
+driver's queue was full, and each notice was sent again on the next pass as designed. `dir` listed its
+11 entries, and `wifi`, `ping` and other commands were typed while receive ran.
+
+**The replugs.** All five came back the same way: `REMOVED`, then a fresh address, configured, R1 to
+R3a, `receive started`, and `R3b done`. One removal landed while `wifi-usb` was collecting a transfer,
+and it said so (`collecting a transfer - the dongle is no longer bound`) and waited for the next bind.
+**No STATUS stage errored on any of them.** R2c's re-run never had to fire, so the replug it was built
+for is still unseen. What is shown is that a replug now works.
+
+**What the run measured that the stand-aside was guessing at.** The NIC's own bulk IN (channel 3, which
+the radio does not stand aside for) was armed for the whole run, NAKed by a LAN9514 with no cable. The
+`net IRQ` line shows `13032 still in flight` across 13033 interrupts, and `net IN HCINT=0x00000010` (NAK).
+Every interrupt was the radio's, because the network had no link; each one also asks the NIC for frames.
+So, unlike R1 to R3a, this run had an IN that the device NAKs armed throughout. Five replugs' worth of
+control transfers ran beside it, hundreds per replug (the efuse, 126 firmware blocks, the MAC, baseband and RF tables), along with the disk's bulk transfers and the
+radio's own IN. None failed. That is one run, not a proof that the queue cannot starve a SETUP. But it
+is the first evidence there is, and it points at the transmit-only starvation `net.rs` saw.
+
+**One instrument mislabel, found here.** The `net IRQ` line counts every USB interrupt, and the radio's
+now outnumber the network's by thousands, so "net IRQ - 13033 interrupts, 0 frames" reads as a busy NIC
+with nothing to show. It is the shared vector. Relabelled in the next `dwc2` change.
