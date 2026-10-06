@@ -40,6 +40,10 @@ const RX_ENC_AES: u8 = 4;
 /// `RX_FLAG_MIC_STRIPPED` - which `rtl8xxxu` never sets.
 const CCMP_MIC: usize = 8;
 
+/// The longest EAPOL frame taken or sent, as ethernet: the supplicant's own message buffer (its header,
+/// the 99-byte key descriptor, a nonce's worth, and 512 bytes of key data).
+pub const EAPOL_MAX: usize = 14 + 99 + 64 + 512;
+
 /// The link as the station and this host share it: the network joined, and the frames received through
 /// it waiting for the station's `pull`. Owned by `main.rs` for the life of the service.
 pub struct Link {
@@ -60,6 +64,12 @@ pub struct Link {
     pub pairwise_pn: u64,
     pub group_pn: [u64; 4],
     pub replays: u32,
+    /// A key frame from the access point on the joined link (a group rekey, R7), as ethernet, waiting for
+    /// the station's `pull` to answer it. One slot: the access point sends the next only after this one is
+    /// answered or timed out, and a second arriving meanwhile is counted in `rekeys_dropped`.
+    pub rekey: [u8; EAPOL_MAX],
+    pub rekey_len: usize,
+    pub rekeys_dropped: u32,
 }
 
 impl Link {
@@ -67,6 +77,7 @@ impl Link {
         Link {
             bssid: None, frames: RxQueue::new(), data_in: 0, dropped: 0, undecrypted: 0, rekeys: 0,
             pairwise_pn: 0, group_pn: [0; 4], replays: 0,
+            rekey: [0; EAPOL_MAX], rekey_len: 0, rekeys_dropped: 0,
         }
     }
 
@@ -95,6 +106,7 @@ impl Link {
     pub fn joined(&mut self, bssid: [u8; 6]) {
         self.bssid = Some(bssid);
         self.frames.clear();
+        self.rekey_len = 0;
     }
 }
 
@@ -333,15 +345,27 @@ fn data_frame(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
         l.pairwise_pn = pn;
     }
     let Some(d) = data::llc_payload(f, true) else { return };
-    if d.ethertype == eapol::ETHERTYPE_EAPOL {
-        l.rekeys = l.rekeys.wrapping_add(1);
-        if l.rekeys == 1 {
-            ctx.log("wifi-usb: the access point sent a key frame on the joined link (a group rekey) - not answered yet (R7); it may drop the station");
-        }
-        return;
-    }
+    // The MIC off first, for every frame - a key frame's own MIC is computed over its exact length, so a
+    // trailing 8 bytes would fail it.
     let body = &d.body[..d.body.len().saturating_sub(CCMP_MIC)];
     let inner = DataIn { ethertype: d.ethertype, da: d.da, sa: d.sa, body };
+    if d.ethertype == eapol::ETHERTYPE_EAPOL {
+        // A key frame on the joined link: the access point's group rekey, for the station's `pull` (R7).
+        l.rekeys = l.rekeys.wrapping_add(1);
+        if l.rekey_len != 0 {
+            l.rekeys_dropped = l.rekeys_dropped.wrapping_add(1);
+            return;
+        }
+        let mut eth = [0u8; EAPOL_MAX];
+        let n = data::to_ethernet(&inner, &mut eth);
+        if n == 0 {
+            l.rekeys_dropped = l.rekeys_dropped.wrapping_add(1);
+            return;
+        }
+        l.rekey[..n].copy_from_slice(&eth[..n]);
+        l.rekey_len = n;
+        return;
+    }
     let mut eth = [0u8; godspeed_wifi::rxq::FRAME_MAX];
     let n = data::to_ethernet(&inner, &mut eth);
     if n == 0 || !l.frames.push(&eth[..n]) {

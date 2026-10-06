@@ -67,7 +67,8 @@ const REASON_LEAVING: u16 = 3;
 /// about four of the one-second retries an access point is commonly configured with, and room.
 const HANDSHAKE_MS: u64 = 8_000;
 /// The longest EAPOL frame this station takes in or sends, as ethernet: the supplicant's own message buffer.
-const EAPOL_MAX: usize = 14 + 99 + 64 + 512;
+// The longest EAPOL frame is `rx::EAPOL_MAX`, one fact for both sides.
+use crate::rx::EAPOL_MAX;
 /// Frame control first bytes of the two frames by which an access point ends an association.
 const FC_DEAUTH: u8 = 0xC0;
 const FC_DISASSOC: u8 = 0xA0;
@@ -134,6 +135,13 @@ pub struct Dongle<'l> {
     /// The last `install_key` for a group key found it already installed; its `group_rsc` must not lower
     /// the counter.
     gtk_reinstall: bool,
+    /// The CAM entry each group key slot uses, so a rekey into a slot already holding a key overwrites its
+    /// entry rather than taking a new one - the CAM is bounded and the access point rekeys for as long as
+    /// the station stays.
+    gtk_entry: [Option<u8>; 4],
+    /// The pairwise key is in the CAM: from then on every data frame sent - the EAPOL ones of a rekey
+    /// included - goes protected. Decided by what the chip holds, not by what the supplicant keeps.
+    ptk_in: bool,
 }
 
 /// Where a sweep is: the channel tuned now, and when it was tuned.
@@ -147,7 +155,7 @@ impl<'l> Dongle<'l> {
         Dongle {
             link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
-            assoc: None, keys: None, cam_next: 0, off: false, gtk: [None; 4], gtk_reinstall: false,
+            assoc: None, keys: None, cam_next: 0, off: false, gtk: [None; 4], gtk_reinstall: false, gtk_entry: [None; 4], ptk_in: false,
         }
     }
 
@@ -280,6 +288,8 @@ impl<'l> Dongle<'l> {
             }
             *g = None;
         }
+        self.gtk_entry = [None; 4];
+        self.ptk_in = false;
         for e in 0..self.cam_next {
             let _ = rtl8188::clear_key(ctx, e);
         }
@@ -630,7 +640,7 @@ impl Station for Dongle<'_> {
     /// join made keys, plain on an open network.
     fn send(&mut self, eth: &[u8], ctx: &ServiceContext) -> bool {
         let Some(a) = self.assoc else { return false };
-        let keyed = self.keys.is_some();
+        let keyed = self.ptk_in;
         let mut frame = [0u8; godspeed_wifi::rxq::FRAME_MAX + data::DATA_OVERHEAD + data::CCMP_HEADER];
         let seq = self.next_seq();
         let ccmp = if keyed {
@@ -667,19 +677,51 @@ impl Station for Dongle<'_> {
         ok
     }
 
-    /// What the receive side has taken through the link since the last pull, into `rxq`.
-    fn pull(&mut self, rxq: &mut RxQueue, _ctx: &ServiceContext) -> Pulled {
-        let mut got = 0u32;
-        let mut l = self.link.borrow_mut();
-        while rxq.has_room() {
-            let mut b = [0u8; godspeed_wifi::rxq::FRAME_MAX];
-            let n = l.frames.pop(&mut b);
-            if n == 0 || !rxq.push(&b[..n]) {
-                break;
+    /// What the receive side has taken through the link since the last pull, into `rxq` - and a key frame
+    /// waiting, answered (R7). The serve loop pulls at least every 250 ms while joined, read or not, so a
+    /// group rekey is answered within that.
+    fn pull(&mut self, rxq: &mut RxQueue, ctx: &ServiceContext) -> Pulled {
+        let mut p = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None };
+        let mut key = [0u8; EAPOL_MAX];
+        let mut key_len = 0usize;
+        {
+            let mut l = self.link.borrow_mut();
+            while rxq.has_room() {
+                let mut b = [0u8; godspeed_wifi::rxq::FRAME_MAX];
+                let n = l.frames.pop(&mut b);
+                if n == 0 || !rxq.push(&b[..n]) {
+                    break;
+                }
+                p.data += 1;
             }
-            got += 1;
+            if l.rekey_len != 0 {
+                key_len = l.rekey_len;
+                key[..key_len].copy_from_slice(&l.rekey[..key_len]);
+                l.rekey_len = 0;
+            }
         }
-        Pulled { data: got, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None }
+        if key_len > 0 {
+            // The supplicant every radio shares answers it, through this station's `KeyPath` (the new group
+            // key into the CAM, the acknowledgement out protected) - as the AIC8800's pull does.
+            let mut keys = self.keys.take();
+            let r = supplicant::group_rekey(self, &key[..key_len], keys.as_mut(), "wifi-usb", ctx);
+            if self.keys.is_none() {
+                self.keys = keys;
+            }
+            match r {
+                supplicant::Rekey::Answered => {
+                    p.rekeyed += 1;
+                    ctx.log("wifi-usb: the access point's group rekey answered - the new group key installed and acknowledged; R7 done");
+                }
+                supplicant::Rekey::Refused => p.rekey_failed += 1,
+                supplicant::Rekey::Pairwise => {
+                    p.pairwise_failed += 1;
+                    ctx.log("wifi-usb: the access point restarted the four-way handshake on the live link (a pairwise rekey) - not answered by this station yet; it will drop the link, and `wifi join` returns");
+                }
+                supplicant::Rekey::NotAKey => {}
+            }
+        }
+        p
     }
 
     fn event_name(&self, _code: u32) -> &'static str {
@@ -698,6 +740,11 @@ impl KeyPath for Dongle<'_> {
     /// (`godspeed_wifi::data::to_80211`) with its descriptor (`rtl_tx::eapol`), on the best-effort queue's
     /// endpoint.
     fn send_eapol(&mut self, eth: &[u8], ctx: &ServiceContext) -> bool {
+        // Once the pairwise key is in, an EAPOL frame is data like any other and goes protected - a group
+        // rekey's acknowledgement. Before it, the four-way handshake's own frames go plain (below).
+        if self.ptk_in {
+            return self.send(eth, ctx);
+        }
         let Some(a) = self.assoc else { return false };
         let mut frame = [0u8; EAPOL_MAX + data::DATA_OVERHEAD];
         let seq = self.next_seq();
@@ -735,6 +782,8 @@ impl KeyPath for Dongle<'_> {
         };
         let slot = key_idx as usize & 3;
         self.gtk_reinstall = false;
+        // A group key into a slot already holding one takes that slot's CAM entry back.
+        let reuse = if group { self.gtk_entry[slot] } else { None };
         if group && self.gtk[slot] == Some(*key) {
             // THE SAME GROUP KEY AGAIN: not reinstalled, and its counter not reset (`group_rsc` below).
             self.gtk_reinstall = true;
@@ -743,12 +792,17 @@ impl KeyPath for Dongle<'_> {
                 key_idx));
             return true;
         }
-        let entry = self.cam_next;
+        let entry = reuse.unwrap_or(self.cam_next);
         match rtl8188::install_key(ctx, entry, key_idx as u8, key, &mac, group) {
             Ok(()) => {
-                self.cam_next += 1;
+                if reuse.is_none() {
+                    self.cam_next += 1;
+                }
                 if group {
                     self.gtk[slot] = Some(*key);
+                    self.gtk_entry[slot] = Some(entry);
+                } else {
+                    self.ptk_in = true;
                 }
                 ctx.log_fmt(format_args!(
                     "wifi-usb: {} key {} in CAM entry {}", if group { "group" } else { "pairwise" }, key_idx, entry));

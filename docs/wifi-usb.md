@@ -895,3 +895,34 @@ both correct. `wifi status` read the radio off. `wifi radio on`: `radio on - RF 
 `rejoining the network last joined`, JOINED 1.3 s later, `nic-driver` back on the radio, `lease ok`, and
 `ping` 5 of 5. The shell calls the off "soft - the firmware's switch; the chip stays powered", which is
 true here as well: the dongle's power is its USB port's.
+
+## 16. R7 (2026-10-06): the access point's group rekey, answered - built, NOT YET RUN
+
+An access point changes its group key on a timer, often hourly, by a two-message group key handshake on
+the live link. A station that does not answer it is dropped. Until now the dongle counted the frame and left
+it.
+
+**In.** A key frame on the joined link waits in one slot in `rx::Link`, as ethernet with the MIC trimmed.
+The trim now happens before the EAPOL check, because a key frame's own MIC covers its exact length. The
+station's `pull` hands it to `supplicant::group_rekey`, the runner the AIC8800's `pull` uses. The serve loop
+pulls at least every 250 ms while joined, frames read or not, so the rekey is answered within that.
+
+**Out, protected.** The acknowledgement is an EAPOL frame on a link that has keys, so it goes protected, as
+any data frame does. `send_eapol` now sends protected once the pairwise key is in the CAM (`ptk_in`, set by
+the install itself, so it follows what the chip holds). The four-way handshake's own frames still go plain,
+being sent before that.
+
+**The CAM stays bounded.** A new group key in a slot that already holds one overwrites that slot's CAM entry
+instead of taking a new one, so an hourly rekey cannot fill the CAM. The same key again is refused as the
+KRACK guard above refuses it. Its counter starts at the new key's RSC.
+
+**Not answered, and said:** the access point restarting the four-way handshake on the live link (a
+pairwise rekey; hostapd does not do it by default). The log says so, and the link will drop.
+
+**Prediction:** join, take a lease, and leave the Pi up past the access point's rekey interval (an hour
+covers the common setting). When it comes: `group key n accepts packet numbers above N`, then `the access
+point's group rekey answered - ...; R7 done`, and `ping` still answering afterwards. **Refuted by:**
+`group-key frame whose MIC does not verify` (the trim, or the frame), `could not be sent` (the protected
+send), or the link dropping at the rekey (the acknowledgement not reaching the access point). If nothing
+happens in two hours, the access point may not rekey at all, which the log cannot distinguish from
+silence - a `wifi status` showing the join still up is then the result.
