@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! R3b, the driver's half: frames from the air. The host keeps one bulk IN armed and says `NOTE_BULK_IN`
-//! when a transfer is held (`usbfn::OP_BULK_IN`); this collects it, reads its packets (`rtl_rx`) and each
-//! frame (`godspeed_wifi::mgmt`), and says what was heard. No scan yet, and nothing goes further up: the
-//! card's question is only whether beacons arrive on the channel R3a tuned (`docs/wifi-usb.md` 9).
+//! Frames from the air, and the USB host's other notices. The host keeps one bulk IN armed and says
+//! `NOTE_BULK_IN` when a transfer is held (`usbfn::OP_BULK_IN`); this collects it, reads its packets
+//! (`rtl_rx`) and each frame (`godspeed_wifi::mgmt`), and says what was heard (R3b). While a sweep runs,
+//! each beacon also goes into it, which is all a passive scan is (R4, `station.rs`).
+//!
+//! These arrive with no reply cap, so they reach this service through the serve loop's [`Host`]: the
+//! loop answers the shell, and hands the host's notices here. `NOTE_RADIO` - the dongle bound or
+//! removed - ends the loop, so `main.rs` can bring up whatever is there now.
 
 use godspeed_sdk::ServiceContext;
-use godspeed_wifi::{mgmt, usbfn};
+use godspeed_wifi::bss::{self, Network, Scan};
+use godspeed_wifi::serve::{Host, Notice};
+use godspeed_wifi::{mgmt, usbfn, wire};
 
 use crate::rtl_rx;
 
@@ -17,7 +23,7 @@ const PER_NOTICE: u32 = 8;
 /// A summary every this many transfers - a count, not a timer (the service blocks between notices).
 const SUMMARY_EVERY: u32 = 256;
 
-/// What has been heard since the radio came up.
+/// What has been heard since the radio came up - and the dongle's [`Host`]: its notices are the USB host's.
 pub struct Heard {
     transfers: u32,
     frames: u32,
@@ -65,8 +71,24 @@ fn ask(ctx: &ServiceContext) -> Result<Option<godspeed_sdk::Message>, &'static s
     }
 }
 
-/// `NOTE_BULK_IN` arrived: collect what the host holds, up to `PER_NOTICE` transfers.
-pub fn collect(ctx: &ServiceContext, h: &mut Heard) {
+impl Host for Heard {
+    fn notice(&mut self, msg: &[u8], sweep: Option<&mut Scan>, ctx: &ServiceContext) -> Notice {
+        match msg {
+            [usbfn::NOTE_BULK_IN] => {
+                collect(ctx, self, sweep);
+                Notice::Taken
+            }
+            [usbfn::NOTE_RADIO] => Notice::Changed,
+            _ => Notice::Ignored,
+        }
+    }
+    // No power operations: the dongle's power is its USB port's, and not this service's to cut. The loop
+    // answers `wifi radio off hard` and `powercycle` "no control over the radio's power", which is true.
+}
+
+/// `NOTE_BULK_IN` arrived: collect what the host holds, up to `PER_NOTICE` transfers, keeping each beacon
+/// in `sweep` when one is running.
+fn collect(ctx: &ServiceContext, h: &mut Heard, mut sweep: Option<&mut Scan>) {
     for _ in 0..PER_NOTICE {
         let m = match ask(ctx) {
             Ok(Some(m)) => m,
@@ -82,7 +104,7 @@ pub fn collect(ctx: &ServiceContext, h: &mut Heard) {
         let t = &m.payload_bytes()[2..];
         h.transfers = h.transfers.wrapping_add(1);
         let first = h.frames == 0;
-        rtl_rx::walk(t, &mut |pk| heard(ctx, h, &pk));
+        rtl_rx::walk(t, &mut |pk| heard(ctx, h, sweep.as_deref_mut(), &pk));
         if first && h.frames > 0 {
             ctx.log_fmt(format_args!(
                 "wifi-usb: the FIRST frame from the air - a {}-byte transfer; R3b done", t.len()));
@@ -95,8 +117,8 @@ pub fn collect(ctx: &ServiceContext, h: &mut Heard) {
     }
 }
 
-/// One packet: counted, and a beacon from a network not yet named, named.
-fn heard(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
+/// One packet: counted; a beacon kept in the sweep when one runs; a network not yet named, named.
+fn heard(ctx: &ServiceContext, h: &mut Heard, sweep: Option<&mut Scan>, pk: &rtl_rx::Packet) {
     if pk.desc.rpt_sel != 0 {
         return;
     }
@@ -112,6 +134,10 @@ fn heard(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
     let Some(b) = mgmt::beacon(pk.frame) else { return };
     h.beacons = h.beacons.wrapping_add(1);
     let bssid = b.bssid();
+    let rssi = rtl_rx::rssi(pk.phy, pk.desc.rxmcs);
+    if let Some(scan) = sweep {
+        keep(scan, &b, rssi);
+    }
     if h.n_seen >= NETWORKS || h.seen[..h.n_seen].contains(&bssid) {
         return;
     }
@@ -119,12 +145,33 @@ fn heard(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
     h.n_seen += 1;
     let mut name = [0u8; 32];
     let shown = printable(b.ssid().unwrap_or(&[]), &mut name);
-    let rssi = rtl_rx::rssi(pk.phy, pk.desc.rxmcs);
     ctx.log_fmt(format_args!(
         "wifi-usb: {} '{}' {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} on channel {}, {} dBm",
         if b.answers_a_probe() { "probe response" } else { "beacon" },
         shown, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
         b.channel().map(|c| c as i16).unwrap_or(-1), rssi.unwrap_or(0)));
+}
+
+/// A beacon heard during a sweep, as the record `wifi list` prints: the network's own channel from its DS
+/// Parameter Set (a neighbour's beacon leaks onto the channel tuned, so the tuned one would be wrong), and
+/// its security read from its elements by the one classifier every radio uses (`bss::classify`).
+///
+/// No channel element means a channel of 0 rather than a guess. No signal reading means 0 dBm, which the
+/// shell prints as it is; the descriptor carries one on every frame this chip has handed up so far.
+fn keep(scan: &mut Scan, b: &mgmt::Beacon, rssi: Option<i16>) {
+    let mut n = Network::blank();
+    n.bssid = b.bssid();
+    if let Some(ssid) = b.ssid() {
+        let len = ssid.len().min(wire::SSID_MAX);
+        n.ssid[..len].copy_from_slice(&ssid[..len]);
+        n.ssid_len = len as u8;
+    }
+    // 2.4 GHz: band bits 15:14 are 0, so the chanspec is the channel (`wire::RECORD`).
+    n.chanspec = b.channel().unwrap_or(0) as u16;
+    n.rssi = rssi.unwrap_or(0);
+    n.security = bss::classify(b.elements(), b.capability());
+    scan.results = scan.results.wrapping_add(1);
+    scan.keep(n);
 }
 
 /// An SSID as text: printable ASCII kept, anything else a `?`. It is the air's, so nothing about it is trusted.

@@ -421,6 +421,9 @@ pub struct ShellCtx {
     wifi_tag: core::cell::Cell<u8>,
     /// Byte 1 of the last `radio down` answer - WHY the driver says it is down (0 = it did not say).
     wifi_down_reason: core::cell::Cell<u8>,
+    /// The radio service this `wifi` command is talking to (`RADIOS`), found once per command by
+    /// `cmd_wifi`, because finding it is a walk of every task slot and one command asks many times.
+    wifi_radio: core::cell::Cell<&'static str>,
     /// The audio request correlation tag (see `audio_ask`). Its own counter, as `wifi_tag` has.
     audio_tag: core::cell::Cell<u8>,
     /// The job table: what `background` started, what `jobs` lists, what `foreground` attaches to.
@@ -461,6 +464,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         wifi_unsent: core::cell::Cell::new(0),
         wifi_tag: core::cell::Cell::new(0),
         wifi_down_reason: core::cell::Cell::new(0),
+        wifi_radio: core::cell::Cell::new(RADIOS[0]),
         audio_tag: core::cell::Cell::new(0),
         jobs: core::cell::RefCell::new(JobTable::new()),
     };
@@ -1060,10 +1064,14 @@ fn complete_wifi_stored(ctx: &ServiceContext, line: &mut Line, tok_start: usize)
     // Tagged and sifted like every radio request (`wifi_sift`), with the completion's own tag.
     let msg = wifi_tagged(&[9u8], wifi_wire::COMPLETION_TAG);
     let ours = |m: &Message| wifi_is_answer(m, Some(wifi_wire::COMPLETION_TAG));
-    let reply = match ctx.request_with_reply_ms_sifted(WIFI_DRIVER, &msg, 1500, ours) {
-        Some(r) => Some(r),
-        None if ctx.reacquire_by_name(WIFI_DRIVER) => ctx.request_with_reply_ms_sifted(WIFI_DRIVER, &msg, 1500, ours),
+    // Completion runs without the shell's state, so it finds the radio itself.
+    let reply = match find_radio(ctx) {
         None => None,
+        Some(radio) => match ctx.request_with_reply_ms_sifted(radio, &msg, 1500, ours) {
+            Some(r) => Some(r),
+            None if ctx.reacquire_by_name(radio) => ctx.request_with_reply_ms_sifted(radio, &msg, 1500, ours),
+            None => None,
+        },
     };
     if let Some(r) = reply {
         let r = wifi_untag(&r);
@@ -8195,22 +8203,30 @@ fn audio_pipe_refusal(arg: &str) -> Option<&'static str> {
     }
 }
 
-/// The service that owns the radio, when there is one (`docs/wifi.md`). Named to the same
-/// convention as `nic-driver` and `block-driver`.
-const WIFI_DRIVER: &str = "wifi-driver";
+/// The services that can own a radio, in the order they are asked: the onboard radio's driver
+/// (`docs/wifi.md`), then a USB dongle's (`docs/wifi-usb.md`). Each answers the same protocol through the
+/// same serve loop (`godspeed_wifi::serve`), so which one is running is the only thing this shell needs
+/// to know. A machine with BOTH is answered by the first; choosing between two radios is not built.
+const RADIOS: [&str; 2] = ["wifi-driver", "wifi-usb"];
+
+/// The first of `RADIOS` with a live task, if any. A walk of every task slot (`slot_of`), so a command
+/// asks once and keeps the answer in `ShellCtx::wifi_radio`.
+fn find_radio(ctx: &ServiceContext) -> Option<&'static str> {
+    RADIOS.iter().copied().find(|r| slot_of(ctx, r).is_some())
+}
 
 /// `wifi` - join and inspect a wireless network (`utilities/56_wifi.md` is the surface; `docs/wifi.md` the
 /// design and the bring-up record).
 ///
-/// Every verb here is a question put to `wifi-driver` over IPC, by name, and the answers are the driver's
-/// (`sdk/wifi/src/wire.rs`, which the driver re-exports as `scan::reply`); this file formats them and asks for a passphrase where
-/// the driver says one is needed. The vocabulary lives once, in `wifi_wire`.
+/// Every verb here is a question put over IPC, by name, to whichever radio service is running (`RADIOS`:
+/// `wifi-driver` for an onboard radio, `wifi-usb` for a USB dongle), and the answers are that service's
+/// (`sdk/wifi/src/wire.rs`); this file formats them and asks for a passphrase where the driver says one
+/// is needed. The vocabulary lives once, in `wifi_wire`.
 ///
-/// **On three of the five machines the absence line is not a stub, it is the answer.** The T630 and the
-/// Wyse have no onboard radio, so "no wireless radio on this machine" is the answer there - until a USB
-/// dongle's driver, `wifi-usb`, can answer too (`docs/wifi-usb.md` 3: today this asks `wifi-driver` only,
-/// so it says the same on a Pi 2 with a dongle up). That is why the absence path was built first rather
-/// than last: it is the only part that is correct on every board.
+/// **On a machine with neither, the absence line is not a stub, it is the answer.** The T630 and the
+/// Wyse have no onboard radio, so "no wireless radio on this machine" is the answer there until a USB
+/// host other than the Pi 2's serves a dongle (`docs/wifi-usb.md`, U2). That is why the absence path was
+/// built first rather than last: it is the only part that is correct on every board.
 ///
 /// **Absence is told apart from a wedge**, because `utilities/56_wifi.md` section 5 says the user's
 /// real question is whose fault it is. `slot_of` - the same introspection `caps` uses - answers it: no
@@ -8286,15 +8302,18 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     }
 
     // Then the hardware question, which every verb shares.
-    match slot_of(ctx, WIFI_DRIVER) {
+    match find_radio(ctx) {
         None => {
             out.line_fmt(ctx, format_args!("no wireless radio on this machine"));
             // Say WHY rather than only what, so a reader on a board that HAS a radio knows where to
             // look. Asking is never an error (`utilities/56_wifi.md` section 5), so this is Ok.
-            out.line_fmt(ctx, format_args!("  (no `{}` is running - this machine has no radio, or none is driven yet)", WIFI_DRIVER));
+            out.line_fmt(ctx, format_args!(
+                "  (neither `{}` nor `{}` is running - this machine has no radio, or none is driven yet)",
+                RADIOS[0], RADIOS[1]));
             Ok(())
         }
-        Some(_) => {
+        Some(radio) => {
+            ctx.wifi_radio.set(radio);
             match arg {
                 "scan" => return wifi_scan(ctx, out),
                 "list" => return wifi_list(ctx, out),
@@ -8323,7 +8342,7 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             // Every spec verb is routed above; what reaches here is a verb the shell parses and the driver (`docs/wifi.md` 6): there is
             // nothing to list or delete until a credential can be held. Loud and specific: the one thing
             // this must never do is imply the radio failed.
-            out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell cannot ask it that yet", WIFI_DRIVER));
+            out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell cannot ask it that yet", radio));
             out.line_fmt(ctx, format_args!("  (`wifi {}` arrives with the phase that needs it - `docs/wifi.md` has the phases)",
                 arg.split_whitespace().next().unwrap_or("status")));
             Err(ShellError::Unknown)
@@ -8411,7 +8430,7 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // that failed (no send slot, or a dead driver), never a deadline.
     let attempt = || {
         let s0 = ctx.read_tsc();
-        let got = ctx.request_with_reply_ms_sifted(WIFI_DRIVER, &msg, max_ms, |m| wifi_sift(ctx, m, Some(tag)));
+        let got = ctx.request_with_reply_ms_sifted(ctx.wifi_radio.get(), &msg, max_ms, |m| wifi_sift(ctx, m, Some(tag)));
         let left = got.is_some() || ctx.read_tsc().wrapping_sub(s0) >= ctx.duration_cycles(250);
         (got, left)
     };
@@ -8420,7 +8439,7 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
         // Reacquire and send ONCE - nothing is in flight to a live driver, so this is a first request, not
         // a repeat. A respawned driver owes nothing: its dead predecessor's answers will never come.
         ctx.wifi_owed.set(0);
-        if !ctx.reacquire_by_name(WIFI_DRIVER) {
+        if !ctx.reacquire_by_name(ctx.wifi_radio.get()) {
             return None;
         }
         (got, left) = attempt();
@@ -8540,12 +8559,12 @@ fn wifi_ask_keys(ctx: &ShellCtx, req: &[u8], hint_secs: i64, max_secs: i64, on_l
     let msg = wifi_tagged(req, tag);
     let ask = || {
         let t0 = ctx.read_tsc();
-        let out = ctx.request_with_reply_keyhint_sifted(WIFI_DRIVER, &msg, hint_secs, max_secs,
+        let out = ctx.request_with_reply_keyhint_sifted(ctx.wifi_radio.get(), &msg, hint_secs, max_secs,
             ServiceContext::QUIT_KEYS, &on_linger, |m| wifi_sift(ctx, m, Some(tag)));
         (out, ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(250))
     };
     let (mut outcome, mut at_once) = ask();
-    if matches!(outcome, ReqOutcome::Timeout) && at_once && ctx.reacquire_by_name(WIFI_DRIVER) {
+    if matches!(outcome, ReqOutcome::Timeout) && at_once && ctx.reacquire_by_name(ctx.wifi_radio.get()) {
         ctx.wifi_owed.set(0);
         (outcome, at_once) = ask();
     }
@@ -8714,7 +8733,7 @@ fn wifi_not_answering(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 fn wifi_kill_driver(ctx: &ShellCtx) -> Result<(), ShellError> {
     ctx.wifi_owed.set(0);
     let _ = wifi_drain_stale(ctx);
-    cmd_kill(&**ctx, "wifi-driver")
+    cmd_kill(&**ctx, ctx.wifi_radio.get())
 }
 
 /// The states in which nothing can be asked of the radio (down, off, powered off), said the same way by
@@ -9581,7 +9600,7 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
                 // respawn take the boot's own path - the same watch `powercycle` uses.
                 out.line_fmt(ctx, format_args!("radio powered up - starting the driver on the cold chip"));
                 if let Err(e) = wifi_kill_driver(ctx) {
-                    out.line_fmt(ctx, format_args!("radio on failed - the chip is powered but the driver could not be restarted; `kill wifi-driver` by hand brings it back"));
+                    out.line_fmt(ctx, format_args!("radio on failed - the chip is powered but the driver could not be restarted; `kill {}` by hand brings it back", ctx.wifi_radio.get()));
                     return Err(e);
                 }
                 let outcome = wifi_powercycle_watch(ctx, out, "radio on");
@@ -9701,7 +9720,7 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
                             OFF_UNITS / 10, OFF_UNITS % 10,
                             if was_joined { " (the network is left)" } else { "" }));
                         if let Err(e) = wifi_kill_driver(ctx) {
-                            out.line_fmt(ctx, format_args!("powercycle failed - the chip was power-cycled but the driver could not be restarted; `kill wifi-driver` by hand brings it back"));
+                            out.line_fmt(ctx, format_args!("powercycle failed - the chip was power-cycled but the driver could not be restarted; `kill {}` by hand brings it back", ctx.wifi_radio.get()));
                             return Err(e);
                         }
                         wifi_powercycle_watch(ctx, out, "powercycle")
@@ -9756,7 +9775,7 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
 fn wifi_restart_and_watch(ctx: &ShellCtx, out: &mut Out, verb: &str, why: &str) -> Result<WatchOutcome, ShellError> {
     out.line_fmt(ctx, format_args!("{} - restarting the driver (its respawn adopts a live firmware or power-cycles a dead one)", why));
     if let Err(e) = wifi_kill_driver(ctx) {
-        out.line_fmt(ctx, format_args!("{} failed - the driver could not be restarted; `kill wifi-driver` by hand brings it back", verb));
+        out.line_fmt(ctx, format_args!("{} failed - the driver could not be restarted; `kill {}` by hand brings it back", verb, ctx.wifi_radio.get()));
         return Err(e);
     }
     Ok(wifi_powercycle_watch(ctx, out, verb))
@@ -9911,7 +9930,7 @@ fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
         }
         Some(RADIO_DOWN) => {
             // An older driver that does not serve the power ops with its radio down. Nothing was cut.
-            out.line_fmt(ctx, format_args!("radio off hard failed - the radio is down and the driver did not cut the power; `kill wifi-driver` restarts it, and the respawn serves the command"));
+            out.line_fmt(ctx, format_args!("radio off hard failed - the radio is down and the driver did not cut the power; `kill {}` restarts it, and the respawn serves the command", ctx.wifi_radio.get()));
             Err(ShellError::Unknown)
         }
         Some(_) => {

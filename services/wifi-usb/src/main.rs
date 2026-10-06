@@ -24,10 +24,18 @@
 //! again. The waits inside a bring-up are polls of the chip's own status bits, which it reports only when
 //! read; frames come the way the binding does - the host told by its interrupt, and `NOTE_BULK_IN` to us
 //! (R3b, `rx.rs`).
+//!
+//! **The shell's `wifi` is answered by the loop every radio shares (R4).** Once the dongle is up it is a
+//! `Station` (`station.rs`) under `godspeed_wifi::serve`, the loop the Pi 4's and the VisionFive's radios
+//! run under in `wifi-driver`: `wifi scan`, `wifi list` and `wifi status` are that loop's, and the sweep is
+//! this dongle's (a passive one, channels 1 to 13). With no dongle, or one whose bring-up stopped, the same
+//! loop answers `radio down` and says why. The host's notices reach `rx.rs` through the loop's `Host`;
+//! `NOTE_RADIO` ends it, and the binding is asked again.
 
 use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
-use godspeed_wifi::usbfn;
+use godspeed_wifi::station::Station;
+use godspeed_wifi::{usbfn, wire};
 
 mod rtl8188;
 mod rtl_fw;
@@ -36,6 +44,7 @@ mod rtl_queues;
 mod rtl_rx;
 mod rtl_tables;
 mod rx;
+mod station;
 
 /// The 8051's firmware, embedded (`build.rs`, `nonfree/rtl8192cu/PROVENANCE`), and the hash the build measured
 /// on disk, which `bring_up` recomputes over what the binary actually holds.
@@ -88,8 +97,9 @@ fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16)>, &'static str> {
     }
 }
 
-/// U1's reads, logged and decoded. `true` when both came back as a register file could.
-fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> bool {
+/// U1's reads, logged and decoded, then the bring-up. The radio as a `Station` when it came up as far as
+/// receiving; `None` when it stopped, said where.
+fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> Option<station::Dongle> {
     ctx.log_fmt(format_args!("wifi-usb: {} has bound a radio at {:04x}:{:04x}", host_name(ctx), vid, pid));
     let cfg = read32(ctx, REG_SYS_CFG);
     let iso = read32(ctx, REG_SYS_ISO_CTRL);
@@ -100,7 +110,7 @@ fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> bool {
             let plausible = |v: u32| v != 0 && v != 0xFFFF_FFFF;
             if !(plausible(c) && plausible(i)) {
                 ctx.log("wifi-usb: all-zeros or all-ones - a bus or power fault, not a register file");
-                return false;
+                return None;
             }
             ctx.log_fmt(format_args!(
                 "wifi-usb: the chip is an RTL{} ({}), cut {}, made by {} - a {} chip, so its firmware is {}",
@@ -119,17 +129,19 @@ fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> bool {
                 }));
             ctx.log("wifi-usb: U1 done - the dongle answers through the host");
             // Receive starts only once the chip's own is set up (R3a): the host's IN armed at a chip that
-            // has not been told where to put frames would only be NAKed.
-            if bring_up(ctx) {
-                rx::start(ctx);
+            // has not been told where to put frames would only be NAKed. A radio that cannot receive
+            // cannot scan, so it is not a station.
+            let mac = bring_up(ctx)?;
+            if !rx::start(ctx) {
+                return None;
             }
-            true
+            Some(station::Dongle::new(mac, FIRST_CHANNEL))
         }
         (c, i) => {
             ctx.log_fmt(format_args!(
                 "wifi-usb: the register reads did not complete - SYS_CFG: {}, ISO_CTRL: {}",
                 c.err().unwrap_or("ok"), i.err().unwrap_or("ok")));
-            false
+            None
         }
     }
 }
@@ -137,13 +149,15 @@ fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> bool {
 /// The ceiling on a bring-up step's REPORTED duration; see `bring_up`.
 const REPORT_CEILING_MS: u64 = 60_000;
 
-/// R1 (`docs/wifi-usb.md`): the efuse, then the power-on - Linux's order (`rtl8xxxu_init_device`).
-fn bring_up(ctx: &ServiceContext) -> bool {
+/// R1 (`docs/wifi-usb.md`): the efuse, then the power-on - Linux's order (`rtl8xxxu_init_device`) - and on
+/// through R2 and R3a. The dongle's own address, from its efuse, when every stage completed; `None` when one
+/// stopped, said where.
+fn bring_up(ctx: &ServiceContext) -> Option<[u8; 6]> {
     // How long each half took, for the log - `Deadline::elapsed_us` is the stdlib's measure of a wait. The
     // bound is a ceiling for the report only; every wait inside the efuse walk and the power-on is
     // bounded on its own (`rtl8188.rs`).
     let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
-    match rtl8188::read_efuse(ctx) {
+    let mac = match rtl8188::read_efuse(ctx) {
         Ok(e) => {
             let m = e.mac;
             ctx.log_fmt(format_args!(
@@ -151,12 +165,13 @@ fn bring_up(ctx: &ServiceContext) -> bool {
                 e.id, if rtl8188::efuse_id_ok(&e) { "as expected" } else { "NOT the 0x8129 this family carries" },
                 e.vid, e.pid, m[0], m[1], m[2], m[3], m[4], m[5], e.walked, e.sections,
                 clock.elapsed_us() / 1000));
+            e.mac
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the efuse read stopped - {}", why));
-            return false;
+            return None;
         }
-    }
+    };
     // Asked BEFORE the power-on, as Linux asks them: whether the MAC is cold, and which transmit queues the
     // dongle's endpoints serve - both decide how the queues are set up after it (R2).
     let (cold, queues) = match (rtl8188::mac_is_cold(ctx), rtl8188::tx_queues(ctx)) {
@@ -175,7 +190,7 @@ fn bring_up(ctx: &ServiceContext) -> bool {
             ctx.log_fmt(format_args!(
                 "wifi-usb: could not read the MAC's state or the dongle's queues - {}",
                 c.err().or(q.err()).unwrap_or("?")));
-            return false;
+            return None;
         }
     };
     let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
@@ -184,16 +199,16 @@ fn bring_up(ctx: &ServiceContext) -> bool {
             "wifi-usb: powered on in {} ms - CR={:#06x}; R1 done", clock.elapsed_us() / 1000, cr)),
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the power-on stopped at {}", why));
-            return false;
+            return None;
         }
     }
     if let Err(why) = rtl8188::init_queues(ctx, queues, cold) {
         ctx.log_fmt(format_args!("wifi-usb: the transmit queues were not set up - {}", why));
-        return false;
+        return None;
     }
     ctx.log("wifi-usb: transmit queues set up - priority, the receive boundary, and the page reservation where the MAC was cold");
     if !firmware(ctx) {
-        return false;
+        return None;
     }
     // R3a: the MAC, the baseband and the RF set up, tuned to one channel, and the channel read back out of
     // the RF chip itself - the one register here that only a working RF path can answer.
@@ -205,11 +220,11 @@ fn bring_up(ctx: &ServiceContext) -> bool {
                 "wifi-usb: MAC, baseband and RF set up in {} ms ({} RF registers); RF_MODE_AG reads {:#07x} - channel {}{}",
                 clock.elapsed_us() / 1000, rf, mode, on,
                 if on == FIRST_CHANNEL { ", as asked; R3a done" } else { " - NOT the channel asked for" }));
-            on == FIRST_CHANNEL
+            (on == FIRST_CHANNEL).then_some(mac)
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the radio's set-up stopped - {}", why));
-            false
+            None
         }
     }
 }
@@ -275,15 +290,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("wifi-usb: starting - the USB WiFi dongle's driver; asks its USB host once whether a dongle is bound, then waits to be told");
     // What was last said, so each change is said once: none yet, bound (vid, pid), gone, or a host fault.
     let mut said: Option<Result<Option<(u16, u16)>, &'static str>> = None;
-    // What the radio has heard since it was last brought up (R3b).
+    // The dongle as a station, once a bring-up has made one; `None` while there is no dongle or its
+    // bring-up stopped - and then the loop below answers `radio down`, with why.
+    let mut dongle: Option<station::Dongle> = None;
+    // What the radio has heard since it was last brought up (R3b), and the host's notices (`rx.rs`).
     let mut heard = rx::Heard::new();
+    // The key-derivation primitives against their published vectors, once: the serve loop is entered again
+    // on every replug, and this result does not change.
+    let crypto_ok = godspeed_wifi::crypto::selftest(&ctx, "wifi-usb");
     loop {
         let now = bound(&ctx);
         if said != Some(now) {
+            dongle = None;
             match now {
                 Ok(Some((vid, pid))) => {
                     heard = rx::Heard::new();
-                    identify(&ctx, vid, pid);
+                    dongle = identify(&ctx, vid, pid);
                 }
                 Ok(None) => ctx.log_fmt(format_args!(
                     "wifi-usb: {} has no dongle bound - waiting to be told when one is", host_name(&ctx))),
@@ -292,21 +314,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             said = Some(now);
         }
-        // BLOCK until something arrives - no timer (U1b). The host sends `NOTE_RADIO`, with no reply cap,
-        // when the radio's binding changes, and the loop goes round to ask `OP_INFO`. Nothing else asks
-        // this service anything yet; a request that does is answered `[0]` - not known - rather than left
-        // to time out, and its reply cap given back, and then waited on again.
-        loop {
-            let m = gs::ipc::recv(&ctx);
-            match gs::ipc::take_sent_cap(&ctx) {
-                Some(cap) => {
-                    let _ = gs::ipc::reply(&ctx, cap, &Message::from_bytes(&[0u8]));
-                }
-                None if m.payload_bytes() == [usbfn::NOTE_RADIO] => break,
-                // A received transfer is held for us (R3b): collect it, and go back to blocking.
-                None if m.payload_bytes() == [usbfn::NOTE_BULK_IN] => rx::collect(&ctx, &mut heard),
-                None => {}
-            }
-        }
+        // The shell's `wifi` and the host's notices, until the host says the binding changed (U1b's
+        // `NOTE_RADIO`, which ends the loop) - no timer. A dongle that is bound but did not come up is
+        // answered as one whose bring-up stopped; no dongle, as no radio.
+        let why = if matches!(now, Ok(Some(_))) { wire::DOWN_BRINGUP } else { wire::DOWN_NO_RADIO };
+        godspeed_wifi::serve::serve(
+            &ctx, "wifi-usb", dongle.as_mut().map(|d| d as &mut dyn Station), &mut heard, why, crypto_ok);
     }
 }

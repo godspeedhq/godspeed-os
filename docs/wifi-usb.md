@@ -62,12 +62,11 @@ driver asks `OP_INFO`. It is what lets the driver block rather than poll (sectio
 | **R6** | data frames both ways through `nic-driver`: DHCP and ping |
 | **R7** | rekeys |
 
-**Until R4, the shell's `wifi` does not see the dongle.** `wifi` asks `wifi-driver` by name and nothing
-else (`cmd_wifi`, `slot_of(ctx, WIFI_DRIVER)`), so on the Pi 2 it answers "no wireless radio on this
-machine" with the dongle bound, the firmware running and channel 1 tuned (seen on the R2c card,
-2026-10-06). That is a gap, not a fault: `wifi-usb` is not a `Station` yet and has nothing to answer
-with. R4 is where it closes - the shell must find whichever radio service is up, which is also what
-makes "never" wrong on the T630 and the Wyse once U2 lets a dongle reach them.
+**Until R4, the shell's `wifi` did not see the dongle.** `wifi` asked `wifi-driver` by name and nothing
+else, so on the Pi 2 it answered "no wireless radio on this machine" with the dongle bound, the firmware
+running and channel 1 tuned (seen on the R2c card, 2026-10-06). R4 closes it: the shell asks whichever
+radio service is up (`RADIOS`, section 10), which is also what makes "never" wrong on the T630 and the
+Wyse once U2 lets a dongle reach them.
 
 The register-level sequences for R1 and R2 - the power-on, the efuse map, the firmware header and download -
 are taken from Linux's `rtl8xxxu` and `rtlwifi`, with rtlwifi's differences noted where they disagree
@@ -426,3 +425,80 @@ is the first evidence there is, and it points at the transmit-only starvation `n
 **One instrument mislabel, found here.** The `net IRQ` line counts every USB interrupt, and the radio's
 now outnumber the network's by thousands, so "net IRQ - 13033 interrupts, 0 frames" reads as a busy NIC
 with nothing to show. It is the shared vector. Relabelled `USB IRQ` in the change after this run, with the radio's share said.
+
+## 10. R4 (2026-10-06): `wifi scan` - the dongle a `Station`, under the loop every radio shares - built, NOT YET RUN
+
+**The decision (the operator's, 2026-10-06): move the whole serve loop, not a piece of it.** What answers
+the shell's `wifi` - the sweep as a state, the scan cache, the credential table and `/wifi.keys`,
+auto-join, every reply layout, and `nic-driver`'s frame ops - was about 1,100 lines inside
+`wifi-driver`'s `main.rs`, run by the Pi 4's Broadcom and the VisionFive's AIC8800. A second service
+needed it, so it is `sdk/wifi/src/serve.rs` now (`godspeed_wifi::serve::serve`), run by both services,
+and `wifi-driver` keeps a short `serve_radio` that calls it with its power host. The alternatives were a shared sweep piece
+with the rest left behind, which keeps two scan policies until `wifi-driver` moved, or a scan logged and
+not served; both were declined.
+
+**Moved unchanged in what it decides.** A normalised diff of the old loop against the new one (the
+mechanical renames undone) shows only these differences:
+
+- **`who`**: every line it logs opens with the service's name instead of a written-in `wifi-driver:`.
+  `keyfile` and `crypto::selftest` take it too.
+- **A `Host`** (`serve::Host`): what is AROUND the radio. The power operations - `wifi-driver`'s are
+  `DevicePower` and the parked SDIO host, exactly the calls the loop made inline (`SdioPower`); a dongle
+  has none, and the loop answers "no control over the radio's power", which is true. And the notices
+  that arrive with no reply cap: they were counted and dropped; now the host is asked first, and only
+  what it calls `Ignored` is counted and dropped. A notice it calls `Changed` (a dongle bound or
+  removed) ends the loop, which is the only way it returns.
+- **`gs`**: receive, reply, sleep and the monotonic clock are the standard library's.
+  `gs::ipc::reply` is exactly the `try_send` and reclaim the loop made by hand. The tick-counter stamps
+  (the idle pull, the minute's summary, how long a request took) needed a moment that can be KEPT
+  between calls, which a `Deadline` cannot be because it borrows the context. That was a gap in `gs`,
+  filled there: `gs::driver::wait::Since`.
+- **`crypto::selftest` runs once per service**, before the loop, rather than on entry: `wifi-usb`
+  re-enters the loop on every replug.
+
+`wifi-driver`'s one-way count fell 55 -> 25. Some of that fall is calls that became `gs`, and the rest is
+code that moved into `sdk/wifi`, which the ratchet does not count. So the library's own remaining raw
+calls were converted too: what is left in `serve.rs` is two `log_fmt` calls, which have no `gs`
+replacement.
+
+**This changes two hardware-verified radios, so each owes a check card** before the move counts as
+verified on it: on the Pi 4 and on the VisionFive, `wifi scan`, `wifi list`, `wifi status`, a join
+(auto-join from `/wifi.keys` at boot is one), and `ping` over the radio with the cable out. Both images
+build, and every gate passes on both.
+
+**The dongle's `Station`** (`services/wifi-usb/src/station.rs`). This chip is soft-MAC, so the sweep is
+the host's to run: tune channel 1, listen `DWELL_MS` (150 ms, one beacon interval of 102.4 ms with room
+for the hop), tune the next, through 13, then back to the channel it rested on. It is a PASSIVE scan,
+with nothing transmitted. A network that beacons is found; a hidden one that only answers probes is not,
+because a probe is a transmit, which waits for R5. Frames reach it the way R3b's did: `dwc2` sends
+`NOTE_BULK_IN`, the loop hands it to the dongle's `Host` (`rx.rs`) with the running sweep, and each
+beacon is kept as a record with its network's OWN channel, from its DS Parameter Set, and its security
+from `bss::classify`, the classifier every radio uses. `scan_step` only moves the dial. A join answers
+`JOIN_FAILED` with a line that names R5; the link reports not associated, which is the truth.
+
+**The shell** asks `wifi-driver`, then `wifi-usb` (`RADIOS`), and keeps the one it found for the
+command. A machine with both is answered by the onboard radio; choosing between two is not built.
+
+**Wiring.** `wifi-usb` gains `fs` as a peer, for `/wifi.keys` - pinned in `COMMANDMENTS.baseline.toml`
+with that reason, after the gate refused it unpinned. It is spawned after `fs` now, so both peers wire
+at spawn.
+
+**Prediction for the card** (the Pi 2, the dongle in):
+
+1. At boot, before the dongle's lines: `wifi-usb: stage 0 - every primitive matches its vector`. Then
+   U1 to R3b as before, ending `receive started` and `R3b done`. Then `no /wifi.keys - nothing to
+   rejoin`, or `/wifi.keys loaded`, prefixed `wifi-usb:`.
+2. `wifi status` no longer says "no wireless radio": the radio is on, not joined, and no scan yet.
+3. `wifi scan`: `sweep started - listening on channels 1 to 13, 150 ms each`, the networks appearing
+   as they are heard, and about 2 to 3 seconds later `sweep done - N network(s) ... back on the channel
+   it was on` and `sweep complete - N network(s), ended by the last channel's dwell`. N should be MORE
+   than R3b's eight, with channels other than 1 to 3 among them (6 and 11 are the usual others).
+4. `wifi list` prints the same networks, with channel, signal and security.
+5. `wifi join <name>` fails, and the log names R5.
+6. The keyboard and the disk unaffected; a replug brings the dongle back and `wifi scan` works again.
+
+**Refuted by:** `sweep fell silent ... discarded` (the dwell never ends, or the loop never turns);
+`could not tune channel N` (the RF chip refusing a hop); every network on channels 1 to 3 only (the hops
+are accepted and do not retune, so only channel 1's neighbours are heard); no networks at all with
+`radio rx` transfers climbing (beacons not reaching the sweep); or the prompt or disk stalling during a
+sweep (the hops' control transfers and the stand-aside).

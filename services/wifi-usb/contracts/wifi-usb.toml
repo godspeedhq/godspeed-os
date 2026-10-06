@@ -4,7 +4,8 @@
 #
 # It holds no hardware grant at all: no MMIO, no DMA, no interrupt. Everything it does to the chip is a
 # request to the host, which serves only the one device it bound. Started at boot where there is such a
-# host, and idle until the dongle is there.
+# host, and idle until the dongle is there. `fs` holds `/wifi.keys`, which the serve loop every radio
+# shares (`godspeed_wifi::serve`) loads and writes - the same reason `wifi-driver` has it.
 name    = "wifi-usb"
 version = "0.1.0"
 
@@ -15,4 +16,4 @@ limit   = "8MiB"
 [capabilities]
 ipc_receive = ["wifi-usb"]
 log_write   = true
-ipc_send    = ["dwc2"]
+ipc_send    = ["dwc2", "fs"]

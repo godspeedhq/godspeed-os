@@ -755,7 +755,10 @@ SpawnImage               = 52
 # wifi-driver: hw:WIFI_SDIO - the Arasan SDIO host the radio sits on, and its power control, granted by
 # device KIND since 2026-10-03 (they were granted by NAME before, so the pin did not see them).
 "wifi-driver" = ["hw:WIFI_SDIO", "peer:fs", "peer:power"]
-"wifi-usb" = ["peer:dwc2"]
+# wifi-usb: peer:dwc2 - the USB host that bound the dongle and answers `usbfn` for it. peer:fs (R4,
+# 2026-10-06) - `/wifi.keys`, which the serve loop every radio shares (`godspeed_wifi::serve`) loads and
+# writes; the same grant wifi-driver carries for the same reason, now that both run that loop.
+"wifi-usb" = ["peer:dwc2", "peer:fs"]
 "xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "priv:CONSOLE_PUSH"]
 
 # --------------------------------------------------------------------------------------------------

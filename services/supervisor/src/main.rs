@@ -678,11 +678,13 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      godspeed_sdk::service_context::hwclass::DWC2),
     // The USB WiFi dongle's driver (docs/wifi-usb.md). NO hardware grant - no window, no arena, no
     // interrupt, no device class: everything it does to the chip is a request to the USB host that bound
-    // the dongle, which answers for that one device only (`godspeed_wifi::usbfn`). Its one peer is that
-    // host. Unplaced: it is idle until a dongle is there, and a radio's work is milliseconds at a time.
+    // the dongle, which answers for that one device only (`godspeed_wifi::usbfn`). Its peers are that host
+    // and `fs`, which holds `/wifi.keys` for the serve loop every radio shares (`godspeed_wifi::serve`, R4)
+    // - the same reason `wifi-driver` has it. Unplaced: it is idle until a dongle is there, and a radio's
+    // work is milliseconds at a time.
     #[cfg(has_wifi_usb)]
     ("wifi-usb", WIFI_USB_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     8 * 1024 * 1024, u32::MAX, &["dwc2"], 0, 0, 0),
+     8 * 1024 * 1024, u32::MAX, &["dwc2", "fs"], 0, 0, 0),
 ];
 
 /// A build that EMBEDDED a USB host image must have a row to spawn it with.
@@ -1532,15 +1534,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     }
 
-    // The dongle's driver, once its USB host is up (above), so its one peer wires at spawn. Nothing waits
-    // on it: it asks the host itself, and says when there is no dongle.
-    #[cfg(has_wifi_usb)]
-    ensure_wired(&ctx, &mut name_map, "wifi-usb", &["dwc2"]);
-
     ensure_mapped(&ctx, &mut name_map, "block-driver", 0xFFFF);
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     ensure_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
+
+    // The dongle's driver, once its USB host (above) and `fs` are up, so both its peers wire at spawn.
+    // Nothing waits on it: it asks the host itself, and says when there is no dongle.
+    #[cfg(has_wifi_usb)]
+    ensure_wired(&ctx, &mut name_map, "wifi-usb", &["dwc2", "fs"]);
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests here) and full builds;
     // excluded from test-specific builds. Its `fs` peer is wired from the supervisor's map.
