@@ -68,7 +68,7 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   Both halves are wired as of 2026-08-25 (the vector is armed from the loop that owns the hardware, and
   the host-channel interrupt is enabled at the device), and interrupts now do arrive - but they harvest
   almost nothing, because the client poll path reaches each completion first. Receive is therefore still
-  poll-driven in practice, and the honest claim is the one above. The `net IRQ` counters report it
+  poll-driven in practice, and the honest claim is the one above. The `USB IRQ` counters (once `net IRQ`) report it
   rather than leaving it to be inferred. Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
 - **Multiple USB devices coexist:** `enumerate_downstream` walks *every* hub port, gives each device a
   distinct address, and configures all of them; the single DWC2 host channel is time-shared by having each

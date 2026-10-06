@@ -425,4 +425,4 @@ is the first evidence there is, and it points at the transmit-only starvation `n
 
 **One instrument mislabel, found here.** The `net IRQ` line counts every USB interrupt, and the radio's
 now outnumber the network's by thousands, so "net IRQ - 13033 interrupts, 0 frames" reads as a busy NIC
-with nothing to show. It is the shared vector. Relabelled in the next `dwc2` change.
+with nothing to show. It is the shared vector. Relabelled `USB IRQ` in the change after this run, with the radio's share said.

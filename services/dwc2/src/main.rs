@@ -600,10 +600,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // before this session both halves were missing, and the vector produced zero interrupts.
         //
         // This says ARMED, not "interrupt-driven". Whether interrupts actually arrive is a fact
-        // about the hardware, and the `net IRQ` counters below are what report it. A status line
+        // about the hardware, and the `USB IRQ` counters below are what report it. A status line
         // that asserts the outcome is how a claim outlives the thing it described.
         ctx.irq_unmask(USB_VECTOR);
-        ctx.log("dwc2-svc: USB vector armed - see the 'net IRQ' counters for whether it fires");
+        ctx.log("dwc2-svc: USB vector armed - see the 'USB IRQ' counters for whether it fires");
 
         loop {
             passes = passes.wrapping_add(1);
@@ -1092,10 +1092,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     ns.18, ns.21, ns.22, ns.19, ns.20, ns.4, ns.23, ns.24, ns.25, ns.26));
                 // INTERRUPTS TAKEN vs FRAMES THEY YIELDED. A count of zero means the line is armed
                 // but nothing is arriving, and receive is still whatever a client asks for - which
-                // is the state this driver was in without anyone noticing.
+                // is the state this driver was in without anyone noticing. The count is of the ONE
+                // USB vector, which the radio's bulk IN shares since R3b: it was labelled "net IRQ",
+                // and on the R3b run 13033 radio interrupts read as a busy NIC with nothing to show.
+                // The four reasons are the NIC's, asked on every interrupt whoever raised it.
                 let r0 = nic.as_ref().map(|(n, _)| n.rx0).unwrap_or([0; 4]);
                 ctx.log_fmt(format_args!(
-                    "dwc2-svc: net IRQ - {} interrupts, {} frames harvested; empty because: {} not armed,                      {} still in flight, {} stalled, {} zero-length",
+                    "dwc2-svc: USB IRQ - {} interrupts (one vector, the NIC's and the radio's), {} net frames harvested; net receive empty because: {} not armed, {} still in flight, {} stalled, {} zero-length",
                     irq_count, irq_frames, r0[0], r0[1], r0[2], r0[3]));
                 if let Some(r) = radio.as_ref() {
                     rtl::report(&ctx, r);
