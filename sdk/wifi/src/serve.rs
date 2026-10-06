@@ -53,6 +53,13 @@ pub enum Notice {
 ///
 /// Every method has the answer for a radio with neither, so a host implements only what it has.
 pub trait Host {
+    /// Whether this host can cut the chip's power at all. Asked BEFORE `wifi radio off hard` leaves the
+    /// network: a dongle's power is its USB port's, and leaving first and then finding no power to cut left
+    /// the station off its network while the shell said "the radio is as it was" (seen on the Pi 2,
+    /// 2026-10-06). The kernel may still refuse a host that says yes; that case is unchanged.
+    fn can_cut_power(&self) -> bool {
+        false
+    }
     /// Cut the chip's power and leave the host's lines quiet. `false`: this machine has no control over
     /// the radio's power (the kernel refused, or there is no such thing to ask for).
     fn cut_power(&mut self, _ctx: &ServiceContext) -> bool {
@@ -594,6 +601,16 @@ pub fn serve<'s>(
             (_, Some(_)) if powered_off => {
                 out[0] = wire::RADIO_POWERED_OFF;
                 1
+            }
+            (wire::OP_RADIO, Some(_)) if payload.get(1).copied() == Some(wire::RADIO_HARD_OFF) && !host.can_cut_power() => {
+                // No power to cut here: say so and change NOTHING - in particular, do not leave the network.
+                say(ctx, who, "`wifi radio off hard` asked, and this radio's power is not this driver's to cut - nothing changed, still on the network");
+                out[0] = wire::NO_POWER_CONTROL;
+                out[1] = 0;
+                out[2] = 0;
+                out[3] = 0;
+                out[4] = 0;
+                5
             }
             (wire::OP_RADIO, Some(session)) if payload.get(1).copied() == Some(wire::RADIO_HARD_OFF) => {
                 // `wifi radio off hard`: leave the network politely while the firmware can still send,

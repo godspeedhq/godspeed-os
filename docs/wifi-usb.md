@@ -896,7 +896,7 @@ both correct. `wifi status` read the radio off. `wifi radio on`: `radio on - RF 
 `ping` 5 of 5. The shell calls the off "soft - the firmware's switch; the chip stays powered", which is
 true here as well: the dongle's power is its USB port's.
 
-## 16. R7 (2026-10-06): the access point's group rekey, answered - built, NOT YET RUN
+## 16. R7 (2026-10-06): the access point's group rekey, answered - built, NOT SEEN (needs an hour joined)
 
 An access point changes its group key on a timer, often hourly, by a two-message group key handshake on
 the live link. A station that does not answer it is dropped. Until now the dongle counted the frame and left
@@ -926,3 +926,19 @@ point's group rekey answered - ...; R7 done`, and `ping` still answering afterwa
 send), or the link dropping at the rekey (the acknowledgement not reaching the access point). If nothing
 happens in two hours, the access point may not rekey at all, which the log cannot distinguish from
 silence - a `wifi status` showing the join still up is then the result.
+
+**The R7 card's run (2026-10-06, a few minutes): no regression, and the rekey not seen.** The operator will
+not hold a board up for an hour to wait for an access point's timer, so R7 stays "built, not seen" until a
+run happens to last that long. What the run did show:
+- Boot to JOINED, with `group key 1 accepts packet numbers above 0 (its Key RSC)`. A fresh group key, so its
+  RSC is 0.
+- The lease, the gateway's ARP and an ICMP reply.
+- `wifi join` again later: JOINED, and `ping` 5 of 5.
+
+**A second misleading off, the same shape as R6's, found and fixed.** `wifi radio off hard` left the network
+first and then tried to cut the chip's power, which the dongle cannot. The shell said `the radio is as it
+was` while the station had left; the following pings failed and `wifi radio on` answered `already on`. Not
+a dongle fault: the order is the shared serve loop's. It now asks `Host::can_cut_power` BEFORE leaving, and a
+host that cannot (the default, so the dongle) is answered "no power control" with nothing changed, still on
+the network. `wifi-driver`'s SDIO host says it can, so the Pi 4's and the VisionFive's hard off is
+unchanged.

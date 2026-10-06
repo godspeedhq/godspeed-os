@@ -583,6 +583,10 @@ struct SdioPower<'a> {
 }
 
 impl godspeed_wifi::serve::Host for SdioPower<'_> {
+    fn can_cut_power(&self) -> bool {
+        // The pin is reached through the kernel's `DevicePower`; whether it is granted is asked when cutting.
+        true
+    }
     fn cut_power(&mut self, ctx: &ServiceContext) -> bool {
         if !ctx.device_power(false) {
             return false;
