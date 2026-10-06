@@ -197,3 +197,24 @@ released - N of 96 routing slots free, reserve 72`.
 **Verified in QEMU (Pi 2, 2026-10-06):** at boot `nic-driver` and `net-stack` were refused as before. Then
 `kill time`, and `time`'s respawn at 71 free took the mailbox back, where before it would have been
 refused. The x86 identity suite, then the Pi 2 card for `wifi-usb`, follow (`docs/wifi-usb.md` 20).
+
+## Option 4 on hardware (Pi 2, 2026-10-06): it holds
+
+The operator's run: `wifi radio off` and `on`, `off hard` and `on`, a `powercycle`, then `chaos max-carnage`
+50 rounds (351 kills, kernel alive). **167 grants were taken back** past the reserve, and **no service was
+refused its mandatory endpoint**: no `spawn REFUSED - IPC routing table full` anywhere. Every `wifi-usb`
+restart took a mailbox back, and `dwc2` read `0 taken as answers (OP_SYNC)` throughout, where the run
+before it read 987 of 1044.
+
+**Two things it showed:**
+- **Credits are pooled, as designed, so they also reached `nic-driver` and `net-stack`.** Both were refused
+  at boot, banked nothing, and during chaos took mailboxes other watched tasks had released. That is the
+  footprint conserved, not grown: a grant spends exactly one release. But it means which service holds a
+  mailbox after a storm is the order of respawns, not who held one at boot. A service that had one at boot
+  can find the credits gone. `wifi-usb` did not, in 7 restarts.
+- **The supervisor was refused 13 times** (`gets no reply mailbox`), once per kernel respawn. It is not
+  WATCHED: the kernel respawns it directly, and the watched flag is the supervisor's to set on what it
+  manages. So it neither banks nor spends. Nothing in the run failed for it, and that was equally true
+  before this change; the boot supervisor has one and every respawn does not. Open: whether the kernel's
+  one direct respawn should bank and spend like a watched task. That is a small kernel change, and the
+  operator's call.

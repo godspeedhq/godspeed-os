@@ -1161,7 +1161,7 @@ in `backlog/74` with this evidence.
 **Also seen:** `dwc2` counted 309 receive errors (`HCINT=0x92`) across the powered-down windows: its bulk
 IN polling a suspended chip. They stopped when the chip came back, and no transfer was lost to them.
 
-## 20. A respawn takes its reply mailbox back - a kernel change (2026-10-06) - QEMU-verified, card not yet run
+## 20. A respawn takes its reply mailbox back - a kernel change (2026-10-06) - hardware-verified on the Pi 2
 
 **With the operator's go-ahead, the fix section 19 pointed at.** When a watched task dies holding a reply
 mailbox, the kernel banks a credit. A watched spawn the reserve would refuse may spend one
@@ -1187,3 +1187,15 @@ watched task released - 71 of 96 routing slots free, reserve 72`. At the same co
 - a non-zero `taken as answers` count on a restarted instance;
 - any service refused its MANDATORY endpoint (`spawn REFUSED - IPC routing table full`) during chaos, which
   would mean the credits spent slots the reserve was holding for it.
+
+**The card's run (2026-10-06): as predicted.**
+- Every restart of `wifi-usb` (`off hard` then `on`, a `powercycle`, and 7 in chaos) logged `takes back a
+  reply mailbox`.
+- `dwc2` read `0 taken as answers (OP_SYNC)` at every heartbeat.
+- `radio on succeeded` and `powercycle succeeded`.
+- `chaos max-carnage` 50 rounds, 351 kills: kernel alive, no mandatory endpoint refused, 167 mailboxes
+  taken back across all services. After it the dongle rejoined and `ping` went 3 of 3.
+- The pings that failed were sent with the radio off, soft and hard, and were answered `link not
+  confirmed`. One `Request timed out` was the first echo after a power cycle, while ARP resolved again.
+
+`backlog/74` has what the run showed about pooling and about the supervisor.
