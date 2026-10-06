@@ -24,6 +24,27 @@ pub const DATA_OVERHEAD: usize = 24 + 8;
 /// not written here: on a radio that encrypts in hardware the radio appends it, as mac80211 leaves it to
 /// (`ccmp_encrypt_skb` adds no tail when the key is in hardware).
 pub const CCMP_HEADER: usize = 8;
+/// The QoS Control field a QoS data frame adds after the 24-byte header (9.2.4.5): the TID in its low four
+/// bits, normal acknowledgement, no A-MSDU.
+pub const QOS_CONTROL: usize = 2;
+/// Where a receiver keeps the replay counter of a frame with no TID (a non-QoS one): after the sixteen
+/// TIDs, as mac80211 does (`IEEE80211_NUM_TIDS`).
+pub const NON_QOS: usize = 16;
+/// Replay counters per key: one per TID, and one for non-QoS frames.
+pub const REPLAY_SLOTS: usize = 17;
+
+/// The replay slot a received data frame counts under: its TID for a QoS data frame, `NON_QOS` otherwise
+/// (`ieee80211_crypto_ccmp_decrypt` keys the packet number on `rx->security_idx` the same way). `None` for
+/// a frame too short to carry the QoS Control field it says it has.
+pub fn replay_slot(frame: &[u8]) -> Option<usize> {
+    if frame.len() < 24 || frame[0] & 0x0c != 0x08 {
+        return None;
+    }
+    if frame[0] & 0x80 == 0 {
+        return Some(NON_QOS);
+    }
+    frame.get(24).map(|q| (q & 0x0F) as usize)
+}
 
 /// A received data frame, as the vendor driver turns it into an ethernet frame (`rwnx_rxdataind_aicwf`):
 /// DA is address 1, SA is address 3 on a frame from the access point (address 2 otherwise).
@@ -92,23 +113,26 @@ pub fn to_ethernet(d: &DataIn, out: &mut [u8]) -> usize {
     n
 }
 
-/// An ethernet frame from a station, as the 802.11 data frame it sends its access point (9.3.2.1): non-QoS
-/// data (frame control `08`), To DS (`01`), address 1 the BSSID (the receiver), address 2 the ethernet
-/// source (this station), address 3 the ethernet destination; sequence `seq`; LLC/SNAP and the ethertype;
-/// the payload. With `ccmp` - `(packet number, key id)` - the Protected bit is set and the CCMP header goes
-/// after the MAC header, where mac80211's `ccmp_pn2hdr` puts it for a key the hardware encrypts with; the
-/// hardware does the rest. 0 when `eth` is shorter than its header or `out` cannot hold the frame.
-pub fn to_80211(eth: &[u8], bssid: &[u8; 6], seq: u16, ccmp: Option<(u64, u8)>, out: &mut [u8]) -> usize {
+/// An ethernet frame from a station, as the 802.11 data frame it sends its access point (9.3.2.1): data
+/// (frame control `08`), To DS (`01`), address 1 the BSSID (the receiver), address 2 the ethernet source
+/// (this station), address 3 the ethernet destination; sequence `seq`; LLC/SNAP and the ethertype; the
+/// payload. With `qos` - a TID - it is a QoS data frame (`88`) with the QoS Control field after the header
+/// (R12a, a WMM association). With `ccmp` - `(packet number, key id)` - the Protected bit is set and the
+/// CCMP header goes after the MAC header, where mac80211's `ccmp_pn2hdr` puts it for a key the hardware
+/// encrypts with; the hardware does the rest. 0 when `eth` is shorter than its header or `out` cannot hold
+/// the frame.
+pub fn to_80211(eth: &[u8], bssid: &[u8; 6], seq: u16, qos: Option<u8>, ccmp: Option<(u64, u8)>, out: &mut [u8]) -> usize {
     if eth.len() < ETH_HEADER {
         return 0;
     }
     let body = &eth[ETH_HEADER..];
+    let qc = if qos.is_some() { QOS_CONTROL } else { 0 };
     let iv = if ccmp.is_some() { CCMP_HEADER } else { 0 };
-    let n = DATA_OVERHEAD + iv + body.len();
+    let n = DATA_OVERHEAD + qc + iv + body.len();
     if n > out.len() {
         return 0;
     }
-    out[0] = 0x08;
+    out[0] = if qos.is_some() { 0x88 } else { 0x08 };
     out[1] = 0x01 | if ccmp.is_some() { 0x40 } else { 0 };
     out[2] = 0;
     out[3] = 0;
@@ -116,11 +140,16 @@ pub fn to_80211(eth: &[u8], bssid: &[u8; 6], seq: u16, ccmp: Option<(u64, u8)>, 
     out[10..16].copy_from_slice(&eth[6..12]);
     out[16..22].copy_from_slice(&eth[0..6]);
     out[22..24].copy_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
+    if let Some(tid) = qos {
+        out[24] = tid & 0x0F;
+        out[25] = 0;
+    }
+    let h = 24 + qc;
     if let Some((pn, key_id)) = ccmp {
         let p = pn.to_le_bytes();
-        out[24..32].copy_from_slice(&[p[0], p[1], 0, 0x20 | (key_id & 0x3) << 6, p[2], p[3], p[4], p[5]]);
+        out[h..h + 8].copy_from_slice(&[p[0], p[1], 0, 0x20 | (key_id & 0x3) << 6, p[2], p[3], p[4], p[5]]);
     }
-    let at = 24 + iv;
+    let at = h + iv;
     out[at..at + 6].copy_from_slice(&LLC_SNAP);
     out[at + 6..at + 8].copy_from_slice(&eth[12..14]);
     out[at + 8..n].copy_from_slice(body);
@@ -174,7 +203,7 @@ mod tests {
         eth[12..14].copy_from_slice(&[0x88, 0x8e]);
         eth[14..18].copy_from_slice(&[1, 3, 0, 0x5f]);
         let mut f = [0u8; 64];
-        let n = to_80211(&eth, &ap, 0x123, None, &mut f);
+        let n = to_80211(&eth, &ap, 0x123, None, None, &mut f);
         assert_eq!(n, 32 + 4);
         assert_eq!((f[0], f[1]), (0x08, 0x01), "data, to DS");
         assert_eq!(&f[4..10], &ap, "to the access point");
@@ -186,8 +215,9 @@ mod tests {
         // Read back as a frame from the station (not from DS), it is the ethernet frame it was made from.
         let d = llc_payload(&f[..n], false).map(|d| (d.ethertype, d.da, d.sa, d.body.len()));
         assert_eq!(d, Some((0x888e, ap, us, 4)));
-        assert_eq!(to_80211(&eth[..13], &ap, 0, None, &mut f), 0, "too short to be ethernet");
-        assert_eq!(to_80211(&eth, &ap, 0, None, &mut [0u8; 35]), 0, "no room");
+        assert_eq!(to_80211(&eth[..13], &ap, 0, None, None, &mut f), 0, "too short to be ethernet");
+        assert_eq!(to_80211(&eth, &ap, 0, None, None, &mut [0u8; 35]), 0, "no room");
+        assert_eq!(replay_slot(&f[..n]), Some(NON_QOS));
     }
 
     /// A protected frame: the Protected bit, and the CCMP header where `ccmp_pn2hdr` writes it - the packet
@@ -199,7 +229,7 @@ mod tests {
         eth[12..14].copy_from_slice(&[0x08, 0x00]);
         eth[14..18].copy_from_slice(&[0x45, 0, 0, 4]);
         let mut f = [0u8; 64];
-        let n = to_80211(&eth, &[9; 6], 0, Some((0x0000_0605_0403_0201, 1)), &mut f);
+        let n = to_80211(&eth, &[9; 6], 0, None, Some((0x0000_0605_0403_0201, 1)), &mut f);
         assert_eq!(n, 32 + 8 + 4);
         assert_eq!(f[1], 0x41, "to DS, protected");
         assert_eq!(&f[24..32], &[0x01, 0x02, 0, 0x60, 0x03, 0x04, 0x05, 0x06]);
@@ -210,5 +240,23 @@ mod tests {
         assert_eq!(ccmp_pn(&f[..23]), None, "too short");
         f[1] = 0x01;
         assert_eq!(ccmp_pn(&f[..n]), None, "not protected");
+    }
+
+    /// A QoS data frame (R12a): subtype QoS, the QoS Control field with the TID after the header, the CCMP
+    /// header after that - and the receive side reads all three back where they are.
+    #[test]
+    fn a_qos_frame_carries_its_tid() {
+        let mut eth = [0u8; 18];
+        eth[12..14].copy_from_slice(&[0x08, 0x00]);
+        eth[14..18].copy_from_slice(&[0x45, 0, 0, 4]);
+        let mut f = [0u8; 64];
+        let n = to_80211(&eth, &[9; 6], 0, Some(5), Some((0x0201, 0)), &mut f);
+        assert_eq!(n, 32 + 2 + 8 + 4);
+        assert_eq!((f[0], f[24], f[25]), (0x88, 5, 0), "QoS data, TID 5");
+        assert_eq!(&f[26..28], &[0x01, 0x02], "the CCMP header after the QoS Control field");
+        assert_eq!(replay_slot(&f[..n]), Some(5));
+        assert_eq!(ccmp_pn(&f[..n]), Some((0x0201, 0)));
+        assert_eq!(llc_payload(&f[..n], true).map(|d| d.ethertype), Some(0x0800));
+        assert_eq!(replay_slot(&f[..24]), None, "QoS, but too short for the field");
     }
 }

@@ -82,6 +82,8 @@ struct Assoc {
     rssi: i16,
     /// The access point's rates as the firmware's mask (`rtl_tx::rate_mask`, R8).
     rates: u32,
+    /// A WMM (QoS) association (R12a): data goes as QoS data.
+    wmm: bool,
 }
 
 /// The network a join found: where it is, and what its beacon or probe response says about it.
@@ -94,6 +96,8 @@ struct Found {
     /// `mgmt::rsn_is_ccmp`: `None` with no RSN element (an open or WEP network).
     ccmp: Option<bool>,
     rates: u32,
+    /// The access point advertises WMM (`mgmt::has_wmm`).
+    wmm: bool,
 }
 
 /// The dongle, brought up: its address, the channel it rests on, and the sweep when one is running.
@@ -259,6 +263,7 @@ impl<'l> Dongle<'l> {
                                 capability: b.capability(),
                                 ccmp: mgmt::rsn_is_ccmp(b.elements()),
                                 rates: rtl_tx::rate_mask(b.elements()),
+                                wmm: mgmt::has_wmm(b.elements()),
                             });
                         }
                     }
@@ -469,7 +474,10 @@ impl<'l> Dongle<'l> {
         for _ in 0..TRIES {
             let mut f = [0u8; mgmt::ASSOC_REQUEST_MAX];
             let seq = self.next_seq();
-            let Some(n) = mgmt::assoc_request(&us, &b, seq, cap, LISTEN_INTERVAL, ssid, rsn, &mut f) else {
+            // R12a: a QoS station where the access point does WMM, as mac80211 associates - the 802.11n
+            // rates the next card asks for are given only to one.
+            let extra: &[u8] = if net.wmm { &mgmt::WMM_INFO } else { &[] };
+            let Some(n) = mgmt::assoc_request(&us, &b, seq, cap, LISTEN_INTERVAL, ssid, rsn, extra, &mut f) else {
                 break;
             };
             if let Err(why) = self.send_mgmt(ctx, &f[..n], seq, false) {
@@ -482,7 +490,12 @@ impl<'l> Dongle<'l> {
             }
         }
         match assoc {
-            Some((0, aid)) => Ok(Assoc { bssid: b, channel: net.channel, aid, rssi: net.rssi, rates: net.rates }),
+            Some((0, aid)) => {
+                ctx.log_fmt(format_args!("wifi-usb: join - {}",
+                    if net.wmm { "the access point does WMM: associated as a QoS station, data goes as QoS data (R12a)" }
+                    else { "the access point does no WMM: a non-QoS association, as before" }));
+                Ok(Assoc { bssid: b, channel: net.channel, aid, rssi: net.rssi, rates: net.rates, wmm: net.wmm })
+            }
             Some((st, _)) => {
                 ctx.log_fmt(format_args!("wifi-usb: join - the access point refused the association, status {}", st));
                 self.leave(ctx, &b);
@@ -681,7 +694,8 @@ impl Station for Dongle<'_> {
     fn send(&mut self, eth: &[u8], ctx: &ServiceContext) -> bool {
         let Some(a) = self.assoc else { return false };
         let keyed = self.ptk_in;
-        let mut frame = [0u8; godspeed_wifi::rxq::FRAME_MAX + data::DATA_OVERHEAD + data::CCMP_HEADER];
+        const MAX: usize = godspeed_wifi::rxq::FRAME_MAX + data::DATA_OVERHEAD + data::QOS_CONTROL + data::CCMP_HEADER;
+        let mut frame = [0u8; MAX];
         let seq = self.next_seq();
         let ccmp = if keyed {
             self.pn += 1;
@@ -689,12 +703,14 @@ impl Station for Dongle<'_> {
         } else {
             None
         };
-        let n = data::to_80211(eth, &a.bssid, seq, ccmp, &mut frame);
+        // TID 0, best effort, on a WMM association: the queue every frame here already goes on.
+        let qos = a.wmm.then_some(0u8);
+        let n = data::to_80211(eth, &a.bssid, seq, qos, ccmp, &mut frame);
         if n == 0 {
             return false;
         }
-        let desc = rtl_tx::data(n as u16, seq, keyed);
-        let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + godspeed_wifi::rxq::FRAME_MAX + data::DATA_OVERHEAD + data::CCMP_HEADER];
+        let desc = rtl_tx::data(n as u16, seq, keyed, a.wmm);
+        let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + MAX];
         req[0] = usbfn::OP_BULK_OUT;
         req[1] = rtl_tx::be_out(self.queues);
         req[2..2 + rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
@@ -788,7 +804,7 @@ impl KeyPath for Dongle<'_> {
         let Some(a) = self.assoc else { return false };
         let mut frame = [0u8; EAPOL_MAX + data::DATA_OVERHEAD];
         let seq = self.next_seq();
-        let n = data::to_80211(eth, &a.bssid, seq, None, &mut frame);
+        let n = data::to_80211(eth, &a.bssid, seq, None, None, &mut frame);
         if n == 0 {
             return false;
         }

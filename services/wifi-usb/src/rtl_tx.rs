@@ -68,15 +68,19 @@ pub fn mgmt(frame_len: u16, seq: u16, group: bool) -> [u8; TX_DESC_LEN] {
 /// receiver (`rtl8xxxu_tx` sets it when mac80211 hands the frame a hardware key).
 const DW1_SEC_AES: u32 = 0x00C0_0000;
 
+/// `TXDESC32_QOS` in `txdw4`: the frame is QoS data (R12a), as `fill_txdesc_v1` marks every one.
+const DW4_QOS: u32 = 1 << 6;
+
 /// `txdw5`'s data bits for a frame the FIRMWARE picks the rate of: `fill_txdesc_v1` ORs `0x0001ff00` in for
 /// every data frame, and sets no driver rate - the rate is the firmware's, adapting within the mask the
 /// driver gave it after the association (`rtl8188::rate_mask`, R8).
 const DW5_DATA: u32 = 0x0001_FF00;
 
 /// The descriptor for a unicast DATA frame - the link's traffic (R6) - on the best-effort queue, protected
-/// for the chip to encrypt (`DW1_SEC_AES`) when `protected`, signed. Since R8 the rate is the firmware's
-/// choice, as `rtl8xxxu_fill_txdesc_v1` leaves it for a data frame; R6 sent these at the driver's 1 Mb/s.
-pub fn data(frame_len: u16, seq: u16, protected: bool) -> [u8; TX_DESC_LEN] {
+/// for the chip to encrypt (`DW1_SEC_AES`) when `protected`, marked QoS (`DW4_QOS`) when `qos`, signed.
+/// Since R8 the rate is the firmware's choice, as `rtl8xxxu_fill_txdesc_v1` leaves it for a data frame;
+/// R6 sent these at the driver's 1 Mb/s.
+pub fn data(frame_len: u16, seq: u16, protected: bool, qos: bool) -> [u8; TX_DESC_LEN] {
     let mut d = [0u8; TX_DESC_LEN];
     d[0..2].copy_from_slice(&frame_len.to_le_bytes());
     d[2] = TX_DESC_LEN as u8;
@@ -85,6 +89,9 @@ pub fn data(frame_len: u16, seq: u16, protected: bool) -> [u8; TX_DESC_LEN] {
     d[4..8].copy_from_slice(&dw1.to_le_bytes());
     let dw3 = ((seq as u32) & 0x0FFF) << DW3_SEQ_SHIFT;
     d[12..16].copy_from_slice(&dw3.to_le_bytes());
+    if qos {
+        d[16..20].copy_from_slice(&DW4_QOS.to_le_bytes());
+    }
     d[20..24].copy_from_slice(&DW5_DATA.to_le_bytes());
     sign(&mut d);
     d
@@ -209,8 +216,9 @@ mod tests {
 
     #[test]
     fn a_data_descriptor_leaves_the_rate_to_the_firmware() {
-        let d = data(120, 3, false);
+        let d = data(120, 3, false, false);
         assert_eq!(word(&d, 16), 0, "no driver rate");
+        assert_eq!(word(&data(120, 3, false, true), 16), 0x40, "QOS, and still no driver rate");
         assert_eq!(word(&d, 20), 0x0001_FF00, "fill_txdesc_v1's data bits");
         assert_eq!(word(&d, 4), 0x0040, "queue BE, AGG_BREAK, not protected");
     }
@@ -228,7 +236,7 @@ mod tests {
 
     #[test]
     fn a_protected_descriptor_asks_the_chip_for_ccmp() {
-        let d = data(120, 3, true);
+        let d = data(120, 3, true, false);
         assert_eq!(word(&d, 4), 0x00C0_0040, "SEC_AES, queue BE, AGG_BREAK");
         let x = d.chunks_exact(2).fold(0u16, |a, w| a ^ u16::from_le_bytes([w[0], w[1]]));
         assert_eq!(x, 0, "signed after the security bits went in");

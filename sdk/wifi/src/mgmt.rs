@@ -96,8 +96,37 @@ pub const CAP_SHORT_PREAMBLE: u16 = 1 << 5;
 pub const CAP_SHORT_SLOT_TIME: u16 = 1 << 10;
 
 /// The longest association request [`assoc_request`] builds: the header, capability and listen interval,
-/// the SSID, the two rate elements and an RSN element of up to 40 bytes.
-pub const ASSOC_REQUEST_MAX: usize = 24 + 4 + 2 + SSID_MAX + 2 + RATES.len() + 2 + EXT_RATES.len() + 40;
+/// the SSID, the two rate elements, an RSN element of up to 40 bytes and up to `EXTRA_MAX` more.
+pub const ASSOC_REQUEST_MAX: usize = 24 + 4 + 2 + SSID_MAX + 2 + RATES.len() + 2 + EXT_RATES.len() + 40 + EXTRA_MAX;
+/// Room for the elements a station adds after the RSN element: the WMM information element (9 bytes,
+/// R12a) and the HT capabilities element (28, R12b), with a little over.
+pub const EXTRA_MAX: usize = 40;
+
+/// The WMM information element a station sends to be a QoS station (WMM 2.2.1, the Wi-Fi Alliance's form of
+/// 802.11e): vendor-specific (221), OUI 00:50:F2, type 2, subtype 0 (information), version 1, and a QoS Info
+/// of 0 - no U-APSD - as mac80211 builds it (`ieee80211_add_wmm_info_ie`) for a station not asking for it.
+pub const WMM_INFO: [u8; 9] = [221, 7, 0x00, 0x50, 0xF2, 0x02, 0x00, 0x01, 0x00];
+
+/// Whether `ies` carry a WMM element - the information (subtype 0) or parameter (subtype 1) form, which an
+/// access point advertises in its beacons when it does QoS. A walk over every vendor element, since a
+/// beacon carries several (WPS, the vendor's own) and only one is WMM. An element running past the end
+/// stops the walk: the lengths are from the air.
+pub fn has_wmm(ies: &[u8]) -> bool {
+    let mut at = 0usize;
+    while at + 2 <= ies.len() {
+        let (id, len) = (ies[at], ies[at + 1] as usize);
+        let end = at + 2 + len;
+        if end > ies.len() {
+            return false;
+        }
+        let b = &ies[at + 2..end];
+        if id == 221 && b.len() >= 6 && b[..4] == [0x00, 0x50, 0xF2, 0x02] && b[4] <= 1 && b[5] == 1 {
+            return true;
+        }
+        at = end;
+    }
+    false
+}
 /// An authentication or deauthentication frame from a station: the header and six (or two) body bytes.
 pub const AUTH_LEN: usize = 24 + 6;
 pub const DEAUTH_LEN: usize = 24 + 2;
@@ -123,15 +152,16 @@ pub fn auth_request(sa: &[u8; 6], bssid: &[u8; 6], seq: u16, out: &mut [u8; AUTH
 }
 
 /// An association request (9.3.3.6): `cap`, a listen interval of `listen` beacon intervals, the SSID, the
-/// station's rates, and `rsn` when the network is joined with WPA2 - the element the four-way handshake's
-/// message 2 must then repeat byte for byte. `None` when `rsn` is too long for the frame.
+/// station's rates, `rsn` when the network is joined with WPA2 - the element the four-way handshake's
+/// message 2 must then repeat byte for byte - and `extra`, whole elements after it (`WMM_INFO`, R12a).
+/// `None` when `rsn` or `extra` is too long for the frame.
 pub fn assoc_request(
     sa: &[u8; 6], bssid: &[u8; 6], seq: u16, cap: u16, listen: u16, ssid: &[u8], rsn: Option<&[u8]>,
-    out: &mut [u8; ASSOC_REQUEST_MAX],
+    extra: &[u8], out: &mut [u8; ASSOC_REQUEST_MAX],
 ) -> Option<usize> {
     let ssid = &ssid[..ssid.len().min(SSID_MAX)];
     let rsn = rsn.unwrap_or(&[]);
-    if rsn.len() > 40 {
+    if rsn.len() > 40 || extra.len() > EXTRA_MAX {
         return None;
     }
     out.fill(0);
@@ -145,9 +175,11 @@ pub fn assoc_request(
         out[at + 2..at + 2 + body.len()].copy_from_slice(body);
         at += 2 + body.len();
     }
-    // `rsn` is a whole element, id and length included (`eapol::RSN_IE`).
+    // `rsn` is a whole element, id and length included (`eapol::RSN_IE`), and so is each of `extra`.
     out[at..at + rsn.len()].copy_from_slice(rsn);
-    Some(at + rsn.len())
+    at += rsn.len();
+    out[at..at + extra.len()].copy_from_slice(extra);
+    Some(at + extra.len())
 }
 
 /// A deauthentication (9.3.3.13) with `reason` - 3, "leaving", for a station that is going.
@@ -302,6 +334,16 @@ mod tests {
     }
 
     #[test]
+    fn wmm_is_found_among_the_vendor_elements() {
+        // A WPS element (type 4) first, then the WMM parameter element (subtype 1, version 1).
+        let ies = [0, 0, 221, 4, 0x00, 0x50, 0xF2, 0x04, 221, 7, 0x00, 0x50, 0xF2, 0x02, 0x01, 0x01, 0x80];
+        assert!(has_wmm(&ies));
+        assert!(has_wmm(&WMM_INFO));
+        assert!(!has_wmm(&ies[..8]), "only the WPS element");
+        assert!(!has_wmm(&[221, 9, 0x00, 0x50, 0xF2, 0x02]), "an element longer than what is left");
+    }
+
+    #[test]
     fn the_join_frames_are_the_standards() {
         let (us, ap) = ([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 9]);
         let mut a = [0u8; AUTH_LEN];
@@ -315,14 +357,19 @@ mod tests {
         let rsn = [0x30, 0x02, 0x01, 0x00];
         let mut q = [0u8; ASSOC_REQUEST_MAX];
         let cap = CAP_ESS | CAP_PRIVACY;
-        let n = assoc_request(&us, &ap, 6, cap, 10, b"net", Some(&rsn), &mut q).unwrap();
+        let n = assoc_request(&us, &ap, 6, cap, 10, b"net", Some(&rsn), &[], &mut q).unwrap();
         assert_eq!(q[0], 0x00);
         assert_eq!(u16::from_le_bytes([q[24], q[25]]), 0x11);
         assert_eq!(u16::from_le_bytes([q[26], q[27]]), 10);
         assert_eq!(&q[28..33], &[0, 3, b'n', b'e', b't']);
         assert_eq!(&q[n - 4..n], &rsn, "the RSN element last, whole");
         assert_eq!(n, 28 + 5 + 10 + 6 + 4);
-        assert!(assoc_request(&us, &ap, 6, cap, 10, b"net", Some(&[0u8; 41]), &mut q).is_none());
+        assert!(assoc_request(&us, &ap, 6, cap, 10, b"net", Some(&[0u8; 41]), &[], &mut q).is_none());
+        // The WMM element after the RSN one, whole.
+        let n = assoc_request(&us, &ap, 6, cap, 10, b"net", Some(&rsn), &WMM_INFO, &mut q).unwrap();
+        assert_eq!(&q[n - 13..n - 9], &rsn);
+        assert_eq!(&q[n - 9..n], &WMM_INFO);
+        assert!(assoc_request(&us, &ap, 6, cap, 10, b"net", None, &[0u8; EXTRA_MAX + 1], &mut q).is_none());
 
         let mut d = [0u8; DEAUTH_LEN];
         assert_eq!(deauth(&us, &ap, 7, 3, &mut d), 26);

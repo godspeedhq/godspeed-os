@@ -62,10 +62,11 @@ pub struct Link {
     pub rekeys: u32,
     /// REPLAY PROTECTION: the highest CCMP packet number accepted under the pairwise key, and under each
     /// group key id. The chip decrypts and does not check them; a frame whose number is not above the last
-    /// one accepted for its key is a replay - an old frame sent again - and is dropped. mac80211 keeps one
-    /// per TID for the pairwise key; this association is non-QoS, so it has one.
-    pub pairwise_pn: u64,
-    pub group_pn: [u64; 4],
+    /// one accepted for its key is a replay - an old frame sent again - and is dropped. One per TID and one
+    /// for non-QoS frames (`data::replay_slot`), as mac80211 keeps them: on a WMM association (R12a) the
+    /// access point numbers each TID's frames apart, and one counter would drop a second TID as replays.
+    pub pairwise_pn: [u64; data::REPLAY_SLOTS],
+    pub group_pn: [[u64; data::REPLAY_SLOTS]; 4],
     pub replays: u32,
     /// A key frame from the access point on the joined link (a group rekey, R7), as ethernet, waiting for
     /// the station's `pull` to answer it. One slot: the access point sends the next only after this one is
@@ -79,7 +80,7 @@ impl Link {
     pub fn new() -> Self {
         Link {
             bssid: None, frames: RxQueue::new(), data_in: 0, dropped: 0, undecrypted: 0, rekeys: 0,
-            pairwise_pn: 0, group_pn: [0; 4], replays: 0,
+            pairwise_pn: [0; data::REPLAY_SLOTS], group_pn: [[0; data::REPLAY_SLOTS]; 4], replays: 0,
             rekey: [0; EAPOL_MAX], rekey_len: 0, rekeys_dropped: 0,
         }
     }
@@ -88,20 +89,22 @@ impl Link {
     /// pairwise key starts its packet numbers at 1. The group key's counter is then set from its Key RSC
     /// when it is installed (`group_rsc`), which is why this runs at the START of a join and not its end.
     pub fn new_keys(&mut self) {
-        self.pairwise_pn = 0;
-        self.group_pn = [0; 4];
+        self.pairwise_pn = [0; data::REPLAY_SLOTS];
+        self.group_pn = [[0; data::REPLAY_SLOTS]; 4];
     }
 
     /// The group key at `key_id` starts above `rsc` (its Key RSC): a broadcast frame the access point sent
     /// under it before this station joined cannot be replayed to it.
+    /// Every slot of it, as mac80211 seeds a group key's every TID from the one RSC.
     pub fn group_rsc(&mut self, key_id: u32, rsc: u64) {
-        self.group_pn[key_id as usize & 3] = rsc;
+        self.group_pn[key_id as usize & 3] = [rsc; data::REPLAY_SLOTS];
     }
 
     /// The same, for a key already held: the counter only ever rises (no KRACK-style reset).
     pub fn group_rsc_at_least(&mut self, key_id: u32, rsc: u64) {
-        let k = key_id as usize & 3;
-        self.group_pn[k] = self.group_pn[k].max(rsc);
+        for p in self.group_pn[key_id as usize & 3].iter_mut() {
+            *p = (*p).max(rsc);
+        }
     }
 
     /// A join completed: take its network's frames from now, with nothing left queued from before. The
@@ -396,9 +399,10 @@ fn data_frame(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
     // REPLAY: the packet number must climb, per key - the pairwise one for a frame to us, the group key
     // its header names for a frame to a group.
     let Some((pn, key_id)) = data::ccmp_pn(f) else { return };
+    let Some(slot) = data::replay_slot(f) else { return };
     let group = f[4] & 1 != 0;
     let k = key_id as usize & 3;
-    let last = if group { l.group_pn[k] } else { l.pairwise_pn };
+    let last = if group { l.group_pn[k][slot] } else { l.pairwise_pn[slot] };
     if pn <= last {
         l.replays = l.replays.wrapping_add(1);
         if l.replays == 1 || l.replays % 64 == 0 {
@@ -409,9 +413,9 @@ fn data_frame(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
         return;
     }
     if group {
-        l.group_pn[k] = pn;
+        l.group_pn[k][slot] = pn;
     } else {
-        l.pairwise_pn = pn;
+        l.pairwise_pn[slot] = pn;
     }
     let Some(d) = data::llc_payload(f, true) else { return };
     // The MIC off first, for every frame - a key frame's own MIC is computed over its exact length, so a
