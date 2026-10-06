@@ -612,9 +612,13 @@ station only after hearing that station's probe. So the frames went out and the 
 buffer-DMA mode that field is no byte count. The disk's own notes had already found it reading 0 for
 transfers whose data was right, and the disk never looked at an OUT's count, so nothing had failed on it
 until now. Linux's `dwc2_get_actual_xfer_length` (`hcd_intr.c`) never reads it for an OUT: a non-split OUT
-halted with transfer-complete moved `chan->xfer_len`, the length asked for. **Fixed (R5a2, built, not yet
-run):** `bulk_xfer` returns the asked length for a completed OUT. Both disk write paths look only at
+halted with transfer-complete moved `chan->xfer_len`, the length asked for. **Fixed (R5a2, hardware-verified):** `bulk_xfer` returns the asked length for a completed OUT. Both disk write paths look only at
 whether a command succeeded, not at the count, so the disk's behaviour does not change.
 
 Predicted on R5a2: `13 probe request(s) sent, 0 not` per sweep, `tx - 13 frames ... 0 failed` (26 after
 two), and the probe responses to us as before.
+
+**R5a2 (2026-10-06, `build/kernel7-R5a2.img`): passed.** Two sweeps, each `13 probe request(s) sent, 0 not`;
+the heartbeat `tx - 26 frames 1924 bytes, 0 failed` - 74 bytes a frame, the 32-byte descriptor and the
+42-byte probe request; 15 probe responses addressed to the dongle; 20 and 18 networks. The first transmit is
+done: the frame is built right, the host sends it, it reaches the air, and the host now says so.
