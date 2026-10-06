@@ -53,6 +53,7 @@ mod at {
     pub const KEY_LEN: usize = 7;
     pub const KEY_REPLAY: usize = 9;
     pub const KEY_NONCE: usize = 17;
+    pub const KEY_RSC: usize = 65;
     pub const KEY_MIC: usize = 81;
     pub const KEY_PAYLEN: usize = 97;
     /// `sizeof(struct ieee80211_eapol_key)`.
@@ -108,6 +109,11 @@ pub struct Key {
     pub pay_len: u16,
     /// The authenticator's nonce (message 1 and 3 carry it; 2 and 4 carry ours).
     pub nonce: [u8; 32],
+    /// The Key RSC: the group key's packet number as the access point last sent under it, the lowest a
+    /// receiver may accept next. LITTLE-endian, unlike this header's other fields - mac80211 loads it into a
+    /// CCMP receive counter as `rx_pn[j] = seq[5 - j]` (`net/mac80211/key.c`), so the first byte is the
+    /// packet number's lowest. Six bytes of eight for CCMP.
+    pub rsc: u64,
     /// The access point's address - the ethernet source, which is also the AA of the key derivation.
     pub from: [u8; 6],
     /// Where the key data begins in the frame this was read from, and how long it is (`pay_len`, bounded
@@ -298,6 +304,8 @@ pub fn describe(frame: &[u8], ctx: &ServiceContext, who: &str) -> Option<Key> {
     nonce.copy_from_slice(&k[at::KEY_NONCE..at::KEY_NONCE + 32]);
     let mut from = [0u8; 6];
     from.copy_from_slice(&frame[6..12]);
+    let r = &k[at::KEY_RSC..at::KEY_RSC + 6];
+    let rsc = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], 0, 0]);
     let key_data_at = ETHHDR + at::KEY_HEADER;
     let key_data_len = core::cmp::min(pay_len as usize, frame.len().saturating_sub(key_data_at));
     let key = Key {
@@ -316,6 +324,7 @@ pub fn describe(frame: &[u8], ctx: &ServiceContext, who: &str) -> Option<Key> {
         ]),
         pay_len,
         nonce,
+        rsc,
         from,
         key_data_at,
         key_data_len,

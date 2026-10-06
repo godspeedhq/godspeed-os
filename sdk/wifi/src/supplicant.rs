@@ -44,6 +44,11 @@ pub trait KeyPath {
     /// Install a CCMP key: the pairwise key at index 0 against `peer`, or a group key at its key id with
     /// `peer` `None`.
     fn install_key(&mut self, key_idx: u32, key: &[u8; 16], peer: Option<&[u8; 6]>, ctx: &ServiceContext) -> bool;
+    /// A group key at `key_idx` was installed, and the access point says its frames under it start above
+    /// packet number `rsc` (the Key RSC). A radio whose firmware checks replay does nothing here - the
+    /// default; one whose host checks it (the RTL8188CUS, `wifi-usb`) starts that key's counter there, so a
+    /// broadcast frame sent before the join cannot be replayed to it once.
+    fn group_rsc(&mut self, _key_idx: u32, _rsc: u64, _ctx: &ServiceContext) {}
 }
 
 /// What a WPA2 join KEEPS for the life of the association, and nothing more: the confirmation and
@@ -257,6 +262,7 @@ impl Handshake {
                 ctx.log_fmt(format_args!("{}: the firmware refused the group key - not joined", self.who));
                 return Step::Failed;
             }
+            path.group_rsc(kid as u32, key.rsc, ctx);
             ctx.log_fmt(format_args!(
                 "{}: JOINED - handshake complete, pairwise key installed, group key {} installed{}", self.who,
                 kid,
@@ -368,6 +374,7 @@ pub fn group_rekey(
         ctx.log_fmt(format_args!("{}: the firmware refused the new group key - the rekey is not acknowledged", who));
         return Rekey::Refused;
     }
+    path.group_rsc(kid as u32, key.rsc, ctx);
     // The acknowledgement is an ethernet header and a 99-byte key descriptor with no key data: 113 bytes.
     let mut tx = [0u8; 128];
     let n = eapol::build_key_frame(

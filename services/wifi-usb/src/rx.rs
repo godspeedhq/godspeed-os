@@ -70,12 +70,24 @@ impl Link {
         }
     }
 
-    /// A join completed with fresh keys: take its network's frames from now, every replay counter at zero
-    /// (a new key starts its packet numbers again) and nothing left queued from before.
-    pub fn joined(&mut self, bssid: [u8; 6]) {
-        self.bssid = Some(bssid);
+    /// A join is starting: every replay counter back to zero, for the keys it is about to install - a new
+    /// pairwise key starts its packet numbers at 1. The group key's counter is then set from its Key RSC
+    /// when it is installed (`group_rsc`), which is why this runs at the START of a join and not its end.
+    pub fn new_keys(&mut self) {
         self.pairwise_pn = 0;
         self.group_pn = [0; 4];
+    }
+
+    /// The group key at `key_id` starts above `rsc` (its Key RSC): a broadcast frame the access point sent
+    /// under it before this station joined cannot be replayed to it.
+    pub fn group_rsc(&mut self, key_id: u32, rsc: u64) {
+        self.group_pn[key_id as usize & 3] = rsc;
+    }
+
+    /// A join completed: take its network's frames from now, with nothing left queued from before. The
+    /// replay counters stand as the join set them.
+    pub fn joined(&mut self, bssid: [u8; 6]) {
+        self.bssid = Some(bssid);
         self.frames.clear();
     }
 }

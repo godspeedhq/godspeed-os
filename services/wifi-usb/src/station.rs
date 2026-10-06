@@ -520,6 +520,7 @@ impl Station for Dongle<'_> {
             self.leave(ctx, &old.bssid);
         }
         self.cam_next = 0;
+        self.link.borrow_mut().new_keys();
         let a = match self.associate(ctx, ssid, secret) {
             Ok(a) => a,
             Err(outcome) => return outcome,
@@ -731,5 +732,12 @@ impl KeyPath for Dongle<'_> {
                 false
             }
         }
+    }
+
+    /// The group key's starting packet number (its Key RSC) into the receive side's replay counter: this
+    /// host checks replay, because the chip does not (`rx::Link`).
+    fn group_rsc(&mut self, key_idx: u32, rsc: u64, ctx: &ServiceContext) {
+        self.link.borrow_mut().group_rsc(key_idx, rsc);
+        ctx.log_fmt(format_args!("wifi-usb: group key {} accepts packet numbers above {} (its Key RSC)", key_idx, rsc));
     }
 }
