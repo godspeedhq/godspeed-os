@@ -70,6 +70,9 @@ const DW1_SEC_AES: u32 = 0x00C0_0000;
 
 /// `TXDESC32_QOS` in `txdw4`: the frame is QoS data (R12a), as `fill_txdesc_v1` marks every one.
 const DW4_QOS: u32 = 1 << 6;
+/// `TXDESC32_SHORT_GI` in `txdw5`: `fill_txdesc_v1` sets it on a QoS data frame to a station whose HT
+/// capabilities offer the short guard interval (R12b); the firmware uses it when it picks an HT rate.
+const DW5_SHORT_GI: u32 = 1 << 6;
 
 /// `txdw5`'s data bits for a frame the FIRMWARE picks the rate of: `fill_txdesc_v1` ORs `0x0001ff00` in for
 /// every data frame, and sets no driver rate - the rate is the firmware's, adapting within the mask the
@@ -80,7 +83,7 @@ const DW5_DATA: u32 = 0x0001_FF00;
 /// for the chip to encrypt (`DW1_SEC_AES`) when `protected`, marked QoS (`DW4_QOS`) when `qos`, signed.
 /// Since R8 the rate is the firmware's choice, as `rtl8xxxu_fill_txdesc_v1` leaves it for a data frame;
 /// R6 sent these at the driver's 1 Mb/s.
-pub fn data(frame_len: u16, seq: u16, protected: bool, qos: bool) -> [u8; TX_DESC_LEN] {
+pub fn data(frame_len: u16, seq: u16, protected: bool, qos: bool, sgi: bool) -> [u8; TX_DESC_LEN] {
     let mut d = [0u8; TX_DESC_LEN];
     d[0..2].copy_from_slice(&frame_len.to_le_bytes());
     d[2] = TX_DESC_LEN as u8;
@@ -92,7 +95,8 @@ pub fn data(frame_len: u16, seq: u16, protected: bool, qos: bool) -> [u8; TX_DES
     if qos {
         d[16..20].copy_from_slice(&DW4_QOS.to_le_bytes());
     }
-    d[20..24].copy_from_slice(&DW5_DATA.to_le_bytes());
+    let dw5 = DW5_DATA | if qos && sgi { DW5_SHORT_GI } else { 0 };
+    d[20..24].copy_from_slice(&dw5.to_le_bytes());
     sign(&mut d);
     d
 }
@@ -216,9 +220,11 @@ mod tests {
 
     #[test]
     fn a_data_descriptor_leaves_the_rate_to_the_firmware() {
-        let d = data(120, 3, false, false);
+        let d = data(120, 3, false, false, false);
         assert_eq!(word(&d, 16), 0, "no driver rate");
-        assert_eq!(word(&data(120, 3, false, true), 16), 0x40, "QOS, and still no driver rate");
+        assert_eq!(word(&data(120, 3, false, true, false), 16), 0x40, "QOS, and still no driver rate");
+        assert_eq!(word(&data(120, 3, false, true, true), 20), 0x0001_FF40, "short GI on a QoS frame");
+        assert_eq!(word(&data(120, 3, false, false, true), 20), 0x0001_FF00, "never on a non-QoS one");
         assert_eq!(word(&d, 20), 0x0001_FF00, "fill_txdesc_v1's data bits");
         assert_eq!(word(&d, 4), 0x0040, "queue BE, AGG_BREAK, not protected");
     }
@@ -236,7 +242,7 @@ mod tests {
 
     #[test]
     fn a_protected_descriptor_asks_the_chip_for_ccmp() {
-        let d = data(120, 3, true, false);
+        let d = data(120, 3, true, false, false);
         assert_eq!(word(&d, 4), 0x00C0_0040, "SEC_AES, queue BE, AGG_BREAK");
         let x = d.chunks_exact(2).fold(0u16, |a, w| a ^ u16::from_le_bytes([w[0], w[1]]));
         assert_eq!(x, 0, "signed after the security bits went in");

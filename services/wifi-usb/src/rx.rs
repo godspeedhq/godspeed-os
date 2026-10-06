@@ -74,6 +74,10 @@ pub struct Link {
     pub rekey: [u8; EAPOL_MAX],
     pub rekey_len: usize,
     pub rekeys_dropped: u32,
+    /// An ADDBA request from the access point (R12b): its dialog token and Block Ack parameters, for the
+    /// station's `pull` to decline. One slot: a request repeated before it is answered replaces it.
+    pub addba: Option<(u8, u16)>,
+    pub addbas: u32,
 }
 
 impl Link {
@@ -81,7 +85,7 @@ impl Link {
         Link {
             bssid: None, frames: RxQueue::new(), data_in: 0, dropped: 0, undecrypted: 0, rekeys: 0,
             pairwise_pn: [0; data::REPLAY_SLOTS], group_pn: [[0; data::REPLAY_SLOTS]; 4], replays: 0,
-            rekey: [0; EAPOL_MAX], rekey_len: 0, rekeys_dropped: 0,
+            rekey: [0; EAPOL_MAX], rekey_len: 0, rekeys_dropped: 0, addba: None, addbas: 0,
         }
     }
 
@@ -349,6 +353,17 @@ fn heard(ctx: &ServiceContext, h: &mut Heard, sweep: Option<&mut Scan>, pk: &rtl
     if pk.frame.len() >= 24 && pk.frame[0] & 0x0c == 0x08 {
         data_frame(ctx, h, pk);
         return;
+    }
+    // R12b: the joined access point asking to aggregate - kept for the station's `pull` to decline.
+    {
+        let mut l = h.link.borrow_mut();
+        if let Some(bssid) = l.bssid {
+            if let Some(req) = mgmt::addba_request(pk.frame, &bssid, &h.us) {
+                l.addba = Some(req);
+                l.addbas = l.addbas.wrapping_add(1);
+                return;
+            }
+        }
     }
     let Some(b) = mgmt::beacon(pk.frame) else { return };
     h.beacons = h.beacons.wrapping_add(1);

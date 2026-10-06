@@ -84,6 +84,8 @@ struct Assoc {
     rates: u32,
     /// A WMM (QoS) association (R12a): data goes as QoS data.
     wmm: bool,
+    /// An HT association (R12b): the access point's HT capabilities, when both sides offered them.
+    ht: Option<mgmt::HtCap>,
 }
 
 /// The network a join found: where it is, and what its beacon or probe response says about it.
@@ -98,6 +100,8 @@ struct Found {
     rates: u32,
     /// The access point advertises WMM (`mgmt::has_wmm`).
     wmm: bool,
+    /// Its HT capabilities (`mgmt::ht_cap`), when it is an 802.11n access point.
+    ht: Option<mgmt::HtCap>,
 }
 
 /// The dongle, brought up: its address, the channel it rests on, and the sweep when one is running.
@@ -264,6 +268,7 @@ impl<'l> Dongle<'l> {
                                 ccmp: mgmt::rsn_is_ccmp(b.elements()),
                                 rates: rtl_tx::rate_mask(b.elements()),
                                 wmm: mgmt::has_wmm(b.elements()),
+                                ht: mgmt::ht_cap(b.elements()),
                             });
                         }
                     }
@@ -476,7 +481,18 @@ impl<'l> Dongle<'l> {
             let seq = self.next_seq();
             // R12a: a QoS station where the access point does WMM, as mac80211 associates - the 802.11n
             // rates the next card asks for are given only to one.
-            let extra: &[u8] = if net.wmm { &mgmt::WMM_INFO } else { &[] };
+            // R12b: and an HT station where the access point is one too - only on a WMM association, since
+            // an HT station is a QoS one. The HT element before the vendor one, in the standard's order.
+            let mut extra_buf = [0u8; mgmt::HT_CAP.len() + mgmt::WMM_INFO.len()];
+            let extra: &[u8] = match (net.wmm, net.ht.is_some()) {
+                (true, true) => {
+                    extra_buf[..mgmt::HT_CAP.len()].copy_from_slice(&mgmt::HT_CAP);
+                    extra_buf[mgmt::HT_CAP.len()..].copy_from_slice(&mgmt::WMM_INFO);
+                    &extra_buf
+                }
+                (true, false) => &mgmt::WMM_INFO,
+                (false, _) => &[],
+            };
             let Some(n) = mgmt::assoc_request(&us, &b, seq, cap, LISTEN_INTERVAL, ssid, rsn, extra, &mut f) else {
                 break;
             };
@@ -494,7 +510,13 @@ impl<'l> Dongle<'l> {
                 ctx.log_fmt(format_args!("wifi-usb: join - {}",
                     if net.wmm { "the access point does WMM: associated as a QoS station, data goes as QoS data (R12a)" }
                     else { "the access point does no WMM: a non-QoS association, as before" }));
-                Ok(Assoc { bssid: b, channel: net.channel, aid, rssi: net.rssi, rates: net.rates, wmm: net.wmm })
+                let ht = if net.wmm { net.ht } else { None };
+                if let Some(h) = ht {
+                    ctx.log_fmt(format_args!(
+                        "wifi-usb: join - an 802.11n access point: associated as an HT station; it receives MCS {:#04x}/{:#04x}, short GI {} (R12b)",
+                        h.mcs[0], h.mcs[1], if h.cap & (mgmt::HT_CAP_SGI_20 | mgmt::HT_CAP_SGI_40) != 0 { "yes" } else { "no" }));
+                }
+                Ok(Assoc { bssid: b, channel: net.channel, aid, rssi: net.rssi, rates: net.rates, wmm: net.wmm, ht })
             }
             Some((st, _)) => {
                 ctx.log_fmt(format_args!("wifi-usb: join - the access point refused the association, status {}", st));
@@ -604,12 +626,20 @@ impl Station for Dongle<'_> {
             self.link.borrow_mut().joined(a.bssid);
             // R8: the firmware told what the link is - the access point's rates, the association - so it
             // adapts the data rate within them, as Linux's `bss_info_changed` does once associated.
-            match rtl8188::joined(ctx, &mut self.mbox, a.rates, a.aid) {
+            // R12b: the access point's HT receive set into the mask, as `rtl8xxxu` builds it.
+            let (mask, sgi) = match a.ht {
+                Some(h) => (
+                    a.rates | (h.mcs[0] as u32) << 12 | (h.mcs[1] as u32) << 20,
+                    h.cap & (mgmt::HT_CAP_SGI_20 | mgmt::HT_CAP_SGI_40) != 0,
+                ),
+                None => (a.rates, false),
+            };
+            match rtl8188::joined(ctx, &mut self.mbox, mask, sgi, a.aid) {
                 Ok(()) => {
                     self.reported = true;
                     ctx.log_fmt(format_args!(
-                        "wifi-usb: join - the firmware has the rate mask {:#05x} and the association; it picks the data rate from here",
-                        a.rates));
+                        "wifi-usb: join - the firmware has the rate mask {:#010x}{} and the association; it picks the data rate from here",
+                        mask, if sgi { ", short GI" } else { "" }));
                 }
                 Err(why) => ctx.log_fmt(format_args!(
                     "wifi-usb: join - the firmware was not given the rates ({}) - data falls back to its own default", why)),
@@ -709,7 +739,8 @@ impl Station for Dongle<'_> {
         if n == 0 {
             return false;
         }
-        let desc = rtl_tx::data(n as u16, seq, keyed, a.wmm);
+        let sgi = a.ht.is_some_and(|h| h.cap & (mgmt::HT_CAP_SGI_20 | mgmt::HT_CAP_SGI_40) != 0);
+        let desc = rtl_tx::data(n as u16, seq, keyed, a.wmm, sgi);
         let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + MAX];
         req[0] = usbfn::OP_BULK_OUT;
         req[1] = rtl_tx::be_out(self.queues);
@@ -740,8 +771,10 @@ impl Station for Dongle<'_> {
         let mut p = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None };
         let mut key = [0u8; EAPOL_MAX];
         let mut key_len = 0usize;
+        let addba;
         {
             let mut l = self.link.borrow_mut();
+            addba = l.addba.take().map(|r| (r, l.addbas));
             while rxq.has_room() {
                 let mut b = [0u8; godspeed_wifi::rxq::FRAME_MAX];
                 let n = l.frames.pop(&mut b);
@@ -754,6 +787,20 @@ impl Station for Dongle<'_> {
                 key_len = l.rekey_len;
                 key[..key_len].copy_from_slice(&l.rekey[..key_len]);
                 l.rekey_len = 0;
+            }
+        }
+        // R12b: an access point's ADDBA request, declined in kind (`mgmt::addba_decline`): this station does
+        // not reorder aggregated frames, so the access point sends its frames to it unaggregated.
+        if let (Some(((dialog, params), n)), Some(a)) = (addba, self.assoc) {
+            let mut f = [0u8; mgmt::ADDBA_RESPONSE_LEN];
+            let seq = self.next_seq();
+            let len = mgmt::addba_decline(&self.mac, &a.bssid, seq, dialog, params, &mut f);
+            match self.send_mgmt(ctx, &f[..len], seq, false) {
+                Ok(()) if n == 1 => ctx.log_fmt(format_args!(
+                    "wifi-usb: the access point asked to aggregate (ADDBA, TID {}) - declined, as a station that does not reorder; R12b",
+                    (params >> 2) & 0x0F)),
+                Ok(()) => {}
+                Err(why) => ctx.log_fmt(format_args!("wifi-usb: the ADDBA decline was not sent - {}", why)),
             }
         }
         if key_len > 0 {

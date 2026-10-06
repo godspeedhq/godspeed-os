@@ -635,3 +635,12 @@ rtl8192c_power_base                # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h
 rtl8xxxu_config                    # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
 rtl8xxxu_gen1_channel_to_group     # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
 rtl8xxxu_gen1_set_tx_power         # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+ieee80211_add_ht_ie                # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+ieee80211_add_wmm_info_ie          # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+IEEE80211_HT_MCS_TX_DEFINED        # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+IEEE80211_NUM_TIDS                 # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+rtl8xxxu_probe                     # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+SMPS_OFF                           # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+TXDESC32_QOS                       # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+TXDESC32_SHORT_GI                  # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+WLAN_STATUS_REQUEST_DECLINED       # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14

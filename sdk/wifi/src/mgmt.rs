@@ -107,6 +107,82 @@ pub const EXTRA_MAX: usize = 40;
 /// of 0 - no U-APSD - as mac80211 builds it (`ieee80211_add_wmm_info_ie`) for a station not asking for it.
 pub const WMM_INFO: [u8; 9] = [221, 7, 0x00, 0x50, 0xF2, 0x02, 0x00, 0x01, 0x00];
 
+/// The element ID of HT Capabilities (9.4.2.55), and its two short guard interval bits in the capability
+/// field (bit 5 for 20 MHz, bit 6 for 40 MHz).
+const EID_HT_CAP: u8 = 45;
+pub const HT_CAP_SGI_20: u16 = 1 << 5;
+pub const HT_CAP_SGI_40: u16 = 1 << 6;
+
+/// The HT Capabilities element a one-stream, 20 MHz station sends (R12b), as mac80211 builds it from
+/// `rtl8xxxu`'s band (`ieee80211_add_ht_ie`, `rtl8xxxu_probe`):
+/// - capability `0x002C`: short guard interval at 20 MHz, and SM power save disabled (`SMPS_OFF`, 3 at
+///   bits 2-3), nothing for 40 MHz, which this driver never tunes;
+/// - A-MPDU parameters `0x1F`: up to 64 KiB (3) with a 16 us minimum spacing (7 at bits 2-4);
+/// - the MCS set: MCS 0-7 received (`rx_mask[0] = 0xff`), MCS 32 (`rx_mask[4] = 0x01`), and the transmit
+///   set defined (`IEEE80211_HT_MCS_TX_DEFINED`, byte 12);
+/// - extended capabilities, beamforming and antenna selection all zero.
+pub const HT_CAP: [u8; 28] = [
+    EID_HT_CAP, 26,
+    0x2C, 0x00,
+    0x1F,
+    0xFF, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,
+    0, 0,
+    0, 0, 0, 0,
+    0,
+];
+
+/// What a station needs from its access point's HT Capabilities element: the capability field (for the
+/// short guard interval) and the first two bytes of the MCS set it receives (one and two streams) - the
+/// firmware's rate mask (`rtl8xxxu`'s `ht_cap.mcs.rx_mask[0] << 12 | rx_mask[1] << 20`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HtCap {
+    pub cap: u16,
+    pub mcs: [u8; 2],
+}
+
+/// The access point's HT capabilities, when `ies` carry the element at full length.
+pub fn ht_cap(ies: &[u8]) -> Option<HtCap> {
+    let e = element(ies, EID_HT_CAP)?;
+    if e.len() < 26 {
+        return None;
+    }
+    Some(HtCap { cap: u16::from_le_bytes([e[0], e[1]]), mcs: [e[3], e[4]] })
+}
+
+/// Management subtype Action (9.3.3.13), and the Block Ack category's ADDBA request and response.
+const FC_ACTION: u8 = 0xD0;
+const CATEGORY_BLOCK_ACK: u8 = 3;
+const ADDBA_REQUEST: u8 = 0;
+const ADDBA_RESPONSE: u8 = 1;
+/// The status a station that does not take aggregated frames answers with (`WLAN_STATUS_REQUEST_DECLINED`,
+/// what mac80211 sends when it will not start a receive session).
+const STATUS_REQUEST_DECLINED: u16 = 37;
+/// An ADDBA response: the header, category, action, dialog token, status, Block Ack parameters, timeout.
+pub const ADDBA_RESPONSE_LEN: usize = 24 + 9;
+
+/// An access point's ADDBA request to `us` (9.6.4.2): its dialog token and Block Ack parameter set, for
+/// the answer to repeat. `None` for any other frame.
+pub fn addba_request(frame: &[u8], bssid: &[u8; 6], us: &[u8; 6]) -> Option<(u8, u16)> {
+    if frame.len() < 24 + 9 || frame[0] != FC_ACTION || !between(frame, bssid, us) {
+        return None;
+    }
+    let b = &frame[24..];
+    (b[0] == CATEGORY_BLOCK_ACK && b[1] == ADDBA_REQUEST).then(|| (b[2], u16::from_le_bytes([b[3], b[4]])))
+}
+
+/// The answer that declines it (9.6.4.3): the same dialog token and parameter set, status 37, no timeout.
+/// The access point then sends this station's frames unaggregated, which is what a station that does not
+/// reorder aggregated frames needs.
+pub fn addba_decline(
+    sa: &[u8; 6], bssid: &[u8; 6], seq: u16, dialog: u8, params: u16, out: &mut [u8; ADDBA_RESPONSE_LEN],
+) -> usize {
+    unicast_header(out, FC_ACTION, sa, bssid, seq);
+    let p = params.to_le_bytes();
+    let s = STATUS_REQUEST_DECLINED.to_le_bytes();
+    out[24..33].copy_from_slice(&[CATEGORY_BLOCK_ACK, ADDBA_RESPONSE, dialog, s[0], s[1], p[0], p[1], 0, 0]);
+    ADDBA_RESPONSE_LEN
+}
+
 /// Whether `ies` carry a WMM element - the information (subtype 0) or parameter (subtype 1) form, which an
 /// access point advertises in its beacons when it does QoS. A walk over every vendor element, since a
 /// beacon carries several (WPS, the vendor's own) and only one is WMM. An element running past the end
@@ -331,6 +407,32 @@ mod tests {
         assert_eq!(n, 24 + 5 + 10 + 6);
         // A name over 32 bytes is cut to the element's limit rather than written past it.
         assert_eq!(probe_request(&[0; 6], 0, &[b'a'; 40], &mut f), PROBE_REQUEST_MAX);
+    }
+
+    #[test]
+    fn the_ht_element_is_a_one_stream_20_mhz_stations() {
+        assert_eq!(HT_CAP.len(), 2 + HT_CAP[1] as usize);
+        // Read back as an access point's would be: SGI 20, MCS 0-7.
+        let c = ht_cap(&HT_CAP).unwrap();
+        assert_eq!((c.cap & HT_CAP_SGI_20 != 0, c.cap & HT_CAP_SGI_40 != 0, c.mcs), (true, false, [0xFF, 0]));
+        assert_eq!(ht_cap(&HT_CAP[..20]), None, "short");
+    }
+
+    #[test]
+    fn an_addba_request_is_declined_in_kind() {
+        let (us, ap) = ([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 9]);
+        let mut f = [0u8; 24 + 9];
+        f[0] = 0xD0;
+        f[4..10].copy_from_slice(&us);
+        f[10..16].copy_from_slice(&ap);
+        f[16..22].copy_from_slice(&ap);
+        f[24..33].copy_from_slice(&[3, 0, 0x17, 0x02, 0x10, 0, 0, 0x10, 0]);
+        assert_eq!(addba_request(&f, &ap, &us), Some((0x17, 0x1002)));
+        assert_eq!(addba_request(&f, &ap, &ap), None, "not to us");
+        let mut r = [0u8; ADDBA_RESPONSE_LEN];
+        assert_eq!(addba_decline(&us, &ap, 4, 0x17, 0x1002, &mut r), 33);
+        assert_eq!(r[0], 0xD0);
+        assert_eq!(&r[24..33], &[3, 1, 0x17, 37, 0, 0x02, 0x10, 0, 0]);
     }
 
     #[test]

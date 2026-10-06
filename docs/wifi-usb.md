@@ -1200,7 +1200,7 @@ watched task released - 71 of 96 routing slots free, reserve 72`. At the same co
 
 `backlog/74` has what the run showed about pooling and about the supervisor.
 
-## 21. R11 (2026-10-06): transmit power from the dongle's own calibration - built, not yet run
+## 21. R11 (2026-10-06): transmit power from the dongle's own calibration - hardware-verified on the Pi 2
 
 Until now the transmit gain was what the baseband table wrote: the same for every dongle and every
 channel. The factory writes per-channel-group power indexes into each dongle's efuse (`struct
@@ -1236,3 +1236,79 @@ R11 does the same:
 
 What it cannot show from this side is the transmitted power itself; the access point's view of it is not
 reachable from here. The read-back proves the words landed, and the link proves they are not wrong.
+
+**The R11 card's run (2026-10-06): as predicted.**
+- At bring-up: `transmit power from the efuse, channel 1 (group 0): CCK 0x28, OFDM 0x28, 1 path(s);
+  TX_AGC_A_RATE18_06 written 0x31333636, reads 0x31333636 - R11 done`. The word is 0x2a in each byte plus
+  the base `0x07090c0c`: the efuse's OFDM difference of +2 on its 0x28 index, applied as Linux applies it.
+- JOINED. `wifi scan` re-tuned all 13 channels, each with its own power: 23 networks, 13 probe requests
+  sent, 0 not, and 9 probe responses addressed to us, so the frames sent at the new power reach the air.
+- `ping 8.8.8.8` 7 of 7, 19 to 26 ms.
+
+## 22. R12a (2026-10-06): a WMM (QoS) association - built, not yet run
+
+The step 802.11n needs first. An HT station is a QoS station (802.11-2020 11.2), and access points give
+HT rates only to a station that associated with WMM. mac80211 adds the WMM information element to its
+association request for that reason. Until R12a this station associated non-QoS.
+
+**What changes:**
+- **The join:**
+  - the find notes whether the access point advertises WMM (`mgmt::has_wmm`, a walk over every vendor
+    element, host-tested);
+  - the association request then carries `mgmt::WMM_INFO`: version 1, no U-APSD, as mac80211 builds it
+    for a station not asking for power save;
+  - `assoc_request` takes extra whole elements after the RSN one, so R12b's HT element goes the same way.
+- **Out:** data goes as QoS data, TID 0, best effort:
+  - `data::to_80211` gains the QoS Control field (host-tested);
+  - the descriptor gains `TXDESC32_QOS`, as `fill_txdesc_v1` marks every QoS frame;
+  - the endpoint is unchanged, since best effort is the queue it already used.
+  - The handshake's own frames stay non-QoS, which an access point accepts.
+- **In:** the replay counters are per TID now, plus one for non-QoS frames (`data::replay_slot`), per key,
+  as mac80211 keeps them. A QoS access point numbers each TID's frames separately, so one counter would
+  drop a second TID's frames as replays. A group key's Key RSC seeds every slot.
+
+**Prediction, Pi 2:**
+- At JOINED: `the access point does WMM: associated as a QoS station, data goes as QoS data (R12a)`.
+  Most access points do WMM.
+- Then the lease and `ping 192.168.10.1` and `ping 8.8.8.8` as before.
+- No `a data frame replayed` lines.
+
+**Refuted by:**
+- an association refused, or answered and then a link that carries nothing (QoS frames the access point
+  will not take);
+- replays logged where there were none before (the per-TID counters wrong);
+- the handshake failing (the access point refusing non-QoS EAPOL on a QoS association).
+
+## 23. R12b (2026-10-06): 802.11n - an HT association - built, not yet run
+
+On a WMM association (R12a) to an access point that advertises HT Capabilities, the station associates
+as an HT station, as mac80211 does for `rtl8xxxu`'s band.
+
+**The element** (`mgmt::HT_CAP`, host-tested), as mac80211's `ieee80211_add_ht_ie` builds it from
+`rtl8xxxu_probe`'s band:
+- capability `0x002C`: short guard interval at 20 MHz, and SM power save off;
+- A-MPDU parameters `0x1F`: 64 KiB, 16 us spacing;
+- MCS 0-7 received, MCS 32, and the transmit set defined.
+
+It goes after the RSN element and before the WMM one.
+
+**The rates.** The firmware's mask gains the access point's HT receive set (`mcs[0] << 12 | mcs[1] << 20`,
+as `rtl8xxxu` builds it). The argument byte gains 0x20 when the access point offers the short guard
+interval, and so does a QoS data frame's descriptor (`TXDESC32_SHORT_GI`, as `fill_txdesc_v1` sets it).
+
+**Aggregation is declined, in kind.** An access point offers a Block Ack session with an ADDBA request.
+This station does not reorder aggregated frames, so it answers status 37, "request declined", with the
+same dialog token and parameters (`mgmt::addba_request` / `addba_decline`, host-tested). That is what
+mac80211 sends when it will not start a receive session, and the access point then sends unaggregated.
+The receive side keeps the request (`rx::Link::addba`) and the station's `pull` sends the decline, the
+way a group rekey is answered. The first is said: `the access point asked to aggregate (ADDBA, TID n) -
+declined`.
+
+**Prediction, Pi 2:**
+- At the join: `an 802.11n access point: associated as an HT station; it receives MCS 0xff/0x..`.
+- Then `the firmware has the rate mask 0x....fff, short GI`.
+- The lease and the pings as before. `ping bytes 1024 192.168.10.1` should come back closer still to the
+  32-byte one: the uplink can now reach 65 or 72 Mb/s, against 54 before.
+
+**Refuted by:** the association refused (the HT element wrong), or the link carrying nothing afterwards
+(the HT rate mask or the short guard interval wrong for this access point).

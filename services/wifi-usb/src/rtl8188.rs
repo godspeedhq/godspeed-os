@@ -781,8 +781,11 @@ fn h2c(ctx: &ServiceContext, mbox: &mut u8, cmd: &[u8; 6], len: usize) -> Result
 /// `struct h2c_cmd`'s `ramask` layout), `REG_BCN_MAX_ERR`, the port's beacon transmission stopped
 /// (`rtl8xxxu_stop_tx_beacon`), `REG_BCN_PSR_RPT` with the association ID, and the connect report
 /// (`rtl8xxxu_gen1_report_connect`). With these the firmware adapts the data rate within `mask`.
-pub fn joined(ctx: &ServiceContext, mbox: &mut u8, mask: u32, aid: u16) -> Result<(), &'static str> {
-    let ramask = [H2C_SET_RATE_MASK, (mask >> 16) as u8, (mask >> 24) as u8, 0x80, mask as u8, (mask >> 8) as u8];
+/// `sgi` (R12b): the access point takes the short guard interval, so the argument byte gains 0x20 - what
+/// `rtl8xxxu_update_rate_mask` sets for an HT peer that offers it.
+pub fn joined(ctx: &ServiceContext, mbox: &mut u8, mask: u32, sgi: bool, aid: u16) -> Result<(), &'static str> {
+    let arg = 0x80 | if sgi { 0x20 } else { 0 };
+    let ramask = [H2C_SET_RATE_MASK, (mask >> 16) as u8, (mask >> 24) as u8, arg, mask as u8, (mask >> 8) as u8];
     h2c(ctx, mbox, &ramask, 6)?;
     write8(ctx, REG_BCN_MAX_ERR, 0xFF)?;
     let q = read8(ctx, REG_FWHW_TXQ_CTRL + 2)?;
