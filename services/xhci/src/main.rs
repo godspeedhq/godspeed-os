@@ -1677,10 +1677,21 @@ fn read_config_and_bind(
                 // and may use them later without reading them again. Linux enables a quirk for exactly
                 // this on the VL805 (`XHCI_TRB_OVERFETCH`, a dummy page after every ring segment). Here the
                 // next page is this slice's interrupt ring, which the dongle does not use and an earlier
-                // device's TRBs may still fill: on the Pi 4 (2026-10-06) the first transfer after the
-                // wrap failed with a TRB Error, five starts in five; the T630's controller never showed it.
+                // device's TRBs may still fill. It was added for the Pi 4's TRB Error at the wrap and did
+                // NOT cure it (the cause is below); kept because the overfetch is documented for this part.
                 for i in (0..0x1000).step_by(4) {
                     dma.write32(int_tr_off(dev_idx) + i, 0);
+                }
+                // AND THE REST OF ITS OWN EP0 RING, from where `radio.rs` starts writing to the page's
+                // end. A ring's unwritten slots must read as not yet given to the controller - cycle 0
+                // against our 1, as Linux gets by zeroing every ring it allocates - and this page is a
+                // reused slice's: what an earlier device left there can carry cycle 1. The Pi 4 showed it
+                // (2026-10-06): the controller finished the TD before 0xff0, went on to 0xff0 before this
+                // host had written its Link there, found a leftover TRB it was allowed to run, and stopped
+                // on it with a TRB Error - its dequeue pointer at 0xff0, cycle 1. Every other device's
+                // EP0 ring stays near its start, which is why only the dongle, the one that wraps, met it.
+                for i in (radio::EP0_RUNTIME_START..0x1000).step_by(4) {
+                    dma.write32(ep0_tr_off(dev_idx) + i, 0);
                 }
                 return (None, None, Some(radio::Radio::new(slot, dev_idx, port, ids)), cfg_val);
             }

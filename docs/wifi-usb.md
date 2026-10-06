@@ -1701,3 +1701,23 @@ at the TRB it rejected, and `xhci` already reads that pointer (`ep0_hw_dequeue`)
 failure, and once per binding the controller's dequeue is compared with this host's cursor: the dongle
 is enumerated behind a hub on the Pi 4 and on a root port on the T630, and `EP0_RUNTIME_START` assumes
 what enumeration left on the ring.
+
+**The measurement (Pi 4, 2026-10-06, `build/pi4_xhci_dequeue.log`): the controller stopped AT 0xff0.**
+`the controller stopped at Some((4080, 1))` - offset 0xff0, cycle 1 - for the failure whose TD this host
+then put at 0xff0. So the controller was already sitting at 0xff0 before this host wrote its Link TRB
+there: it had finished the TD that ends at 0xff0, read on into the next slot, found a TRB with cycle 1 -
+one it is allowed to run - and stopped on it with a TRB Error. The request that then failed only
+reported the error. The Link TRB was never refused.
+
+**The cause is ours, not the VL805's.** A ring's slots ahead of the producer must read as not yet given
+to the controller: cycle 0 against our 1. Linux gets that by zeroing every ring it allocates. The dongle's
+EP0 ring is a page of a reused slice, and nothing cleared it, so a slot an earlier device left with cycle
+1 is a TRB the controller may run. Every other device's EP0 ring stays near its start; only the dongle's
+reaches 0xff0. The T630 got away with what happened to be in its page. (The bind-time dequeue read
+`(0, 1)` against this host's 0x80: the endpoint context's pointer is written back only when the endpoint
+stops, so while it runs it is stale, and transfers from 0x80 working shows it is.)
+
+**The fix:** the dongle's EP0 ring is cleared from `EP0_RUNTIME_START` to the page's end when it is
+bound. The interrupt-ring zeroing stays, for the overfetch, with its comment corrected: it did not cure
+this. **Prediction:** the bring-up passes 0xff0 and reaches `receive did not start - the host has no bulk
+IN for this dongle`, as on the T630. **Refuted by** any further `cc=5`.
