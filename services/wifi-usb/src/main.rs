@@ -135,11 +135,16 @@ fn identify<'l>(ctx: &ServiceContext, vid: u16, pid: u16, link: &'l RefCell<rx::
             // Receive starts only once the chip's own is set up (R3a): the host's IN armed at a chip that
             // has not been told where to put frames would only be NAKed. A radio that cannot receive
             // cannot scan, so it is not a station.
-            let (mac, queues) = bring_up(ctx)?;
+            let (mac, queues, is_8188r) = bring_up(ctx)?;
             if !rx::start(ctx) {
                 return None;
             }
-            Some(station::Dongle::new(mac, FIRST_CHANNEL, queues, link))
+            // What the power-off needs (R9): the efuse's word, and a UMC chip of cut B from `SYS_CFG`.
+            let chip = rtl8188::Chip {
+                is_8188r,
+                umc_cut_b: c & SYS_CFG_VENDOR_UMC != 0 && (c >> SYS_CFG_CHIP_VER_SHIFT) & 0xF == 1,
+            };
+            Some(station::Dongle::new(mac, FIRST_CHANNEL, queues, chip, link))
         }
         (c, i) => {
             ctx.log_fmt(format_args!(
@@ -156,12 +161,12 @@ const REPORT_CEILING_MS: u64 = 60_000;
 /// R1 (`docs/wifi-usb.md`): the efuse, then the power-on - Linux's order (`rtl8xxxu_init_device`) - and on
 /// through R2 and R3a. The dongle's own address, from its efuse, and how many transmit queues its endpoints
 /// serve, when every stage completed; `None` when one stopped, said where.
-fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8)> {
+fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8, bool)> {
     // How long each half took, for the log - `Deadline::elapsed_us` is the stdlib's measure of a wait. The
     // bound is a ceiling for the report only; every wait inside the efuse walk and the power-on is
     // bounded on its own (`rtl8188.rs`).
     let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
-    let mac = match rtl8188::read_efuse(ctx) {
+    let (mac, is_8188r) = match rtl8188::read_efuse(ctx) {
         Ok(e) => {
             let m = e.mac;
             ctx.log_fmt(format_args!(
@@ -169,7 +174,7 @@ fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8)> {
                 e.id, if rtl8188::efuse_id_ok(&e) { "as expected" } else { "NOT the 0x8129 this family carries" },
                 e.vid, e.pid, m[0], m[1], m[2], m[3], m[4], m[5], e.walked, e.sections,
                 clock.elapsed_us() / 1000));
-            e.mac
+            (e.mac, e.is_8188r)
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the efuse read stopped - {}", why));
@@ -235,7 +240,7 @@ fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8)> {
                     return None;
                 }
             }
-            Some((mac, queues.count()))
+            Some((mac, queues.count(), is_8188r))
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the radio's set-up stopped - {}", why));
@@ -326,6 +331,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     dongle = identify(&ctx, vid, pid, &link);
                     if let Some(d) = dongle.as_ref() {
                         heard.us = d.address();
+                        heard.chip = Some(d.chip());
                     }
                 }
                 Ok(None) => ctx.log_fmt(format_args!(

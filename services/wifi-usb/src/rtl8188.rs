@@ -149,6 +149,10 @@ const EFUSE_ID: u16 = 0x8129;
 const EFUSE_OFF_VID: usize = 0x0A;
 const EFUSE_OFF_PID: usize = 0x0C;
 const EFUSE_OFF_MAC: usize = 0x16;
+/// `struct rtl8192cu_efuse`'s `rf_regulatory`: bit 5 marks an RTL8188RU (`rtl8192cu_parse_efuse`), which
+/// the power-off treats differently (R9).
+const EFUSE_OFF_RF_REGULATORY: usize = 0x79;
+const RF_REGULATORY_8188RU: u8 = 0x20;
 
 /// One physical efuse byte (`rtl8xxxu_read_efuse8`): the address in `EFUSE_CTRL` bytes 1-2, bit 31 clear
 /// to start the read, then bit 31 SET means the byte in bits 7:0 is ready.
@@ -173,6 +177,8 @@ pub struct Efuse {
     /// Physical bytes walked, and the sections found - for the log.
     pub walked: u16,
     pub sections: u16,
+    /// The chip is an RTL8188RU (`rf_regulatory` bit 5), whose power-off has one step more (R9).
+    pub is_8188r: bool,
 }
 
 /// Read the efuse into its logical map (`rtl8xxxu_read_efuse`), the loader enabled as Linux enables it
@@ -239,7 +245,10 @@ pub fn read_efuse(ctx: &ServiceContext) -> Result<Efuse, &'static str> {
     let le16 = |at: usize| u16::from_le_bytes([map[at], map[at + 1]]);
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&map[EFUSE_OFF_MAC..EFUSE_OFF_MAC + 6]);
-    Ok(Efuse { id: le16(0), vid: le16(EFUSE_OFF_VID), pid: le16(EFUSE_OFF_PID), mac, walked: addr, sections })
+    Ok(Efuse {
+        id: le16(0), vid: le16(EFUSE_OFF_VID), pid: le16(EFUSE_OFF_PID), mac, walked: addr, sections,
+        is_8188r: map[EFUSE_OFF_RF_REGULATORY] & RF_REGULATORY_8188RU != 0,
+    })
 }
 
 pub fn efuse_id_ok(e: &Efuse) -> bool {
@@ -614,6 +623,117 @@ pub fn install_key(
 pub fn clear_key(ctx: &ServiceContext, entry: u8) -> Result<(), &'static str> {
     write32(ctx, REG_CAM_WRITE, 0)?;
     write32(ctx, REG_CAM_CMD, CAM_CMD_POLLING | CAM_CMD_WRITE | ((entry as u32) << CAM_CMD_KEY_SHIFT))
+}
+
+/// What the power-off needs to know about the chip it stops (R9), as `rtl8192cu_power_off` asks it: an
+/// RTL8188RU (from the efuse) gets an LNA leakage workaround, and a UMC chip of cut B one more bit in
+/// the switching regulator's last setting (from `SYS_CFG`).
+#[derive(Clone, Copy)]
+pub struct Chip {
+    pub is_8188r: bool,
+    pub umc_cut_b: bool,
+}
+
+/// How the 8051's firmware stopped in [`power_off`].
+pub enum FwStop {
+    /// None was marked ready (`MCU_FW_DL`): nothing to stop.
+    NotRunning,
+    /// It answered the stop request and turned its own CPU off.
+    Itself,
+    /// It did not answer within `FW_STOP_MS`, and the CPU was stopped from the host - the case a hung
+    /// firmware is.
+    Forced,
+}
+
+const REG_FPGA0_XCD_RF_PARM: u16 = 0x087C;
+const FPGA0_RF_PARM_CLK_GATE: u32 = 1 << 31;
+const REG_FWIMR: u16 = 0x0130;
+const REG_GPIO_MUXCFG: u16 = 0x0040;
+const REG_GPIO_PIN_CTRL: u16 = 0x0044;
+const APSD_CTRL_OFF: u8 = 1 << 6;
+/// `REG_SYS_FUNC`'s low byte: the baseband global reset, the USB analog and the USB digital blocks.
+const SYS_FUNC_BB_GLB_RSTN: u8 = 1 << 1;
+const SYS_FUNC_USBA: u8 = 1 << 2;
+const SYS_FUNC_USBD: u8 = 1 << 4;
+/// `REG_SYS_FUNC`'s high bits: the loader (`ELDR`) and the hardware power-down (`HWPDN`).
+const SYS_FUNC_ELDR: u16 = 1 << 12;
+const SYS_FUNC_HWPDN: u16 = 1 << 14;
+/// `REG_APS_FSMCO` as the power-off leaves it: the autoload done, suspended by the hardware, for the host.
+const APS_FSMCO_PFM_ALDN: u16 = 1 << 1;
+const APS_FSMCO_HW_SUSPEND: u16 = 1 << 11;
+const APS_FSMCO_HOST: u16 = 1 << 14;
+/// How long a running firmware has to stop its own CPU. Linux reads 100 times, 50 us apart - about 5 ms;
+/// a count is not a duration, so this is that time with room.
+const FW_STOP_MS: u64 = 10;
+/// After stopping the CPU from the host, as Linux's `msleep(10)`.
+const FW_FORCED_SETTLE_MS: u64 = 10;
+
+/// R9: `rtl8192cu_power_off`, what Linux runs when the dongle is unplugged or its driver unloaded - the
+/// chip's own power-down, through register writes alone. Every one is a USB control transfer the chip's
+/// USB block answers, not its 8051, so a firmware that has hung cannot stop it: asked to stop and silent,
+/// it is stopped from the host. In Linux's order and with its names:
+/// - `_DisableRFAFEAndResetBB`: transmit paused, the RF's mode bits to zero, APSD off, the RF clock gated,
+///   the baseband reset;
+/// - `_ResetDigitalProcedure1`: a firmware marked ready asked to stop, and stopped if it does not;
+/// - `_DisableGPIO` and `_DisableAnalog`: the pins quiet, the regulator to its low setting, the chip
+///   suspended for the host, and the ISO, clock and power registers locked.
+///
+/// The dongle stays on its USB port and answers control transfers; [`power_on`] and the firmware upload
+/// bring it back - the bring-up a restart of this service runs.
+pub fn power_off(ctx: &ServiceContext, chip: Chip) -> Result<FwStop, &'static str> {
+    // The 8188RU's LNA power leakage workaround.
+    if chip.is_8188r {
+        set32(ctx, REG_FPGA0_XCD_RF_PARM, 1 << 1, 0)?;
+    }
+    // _DisableRFAFEAndResetBB
+    write8(ctx, REG_TXPAUSE, 0xFF)?;
+    let ac = read_rf(ctx, RF_AC)?;
+    write_rf(ctx, RF_AC, ac & !0xFF)?;
+    let a = read8(ctx, REG_APSD_CTRL)?;
+    write8(ctx, REG_APSD_CTRL, a | APSD_CTRL_OFF)?;
+    set32(ctx, REG_FPGA0_XCD_RF_PARM, FPGA0_RF_PARM_CLK_GATE, 0)?;
+    write8(ctx, REG_SYS_FUNC, SYS_FUNC_USBA | SYS_FUNC_USBD | SYS_FUNC_BB_GLB_RSTN)?;
+    write8(ctx, REG_SYS_FUNC, SYS_FUNC_USBA | SYS_FUNC_USBD)?;
+    // _ResetDigitalProcedure1: ask a running firmware to stop (the download-ready flag cleared, its
+    // interrupt mask set, the stop request in the mailbox's top byte), and wait for its CPU to go off.
+    let mut stop = FwStop::NotRunning;
+    if read8(ctx, REG_MCU_FW_DL)? as u32 & MCU_FW_DL_READY != 0 {
+        write8(ctx, REG_MCU_FW_DL, 0x00)?;
+        write8(ctx, REG_FWIMR, 0x20)?;
+        write8(ctx, REG_HMTFR + 3, 0x20)?;
+        stop = if poll(ctx, REG_SYS_FUNC, 2, FW_STOP_MS, |v| v & SYS_FUNC_CPU_ENABLE as u32 == 0)?.is_some() {
+            FwStop::Itself
+        } else {
+            // Silent: the CPU off from here, the loader and the hardware power-down left on.
+            write8(ctx, REG_SYS_FUNC + 1, ((SYS_FUNC_HWPDN | SYS_FUNC_ELDR) >> 8) as u8)?;
+            delay::hold(ctx, Budget::ms(FW_FORCED_SETTLE_MS));
+            FwStop::Forced
+        };
+    }
+    // The CPU enabled again with no firmware marked ready - as Linux leaves it; the next upload resets it.
+    write8(ctx, REG_SYS_FUNC + 1, ((SYS_FUNC_HWPDN | SYS_FUNC_ELDR | SYS_FUNC_CPU_ENABLE) >> 8) as u8)?;
+    // _DisableGPIO: every pin an input, its output value kept in the output byte; the mux likewise, and
+    // the LED pins (`0x0780`) disabled.
+    write16(ctx, REG_GPIO_PIN_CTRL + 2, 0)?;
+    let mut pins = read32(ctx, REG_GPIO_PIN_CTRL)? & 0xFFFF_00FF;
+    pins |= (pins & 0xFF) << 8;
+    pins |= 0x00FF_0000;
+    write32(ctx, REG_GPIO_PIN_CTRL, pins)?;
+    write8(ctx, REG_GPIO_MUXCFG + 3, 0)?;
+    let mut mux = read16(ctx, REG_GPIO_MUXCFG + 2)? & 0xFF0F;
+    mux |= (mux & 0x0F) << 4;
+    mux |= 0x0780;
+    write16(ctx, REG_GPIO_MUXCFG + 2, mux)?;
+    // _DisableAnalog
+    write8(ctx, REG_SPS0_CTRL, 0x23 | if chip.umc_cut_b { 1 << 3 } else { 0 })?;
+    write16(ctx, REG_APS_FSMCO, APS_FSMCO_HOST | APS_FSMCO_HW_SUSPEND | APS_FSMCO_PFM_ALDN)?;
+    write8(ctx, REG_RSV_CTRL, 0x0E)?;
+    Ok(stop)
+}
+
+/// Whether a firmware is marked ready (`MCU_FW_DL`) - after [`power_off`], the check that it took.
+pub fn firmware_ready(ctx: &ServiceContext) -> Result<bool, &'static str> {
+    Ok(read8(ctx, REG_MCU_FW_DL)? as u32 & MCU_FW_DL_READY != 0)
 }
 
 /// The host-to-firmware mailboxes (R8): four 32-bit boxes and their 16-bit extensions, taken in turn; a box's

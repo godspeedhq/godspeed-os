@@ -83,3 +83,4 @@ SRVC_RQST                          # docs/wifi-aic8800.md - Linux jh7110-trng.c,
 rtl8xxxu_gen1_set_tx_power         # docs/wifi-usb.md - Linux rtl8xxxu core.c, EXTERNAL; the calibrated transmit power R5a does not set yet
 IEEE80211_AUTH_MAX_TRIES           # docs/wifi-usb.md - Linux mac80211 mlme.c, EXTERNAL; the authentication retries R5b matches
 GENERATE_IV                        # docs/wifi-usb.md - Linux mac80211 key flag (IEEE80211_KEY_FLAG_GENERATE_IV), EXTERNAL; why the CCMP header is written by the host (R6)
+rtl8xxxu_disconnect                # docs/wifi-usb.md - Linux rtl8xxxu core.c, EXTERNAL; the unplug path that runs the power-off R9 ports

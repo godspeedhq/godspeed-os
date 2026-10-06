@@ -627,3 +627,5 @@ TXDESC32_SEQ_SHIFT                 # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h
 TXDESC32_USE_DRIVER_RATE           # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
 update_rate_mask                   # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
 WLAN_CIPHER_SUITE_CCMP             # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+rf_regulatory                      # Linux rtl8xxxu.h struct rtl8192cu_efuse field, cited by wifi-usb for the 8188RU test in the power-off (R9) - external, 26.14
+rtl8192cu_parse_efuse              # Linux rtl8xxxu 8192c.c, cited by wifi-usb for where the 8188RU is recognised (R9) - external, 26.14

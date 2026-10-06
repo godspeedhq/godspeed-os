@@ -9716,7 +9716,7 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
                     Some(OK) => {
                         let was_joined = p.get(1).copied().unwrap_or(0) != 0;
                         out.line_fmt(ctx, format_args!(
-                            "radio power cut for {}.{} s and restored{} - restarting the driver on the cold chip",
+                            "radio powered down for {}.{} s{} - restarting the driver on the cold chip",
                             OFF_UNITS / 10, OFF_UNITS % 10,
                             if was_joined { " (the network is left)" } else { "" }));
                         if let Err(e) = wifi_kill_driver(ctx) {
@@ -9911,13 +9911,13 @@ fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
             let was_joined = p.get(1).copied().unwrap_or(0) != 0;
             let changed = p.get(2).copied().unwrap_or(1) != 0;
             if p.get(3).copied() == Some(3) {
-                out.line_fmt(ctx, format_args!("radio off hard FAILED - the power pin was driven low but the chip still answers on its bus: its power did not go off"));
+                out.line_fmt(ctx, format_args!("radio off hard FAILED - the driver's check after the power-down contradicts it (an SDIO radio still answers on its bus; a USB dongle still has a firmware marked running) - the serial log has what it read"));
                 return Err(ShellError::Unknown);
             }
             if !changed {
                 out.line_fmt(ctx, format_args!("radio already off (hard)"));
             } else if p.get(3).copied() == Some(1) {
-                out.line_fmt(ctx, format_args!("{}radio off (hard) - verified: the chip no longer answers on its bus; `wifi radio on` powers it up",
+                out.line_fmt(ctx, format_args!("{}radio off (hard) - verified by its driver (an SDIO radio no longer answers on its bus; a USB dongle's firmware is stopped); `wifi radio on` powers it up",
                     if was_joined { "left the network, then " } else { "" }));
             } else if was_joined {
                 out.line_fmt(ctx, format_args!("left the network, then radio off (hard) - the chip is powered down; `wifi radio on` powers it up"));
@@ -9930,7 +9930,7 @@ fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
             // Byte 1 says whether the driver left the network before the refusal: only one that could cut
             // the power gets that far (the kernel then refusing it); one that cannot changes nothing.
             if p.get(1).copied().unwrap_or(0) != 0 {
-                out.line_fmt(ctx, format_args!("radio off hard failed - the driver left the network, then the kernel refused to cut the power; the radio is on and off the network - `wifi join` rejoins"));
+                out.line_fmt(ctx, format_args!("radio off hard failed - the driver left the network, then could not power the chip down (the kernel refused, or the device stopped answering - the serial log says which); `wifi join` rejoins, and a USB dongle that stopped answering needs unplugging"));
             } else {
                 out.line_fmt(ctx, format_args!("radio off hard failed - this radio's power is not under its driver's control (a USB dongle's is its port's); nothing changed - `wifi radio off` turns the radio off"));
             }

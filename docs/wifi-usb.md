@@ -1016,3 +1016,66 @@ first" before asking, and answered the dongle's refusal with "the kernel refused
 driver that changes nothing. The shell now asks rather than announces. On `NO_POWER_CONTROL` it reads byte
 1 (whether the driver left first): left means the kernel refused a host that could cut; not left means the
 driver has no power to cut, and nothing changed. `powercycle`'s refusal no longer blames the kernel alone.
+
+## 18. R9 (2026-10-06): `off hard` and `powercycle` for the dongle - the chip's own power-down - built, not yet run
+
+**The question that led here.** A dongle's 5 V is its USB port's, and on the Pi 2 that port is behind the
+hub the disk, the keyboard and the ethernet share. Cutting it, or even suspending the port, puts the shared
+path at risk to idle one device, so neither is done. Until R9 `off hard` on the dongle refused, and the one
+cure for a hung dongle firmware was to unplug it.
+
+**What unplugging does that software can.** Every register access is a USB control transfer to the
+dongle's own endpoint 0, answered by the chip's USB block, not its 8051. A hung firmware cannot stop
+them. Linux uses that on unplug: `rtl8xxxu_disconnect` calls `rtl8192cu_power_off` (`8192c.c`, read
+2026-10-06). R9 ports it whole (`rtl8188::power_off`), in its order:
+- **The RF and baseband:** transmit paused, the RF's mode bits zeroed, APSD off, the RF clock gated, the
+  baseband reset.
+- **The firmware:** a firmware marked ready is asked to stop, and given `FW_STOP_MS` (10 ms; Linux's 100
+  reads 50 us apart, as a time). **If it does not answer, its CPU is stopped from the host.** The log says
+  which (`FwStop`).
+- **The pins and the analog side:** the pins quiet, the regulator to its low setting, the chip suspended
+  for the host, the ISO, clock and power registers locked.
+- **The RTL8188RU's LNA workaround,** by the efuse's `rf_regulatory` bit, and the extra regulator bit
+  for a UMC chip of cut B, from `SYS_CFG`.
+
+**Through the serve loop's `Host`** (`rx.rs`), so nothing in `godspeed_wifi::serve` changes:
+- `can_cut_power` is true once a bring-up has made a station.
+- `cut_power` is the power-off.
+- `verify_off` reads `MCU_FW_DL`: no firmware marked running is `OFF_VERIFIED`.
+- `restore_power` has nothing to do in place.
+- `power_cycle` is the power-off held for the shell's 2 s.
+
+From there the shell's existing path takes over, unchanged: `on` and `powercycle` restart the driver,
+whose bring-up powers the chip on and uploads its firmware. The shell's words for the verified,
+contradicted and power-cycled cases no longer name SDIO alone.
+
+**What it cannot recover:** a dongle whose USB block has stopped answering. The power-off fails at its
+first transfer, the driver says `the dongle is not answering on USB; only unplugging it recovers that`,
+and the shell reports the refusal.
+
+**Also on this image: R8's missing pair.** The rate card still needs the small and the large ping to the
+gateway back to back.
+
+**Prediction, Pi 2, cable out, a few minutes:**
+1. `ping 192.168.10.1` then `ping bytes 1024 192.168.10.1`: the difference closes R8 (section 17).
+2. `wifi radio powercycle`. The shell prints `radio powered down for 2.0 s (the network is left) -
+   restarting the driver on the cold chip`. The log shows:
+   - `the chip powered down ... - the firmware stopped its CPU when asked` (a healthy firmware should
+     answer);
+   - `held powered down for 2000 ms`;
+   - the new instance's bring-up from the efuse on: the MAC read cold or warm (either is a result, and it
+     is recorded), the firmware uploaded, R3a done;
+   - JOINED, and the shell's `powercycle succeeded - joined ...`;
+   - `ping` answering.
+3. `wifi radio off hard`. The log shows `the chip powered down` and `checked - no firmware is marked
+   running`, and the shell `left the network, then radio off (hard) - verified by its driver ...`. `wifi
+   status` shows the powered-down state. Then `wifi radio on`: `radio powered up - starting the driver on
+   the cold chip`, the rejoin, and `ping`.
+
+**Refuted by:**
+- `the power-off stopped` with the dongle otherwise answering (a step Linux takes that this chip refuses);
+- `Forced` on a firmware that was working (the stop request wrong; the power-off still completes);
+- a bring-up after it that stops, at the efuse or `power_on` step 1 (the chip not coming back from Linux's
+  power-down the way it does under Linux);
+- `dwc2` losing the dongle while it is suspended (its bulk IN erroring into an unbind);
+- `checked - a firmware is STILL marked running`.

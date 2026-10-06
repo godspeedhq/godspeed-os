@@ -130,6 +130,8 @@ pub struct Dongle<'l> {
     cam_next: u8,
     /// `wifi radio off` took (R6b): the RF is down and the receive filters closed.
     off: bool,
+    /// For the power-off (R9).
+    chip: rtl8188::Chip,
     /// The firmware mailbox the next host-to-firmware command takes (`rtl8188::h2c`, R8).
     mbox: u8,
     /// The firmware was told the station is connected, so leaving tells it otherwise.
@@ -158,8 +160,9 @@ struct Hop {
 }
 
 impl<'l> Dongle<'l> {
-    pub fn new(mac: [u8; 6], home: u8, queues: u8, link: &'l RefCell<rx::Link>) -> Self {
+    pub fn new(mac: [u8; 6], home: u8, queues: u8, chip: rtl8188::Chip, link: &'l RefCell<rx::Link>) -> Self {
         Dongle {
+            chip,
             link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
             assoc: None, keys: None, cam_next: 0, off: false, mbox: 0, reported: false, gtk: [None; 4], gtk_reinstall: false, gtk_entry: [None; 4], ptk_in: false,
@@ -169,6 +172,11 @@ impl<'l> Dongle<'l> {
     /// The dongle's own address, from its efuse.
     pub fn address(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// What the power-off needs to know about this chip (R9, `rtl8188::power_off`).
+    pub fn chip(&self) -> rtl8188::Chip {
+        self.chip
     }
 
     /// The next 802.11 sequence number, 12 bits.

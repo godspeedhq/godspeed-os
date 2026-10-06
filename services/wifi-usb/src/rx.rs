@@ -23,7 +23,10 @@ use godspeed_wifi::rxq::RxQueue;
 use godspeed_wifi::serve::{Host, Notice};
 use godspeed_wifi::{eapol, mgmt, usbfn, wire};
 
+use crate::rtl8188;
 use crate::rtl_rx;
+use gs::driver::delay;
+use gs::driver::wait::Budget;
 
 /// Networks remembered, so each is said once. Bounded: past it, beacons are still counted, not named.
 const NETWORKS: usize = 8;
@@ -129,6 +132,9 @@ pub struct Heard<'l> {
     pub us: [u8; 6],
     /// Probe responses addressed to `us`.
     answers: u32,
+    /// The chip, once a bring-up has made a station of it: what its power-off needs (R9). `None` while
+    /// there is no dongle up, and then there is nothing to power off.
+    pub chip: Option<rtl8188::Chip>,
 }
 
 impl<'l> Heard<'l> {
@@ -136,7 +142,7 @@ impl<'l> Heard<'l> {
         Heard {
             link,
             transfers: 0, frames: 0, beacons: 0, crc: 0, cut: 0, seen: [[0; 6]; NETWORKS], n_seen: 0,
-            no_bulk_said: false, serving: Ok(None), us: [0; 6], answers: 0,
+            no_bulk_said: false, serving: Ok(None), us: [0; 6], answers: 0, chip: None,
         }
     }
 }
@@ -189,8 +195,71 @@ impl Host for Heard<'_> {
             _ => Notice::Ignored,
         }
     }
-    // No power operations: the dongle's power is its USB port's, and not this service's to cut. The loop
-    // answers `wifi radio off hard` and `powercycle` "no control over the radio's power", which is true.
+    // R9: THE CHIP'S OWN POWER-DOWN, NOT ITS PORT'S. The dongle's 5 V is its USB port's, behind the hub the
+    // disk, the keyboard and the ethernet share, and nothing here touches it. What this service can do is
+    // what Linux does when the dongle is unplugged: `rtl8188::power_off`, which stops the 8051 - by force
+    // when it does not answer - and suspends the chip, through the dongle's own control endpoint. So `off
+    // hard` stops the firmware without trusting it, and `powercycle` is that followed by the cold bring-up
+    // the shell's restart of this service runs. What it cannot recover is a dongle whose USB block no
+    // longer answers; that is said, and only unplugging it helps.
+    fn can_cut_power(&self) -> bool {
+        self.chip.is_some()
+    }
+
+    fn cut_power(&mut self, ctx: &ServiceContext) -> bool {
+        let Some(chip) = self.chip else { return false };
+        match rtl8188::power_off(ctx, chip) {
+            Ok(stop) => {
+                ctx.log_fmt(format_args!("wifi-usb: the chip powered down (Linux's rtl8192cu_power_off) - {}; R9",
+                    match stop {
+                        rtl8188::FwStop::NotRunning => "no firmware was marked running",
+                        rtl8188::FwStop::Itself => "the firmware stopped its CPU when asked",
+                        rtl8188::FwStop::Forced => "the firmware did NOT answer the stop request and its CPU was stopped from the host",
+                    }));
+                true
+            }
+            Err(why) => {
+                ctx.log_fmt(format_args!(
+                    "wifi-usb: the power-off stopped - {} - the dongle is not answering on USB; only unplugging it recovers that", why));
+                false
+            }
+        }
+    }
+
+    fn verify_off(&mut self, ctx: &ServiceContext) -> u8 {
+        match rtl8188::firmware_ready(ctx) {
+            Ok(false) => {
+                ctx.log("wifi-usb: checked - no firmware is marked running (MCU_FW_DL); the chip is suspended for the host");
+                wire::OFF_VERIFIED
+            }
+            Ok(true) => {
+                ctx.log("wifi-usb: checked - a firmware is STILL marked running after the power-off (MCU_FW_DL)");
+                wire::OFF_CONTRADICTED
+            }
+            Err(why) => {
+                ctx.log_fmt(format_args!("wifi-usb: the check after the power-off could not be read - {}", why));
+                wire::OFF_UNVERIFIED
+            }
+        }
+    }
+
+    /// Nothing to restore in place: the chip's power-down is undone by the bring-up - the power-on and the
+    /// firmware upload - which the restart the shell does next runs from the beginning.
+    fn restore_power(&mut self, ctx: &ServiceContext) -> bool {
+        ctx.log("wifi-usb: `on` after the chip's power-down - the restart that follows powers it on and uploads its firmware");
+        true
+    }
+
+    /// The power-down, held for `units` of 100 ms. The power-on is the restarted service's bring-up.
+    fn power_cycle(&mut self, ctx: &ServiceContext, units: u8) -> bool {
+        if !self.cut_power(ctx) {
+            return false;
+        }
+        delay::hold(ctx, Budget::ms(units as u64 * 100));
+        ctx.log_fmt(format_args!(
+            "wifi-usb: held powered down for {} ms - the restart that follows brings the chip up cold", units as u32 * 100));
+        true
+    }
 }
 
 /// How far apart the join's own asks are (`wait_frames`): often enough that a 200 ms answer window holds
