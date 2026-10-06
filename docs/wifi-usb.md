@@ -1588,7 +1588,7 @@ of 96 routing slots free, reserve 72`), as the audit expected - and none ever to
 part of the prediction the card refuted (above). Each still joined in 5 to 6 s on the `OP_SYNC`
 fallback, so this costs nothing visible today; giving an on-demand driver a mailbox is `backlog/74`'s.
 
-## 27. `xhci` reports the dongle too, and the Pi 4 and VisionFive carry `wifi-usb` beside their onboard radio (2026-10-06) - the reports hardware-verified on the Pi 4; the bring-up through the Pi 4's `xhci` fails
+## 27. `xhci` reports the dongle too, and the Pi 4 and VisionFive carry `wifi-usb` beside their onboard radio (2026-10-06) - hardware-verified on the Pi 4: the reports, the unplug, and U2a's bring-up through its `xhci`
 
 Section 26's mechanism on the second host. The card is the Pi 4, at the operator's choice (*"easier to
 test on the pi4/visionfive ... then later on on the x86 machines"*): its debug console is on the GPIO
@@ -1761,3 +1761,22 @@ the doorbell does not restart. The first error may be the dongle's own - `dwc2` 
 download too, which is why it re-runs a failed stage (R2c) - but the dead endpoint after the repair is
 this host's. **The next card measures it:** every logged failure gives the endpoint's state, and every
 repair says what it left.
+
+**U2a on the Pi 4 (2026-10-06, `build/pi4_xhci_u2a_pass.log`): as predicted, to `no bulk IN`.** No failed
+transfer and no repair. The efuse, `R1 done`, the transmit queues, the firmware in 126 blocks `in 18 ms (1
+try)` and `RUNNING`, `R3a done` (channel 1 read back from the RF chip), and the transmit power written
+and read back (`R11 done`), then `receive did not start - the host has no bulk IN for this dongle`.
+
+| Step | `xhci` (Pi 4, VL805) | `xhci` (T630) | `dwc2` (Pi 2) |
+|---|---|---|---|
+| firmware | 18 ms | 71 ms | 146 ms |
+| MAC, baseband and RF tables | 417 ms | 778 ms | about 1500 ms |
+
+**Still open, and recorded rather than closed:** the previous run's `cc=4` on the first firmware block did
+not recur, so it is intermittent - and when it happens, the repair leaves an endpoint whose transfers all
+time out. That is this host's to fix. The instrument stays in, silent unless a transfer fails: the next
+occurrence says the endpoint's state at the failure and what the repair left.
+
+The U2a work on the Pi 4, in order of what each run showed: the reports and the hub-port unplug watch
+(confirmed), the wrap's TRB Error located at the Link's slot (measured), a zeroed next page and a cleared
+ring (both refuted as the cure, both kept as correct ring hygiene), the eager Link (confirmed).

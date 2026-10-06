@@ -1,4 +1,4 @@
-# USB device drivers on demand - HARDWARE-VERIFIED ON THE PI 2 (`dwc2`); `xhci` BUILT, its Pi 4 card owed (2026-10-06)
+# USB device drivers on demand - HARDWARE-VERIFIED ON THE PI 2 (`dwc2`); `xhci` HARDWARE-VERIFIED ON THE PI 4 (2026-10-06)
 
 Agreed with the operator on 2026-10-06, while the USB WiFi dongle was being brought to `xhci`
 (`docs/wifi-usb.md` section 7, U2): *"I would like the connected device to be recognised and the
