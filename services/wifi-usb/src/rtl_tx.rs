@@ -68,15 +68,55 @@ pub fn mgmt(frame_len: u16, seq: u16, group: bool) -> [u8; TX_DESC_LEN] {
 /// receiver (`rtl8xxxu_tx` sets it when mac80211 hands the frame a hardware key).
 const DW1_SEC_AES: u32 = 0x00C0_0000;
 
-/// The descriptor for a protected unicast DATA frame - the link's traffic once the keys are in (R6) - on the
-/// best-effort queue, for the chip to encrypt (`DW1_SEC_AES`), signed. At the driver's rate, for the reason
-/// `eapol` gives.
-pub fn protected(frame_len: u16, seq: u16) -> [u8; TX_DESC_LEN] {
-    let mut d = driver_rate(frame_len, seq, false, QUEUE_BE);
-    let dw1 = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) | DW1_SEC_AES;
+/// `txdw5`'s data bits for a frame the FIRMWARE picks the rate of: `fill_txdesc_v1` ORs `0x0001ff00` in for
+/// every data frame, and sets no driver rate - the rate is the firmware's, adapting within the mask the
+/// driver gave it after the association (`rtl8188::rate_mask`, R8).
+const DW5_DATA: u32 = 0x0001_FF00;
+
+/// The descriptor for a unicast DATA frame - the link's traffic (R6) - on the best-effort queue, protected
+/// for the chip to encrypt (`DW1_SEC_AES`) when `protected`, signed. Since R8 the rate is the firmware's
+/// choice, as `rtl8xxxu_fill_txdesc_v1` leaves it for a data frame; R6 sent these at the driver's 1 Mb/s.
+pub fn data(frame_len: u16, seq: u16, protected: bool) -> [u8; TX_DESC_LEN] {
+    let mut d = [0u8; TX_DESC_LEN];
+    d[0..2].copy_from_slice(&frame_len.to_le_bytes());
+    d[2] = TX_DESC_LEN as u8;
+    d[3] = DW0_OWN | DW0_FIRST_SEGMENT | DW0_LAST_SEGMENT;
+    let dw1 = (QUEUE_BE << DW1_QUEUE_SHIFT) | DW1_AGG_BREAK | if protected { DW1_SEC_AES } else { 0 };
     d[4..8].copy_from_slice(&dw1.to_le_bytes());
+    let dw3 = ((seq as u32) & 0x0FFF) << DW3_SEQ_SHIFT;
+    d[12..16].copy_from_slice(&dw3.to_le_bytes());
+    d[20..24].copy_from_slice(&DW5_DATA.to_le_bytes());
     sign(&mut d);
     d
+}
+
+/// The rates `rtl8xxxu`'s table lists, in its order (`rtl8xxxu_legacy_ratetable`: 1, 2, 5.5, 11, then 6 to
+/// 54 Mb/s), in the 500 kb/s units a rate element carries. A rate's position is its bit in the mask.
+const LEGACY_RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+
+/// The rate mask for the firmware (`update_rate_mask`'s `ramask`, the legacy part of
+/// `sta->deflink.supp_rates[0]`): a bit for each rate the access point lists in its Supported Rates (1) and
+/// Extended Supported Rates (50) elements. Basic-rate flags (bit 7) are ignored; a rate this chip does not
+/// list is ignored; an element walk that would run past the end stops - the lengths are from the air.
+pub fn rate_mask(ies: &[u8]) -> u32 {
+    let mut mask = 0u32;
+    let mut at = 0usize;
+    while at + 2 <= ies.len() {
+        let (id, len) = (ies[at], ies[at + 1] as usize);
+        let end = at + 2 + len;
+        if end > ies.len() {
+            break;
+        }
+        if id == 1 || id == 50 {
+            for &r in &ies[at + 2..end] {
+                if let Some(i) = LEGACY_RATES.iter().position(|&x| x == r & 0x7F) {
+                    mask |= 1 << i;
+                }
+            }
+        }
+        at = end;
+    }
+    mask
 }
 
 /// The descriptor for an unprotected unicast DATA frame - an EAPOL frame of the four-way handshake (R5c) -
@@ -84,9 +124,10 @@ pub fn protected(frame_len: u16, seq: u16) -> [u8; TX_DESC_LEN] {
 ///
 /// **A deliberate difference from Linux, recorded (26.14).** `fill_txdesc_v1` sends a data frame at the
 /// rate the chip's firmware chooses, from the rate mask `rtl8xxxu_bss_info_changed` hands it once the
-/// association is up (`update_rate_mask`), which this driver does not send yet. Until it does, the handshake's
-/// frames go at the driver's rate - 1 Mb/s with a retry limit of 6, as the management frames do - the one
-/// rate every access point takes. The data rates are R6's.
+/// association is up (`update_rate_mask`). This driver hands it over after the handshake instead (R8,
+/// `rtl8188::joined`), so the handshake's frames go at the driver's rate - 1 Mb/s with a retry limit of 6,
+/// as the management frames do - the one rate every access point takes. Four small frames; the link's
+/// traffic after them is `data`'s.
 pub fn eapol(frame_len: u16, seq: u16) -> [u8; TX_DESC_LEN] {
     driver_rate(frame_len, seq, false, QUEUE_BE)
 }
@@ -167,8 +208,27 @@ mod tests {
     }
 
     #[test]
+    fn a_data_descriptor_leaves_the_rate_to_the_firmware() {
+        let d = data(120, 3, false);
+        assert_eq!(word(&d, 16), 0, "no driver rate");
+        assert_eq!(word(&d, 20), 0x0001_FF00, "fill_txdesc_v1's data bits");
+        assert_eq!(word(&d, 4), 0x0040, "queue BE, AGG_BREAK, not protected");
+    }
+
+    #[test]
+    fn the_rate_mask_reads_both_rate_elements() {
+        // 1, 2, 5.5, 11 (basic) and 6, 9, 12, 18 in Supported Rates; 24, 36, 48, 54 extended - all twelve.
+        let ies = [0, 0, 1, 8, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24, 3, 1, 1, 50, 4, 0x30, 0x48, 0x60, 0x6C];
+        assert_eq!(rate_mask(&ies), 0xFFF);
+        // A g-only network (no CCK): the four low bits clear.
+        let g = [1, 8, 0x8C, 0x12, 0x98, 0x24, 0xB0, 0x48, 0x60, 0x6C];
+        assert_eq!(rate_mask(&g), 0xFF0);
+        assert_eq!(rate_mask(&[1, 9, 2]), 0, "an element longer than what is left stops the walk");
+    }
+
+    #[test]
     fn a_protected_descriptor_asks_the_chip_for_ccmp() {
-        let d = protected(120, 3);
+        let d = data(120, 3, true);
         assert_eq!(word(&d, 4), 0x00C0_0040, "SEC_AES, queue BE, AGG_BREAK");
         let x = d.chunks_exact(2).fold(0u16, |a, w| a ^ u16::from_le_bytes([w[0], w[1]]));
         assert_eq!(x, 0, "signed after the security bits went in");

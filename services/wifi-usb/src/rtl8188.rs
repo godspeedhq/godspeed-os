@@ -616,6 +616,61 @@ pub fn clear_key(ctx: &ServiceContext, entry: u8) -> Result<(), &'static str> {
     write32(ctx, REG_CAM_CMD, CAM_CMD_POLLING | CAM_CMD_WRITE | ((entry as u32) << CAM_CMD_KEY_SHIFT))
 }
 
+/// The host-to-firmware mailboxes (R8): four 32-bit boxes and their 16-bit extensions, taken in turn; a box's
+/// bit in `REG_HMTFR` is set while the firmware has not yet read it.
+const REG_HMTFR: u16 = 0x01CC;
+const REG_HMBOX_0: u16 = 0x01D0;
+const REG_HMBOX_EXT_0: u16 = 0x0088;
+const H2C_MAX_MBOX: u8 = 4;
+/// `H2C_SET_RATE_MASK` (6, with `H2C_EXT`: the command has extension bytes) and `H2C_JOIN_BSS_REPORT` (2).
+const H2C_SET_RATE_MASK: u8 = 6 | 0x80;
+const H2C_JOIN_BSS_REPORT: u8 = 2;
+/// How long a mailbox may stay unread. Linux tries 100 reads; a count is not a duration, so this is the
+/// time those reads take over USB with room.
+const MBOX_FREE_MS: u64 = 20;
+const REG_BCN_MAX_ERR: u16 = 0x055D;
+const REG_BCN_PSR_RPT: u16 = 0x06A8;
+const REG_FWHW_TXQ_CTRL: u16 = 0x0420;
+const REG_TBTT_PROHIBIT: u16 = 0x0540;
+
+/// One host-to-firmware command, `rtl8xxxu_gen1_h2c_cmd`: wait for mailbox `mbox` to be free, write the
+/// extension (bytes 4-5) first when there is one, then the box (bytes 0-3); the next command takes the next box.
+fn h2c(ctx: &ServiceContext, mbox: &mut u8, cmd: &[u8; 6], len: usize) -> Result<(), &'static str> {
+    let nr = *mbox % H2C_MAX_MBOX;
+    if poll(ctx, REG_HMTFR, 1, MBOX_FREE_MS, |v| v & (1 << nr) == 0)?.is_none() {
+        return Err("the firmware's mailbox stayed busy");
+    }
+    if len > 4 {
+        write16(ctx, REG_HMBOX_EXT_0 + nr as u16 * 2, u16::from_le_bytes([cmd[4], cmd[5]]))?;
+    }
+    write32(ctx, REG_HMBOX_0 + nr as u16 * 4, u32::from_le_bytes([cmd[0], cmd[1], cmd[2], cmd[3]]))?;
+    *mbox = (nr + 1) % H2C_MAX_MBOX;
+    Ok(())
+}
+
+/// R8, what `rtl8xxxu_bss_info_changed` does once associated, in its order: the rate mask to the firmware
+/// (`rtl8xxxu_update_rate_mask`: `mask_hi`, `arg` 0x80 - no short guard interval - and `mask_lo`, in
+/// `struct h2c_cmd`'s `ramask` layout), `REG_BCN_MAX_ERR`, the port's beacon transmission stopped
+/// (`rtl8xxxu_stop_tx_beacon`), `REG_BCN_PSR_RPT` with the association ID, and the connect report
+/// (`rtl8xxxu_gen1_report_connect`). With these the firmware adapts the data rate within `mask`.
+pub fn joined(ctx: &ServiceContext, mbox: &mut u8, mask: u32, aid: u16) -> Result<(), &'static str> {
+    let ramask = [H2C_SET_RATE_MASK, (mask >> 16) as u8, (mask >> 24) as u8, 0x80, mask as u8, (mask >> 8) as u8];
+    h2c(ctx, mbox, &ramask, 6)?;
+    write8(ctx, REG_BCN_MAX_ERR, 0xFF)?;
+    let q = read8(ctx, REG_FWHW_TXQ_CTRL + 2)?;
+    write8(ctx, REG_FWHW_TXQ_CTRL + 2, q & !(1 << 6))?;
+    write8(ctx, REG_TBTT_PROHIBIT + 1, 0x64)?;
+    let t = read8(ctx, REG_TBTT_PROHIBIT + 2)?;
+    write8(ctx, REG_TBTT_PROHIBIT + 2, t & !1)?;
+    write16(ctx, REG_BCN_PSR_RPT, 0xC000 | aid)?;
+    h2c(ctx, mbox, &[H2C_JOIN_BSS_REPORT, 1, 0, 0, 0, 0], 2)
+}
+
+/// The connect report's other half, on leaving (`report_connect(..., false)`).
+pub fn left(ctx: &ServiceContext, mbox: &mut u8) -> Result<(), &'static str> {
+    h2c(ctx, mbox, &[H2C_JOIN_BSS_REPORT, 0, 0, 0, 0, 0], 2)
+}
+
 /// `REG_BSSID`: the network the station is joining, six bytes.
 const REG_BSSID: u16 = 0x0618;
 

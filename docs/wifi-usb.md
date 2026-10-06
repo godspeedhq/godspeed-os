@@ -942,3 +942,49 @@ a dongle fault: the order is the shared serve loop's. It now asks `Host::can_cut
 host that cannot (the default, so the dongle) is answered "no power control" with nothing changed, still on
 the network. `wifi-driver`'s SDIO host says it can, so the Pi 4's and the VisionFive's hard off is
 unchanged.
+
+## 17. R8 (2026-10-06): the data rate is the firmware's - built, not yet run
+
+Since R6 every data frame went at the driver's rate, 1 Mb/s, the rate the management frames use. Linux
+does not send data that way. Once associated, `rtl8xxxu_bss_info_changed` gives the chip's firmware the
+access point's rates as a mask (`update_rate_mask`, the `H2C_SET_RATE_MASK` command), and
+`fill_txdesc_v1` leaves a data frame's rate to the firmware, which adapts it within that mask.
+
+**What R8 does**, in Linux's order (`rtl8188::joined`, called once the handshake has the link JOINED):
+- the rate mask through the host-to-firmware mailbox (`h2c`). Four boxes taken in turn, each waited on
+  until the firmware has read it (`REG_HMTFR`), the extension bytes written before the box;
+- `REG_BCN_MAX_ERR`;
+- the port's beacon transmission stopped;
+- `REG_BCN_PSR_RPT` with the association ID;
+- the connect report.
+
+Leaving sends the disconnect report.
+
+**The mask** comes from the Supported Rates and Extended Supported Rates elements of the access point's
+probe response, which the find already reads (`rtl_tx::rate_mask`, host-tested). There is one bit per rate
+in `rtl8xxxu_legacy_ratetable`'s order: 1, 2, 5.5 and 11 Mb/s in bits 0-3, and 6 to 54 Mb/s in bits 4-11.
+A typical 802.11g access point gives `0xfff`.
+
+**The descriptor.** Data frames now take `rtl_tx::data`: no `USE_DRIVER_RATE`, `txdw5` = `0x0001ff00`, as
+`fill_txdesc_v1` writes for data. The handshake's four frames still go at 1 Mb/s, being sent before the
+mask (`eapol`, its comment records why). No 802.11n rates: the station offers no HT element, so the
+association is legacy, and HT is a later card.
+
+**Also on this image: the R7b fix** (section 16): `wifi radio off hard` on the dongle answers that there is
+no power control and stays on the network.
+
+**Prediction:** at JOINED, `the firmware has the rate mask 0x... and the association; it picks the data rate
+from here`, with a mask of `0xff0` or more. Then the lease, then `ping` against the gateway with small and
+large payloads.
+- The difference is in the uplink. At 1 Mb/s a 1024-byte request is about 8.5 ms in the air before any
+  retry. Within the mask it is a fraction of a millisecond.
+- So the large ping's round trip should drop by several milliseconds compared with an R7 run, and stay
+  within a couple of milliseconds of the small one. The same pings on the R7 image are the baseline if a
+  comparison is needed.
+- `wifi radio off hard` answers "no power control", and `wifi status` still shows the join.
+
+**Refuted by:**
+- `the firmware's mailbox stayed busy` (the firmware not reading its mailbox);
+- `the firmware was not given the rates`;
+- the lease or the pings failing where R6 succeeded (a data descriptor the chip refuses or sends badly);
+- no change in the large ping's time (the firmware not adapting, or the mask not taking).

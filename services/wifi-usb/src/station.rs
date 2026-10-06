@@ -80,6 +80,8 @@ struct Assoc {
     channel: u8,
     aid: u16,
     rssi: i16,
+    /// The access point's rates as the firmware's mask (`rtl_tx::rate_mask`, R8).
+    rates: u32,
 }
 
 /// The network a join found: where it is, and what its beacon or probe response says about it.
@@ -91,6 +93,7 @@ struct Found {
     capability: u16,
     /// `mgmt::rsn_is_ccmp`: `None` with no RSN element (an open or WEP network).
     ccmp: Option<bool>,
+    rates: u32,
 }
 
 /// The dongle, brought up: its address, the channel it rests on, and the sweep when one is running.
@@ -127,6 +130,10 @@ pub struct Dongle<'l> {
     cam_next: u8,
     /// `wifi radio off` took (R6b): the RF is down and the receive filters closed.
     off: bool,
+    /// The firmware mailbox the next host-to-firmware command takes (`rtl8188::h2c`, R8).
+    mbox: u8,
+    /// The firmware was told the station is connected, so leaving tells it otherwise.
+    reported: bool,
     /// The group key in each key-id slot, as installed - kept ONLY to refuse a reinstall of the same key,
     /// the group half of the KRACK attack: an access point, or someone replaying its frames, sending a
     /// group key the station already holds would, reinstalled, reset that key's replay counter. wpa_supplicant
@@ -155,7 +162,7 @@ impl<'l> Dongle<'l> {
         Dongle {
             link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
-            assoc: None, keys: None, cam_next: 0, off: false, gtk: [None; 4], gtk_reinstall: false, gtk_entry: [None; 4], ptk_in: false,
+            assoc: None, keys: None, cam_next: 0, off: false, mbox: 0, reported: false, gtk: [None; 4], gtk_reinstall: false, gtk_entry: [None; 4], ptk_in: false,
         }
     }
 
@@ -237,6 +244,7 @@ impl<'l> Dongle<'l> {
                                 rssi,
                                 capability: b.capability(),
                                 ccmp: mgmt::rsn_is_ccmp(b.elements()),
+                                rates: rtl_tx::rate_mask(b.elements()),
                             });
                         }
                     }
@@ -266,6 +274,12 @@ impl<'l> Dongle<'l> {
         let n = mgmt::deauth(&self.mac, bssid, seq, REASON_LEAVING, &mut f);
         if let Err(why) = self.send_mgmt(ctx, &f[..n], seq, false) {
             ctx.log_fmt(format_args!("wifi-usb: the deauthentication was not sent - {}", why));
+        }
+        if self.reported {
+            self.reported = false;
+            if let Err(why) = rtl8188::left(ctx, &mut self.mbox) {
+                ctx.log_fmt(format_args!("wifi-usb: the firmware was not told the station left - {}", why));
+            }
         }
         let _ = rtl8188::set_bssid(ctx, &[0; 6]);
         self.drop_keys(ctx);
@@ -454,7 +468,7 @@ impl<'l> Dongle<'l> {
             }
         }
         match assoc {
-            Some((0, aid)) => Ok(Assoc { bssid: b, channel: net.channel, aid, rssi: net.rssi }),
+            Some((0, aid)) => Ok(Assoc { bssid: b, channel: net.channel, aid, rssi: net.rssi, rates: net.rates }),
             Some((st, _)) => {
                 ctx.log_fmt(format_args!("wifi-usb: join - the access point refused the association, status {}", st));
                 self.leave(ctx, &b);
@@ -561,6 +575,18 @@ impl Station for Dongle<'_> {
         if outcome == Outcome::Joined {
             self.pn = 0;
             self.link.borrow_mut().joined(a.bssid);
+            // R8: the firmware told what the link is - the access point's rates, the association - so it
+            // adapts the data rate within them, as Linux's `bss_info_changed` does once associated.
+            match rtl8188::joined(ctx, &mut self.mbox, a.rates, a.aid) {
+                Ok(()) => {
+                    self.reported = true;
+                    ctx.log_fmt(format_args!(
+                        "wifi-usb: join - the firmware has the rate mask {:#05x} and the association; it picks the data rate from here",
+                        a.rates));
+                }
+                Err(why) => ctx.log_fmt(format_args!(
+                    "wifi-usb: join - the firmware was not given the rates ({}) - data falls back to its own default", why)),
+            }
             ctx.log("wifi-usb: join - JOINED; frames to and from the network go through nic-driver when the cable is out (R6)");
         } else {
             self.leave(ctx, &a.bssid);
@@ -653,7 +679,7 @@ impl Station for Dongle<'_> {
         if n == 0 {
             return false;
         }
-        let desc = if keyed { rtl_tx::protected(n as u16, seq) } else { rtl_tx::eapol(n as u16, seq) };
+        let desc = rtl_tx::data(n as u16, seq, keyed);
         let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + godspeed_wifi::rxq::FRAME_MAX + data::DATA_OVERHEAD + data::CCMP_HEADER];
         req[0] = usbfn::OP_BULK_OUT;
         req[1] = rtl_tx::be_out(self.queues);
