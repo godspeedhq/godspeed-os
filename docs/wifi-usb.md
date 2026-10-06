@@ -698,3 +698,62 @@ That is 17 for the boot join (13 probes, the authentication, two association req
 deauthentication), 13 for a `wifi scan` between the joins, and 16 for the second join, whose association
 answered first time. The shell's `wifi leave` between joins answered `nothing to leave - not joined`, which
 is true.
+
+## 13. R5c (2026-10-06): the WPA2 four-way handshake - JOINED - built, NOT YET RUN
+
+R5b's join, and then what R5b left out: the keys. The handshake itself is not new code. It is
+`godspeed_wifi::supplicant::Handshake`, the runner the Pi 4's Broadcom and the VisionFive's AIC8800 already
+join through. A radio supplies it a `KeyPath`: how an EAPOL frame leaves the station, and how a key reaches
+the chip. The dongle's station is that `KeyPath` now.
+
+**Frames in.** After the association, `rx::wait_frames` (R5b's paced ask, bounded here by 8 s) reads each
+unprotected data frame from the access point. `godspeed_wifi::data::llc_payload` takes off the 802.11
+header and the LLC/SNAP, and an EAPOL frame (ethertype `888e`) to us goes to the supplicant as the ethernet
+frame it expects (`data::to_ethernet`). The chip passes data frames up because R3a set `REG_RXFLTMAP2` to
+`0xFFFF`, as `rtl8xxxu_start` does, and they are addressed to the address R5a set. A deauthentication or
+disassociation from the access point ends the wait. If message 2 had been sent, the supplicant's reading
+applies: our key is not its key.
+
+**Frames out.** The supplicant's message 2 and message 4, as ethernet, become 802.11 data frames to the
+access point (`data::to_80211`: non-QoS, To DS, LLC/SNAP). They go on the best-effort queue's endpoint, which
+is `out_ep[bep]` in `rtl8xxxu_init_queue_priority`: position 1 for this dongle's two queues. **A deliberate
+difference from Linux:** they go at the driver's rate, 1 Mb/s, not the firmware's choice, because the rate
+mask Linux hands the firmware after associating (`update_rate_mask`) is not sent yet (`rtl_tx::eapol`).
+
+**Keys.** `rtl8188::install_key` follows `rtl8xxxu_set_key` and `rtl8xxxu_cam_write`. It sets
+`CR_SECURITY_ENABLE` and `REG_SECURITY_CFG`'s six enables, then writes six CAM words for the entry, highest
+first, each committed through `REG_CAM_CMD` with 100 us after it. The control word holds the CCMP cipher
+(the suite's low nibble, 4), the key id, the valid bit, and the group flag for a group key. The pairwise
+key goes into entry 0 against the access point's address and the group key into entry 1 against the BSSID:
+first free, as Linux allocates them on a fresh join. Leaving empties them (`DISABLE_KEY`'s zero control
+word) and zeroes the kept keys.
+
+**What JOINED means here, and what it does not.** The association stays up and `wifi status` shows it: the
+BSSID, the channel, and the signal as the find heard it, not a fresh reading. Nothing yet sends or receives
+data through it (R6), and nothing answers the access point's group rekey (R7). So an access point that
+rekeys on a timer will eventually see no answer and may drop the station. A dropped link is not noticed
+until R6.
+
+**`who`, done.** The supplicant and `eapol` logged as `wifi-driver:`, recorded as debt at R4 for exactly
+this card. `Handshake::new`, `group_rekey` and `eapol::describe` now take the service's name.
+`wifi-driver`'s callers pass `"wifi-driver"`, so its lines read as before.
+
+**One-way, kept.** The 802.11-to-ethernet conversion was the AIC8800's (`aic_wire.rs`). It is 802.11, so it
+moved to `sdk/wifi/src/data.rs` with its test rather than being written a second time, and the AIC8800
+imports it from there. The new direction, `to_80211`, is beside it, host-tested.
+
+**Prediction for the card** (the Pi 2, the dongle in, the key stored):
+
+1. **At boot, the auto-join** - R5b's lines, `ASSOCIATED, association ID n`, then the supplicant's, each
+   opening `wifi-usb:`: `EAPOL-Key from <the access point> - message 1`, `message 2 of 4 sent`, `EAPOL-Key
+   ... message 3`, `message 3 verified ...; message 4 sent`, then `pairwise key 0 in CAM entry 0`, `group key
+   n in CAM entry 1`, `JOINED - handshake complete ...` and `join - JOINED; R5c done`.
+2. `wifi status`: joined to the network, its BSSID and channel 1.
+3. `wifi leave`: left, and `wifi join` joins again with the stored key.
+
+**Refuted by:** `the handshake reached no verdict` with no handshake frames, meaning message 1 never reached
+us: the data frame filter, or the access point waiting for something an association without WMM or HT does
+not give it. Message 1 repeated until `INCORRECT PASSPHRASE` with the right key means message 2 does not
+reach the access point, or reaches it wrong: the data path out, its endpoint, its LLC/SNAP. `message 3's MIC
+does not verify` means the key derivation, which is shared and verified on two other radios, so more likely
+the addresses fed into it. `the key did not go into the CAM` means the CAM write.

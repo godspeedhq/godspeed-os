@@ -525,6 +525,63 @@ pub fn set_station(ctx: &ServiceContext, mac: &[u8; 6]) -> Result<(), &'static s
     Ok(())
 }
 
+/// The key store (R5c): `REG_CR`'s security enable, `REG_SECURITY_CFG`, and the CAM - written a word at a
+/// time through `REG_CAM_WRITE`, each word committed by a command in `REG_CAM_CMD`.
+// `REG_CR` is the power-on's, above.
+const CR_SECURITY_ENABLE: u16 = 1 << 9;
+const REG_SECURITY_CFG: u16 = 0x0680;
+/// `rtl8xxxu_set_key`'s value: TX and RX encryption on, and the default keys used for TX, RX and both
+/// directions' broadcast - `SEC_CFG_TX_SEC_ENABLE | SEC_CFG_TXBC_USE_DEFKEY | SEC_CFG_RX_SEC_ENABLE |
+/// SEC_CFG_RXBC_USE_DEFKEY | SEC_CFG_TX_USE_DEFKEY | SEC_CFG_RX_USE_DEFKEY`.
+const SECURITY_CFG: u8 = (1 << 2) | (1 << 6) | (1 << 3) | (1 << 7) | (1 << 0) | (1 << 1);
+// `REG_CAM_CMD` is R3a's, above, where the init clears the CAM.
+const CAM_CMD_POLLING: u32 = 1 << 31;
+const CAM_CMD_WRITE: u32 = 1 << 16;
+const CAM_CMD_KEY_SHIFT: u32 = 3;
+const REG_CAM_WRITE: u16 = 0x0674;
+const CAM_WRITE_VALID: u32 = 1 << 15;
+/// The CAM's cipher field for CCMP: `rtl8xxxu_cam_write` takes the cipher suite's low nibble, which for
+/// `WLAN_CIPHER_SUITE_CCMP` (00-0F-AC:4) is 4, into bits 4:2.
+const CAM_CIPHER_CCMP: u32 = 4 << 2;
+/// A group key's flag in the control word: `BIT(6)` when the key is not `IEEE80211_KEY_FLAG_PAIRWISE`.
+const CAM_GROUP: u32 = 1 << 6;
+
+/// R5c: a CCMP key into CAM entry `entry` - `rtl8xxxu_set_key`'s security enables, then
+/// `rtl8xxxu_cam_write`: six words, the highest first, words 2-5 the key, word 1 the address's last four
+/// bytes, word 0 the control word (cipher, key id, valid, and the group flag) with the address's first two;
+/// each committed with a write command and 100 us. `mac` is the peer for a pairwise key and the BSSID for a
+/// group key, as Linux passes them.
+pub fn install_key(
+    ctx: &ServiceContext, entry: u8, key_id: u8, key: &[u8; 16], mac: &[u8; 6], group: bool,
+) -> Result<(), &'static str> {
+    let cr = read16(ctx, REG_CR)?;
+    write16(ctx, REG_CR, cr | CR_SECURITY_ENABLE)?;
+    write8(ctx, REG_SECURITY_CFG, SECURITY_CFG)?;
+    let ctrl = CAM_CIPHER_CCMP | (key_id as u32 & 0x3) | CAM_WRITE_VALID | if group { CAM_GROUP } else { 0 };
+    let addr = (entry as u32) << CAM_CMD_KEY_SHIFT;
+    for j in (0..6u32).rev() {
+        let v = match j {
+            0 => ctrl | (mac[0] as u32) << 16 | (mac[1] as u32) << 24,
+            1 => u32::from_le_bytes([mac[2], mac[3], mac[4], mac[5]]),
+            _ => {
+                let i = ((j - 2) * 4) as usize;
+                u32::from_le_bytes([key[i], key[i + 1], key[i + 2], key[i + 3]])
+            }
+        };
+        write32(ctx, REG_CAM_WRITE, v)?;
+        write32(ctx, REG_CAM_CMD, CAM_CMD_POLLING | CAM_CMD_WRITE | (addr + j))?;
+        delay::hold(ctx, Budget::us(100));
+    }
+    Ok(())
+}
+
+/// A CAM entry emptied - `rtl8xxxu_set_key`'s `DISABLE_KEY`: zero written to the entry's control word, which
+/// clears its valid bit.
+pub fn clear_key(ctx: &ServiceContext, entry: u8) -> Result<(), &'static str> {
+    write32(ctx, REG_CAM_WRITE, 0)?;
+    write32(ctx, REG_CAM_CMD, CAM_CMD_POLLING | CAM_CMD_WRITE | ((entry as u32) << CAM_CMD_KEY_SHIFT))
+}
+
 /// `REG_BSSID`: the network the station is joining, six bytes.
 const REG_BSSID: u16 = 0x0618;
 

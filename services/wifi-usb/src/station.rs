@@ -17,10 +17,11 @@
 //! **The join, so far (R5b).** Find the network by a probe that NAMES it, on each channel, keeping the
 //! strongest answer; tune there and set the chip's BSSID; Open System authentication, then the association
 //! request - each answer awaited 200 ms and tried three times, mac80211's `IEEE80211_AUTH_TIMEOUT` and
-//! `_MAX_TRIES` and their `ASSOC` twins (`net/mac80211/mlme.c`). Then, since the four-way handshake is R5c,
-//! it says how far it got, leaves with a deauthentication, and reports the join failed: an association with
-//! no keys carries nothing, and calling it joined would be the lie. The frame path is R6; the link is
-//! reported as not associated.
+//! `_MAX_TRIES` and their `ASSOC` twins (`net/mac80211/mlme.c`). Then (R5c) the WPA2 four-way handshake, run
+//! by the supplicant every radio shares (`godspeed_wifi::supplicant`) over this station as its `KeyPath`:
+//! EAPOL frames go out as 802.11 data frames (`godspeed_wifi::data::to_80211`) and come in the same way,
+//! and the two keys go into the chip's CAM (`rtl8188::install_key`). A join that reaches `JOINED` stays
+//! joined; the frame path is R6.
 
 use godspeed as gs;
 use gs::driver::wait::{Budget, Since};
@@ -30,7 +31,8 @@ use godspeed_wifi::rxq::RxQueue;
 use godspeed_wifi::station::{Link, Outcome, Pulled, ScanStep, Secret, Station};
 use godspeed_wifi::wire;
 
-use godspeed_wifi::{eapol, mgmt, usbfn};
+use godspeed_wifi::supplicant::{self, Handshake, KeyPath, Keys, Step};
+use godspeed_wifi::{data, eapol, mgmt, usbfn};
 
 use crate::{rtl8188, rtl_rx, rtl_tx, rx};
 
@@ -57,6 +59,27 @@ const TRIES: u32 = 3;
 const LISTEN_INTERVAL: u16 = 10;
 /// Deauthentication reason 3: "deauthenticated because sending STA is leaving".
 const REASON_LEAVING: u16 = 3;
+/// How long the handshake may take once associated. An access point resends message 1 when it hears no
+/// message 2 and gives up after a few tries, so a wrong key shows as message 1 repeated (the supplicant
+/// counts it) or as the access point leaving; this bound is for an access point that does neither. CHOSEN:
+/// about four of the one-second retries an access point is commonly configured with, and room.
+const HANDSHAKE_MS: u64 = 8_000;
+/// The EAPOL ethertype (802.1X), which marks a handshake frame inside an 802.11 data frame.
+const ETHERTYPE_EAPOL: u16 = 0x888e;
+/// The longest EAPOL frame this station takes in or sends, as ethernet: the supplicant's own message buffer.
+const EAPOL_MAX: usize = 14 + 99 + 64 + 512;
+/// Frame control first bytes of the two frames by which an access point ends an association.
+const FC_DEAUTH: u8 = 0xC0;
+const FC_DISASSOC: u8 = 0xA0;
+
+/// An association that held: to whom, where, its ID, and the signal the find heard.
+#[derive(Clone, Copy)]
+struct Assoc {
+    bssid: [u8; 6],
+    channel: u8,
+    aid: u16,
+    rssi: i16,
+}
 
 /// The network a join found: where it is, and what its beacon or probe response says about it.
 #[derive(Clone, Copy)]
@@ -82,6 +105,16 @@ pub struct Dongle {
     /// Probe requests the host took, and refused, in the sweep running now.
     probes_sent: u32,
     probes_refused: u32,
+    /// How many transmit queues the dongle's endpoints serve (R2), which decides the endpoint a data frame
+    /// is sent on (`rtl_tx::be_out`).
+    queues: u8,
+    /// The association, once one is up - with keys when it is JOINED.
+    assoc: Option<Assoc>,
+    /// The keys a WPA2 join keeps for the rekeys to come (`supplicant::Keys`); zeroed on every end.
+    keys: Option<Keys>,
+    /// The next CAM entry a key goes into: Linux takes the first free one, so the pairwise key is 0 and the
+    /// group key 1 on a fresh join; and how many are in, to empty them on leaving.
+    cam_next: u8,
 }
 
 /// Where a sweep is: the channel tuned now, and when it was tuned.
@@ -91,8 +124,11 @@ struct Hop {
 }
 
 impl Dongle {
-    pub fn new(mac: [u8; 6], home: u8) -> Self {
-        Dongle { mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0 }
+    pub fn new(mac: [u8; 6], home: u8, queues: u8) -> Self {
+        Dongle {
+            mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
+            assoc: None, keys: None, cam_next: 0,
+        }
     }
 
     /// The dongle's own address, from its efuse.
@@ -204,13 +240,87 @@ impl Dongle {
             ctx.log_fmt(format_args!("wifi-usb: the deauthentication was not sent - {}", why));
         }
         let _ = rtl8188::set_bssid(ctx, &[0; 6]);
-        let home = self.home;
-        let _ = self.tune(ctx, home);
+        self.drop_keys(ctx);
+        self.assoc = None;
+        self.home = FIRST;
+        let _ = self.tune(ctx, FIRST);
     }
 
-    /// R5b's join: find, authenticate, associate - then leave, since keys are R5c. `Ok((aid, bssid))` when the
-    /// access point accepted the association; `Err` with the outcome to report and the line already said.
-    fn associate(&mut self, ctx: &ServiceContext, ssid: &[u8], secret: Secret) -> Result<(u16, [u8; 6]), Outcome> {
+    /// The keys out: the kept ones zeroed (`supplicant::forget`) and every CAM entry this join filled emptied.
+    fn drop_keys(&mut self, ctx: &ServiceContext) {
+        supplicant::forget(&mut self.keys);
+        for e in 0..self.cam_next {
+            let _ = rtl8188::clear_key(ctx, e);
+        }
+        self.cam_next = 0;
+    }
+
+    /// The four-way handshake on the association `a`, with `pmk`: the supplicant reads each EAPOL frame from
+    /// the access point and answers through this station (`KeyPath`), until it says the association has
+    /// keys, or refused, or failed - or the access point ends it, or `HANDSHAKE_MS` passes.
+    fn handshake(&mut self, ctx: &ServiceContext, a: Assoc, pmk: &[u8; 32]) -> Outcome {
+        let mut hs = Handshake::new(*pmk, self.mac, "wifi-usb");
+        let mut verdict: Option<Outcome> = None;
+        let mut frames = 0u32;
+        let us = self.mac;
+        rx::wait_frames(ctx, HANDSHAKE_MS, &mut |pk: &rtl_rx::Packet| {
+            let f = pk.frame;
+            // The access point ending it: a deauthentication or disassociation from it, to us.
+            if f.len() >= 26 && (f[0] == FC_DEAUTH || f[0] == FC_DISASSOC) && f[4..10] == us && f[10..16] == a.bssid {
+                let reason = u16::from_le_bytes([f[24], f[25]]);
+                verdict = Some(if hs.msg2_sent > 0 {
+                    ctx.log_fmt(format_args!(
+                        "wifi-usb: join - the access point ended the association (reason {}) after {} answer(s) to message 1 - our key is not its key: INCORRECT PASSPHRASE",
+                        reason, hs.msg2_sent));
+                    Outcome::PassphraseRefused
+                } else {
+                    ctx.log_fmt(format_args!(
+                        "wifi-usb: join - the access point ended the association (reason {}) before the handshake began", reason));
+                    Outcome::Failed
+                });
+                return true;
+            }
+            // A handshake frame: an unprotected data frame from the access point, carrying EAPOL.
+            if f.len() < 16 || f[1] & 0x40 != 0 || f[10..16] != a.bssid {
+                return false;
+            }
+            let Some(d) = data::llc_payload(f, false) else { return false };
+            if d.ethertype != ETHERTYPE_EAPOL || d.da != us {
+                return false;
+            }
+            let mut eth = [0u8; EAPOL_MAX];
+            let n = data::to_ethernet(&d, &mut eth);
+            if n == 0 {
+                return false;
+            }
+            frames += 1;
+            match hs.on_key_frame(self, &eth[..n], ctx) {
+                Step::Continue => false,
+                Step::Joined(k) => {
+                    self.keys = Some(k);
+                    verdict = Some(Outcome::Joined);
+                    true
+                }
+                Step::PassphraseRefused => {
+                    verdict = Some(Outcome::PassphraseRefused);
+                    true
+                }
+                Step::Failed => {
+                    verdict = Some(Outcome::Failed);
+                    true
+                }
+            }
+        });
+        verdict.unwrap_or_else(|| {
+            ctx.log_fmt(format_args!(
+                "wifi-usb: join - the handshake reached no verdict in {} ms ({} handshake frame(s), message 2 sent {} time(s))",
+                HANDSHAKE_MS, frames, hs.msg2_sent));
+            Outcome::Timeout
+        })
+    }
+
+    /// R5b's join: find, authenticate, associate. `Ok` with the association when the access point accepted it; `Err` with the outcome to report and the line already said.
+    fn associate(&mut self, ctx: &ServiceContext, ssid: &[u8], secret: Secret) -> Result<Assoc, Outcome> {
         let shown = core::str::from_utf8(ssid).unwrap_or("(not text)");
         self.probes_sent = 0;
         self.probes_refused = 0;
@@ -303,7 +413,7 @@ impl Dongle {
             }
         }
         match assoc {
-            Some((0, aid)) => Ok((aid, b)),
+            Some((0, aid)) => Ok(Assoc { bssid: b, channel: net.channel, aid, rssi: net.rssi }),
             Some((st, _)) => {
                 ctx.log_fmt(format_args!("wifi-usb: join - the access point refused the association, status {}", st));
                 self.leave(ctx, &b);
@@ -388,22 +498,41 @@ impl Station for Dongle {
     }
 
     fn join(&mut self, ssid: &[u8], secret: Secret, ctx: &ServiceContext) -> Outcome {
-        match self.associate(ctx, ssid, secret) {
-            Ok((aid, bssid)) => {
-                ctx.log_fmt(format_args!(
-                    "wifi-usb: join - ASSOCIATED, association ID {}; R5b done. The four-way handshake is R5c, so the station leaves now - an association with no keys carries nothing",
-                    aid));
-                self.leave(ctx, &bssid);
-                Outcome::Failed
-            }
-            Err(outcome) => outcome,
+        // A join replaces whatever this station was on: leave it first, so its keys do not outlive it.
+        if let Some(old) = self.assoc {
+            self.leave(ctx, &old.bssid);
         }
+        self.cam_next = 0;
+        let a = match self.associate(ctx, ssid, secret) {
+            Ok(a) => a,
+            Err(outcome) => return outcome,
+        };
+        ctx.log_fmt(format_args!("wifi-usb: join - ASSOCIATED, association ID {}", a.aid));
+        self.assoc = Some(a);
+        // Sweeps return here now, not to channel 1: this is where the access point is.
+        self.home = a.channel;
+        let outcome = match secret {
+            // An open network has no handshake: the association is the join.
+            Secret::Open => Outcome::Joined,
+            Secret::Pmk(pmk) => self.handshake(ctx, a, pmk),
+        };
+        if outcome == Outcome::Joined {
+            ctx.log("wifi-usb: join - JOINED; R5c done. Frames to and from the network are R6");
+        } else {
+            self.leave(ctx, &a.bssid);
+        }
+        outcome
     }
 
-    fn forget_keys(&mut self) {}
+    fn forget_keys(&mut self) {
+        // The kept keys only: the CAM entries go when the association does (`leave`), which needs the bus.
+        supplicant::forget(&mut self.keys);
+    }
 
-    fn disassoc(&mut self, _ctx: &ServiceContext) -> bool {
-        // Never associated, so there is nothing to leave.
+    fn disassoc(&mut self, ctx: &ServiceContext) -> bool {
+        if let Some(a) = self.assoc {
+            self.leave(ctx, &a.bssid);
+        }
         true
     }
 
@@ -422,8 +551,12 @@ impl Station for Dongle {
     }
 
     fn link(&mut self, _ctx: &ServiceContext) -> Option<Link> {
-        // Not associated: no join has been made, because none can be yet.
-        Some(Link { bssid: [0; 6], rssi: 0, chanspec: 0 })
+        // What this station holds, not a fresh reading from the chip: it does not yet track the access
+        // point's beacons after the join (a lost link is R6's to notice), and the signal is the find's.
+        Some(match self.assoc {
+            Some(a) => Link { bssid: a.bssid, rssi: a.rssi as i32, chanspec: a.channel as u16 },
+            None => Link { bssid: [0; 6], rssi: 0, chanspec: 0 },
+        })
     }
 
     fn mac(&mut self, _ctx: &ServiceContext) -> Option<[u8; 6]> {
@@ -451,5 +584,62 @@ impl Station for Dongle {
     fn debug(&mut self, _sub: u8, _live: bool, out: &mut [u8], _ctx: &ServiceContext) -> usize {
         out[0] = wire::UNKNOWN_OP;
         1
+    }
+}
+
+/// The supplicant's two needs, answered by this chip (R5c).
+impl KeyPath for Dongle {
+    /// An EAPOL frame as ethernet, sent as the 802.11 data frame to the access point
+    /// (`godspeed_wifi::data::to_80211`) with its descriptor (`rtl_tx::eapol`), on the best-effort queue's
+    /// endpoint.
+    fn send_eapol(&mut self, eth: &[u8], ctx: &ServiceContext) -> bool {
+        let Some(a) = self.assoc else { return false };
+        let mut frame = [0u8; EAPOL_MAX + data::DATA_OVERHEAD];
+        let seq = self.next_seq();
+        let n = data::to_80211(eth, &a.bssid, seq, &mut frame);
+        if n == 0 {
+            return false;
+        }
+        let desc = rtl_tx::eapol(n as u16, seq);
+        let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + EAPOL_MAX + data::DATA_OVERHEAD];
+        req[0] = usbfn::OP_BULK_OUT;
+        req[1] = rtl_tx::be_out(self.queues);
+        req[2..2 + rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
+        req[2 + rtl_tx::TX_DESC_LEN..2 + rtl_tx::TX_DESC_LEN + n].copy_from_slice(&frame[..n]);
+        match crate::host(ctx, &req[..2 + rtl_tx::TX_DESC_LEN + n]) {
+            Ok(r) if r.payload_bytes().get(..2) == Some(&[usbfn::OP_BULK_OUT, usbfn::ST_OK][..]) => true,
+            Ok(r) => {
+                ctx.log_fmt(format_args!(
+                    "wifi-usb: an EAPOL frame was not sent - the host answered status {:?}", r.payload_bytes().get(1)));
+                false
+            }
+            Err(why) => {
+                ctx.log_fmt(format_args!("wifi-usb: an EAPOL frame was not sent - {}", why));
+                false
+            }
+        }
+    }
+
+    /// A CCMP key into the next CAM entry: against the peer for the pairwise key, against the BSSID for a
+    /// group key, as `rtl8xxxu_set_key` does.
+    fn install_key(&mut self, key_idx: u32, key: &[u8; 16], peer: Option<&[u8; 6]>, ctx: &ServiceContext) -> bool {
+        let Some(a) = self.assoc else { return false };
+        let (mac, group) = match peer {
+            Some(p) => (*p, false),
+            None => (a.bssid, true),
+        };
+        let entry = self.cam_next;
+        match rtl8188::install_key(ctx, entry, key_idx as u8, key, &mac, group) {
+            Ok(()) => {
+                self.cam_next += 1;
+                ctx.log_fmt(format_args!(
+                    "wifi-usb: {} key {} in CAM entry {}", if group { "group" } else { "pairwise" }, key_idx, entry));
+                true
+            }
+            Err(why) => {
+                ctx.log_fmt(format_args!("wifi-usb: the key did not go into the CAM - {}", why));
+                false
+            }
+        }
     }
 }

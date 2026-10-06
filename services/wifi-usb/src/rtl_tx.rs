@@ -43,14 +43,46 @@ pub const RATE_1M: u32 = 0x00;
 /// one endpoint, 0 for two, and `TRXDMA_QUEUE_HIGH ^ 3` = 0 for three: always the first.
 pub const MGNT_OUT: u8 = 0;
 
+/// `TXDESC_QUEUE_BE`: best effort, where a data frame goes when the association has no QoS - this station
+/// offers no WMM element, so every data frame it sends is best effort.
+pub const QUEUE_BE: u32 = 0x0;
+
+/// The bulk OUT endpoint, as a POSITION, that best-effort data is sent on: `out_ep[bep]` in
+/// `rtl8xxxu_init_queue_priority`, where `bep` is 0 for one endpoint, 1 for two (`bkp = bep = 1`), and
+/// `TRXDMA_QUEUE_LOW ^ 3` = 2 for three. `queues` is how many transmit queues the dongle's endpoints serve.
+pub fn be_out(queues: u8) -> u8 {
+    match queues {
+        2 => 1,
+        3 => 2,
+        _ => 0,
+    }
+}
+
 /// The descriptor for a management frame of `frame_len` bytes, sequence number `seq`, to a group address
 /// when `group` (a probe request's broadcast) - signed. Little-endian throughout, as the struct is `__le`.
 pub fn mgmt(frame_len: u16, seq: u16, group: bool) -> [u8; TX_DESC_LEN] {
+    driver_rate(frame_len, seq, group, QUEUE_MGNT)
+}
+
+/// The descriptor for an unprotected unicast DATA frame - an EAPOL frame of the four-way handshake (R5c) -
+/// on the best-effort queue, signed.
+///
+/// **A deliberate difference from Linux, recorded (26.14).** `fill_txdesc_v1` sends a data frame at the
+/// rate the chip's firmware chooses, from the rate mask `rtl8xxxu_bss_info_changed` hands it once the
+/// association is up (`update_rate_mask`), which this driver does not send yet. Until it does, the handshake's
+/// frames go at the driver's rate - 1 Mb/s with a retry limit of 6, as the management frames do - the one
+/// rate every access point takes. The data rates are R6's.
+pub fn eapol(frame_len: u16, seq: u16) -> [u8; TX_DESC_LEN] {
+    driver_rate(frame_len, seq, false, QUEUE_BE)
+}
+
+/// A descriptor whose frame goes at the driver's rate, 1 Mb/s, retried up to 6 times, on `queue`.
+fn driver_rate(frame_len: u16, seq: u16, group: bool, queue: u32) -> [u8; TX_DESC_LEN] {
     let mut d = [0u8; TX_DESC_LEN];
     d[0..2].copy_from_slice(&frame_len.to_le_bytes());
     d[2] = TX_DESC_LEN as u8;
     d[3] = DW0_OWN | DW0_FIRST_SEGMENT | DW0_LAST_SEGMENT | if group { DW0_BROADMULTICAST } else { 0 };
-    let dw1 = (QUEUE_MGNT << DW1_QUEUE_SHIFT) | DW1_AGG_BREAK;
+    let dw1 = (queue << DW1_QUEUE_SHIFT) | DW1_AGG_BREAK;
     d[4..8].copy_from_slice(&dw1.to_le_bytes());
     let dw3 = ((seq as u32) & 0x0FFF) << DW3_SEQ_SHIFT;
     d[12..16].copy_from_slice(&dw3.to_le_bytes());
@@ -108,6 +140,20 @@ mod tests {
             let x = d.chunks_exact(2).fold(0u16, |a, w| a ^ u16::from_le_bytes([w[0], w[1]]));
             assert_eq!(x, 0);
         }
+    }
+
+    #[test]
+    fn an_eapol_descriptor_is_best_effort_and_unicast() {
+        let d = eapol(99, 7);
+        assert_eq!(d[3], 0x8C, "OWN | FIRST | LAST, no group bit");
+        assert_eq!(word(&d, 4), 0x0040, "queue BE (0) and AGG_BREAK");
+        assert_eq!(word(&d, 16), 0x100, "the driver's rate");
+        assert_eq!(word(&d, 20), 0x001A_0000, "1 Mb/s, retry limit 6");
+    }
+
+    #[test]
+    fn best_effort_takes_the_endpoint_linux_maps_it_to() {
+        assert_eq!((be_out(1), be_out(2), be_out(3)), (0, 1, 2));
     }
 
     #[test]

@@ -133,11 +133,11 @@ fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> Option<station::Dongle>
             // Receive starts only once the chip's own is set up (R3a): the host's IN armed at a chip that
             // has not been told where to put frames would only be NAKed. A radio that cannot receive
             // cannot scan, so it is not a station.
-            let mac = bring_up(ctx)?;
+            let (mac, queues) = bring_up(ctx)?;
             if !rx::start(ctx) {
                 return None;
             }
-            Some(station::Dongle::new(mac, FIRST_CHANNEL))
+            Some(station::Dongle::new(mac, FIRST_CHANNEL, queues))
         }
         (c, i) => {
             ctx.log_fmt(format_args!(
@@ -152,9 +152,9 @@ fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> Option<station::Dongle>
 const REPORT_CEILING_MS: u64 = 60_000;
 
 /// R1 (`docs/wifi-usb.md`): the efuse, then the power-on - Linux's order (`rtl8xxxu_init_device`) - and on
-/// through R2 and R3a. The dongle's own address, from its efuse, when every stage completed; `None` when one
-/// stopped, said where.
-fn bring_up(ctx: &ServiceContext) -> Option<[u8; 6]> {
+/// through R2 and R3a. The dongle's own address, from its efuse, and how many transmit queues its endpoints
+/// serve, when every stage completed; `None` when one stopped, said where.
+fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8)> {
     // How long each half took, for the log - `Deadline::elapsed_us` is the stdlib's measure of a wait. The
     // bound is a ceiling for the report only; every wait inside the efuse walk and the power-on is
     // bounded on its own (`rtl8188.rs`).
@@ -233,7 +233,7 @@ fn bring_up(ctx: &ServiceContext) -> Option<[u8; 6]> {
                     return None;
                 }
             }
-            Some(mac)
+            Some((mac, queues.count()))
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the radio's set-up stopped - {}", why));
