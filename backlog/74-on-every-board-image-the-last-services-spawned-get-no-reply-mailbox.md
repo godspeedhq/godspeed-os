@@ -142,3 +142,26 @@ wall-clock second to turn and then a whole second more - and it had already done
 for TCP's clock and kept the result there. Ping now starts from the startup measurement and calibrates
 lazily only if that one failed. The Pi 4 boot after the fix: first echo over the cable 24 ms, first over
 the radio 37 ms, no slow pass logged.
+
+## A cost found: the respawned `wifi-usb` on the Pi 2 (2026-10-06, `docs/wifi-usb.md` 19)
+
+**A driver that RECEIVES NOTICES from the peer it calls is not unaffected.** The measurements above found
+no tax on the radio boards, and for a service whose only messages from a peer are replies, that holds.
+`wifi-usb` is different: `dwc2` sends it a notice per received USB transfer (`NOTE_BULK_IN`) and calls
+from it carry requests, both on one endpoint when there is no mailbox. The kernel matches a call's reply
+by sender, so a notice can be taken as the answer. Boot gives `wifi-usb` a mailbox; EVERY respawn is
+refused one (`71 of 96 routing slots free, reserve 72`).
+
+The first respawn after R9's power cycle stopped dead: every answer one behind. `usbfn::OP_SYNC`, a
+request `dwc2` never answers, now recovers it without a kernel change, and the operator's run that day
+(19 restarts of `wifi-usb`, `chaos max-carnage` 50 rounds, an unplug and replug) passed throughout.
+
+**What it costs, measured in that run.** On a respawned instance nearly every received transfer goes
+through the recovery: `dwc2`'s heartbeat read `1044 transfers ... 987 taken as answers (OP_SYNC)`. Each one
+is an extra call to `dwc2`, and the notice is re-sent only after `wifi-usb` has been quiet for 5 ms. Beacons
+and a ping do not notice; sustained receive would. The instance with a mailbox showed 0.
+
+**What would remove it:** the mailbox for a respawn. A watched service's respawn could take back the slot
+its dead instance just released, instead of competing with the reserve as a new service would. That is
+option 1 or 2 above applied to respawns only, and a kernel change, so not made without the operator's
+go-ahead and a QEMU boot first.

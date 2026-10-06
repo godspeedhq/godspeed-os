@@ -1023,7 +1023,7 @@ driver that changes nothing. The shell now asks rather than announces. On `NO_PO
 1 (whether the driver left first): left means the kernel refused a host that could cut; not left means the
 driver has no power to cut, and nothing changed. `powercycle`'s refusal no longer blames the kernel alone.
 
-## 18. R9 (2026-10-06): `off hard` and `powercycle` for the dongle - the chip's own power-down - the power-down hardware-verified; the restart after it needed section 19
+## 18. R9 (2026-10-06): `off hard` and `powercycle` for the dongle - the chip's own power-down - hardware-verified on the Pi 2 (with section 19)
 
 **The question that led here.** A dongle's 5 V is its USB port's, and on the Pi 2 that port is behind the
 hub the disk, the keyboard and the ethernet share. Cutting it, or even suspending the port, puts the shared
@@ -1096,7 +1096,7 @@ gateway back to back.
   restart after that, every request the sweep made was `malformed`. Not the chip: section 19.
 - `off hard` was not reached.
 
-## 19. A respawned `wifi-usb` and the host's notices (2026-10-06) - built, not yet run
+## 19. A respawned `wifi-usb` and the host's notices (2026-10-06) - hardware-verified on the Pi 2
 
 **What went wrong after R9's power cycle,** and would have after any restart of `wifi-usb` - a crash, a
 `kill`, a `chaos` round. Boot gives `wifi-usb` a reply mailbox, an endpoint that carries only replies.
@@ -1136,3 +1136,27 @@ request after it.
 - receive stalling after a restart (a swallowed `NOTE_BULK_IN` never re-sent): no data frames, and
   `dwc2` reporting `held for wifi-usb` at every heartbeat;
 - any `malformed` from the host.
+
+**The run (2026-10-06, the operator's: the R9 card and more).** Passed throughout:
+- **`wifi radio off hard`:** `the firmware stopped its CPU when asked`, then `left the network, then radio
+  off (hard) - verified by its driver`. `wifi radio on`: `radio on succeeded - joined ...`.
+- **`wifi radio powercycle`, five times.** Every one powered the chip down with the firmware stopping when
+  asked. Four ended `powercycle succeeded - joined ...`. The fifth met the operator's unplug during its 2 s
+  hold (`port 4 - device REMOVED`). The new instance said `no dongle bound` and the shell `the driver found
+  no working radio on its bus`. On the replug (port 5) the chip came up cold, rejoined, and `ping` answered.
+- **`chaos max-carnage`, 50 rounds:** 343 kills, kernel alive. `wifi-usb` was restarted 19 times in the
+  run. After chaos the driver came back and recovered one transient USB error during the firmware upload
+  (`dwc2` re-ran several STATUS stages as R2c does, one gave up after 3 errors, and the upload's own
+  retry took it: `try 1 of 6`, then `2 tries`; this was a restart, so R2c's replug case is still unseen). It rejoined, and `ping` went 4 of 4.
+- **Unplug and replug** once more by hand: the dongle came back on port 4 (one failed enumeration first,
+  retried), rejoined, and `ping`, `wifi scan` and `wifi list` worked.
+- **No** `kept arriving`, no `malformed`, no `something other than`.
+
+**The cure's cost, seen in the counters.** On a respawned instance nearly every received transfer is
+recovered this way: `1044 transfers ... 987 taken as answers (OP_SYNC)`. Each costs an extra call to the
+host and a re-sent notice after 5 ms of quiet. Beacons and pings do not show it; sustained receive would.
+The instance with a mailbox showed 0. The real fix is the mailbox for a respawn, a kernel change, recorded
+in `backlog/74` with this evidence.
+
+**Also seen:** `dwc2` counted 309 receive errors (`HCINT=0x92`) across the powered-down windows: its bulk
+IN polling a suspended chip. They stopped when the chip came back, and no transfer was lost to them.
