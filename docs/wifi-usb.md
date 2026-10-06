@@ -812,6 +812,16 @@ keeps the highest accepted under the pairwise key and under each group key id, a
 A frame whose number does not climb is dropped, counted and said. A frame that failed its ICV never gets
 this far: the receive side drops it first.
 
+**And the group key's counter does not start at zero (a second review).** A group key was in use before
+this station joined, so a broadcast frame sent under it earlier could have been replayed to us once while
+its counter stood at 0. Message 3 carries the group key's Key RSC, the packet number it has reached.
+`eapol::Key::rsc` reads it, little-endian unlike the rest of that header, because mac80211 loads it as
+`rx_pn[j] = seq[5 - j]` (`net/mac80211/key.c`). The supplicant now hands it to the radio after installing
+a group key, in message 3 and in a group rekey, through a new `KeyPath::group_rsc`. That method does
+nothing by default, which is right for the Broadcom and the AIC8800, whose firmware checks replay itself.
+The dongle seeds that key id's counter from it. The counters are zeroed when a join STARTS, so the seeding
+is not undone when the join completes. The log says `group key n accepts packet numbers above N`.
+
 **A comment that was wrong, corrected.** `rtl_rx::Desc::pkt_len` said "FCS included". The chip's `RCR`
 appends the PHY status, the ICV and the MIC (bits 28 to 30, as Linux sets them), not the FCS (bit 31), so the
 length has no FCS in it. Nothing used the claim, and the MIC trim depends on the truth of it.
@@ -854,7 +864,7 @@ because it could not yet, and the shell said `the radio did not take the power c
 already left, so the next `net` read `the radio is not joined`. Nothing broke. The sentence was the problem:
 it said "nothing happened" about an off that had happened halfway.
 
-## 15. R6b (2026-10-06): `wifi radio off` and `on` for the dongle - built, NOT YET RUN
+## 15. R6b (2026-10-06): `wifi radio off` and `on` for the dongle - hardware-verified on the Pi 2
 
 So the off now completes. `rtl8188::radio_off` is what `rtl8xxxu_stop` does to the chip: transmit paused,
 the management and data receive filters closed, then `rtl8xxxu_gen1_disable_rf` for its one path (the RF
@@ -870,3 +880,11 @@ network last joined (R5c's lines again), `nic-driver` switches back to the radio
 lease, and `ping` answers. **Refuted by:** `radio off did not complete`, a rejoin that never reaches JOINED
 after `on` (the RF not back, or the receive filters still closed), or no lease after a JOINED (the link
 switch back).
+
+**Result (2026-10-06, `build/kernel7-R6b.img` as first built): passed.** Boot to JOINED, a lease, `ping` 4 of
+4. `wifi radio off`: `radio off - transmit paused, receive filters closed, the RF module down`, and the shell
+said `left the network, then radio off - verified`. `ping` then lost everything and `net` read `link down`,
+both correct. `wifi status` read the radio off. `wifi radio on`: `radio on - RF up, receive filters open`,
+`rejoining the network last joined`, JOINED 1.3 s later, `nic-driver` back on the radio, `lease ok`, and
+`ping` 5 of 5. The shell calls the off "soft - the firmware's switch; the chip stays powered", which is
+true here as well: the dongle's power is its USB port's.
