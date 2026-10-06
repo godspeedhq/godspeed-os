@@ -152,6 +152,23 @@ fn control_once(
     hc.dma.write32(off + 8, 0);
     hc.dma.write32(off + 12, r.pcs | (1 << 5) | (TRB_STATUS_STAGE << 10) | ((status_in as u32) << 16));
     r.cur = off + TRB_SIZE - ring;
+    // THE LINK GOES IN NOW, not when the next transfer finds no room: written before the doorbell, the
+    // controller follows it while it is busy with this TD and comes to rest at the ring's start, never ON
+    // the Link. Written lazily (the check above), the controller idled with its dequeue on the slot the
+    // Link later went into, and the Pi 4's VL805 failed every first transfer after the wrap with a TRB
+    // Error, its dequeue stopped at that slot (2026-10-06). Linux records that the VL805 "can't cope with
+    // the TR Dequeue Pointer for an endpoint being set to a Link TRB" (`XHCI_AVOID_DQ_ON_LINK`); that is
+    // about Set TR Dequeue, and this is the same position reached by idling - the reason, not yet the
+    // proof. The check above stays for a cursor that starts near the end.
+    if r.cur + 4 * TRB_SIZE > RING_BYTES {
+        let bp = hc.dma.phys_at(ring);
+        hc.dma.write32(ring + r.cur, bp as u32);
+        hc.dma.write32(ring + r.cur + 4, (bp >> 32) as u32);
+        hc.dma.write32(ring + r.cur + 8, 0);
+        hc.dma.write32(ring + r.cur + 12, (TRB_LINK << 10) | (1 << 1) | r.pcs);
+        r.cur = 0;
+        r.pcs ^= 1;
+    }
     hc.mmio.write32(hc.dboff + r.slot as usize * 4, 1);
 
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(CONTROL_MS));

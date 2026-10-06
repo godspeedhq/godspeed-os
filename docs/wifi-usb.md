@@ -1721,3 +1721,27 @@ stops, so while it runs it is stale, and transfers from 0x80 working shows it is
 bound. The interrupt-ring zeroing stays, for the overfetch, with its comment corrected: it did not cure
 this. **Prediction:** the bring-up passes 0xff0 and reaches `receive did not start - the host has no bulk
 IN for this dongle`, as on the T630. **Refuted by** any further `cc=5`.
+
+**The cleared ring did not help either (Pi 4, 2026-10-06, `build/pi4_xhci_ep0clear.log`): refuted.** The
+same `cc=5`, the controller stopped at 0xff0 cycle 1. With the slot zeroed there was nothing there it was
+allowed to run, so the reading above was wrong: the controller idled at 0xff0, this host wrote its Link
+TRB there and rang, and the controller stopped ON THE LINK with a TRB Error. The clearing stays - a
+ring's unwritten slots should read as not given, and Linux zeroes rings for that reason - but it is not
+this fault. **Also withdrawn:** the claim above that the hub probes wrap their EP0 ring at 0xff0
+"thousands of times" on this controller. Nobody checked it; at one probe every 1.5 s they may never have
+wrapped at all.
+
+**What is documented** (read, not recalled): the Raspberry Pi kernel's `XHCI_AVOID_DQ_ON_LINK`, because
+the VL805 "can't cope with the TR Dequeue Pointer for an endpoint being set to a Link TRB" and its context
+"ends up stuck at the address of the Link TRB"
+([raspberrypi/linux be18ca1](https://github.com/raspberrypi/linux/commit/be18ca1d4ca4cd6b85eabfe3645d3d11ad0939d3)).
+That is about a Set TR Dequeue command, not an idle endpoint, so it is a reason, not a proof. And the
+disk's bulk rings also write their Link lazily on this controller and work, which argues against it.
+
+**Next experiment: the Link written eagerly** - straight after a TD whose follower would not fit, before
+the doorbell - so the controller follows it while busy and never rests on it. A rewind instead (Stop
+Endpoint and Set TR Dequeue to the ring's base, which `xhci` already does as a repair and which this
+controller accepts) was considered and not taken: `xhci`'s command ring is one page per pass and does not
+wrap, and a bring-up would spend two commands every eighty transfers. **Prediction:** no `cc=5`, and the
+bring-up reaches `no bulk IN`. **Refuted by** a `cc=5` at the new wrap (offset 0 after the Link, or
+wherever the dequeue says).
