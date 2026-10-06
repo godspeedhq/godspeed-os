@@ -1160,3 +1160,30 @@ in `backlog/74` with this evidence.
 
 **Also seen:** `dwc2` counted 309 receive errors (`HCINT=0x92`) across the powered-down windows: its bulk
 IN polling a suspended chip. They stopped when the chip came back, and no transfer was lost to them.
+
+## 20. A respawn takes its reply mailbox back - a kernel change (2026-10-06) - QEMU-verified, card not yet run
+
+**With the operator's go-ahead, the fix section 19 pointed at.** When a watched task dies holding a reply
+mailbox, the kernel banks a credit. A watched spawn the reserve would refuse may spend one
+(`routing::MAILBOX_CREDITS`, `backlog/74` option 4). A respawned `wifi-usb` therefore gets back the mailbox
+its boot instance had. Its replies come only there, and `dwc2`'s notices can no longer be taken as answers.
+
+**`OP_SYNC` stays.** It is now the fallback for a respawn that still finds no credit (a table that has
+genuinely filled), and it costs nothing while unused.
+
+**Verified in QEMU (Pi 2):** `kill time` logged `spawn[ipc]: 'time' takes back a reply mailbox a dead
+watched task released - 71 of 96 routing slots free, reserve 72`. At the same count the old rule refused.
+
+**Prediction, the card, Pi 2:**
+- `wifi radio powercycle` twice.
+- Each restart of `wifi-usb` logs `takes back a reply mailbox` where it logged `gets no reply mailbox`.
+- `dwc2`'s heartbeats after it read `0 taken as answers (OP_SYNC)`, where the R9 run read 987 of 1044.
+- `powercycle succeeded`, and `ping` answers.
+- A `chaos max-carnage` run, as before, shows no panic and the dongle rejoining. Every respawn of a service
+  that had a mailbox at boot should take it back.
+
+**Refuted by:**
+- `gets no reply mailbox` for `wifi-usb` after a powercycle;
+- a non-zero `taken as answers` count on a restarted instance;
+- any service refused its MANDATORY endpoint (`spawn REFUSED - IPC routing table full`) during chaos, which
+  would mean the credits spent slots the reserve was holding for it.

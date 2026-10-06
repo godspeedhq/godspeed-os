@@ -218,6 +218,51 @@ const OPTIONAL_RESERVE: usize = MAX_ENDPOINTS * 3 / 4;
 /// refusal happens, so the count cannot disagree with the decision.
 static REFUSED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Reply mailboxes released by WATCHED tasks that died holding one, not yet taken back (`backlog/74`).
+///
+/// A watched task is one the supervisor restarts (`SPAWN_FLAG_WATCHED`). Its boot instance is spawned
+/// early and gets a mailbox above the reserve; its respawn comes when the table is past the reserve and
+/// was refused one - every respawn, on every board image. A respawned `wifi-usb` then awaited its host's
+/// replies on the endpoint the host's notices also reach, and the kernel matches a reply by sender, so a
+/// notice was taken as the answer (`docs/wifi-usb.md` 19).
+///
+/// So the death of a watched task holding a mailbox leaves a CREDIT here, and a watched spawn the reserve
+/// would refuse may spend one. A mailbox is therefore granted either above the reserve, as before, or in
+/// place of one a watched task released: the respawn takes back what its dead instance held, and the
+/// footprint is what boot already granted. Not keyed on any name - the kernel learns nothing about which
+/// service is which, only that one watched mailbox was given back and one is being asked for. Owned here,
+/// beside the decision that spends it.
+static MAILBOX_CREDITS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The slots a credit may NEVER spend into, whatever the credits say: a hard floor under the reserve, kept
+/// for MANDATORY endpoints - the receive endpoint every task needs to exist at all. Credits are pooled,
+/// not tied to the task that banked them, so an unusual order of deaths and spawns could in principle
+/// have mailboxes hold a few more slots past the reserve than boot granted; this makes that harmless
+/// rather than merely unlikely. An eighth of the table.
+const CREDIT_FLOOR: usize = MAX_ENDPOINTS / 8;
+
+/// A watched task died holding a reply mailbox: its respawn may take one back past the reserve.
+pub fn bank_mailbox_credit() {
+    MAILBOX_CREDITS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+/// Take one credit if there is one.
+fn take_mailbox_credit() -> bool {
+    MAILBOX_CREDITS
+        .fetch_update(core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire,
+            |c| c.checked_sub(1))
+        .is_ok()
+}
+
+/// How a reply mailbox was granted.
+pub enum OptionalGrant {
+    /// Above the reserve, as every grant was before credits.
+    Free,
+    /// Past the reserve, in place of one a dead watched task released. The counts at the decision, for
+    /// the caller's line, as `OptionalRefusal` carries them.
+    Credit { free: usize, total: usize, reserve: usize },
+}
+
 /// Why `try_register_optional` refused, for the caller to report. The caller reports it because the
 /// caller knows WHOSE endpoint it was and this table does not.
 pub struct OptionalRefusal {
@@ -244,7 +289,11 @@ pub struct OptionalRefusal {
 /// chaos storm could lose its reply mailbox with nothing in the log naming it (`backlog/74`). The spawn
 /// path prints every refusal with the task's name instead; it is one line per spawn at most, bounded by
 /// the spawn rate exactly like the `spawned OK` line beside it.
-pub fn try_register_optional(id: EndpointId, core_id: u32, generation: Generation) -> Result<(), OptionalRefusal> {
+/// `watched`: the task is one the supervisor restarts, so it may spend a credit (`MAILBOX_CREDITS`) where
+/// the reserve would refuse it.
+pub fn try_register_optional(
+    id: EndpointId, core_id: u32, generation: Generation, watched: bool,
+) -> Result<OptionalGrant, OptionalRefusal> {
     // Count under the lock, decide outside it. The caller prints, and a serial write is ~9 ms on the
     // ARM ports and not preemptible, so it must never happen while holding the routing table, which is
     // on the path of every send. The scope here is deliberate and not stylistic.
@@ -254,6 +303,16 @@ pub fn try_register_optional(id: EndpointId, core_id: u32, generation: Generatio
             .filter(|e| !e.valid || e.liveness == EndpointLiveness::Dead)
             .count()
     };
+    if free <= OPTIONAL_RESERVE && free > CREDIT_FLOOR && watched && take_mailbox_credit() {
+        // A watched task's mailbox, given back by its own death or a sibling's, taken back. Spent only
+        // on a registration that happens: a table that has filled meanwhile refunds it.
+        if try_register(id, core_id, generation) {
+            return Ok(OptionalGrant::Credit { free, total: MAX_ENDPOINTS, reserve: OPTIONAL_RESERVE });
+        }
+        bank_mailbox_credit();
+        let count = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        return Err(OptionalRefusal { free: 0, total: MAX_ENDPOINTS, reserve: OPTIONAL_RESERVE, count });
+    }
     if free <= OPTIONAL_RESERVE {
         // LOUD, by the caller, because a silent refusal leaves no trace of a real degradation
         // (invariant 12). The caller does fall back correctly - it awaits replies on its shared
@@ -268,7 +327,7 @@ pub fn try_register_optional(id: EndpointId, core_id: u32, generation: Generatio
         let count = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
         return Err(OptionalRefusal { free, total: MAX_ENDPOINTS, reserve: OPTIONAL_RESERVE, count });
     }
-    if try_register(id, core_id, generation) { Ok(()) } else {
+    if try_register(id, core_id, generation) { Ok(OptionalGrant::Free) } else {
         // The table filled between the count and the insert. Reported as the same refusal, so the
         // caller has one case to handle and the operator one line to read.
         let count = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;

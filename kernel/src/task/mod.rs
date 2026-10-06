@@ -1820,8 +1820,15 @@ fn spawn_service_with_image(
         // first. Property P5 caught the consequence - a real service refused with "IPC routing
         // table full" while convenience endpoints held slots they could have done without.
         let reply_routed =
-            match crate::ipc::routing::try_register_optional(reply_ep_id, core_id, reply_gen) {
-                Ok(()) => true,
+            match crate::ipc::routing::try_register_optional(reply_ep_id, core_id, reply_gen, watched) {
+                Ok(crate::ipc::routing::OptionalGrant::Free) => true,
+                Ok(crate::ipc::routing::OptionalGrant::Credit { free, total, reserve }) => {
+                    // Said, as the refusal is: a grant past the reserve is the exception this makes.
+                    crate::kprintln!(
+                        "spawn[ipc]: '{}' takes back a reply mailbox a dead watched task released - {} of {} routing slots free, reserve {}",
+                        name, free, total, reserve);
+                    true
+                }
                 Err(r) => {
                     // EVERY refusal, NAMED: who runs without a reply mailbox is the fact `backlog/74`
                     // turns on, and the routing table cannot say it because it holds ids, not tasks.

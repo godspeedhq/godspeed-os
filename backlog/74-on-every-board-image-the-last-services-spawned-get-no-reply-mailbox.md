@@ -165,3 +165,35 @@ and a ping do not notice; sustained receive would. The instance with a mailbox s
 its dead instance just released, instead of competing with the reserve as a new service would. That is
 option 1 or 2 above applied to respawns only, and a kernel change, so not made without the operator's
 go-ahead and a QEMU boot first.
+
+## Option 4, done (2026-10-06, operator's go-ahead): a respawn takes its mailbox back
+
+**The rule.** When a WATCHED task (`SPAWN_FLAG_WATCHED`, what the supervisor restarts) dies holding a
+reply mailbox, the death path banks one credit (`routing::MAILBOX_CREDITS`). A watched spawn the reserve
+would refuse may spend one, and is granted the mailbox past the reserve. The credit is spent only on a
+registration that happens; a table that filled meanwhile refunds it.
+
+**Why this keeps what the reserve protects.** A mailbox is now granted either above the reserve, as
+before, or in place of one a watched task released. The reserve exists so convenience endpoints cannot
+starve the mandatory ones in the probe builds (P5, P7). Probes are not watched, so they neither bank nor
+spend, and the footprint a credit restores is one boot already granted. **Not keyed on a name:** the
+kernel learns only that one watched mailbox was given back and one is being asked for, not which service
+is which.
+
+**And a floor under it, because credits are pooled.** A credit is not tied to the task that banked it, so
+an unusual order (watched deaths freeing slots, unwatched spawns taking mailboxes above the reserve in that
+window, the respawns then spending their credits) could have mailboxes hold more slots past the reserve
+than boot granted. "It balances in practice" is weaker than what the reserve promises, so a credit is never
+spent when 12 or fewer slots are free (`CREDIT_FLOOR`, an eighth of the table). Those are kept for
+mandatory receive endpoints, whatever the credits say, and the grant falls back to the refusal.
+
+**What it does not change.** A service refused at boot (`nic-driver`, `net-stack` on these images)
+never held one, banks nothing, and is still refused on a respawn. That is the rest of this item. The
+reserve itself is untouched.
+
+**Said, like the refusal:** `spawn[ipc]: '<name>' takes back a reply mailbox a dead watched task
+released - N of 96 routing slots free, reserve 72`.
+
+**Verified in QEMU (Pi 2, 2026-10-06):** at boot `nic-driver` and `net-stack` were refused as before. Then
+`kill time`, and `time`'s respawn at 71 free took the mailbox back, where before it would have been
+refused. The x86 identity suite, then the Pi 2 card for `wifi-usb`, follow (`docs/wifi-usb.md` 20).

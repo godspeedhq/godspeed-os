@@ -2388,6 +2388,12 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::capability::table::mark_dead_resource(
                 crate::capability::cap::ResourceId::from(rep_id));
             TASK_REPLY_ENDPOINT[slot].store(0, Ordering::Relaxed);
+            // A watched task's mailbox is owed back to its respawn (`routing::MAILBOX_CREDITS`,
+            // `backlog/74`): the reserve would refuse it, and the respawn needs it as much as the boot
+            // instance did. `TASK_WATCHED` still holds this task's value - it is only set by a spawn.
+            if task_watched(slot) {
+                crate::ipc::routing::bank_mailbox_credit();
+            }
             // RECLAIM THE ID, exactly as the primary endpoint's is reclaimed below. Without this a
             // spawn took TWO ids and a death gave ONE back, so every restart leaked one id and a
             // sustained restart storm marched the counter into the delegated/file-cap band and
