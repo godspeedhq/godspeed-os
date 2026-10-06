@@ -534,6 +534,57 @@ pub mod supcmd {
     }
 }
 
+/// A USB host's report to the supervisor about a device it does not drive itself, so the supervisor can
+/// start that device's driver when it arrives and stop it when it leaves (`docs/usb-device-drivers.md`).
+///
+/// The host reports FACTS - present or not, VID:PID, how many times it has bound one - and never names a
+/// driver: which driver a device gets is the supervisor's table. Sent with `try_send` and never answered,
+/// so a host never waits on the supervisor (8.9). Each report is the host's whole state for that device,
+/// not a change, so a duplicate is harmless and a lost one is corrected by the next.
+pub mod usbdev {
+    /// The report's opcode, after `supcmd::MARKER`: `[MARKER, REPORT, present, gen(4 LE), vid(2 LE), pid(2 LE)]`.
+    pub const REPORT: u8 = b'U';
+    /// Supervisor to host, one byte and no reply capability: send your report again. How a respawned
+    /// supervisor learns what is attached (6.2). In the host's request space beside `usbfn`'s ops (0x20 up),
+    /// clear of them and of every block and net op.
+    pub const ASK: u8 = 0x26;
+    pub const LEN: usize = 11;
+
+    /// One report. `gen` counts every bind on that host, so the same dongle bound again - a replug, or the
+    /// host re-enumerating it - reads differently from the same dongle still bound.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Report {
+        pub present: bool,
+        pub gen: u32,
+        pub vid: u16,
+        pub pid: u16,
+    }
+
+    pub fn encode(r: &Report) -> [u8; LEN] {
+        let mut b = [0u8; LEN];
+        b[0] = super::supcmd::MARKER;
+        b[1] = REPORT;
+        b[2] = r.present as u8;
+        b[3..7].copy_from_slice(&r.gen.to_le_bytes());
+        b[7..9].copy_from_slice(&r.vid.to_le_bytes());
+        b[9..11].copy_from_slice(&r.pid.to_le_bytes());
+        b
+    }
+
+    /// `None` for anything that is not exactly a report.
+    pub fn decode(p: &[u8]) -> Option<Report> {
+        if p.len() != LEN || p[0] != super::supcmd::MARKER || p[1] != REPORT || p[2] > 1 {
+            return None;
+        }
+        Some(Report {
+            present: p[2] == 1,
+            gen: u32::from_le_bytes([p[3], p[4], p[5], p[6]]),
+            vid: u16::from_le_bytes([p[7], p[8]]),
+            pid: u16::from_le_bytes([p[9], p[10]]),
+        })
+    }
+}
+
 
 /// Probe parameters ride in the upper 32 bits of `Spawn`'s `arg0`, which were unused:
 /// `[55..48] flags  [47..32] mode  [31..16] core  [15..0] spawn cap slot`.

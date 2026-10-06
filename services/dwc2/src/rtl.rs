@@ -7,7 +7,7 @@
 //! registers, firmware and 802.11 are `wifi-usb`'s; this file builds no Realtek request of its own except
 //! milestone 1's two reads at bind, kept because they are the line a board log is checked against.
 //!
-//! The host TELLS the driver when the binding changes (`usbfn::NOTE_RADIO`, `notify_driver`), so the
+//! The host TELLS the driver when the binding changes (`usbfn::NOTE_RADIO`, `announce`), so the
 //! driver blocks rather than asking on a timer (U1b).
 //!
 //! **Receive (R3b):** one bulk IN on `CH_RADIO_RX`, armed in the background once `wifi-usb` first asks
@@ -49,6 +49,7 @@
 //! WHAT the silicon wants, per 26.14); no code copied, and the model here is ours.
 
 use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed_sdk::service_context::usbdev;
 use godspeed as gs;
 use gs::cap::Cap;
 use gs::driver::{delay, wait::{self, Budget}};
@@ -66,6 +67,9 @@ pub struct Radio {
     pub t: Target,
     pub vid: u16,
     pub pid: u16,
+    /// This bind's number on this host (`usbdev::Report::gen`): the same dongle bound again reads as a new
+    /// binding, not as the one before it.
+    pub gen: u32,
     ep_in: u8,
     in_mps: u16,
     rx: Rx,
@@ -169,13 +173,13 @@ const HS_BULK_MPS: u16 = 512;
 /// it - this host never did, and control transfers worked without it, but a bulk endpoint exists only in a
 /// configured device - then milestone 1's two reads, then its bulk IN found. Bound whatever happens, so
 /// `wifi-usb` reaches its registers and says itself what failed.
-pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, pid: u16) -> Radio {
+pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, pid: u16, gen: u32) -> Radio {
     stop(ctx, mmio);
     let e = configure(ctx, mmio, dma, t)
         .unwrap_or(Eps { ep_in: 0, in_mps: 0, outs: [0; MAX_OUT], n_out: 0, out_mps: 0 });
     let _ = probe(ctx, mmio, dma, t);
     Radio {
-        t: *t, vid, pid, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
+        t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
         sync_bulk: false, sync_radio: false, last_req: None,
         errs_run: 0, stats: RxStats::default(),
         outs: e.outs, n_out: e.n_out, out_mps: e.out_mps, pid_out: [chan::PID_DATA0; MAX_OUT],
@@ -488,23 +492,36 @@ fn read32(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, reg: u16) ->
     None
 }
 
-/// Tell the radio's driver its binding changed (`usbfn::NOTE_RADIO`): `try_send`, never blocking on a driver
-/// that is behind, and reacquired by name once if the cap is stale - `wifi-usb` is spawned after this
-/// service, so at the first bind it may not have been in the name map yet. Said in the log when it cannot be
-/// delivered at all: the driver then learns at its next start, which is the bound on how stale it can be.
-pub fn notify_driver(ctx: &ServiceContext) {
-    if !tell(ctx) {
-        ctx.log("dwc2-svc: could not tell wifi-usb the radio's binding changed (not running, or its queue is full)");
+/// The radio's binding changed, or the boot enumeration ended: said to the supervisor (`usbdev`), which
+/// starts the dongle's driver when one is present and stops it when none is (`docs/usb-device-drivers.md`),
+/// and told to the driver (`usbfn::NOTE_RADIO`) in case it is already running and should ask `OP_INFO`.
+///
+/// The driver's notice is QUIET when it cannot be delivered: the driver is started BY this report, so at a
+/// bind it is normally not running yet, and it asks `OP_INFO` itself when it starts. The report is LOUD,
+/// because without it the dongle has no driver and nothing else will say so.
+pub fn announce(ctx: &ServiceContext, radio: Option<&Radio>) {
+    let _ = tell(ctx);
+    report(ctx, radio);
+}
+
+/// This host's report on the radio, to the supervisor: the whole state, not a change, so the supervisor's
+/// `usbdev::ASK` is answered by sending it again. `try_send`, reacquired by name once - the supervisor is
+/// restartable (6.2) - and never waited on (8.9).
+pub fn report(ctx: &ServiceContext, radio: Option<&Radio>) {
+    let r = match radio {
+        Some(r) => usbdev::Report { present: true, gen: r.gen, vid: r.vid, pid: r.pid },
+        None => usbdev::Report { present: false, gen: 0, vid: 0, pid: 0 },
+    };
+    let msg = Message::from_bytes(&usbdev::encode(&r));
+    let sent = gs::ipc::try_send(ctx, SUPERVISOR, &msg).is_ok()
+        || (gs::cap::reacquire(ctx, SUPERVISOR) && gs::ipc::try_send(ctx, SUPERVISOR, &msg).is_ok());
+    if !sent {
+        ctx.log("dwc2-svc: could not report the WiFi dongle to the supervisor - its driver will not be started or stopped until the next report");
     }
 }
 
-/// The same notice, once, at the end of this service's boot enumeration - bound or not. On a respawn it is
-/// the only way the driver learns the dongle is gone if it did not come back: nothing was bound, so nothing
-/// else would say. QUIET when it cannot be delivered, because on a first boot the driver is not running
-/// yet - it is spawned after this service - and its own `OP_INFO` at start covers that case.
-pub fn notify_driver_at_start(ctx: &ServiceContext) {
-    let _ = tell(ctx);
-}
+/// Where the reports go: the supervisor decides which driver a device gets.
+const SUPERVISOR: &str = "supervisor";
 
 fn tell(ctx: &ServiceContext) -> bool {
     let msg = Message::from_bytes(&[usbfn::NOTE_RADIO]);

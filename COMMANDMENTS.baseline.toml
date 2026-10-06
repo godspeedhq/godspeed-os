@@ -733,7 +733,10 @@ SpawnImage               = 52
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "copier" = ["peer:fs"]
 "counter" = ["peer:fs"]
-"dwc2" = ["hw:DWC2", "peer:events", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
+# dwc2: peer:supervisor (2026-10-06) - its USB device report (`usbdev`): the WiFi dongle attached or not,
+# so the supervisor starts the dongle's driver when it is there and stops it when it leaves
+# (docs/usb-device-drivers.md). Facts only, `try_send`, never answered - the host names no driver.
+"dwc2" = ["hw:DWC2", "peer:events", "peer:supervisor", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
 "ehci" = ["hw:EHCI", "peer:events", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]

@@ -20,7 +20,9 @@ ipc_receive = ["dwc2"]
 # publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
-ipc_send    = ["events", "wifi-usb"]
+# `supervisor` - the USB device report (`usbdev`): the WiFi dongle attached or not, so its driver is
+# started and stopped with it (docs/usb-device-drivers.md).
+ipc_send    = ["events", "wifi-usb", "supervisor"]
 hw_device   = "dwc2"
 hw_interrupt = [41]   # 0x29, the BCM2836 USB line
 log_write   = true

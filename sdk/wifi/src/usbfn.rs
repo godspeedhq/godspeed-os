@@ -55,7 +55,8 @@ pub const OP_SYNC: u8 = 0x25;
 pub const NOTE_BULK_IN: u8 = 0x2E;
 
 // 0x29 is NOT free in this range: `dwc2` receives the USB interrupt as the one-byte message `[0x29]`, told
-// apart from a request only by carrying no reply cap, so no op may take that value.
+// apart from a request only by carrying no reply cap, so no op may take that value. Nor is 0x26: it is
+// `godspeed_sdk::service_context::usbdev::ASK`, the supervisor asking a USB host for its device report.
 
 /// `[NOTE_RADIO]`, sent BY the host TO the driver, with no reply expected: the radio's binding changed -
 /// a dongle was bound or removed - so ask `OP_INFO`. The host sends it with `try_send`, so it never blocks

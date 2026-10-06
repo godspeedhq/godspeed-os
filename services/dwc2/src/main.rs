@@ -195,6 +195,12 @@ fn dispatch(
     if p.is_empty() {
         return false;
     }
+    // The supervisor asking for this host's device report again (`usbdev::ASK`): no reply capability, by
+    // design - the answer is the report itself, sent the way every report is (rtl.rs).
+    if p == [godspeed_sdk::service_context::usbdev::ASK] {
+        rtl::report(ctx, radio.as_deref());
+        return true;
+    }
     // Taken through `gs`: the radio answers with `gs::ipc::reply`; the disk and net servers still take the
     // raw handle (`Cap::handle`).
     let reply = match gs::ipc::take_sent_cap(ctx) {
@@ -307,6 +313,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // and its receive, and the port it came from so a removal can drop it.
     let mut radio: Option<rtl::Radio> = None;
     let mut radio_port: u8 = 0;
+    // Every bind of the dongle on this host, counted: the report's generation (`usbdev`).
+    let mut radio_binds: u32 = 0;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -453,8 +461,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // Bound whether or not the reads answered - the
                                                 // driver asks again and says what it got.
                                                 radio_port = p;
-                                                radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid));
-                                                rtl::notify_driver(&ctx);
+                                                radio_binds = radio_binds.wrapping_add(1);
+                                                radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver does:
                                                 // ask the device its size, then read block 0. Capacity
@@ -503,8 +511,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
     }
-    // The radio's driver is told the boot enumeration is over, whatever it found (rtl.rs).
-    rtl::notify_driver_at_start(&ctx);
+    // The boot enumeration is over: the supervisor and the radio's driver are told what it found, the
+    // dongle or nothing (rtl.rs). Once, here, rather than at the bind as well: the bind is part of this.
+    rtl::announce(&ctx, radio.as_ref());
 
     // Interrupts arrive as ordinary IPC on this service's receive endpoint: the kernel's neutral
     // router enqueues a one-byte message carrying the vector. That is the same delivery the `xhci`
@@ -730,10 +739,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             {
                                 if hvid == rtl::VID && hpid == rtl::PID {
                                     // The radio, plugged in after boot: bound as at boot, and said.
-                                    radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid));
+                                    radio_binds = radio_binds.wrapping_add(1);
+                                    radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
                                     notify(&ctx, format_args!("usb: WiFi dongle connected (port {})", port));
                                     radio_port = port;
-                                    rtl::notify_driver(&ctx);
+                                    rtl::announce(&ctx, radio.as_ref());
                                 } else if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
                                     notify(&ctx, format_args!("usb: keyboard connected (port {}) - ready", port));
                                     kbd_port = port;
@@ -786,7 +796,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             if radio.is_some() && radio_port == port {
                                 rtl::stop(&ctx, &m);
                                 radio = None;
-                                rtl::notify_driver(&ctx);
+                                rtl::announce(&ctx, None);
                                 notify(&ctx, format_args!("usb: WiFi dongle removed (port {})", port));
                             }
                         }

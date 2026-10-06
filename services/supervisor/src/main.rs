@@ -33,6 +33,7 @@
 use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
 use godspeed_sdk::service_context::DeadlineOutcomeInto;
 use godspeed_sdk::service_context::supcmd;
+use godspeed_sdk::service_context::usbdev;
 
 // ONE table, shared by source with the other principal that spawns probes: a probe respawns its own
 // victim, and a second copy of these parameters would be a second truth (Commandment III).
@@ -341,7 +342,10 @@ mod board {
     /// The USB host this board's NIC sits behind. Only the Pi 2 puts ethernet on USB (the LAN9514);
     /// every other board's NIC is on a bus its driver reaches directly.
     /// `dwc2`'s send peers: `events`, and the dongle's driver wherever it is embedded (see the IMAGES row).
-    pub const DWC2_PEERS: &[&str] = if cfg!(has_wifi_usb) { &["events", "wifi-usb"] } else { &["events"] };
+    /// `supervisor` where it reports the dongle to it, so the dongle's driver is started when the dongle is
+    /// there and stopped when it leaves (`usbdev`, `docs/usb-device-drivers.md`).
+    pub const DWC2_PEERS: &[&str] =
+        if cfg!(has_wifi_usb) { &["events", "wifi-usb", "supervisor"] } else { &["events"] };
     /// `xhci`'s send peers: `events`, and the dongle's driver where it is embedded (U2a) - the same notice
     /// `dwc2` sends, `NOTE_RADIO`.
     pub const XHCI_PEERS: &[&str] = if cfg!(has_wifi_usb) { &["events", "wifi-usb"] } else { &["events"] };
@@ -1187,6 +1191,103 @@ fn is_watched(name: &str) -> bool {
     MANAGED.contains(&name) || name == "counter"
 }
 
+/// A USB device whose driver this supervisor starts when a USB host reports it attached, and stops when
+/// the host reports it gone (`docs/usb-device-drivers.md`). The policy half of "a device that appears gets
+/// its driver": the host reports facts (`usbdev`) and never names a driver, so which image runs for a
+/// device is decided here, by the service that decides what runs.
+struct UsbMatch {
+    vid: u16,
+    pid: u16,
+    driver: &'static str,
+    peers: &'static [&'static str],
+}
+
+/// The table. Only where the host reports: `dwc2` does; `xhci` does not yet, so on its boards the dongle's
+/// driver is still started at boot (`USB_ON_DEMAND`).
+const USB_MATCH: &[UsbMatch] = if cfg!(all(has_dwc2, has_wifi_usb)) {
+    &[UsbMatch { vid: 0x0bda, pid: 0x8176, driver: "wifi-usb", peers: board::WIFI_USB_PEERS }]
+} else {
+    &[]
+};
+const USB_MATCH_MAX: usize = 1;
+const _: () = assert!(USB_MATCH.len() <= USB_MATCH_MAX);
+const USB_ON_DEMAND: bool = !USB_MATCH.is_empty();
+/// The USB hosts that report, asked for their report when this supervisor starts (`usbdev::ASK`).
+const USB_HOSTS: &[&str] = if USB_ON_DEMAND { &["dwc2"] } else { &[] };
+
+/// Whether each `USB_MATCH` row's device is attached, as its host last reported. A new supervisor knows
+/// nothing - false until a host says otherwise, which it is asked to do at once. Owned by the main loop.
+struct UsbState {
+    present: [bool; USB_MATCH_MAX],
+}
+
+impl UsbState {
+    const fn new() -> Self { UsbState { present: [false; USB_MATCH_MAX] } }
+
+    /// Should `name` be running? A device's driver only while its device is attached; everything else,
+    /// always. What keeps the restart paths (the death arm, `reconcile`, `converge`) from bringing back a
+    /// driver that was stopped because its device left.
+    fn wanted(&self, name: &str) -> bool {
+        match USB_MATCH.iter().position(|m| m.driver == name) {
+            Some(i) => self.present[i],
+            None => true,
+        }
+    }
+}
+
+/// A host's report (`usbdev::Report`): start the device's driver if it is attached and not running, stop
+/// it if the device is gone. One host reports today, with one such device, so "absent" means every row.
+fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r: usbdev::Report) {
+    if !r.present {
+        for (i, m) in USB_MATCH.iter().enumerate() {
+            usb.present[i] = false;
+            if name_alive(ctx, m.driver) {
+                match ctx.kill(m.driver) {
+                    Ok(()) => ctx.log_fmt(format_args!(
+                        "supervisor: {} stopped - its USB device {:04x}:{:04x} is not attached", m.driver, m.vid, m.pid)),
+                    Err(e) => ctx.log_fmt(format_args!(
+                        "supervisor: {} could not be stopped ({:?}) - its device is not attached", m.driver, e)),
+                }
+            }
+        }
+        return;
+    }
+    let Some(i) = USB_MATCH.iter().position(|m| m.vid == r.vid && m.pid == r.pid) else {
+        ctx.log_fmt(format_args!("supervisor: USB device {:04x}:{:04x} attached - no driver for it here", r.vid, r.pid));
+        return;
+    };
+    usb.present[i] = true;
+    let m = &USB_MATCH[i];
+    if name_alive(ctx, m.driver) {
+        // Already running - a repeated report, or a supervisor respawn finding it. Adopted into the map if
+        // this supervisor does not hold it yet, so its restarts are wired like any other.
+        if map.get(m.driver).is_none() { ensure_wired(ctx, map, m.driver, m.peers); }
+        ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached (binding {}) - {} running",
+            r.vid, r.pid, r.gen, m.driver));
+        return;
+    }
+    ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached (binding {}) - starting {}",
+        r.vid, r.pid, r.gen, m.driver));
+    if !spawn_wired(ctx, map, m.driver, m.peers) {
+        ctx.log_fmt(format_args!("supervisor: {} could not be started for its device", m.driver));
+    }
+}
+
+/// Ask every reporting USB host for its report (`usbdev::ASK`): how a supervisor that has just started -
+/// at boot, or respawned by the kernel (6.2) - learns which devices are attached. No reply: the answer is
+/// the host's ordinary report, read by the main loop. A host not in the map yet is skipped; it reports on
+/// its own when its boot enumeration ends.
+fn ask_usb_hosts(ctx: &ServiceContext, map: &NameCapMap) {
+    let msg = Message::from_bytes(&[usbdev::ASK]);
+    for h in USB_HOSTS {
+        if let Some(slot) = map.get(h) {
+            if ctx.try_send_by_handle(CapHandle(slot), &msg).is_err() {
+                ctx.log_fmt(format_args!("supervisor: could not ask {} for its USB devices", h));
+            }
+        }
+    }
+}
+
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
 /// task (valid AND not Dead) right now. Index-aligned to `MANAGED`.
@@ -1247,7 +1348,7 @@ fn respawn_retry(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool
 /// and a dropped name is silently never restarted (the "fs gone from observe after a storm" bug).
 /// `acquire_*_cap` cannot detect this (the kernel directory keeps a dead name), so we scan REAL liveness
 /// via `task_stat`. Returns how many it respawned. (One pass; the death-loop backstop.)
-fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
+fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState) -> u32 {
     let alive = managed_alive(ctx);
     let mut n = 0;
     for i in 0..MANAGED_N {
@@ -1255,7 +1356,7 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
         // the PCI scan did not find (ehci/nic-driver/net-stack, below). Without this, reconcile would
         // "resurrect" a deliberately-skipped driver on the first death notification, undoing the skip.
         // Mirrors converge's `map.get(...).is_none()` guard.
-        if alive[i] || map.get(MANAGED[i]).is_none() { continue; }
+        if alive[i] || map.get(MANAGED[i]).is_none() || !usb.wanted(MANAGED[i]) { continue; }
         // respawn_RETRY, not a single respawn_managed: the reconcile backstop recovers a service whose
         // death NOTIFICATION was dropped (endpoint overflow under a storm), so a transient respawn
         // failure here has no later death to ride - it must retry to satisfaction like the death arms
@@ -1281,7 +1382,7 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
 /// that will not come up after `MAX_TRIES` is given up LOUDLY, so this can never hang on an impossible
 /// truth. Once consistent it returns to the recv loop and the live-supervisor notification path carries
 /// every future death.
-fn converge(ctx: &ServiceContext, map: &mut NameCapMap) {
+fn converge(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState) {
     const MAX_TRIES: u32 = 7;
     let mut attempts = [0u32; MANAGED_N];
     let mut given_up = [false; MANAGED_N];
@@ -1290,7 +1391,7 @@ fn converge(ctx: &ServiceContext, map: &mut NameCapMap) {
         let mut all_settled = true;
         for i in 0..MANAGED_N {
             // Only reconverge a service this build actually manages (`ensure_*` recorded it in the map).
-            if given_up[i] || alive[i] || map.get(MANAGED[i]).is_none() { continue; }
+            if given_up[i] || alive[i] || map.get(MANAGED[i]).is_none() || !usb.wanted(MANAGED[i]) { continue; }
             all_settled = false;
             attempts[i] += 1;
             if attempts[i] > MAX_TRIES {
@@ -1552,8 +1653,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // The dongle's driver, once its USB host (above) and `fs` are up, so both its peers wire at spawn.
     // Nothing waits on it: it asks the host itself, and says when there is no dongle.
+    // Started HERE only where its host does not report yet (`xhci`). Where it does (`dwc2`), the
+    // supervisor starts it when the host reports the dongle attached (`usb_report`), and stops it when the
+    // host reports it gone.
     #[cfg(has_wifi_usb)]
-    ensure_wired(&ctx, &mut name_map, "wifi-usb", board::WIFI_USB_PEERS);
+    if !USB_ON_DEMAND { ensure_wired(&ctx, &mut name_map, "wifi-usb", board::WIFI_USB_PEERS); }
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests here) and full builds;
     // excluded from test-specific builds. Its `fs` peer is wired from the supervisor's map.
@@ -1763,7 +1867,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // catches any managed service still Dead/settling in the churn - including a shell that `ensure_*`
     // adopted as a stale cap - and only returns once the roster is truly satisfied. From here the recv
     // loop plus the live-supervisor notification path carry every future death.
-    converge(&ctx, &mut name_map);
+    // Which USB devices are attached is the hosts' to say. Asked before the convergence, which leaves a
+    // device's driver alone until its host has answered (`UsbState::wanted`).
+    let mut usb = UsbState::new();
+    ask_usb_hosts(&ctx, &name_map);
+    converge(&ctx, &mut name_map, &usb);
 
     ctx.log("supervisor: ready");
 
@@ -1782,7 +1890,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     loop {
         let msg = ctx.recv();
-        handle_message(&ctx, &mut name_map, &msg);
+        handle_message(&ctx, &mut name_map, &mut usb, &msg);
         // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
         // multi-kill it found the services whose notifications were still QUEUED behind this one, respawned
         // them, and logged "missed death notification" for each - and then each notification arrived and
@@ -1796,20 +1904,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut drained = 0;
         while drained < DRAIN_MAX {
             let Some(next) = ctx.try_recv() else { break };
-            handle_message(&ctx, &mut name_map, &next);
+            handle_message(&ctx, &mut name_map, &mut usb, &next);
             drained += 1;
         }
         // Reconcile backstop: catch any managed service whose death notification never reached us - our
         // 16-deep endpoint overflowed under a storm, or we were ourselves dead and respawning when it was
         // sent (the kernel says which, `UNHEARD` / dropped). It would otherwise stay dead forever (the "fs
         // gone from observe after a storm" bug). Cheap when nothing is dead.
-        reconcile(&ctx, &mut name_map);
+        reconcile(&ctx, &mut name_map, &usb);
     }
 }
 
 /// One message on the supervisor's endpoint: an operator command, or a death notification. Taken out of
 /// the main loop so the loop can drain its queue before the reconcile sweep (see there).
-fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, msg: &Message) {
+fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, msg: &Message) {
+    // A USB host's device report, before the commands it shares `supcmd::MARKER` with: it carries no reply
+    // capability and is never answered.
+    if let Some(r) = usbdev::decode(msg.payload_bytes()) {
+        usb_report(ctx, name_map, usb, r);
+        return;
+    }
     // A command, or a death notification? The first byte decides (see supcmd::MARKER).
     if handle_command(ctx, name_map, msg.payload_bytes()) { return; }
     let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
@@ -1846,6 +1960,12 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, msg: &Message
     // counter re-reads /counter.dat, net-stack re-runs DHCP, a USB host re-enumerates, the shell
     // gives a fresh prompt), and clients reacquire it by name and retry (14.2, 14.3). An in-flight
     // operation is lost, never resumed (25). The "died/restarted" lines are what tests gate on.
+    // A device's driver whose device has gone: stopped on purpose (`usb_report`), so not restarted. It
+    // comes back when its host reports the device attached again.
+    if !name.is_empty() && !usb.wanted(name) {
+        ctx.log_fmt(format_args!("supervisor: {} ended - not restarted, its USB device is not attached", name));
+        return;
+    }
     if !name.is_empty() && is_watched(name) {
         ctx.log_fmt(format_args!("supervisor: {} died, restarting", name));
         if respawn_retry(ctx, name_map, name) {
