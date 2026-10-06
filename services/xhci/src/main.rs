@@ -190,7 +190,7 @@ pub(crate) fn ep0_tr_off(i: usize) -> usize {
 /// ring - a zeroed context, a slot that was never addressed, a controller that reset underneath us.
 /// A caller that gets `None` should fall back to its recorded offset, because a plausible cursor beats
 /// a fabricated one: the whole bug was a number nobody checked against the hardware.
-fn ep0_hw_dequeue(
+pub(crate) fn ep0_hw_dequeue(
     dma: &Dma,
     dev: usize,
     ctx_size: usize,
@@ -211,7 +211,7 @@ fn ep0_hw_dequeue(
 }
 /// One page per ring in a device's slice, so an offset at or past this is not in the EP0 ring and
 /// whatever produced it was not a dequeue pointer.
-const EP0_RING_BYTES: usize = 0x1000;
+pub(crate) const EP0_RING_BYTES: usize = 0x1000;
 fn int_tr_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x2000
 }

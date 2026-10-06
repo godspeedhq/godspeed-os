@@ -1686,3 +1686,18 @@ wrap, which would mean a zero page is not enough here and the Link TRB must move
 
 **Recorded for U2b:** the bulk IN ring will want a page of the slice, and must not be the page after the
 EP0 ring, or this returns with live TRBs in it.
+
+**The zeroed page did not help (Pi 4, 2026-10-06, `build/pi4_xhci_cc5_zeroed.log`): refuted.** The same
+`cc=5`, the same request, the same `TD at ring offset 0xff0`. The offset is the same on every run because
+it is deterministic: the efuse read writes three registers per byte, so the ring reaches its end about
+twenty bytes in. And a Link TRB at 0xff0 is not wrong in itself: `xhci`'s hub probes wrap their own
+one-page EP0 ring there on this controller thousands of times without a fault. The zeroing stays - it is
+Linux's mitigation for a documented property of this part and costs one page write per bind - but it is
+not this fault. The Raspberry Pi's own approach, shortening a segment by four TRBs, is the other one on
+record and is not tried yet.
+
+**The next card measures which TRB was refused.** In the Error state an endpoint's dequeue pointer stops
+at the TRB it rejected, and `xhci` already reads that pointer (`ep0_hw_dequeue`). It is logged at the
+failure, and once per binding the controller's dequeue is compared with this host's cursor: the dongle
+is enumerated behind a hub on the Pi 4 and on a root port on the T630, and `EP0_RUNTIME_START` assumes
+what enumeration left on the ring.

@@ -27,7 +27,7 @@ use gs::driver::wait::{self, Budget};
 
 use crate::msc::POLL_GRANULARITY;
 use crate::{
-    device_ctx_off, ep0_tr_off, next_event, report_off, reset_endpoint, EvMail, TRB_DATA_STAGE, TRB_LINK,
+    device_ctx_off, ep0_hw_dequeue, ep0_tr_off, EP0_RING_BYTES, next_event, report_off, reset_endpoint, EvMail, TRB_DATA_STAGE, TRB_LINK,
     TRB_SETUP_STAGE, TRB_SIZE, TRB_STATUS_STAGE, TRB_TRANSFER_EVENT,
 };
 
@@ -63,11 +63,13 @@ pub struct Radio {
     /// Endpoint repairs this pass, bounded: the command ring is one page per pass, and a dongle that
     /// keeps failing is re-enumerated rather than repaired forever (26.6).
     repairs: u32,
+    /// Whether the controller's EP0 dequeue has been compared with `cur` yet (once per binding).
+    checked: bool,
 }
 
 impl Radio {
     pub fn new(slot: u32, dev_idx: usize, port: u32, ids: u32) -> Self {
-        Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0 }
+        Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0, checked: false }
     }
 
     pub fn vid(&self) -> u16 {
@@ -237,6 +239,15 @@ fn control(
     if !data_in {
         buf[..len].copy_from_slice(&p[9..9 + len]);
     }
+    // MEASURED once per binding: where the CONTROLLER has consumed this EP0 ring to, against where this
+    // file is about to write (`EP0_RUNTIME_START`, which assumes the enumeration's transfers). The dongle
+    // sits behind a hub on the Pi 4 and on a root port on the T630, and the two enumerate differently.
+    if !r.checked {
+        r.checked = true;
+        ctx.log_fmt(format_args!(
+            "xhci: the WiFi dongle's EP0 - the controller's dequeue {:?} (offset, cycle), this host's cursor {:#x} pcs={}",
+            ep0_hw_dequeue(hc.dma, r.dev_idx, hc.ctx_size, EP0_RING_BYTES), r.cur, r.pcs));
+    }
     for _ in 0..tries {
         let at = r.cur;
         let got = control_once(ctx, hc, r, &setup, &mut buf, len, data_in, ev_idx, ev_cycle, eaten);
@@ -246,8 +257,9 @@ fn control(
         // The first few per pass only (`repairs` is per pass).
         if !matches!(got, Some(1) | Some(13)) && r.repairs < 3 {
             ctx.log_fmt(format_args!(
-                "xhci: the WiFi dongle's control transfer failed - cc={} (0 = no event within {} ms), setup={:02x?}, {} {} byte(s), TD at ring offset {:#x} pcs={}",
-                got.unwrap_or(0), CONTROL_MS, setup, if data_in { "IN" } else { "OUT" }, len, at, r.pcs));
+                "xhci: the WiFi dongle's control transfer failed - cc={} (0 = no event within {} ms), setup={:02x?}, {} {} byte(s), TD at ring offset {:#x} pcs={}; the controller stopped at {:?} (offset, cycle)",
+                got.unwrap_or(0), CONTROL_MS, setup, if data_in { "IN" } else { "OUT" }, len, at, r.pcs,
+                ep0_hw_dequeue(hc.dma, r.dev_idx, hc.ctx_size, EP0_RING_BYTES)));
         }
         match got {
             Some(1) | Some(13) => {
