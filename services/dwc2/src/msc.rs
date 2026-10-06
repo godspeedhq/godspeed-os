@@ -222,7 +222,13 @@ pub(crate) fn bulk_xfer(
                 // other direction: there a stale toggle made the device RETRANSMIT, here it makes the
                 // device IGNORE.
                 *pid = chan::pid_from_hctsiz(mmio, chan::CH_BULK);
-                return Ok(len.saturating_sub(left));
+                // AN OUT THAT COMPLETED MOVED ALL OF IT. `HCTSIZ`'s byte count is no measure of an OUT in
+                // buffer-DMA mode (the BOT notes below found it reading 0 for transfers that were right),
+                // and Linux's `dwc2_get_actual_xfer_length` (`hcd_intr.c`) never reads it for one: a
+                // non-split OUT halted with transfer-complete is `chan->xfer_len`, the length asked for.
+                // The disk never looked at an OUT's count; the radio's first transmit did, and reported
+                // 26 frames "not sent" while an access point answered the probe they carried (R5a).
+                return Ok(if dir_in { len.saturating_sub(left) } else { len });
             }
             Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => {
                 ctx.log_fmt(format_args!("dwc2-svc: bulk ep {} STALLed", ep));

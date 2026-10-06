@@ -546,7 +546,7 @@ turned up something that is not WiFi's: two entries with one name in `/` (`backl
 
 R4 is done on the Pi 2. Owed elsewhere: the Pi 4 and the VisionFive check card for the shared loop (above).
 
-## 11. R5a (2026-10-06): the first frame sent - a probe request on every channel the sweep tunes - built, NOT YET RUN
+## 11. R5a (2026-10-06): the first frame sent - a probe request on every channel the sweep tunes - hardware-verified on the Pi 2
 
 R5 is the join: authentication, association and the WPA2 handshake, each of them frames this driver must
 SEND. So it starts with sending one, and the smallest frame whose arrival can be seen from here is a probe
@@ -598,3 +598,23 @@ STALL, or a NAK past 200 ms - the chip not taking frames: its transmit DMA, page
 counted as sent and no probe response to us ever (the frame is on the bus and not on the air - the
 descriptor, the queue, the power - or on the air and not answered, which the access point's side would have
 to show); or the keyboard or disk stalling during a sweep.
+
+**Result (2026-10-06, `build/kernel7-R5a.img`): the dongle TRANSMITS - and the host said it did not.** `dwc2`
+found two bulk OUT endpoints (2 and 3). Within 16 ms of the first sweep starting, `the FIRST probe response
+addressed to us ... R5a done`; over two sweeps, 17 probe responses addressed to the dongle, none before the
+first. The first sweep found 23 networks, the most yet. And every one of the 26 probe requests was reported
+NOT sent: `a probe request was not sent - the device or the bus did not take it`, and `tx - 0 frames, 26
+failed`.
+
+Both cannot be true, and the air is the better witness: an access point addresses a probe response to a
+station only after hearing that station's probe. So the frames went out and the host's ACCOUNTING was wrong.
+`msc::bulk_xfer` measured a completed transfer as `len - HCTSIZ.XferSize` both ways. For an OUT in
+buffer-DMA mode that field is no byte count. The disk's own notes had already found it reading 0 for
+transfers whose data was right, and the disk never looked at an OUT's count, so nothing had failed on it
+until now. Linux's `dwc2_get_actual_xfer_length` (`hcd_intr.c`) never reads it for an OUT: a non-split OUT
+halted with transfer-complete moved `chan->xfer_len`, the length asked for. **Fixed (R5a2, built, not yet
+run):** `bulk_xfer` returns the asked length for a completed OUT. Both disk write paths look only at
+whether a command succeeded, not at the count, so the disk's behaviour does not change.
+
+Predicted on R5a2: `13 probe request(s) sent, 0 not` per sweep, `tx - 13 frames ... 0 failed` (26 after
+two), and the probe responses to us as before.
