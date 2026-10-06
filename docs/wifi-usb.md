@@ -503,8 +503,11 @@ hard-off order, the shell's wording): passed.**
   there: a failed reset waits a second, and repeating it every half second would stall every request
   behind it. That correction came after the rerun, so the cable-arrival path itself is not yet seen.
 - **GENET's backend had the same shape and has the same fix** (`genet_main`, `serve` with `mac: Option`):
-  the radio is served when the MAC does not come up, and the MAC is tried again when a cable arrives. Owed
-  a Pi 4 card.
+  the radio is served when the MAC does not come up, and the MAC is tried again when a cable arrives.
+  **The Pi 4's card (2026-10-06): no regression, and the failure path not reached.** `chaos max-carnage` 20
+  rounds, 155 kills, kernel alive; `nic-driver` respawned 8 times and GENET came up every time; the radio
+  rejoined after and `ping 8.8.8.8` went 5 of 5. The GENET failure path and the cable-arrival retry on
+  both boards stay unseen, since nothing has needed them yet.
 - **Also seen, at boot:** a `wifi status` typed during the AIC8800's 12-second firmware upload was never
   answered. The shell held it owed until its 30-second bound (`owed for over 30 s never came - forgotten`),
   refusing `wifi` meanwhile. The serve loop's tagged reply looks right, so the request was most likely lost
