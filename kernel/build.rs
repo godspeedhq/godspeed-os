@@ -203,7 +203,8 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         // The power policy (docs/power.md). Arch-neutral: on a board whose clock the OS cannot set it
         // says so once and answers every lease "no control", which costs a holder nothing.
         "power",
-        // The USB WiFi dongle's driver (docs/wifi-usb.md), reached through dwc2; idle until a dongle is bound.
+        // The USB WiFi dongle's driver (docs/wifi-usb.md), reached through dwc2; started by the supervisor when
+        // dwc2 reports the dongle.
         "wifi-usb",
     ];
     let arm_dir = workspace
@@ -246,8 +247,8 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         &["events", "recorder", "copier", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
-          // The Pi 4's onboard radio, over SDIO. aarch64-only: it is the ONE board in this tree with a
-          // WiFi part soldered to an SD host controller, and the Pi 2's dongle is a different problem
+          // The Pi 4's onboard radio, over SDIO: on aarch64, the board with a WiFi part soldered to an SD
+          // host controller (the VisionFive's is in its own list), and the Pi 2's dongle is a different problem
           // (a USB soft-MAC part, docs/wifi.md phase 6).
           "wifi-driver",
           // The power policy, which holds the Arm clock fast while the radio loads (docs/power.md).

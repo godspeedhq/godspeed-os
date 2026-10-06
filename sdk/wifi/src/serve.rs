@@ -10,8 +10,8 @@
 //!
 //! - **`who`**: the service's name opens every line it logs, where `wifi-driver:` was written in.
 //! - **[`Host`]**: what is AROUND the radio rather than in it. The power operations (the Pi 4 and the
-//!   VisionFive cut and restore the chip's power through `DevicePower`; a dongle's power is its USB
-//!   port's and is not this service's to cut), and the notices that arrive with no reply cap - which
+//!   VisionFive cut and restore the chip's power through `DevicePower`; the dongle powers its chip down
+//!   by register (R9), its port's 5 V staying on), and the notices that arrive with no reply cap - which
 //!   were counted and dropped, and on `wifi-usb` are the host saying a transfer is waiting or the
 //!   dongle went away.
 //! - **`gs`**: the receive and the reply are the standard library's (`gs::ipc`), the one way a service
@@ -54,7 +54,7 @@ pub enum Notice {
 /// Every method has the answer for a radio with neither, so a host implements only what it has.
 pub trait Host {
     /// Whether this host can cut the chip's power at all. Asked BEFORE `wifi radio off hard` leaves the
-    /// network: a dongle's power is its USB port's, and leaving first and then finding no power to cut left
+    /// network: a host with no way to power its chip down says no, and leaving first and then finding no power to cut left
     /// the station off its network while the shell said "the radio is as it was" (seen on the Pi 2,
     /// 2026-10-06). The kernel may still refuse a host that says yes; that case is unchanged.
     fn can_cut_power(&self) -> bool {
@@ -633,8 +633,9 @@ pub fn serve<'s>(
                 out[4] = 0;
                 if host.cut_power(ctx) {
                     // Quiet for as long as the power stays off - and while it is off nothing in this loop
-                    // touches the bus after the one-CMD52 check below that the cut took: auto-join needs `radio_on`, the sweep was stopped above, and every
-                    // request is answered from the powered-off arms (docs/wifi.md 48).
+                    // touches the bus after the one check below that the cut took (`Host::verify_off`):
+                    // auto-join needs `radio_on`, the sweep was stopped above, and every request is
+                    // answered from the powered-off arms (docs/wifi.md 48).
                     powered_off = true;
                     radio_on = false;
                     say(ctx, who, "`wifi radio off hard` - the chip's power is cut and stays cut until `wifi radio on`");
@@ -742,7 +743,7 @@ pub fn serve<'s>(
             // the recovery this driver does for itself when it finds a firmware it cannot adopt
             // (docs/wifi.md 47). The power is cut and restored here, because this service holds
             // DEVICE_POWER; what follows is the SHELL's, because it holds restart authority: it kills this
-            // instance, and the respawn finds a card that does not answer the CCCR - the boot's own path.
+            // instance, and the respawn finds a cold chip - the boot's own path.
             // The reply goes out before the kill arrives, so the operator is told the cycle happened (or
             // that this machine cannot do it) rather than left with a prompt that went quiet.
             (wire::OP_RADIO, Some(session)) if payload.get(1).copied() == Some(wire::RADIO_POWERCYCLE) => {

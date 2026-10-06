@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! THE USB RADIO'S FUNCTION PROTOCOL: what a USB host service (`dwc2`, later `xhci`) answers for the one
+//! THE USB RADIO'S FUNCTION PROTOCOL: what a USB host service (`dwc2`, and `xhci` since U2a) answers for the one
 //! device it has bound as a WiFi radio, and what `wifi-usb` asks. ONE definition, read by both sides.
 //!
 //! **Narrow on purpose.** A host binds a radio by its VID:PID - a vendor-class device, so there is no class
@@ -39,8 +39,8 @@ pub const OP_BULK_IN: u8 = 0x23;
 /// `ST_FAILED` when the device or the bus did not take it.
 pub const OP_BULK_OUT: u8 = 0x24;
 
-/// `[OP_SYNC, notice]`: **never answered.** A driver spawned without a reply mailbox (a respawn, once the
-/// routing table is past its reserve - `spawn[ipc]: ... gets no reply mailbox`) awaits its replies on the
+/// `[OP_SYNC, notice]`: **never answered.** A driver spawned without a reply mailbox (past the routing table's
+/// reserve with no mailbox credit left - `spawn[ipc]: ... gets no reply mailbox`, `docs/wifi-usb.md` 19, 20) awaits its replies on the
 /// endpoint the host's notices also arrive on, and the kernel hands a call the host's NEXT message, matched
 /// by sender and not by request. So a notice can be taken as the answer, and every answer after it is one
 /// behind. The driver that receives a notice in place of an answer sends this, naming the notice: its call

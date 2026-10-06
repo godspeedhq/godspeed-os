@@ -191,8 +191,9 @@ impl Host for Heard<'_> {
                 collect(ctx, self, sweep);
                 Notice::Taken
             }
-            // The binding MAY have changed: ask, and end the loop only if it did. `dwc2` sends more than one
-            // of these for one bind, and the first card of R4 (2026-10-06) showed what ending the loop on
+            // The binding MAY have changed: ask, and end the loop only if it did. A `NOTE_RADIO` can repeat
+            // what `OP_INFO` at start already said (an `OP_SYNC` re-send, or a notice that arrived before the
+            // start), and the first card of R4 (2026-10-06) showed what ending the loop on
             // each costs: the loop entered three times at boot, `/wifi.keys` loaded three times, and the
             // auto-join tried three times - harmless while a join is refused, and three real joins once R5
             // makes one. `main.rs` asked the same question of every notice before the loop was shared.

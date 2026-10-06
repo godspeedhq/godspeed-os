@@ -3,12 +3,13 @@
 //!
 //! Since U1 (`docs/wifi-usb.md`) the driver is the `wifi-usb` service, and this file is what the USB host
 //! owes it: the dongle matched by VID:PID and bound as THE radio, and `godspeed_wifi::usbfn` served for
-//! that one device - who it is, and its control transfers - and for nothing else on the bus. The chip's
+//! that one device - who it is, its control transfers, and its bulk IN and OUT - and for nothing else on the bus. The chip's
 //! registers, firmware and 802.11 are `wifi-usb`'s; this file builds no Realtek request of its own except
 //! milestone 1's two reads at bind, kept because they are the line a board log is checked against.
 //!
-//! The host TELLS the driver when the binding changes (`usbfn::NOTE_RADIO`, `announce`), so the
-//! driver blocks rather than asking on a timer (U1b).
+//! `announce` TELLS the driver when the binding changes (`usbfn::NOTE_RADIO`), so the driver blocks rather
+//! than asking on a timer (U1b), and REPORTS it to the supervisor (`usbdev`), which starts and stops the
+//! driver with the dongle (`docs/usb-device-drivers.md`).
 //!
 //! **Receive (R3b):** one bulk IN on `CH_RADIO_RX`, armed in the background once `wifi-usb` first asks
 //! `OP_BULK_IN`, taken on the USB interrupt (`service`), held until collected, with `usbfn::NOTE_BULK_IN`
@@ -400,7 +401,6 @@ fn bulk_in_request(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, 
     let _ = gs::ipc::reply(ctx, reply, &Message::from_bytes(&out[..2 + n]));
 }
 
-/// The heartbeat's line about the radio's receive.
 /// `OP_BULK_OUT`: `p` is `[op, out, transfer...]`. Staged in the arena and sent on the bulk channel, the
 /// disk's, by the same transfer the disk uses - one at a time, which is all one service can make - with the
 /// endpoint's toggle carried forward. The radio's IN stands aside for it as for any bulk transfer
@@ -430,6 +430,7 @@ fn bulk_out(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, p: &[u8
     }
 }
 
+/// The heartbeat's line about the radio's receive.
 pub fn report(ctx: &ServiceContext, r: &Radio) {
     let s = &r.stats;
     let state = match r.rx {

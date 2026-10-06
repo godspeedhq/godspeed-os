@@ -23,7 +23,7 @@ use godspeed_sdk::{Dma, Mmio, ServiceContext};
 /// on top of the bulk endpoints this file configures - and because it is the capability whose absence
 /// kept a USB stack in the kernel.
 mod msc;
-/// The USB WiFi dongle, bound by VID:PID and served to `wifi-usb` (U2, `docs/wifi-usb.md` 7).
+/// The USB WiFi dongle, bound by VID:PID and served to `wifi-usb` (U2, `docs/wifi-usb.md` 7 for the design, 25 for U2a).
 mod radio;
 
 /// Shadow topology model - observation only, see docs/xhci-topology.md.

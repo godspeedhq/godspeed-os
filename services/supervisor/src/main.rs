@@ -14,10 +14,11 @@
 //! What it does, in order:
 //!   1. Spawns `events`, then `console` (the display changes hands once, early).
 //!   2. In non-bare-metal builds, `pong` on core 1 then `ping` on core 0 (§23.2), then the probes.
-//!   3. Spawns the service set: time, control, hw-enumerator, the USB host, block-driver, fs,
-//!      shell, nic-driver, net-stack - in dependency order (`services/CLAUDE.md`).
-//!   4. Logs "supervisor: ready" once every spawn has completed.
-//!   5. Runs the death-notification restart loop, forever.
+//!   3. Spawns the service set: time, control, power, hw-enumerator, the USB hosts, block-driver, fs,
+//!      wifi-usb (on `xhci`'s boards), shell, the radio and audio drivers, nic-driver, net-stack - in
+//!      dependency order (`services/CLAUDE.md`).
+//!   4. Asks each reporting USB host for its device report, converges, and logs "supervisor: ready".
+//!   5. Runs the main loop - death notices, operator commands, USB device reports - forever.
 //!
 //! This header said "Non-restartable" and "Yields indefinitely (death-notification restart loop
 //! deferred to Phase 6)". Phase 6 shipped: the loop is ~1,400 lines below, and the supervisor is the
@@ -252,7 +253,7 @@ static XHCI_ELF: &[u8] = include_bytes!(env!("SVC_XHCI_ELF"));
 static EHCI_ELF: &[u8] = include_bytes!(env!("SVC_EHCI_ELF"));
 #[cfg(has_dwc2)]
 static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
-// The onboard radio, which only the Pi 4 has. Same shape as the USB gates above and for the same
+// The onboard radio (the Pi 4's CYW43455, the VisionFive's AIC8800). Same shape as the USB gates above and for the same
 // reason: `build.rs` decides what it embedded and sets the cfg, so this is that one fact rather than a
 // second copy of it.
 #[cfg(has_wifi_driver)]
@@ -714,8 +715,8 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
 const _: () = assert!(!USB_IMAGES.is_empty(),
     "a USB host image was embedded but USB_IMAGES has no row for it");
 
-/// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
-/// kernel catalogue", which is how the two coexist while services move across one at a time.
+/// Spawn `name` from a supervisor-held image, if we hold one. `None` means no image by that name is
+/// held here; the caller then asks the kernel, whose catalogue holds only the supervisor (step C).
 fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
                   installs: &[(&str, CapHandle)])
     -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
@@ -1168,7 +1169,7 @@ const MANAGED: [&str; MANAGED_N] =
      // (x86_64, aarch64, riscv64 - `enumerator` in build.rs), and reconcile skips any name absent from
      // the map, so listing it unconditionally costs the Pi 2 nothing, exactly as `dwc2` costs x86 nothing.
      "hw-enumerator",
-     // The Pi 4's radio. Listed unconditionally for the reason `dwc2` and `hw-enumerator` above are:
+     // The onboard radio. Listed unconditionally for the reason `dwc2` and `hw-enumerator` above are:
      // reconcile skips any name absent from the name-cap map, so a service only one board spawns costs
      // the others nothing - and being absent from this list is what left arm32's storage, keyboard and
      // network down with no backstop when a death notification was dropped.
@@ -1569,8 +1570,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // hw-enumerator: hardware discovery in userspace (step D2). Started here because it holds no
     // device and blocks nothing - it reads PCI config space once, reports, then answers questions.
     //
-    // x86 ONLY, and the cfg is load-bearing rather than tidiness. ARM has no port I/O address space,
-    // so the image is not embedded there - and asking to spawn a name the kernel has no image for
+    // Embedded where configuration space is reachable (x86, aarch64, riscv64; `has_hw_enumerator`), and
+    // the cfg is load-bearing rather than tidiness. The Pi 2 has no PCI, so the image is not embedded there - and asking to spawn a name the kernel has no image for
     // does NOT quietly do nothing: the kernel embeds an empty placeholder and the spawn fails with
     // `LoadFailed(TooSmall)`. An earlier version of this line was unconditional with a comment
     // asserting it was "a no-op on ARM", which was simply untrue; `scripts/service_embed_check.py`
@@ -1604,7 +1605,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // `ensure_mapped` adopts a running instance rather than spawning a second: the supervisor is
     // restartable (Phase 6), so this line runs again on every respawn, and two drivers on one
     // controller is a worse failure than the one being fixed.
-    // Gated on the ARCHITECTURE only, deliberately. The test-build feature list that guards `xhci`
+    // Gated on the board having a DWC2 (`has_dwc2`) only, deliberately. The test-build feature list that guards `xhci`
     // below buys nothing here: on this board `dwc2` is not one driver among several, it is the only
     // path to storage, keyboard and network, so every arm32 build that boots at all wants it. Fewer
     // conditions also means fewer ways for this spawn to silently not happen - which is the exact
@@ -1661,8 +1662,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     ensure_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
 
-    // The dongle's driver, once its USB host (above) and `fs` are up, so both its peers wire at spawn.
-    // Nothing waits on it: it asks the host itself, and says when there is no dongle.
+    // The dongle's driver, after `fs`. On the PCs its host, `xhci`, is spawned further down, so that
+    // peer is not wired at spawn and the driver reacquires it by name on first use (`host_name`). Nothing
+    // waits on it: it asks the host itself, and says when there is no dongle.
     // Started HERE only where its host does not report yet (`xhci`). Where it does (`dwc2`), the
     // supervisor starts it when the host reports the dongle attached (`usb_report`), and stops it when the
     // host reports it gone.

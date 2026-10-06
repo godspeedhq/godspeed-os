@@ -3,7 +3,7 @@
 //! ops, and which of the cable and the radio carries `net-stack`'s frames. Moved out of `genet.rs` whole
 //! when the VisionFive's `dwmac` gained the same bridge (`docs/wifi-aic8800.md`, phase V6), so the rule -
 //! the cable always wins - and the radio's bounded exchange are written once for every board. Included by
-//! `#[path]` from each backend that uses it; see the note where `genet.rs` and `dwmac.rs` include it.
+//! `#[path]` from each backend that uses it; see the note where `genet.rs`, `dwmac.rs` and `main.rs` (the Pi 2) include it.
 //!
 //! WHICH SERVICE IS THE RADIO is the backend's to say (`Radio::new`): `wifi-driver` beside GENET and
 //! `dwmac`, whose radios are on the board, and `wifi-usb` beside the Pi 2's USB ethernet, whose radio is a
@@ -13,8 +13,8 @@ use godspeed_sdk::{CapHandle, Message, ServiceContext};
 
 /// Which link carries `net-stack`'s frames.
 ///
-/// **THE CABLE ALWAYS WINS.** While the PHY reports a link, frames go over GENET; the moment it does not,
-/// they go to `wifi-driver` over the same three ops this service answers upward (`docs/wifi.md` 2) - if
+/// **THE CABLE ALWAYS WINS.** While the PHY reports a link, frames go over the cable; the moment it does
+/// not, they go to the radio's service (`wifi-driver` or `wifi-usb`, `Radio::new`) over the same three ops this service answers upward (`docs/wifi.md` 2) - if
 /// the radio is joined - and come back to the cable the moment it returns. Decided by the operator on
 /// 2026-09-29, in these words: "cable always wins. unplug the cable, switch to wifi automatically." One
 /// link at a time, chosen by the cable rather than by a command, and the choice lives here because this
@@ -34,7 +34,7 @@ pub(crate) enum Carrier {
 /// pay it for nothing, and a switch half a second late is not something a person can see.
 pub(crate) const CABLE_RECHECK_MS: u64 = 500;
 
-/// The bound on one exchange with `wifi-driver`, in milliseconds - and it is SHORT on purpose. This was a
+/// The bound on one exchange with the radio's service, in milliseconds - and it is SHORT on purpose. This was a
 /// second, and the first boot showed what a second costs: `net-stack` gives up on this service well inside
 /// it and sends its next request, which queues behind the one still waiting; sixteen of those and this
 /// service's inbox is full, at which point the radio's answer cannot land in it and every exchange times
@@ -49,12 +49,12 @@ const RADIO_SLOW_MS: u64 = 20;
 const RADIO_REACQUIRE_AFTER: u32 = 3;
 /// How long a radio that has gone silent (`RADIO_REACQUIRE_AFTER` requests in a row) is held DOWN before
 /// the next probe. Every request inside the window is answered without asking the radio, so this driver
-/// stays answerable to net-stack while wifi-driver is being brought up from cold (~30 s after a
+/// stays answerable to net-stack while the radio's service is being brought up from cold (~30 s after a
 /// `wifi radio reload`) or is simply dead. A second: long enough that the serve loop is not spending
 /// its time on bounded waits that will fail, short enough that a radio coming back is noticed at once.
 const RADIO_BACKOFF_MS: u64 = 1_000;
 
-/// The radio as a backend: `wifi-driver` reached over the frame ops, the way the Pi 2's `nic-driver`
+/// The radio as a backend: the radio's service reached over the frame ops, the way the Pi 2's `nic-driver`
 /// reaches `dwc2` (`main.rs`, `kernel_net_main`) - one bounded request, one reacquire-and-retry when the
 /// cap is stale (the radio is spawned by the supervisor and may be respawned after us), and every reply
 /// checked against the op it answers, because the radio's endpoint also serves the `wifi` utility and a
@@ -295,7 +295,7 @@ pub(crate) fn status(ctx: &ServiceContext, radio: &mut Radio, cable: bool, mac: 
     // [7]. The ninth byte names the carrier for `net` (1 the cable, 2 the radio, 0 neither), and
     // is what makes this reply nine bytes where every other backend's is eight or more, so a
     // reader can tell whose it is. The link is LIVE either way: the cable from the PHY, the radio
-    // from `wifi-driver`'s own word on its join.
+    // from the radio service's own word on its join.
     let mut out = [0u8; 9];
     out[0] = 1;
     let next = if cable {

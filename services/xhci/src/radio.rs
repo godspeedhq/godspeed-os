@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The USB WiFi dongle, behind `xhci` (U2, `docs/wifi-usb.md` 7). This host binds it by VID:PID and serves
+//! The USB WiFi dongle, behind `xhci` (U2, `docs/wifi-usb.md` 7 for the design, 25 for U2a). This host binds it by VID:PID and serves
 //! `godspeed_wifi::usbfn` for it to `wifi-usb` - the protocol `dwc2` serves on the Pi 2, answered the same
 //! way, so the dongle's driver cannot tell the hosts apart.
 //!
@@ -343,7 +343,7 @@ pub fn answer_absent(ctx: &ServiceContext, msg: &Message) -> bool {
 const DRIVER: &str = "wifi-usb";
 
 /// Tell `wifi-usb` the radio's binding changed (`usbfn::NOTE_RADIO`): `try_send`, never blocking on a driver
-/// that is behind, reacquired by name once if the cap is stale - `wifi-usb` is spawned after this service.
+/// that is behind, reacquired by name once if the cap is stale - either may be spawned or respawned after the other.
 /// Quiet when it cannot be delivered: on a board where `wifi-usb` is not built there is nobody to tell, and
 /// where it is, its own `OP_INFO` at start covers a notice it missed.
 pub fn notify_driver(ctx: &ServiceContext) {

@@ -20,8 +20,8 @@
 //! `_MAX_TRIES` and their `ASSOC` twins (`net/mac80211/mlme.c`). Then (R5c) the WPA2 four-way handshake, run
 //! by the supplicant every radio shares (`godspeed_wifi::supplicant`) over this station as its `KeyPath`:
 //! EAPOL frames go out as 802.11 data frames (`godspeed_wifi::data::to_80211`) and come in the same way,
-//! and the two keys go into the chip's CAM (`rtl8188::install_key`). A join that reaches `JOINED` stays
-//! joined; the frame path is R6.
+//! and the two keys go into the chip's CAM (`rtl8188::install_key`). The frame path (R6), the rate
+//! mask (R8), WMM and HT (R12) and the rekey (R7) follow below.
 
 use core::cell::RefCell;
 
@@ -709,7 +709,8 @@ impl Station for Dongle<'_> {
 
     fn link(&mut self, _ctx: &ServiceContext) -> Option<Link> {
         // What this station holds, not a fresh reading from the chip: it does not yet track the access
-        // point's beacons after the join (a lost link is R6's to notice), and the signal is the find's.
+        // point's beacons after the join (a lost link is not noticed yet: `pull` reports none), and the
+        // signal is the find's.
         Some(match self.assoc {
             Some(a) => Link { bssid: a.bssid, rssi: a.rssi as i32, chanspec: a.channel as u16 },
             None => Link { bssid: [0; 6], rssi: 0, chanspec: 0 },

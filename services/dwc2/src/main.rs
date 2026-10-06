@@ -1150,6 +1150,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // The message it returns must be SERVED, not dropped - `recv_timeout` consumes. That is
             // the exact bug that made the keyboard report `0 USB IRQ(s)` on a boot where the kernel
             // had delivered the interrupt, and it is one `let _ =` away from happening again.
+
             // The radio's IN, once a pass: put back after the transfers this pass stood it aside for, and a
             // refused notice sent again. Before the block, so it is armed while the loop sleeps - which is
             // when frames arrive.

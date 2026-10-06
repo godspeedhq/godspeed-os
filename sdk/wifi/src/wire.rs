@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! The request/reply vocabulary between a radio driver and the shell's `wifi` utility. One definition, read
-//! by both sides (the frame ops `nic-driver` uses, 0x10-0x12, are the Broadcom driver's own, in its
-//! `frames.rs`) - it used to be the
+//! by both sides (the frame ops `nic-driver` uses, `OP_NET_*` 0x10-0x12, are below) - it used to be the
 //! driver's `scan::reply` and a hand-kept mirror of it in the shell (`wifi_wire`), the same fact twice.
 //!
 //! A reply's first byte is its status. A request may be TAGGED (`TAGGED`): see that constant.
@@ -14,7 +13,7 @@
 /// request just sent, so an answer the shell had stopped waiting for was read as the next request's.
 /// The shell tried to count what it was owed, and could not: its reply mailbox takes every peer's
 /// replies, and nothing on a message says who sent it. A tag is a fact in the reply itself. Chosen
-/// outside every request op (1-11 here, 0x10-0x12 in `frames`).
+/// outside every request op (1-11, and 0x10-0x12 for `OP_NET_*`).
 pub const TAGGED: u8 = 0xE7;
 
 /// Networks follow.

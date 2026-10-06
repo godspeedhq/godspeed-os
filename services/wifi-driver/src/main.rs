@@ -22,10 +22,10 @@
 //! running rather than reloading it, and rejoins from `/wifi.keys`. A radio that cannot be brought up is
 //! served as `radio down` with its reason (`wire::DOWN_*`) - answered loudly, never left to time out.
 //!
-//! **VisionFive 2 Lite (riscv64, `wifi_host_dw_mmc`): the AIC8800, phase V1** (`docs/wifi-aic8800.md`).
-//! `dwmmc.rs` drives the DesignWare host on the CMD line only: the radio is power-cycled, the card
-//! identified and its CIS read. Nothing is uploaded yet (V2), so it then answers `radio down` with the reason
-//! `DOWN_NOT_BUILT`, and refuses a power cycle that could not change that.
+//! **VisionFive 2 Lite (riscv64, `wifi_host_dw_mmc`): the AIC8800, phases V0-V6** (`docs/wifi-aic8800.md`).
+//! `dwmmc.rs` drives the DesignWare host; the radio is power-cycled and identified, the firmware uploaded
+//! and started (`aic.rs`), and the station served through the shared loop (`aic_station.rs`). A bring-up
+//! that stops short answers `radio down` with the reason `DOWN_NOT_BUILT`.
 //!
 //! ## Reference
 //!

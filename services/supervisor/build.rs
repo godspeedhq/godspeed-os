@@ -79,8 +79,8 @@ fn main() {
     };
 
     // The onboard WiFi radio, which on this board sits on an SD host controller rather than any bus
-    // that enumerates. aarch64 alone: the Pi 4 is the one machine here with a full-MAC part soldered to
-    // SDIO. Split out as its own list rather than added to `usb` for the same reason `enumerator` is -
+    // that enumerates. aarch64 and riscv64: the Pi 4's CYW43455 and the VisionFive 2 Lite's AIC8800D80, each a
+    // full-MAC part on an SD host. Split out as its own list rather than added to `usb` for the same reason `enumerator` is -
     // it answers a different question about the board, and a list that answers two questions stops
     // being readable as either.
     //
@@ -89,8 +89,8 @@ fn main() {
     // inside `main.rs`. The kernel still refuses the MMIO grant on a board whose census found no
     // controller, so an embedded-but-radioless build reports "no radio" and serves rather than dying.
     // riscv64 joined on 2026-10-04: the VisionFive 2 Lite's AIC8800D80 sits on its second SD host
-    // (docs/wifi-aic8800.md). Phase V0 grants the host and its power pin and the driver serves `no radio`
-    // until the AIC8800 protocol exists; on QEMU's `virt` no window is granted at all.
+    // (docs/wifi-aic8800.md). Its driver is hardware-verified through V6 (scan, join, frames);
+    // on QEMU's `virt` no window is granted at all.
     let radio: &[&str] = if arch == "aarch64" || arch == "riscv64" { &["wifi-driver"] } else { &[] };
 
     // The USB WiFi dongle's driver (docs/wifi-usb.md), embedded where a USB host serves the radio

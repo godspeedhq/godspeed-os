@@ -480,7 +480,7 @@ fn init_llt(ctx: &ServiceContext) -> Result<(), &'static str> {
 }
 
 /// `rtl8xxxu_gen1_usb_quirks`: the USB PHY writes Linux makes for the interface's interference, the second
-/// block because this part is not a UMC A-cut.
+/// block unconditionally: Linux skips it on a UMC A-cut, which this driver does not check yet.
 fn usb_quirks(ctx: &ServiceContext) -> Result<(), &'static str> {
     for (a, b) in [(0xE0, 0x8D)] {
         write8(ctx, 0xFE40, a)?;
@@ -814,8 +814,6 @@ pub fn set_bssid(ctx: &ServiceContext, bssid: &[u8; 6]) -> Result<(), &'static s
     Ok(())
 }
 
-/// `rtl8xxxu_gen1_config_channel` for a 20 MHz HT channel: the band width registers, the channel into
-/// `RF_MODE_AG`, the SIFS timings, the 20 MHz bit. `channel` is 1 to 14.
 /// `REG_HPON_FSM`: an 8192C's bonding (`HPON_FSM_BONDING_MASK`), which says whether it transmits on one
 /// path or two (`rtl8192cu_identify_chip`).
 pub(crate) const REG_HPON_FSM: u16 = 0x00EC;
@@ -850,6 +848,8 @@ pub fn set_tx_power(ctx: &ServiceContext, power: &TxPower, channel: u8) -> Resul
     Ok(())
 }
 
+/// `rtl8xxxu_gen1_config_channel` for a 20 MHz HT channel: the band width registers, the channel into
+/// `RF_MODE_AG`, the SIFS timings, the 20 MHz bit. `channel` is 1 to 14.
 pub fn set_channel(ctx: &ServiceContext, channel: u8, power: &TxPower) -> Result<(), &'static str> {
     let o = read8(ctx, REG_BW_OPMODE)?;
     write8(ctx, REG_BW_OPMODE, o | (1 << 2))?;
@@ -870,7 +870,7 @@ pub fn set_channel(ctx: &ServiceContext, channel: u8, power: &TxPower) -> Result
 
 /// R3a: everything `rtl8xxxu_init_device` does after the firmware that bears on RECEIVING, then
 /// `rtl8xxxu_start`'s RF enable, filters and gain, then `channel`. Left out, and recorded in
-/// `docs/wifi-usb.md`: the transmit side (power, the response rate set and retry limits, the EDCA, ACK and
+/// `docs/wifi-usb.md`: the transmit side (the response rate set and retry limits, the EDCA, ACK and
 /// beacon timings), the IQ calibration and the thermal meter - none decides whether a beacon is heard.
 /// `RF_MODE_AG` read back after the channel is set, for the caller to check.
 pub fn init_radio(ctx: &ServiceContext, cold: bool, channel: u8, power: &TxPower) -> Result<(usize, u32), &'static str> {

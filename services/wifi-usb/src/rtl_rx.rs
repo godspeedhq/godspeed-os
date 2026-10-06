@@ -8,7 +8,7 @@
 //! every build. Every rule here is `rtl8xxxu`'s (26.14), read from the source rather than summarised:
 //! `struct rtl8xxxu_rxdesc16` and `struct rtl8723au_phy_stats` (`rtl8xxxu.h`), `rtl8xxxu_parse_rxdesc16`
 //! (`core.c`), `rtl8723au_rx_parse_phystats` (`core.c`) and `rtl8723a_cck_rssi` (`8723a.c`, which the 8192C
-//! family's `fops` names). R3b in `docs/wifi-usb.md`; nothing calls this until `dwc2` has a bulk IN path.
+//! family's `fops` names). R3b in `docs/wifi-usb.md`; `rx.rs` walks every transfer the host's bulk IN hands up.
 
 /// `sizeof(struct rtl8xxxu_rxdesc16)`: six little-endian words.
 pub const DESC_LEN: usize = 24;
@@ -83,7 +83,7 @@ pub struct Packet<'a> {
     pub desc: Desc,
     /// The PHY status, when the descriptor says there is one and it arrived whole.
     pub phy: Option<&'a [u8]>,
-    /// The 802.11 frame, FCS included, cut to `pkt_len` - or to what arrived, if the transfer ended first
+    /// The 802.11 frame, cut to `pkt_len` (no FCS: RCR does not append it) - or to what arrived, if the transfer ended first
     /// (`truncated` then says so; such a frame is not to be trusted past its header).
     pub frame: &'a [u8],
     pub truncated: bool,

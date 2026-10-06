@@ -4,9 +4,9 @@
 //!
 //! Read from Linux's `rtl8xxxu` (`core.c`, fetched 2026-10-06): `rtl8xxxu_tx` builds the common words and
 //! `rtl8xxxu_fill_txdesc_v1` - the "gen1" format the 8188CU, 8192CU and 8723AU use - the chip-specific
-//! ones, then `rtl8xxxu_calc_tx_desc_csum` signs the first 32 bytes. Only what a MANAGEMENT frame takes is
-//! built here: a data frame's QoS, aggregation and protection bits are R6's (26.14: the silicon's layout,
-//! taken whole; which frames this driver sends is ours).
+//! ones, then `rtl8xxxu_calc_tx_desc_csum` signs the first 32 bytes. A management frame's descriptor, and a
+//! data frame's (`data`: protection, QoS, short GI; aggregation never, since it is declined) (26.14: the
+//! silicon's layout, taken whole; which frames this driver sends is ours).
 //!
 //! Pure, and naming nothing outside `core`, so `scripts/host_test_check.py` runs its tests on every build.
 
@@ -43,8 +43,8 @@ pub const RATE_1M: u32 = 0x00;
 /// one endpoint, 0 for two, and `TRXDMA_QUEUE_HIGH ^ 3` = 0 for three: always the first.
 pub const MGNT_OUT: u8 = 0;
 
-/// `TXDESC_QUEUE_BE`: best effort, where a data frame goes when the association has no QoS - this station
-/// offers no WMM element, so every data frame it sends is best effort.
+/// `TXDESC_QUEUE_BE`: best effort - the queue for a non-QoS association, and for TID 0, the only TID this
+/// station sends on.
 pub const QUEUE_BE: u32 = 0x0;
 
 /// The bulk OUT endpoint, as a POSITION, that best-effort data is sent on: `out_ep[bep]` in

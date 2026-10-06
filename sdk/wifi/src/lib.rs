@@ -39,7 +39,7 @@
 //! radio drivers use. This is an ordinary library beside it, with no `unsafe` at all.
 //!
 //! It is a crate rather than one service with vendor backends because the radios will not all live in one
-//! service: the Pi 2's USB dongle has its own, `wifi-usb`, reaching the chip through the `dwc2` host service
+//! service: the Pi 2's USB dongle has its own, `wifi-usb`, reaching the chip through its USB host service (`dwc2`, or `xhci`)
 //! (`docs/wifi-usb.md`), and a library serves both shapes.
 //!
 //! # Known gap

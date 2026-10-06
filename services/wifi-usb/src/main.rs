@@ -12,7 +12,7 @@
 //!
 //! A Realtek RTL8188CUS today: a soft-MAC radio whose register file is reached by a vendor control
 //! request. This service holds no hardware at all. The USB host service that enumerated the dongle -
-//! `dwc2` on the Pi 2 - bound it as the radio, and answers `godspeed_wifi::usbfn` for that one device;
+//! `dwc2` on the Pi 2, `xhci` on the T630 (U2a) - bound it as the radio, and answers `godspeed_wifi::usbfn` for that one device;
 //! every register read, and later the firmware and the frames, is a request to it.
 //!
 //! **U1, this card: the plumbing.** Wait for the host to report the dongle, then read the same two
@@ -91,8 +91,9 @@ const SYS_CFG_TYPE_92C: u32 = 1 << 27;
 pub(crate) fn host(ctx: &ServiceContext, body: &[u8]) -> Result<Message, &'static str> {
     let ask = |m: &[u8]| gs::call::request_within(ctx, host_name(ctx), &Message::from_bytes(m), HOST_SECS).map_err(|e| e.as_str());
     let mut r = ask(body)?;
-    // A NOTICE IN PLACE OF THE ANSWER. A respawn of this service gets no reply mailbox once the routing
-    // table is past its reserve (seen on every respawn on the Pi 2, 2026-10-06), and then the kernel hands
+    // A NOTICE IN PLACE OF THE ANSWER. An instance with no reply mailbox - one spawned past the routing
+    // table's reserve with no mailbox credit to take back (docs/wifi-usb.md 19, 20) - awaits its replies on
+    // its own endpoint, and then the kernel hands
     // a call the host's next message - its notices included. Taken as the answer, a notice puts every
     // answer after it one behind: R9's first power cycle stopped at "the host answered something other
     // than CONTROL" and then every request was "malformed". `OP_SYNC` names the notice and is never
@@ -151,6 +152,7 @@ fn identify<'l>(ctx: &ServiceContext, vid: u16, pid: u16, link: &'l RefCell<rx::
                 if c & SYS_CFG_VENDOR_UMC != 0 { "UMC" } else { "TSMC" },
                 if c & SYS_CFG_TEST_CHIP != 0 { "TEST" } else { "normal" },
                 // `rtl8192cu_load_firmware`'s choice: not UMC -> _TMSC; UMC and (a later cut or a 92C) -> _B; else _A.
+                // (Linux excludes a 1T2R 8191C from "a 92C"; this log line does not.)
                 if c & SYS_CFG_VENDOR_UMC == 0 {
                     "rtl8192cufw_TMSC.bin"
                 } else if (c >> SYS_CFG_CHIP_VER_SHIFT) & 0xF != 0 || c & SYS_CFG_TYPE_92C != 0 {
