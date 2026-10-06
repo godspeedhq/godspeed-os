@@ -1464,3 +1464,17 @@ survives the reset is not known. That is hot-plug, a later card.
 - the bring-up stopping before `R3a done`: a control transfer this host gets wrong, which the step that
   stopped names;
 - `could not be repaired` lines.
+
+**The U2a card's first run (T630, 2026-10-06): the binding works, the driver asked the wrong host.**
+- `xhci: DEVICE DESCRIPTOR class=0x00 VID=0x0bda PID=0x8176`, then `the WiFi dongle 0bda:8176 on port 7
+  (slot 1) - configured, bound as the radio for wifi-usb (U2a)`, then the poll loop entered with the
+  dongle alone. The keyboard on `ehci` was unaffected.
+- **`wifi-usb: asking dwc2 about the radio: the service could not be reached`.** On x86 `wifi-usb` is
+  spawned before `xhci`, so at its spawn the peer was declared but not wired. `host_name` took "the first
+  host I hold a cap for", found none, and fell back to `dwc2`, which this machine does not have. Fixed: a
+  host not yet held is REACQUIRED by name before falling back.
+- **Ten seconds after binding, the dongle's port read empty** (`[topo] root port 7 attached -> empty`),
+  then connected again: `new device on port 7 - re-enumerating`, which rebound it. Nothing else in the log
+  explains it: no `ehci` event, nothing sent to the dongle. It is NOT diagnosed. The next run logs the
+  whole `PORTSC` when the bound dongle's port reads empty, so it can be read rather than guessed (a real
+  detach, or a link state).

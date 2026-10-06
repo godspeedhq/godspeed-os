@@ -5203,6 +5203,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         break 'poll;
                     }
                     if !c {
+                        // The WiFi dongle's port reading empty while it is bound (U2a, T630, 2026-10-06:
+                        // ten seconds after binding, then "new device" and a re-enumeration). Said with the
+                        // whole PORTSC once per change, so the next run shows whether it was a real detach
+                        // or a link-state change, rather than a guess.
+                        if present & (1 << p) != 0 && radio.as_ref().is_some_and(|r| r.port == p) {
+                            ctx.log_fmt(format_args!(
+                                "xhci: the WiFi dongle's port {} reads EMPTY while bound - PORTSC={:#010x}",
+                                p, mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10)));
+                        }
                         present &= !(1 << p);
                         // The port is empty, so whatever refused to enumerate on it is gone. Clear
                         // its poison: the bound exists to stop retrying a device that will not come

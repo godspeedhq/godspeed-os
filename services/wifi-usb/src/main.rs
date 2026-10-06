@@ -64,10 +64,15 @@ use rtl8188::{read32, REG_SYS_CFG, REG_SYS_ISO_CTRL};
 /// names no board itself (U2).
 const HOSTS: [&str; 2] = ["dwc2", "xhci"];
 
-/// The host this service was given: the first of `HOSTS` it was wired to. `dwc2` when none is, which only a
-/// broken spawn row could produce, and whose requests then fail and say so.
+/// The host this service was given: the first of `HOSTS` it holds a capability for, else the first it can
+/// REACQUIRE by name. A host spawned after this service is declared but not yet wired: on the T630 (U2a,
+/// 2026-10-06) `xhci` came up after `wifi-usb`, this fell back to `dwc2` - absent there - and the first ask
+/// failed with "the service could not be reached". `dwc2` when neither works, whose requests then fail and
+/// say so.
 fn host_name(ctx: &ServiceContext) -> &'static str {
-    HOSTS.iter().copied().find(|h| gs::ipc::peer(ctx, h).is_some()).unwrap_or(HOSTS[0])
+    HOSTS.iter().copied().find(|h| gs::ipc::peer(ctx, h).is_some())
+        .or_else(|| HOSTS.iter().copied().find(|h| gs::cap::reacquire(ctx, h)))
+        .unwrap_or(HOSTS[0])
 }
 /// The bound on one request to the host. A control transfer takes milliseconds; the host retries a
 /// transient itself, so a request still unanswered after this is a host that is not serving.
