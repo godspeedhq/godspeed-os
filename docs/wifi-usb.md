@@ -36,6 +36,7 @@ is due when a scan exists, not before.
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
 | `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |
+| `OP_BULK_OUT` 0x24 | `[op, out, transfer...]` - `out` the OUT endpoint's position in the configuration descriptor | `[op, status]` |
 | `NOTE_BULK_IN` 0x2E | sent by the HOST to the driver, `[note]`, no reply cap: a transfer is held | none |
 | `NOTE_RADIO` 0x2F | sent by the HOST to the driver, `[note]`, no reply cap | none |
 
@@ -544,3 +545,56 @@ back to `R3b done` with no STATUS-stage error, and the join stayed refused namin
 turned up something that is not WiFi's: two entries with one name in `/` (`backlog/75`).
 
 R4 is done on the Pi 2. Owed elsewhere: the Pi 4 and the VisionFive check card for the shared loop (above).
+
+## 11. R5a (2026-10-06): the first frame sent - a probe request on every channel the sweep tunes - built, NOT YET RUN
+
+R5 is the join: authentication, association and the WPA2 handshake, each of them frames this driver must
+SEND. So it starts with sending one, and the smallest frame whose arrival can be seen from here is a probe
+request: every access point that hears it and beacons answers with a probe response addressed to the
+sender, and the receive path built in R3b already reads those. One wildcard probe request (any SSID, any
+network) goes out on each channel as the sweep tunes it.
+
+**The host half: `OP_BULK_OUT`** (`usbfn`, 0x24): `[op, out, transfer...]` -> `[op, status]`, where `out` is
+the endpoint's POSITION among the radio's bulk OUT endpoints in its configuration descriptor - the order
+Linux's `rtl8xxxu_parse_usb` fills `out_ep[]` in - so the driver maps queues to endpoints as
+`rtl8xxxu_init_queue_priority` does without knowing an endpoint number. `dwc2` finds the OUT endpoints at bind
+in the same walk as the IN (and keeps none that are not high-speed, as for the IN), stages the frame in its
+arena at 0x5000, after the radio's receive area, and sends it on the bulk channel with the disk's own
+transfer (`msc::bulk_xfer`, now shared), carrying each endpoint's data toggle forward. The radio's IN stands
+aside for it like any bulk transfer. A transfer the chip keeps NAKing for 200 ms is reported not sent. The
+heartbeat's `radio rx` line gains `tx - frames, bytes, failed`.
+
+**The driver half**, every value read from `rtl8xxxu` (`core.c`, fetched 2026-10-06):
+
+- **The station's address and link type** (`rtl8188::set_station`): `REG_MACID` to the efuse address a byte
+  at a time (`rtl8xxxu_set_mac`) and port 0's link type to station (`rtl8xxxu_set_linktype`), which Linux
+  does when the interface is added. Without it the chip drops a probe response addressed to us: `RCR`
+  accepts unicast only when the address matches.
+- **The descriptor** (`rtl_tx.rs`, host-tested): `rtl8xxxu_tx`'s common words and
+  `rtl8xxxu_fill_txdesc_v1`'s for a management frame - own, first and last segment, broadcast for a
+  group address; the management queue (0x12) and `AGG_BREAK`; the sequence number; the driver's rate, 1
+  Mb/s; a retry limit of 6 - signed by `rtl8xxxu_calc_tx_desc_csum`'s XOR.
+- **The endpoint**: the management queue is `out_ep[mgp]`, and `mgp` is 0 for one, two or three endpoints
+  (for three it is `TRXDMA_QUEUE_HIGH ^ 3`, and that queue is 3), so position 0 always.
+- **The frame** (`mgmt::probe_request`, host-tested): IEEE 802.11 9.3.3.10 - broadcast, the wildcard BSSID,
+  the wildcard SSID, and the 2.4 GHz rates (1, 2, 5.5 and 11 basic; 6 to 54 in the two rate elements).
+
+**Transmit power is the table's, not calibrated.** The baseband table R3a loads sets path A's TX AGC
+(`0xE00`-`0xE1C`, and the CCK bytes in `0xE08` and `0x86C`) to fixed mid values; Linux replaces them with the
+per-channel values in the efuse (`rtl8xxxu_gen1_set_tx_power`). That is enough for a probe across a room; it
+is not what Linux transmits at, and the calibration is a later card.
+
+**Prediction for the card** (the Pi 2, the dongle in):
+
+1. At bind, `dwc2`'s configured line names the bulk OUT endpoints (expected two, high and normal, as R2's
+   queue reading found), "sent on channel 0". After R3a, `the chip is a station at its efuse address`.
+2. `wifi scan`: the sweep as in R4, and at its end `13 probe request(s) sent, 0 not`.
+3. `wifi-usb: the FIRST probe response addressed to us - ...; R5a done`, during that sweep.
+4. The heartbeat's `radio rx` line: `tx - 13 frames` (and more with each scan), `0 failed`.
+5. As many networks as R4 found or more - a network that beacons rarely now answers within the dwell.
+
+**Refuted by:** `a probe request was not sent` with the host's reason (the host half: no OUT endpoint, a
+STALL, or a NAK past 200 ms - the chip not taking frames: its transmit DMA, pages or queue map); probes
+counted as sent and no probe response to us ever (the frame is on the bus and not on the air - the
+descriptor, the queue, the power - or on the air and not answered, which the access point's side would have
+to show); or the keyboard or disk stalling during a sweep.

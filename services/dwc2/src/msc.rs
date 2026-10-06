@@ -183,7 +183,7 @@ const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
 /// recovers. Treating the first as the second is not a cosmetic error on this board: the kernel
 /// driver issued a Mass Storage Reset plus two clear-halts for every busy hand-back and logged 564
 /// spurious recoveries in ONE selfcheck, resetting a stick that was never broken.
-pub enum XferErr {
+pub(crate) enum XferErr {
     /// Out of time with no transport error - the device is pacing us.
     Busy,
     /// STALL, repeated transaction errors, or a channel that never halted.
@@ -197,7 +197,7 @@ pub enum XferErr {
 /// difference between a driver that survives this board's stick and one that declares it broken: it
 /// goes BUSY for tens of seconds under load, and a 45-second stall was observed on this branch.
 #[allow(clippy::too_many_arguments)]
-fn bulk_xfer(
+pub(crate) fn bulk_xfer(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target, mps: u16,
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
 ) -> Result<u32, XferErr> {

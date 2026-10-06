@@ -6,7 +6,8 @@
 //! to match on - and then serves exactly that device: who it is, and its control transfers. It is not a
 //! passthrough to the bus: a host never lets a client address another device, and knows nothing of the
 //! chip behind the requests. The register file, the firmware and the 802.11 above them are `wifi-usb`'s.
-//! Bulk transfers join when frames do (`docs/wifi-usb.md`).
+//! Bulk transfers carry the frames: one IN the host keeps armed (`OP_BULK_IN`), and an OUT per frame sent
+//! (`OP_BULK_OUT`, `docs/wifi-usb.md`).
 //!
 //! Every reply starts `[op, status]`; the status is one of the `ST_` values, so a reply to the wrong op, or a
 //! host that does not speak this protocol, is told apart from an answer.
@@ -30,6 +31,13 @@ pub const OP_CONTROL_ONCE: u8 = 0x22;
 /// `NOTE_BULK_IN`; it does not arm again until the transfer is collected, so the chip holds what arrives
 /// meanwhile and nothing is dropped between the two. `ST_FAILED` when the radio has no bulk IN endpoint.
 pub const OP_BULK_IN: u8 = 0x23;
+/// `[op, out, transfer...]` -> `[op, status]`: one bulk OUT transfer to the radio - a frame with the chip's
+/// transmit descriptor in front of it. `out` is the endpoint's POSITION among the radio's bulk OUT endpoints
+/// in its configuration descriptor, 0 first: the order Linux's `rtl8xxxu_parse_usb` fills `out_ep[]` in, so
+/// the driver maps its queues to endpoints as `rtl8xxxu_init_queue_priority` does without knowing any
+/// endpoint's number. `ST_BAD_REQUEST` for an `out` the radio does not have or an empty transfer;
+/// `ST_FAILED` when the device or the bus did not take it.
+pub const OP_BULK_OUT: u8 = 0x24;
 
 /// `[NOTE_BULK_IN]`, sent BY the host TO the driver, no reply expected: a bulk IN transfer is held, ask
 /// `OP_BULK_IN`. Sent with `try_send`; one the driver's full queue refused is sent again on the host's next
@@ -67,3 +75,7 @@ pub const CONTROL_MAX: usize = 256;
 pub const BULK_IN_MAX: usize = 3584;
 const _: () = assert!(BULK_IN_MAX + 2 <= godspeed_sdk::ipc::MAX_PAYLOAD);
 const _: () = assert!(BULK_IN_MAX % 512 == 0);
+
+/// The most one bulk OUT transfer carries: the rest of an IPC message after the op and the endpoint byte. A
+/// full-length frame with its 32-byte descriptor is about 2,400 bytes, so this is room, not a squeeze.
+pub const BULK_OUT_MAX: usize = godspeed_sdk::ipc::MAX_PAYLOAD - 2;

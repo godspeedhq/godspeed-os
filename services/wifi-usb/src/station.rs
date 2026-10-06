@@ -5,9 +5,10 @@
 //!
 //! **The sweep is the host's to run.** A full-MAC radio is told "scan" and reports what its firmware heard;
 //! this chip is soft-MAC, so the sweep is this file: tune a channel, listen for `DWELL_MS`, tune the next,
-//! through 1 to 13, then back to the channel it was on. It LISTENS - a passive scan, nothing transmitted -
-//! so a network that beacons is found and a hidden one that only answers probes is not. Probing is a
-//! transmit, which waits for the transmit path (R5).
+//! through 1 to 13, then back to the channel it was on. Since R5a it also ASKS: one wildcard probe request
+//! on each channel as it is tuned, the first frame this driver sends. Networks that beacon answer it with a
+//! probe response addressed to us (`rx.rs` counts those); a hidden network answers only a probe that names
+//! it, which is the join's to send.
 //!
 //! **Frames arrive as they always did** (R3b): the host takes the bulk IN on its interrupt and sends
 //! `NOTE_BULK_IN`, which the serve loop hands to this service's `Host` (`rx.rs`) with the running sweep, and
@@ -25,7 +26,9 @@ use godspeed_wifi::rxq::RxQueue;
 use godspeed_wifi::station::{Link, Outcome, Pulled, ScanStep, Secret, Station};
 use godspeed_wifi::wire;
 
-use crate::rtl8188;
+use godspeed_wifi::{mgmt, usbfn};
+
+use crate::{rtl8188, rtl_tx};
 
 /// The channels swept: 1 to 13, the 2.4 GHz channels outside Japan's 14. Listening transmits nothing, so a
 /// channel a regulatory domain does not allow us to TRANSMIT on is still one we may hear.
@@ -47,6 +50,11 @@ pub struct Dongle {
     sweep: Option<Hop>,
     /// Hops the RF chip did not take, this boot - each one is said once by the sweep that met it.
     hops_failed: u32,
+    /// The 802.11 sequence number of the next frame sent, 12 bits.
+    seq: u16,
+    /// Probe requests the host took, and refused, in the sweep running now.
+    probes_sent: u32,
+    probes_refused: u32,
 }
 
 /// Where a sweep is: the channel tuned now, and when it was tuned.
@@ -57,7 +65,48 @@ struct Hop {
 
 impl Dongle {
     pub fn new(mac: [u8; 6], home: u8) -> Self {
-        Dongle { mac, home, sweep: None, hops_failed: 0 }
+        Dongle { mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0 }
+    }
+
+    /// The dongle's own address, from its efuse.
+    pub fn address(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    /// One wildcard probe request on the channel tuned now: the frame (`mgmt::probe_request`), its
+    /// descriptor (`rtl_tx::mgmt`), and the host's bulk OUT for the management queue. Counted; the first
+    /// refusal is said, with the host's status.
+    fn probe(&mut self, ctx: &ServiceContext) {
+        let mut frame = [0u8; mgmt::PROBE_REQUEST_MAX];
+        let n = mgmt::probe_request(&self.mac, self.seq, &[], &mut frame);
+        let desc = rtl_tx::mgmt(n as u16, self.seq, true);
+        self.seq = (self.seq + 1) & 0x0FFF;
+        let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + mgmt::PROBE_REQUEST_MAX];
+        req[0] = usbfn::OP_BULK_OUT;
+        req[1] = rtl_tx::MGNT_OUT;
+        req[2..2 + rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
+        req[2 + rtl_tx::TX_DESC_LEN..2 + rtl_tx::TX_DESC_LEN + n].copy_from_slice(&frame[..n]);
+        let took = match crate::host(ctx, &req[..2 + rtl_tx::TX_DESC_LEN + n]) {
+            Ok(r) => match r.payload_bytes() {
+                [usbfn::OP_BULK_OUT, usbfn::ST_OK, ..] => Ok(()),
+                [usbfn::OP_BULK_OUT, st, ..] => Err(match *st {
+                    usbfn::ST_NO_DEVICE => "the dongle is no longer bound",
+                    usbfn::ST_BAD_REQUEST => "the host has no such bulk OUT, or refused the transfer as malformed",
+                    _ => "the device or the bus did not take it",
+                }),
+                _ => Err("the host answered something other than BULK_OUT - not speaking it yet"),
+            },
+            Err(why) => Err(why),
+        };
+        match took {
+            Ok(()) => self.probes_sent = self.probes_sent.saturating_add(1),
+            Err(why) => {
+                if self.probes_refused == 0 {
+                    ctx.log_fmt(format_args!("wifi-usb: a probe request was not sent - {}", why));
+                }
+                self.probes_refused = self.probes_refused.saturating_add(1);
+            }
+        }
     }
 
     /// Tune `channel` for the sweep; `false` when the RF chip did not take it, said here.
@@ -78,6 +127,9 @@ impl Station for Dongle {
         if !self.tune(ctx, FIRST) {
             return false;
         }
+        self.probes_sent = 0;
+        self.probes_refused = 0;
+        self.probe(ctx);
         self.sweep = Some(Hop { channel: FIRST, since: Since::now(ctx) });
         ctx.log_fmt(format_args!(
             "wifi-usb: sweep started - listening on channels {} to {}, {} ms each", FIRST, LAST, DWELL_MS));
@@ -97,15 +149,16 @@ impl Station for Dongle {
             let home = self.home;
             let back = self.tune(ctx, home);
             ctx.log_fmt(format_args!(
-                "wifi-usb: sweep done - {} network(s) on channels {} to {}{}",
-                scan.count(), FIRST, LAST,
+                "wifi-usb: sweep done - {} network(s) on channels {} to {}, {} probe request(s) sent, {} not{}",
+                scan.count(), FIRST, LAST, self.probes_sent, self.probes_refused,
                 if back { "; back on the channel it was on" } else { "; NOT back on the channel it was on (above)" }));
             return ScanStep::Ended("the last channel's dwell");
         }
-        if !self.tune(ctx, next) {
-            // A channel the chip would not take is skipped, said once above, and the sweep goes on: the
-            // rest of the band is still worth hearing.
+        if self.tune(ctx, next) {
+            self.probe(ctx);
         }
+        // A channel the chip would not take is skipped, said once above, and the sweep goes on: the rest of
+        // the band is still worth hearing - and is not probed, since a probe would go out on the wrong one.
         self.sweep = Some(Hop { channel: next, since: Since::now(ctx) });
         ScanStep::Frame
     }

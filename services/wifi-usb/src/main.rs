@@ -42,6 +42,8 @@ mod rtl_fw;
 mod rtl_queues;
 // Read by `rx` (R3b): what the host's bulk IN hands up. Host-tested as well.
 mod rtl_rx;
+// What goes in front of a frame the host sends (R5a). Host-tested as well.
+mod rtl_tx;
 mod rtl_tables;
 mod rx;
 mod station;
@@ -220,7 +222,18 @@ fn bring_up(ctx: &ServiceContext) -> Option<[u8; 6]> {
                 "wifi-usb: MAC, baseband and RF set up in {} ms ({} RF registers); RF_MODE_AG reads {:#07x} - channel {}{}",
                 clock.elapsed_us() / 1000, rf, mode, on,
                 if on == FIRST_CHANNEL { ", as asked; R3a done" } else { " - NOT the channel asked for" }));
-            (on == FIRST_CHANNEL).then_some(mac)
+            if on != FIRST_CHANNEL {
+                return None;
+            }
+            // R5a: a station at its own address, so the chip passes up what is addressed to it.
+            match rtl8188::set_station(ctx, &mac) {
+                Ok(()) => ctx.log("wifi-usb: the chip is a station at its efuse address (REG_MACID, REG_MSR)"),
+                Err(why) => {
+                    ctx.log_fmt(format_args!("wifi-usb: the station address was not set - {}", why));
+                    return None;
+                }
+            }
+            Some(mac)
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the radio's set-up stopped - {}", why));
@@ -306,6 +319,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 Ok(Some((vid, pid))) => {
                     heard = rx::Heard::new();
                     dongle = identify(&ctx, vid, pid);
+                    if let Some(d) = dongle.as_ref() {
+                        heard.us = d.address();
+                    }
                 }
                 Ok(None) => ctx.log_fmt(format_args!(
                     "wifi-usb: {} has no dongle bound - waiting to be told when one is", host_name(&ctx))),

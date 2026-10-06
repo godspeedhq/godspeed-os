@@ -506,6 +506,25 @@ fn enable_rf(ctx: &ServiceContext) -> Result<(), &'static str> {
     write8(ctx, REG_TXPAUSE, 0x00)
 }
 
+/// `REG_MACID`: the station's own address, six bytes. The chip ACKs and passes up a unicast frame only when it
+/// matches (`RCR_ACCEPT_PHYS_MATCH`), so a probe response to us is dropped until it is set.
+const REG_MACID: u16 = 0x0610;
+/// `REG_MSR`: the link type of port 0 in bits 1:0 (`MSR_LINKTYPE_STATION` = 2), port 1's in bits 3:2.
+const REG_MSR: u16 = 0x0102;
+const MSR_LINKTYPE_STATION: u8 = 0x2;
+
+/// R5a: the chip told it is a station at `mac` - `rtl8xxxu_add_interface`'s two writes, `rtl8xxxu_set_linktype`
+/// for port 0 (keeping port 1's bits) and `rtl8xxxu_set_mac` a byte at a time. Linux does this when the
+/// interface is added, before any scan; R3a left it out because nothing was sent or addressed to us yet.
+pub fn set_station(ctx: &ServiceContext, mac: &[u8; 6]) -> Result<(), &'static str> {
+    let m = read8(ctx, REG_MSR)? & 0x0C;
+    write8(ctx, REG_MSR, m | MSR_LINKTYPE_STATION)?;
+    for (i, &b) in mac.iter().enumerate() {
+        write8(ctx, REG_MACID + i as u16, b)?;
+    }
+    Ok(())
+}
+
 /// `rtl8xxxu_gen1_config_channel` for a 20 MHz HT channel: the band width registers, the channel into
 /// `RF_MODE_AG`, the SIFS timings, the 20 MHz bit. `channel` is 1 to 14.
 pub fn set_channel(ctx: &ServiceContext, channel: u8) -> Result<(), &'static str> {

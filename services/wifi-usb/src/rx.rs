@@ -36,13 +36,18 @@ pub struct Heard {
     /// What the host said was bound when the serve loop was entered (`main.rs`). A `NOTE_RADIO` ends the
     /// loop only when the host now says something else.
     pub serving: Result<Option<(u16, u16)>, &'static str>,
+    /// The dongle's own address, once it is a station (R5a): a probe response addressed to it answers OUR
+    /// probe request, which is the proof a frame we sent reached the air.
+    pub us: [u8; 6],
+    /// Probe responses addressed to `us`.
+    answers: u32,
 }
 
 impl Heard {
     pub const fn new() -> Self {
         Heard {
             transfers: 0, frames: 0, beacons: 0, crc: 0, cut: 0, seen: [[0; 6]; NETWORKS], n_seen: 0,
-            no_bulk_said: false, serving: Ok(None),
+            no_bulk_said: false, serving: Ok(None), us: [0; 6], answers: 0,
         }
     }
 }
@@ -124,8 +129,8 @@ fn collect(ctx: &ServiceContext, h: &mut Heard, mut sweep: Option<&mut Scan>) {
         }
         if h.transfers % SUMMARY_EVERY == 0 {
             ctx.log_fmt(format_args!(
-                "wifi-usb: rx - {} transfers, {} frames ({} beacons, {} failed their CRC, {} cut short), {} networks named",
-                h.transfers, h.frames, h.beacons, h.crc, h.cut, h.n_seen));
+                "wifi-usb: rx - {} transfers, {} frames ({} beacons, {} failed their CRC, {} cut short), {} networks named, {} answers to our probes",
+                h.transfers, h.frames, h.beacons, h.crc, h.cut, h.n_seen, h.answers));
         }
     }
 }
@@ -147,6 +152,12 @@ fn heard(ctx: &ServiceContext, h: &mut Heard, sweep: Option<&mut Scan>, pk: &rtl
     let Some(b) = mgmt::beacon(pk.frame) else { return };
     h.beacons = h.beacons.wrapping_add(1);
     let bssid = b.bssid();
+    if b.answers_a_probe() && h.us != [0; 6] && mgmt::addressed_to(pk.frame, &h.us) {
+        h.answers = h.answers.wrapping_add(1);
+        if h.answers == 1 {
+            ctx.log("wifi-usb: the FIRST probe response addressed to us - a probe request we sent reached the air; R5a done");
+        }
+    }
     let rssi = rtl_rx::rssi(pk.phy, pk.desc.rxmcs);
     if let Some(scan) = sweep {
         keep(scan, &b, rssi);

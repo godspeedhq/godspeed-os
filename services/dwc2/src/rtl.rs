@@ -78,6 +78,42 @@ pub struct Radio {
     /// Consecutive transaction errors on the IN, for `RX_ERROR_TRIES`.
     errs_run: u32,
     pub stats: RxStats,
+    /// The bulk OUT endpoints, in configuration-descriptor order (`usbfn::OP_BULK_OUT`'s `out`), their
+    /// packet size, and each one's data toggle - carried forward from the channel after every transfer, as
+    /// the disk's are (`msc::bulk_xfer`).
+    outs: [u8; MAX_OUT],
+    n_out: usize,
+    out_mps: u16,
+    pid_out: [u32; MAX_OUT],
+    pub tx: TxStats,
+}
+
+/// What has been sent to the radio, for the heartbeat.
+#[derive(Default)]
+pub struct TxStats {
+    pub frames: u32,
+    pub bytes: u32,
+    pub failed: u32,
+}
+
+/// The most bulk OUT endpoints kept: Linux's `RTL8XXXU_OUT_ENDPOINTS` is 6 for its whole family; the
+/// RTL8188CUS has two or three, so three is the bound here, and a fourth is not addressable.
+const MAX_OUT: usize = 3;
+/// Where a frame to send is staged: after the radio's receive area, inside the 64 KiB arena.
+const RADIO_TX_OFF: usize = 0x5000;
+const _: () = assert!(RADIO_TX_OFF >= RADIO_RX_OFF + usbfn::BULK_IN_MAX);
+const _: () = assert!(RADIO_TX_OFF + usbfn::BULK_OUT_MAX <= 64 * 1024);
+/// How long one frame may take to go out: a bulk OUT the chip NAKs is it pacing us (its transmit FIFO full),
+/// and a frame is milliseconds; past this the frame is reported not sent.
+const RADIO_TX_BUDGET_MS: u64 = 200;
+
+/// The radio's endpoints, as `configure` found them.
+struct Eps {
+    ep_in: u8,
+    in_mps: u16,
+    outs: [u8; MAX_OUT],
+    n_out: usize,
+    out_mps: u16,
 }
 
 /// Where the radio's receive is. `Armed { at }`: the IN is programmed to land at `RADIO_RX_OFF + at`, `at` being
@@ -127,17 +163,20 @@ const HS_BULK_MPS: u16 = 512;
 /// `wifi-usb` reaches its registers and says itself what failed.
 pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, pid: u16) -> Radio {
     stop(ctx, mmio);
-    let (ep_in, in_mps) = configure(ctx, mmio, dma, t).unwrap_or((0, 0));
+    let e = configure(ctx, mmio, dma, t)
+        .unwrap_or(Eps { ep_in: 0, in_mps: 0, outs: [0; MAX_OUT], n_out: 0, out_mps: 0 });
     let _ = probe(ctx, mmio, dma, t);
     Radio {
-        t: *t, vid, pid, ep_in, in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false, errs_run: 0,
-        stats: RxStats::default(),
+        t: *t, vid, pid, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
+        errs_run: 0, stats: RxStats::default(),
+        outs: e.outs, n_out: e.n_out, out_mps: e.out_mps, pid_out: [chan::PID_DATA0; MAX_OUT],
+        tx: TxStats::default(),
     }
 }
 
-/// Read the configuration descriptor, find the bulk IN endpoint, and SET_CONFIGURATION. `None`, said, on
-/// any failure; `Some((0, 0))` when it configured but has no high-speed bulk IN.
-fn configure(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<(u8, u16)> {
+/// Read the configuration descriptor, find the bulk IN endpoint and the bulk OUTs, and SET_CONFIGURATION.
+/// `None`, said, on any failure; an `ep_in` of 0 when it configured but has no high-speed bulk IN.
+fn configure(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<Eps> {
     const TRIES: u32 = 4;
     let ctl = |setup: &[u8; 8], buf: &mut [u8], data_in: bool, len: usize| -> bool {
         (0..TRIES).any(|i| {
@@ -165,16 +204,49 @@ fn configure(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option
         return None;
     }
     let (ep, mps) = bulk_in(&full, want).unwrap_or((0, 0));
+    let mut e = Eps { ep_in: 0, in_mps: 0, outs: [0; MAX_OUT], n_out: 0, out_mps: 0 };
+    bulk_outs(&full, want, &mut e);
+    // A bulk OUT that is not 512 bytes is a full-speed dongle behind the hub, which needs splits this host
+    // does not run for bulk, exactly as for the IN below: none is kept, and transmit is off, said.
+    if e.n_out > 0 && e.out_mps != HS_BULK_MPS {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: RTL8188CUS bulk OUT is {} bytes, not high-speed - no transmit", e.out_mps));
+        e.n_out = 0;
+    }
     if ep == 0 || mps != HS_BULK_MPS {
         ctx.log_fmt(format_args!(
             "dwc2-svc: RTL8188CUS configured ({}) but no high-speed bulk IN (endpoint {}, {} bytes) - control only, no receive",
             cfg_val, ep, mps));
-        return Some((0, 0));
+        return Some(e);
     }
+    e.ep_in = ep;
+    e.in_mps = mps;
     ctx.log_fmt(format_args!(
-        "dwc2-svc: RTL8188CUS configured ({}) - bulk IN endpoint {}, {} bytes, received on channel {}",
-        cfg_val, ep, mps, CH_RADIO_RX));
-    Some((ep, mps))
+        "dwc2-svc: RTL8188CUS configured ({}) - bulk IN endpoint {}, {} bytes, received on channel {}; {} bulk OUT ({:?}), sent on channel {}",
+        cfg_val, ep, mps, CH_RADIO_RX, e.n_out, &e.outs[..e.n_out], chan::CH_BULK));
+    Some(e)
+}
+
+/// The bulk OUT endpoints, in the order the configuration descriptor lists them - `rtl8xxxu_parse_usb`'s
+/// `out_ep[j++]` - up to `MAX_OUT`, with the packet size of the first. Every length is the device's.
+fn bulk_outs(buf: &[u8], total: usize, e: &mut Eps) {
+    let mut i = 0usize;
+    while i + 2 <= total {
+        let len = buf[i] as usize;
+        if len < 2 || i + len > total {
+            return;
+        }
+        if buf[i + 1] == DESC_ENDPOINT && len >= 7 && buf[i + 3] & 0x03 == EP_TYPE_BULK && buf[i + 2] & 0x80 == 0 {
+            if e.n_out < MAX_OUT {
+                if e.n_out == 0 {
+                    e.out_mps = u16::from_le_bytes([buf[i + 4], buf[i + 5]]) & 0x07FF;
+                }
+                e.outs[e.n_out] = buf[i + 2] & 0x0F;
+                e.n_out += 1;
+            }
+        }
+        i += len;
+    }
 }
 
 /// The first bulk IN endpoint in a configuration descriptor, and its packet size - Linux's
@@ -304,6 +376,35 @@ fn bulk_in_request(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, 
 }
 
 /// The heartbeat's line about the radio's receive.
+/// `OP_BULK_OUT`: `p` is `[op, out, transfer...]`. Staged in the arena and sent on the bulk channel, the
+/// disk's, by the same transfer the disk uses - one at a time, which is all one service can make - with the
+/// endpoint's toggle carried forward. The radio's IN stands aside for it as for any bulk transfer
+/// (`chan::program_ping`). A status byte.
+fn bulk_out(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, p: &[u8]) -> u8 {
+    let idx = p.get(1).copied().unwrap_or(u8::MAX) as usize;
+    let data = p.get(2..).unwrap_or(&[]);
+    if idx >= r.n_out || data.is_empty() || data.len() > usbfn::BULK_OUT_MAX {
+        return usbfn::ST_BAD_REQUEST;
+    }
+    for (i, &b) in data.iter().enumerate() {
+        dma.write8(RADIO_TX_OFF + i, b);
+    }
+    let sent = crate::msc::bulk_xfer(ctx, mmio, &r.t, r.out_mps, false, r.outs[idx],
+                                     dma.phys_at(RADIO_TX_OFF) as u32, data.len() as u32, RADIO_TX_BUDGET_MS,
+                                     &mut r.pid_out[idx]);
+    match sent {
+        Ok(n) if n as usize == data.len() => {
+            r.tx.frames = r.tx.frames.wrapping_add(1);
+            r.tx.bytes = r.tx.bytes.wrapping_add(n);
+            usbfn::ST_OK
+        }
+        _ => {
+            r.tx.failed = r.tx.failed.wrapping_add(1);
+            usbfn::ST_FAILED
+        }
+    }
+}
+
 pub fn report(ctx: &ServiceContext, r: &Radio) {
     let s = &r.stats;
     let state = match r.rx {
@@ -313,8 +414,8 @@ pub fn report(ctx: &ServiceContext, r: &Radio) {
         Rx::Held(_) => "held for wifi-usb",
     };
     ctx.log_fmt(format_args!(
-        "dwc2-svc: radio rx - {} transfers {} bytes, {} asides, {} errors (last HCINT={:#010x}), {} notices late; {}",
-        s.transfers, s.bytes, s.asides, s.errors, s.last_err, s.notes_late, state));
+        "dwc2-svc: radio rx - {} transfers {} bytes, {} asides, {} errors (last HCINT={:#010x}), {} notices late; {}; tx - {} frames {} bytes, {} failed",
+        s.transfers, s.bytes, s.asides, s.errors, s.last_err, s.notes_late, state, r.tx.frames, r.tx.bytes, r.tx.failed));
 }
 
 fn tell_bulk(ctx: &ServiceContext) -> bool {
@@ -408,6 +509,11 @@ pub fn serve(
     let op = p.first().copied().unwrap_or(0);
     let radio = match (op, radio) {
         (usbfn::OP_BULK_IN, Some(r)) => return bulk_in_request(ctx, mmio, dma, r, reply),
+        (usbfn::OP_BULK_OUT, Some(r)) => {
+            let st = bulk_out(ctx, mmio, dma, r, p);
+            let _ = gs::ipc::reply(ctx, reply, &Message::from_bytes(&[op, st]));
+            return;
+        }
         (_, r) => r,
     };
     let mut out = [0u8; 2 + usbfn::CONTROL_MAX];

@@ -11,8 +11,12 @@
 //! Every length here comes from the air. A frame too short for its fixed fields is not a beacon, and an
 //! element walk that runs off the end stops rather than reads past it.
 //!
+//! And the one frame a passive listener needs to SEND to stop being passive: a probe request
+//! ([`probe_request`]), for a radio whose host builds its frames (the RTL8188CUS, from R5a).
+//!
 //! Pure, and named nothing outside `core`, so `scripts/host_test_check.py` runs the tests at the bottom on
-//! every build. The layout is IEEE 802.11-2020 9.3.3.3 (beacon) and 9.3.3.11 (probe response), which share it.
+//! every build. The layout is IEEE 802.11-2020 9.3.3.3 (beacon) and 9.3.3.11 (probe response), which share it,
+//! and 9.3.3.10 (probe request).
 
 /// The frame control's first byte for the two frames that carry a network's description: version 0, type
 /// management (0), subtype 8 for a beacon and 5 for a probe response.
@@ -24,10 +28,52 @@ const CAPABILITY_AT: usize = 34;
 const ELEMENTS_AT: usize = 36;
 
 /// Element IDs: the SSID (at most 32 bytes; zero is a hidden network) and the DS Parameter Set, whose one
-/// byte is the channel the network is on.
+/// byte is the channel the network is on; and the two rate lists a probe request carries.
 const EID_SSID: u8 = 0;
+const EID_SUPP_RATES: u8 = 1;
 const EID_DS_PARAMS: u8 = 3;
+const EID_EXT_SUPP_RATES: u8 = 50;
 const SSID_MAX: usize = 32;
+
+/// A probe request's frame control: version 0, type management, subtype 4.
+const FC_PROBE_REQ: u8 = 0x40;
+/// The rates a 2.4 GHz station offers, in the elements' unit of 500 kb/s: 1, 2, 5.5 and 11 Mb/s (DSSS and
+/// CCK, flagged basic with bit 7, as every 2.4 GHz network requires them), then 6, 9, 12 and 18 - eight,
+/// the most the Supported Rates element holds - and 24, 36, 48 and 54 in the Extended Supported Rates.
+const RATES: [u8; 8] = [0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24];
+const EXT_RATES: [u8; 4] = [0x30, 0x48, 0x60, 0x6C];
+/// The longest probe request [`probe_request`] builds: the 24-byte header, an SSID element of up to 32
+/// bytes, and the two rate elements.
+pub const PROBE_REQUEST_MAX: usize = 24 + 2 + SSID_MAX + 2 + RATES.len() + 2 + EXT_RATES.len();
+
+/// A probe request from `sa`, sequence number `seq`, into `out`; the bytes written. Broadcast, to any
+/// network (the wildcard BSSID); for `ssid` empty, any SSID (the wildcard SSID) - which networks that
+/// beacon answer and hidden ones do not - and for a name, that network, hidden or not. No FCS: the radio
+/// appends it.
+pub fn probe_request(sa: &[u8; 6], seq: u16, ssid: &[u8], out: &mut [u8; PROBE_REQUEST_MAX]) -> usize {
+    let ssid = &ssid[..ssid.len().min(SSID_MAX)];
+    out.fill(0);
+    out[0] = FC_PROBE_REQ;
+    // [2..4] duration: 0, the station's to leave for the access point to fill.
+    out[4..10].copy_from_slice(&[0xFF; 6]);
+    out[10..16].copy_from_slice(sa);
+    out[16..22].copy_from_slice(&[0xFF; 6]);
+    out[22..24].copy_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
+    let mut at = 24;
+    for (id, body) in [(EID_SSID, ssid), (EID_SUPP_RATES, &RATES[..]), (EID_EXT_SUPP_RATES, &EXT_RATES[..])] {
+        out[at] = id;
+        out[at + 1] = body.len() as u8;
+        out[at + 2..at + 2 + body.len()].copy_from_slice(body);
+        at += 2 + body.len();
+    }
+    at
+}
+
+/// Whether `frame` (a beacon or probe response) was addressed to `us` - a probe response answering our
+/// own probe request, rather than one heard on its way to somebody else's.
+pub fn addressed_to(frame: &[u8], us: &[u8; 6]) -> bool {
+    frame.len() >= 10 && &frame[4..10] == us
+}
 
 /// A beacon or probe response, borrowed from the frame it was read from.
 pub struct Beacon<'a> {
@@ -100,6 +146,44 @@ pub fn element(ies: &[u8], id: u8) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wildcard_probe_request_is_the_standards_frame() {
+        let sa = [0x02, 0, 0, 0, 0, 9];
+        let mut f = [0u8; PROBE_REQUEST_MAX];
+        let n = probe_request(&sa, 0x123, &[], &mut f);
+        assert_eq!(n, 24 + 2 + 2 + 8 + 2 + 4);
+        assert_eq!(f[0], 0x40);
+        assert_eq!(&f[4..10], &[0xFF; 6], "to everyone");
+        assert_eq!(&f[10..16], &sa);
+        assert_eq!(&f[16..22], &[0xFF; 6], "any network");
+        assert_eq!(u16::from_le_bytes([f[22], f[23]]), 0x1230, "the sequence number above the fragment number");
+        assert_eq!(&f[24..26], &[0, 0], "the wildcard SSID: element 0, length 0");
+        assert_eq!(&f[26..28], &[1, 8]);
+        assert_eq!(f[28], 0x82, "1 Mb/s, basic");
+        assert_eq!(&f[36..38], &[50, 4]);
+        assert_eq!(f[41], 0x6C, "54 Mb/s last");
+    }
+
+    #[test]
+    fn a_directed_probe_request_carries_the_name() {
+        let mut f = [0u8; PROBE_REQUEST_MAX];
+        let n = probe_request(&[2, 0, 0, 0, 0, 1], 0, b"net", &mut f);
+        assert_eq!(&f[24..29], &[0, 3, b'n', b'e', b't']);
+        assert_eq!(n, 24 + 5 + 10 + 6);
+        // A name over 32 bytes is cut to the element's limit rather than written past it.
+        assert_eq!(probe_request(&[0; 6], 0, &[b'a'; 40], &mut f), PROBE_REQUEST_MAX);
+    }
+
+    #[test]
+    fn addressed_to_reads_the_first_address() {
+        let us = [2, 0, 0, 0, 0, 7];
+        let (mut f, n) = frame(FC_PROBE_RESP, 0, &[]);
+        assert!(!addressed_to(&f[..n], &us), "the helper frames go to broadcast");
+        f[4..10].copy_from_slice(&us);
+        assert!(addressed_to(&f[..n], &us));
+        assert!(!addressed_to(&f[..9], &us), "too short to say");
+    }
 
     /// A beacon with the given fixed fields and elements appended.
     fn frame(fc: u8, cap: u16, ies: &[u8]) -> ([u8; 128], usize) {
