@@ -142,12 +142,15 @@ pub struct Heard<'l> {
     /// The chip, once a bring-up has made a station of it: what its power-off needs (R9). `None` while
     /// there is no dongle up, and then there is nothing to power off.
     pub chip: Option<rtl8188::Chip>,
+    /// The bus the dongle is reached over, for `wifi hardware`: `USB` and the host serving it.
+    bus: &'static str,
 }
 
 impl<'l> Heard<'l> {
-    pub fn new(link: &'l RefCell<Link>) -> Self {
+    pub fn new(link: &'l RefCell<Link>, host: &str) -> Self {
         Heard {
             link,
+            bus: match host { "xhci" => "USB xhci", "dwc2" => "USB dwc2", _ => "USB" },
             transfers: 0, frames: 0, beacons: 0, crc: 0, cut: 0, seen: [[0; 6]; NETWORKS], n_seen: 0,
             no_bulk_said: false, serving: Ok(None), us: [0; 6], answers: 0, chip: None,
         }
@@ -185,6 +188,9 @@ fn ask(ctx: &ServiceContext) -> Result<Option<godspeed_sdk::Message>, &'static s
 }
 
 impl Host for Heard<'_> {
+    fn hardware(&self) -> godspeed_wifi::serve::Hardware {
+        godspeed_wifi::serve::Hardware { chip: "RTL8188CUS", bus: self.bus }
+    }
     fn notice(&mut self, msg: &[u8], sweep: Option<&mut Scan>, ctx: &ServiceContext) -> Notice {
         match msg {
             [usbfn::NOTE_BULK_IN] => {

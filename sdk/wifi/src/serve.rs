@@ -80,6 +80,12 @@ pub trait Host {
     }
     /// A message with no reply cap. `sweep` is the scan running now, so a host whose frames arrive as
     /// notices can keep what a sweep hears.
+    /// What this radio is, for `wifi hardware` (`wire::OP_HARDWARE`): the chip's name and the bus it is
+    /// reached over. The host's to say, not the station's: it is true while the radio is down, when there
+    /// is no station to ask.
+    fn hardware(&self) -> Hardware {
+        Hardware { chip: "unknown", bus: "unknown" }
+    }
     fn notice(&mut self, _msg: &[u8], _sweep: Option<&mut Scan>, _ctx: &ServiceContext) -> Notice {
         Notice::Ignored
     }
@@ -100,6 +106,12 @@ fn say_fmt(ctx: &ServiceContext, who: &str, args: core::fmt::Arguments) {
 }
 
 /// A request's correlation tag, if it carries one (`wire::TAGGED`), and the request without it.
+/// A radio's chip and bus, as `wifi hardware` shows them (`Host::hardware`).
+pub struct Hardware {
+    pub chip: &'static str,
+    pub bus: &'static str,
+}
+
 pub fn untag(raw: &[u8]) -> (Option<u8>, &[u8]) {
     match raw {
         [wire::TAGGED, tag, rest @ ..] => (Some(*tag), rest),
@@ -567,6 +579,20 @@ pub fn serve<'s>(
         // start (boot 2026-09-30 14:51) left neither of them able to say where the time went.
         let served_t0 = Since::now(ctx);
         let n = match (op, radio.as_deref_mut()) {
+            // What this radio is, before every other arm: true down, powered off or up (`wifi hardware`).
+            (wire::OP_HARDWARE, _) => {
+                let hw = host.hardware();
+                let mut at = 1;
+                out[0] = wire::OK;
+                for text in [hw.chip, hw.bus] {
+                    let b = text.as_bytes();
+                    let len = b.len().min(wire::HW_TEXT_MAX);
+                    out[at] = len as u8;
+                    out[at + 1..at + 1 + len].copy_from_slice(&b[..len]);
+                    at += 1 + len;
+                }
+                at
+            }
             // ---- Powered down (`wifi radio off hard`): these four arms come first, so nothing below talks
             // to a chip that has no power. ----
             (wire::OP_STATUS, _) if powered_off => {

@@ -440,7 +440,7 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
                                     // path are the loop's from here (`aic_station.rs`). It does not return. ----
                                     ctx.log("wifi-driver: stage 11 - the AIC8800 is a station; serving `wifi` and the frame path");
                                     let mut station = aic_station::Aic::new(&h, i.index, &f);
-                                    serve_radio(ctx, &h, Some(&mut station as &mut dyn Station), scan::reply::DOWN_NO_RADIO);
+                                    serve_radio(ctx, &h, Some(&mut station as &mut dyn Station), scan::reply::DOWN_NO_RADIO, "AIC8800D80");
                                 }
                                 None => ctx.log("wifi-driver: stage 9 - the station bring-up stopped; the line above names the message"),
                             }
@@ -486,7 +486,19 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
         let op = p.first().copied().unwrap_or(0);
         let mode = p.get(1).copied().unwrap_or(1);
         out[..5].fill(0);
-        let n = if op == scan::reply::OP_STATUS && powered_off {
+        let n = if op == godspeed_wifi::wire::OP_HARDWARE {
+            // `wifi hardware` (`wire::OP_HARDWARE`), the serve loop's shape: the bus is known, and the chip
+            // is NOT - this loop is reached before one was identified, so naming the board's usual part
+            // would be a guess.
+            let mut at = 1;
+            out[0] = scan::reply::OK;
+            for text in ["not identified", "SDIO"] {
+                out[at] = text.len() as u8;
+                out[at + 1..at + 1 + text.len()].copy_from_slice(text.as_bytes());
+                at += 1 + text.len();
+            }
+            at
+        } else if op == scan::reply::OP_STATUS && powered_off {
             // The powered-down status `serve_radio` gives: all zero, the trailing power byte included.
             out.fill(0);
             out[0] = scan::reply::OK;
@@ -565,8 +577,9 @@ fn serve_radio(
     h: &dyn SdioHost,
     mut radio: Option<&mut dyn Station>,
     down_reason: u8,
+    chip: &'static str,
 ) -> ! {
-    let mut host = SdioPower { h };
+    let mut host = SdioPower { h, chip };
     // Once, where the loop used to run it on entry: the key-derivation primitives against their vectors.
     let crypto_ok = godspeed_wifi::crypto::selftest(ctx, "wifi-driver");
     loop {
@@ -580,9 +593,15 @@ fn serve_radio(
 /// whenever the power is cut, so nothing drives the lines into an unpowered chip (docs/wifi.md 48).
 struct SdioPower<'a> {
     h: &'a dyn SdioHost,
+    /// The chip on this board's SD host, for `wifi hardware`: said by the caller, which is the code that
+    /// identified it.
+    chip: &'static str,
 }
 
 impl godspeed_wifi::serve::Host for SdioPower<'_> {
+    fn hardware(&self) -> godspeed_wifi::serve::Hardware {
+        godspeed_wifi::serve::Hardware { chip: self.chip, bus: "SDIO" }
+    }
     fn can_cut_power(&self) -> bool {
         // The pin is reached through the kernel's `DevicePower`; whether it is granted is asked when cutting.
         true
@@ -1091,5 +1110,5 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let down_reason = if trapped { scan::reply::DOWN_TRAPPED } else { scan::reply::DOWN_BRINGUP };
     clock_release(&ctx, lease);
     let mut bcm = radio.map(|s| bcm::Bcm::new(&h, &mut window, s));
-    serve_radio(&ctx, &h, bcm.as_mut().map(|b| b as &mut dyn Station), down_reason)
+    serve_radio(&ctx, &h, bcm.as_mut().map(|b| b as &mut dyn Station), down_reason, "CYW43455")
 }

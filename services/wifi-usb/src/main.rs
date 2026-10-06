@@ -386,7 +386,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // What the radio has heard since it was last brought up (R3b), and the host's notices (`rx.rs`).
     // The link the station and the receive side share (`rx::Link`): owned here, for the service's life.
     let link = RefCell::new(rx::Link::new());
-    let mut heard = rx::Heard::new(&link);
+    let mut heard = rx::Heard::new(&link, host_name(&ctx));
     // The key-derivation primitives against their published vectors, once: the serve loop is entered again
     // on every replug, and this result does not change.
     let crypto_ok = godspeed_wifi::crypto::selftest(&ctx, "wifi-usb");
@@ -396,7 +396,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             dongle = None;
             match now {
                 Ok(Some((vid, pid))) => {
-                    heard = rx::Heard::new(&link);
+                    heard = rx::Heard::new(&link, host_name(&ctx));
                     *link.borrow_mut() = rx::Link::new();
                     dongle = identify(&ctx, vid, pid, &link);
                     if let Some(d) = dongle.as_ref() {

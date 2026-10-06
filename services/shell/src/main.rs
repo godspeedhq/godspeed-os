@@ -976,7 +976,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
-    ("wifi",    &["scan", "list", "join", "leave", "status", "info", "debug", "forget", "stored", "radio"]),
+    ("wifi",    &["scan", "list", "join", "leave", "status", "info", "debug", "forget", "stored", "radio", "hardware"]),
     // Only the verbs that are BUILT: completing one that answers "not built yet" would teach a word
     // the utility cannot act on. `outputs`, `output`, `debug` and `system` join as they land. `play`
     // takes a PATH, which is why `audio` is not in NO_PATH_CMDS: Tab after `audio play ` offers files.
@@ -5287,6 +5287,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wifi stored", "which networks a passphrase is held for (names only, never secrets)", "wifi stored"),
             ("wifi forget <ssid>", "delete a stored passphrase; does not disconnect", "wifi forget Bankole-WiFi"),
             ("wifi radio on|off|off hard|powercycle", "the radio's switch and the chip's power: `off` is the firmware's switch, `off hard` cuts the chip's power, `on` brings it back from either (cold from `off hard`), `powercycle` is off hard and on in one", "wifi radio off"),
+            ("wifi hardware", "the radios this machine has, one record each: radio, chip, bus, state, network, in use", "wifi hardware"),
         ], true),
         "audio" => help_block(ctx, "audio", "sound: what is playing, the volume, the codec's power, a test tone", &[
             ("audio", "this usage (rule 1: a bare utility name teaches its verbs)", "audio"),
@@ -5550,6 +5551,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("wifi", "scan") => help_block(ctx, "wifi scan", "sweep for networks and pick one", &[
             ("wifi scan", "rows appear as heard, numbered; q stops the sweep, b leaves it running; then a number and Enter joins", "wifi scan"),
+        ], false),
+        ("wifi", "hardware") => help_block(ctx, "wifi hardware", "which radios this machine has (utilities/56_wifi.md 11)", &[
+            ("wifi hardware", "RADIO CHIP BUS STATE NETWORK IN-USE, one record per radio running now; `use` is specified, not built", "wifi hardware | where state=joined"),
         ], false),
         ("wifi", "list") => help_block(ctx, "wifi list", "the last complete scan, as records", &[
             ("wifi list", "NETWORK BAND SIGNAL SECURITY NOTE, one line per network; never scans - an error while a sweep runs or before any", "wifi list | match saved"),
@@ -8283,6 +8287,16 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
             return Err(ShellError::Unknown);
         }
     }
+    // `wifi hardware` is a report about which radios EXIST, so it is answered before the question every
+    // other verb shares - and on a machine with none, "none" is its answer (`utilities/56_wifi.md` 11).
+    if arg == "hardware" {
+        return wifi_hardware(ctx, out);
+    }
+    if arg.starts_with("hardware ") {
+        out.line_fmt(ctx, format_args!(
+            "wifi: `hardware use` is specified but not built yet - until it is, the first running radio carries the link (utilities/56_wifi.md 11)"));
+        return Err(ShellError::Unknown);
+    }
     if let Some(word) = arg.strip_prefix("radio ") {
         let word = word.trim();
         if word != "on" && word != "off" && word != "off hard" && word != "powercycle" {
@@ -8297,7 +8311,7 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     if !known {
         out.line_fmt(ctx, format_args!(
             "wifi: unknown subcommand - try wifi, wifi scan, wifi list, wifi join <ssid>, wifi leave,"));
-        out.line_fmt(ctx, format_args!("      wifi stored, wifi forget <ssid>, wifi radio on|off|off hard|powercycle, or wifi help"));
+        out.line_fmt(ctx, format_args!("      wifi stored, wifi forget <ssid>, wifi radio on|off|off hard|powercycle, wifi hardware, or wifi help"));
         return Err(ShellError::Unknown);
     }
 
@@ -9063,6 +9077,128 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
 /// `wifi list` - the last complete scan, one record per network, instant. Never scans: a sweep in progress
 /// and no sweep yet are both ERRORS, because a derived view is not served as current when it is not
 /// (`utilities/56_wifi.md` 3).
+/// One radio, as `wifi hardware` shows it (`utilities/56_wifi.md` 11).
+struct WifiHw {
+    radio: &'static str,
+    chip: [u8; wifi_wire::HW_TEXT_MAX],
+    chip_len: usize,
+    bus: [u8; wifi_wire::HW_TEXT_MAX],
+    bus_len: usize,
+    state: &'static str,
+    network: [u8; wifi_wire::SSID_MAX],
+    network_len: usize,
+    in_use: bool,
+}
+
+/// Every radio service running now, asked what it is (`OP_HARDWARE`) and what it is doing (`OP_STATUS`),
+/// in `RADIOS` order. Named by what it is - `onboard`, `usb` - never by where (invariant 11). The radio in
+/// use is the first running one: the radio every other `wifi` verb addresses, and the one `nic-driver`'s
+/// bridge carries frames through until `wifi hardware use` lets the operator choose (not built). A
+/// radio that does not answer is still a row, saying so: a running service IS a radio this machine has.
+fn wifi_hardware_rows(ctx: &ShellCtx) -> [Option<WifiHw>; 2] {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    let mut rows: [Option<WifiHw>; 2] = [None, None];
+    let mut first = true;
+    for (i, &svc) in RADIOS.iter().enumerate() {
+        if slot_of(ctx, svc).is_none() {
+            continue;
+        }
+        ctx.wifi_radio.set(svc);
+        let mut row = WifiHw {
+            radio: if svc == "wifi-usb" { "usb" } else { "onboard" },
+            chip: [0; HW_TEXT_MAX], chip_len: 0, bus: [0; HW_TEXT_MAX], bus_len: 0,
+            state: "not answering", network: [0; SSID_MAX], network_len: 0, in_use: first,
+        };
+        first = false;
+        if let Some(r) = wifi_ask(ctx, &[OP_HARDWARE], REPLY_MS) {
+            let p = r.payload_bytes();
+            if p.first() == Some(&OK) {
+                let cl = (*p.get(1).unwrap_or(&0) as usize).min(HW_TEXT_MAX).min(p.len().saturating_sub(2));
+                row.chip[..cl].copy_from_slice(&p[2..2 + cl]);
+                row.chip_len = cl;
+                let at = 2 + cl;
+                let bl = (*p.get(at).unwrap_or(&0) as usize).min(HW_TEXT_MAX).min(p.len().saturating_sub(at + 1));
+                row.bus[..bl].copy_from_slice(&p[at + 1..at + 1 + bl]);
+                row.bus_len = bl;
+            }
+        }
+        if let Some(r) = wifi_ask(ctx, &[OP_STATUS], REPLY_MS) {
+            let p = r.payload_bytes();
+            row.state = match p.first().copied() {
+                Some(OK) if p.len() >= 30 + SSID_MAX => {
+                    if p[61] == 0 {
+                        "off hard"
+                    } else if p[9] == 0 {
+                        "off"
+                    } else if p[10] != 0 {
+                        let jlen = core::cmp::min(p[28] as usize, SSID_MAX);
+                        row.network[..jlen].copy_from_slice(&p[29..29 + jlen]);
+                        row.network_len = jlen;
+                        "joined"
+                    } else {
+                        "on"
+                    }
+                }
+                Some(OK) => "short reply",
+                Some(_) => "down",
+                None => "not answering",
+            };
+        }
+        rows[i] = Some(row);
+    }
+    ctx.wifi_radio.set(RADIOS[0]);
+    rows
+}
+
+/// `wifi hardware` on the console: one line per radio, `*` on the one in use; no radio is the answer, not
+/// an error (`utilities/56_wifi.md` 11).
+fn wifi_hardware(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    let rows = wifi_hardware_rows(ctx);
+    if rows.iter().all(|r| r.is_none()) {
+        out.line_fmt(ctx, format_args!("no wireless radio on this machine"));
+        out.line_fmt(ctx, format_args!(
+            "  (neither `{}` nor `{}` is running - this machine has no radio, or none is driven yet)",
+            RADIOS[0], RADIOS[1]));
+        return Ok(());
+    }
+    out.line_fmt(ctx, format_args!("{:<9}  {:<14}  {:<10}  {:<13}  {:<20}  {}", "RADIO", "CHIP", "BUS", "STATE", "NETWORK", "IN USE"));
+    for r in rows.iter().flatten() {
+        let chip = core::str::from_utf8(&r.chip[..r.chip_len]).unwrap_or("?");
+        let bus = core::str::from_utf8(&r.bus[..r.bus_len]).unwrap_or("?");
+        let mut shown = [b'.'; wifi_wire::SSID_MAX];
+        let net = if r.network_len == 0 { "-" } else { wifi_ssid_text(&r.network[..r.network_len], &mut shown) };
+        out.line_fmt(ctx, format_args!("{:<9}  {:<14}  {:<10}  {:<13}  {:<20}  {}",
+            r.radio, if chip.is_empty() { "?" } else { chip }, if bus.is_empty() { "?" } else { bus },
+            r.state, net, if r.in_use { "*" } else { "" }));
+    }
+    Ok(())
+}
+
+/// `wifi hardware` in a pipe: the same rows as records - `radio`, `chip`, `bus`, `state`, `network`,
+/// `in_use` (`yes`, or empty). No radio is no rows, with the reason on the console.
+fn build_wifi_hardware_table(ctx: &ShellCtx) -> Table {
+    let mut t = Table::new(&["radio", "chip", "bus", "state", "network", "in_use"]);
+    let rows = wifi_hardware_rows(ctx);
+    if rows.iter().all(|r| r.is_none()) {
+        ctx.console_writeln("wifi: no wireless radio on this machine");
+    }
+    for r in rows.iter().flatten() {
+        let mut shown = [b'.'; wifi_wire::SSID_MAX];
+        let net = if r.network_len == 0 { None } else { Some(wifi_ssid_text(&r.network[..r.network_len], &mut shown)) };
+        let row = [
+            t.intern(r.radio.as_bytes()),
+            t.intern(&r.chip[..r.chip_len]),
+            t.intern(&r.bus[..r.bus_len]),
+            t.intern(r.state.as_bytes()),
+            match net { Some(n) => t.intern(n.as_bytes()), None => Value::Empty },
+            if r.in_use { t.intern(b"yes") } else { Value::Empty },
+        ];
+        t.add_row(&row);
+    }
+    t
+}
+
 fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use wifi_wire::*;
     let r = wifi_list_fetch(ctx, out)?;
@@ -11323,7 +11459,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
     // Stage 1 - produce a Stream.
     let (c0, _) = split_first(stages[0]);
     // `wifi list` is the one `wifi` verb that is a table; `status`, `info` and the rest are labelled lines.
-    let wifi_records = c0 == "wifi" && split_first(stages[0]).1.trim() == "list";
+    let wifi_records = c0 == "wifi" && matches!(split_first(stages[0]).1.trim(), "list" | "hardware");
     let mut s = if is_record_producer(c0) || wifi_records {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
@@ -11334,6 +11470,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
             "jobs"    => build_jobs_table(ctx),
+            "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
             "wifi"    => match build_wifi_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
             // `events ipc` / `events failures` are record sources; the other subcommands are readers
             // of live kernel state that print a tree, and a tree is not a table. Piping one of those
@@ -14328,10 +14465,13 @@ fn is_producer_builtin(name: &str) -> bool {
 /// passphrase from the console - piped, its prompt would vanish into the pipe while it waited - and the
 /// power verbs print progress. `None` when the verb may be piped, else the sentence that says why not.
 fn wifi_pipe_refusal(arg: &str) -> Option<&'static str> {
+    if arg.trim() == "hardware" {
+        return None;
+    }
     match arg.split_whitespace().next().unwrap_or("") {
         "list" | "stored" | "status" | "info" | "debug" | "version" => None,
-        "" => Some("pipe: bare 'wifi' prints its usage, which is not data - pipe a report: wifi list, stored, status, info or debug"),
-        _ => Some("pipe: that 'wifi' verb is an action, not a report, so it cannot start a pipe - the reports are: wifi list, stored, status, info and debug"),
+        "" => Some("pipe: bare 'wifi' prints its usage, which is not data - pipe a report: wifi list, stored, status, info, debug or hardware"),
+        _ => Some("pipe: that 'wifi' verb is an action, not a report, so it cannot start a pipe - the reports are: wifi list, stored, status, info, debug and hardware"),
     }
 }
 

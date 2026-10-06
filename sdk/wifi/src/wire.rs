@@ -118,6 +118,12 @@ pub const NEEDS_PASSPHRASE: u8 = 16;
 pub const ALREADY_JOINED: u8 = 17;
 /// Request op byte: `[11, sub]` - the driver's own account of itself, for `wifi debug` (`dbg::*`).
 pub const OP_DEBUG: u8 = 11;
+/// Request op byte: what this radio IS, for `wifi hardware` (`utilities/56_wifi.md` 11). Reply
+/// `[OK, chip_len, chip..., bus_len, bus...]` - the chip's name and the bus it is reached over, each at
+/// most `HW_TEXT_MAX` bytes. Answered whatever state the radio is in, down or powered off included: it is a
+/// fact about the hardware, not a reading from it.
+pub const OP_HARDWARE: u8 = 12;
+pub const HW_TEXT_MAX: usize = 24;
 
 /// Sub-codes of `OP_DEBUG`, and their reply layouts.
 pub mod dbg {
