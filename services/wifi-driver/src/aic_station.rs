@@ -38,13 +38,15 @@ use godspeed_wifi::sdio::SdioHost;
 use godspeed_wifi::station::{Link, Outcome, Pulled, ScanStep, Secret, Station};
 use godspeed_wifi::supplicant::{self, Handshake, KeyPath, Keys, Rekey, Step};
 use godspeed_wifi::wire as reply;
+// A received 802.11 data frame as ethernet: every raw-frame radio's (`godspeed_wifi::data`).
+use godspeed_wifi::data::{llc_payload, to_ethernet};
 
 use crate::aic::{self, Packet, CFM_MAX, RX_BYTES, TASK_ME};
 // Reads one pull makes at most: the Broadcom's bound, the same for this radio.
 use crate::frames::PULL_MAX_READS;
 use crate::aic_wire::{
-    build_data_frame, channel_of, control_port, disconnect, key_add, llc_payload, parse_connect_ind, parse_result, rx_header,
-    scanu_start, sm_connect, sta_info_rssi, to_ethernet, FRAME_MAX, MM_GET_STA_INFO_CFM, MM_GET_STA_INFO_REQ, MM_KEY_ADD_CFM,
+    build_data_frame, channel_of, control_port, disconnect, key_add, parse_connect_ind, parse_result, rx_header,
+    scanu_start, sm_connect, sta_info_rssi, FRAME_MAX, MM_GET_STA_INFO_CFM, MM_GET_STA_INFO_REQ, MM_KEY_ADD_CFM,
     MM_KEY_ADD_REQ, MM_REMOVE_IF_CFM, MM_REMOVE_IF_REQ, ME_SET_CONTROL_PORT_CFM, ME_SET_CONTROL_PORT_REQ, RX_DATA_HDR,
     SM_CONNECT_CFM, SM_CONNECT_IND, SM_CONNECT_REQ, SM_DISCONNECT_CFM, SM_DISCONNECT_IND, SM_DISCONNECT_REQ, TASK_SM,
 };
@@ -351,7 +353,7 @@ impl<'a> Aic<'a> {
             return false;
         };
         ctx.log("wifi-driver: the access point began a NEW four-way handshake on the live link - answering (pairwise rekey)");
-        let mut hs = Handshake::new(old.pmk, old.mac);
+        let mut hs = Handshake::new(old.pmk, old.mac, "wifi-driver");
         let mut done: Option<bool> = match hs.on_key_frame(self, first, ctx) {
             Step::Continue => None,
             Step::Joined(k) => {
@@ -567,7 +569,7 @@ impl Station for Aic<'_> {
             return Outcome::Failed;
         }
         let mut hs = match secret {
-            Secret::Pmk(p) => Some(Handshake::new(*p, self.mac)),
+            Secret::Pmk(p) => Some(Handshake::new(*p, self.mac, "wifi-driver")),
             Secret::Open => None,
         };
         let mut d = wait::Deadline::start(ctx, JOIN_WAIT);
@@ -823,7 +825,7 @@ impl Station for Aic<'_> {
             }
             if key_len > 0 && got.dropped_link.is_none() {
                 let mut keys = self.keys.take();
-                let r = supplicant::group_rekey(self, &key_frame[..key_len], keys.as_mut(), ctx);
+                let r = supplicant::group_rekey(self, &key_frame[..key_len], keys.as_mut(), "wifi-driver", ctx);
                 if self.keys.is_none() {
                     self.keys = keys;
                 }

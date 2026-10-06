@@ -507,55 +507,9 @@ pub fn rx_header(pkt: &[u8]) -> Option<RxData> {
     })
 }
 
-/// A received data frame, as the vendor driver turns it into an ethernet frame (`rwnx_rxdataind_aicwf`):
-/// DA is address 1, SA is address 3 on a frame from the access point (address 2 otherwise).
-pub struct DataIn<'a> {
-    pub ethertype: u16,
-    pub da: [u8; 6],
-    pub sa: [u8; 6],
-    pub body: &'a [u8],
-}
-
-/// The ethertype and body of a received 802.11 data frame: the MAC header (24 bytes, 26 with QoS, 4 more
-/// when the order bit is set - the vendor's own test), the 8-byte CCMP header when `ccmp` (the firmware
-/// decrypts but leaves it; the frame's protected bit is not what decides it, `decr_status` is), then
-/// LLC/SNAP `aa aa 03 00 00 00` and the ethertype. `None` for anything that is not a data frame carrying
-/// LLC/SNAP. Whether a CCMP frame's length counts its 8-byte MIC is not in the source (the line that would
-/// strip it is commented out): a body may carry 8 trailing bytes, which EAPOL and IP both bound by their
-/// own length fields.
-pub fn llc_payload(frame: &[u8], ccmp: bool) -> Option<DataIn<'_>> {
-    if frame.len() < 24 || frame[0] & 0x0c != 0x08 {
-        return None;
-    }
-    let qos = frame[0] & 0x80 != 0;
-    let order = frame[1] & 0x80 != 0;
-    let from_ds = frame[1] & 0x03 == 0x02;
-    let mut at = 24 + if qos { 2 } else { 0 } + if order { 4 } else { 0 };
-    if ccmp {
-        at += 8;
-    }
-    if frame.len() < at + 8 || frame[at..at + 6] != [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00] {
-        return None;
-    }
-    let mut da = [0u8; 6];
-    da.copy_from_slice(&frame[4..10]);
-    let mut sa = [0u8; 6];
-    sa.copy_from_slice(if from_ds { &frame[16..22] } else { &frame[10..16] });
-    Some(DataIn { ethertype: u16::from_be_bytes([frame[at + 6], frame[at + 7]]), da, sa, body: &frame[at + 8..] })
-}
-
-/// `d` as an ethernet frame into `out`: DA, SA, ethertype, body. 0 when `out` cannot hold it.
-pub fn to_ethernet(d: &DataIn, out: &mut [u8]) -> usize {
-    let n = 14 + d.body.len();
-    if n > out.len() {
-        return 0;
-    }
-    out[0..6].copy_from_slice(&d.da);
-    out[6..12].copy_from_slice(&d.sa);
-    out[12..14].copy_from_slice(&d.ethertype.to_be_bytes());
-    out[14..n].copy_from_slice(d.body);
-    n
-}
+// A received data frame as an ethernet frame (`llc_payload`, `to_ethernet`) was here, written from
+// `rwnx_rxdataind_aicwf`. It is 802.11, not AIC8800, and moved to `godspeed_wifi::data` when the USB dongle
+// needed it too (2026-10-06).
 
 #[cfg(test)]
 mod tests {
@@ -811,38 +765,6 @@ mod tests {
         assert_eq!(&f[24..26], &[0x88, 0x8e]);
         assert_eq!((f[28], f[29]), (0, 3));
         assert_eq!(&f[32..36], &body);
-    }
-
-    /// An EAPOL frame in: a QoS data frame from the AP, LLC/SNAP, ethertype 888e, turned into ethernet
-    /// with DA = address 1 and SA = address 3. And a frame the firmware decrypted, with the 8-byte CCMP
-    /// header it leaves in place - decided by the header's `decr_status`, not the protected bit.
-    #[test]
-    fn eapol_in_a_data_frame() {
-        let mut f = [0u8; 26 + 8 + 4];
-        f[0] = 0x88; // QoS data
-        f[1] = 0x02; // from DS
-        f[4..10].copy_from_slice(&[1; 6]);
-        f[10..16].copy_from_slice(&[7; 6]);
-        f[16..22].copy_from_slice(&[9; 6]);
-        f[26..34].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-        f[34..38].copy_from_slice(&[2, 3, 0, 0x5f]);
-        let Some(d) = llc_payload(&f, false) else {
-            assert!(false, "an EAPOL data frame was not recognised");
-            return;
-        };
-        assert_eq!((d.ethertype, d.da, d.sa), (0x888e, [1; 6], [9; 6]));
-        assert_eq!(d.body, &[2, 3, 0, 0x5f]);
-        let mut eth = [0u8; 32];
-        assert_eq!(to_ethernet(&d, &mut eth), 18);
-        assert_eq!(&eth[..14], &[1, 1, 1, 1, 1, 1, 9, 9, 9, 9, 9, 9, 0x88, 0x8e]);
-        assert_eq!(to_ethernet(&d, &mut [0u8; 17]), 0);
-        let mut g = [0u8; 26 + 8 + 8 + 4];
-        g[0] = 0x88;
-        g[1] = 0x42; // from DS, protected
-        g[34..42].copy_from_slice(&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e]);
-        assert_eq!(llc_payload(&g, true).map(|d| (d.ethertype, d.body.len())), Some((0x888e, 4)));
-        assert!(llc_payload(&g, false).is_none()); // the IV read as LLC/SNAP is not LLC/SNAP
-        assert!(llc_payload(&[0x80; 40], false).is_none()); // a beacon is not data
     }
 
     /// The receive header's fields where `rwnx_rx.h` puts them.

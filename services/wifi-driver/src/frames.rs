@@ -116,7 +116,7 @@ pub fn pull(
             }
         }
         if eapol_len > 0 {
-            match group_rekey(&mut BcmPath { h, w: &mut *w, s: &mut *s }, &eapol_frame[..eapol_len], keys.as_deref_mut(), ctx) {
+            match group_rekey(&mut BcmPath { h, w: &mut *w, s: &mut *s }, &eapol_frame[..eapol_len], keys.as_deref_mut(), "wifi-driver", ctx) {
                 Rekey::Answered => got.rekeyed += 1,
                 Rekey::Refused => got.rekey_failed += 1,
                 Rekey::Pairwise => {
@@ -166,7 +166,7 @@ fn pairwise_rekey(
         }
     };
     ctx.log("wifi-driver: the access point began a NEW four-way handshake on the live link - answering (pairwise rekey)");
-    let mut hs = Handshake::new(keys.pmk, keys.mac);
+    let mut hs = Handshake::new(keys.pmk, keys.mac, "wifi-driver");
     match hs.on_key_frame(&mut BcmPath { h, w: &mut *w, s: &mut *s }, first, ctx) {
         Step::Continue => {}
         Step::Joined(k) => { ctrl::report_power_mode(h, w, s, ctx); *keys = k; return true; }

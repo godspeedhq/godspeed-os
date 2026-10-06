@@ -15,6 +15,8 @@
 //! - [`supplicant`]: the WPA2 four-way handshake and the group-key rekey, run by the HOST on every radio,
 //!   over the [`supplicant::KeyPath`] each radio supplies.
 //! - [`keyfile`]: the credentials a join earned, kept in `/wifi.keys` across a restart.
+//! - [`data`]: an 802.11 data frame and the ethernet frame it carries, both ways, for every radio whose
+//!   host sees raw frames.
 //! - [`mgmt`]: a beacon or probe response read from the raw 802.11 frame - BSSID, capability, SSID and
 //!   channel - for every radio whose firmware forwards the frames rather than digesting them.
 //! - [`station`]: the [`station::Station`] trait - what the serve loop asks of a radio - and the types it
@@ -43,15 +45,15 @@
 //! # Known gap
 //!
 //! Log lines in this crate were prefixed `wifi-driver:`, the only radio service until `wifi-usb`. The
-//! second caller arrived with R4 (2026-10-06), and the modules it reaches now take the service's name:
-//! [`serve`], [`keyfile`] and [`crypto::selftest`]. [`eapol`] and [`supplicant`] still say `wifi-driver:`;
-//! `wifi-usb` reaches them only once it can join (R5, `docs/wifi-usb.md`), which is where they gain it.
-//! [`sdio`] is right as it is - only `wifi-driver` drives an SDIO bus.
+//! second caller arrived with R4 (2026-10-06), and every module it reaches now takes the service's name:
+//! [`serve`], [`keyfile`] and [`crypto::selftest`] at R4, [`supplicant`] and [`eapol`] at R5c. [`sdio`] still
+//! says `wifi-driver:`, and is right to - only `wifi-driver` drives an SDIO bus.
 #![no_std]
 #![deny(unsafe_code)]
 
 pub mod bss;
 pub mod crypto;
+pub mod data;
 pub mod eapol;
 pub mod keyfile;
 pub mod mgmt;

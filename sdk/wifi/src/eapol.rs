@@ -262,11 +262,12 @@ impl Key {
 ///
 /// `frame` starts at the ethernet header. Returns `None`, with the reason logged, for anything that is not
 /// a key descriptor this driver knows - which is reported, never silently skipped.
-pub fn describe(frame: &[u8], ctx: &ServiceContext) -> Option<Key> {
+pub fn describe(frame: &[u8], ctx: &ServiceContext, who: &str) -> Option<Key> {
     if frame.len() < ETHHDR + at::KEY_HEADER {
         ctx.log_fmt(format_args!(
-            "wifi-driver:   an EAPOL frame of {} bytes is shorter than the {} its ethernet and key headers \
+            "{}:   an EAPOL frame of {} bytes is shorter than the {} its ethernet and key headers \
              need - not read",
+            who,
             frame.len(),
             ETHHDR + at::KEY_HEADER
         ));
@@ -279,16 +280,16 @@ pub fn describe(frame: &[u8], ctx: &ServiceContext) -> Option<Key> {
     let len = be16(at::PKT_LEN);
     if ptype != TYPE_KEY {
         ctx.log_fmt(format_args!(
-            "wifi-driver:   EAPOL version {} type {} ({} bytes) - not a key frame, so not the handshake",
-            version, ptype, len
+            "{}:   EAPOL version {} type {} ({} bytes) - not a key frame, so not the handshake",
+            who, version, ptype, len
         ));
         return None;
     }
     let desc = k[at::KEY_DESC];
     if desc != DESC_RSN && desc != DESC_WPA {
         ctx.log_fmt(format_args!(
-            "wifi-driver:   EAPOL-Key with descriptor type {} - neither RSN (2) nor WPA (254), not read",
-            desc
+            "{}:   EAPOL-Key with descriptor type {} - neither RSN (2) nor WPA (254), not read",
+            who, desc
         ));
         return None;
     }
@@ -321,10 +322,10 @@ pub fn describe(frame: &[u8], ctx: &ServiceContext) -> Option<Key> {
     };
     let i = key.info;
     ctx.log_fmt(format_args!(
-        "wifi-driver:   EAPOL-Key from {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} - {} - descriptor {} \
+        "{}:   EAPOL-Key from {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} - {} - descriptor {} \
          version {} info {:#06x} [{}{}{}{}{}{}{}] key_len {} replay {} key_data {} bytes; nonce begins \
          {:02x}{:02x}{:02x}{:02x}, mic begins {:02x}{:02x}",
-        frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+        who, frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
         key.which(),
         if desc == DESC_RSN { "RSN" } else { "WPA" },
         i & info::VERSION_MASK,

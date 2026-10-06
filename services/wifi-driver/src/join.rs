@@ -192,7 +192,7 @@ pub fn join(
     // The handshake's state: the AP's nonce, ours, the derived keys, and how many times we have answered
     // message 1 - which is what tells a repeated message 1 apart from a first one.
     let mut hs = match secret {
-        Secret::Pmk(p) => Some(Handshake::new(*p, our_mac)),
+        Secret::Pmk(p) => Some(Handshake::new(*p, our_mac, "wifi-driver")),
         Secret::Open => None,
     };
 
