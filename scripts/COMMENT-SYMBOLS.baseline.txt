@@ -629,3 +629,9 @@ update_rate_mask                   # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h
 WLAN_CIPHER_SUITE_CCMP             # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 rf_regulatory                      # Linux rtl8xxxu.h struct rtl8192cu_efuse field, cited by wifi-usb for the 8188RU test in the power-off (R9) - external, 26.14
 rtl8192cu_parse_efuse              # Linux rtl8xxxu 8192c.c, cited by wifi-usb for where the 8188RU is recognised (R9) - external, 26.14
+RF6052_MAX_TX_PWR                  # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8188r_power_base                # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8192c_power_base                # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8xxxu_config                    # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8xxxu_gen1_channel_to_group     # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8xxxu_gen1_set_tx_power         # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14

@@ -41,6 +41,7 @@ use godspeed_wifi::{usbfn, wire};
 
 mod rtl8188;
 mod rtl_fw;
+mod rtl_power;
 mod rtl_queues;
 // Read by `rx` (R3b): what the host's bulk IN hands up. Host-tested as well.
 mod rtl_rx;
@@ -156,7 +157,22 @@ fn identify<'l>(ctx: &ServiceContext, vid: u16, pid: u16, link: &'l RefCell<rx::
             // Receive starts only once the chip's own is set up (R3a): the host's IN armed at a chip that
             // has not been told where to put frames would only be NAKed. A radio that cannot receive
             // cannot scan, so it is not a station.
-            let (mac, queues, is_8188r) = bring_up(ctx)?;
+            // How many paths transmit (`rtl8192cu_identify_chip`): one on an 8188C, and on an 8192C two
+            // unless its bonding says 1T2R. Asked here, beside the rest of the identity, for the power (R11).
+            let tx_paths = if c & SYS_CFG_TYPE_92C == 0 {
+                1
+            } else {
+                match read32(ctx, rtl8188::REG_HPON_FSM) {
+                    Ok(h) if h & rtl8188::HPON_FSM_BONDING_MASK == rtl8188::HPON_FSM_BONDING_1T2R => 1,
+                    Ok(_) => 2,
+                    Err(why) => {
+                        ctx.log_fmt(format_args!("wifi-usb: the bonding read failed - {}", why));
+                        return None;
+                    }
+                }
+            };
+            let (mac, queues, power) = bring_up(ctx, tx_paths)?;
+            let is_8188r = power.is_8188r;
             if !rx::start(ctx) {
                 return None;
             }
@@ -165,7 +181,7 @@ fn identify<'l>(ctx: &ServiceContext, vid: u16, pid: u16, link: &'l RefCell<rx::
                 is_8188r,
                 umc_cut_b: c & SYS_CFG_VENDOR_UMC != 0 && (c >> SYS_CFG_CHIP_VER_SHIFT) & 0xF == 1,
             };
-            Some(station::Dongle::new(mac, FIRST_CHANNEL, queues, chip, link))
+            Some(station::Dongle::new(mac, FIRST_CHANNEL, queues, chip, power, link))
         }
         (c, i) => {
             ctx.log_fmt(format_args!(
@@ -176,18 +192,38 @@ fn identify<'l>(ctx: &ServiceContext, vid: u16, pid: u16, link: &'l RefCell<rx::
     }
 }
 
+/// R11: what the efuse's calibration put in the transmit gain registers on the first channel, and the first
+/// word read back - the proof the writes landed. Said once, at bring-up; every later tune sets its own
+/// channel's power without a line.
+fn report_power(ctx: &ServiceContext, power: &rtl_power::TxPower) {
+    if !power.cal.programmed() {
+        ctx.log("wifi-usb: the efuse carries no transmit power calibration - the baseband table's gain stays (R11)");
+        return;
+    }
+    let w = rtl_power::words(power, FIRST_CHANNEL);
+    let (reg, wrote) = w.gains[0];
+    match read32(ctx, reg) {
+        Ok(back) => ctx.log_fmt(format_args!(
+            "wifi-usb: transmit power from the efuse, channel {} (group {}): CCK {:#04x}, OFDM {:#04x}, {} path(s){}; TX_AGC_A_RATE18_06 written {:#010x}, reads {:#010x}{}",
+            FIRST_CHANNEL, rtl_power::group(FIRST_CHANNEL), w.cck[0], w.ofdm[0], power.tx_paths,
+            if power.is_8188r { ", 8188RU tables" } else { "" }, wrote, back,
+            if back == wrote { " - R11 done" } else { " - NOT what was written" })),
+        Err(why) => ctx.log_fmt(format_args!("wifi-usb: the transmit power read-back failed - {}", why)),
+    }
+}
+
 /// The ceiling on a bring-up step's REPORTED duration; see `bring_up`.
 const REPORT_CEILING_MS: u64 = 60_000;
 
 /// R1 (`docs/wifi-usb.md`): the efuse, then the power-on - Linux's order (`rtl8xxxu_init_device`) - and on
 /// through R2 and R3a. The dongle's own address, from its efuse, and how many transmit queues its endpoints
 /// serve, when every stage completed; `None` when one stopped, said where.
-fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8, bool)> {
+fn bring_up(ctx: &ServiceContext, tx_paths: u8) -> Option<([u8; 6], u8, rtl_power::TxPower)> {
     // How long each half took, for the log - `Deadline::elapsed_us` is the stdlib's measure of a wait. The
     // bound is a ceiling for the report only; every wait inside the efuse walk and the power-on is
     // bounded on its own (`rtl8188.rs`).
     let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
-    let (mac, is_8188r) = match rtl8188::read_efuse(ctx) {
+    let (mac, power) = match rtl8188::read_efuse(ctx) {
         Ok(e) => {
             let m = e.mac;
             ctx.log_fmt(format_args!(
@@ -195,7 +231,12 @@ fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8, bool)> {
                 e.id, if rtl8188::efuse_id_ok(&e) { "as expected" } else { "NOT the 0x8129 this family carries" },
                 e.vid, e.pid, m[0], m[1], m[2], m[3], m[4], m[5], e.walked, e.sections,
                 clock.elapsed_us() / 1000));
-            (e.mac, e.is_8188r)
+            let power = rtl_power::TxPower {
+                cal: rtl_power::Calibration::from_efuse(&e.power),
+                tx_paths,
+                is_8188r: e.is_8188r,
+            };
+            (e.mac, power)
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the efuse read stopped - {}", why));
@@ -243,7 +284,7 @@ fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8, bool)> {
     // R3a: the MAC, the baseband and the RF set up, tuned to one channel, and the channel read back out of
     // the RF chip itself - the one register here that only a working RF path can answer.
     let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
-    match rtl8188::init_radio(ctx, cold, FIRST_CHANNEL) {
+    match rtl8188::init_radio(ctx, cold, FIRST_CHANNEL, &power) {
         Ok((rf, mode)) => {
             let on = (mode & rtl8188::RF_CHANNEL_MASK) as u8;
             ctx.log_fmt(format_args!(
@@ -261,7 +302,8 @@ fn bring_up(ctx: &ServiceContext) -> Option<([u8; 6], u8, bool)> {
                     return None;
                 }
             }
-            Some((mac, queues.count(), is_8188r))
+            report_power(ctx, &power);
+            Some((mac, queues.count(), power))
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the radio's set-up stopped - {}", why));

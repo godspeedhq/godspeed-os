@@ -132,6 +132,8 @@ pub struct Dongle<'l> {
     off: bool,
     /// For the power-off (R9).
     chip: rtl8188::Chip,
+    /// The transmit power calibration, applied on every tune (R11).
+    power: crate::rtl_power::TxPower,
     /// The firmware mailbox the next host-to-firmware command takes (`rtl8188::h2c`, R8).
     mbox: u8,
     /// The firmware was told the station is connected, so leaving tells it otherwise.
@@ -160,9 +162,13 @@ struct Hop {
 }
 
 impl<'l> Dongle<'l> {
-    pub fn new(mac: [u8; 6], home: u8, queues: u8, chip: rtl8188::Chip, link: &'l RefCell<rx::Link>) -> Self {
+    pub fn new(
+        mac: [u8; 6], home: u8, queues: u8, chip: rtl8188::Chip, power: crate::rtl_power::TxPower,
+        link: &'l RefCell<rx::Link>,
+    ) -> Self {
         Dongle {
             chip,
+            power,
             link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
             assoc: None, keys: None, cam_next: 0, off: false, mbox: 0, reported: false, gtk: [None; 4], gtk_reinstall: false, gtk_entry: [None; 4], ptk_in: false,
@@ -498,7 +504,7 @@ impl<'l> Dongle<'l> {
 
     /// Tune `channel` for the sweep; `false` when the RF chip did not take it, said here.
     fn tune(&mut self, ctx: &ServiceContext, channel: u8) -> bool {
-        match rtl8188::set_channel(ctx, channel) {
+        match rtl8188::set_channel(ctx, channel, &self.power) {
             Ok(()) => true,
             Err(why) => {
                 self.hops_failed = self.hops_failed.saturating_add(1);
@@ -635,7 +641,7 @@ impl Station for Dongle<'_> {
     /// `wifi radio on`: the RF back up and receive open, on the channel the dongle rests on; the serve loop
     /// then rejoins the network last joined.
     fn radio_up(&mut self, ctx: &ServiceContext) -> bool {
-        match rtl8188::radio_on(ctx, self.home) {
+        match rtl8188::radio_on(ctx, self.home, &self.power) {
             Ok(()) => {
                 self.off = false;
                 ctx.log("wifi-usb: radio on - RF up, receive filters open");

@@ -34,6 +34,7 @@ FILES = [
     "services/wifi-usb/src/rtl_rx.rs",
     # Its transmit descriptor, for a management frame, signed (R5a).
     "services/wifi-usb/src/rtl_tx.rs",
+    "services/wifi-usb/src/rtl_power.rs",
     # A beacon or probe response read from the raw frame, for every radio that forwards frames.
     "sdk/wifi/src/mgmt.rs",
     # An 802.11 data frame and the ethernet frame it carries, both ways (moved from aic_wire.rs, R5c).

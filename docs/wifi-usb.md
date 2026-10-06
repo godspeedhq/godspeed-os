@@ -1199,3 +1199,40 @@ watched task released - 71 of 96 routing slots free, reserve 72`. At the same co
   confirmed`. One `Request timed out` was the first echo after a power cycle, while ARP resolved again.
 
 `backlog/74` has what the run showed about pooling and about the supervisor.
+
+## 21. R11 (2026-10-06): transmit power from the dongle's own calibration - built, not yet run
+
+Until now the transmit gain was what the baseband table wrote: the same for every dongle and every
+channel. The factory writes per-channel-group power indexes into each dongle's efuse (`struct
+rtl8192cu_efuse`, from 0x5a: CCK and HT40 one-stream indexes per path, and signed differences for OFDM,
+HT20 and two streams). Linux turns them into the gain words on every tune (`rtl8xxxu_gen1_set_tx_power`).
+
+R11 does the same:
+- **`rtl_power.rs`** (new, host-tested) holds the arithmetic, to the byte:
+  - the channel group (1-3, 4-9, 10-13);
+  - the signed nibbles;
+  - the ceilings (0x3f, and 0x20 for an 8188RU's CCK);
+  - the power base table (the 8188RU has its own);
+  - the gain words, added as whole 32-bit values as C adds them;
+  - the IQ-imbalance bytes stepped down from the last word.
+- **`rtl8188::set_tx_power`** writes them: the CCK indexes by read-modify-write, the rest whole.
+  `set_channel` calls it after every tune, as `rtl8xxxu_config` does.
+- **An efuse never programmed** (0xFF) writes nothing and keeps the table's gain, and says so.
+- **The number of transmit paths** is `rtl8192cu_identify_chip`'s: one on an 8188C, and on an 8192C two
+  unless its bonding (`REG_HPON_FSM`) says 1T2R.
+
+**Prediction, Pi 2:**
+- At bring-up: `transmit power from the efuse, channel 1 (group 0): CCK 0x.., OFDM 0x.., 1 path(s);
+  TX_AGC_A_RATE18_06 written 0x........, reads 0x........ - R11 done`. Indexes in the 0x20s to 0x30s are
+  typical for this family.
+- Then the join, the lease and `ping`, as before.
+- `wifi scan` still lists networks: the sweep re-tunes every channel, and each tune now sets its power.
+
+**Refuted by:**
+- `NOT what was written` (the write did not land);
+- a join or ping that worked before and fails now (a gain word wrong enough to break transmit);
+- `no transmit power calibration` on this dongle, whose efuse is known programmed (its MAC is read from
+  the same map).
+
+What it cannot show from this side is the transmitted power itself; the access point's view of it is not
+reachable from here. The read-back proves the words landed, and the link proves they are not wrong.

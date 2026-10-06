@@ -14,6 +14,7 @@ use godspeed_sdk::ServiceContext;
 use godspeed_wifi::usbfn;
 
 use crate::host;
+use crate::rtl_power::{self, TxPower};
 use crate::rtl_queues::{self, TxQueues};
 use crate::rtl_tables;
 
@@ -179,6 +180,8 @@ pub struct Efuse {
     pub sections: u16,
     /// The chip is an RTL8188RU (`rf_regulatory` bit 5), whose power-off has one step more (R9).
     pub is_8188r: bool,
+    /// The transmit power calibration (`rtl_power::Calibration`, R11).
+    pub power: [u8; rtl_power::EFUSE_LEN],
 }
 
 /// Read the efuse into its logical map (`rtl8xxxu_read_efuse`), the loader enabled as Linux enables it
@@ -248,6 +251,11 @@ pub fn read_efuse(ctx: &ServiceContext) -> Result<Efuse, &'static str> {
     Ok(Efuse {
         id: le16(0), vid: le16(EFUSE_OFF_VID), pid: le16(EFUSE_OFF_PID), mac, walked: addr, sections,
         is_8188r: map[EFUSE_OFF_RF_REGULATORY] & RF_REGULATORY_8188RU != 0,
+        power: {
+            let mut p = [0u8; rtl_power::EFUSE_LEN];
+            p.copy_from_slice(&map[rtl_power::EFUSE_OFF..rtl_power::EFUSE_OFF + rtl_power::EFUSE_LEN]);
+            p
+        },
     })
 }
 
@@ -516,11 +524,11 @@ pub fn radio_off(ctx: &ServiceContext) -> Result<(), &'static str> {
 /// `wifi radio on` (R6b): what `rtl8xxxu_start` does after `radio_off` undid it - the RF enabled
 /// (`enable_rf`, which also unpauses transmit) and the receive filters open again - and the channel the
 /// dongle rests on tuned.
-pub fn radio_on(ctx: &ServiceContext, channel: u8) -> Result<(), &'static str> {
+pub fn radio_on(ctx: &ServiceContext, channel: u8, power: &TxPower) -> Result<(), &'static str> {
     enable_rf(ctx)?;
     write16(ctx, REG_RXFLTMAP2, 0xFFFF)?;
     write16(ctx, REG_RXFLTMAP0, 0xFFFF)?;
-    set_channel(ctx, channel)
+    set_channel(ctx, channel, power)
 }
 
 /// `rtl8xxxu_gen1_disable_rf`, one RF path: the RF parameter word's path A bits cleared, every transmit path
@@ -805,7 +813,41 @@ pub fn set_bssid(ctx: &ServiceContext, bssid: &[u8; 6]) -> Result<(), &'static s
 
 /// `rtl8xxxu_gen1_config_channel` for a 20 MHz HT channel: the band width registers, the channel into
 /// `RF_MODE_AG`, the SIFS timings, the 20 MHz bit. `channel` is 1 to 14.
-pub fn set_channel(ctx: &ServiceContext, channel: u8) -> Result<(), &'static str> {
+/// `REG_HPON_FSM`: an 8192C's bonding (`HPON_FSM_BONDING_MASK`), which says whether it transmits on one
+/// path or two (`rtl8192cu_identify_chip`).
+pub(crate) const REG_HPON_FSM: u16 = 0x00EC;
+pub(crate) const HPON_FSM_BONDING_MASK: u32 = (1 << 22) | (1 << 23);
+pub(crate) const HPON_FSM_BONDING_1T2R: u32 = 1 << 22;
+
+/// R11: `rtl8xxxu_gen1_set_tx_power` for `channel` - the efuse's calibration into the transmit gain
+/// registers (`rtl_power::words`). The CCK indexes go in by read-modify-write, as their registers hold
+/// other fields; the rest are whole words. Nothing is written for an efuse that was never programmed,
+/// which keeps the gain the baseband table set - what every channel had before R11.
+pub fn set_tx_power(ctx: &ServiceContext, power: &TxPower, channel: u8) -> Result<(), &'static str> {
+    if !power.cal.programmed() {
+        return Ok(());
+    }
+    let w = rtl_power::words(power, channel);
+    let [a, b] = w.cck.map(|c| c as u32);
+    set32(ctx, rtl_power::REG_TX_AGC_A_CCK1_MCS32, a << 8, 0x0000_FF00)?;
+    set32(ctx, rtl_power::REG_TX_AGC_B_CCK11_A_CCK2_11, a << 8 | a << 16 | a << 24, 0xFFFF_FF00)?;
+    set32(ctx, rtl_power::REG_TX_AGC_B_CCK11_A_CCK2_11, b, 0x0000_00FF)?;
+    set32(ctx, rtl_power::REG_TX_AGC_B_CCK1_55_MCS32, b << 8 | b << 16 | b << 24, 0xFFFF_FF00)?;
+    // Linux's order: path A's last word, its IQ bytes, then path B's last word and its IQ bytes.
+    for &(reg, val) in &w.gains[..11] {
+        write32(ctx, reg, val)?;
+    }
+    for (i, &v) in w.iq_c.iter().enumerate() {
+        write8(ctx, rtl_power::REG_OFDM0_XC_TX_IQ_IMBALANCE + i as u16, v)?;
+    }
+    write32(ctx, w.gains[11].0, w.gains[11].1)?;
+    for (i, &v) in w.iq_d.iter().enumerate() {
+        write8(ctx, rtl_power::REG_OFDM0_XD_TX_IQ_IMBALANCE + i as u16, v)?;
+    }
+    Ok(())
+}
+
+pub fn set_channel(ctx: &ServiceContext, channel: u8, power: &TxPower) -> Result<(), &'static str> {
     let o = read8(ctx, REG_BW_OPMODE)?;
     write8(ctx, REG_BW_OPMODE, o | (1 << 2))?;
     set32(ctx, REG_FPGA0_RF_MODE, 0, 1 << 0)?;
@@ -818,7 +860,9 @@ pub fn set_channel(ctx: &ServiceContext, channel: u8) -> Result<(), &'static str
     write16(ctx, REG_R2T_SIFS, 0x0808)?;
     write16(ctx, REG_T2T_SIFS, 0x0A0A)?;
     let m = read_rf(ctx, RF_MODE_AG)?;
-    write_rf(ctx, RF_MODE_AG, (m & !RF_BW_MASK) | RF_BW_20MHZ)
+    write_rf(ctx, RF_MODE_AG, (m & !RF_BW_MASK) | RF_BW_20MHZ)?;
+    // R11: the channel's own transmit power, as `rtl8xxxu_config` sets it after every tune.
+    set_tx_power(ctx, power, channel)
 }
 
 /// R3a: everything `rtl8xxxu_init_device` does after the firmware that bears on RECEIVING, then
@@ -826,7 +870,7 @@ pub fn set_channel(ctx: &ServiceContext, channel: u8) -> Result<(), &'static str
 /// `docs/wifi-usb.md`: the transmit side (power, the response rate set and retry limits, the EDCA, ACK and
 /// beacon timings), the IQ calibration and the thermal meter - none decides whether a beacon is heard.
 /// `RF_MODE_AG` read back after the channel is set, for the caller to check.
-pub fn init_radio(ctx: &ServiceContext, cold: bool, channel: u8) -> Result<(usize, u32), &'static str> {
+pub fn init_radio(ctx: &ServiceContext, cold: bool, channel: u8, power: &TxPower) -> Result<(usize, u32), &'static str> {
     for (reg, val) in rtl_tables::MAC_INIT.iter() {
         write8(ctx, *reg, *val)?;
     }
@@ -870,7 +914,7 @@ pub fn init_radio(ctx: &ServiceContext, cold: bool, channel: u8) -> Result<(usiz
     write16(ctx, REG_RXFLTMAP2, 0xFFFF)?;
     write16(ctx, REG_RXFLTMAP0, 0xFFFF)?;
     set32(ctx, REG_OFDM0_XA_AGC_CORE1, 0x1E, 0x7F)?;
-    set_channel(ctx, channel)?;
+    set_channel(ctx, channel, power)?;
     Ok((rf, read_rf(ctx, RF_MODE_AG)?))
 }
 
