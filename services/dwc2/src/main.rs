@@ -198,7 +198,7 @@ fn dispatch(
     // The supervisor asking for this host's device report again (`usbdev::ASK`): no reply capability, by
     // design - the answer is the report itself, sent the way every report is (rtl.rs).
     if p == [godspeed_sdk::service_context::usbdev::ASK] {
-        rtl::report(ctx, radio.as_deref());
+        rtl::report_device(ctx, radio.as_deref());
         return true;
     }
     // Taken through `gs`: the radio answers with `gs::ipc::reply`; the disk and net servers still take the

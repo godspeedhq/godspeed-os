@@ -501,13 +501,13 @@ fn read32(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, reg: u16) ->
 /// because without it the dongle has no driver and nothing else will say so.
 pub fn announce(ctx: &ServiceContext, radio: Option<&Radio>) {
     let _ = tell(ctx);
-    report(ctx, radio);
+    report_device(ctx, radio);
 }
 
 /// This host's report on the radio, to the supervisor: the whole state, not a change, so the supervisor's
 /// `usbdev::ASK` is answered by sending it again. `try_send`, reacquired by name once - the supervisor is
-/// restartable (6.2) - and never waited on (8.9).
-pub fn report(ctx: &ServiceContext, radio: Option<&Radio>) {
+/// restartable (6.2) - and never waited on (8.9). (`report` above is the radio's statistics, not this.)
+pub fn report_device(ctx: &ServiceContext, radio: Option<&Radio>) {
     let r = match radio {
         Some(r) => usbdev::Report { present: true, gen: r.gen, vid: r.vid, pid: r.pid },
         None => usbdev::Report { present: false, gen: 0, vid: 0, pid: 0 },
