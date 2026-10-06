@@ -6,7 +6,9 @@ unkillable thing. Spawned directly by the kernel (init removed, Phase 5).
 
 ## Responsibilities
 
-- Read the boot manifest and spawn all non-TCB services per placement rules (§9.2).
+- Spawn the services in its `IMAGES` table per placement rules (§9.2); there is no manifest file.
+- Start a USB device's driver when its host reports the device attached, and stop it - without a restart -
+  when the host reports it gone (`USB_MATCH`, `UsbState`, `docs/usb-device-drivers.md`; the Pi 2 today).
 - Monitor services for death (via kernel death-notification endpoint).
 - Kill and restart failed services.
 - Expose `kill` and `restart` API (§14.4).
@@ -51,7 +53,7 @@ service_main():
   4. spawn("ping") on core 0      ← both skipped in a bare-metal build
   5. spawn the probe set, then the service set from the name→cap map (no kernel name resolution)
   6. log("supervisor: ready")
-  7. loop { recv() }  ← death-notification restart loop
+  7. loop: drain the queue (death notices, operator commands, USB device reports), then the reconcile sweep
 ```
 
 `"supervisor: ready"` appears after **all** spawns complete. Identity tests that trigger a service restart use this string as the `wait_for` gate to ensure the restart fires only when supervisor is safely in its yield loop - no restart-mid-spawn conflict.
@@ -72,16 +74,15 @@ When supervisor calls `restart(name, placement_override)`:
 ```mermaid
 sequenceDiagram
     participant Ctrl as Control channel (COM2)
+    participant Sup as Supervisor
     participant K as Kernel
-    participant OldSvc as Old Service (gen N)
     participant NewSvc as New Service (gen N+1)
 
-    Ctrl->>K: RESTART <name> <core>
-    K->>OldSvc: kill - bump generation to N+1
-    K->>K: drain endpoint queue, reclaim memory
-    K->>NewSvc: spawn on target core with gen N+1 caps
+    Ctrl->>Sup: RESTART <name> <core> (supcmd)
+    Sup->>K: kill <name> - generation bumped, queue drained, memory reclaimed
+    Sup->>K: spawn <name> from its IMAGES row on <core>, gen N+1 caps
     NewSvc->>K: register endpoint name (gen N+1)
-    K->>Ctrl: log "control: <name> restarted"
+    Sup->>Ctrl: status (OK / FAILED)
 ```
 
 ## Failure semantics (§6.2)

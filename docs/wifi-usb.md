@@ -19,9 +19,10 @@ to the bus: a client cannot address another device, and the host knows nothing o
 requests. The register file, the firmware and the 802.11 above them are `wifi-usb`'s. That is what lets
 one driver run behind every host.
 
-`wifi-usb` holds no hardware grant - no window, no arena, no interrupt, no device class. Its one peer is
-the host. It is started at boot where such a host exists and is idle until a dongle is bound, which is
-what "plug it in and it is picked up" costs without a new mechanism for spawning a driver on demand.
+`wifi-usb` holds no hardware grant - no window, no arena, no interrupt, no device class. Its peers are the
+host and `fs`, for `/wifi.keys` (section 10). On the Pi 2 the supervisor starts it when `dwc2` reports the
+dongle attached and stops it when the dongle leaves (section 26, `docs/usb-device-drivers.md`); on `xhci`'s
+boards it is still started at boot and idles until a dongle is bound.
 
 The chip itself is soft-MAC (`docs/wifi.md` 59): the host builds and parses every 802.11 frame. So above
 the register file this needs a host-side MLME - scan, authenticate, associate - over a raw radio, and the
@@ -37,8 +38,11 @@ is due when a scan exists, not before.
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
 | `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |
 | `OP_BULK_OUT` 0x24 | `[op, out, transfer...]` - `out` the OUT endpoint's position in the configuration descriptor | `[op, status]` |
+| `OP_SYNC` 0x25 | `[op, notice]` - never answered: names a notice the driver took in place of an answer (section 19) | none |
 | `NOTE_BULK_IN` 0x2E | sent by the HOST to the driver, `[note]`, no reply cap: a transfer is held | none |
 | `NOTE_RADIO` 0x2F | sent by the HOST to the driver, `[note]`, no reply cap | none |
+
+0x26 is not free: it is `usbdev::ASK`, the supervisor asking the host for its device report (section 26).
 
 Every reply starts `[op, status]`, so an answer to the wrong op, or a host that does not speak this, is
 told apart from an answer. A control transfer carries at most 256 bytes either way, and the host retries a
@@ -132,9 +136,9 @@ receive loop on `gs::ipc::recv`, `take_sent_cap` and `reply`, its holds on `gs::
 its timings on `gs::driver::wait`. It holds no hardware, so it touches no hardware API at all; the SDK
 appears only as the `ServiceContext` and `Message` types every `gs` call takes, and `ctx.log`, which is the
 one way every service logs (CLAUDE.md 11.4). `dwc2`'s new notification is on `gs::ipc::try_send` and
-`gs::cap::reacquire`; its REPLY to `wifi-usb` still goes through the raw SDK, because it shares `dwc2`'s
-request dispatch with the block and network servers, which are raw throughout - converting that dispatch
-is the stdlib-dogfood branch's work, not this one's.
+`gs::cap::reacquire`, and its reply to `wifi-usb` is `gs::ipc::reply` too (`rtl::serve`); the block and
+network servers beside it in `dwc2`'s dispatch are still raw - converting those is the stdlib-dogfood
+branch's work, not this one's.
 
 **Three gates fixed on the way, each found by doing the consistent thing:**
 
@@ -241,7 +245,7 @@ One more thing the R2 run settled: on the U1b run the third replug came up at fu
 transaction translator, and every vendor read failed. In the R2 run both replugs came up at high speed and
 read the chip at once, so that was the insertion; it is recorded here in case it returns.
 
-## 7. U2: `xhci` - the design, from a reading of the driver (2026-10-05), NOT BUILT
+## 7. U2: `xhci` - the design, from a reading of the driver (2026-10-05); U2a built (section 25), bulk IN and OUT (U2b, U2c) not built
 
 `wifi-usb` already asks whichever host it was wired to (`HOSTS`, `gs::ipc::peer`), so on the driver's side U2
 is a spawn row. On `xhci`'s side it is real work, because that driver was written around keyboards and one
@@ -1210,8 +1214,9 @@ IN polling a suspended chip. They stopped when the chip came back, and no transf
 
 ## 20. A respawn takes its reply mailbox back - a kernel change (2026-10-06) - hardware-verified on the Pi 2
 
-**With the operator's go-ahead, the fix section 19 pointed at.** When a watched task dies holding a reply
-mailbox, the kernel banks a credit. A watched spawn the reserve would refuse may spend one
+**With the operator's go-ahead, the fix section 19 pointed at.** When a watched task, or the supervisor, dies
+holding a reply mailbox, the kernel banks a credit; such a spawn the reserve would refuse may spend one.
+Credits are pooled, not tied to the task that banked them
 (`routing::MAILBOX_CREDITS`, `backlog/74` option 4). A respawned `wifi-usb` therefore gets back the mailbox
 its boot instance had. Its replies come only there, and `dwc2`'s notices can no longer be taken as answers.
 
@@ -1552,6 +1557,13 @@ attached` twice - `dwc2`'s boot report and its answer to the ask - and `wifi-usb
 5. `kill wifi-usb` with the dongle in: restarted, as every service is (`died, restarting`).
 6. `kill supervisor` with the dongle in: the respawned supervisor asks, `dwc2` answers, and the line ends
    `- wifi-usb running`; nothing is started twice.
+
+**Expected and not a refutation: the first instance without a reply mailbox.** On the Pi 2 `wifi-usb` no
+longer spawns at boot after `fs`; it spawns from the main loop, after `net-stack`, past the reply-mailbox
+reserve with no credit banked yet (`backlog/74`). So the first instance is likely to log `spawn[ipc]:
+'wifi-usb' gets no reply mailbox` and to run on the `OP_SYNC` fallback (section 19), with `syncs` above 0.
+Its stop on an unplug banks a credit, which the next instance takes back. Found by the documentation audit
+from the spawn order, not yet seen in a log.
 
 **Refuted by:** a `wifi-usb` started with no dongle; a `wifi-usb` restarted after an unplug; `could not
 report the WiFi dongle to the supervisor`; a second `wifi-usb` after the supervisor's respawn.

@@ -44,10 +44,12 @@ supervisor (8.9):
 - `ATTACHED [host, port, vid, pid, class, binding generation]`
 - `DETACHED [host, port, binding generation]`
 
-The **binding generation** counts every bind on that host. It is also returned by `usbfn::OP_INFO`, so
-the started driver - and a driver comparing after any re-enumeration - can tell "the same dongle, still
-bound" from "the same kind of dongle, bound again" (a replug, or a host re-scan that reset it). Today a
-replug of the same dongle reads as unchanged on both `dwc2` and `xhci` (`docs/wifi-usb.md` 25).
+The **binding generation** counts every bind on that host. It is meant to be returned by `usbfn::OP_INFO`
+as well, so the started driver - and a driver comparing after any re-enumeration - can tell "the same
+dongle, still bound" from "the same kind of dongle, bound again" (a replug, or a host re-scan that reset
+it); that half is not built (below). On `xhci` a re-enumeration of the same dongle reads as unchanged
+(`docs/wifi-usb.md` 25); on the Pi 2 a replug is seen, because the unplug's report stops the driver and the
+plug's starts a new one (`docs/wifi-usb.md` 10, 26).
 
 Supervisor to host, for the reconcile: `ASK` (`usbdev::ASK`, one byte, no reply capability). The host
 answers with its ordinary report rather than a reply, so a late answer can never be mistaken for one of
@@ -63,8 +65,8 @@ each host instance. `OP_INFO` does not carry it yet.
 
 - **Not the kernel.** The supervisor already spawns and kills services; the hosts already send it
   nothing, and will send it this.
-- **New grants, pinned with their reasons:** each USB host gains the supervisor as a peer, for the
-  reports.
+- **New grants, pinned with their reasons:** `dwc2` gains the supervisor as a peer, for the reports;
+  `xhci` gains it when it reports.
 - **`wifi-usb`** is no longer started at boot. It is spawned with its dongle already bound, and the
   supervisor stops it on the report that the dongle is gone (decided in the first card: the driver does
   not exit by itself). On the Pi 2 today; on `xhci`'s boards it is still started at boot until `xhci`

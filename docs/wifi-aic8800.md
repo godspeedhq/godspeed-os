@@ -1,6 +1,6 @@
 # WiFi on the VisionFive 2 Lite: the AIC8800D80 (design, 2026-10-04)
 
-**Status: DESIGN; phases V0 and V1 DONE and verified on the board 2026-10-04, and V2 DONE the same day in three cards: the data phase and a message to the chip's ROM (revision 7 read back); the three patches; then the table's writes, `fmacfw`, its patch configuration and the start, confirmed. V3 on is not built.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification, after which the driver answers `radio down` with the reason `DOWN_NOT_BUILT`. V3 onward is not built. This is the plan for the third radio in `docs/wifi.md`'s table and the
+**Status: phases V0 to V6 DONE and verified on the board (2026-10-04 to 2026-10-05): the grant, the `dw_mmc` host, the upload, the firmware's bring-up, scan, WPA2 join, and the frame path through `nic-driver`'s radio bridge (section 4). V7 (a rekey seen on this radio) is open.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification. The driver answers `radio down` with the reason `DOWN_NOT_BUILT` only when the bring-up stops before a station interface exists. This is the plan for the third radio in `docs/wifi.md`'s table and the
 second WiFi driver. `docs/wifi.md` section 44 identified the chip from the board's own boot log; the
 firmware is in `nonfree/aic8800d80/` (byte for byte what the board's vendor image loaded, with its
 licence position recorded there and in `docs/licensing.md` 5a). What follows is the hardware as the
@@ -29,7 +29,7 @@ are installed with one firmware command. So:
 |---|---|---|
 | WPA2 crypto: PBKDF2, the PRF, HMAC-SHA1 MIC, AES key unwrap | `sdk/wifi/src/crypto.rs` | **as is** |
 | EAPOL key frames: parse, build, MIC check, GTK KDE | `sdk/wifi/src/eapol.rs` | **as is** |
-| The four-way and group-key handshakes, rekeys included | `wifi-driver/join.rs` (`Handshake`), `frames.rs` | **moves to `sdk/wifi`** behind three calls (section 6) |
+| The four-way and group-key handshakes, rekeys included | `sdk/wifi/src/supplicant.rs` (`Handshake`, `group_rekey`) | **moved** behind a two-method `KeyPath`; each radio keeps its own short pairwise-rekey driver |
 | The credential table, `/wifi.keys`, the scan cache, auto-join, every reply layout | `wifi-driver/main.rs` serve loop, over `&mut dyn Station` (moved to `sdk/wifi/src/serve.rs` on 2026-10-06, for the USB dongle; `docs/wifi-usb.md` 10) | **as is** - the AIC8800 is a second `Station` |
 | SDIO protocol: CMD52, CMD53, identification, CIS | `sdk/wifi/src/sdio.rs`, behind `SdioHost` | **as is**, over a new host |
 | The `wifi` utility, `nic-driver`'s radio bridge, `net-stack` | above the driver | **as is** |
@@ -87,7 +87,7 @@ Pi 4's does. The 10 ms hold-offs are the device's and live in the driver.
 
 **MISCIS is unchanged**: no syscall, no privilege bit, no runtime role - the same argument as the Pi
 audio grant. The seam itself is in place (`4f34ab63`, merged into this branch from `feat/audio` on
-2026-10-04): riscv64 answers it today with `false` and `None`, and V0 is the change that makes it answer
+2026-10-04): riscv64 answered it with `false` and `None` until V0, which made it answer
 for this board.
 
 ## 4. The SDIO host: `dw_mmc` behind `SdioHost`
@@ -374,7 +374,8 @@ size), start `0x40D`; each answered by its confirm. In order:
 7. start the application: `{boot address 0x0012_0000, type 1}`, wait for its confirm;
 8. write `4` to register `0x02`.
 
-The five files reach the driver the way the CYW43455's do (`docs/wifi.md` 8): from the disk, through `fs`.
+The five files are embedded in the driver's image at build time (`aic_fw.rs`), as the CYW43455's are
+(`docs/wifi.md` 21); bringing the radio up does not depend on `fs`.
 
 **One discrepancy recorded, not resolved**: Radxa's source never changes the bus clock for the D80, but
 the board's log shows StarFive's build dropping it to 4.95 MHz for the upload. Uploading at a
@@ -391,7 +392,7 @@ driver will:
 |---|---|---|
 | start the stack | `MM_SET_STACK_START_REQ` (`0x7B`) | whether 5 GHz is supported |
 | firmware version | `MM_GET_FW_VERSION_REQ` (`0x80`) | the string for `wifi info` |
-| RF setup | tx power level, offset, adjust; `MM_SET_RF_CALIB_REQ` (`0x69`) | mandatory: the vendor driver aborts if any fails |
+| RF setup | tx power level (`0x77`) and `MM_SET_RF_CALIB_REQ` (`0x69`); offset and adjust not sent (vendor defaults leave both disabled) | mandatory: the vendor driver aborts if any fails |
 | our address | `MM_GET_MAC_ADDR_REQ` (`0x73`) | the efuse MAC |
 | reset, version | `MM_RESET_REQ` (`0x00`), `MM_VERSION_REQ` (`0x04`) | |
 | configure | `ME_CONFIG_REQ` (`0x1400`), `ME_CHAN_CONFIG_REQ` (`0x1402`) | the channel list |
@@ -411,7 +412,7 @@ a step the Broadcom firmware does implicitly. Leaving: `SM_DISCONNECT_REQ` / `_I
 
 **The handshake is in `sdk/wifi`** (`supplicant.rs`, moved 2026-10-05). It reached the chip through
 exactly two Broadcom calls, `ctrl::send_data` and `ctrl::install_key`; behind a two-method `KeyPath` it
-serves both chips, and the rekey work (`backlog/64`) came with it rather than being redone.
+serves both chips, and the group rekey (`backlog/64`) came with it rather than being redone.
 
 **Data**: transmit is 802.3-shaped - a 28-byte descriptor carrying the destination, source and ethertype,
 then the payload - and the firmware does the 802.11 encapsulation and the encryption. **Receive is not**:
@@ -469,7 +470,8 @@ command from a chip nobody has powered before. Everything after it is protocol.
 - ~~How the firmware reports a lost link.~~ **Settled (2026-10-05): `SM_DISCONNECT_IND`**, reason 1 when the
   unread link was dropped and 0 after the host's own `radio off`. An access point switched off has not
   been tried.
-- The `5 MHz` versus `150 MHz` clock question in section 5.
+- The clock questions in sections 4 and 5: whether `CIU_HZ` is really 49.5 MHz, and whether the upload
+  needs the vendor's 4.95 MHz or tolerates more.
 
 ## 10. Also done on this board, and what is left
 
@@ -495,8 +497,8 @@ radio ...`), which is the point of it: the radio in standby still answers a reke
 **Left open, recorded rather than closed (26.7):**
 
 - **V7, a group rekey answered on this radio.** It needs the board joined past the access point's rekey
-  interval, which no run so far lasted; the code is the shared `group_rekey`, hardware-verified on the Pi 4
-  (`backlog/64`), reached here by the same `pull` that carried DHCP and ping. Not seen is not shown.
+  interval, which no run so far lasted; the code is the shared `group_rekey` (`sdk/wifi/src/supplicant.rs`),
+  the same code the Pi 4 runs and not yet seen on hardware there either (`backlog/64`), reached here by the same `pull` that carried DHCP and ping. Not seen is not shown.
 - Section 9's clock question, and `SCANU_CANCEL_REQ`, known only by its place in the source's enum.
 - `STAT` bit 27 (`SRVC_RQST` in Linux, which never reads it) is set after the TRNG's first seed; nothing
   here acts on it, and nothing has gone wrong for its being set.

@@ -9,8 +9,9 @@ handshake run on the host (hardware 2026-09-29, sections 40-41), and carries `ne
 neither yet seen on hardware, `backlog/64`), keeps derived keys in `/wifi.keys` (43), adopts a running
 firmware on respawn (46), cuts and restores the chip's power through its own grant (47-52), holds a lease
 on the Arm clock for the upload (57), and shares its station half with other radios through `sdk/wifi`
-(59). The VisionFive 2 Lite's AIC8800 is a second driver in progress: the kernel grant (phase V0) and the
-userspace `dw_mmc` host's identification (V1) are built, `docs/wifi-aic8800.md` (44). `utilities/56_wifi.md`
+(59). The VisionFive 2 Lite's AIC8800 scans, joins and carries frames behind `nic-driver` (V0-V6,
+`docs/wifi-aic8800.md`, 44). The USB dongle is its own service, `wifi-usb` (`docs/wifi-usb.md`). All three
+share `sdk/wifi`, the serve loop included since 2026-10-06. `utilities/56_wifi.md`
 is the command surface and its status section is the current truth. Where a design section below and a
 later dated section disagree, the later one is what was built.
 
@@ -46,7 +47,8 @@ operator's captures) answers it: an AICSemi AIC8800D80 WiFi/Bluetooth combo on S
 Section 44 has the evidence and what it means for a port. This document now plans for three radios, two
 of them full-MAC.
 
-**Neither x86 box has WiFi, which is a convenience.** It means the QEMU-first development pattern that
+**Neither x86 box has WiFi, which is a convenience.** (Neither has an onboard radio; the USB dongle,
+`docs/wifi-usb.md`, has since run on the T630 through `xhci`.) It means the QEMU-first development pattern that
 carried the whole network stack (`e1000` in QEMU, RTL8168 on the bench) **does not transfer here**.
 QEMU has no model of either of our radios. Every line of this work is bench-only, on ARM, which is a
 real change in iteration cost and is the strongest argument for the phasing in section 7.
@@ -82,7 +84,9 @@ presents those three ops carries DHCP, ARP, ICMP, DNS and TCP with no change to 
 - **`wifi`** - the utility, the verb a person types (`utilities/56_wifi.md`).
 - **`wifi-driver`** - the service that owns the radio, named to the same convention as `nic-driver`
   and `block-driver`.
-- **`keyring`** - the service that owns the credential.
+- **`keyring`** - designed to own the credential and never built (section 6); the driver holds derived
+  keys and `/wifi.keys`.
+- **`wifi-usb`** - the USB dongle's driver (`docs/wifi-usb.md`).
 - **`nic-driver`** - unchanged, and it is the one that matters here: the link front end the radio sits
   behind.
 
@@ -251,7 +255,8 @@ consumer (59), exactly as the paragraph above said it would.
 > **Superseded (2026-09-29).** The keyring service this section designs was not built. The decision the
 > operator made instead - the driver derives the pairwise master key from the passphrase the moment it
 > arrives, keeps up to 64 keys in its own memory, and loses them on any restart ("better that than the
-> kernel crashing") - is recorded in `utilities/56_wifi.md` section 6, which is the current truth. This
+> kernel crashing"; since section 43 it saves up to 48 of them to `/wifi.keys`, which a restarted driver
+> reads back) - is recorded in `utilities/56_wifi.md` section 6, which is the current truth. This
 > section stays as the argument that led there.
 
 A WiFi passphrase is a **credential**, and this project has strong opinions about authority that apply
@@ -494,7 +499,7 @@ needs the upload again, after a power cycle (section 47).
 
 ## 9. Non-goals, stated so scope cannot creep (§26.2, §13.3)
 
-**In:** WPA2-PSK, one band, one SSID, one station link, scanning, DHCP through the existing stack.
+**In:** WPA2-PSK, both bands the chip offers (one band when this was written), one SSID, one station link, scanning, DHCP through the existing stack.
 
 **Out, and each for a reason rather than for now:**
 
@@ -777,8 +782,9 @@ rather than a default, so without it the driver would correctly decline to set a
 
 ### The authority, stated plainly
 
-One page of MMIO, granted by name and only where the census saw the controller answer. **No DMA arena,
-no interrupt, and no send peers** - not even `events`, which every other driver here declares. Each
+One page of MMIO, granted (by the service's name at the time; by device kind, `WIFI_SDIO`, since
+2026-10-03) and only where the census saw the controller answer. **No DMA arena, no interrupt, and no send
+peers at this step** (`fs` and `power` came later, sections 43 and 57) - not even `events`, which every other driver here declares. Each
 absence is in `services/wifi-driver/contracts/wifi-driver.toml` with its reason; the short form is that every command in this
 phase rides the SDIO command line, and a capability that buys nothing is standing authority a compromise
 inherits (§3.1, §26.9). They arrive with the phase that needs them.
@@ -3019,9 +3025,9 @@ nothing above the join existed yet - phase 5 in section 7's table. This section 
   `Carrier`: the cable, re-read at most every 500 ms on whatever request arrives, or the radio.
 - **The supervisor** wires `nic-driver` to `wifi-driver` where the image is embedded (`NIC_PEERS` on the
   `has_wifi_driver` board fact, not the ISA), and spawns the radio BEFORE `nic-driver` so the peer is in
-  the name-cap map when it wires. (Now keyed on the `nic_radio_bridge` board fact, split off
-`has_wifi_driver` in `services/supervisor/build.rs` because the VisionFive embeds the radio's driver but
-has no bridge to it.) The contract, the authority pin and the send-peer list all say the
+  the name-cap map when it wires. (Now keyed on the `nic_radio_bridge` board fact. It was split off
+`has_wifi_driver` while the VisionFive had no bridge to the radio, and since V6 it is derived from the radio
+fact again, `services/supervisor/build.rs`.) The contract, the authority pin and the send-peer list all say the
   same thing, and `contract_check` and Commandment VII hold them to it.
 - **`net` names the carrier**: `link  up via the cable`, `up via wifi (the cable is out)`, or `down`.
 

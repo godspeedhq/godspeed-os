@@ -2,10 +2,15 @@
 # `wifi` - join and inspect a wireless network
 
 Version reported by `wifi version`. Implementation shape: **shell built-in, every verb** (`cmd_wifi` in
-`services/shell/src/main.rs`), each a question put to `wifi-driver` over one send cap - see section 7,
+`services/shell/src/main.rs`), each a question put to whichever radio service is running (`RADIOS`: `wifi-driver`, then `wifi-usb`) - see
+section 7,
 where the reason for `scan` and `join` is a constraint rather than a preference.
 
 ## Status, as built and honest (2026-09-29)
+
+*(Since then: the VisionFive 2 Lite's AIC8800 (`docs/wifi-aic8800.md`, V0-V6) and the Pi 2's USB dongle
+(`docs/wifi-usb.md`, R4-R12c) answer the same verbs through the same serve loop. What follows is the Pi 4
+as of this date.)*
 
 **The radio scans and lists on the Raspberry Pi 4, and has since 2026-09-28.** The shell asks the
 `wifi-driver` over IPC, the radio sweeps, and one record per network prints in the order this file
@@ -677,8 +682,8 @@ frames when the cable is out. It is an action and does not pipe.
   radio the default would pick) clears the file rather than writing the default into it.
 
 **What `use` does, walked through on a Pi 4 with its onboard radio joined and a dongle plugged in.**
-1. The dongle is already up before anyone types `use`: `wifi-usb` runs from boot, and plugging the dongle
-   in is what binds it and brings the chip up (a few seconds). `use` on a radio still coming up waits for
+1. The dongle is already up before anyone types `use`: `wifi-usb` runs while its dongle is attached (on the Pi 2
+   the supervisor starts it when the host reports the dongle), and plugging the dongle in is what binds it and brings the chip up (a few seconds). `use` on a radio still coming up waits for
    it, bounded, and says so.
 2. `use usb` records the choice in `nic-driver` and `/wifi.radio`.
 3. `nic-driver` asks the radio in use what it is joined to, and asks the chosen one to join that network.

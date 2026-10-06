@@ -1,7 +1,8 @@
 # 74. On every board image the last services spawned get no reply mailbox, and `net-stack` is always one of them
 
-**Status: OPEN, low priority - found 2026-10-04 from a VisionFive boot, confirmed in a Pi 4 log. Measured on both radio boards the same day: the mailboxes make no measurable difference (below). Option 3 (every refusal
-named) is DONE; the reserve stays at 72.**
+**Status: OPEN, low priority - found 2026-10-04 from a VisionFive boot, confirmed in a Pi 4 log. Measured on both radio boards the same day: the mailboxes make no measurable difference (below). Options 3 and 4 are DONE
+(refusals named; a watched task's or the supervisor's respawn takes back a released mailbox,
+hardware-verified on the Pi 2 2026-10-06); the reserve stays at 72.**
 
 ## What was seen
 
@@ -149,8 +150,9 @@ the radio 37 ms, no slow pass logged.
 no tax on the radio boards, and for a service whose only messages from a peer are replies, that holds.
 `wifi-usb` is different: `dwc2` sends it a notice per received USB transfer (`NOTE_BULK_IN`) and calls
 from it carry requests, both on one endpoint when there is no mailbox. The kernel matches a call's reply
-by sender, so a notice can be taken as the answer. Boot gives `wifi-usb` a mailbox; EVERY respawn is
-refused one (`71 of 96 routing slots free, reserve 72`).
+by sender, so a notice can be taken as the answer. Boot gave `wifi-usb` a mailbox while it was spawned after `fs`; EVERY respawn was
+refused one (`71 of 96 routing slots free, reserve 72`). Since it is started on demand on the Pi 2
+(`docs/wifi-usb.md` 26) it spawns after `net-stack` and is expected to be refused one at first.
 
 The first respawn after R9's power cycle stopped dead: every answer one behind. `usbfn::OP_SYNC`, a
 request `dwc2` never answers, now recovers it without a kernel change, and the operator's run that day
@@ -188,7 +190,8 @@ spent when 12 or fewer slots are free (`CREDIT_FLOOR`, an eighth of the table). 
 mandatory receive endpoints, whatever the credits say, and the grant falls back to the refusal.
 
 **What it does not change.** A service refused at boot (`nic-driver`, `net-stack` on these images)
-never held one, banks nothing, and is still refused on a respawn. That is the rest of this item. The
+never held one and banks nothing. On a respawn it may still take a pooled credit another watched task
+released, so whether it gets one depends on the order of deaths and spawns. That is the rest of this item. The
 reserve itself is untouched.
 
 **Said, like the refusal:** `spawn[ipc]: '<name>' takes back a reply mailbox released by a service that
