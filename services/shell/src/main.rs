@@ -9732,7 +9732,7 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
                     Some(RADIO_DOWN) if p.get(1).copied() == Some(DOWN_NOT_BUILT) => return wifi_radio_unavailable(ctx, out, RADIO_DOWN),
                     Some(RADIO_DOWN) => wifi_restart_and_watch(ctx, out, "powercycle", "the radio is down (no firmware behind it)")?,
                     Some(NO_POWER_CONTROL) => {
-                        out.line_fmt(ctx, format_args!("powercycle failed - the kernel refused: this machine has no control over the radio's power"));
+                        out.line_fmt(ctx, format_args!("powercycle failed - the radio's power is not under its driver's control here (the kernel refused, or a USB dongle, whose power is its port's)"));
                         return Err(ShellError::Unknown);
                     }
                     Some(_) => {
@@ -9898,7 +9898,9 @@ fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
     // first. There is no [b]: a blocking Call cannot poll the console mid-flight (the kernel dequeue is
     // welded to the send), and three seconds does not earn a new kernel syscall to make it abortable.
     const MAX_SECS: i64 = 15;
-    out.line_fmt(ctx, format_args!("cutting the chip's power - leaving the network first, then the pin is read back low"));
+    // Said as a question, not as what happens: a driver with no power to cut (a USB dongle's is its port's)
+    // answers NO_POWER_CONTROL without leaving the network (`serve::Host::can_cut_power`).
+    out.line_fmt(ctx, format_args!("asking the driver to cut the chip's power - one that can leaves the network first"));
     let r = match wifi_ask(ctx, &[OP_RADIO, RADIO_HARD_OFF], (MAX_SECS as u64) * 1000) {
         Some(r) => r,
         None => return wifi_not_answering(ctx, out),
@@ -9925,7 +9927,13 @@ fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
             Ok(())
         }
         Some(NO_POWER_CONTROL) => {
-            out.line_fmt(ctx, format_args!("radio off hard failed - the kernel refused: this machine has no control over the radio's power; the radio is as it was"));
+            // Byte 1 says whether the driver left the network before the refusal: only one that could cut
+            // the power gets that far (the kernel then refusing it); one that cannot changes nothing.
+            if p.get(1).copied().unwrap_or(0) != 0 {
+                out.line_fmt(ctx, format_args!("radio off hard failed - the driver left the network, then the kernel refused to cut the power; the radio is on and off the network - `wifi join` rejoins"));
+            } else {
+                out.line_fmt(ctx, format_args!("radio off hard failed - this radio's power is not under its driver's control (a USB dongle's is its port's); nothing changed - `wifi radio off` turns the radio off"));
+            }
             Err(ShellError::Unknown)
         }
         Some(RADIO_DOWN) => {

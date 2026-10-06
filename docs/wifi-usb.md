@@ -943,7 +943,7 @@ host that cannot (the default, so the dongle) is answered "no power control" wit
 the network. `wifi-driver`'s SDIO host says it can, so the Pi 4's and the VisionFive's hard off is
 unchanged.
 
-## 17. R8 (2026-10-06): the data rate is the firmware's - built, not yet run
+## 17. R8 (2026-10-06): the data rate is the firmware's - the rate mask taken; the speed-up not yet measured
 
 Since R6 every data frame went at the driver's rate, 1 Mb/s, the rate the management frames use. Linux
 does not send data that way. Once associated, `rtl8xxxu_bss_info_changed` gives the chip's firmware the
@@ -988,3 +988,31 @@ large payloads.
 - `the firmware was not given the rates`;
 - the lease or the pings failing where R6 succeeded (a data descriptor the chip refuses or sends badly);
 - no change in the large ping's time (the firmware not adapting, or the mask not taking).
+
+**The R8 card's run (2026-10-06): nothing refuted, and the speed-up itself not measured.**
+- At JOINED, after boot and again after `radio on`: `the firmware has the rate mask 0xfff and the
+  association`. The mailbox took both commands; the access point lists all twelve legacy rates.
+- The lease, the gateway and the internet over the dongle: `ping` 8.8.8.8 3 of 3, then 3 of 3 after the
+  rejoin. `ping bytes 1024` to the gateway: 7 of 7, 9 to 18 ms, average 14 ms. No frame failed: `dwc2`
+  reported `tx - 62 frames, 0 failed`.
+- `wifi radio off hard`: `nothing changed, still on the network`, and `wifi status` showed the join still
+  up. The R7b fix holds.
+
+**What it does not show.** No small ping to the gateway was run on this image, and no large one on R7. So
+there is no pair to subtract, and 14 ms on its own says nothing about the uplink rate: the floor of this
+path (USB, three services, the access point) has not been measured. The next run needs `ping 192.168.10.1`
+and `ping bytes 1024 192.168.10.1` back to back. A difference of about 8 ms or more is the 1 Mb/s uplink
+still in force; a difference of a millisecond or two is the firmware choosing a higher rate.
+
+**Seen on the way, not R8's.** At the first DHCP exchange `nic-driver` logged `wifi-usb answered 0x10
+while we asked 0x11 - not our reply (1 mismatched ...)`. The bridge's own request timed out ("2 slow") and
+the late answer arrived after it had moved on. The bridge's check caught it, the lease completed 50 ms
+later, and it did not recur. It came during the join's busiest second: the keys file being written, an
+op that took 1636 ms to serve. Recorded, not chased: the check did its job, and a second sighting would
+make it a card.
+
+**The shell's words for hard off, corrected.** It announced "cutting the chip's power - leaving the network
+first" before asking, and answered the dongle's refusal with "the kernel refused". Neither is true for a
+driver that changes nothing. The shell now asks rather than announces. On `NO_POWER_CONTROL` it reads byte
+1 (whether the driver left first): left means the kernel refused a host that could cut; not left means the
+driver has no power to cut, and nothing changed. `powercycle`'s refusal no longer blames the kernel alone.
