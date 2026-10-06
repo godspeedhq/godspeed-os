@@ -385,7 +385,7 @@ fn serve(ctx: &ServiceContext, d: &mut Dwmac) -> ! {
     let mut cable = link_was_up;
     let mut cable_read_at = ctx.read_tsc();
     let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
-    let mut radio = Radio::new();
+    let mut radio = Radio::new("wifi-driver");
     let mut radio_tx_fail: u32 = 0;
 
     loop {

@@ -999,6 +999,21 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     }
     ctx.log("nic-driver: serving frame interface");
 
+    // THE RADIO AS THE LINK'S SECOND BACKEND (R6, `docs/wifi-usb.md` 14): the USB WiFi dongle's service,
+    // `wifi-usb`, reached over the same frame ops as GENET's and dwmac's `wifi-driver`, with the same rule -
+    // the cable always wins. Included by path from inside this function, the backend it serves, as those
+    // two include it from theirs: no board fact is added to say which board has it.
+    #[path = "radio.rs"]
+    mod radio;
+    use radio::{Carrier, Radio, CABLE_RECHECK_MS};
+    let mut radio = Radio::new("wifi-usb");
+    let mut carrier = Carrier::None;
+    let mut radio_tx_fail: u32 = 0;
+    // The cable: the USB ethernet's own link bit (`dev_info`), re-read at most every `CABLE_RECHECK_MS`
+    // on whatever request arrives, and on every STATUS. With no USB ethernet at all there is no cable.
+    let mut cable = { let mut ni = [0u8; 7]; dev_info(&ctx, &mut ni) && ni[6] != 0 };
+    let mut cable_read_at = ctx.read_tsc();
+
     // Poll the bulk IN endpoint up to RX_TRIES times for one received frame; returns its length (0 = none).
     let rx_one = |ctx: &ServiceContext, buf: &mut [u8]| -> usize {
         for _ in 0..RX_TRIES {
@@ -1012,24 +1027,46 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
     loop {
-        let _req = ctx.recv();
-        let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        // A REQUEST THE RADIO WAIT KEPT IS SERVED FIRST - it arrived before anything the recv below could
+        // return (`Radio::held`, as in GENET's loop).
+        let (_req, reply_cap) = match radio.take_held() {
+            Some(h) => h,
+            None => {
+                let r = ctx.recv();
+                match ctx.take_pending_cap() { Some(c) => (r, c), None => continue }
+            }
+        };
         let p = _req.payload_bytes();
 
-        if p.len() == 1 && p[0] == 3 {
-            // STATUS: [ok, mac(6), link] - net-stack reads MAC at [1..7] and link at [7].
-            let mut out = [0u8; 8];
+        // THE CABLE, re-read at most every CABLE_RECHECK_MS (`Carrier`).
+        let now = ctx.read_tsc();
+        if now.wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
+            cable_read_at = now;
             let mut ni = [0u8; 7];
-            if dev_info(&ctx, &mut ni) {
-                out[0] = 1;
-                out[1..7].copy_from_slice(&ni[0..6]);
-                out[7] = ni[6];
+            cable = dev_info(&ctx, &mut ni) && ni[6] != 0;
+        }
+
+        if p.len() == 1 && p[0] == 3 {
+            // STATUS: [ok, mac(6), link, carrier] (`radio::status`) - the cable's own address and link
+            // while it has one, the radio's when it does not and the dongle is joined. Read fresh.
+            let mut ni = [0u8; 7];
+            let have = dev_info(&ctx, &mut ni);
+            cable = have && ni[6] != 0;
+            cable_read_at = ctx.read_tsc();
+            let mut mac = [0u8; 6];
+            if have {
+                mac.copy_from_slice(&ni[0..6]);
             }
+            let out = radio::status(&ctx, &mut radio, cable, mac, &mut carrier);
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
+        } else if p.len() == 1 && p[0] == 10 {
+            // WHICH ACCESS POINT carries the radio's link - asked only after STATUS has said the radio does.
+            let out = radio::peer(&ctx, &mut radio, cable);
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
             let mut rx = [0u8; FRAME_MAX];
-            let n = rx_one(&ctx, &mut rx);
+            let n = if cable { rx_one(&ctx, &mut rx) } else { radio.rx(&ctx, &mut rx) };
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n])), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes].
@@ -1042,7 +1079,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 // re-polls (op 4/9) for whatever we stop short of.
                 if opos + 2 + FRAME_MAX > out.len() { break; }
                 let mut rx = [0u8; FRAME_MAX];
-                let n = dev_rx(&ctx, &mut rx);
+                let n = if cable { dev_rx(&ctx, &mut rx) } else { radio.rx(&ctx, &mut rx) };
                 if n == 0 { break; }
                 out[opos] = (n & 0xff) as u8;
                 out[opos + 1] = ((n >> 8) & 0xff) as u8;
@@ -1087,7 +1124,18 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // Nothing is stranded by the change: not fetching the frame leaves it queued for the next
             // drain, and every caller that transmits already drains afterwards. What is lost is at most
             // one poll interval of latency on the first frame after a send.
-            if !dev_tx(&ctx, p) {
+            if !cable {
+                // The radio's turn (`Carrier`): the frame goes to `wifi-usb` as op 0x11, and a refusal is
+                // counted and said sparingly - a dongle that is not joined refuses every frame, correctly.
+                if !radio.tx(&ctx, p) {
+                    radio_tx_fail = radio_tx_fail.saturating_add(1);
+                    if radio_tx_fail == 1 || radio_tx_fail % 64 == 0 {
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio did not send a {} byte frame (x{}) - not joined, or no answer",
+                            p.len(), radio_tx_fail));
+                    }
+                }
+            } else if !dev_tx(&ctx, p) {
                 tx_fail = tx_fail.saturating_add(1);
                 if tx_fail == 1 || tx_fail % 64 == 0 {
                     ctx.log_fmt(format_args!("nic-driver: usb-net TX FAILED x{} (frame not sent)", tx_fail));

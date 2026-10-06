@@ -343,7 +343,13 @@ mod board {
     /// `dwc2`'s send peers: `events`, and the dongle's driver wherever it is embedded (see the IMAGES row).
     pub const DWC2_PEERS: &[&str] = if cfg!(has_wifi_usb) { &["events", "wifi-usb"] } else { &["events"] };
 
-    pub const NIC_PEERS: &[&str] = if cfg!(target_arch = "arm") {
+    pub const NIC_PEERS: &[&str] = if cfg!(has_wifi_usb) {
+        // The Pi 2: its ethernet is behind `dwc2`, and the USB WiFi dongle's driver - embedded only where
+        // `dwc2` serves the dongle, which is the Pi 2 - is the link's other backend (`docs/wifi-usb.md`,
+        // R6), the same rule as the radio below: the cable always wins. Tested first and flat, because
+        // `contract_check.py` reads this chain as text and does not follow a nested `if`.
+        &["dwc2", "events", "wifi-usb"]
+    } else if cfg!(target_arch = "arm") {
         &["dwc2", "events"]
     } else if cfg!(nic_radio_bridge) {
         // The radio is the link's other backend where there is one (docs/wifi.md 2): the cable always

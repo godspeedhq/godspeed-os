@@ -39,7 +39,7 @@ log_write = true
 # the radio is joined, this service carries net-stack's frames to it over the same three ops (0x10 INFO /
 # 0x11 TX / 0x12 RX) it answers upward. Granted only where that image is embedded (the supervisor's
 # `has_wifi_driver` board fact); the policy - the cable always wins - is `Carrier` in `genet.rs`.
-ipc_send  = ["dwc2", "wifi-driver", "events"]
+ipc_send  = ["dwc2", "wifi-driver", "wifi-usb", "events"]
 # ARM NOTE (userspace-audit Audit 5, A5-U1) - applies to BOTH ARM ports: on neither is there a PCIe NIC,
 # so `hw_device = "nic"` resolves to nothing; instead the kernel grants this service the NET_DEVICE
 # capability BY NAME (frame syscalls 42-44 - `service_privileges` in kernel `task/mod.rs`, arch-gated to

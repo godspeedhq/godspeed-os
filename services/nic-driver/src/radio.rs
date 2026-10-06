@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! THE RADIO AS THE LINK'S SECOND BACKEND (`docs/wifi.md` 2): `wifi-driver` reached over the frame ops,
-//! and which of the cable and the radio carries `net-stack`'s frames. Moved out of `genet.rs` whole when
-//! the VisionFive's `dwmac` gained the same bridge (`docs/wifi-aic8800.md`, phase V6), so the rule - the
-//! cable always wins - and the radio's bounded exchange are written once for both boards. Included by
+//! THE RADIO AS THE LINK'S SECOND BACKEND (`docs/wifi.md` 2): the radio's service reached over the frame
+//! ops, and which of the cable and the radio carries `net-stack`'s frames. Moved out of `genet.rs` whole
+//! when the VisionFive's `dwmac` gained the same bridge (`docs/wifi-aic8800.md`, phase V6), so the rule -
+//! the cable always wins - and the radio's bounded exchange are written once for every board. Included by
 //! `#[path]` from each backend that uses it; see the note where `genet.rs` and `dwmac.rs` include it.
+//!
+//! WHICH SERVICE IS THE RADIO is the backend's to say (`Radio::new`): `wifi-driver` beside GENET and
+//! `dwmac`, whose radios are on the board, and `wifi-usb` beside the Pi 2's USB ethernet, whose radio is a
+//! USB dongle (`docs/wifi-usb.md`, R6). Both answer the same frame ops through the same serve loop.
 
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
 
@@ -56,6 +60,8 @@ const RADIO_BACKOFF_MS: u64 = 1_000;
 /// checked against the op it answers, because the radio's endpoint also serves the `wifi` utility and a
 /// late reply would otherwise be read as the next answer.
 pub(crate) struct Radio {
+    /// The radio's service, by name: who the frame ops go to and who the log blames.
+    name: &'static str,
     answered: u32,
     slow: u32,
     timeouts: u32,
@@ -86,8 +92,9 @@ pub(crate) struct Radio {
 const RADIO_HELD_MAX: usize = 2;
 
 impl Radio {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(name: &'static str) -> Self {
         Radio {
+            name,
             answered: 0, slow: 0, timeouts: 0, silent_run: 0, mismatch: 0, sendfail: 0, restale: 0,
             down_until: 0, backoffs: 0,
             held: [None, None], rescued: 0, held_dropped: 0,
@@ -118,7 +125,8 @@ impl Radio {
         // request - net-stack asking for a frame or the link - and is kept for the serve loop; the
         // wait goes on for the radio's actual answer. `take_pending_cap` reads and CLEARS the cap the
         // kernel installed for THIS message, so it must be asked here, at arrival (see `held`).
-        let got = ctx.request_with_reply_ms_sifted("wifi-driver", msg, RADIO_MS, |m| {
+        let name = self.name;
+        let got = ctx.request_with_reply_ms_sifted(name, msg, RADIO_MS, |m| {
             let Some(cap) = ctx.take_pending_cap() else { return true; };
             let op = m.payload_bytes().first().copied().unwrap_or(0);
             if let Some(slot) = self.held.iter_mut().find(|s| s.is_none()) {
@@ -199,7 +207,7 @@ impl Radio {
                 // lookup once a second while the radio is down costs nothing; said once and then every
                 // sixteenth, so a radio that is simply gone is a count.
                 if self.silent_run >= RADIO_REACQUIRE_AFTER {
-                    if ctx.reacquire_by_name("wifi-driver") {
+                    if ctx.reacquire_by_name(self.name) {
                         self.restale = self.restale.saturating_add(1);
                         if self.restale == 1 || self.restale % 16 == 0 {
                             ctx.log_fmt(format_args!(
@@ -208,7 +216,8 @@ impl Radio {
                         }
                     } else {
                         self.sendfail = self.sendfail.saturating_add(1);
-                        ctx.log("nic-driver: the radio was silent and its name does not resolve - wifi-driver is not running");
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio was silent and its name does not resolve - {} is not running", self.name));
                     }
                 }
                 return None;
@@ -220,8 +229,8 @@ impl Radio {
             self.mismatch = self.mismatch.saturating_add(1);
             if self.mismatch == 1 || self.mismatch % 128 == 0 {
                 ctx.log_fmt(format_args!(
-                    "nic-driver: wifi-driver answered {:#04x} while we asked {:#04x} - not our reply ({} mismatched, {} unanswered, {} never sent)",
-                    got.payload_bytes().first().copied().unwrap_or(0), want,
+                    "nic-driver: {} answered {:#04x} while we asked {:#04x} - not our reply ({} mismatched, {} unanswered, {} never sent)",
+                    self.name, got.payload_bytes().first().copied().unwrap_or(0), want,
                     self.mismatch, self.timeouts, self.sendfail));
             }
             return None;

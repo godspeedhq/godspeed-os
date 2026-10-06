@@ -741,7 +741,10 @@ SpawnImage               = 52
 "stdlib-hello" = ["peer:fs"]
 "hw-enumerator" = ["peer:events", "priv:PCI_CFG"]
 "net-stack" = ["peer:events", "peer:nic-driver", "priv:RESOURCE_MINT"]
-"nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci", "peer:dwc2", "peer:events", "peer:wifi-driver"]
+# nic-driver: peer:wifi-usb (R6, 2026-10-06) - on the Pi 2 the USB WiFi dongle's driver is the link's
+# second backend, reached over the frame ops when the cable is out, as wifi-driver is on the Pi 4 and the
+# VisionFive (services/nic-driver/src/radio.rs).
+"nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci", "peer:dwc2", "peer:events", "peer:wifi-driver", "peer:wifi-usb"]
 "observe" = ["priv:INTROSPECT"]
 "observe-live" = ["priv:INTROSPECT"]
 "observe-now" = ["priv:INTROSPECT"]
