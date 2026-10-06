@@ -1,4 +1,4 @@
-# USB device drivers on demand - DESIGN, NOT BUILT (2026-10-06)
+# USB device drivers on demand - BUILT ON THE PI 2 (`dwc2`), not yet on `xhci` (2026-10-06)
 
 Agreed with the operator on 2026-10-06, while the USB WiFi dongle was being brought to `xhci`
 (`docs/wifi-usb.md` section 7, U2): *"I would like the connected device to be recognised and the
@@ -49,7 +49,15 @@ the started driver - and a driver comparing after any re-enumeration - can tell 
 bound" from "the same kind of dongle, bound again" (a replug, or a host re-scan that reset it). Today a
 replug of the same dongle reads as unchanged on both `dwc2` and `xhci` (`docs/wifi-usb.md` 25).
 
-Supervisor to host, for the reconcile: `LIST` -> the attached devices and their generations.
+Supervisor to host, for the reconcile: `ASK` (`usbdev::ASK`, one byte, no reply capability). The host
+answers with its ordinary report rather than a reply, so a late answer can never be mistaken for one of
+the supervisor's commands, and there is one message carrying the state instead of two.
+
+**As built (Pi 2, `docs/wifi-usb.md` 26):** `sdk/rust/src/service_context.rs` `usbdev`. One message,
+`REPORT` - present or not, the binding count, VID:PID - instead of separate attached and detached
+messages: each report is the host's whole state for its device, so a duplicate is harmless. The host and
+port are not in it yet; one host reports today, with one such device. The binding count restarts with
+each host instance. `OP_INFO` does not carry it yet.
 
 ## 3. What it changes
 
@@ -57,9 +65,10 @@ Supervisor to host, for the reconcile: `LIST` -> the attached devices and their 
   nothing, and will send it this.
 - **New grants, pinned with their reasons:** each USB host gains the supervisor as a peer, for the
   reports.
-- **`wifi-usb`** is no longer started at boot. It is spawned with its dongle already bound, and it
-  exits when told the dongle left (or is stopped by the supervisor on the detach report - one of the
-  two, decided in the first card).
+- **`wifi-usb`** is no longer started at boot. It is spawned with its dongle already bound, and the
+  supervisor stops it on the report that the dongle is gone (decided in the first card: the driver does
+  not exit by itself). On the Pi 2 today; on `xhci`'s boards it is still started at boot until `xhci`
+  reports.
 - **`wifi status` with no dongle** says "no wireless radio", which is then literally true.
 - **`utilities/56_wifi.md` 11** (`wifi hardware`) reads the radios that exist at that moment, and
   `nic-driver`'s bridge follows radios appearing and leaving, which the saved choice's fallback
@@ -69,7 +78,7 @@ Supervisor to host, for the reconcile: `LIST` -> the attached devices and their 
 
 | Host | Today | For a driver it does not run itself |
 |---|---|---|
-| `dwc2` (Pi 2) | binds the dongle, serves `usbfn` in full, tells `wifi-usb` | add the reports and the generation |
+| `dwc2` (Pi 2) | binds the dongle, serves `usbfn` in full, tells `wifi-usb`, and REPORTS it (`usbdev`, 2026-10-06) | the generation in `OP_INFO` |
 | `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers | the reports, the generation, the dongle's port watched (an unplug seen at once), then bulk IN (U2b) and bulk OUT (U2c) |
 | `ehci` (the T630's second controller) - **limitation, not planned** | one topology: the AMD hub on its root port, low-speed keyboards and mice behind it; **skips every high-speed device** on a hub port | everything `xhci` needed, and bulk transfers from scratch |
 
@@ -89,7 +98,7 @@ alone; a bulk IN qTD kept armed, with its completion taken on the interrupt; a b
 ## 5. Order of work
 
 1. **Finish U2a on the T630:** the dongle's bring-up through `xhci`, the card in progress.
-2. **On-demand drivers, on the Pi 2 first**, because `dwc2` + `wifi-usb` is the hardware-verified path:
+2. **On-demand drivers, on the Pi 2 first** (BUILT 2026-10-06, `docs/wifi-usb.md` 26; its card is owed), because `dwc2` + `wifi-usb` is the hardware-verified path:
    the reports, the match table, stop-on-detach, the generation. Then the same on `xhci` (T630), with
    the dongle's port watched.
 3. **U2b and U2c:** receive and transmit through `xhci`, then `nic-driver`'s radio bridge on x86 (the

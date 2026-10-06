@@ -1501,3 +1501,57 @@ the same dongle `xhci` was about twice as fast as `dwc2`:
 
 The log ends a second after the bring-up, so it cannot say whether the first run's port drop recurs; the
 `PORTSC` line is in place for a longer run.
+
+## 26. The dongle's driver started by the dongle, on the Pi 2 (2026-10-06) - built, checked in QEMU, not yet on hardware
+
+The first card of `docs/usb-device-drivers.md`, at the operator's direction: *"I would like the connected
+device to be recognised and the appropriate driver/service loaded"*.
+
+**`dwc2` reports, it does not decide.** A new SDK protocol, `usbdev` (`sdk/rust/src/service_context.rs`):
+- `[supcmd::MARKER, 'U', present, binding(4), vid(2), pid(2)]`, host to supervisor, `try_send`, never
+  answered. It names no driver.
+- It is the host's whole state for the dongle, not a change, so a duplicate is harmless and a lost one is
+  corrected by the next.
+- `dwc2` sends it when it binds the dongle, when it loses it, at the end of its boot enumeration (found or
+  not), and when the supervisor asks: `usbdev::ASK`, the one byte `0x26` with no reply capability, which
+  `dwc2` answers with the report (`rtl::announce`, `rtl::report_device`).
+- `binding` counts the dongle's binds on that host: the same dongle bound again reads differently. It
+  counts from 1 in each `dwc2` instance, so a host respawn starts it again - recorded, not yet a problem,
+  since nothing compares it across a host restart.
+
+**The supervisor decides** (`USB_MATCH`, `UsbState`, `usb_report`):
+- The match table: `0bda:8176 -> wifi-usb`, wired to `board::WIFI_USB_PEERS`.
+- Attached: `wifi-usb` started if it is not running, adopted into the name map if it is.
+- Not attached: `wifi-usb` stopped (`kill`), and its death is NOT restarted - not by the death arm, the
+  reconcile sweep or the startup convergence (`UsbState::wanted`). A crash while the dongle is attached
+  is restarted as before.
+- A supervisor that has just started (boot, or respawned by the kernel, 6.2) asks each reporting host
+  before its convergence, and leaves the dongle's driver alone until the host has answered. That is the
+  reconcile: it learns what is attached rather than guessing.
+- One host reports, with one such device, so "not attached" stops every row. A second host or a second
+  dongle needs the report to name its host, recorded for when either exists.
+
+**Only the Pi 2 changes.** `xhci` does not report yet, so on its boards the table is empty and `wifi-usb`
+is still started at boot. `dwc2` gains the supervisor as a send peer (contract, pin).
+
+**Checked before the card:** every gate passes in the x86 build, including the commandments red-team. The
+Pi 2 image boots in QEMU (no dongle there): `supervisor: USB host reports no device with a driver here
+attached` twice - `dwc2`'s boot report and its answer to the ask - and `wifi-usb` never starts.
+`nic-driver` probes the absent radio three times, backs off and says `wifi-usb is not running`.
+
+**Prediction, Pi 2, cable in:**
+1. Boot WITHOUT the dongle: the `no device` line, no `wifi-usb` lines at all, and `wifi status` reports no
+   radio.
+2. Plug the dongle in: `usb: WiFi dongle connected`, then `supervisor: USB 0bda:8176 attached (binding 1)
+   - starting wifi-usb`, then `wifi-usb`'s bring-up as before (R1 to R12c) and its auto-join from
+   `/wifi.keys`.
+3. Unplug it: `supervisor: USB host reports no device ...`, `supervisor: wifi-usb stopped - its USB
+   device 0bda:8176 is not attached`, then `supervisor: wifi-usb ended - not restarted ...`. `wifi status`
+   reports no radio again.
+4. Plug it back: `attached (binding 2) - starting wifi-usb`, and it rejoins.
+5. `kill wifi-usb` with the dongle in: restarted, as every service is (`died, restarting`).
+6. `kill supervisor` with the dongle in: the respawned supervisor asks, `dwc2` answers, and the line ends
+   `- wifi-usb running`; nothing is started twice.
+
+**Refuted by:** a `wifi-usb` started with no dongle; a `wifi-usb` restarted after an unplug; `could not
+report the WiFi dongle to the supervisor`; a second `wifi-usb` after the supervisor's respawn.
