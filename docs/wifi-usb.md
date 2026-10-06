@@ -1285,7 +1285,7 @@ to the gateway went 5 of 5 (4 to 16 ms) and `ping 8.8.8.8` 6 of 6, with no repla
 a 286 byte frame` at the join is `nic-driver`'s first DHCP send meeting the join's last moments, seen
 since R6.
 
-## 23. R12b (2026-10-06): 802.11n - an HT association - built, not yet run
+## 23. R12b (2026-10-06): 802.11n - an HT association - associated and declining aggregation on the Pi 2; slower, see R12c
 
 On a WMM association (R12a) to an access point that advertises HT Capabilities, the station associates
 as an HT station, as mac80211 does for `rtl8xxxu`'s band.
@@ -1318,3 +1318,27 @@ declined`.
 
 **Refuted by:** the association refused (the HT element wrong), or the link carrying nothing afterwards
 (the HT rate mask or the short guard interval wrong for this access point).
+
+**The R12b card's run (2026-10-06): the association holds, the speed is refuted.**
+- `an 802.11n access point: associated as an HT station; it receives MCS 0xff/0xff, short GI yes`.
+- JOINED, then `the firmware has the rate mask 0x0fffffff, short GI`, then `the access point asked to
+  aggregate (ADDBA, TID 0) - declined`. The decline was taken: the link carried on.
+- **But slower.** To the gateway: 32 bytes average 16 ms (min 10) against R12a's 9 (min 4); 1024 bytes
+  average 30 ms (min 26) against R8's 13 (min 8). `ping 8.8.8.8` 5 of 6, average 40 ms against 25.
+
+## 24. R12c (2026-10-06): the two-stream rates out of a one-transmitter chip's mask - built, not yet run
+
+**The suspect, from the run above.** The mask was `0x0fffffff`: the access point receives two streams
+(`0xff/0xff`), so MCS 8-15 went in beside MCS 0-7, exactly as `rtl8xxxu` builds it. This dongle has one
+transmit path (SYS_CFG 1T1R; R11's `1 path(s)`). If the firmware's rate adaptation tries rates the chip
+cannot send, every such attempt fails and falls back, which costs this kind of time. What Linux's
+firmware does with the same mask at runtime is not measured here; only that it passes it.
+
+**The one change:** MCS 8-15 go in only where the chip has two transmit paths (`TxPower::tx_paths`, R11).
+On this dongle the mask becomes `0x000fffff`. Everything else is R12b's, including the short guard
+interval, so the result points at the mask alone.
+
+**Prediction:** `rate mask 0x000fffff, short GI`. The pings come back to R12a's levels or below: 32 bytes
+around 10 ms, and 1024 bytes within a few ms of it.
+
+**Refuted by:** the same slowness. Then the short guard interval is the next suspect, on its own card.

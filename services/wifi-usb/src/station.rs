@@ -629,7 +629,13 @@ impl Station for Dongle<'_> {
             // R12b: the access point's HT receive set into the mask, as `rtl8xxxu` builds it.
             let (mask, sgi) = match a.ht {
                 Some(h) => (
-                    a.rates | (h.mcs[0] as u32) << 12 | (h.mcs[1] as u32) << 20,
+                    // R12c: the two-stream rates (MCS 8-15) only where this chip has two transmit paths.
+                    // `rtl8xxxu` puts the access point's whole receive set in; on a one-path chip the
+                    // firmware could then pick rates it cannot send. The R12b card, with them in, ran a
+                    // 1024-byte ping at 26-36 ms against R12a's 8-18 (26.14: the transmitter count is a
+                    // fact of the device; recorded here as the deliberate difference).
+                    a.rates | (h.mcs[0] as u32) << 12
+                        | if self.power.tx_paths > 1 { (h.mcs[1] as u32) << 20 } else { 0 },
                     h.cap & (mgmt::HT_CAP_SGI_20 | mgmt::HT_CAP_SGI_40) != 0,
                 ),
                 None => (a.rates, false),
