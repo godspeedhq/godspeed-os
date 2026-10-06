@@ -467,6 +467,18 @@ verified on it: on the Pi 4 and on the VisionFive, `wifi scan`, `wifi list`, `wi
 (auto-join from `/wifi.keys` at boot is one), and `ping` over the radio with the cable out. Both images
 build, and every gate passes on both.
 
+**The Pi 4's, run 2026-10-06 on the merge-candidate build (with everything since: the mailbox credit, the
+hard-off order, the shell's wording): passed.**
+- Auto-join from `/wifi.keys` at boot; `ping 8.8.8.8` 4 of 4. `wifi radio off` and `on` rejoined, 4 of 4.
+- `wifi radio powercycle`, a real power cut through `DevicePower`: `radio powered down for 2.0 s`, the
+  driver restarted onto the cold chip (taking its reply mailbox back), `powercycle succeeded - joined`.
+- `kill wifi-driver`: restarted with its mailbox and rejoined. 7 of 9 pings: the first two were sent 0.3 s
+  after the rejoin, inside `nic-driver`'s one-second back-off from the dead radio.
+- `chaos max-carnage` 50 rounds, 366 kills: kernel alive, no `spawn REFUSED`, every restart (wifi-driver's
+  included) took a mailbox back. Rejoined after, `ping` 7 of 7.
+
+The VisionFive's is still owed.
+
 **The dongle's `Station`** (`services/wifi-usb/src/station.rs`). This chip is soft-MAC, so the sweep is
 the host's to run: tune channel 1, listen `DWELL_MS` (150 ms, one beacon interval of 102.4 ms with room
 for the hop), tune the next, through 13, then back to the channel it rested on. It is a PASSIVE scan,
