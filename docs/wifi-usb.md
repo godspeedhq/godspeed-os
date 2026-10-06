@@ -495,8 +495,16 @@ hard-off order, the shell's wording): passed.**
     PHY's.
   - Why the reset did not clear after the storm is not diagnosed; what changed is that it no longer costs
     the radio.
-- **The same shape stands in GENET's backend** (`genet did not come up - serving empty replies`). It did
-  not occur in the Pi 4's chaos run, and it is left as it is until a Pi 4 card can carry the change.
+- **Verified on the VisionFive (the rerun, 2026-10-06):** `chaos max-carnage` 20 rounds, 163 kills, and the
+  last `nic-driver` respawn's DMA reset failed again, the same way (so it is reproducible after a storm
+  with the cable out). This time `dwmac not brought up - the radio still carries the link`; the radio
+  rejoined, `the cable is out - the radio carries the link`, and `ping 8.8.8.8` went 5 of 5.
+- **The retry is on the cable's ARRIVAL,** once per arrival, not on every re-check while a cable sits
+  there: a failed reset waits a second, and repeating it every half second would stall every request
+  behind it. That correction came after the rerun, so the cable-arrival path itself is not yet seen.
+- **GENET's backend had the same shape and has the same fix** (`genet_main`, `serve` with `mac: Option`):
+  the radio is served when the MAC does not come up, and the MAC is tried again when a cable arrives. Owed
+  a Pi 4 card.
 - **Also seen, at boot:** a `wifi status` typed during the AIC8800's 12-second firmware upload was never
   answered. The shell held it owed until its 30-second bound (`owed for over 30 s never came - forgotten`),
   refusing `wifi` meanwhile. The serve loop's tagged reply looks right, so the request was most likely lost

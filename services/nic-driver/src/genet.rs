@@ -1220,19 +1220,25 @@ pub fn genet_main(ctx: ServiceContext) -> ! {
         ctx.log("nic-driver: genet has no timer calibration - hardware waits fall back to an iteration ceiling, which is NOT a duration");
     }
 
-    let Some(mac) = g.bring_up() else {
-        ctx.log("nic-driver: genet did not come up - serving empty replies (net degrades, not hangs)");
-        crate::serve_status(&ctx, &[0u8; 8]);
-    };
+    // A MAC that will not come up does NOT take the radio down with it - the dwmac's lesson from the
+    // VisionFive's chaos run (2026-10-06), where the same "serve empty replies to everything" left a
+    // rejoined radio carrying nothing. The radio is served, and the MAC is tried again when a cable arrives.
+    let mac = g.bring_up();
+    match mac {
+        Some(mac) => say_up(&ctx, &g, mac),
+        None => ctx.log("nic-driver: genet did not come up - the radio still carries the link, and the MAC is tried again when a cable arrives"),
+    }
+    ctx.log("nic-driver: serving frame interface");
 
+    serve(&ctx, &g, mac)
+}
+
+fn say_up(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) {
     ctx.log_fmt(format_args!(
         "nic-driver: genet up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}  ({} rx / {} tx buffers of {} B in a {} KiB arena)",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
         if g.link_is_up() { "UP" } else { "down (no cable?)" },
         RX_RING_DESCS, TX_RING_DESCS, RX_BUF_LENGTH, ARENA_NEEDED / 1024));
-    ctx.log("nic-driver: serving frame interface");
-
-    serve(&ctx, &g, mac)
 }
 
 
@@ -1255,7 +1261,8 @@ fn reply_failed(ctx: &ServiceContext, e: godspeed_sdk::ipc::IpcError, n: &mut u3
     }
 }
 
-fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
+/// `mac` is `None` while the MAC is down (`genet_main`): the cable then carries nothing, and the radio does.
+fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
     let mut tx_next: u32 = 0;
     // Bounds the post-transmit counter report, so a diagnostic cannot become a console flood (§26.6).
     // It lives here rather than in `transmit` because it is serve-loop state, not driver state, and
@@ -1268,7 +1275,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     let mut link_was_up = g.link_is_up();
     let mut rxbuf = [0u8; FRAME_MAX];
     // WHICH LINK CARRIES THE FRAMES - see `Carrier`. Between re-reads, `cable` is the answer.
-    let mut cable = link_was_up;
+    let mut cable = link_was_up && mac.is_some();
     let mut cable_read_at = ctx.read_tsc();
     let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
     let mut radio = Radio::new("wifi-driver");
@@ -1316,7 +1323,18 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
         if now.wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
             cable_read_at = now;
             let up_now = g.link_is_up();
-            if up_now && !link_was_up {
+            if up_now && !link_was_up && mac.is_none() {
+                // A cable arrived at a MAC that did not come up: try it again, once per arrival.
+                mac = g.bring_up();
+                match mac {
+                    Some(m) => {
+                        say_up(ctx, g, m);
+                        ctx.log("nic-driver: genet came up on a later try, with a cable - the cable carries the link again");
+                    }
+                    None => ctx.log("nic-driver: genet still did not come up with the cable - the radio carries on"),
+                }
+                link_was_up = true;
+            } else if up_now && !link_was_up {
                 ctx.log("nic-driver: genet link came up after bring-up - re-applying MAC speed and DMA burst");
                 if g.apply_link_settings() != 0 {
                     link_was_up = true;
@@ -1326,7 +1344,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             } else {
                 link_was_up = up_now;
             }
-            cable = up_now;
+            cable = up_now && mac.is_some();
         }
 
         if p.len() == 1 && p[0] == 3 {
@@ -1338,7 +1356,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                     "nic-driver: serving STATUS #{} at {} ms",
                     status_served, ctx.read_tsc() / ctx.duration_cycles(1).max(1)));
             }
-            let out = radio::status(ctx, &mut radio, cable, mac, &mut carrier);
+            let out = radio::status(ctx, &mut radio, cable, mac.unwrap_or([0; 6]), &mut carrier);
             if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 10 {
             let out = radio::peer(ctx, &mut radio, cable);

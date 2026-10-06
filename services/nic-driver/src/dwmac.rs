@@ -442,9 +442,11 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
         if ctx.read_tsc().wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
             cable_read_at = ctx.read_tsc();
             let (up, speed, fd) = link(ctx, w.m(), 0);
-            // A MAC that did not come up is tried again while the PHY has a link - the clock a reset
-            // needs is the PHY's - and once it is up, this is the ordinary link edge below.
-            if up && speed != 0 && matches!(w, Wire::Down(..)) {
+            // A MAC that did not come up is tried again when a cable ARRIVES - the clock a reset needs is
+            // the PHY's - once per arrival: a failed reset waits a second, and retrying it on every
+            // re-check while a cable sat there would stall every request behind it. Once up, this is
+            // the ordinary link edge below.
+            if up && !link_was_up && speed != 0 && matches!(w, Wire::Down(..)) {
                 configure_tx_clk_edge(ctx, w.m(), 0, speed);
                 w = match w {
                     Wire::Down(m, a) => match Dwmac::bring_up(ctx, m, a, LOCAL_MAC, speed, fd) {
@@ -454,7 +456,11 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
                             link_was_up = true;
                             Wire::Up(d)
                         }
-                        Err((m, a)) => Wire::Down(m, a),
+                        Err((m, a)) => {
+                            ctx.log("nic-driver: dwmac still did not come up with the cable - the radio carries on");
+                            link_was_up = true;
+                            Wire::Down(m, a)
+                        }
                     },
                     up => up,
                 };
