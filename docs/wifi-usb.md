@@ -1245,7 +1245,7 @@ reachable from here. The read-back proves the words landed, and the link proves 
   sent, 0 not, and 9 probe responses addressed to us, so the frames sent at the new power reach the air.
 - `ping 8.8.8.8` 7 of 7, 19 to 26 ms.
 
-## 22. R12a (2026-10-06): a WMM (QoS) association - built, not yet run
+## 22. R12a (2026-10-06): a WMM (QoS) association - hardware-verified on the Pi 2
 
 The step 802.11n needs first. An HT station is a QoS station (802.11-2020 11.2), and access points give
 HT rates only to a station that associated with WMM. mac80211 adds the WMM information element to its
@@ -1278,6 +1278,12 @@ association request for that reason. Until R12a this station associated non-QoS.
   will not take);
 - replays logged where there were none before (the per-TID counters wrong);
 - the handshake failing (the access point refusing non-QoS EAPOL on a QoS association).
+
+**The R12a card's run (2026-10-06): as predicted.** `the access point does WMM: associated as a QoS
+station, data goes as QoS data (R12a)`, ASSOCIATED, the handshake as before, JOINED and the lease. `ping`
+to the gateway went 5 of 5 (4 to 16 ms) and `ping 8.8.8.8` 6 of 6, with no replay dropped. One `did not send
+a 286 byte frame` at the join is `nic-driver`'s first DHCP send meeting the join's last moments, seen
+since R6.
 
 ## 23. R12b (2026-10-06): 802.11n - an HT association - built, not yet run
 
