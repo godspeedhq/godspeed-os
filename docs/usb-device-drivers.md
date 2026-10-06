@@ -1,4 +1,4 @@
-# USB device drivers on demand - HARDWARE-VERIFIED ON THE PI 2 (`dwc2`), not yet on `xhci` (2026-10-06)
+# USB device drivers on demand - HARDWARE-VERIFIED ON THE PI 2 (`dwc2`); `xhci` BUILT, its Pi 4 card owed (2026-10-06)
 
 Agreed with the operator on 2026-10-06, while the USB WiFi dongle was being brought to `xhci`
 (`docs/wifi-usb.md` section 7, U2): *"I would like the connected device to be recognised and the
@@ -65,12 +65,12 @@ each host instance. `OP_INFO` does not carry it yet.
 
 - **Not the kernel.** The supervisor already spawns and kills services; the hosts already send it
   nothing, and will send it this.
-- **New grants, pinned with their reasons:** `dwc2` gains the supervisor as a peer, for the reports;
-  `xhci` gains it when it reports.
+- **New grants, pinned with their reasons:** `dwc2` and `xhci` each gain the supervisor as a peer, for
+  the reports.
 - **`wifi-usb`** is no longer started at boot. It is spawned with its dongle already bound, and the
   supervisor stops it on the report that the dongle is gone (decided in the first card: the driver does
-  not exit by itself). On the Pi 2 today; on `xhci`'s boards it is still started at boot until `xhci`
-  reports.
+  not exit by itself). On every board that embeds it, since `xhci` reports too (`docs/wifi-usb.md` 27),
+  and that is now the Pi 4 and the VisionFive as well, beside their onboard radio.
 - **`wifi status` with no dongle** says "no wireless radio", which is then literally true.
 - **`utilities/56_wifi.md` 11** (`wifi hardware`) reads the radios that exist at that moment, and
   `nic-driver`'s bridge follows radios appearing and leaving, which the saved choice's fallback
@@ -81,7 +81,7 @@ each host instance. `OP_INFO` does not carry it yet.
 | Host | Today | For a driver it does not run itself |
 |---|---|---|
 | `dwc2` (Pi 2) | binds the dongle, serves `usbfn` in full, tells `wifi-usb`, and REPORTS it (`usbdev`, 2026-10-06) | the generation in `OP_INFO` |
-| `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers | the reports, the generation, the dongle's port watched (an unplug seen at once), then bulk IN (U2b) and bulk OUT (U2c) |
+| `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers; REPORTS it and watches its root or hub port (`docs/wifi-usb.md` 27) | the generation in `OP_INFO`, then bulk IN (U2b) and bulk OUT (U2c) |
 | `ehci` (the T630's second controller) - **limitation, not planned** | one topology: the AMD hub on its root port, low-speed keyboards and mice behind it; **skips every high-speed device** on a hub port | everything `xhci` needed, and bulk transfers from scratch |
 
 **`ehci` - A RECORDED LIMITATION, not planned work (operator, 2026-10-06).** A dongle in a socket that

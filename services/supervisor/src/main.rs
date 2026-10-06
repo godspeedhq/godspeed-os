@@ -349,7 +349,9 @@ mod board {
         if cfg!(has_wifi_usb) { &["events", "wifi-usb", "supervisor"] } else { &["events"] };
     /// `xhci`'s send peers: `events`, and the dongle's driver where it is embedded (U2a) - the same notice
     /// `dwc2` sends, `NOTE_RADIO`.
-    pub const XHCI_PEERS: &[&str] = if cfg!(has_wifi_usb) { &["events", "wifi-usb"] } else { &["events"] };
+    /// And `supervisor`, for the dongle's report (`usbdev`), as `dwc2` has.
+    pub const XHCI_PEERS: &[&str] =
+        if cfg!(has_wifi_usb) { &["events", "wifi-usb", "supervisor"] } else { &["events"] };
     /// The dongle driver's peers: the USB host that serves its dongle, and `fs` for `/wifi.keys`. `dwc2` on
     /// the board that has it, `xhci` on the others (U2a).
     pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
@@ -1203,9 +1205,8 @@ struct UsbMatch {
     peers: &'static [&'static str],
 }
 
-/// The table. Only where the host reports: `dwc2` does; `xhci` does not yet, so on its boards the dongle's
-/// driver is still started at boot (`USB_ON_DEMAND`).
-const USB_MATCH: &[UsbMatch] = if cfg!(all(has_dwc2, has_wifi_usb)) {
+/// The table, wherever the dongle's driver is embedded: both of its hosts, `dwc2` and `xhci`, report.
+const USB_MATCH: &[UsbMatch] = if cfg!(has_wifi_usb) {
     &[UsbMatch { vid: 0x0bda, pid: 0x8176, driver: "wifi-usb", peers: board::WIFI_USB_PEERS }]
 } else {
     &[]
@@ -1214,7 +1215,7 @@ const USB_MATCH_MAX: usize = 1;
 const _: () = assert!(USB_MATCH.len() <= USB_MATCH_MAX);
 const USB_ON_DEMAND: bool = !USB_MATCH.is_empty();
 /// The USB hosts that report, asked for their report when this supervisor starts (`usbdev::ASK`).
-const USB_HOSTS: &[&str] = if USB_ON_DEMAND { &["dwc2"] } else { &[] };
+const USB_HOSTS: &[&str] = if !USB_ON_DEMAND { &[] } else if cfg!(has_dwc2) { &["dwc2"] } else { &["xhci"] };
 
 /// Whether each `USB_MATCH` row's device is attached, as its host last reported. A new supervisor knows
 /// nothing - false until a host says otherwise, which it is asked to do at once. Owned by the main loop.
@@ -1662,14 +1663,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     ensure_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
 
-    // The dongle's driver, after `fs`. On the PCs its host, `xhci`, is spawned further down, so that
-    // peer is not wired at spawn and the driver reacquires it by name on first use (`host_name`). Nothing
-    // waits on it: it asks the host itself, and says when there is no dongle.
-    // Started HERE only where its host does not report yet (`xhci`). Where it does (`dwc2`), the
-    // supervisor starts it when the host reports the dongle attached (`usb_report`), and stops it when the
-    // host reports it gone.
-    #[cfg(has_wifi_usb)]
-    if !USB_ON_DEMAND { ensure_wired(&ctx, &mut name_map, "wifi-usb", board::WIFI_USB_PEERS); }
+    // The dongle's driver (`wifi-usb`) is NOT started here. Both of its hosts, `dwc2` and `xhci`, report
+    // the dongle (`usbdev`), and the supervisor starts it when one is attached and stops it when it leaves
+    // (`usb_report`, docs/usb-device-drivers.md).
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests here) and full builds;
     // excluded from test-specific builds. Its `fs` peer is wired from the supervisor's map.

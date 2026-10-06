@@ -21,6 +21,7 @@
 
 use godspeed as gs;
 use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed_sdk::service_context::usbdev;
 use godspeed_wifi::usbfn;
 use gs::driver::wait::{self, Budget};
 
@@ -50,6 +51,13 @@ pub struct Radio {
     /// The root port it is on (or behind), for the log and the binding's identity.
     pub port: u32,
     pub ids: u32,
+    /// This bind's number on this host (`usbdev::Report::gen`). Every enumeration pass rebinds the dongle,
+    /// so it counts passes that found it; set by the caller once the pass is over.
+    pub gen: u32,
+    /// The hub it is behind and its port there, or `0, 0` on a root port: where an unplug is read when the
+    /// root port stays connected (the Pi 4's VL805 hub).
+    pub hub_slot: u32,
+    pub hub_port: u32,
     cur: usize,
     pcs: u32,
     /// Endpoint repairs this pass, bounded: the command ring is one page per pass, and a dongle that
@@ -59,7 +67,7 @@ pub struct Radio {
 
 impl Radio {
     pub fn new(slot: u32, dev_idx: usize, port: u32, ids: u32) -> Self {
-        Radio { slot, dev_idx, port, ids, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0 }
+        Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0 }
     }
 
     pub fn vid(&self) -> u16 {
@@ -272,6 +280,12 @@ pub fn serve(
     ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize, eaten: &mut EvMail,
 ) -> Served {
     let p = msg.payload_bytes();
+    // The supervisor asking for this host's device report again (`usbdev::ASK`): no reply capability, by
+    // design - the answer is the report itself.
+    if p == [usbdev::ASK] {
+        report_device(ctx, radio.as_deref());
+        return Served::Done;
+    }
     let op = p.first().copied().unwrap_or(0);
     if !(usbfn::OP_INFO..=usbfn::OP_SYNC).contains(&op) {
         return Served::NotOurs;
@@ -325,6 +339,11 @@ pub fn serve(
 /// of waiting out its deadline on a host that will never answer. `true` when `msg` was one.
 pub fn answer_absent(ctx: &ServiceContext, msg: &Message) -> bool {
     let p = msg.payload_bytes();
+    // The drains this serves run only where nothing is bound, so "not attached" is the truth there.
+    if p == [usbdev::ASK] {
+        report_device(ctx, None);
+        return true;
+    }
     let op = p.first().copied().unwrap_or(0);
     if !(usbfn::OP_INFO..=usbfn::OP_SYNC).contains(&op) {
         return false;
@@ -351,3 +370,33 @@ pub fn notify_driver(ctx: &ServiceContext) {
     let _ = gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
         || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok());
 }
+
+/// The radio's binding changed, or this host's first pass ended: told to the driver (`notify_driver`) and
+/// reported to the supervisor (`report_device`), which starts the driver when the dongle is attached and
+/// stops it when it is not (`docs/usb-device-drivers.md`) - what `dwc2` does on the Pi 2.
+pub fn announce(ctx: &ServiceContext, radio: Option<&Radio>) {
+    notify_driver(ctx);
+    report_device(ctx, radio);
+}
+
+/// This host's report on the dongle, to the supervisor (`usbdev`): its whole state, not a change, so an
+/// `ASK` is answered by sending it again. `try_send`, reacquired by name once - the supervisor is
+/// restartable (6.2) - and never waited on (8.9). Loud when a dongle's report cannot be delivered: it then
+/// has no driver and nothing else will say so. Quiet when "nothing attached" cannot be: that is every boot
+/// on a board that does not embed the dongle's driver (the Pi 4, the VisionFive), where this host is given
+/// no supervisor peer and there is nothing to start.
+pub fn report_device(ctx: &ServiceContext, radio: Option<&Radio>) {
+    let r = match radio {
+        Some(r) => usbdev::Report { present: true, gen: r.gen, vid: r.vid(), pid: r.pid() },
+        None => usbdev::Report { present: false, gen: 0, vid: 0, pid: 0 },
+    };
+    let msg = Message::from_bytes(&usbdev::encode(&r));
+    let sent = gs::ipc::try_send(ctx, SUPERVISOR, &msg).is_ok()
+        || (gs::cap::reacquire(ctx, SUPERVISOR) && gs::ipc::try_send(ctx, SUPERVISOR, &msg).is_ok());
+    if !sent && r.present {
+        ctx.log("xhci: could not report the WiFi dongle to the supervisor - its driver will not be started until the next report");
+    }
+}
+
+/// Where the reports go: the supervisor decides which driver a device gets.
+const SUPERVISOR: &str = "supervisor";

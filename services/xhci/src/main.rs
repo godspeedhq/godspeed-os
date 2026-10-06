@@ -3039,8 +3039,10 @@ fn enumerate_one(
                     cmd_idx,
                 );
                 // The WiFi dongle behind a hub keeps its slice and slot (U2a); a second is released.
-                if let Some(r) = d_radio {
+                if let Some(mut r) = d_radio {
                     if radio.is_none() {
+                        r.hub_slot = slot;
+                        r.hub_port = dp as u32;
                         *radio = Some(r);
                     } else {
                         ctx.log_fmt(format_args!(
@@ -3241,7 +3243,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // can be gated on an actual not-bound -> bound transition (see its use below).
     let mut disk_was_bound = false;
     // The radio bound at the end of the previous pass, by its ID word, for the same transition rule (U2a).
-    let mut radio_was_bound: Option<u32> = None;
+    // The outer `None` is "nothing said yet": the FIRST pass reports what it found, the dongle or nothing,
+    // so the supervisor learns either way (`usbdev`).
+    let mut radio_was_bound: Option<Option<u32>> = None;
+    // Every pass that found the dongle, counted: the report's binding generation.
+    let mut radio_binds: u32 = 0;
     let mut signaled = false; // signal_input_ready (boot-screen clear) exactly once
     let mut prev_sigs: [u32; MAX_HID] = [u32::MAX; MAX_HID]; // per-device position sigs bound last pass (u32::MAX = empty)
     let mut rescan_noted = false; // "periodic back-port re-scan" logged once per idle spell
@@ -3283,6 +3289,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // not of the pass that happened to look. Reset only when the port answers "present" (below) or a
     // disk is bound.
     let mut disk_absent_seen: u32 = 0;
+    // Consecutive "disconnected" reads of the WiFi dongle's HUB port: two are an unplug, as for the disk.
+    let mut radio_absent_seen: u32 = 0;
     // Shadow model (docs/xhci-topology.md step 1). Fed from observations the driver already makes;
     // it decides nothing. Above the loop because a topology is a fact about the MACHINE, not about
     // the pass that happened to look - the same scope error that stopped the absence counter ever
@@ -3742,14 +3750,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         disk_was_bound = disk.is_some();
         // The radio's binding changed: tell `wifi-usb`, which asks `OP_INFO` (U2a). Compared with the
         // previous pass, as the disk's announce is, so a pass that rebinds the same dongle says nothing.
+        if let Some(r) = radio.as_mut() {
+            radio_binds = radio_binds.wrapping_add(1);
+            r.gen = radio_binds;
+        }
         let radio_now = radio.as_ref().map(|r| r.ids);
-        if radio_now != radio_was_bound {
-            radio::notify_driver(&ctx);
-            if announce {
+        if Some(radio_now) != radio_was_bound {
+            radio::announce(&ctx, radio.as_ref());
+            if announce && radio_was_bound.is_some() {
                 notify(&ctx, if radio_now.is_some() { "WiFi dongle connected (xhci)" } else { "WiFi dongle removed (xhci)" });
             }
         }
-        radio_was_bound = radio_now;
+        radio_was_bound = Some(radio_now);
         if let Some(d) = disk.as_mut() {
             let mut eaten = EvMail::new();
             if msc::read10(
@@ -5043,6 +5055,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 announce = true;
                                 break 'poll;
                             }
+                            // The WiFi dongle's hub port reading disconnected: an unplug once it reads so
+                            // twice running, then re-enumerated so the pass after reports it gone.
+                            Some(false) if radio.as_ref().is_some_and(|r| r.hub_slot == hub_slot && r.hub_port == hp as u32) => {
+                                radio_absent_seen += 1;
+                                if radio_absent_seen >= 2 {
+                                    ctx.log_fmt(format_args!(
+                                        "xhci: the WiFi dongle is gone (hub slot {} port {} reports disconnected) - re-enumerating",
+                                        hub_slot, hp));
+                                    radio_absent_seen = 0;
+                                    announce = true;
+                                    break 'poll;
+                                }
+                            }
+                            Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hub_slot && r.hub_port == hp as u32) => {
+                                radio_absent_seen = 0;
+                            }
                             Some(false) if hp < 64 => {
                                 // Empty resets the confirmation run: two connected reads must be
                                 // CONSECUTIVE, or an empty port that glitches once a minute still
@@ -5144,6 +5172,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 disk_hub_pcs = pcs;
                                 break 'poll;
                             }
+                            // The WiFi dongle's hub port, as in the HID-driven scan.
+                            Some(false) if radio.as_ref().is_some_and(|r| r.hub_slot == hs && r.hub_port == hp as u32) => {
+                                radio_absent_seen += 1;
+                                if radio_absent_seen >= 2 {
+                                    ctx.log_fmt(format_args!(
+                                        "xhci: the WiFi dongle is gone (hub slot {} port {} reports disconnected) - re-enumerating",
+                                        hs, hp));
+                                    radio_absent_seen = 0;
+                                    announce = true;
+                                    disk_hub_cur = cur;
+                                    disk_hub_pcs = pcs;
+                                    break 'poll;
+                                }
+                            }
+                            Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hs && r.hub_port == hp as u32) => {
+                                radio_absent_seen = 0;
+                            }
                             // Gone: forget that we tried, so a replug counts as new again.
                             Some(false) if hp < 64 => {
                                 // Empty resets the confirmation run: two connected reads must be
@@ -5207,10 +5252,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // ten seconds after binding, then "new device" and a re-enumeration). Said with the
                         // whole PORTSC once per change, so the next run shows whether it was a real detach
                         // or a link-state change, rather than a guess.
+                        // And then RE-ENUMERATED, so the pass that follows reports the dongle gone and the
+                        // supervisor stops its driver - an unplug seen at once, as a plug is. A dongle
+                        // behind a hub is not seen here: its root port stays connected (recorded).
                         if present & (1 << p) != 0 && radio.as_ref().is_some_and(|r| r.port == p) {
                             ctx.log_fmt(format_args!(
-                                "xhci: the WiFi dongle's port {} reads EMPTY while bound - PORTSC={:#010x}",
+                                "xhci: the WiFi dongle's port {} reads EMPTY while bound - PORTSC={:#010x} - re-enumerating",
                                 p, mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10)));
+                            announce = true;
+                            break 'poll;
                         }
                         present &= !(1 << p);
                         // The port is empty, so whatever refused to enumerate on it is gone. Clear

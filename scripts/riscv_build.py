@@ -76,6 +76,9 @@ SERVICES = [
     # pin, then serves `no radio`; on QEMU `virt` the kernel grants no window and it says so. The
     # supervisor embeds it on this arch now (`radio` in services/supervisor/build.rs), so it must be built.
     "wifi-driver",
+    # The USB WiFi dongle's driver (docs/wifi-usb.md), reached through xhci and started by the supervisor
+    # when the dongle is plugged in - beside the onboard radio (`usb_radio` in services/supervisor/build.rs).
+    "wifi-usb",
 ]
 
 

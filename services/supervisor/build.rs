@@ -94,12 +94,13 @@ fn main() {
     let radio: &[&str] = if arch == "aarch64" || arch == "riscv64" { &["wifi-driver"] } else { &[] };
 
     // The USB WiFi dongle's driver (docs/wifi-usb.md), embedded where a USB host serves the radio
-    // function protocol (`godspeed_wifi::usbfn`) for a dongle it has bound. Derived from the `usb` and
-    // `radio` lists, so it names no instruction set: `dwc2` serves it since U1, and `xhci` since U2a - on a
-    // board with no onboard radio, which today is the PCs. A board with both (the Pi 4, the VisionFive)
-    // joins when `wifi hardware use` exists to choose between them (`utilities/56_wifi.md` 11). Its own
-    // list rather than part of `radio`, because a board may have both as separate services.
-    let usb_radio: &[&str] = if usb.contains(&"dwc2") || (usb.contains(&"xhci") && radio.is_empty()) {
+    // function protocol (`godspeed_wifi::usbfn`) for a dongle it has bound. Derived from the `usb` list, so
+    // it names no instruction set: `dwc2` serves it since U1, and `xhci` since U2a. The Pi 4 and the
+    // VisionFive have an onboard radio as well, so there both can run: the dongle's driver is started only
+    // when the dongle is plugged in (`usbdev`), and choosing which radio carries the link is `wifi hardware
+    // use` (`utilities/56_wifi.md` 11). Its own list rather than part of `radio`, because a board may have
+    // both as separate services.
+    let usb_radio: &[&str] = if usb.contains(&"dwc2") || usb.contains(&"xhci") {
         &["wifi-usb"]
     } else {
         &[]

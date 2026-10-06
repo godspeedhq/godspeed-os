@@ -1587,3 +1587,60 @@ report the WiFi dongle to the supervisor`; a second `wifi-usb` after the supervi
 of 96 routing slots free, reserve 72`), as the audit expected - and none ever took one back, which is the
 part of the prediction the card refuted (above). Each still joined in 5 to 6 s on the `OP_SYNC`
 fallback, so this costs nothing visible today; giving an on-demand driver a mailbox is `backlog/74`'s.
+
+## 27. `xhci` reports the dongle too, and the Pi 4 and VisionFive carry `wifi-usb` beside their onboard radio (2026-10-06) - built, checked in QEMU, not yet on hardware
+
+Section 26's mechanism on the second host. The card is the Pi 4, at the operator's choice (*"easier to
+test on the pi4/visionfive ... then later on on the x86 machines"*): its debug console is on the GPIO
+pins, where the T630's means unplugging the serial adapter.
+
+**`xhci` (`services/xhci/src/radio.rs`, `main.rs`):**
+- The same `usbdev` report as `dwc2` (`radio::announce`, `radio::report_device`): sent when the binding
+  changes from one enumeration pass to the next, and ALWAYS after the first pass, dongle or not, so the
+  supervisor learns either way. Answers `usbdev::ASK` from its serve path, and from the idle drains -
+  which run only where nothing is bound - with "not attached".
+- `binding` counts the passes that found the dongle. Every pass re-addresses every device, so the count
+  rises on any re-enumeration; it is REPORTED only when presence changes.
+- **The unplug is seen.** On a root port, the dongle's port reading empty now re-enumerates (it used to
+  only log the `PORTSC`). Behind a hub - every USB-A port on the Pi 4, behind the VL805's hub - the
+  dongle's hub port reading "disconnected" twice running does the same, in both of the scans that walk
+  a hub (the keyboard's and the disk's).
+- An undeliverable "not attached" report is quiet: it is every boot on a board whose `xhci` has no
+  supervisor peer. An undeliverable "attached" one is loud.
+
+**The supervisor:** the match table holds wherever `wifi-usb` is embedded, `xhci` is a reporting host
+where `dwc2` is not, and `xhci` gains the supervisor as a peer (contract, pin). `wifi-usb` is no longer
+started at boot anywhere.
+
+**Embedded on the Pi 4 and the VisionFive** (`usb_radio` in `services/supervisor/build.rs` is now
+`dwc2` or `xhci`, and the kernel's and `riscv_build.py`'s lists say so). `service_embed_check.py` read
+only the FIRST host in that condition, so it reported riscv64 missing the driver it embeds; it now reads
+every host named.
+
+**Two radios on one board, and what that means before `wifi hardware use` exists:** the shell's `wifi`
+asks the first live service in `RADIOS`, `wifi-driver`, so it keeps answering for the onboard radio, and
+`nic-driver`'s bridge is still `wifi-driver`. The dongle's driver gets no further than U2a's bring-up,
+since `xhci` has no bulk IN yet (U2b), so it cannot join and does not compete with the onboard radio.
+
+**Not covered, recorded:** a dongle behind a hub with no keyboard and no disk bound is not watched -
+nothing walks that hub - so its unplug is not seen until the next re-enumeration.
+
+**Checked before the card:** every image builds and x86 passes every gate. The Pi 4 in QEMU (no USB
+controller there): one `supervisor: USB host reports no device ...`, from `xhci`'s idle drain answering
+the ask, and no `wifi-usb`.
+
+**Prediction, Pi 4, keyboard and storage stick as usual:**
+1. Boot without the dongle: the `no device` report, no `wifi-usb`, and the onboard radio as before.
+2. Plug the dongle into a USB-A port: `xhci: hub port N DEVICE: VID=0x0bda PID=0x8176`, the dongle
+   `bound as the radio for wifi-usb`, `USB: WiFi dongle connected (xhci)`, then `supervisor: USB 0bda:8176
+   attached (binding K) - starting wifi-usb`, and `wifi-usb`'s bring-up through `xhci` - U1, R1, R2, R3a,
+   R11 - to `receive did not start - the host has no bulk IN for this dongle`, where U2b begins. The
+   keyboard stalls briefly for the re-enumeration.
+3. `wifi status` keeps answering for the onboard radio.
+4. Unplug it: `xhci: the WiFi dongle is gone (hub slot S port N reports disconnected) - re-enumerating`
+   within about three seconds, then `supervisor: wifi-usb stopped ...` and `ended - not restarted`.
+5. Plug it back in: `starting wifi-usb` again with a higher binding.
+6. `kill supervisor` with the dongle in: `- wifi-usb running`, nothing started twice.
+
+**Refuted by:** a `wifi-usb` with no dongle; an unplug with no `gone` line; `wifi-usb` restarted after an
+unplug; the onboard radio's `wifi status` disturbed; `could not report the WiFi dongle`.

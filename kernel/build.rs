@@ -251,6 +251,9 @@ const ARM_ONLY: &[&str] = &["dwc2"];
           // host controller (the VisionFive's is in its own list), and the Pi 2's dongle is a different problem
           // (a USB soft-MAC part, docs/wifi.md phase 6).
           "wifi-driver",
+          // The USB WiFi dongle's driver (docs/wifi-usb.md), reached through xhci and started when the
+          // dongle is plugged in; beside the onboard radio, not instead of it.
+          "wifi-usb",
           // The power policy, which holds the Arm clock fast while the radio loads (docs/power.md).
           "power",
           // The audio jack, driven by PWM (docs/audio.md).
@@ -264,7 +267,7 @@ const ARM_ONLY: &[&str] = &["dwc2"];
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           // See the demo arm above. Present in BOTH arms because both can ship, which is the trap
           // `service_embed_check.embedded_arms` refuses to union away.
-          "wifi-driver", "power", "pwm-audio",
+          "wifi-driver", "wifi-usb", "power", "pwm-audio",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
     let aarch64_dir = workspace

@@ -771,7 +771,8 @@ SpawnImage               = 52
 "wifi-usb" = ["peer:dwc2", "peer:fs", "peer:xhci"]
 # xhci: peer:wifi-usb (U2a, 2026-10-06) - the one notice the host sends the dongle's driver, `NOTE_RADIO`,
 # when the binding changes; `try_send`, no reply expected - the grant `dwc2` carries for the same notice.
-"xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
+# peer:supervisor (2026-10-06) - its USB device report (`usbdev`), as `dwc2`'s: facts only, never answered.
+"xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "peer:supervisor", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
 
 # --------------------------------------------------------------------------------------------------
 # Commandment IV - which contract capability key corresponds to which privilege bit. Read by
