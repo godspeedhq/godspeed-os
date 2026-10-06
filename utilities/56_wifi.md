@@ -135,6 +135,8 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi radio on` / `wifi radio off` | the FIRMWARE's radio switch: the chip stays powered. `off` disconnects first and says so. `on` converges from whichever state the radio is in - soft off, it is the two-second switch below; after `off hard`, it is the cold start described in that row; and with the radio DOWN (its firmware trapped at start, or never ran) it is the hard on: the driver is restarted (the respawn adopts a live firmware or power-cycles a dead one) and watched to `radio on succeeded - joined <name>`, and a chip that comes up warm is reported, not retried: ONE attempt, then the prompt and ``radio on failed - the chip came up warm (...); `wifi radio powercycle` tries once more``. `on` never answers "no control over the radio's power" unless the kernel refused. `on` then REJOINS the network last joined this boot, with the key it holds and without asking, and says `joined <name>` (asked for by the operator 2026-09-30); a `wifi leave` before the `off` cancels that, and a `wifi forget` of the name leaves nothing to rejoin with. Asking for the state it is already in says `radio already on` / `radio already off`, and sends the radio nothing. Both BLOCK and offer no key - no `[q]` since 2026-10-01, because the request is a kernel `Call` and a shell blocked in one cannot read the console - for about two seconds, and up to fifteen when `on` rejoins. `off` is VERIFIED: the driver asks the firmware back (`WLC_GET_UP`) and the shell prints `... - verified: ...` when it reads down, says unverified when it could not ask, and `... FAILED ...` when the firmware still reads up (`docs/wifi.md` 49; not yet run on hardware) |
 | `wifi radio off hard` | the CHIP's power, cut and left cut. BLOCKS for about three seconds with NO key, until the driver has left the network, cut the power and the kernel has read the pin back low; the driver then checks the cut on its own bus (a CMD52 50 ms later that nothing should answer) and the shell prints `... - verified: ...`, says unverified when the check could not be made, or `... FAILED ...` when the chip still answered (`docs/wifi.md` 49; not yet run on hardware). There is no `q`, because this cannot be stopped once asked, and no `b` either: it offered `[b] background` until 2026-10-01, but the request is a kernel `Call` and a shell blocked in one cannot read the console, so the key could never have been seen in time. The driver stays alive to answer: `wifi status` says `radio off (hard - the chip is powered down; wifi radio on powers it up)`, every other request answers that the chip is powered down. `wifi radio on` from this state restores the power, prints `radio powered up - starting the driver on the cold chip`, restarts the driver, and watches the cold path like `powercycle` does, ending `radio on succeeded - joined <name>`. About twenty seconds; the soft `off`/`on` stay the two-second switch. `on` after `off hard` can still come up WARM - it did at 09:44 and 14:43 on 2026-10-01 - and then, after its one attempt, returns to the prompt saying `wifi radio powercycle` tries once more; `off hard` cuts and verifies the power, it does not produce a cold chip on demand (`docs/wifi.md` 47, 48). **On a USB dongle (`wifi-usb`, `docs/wifi-usb.md` 18) the power is its port's and is not touched.** `off hard` there is the chip's own power-down, Linux's `rtl8192cu_power_off`: the network left, the firmware asked to stop and stopped from the host if it does not answer, the chip suspended. Its check is that no firmware is marked running. `on` and `powercycle` restart the driver, whose bring-up powers the chip on and uploads its firmware. A dongle that no longer answers on USB cannot be powered down this way; the driver says so, and only unplugging it helps |
 | `wifi radio powercycle` | the CHIP's power, not the firmware's radio switch: the driver cuts and restores it through the kernel's `DevicePower` (its own grant, renewable - CLAUDE.md 12.3), and the shell then restarts the driver, which comes up from power-on and rejoins from `/wifi.keys`. The power request itself is bounded at fifteen seconds before the watch begins. Then it says `radio powered down for 2.0 s - restarting the driver on the cold chip` (with ` (the network is left)` before the dash when it was joined), and BLOCKS with `[q] quit  [b] background`, printing each change of state as the driver answers its status question - `waiting for the driver`, `radio coming up`, `radio up, joining` - and ends in one of two lines: `powercycle succeeded - joined <name>`, or `powercycle failed - <why>` (the driver did not answer, this machine has no control over the radio's power, the driver could not be restarted, or the radio did not rejoin within 90 s and where it got to). VERIFIED: success is a join younger than the watch itself, so a stale answer from before the restart cannot pass for one; and a driver that comes back with its radio down means the chip came up warm - its firmware trapped at start - and the shell reports it and stops: ONE cycle per invocation (attempts on the same chip were not independent, so a retry only hid the cause; `docs/wifi.md` 52), re-runnable by hand. The driver waits 300 ms after power-on before its first command (`POWER_ON_SETTLE_MS`; five seconds was tried in section 52, changed nothing, and was reverted). BOUNDED at the operator's word: a warm chip ends `powercycle failed - the chip came up warm (its firmware trapped at start; ...)`, returns the prompt, and can be run again - nothing needs a reboot. The driver parks its SDIO host for the whole off window. The "warm starts" this paragraph once expected were a slow host - the Arm cores at their minimum clock - and with the `power` service's lease every power cycle has come up cold (`docs/wifi.md` 55-57). `q` leaves the watch. `q` and `b` both return to the prompt and say the power cycle continues in the driver: once the power is cut there is nothing to stop (`docs/wifi.md` 47) |
+| `wifi hardware` | SPECIFIED, NOT BUILT (section 11): the radios this machine has, one row each - its name, chip, bus, state, network and whether it is the one in use. A report: it pipes |
+| `wifi hardware use <radio>` | SPECIFIED, NOT BUILT (section 11): choose the radio every other `wifi` verb talks to and that carries the frames when the cable is out - `onboard`, `usb`, or `usb-1a0d` when there is more than one dongle. An action: it does not pipe |
 | `wifi help` | usage, with one real example per row |
 | `wifi version` | version number plus the collective copyright line |
 
@@ -621,3 +623,52 @@ cable, switch to wifi automatically."*
 - **Where the rule lives.** In `nic-driver`, which is the link front end on every board (`docs/wifi.md`
   2) - one comparison, `Carrier` in its genet backend. `net-stack` never learns there are two links, and
   the `wifi` utility never learns there is a cable.
+
+## 11. Which radio: `wifi hardware` - SPECIFIED, NOT BUILT (2026-10-06)
+
+Agreed with the operator on 2026-10-06, while the USB dongle was being brought to `xhci` (`docs/wifi-usb.md`
+section 7, U2). Until then every machine has had at most one radio, and the shell takes the first of its
+radio services that is running (`RADIOS`: `wifi-driver`, then `wifi-usb`). A Pi 4 or a VisionFive with
+the dongle plugged in has two, and that rule would leave the dongle unreachable.
+
+**`wifi hardware`** is a report, one row per radio, and like every report it pipes (rule 12): records with
+the columns `radio`, `chip`, `bus`, `state`, `network` and `in_use`.
+
+```
+radio      chip         bus                 state    network     in use
+onboard    CYW43455     SDIO                joined   home-5g     *
+usb-1a0d   RTL8188CUS   USB xhci port 3     on       -
+usb-77e2   RTL8188CUS   USB xhci port 4     off      -
+```
+
+**How a radio is named - by what it is, not where it is** (CLAUDE.md invariant 11, identity is stable and
+location is not):
+- **`onboard`** for the board's own radio.
+- **`usb`** for a dongle, when there is one.
+- **`usb-` and the last two bytes of its MAC address** (`usb-1a0d`) for each dongle when there is more
+  than one. The address is in the dongle's own efuse, so the name follows the dongle into any socket, on
+  any board, across any reboot. Numbering them in the order they came up would swap after a replug, and
+  naming them by socket would make one dongle a different radio when it moved. The socket is still shown,
+  in `bus`, so a reader can tell which stick is which.
+
+**`wifi hardware use <radio>`** chooses the radio the other `wifi` verbs address and that carries the
+frames when the cable is out. It is an action and does not pipe.
+- **The choice lives in `nic-driver`, not in the shell.** The radio that carries the traffic is the one
+  `nic-driver`'s bridge talks to (section 10), so a choice held by the shell alone would let `wifi status`
+  describe one radio while the frames went through the other. `use` tells `nic-driver`; the shell asks
+  `nic-driver` which radio is in use and follows its answer. One fact, one owner.
+- **The cable still always wins** (section 10). `use` chooses among radios; it does not choose the radio
+  over the cable.
+- **Refused, with a sentence:**
+  - a name that is not in the report: `no radio called 'usb-9999' - wifi hardware lists them`;
+  - plain `usb` when there are two dongles: `there are two USB radios - usb-1a0d or usb-77e2`.
+- **The default** is today's order: the onboard radio, else the dongle. Whether a choice survives a reboot
+  (kept beside `/wifi.keys`) is not decided; until it is, a reboot returns to the default, and that is
+  said in `wifi hardware use`'s own answer.
+
+**More than one dongle is named now and built later.** Today each USB host binds one radio, and one
+`wifi-usb` drives one dongle. Two need either a `wifi-usb` per dongle or one serving several, plus a host
+that binds more than one. The names and the report are designed for many so they need no change then;
+the support itself waits until two are plugged in (CLAUDE.md 26.2).
+
+**Tab completion** (rule 9): `hardware`, then `use`, then the names in the report.
