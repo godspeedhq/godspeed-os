@@ -23,6 +23,8 @@
 //! and the two keys go into the chip's CAM (`rtl8188::install_key`). A join that reaches `JOINED` stays
 //! joined; the frame path is R6.
 
+use core::cell::RefCell;
+
 use godspeed as gs;
 use gs::driver::wait::{Budget, Since};
 use godspeed_sdk::ServiceContext;
@@ -64,8 +66,6 @@ const REASON_LEAVING: u16 = 3;
 /// counts it) or as the access point leaving; this bound is for an access point that does neither. CHOSEN:
 /// about four of the one-second retries an access point is commonly configured with, and room.
 const HANDSHAKE_MS: u64 = 8_000;
-/// The EAPOL ethertype (802.1X), which marks a handshake frame inside an 802.11 data frame.
-const ETHERTYPE_EAPOL: u16 = 0x888e;
 /// The longest EAPOL frame this station takes in or sends, as ethernet: the supplicant's own message buffer.
 const EAPOL_MAX: usize = 14 + 99 + 64 + 512;
 /// Frame control first bytes of the two frames by which an access point ends an association.
@@ -93,7 +93,16 @@ struct Found {
 }
 
 /// The dongle, brought up: its address, the channel it rests on, and the sweep when one is running.
-pub struct Dongle {
+pub struct Dongle<'l> {
+    /// The link shared with the receive side (`rx::Link`): the joined BSSID it filters on, and the frames
+    /// it has taken for `pull`.
+    link: &'l RefCell<rx::Link>,
+    /// The CCMP packet number of the last protected frame sent; 0 before the first. mac80211 counts from 1
+    /// with `atomic64_inc_return`, and a new pairwise key starts it again.
+    pn: u64,
+    /// Protected frames sent, and refused, for the log.
+    sent: u32,
+    send_failed: u32,
     mac: [u8; 6],
     /// The channel R3a tuned, and the one a sweep returns to.
     home: u8,
@@ -123,9 +132,10 @@ struct Hop {
     since: Since,
 }
 
-impl Dongle {
-    pub fn new(mac: [u8; 6], home: u8, queues: u8) -> Self {
+impl<'l> Dongle<'l> {
+    pub fn new(mac: [u8; 6], home: u8, queues: u8, link: &'l RefCell<rx::Link>) -> Self {
         Dongle {
+            link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
             assoc: None, keys: None, cam_next: 0,
         }
@@ -242,6 +252,11 @@ impl Dongle {
         let _ = rtl8188::set_bssid(ctx, &[0; 6]);
         self.drop_keys(ctx);
         self.assoc = None;
+        {
+            let mut l = self.link.borrow_mut();
+            l.bssid = None;
+            l.frames.clear();
+        }
         self.home = FIRST;
         let _ = self.tune(ctx, FIRST);
     }
@@ -285,7 +300,7 @@ impl Dongle {
                 return false;
             }
             let Some(d) = data::llc_payload(f, false) else { return false };
-            if d.ethertype != ETHERTYPE_EAPOL || d.da != us {
+            if d.ethertype != eapol::ETHERTYPE_EAPOL || d.da != us {
                 return false;
             }
             let mut eth = [0u8; EAPOL_MAX];
@@ -446,7 +461,7 @@ impl Dongle {
     }
 }
 
-impl Station for Dongle {
+impl Station for Dongle<'_> {
     fn scan_start(&mut self, ctx: &ServiceContext) -> bool {
         if !self.tune(ctx, FIRST) {
             return false;
@@ -517,7 +532,9 @@ impl Station for Dongle {
             Secret::Pmk(pmk) => self.handshake(ctx, a, pmk),
         };
         if outcome == Outcome::Joined {
-            ctx.log("wifi-usb: join - JOINED; R5c done. Frames to and from the network are R6");
+            self.pn = 0;
+            self.link.borrow_mut().bssid = Some(a.bssid);
+            ctx.log("wifi-usb: join - JOINED; frames to and from the network go through nic-driver when the cable is out (R6)");
         } else {
             self.leave(ctx, &a.bssid);
         }
@@ -564,17 +581,64 @@ impl Station for Dongle {
     }
 
     fn tx_ok(&self) -> bool {
-        false
+        self.assoc.is_some()
     }
 
-    fn send(&mut self, _eth: &[u8], _ctx: &ServiceContext) -> bool {
-        false
+    /// One ethernet frame from the stack, as an 802.11 data frame to the access point: protected for the
+    /// chip to encrypt with the pairwise key (`rtl_tx::protected`, a fresh packet number, key id 0) when the
+    /// join made keys, plain on an open network.
+    fn send(&mut self, eth: &[u8], ctx: &ServiceContext) -> bool {
+        let Some(a) = self.assoc else { return false };
+        let keyed = self.keys.is_some();
+        let mut frame = [0u8; godspeed_wifi::rxq::FRAME_MAX + data::DATA_OVERHEAD + data::CCMP_HEADER];
+        let seq = self.next_seq();
+        let ccmp = if keyed {
+            self.pn += 1;
+            Some((self.pn, 0))
+        } else {
+            None
+        };
+        let n = data::to_80211(eth, &a.bssid, seq, ccmp, &mut frame);
+        if n == 0 {
+            return false;
+        }
+        let desc = if keyed { rtl_tx::protected(n as u16, seq) } else { rtl_tx::eapol(n as u16, seq) };
+        let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + godspeed_wifi::rxq::FRAME_MAX + data::DATA_OVERHEAD + data::CCMP_HEADER];
+        req[0] = usbfn::OP_BULK_OUT;
+        req[1] = rtl_tx::be_out(self.queues);
+        req[2..2 + rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
+        req[2 + rtl_tx::TX_DESC_LEN..2 + rtl_tx::TX_DESC_LEN + n].copy_from_slice(&frame[..n]);
+        let ok = matches!(crate::host(ctx, &req[..2 + rtl_tx::TX_DESC_LEN + n]),
+                          Ok(r) if r.payload_bytes().get(..2) == Some(&[usbfn::OP_BULK_OUT, usbfn::ST_OK][..]));
+        if ok {
+            self.sent = self.sent.wrapping_add(1);
+            if self.sent == 1 {
+                ctx.log_fmt(format_args!(
+                    "wifi-usb: the FIRST data frame sent through the link - {} bytes, {}; R6 transmit works",
+                    n, if keyed { "encrypted by the chip (CCMP)" } else { "open network, unencrypted" }));
+            }
+        } else {
+            self.send_failed = self.send_failed.wrapping_add(1);
+            if self.send_failed == 1 || self.send_failed % 64 == 0 {
+                ctx.log_fmt(format_args!("wifi-usb: a data frame was not sent (x{})", self.send_failed));
+            }
+        }
+        ok
     }
 
-    fn pull(&mut self, _rxq: &mut RxQueue, _ctx: &ServiceContext) -> Pulled {
-        // Frames reach this service as host notices (`rx.rs`), never by a pull; with no join there are no
-        // data frames for the stack either.
-        Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None }
+    /// What the receive side has taken through the link since the last pull, into `rxq`.
+    fn pull(&mut self, rxq: &mut RxQueue, _ctx: &ServiceContext) -> Pulled {
+        let mut got = 0u32;
+        let mut l = self.link.borrow_mut();
+        while rxq.has_room() {
+            let mut b = [0u8; godspeed_wifi::rxq::FRAME_MAX];
+            let n = l.frames.pop(&mut b);
+            if n == 0 || !rxq.push(&b[..n]) {
+                break;
+            }
+            got += 1;
+        }
+        Pulled { data: got, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None }
     }
 
     fn event_name(&self, _code: u32) -> &'static str {
@@ -588,7 +652,7 @@ impl Station for Dongle {
 }
 
 /// The supplicant's two needs, answered by this chip (R5c).
-impl KeyPath for Dongle {
+impl KeyPath for Dongle<'_> {
     /// An EAPOL frame as ethernet, sent as the 802.11 data frame to the access point
     /// (`godspeed_wifi::data::to_80211`) with its descriptor (`rtl_tx::eapol`), on the best-effort queue's
     /// endpoint.
@@ -596,7 +660,7 @@ impl KeyPath for Dongle {
         let Some(a) = self.assoc else { return false };
         let mut frame = [0u8; EAPOL_MAX + data::DATA_OVERHEAD];
         let seq = self.next_seq();
-        let n = data::to_80211(eth, &a.bssid, seq, &mut frame);
+        let n = data::to_80211(eth, &a.bssid, seq, None, &mut frame);
         if n == 0 {
             return false;
         }

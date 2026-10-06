@@ -64,6 +64,21 @@ pub fn mgmt(frame_len: u16, seq: u16, group: bool) -> [u8; TX_DESC_LEN] {
     driver_rate(frame_len, seq, group, QUEUE_MGNT)
 }
 
+/// `TXDESC_SEC_AES` in `txdw1`: the chip encrypts the frame with CCMP, using the key the CAM holds for its
+/// receiver (`rtl8xxxu_tx` sets it when mac80211 hands the frame a hardware key).
+const DW1_SEC_AES: u32 = 0x00C0_0000;
+
+/// The descriptor for a protected unicast DATA frame - the link's traffic once the keys are in (R6) - on the
+/// best-effort queue, for the chip to encrypt (`DW1_SEC_AES`), signed. At the driver's rate, for the reason
+/// `eapol` gives.
+pub fn protected(frame_len: u16, seq: u16) -> [u8; TX_DESC_LEN] {
+    let mut d = driver_rate(frame_len, seq, false, QUEUE_BE);
+    let dw1 = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) | DW1_SEC_AES;
+    d[4..8].copy_from_slice(&dw1.to_le_bytes());
+    sign(&mut d);
+    d
+}
+
 /// The descriptor for an unprotected unicast DATA frame - an EAPOL frame of the four-way handshake (R5c) -
 /// on the best-effort queue, signed.
 ///
@@ -149,6 +164,14 @@ mod tests {
         assert_eq!(word(&d, 4), 0x0040, "queue BE (0) and AGG_BREAK");
         assert_eq!(word(&d, 16), 0x100, "the driver's rate");
         assert_eq!(word(&d, 20), 0x001A_0000, "1 Mb/s, retry limit 6");
+    }
+
+    #[test]
+    fn a_protected_descriptor_asks_the_chip_for_ccmp() {
+        let d = protected(120, 3);
+        assert_eq!(word(&d, 4), 0x00C0_0040, "SEC_AES, queue BE, AGG_BREAK");
+        let x = d.chunks_exact(2).fold(0u16, |a, w| a ^ u16::from_le_bytes([w[0], w[1]]));
+        assert_eq!(x, 0, "signed after the security bits went in");
     }
 
     #[test]

@@ -20,13 +20,22 @@ const DESC_RATE_6M: u8 = 0x04;
 /// The fields of a receive descriptor this driver reads.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct Desc {
-    /// The 802.11 frame's length, FCS included (`pktlen`, word 0 bits 0-13).
+    /// The 802.11 frame's length (`pktlen`, word 0 bits 0-13). NO FCS: this said "FCS included" until R6,
+    /// and the chip's own receive configuration says otherwise - `RCR` appends the PHY status, the ICV and
+    /// the MIC (bits 28-30, as Linux's `rtl8xxxu_init_device` sets them) and not the FCS (`RCR_APPEND_FCS`,
+    /// bit 31). A frame the chip decrypted keeps its 8-byte CCMP header and ends with the 8-byte MIC.
     pub pkt_len: usize,
     /// The frame failed its CRC (`crc32`, bit 14) or its ICV (`icverr`, bit 15).
     pub crc_err: bool,
     pub icv_err: bool,
     /// The PHY status's length, in bytes (`drvinfo_sz`, bits 16-19, counted in 8-byte units).
     pub drvinfo: usize,
+    /// The cipher the frame arrived under (`security`, bits 20-22): 0 none, 4 AES (CCMP) - Linux's
+    /// `RX_DESC_ENC_*` - and whether it was left for software to decrypt (`swdec`, bit 27). The chip
+    /// decrypted it when `security` is set and `swdec` is not (`rtl8xxxu_parse_rxdesc16`'s
+    /// `RX_FLAG_DECRYPTED`).
+    pub security: u8,
+    pub swdec: bool,
     /// Padding between the PHY status and the frame (`shift`, bits 24-25).
     pub shift: usize,
     /// A PHY status is present (`phy_stats`, bit 26).
@@ -57,6 +66,8 @@ pub fn desc(b: &[u8]) -> Option<Desc> {
         crc_err: w0 & (1 << 14) != 0,
         icv_err: w0 & (1 << 15) != 0,
         drvinfo: ((w0 >> 16) & 0xF) as usize * 8,
+        security: ((w0 >> 20) & 0x7) as u8,
+        swdec: w0 & (1 << 27) != 0,
         shift: ((w0 >> 24) & 0x3) as usize,
         phy_stats: w0 & (1 << 26) != 0,
         pkt_cnt: ((w2 >> 16) & 0xFF) as u8,

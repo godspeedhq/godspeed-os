@@ -772,3 +772,55 @@ answered in 31 ms. The cause is in the kernel, not the radio: the Pi 2's `hw_ran
 its first call and then waits an iteration count shorter than the RNG's warm-up, so the first read after
 boot always comes back empty. Its comment also says its output is "not fed to crypto", which the shared
 supplicant now does. That is `backlog/76`, a kernel change left for the operator's go-ahead.
+
+## 14. R6 (2026-10-06): data both ways - DHCP and ping over the dongle - built, NOT YET RUN
+
+R5c left a joined link that carried nothing. R6 makes it carry the stack's frames. It has three parts, one in
+each service the frames pass through.
+
+**`nic-driver` (the Pi 2's backend).** The Pi 4 and the VisionFive already carry `net-stack`'s frames over
+their radios when the cable is out (`services/nic-driver/src/radio.rs`): the cable always wins, the radio is
+asked over the frame ops (`OP_NET_INFO`, `_TX`, `_RX`), and STATUS names the carrier. The Pi 2's backend,
+`kernel_net_main`, had no radio. Now it includes `radio.rs` by path from inside that function, as GENET and
+`dwmac` include it from theirs, so no board fact is added. It re-reads the USB ethernet's own link bit every
+500 ms and on every STATUS, and routes each op to the cable or to `wifi-usb`. It answers op 10, the
+access point the radio is joined to, which `net-stack` asks only once STATUS has said the radio carries the
+link. `radio.rs` gained one thing: the radio's service by name (`Radio::new`), `wifi-driver` beside GENET and
+`dwmac`, `wifi-usb` here. The supervisor wires `wifi-usb` to `nic-driver` where it is embedded, pinned in
+`COMMANDMENTS.baseline.toml` with that reason.
+
+**`wifi-usb`, out.** A frame from the stack becomes an 802.11 data frame to the access point, PROTECTED: the
+CCMP header goes after the MAC header with a fresh packet number and key id 0, where mac80211's
+`ccmp_encrypt_skb` puts it for a key the hardware holds (`net/mac80211/wpa.c`, fetched 2026-10-06:
+`GENERATE_IV` writes the header, `tail = 0` leaves the MIC to the hardware). The descriptor adds
+`TXDESC_SEC_AES` (`rtl_tx::protected`), and the chip encrypts with the pairwise key R5c put in its CAM. On
+an open network the frame goes plain. It is still at the driver's 1 Mb/s (R5c's reason).
+
+**`wifi-usb`, in.** A data frame from the joined access point, to us or to a group, that the chip decrypted
+(`security` AES and `swdec` clear in the descriptor, `rtl8xxxu_parse_rxdesc16`'s `RX_FLAG_DECRYPTED`)
+becomes the ethernet frame inside it. `llc_payload` steps over the CCMP header, and the 8-byte MIC the chip
+appends (`RCR_APPEND_MIC`) is trimmed, as mac80211 trims it for a frame marked decrypted but not
+`MIC_STRIPPED`, which `rtl8xxxu` never sets. It waits in a queue the receive side and the station share
+(`rx::Link`, a `RefCell` `main.rs` owns), and the station's `pull` hands it to the serve loop's frame path.
+A key frame on the joined link is the access point's group rekey: counted and said, not answered (R7).
+
+**A comment that was wrong, corrected.** `rtl_rx::Desc::pkt_len` said "FCS included". The chip's `RCR`
+appends the PHY status, the ICV and the MIC (bits 28 to 30, as Linux sets them), not the FCS (bit 31), so the
+length has no FCS in it. Nothing used the claim, and the MIC trim depends on the truth of it.
+
+**Prediction for the card** (the Pi 2, the dongle in, the network's key stored, NO ethernet cable):
+
+1. At boot: the auto-join to JOINED (R5c), then `nic-driver: the cable is out - the radio carries the link`
+   with the dongle's MAC.
+2. `wifi-usb: the FIRST data frame sent through the link - ... encrypted by the chip (CCMP); R6 transmit
+   works`, then `the FIRST data frame through the link - ethertype ...; R6 receive works`.
+3. `net-stack` gets a DHCP lease over the radio: `net` shows an address, a gateway and DNS.
+4. `ping 8.8.8.8` gets replies. They will be slower than the cable's, because every frame goes at 1 Mb/s.
+
+**Refuted by:**
+- Frames sent and none received, or `did not decrypt`: the receive side, or the keys' CAM entries -
+  especially the group key's for broadcast DHCP.
+- DHCP offers received but no lease: the stack's side of a carrier switch.
+- Replies that arrive but fail their checksums or come up 8 bytes short: the MIC trim, which would mean
+  the chip does not append the MIC for CCMP after all.
+- `nic-driver` never switching to the radio: the cable read, or the STATUS answer.

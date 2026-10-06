@@ -16,8 +16,14 @@ const LLC_SNAP: [u8; 6] = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00];
 /// An ethernet header: destination, source, ethertype.
 pub const ETH_HEADER: usize = 14;
 /// What `to_80211` puts in front of the ethernet payload: the 24-byte non-QoS header, LLC/SNAP and the
-/// ethertype. An ethernet frame of `n` bytes becomes `n - ETH_HEADER + DATA_OVERHEAD`.
+/// ethertype - and the 8-byte CCMP header too when the frame is protected (`CCMP_HEADER`). An ethernet frame
+/// of `n` bytes becomes `n - ETH_HEADER + DATA_OVERHEAD` (+ `CCMP_HEADER`).
 pub const DATA_OVERHEAD: usize = 24 + 8;
+/// The CCMP header (IEEE 802.11-2020 12.5.3.2): the packet number's two low bytes, a reserved byte, the key
+/// id byte with the Ext IV bit, and the packet number's four high bytes. The MIC that ends a CCMP frame is
+/// not written here: on a radio that encrypts in hardware the radio appends it, as mac80211 leaves it to
+/// (`ccmp_encrypt_skb` adds no tail when the key is in hardware).
+pub const CCMP_HEADER: usize = 8;
 
 /// A received data frame, as the vendor driver turns it into an ethernet frame (`rwnx_rxdataind_aicwf`):
 /// DA is address 1, SA is address 3 on a frame from the access point (address 2 otherwise).
@@ -72,27 +78,35 @@ pub fn to_ethernet(d: &DataIn, out: &mut [u8]) -> usize {
 /// An ethernet frame from a station, as the 802.11 data frame it sends its access point (9.3.2.1): non-QoS
 /// data (frame control `08`), To DS (`01`), address 1 the BSSID (the receiver), address 2 the ethernet
 /// source (this station), address 3 the ethernet destination; sequence `seq`; LLC/SNAP and the ethertype;
-/// the payload. 0 when `eth` is shorter than its header or `out` cannot hold the frame.
-pub fn to_80211(eth: &[u8], bssid: &[u8; 6], seq: u16, out: &mut [u8]) -> usize {
+/// the payload. With `ccmp` - `(packet number, key id)` - the Protected bit is set and the CCMP header goes
+/// after the MAC header, where mac80211's `ccmp_pn2hdr` puts it for a key the hardware encrypts with; the
+/// hardware does the rest. 0 when `eth` is shorter than its header or `out` cannot hold the frame.
+pub fn to_80211(eth: &[u8], bssid: &[u8; 6], seq: u16, ccmp: Option<(u64, u8)>, out: &mut [u8]) -> usize {
     if eth.len() < ETH_HEADER {
         return 0;
     }
     let body = &eth[ETH_HEADER..];
-    let n = DATA_OVERHEAD + body.len();
+    let iv = if ccmp.is_some() { CCMP_HEADER } else { 0 };
+    let n = DATA_OVERHEAD + iv + body.len();
     if n > out.len() {
         return 0;
     }
     out[0] = 0x08;
-    out[1] = 0x01;
+    out[1] = 0x01 | if ccmp.is_some() { 0x40 } else { 0 };
     out[2] = 0;
     out[3] = 0;
     out[4..10].copy_from_slice(bssid);
     out[10..16].copy_from_slice(&eth[6..12]);
     out[16..22].copy_from_slice(&eth[0..6]);
     out[22..24].copy_from_slice(&((seq & 0x0FFF) << 4).to_le_bytes());
-    out[24..30].copy_from_slice(&LLC_SNAP);
-    out[30..32].copy_from_slice(&eth[12..14]);
-    out[32..n].copy_from_slice(body);
+    if let Some((pn, key_id)) = ccmp {
+        let p = pn.to_le_bytes();
+        out[24..32].copy_from_slice(&[p[0], p[1], 0, 0x20 | (key_id & 0x3) << 6, p[2], p[3], p[4], p[5]]);
+    }
+    let at = 24 + iv;
+    out[at..at + 6].copy_from_slice(&LLC_SNAP);
+    out[at + 6..at + 8].copy_from_slice(&eth[12..14]);
+    out[at + 8..n].copy_from_slice(body);
     n
 }
 
@@ -143,7 +157,7 @@ mod tests {
         eth[12..14].copy_from_slice(&[0x88, 0x8e]);
         eth[14..18].copy_from_slice(&[1, 3, 0, 0x5f]);
         let mut f = [0u8; 64];
-        let n = to_80211(&eth, &ap, 0x123, &mut f);
+        let n = to_80211(&eth, &ap, 0x123, None, &mut f);
         assert_eq!(n, 32 + 4);
         assert_eq!((f[0], f[1]), (0x08, 0x01), "data, to DS");
         assert_eq!(&f[4..10], &ap, "to the access point");
@@ -155,7 +169,24 @@ mod tests {
         // Read back as a frame from the station (not from DS), it is the ethernet frame it was made from.
         let d = llc_payload(&f[..n], false).map(|d| (d.ethertype, d.da, d.sa, d.body.len()));
         assert_eq!(d, Some((0x888e, ap, us, 4)));
-        assert_eq!(to_80211(&eth[..13], &ap, 0, &mut f), 0, "too short to be ethernet");
-        assert_eq!(to_80211(&eth, &ap, 0, &mut [0u8; 35]), 0, "no room");
+        assert_eq!(to_80211(&eth[..13], &ap, 0, None, &mut f), 0, "too short to be ethernet");
+        assert_eq!(to_80211(&eth, &ap, 0, None, &mut [0u8; 35]), 0, "no room");
+    }
+
+    /// A protected frame: the Protected bit, and the CCMP header where `ccmp_pn2hdr` writes it - the packet
+    /// number's low two bytes, zero, the Ext IV bit with the key id, then the high four - read back by
+    /// `llc_payload` the way a frame the radio decrypted is read.
+    #[test]
+    fn a_protected_frame_carries_the_ccmp_header() {
+        let mut eth = [0u8; 18];
+        eth[12..14].copy_from_slice(&[0x08, 0x00]);
+        eth[14..18].copy_from_slice(&[0x45, 0, 0, 4]);
+        let mut f = [0u8; 64];
+        let n = to_80211(&eth, &[9; 6], 0, Some((0x0000_0605_0403_0201, 1)), &mut f);
+        assert_eq!(n, 32 + 8 + 4);
+        assert_eq!(f[1], 0x41, "to DS, protected");
+        assert_eq!(&f[24..32], &[0x01, 0x02, 0, 0x60, 0x03, 0x04, 0x05, 0x06]);
+        let d = llc_payload(&f[..n], true).map(|d| (d.ethertype, d.body.len()));
+        assert_eq!(d, Some((0x0800, 4)));
     }
 }

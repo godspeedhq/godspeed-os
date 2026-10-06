@@ -7,12 +7,21 @@
 //! These arrive with no reply cap, so they reach this service through the serve loop's [`Host`]: the
 //! loop answers the shell, and hands the host's notices here. `NOTE_RADIO` - the dongle bound or
 //! removed - ends the loop, so `main.rs` can bring up whatever is there now.
+//!
+//! **Data frames (R6).** Once the station is joined, a data frame from its access point to it (or to a
+//! group address) that the chip decrypted becomes the ethernet frame inside it and waits in the [`Link`]'s
+//! queue, which the station's `pull` hands `nic-driver`. The queue is shared with the station through a
+//! `RefCell` `main.rs` owns, because the serve loop holds the station and this host apart.
+
+use core::cell::RefCell;
 
 use godspeed as gs;
 use godspeed_sdk::ServiceContext;
 use godspeed_wifi::bss::{self, Network, Scan};
+use godspeed_wifi::data::{self, DataIn};
+use godspeed_wifi::rxq::RxQueue;
 use godspeed_wifi::serve::{Host, Notice};
-use godspeed_wifi::{mgmt, usbfn, wire};
+use godspeed_wifi::{eapol, mgmt, usbfn, wire};
 
 use crate::rtl_rx;
 
@@ -24,8 +33,37 @@ const PER_NOTICE: u32 = 8;
 /// A summary every this many transfers - a count, not a timer (the service blocks between notices).
 const SUMMARY_EVERY: u32 = 256;
 
+/// `RX_DESC_ENC_AES`: the receive descriptor's `security` for a frame protected with CCMP.
+const RX_ENC_AES: u8 = 4;
+/// The CCMP MIC at the end of a frame the chip decrypted: `RCR` appends it (`RCR_APPEND_MIC`), and the
+/// 802.11 layer above a radio strips it, as mac80211 does for a frame marked decrypted and not
+/// `RX_FLAG_MIC_STRIPPED` - which `rtl8xxxu` never sets.
+const CCMP_MIC: usize = 8;
+
+/// The link as the station and this host share it: the network joined, and the frames received through
+/// it waiting for the station's `pull`. Owned by `main.rs` for the life of the service.
+pub struct Link {
+    /// The joined network's BSSID, set by the station when it joins and cleared when it leaves; `None`
+    /// means no data frame is taken.
+    pub bssid: Option<[u8; 6]>,
+    pub frames: RxQueue,
+    /// Frames taken, frames the queue had no room for, protected frames the chip did not decrypt, and
+    /// rekey frames not answered (R7).
+    pub data_in: u32,
+    pub dropped: u32,
+    pub undecrypted: u32,
+    pub rekeys: u32,
+}
+
+impl Link {
+    pub fn new() -> Self {
+        Link { bssid: None, frames: RxQueue::new(), data_in: 0, dropped: 0, undecrypted: 0, rekeys: 0 }
+    }
+}
+
 /// What has been heard since the radio came up - and the dongle's [`Host`]: its notices are the USB host's.
-pub struct Heard {
+pub struct Heard<'l> {
+    link: &'l RefCell<Link>,
     transfers: u32,
     frames: u32,
     beacons: u32,
@@ -44,9 +82,10 @@ pub struct Heard {
     answers: u32,
 }
 
-impl Heard {
-    pub const fn new() -> Self {
+impl<'l> Heard<'l> {
+    pub fn new(link: &'l RefCell<Link>) -> Self {
         Heard {
+            link,
             transfers: 0, frames: 0, beacons: 0, crc: 0, cut: 0, seen: [[0; 6]; NETWORKS], n_seen: 0,
             no_bulk_said: false, serving: Ok(None), us: [0; 6], answers: 0,
         }
@@ -83,7 +122,7 @@ fn ask(ctx: &ServiceContext) -> Result<Option<godspeed_sdk::Message>, &'static s
     }
 }
 
-impl Host for Heard {
+impl Host for Heard<'_> {
     fn notice(&mut self, msg: &[u8], sweep: Option<&mut Scan>, ctx: &ServiceContext) -> Notice {
         match msg {
             [usbfn::NOTE_BULK_IN] => {
@@ -186,6 +225,10 @@ fn heard(ctx: &ServiceContext, h: &mut Heard, sweep: Option<&mut Scan>, pk: &rtl
         h.cut = h.cut.wrapping_add(1);
         return;
     }
+    if pk.frame.len() >= 24 && pk.frame[0] & 0x0c == 0x08 {
+        data_frame(ctx, h, pk);
+        return;
+    }
     let Some(b) = mgmt::beacon(pk.frame) else { return };
     h.beacons = h.beacons.wrapping_add(1);
     let bssid = b.bssid();
@@ -211,6 +254,49 @@ fn heard(ctx: &ServiceContext, h: &mut Heard, sweep: Option<&mut Scan>, pk: &rtl
         if b.answers_a_probe() { "probe response" } else { "beacon" },
         shown, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
         b.channel().map(|c| c as i16).unwrap_or(-1), rssi.unwrap_or(0)));
+}
+
+/// A data frame (R6): taken into the link's queue as ethernet when it is from the joined network's access
+/// point, to us or to a group, and the chip decrypted it. Everything else is not this station's.
+fn data_frame(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
+    let mut l = h.link.borrow_mut();
+    let Some(bssid) = l.bssid else { return };
+    let f = pk.frame;
+    // From DS, transmitted by our access point, and to us or to a group.
+    if f[1] & 0x03 != 0x02 || f[10..16] != bssid || (f[4..10] != h.us && f[4] & 1 == 0) {
+        return;
+    }
+    if f[1] & 0x40 == 0 || pk.desc.security != RX_ENC_AES || pk.desc.swdec {
+        l.undecrypted = l.undecrypted.wrapping_add(1);
+        if l.undecrypted == 1 {
+            ctx.log_fmt(format_args!(
+                "wifi-usb: a data frame from the access point the chip did not decrypt (protected {}, security {}, swdec {}) - not taken",
+                f[1] & 0x40 != 0, pk.desc.security, pk.desc.swdec));
+        }
+        return;
+    }
+    let Some(d) = data::llc_payload(f, true) else { return };
+    if d.ethertype == eapol::ETHERTYPE_EAPOL {
+        l.rekeys = l.rekeys.wrapping_add(1);
+        if l.rekeys == 1 {
+            ctx.log("wifi-usb: the access point sent a key frame on the joined link (a group rekey) - not answered yet (R7); it may drop the station");
+        }
+        return;
+    }
+    let body = &d.body[..d.body.len().saturating_sub(CCMP_MIC)];
+    let inner = DataIn { ethertype: d.ethertype, da: d.da, sa: d.sa, body };
+    let mut eth = [0u8; godspeed_wifi::rxq::FRAME_MAX];
+    let n = data::to_ethernet(&inner, &mut eth);
+    if n == 0 || !l.frames.push(&eth[..n]) {
+        l.dropped = l.dropped.wrapping_add(1);
+        return;
+    }
+    l.data_in = l.data_in.wrapping_add(1);
+    if l.data_in == 1 {
+        ctx.log_fmt(format_args!(
+            "wifi-usb: the FIRST data frame through the link - ethertype {:#06x}, {} bytes, decrypted by the chip; R6 receive works",
+            d.ethertype, n));
+    }
 }
 
 /// A beacon heard during a sweep, as the record `wifi list` prints: the network's own channel from its DS

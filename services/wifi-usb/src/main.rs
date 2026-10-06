@@ -33,6 +33,8 @@
 //! `NOTE_RADIO` ends it, and the binding is asked again.
 
 use godspeed as gs;
+use core::cell::RefCell;
+
 use godspeed_sdk::{Message, ServiceContext};
 use godspeed_wifi::station::Station;
 use godspeed_wifi::{usbfn, wire};
@@ -101,7 +103,7 @@ pub(crate) fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16)>, &'static
 
 /// U1's reads, logged and decoded, then the bring-up. The radio as a `Station` when it came up as far as
 /// receiving; `None` when it stopped, said where.
-fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> Option<station::Dongle> {
+fn identify<'l>(ctx: &ServiceContext, vid: u16, pid: u16, link: &'l RefCell<rx::Link>) -> Option<station::Dongle<'l>> {
     ctx.log_fmt(format_args!("wifi-usb: {} has bound a radio at {:04x}:{:04x}", host_name(ctx), vid, pid));
     let cfg = read32(ctx, REG_SYS_CFG);
     let iso = read32(ctx, REG_SYS_ISO_CTRL);
@@ -137,7 +139,7 @@ fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> Option<station::Dongle>
             if !rx::start(ctx) {
                 return None;
             }
-            Some(station::Dongle::new(mac, FIRST_CHANNEL, queues))
+            Some(station::Dongle::new(mac, FIRST_CHANNEL, queues, link))
         }
         (c, i) => {
             ctx.log_fmt(format_args!(
@@ -307,7 +309,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // bring-up stopped - and then the loop below answers `radio down`, with why.
     let mut dongle: Option<station::Dongle> = None;
     // What the radio has heard since it was last brought up (R3b), and the host's notices (`rx.rs`).
-    let mut heard = rx::Heard::new();
+    // The link the station and the receive side share (`rx::Link`): owned here, for the service's life.
+    let link = RefCell::new(rx::Link::new());
+    let mut heard = rx::Heard::new(&link);
     // The key-derivation primitives against their published vectors, once: the serve loop is entered again
     // on every replug, and this result does not change.
     let crypto_ok = godspeed_wifi::crypto::selftest(&ctx, "wifi-usb");
@@ -317,8 +321,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             dongle = None;
             match now {
                 Ok(Some((vid, pid))) => {
-                    heard = rx::Heard::new();
-                    dongle = identify(&ctx, vid, pid);
+                    heard = rx::Heard::new(&link);
+                    *link.borrow_mut() = rx::Link::new();
+                    dongle = identify(&ctx, vid, pid, &link);
                     if let Some(d) = dongle.as_ref() {
                         heard.us = d.address();
                     }
