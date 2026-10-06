@@ -238,7 +238,18 @@ fn control(
         buf[..len].copy_from_slice(&p[9..9 + len]);
     }
     for _ in 0..tries {
-        match control_once(ctx, hc, r, &setup, &mut buf, len, data_in, ev_idx, ev_cycle, eaten) {
+        let at = r.cur;
+        let got = control_once(ctx, hc, r, &setup, &mut buf, len, data_in, ev_idx, ev_cycle, eaten);
+        // MEASURED, not guessed: on the Pi 4 (2026-10-06) the first transfer after U1's reads left EP0 in
+        // the Error state, which the T630 never showed. The completion code, the request and where on the
+        // ring its TD sat say whether the controller rejected a TRB or the device refused the request.
+        // The first few per pass only (`repairs` is per pass).
+        if !matches!(got, Some(1) | Some(13)) && r.repairs < 3 {
+            ctx.log_fmt(format_args!(
+                "xhci: the WiFi dongle's control transfer failed - cc={} (0 = no event within {} ms), setup={:02x?}, {} {} byte(s), TD at ring offset {:#x} pcs={}",
+                got.unwrap_or(0), CONTROL_MS, setup, if data_in { "IN" } else { "OUT" }, len, at, r.pcs));
+        }
+        match got {
             Some(1) | Some(13) => {
                 out[1] = usbfn::ST_OK;
                 if data_in {

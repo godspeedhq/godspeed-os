@@ -1588,7 +1588,7 @@ of 96 routing slots free, reserve 72`), as the audit expected - and none ever to
 part of the prediction the card refuted (above). Each still joined in 5 to 6 s on the `OP_SYNC`
 fallback, so this costs nothing visible today; giving an on-demand driver a mailbox is `backlog/74`'s.
 
-## 27. `xhci` reports the dongle too, and the Pi 4 and VisionFive carry `wifi-usb` beside their onboard radio (2026-10-06) - built, checked in QEMU, not yet on hardware
+## 27. `xhci` reports the dongle too, and the Pi 4 and VisionFive carry `wifi-usb` beside their onboard radio (2026-10-06) - the reports hardware-verified on the Pi 4; the bring-up through the Pi 4's `xhci` fails
 
 Section 26's mechanism on the second host. The card is the Pi 4, at the operator's choice (*"easier to
 test on the pi4/visionfive ... then later on on the x86 machines"*): its debug console is on the GPIO
@@ -1644,3 +1644,24 @@ the ask, and no `wifi-usb`.
 
 **Refuted by:** a `wifi-usb` with no dongle; an unplug with no `gone` line; `wifi-usb` restarted after an
 unplug; the onboard radio's `wifi status` disturbed; `could not report the WiFi dongle`.
+
+**The card (Pi 4, 2026-10-06, `build/pi4_xhci_report.log`): the reports as predicted; the bring-up not.**
+- Boot without the dongle: two `no device` reports, no `wifi-usb`.
+- Plugged into a USB-A port: `hub port 3 DEVICE: VID=0x0bda PID=0x8176`, bound, then `supervisor: USB
+  0bda:8176 attached (binding 1) - starting wifi-usb`.
+- Unplugged, twice: `xhci: the WiFi dongle is gone (hub slot 1 port 3 reports disconnected) -
+  re-enumerating` - the hub-port watch, new on this card - then `wifi-usb stopped` and `ended - not
+  restarted`. Plugged back in: `binding 3`, then `binding 5`.
+- `kill supervisor`: `attached (binding 6) - wifi-usb running`, nothing started twice.
+- `kill wifi-usb` with the dongle in: `died, restarting`, as every service.
+
+**What did not work: `wifi-usb`'s bring-up through the Pi 4's `xhci`.** U1's reads all answered
+(`SYS_CFG`, the chip decoded as an RTL8188C, `9346CR`), and the very next transfer - the efuse read's
+first, which is the first control transfer with an OUT data stage - left the dongle's EP0 in the xHCI
+**Error** state (`endpoint slot 3 dci 1 is in state 4`). Error, not Halted, is where a controller puts an
+endpoint whose TRB it rejected, not one whose device stalled. `xhci` re-scanned, rebound the dongle,
+and `wifi-usb` said `the efuse read stopped - the transfer did not complete`. The same every time, five
+starts in five. The T630's controller took the same TRBs to R11 (section 25), so this is the Pi 4's VL805
+refusing something the T630's AMD controller accepts. NOT diagnosed: the next card logs the failed
+transfer's completion code, its setup packet and where its TD sat on the ring, so it is read rather than
+guessed.
