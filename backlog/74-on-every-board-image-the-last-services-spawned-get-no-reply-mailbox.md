@@ -239,3 +239,14 @@ kernel knows by name.
 **Verified in QEMU (Pi 2):** `kill supervisor` - the kernel's respawn logged `'supervisor' takes back a
 reply mailbox ... 71 of 96 routing slots free`, where the same boot without this change logged `gets no
 reply mailbox` at the same count. The respawned supervisor adopted every running service as before.
+
+**On hardware (Pi 2, 2026-10-06, b2a54655): the supervisor is never refused now.** The operator's run:
+`kill supervisor`, cable plugged and unplugged repeatedly under `ping`, then `chaos max-carnage` 50 rounds
+(344 kills, kernel alive). The kernel respawned the supervisor 21 times. 16 of them logged `'supervisor'
+takes back a reply mailbox released by a service that died`, and **none** logged `gets no reply mailbox`.
+The other 5 were granted above the reserve, where the table had room, which is not logged. Across the
+run 199 mailboxes were taken back. The only refusals were at boot (`nic-driver`, `net-stack`) and
+`chaos` itself, which is not watched and is not restarted. No `spawn REFUSED - IPC routing table full`
+anywhere. The cable and the radio handed the link back and forth on every plug (`the cable carries the
+link; the radio stands by` / `the cable is out - the radio carries the link`), and the dongle rejoined
+after chaos.
