@@ -426,7 +426,7 @@ is the first evidence there is, and it points at the transmit-only starvation `n
 now outnumber the network's by thousands, so "net IRQ - 13033 interrupts, 0 frames" reads as a busy NIC
 with nothing to show. It is the shared vector. Relabelled `USB IRQ` in the change after this run, with the radio's share said.
 
-## 10. R4 (2026-10-06): `wifi scan` - the dongle a `Station`, under the loop every radio shares - built, NOT YET RUN
+## 10. R4 (2026-10-06): `wifi scan` - the dongle a `Station`, under the loop every radio shares - hardware-verified on the Pi 2
 
 **The decision (the operator's, 2026-10-06): move the whole serve loop, not a piece of it.** What answers
 the shell's `wifi` - the sweep as a state, the scan cache, the credential table and `/wifi.keys`,
@@ -502,3 +502,36 @@ at spawn.
 are accepted and do not retune, so only channel 1's neighbours are heard); no networks at all with
 `radio rx` transfers climbing (beacons not reaching the sweep); or the prompt or disk stalling during a
 sweep (the hops' control transfers and the stand-aside).
+
+**Result (2026-10-06, `build/kernel7-R4.img`): passed on the Pi 2, with one fault found and fixed.**
+`stage 0` matched every vector, then U1 to R3b as before. `wifi scan` swept channels 1 to 13 in 2.3 s and
+listed **16 networks**, twice R3b's eight. The prompt read "16 networks in 3 s", and the radio was back on
+channel 1 afterwards. The shell's table has no channel column, so the evidence that the hops retune is
+timing, not a printed channel. Five networks R3b never heard on channel 1 first appeared 1.8 s into the
+sweep, where the dial was near channels 10 to 12. The records carried security: WPA2, WPA2/WPA, open,
+and hidden networks shown as hidden. A join with the stored key was refused, and the log named R5. `radio
+on` answered "already on", and `radio off` and `powercycle` said the dongle cannot do them. 6,144 frames,
+0 failed their CRC. The keyboard worked throughout, and `fs` served `/wifi.keys`.
+
+**The fault: the loop entered three times at boot.** `/wifi.keys loaded` and the auto-join appeared three
+times. `dwc2` sends more than one `NOTE_RADIO` for one bind, and the dongle's `Host` ended the loop on each.
+Before the loop was shared, `main.rs` had asked the host about every notice and ignored one that changed
+nothing; the move dropped that question. Harmless while a join is refused; three real joins once R5 makes
+one. **Fixed (R4b, built, not yet run):** `rx.rs` asks `OP_INFO` on a `NOTE_RADIO` and ends the loop only
+if the answer differs from the binding the loop was entered for. Predicted on the next card: ONE
+`/wifi.keys loaded` and one auto-join line at boot, and a replug still bringing the dongle back.
+
+**Not exercised on this card:** `wifi list` and `wifi status` were not typed, and the dongle was not
+replugged. Both are on the next card.
+
+**A limit the fix inherits, recorded rather than fixed.** "Changed" means a different `(vid, pid)`, or
+bound against not bound - the same test `main.rs` made since U1b. A dongle pulled and put back before
+`wifi-usb` reads the first notice reads as unchanged, and is not brought up again. The R2 and R3b replugs
+were seconds apart and never met it. Closing it needs the host to say WHICH insertion is bound (its USB
+address, which changes on every insertion), in `OP_INFO`.
+
+**Two sentences that are the shared loop's, and read wrong for a dongle.** `wifi radio off` logs "the
+firmware refused DOWN" after the dongle's own line says the off is not built. And the shell answers a
+`powercycle` with "the kernel refused: this machine has no control over the radio's power", which is the
+`wire::NO_POWER_CONTROL` sentence; for the dongle the kernel was never asked. Both are true in outcome and
+loose in cause. Left for the cards that build those verbs.

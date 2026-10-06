@@ -84,7 +84,7 @@ pub(crate) fn host(ctx: &ServiceContext, body: &[u8]) -> Result<Message, &'stati
 
 /// What the host says about the radio: `Some((vid, pid))` when one is bound, `None` when none is or the
 /// host did not answer - the second said once by the caller.
-fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16)>, &'static str> {
+pub(crate) fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16)>, &'static str> {
     let r = host(ctx, &[usbfn::OP_INFO])?;
     let p = r.payload_bytes();
     if p.len() < 2 || p[0] != usbfn::OP_INFO {
@@ -318,6 +318,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `NOTE_RADIO`, which ends the loop) - no timer. A dongle that is bound but did not come up is
         // answered as one whose bring-up stopped; no dongle, as no radio.
         let why = if matches!(now, Ok(Some(_))) { wire::DOWN_BRINGUP } else { wire::DOWN_NO_RADIO };
+        heard.serving = now;
         godspeed_wifi::serve::serve(
             &ctx, "wifi-usb", dongle.as_mut().map(|d| d as &mut dyn Station), &mut heard, why, crypto_ok);
     }

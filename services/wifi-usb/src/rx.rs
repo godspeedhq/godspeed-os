@@ -33,11 +33,17 @@ pub struct Heard {
     seen: [[u8; 6]; NETWORKS],
     n_seen: usize,
     no_bulk_said: bool,
+    /// What the host said was bound when the serve loop was entered (`main.rs`). A `NOTE_RADIO` ends the
+    /// loop only when the host now says something else.
+    pub serving: Result<Option<(u16, u16)>, &'static str>,
 }
 
 impl Heard {
     pub const fn new() -> Self {
-        Heard { transfers: 0, frames: 0, beacons: 0, crc: 0, cut: 0, seen: [[0; 6]; NETWORKS], n_seen: 0, no_bulk_said: false }
+        Heard {
+            transfers: 0, frames: 0, beacons: 0, crc: 0, cut: 0, seen: [[0; 6]; NETWORKS], n_seen: 0,
+            no_bulk_said: false, serving: Ok(None),
+        }
     }
 }
 
@@ -78,7 +84,14 @@ impl Host for Heard {
                 collect(ctx, self, sweep);
                 Notice::Taken
             }
-            [usbfn::NOTE_RADIO] => Notice::Changed,
+            // The binding MAY have changed: ask, and end the loop only if it did. `dwc2` sends more than one
+            // of these for one bind, and the first card of R4 (2026-10-06) showed what ending the loop on
+            // each costs: the loop entered three times at boot, `/wifi.keys` loaded three times, and the
+            // auto-join tried three times - harmless while a join is refused, and three real joins once R5
+            // makes one. `main.rs` asked the same question of every notice before the loop was shared.
+            [usbfn::NOTE_RADIO] => {
+                if crate::bound(ctx) == self.serving { Notice::Taken } else { Notice::Changed }
+            }
             _ => Notice::Ignored,
         }
     }
