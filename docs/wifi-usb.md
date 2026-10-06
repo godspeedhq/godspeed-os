@@ -699,7 +699,7 @@ deauthentication), 13 for a `wifi scan` between the joins, and 16 for the second
 answered first time. The shell's `wifi leave` between joins answered `nothing to leave - not joined`, which
 is true.
 
-## 13. R5c (2026-10-06): the WPA2 four-way handshake - JOINED - built, NOT YET RUN
+## 13. R5c (2026-10-06): the WPA2 four-way handshake - JOINED - hardware-verified on the Pi 2
 
 R5b's join, and then what R5b left out: the keys. The handshake itself is not new code. It is
 `godspeed_wifi::supplicant::Handshake`, the runner the Pi 4's Broadcom and the VisionFive's AIC8800 already
@@ -757,3 +757,18 @@ not give it. Message 1 repeated until `INCORRECT PASSPHRASE` with the right key 
 reach the access point, or reaches it wrong: the data path out, its endpoint, its LLC/SNAP. `message 3's MIC
 does not verify` means the key derivation, which is shared and verified on two other radios, so more likely
 the addresses fed into it. `the key did not go into the CAM` means the CAM write.
+
+**Result (2026-10-06, `build/kernel7-R5c.img`): JOINED, twice.** At boot the auto-join went: associated
+(ID 1), message 1, message 2 sent, message 3 verified with 56 bytes of key data unwrapped, message 4 sent,
+the pairwise key into CAM entry 0 and group key 1 into entry 1, `JOINED - handshake complete`. Then `wifi
+leave` (`left <the network>`) and `wifi join` joined again, keeping the key in credential slot 0, and
+`wifi status` read `joined 15 s ago`. The scan list marks the network `joined`, against both access points
+that carry its name.
+
+**The first handshake after boot waited 650 ms for its nonce.** Between message 1 and message 2 the
+supplicant logged `NO HARDWARE RNG on this board` and used its counter-hashed fallback. The access point
+resent message 1 in the gap, and the handshake completed on the resend. The second join had no such line and
+answered in 31 ms. The cause is in the kernel, not the radio: the Pi 2's `hw_random` turns the RNG on at
+its first call and then waits an iteration count shorter than the RNG's warm-up, so the first read after
+boot always comes back empty. Its comment also says its output is "not fed to crypto", which the shared
+supplicant now does. That is `backlog/76`, a kernel change left for the operator's go-ahead.
