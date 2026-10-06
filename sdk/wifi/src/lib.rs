@@ -19,6 +19,9 @@
 //!   channel - for every radio whose firmware forwards the frames rather than digesting them.
 //! - [`station`]: the [`station::Station`] trait - what the serve loop asks of a radio - and the types it
 //!   speaks in; [`bss`] (a scan's networks and their wire records) and [`rxq`] (received frames) with it.
+//! - [`serve`]: THE serve loop - what the shell's `wifi` and `nic-driver`'s frame ops are answered by,
+//!   the scan cache, the credential table, auto-join - run by every radio service over its `Station`.
+//!   It lived in `wifi-driver` until the USB dongle's driver, a second service, needed it (2026-10-06).
 //! - [`sdio`]: the SDIO card protocol and the [`sdio::SdioHost`] trait every SDIO controller implements,
 //!   so the radios' code runs on the Pi 4's Arasan and the VisionFive 2's DesignWare host alike.
 //! - [`wire`]: the request/reply vocabulary between a radio driver and the shell's `wifi`, so the shell
@@ -39,9 +42,11 @@
 //!
 //! # Known gap
 //!
-//! Log lines in this crate are prefixed `wifi-driver:`. That is the only radio service today; a radio
-//! driven from another service (the Pi 2's, behind `dwc2`) will need the prefix passed in rather than
-//! assumed. Recorded here rather than solved before there is a second caller (26.2).
+//! Log lines in this crate were prefixed `wifi-driver:`, the only radio service until `wifi-usb`. The
+//! second caller arrived with R4 (2026-10-06), and the modules it reaches now take the service's name:
+//! [`serve`], [`keyfile`] and [`crypto::selftest`]. [`eapol`] and [`supplicant`] still say `wifi-driver:`;
+//! `wifi-usb` reaches them only once it can join (R5, `docs/wifi-usb.md`), which is where they gain it.
+//! [`sdio`] is right as it is - only `wifi-driver` drives an SDIO bus.
 #![no_std]
 #![deny(unsafe_code)]
 
@@ -51,6 +56,7 @@ pub mod eapol;
 pub mod keyfile;
 pub mod mgmt;
 pub mod rxq;
+pub mod serve;
 pub mod sdio;
 pub mod station;
 pub mod supplicant;

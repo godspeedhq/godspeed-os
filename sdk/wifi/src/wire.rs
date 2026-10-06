@@ -136,6 +136,17 @@ pub mod dbg {
     pub const FIRMWARE: u8 = 2;
 }
 
+/// THE FRAME INTERFACE: what `nic-driver` asks a radio when the cable is out (`docs/wifi.md` 2). Its ops
+/// start at 0x10 because they share the radio's endpoint with the `wifi` ops above; every reply opens
+/// with its op, because the caller bounds its wait and a late answer must not be read as the next one.
+///
+/// `[0x10]` -> `[0x10, ok, mac(6), link, peer(6)]`; `peer` is the access point, zeros when not known.
+pub const OP_NET_INFO: u8 = 0x10;
+/// `[0x11, ethernet frame...]` -> `[0x11, sent]`.
+pub const OP_NET_TX: u8 = 0x11;
+/// `[0x12]` -> `[0x12, len_lo, len_hi, ethernet frame...]`; a length of 0 is "nothing waiting".
+pub const OP_NET_RX: u8 = 0x12;
+
 /// A sweep is running. For `OP_LIST` this is a REFUSAL: the cache is not served while it is about to be
 /// replaced (`utilities/56_wifi.md` §3, Commandment III). Byte 1 is the count heard so far.
 pub const SCANNING: u8 = 4;

@@ -191,6 +191,44 @@ impl<'a> Deadline<'a> {
     }
 }
 
+/// A moment to measure from, KEPT - what a [`Deadline`] cannot be, because it borrows the context it reads
+/// the clock through and so cannot outlive the call that made it.
+///
+/// For a wait that is not a loop: something started now and asked about later, from a different call. A
+/// radio's sweep is the first - each channel is listened to for a dwell, and the serve loop asks the radio
+/// once per turn whether it is time to tune the next; and the same loop times how long it has gone
+/// without reading a joined radio, and how long a request took to serve.
+///
+/// **On an uncalibrated machine every budget has passed** and nothing has elapsed. There is no duration
+/// to compare with, and the alternative - nothing ever passes - turns a dwell into a hang; this way a
+/// sweep still runs, only too fast to hear everything. [`calibrated`] says which case this is.
+#[derive(Clone, Copy)]
+pub struct Since {
+    start: u64,
+    per_10ms: u64,
+}
+
+#[cfg(not(test))]
+impl Since {
+    /// Now.
+    pub fn now(ctx: &ServiceContext) -> Self {
+        Since { start: ctx.read_tsc(), per_10ms: ctx.tsc_ticks_per_10ms() }
+    }
+
+    /// Has `budget` passed since this moment?
+    pub fn passed(&self, ctx: &ServiceContext, budget: Budget) -> bool {
+        if self.per_10ms == 0 {
+            return true;
+        }
+        ctx.read_tsc().wrapping_sub(self.start) >= ticks_for(self.per_10ms, budget.as_us())
+    }
+
+    /// Microseconds since this moment; 0 when uncalibrated, where it cannot be known.
+    pub fn elapsed_us(&self, ctx: &ServiceContext) -> u64 {
+        us_for(self.per_10ms, ctx.read_tsc().wrapping_sub(self.start))
+    }
+}
+
 /// Wait until `cond` returns true or `budget` runs out. `Ok` carries the microseconds it took (0 if
 /// the machine is uncalibrated or the condition already held).
 #[cfg(not(test))]

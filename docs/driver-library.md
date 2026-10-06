@@ -51,6 +51,9 @@ and why; read them for the reasoning, not to find out what the library contains.
   `Deadline::start` (polling) and `Deadline::paced` (sleeping a pace between looks), each with
   `expired`, `pause` and `elapsed_us`; `calibrated`. On an uncalibrated clock a polling wait gets
   `UNCALIBRATED_POLLS` (200,000) looks and a paced one the paces that fit its budget. It never logs.
+  `Since` (2026-10-06) is a moment KEPT across calls, which a `Deadline` cannot be because it borrows the
+  context: `now`, `passed(budget)` and `elapsed_us`. Its first users are the shared WiFi serve loop and
+  the USB dongle's channel sweep. Uncalibrated, every budget has passed, so a dwell cannot become a hang.
 - **`delay`** - holds, for gaps nothing reports the end of. `hold` spins on a calibrated clock;
   `hold_parked` sleeps first and spins the rest, for holds of tens of milliseconds. On an uncalibrated
   clock both sleep whole scheduler quanta, erring long, because a hold is a minimum.

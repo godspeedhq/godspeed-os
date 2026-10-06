@@ -86,9 +86,6 @@ const AUTH_OPEN_SYSTEM: u32 = 0;
 /// `BWFM_MFP_NONE` - no management frame protection, as `bwfm_connect` sets it.
 const MFP_NONE: [u8; 4] = [0, 0, 0, 0];
 
-/// `CYW43_WPA_MAX_PASSWORD_LEN` - the longest passphrase the request carries.
-pub const MAX_PASSPHRASE: usize = 64;
-
 // How a join ended and what it joins with are every radio's (`godspeed_wifi::station`).
 pub use godspeed_wifi::station::{Outcome, Secret};
 /// The SSID limit lives in `scan`; re-exported so `join::MAX_SSID` reads naturally at the request site.

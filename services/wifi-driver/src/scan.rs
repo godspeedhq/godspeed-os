@@ -307,7 +307,7 @@ const SYNC_ID: u16 = 0x1234;
 pub const MAX_SSID: usize = godspeed_wifi::wire::SSID_MAX;
 // The network list, its classification and its wire encoding are every radio's (`godspeed_wifi::bss`);
 // what stays here is how THIS firmware reports a scan.
-pub use godspeed_wifi::bss::{classify, sec, write_records, write_reply, Network, Scan, CAPINFO_PRIVACY, MAX_RESULTS};
+pub use godspeed_wifi::bss::{classify, sec, Network, Scan, CAPINFO_PRIVACY, MAX_RESULTS};
 /// One turn of the sweep (`godspeed_wifi::station::ScanStep`).
 pub use godspeed_wifi::station::ScanStep as Step;
 /// The wire vocabulary lives in the shared crate now (`godspeed_wifi::wire`), so the shell reads the same

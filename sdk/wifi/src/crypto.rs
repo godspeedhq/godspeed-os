@@ -395,22 +395,22 @@ pub fn aes_key_unwrap(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> bool {
 /// Every primitive against its published vector. Logs one line per vector and returns whether all held.
 /// Run at boot, before the radio is touched: a key derived by a wrong hash is refused by the access point
 /// in a way that is indistinguishable from a wrong passphrase, so this is the only place the error is visible.
-pub fn selftest(ctx: &ServiceContext) -> bool {
+pub fn selftest(ctx: &ServiceContext, who: &str) -> bool {
     let mut ok = true;
     let mut check = |name: &str, got: &[u8], want: &[u8]| {
         let same = got == want;
         if same {
-            ctx.log_fmt(format_args!("wifi-driver:   {} - matches the published vector", name));
+            ctx.log_fmt(format_args!("{}:   {} - matches the published vector", who, name));
         } else {
             ok = false;
             ctx.log_fmt(format_args!(
-                "wifi-driver:   {} - WRONG: got {:02x}{:02x}{:02x}{:02x}.., wanted {:02x}{:02x}{:02x}{:02x}..",
-                name, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]
+                "{}:   {} - WRONG: got {:02x}{:02x}{:02x}{:02x}.., wanted {:02x}{:02x}{:02x}{:02x}..",
+                who, name, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]
             ));
         }
     };
 
-    ctx.log("wifi-driver: stage 0 - the key-derivation primitives against their published vectors");
+    ctx.log_fmt(format_args!("{}: stage 0 - the key-derivation primitives against their published vectors", who));
 
     // FIPS 180-1 appendix A: SHA-1("abc").
     let sha = {
@@ -505,13 +505,13 @@ pub fn selftest(ctx: &ServiceContext) -> bool {
     );
     if !unwrap_ok {
         ok = false;
-        ctx.log("wifi-driver:   AES key unwrap - WRONG: the integrity value did not come out as A6A6A6A6A6A6A6A6");
+        ctx.log_fmt(format_args!("{}:   AES key unwrap - WRONG: the integrity value did not come out as A6A6A6A6A6A6A6A6", who));
     }
 
     if ok {
-        ctx.log("wifi-driver: stage 0 - every primitive matches its vector; a passphrase will derive the key the standard says");
+        ctx.log_fmt(format_args!("{}: stage 0 - every primitive matches its vector; a passphrase will derive the key the standard says", who));
     } else {
-        ctx.log("wifi-driver: stage 0 - A PRIMITIVE IS WRONG. No passphrase will be accepted; joins are refused until this is fixed");
+        ctx.log_fmt(format_args!("{}: stage 0 - A PRIMITIVE IS WRONG. No passphrase will be accepted; joins are refused until this is fixed", who));
     }
     ok
 }

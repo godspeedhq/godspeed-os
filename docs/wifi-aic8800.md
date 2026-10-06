@@ -30,7 +30,7 @@ are installed with one firmware command. So:
 | WPA2 crypto: PBKDF2, the PRF, HMAC-SHA1 MIC, AES key unwrap | `sdk/wifi/src/crypto.rs` | **as is** |
 | EAPOL key frames: parse, build, MIC check, GTK KDE | `sdk/wifi/src/eapol.rs` | **as is** |
 | The four-way and group-key handshakes, rekeys included | `wifi-driver/join.rs` (`Handshake`), `frames.rs` | **moves to `sdk/wifi`** behind three calls (section 6) |
-| The credential table, `/wifi.keys`, the scan cache, auto-join, every reply layout | `wifi-driver/main.rs` serve loop, over `&mut dyn Station` | **as is** - the AIC8800 is a second `Station` |
+| The credential table, `/wifi.keys`, the scan cache, auto-join, every reply layout | `wifi-driver/main.rs` serve loop, over `&mut dyn Station` (moved to `sdk/wifi/src/serve.rs` on 2026-10-06, for the USB dongle; `docs/wifi-usb.md` 10) | **as is** - the AIC8800 is a second `Station` |
 | SDIO protocol: CMD52, CMD53, identification, CIS | `sdk/wifi/src/sdio.rs`, behind `SdioHost` | **as is**, over a new host |
 | The `wifi` utility, `nic-driver`'s radio bridge, `net-stack` | above the driver | **as is** |
 | The SDIO HOST controller | `wifi-driver/host.rs` (Arasan) | **new**: DesignWare `dw_mmc` |

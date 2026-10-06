@@ -30,12 +30,8 @@ use godspeed_wifi::sdio::SdioHost;
 use crate::join::{BcmPath, Handshake, Keys, Step, EVENT_MSG_LINK};
 use crate::scan::{self, code, ev, CHANNEL_DATA, CHANNEL_EVENT, CHANNEL_MASK};
 
-/// `[0x10]` -> `[0x10, ok, mac(6), link, peer(6)]`; `peer` is the access point, zeros when not known.
-pub const OP_NET_INFO: u8 = 0x10;
-/// `[0x11, ethernet frame...]` -> `[0x11, sent]`.
-pub const OP_NET_TX: u8 = 0x11;
-/// `[0x12]` -> `[0x12, len_lo, len_hi, ethernet frame...]`; a length of 0 is "nothing waiting".
-pub const OP_NET_RX: u8 = 0x12;
+// The frame ops (`OP_NET_*`) are the wire vocabulary's (`godspeed_wifi::wire`), served by the shared loop
+// (`godspeed_wifi::serve`); what stays here is how THIS chip's frames are read and sent.
 
 // The received-frame queue and what a pull reports are every radio's (`godspeed_wifi::rxq`, `::station`).
 pub use godspeed_wifi::rxq::RxQueue;
