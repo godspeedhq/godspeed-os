@@ -51,7 +51,7 @@
 use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
 use godspeed as gs;
 use gs::cap::Cap;
-use gs::driver::{delay, wait::Budget};
+use gs::driver::{delay, wait::{self, Budget}};
 use godspeed_wifi::usbfn;
 
 use crate::chan::{self, Target, CH_RADIO_RX};
@@ -75,6 +75,12 @@ pub struct Radio {
     /// A `NOTE_BULK_IN` the driver's queue refused, sent again on a later pass: nothing is armed until the
     /// held transfer is collected, so a notice lost for good would stop receive for good.
     note_owed: bool,
+    /// Notices the driver took in place of an answer and named in an `OP_SYNC` (`usbfn::OP_SYNC`), sent
+    /// again once it has been quiet for `DRIVER_QUIET_MS` - so they reach its serve loop, not its next call.
+    sync_bulk: bool,
+    sync_radio: bool,
+    /// When the driver last asked anything, for that quiet.
+    last_req: Option<wait::Since>,
     /// Consecutive transaction errors on the IN, for `RX_ERROR_TRIES`.
     errs_run: u32,
     pub stats: RxStats,
@@ -136,6 +142,8 @@ pub struct RxStats {
     pub errors: u32,
     pub last_err: u32,
     pub notes_late: u32,
+    /// `OP_SYNC`s: notices the driver received in place of an answer (it has no reply mailbox).
+    pub syncs: u32,
 }
 
 /// Where the radio's transfers land: after the NIC's receive burst, inside the 64 KiB arena. Derived and
@@ -168,6 +176,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, 
     let _ = probe(ctx, mmio, dma, t);
     Radio {
         t: *t, vid, pid, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
+        sync_bulk: false, sync_radio: false, last_req: None,
         errs_run: 0, stats: RxStats::default(),
         outs: e.outs, n_out: e.n_out, out_mps: e.out_mps, pid_out: [chan::PID_DATA0; MAX_OUT],
         tx: TxStats::default(),
@@ -302,6 +311,18 @@ fn arm(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, at: usize) {
 /// the USB interrupt and once a pass. `true` when it found a halt to retire - what lets the interrupt
 /// handler know the line was this channel's.
 pub fn service(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio) -> bool {
+    // Notices named in an `OP_SYNC`, again, once the driver is between requests.
+    if (r.sync_bulk || r.sync_radio)
+        && r.last_req.as_ref().map_or(true, |t| t.passed(ctx, Budget::ms(DRIVER_QUIET_MS)))
+    {
+        if r.sync_radio {
+            r.sync_radio = !tell(ctx);
+        }
+        if r.sync_bulk {
+            r.sync_bulk = false;
+            r.note_owed = true;
+        }
+    }
     if r.note_owed && matches!(r.rx, Rx::Held(_)) {
         r.note_owed = !tell_bulk(ctx);
     }
@@ -414,8 +435,8 @@ pub fn report(ctx: &ServiceContext, r: &Radio) {
         Rx::Held(_) => "held for wifi-usb",
     };
     ctx.log_fmt(format_args!(
-        "dwc2-svc: radio rx - {} transfers {} bytes, {} asides, {} errors (last HCINT={:#010x}), {} notices late; {}; tx - {} frames {} bytes, {} failed",
-        s.transfers, s.bytes, s.asides, s.errors, s.last_err, s.notes_late, state, r.tx.frames, r.tx.bytes, r.tx.failed));
+        "dwc2-svc: radio rx - {} transfers {} bytes, {} asides, {} errors (last HCINT={:#010x}), {} notices late, {} taken as answers (OP_SYNC); {}; tx - {} frames {} bytes, {} failed",
+        s.transfers, s.bytes, s.asides, s.errors, s.last_err, s.notes_late, s.syncs, state, r.tx.frames, r.tx.bytes, r.tx.failed));
 }
 
 fn tell_bulk(ctx: &ServiceContext) -> bool {
@@ -494,6 +515,11 @@ fn tell(ctx: &ServiceContext) -> bool {
 /// The radio's driver, the one service this host tells about the radio.
 const DRIVER: &str = "wifi-usb";
 
+/// How long the driver must have asked nothing before a notice it named in an `OP_SYNC` is sent again:
+/// long enough that it is back in its serve loop rather than mid-sequence, short enough that a held
+/// receive is not kept waiting. A bring-up's requests come well under a millisecond apart.
+const DRIVER_QUIET_MS: u64 = 5;
+
 /// Control transfers tried before the host says FAILED. The reason `read32` gives: this controller sequences
 /// transfers in software, so one XACTERR is a transient on a contended bus, not a verdict. `OP_CONTROL_ONCE`
 /// gets one: a transfer the client must not have reach the device twice, whose failure the client handles.
@@ -507,6 +533,31 @@ pub fn serve(
 ) {
     let p = msg.payload_bytes();
     let op = p.first().copied().unwrap_or(0);
+    let mut radio = radio;
+    if let Some(r) = radio.as_mut() {
+        r.last_req = Some(wait::Since::now(ctx));
+    }
+    // `OP_SYNC`: never answered (`usbfn::OP_SYNC`) - the reply capability given back, the named notice
+    // owed. With no radio bound, a binding notice is told at once: the driver's requests are all answered
+    // `ST_NO_DEVICE` from here, so it is not mid-sequence for long.
+    if op == usbfn::OP_SYNC {
+        gs::cap::remove(ctx, reply);
+        match (p.get(1).copied(), radio) {
+            (Some(usbfn::NOTE_BULK_IN), Some(r)) => {
+                r.stats.syncs = r.stats.syncs.wrapping_add(1);
+                r.sync_bulk = true;
+            }
+            (Some(usbfn::NOTE_RADIO), Some(r)) => {
+                r.stats.syncs = r.stats.syncs.wrapping_add(1);
+                r.sync_radio = true;
+            }
+            (Some(usbfn::NOTE_RADIO), None) => {
+                let _ = tell(ctx);
+            }
+            _ => {}
+        }
+        return;
+    }
     let radio = match (op, radio) {
         (usbfn::OP_BULK_IN, Some(r)) => return bulk_in_request(ctx, mmio, dma, r, reply),
         (usbfn::OP_BULK_OUT, Some(r)) => {

@@ -83,8 +83,29 @@ const SYS_CFG_TYPE_92C: u32 = 1 << 27;
 /// the send failed - the host is spawned by the supervisor and may be respawned after us (14.3) - and never
 /// re-sends after a deadline. The failure as the stdlib words it.
 pub(crate) fn host(ctx: &ServiceContext, body: &[u8]) -> Result<Message, &'static str> {
-    gs::call::request_within(ctx, host_name(ctx), &Message::from_bytes(body), HOST_SECS).map_err(|e| e.as_str())
+    let ask = |m: &[u8]| gs::call::request_within(ctx, host_name(ctx), &Message::from_bytes(m), HOST_SECS).map_err(|e| e.as_str());
+    let mut r = ask(body)?;
+    // A NOTICE IN PLACE OF THE ANSWER. A respawn of this service gets no reply mailbox once the routing
+    // table is past its reserve (seen on every respawn on the Pi 2, 2026-10-06), and then the kernel hands
+    // a call the host's next message - its notices included. Taken as the answer, a notice puts every
+    // answer after it one behind: R9's first power cycle stopped at "the host answered something other
+    // than CONTROL" and then every request was "malformed". `OP_SYNC` names the notice and is never
+    // answered, so the call returns the answer still on its way and leaves nothing owed; the host sends
+    // the notice again once this service is quiet. Bounded: a host that keeps sending notices in place of
+    // answers is said, not chased.
+    let mut syncs = 0u32;
+    while let Some(&note) = r.payload_bytes().first().filter(|&&b| b == usbfn::NOTE_BULK_IN || b == usbfn::NOTE_RADIO) {
+        if syncs == SYNC_MAX {
+            return Err("the host's notices kept arriving in place of its answer");
+        }
+        syncs += 1;
+        r = ask(&[usbfn::OP_SYNC, note])?;
+    }
+    Ok(r)
 }
+
+/// Notices taken in place of one answer before `host` gives up on it.
+const SYNC_MAX: u32 = 4;
 
 /// What the host says about the radio: `Some((vid, pid))` when one is bound, `None` when none is or the
 /// host did not answer - the second said once by the caller.

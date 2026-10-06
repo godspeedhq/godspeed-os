@@ -989,6 +989,12 @@ large payloads.
 - the lease or the pings failing where R6 succeeded (a data descriptor the chip refuses or sends badly);
 - no change in the large ping's time (the firmware not adapting, or the mask not taking).
 
+**Closed on the R9 card's run (2026-10-06): the uplink is not 1 Mb/s.** `ping` to the gateway: 32 bytes,
+8 of 8, 4 to 16 ms, average 10; then 1024 bytes, 7 of 7, 8 to 20 ms, average 13. The large ping costs about
+4 ms more on the minimum and about 3 ms more on the average. At 1 Mb/s its request alone is 8.5 ms in the
+air, so the firmware is sending faster than 1 Mb/s. How much faster this cannot say: the remaining
+difference includes the larger copies through USB and three services. The record of the R8 run follows.
+
 **The R8 card's run (2026-10-06): nothing refuted, and the speed-up itself not measured.**
 - At JOINED, after boot and again after `radio on`: `the firmware has the rate mask 0xfff and the
   association`. The mailbox took both commands; the access point lists all twelve legacy rates.
@@ -1017,7 +1023,7 @@ driver that changes nothing. The shell now asks rather than announces. On `NO_PO
 1 (whether the driver left first): left means the kernel refused a host that could cut; not left means the
 driver has no power to cut, and nothing changed. `powercycle`'s refusal no longer blames the kernel alone.
 
-## 18. R9 (2026-10-06): `off hard` and `powercycle` for the dongle - the chip's own power-down - built, not yet run
+## 18. R9 (2026-10-06): `off hard` and `powercycle` for the dongle - the chip's own power-down - the power-down hardware-verified; the restart after it needed section 19
 
 **The question that led here.** A dongle's 5 V is its USB port's, and on the Pi 2 that port is behind the
 hub the disk, the keyboard and the ethernet share. Cutting it, or even suspending the port, puts the shared
@@ -1079,3 +1085,54 @@ gateway back to back.
   power-down the way it does under Linux);
 - `dwc2` losing the dongle while it is suspended (its bulk IN erroring into an unbind);
 - `checked - a firmware is STILL marked running`.
+
+**The R9 card's run (2026-10-06).** R8's pair first: closed, in section 17. Then `wifi radio powercycle`:
+- `the chip powered down (Linux's rtl8192cu_power_off) - the firmware stopped its CPU when asked`, then
+  `held powered down for 2000 ms`. The shell printed `radio powered down for 2.0 s (the network is left)`
+  and restarted the driver.
+- The new instance found the chip **cold**, powered it on, uploaded the firmware, and the firmware ran
+  (`MCU_FW_DL=0x000300c6`). **The chip comes back from Linux's power-down exactly as from a plug-in.**
+- The bring-up then stopped at `the host answered something other than CONTROL`, and on the shell's
+  restart after that, every request the sweep made was `malformed`. Not the chip: section 19.
+- `off hard` was not reached.
+
+## 19. A respawned `wifi-usb` and the host's notices (2026-10-06) - built, not yet run
+
+**What went wrong after R9's power cycle,** and would have after any restart of `wifi-usb` - a crash, a
+`kill`, a `chaos` round. Boot gives `wifi-usb` a reply mailbox, an endpoint that carries only replies.
+A respawn gets none: `spawn[ipc]: 'wifi-usb' gets no reply mailbox - 71 of 96 routing slots free, reserve
+72`, logged at both restarts. `nic-driver` and `net-stack` have none from boot. Without one, `wifi-usb`
+awaits its replies on the endpoint where `dwc2` also sends its notices (`NOTE_BULK_IN`, `NOTE_RADIO`).
+The kernel matches a call's reply by SENDER (`dequeue_reply_locked`), not by request. So a notice from
+`dwc2` can be taken as the reply, and the real reply then answers the next request: every answer one
+behind. That is exactly the log: `answered something other than CONTROL`, then `malformed` on every
+request after it.
+
+**The cure, with no kernel change.** `usbfn::OP_SYNC`, a request the host never answers:
+- **The driver** (`main.rs` `host`): when a request's answer is a notice, it sends `[OP_SYNC, notice]`.
+  The kernel returns that call with the host's next message, which is the real answer still on its way.
+  Since nothing answers `OP_SYNC`, no reply is left owed behind it. Bounded at 4 notices for one answer.
+- **The host** (`dwc2` `rtl.rs`): it gives back `OP_SYNC`'s reply capability and owes the named notice.
+  It sends the notice again only once the driver has asked nothing for 5 ms (`DRIVER_QUIET_MS`), so the
+  notice reaches the serve loop, not the next request of a sequence. A swallowed `NOTE_BULK_IN` must be
+  re-sent: `dwc2` holds the transfer until it is collected and arms nothing meanwhile, so a lost one would
+  stop receive. Counted in the heartbeat as `taken as answers (OP_SYNC)`.
+
+**Not done, and recorded.**
+- A respawn's missing mailbox is the kernel's reserve policy (`try_register_optional`), and changing the
+  reserve is a kernel change with its own measurement. With `OP_SYNC` the driver no longer depends on it.
+- `nic-driver` asks `wifi-usb` on an endpoint that also carries its own clients. Its mismatched answers
+  (section 17) are the same mechanism one layer up, and its existing check catches them.
+
+**Prediction, the R9 card again:**
+- `wifi radio powercycle` ends `powercycle succeeded - joined ...`.
+- The new instance's bring-up runs to JOINED. `dwc2`'s heartbeat may show `N taken as answers (OP_SYNC)`
+  above 0, which is the cure working. No `malformed` and no `something other than` lines.
+- `ping` answers.
+- Then `wifi radio off hard`, `wifi status`, `wifi radio on` and `ping`, as section 18 predicts.
+
+**Refuted by:**
+- `the host's notices kept arriving in place of its answer`;
+- receive stalling after a restart (a swallowed `NOTE_BULK_IN` never re-sent): no data frames, and
+  `dwc2` reporting `held for wifi-usb` at every heartbeat;
+- any `malformed` from the host.

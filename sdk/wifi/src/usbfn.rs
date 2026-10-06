@@ -39,6 +39,16 @@ pub const OP_BULK_IN: u8 = 0x23;
 /// `ST_FAILED` when the device or the bus did not take it.
 pub const OP_BULK_OUT: u8 = 0x24;
 
+/// `[OP_SYNC, notice]`: **never answered.** A driver spawned without a reply mailbox (a respawn, once the
+/// routing table is past its reserve - `spawn[ipc]: ... gets no reply mailbox`) awaits its replies on the
+/// endpoint the host's notices also arrive on, and the kernel hands a call the host's NEXT message, matched
+/// by sender and not by request. So a notice can be taken as the answer, and every answer after it is one
+/// behind. The driver that receives a notice in place of an answer sends this, naming the notice: its call
+/// then returns the host's next message - the answer still on its way - and, since nothing answers this,
+/// no answer is left owed behind it. The host gives the reply capability back and sends the named notice
+/// again once the driver has been quiet (`docs/wifi-usb.md` 19).
+pub const OP_SYNC: u8 = 0x25;
+
 /// `[NOTE_BULK_IN]`, sent BY the host TO the driver, no reply expected: a bulk IN transfer is held, ask
 /// `OP_BULK_IN`. Sent with `try_send`; one the driver's full queue refused is sent again on the host's next
 /// pass, because the host arms nothing until the transfer is collected and a lost notice would stop receive.
