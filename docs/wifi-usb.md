@@ -1780,3 +1780,42 @@ occurrence says the endpoint's state at the failure and what the repair left.
 The U2a work on the Pi 4, in order of what each run showed: the reports and the hub-port unplug watch
 (confirmed), the wrap's TRB Error located at the Link's slot (measured), a zeroed next page and a cleared
 ring (both refuted as the cure, both kept as correct ring hygiene), the eager Link (confirmed).
+
+## 28. U2b (2026-10-06): the bulk IN through `xhci` - built, not yet on hardware
+
+Received frames, through the Pi 4's `xhci` first (the operator's test board; the T630 later).
+
+**Telling a slot's two endpoints apart.** The dongle's EP0 and its armed bulk IN share one slot, and a
+completion for one must never be taken as the other's. `next_event_at` now returns the transfer event's
+endpoint ID (bits 20:16) and residual (bits 23:0) beside what it already did, and `EvMail` files a
+completion that another consumer dequeued by endpoint as well as by slot (`take_ep0`, `take_bulk`;
+`take` and `have` keep their meaning for the keyboard and the hub probes). Every consumer that files one -
+the disk's wait, the hub probe, the poll drain, the dongle's control transfer - passes the endpoint.
+
+**The bulk IN** (`radio.rs`): found in the configuration descriptor already read at bind (`parse_eps`;
+every length distrusted) and added with one Configure Endpoint (`configure_radio_in`, built as
+`bind_msc` builds the disk's). Its ring is the second half of the slice's report page, whose first half
+is EP0's data stage; its 3584-byte buffer (`usbfn::BULK_IN_MAX`, seven packets) is the slice's
+interrupt-ring page. That keeps every RING away from the page after the EP0 ring, which the VL805 reads
+into (section 27); a data buffer there does no harm. The Link is written eagerly, as EP0's is.
+
+**The protocol, as `dwc2` answers it:** one transfer kept armed, Interrupt On Completion and On Short
+Packet, so every frame completes at once; a completion held, `NOTE_BULK_IN` told (sent again each pass
+if the driver's queue refused it); `OP_BULK_IN` returns what is held and arms again, `ST_OK` with no data
+when nothing is. A failed transfer is told too, and the ask that follows repairs the endpoint (Reset
+Endpoint and Set TR Dequeue to the ring's start, bounded per pass). The bulk OUT is U2c and still answers
+`ST_FAILED`.
+
+**Checked before the card:** the Pi 4, x86 and VisionFive images build and x86 passes every gate.
+
+**Prediction, Pi 4, dongle plugged in at the prompt:**
+1. `xhci: the WiFi dongle's bulk IN 0x81 configured (DCI 3, mps 512) - receive ready (U2b)`.
+2. The bring-up as in section 27, then `wifi-usb: receive started` instead of `receive did not start`.
+3. `xhci: the WiFi dongle's first bulk IN transfer - N bytes (U2b)`, `wifi-usb: the FIRST frame from the
+   air ... R3b done`, and `wifi-usb: beacon '<network>' <its BSSID> on channel N, -NN dBm` for the networks
+   around, each once.
+4. A sweep's probe requests and an auto-join need the bulk OUT, so they fail and say so - U2c's work.
+   The onboard radio is untouched.
+
+**Refuted by:** a Configure Endpoint failure; no first bulk IN transfer; a `bulk IN transfer failed` that
+recurs; EP0 transfers failing where section 27's did not (the endpoint matching wrong).

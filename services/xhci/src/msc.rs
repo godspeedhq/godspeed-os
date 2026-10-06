@@ -44,7 +44,7 @@
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
-use crate::{next_event, EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
+use crate::{EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
 
 /// The disk's own DMA region, past the scratchpad tail (`SCRATCHPAD_BUF_BASE + MAX_SCRATCHPAD`).
 ///
@@ -267,8 +267,8 @@ fn await_on_slot(
         return Some(cc);
     }
     loop {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
-            Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == slot => return Some(cc),
+        match crate::next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, _, _)) if sid == slot => return Some(cc),
             // Another consumer's transfer completed. FILE IT - do not just note that it happened.
             //
             // This arm used to record a re-arm bit and DISCARD the completion, which was fine for a
@@ -281,8 +281,8 @@ fn await_on_slot(
             // Measured: 328 probes posted, 151 answered, and ZERO late answers seen by the drain -
             // because they never reached the drain. They were eaten here.
             // `docs/xhci-completion-correlation.md`.
-            Some((TRB_TRANSFER_EVENT, cc, sid)) => {
-                eaten.put(sid, cc);
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) => {
+                eaten.put(sid, ep, cc, res);
                 unrelated += 1;
                 if unrelated >= MAX_UNRELATED_EVENTS {
                     ctx.log("xhci: gave up waiting for a disk transfer - too many unrelated events");

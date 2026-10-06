@@ -5,16 +5,17 @@
 //!
 //! **U2a (2026-10-06): who it is, and its control transfers, both directions.** That is everything
 //! `wifi-usb`'s bring-up asks of a host up to and including the firmware, the MAC, baseband and RF tables
-//! and the channel (R1 to R3a). The bulk IN that carries received frames is U2b, the bulk OUT that carries
-//! sent ones U2c; until then those two answer `ST_FAILED`, which `wifi-usb` reports.
+//! and the channel (R1 to R3a). **U2b: the bulk IN** that carries received frames - one transfer kept
+//! armed, held when it completes, `NOTE_BULK_IN` told, collected by `OP_BULK_IN`, as `dwc2` does. The bulk
+//! OUT that carries sent frames is U2c; until then it answers `ST_FAILED`, which `wifi-usb` reports.
 //!
 //! **Where it lives in the arena.** In the device slice it was enumerated into, kept as a keyboard's is:
 //! the EP0 ring is the slice's EP0 page, and a control transfer's data stage uses the slice's report page,
 //! which a dongle has no interrupt endpoint to use. No new arena, so no kernel change.
 //!
-//! **Matched by slot.** A control completion is taken as this slot's transfer event. That is exact while
-//! EP0 is the only endpoint this host drives on the dongle; U2b's armed bulk IN on the same slot is where
-//! matching must take the endpoint too (the transfer event's bits 20:16), and that card says so.
+//! **Matched by slot AND endpoint (U2b).** EP0 and the armed bulk IN share the dongle's slot, so every
+//! completion is told apart by the transfer event's endpoint ID, and one filed by another consumer is filed
+//! by endpoint too (`EvMail::take_ep0`, `take_bulk`).
 //!
 //! A completion belonging to someone else - a keystroke - is filed in the caller's `EvMail`, as the disk
 //! path files it, so the caller re-arms that endpoint.
@@ -27,9 +28,66 @@ use gs::driver::wait::{self, Budget};
 
 use crate::msc::POLL_GRANULARITY;
 use crate::{
-    device_ctx_off, ep0_hw_dequeue, ep0_tr_off, EP0_RING_BYTES, next_event, report_off, reset_endpoint, EvMail, TRB_DATA_STAGE, TRB_LINK,
-    TRB_SETUP_STAGE, TRB_SIZE, TRB_STATUS_STAGE, TRB_TRANSFER_EVENT,
+    device_ctx_off, ep0_hw_dequeue, ep0_tr_off, EP0_RING_BYTES, int_tr_off, next_event_at, report_off, reset_endpoint, EvMail,
+    TRB_DATA_STAGE, TRB_LINK, TRB_NORMAL, TRB_SETUP_STAGE, TRB_SIZE, TRB_STATUS_STAGE, TRB_TRANSFER_EVENT,
 };
+
+/// The bulk IN ring: the second half of the slice's report page, whose first half is EP0's data stage
+/// (`usbfn::CONTROL_MAX` bytes). Its received transfer lands in the slice's interrupt-ring page, which the
+/// dongle has no interrupt endpoint to use - a data buffer, so the VL805 reading past the EP0 ring into it
+/// does no harm.
+pub const IN_RING_AT: usize = 0x800;
+pub const IN_RING_BYTES: usize = 0x800;
+const _: () = assert!(usbfn::CONTROL_MAX <= IN_RING_AT);
+const _: () = assert!(usbfn::BULK_IN_MAX <= 0x1000);
+
+/// The dongle's bulk endpoints, read from its configuration descriptor: the first bulk IN, and the bulk
+/// OUTs in descriptor order (U2c's, recorded now so the walk is done once).
+pub struct Eps {
+    pub in_addr: u8,
+    pub in_mps: u16,
+    pub outs: [u8; 3],
+    pub n_out: usize,
+    pub out_mps: u16,
+}
+
+/// Walk a configuration descriptor at `off` (`len` bytes) for its bulk endpoints. Every length is from
+/// the device and distrusted: a zero length ends the walk, and nothing is read past `len`.
+pub fn parse_eps(dma: &Dma, off: usize, len: usize) -> Eps {
+    let mut e = Eps { in_addr: 0, in_mps: 0, outs: [0; 3], n_out: 0, out_mps: 0 };
+    let mut i = 0usize;
+    while i + 2 <= len {
+        let l = dma.read8(off + i) as usize;
+        if l < 2 {
+            break;
+        }
+        if dma.read8(off + i + 1) == 5 && l >= 7 && i + 7 <= len {
+            let addr = dma.read8(off + i + 2);
+            let bulk = dma.read8(off + i + 3) & 0x3 == 2;
+            let mps = (dma.read8(off + i + 4) as u16 | (dma.read8(off + i + 5) as u16) << 8) & 0x7FF;
+            if bulk && addr & 0x80 != 0 && e.in_addr == 0 {
+                e.in_addr = addr;
+                e.in_mps = mps;
+            } else if bulk && addr & 0x80 == 0 && e.n_out < e.outs.len() {
+                e.outs[e.n_out] = addr;
+                e.n_out += 1;
+                e.out_mps = mps;
+            }
+        }
+        i += l;
+    }
+    e
+}
+
+/// The bulk IN's state: nothing armed, a transfer armed, a completed transfer held for `wifi-usb` (its
+/// length), or a failed one (its completion code) waiting for the next ask to repair the endpoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Rx {
+    Off,
+    Armed,
+    Held(usize),
+    Failed(u32),
+}
 
 /// The dongle this host binds: a Realtek RTL8188CUS, the one `wifi-usb` drives - the same pair `dwc2` binds.
 pub const VID: u16 = 0x0bda;
@@ -65,11 +123,34 @@ pub struct Radio {
     repairs: u32,
     /// Whether the controller's EP0 dequeue has been compared with `cur` yet (once per binding).
     checked: bool,
+    /// The bulk IN (U2b): its DCI (0 = not configured), packet size, ring cursor and cycle, state, and
+    /// whether a `NOTE_BULK_IN` is owed because the driver's queue refused it.
+    pub in_dci: u32,
+    in_mps: u16,
+    in_cur: usize,
+    in_pcs: u32,
+    rx: Rx,
+    note_owed: bool,
+    in_repairs: u32,
+    /// Transfers received and failed, for the log.
+    rx_frames: u32,
+    rx_failed: u32,
 }
 
 impl Radio {
     pub fn new(slot: u32, dev_idx: usize, port: u32, ids: u32) -> Self {
-        Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0, checked: false }
+        Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0, checked: false,
+                in_dci: 0, in_mps: 0, in_cur: 0, in_pcs: 1, rx: Rx::Off, note_owed: false, in_repairs: 0,
+                rx_frames: 0, rx_failed: 0 }
+    }
+
+    /// The bulk IN configured at bind (U2b), its ring zeroed there.
+    pub fn set_bulk_in(&mut self, dci: u32, mps: u16) {
+        self.in_dci = dci;
+        self.in_mps = mps;
+        self.in_cur = 0;
+        self.in_pcs = 1;
+        self.rx = Rx::Off;
     }
 
     pub fn vid(&self) -> u16 {
@@ -173,14 +254,21 @@ fn control_once(
 
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(CONTROL_MS));
     let mut unrelated = 0u32;
-    if let Some(cc) = eaten.take(r.slot) {
+    if let Some((cc, res)) = eaten.take_bulk(r.slot) {
+        bulk_done(ctx, r, cc, res);
+    }
+    if let Some(cc) = eaten.take_ep0(r.slot) {
         return finish(hc, r, data, len, data_in, cc);
     }
     loop {
-        match next_event(hc.dma, hc.mmio, hc.ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
-            Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == r.slot => return finish(hc, r, data, len, data_in, cc),
-            Some((TRB_TRANSFER_EVENT, cc, sid)) => {
-                eaten.put(sid, cc);
+        match next_event_at(hc.dma, hc.mmio, hc.ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, 1, _)) if sid == r.slot => return finish(hc, r, data, len, data_in, cc),
+            // The bulk IN completing while a control transfer waits: taken here, it is not this answer.
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) if sid == r.slot && ep == r.in_dci && r.in_dci != 0 => {
+                bulk_done(ctx, r, cc, res);
+            }
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) => {
+                eaten.put(sid, ep, cc, res);
                 unrelated += 1;
                 if unrelated >= MAX_UNRELATED {
                     return None;
@@ -350,6 +438,20 @@ pub fn serve(
         }
         return Served::Done;
     }
+    let mut radio = radio;
+    if op == usbfn::OP_BULK_IN {
+        let mut out = [0u8; 2 + usbfn::BULK_IN_MAX];
+        out[0] = op;
+        let n = match radio.as_deref_mut() {
+            None => {
+                out[1] = usbfn::ST_NO_DEVICE;
+                2
+            }
+            Some(r) => bulk_in_request(ctx, hc, r, &mut out, ev_idx, ev_cycle, cmd_idx),
+        };
+        let _ = gs::ipc::reply(ctx, reply, &Message::from_bytes(&out[..n]));
+        return Served::Done;
+    }
     let mut out = [0u8; 2 + usbfn::CONTROL_MAX];
     out[0] = op;
     let mut verdict = Served::Done;
@@ -374,7 +476,7 @@ pub fn serve(
                 }
             }
         }
-        // U2b and U2c: the bulk endpoints are not configured yet on this host.
+        // U2c: the bulk OUT is not configured yet on this host.
         (_, Some(_)) => {
             out[1] = usbfn::ST_FAILED;
             2
@@ -450,3 +552,133 @@ pub fn report_device(ctx: &ServiceContext, radio: Option<&Radio>) {
 
 /// Where the reports go: the supervisor decides which driver a device gets.
 const SUPERVISOR: &str = "supervisor";
+
+/// `OP_BULK_IN`, as `dwc2` answers it: the held transfer if there is one, then the IN armed again; nothing
+/// held is `ST_OK` with no data. A transfer that failed is repaired here (Reset Endpoint and Set TR
+/// Dequeue to the ring's start, as EP0's repair), bounded per pass. Returns the reply's length.
+#[allow(clippy::too_many_arguments)]
+fn bulk_in_request(
+    ctx: &ServiceContext, hc: &Hc, r: &mut Radio, out: &mut [u8],
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) -> usize {
+    if r.in_dci == 0 {
+        out[1] = usbfn::ST_FAILED;
+        return 2;
+    }
+    let mut n = 2;
+    match r.rx {
+        Rx::Held(len) => {
+            let buf = int_tr_off(r.dev_idx);
+            for (i, b) in out[2..2 + len].iter_mut().enumerate() {
+                *b = hc.dma.read8(buf + i);
+            }
+            n = 2 + len;
+            r.rx = Rx::Off;
+            r.note_owed = false;
+        }
+        Rx::Failed(_) => {
+            if !repair_in(ctx, hc, r, ev_idx, ev_cycle, cmd_idx) {
+                out[1] = usbfn::ST_FAILED;
+                return 2;
+            }
+            r.rx = Rx::Off;
+        }
+        Rx::Off | Rx::Armed => {}
+    }
+    if r.rx == Rx::Off {
+        arm(hc, r);
+    }
+    out[1] = usbfn::ST_OK;
+    n
+}
+
+/// Arm one bulk IN transfer of `usbfn::BULK_IN_MAX` bytes (a multiple of the packet size, so the device
+/// never sends more than fits) into the slice's interrupt-ring page. Interrupt On Completion and On Short
+/// Packet, so a transfer shorter than the buffer - every frame - completes at once. The Link is written
+/// eagerly, as EP0's is (the VL805, `control_once`).
+fn arm(hc: &Hc, r: &mut Radio) {
+    let ring = report_off(r.dev_idx) + IN_RING_AT;
+    let bp = hc.dma.phys_at(int_tr_off(r.dev_idx));
+    let t = ring + r.in_cur;
+    hc.dma.write32(t, bp as u32);
+    hc.dma.write32(t + 4, (bp >> 32) as u32);
+    hc.dma.write32(t + 8, usbfn::BULK_IN_MAX as u32);
+    hc.dma.write32(t + 12, r.in_pcs | (1 << 2) | (1 << 5) | (TRB_NORMAL << 10));
+    r.in_cur += TRB_SIZE;
+    if r.in_cur + 2 * TRB_SIZE > IN_RING_BYTES {
+        let base = hc.dma.phys_at(ring);
+        hc.dma.write32(ring + r.in_cur, base as u32);
+        hc.dma.write32(ring + r.in_cur + 4, (base >> 32) as u32);
+        hc.dma.write32(ring + r.in_cur + 8, 0);
+        hc.dma.write32(ring + r.in_cur + 12, (TRB_LINK << 10) | (1 << 1) | r.in_pcs);
+        r.in_cur = 0;
+        r.in_pcs ^= 1;
+    }
+    r.rx = Rx::Armed;
+    hc.mmio.write32(hc.dboff + r.slot as usize * 4, r.in_dci);
+}
+
+/// The bulk IN's completion, from whichever consumer dequeued it: a transfer held and `wifi-usb` told,
+/// or a failure kept for the next ask to repair. A completion with nothing armed is stray and ignored.
+pub fn bulk_done(ctx: &ServiceContext, r: &mut Radio, cc: u32, res: u32) {
+    if r.rx != Rx::Armed {
+        return;
+    }
+    if cc == 1 || cc == 13 {
+        let len = usbfn::BULK_IN_MAX.saturating_sub(res as usize);
+        r.rx = Rx::Held(len);
+        r.rx_frames = r.rx_frames.wrapping_add(1);
+        if r.rx_frames == 1 {
+            ctx.log_fmt(format_args!("xhci: the WiFi dongle's first bulk IN transfer - {} bytes (U2b)", len));
+        }
+        r.note_owed = !tell_bulk(ctx);
+    } else {
+        r.rx = Rx::Failed(cc);
+        r.rx_failed = r.rx_failed.wrapping_add(1);
+        if r.rx_failed <= 3 {
+            ctx.log_fmt(format_args!(
+                "xhci: the WiFi dongle's bulk IN transfer failed - cc={} ({} so far); repaired on the next ask",
+                cc, r.rx_failed));
+        }
+        // Told as a held transfer would be, so the driver asks - and the ask is what repairs it.
+        r.note_owed = !tell_bulk(ctx);
+    }
+}
+
+/// Once a pass: a `NOTE_BULK_IN` the driver's queue refused, sent again. Nothing is armed until the held
+/// transfer is collected, so a notice lost for good would stop receive for good.
+pub fn service(ctx: &ServiceContext, r: &mut Radio) {
+    if r.note_owed {
+        r.note_owed = !tell_bulk(ctx);
+    }
+}
+
+fn tell_bulk(ctx: &ServiceContext) -> bool {
+    let msg = Message::from_bytes(&[usbfn::NOTE_BULK_IN]);
+    gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
+        || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok())
+}
+
+/// The bulk IN after a failed transfer: its ring cleared and the endpoint reset to the ring's start
+/// (`reset_endpoint`: Reset Endpoint from Halted, then Set TR Dequeue), bounded per pass.
+fn repair_in(
+    ctx: &ServiceContext, hc: &Hc, r: &mut Radio, ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) -> bool {
+    if r.in_repairs >= MAX_REPAIRS {
+        return false;
+    }
+    r.in_repairs += 1;
+    let ring = report_off(r.dev_idx) + IN_RING_AT;
+    for off in (0..IN_RING_BYTES).step_by(4) {
+        hc.dma.write32(ring + off, 0);
+    }
+    if !reset_endpoint(
+        ctx, hc.dma, hc.mmio, hc.dboff, hc.ir0, r.slot, r.in_dci, ring, device_ctx_off(r.dev_idx), hc.ctx_size,
+        ev_idx, ev_cycle, cmd_idx,
+    ) {
+        return false;
+    }
+    r.in_cur = 0;
+    r.in_pcs = 1;
+    true
+}

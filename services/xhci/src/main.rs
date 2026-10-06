@@ -108,19 +108,58 @@ pub(crate) struct EvMail {
     /// The completion code that arrived with it, so the slot's real owner can still collect it
     /// instead of waiting out a deadline for an answer that already came and was discarded.
     cc: [u32; 32],
+    /// The same completion filed again by ENDPOINT, for a slot that has more than one in flight: the
+    /// WiFi dongle's EP0 and its armed bulk IN share a slot (U2b), and a completion for one must never
+    /// be collected as the other's. `have` keeps its meaning for every other consumer.
+    ep0_have: u32,
+    ep0_cc: [u32; 32],
+    bulk_have: u32,
+    bulk_cc: [u32; 32],
+    /// The bulk completion's residual (the transfer event's bits 23:0): what was NOT transferred.
+    bulk_res: [u32; 32],
 }
 
 impl EvMail {
     pub(crate) fn new() -> Self {
-        Self { have: 0, cc: [0; 32] }
+        Self {
+            have: 0, cc: [0; 32], ep0_have: 0, ep0_cc: [0; 32], bulk_have: 0, bulk_cc: [0; 32], bulk_res: [0; 32],
+        }
     }
 
-    /// File a completion belonging to a consumer other than the one that dequeued it.
-    pub(crate) fn put(&mut self, sid: u32, cc: u32) {
+    /// File a completion belonging to a consumer other than the one that dequeued it. `ep` is the
+    /// transfer event's endpoint ID (DCI) and `res` its residual.
+    pub(crate) fn put(&mut self, sid: u32, ep: u32, cc: u32, res: u32) {
         if sid < 32 {
             self.have |= 1 << sid;
             self.cc[sid as usize] = cc;
+            if ep == 1 {
+                self.ep0_have |= 1 << sid;
+                self.ep0_cc[sid as usize] = cc;
+            } else {
+                self.bulk_have |= 1 << sid;
+                self.bulk_cc[sid as usize] = cc;
+                self.bulk_res[sid as usize] = res;
+            }
         }
+    }
+
+    /// Collect this slot's EP0 completion, if one was filed - never an endpoint's beside it.
+    pub(crate) fn take_ep0(&mut self, sid: u32) -> Option<u32> {
+        if sid < 32 && self.ep0_have & (1 << sid) != 0 {
+            self.ep0_have &= !(1 << sid);
+            self.have &= !(1 << sid);
+            return Some(self.ep0_cc[sid as usize]);
+        }
+        None
+    }
+
+    /// Collect this slot's non-EP0 completion, if one was filed: `(completion, residual)`.
+    pub(crate) fn take_bulk(&mut self, sid: u32) -> Option<(u32, u32)> {
+        if sid < 32 && self.bulk_have & (1 << sid) != 0 {
+            self.bulk_have &= !(1 << sid);
+            return Some((self.bulk_cc[sid as usize], self.bulk_res[sid as usize]));
+        }
+        None
     }
 
     /// Collect this slot's completion if one was filed, clearing it. `None` means nothing is
@@ -212,7 +251,7 @@ pub(crate) fn ep0_hw_dequeue(
 /// One page per ring in a device's slice, so an offset at or past this is not in the EP0 ring and
 /// whatever produced it was not a dequeue pointer.
 pub(crate) const EP0_RING_BYTES: usize = 0x1000;
-fn int_tr_off(i: usize) -> usize {
+pub(crate) fn int_tr_off(i: usize) -> usize {
     DEV_BASE + i * DEV_STRIDE + 0x2000
 }
 pub(crate) fn report_off(i: usize) -> usize {
@@ -456,6 +495,52 @@ pub(crate) fn reset_endpoint(
     ctx.log_fmt(format_args!(
         "xhci: endpoint slot {} dci {} quiesced and dequeue re-pointed to the ring base - recovered",
         slot, dci));
+    true
+}
+
+/// Configure the WiFi dongle's bulk IN endpoint (U2b): one Configure Endpoint adding it, its ring in the
+/// second half of the slice's report page (`radio::IN_RING_AT`). Not the page after the EP0 ring: the
+/// VL805 reads up to four TRBs past a ring's end into the next page (`XHCI_TRB_OVERFETCH`), and a live
+/// ring there could be served from that stale read. The page after this ring is the next slice's device
+/// context, which no endpoint fetches TRBs from. The slot context is built as `bind_msc` builds it.
+#[allow(clippy::too_many_arguments)]
+fn configure_radio_in(
+    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, ctx_size: usize,
+    slot: u32, dev_idx: usize, speed: u32, route: u32, root_port: u32, in_dci: u32, mps: u16,
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) -> bool {
+    let ring = report_off(dev_idx) + radio::IN_RING_AT;
+    for i in (0..radio::IN_RING_BYTES).step_by(4) {
+        dma.write32(ring + i, 0);
+    }
+    let islot = INPUT_CTX_OFF + ctx_size;
+    clear_input_ctx(dma, ctx_size);
+    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
+    dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << in_dci));
+    dma.write32(islot, (in_dci << 27) | (speed << 20) | (route & 0xFFFFF));
+    dma.write32(islot + 4, root_port << 16);
+    dma.write32(islot + 8, 0); // a high-speed device: no transaction translator
+    let rp = dma.phys_at(ring);
+    let iep = INPUT_CTX_OFF + (1 + in_dci as usize) * ctx_size;
+    dma.write32(iep, 0);
+    dma.write32(iep + 4, (3 << 1) | (6 << 3) | ((mps as u32) << 16)); // CErr 3, bulk IN (6)
+    dma.write32(iep + 8, (rp as u32 & !0xF) | 1);
+    dma.write32(iep + 12, (rp >> 32) as u32);
+    dma.write32(iep + 16, mps as u32);
+    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let ce = run_command(
+        ctx, dma, mmio, dboff, ir0, cmd_off, in_phys as u32, (in_phys >> 32) as u32, 0,
+        (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24) | 1, ev_idx, ev_cycle,
+    )
+    .map(|(c, _)| c)
+    .unwrap_or(0);
+    if ce != 1 {
+        ctx.log_fmt(format_args!(
+            "xhci: the WiFi dongle's bulk IN Configure Endpoint failed (completion={}) - receive will not start", ce));
+        return false;
+    }
     true
 }
 
@@ -833,7 +918,7 @@ pub(crate) fn next_event_at(
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     max_tries: u32,
-) -> Option<(u32, u32, u32, u64)> {
+) -> Option<(u32, u32, u32, u64, u32, u32)> {
     let mut tries = 0u32;
     while tries < max_tries {
         tries += 1;
@@ -844,6 +929,10 @@ pub(crate) fn next_event_at(
         }
         let trb_type = (ctrl >> 10) & 0x3F;
         let completion = dma.read32(off + 8) >> 24;
+        // A transfer event's residual (bits 23:0) and endpoint ID (bits 20:16 of the control word):
+        // which endpoint of the slot completed, and how much of its TD did not transfer (U2b).
+        let residual = dma.read32(off + 8) & 0x00FF_FFFF;
+        let ep_id = (ctrl >> 16) & 0x1F;
         let slot_id = (ctrl >> 24) & 0xFF;
         let ptr = (dma.read32(off) as u64) | ((dma.read32(off + 4) as u64) << 32);
         *ev_idx += 1;
@@ -856,7 +945,7 @@ pub(crate) fn next_event_at(
             ir0 + 0x18,
             dma.phys_at(EVENT_RING_OFF + *ev_idx * TRB_SIZE) | (1 << 3),
         );
-        return Some((trb_type, completion, slot_id, ptr));
+        return Some((trb_type, completion, slot_id, ptr, ep_id, residual));
     }
     None
 }
@@ -871,7 +960,7 @@ pub(crate) fn next_event(
     ev_cycle: &mut u32,
     max_tries: u32,
 ) -> Option<(u32, u32, u32)> {
-    next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, max_tries).map(|(t, c, s, _)| (t, c, s))
+    next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, max_tries).map(|(t, c, s, _, _, _)| (t, c, s))
 }
 
 /// Issue a command TRB and wait for its Command Completion Event, skipping any
@@ -1182,7 +1271,7 @@ fn hub_port_status(
             // that port's answer, read as this one's. A connected disk reported DISCONNECTED twice
             // running and was dropped; the two-consecutive-reads guard could not help, because two
             // misattributed answers are no harder to get than one.
-            Some((TRB_TRANSFER_EVENT, cc, sid, ptr)) if sid == hub_slot && ptr == want_trb => {
+            Some((TRB_TRANSFER_EVENT, cc, sid, ptr, _, _)) if sid == hub_slot && ptr == want_trb => {
                 if cc == 1 || cc == 13 {
                     return Some(dma.read16(PROBE_BUF_OFF) & 1 != 0); // wPortStatus bit0 = connect
                 }
@@ -1242,8 +1331,8 @@ fn hub_port_status(
             //     port's answer, buffer and all, which is the misattribution being fixed.
             // Both are handled the same way: record the slot so the caller re-arms that endpoint,
             // and do not treat it as an answer to the question actually asked.
-            Some((TRB_TRANSFER_EVENT, cc, sid, _)) => {
-                eaten.put(sid, cc);
+            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) => {
+                eaten.put(sid, ep, cc, res);
                 // ABANDON THE PROBE and let the caller deliver the keystroke NOW.
                 //
                 // This used to keep waiting for its own event, so a key pressed during a probe sat
@@ -1693,7 +1782,24 @@ fn read_config_and_bind(
                 for i in (radio::EP0_RUNTIME_START..0x1000).step_by(4) {
                     dma.write32(ep0_tr_off(dev_idx) + i, 0);
                 }
-                return (None, None, Some(radio::Radio::new(slot, dev_idx, port, ids)), cfg_val);
+                let mut r = radio::Radio::new(slot, dev_idx, port, ids);
+                // U2b: its bulk IN, found in the configuration descriptor read above and configured, so
+                // frames can be received. Bound either way: `wifi-usb` reaches the chip over EP0 without
+                // it, and says itself that receive did not start.
+                let eps = radio::parse_eps(dma, CONFIG_BUF_OFF, 64);
+                if eps.in_addr == 0 {
+                    ctx.log("xhci: the WiFi dongle's configuration names no bulk IN - receive will not start");
+                } else {
+                    let in_dci = (eps.in_addr & 0xF) as u32 * 2 + 1;
+                    if configure_radio_in(ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, route,
+                                          root_port, in_dci, eps.in_mps, ev_idx, ev_cycle, cmd_idx) {
+                        r.set_bulk_in(in_dci, eps.in_mps);
+                        ctx.log_fmt(format_args!(
+                            "xhci: the WiFi dongle's bulk IN {:#04x} configured (DCI {}, mps {}) - receive ready (U2b)",
+                            eps.in_addr, in_dci, eps.in_mps));
+                    }
+                }
+                return (None, None, Some(r), cfg_val);
             }
             ctx.log_fmt(format_args!(
                 "xhci: the WiFi dongle on port {} (slot {}) did not take Set Configuration - not bound", port, slot));
@@ -4578,9 +4684,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     ctx.log("xhci: event drain hit its bound - the controller is posting faster than we retire (storm?)");
                     break;
                 }
-                match next_event(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1) {
-                    Some((TRB_TRANSFER_EVENT, cc, slot_id)) => {
-                        if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
+                match next_event_at(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1) {
+                    Some((TRB_TRANSFER_EVENT, cc, slot_id, _, ep, res)) => {
+                        if let Some(r) = radio.as_mut().filter(|r| r.slot == slot_id) {
+                            // The WiFi dongle's armed bulk IN completing (U2b). An EP0 completion here
+                            // is a late answer to a control transfer already given up on: dropped.
+                            if ep == r.in_dci && r.in_dci != 0 {
+                                radio::bulk_done(&ctx, r, cc, res);
+                            }
+                        } else if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
                             deliver_hid_report(&ctx, &dma, d, &devs, &mut kb_last,
                                                &mut kb_rep, &mut kb_caps, &mut mouse);
                             if !irq_this_pass { hid_needs_poll = true; }   // harvested without an interrupt: polling is load-bearing here
@@ -4591,7 +4703,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // the next probe for this hub can recognise it as the stale answer to
                             // the previous question and resynchronise instead of queueing a second
                             // TD behind an unretired one.
-                            eaten.put(slot_id, cc);
+                            eaten.put(slot_id, ep, cc, res);
                             // A completion for a HUB, found by the drain - so it arrived with no
                             // probe waiting for it, i.e. AFTER the probe that asked gave up. This is
                             // the answer to a question we already abandoned, and we are about to
@@ -5225,6 +5337,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     disk_hub_cur = cur;
                     disk_hub_pcs = pcs;
                 }
+            }
+            // The dongle's bulk IN: a completion another consumer dequeued and filed this pass, and a
+            // `NOTE_BULK_IN` its driver's queue refused, sent again (U2b).
+            if let Some(r) = radio.as_mut() {
+                if let Some((cc, res)) = eaten.take_bulk(r.slot) {
+                    radio::bulk_done(&ctx, r, cc, res);
+                }
+                radio::service(&ctx, r);
             }
             if disk_gone {
                 // Drop it and re-scan. The filesystem above sees its next request fail and
