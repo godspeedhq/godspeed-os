@@ -167,7 +167,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
         };
         // No cap to send, or sending it failed: still ANSWER, so the caller is never left waiting
         // on a reply that is not coming (invariant 12). It gets the status alone.
-        if !sent { let _ = ctx.try_send_by_handle(reply_cap, &msg); }
+        if !sent { let _ = try_send_slot(ctx, reply_cap, &msg); }
         ctx.remove_cap(reply_cap);
     }
     true
@@ -1273,6 +1273,13 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r:
     }
 }
 
+/// The supervisor's one non-blocking send on a capability it holds in hand - a reply capability, or a
+/// service's cap from the name map. One site, because the supervisor reaches the SDK directly: `gs` can
+/// only send on a `Cap` it granted itself, and these slots come from the map (scripts/one_way_check.py).
+fn try_send_slot(ctx: &ServiceContext, cap: CapHandle, msg: &Message) -> bool {
+    ctx.try_send_by_handle(cap, msg).is_ok()
+}
+
 /// Ask every reporting USB host for its report (`usbdev::ASK`): how a supervisor that has just started -
 /// at boot, or respawned by the kernel (6.2) - learns which devices are attached. No reply: the answer is
 /// the host's ordinary report, read by the main loop. A host not in the map yet is skipped; it reports on
@@ -1281,7 +1288,7 @@ fn ask_usb_hosts(ctx: &ServiceContext, map: &NameCapMap) {
     let msg = Message::from_bytes(&[usbdev::ASK]);
     for h in USB_HOSTS {
         if let Some(slot) = map.get(h) {
-            if ctx.try_send_by_handle(CapHandle(slot), &msg).is_err() {
+            if !try_send_slot(ctx, CapHandle(slot), &msg) {
                 ctx.log_fmt(format_args!("supervisor: could not ask {} for its USB devices", h));
             }
         }
