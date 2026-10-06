@@ -623,7 +623,7 @@ the heartbeat `tx - 26 frames 1924 bytes, 0 failed` - 74 bytes a frame, the 32-b
 42-byte probe request; 15 probe responses addressed to the dongle; 20 and 18 networks. The first transmit is
 done: the frame is built right, the host sends it, it reaches the air, and the host now says so.
 
-## 12. R5b (2026-10-06): authentication and association - built, NOT YET RUN
+## 12. R5b (2026-10-06): authentication and association - hardware-verified on the Pi 2
 
 The join up to the keys. R5c is the WPA2 four-way handshake, whose runner already exists and is every
 radio's (`godspeed_wifi::supplicant`); R5b is what comes before it, and it is the first exchange with ONE
@@ -681,3 +681,20 @@ find's receive); `no authentication answer` (the unicast frame not reaching it, 
 us: `REG_MACID`, `REG_BSSID`, or the chip not acknowledging); a refusal with a status code, which names the
 reason itself (17 is the access point full, 18 rates, 40 to 46 the RSN element); or the prompt stalling
 during a join longer than a few seconds.
+
+**Result (2026-10-06, `build/kernel7-R5b.img`): passed, three times.** The auto-join at boot and two `wifi
+join`s each found the network on channel 1 (-40 to -48 dBm, WPA2 with CCMP), were AUTHENTICATED (Open
+System, status 0) about 50 ms after the request, and ASSOCIATED with association ID 1, then left. Each join
+took about 1.2 s, most of it the find's thirteen 60 ms dwells.
+
+**The association answer came late twice.** In two of the three joins it arrived about 220 ms after the
+first request, just past the 200 ms window. So the second request went out, and its answer was the one taken.
+In the other join it came 9 ms after the request. Either the access point is slow to answer some
+associations, or the first answer was missed; the log cannot tell which. Three tries cover it as they cover
+it for mac80211.
+
+**Every frame is accounted for.** The heartbeat before the third join read `tx - 46 frames ... 0 failed`.
+That is 17 for the boot join (13 probes, the authentication, two association requests, the
+deauthentication), 13 for a `wifi scan` between the joins, and 16 for the second join, whose association
+answered first time. The shell's `wifi leave` between joins answered `nothing to leave - not joined`, which
+is true.
