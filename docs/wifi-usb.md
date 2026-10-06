@@ -60,6 +60,13 @@ driver asks `OP_INFO`. It is what lets the driver block rather than poll (sectio
 | **R6** | data frames both ways through `nic-driver`: DHCP and ping |
 | **R7** | rekeys |
 
+**Until R4, the shell's `wifi` does not see the dongle.** `wifi` asks `wifi-driver` by name and nothing
+else (`cmd_wifi`, `slot_of(ctx, WIFI_DRIVER)`), so on the Pi 2 it answers "no wireless radio on this
+machine" with the dongle bound, the firmware running and channel 1 tuned (seen on the R2c card,
+2026-10-06). That is a gap, not a fault: `wifi-usb` is not a `Station` yet and has nothing to answer
+with. R4 is where it closes - the shell must find whichever radio service is up, which is also what
+makes "never" wrong on the T630 and the Wyse once U2 lets a dongle reach them.
+
 The register-level sequences for R1 and R2 - the power-on, the efuse map, the firmware header and download -
 are taken from Linux's `rtl8xxxu` and `rtlwifi`, with rtlwifi's differences noted where they disagree
 (26.14: the silicon's requirement, not their model).
@@ -265,7 +272,7 @@ host its board has.
 the VisionFive and both PCs, hardware-verified on all four, and the dongle path cannot be shown in QEMU. It
 is a card per board with the operator present.
 
-## 8. R3a (2026-10-05): the MAC, the baseband and the RF, tuned to one channel - built, NOT YET RUN
+## 8. R3a (2026-10-05): the MAC, the baseband and the RF, tuned to one channel - hardware-verified on the Pi 2
 
 R3 is two cards. **R3a** is everything `rtl8xxxu_init_device` does after the firmware that bears on
 receiving, `rtl8xxxu_start`'s RF enable, filters and gain, and `rtl8xxxu_gen1_config_channel` for channel 1
@@ -295,6 +302,11 @@ thermal meter.
 path - the one register that only a working RF serial interface can answer - and its channel field must read
 1. Prediction, after R2's lines: `MAC, baseband and RF set up in ... ms (137 RF registers); RF_MODE_AG reads
 0x.....  - channel 1, as asked`. A wrong channel, or all ones, says the RF path is not answering.
+
+**What the Pi 2 showed (2026-10-05), as predicted:** `MAC, baseband and RF set up in 1498 ms (137 RF
+registers); RF_MODE_AG reads 0x07401 - channel 1, as asked`. The low byte, 0x01, is the channel; the
+rest is the band and bandwidth field the table loaded. Repeated after every clean download since,
+including the R2c card's boot (2026-10-06).
 
 ## 9. R3b, the half that needs no hardware (2026-10-05): reading what the chip hands up - host-tested, no card
 

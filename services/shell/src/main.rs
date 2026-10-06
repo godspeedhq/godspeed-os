@@ -8207,8 +8207,10 @@ const WIFI_DRIVER: &str = "wifi-driver";
 /// the driver says one is needed. The vocabulary lives once, in `wifi_wire`.
 ///
 /// **On three of the five machines the absence line is not a stub, it is the answer.** The T630 and the
-/// Wyse have no radio and never will, so "no wireless radio on this machine" is final there. That is why
-/// the absence path was built first rather than last: it is the only part that is correct on every board.
+/// Wyse have no onboard radio, so "no wireless radio on this machine" is the answer there - until a USB
+/// dongle's driver, `wifi-usb`, can answer too (`docs/wifi-usb.md` 3: today this asks `wifi-driver` only,
+/// so it says the same on a Pi 2 with a dongle up). That is why the absence path was built first rather
+/// than last: it is the only part that is correct on every board.
 ///
 /// **Absence is told apart from a wedge**, because `utilities/56_wifi.md` section 5 says the user's
 /// real question is whose fault it is. `slot_of` - the same introspection `caps` uses - answers it: no
