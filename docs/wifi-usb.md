@@ -773,7 +773,7 @@ its first call and then waits an iteration count shorter than the RNG's warm-up,
 boot always comes back empty. Its comment also says its output is "not fed to crypto", which the shared
 supplicant now does. That is `backlog/76`, a kernel change left for the operator's go-ahead.
 
-## 14. R6 (2026-10-06): data both ways - DHCP and ping over the dongle - built, NOT YET RUN
+## 14. R6 (2026-10-06): data both ways - DHCP and ping over the dongle - hardware-verified on the Pi 2
 
 R5c left a joined link that carried nothing. R6 makes it carry the stack's frames. It has three parts, one in
 each service the frames pass through.
@@ -832,3 +832,41 @@ length has no FCS in it. Nothing used the claim, and the MIC trim depends on the
 - Replies that arrive but fail their checksums or come up 8 bytes short: the MIC trim, which would mean
   the chip does not append the MIC for CCMP after all.
 - `nic-driver` never switching to the radio: the cable read, or the STATUS answer.
+
+**Result (2026-10-06, `build/kernel7-R6.img` with replay protection): DHCP and ping over the dongle.** The
+auto-join reached JOINED, and 50 ms later `nic-driver: the cable is out - the radio carries the link`. Then
+`the FIRST data frame sent ... encrypted by the chip (CCMP)` and, 15 ms after it, `the FIRST data frame
+through the link - ethertype 0x0800, 320 bytes, decrypted by the chip`: the DHCP offer. The lease was ACKed
+8 ms after the offer; `net` read `link up via wifi (the cable is out)`, an address, the gateway and
+`lease ok (DHCP)`. `ping 8.8.8.8`: four sent, four received, 18 to 32 ms. No replay was flagged, no frame
+was left undecrypted, and the dongle's transmit count read 28 frames with 0 failed.
+
+**Smaller things, recorded.**
+- At boot `nic-driver` asked the radio twice before `wifi-usb` had brought the chip up, got no answer
+  within 100 ms, and backed off as `radio.rs` is built to.
+- Right after the join, one 286-byte frame came back `the radio did not send` while the dongle counted no
+  failure. That is `nic-driver`'s 100 ms bound passing while `wifi-usb` was busy, not a transmit that
+  failed. DHCP completed regardless.
+
+**The link then dropped, and the cause was `wifi radio off`.** The serve loop every radio shares leaves the
+network first (disassociate, forget the keys) and only then asks the radio to go down. The dongle refused,
+because it could not yet, and the shell said `the radio did not take the power command`. But the station had
+already left, so the next `net` read `the radio is not joined`. Nothing broke. The sentence was the problem:
+it said "nothing happened" about an off that had happened halfway.
+
+## 15. R6b (2026-10-06): `wifi radio off` and `on` for the dongle - built, NOT YET RUN
+
+So the off now completes. `rtl8188::radio_off` is what `rtl8xxxu_stop` does to the chip: transmit paused,
+the management and data receive filters closed, then `rtl8xxxu_gen1_disable_rf` for its one path (the RF
+parameter word's path bits, the transmit paths, the power-saving bit, the CCA wait, RF register 0 to zero,
+the regulator bits). `radio_on` is what `rtl8xxxu_start` does after it: `enable_rf` (R3a's, which also
+unpauses transmit), the filters open, and the channel the dongle rests on. `is_up` reports which. The
+host's bulk IN stays armed; with the filters closed the chip hands it nothing.
+
+**Prediction:** after a join and a lease as in R6, `wifi radio off` logs `radio off - transmit paused,
+receive filters closed, the RF module down` and the shell says the radio is off. `wifi status` shows the
+radio off. `wifi radio on` logs `radio on - RF up, receive filters open`, and the serve loop rejoins the
+network last joined (R5c's lines again), `nic-driver` switches back to the radio, `net-stack` takes a
+lease, and `ping` answers. **Refuted by:** `radio off did not complete`, a rejoin that never reaches JOINED
+after `on` (the RF not back, or the receive filters still closed), or no lease after a JOINED (the link
+switch back).

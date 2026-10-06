@@ -493,6 +493,40 @@ fn lc_calibrate(ctx: &ServiceContext) -> Result<(), &'static str> {
     write8(ctx, REG_TXPAUSE, 0x00)
 }
 
+/// `wifi radio off` (R6b): `rtl8xxxu_stop`'s writes to the chip - transmit paused, the management and data
+/// receive filters closed - then `rtl8xxxu_gen1_disable_rf` for its one path. The host's bulk IN stays
+/// armed; with the filters closed the chip hands it nothing.
+pub fn radio_off(ctx: &ServiceContext) -> Result<(), &'static str> {
+    write8(ctx, REG_TXPAUSE, 0xFF)?;
+    write16(ctx, REG_RXFLTMAP0, 0x0000)?;
+    write16(ctx, REG_RXFLTMAP2, 0x0000)?;
+    write8(ctx, REG_TXPAUSE, 0xFF)?;
+    disable_rf(ctx)
+}
+
+/// `wifi radio on` (R6b): what `rtl8xxxu_start` does after `radio_off` undid it - the RF enabled
+/// (`enable_rf`, which also unpauses transmit) and the receive filters open again - and the channel the
+/// dongle rests on tuned.
+pub fn radio_on(ctx: &ServiceContext, channel: u8) -> Result<(), &'static str> {
+    enable_rf(ctx)?;
+    write16(ctx, REG_RXFLTMAP2, 0xFFFF)?;
+    write16(ctx, REG_RXFLTMAP0, 0xFFFF)?;
+    set_channel(ctx, channel)
+}
+
+/// `rtl8xxxu_gen1_disable_rf`, one RF path: the RF parameter word's path A bits cleared, every transmit path
+/// off, Japan mode on (the power saving bit), the CCA wait with the AFE's power-down bits clear, RF register
+/// 0 to zero (the RF module down), and the regulator bits off.
+fn disable_rf(ctx: &ServiceContext) -> Result<(), &'static str> {
+    let sps0 = read8(ctx, REG_SPS0_CTRL)?;
+    set32(ctx, REG_FPGA0_XAB_RF_PARM, 0, (1 << 3) | (1 << 4) | (1 << 5))?;
+    set32(ctx, REG_OFDM0_TRX_PATH_ENABLE, 0, 0xF0)?;
+    set32(ctx, REG_FPGA0_RF_MODE, 1 << 1, 0)?;
+    write32(ctx, REG_RX_WAIT_CCA, 0x001B_25A0)?;
+    write_rf(ctx, RF_AC, 0)?;
+    write8(ctx, REG_SPS0_CTRL, sps0 & !0x09)
+}
+
 /// `rtl8xxxu_gen1_enable_rf`: the regulator, the RF parameter word, path A as the transmit path, Japan mode
 /// off, the CCA wait, and RF register 0 into its receive mode.
 fn enable_rf(ctx: &ServiceContext) -> Result<(), &'static str> {

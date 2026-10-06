@@ -124,6 +124,8 @@ pub struct Dongle<'l> {
     /// The next CAM entry a key goes into: Linux takes the first free one, so the pairwise key is 0 and the
     /// group key 1 on a fresh join; and how many are in, to empty them on leaving.
     cam_next: u8,
+    /// `wifi radio off` took (R6b): the RF is down and the receive filters closed.
+    off: bool,
 }
 
 /// Where a sweep is: the channel tuned now, and when it was tuned.
@@ -137,7 +139,7 @@ impl<'l> Dongle<'l> {
         Dongle {
             link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
-            assoc: None, keys: None, cam_next: 0,
+            assoc: None, keys: None, cam_next: 0, off: false,
         }
     }
 
@@ -553,18 +555,42 @@ impl Station for Dongle<'_> {
         true
     }
 
+    /// `wifi radio off`. The serve loop has already left the network (it disassociates first); this takes
+    /// the radio itself down (`rtl8188::radio_off`, R6b). Until R6b this was refused while the leave still
+    /// happened - so the shell said the power command did not take on a station that had in fact left.
     fn radio_down(&mut self, ctx: &ServiceContext) -> bool {
-        ctx.log("wifi-usb: `wifi radio off` for this dongle is not built yet - its receive stays on");
-        false
+        self.sweep = None;
+        match rtl8188::radio_off(ctx) {
+            Ok(()) => {
+                self.off = true;
+                ctx.log("wifi-usb: radio off - transmit paused, receive filters closed, the RF module down");
+                true
+            }
+            Err(why) => {
+                ctx.log_fmt(format_args!("wifi-usb: radio off did not complete - {}", why));
+                false
+            }
+        }
     }
 
-    fn radio_up(&mut self, _ctx: &ServiceContext) -> bool {
-        // It is never taken down (above), so it is up.
-        true
+    /// `wifi radio on`: the RF back up and receive open, on the channel the dongle rests on; the serve loop
+    /// then rejoins the network last joined.
+    fn radio_up(&mut self, ctx: &ServiceContext) -> bool {
+        match rtl8188::radio_on(ctx, self.home) {
+            Ok(()) => {
+                self.off = false;
+                ctx.log("wifi-usb: radio on - RF up, receive filters open");
+                true
+            }
+            Err(why) => {
+                ctx.log_fmt(format_args!("wifi-usb: radio on did not complete - {}", why));
+                false
+            }
+        }
     }
 
     fn is_up(&mut self, _ctx: &ServiceContext) -> Option<bool> {
-        Some(true)
+        Some(!self.off)
     }
 
     fn link(&mut self, _ctx: &ServiceContext) -> Option<Link> {
