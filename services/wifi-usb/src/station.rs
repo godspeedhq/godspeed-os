@@ -126,6 +126,14 @@ pub struct Dongle<'l> {
     cam_next: u8,
     /// `wifi radio off` took (R6b): the RF is down and the receive filters closed.
     off: bool,
+    /// The group key in each key-id slot, as installed - kept ONLY to refuse a reinstall of the same key,
+    /// the group half of the KRACK attack: an access point, or someone replaying its frames, sending a
+    /// group key the station already holds would, reinstalled, reset that key's replay counter. wpa_supplicant
+    /// skips such a reinstall; so does this. Zeroed when the station leaves.
+    gtk: [Option<[u8; 16]>; 4],
+    /// The last `install_key` for a group key found it already installed; its `group_rsc` must not lower
+    /// the counter.
+    gtk_reinstall: bool,
 }
 
 /// Where a sweep is: the channel tuned now, and when it was tuned.
@@ -139,7 +147,7 @@ impl<'l> Dongle<'l> {
         Dongle {
             link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
-            assoc: None, keys: None, cam_next: 0, off: false,
+            assoc: None, keys: None, cam_next: 0, off: false, gtk: [None; 4], gtk_reinstall: false,
         }
     }
 
@@ -266,6 +274,12 @@ impl<'l> Dongle<'l> {
     /// The keys out: the kept ones zeroed (`supplicant::forget`) and every CAM entry this join filled emptied.
     fn drop_keys(&mut self, ctx: &ServiceContext) {
         supplicant::forget(&mut self.keys);
+        for g in self.gtk.iter_mut() {
+            if let Some(k) = g.as_mut() {
+                k.fill(0);
+            }
+            *g = None;
+        }
         for e in 0..self.cam_next {
             let _ = rtl8188::clear_key(ctx, e);
         }
@@ -719,10 +733,23 @@ impl KeyPath for Dongle<'_> {
             Some(p) => (*p, false),
             None => (a.bssid, true),
         };
+        let slot = key_idx as usize & 3;
+        self.gtk_reinstall = false;
+        if group && self.gtk[slot] == Some(*key) {
+            // THE SAME GROUP KEY AGAIN: not reinstalled, and its counter not reset (`group_rsc` below).
+            self.gtk_reinstall = true;
+            ctx.log_fmt(format_args!(
+                "wifi-usb: group key {} is the one already installed - not reinstalled, its replay counter kept (KRACK)",
+                key_idx));
+            return true;
+        }
         let entry = self.cam_next;
         match rtl8188::install_key(ctx, entry, key_idx as u8, key, &mac, group) {
             Ok(()) => {
                 self.cam_next += 1;
+                if group {
+                    self.gtk[slot] = Some(*key);
+                }
                 ctx.log_fmt(format_args!(
                     "wifi-usb: {} key {} in CAM entry {}", if group { "group" } else { "pairwise" }, key_idx, entry));
                 true
@@ -736,8 +763,17 @@ impl KeyPath for Dongle<'_> {
 
     /// The group key's starting packet number (its Key RSC) into the receive side's replay counter: this
     /// host checks replay, because the chip does not (`rx::Link`).
+    ///
+    /// For a key just installed the counter is SET to the RSC; for a key already held it is never lowered.
+    /// No frame can be taken between the install and this: both run in one call of the supplicant on this
+    /// one thread, and a join's data frames are not taken until it completes.
     fn group_rsc(&mut self, key_idx: u32, rsc: u64, ctx: &ServiceContext) {
-        self.link.borrow_mut().group_rsc(key_idx, rsc);
+        let mut l = self.link.borrow_mut();
+        if self.gtk_reinstall {
+            l.group_rsc_at_least(key_idx, rsc);
+            return;
+        }
+        l.group_rsc(key_idx, rsc);
         ctx.log_fmt(format_args!("wifi-usb: group key {} accepts packet numbers above {} (its Key RSC)", key_idx, rsc));
     }
 }

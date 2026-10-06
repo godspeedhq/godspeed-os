@@ -84,6 +84,12 @@ impl Link {
         self.group_pn[key_id as usize & 3] = rsc;
     }
 
+    /// The same, for a key already held: the counter only ever rises (no KRACK-style reset).
+    pub fn group_rsc_at_least(&mut self, key_id: u32, rsc: u64) {
+        let k = key_id as usize & 3;
+        self.group_pn[k] = self.group_pn[k].max(rsc);
+    }
+
     /// A join completed: take its network's frames from now, with nothing left queued from before. The
     /// replay counters stand as the join set them.
     pub fn joined(&mut self, bssid: [u8; 6]) {

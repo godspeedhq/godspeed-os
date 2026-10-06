@@ -822,6 +822,13 @@ nothing by default, which is right for the Broadcom and the AIC8800, whose firmw
 The dongle seeds that key id's counter from it. The counters are zeroed when a join STARTS, so the seeding
 is not undone when the join completes. The log says `group key n accepts packet numbers above N`.
 
+**And a group key is never reinstalled (a third review).** That makes the counter seeding the group half of
+KRACK: a group-key message carrying a key the station already holds would, reinstalled, set the counter back.
+The dongle keeps each slot's installed group key for exactly this comparison. The same key again is not
+written to the CAM, and its counter is only ever raised (`Link::group_rsc_at_least`), as wpa_supplicant
+skips such a reinstall. The kept keys are zeroed when the station leaves. No frame can be taken between an
+install and its seeding, because both run in one supplicant call on one thread.
+
 **A comment that was wrong, corrected.** `rtl_rx::Desc::pkt_len` said "FCS included". The chip's `RCR`
 appends the PHY status, the ICV and the MIC (bits 28 to 30, as Linux sets them), not the FCS (bit 31), so the
 length has no FCS in it. Nothing used the claim, and the MIC trim depends on the truth of it.
