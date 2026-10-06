@@ -1326,7 +1326,7 @@ declined`.
 - **But slower.** To the gateway: 32 bytes average 16 ms (min 10) against R12a's 9 (min 4); 1024 bytes
   average 30 ms (min 26) against R8's 13 (min 8). `ping 8.8.8.8` 5 of 6, average 40 ms against 25.
 
-## 24. R12c (2026-10-06): the two-stream rates out of a one-transmitter chip's mask - built, not yet run
+## 24. R12c (2026-10-06): the two-stream rates out of a one-transmitter chip's mask - hardware-verified on the Pi 2
 
 **The suspect, from the run above.** The mask was `0x0fffffff`: the access point receives two streams
 (`0xff/0xff`), so MCS 8-15 went in beside MCS 0-7, exactly as `rtl8xxxu` builds it. This dongle has one
@@ -1342,3 +1342,17 @@ interval, so the result points at the mask alone.
 around 10 ms, and 1024 bytes within a few ms of it.
 
 **Refuted by:** the same slowness. Then the short guard interval is the next suspect, on its own card.
+
+**The R12c card's run (2026-10-06): confirmed - the mask was the cause.** `rate mask 0x000fffff, short GI`,
+the ADDBA declined as before. To the gateway: 32 bytes average 9-10 ms (min 4), 1024 bytes average 12 ms
+(min 9), so the large ping is now about 2-3 ms over the small one, against 3-4 ms at R8's legacy rates.
+`ping 8.8.8.8` 6 of 6, average 25 ms. The short guard interval stays: with the mask right it costs nothing
+measurable.
+
+**Where the dongle stands on the Pi 2.** A full station: scan, WPA2 with replay and KRACK protection, DHCP
+and ping, the firmware's rate adaptation over 802.11n MCS 0-7 with short GI on a WMM association,
+calibrated transmit power, radio off and on, hard off and power cycle by the chip's own power-down,
+hot-plug, restarts with the reply mailbox kept, chaos. **Two things remain unseen, both waiting on events
+nothing here can cause:** the access point's group rekey (R7, on its timer, often hourly), and `dwc2`'s
+STATUS-stage retry on a replug that happens to hit a transient error (R2c's replug case). Each is built
+and will say so in the log the first time it happens.
