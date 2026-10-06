@@ -1404,7 +1404,7 @@ nothing here can cause:** the access point's group rekey (R7, on its timer, ofte
 STATUS-stage retry on a replug that happens to hit a transient error (R2c's replug case). Each is built
 and will say so in the log the first time it happens.
 
-## 25. U2a (2026-10-06): the dongle behind `xhci` - bound, identified, brought up to the channel - built, not yet run
+## 25. U2a (2026-10-06): the dongle behind `xhci` - bound, identified, brought up to the channel - hardware-verified on the T630
 
 Section 7's design, first card, on the T630 (no onboard radio, so nothing to choose between yet;
 `utilities/56_wifi.md` 11 has the choosing for a board with both).
@@ -1478,3 +1478,26 @@ survives the reset is not known. That is hot-plug, a later card.
   explains it: no `ehci` event, nothing sent to the dongle. It is NOT diagnosed. The next run logs the
   whole `PORTSC` when the bound dongle's port reads empty, so it can be read rather than guessed (a real
   detach, or a link state).
+
+**The U2a card's second run (T630, 2026-10-06): as predicted, to the line.**
+- `wifi-usb: xhci has bound a radio at 0bda:8176`: the host was reacquired by name.
+- `SYS_CFG` and `ISO_CTRL` were read through `xhci` and the chip decoded, then `U1 done`; the efuse with
+  the dongle's MAC.
+- The MAC cold, `powered on in 7 ms` (R1); the transmit queues; the firmware verified and downloaded in
+  126 blocks, each sent once (`OP_CONTROL_ONCE`), in one try, then `RUNNING` (R2).
+- The MAC, baseband and RF tables, channel 1 read back from the RF chip (`R3a done`), the station
+  address, and the transmit power from the efuse written and read back (`R11 done`).
+- Then `receive did not start - the host has no bulk IN for this dongle`, U2b's work, where the card was
+  meant to stop.
+
+Every register access in that bring-up was a control transfer through `radio.rs`, in both directions. On
+the same dongle `xhci` was about twice as fast as `dwc2`:
+
+| Step | `xhci` (T630) | `dwc2` (Pi 2) |
+|---|---|---|
+| efuse | 487 ms | about 1200 ms |
+| firmware | 71 ms | 146 ms |
+| MAC, baseband and RF tables | 778 ms | about 1500 ms |
+
+The log ends a second after the bring-up, so it cannot say whether the first run's port drop recurs; the
+`PORTSC` line is in place for a longer run.
