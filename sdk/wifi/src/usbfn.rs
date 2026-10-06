@@ -23,6 +23,21 @@ pub const OP_CONTROL: u8 = 0x21;
 /// reported (seen on a Pi 2 replug, R2). Linux sends each block once and restarts the whole download on a
 /// failure (`rtl8xxxu_download_firmware`'s `-EAGAIN`), which needs the failure to be seen.
 pub const OP_CONTROL_ONCE: u8 = 0x22;
+/// `[op]` -> `[op, status, transfer...]`: the bulk IN transfer the host has taken from the radio, if it holds
+/// one, and the host's IN armed again; `ST_OK` with no bytes when it holds none, which also arms the IN if it
+/// was not armed - so the driver's first ask, once the chip's receive is set up, is what starts receiving.
+/// The host keeps one IN armed in the background and takes its completion on the USB interrupt, then sends
+/// `NOTE_BULK_IN`; it does not arm again until the transfer is collected, so the chip holds what arrives
+/// meanwhile and nothing is dropped between the two. `ST_FAILED` when the radio has no bulk IN endpoint.
+pub const OP_BULK_IN: u8 = 0x23;
+
+/// `[NOTE_BULK_IN]`, sent BY the host TO the driver, no reply expected: a bulk IN transfer is held, ask
+/// `OP_BULK_IN`. Sent with `try_send`; one the driver's full queue refused is sent again on the host's next
+/// pass, because the host arms nothing until the transfer is collected and a lost notice would stop receive.
+pub const NOTE_BULK_IN: u8 = 0x2E;
+
+// 0x29 is NOT free in this range: `dwc2` receives the USB interrupt as the one-byte message `[0x29]`, told
+// apart from a request only by carrying no reply cap, so no op may take that value.
 
 /// `[NOTE_RADIO]`, sent BY the host TO the driver, with no reply expected: the radio's binding changed -
 /// a dongle was bound or removed - so ask `OP_INFO`. The host sends it with `try_send`, so it never blocks
@@ -43,3 +58,12 @@ pub const ST_BAD_REQUEST: u8 = 3;
 /// The most data one control transfer may carry either way. The hosts' control buffers are this size or
 /// larger, and the Realtek's register file is reached a word at a time, its firmware 128 bytes at a time.
 pub const CONTROL_MAX: usize = 256;
+
+/// The most one bulk IN transfer carries: seven 512-byte high-speed packets, the most whole packets that fit
+/// one IPC message beside the reply's two bytes. It holds one unaggregated receive transfer, which Linux
+/// sizes as `IEEE80211_MAX_FRAME_LEN` (2352, `include/linux/ieee80211.h`) plus the receive descriptor
+/// (`rtl8xxxu_submit_rx_urb`); a driver that turns the chip's receive aggregation on must keep its batches
+/// under it. A whole number of packets, because a device that sends more than the host asked for is babble.
+pub const BULK_IN_MAX: usize = 3584;
+const _: () = assert!(BULK_IN_MAX + 2 <= godspeed_sdk::ipc::MAX_PAYLOAD);
+const _: () = assert!(BULK_IN_MAX % 512 == 0);

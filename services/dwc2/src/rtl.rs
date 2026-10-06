@@ -10,6 +10,11 @@
 //! The host TELLS the driver when the binding changes (`usbfn::NOTE_RADIO`, `notify_driver`), so the
 //! driver blocks rather than asking on a timer (U1b).
 //!
+//! **Receive (R3b):** one bulk IN on `CH_RADIO_RX`, armed in the background once `wifi-usb` first asks
+//! `OP_BULK_IN`, taken on the USB interrupt (`service`), held until collected, with `usbfn::NOTE_BULK_IN`
+//! sent to say so. It stands aside for every other non-periodic transfer (`chan::program_ping`) and is put
+//! back from the packet it reached, with its toggle.
+//!
 //! What follows is milestone 1's account, as it was written. Its "likely end state" - a separate driver
 //! service and a narrow USB-transfer protocol in `dwc2` - is what U1 built; "not built now" is history.
 //!
@@ -43,12 +48,280 @@
 //! of that interface (rtlwifi's `_usbctrl_vendorreq` and rtl8xxxu's equivalent are the reference for
 //! WHAT the silicon wants, per 26.14); no code copied, and the model here is ours.
 
-use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
+use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
 use godspeed as gs;
+use gs::cap::Cap;
 use gs::driver::{delay, wait::Budget};
 use godspeed_wifi::usbfn;
 
-use crate::chan::{self, Target};
+use crate::chan::{self, Target, CH_RADIO_RX};
+use crate::regs::{
+    GAHBCFG, GAHBCFG_GLBLINTRMSK, GINTMSK, GINTMSK_HCHINT, GINTSTS, HAINTMSK, HCINT_CHHLTD, HCINT_STALL,
+    HCINT_XFERCOMPL,
+};
+
+/// THE BOUND RADIO: who it is, and its receive. `ep_in` is 0 when the dongle could not be configured or
+/// offered no high-speed bulk IN - control transfers are then still served, and `OP_BULK_IN` says FAILED.
+pub struct Radio {
+    pub t: Target,
+    pub vid: u16,
+    pub pid: u16,
+    ep_in: u8,
+    in_mps: u16,
+    rx: Rx,
+    /// The IN endpoint's data toggle, read back from the channel after every halt - the hardware owns it,
+    /// and a halt that does not carry it destroys the next packet (`net::tx` records the cost of that).
+    pid_in: u32,
+    /// A `NOTE_BULK_IN` the driver's queue refused, sent again on a later pass: nothing is armed until the
+    /// held transfer is collected, so a notice lost for good would stop receive for good.
+    note_owed: bool,
+    /// Consecutive transaction errors on the IN, for `RX_ERROR_TRIES`.
+    errs_run: u32,
+    pub stats: RxStats,
+}
+
+/// Where the radio's receive is. `Armed { at }`: the IN is programmed to land at `RADIO_RX_OFF + at`, `at` being
+/// what a transfer that was stood aside had already received. `Held(n)`: a transfer of `n` bytes is waiting
+/// for `wifi-usb` to collect it, and the IN is NOT armed.
+#[derive(Clone, Copy, PartialEq)]
+enum Rx {
+    Off,
+    Armed { at: usize },
+    Held(usize),
+}
+
+/// What the radio's receive has done, for the heartbeat report. Counts, never reset: a rate is two reports.
+#[derive(Default, Clone, Copy)]
+pub struct RxStats {
+    pub transfers: u32,
+    pub bytes: u32,
+    /// Times the IN stood aside for another transfer and was put back (`chan::program_ping`).
+    pub asides: u32,
+    pub errors: u32,
+    pub last_err: u32,
+    pub notes_late: u32,
+}
+
+/// Where the radio's transfers land: after the NIC's receive burst, inside the 64 KiB arena. Derived and
+/// asserted, as `net.rs` does its own, because an overlap here is a device writing into another's buffer.
+const RADIO_RX_OFF: usize = 0x4000;
+const _: () = assert!(RADIO_RX_OFF >= crate::net::RX_OFF + crate::net::RX_BURST);
+const _: () = assert!(RADIO_RX_OFF + usbfn::BULK_IN_MAX <= 64 * 1024);
+
+/// Transaction errors in a row on the IN before what it had received is dropped and it starts again: the
+/// figure `chan::stage` takes from Linux's `dwc2_release_channel` (the third error fails the transfer).
+const RX_ERROR_TRIES: u32 = 3;
+
+/// The descriptor kinds and the bulk transfer type, as USB 2.0 chapter 9 numbers them.
+const DESC_CONFIG: u8 = 0x02;
+const DESC_ENDPOINT: u8 = 0x05;
+const EP_TYPE_BULK: u8 = 0x02;
+/// A high-speed bulk endpoint's packet size, the only one USB 2.0 allows it. A smaller one means the dongle
+/// came up at full speed behind the hub, which needs split transactions this driver does not run for a bulk
+/// IN - so receive stays off and says why, rather than half-working.
+const HS_BULK_MPS: u16 = 512;
+
+/// Bind the dongle as the radio: configured, as Linux's USB core configures a device before a driver sees
+/// it - this host never did, and control transfers worked without it, but a bulk endpoint exists only in a
+/// configured device - then milestone 1's two reads, then its bulk IN found. Bound whatever happens, so
+/// `wifi-usb` reaches its registers and says itself what failed.
+pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, pid: u16) -> Radio {
+    stop(ctx, mmio);
+    let (ep_in, in_mps) = configure(ctx, mmio, dma, t).unwrap_or((0, 0));
+    let _ = probe(ctx, mmio, dma, t);
+    Radio {
+        t: *t, vid, pid, ep_in, in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false, errs_run: 0,
+        stats: RxStats::default(),
+    }
+}
+
+/// Read the configuration descriptor, find the bulk IN endpoint, and SET_CONFIGURATION. `None`, said, on
+/// any failure; `Some((0, 0))` when it configured but has no high-speed bulk IN.
+fn configure(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<(u8, u16)> {
+    const TRIES: u32 = 4;
+    let ctl = |setup: &[u8; 8], buf: &mut [u8], data_in: bool, len: usize| -> bool {
+        (0..TRIES).any(|i| {
+            if i > 0 {
+                delay::hold(ctx, Budget::ms(5));
+            }
+            chan::control(ctx, mmio, dma, t, setup, buf, data_in, len)
+        })
+    };
+    let mut head = [0u8; 9];
+    if !ctl(&[0x80, 0x06, 0, DESC_CONFIG, 0, 0, 9, 0], &mut head, true, 9) {
+        ctx.log("dwc2-svc: RTL8188CUS - the configuration descriptor did not come back; no receive");
+        return None;
+    }
+    let want = (u16::from_le_bytes([head[2], head[3]]) as usize).min(chan::DATA_LEN);
+    let cfg_val = head[5];
+    let mut full = [0u8; chan::DATA_LEN];
+    if !ctl(&[0x80, 0x06, 0, DESC_CONFIG, 0, 0, (want & 0xFF) as u8, (want >> 8) as u8], &mut full, true, want) {
+        ctx.log("dwc2-svc: RTL8188CUS - the configuration descriptor did not come back; no receive");
+        return None;
+    }
+    let mut none: [u8; 0] = [];
+    if !ctl(&[0x00, 0x09, cfg_val, 0, 0, 0, 0, 0], &mut none, false, 0) {
+        ctx.log_fmt(format_args!("dwc2-svc: RTL8188CUS - SET_CONFIGURATION {} FAILED; no receive", cfg_val));
+        return None;
+    }
+    let (ep, mps) = bulk_in(&full, want).unwrap_or((0, 0));
+    if ep == 0 || mps != HS_BULK_MPS {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: RTL8188CUS configured ({}) but no high-speed bulk IN (endpoint {}, {} bytes) - control only, no receive",
+            cfg_val, ep, mps));
+        return Some((0, 0));
+    }
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: RTL8188CUS configured ({}) - bulk IN endpoint {}, {} bytes, received on channel {}",
+        cfg_val, ep, mps, CH_RADIO_RX));
+    Some((ep, mps))
+}
+
+/// The first bulk IN endpoint in a configuration descriptor, and its packet size - Linux's
+/// `rtl8xxxu_parse_usb` takes the one bulk IN the interface has. Every length is the device's, so a
+/// descriptor too short to step over ends the walk.
+fn bulk_in(buf: &[u8], total: usize) -> Option<(u8, u16)> {
+    let mut i = 0usize;
+    while i + 2 <= total {
+        let len = buf[i] as usize;
+        if len < 2 || i + len > total {
+            return None;
+        }
+        if buf[i + 1] == DESC_ENDPOINT && len >= 7 && buf[i + 3] & 0x03 == EP_TYPE_BULK && buf[i + 2] & 0x80 != 0 {
+            return Some((buf[i + 2] & 0x0F, u16::from_le_bytes([buf[i + 4], buf[i + 5]]) & 0x07FF));
+        }
+        i += len;
+    }
+    None
+}
+
+/// Take the radio's channel down: halted, its interrupt masked, its status cleared. Before a binding and
+/// after a removal, so no IN is left armed at a device that has gone - or at the next one at its address.
+pub fn stop(ctx: &ServiceContext, mmio: &Mmio) {
+    chan::halt(ctx, mmio, CH_RADIO_RX);
+    chan::release(mmio, CH_RADIO_RX);
+    mmio.write32(HAINTMSK, mmio.read32(HAINTMSK) & !(1 << CH_RADIO_RX));
+}
+
+/// Arm the IN to land at `RADIO_RX_OFF + at`, for the rest of `BULK_IN_MAX`, and let it raise the interrupt.
+fn arm(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, at: usize) {
+    let t = Target { addr: r.t.addr, mps: r.in_mps, low_speed: false };
+    chan::program(ctx, mmio, &t, CH_RADIO_RX, true, r.pid_in, (usbfn::BULK_IN_MAX - at) as u32,
+                  dma.phys_at(RADIO_RX_OFF + at) as u32, r.ep_in as u32, 2, 0);
+    // The halt alone: a completion halts the channel too, so it is the one event that covers all of them.
+    // HAINTMSK picks which channels may raise the core's HCHINT; the NIC's receive sets its own bit.
+    mmio.write32(chan::hcintmsk_at(CH_RADIO_RX), HCINT_CHHLTD);
+    mmio.write32(HAINTMSK, mmio.read32(HAINTMSK) | (1 << CH_RADIO_RX));
+    // The core's line, as `net::arm_in` enables it - HCHINT alone, and the global enable - for a board where
+    // the NIC never armed. Tested rather than flagged: the registers are the truth of whether it is on.
+    if mmio.read32(GINTMSK) & GINTMSK_HCHINT == 0 {
+        mmio.write32(GINTSTS, GINTMSK_HCHINT);
+        mmio.write32(GINTMSK, mmio.read32(GINTMSK) | GINTMSK_HCHINT);
+    }
+    if mmio.read32(GAHBCFG) & GAHBCFG_GLBLINTRMSK == 0 {
+        mmio.write32(GAHBCFG, mmio.read32(GAHBCFG) | GAHBCFG_GLBLINTRMSK);
+    }
+    r.rx = Rx::Armed { at };
+}
+
+/// Look at the radio's IN and act on a halt: a completed transfer is HELD and `wifi-usb` told; one stood
+/// aside for another transfer (`chan::program_ping`) is armed again from where it stopped; a transaction
+/// error is re-run from there too, up to `RX_ERROR_TRIES` in a row; a STALL stops receive, said. Called on
+/// the USB interrupt and once a pass. `true` when it found a halt to retire - what lets the interrupt
+/// handler know the line was this channel's.
+pub fn service(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio) -> bool {
+    if r.note_owed && matches!(r.rx, Rx::Held(_)) {
+        r.note_owed = !tell_bulk(ctx);
+    }
+    let at = match r.rx {
+        Rx::Armed { at } => at,
+        _ => return false,
+    };
+    let hcint = mmio.read32(chan::hcint_at(CH_RADIO_RX));
+    if hcint & HCINT_CHHLTD == 0 {
+        return false;
+    }
+    mmio.write32(chan::hcint_at(CH_RADIO_RX), hcint);
+    r.pid_in = chan::pid_from_hctsiz(mmio, CH_RADIO_RX);
+    let left = (mmio.read32(chan::hctsiz_at(CH_RADIO_RX)) & 0x7_FFFF) as usize;
+    let got = (at + (usbfn::BULK_IN_MAX - at).saturating_sub(left)).min(usbfn::BULK_IN_MAX);
+    if hcint & HCINT_XFERCOMPL != 0 {
+        r.errs_run = 0;
+        if got == 0 {
+            arm(ctx, mmio, dma, r, 0);
+            return true;
+        }
+        r.stats.transfers = r.stats.transfers.wrapping_add(1);
+        r.stats.bytes = r.stats.bytes.wrapping_add(got as u32);
+        r.rx = Rx::Held(got);
+        if !tell_bulk(ctx) {
+            r.note_owed = true;
+            r.stats.notes_late = r.stats.notes_late.wrapping_add(1);
+        }
+    } else if hcint & HCINT_STALL != 0 {
+        r.stats.errors = r.stats.errors.wrapping_add(1);
+        r.stats.last_err = hcint;
+        r.rx = Rx::Off;
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: the radio's bulk IN STALLED (HCINT={:#010x}) - receive stopped until wifi-usb asks again", hcint));
+    } else if hcint & !(HCINT_CHHLTD | crate::regs::HCINT_NAK | crate::regs::HCINT_ACK) != 0 {
+        r.stats.errors = r.stats.errors.wrapping_add(1);
+        r.stats.last_err = hcint;
+        r.errs_run += 1;
+        let from = if r.errs_run >= RX_ERROR_TRIES { r.errs_run = 0; 0 } else { got };
+        arm(ctx, mmio, dma, r, from);
+    } else {
+        r.stats.asides = r.stats.asides.wrapping_add(1);
+        arm(ctx, mmio, dma, r, got);
+    }
+    true
+}
+
+/// `OP_BULK_IN`: the held transfer, if any, and the IN armed again. Answers on `reply` itself, with a
+/// buffer of its own, so `serve`'s frame stays the size of a control transfer.
+fn bulk_in_request(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, reply: Cap) {
+    let mut out = [0u8; 2 + usbfn::BULK_IN_MAX];
+    out[0] = usbfn::OP_BULK_IN;
+    let mut n = 0usize;
+    if r.ep_in == 0 {
+        out[1] = usbfn::ST_FAILED;
+    } else {
+        // A completion the interrupt has not been handled for yet is taken now rather than a pass later.
+        let _ = service(ctx, mmio, dma, r);
+        if let Rx::Held(len) = r.rx {
+            for (i, b) in out[2..2 + len].iter_mut().enumerate() {
+                *b = dma.read8(RADIO_RX_OFF + i);
+            }
+            n = len;
+            r.note_owed = false;
+        }
+        if !matches!(r.rx, Rx::Armed { .. }) {
+            arm(ctx, mmio, dma, r, 0);
+        }
+        out[1] = usbfn::ST_OK;
+    }
+    let _ = gs::ipc::reply(ctx, reply, &Message::from_bytes(&out[..2 + n]));
+}
+
+/// The heartbeat's line about the radio's receive.
+pub fn report(ctx: &ServiceContext, r: &Radio) {
+    let s = &r.stats;
+    let state = match r.rx {
+        Rx::Off if r.ep_in == 0 => "no bulk IN",
+        Rx::Off => "not started",
+        Rx::Armed { .. } => "armed",
+        Rx::Held(_) => "held for wifi-usb",
+    };
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: radio rx - {} transfers {} bytes, {} asides, {} errors (last HCINT={:#010x}), {} notices late; {}",
+        s.transfers, s.bytes, s.asides, s.errors, s.last_err, s.notes_late, state));
+}
+
+fn tell_bulk(ctx: &ServiceContext) -> bool {
+    let msg = Message::from_bytes(&[usbfn::NOTE_BULK_IN]);
+    gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
+        || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok())
+}
 
 /// The dongle on the Pi 2's hub, confirmed on hardware twice - `bugs/3` recorded it via this driver and
 /// the T630's `xhci` read the same pair on 2026-09-27.
@@ -125,15 +398,18 @@ const DRIVER: &str = "wifi-usb";
 /// gets one: a transfer the client must not have reach the device twice, whose failure the client handles.
 const CONTROL_TRIES: u32 = 4;
 
-/// Serve one `usbfn` request for the bound radio - `radio` is its target, VID and PID, or `None` when none is
-/// bound - and answer on `reply`, which this reclaims. Every op is answered, a request for a radio that is
-/// not here included, so a client is never left to time out against a clean log.
+/// Serve one `usbfn` request for the bound radio - `None` when none is bound - and answer on `reply`, which
+/// this reclaims. Every op is answered, a request for a radio that is not here included, so a client is
+/// never left to time out against a clean log.
 pub fn serve(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, radio: Option<&(Target, u16, u16)>,
-    msg: &Message, reply: CapHandle,
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, radio: Option<&mut Radio>, msg: &Message, reply: Cap,
 ) {
     let p = msg.payload_bytes();
     let op = p.first().copied().unwrap_or(0);
+    let radio = match (op, radio) {
+        (usbfn::OP_BULK_IN, Some(r)) => return bulk_in_request(ctx, mmio, dma, r, reply),
+        (_, r) => r,
+    };
     let mut out = [0u8; 2 + usbfn::CONTROL_MAX];
     out[0] = op;
     let n = match (op, radio) {
@@ -141,21 +417,20 @@ pub fn serve(
             out[1] = usbfn::ST_NO_DEVICE;
             2
         }
-        (usbfn::OP_INFO, Some((_, vid, pid))) => {
+        (usbfn::OP_INFO, Some(r)) => {
             out[1] = usbfn::ST_OK;
-            out[2..4].copy_from_slice(&vid.to_le_bytes());
-            out[4..6].copy_from_slice(&pid.to_le_bytes());
+            out[2..4].copy_from_slice(&r.vid.to_le_bytes());
+            out[4..6].copy_from_slice(&r.pid.to_le_bytes());
             6
         }
-        (usbfn::OP_CONTROL, Some((t, _, _))) => control(ctx, mmio, dma, t, p, CONTROL_TRIES, &mut out),
-        (usbfn::OP_CONTROL_ONCE, Some((t, _, _))) => control(ctx, mmio, dma, t, p, 1, &mut out),
+        (usbfn::OP_CONTROL, Some(r)) => control(ctx, mmio, dma, &r.t, p, CONTROL_TRIES, &mut out),
+        (usbfn::OP_CONTROL_ONCE, Some(r)) => control(ctx, mmio, dma, &r.t, p, 1, &mut out),
         _ => {
             out[1] = usbfn::ST_BAD_REQUEST;
             2
         }
     };
-    let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..n]));
-    ctx.remove_cap(reply);
+    let _ = gs::ipc::reply(ctx, reply, &Message::from_bytes(&out[..n]));
 }
 
 /// One control transfer: `p` is `[op, setup(8), data out...]`. Fills `out[1..]` and returns its length.

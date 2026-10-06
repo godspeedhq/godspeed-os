@@ -15,7 +15,7 @@ The chip-independent half of every WiFi driver, as a library: `godspeed-wifi` (`
 | `keyfile.rs` | The credentials a join earned, in `/wifi.keys` |
 | `sdio.rs` | The SDIO card protocol (CMD52, CMD53, identification, the CIS) and the `SdioHost` trait every SDIO controller implements - the Pi 4's Arasan (`host.rs`) and the VisionFive 2's DesignWare (`dwmmc.rs`: commands since V1, the PIO data phase since V2) |
 | `wire.rs` | The request/reply vocabulary between a radio driver and the shell's `wifi`. ONE definition, read by both sides. The frame ops `nic-driver` uses (0x10-0x12) are not here: they are the Broadcom driver's own, in `services/wifi-driver/src/frames.rs`, and `nic-driver` does not link this crate |
-| `usbfn.rs` | What a USB host service answers for the one device it has bound as a radio - `OP_INFO`, `OP_CONTROL` and `OP_CONTROL_ONCE` (a transfer the host must not retry: a firmware block) - and what `wifi-usb` asks; and `NOTE_RADIO`, which the host sends the driver when the binding changes, so the driver blocks instead of polling (`docs/wifi-usb.md`). One definition for `dwc2`, later `xhci`, and the driver |
+| `usbfn.rs` | What a USB host service answers for the one device it has bound as a radio - `OP_INFO`, `OP_CONTROL`, `OP_CONTROL_ONCE` (a transfer the host must not retry: a firmware block) and `OP_BULK_IN` (the received transfer the host holds) - and what `wifi-usb` asks; and `NOTE_RADIO` and `NOTE_BULK_IN`, which the host sends the driver when the binding changes or a transfer is held, so the driver blocks instead of polling (`docs/wifi-usb.md`). One definition for `dwc2`, later `xhci`, and the driver |
 
 ## Why a crate, and why not in the SDK
 

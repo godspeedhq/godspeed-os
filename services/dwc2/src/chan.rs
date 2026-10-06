@@ -45,6 +45,9 @@ pub const CH_KBD: u32 = 1;
 /// the keyboard would mean a hot-plug check could destroy a split mid-flight, which is the class of
 /// bug the channel-per-stream split was introduced to prevent.
 pub const CH_HUB: u32 = 4;
+/// The WiFi dongle's bulk IN (`rtl.rs`): armed in the background, like the NIC's receive on 3, and taken on
+/// the USB interrupt. Its own channel for the reason every stream has one.
+pub const CH_RADIO_RX: u32 = 5;
 
 /// Channel-enable / disable bits in HCCHAR.
 const HCCHAR_CHENA: u32 = 1 << 31;
@@ -105,6 +108,18 @@ pub fn program_ping(
 ) {
     let mps = t.mps as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
+
+    // THE RADIO'S IN STANDS ASIDE for every other non-periodic transfer. An armed bulk IN the device NAKs is
+    // retried by the core in hardware, and every retry takes an entry in the NON-PERIODIC REQUEST QUEUE that
+    // control and bulk transfers on every other channel need - `net::tx` found it starving a transmit, with
+    // GNPTXSTS reporting zero entries free. Whether it starves a control transfer too has not been measured
+    // on this board (no run has had the NIC's IN armed), and a SETUP takes the same queue, so it stands
+    // aside for both. `rtl::service` puts it back, from where it stopped, with its data toggle. The NIC's own
+    // background IN is left alone: arming it is not a transfer that has to complete. Periodic transfers - the
+    // keyboard, the hub's status - ride the periodic queue and are not affected. A no-op when it is not armed.
+    if ch != CH_RADIO_RX && ch != crate::regs::CH_NET_RX && (ep_type == 0 || ep_type == 2) {
+        halt(ctx, mmio, CH_RADIO_RX);
+    }
 
     // Channel-reuse hygiene: if a prior transaction left the channel ENABLED - a timeout that never
     // truly halted, or a split phase re-arm - disable it cleanly before reprogramming. Never reuse a

@@ -22,7 +22,8 @@
 //! **Told, not polled (U1b).** The service asks the host once at start whether a dongle is bound, then
 //! blocks; the host sends `usbfn::NOTE_RADIO` when a dongle is bound or removed, and only then is it asked
 //! again. The waits inside a bring-up are polls of the chip's own status bits, which it reports only when
-//! read; frames, from R3, will come the same way the binding does - the host told by its interrupt.
+//! read; frames come the way the binding does - the host told by its interrupt, and `NOTE_BULK_IN` to us
+//! (R3b, `rx.rs`).
 
 use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
@@ -31,10 +32,10 @@ use godspeed_wifi::usbfn;
 mod rtl8188;
 mod rtl_fw;
 mod rtl_queues;
-// Read by R3b, once `dwc2` has a bulk IN path to hand it transfers; host-tested until then.
-#[allow(dead_code)]
+// Read by `rx` (R3b): what the host's bulk IN hands up. Host-tested as well.
 mod rtl_rx;
 mod rtl_tables;
+mod rx;
 
 /// The 8051's firmware, embedded (`build.rs`, `nonfree/rtl8192cu/PROVENANCE`), and the hash the build measured
 /// on disk, which `bring_up` recomputes over what the binary actually holds.
@@ -117,7 +118,11 @@ fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> bool {
                     "rtl8192cufw_A.bin"
                 }));
             ctx.log("wifi-usb: U1 done - the dongle answers through the host");
-            bring_up(ctx);
+            // Receive starts only once the chip's own is set up (R3a): the host's IN armed at a chip that
+            // has not been told where to put frames would only be NAKed.
+            if bring_up(ctx) {
+                rx::start(ctx);
+            }
             true
         }
         (c, i) => {
@@ -133,7 +138,7 @@ fn identify(ctx: &ServiceContext, vid: u16, pid: u16) -> bool {
 const REPORT_CEILING_MS: u64 = 60_000;
 
 /// R1 (`docs/wifi-usb.md`): the efuse, then the power-on - Linux's order (`rtl8xxxu_init_device`).
-fn bring_up(ctx: &ServiceContext) {
+fn bring_up(ctx: &ServiceContext) -> bool {
     // How long each half took, for the log - `Deadline::elapsed_us` is the stdlib's measure of a wait. The
     // bound is a ceiling for the report only; every wait inside the efuse walk and the power-on is
     // bounded on its own (`rtl8188.rs`).
@@ -149,7 +154,7 @@ fn bring_up(ctx: &ServiceContext) {
         }
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the efuse read stopped - {}", why));
-            return;
+            return false;
         }
     }
     // Asked BEFORE the power-on, as Linux asks them: whether the MAC is cold, and which transmit queues the
@@ -170,7 +175,7 @@ fn bring_up(ctx: &ServiceContext) {
             ctx.log_fmt(format_args!(
                 "wifi-usb: could not read the MAC's state or the dongle's queues - {}",
                 c.err().or(q.err()).unwrap_or("?")));
-            return;
+            return false;
         }
     };
     let clock = gs::driver::wait::Deadline::start(ctx, gs::driver::wait::Budget::ms(REPORT_CEILING_MS));
@@ -179,16 +184,16 @@ fn bring_up(ctx: &ServiceContext) {
             "wifi-usb: powered on in {} ms - CR={:#06x}; R1 done", clock.elapsed_us() / 1000, cr)),
         Err(why) => {
             ctx.log_fmt(format_args!("wifi-usb: the power-on stopped at {}", why));
-            return;
+            return false;
         }
     }
     if let Err(why) = rtl8188::init_queues(ctx, queues, cold) {
         ctx.log_fmt(format_args!("wifi-usb: the transmit queues were not set up - {}", why));
-        return;
+        return false;
     }
     ctx.log("wifi-usb: transmit queues set up - priority, the receive boundary, and the page reservation where the MAC was cold");
     if !firmware(ctx) {
-        return;
+        return false;
     }
     // R3a: the MAC, the baseband and the RF set up, tuned to one channel, and the channel read back out of
     // the RF chip itself - the one register here that only a working RF path can answer.
@@ -199,9 +204,13 @@ fn bring_up(ctx: &ServiceContext) {
             ctx.log_fmt(format_args!(
                 "wifi-usb: MAC, baseband and RF set up in {} ms ({} RF registers); RF_MODE_AG reads {:#07x} - channel {}{}",
                 clock.elapsed_us() / 1000, rf, mode, on,
-                if on == FIRST_CHANNEL { ", as asked; R3a done, no frames yet (R3b, docs/wifi-usb.md)" } else { " - NOT the channel asked for" }));
+                if on == FIRST_CHANNEL { ", as asked; R3a done" } else { " - NOT the channel asked for" }));
+            on == FIRST_CHANNEL
         }
-        Err(why) => ctx.log_fmt(format_args!("wifi-usb: the radio's set-up stopped - {}", why)),
+        Err(why) => {
+            ctx.log_fmt(format_args!("wifi-usb: the radio's set-up stopped - {}", why));
+            false
+        }
     }
 }
 
@@ -266,11 +275,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("wifi-usb: starting - the USB WiFi dongle's driver; asks its USB host once whether a dongle is bound, then waits to be told");
     // What was last said, so each change is said once: none yet, bound (vid, pid), gone, or a host fault.
     let mut said: Option<Result<Option<(u16, u16)>, &'static str>> = None;
+    // What the radio has heard since it was last brought up (R3b).
+    let mut heard = rx::Heard::new();
     loop {
         let now = bound(&ctx);
         if said != Some(now) {
             match now {
                 Ok(Some((vid, pid))) => {
+                    heard = rx::Heard::new();
                     identify(&ctx, vid, pid);
                 }
                 Ok(None) => ctx.log_fmt(format_args!(
@@ -291,6 +303,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let _ = gs::ipc::reply(&ctx, cap, &Message::from_bytes(&[0u8]));
                 }
                 None if m.payload_bytes() == [usbfn::NOTE_RADIO] => break,
+                // A received transfer is held for us (R3b): collect it, and go back to blocking.
+                None if m.payload_bytes() == [usbfn::NOTE_BULK_IN] => rx::collect(&ctx, &mut heard),
                 None => {}
             }
         }

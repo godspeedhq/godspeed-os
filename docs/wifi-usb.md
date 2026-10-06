@@ -35,6 +35,8 @@ is due when a scan exists, not before.
 | `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2)]` |
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
+| `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |
+| `NOTE_BULK_IN` 0x2E | sent by the HOST to the driver, `[note]`, no reply cap: a transfer is held | none |
 | `NOTE_RADIO` 0x2F | sent by the HOST to the driver, `[note]`, no reply cap | none |
 
 Every reply starts `[op, status]`, so an answer to the wrong op, or a host that does not speak this, is
@@ -335,5 +337,52 @@ existed. Two readings of one frame is what the one-way rule forbids. Moving the 
 a change to a hardware-verified scan, so it waits for the VisionFive to be on the bench, with a scan as
 its card - not done unattended.
 
-Nothing in the image calls `rtl_rx.rs` yet; `wifi-usb` declares it `#[allow(dead_code)]` until the `dwc2`
-half hands it a transfer, and that attribute goes with the change that does.
+Nothing in the image called `rtl_rx.rs` until the `dwc2` half below; the `#[allow(dead_code)]` it carried
+went with that change.
+
+### The `dwc2` half (2026-10-06): built, the card is `build/kernel7-R3b.img` - NOT YET RUN
+
+**At bind, the dongle is configured.** `dwc2` never sent the radio SET_CONFIGURATION: control transfers on
+endpoint 0 work in the Addressed state, and every card from U1 to R3a ran that way. A bulk endpoint exists
+only in a configured device, and Linux's USB core configures one before any driver's probe, so `rtl::bind`
+now reads the configuration descriptor, takes the one bulk IN (`rtl8xxxu_parse_usb`'s rule), and sets the
+configuration - then milestone 1's two reads, as before. A bulk IN whose packet is not 512 bytes means the
+dongle came up at full speed behind the hub; that needs split transactions this driver does not run for a
+bulk IN, so receive stays off and the log says so.
+
+**One IN, armed in the background, taken on the interrupt.** Channel 5, landing at arena offset 0x4000 (after
+the NIC's receive burst, asserted at build time), for `usbfn::BULK_IN_MAX` = 3584 bytes - seven high-speed
+packets, holding one unaggregated receive, which Linux sizes as `IEEE80211_MAX_FRAME_LEN` (2352) plus the
+descriptor. It is armed the first time `wifi-usb` asks `OP_BULK_IN`, which it does once R3a has set the
+chip's receive up. Its halt is the one interrupt it raises; `rtl::service` takes a completed transfer and
+HOLDS it, sends `NOTE_BULK_IN`, and arms nothing until `wifi-usb` collects it with `OP_BULK_IN` - so the chip
+keeps what arrives meanwhile, and nothing is dropped between the two services. A notice the driver's full
+queue refused is sent again on the next pass, because a lost one would stop receive for good. One transfer
+per round trip is enough for beacons; R6's data rate is a later question.
+
+**It stands aside for every other non-periodic transfer.** `net.rs` found, on this board, that an armed bulk
+IN the device NAKs fills the core's non-periodic request queue with retries and starves a transmit (GNPTXSTS:
+zero entries free). Whether it starves a control transfer has never been measured here - the R1 to R3a logs
+show the NIC's IN never armed (`nohalt 0`), so they cannot answer it, though they first looked as if they
+did - and a SETUP takes the same queue. So `chan::program_ping` halts the radio's IN before programming any
+control or bulk transfer on another channel, and `rtl::service` puts it back from the packet it reached, with
+the data toggle read out of the channel. Periodic transfers (the keyboard, the hub's status) ride the other
+queue and do not stand it aside.
+
+**The interrupt could be dropped, and now cannot.** The USB interrupt reaches `dwc2` as the message `[0x29]`
+with no reply cap. Only the disk drain asked for it; the no-disk drain and the blocking receive between passes
+handed it to `dispatch`, which dropped it as a capless request and left the vector masked for good. No run had
+armed an IN, so none had raised one. `usb_irq` is now asked for first at all three places.
+
+**The driver's half** (`services/wifi-usb/src/rx.rs`): on `NOTE_BULK_IN` it collects up to eight transfers,
+walks each (`rtl_rx`), counts frames, CRC failures and frames cut short, reads each good frame as a beacon or
+probe response (`mgmt`), and names each network once (eight at most).
+
+**Prediction.** After R3a's line: `dwc2-svc: RTL8188CUS configured (...) - bulk IN endpoint .., 512 bytes,
+received on channel 5` at bind; `wifi-usb: receive started`; within a second, `wifi-usb: beacon '...' ... on
+channel 1` (or 2 or 3: a neighbour's beacon leaks across, and the channel printed is the network's own) and
+`the FIRST frame from the air - ...; R3b done`; the heartbeat's `radio rx - N transfers ...` climbing with no
+errors; and the keyboard and the disk unaffected. **Refuted by:** no bulk IN or a failed SET_CONFIGURATION at
+bind; `receive started` and then nothing, with `radio rx` at 0 transfers (the IN never completes - the chip's
+receive, or the queue); transfers climbing with no beacons and every frame failing its CRC (the descriptor
+read); or a keyboard or disk that stalls once receive starts (the stand-aside).

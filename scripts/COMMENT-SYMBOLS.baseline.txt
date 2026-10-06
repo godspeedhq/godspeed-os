@@ -89,6 +89,9 @@ dwc2_hc_nak_intr
 dwc2_hc_nyet_intr
 dwc2_hc_xacterr_intr               # Linux drivers/usb/dwc2/hcd_intr.c, cited by dwc2 chan::stage for re-running a stage on a transaction error (R2c) - external, 26.14
 dwc2_update_urb_state_abn          # Linux drivers/usb/dwc2/hcd_intr.c, same citation - external, 26.14
+IEEE80211_MAX_FRAME_LEN            # Linux include/linux/ieee80211.h (2352), cited by usbfn::BULK_IN_MAX for the size of one unaggregated receive (R3b) - external, 26.14
+rtl8xxxu_parse_usb                 # Linux rtl8xxxu_core.c, cited by dwc2 rtl::bulk_in for taking the one bulk IN endpoint (R3b) - external, 26.14
+rtl8xxxu_submit_rx_urb             # Linux rtl8xxxu_core.c, cited by usbfn::BULK_IN_MAX for how Linux sizes the receive buffer (R3b) - external, 26.14
 dwc2_release_channel
 dwmac4_dma_axi
 dwmac4_dma_init
