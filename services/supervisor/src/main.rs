@@ -1239,6 +1239,9 @@ impl UsbState {
 /// it if the device is gone. One host reports today, with one such device, so "absent" means every row.
 fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r: usbdev::Report) {
     if !r.present {
+        // Said once per report, which is rare: a host reports at its boot, on a plug or unplug, and when a
+        // new supervisor asks.
+        ctx.log("supervisor: USB host reports no device with a driver here attached");
         for (i, m) in USB_MATCH.iter().enumerate() {
             usb.present[i] = false;
             if name_alive(ctx, m.driver) {
