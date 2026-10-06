@@ -270,6 +270,17 @@ crate gains `godspeed-wifi` for the `usbfn` constants. Then: the supervisor's `u
 `xhci` as well as `dwc2`, `xhci` gains `wifi-usb` as a peer, and `wifi-usb`'s row and contract name the
 host its board has.
 
+**What R3b adds to it (2026-10-06).** `xhci` must answer `OP_BULK_IN` and send `NOTE_BULK_IN` too. Read
+from its mass-storage path rather than assumed: a bulk IN there is an endpoint added by Configure Endpoint
+with the DIRECTIONAL type (bulk IN is 6, xHCI 6.2.3 - `bind_msc` records that the wrong type configures a
+pipe that never completes), with a transfer ring and data page in a region of its own (`msc.rs`'s
+`DISK_BASE`, separate because one shared page let an armed interrupt endpoint overwrite a disk command on
+the Pi 4). The radio needs the same: its own ring and a `BULK_IN_MAX` buffer, one Normal TRB queued as the
+"armed" IN, and its Transfer Event taken where the interrupt already drains the event ring - matched to the
+radio's slot and endpoint, which is point 3 above again. `dwc2`'s stand-aside is a fact about `dwc2`'s
+non-periodic request queue; whether `xhci` needs anything like it is a hardware question, not assumed either
+way.
+
 **Why it was not built unattended:** it is the driver that carries the keyboard and the disk on the Pi 4,
 the VisionFive and both PCs, hardware-verified on all four, and the dongle path cannot be shown in QEMU. It
 is a card per board with the operator present.
