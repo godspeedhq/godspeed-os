@@ -10,7 +10,7 @@
    13  services/console
     7  services/control
    24  services/copier
-  105  services/dwc2
+  102  services/dwc2
    20  services/ehci
    11  services/events
    34  services/fs
