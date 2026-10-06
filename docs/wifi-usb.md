@@ -477,7 +477,31 @@ hard-off order, the shell's wording): passed.**
 - `chaos max-carnage` 50 rounds, 366 kills: kernel alive, no `spawn REFUSED`, every restart (wifi-driver's
   included) took a mailbox back. Rejoined after, `ping` 7 of 7.
 
-The VisionFive's is still owed.
+**The VisionFive's, run the same day: everything passed until chaos, and chaos found a `nic-driver` fault.**
+- Bring-up, auto-join over 5 GHz, `ping`, `wifi radio off`/`on`, `powercycle` (`powercycle succeeded -
+  joined`), `kill wifi-driver` (rejoined with its mailbox, 3 of 3): all as on the Pi 4.
+- `chaos max-carnage` 50 rounds, 334 kills: kernel alive, the radio rejoined. But `ping` then said `link not
+  confirmed` and kept saying it through a further kill and power cycle of the radio.
+- **The cause was `nic-driver`, not the radio.** Its last respawn in the storm, with the cable out, could
+  not reset the dwmac's DMA (`DMA reset did not clear in 1000000 us - bus mode was 0x00000000, now
+  0x00000001`; at boot the same reset cleared in 4 us). Its failure path then served EMPTY replies to
+  everything, the radio bridge's included. So a rejoined, working radio carried nothing until `nic-driver`
+  itself was restarted.
+- **Fixed in `nic-driver`'s dwmac backend**, with the VisionFive card owed for it:
+  - `Dwmac::bring_up` hands its register window and arena back on failure;
+  - the serve loop carries on with the radio bridge (`Wire::Down`), the cable counting only through a
+    MAC that is up;
+  - the MAC is tried again whenever the PHY reports a link, since the clock a DMA reset needs is the
+    PHY's.
+  - Why the reset did not clear after the storm is not diagnosed; what changed is that it no longer costs
+    the radio.
+- **The same shape stands in GENET's backend** (`genet did not come up - serving empty replies`). It did
+  not occur in the Pi 4's chaos run, and it is left as it is until a Pi 4 card can carry the change.
+- **Also seen, at boot:** a `wifi status` typed during the AIC8800's 12-second firmware upload was never
+  answered. The shell held it owed until its 30-second bound (`owed for over 30 s never came - forgotten`),
+  refusing `wifi` meanwhile. The serve loop's tagged reply looks right, so the request was most likely lost
+  before being served: `nic-driver` had filled its held slots probing the busy radio at that moment.
+  Recorded, not diagnosed.
 
 **The dongle's `Station`** (`services/wifi-usb/src/station.rs`). This chip is soft-MAC, so the sweep is
 the host's to run: tune channel 1, listen `DWELL_MS` (150 ms, one beacon interval of 102.4 ms with room

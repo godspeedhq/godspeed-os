@@ -415,14 +415,16 @@ impl Dwmac {
         mac: [u8; 6],
         speed: u32,
         full_duplex: bool,
-    ) -> Option<Self> {
+    ) -> Result<Self, (Mmio, Dma)> {
+        // A failure HANDS THE GRANT BACK: the caller keeps the window, serves the radio without the MAC,
+        // and tries again when a cable arrives (`dwmac::serve`).
         if a.len() < ARENA_NEEDED {
             ctx.log_fmt(format_args!(
                 "nic-driver: dwmac needs {} bytes of DMA arena and was granted {} - not bringing the MAC up",
                 ARENA_NEEDED,
                 a.len()
             ));
-            return None;
+            return Err((m, a));
         }
 
         let mut d = Dwmac { m, a, mac, last_tx_status: 0, rbu: 0, tx_next: 0, rx_next: 0 };
@@ -451,8 +453,8 @@ impl Dwmac {
             ctx.log_fmt(format_args!(
                 "nic-driver: dwmac DMA reset did not clear in {} us - bus mode was 0x{:08x}, now 0x{:08x}",
                 RESET_US, before, d.m.read32(DMA_BUS_MODE)));
-            ctx.log("nic-driver: dwmac not brought up - serving empty replies (net degrades, it does not hang)");
-            return None;
+            ctx.log("nic-driver: dwmac not brought up - the radio still carries the link, and the MAC is tried again when a cable arrives");
+            return Err((d.m, d.a));
         }
         ctx.log_fmt(format_args!("nic-driver: dwmac DMA reset cleared in {} us", took_us));
         // Reported rather than programmed. The AXI burst-length field lives here, and its reset
@@ -469,7 +471,7 @@ impl Dwmac {
         d.arm_rx_ring();
         d.program(speed, full_duplex);
         d.log_filter_addr(ctx);
-        Some(d)
+        Ok(d)
     }
 
     fn desc_write(&self, off: usize, word: usize, v: u32) {
