@@ -241,7 +241,8 @@ static MAILBOX_CREDITS: core::sync::atomic::AtomicUsize = core::sync::atomic::At
 /// rather than merely unlikely. An eighth of the table.
 const CREDIT_FLOOR: usize = MAX_ENDPOINTS / 8;
 
-/// A watched task died holding a reply mailbox: its respawn may take one back past the reserve.
+/// A watched task - or the supervisor, which the kernel respawns and never marks watched - died holding a
+/// reply mailbox: its respawn may take one back past the reserve.
 pub fn bank_mailbox_credit() {
     MAILBOX_CREDITS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 }
@@ -258,7 +259,7 @@ fn take_mailbox_credit() -> bool {
 pub enum OptionalGrant {
     /// Above the reserve, as every grant was before credits.
     Free,
-    /// Past the reserve, in place of one a dead watched task released. The counts at the decision, for
+    /// Past the reserve, in place of one released by a service that died (watched, or the supervisor). The counts at the decision, for
     /// the caller's line, as `OptionalRefusal` carries them.
     Credit { free: usize, total: usize, reserve: usize },
 }
@@ -289,8 +290,8 @@ pub struct OptionalRefusal {
 /// chaos storm could lose its reply mailbox with nothing in the log naming it (`backlog/74`). The spawn
 /// path prints every refusal with the task's name instead; it is one line per spawn at most, bounded by
 /// the spawn rate exactly like the `spawned OK` line beside it.
-/// `watched`: the task is one the supervisor restarts, so it may spend a credit (`MAILBOX_CREDITS`) where
-/// the reserve would refuse it.
+/// `watched`: the task is one that is restarted - by the supervisor, or the supervisor itself by the
+/// kernel - so it may spend a credit (`MAILBOX_CREDITS`) where the reserve would refuse it.
 pub fn try_register_optional(
     id: EndpointId, core_id: u32, generation: Generation, watched: bool,
 ) -> Result<OptionalGrant, OptionalRefusal> {

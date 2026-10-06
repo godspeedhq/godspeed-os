@@ -2391,7 +2391,9 @@ pub fn kill_task_by_slot(slot: usize) {
             // A watched task's mailbox is owed back to its respawn (`routing::MAILBOX_CREDITS`,
             // `backlog/74`): the reserve would refuse it, and the respawn needs it as much as the boot
             // instance did. `TASK_WATCHED` still holds this task's value - it is only set by a spawn.
-            if task_watched(slot) {
+            // The supervisor too: the kernel respawns it, so it is not watched, and its respawn needs its
+            // mailbox back like any other (the spawn side says the same, `task::spawn`).
+            if task_watched(slot) || task_name == "supervisor" {
                 crate::ipc::routing::bank_mailbox_credit();
             }
             // RECLAIM THE ID, exactly as the primary endpoint's is reclaimed below. Without this a

@@ -191,8 +191,9 @@ mandatory receive endpoints, whatever the credits say, and the grant falls back 
 never held one, banks nothing, and is still refused on a respawn. That is the rest of this item. The
 reserve itself is untouched.
 
-**Said, like the refusal:** `spawn[ipc]: '<name>' takes back a reply mailbox a dead watched task
-released - N of 96 routing slots free, reserve 72`.
+**Said, like the refusal:** `spawn[ipc]: '<name>' takes back a reply mailbox released by a service that
+died - N of 96 routing slots free, reserve 72`. (It first read "a dead watched task released", which was
+wrong once the supervisor could take one too; the runs quoted below predate the rewording.)
 
 **Verified in QEMU (Pi 2, 2026-10-06):** at boot `nic-driver` and `net-stack` were refused as before. Then
 `kill time`, and `time`'s respawn at 71 free took the mailbox back, where before it would have been
@@ -212,9 +213,29 @@ before it read 987 of 1044.
   footprint conserved, not grown: a grant spends exactly one release. But it means which service holds a
   mailbox after a storm is the order of respawns, not who held one at boot. A service that had one at boot
   can find the credits gone. `wifi-usb` did not, in 7 restarts.
-- **The supervisor was refused 13 times** (`gets no reply mailbox`), once per kernel respawn. It is not
-  WATCHED: the kernel respawns it directly, and the watched flag is the supervisor's to set on what it
-  manages. So it neither banks nor spends. Nothing in the run failed for it, and that was equally true
-  before this change; the boot supervisor has one and every respawn does not. Open: whether the kernel's
-  one direct respawn should bank and spend like a watched task. That is a small kernel change, and the
-  operator's call.
+- **The supervisor was refused 13 times** (`gets no reply mailbox`), once per kernel respawn. Credits
+  went only to WATCHED tasks, and the supervisor is never watched. "Watched" is a flag the supervisor
+  sets on the services it restarts, and it means "tell the supervisor when this one dies". The
+  supervisor is restarted by the kernel instead, and telling it of its own death would be telling the
+  dead. So it neither banked nor spent. Nothing failed for it, and that was equally true before this
+  change: the boot supervisor had a mailbox and every respawn did not.
+
+## The supervisor too (2026-10-06, operator's go-ahead)
+
+**The rule now reads "watched, or the supervisor".** The death of either, holding a mailbox, banks a
+credit, and the spawn of either may spend one (`may_take_back` in `task::spawn`, and the death path in
+`scheduler.rs`). The supervisor is NOT marked watched to get this, because that flag would also send its
+death notice to its own dead endpoint and log a false "death UNHEARD" at every respawn. It is named
+instead, as the one service the kernel knows by name. The restart counter in the same death path already
+names it the same way, for the same reason.
+
+**What the kernel restarts, stated plainly because an earlier note blurred it:** the supervisor, and
+nothing else. Every other service is restarted by the supervisor; the kernel's part in that is only to
+report the death of a task the supervisor asked about (`SPAWN_FLAG_WATCHED`). "Watched" is that request,
+made by the supervisor in its own spawn requests. The supervisor is not watched because nothing above it
+is asked to restart it: the kernel does that itself (CLAUDE.md 6.2), and it is the one service the
+kernel knows by name.
+
+**Verified in QEMU (Pi 2):** `kill supervisor` - the kernel's respawn logged `'supervisor' takes back a
+reply mailbox ... 71 of 96 routing slots free`, where the same boot without this change logged `gets no
+reply mailbox` at the same count. The respawned supervisor adopted every running service as before.

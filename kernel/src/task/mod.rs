@@ -1819,13 +1819,18 @@ fn spawn_service_with_image(
         // equal terms with the MANDATORY receive endpoint above, and winning by getting there
         // first. Property P5 caught the consequence - a real service refused with "IPC routing
         // table full" while convenience endpoints held slots they could have done without.
+        // Who may take a mailbox back past the reserve: what the supervisor manages (WATCHED), and the
+        // supervisor itself, which the kernel respawns and so never marks watched - "watched" means
+        // "tell the supervisor of this death", which for the supervisor would be telling the dead.
+        // It is the one name the kernel knows, as the restart counter in the death path also uses.
+        let may_take_back = watched || name == "supervisor";
         let reply_routed =
-            match crate::ipc::routing::try_register_optional(reply_ep_id, core_id, reply_gen, watched) {
+            match crate::ipc::routing::try_register_optional(reply_ep_id, core_id, reply_gen, may_take_back) {
                 Ok(crate::ipc::routing::OptionalGrant::Free) => true,
                 Ok(crate::ipc::routing::OptionalGrant::Credit { free, total, reserve }) => {
                     // Said, as the refusal is: a grant past the reserve is the exception this makes.
                     crate::kprintln!(
-                        "spawn[ipc]: '{}' takes back a reply mailbox a dead watched task released - {} of {} routing slots free, reserve {}",
+                        "spawn[ipc]: '{}' takes back a reply mailbox released by a service that died - {} of {} routing slots free, reserve {}",
                         name, free, total, reserve);
                     true
                 }
