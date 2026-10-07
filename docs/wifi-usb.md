@@ -2775,7 +2775,7 @@ ports 2 and 4 and powercycles: five `device REMOVED`, five `device CONNECTED`, e
 port, and no `did not finish reset`, no `did not settle`, no failed enumeration. Seven joins, no `did not
 decrypt`; pings 2/2, 3/3, 2/2, 3/3, 3/3 and one 3 of 5 just after a move. No panic.
 
-## 47. A 1000-round chaos run on the Pi 2, and the 18 `selfcheck` failures after it: the ARMv7 page-table arena (2026-10-07) - a kernel change, operator-approved; built and booted in QEMU, not yet on hardware
+## 47. A 1000-round chaos run on the Pi 2, and the 18 `selfcheck` failures after it: the ARMv7 page-table arena (2026-10-07) - a kernel change, operator-approved; hardware-verified on the Pi 2
 
 **The run.** Cable out, dongle in: `chaos max-carnage 1000` - 1000 rounds, 6405 kills, no kernel panic,
 every service back - then `selfcheck`: 517 run, **18 failed**. Every failure was one cause: an on-demand
@@ -2828,3 +2828,7 @@ afterwards; report `1000 spawns (999 refused)` - and every refusal in the kernel
 running`, the by-design one (the first `mem-pressure` runs and holds memory; later ones are refused by
 name). No `FrameAllocFailed`, no `arena is full` - against 1799 arena refusals on the same card before the
 change. `selfcheck` not yet run on this image.
+
+**And the `selfcheck` half, on the same image after the chaos run:** `ran 517, failed 0, skipped 1` -
+the 18 failures gone - and hot-plug of the USB stick and the keyboard working, by the operator. Section
+47's change is hardware-verified on the Pi 2.
