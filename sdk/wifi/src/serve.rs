@@ -306,6 +306,11 @@ pub fn serve<'s>(
     // joined without being asked. Written after every change to the table.
     let mut keyfile_settled = false;
     let mut keyfile_tries: u32 = 0;
+    // WHICH RADIO IS IN USE (`wifi hardware use`, `utilities/56_wifi.md` 11): `/wifi.radio`, written by the
+    // shell, read here beside `/wifi.keys` and kept current by `wire::OP_USE`. A radio that is not the one
+    // in use does not rejoin at start, and says so in its link status, so `nic-driver` follows the choice.
+    let mut choice_use: u8 = wire::USE_DEFAULT;
+    let mut choice_settled = false;
     const KEYFILE_TRIES: u32 = 15;
     let mut auto_join: Option<([u8; SSID_MAX], u8, u8)> = None;
     /// Join a network this driver holds a key for - the rejoin after `radio on`, and the auto-join at boot
@@ -354,7 +359,7 @@ pub fn serve<'s>(
         Some(outcome)
     }
     /// Write the table to `/wifi.keys`, most recently used first. Called after any change to it.
-    fn save_keys(ctx: &ServiceContext, who: &str, stored: &[Option<Stored>]) {
+    fn save_keys(ctx: &ServiceContext, who: &str, stored: &[Option<Stored>], forgotten: Option<&[u8]>) {
         let mut entries = [keyfile::Entry::EMPTY; keyfile::MAX_SAVED];
         let mut n = 0usize;
         // Selection by recency into a bounded array: the table is 64 slots and this is 48 picks of it.
@@ -378,7 +383,7 @@ pub fn serve<'s>(
                 n += 1;
             }
         }
-        if keyfile::save(ctx, who, &entries[..n]) {
+        if keyfile::save(ctx, who, &entries[..n], forgotten) {
             say_fmt(ctx, who, format_args!("/wifi.keys written - {} network(s)", n));
         }
         for e in entries.iter_mut() {
@@ -489,6 +494,24 @@ pub fn serve<'s>(
 
     loop {
         if !keyfile_settled && radio.is_some() {
+            // The choice first, so the auto-join below knows whether it is this radio's to make.
+            if !choice_settled {
+                match keyfile::load_choice(ctx) {
+                    keyfile::Choice::Named(name, len) => {
+                        choice_settled = true;
+                        let mine = wire::radio_name(who).as_bytes() == &name[..len];
+                        choice_use = if mine { wire::USE_THIS } else { wire::USE_NOT };
+                        say_fmt(ctx, who, format_args!("/wifi.radio names {} - {}",
+                            core::str::from_utf8(&name[..len]).unwrap_or("?"),
+                            if mine { "this radio is the one in use" } else { "another radio is in use; this one does not rejoin" }));
+                    }
+                    keyfile::Choice::None => {
+                        choice_settled = true;
+                        choice_use = wire::USE_DEFAULT;
+                    }
+                    keyfile::Choice::Unreachable => {}
+                }
+            }
             let mut entries = [keyfile::Entry::EMPTY; keyfile::MAX_SAVED];
             match keyfile::load(ctx, who, &mut entries) {
                 keyfile::Load::Loaded(n) => {
@@ -525,13 +548,15 @@ pub fn serve<'s>(
             }
         }
         if let (Some((name, len, sec)), Some(session)) = (auto_join.take(), radio.as_deref_mut()) {
-            if radio_on && sweep.is_none() && joined.is_none() {
+            if choice_use == wire::USE_NOT {
+                say(ctx, who, "not rejoining the network last joined - another radio is the one in use (/wifi.radio)");
+            } else if radio_on && sweep.is_none() && joined.is_none() {
                 say(ctx, who, "joining the network last joined, from /wifi.keys");
                 match join_known(session, &name, len, sec, &mut stored, &mut joined,
                                  &mut joined_at_secs, &mut joined_security, &mut rxq, ctx) {
                     Some(Outcome::Joined) => {
                         last_joined = Some((name, len, sec));
-                        save_keys(ctx, who, &stored);
+                        save_keys(ctx, who, &stored, None);
                     }
                     Some(_) => say(ctx, who, "the network last joined did not take us back - not joined; `wifi join` when it is in range"),
                     None => {}
@@ -662,6 +687,25 @@ pub fn serve<'s>(
                     at += 1 + len;
                 }
                 at
+            }
+            // The radio the operator chose (`wire::OP_USE`): asked, or told. Answered in any state, since a
+            // radio that is down must still know it is not the one to rejoin.
+            (wire::OP_USE, _) => {
+                if let Some(&len) = payload.get(1) {
+                    let len = (len as usize).min(16);
+                    let name = payload.get(2..2 + len).unwrap_or(&[]);
+                    choice_use = if name.is_empty() {
+                        wire::USE_DEFAULT
+                    } else if name == wire::radio_name(who).as_bytes() {
+                        wire::USE_THIS
+                    } else {
+                        wire::USE_NOT
+                    };
+                    choice_settled = true;
+                }
+                out[0] = wire::OK;
+                out[1] = choice_use;
+                2
             }
             // One radio in full (`wifi hardware <radio>`): the host's facts, then the station's, and for a
             // radio with no station the reason its readings are missing. The station may ask the chip only
@@ -921,7 +965,7 @@ pub fn serve<'s>(
                                     out[4] = len;
                                     out[5..5 + SSID_MAX].copy_from_slice(&name);
                                     if outcome == Outcome::Joined {
-                                        save_keys(ctx, who, &stored);
+                                        save_keys(ctx, who, &stored, None);
                                     }
                                 }
                             }
@@ -1218,7 +1262,7 @@ pub fn serve<'s>(
                                     ));
                                 }
                                 if !matches!(secret, Secret::Open) {
-                                    save_keys(ctx, who, &stored);
+                                    save_keys(ctx, who, &stored, None);
                                 }
                             } else {
                                 joined = None;
@@ -1289,9 +1333,9 @@ pub fn serve<'s>(
                     }
                     None => false,
                 };
-                if dropped {
-                    save_keys(ctx, who, &stored);
-                }
+                // Saved whether or not THIS table held it: the file is shared with the other radio, which may
+                // be the one that added it, and the merge would otherwise keep it (`keyfile::save`).
+                save_keys(ctx, who, &stored, payload.get(2..2 + len));
                 out[0] = wire::OK;
                 out[1] = dropped as u8;
                 2
@@ -1342,7 +1386,9 @@ pub fn serve<'s>(
                 } else {
                     out[9..15].fill(0);
                 }
-                15
+                // Whether this is the radio in use (`wire::USE_*`), for `nic-driver`'s bridge.
+                out[15] = choice_use;
+                16
             }
             (wire::OP_NET_TX, Some(session)) => {
                 last_frame_op = Since::now(ctx);

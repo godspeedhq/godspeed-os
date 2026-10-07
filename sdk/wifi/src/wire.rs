@@ -136,6 +136,21 @@ pub const DETAIL_VALUE_MAX: usize = 96;
 /// The labels a `OP_HARDWARE_DETAIL` reply may carry, in the order a record has them. One list, so the
 /// shell's record and every driver's reply agree on the fields; a driver gives the ones it knows.
 pub const DETAIL_LABELS: [&str; 7] = ["chip", "id", "address", "firmware", "bus", "endpoints", "queues"];
+/// Request op byte: the radio the operator chose (`wifi hardware use`, `utilities/56_wifi.md` 11). `[14]`
+/// asks, `[14, len, name...]` tells - the name the shell wrote to `/wifi.radio`, or an empty name for no
+/// choice. Reply `[OK, use]`, one of the `USE_*` values, for this radio. The radio reads `/wifi.radio`
+/// itself at start, beside `/wifi.keys`; this keeps it current when the choice changes while it runs.
+pub const OP_USE: u8 = 14;
+/// Another radio is the one in use: this one does not rejoin at start, and `nic-driver` looks elsewhere.
+pub const USE_NOT: u8 = 0;
+/// This is the radio in use.
+pub const USE_THIS: u8 = 1;
+/// No choice is recorded: the default order decides (the onboard radio, else the dongle).
+pub const USE_DEFAULT: u8 = 2;
+/// The name a radio service goes by in `wifi hardware` and `/wifi.radio`: by what it is, not where.
+pub fn radio_name(service: &str) -> &'static str {
+    if service == "wifi-usb" { "usb" } else { "onboard" }
+}
 
 /// Sub-codes of `OP_DEBUG`, and their reply layouts.
 pub mod dbg {
@@ -157,7 +172,9 @@ pub mod dbg {
 /// start at 0x10 because they share the radio's endpoint with the `wifi` ops above; every reply opens
 /// with its op, because the caller bounds its wait and a late answer must not be read as the next one.
 ///
-/// `[0x10]` -> `[0x10, ok, mac(6), link, peer(6)]`; `peer` is the access point, zeros when not known.
+/// `[0x10]` -> `[0x10, ok, mac(6), link, peer(6), use]`; `peer` is the access point, zeros when not known;
+/// `use` is one of the `USE_*` values, so `nic-driver` follows the radio the operator chose
+/// (`wifi hardware use`, `utilities/56_wifi.md` 11) without holding the choice itself.
 pub const OP_NET_INFO: u8 = 0x10;
 /// `[0x11, ethernet frame...]` -> `[0x11, sent]`.
 pub const OP_NET_TX: u8 = 0x11;

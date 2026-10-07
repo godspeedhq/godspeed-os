@@ -1042,7 +1042,7 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("trace",  "chain",        CHAOS_RESTARTABLE),
     ("wifi",   "radio",        &["on", "off", "powercycle"]),
     // The radios by name (`wifi_radio_service`); `use` joins when it is built.
-    ("wifi",   "hardware",     &["onboard", "usb"]),
+    ("wifi",   "hardware",     &["onboard", "usb", "use"]),
     ("audio",  "off",          &["hard"]),
     ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
 ];
@@ -1118,6 +1118,7 @@ fn complete_with_help(ctx: &ServiceContext, line: &mut Line, tok_start: usize, c
 
 const SUBCMD_THIRD: &[(&str, &str, &str, &[&str])] = &[
     ("events", "persist", "start", &["sticky"]),
+    ("wifi", "hardware", "use", &["onboard", "usb"]),
 ];
 
 /// Commands whose FIRST argument is a command name rather than a path or a keyword.
@@ -5291,6 +5292,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wifi radio on|off|off hard|powercycle", "the radio's switch and the chip's power: `off` is the firmware's switch, `off hard` cuts the chip's power, `on` brings it back from either (cold from `off hard`), `powercycle` is off hard and on in one", "wifi radio off"),
             ("wifi hardware", "the radios this machine has, one record each: radio, chip, bus, state, network, in use", "wifi hardware"),
             ("wifi hardware <radio>", "one radio in full: chip, id, address, firmware, bus, endpoints, queues", "wifi hardware usb"),
+            ("wifi hardware use <radio>", "choose the radio the wifi verbs address and the link goes through", "wifi hardware use usb"),
         ], true),
         "audio" => help_block(ctx, "audio", "sound: what is playing, the volume, the codec's power, a test tone", &[
             ("audio", "this usage (rule 1: a bare utility name teaches its verbs)", "audio"),
@@ -5556,7 +5558,8 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi scan", "rows appear as heard, numbered; q stops the sweep, b leaves it running; then a number and Enter joins", "wifi scan"),
         ], false),
         ("wifi", "hardware") => help_block(ctx, "wifi hardware", "which radios this machine has (utilities/56_wifi.md 11)", &[
-            ("wifi hardware", "RADIO CHIP BUS STATE NETWORK IN-USE, one record per radio running now; `use` is specified, not built", "wifi hardware | where state=joined"),
+            ("wifi hardware", "RADIO CHIP BUS STATE NETWORK IN-USE, one record per radio running now", "wifi hardware | where state=joined"),
+            ("wifi hardware use <radio>", "make it the radio in use: it joins your network first, then carries the link; the other leaves", "wifi hardware use usb"),
             ("wifi hardware <radio>", "one radio in full: chip, id, address, firmware, bus, endpoints, queues, state - labelled lines", "wifi hardware usb"),
         ], false),
         ("wifi", "list") => help_block(ctx, "wifi list", "the last complete scan, as records", &[
@@ -8298,10 +8301,12 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     }
     if let Some(rest) = arg.strip_prefix("hardware ") {
         let rest = rest.trim();
-        if rest == "use" || rest.starts_with("use ") {
-            out.line_fmt(ctx, format_args!(
-                "wifi: `hardware use` is specified but not built yet - until it is, the first running radio carries the link (utilities/56_wifi.md 11)"));
+        if rest == "use" {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi hardware use <radio>  (onboard or usb - wifi hardware lists them)"));
             return Err(ShellError::Unknown);
+        }
+        if let Some(name) = rest.strip_prefix("use ") {
+            return wifi_hardware_use(ctx, out, name.trim());
         }
         return wifi_hardware_one(ctx, out, rest);
     }
@@ -8323,8 +8328,9 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         return Err(ShellError::Unknown);
     }
 
-    // Then the hardware question, which every verb shares.
-    match find_radio(ctx) {
+    // Then the hardware question, which every verb shares: the radio in use, which the operator may have
+    // chosen (`wifi hardware use`), else the first running one.
+    match radio_in_use(ctx) {
         None => {
             out.line_fmt(ctx, format_args!("no wireless radio on this machine"));
             // Say WHY rather than only what, so a reader on a board that HAS a radio knows where to
@@ -9109,18 +9115,17 @@ fn wifi_hardware_rows(ctx: &ShellCtx) -> [Option<WifiHw>; 2] {
     use wifi_wire::*;
     const REPLY_MS: u64 = 3000;
     let mut rows: [Option<WifiHw>; 2] = [None, None];
-    let mut first = true;
+    let using = radio_in_use(ctx);
     for (i, &svc) in RADIOS.iter().enumerate() {
         if slot_of(ctx, svc).is_none() {
             continue;
         }
         ctx.wifi_radio.set(svc);
         let mut row = WifiHw {
-            radio: if svc == "wifi-usb" { "usb" } else { "onboard" },
+            radio: radio_name(svc),
             chip: [0; HW_TEXT_MAX], chip_len: 0, bus: [0; HW_TEXT_MAX], bus_len: 0,
-            state: "not answering", network: [0; SSID_MAX], network_len: 0, in_use: first,
+            state: "not answering", network: [0; SSID_MAX], network_len: 0, in_use: using == Some(svc),
         };
-        first = false;
         if let Some(r) = wifi_ask(ctx, &[OP_HARDWARE], REPLY_MS) {
             let p = r.payload_bytes();
             if p.first() == Some(&OK) {
@@ -9182,6 +9187,131 @@ fn wifi_hardware(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             r.radio, if chip.is_empty() { "?" } else { chip }, if bus.is_empty() { "?" } else { bus },
             r.state, net, if r.in_use { "*" } else { "" }));
     }
+    Ok(())
+}
+
+/// The radio every `wifi` verb addresses: the one that says it is in use (`wire::OP_USE`, the operator's
+/// choice in `/wifi.radio`), else the first running one in `RADIOS` order - which is also what a choice of
+/// a radio that is not running falls back to (`utilities/56_wifi.md` 11). With one radio running nothing
+/// is asked.
+fn radio_in_use(ctx: &ShellCtx) -> Option<&'static str> {
+    use wifi_wire::*;
+    let first = find_radio(ctx)?;
+    let running = RADIOS.iter().filter(|r| slot_of(ctx, r).is_some()).count();
+    if running < 2 {
+        return Some(first);
+    }
+    let mut found = None;
+    for &svc in RADIOS.iter() {
+        if slot_of(ctx, svc).is_none() {
+            continue;
+        }
+        ctx.wifi_radio.set(svc);
+        if let Some(r) = wifi_ask(ctx, &[OP_USE], 1500) {
+            if r.payload_bytes() == [OK, USE_THIS] {
+                found = Some(svc);
+                break;
+            }
+        }
+    }
+    ctx.wifi_radio.set(RADIOS[0]);
+    found.or(Some(first))
+}
+
+/// The network the radio `ctx.wifi_radio` names is joined to, if it is: `(ssid, len)`.
+fn wifi_joined_to(ctx: &ShellCtx) -> Option<([u8; wifi_wire::SSID_MAX], usize)> {
+    use wifi_wire::*;
+    let r = wifi_ask(ctx, &[OP_STATUS], 3000)?;
+    let p = r.payload_bytes();
+    if p.first() != Some(&OK) || p.len() < 30 + SSID_MAX || p[9] == 0 || p[10] == 0 {
+        return None;
+    }
+    let len = core::cmp::min(p[28] as usize, SSID_MAX);
+    let mut ssid = [0u8; SSID_MAX];
+    ssid[..len].copy_from_slice(&p[29..29 + len]);
+    Some((ssid, len))
+}
+
+/// Where the shell keeps the operator's choice (`wifi hardware use`); the radios and, through them,
+/// `nic-driver` read it (`godspeed_wifi::keyfile::RADIO_PATH`).
+const RADIO_FILE: &[u8] = b"/wifi.radio";
+
+/// `wifi hardware use <radio>` (`utilities/56_wifi.md` 11): make `radio` the one every `wifi` verb
+/// addresses and the one `nic-driver` carries frames through when the cable is out.
+///
+/// In this order, so a step that fails loses nothing: the chosen radio joins the network the radio in use
+/// is on (its key from `/wifi.keys`, which both drivers share; asked for if it is not held); only once it
+/// is joined is the choice written to `/wifi.radio` and told to every radio (`wire::OP_USE`); then the radio
+/// that was in use leaves and stays up. `nic-driver` follows on its next look at the radios. Choosing the
+/// default radio - the first running one - removes the file rather than writing it, so no choice is
+/// recorded.
+fn wifi_hardware_use(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    let svc = match wifi_radio_service(name) {
+        Some(s) if slot_of(ctx, s).is_some() => s,
+        _ => {
+            out.line_fmt(ctx, format_args!("wifi: no radio called '{}' - wifi hardware lists them", name));
+            return Err(ShellError::Unknown);
+        }
+    };
+    let cur = radio_in_use(ctx);
+    if cur == Some(svc) {
+        out.line_fmt(ctx, format_args!("wifi: {} is already the radio in use", name));
+        return Ok(());
+    }
+    let cur_name = cur.map(radio_name).unwrap_or("none");
+    // 1. The chosen radio joins the network the one in use is on, before anything moves.
+    let net = cur.and_then(|c| {
+        ctx.wifi_radio.set(c);
+        wifi_joined_to(ctx)
+    });
+    if let Some((ssid, len)) = net {
+        ctx.wifi_radio.set(svc);
+        let already = wifi_joined_to(ctx).is_some_and(|(s2, l2)| s2[..l2] == ssid[..len]);
+        if !already {
+            let mut shown = [b'.'; SSID_MAX];
+            out.line_fmt(ctx, format_args!("wifi: joining {} on {} first - {} keeps the link until it has",
+                wifi_ssid_text(&ssid[..len], &mut shown), name, cur_name));
+            if wifi_join(ctx, out, &ssid[..len], &[]).is_err() {
+                ctx.wifi_radio.set(RADIOS[0]);
+                out.line_fmt(ctx, format_args!("wifi: {} did not join, so nothing changed - {} is still the radio in use", name, cur_name));
+                return Err(ShellError::Unknown);
+            }
+        }
+    }
+    // 2. The choice, written, then told to every radio. The default radio clears the file instead.
+    let default = find_radio(ctx);
+    let recorded = if default == Some(svc) {
+        let mut probe = [0u8; 16];
+        sh_delete(ctx, RADIO_FILE) || fs_read_file(ctx, RADIO_FILE, &mut probe, 2).is_none()
+    } else {
+        sh_write_within(ctx, RADIO_FILE, name.as_bytes(), 4)
+    };
+    if !recorded {
+        ctx.wifi_radio.set(RADIOS[0]);
+        out.line_fmt(ctx, format_args!("wifi: /wifi.radio could not be written - nothing changed; {} is still the radio in use", cur_name));
+        return Err(ShellError::Unknown);
+    }
+    let told: &[u8] = if default == Some(svc) { &[] } else { name.as_bytes() };
+    let mut req = [0u8; 2 + 16];
+    req[0] = OP_USE;
+    req[1] = told.len() as u8;
+    req[2..2 + told.len()].copy_from_slice(told);
+    for &r in RADIOS.iter() {
+        if slot_of(ctx, r).is_some() {
+            ctx.wifi_radio.set(r);
+            let _ = wifi_ask(ctx, &req[..2 + told.len()], 1500);
+        }
+    }
+    // 3. The radio that was in use leaves its network and stays up.
+    if let (Some(c), Some(_)) = (cur, net) {
+        ctx.wifi_radio.set(c);
+        let _ = wifi_leave(ctx, out);
+    }
+    ctx.wifi_radio.set(RADIOS[0]);
+    out.line_fmt(ctx, format_args!(
+        "wifi: {} is the radio in use{} - the wifi verbs address it, and it carries the link when the cable is out (nic-driver follows within a few seconds)",
+        name, if default == Some(svc) { " (the default; /wifi.radio removed)" } else { "" }));
     Ok(())
 }
 
@@ -9740,6 +9870,16 @@ fn wifi_forget(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellErr
         Some(r) => r,
         None => return wifi_not_answering(ctx, out),
     };
+    // The other radio too: both read and write `/wifi.keys`, and one that still held the key would put it
+    // back in the file on its next save (`godspeed_wifi::keyfile::save`).
+    let asked = ctx.wifi_radio.get();
+    for &other in RADIOS.iter() {
+        if other != asked && slot_of(ctx, other).is_some() {
+            ctx.wifi_radio.set(other);
+            let _ = wifi_ask(ctx, &req, REPLY_MS);
+        }
+    }
+    ctx.wifi_radio.set(asked);
     let p = r.payload_bytes();
     match p.first().copied() {
         Some(OK) if p.get(1).copied().unwrap_or(0) != 0 => {

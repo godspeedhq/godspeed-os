@@ -10,6 +10,7 @@
 //! USB dongle (`docs/wifi-usb.md`, R6). Both answer the same frame ops through the same serve loop.
 
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
+use godspeed::driver::wait::{self, Budget};
 
 /// Which link carries `net-stack`'s frames.
 ///
@@ -86,7 +87,21 @@ pub(crate) struct Radio {
     held: [Option<(Message, CapHandle)>; RADIO_HELD_MAX],
     rescued: u32,
     held_dropped: u32,
+    /// The OTHER radio service on a board with two (`wifi hardware use`, `utilities/56_wifi.md` 11): the
+    /// onboard radio's and the dongle's. `None` where there is one. See `info`.
+    other: Option<&'static str>,
+    /// When the other radio was last asked whether it is the one in use: at most every `OTHER_EVERY_MS`.
+    other_asked: Option<wait::Since>,
 }
+
+/// How often the other radio is asked whether it is the one in use, while the current one says it is
+/// not, or does not answer. Bounded, because asking a radio that is not there costs a timeout.
+const OTHER_EVERY_MS: u64 = 5_000;
+/// `wire::USE_*` (`sdk/wifi`), as literals for the reason the op numbers are: this crate does not link it.
+const USE_NOT: u8 = 0;
+const USE_THIS: u8 = 1;
+/// Where `[0x10]`'s reply carries the radio's `USE_*` value.
+const INFO_USE_AT: usize = 15;
 
 /// How many client requests the radio wait can keep for the serve loop. See `Radio::held`.
 const RADIO_HELD_MAX: usize = 2;
@@ -98,7 +113,30 @@ impl Radio {
             answered: 0, slow: 0, timeouts: 0, silent_run: 0, mismatch: 0, sendfail: 0, restale: 0,
             down_until: 0, backoffs: 0,
             held: [None, None], rescued: 0, held_dropped: 0,
+            other: None, other_asked: None,
         }
+    }
+
+    /// A radio bridge with a second radio to follow the operator's choice to (see `info`).
+    pub(crate) fn with_other(name: &'static str, other: &'static str) -> Self {
+        let mut r = Radio::new(name);
+        r.other = Some(other);
+        r
+    }
+
+    /// Ask `[0x10]` of the OTHER radio, leaving the current one's silence count and backoff as they were:
+    /// a probe of a radio that is not there must not hold the current one down.
+    fn ask_other(&mut self, ctx: &ServiceContext, other: &'static str) -> Option<Message> {
+        let (name, run, until, offs) = (self.name, self.silent_run, self.down_until, self.backoffs);
+        self.name = other;
+        self.silent_run = 0;
+        self.down_until = 0;
+        let r = self.rpc(ctx, &Message::from_bytes(&[0x10]));
+        self.name = name;
+        self.silent_run = run;
+        self.down_until = until;
+        self.backoffs = offs;
+        r
     }
 
     /// The oldest held request, if any - served before the next `recv`, because it arrived first.
@@ -241,7 +279,39 @@ impl Radio {
     /// `[0x10]` -> `(mac, link up, access point)`, or `None` when the radio did not answer or has no
     /// address yet. The access point is zeros when the radio does not know it.
     pub(crate) fn info(&mut self, ctx: &ServiceContext) -> Option<([u8; 6], bool, [u8; 6])> {
-        let r = self.rpc(ctx, &Message::from_bytes(&[0x10]))?;
+        let mut r = self.rpc(ctx, &Message::from_bytes(&[0x10]));
+        // FOLLOW THE RADIO IN USE (`wifi hardware use`). Each radio says in this reply whether it is the
+        // one the operator chose; this driver holds no choice of its own. While the current radio says
+        // another is in use, or does not answer, the other is asked (bounded, `OTHER_EVERY_MS`), and the
+        // frames move to it when it says it is the one - or when the current one is gone and the other
+        // answers, because a saved choice is a preference and a missing radio must not leave the machine
+        // without the one that is there (`utilities/56_wifi.md` 11).
+        let use_now = r.as_ref().and_then(|m| m.payload_bytes().get(INFO_USE_AT).copied());
+        if let Some(other) = self.other {
+            let want_other = r.is_none() || use_now == Some(USE_NOT);
+            let due = self.other_asked.as_ref().map_or(true, |t| t.passed(ctx, Budget::ms(OTHER_EVERY_MS)));
+            if want_other && due {
+                self.other_asked = Some(wait::Since::now(ctx));
+                if let Some(o) = self.ask_other(ctx, other) {
+                    let o_use = o.payload_bytes().get(INFO_USE_AT).copied();
+                    if o_use == Some(USE_THIS) || r.is_none() {
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio bridge now goes to {} ({}) - {} {}",
+                            other,
+                            if o_use == Some(USE_THIS) { "the radio in use, /wifi.radio" } else { "the one that answers" },
+                            self.name,
+                            if r.is_none() { "does not answer" } else { "is not the one in use" }));
+                        self.other = Some(self.name);
+                        self.name = other;
+                        self.silent_run = 0;
+                        self.down_until = 0;
+                        self.backoffs = 0;
+                        r = Some(o);
+                    }
+                }
+            }
+        }
+        let r = r?;
         let p = r.payload_bytes();
         if p.len() < 9 || p[1] == 0 {
             return None;

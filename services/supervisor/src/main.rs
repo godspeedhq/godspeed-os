@@ -367,8 +367,13 @@ mod board {
         // The radio is the link's other backend where there is one (docs/wifi.md 2): the cable always
         // wins, and when it is out nic-driver carries the frames to wifi-driver over the frame ops. A
         // board fact of its own (build.rs), held by the Pi 4's GENET and, since phase V6, the VisionFive's
-        // dwmac - both through `services/nic-driver/src/radio.rs`.
-        &["wifi-driver", "events"]
+        // dwmac - both through `services/nic-driver/src/radio.rs`. And the USB dongle's driver, embedded on
+        // both: the bridge follows whichever radio says it is the one in use (`wifi hardware use`,
+        // `utilities/56_wifi.md` 11). One branch, not a second keyed on `has_wifi_usb` as well, because
+        // `contract_check.py` reads this chain as text and takes one `cfg!` per branch. A declared peer
+        // whose service is not running is only reacquired later, so a bridge board without the dongle's
+        // driver would lose nothing by it.
+        &["wifi-driver", "wifi-usb", "events"]
     } else {
         &["events"]
     };

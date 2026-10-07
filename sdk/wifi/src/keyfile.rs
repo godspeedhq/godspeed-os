@@ -141,7 +141,88 @@ pub fn load(ctx: &ServiceContext, who: &str, out: &mut [Entry; MAX_SAVED]) -> Lo
 }
 
 /// Write the table, most recent first, at most `MAX_SAVED` entries. True when `fs` accepted it.
-pub fn save(ctx: &ServiceContext, who: &str, entries: &[Entry]) -> bool {
+///
+/// **MERGED WITH THE FILE, not written over it.** Two radio drivers keep this file - the onboard radio's
+/// and the dongle's (`utilities/56_wifi.md` 11) - each from its own table, so a save of one table alone
+/// would drop a key the other radio added. So the file is read first and its entries that this table does
+/// not hold are kept, after this table's, up to `MAX_SAVED`. `forgotten` is the network a `wifi forget`
+/// asked to drop: it is the one entry of the file NOT kept.
+pub fn save(ctx: &ServiceContext, who: &str, entries: &[Entry], forgotten: Option<&[u8]>) -> bool {
+    let mut file = [Entry::EMPTY; MAX_SAVED];
+    let in_file = match load(ctx, who, &mut file) {
+        Load::Loaded(n) => n,
+        _ => 0,
+    };
+    let mut merged = [Entry::EMPTY; MAX_SAVED];
+    let mut m = 0usize;
+    for e in entries.iter().take(MAX_SAVED) {
+        if forgotten.is_some_and(|f| f == &e.ssid[..e.len as usize]) {
+            continue;
+        }
+        merged[m] = *e;
+        m += 1;
+    }
+    for e in file.iter().take(in_file) {
+        if m == MAX_SAVED {
+            break;
+        }
+        let name = &e.ssid[..e.len as usize];
+        if forgotten.is_some_and(|f| f == name) || merged[..m].iter().any(|x| &x.ssid[..x.len as usize] == name) {
+            continue;
+        }
+        merged[m] = *e;
+        m += 1;
+    }
+    for e in file.iter_mut() {
+        e.pmk.fill(0);
+    }
+    let ok = write(ctx, who, &merged[..m]);
+    for e in merged.iter_mut() {
+        e.pmk.fill(0);
+    }
+    ok
+}
+
+/// The radio the operator chose (`wifi hardware use`), as the shell wrote it: `/wifi.radio`, holding the
+/// radio's name (`wire::radio_name`). Read beside `/wifi.keys`, with the same settling rules.
+pub const RADIO_PATH: &[u8] = b"/wifi.radio";
+
+/// What `/wifi.radio` says.
+pub enum Choice {
+    /// The radio by this name, `len` bytes of it.
+    Named([u8; 16], usize),
+    /// No choice recorded - no file, or no filesystem.
+    None,
+    /// `fs` did not answer, or its storage is in trouble: worth asking again.
+    Unreachable,
+}
+
+pub fn load_choice(ctx: &ServiceContext) -> Choice {
+    let mut req = [0u8; 3 + 32];
+    req[0] = TAG;
+    req[1] = FS_OP_READ;
+    req[2] = RADIO_PATH.len() as u8;
+    req[3..3 + RADIO_PATH.len()].copy_from_slice(RADIO_PATH);
+    let Some(r) = ask(ctx, &req[..3 + RADIO_PATH.len()]) else { return Choice::Unreachable };
+    let p = r.payload_bytes();
+    match p.get(1).copied() {
+        Some(FS_OK) if p.len() >= 6 => {}
+        Some(FS_NOTFOUND) | Some(FS_NOFS) => return Choice::None,
+        _ => return Choice::Unreachable,
+    }
+    let n = u32::from_le_bytes([p[2], p[3], p[4], p[5]]) as usize;
+    let data = &p[6..core::cmp::min(p.len(), 6 + n)];
+    let text = data.iter().position(|&b| b == b'\n' || b == 0).map_or(data, |i| &data[..i]);
+    if text.is_empty() || text.len() > 16 {
+        return Choice::None;
+    }
+    let mut name = [0u8; 16];
+    name[..text.len()].copy_from_slice(text);
+    Choice::Named(name, text.len())
+}
+
+/// Write `entries` as the whole file.
+fn write(ctx: &ServiceContext, who: &str, entries: &[Entry]) -> bool {
     let count = core::cmp::min(entries.len(), MAX_SAVED);
     let mut req = [0u8; 3 + 32 + HEADER + MAX_SAVED * ENTRY];
     req[0] = TAG;

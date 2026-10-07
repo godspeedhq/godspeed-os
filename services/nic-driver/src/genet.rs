@@ -1278,7 +1278,9 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
     let mut cable = link_was_up && mac.is_some();
     let mut cable_read_at = ctx.read_tsc();
     let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
-    let mut radio = Radio::new("wifi-driver");
+    // The onboard radio first, and the USB dongle's service as the other: the bridge follows whichever
+    // says it is the one in use (`wifi hardware use`, `Radio::info`).
+    let mut radio = Radio::with_other("wifi-driver", "wifi-usb");
     let mut radio_tx_fail: u32 = 0;
     let mut status_served: u32 = 0;
 
