@@ -2174,3 +2174,37 @@ after which sector 0 read `47 53 46 53` on every pass, `fs` worked, and both rad
 onboard one by `wifi join` and the dongle from the `/wifi.keys` that join wrote. The interrupt work that
 preceded this is reverted (sections 34, 35); a retry of it should run with a stick whose loss does not
 matter.
+
+## 37. `wifi hardware <radio>` and `wifi hardware use` on the Pi 4 (2026-10-07): the commands work; `nic-driver` did not follow, fixed, not yet seen
+
+`utilities/56_wifi.md` 11 and 11a, with both radios. What held:
+
+- **`wifi hardware usb` and `wifi hardware onboard`** gave every fact predicted: the dongle's chip from
+  `SYS_CFG` (RTL8188C, 1T1R, cut A, TSMC), its IDs, its efuse address, firmware 88.2, the bus as root port
+  1 > hub port 3, slot 3, the endpoints and queues; the onboard radio's address and firmware version from
+  the firmware. The `in use` lines agreed with the report's `*`.
+- **`wifi hardware use usb`** with both joined: the dongle already joined, so no join; the choice written,
+  the onboard radio `left` its network, and `wifi hardware` then marked `usb`.
+- **The reboot**: `wifi-usb: /wifi.radio names usb - this radio is the one in use`, rejoined; `wifi-driver:
+  not rejoining ... another radio is the one in use`. Only the dongle joined.
+- **`wifi forget`** went to both radios: `wifi-usb: /wifi.keys written - 0 network(s)` and then
+  `wifi-driver: /wifi.keys written - 0 network(s)`, so neither put the key back.
+- **`wifi hardware use onboard`**: `joining ... on onboard first`, the passphrase asked for (the forget
+  earlier in the run had dropped the key), `JOINED`, the dongle `left`, `/wifi.radio` removed, and
+  `nic-driver` back on the onboard radio within 15 s.
+
+**What did not: the link never moved to the dongle.** After `use usb`, and again after the reboot with
+`usb` chosen, `net` said `the cable is out and the radio is not joined` and `ping` had no link. There was
+no `the radio bridge now goes to wifi-usb` line at all. The cause is in the spawn log: `task: peer
+'wifi-usb' not yet registered, no SEND cap for 'nic-driver' (declared - will reacquire)`. `nic-driver`
+starts before the dongle's service, so it holds no cap to it, and the reacquire it does for a silent radio
+runs on the CURRENT radio's silence count, which the ask of the other radio deliberately leaves alone. So
+every ask of `wifi-usb` went to no cap and failed at once, and nothing ever looked the name up.
+
+**Fix:** `Radio::ask_other` reacquires the other radio's cap by name before each ask (at most every 5 s,
+`OTHER_EVERY_MS`), and does not ask at all when the name does not resolve. It also covers a dongle service
+respawned since the last ask. Built; not yet seen on hardware.
+
+Also seen, not changed: a `wifi hardware` straight after the onboard radio has left logs `wifi-driver: the
+firmware REFUSED the request - BCME_NOTASSOCIATED`, its status ask of a radio that is not associated. The
+report is right; the line is noise.

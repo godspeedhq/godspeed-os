@@ -126,7 +126,18 @@ impl Radio {
 
     /// Ask `[0x10]` of the OTHER radio, leaving the current one's silence count and backoff as they were:
     /// a probe of a radio that is not there must not hold the current one down.
+    ///
+    /// **The cap is reacquired by name first, every time.** This driver is spawned before the dongle's
+    /// service registers, so it starts with no cap to it at all ("peer 'wifi-usb' not yet registered"),
+    /// and the silence count that reacquires the current radio's cap is the one this ask leaves alone - so
+    /// the other was asked through nothing, forever, and the bridge never moved (Pi 4, 2026-10-07: `use
+    /// usb` reported, the link stayed down). A lookup is cheap and this runs at most every
+    /// `OTHER_EVERY_MS`; a name that does not resolve means the other radio is not running, and it is not
+    /// asked.
     fn ask_other(&mut self, ctx: &ServiceContext, other: &'static str) -> Option<Message> {
+        if !godspeed::cap::reacquire(ctx, other) {
+            return None;
+        }
         let (name, run, until, offs) = (self.name, self.silent_run, self.down_until, self.backoffs);
         self.name = other;
         self.silent_run = 0;
