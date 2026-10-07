@@ -740,7 +740,7 @@ pub fn is_endpoint_alive(endpoint: EndpointId) -> bool {
 }
 
 /// INSTRUMENT (backlog/66): `(messages queued, the task slot recorded as its blocked receiver)` for
-/// `endpoint`, or `None` if it is not found. For the scheduler's lost-wake check only.
+/// `endpoint`, or `None` if it is not found. For the scheduler's flight recorder only.
 pub fn receiver_view(endpoint: EndpointId) -> Option<(usize, Option<usize>)> {
     let table = TABLE.lock_irq();
     table.iter()

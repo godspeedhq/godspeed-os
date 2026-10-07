@@ -100,6 +100,10 @@ fn core_still_using(cid: usize, slot: usize) -> bool {
 fn core_release_current(cid: usize, to: usize) {
     wake_gap_check(cid, to);
     let leaving = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
+    if leaving != to {
+        if leaving < MAX_TASKS { fl_note(fl::OFF, leaving, TASK_STATE[leaving].load(Ordering::Relaxed) as u64); }
+        if to < MAX_TASKS { fl_note(fl::RUN, to, 0); }
+    }
     // ORDER MATTERS AND SO DOES SeqCst: the killer must not be able to observe the release without
     // also observing the claim, or it concludes nobody is using a task this core is still standing on.
     CORE_LEAVING.get(cid).0.store(leaving as u64, Ordering::SeqCst);
@@ -358,6 +362,7 @@ pub fn scan_timed_wakes() {
             && TASK_STATE[slot].load(Ordering::Relaxed) == TaskState::BlockedOnRecv as u8
         {
             TASK_WAKE_DEADLINE[slot].store(0, Ordering::Relaxed);
+            fl_note(fl::DEADLINE, slot, 0);
             wake_by_slot(slot, 0);
         }
     }
@@ -637,54 +642,95 @@ static WOKEN_CORE: [portable_atomic::AtomicU64; MAX_TASKS] =
 /// 100 ms, in 10 ms BSP ticks: well above a scheduling round on a core with a handful of tasks.
 const WAKE_GAP_SAY_TICKS: u64 = 10;
 
-/// LOST WAKE, caught where it sits (backlog/66, 2026-10-07). The Pi 4 log with `nic-driver` timing its
-/// own work showed every late request answered 1-2 ms after it was TAKEN, and taken ~30 ms after
-/// net-stack's one-second wait gave up - with no wake-to-run gap reported. So the request sat in the
-/// queue for a second while nothing woke the receiver. This looks for exactly that, from the BSP tick: a
-/// task `BlockedOnRecv` on its own endpoint (not in a `Call`, which legitimately leaves other messages
-/// queued), with messages queued there, for `STUCK_SAY_TICKS` or more - and says whether the routing
-/// entry still records it as the blocked receiver. Recorded: a wake was lost after registration. Not
-/// recorded: the registration itself was lost. Diagnostic; it goes when the fault does.
-static STUCK_SINCE: [portable_atomic::AtomicU64; MAX_TASKS] =
-    [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
-static STUCK_SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// 50 ms in BSP ticks: far longer than any wake takes to land, far shorter than net-stack's second.
-const STUCK_SAY_TICKS: u64 = 5;
-/// Set in `STUCK_SINCE` once an episode has been said, so it is said once.
-const STUCK_SAID_BIT: u64 = 1 << 63;
+/// FLIGHT RECORDER (backlog/66, 2026-10-07). Over the radio, on the Pi 4 and the VisionFive, a request to
+/// `nic-driver` is taken about a second after `net-stack` sent it and answered 1-2 ms after it is taken.
+/// Checks that each tested one explanation ruled them out one at a time; this records instead. Every IPC
+/// event touching the three tasks on that path - `net-stack`, `nic-driver`, `wifi-driver` - goes into a
+/// ring with the cycle counter: each send and what it did (woke a receiver, queued, refused), each
+/// receive (got a message, or found none and is about to block), each block and each declined block,
+/// each wake and the state it lifted the task out of, each switch on and off a core, and each timed
+/// wake. When `nic-driver`'s endpoint has held mail without a break for `FL_STUCK_TICKS`, the ring is
+/// printed, oldest first, so the second is read rather than inferred. Diagnostic; it goes with the fault.
+pub mod fl {
+    pub const SEND: u8 = 1;      // a = (result << 32) | endpoint low 32; result 0 queued, 1 woke, 2 full, 3 err
+    pub const GOT: u8 = 2;       // recv dequeued a message; a = 1 for a timed recv
+    pub const EMPTY: u8 = 3;     // recv found the queue empty and is about to block; a = 1 for a timed recv
+    pub const BLOCK: u8 = 4;     // blocked; a = state
+    pub const NOBLOCK: u8 = 5;   // declined to block; a = 1 wake pending, 2 state no longer Running
+    pub const WAKE: u8 = 6;      // made Ready; a = (state it was in << 8) | waking slot (0xFF = none)
+    pub const RUN: u8 = 7;       // switched onto its core
+    pub const OFF: u8 = 8;       // switched off its core; a = its state then
+    pub const TIMEOUT: u8 = 9;   // recv_timeout returned its timeout
+    pub const DEADLINE: u8 = 10; // the BSP scan's timed wake fired for it
+}
+const FL_LEN: usize = 512;
+static FL_CYC: [portable_atomic::AtomicU64; FL_LEN] = [const { portable_atomic::AtomicU64::new(0) }; FL_LEN];
+static FL_EV: [portable_atomic::AtomicU64; FL_LEN] = [const { portable_atomic::AtomicU64::new(0) }; FL_LEN];
+static FL_HEAD: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+fn fl_traced(slot: usize) -> bool {
+    slot < MAX_TASKS && matches!(task_name(slot), "nic-driver" | "net-stack" | "wifi-driver")
+}
+
+/// Record `kind` for `slot` if it is one of the traced tasks. Lock-free; a torn entry under a race is
+/// possible and harmless for a diagnostic.
+pub fn fl_note(kind: u8, slot: usize, a: u64) {
+    if !fl_traced(slot) { return; }
+    let i = (FL_HEAD.fetch_add(1, Ordering::Relaxed) as usize) % FL_LEN;
+    let core = current_core_id() as u64 & 0xFF;
+    FL_CYC[i].store(crate::arch::imp::read_cycle_counter(), Ordering::Relaxed);
+    FL_EV[i].store(((kind as u64) << 56) | ((slot as u64 & 0xFF) << 48) | (core << 40)
+        | (a & 0xFF_FFFF_FFFF), Ordering::Relaxed);
+}
+
+static FL_STUCK_SINCE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+static FL_DUMPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 300 ms in BSP ticks: `nic-driver` answers in milliseconds, so mail held this long is the fault.
+const FL_STUCK_TICKS: u64 = 30;
+const FL_DUMPS_MAX: u32 = 3;
+const FL_DUMP_EVENTS: u64 = 80;
 
 fn lost_wake_check(now: u64) {
-    if now % 2 != 0 { return; }
-    for slot in 0..MAX_TASKS {
-        let blocked = TASK_VALID[slot].load(Ordering::Acquire)
-            && TaskState::from(TASK_STATE[slot].load(Ordering::Acquire)) == TaskState::BlockedOnRecv
-            && crate::ipc::routing::call_await_endpoint(slot) == 0;
-        let view = if blocked {
-            ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed))
-                .and_then(crate::ipc::routing::receiver_view)
-        } else {
-            None
+    if now % 2 != 0 || FL_DUMPS.load(Ordering::Relaxed) >= FL_DUMPS_MAX { return; }
+    let Some(nic) = (0..MAX_TASKS).find(|&s| TASK_VALID[s].load(Ordering::Acquire)
+        && task_name(s) == "nic-driver"
+        && TaskState::from(TASK_STATE[s].load(Ordering::Acquire)) != TaskState::Dead) else { return };
+    let view = ep_from_u64(TASK_ENDPOINT[nic].load(Ordering::Relaxed)).and_then(crate::ipc::routing::receiver_view);
+    let Some((queued, rx)) = view.filter(|v| v.0 > 0) else {
+        FL_STUCK_SINCE.store(0, Ordering::Relaxed);
+        return;
+    };
+    let since = FL_STUCK_SINCE.load(Ordering::Relaxed);
+    if since == 0 { FL_STUCK_SINCE.store(now, Ordering::Relaxed); return; }
+    if since == u64::MAX || now.saturating_sub(since) < FL_STUCK_TICKS { return; }
+    FL_STUCK_SINCE.store(u64::MAX, Ordering::Relaxed); // said; re-armed when the queue empties
+    let n = FL_DUMPS.fetch_add(1, Ordering::Relaxed) + 1;
+    let state = TaskState::from(TASK_STATE[nic].load(Ordering::Acquire));
+    let q = crate::arch::imp::boot::tsc_ticks_per_quantum().max(1);
+    let t_now = crate::arch::imp::read_cycle_counter();
+    crate::kprintln!(
+        "flight #{}: nic-driver (slot {}, endpoint {:#x}) has held mail {} ms without a break ({} queued, receiver recorded: {}, {:?}, wake pending {}) - last {} events, oldest first, us before now (counter {} per 10 ms):",
+        n, nic, TASK_ENDPOINT[nic].load(Ordering::Relaxed), (now - since) * 10, queued,
+        rx.map_or("none", |r| if r == nic { "itself" } else { "OTHER" }),
+        state, TASK_WAKE_PENDING[nic].load(Ordering::Relaxed), FL_DUMP_EVENTS, q);
+    let head = FL_HEAD.load(Ordering::Relaxed);
+    let from = head.saturating_sub(FL_DUMP_EVENTS);
+    for k in from..head {
+        let i = (k as usize) % FL_LEN;
+        let ev = FL_EV[i].load(Ordering::Relaxed);
+        let ago = t_now.wrapping_sub(FL_CYC[i].load(Ordering::Relaxed)).saturating_mul(10_000) / q;
+        let kind = (ev >> 56) as u8;
+        let slot = ((ev >> 48) & 0xFF) as usize;
+        let core = (ev >> 40) & 0xFF;
+        let a = ev & 0xFF_FFFF_FFFF;
+        let what = match kind {
+            fl::SEND => "send", fl::GOT => "got", fl::EMPTY => "empty", fl::BLOCK => "block",
+            fl::NOBLOCK => "noblock", fl::WAKE => "wake", fl::RUN => "run", fl::OFF => "off",
+            fl::TIMEOUT => "timeout", fl::DEADLINE => "deadline", _ => "?",
         };
-        let Some((queued, rx)) = view.filter(|v| v.0 > 0) else {
-            STUCK_SINCE[slot].store(0, Ordering::Relaxed);
-            continue;
-        };
-        let since = STUCK_SINCE[slot].load(Ordering::Relaxed);
-        if since == 0 {
-            STUCK_SINCE[slot].store(now, Ordering::Relaxed);
-            continue;
-        }
-        if since & STUCK_SAID_BIT != 0 || now.saturating_sub(since) < STUCK_SAY_TICKS { continue; }
-        STUCK_SINCE[slot].store(since | STUCK_SAID_BIT, Ordering::Relaxed);
-        let n = STUCK_SAID.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 20 || n % 64 == 0 {
-            crate::kprintln!(
-                "sched: '{}' is blocked in recv with {} message(s) queued on its endpoint for {} ms - recorded as its receiver: {}; wake pending: {} (x{})",
-                task_name(slot), queued, (now - since) * 10,
-                match rx { Some(r) if r == slot => "yes", Some(_) => "ANOTHER slot", None => "NO" },
-                TASK_WAKE_PENDING[slot].load(Ordering::Relaxed), n);
-        }
+        crate::kprintln!("fl {:>8} c{} {:<11} {:<8} {:#x}", ago, core, task_name(slot), what, a);
     }
+    crate::kprintln!("flight #{} end", n);
 }
 
 /// Called on every switch to `to`: if a wake made it Ready, how long ago (see `WOKEN_AT`).
@@ -2327,6 +2373,10 @@ pub fn wake_by_slot(slot: usize, result: i64) {
 
             let task_core = TASK_CORE[slot] as usize;
             let my_core   = current_core_id();
+            {
+                let waker = CORE_CURRENT.get(my_core).load(Ordering::Relaxed);
+                fl_note(fl::WAKE, slot, ((current as u64) << 8) | if waker < MAX_TASKS { waker as u64 & 0xFF } else { 0xFF });
+            }
             // The earliest wake since it last ran (`WOKEN_AT`); a second wake before it runs keeps the first.
             // ONLY a wake out of a BLOCKED state: one that reaches a task still Running (between its
             // registration and `block_and_reschedule`, the `TASK_WAKE_PENDING` race) leaves it running
@@ -2339,8 +2389,10 @@ pub fn wake_by_slot(slot: usize, result: i64) {
                 .is_ok()
             {
                 WOKEN_HALTS[slot].store(core_idle_halts(task_core), Ordering::Relaxed);
-                WOKEN_CORE[slot].store(task_core as u64, Ordering::Relaxed);
             }
+            // On EVERY wake, not only a stamped one: the aged-message check (`lost_wake_check`) reads
+            // the core from here, since `TASK_CORE` is not readable outside an unsafe block.
+            WOKEN_CORE[slot].store(task_core as u64, Ordering::Relaxed);
 
             if task_core != my_core {
                 // Cross-core wakeup: the target core's pick_next may be deep into
@@ -3138,6 +3190,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         if state == TaskState::BlockedOnRecv
             && TASK_WAKE_PENDING[slot].swap(false, Ordering::AcqRel)
         {
+            fl_note(fl::NOBLOCK, slot, 1);
             crate::arch::imp::enable_interrupts();
             return 0;
         }
@@ -3158,10 +3211,12 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
             Ordering::Acquire,
         ).is_err() {
             // CAS failed: wake_by_slot already set state to Ready (lost-wakeup prevention).
+            fl_note(fl::NOBLOCK, slot, 2);
             crate::arch::imp::enable_interrupts();
             return TASK_WAKEUP_ERR[slot];
         }
 
+        fl_note(fl::BLOCK, slot, state as u64);
         let current_ctx = TASK_CTX[slot].assume_init_mut() as *mut TaskContext;
 
         // Save user_rsp before switching away: the SYSRETQ exit on resume must
