@@ -2769,3 +2769,8 @@ unchanged).
 finish reset`; a plug pushed in slowly may show `the connection did not settle within 2 s` once, then
 bind when it settles. Powercycles and replugs as before: no `did not decrypt`, no repeated `device
 REMOVED`.
+
+**That card's run (Pi 2, 2026-10-07): as predicted.** The same physical chaos - five moves between hub
+ports 2 and 4 and powercycles: five `device REMOVED`, five `device CONNECTED`, every move bound on its new
+port, and no `did not finish reset`, no `did not settle`, no failed enumeration. Seven joins, no `did not
+decrypt`; pings 2/2, 3/3, 2/2, 3/3, 3/3 and one 3 of 5 just after a move. No panic.
