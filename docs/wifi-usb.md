@@ -1784,7 +1784,7 @@ The U2a work on the Pi 4, in order of what each run showed: the reports and the 
 (confirmed), the wrap's TRB Error located at the Link's slot (measured), a zeroed next page and a cleared
 ring (both refuted as the cure, both kept as correct ring hygiene), the eager Link (confirmed).
 
-## 28. U2b (2026-10-06): the bulk IN through `xhci` - built, not yet on hardware
+## 28. U2b (2026-10-06): the bulk IN through `xhci` - hardware-verified on the Pi 4 (2026-10-07, with section 30's fix)
 
 Received frames, through the Pi 4's `xhci` first (the operator's test board; the T630 later).
 
@@ -1829,6 +1829,23 @@ The U2b image on the operator's SD card was built before the fix.
 **Refuted by:** a Configure Endpoint failure; no first bulk IN transfer; a `bulk IN transfer failed` that
 recurs; EP0 transfers failing where section 27's did not (the endpoint matching wrong).
 
+**Result (2026-10-07, the Pi 4, the card `card/u2b-sync`: U2b plus only section 30's fix): all four
+predictions met.** With the dongle plugged in at the prompt, on hub port 3 behind the VL805:
+`bulk IN 0x81 configured (DCI 3, mps 512) - receive ready (U2b)`; the bring-up to R11 as in section 27;
+`receive started`; `the WiFi dongle's first bulk IN transfer - 284 bytes (U2b)`; `the FIRST frame from
+the air - a 284-byte transfer; R3b done`; eight networks named on channel 1, each once. Receive kept
+going: `rx - 1024 transfers, 1024 frames (951 beacons, 0 failed their CRC, 0 cut short), 8 networks
+named` twelve seconds later, and the counts were still rising when the log ended. The probe request, the
+auto-join's authentication and its deauthentication each said `was not sent - the device or the bus did
+not take it`, as prediction 4 says: U2c's work, and the onboard radio carried on untouched.
+
+Section 30's fix was seen working in the same run: three `wifi-usb took NOTE_BULK_IN in place of an
+answer (OP_SYNC, N so far) - sent again once it is quiet` lines, during the join, and receive carried on
+after every one. Without the fix, receive would have stopped at the first.
+
+The same log found a second fault, with the dongle plugged in at BOOT rather than at the prompt
+(section 31).
+
 ## 29. U2c (2026-10-06): the bulk OUTs through `xhci` - built, not yet on hardware
 
 Built while the operator was away, on top of U2b, and held off the card until U2b has run, so each flash
@@ -1869,7 +1886,7 @@ this path has had that length yet.
 **Refuted by:** a Configure Endpoint failure; `bulk OUT ... failed` lines; no probe response; U2b's
 receive breaking.
 
-## 30. `OP_SYNC` for both of `xhci`'s notices (2026-10-07) - found by an audit, built, not yet on hardware
+## 30. `OP_SYNC` for both of `xhci`'s notices (2026-10-07) - found by an audit, hardware-verified on the Pi 4 (section 28's result)
 
 **What was wrong.** `usbfn::OP_SYNC` is how a `wifi-usb` with no reply mailbox recovers a notice it took
 in place of an answer (section 19): it names the notice, and the host gives the reply capability back and
@@ -1900,3 +1917,33 @@ reaches it (no dongle there).
 frames for this reason alone. Section 28's predictions stand for U2b with this fix; a `took NOTE_BULK_IN
 in place of an answer` line followed by more beacons is this section working, and receive stopping right
 after that line refutes it.
+
+**Result (2026-10-07):** three such lines during the join, more beacons after each, and 1024 frames
+received in the next twelve seconds (section 28's result).
+
+## 31. A dongle present at boot re-enumerated the controller under its driver (2026-10-07) - fixed, not yet on hardware
+
+**What was seen.** On the U2b card the dongle was on hub port 1 when the Pi 4 booted. `xhci` bound it
+during the boot enumeration and the supervisor started `wifi-usb`, which got as far as R2. About 1.3 s
+after the bind, `xhci` logged `new device on hub slot 1 port 1 - re-enumerating` and reset the whole
+controller. The dongle came back bound in the same slot, but its driver's set-up had been cut off under
+it, and it stopped: `the radio's set-up stopped - a link-list entry was never taken (LLT_INIT stayed
+busy)`. The run then went on with the dongle unplugged and plugged in again at the prompt, which is
+section 28's result.
+
+**Why.** Each of `xhci`'s two hub scans (the one driven by a bound keyboard and the one driven by the
+disk) checks its match arms in order. The arm that takes a connected port that has not been tried yet as
+an ARRIVAL came before the arm that knows the port is the dongle's. A port is marked tried only by an
+arrival the scan itself saw. A dongle plugged in at the prompt arrives that way and is marked, so section
+27's card never met this. One bound during enumeration, as at boot, is not marked, so the scan's second
+connected read of it counted as a new device and re-enumerated. Each scan does this at most once, because
+the arrival arm marks the port as tried.
+
+**The fix:** the dongle's "still connected" arm now comes first in both scans, so the dongle's own port is
+never taken for an arrival. The unplug arm already came before the arm for an empty port and is
+unchanged.
+
+**Prediction, Pi 4, dongle plugged in BEFORE power-on:** no `new device on hub slot 1 port <the dongle's>`
+line and no `xhci: reset: entering` after the boot enumeration. The driver goes on through R11 to `receive
+started` and beacons, as in section 28. **Refuted by:** a re-enumeration naming the dongle's port while
+it is bound.

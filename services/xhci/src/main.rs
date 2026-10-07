@@ -5210,6 +5210,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // the retry mask, a port holding something we cannot bind re-enumerates the
                         // whole controller on every pass.
                         match st {
+                            // The WiFi dongle's own port, still connected: not an arrival. This arm
+                            // must come BEFORE the arrival arm. A dongle bound by enumeration, as at
+                            // boot, never had its port marked tried, so the arrival arm took its
+                            // second connected read for a new device and re-enumerated the controller
+                            // under the driver's set-up (docs/wifi-usb.md 31). A dongle plugged in
+                            // later was marked by its own arrival, which is why that case never met it.
+                            Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hub_slot && r.hub_port == hp as u32) => {
+                                radio_absent_seen = 0;
+                            }
                             // The bind guard lives HERE now (see the scan gate above): only a free
                             // HID slice makes an arrival actionable. A full table still watches.
                             // CONFIRM the arrival: one connected read is a reading, two is an event.
@@ -5236,9 +5245,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     announce = true;
                                     break 'poll;
                                 }
-                            }
-                            Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hub_slot && r.hub_port == hp as u32) => {
-                                radio_absent_seen = 0;
                             }
                             Some(false) if hp < 64 => {
                                 // Empty resets the confirmation run: two connected reads must be
@@ -5331,6 +5337,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             Some(true) if is_disk_port => {
                                 disk_absent_seen = 0;
                             }
+                            // The WiFi dongle's own port, still connected: ahead of the arrival arm,
+                            // for the reason given in the HID-driven scan.
+                            Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hs && r.hub_port == hp as u32) => {
+                                radio_absent_seen = 0;
+                            }
                             // Connected AND not already tried: a real arrival.
                             Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0 => {
                                 hub_tried |= 1u64 << hp;
@@ -5354,9 +5365,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     disk_hub_pcs = pcs;
                                     break 'poll;
                                 }
-                            }
-                            Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hs && r.hub_port == hp as u32) => {
-                                radio_absent_seen = 0;
                             }
                             // Gone: forget that we tried, so a replug counts as new again.
                             Some(false) if hp < 64 => {
