@@ -141,7 +141,7 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi radio off hard` | the CHIP's power, cut and left cut. BLOCKS for about three seconds with NO key, until the driver has left the network, cut the power and the kernel has read the pin back low; the driver then checks the cut on its own bus (a CMD52 50 ms later that nothing should answer) and the shell prints `... - verified: ...`, says unverified when the check could not be made, or `... FAILED ...` when the chip still answered (`docs/wifi.md` 49; not yet run on hardware). There is no `q`, because this cannot be stopped once asked, and no `b` either: it offered `[b] background` until 2026-10-01, but the request is a kernel `Call` and a shell blocked in one cannot read the console, so the key could never have been seen in time. The driver stays alive to answer: `wifi status` says `radio off (hard - the chip is powered down; wifi radio on powers it up)`, every other request answers that the chip is powered down. `wifi radio on` from this state restores the power, prints `radio powered up - starting the driver on the cold chip`, restarts the driver, and watches the cold path like `powercycle` does, ending `radio on succeeded - joined <name>`. About twenty seconds; the soft `off`/`on` stay the two-second switch. `on` after `off hard` can still come up WARM - it did at 09:44 and 14:43 on 2026-10-01 - and then, after its one attempt, returns to the prompt saying `wifi radio powercycle` tries once more; `off hard` cuts and verifies the power, it does not produce a cold chip on demand (`docs/wifi.md` 47, 48). **On a USB dongle (`wifi-usb`, `docs/wifi-usb.md` 18) the power is its port's and is not touched.** `off hard` there is the chip's own power-down, Linux's `rtl8192cu_power_off`: the network left, the firmware asked to stop and stopped from the host if it does not answer, the chip suspended. Its check is that no firmware is marked running. `on` and `powercycle` restart the driver, whose bring-up powers the chip on and uploads its firmware. A dongle that no longer answers on USB cannot be powered down this way; the driver says so, and only unplugging it helps |
 | `wifi radio powercycle` | the CHIP's power, not the firmware's radio switch: the driver cuts and restores it through the kernel's `DevicePower` (its own grant, renewable - CLAUDE.md 12.3), and the shell then restarts the driver, which comes up from power-on and rejoins from `/wifi.keys`. The power request itself is bounded at fifteen seconds before the watch begins. Then it says `radio powered down for 2.0 s - restarting the driver on the cold chip` (with ` (the network is left)` before the dash when it was joined), and BLOCKS with `[q] quit  [b] background`, printing each change of state as the driver answers its status question - `waiting for the driver`, `radio coming up`, `radio up, joining` - and ends in one of two lines: `powercycle succeeded - joined <name>`, or `powercycle failed - <why>` (the driver did not answer, this machine has no control over the radio's power, the driver could not be restarted, or the radio did not rejoin within 90 s and where it got to). VERIFIED: success is a join younger than the watch itself, so a stale answer from before the restart cannot pass for one; and a driver that comes back with its radio down means the chip came up warm - its firmware trapped at start - and the shell reports it and stops: ONE cycle per invocation (attempts on the same chip were not independent, so a retry only hid the cause; `docs/wifi.md` 52), re-runnable by hand. The driver waits 300 ms after power-on before its first command (`POWER_ON_SETTLE_MS`; five seconds was tried in section 52, changed nothing, and was reverted). BOUNDED at the operator's word: a warm chip ends `powercycle failed - the chip came up warm (its firmware trapped at start; ...)`, returns the prompt, and can be run again - nothing needs a reboot. The driver parks its SDIO host for the whole off window. The "warm starts" this paragraph once expected were a slow host - the Arm cores at their minimum clock - and with the `power` service's lease every power cycle has come up cold (`docs/wifi.md` 55-57). `q` leaves the watch. `q` and `b` both return to the prompt and say the power cycle continues in the driver: once the power is cut there is nothing to stop (`docs/wifi.md` 47) |
 | `wifi hardware` | BUILT (section 11): the radios this machine has, one row each - its name, chip, bus, state, network and whether it is the one in use. A report: it pipes |
-| `wifi hardware <radio>` | SPECIFIED, NOT BUILT (section 11a): one radio in full - the chip as the driver read it, its firmware, its address, and the bus it is reached over down to the port and endpoints. Labelled lines, like `wifi info`: it pipes |
+| `wifi hardware <radio>` | BUILT (section 11a): one radio in full - the chip as the driver read it, its firmware, its address, and the bus it is reached over down to the port and endpoints. Labelled lines, like `wifi info`: it pipes |
 | `wifi hardware use <radio>` | SPECIFIED, NOT BUILT (section 11): choose the radio every other `wifi` verb talks to and that carries the frames when the cable is out - `onboard`, `usb`, or `usb-1a0d` when there is more than one dongle. An action: it does not pipe |
 | `wifi help` | usage, with one real example per row |
 | `wifi version` | version number plus the collective copyright line |
@@ -630,7 +630,7 @@ cable, switch to wifi automatically."*
   2) - one comparison, `Carrier` in its genet backend. `net-stack` never learns there are two links, and
   the `wifi` utility never learns there is a cable.
 
-## 11. Which radio: `wifi hardware` - the report BUILT (2026-10-06); `use` and one radio in full (11a) SPECIFIED, NOT BUILT
+## 11. Which radio: `wifi hardware` - the report BUILT (2026-10-06); one radio in full (11a) BUILT (2026-10-07); `use` SPECIFIED, NOT BUILT
 
 Agreed with the operator on 2026-10-06, while the USB dongle was being brought to `xhci` (`docs/wifi-usb.md`
 section 7, U2). Until then every machine has had at most one radio, and the shell takes the first of its
@@ -719,7 +719,7 @@ frames when the cable is out. It is an action and does not pipe.
   could drop a key the other added. A save re-reads the file and merges before writing.
 - **`nic-driver` asks a radio what it is joined to**, which it does not do today.
 
-### 11a. One radio in full: `wifi hardware <radio>` - SPECIFIED, NOT BUILT
+### 11a. One radio in full: `wifi hardware <radio>` - BUILT (2026-10-07), checked in QEMU, not yet on hardware
 
 Asked for by the operator on 2026-10-07, as `wifi hardware details usb<x>`. Built without the word
 `details`: naming a radio already means "tell me about this one", as `dir` with and without a path
@@ -728,7 +728,26 @@ be confused.
 
 The report (section 11) is the summary, one row per radio. This is the raw account of one: what the
 driver read from the chip, and how the machine reaches it. Like `wifi info` it is labelled lines, so it
-pipes (`wifi hardware usb | match firmware`), and `| to json` gives one record with these fields.
+pipes the way `wifi info` does (`wifi hardware usb | match firmware`).
+
+**As built (2026-10-07).** The driver answers `wire::OP_HARDWARE_DETAIL` with labelled facts, each label
+one of `wire::DETAIL_LABELS`; the shell prints `radio` and `driver`, then the facts in that list's order,
+then `state` and `in use`. The host's facts (`serve::Host::details`) come in any state, the station's
+(`Station::details`) only while there is one; a radio with no station says `firmware   not running -
+the radio is down`. `wifi-driver`'s loop for a radio that never came up answers too, with the bus and
+`chip   not identified`. Differences from the examples below: `dwc2` does not report where the dongle is
+yet, so on the Pi 2 the bus line says so; the USB speed is not reported; the onboard radio's chip line is
+its name, without a revision. Checked in QEMU on the Pi 4 image, where `wifi-driver` runs with no card:
+
+```
+radio      onboard
+driver     wifi-driver
+chip       not identified - the bring-up stopped before one was
+firmware   not running - the radio is down
+bus        SDIO, card clock asked 25 MHz, function 2 at 512-byte blocks
+state      down
+in use     yes
+```
 
 ```
 gsh> wifi hardware usb
@@ -763,11 +782,10 @@ onboard radio's revision, firmware version and clock are illustrative, and both 
   only one the shell already asks, and it is the one that read the chip.
 - **The chip, its address and its firmware** are the driver's own readings: the efuse and the version
   the firmware reported for the dongle, and the chip ID and firmware version for the onboard radio.
-- **The bus lines on a USB radio come from its host**, which the driver relays: speed, host, port path,
-  slot, endpoints and packet sizes. Today the host tells `wifi-usb` only that a dongle is bound and its
-  IDs, so `usbfn`'s bind answer gains the port path, the speed and the endpoint table. That is a change
-  to `xhci` and `dwc2` as well as the driver. The driver does not work them out itself, because only the
-  host enumerated the device.
+- **The bus lines on a USB radio come from its host**, which the driver relays: host, port path, slot,
+  endpoints and the IN packet size. `usbfn::OP_INFO`'s answer carries them after the IDs, from
+  `usbfn::INFO_WHERE_AT`; `xhci` fills them in, `dwc2` not yet. The driver does not work them out itself,
+  because only the host enumerated the device.
 - **On the onboard radio** the bus facts are the driver's own, since the driver is its host.
 
 **When the radio is down** (the driver is running and the chip is not up), the facts that are the
@@ -778,8 +796,9 @@ says `no radio called 'usb' - wifi hardware lists them`, the same sentence `use`
 
 **What it is not.** It is not `wifi debug`: no counters, no event history, no register dumps. Those are
 the driver's account of its own work and stay there. This shows what the hardware IS and how it is
-reached. Nothing here is written to the chip, and nothing is read from it that the driver does not
-already hold, so asking costs no traffic on the bus.
+reached. Nothing here is written to the chip. The dongle's facts are all already held, so asking it
+costs no bus traffic; the onboard radio's address and firmware version are asked of its firmware (two
+reads, as `wifi debug firmware` makes), and not mid-sweep or with the radio off.
 
 **The address is shown on the console and in the record**, as `wifi info` shows the network's. It is the
 operator's own device. The rule that keeps addresses out of the repository is about commits, not about
@@ -794,5 +813,5 @@ usb-77e2`. These are section 11's sentences, shared.
 that binds more than one. The names and the report are designed for many so they need no change then;
 the support itself waits until two are plugged in (CLAUDE.md 26.2).
 
-**Tab completion** (rule 9): `hardware`, then `use` or a name in the report, then after `use` the
-names in the report.
+**Tab completion** (rule 9): `hardware`, then a radio's name (`onboard`, `usb`); `use` joins the list
+when it is built.

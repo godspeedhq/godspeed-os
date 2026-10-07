@@ -124,6 +124,18 @@ pub const OP_DEBUG: u8 = 11;
 /// fact about the hardware, not a reading from it.
 pub const OP_HARDWARE: u8 = 12;
 pub const HW_TEXT_MAX: usize = 24;
+/// Request op byte: one radio in full, for `wifi hardware <radio>` (`utilities/56_wifi.md` 11a). Reply
+/// `[OK, count, (label_len, label..., value_len, value...) * count]`: the driver's facts about its radio as
+/// labelled text, each label one of `DETAIL_LABELS` and at most `DETAIL_LABEL_MAX` bytes, each value at
+/// most `DETAIL_VALUE_MAX`. The facts that are the hardware's (the chip, its IDs, the bus) are given in
+/// any state; those that need a running chip say why they are missing instead. In any order: the host's
+/// facts come first and the station's after, and the shell prints them in `DETAIL_LABELS` order.
+pub const OP_HARDWARE_DETAIL: u8 = 13;
+pub const DETAIL_LABEL_MAX: usize = 12;
+pub const DETAIL_VALUE_MAX: usize = 96;
+/// The labels a `OP_HARDWARE_DETAIL` reply may carry, in the order a record has them. One list, so the
+/// shell's record and every driver's reply agree on the fields; a driver gives the ones it knows.
+pub const DETAIL_LABELS: [&str; 7] = ["chip", "id", "address", "firmware", "bus", "endpoints", "queues"];
 
 /// Sub-codes of `OP_DEBUG`, and their reply layouts.
 pub mod dbg {

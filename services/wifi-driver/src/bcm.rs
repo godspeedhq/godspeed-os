@@ -81,6 +81,26 @@ impl Station for Bcm<'_> {
     fn event_name(&self, code: u32) -> &'static str {
         scan::code::name(code)
     }
+    // `wifi hardware onboard`, after the host's facts: the address and the version of the code running on
+    // the radio, asked of the firmware when it may be asked (`live`, as for `wifi debug firmware`) - two
+    // iovars, no more.
+    fn details(&mut self, d: &mut godspeed_wifi::serve::Details, live: bool, ctx: &ServiceContext) {
+        if !live {
+            d.add("firmware", format_args!("running (not asked now - a sweep is running or the radio is off)"));
+            return;
+        }
+        if let Some(m) = self.mac(ctx) {
+            d.add("address", format_args!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (from the firmware)", m[0], m[1], m[2], m[3], m[4], m[5]));
+        }
+        let mut ver = [0u8; 128];
+        let n = ctrl::query_iovar(self.h, &mut *self.w, &mut self.s, "ver", &mut ver, ctx).unwrap_or(0);
+        let len = ver[..n.min(ver.len())].iter().position(|&b| b == 0 || b == b'\n').unwrap_or(n.min(ver.len()));
+        match core::str::from_utf8(&ver[..len]) {
+            Ok(v) if !v.trim().is_empty() => d.add("firmware", format_args!("{}, running", v.trim())),
+            _ => d.add("firmware", format_args!("running (its version string did not come back)")),
+        }
+    }
+
     fn debug(&mut self, sub: u8, live: bool, out: &mut [u8], ctx: &ServiceContext) -> usize {
                 out[0] = scan::reply::OK;
                 match sub {

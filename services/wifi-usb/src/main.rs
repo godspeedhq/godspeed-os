@@ -53,7 +53,7 @@ mod station;
 
 /// The 8051's firmware, embedded (`build.rs`, `nonfree/rtl8192cu/PROVENANCE`), and the hash the build measured
 /// on disk, which `bring_up` recomputes over what the binary actually holds.
-static FIRMWARE: &[u8] = include_bytes!(env!("RTL_FW_TMSC"));
+pub(crate) static FIRMWARE: &[u8] = include_bytes!(env!("RTL_FW_TMSC"));
 const FIRMWARE_FNV: u32 = rtl_fw::decimal(env!("RTL_FW_TMSC_FNV"));
 /// How many times the download is tried before giving up - `rtl8xxxu_init_device`'s figure.
 const DOWNLOAD_TRIES: u32 = 6;
@@ -129,14 +129,43 @@ pub(crate) fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16)>, &'static
     }
 }
 
+/// Where the host says the dongle is (`usbfn::OP_INFO`'s optional part), for `wifi hardware usb`. `None`
+/// from a host that does not say, or one that did not answer.
+fn where_bound(ctx: &ServiceContext) -> Option<rx::Where> {
+    let r = host(ctx, &[usbfn::OP_INFO]).ok()?;
+    let p = r.payload_bytes();
+    let w = usbfn::INFO_WHERE_AT;
+    if p.len() < w + 7 || p[0] != usbfn::OP_INFO || p[1] != usbfn::ST_OK {
+        return None;
+    }
+    let n_out = (p[w + 6] as usize).min(4).min(p.len() - (w + 7));
+    let mut outs = [0u8; 4];
+    outs[..n_out].copy_from_slice(&p[w + 7..w + 7 + n_out]);
+    Some(rx::Where {
+        root: p[w], hub: p[w + 1], slot: p[w + 2], in_addr: p[w + 3],
+        in_mps: u16::from_le_bytes([p[w + 4], p[w + 5]]), outs, n_out: n_out as u8,
+    })
+}
+
+/// The chip `SYS_CFG` names, as the identity line logs it: `RTL8188C, 1T1R, cut A, TSMC`.
+pub(crate) fn chip_text(c: u32) -> (&'static str, &'static str, char, &'static str) {
+    (
+        if c & SYS_CFG_TYPE_92C != 0 { "RTL8192C" } else { "RTL8188C" },
+        if c & SYS_CFG_TYPE_92C != 0 { "2T2R" } else { "1T1R" },
+        (b'A' + ((c >> SYS_CFG_CHIP_VER_SHIFT) & 0xF) as u8) as char,
+        if c & SYS_CFG_VENDOR_UMC != 0 { "UMC" } else { "TSMC" },
+    )
+}
+
 /// U1's reads, logged and decoded, then the bring-up. The radio as a `Station` when it came up as far as
 /// receiving; `None` when it stopped, said where.
-fn identify<'l>(ctx: &ServiceContext, vid: u16, pid: u16, link: &'l RefCell<rx::Link>) -> Option<station::Dongle<'l>> {
+fn identify<'l>(ctx: &ServiceContext, vid: u16, pid: u16, link: &'l RefCell<rx::Link>, sys_cfg: &mut Option<u32>) -> Option<station::Dongle<'l>> {
     ctx.log_fmt(format_args!("wifi-usb: {} has bound a radio at {:04x}:{:04x}", host_name(ctx), vid, pid));
     let cfg = read32(ctx, REG_SYS_CFG);
     let iso = read32(ctx, REG_SYS_ISO_CTRL);
     match (cfg, iso) {
         (Ok(c), Ok(i)) => {
+            *sys_cfg = Some(c);
             ctx.log_fmt(format_args!(
                 "wifi-usb: SYS_CFG(0xF0)={:#010x} ISO_CTRL(0x00)={:#010x}, read through {}", c, i, host_name(ctx)));
             let plausible = |v: u32| v != 0 && v != 0xFFFF_FFFF;
@@ -398,7 +427,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 Ok(Some((vid, pid))) => {
                     heard = rx::Heard::new(&link, host_name(&ctx));
                     *link.borrow_mut() = rx::Link::new();
-                    dongle = identify(&ctx, vid, pid, &link);
+                    heard.ids = Some((vid, pid));
+                    heard.place = where_bound(&ctx);
+                    dongle = identify(&ctx, vid, pid, &link, &mut heard.sys_cfg);
                     if let Some(d) = dongle.as_ref() {
                         heard.us = d.address();
                         heard.chip = Some(d.chip());

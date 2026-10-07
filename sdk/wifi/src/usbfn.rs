@@ -13,7 +13,14 @@
 //! host that does not speak this protocol, is told apart from an answer.
 
 /// `[op]` -> `[op, status, vid lo, vid hi, pid lo, pid hi]`: which device is bound as the radio, if any.
+///
+/// A host that knows where the radio is may go on, for `wifi hardware <radio>` (`utilities/56_wifi.md` 11a):
+/// `[root port, hub port (0 = on the root port itself), slot, bulk IN address, bulk IN max packet lo, hi,
+/// bulk OUT count, bulk OUT address...]` (`INFO_WHERE_AT` onwards). `xhci` does; `dwc2` does not yet, and a
+/// driver reads only what the reply carries.
 pub const OP_INFO: u8 = 0x20;
+/// Where the optional part of an `OP_INFO` answer starts.
+pub const INFO_WHERE_AT: usize = 6;
 /// `[op, setup(8), data out...]` -> `[op, status, data in...]`. One control transfer to the bound radio: the
 /// 8-byte setup packet as USB defines it; for an OUT transfer the data follows it, `wLength` bytes; for an
 /// IN transfer the reply carries what the device returned.

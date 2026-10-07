@@ -86,6 +86,10 @@ pub trait Host {
     fn hardware(&self) -> Hardware {
         Hardware { chip: "unknown", bus: "unknown" }
     }
+    /// The host's facts for `wifi hardware <radio>` (`wire::OP_HARDWARE_DETAIL`): the ones true while the
+    /// radio is down - the chip as identified, its IDs, the bus and its endpoints. The station adds the
+    /// ones that need a running chip (`Station::details`).
+    fn details(&self, _d: &mut Details) {}
     fn notice(&mut self, _msg: &[u8], _sweep: Option<&mut Scan>, _ctx: &ServiceContext) -> Notice {
         Notice::Ignored
     }
@@ -106,6 +110,72 @@ fn say_fmt(ctx: &ServiceContext, who: &str, args: core::fmt::Arguments) {
 }
 
 /// A request's correlation tag, if it carries one (`wire::TAGGED`), and the request without it.
+/// The labelled facts of `wire::OP_HARDWARE_DETAIL`, written into the reply as they are added. Bounded by
+/// the buffer it was given: a fact that does not fit is dropped, the ones before it kept. A label that is
+/// not one of `wire::DETAIL_LABELS` is dropped too, so the shell's record and the reply cannot disagree.
+pub struct Details<'b> {
+    buf: &'b mut [u8],
+    at: usize,
+    count: u8,
+}
+
+impl<'b> Details<'b> {
+    /// Facts written from the start of `buf`.
+    pub fn new(buf: &'b mut [u8]) -> Self {
+        Details { buf, at: 0, count: 0 }
+    }
+    /// One fact: `label` and its value, formatted, cut at `wire::DETAIL_VALUE_MAX` bytes.
+    pub fn add(&mut self, label: &str, value: core::fmt::Arguments) {
+        struct Cap<'c> { b: &'c mut [u8; wire::DETAIL_VALUE_MAX], n: usize }
+        impl core::fmt::Write for Cap<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &c in s.as_bytes() {
+                    if self.n < self.b.len() {
+                        self.b[self.n] = c;
+                        self.n += 1;
+                    }
+                }
+                Ok(())
+            }
+        }
+        if !wire::DETAIL_LABELS.contains(&label) || label.len() > wire::DETAIL_LABEL_MAX {
+            return;
+        }
+        let mut v = [0u8; wire::DETAIL_VALUE_MAX];
+        let mut cap = Cap { b: &mut v, n: 0 };
+        let _ = core::fmt::write(&mut cap, value);
+        let n = cap.n;
+        let need = 2 + label.len() + n;
+        if self.at + need > self.buf.len() || self.count == u8::MAX {
+            return;
+        }
+        self.buf[self.at] = label.len() as u8;
+        self.buf[self.at + 1..self.at + 1 + label.len()].copy_from_slice(label.as_bytes());
+        let vat = self.at + 1 + label.len();
+        self.buf[vat] = n as u8;
+        self.buf[vat + 1..vat + 1 + n].copy_from_slice(&v[..n]);
+        self.at += need;
+        self.count += 1;
+    }
+    /// Whether `label` has been given already, so a later source does not repeat it.
+    pub fn has(&self, label: &str) -> bool {
+        let mut at = 0;
+        for _ in 0..self.count {
+            let l = self.buf[at] as usize;
+            if &self.buf[at + 1..at + 1 + l] == label.as_bytes() {
+                return true;
+            }
+            let v = self.buf[at + 1 + l] as usize;
+            at += 2 + l + v;
+        }
+        false
+    }
+    /// Facts written, and the bytes they take.
+    pub fn done(&self) -> (u8, usize) {
+        (self.count, self.at)
+    }
+}
+
 /// A radio's chip and bus, as `wifi hardware` shows them (`Host::hardware`).
 pub struct Hardware {
     pub chip: &'static str,
@@ -592,6 +662,27 @@ pub fn serve<'s>(
                     at += 1 + len;
                 }
                 at
+            }
+            // One radio in full (`wifi hardware <radio>`): the host's facts, then the station's, and for a
+            // radio with no station the reason its readings are missing. The station may ask the chip only
+            // when `OP_DEBUG` may: not mid-sweep, not with the radio off, not powered down.
+            (wire::OP_HARDWARE_DETAIL, r) => {
+                let live = sweep.is_none() && radio_on && !powered_off;
+                out[0] = wire::OK;
+                let (count, len) = {
+                    let mut d = Details::new(&mut out[2..]);
+                    host.details(&mut d);
+                    match r {
+                        Some(station) => station.details(&mut d, live, ctx),
+                        None => d.add("firmware", format_args!("not running - the radio is down")),
+                    }
+                    if powered_off && !d.has("firmware") {
+                        d.add("firmware", format_args!("not running - the chip is powered down"));
+                    }
+                    d.done()
+                };
+                out[1] = count;
+                2 + len
             }
             // ---- Powered down (`wifi radio off hard`): these four arms come first, so nothing below talks
             // to a chip that has no power. ----

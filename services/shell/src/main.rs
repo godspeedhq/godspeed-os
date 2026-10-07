@@ -1041,6 +1041,8 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("trace",  "deps",         CHAOS_RESTARTABLE),
     ("trace",  "chain",        CHAOS_RESTARTABLE),
     ("wifi",   "radio",        &["on", "off", "powercycle"]),
+    // The radios by name (`wifi_radio_service`); `use` joins when it is built.
+    ("wifi",   "hardware",     &["onboard", "usb"]),
     ("audio",  "off",          &["hard"]),
     ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
 ];
@@ -5288,6 +5290,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("wifi forget <ssid>", "delete a stored passphrase; does not disconnect", "wifi forget Bankole-WiFi"),
             ("wifi radio on|off|off hard|powercycle", "the radio's switch and the chip's power: `off` is the firmware's switch, `off hard` cuts the chip's power, `on` brings it back from either (cold from `off hard`), `powercycle` is off hard and on in one", "wifi radio off"),
             ("wifi hardware", "the radios this machine has, one record each: radio, chip, bus, state, network, in use", "wifi hardware"),
+            ("wifi hardware <radio>", "one radio in full: chip, id, address, firmware, bus, endpoints, queues", "wifi hardware usb"),
         ], true),
         "audio" => help_block(ctx, "audio", "sound: what is playing, the volume, the codec's power, a test tone", &[
             ("audio", "this usage (rule 1: a bare utility name teaches its verbs)", "audio"),
@@ -5554,6 +5557,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("wifi", "hardware") => help_block(ctx, "wifi hardware", "which radios this machine has (utilities/56_wifi.md 11)", &[
             ("wifi hardware", "RADIO CHIP BUS STATE NETWORK IN-USE, one record per radio running now; `use` is specified, not built", "wifi hardware | where state=joined"),
+            ("wifi hardware <radio>", "one radio in full: chip, id, address, firmware, bus, endpoints, queues, state - labelled lines", "wifi hardware usb"),
         ], false),
         ("wifi", "list") => help_block(ctx, "wifi list", "the last complete scan, as records", &[
             ("wifi list", "NETWORK BAND SIGNAL SECURITY NOTE, one line per network; never scans - an error while a sweep runs or before any", "wifi list | match saved"),
@@ -8292,10 +8296,14 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     if arg == "hardware" {
         return wifi_hardware(ctx, out);
     }
-    if arg.starts_with("hardware ") {
-        out.line_fmt(ctx, format_args!(
-            "wifi: `hardware use` is specified but not built yet - until it is, the first running radio carries the link (utilities/56_wifi.md 11)"));
-        return Err(ShellError::Unknown);
+    if let Some(rest) = arg.strip_prefix("hardware ") {
+        let rest = rest.trim();
+        if rest == "use" || rest.starts_with("use ") {
+            out.line_fmt(ctx, format_args!(
+                "wifi: `hardware use` is specified but not built yet - until it is, the first running radio carries the link (utilities/56_wifi.md 11)"));
+            return Err(ShellError::Unknown);
+        }
+        return wifi_hardware_one(ctx, out, rest);
     }
     if let Some(word) = arg.strip_prefix("radio ") {
         let word = word.trim();
@@ -9174,6 +9182,75 @@ fn wifi_hardware(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             r.radio, if chip.is_empty() { "?" } else { chip }, if bus.is_empty() { "?" } else { bus },
             r.state, net, if r.in_use { "*" } else { "" }));
     }
+    Ok(())
+}
+
+/// The service behind a radio's name in `wifi hardware` (`wifi_hardware_rows` names them).
+fn wifi_radio_service(name: &str) -> Option<&'static str> {
+    match name {
+        "onboard" => Some(RADIOS[0]),
+        "usb" => Some(RADIOS[1]),
+        _ => None,
+    }
+}
+
+/// `wifi hardware <radio>`: one radio in full (`utilities/56_wifi.md` 11a) - labelled lines, as `wifi info`
+/// gives, so it pipes the same way. The radio's name and driver, then the driver's own facts
+/// (`wire::OP_HARDWARE_DETAIL`), in the order `wire::DETAIL_LABELS` lists them, then its state.
+fn wifi_hardware_one(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    let svc = match wifi_radio_service(name) {
+        Some(s) if slot_of(ctx, s).is_some() => s,
+        _ => {
+            out.line_fmt(ctx, format_args!("wifi: no radio called '{}' - wifi hardware lists them", name));
+            return Err(ShellError::Unknown);
+        }
+    };
+    let rows = wifi_hardware_rows(ctx);
+    let row = rows.iter().flatten().find(|r| r.radio == name);
+    ctx.wifi_radio.set(svc);
+    let reply = wifi_ask(ctx, &[OP_HARDWARE_DETAIL], 3000);
+    ctx.wifi_radio.set(RADIOS[0]);
+    out.line_fmt(ctx, format_args!("{:<10} {}", "radio", name));
+    out.line_fmt(ctx, format_args!("{:<10} {}", "driver", svc));
+    match reply.as_ref().map(|m| m.payload_bytes()) {
+        Some(p) if p.first() == Some(&OK) => {
+            // Read every fact, then print them in `DETAIL_LABELS` order: the host gives its facts and the
+            // station its own after, so the reply's order is the driver's, not the reader's.
+            let count = p.get(1).copied().unwrap_or(0) as usize;
+            let mut facts: [(&[u8], &[u8]); 16] = [(&[], &[]); 16];
+            let mut n = 0;
+            let mut at = 2;
+            for _ in 0..count.min(facts.len()) {
+                let Some(&ll) = p.get(at) else { break };
+                let ll = ll as usize;
+                let Some(&vl) = p.get(at + 1 + ll) else { break };
+                let vl = vl as usize;
+                if at + 2 + ll + vl > p.len() {
+                    break;
+                }
+                facts[n] = (&p[at + 1..at + 1 + ll], &p[at + 2 + ll..at + 2 + ll + vl]);
+                n += 1;
+                at += 2 + ll + vl;
+            }
+            for label in DETAIL_LABELS {
+                if let Some((_, v)) = facts[..n].iter().find(|(l, _)| *l == label.as_bytes()) {
+                    out.line_fmt(ctx, format_args!("{:<10} {}", label, core::str::from_utf8(v).unwrap_or("?")));
+                }
+            }
+        }
+        Some(_) => out.line_fmt(ctx, format_args!("{:<10} {} refused the question - a driver older than `wifi hardware <radio>`", "details", svc)),
+        None => out.line_fmt(ctx, format_args!("{:<10} {} did not answer", "details", svc)),
+    }
+    match row {
+        Some(r) if r.network_len > 0 => {
+            let mut shown = [b'.'; SSID_MAX];
+            out.line_fmt(ctx, format_args!("{:<10} {} {}", "state", r.state, wifi_ssid_text(&r.network[..r.network_len], &mut shown)));
+        }
+        Some(r) => out.line_fmt(ctx, format_args!("{:<10} {}", "state", r.state)),
+        None => out.line_fmt(ctx, format_args!("{:<10} not answering", "state")),
+    }
+    out.line_fmt(ctx, format_args!("{:<10} {}", "in use", if row.is_some_and(|r| r.in_use) { "yes" } else { "no" }));
     Ok(())
 }
 
@@ -14467,7 +14544,9 @@ fn is_producer_builtin(name: &str) -> bool {
 /// passphrase from the console - piped, its prompt would vanish into the pipe while it waited - and the
 /// power verbs print progress. `None` when the verb may be piped, else the sentence that says why not.
 fn wifi_pipe_refusal(arg: &str) -> Option<&'static str> {
-    if arg.trim() == "hardware" {
+    let a = arg.trim();
+    // `hardware` and `hardware <radio>` are reports; `hardware use` is an action.
+    if a == "hardware" || (a.starts_with("hardware ") && !a["hardware ".len()..].trim().starts_with("use")) {
         return None;
     }
     match arg.split_whitespace().next().unwrap_or("") {

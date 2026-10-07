@@ -122,4 +122,8 @@ pub trait Station {
     /// The driver's account of itself for `wifi debug`: write the reply for sub-command `sub` into `out`
     /// and return its length. `live` is whether the firmware may be asked anything now.
     fn debug(&mut self, sub: u8, live: bool, out: &mut [u8], ctx: &ServiceContext) -> usize;
+    /// The station's facts for `wifi hardware <radio>` (`wire::OP_HARDWARE_DETAIL`), after the host's:
+    /// the address, the firmware, whatever needs the chip up. `live` is `debug`'s: whether the chip may be
+    /// asked anything now. A station that adds nothing leaves the host's facts as the whole answer.
+    fn details(&mut self, _d: &mut crate::serve::Details, _live: bool, _ctx: &ServiceContext) {}
 }

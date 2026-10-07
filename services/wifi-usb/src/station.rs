@@ -838,6 +838,18 @@ impl Station for Dongle<'_> {
         "(this radio has no firmware events)"
     }
 
+    // `wifi hardware usb`, after the host's facts: what the running chip holds. Nothing here asks the chip -
+    // the address is the efuse's, read at bring-up, and the firmware is the file this service carries.
+    fn details(&mut self, d: &mut godspeed_wifi::serve::Details, _live: bool, _ctx: &ServiceContext) {
+        let m = self.mac;
+        d.add("address", format_args!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (efuse)", m[0], m[1], m[2], m[3], m[4], m[5]));
+        match crate::rtl_fw::header(crate::FIRMWARE) {
+            Ok(h) => d.add("firmware", format_args!("rtl8192cufw_TMSC.bin, version {}.{}, running", h.major, h.minor)),
+            Err(_) => d.add("firmware", format_args!("running")),
+        }
+        d.add("queues", format_args!("{} transmit queue(s) on the bulk OUTs", self.queues));
+    }
+
     fn debug(&mut self, _sub: u8, _live: bool, out: &mut [u8], _ctx: &ServiceContext) -> usize {
         out[0] = wire::UNKNOWN_OP;
         1

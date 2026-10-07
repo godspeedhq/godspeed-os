@@ -465,7 +465,9 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
     // way `serve_radio`'s powered-off arms do, so the shell sees one shape for one state whichever loop
     // holds it. `h` is `None` only where no SDIO window was granted, and there no power op can be made.
     let mut powered_off = false;
-    let mut out = [0u8; 30 + join::MAX_SSID];
+    // The status reply's size, and room for `wifi hardware onboard`'s facts beside it.
+    const STATUS_LEN: usize = 30 + join::MAX_SSID;
+    let mut out = [0u8; 256];
     loop {
         let req = ctx.recv();
         // No reply cap means there is nothing to answer on, and dropping is all that is left.
@@ -498,11 +500,26 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
                 at += 1 + text.len();
             }
             at
+        } else if op == godspeed_wifi::wire::OP_HARDWARE_DETAIL {
+            // `wifi hardware onboard` here, in the serve loop's shape: what is known before a chip is
+            // identified - the bus as this driver sets it up, and why there is no firmware.
+            out[0] = scan::reply::OK;
+            let (count, len) = {
+                let mut d = godspeed_wifi::serve::Details::new(&mut out[2..]);
+                d.add("chip", format_args!("not identified - the bring-up stopped before one was"));
+                d.add("firmware", format_args!("not running - {}",
+                    if powered_off { "the chip is powered down" } else { "the radio is down" }));
+                d.add("bus", format_args!("SDIO, card clock asked {} MHz, function {} at {}-byte blocks",
+                    OPERATING_HZ / 1_000_000, sdio::DATA_FUNC, sdio::DATA_BLOCK));
+                d.done()
+            };
+            out[1] = count;
+            2 + len
         } else if op == scan::reply::OP_STATUS && powered_off {
             // The powered-down status `serve_radio` gives: all zero, the trailing power byte included.
-            out.fill(0);
+            out[..STATUS_LEN].fill(0);
             out[0] = scan::reply::OK;
-            out.len()
+            STATUS_LEN
         } else if op == scan::reply::OP_RADIO && mode == scan::reply::RADIO_POWERCYCLE && (powered_off || why != scan::reply::DOWN_NOT_BUILT) {
             // A radio this driver does not drive yet (`DOWN_NOT_BUILT`) is NOT cycled while it is powered:
             // the respawn would identify it again and come back down for the same reason, so the request
@@ -601,6 +618,13 @@ struct SdioPower<'a> {
 impl godspeed_wifi::serve::Host for SdioPower<'_> {
     fn hardware(&self) -> godspeed_wifi::serve::Hardware {
         godspeed_wifi::serve::Hardware { chip: self.chip, bus: "SDIO" }
+    }
+    // `wifi hardware onboard`: the chip as identified and the bus as this driver set it up - the card clock
+    // it asks for and the block size of the function that carries frames.
+    fn details(&self, d: &mut godspeed_wifi::serve::Details) {
+        d.add("chip", format_args!("{}", self.chip));
+        d.add("bus", format_args!("SDIO, card clock asked {} MHz, function {} at {}-byte blocks",
+            OPERATING_HZ / 1_000_000, sdio::DATA_FUNC, sdio::DATA_BLOCK));
     }
     fn can_cut_power(&self) -> bool {
         // The pin is reached through the kernel's `DevicePower`; whether it is granted is asked when cutting.

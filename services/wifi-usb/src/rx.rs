@@ -144,6 +144,25 @@ pub struct Heard<'l> {
     pub chip: Option<rtl8188::Chip>,
     /// The bus the dongle is reached over, for `wifi hardware`: `USB` and the host serving it.
     bus: &'static str,
+    /// The host serving it, by name, for `wifi hardware usb`.
+    host: &'static str,
+    /// For `wifi hardware usb` (`Host::details`): the IDs the host bound, the chip's `SYS_CFG` once read,
+    /// and where the host says the dongle is, when it says.
+    pub ids: Option<(u16, u16)>,
+    pub sys_cfg: Option<u32>,
+    pub place: Option<Where>,
+}
+
+/// Where a host says the dongle is (`usbfn::OP_INFO`'s optional part).
+#[derive(Clone, Copy)]
+pub struct Where {
+    pub root: u8,
+    pub hub: u8,
+    pub slot: u8,
+    pub in_addr: u8,
+    pub in_mps: u16,
+    pub outs: [u8; 4],
+    pub n_out: u8,
 }
 
 impl<'l> Heard<'l> {
@@ -151,6 +170,8 @@ impl<'l> Heard<'l> {
         Heard {
             link,
             bus: match host { "xhci" => "USB xhci", "dwc2" => "USB dwc2", _ => "USB" },
+            host: match host { "xhci" => "xhci", "dwc2" => "dwc2", _ => "a USB host" },
+            ids: None, sys_cfg: None, place: None,
             transfers: 0, frames: 0, beacons: 0, crc: 0, cut: 0, seen: [[0; 6]; NETWORKS], n_seen: 0,
             no_bulk_said: false, serving: Ok(None), us: [0; 6], answers: 0, chip: None,
         }
@@ -190,6 +211,43 @@ fn ask(ctx: &ServiceContext) -> Result<Option<godspeed_sdk::Message>, &'static s
 impl Host for Heard<'_> {
     fn hardware(&self) -> godspeed_wifi::serve::Hardware {
         godspeed_wifi::serve::Hardware { chip: "RTL8188CUS", bus: self.bus }
+    }
+    // `wifi hardware usb`: what is true of the dongle while its chip is down - its identity as read, its
+    // IDs, and where the host says it is.
+    fn details(&self, d: &mut godspeed_wifi::serve::Details) {
+        match self.sys_cfg {
+            Some(c) => {
+                let (kind, paths, cut, maker) = crate::chip_text(c);
+                d.add("chip", format_args!("RTL8188CUS - {}, {}, cut {}, {}", kind, paths, cut, maker));
+            }
+            None => d.add("chip", format_args!("RTL8188CUS - not identified (its registers were not read)")),
+        }
+        if let Some((v, p)) = self.ids {
+            d.add("id", format_args!("{:04x}:{:04x} (vendor:product)", v, p));
+        }
+        match self.place {
+            Some(w) => {
+                if w.hub != 0 {
+                    d.add("bus", format_args!("USB, {}, root port {} > hub port {}, slot {}", self.host, w.root, w.hub, w.slot));
+                } else {
+                    d.add("bus", format_args!("USB, {}, root port {}, slot {}", self.host, w.root, w.slot));
+                }
+                struct Outs<'o>(&'o [u8]);
+                impl core::fmt::Display for Outs<'_> {
+                    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                        for (i, a) in self.0.iter().enumerate() {
+                            write!(f, "{}{:#04x}", if i == 0 { "" } else { " " }, a)?;
+                        }
+                        Ok(())
+                    }
+                }
+                if w.in_addr != 0 {
+                    d.add("endpoints", format_args!("bulk IN {:#04x} {} B; bulk OUT {}",
+                        w.in_addr, w.in_mps, Outs(&w.outs[..w.n_out as usize])));
+                }
+            }
+            None => d.add("bus", format_args!("USB, {} (this host does not report where the dongle is)", self.host)),
+        }
     }
     fn notice(&mut self, msg: &[u8], sweep: Option<&mut Scan>, ctx: &ServiceContext) -> Notice {
         match msg {
