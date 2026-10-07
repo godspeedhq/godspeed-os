@@ -2501,7 +2501,7 @@ cable`, and with it out `link     up via wifi (the cable is out)`. Three joins f
 and no `CAM entry` lines; none refused its frames. The cable went in and out twice, a 48-ping run across
 the switches lost one reply. The Wyse is next, on the same image.
 
-## 41. The Wyse: the dongle never addressed, and the keyboard lost on a replug - a stale input context in `xhci` (2026-10-07) - fixed, not yet on hardware
+## 41. The Wyse: the dongle never addressed, and the keyboard lost on a replug - a stale input context in `xhci` (2026-10-07) - fixed, hardware-verified on the Wyse; a USB3 hub fault found behind it, open
 
 **The Wyse card (same image as section 40's last run).** The dongle was never seen, and after a while
 the keyboard did not come back from an unplug either. The T630, retested on the same image by the
@@ -2547,3 +2547,39 @@ validate it), so that run shows the order works and nothing regressed, not that 
    xHCI 4.6.1.2) - to be read before it is written, not retried around.
 3. The keyboard unplugged and replugged, twice: found again each time.
 4. Then section 40's card: `wifi scan`, `wifi join`, the cable out and in, `ping`.
+
+**The Wyse card's run (2026-10-07): the fix holds, and it uncovered the next fault.**
+- **Every root port addresses now**: the hub on port 1 and the keyboard behind it, the dongle on port 4,
+  and ports 6, 10 and 15, which turn out to be the board's other hubs (0bda:5415, and the USB3 halves
+  0bda:0411 and 0bda:0415). No `completion=4` on any root port, at boot or on any re-enumeration.
+  Predictions 1 and 2 confirmed: the stale word was the cause of both.
+- **The operator: "everything works"** - the dongle scanned, joined and carried the link, and the cable
+  path ran as on the T630.
+- **But with the dongle unplugged, the keyboard is not seen leaving or coming back; plugging the dongle in
+  brings both back.** The log says why. A dongle unplug re-enumerates the whole controller (section 37's
+  known behaviour). The walk then reaches the USB3 hub on port 15 and finds a device on its port 2 - the
+  boot stick, most likely, the one SuperSpeed device in the machine - and that device's Address Device
+  never completes. The command ring wedges behind it, so the repair of hub slot 1's control endpoint never
+  runs, hub slot 1 cannot be asked what changed, and the keyboard behind it is invisible
+  (`hub slot 1 port 3 status probe -> None`). Plugging the dongle in is a ROOT port change, which resets
+  the controller and rebuilds everything, which is why both come back together.
+- **Why only with the dongle out:** `xhci` has six device slices. With the dongle bound all six are in use
+  before the walk reaches port 15's downstream port (`out of DMA slices for a downstream device -
+  stopping hub walk`), so the stuck device is never tried. With it out, one is free.
+
+**Why the device behind port 15 does not address - read from the code, not yet proved.** `xhci` decides
+a hub is SuperSpeed by its answer to the hub descriptor: it asks for the USB2 one (0x29) and only asks for
+the USB3 one (0x2A) if that returns no ports. The Pi 4's VL805 answers nothing to 0x29, so it is found as
+USB3; this Realtek hub answers 0x29 with two ports, so it is walked as a USB2 hub (`USB2 hub on port 15`)
+though it sits on a SuperSpeed port. And nothing in `xhci` sends a USB3 hub SET_HUB_DEPTH, which - as I
+understand the USB 3 hub class, NOT yet checked against Linux's hub driver or the spec - a SuperSpeed
+hub needs before it can route anything below it by route string. Either would leave a SET_ADDRESS that
+never reaches the device.
+
+**Open, recorded rather than fixed here (26.7):** USB3 hubs on the Wyse - decide SuperSpeed by the port's
+speed, not by which descriptor answers; SET_HUB_DEPTH, read from the USB 3 spec and Linux's hub driver
+before it is written; and the general fault under it, that a command which never completes blocks every
+command after it, for which the spec's answer is Command Abort (xHCI 4.6.1.2). No QEMU device emulates a
+USB3 hub, so all of it is hardware-only. It predates this branch - the walk never reached that device
+while ports 10 and 15 could not be addressed at all - and the state now is strictly better than before:
+before the fix the dongle was never seen on the Wyse and a replugged keyboard was always lost.
