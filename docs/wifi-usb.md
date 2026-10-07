@@ -1955,7 +1955,7 @@ after that line refutes it.
 **Result (2026-10-07):** three such lines during the join, more beacons after each, and 1024 frames
 received in the next twelve seconds (section 28's result).
 
-## 31. A dongle present at boot re-enumerated the controller under its driver (2026-10-07) - fixed, not yet on hardware (seen again on the unfixed U2c card)
+## 31. A dongle present at boot re-enumerated the controller under its driver (2026-10-07) - fixed, hardware-verified on the Pi 4
 
 **What was seen.** On the U2b card the dongle was on hub port 1 when the Pi 4 booted. `xhci` bound it
 during the boot enumeration and the supervisor started `wifi-usb`, which got as far as R2. About 1.3 s
@@ -1988,7 +1988,7 @@ started` and beacons, as in section 28, and to `JOINED` as in section 29. The pr
 5 s. **Refuted by:** a re-enumeration naming the dongle's port while
 it is bound.
 
-## 32. A command's completion taken from the command before it (2026-10-07) - fixed, not yet on hardware
+## 32. A command's completion taken from the command before it (2026-10-07) - fixed, hardware-verified on the Pi 4
 
 **What was seen** on U2c's first card (section 29), after the dongle's EP0 could not be repaired.
 `xhci` re-enumerated. On hub port 3 the dongle was refused with `Enable Slot REFUSED (completion=4)`.
@@ -2017,3 +2017,29 @@ than treating it as an empty port.
 got no completion`. And the keyboard on the other port is bound after the walk (`1 HID device(s)
 bound`). **Refuted by:** the keyboard lost again with neither new line explaining why. If a `status read
 failed` line names its port, the cause is the hub's EP0, not the command ring.
+
+## 33. The branch tip on the Pi 4 (2026-10-07): sections 31 and 32 and the prompt, confirmed; the download fault still intermittent
+
+One card carried three fixes, each with its own line in the log: section 31, section 32, and the shell
+drawing its prompt before it reads `/persist.conf` (`1da33d6b`).
+
+**The prompt:** `gsh>` came with the same timestamp as `shell: ready`, 2.4 s after power-on. On U2c's
+second run it came at 6.1 s, and 4.8 s on a boot without the dongle plugged in.
+
+**Section 31, confirmed.** The dongle was plugged in at power-on. There was no re-enumeration naming its
+port, and it went from the boot enumeration to `JOINED` with no replug, 6.5 s after power-on.
+
+**Section 32, confirmed, in exactly the predicted shape.** Later the dongle's EP0 died again, and the
+walk after it logged `command type 11 got no completion within its bound` (Address Device), then `a
+completion for an earlier command arrived late (completion=4 ...) - discarded`. Each happened two or
+three times. Then `keyboard found` and `1 HID device(s) bound`: the keyboard survived the walk that lost
+it before. That late `completion=4` is the one the old code read as Enable Slot's refusal.
+
+**The download fault is still there, and intermittent.** The dongle was moved between hub ports during the run.
+Of the four bring-ups, two failed in the firmware download with `cc=4` and the same dead EP0 after
+the repair. The boot one and the last one, on port 3, downloaded in one try and joined. One bring-up also ended with three
+bulk IN transfers failing with `cc=4`, just before the hub reported the port disconnected. Whether that
+was the plug being pulled or the dongle dropping off the bus, this log cannot say. Counting the Pi 4
+bring-ups whose download is in the logs kept, it has failed in 4 of 10. One more fault: during a failed bring-up, `wifi
+hardware` showed the dongle as `usb  ?  ?  down`. Its chip and bus were unknown even though the driver
+had identified the chip. This fault and the dead repair are the next work on this host.
