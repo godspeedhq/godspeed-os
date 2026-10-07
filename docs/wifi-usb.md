@@ -2149,7 +2149,7 @@ and then to `ebe4bc4e` without it. The
 design stands as a record; trying it again needs a run that separates those, with the dongle unplugged so
 its fault cannot start the chain.
 
-## 36. The stick's first sector no longer GSFS after section 35's run (2026-10-07) - open
+## 36. The stick's first sector no longer GSFS after section 35's run (2026-10-07) - the stick was overwritten; reformatted
 
 On the next boot, with section 35 reverted, `xhci` read the stick's sector 0 as `01 0c 6e 65`, with a
 boot-signature word of `0x558a`, where every earlier run read `47 53 46 53` (`GSFS`). `fs` reported `bad
@@ -2162,3 +2162,11 @@ served garbage as a complete transfer)`.
 the wrong bytes. That log was overwritten, so what was written during section 35's run cannot be
 recovered from it. A second boot that reads the same bytes says the stick holds them; GSFS read correctly
 says it was the read. Recovering the stick means `drives flash`, which erases it, `/wifi.keys` with it.
+
+**Result (2026-10-07, the next boot, the reverted image):** the same `01 0c 6e 65` and `0x558a` on two
+enumerations of that boot and again after a replug, so the stick itself held them: it was overwritten.
+What wrote it is still not shown. The operator ran `drives flash -0 data` (`formatted as GSFS - mounted`),
+after which sector 0 read `47 53 46 53` on every pass, `fs` worked, and both radios joined again, the
+onboard one by `wifi join` and the dongle from the `/wifi.keys` that join wrote. The interrupt work that
+preceded this is reverted (sections 34, 35); a retry of it should run with a stick whose loss does not
+matter.
