@@ -2246,6 +2246,17 @@ dongle work began); what is new is a second device on the same controller whose 
 waits run out. `scripts/cross_isa.py`, whose riscv64 leg runs every disk read and write through `xhci`'s
 mass storage in QEMU, passes 12 of 12 with no completion passed over.
 
+**First card run of it (2026-10-07, one boot).** The stick's sector 0 read `01 0c 2e 67` on the FIRST read
+of a cold boot, on a controller nothing had happened to yet, and `fs` found no filesystem. So the previous
+session did change the stick; the "no write reached it" above was wrong, read from the absence of `fs`
+log lines, and `fs` does not log every block write. Reformatted (`drives flash`), then the keys saved and
+`dir` listed 3 entries. Across the next two re-scans (the dongle left the bus again, then the download
+fault) sector 0 read `47 53 46 53` both times, with no CRC mismatch, no `served garbage` and no
+`passed over`. The third re-scan lost the stick altogether: `downstream Address Device failed
+(completion=4)` for hub ports 1 and 2, the dongle and the stick, while the keyboard on port 4 bound, and
+`fs` then reported storage unavailable, its data intact. A new failure of the re-scan, not of the read
+path; not explained.
+
 Also seen, not changed: a `wifi hardware` straight after the onboard radio has left logs `wifi-driver: the
 firmware REFUSED the request - BCME_NOTASSOCIATED`, its status ask of a radio that is not associated. The
 report is right; the line is noise.
