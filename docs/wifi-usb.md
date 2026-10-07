@@ -2044,7 +2044,7 @@ bring-ups whose download is in the logs kept, it has failed in 4 of 10. One more
 hardware` showed the dongle as `usb  ?  ?  down`. Its chip and bus were unknown even though the driver
 had identified the chip. This fault and the dead repair are the next work on this host.
 
-## 34. The keyboard put on the 10 ms poll by a report its interrupt had not been taken for yet (2026-10-07) - fixed, not yet on hardware
+## 34. The keyboard put on the 10 ms poll by a report its interrupt had not been taken for yet (2026-10-07) - REVERTED with section 35, not yet tested on hardware
 
 **What was seen.** On every Pi 4 run since the dongle arrived, about a second after the keyboard is
 bound, `xhci` logs `waking on interrupts (MSI) - not polling` and then `a HID report arrived with no
@@ -2074,6 +2074,11 @@ such report set the poll for good.
 `fast` passes far fewer than its `idle` ones while nobody types. The previous run's heartbeat read `14275
 fast/4703 idle`. Typing feels the same. **Refuted by:** the polling line appearing anyway, which would
 mean three reports really were found by timed-out waits, or by typing lag.
+
+**Reverted, untested (2026-10-07).** The card that carried it alone (after section 35 was reverted) found
+the stick unreadable (section 36), and the operator asked for the interrupt work to come out entirely
+until it can be revisited. `xhci/src/main.rs` is back at `ebe4bc4e`, so input goes on the 10 ms poll as
+before. The analysis above stands; the fix was never seen on hardware.
 
 ## 35. Hub ports watched by the hub's status-change endpoint, not a 500 ms timer (2026-10-07) - REVERTED: worse on the Pi 4
 
@@ -2139,6 +2144,21 @@ The run before, without this change and with the same dongle fault, re-bound the
 
 **Not shown:** which part of the change did it - the endpoint armed during the port walk, the Configure
 Endpoint without EP0's add flag, the change-bit clears, or the fault starting from the dongle anyway and
-only being unlucky here. `xhci/src/main.rs` is back at `822f8736`, section 34's keyboard fix alone. The
+only being unlucky here. `xhci/src/main.rs` went back to `822f8736`, section 34's keyboard fix alone,
+and then to `ebe4bc4e` without it. The
 design stands as a record; trying it again needs a run that separates those, with the dongle unplugged so
 its fault cannot start the chain.
+
+## 36. The stick's first sector no longer GSFS after section 35's run (2026-10-07) - open
+
+On the next boot, with section 35 reverted, `xhci` read the stick's sector 0 as `01 0c 6e 65`, with a
+boot-signature word of `0x558a`, where every earlier run read `47 53 46 53` (`GSFS`). `fs` reported `bad
+superblock magic - disk not formatted` and is waiting for `drives flash`. Section 35's run had already
+shown the disk path misbehaving after the walks began failing: reads of lba 0 refused by `xhci`, and `fs:
+CRC mismatch on directory block lba 7784 healed on re-read 1 - a transient bad READ ... (the transport
+served garbage as a complete transfer)`.
+
+**Not shown:** whether the sector on the stick was overwritten, or whether only this boot's read returned
+the wrong bytes. That log was overwritten, so what was written during section 35's run cannot be
+recovered from it. A second boot that reads the same bytes says the stick holds them; GSFS read correctly
+says it was the read. Recovering the stick means `drives flash`, which erases it, `/wifi.keys` with it.
