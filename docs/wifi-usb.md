@@ -2101,8 +2101,8 @@ and a transfer completes only when something changed.
   the half-dozen loops that read events can file it as someone else's answer. A failed completion
   removes the hub from the armed set, its ports go back to the 500 ms scan, and the log says so.
 - **The scan.** On a change the poll loop queues the next TD and scans the hub's ports at once, then
-  every 500 ms for 2 s (`HUB_SETTLE_MS`), because the arrival and departure rules want two consecutive
-  readings. After that the scan runs every 5 s (`HUB_SAFETY_MS`), but only once every hub that
+  every 500 ms for 2 s, because the arrival and departure rules want two consecutive
+  readings. After that the scan runs every 5 s, but only once every hub that
   something is bound behind is armed, and only once an interrupt has been seen, so a controller whose
   interrupts never arrive keeps its 500 ms wait for the keyboard's sake.
 - **The change is acknowledged.** A hub keeps reporting a port while any of its `C_PORT_*` bits is set,
