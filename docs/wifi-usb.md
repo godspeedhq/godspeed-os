@@ -2396,7 +2396,10 @@ chip finding no key for the frame - the CAM lookup missed, or receive decryption
 key was written. On the Pi 2 the same restarts (section 19) rejoined and `ping` answered, so this is not
 yet a fact about the chip. What separates the two runs here: the working instance came from a plug and
 joined by `wifi join` after a scan; the failing ones came from `rtl8192cu_power_off` and rejoined from the
-key file with no scan. NOT diagnosed. The next step is an instrument, not a retry: after the keys go in,
+key file with no scan. **The same log narrows it:** the dongle was later unplugged and plugged back into
+`xhci`, a plug and not a power-down, and that instance rejoined from `/wifi.keys` and refused every frame
+the same way. So the power-down is not what separates them; a fresh instance rejoining from the key file
+is, and on this host only. NOT diagnosed. The next step is an instrument, not a retry: after the keys go in,
 read back `REG_CR`'s security bit, `REG_SECURITY_CFG` and the two CAM entries, and say them once on the
 first undecrypted frame.
 
@@ -2405,3 +2408,54 @@ instance ran - something still held a send cap to the first `wifi-usb` instance'
 generations old. The log does not say who. And at the end the dongle left the bus (`bulk IN ... cc=4`,
 `port 7 reads EMPTY while bound`), the controller was reset, and no port had a device on the census -
 consistent with the dongle being pulled.
+
+**And on `ehci`, the operator's question.** The dongle was also tried on the back ports, which `ehci`
+serves. `ehci` enumerated it at high speed on its hub ports 4 and 3 and said `not a HID, skipping`: it
+binds no WiFi dongle, and `wifi-usb`'s hosts are `dwc2` and `xhci` only, so that is the expected result,
+not an error. The `didn't enumerate (faulty port - try another)` message was hub port 1's, a LOW-speed
+device: the keyboard (a Logitech, 046d:c30a) after it left `ehci`, whose split-transaction descriptor read
+failed three resets before it was found on `xhci`'s port 7. `ehci` went on resetting port 1 for 12 s after
+the keyboard had moved.
+
+## 40. The key store, read back (2026-10-07) - an instrument for section 39's refused frames; built, not yet on hardware
+
+Section 39's fault: a fresh `wifi-usb` that rejoins from `/wifi.keys` writes both keys, transmits, and
+every frame back comes up `security 0` - the chip found no key for it. The question is whether the key
+store holds what was written. Asked of the chip, not of this driver's memory (Commandment VIII): no
+retry, no workaround, a reading.
+
+**What it reads (`rtl8188::key_store`), and says twice per join** - once after JOINED, and once on the
+first frame of that join the chip did not decrypt (`station.rs`, `say_key_store`):
+- `REG_CR`, whose bit 9 is the security enable `install_key` sets;
+- `REG_SECURITY_CFG`, which `install_key` writes as 0xcf;
+- words 0 and 1 of CAM entries 0 and 1: each entry's control word (valid, group, key id, cipher) and the
+  address it matches. **Never words 2 to 5, the key itself:** a read-back for the log must not carry key
+  material.
+
+A CAM word is read with `REG_CAM_CMD` (polling bit, no write bit, the word's address) and lands in
+`REG_CAM_READ` (0x0678) - both in the register map in `build/rtl` (`rtl8xxxu_regs.h`, and `RWCAM` / `RCAMO`
+in `rtl8192cu_sw.c`). The code that drives the read in Linux is not in `build/rtl`, so the wait is this
+driver's: 100 us, as a write gets, then the polling bit must be clear or the read says it did not
+complete. Ten control transfers, a few milliseconds, once per join and once per bad join.
+
+**Checked:** the x86 and Pi 2 images build and x86 passes every gate. Nothing here runs in QEMU.
+
+**Prediction, T630, the cable out, the dongle on `xhci`.** `/wifi.keys` is on the disk from section 39's
+card, so a plug-in now rejoins from it - section 39's failing case:
+1. After `JOINED`: `key store after the join - REG_CR=... (security on), SECURITY_CFG=0xcf`, entry 0
+   `valid, pairwise, key id 0, cipher 4` at the access point's address, entry 1 `valid, group, key id
+   <the group key's id>, cipher 4` at the same address. (4 is CCMP's value in the control word's bits
+   4:2, which `install_key` writes as 4 << 2.)
+2. On the first refused frame: the same line again, `on the first frame the chip did not decrypt`.
+3. Then `wifi join <the same network>` by hand in that instance, and `ping` - whether the hand-made join
+   decrypts where the rejoin did not, with its own two readings.
+
+**What each reading would say:**
+- `security OFF`, or SECURITY_CFG not 0xcf, on the second reading but not the first: something after the
+  join rewrote them - look for the writer.
+- An entry `NOT valid`, or at the wrong address: the CAM write did not take, or was undone.
+- Both readings exactly as written: the key store is right, and the chip's miss is elsewhere - the
+  receive configuration, or the station address it matches against.
+- `not read back: the CAM read did not complete`: the read sequence is wrong and this instrument has
+  said nothing about the CAM; `REG_CR` and SECURITY_CFG are not read either, since the read stops at the
+  first error. Recorded so the next reader does not take silence for a result.

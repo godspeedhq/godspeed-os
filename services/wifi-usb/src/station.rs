@@ -161,6 +161,12 @@ pub struct Dongle<'l> {
     /// The pairwise key is in the CAM: from then on every data frame sent - the EAPOL ones of a rekey
     /// included - goes protected. Decided by what the chip holds, not by what the supplicant keeps.
     ptk_in: bool,
+    /// The key store was read back on this join's first undecrypted frame (`say_key_store`): once per
+    /// join, so a link whose every frame is refused says it one time.
+    keys_said: bool,
+    /// `rx::Link::undecrypted` when this join began: that count lives as long as the instance, so the
+    /// first undecrypted frame OF THIS JOIN is the first one above it.
+    undecrypted_at_join: u32,
 }
 
 /// Where a sweep is: the channel tuned now, and when it was tuned.
@@ -179,7 +185,7 @@ impl<'l> Dongle<'l> {
             power,
             link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
-            assoc: None, keys: None, cam_next: 0, off: false, mbox: 0, reported: false, gtk: [None; 4], gtk_reinstall: false, gtk_entry: [None; 4], ptk_in: false,
+            assoc: None, keys: None, cam_next: 0, off: false, mbox: 0, reported: false, gtk: [None; 4], gtk_reinstall: false, gtk_entry: [None; 4], ptk_in: false, keys_said: false, undecrypted_at_join: 0,
         }
     }
 
@@ -318,6 +324,32 @@ impl<'l> Dongle<'l> {
     }
 
     /// The keys out: the kept ones zeroed (`supplicant::forget`) and every CAM entry this join filled emptied.
+    /// THE KEY STORE, READ BACK (`docs/wifi-usb.md` 40) - an instrument for the card where a joined link
+    /// took no frame: every one came up `security 0`, the chip finding no key, with both keys written.
+    /// It says what the chip holds, not what this driver believes it wrote: the security enable in
+    /// `REG_CR`, `REG_SECURITY_CFG` (0xcf is what `install_key` writes), and each CAM entry's control word
+    /// - valid, group, key id, cipher - and address. Never the key itself.
+    fn say_key_store(&self, ctx: &ServiceContext, when: &str) {
+        match rtl8188::key_store(ctx) {
+            Ok(k) => {
+                ctx.log_fmt(format_args!(
+                    "wifi-usb: key store {} - REG_CR={:#06x} (security {}), SECURITY_CFG={:#04x}",
+                    when, k.cr, if k.cr & (1 << 9) != 0 { "on" } else { "OFF" }, k.sec_cfg));
+                for (e, w) in k.cam.iter().enumerate() {
+                    let c = w[0];
+                    let m = [(c >> 16) as u8, (c >> 24) as u8, w[1] as u8, (w[1] >> 8) as u8, (w[1] >> 16) as u8, (w[1] >> 24) as u8];
+                    ctx.log_fmt(format_args!(
+                        "wifi-usb:   CAM entry {}: control {:#06x} - {}, {}, key id {}, cipher {}; address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        e, c & 0xffff,
+                        if c & (1 << 15) != 0 { "valid" } else { "NOT valid" },
+                        if c & (1 << 6) != 0 { "group" } else { "pairwise" },
+                        c & 0x3, (c >> 2) & 0x7, m[0], m[1], m[2], m[3], m[4], m[5]));
+                }
+            }
+            Err(why) => ctx.log_fmt(format_args!("wifi-usb: key store {} - not read back: {}", when, why)),
+        }
+    }
+
     fn drop_keys(&mut self, ctx: &ServiceContext) {
         supplicant::forget(&mut self.keys);
         for g in self.gtk.iter_mut() {
@@ -607,6 +639,8 @@ impl Station for Dongle<'_> {
             self.leave(ctx, &old.bssid);
         }
         self.cam_next = 0;
+        self.keys_said = false;
+        self.undecrypted_at_join = self.link.borrow().undecrypted;
         self.link.borrow_mut().new_keys();
         let a = match self.associate(ctx, ssid, secret) {
             Ok(a) => a,
@@ -651,6 +685,7 @@ impl Station for Dongle<'_> {
                     "wifi-usb: join - the firmware was not given the rates ({}) - data falls back to its own default", why)),
             }
             ctx.log("wifi-usb: join - JOINED; frames to and from the network go through nic-driver when the cable is out (R6)");
+            self.say_key_store(ctx, "after the join");
         } else {
             self.leave(ctx, &a.bssid);
         }
@@ -779,8 +814,10 @@ impl Station for Dongle<'_> {
         let mut key = [0u8; EAPOL_MAX];
         let mut key_len = 0usize;
         let addba;
+        let undecrypted;
         {
             let mut l = self.link.borrow_mut();
+            undecrypted = l.undecrypted;
             addba = l.addba.take().map(|r| (r, l.addbas));
             while rxq.has_room() {
                 let mut b = [0u8; godspeed_wifi::rxq::FRAME_MAX];
@@ -795,6 +832,11 @@ impl Station for Dongle<'_> {
                 key[..key_len].copy_from_slice(&l.rekey[..key_len]);
                 l.rekey_len = 0;
             }
+        }
+        // The first frame of this join the chip did not decrypt: what the key store holds, once.
+        if undecrypted != self.undecrypted_at_join && !self.keys_said {
+            self.keys_said = true;
+            self.say_key_store(ctx, "on the first frame the chip did not decrypt");
         }
         // R12b: an access point's ADDBA request, declined in kind (`mgmt::addba_decline`): this station does
         // not reorder aggregated frames, so the access point sends its frames to it unaggregated.
