@@ -2894,3 +2894,11 @@ serve loop that takes the notice never runs there.
    in its place`, and `wifi-usb` joins and carries the link.
 **Refuted by** the onboard radio joining at a boot with the dongle IN and chosen - the race this is built to
 avoid.
+
+**The card's run (Pi 4, 2026-10-07), step 1, as predicted.** `/wifi.radio` on `usb`, no dongle, cable out.
+At boot: `not rejoining yet - ... the supervisor's to say`, then 32 ms later `the USB radio is not attached
+(the supervisor)` and `this one rejoins in its place`, JOINED three seconds after; `nic-driver: the cable
+is out - the radio carries the link`, a DHCP lease and the gateway answering a ping. The keyboard and the
+USB stick came up on `xhci` as before. (The twelve `fs: flash requested ... REFUSED` lines at boot are
+`fs`'s own protocol selftest walking every opcode with a zero capacity injected so it cannot format -
+documented beside the code that logs them, not a request from anywhere.) Steps 2 to 4 not yet run.
