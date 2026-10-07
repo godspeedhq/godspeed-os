@@ -7,6 +7,7 @@
 # debt. What the file prevents is the OTHER kind growing silently: a name this tree
 # once defined and has since deleted, still cited by a comment as if it were live.
 
+CAM_PAIRWISE_KEY_POSITION          # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
 CNTPCT_EL0
 CNTP_TVAL
 CNTP_TVAL_EL0
@@ -44,6 +45,8 @@ RBUF_FLUSH_CTRL_V1
 REQ_SCROLL
 RGMII_RXID
 RXPBL_MASK
+SCR_RXUSEDK                        # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
+SCR_TXUSEDK                        # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
 SP_EL1
 TCR_EL1
 TLB_ACK
@@ -133,6 +136,10 @@ rst_axi
 rst_core
 rst_noc_disp
 rst_vout_src
+rtl92ce_set_key                    # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
+rtl92cu_enable_hw_security_config  # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
+rtl_cam_add_one_entry              # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
+rtl_cam_program_entry              # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
 rtl_hw_start
 rx_desc_idx
 sbi_remote_fence_i

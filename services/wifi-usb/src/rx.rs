@@ -59,6 +59,9 @@ pub struct Link {
     pub data_in: u32,
     pub dropped: u32,
     pub undecrypted: u32,
+    /// Of `undecrypted`, the frames to a group (broadcast or multicast) - so a refusal of the group key
+    /// and a refusal of the pairwise key are told apart (`docs/wifi-usb.md` 43).
+    pub undecrypted_group: u32,
     pub rekeys: u32,
     /// REPLAY PROTECTION: the highest CCMP packet number accepted under the pairwise key, and under each
     /// group key id. The chip decrypts and does not check them; a frame whose number is not above the last
@@ -83,7 +86,7 @@ pub struct Link {
 impl Link {
     pub fn new() -> Self {
         Link {
-            bssid: None, frames: RxQueue::new(), data_in: 0, dropped: 0, undecrypted: 0, rekeys: 0,
+            bssid: None, frames: RxQueue::new(), data_in: 0, dropped: 0, undecrypted: 0, undecrypted_group: 0, rekeys: 0,
             pairwise_pn: [0; data::REPLAY_SLOTS], group_pn: [[0; data::REPLAY_SLOTS]; 4], replays: 0,
             rekey: [0; EAPOL_MAX], rekey_len: 0, rekeys_dropped: 0, addba: None, addbas: 0,
         }
@@ -469,10 +472,17 @@ fn data_frame(ctx: &ServiceContext, h: &mut Heard, pk: &rtl_rx::Packet) {
     }
     if f[1] & 0x40 == 0 || pk.desc.security != RX_ENC_AES || pk.desc.swdec {
         l.undecrypted = l.undecrypted.wrapping_add(1);
-        if l.undecrypted == 1 {
+        let to_group = f[4] & 1 != 0;
+        if to_group {
+            l.undecrypted_group = l.undecrypted_group.wrapping_add(1);
+        }
+        // The first of each kind, and every 64th after, with the running split.
+        let n = if to_group { l.undecrypted_group } else { l.undecrypted - l.undecrypted_group };
+        if n == 1 || n % 64 == 0 {
             ctx.log_fmt(format_args!(
-                "wifi-usb: a data frame from the access point the chip did not decrypt (protected {}, security {}, swdec {}) - not taken",
-                f[1] & 0x40 != 0, pk.desc.security, pk.desc.swdec));
+                "wifi-usb: a data frame {} from the access point the chip did not decrypt (protected {}, security {}, swdec {}) - not taken; {} refused so far, {} of them to a group",
+                if to_group { "to a group" } else { "to us" },
+                f[1] & 0x40 != 0, pk.desc.security, pk.desc.swdec, l.undecrypted, l.undecrypted_group));
         }
         return;
     }

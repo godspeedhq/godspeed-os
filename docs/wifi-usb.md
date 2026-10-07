@@ -2611,3 +2611,44 @@ true)`, `ping` 0 of 5. So it is **not `xhci`'s and not the key file's**: it happ
 hand-made join as well as a rejoin. What every failure so far shares is a fresh `wifi-usb` instance on a
 chip that has just been brought up; what separates a failing one from a working one is still unknown. In
 this session's cards: four failures in about fifteen fresh joins, on two hosts. `backlog/79` carries it.
+
+## 43. The key store laid out as Realtek's own driver lays it out (2026-10-07) - for `backlog/79`; built, not yet on hardware
+
+`backlog/79`: a fresh `wifi-usb` sometimes joins and every frame back comes up `security 0`. Section 40
+showed the two security enables read back as written, and the CAM could not be read back (rtlwifi has no
+CAM read either - `build/rtl/cam.c`, fetched for this). So the question became what the CAM layout
+should be, read from the driver Realtek wrote for this chip family, rtlwifi, rather than from rtl8xxxu
+alone.
+
+**What rtlwifi does, and this driver did not** (`build/rtl/rtlwifi_rtl8192ce_hw.c` `rtl92ce_set_key`,
+`cam.c`, `cam.h`, `rtl8192cu_hw.c` `rtl92cu_enable_hw_security_config`, fetched from Linux master):
+- **A group key goes in the CAM entry its key id names** - entries 0 to 3 are the default keys - at the
+  broadcast address, ff:ff:ff:ff:ff:ff. This driver, following rtl8xxxu, took the first free entry: the
+  pairwise key in 0, the group key in 1, at the BSSID. This card's access point uses group key id **2**.
+- **The pairwise key goes in entry 4** (`CAM_PAIRWISE_KEY_POSITION`), key id 0, at the access point's
+  address.
+- **The control word has no group flag** (`rtl_cam_add_one_entry`: valid, cipher, key id).
+- **`REG_SECURITY_CFG` is 0xcc for a WPA2 station** - TX encrypt, RX decrypt, and the default keys for
+  BROADCAST only. This driver wrote 0xcf, rtl8xxxu's value, which also sets the default keys for unicast;
+  rtlwifi sets those only for WEP and IBSS, where every key is a default key.
+
+So with the old layout, a group frame was looked up in default-key entry 2, which was empty. That is
+certain from the layouts, and it alone explains the single refused frame in otherwise working joins.
+Whether it also explains a join where EVERY frame is refused, unicast included, is NOT shown: the old
+layout was the same in working and failing joins. The receive path now counts a refusal to us and a
+refusal to a group apart, and says the first of each and every 64th, so the next failure, if there is
+one, says which key the chip did not find.
+
+**The change:** rtlwifi's layout and value, in `station.rs` and `rtl8188::install_key`. A rekey into a
+group slot overwrites that slot's entry; leaving clears every entry used. Recorded as a deliberate
+divergence from rtl8xxxu where the value is set (26.14).
+
+**Checked:** the x86 and Pi 2 images build and x86 passes every gate. Nothing here runs in QEMU.
+
+**Prediction, Pi 2, cable out, dongle in:**
+1. After every join: `pairwise key 0 in CAM entry 4`, `group key 2 in CAM entry 2`, and
+   `SECURITY_CFG=0xcc`.
+2. No `did not decrypt ... to a group` at all - group frames decrypt now.
+3. Across the boot's rejoin, five `wifi radio powercycle`s and one replug, each followed by `ping
+   8.8.8.8`: every one answers, and no `did not decrypt ... to us`. **Refuted by** a join with `to us`
+   refusals: then the pairwise lookup is what fails, and the split says so.

@@ -133,9 +133,10 @@ pub struct Dongle<'l> {
     assoc: Option<Assoc>,
     /// The keys a WPA2 join keeps for the rekeys to come (`supplicant::Keys`); zeroed on every end.
     keys: Option<Keys>,
-    /// The next CAM entry a key goes into: Linux takes the first free one, so the pairwise key is 0 and the
-    /// group key 1 on a fresh join; and how many are in, to empty them on leaving.
-    cam_next: u8,
+    /// The CAM entries holding a key, one bit each, to empty them on leaving. WHICH entry a key goes into is
+    /// rtlwifi's layout, Realtek's own driver for this chip family (`docs/wifi-usb.md` 43): a group key in
+    /// the entry its key id names, at the broadcast address, and the pairwise key in `CAM_PAIRWISE`.
+    cam_used: u8,
     /// `wifi radio off` took (R6b): the RF is down and the receive filters closed.
     off: bool,
     /// For the power-off (R9).
@@ -154,10 +155,6 @@ pub struct Dongle<'l> {
     /// The last `install_key` for a group key found it already installed; its `group_rsc` must not lower
     /// the counter.
     gtk_reinstall: bool,
-    /// The CAM entry each group key slot uses, so a rekey into a slot already holding a key overwrites its
-    /// entry rather than taking a new one - the CAM is bounded and the access point rekeys for as long as
-    /// the station stays.
-    gtk_entry: [Option<u8>; 4],
     /// The pairwise key is in the CAM: from then on every data frame sent - the EAPOL ones of a rekey
     /// included - goes protected. Decided by what the chip holds, not by what the supplicant keeps.
     ptk_in: bool,
@@ -185,7 +182,7 @@ impl<'l> Dongle<'l> {
             power,
             link, pn: 0, sent: 0, send_failed: 0,
             mac, home, sweep: None, hops_failed: 0, seq: 0, probes_sent: 0, probes_refused: 0, queues,
-            assoc: None, keys: None, cam_next: 0, off: false, mbox: 0, reported: false, gtk: [None; 4], gtk_reinstall: false, gtk_entry: [None; 4], ptk_in: false, keys_said: false, undecrypted_at_join: 0,
+            assoc: None, keys: None, cam_used: 0, off: false, mbox: 0, reported: false, gtk: [None; 4], gtk_reinstall: false, ptk_in: false, keys_said: false, undecrypted_at_join: 0,
         }
     }
 
@@ -327,7 +324,7 @@ impl<'l> Dongle<'l> {
     /// THE KEY STORE'S ENABLES, READ BACK (`docs/wifi-usb.md` 40) - an instrument for the card where a
     /// joined link took no frame: every one came up `security 0`, the chip finding no key, with both keys
     /// written. It says what the chip holds, not what this driver believes it wrote: the security enable
-    /// in `REG_CR` and `REG_SECURITY_CFG` (0xcf is what `install_key` writes). Not the CAM entries - see
+    /// in `REG_CR` and `REG_SECURITY_CFG` (0xcc is what `install_key` writes, rtlwifi's value). Not the CAM entries - see
     /// `rtl8188::KeyStore` for why.
     fn say_key_store(&self, ctx: &ServiceContext, when: &str) {
         match rtl8188::key_store(ctx) {
@@ -346,12 +343,13 @@ impl<'l> Dongle<'l> {
             }
             *g = None;
         }
-        self.gtk_entry = [None; 4];
         self.ptk_in = false;
-        for e in 0..self.cam_next {
-            let _ = rtl8188::clear_key(ctx, e);
+        for e in 0..8u8 {
+            if self.cam_used & (1 << e) != 0 {
+                let _ = rtl8188::clear_key(ctx, e);
+            }
         }
-        self.cam_next = 0;
+        self.cam_used = 0;
     }
 
     /// The four-way handshake on the association `a`, with `pmk`: the supplicant reads each EAPOL frame from
@@ -626,7 +624,6 @@ impl Station for Dongle<'_> {
         if let Some(old) = self.assoc {
             self.leave(ctx, &old.bssid);
         }
-        self.cam_next = 0;
         self.keys_said = false;
         self.undecrypted_at_join = self.link.borrow().undecrypted;
         self.link.borrow_mut().new_keys();
@@ -934,8 +931,6 @@ impl KeyPath for Dongle<'_> {
         };
         let slot = key_idx as usize & 3;
         self.gtk_reinstall = false;
-        // A group key into a slot already holding one takes that slot's CAM entry back.
-        let reuse = if group { self.gtk_entry[slot] } else { None };
         if group && self.gtk[slot] == Some(*key) {
             // THE SAME GROUP KEY AGAIN: not reinstalled, and its counter not reset (`group_rsc` below).
             self.gtk_reinstall = true;
@@ -944,15 +939,20 @@ impl KeyPath for Dongle<'_> {
                 key_idx));
             return true;
         }
-        let entry = reuse.unwrap_or(self.cam_next);
-        match rtl8188::install_key(ctx, entry, key_idx as u8, key, &mac, group) {
+        // rtlwifi's layout (`rtl92ce_set_key`): a group key in the entry its key id names, at the broadcast
+        // address - where the chip's broadcast default-key lookup reads it - and the pairwise key, key id 0,
+        // in `CAM_PAIRWISE` at the peer's address. A rekey into a slot overwrites that slot's entry, so the
+        // CAM never fills however long the station stays.
+        let (entry, id, mac) = if group {
+            (slot as u8, key_idx as u8, [0xffu8; 6])
+        } else {
+            (rtl8188::CAM_PAIRWISE, 0, mac)
+        };
+        match rtl8188::install_key(ctx, entry, id, key, &mac) {
             Ok(()) => {
-                if reuse.is_none() {
-                    self.cam_next += 1;
-                }
+                self.cam_used |= 1 << entry;
                 if group {
                     self.gtk[slot] = Some(*key);
-                    self.gtk_entry[slot] = Some(entry);
                 } else {
                     self.ptk_in = true;
                 }
