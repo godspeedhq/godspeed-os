@@ -281,7 +281,7 @@ fn await_on_slot(
     // Our answer may already be in hand: another consumer of the shared event ring can have
     // dequeued it and filed it for us. Check the mailbox before touching the ring, or we would wait
     // out a deadline for a completion that already arrived.
-    let passed_over = |ctx: &ServiceContext, trb: u64, stale: &mut u32| {
+    let mut passed_over = |ctx: &ServiceContext, trb: u64, stale: &mut u32| {
         *stale = stale.saturating_add(1);
         if *stale <= 3 || *stale % 64 == 0 {
             ctx.log_fmt(format_args!(

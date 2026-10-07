@@ -2261,10 +2261,10 @@ Also seen, not changed: a `wifi hardware` straight after the onboard radio has l
 firmware REFUSED the request - BCME_NOTASSOCIATED`, its status ask of a radio that is not associated. The
 report is right; the line is noise.
 
-## 38. A dongle fault no longer resets the bus: its hub port alone is released or brought up again (2026-10-07) - built, checked in QEMU where it can be, not yet on the card
+## 38. A dongle fault handled on its hub port alone, and a command ring that wraps (2026-10-07) - REVERTED: on the Pi 4 it took the keyboard away
 
 Section 37 showed every dongle fault re-enumerating the whole controller, and the disk paying for it.
-`xhci` now handles a dongle behind a hub on its own (`services/xhci/src/rebind.rs`):
+`xhci` now handles a dongle behind a hub on its own (rebind.rs in `61c8c827`, reverted):
 
 - **Its hub port reads disconnected** (it dropped off the bus): its slot is released (Disable Slot) and
   its slice freed. Nothing else is touched. The supervisor is told it is gone, as before.
@@ -2276,14 +2276,14 @@ Section 37 showed every dongle fault re-enumerating the whole controller, and th
 - **A dongle on a root port** is re-enumerated as before; nothing else shares a root port.
 
 The hub's control ring is the poll loop's: the requests ride the same cursor the hub-port probes use
-(`hub_request`), matched on the TRB pointer. A slice reused for the dongle is zeroed first, because the
+(a hub_request that is reverted), matched on the TRB pointer. A slice reused for the dongle is zeroed first, because the
 full walk only ever starts from an arena a reset has just zeroed.
 
 **And the command ring wraps now.** It never did: each command took the next slot and only a controller
 reset put the cursor back. The re-enumerations reset it often enough that the end was never reached;
 without them a long session of dongle repairs would have written past the ring into the event ring.
 The last slot is a Link TRB back to the first, Toggle Cycle clear, and each command clears the cycle bit
-of the slot after it (`next_cmd`). `scripts/cross_isa.py` passes 12 of 12 with the ring cut to three slots,
+of the slot after it (a next_cmd that is reverted). `scripts/cross_isa.py` passes 12 of 12 with the ring cut to three slots,
 so it wrapped every two commands through a whole USB disk bring-up and the round trip, and again at its
 real size.
 
@@ -2295,3 +2295,22 @@ against 3.0 s without it, and re-enumerated twice after the prompt (`new device 
 then port 2), re-binding the keyboard each time - section 31's boot-dongle fault, before its fix. So the
 slow first keystrokes with the dongle in predate this branch's interrupt work, which the operator
 confirmed by booting the release.
+
+**On the card, and why it is reverted.** The dongle was plugged in after boot; the bus re-enumerated as
+before and bound it, and its firmware download then hit the cc=4 fault. The new path did what it was
+written to: `resetting its hub port 3 alone`. But `Address Device` then failed three times
+(`completion=4, route=0x3`) - where the full re-enumeration minutes earlier had addressed the same
+device on the same port at once. The failure is not explained: something the full walk does to the
+hub or the port, which a one-port reset from the poll loop does not, matters.
+
+And the failed re-bind was retried WITHOUT A BOUND. The port was left marked untried, so the next
+confirmed reading tried it again: 60 times in two minutes, each costing about 7 s of the poll loop, and
+the keyboard is polled by that loop. Typing stopped. That retry was the mistake, and the operator named
+the commandment it breaks: VIII. `Address Device` answered with a definite failure, completion 4, and
+the code took that answer as a reason to ask again on the next probe, so the timing of the next reading
+decided what happened next rather than the cause of the failure. A failure is a truth to act on, not a
+cue to wait and repeat (and an unbounded repeat is 26.6 as well). The right next step is the one not
+taken: find out why a one-port re-address fails where the full walk succeeds, before any retry at all. The operator chose to close the branch rather than carry this further; the commit is
+reverted whole, the command ring wrap with it, since the wrap was needed only once the re-enumerations
+that reset the ring were gone. The finding about the ring stands for whoever returns: it does not wrap,
+and only a controller reset puts its cursor back.
