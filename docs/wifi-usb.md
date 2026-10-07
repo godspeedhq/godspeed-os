@@ -2114,8 +2114,8 @@ and a transfer completes only when something changed.
 
 **Checked in QEMU** (x86, `qemu-xhci` with a `usb-hub` and the keyboard behind it, and a mouse
 hot-plugged onto the hub from the QEMU monitor): `status-change endpoint armed`, then `hub ports
-watched by the hub's status-change endpoint`. The mouse's arrival was seen 0.8 s after `device_add`,
-including the two-reading confirmation, and its removal 0.05 s after `device_del`. Each change was
+watched by the hub's status-change endpoint`. The mouse's arrival was seen 0.8 s after the monitor added it,
+including the two-reading confirmation, and its removal 0.05 s after the monitor removed it. Each change was
 reported as `a hub reported a change on its status-change endpoint`. With one slot, before the fix, both
 took the 5 s safety scan. `osdev test iommu` still passes.
 
