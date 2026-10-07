@@ -625,126 +625,6 @@ static PROBE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 /// keystroke echo has to wait behind. Owned by this service, like `PROBE_FAILS` above.
 static DIAG_HINT_SAID: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-
-// THE HUB'S STATUS-CHANGE ENDPOINT (USB 2.0 11.12.1), so a hub port is looked at when the hub says
-// something changed, not every HUB_POLL_MS. Owned by this service, like `PROBE_FAILS` above; one bit
-// per slot (slots here are below 32, as `EvMail` already assumes). Reset at every re-enumeration,
-// because a controller reset takes every endpoint with it.
-//
-// Its completions are taken out of the event ring by `next_event_at` itself and never returned to a
-// caller. Half a dozen loops in this file dequeue events - control transfers, commands, hub probes,
-// the disk, the radio, the poll drain - and each treats a completion that is not its own as noise to
-// file or drop. A status-change completion dropped by any of them would leave the endpoint unarmed and
-// the hub silent for good, so the one place every event passes is where it is recorded.
-/// Slots whose DCI 3 is an armed hub status-change endpoint.
-static HUB_INT_SLOTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Slots whose status-change endpoint has completed and is owed a scan and a re-arm.
-static HUB_CHANGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Slots whose next status-change TRB is written with cycle 1 (clear: cycle 0): the producer cycle of
-/// each hub's ring, which flips at the ring's Link.
-static HUB_INT_PCS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Normal TRB slots in a hub's status-change ring, before its Link. FOUR, not one. With one slot the
-/// Link is both after the TD just completed and before the next one, so a re-arm must rewrite it - and
-/// a controller that rests ON the Link once a TD completes then finds the next lap's cycle there and
-/// stops. QEMU's xHCI rests there (its endpoint context's dequeue pointer read the Link's address); the
-/// VL805 follows a Link at once. With several slots the Link is written only when the slot before it
-/// is queued, in that lap's cycle, and is never touched while the controller might still have to
-/// cross it: the producer rule the VL805 already needed for EP0 (docs/wifi-usb.md 27, 35).
-const HUB_INT_RING: usize = 4;
-/// Each armed hub's slice and change-bitmap length, by slot, for the re-arm in the poll loop.
-const HUB_INT_ZERO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-static HUB_INT_DEV: [core::sync::atomic::AtomicU8; 32] = [HUB_INT_ZERO; 32];
-static HUB_INT_LEN: [core::sync::atomic::AtomicU8; 32] = [HUB_INT_ZERO; 32];
-/// Each armed hub's producer slot in its status-change ring, 0..HUB_INT_RING.
-static HUB_INT_PROD: [core::sync::atomic::AtomicU8; 32] = [HUB_INT_ZERO; 32];
-/// The hub status-change endpoint's DCI: endpoint 1 IN, the hub's only interrupt endpoint.
-const HUB_INT_DCI: u32 = 3;
-/// How often the hub ports are scanned anyway while the hub's status-change endpoint is armed and
-/// nothing has changed: the guard against a change event lost somewhere this driver did not foresee.
-/// Not the detection path, so it is long.
-const HUB_SAFETY_MS: u64 = 5_000;
-/// After a hub reports a change, its ports are scanned at HUB_POLL_MS for this long: the arrival and
-/// departure rules want two consecutive readings, and a single change event gives only one.
-const HUB_SETTLE_MS: u64 = 2_000;
-
-/// Queue one TD on a hub's status-change endpoint, at its ring's producer slot (`HUB_INT_PROD`). When
-/// that is the last Normal slot, the Link after it is written FIRST, in this lap's cycle, so it is
-/// valid before the controller can reach it (`HUB_INT_RING`). The change bitmap lands in the slice's
-/// report page; it is not read, since any change means a scan.
-fn hub_int_arm(dma: &Dma, mmio: &Mmio, dboff: usize, slot: u32, dev: usize, len: u32) {
-    if slot >= 32 {
-        return;
-    }
-    let bit = 1u32 << slot;
-    let pcs = if HUB_INT_PCS.load(core::sync::atomic::Ordering::Relaxed) & bit != 0 { 1 } else { 0 };
-    let prod = (HUB_INT_PROD[slot as usize].load(core::sync::atomic::Ordering::Relaxed) as usize)
-        .min(HUB_INT_RING - 1);
-    let ring = int_tr_off(dev);
-    if prod == HUB_INT_RING - 1 {
-        let link = ring + HUB_INT_RING * TRB_SIZE;
-        let rp = dma.phys_at(ring);
-        dma.write32(link, rp as u32);
-        dma.write32(link + 4, (rp >> 32) as u32);
-        dma.write32(link + 8, 0);
-        dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | pcs);
-    }
-    let t = ring + prod * TRB_SIZE;
-    let bp = dma.phys_at(report_off(dev));
-    dma.write32(t, bp as u32);
-    dma.write32(t + 4, (bp >> 32) as u32);
-    dma.write32(t + 8, len.clamp(1, 8));
-    // ISP and IOC: a short packet (fewer ports changed than the buffer holds) completes it too. The
-    // cycle bit goes in last, with the rest of the control word.
-    dma.write32(t + 12, pcs | (1 << 2) | (1 << 5) | (TRB_NORMAL << 10));
-    if prod + 1 == HUB_INT_RING {
-        HUB_INT_PROD[slot as usize].store(0, core::sync::atomic::Ordering::Relaxed);
-        HUB_INT_PCS.fetch_xor(bit, core::sync::atomic::Ordering::Relaxed);
-    } else {
-        HUB_INT_PROD[slot as usize].store((prod + 1) as u8, core::sync::atomic::Ordering::Relaxed);
-    }
-    mmio.write32(dboff + slot as usize * 4, HUB_INT_DCI);
-}
-
-/// The hub's status-change endpoint from its configuration descriptor in CONFIG_BUF_OFF:
-/// `(max packet, bInterval)` of the interrupt IN endpoint at address 0x81, its DCI being `HUB_INT_DCI`.
-/// `None` when the descriptor holds no such endpoint, and the hub is then scanned on the timer.
-fn hub_int_ep(dma: &Dma) -> Option<(u32, u8)> {
-    let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
-    let mut i = 0usize;
-    while i + 7 <= total && i < 200 {
-        let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
-        if blen == 0 {
-            break;
-        }
-        if dma.read8(CONFIG_BUF_OFF + i + 1) == 5
-            && dma.read8(CONFIG_BUF_OFF + i + 2) == 0x81
-            && dma.read8(CONFIG_BUF_OFF + i + 3) & 3 == 3
-        {
-            let mps = (dma.read16(CONFIG_BUF_OFF + i + 4) & 0x7FF) as u32;
-            return (mps > 0).then_some((mps, dma.read8(CONFIG_BUF_OFF + i + 6)));
-        }
-        i += blen;
-    }
-    None
-}
-
-/// Bytes of a hub's change bitmap: bit 0 for the hub, one per port after it.
-fn hub_change_len(nports: u32) -> u32 {
-    nports / 8 + 1
-}
-
-/// The xHCI Interval for a hub's interrupt endpoint (xHCI 6.2.3.6), from its descriptor's bInterval.
-/// High speed counts 2^(bInterval-1) microframes; full speed counts frames, rounded down to a power of
-/// two microframes.
-fn hub_int_interval(speed: u32, binterval: u8) -> u32 {
-    let b = binterval.max(1) as u32;
-    if speed == 1 {
-        let frames = b.min(255);
-        (31 - frames.leading_zeros()) + 3
-    } else {
-        (b.min(16)) - 1
-    }
-}
 const TRB_RESET_ENDPOINT: u32 = 14;
 /// Set TR Dequeue Pointer (xHCI 4.6.10) - tells the controller where to resume on that endpoint.
 /// Stop Endpoint (xHCI 4.6.9) - moves a RUNNING endpoint to Stopped, which is the state Set TR
@@ -1092,22 +972,6 @@ pub(crate) fn next_event_at(
             ir0 + 0x18,
             dma.phys_at(EVENT_RING_OFF + *ev_idx * TRB_SIZE) | (1 << 3),
         );
-        // A hub's status-change completion: recorded here and NOT returned, so no caller can file it
-        // as someone else's answer and leave the hub unarmed (see `HUB_INT_SLOTS`). Counts as a try,
-        // so a hub reporting without pause cannot hold this loop past `max_tries`.
-        if trb_type == TRB_TRANSFER_EVENT && ep_id == HUB_INT_DCI && slot_id < 32
-            && HUB_INT_SLOTS.load(core::sync::atomic::Ordering::Relaxed) & (1 << slot_id) != 0
-        {
-            HUB_CHANGED.fetch_or(1 << slot_id, core::sync::atomic::Ordering::Relaxed);
-            // A FAILED completion halts the endpoint, and re-arming a halted endpoint does nothing.
-            // Stop trusting it: the slot leaves the armed set and its hub goes back to being
-            // scanned every HUB_POLL_MS, the behaviour before this endpoint was used. The poll loop
-            // says so.
-            if completion != 1 && completion != 13 {
-                HUB_INT_SLOTS.fetch_and(!(1 << slot_id), core::sync::atomic::Ordering::Relaxed);
-            }
-            continue;
-        }
         return Some((trb_type, completion, slot_id, ptr, ep_id, residual));
     }
     None
@@ -1460,27 +1324,7 @@ fn hub_port_status(
             // misattributed answers are no harder to get than one.
             Some((TRB_TRANSFER_EVENT, cc, sid, ptr, _, _)) if sid == hub_slot && ptr == want_trb => {
                 if cc == 1 || cc == 13 {
-                    let connected = dma.read16(PROBE_BUF_OFF) & 1 != 0; // wPortStatus bit0 = connect
-                    // ACKNOWLEDGE THE CHANGE, where the hub's status-change endpoint is in use. A hub
-                    // reports a port in its change bitmap for as long as any of its C_PORT_* bits is
-                    // set, so a change left unacknowledged is reported again at every interval and the
-                    // endpoint is a timer again. wPortChange is the second half of the answer; bits 0-4
-                    // are C_PORT_CONNECTION, C_PORT_ENABLE, C_PORT_SUSPEND, C_PORT_OVER_CURRENT and
-                    // C_PORT_RESET, features 16-20. Nothing here reads them, so clearing loses nothing.
-                    let change = dma.read16(PROBE_BUF_OFF + 2) & 0x1F;
-                    if change != 0 && hub_slot < 32
-                        && HUB_INT_SLOTS.load(core::sync::atomic::Ordering::Relaxed) & (1 << hub_slot) != 0
-                    {
-                        for b in 0..5u32 {
-                            if change & (1 << b) != 0
-                                && !hub_clear_feature(ctx, dma, mmio, dboff, ir0, hub_slot, hub_dev, hub_port,
-                                                      16 + b, cur, pcs, ev_idx, ev_cycle, eaten, abandoned)
-                            {
-                                break; // unacknowledged: the hub reports it again, and the next scan retries
-                            }
-                        }
-                    }
-                    return Some(connected);
+                    return Some(dma.read16(PROBE_BUF_OFF) & 1 != 0); // wPortStatus bit0 = connect
                 }
                 // The transfer came back FAILED, and this used to return a bare `None` - identical
                 // to "no answer arrived", which is a completely different fact (§26.7: a failure
@@ -1591,73 +1435,6 @@ fn hub_port_status(
 /// through it: a Configure Endpoint command that sets the slot-context Hub bit, Number of Ports, MTT
 /// (multi-TT), and TT Think Time (xHCI 4.6.5 / 6.2.2). Runs after the hub is Address'd +
 /// Set_Configuration'd. `route` is 0 for a hub on a root port (recursion passes the parent's route).
-/// CLEAR_FEATURE(`feature`) on a hub's downstream `hub_port`, over the hub's EP0 at the probe's own
-/// persistent cursor - the same ring, wrap and matching rules as `hub_port_status`, with no data stage.
-/// True when the hub acknowledged it. A completion for someone else is filed and the request given up,
-/// as the probe does.
-#[allow(clippy::too_many_arguments)]
-fn hub_clear_feature(
-    ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
-    dboff: usize,
-    ir0: usize,
-    hub_slot: u32,
-    hub_dev: usize,
-    hub_port: u32,
-    feature: u32,
-    cur: &mut usize,
-    pcs: &mut u32,
-    ev_idx: &mut usize,
-    ev_cycle: &mut u32,
-    eaten: &mut EvMail,
-    abandoned: &mut bool,
-) -> bool {
-    const RING: usize = 0x1000;
-    let base = ep0_tr_off(hub_dev);
-    if *cur + 3 * 0x10 >= RING {
-        let bp = dma.phys_at(base);
-        dma.write32(base + *cur, bp as u32);
-        dma.write32(base + *cur + 4, (bp >> 32) as u32);
-        dma.write32(base + *cur + 8, 0);
-        dma.write32(base + *cur + 12, (TRB_LINK << 10) | (1 << 1) | *pcs);
-        *cur = 0;
-        *pcs ^= 1;
-    }
-    let tr = base + *cur;
-    let c = *pcs;
-    // Setup: CLEAR_FEATURE - bmRequestType 0x23 (class, other, OUT), bRequest 1, wValue the feature,
-    // wIndex the port, wLength 0. No data stage, so the status stage is IN.
-    dma.write32(tr, 0x23 | (1 << 8) | (feature << 16));
-    dma.write32(tr + 4, hub_port);
-    dma.write32(tr + 8, 8);
-    dma.write32(tr + 12, c | (1 << 6) | (TRB_SETUP_STAGE << 10)); // IDT, TRT 0 = no data
-    dma.write32(tr + 16, 0);
-    dma.write32(tr + 20, 0);
-    dma.write32(tr + 24, 0);
-    dma.write32(tr + 28, c | (1 << 5) | (TRB_STATUS_STAGE << 10) | (1 << 16)); // IOC, DIR=IN
-    let want_trb = dma.phys_at(tr + 16);
-    *cur += 2 * 0x10;
-    mmio.write32(dboff + hub_slot as usize * 4, 1);
-    let mut deadline = wait::Deadline::paced(ctx, Budget::ms(PROBE_ANSWER_MS), Budget::ms(1));
-    let ev = loop {
-        let e = next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, 4_096);
-        if e.is_some() || deadline.expired() {
-            break e;
-        }
-        deadline.pause();
-    };
-    match ev {
-        Some((TRB_TRANSFER_EVENT, cc, sid, ptr, _, _)) if sid == hub_slot && ptr == want_trb => cc == 1,
-        Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) => {
-            eaten.put(sid, ep, cc, res);
-            *abandoned = true;
-            false
-        }
-        _ => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn configure_as_hub(
     ctx: &ServiceContext,
@@ -1674,9 +1451,6 @@ fn configure_as_hub(
     nports: u8,
     mtt: bool,
     ttt: u32,
-    // The hub's status-change endpoint, `(max packet, xHCI interval)`, when it is to be configured in
-    // the same command (`HUB_INT_SLOTS`). `None` configures EP0 alone, as before.
-    int_ep: Option<(u32, u32)>,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
@@ -1685,18 +1459,11 @@ fn configure_as_hub(
     let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
     clear_input_ctx(dma, ctx_size);
     dma.write32(INPUT_CTX_OFF, 0); // Drop flags
-    // Add: slot + EP0 as always; with the status-change endpoint, slot + DCI 3 and NOT EP0. QEMU's xHCI
-    // refuses any Configure Endpoint whose input context adds EP0 (TRB Error, completion 5, on the plain
-    // hub configure too), so the hub's endpoint could not be tested there at all. EP0 needs no
-    // re-specifying in this command: Address Device set it. The plain form is left as it was, since the
-    // VL805 accepts it; if it refuses this one, the caller falls back to the plain form and says so.
-    dma.write32(INPUT_CTX_OFF + 4, if int_ep.is_some() { 0b1001 } else { 0b11 });
-    // Slot dword0: Context Entries (31:27, the highest DCI configured), Hub=1 (bit 26), MTT (bit 25),
-    // Speed (bits 23:20), Route (19:0).
-    let entries = if int_ep.is_some() { HUB_INT_DCI } else { 1 };
+    dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add: slot + EP0
+                                          // Slot dword0: Context Entries=1, Hub=1 (bit 26), MTT (bit 25), Speed (bits 23:20), Route (19:0).
     dma.write32(
         islot,
-        (entries << 27) | (1 << 26) | (if mtt { 1 << 25 } else { 0 }) | (speed << 20) | (route & 0xFFFFF),
+        (1 << 27) | (1 << 26) | (if mtt { 1 << 25 } else { 0 }) | (speed << 20) | (route & 0xFFFFF),
     );
     // Slot dword1: Number of Ports [31:24], Root Hub Port Number [23:16].
     dma.write32(islot + 4, ((nports as u32) << 24) | (root_port << 16));
@@ -1709,18 +1476,6 @@ fn configure_as_hub(
     dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
     dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
     dma.write32(iep0 + 16, 8);
-    if let Some((mps, interval)) = int_ep {
-        // DCI 3's endpoint context, one `ctx_size` per DCI past the input control context: Interval
-        // (23:16), then CErr 3, EP Type 7 (Interrupt IN) and Max Packet Size, the ring with DCS 1, and
-        // Average TRB Length / Max ESIT Payload both the packet size.
-        let iep = INPUT_CTX_OFF + (HUB_INT_DCI as usize + 1) * ctx_size;
-        let tr = dma.phys_at(int_tr_off(dev_idx));
-        dma.write32(iep, (interval & 0xFF) << 16);
-        dma.write32(iep + 4, (3 << 1) | (7 << 3) | (mps << 16));
-        dma.write32(iep + 8, (tr as u32 & !0xF) | 1);
-        dma.write32(iep + 12, (tr >> 32) as u32);
-        dma.write32(iep + 16, mps | (mps << 16));
-    }
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
     let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
@@ -1741,8 +1496,8 @@ fn configure_as_hub(
     .map(|(c, _)| c)
     .unwrap_or(0);
     ctx.log_fmt(format_args!(
-        "xhci: hub configure (Hub bit, {} ports, mtt={}, ttt={}{}) completion={}",
-        nports, mtt, ttt, if int_ep.is_some() { ", status-change endpoint" } else { "" }, ce
+        "xhci: hub configure (Hub bit, {} ports, mtt={}, ttt={}) completion={}",
+        nports, mtt, ttt, ce
     ));
     ce == 1
 }
@@ -3213,48 +2968,10 @@ fn enumerate_one(
     // replugged behind a hub changes no root PORTSC - see the reenum loop).
     *saw_hub = true;
     // Configure the device AS a hub so the controller routes downstream traffic through it.
-    // The hub's status-change endpoint, configured in the same command, so a port is looked at when
-    // the hub says it changed rather than every HUB_POLL_MS. Read from the configuration descriptor
-    // `read_config_and_bind` left in CONFIG_BUF_OFF: everything since went to DATA_BUF_OFF. Only a
-    // USB 2 hub: a SuperSpeed one has different change bits and an endpoint companion, and is still
-    // scanned on the timer.
-    let int_ep = if ss_hub || !(speed == 1 || speed == 3) {
-        None
-    } else {
-        hub_int_ep(dma).map(|(mps, bint)| (mps, hub_int_interval(speed, bint)))
-    };
-    if int_ep.is_some() {
-        // A previous pass's TRBs must not look valid in the first lap's cycle.
-        for off in (0..(HUB_INT_RING + 1) * TRB_SIZE).step_by(4) {
-            dma.write32(int_tr_off(dev_idx) + off, 0);
-        }
-    }
-    let mut armed = false;
-    if configure_as_hub(
+    configure_as_hub(
         ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, 0, port, nports, mtt, ttt,
-        int_ep, ev_idx, ev_cycle, cmd_idx,
-    ) {
-        armed = int_ep.is_some();
-    } else if int_ep.is_some() {
-        // Refused with the endpoint: configure the hub as it always was, and watch it on the timer.
-        ctx.log("xhci: the hub refused its status-change endpoint - configuring it without, scanned on the timer");
-        configure_as_hub(
-            ctx, dma, mmio, dboff, ir0, ctx_size, slot, dev_idx, speed, 0, port, nports, mtt, ttt,
-            None, ev_idx, ev_cycle, cmd_idx,
-        );
-    }
-    if armed && slot < 32 {
-        let bit = 1u32 << slot;
-        HUB_INT_PCS.fetch_or(bit, core::sync::atomic::Ordering::Relaxed); // the first lap is cycle 1
-        HUB_INT_PROD[slot as usize].store(0, core::sync::atomic::Ordering::Relaxed);
-        HUB_INT_DEV[slot as usize].store(dev_idx as u8, core::sync::atomic::Ordering::Relaxed);
-        HUB_INT_LEN[slot as usize].store(hub_change_len(nports as u32) as u8, core::sync::atomic::Ordering::Relaxed);
-        HUB_INT_SLOTS.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
-        hub_int_arm(dma, mmio, dboff, slot, dev_idx, hub_change_len(nports as u32));
-        ctx.log_fmt(format_args!(
-            "xhci: hub slot {}'s status-change endpoint armed - its ports are scanned when it reports a change, and every {} s anyway",
-            slot, HUB_SAFETY_MS / 1000));
-    }
+        ev_idx, ev_cycle, cmd_idx,
+    );
     // POWER every downstream port. The EP0 cursor stays contiguous (hub descriptor ended at ~176);
     // bounded so a many-port hub cannot overrun the one-page ring.
     // Past the hub-descriptor read, and past the SuperSpeed retry if one was issued - each is 3 TRBs
@@ -3891,11 +3608,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     'reenum: loop {
         reenums += 1;
-        // The controller is about to be reset, and every endpoint with it: no hub's status-change
-        // endpoint survives, so none is armed until enumeration configures it again.
-        HUB_INT_SLOTS.store(0, core::sync::atomic::Ordering::Relaxed);
-        HUB_CHANGED.store(0, core::sync::atomic::Ordering::Relaxed);
-        HUB_INT_PCS.store(0, core::sync::atomic::Ordering::Relaxed);
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
         // DETERMINISTICALLY in this sequence (the log dies right after the "v..." line above), so bracket
         // every step with a log: the last line printed before a freeze is then the exact MMIO that hung.
@@ -4608,14 +4320,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // failure path still repairs. Never silently assume the re-point happened (§26.7).
         }
         let mut last_hub_poll = ctx.read_tsc();
-        // The hub scan's pace (`HUB_INT_SLOTS`): HUB_POLL_MS until every hub in use has an armed
-        // status-change endpoint, then HUB_SAFETY_MS, except for HUB_SETTLE_MS after a change. Kept
-        // across passes because the wait at the top of the pass needs the value the last one chose.
-        let mut hub_changed_at: Option<wait::Since> = None;
-        let mut hub_scan_ms = HUB_POLL_MS;
-        let mut hub_int_was = 0u32;
-        let mut hub_int_noted = false;
-        let mut hub_reports = 0u32;
         // LIVENESS HEARTBEAT. The driver must be able to say "I am still running".
         //
         // On hardware this driver went completely silent for two minutes - keyboard dead, hot-plug
@@ -4803,7 +4507,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // that "MSI not reaching us" and made normal idle read as a broken feature.
                 // What matters is whether the interrupt line ever worked, which the companion
                 // message states from an observed delivery.
-                ctx.log("xhci: HID bound - waking on interrupts, hub watchdog at 500ms (longer once a hub's status-change endpoint carries it)");
+                ctx.log("xhci: HID bound - waking on interrupts, hub watchdog at 500ms");
                 poll_noted = true;
             }
             // Announced only from an OBSERVED delivery (`irq_seen`), never from the initial state.
@@ -4892,10 +4596,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let deadline = if wake_fast {
                 base
             } else if polling {
-                // The hub's pace, but HUB_POLL_MS until an interrupt has been seen: this wait is also
-                // what finds a keyboard report on a controller whose interrupts never arrive, and five
-                // seconds of it would be five seconds per keystroke there.
-                ctx.duration_cycles(if irq_seen { hub_scan_ms } else { HUB_POLL_MS })
+                ctx.duration_cycles(HUB_POLL_MS)
             } else {
                 base.saturating_mul(25)
             };
@@ -5200,57 +4901,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if disk.is_some() { "yes" } else { "no" },
                     no_cap_drops));
             }
-            // A hub reported a change (`next_event_at` recorded it): re-arm its endpoint, scan now, and
-            // keep scanning at HUB_POLL_MS for HUB_SETTLE_MS so the two-reading rules can confirm it.
-            let now = ctx.read_tsc();
-            let changed = HUB_CHANGED.swap(0, core::sync::atomic::Ordering::Relaxed);
-            let armed_hubs = HUB_INT_SLOTS.load(core::sync::atomic::Ordering::Relaxed);
-            for s in 0..32u32 {
-                if changed & armed_hubs & (1 << s) != 0 {
-                    let dev = HUB_INT_DEV[s as usize].load(core::sync::atomic::Ordering::Relaxed) as usize;
-                    let len = HUB_INT_LEN[s as usize].load(core::sync::atomic::Ordering::Relaxed) as u32;
-                    hub_int_arm(&dma, &mmio, dboff, s, dev, len);
-                }
-            }
-            if changed != 0 {
-                hub_changed_at = Some(wait::Since::now(&ctx));
-                hub_reports = hub_reports.saturating_add(1);
-                if hub_reports <= 6 {
-                    ctx.log_fmt(format_args!(
-                        "xhci: a hub reported a change on its status-change endpoint (slots {:#x}, {} so far) - scanning now",
-                        changed, hub_reports));
-                }
-            }
-            // A hub whose endpoint failed has left the armed set: back to the timer, said once.
-            if hub_int_was & !armed_hubs != 0 {
-                ctx.log("xhci: a hub's status-change endpoint failed - its ports are scanned every 500 ms again");
-            }
-            hub_int_was = armed_hubs;
-            // Every hub something is bound behind must be armed for the long pace.
-            let mut hubs_in_use = 0u32;
-            for h in &devs[..ndev] {
-                if h.hub_slot != 0 && h.hub_slot < 32 { hubs_in_use |= 1 << h.hub_slot; }
-            }
-            if let Some(dk) = disk.as_ref() {
-                if dk.hub_slot != 0 && dk.hub_slot < 32 { hubs_in_use |= 1 << dk.hub_slot; }
-            }
-            if let Some(r) = radio.as_ref() {
-                if r.hub_slot != 0 && r.hub_slot < 32 { hubs_in_use |= 1 << r.hub_slot; }
-            }
-            let settling = hub_changed_at.as_ref().is_some_and(|t| !t.passed(&ctx, Budget::ms(HUB_SETTLE_MS)));
-            hub_scan_ms = if hubs_in_use != 0 && hubs_in_use & !armed_hubs == 0 && !settling {
-                HUB_SAFETY_MS
-            } else {
-                HUB_POLL_MS
-            };
-            if hub_scan_ms == HUB_SAFETY_MS && !hub_int_noted {
-                ctx.log_fmt(format_args!(
-                    "xhci: hub ports watched by the hub's status-change endpoint - scanned on a change, and every {} s anyway",
-                    HUB_SAFETY_MS / 1000));
-                hub_int_noted = true;
-            }
-            let hub_due = changed != 0
-                || now.wrapping_sub(last_hub_poll) > ctx.duration_cycles(hub_scan_ms);
+            let hub_due =
+                ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
             // (declared above, before the block-serving calls - a DISK transfer can consume a HID
             // completion just as a hub check can, and both owe the same re-arm)
             for d in 0..ndev {

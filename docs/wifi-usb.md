@@ -2075,7 +2075,7 @@ such report set the poll for good.
 fast/4703 idle`. Typing feels the same. **Refuted by:** the polling line appearing anyway, which would
 mean three reports really were found by timed-out waits, or by typing lag.
 
-## 35. Hub ports watched by the hub's status-change endpoint, not a 500 ms timer (2026-10-07) - built, checked in QEMU, not yet on hardware
+## 35. Hub ports watched by the hub's status-change endpoint, not a 500 ms timer (2026-10-07) - REVERTED: worse on the Pi 4
 
 **What it replaces.** `xhci` learned of anything plugged into or pulled from a port behind a hub by
 asking the hub about every port, over its control endpoint, every 500 ms (`HUB_POLL_MS`). On the Pi 4
@@ -2126,3 +2126,19 @@ endpoint`. Plugging and pulling the dongle or the stick is seen within about a s
 run's (`hub 46426` ms, 18978 passes in 183 s). **Refuted by:** `refused its status-change endpoint`, or
 `failed - its ports are scanned every 500 ms again` (the VL805 differs from QEMU here), or an unplug that
 takes five seconds to be seen (the change was missed and the safety scan caught it).
+
+**Result (2026-10-07, the Pi 4): refuted, and reverted the same hour.** The endpoint was accepted and
+armed on every pass (`hub configure (... status-change endpoint) completion=1`), and the first
+enumeration bound the keyboard, the stick and the dongle. Then the dongle's firmware download failed
+with `cc=4` (section 33), its EP0 could not be repaired, and `xhci` re-enumerated. From the fourth pass
+on, NO device behind the hub could be addressed: `downstream Address Device failed (completion=4)` for
+the stick, the dongle and the keyboard alike, Address Device and Enable Slot getting no completion at
+all, one controller reset that did not halt within 250 ms, and a re-scan every few seconds that bound
+nothing. The operator saw the keyboard dead for long stretches: "the user experience is much worse".
+The run before, without this change and with the same dongle fault, re-bound the keyboard on every pass.
+
+**Not shown:** which part of the change did it - the endpoint armed during the port walk, the Configure
+Endpoint without EP0's add flag, the change-bit clears, or the fault starting from the dongle anyway and
+only being unlucky here. `xhci/src/main.rs` is back at `822f8736`, section 34's keyboard fix alone. The
+design stands as a record; trying it again needs a run that separates those, with the dongle unplugged so
+its fault cannot start the chain.
