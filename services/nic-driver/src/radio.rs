@@ -32,8 +32,9 @@ pub(crate) enum Carrier {
     None,
 }
 
-/// How often the cable is re-read on a request. A PHY read is two MDIO transactions; every drain would
-/// pay it for nothing, and a switch half a second late is not something a person can see.
+/// How often the cable is re-read on a request. A cable read costs two MDIO transactions (GENET, dwmac)
+/// or an IPC to `dwc2` (the Pi 2); every drain would pay it for nothing, and a switch half a second late is
+/// not something a person can see. The RTL8168 reads one register and re-reads it on every request.
 pub(crate) const CABLE_RECHECK_MS: u64 = 500;
 
 /// The bound on one exchange with the radio's service, in milliseconds - and it is SHORT on purpose. This was a

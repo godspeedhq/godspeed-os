@@ -320,7 +320,6 @@ impl<'l> Dongle<'l> {
         let _ = self.tune(ctx, FIRST);
     }
 
-    /// The keys out: the kept ones zeroed (`supplicant::forget`) and every CAM entry this join filled emptied.
     /// THE KEY STORE'S ENABLES, READ BACK (`docs/wifi-usb.md` 40) - an instrument for the card where a
     /// joined link took no frame: every one came up `security 0`, the chip finding no key, with both keys
     /// written. It says what the chip holds, not what this driver believes it wrote: the security enable
@@ -335,6 +334,7 @@ impl<'l> Dongle<'l> {
         }
     }
 
+    /// The keys out: the kept ones zeroed (`supplicant::forget`) and every CAM entry this join filled emptied.
     fn drop_keys(&mut self, ctx: &ServiceContext) {
         supplicant::forget(&mut self.keys);
         for g in self.gtk.iter_mut() {
@@ -921,8 +921,8 @@ impl KeyPath for Dongle<'_> {
         }
     }
 
-    /// A CCMP key into the next CAM entry: against the peer for the pairwise key, against the BSSID for a
-    /// group key, as `rtl8xxxu_set_key` does.
+    /// A CCMP key into its CAM entry, in rtlwifi's layout (`docs/wifi-usb.md` 43): a group key in the entry its
+    /// key id names, at ff:ff:ff:ff:ff:ff; the pairwise key in `rtl8188::CAM_PAIRWISE`, at the peer's address.
     fn install_key(&mut self, key_idx: u32, key: &[u8; 16], peer: Option<&[u8; 6]>, ctx: &ServiceContext) -> bool {
         let Some(a) = self.assoc else { return false };
         let (mac, group) = match peer {

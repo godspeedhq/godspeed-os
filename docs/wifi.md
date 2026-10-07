@@ -2530,7 +2530,7 @@ frame 3: channel 0x00 (CONTROL), frmlen 42, dataoff 12, seq 2, nextlen 0 -> 30 b
   [16] 98 fe 54 1c dc 54 68 65
   [24] 72 61 64 64 72 00 00 00
 the reply arrived after 2 other frame(s) - 0 header-only, 2 on another channel, 0 from another exchange
-THE RADIO ANSWERED - its MAC address is 98:fe:54:1c:dc:54
+THE RADIO ANSWERED - its MAC address is xx:xx:xx:xx:xx:54
 ```
 
 Everything decodes: command 262 echoed, `len 14`, `id 1`, no error, the MAC at payload offset 0, and the
@@ -2538,7 +2538,7 @@ untouched tail of the request buffer (`heraddr\0`) behind it - which is what a s
 fourteen-byte buffer looks like.
 
 **Independently corroborated**, which matters because the alternative is a self-consistent parse of our own
-bytes. The Raspberry Pi OS boot carried `smsc95xx.macaddr=98:FE:54:1C:DC:53` on its kernel command line - the
+bytes. The Raspberry Pi OS boot carried `smsc95xx.macaddr=XX:XX:XX:XX:XX:53` on its kernel command line - the
 ethernet MAC. Ours is `...dc:54`. Consecutive, which is how the Pi Foundation assigns the pair. Two unrelated
 sources agree.
 
@@ -3069,7 +3069,7 @@ The machine booted with the cable out. `wifi join` joined. On the next network r
 radio's link and configured itself OVER THE RADIO, on the guest network's own subnet:
 
 ```
-nic-driver: the cable is out - the radio carries the link (MAC 98:fe:54:1c:dc:54)
+nic-driver: the cable is out - the radio carries the link (MAC xx:xx:xx:xx:xx:54)
 net-stack: DHCP reply - 320 bytes, type 2 (2=OFFER 5=ACK), server 192.168.11.1
 net-stack: DHCP - offered 192.168.11.20, gw 192.168.11.1, dns 194.168.4.100
 net-stack: DHCP - ACK, 192.168.11.20 is ours (server 192.168.11.1)
@@ -3080,7 +3080,7 @@ net-stack: ICMP - 192.168.11.1 echo reply (ping OK)
 Discover, offer, request, acknowledge, ARP and an echo through the radio, on the first attempt: every op
 of the frame interface, the transmit credit, the pull, the address-change rule and the DHCP exchange all
 proved at once. Plugging the cable back in later did the other half - `the link's address changed
-(98:fe:54:1c:dc:54 -> 02:00:00:00:00:01) - re-configuring`, a new lease from 192.168.4.1, and `ping`
+(xx:xx:xx:xx:xx:54 -> 02:00:00:00:00:01) - re-configuring`, a new lease from 192.168.4.1, and `ping`
 answering over the cable within a second.
 
 **Then the radio stopped answering, and `ping` over it never happened.** The operator's words: "wifi

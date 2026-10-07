@@ -11,7 +11,7 @@ behind any USB host - `dwc2` on the Pi 2, `xhci` on the Wyse 5070, the T630, the
 - and a board with an onboard radio may have a dongle as well. Two services keep two radios apart: each
 restarts alone, and no board's image carries a radio it cannot have. On a board with both, `wifi`
 addresses the onboard radio unless told otherwise; how it is told is `wifi hardware use`, specified in
-`utilities/56_wifi.md` 11 (the report is built, the choosing is not).
+`utilities/56_wifi.md` 11 (both the report and the choosing are built; section 37).
 
 **The USB host serves the dongle; it does not drive it.** A host binds the dongle by VID:PID - it is a
 vendor-class device, so there is no class to match - and then answers `godspeed_wifi::usbfn` for that one
@@ -34,7 +34,7 @@ is due when a scan exists, not before.
 
 | Op | Request | Reply |
 |---|---|---|
-| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2)]` |
+| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`) |
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
 | `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |
@@ -246,7 +246,7 @@ One more thing the R2 run settled: on the U1b run the third replug came up at fu
 transaction translator, and every vendor read failed. In the R2 run both replugs came up at high speed and
 read the chip at once, so that was the insertion; it is recorded here in case it returns.
 
-## 7. U2: `xhci` - the design, from a reading of the driver (2026-10-05); U2a hardware-verified (sections 25, 27), bulk IN and OUT (U2b, U2c) built, not yet on hardware (sections 28-30)
+## 7. U2: `xhci` - the design, from a reading of the driver (2026-10-05); U2a hardware-verified (sections 25, 27), bulk IN and OUT (U2b, U2c) hardware-verified on the Pi 4 (sections 28-30)
 
 `wifi-usb` already asks whichever host it was wired to (`HOSTS`, `gs::ipc::peer`), so on the driver's side U2
 is a spawn row. On `xhci`'s side it is real work, because that driver was written around keyboards and one
@@ -2048,7 +2048,7 @@ bring-ups whose download is in the logs kept, it has failed in 4 of 10. One more
 hardware` showed the dongle as `usb  ?  ?  down`. Its chip and bus were unknown even though the driver
 had identified the chip. This fault and the dead repair are the next work on this host.
 
-## 34. The keyboard put on the 10 ms poll by a report its interrupt had not been taken for yet (2026-10-07) - REVERTED with section 35, not yet tested on hardware
+## 34. The keyboard put on the 10 ms poll by a report its interrupt had not been taken for yet (2026-10-07) - REVERTED after section 35; its card found section 36's stick, and the fix itself was never observed
 
 **What was seen.** On every Pi 4 run since the dongle arrived, about a second after the keyboard is
 bound, `xhci` logs `waking on interrupts (MSI) - not polling` and then `a HID report arrived with no
@@ -2264,7 +2264,7 @@ report is right; the line is noise.
 ## 38. A dongle fault handled on its hub port alone, and a command ring that wraps (2026-10-07) - REVERTED: on the Pi 4 it took the keyboard away
 
 Section 37 showed every dongle fault re-enumerating the whole controller, and the disk paying for it.
-`xhci` now handles a dongle behind a hub on its own (rebind.rs in `61c8c827`, reverted):
+`xhci` was made to handle a dongle behind a hub on its own (rebind.rs in `61c8c827`; all of this was reverted):
 
 - **Its hub port reads disconnected** (it dropped off the bus): its slot is released (Disable Slot) and
   its slice freed. Nothing else is touched. The supervisor is told it is gone, as before.
@@ -2279,7 +2279,7 @@ The hub's control ring is the poll loop's: the requests ride the same cursor the
 (a hub_request that is reverted), matched on the TRB pointer. A slice reused for the dongle is zeroed first, because the
 full walk only ever starts from an arena a reset has just zeroed.
 
-**And the command ring wraps now.** It never did: each command took the next slot and only a controller
+**And the command ring was made to wrap (reverted with the rest).** It never did: each command took the next slot and only a controller
 reset put the cursor back. The re-enumerations reset it often enough that the end was never reached;
 without them a long session of dongle repairs would have written past the ring into the event ring.
 The last slot is a Link TRB back to the first, Toggle Cycle clear, and each command clears the cycle bit
@@ -2315,7 +2315,7 @@ reverted whole, the command ring wrap with it, since the wrap was needed only on
 that reset the ring were gone. The finding about the ring stands for whoever returns: it does not wrap,
 and only a controller reset puts its cursor back.
 
-## 39. The radio bridge on the PCs: the RTL8168 carries frames to the dongle when the cable is out (2026-10-07) - hardware-verified on the T630 with the cable out; the cable path and the Wyse not yet run
+## 39. The radio bridge on the PCs: the RTL8168 carries frames to the dongle when the cable is out (2026-10-07) - hardware-verified on the T630, the cable path included (section 40), and on the Wyse (41)
 
 Until now a dongle on the T630 or the Wyse could scan and join and carry nothing: `nic-driver`'s RTL8168
 backend had no radio bridge, so with the cable out `net-stack`'s frames went to a dead cable. The
@@ -2612,7 +2612,7 @@ hand-made join as well as a rejoin. What every failure so far shares is a fresh 
 chip that has just been brought up; what separates a failing one from a working one is still unknown. In
 this session's cards: four failures in about fifteen fresh joins, on two hosts. `backlog/79` carries it.
 
-## 43. The key store laid out as Realtek's own driver lays it out (2026-10-07) - for `backlog/79`; built, not yet on hardware
+## 43. The key store laid out as Realtek's own driver lays it out (2026-10-07) - for `backlog/79`; hardware-verified on the Pi 2 (sections 45, 46)
 
 `backlog/79`: a fresh `wifi-usb` sometimes joins and every frame back comes up `security 0`. Section 40
 showed the two security enables read back as written, and the CAM could not be read back (rtlwifi has no

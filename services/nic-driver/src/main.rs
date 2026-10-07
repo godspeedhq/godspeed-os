@@ -482,8 +482,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 answer(ctx, reply_cap, &rs, &mut reply_fails);
                 continue;
             }
-            // Fresh 15-byte status: reset_ok, mac(6), CURRENT link, last-TX-done, last-RX len, TX/RX
-            // counts. The link is read LIVE (it negotiates over a few seconds after reset).
+            // The link is read LIVE (it negotiates over a few seconds after reset).
             // 32-byte NIC hardware status (Layer-1 ground truth). [0] reset_ok, [1..7] mac, [7] link,
             // [8] last-TX-done, [9..11] last-RX len, [11..13] TX req count, [13..15] RX req count,
             // [15] speed|duplex, then the CHIP's OWN cumulative tally counters (DTCCR dump, independent

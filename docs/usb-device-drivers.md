@@ -58,7 +58,7 @@ the supervisor's commands, and there is one message carrying the state instead o
 **As built (Pi 2, `docs/wifi-usb.md` 26):** `sdk/rust/src/service_context.rs` `usbdev`. One message,
 `REPORT` - present or not, the binding count, VID:PID - instead of separate attached and detached
 messages: each report is the host's whole state for its device, so a duplicate is harmless. The host and
-port are not in it yet; one host reports today, with one such device. The binding count restarts with
+port are not in it yet; two hosts report (`dwc2` and `xhci`), each with one such device. The binding count restarts with
 each host instance. `OP_INFO` does not carry it yet.
 
 ## 3. What it changes
@@ -106,9 +106,11 @@ alone; a bulk IN qTD kept armed, with its completion taken on the interrupt; a b
    dongle's port watched (DONE 2026-10-06, hardware-verified on the Pi 4 rather than the T630, the
    operator's choice of test board; `docs/wifi-usb.md` 27).
 3. **U2b and U2c:** receive and transmit through `xhci` (DONE 2026-10-07: both hardware-verified on
-   the Pi 4, the dongle joined, `docs/wifi-usb.md` 28-32), then `nic-driver`'s radio bridge on x86 (the PCs' NIC backends have none
-   yet).
+   the Pi 4, the dongle joined, `docs/wifi-usb.md` 28-32), then `nic-driver`'s radio bridge on x86 (DONE
+   2026-10-07 on the RTL8168, hardware-verified on the T630 and the Wyse, `docs/wifi-usb.md` 39-41; the
+   e1000, QEMU's, has none).
 4. **`wifi hardware`** (`utilities/56_wifi.md` 11) once a board can have two radios: the report BUILT
-   (2026-10-06, checked in QEMU), `wifi hardware use` specified, not built.
+   (2026-10-06, checked in QEMU), and `wifi hardware use` (DONE, both hardware-verified on the Pi 4,
+   `docs/wifi-usb.md` 37).
 
 Each step is a card on hardware, one change per flash, with its prediction written before it runs.

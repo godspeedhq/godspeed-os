@@ -1823,8 +1823,8 @@ fn read_config_and_bind(
     }
     if ep_addr == 0 {
         // THE WIFI DONGLE (U2a), by its VID:PID - a vendor-class device has no class to match on. It is
-        // configured and KEPT, its slot and slice with it, and served to `wifi-usb` (`radio.rs`). Only its
-        // EP0 is driven so far: the bulk endpoints are U2b and U2c.
+        // configured and KEPT, its slot and slice with it, and served to `wifi-usb` (`radio.rs`): EP0 for
+        // its registers, and the bulk endpoints configured below for its frames (U2b, U2c).
         if radio::is_radio(ids) {
             if control(
                 dma, mmio, dboff, ir0, slot, dev_idx, 96, ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
@@ -2752,7 +2752,7 @@ fn enumerate_one(
     // device enumerated after it failed Address Device with Transaction Error (completion 4) - the WiFi
     // dongle on port 4, and the device on port 6 on every boot. The SuperSpeed devices on ports 10 and
     // 15, enumerated in the same position, got no completion at all and blocked every later command;
-    // whether that is the same cause is for the card to show (`docs/wifi-usb.md` 41). On the T630 the
+    // the Wyse card confirmed it was the same cause (`docs/wifi-usb.md` 41). On the T630 the
     // dongle was always the first device found, so nothing before it had written the word.
     let islot = INPUT_CTX_OFF + ctx_size;
     let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
@@ -3024,8 +3024,9 @@ fn enumerate_one(
     // SET HUB DEPTH, for a SuperSpeed hub: it routes by the route string, and needs to be told which tier
     // of it is its own before it can send anything to a port below it. USB 3 hub class request 12, sent
     // after Set Configuration as Linux's `hub_activate` sends it, with the hub's level less one - 0 here,
-    // because this walk runs on a hub on a ROOT port. Without it the device behind the Wyse's USB3 hub
-    // never answered its Address Device, and the command ring stopped behind it.
+    // because this walk runs on a hub on a ROOT port. The device behind the Wyse's USB3 hub never answered
+    // its Address Device; this, the USB2 port-status bits and the wrong speed were all read as causes from
+    // the code (`docs/wifi-usb.md` 44), and which of them it was is for the Wyse card to show.
     if ss_hub {
         let ok = control(
             dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0x20, 12, 0, 0, 0, 0,

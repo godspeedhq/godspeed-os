@@ -360,8 +360,9 @@ pub fn reset_port(
             ctx.log_fmt(format_args!(
                 "dwc2-svc: hub port {} did not finish reset within {} ms (status={:#06x})",
                 port, RESET_TIMEOUT_MS, st.status));
-            // Acknowledged here too, as the success path above does: a reset that never finished - the
-            // device pulled during it - leaves change bits the hub would otherwise report forever.
+            // Acknowledged here too - every change bit, where the success path above clears the two it
+            // expects: a reset that never finished (the device pulled during it) leaves change bits the
+            // hub would otherwise report forever.
             let _ = clear_changes(ctx, mmio, dma, t, port);
             return None;
         }

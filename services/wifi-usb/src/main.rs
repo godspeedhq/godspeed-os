@@ -12,7 +12,7 @@
 //!
 //! A Realtek RTL8188CUS today: a soft-MAC radio whose register file is reached by a vendor control
 //! request. This service holds no hardware at all. The USB host service that enumerated the dongle -
-//! `dwc2` on the Pi 2, `xhci` on the T630 (U2a) - bound it as the radio, and answers `godspeed_wifi::usbfn` for that one device;
+//! `dwc2` on the Pi 2, `xhci` on the Pi 4, the VisionFive and the PCs (U2a) - bound it as the radio, and answers `godspeed_wifi::usbfn` for that one device;
 //! every register read, and later the firmware and the frames, is a request to it.
 //!
 //! **U1, this card: the plumbing.** Wait for the host to report the dongle, then read the same two
@@ -28,7 +28,7 @@
 //! **The shell's `wifi` is answered by the loop every radio shares (R4).** Once the dongle is up it is a
 //! `Station` (`station.rs`) under `godspeed_wifi::serve`, the loop the Pi 4's and the VisionFive's radios
 //! run under in `wifi-driver`: `wifi scan`, `wifi list` and `wifi status` are that loop's, and the sweep is
-//! this dongle's (a passive one, channels 1 to 13). With no dongle, or one whose bring-up stopped, the same
+//! this dongle's (channels 1 to 13, a probe request on each since R5a). With no dongle, or one whose bring-up stopped, the same
 //! loop answers `radio down` and says why. The host's notices reach `rx.rs` through the loop's `Host`;
 //! `NOTE_RADIO` ends it, and the binding is asked again.
 

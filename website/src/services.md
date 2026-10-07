@@ -228,15 +228,17 @@ come. A respawn adopts a firmware still running; a stopped one is power-cycled c
 ### `wifi-usb` - a USB WiFi dongle
 
 ```
-   wifi-usb ──usbfn──▶ USB host (dwc2) ──▶ the dongle it bound (a Realtek RTL8188CUS)
+   wifi-usb ──usbfn──▶ USB host (dwc2 or xhci) ──▶ the dongle it bound (a Realtek RTL8188CUS)
 ```
 
 The driver for a WiFi dongle, separate from `wifi-driver` so a board with an onboard radio can run both.
 It holds no hardware: the USB host that enumerated the dongle binds it as the radio and answers
-`godspeed_wifi::usbfn` for that one device - who it is, and its control transfers. On the Pi 2 today,
-behind `dwc2`; reading the chip's registers through it is as far as it goes so far (`docs/wifi-usb.md`).
+`godspeed_wifi::usbfn` for that one device - who it is, its control transfers and its frames. Behind
+`dwc2` on the Pi 2 and `xhci` everywhere else, it scans, joins WPA2 and carries the machine's traffic
+through `nic-driver` when the cable is out; the supervisor starts it when the host reports the dongle and
+stops it when the dongle leaves (`docs/wifi-usb.md`).
 
-**Peers:** `dwc2`.
+**Peers:** its USB host (`dwc2` or `xhci`), and `fs` for `/wifi.keys`.
 
 ### `power` - the machine's power policy
 

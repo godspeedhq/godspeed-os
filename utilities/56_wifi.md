@@ -651,10 +651,9 @@ socket in the example below belongs to the two-dongle naming, not built. The con
 capitals (`RADIO CHIP ...`). Checked in QEMU on the Pi 4 image, where `wifi-driver` runs with no card:
 `onboard  not identified  SDIO  down  -  *`, and `wifi hardware | to json` gives the record.
 
-`in_use` is the shell's view. Until `use` exists, `nic-driver`'s bridge does not ask: it is fixed per
-board - `wifi-driver` on the Pi 4 and the VisionFive, `wifi-usb` on the Pi 2, none on the PCs - and it
-agrees with `in_use` wherever both exist. On a PC with a dongle, `in_use` marks the radio the `wifi`
-verbs address, and no radio carries the machine's traffic yet.
+`in_use` is the shell's view, and `nic-driver`'s bridge follows the same choice from the radios' own
+answers (`wire::OP_USE`), so the two agree: the onboard radio or the dongle on the Pi 4 and the
+VisionFive, the dongle on the Pi 2 and on the PCs' RTL8168 (`docs/wifi-usb.md` 39).
 
 ```
 radio      chip         bus                 state    network     in use
@@ -719,11 +718,12 @@ frames when the cable is out. It is an action and does not pipe.
   could drop a key the other added. A save re-reads the file and merges before writing.
 - **`nic-driver` asks a radio what it is joined to**, which it does not do today.
 
-**As built (2026-10-07), and where it differs from the design above.** Built and checked in QEMU on the
-Pi 4 image (the refusals, and `use` of the radio already in use); not yet on hardware with both radios.
+**As built (2026-10-07), and where it differs from the design above.** Built, checked in QEMU on the
+Pi 4 image (the refusals, and `use` of the radio already in use), and hardware-verified on the Pi 4 with
+both radios (`docs/wifi-usb.md` 37).
 - **The SHELL writes `/wifi.radio`, and nothing else does.** The design gave the choice to `nic-driver`,
-  but on the PCs `nic-driver` has no radio bridge at all, and there the choice still decides which radio
-  the `wifi` verbs address. So the one writer is the shell; the file holds the radio's name (`onboard`,
+  but the choice decides which radio the `wifi` verbs address as well, on boards where `nic-driver`
+  bridges and where it once did not. So the one writer is the shell; the file holds the radio's name (`onboard`,
   `usb`), and choosing the default radio removes it. One fact, one writer, every other party a reader.
 - **Each radio knows whether it is the one in use**, read from `/wifi.radio` at start beside `/wifi.keys`
   (same bounded retries) and kept current by a new op, `wire::OP_USE` (14), which the shell sends every
@@ -748,7 +748,7 @@ Pi 4 image (the refusals, and `use` of the radio already in use); not yet on har
   choice of `usb` with the dongle unplugged is kept in the file and the onboard radio carries the link,
   but `wifi hardware` does not yet mark the chosen-but-absent radio's row.
 
-### 11a. One radio in full: `wifi hardware <radio>` - BUILT (2026-10-07), checked in QEMU, not yet on hardware
+### 11a. One radio in full: `wifi hardware <radio>` - BUILT (2026-10-07), hardware-verified on the Pi 4 (`docs/wifi-usb.md` 37)
 
 Asked for by the operator on 2026-10-07, as `wifi hardware details usb<x>`. Built without the word
 `details`: naming a radio already means "tell me about this one", as `dir` with and without a path

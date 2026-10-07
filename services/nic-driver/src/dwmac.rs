@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! `dwmac` - the Synopsys DesignWare MAC on the StarFive JH7110 (VisionFive 2).
 //!
-//! **This file IDENTIFIES the part; it does not yet move frames.** The split is deliberate and it is
-//! the first step of the driver rather than a throwaway. Before a single descriptor ring is built,
+//! **This file began by IDENTIFYING the part, before it moved a frame** - it carries frames now, through
+//! `dwmac_ring.rs`. The split was deliberate, and the first step of the driver rather than a throwaway. Before a single descriptor ring is built,
 //! four things have to be true, and each is a fact the silicon can be asked for: what the controller
 //! says it IS (`GMAC_VERSION`), what it says it HAS (`HW_FEATURE0..3` - how wide its DMA addresses
 //! are, how many channels, whether an MDIO master is even fitted), what the bootloader left behind

@@ -15,9 +15,11 @@
 //!   1. Spawns `events`, then `console` (the display changes hands once, early).
 //!   2. In non-bare-metal builds, `pong` on core 1 then `ping` on core 0 (§23.2), then the probes.
 //!   3. Spawns the service set: time, control, power, hw-enumerator, the USB hosts, block-driver, fs,
-//!      wifi-usb (on `xhci`'s boards), shell, the radio and audio drivers, nic-driver, net-stack - in
-//!      dependency order (`services/CLAUDE.md`).
-//!   4. Asks each reporting USB host for its device report, converges, and logs "supervisor: ready".
+//!      shell, the radio and audio drivers, nic-driver, net-stack - in dependency order
+//!      (`services/CLAUDE.md`).
+//!   4. Asks each reporting USB host for its device report, converges, and logs "supervisor: ready". A
+//!      USB device's driver - `wifi-usb` - is started on that report and on every later one (`usb_report`),
+//!      never in step 3.
 //!   5. Runs the main loop - death notices, operator commands, USB device reports - forever.
 //!
 //! This header said "Non-restartable" and "Yields indefinitely (death-notification restart loop
@@ -340,8 +342,6 @@ mod board {
     pub const BLOCK_CORE:   u32 = if cfg!(has_dwc2) { 2 } else { 1 };
     pub const CONSOLE_CORE: u32 = if cfg!(has_dwc2) { 3 } else { 0 };
 
-    /// The USB host this board's NIC sits behind. Only the Pi 2 puts ethernet on USB (the LAN9514);
-    /// every other board's NIC is on a bus its driver reaches directly.
     /// `dwc2`'s send peers: `events`, and the dongle's driver wherever it is embedded (see the IMAGES row).
     /// `supervisor` where it reports the dongle to it, so the dongle's driver is started when the dongle is
     /// there and stopped when it leaves (`usbdev`, `docs/usb-device-drivers.md`).
@@ -356,6 +356,8 @@ mod board {
     /// the board that has it, `xhci` on the others (U2a).
     pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
 
+    /// `nic-driver`'s send peers: the USB host its NIC sits behind where it has one (only the Pi 2 puts
+    /// ethernet on USB, the LAN9514), the radio service or services its bridge reaches, and `events`.
     pub const NIC_PEERS: &[&str] = if cfg!(has_dwc2) {
         // The Pi 2: its ethernet is behind `dwc2`, and the USB WiFi dongle's driver - always embedded with
         // `dwc2` - is the link's other backend (`docs/wifi-usb.md`, R6), the same rule as the radio below:

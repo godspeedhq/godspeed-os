@@ -8,7 +8,7 @@ unkillable thing. Spawned directly by the kernel (init removed, Phase 5).
 
 - Spawn the services in its `IMAGES` table per placement rules (§9.2); there is no manifest file.
 - Start a USB device's driver when its host reports the device attached, and stop it - without a restart -
-  when the host reports it gone (`USB_MATCH`, `UsbState`, `docs/usb-device-drivers.md`; the Pi 2 today).
+  when the host reports it gone (`USB_MATCH`, `UsbState`, `docs/usb-device-drivers.md`; both hosts, `dwc2` and `xhci`).
 - Monitor services for death (via kernel death-notification endpoint).
 - Kill and restart failed services.
 - Expose `kill` and `restart` API (§14.4).

@@ -47,7 +47,7 @@ confirmed.
   without trouble while it is plugged in.
 - **The T630**: it has no USB3 hub and no SuperSpeed device, and hot-plugs its keyboard on the same image.
 
-## What the code shows - read, not yet proved
+## What the code showed, before `docs/wifi-usb.md` 44 changed it - read, not yet proved on hardware
 
 - **The hub is walked as USB2.** `xhci` asks for the USB2 hub descriptor (0x29) and asks for the USB3 one
   (0x2A) only if that returned no ports. The Pi 4's VL805 answers nothing to 0x29 and is found as USB3;
@@ -62,9 +62,9 @@ confirmed.
 
 ## The next concrete step
 
-1. Read the USB 3 hub class (SET_HUB_DEPTH, the SuperSpeed hub descriptor) and Linux's hub driver for
-   what it sends a SuperSpeed hub and when, then decide SuperSpeed by the root port's speed rather than
-   by which descriptor answers.
+1. DONE (`docs/wifi-usb.md` 44): Linux's hub driver read, and `xhci` now decides SuperSpeed by the
+   device's protocol, sends Set Hub Depth, and addresses devices on a USB3 hub at SuperSpeed. Awaiting
+   the Wyse card.
 2. Read xHCI 4.6.1.2 and implement Command Abort for a command that has no completion within its bound,
    so one stuck command cannot take the hub repairs with it. This is the general fix and is worth having
    even if step 1 is the specific one.

@@ -4,8 +4,8 @@
 //! # Why this exists
 //!
 //! The Pi 4's Broadcom CYW43455 was the first radio, and its driver grew everything a station needs in
-//! one service. Two more radios are on the bench: the VisionFive 2 Lite's AICSemi AIC8800D80 (SDIO,
-//! full-MAC, like the Broadcom) and the Pi 2's Realtek RTL8188CUS USB dongle (soft-MAC). What differs
+//! one service. Two more radios followed: the VisionFive 2 Lite's AICSemi AIC8800D80 (SDIO, full-MAC,
+//! like the Broadcom) and a Realtek RTL8188CUS USB dongle (soft-MAC), behind `dwc2` or `xhci`. What differs
 //! between them is the bus, the firmware upload and the language the firmware speaks. What does NOT
 //! differ is everything a station does above that - and that is what lives here, written once:
 //!
@@ -39,7 +39,7 @@
 //! radio drivers use. This is an ordinary library beside it, with no `unsafe` at all.
 //!
 //! It is a crate rather than one service with vendor backends because the radios will not all live in one
-//! service: the Pi 2's USB dongle has its own, `wifi-usb`, reaching the chip through its USB host service (`dwc2`, or `xhci`)
+//! service: the USB dongle has its own, `wifi-usb`, reaching the chip through its USB host service (`dwc2`, or `xhci`)
 //! (`docs/wifi-usb.md`), and a library serves both shapes.
 //!
 //! # Known gap

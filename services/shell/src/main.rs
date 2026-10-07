@@ -1041,7 +1041,7 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("trace",  "deps",         CHAOS_RESTARTABLE),
     ("trace",  "chain",        CHAOS_RESTARTABLE),
     ("wifi",   "radio",        &["on", "off", "powercycle"]),
-    // The radios by name (`wifi_radio_service`); `use` joins when it is built.
+    // The radios by name (`wifi_radio_service`), and `use` to choose between them.
     ("wifi",   "hardware",     &["onboard", "usb", "use"]),
     ("audio",  "off",          &["hard"]),
     ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
@@ -8217,7 +8217,7 @@ fn audio_pipe_refusal(arg: &str) -> Option<&'static str> {
 /// The services that can own a radio, in the order they are asked: the onboard radio's driver
 /// (`docs/wifi.md`), then a USB dongle's (`docs/wifi-usb.md`). Each answers the same protocol through the
 /// same serve loop (`godspeed_wifi::serve`), so which one is running is the only thing this shell needs
-/// to know. A machine with BOTH is answered by the first; choosing between two radios is not built.
+/// to know. On a machine with BOTH, `wifi hardware use` chooses (`radio_in_use`).
 const RADIOS: [&str; 2] = ["wifi-driver", "wifi-usb"];
 
 /// The first of `RADIOS` with a live task, if any. A walk of every task slot (`slot_of`), so a command
@@ -8235,9 +8235,9 @@ fn find_radio(ctx: &ServiceContext) -> Option<&'static str> {
 /// is needed. The vocabulary lives once, in `wifi_wire`.
 ///
 /// **On a machine with neither, the absence line is not a stub, it is the answer.** The T630 and the
-/// Wyse have no onboard radio, so "no wireless radio on this machine" is the answer there until a USB
-/// host other than the Pi 2's serves a dongle (`docs/wifi-usb.md`, U2). That is why the absence path was
-/// built first rather than last: it is the only part that is correct on every board.
+/// Wyse have no onboard radio, so "no wireless radio on this machine" is the answer there whenever no
+/// dongle is plugged in (`xhci` serves one when it is, `docs/wifi-usb.md` U2). That is why the absence path
+/// was built first rather than last: it is the only part that is correct on every board.
 ///
 /// **Absence is told apart from a wedge**, because `utilities/56_wifi.md` section 5 says the user's
 /// real question is whose fault it is. `slot_of` - the same introspection `caps` uses - answers it: no
@@ -9106,11 +9106,10 @@ struct WifiHw {
 
 /// Every radio service running now, asked what it is (`OP_HARDWARE`) and what it is doing (`OP_STATUS`),
 /// in `RADIOS` order. Named by what it is - `onboard`, `usb` - never by where (invariant 11). The radio in
-/// use is the first running one: the radio every other `wifi` verb addresses until `wifi hardware use`
-/// lets the operator choose (not built). `nic-driver`'s bridge does not ask: until `use` exists it is fixed
-/// per board - `wifi-driver` on the Pi 4 and the VisionFive, `wifi-usb` on the Pi 2, none on the PCs - and
-/// it agrees with this row wherever both exist. A radio that does not answer is still a row, saying so: a
-/// running service IS a radio this machine has.
+/// use is `radio_in_use`'s: the one that says it is (`OP_USE`, the operator's `wifi hardware use`), else the
+/// first running one. `nic-driver`'s bridge follows the same choice from the radios' own answers
+/// (`radio.rs`, `with_other`), so this row and the bridge agree. A radio that does not answer is still a
+/// row, saying so: a running service IS a radio this machine has.
 fn wifi_hardware_rows(ctx: &ShellCtx) -> [Option<WifiHw>; 2] {
     use wifi_wire::*;
     const REPLY_MS: u64 = 3000;
@@ -10667,9 +10666,10 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                     p[1], p[2], p[3], p[4], p[5], p[6],
                     if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
             }
-            // An EIGHT-byte answer ([ok, mac(6), link]) is every backend with one link: e1000, smsc95xx,
-            // dwmac. Its link byte went unprinted, so on those boards `net` never said whether the cable
-            // was up. It also ties the address lines below to the live link, as the 15-byte answer does.
+            // An EIGHT-byte answer ([ok, mac(6), link]) is a backend with one link - e1000 today; every
+            // other backend has a radio bridge and answers nine. Its link byte went unprinted, so `net`
+            // never said whether the cable was up. It also ties the address lines below to the live link,
+            // as the 15-byte answer does.
             if p.len() == 8 {
                 nic_link_up = p[7] != 0;
                 out.line(ctx, if nic_link_up { "link     up via the cable" } else { "link     down - no cable" });
@@ -10678,6 +10678,10 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             // carries the frames (`Carrier` in nic-driver's `radio.rs`): 1 the cable, 2 the radio, 0 neither. The cable
             // always wins; the radio carries the link only while the cable is out and it is joined.
             if p.len() == 9 {
+                // The live link, for the address lines below - as the eight- and long answers set it. It
+                // was not set here, so a radio-bridge board with the cable out and the radio not joined
+                // said `link down` and then printed the old address and `ping ok` as if it were up.
+                nic_link_up = p[7] != 0;
                 out.line_fmt(ctx, format_args!("link     {}", match p[8] {
                     1 => "up via the cable",
                     2 => "up via wifi (the cable is out)",

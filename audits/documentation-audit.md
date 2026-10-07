@@ -1029,3 +1029,66 @@ service; a radio behind `dwc2` will need the prefix passed in (`sdk/wifi/src/lib
 
 Verified rather than asserted: the Rust part of this audit is comments only - the uncommitted diff's
 non-comment Rust lines are the ten of the separate `keyfile` fix, counted, not assumed.
+
+## Audit 9 - documents and code comments, `feat/wifi-driver` since `5f501775` (2026-10-07)
+
+Scope: everything the branch changed since Audit 8 - 140 commits, 24 documents and the comments of 70 Rust
+files: the USB WiFi dongle end to end (`wifi-usb`, its hosts, the radio bridge on the PCs, `wifi hardware`),
+and the day's hub and key-store fixes. Three read-only audits ran in parallel - the long design note, the
+other documents, the comments - and every finding was checked against the source before it was fixed. The
+mechanical gates (`doc_refs`, `doc_symbols_check`, `comment_symbol_check`, `facts_check`, `line_ref_check`,
+`site_check`, `dash_check`) were green throughout; nothing below is a thing they can see.
+
+**The finding that matters most was a bug, found by reading a comment.** The shell's `net` sets
+`nic_link_up` from the eight-byte and the long status answers, and did not from the nine-byte one - the
+answer every radio-bridge board gives. So on a Pi 2, Pi 4, VisionFive or PC with the cable out and the radio
+not joined, `net` printed `link down - no cable, and the radio is not joined` and then the last address
+held, the gateway and `ping ok`, as if the link were up - the exact case `utilities/40_net.md` promises
+it does not ("when it says down, the address lines below say so too"). One line; the comment above it
+claimed smsc95xx and dwmac answer eight bytes, which is how it was missed.
+
+**Stale after the code moved (comments):**
+- `wifi-usb`'s `install_key` doc still described rtl8xxxu's first-free layout directly above the rtlwifi
+  code that replaced it (`docs/wifi-usb.md` 43); `drop_keys`'s doc line had been fused onto
+  `say_key_store`'s when the instrument went in.
+- The shell said `wifi hardware use` is "not built", the bridge "fixed per board ... none on the PCs", and
+  the PCs have "no wireless radio ... until a USB host other than the Pi 2's serves a dongle" - all three
+  done.
+- The supervisor's header listed `wifi-usb` in the boot spawn set (it is started on a USB report), and
+  `NIC_PEERS` had lost its doc to the `DWC2_PEERS` inserted above it.
+- `xhci`: "only its EP0 is driven so far" above the bulk endpoints' configuration; Set Hub Depth's comment
+  stated as fact a cause the Wyse card has not yet shown; the input-context comment still said the card
+  would show what it has shown.
+- `wifi-usb`'s header: the sweep "passive" (it probes since R5a) and `xhci` "on the T630" only;
+  `sdk/wifi`'s header: two radios "on the bench".
+- `dwc2`: the failure path "as the success path does" (it clears more); `radio.rs`: the cable re-read
+  justified by MDIO alone (the Pi 2's is an IPC); the RTL8168's "15-byte status" above a 32-byte one;
+  `dwmac.rs` "does not yet move frames".
+
+**Stale after the hardware said otherwise (documents):** `website/src/services.md` described `wifi-usb` as
+reading chip registers behind `dwc2` with peers `dwc2` (it joins and carries traffic behind either host,
+peers its host and `fs`); `utilities/56_wifi.md` called `wifi hardware use` and 11a QEMU-only and the PCs
+bridgeless; `utilities/40_net.md` listed smsc95xx and dwmac as single-link; `docs/usb-device-drivers.md`
+had the bridge on x86 and `use` as not built and "one host reports"; `docs/CLAUDE.md` said the Pi 4 owed a
+check card it passed; `services/supervisor/CLAUDE.md` started a USB device's driver "on the Pi 2 today";
+`sdk/wifi/CLAUDE.md` gave `xhci` control transfers only; `backlog/78` described the pre-fix code in the
+present tense. In `docs/wifi-usb.md`, five section headings carried a status later sections overtook (7,
+34, 39, 43) and section 38's reverted change was in the present tense; the overview said the choosing was
+not built; the `OP_INFO` row lacked `xhci`'s location tail.
+
+**Real addresses removed.** Four lines of `docs/wifi.md` carried the Pi's radio and ethernet MACs, and
+three lines of `utilities/40_net.md` a NIC's MAC and the gateway's - all written before this branch. They
+are placeholders now; the history still has them. `utilities/56_wifi.md`'s `02:1a:7e:c4:09:51` is locally
+administered and stands as an invented example.
+
+**Checked and correct, recorded so it is not re-chased:** the key-store constants and their comments
+(0xcc, entry 4, no group flag, the read-back of the two enables only); `dwc2`'s debounce and reset numbers
+(25/100/2000, 800) against their comments; `xhci`'s `MAX_SLICES` 6, the input-context clear, the protocol
+test and Set Hub Depth; no live comment still describes section 38's reverted per-port rebind or ring wrap;
+every `usbfn` opcode and size in the doc's table; the 54 arch-conditional sites in `CLAUDE.md` and
+`docs/porting.md`; `backlog/79` against the code.
+
+**Left as they are:** `docs/wifi-aic8800.md`'s "`serve_radio` waits at most 250 ms" is in dated text and was
+true then (the loop moved to `godspeed_wifi::serve` since). `install_key`'s group arm in `station.rs` still
+computes the BSSID it no longer uses - a dead branch, not a wrong comment, left for a code change rather
+than an audit.
