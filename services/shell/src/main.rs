@@ -500,6 +500,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the first `gsh> ` the serial-driven shell-test waits on.
     ctx.console_boot_complete();
 
+    // RESUME A STICKY CAPTURE, if one was recorded. Deliberately after `console_boot_complete`: fs is
+    // at its slowest while mounting and replaying its journal, and this read retries rather than
+    // giving up on one slow answer - a capture missed because storage was half a second late is
+    // exactly the unattended failure sticky exists to prevent.
+    sticky_resume(ctx);
+
     // The shell owns echo from here on. The kernel's auto-echo (console_push_byte)
     // can only echo single bytes blindly, so it prints the `[` and `A` of an arrow
     // key's `ESC [ A` sequence before the shell consumes them - smearing "[A" onto
@@ -511,19 +517,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // console write so a concurrent driver boot-log can't land between the hint and the
     // prompt (it stays one atomic unit on the serial console too).
     ctx.console_write("(F1=help or type 'help')\ngsh> ");
-
-    // RESUME A STICKY CAPTURE, if one was recorded - AFTER the prompt, never before it. This read waits
-    // for fs, which is at its slowest while mounting and replaying its journal, and it retries rather
-    // than giving up on one slow answer: a capture missed because storage was half a second late is
-    // exactly the unattended failure sticky exists to prevent. Before the prompt that wait was the
-    // prompt's: on the Pi 4, `gsh>` came 3.7 s after `shell: ready`, at the moment fs began serving,
-    // and the bound allows four tries of STICKY_SECS. On almost every boot there is no capture to
-    // resume, so the prompt was waiting on the disk to learn that nothing needed doing.
-    //
-    // Here the prompt is already on the screen, and keys typed meanwhile wait in the kernel's input
-    // ring, so none are lost; they are echoed once this returns. It runs before the first read on
-    // purpose, not lazily on a keystroke, because the case it is for is the machine nobody types at.
-    sticky_resume(ctx);
 
     let mut line = Line::new();
     // Current location on the (single) drive: the directory bare/relative paths target,
