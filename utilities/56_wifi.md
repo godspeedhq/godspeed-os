@@ -645,8 +645,15 @@ still says its chip and bus) and what it is doing (`OP_STATUS`). `state` is `joi
 hard`, `down` or `not answering`; `network` is empty unless joined; `in_use` is `yes` on the radio every
 other verb addresses, the first running one, until `use` lets the operator choose. A radio whose chip was
 never identified says `not identified` rather than the board's usual part. Two dongles are not supported
-yet, so a dongle is always plain `usb`. Checked in QEMU on the Pi 4 image, where `wifi-driver` runs with
-no card: `onboard  not identified  SDIO  down  -  *`, and `wifi hardware | to json` gives the record.
+yet, so a dongle is always plain `usb`, and its `bus` names the host only (`USB xhci`, `USB dwc2`): the
+socket in the example below belongs to the two-dongle naming, not built. The console's headings are in
+capitals (`RADIO CHIP ...`). Checked in QEMU on the Pi 4 image, where `wifi-driver` runs with no card:
+`onboard  not identified  SDIO  down  -  *`, and `wifi hardware | to json` gives the record.
+
+`in_use` is the shell's view. Until `use` exists, `nic-driver`'s bridge does not ask: it is fixed per
+board - `wifi-driver` on the Pi 4 and the VisionFive, `wifi-usb` on the Pi 2, none on the PCs - and it
+agrees with `in_use` wherever both exist. On a PC with a dongle, `in_use` marks the radio the `wifi`
+verbs address, and no radio carries the machine's traffic yet.
 
 ```
 radio      chip         bus                 state    network     in use

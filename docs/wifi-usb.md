@@ -10,7 +10,8 @@ one, and the record of each card that does.
 behind any USB host - `dwc2` on the Pi 2, `xhci` on the Wyse 5070, the T630, the Pi 4 and the VisionFive
 - and a board with an onboard radio may have a dongle as well. Two services keep two radios apart: each
 restarts alone, and no board's image carries a radio it cannot have. On a board with both, `wifi`
-addresses the onboard radio unless told otherwise; how it is told is decided when a scan exists.
+addresses the onboard radio unless told otherwise; how it is told is `wifi hardware use`, specified in
+`utilities/56_wifi.md` 11 (the report is built, the choosing is not).
 
 **The USB host serves the dongle; it does not drive it.** A host binds the dongle by VID:PID - it is a
 vendor-class device, so there is no class to match - and then answers `godspeed_wifi::usbfn` for that one
@@ -21,8 +22,8 @@ one driver run behind every host.
 
 `wifi-usb` holds no hardware grant - no window, no arena, no interrupt, no device class. Its peers are the
 host and `fs`, for `/wifi.keys` (section 10). On the Pi 2 the supervisor starts it when `dwc2` reports the
-dongle attached and stops it when the dongle leaves (section 26, `docs/usb-device-drivers.md`); on `xhci`'s
-boards it is still started at boot and idles until a dongle is bound.
+dongle attached and stops it when the dongle leaves (section 26, `docs/usb-device-drivers.md`); `xhci`
+reports it the same way since section 27, so no board starts it at boot.
 
 The chip itself is soft-MAC (`docs/wifi.md` 59): the host builds and parses every 802.11 frame. So above
 the register file this needs a host-side MLME - scan, authenticate, associate - over a raw radio, and the
@@ -245,7 +246,7 @@ One more thing the R2 run settled: on the U1b run the third replug came up at fu
 transaction translator, and every vendor read failed. In the R2 run both replugs came up at high speed and
 read the chip at once, so that was the insertion; it is recorded here in case it returns.
 
-## 7. U2: `xhci` - the design, from a reading of the driver (2026-10-05); U2a built (section 25), bulk IN and OUT (U2b, U2c) not built
+## 7. U2: `xhci` - the design, from a reading of the driver (2026-10-05); U2a hardware-verified (sections 25, 27), bulk IN and OUT (U2b, U2c) built, not yet on hardware (sections 28-30)
 
 `wifi-usb` already asks whichever host it was wired to (`HOSTS`, `gs::ipc::peer`), so on the driver's side U2
 is a spawn row. On `xhci`'s side it is real work, because that driver was written around keyboards and one
@@ -1621,6 +1622,8 @@ every host named.
 asks the first live service in `RADIOS`, `wifi-driver`, so it keeps answering for the onboard radio, and
 `nic-driver`'s bridge is still `wifi-driver`. The dongle's driver gets no further than U2a's bring-up,
 since `xhci` has no bulk IN yet (U2b), so it cannot join and does not compete with the onboard radio.
+(True at this section's date. With U2c it can join from `/wifi.keys` beside the onboard radio, while the
+shell and the bridge keep using `wifi-driver` - section 29.)
 
 **Not covered, recorded:** a dongle behind a hub with no keyboard and no disk bound is not watched -
 nothing walks that hub - so its unplug is not seen until the next re-enumeration.
@@ -1803,8 +1806,14 @@ into (section 27); a data buffer there does no harm. The Link is written eagerly
 Packet, so every frame completes at once; a completion held, `NOTE_BULK_IN` told (sent again each pass
 if the driver's queue refused it); `OP_BULK_IN` returns what is held and arms again, `ST_OK` with no data
 when nothing is. A failed transfer is told too, and the ask that follows repairs the endpoint (Reset
-Endpoint and Set TR Dequeue to the ring's start, bounded per pass). The bulk OUT is U2c and still answers
-`ST_FAILED`.
+Endpoint and Set TR Dequeue to the ring's start, bounded per pass). The bulk OUT is U2c and, in this
+image, still answers `ST_FAILED`.
+
+**Missed here, and found by the audit after U2c (section 30):** an `OP_SYNC` naming `NOTE_BULK_IN` was
+dropped. `dwc2` keeps it and sends the notice again once the driver is quiet; `xhci` answered only a
+`NOTE_RADIO` one, and at once. On the Pi 4 `wifi-usb` is started on demand and has no reply mailbox, so
+a receive notice that lands while it is mid-call is that case, and receive would stop at the first one.
+The U2b image on the operator's SD card was built before the fix.
 
 **Checked before the card:** the Pi 4, x86 and VisionFive images build and x86 passes every gate.
 
@@ -1859,3 +1868,35 @@ this path has had that length yet.
 
 **Refuted by:** a Configure Endpoint failure; `bulk OUT ... failed` lines; no probe response; U2b's
 receive breaking.
+
+## 30. `OP_SYNC` for both of `xhci`'s notices (2026-10-07) - found by an audit, built, not yet on hardware
+
+**What was wrong.** `usbfn::OP_SYNC` is how a `wifi-usb` with no reply mailbox recovers a notice it took
+in place of an answer (section 19): it names the notice, and the host gives the reply capability back and
+sends the notice again once the driver has asked nothing for a moment, so it reaches the driver's serve
+loop rather than its next call. `dwc2` does exactly that for both of its notices (`sync_bulk`,
+`sync_radio`, `DRIVER_QUIET_MS`). `xhci` was written at U2a, when its only notice was `NOTE_RADIO`, and
+answered a sync for it by sending it again AT ONCE - into the driver's next call, the case the quiet
+exists for - and ignored any other. U2b added `NOTE_BULK_IN` and did not touch it, and the comment there
+still said `NOTE_RADIO` was the only notice.
+
+**Why it matters on the Pi 4 in particular.** An instance the supervisor starts on demand has no reply
+mailbox (`backlog/74`), and since section 27 that is the only way `wifi-usb` starts on the Pi 4. So a
+`NOTE_BULK_IN` arriving while `wifi-usb` is in a call - a sweep retuning, a register read - is the
+ordinary case, not the respawn corner section 19 met. Dropped, it stops receive for good: nothing is
+armed until the held transfer is collected, and the notice had been delivered, so nothing was owed.
+
+**The fix, `dwc2`'s, in `radio.rs`:** the time of the driver's last request is kept; a sync for either
+notice is recorded (`sync_bulk`, `sync_radio`) and the notice sent again by `radio::service` once the
+driver has asked nothing for 5 ms (`DRIVER_QUIET_MS`, `dwc2`'s figure); a re-sent `NOTE_BULK_IN` goes
+only while a transfer is still held or failed. With no dongle bound, a `NOTE_RADIO` sync is still told at
+once, as `dwc2` does. The first three syncs are logged: `xhci: wifi-usb took NOTE_BULK_IN in place of an
+answer (OP_SYNC, N so far) - sent again once it is quiet`.
+
+**Checked:** the Pi 4, x86 and VisionFive images build and x86 passes every gate. Nothing in QEMU
+reaches it (no dongle there).
+
+**On the cards.** The U2b image on the SD card predates this fix, so it may stall after its first few
+frames for this reason alone. Section 28's predictions stand for U2b with this fix; a `took NOTE_BULK_IN
+in place of an answer` line followed by more beacons is this section working, and receive stopping right
+after that line refutes it.

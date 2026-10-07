@@ -113,7 +113,9 @@ pub(crate) struct EvMail {
     cc: [u32; 32],
     /// The same completion filed again by ENDPOINT, for a slot that has more than one in flight: the
     /// WiFi dongle's EP0 and its armed bulk IN share a slot (U2b), and a completion for one must never
-    /// be collected as the other's. `have` keeps its meaning for every other consumer.
+    /// be collected as the other's. `have` keeps its meaning for every other consumer. `take_bulk`
+    /// leaves the slot's `have` bit set, which nothing acts on: only a keyboard's or mouse's slot is
+    /// re-armed from `have`, and the dongle is never one.
     ep0_have: u32,
     ep0_cc: [u32; 32],
     bulk_have: u32,
@@ -1790,8 +1792,9 @@ fn read_config_and_bind(
                 // ring's end: up to four TRBs from the next page, even past a Link TRB on a page boundary,
                 // and may use them later without reading them again. Linux enables a quirk for exactly
                 // this on the VL805 (`XHCI_TRB_OVERFETCH`, a dummy page after every ring segment). Here the
-                // next page is this slice's interrupt ring, which the dongle does not use and an earlier
-                // device's TRBs may still fill. It was added for the Pi 4's TRB Error at the wrap and did
+                // next page is this slice's interrupt-ring page, which the dongle has no interrupt endpoint
+                // for (since U2b it is the bulk IN's receive buffer, never a ring) and an earlier device's
+                // TRBs may still fill. It was added for the Pi 4's TRB Error at the wrap and did
                 // NOT cure it (the cause is below); kept because the overfetch is documented for this part.
                 for i in (0..0x1000).step_by(4) {
                     dma.write32(int_tr_off(dev_idx) + i, 0);
@@ -5428,7 +5431,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // or a link-state change, rather than a guess.
                         // And then RE-ENUMERATED, so the pass that follows reports the dongle gone and the
                         // supervisor stops its driver - an unplug seen at once, as a plug is. A dongle
-                        // behind a hub is not seen here: its root port stays connected (recorded).
+                        // behind a hub is not seen here, since its root port stays connected: its hub port
+                        // is read by the two hub scans (`radio_absent_seen`), which run only while a
+                        // keyboard or a disk is bound. With neither, its unplug is not
+                        // seen until the next re-enumeration (recorded, `docs/wifi-usb.md` 27).
                         if present & (1 << p) != 0 && radio.as_ref().is_some_and(|r| r.port == p) {
                             ctx.log_fmt(format_args!(
                                 "xhci: the WiFi dongle's port {} reads EMPTY while bound - PORTSC={:#010x} - re-enumerating",

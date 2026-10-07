@@ -9092,9 +9092,11 @@ struct WifiHw {
 
 /// Every radio service running now, asked what it is (`OP_HARDWARE`) and what it is doing (`OP_STATUS`),
 /// in `RADIOS` order. Named by what it is - `onboard`, `usb` - never by where (invariant 11). The radio in
-/// use is the first running one: the radio every other `wifi` verb addresses, and the one `nic-driver`'s
-/// bridge carries frames through until `wifi hardware use` lets the operator choose (not built). A
-/// radio that does not answer is still a row, saying so: a running service IS a radio this machine has.
+/// use is the first running one: the radio every other `wifi` verb addresses until `wifi hardware use`
+/// lets the operator choose (not built). `nic-driver`'s bridge does not ask: until `use` exists it is fixed
+/// per board - `wifi-driver` on the Pi 4 and the VisionFive, `wifi-usb` on the Pi 2, none on the PCs - and
+/// it agrees with this row wherever both exist. A radio that does not answer is still a row, saying so: a
+/// running service IS a radio this machine has.
 fn wifi_hardware_rows(ctx: &ShellCtx) -> [Option<WifiHw>; 2] {
     use wifi_wire::*;
     const REPLY_MS: u64 = 3000;

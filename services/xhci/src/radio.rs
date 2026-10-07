@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The USB WiFi dongle, behind `xhci` (U2, `docs/wifi-usb.md` 7 for the design, 25 for U2a). This host binds it by VID:PID and serves
+//! The USB WiFi dongle, behind `xhci` (U2, `docs/wifi-usb.md` 7 for the design, 25 and 27 for U2a, 28 for
+//! U2b, 29 for U2c). This host binds it by VID:PID and serves
 //! `godspeed_wifi::usbfn` for it to `wifi-usb` - the protocol `dwc2` serves on the Pi 2, answered the same
 //! way, so the dongle's driver cannot tell the hosts apart.
 //!
@@ -10,9 +11,12 @@
 //! the bulk OUTs** that carry sent frames - `OP_BULK_OUT`, one frame at a time, waited for, as `dwc2`
 //! sends them.
 //!
-//! **Where it lives in the arena.** In the device slice it was enumerated into, kept as a keyboard's is:
-//! the EP0 ring is the slice's EP0 page, and a control transfer's data stage uses the slice's report page,
-//! which a dongle has no interrupt endpoint to use. No new arena, so no kernel change.
+//! **Where it lives in the arena.** In the device slice it was enumerated into, kept as a keyboard's is,
+//! and a dongle has no interrupt endpoint to use the slice's last two pages for: the EP0 ring is the
+//! slice's EP0 page; the report page holds a control transfer's data stage, the bulk OUT rings and the
+//! bulk IN ring (`OUT_RINGS_AT`, `IN_RING_AT`); the interrupt-ring page is the bulk IN's receive buffer.
+//! A frame to send is staged in `DATA_BUF_OFF`, which only enumeration otherwise uses. No new arena, so no
+//! kernel change.
 //!
 //! **Matched by slot AND endpoint (U2b).** EP0 and the armed bulk IN share the dongle's slot, so every
 //! completion is told apart by the transfer event's endpoint ID, and one filed by another consumer is filed
@@ -60,8 +64,9 @@ const OUT_FRAME_MAX: usize = if usbfn::BULK_OUT_MAX < 0x1000 { usbfn::BULK_OUT_M
 /// How long one frame may take to send - `dwc2`'s budget for the same frame (`RADIO_TX_BUDGET_MS`).
 const OUT_MS: u64 = 200;
 
-/// The dongle's bulk endpoints, read from its configuration descriptor: the first bulk IN, and the bulk
-/// OUTs in descriptor order (U2c's, recorded now so the walk is done once).
+/// The dongle's bulk endpoints, read from its configuration descriptor: the first bulk IN (U2b), and up to
+/// `MAX_OUT` bulk OUTs in descriptor order (U2c), with the packet size of the last one read. One figure
+/// serves them all at high speed, where USB 2.0 allows a bulk endpoint only 512 (`dwc2`'s `HS_BULK_MPS`).
 pub struct Eps {
     pub in_addr: u8,
     pub in_mps: u16,
@@ -121,7 +126,8 @@ pub fn is_radio(ids: u32) -> bool {
 /// device descriptor at 0, the configuration descriptor at 48, Set Configuration at 96, ending at 128.
 pub const EP0_RUNTIME_START: usize = 128;
 
-/// The bound dongle: its controller slot, its DMA slice, where it is, and its EP0 ring's producer cursor.
+/// The bound dongle: its controller slot, its DMA slice, where it is, and each of its rings' producer
+/// state - EP0, the bulk IN and the bulk OUTs - with what it has sent and received, for the log.
 pub struct Radio {
     pub slot: u32,
     pub dev_idx: usize,
@@ -163,6 +169,14 @@ pub struct Radio {
     out_repairs: u32,
     tx_frames: u32,
     tx_failed: u32,
+    /// Notices the driver took in place of an answer and named in an `OP_SYNC` (`usbfn::OP_SYNC`), sent
+    /// again once it has asked nothing for `DRIVER_QUIET_MS` - so they reach its serve loop, not its next
+    /// call. As `dwc2` keeps them (`services/dwc2/src/rtl.rs`).
+    sync_bulk: bool,
+    sync_radio: bool,
+    syncs: u32,
+    /// When the driver last asked anything, for that quiet.
+    last_req: Option<wait::Since>,
 }
 
 impl Radio {
@@ -171,7 +185,7 @@ impl Radio {
                 in_dci: 0, in_mps: 0, in_cur: 0, in_pcs: 1, rx: Rx::Off, note_owed: false, in_repairs: 0,
                 rx_frames: 0, rx_failed: 0,
                 out_dci: [0; MAX_OUT], n_out: 0, out_cur: [0; MAX_OUT], out_pcs: [1; MAX_OUT], out_repairs: 0,
-                tx_frames: 0, tx_failed: 0 }
+                tx_frames: 0, tx_failed: 0, sync_bulk: false, sync_radio: false, syncs: 0, last_req: None }
     }
 
     /// The bulk IN configured at bind (U2b), its ring zeroed there.
@@ -205,7 +219,8 @@ const RING_BYTES: usize = 0x1000;
 /// How long one control transfer may take. A register access is a few hundred microseconds; the bound is
 /// for a dongle that stopped answering, and it sits well inside `wifi-usb`'s two-second wait on the host.
 const CONTROL_MS: u64 = 500;
-/// Completions for other slots tolerated while waiting for ours - an event storm must not livelock the wait.
+/// Completions for anyone else - other slots, or another endpoint of this one - tolerated while waiting for
+/// ours: an event storm must not livelock the wait.
 const MAX_UNRELATED: u32 = 4096;
 /// Tries for `OP_CONTROL`, as `dwc2`'s `CONTROL_TRIES`: a transient on the bus is retried; `OP_CONTROL_ONCE`
 /// gets one, for a transfer that must not reach the device twice (a firmware block).
@@ -278,7 +293,8 @@ fn control_once(
     // Error, its dequeue stopped at that slot (2026-10-06). Linux records that the VL805 "can't cope with
     // the TR Dequeue Pointer for an endpoint being set to a Link TRB" (`XHCI_AVOID_DQ_ON_LINK`); that is
     // about Set TR Dequeue, and this is the same position reached by idling - the reason, not yet the
-    // proof. The check above stays for a cursor that starts near the end.
+    // proof. The FIX is confirmed: with the Link written here the bring-up passed the wrap on the Pi 4
+    // (`docs/wifi-usb.md` 27). The check above stays for a cursor that starts near the end.
     if r.cur + 4 * TRB_SIZE > RING_BYTES {
         let bp = hc.dma.phys_at(ring);
         hc.dma.write32(ring + r.cur, bp as u32);
@@ -467,16 +483,37 @@ pub fn serve(
         return Served::NotOurs;
     }
     let Some(reply) = gs::ipc::take_sent_cap(ctx) else { return Served::Done };
-    // `OP_SYNC` is never answered (`usbfn::OP_SYNC`); this host sends no notice that could stand in for
-    // an answer except `NOTE_RADIO`, so a named binding notice is simply told again.
+    let mut radio = radio;
+    if let Some(r) = radio.as_deref_mut() {
+        r.last_req = Some(wait::Since::now(ctx));
+    }
+    // `OP_SYNC`: never answered (`usbfn::OP_SYNC`) - the reply capability given back, the named notice
+    // owed, and sent again by `service` once the driver is quiet, as `dwc2` does. Both of this host's
+    // notices can be taken in place of an answer: `NOTE_RADIO` since U2a, `NOTE_BULK_IN` since U2b. A
+    // dropped `NOTE_BULK_IN` would stop receive for good - nothing is armed until the held transfer is
+    // collected - and every `wifi-usb` the supervisor starts on demand has no reply mailbox, so this is
+    // the path it takes. Told at once, the notice would land in the driver's next call and be taken as an
+    // answer again. With no radio bound, a binding notice is told at once: every request is answered
+    // `ST_NO_DEVICE` from here, so the driver is not mid-sequence for long.
     if op == usbfn::OP_SYNC {
         gs::cap::remove(ctx, reply);
-        if p.get(1).copied() == Some(usbfn::NOTE_RADIO) {
-            notify_driver(ctx);
+        let note = p.get(1).copied();
+        match (note, radio) {
+            (Some(usbfn::NOTE_BULK_IN), Some(r)) => {
+                r.sync_bulk = true;
+                note_sync(ctx, r, "NOTE_BULK_IN");
+            }
+            (Some(usbfn::NOTE_RADIO), Some(r)) => {
+                r.sync_radio = true;
+                note_sync(ctx, r, "NOTE_RADIO");
+            }
+            (Some(usbfn::NOTE_RADIO), None) => {
+                let _ = notify_driver(ctx);
+            }
+            _ => {}
         }
         return Served::Done;
     }
-    let mut radio = radio;
     if op == usbfn::OP_BULK_IN {
         let mut out = [0u8; 2 + usbfn::BULK_IN_MAX];
         out[0] = op;
@@ -557,18 +594,33 @@ const DRIVER: &str = "wifi-usb";
 /// Tell `wifi-usb` the radio's binding changed (`usbfn::NOTE_RADIO`): `try_send`, never blocking on a driver
 /// that is behind, reacquired by name once if the cap is stale - either may be spawned or respawned after the other.
 /// Quiet when it cannot be delivered: on a board where `wifi-usb` is not built there is nobody to tell, and
-/// where it is, its own `OP_INFO` at start covers a notice it missed.
-pub fn notify_driver(ctx: &ServiceContext) {
+/// where it is, its own `OP_INFO` at start covers a notice it missed. `true` when it was delivered.
+pub fn notify_driver(ctx: &ServiceContext) -> bool {
     let msg = Message::from_bytes(&[usbfn::NOTE_RADIO]);
-    let _ = gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
-        || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok());
+    gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
+        || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok())
 }
+
+/// An `OP_SYNC` counted, and the first few said: the driver took this notice in place of an answer.
+fn note_sync(ctx: &ServiceContext, r: &mut Radio, which: &str) {
+    r.syncs = r.syncs.wrapping_add(1);
+    if r.syncs <= 3 {
+        ctx.log_fmt(format_args!(
+            "xhci: wifi-usb took {} in place of an answer (OP_SYNC, {} so far) - sent again once it is quiet",
+            which, r.syncs));
+    }
+}
+
+/// How long the driver must have asked nothing before a notice it named in an `OP_SYNC` is sent again -
+/// `dwc2`'s figure (`DRIVER_QUIET_MS`): long enough that it is back in its serve loop rather than
+/// mid-sequence, short enough that a held receive is not kept waiting.
+const DRIVER_QUIET_MS: u64 = 5;
 
 /// The radio's binding changed, or this host's first pass ended: told to the driver (`notify_driver`) and
 /// reported to the supervisor (`report_device`), which starts the driver when the dongle is attached and
 /// stops it when it is not (`docs/usb-device-drivers.md`) - what `dwc2` does on the Pi 2.
 pub fn announce(ctx: &ServiceContext, radio: Option<&Radio>) {
-    notify_driver(ctx);
+    let _ = notify_driver(ctx);
     report_device(ctx, radio);
 }
 
@@ -576,8 +628,9 @@ pub fn announce(ctx: &ServiceContext, radio: Option<&Radio>) {
 /// `ASK` is answered by sending it again. `try_send`, reacquired by name once - the supervisor is
 /// restartable (6.2) - and never waited on (8.9). Loud when a dongle's report cannot be delivered: it then
 /// has no driver and nothing else will say so. Quiet when "nothing attached" cannot be: that is every boot
-/// on a board that does not embed the dongle's driver (the Pi 4, the VisionFive), where this host is given
-/// no supervisor peer and there is nothing to start.
+/// on an image that does not embed the dongle's driver, where this host is given no supervisor peer and
+/// there is nothing to start (none today: every image with `xhci` embeds `wifi-usb` since section 27 of
+/// `docs/wifi-usb.md`).
 pub fn report_device(ctx: &ServiceContext, radio: Option<&Radio>) {
     let r = match radio {
         Some(r) => usbdev::Report { present: true, gen: r.gen, vid: r.vid(), pid: r.pid() },
@@ -686,10 +739,23 @@ pub fn bulk_done(ctx: &ServiceContext, r: &mut Radio, cc: u32, res: u32) {
     }
 }
 
-/// Once a pass: a `NOTE_BULK_IN` the driver's queue refused, sent again. Nothing is armed until the held
-/// transfer is collected, so a notice lost for good would stop receive for good.
+/// Once a pass: the notices named in an `OP_SYNC`, again, once the driver is between requests; then a
+/// `NOTE_BULK_IN` the driver's queue refused (or that a sync left owed), sent again while a transfer is
+/// still held or failed. Nothing is armed until the held transfer is collected, so a notice lost for good
+/// would stop receive for good.
 pub fn service(ctx: &ServiceContext, r: &mut Radio) {
-    if r.note_owed {
+    if (r.sync_bulk || r.sync_radio)
+        && r.last_req.as_ref().map_or(true, |t| t.passed(ctx, Budget::ms(DRIVER_QUIET_MS)))
+    {
+        if r.sync_radio {
+            r.sync_radio = !notify_driver(ctx);
+        }
+        if r.sync_bulk {
+            r.sync_bulk = false;
+            r.note_owed = true;
+        }
+    }
+    if r.note_owed && matches!(r.rx, Rx::Held(_) | Rx::Failed(_)) {
         r.note_owed = !tell_bulk(ctx);
     }
 }

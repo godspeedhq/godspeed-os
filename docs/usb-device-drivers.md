@@ -81,7 +81,7 @@ each host instance. `OP_INFO` does not carry it yet.
 | Host | Today | For a driver it does not run itself |
 |---|---|---|
 | `dwc2` (Pi 2) | binds the dongle, serves `usbfn` in full, tells `wifi-usb`, and REPORTS it (`usbdev`, 2026-10-06) | the generation in `OP_INFO` |
-| `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers; REPORTS it and watches its root or hub port (`docs/wifi-usb.md` 27) | the generation in `OP_INFO`, then bulk IN (U2b) and bulk OUT (U2c) |
+| `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers; REPORTS it and watches its root or hub port (`docs/wifi-usb.md` 27). U2b and U2c, the bulk IN and OUTs, built, not yet on hardware (28-30) | the generation in `OP_INFO` |
 | `ehci` (the T630's second controller) - **limitation, not planned** | one topology: the AMD hub on its root port, low-speed keyboards and mice behind it; **skips every high-speed device** on a hub port | everything `xhci` needed, and bulk transfers from scratch |
 
 **`ehci` - A RECORDED LIMITATION, not planned work (operator, 2026-10-06).** A dongle in a socket that
@@ -99,12 +99,16 @@ alone; a bulk IN qTD kept armed, with its completion taken on the interrupt; a b
 
 ## 5. Order of work
 
-1. **Finish U2a on the T630:** the dongle's bring-up through `xhci`, the card in progress.
+1. **Finish U2a on the T630:** the dongle's bring-up through `xhci` (DONE 2026-10-06, on the T630 and
+   then the Pi 4, `docs/wifi-usb.md` 25 and 27).
 2. **On-demand drivers, on the Pi 2 first** (DONE 2026-10-06, hardware-verified on the Pi 2: plug, unplug, replug, a kill and a supervisor respawn, `docs/wifi-usb.md` 26), because `dwc2` + `wifi-usb` is the hardware-verified path:
-   the reports, the match table, stop-on-detach, the generation. Then the same on `xhci` (T630), with
-   the dongle's port watched.
-3. **U2b and U2c:** receive and transmit through `xhci`, then `nic-driver`'s radio bridge on x86 (the
-   PCs' NIC backends have none yet).
-4. **`wifi hardware`** (`utilities/56_wifi.md` 11) once a board can have two radios.
+   the reports, the match table, stop-on-detach, the generation. Then the same on `xhci`, with the
+   dongle's port watched (DONE 2026-10-06, hardware-verified on the Pi 4 rather than the T630, the
+   operator's choice of test board; `docs/wifi-usb.md` 27).
+3. **U2b and U2c:** receive and transmit through `xhci` (BUILT 2026-10-06, their Pi 4 cards owed,
+   `docs/wifi-usb.md` 28-30), then `nic-driver`'s radio bridge on x86 (the PCs' NIC backends have none
+   yet).
+4. **`wifi hardware`** (`utilities/56_wifi.md` 11) once a board can have two radios: the report BUILT
+   (2026-10-06, checked in QEMU), `wifi hardware use` specified, not built.
 
 Each step is a card on hardware, one change per flash, with its prediction written before it runs.
