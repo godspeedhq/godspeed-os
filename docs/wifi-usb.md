@@ -2024,7 +2024,11 @@ One card carried three fixes, each with its own line in the log: section 31, sec
 drawing its prompt before it reads `/persist.conf` (`1da33d6b`).
 
 **The prompt:** `gsh>` came with the same timestamp as `shell: ready`, 2.4 s after power-on. On U2c's
-second run it came at 6.1 s, and 4.8 s on a boot without the dongle plugged in.
+second run it came at 6.1 s, and 4.8 s on a boot without the dongle plugged in. **Reverted later the same day
+(`06753a16`):** the prompt came early but the check it moved behind it then held the shell until `fs`
+served, so for about 2.5 s after `gsh>` nothing typed was echoed - a prompt saying ready when it was
+not. The prompt waits for the check again. A prompt that is both early and true needs an `fs` request
+that does not hold the console read.
 
 **Section 31, confirmed.** The dongle was plugged in at power-on. There was no re-enumeration naming its
 port, and it went from the boot enumeration to `JOINED` with no replug, 6.5 s after power-on.
