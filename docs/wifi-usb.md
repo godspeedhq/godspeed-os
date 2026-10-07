@@ -2500,3 +2500,50 @@ cable`, and with it out `link     up via wifi (the cable is out)`. Three joins f
 `radio off`/`on`, `powercycle`), each with one `key store after the join` line, `security on` and `0xcf`,
 and no `CAM entry` lines; none refused its frames. The cable went in and out twice, a 48-ping run across
 the switches lost one reply. The Wyse is next, on the same image.
+
+## 41. The Wyse: the dongle never addressed, and the keyboard lost on a replug - a stale input context in `xhci` (2026-10-07) - fixed, not yet on hardware
+
+**The Wyse card (same image as section 40's last run).** The dongle was never seen, and after a while
+the keyboard did not come back from an unplug either. The T630, retested on the same image by the
+operator, still hot-plugs its keyboard. Neither fault is in this branch's dongle code.
+
+**What the log showed.** The Wyse's keyboard sits behind the board's internal USB2 hub on root port 1,
+and `xhci` walks that hub first. Then:
+- **Every high-speed device directly on a root port failed Address Device with Transaction Error
+  (completion 4)**, three times, then the port was skipped: the device on port 6 at every boot, and the
+  dongle on port 4 when it was plugged in. This was recorded in the Wyse bring-up as "port 6, unknown
+  device", and put down to that device.
+- **The SuperSpeed devices on ports 10 and 15 got no completion at all** to Address Device. A command ring
+  runs in order, so every command after it - Disable Slot, Enable Slot, and the Reset Endpoint and Set TR
+  Dequeue that repair the hub's control endpoint - got none either; no late completion was ever logged, so
+  the stuck one never finished. With the hub's control endpoint unrepairable the hub cannot be asked what
+  changed, and a keyboard unplugged from it is never found again. Every re-enumeration (about one a
+  minute, on `hub slot 1 unreachable 200x`) rebuilt the hub and the keyboard and then wedged again on
+  port 10. (`xhci` enumerates SuperSpeed root ports since `fb9bc1f8`, on main since August, so a USB3
+  stick can be found; the Wyse bring-up had skipped them for exactly this wedge.)
+
+**The cause found in the code, for the first of the two.** One input context is shared by every
+Address Device. Every path that fills it clears it first - except `enumerate_one`, the root-port path,
+which wrote only the words it uses. The hub path had just written the keyboard's slot dword2: its
+transaction translator, hub slot 1, port 4 (`0x0401`), which a low- or full-speed device behind a
+high-speed hub needs and nothing else may carry. So every root-port device enumerated after the keyboard
+went to the controller claiming a translator it does not have, and the Wyse's Intel controller refused
+it. On the T630 the dongle was always the first device found, so nothing had written the word before it.
+
+**The fix:** `enumerate_one` clears the input context first, as the others do.
+
+**Checked:** the x86 image builds and passes every gate. QEMU, the Wyse's order reproduced - a hub on a
+root port with a keyboard behind it, a USB stick on a later root port: the hub, the keyboard, then the
+stick addressed and its disk read. QEMU accepted the stale word before the fix as well (it does not
+validate it), so that run shows the order works and nothing regressed, not that the fault is gone.
+`scripts/cross_isa.py`, whose riscv64 leg runs its disk through `xhci`: 12 of 12.
+
+**Prediction, Wyse, the dongle on a front port at boot, the cable in:**
+1. Port 6's device and the dongle each pass Address Device - no `completion=4` on any root port.
+2. The SuperSpeed ports 10 and 15: either they address (they then show as hubs, the USB3 halves of the
+   board's hub), or they fail with a completion code. Either confirms the stale word was also their
+   cause. **Refuted by** `Address Device - no completion` on port 10 again: then that is a second fault,
+   a command the controller never finishes, and the next step is the spec's answer to one (Command Abort,
+   xHCI 4.6.1.2) - to be read before it is written, not retried around.
+3. The keyboard unplugged and replugged, twice: found again each time.
+4. Then section 40's card: `wifi scan`, `wifi join`, the cable out and in, `ping`.

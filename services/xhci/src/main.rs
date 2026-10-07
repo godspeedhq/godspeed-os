@@ -2744,8 +2744,20 @@ fn enumerate_one(
     ctx.log_fmt(format_args!("xhci: slot {} enabled", slot));
 
     // Build the Input Context and Address Device (root port, no route string).
+    //
+    // CLEARED FIRST, as every other writer of this one shared input context clears it. This path set
+    // only the words it cared about, so a root-port device enumerated after a low- or full-speed device
+    // behind a hub inherited that device's slot dword2 - the hub's slot and port as its transaction
+    // translator (0x0401 for the Wyse's keyboard on hub slot 1, port 4). On the Wyse every high-speed
+    // device enumerated after it failed Address Device with Transaction Error (completion 4) - the WiFi
+    // dongle on port 4, and the device on port 6 on every boot. The SuperSpeed devices on ports 10 and
+    // 15, enumerated in the same position, got no completion at all and blocked every later command;
+    // whether that is the same cause is for the card to show (`docs/wifi-usb.md` 41). On the T630 the
+    // dongle was always the first device found, so nothing before it had written the word.
     let islot = INPUT_CTX_OFF + ctx_size;
     let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    clear_input_ctx(dma, ctx_size);
+    dma.write32(INPUT_CTX_OFF, 0); // Drop Context flags: none
     dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add Context flags: slot + EP0
     dma.write32(islot, (1 << 27) | (speed << 20));
     dma.write32(islot + 4, port << 16);
