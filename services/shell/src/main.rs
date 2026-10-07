@@ -10018,7 +10018,7 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
 /// (docs/wifi.md 52), and `wifi radio powercycle` is there to try once more by hand.
 fn wifi_radio_on_outcome(ctx: &ShellCtx, out: &mut Out, outcome: WatchOutcome) -> Result<(), ShellError> {
     match outcome {
-        WatchOutcome::Joined | WatchOutcome::Left => Ok(()),
+        WatchOutcome::Joined | WatchOutcome::Left | WatchOutcome::UpNotChosen => Ok(()),
         // ONE attempt, as `powercycle` makes: a second cycle on the same chip gives the same result.
         WatchOutcome::Warm => {
             out.line_fmt(ctx, format_args!("radio on failed - the chip came up warm (its firmware trapped at start; docs/wifi.md 52); `wifi radio powercycle` tries once more"));
@@ -10104,7 +10104,7 @@ fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError
                 }
                 return Ok(());
             }
-            WatchOutcome::Left => return Ok(()),
+            WatchOutcome::Left | WatchOutcome::UpNotChosen => return Ok(()),
             WatchOutcome::Warm if attempt < MAX_ATTEMPTS => {
                 out.line_fmt(ctx, format_args!(
                     "  the chip came up warm - its firmware trapped at start; cycling again (attempt {} of {})",
@@ -10151,6 +10151,10 @@ enum WatchOutcome {
     Down,
     /// Nothing conclusive within the bound; said on the way out.
     TimedOut,
+    /// The radio is up and will NOT rejoin, by its own word: `/wifi.radio` names the other radio
+    /// (`OP_USE` answers `USE_NOT`). A power cycle that succeeded, said with the reason and the remedy,
+    /// rather than ninety seconds spent waiting for a join the driver has already decided against.
+    UpNotChosen,
 }
 
 /// Watch the radio come back after a power cycle, blocking until it has rejoined. `b` backgrounds, `q`
@@ -10178,6 +10182,8 @@ fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutc
     out.line_fmt(ctx, format_args!("the radio is coming back from power-on  [q] quit  [b] background"));
     let t0 = ctx.epoch_secs_monotonic();
     let mut last = "";
+    // Whether the radio, once up and not joined, has been asked if it will rejoin at all (`OP_USE`).
+    let mut asked_use = false;
     loop {
         while let Some(b) = ctx.try_console_read() {
             match b {
@@ -10208,6 +10214,22 @@ fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutc
                 } else if p[9] == 0 {
                     "radio coming up"
                 } else if p[10] == 0 {
+                    // ASK, ONCE, WHETHER IT WILL. A radio that `/wifi.radio` does not choose does not
+                    // rejoin at start (`godspeed_wifi::serve`), and waited on, this read "radio up,
+                    // joining" for the whole bound: the Pi 4 with the choice left on `usb` and no dongle
+                    // in (`docs/wifi-usb.md` 48). The driver knows; the watch asks rather than waits.
+                    if !asked_use {
+                        asked_use = true;
+                        if let Some(u) = wifi_ask(ctx, &[OP_USE], POLL_MS) {
+                            if u.payload_bytes() == [OK, USE_NOT] {
+                                let me = radio_name(ctx.wifi_radio.get());
+                                out.line_fmt(ctx, format_args!(
+                                    "{} succeeded - the radio is up, and does not rejoin: /wifi.radio chooses the other radio. `wifi hardware use {}` makes this one the one in use",
+                                    verb, me));
+                                return WatchOutcome::UpNotChosen;
+                            }
+                        }
+                    }
                     "radio up, joining"
                 } else {
                     let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);

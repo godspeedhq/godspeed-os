@@ -2832,3 +2832,23 @@ change. `selfcheck` not yet run on this image.
 **And the `selfcheck` half, on the same image after the chaos run:** `ran 517, failed 0, skipped 1` -
 the 18 failures gone - and hot-plug of the USB stick and the keyboard working, by the operator. Section
 47's change is hardware-verified on the Pi 2.
+
+## 48. The Pi 4 with `/wifi.radio` left on `usb` and no dongle in: `powercycle` waited on a join that was never coming (2026-10-07) - the watch asks now; built, not yet on hardware
+
+The Pi 4 card for this branch's `xhci` and `net` changes, the dongle not plugged in. The stick still held
+`/wifi.radio` = `usb` from section 37's card. After `wifi radio powercycle` the onboard driver said
+`/wifi.radio names usb - another radio is in use; this one does not rejoin`, as section 37 verified it
+should, and the shell printed `radio up, joining` and waited - bounded at 90 s, but waiting on time for
+something the driver had already decided against (Commandment VIII).
+
+**The change (shell):** the power-cycle watch, once the radio is up and not joined, asks it ONCE whether it
+is the one in use (`OP_USE`, which every radio answers). `USE_NOT` ends the watch at once - `powercycle
+succeeded - the radio is up, and does not rejoin: /wifi.radio chooses the other radio. wifi hardware use
+onboard makes this one the one in use` - a success, since the cycle did its job.
+
+**Open, the operator's question:** whether a radio the choice names but that is not present should leave
+the machine without WiFi at all, or the one that is present should take over. `nic-driver`'s bridge and
+the shell's verbs already fall back; the driver's rejoin at start does not.
+
+**Prediction, Pi 4:** with the choice still on `usb`, `wifi radio powercycle` ends within a few seconds of
+`radio up` with the line above; `wifi hardware use onboard`, then `wifi radio powercycle`, rejoins.
