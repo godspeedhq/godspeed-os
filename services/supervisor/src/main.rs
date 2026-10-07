@@ -981,7 +981,16 @@ fn record_name(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapH
 /// used to discard this and then print "adopted running X" - a line that was not true if the record
 /// had just been dropped. Announcing the outcome is optional; hiding a failure is not (invariant 12).
 fn record_name_quiet(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapHandle) -> bool {
-    if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
+    // ONE cap is let go here: the old instance's, for a name the map keeps; the new one, for a name it
+    // does not. An on-demand program - `upper`, `recorder`, a selfcheck's `greet` - is restarted by nothing
+    // and wired to nothing, so the supervisor holds no capability to it, and it is never in the map, so
+    // there is no old one to free as well. The map is bounded at `NAME_MAP_MAX`, and these used to stay in
+    // it for the life of the machine: on the Pi 4 a `selfcheck` filled it, and the USB dongle's driver
+    // arriving after was dropped (`docs/wifi-usb.md` 49).
+    let keep = map_keeps(name);
+    let let_go = if keep { map.get(name).map(CapHandle) } else { Some(cap) };
+    if let Some(c) = let_go { ctx.remove_cap(c); }
+    if !keep { return false; }
     if map.record(name, cap.0) { return true; }
     ctx.log_fmt(format_args!("supervisor: name-map FULL - dropped {}", name));
     false
@@ -1319,6 +1328,15 @@ fn tell_radio_of_dongle(ctx: &ServiceContext, map: &NameCapMap, usb: &UsbState, 
     }
     // Not delivered (its queue full, or it is mid-respawn): left untold, so the next pass tries again -
     // the loop runs on every message, and a driver's death is one.
+}
+
+/// Whether the name map keeps `name`: a service this supervisor RESTARTS (`is_watched`), starts for a USB
+/// device (`USB_MATCH`), or wires other services to (a peer in some image row - `pong`, which `ping` and
+/// `greet` name). Every other spawn is on demand, and is not kept (`record_name_quiet`).
+fn map_keeps(name: &str) -> bool {
+    is_watched(name)
+        || USB_MATCH.iter().any(|m| m.driver == name)
+        || IMAGES.iter().chain(USB_IMAGES.iter()).any(|row| row.5.contains(&name))
 }
 
 /// The supervisor's one non-blocking send on a capability it holds in hand - a reply capability, or a

@@ -2880,7 +2880,7 @@ that only the chosen radio rejoins. The fact is the supervisor's: a USB host's r
   bridge stays on it as on the radio in use; the shell's power-cycle watch (section 48) ends early only on
   `USE_NOT`, so it waits for a stand-in's join. Choosing a radio (`wifi hardware use`) ends a stand-in.
 
-**Checked:** the Pi 4, Pi 2, VisionFive and x86 images build and x86 passes every gate. QEMU raspi4b boots,
+**Checked:** the Pi 4, Pi 2, VisionFive and x86 images build and x86 passes every gate; with the name-map change, `osdev test identity` 24 of 24 in QEMU. QEMU raspi4b boots,
 `supervisor: ready`, and the USB host's boot report arrives; QEMU has no radio behind the SD host, so the
 serve loop that takes the notice never runs there.
 
@@ -2902,3 +2902,28 @@ is out - the radio carries the link`, a DHCP lease and the gateway answering a p
 USB stick came up on `xhci` as before. (The twelve `fs: flash requested ... REFUSED` lines at boot are
 `fs`'s own protocol selftest walking every opcode with a zero capacity injected so it cannot format -
 documented beside the code that logs them, not a request from anywhere.) Steps 2 to 4 not yet run.
+
+**Steps 2 to 4 (same boot).**
+- **`wifi radio powercycle`:** the respawned driver was told again (`the USB radio is not attached`), stood
+  in, and the watch ended `powercycle succeeded - joined ...`; `net` said `link up via wifi`; `ping
+  8.8.8.8` 3 of 3.
+- **Stand-down and stand-in, three times:** each time the operator plugged the dongle in, `the USB radio is
+  attached` and `this one leaves the network it held in its place`; each time it came out, `not attached`
+  and `this one rejoins in its place`. The keyboard and the stick came and went with it, bound each time.
+- **`selfcheck`: 527 run, 1 failed** - `dns: ICMP to 8.8.8.8 works but no name resolves`. `net-stack`'s
+  receive and transmit to `nic-driver` (ops 4 and 0) each went unanswered for about 2 s, and `nic-driver`'s
+  answers arrived after `net-stack` had given up (`reply cap is dead`), with no slow or missing answer from
+  the radio logged in that window. That is `backlog/66`'s signature on the Pi 4 - `nic-driver` waking late
+  on core 1 - recorded there; nothing this branch changed touches that path.
+
+**Two things the dongle's arrivals showed.**
+- **The dongle's firmware download hit `cc=4`** - section 37's Pi 4 fault, parked. The onboard radio had
+  stood down because the dongle was ATTACHED, and the dongle then never came up, so until it was pulled
+  the Pi 4 had no WiFi. The stand-in follows "attached", which the supervisor knows; whether the chosen
+  radio WORKS is its driver's to know, and nothing carries that to the onboard radio yet.
+- **`supervisor: name-map FULL - dropped wifi-usb`.** The supervisor's name map holds sixteen, and every
+  spawn it made was recorded in it, on-demand programs included: after `selfcheck`, `upper` and `recorder`
+  held two slots for the life of the machine, and the dongle's driver arriving after was dropped (it still
+  started, wired from its peers). **Fixed:** the map keeps only what the supervisor restarts (`is_watched`),
+  starts for a USB device (`USB_MATCH`), or wires others to (a peer in an image row - `pong`); an on-demand
+  program's capability is let go at once (`map_keeps`, `record_name_quiet`).

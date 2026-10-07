@@ -164,3 +164,9 @@ calibration, taken once at startup against the kernel's monotonic seconds - on t
 network is CONFIGURED. It coincided with the clock being set because the dance that configured the
 network used to end in an SNTP exchange: the clock was a correlate of the onset, not its cause. The
 index row is corrected to match.
+
+**2026-10-07, seen again, once.** A Pi 4 `selfcheck` over the onboard radio (cable out) failed only its
+DNS check: `net-stack`'s ops 4 and 0 to `nic-driver` went unanswered for about 2 s each, and
+`nic-driver`'s replies arrived after `net-stack` had given up (`a reply send FAILED - the reply cap is
+dead`), with no slow or unanswered radio exchange logged in that window. Pings in the same session ran
+at 43-52 ms. Recorded as a sighting; the item stays parked (`docs/wifi-usb.md` 49).
