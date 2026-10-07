@@ -649,8 +649,10 @@ const WAKE_GAP_SAY_TICKS: u64 = 10;
 /// ring with the cycle counter: each send and what it did (woke a receiver, queued, refused), each
 /// receive (got a message, or found none and is about to block), each block and each declined block,
 /// each wake and the state it lifted the task out of, each switch on and off a core, and each timed
-/// wake. When `nic-driver`'s endpoint has held mail without a break for `FL_STUCK_TICKS`, the ring is
-/// printed, oldest first, so the second is read rather than inferred. Diagnostic; it goes with the fault.
+/// wake, each received message (sender, caps, length, first byte) and each `TakePendingCap` and what it
+/// returned. When net-stack has asked nic-driver and had no answer sent back for `FL_ASK_TICKS`, the ring
+/// is printed from that ask, so the second is read rather than inferred. (The first trigger, mail held at
+/// nic-driver, fired only at boot: the request is not waiting there.) Diagnostic; it goes with the fault.
 pub mod fl {
     pub const SEND: u8 = 1;      // a = (result << 32) | endpoint low 32; result 0 queued, 1 woke, 2 full, 3 err
     pub const GOT: u8 = 2;       // recv dequeued a message; a = 1 for a timed recv
@@ -662,6 +664,14 @@ pub mod fl {
     pub const OFF: u8 = 8;       // switched off its core; a = its state then
     pub const TIMEOUT: u8 = 9;   // recv_timeout returned its timeout
     pub const DEADLINE: u8 = 10; // the BSP scan's timed wake fired for it
+    pub const TAKE: u8 = 11;     // TakePendingCap; a = (caps pending before << 16) | slot returned (0xFFFF = none)
+    pub const SLEEP: u8 = 12;    // the sleep syscall; a = microseconds asked for. Not in recv: a send cannot wake it
+}
+/// What `GOT` records about the message: who sent it, how many caps it carried, its length and first
+/// byte, and whether the receive was timed - enough to tell a driver's reply from a client's request.
+pub fn fl_got_word(sender_ep: u64, caps: usize, len: usize, first: u8, timed: bool) -> u64 {
+    ((sender_ep & 0xFFFF) << 24) | ((caps as u64 & 7) << 21) | ((len as u64 & 0xFFF) << 9)
+        | ((first as u64) << 1) | timed as u64
 }
 const FL_LEN: usize = 512;
 static FL_CYC: [portable_atomic::AtomicU64; FL_LEN] = [const { portable_atomic::AtomicU64::new(0) }; FL_LEN];
@@ -676,6 +686,23 @@ fn fl_traced(slot: usize) -> bool {
 /// possible and harmless for a diagnostic.
 pub fn fl_note(kind: u8, slot: usize, a: u64) {
     if !fl_traced(slot) { return; }
+    if kind == fl::SEND {
+        // An ASK is net-stack sending to nic-driver's endpoint; an ANSWER is nic-driver sending to
+        // net-stack's. The trigger below fires on an ask left unanswered (`FL_ASK_TICKS`).
+        let ep = a & 0xFFFF_FFFF;
+        let owner = (0..MAX_TASKS).find(|&t| TASK_VALID[t].load(Ordering::Acquire)
+            && TASK_ENDPOINT[t].load(Ordering::Relaxed) & 0xFFFF_FFFF == ep);
+        match (task_name(slot), owner.map(task_name)) {
+            ("net-stack", Some("nic-driver")) => {
+                if FL_ASK_AT.load(Ordering::Relaxed) == 0 {
+                    FL_ASK_IDX.store(FL_HEAD.load(Ordering::Relaxed), Ordering::Relaxed);
+                    FL_ASK_AT.store(monotonic_ticks().max(1), Ordering::Relaxed);
+                }
+            }
+            ("nic-driver", Some("net-stack")) => FL_ASK_AT.store(0, Ordering::Relaxed),
+            _ => {}
+        }
+    }
     let i = (FL_HEAD.fetch_add(1, Ordering::Relaxed) as usize) % FL_LEN;
     let core = current_core_id() as u64 & 0xFF;
     FL_CYC[i].store(crate::arch::imp::read_cycle_counter(), Ordering::Relaxed);
@@ -683,39 +710,38 @@ pub fn fl_note(kind: u8, slot: usize, a: u64) {
         | (a & 0xFF_FFFF_FFFF), Ordering::Relaxed);
 }
 
-static FL_STUCK_SINCE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// BSP tick of the oldest unanswered ask (0 = none, `u64::MAX` = said, until the next answer).
+static FL_ASK_AT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// Ring position of that ask, so the dump starts at it.
+static FL_ASK_IDX: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 static FL_DUMPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// 300 ms in BSP ticks: `nic-driver` answers in milliseconds, so mail held this long is the fault.
-const FL_STUCK_TICKS: u64 = 30;
+/// 300 ms in BSP ticks: nic-driver answers in milliseconds, so an ask unanswered this long is the fault.
+const FL_ASK_TICKS: u64 = 30;
 const FL_DUMPS_MAX: u32 = 3;
-const FL_DUMP_EVENTS: u64 = 80;
+/// 60 s in BSP ticks.
+const FL_QUIET_TICKS: u64 = 6000;
+/// Events printed: from a few before the ask, at most this many.
+const FL_DUMP_EVENTS: u64 = 150;
 
 fn lost_wake_check(now: u64) {
-    if now % 2 != 0 || FL_DUMPS.load(Ordering::Relaxed) >= FL_DUMPS_MAX { return; }
-    let Some(nic) = (0..MAX_TASKS).find(|&s| TASK_VALID[s].load(Ordering::Acquire)
-        && task_name(s) == "nic-driver"
-        && TaskState::from(TASK_STATE[s].load(Ordering::Acquire)) != TaskState::Dead) else { return };
-    let view = ep_from_u64(TASK_ENDPOINT[nic].load(Ordering::Relaxed)).and_then(crate::ipc::routing::receiver_view);
-    let Some((queued, rx)) = view.filter(|v| v.0 > 0) else {
-        FL_STUCK_SINCE.store(0, Ordering::Relaxed);
-        return;
-    };
-    let since = FL_STUCK_SINCE.load(Ordering::Relaxed);
-    if since == 0 { FL_STUCK_SINCE.store(now, Ordering::Relaxed); return; }
-    if since == u64::MAX || now.saturating_sub(since) < FL_STUCK_TICKS { return; }
-    FL_STUCK_SINCE.store(u64::MAX, Ordering::Relaxed); // said; re-armed when the queue empties
+    if FL_DUMPS.load(Ordering::Relaxed) >= FL_DUMPS_MAX { return; }
+    // Not in the first minute: bring-up asks and sleeps by design, and would spend every dump.
+    if now < FL_QUIET_TICKS { return; }
+    let at = FL_ASK_AT.load(Ordering::Relaxed);
+    if at == 0 || at == u64::MAX || now.saturating_sub(at) < FL_ASK_TICKS { return; }
+    FL_ASK_AT.store(u64::MAX, Ordering::Relaxed);
     let n = FL_DUMPS.fetch_add(1, Ordering::Relaxed) + 1;
-    let state = TaskState::from(TASK_STATE[nic].load(Ordering::Acquire));
     let q = crate::arch::imp::boot::tsc_ticks_per_quantum().max(1);
     let t_now = crate::arch::imp::read_cycle_counter();
-    crate::kprintln!(
-        "flight #{}: nic-driver (slot {}, endpoint {:#x}) has held mail {} ms without a break ({} queued, receiver recorded: {}, {:?}, wake pending {}) - last {} events, oldest first, us before now (counter {} per 10 ms):",
-        n, nic, TASK_ENDPOINT[nic].load(Ordering::Relaxed), (now - since) * 10, queued,
-        rx.map_or("none", |r| if r == nic { "itself" } else { "OTHER" }),
-        state, TASK_WAKE_PENDING[nic].load(Ordering::Relaxed), FL_DUMP_EVENTS, q);
     let head = FL_HEAD.load(Ordering::Relaxed);
-    let from = head.saturating_sub(FL_DUMP_EVENTS);
-    for k in from..head {
+    let from = FL_ASK_IDX.load(Ordering::Relaxed).saturating_sub(6).max(head.saturating_sub(FL_LEN as u64 - 1));
+    let to = head.min(from + FL_DUMP_EVENTS);
+    let ep_of = |name: &str| (0..MAX_TASKS).find(|&t| TASK_VALID[t].load(Ordering::Acquire) && task_name(t) == name)
+        .map_or(0, |t| TASK_ENDPOINT[t].load(Ordering::Relaxed));
+    crate::kprintln!(
+        "flight #{}: net-stack asked nic-driver {} ms ago and has had no answer - events {} to {} of {}, oldest first, us before now (counter {} per 10 ms); endpoints net-stack {:#x} nic-driver {:#x} wifi-driver {:#x}; got = sender<<24 | caps<<21 | len<<9 | byte0<<1 | timed",
+        n, (now - at) * 10, from, to, head, q, ep_of("net-stack"), ep_of("nic-driver"), ep_of("wifi-driver"));
+    for k in from..to {
         let i = (k as usize) % FL_LEN;
         let ev = FL_EV[i].load(Ordering::Relaxed);
         let ago = t_now.wrapping_sub(FL_CYC[i].load(Ordering::Relaxed)).saturating_mul(10_000) / q;
@@ -726,7 +752,7 @@ fn lost_wake_check(now: u64) {
         let what = match kind {
             fl::SEND => "send", fl::GOT => "got", fl::EMPTY => "empty", fl::BLOCK => "block",
             fl::NOBLOCK => "noblock", fl::WAKE => "wake", fl::RUN => "run", fl::OFF => "off",
-            fl::TIMEOUT => "timeout", fl::DEADLINE => "deadline", _ => "?",
+            fl::TIMEOUT => "timeout", fl::DEADLINE => "deadline", fl::TAKE => "take", fl::SLEEP => "sleep", _ => "?",
         };
         crate::kprintln!("fl {:>8} c{} {:<11} {:<8} {:#x}", ago, core, task_name(slot), what, a);
     }
@@ -1284,6 +1310,8 @@ pub fn pop_pending_recv_cap() -> Option<u32> {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             let count = TASK_PENDING_RECV_CAP_COUNT[cur];
+            fl_note(fl::TAKE, cur, ((count as u64) << 16)
+                | if count > 0 { TASK_PENDING_RECV_CAPS[cur][0] as u64 & 0xFFFF } else { 0xFFFF });
             if count > 0 {
                 let slot = TASK_PENDING_RECV_CAPS[cur][0];
                 // Shift remaining entries left.

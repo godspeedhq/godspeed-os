@@ -416,7 +416,9 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     loop {
         match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
             Ok((msg, sender_to_wake)) => {
-                scheduler::fl_note(scheduler::fl::GOT, my_slot, 0);
+                scheduler::fl_note(scheduler::fl::GOT, my_slot, scheduler::fl_got_word(
+                    msg.sender_ep, msg.cap_count, msg.payload_bytes().len(),
+                    msg.payload_bytes().first().copied().unwrap_or(0), false));
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
                 }
@@ -537,7 +539,9 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
     let result = loop {
         match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
             Ok((msg, sender_to_wake)) => {
-                scheduler::fl_note(scheduler::fl::GOT, my_slot, 1);
+                scheduler::fl_note(scheduler::fl::GOT, my_slot, scheduler::fl_got_word(
+                    msg.sender_ep, msg.cap_count, msg.payload_bytes().len(),
+                    msg.payload_bytes().first().copied().unwrap_or(0), true));
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
                 }
@@ -599,6 +603,7 @@ fn handle_irq_unmask(irq: u64) -> i64 {
 fn handle_sleep(cycles: u64) -> i64 {
     if cycles == 0 { return 0; }
     let my_slot = scheduler::current_task_slot();
+    scheduler::fl_note(scheduler::fl::SLEEP, my_slot, scheduler::cycles_to_us(cycles));
 
     // SUB-TICK SLEEPS GO TO THE MICROSECOND ONE-SHOT - RE-ENABLED, with the reason it was pulled now
     // understood and fixed elsewhere.
