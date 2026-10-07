@@ -1886,6 +1886,15 @@ this path has had that length yet.
 **Refuted by:** a Configure Endpoint failure; `bulk OUT ... failed` lines; no probe response; U2b's
 receive breaking.
 
+**First card (2026-10-07, the Pi 4, `card/u2c` at `f230503e`): stopped before any frame was sent, by
+the intermittent firmware-download fault of section 27, not by U2c.** The Configure Endpoint passed:
+`bulk IN 0x81 (DCI 3, mps 512) and 2 bulk OUT(s) [4, 6] (mps 512) configured - receive and send ready
+(U2b, U2c)`. The bring-up reached the firmware, and its first block failed with `cc=4`. EP0 was
+repaired eight times, and every transfer after each repair timed out with no event. Then `xhci`
+re-enumerated, and the dongle could not be addressed again on two walks. It is now two failed downloads
+in four Pi 4 bring-ups. The keyboard was lost as well, which is section 32. U2c's predictions are
+untested, not refuted.
+
 ## 30. `OP_SYNC` for both of `xhci`'s notices (2026-10-07) - found by an audit, hardware-verified on the Pi 4 (section 28's result)
 
 **What was wrong.** `usbfn::OP_SYNC` is how a `wifi-usb` with no reply mailbox recovers a notice it took
@@ -1947,3 +1956,33 @@ unchanged.
 line and no `xhci: reset: entering` after the boot enumeration. The driver goes on through R11 to `receive
 started` and beacons, as in section 28. **Refuted by:** a re-enumeration naming the dongle's port while
 it is bound.
+
+## 32. A command's completion taken from the command before it (2026-10-07) - fixed, not yet on hardware
+
+**What was seen** on U2c's first card (section 29), after the dongle's EP0 could not be repaired.
+`xhci` re-enumerated. On hub port 3 the dongle was refused with `Enable Slot REFUSED (completion=4)`.
+The keyboard on hub port 4, which had been bound twice before in the same session, was then not found
+at all: there was no line for port 4, and `0 HID device(s) bound`. A second walk, five seconds later, did
+exactly the same. The keyboard stayed lost for the rest of the run, because a port whose arrival has
+been tried is not tried again while it stays connected.
+
+**What is wrong.** `run_command` took the first Command Completion Event as its own. It did not check
+the address of the command TRB that every completion carries. So a command that timed out (returning
+`None`, in silence, through each caller's `?`) left its completion to be read as the NEXT command's,
+and every command after that as the one before it. Enable Slot cannot complete with `cc=4`, a USB
+Transaction Error, but an Address Device sent to a device that does not answer does. That is what the
+refusal looks like: the address retry's Enable Slot reading the previous attempt's late Address Device.
+**Not shown:** why port 4 printed nothing. Its status read is a control transfer, and a failed read was
+skipped as an empty port without a word, so this run cannot say whether that is what happened.
+
+**The fix.** `run_command` takes only the completion whose TRB pointer is its own command's. A late one
+for an earlier command is logged (`a completion for an earlier command arrived late ... discarded`) and
+skipped. A command with no completion says so, rather than returning `None` in silence. The hub walk
+now logs a failed port status read (`hub port N status read failed - not scanned this pass`) rather
+than treating it as an empty port.
+
+**Prediction, the next time the dongle's EP0 cannot be repaired on the Pi 4:** no `Enable Slot REFUSED
+(completion=4)`. Instead, possibly `a completion for an earlier command arrived late` or `command type N
+got no completion`. And the keyboard on the other port is bound after the walk (`1 HID device(s)
+bound`). **Refuted by:** the keyboard lost again with neither new line explaining why. If a `status read
+failed` line names its port, the cause is the hub's EP0, not the command ring.

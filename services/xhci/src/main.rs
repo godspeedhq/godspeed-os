@@ -1013,18 +1013,42 @@ fn run_command(
     dma.write32(cmd_trb_off + 12, d3);
     mmio.write32(dboff, 0); // command doorbell: DB Target must be 0 (the command ring), NOT a DCI like the slot doorbells (dboff + slot*4, target = endpoint DCI) elsewhere in this file
 
+    // MATCH THE COMPLETION TO THIS COMMAND. A Command Completion Event carries the address of the
+    // command TRB it completes, and this took the first completion of any command as its own. A
+    // command that times out here still completes later, so its completion was read as the NEXT
+    // command's, and every command after it as the one before. On the Pi 4 a retry's Enable Slot
+    // reported "REFUSED (completion=4)", which Enable Slot cannot return and a dead dongle's late
+    // Address Device would, and the keyboard on the next port was lost in the same walk
+    // (docs/wifi-usb.md 32). `hub_port_status` matches its transfers the same way.
+    let want = dma.phys_at(cmd_trb_off) & !0xF;
     for _ in 0..8 {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
-            Some((TRB_CMD_COMPLETION, completion, slot)) => return Some((completion, slot)),
-            Some((TRB_PORT_STATUS_CHANGE, _, _)) => {
+        match next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
+            Some((TRB_CMD_COMPLETION, completion, slot, ptr, _, _)) if ptr & !0xF == want => {
+                return Some((completion, slot))
+            }
+            Some((TRB_CMD_COMPLETION, completion, _, ptr, _, _)) => {
+                ctx.log_fmt(format_args!(
+                    "xhci: a completion for an earlier command arrived late (completion={}, TRB {:#x}) - discarded, not taken as this one's",
+                    completion, ptr));
+            }
+            Some((TRB_PORT_STATUS_CHANGE, _, _, _, _, _)) => {
                 ctx.log("xhci: (port status change event)");
             }
-            Some((t, _, _)) => {
+            Some((t, _, _, _, _, _)) => {
                 ctx.log_fmt(format_args!("xhci: (event type {})", t));
             }
-            None => return None,
+            None => {
+                // Said, because every caller turns this into a silent `None` with `?`.
+                ctx.log_fmt(format_args!(
+                    "xhci: command type {} got no completion within its bound - its completion, if it comes, will be discarded",
+                    (d3 >> 10) & 0x3F));
+                return None;
+            }
         }
     }
+    ctx.log_fmt(format_args!(
+        "xhci: command type {} - eight other events and no completion of its own; giving up on it",
+        (d3 >> 10) & 0x3F));
     None
 }
 
@@ -3008,6 +3032,12 @@ fn enumerate_one(
             DATA_BUF_OFF,
         ); // Get_Status(port)
         hoff += 48;
+        // A failed read is not an empty port, and it used to be skipped as one in silence: the keyboard
+        // on the Pi 4's hub port 4 went missing from a walk with no line saying why (docs/wifi-usb.md 32).
+        if !ok {
+            ctx.log_fmt(format_args!(
+                "xhci: hub port {} status read failed - not scanned this pass", dp));
+        }
         let st = if ok { dma.read16(DATA_BUF_OFF) } else { 0 };
         if st & 1 == 0 {
             continue; // nothing connected on this downstream port
