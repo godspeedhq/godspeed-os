@@ -2074,3 +2074,55 @@ such report set the poll for good.
 `fast` passes far fewer than its `idle` ones while nobody types. The previous run's heartbeat read `14275
 fast/4703 idle`. Typing feels the same. **Refuted by:** the polling line appearing anyway, which would
 mean three reports really were found by timed-out waits, or by typing lag.
+
+## 35. Hub ports watched by the hub's status-change endpoint, not a 500 ms timer (2026-10-07) - built, checked in QEMU, not yet on hardware
+
+**What it replaces.** `xhci` learned of anything plugged into or pulled from a port behind a hub by
+asking the hub about every port, over its control endpoint, every 500 ms (`HUB_POLL_MS`). On the Pi 4
+every USB socket is behind its internal hub (2109:3431), so this was the driver's main timer: of
+55.7 s of work in the first 183 s, the heartbeat charged 46.4 s to the hub segment. It also shared the control endpoint with every
+other request to the hub, which is where the hub's late-answer and wedge handling comes from.
+
+**What a hub has for this.** Every hub has one interrupt IN endpoint, 1 IN, whose data is a bitmap of
+the ports with a change pending (USB 2.0 11.12.1). The controller polls it at its interval in hardware,
+and a transfer completes only when something changed.
+
+**What is built.**
+- **Configured with the hub.** The endpoint is read from the hub's configuration descriptor and
+  configured in the same Configure Endpoint as the hub (DCI 3). This is done only for a USB 2 hub: a
+  SuperSpeed one has other change bits and an endpoint companion, and is still scanned on the timer. If
+  the hub refuses the endpoint, it is configured as before and the log says so.
+- **The ring.** It has four Normal TRB slots and a Link, written in the producer order the VL805 needs
+  (section 27). With one slot, QEMU's controller, which rests on the Link after a completion, met the
+  next lap's cycle there and stopped. The debug log showed its endpoint context's dequeue pointer at
+  the Link's address.
+- **No other wait can swallow a completion.** Every event the driver reads goes through `next_event_at`,
+  and that is where a hub's status-change completion is recorded and taken out of the ring. So none of
+  the half-dozen loops that read events can file it as someone else's answer. A failed completion
+  removes the hub from the armed set, its ports go back to the 500 ms scan, and the log says so.
+- **The scan.** On a change the poll loop queues the next TD and scans the hub's ports at once, then
+  every 500 ms for 2 s (`HUB_SETTLE_MS`), because the arrival and departure rules want two consecutive
+  readings. After that the scan runs every 5 s (`HUB_SAFETY_MS`), but only once every hub that
+  something is bound behind is armed, and only once an interrupt has been seen, so a controller whose
+  interrupts never arrive keeps its 500 ms wait for the keyboard's sake.
+- **The change is acknowledged.** A hub keeps reporting a port while any of its `C_PORT_*` bits is set,
+  so the probe now reads `wPortChange` and clears each bit that is set (features 16 to 20) over the same
+  control ring. It does this only where the endpoint is armed. Nothing in the driver reads those bits.
+- **One more fix it needed.** QEMU refuses a Configure Endpoint that adds EP0 (TRB Error, completion 5)
+  and had been refusing the plain hub configure all along. With the endpoint, the command adds the slot
+  and DCI 3 only. The plain form, which the VL805 accepts, is unchanged.
+
+**Checked in QEMU** (x86, `qemu-xhci` with a `usb-hub` and the keyboard behind it, and a mouse
+hot-plugged onto the hub from the QEMU monitor): `status-change endpoint armed`, then `hub ports
+watched by the hub's status-change endpoint`. The mouse's arrival was seen 0.8 s after `device_add`,
+including the two-reading confirmation, and its removal 0.05 s after `device_del`. Each change was
+reported as `a hub reported a change on its status-change endpoint`. With one slot, before the fix, both
+took the 5 s safety scan. `osdev test iommu` still passes.
+
+**Prediction, Pi 4 (its hub behind the VL805):** `hub configure (... status-change endpoint)
+completion=1`, `status-change endpoint armed`, then `hub ports watched by the hub's status-change
+endpoint`. Plugging and pulling the dongle or the stick is seen within about a second, each with a
+`reported a change` line. The heartbeat's `hub` segment and pass count fall well below the previous
+run's (`hub 46426` ms, 18978 passes in 183 s). **Refuted by:** `refused its status-change endpoint`, or
+`failed - its ports are scanned every 500 ms again` (the VL805 differs from QEMU here), or an unplug that
+takes five seconds to be seen (the change was missed and the safety scan caught it).
