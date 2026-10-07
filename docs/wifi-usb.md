@@ -2175,7 +2175,7 @@ onboard one by `wifi join` and the dongle from the `/wifi.keys` that join wrote.
 preceded this is reverted (sections 34, 35); a retry of it should run with a stick whose loss does not
 matter.
 
-## 37. `wifi hardware <radio>` and `wifi hardware use` on the Pi 4 (2026-10-07): the commands work; `nic-driver` did not follow, fixed, not yet seen
+## 37. `wifi hardware <radio>` and `wifi hardware use` on the Pi 4 (2026-10-07): the commands work, and `nic-driver` follows the choice (fixed, verified); the dongle drops off under load, and the disk misreads across re-scans
 
 `utilities/56_wifi.md` 11 and 11a, with both radios. What held:
 
@@ -2204,6 +2204,37 @@ every ask of `wifi-usb` went to no cap and failed at once, and nothing ever look
 **Fix:** `Radio::ask_other` reacquires the other radio's cap by name before each ask (at most every 5 s,
 `OTHER_EVERY_MS`), and does not ask at all when the name does not resolve. It also covers a dongle service
 respawned since the last ask. Built; not yet seen on hardware.
+
+**Second card run (`e90f200a`): the fix is verified.** `use usb` gave `nic-driver: the radio bridge now goes
+to wifi-usb (the radio in use, /wifi.radio)` 5 s later, the link stayed up with its DHCP lease, and `ping
+8.8.8.8` answered through the dongle (14-66 ms). When the dongle dropped, the bridge went to the onboard
+radio (`the one that answers`); when the dongle came back, the bridge went back to it within 2 s of its
+`/wifi.radio` line. Both directions of the follow logic were seen.
+
+**What the run found instead: under sustained ping the dongle left the bus.** Twice, about 10 s into
+traffic: bulk IN `cc=4` three times in a row, a bulk OUT `cc=4`, then `the WiFi dongle is gone (hub ...
+reports disconnected)`. The hub saw the device detach, which is the device or its power, not a ring
+state; the Pi 2 carried the same traffic on its own port without it. Recovery was complete each time:
+re-enumerated, `wifi-usb` restarted by the supervisor, rejoined, bridge back, ping answered (101 sent, 42
+received across both drops). Not explained; one candidate to test is the dongle's transmit current
+through the VL805 hub port.
+
+**And after the reboot that followed, the stick read wrong.** The boot hit the known download fault (the
+`cc=4` firmware block, EP0 not repairable, section 33), and each failed repair re-scans the whole bus,
+which took `xhci` away from `block-driver` for seconds at a time while `fs` mounted. Across those
+re-scans the disk returned OTHER blocks' contents as complete transfers: lba 7699 read as the superblock
+(`47534653 30303038`), another as ASCII digits, and `fs` logged `healed on re-read 2 - ... the transport
+served garbage as a complete transfer`. Sector 0 later read `01 0c 2e 67` twice. No write reached the
+stick in that boot (no journal commit, no `/wifi.keys` save), so the stick is probably intact, but that
+is not shown.
+
+Read, not yet changed: `msc::await_on_slot` takes the first transfer event for the disk's SLOT, from the
+ring or from the `EvMail` filed for that slot, without checking which TRB it completes. The CSW tag check
+catches a shifted status, and is what produced the many `refused ... status -1`; nothing checks that a
+DATA stage's completion is that stage's. A stale filed completion, or one from a device that held the
+same slot number before a re-scan, would end a data stage before the device wrote the buffer. The fix
+this points to: match each stage on its TRB pointer, as `hub_port_status` already does, and drop the
+event mailbox when the controller is reset. That is the next change, not made here.
 
 Also seen, not changed: a `wifi hardware` straight after the onboard radio has left logs `wifi-driver: the
 firmware REFUSED the request - BCME_NOTASSOCIATED`, its status ask of a radio that is not associated. The
