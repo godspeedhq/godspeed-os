@@ -2774,3 +2774,50 @@ REMOVED`.
 ports 2 and 4 and powercycles: five `device REMOVED`, five `device CONNECTED`, every move bound on its new
 port, and no `did not finish reset`, no `did not settle`, no failed enumeration. Seven joins, no `did not
 decrypt`; pings 2/2, 3/3, 2/2, 3/3, 3/3 and one 3 of 5 just after a move. No panic.
+
+## 47. A 1000-round chaos run on the Pi 2, and the 18 `selfcheck` failures after it: the ARMv7 page-table arena (2026-10-07) - a kernel change, operator-approved; built and booted in QEMU, not yet on hardware
+
+**The run.** Cable out, dongle in: `chaos max-carnage 1000` - 1000 rounds, 6405 kills, no kernel panic,
+every service back - then `selfcheck`: 517 run, **18 failed**. Every failure was one cause: an on-demand
+program - `greet`, `upper`, `roster`, `copier` - could not be started, `supervisor: spawn '...' from image
+FAILED (InvalidArgument)`. The same refusal hit chaos itself from its first round: 982 of its 1000
+memory-pressure spawns, and at times the respawn of `dwc2`, `events`, `shell` and `net-stack` (173 times),
+which came back late rather than at once.
+
+**Not memory.** `observe` read `RAM: 9 MiB used / 921 MiB total` during the run. The kernel's own line
+beside each refusal said `LoadFailed(MapFailed(FrameAllocFailed))`, and on ARMv7 that comes from
+`PageTable::new`: every address space's 16 KiB root table comes from a fixed static arena, sixteen of them
+(`L1_TABLES`), not from RAM.
+
+**Why sixteen stopped being enough.** The boot loader selftest built a page table to prove the loader and
+dropped it, keeping one root for the life of the machine (`arm32: loader PASS` is in this boot). This
+branch made `wifi-usb` the Pi 2's fourteenth resident service. That left one root for everything
+transient; during `selfcheck` `recorder` held it, and every program after it was refused. The arena's own
+comment sized it for "the concurrent-live set plus the brief overlap of a dying and its replacement", and
+the live set had grown past it.
+
+**The change (kernel, `arch/arm` only):**
+- `PageTable::discard` gives back an address space built and never run - its pages, L2 tables and L1
+  root, the kill path's two steps - and the loader selftest calls it: `loader selftest's page table
+  returned - 7 page(s) and its L1 root`.
+- `L1_TABLES` 16 -> 32 and `L2_TABLES` 128 -> 256: 768 KiB static, the bound still visible (26.6.1).
+- An exhausted arena now says so where it is known, on the first refusal and every 64th: `the L1 arena is
+  full - all 32 tables in use (a bound of this arena, not of RAM)`. The spawner still sees
+  `FrameAllocFailed`, and the supervisor `InvalidArgument`; a distinct error would add a variant to the
+  SDK's public `Error`, which every `match` and the surface `backlog/71` will freeze would feel, so it is
+  the kernel's line that names the cause.
+- `chaos max-carnage`'s report counts the memory-pressure spawns refused beside those fired, and says
+  plainly when none ran (`services/chaos`).
+
+**Found while proving it, not changed:** `chaos spawn-storm` can start only one `mem-pressure` - the
+kernel refuses a second task under a live name (`rejected: already running`) - so it cannot reach the
+task-pool or memory ceiling it reports on, on any board. Its verdict reads PASS at spawn #2.
+
+**Checked:** the Pi 2 and x86 images build and x86 passes every gate; `audits/unsafe-audit.md` records the
+one new `unsafe` block (`discard`). QEMU raspi2b: the kernel boots, the selftest returns its table, the
+services run, `observe now` runs. The exhausted-arena line has not fired in QEMU - nothing there spawns
+enough distinct tasks.
+
+**Prediction, Pi 2, the same card as before:** `selfcheck` with no failures from a refused spawn; then a
+short `chaos max-carnage 100` whose report shows few refused spawns and not the "none ran" note, and no
+`arena is full` line in the log.

@@ -330,6 +330,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut nsv = 0usize;
 
     let (mut round, mut killed, mut flooded, mut mempr, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // Of `spawns`, the ones refused. The count above is what chaos FIRED, deliberately; this is what the
+    // system did with it, so a run in which NO mem-pressure task ever ran says so instead of reading as a
+    // pass (a Pi 2 run refused 982 of 1000 for want of a page-table root, `docs/wifi-usb.md` 47).
+    let mut spawns_refused = 0u64;
     // Wall-clock start (RTC, year-guarded): the datetime for the "started HH:MM:SS" readout, and its epoch
     // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
     // `datetime()` is the kernel's RAW RTC. Machines without one (the Pi) read zero here, and since
@@ -514,7 +518,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // exhausted (later spawns are refused). The system holding IS the point; the offense is what we count.
         // (Reclaimed at cleanup below.)
         let _ = ctx.alloc_mem(MEMP_CHUNK); mempr += 1;
-        let _ = ctx.spawn("mem-pressure"); spawns += 1;
+        if ctx.spawn("mem-pressure").is_err() { spawns_refused += 1; }
+        spawns += 1;
 
         // Redraw the per-service TABLE in place. We build the whole frame into one buffer and flush it in
         // a couple of writes (not ~one per line), so the framebuffer redraws without flicker. Home the
@@ -614,8 +619,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // summary line below it (which also carries the substrings the shell test greps for).
     ctx.console_writeln("=== chaos max-carnage: report ===");
     ctx.console_writeln_fmt(format_args!(
-        "total: {} rounds, {} kills, {} flooded, {} mem-pressure, {} spawns. kernel: alive (this command returned).",
-        round, killed, flooded, mempr, spawns));
+        "total: {} rounds, {} kills, {} flooded, {} mem-pressure, {} spawns ({} refused). kernel: alive (this command returned).",
+        round, killed, flooded, mempr, spawns, spawns_refused));
+    // Later spawns are EXPECTED to be refused once a mem-pressure task holds memory; every one refused
+    // means none ever ran, and the memory-pressure dimension of this run was not exercised at all.
+    if spawns != 0 && spawns_refused == spawns {
+        ctx.console_writeln("NOTE: every mem-pressure spawn was refused - no memory-pressure task ran, so that dimension was not exercised (see the kernel log for why).");
+    }
 
     // Reclaim any flood caps still cached, so the run leaves the cap table as it found it.
     for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }

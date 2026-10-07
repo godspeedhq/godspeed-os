@@ -2654,7 +2654,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/bootcon.rs | 2 | permitted |
-| arch/arm/page_tables.rs | 31 | permitted |
+| arch/arm/page_tables.rs | 32 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |
 | arch/arm/spawn.rs | 4 | permitted |
@@ -3606,3 +3606,19 @@ syscall for it would grow the kernel's responsibilities (§4.4). The marker only
 caller's OWN address space, and the kernel refuses any value that is not page-aligned and inside the
 user stack range, reporting the refusal rather than acting on it (invariant 12). It fires once per
 boot. All of it is diagnostic and goes when the fault does.
+
+## `arch/arm/page_tables.rs` 31 -> 32 (2026-10-07): `PageTable::discard`, and the arenas doubled
+
+One block: the body of `PageTable::discard`, which gives back an address space that was built and never
+run - `reclaim_user_frames` then `free_page_table_root`, the kill path's two steps. Sound for the same
+reason those are sound on a Dead task's root, and more simply: `discard` consumes the `PageTable`, and a
+table that was never turned into a CR3 (`into_cr3` takes `self`) was never written to TTBR0, so no
+core's walker can reach it. Its one caller is the ARMv7 loader selftest, which built a table to prove
+the loader and dropped it, keeping one of the arena's L1 roots with its L2s and frames for the life of
+the machine. `loadtest.rs` itself gains no `unsafe`.
+
+Beside it, constants only: `L1_TABLES` 16 -> 32 and `L2_TABLES` 128 -> 256 (512 + 256 KiB, static,
+the bound still visible per 26.6.1), and a rate-limited line naming an exhausted arena where it is
+known - the failure reaches the spawner as `FrameAllocFailed`, which named a frame when no frame was
+short. Found by a Pi 2 chaos run whose spawns were refused with 9 MiB of 921 in use
+(`docs/wifi-usb.md` 47).
