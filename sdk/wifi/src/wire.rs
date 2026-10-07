@@ -147,6 +147,15 @@ pub const USE_NOT: u8 = 0;
 pub const USE_THIS: u8 = 1;
 /// No choice is recorded: the default order decides (the onboard radio, else the dongle).
 pub const USE_DEFAULT: u8 = 2;
+/// The choice names the other radio, and that radio is NOT attached: this one serves in its place until it
+/// is (`NOTE_USB_RADIO`). `nic-driver` stays on it, as on the radio in use.
+pub const USE_STANDIN: u8 = 3;
+/// The supervisor's notice to the onboard radio's driver: `[NOTE_USB_RADIO, attached]`, whether the USB
+/// dongle is attached, from its host's report. Sent once a host has reported, again on every attach and
+/// detach, and to a respawned driver. No reply. What lets a radio the choice does not name stand in for a
+/// chosen dongle that is not there, and stand down when it arrives (`docs/wifi-usb.md` 49). Distinct from
+/// the USB hosts' notices (`usbfn::NOTE_*`, 0x2E and 0x2F), which share the capless path.
+pub const NOTE_USB_RADIO: u8 = 0x2D;
 /// The name a radio service goes by in `wifi hardware` and `/wifi.radio`: by what it is, not where.
 pub fn radio_name(service: &str) -> &'static str {
     if service == "wifi-usb" { "usb" } else { "onboard" }

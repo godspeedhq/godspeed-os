@@ -1232,10 +1232,13 @@ const USB_HOSTS: &[&str] = if !USB_ON_DEMAND { &[] } else if cfg!(has_dwc2) { &[
 /// nothing - false until a host says otherwise, which it is asked to do at once. Owned by the main loop.
 struct UsbState {
     present: [bool; USB_MATCH_MAX],
+    /// A host has reported at least once. Until then `present` is only this supervisor's starting value,
+    /// and "absent" must not be told to anyone (`tell_radio_of_dongle`).
+    heard: bool,
 }
 
 impl UsbState {
-    const fn new() -> Self { UsbState { present: [false; USB_MATCH_MAX] } }
+    const fn new() -> Self { UsbState { present: [false; USB_MATCH_MAX], heard: false } }
 
     /// Should `name` be running? A device's driver only while its device is attached; everything else,
     /// always. What keeps the restart paths (the death arm, `reconcile`, `converge`) from bringing back a
@@ -1251,6 +1254,7 @@ impl UsbState {
 /// A host's report (`usbdev::Report`): start the device's driver if it is attached and not running, stop
 /// it if the device is gone. One host reports today, with one such device, so "absent" means every row.
 fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r: usbdev::Report) {
+    usb.heard = true;
     if !r.present {
         // Said once per report, which is rare: a host reports at its boot, on a plug or unplug, and when a
         // new supervisor asks.
@@ -1287,6 +1291,34 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r:
     if !spawn_wired(ctx, map, m.driver, m.peers) {
         ctx.log_fmt(format_args!("supervisor: {} could not be started for its device", m.driver));
     }
+}
+
+/// TELL THE ONBOARD RADIO WHETHER THE DONGLE IS ATTACHED (`godspeed_wifi::wire::NOTE_USB_RADIO`, 0x2D -
+/// a literal here, as `nic-driver` writes the wire's ops, since this crate does not link `sdk/wifi`).
+/// The fact a radio that `/wifi.radio` does not choose stands in on, for a chosen dongle that is not
+/// there, and stands down on when it arrives (`docs/wifi-usb.md` 49).
+///
+/// Said when the pair (the onboard driver's endpoint, the dongle attached) differs from the last one told,
+/// so it reaches a respawned driver - a new endpoint - and every attach and detach, whichever spawn or
+/// report path made the change. Nothing is told before a host has reported (`UsbState::heard`): before
+/// that "absent" is only a starting value, and acting on it would stand the onboard radio in at every
+/// boot, ahead of the dongle's driver. Only where both radios exist: the onboard driver and a USB device
+/// driver for the dongle.
+fn tell_radio_of_dongle(ctx: &ServiceContext, map: &NameCapMap, usb: &UsbState, told: &mut Option<(u32, bool)>) {
+    if !cfg!(has_wifi_driver) || !usb.heard {
+        return;
+    }
+    let Some(row) = USB_MATCH.iter().position(|m| m.driver == "wifi-usb") else { return };
+    let Some(slot) = map.get("wifi-driver") else { return };
+    let now = (slot, usb.present[row]);
+    if *told == Some(now) {
+        return;
+    }
+    if try_send_slot(ctx, CapHandle(slot), &Message::from_bytes(&[0x2D, now.1 as u8])) {
+        *told = Some(now);
+    }
+    // Not delivered (its queue full, or it is mid-respawn): left untold, so the next pass tries again -
+    // the loop runs on every message, and a driver's death is one.
 }
 
 /// The supervisor's one non-blocking send on a capability it holds in hand - a reply capability, or a
@@ -1891,6 +1923,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut usb = UsbState::new();
     ask_usb_hosts(&ctx, &name_map);
     converge(&ctx, &mut name_map, &usb);
+    // What the onboard radio was last told about the dongle (`tell_radio_of_dongle`).
+    let mut told_radio: Option<(u32, bool)> = None;
 
     ctx.log("supervisor: ready");
 
@@ -1931,6 +1965,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // sent (the kernel says which, `UNHEARD` / dropped). It would otherwise stay dead forever (the "fs
         // gone from observe after a storm" bug). Cheap when nothing is dead.
         reconcile(&ctx, &mut name_map, &usb);
+        tell_radio_of_dongle(&ctx, &name_map, &usb, &mut told_radio);
     }
 }
 

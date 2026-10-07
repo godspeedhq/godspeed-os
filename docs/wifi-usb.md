@@ -2852,3 +2852,45 @@ the shell's verbs already fall back; the driver's rejoin at start does not.
 
 **Prediction, Pi 4:** with the choice still on `usb`, `wifi radio powercycle` ends within a few seconds of
 `radio up` with the line above; `wifi hardware use onboard`, then `wifi radio powercycle`, rejoins.
+
+## 49. A radio the choice does not name stands in for a chosen dongle that is not attached, and stands down when it arrives (2026-10-07) - built, not yet on hardware
+
+The operator's decision, after section 48: "if a wifi hardware isn't available, fall back to the onboard".
+`nic-driver`'s bridge and the shell's verbs already fell back; the radio driver's own rejoin at start did
+not, so a Pi 4 whose `/wifi.radio` named `usb` with no dongle in had no WiFi until someone typed `wifi
+hardware use onboard`.
+
+**Decided from a fact, never from timing.** At boot the onboard driver starts before the dongle's, whose
+host reports it a few seconds later; "the dongle's driver is not running yet" is not "the dongle is not
+attached", and acting on it would stand the onboard radio in at every boot and break section 37's rule
+that only the chosen radio rejoins. The fact is the supervisor's: a USB host's report.
+
+**The change:**
+- **`wire::NOTE_USB_RADIO` `[0x2D, attached]`**, from the supervisor to `wifi-driver`, no reply. Sent once a
+  host has reported (`UsbState::heard`), again on every attach and detach, and to a respawned driver - the
+  supervisor tells whenever the pair (the driver's endpoint, attached) differs from the last it told
+  (`tell_radio_of_dongle`), so no spawn or report path can miss it.
+- **The serve loop** (`sdk/wifi`): a radio `/wifi.radio` does not choose holds its rejoin until it is told.
+  Not attached: it rejoins in the chosen radio's place - `the radio /wifi.radio chooses is not attached -
+  this one rejoins in its place`. Attached: it does not rejoin, as before. Told attached while standing
+  in: it leaves the network - `this one leaves the network it held in its place` - and the dongle joins as
+  it always has. Told absent again: it stands in again. The dongle's driver never stands in for the
+  onboard radio, which is part of the board.
+- **`wire::USE_STANDIN`**, the answer a stand-in gives to `OP_USE` and in its link status. `nic-driver`'s
+  bridge stays on it as on the radio in use; the shell's power-cycle watch (section 48) ends early only on
+  `USE_NOT`, so it waits for a stand-in's join. Choosing a radio (`wifi hardware use`) ends a stand-in.
+
+**Checked:** the Pi 4, Pi 2, VisionFive and x86 images build and x86 passes every gate. QEMU raspi4b boots,
+`supervisor: ready`, and the USB host's boot report arrives; QEMU has no radio behind the SD host, so the
+serve loop that takes the notice never runs there.
+
+**Prediction, Pi 4, `/wifi.radio` still on `usb`, no dongle:**
+1. Boot: `wifi-driver: not rejoining yet - ... the supervisor's to say`, then `the USB radio is not attached
+   (the supervisor)` and `this one rejoins in its place`, and it joins; `net` with the cable out says
+   `link up via wifi`, and `ping 8.8.8.8` answers.
+2. `wifi radio powercycle`: the respawned driver is told again and rejoins; the watch ends `succeeded -
+   joined ...`.
+3. If the dongle is plugged in at the end: `the USB radio is attached`, `this one leaves the network it held
+   in its place`, and `wifi-usb` joins and carries the link.
+**Refuted by** the onboard radio joining at a boot with the dongle IN and chosen - the race this is built to
+avoid.

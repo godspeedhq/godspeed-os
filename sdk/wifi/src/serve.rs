@@ -311,6 +311,17 @@ pub fn serve<'s>(
     // in use does not rejoin at start, and says so in its link status, so `nic-driver` follows the choice.
     let mut choice_use: u8 = wire::USE_DEFAULT;
     let mut choice_settled = false;
+    // STANDING IN (`docs/wifi-usb.md` 49). Whether the OTHER radio is attached, as the supervisor says it
+    // (`wire::NOTE_USB_RADIO`) - a fact, not a guess from timing: at boot the dongle's driver starts after
+    // this one, so "not running yet" is not "absent". `None` until told. The dongle's own driver never
+    // stands in for the onboard radio, which is part of the board, so for it the other is always there.
+    let mut other_present: Option<bool> = if wire::radio_name(who) == "usb" { Some(true) } else { None };
+    // Joined in the chosen radio's place, while it is absent; left when it arrives.
+    let mut standing_in = false;
+    // The network to stand in on - the auto-join this radio did not make because it was not chosen.
+    let mut standby: Option<([u8; SSID_MAX], u8, u8)> = None;
+    // The wait for that fact, said once.
+    let mut said_waiting = false;
     const KEYFILE_TRIES: u32 = 15;
     let mut auto_join: Option<([u8; SSID_MAX], u8, u8)> = None;
     /// Join a network this driver holds a key for - the rejoin after `radio on`, and the auto-join at boot
@@ -548,9 +559,23 @@ pub fn serve<'s>(
             }
         }
         if let (Some((name, len, sec)), Some(session)) = (auto_join.take(), radio.as_deref_mut()) {
-            if choice_use == wire::USE_NOT {
-                say(ctx, who, "not rejoining the network last joined - another radio is the one in use (/wifi.radio)");
-            } else if radio_on && sweep.is_none() && joined.is_none() {
+            let mut go = choice_use != wire::USE_NOT;
+            if !go {
+                standby = Some((name, len, sec));
+                match other_present {
+                    Some(false) => {
+                        say(ctx, who, "the radio /wifi.radio chooses is not attached - this one rejoins in its place, and leaves when it arrives");
+                        standing_in = true;
+                        go = true;
+                    }
+                    Some(true) => say(ctx, who, "not rejoining the network last joined - another radio is the one in use (/wifi.radio)"),
+                    None => if !said_waiting {
+                        said_waiting = true;
+                        say(ctx, who, "not rejoining yet - /wifi.radio chooses another radio, and whether it is attached is the supervisor's to say");
+                    },
+                }
+            }
+            if go && radio_on && sweep.is_none() && joined.is_none() {
                 say(ctx, who, "joining the network last joined, from /wifi.keys");
                 match join_known(session, &name, len, sec, &mut stored, &mut joined,
                                  &mut joined_at_secs, &mut joined_security, &mut rxq, ctx) {
@@ -647,6 +672,32 @@ pub fn serve<'s>(
             // transfer is waiting, or that the dongle was bound or removed. The host takes it, and says
             // whether the radio under this loop changed - which ends it, so the caller can bring the new
             // one up. A radio on the board has no such notices and says `Ignored` to all of them.
+            // The supervisor saying whether the USB dongle is attached (`wire::NOTE_USB_RADIO`): the fact a
+            // radio the choice does not name stands in, or stands down, on.
+            None if matches!(req.payload_bytes(), [wire::NOTE_USB_RADIO, _]) => {
+                let attached = req.payload_bytes()[1] != 0;
+                if other_present != Some(attached) {
+                    say(ctx, who, if attached { "the USB radio is attached (the supervisor)" } else { "the USB radio is not attached (the supervisor)" });
+                }
+                other_present = Some(attached);
+                if attached && standing_in {
+                    // STAND DOWN: the chosen radio is here, and it rejoins on its own.
+                    standing_in = false;
+                    if let Some(session) = radio.as_deref_mut() {
+                        if joined.is_some() {
+                            let _ = session.disassoc(ctx);
+                            joined = None;
+                            session.forget_keys();
+                            rxq.clear();
+                        }
+                    }
+                    say(ctx, who, "the radio /wifi.radio chooses is attached - this one leaves the network it held in its place");
+                } else if !attached && choice_use == wire::USE_NOT && !standing_in && joined.is_none() {
+                    // STAND IN: the chosen radio is absent, so the rejoin this radio held back is made now.
+                    auto_join = standby;
+                }
+                continue;
+            }
             None => match host.notice(req.payload_bytes(), sweep.as_mut().map(|s| &mut s.scan), ctx) {
                 Notice::Taken => continue,
                 Notice::Changed => return,
@@ -702,9 +753,13 @@ pub fn serve<'s>(
                         wire::USE_NOT
                     };
                     choice_settled = true;
+                    // Chosen now, or the default: no longer anyone's stand-in.
+                    if choice_use != wire::USE_NOT {
+                        standing_in = false;
+                    }
                 }
                 out[0] = wire::OK;
-                out[1] = choice_use;
+                out[1] = if standing_in { wire::USE_STANDIN } else { choice_use };
                 2
             }
             // One radio in full (`wifi hardware <radio>`): the host's facts, then the station's, and for a
@@ -1386,8 +1441,9 @@ pub fn serve<'s>(
                 } else {
                     out[9..15].fill(0);
                 }
-                // Whether this is the radio in use (`wire::USE_*`), for `nic-driver`'s bridge.
-                out[15] = choice_use;
+                // Whether this is the radio in use (`wire::USE_*`), for `nic-driver`'s bridge - a stand-in
+                // answers `USE_STANDIN`, and the bridge stays on it as on the radio in use.
+                out[15] = if standing_in { wire::USE_STANDIN } else { choice_use };
                 16
             }
             (wire::OP_NET_TX, Some(session)) => {
