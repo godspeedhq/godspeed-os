@@ -1,6 +1,6 @@
 # 79. The USB WiFi dongle sometimes joins, transmits, and decrypts nothing it receives
 
-**Status: OPEN - FIX BUILT 2026-10-07 (`docs/wifi-usb.md` 43: the key store laid out as rtlwifi lays it out), awaiting the Pi 2 card. Found 2026-10-07 on the T630 (`docs/wifi-usb.md` 39), seen on the Pi 2 the same day (42).**
+**Status: CLOSED 2026-10-07 - fixed by laying out the key store as rtlwifi does (`docs/wifi-usb.md` 43); about nineteen fresh joins on the Pi 2 since, none refused (45, 46). Found the same day on the T630 (39) and the Pi 2 (42).**
 
 ## What is seen
 
@@ -56,3 +56,27 @@ About four in fifteen. The same instance's `wifi radio off` / `on` rejoin has ne
 
 **Workaround:** none established. `wifi radio powercycle` brings up a new instance, which usually works;
 that is an observation over fifteen joins, not a fix.
+
+## Post-mortem (2026-10-07)
+
+**The cause was where the keys sat, not whether they were written.** This driver had followed rtl8xxxu:
+every key in the first free CAM entry - pairwise in 0, group in 1 at the BSSID with a group flag - and
+`SECURITY_CFG` 0xcf, which turns the default keys on for unicast as well as broadcast. rtlwifi, Realtek's
+own driver for the family, puts a group key in the entry its key id names, at the broadcast address, the
+pairwise key in entry 4 at the peer, and sets 0xcc, default keys for broadcast only. This access point's
+group key id is 2.
+
+**What the evidence showed:** after the change, four fresh joins on the first card and about fifteen on
+the operator's physical-chaos card - powercycles, pulls mid-download, replugs on both hub ports - every one
+logged entries 4 and 2 and 0xcc, and not one frame was refused, to us or to a group. Before it, about four
+joins in fifteen refused everything and every working join refused at least one group frame.
+
+**What is NOT shown, said plainly:** why the old layout failed only sometimes for unicast. Group frames
+missing entry 2 is certain from the layouts; the all-frames failure was intermittent under the same
+layout and its mechanism was never observed, because the CAM cannot be read back (rtlwifi has no read
+either, and this driver's attempt read the same word for different entries). The fix is the vendor's
+layout and the evidence is the joins after it. If a refusal ever returns, the receive path now says
+whether it was to us or to a group, which is the first question.
+
+**What it cost to find:** a CAM read-back that was not reading the CAM (removed rather than left logging
+a non-fact), and two wrong narrowings - `xhci`, then the key file - each refuted by the next card.
