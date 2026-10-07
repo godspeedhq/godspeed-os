@@ -2821,3 +2821,10 @@ enough distinct tasks.
 **Prediction, Pi 2, the same card as before:** `selfcheck` with no failures from a refused spawn; then a
 short `chaos max-carnage 100` whose report shows few refused spawns and not the "none ran" note, and no
 `arena is full` line in the log.
+
+**The card's run (Pi 2, 2026-10-07), the chaos half.** `loader selftest's page table returned` at boot.
+`chaos max-carnage 1000`: 6726 kills, no kernel panic, every service back, the dongle receiving
+afterwards; report `1000 spawns (999 refused)` - and every refusal in the kernel log is `rejected: already
+running`, the by-design one (the first `mem-pressure` runs and holds memory; later ones are refused by
+name). No `FrameAllocFailed`, no `arena is full` - against 1799 arena refusals on the same card before the
+change. `selfcheck` not yet run on this image.
