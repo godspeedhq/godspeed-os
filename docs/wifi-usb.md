@@ -2043,3 +2043,34 @@ was the plug being pulled or the dongle dropping off the bus, this log cannot sa
 bring-ups whose download is in the logs kept, it has failed in 4 of 10. One more fault: during a failed bring-up, `wifi
 hardware` showed the dongle as `usb  ?  ?  down`. Its chip and bus were unknown even though the driver
 had identified the chip. This fault and the dead repair are the next work on this host.
+
+## 34. The keyboard put on the 10 ms poll by a report its interrupt had not been taken for yet (2026-10-07) - fixed, not yet on hardware
+
+**What was seen.** On every Pi 4 run since the dongle arrived, about a second after the keyboard is
+bound, `xhci` logs `waking on interrupts (MSI) - not polling` and then `a HID report arrived with no
+interrupt - polling input at the 10ms tick`. From then on it wakes every 10 ms for the rest of the
+session, on a controller whose interrupts demonstrably work: the dongle's frames arrive on them.
+
+**Why.** `xhci` decided that interrupts do not carry input the first time it found a keyboard report on
+a pass that the interrupt itself had not woken. That is not evidence. The pass may have been woken by
+another message on the same endpoint, such as one of `wifi-usb`'s requests, which are constant during
+its bring-up, or a block request. The report's own interrupt is then still queued behind that message,
+and the one-message drain took it without noting it. The second site was worse: a report that a hub
+probe's synchronous wait had consumed also counted, though it says nothing about interrupts at all. One
+such report set the poll for good.
+
+**The fix.**
+- Only a pass whose wait ran out its whole deadline, and found a report waiting, counts as a report no
+  interrupt announced.
+- An interrupt message taken from the queue behind the waking message counts as this pass's interrupt.
+- A report consumed by a hub probe counts for nothing.
+- Three timed-out finds in a row switch input to the 10 ms poll. Sixteen interrupt deliveries in a row
+  switch it back (`16 HID reports in a row came on interrupts - waiting on them again`). Either switch is
+  logged, up to four times.
+- The cost on a machine whose interrupts really do not cover its HID (the T630 booted single-core, with
+  `0 MSI` in its heartbeat) is three slow keystrokes instead of one before the poll engages.
+
+**Prediction, Pi 4, keyboard and dongle:** no `polling input at the 10ms tick` line, and the heartbeat's
+`fast` passes far fewer than its `idle` ones while nobody types. The previous run's heartbeat read `14275
+fast/4703 idle`. Typing feels the same. **Refuted by:** the polling line appearing anyway, which would
+mean three reports really were found by timed-out waits, or by typing lag.

@@ -4201,6 +4201,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Was THIS pass woken by an interrupt? Declared out here because the harvest sites are far
         // below the wait and `is_irq` does not reach them.
         let mut irq_this_pass = false;
+        // Did THIS pass's wait run out its whole deadline? Only then is a report found waiting evidence
+        // that no interrupt announced it. A pass woken by any other message - the dongle's driver, a
+        // block request - can find the report with its interrupt still queued BEHIND the message that
+        // woke us. On the Pi 4, with `wifi-usb` sending requests all through its bring-up, that is
+        // what put the keyboard on the 10 ms poll for the rest of every session, on a controller whose
+        // interrupts work (docs/wifi-usb.md 34).
+        let mut pass_timed_out: bool;
+        // Consecutive reports found by a timed-out pass, and consecutive reports an interrupt
+        // delivered. Three of the first switch input to polling; sixteen of the second switch it back.
+        // One of either is a race, not a measurement.
+        let mut hid_quiet_hits = 0u32;
+        let mut hid_irq_hits = 0u32;
+        let mut hid_mode_switches = 0u32;
         let mut int_idx = [0usize; MAX_HID];
         let mut int_cycle = [1u32; MAX_HID];
         let mut need_queue = [true; MAX_HID];
@@ -4507,7 +4520,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Not a warning: the driver has RECOVERED the latency, and says so with the reason.
                 // Without this line a machine at the fast floor and a machine at the slow one look
                 // identical in the log, which is how the 500 ms floor survived being shipped.
-                ctx.log("xhci: a HID report arrived with no interrupt - polling input at the 10ms tick (interrupts are not covering this controller's HID)");
+                if hid_mode_switches <= 4 {
+                    ctx.log("xhci: 3 HID reports in a row were found by a wait that ran out, with no interrupt - polling input at the 10ms tick (interrupts are not covering this controller's HID)");
+                }
                 hid_poll_noted = true;
             }
             if irq_seen && !irq_noted {
@@ -4616,6 +4631,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if is_irq { msi_count = msi_count.saturating_add(1); }
             // Assigned, not or-ed: this is a property of the pass, and it must CLEAR on a timeout.
             irq_this_pass = is_irq;
+            pass_timed_out = woke.is_none();
             // Woken by a message that is NOT an interrupt - i.e. a block request, or anything else
             // addressed to this endpoint. Counted because the arithmetic says something is: the idle
             // deadline is HUB_POLL_MS (2 wakes/sec) and MSI runs ~5/sec, yet the loop turns ~39
@@ -4705,6 +4721,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             while served < 1 {
                 let Some(m) = ctx.try_recv() else { break };
                 served += 1;
+                // An interrupt queued behind the message that woke this pass is still this pass's
+                // interrupt: the reports the drain below finds are the ones it announced.
+                if msi_vector.is_some_and(|v| m.payload_bytes() == [v]) {
+                    irq_this_pass = true;
+                    msi_count = msi_count.saturating_add(1);
+                }
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
                 match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
                     radio::Served::Reenumerate => {
@@ -4760,7 +4782,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         } else if let Some(d) = devs[..ndev].iter().position(|h| h.slot == slot_id) {
                             deliver_hid_report(&ctx, &dma, d, &devs, &mut kb_last,
                                                &mut kb_rep, &mut kb_caps, &mut mouse);
-                            if !irq_this_pass { hid_needs_poll = true; }   // harvested without an interrupt: polling is load-bearing here
+                            // Whether interrupts are carrying input, decided by what each report
+                            // shows (see `pass_timed_out`): found by a wait that ran out, or delivered
+                            // by an interrupt. A report on a pass woken by some other message, with no
+                            // interrupt seen, shows neither and counts for nothing.
+                            if irq_this_pass {
+                                hid_quiet_hits = 0;
+                                hid_irq_hits = hid_irq_hits.saturating_add(1);
+                                if hid_needs_poll && hid_irq_hits >= 16 {
+                                    hid_needs_poll = false;
+                                    hid_poll_noted = false;
+                                    hid_mode_switches += 1;
+                                    if hid_mode_switches <= 4 {
+                                        ctx.log("xhci: 16 HID reports in a row came on interrupts - waiting on them again, not polling input");
+                                    }
+                                }
+                            } else if pass_timed_out {
+                                hid_irq_hits = 0;
+                                hid_quiet_hits = hid_quiet_hits.saturating_add(1);
+                                if !hid_needs_poll && hid_quiet_hits >= 3 {
+                                    hid_needs_poll = true;
+                                    hid_mode_switches += 1;
+                                }
+                            }
                             need_queue[d] = true;
                         } else if devs[..ndev].iter().any(|h| h.hub_slot == slot_id) {
                             // A hub's completion, dequeued here with no probe waiting - it arrived
@@ -5441,7 +5485,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if devs[k].slot < 32 && eaten.have & (1 << devs[k].slot) != 0 {
                         deliver_hid_report(&ctx, &dma, k, &devs, &mut kb_last,
                                            &mut kb_rep, &mut kb_caps, &mut mouse);
-                        if !irq_this_pass { hid_needs_poll = true; }   // harvested without an interrupt: polling is load-bearing here
+                        // Not evidence either way: a hub probe's own wait consumed this completion
+                        // before its interrupt could be taken, which says nothing about whether
+                        // interrupts carry input. It used to switch input to polling for good.
                         need_queue[k] = true;
                     }
                 }
