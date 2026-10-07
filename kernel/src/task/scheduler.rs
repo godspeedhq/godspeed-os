@@ -361,6 +361,7 @@ pub fn scan_timed_wakes() {
             wake_by_slot(slot, 0);
         }
     }
+    lost_wake_check(now);
 }
 
 /// Saved user-space RSP for each ring-3 task.  Updated whenever the task is
@@ -635,6 +636,56 @@ static WOKEN_CORE: [portable_atomic::AtomicU64; MAX_TASKS] =
     [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
 /// 100 ms, in 10 ms BSP ticks: well above a scheduling round on a core with a handful of tasks.
 const WAKE_GAP_SAY_TICKS: u64 = 10;
+
+/// LOST WAKE, caught where it sits (backlog/66, 2026-10-07). The Pi 4 log with `nic-driver` timing its
+/// own work showed every late request answered 1-2 ms after it was TAKEN, and taken ~30 ms after
+/// net-stack's one-second wait gave up - with no wake-to-run gap reported. So the request sat in the
+/// queue for a second while nothing woke the receiver. This looks for exactly that, from the BSP tick: a
+/// task `BlockedOnRecv` on its own endpoint (not in a `Call`, which legitimately leaves other messages
+/// queued), with messages queued there, for `STUCK_SAY_TICKS` or more - and says whether the routing
+/// entry still records it as the blocked receiver. Recorded: a wake was lost after registration. Not
+/// recorded: the registration itself was lost. Diagnostic; it goes when the fault does.
+static STUCK_SINCE: [portable_atomic::AtomicU64; MAX_TASKS] =
+    [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
+static STUCK_SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// 50 ms in BSP ticks: far longer than any wake takes to land, far shorter than net-stack's second.
+const STUCK_SAY_TICKS: u64 = 5;
+/// Set in `STUCK_SINCE` once an episode has been said, so it is said once.
+const STUCK_SAID_BIT: u64 = 1 << 63;
+
+fn lost_wake_check(now: u64) {
+    if now % 2 != 0 { return; }
+    for slot in 0..MAX_TASKS {
+        let blocked = TASK_VALID[slot].load(Ordering::Acquire)
+            && TaskState::from(TASK_STATE[slot].load(Ordering::Acquire)) == TaskState::BlockedOnRecv
+            && crate::ipc::routing::call_await_endpoint(slot) == 0;
+        let view = if blocked {
+            ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed))
+                .and_then(crate::ipc::routing::receiver_view)
+        } else {
+            None
+        };
+        let Some((queued, rx)) = view.filter(|v| v.0 > 0) else {
+            STUCK_SINCE[slot].store(0, Ordering::Relaxed);
+            continue;
+        };
+        let since = STUCK_SINCE[slot].load(Ordering::Relaxed);
+        if since == 0 {
+            STUCK_SINCE[slot].store(now, Ordering::Relaxed);
+            continue;
+        }
+        if since & STUCK_SAID_BIT != 0 || now.saturating_sub(since) < STUCK_SAY_TICKS { continue; }
+        STUCK_SINCE[slot].store(since | STUCK_SAID_BIT, Ordering::Relaxed);
+        let n = STUCK_SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 20 || n % 64 == 0 {
+            crate::kprintln!(
+                "sched: '{}' is blocked in recv with {} message(s) queued on its endpoint for {} ms - recorded as its receiver: {}; wake pending: {} (x{})",
+                task_name(slot), queued, (now - since) * 10,
+                match rx { Some(r) if r == slot => "yes", Some(_) => "ANOTHER slot", None => "NO" },
+                TASK_WAKE_PENDING[slot].load(Ordering::Relaxed), n);
+        }
+    }
+}
 
 /// Called on every switch to `to`: if a wake made it Ready, how long ago (see `WOKEN_AT`).
 fn wake_gap_check(cid: usize, to: usize) {
