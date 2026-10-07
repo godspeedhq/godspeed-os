@@ -2576,7 +2576,7 @@ understand the USB 3 hub class, NOT yet checked against Linux's hub driver or th
 hub needs before it can route anything below it by route string. Either would leave a SET_ADDRESS that
 never reaches the device.
 
-**Open, recorded rather than fixed here (26.7):** USB3 hubs on the Wyse - decide SuperSpeed by the port's
+**Open, recorded rather than fixed here (26.7), as `backlog/78`:** USB3 hubs on the Wyse - decide SuperSpeed by the port's
 speed, not by which descriptor answers; SET_HUB_DEPTH, read from the USB 3 spec and Linux's hub driver
 before it is written; and the general fault under it, that a command which never completes blocks every
 command after it, for which the spec's answer is Command Abort (xHCI 4.6.1.2). No QEMU device emulates a
