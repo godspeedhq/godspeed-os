@@ -98,6 +98,7 @@ fn core_still_using(cid: usize, slot: usize) -> bool {
 /// killer's wait ignores it.
 #[inline]
 fn core_release_current(cid: usize, to: usize) {
+    wake_gap_check(cid, to);
     let leaving = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
     // ORDER MATTERS AND SO DOES SeqCst: the killer must not be able to observe the release without
     // also observing the claim, or it concludes nobody is using a task this core is still standing on.
@@ -614,6 +615,67 @@ static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
 /// caller re-check. Same race exists for a plain `recv`, and the same flag covers it.
 static TASK_WAKE_PENDING: [core::sync::atomic::AtomicBool; MAX_TASKS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TASKS];
+
+/// WAKE-TO-RUN, the instrument `backlog/66` names as its next measurement. On the Pi 4 a request to
+/// `nic-driver` is received about a second late, and only when the sender's RETRY arrives - a wake lost
+/// somewhere between `send` and the receiver running, on the same core. Two places it can be lost, and
+/// they need different fixes: the task was made Ready and not picked (a `pick_next` / idle question), or
+/// it was never made Ready (an enqueue / `blocked_receiver` question). This stamps the BSP tick when
+/// `wake_by_slot` makes a task Ready and checks it when the task next runs (`core_release_current`): a gap
+/// of `WAKE_GAP_SAY_TICKS` or more is said, with the halts its core took in idle meanwhile. A long gap
+/// says the first; NO line while the late answers recur says the second. Diagnostic; it goes when the
+/// fault does.
+static WOKEN_AT: [portable_atomic::AtomicU64; MAX_TASKS] =
+    [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
+static WOKEN_HALTS: [portable_atomic::AtomicU64; MAX_TASKS] =
+    [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
+static WAKE_GAPS_SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// The core the stamped task runs on, recorded with the stamp so the idle check needs no `TASK_CORE` read.
+static WOKEN_CORE: [portable_atomic::AtomicU64; MAX_TASKS] =
+    [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
+/// 100 ms, in 10 ms BSP ticks: well above a scheduling round on a core with a handful of tasks.
+const WAKE_GAP_SAY_TICKS: u64 = 10;
+
+/// Called on every switch to `to`: if a wake made it Ready, how long ago (see `WOKEN_AT`).
+fn wake_gap_check(cid: usize, to: usize) {
+    if to >= MAX_TASKS { return; }
+    let w = WOKEN_AT[to].swap(0, Ordering::Relaxed);
+    if w == 0 { return; }
+    let gap = (monotonic_ticks() + 1).saturating_sub(w);
+    if gap < WAKE_GAP_SAY_TICKS { return; }
+    let n = WAKE_GAPS_SAID.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 20 || n % 64 == 0 {
+        let halts = core_idle_halts(cid).saturating_sub(WOKEN_HALTS[to].load(Ordering::Relaxed));
+        crate::kprintln!(
+            "sched: '{}' ran {} ms after a wake made it Ready (core {}, which halted in idle {} time(s) meanwhile) (x{})",
+            task_name(to), gap * 10, cid, halts, n);
+    }
+}
+
+/// The direct check behind `wake_gap_check`: `pick_next` has just found nothing on `cid`, so no task
+/// on this core may be Ready. One that is - stamped by a wake and still Ready - is the "made Ready and
+/// not picked" case caught in the act, and said once per task per wake. If this never fires while
+/// `wake_gap_check` reports gaps, the gaps are the instrument's, not the scheduler's.
+static IDLE_READY_SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn idle_with_ready_check(cid: usize) {
+    for slot in 0..MAX_TASKS {
+        // Atomics only: the task's core is the one its wake recorded (`WOKEN_CORE`).
+        if WOKEN_AT[slot].load(Ordering::Relaxed) == 0 { continue; }
+        if !TASK_VALID[slot].load(Ordering::Acquire) { continue; }
+        if TaskState::from(TASK_STATE[slot].load(Ordering::Acquire)) != TaskState::Ready { continue; }
+        if WOKEN_CORE[slot].load(Ordering::Relaxed) != cid as u64 { continue; }
+        // A wake younger than the threshold is the benign race - it landed between `pick_next`'s answer
+        // and this check, and the idle path re-checks before it halts. Only a wake that has waited is news.
+        let age = (monotonic_ticks() + 1).saturating_sub(WOKEN_AT[slot].load(Ordering::Relaxed));
+        if age < WAKE_GAP_SAY_TICKS { continue; }
+        let n = IDLE_READY_SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 20 || n % 64 == 0 {
+            crate::kprintln!(
+                "sched: core {} going idle with '{}' Ready on it since a wake {} ms ago - pick_next did not return it (x{})",
+                cid, task_name(slot), age * 10, n);
+        }
+    }
+}
 
 /// How many times this core has HALTED in the idle path.
 ///
@@ -1461,6 +1523,7 @@ pub fn run(core_id: u32) -> ! {
                 }
             }
             None => {
+                idle_with_ready_check(cid);
                 // Phase 2a - SLOW THE IDLE TICK (docs/power.md §14). With no ready tasks this core
                 // has nothing to preempt, yet its timer still fires ~100x/s purely to re-arm
                 // itself. Re-arm at ~1 s instead, so it wakes ~1x/s and sleeps deep in between.
@@ -2213,6 +2276,20 @@ pub fn wake_by_slot(slot: usize, result: i64) {
 
             let task_core = TASK_CORE[slot] as usize;
             let my_core   = current_core_id();
+            // The earliest wake since it last ran (`WOKEN_AT`); a second wake before it runs keeps the first.
+            // ONLY a wake out of a BLOCKED state: one that reaches a task still Running (between its
+            // registration and `block_and_reschedule`, the `TASK_WAKE_PENDING` race) leaves it running
+            // with no switch to clear the stamp, and the next real switch would report a gap that never
+            // was - which is what this instrument's first QEMU boot printed for `events`.
+            // `current` is the state the CAS above moved it out of (or Ready, if it already was).
+            let from_blocked = matches!(TaskState::from(current), TaskState::BlockedOnRecv | TaskState::BlockedOnSend);
+            if from_blocked && WOKEN_AT[slot]
+                .compare_exchange(0, monotonic_ticks() + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                WOKEN_HALTS[slot].store(core_idle_halts(task_core), Ordering::Relaxed);
+                WOKEN_CORE[slot].store(task_core as u64, Ordering::Relaxed);
+            }
 
             if task_core != my_core {
                 // Cross-core wakeup: the target core's pick_next may be deep into

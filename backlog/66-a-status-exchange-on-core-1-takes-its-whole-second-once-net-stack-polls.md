@@ -177,3 +177,16 @@ while every radio exchange it made was answered within 2 ms. With the cable in, 
 the late answer is on the radio-bridged path on core 1 (which `nic-driver` shares with `net-stack`,
 `block-driver` and `fs`), and DNS is where it shows because a lookup is one request and one reply with
 nothing to retry it but `net-stack`'s own bound. Still parked; `docs/wifi-usb.md` 49 has the split.
+
+**2026-10-07, the instrument this item named, built.** `kernel/src/task/scheduler.rs`: `wake_by_slot` stamps
+the BSP tick when it moves a task out of a BLOCKED state (`WOKEN_AT`), and every switch to a task
+(`core_release_current`) checks the stamp - `sched: '<task>' ran N ms after a wake made it Ready (core C,
+which halted in idle H time(s) meanwhile)` for 100 ms or more. Beside it, the direct test: when
+`pick_next` finds nothing and a task on that core has been Ready since a wake 100 ms or more ago, `sched:
+core C going idle with '<task>' Ready on it ... - pick_next did not return it`. The first QEMU boots taught
+two corrections before it could be trusted: a wake that reaches a task still Running leaves no switch to
+clear the stamp (now stamped only out of a blocked state), and a wake landing between `pick_next`'s
+answer and the idle check is benign (now filtered by age). In QEMU one boot in three showed `events`
+Ready 2 s after a wake on an idle core, with no idle-with-Ready line - not yet explained, and not yet
+seen on the hardware. The Pi 4 card: cable out, `net dns google.com` until it fails, and read which
+line, if either, comes with the late answer.
