@@ -1,8 +1,6 @@
 # 79. The USB WiFi dongle sometimes joins, transmits, and decrypts nothing it receives
 
-**Status: OPEN - found 2026-10-07 on the T630 (`docs/wifi-usb.md` 39), seen on the Pi 2 the same day
-(42). Intermittent, cause unknown. The dongle's driver is new on the branch it was found on, so this is a
-fault of new code, not a regression of `main`.**
+**Status: OPEN - FIX BUILT 2026-10-07 (`docs/wifi-usb.md` 43: the key store laid out as rtlwifi lays it out), awaiting the Pi 2 card. Found 2026-10-07 on the T630 (`docs/wifi-usb.md` 39), seen on the Pi 2 the same day (42).**
 
 ## What is seen
 

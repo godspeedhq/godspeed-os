@@ -2652,3 +2652,43 @@ divergence from rtl8xxxu where the value is set (26.14).
 3. Across the boot's rejoin, five `wifi radio powercycle`s and one replug, each followed by `ping
    8.8.8.8`: every one answers, and no `did not decrypt ... to us`. **Refuted by** a join with `to us`
    refusals: then the pairwise lookup is what fails, and the split says so.
+
+## 44. USB3 hubs: recognised by their protocol, told their depth, their devices addressed at SuperSpeed (2026-10-07) - for `backlog/78`; built, not yet on hardware
+
+`backlog/78`: on the Wyse, after a dongle unplug re-enumerates, the walk reaches the device behind the
+USB3 hub on root port 15, its Address Device never completes, and the command ring stops behind it -
+taking the keyboard's hub repairs with it. Read against Linux's hub driver (`build/rtl/usb_core_hub.c`
+and `usb_core_hub.h`, fetched from master), the walk got three things wrong for a USB3 hub:
+
+- **It decided "SuperSpeed" by which descriptor answered.** It asked for the USB2 hub descriptor (0x29)
+  and tried the USB3 one (0x2A) only when that gave no ports. The Pi 4's VL805 answers nothing to 0x29;
+  the Wyse's Realtek 0bda:0415 answers it with two ports, so it was walked as USB2. Linux decides by the
+  device descriptor's protocol (`hub_is_superspeed`: bDeviceProtocol 3). Now so does this - in addition
+  to the old test, which still finds the VL805.
+- **It read a USB3 hub port's status with USB2 bits.** Bit 9 is low speed on a USB2 hub and PORT_POWER on
+  a USB3 one, set on every powered port, so every device behind a USB3 hub was taken for low speed and
+  addressed at speed 2 with a transaction translator. A USB3 hub's ports carry no speed bits; Linux
+  (`hub_port_reset`) gives the device SuperSpeed from the hub alone. Now so does this.
+- **It never sent Set Hub Depth.** A USB3 hub routes by the route string and must be told its tier first;
+  Linux's `hub_activate` sends class request 12 after Set Configuration with the hub's level less one.
+  Now sent, depth 0, because this walk runs on hubs on root ports only.
+
+**Checked:** the x86 and Pi 4 images build and x86 passes every gate. QEMU, the USB2 hub path unchanged
+(a hub with a keyboard behind it, a stick on a root port: all addressed, the disk read);
+`scripts/cross_isa.py` 12 of 12. No QEMU device is a USB3 hub, so the new path itself has run nowhere.
+
+**Not done, and why:** Command Abort (xHCI 4.6.1.2), the general answer to a command that never
+completes. With the hub handled as what it is, nothing known produces such a command, so an abort path
+written now could not be exercised by any card; it would be code nobody has seen run.
+
+**Prediction, Wyse, the same order as section 41's card (this image also carries section 43's change,
+whose own card runs on the Pi 2):**
+1. At boot: `USB3 SuperSpeed hub on port 10` and `on port 15`, each followed by `Set Hub Depth 0 ... OK`.
+2. With the dongle unplugged (the re-enumeration that reaches port 15's port 2): the device there
+   addresses - most likely the boot stick, as USB mass storage - and there is no `no completion` on any
+   command.
+3. Then the keyboard unplugged and replugged, twice: seen leaving and coming back each time, with the
+   dongle still out.
+4. The dongle plugged back in: bound, joined, `ping` over it.
+**Refuted by** `no completion` behind a USB3 hub again: then the device needs something more than these
+three, and the next reading is its port status after reset, logged in full.

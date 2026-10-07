@@ -1,8 +1,6 @@
 # 78. A device behind the Wyse's USB3 hub wedges `xhci`'s command ring, and the keyboard is lost until a root port changes
 
-**Status: OPEN - found 2026-10-07 on the Dell Wyse 5070 (`docs/wifi-usb.md` 41), read in the code, not
-fixed. Predates the branch it was found on: the walk never reached the device while the hub's own root
-port could not be addressed, which `41e98639` fixed.**
+**Status: OPEN - FIX BUILT 2026-10-07 (`docs/wifi-usb.md` 44: USB3 hubs recognised by protocol, Set Hub Depth sent, their devices addressed at SuperSpeed), awaiting the Wyse card. Found 2026-10-07 on the Dell Wyse 5070 (`docs/wifi-usb.md` 41).**
 
 ## What the operator saw
 

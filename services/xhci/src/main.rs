@@ -2969,7 +2969,9 @@ fn enumerate_one(
     //
     // The retry consumes another 3 TRBs of the EP0 ring, which is why `hoff` starts past it below.
     let mut ss_hub = false;
+    let mut retried = false;
     if nports == 0 {
+        retried = true;
         let ok2 = control(
             dma, mmio, dboff, ir0, slot, dev_idx, 176,
             ev_idx, ev_cycle, 0xA0, 6, 0x2A << 8, 0, 12, DATA_BUF_OFF,
@@ -2978,6 +2980,15 @@ fn enumerate_one(
             nports = dma.read8(DATA_BUF_OFF + 2);
             ss_hub = nports != 0;
         }
+    }
+    // AND BY ITS PROTOCOL, as Linux decides it (`hub_is_superspeed`: bDeviceProtocol 3). The descriptor a
+    // hub answers is not a reliable test: the Wyse's Realtek USB3 hub (0bda:0415, on a SuperSpeed root
+    // port) answers the USB2 descriptor with its port count, so it was walked as a USB2 hub - its ports'
+    // status read with USB2 bits, its device addressed at the wrong speed, and no Set Hub Depth sent
+    // (`docs/wifi-usb.md` 44). The two descriptors agree on the fields read here, so which one answered
+    // does not matter once the hub is known for what it is.
+    if dproto == 3 {
+        ss_hub = true;
     }
     let whubchar = dma.read16(DATA_BUF_OFF + 3); // wHubCharacteristics
     // A SuperSpeed hub has NO transaction translator - a TT exists to carry low/full-speed traffic
@@ -3009,7 +3020,21 @@ fn enumerate_one(
     // bounded so a many-port hub cannot overrun the one-page ring.
     // Past the hub-descriptor read, and past the SuperSpeed retry if one was issued - each is 3 TRBs
     // of 16 bytes. Overlapping them would rewrite a TRB the controller may not have consumed.
-    let mut hoff = if ss_hub { 224usize } else { 176usize };
+    let mut hoff = if retried { 224usize } else { 176usize };
+    // SET HUB DEPTH, for a SuperSpeed hub: it routes by the route string, and needs to be told which tier
+    // of it is its own before it can send anything to a port below it. USB 3 hub class request 12, sent
+    // after Set Configuration as Linux's `hub_activate` sends it, with the hub's level less one - 0 here,
+    // because this walk runs on a hub on a ROOT port. Without it the device behind the Wyse's USB3 hub
+    // never answered its Address Device, and the command ring stopped behind it.
+    if ss_hub {
+        let ok = control(
+            dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0x20, 12, 0, 0, 0, 0,
+        );
+        hoff += 32;
+        ctx.log_fmt(format_args!(
+            "xhci: Set Hub Depth 0 on the SuperSpeed hub on port {} - {}",
+            port, if ok { "OK" } else { "FAILED (its downstream ports may not route)" }));
+    }
     for dp in 1..=nports {
         if hoff + 32 > 0xF00 {
             break;
@@ -3172,7 +3197,15 @@ fn enumerate_one(
         let pst = dma.read16(DATA_BUF_OFF);
         // Port-status speed bits: bit 9 = low-speed, bit 10 = high-speed; neither = full-speed.
         // Map to the xHCI slot-context speed value (1=Full, 2=Low, 3=High).
-        let dspeed = if pst & (1 << 9) != 0 {
+        //
+        // NOT ON A SUPERSPEED HUB. Its port status has no speed bits - every device on it is SuperSpeed
+        // (4), as Linux's `hub_port_reset` sets it from the hub alone - and its bit 9 is PORT_POWER, set on
+        // every powered port. Read as USB2 bits, every device behind a USB3 hub was "low-speed": addressed
+        // at speed 2 with a transaction translator a SuperSpeed hub does not have, which the Wyse's
+        // controller never answered (`docs/wifi-usb.md` 44).
+        let dspeed = if ss_hub {
+            4
+        } else if pst & (1 << 9) != 0 {
             2
         } else if pst & (1 << 10) != 0 {
             3
