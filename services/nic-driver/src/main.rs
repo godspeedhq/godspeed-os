@@ -31,7 +31,7 @@
 
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
+use godspeed_sdk::{CapHandle, ServiceContext, Message, Mmio, Dma};
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
 ///
@@ -351,6 +351,15 @@ fn rtl_arm_rx(arena: &Dma, i: usize) {
     arena.write32(d, o1);
 }
 
+/// Answer a request on `reply_cap` and give the capability back - both halves, every time, so a reply
+/// slot cannot leak (CLAUDE.md 8.5). `gs::ipc::reply` is the same call on a `gs` capability; the
+/// radio bridge keeps the raw handle a held request arrived with (`radio.rs`), so this serve loop
+/// answers by handle. The outcome is counted, never discarded (`note_reply`).
+fn answer(ctx: &ServiceContext, reply_cap: CapHandle, body: &[u8], fails: &mut u32) {
+    note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(body)), ctx, fails);
+    ctx.remove_cap(reply_cap);
+}
+
 /// Realtek RTL8168 C+ TX/RX (Phase 4, STAGE B): set up the C+ descriptor rings in the DMA arena, enable
 /// the receiver + transmitter, and serve the frame interface FOR REAL - transmit each request frame and
 /// hand back whatever arrives on the wire (§8.2, mirroring the e1000 serve loop with RTL8168 registers
@@ -423,9 +432,31 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     // All three look identical from outside, and they are three different bugs.
     let mut empty_drains = 0u32;
     let mut rx_silence_logged = false;
+
+    // THE RADIO AS THE LINK'S SECOND BACKEND (`docs/wifi-usb.md` 39): the USB WiFi dongle's service,
+    // `wifi-usb`, reached over the same frame ops as on the Pi 2, Pi 4 and VisionFive, with the same rule
+    // - the cable always wins. Included by path, as those three include it. A PC has no onboard radio, so
+    // there is no second radio to follow (`Radio::new`, not `with_other`).
+    #[path = "radio.rs"]
+    mod radio;
+    use radio::{Carrier, Radio};
+    let mut radio = Radio::new("wifi-usb");
+    let mut carrier = Carrier::None;
+    let mut radio_tx_fail: u32 = 0;
     loop {
-        let req = ctx.recv();
-        let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        // A REQUEST THE RADIO WAIT KEPT IS SERVED FIRST - it arrived before anything the recv below could
+        // return (`Radio::held`).
+        let (req, reply_cap) = match radio.take_held() {
+            Some(h) => h,
+            None => {
+                let req = godspeed::ipc::recv(ctx);
+                match godspeed::ipc::take_sent_cap(ctx) { Some(c) => (req, c.handle()), None => continue }
+            }
+        };
+        // THE CABLE, read live on every request: PHYSTATUS is one register read, not the MDIO
+        // transactions GENET pays, so nothing is gained by remembering it. A `chaos link-flap` override
+        // counts as the cable, so a forced DOWN hands the frames to the radio as an unplug would.
+        let cable = force_link.unwrap_or(mmio.read8(RTL_PHYSTATUS) & 0x02 != 0);
         // ACK any latched RX/TX interrupt status before servicing. We POLL (IMR=0), and an UNCLEARED RDU
         // (Rx Descriptor Unavailable) or FOVW (Rx FIFO Overflow) HALTS the RTL8168 receiver - `net stats`
         // showed ISR=0x95 (RDU+TDU latched). But acking ALONE does not un-halt it once the ring actually
@@ -442,6 +473,15 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         }
         // [3] STATUS query (the `net` nic-mac diagnostic) - answer the MAC, do NOT treat it as a frame.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
+            // THE CABLE OUT: the nine-byte answer every radio backend gives (`radio::status`) - the
+            // radio's address and link while it is joined, and its last byte naming the carrier, which is
+            // how `net-stack` and `net` tell the radio carries the frames. The chip's tally below is the
+            // cable's, so it is not sent while the cable carries nothing.
+            let rs = radio::status(&ctx, &mut radio, cable, *mac, &mut carrier);
+            if !cable {
+                answer(ctx, reply_cap, &rs, &mut reply_fails);
+                continue;
+            }
             // Fresh 15-byte status: reset_ok, mac(6), CURRENT link, last-TX-done, last-RX len, TX/RX
             // counts. The link is read LIVE (it negotiates over a few seconds after reset).
             // 32-byte NIC hardware status (Layer-1 ground truth). [0] reset_ok, [1..7] mac, [7] link,
@@ -489,15 +529,28 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             s[24..28].copy_from_slice(&rx_brd.to_le_bytes());
             s[28..30].copy_from_slice(&rx_er.to_le_bytes());
             s[30..32].copy_from_slice(&miss.to_le_bytes());
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &s, &mut reply_fails);
+            continue;
+        }
+
+        // [10] WHICH ACCESS POINT carries the radio's link - asked only after STATUS has said the radio
+        // does. Before the bridge this backend took the one byte for a frame and sent it.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 10 } {
+            let out = radio::peer(&ctx, &mut radio, cable);
+            answer(ctx, reply_cap, &out, &mut reply_fails);
             continue;
         }
 
         // [4] RX-ONLY: poll the RX ring for ONE frame and return it (or empty) - NO drain, NO TX. Lets
         // net-stack collect frames AFTER a single query TX, so a reply arriving behind stray broadcasts
         // (mDNS etc. on a busy LAN) is caught WITHOUT re-transmitting - a re-TX drains+discards the reply.
+        // With the cable out, the frame is the radio's.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 4 } {
+            if !cable {
+                let n = radio.rx(&ctx, &mut rxbuf);
+                answer(ctx, reply_cap, &rxbuf[..n], &mut reply_fails);
+                continue;
+            }
             let mut n = 0usize;
             let mut rs = 0u32;
             while rs < RX_POLL_MAX {
@@ -514,8 +567,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 rs += 1;
             }
             if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &rxbuf[..n], &mut reply_fails);
             continue;
         }
 
@@ -523,6 +575,26 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         // poll, length-prefixed, so net-stack scans past stray broadcasts for its reply in a single
         // round-trip. Ready descriptors are drained back-to-back (no yield); when the ring is empty we
         // poll (RX_POLL_MAX total) for more to arrive - so the whole call is ONE bounded poll, not N.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 && !cable } {
+            // THE CABLE OUT: the same batch, from the radio, one frame per ask until it has none (as on
+            // the Pi 2). The room check comes BEFORE the ask, so a frame is never taken from the radio
+            // only to be dropped for lack of space.
+            let mut out = [0u8; BATCH_MSG_MAX];
+            let mut opos = 1usize;
+            let mut nfr = 0u8;
+            while (nfr as usize) < BATCH_MAX && opos + 2 + FRAME_MAX <= out.len() {
+                let n = radio.rx(&ctx, &mut rxbuf);
+                if n == 0 { break; }
+                out[opos..opos + 2].copy_from_slice(&(n as u16).to_le_bytes());
+                opos += 2;
+                out[opos..opos + n].copy_from_slice(&rxbuf[..n]);
+                opos += n;
+                nfr += 1;
+            }
+            out[0] = nfr;
+            answer(ctx, reply_cap, &out[..opos], &mut reply_fails);
+            continue;
+        }
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 } {
             let mut out = [0u8; BATCH_MSG_MAX];
             let mut opos = 1usize;   // out[0] = frame count, filled at the end
@@ -593,8 +665,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                         if phy & 0x02 != 0 { "up" } else { "DOWN" }, rx_idx));
                 }
             }
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &out[..opos], &mut reply_fails);
             continue;
         }
 
@@ -630,8 +701,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 let o = STAT_FIXED + i * 4;
                 s[o..o + 4].copy_from_slice(&opts1.to_le_bytes());
             }
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &s, &mut reply_fails);
             continue;
         }
 
@@ -644,8 +714,24 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             force_link = match req.payload_bytes()[0] { 6 => Some(false), 7 => Some(true), _ => None };
             ctx.log_fmt(format_args!("nic-driver: force-link {} (chaos link-flap)",
                 match force_link { Some(false) => "DOWN", Some(true) => "UP", None => "CLEAR (live)" }));
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1])), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &[1], &mut reply_fails);
+            continue;
+        }
+
+        // THE CABLE OUT: the frame is the radio's (`Carrier`), sent to `wifi-usb` as op 0x11, and none of
+        // the cable's receive-ring or transmit work below is done. A refusal is counted and said
+        // sparingly - a dongle that is not joined refuses every frame, correctly. One byte back, for the
+        // reason given at the end of the cable's path.
+        if !cable {
+            if !radio.tx(&ctx, req.payload_bytes()) {
+                radio_tx_fail = radio_tx_fail.saturating_add(1);
+                if radio_tx_fail == 1 || radio_tx_fail % 64 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: the radio did not send a {} byte frame (x{}) - not joined, or no answer",
+                        req.payload_bytes().len(), radio_tx_fail));
+                }
+            }
+            answer(ctx, reply_cap, &[0u8], &mut reply_fails);
             continue;
         }
 
@@ -727,8 +813,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         // the send (`validate_user_ptr` fails on `len == 0`), so the caller waits out its full
         // deadline for a reply that never left. Same defect and same fix as the transmit reply
         // further down; no caller of a transmit reads its payload.
-        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
-        ctx.remove_cap(reply_cap);
+        answer(ctx, reply_cap, &[0u8], &mut reply_fails);
     }
 }
 

@@ -374,6 +374,10 @@ mod board {
         // whose service is not running is only reacquired later, so a bridge board without the dongle's
         // driver would lose nothing by it.
         &["wifi-driver", "wifi-usb", "events"]
+    } else if cfg!(has_wifi_usb) {
+        // The PCs: no onboard radio, and the USB dongle's driver is the link's other backend, carried by
+        // the RTL8168's serve loop through the same `radio.rs` (`docs/wifi-usb.md` 39). The cable wins.
+        &["events", "wifi-usb"]
     } else {
         &["events"]
     };

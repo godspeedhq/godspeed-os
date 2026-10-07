@@ -3,11 +3,12 @@
 //! ops, and which of the cable and the radio carries `net-stack`'s frames. Moved out of `genet.rs` whole
 //! when the VisionFive's `dwmac` gained the same bridge (`docs/wifi-aic8800.md`, phase V6), so the rule -
 //! the cable always wins - and the radio's bounded exchange are written once for every board. Included by
-//! `#[path]` from each backend that uses it; see the note where `genet.rs`, `dwmac.rs` and `main.rs` (the Pi 2) include it.
+//! `#[path]` from each backend that uses it; see the note where `genet.rs`, `dwmac.rs` and `main.rs` (the Pi 2, and the RTL8168) include it.
 //!
 //! WHICH SERVICE IS THE RADIO is the backend's to say (`Radio::new`): `wifi-driver` beside GENET and
-//! `dwmac`, whose radios are on the board, and `wifi-usb` beside the Pi 2's USB ethernet, whose radio is a
-//! USB dongle (`docs/wifi-usb.md`, R6). Both answer the same frame ops through the same serve loop.
+//! `dwmac`, whose radios are on the board, and `wifi-usb` beside the Pi 2's USB ethernet and the PCs'
+//! RTL8168, whose radio is a USB dongle (`docs/wifi-usb.md`, R6 and 39). Both answer the same frame ops
+//! through the same serve loop.
 
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
 use godspeed::driver::wait::{self, Budget};
@@ -264,9 +265,14 @@ impl Radio {
                                 self.silent_run, self.restale));
                         }
                     } else {
+                        // Once, then every sixteenth, as the comment above says: on a PC with no dongle
+                        // and the cable out this is every probe, a line a second for as long as it lasts.
                         self.sendfail = self.sendfail.saturating_add(1);
-                        ctx.log_fmt(format_args!(
-                            "nic-driver: the radio was silent and its name does not resolve - {} is not running", self.name));
+                        if self.sendfail == 1 || self.sendfail % 16 == 0 {
+                            ctx.log_fmt(format_args!(
+                                "nic-driver: the radio was silent and its name does not resolve - {} is not running (x{})",
+                                self.name, self.sendfail));
+                        }
                     }
                 }
                 return None;

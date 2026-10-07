@@ -10674,8 +10674,8 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                 nic_link_up = p[7] != 0;
                 out.line(ctx, if nic_link_up { "link     up via the cable" } else { "link     down - no cable" });
             }
-            // A nine-byte answer is the Pi 4's, and its last byte says which link carries the frames
-            // (`Carrier` in nic-driver's genet backend): 1 the cable, 2 the radio, 0 neither. The cable
+            // A nine-byte answer is a backend with a radio bridge, and its last byte says which link
+            // carries the frames (`Carrier` in nic-driver's `radio.rs`): 1 the cable, 2 the radio, 0 neither. The cable
             // always wins; the radio carries the link only while the cable is out and it is joined.
             if p.len() == 9 {
                 out.line_fmt(ctx, format_args!("link     {}", match p[8] {

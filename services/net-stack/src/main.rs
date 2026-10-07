@@ -2637,8 +2637,8 @@ fn link_addr(ctx: &ServiceContext, pending: &mut Displaced) -> Option<(bool, [u8
     }
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&p[1..7]);
-    // The third value says the RADIO carries the link. Only the Pi 4's genet backend answers nine bytes,
-    // and its ninth is the carrier, 2 for the radio (nic-driver's `Carrier`).
+    // The third value says the RADIO carries the link. Only a backend with a radio bridge answers nine
+    // bytes (`radio::status` in nic-driver), and its ninth is the carrier, 2 for the radio (`Carrier`).
     Some((p[7] != 0, mac, p.len() == 9 && p[8] == 2))
 }
 

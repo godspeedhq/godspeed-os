@@ -2314,3 +2314,58 @@ taken: find out why a one-port re-address fails where the full walk succeeds, be
 reverted whole, the command ring wrap with it, since the wrap was needed only once the re-enumerations
 that reset the ring were gone. The finding about the ring stands for whoever returns: it does not wrap,
 and only a controller reset puts its cursor back.
+
+## 39. The radio bridge on the PCs: the RTL8168 carries frames to the dongle when the cable is out (2026-10-07) - built, not yet seen on hardware
+
+Until now a dongle on the T630 or the Wyse could scan and join and carry nothing: `nic-driver`'s RTL8168
+backend had no radio bridge, so with the cable out `net-stack`'s frames went to a dead cable. The
+bridge is the one the other three boards already share, `services/nic-driver/src/radio.rs`, now
+included from the RTL8168's serve loop as well (both PCs have that chip; the Wyse is the board its
+single-descriptor transmit fix was found on). The rule is unchanged: the cable always wins.
+
+**What changed in the RTL8168 loop (`realtek_serve`):**
+- **The cable is read live on every request**, from PHYSTATUS - one register read, where GENET pays two
+  MDIO transactions and so remembers it for 500 ms. A `chaos link-flap` override counts as the cable,
+  so a forced DOWN hands the frames to the radio as an unplug would.
+- **STATUS** with the cable in is the 32-byte answer it always was, the chip's tally included. With the
+  cable out it is the nine-byte answer every radio backend gives (`radio::status`), whose last byte names
+  the carrier; that is how `net-stack` and `net` learn the radio carries the link. The tally is the
+  cable's, so it is not sent while the cable carries nothing.
+- **Op 10** (which access point) is answered. Before, this backend took the one byte for a frame and sent
+  it - harmless only because nothing asked it, since only a nine-byte STATUS leads `net-stack` to ask.
+- **Receive (ops 4 and 9) and transmit** go to `wifi-usb` with the cable out, and none of the cable's
+  receive-ring reset or descriptor work is done for them. The RDU/FOVW re-arm at the top of the loop runs
+  on every request either way, so a cable plugged back in finds a receiver that is running.
+- **A request that arrives while the bridge waits on the radio** is kept and served first
+  (`Radio::take_held`), as on the other boards.
+- **Every reply goes through one helper, `answer`**, which sends and gives the reply capability back. The
+  radio's held requests carry a raw capability handle, and `gs` has no way to make a `gs` capability
+  from one, so the loop answers by handle; `nic-driver`'s raw-SDK count fell from 94 to 82 rather than
+  rising (`one_way_check.py`).
+
+**The supervisor** gives `nic-driver` `wifi-usb` as a peer on the PCs (`NIC_PEERS`, its own branch keyed
+on `has_wifi_usb`). The contract already declared it.
+
+**One fix in the shared bridge:** "`wifi-usb` is not running" was logged on every failed probe, though
+the comment above it said once and every sixteenth. With no dongle and the cable out that is a line a
+second; it is now once, then every sixteenth, with a count. The same on every board.
+
+**Checked:** the x86, Pi 2, Pi 4 and VisionFive images build, and x86 passes every gate. In QEMU (x86,
+UEFI, e1000 - QEMU has no RTL8168) the image boots, `nic-driver` is spawned with the new peer (`peer
+'wifi-usb' not yet registered ... will reacquire`, as on the Pi 2 before the dongle is plugged), DHCP
+completes and `ping 10.0.2.2` answers in about 1 ms. So the supervisor change and the e1000 path are
+seen; the RTL8168 loop itself, and the radio path, have run on nothing yet.
+
+**Prediction, T630, the dongle on a front port at boot, the cable in:**
+1. Boot as before: `nic-driver: RTL8168 C+ TX/RX rings up (link UP)`, a DHCP lease, `ping` to the
+   gateway answers. `net` prints the `nic-hw` tally line, as today.
+2. `wifi scan` lists the networks, and `wifi join` joins one - the first time either has run on x86
+   since `xhci` gained the bulk IN and OUTs (sections 28, 29). **Refuted by** a scan that finds nothing,
+   or a join that never reaches the handshake.
+3. Cable out: within a status query, `nic-driver: the cable is out - the radio carries the link (MAC
+   ...)` with the dongle's MAC, `net-stack` re-configures on the new address and leases again, and `ping`
+   to the gateway answers over the dongle. `net` says `link up via wifi (the cable is out)`. **Refuted
+   by** `the radio did not send` repeating while `wifi status` says joined.
+4. Cable back in: `the cable carries the link; the radio stands by`, a lease on the cable's address,
+   `ping` answers, and the `nic-hw` line is back in `net`.
+5. Then the same on the Wyse.
