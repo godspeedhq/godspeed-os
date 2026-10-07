@@ -2942,3 +2942,11 @@ Nothing this branch changed touches `nic-driver`'s GENET path beyond comments.
 
 **And `selfcheck` with the cable in, same boot: 526 run, 0 failed, 0 skipped** (`run: ran 526, failed 0`). The one failure on the
 radio is the radio-bridged path's (`backlog/66`), not anything `selfcheck` checks being broken.
+
+**And the Pi 2, the same day, the cable out and the dongle carrying the link** (`nic-driver: the cable is
+out - the radio carries the link`), joined to the SAME guest network the Pi 4's radio was on
+(`ogundero_guest`): `net dns example.com` resolved every time it was asked, and `selfcheck` ran 517 with 0
+failed - `PASS  dns - names resolve over a network that is proven reachable`. So the guest network and
+its DNS server are ruled out as the Pi 4's cause, and so is anything in the resolver or the shared radio
+bridge (`radio.rs`): what fails is specific to the Pi 4. The Pi 2 image also carries the name-map change
+(`map_keeps`), seen here for the first time on that board.

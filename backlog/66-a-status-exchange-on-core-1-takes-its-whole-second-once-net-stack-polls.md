@@ -190,3 +190,8 @@ answer and the idle check is benign (now filtered by age). In QEMU one boot in t
 Ready 2 s after a wake on an idle core, with no idle-with-Ready line - not yet explained, and not yet
 seen on the hardware. The Pi 4 card: cable out, `net dns google.com` until it fails, and read which
 line, if either, comes with the late answer.
+
+**2026-10-07, the Pi 2 rules out everything but the Pi 4.** On the Pi 2, the dongle carrying the link
+through the same shared bridge (`radio.rs`) on the same guest network and DNS server, every lookup
+resolved and `selfcheck`'s DNS check passed. What differs is the board: the Pi 4's AArch64 kernel, and
+`nic-driver` pinned to core 1 with `net-stack`, `block-driver` and `fs` (the Pi 2's is unpinned).
