@@ -1846,7 +1846,7 @@ after every one. Without the fix, receive would have stopped at the first.
 The same log found a second fault, with the dongle plugged in at BOOT rather than at the prompt
 (section 31).
 
-## 29. U2c (2026-10-06): the bulk OUTs through `xhci` - built, not yet on hardware
+## 29. U2c (2026-10-06): the bulk OUTs through `xhci` - hardware-verified on the Pi 4 (2026-10-07): joined through the VL805
 
 Built while the operator was away, on top of U2b, and held off the card until U2b has run, so each flash
 still tests one change.
@@ -1895,6 +1895,31 @@ re-enumerated, and the dongle could not be addressed again on two walks. It is n
 in four Pi 4 bring-ups. The keyboard was lost as well, which is section 32. U2c's predictions are
 untested, not refuted.
 
+**Second run of the same card (2026-10-07): JOINED.** The dongle was left plugged in at boot, so
+section 31's fault happened first, exactly as described there. The re-enumeration came 1.7 s after the
+bind, the first `wifi-usb` stopped at `LLT_INIT stayed busy`, and the prompt came up later than usual
+(section 31). The dongle was then unplugged and plugged into another hub port at the prompt. On that
+bring-up the firmware downloaded in one try, and receive started. `the WiFi dongle's first bulk OUT
+transfer - 88 bytes (U2c)` came next. Then the auto-join from `/wifi.keys`: `AUTHENTICATED (Open System,
+status 0)`, a QoS and HT association (R12a, R12b), `ASSOCIATED, association ID 1`, the four-way
+handshake with message 3's MIC verified and its key data unwrapped, both keys in the CAM, and `JOINED -
+handshake complete`. Fourteen seconds later came `the FIRST data frame through the link - ethertype
+0x0800, 42 bytes, decrypted by the chip; R6 receive works`. Receive ran on for 3072 frames with none
+failing their CRC. The onboard radio stayed joined and in use, and `wifi hardware` gave both rows:
+
+```
+RADIO      CHIP            BUS         STATE          NETWORK               IN USE
+onboard    CYW43455        SDIO        joined         <network>             *
+usb        RTL8188CUS      USB xhci    joined         <network>
+```
+
+**Met:** predictions 1 and 3. **Not met: prediction 2.** No `FIRST probe response addressed to us` line
+appeared, and the rx counters said `0 answers to our probes` throughout. The join found the access point
+from its beacons, so this did not stop it. Either the probe requests are not reaching the air, or they
+are not being answered, and this run cannot say which. Open. As expected, `nothing is taking received
+frames` followed, because the Pi 4's bridge is `wifi-driver`'s (section 27). Carrying traffic over the
+dongle is `wifi hardware use`.
+
 ## 30. `OP_SYNC` for both of `xhci`'s notices (2026-10-07) - found by an audit, hardware-verified on the Pi 4 (section 28's result)
 
 **What was wrong.** `usbfn::OP_SYNC` is how a `wifi-usb` with no reply mailbox recovers a notice it took
@@ -1930,7 +1955,7 @@ after that line refutes it.
 **Result (2026-10-07):** three such lines during the join, more beacons after each, and 1024 frames
 received in the next twelve seconds (section 28's result).
 
-## 31. A dongle present at boot re-enumerated the controller under its driver (2026-10-07) - fixed, not yet on hardware
+## 31. A dongle present at boot re-enumerated the controller under its driver (2026-10-07) - fixed, not yet on hardware (seen again on the unfixed U2c card)
 
 **What was seen.** On the U2b card the dongle was on hub port 1 when the Pi 4 booted. `xhci` bound it
 during the boot enumeration and the supervisor started `wifi-usb`, which got as far as R2. About 1.3 s
@@ -1952,9 +1977,15 @@ the arrival arm marks the port as tried.
 never taken for an arrival. The unplug arm already came before the arm for an empty port and is
 unchanged.
 
+**It also delays the prompt.** The shell prints `gsh>` once `fs` is serving, and the re-enumeration
+takes the USB stick away and gives it back. On U2c's second run (section 29, an image without this fix)
+`fs` mounted at 6.0 s and the prompt came at 6.1 s. With the dongle not plugged in at boot, U2a's pass
+had the prompt at 4.8 s.
+
 **Prediction, Pi 4, dongle plugged in BEFORE power-on:** no `new device on hub slot 1 port <the dongle's>`
 line and no `xhci: reset: entering` after the boot enumeration. The driver goes on through R11 to `receive
-started` and beacons, as in section 28. **Refuted by:** a re-enumeration naming the dongle's port while
+started` and beacons, as in section 28, and to `JOINED` as in section 29. The prompt comes back to about
+5 s. **Refuted by:** a re-enumeration naming the dongle's port while
 it is bound.
 
 ## 32. A command's completion taken from the command before it (2026-10-07) - fixed, not yet on hardware

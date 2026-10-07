@@ -81,7 +81,7 @@ each host instance. `OP_INFO` does not carry it yet.
 | Host | Today | For a driver it does not run itself |
 |---|---|---|
 | `dwc2` (Pi 2) | binds the dongle, serves `usbfn` in full, tells `wifi-usb`, and REPORTS it (`usbdev`, 2026-10-06) | the generation in `OP_INFO` |
-| `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers; REPORTS it and watches its root or hub port (`docs/wifi-usb.md` 27). U2b, the bulk IN, hardware-verified on the Pi 4; U2c, the bulk OUTs, built, not yet on hardware (28-31) | the generation in `OP_INFO` |
+| `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers; REPORTS it and watches its root or hub port (`docs/wifi-usb.md` 27). U2b and U2c, the bulk IN and OUTs, hardware-verified on the Pi 4: the dongle joins WPA2 through the VL805 (28-32) | the generation in `OP_INFO` |
 | `ehci` (the T630's second controller) - **limitation, not planned** | one topology: the AMD hub on its root port, low-speed keyboards and mice behind it; **skips every high-speed device** on a hub port | everything `xhci` needed, and bulk transfers from scratch |
 
 **`ehci` - A RECORDED LIMITATION, not planned work (operator, 2026-10-06).** A dongle in a socket that
@@ -105,8 +105,8 @@ alone; a bulk IN qTD kept armed, with its completion taken on the interrupt; a b
    the reports, the match table, stop-on-detach, the generation. Then the same on `xhci`, with the
    dongle's port watched (DONE 2026-10-06, hardware-verified on the Pi 4 rather than the T630, the
    operator's choice of test board; `docs/wifi-usb.md` 27).
-3. **U2b and U2c:** receive and transmit through `xhci` (BUILT 2026-10-06; U2b hardware-verified on
-   the Pi 4 2026-10-07, U2c's card owed, `docs/wifi-usb.md` 28-31), then `nic-driver`'s radio bridge on x86 (the PCs' NIC backends have none
+3. **U2b and U2c:** receive and transmit through `xhci` (DONE 2026-10-07: both hardware-verified on
+   the Pi 4, the dongle joined, `docs/wifi-usb.md` 28-32), then `nic-driver`'s radio bridge on x86 (the PCs' NIC backends have none
    yet).
 4. **`wifi hardware`** (`utilities/56_wifi.md` 11) once a board can have two radios: the report BUILT
    (2026-10-06, checked in QEMU), `wifi hardware use` specified, not built.
