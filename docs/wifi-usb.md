@@ -2315,7 +2315,7 @@ reverted whole, the command ring wrap with it, since the wrap was needed only on
 that reset the ring were gone. The finding about the ring stands for whoever returns: it does not wrap,
 and only a controller reset puts its cursor back.
 
-## 39. The radio bridge on the PCs: the RTL8168 carries frames to the dongle when the cable is out (2026-10-07) - built, not yet seen on hardware
+## 39. The radio bridge on the PCs: the RTL8168 carries frames to the dongle when the cable is out (2026-10-07) - hardware-verified on the T630 with the cable out; the cable path and the Wyse not yet run
 
 Until now a dongle on the T630 or the Wyse could scan and join and carry nothing: `nic-driver`'s RTL8168
 backend had no radio bridge, so with the cable out `net-stack`'s frames went to a dead cable. The
@@ -2369,3 +2369,39 @@ seen; the RTL8168 loop itself, and the radio path, have run on nothing yet.
 4. Cable back in: `the cable carries the link; the radio stands by`, a lease on the cable's address,
    `ping` answers, and the `nic-hw` line is back in `net`.
 5. Then the same on the Wyse.
+
+**The T630 card's run (2026-10-07).** Booted with no cable and the dongle out, then plugged in.
+- **Before the dongle:** `the radio did not answer 0x10` three times, then `wifi-usb is not running (x1)`,
+  and nothing more - the rate limit doing what it says.
+- **Plugged in after boot:** `xhci` bound it on root port 7, the supervisor started `wifi-usb`, and the
+  bring-up ran to receive in about 1.6 s. Hot-plug on x86 works.
+- **`wifi scan`** found 12 networks across channels 1 to 13 (probe responses addressed to us included),
+  and **`wifi join`** went to JOINED in 1.4 s, WMM and HT. Step 2 confirmed: the first scan and join on x86
+  since the bulk endpoints.
+- **The cable out, the radio carrying the link:** `nic-driver: the cable is out - the radio carries the
+  link` with the dongle's MAC, `net` said `link up via wifi (the cable is out)`, `net-stack` took a DHCP
+  lease, pinged the gateway, and `ping 8.8.8.8` answered 6 of 6 at 16-66 ms. Step 3 confirmed.
+- **`wifi radio off`, then `on`** (the same instance): the rejoin, and `ping 8.8.8.8` 2 of 2.
+- **Steps 1 and 4 were not run:** no cable was plugged in this session, so the cable path of the new
+  loop on the RTL8168, and the hand-back to the cable, are still unseen.
+
+**A fault this card found - after the chip's power-down, the restarted driver joins and receives
+nothing.** `wifi radio off hard` then `on`, and later `wifi radio powercycle`: each restarted `wifi-usb`
+onto the cold chip, the instance rejoined from `/wifi.keys` through the whole handshake (message 3's MIC
+verified, both keys in the CAM), `nic-driver` said the radio carries the link, and transmit worked
+(`the FIRST data frame sent through the link ... encrypted by the chip`). But every frame back was
+refused: `a data frame from the access point the chip did not decrypt (protected true, security 0,
+swdec true)`, and `net-stack` saw 0 frames in 16 pings. `security 0` in the receive descriptor is the
+chip finding no key for the frame - the CAM lookup missed, or receive decryption is off - although the
+key was written. On the Pi 2 the same restarts (section 19) rejoined and `ping` answered, so this is not
+yet a fact about the chip. What separates the two runs here: the working instance came from a plug and
+joined by `wifi join` after a scan; the failing ones came from `rtl8192cu_power_off` and rejoined from the
+key file with no scan. NOT diagnosed. The next step is an instrument, not a retry: after the keys go in,
+read back `REG_CR`'s security bit, `REG_SECURITY_CFG` and the two CAM entries, and say them once on the
+first undecrypted frame.
+
+**Also in the log, not explained:** `cap::get: ResourceId(127) gen mismatch cap=33 rec=35` while the third
+instance ran - something still held a send cap to the first `wifi-usb` instance's endpoint, two
+generations old. The log does not say who. And at the end the dongle left the bus (`bulk IN ... cc=4`,
+`port 7 reads EMPTY while bound`), the controller was reset, and no port had a device on the census -
+consistent with the dongle being pulled.
