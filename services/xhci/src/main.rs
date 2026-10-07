@@ -122,21 +122,26 @@ pub(crate) struct EvMail {
     bulk_cc: [u32; 32],
     /// The bulk completion's residual (the transfer event's bits 23:0): what was NOT transferred.
     bulk_res: [u32; 32],
+    /// The TRB the filed completion retires (the transfer event's pointer), so a waiter with ONE TD
+    /// in flight can tell its own completion from a stale one for the same slot (`take_trb`).
+    trb: [u64; 32],
 }
 
 impl EvMail {
     pub(crate) fn new() -> Self {
         Self {
             have: 0, cc: [0; 32], ep0_have: 0, ep0_cc: [0; 32], bulk_have: 0, bulk_cc: [0; 32], bulk_res: [0; 32],
+            trb: [0; 32],
         }
     }
 
     /// File a completion belonging to a consumer other than the one that dequeued it. `ep` is the
-    /// transfer event's endpoint ID (DCI) and `res` its residual.
-    pub(crate) fn put(&mut self, sid: u32, ep: u32, cc: u32, res: u32) {
+    /// transfer event's endpoint ID (DCI), `res` its residual and `trb` the TRB it retires.
+    pub(crate) fn put(&mut self, sid: u32, ep: u32, cc: u32, res: u32, trb: u64) {
         if sid < 32 {
             self.have |= 1 << sid;
             self.cc[sid as usize] = cc;
+            self.trb[sid as usize] = trb;
             if ep == 1 {
                 self.ep0_have |= 1 << sid;
                 self.ep0_cc[sid as usize] = cc;
@@ -163,6 +168,22 @@ impl EvMail {
         if sid < 32 && self.bulk_have & (1 << sid) != 0 {
             self.bulk_have &= !(1 << sid);
             return Some((self.bulk_cc[sid as usize], self.bulk_res[sid as usize]));
+        }
+        None
+    }
+
+    /// Collect this slot's completion only if it retires `want`, the one TRB its waiter has in flight
+    /// (the disk, `msc::await_on_slot`). A filed completion for any other TRB on the slot is stale - a
+    /// TD an earlier, abandoned wait left behind - and is dropped here rather than collected, because
+    /// collecting it would end THIS stage before the device did its part. `Some(Err(trb))` reports the
+    /// stale one so the caller can count it.
+    pub(crate) fn take_trb(&mut self, sid: u32, want: u64) -> Option<Result<u32, u64>> {
+        if sid < 32 && self.have & (1 << sid) != 0 {
+            self.have &= !(1 << sid);
+            self.bulk_have &= !(1 << sid);
+            self.ep0_have &= !(1 << sid);
+            let i = sid as usize;
+            return Some(if self.trb[i] == want { Ok(self.cc[i]) } else { Err(self.trb[i]) });
         }
         None
     }
@@ -1382,8 +1403,8 @@ fn hub_port_status(
             //     port's answer, buffer and all, which is the misattribution being fixed.
             // Both are handled the same way: record the slot so the caller re-arms that endpoint,
             // and do not treat it as an answer to the question actually asked.
-            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) => {
-                eaten.put(sid, ep, cc, res);
+            Some((TRB_TRANSFER_EVENT, cc, sid, ptr, ep, res)) => {
+                eaten.put(sid, ep, cc, res, ptr);
                 // ABANDON THE PROBE and let the caller deliver the keystroke NOW.
                 //
                 // This used to keep waiting for its own event, so a key pressed during a probe sat
@@ -4750,7 +4771,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     break;
                 }
                 match next_event_at(&dma, &mmio, ir0, &mut ev_idx, &mut ev_cycle, 1) {
-                    Some((TRB_TRANSFER_EVENT, cc, slot_id, _, ep, res)) => {
+                    Some((TRB_TRANSFER_EVENT, cc, slot_id, ptr, ep, res)) => {
                         if let Some(r) = radio.as_mut().filter(|r| r.slot == slot_id) {
                             // The WiFi dongle's armed bulk IN completing (U2b). An EP0 completion here
                             // is a late answer to a control transfer already given up on: dropped.
@@ -4768,7 +4789,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // the next probe for this hub can recognise it as the stale answer to
                             // the previous question and resynchronise instead of queueing a second
                             // TD behind an unretired one.
-                            eaten.put(slot_id, ep, cc, res);
+                            eaten.put(slot_id, ep, cc, res, ptr);
                             // A completion for a HUB, found by the drain - so it arrived with no
                             // probe waiting for it, i.e. AFTER the probe that asked gave up. This is
                             // the answer to a question we already abandoned, and we are about to

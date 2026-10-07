@@ -321,8 +321,8 @@ fn control_once(
             Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) if sid == r.slot && ep == r.in_dci && r.in_dci != 0 => {
                 bulk_done(ctx, r, cc, res);
             }
-            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) => {
-                eaten.put(sid, ep, cc, res);
+            Some((TRB_TRANSFER_EVENT, cc, sid, ptr, ep, res)) => {
+                eaten.put(sid, ep, cc, res, ptr);
                 unrelated += 1;
                 if unrelated >= MAX_UNRELATED {
                     return None;
@@ -850,8 +850,8 @@ fn bulk_out(
             Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) if sid == r.slot && ep == r.in_dci && r.in_dci != 0 => {
                 bulk_done(ctx, r, cc, res);
             }
-            Some((TRB_TRANSFER_EVENT, cc, sid, _, ep, res)) => {
-                eaten.put(sid, ep, cc, res);
+            Some((TRB_TRANSFER_EVENT, cc, sid, ptr, ep, res)) => {
+                eaten.put(sid, ep, cc, res, ptr);
                 unrelated += 1;
                 if unrelated >= MAX_UNRELATED {
                     break None;

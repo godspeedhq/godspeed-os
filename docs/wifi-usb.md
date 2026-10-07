@@ -2236,6 +2236,16 @@ same slot number before a re-scan, would end a data stage before the device wrot
 this points to: match each stage on its TRB pointer, as `hub_port_status` already does, and drop the
 event mailbox when the controller is reset. That is the next change, not made here.
 
+**Made (2026-10-07), built, checked in QEMU, not yet on the card.** Each stage of a disk command now
+waits for the transfer event whose TRB pointer is the one it posted (`Ring::push` returns it); a completion
+for the disk's slot that retires any other TRB is logged as `passed over` and not taken, from the ring and
+from `EvMail`, which now files the pointer too (`take_trb`). The mailbox half of the plan above was not
+needed: `EvMail` is built fresh on every pass and the whole arena is zeroed on a controller reset, so
+nothing filed survives one. The slot-only match predates this branch (it is unchanged since before the
+dongle work began); what is new is a second device on the same controller whose faults make the disk's
+waits run out. `scripts/cross_isa.py`, whose riscv64 leg runs every disk read and write through `xhci`'s
+mass storage in QEMU, passes 12 of 12 with no completion passed over.
+
 Also seen, not changed: a `wifi hardware` straight after the onboard radio has left logs `wifi-driver: the
 firmware REFUSED the request - BCME_NOTASSOCIATED`, its status ask of a radio that is not associated. The
 report is right; the line is noise.
