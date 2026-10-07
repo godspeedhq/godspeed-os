@@ -17,7 +17,7 @@
     4  services/hw-enumerator
     1  services/mem-pressure
   101  services/net-stack
-   94  services/nic-driver
+   82  services/nic-driver
     9  services/observe
     5  services/power
   270  services/probe
