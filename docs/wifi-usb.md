@@ -2729,3 +2729,43 @@ when a reset times out. The status the handler acts on is the one read before th
    REMOVED` and one `device CONNECTED` per port touched, and nothing repeats. A move that catches a port
    mid-reset logs the reset failure once and goes quiet. **Refuted by** any repeated `device REMOVED`
    for a port with nothing in it.
+
+## 46. Section 45's card - the operator's physical chaos on the Pi 2 (2026-10-07): the flood gone, the keys hold; a port reset before the plug had settled, now debounced
+
+**Run:** cable out, dongle in; seven `wifi radio powercycle`s, and the dongle pulled and moved between hub
+ports 2 and 4 about ten times - twice in the middle of a powercycle (the download stopped, `the dongle is
+no longer bound`, and `wifi-usb` ended cleanly).
+
+- **Section 45's fix holds:** `device REMOVED` 9 times in the session, once for each pull. No repeat.
+- **Section 43's key layout holds:** about fifteen fresh joins - powercycles, replugs on both ports,
+  rejoins from the key file - every one `CAM entry 4`, `CAM entry 2`, `0xcc`, and **no `did not decrypt`
+  anywhere**. Every `ping 8.8.8.8` answered. With section 45's four, about nineteen fresh joins and none
+  refused, against about four in fifteen before section 43.
+- **Every pull mid-powercycle recovered** on the other port: bound, the chip up cold, rejoined, pinged.
+- **One move did not recover** - the operator's "didn't recover fully". At 14:28:38 the dongle went into
+  port 2: `device CONNECTED`, then `hub port 2 did not finish reset within 200 ms (status=0x0101)` -
+  connected, powered, NOT enabled - `enumeration FAILED; nothing bound`. The dongle sat there unbound for
+  28 s until it was moved again. It was really in the port (0x0101 is connected), so this is not section
+  45's case of a pull during a reset.
+
+**Why, read against USB 2.0 and Linux.** USB 2.0 7.1.7.3 requires at least 100 ms between detecting a
+connect and signalling reset, for debounce and power-settling, the timer restarting on any disconnect.
+Linux's `hub_port_debounce` reads the port every 25 ms and waits for the connection to hold for 100 ms,
+up to 2 s. `dwc2` reset the port the moment the change arrived, while a hand-pushed plug was still making
+and breaking contact. And it gave the reset 200 ms - Linux's time for one long reset - where Linux's
+bound on the wait (`HUB_RESET_TIMEOUT`) is 800 ms.
+
+**The fix:** `hub::debounce`, Linux's debounce, before a hot-plugged device is reset; a connection that
+has not settled within 2 s is said once and treated as not connected until the port changes again -
+what Linux does on `connect-debounce failed`, and the cost is the same: a plug that settles only after
+2 s is not seen until it is moved. The reset wait is 800 ms. Both are
+bounded, and both are the specification's and Linux's numbers rather than new ones. The debounce costs
+the `dwc2` loop about 100 ms per plug-in; a device present at boot is not debounced (the boot survey is
+unchanged).
+
+**Checked:** the Pi 2 and x86 images build and x86 passes every gate. No QEMU device models this hub.
+
+**Prediction, Pi 2, the same physical chaos:** every move ends bound on the new port, with no `did not
+finish reset`; a plug pushed in slowly may show `the connection did not settle within 2 s` once, then
+bind when it settles. Powercycles and replugs as before: no `did not decrypt`, no repeated `device
+REMOVED`.

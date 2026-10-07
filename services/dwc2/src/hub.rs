@@ -9,6 +9,7 @@
 //! means that when splits are attempted, the port they are attempted through is already known to
 //! report the right thing.
 
+use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
@@ -230,6 +231,53 @@ pub fn status_change(
     Some(bits)
 }
 
+/// How long a port reset may take before it is given up: Linux's `HUB_RESET_TIMEOUT` (usb/core/hub.c).
+/// This was 200 ms, Linux's LONG reset time for one attempt rather than its bound on the wait.
+const RESET_TIMEOUT_MS: u64 = 800;
+
+/// The attach debounce, USB 2.0 7.1.7.3: at least 100 ms between connect detection and reset, the timer
+/// restarting on any disconnect. As Linux's `hub_port_debounce` does it: the port read every 25 ms, the
+/// connection unchanged for 100 ms, given up after 2 s.
+const DEBOUNCE_STEP_MS: u64 = 25;
+const DEBOUNCE_STABLE_MS: u64 = 100;
+const DEBOUNCE_TIMEOUT_MS: u64 = 2000;
+
+/// Wait for a port's connection to settle before it is reset: `Some(connected)` once it has held for
+/// `DEBOUNCE_STABLE_MS`, `None` if it has not within `DEBOUNCE_TIMEOUT_MS` (or the hub stopped answering).
+///
+/// Without it a device pushed in by hand was reset while its contacts were still making and breaking,
+/// and the reset did not finish: on the Pi 2 a dongle moved between ports was `connected, powered, not
+/// enabled` (0x0101) 200 ms later and was left unbound for as long as it stayed there (`docs/wifi-usb.md`
+/// 46). A connection change seen while waiting is acknowledged and restarts the count, as Linux does.
+pub fn debounce(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, port: u8,
+) -> Option<bool> {
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(DEBOUNCE_TIMEOUT_MS));
+    let mut last: Option<bool> = None;
+    let mut stable_ms = 0u64;
+    loop {
+        let st = port_status(ctx, mmio, dma, t, port)?;
+        let connected = st.connected();
+        let changed = st.change & 1 != 0; // C_PORT_CONNECTION
+        if !changed && last == Some(connected) {
+            stable_ms += DEBOUNCE_STEP_MS;
+            if stable_ms >= DEBOUNCE_STABLE_MS {
+                return Some(connected);
+            }
+        } else {
+            stable_ms = 0;
+            last = Some(connected);
+        }
+        if changed {
+            let _ = port_feature(ctx, mmio, dma, t, false, FEAT_C_PORT_CONNECTION, port);
+        }
+        if deadline.expired() {
+            return None;
+        }
+        delay::hold(ctx, Budget::ms(DEBOUNCE_STEP_MS));
+    }
+}
+
 /// Read a port's status and acknowledge EVERY change bit it reports, so the hub stops reporting it.
 ///
 /// A hub keeps a port in its status-change bitmap while ANY of the port's change bits is set (USB 2.0
@@ -298,7 +346,7 @@ pub fn reset_port(
     // clock the library's 200,000 looks are 200,000 control transfers, which can be hours: it ends,
     // where the one-tick deadline built from `duration_cycles` allowed a single look. Recorded in
     // `docs/driver-library.md` as an open gap, not a bound anyone chose.
-    let mut deadline = wait::Deadline::start(ctx, Budget::ms(200));
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(RESET_TIMEOUT_MS));
     loop {
         let st = port_status(ctx, mmio, dma, t, port)?;
         if st.status & PORT_RESET == 0 && st.enabled() {
@@ -310,8 +358,8 @@ pub fn reset_port(
         }
         if deadline.expired() {
             ctx.log_fmt(format_args!(
-                "dwc2-svc: hub port {} did not finish reset within 200 ms (status={:#06x})",
-                port, st.status));
+                "dwc2-svc: hub port {} did not finish reset within {} ms (status={:#06x})",
+                port, RESET_TIMEOUT_MS, st.status));
             // Acknowledged here too, as the success path above does: a reset that never finished - the
             // device pulled during it - leaves change bits the hub would otherwise report forever.
             let _ = clear_changes(ctx, mmio, dma, t, port);

@@ -30,6 +30,7 @@ FB_READBACK_CHEAP
 GET_BOARD_MAC_ADDRESS
 GMAC0_RMII_RTX
 GMAC_CONFIG_ACS
+HUB_RESET_TIMEOUT                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by dwc2 for the attach debounce and the port reset bound (docs/wifi-usb.md 46) - external, 26.14
 IA32_KERNEL_GS_BASE
 INTRL2_0
 INT_EP_CTL
@@ -95,6 +96,7 @@ dwc2_update_urb_state_abn          # Linux drivers/usb/dwc2/hcd_intr.c, same cit
 IEEE80211_MAX_FRAME_LEN            # Linux include/linux/ieee80211.h (2352), cited by usbfn::BULK_IN_MAX for the size of one unaggregated receive (R3b) - external, 26.14
 hub_activate                       # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
 hub_is_superspeed                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
+hub_port_debounce                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by dwc2 for the attach debounce and the port reset bound (docs/wifi-usb.md 46) - external, 26.14
 hub_port_reset                     # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
 rtl8xxxu_parse_usb                 # Linux rtl8xxxu_core.c, cited by dwc2 rtl::bulk_in for taking the one bulk IN endpoint (R3b) - external, 26.14
 rtl8xxxu_submit_rx_urb             # Linux rtl8xxxu_core.c, cited by usbfn::BULK_IN_MAX for how Linux sizes the receive buffer (R3b) - external, 26.14

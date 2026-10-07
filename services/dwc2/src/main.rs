@@ -729,9 +729,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // Acknowledge FIRST - every change bit, not only the connection's. An
                         // unacknowledged change is re-reported forever, and a handler that fails
                         // partway would then spin on the same event (`hub::clear_changes`).
-                        let connected = hub::clear_changes(&ctx, &m, &d, &ht, port)
+                        let seen = hub::clear_changes(&ctx, &m, &d, &ht, port)
                             .map(|st| st.connected())
                             .unwrap_or(false);
+                        // A device that has just arrived is debounced before it is reset (USB 2.0
+                        // 7.1.7.3, `hub::debounce`): what is acted on is the connection once it has
+                        // held for 100 ms. One that has not settled within 2 s is said and left; the hub
+                        // reports the port again when its connection next changes.
+                        let connected = if seen {
+                            match hub::debounce(&ctx, &m, &d, &ht, port) {
+                                Some(c) => c,
+                                None => {
+                                    ctx.log_fmt(format_args!(
+                                        "dwc2-svc: port {} - the connection did not settle within 2 s; not enumerated", port));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            false
+                        };
                         if connected {
                             ctx.log_fmt(format_args!("dwc2-svc: port {} - device CONNECTED", port));
                             if let Some((hvid, hpid, _, dt, dsplt)) =
