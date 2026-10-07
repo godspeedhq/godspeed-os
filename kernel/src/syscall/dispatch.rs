@@ -433,6 +433,7 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = msg.caps[i] {
                         if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
+                            scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(), scheduler::fl_cap_word(new_slot, Some(&embedded_cap)));
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -487,6 +488,7 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             for i in 0..n_caps {
                 if let Some(embedded_cap) = msg.caps[i] {
                     if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
+                        scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(), scheduler::fl_cap_word(new_slot, Some(&embedded_cap)));
                         scheduler::push_pending_recv_cap(new_slot as u32);
                     }
                 }
@@ -550,6 +552,7 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = msg.caps[i] {
                         if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
+                            scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(), scheduler::fl_cap_word(new_slot, Some(&embedded_cap)));
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -1582,8 +1585,14 @@ fn handle_derive_cap(held_slot: u64, _a1: u64, _a2: u64) -> i64 {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
+    scheduler::fl_note(scheduler::fl::CAPDV, scheduler::current_task_slot(),
+        scheduler::fl_cap_word(held_slot as usize, Some(&held)));
     match scheduler::current_task_insert_cap(held) {
-        Ok(slot) => slot as i64,
+        Ok(slot) => {
+            scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(),
+                scheduler::fl_cap_word(slot, Some(&held)));
+            slot as i64
+        }
         Err(_)   => -1, // cap table full
     }
 }
@@ -1814,6 +1823,7 @@ fn do_call(
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = reply.caps[i] {
                         if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
+                            scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(), scheduler::fl_cap_word(new_slot, Some(&embedded_cap)));
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -2280,7 +2290,8 @@ fn handle_query_cap_rights(slot: u64) -> i64 {
 /// Clears the cap at `slot`. Always returns 0; out-of-range slots are silently
 /// ignored (idempotent - the slot is already empty).
 fn handle_remove_cap(slot: u64) -> i64 {
-    scheduler::current_task_remove_cap(slot as usize);
+    let removed = scheduler::current_task_remove_cap(slot as usize);
+    scheduler::fl_removed(slot as usize, removed.as_ref());
     0
 }
 

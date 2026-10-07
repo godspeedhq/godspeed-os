@@ -666,6 +666,30 @@ pub mod fl {
     pub const DEADLINE: u8 = 10; // the BSP scan's timed wake fired for it
     pub const TAKE: u8 = 11;     // TakePendingCap; a = (caps pending before << 16) | slot returned (0xFFFF = none)
     pub const SLEEP: u8 = 12;    // the sleep syscall; a = microseconds asked for. Not in recv: a send cannot wake it
+    pub const CAPIN: u8 = 13;    // a cap arrived in a message and was installed; a = (slot << 32) | endpoint it names
+    pub const CAPRM: u8 = 14;    // RemoveCap; a = (slot << 32) | endpoint the removed cap named (0xFFFF_FFFF = slot empty)
+    pub const CAPDV: u8 = 15;    // DeriveCap; a = (source slot << 32) | endpoint it names; the new slot follows as CAPIN
+}
+
+/// The endpoint `cap` names, low 32 bits, for a cap-table event.
+pub fn fl_cap_word(slot: usize, cap: Option<&Capability>) -> u64 {
+    ((slot as u64 & 0xFF) << 32) | cap.map_or(0xFFFF_FFFF, |c| c.resource_id.0 & 0xFFFF_FFFF)
+}
+
+/// A traced task removing a cap that names ITS OWN endpoint is said at once, with the slot. Its
+/// self-grant is such a cap, and every reply cap it hands out is copied from that; a removed derived
+/// copy is the other case, and the slot says which.
+pub fn fl_removed(slot: usize, cap: Option<&Capability>) {
+    let cid = current_core_id();
+    let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
+    if cur >= MAX_TASKS || !fl_traced(cur) { return; }
+    fl_note(fl::CAPRM, cur, fl_cap_word(slot, cap));
+    if let Some(c) = cap {
+        if c.resource_id.0 == TASK_ENDPOINT[cur].load(Ordering::Relaxed) {
+            crate::kprintln!("fl-alert: '{}' removed cap slot {}, which names its OWN endpoint {:#x}",
+                task_name(cur), slot, c.resource_id.0);
+        }
+    }
 }
 /// What `GOT` records about the message: who sent it, how many caps it carried, its length and first
 /// byte, and whether the receive was timed - enough to tell a driver's reply from a client's request.
@@ -752,7 +776,8 @@ fn lost_wake_check(now: u64) {
         let what = match kind {
             fl::SEND => "send", fl::GOT => "got", fl::EMPTY => "empty", fl::BLOCK => "block",
             fl::NOBLOCK => "noblock", fl::WAKE => "wake", fl::RUN => "run", fl::OFF => "off",
-            fl::TIMEOUT => "timeout", fl::DEADLINE => "deadline", fl::TAKE => "take", fl::SLEEP => "sleep", _ => "?",
+            fl::TIMEOUT => "timeout", fl::DEADLINE => "deadline", fl::TAKE => "take", fl::SLEEP => "sleep",
+            fl::CAPIN => "capin", fl::CAPRM => "caprm", fl::CAPDV => "capdv", _ => "?",
         };
         crate::kprintln!("fl {:>8} c{} {:<11} {:<8} {:#x}", ago, core, task_name(slot), what, a);
     }
