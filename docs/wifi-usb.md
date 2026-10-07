@@ -2494,3 +2494,9 @@ report; a shell change only.
 **Prediction for the next card (T630):** `net` with the cable in shows `link     up via the cable` above
 the `nic-link` line; with the cable out, `link     up via wifi (the cable is out)` as before. After every
 join, one `key store after the join` line with `security on` and `0xcf`, and no `CAM entry` lines.
+
+**That card's run (T630, 2026-10-07): as predicted.** `net` with the cable in printed `link     up via the
+cable`, and with it out `link     up via wifi (the cable is out)`. Three joins from `/wifi.keys` (boot,
+`radio off`/`on`, `powercycle`), each with one `key store after the join` line, `security on` and `0xcf`,
+and no `CAM entry` lines; none refused its frames. The cable went in and out twice, a 48-ping run across
+the switches lost one reply. The Wyse is next, on the same image.
