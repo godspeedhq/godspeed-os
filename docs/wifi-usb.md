@@ -2260,3 +2260,38 @@ path; not explained.
 Also seen, not changed: a `wifi hardware` straight after the onboard radio has left logs `wifi-driver: the
 firmware REFUSED the request - BCME_NOTASSOCIATED`, its status ask of a radio that is not associated. The
 report is right; the line is noise.
+
+## 38. A dongle fault no longer resets the bus: its hub port alone is released or brought up again (2026-10-07) - built, checked in QEMU where it can be, not yet on the card
+
+Section 37 showed every dongle fault re-enumerating the whole controller, and the disk paying for it.
+`xhci` now handles a dongle behind a hub on its own (`services/xhci/src/rebind.rs`):
+
+- **Its hub port reads disconnected** (it dropped off the bus): its slot is released (Disable Slot) and
+  its slice freed. Nothing else is touched. The supervisor is told it is gone, as before.
+- **Its EP0 cannot be repaired** (the download fault): it is released, then its hub port alone is reset,
+  addressed and bound - the steps the full walk takes for one port, with the same timings - and
+  `wifi-usb` is told the new binding.
+- **A device arrives on the port the dongle was last on**: that port alone is brought up. If what is
+  there is not the dongle, it is released and the bus is re-enumerated so it is bound the ordinary way.
+- **A dongle on a root port** is re-enumerated as before; nothing else shares a root port.
+
+The hub's control ring is the poll loop's: the requests ride the same cursor the hub-port probes use
+(`hub_request`), matched on the TRB pointer. A slice reused for the dongle is zeroed first, because the
+full walk only ever starts from an arena a reset has just zeroed.
+
+**And the command ring wraps now.** It never did: each command took the next slot and only a controller
+reset put the cursor back. The re-enumerations reset it often enough that the end was never reached;
+without them a long session of dongle repairs would have written past the ring into the event ring.
+The last slot is a Link TRB back to the first, Toggle Cycle clear, and each command clears the cycle bit
+of the slot after it (`next_cmd`). `scripts/cross_isa.py` passes 12 of 12 with the ring cut to three slots,
+so it wrapped every two commands through a whole USB disk bring-up and the round trip, and again at its
+real size.
+
+**Not testable in QEMU:** it emulates no RTL8188, so the release and the re-bind themselves have run on
+nothing yet.
+
+Also noted the same day: v0.21.0 on the Pi 4, with the dongle in, put `gsh>` up about 6.5 s after power,
+against 3.0 s without it, and re-enumerated twice after the prompt (`new device on hub slot 1 port 1`,
+then port 2), re-binding the keyboard each time - section 31's boot-dongle fault, before its fix. So the
+slow first keystrokes with the dongle in predate this branch's interrupt work, which the operator
+confirmed by booting the release.

@@ -141,6 +141,10 @@ pub struct Radio {
     /// root port stays connected (the Pi 4's VL805 hub).
     pub hub_slot: u32,
     pub hub_port: u32,
+    /// That hub's DMA slice and its think time, so the dongle's port alone can be brought up again from
+    /// the poll loop (`rebind`).
+    pub hub_dev: usize,
+    pub hub_ttt: u32,
     cur: usize,
     pcs: u32,
     /// Endpoint repairs this pass, bounded: the command ring is one page per pass, and a dongle that
@@ -181,7 +185,7 @@ pub struct Radio {
 
 impl Radio {
     pub fn new(slot: u32, dev_idx: usize, port: u32, ids: u32) -> Self {
-        Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0, checked: false,
+        Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, hub_dev: 0, hub_ttt: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0, checked: false,
                 in_dci: 0, in_mps: 0, in_cur: 0, in_pcs: 1, rx: Rx::Off, note_owed: false, in_repairs: 0,
                 rx_frames: 0, rx_failed: 0,
                 out_dci: [0; MAX_OUT], n_out: 0, out_cur: [0; MAX_OUT], out_pcs: [1; MAX_OUT], out_repairs: 0,

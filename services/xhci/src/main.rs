@@ -25,6 +25,7 @@ use godspeed_sdk::{Dma, Mmio, ServiceContext};
 mod msc;
 /// The USB WiFi dongle, bound by VID:PID and served to `wifi-usb` (U2, `docs/wifi-usb.md` 7 for the design, 25 for U2a).
 mod radio;
+mod rebind;
 
 /// Shadow topology model - observation only, see docs/xhci-topology.md.
 mod topo;
@@ -73,6 +74,40 @@ const PORT_RW1C: u32 = 0x00FE_0000; // change bits 17..23 (write 0 to preserve)
 const DCBAA_OFF: usize = 0x0000;
 const CMD_RING_OFF: usize = 0x1000;
 const EVENT_RING_OFF: usize = 0x2000;
+/// What the poll loop does about the WiFi dongle behind a hub after a pass's scans (`rebind`).
+#[derive(Clone, Copy)]
+enum DongleJob {
+    /// Its hub port read disconnected: release its slot, and touch nothing else.
+    Release,
+    /// Its EP0 could not be repaired, or a device arrived where it was: bring that hub port up alone.
+    Rebind(rebind::DonglePort),
+}
+
+/// The command ring's TRB slots; the last holds a Link TRB back to the first (`next_cmd`).
+const CMD_RING_SLOTS: usize = (EVENT_RING_OFF - CMD_RING_OFF) / TRB_SIZE;
+
+/// The command ring's next free TRB, as an offset into the arena; advances the cursor.
+///
+/// **THE RING WRAPS.** It did not: every command took the next slot and only a controller reset put the
+/// cursor back, so a pass that ran 256 commands - repairs of the dongle's endpoints are two each, and
+/// nothing bounded how many a long pass may do - would have written its 256th into the EVENT ring that
+/// follows it in the arena. Re-enumerations reset it often enough that it was never reached, and once a
+/// dongle fault is handled in place rather than by a reset (`rebind`) they no longer would.
+///
+/// The last slot is a Link TRB to the first, written at start with the Toggle Cycle bit CLEAR, so the
+/// controller's cycle stays 1 for the life of the pass and every posting site keeps writing cycle 1. That
+/// is sound because commands here are SYNCHRONOUS - each is awaited before the next is written - so at a
+/// doorbell the controller's dequeue is at the command just written and only what follows it can be
+/// stale; `run_command` clears the cycle bit of the slot after it, which is what stops the controller
+/// running a previous lap's command once the ring has wrapped.
+fn next_cmd(cmd_idx: &mut usize) -> usize {
+    if *cmd_idx >= CMD_RING_SLOTS - 1 {
+        *cmd_idx = 0;
+    }
+    let off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    *cmd_idx += 1;
+    off
+}
 const ERST_OFF: usize = 0x3000;
 const INPUT_CTX_OFF: usize = 0x4000; // transient: built per device for Address/Configure
 /// Transient: control-transfer data during enumeration - and, inside the poll loop, the WiFi dongle's
@@ -331,8 +366,7 @@ fn disable_slot(
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
 ) {
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let done = run_command(
         ctx,
         dma,
@@ -458,8 +492,7 @@ pub(crate) fn reset_endpoint(
     let cc = match ep_state {
         // Halted: Reset Endpoint is the command that clears it.
         2 => {
-            let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-            *cmd_idx += 1;
+            let cmd_off = next_cmd(cmd_idx);
             run_command(
                 ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
                 (TRB_RESET_ENDPOINT << 10) | (slot << 24) | (dci << 16) | 1,
@@ -468,8 +501,7 @@ pub(crate) fn reset_endpoint(
         }
         // Running: quiesce it, because Set TR Dequeue is legal only from Stopped.
         1 => {
-            let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-            *cmd_idx += 1;
+            let cmd_off = next_cmd(cmd_idx);
             run_command(
                 ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
                 (TRB_STOP_ENDPOINT << 10) | (slot << 24) | (dci << 16) | 1,
@@ -502,8 +534,7 @@ pub(crate) fn reset_endpoint(
     // Resume at the ring BASE with Dequeue Cycle State = 1, the state a fresh ring is in. The caller
     // resets its producer cursor to the same place, so both sides agree again.
     let bp = dma.phys_at(ring_off);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let cc = run_command(
         ctx, dma, mmio, dboff, ir0, cmd_off,
         (bp as u32) | 1,          // low 32 bits | DCS=1
@@ -575,8 +606,7 @@ fn configure_radio_bulk(
         dma.write32(oep + 12, (op >> 32) as u32);
         dma.write32(oep + 16, out_mps as u32);
     }
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
     let ce = run_command(
         ctx, dma, mmio, dboff, ir0, cmd_off, in_phys as u32, (in_phys >> 32) as u32, 0,
@@ -1028,6 +1058,13 @@ fn run_command(
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
 ) -> Option<(u32, u32)> {
+    // The slot after this one must not look like a command (`next_cmd`): on a ring that has wrapped it
+    // holds the previous lap's, still at cycle 1. Past the last slot the Link leads to the first.
+    let mut after = cmd_trb_off + TRB_SIZE;
+    if after >= CMD_RING_OFF + (CMD_RING_SLOTS - 1) * TRB_SIZE {
+        after = CMD_RING_OFF;
+    }
+    dma.write32(after + 12, 0);
     dma.write32(cmd_trb_off, d0);
     dma.write32(cmd_trb_off + 4, d1);
     dma.write32(cmd_trb_off + 8, d2);
@@ -1498,8 +1535,7 @@ fn configure_as_hub(
     dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
     dma.write32(iep0 + 16, 8);
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let ce = run_command(
         ctx,
         dma,
@@ -1549,8 +1585,7 @@ fn address_downstream(
     cmd_idx: &mut usize,
 ) -> Option<(u32, u16, u16, u8)> {
     // Enable Slot.
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let (comp, slot) = run_command(
         ctx,
         dma,
@@ -1632,8 +1667,7 @@ fn address_downstream(
     );
     // Address Device.
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let (comp, _) = run_command(
         ctx,
         dma,
@@ -2012,8 +2046,7 @@ fn read_config_and_bind(
     dma.write32(iep + 8, (int_tr as u32 & !0xF) | 1);
     dma.write32(iep + 12, (int_tr >> 32) as u32);
     dma.write32(iep + 16, ep_mps as u32 | ((ep_mps as u32) << 16));
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
     let ce = run_command(
         ctx,
@@ -2356,8 +2389,7 @@ fn bind_msc(
         dma.write32(iep + 16, m.mps as u32);
     }
 
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
     let ce = run_command(
         ctx,
@@ -2700,8 +2732,7 @@ fn enumerate_one(
     ));
 
     // Enable Slot.
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let (comp, slot) = match run_command(
         ctx,
         dma,
@@ -2759,8 +2790,7 @@ fn enumerate_one(
         dma.phys_at(device_ctx_off(dev_idx)),
     );
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
-    *cmd_idx += 1;
+    let cmd_off = next_cmd(cmd_idx);
     let (comp, _) = match run_command(
         ctx,
         dma,
@@ -3257,6 +3287,8 @@ fn enumerate_one(
                     if radio.is_none() {
                         r.hub_slot = slot;
                         r.hub_port = dp as u32;
+                        r.hub_dev = dev_idx;
+                        r.hub_ttt = ttt;
                         *radio = Some(r);
                     } else {
                         ctx.log_fmt(format_args!(
@@ -3731,6 +3763,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             dma.write64(DCBAA_OFF, dma.phys_at(SCRATCHPAD_SBA_OFF));
         }
         wr64(&mmio, op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
+        // The command ring's Link TRB, back to its first slot, Toggle Cycle clear (`next_cmd`).
+        let link = CMD_RING_OFF + (CMD_RING_SLOTS - 1) * TRB_SIZE;
+        dma.write64(link, dma.phys_at(CMD_RING_OFF));
+        dma.write32(link + 8, 0);
+        dma.write32(link + 12, (TRB_LINK << 10) | 1);
         wr64(&mmio, op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
         dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF));
         dma.write32(ERST_OFF + 8, EVENT_RING_TRBS as u32);
@@ -4384,6 +4421,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 present |= 1 << p;
             }
         }
+        // THE DONGLE'S PORT, HANDLED ALONE (`rebind`): what a fault of the dongle behind a hub asks for,
+        // done after this pass's scans, and where it last was - so a device arriving there is brought up
+        // on its own rather than by re-enumerating the whole controller.
+        let mut dongle_job: Option<DongleJob> = None;
+        let mut dongle_last: Option<rebind::DonglePort> = radio.as_ref().and_then(rebind::DonglePort::of);
         'poll: loop {
             // THE PASS COUNTER, first statement of the pass and ahead of every exit from it.
             //
@@ -4666,10 +4708,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the block server's to judge.
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
                 match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
-                    radio::Served::Reenumerate => {
-                        ctx.log("xhci: the WiFi dongle's control endpoint could not be repaired - re-scanning (unplugged?)");
-                        continue 'reenum;
-                    }
+                    radio::Served::Reenumerate => match radio.as_ref().and_then(rebind::DonglePort::of) {
+                        Some(at) => {
+                            ctx.log_fmt(format_args!(
+                                "xhci: the WiFi dongle's control endpoint could not be repaired - resetting its hub port {} alone; the rest of the bus is left as it is",
+                                at.hub_port));
+                            dongle_job = Some(DongleJob::Rebind(at));
+                        }
+                        None => {
+                            ctx.log("xhci: the WiFi dongle's control endpoint could not be repaired - re-scanning (unplugged?)");
+                            continue 'reenum;
+                        }
+                    },
                     radio::Served::Done => {}
                     radio::Served::NotOurs => {
                         if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops) {
@@ -4728,10 +4778,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 served += 1;
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
                 match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
-                    radio::Served::Reenumerate => {
-                        ctx.log("xhci: the WiFi dongle's control endpoint could not be repaired - re-scanning (unplugged?)");
-                        continue 'reenum;
-                    }
+                    radio::Served::Reenumerate => match radio.as_ref().and_then(rebind::DonglePort::of) {
+                        Some(at) => {
+                            ctx.log_fmt(format_args!(
+                                "xhci: the WiFi dongle's control endpoint could not be repaired - resetting its hub port {} alone; the rest of the bus is left as it is",
+                                at.hub_port));
+                            dongle_job = Some(DongleJob::Rebind(at));
+                        }
+                        None => {
+                            ctx.log("xhci: the WiFi dongle's control endpoint could not be repaired - re-scanning (unplugged?)");
+                            continue 'reenum;
+                        }
+                    },
                     radio::Served::Done => {}
                     radio::Served::NotOurs => {
                         disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops);
@@ -5277,12 +5335,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 && { hub_seen[hp as usize] = hub_seen[hp as usize].saturating_add(1);
                                      hub_seen[hp as usize] >= 2 } => {
                                 hub_tried |= 1u64 << hp;
-                                ctx.log_fmt(format_args!(
-                                    "xhci: new device on hub slot {} port {} - re-enumerating",
-                                    hub_slot, hp
-                                ));
-                                announce = true;
-                                break 'poll;
+                                match dongle_last.filter(|d| radio.is_none() && d.hub_slot == hub_slot && d.hub_port == hp as u32) {
+                                    Some(at) => {
+                                        ctx.log_fmt(format_args!(
+                                            "xhci: a device on hub slot {} port {}, where the WiFi dongle was - bringing that port up alone",
+                                            hub_slot, hp));
+                                        dongle_job = Some(DongleJob::Rebind(at));
+                                    }
+                                    None => {
+                                        ctx.log_fmt(format_args!(
+                                            "xhci: new device on hub slot {} port {} - re-enumerating",
+                                            hub_slot, hp
+                                        ));
+                                        announce = true;
+                                        break 'poll;
+                                    }
+                                }
                             }
                             // The WiFi dongle's hub port reading disconnected: an unplug once it reads so
                             // twice running, then re-enumerated so the pass after reports it gone.
@@ -5290,11 +5358,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 radio_absent_seen += 1;
                                 if radio_absent_seen >= 2 {
                                     ctx.log_fmt(format_args!(
-                                        "xhci: the WiFi dongle is gone (hub slot {} port {} reports disconnected) - re-enumerating",
+                                        "xhci: the WiFi dongle is gone (hub slot {} port {} reports disconnected) - releasing it alone; the rest of the bus is left as it is",
                                         hub_slot, hp));
                                     radio_absent_seen = 0;
-                                    announce = true;
-                                    break 'poll;
+                                    dongle_job = Some(DongleJob::Release);
                                 }
                             }
                             Some(false) if hp < 64 => {
@@ -5396,25 +5463,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // Connected AND not already tried: a real arrival.
                             Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0 => {
                                 hub_tried |= 1u64 << hp;
-                                ctx.log_fmt(format_args!(
-                                    "xhci: device arrived on hub slot {} port {} - re-enumerating", hs, hp));
-                                announce = true;
-                                disk_hub_cur = cur;
-                                disk_hub_pcs = pcs;
-                                break 'poll;
+                                match dongle_last.filter(|d| radio.is_none() && d.hub_slot == hs && d.hub_port == hp) {
+                                    Some(at) => {
+                                        ctx.log_fmt(format_args!(
+                                            "xhci: a device on hub slot {} port {}, where the WiFi dongle was - bringing that port up alone",
+                                            hs, hp));
+                                        dongle_job = Some(DongleJob::Rebind(at));
+                                    }
+                                    None => {
+                                        ctx.log_fmt(format_args!(
+                                            "xhci: device arrived on hub slot {} port {} - re-enumerating", hs, hp));
+                                        announce = true;
+                                        disk_hub_cur = cur;
+                                        disk_hub_pcs = pcs;
+                                        break 'poll;
+                                    }
+                                }
                             }
                             // The WiFi dongle's hub port, as in the HID-driven scan.
                             Some(false) if radio.as_ref().is_some_and(|r| r.hub_slot == hs && r.hub_port == hp as u32) => {
                                 radio_absent_seen += 1;
                                 if radio_absent_seen >= 2 {
                                     ctx.log_fmt(format_args!(
-                                        "xhci: the WiFi dongle is gone (hub slot {} port {} reports disconnected) - re-enumerating",
+                                        "xhci: the WiFi dongle is gone (hub slot {} port {} reports disconnected) - releasing it alone; the rest of the bus is left as it is",
                                         hs, hp));
                                     radio_absent_seen = 0;
-                                    announce = true;
-                                    disk_hub_cur = cur;
-                                    disk_hub_pcs = pcs;
-                                    break 'poll;
+                                    dongle_job = Some(DongleJob::Release);
                                 }
                             }
                             // Gone: forget that we tried, so a replug counts as new again.
@@ -5430,6 +5504,74 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     disk_hub_cur = cur;
                     disk_hub_pcs = pcs;
+                }
+            }
+            // THE DONGLE'S JOB, after the scans so no probe is mid-flight on the hub's ring.
+            if let Some(job) = dongle_job.take() {
+                let at = match job {
+                    DongleJob::Release => None,
+                    DongleJob::Rebind(at) => Some(at),
+                };
+                if let Some(r) = radio.take() {
+                    dongle_last = rebind::DonglePort::of(&r).or(dongle_last);
+                    rebind::release(&ctx, &dma, &mmio, dboff, ir0, r, &mut sa, &mut ev_idx, &mut ev_cycle, &mut cmd_idx);
+                }
+                let mut bound = false;
+                let mut fall_back = false;
+                if let Some(at) = at {
+                    // The hub's EP0 cursor: the probes' for that hub, the disk scan's, or the controller's
+                    // own dequeue when nothing on this hub is probed.
+                    let owner = (0..ndev).find(|&d| devs[d].hub_slot == at.hub_slot).map(|d| cursor_owner[d]);
+                    let on_disk_hub = owner.is_none() && disk.as_ref().is_some_and(|dk| dk.hub_slot == at.hub_slot);
+                    let start = match owner {
+                        Some(o) => Some((hub_cur[o], hub_pcs[o])),
+                        None if on_disk_hub => {
+                            let hoff = disk.as_ref().map_or(0, |dk| dk.hub_off);
+                            Some((disk_hub_cur.max(hoff), disk_hub_pcs))
+                        }
+                        None => ep0_hw_dequeue(&dma, at.hub_dev, ctx_size, EP0_RING_BYTES),
+                    };
+                    match start {
+                        Some((mut cur, mut pcs)) => {
+                            match rebind::rebind(&ctx, &dma, &mmio, dboff, ir0, ctx_size, at, &mut cur, &mut pcs, &mut sa,
+                                                 &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
+                                rebind::Rebound::Radio(mut r) => {
+                                    radio_binds = radio_binds.wrapping_add(1);
+                                    r.gen = radio_binds;
+                                    ctx.log_fmt(format_args!(
+                                        "xhci: the WiFi dongle is bound again on hub port {} (slot {}, binding {}) - nothing else on the bus was reset",
+                                        at.hub_port, r.slot, r.gen));
+                                    radio = Some(r);
+                                    bound = true;
+                                }
+                                rebind::Rebound::NotTheDongle => fall_back = true,
+                                rebind::Rebound::Failed => {}
+                            }
+                            match owner {
+                                Some(o) => { hub_cur[o] = cur; hub_pcs[o] = pcs; }
+                                None if on_disk_hub => { disk_hub_cur = cur; disk_hub_pcs = pcs; }
+                                None => {}
+                            }
+                        }
+                        None => fall_back = true,
+                    }
+                    // A port that failed stays watched: it was marked tried, so the mark is cleared and the
+                    // next confirmed reading tries it again - bounded by the probe cadence.
+                    if !bound && at.hub_port < 64 {
+                        hub_tried &= !(1u64 << at.hub_port);
+                        hub_seen[at.hub_port as usize] = 0;
+                    }
+                }
+                radio::announce(&ctx, radio.as_ref());
+                let radio_now = radio.as_ref().map(|r| r.ids);
+                if Some(radio_now) != radio_was_bound {
+                    notify(&ctx, if radio_now.is_some() { "WiFi dongle connected (xhci)" } else { "WiFi dongle removed (xhci)" });
+                }
+                radio_was_bound = Some(radio_now);
+                if fall_back {
+                    ctx.log("xhci: the dongle's port could not be handled alone - re-enumerating the bus");
+                    announce = true;
+                    break 'poll;
                 }
             }
             // The dongle's bulk IN: a completion another consumer dequeued and filed this pass, and a
