@@ -10688,6 +10688,10 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             // whole bring-up story without the serial log.
             if p.len() >= 15 {
                 nic_link_up = p[7] != 0;   // remember the live link for the net-stack lines below
+                // The carrier in the same words as the eight- and nine-byte answers above. A backend with
+                // a radio answers nine bytes while the cable is out, so a long answer is the cable's; on
+                // the PCs `link up via wifi` and this line are the two halves of one switch.
+                out.line(ctx, if nic_link_up { "link     up via the cable" } else { "link     down - no cable" });
                 let rx_len = u16::from_le_bytes([p[9], p[10]]);
                 let tx_cnt = u16::from_le_bytes([p[11], p[12]]);
                 let rx_cnt = u16::from_le_bytes([p[13], p[14]]);

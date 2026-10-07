@@ -2417,7 +2417,7 @@ device: the keyboard (a Logitech, 046d:c30a) after it left `ehci`, whose split-t
 failed three resets before it was found on `xhci`'s port 7. `ehci` went on resetting port 1 for 12 s after
 the keyboard had moved.
 
-## 40. The key store, read back (2026-10-07) - an instrument for section 39's refused frames; built, not yet on hardware
+## 40. The key store, read back (2026-10-07) - an instrument for section 39's refused frames; on the card the fault did not recur, and the CAM read was not reading the CAM
 
 Section 39's fault: a fresh `wifi-usb` that rejoins from `/wifi.keys` writes both keys, transmits, and
 every frame back comes up `security 0` - the chip found no key for it. The question is whether the key
@@ -2433,7 +2433,7 @@ first frame of that join the chip did not decrypt (`station.rs`, `say_key_store`
   material.
 
 A CAM word is read with `REG_CAM_CMD` (polling bit, no write bit, the word's address) and lands in
-`REG_CAM_READ` (0x0678) - both in the register map in `build/rtl` (`rtl8xxxu_regs.h`, and `RWCAM` / `RCAMO`
+the CAM read register (0x0678, REG_CAM_READ in `rtl8xxxu_regs.h`) - both in the register map in `build/rtl` (`rtl8xxxu_regs.h`, and `RWCAM` / `RCAMO`
 in `rtl8192cu_sw.c`). The code that drives the read in Linux is not in `build/rtl`, so the wait is this
 driver's: 100 us, as a write gets, then the polling bit must be clear or the read says it did not
 complete. Ten control transfers, a few milliseconds, once per join and once per bad join.
@@ -2459,3 +2459,38 @@ card, so a plug-in now rejoins from it - section 39's failing case:
 - `not read back: the CAM read did not complete`: the read sequence is wrong and this instrument has
   said nothing about the CAM; `REG_CR` and SECURITY_CFG are not read either, since the read stops at the
   first error. Recorded so the next reader does not take silence for a result.
+
+**The card's run (T630, 2026-10-07).** Booted with the dongle in and the cable out; the operator then
+power-cycled the radio twice, turned it off and on, and plugged the cable in and out.
+- **Section 39's fault did not recur.** Four joins from `/wifi.keys` - the boot's rejoin, the rejoin after
+  each `powercycle`, and after `radio off`/`on` - and every one decrypted: `ping 8.8.8.8` answered each time,
+  20 of 20 in the longest run. Two `did not decrypt` frames in the whole session, each a single frame, against
+  every frame of three joins in section 39. Section 39 failed 3 of 3; this run 0 of 4. That is a fault
+  that comes and goes, and this run does not say why. **And the instrument is suspect in its own right:** it
+  adds about ten control transfers right after the keys go in, before the first data frame, which is
+  exactly the kind of change that hides a timing fault. So "it did not recur" is not "it is fixed", and the
+  instrument staying in is not neutral (see what was kept, below).
+- **`REG_CR`'s security bit and `SECURITY_CFG` read as written**: `0x02ff (security on)`, `0xcf`, after
+  every join.
+- **The CAM read was wrong.** Both entries read `control 0xff10`, address all zeros, after every join - for
+  a pairwise entry and a group entry written with different control words (the group one with its group
+  bit and key id 2) at the access point's address. A read that returns the same word for two different
+  entries is not reading them. It is taken out: a log line that looks like a fact and is not one is worse
+  than no line. What stays is the two enables. Reading the CAM properly needs the read sequence Linux
+  drives (rtlwifi's CAM code), which is not in `build/rtl`; it is not guessed at a second time.
+- **The cable path on the RTL8168, and the switch both ways, confirmed** (section 39's steps 1 and 4).
+  Cable in while the radio carried a ping: `the cable carries the link; the radio stands by`, a lease on
+  the cable's network, and the ping ran on without losing a reply; `net` showed `nic-link UP 1000M full`
+  and the chip's tally. Cable out again: `the cable is out - the radio carries the link`, `net-stack`
+  re-configured on the dongle's address and leased again.
+
+**And `net` with the cable in did not SAY the cable carries the link.** With the cable out `net` prints
+`link up via wifi (the cable is out)`, from the nine-byte answer; with the cable in the RTL8168 answers 32
+bytes, and the shell printed the `nic-link` line for it but no `link` line at all, so a reader had to know
+that `nic-link UP` means the cable. The shell now prints `link     up via the cable` (or `down - no
+cable`) for the long answer too, the same words the eight- and nine-byte answers use. The operator's
+report; a shell change only.
+
+**Prediction for the next card (T630):** `net` with the cable in shows `link     up via the cable` above
+the `nic-link` line; with the cable out, `link     up via wifi (the cable is out)` as before. After every
+join, one `key store after the join` line with `security on` and `0xcf`, and no `CAM entry` lines.

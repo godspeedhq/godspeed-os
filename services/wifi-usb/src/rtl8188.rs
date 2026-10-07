@@ -626,43 +626,19 @@ pub fn install_key(
     Ok(())
 }
 
-/// Where a CAM word read lands: `REG_CAM_READ` in `rtl8xxxu_regs.h`, `RCAMO` in `rtl8192cu_sw.c`'s map.
-const REG_CAM_READ: u16 = 0x0678;
-
-/// What the key store holds, read back (`docs/wifi-usb.md` 40): `REG_CR` (its bit 9 the security
-/// enable), `REG_SECURITY_CFG`, and words 0 and 1 of CAM entries 0 and 1 - the control word with the
-/// address's first two bytes, and its last four. Never the key words (2-5): a read-back for a log must
-/// not carry key material.
+/// What the key store's two enables hold, read back (`docs/wifi-usb.md` 40): `REG_CR` (its bit 9 the
+/// security enable) and `REG_SECURITY_CFG`. The CAM entries are NOT read: the first card's read of them
+/// (`REG_CAM_CMD` with the polling bit, the word from 0x0678) returned the same word, 0xff10 with a zero
+/// address, for a pairwise and a group entry that were written differently, so it was not reading the
+/// CAM, and a reading that looks like a fact and is not one was taken out rather than left in the log.
 pub struct KeyStore {
     pub cr: u16,
     pub sec_cfg: u8,
-    pub cam: [[u32; 2]; 2],
 }
 
-/// One CAM word: the read command is `REG_CAM_CMD` with the polling bit and no write bit (rtlwifi's read
-/// command value is 0, in `rtl8192ce_reg.h`), and the word lands in `REG_CAM_READ`. The code that drives this in Linux
-/// (rtlwifi's CAM dump) is not in `build/rtl`, so the wait is this driver's: the same 100 us a write is
-/// given, then the polling bit must have cleared, or the read is reported as not done.
-fn cam_word(ctx: &ServiceContext, entry: u8, word: u32) -> Result<u32, &'static str> {
-    write32(ctx, REG_CAM_CMD, CAM_CMD_POLLING | (((entry as u32) << CAM_CMD_KEY_SHIFT) + word))?;
-    delay::hold(ctx, Budget::us(100));
-    if read32(ctx, REG_CAM_CMD)? & CAM_CMD_POLLING != 0 {
-        return Err("the CAM read did not complete (polling bit still set)");
-    }
-    read32(ctx, REG_CAM_READ)
-}
-
-/// The key store, read back - see [`KeyStore`].
+/// The key store's enables, read back - see [`KeyStore`].
 pub fn key_store(ctx: &ServiceContext) -> Result<KeyStore, &'static str> {
-    let cr = read16(ctx, REG_CR)?;
-    let sec_cfg = read8(ctx, REG_SECURITY_CFG)?;
-    let mut cam = [[0u32; 2]; 2];
-    for e in 0..2u8 {
-        for w in 0..2u32 {
-            cam[e as usize][w as usize] = cam_word(ctx, e, w)?;
-        }
-    }
-    Ok(KeyStore { cr, sec_cfg, cam })
+    Ok(KeyStore { cr: read16(ctx, REG_CR)?, sec_cfg: read8(ctx, REG_SECURITY_CFG)? })
 }
 
 /// A CAM entry emptied - `rtl8xxxu_set_key`'s `DISABLE_KEY`: zero written to the entry's control word, which

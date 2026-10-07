@@ -324,28 +324,16 @@ impl<'l> Dongle<'l> {
     }
 
     /// The keys out: the kept ones zeroed (`supplicant::forget`) and every CAM entry this join filled emptied.
-    /// THE KEY STORE, READ BACK (`docs/wifi-usb.md` 40) - an instrument for the card where a joined link
-    /// took no frame: every one came up `security 0`, the chip finding no key, with both keys written.
-    /// It says what the chip holds, not what this driver believes it wrote: the security enable in
-    /// `REG_CR`, `REG_SECURITY_CFG` (0xcf is what `install_key` writes), and each CAM entry's control word
-    /// - valid, group, key id, cipher - and address. Never the key itself.
+    /// THE KEY STORE'S ENABLES, READ BACK (`docs/wifi-usb.md` 40) - an instrument for the card where a
+    /// joined link took no frame: every one came up `security 0`, the chip finding no key, with both keys
+    /// written. It says what the chip holds, not what this driver believes it wrote: the security enable
+    /// in `REG_CR` and `REG_SECURITY_CFG` (0xcf is what `install_key` writes). Not the CAM entries - see
+    /// `rtl8188::KeyStore` for why.
     fn say_key_store(&self, ctx: &ServiceContext, when: &str) {
         match rtl8188::key_store(ctx) {
-            Ok(k) => {
-                ctx.log_fmt(format_args!(
-                    "wifi-usb: key store {} - REG_CR={:#06x} (security {}), SECURITY_CFG={:#04x}",
-                    when, k.cr, if k.cr & (1 << 9) != 0 { "on" } else { "OFF" }, k.sec_cfg));
-                for (e, w) in k.cam.iter().enumerate() {
-                    let c = w[0];
-                    let m = [(c >> 16) as u8, (c >> 24) as u8, w[1] as u8, (w[1] >> 8) as u8, (w[1] >> 16) as u8, (w[1] >> 24) as u8];
-                    ctx.log_fmt(format_args!(
-                        "wifi-usb:   CAM entry {}: control {:#06x} - {}, {}, key id {}, cipher {}; address {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        e, c & 0xffff,
-                        if c & (1 << 15) != 0 { "valid" } else { "NOT valid" },
-                        if c & (1 << 6) != 0 { "group" } else { "pairwise" },
-                        c & 0x3, (c >> 2) & 0x7, m[0], m[1], m[2], m[3], m[4], m[5]));
-                }
-            }
+            Ok(k) => ctx.log_fmt(format_args!(
+                "wifi-usb: key store {} - REG_CR={:#06x} (security {}), SECURITY_CFG={:#04x}",
+                when, k.cr, if k.cr & (1 << 9) != 0 { "on" } else { "OFF" }, k.sec_cfg)),
             Err(why) => ctx.log_fmt(format_args!("wifi-usb: key store {} - not read back: {}", when, why)),
         }
     }
