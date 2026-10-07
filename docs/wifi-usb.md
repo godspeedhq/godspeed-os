@@ -2583,3 +2583,31 @@ command after it, for which the spec's answer is Command Abort (xHCI 4.6.1.2). N
 USB3 hub, so all of it is hardware-only. It predates this branch - the walk never reached that device
 while ports 10 and 15 could not be addressed at all - and the state now is strictly better than before:
 before the fix the dongle was never seen on the Wyse and a replugged keyboard was always lost.
+
+## 42. The Pi 2 regression card for this branch's shared changes (2026-10-07) - passed; section 39's refused frames seen on the Pi 2 as well
+
+The Pi 2's dongle was hardware-verified before the shared changes of sections 37 to 41 (`wifi hardware`,
+the key-file merge, forget to every radio, the bridge's rate-limited log, the key-store line, the `net`
+link line). One card, cable and dongle in at boot, image from `05574ac0`.
+
+- **Boot:** `dwc2` reported the dongle, the supervisor started `wifi-usb`, it rejoined from `/wifi.keys`
+  and said `key store after the join - REG_CR=0x02ff (security on), SECURITY_CFG=0xcf`.
+- **`wifi hardware`:** one row, `usb RTL8188CUS USB dwc2 joined ... *`.
+- **`net`:** `link up via the cable`, and with the cable out `link up via wifi (the cable is out)`;
+  `ping 8.8.8.8` 6 of 6 over the dongle.
+- **`wifi radio powercycle`:** the restart onto the cold chip rejoined from the key file and `ping` went 7
+  of 7.
+- **The cable in and out three more times:** each switch logged, a 48-ping run across them lost 4.
+- **A replug of the dongle** (binding 2): started, rejoined, carried the link.
+- **`wifi forget`, then `wifi join`:** `/wifi.keys written - 0 network(s)`, then after the join `1
+  network(s)` - the merge and the forget as written.
+- **The bridge's log:** `wifi-usb is not running` appears 0 times - the dongle's driver was running or being
+  started throughout, and the rate limit was not needed. No panic.
+
+**And section 39's fault, on the Pi 2.** After the forget, a second `wifi radio powercycle` (its wait
+quit by the operator), then `wifi join` by hand in that new instance: JOINED, both keys written, both
+enables read back as written - and every frame back `did not decrypt (protected true, security 0, swdec
+true)`, `ping` 0 of 5. So it is **not `xhci`'s and not the key file's**: it happens behind `dwc2`, and to a
+hand-made join as well as a rejoin. What every failure so far shares is a fresh `wifi-usb` instance on a
+chip that has just been brought up; what separates a failing one from a working one is still unknown. In
+this session's cards: four failures in about fifteen fresh joins, on two hosts. `backlog/79` carries it.
