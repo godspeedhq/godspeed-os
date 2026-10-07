@@ -170,3 +170,10 @@ DNS check: `net-stack`'s ops 4 and 0 to `nic-driver` went unanswered for about 2
 `nic-driver`'s replies arrived after `net-stack` had given up (`a reply send FAILED - the reply cap is
 dead`), with no slow or unanswered radio exchange logged in that window. Pings in the same session ran
 at 43-52 ms. Recorded as a sighting; the item stays parked (`docs/wifi-usb.md` 49).
+
+**2026-10-07, later the same day, and reproducible.** On the current image the Pi 4's DNS check failed in
+two `selfcheck`s running, both over the radio, with `nic-driver` answering `net-stack` about 2 s late
+while every radio exchange it made was answered within 2 ms. With the cable in, every lookup resolved. So
+the late answer is on the radio-bridged path on core 1 (which `nic-driver` shares with `net-stack`,
+`block-driver` and `fs`), and DNS is where it shows because a lookup is one request and one reply with
+nothing to retry it but `net-stack`'s own bound. Still parked; `docs/wifi-usb.md` 49 has the split.

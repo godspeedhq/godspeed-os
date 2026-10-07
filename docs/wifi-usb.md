@@ -2927,3 +2927,15 @@ documented beside the code that logs them, not a request from anywhere.) Steps 2
   started, wired from its peers). **Fixed:** the map keeps only what the supervisor restarts (`is_watched`),
   starts for a USB device (`USB_MATCH`), or wires others to (a peer in an image row - `pong`); an on-demand
   program's capability is let go at once (`map_keeps`, `record_name_quiet`).
+
+**The Pi 4 `selfcheck` on the current image (`edd63579`): 527 run, 1 failed, the same DNS check, and split
+by the operator.** With the cable OUT, `net dns google.com` resolved once (on `net-stack`'s retry) in five
+tries: `net-stack`'s receive and transmit requests to `nic-driver` went about 2 s unanswered, and
+`nic-driver`'s replies arrived after `net-stack` had given up, while every exchange `nic-driver` logged
+with the radio was answered within 2 ms. With the cable IN, `net dns google.com` and `net dns example.com`
+resolved every time. So the resolver and the UDP path are sound, and what fails is the radio-bridged path
+on the Pi 4: `nic-driver` answering late on core 1 (`backlog/66`) - and, separately, the radio's network
+is the guest one (`192.168.11.x`, DNS `194.168.4.100`, outside), not the cable's (`192.168.4.x`, DNS the
+router). An earlier draft of this note read the late answers as landing "on a one-second grid"; those
+times are `net-stack`'s own retry boundaries, not `nic-driver`'s wake, and that reading was withdrawn.
+Nothing this branch changed touches `nic-driver`'s GENET path beyond comments.
