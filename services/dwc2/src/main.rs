@@ -726,10 +726,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         if bits & (1 << port) == 0 {
                             continue;
                         }
-                        // Acknowledge FIRST. An unacknowledged change is re-reported forever, and a
-                        // handler that fails partway would then spin on the same event.
-                        hub::clear_connect_change(&ctx, &m, &d, &ht, port);
-                        let connected = hub::port_status(&ctx, &m, &d, &ht, port)
+                        // Acknowledge FIRST - every change bit, not only the connection's. An
+                        // unacknowledged change is re-reported forever, and a handler that fails
+                        // partway would then spin on the same event (`hub::clear_changes`).
+                        let connected = hub::clear_changes(&ctx, &m, &d, &ht, port)
                             .map(|st| st.connected())
                             .unwrap_or(false);
                         if connected {

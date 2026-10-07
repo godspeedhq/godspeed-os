@@ -230,11 +230,25 @@ pub fn status_change(
     Some(bits)
 }
 
-/// Clear a port's CONNECTION-CHANGE flag, so the hub stops reporting the same event forever.
-pub fn clear_connect_change(
+/// Read a port's status and acknowledge EVERY change bit it reports, so the hub stops reporting it.
+///
+/// A hub keeps a port in its status-change bitmap while ANY of the port's change bits is set (USB 2.0
+/// 11.24.2.7.2: connection, enable, suspend, over-current, reset - bits 0 to 4 of wPortChange, cleared
+/// by features 16 to 20). This cleared only the connection change. On the Pi 2 a dongle pulled while its
+/// port was being reset left the reset unfinished and its other change bits set, so the hub reported
+/// port 2 on every pass and the handler logged `device REMOVED` nine thousand times in a minute
+/// (`docs/wifi-usb.md` 45). The status returned is the one read BEFORE the clears, which is the one the
+/// change was about.
+pub fn clear_changes(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8,
-) {
-    let _ = port_feature(ctx, mmio, dma, hub, false, FEAT_C_PORT_CONNECTION, port);
+) -> Option<PortStatus> {
+    let st = port_status(ctx, mmio, dma, hub, port)?;
+    for bit in 0..5u16 {
+        if st.change & (1 << bit) != 0 {
+            let _ = port_feature(ctx, mmio, dma, hub, false, FEAT_C_PORT_CONNECTION + bit, port);
+        }
+    }
+    Some(st)
 }
 
 pub fn port_status(
@@ -298,6 +312,9 @@ pub fn reset_port(
             ctx.log_fmt(format_args!(
                 "dwc2-svc: hub port {} did not finish reset within 200 ms (status={:#06x})",
                 port, st.status));
+            // Acknowledged here too, as the success path above does: a reset that never finished - the
+            // device pulled during it - leaves change bits the hub would otherwise report forever.
+            let _ = clear_changes(ctx, mmio, dma, t, port);
             return None;
         }
     }

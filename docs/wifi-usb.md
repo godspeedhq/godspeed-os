@@ -2692,3 +2692,40 @@ whose own card runs on the Pi 2):**
 4. The dongle plugged back in: bound, joined, `ping` over it.
 **Refuted by** `no completion` behind a USB3 hub again: then the device needs something more than these
 three, and the next reading is its port status after reset, logged in full.
+
+## 45. Section 43's card on the Pi 2 (2026-10-07): the key layout confirmed; and `dwc2`'s hub port change bits, all of them acknowledged now
+
+**The key layout, as predicted.** Four fresh joins - the boot's rejoin, one `wifi radio powercycle`, and
+two replugs of the dongle - each said `pairwise key 0 in CAM entry 4`, `group key 2 in CAM entry 2` and
+`SECURITY_CFG=0xcc`, and every `ping 8.8.8.8` answered (3 of 3, 2 of 2, 36 of 39 across a replug). **Not
+one `did not decrypt`**, to us or to a group, in the whole session - where section 42's Pi 2 card had one
+failing join in four and every working join had refused at least one group frame. One powercycle, not
+the five asked for; the four fresh instances are the evidence, and more joins on the next cards add to
+it. `backlog/79` stays open until they do.
+
+**What the card found instead: `dwc2-svc: port 2 - device REMOVED`, about 9,200 times.** The operator
+moved the dongle from hub port 2 to port 4. As it came out, port 2 read connected once more: `device
+CONNECTED`, then `hub port 2 did not finish reset within 200 ms (status=0x0100)`, `enumeration FAILED;
+nothing bound` - and from then on `port 2 - device REMOVED` on every pass of `dwc2`'s loop, in bursts
+and then about once a second, until the log ended a minute later.
+
+**Why, from the code.** A USB 2.0 hub keeps a port in its status-change bitmap while ANY of the port's
+change bits is set (11.24.2.7.2: connection, enable, suspend, over-current, reset). `dwc2`'s hot-plug
+handler acknowledged only the connection change, and `hub::reset_port`, which acknowledges the reset and
+connection changes when a reset finishes, returned without acknowledging anything when one did not. The
+pulled dongle left a reset unfinished, so the hub went on reporting port 2, and each pass read "not
+connected" and logged the removal again. Which change bit it was is not in the log.
+
+**The fix:** `hub::clear_changes` reads the port's status and clears every change bit it reports. The
+hot-plug handler uses it in place of clearing the connection change alone, and the reset path calls it
+when a reset times out. The status the handler acts on is the one read before the clears.
+
+**Checked:** the Pi 2 and x86 images build and x86 passes every gate. No QEMU device models this hub.
+
+**Prediction, Pi 2, cable out, dongle in:**
+1. Section 43's card again, with more fresh joins: five `wifi radio powercycle`s, each left to finish,
+   each followed by `ping 8.8.8.8`; no `did not decrypt`.
+2. Then the dongle moved between hub ports a few times, quickly, as before. Each move logs one `device
+   REMOVED` and one `device CONNECTED` per port touched, and nothing repeats. A move that catches a port
+   mid-reset logs the reset failure once and goes quiet. **Refuted by** any repeated `device REMOVED`
+   for a port with nothing in it.
