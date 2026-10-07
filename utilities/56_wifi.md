@@ -141,6 +141,7 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi radio off hard` | the CHIP's power, cut and left cut. BLOCKS for about three seconds with NO key, until the driver has left the network, cut the power and the kernel has read the pin back low; the driver then checks the cut on its own bus (a CMD52 50 ms later that nothing should answer) and the shell prints `... - verified: ...`, says unverified when the check could not be made, or `... FAILED ...` when the chip still answered (`docs/wifi.md` 49; not yet run on hardware). There is no `q`, because this cannot be stopped once asked, and no `b` either: it offered `[b] background` until 2026-10-01, but the request is a kernel `Call` and a shell blocked in one cannot read the console, so the key could never have been seen in time. The driver stays alive to answer: `wifi status` says `radio off (hard - the chip is powered down; wifi radio on powers it up)`, every other request answers that the chip is powered down. `wifi radio on` from this state restores the power, prints `radio powered up - starting the driver on the cold chip`, restarts the driver, and watches the cold path like `powercycle` does, ending `radio on succeeded - joined <name>`. About twenty seconds; the soft `off`/`on` stay the two-second switch. `on` after `off hard` can still come up WARM - it did at 09:44 and 14:43 on 2026-10-01 - and then, after its one attempt, returns to the prompt saying `wifi radio powercycle` tries once more; `off hard` cuts and verifies the power, it does not produce a cold chip on demand (`docs/wifi.md` 47, 48). **On a USB dongle (`wifi-usb`, `docs/wifi-usb.md` 18) the power is its port's and is not touched.** `off hard` there is the chip's own power-down, Linux's `rtl8192cu_power_off`: the network left, the firmware asked to stop and stopped from the host if it does not answer, the chip suspended. Its check is that no firmware is marked running. `on` and `powercycle` restart the driver, whose bring-up powers the chip on and uploads its firmware. A dongle that no longer answers on USB cannot be powered down this way; the driver says so, and only unplugging it helps |
 | `wifi radio powercycle` | the CHIP's power, not the firmware's radio switch: the driver cuts and restores it through the kernel's `DevicePower` (its own grant, renewable - CLAUDE.md 12.3), and the shell then restarts the driver, which comes up from power-on and rejoins from `/wifi.keys`. The power request itself is bounded at fifteen seconds before the watch begins. Then it says `radio powered down for 2.0 s - restarting the driver on the cold chip` (with ` (the network is left)` before the dash when it was joined), and BLOCKS with `[q] quit  [b] background`, printing each change of state as the driver answers its status question - `waiting for the driver`, `radio coming up`, `radio up, joining` - and ends in one of two lines: `powercycle succeeded - joined <name>`, or `powercycle failed - <why>` (the driver did not answer, this machine has no control over the radio's power, the driver could not be restarted, or the radio did not rejoin within 90 s and where it got to). VERIFIED: success is a join younger than the watch itself, so a stale answer from before the restart cannot pass for one; and a driver that comes back with its radio down means the chip came up warm - its firmware trapped at start - and the shell reports it and stops: ONE cycle per invocation (attempts on the same chip were not independent, so a retry only hid the cause; `docs/wifi.md` 52), re-runnable by hand. The driver waits 300 ms after power-on before its first command (`POWER_ON_SETTLE_MS`; five seconds was tried in section 52, changed nothing, and was reverted). BOUNDED at the operator's word: a warm chip ends `powercycle failed - the chip came up warm (its firmware trapped at start; ...)`, returns the prompt, and can be run again - nothing needs a reboot. The driver parks its SDIO host for the whole off window. The "warm starts" this paragraph once expected were a slow host - the Arm cores at their minimum clock - and with the `power` service's lease every power cycle has come up cold (`docs/wifi.md` 55-57). `q` leaves the watch. `q` and `b` both return to the prompt and say the power cycle continues in the driver: once the power is cut there is nothing to stop (`docs/wifi.md` 47) |
 | `wifi hardware` | BUILT (section 11): the radios this machine has, one row each - its name, chip, bus, state, network and whether it is the one in use. A report: it pipes |
+| `wifi hardware <radio>` | SPECIFIED, NOT BUILT (section 11a): one radio in full - the chip as the driver read it, its firmware, its address, and the bus it is reached over down to the port and endpoints. Labelled lines, like `wifi info`: it pipes |
 | `wifi hardware use <radio>` | SPECIFIED, NOT BUILT (section 11): choose the radio every other `wifi` verb talks to and that carries the frames when the cable is out - `onboard`, `usb`, or `usb-1a0d` when there is more than one dongle. An action: it does not pipe |
 | `wifi help` | usage, with one real example per row |
 | `wifi version` | version number plus the collective copyright line |
@@ -629,7 +630,7 @@ cable, switch to wifi automatically."*
   2) - one comparison, `Carrier` in its genet backend. `net-stack` never learns there are two links, and
   the `wifi` utility never learns there is a cable.
 
-## 11. Which radio: `wifi hardware` - the report BUILT (2026-10-06); `use` SPECIFIED, NOT BUILT
+## 11. Which radio: `wifi hardware` - the report BUILT (2026-10-06); `use` and one radio in full (11a) SPECIFIED, NOT BUILT
 
 Agreed with the operator on 2026-10-06, while the USB dongle was being brought to `xhci` (`docs/wifi-usb.md`
 section 7, U2). Until then every machine has had at most one radio, and the shell takes the first of its
@@ -718,9 +719,80 @@ frames when the cable is out. It is an action and does not pipe.
   could drop a key the other added. A save re-reads the file and merges before writing.
 - **`nic-driver` asks a radio what it is joined to**, which it does not do today.
 
+### 11a. One radio in full: `wifi hardware <radio>` - SPECIFIED, NOT BUILT
+
+Asked for by the operator on 2026-10-07, as `wifi hardware details usb<x>`. Built without the word
+`details`: naming a radio already means "tell me about this one", as `dir` with and without a path
+does, and `use` is the only other word after `hardware`. A radio name is never `use`, so the two cannot
+be confused.
+
+The report (section 11) is the summary, one row per radio. This is the raw account of one: what the
+driver read from the chip, and how the machine reaches it. Like `wifi info` it is labelled lines, so it
+pipes (`wifi hardware usb | match firmware`), and `| to json` gives one record with these fields.
+
+```
+gsh> wifi hardware usb
+radio      usb
+driver     wifi-usb
+chip       RTL8188CUS - RTL8188C, 1T1R, cut A, TSMC
+id         0bda:8176 (vendor:product)
+address    00:11:22:33:44:55 (efuse)
+firmware   rtl8192cufw_TMSC.bin, version 88.2, running
+bus        USB 2.0 high speed, xhci, root port 1 > hub port 3, slot 3
+endpoints  control 64 B; bulk IN 0x81 512 B; bulk OUT 0x02 0x03 512 B
+queues     high, normal (low unused)
+state      joined home-5g
+```
+
+```
+gsh> wifi hardware onboard
+radio      onboard
+driver     wifi-driver
+chip       CYW43455, revision 6
+address    00:11:22:33:44:66 (from the firmware)
+firmware   7.45.241, running
+bus        SDIO, 4-bit, 50 MHz, function 2 block 512 B
+state      joined home-5g
+```
+
+The dongle's chip, IDs, firmware, endpoints and queues above are what the Pi 4 logged on 2026-10-07. The
+onboard radio's revision, firmware version and clock are illustrative, and both addresses are made up.
+
+**Who says what - one owner per fact** (Commandment III).
+- **The radio's driver** answers the whole record, over a new wire op beside `OP_HARDWARE`. It is the
+  only one the shell already asks, and it is the one that read the chip.
+- **The chip, its address and its firmware** are the driver's own readings: the efuse and the version
+  the firmware reported for the dongle, and the chip ID and firmware version for the onboard radio.
+- **The bus lines on a USB radio come from its host**, which the driver relays: speed, host, port path,
+  slot, endpoints and packet sizes. Today the host tells `wifi-usb` only that a dongle is bound and its
+  IDs, so `usbfn`'s bind answer gains the port path, the speed and the endpoint table. That is a change
+  to `xhci` and `dwc2` as well as the driver. The driver does not work them out itself, because only the
+  host enumerated the device.
+- **On the onboard radio** the bus facts are the driver's own, since the driver is its host.
+
+**When the radio is down** (the driver is running and the chip is not up), the facts that are the
+hardware's are still given: the chip's ID once read, the bus, the endpoints. The readings that need a
+running chip say why they are missing rather than going blank: `firmware   not running - the radio is
+down`. A dongle that is unplugged has no driver running and is not in the report, so `wifi hardware usb`
+says `no radio called 'usb' - wifi hardware lists them`, the same sentence `use` gives.
+
+**What it is not.** It is not `wifi debug`: no counters, no event history, no register dumps. Those are
+the driver's account of its own work and stay there. This shows what the hardware IS and how it is
+reached. Nothing here is written to the chip, and nothing is read from it that the driver does not
+already hold, so asking costs no traffic on the bus.
+
+**The address is shown on the console and in the record**, as `wifi info` shows the network's. It is the
+operator's own device. The rule that keeps addresses out of the repository is about commits, not about
+what the machine tells its owner.
+
+**Refused, with a sentence:** a name that is not in the report: `no radio called 'usb-9999' - wifi
+hardware lists them`; and plain `usb` when there are two dongles: `there are two USB radios - usb-1a0d or
+usb-77e2`. These are section 11's sentences, shared.
+
 **More than one dongle is named now and built later.** Today each USB host binds one radio, and one
 `wifi-usb` drives one dongle. Two need either a `wifi-usb` per dongle or one serving several, plus a host
 that binds more than one. The names and the report are designed for many so they need no change then;
 the support itself waits until two are plugged in (CLAUDE.md 26.2).
 
-**Tab completion** (rule 9): `hardware`, then `use`, then the names in the report.
+**Tab completion** (rule 9): `hardware`, then `use` or a name in the report, then after `use` the
+names in the report.
