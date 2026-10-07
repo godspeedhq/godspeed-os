@@ -2939,3 +2939,6 @@ is the guest one (`192.168.11.x`, DNS `194.168.4.100`, outside), not the cable's
 router). An earlier draft of this note read the late answers as landing "on a one-second grid"; those
 times are `net-stack`'s own retry boundaries, not `nic-driver`'s wake, and that reading was withdrawn.
 Nothing this branch changed touches `nic-driver`'s GENET path beyond comments.
+
+**And `selfcheck` with the cable in, same boot: 527 run, 0 failed** (the operator). The one failure on the
+radio is the radio-bridged path's (`backlog/66`), not anything `selfcheck` checks being broken.
