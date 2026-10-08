@@ -592,6 +592,18 @@ static WEDGE_PANICKED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 static CORE_LEAVING: PerCore<CachePaddedU64> = PerCore::new();
 
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
+/// This core's interrupt count and idle-halt count AT its last progress stamp (`CORE_LAST_TICK_TSC`).
+///
+/// The liveness panic printed the interrupt count SINCE BOOT, and its comment says that count is what
+/// tells the two wedges apart: a core that stopped receiving its timer, and a core that receives it
+/// but whose handler skips the stamp. A since-boot total cannot do that - it is nonzero in both, and
+/// on the T630 on 2026-10-08 it read 57444 for an idle core 2 that had been dark for 3 s, which says
+/// nothing either way. The panic now subtracts these, so it reports what arrived AFTER the last stamp:
+/// 0 interrupts means the timer stopped reaching the core; any more means the stamp is being skipped.
+/// The halt count says the same of the idle path: a core that halted after its last stamp and took
+/// nothing since went to sleep with no wake armed.
+static CORE_IRQS_AT_STAMP: PerCore<CachePaddedU64> = PerCore::new();
+static CORE_HALTS_AT_STAMP: PerCore<CachePaddedU64> = PerCore::new();
 /// A wake that arrived for a task which was RUNNABLE at the time, and so left no other trace.
 ///
 /// The block-then-wake handshake detects a racing wake by CAS: `block_and_reschedule` moves the task
@@ -750,6 +762,8 @@ pub fn init_arenas(n: usize) {
     CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LAST_TICK_TSC.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_IRQS_AT_STAMP.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_HALTS_AT_STAMP.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LEAVING.init_with(n, |_| CachePaddedU64(AtomicU64::new(IDLE as u64)));
     CORE_IDLE_HALTS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
@@ -1625,6 +1639,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // shootdown/critical-section is milliseconds, so the ~3 s deadline cannot false-fire.
         let now = crate::arch::imp::read_cycle_counter();
         CORE_LAST_TICK_TSC.get(cid).0.store(now, Ordering::Relaxed);
+        // What this core had taken at this stamp, so a panic can say what came AFTER it (see
+        // `CORE_IRQS_AT_STAMP`). Two relaxed stores per tick; the reader is a panic.
+        let (irqs_now, _) = crate::arch::imp::core_irq_debug(cid as u32);
+        CORE_IRQS_AT_STAMP.get(cid).0.store(irqs_now as u64, Ordering::Relaxed);
+        CORE_HALTS_AT_STAMP.get(cid).0.store(CORE_IDLE_HALTS.get(cid).0.load(Ordering::Relaxed), Ordering::Relaxed);
         // The deadline comes from the ARCH, in the same units as `read_cycle_counter`, because the two
         // must agree and only the arch knows both. It used to be derived here from
         // `tsc_ticks_per_quantum() * 300`, which silently disabled the whole watchdog on any arch whose
@@ -1659,6 +1678,13 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // means the core is not taking interrupts at all, a climbing one means it is and
                     // the tick inside the handler is being skipped. Same symptom, opposite causes.
                     let (irqs, last_src) = crate::arch::imp::core_irq_debug(other as u32);
+                    // SINCE THE LAST STAMP, which is the reading that separates the two causes; the
+                    // since-boot total above cannot (see `CORE_IRQS_AT_STAMP`). The count is a u32
+                    // on every arch, so the difference is taken in u32 and survives a wrap.
+                    let irqs_at = CORE_IRQS_AT_STAMP.get(other).0.load(Ordering::Relaxed) as u32;
+                    let irqs_since = irqs.wrapping_sub(irqs_at);
+                    let halts_since = CORE_IDLE_HALTS.get(other).0.load(Ordering::Relaxed)
+                        .wrapping_sub(CORE_HALTS_AT_STAMP.get(other).0.load(Ordering::Relaxed));
                     // SAY "IDLE" WHEN IT WAS IDLE. `CORE_CURRENT` holds `IDLE` (== MAX_TASKS) when a
                     // core has nothing to run, and printing that as "last running task slot 224" sent
                     // a reader hunting a task that does not exist - 224 is not a slot, it is the
@@ -1690,9 +1716,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     }
                     panic!(
                         "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
-                         allowed); it was running {} {} '{}'; it has taken {} timer interrupts, last vector \
-                         {:#010x}; detected by core {}. No forward progress = loud stop.",
-                        other, dark, dark / deadline, deadline, what, slot_num, stuck_name, irqs, last_src, cid
+                         allowed); it was running {} {} '{}'; since its last stamp it has taken {} timer \
+                         interrupts and halted {} times in idle ({} timer interrupts since boot, last vector \
+                         {:#010x}); detected by core {}. No forward progress = loud stop.",
+                        other, dark, dark / deadline, deadline, what, slot_num, stuck_name, irqs_since,
+                        halts_since, irqs, last_src, cid
                     );
                 }
             }
