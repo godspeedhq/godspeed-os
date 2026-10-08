@@ -2853,7 +2853,7 @@ the shell's verbs already fall back; the driver's rejoin at start does not.
 **Prediction, Pi 4:** with the choice still on `usb`, `wifi radio powercycle` ends within a few seconds of
 `radio up` with the line above; `wifi hardware use onboard`, then `wifi radio powercycle`, rejoins.
 
-## 49. A radio the choice does not name stands in for a chosen dongle that is not attached, and stands down when it arrives (2026-10-07) - built, not yet on hardware
+## 49. A radio the choice does not name stands in for a chosen dongle that is not attached, and stands down when it arrives (2026-10-07) - hardware-verified on the Pi 4 the same day and on the VisionFive (section 50)
 
 The operator's decision, after section 48: "if a wifi hardware isn't available, fall back to the onboard".
 `nic-driver`'s bridge and the shell's verbs already fell back; the radio driver's own rejoin at start did
@@ -2956,3 +2956,46 @@ failed - `PASS  dns - names resolve over a network that is proven reachable`. So
 its DNS server are ruled out as the Pi 4's cause, and so is anything in the resolver or the shared radio
 bridge (`radio.rs`): what fails is specific to the Pi 4. The Pi 2 image also carries the name-map change
 (`map_keeps`), seen here for the first time on that board.
+
+## 50. The three boards on one build (2026-10-08): DNS over every radio, a 1000-round chaos run each, `selfcheck` clean - hardware-verified on the Pi 2, the Pi 4 and the VisionFive
+
+What changed since section 49, all of it on the cards below:
+
+- **An empty message is a message on every port** (`e3fcf7ed`). `nic-driver` answers a drain that found no
+  frame with an empty message, and the kernel refused one on x86, AArch64 and RISC-V; ARM32 accepted it.
+  So over the radio, where most drains are empty while an answer is in flight, `net-stack` waited out a
+  second per drain and `net dns` ran out of time - on the Pi 4 and the VisionFive, never on the Pi 2,
+  which is what section 49's Pi 2 card was showing. Found with a kernel flight recorder; `backlog/66` has
+  the account, and section 49's correction above.
+- **The instruments that found it are out** (`b77c7dd5`), and `osdev test shell` no longer passes a `net
+  dns` that `net-stack` did not answer.
+- **The supervisor hands a `SPAWN` caller the cap to an on-demand program again** (`0a179048`): section 49's
+  name-map change let it go before the caller was answered.
+- **A link the access point drops is rejoined once** (`9261f7d5`), when it had lasted a minute or more -
+  the VisionFive was disassociated for inactivity (reason 4) after half an hour idle and waited for `wifi
+  join`. Built, x86 `osdev test shell` 215 of 215; **not yet seen on hardware**, because no access point
+  dropped a board on any card below.
+
+**The cards.** Cable out on every board, the radio carrying the link.
+
+| Board | radio | `net dns example.com` | chaos | after chaos | `selfcheck` |
+|---|---|---|---|---|---|
+| VisionFive 2 Lite (`0a179048`) | AIC8800, onboard | 9 of 9 at boot | `max-carnage 1000`: 7019 kills, kernel alive | the radio rejoined on its own (as a stand-in, section 49) | 526 run, 0 failed - before chaos, and after a `wifi join` |
+| VisionFive 2 Lite (`9261f7d5`) | AIC8800, onboard | - | `max-carnage all-services 100`: 701 kills, `wifi-driver` killed 24 times | rejoined on its own; `ping` 4 of 4 | - |
+| Raspberry Pi 4 (`9261f7d5`) | CYW43455, onboard | 7 of 7 at boot, 6 of 6 after chaos | `max-carnage all-services 1000`: 7488 kills, kernel alive | rejoined on its own 8 s after; `ping` 2 of 2 | 526 run, 0 failed, 0 skipped |
+| Raspberry Pi 2 (`9261f7d5`) | RTL8188CUS dongle | 9 of 9 after chaos | `max-carnage 1000`: 6682 kills, kernel alive, no page-table arena refusal (section 47) | the dongle rejoined on its own 6 s after; `ping` 2 of 2 | 517 run, 0 failed, 1 skipped (`hw-enumerator`: no PCI) |
+
+The VisionFive also resolved twenty of twenty over WiFi on `e3fcf7ed`, and with the cable in, before the
+instruments came out.
+
+**Read with them:**
+- **After the VisionFive's 1000-round run the WiFi had to be joined again by hand.** Not chaos: the radio
+  rejoined 14 s after the run, and half an hour later the access point disassociated the idle board
+  (`SM_DISCONNECT_IND`, reason 4). The driver then waited for `wifi join`, by design at the time - which
+  is the `9261f7d5` change above.
+- **`1000 spawns (999 refused)`** on every board is chaos's design, not a fault: the first `mem-pressure`
+  task holds its memory until chaos ends, and every later spawn is refused as already running. The
+  supervisor's line for each, `spawn 'mem-pressure' from image FAILED (InvalidArgument)`, does not say
+  why; the kernel's `already running` before it does.
+- **`reply send FAILED` lines** in the chaos runs are all inside them, from requesters chaos had killed.
+- **The Pi 4's `selfcheck` DNS check passes again** - the one it failed on 2026-10-07, section 49.
