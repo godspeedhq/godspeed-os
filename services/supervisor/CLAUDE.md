@@ -13,6 +13,9 @@ unkillable thing. Spawned directly by the kernel (init removed, Phase 5).
 - Kill and restart failed services.
 - Expose `kill` and `restart` API (§14.4).
 - Log all lifecycle events.
+- Keep a bounded record of what happens to the devices it drives - a driver's death and restart, a USB
+  device attached or removed (`DevEvents`, the newest 32) - and answer it as `supcmd::EVENTS` for
+  `hardware events`. Volatile: a respawned supervisor starts an empty record and says from when.
 
 ## Build features
 

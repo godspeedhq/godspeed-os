@@ -903,10 +903,10 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("no section or device 'banana'"), "hardware: an unknown name says so"),
         None => { println!("shell-test: FAIL - timed out after `hardware banana`"); fail += 1; }
     }
-    send(&mut write_half, b"hardware problems\r");
+    send(&mut write_half, b"hardware power\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("designed, not built yet"), "hardware: a word not built yet says so"),
-        None => { println!("shell-test: FAIL - timed out after `hardware problems`"); fail += 1; }
+        None => { println!("shell-test: FAIL - timed out after `hardware power`"); fail += 1; }
     }
     // hardware step 2 (utilities/58_hardware.md), with NO kernel change: the live configuration space
     // from hw-enumerator's op 4, the driver's capabilities, and the supervisor's recorded reason. The
@@ -952,6 +952,43 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("GodspeedOS hardware report") && r.contains("authority  nic-driver"),
                           "hardware report: the overview and each driven device in full"),
         None => { println!("shell-test: FAIL - timed out after `hardware report`"); fail += 1; }
+    }
+    // hardware step 3 (utilities/58_hardware.md): problems, tree, firmware - still no kernel change.
+    send(&mut write_half, b"hardware problems\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("problem(s):") && r.contains("not checked: IOMMU faults"),
+                          "hardware problems: a count by severity, and what it did not check said"),
+        None => { println!("shell-test: FAIL - timed out after `hardware problems`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware problems | where severity=error | count\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("0"), "hardware problems: records when piped, and no error on the QEMU machine"),
+        None => { println!("shell-test: FAIL - timed out after `hardware problems | where`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware tree\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("machine  ") && r.contains("- 00:03.0") && !r.contains("ehci"),
+                          "hardware tree: the machine, its PCI devices, and no row for a host this machine lacks"),
+        None => { println!("shell-test: FAIL - timed out after `hardware tree`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware firmware\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("no radio on this machine") && r.contains("only the firmware this OS loads"),
+                          "hardware firmware: no radio in QEMU, said, and what is listed at all"),
+        None => { println!("shell-test: FAIL - timed out after `hardware firmware`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware compare\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("name a saved report"), "hardware compare: with no report, says how to make one"),
+        None => { println!("shell-test: FAIL - timed out after `hardware compare`"); fail += 1; }
+    }
+    // The supervisor's device record. In QEMU nothing has died by this point, so the record may be empty;
+    // what is asserted is that it answers and says what it does not record.
+    send(&mut write_half, b"hardware events\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("recorded by the supervisor since it started") && r.contains("not recorded: what the kernel does"),
+                          "hardware events: the supervisor answers, from when, and what it does not record"),
+        None => { println!("shell-test: FAIL - timed out after `hardware events`"); fail += 1; }
     }
     // events log boot (utilities/47_events.md): the KERNEL'S fixed copy of the boot, which never wraps.
     // It must hold lines from before the shell existed - the kernel's own core count and the supervisor

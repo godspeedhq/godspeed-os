@@ -984,7 +984,8 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     // takes a PATH, which is why `audio` is not in NO_PATH_CMDS: Tab after `audio play ` offers files.
     ("audio",   &["status", "info", "volume", "mute", "unmute", "on", "off", "tone", "play"]),
     // The sections that are built; a device name is the other first word, and it is the machine's.
-    ("hardware", &["cpu", "memory", "pci", "soc", "display", "usb", "interrupts", "report", "why"]),
+    ("hardware", &["cpu", "memory", "pci", "soc", "display", "usb", "interrupts", "report", "why",
+                   "problems", "tree", "firmware", "compare", "events"]),
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
@@ -2087,7 +2088,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
         "wifi"    => cmd_wifi(ctx, s["wifi".len()..].trim(), out),
         "audio"   => cmd_audio(ctx, cwd, s["audio".len()..].trim(), out),
-        "hardware" => cmd_hardware(ctx, s["hardware".len()..].trim(), out),
+        "hardware" => cmd_hardware(ctx, cwd, s["hardware".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -5321,6 +5322,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("hardware interrupts", "how each PCI device interrupts, and the service that drives it", "hardware interrupts"),
             ("hardware why <device>", "why a device is handled as it is: who drives it, and the reason recorded", "hardware why 00:12.0"),
             ("hardware report", "everything, for a bug report", "hardware report | write /hw.txt"),
+            ("hardware problems", "what is wrong now: severity, device, problem, detail", "hardware problems | where severity=error"),
+            ("hardware tree", "every device by how it connects - behind its bridge, under its USB host", "hardware tree"),
+            ("hardware firmware", "the firmware this OS loads, as the driver that loaded it reports it", "hardware firmware"),
+            ("hardware compare <report>", "what changed since a saved report: added, removed, changed", "hardware compare /hw.txt"),
+            ("hardware events", "what happened to the devices, as the supervisor saw it: deaths, restarts, USB attach and removal", "hardware events | last 6"),
             ("hardware | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware | where driver=-"),
         ], true),
         "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
@@ -5637,6 +5643,25 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("hardware", "report") => help_block(ctx, "hardware report", "everything, for a bug report", &[
             ("hardware report", "the overview, the interrupts, every driven device in full, the cores", "hardware report"),
             ("hardware report | write <path>", "keep it; the pipe holds 16 KiB and says when it cut", "hardware report | write /hw.txt"),
+        ], false),
+        ("hardware", "problems") => help_block(ctx, "hardware problems", "what is wrong now, from what each owner answers", &[
+            ("hardware problems", "errors, warnings and notices; IOMMU faults and interrupt counts are not checked - the kernel does not report them", "hardware problems"),
+            ("hardware problems | where severity=error", "records: severity, device, problem, detail", "hardware problems | where severity=error"),
+        ], false),
+        ("hardware", "tree") => help_block(ctx, "hardware tree", "every device by how it connects", &[
+            ("hardware tree", "a PCI device behind its bridge, a USB device under the host that bound it", "hardware tree"),
+            ("hardware tree | where parent=<device>", "records: device, parent, kind, driver", "hardware tree | where parent=xhci"),
+        ], false),
+        ("hardware", "events") => help_block(ctx, "hardware events", "what happened to the devices, as the supervisor saw it", &[
+            ("hardware events", "a driver's death and restart, a USB device attached or removed - since the supervisor started; the kernel's part is not recorded", "hardware events"),
+            ("hardware events | where event=attached", "records: time, device, event, detail", "hardware events | where event=attached"),
+        ], false),
+        ("hardware", "firmware") => help_block(ctx, "hardware firmware", "the firmware this OS loads", &[
+            ("hardware firmware", "each radio's chip and firmware, as its driver reports them", "hardware firmware"),
+        ], false),
+        ("hardware", "compare") => help_block(ctx, "hardware compare", "what changed since a saved report", &[
+            ("hardware compare <report>", "devices added, removed, or with a different kind, driver or state", "hardware compare /hw.txt"),
+            ("hardware report | write <path>", "save one to compare against later", "hardware report | write /hw.txt"),
         ], false),
         ("hardware", "why") => help_block(ctx, "hardware why", "why a device is handled the way it is", &[
             ("hardware why <device>", "who drives it, why that service, and the reason the supervisor records beside its spawn row", "hardware why 00:12.0"),
@@ -7174,12 +7199,14 @@ struct HwRow {
     hw: u32,
     /// For a device its class's driver did not take: that driver's name (`hardware why`).
     takes: HwText<20>,
+    /// For a USB device: the host that bound it (`hardware tree` hangs it there).
+    host: HwText<12>,
 }
 
 impl HwRow {
     const EMPTY: Self = HwRow {
         section: "", device: HwText::EMPTY, kind: HwText::EMPTY, driver: HwText::EMPTY,
-        state: "", detail: HwText::EMPTY, pci: None, hw: 0, takes: HwText::EMPTY,
+        state: "", detail: HwText::EMPTY, pci: None, hw: 0, takes: HwText::EMPTY, host: HwText::EMPTY,
     };
 }
 
@@ -7470,6 +7497,11 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
                         r.state = "not driven";
                         r.takes = HwText::of(format_args!("{}", drv_name[k].as_str()));
                     }
+                    // The IOMMU is the kernel's own (AMD-Vi, CLAUDE.md 6.4): it is driven, by no service.
+                    None if d.class == 0x080600 && ARCH == "x86_64" => {
+                        r.driver = HwText::of(format_args!("kernel"));
+                        r.state = "in use";
+                    }
                     None => {
                         r.driver = HwText::of(format_args!("-"));
                         r.state = "no driver";
@@ -7495,6 +7527,12 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
     for k in 0..nd {
         // A PCI driver, or a kind already shown on its PCI device above.
         if drv_hw[k] & hwclass::PCI != 0 || claimed[k] { continue; }
+        // A kind the kernel resolves on the PCI bus, with no device of its class there and no driver
+        // running: the device is not on this machine (QEMU's `ehci`), so it is not a row - a row would
+        // say "not running" about hardware that does not exist.
+        if f.pci_bus && hw_kind_pci_class(drv_hw[k]).is_some() && slot_of(ctx, drv_name[k].as_str()).is_none() {
+            continue;
+        }
         let Some((section, dev, kind)) = hw_kind(drv_hw[k]) else { continue };
         if matches!(dev, "xhci" | "ehci" | "dwc2") { f.usb_host = true; }
         let name = drv_name[k].as_str();
@@ -7523,6 +7561,7 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
         };
         r.driver = HwText::of(format_args!("{}", name));
         r.state = hw_running(ctx, name);
+        r.host = usb_host[u];
         r.detail = match hw_vendor(vid) {
             Some(v) => HwText::of(format_args!("{}, on {}", v, usb_host[u].as_str())),
             None => HwText::of(format_args!("on {}", usb_host[u].as_str())),
@@ -7565,12 +7604,10 @@ fn hw_absent_reason(section: &str) -> &'static str {
 }
 
 /// The words of the design that are not built yet, answered as such rather than mistaken for a device.
-const HW_NOT_BUILT: &[&str] = &[
-    "problems", "tree", "events", "firmware", "compare", "power",
-];
+const HW_NOT_BUILT: &[&str] = &["power"];
 
 /// `hardware [section[,section...] | device]` - see `utilities/58_hardware.md`.
-fn cmd_hardware(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_hardware(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let arg = arg.trim();
     let first = arg.split_whitespace().next().unwrap_or("");
     let last = arg.split_whitespace().last().unwrap_or("");
@@ -7596,6 +7633,15 @@ fn cmd_hardware(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Sh
     }
     match (first, last) {
         ("interrupts", "interrupts") => { hw_interrupts(ctx, out, &f); return Ok(()); }
+        ("problems", "problems") => { hw_problems(ctx, out, &f); return Ok(()); }
+        ("tree", "tree") => { hw_tree(ctx, out, &f); return Ok(()); }
+        ("firmware", "firmware") => { hw_firmware(ctx, out); return Ok(()); }
+        ("events", "events") => return hw_events(ctx, out, &f),
+        ("compare", _) if first != last => return hw_compare(ctx, cwd, out, &f, arg["compare".len()..].trim()),
+        ("compare", _) => {
+            out.line(ctx, "hardware compare: name a saved report - `hardware report | write /hw.txt`, then later `hardware compare /hw.txt`");
+            return Err(ShellError::Unknown);
+        }
         ("report", "report") => { hw_report(ctx, out, &f); return Ok(()); }
         ("why", _) if first != last => {
             let name = arg["why".len()..].trim();
@@ -8032,12 +8078,21 @@ fn hw_why(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
 
 /// `hardware report`: everything, for a bug report - the overview, the interrupts, each device with a
 /// driver in full, the cores. Text, to paste or `| write`; the pipe holds 16 KiB and says when it cut.
-fn hw_report(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+fn hw_report(ctx: &ShellCtx, out: &mut Out, f: &HwFacts) {
     out.line_fmt(ctx, format_args!("GodspeedOS hardware report - {}", ARCH));
     hw_print(ctx, out, f, 0xFF, false);
     out.line(ctx, "");
+    out.line(ctx, "problems");
+    hw_problems(ctx, out, f);
+    out.line(ctx, "");
     out.line(ctx, "interrupts");
     hw_interrupts(ctx, out, f);
+    out.line(ctx, "");
+    out.line(ctx, "firmware");
+    hw_firmware(ctx, out);
+    out.line(ctx, "");
+    out.line(ctx, "events");
+    let _ = hw_events(ctx, out, f);
     for r in f.rows[..f.n].iter().filter(|r| matches!(r.section, "pci" | "soc" | "display" | "usb")) {
         if r.driver.as_str() == "-" { continue; }
         out.line(ctx, "");
@@ -8047,12 +8102,464 @@ fn hw_report(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
     hw_cpu_debug(ctx, out);
 }
 
+/// Print a record table as a grid through `out`, so a view reads the same at the prompt, inside
+/// `hardware report` and in a capture. An empty table prints `empty` instead, indented as rows are.
+fn hw_grid(ctx: &ServiceContext, out: &mut Out, t: &Table, empty: &str) {
+    if t.nrows() == 0 {
+        out.line_fmt(ctx, format_args!("  {}", empty));
+        return;
+    }
+    let w = t.grid_widths();
+    let mut sink = OutSink { ctx, out };
+    t.grid_header(&mut sink, &w);
+    for r in 0..t.nrows() {
+        t.grid_row(&mut sink, r, &w);
+    }
+}
+
+/// `hardware problems`: what is wrong now, collected from what each owner already answers - the
+/// warning-icon view. One record per problem: `severity` (error, warning, notice), `device`, `problem`,
+/// `detail`. What only the kernel could tell - IOMMU faults, interrupt counts - is not checked, and the
+/// view says so rather than reporting a clean machine it did not look at.
+#[inline(never)]
+fn build_hw_problems(ctx: &ServiceContext, f: &HwFacts) -> Table {
+    use godspeed_sdk::service_context::hwclass;
+    let mut t = Table::new(&["severity", "device", "problem", "detail"]);
+    fn add(t: &mut Table, sev: &str, dev: &str, problem: &str, detail: core::fmt::Arguments) {
+        let d = HwText::<96>::of(detail);
+        let row = [
+            t.intern(sev.as_bytes()),
+            t.intern(dev.as_bytes()),
+            t.intern(problem.as_bytes()),
+            t.intern(d.as_str().as_bytes()),
+        ];
+        t.add_row(&row);
+    }
+    if !f.drivers_known {
+        add(&mut t, "warning", "supervisor", "did not answer", format_args!("which service drives which device is not known"));
+    }
+    if f.dropped > 0 {
+        add(&mut t, "warning", "hardware", "rows left out", format_args!("{} row(s) did not fit - the view holds {}", f.dropped, HW_ROWS));
+    }
+    // A driver counted once, however many rows name it.
+    let mut seen = [HwText::<20>::EMPTY; HW_ROWS];
+    let mut nseen = 0usize;
+    for r in f.rows[..f.n].iter().filter(|r| matches!(r.section, "pci" | "soc" | "display" | "usb")) {
+        let dev = r.device.as_str();
+        let name = r.driver.as_str();
+        match r.state {
+            "not running" => add(&mut t, "error", dev, "driver not running",
+                format_args!("{} is not running, so nothing serves this device", name)),
+            "not driven" => add(&mut t, "notice", dev, "not driven",
+                format_args!("{} drives the first device of this class, and one device only", r.takes.as_str())),
+            "no driver" => {
+                // A bridge is the bus itself, not a device that wants a service.
+                let bridge = r.pci.is_some_and(|d| d.class >> 16 == 0x06);
+                if !bridge {
+                    add(&mut t, "notice", dev, "no driver", format_args!("{} - nothing in this image asks for it", r.kind.as_str()));
+                }
+            }
+            _ => {}
+        }
+        if r.state == "running" && !seen[..nseen].iter().any(|s| s.as_str() == name) {
+            if nseen < seen.len() {
+                seen[nseen] = HwText::of(format_args!("{}", name));
+                nseen += 1;
+            }
+            if let Some(slot) = slot_of(ctx, name) {
+                let st = ctx.task_stat(slot);
+                if st.restart_count > 0 {
+                    add(&mut t, "notice", dev, "restarted",
+                        format_args!("{} restarted {} time(s) this boot", name, st.restart_count));
+                }
+            }
+        }
+        if r.state != "running" { continue; }
+        let Some(d) = r.pci else { continue };
+        let Some(c) = hw_config(ctx, d.idx) else { continue };
+        let has_mem_bar = (0..6).any(|i| { let v = c32(&c, 0x10 + i * 4); v != 0 && v & 1 == 0 });
+        if has_mem_bar && c16(&c, 0x04) & 2 == 0 {
+            add(&mut t, "error", dev, "registers not decoded",
+                format_args!("memory decoding is off, so {} cannot reach its registers", name));
+        }
+        if r.hw & hwclass::PCI_IRQ != 0 {
+            let route = hw_irq_route(&c);
+            if !route.as_str().starts_with("MSI") {
+                add(&mut t, "warning", dev, "no interrupt enabled",
+                    format_args!("its spawn asked for an interrupt; the device shows {}", route.as_str()));
+            }
+        }
+    }
+    t
+}
+
+fn hw_problems(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+    let t = build_hw_problems(ctx, f);
+    hw_grid(ctx, out, &t, "(nothing wrong found)");
+    let mut counts = [0usize; 3];
+    for r in 0..t.nrows() {
+        match t.cell_bytes(r, 0) {
+            b"error" => counts[0] += 1,
+            b"warning" => counts[1] += 1,
+            _ => counts[2] += 1,
+        }
+    }
+    out.line(ctx, "");
+    out.line_fmt(ctx, format_args!("{} problem(s): {} error(s), {} warning(s), {} notice(s)",
+        t.nrows(), counts[0], counts[1], counts[2]));
+    out.line(ctx, "not checked: IOMMU faults and interrupt counts - the kernel does not report them");
+}
+
+/// `hardware tree`: every device by how it connects. A PCI device on a bus behind a bridge hangs under
+/// that bridge (its configuration space names the bus it leads to); a USB device hangs under the host
+/// that bound it. Records: `device`, `parent`, `kind`, `driver`.
+#[inline(never)]
+fn hw_tree_parents(ctx: &ServiceContext, f: &HwFacts, parent: &mut [Option<usize>; HW_ROWS]) {
+    // Which bridge leads to which bus: a bridge's secondary bus number, from its configuration space.
+    let mut buses: [(u8, usize); 16] = [(0, 0); 16];
+    let mut nb = 0usize;
+    for (i, r) in f.rows[..f.n].iter().enumerate() {
+        let Some(d) = r.pci else { continue };
+        if d.class >> 8 != 0x0604 || nb == buses.len() { continue; }
+        if let Some(c) = hw_config(ctx, d.idx) {
+            buses[nb] = (c[0x19], i);
+            nb += 1;
+        }
+    }
+    for (i, r) in f.rows[..f.n].iter().enumerate() {
+        parent[i] = None;
+        if let Some(d) = r.pci {
+            let bus = (d.bdf >> 8) as u8;
+            if bus != 0 {
+                parent[i] = buses[..nb].iter().find(|(b, _)| *b == bus).map(|&(_, at)| at);
+            }
+        } else if r.section == "usb" {
+            let host = r.host.as_str();
+            parent[i] = f.rows[..f.n].iter().position(|h| h.section != "usb" && h.driver.as_str() == host);
+        }
+    }
+}
+
+fn hw_tree(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+    let mut parent = [None; HW_ROWS];
+    hw_tree_parents(ctx, f, &mut parent);
+    let mib = f.total_frames / 256;
+    out.line_fmt(ctx, format_args!("machine  {}", ARCH));
+    out.line_fmt(ctx, format_args!("|- cpu       {} core(s)", f.cores));
+    out.line_fmt(ctx, format_args!("|- memory    {} MiB", mib));
+    // Roots: every device with no parent, grouped under its section.
+    for sec in ["pci", "soc", "display", "usb"] {
+        let roots = (0..f.n).filter(|&i| f.rows[i].section == sec && parent[i].is_none()).count();
+        if roots == 0 { continue; }
+        out.line_fmt(ctx, format_args!("|- {}", sec));
+        // Depth-first with an explicit, bounded stack (26.6.1): (row, depth, is the last child).
+        let mut stack: [(usize, usize, bool); HW_ROWS] = [(0, 0, false); HW_ROWS];
+        let mut sp = 0usize;
+        let mut kids = [0usize; HW_ROWS];
+        let mut nk = 0usize;
+        for i in (0..f.n).rev() {
+            if f.rows[i].section == sec && parent[i].is_none() && nk < kids.len() { kids[nk] = i; nk += 1; }
+        }
+        for (k, &i) in kids[..nk].iter().enumerate() {
+            if sp < stack.len() { stack[sp] = (i, 1, k == 0); sp += 1; }
+        }
+        // Whether each depth's ancestor was the last of its siblings, which decides `|` or a space.
+        let mut last_at = [false; 8];
+        while sp > 0 {
+            sp -= 1;
+            let (i, depth, last) = stack[sp];
+            if depth < last_at.len() { last_at[depth] = last; }
+            let mut lead = HwText::<32>::EMPTY;
+            for d in 1..depth.min(last_at.len()) {
+                let _ = core::fmt::Write::write_str(&mut lead, if last_at[d] { "   " } else { "|  " });
+            }
+            let r = &f.rows[i];
+            out.line_fmt(ctx, format_args!("|  {}{}- {:<12} {:<20} {}", lead.as_str(),
+                if last { "`" } else { "|" }, r.device.as_str(), r.kind.as_str(), r.driver.as_str()));
+            if depth + 1 >= last_at.len() { continue; }
+            nk = 0;
+            for j in (0..f.n).rev() {
+                if parent[j] == Some(i) && nk < kids.len() { kids[nk] = j; nk += 1; }
+            }
+            for (k, &j) in kids[..nk].iter().enumerate() {
+                if sp < stack.len() { stack[sp] = (j, depth + 1, k == 0); sp += 1; }
+            }
+        }
+    }
+}
+
+#[inline(never)]
+fn build_hw_tree(ctx: &ServiceContext, f: &HwFacts) -> Table {
+    let mut parent = [None; HW_ROWS];
+    hw_tree_parents(ctx, f, &mut parent);
+    let mut t = Table::new(&["device", "parent", "kind", "driver"]);
+    for (i, r) in f.rows[..f.n].iter().enumerate() {
+        let p = match parent[i] {
+            Some(at) => f.rows[at].device,
+            None => HwText::of(format_args!("{}", if matches!(r.section, "cpu" | "memory") { "machine" } else { r.section })),
+        };
+        let row = [
+            t.intern(r.device.as_str().as_bytes()),
+            t.intern(p.as_str().as_bytes()),
+            t.intern(r.kind.as_str().as_bytes()),
+            t.intern(r.driver.as_str().as_bytes()),
+        ];
+        t.add_row(&row);
+    }
+    t
+}
+
+/// `hardware firmware`: the firmware this OS loads, as the driver that loaded it reports it - today the
+/// radios (`OP_HARDWARE_DETAIL`'s `chip` and `firmware` facts). A controller's own ROM is not read.
+/// Records: `device`, `driver`, `chip`, `firmware`.
+#[inline(never)]
+fn build_hw_firmware(ctx: &ShellCtx) -> Table {
+    use wifi_wire::*;
+    let mut t = Table::new(&["device", "driver", "chip", "firmware"]);
+    let was = ctx.wifi_radio.get();
+    for (i, &svc) in RADIOS.iter().enumerate() {
+        if slot_of(ctx, svc).is_none() { continue; }
+        ctx.wifi_radio.set(svc);
+        let reply = wifi_ask(ctx, &[OP_HARDWARE_DETAIL], 3000);
+        let mut chip: &[u8] = b"-";
+        let mut fw: &[u8] = b"(the driver did not answer)";
+        let p = reply.as_ref().map(|m| m.payload_bytes()).unwrap_or(&[]);
+        if p.first() == Some(&OK) {
+            fw = b"(not reported)";
+            let count = p.get(1).copied().unwrap_or(0) as usize;
+            let mut at = 2;
+            for _ in 0..count {
+                let Some(&ll) = p.get(at) else { break };
+                let ll = ll as usize;
+                let Some(&vl) = p.get(at + 1 + ll) else { break };
+                let vl = vl as usize;
+                if at + 2 + ll + vl > p.len() { break; }
+                let label = &p[at + 1..at + 1 + ll];
+                let value = &p[at + 2 + ll..at + 2 + ll + vl];
+                if label == b"chip" { chip = value; }
+                if label == b"firmware" { fw = value; }
+                at += 2 + ll + vl;
+            }
+        }
+        let row = [
+            t.intern(if i == 0 { b"onboard" } else { b"usb" }),
+            t.intern(svc.as_bytes()),
+            t.intern(chip),
+            t.intern(fw),
+        ];
+        t.add_row(&row);
+    }
+    ctx.wifi_radio.set(was);
+    t
+}
+
+fn hw_firmware(ctx: &ShellCtx, out: &mut Out) {
+    let t = build_hw_firmware(ctx);
+    hw_grid(ctx, out, &t, "(no radio on this machine - nothing here loads firmware this OS supplies)");
+    out.line(ctx, "only the firmware this OS loads is listed; a controller's own ROM is not read");
+}
+
+/// The saved overview rows `compare` reads back: the fixed columns `hw_print` writes.
+#[derive(Clone, Copy)]
+struct HwSaved {
+    device: HwText<16>,
+    kind: HwText<32>,
+    driver: HwText<20>,
+    state: HwText<12>,
+}
+
+/// One field of a saved overview line, by the column `hw_print` puts it in.
+fn hw_col(line: &str, from: usize, to: usize) -> &str {
+    let b = line.as_bytes();
+    if from >= b.len() { return ""; }
+    let to = to.min(b.len());
+    core::str::from_utf8(&b[from..to]).unwrap_or("").trim()
+}
+
+/// `hardware compare <report>`: what changed since a saved `hardware` or `hardware report` - a device
+/// added, removed, or now with a different kind, driver or state. The detail column is not compared:
+/// it carries live numbers (free memory) that differ on every run. Records: `change`, `device`, `was`,
+/// `now`; `None` when the file cannot be read, said on the console.
+#[inline(never)]
+fn build_hw_compare(ctx: &ShellCtx, cwd: &Cwd, f: &HwFacts, path: &str) -> Option<(Table, usize)> {
+    let mut pbuf = [0u8; PATH_MAX];
+    let Some(pl) = resolve_path(cwd.as_str(), path, &mut pbuf) else {
+        ctx.console_writeln_fmt(format_args!("hardware compare: '{}' is not a path", path));
+        return None;
+    };
+    let mut buf = [0u8; 16 * 1024];
+    let Some(n) = fs_read_file(ctx, &pbuf[..pl], &mut buf, 10) else {
+        ctx.console_writeln_fmt(format_args!(
+            "hardware compare: cannot read '{}' - save one first with `hardware report | write {}`", path, path));
+        return None;
+    };
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut saved = [HwSaved { device: HwText::EMPTY, kind: HwText::EMPTY, driver: HwText::EMPTY, state: HwText::EMPTY }; HW_ROWS];
+    let mut ns = 0usize;
+    let mut in_section = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if !line.starts_with(' ') {
+            in_section = HW_SECTIONS.contains(&line.trim());
+            continue;
+        }
+        if !in_section || !line.starts_with("  ") || line.trim_start().starts_with("DEVICE") || line.trim_start().starts_with('(') {
+            continue;
+        }
+        if ns == saved.len() { break; }
+        saved[ns] = HwSaved {
+            device: HwText::of(format_args!("{}", hw_col(line, 2, 14))),
+            kind: HwText::of(format_args!("{}", hw_col(line, 15, 35))),
+            driver: HwText::of(format_args!("{}", hw_col(line, 36, 50))),
+            state: HwText::of(format_args!("{}", hw_col(line, 51, 62))),
+        };
+        ns += 1;
+    }
+    if ns == 0 {
+        ctx.console_writeln_fmt(format_args!(
+            "hardware compare: '{}' holds no hardware overview - it should be the output of `hardware` or `hardware report`", path));
+        return None;
+    }
+    let mut t = Table::new(&["change", "device", "was", "now"]);
+    let mut same = 0usize;
+    for s in saved[..ns].iter() {
+        let now = f.rows[..f.n].iter().find(|r| r.device.as_str() == s.device.as_str());
+        let was = HwText::<64>::of(format_args!("{}, {}, {}", s.kind.as_str(), s.driver.as_str(), s.state.as_str()));
+        match now {
+            None => {
+                let row = [t.intern(b"removed"), t.intern(s.device.as_str().as_bytes()), t.intern(was.as_str().as_bytes()), t.intern(b"-")];
+                t.add_row(&row);
+            }
+            Some(r) if r.kind.as_str() != s.kind.as_str() || r.driver.as_str() != s.driver.as_str() || r.state != s.state.as_str() => {
+                let is = HwText::<64>::of(format_args!("{}, {}, {}", r.kind.as_str(), r.driver.as_str(), r.state));
+                let row = [t.intern(b"changed"), t.intern(s.device.as_str().as_bytes()), t.intern(was.as_str().as_bytes()), t.intern(is.as_str().as_bytes())];
+                t.add_row(&row);
+            }
+            Some(_) => same += 1,
+        }
+    }
+    for r in f.rows[..f.n].iter() {
+        if saved[..ns].iter().any(|s| s.device.as_str() == r.device.as_str()) { continue; }
+        let is = HwText::<64>::of(format_args!("{}, {}, {}", r.kind.as_str(), r.driver.as_str(), r.state));
+        let row = [t.intern(b"added"), t.intern(r.device.as_str().as_bytes()), t.intern(b"-"), t.intern(is.as_str().as_bytes())];
+        t.add_row(&row);
+    }
+    Some((t, same))
+}
+
+fn hw_compare(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, f: &HwFacts, path: &str) -> Result<(), ShellError> {
+    let Some((t, same)) = build_hw_compare(ctx, cwd, f, path) else { return Err(ShellError::Unknown) };
+    hw_grid(ctx, out, &t, "(no change)");
+    out.line(ctx, "");
+    out.line_fmt(ctx, format_args!("{} changed, {} unchanged - kind, driver and state are compared; the live detail column is not", t.nrows(), same));
+    Ok(())
+}
+
+/// `hardware events`: what has happened to the devices, as the supervisor saw it - a driver's death and
+/// restart, a USB device attached or gone (`supcmd::EVENTS`). Records: `time` (uptime), `device`,
+/// `event`, `detail`. The kernel's own part - grants, confinement, releases, resets - is not recorded,
+/// because `hardware` makes no kernel change; the view says so, and says from when its record runs.
+#[inline(never)]
+fn build_hw_events(ctx: &ServiceContext, f: &HwFacts) -> Option<(Table, u32, u32)> {
+    use godspeed_sdk::service_context::supcmd;
+    let m = hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::EVENTS])?;
+    let p = m.payload_bytes();
+    if p.len() < 10 || p[0] != supcmd::OK { return None; }
+    let since = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+    let recorded = u32::from_le_bytes([p[5], p[6], p[7], p[8]]);
+    let count = p[9] as usize;
+    let mut t = Table::new(&["time", "device", "event", "detail"]);
+    let mut at = 10usize;
+    for _ in 0..count {
+        if at + 10 > p.len() { break; }
+        let secs = u32::from_le_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
+        let what = p[at + 4];
+        let vid = u16::from_le_bytes([p[at + 5], p[at + 6]]);
+        let pid = u16::from_le_bytes([p[at + 7], p[at + 8]]);
+        let nl = p[at + 9] as usize;
+        if at + 10 + nl > p.len() { break; }
+        let name = core::str::from_utf8(&p[at + 10..at + 10 + nl]).unwrap_or("?");
+        at += 10 + nl;
+        // The device, named as the overview names it: a USB device by its IDs, a driver's device by
+        // the row it drives - or the driver's name, when its device is not in the view now.
+        let device = if vid != 0 || pid != 0 {
+            HwText::<16>::of(format_args!("{:04x}:{:04x}", vid, pid))
+        } else {
+            match f.rows[..f.n].iter().find(|r| r.driver.as_str() == name && r.section != "usb") {
+                Some(r) => r.device,
+                None => HwText::of(format_args!("{}", name)),
+            }
+        };
+        let (event, detail) = match what {
+            supcmd::EV_RESTARTED => ("driver died", HwText::<64>::of(format_args!("{}, restarted", name))),
+            supcmd::EV_RESTART_FAILED => ("driver died", HwText::of(format_args!("{}, restart FAILED", name))),
+            supcmd::EV_ATTACHED => ("attached", HwText::of(format_args!("{} started for it", name))),
+            supcmd::EV_DETACHED => ("removed", HwText::of(format_args!("{} stopped", name))),
+            supcmd::EV_SWEPT => ("driver died", HwText::of(format_args!("{}, found dead by the sweep and restarted", name))),
+            _ => ("event", HwText::of(format_args!("{} (code {})", name, what))),
+        };
+        let time = HwText::<12>::of(format_args!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60));
+        let row = [
+            t.intern(time.as_str().as_bytes()),
+            t.intern(device.as_str().as_bytes()),
+            t.intern(event.as_bytes()),
+            t.intern(detail.as_str().as_bytes()),
+        ];
+        t.add_row(&row);
+    }
+    Some((t, since, recorded))
+}
+
+fn hw_events(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) -> Result<(), ShellError> {
+    let Some((t, since, recorded)) = build_hw_events(ctx, f) else {
+        out.line(ctx, "hardware events: the supervisor did not answer - it keeps the record");
+        return Err(ShellError::Unknown);
+    };
+    hw_grid(ctx, out, &t, "(nothing has happened to a device since the supervisor started)");
+    out.line(ctx, "");
+    let lost = recorded.saturating_sub(t.nrows() as u32);
+    out.line_fmt(ctx, format_args!(
+        "time is uptime; recorded by the supervisor since it started at {:02}:{:02}:{:02}{}",
+        since / 3600, (since / 60) % 60, since % 60,
+        if lost > 0 { HwText::<48>::of(format_args!(", {} older event(s) overwritten", lost)) } else { HwText::EMPTY }.as_str()));
+    out.line(ctx, "not recorded: what the kernel does - grants, IOMMU confinement and release, controller resets");
+    Ok(())
+}
+
 /// `hardware` or `hardware <sections>` as records (`docs/hardware-design.md` 3). `#[inline(never)]`
 /// like the other builders: the facts and the table are kept off every other pipeline's frame.
 #[inline(never)]
-fn build_hardware_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
-    if arg.trim() == "interrupts" {
-        return build_hw_interrupts_table(ctx);
+fn build_hardware_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
+    match arg.trim() {
+        "interrupts" => return build_hw_interrupts_table(ctx),
+        "firmware" => return Some(build_hw_firmware(ctx)),
+        a @ ("problems" | "tree" | "events") => {
+            let mut f = HwFacts {
+                rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+                pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+            };
+            hw_gather(ctx, &mut f);
+            return match a {
+                "problems" => Some(build_hw_problems(ctx, &f)),
+                "tree" => Some(build_hw_tree(ctx, &f)),
+                _ => match build_hw_events(ctx, &f) {
+                    Some((t, _, _)) => Some(t),
+                    None => {
+                        ctx.console_writeln("hardware events: the supervisor did not answer - it keeps the record");
+                        None
+                    }
+                },
+            };
+        }
+        a if a.starts_with("compare ") => {
+            let mut f = HwFacts {
+                rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+                pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+            };
+            hw_gather(ctx, &mut f);
+            return build_hw_compare(ctx, cwd, &f, a["compare".len()..].trim()).map(|(t, _)| t);
+        }
+        _ => {}
     }
     let mask = if arg.trim().is_empty() { 0xFF } else { hw_sections(arg)? };
     let mut f = HwFacts {
@@ -12777,7 +13284,8 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
     // `hardware` and `hardware <sections>` are a table; one device is labelled lines.
     let hardware_records = c0 == "hardware" && {
         let a = split_first(stages[0]).1.trim();
-        a.is_empty() || a == "interrupts" || hw_sections(a).is_some()
+        a.is_empty() || matches!(a, "interrupts" | "problems" | "tree" | "firmware" | "events")
+            || a.starts_with("compare ") || hw_sections(a).is_some()
     };
     // `events log boot` is text, not records: the boot record is 32 KiB and a table holds 4.
     let events_boot = c0 == "events" && {
@@ -12802,7 +13310,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "uptime"  => build_uptime_table(ctx),
             "jobs"    => build_jobs_table(ctx),
             "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
-            "hardware" => match build_hardware_table(ctx, arg) { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "hardware" => match build_hardware_table(ctx, cwd, arg) { Some(t) => t, None => return Err(ShellError::Unknown) },
             "wifi"    => match build_wifi_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
             // `events ipc` / `events failures` are record sources; the other subcommands are readers
             // of live kernel state that print a tree, and a tree is not a table. Piping one of those
@@ -12997,7 +13505,14 @@ fn assert_stream(ctx: &ServiceContext, s: &Stream, arg: &str) -> Result<(), Shel
     let held = match check {
         "contains" => contains(bytes, want.as_bytes()),
         "lacks"    => !contains(bytes, want.as_bytes()),
-        "empty"    => trim_bytes(bytes).is_empty(),
+        // A RECORD stream is empty when it has no rows. Its rendering always carries the header line, so
+        // judging the text made `| where ... | assert empty` impossible to pass - found by the first
+        // check that asked it of a table (`selfcheck hardware`, `hardware problems | where
+        // severity=error | assert empty`, 2026-10-09).
+        "empty"    => match s {
+            Stream::Table(t) => t.nrows() == 0,
+            Stream::Bytes(_) => trim_bytes(bytes).is_empty(),
+        },
         _ => {
             ctx.console_writeln_fmt(format_args!("assert: unknown check '{}' (try: contains, lacks, empty)", check));
             return Err(ShellError::Unknown);
@@ -15900,7 +16415,7 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) -> bool
         "net"          => { let _ = cmd_net(ctx, arg, out); }
         "wifi"         => return cmd_wifi(ctx, arg, out).is_ok(),
         "audio"        => return cmd_audio(ctx, cwd, arg, out).is_ok(),
-        "hardware"     => return cmd_hardware(ctx, arg, out).is_ok(),
+        "hardware"     => return cmd_hardware(ctx, cwd, arg, out).is_ok(),
         "random"       => { let _ = cmd_random(ctx, arg, out); }
         "tcp"          => {
             let mut a = [""; MAX_ARGS];

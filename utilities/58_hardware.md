@@ -50,8 +50,29 @@ is in its boot log - `events log boot | match <driver>`, which the view names); 
 interrupt fires; per-device IOMMU fault counts; each core's timer mode. A BAR's SIZE is not shown
 either: reading it means writing all ones to the BAR, and this utility never writes.
 
-**Not built**, each answering `designed, not built yet` rather than being mistaken for a device:
-`problems`, `tree`, `events`, `firmware`, `compare` and `power`.
+**Step 3 is built (2026-10-09), still with no kernel change:** `problems`, `tree`, `firmware`, `compare`
+and `events`, and the hardware invariants in `selfcheck hardware`. QEMU-verified (`osdev test shell`
+and the `selfcheck` suite); not yet run on hardware. Where each comes from:
+
+- `problems` - the same answers the overview uses: a driver named but not running, a device of a class
+  whose driver took another, a device nothing drives (bridges left out - they are the bus), a driver
+  that has restarted, a driven device whose memory decoding is off, and a spawn that asked for an
+  interrupt on a device showing none. It says, every time, that IOMMU faults and interrupt counts were
+  not checked.
+- `tree` - a PCI device on a bus behind a bridge hangs under that bridge, by the secondary bus number in
+  the bridge's own configuration space; a USB device hangs under the host that bound it.
+- `firmware` - each radio's driver already reports its chip and firmware (`wifi hardware <radio>`); this
+  asks them. A controller's own ROM is not read, and the view says only firmware this OS loads is listed.
+- `compare <report>` - reads a saved `hardware report` (or `hardware` text) and lists devices added,
+  removed, or with a different kind, driver or state. The detail column is not compared: it holds live
+  numbers, such as free memory, that differ on every run.
+- `events` - the supervisor keeps a bounded record of what it sees happen to the devices it drives: a
+  driver's death and restart (or failed restart, or a death the sweep found), a USB device attached or
+  removed. The newest 32, with a count of any overwritten; lost when the supervisor restarts, and the
+  view says from when its record runs. What the kernel does on those occasions - granting, confining,
+  releasing, resetting - is not recorded.
+
+**Not built**, answering `designed, not built yet` rather than being mistaken for a device: `power`.
 
 Two limits of step 1, stated: the `usb` section lists only the devices the supervisor starts a driver
 for (today the USB WiFi dongle) - a keyboard or a stick a host drives itself, or a device nothing
@@ -69,7 +90,12 @@ its host and port.
 | `hardware <section> debug` | report, pipes as lines | debug for every device in the section; `cpu debug` is each core's scheduler counts |
 | `hardware interrupts` | report, pipes | each PCI device's interrupt route - MSI vector and target APIC, MSI-X, or legacy line - and its driver; records `device`, `route`, `driver` |
 | `hardware why <device>` | report, pipes as lines | who drives it, why that service, and the reason the supervisor records beside its spawn row |
-| `hardware report` | report, pipes as lines | everything, for a bug report: the overview, the interrupts, every driven device in full, the cores |
+| `hardware report` | report, pipes as lines | everything, for a bug report: the overview, problems, interrupts, firmware, events, every driven device in full, the cores |
+| `hardware problems` | report, pipes | what is wrong now; records `severity`, `device`, `problem`, `detail` |
+| `hardware tree` | report, pipes | every device by how it connects; records `device`, `parent`, `kind`, `driver` |
+| `hardware firmware` | report, pipes | each radio's chip and firmware, as its driver reports them; records `device`, `driver`, `chip`, `firmware` |
+| `hardware compare <report>` | report, pipes | what changed since a saved report; records `change`, `device`, `was`, `now` |
+| `hardware events` | report, pipes | what happened to the devices, as the supervisor saw it; records `time`, `device`, `event`, `detail` |
 | `hardware help` / `hardware version` | | the house conventions |
 
 ## 2. Sections, and a section that is not there
@@ -146,5 +172,5 @@ fails, so `if hardware problems` cannot be read as an answer.
 
 ## 5. Tab completion (rule 9)
 
-The built sections and the words `interrupts`, `report` and `why` complete; a device name is the
-machine's, typed. No word completes to a path.
+The built sections and the words `interrupts`, `report`, `why`, `problems`, `tree`, `firmware`,
+`compare` and `events` complete; a device name is the machine's, typed. No word completes to a path.

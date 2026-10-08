@@ -514,6 +514,22 @@ pub mod supcmd {
     /// with `[OK, text...]` - the reason the supervisor keeps beside the spawn rows - or `[UNKNOWN]`
     /// for a service with none recorded. `hardware why` (`docs/hardware-design.md` 11).
     pub const WHY:     u8 = b'W';
+    /// What has happened to the devices this supervisor drives since it started. Read only:
+    /// `[MARKER, EVENTS]`, answered with `[OK, since u32 LE, recorded u32 LE, count, entries...]` - since:
+    /// the supervisor's start, in seconds of uptime; recorded: every event noted, so `recorded - count`
+    /// were overwritten; per entry the uptime second (u32 LE), an `EV_*` code, the USB vid and pid (u16
+    /// LE each, 0 for a driver event), and the driver's name (length byte, bytes). `hardware events`.
+    pub const EVENTS:  u8 = b'E';
+    /// A device's driver died and was restarted.
+    pub const EV_RESTARTED: u8 = 1;
+    /// A device's driver died and its restart failed.
+    pub const EV_RESTART_FAILED: u8 = 2;
+    /// A USB device was reported attached and its driver started.
+    pub const EV_ATTACHED: u8 = 3;
+    /// A USB device was reported gone and its driver stopped.
+    pub const EV_DETACHED: u8 = 4;
+    /// A device's driver was found dead by the sweep - its death notice never arrived - and restarted.
+    pub const EV_SWEPT: u8 = 5;
 
     /// Reply status, one byte, so a caller can log the truth rather than assume success.
     pub const OK:      u8 = 0;

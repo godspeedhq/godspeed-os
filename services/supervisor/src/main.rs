@@ -33,6 +33,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
 use godspeed_sdk::service_context::DeadlineOutcomeInto;
 use godspeed_sdk::service_context::supcmd;
@@ -73,7 +74,7 @@ use godspeed_sdk::service_context::usbdev;
 /// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
 /// must never block the supervisor, which is the one service everything else depends on, and a
 /// retained return address burns a cap-table slot per request (the `events` leak, §26.6).
-fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, payload: &[u8]) -> bool {
+fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &DevEvents, payload: &[u8]) -> bool {
     if payload.first() != Some(&supcmd::MARKER) { return false; }
 
     // `supcmd::DEVICES` answers with a body rather than a status byte; everything else leaves it empty.
@@ -86,6 +87,9 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, pa
     let mut handed: Option<CapHandle> = None;
     let status = if payload.len() == 2 && payload[1] == supcmd::DEVICES {
         body_len = devices_answer(usb, &mut body);
+        supcmd::OK
+    } else if payload.len() == 2 && payload[1] == supcmd::EVENTS {
+        body_len = events.answer(&mut body);
         supcmd::OK
     } else if payload.len() > 2 && payload[1] == supcmd::WHY {
         let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
@@ -1324,6 +1328,85 @@ fn is_watched(name: &str) -> bool {
     MANAGED.contains(&name) || name == "counter"
 }
 
+/// WHAT HAS HAPPENED TO THE DEVICES THIS SUPERVISOR DRIVES - for `hardware events` (`supcmd::EVENTS`).
+///
+/// Only events this supervisor itself sees and acts on: a device driver's death and its restart, a USB
+/// device reported attached or gone. What the KERNEL does on those occasions - granting, confining,
+/// releasing, resetting - is not seen here and not recorded (`hardware` makes no kernel change).
+///
+/// Bounded (26.6): the newest `DEV_EVENTS` are kept, `recorded` counts every one, so a reader knows how
+/// many were overwritten. Volatile: a respawned supervisor starts an empty record, and says from when.
+const DEV_EVENTS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct DevEvent {
+    secs: u32,
+    what: u8,
+    vid: u16,
+    pid: u16,
+    name: [u8; 16],
+    nlen: u8,
+}
+
+struct DevEvents {
+    ring: [DevEvent; DEV_EVENTS],
+    recorded: u32,
+    since: u32,
+}
+
+impl DevEvents {
+    fn new(ctx: &ServiceContext) -> Self {
+        let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; 16], nlen: 0 };
+        DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32 }
+    }
+
+    /// Note an event for `name`, if `name` drives a device - every other service's life is not a
+    /// hardware event, and the record is short.
+    fn note(&mut self, ctx: &ServiceContext, what: u8, name: &str, vid: u16, pid: u16) {
+        if !drives_device(name) { return; }
+        let mut e = DevEvent { secs: gs::task::uptime_secs(ctx).max(0) as u32, what, vid, pid, name: [0; 16], nlen: 0 };
+        let n = name.len().min(e.name.len());
+        e.name[..n].copy_from_slice(&name.as_bytes()[..n]);
+        e.nlen = n as u8;
+        self.ring[self.recorded as usize % DEV_EVENTS] = e;
+        self.recorded = self.recorded.wrapping_add(1);
+    }
+
+    /// `[OK, since, recorded, count, entries...]`, oldest first, as `supcmd::EVENTS` documents.
+    fn answer(&self, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+        out[0] = supcmd::OK;
+        out[1..5].copy_from_slice(&self.since.to_le_bytes());
+        out[5..9].copy_from_slice(&self.recorded.to_le_bytes());
+        let held = (self.recorded as usize).min(DEV_EVENTS);
+        let first = self.recorded as usize - held;
+        let mut n = 10usize;
+        let mut count = 0u8;
+        for k in first..self.recorded as usize {
+            let e = &self.ring[k % DEV_EVENTS];
+            let need = 4 + 1 + 4 + 1 + e.nlen as usize;
+            if n + need > out.len() { break; }
+            out[n..n + 4].copy_from_slice(&e.secs.to_le_bytes());
+            out[n + 4] = e.what;
+            out[n + 5..n + 7].copy_from_slice(&e.vid.to_le_bytes());
+            out[n + 7..n + 9].copy_from_slice(&e.pid.to_le_bytes());
+            out[n + 9] = e.nlen;
+            out[n + 10..n + 10 + e.nlen as usize].copy_from_slice(&e.name[..e.nlen as usize]);
+            n += need;
+            count += 1;
+        }
+        out[9] = count;
+        n
+    }
+}
+
+/// Does `name` drive a device - a spawn row that names one, or a USB device's driver?
+fn drives_device(name: &str) -> bool {
+    use godspeed_sdk::service_context::hwclass;
+    IMAGES.iter().chain(USB_IMAGES.iter())
+        .any(|row| row.0 == name && row.8 != hwclass::NONE && row.8 != hwclass::TEST_IRQ)
+        || USB_MATCH.iter().any(|m| m.driver == name)
+}
+
 /// A USB device whose driver this supervisor starts when a USB host reports it attached, and stops when
 /// the host reports it gone (`docs/usb-device-drivers.md`). The policy half of "a device that appears gets
 /// its driver": the host reports facts (`usbdev`) and never names a driver, so which image runs for a
@@ -1371,7 +1454,7 @@ impl UsbState {
 }
 
 /// The longest `supcmd::DEVICES` answer: room for every spawn row with a device and every USB match.
-const DEVICES_REPLY_MAX: usize = 768;
+const DEVICES_REPLY_MAX: usize = 1024;
 
 /// `supcmd::DEVICES`: which devices this supervisor drives, for the `hardware` utility's DRIVER column
 /// (`docs/hardware-design.md`). Read only - it reports the spawn table and the USB match table, which
@@ -1413,7 +1496,7 @@ fn devices_answer(usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
 
 /// A host's report (`usbdev::Report`): start the device's driver if it is attached and not running, stop
 /// it if the device is gone. One host reports today, with one such device, so "absent" means every row.
-fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r: usbdev::Report) {
+fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, r: usbdev::Report) {
     usb.heard = true;
     if !r.present {
         // Said once per report, which is rare: a host reports at its boot, on a plug or unplug, and when a
@@ -1423,8 +1506,11 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r:
             usb.present[i] = false;
             if name_alive(ctx, m.driver) {
                 match ctx.kill(m.driver) {
-                    Ok(()) => ctx.log_fmt(format_args!(
-                        "supervisor: {} stopped - its USB device {:04x}:{:04x} is not attached", m.driver, m.vid, m.pid)),
+                    Ok(()) => {
+                        events.note(ctx, supcmd::EV_DETACHED, m.driver, m.vid, m.pid);
+                        ctx.log_fmt(format_args!(
+                            "supervisor: {} stopped - its USB device {:04x}:{:04x} is not attached", m.driver, m.vid, m.pid))
+                    }
                     Err(e) => ctx.log_fmt(format_args!(
                         "supervisor: {} could not be stopped ({:?}) - its device is not attached", m.driver, e)),
                 }
@@ -1448,6 +1534,7 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r:
     }
     ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached (binding {}) - starting {}",
         r.vid, r.pid, r.gen, m.driver));
+    events.note(ctx, supcmd::EV_ATTACHED, m.driver, m.vid, m.pid);
     if !spawn_wired(ctx, map, m.driver, m.peers) {
         ctx.log_fmt(format_args!("supervisor: {} could not be started for its device", m.driver));
     }
@@ -1577,7 +1664,7 @@ fn respawn_retry(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool
 /// and a dropped name is silently never restarted (the "fs gone from observe after a storm" bug).
 /// `acquire_*_cap` cannot detect this (the kernel directory keeps a dead name), so we scan REAL liveness
 /// via `task_stat`. Returns how many it respawned. (One pass; the death-loop backstop.)
-fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState) -> u32 {
+fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &mut DevEvents) -> u32 {
     let alive = managed_alive(ctx);
     let mut n = 0;
     for i in 0..MANAGED_N {
@@ -1593,6 +1680,7 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState) -> u32 
         if respawn_retry(ctx, map, MANAGED[i]) {
             n += 1;
             ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
+            events.note(ctx, supcmd::EV_SWEPT, MANAGED[i], 0, 0);
         }
     }
     n
@@ -2095,6 +2183,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Which USB devices are attached is the hosts' to say. Asked before the convergence, which leaves a
     // device's driver alone until its host has answered (`UsbState::wanted`).
     let mut usb = UsbState::new();
+    // What happens to the devices from here on (`hardware events`). Started before the hosts are asked,
+    // so the attaches their answers cause are in it.
+    let mut events = DevEvents::new(&ctx);
     ask_usb_hosts(&ctx, &name_map);
     converge(&ctx, &mut name_map, &usb);
     // What the onboard radio was last told about the dongle (`tell_radio_of_dongle`).
@@ -2117,7 +2208,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     loop {
         let msg = ctx.recv();
-        handle_message(&ctx, &mut name_map, &mut usb, &msg);
+        handle_message(&ctx, &mut name_map, &mut usb, &mut events, &msg);
         name_map.release_handoff(&ctx);
         // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
         // multi-kill it found the services whose notifications were still QUEUED behind this one, respawned
@@ -2132,7 +2223,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut drained = 0;
         while drained < DRAIN_MAX {
             let Some(next) = ctx.try_recv() else { break };
-            handle_message(&ctx, &mut name_map, &mut usb, &next);
+            handle_message(&ctx, &mut name_map, &mut usb, &mut events, &next);
             name_map.release_handoff(&ctx);
             drained += 1;
         }
@@ -2140,7 +2231,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // 16-deep endpoint overflowed under a storm, or we were ourselves dead and respawning when it was
         // sent (the kernel says which, `UNHEARD` / dropped). It would otherwise stay dead forever (the "fs
         // gone from observe after a storm" bug). Cheap when nothing is dead.
-        reconcile(&ctx, &mut name_map, &usb);
+        reconcile(&ctx, &mut name_map, &usb, &mut events);
         tell_radio_of_dongle(&ctx, &name_map, &usb, &mut told_radio);
         name_map.release_handoff(&ctx);
     }
@@ -2148,15 +2239,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
 /// One message on the supervisor's endpoint: an operator command, or a death notification. Taken out of
 /// the main loop so the loop can drain its queue before the reconcile sweep (see there).
-fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, msg: &Message) {
+fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, msg: &Message) {
     // A USB host's device report, before the commands it shares `supcmd::MARKER` with: it carries no reply
     // capability and is never answered.
     if let Some(r) = usbdev::decode(msg.payload_bytes()) {
-        usb_report(ctx, name_map, usb, r);
+        usb_report(ctx, name_map, usb, events, r);
         return;
     }
     // A command, or a death notification? The first byte decides (see supcmd::MARKER).
-    if handle_command(ctx, name_map, usb, msg.payload_bytes()) { return; }
+    if handle_command(ctx, name_map, usb, events, msg.payload_bytes()) { return; }
     let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
     // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
     // ALREADY respawned this service before its queued death notification reached us. If it is
@@ -2201,8 +2292,10 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
         ctx.log_fmt(format_args!("supervisor: {} died, restarting", name));
         if respawn_retry(ctx, name_map, name) {
             ctx.log_fmt(format_args!("supervisor: {} restarted", name));
+            events.note(ctx, supcmd::EV_RESTARTED, name, 0, 0);
         } else {
             ctx.log_fmt(format_args!("supervisor: {} restart FAILED", name));
+            events.note(ctx, supcmd::EV_RESTART_FAILED, name, 0, 0);
         }
     }
 }

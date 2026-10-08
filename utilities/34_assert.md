@@ -49,7 +49,7 @@ to its grid) and checks it. Because it's the last stage, *its* verdict is the pi
 |-------|-----------|
 | `contains <text>` | the output contains `<text>` |
 | `lacks <text>`    | the output does **not** contain `<text>` |
-| `empty`           | the output is blank |
+| `empty`           | the output is blank - for records, there are no rows (a table's header line does not count) |
 
 ```
 roster | where role=core | assert contains vesta

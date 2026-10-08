@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # `hardware` - what this machine is, what drives each part of it, and what is wrong
 
-**Status: STEPS 1 AND 2 BUILT (2026-10-08), the rest designed. No kernel change, by the operator's rule
-(section 10).** Agreed with the operator in conversation on
+**Status: STEPS 1 TO 3 BUILT (2026-10-08 and 09); step 4, `power`, designed and not built. No kernel
+change, by the operator's rule (section 10).** Agreed with the operator in conversation on
 2026-10-08, during the T630 cards of `docs/wifi-usb.md` 51. Step 1 of the build order (section 14) is
 built and its spec is `utilities/58_hardware.md`, which is what the shell answers; this note stays the
 design for everything after it.
@@ -280,7 +280,7 @@ its raw hex ID, never a guess.
 | a device's live BARs, command register and interrupt route (MSI target included) | the device's configuration space, via `hw-enumerator` op 4 | yes - built in step 2 |
 | radio firmware and its load check | the radio drivers | yes, as boot lines |
 | the reasons in `why` | fixed strings beside each decision in code | **no** - to be added with each decision |
-| events | the `events` service | the service exists; the events do not yet |
+| events | the supervisor, for what it sees (deaths, restarts, USB attach and removal) | yes - `supcmd::EVENTS`, built in step 3; the kernel's part is not recorded |
 
 ## 10. No kernel change - the operator's rule, and what it costs
 
@@ -433,7 +433,13 @@ run: ran 5, failed 1, skipped 0
    driver's capabilities, what its spawn asked for, the device's live BARs and interrupt route - and
    `debug`, `interrupts`, `report`, `why`. Interrupt counts, per-device IOMMU faults and timer modes
    are not shown, because only the kernel holds them.
-3. `events`, `firmware`, `compare`, and `selfcheck hardware`.
+3. **Built 2026-10-09, with no kernel change:** `events` (a bounded record the SUPERVISOR keeps of what
+   it sees - deaths, restarts, USB attach and removal; the kernel's part is not recorded), `firmware`
+   (each radio's driver's own report), `compare`, and the invariants in `selfcheck hardware`. `problems`
+   and `tree`, left over from step 1, with them. `selfcheck hardware` asserts what can be read without
+   the kernel: every device shown has a running driver, no problem is an error, a report reads back as
+   unchanged. The section 13 checks that need kernel state - IOMMU faults, per-device domains, each
+   core's last tick - are not made.
 4. `power` and temperature, when something needs them.
 
 ## 15. Out of scope

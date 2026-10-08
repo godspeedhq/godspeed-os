@@ -130,3 +130,23 @@ trace endpoints | where name contains fs | assert contains fs
 assert ok events status
 # The shell has been calling `fs` throughout this suite, so the ring holds real traffic.
 events ipc | assert contains outcome
+
+# ===== the `hardware` utility: the model holds on this machine (docs/hardware-design.md 13) =====
+# Read only, and read from what the owners answer: no kernel query, so what only the kernel holds -
+# IOMMU faults, interrupt counts - is not asserted here, and `hardware problems` says it did not look.
+echo ''
+echo '===== hardware: every device it shows, driven by a running service ====='
+assert ok hardware
+# A device whose driver is named but not running is a device nothing serves.
+hardware | assert lacks not running
+# Nothing the owners report is an error: no driver dead, no driven device with its registers off.
+hardware problems | where severity=error | assert empty
+assert ok hardware tree
+assert ok hardware interrupts
+assert ok hardware firmware
+# A report read straight back finds nothing changed - `compare` reads the format `report` writes.
+hardware report | write /hw_self.txt
+hardware compare /hw_self.txt | where change=removed | assert empty
+hardware compare /hw_self.txt | where change=added | assert empty
+delete /hw_self.txt
+assert fails hardware compare /no_such_report.txt
