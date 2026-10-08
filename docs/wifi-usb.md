@@ -3041,3 +3041,22 @@ since the last stamp. The next 100-round run did not wedge, so that reading is s
 **Read with them:** `PANIC in service ... recv failed: EndpointDead` lines during chaos are services
 dying on purpose after their endpoint was killed; `a request arrived with no reply cap` from `wifi-usb`
 is chaos's flood.
+
+**The afternoon's cards (2026-10-08, `a0cb2991`, the rebind `32798620` and nothing else of code):**
+- **The rebind, hardware-verified.** "the host bound the dongle while its bring-up was stopped - bringing it
+  up again" fired 3 times in a 100-round all-services run and 29 times in a 1000-round one, and after the
+  100-round run the dongle was joined with no `wifi radio on`. `net dns` 11 of 11 at boot and 4 of 4 after
+  chaos; `selfcheck` 526 run, 0 failed, 0 skipped.
+- **The 1000-round run: the kernel alive at round 1000, 7024 kills - and the T630's `xhci` controller hung
+  at round 204.** A fresh `xhci` reset it cleanly, its first command completed, and 70 ms later Address
+  Device, Disable Slot and Enable Slot got no completion, with the controller reporting no error (HSE 0,
+  HCE 0), its command ring running and nothing written to its event ring. From the next respawn on it
+  would not halt or reset (HCRST never cleared), about 300 times over fifteen minutes, so USB on that
+  controller - the dongle with it - was dead for the rest of the run; the keyboard, on `ehci`, was not.
+  A power cycle cleared it: the next boot joined and resolved 18 of 18. No IOMMU fault was logged.
+- **The defect found under it, fixed in `kernel/src/arch/x86_64/iommu.rs`:** every confined device carried
+  the same IOMMU domain ID, and the T630 has had two confined devices - `xhci` and the audio controller -
+  since 2026-10-03. Each now has its own (`domain_of`, its BDF plus one); QEMU with both confined showed
+  domains 33 and 41 and both working. Whether this was the whole cause is not shown - the hang was about
+  one in 500 `xhci` restarts - and a second all-services 1000-round run is the card for it. **The
+  DNS-after-idle case (several idle minutes, then a lookup) has still not been run on the fixed build.**

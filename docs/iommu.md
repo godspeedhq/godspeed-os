@@ -51,6 +51,15 @@ engine.
 
 ## 2. The mechanism: an IOMMU translation domain per driver
 
+> **Corrected 2026-10-08: until today every confined device got the SAME domain ID, 1.** The page table
+> was per device, as below, but the ID that tags the IOMMU's cached translations was shared, on the
+> reasoning that each device only reaches its own arena. AMD-Vi caches translations and page directory
+> entries by domain ID, so two devices with different tables under one ID can be translated through each
+> other's cached entries. It was harmless while `xhci` was the only confined device, and became live
+> when the audio controller was confined beside it (2026-10-03). Each device's ID is now its BDF plus
+> one (`domain_of`), so the logs below that say `domain 1` are from before the fix. Found under an
+> `xhci` that stopped completing commands mid-chaos on the T630 (`docs/wifi-usb.md` 51).
+
 An IOMMU (AMD calls it AMD-Vi) sits between devices and memory and translates
 every device DMA through a per-device page table, exactly as the MMU translates
 every CPU access through the process page table. If we give each DMA-capable

@@ -751,6 +751,12 @@ official, not the runtime behaviour.
 > in passthrough, and on the T630 the audio driver does not yet use DMA at all (`docs/audio.md`, A6), so
 > on real hardware `xhci` is still the one confined device. The mechanism now bounds two devices, on one
 > architecture, one of them in QEMU only.
+>
+> *(Note 2026-10-08: the T630 confines the audio controller too - its log shows `xhci` and 00:01.1 each
+> confined with an arena - so on real hardware there were two confined devices, and they shared one IOMMU
+> domain ID. AMD-Vi caches translations by domain ID, so that sharing was a defect; each confined device
+> now has its own (`kernel/src/arch/x86_64/iommu.rs`, `domain_of`). Found under an `xhci` that stopped
+> completing commands in a chaos run, `docs/wifi-usb.md` 51.)*
 
 > **Amendment 2026-07-16 (SEC-2): a confined USB driver's least-privilege claim is bounded by the
 > console it drives.** A USB *keyboard* driver is, by function, the machine's input path: it delivers
