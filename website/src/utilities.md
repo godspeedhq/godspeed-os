@@ -80,6 +80,7 @@ fails.
 | [`events`](utilities/events.md) | what was recorded: IPC ring, metrics, logs, capture to disk |
 | [`mem`](utilities/mem.md) | memory |
 | [`cores`](utilities/cores.md) | the cores that came up |
+| [`hardware`](utilities/hardware.md) | this machine's devices, and what drives each |
 | [`uptime`](utilities/uptime.md) | how long since boot |
 | [`date`](utilities/date.md) | the wall clock |
 | [`audio`](utilities/audio.md) | sound: what is playing, the volume, a test tone |

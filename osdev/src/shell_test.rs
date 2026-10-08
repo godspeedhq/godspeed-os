@@ -871,6 +871,38 @@ pub fn run(image_path: &Path, smp: u32) {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // hardware (utilities/58_hardware.md): the overview from its owners - the kernel, hw-enumerator
+    // and the supervisor - one record shape for every section, and the words not built yet.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"hardware\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => {
+            check!(r.contains("cpu") && r.contains("core 0") && r.contains("memory") && r.contains("system RAM"),
+                   "hardware: the overview has the cpu and memory sections");
+            check!(r.contains("pci") && r.contains("DEVICE") && r.contains("DRIVER"),
+                   "hardware: the PCI bus is read from hw-enumerator, in the shared columns");
+            check!(r.contains("device(s) with a driver"), "hardware: the overview ends with its device count");
+            check!(!r.contains("the supervisor did not answer"), "hardware: the supervisor answered which service drives which device");
+        }
+        None => { println!("shell-test: FAIL - timed out after `hardware`"); fail += 4; }
+    }
+    send(&mut write_half, b"hardware cpu,memory | count\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains(&format!("{}", smp + 1)), "hardware: two sections pipe as one table (cores + 1 rows)"),
+        None => { println!("shell-test: FAIL - timed out after `hardware cpu,memory | count`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware banana\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("no section or device 'banana'"), "hardware: an unknown name says so"),
+        None => { println!("shell-test: FAIL - timed out after `hardware banana`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware problems\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("designed, not built yet"), "hardware: a word not built yet says so"),
+        None => { println!("shell-test: FAIL - timed out after `hardware problems`"); fail += 1; }
+    }
+
     // -------------------------------------------------------------------
     // trace - the IPC blocked-chain reader (utilities/46_trace.md)
     //

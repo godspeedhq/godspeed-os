@@ -73,14 +73,21 @@ use godspeed_sdk::service_context::usbdev;
 /// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
 /// must never block the supervisor, which is the one service everything else depends on, and a
 /// retained return address burns a cap-table slot per request (the `events` leak, §26.6).
-fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
+fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, payload: &[u8]) -> bool {
     if payload.first() != Some(&supcmd::MARKER) { return false; }
+
+    // `supcmd::DEVICES` answers with a body rather than a status byte; everything else leaves it empty.
+    let mut body = [0u8; DEVICES_REPLY_MAX];
+    let mut body_len = 0usize;
 
     // The new service's endpoint cap, when the spawn produced one - returned to the caller below.
     let mut spawned_cap: Option<CapHandle> = None;
     // ...and when that cap is one the supervisor does not keep, it is SENT rather than copied (below).
     let mut handed: Option<CapHandle> = None;
-    let status = if payload.len() >= 6 && (payload[1] == supcmd::RESTART || payload[1] == supcmd::SPAWN) {
+    let status = if payload.len() == 2 && payload[1] == supcmd::DEVICES {
+        body_len = devices_answer(usb, &mut body);
+        supcmd::OK
+    } else if payload.len() >= 6 && (payload[1] == supcmd::RESTART || payload[1] == supcmd::SPAWN) {
         let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         match core::str::from_utf8(&payload[6..]) {
             // `name` may carry a NUL-separated PEER LIST after it, exactly as SpawnRequest's payload
@@ -168,7 +175,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
     // dependents later) - for a service the map keeps. One it does not is sent itself (`handed`). If the send fails the derived copy is reclaimed - an orphaned cap is a
     // table slot leaked per request (26.6).
     if let Some(reply_cap) = ctx.take_pending_cap() {
-        let msg = Message::from_bytes(&[status]);
+        let msg = if body_len > 0 { Message::from_bytes(&body[..body_len]) } else { Message::from_bytes(&[status]) };
         // A cap the supervisor does not keep goes as it is: copying it would leave the supervisor holding
         // the original, which is what `map_keeps` exists to stop.
         let sent = match handed.or_else(|| spawned_cap.and_then(|c| ctx.derive_cap(c))) {
@@ -1336,6 +1343,45 @@ impl UsbState {
     }
 }
 
+/// The longest `supcmd::DEVICES` answer: room for every spawn row with a device and every USB match.
+const DEVICES_REPLY_MAX: usize = 768;
+
+/// `supcmd::DEVICES`: which devices this supervisor drives, for the `hardware` utility's DRIVER column
+/// (`docs/hardware-design.md`). Read only - it reports the spawn table and the USB match table, which
+/// are this service's own decisions about what runs for which device, and changes nothing. Whether
+/// each named service is running is the asker's to read (`task_stat`); whether a PCI device is
+/// present is `hw-enumerator`'s. Bounded: an entry that does not fit is left out and the count says
+/// what was sent.
+fn devices_answer(usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+    use godspeed_sdk::service_context::hwclass;
+    out[0] = supcmd::OK;
+    let mut n = 2usize;
+    let mut count = 0u8;
+    let mut put = |bytes: &[&[u8]], out: &mut [u8; DEVICES_REPLY_MAX], n: &mut usize| -> bool {
+        let need: usize = bytes.iter().map(|b| b.len()).sum();
+        if *n + need > out.len() { return false; }
+        for b in bytes { out[*n..*n + b.len()].copy_from_slice(b); *n += b.len(); }
+        true
+    };
+    for row in IMAGES.iter() {
+        let hw = row.8;
+        // No device, or the test vector that is not a device at all.
+        if hw == hwclass::NONE || hw == hwclass::TEST_IRQ { continue; }
+        let name = row.0.as_bytes();
+        if put(&[b"H", &hw.to_le_bytes(), &[name.len() as u8], name], out, &mut n) { count += 1; }
+    }
+    let host = USB_HOSTS.first().copied().unwrap_or("");
+    for (i, m) in USB_MATCH.iter().enumerate() {
+        let attached = usb.present.get(i).copied().unwrap_or(false) as u8;
+        if put(&[b"U", &m.vid.to_le_bytes(), &m.pid.to_le_bytes(), &[attached],
+                 &[host.len() as u8], host.as_bytes(), &[m.driver.len() as u8], m.driver.as_bytes()], out, &mut n) {
+            count += 1;
+        }
+    }
+    out[1] = count;
+    n
+}
+
 /// A host's report (`usbdev::Report`): start the device's driver if it is attached and not running, stop
 /// it if the device is gone. One host reports today, with one such device, so "absent" means every row.
 fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, r: usbdev::Report) {
@@ -2081,7 +2127,7 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
         return;
     }
     // A command, or a death notification? The first byte decides (see supcmd::MARKER).
-    if handle_command(ctx, name_map, msg.payload_bytes()) { return; }
+    if handle_command(ctx, name_map, usb, msg.payload_bytes()) { return; }
     let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
     // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
     // ALREADY respawned this service before its queued death notification reached us. If it is

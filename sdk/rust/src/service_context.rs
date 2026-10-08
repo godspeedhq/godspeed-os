@@ -504,6 +504,12 @@ pub mod supcmd {
     pub const RESTART: u8 = b'R';
     /// Spawn a service that is not running.
     pub const SPAWN:   u8 = b'S';
+    /// Which devices does the supervisor drive? Read only: `[MARKER, DEVICES]`, answered with
+    /// `[OK, count, entries...]` - per entry `b'H'`, the spawn row's device word (u32 LE, `hwclass`),
+    /// the service's name (length byte, bytes); or `b'U'`, a USB device it starts a driver for (vid
+    /// u16 LE, pid u16 LE, attached 0/1, the reporting host's name, the driver's name, each a length
+    /// byte and bytes). The `hardware` utility's DRIVER column (`docs/hardware-design.md`).
+    pub const DEVICES: u8 = b'D';
 
     /// Reply status, one byte, so a caller can log the truth rather than assume success.
     pub const OK:      u8 = 0;

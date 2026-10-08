@@ -1,10 +1,20 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # `hardware` - what this machine is, what drives each part of it, and what is wrong
 
-**Status: DESIGNED, NOT BUILT (2026-10-08).** Agreed with the operator in conversation on 2026-10-08,
-during the T630 cards of `docs/wifi-usb.md` 51. This is a design note, not a utility spec: under
-`utilities/` a spec asserts that the shell answers the verb (`utilities/0_conventions.md` 2a), so this
-moves there - as the next free number - the day the shell answers `hardware`. Every example below is a
+**Status: STEP 1 BUILT (2026-10-08), the rest designed.** Agreed with the operator in conversation on
+2026-10-08, during the T630 cards of `docs/wifi-usb.md` 51. Step 1 of the build order (section 14) is
+built and its spec is `utilities/58_hardware.md`, which is what the shell answers; this note stays the
+design for everything after it.
+
+**Two decisions made while building step 1:**
+- **A section the machine does not have is left out of the bare view; asked for by name, it is
+  answered** ("pci: none on this machine"); a section that is there but empty shows its heading and
+  says so. "The bus is not there" and "the bus is there with nothing on it" are different facts.
+- **The raw boot log does not belong here.** It is a log, and the shell already reads the kernel's log
+  ring with `events log`; two ways to read one log is two ways to ask. What the ring cannot do is keep
+  the boot: it is 16 KiB and wraps, so after a chaos run the boot lines are gone. That is `events log
+  boot` - a fixed copy of the boot output the kernel keeps - agreed with the operator the same day, as
+  its own change. `hardware` keeps what the boot FOUND (the bus, the IOMMU, the timer mode), as facts. Every example below is a
 MOCKUP: values seen in the T630's logs that day are real, and times, counts and anything not yet read are
 illustrative.
 
@@ -103,6 +113,7 @@ usb
 
 One section, or several:
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware usb
 usb
@@ -129,6 +140,7 @@ Every row of every section is one device with the same columns:
 
 So sections combine and filter like any record source (`docs/records.md`):
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware memory,cpu | where state=idle | select device detail
 DEVICE   DETAIL
@@ -145,6 +157,7 @@ way `wifi info` does.
 
 ## 4. One device in full, with authority
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware 00:10.0
 device     00:10.0
@@ -170,6 +183,7 @@ granted for class 0x040300, but the device here is class 0x0c0330 - MISMATCH
 
 ## 5. `debug`: the device as the hardware sees it
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware 00:10.0 debug
 device      00:10.0  (bus 0, device 0x10, function 0)
@@ -200,6 +214,7 @@ does today), LAPIC and IOMMU state from the kernel (section 10).
 
 ## 6. `problems`: the warning-icon view
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware problems
 SEVERITY  DEVICE    PROBLEM                      DETAIL
@@ -225,6 +240,7 @@ the invariants hold.
 
 ## 7. `interrupts`
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware interrupts
 SOURCE    VECTOR  KIND      DEVICE / USE          CORE   COUNT     RATE
@@ -276,6 +292,7 @@ go-ahead and a constitution note before it is written.
 
 `hardware tree` - by connection:
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware tree
 machine  x86-64, AMD GX-420GI
@@ -299,6 +316,7 @@ machine  x86-64, AMD GX-420GI
 `hardware why <device>` - the policy behind a device, from a short fixed string kept next to the
 decision in code, so the explanation cannot drift from the behaviour:
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware why 00:12.0
 00:12.0 (USB 2, EHCI) runs in IOMMU passthrough, not confined:
@@ -313,6 +331,7 @@ wifi-usb when the host reported it attached (docs/usb-device-drivers.md)
 
 `hardware report` - one file to attach to a failed card:
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware report write /hw-report.txt
 wrote /hw-report.txt - 11 devices, 5 problems, debug for every device, 18 KiB
@@ -323,6 +342,7 @@ It holds the build and uptime, the overview, `problems`, and `debug` for every d
 
 `hardware events` - a timeline, on the `events` service:
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware events | last 6
 TIME      DEVICE    EVENT                 DETAIL
@@ -336,6 +356,7 @@ TIME      DEVICE    EVENT                 DETAIL
 
 `hardware firmware`:
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware firmware
 DEVICE    FIRMWARE                VERSION   SIZE       CHECK                       LOADED
@@ -347,6 +368,7 @@ On the Pi 4 it lists the CYW43455's image, NVRAM and CLM; on the VisionFive the 
 
 `hardware compare <report>` - a regression check across builds:
 
+<!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
 gsh> hardware compare /hw-report-0930.txt
 CHANGE    DEVICE    WAS                          NOW
