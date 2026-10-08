@@ -1363,7 +1363,9 @@ fn devices_answer(usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
         for b in bytes { out[*n..*n + b.len()].copy_from_slice(b); *n += b.len(); }
         true
     };
-    for row in IMAGES.iter() {
+    // BOTH tables: the USB hosts (`xhci`, `ehci`) are spawned from `USB_IMAGES`, and reading `IMAGES`
+    // alone left every host controller reported as having no driver while it ran (the Wyse, 2026-10-08).
+    for row in IMAGES.iter().chain(USB_IMAGES.iter()) {
         let hw = row.8;
         // No device, or the test vector that is not a device at all.
         if hw == hwclass::NONE || hw == hwclass::TEST_IRQ { continue; }

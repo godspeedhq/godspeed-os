@@ -884,8 +884,14 @@ pub fn run(image_path: &Path, smp: u32) {
                    "hardware: the PCI bus is read from hw-enumerator, in the shared columns");
             check!(r.contains("device(s) with a driver"), "hardware: the overview ends with its device count");
             check!(!r.contains("the supervisor did not answer"), "hardware: the supervisor answered which service drives which device");
+            // A device of a class this system HAS a driver for is never shown driverless. The Wyse showed
+            // its xHCI controller as "no driver" while `xhci` ran: the supervisor answered from its main
+            // image table and the USB hosts are spawned from another (2026-10-08).
+            let driven = ["USB 3 (xHCI)", "USB 2 (EHCI)", "SATA (AHCI)", "ethernet", "HD audio"];
+            let wrong = r.lines().filter(|l| driven.iter().any(|k| l.contains(k)) && l.contains("no driver")).count();
+            check!(wrong == 0, "hardware: no device a driver exists for is shown without one");
         }
-        None => { println!("shell-test: FAIL - timed out after `hardware`"); fail += 4; }
+        None => { println!("shell-test: FAIL - timed out after `hardware`"); fail += 5; }
     }
     send(&mut write_half, b"hardware cpu,memory | count\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {

@@ -55,8 +55,8 @@ cpu
   ...
 pci
   DEVICE      KIND                 DRIVER         STATE       DETAIL
-  00:10.0     USB 3 (xHCI)         xhci           running     AMD 1022:7914, IRQ 11
-  00:02.6     class 0x......       -              no driver   AMD 1022:...., IRQ ...
+  00:10.0     USB 3 (xHCI)         xhci           running     AMD 1022:7914, IRQ line 11
+  00:18.0     host bridge          -              no driver   AMD 1022:...., no IRQ line
   ...
 
 9 device(s) with a driver, 2 without - hardware <device> for one in full

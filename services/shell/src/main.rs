@@ -7233,14 +7233,23 @@ fn hw_class(c: u32) -> Option<&'static str> {
         0x050000 => "RAM controller",
         0x058000 => "memory controller",
         0x010180 | 0x01018a | 0x01018f => "IDE",
-        // A subclass not listed above: what its base class is, rather than a bare number.
+        0x080500 | 0x080501 => "SD host",
+        // A subclass not listed above: what its base class is, rather than a bare number. The PCI base
+        // classes, as the specification names them.
         c => match c >> 16 {
             0x01 => "storage",
             0x02 => "network",
             0x03 => "display",
             0x04 => "multimedia",
+            0x05 => "memory controller",
             0x06 => "bridge",
+            0x07 => "communication",
+            0x08 => "system peripheral",
+            0x09 => "input",
             0x0c => "serial bus",
+            0x0d => "wireless",
+            0x10 => "encryption",
+            0x11 => "signal processing",
             _ => return None,
         },
     })
@@ -7406,9 +7415,15 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
                         r.state = "no driver";
                     }
                 }
-                r.detail = match hw_vendor(d.vendor) {
-                    Some(v) => HwText::of(format_args!("{} {:04x}:{:04x}, IRQ {}", v, d.vendor, d.device, d.irq)),
-                    None => HwText::of(format_args!("{:04x}:{:04x}, IRQ {}", d.vendor, d.device, d.irq)),
+                // The configuration space's interrupt LINE, which 255 means "not connected" - printed as
+                // "IRQ 255" it read like a vector. A driver that asks for an interrupt is given an MSI
+                // vector instead, which this line does not show.
+                let v = hw_vendor(d.vendor).unwrap_or("");
+                let sp = if v.is_empty() { "" } else { " " };
+                r.detail = if d.irq == 0xff {
+                    HwText::of(format_args!("{}{}{:04x}:{:04x}, no IRQ line", v, sp, d.vendor, d.device))
+                } else {
+                    HwText::of(format_args!("{}{}{:04x}:{:04x}, IRQ line {}", v, sp, d.vendor, d.device, d.irq))
                 };
                 r.pci = Some(d);
                 f.push(r);
