@@ -27,6 +27,7 @@
 #![no_main]
 
 use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome, CapHandle};
+use godspeed::driver::wait::{Deadline, Budget};
 
 // Our MAC is LEARNED from the NIC, never hardcoded (audit U9 / Commandment III). The controller's
 // burned-in MAC is the one source of truth for our hardware identity; nic-driver reads it (RTL8168
@@ -81,15 +82,21 @@ const DANCE_TRIES: u32 = 6;
 // DNS collects frames after ONE query TX (the [4] RX-only path): frames pulled without
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
 //
-// KEPT ONLY AS A RUNAWAY BACKSTOP. The binding limit is `DNS_BUDGET_SECS` below, because a COUNT IS
-// NOT A DURATION: twelve tries meant twelve times whatever a poll happened to cost, which on a Dell
-// Wyse with a slow lookup was 24 seconds - three times longer than the client waiting for the answer.
-const DNS_RX_TRIES: u32 = 12;
+//
+// THE CLOCK BOUNDS THESE POLL LOOPS, NOT A COUNT - a `gs` paced `Deadline`, which falls back to as many
+// looks as the pace fits into the budget only on a machine whose clock is uncalibrated. Both loops were
+// bounded by a fixed twelve polls, and a count is not a duration in EITHER direction: twelve polls that
+// each waited out a silent driver cost 24 seconds on a Dell Wyse, and twelve that each came back empty
+// at once cost 130 ms. The second is what happened once `e3fcf7ed` let an empty drain answer instantly
+// on every port: on the T630 a cold lookup slower than 130 ms failed in a quarter second with
+// "0 frames, 0 UDP, 0 timeouts" while its client still had six seconds of patience left. The Pi 2 had
+// always answered empty drains at once and carried the same limit, behind resolvers fast enough not to
+// show it.
 
-/// The same backstop for `udp_roundtrip`'s RX poll, and the same number for the same reason.
-/// Named apart from the DNS one because it bounds a different loop: a rename of either must
-/// not silently re-tune the other.
-const UDP_RX_TRIES: u32 = 12;
+/// What `udp_roundtrip` will wait for its reply. Its one client (`sock`, through `gs::net`) waits
+/// `SOCKET_SECS` (30 s), so this answers well inside that; it is held in the serve loop, so it is kept
+/// to the order of the DNS budget rather than the client's whole patience.
+const UDP_BUDGET_MS: u64 = 3000;
 
 /// The shortest deadline any CLIENT gives a single net-stack request.
 ///
@@ -1092,7 +1099,7 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
 /// Why a late answer is worse than no answer: the caller has already given up, so the reply lands as
 /// a STALE one. The next request receives the previous one's answer, the correlation tag rejects it,
 /// and the stream never catches up - one slow lookup desyncs the channel until `net-stack` restarts.
-fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, deadline: u64,
+fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
                hostname: &[u8], gw_mac: &[u8; 6], our_ip: &[u8; 4],
                our_mac: &[u8; 6], dns_server: &[u8; 4], got_reply: &mut bool,
                frames: &mut u16, udp: &mut u16, timeouts: &mut u16) -> Option<[u8; 4]> {
@@ -1101,6 +1108,8 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, deadline: u64,
     // dominating => the deadline is too short (a timing bug); empties dominating => the receiver is dead.
     *got_reply = false;   // set true once a matching DNS reply arrives - lets the caller tell
                           // "server did not reply" from "server replied but had no A record".
+    // The whole exchange, the query's send included, runs against this one clock.
+    let mut deadline = Deadline::paced(ctx, Budget::ms(budget_ms), Budget::ms(RX_POLL_PACE_MS));
     let mut frame = [0u8; 512];
     // Ethernet: to the gateway; slirp routes the datagram to its DNS at 10.0.2.3.
     frame[0..6].copy_from_slice(gw_mac);
@@ -1161,17 +1170,13 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, deadline: u64,
     // caller waiting on a reply needs to know.
     if nic_req(ctx, pending, &req, LINK_SECS).is_none() { *timeouts += 1; }
     let mut reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
-    // BOUNDED BY THE CLOCK, with the try count kept only as a runaway backstop - the same shape the
-    // `fs` mount loop settled on for the same reason. `LINK_SECS` rather than `DANCE_SECS` per poll
-    // so one silent poll cannot eat half the budget on its own.
-    let dns_deadline = deadline;
-    for _ in 0..DNS_RX_TRIES {
-        // `wrapping_sub` compared against the sign bit: the idiom used everywhere else here for a
-        // deadline that may have been set before a TSC wrap.
-        if ctx.read_tsc().wrapping_sub(dns_deadline) < (1u64 << 63) {
+    // BOUNDED BY THE CLOCK (the note above `UDP_BUDGET_MS`). `LINK_SECS` rather than `DANCE_SECS` per
+    // poll so one silent poll cannot eat half the budget on its own.
+    loop {
+        if deadline.expired() {
             ctx.log_fmt(format_args!(
-                "net-stack: DNS gave up after {}s - answering the client rather than letting it time out \
-                 (a late answer would desync its reply stream)", DNS_BUDGET_SECS));
+                "net-stack: DNS gave up after {} ms - answering the client rather than letting it time out \
+                 (a late answer would desync its reply stream)", budget_ms));
             return None;
         }
         let (matched, answer_arp) = {
@@ -1243,10 +1248,9 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, deadline: u64,
         // with it and left the retry counting rather than waiting. `drain_scan` already carries the same
         // pacing for the same reason - a poll is a question, and asking it twelve times in a row does
         // not make the answer arrive sooner.
-        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+        deadline.pause();
         reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, LINK_SECS);
     }
-    None
 }
 
 // --- Socket as capability (§7.10): a UDP socket is a delegated resource cap minted by net-stack,
@@ -1348,8 +1352,10 @@ fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6]
     }
     let rx_only = Message::from_bytes(&[4u8]);
     let mut arp_out = [0u8; 42];
+    let mut deadline = Deadline::paced(ctx, Budget::ms(UDP_BUDGET_MS), Budget::ms(RX_POLL_PACE_MS));
     let mut reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
-    for _ in 0..UDP_RX_TRIES {
+    loop {
+        if deadline.expired() { return None; }
         let (matched, answer_arp) = {
             let f: &[u8] = match &reply { Some(r) => r.payload_bytes(), None => &[] };
             // A UDP packet FROM dest_ip back TO our src_port. f[36..38] is the reply's DESTINATION
@@ -1381,10 +1387,9 @@ fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6]
         // arrived, so N of them back to back is N instant questions rather than a wait - the exact
         // defect measured on the DNS path, where the whole loop finished in 78 ms and reported that
         // nothing had answered.
-        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+        deadline.pause();
         reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
     }
-    None
 }
 
 /// Passes of the TCP transaction loop. A BACKSTOP on work, not the bound - `budget_ms` bounds the
@@ -1798,7 +1803,7 @@ const ADDR_CHECK_SECS: i64 = 2;
 /// A UDP EXCHANGE ANSWERED WHEN ITS REPLY ARRIVES (op 12), held while this service goes on serving.
 ///
 /// **Why it exists.** Every other UDP path here waits for its reply inside the serve loop (`udp_roundtrip`,
-/// one send, then up to `UDP_RX_TRIES` receive polls of up to `LINK_SECS` each), and while it waits nobody else is served - a `ping` typed during a
+/// one send, then receive polls of up to `LINK_SECS` each for `UDP_BUDGET_MS`), and while it waits nobody else is served - a `ping` typed during a
 /// clock sync sat behind a time server. This sends the datagram, keeps the asker's reply capability, and
 /// returns to the loop at once. The poll step, which reads every frame anyway, hands the matching reply
 /// straight to the asker; a deadline answers "no reply" instead. Nothing waits.
@@ -3591,8 +3596,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let per_server_ms = ((usable * 1000) / 2).max(500) as u64;
                 for server in [dns_server, [8, 8, 8, 8]] {
                     let mut got = false;
-                    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(per_server_ms));
-                    ip = dns_resolve(&ctx, pending, deadline, &pl[1..], &gw_mac, &our_ip, &our_mac, &server, &mut got,
+                    ip = dns_resolve(&ctx, pending, per_server_ms, &pl[1..], &gw_mac, &our_ip, &our_mac, &server, &mut got,
                                      &mut frames, &mut udp, &mut timeouts);
                     any_reply |= got;
                     if ip.is_some() { break; }
