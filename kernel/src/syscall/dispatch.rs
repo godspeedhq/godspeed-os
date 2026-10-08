@@ -441,7 +441,7 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 // Copy payload to the caller's user-space buffer.
                 let payload  = msg.payload_bytes();
                 let copy_len = payload.len().min(buf_len);
-                if !write_user_bytes(out_buf, &payload[..copy_len]) {
+                if !copy_out(out_buf, &payload[..copy_len]) {
                     return -1;
                 }
                 return copy_len as i64;
@@ -495,7 +495,7 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             }
             let payload  = msg.payload_bytes();
             let copy_len = payload.len().min(buf_len);
-            if !write_user_bytes(out_buf, &payload[..copy_len]) {
+            if !copy_out(out_buf, &payload[..copy_len]) {
                 return -1;
             }
             copy_len as i64
@@ -559,7 +559,7 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 }
                 let payload  = msg.payload_bytes();
                 let copy_len = payload.len().min(buf_len);
-                if !write_user_bytes(out_buf, &payload[..copy_len]) { break -1; }
+                if !copy_out(out_buf, &payload[..copy_len]) { break -1; }
                 break copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
@@ -697,15 +697,31 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // Helpers.
 // ---------------------------------------------------------------------------
 
+/// Copy a received payload out to the receiver. An empty one copies nothing and succeeds, on every port
+/// (see `build_message`): it was refused by the arch's range check, which failed the receive after the
+/// message had already been taken off the queue.
+fn copy_out(dst: u64, bytes: &[u8]) -> bool {
+    bytes.is_empty() || write_user_bytes(dst, bytes)
+}
+
 /// Build a kernel `Message` from a user-space pointer + length.
 fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
     let len = msg_len as usize;
     if len > MAX_MESSAGE_SIZE {
         return Err(ipc_err_to_i64(IpcError::MessageTooLarge));
     }
-    let bytes = match read_user_bytes(msg_ptr, len) {
-        Some(b) => b,
-        None    => return Err(-1),
+    // An EMPTY message is a message, on every port. Each arch's `read_user_bytes` refuses an empty range
+    // except arm32's, so a zero-length send failed on x86, AArch64 and RISC-V and worked on the Pi 2 -
+    // and nic-driver answers a drain that found no frame with exactly that (backlog/66): the reply was
+    // refused, net-stack waited out its second, and over the radio, where most drains are empty, `net
+    // dns` ran out of time. No bytes are read for no bytes; the pointer is not looked at.
+    let bytes: &[u8] = if len == 0 {
+        &[]
+    } else {
+        match read_user_bytes(msg_ptr, len) {
+            Some(b) => b,
+            None    => return Err(-1),
+        }
     };
     let mut msg = Message::new(bytes).map_err(|e| ipc_err_to_i64(e))?;
     // Stamp the sender's primary endpoint (kernel-set, unforgeable by userspace - the payload cannot
@@ -1840,7 +1856,7 @@ fn do_call(
                     break ipc_err_to_i64(IpcError::MessageTooLarge);
                 }
                 let copy_len = payload.len().min(reply_buf_cap);
-                if !write_user_bytes(buf_ptr, &payload[..copy_len]) { break -1; }
+                if !copy_out(buf_ptr, &payload[..copy_len]) { break -1; }
                 break copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
