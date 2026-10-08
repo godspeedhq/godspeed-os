@@ -27,7 +27,12 @@ them, one device in full, the vendor and class names, and records when piped.
 `hardware` is read only and takes what the system already answers.** It adds, to one device in full,
 the live command register, every BAR and the interrupt route, the capabilities its driver holds, and
 what the driver's spawn asked for; and the views `<device> debug`, `<section> debug`, `interrupts`,
-`why <device>` and `report`. QEMU-verified (`osdev test shell`); not yet run on hardware.
+`why <device>` and `report`. QEMU-verified (`osdev test shell`), and on the HP T630 at `2149fc8c`:
+`interrupts` read `xhci` and `audio-driver` on MSI vectors 0x30 and 0x31 to APIC 18, and `ehci`,
+AHCI and the RTL8168 on legacy lines; `00:10.0 debug` decoded the xHCI controller's configuration
+space - its MSI capability enabled, its MSI-X present but off - and its raw dump began `22 10 14 79`;
+`why` named `xhci`'s confinement and `ehci`'s passthrough with their reasons. `report` and one device
+in full were not run there.
 
 Where those come from: the device's configuration space, read live by `hw-enumerator` (its op 4 - the
 bus is where the kernel wrote each device's interrupt route, so reading it there needs no kernel
