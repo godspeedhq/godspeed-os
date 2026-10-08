@@ -324,6 +324,38 @@ pub fn serve<'s>(
     let mut said_waiting = false;
     const KEYFILE_TRIES: u32 = 15;
     let mut auto_join: Option<([u8; SSID_MAX], u8, u8)> = None;
+    // Why `auto_join` is set, for its line: the boot rejoin from `/wifi.keys`, or the rejoin after the
+    // access point dropped the link (`rejoin_after_drop`).
+    let mut auto_join_why: &str = "from /wifi.keys";
+    /// THE REJOIN AFTER A DROP. An access point drops a station for its own reasons - on 2026-10-08 a
+    /// VisionFive idle for half an hour was disassociated for inactivity (reason 4) - and the network is
+    /// still there and still the one chosen, so it is rejoined, ONCE per drop, through the same path as the
+    /// boot rejoin (`auto_join`, which also honours `/wifi.radio`). Not when the link lasted under
+    /// `REJOIN_MIN_SECS`: an access point that drops every join would otherwise be rejoined forever, and a
+    /// drop that soon is an answer about this station, not an accident (Commandment VIII). Either way the
+    /// line says what was done and why.
+    fn rejoin_after_drop(
+        ctx: &ServiceContext,
+        who: &str,
+        joined_at_secs: i64,
+        last_joined: Option<([u8; SSID_MAX], u8, u8)>,
+    ) -> Option<([u8; SSID_MAX], u8, u8)> {
+        const REJOIN_MIN_SECS: i64 = 60;
+        let lasted = (gs::task::epoch_secs_monotonic(ctx) - joined_at_secs).max(0);
+        match last_joined {
+            None => {
+                say(ctx, who, "nothing to rejoin - `wifi join` returns");
+                None
+            }
+            Some(_) if lasted < REJOIN_MIN_SECS => {
+                say_fmt(ctx, who, format_args!(
+                    "not rejoined: the link lasted {} s, under {} - an access point that drops a join that soon would be rejoined forever; `wifi join` returns",
+                    lasted, REJOIN_MIN_SECS));
+                None
+            }
+            some => some,
+        }
+    }
     /// Join a network this driver holds a key for - the rejoin after `radio on`, and the auto-join at boot
     /// from `/wifi.keys`. `None` when there is no key for a WPA2 name (nothing was attempted); otherwise
     /// the join's outcome, with the driver's memory of the link updated either way.
@@ -405,6 +437,7 @@ pub fn serve<'s>(
     // (`Station::forget_keys` drops them at every end of an association).
     /// What a pull saw, applied to the driver's memory of the join - here, so the frame module need not
     /// know what a join is.
+    /// Returns whether the pull saw the access point drop a link this driver held (`rejoin_after_drop`).
     fn note_pull(
         session: &mut dyn Station,
         p: &Pulled,
@@ -412,11 +445,13 @@ pub fn serve<'s>(
         rekey_seen: &mut u32,
         who: &str,
         ctx: &ServiceContext,
-    ) {
+    ) -> bool {
+        let mut dropped = false;
         if let Some((event, reason)) = p.dropped_link {
             if joined.is_some() {
+                dropped = true;
                 say_fmt(ctx, who, format_args!(
-                    "the access point dropped the link (event {} - {}, reason {}) - not joined; `wifi join` returns",
+                    "the access point dropped the link (event {} - {}, reason {}) - not joined",
                     event, session.event_name(event), reason
                 ));
             }
@@ -428,8 +463,9 @@ pub fn serve<'s>(
             // the log above. The access point decides what happens to the link next, and if it drops it
             // the pull sees that too.
             *rekey_seen = rekey_seen.wrapping_add(p.pairwise_failed);
-            say(ctx, who, "a pairwise rekey did not complete - if the access point drops the link, `wifi join` brings it back");
+            say(ctx, who, "a pairwise rekey did not complete - if the access point drops the link, the driver rejoins it once");
         }
+        dropped
     }
 
     // THE CREDENTIAL SLOTS (`utilities/56_wifi.md` 6): a network name and the pairwise master key derived
@@ -537,6 +573,7 @@ pub fn serve<'s>(
                     say_fmt(ctx, who, format_args!("/wifi.keys loaded - {} network(s) known", n));
                     if n > 0 {
                         auto_join = Some((entries[0].ssid, entries[0].len, entries[0].sec));
+                        auto_join_why = "from /wifi.keys";
                     }
                 }
                 keyfile::Load::NoFile => {
@@ -576,7 +613,7 @@ pub fn serve<'s>(
                 }
             }
             if go && radio_on && sweep.is_none() && joined.is_none() {
-                say(ctx, who, "joining the network last joined, from /wifi.keys");
+                say_fmt(ctx, who, format_args!("joining the network last joined, {}", auto_join_why));
                 match join_known(session, &name, len, sec, &mut stored, &mut joined,
                                  &mut joined_at_secs, &mut joined_security, &mut rxq, ctx) {
                     Some(Outcome::Joined) => {
@@ -640,7 +677,10 @@ pub fn serve<'s>(
                     if last_frame_op.passed(ctx, Budget::ms(IDLE_PULL_MS)) {
                         rxq.clear();
                         let p = session.pull(&mut rxq, ctx);
-                        note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx);
+                        if note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx) {
+                            auto_join = rejoin_after_drop(ctx, who, joined_at_secs, last_joined);
+                            auto_join_why = "after the access point dropped it";
+                        }
                         rxq.clear();
                         if p.data > 0 && idle_discarded == 0 {
                             say(ctx, who, "nothing is taking received frames - the loop reads the radio itself every 250 ms and discards them, so the chip never fills and group rekeys are answered");
@@ -1457,7 +1497,10 @@ pub fn serve<'s>(
                     if !session.tx_ok() {
                         // Credit comes back on received frames; a stack that only sends runs dry.
                         let p = session.pull(&mut rxq, ctx);
-                        note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx);
+                        if note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx) {
+                            auto_join = rejoin_after_drop(ctx, who, joined_at_secs, last_joined);
+                            auto_join_why = "after the access point dropped it";
+                        }
                     }
                     if joined.is_some() {
                         sent = session.send(eth, ctx);
@@ -1473,7 +1516,10 @@ pub fn serve<'s>(
                 out[0] = wire::OP_NET_RX;
                 if rxq.is_empty() && radio_on && joined.is_some() && sweep.is_none() {
                     let p = session.pull(&mut rxq, ctx);
-                    note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx);
+                    if note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx) {
+                        auto_join = rejoin_after_drop(ctx, who, joined_at_secs, last_joined);
+                        auto_join_why = "after the access point dropped it";
+                    }
                 }
                 let n = rxq.pop(&mut out[3..]);
                 out[1..3].copy_from_slice(&(n as u16).to_le_bytes());

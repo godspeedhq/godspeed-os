@@ -95,7 +95,15 @@ What every verb does, and what was seen:
 - An access point that drops the station is noticed by the frame pull - the next time the stack asks for
   frames, which is every hundred milliseconds while there is a link - and by `wifi status` or `wifi
   info` reading the link. It is NOT noticed while the radio is standing by behind a cable that is in,
-  because nobody is pulling then; the driver still does not watch `LINK` events on its own.
+  because nobody is pulling then; the driver still does not watch `LINK` events on its own. Joined and
+  idle, the driver's own loop reads the radio every 250 ms, so a drop is noticed then too.
+- **A drop is rejoined once.** When the access point drops a link that had lasted a minute or more, the
+  driver rejoins the same network with the key it holds, through the same path as the boot rejoin - so
+  it honours `/wifi.radio` - and says `joining the network last joined, after the access point dropped
+  it`. One attempt per drop: if it fails, `wifi join` brings it back. A link dropped in under a minute
+  is NOT rejoined, and the line says so - an access point that drops every join would otherwise be
+  rejoined forever. (Seen 2026-10-08: a VisionFive idle for half an hour, disassociated for inactivity,
+  reason 4.)
 
 One limitation of the record format, recorded rather than left for a pipe to find: SSIDs may contain
 spaces, and `ssid` is the first field, so a positional filter on the second field will misread such a row.
