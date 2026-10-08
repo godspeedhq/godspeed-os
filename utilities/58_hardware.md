@@ -21,11 +21,29 @@ NIC was missing too. It also showed `ehci`'s controller driverless and `audio-dr
 controllers (`86f4e60c`).
 
 Built: the overview, the sections `cpu`, `memory`, `pci`, `soc`, `display` and `usb`, a comma list of
-them, one device in full, the vendor and class names, and records when piped. **Not built**, each
-answering `designed, not built yet` rather than being mistaken for a device: `debug`, `problems`,
-`interrupts`, `tree`, `why`, `report`, `events`, `firmware`, `compare` and `power`. One device in full
-says the kernel's grant - its authority block - is not shown yet: that needs the introspection query
-of the design's section 10.
+them, one device in full, the vendor and class names, and records when piped.
+
+**Step 2 is built too, and with NO kernel change - by the operator's rule for this utility (2026-10-08):
+`hardware` is read only and takes what the system already answers.** It adds, to one device in full,
+the live command register, every BAR and the interrupt route, the capabilities its driver holds, and
+what the driver's spawn asked for; and the views `<device> debug`, `<section> debug`, `interrupts`,
+`why <device>` and `report`. QEMU-verified (`osdev test shell`); not yet run on hardware.
+
+Where those come from: the device's configuration space, read live by `hw-enumerator` (its op 4 - the
+bus is where the kernel wrote each device's interrupt route, so reading it there needs no kernel
+query); the driver's capabilities (`TaskCaps`, as `caps` reads them); each core's scheduler counts
+(InspectKernel 6 and 7, as `observe` reads them); and, for `why`, the supervisor's spawn decision and
+the reason it keeps beside its spawn rows (`supcmd::WHY`).
+
+**What it does NOT show, because the kernel does not report it, and each view says so where it would
+be:** the addresses of the grant as the kernel recorded them (a device's BARs are shown as the device
+reports them; the kernel's own record of the window, the DMA arena and whether the IOMMU confined it
+is in its boot log - `events log boot | match <driver>`, which the view names); how often each
+interrupt fires; per-device IOMMU fault counts; each core's timer mode. A BAR's SIZE is not shown
+either: reading it means writing all ones to the BAR, and this utility never writes.
+
+**Not built**, each answering `designed, not built yet` rather than being mistaken for a device:
+`problems`, `tree`, `events`, `firmware`, `compare` and `power`.
 
 Two limits of step 1, stated: the `usb` section lists only the devices the supervisor starts a driver
 for (today the USB WiFi dongle) - a keyboard or a stick a host drives itself, or a device nothing
@@ -38,7 +56,12 @@ its host and port.
 |---|---|---|
 | `hardware` | report, pipes | a line for the machine, then every section this machine has |
 | `hardware <section>[,<section>...]` | report, pipes | those sections; one this machine lacks says so |
-| `hardware <device>` | report, pipes as lines | one device in full, named as `hardware` names it |
+| `hardware <device>` | report, pipes as lines | one device in full, named as `hardware` names it: its live registers, interrupt and authority |
+| `hardware <device> debug` | report, pipes as lines | the device as the hardware sees it, read now: configuration space decoded, its capability list, and the raw 256 bytes |
+| `hardware <section> debug` | report, pipes as lines | debug for every device in the section; `cpu debug` is each core's scheduler counts |
+| `hardware interrupts` | report, pipes | each PCI device's interrupt route - MSI vector and target APIC, MSI-X, or legacy line - and its driver; records `device`, `route`, `driver` |
+| `hardware why <device>` | report, pipes as lines | who drives it, why that service, and the reason the supervisor records beside its spawn row |
+| `hardware report` | report, pipes as lines | everything, for a bug report: the overview, the interrupts, every driven device in full, the cores |
 | `hardware help` / `hardware version` | | the house conventions |
 
 ## 2. Sections, and a section that is not there
@@ -77,11 +100,34 @@ second `not driven`). A USB host asked for by kind (`ehci`, `xhci`) is shown on 
 where the kernel resolves the kind on the bus, and in `soc` where it does not. A view that cannot hold
 every row says how many it left out.
 
+**One device in full**, as the QEMU machine's network card reads:
+
+```
+gsh> hardware 00:03.0
+device     00:03.0
+section    pci
+kind       ethernet
+id         8086:100e (Intel)
+class      0x020000
+driver     nic-driver
+state      running, on core 1, restarted 0 time(s)
+command    0x0107 (memory on, I/O on, bus master on, INTx on)
+bar0       0xfebc0000 (32-bit memory)
+bar1       0xc000 (I/O ports)
+interrupt  INTx pin A, IRQ line 11
+authority  nic-driver holds log_write, and 3 endpoint(s)
+asked      class 0x020000, the first memory BAR, no confinement
+granted    the kernel does not report its grant's addresses; it logged them at spawn - events log boot | match nic-driver
+why        hardware why 00:03.0
+```
+
 ## 3. Pipes (rule 12)
 
 Every section is one record shape - `section`, `device`, `kind`, `driver`, `state`, `detail` - so any
 combination pipes as one table: `hardware cpu,memory | count`, `hardware | where driver=-`,
-`hardware pci | select device kind`. One device is labelled lines and pipes as text, to `match`.
+`hardware pci | select device kind`. `interrupts` is its own table - `device`, `route`, `driver`. One
+device, `debug`, `why` and `report` are labelled lines and pipe as text, to `match` or `write`; the pipe
+holds 16 KiB and says when it cut a long `report`.
 
 ## 4. Failure says whose answer is missing
 
@@ -92,4 +138,5 @@ fails, so `if hardware problems` cannot be read as an answer.
 
 ## 5. Tab completion (rule 9)
 
-The built sections complete; a device name is the machine's, typed. No word completes to a path.
+The built sections and the words `interrupts`, `report` and `why` complete; a device name is the
+machine's, typed. No word completes to a path.

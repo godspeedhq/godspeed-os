@@ -87,6 +87,19 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, pa
     let status = if payload.len() == 2 && payload[1] == supcmd::DEVICES {
         body_len = devices_answer(usb, &mut body);
         supcmd::OK
+    } else if payload.len() > 2 && payload[1] == supcmd::WHY {
+        let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        match DEVICE_WHY.iter().find(|(n, _)| *n == name) {
+            Some((_, why)) => {
+                let w = why.as_bytes();
+                let len = w.len().min(body.len() - 1);
+                body[0] = supcmd::OK;
+                body[1..1 + len].copy_from_slice(&w[..len]);
+                body_len = 1 + len;
+                supcmd::OK
+            }
+            None => supcmd::UNKNOWN,
+        }
     } else if payload.len() >= 6 && (payload[1] == supcmd::RESTART || payload[1] == supcmd::SPAWN) {
         let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         match core::str::from_utf8(&payload[6..]) {
@@ -404,6 +417,20 @@ mod board {
         &["events"]
     };
 }
+
+/// WHY each driver's device is handled as it is, for `hardware why` (`supcmd::WHY`). Kept here, beside
+/// the rows that make the decisions, so the explanation is edited where the decision is: a row whose
+/// confinement or device changes changes its line here in the same edit. A reason not recorded is
+/// said to be not recorded - `nic-driver` - rather than invented.
+const DEVICE_WHY: &[(&str, &str)] = &[
+    ("xhci", "confined by the IOMMU where the machine has one: every DMA the controller makes is inside its arena, so confinement refuses nothing it does legitimately (CLAUDE.md 6.4)"),
+    ("ehci", "IOMMU passthrough, not confined: the controller legitimately reaches firmware and hub regions outside any arena that could be granted (the 0xffffffc0 accesses), so a tight confinement does not fit it (docs/iommu.md 4a)"),
+    ("block-driver", "IOMMU passthrough, not confined: the AHCI controller keeps a stale firmware DMA pointer that confinement would fault (CLAUDE.md 6.4)"),
+    ("audio-driver", "confined by the IOMMU where the machine has one: the command rings, the buffer list and the ring of sound are all inside its arena (CLAUDE.md 6.4)"),
+    ("nic-driver", "not confined: its spawn row asks for no confinement and no reason is recorded beside it; on a machine with no IOMMU it is trust-critical either way (CLAUDE.md 6.4)"),
+    ("console", "granted the framebuffer by kind; the kernel takes the screen back if it dies, so the machine is never mute (CLAUDE.md 11.4)"),
+    ("wifi-usb", "holds no hardware: the USB host that bound the dongle serves every request it makes, and the supervisor starts it when that host reports the dongle attached (docs/wifi-usb.md)"),
+];
 
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),

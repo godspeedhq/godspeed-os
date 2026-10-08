@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # `hardware` - what this machine is, what drives each part of it, and what is wrong
 
-**Status: STEP 1 BUILT (2026-10-08), the rest designed.** Agreed with the operator in conversation on
+**Status: STEPS 1 AND 2 BUILT (2026-10-08), the rest designed. No kernel change, by the operator's rule
+(section 10).** Agreed with the operator in conversation on
 2026-10-08, during the T630 cards of `docs/wifi-usb.md` 51. Step 1 of the build order (section 14) is
 built and its spec is `utilities/58_hardware.md`, which is what the shell answers; this note stays the
 design for everything after it.
@@ -42,9 +43,9 @@ are not right - and it adds the thing Device Manager cannot show: who holds auth
    <service>` already covers the one useful action, and a utility that only reads can be trusted at a
    glance, which is when it is wanted - while the machine is misbehaving. A read with side effects (a
    status register that clears when read) is left out or marked.
-2. **Each owner answers for its own devices; the utility only asks.** No new kernel responsibility. The
-   sources are in section 9; one new introspection query is the only kernel change, and it needs the
-   operator's go-ahead and a constitution note (section 10).
+2. **Each owner answers for its own devices; the utility only asks.** No kernel change at all - the
+   operator's rule, 2026-10-08. The sources are in section 9; what only the kernel could say is shown as
+   not shown (section 10).
 3. **One record shape for every section.** The shell's pipes carry one table with one set of columns,
    so every row is one device with the same columns (section 3) and any combination of sections pipes.
    On the terminal the rows are grouped under section headings, so it reads like Device Manager.
@@ -210,7 +211,8 @@ core 2      LAPIC id 18
 
 Every line names where it came from in the source, not on screen: PCI configuration from
 `hw-enumerator`, controller registers from the driver over its own protocol (as `wifi debug transport`
-does today), LAPIC and IOMMU state from the kernel (section 10).
+does today). LAPIC and IOMMU state would have come from the kernel, which does not report it - so it is
+not shown (section 10). What `debug` does show today is the configuration space, decoded and raw.
 
 ## 6. `problems`: the warning-icon view
 
@@ -274,19 +276,31 @@ its raw hex ID, never a guess.
 | USB devices with NO driver here | the host drivers | **no** - the hosts report only what they bound |
 | fixed SoC blocks (the Pis) | the kernel, by device kind | yes, as boot lines; no query yet |
 | controller registers (`debug`) | the driver, over its own protocol | per driver; `wifi debug transport` is the pattern |
-| per-device grant, IOMMU domain and faults, MSI target, timer state | the kernel | **no** - section 10 |
+| per-device grant, IOMMU domain and faults, timer state | the kernel | **no**, and not shown - section 10 |
+| a device's live BARs, command register and interrupt route (MSI target included) | the device's configuration space, via `hw-enumerator` op 4 | yes - built in step 2 |
 | radio firmware and its load check | the radio drivers | yes, as boot lines |
 | the reasons in `why` | fixed strings beside each decision in code | **no** - to be added with each decision |
 | events | the `events` service | the service exists; the events do not yet |
 
-## 10. The one kernel change
+## 10. No kernel change - the operator's rule, and what it costs
 
-The per-device facts only the kernel holds - the grant (window, arena, interrupt route, power), the
-IOMMU domain and fault count, the MSI target core, and each core's timer state - need one new
-`InspectKernel` query, behind the existing `INTROSPECT` capability. A new query on an existing syscall,
-not a new syscall, and no new responsibility: the kernel already holds every one of these facts and
-logs most of them at spawn. It still widens the surface Commandment I pins, so it needs the operator's
-go-ahead and a constitution note before it is written.
+**Decided 2026-10-08: `hardware` makes no kernel change.** It is a read-only utility, and it takes what
+the system already answers. This section used to propose one new `InspectKernel` query for the
+per-device facts only the kernel holds, on the claim that "the kernel already holds every one of these
+facts". That claim was false, and it is corrected here rather than left standing:
+
+- The kernel keeps, per task, a BDF (only for a driver with a DMA arena) and a device-kind word (0 for
+  every PCI driver). The window, the arena and the vectors it grants go into the driver's own context
+  page, whose address the kernel does not keep.
+- It does not count interrupts per vector (on x86 only the timer is counted), does not record which
+  core a vector targets, and buckets IOMMU faults as xhci / ehci / other, not per device.
+- Each core's timer mode is held, but nothing reads it.
+
+So the query would have needed the kernel to START recording, which is the growth the rule exists to
+prevent. Step 2 was built instead from what already answers (`utilities/58_hardware.md`): the
+configuration space read live by `hw-enumerator` - where the kernel wrote each device's interrupt route
+- the driver's capabilities, the per-core scheduler counts, and the supervisor's spawn decision. What
+only the kernel could say is named as not shown, at the place a reader would look for it.
 
 ## 11. More views
 
@@ -415,8 +429,10 @@ run: ran 5, failed 1, skipped 0
 
 1. **From facts that exist, no kernel change:** the overview, sections, `hardware <device>` (without the
    kernel-held authority lines), the names table, `tree`, and `problems` from the owners' own reports.
-2. **With the kernel query (section 10), after the operator's go-ahead:** authority in full, `debug`,
-   `interrupts`, `report`, `why`.
+2. **Built 2026-10-08, with no kernel change (section 10):** the authority a reader can reach - the
+   driver's capabilities, what its spawn asked for, the device's live BARs and interrupt route - and
+   `debug`, `interrupts`, `report`, `why`. Interrupt counts, per-device IOMMU faults and timer modes
+   are not shown, because only the kernel holds them.
 3. `events`, `firmware`, `compare`, and `selfcheck hardware`.
 4. `power` and temperature, when something needs them.
 

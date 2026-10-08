@@ -304,6 +304,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Answer questions about what was found. A reporter answers; it does not push.
     //   op 1        -> device count
     //   op 2 + idx  -> that device's facts
+    //   op 4 + idx  -> that device's configuration space, read NOW: [bdf, 256 bytes]
     //   op 3 + class -> the BDF of the first device with that class code (0 = none), and the class
     loop {
         let msg = ctx.recv();
@@ -348,6 +349,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let mut b = [0u8; 8];
                 b[0..4].copy_from_slice(&bdf.to_le_bytes());
                 b[4..8].copy_from_slice(&want.to_le_bytes());
+                Message::from_bytes(&b)
+            }
+            // op 4: the device's whole configuration header and capability area AS IT IS NOW - the
+            // command register, the BARs and the MSI routing the kernel programmed, read live rather
+            // than from the boot scan. For `hardware <device> debug` and `hardware interrupts`
+            // (utilities/58_hardware.md): the bus is the one place a device's interrupt route is
+            // recorded, so reading it here is how a read-only view learns it with no kernel change.
+            // Reads only; a dword the kernel refuses reads as all ones, which a reader sees as such.
+            (Some(4), Some(i)) if (i as usize) < n => {
+                let f = found[i as usize];
+                let (bus, dev, func) = ((f.bdf >> 8) as u8, ((f.bdf >> 3) & 0x1f) as u8, (f.bdf & 7) as u8);
+                let mut b = [0u8; 4 + 256];
+                b[0..4].copy_from_slice(&f.bdf.to_le_bytes());
+                for k in 0..64usize {
+                    let v = cfg_read(&ctx, bus, dev, func, (k * 4) as u8).unwrap_or(0xFFFF_FFFF);
+                    b[4 + k * 4..8 + k * 4].copy_from_slice(&v.to_le_bytes());
+                }
                 Message::from_bytes(&b)
             }
             // An unknown op is ANSWERED, not ignored: a caller blocked on a reply that never comes is

@@ -908,6 +908,51 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("designed, not built yet"), "hardware: a word not built yet says so"),
         None => { println!("shell-test: FAIL - timed out after `hardware problems`"); fail += 1; }
     }
+    // hardware step 2 (utilities/58_hardware.md), with NO kernel change: the live configuration space
+    // from hw-enumerator's op 4, the driver's capabilities, and the supervisor's recorded reason. The
+    // QEMU machine's e1000 at 00:03.0 is the device every check reads.
+    send(&mut write_half, b"hardware 00:03.0\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => {
+            check!(r.contains("command    0x") && r.contains("bus master"), "hardware <device>: the live command register");
+            check!(r.contains("interrupt  "), "hardware <device>: its interrupt route, from the configuration space");
+            check!(r.contains("authority  nic-driver holds") && r.contains("granted    "), "hardware <device>: what the driver holds, and where the grant was logged");
+        }
+        None => { println!("shell-test: FAIL - timed out after `hardware 00:03.0`"); fail += 3; }
+    }
+    send(&mut write_half, b"hardware 00:03.0 debug\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("vendor 8086") && r.contains("  00: 86 80"), "hardware <device> debug: configuration space decoded and raw"),
+        None => { println!("shell-test: FAIL - timed out after `hardware 00:03.0 debug`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware why 00:03.0\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("is driven by nic-driver") && r.contains("not confined"),
+                          "hardware why: who drives it, and the reason the supervisor records"),
+        None => { println!("shell-test: FAIL - timed out after `hardware why 00:03.0`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware why 00:00.0\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("has no service"), "hardware why: a device with no driver says why"),
+        None => { println!("shell-test: FAIL - timed out after `hardware why 00:00.0`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware interrupts\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("00:03.0") && r.contains("does not count interrupts"),
+                          "hardware interrupts: each device's route, and what is not counted said"),
+        None => { println!("shell-test: FAIL - timed out after `hardware interrupts`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware cpu debug\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("core 0") && r.contains("scheduler quanta"), "hardware cpu debug: each core's quanta"),
+        None => { println!("shell-test: FAIL - timed out after `hardware cpu debug`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware report\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => check!(r.contains("GodspeedOS hardware report") && r.contains("authority  nic-driver"),
+                          "hardware report: the overview and each driven device in full"),
+        None => { println!("shell-test: FAIL - timed out after `hardware report`"); fail += 1; }
+    }
     // events log boot (utilities/47_events.md): the KERNEL'S fixed copy of the boot, which never wraps.
     // It must hold lines from before the shell existed - the kernel's own core count and the supervisor
     // coming up - which the sink's window does not, and say how much it holds.

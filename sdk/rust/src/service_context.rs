@@ -510,6 +510,10 @@ pub mod supcmd {
     /// u16 LE, pid u16 LE, attached 0/1, the reporting host's name, the driver's name, each a length
     /// byte and bytes). The `hardware` utility's DRIVER column (`docs/hardware-design.md`).
     pub const DEVICES: u8 = b'D';
+    /// Why is this driver's device handled as it is? Read only: `[MARKER, WHY, name...]`, answered
+    /// with `[OK, text...]` - the reason the supervisor keeps beside the spawn rows - or `[UNKNOWN]`
+    /// for a service with none recorded. `hardware why` (`docs/hardware-design.md` 11).
+    pub const WHY:     u8 = b'W';
 
     /// Reply status, one byte, so a caller can log the truth rather than assume success.
     pub const OK:      u8 = 0;
