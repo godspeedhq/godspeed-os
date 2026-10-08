@@ -7457,7 +7457,11 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
     // pci: the bus as `hw-enumerator` found it (op 1, the count; op 2, each device).
     f.pci_bus = false;
     f.usb_host = false;
-    if let Some(m) = hw_ask(ctx, "hw-enumerator", &[1]) {
+    // Asked only where it runs: a board with no PCI bus (the Pi 2) has no `hw-enumerator`, and asking
+    // for it by name there made the kernel log a failed lookup for a question with a known answer.
+    if slot_of(ctx, "hw-enumerator").is_none() {
+        // No PCI bus the OS can read; `pci_bus` stays false and the section says so.
+    } else if let Some(m) = hw_ask(ctx, "hw-enumerator", &[1]) {
         let p = m.payload_bytes();
         if p.len() >= 4 {
             f.pci_bus = true;
@@ -15641,8 +15645,11 @@ fn events_log_boot(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError
         ctx.console_writeln_fmt(format_args!(
             "events: the boot record is FULL at {} KiB and stopped there - later lines are on serial, and the recent ones in `events log`", cap / 1024));
     } else {
+        // Not yet full: it holds EVERYTHING logged since boot, and keeps filling until it is. The Pi 2
+        // read 29323 bytes and then 29591 seconds later; "the whole boot record" read as final when it
+        // was still growing.
         ctx.console_writeln_fmt(format_args!(
-            "events: the whole boot record, {} byte(s) of {} KiB. It is the KERNEL'S copy and never wraps; `events log` is the sink's recent window", held, cap / 1024));
+            "events: the boot record holds everything logged since boot, {} byte(s) - it fills to {} KiB and then stops. It is the KERNEL'S copy and never wraps; `events log` is the sink's recent window", held, cap / 1024));
     }
     Ok(())
 }
