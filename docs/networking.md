@@ -408,8 +408,11 @@ appeared to cure it only because a success latched the clock and quietened the n
 **What this does not fix, recorded rather than smoothed over.** Two things still hold the serve loop.
 The dance itself (DHCP and ARP) blocks it while the network is being configured - `backlog/28` and
 `backlog/29` describe the incremental dance that would fix that. And on the Pi 4 every exchange with
-`nic-driver` can cost a second, because the first send does not wake it: `backlog/66`, a lost wake-up in
-the kernel's blocked-receiver path, measured and parked. The decoupling should remove the multi-second
+`nic-driver` can cost a second: `backlog/66`, then read as a lost wake-up in the kernel's blocked-receiver
+path. **Corrected 2026-10-08:** no wake was ever shown lost. What later failed `net dns` over the radio was
+`nic-driver` answering a drain that found no frame with an empty message, which the kernel refused on
+every port but ARM32 (fixed in `e3fcf7ed`); the one-second STATUS tax itself had stopped appearing by
+2026-10-04, unexplained (`backlog/66`). The decoupling should remove the multi-second
 stalls the clock caused - not yet run on hardware; it does not touch that one-second tax, and a slow `ping` after this change is that.
 
 ### 16.1 Later the same day: the clock leaves `net-stack` entirely

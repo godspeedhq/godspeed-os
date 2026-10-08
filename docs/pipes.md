@@ -191,8 +191,8 @@ stage crossing a **service** boundary is capped at 4 KiB and refuses a larger bu
 ## The EOT end-of-stream marker
 
 A service ends a stream with a one-byte **EOT** (`0x04`) message, so the shell's `recv` drain
-knows when to stop. A zero-length message is **not** used - the IPC path does not deliver an
-empty body. A filter (`upper`) forwards EOT downstream; the shell stops draining on it.
+knows when to stop. A zero-length message is **not** used: a byte says what it means, and until
+2026-10-08 (`e3fcf7ed`) the kernel did not deliver an empty body on x86, AArch64 or RISC-V. A filter (`upper`) forwards EOT downstream; the shell stops draining on it.
 
 ## Bounds and failure (loud, never silent - §26.6 / §3.12)
 

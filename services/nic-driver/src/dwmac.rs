@@ -542,8 +542,9 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
         } else {
             // A frame to transmit. The acknowledgement carries NOTHING, deliberately: answering a
             // send with a received frame hands it to a caller that did not ask for one (destroying
-            // it), and when no frame is waiting the reply is empty, which cannot be delivered at
-            // all, so the caller waits out its whole deadline. That pair was the Pi 4's ping loss.
+            // it), and when no frame was waiting the reply was empty, which the kernel refused on three
+            // ports until `e3fcf7ed`, so the caller waited out its whole deadline. That pair was the
+            // Pi 4's ping loss. A drain (op 4) that finds nothing still answers empty, and is delivered.
             let d = match &mut w {
                 Wire::Up(d) if cable => Some(d),
                 _ => None,

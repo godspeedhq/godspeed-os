@@ -1092,3 +1092,59 @@ every `usbfn` opcode and size in the doc's table; the 54 arch-conditional sites 
 true then (the loop moved to `godspeed_wifi::serve` since). `install_key`'s group arm in `station.rs` still
 computes the BSSID it no longer uses - a dead branch, not a wrong comment, left for a code change rather
 than an audit.
+
+## Audit 10 - documents and code comments, `feat/wifi-driver` since `ff40a6fa` (2026-10-08)
+
+Scope: everything changed since Audit 9 - 14 files: the Pi 2 page-table arena, the radio stand-in, the
+supervisor's name map, `backlog/66` found and fixed, its instruments removed - and everything elsewhere
+those changes made untrue. The second half was the larger. The mechanical gates (`doc_refs`,
+`doc_symbols_check`, `comment_symbol_check`, `facts_check`, `line_ref_check`, `site_check`, `dash_check`,
+`backlog_check`, `docs_index_check`, `foreign_word_check`, `doc_command_check`) were green before and after;
+nothing below is a thing they can see, except the two names the doc-symbol gate caught the same day and
+`1e7319cb` fixed (`WOKEN_AT`, and a network name in `docs/wifi-usb.md` that should never have been
+committed).
+
+**A rule of the system stopped being true, and twenty places said it was.** `e3fcf7ed` made an empty
+message deliverable on every port; until then the kernel refused one on x86, AArch64 and RISC-V. That
+refusal had been found before - `d2f99b65`, the TCP close, the fs protocol selftest - and each time the
+answer was a one-byte reply at the site and a comment stating the refusal as a law: "a zero-length message
+cannot be delivered at all", "it is not even a message". Those comments were in `net-stack` (five, and a
+`debug_assert!` message), `nic-driver` (`main.rs` four, `genet.rs`, `dwmac.rs`), `wifi-driver`, `fs` (its
+selftest's doc and its failure line), `osdev`'s shell test, `examples/greet` and its index, and
+`docs/pipes.md`, `docs/gsfs-next.md` and `docs/tcp-design.md`. Each now says the kernel refused it on three
+ports until `e3fcf7ed`, and why the byte stays anyway: an answer should say what happened, and `fs`'s
+protocol reads a short reply as malformed. `docs/tcp-design.md` is dated text and got a correction note
+instead of an edit; it also now says the other reason the Pi 2 never showed it - ARM32's check accepted an
+empty range. `nic-driver`'s `serve_status` doc said it answered other requests EMPTY; it answers `[1]`.
+
+**`backlog/66` was read as a lost wake-up for a week, and four documents still said so.**
+`docs/networking.md`, `backlog/74`, the backlog index row and `docs/wifi-usb.md` section 49 each stated
+or leaned on it; each has a dated correction. `nic-driver`'s `radio.rs` called the held-request collision
+"the three-second ping of `backlog/66`" and `genet.rs` called failed replies "the shape backlog/66 is
+chasing"; both now say what 66's DNS failure turned out to be.
+
+**An overclaim of this session's own, caught on the read-back.** `backlog/66`'s status and the first draft
+of these corrections said the empty reply explained the item. It explains what the item had become - `net
+dns` failing over the radio, on drains that found no frame. It does not explain the item's title: a STATUS
+reply is nine bytes and never empty, so the one-second STATUS exchanges of 2026-09-30 had another cause,
+and they had stopped appearing by 2026-10-04 with nobody having shown why. The status line, its last
+entry, the index row and the three corrections that touched it now say exactly that much.
+
+**Stale after the code moved (comments):** the supervisor's `record_name_quiet` said an on-demand
+program's cap is "let go here", above the `0a179048` change that holds it until the caller is answered,
+and the reply comment said the supervisor always keeps the original; `docs/wifi-usb.md` section 49 said
+the cap is let go "at once". `net-stack`'s first-attempt log was labelled an INSTRUMENT for `backlog/66`;
+it is a permanent line that names both halves of an exchange, and says so now.
+
+**Checked and correct, recorded so it is not re-chased:** the Pi 2 arena comments (`L1_TABLES` 32 at 16
+KiB = 512 KiB, `L2_TABLES` 256 at 1 KiB = 256 KiB, the 982 refusals and 18 failures against `docs/wifi-usb.md`
+47) and `PageTable::discard`'s safety argument against `into_cr3`, `reclaim_user_frames` and
+`free_page_table_root`; `chaos`'s refused-spawn count; the stand-in's comments in `sdk/wifi/src/serve.rs`
+and `wire.rs` (`USE_STANDIN` 3, `NOTE_USB_RADIO` 0x2D, distinct from `usbfn`'s 0x2E and 0x2F) and the
+supervisor's `tell_radio_of_dongle`; the shell's `UpNotChosen`; the scheduler's lost-wakeup comment, which
+is about the idle halt and true; `dispatch.rs`'s `build_message` and `copy_out`.
+
+**Left as they are:** dated narrative that was true when written and is marked as history by its date
+(`docs/wifi.md` 3439, the earlier entries of `backlog/66`). The one-byte replies themselves are left in the
+code: they are correct protocol with or without the kernel's refusal, and changing them is a code change,
+not an audit.

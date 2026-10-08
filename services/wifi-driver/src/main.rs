@@ -473,8 +473,8 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
         // No reply cap means there is nothing to answer on, and dropping is all that is left.
         let Some(reply) = ctx.take_pending_cap() else { continue };
         // The reply cap is RECLAIMED after use (26.6): see the serve loop for what not doing so cost.
-        // One byte at least, not an empty message: the kernel refuses a zero-length send, so an "empty
-        // reply" is no reply at all and the caller waits out its deadline.
+        // One byte at least, not an empty message: the kernel refused a zero-length send on three ports
+        // until `e3fcf7ed`, so an "empty reply" was no reply at all; a byte says what happened.
         let (tag, p) = godspeed_wifi::serve::untag(req.payload_bytes());
         // THIS LOOP IS REACHED when the radio never got as far as its firmware - no SDIO window, the host
         // failed, no card on the bus even after the power was asserted, a backplane that would not open. A

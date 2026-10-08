@@ -472,6 +472,11 @@ The kernel's `validate_user_ptr` rejects `len == 0`, so a zero-length `try_send`
 never leaves, and the caller waits out its entire deadline for a message that could not have been
 sent. Silent at both ends: the sender discards the failed send, the receiver sees only a timeout.
 
+**Corrected 2026-10-08:** that held on x86, AArch64 and RISC-V; ARM32's check accepted an empty range,
+which is the other reason the Pi 2 never showed it. It is gone on every port since `e3fcf7ed`
+(`backlog/66`, where the same refusal cost `net dns` over WiFi). The status bytes below stay, for the
+reason the next paragraph gives.
+
 `COP_CLOSE` replied with nothing, and so did the refusal path and the UDP socket path when a datagram
 drew no answer. Every other reply in the service happens to carry a byte, which is the only reason
 this took until the fourth board to surface. All three now answer with a status byte, and

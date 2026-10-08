@@ -808,16 +808,16 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         last_tx_done = tx_done;
         tx_count = tx_count.saturating_add(1);
 
-        // ONE BYTE, NOT EMPTY - a zero-length message cannot be delivered at all. The kernel rejects
-        // the send (`validate_user_ptr` fails on `len == 0`), so the caller waits out its full
-        // deadline for a reply that never left. Same defect and same fix as the transmit reply
-        // further down; no caller of a transmit reads its payload.
+        // ONE BYTE, NOT EMPTY. Until `e3fcf7ed` the kernel refused a zero-length send on three ports
+        // (`validate_user_ptr` failed on `len == 0`), and the caller waited out its full deadline for
+        // a reply that never left. Same fix as the transmit reply further down, and kept: no caller of
+        // a transmit reads its payload, and a byte says the frame was taken.
         answer(ctx, reply_cap, &[0u8], &mut reply_fails);
     }
 }
 
 /// Serve the frame interface. A 1-byte `[3]` STATUS query gets `sreply` ([ok, mac(6)]) back - the
-/// `net` nic-mac diagnostic. Every other request (a frame from net-stack) gets an EMPTY reply, so
+/// `net` nic-mac diagnostic. Every other request (a frame from net-stack) gets a one-byte `[1]`, so
 /// net-stack degrades rather than hangs (§26.7). Never returns.
 fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     // Counts replies that could not be delivered; see `note_reply`.
@@ -829,9 +829,9 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
         if p.len() == 1 && p[0] == 3 {
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(sreply)), &ctx, &mut reply_fails);
         } else {
-            // Unrecognised op: still ANSWER. An empty reply is undeliverable (the kernel refuses a
-            // zero-length send), so this used to leave the caller waiting out its deadline for a
-            // request the driver had already decided it would not serve. One byte says so.
+            // Unrecognised op: still ANSWER. An empty reply was undeliverable on three ports until
+            // `e3fcf7ed`, so this used to leave the caller waiting out its deadline for a request the
+            // driver had already decided it would not serve. One byte says so.
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1u8])), &ctx, &mut reply_fails);
         }
         ctx.remove_cap(reply_cap);
@@ -1224,11 +1224,12 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                     ctx.log_fmt(format_args!("nic-driver: usb-net TX FAILED x{} (frame not sent)", tx_fail));
                 }
             }
-            // A ONE-BYTE ANSWER, BECAUSE AN EMPTY MESSAGE CANNOT BE DELIVERED AT ALL.
+            // A ONE-BYTE ANSWER, BECAUSE AN EMPTY MESSAGE COULD NOT BE DELIVERED WHEN THIS WAS FOUND.
             //
-            // The kernel rejects a zero-length send outright - `validate_user_ptr` returns false for
-            // `len == 0`, so `build_message` fails and the reply never leaves. The caller then waits
-            // out its whole deadline for an answer that was never on the wire. Measured on hardware:
+            // The kernel rejected a zero-length send outright - `validate_user_ptr` returned false for
+            // `len == 0`, so `build_message` failed and the reply never left (it accepts one on every
+            // port since `e3fcf7ed`, `backlog/66`). The caller then waited out its whole deadline for
+            // an answer that was never on the wire. Measured on hardware:
             // every ping cost `nic-driver gave NO ANSWER after 2012 ms (budget 1 s) for op 0 [why -1]`
             // - two attempts timing out - while the ICMP round trip itself took 66 ms. The ping was
             // not slow; this acknowledgement was undeliverable.
@@ -1240,7 +1241,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // `is_some()` - none reads the payload. The comment outlived the code it described.
             //
             // 0 = sent. `fs` reached the same conclusion for its own protocol and wrote it down
-            // there: an empty reply is not an answer. It is not even a message.
+            // there: an empty reply is not an answer.
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
         }
         ctx.remove_cap(reply_cap);

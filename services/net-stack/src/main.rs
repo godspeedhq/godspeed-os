@@ -250,7 +250,7 @@ fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, s
             // net-stack and nic-driver queries. Once per call, and only after the deadline has
             // already passed, so a healthy path is untouched: this is recovery, not a retry loop.
             first => {
-                // INSTRUMENT (backlog/66): this branch was silent, and the wrapper above it reports
+                // NAMED, NOT SUMMED: this branch was silent, and the wrapper above it reports
                 // only the total - so an exchange whose FIRST attempt timed out and whose RETRY
                 // answered looked like one slow answer. Name both halves.
                 let what = match first {
@@ -378,12 +378,13 @@ impl Reply {
     /// that to `service_main`'s frame at every one of the thirteen call sites. The SDK has already
     /// paid for that mistake once - see `await_slice`, where a one-line wrapper returning a `Message`
     /// by value cost `fs` a stack frame per request and took it over its limit on hardware.
-    /// Answering with NOTHING is not possible, so it is not allowed to be attempted.
+    /// Answering with NOTHING is not allowed.
     ///
-    /// The kernel's `validate_user_ptr` rejects a zero-length buffer, so a zero-length send fails
-    /// and the reply never leaves - the caller then waits out its entire deadline for a message that
-    /// could not have been sent. On a Pi 4 that was five seconds on every `serve` close, while the
-    /// close itself had worked (net-stack reaped the connection 400 ms later).
+    /// Until `e3fcf7ed` the kernel refused a zero-length send on x86, AArch64 and RISC-V
+    /// (`backlog/66`), so the reply never left and the caller waited out its entire deadline. On a
+    /// Pi 4 that was five seconds on every `serve` close, while the close itself had worked (net-stack
+    /// reaped the connection 400 ms later). An empty message is delivered on every port now; the
+    /// rule stays for the reason below.
     ///
     /// Debug-asserted rather than silently padded: a caller that means "nothing" should say so with
     /// a byte that means it, because the receiver has to distinguish "no data" from "no answer"
@@ -391,7 +392,7 @@ impl Reply {
     #[inline(never)]
     fn send(&self, ctx: &ServiceContext, body: &[u8]) {
         debug_assert!(!body.is_empty(),
-            "a zero-length reply cannot be sent - the kernel refuses it and the caller hangs");
+            "a reply carries at least one byte - say nothing with a byte that means it");
         match self.tag {
             None => { let _ = ctx.try_send_by_handle(self.cap, &Message::from_bytes(body)); }
             Some(t) => {
@@ -3329,9 +3330,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         resp[1] = (took >> 8) as u8;
                         2
                     }
-                    // ONE BYTE, NOT ZERO. An empty reply cannot be sent at all: the kernel's
-                    // `validate_user_ptr` rejects `len == 0`, so `try_send` fails, the reply is
-                    // discarded, and the caller waits out its whole deadline. Every other reply here
+                    // ONE BYTE, NOT ZERO. An empty reply could not be sent at all until `e3fcf7ed`:
+                    // the kernel refused `len == 0` on three ports, so `try_send` failed, the reply was
+                    // discarded, and the caller waited out its whole deadline. Every other reply here
                     // happens to carry a byte; this one did not, and it cost five seconds per close
                     // on a Pi 4 - the close itself worked, which is why the connection was reaped
                     // 400 ms later while the client sat waiting.
@@ -3350,7 +3351,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         6
                     }
                     // A refused operation answers `[0]` rather than nothing, for the same
-                    // reason: an empty reply is undeliverable and reads as a hang.
+                    // reason: the caller learns what happened rather than inferring it.
                     _ => { resp[0] = 0; 1 }
                 };
                 reply.send(&ctx, &resp[..n]);
@@ -3380,10 +3381,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 } else { None }
             } else { None };
             match n {
-                // A zero-length UDP response is as undeliverable as a refusal, for the same reason -
-                // the kernel rejects a zero-length send - so both answer with a single zero byte.
-                // `sock` already reads an empty payload as "nothing came back"; it now gets a reply
-                // saying so instead of waiting out its deadline for one that could never arrive.
+                // A zero-length UDP response and a refusal both answer with a single zero byte. Until
+                // `e3fcf7ed` an empty reply was refused by the kernel on three ports and the caller
+                // waited out its deadline; `sock` reads the byte as "nothing came back", which is
+                // what it is told either way.
                 Some(len) if len > 0 => { reply.send(&ctx, &resp[..len]); }
                 _ => { reply.send(&ctx, &[0]); }
             }

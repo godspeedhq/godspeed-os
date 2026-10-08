@@ -2926,7 +2926,8 @@ documented beside the code that logs them, not a request from anywhere.) Steps 2
   held two slots for the life of the machine, and the dongle's driver arriving after was dropped (it still
   started, wired from its peers). **Fixed:** the map keeps only what the supervisor restarts (`is_watched`),
   starts for a USB device (`USB_MATCH`), or wires others to (a peer in an image row - `pong`); an on-demand
-  program's capability is let go at once (`map_keeps`, `record_name_quiet`).
+  program's capability is let go (`map_keeps`, `record_name_quiet`) - since `0a179048` after the caller
+  that asked for the spawn is answered, because letting it go at once left `spawncap` with no cap.
 
 **The Pi 4 `selfcheck` on the current image (`edd63579`): 527 run, 1 failed, the same DNS check, and split
 by the operator.** With the cable OUT, `net dns google.com` resolved once (on `net-stack`'s retry) in five
@@ -2942,6 +2943,11 @@ Nothing this branch changed touches `nic-driver`'s GENET path beyond comments.
 
 **And `selfcheck` with the cable in, same boot: 526 run, 0 failed, 0 skipped** (`run: ran 526, failed 0`). The one failure on the
 radio is the radio-bridged path's (`backlog/66`), not anything `selfcheck` checks being broken.
+
+**Corrected 2026-10-08: `nic-driver` was not waking late.** A kernel flight recorder on the VisionFive
+showed the request answered in milliseconds and the answer refused: a drain that found no frame was
+answered with an empty message, which the kernel refused on every port but ARM32 - which is why the Pi 2
+below resolved on the same network. Fixed in `e3fcf7ed`; `backlog/66` has the account.
 
 **And the Pi 2, the same day, the cable out and the dongle carrying the link** (`nic-driver: the cable is
 out - the radio carries the link`), joined to the SAME guest network the Pi 4's radio was on:

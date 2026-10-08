@@ -165,7 +165,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
     // delegate access to it.
     //
     // A copy is DERIVED for the caller and the supervisor keeps its own (it needs it to wire
-    // dependents later). If the send fails the derived copy is reclaimed - an orphaned cap is a
+    // dependents later) - for a service the map keeps. One it does not is sent itself (`handed`). If the send fails the derived copy is reclaimed - an orphaned cap is a
     // table slot leaked per request (26.6).
     if let Some(reply_cap) = ctx.take_pending_cap() {
         let msg = Message::from_bytes(&[status]);
@@ -1014,10 +1014,11 @@ fn record_name(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapH
 /// used to discard this and then print "adopted running X" - a line that was not true if the record
 /// had just been dropped. Announcing the outcome is optional; hiding a failure is not (invariant 12).
 fn record_name_quiet(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapHandle) -> bool {
-    // ONE cap is let go here: the old instance's, for a name the map keeps; the new one, for a name it
-    // does not. An on-demand program - `upper`, `recorder`, a selfcheck's `greet` - is restarted by nothing
-    // and wired to nothing, so the supervisor holds no capability to it, and it is never in the map, so
-    // there is no old one to free as well. The map is bounded at `NAME_MAP_MAX`, and these used to stay in
+    // For a name the map keeps, the old instance's cap is let go here. For a name it does not, the new
+    // one is held until the caller is answered (below) and then let go. An on-demand program - `upper`,
+    // `recorder`, a selfcheck's `greet` - is restarted by nothing and wired to nothing, so the supervisor
+    // holds no capability to it once that message is done, and it is never in the map, so there is no old
+    // one to free as well. The map is bounded at `NAME_MAP_MAX`, and these used to stay in
     // it for the life of the machine: on the Pi 4 a `selfcheck` filled it, and the USB dongle's driver
     // arriving after was dropped (`docs/wifi-usb.md` 49).
     //

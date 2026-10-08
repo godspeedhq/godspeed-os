@@ -1245,7 +1245,8 @@ fn say_up(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) {
 /// A reply that could not be sent, said WITH ITS REASON. The two reasons are different faults: a full
 /// queue means the requester is alive and behind, a dead capability means the requester already gave
 /// up (timed out and reclaimed its reply cap) before this driver was scheduled to answer - which is
-/// the shape backlog/66 is chasing. The old line latched once and named neither. First failure and
+/// what backlog/66 was first taken for (its DNS failure turned out to be an empty reply the kernel
+/// refused, fixed in `e3fcf7ed`). The old line latched once and named neither. First failure and
 /// every sixteenth after, so a run of them is a count and not a flood.
 fn reply_failed(ctx: &ServiceContext, e: godspeed_sdk::ipc::IpcError, n: &mut u32) {
     *n = n.saturating_add(1);
@@ -1434,9 +1435,9 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
             // not want one (net-stack's send path checks only whether a reply arrived), so the frame
             // was consumed and destroyed: exactly what "every transmit a place a frame could be
             // destroyed by a caller who did not want an answer" describes. And when NO frame was
-            // waiting, `n` was 0, so the reply was EMPTY - and an empty reply cannot be delivered
-            // (d2f99b65), so the acknowledgement never arrived and net-stack waited out its whole
-            // one-second deadline.
+            // waiting, `n` was 0, so the reply was EMPTY - and an empty reply could not be delivered
+            // (d2f99b65; the kernel refused one on three ports until e3fcf7ed), so the acknowledgement
+            // never arrived and net-stack waited out its whole one-second deadline.
             //
             // That second case is the Pi 4's ping loss. The window is measured from BEFORE the send,
             // so a stalled acknowledgement spends the window the echo reply needed: the log showed

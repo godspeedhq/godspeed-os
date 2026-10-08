@@ -61,7 +61,9 @@ exchange is received by `nic-driver` about a second late, served back to back wi
 as a lost wake-up in the kernel's blocked-receiver path. Neither service had a mailbox in any of those
 boots, so every reply and every request in that exchange shared a queue with the other kind. That is a
 candidate, not a cause: nothing here shows the mechanism, and 66 stays as written until a boot with
-mailboxes says otherwise.
+mailboxes says otherwise. **Corrected 2026-10-08:** 66's later form, `net dns` failing over the radio, was
+an empty reply the kernel refused on three ports (`e3fcf7ed`), not the mailboxes; the one-second STATUS tax
+this paragraph describes had stopped by 2026-10-04 and was never explained.
 
 ## Ruled out
 

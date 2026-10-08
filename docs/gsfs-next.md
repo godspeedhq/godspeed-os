@@ -78,9 +78,9 @@ shell, and no way for this to become a back door. It runs as a startup selftest,
 guards, so it is proved on every boot of every board rather than in one suite on one architecture.
 
 **The assertion is that every request produces a NON-EMPTY answer.** Not the right answer - a
-malformed request has none - but some answer. A zero-length reply is undeliverable (the kernel
-refuses a zero-length send), so a request that produces one leaves its caller waiting out a full
-deadline for a reply that can never arrive. This project has shipped exactly that bug on another
+malformed request has none - but some answer. A zero-length reply is not an answer in this protocol,
+and until 2026-10-08 (`e3fcf7ed`) the kernel did not deliver one on three ports, so a request that
+produced one left its caller waiting out a full deadline. This project has shipped exactly that bug on another
 service and it cost a day.
 
     fs: protocol selftest PASS - 599 malformed requests, every one answered

@@ -6954,9 +6954,10 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
         check!(whole.contains("path guard selftest PASS"), "fs proved its path guards at startup");
         // 599 malformed requests through the REAL parser, on every boot. The assertion is not that
         // each gets the right answer - a malformed request has none - but that each gets SOME answer:
-        // a zero-length reply is undeliverable, so it leaves the caller waiting out its deadline.
+        // a zero-length reply is not an answer in fs's protocol (and was not even delivered on three
+        // ports until e3fcf7ed).
         check!(whole.contains("protocol selftest PASS"),
-               "fs answered every malformed request at startup (no undeliverable empty reply)");
+               "fs answered every malformed request at startup (no empty reply)");
     }
     let base = answered!("read /canary.txt", "the canary reads before the assault");
     check!(base.contains("canary-must-survive"), "the canary is intact before the assault");

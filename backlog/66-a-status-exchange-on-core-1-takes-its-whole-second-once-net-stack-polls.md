@@ -1,6 +1,6 @@
 # 66. A STATUS exchange between net-stack and nic-driver takes its whole second once net-stack is polling, and two fixes that should have touched it did not
 
-**Status: FIXED 2026-10-08 (`e3fcf7ed`) - an empty reply was refused by the kernel on every port but ARM32 (the last entry below). Verified on the VisionFive over WiFi and over the cable; the Pi 4 has not yet run the fixed build. Was: PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well.**
+**Status: FIXED 2026-10-08 (`e3fcf7ed`) for what this item had become - `net dns` failing over the radio: an empty reply was refused by the kernel on every port but ARM32 (the last entry below). Verified on the VisionFive over WiFi and over the cable; the Pi 4 has not yet run the fixed build. The item's FIRST form, a STATUS exchange (op 3) taking its second, is not explained by it - a STATUS reply is never empty - and had stopped appearing by 2026-10-04 (below). Was: PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well.**
 **Found:** 2026-09-30 on the Pi 4, as `ping` over the radio running at one echo every three seconds.
 
 **2026-10-02, the symptom is mostly gone, and nobody fixed it on purpose.** The boot of commit `5dd1f1b8`
@@ -211,6 +211,11 @@ FAILED`); `net-stack` waited out its second and retried into the next empty drai
 drains are empty while an answer is in flight, so DNS ran out of time; over the cable fewer are, which
 was the ~900 ms first-try miss seen there. The receive side had the same fault: an empty payload already
 taken off the queue failed its copy-out.
+
+What this does NOT explain: the item's title. A STATUS reply is nine bytes, never empty, so the
+one-second STATUS exchanges of 2026-09-30 had some other cause - most likely `backlog/67`'s dead reply
+caps and the held-request collision in `nic-driver`'s radio wait, both fixed since - and they had stopped
+appearing by 2026-10-04 with nobody having shown why. Recorded rather than folded in.
 
 `e3fcf7ed` makes an empty message a message on every port, in neutral code: `build_message` reads
 nothing for nothing, and the receive copy-outs succeed on an empty payload. VisionFive, the same day:
