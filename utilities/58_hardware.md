@@ -9,7 +9,16 @@ is `docs/hardware-design.md`.
 ## Status, as built and honest (2026-10-08)
 
 **Step 1 of the design's build order is built: the facts that already exist, no kernel change.** Run in
-QEMU (`osdev test shell`). Not yet run on hardware.
+QEMU (`osdev test shell`), and on hardware on 2026-10-08: the Dell Wyse 5070 and the HP T630, where
+the T630's view at `86f4e60c` was operator-checked line by line - 22 PCI devices, every driver on the
+device it drives, the dongle in `usb`.
+
+Three runs to get there, each finding what QEMU could not. The Wyse showed its xHCI controller
+driverless (the supervisor's answer left out the USB hosts, `c2bae9a1`). The T630 then lost every row
+after the 24th: the commit that fixed it says the T630 has 19 PCI devices, which was the number the
+truncated view SHOWED - it has 22, and the three hidden were two host bridges and the RTL8168, so the
+NIC was missing too. It also showed `ehci`'s controller driverless and `audio-driver` on both HD audio
+controllers (`86f4e60c`).
 
 Built: the overview, the sections `cpu`, `memory`, `pci`, `soc`, `display` and `usb`, a comma list of
 them, one device in full, the vendor and class names, and records when piped. **Not built**, each
