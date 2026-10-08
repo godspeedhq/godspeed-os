@@ -3089,3 +3089,15 @@ diagnosed), fixed in `arch/x86_64/boot.rs`. **Open:** about 116,000 IOMMU faults
 run, every address inside its own arena, in bursts just after its restarts, with `xhci` working
 throughout - none in the 16:12 run and 2 in the 17:05 one. One suspect, not shown: the invalidation waits
 for the IOMMU to fetch its commands, not to complete them (AMD-Vi's COMPLETION_WAIT).
+**The fourth T630 run (`bdc7adaa`, the timer fix), operator-accepted:** all 1000 rounds, 7982 kills, the
+kernel alive and no liveness panic; `wifi-usb` recovered after chaos and `net dns` answered; `selfcheck`
+524, 0 failed.
+
+**The Dell Wyse 5070 on the same work (`33ec635b`), operator-accepted:** all 1000 rounds of
+`chaos max-carnage all-services`, 7195 kills, the kernel alive, no panic and no liveness wedge. After
+chaos the dongle joined and `net dns google.com` answered every time it was asked (21 lookups, the
+answers rotating through Google's addresses); `selfcheck` ran 526, 0 failed. The Wyse is an Intel
+machine with no AMD-Vi table, so it says nothing about the T630's open `xhci` IOMMU faults: its drivers
+are unconfined and stay in the TCB (CLAUDE.md 6.4), as its boot line reports. During and just after
+chaos, `net-stack` logged four link queries that `nic-driver` did not answer in time; each says it is
+a timeout and not a reading, and the wired port had no cable.
