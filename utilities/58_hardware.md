@@ -10,7 +10,7 @@ is `docs/hardware-design.md`.
 
 **Step 1 of the design's build order is built: the facts that already exist, no kernel change.** Run in
 QEMU (`osdev test shell`), and on hardware on 2026-10-08: the Dell Wyse 5070 and the HP T630, where
-the T630's view at `86f4e60c` was operator-checked line by line - 22 PCI devices, every driver on the
+the T630's view at `86f4e60c` reads right against its boot log - 22 PCI devices, every driver on the
 device it drives, the dongle in `usb`.
 
 Three runs to get there, each finding what QEMU could not. The Wyse showed its xHCI controller
