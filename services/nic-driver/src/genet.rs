@@ -1247,17 +1247,8 @@ fn say_up(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) {
 /// up (timed out and reclaimed its reply cap) before this driver was scheduled to answer - which is
 /// the shape backlog/66 is chasing. The old line latched once and named neither. First failure and
 /// every sixteenth after, so a run of them is a count and not a flood.
-fn reply_failed(ctx: &ServiceContext, e: godspeed_sdk::ipc::IpcError, n: &mut u32, taken: wait::Since, held: bool) {
+fn reply_failed(ctx: &ServiceContext, e: godspeed_sdk::ipc::IpcError, n: &mut u32) {
     *n = n.saturating_add(1);
-    // INSTRUMENT (backlog/66, 2026-10-07): how long THIS driver had the request before answering it. A
-    // reply cap dies only when net-stack has stopped waiting (about a second); if this reads a few ms,
-    // the second passed BEFORE the request reached this loop, and the delay is not in this driver's work.
-    let had_ms = taken.elapsed_us(ctx) / 1000;
-    if *n <= 8 || *n % 16 == 0 {
-        ctx.log_fmt(format_args!(
-            "nic-driver: the failed reply's request was taken {} ms before it was answered, from {} (#{})",
-            had_ms, if held { "the radio wait's held slots" } else { "recv" }, *n));
-    }
     if *n == 1 || *n % 16 == 0 {
         let why = match e {
             godspeed_sdk::ipc::IpcError::QueueFull => "the requester's queue is full",
@@ -1300,11 +1291,9 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
     loop {
         // A REQUEST THE RADIO WAIT KEPT IS SERVED FIRST - it arrived before anything the recv below
         // could return (`Radio::held`).
-        let from_held;
         let (req, reply_cap) = match radio.take_held() {
-            Some(h) => { from_held = true; h }
+            Some(h) => h,
             None => {
-                from_held = false;
                 let req = ctx.recv();
                 // The reply cap is the ONLY authority to answer net-stack (§8.5).
                 //
@@ -1327,7 +1316,6 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
             }
         };
         let p = req.payload_bytes();
-        let taken = wait::Since::now(ctx);
 
         // THE CABLE, re-read at most every CABLE_RECHECK_MS on whatever request arrives (`Carrier`). A
         // link that came up after bring-up gets the MAC speed and DMA burst re-applied, edge-triggered,
@@ -1371,14 +1359,14 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
                     status_served, ctx.read_tsc() / ctx.duration_cycles(1).max(1)));
             }
             let out = radio::status(ctx, &mut radio, cable, mac.unwrap_or([0; 6]), &mut carrier);
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures, taken, from_held); }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 10 {
             let out = radio::peer(ctx, &mut radio, cable);
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures, taken, from_held); }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
             let n = if cable { g.receive(&mut rxbuf) } else { radio.rx(ctx, &mut rxbuf) };
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])) { reply_failed(ctx, e, &mut reply_failures, taken, from_held); }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes]. Bounded three ways - by
             // BATCH_MAX, by the reply buffer, and by the ring emptying - so it always terminates.
@@ -1404,14 +1392,14 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
                 count += 1;
             }
             out[0] = count;
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])) { reply_failed(ctx, e, &mut reply_failures, taken, from_held); }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
             // UNSUPPORTED on this backend - answered `[0]`, not `[1]`. Ops 6/7/8 are the chaos
             // force-link override and op 5 is a Realtek/e1000-shaped register dump; acking any of them
             // with success would make `chaos link-flap` print that it had exercised link recovery
             // having exercised nothing. A test that cannot fail is worse than absent when it reads as
             // passing. The caller needs an ANSWER, and "not supported here" is one.
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures, taken, from_held); }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
         } else {
             // TX FRAME (any multi-byte payload) : transmit and acknowledge. The frame is NOT coupled to a receive - see below.
             if !cable {
@@ -1460,7 +1448,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
             // the shared path was changed to match and THIS backend was not, so the Pi 4 kept the old
             // coupled behaviour under the new caller. Frames stay in the ring for the drain (ops 4
             // and 9), which is the path whose job that is.
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures, taken, from_held); }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
         }
         ctx.remove_cap(reply_cap);
     }

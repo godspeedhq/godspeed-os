@@ -359,9 +359,7 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 
     // enqueue atomically records us as a blocked sender if QueueFull -
     // no separate record_blocked_sender call needed.
-    let res = crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, Some(my_slot));
-    { let fl_r: u64 = match &res { Ok(Some(_)) => 1, Ok(None) => 0, Err(IpcError::QueueFull) => 2, Err(_) => 3 }; scheduler::fl_note(scheduler::fl::SEND, scheduler::current_task_slot(), (fl_r << 32) | (endpoint_id.0 & 0xFFFF_FFFF)); }
-    match res {
+    match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, Some(my_slot)) {
         Ok(Some(receiver_slot)) => {
             scheduler::wake_by_slot(receiver_slot, 0);
             0
@@ -416,9 +414,6 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     loop {
         match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
             Ok((msg, sender_to_wake)) => {
-                scheduler::fl_note(scheduler::fl::GOT, my_slot, scheduler::fl_got_word(
-                    msg.sender_ep, msg.cap_count, msg.payload_bytes().len(),
-                    msg.payload_bytes().first().copied().unwrap_or(0), false));
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
                 }
@@ -433,7 +428,6 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = msg.caps[i] {
                         if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(), scheduler::fl_cap_word(new_slot, Some(&embedded_cap)));
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -447,7 +441,6 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 return copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
-                scheduler::fl_note(scheduler::fl::EMPTY, my_slot, 0);
                 let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
                 if err != 0 { return err; }
                 // Sender woke us; loop to dequeue the message.
@@ -488,7 +481,6 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             for i in 0..n_caps {
                 if let Some(embedded_cap) = msg.caps[i] {
                     if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                        scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(), scheduler::fl_cap_word(new_slot, Some(&embedded_cap)));
                         scheduler::push_pending_recv_cap(new_slot as u32);
                     }
                 }
@@ -541,9 +533,6 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
     let result = loop {
         match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
             Ok((msg, sender_to_wake)) => {
-                scheduler::fl_note(scheduler::fl::GOT, my_slot, scheduler::fl_got_word(
-                    msg.sender_ep, msg.cap_count, msg.payload_bytes().len(),
-                    msg.payload_bytes().first().copied().unwrap_or(0), true));
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
                 }
@@ -552,7 +541,6 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = msg.caps[i] {
                         if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(), scheduler::fl_cap_word(new_slot, Some(&embedded_cap)));
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -564,10 +552,8 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
             }
             Err(IpcError::QueueEmpty) => {
                 if deadline != 0 && scheduler::monotonic_ticks() >= deadline {
-                    scheduler::fl_note(scheduler::fl::TIMEOUT, my_slot, 0);
                     break RECV_TIMED_OUT;
                 }
-                scheduler::fl_note(scheduler::fl::EMPTY, my_slot, 1);
                 if deadline != 0 {
                     scheduler::set_wake_deadline(my_slot, deadline);
                 }
@@ -606,7 +592,6 @@ fn handle_irq_unmask(irq: u64) -> i64 {
 fn handle_sleep(cycles: u64) -> i64 {
     if cycles == 0 { return 0; }
     let my_slot = scheduler::current_task_slot();
-    scheduler::fl_note(scheduler::fl::SLEEP, my_slot, scheduler::cycles_to_us(cycles));
 
     // SUB-TICK SLEEPS GO TO THE MICROSECOND ONE-SHOT - RE-ENABLED, with the reason it was pulled now
     // understood and fixed elsewhere.
@@ -679,9 +664,7 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
     // Pass None for blocked_sender_slot - QueueFull is returned directly.
-    let res = crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, None);
-    { let fl_r: u64 = match &res { Ok(Some(_)) => 1, Ok(None) => 0, Err(IpcError::QueueFull) => 2, Err(_) => 3 }; scheduler::fl_note(scheduler::fl::SEND, scheduler::current_task_slot(), (fl_r << 32) | (endpoint_id.0 & 0xFFFF_FFFF)); }
-    match res {
+    match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, None) {
         Ok(Some(receiver_slot)) => {
             scheduler::wake_by_slot(receiver_slot, 0);
             0
@@ -1601,14 +1584,8 @@ fn handle_derive_cap(held_slot: u64, _a1: u64, _a2: u64) -> i64 {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
-    scheduler::fl_note(scheduler::fl::CAPDV, scheduler::current_task_slot(),
-        scheduler::fl_cap_word(held_slot as usize, Some(&held)));
     match scheduler::current_task_insert_cap(held) {
-        Ok(slot) => {
-            scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(),
-                scheduler::fl_cap_word(slot, Some(&held)));
-            slot as i64
-        }
+        Ok(slot) => slot as i64,
         Err(_)   => -1, // cap table full
     }
 }
@@ -1662,9 +1639,7 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     //    On QueueFull the message (with cap) is stored in the routing table as
     //    a blocked-sender record; remove the cap from the sender's table so it
     //    is not duplicated.
-    let res = crate::ipc::routing::enqueue(endpoint_id, msg, endpoint_cap.generation, Some(my_slot));
-    { let fl_r: u64 = match &res { Ok(Some(_)) => 1, Ok(None) => 0, Err(IpcError::QueueFull) => 2, Err(_) => 3 }; scheduler::fl_note(scheduler::fl::SEND, scheduler::current_task_slot(), (fl_r << 32) | (endpoint_id.0 & 0xFFFF_FFFF)); }
-    match res {
+    match crate::ipc::routing::enqueue(endpoint_id, msg, endpoint_cap.generation, Some(my_slot)) {
         Ok(Some(receiver_slot)) => {
             scheduler::current_task_remove_cap(grant_slot);
             scheduler::wake_by_slot(receiver_slot, 0);
@@ -1839,7 +1814,6 @@ fn do_call(
                 for i in 0..n_caps {
                     if let Some(embedded_cap) = reply.caps[i] {
                         if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::fl_note(scheduler::fl::CAPIN, scheduler::current_task_slot(), scheduler::fl_cap_word(new_slot, Some(&embedded_cap)));
                             scheduler::push_pending_recv_cap(new_slot as u32);
                         }
                     }
@@ -2306,8 +2280,7 @@ fn handle_query_cap_rights(slot: u64) -> i64 {
 /// Clears the cap at `slot`. Always returns 0; out-of-range slots are silently
 /// ignored (idempotent - the slot is already empty).
 fn handle_remove_cap(slot: u64) -> i64 {
-    let removed = scheduler::current_task_remove_cap(slot as usize);
-    scheduler::fl_removed(slot as usize, removed.as_ref());
+    scheduler::current_task_remove_cap(slot as usize);
     0
 }
 

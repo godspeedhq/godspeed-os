@@ -98,12 +98,7 @@ fn core_still_using(cid: usize, slot: usize) -> bool {
 /// killer's wait ignores it.
 #[inline]
 fn core_release_current(cid: usize, to: usize) {
-    wake_gap_check(cid, to);
     let leaving = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-    if leaving != to {
-        if leaving < MAX_TASKS { fl_note(fl::OFF, leaving, TASK_STATE[leaving].load(Ordering::Relaxed) as u64); }
-        if to < MAX_TASKS { fl_note(fl::RUN, to, 0); }
-    }
     // ORDER MATTERS AND SO DOES SeqCst: the killer must not be able to observe the release without
     // also observing the claim, or it concludes nobody is using a task this core is still standing on.
     CORE_LEAVING.get(cid).0.store(leaving as u64, Ordering::SeqCst);
@@ -362,11 +357,9 @@ pub fn scan_timed_wakes() {
             && TASK_STATE[slot].load(Ordering::Relaxed) == TaskState::BlockedOnRecv as u8
         {
             TASK_WAKE_DEADLINE[slot].store(0, Ordering::Relaxed);
-            fl_note(fl::DEADLINE, slot, 0);
             wake_by_slot(slot, 0);
         }
     }
-    lost_wake_check(now);
 }
 
 /// Saved user-space RSP for each ring-3 task.  Updated whenever the task is
@@ -621,216 +614,6 @@ static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
 /// caller re-check. Same race exists for a plain `recv`, and the same flag covers it.
 static TASK_WAKE_PENDING: [core::sync::atomic::AtomicBool; MAX_TASKS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TASKS];
-
-/// WAKE-TO-RUN, the instrument `backlog/66` names as its next measurement. On the Pi 4 a request to
-/// `nic-driver` is received about a second late, and only when the sender's RETRY arrives - a wake lost
-/// somewhere between `send` and the receiver running, on the same core. Two places it can be lost, and
-/// they need different fixes: the task was made Ready and not picked (a `pick_next` / idle question), or
-/// it was never made Ready (an enqueue / `blocked_receiver` question). This stamps the BSP tick when
-/// `wake_by_slot` makes a task Ready and checks it when the task next runs (`core_release_current`): a gap
-/// of `WAKE_GAP_SAY_TICKS` or more is said, with the halts its core took in idle meanwhile. A long gap
-/// says the first; NO line while the late answers recur says the second. Diagnostic; it goes when the
-/// fault does.
-static WOKEN_AT: [portable_atomic::AtomicU64; MAX_TASKS] =
-    [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
-static WOKEN_HALTS: [portable_atomic::AtomicU64; MAX_TASKS] =
-    [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
-static WAKE_GAPS_SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// The core the stamped task runs on, recorded with the stamp so the idle check needs no `TASK_CORE` read.
-static WOKEN_CORE: [portable_atomic::AtomicU64; MAX_TASKS] =
-    [const { portable_atomic::AtomicU64::new(0) }; MAX_TASKS];
-/// 100 ms, in 10 ms BSP ticks: well above a scheduling round on a core with a handful of tasks.
-const WAKE_GAP_SAY_TICKS: u64 = 10;
-
-/// FLIGHT RECORDER (backlog/66, 2026-10-07). Over the radio, on the Pi 4 and the VisionFive, a request to
-/// `nic-driver` is taken about a second after `net-stack` sent it and answered 1-2 ms after it is taken.
-/// Checks that each tested one explanation ruled them out one at a time; this records instead. Every IPC
-/// event touching the three tasks on that path - `net-stack`, `nic-driver`, `wifi-driver` - goes into a
-/// ring with the cycle counter: each send and what it did (woke a receiver, queued, refused), each
-/// receive (got a message, or found none and is about to block), each block and each declined block,
-/// each wake and the state it lifted the task out of, each switch on and off a core, and each timed
-/// wake, each received message (sender, caps, length, first byte) and each `TakePendingCap` and what it
-/// returned. When net-stack has asked nic-driver and had no answer sent back for `FL_ASK_TICKS`, the ring
-/// is printed from that ask (or its last `FL_DUMP_EVENTS`) up to now, so the second is read rather than inferred. (The first trigger, mail held at
-/// nic-driver, fired only at boot: the request is not waiting there.) Diagnostic; it goes with the fault.
-pub mod fl {
-    pub const SEND: u8 = 1;      // a = (result << 32) | endpoint low 32; result 0 queued, 1 woke, 2 full, 3 err
-    pub const GOT: u8 = 2;       // recv dequeued a message; a = 1 for a timed recv
-    pub const EMPTY: u8 = 3;     // recv found the queue empty and is about to block; a = 1 for a timed recv
-    pub const BLOCK: u8 = 4;     // blocked; a = state
-    pub const NOBLOCK: u8 = 5;   // declined to block; a = 1 wake pending, 2 state no longer Running
-    pub const WAKE: u8 = 6;      // made Ready; a = (state it was in << 8) | waking slot (0xFF = none)
-    pub const RUN: u8 = 7;       // switched onto its core
-    pub const OFF: u8 = 8;       // switched off its core; a = its state then
-    pub const TIMEOUT: u8 = 9;   // recv_timeout returned its timeout
-    pub const DEADLINE: u8 = 10; // the BSP scan's timed wake fired for it
-    pub const TAKE: u8 = 11;     // TakePendingCap; a = (caps pending before << 16) | slot returned (0xFFFF = none)
-    pub const SLEEP: u8 = 12;    // the sleep syscall; a = microseconds asked for. Not in recv: a send cannot wake it
-    pub const CAPIN: u8 = 13;    // a cap arrived in a message and was installed; a = (slot << 32) | endpoint it names
-    pub const CAPRM: u8 = 14;    // RemoveCap; a = (slot << 32) | endpoint the removed cap named (0xFFFF_FFFF = slot empty)
-    pub const CAPDV: u8 = 15;    // DeriveCap; a = (source slot << 32) | endpoint it names; the new slot follows as CAPIN
-}
-
-/// The endpoint `cap` names, low 32 bits, for a cap-table event.
-pub fn fl_cap_word(slot: usize, cap: Option<&Capability>) -> u64 {
-    ((slot as u64 & 0xFF) << 32) | cap.map_or(0xFFFF_FFFF, |c| c.resource_id.0 & 0xFFFF_FFFF)
-}
-
-/// A traced task removing a cap that names ITS OWN endpoint is said at once, with the slot. Its
-/// self-grant is such a cap, and every reply cap it hands out is copied from that; a removed derived
-/// copy is the other case, and the slot says which.
-pub fn fl_removed(slot: usize, cap: Option<&Capability>) {
-    let cid = current_core_id();
-    let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
-    if cur >= MAX_TASKS || !fl_traced(cur) { return; }
-    fl_note(fl::CAPRM, cur, fl_cap_word(slot, cap));
-    if let Some(c) = cap {
-        if c.resource_id.0 == TASK_ENDPOINT[cur].load(Ordering::Relaxed) {
-            crate::kprintln!("fl-alert: '{}' removed cap slot {}, which names its OWN endpoint {:#x}",
-                task_name(cur), slot, c.resource_id.0);
-        }
-    }
-}
-/// What `GOT` records about the message: who sent it, how many caps it carried, its length and first
-/// byte, and whether the receive was timed - enough to tell a driver's reply from a client's request.
-pub fn fl_got_word(sender_ep: u64, caps: usize, len: usize, first: u8, timed: bool) -> u64 {
-    ((sender_ep & 0xFFFF) << 24) | ((caps as u64 & 7) << 21) | ((len as u64 & 0xFFF) << 9)
-        | ((first as u64) << 1) | timed as u64
-}
-const FL_LEN: usize = 2048;
-static FL_CYC: [portable_atomic::AtomicU64; FL_LEN] = [const { portable_atomic::AtomicU64::new(0) }; FL_LEN];
-static FL_EV: [portable_atomic::AtomicU64; FL_LEN] = [const { portable_atomic::AtomicU64::new(0) }; FL_LEN];
-static FL_HEAD: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-
-fn fl_traced(slot: usize) -> bool {
-    slot < MAX_TASKS && matches!(task_name(slot), "nic-driver" | "net-stack" | "wifi-driver")
-}
-
-/// Record `kind` for `slot` if it is one of the traced tasks. Lock-free; a torn entry under a race is
-/// possible and harmless for a diagnostic.
-pub fn fl_note(kind: u8, slot: usize, a: u64) {
-    if !fl_traced(slot) { return; }
-    // net-stack's sifted wait wakes every 20 ms and records nine scheduler events each time, which
-    // filled the first dump with its own polling and pushed out what came after the ask. Its messages,
-    // caps and sleeps are what say anything; a send that woke it is recorded by the sender.
-    if task_name(slot) == "net-stack" && matches!(kind, fl::RUN | fl::OFF | fl::BLOCK | fl::NOBLOCK
-        | fl::EMPTY | fl::TIMEOUT | fl::DEADLINE | fl::WAKE) { return; }
-    if kind == fl::SEND {
-        // An ASK is net-stack sending to nic-driver's endpoint; an ANSWER is nic-driver sending to
-        // net-stack's. The trigger below fires on an ask left unanswered (`FL_ASK_TICKS`).
-        let ep = a & 0xFFFF_FFFF;
-        let owner = (0..MAX_TASKS).find(|&t| TASK_VALID[t].load(Ordering::Acquire)
-            && TASK_ENDPOINT[t].load(Ordering::Relaxed) & 0xFFFF_FFFF == ep);
-        match (task_name(slot), owner.map(task_name)) {
-            ("net-stack", Some("nic-driver")) => {
-                if FL_ASK_AT.load(Ordering::Relaxed) == 0 {
-                    FL_ASK_IDX.store(FL_HEAD.load(Ordering::Relaxed), Ordering::Relaxed);
-                    FL_ASK_AT.store(monotonic_ticks().max(1), Ordering::Relaxed);
-                }
-            }
-            ("nic-driver", Some("net-stack")) => FL_ASK_AT.store(0, Ordering::Relaxed),
-            _ => {}
-        }
-    }
-    let i = (FL_HEAD.fetch_add(1, Ordering::Relaxed) as usize) % FL_LEN;
-    let core = current_core_id() as u64 & 0xFF;
-    FL_CYC[i].store(crate::arch::imp::read_cycle_counter(), Ordering::Relaxed);
-    FL_EV[i].store(((kind as u64) << 56) | ((slot as u64 & 0xFF) << 48) | (core << 40)
-        | (a & 0xFF_FFFF_FFFF), Ordering::Relaxed);
-}
-
-/// BSP tick of the oldest unanswered ask (0 = none, `u64::MAX` = said, until the next answer).
-static FL_ASK_AT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-/// Ring position of that ask, so the dump starts at it.
-static FL_ASK_IDX: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-static FL_DUMPS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// 300 ms in BSP ticks: nic-driver answers in milliseconds, so an ask unanswered this long is the fault.
-const FL_ASK_TICKS: u64 = 30;
-const FL_DUMPS_MAX: u32 = 3;
-/// 60 s in BSP ticks.
-const FL_QUIET_TICKS: u64 = 6000;
-/// Events printed: the LAST this many, so the dump always reaches the moment it fired - the first dump
-/// printed 150 from the ask and stopped 744 ms short of now, at the radio's request.
-const FL_DUMP_EVENTS: u64 = 400;
-
-fn lost_wake_check(now: u64) {
-    if FL_DUMPS.load(Ordering::Relaxed) >= FL_DUMPS_MAX { return; }
-    // Not in the first minute: bring-up asks and sleeps by design, and would spend every dump.
-    if now < FL_QUIET_TICKS { return; }
-    let at = FL_ASK_AT.load(Ordering::Relaxed);
-    if at == 0 || at == u64::MAX || now.saturating_sub(at) < FL_ASK_TICKS { return; }
-    FL_ASK_AT.store(u64::MAX, Ordering::Relaxed);
-    let n = FL_DUMPS.fetch_add(1, Ordering::Relaxed) + 1;
-    let q = crate::arch::imp::boot::tsc_ticks_per_quantum().max(1);
-    let t_now = crate::arch::imp::read_cycle_counter();
-    let head = FL_HEAD.load(Ordering::Relaxed);
-    let from = FL_ASK_IDX.load(Ordering::Relaxed).saturating_sub(6)
-        .max(head.saturating_sub(FL_LEN as u64 - 1)).max(head.saturating_sub(FL_DUMP_EVENTS));
-    let to = head;
-    let ep_of = |name: &str| (0..MAX_TASKS).find(|&t| TASK_VALID[t].load(Ordering::Acquire) && task_name(t) == name)
-        .map_or(0, |t| TASK_ENDPOINT[t].load(Ordering::Relaxed));
-    crate::kprintln!(
-        "flight #{}: net-stack asked nic-driver {} ms ago and has had no answer - events {} to {} of {}, oldest first, us before now (counter {} per 10 ms); endpoints net-stack {:#x} nic-driver {:#x} wifi-driver {:#x}; got = sender<<24 | caps<<21 | len<<9 | byte0<<1 | timed",
-        n, (now - at) * 10, from, to, head, q, ep_of("net-stack"), ep_of("nic-driver"), ep_of("wifi-driver"));
-    for k in from..to {
-        let i = (k as usize) % FL_LEN;
-        let ev = FL_EV[i].load(Ordering::Relaxed);
-        let ago = t_now.wrapping_sub(FL_CYC[i].load(Ordering::Relaxed)).saturating_mul(10_000) / q;
-        let kind = (ev >> 56) as u8;
-        let slot = ((ev >> 48) & 0xFF) as usize;
-        let core = (ev >> 40) & 0xFF;
-        let a = ev & 0xFF_FFFF_FFFF;
-        let what = match kind {
-            fl::SEND => "send", fl::GOT => "got", fl::EMPTY => "empty", fl::BLOCK => "block",
-            fl::NOBLOCK => "noblock", fl::WAKE => "wake", fl::RUN => "run", fl::OFF => "off",
-            fl::TIMEOUT => "timeout", fl::DEADLINE => "deadline", fl::TAKE => "take", fl::SLEEP => "sleep",
-            fl::CAPIN => "capin", fl::CAPRM => "caprm", fl::CAPDV => "capdv", _ => "?",
-        };
-        crate::kprintln!("fl {:>8} c{} {:<11} {:<8} {:#x}", ago, core, task_name(slot), what, a);
-    }
-    crate::kprintln!("flight #{} end", n);
-}
-
-/// Called on every switch to `to`: if a wake made it Ready, how long ago (see `WOKEN_AT`).
-fn wake_gap_check(cid: usize, to: usize) {
-    if to >= MAX_TASKS { return; }
-    let w = WOKEN_AT[to].swap(0, Ordering::Relaxed);
-    if w == 0 { return; }
-    let gap = (monotonic_ticks() + 1).saturating_sub(w);
-    if gap < WAKE_GAP_SAY_TICKS { return; }
-    let n = WAKE_GAPS_SAID.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 20 || n % 64 == 0 {
-        let halts = core_idle_halts(cid).saturating_sub(WOKEN_HALTS[to].load(Ordering::Relaxed));
-        crate::kprintln!(
-            "sched: '{}' ran {} ms after a wake made it Ready (core {}, which halted in idle {} time(s) meanwhile) (x{})",
-            task_name(to), gap * 10, cid, halts, n);
-    }
-}
-
-/// The direct check behind `wake_gap_check`: `pick_next` has just found nothing on `cid`, so no task
-/// on this core may be Ready. One that is - stamped by a wake and still Ready - is the "made Ready and
-/// not picked" case caught in the act, and said once per task per wake. If this never fires while
-/// `wake_gap_check` reports gaps, the gaps are the instrument's, not the scheduler's.
-static IDLE_READY_SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-fn idle_with_ready_check(cid: usize) {
-    for slot in 0..MAX_TASKS {
-        // Atomics only: the task's core is the one its wake recorded (`WOKEN_CORE`).
-        if WOKEN_AT[slot].load(Ordering::Relaxed) == 0 { continue; }
-        if !TASK_VALID[slot].load(Ordering::Acquire) { continue; }
-        if TaskState::from(TASK_STATE[slot].load(Ordering::Acquire)) != TaskState::Ready { continue; }
-        if WOKEN_CORE[slot].load(Ordering::Relaxed) != cid as u64 { continue; }
-        // A wake younger than the threshold is the benign race - it landed between `pick_next`'s answer
-        // and this check, and the idle path re-checks before it halts. Only a wake that has waited is news.
-        let age = (monotonic_ticks() + 1).saturating_sub(WOKEN_AT[slot].load(Ordering::Relaxed));
-        if age < WAKE_GAP_SAY_TICKS { continue; }
-        let n = IDLE_READY_SAID.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 20 || n % 64 == 0 {
-            crate::kprintln!(
-                "sched: core {} going idle with '{}' Ready on it since a wake {} ms ago - pick_next did not return it (x{})",
-                cid, task_name(slot), age * 10, n);
-        }
-    }
-}
 
 /// How many times this core has HALTED in the idle path.
 ///
@@ -1342,8 +1125,6 @@ pub fn pop_pending_recv_cap() -> Option<u32> {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS {
             let count = TASK_PENDING_RECV_CAP_COUNT[cur];
-            fl_note(fl::TAKE, cur, ((count as u64) << 16)
-                | if count > 0 { TASK_PENDING_RECV_CAPS[cur][0] as u64 & 0xFFFF } else { 0xFFFF });
             if count > 0 {
                 let slot = TASK_PENDING_RECV_CAPS[cur][0];
                 // Shift remaining entries left.
@@ -1680,7 +1461,6 @@ pub fn run(core_id: u32) -> ! {
                 }
             }
             None => {
-                idle_with_ready_check(cid);
                 // Phase 2a - SLOW THE IDLE TICK (docs/power.md §14). With no ready tasks this core
                 // has nothing to preempt, yet its timer still fires ~100x/s purely to re-arm
                 // itself. Re-arm at ~1 s instead, so it wakes ~1x/s and sleeps deep in between.
@@ -2433,26 +2213,6 @@ pub fn wake_by_slot(slot: usize, result: i64) {
 
             let task_core = TASK_CORE[slot] as usize;
             let my_core   = current_core_id();
-            {
-                let waker = CORE_CURRENT.get(my_core).load(Ordering::Relaxed);
-                fl_note(fl::WAKE, slot, ((current as u64) << 8) | if waker < MAX_TASKS { waker as u64 & 0xFF } else { 0xFF });
-            }
-            // The earliest wake since it last ran (`WOKEN_AT`); a second wake before it runs keeps the first.
-            // ONLY a wake out of a BLOCKED state: one that reaches a task still Running (between its
-            // registration and `block_and_reschedule`, the `TASK_WAKE_PENDING` race) leaves it running
-            // with no switch to clear the stamp, and the next real switch would report a gap that never
-            // was - which is what this instrument's first QEMU boot printed for `events`.
-            // `current` is the state the CAS above moved it out of (or Ready, if it already was).
-            let from_blocked = matches!(TaskState::from(current), TaskState::BlockedOnRecv | TaskState::BlockedOnSend);
-            if from_blocked && WOKEN_AT[slot]
-                .compare_exchange(0, monotonic_ticks() + 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                WOKEN_HALTS[slot].store(core_idle_halts(task_core), Ordering::Relaxed);
-            }
-            // On EVERY wake, not only a stamped one: the aged-message check (`lost_wake_check`) reads
-            // the core from here, since `TASK_CORE` is not readable outside an unsafe block.
-            WOKEN_CORE[slot].store(task_core as u64, Ordering::Relaxed);
 
             if task_core != my_core {
                 // Cross-core wakeup: the target core's pick_next may be deep into
@@ -3250,7 +3010,6 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         if state == TaskState::BlockedOnRecv
             && TASK_WAKE_PENDING[slot].swap(false, Ordering::AcqRel)
         {
-            fl_note(fl::NOBLOCK, slot, 1);
             crate::arch::imp::enable_interrupts();
             return 0;
         }
@@ -3271,12 +3030,10 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
             Ordering::Acquire,
         ).is_err() {
             // CAS failed: wake_by_slot already set state to Ready (lost-wakeup prevention).
-            fl_note(fl::NOBLOCK, slot, 2);
             crate::arch::imp::enable_interrupts();
             return TASK_WAKEUP_ERR[slot];
         }
 
-        fl_note(fl::BLOCK, slot, state as u64);
         let current_ctx = TASK_CTX[slot].assume_init_mut() as *mut TaskContext;
 
         // Save user_rsp before switching away: the SYSRETQ exit on resume must

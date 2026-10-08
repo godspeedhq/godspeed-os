@@ -348,16 +348,17 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(wifihelp.contains("wifi join <ssid>"), "wifi: help lists the join row with an example");
 
     // net dns <host> (utilities/40_net.md): resolve a hostname via slirp's DNS. This is external-
-    // dependent - slirp forwards to the HOST's resolver - so the check is LENIENT: it verifies the
-    // command ran end to end and produced a well-formed line, EITHER a resolved IP ("example.com is
-    // a.b.c.d") OR a clean "no answer", never a hang or crash. A real resolution is a bonus, not required.
+    // dependent - slirp forwards to the HOST's resolver - so the DNS SERVER is allowed to fail: a
+    // resolved IP ("example.com is a.b.c.d"), no A record, or no reply from the server all pass. What
+    // does NOT pass is net-stack failing to answer the shell ("did not answer the resolve"): that is
+    // this machine's own IPC, and accepting it hid backlog/66 - an empty frame reply refused by the
+    // kernel on every port but ARM32, so net-stack waited out a second per empty drain.
     send(&mut write_half, b"net dns example.com\r");
     let dns_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
     check!(dns_out.contains("example.com is ")
             || dns_out.contains("returned no A record")
-            || dns_out.contains("no reply from the DNS server")
-            || dns_out.contains("did not answer the resolve"),
-           "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
+            || dns_out.contains("no reply from the DNS server"),
+           "net dns: resolves a hostname, or the DNS server's own failure is reported (DNS via slirp)");
 
     // System library: `health` is a gsh script baked into the image and resolved PATH-like - typing
     // the name runs the baked script (a fresh, self-contained run). Proves the library model end to

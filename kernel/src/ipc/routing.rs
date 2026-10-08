@@ -739,15 +739,6 @@ pub fn is_endpoint_alive(endpoint: EndpointId) -> bool {
     table.iter().any(|e| e.valid && e.id == endpoint && e.liveness == EndpointLiveness::Alive)
 }
 
-/// INSTRUMENT (backlog/66): `(messages queued, the task slot recorded as its blocked receiver)` for
-/// `endpoint`, or `None` if it is not found. For the scheduler's flight recorder only.
-pub fn receiver_view(endpoint: EndpointId) -> Option<(usize, Option<usize>)> {
-    let table = TABLE.lock_irq();
-    table.iter()
-        .find(|e| e.valid && e.id == endpoint)
-        .map(|e| (e.queue.len(), e.blocked_receiver))
-}
-
 /// Return the current queue depth for `endpoint`, or 0 if not found.
 pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
     let table = TABLE.lock_irq();
