@@ -304,7 +304,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Answer questions about what was found. A reporter answers; it does not push.
     //   op 1        -> device count
     //   op 2 + idx  -> that device's facts
-    //   op 3 + class -> the BDF of the first device with that class code (0 = none)
+    //   op 3 + class -> the BDF of the first device with that class code (0 = none), and the class
     loop {
         let msg = ctx.recv();
         // The caller's one-shot reply cap. No cap means nobody is waiting for an answer, so there is
@@ -339,7 +339,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let bdf = found.iter().take(n)
                     .find(|f| f.class_code == want)
                     .map_or(0u32, |f| f.bdf);
-                Message::from_bytes(&bdf.to_le_bytes())
+                // `[bdf, class asked]`: the answer NAMES ITS QUESTION. The supervisor waits for this on a
+                // mailbox where an answer that missed its deadline is still there for the next question
+                // to take, and with the BDF alone it could not tell; on the T630 on 2026-10-08 every
+                // driver of a restarted supervisor was handed the device the previous one asked about
+                // - the SATA controller's to `xhci`, `xhci`'s to the audio driver - and the kernel
+                // confined the wrong devices. The class echoed back is what lets it refuse that.
+                let mut b = [0u8; 8];
+                b[0..4].copy_from_slice(&bdf.to_le_bytes());
+                b[4..8].copy_from_slice(&want.to_le_bytes());
+                Message::from_bytes(&b)
             }
             // An unknown op is ANSWERED, not ignored: a caller blocked on a reply that never comes is
             // the hang nothing above the kernel may cause.

@@ -3060,3 +3060,23 @@ is chaos's flood.
   domains 33 and 41 and both working. Whether this was the whole cause is not shown - the hang was about
   one in 500 `xhci` restarts - and a second all-services 1000-round run is the card for it. **The
   DNS-after-idle case (several idle minutes, then a lookup) has still not been run on the fixed build.**
+
+**The second 1000-round run (`c51245c6`, the per-device domain ID):** the kernel alive, 7969 kills, the
+`xhci` controller restarted about 485 times and was resetting cleanly at the end. Two findings:
+- **A restarted supervisor handed drivers the wrong devices.** Twice, every driver's device address was
+  the answer to the previous driver's question - the NIC got `0x0016`, the SATA controller the NIC's,
+  `xhci` the SATA controller's, the audio driver `xhci`'s. The supervisor waits on its mailbox, where an
+  answer that missed its deadline stays for the next question to take, and a bare address names no
+  question. The kernel logged each disagreement with its own scan (13 lines), used the supplied address,
+  and confined the SATA controller to `xhci`'s arena and `xhci` to the audio driver's; `xhci` took two
+  IOMMU faults. Fixed in the next commit: `hw-enumerator` echoes the class it was asked about, and the
+  supervisor discards an answer for another class and asks again (at most 3 times, then the kernel's
+  own scan). Whether this also caused the afternoon's controller that would not reset is not known -
+  that run's log was overwritten.
+- **After 18 idle minutes the dongle passed no traffic and still believed it was joined.** Every ping
+  window saw zero frames while beacons kept arriving, DHCP got no answer, and `wifi join` said "already
+  joined". On the dongle the shared loop's idle read never runs - `xhci`'s notice for every received
+  transfer, beacons included, means no 250 ms ever passes with no message - so a key renewal from the
+  access point is not answered while the stack is idle, and `wifi-usb` does not notice the access point
+  ending the association after the handshake. Which the access point did, renewal or inactivity, the log
+  cannot say. Both are the next two changes.

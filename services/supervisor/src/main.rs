@@ -1081,19 +1081,55 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 /// one IPC round trip per driver spawn. The checker refused it, correctly.
 ///
 /// Best effort: any failure returns 0 and the machine boots exactly as it did before.
+///
+/// **AN ANSWER IS TAKEN ONLY FOR THE QUESTION IT NAMES.** The reply comes back on this service's
+/// mailbox, where an answer that missed its deadline is still waiting - and the next question takes it.
+/// On the T630 on 2026-10-08 that put a restarted supervisor one answer behind for a whole spawn round:
+/// the NIC was handed `0x0016`, the SATA controller the NIC's address, `xhci` the SATA controller's,
+/// the audio driver `xhci`'s; the kernel logged each disagreement with its own scan, used the supplied
+/// address, and confined the SATA controller to `xhci`'s arena and `xhci` to the audio driver's. So
+/// `hw-enumerator` echoes the class it was asked about, and an answer for another class is said and
+/// discarded: the question is asked again, which takes the answer that is now waiting, up to
+/// `TRIES` times. Still no matching answer is 0 - the kernel's own scan - never a wrong device.
 #[cfg(has_hw_enumerator)]
 fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
     const OP_BY_CLASS: u8 = 3;
     const ANSWER_SECS: i64 = 2;
+    // One stale answer costs one more ask; more than that in a row is a reporter that is not answering
+    // this question, and the kernel's scan is the better answer.
+    const TRIES: u32 = 3;
     let c = class_code.to_le_bytes();
     let mut buf = [0u8; 16];
-    match ctx.request_with_reply_deadline_outcome_into(
-        "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2]], &mut buf, ANSWER_SECS)
-    {
-        DeadlineOutcomeInto::Reply(n) if n >= 4 =>
-            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-        _ => 0,
+    for _ in 0..TRIES {
+        match ctx.request_with_reply_deadline_outcome_into(
+            "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2]], &mut buf, ANSWER_SECS)
+        {
+            DeadlineOutcomeInto::Reply(n) if n >= 8 => {
+                let bdf = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let answered = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                if answered == class_code {
+                    return bdf;
+                }
+                ctx.log_fmt(format_args!(
+                    "supervisor: hw-enumerator's answer was for class {:#08x}, not {:#08x} (a late answer to an earlier question) - discarded, asking again",
+                    answered, class_code));
+            }
+            DeadlineOutcomeInto::Reply(n) => {
+                // Too short to name its question: the device count (4 bytes) or an unknown-op `?` (1).
+                // Not this question's, so not used. (A late 17-byte device record carries its class at
+                // the same offset, so it reaches the arm above and is used only if it is a device of
+                // the class asked about - whose address is then a right answer anyway.)
+                ctx.log_fmt(format_args!(
+                    "supervisor: hw-enumerator answered {} byte(s) where a class answer is 8 (an answer to another question) - discarded, asking again",
+                    n));
+            }
+            _ => return 0,
+        }
     }
+    ctx.log_fmt(format_args!(
+        "supervisor: no answer from hw-enumerator named class {:#08x} in {} asks - the kernel resolves it from its own scan",
+        class_code, TRIES));
+    0
 }
 
 /// Ask `hw-enumerator` for its device list and log what came back.
