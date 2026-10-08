@@ -31,8 +31,11 @@ what the driver's spawn asked for; and the views `<device> debug`, `<section> de
 `interrupts` read `xhci` and `audio-driver` on MSI vectors 0x30 and 0x31 to APIC 18, and `ehci`,
 AHCI and the RTL8168 on legacy lines; `00:10.0 debug` decoded the xHCI controller's configuration
 space - its MSI capability enabled, its MSI-X present but off - and its raw dump began `22 10 14 79`;
-`why` named `xhci`'s confinement and `ehci`'s passthrough with their reasons. `report` and one device
-in full were not run there.
+`why` named `xhci`'s confinement and `ehci`'s passthrough with their reasons. `report` ran there too:
+every driven device in full - `xhci` holding `console_push`, asking for class 0x0c0330 with
+confinement and an interrupt; `block-driver` BAR 5 unconfined; `ehci` by kind - and the cores. It
+said of `wifi-usb` that the kernel "logged" a grant at spawn, when `wifi-usb` is granted no hardware at
+all; a driver with no device word now says so instead.
 
 Where those come from: the device's configuration space, read live by `hw-enumerator` (its op 4 - the
 bus is where the kernel wrote each device's interrupt route, so reading it there needs no kernel

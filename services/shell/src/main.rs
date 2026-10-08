@@ -7761,6 +7761,12 @@ fn hw_authority(ctx: &ServiceContext, out: &mut Out, r: &HwRow, name: &str) {
             if hw & hwclass::PCI_IRQ != 0 { ", an interrupt" } else { "" }));
     } else if let Some((_, _, kind)) = hw_kind(hw) {
         out.line_fmt(ctx, format_args!("asked      the device kind '{}'", kind));
+    } else {
+        // No device word: a driver the kernel grants no hardware - the USB dongle's, whose host serves
+        // every request it makes. The T630's report said "it logged them at spawn" about a grant that
+        // does not exist, which is the line below said of the wrong kind of driver.
+        out.line(ctx, "asked      no hardware - the kernel grants it none; the host it is attached through does the work");
+        return;
     }
     out.line_fmt(ctx, format_args!(
         "granted    the kernel does not report its grant's addresses; it logged them at spawn - events log boot | match {}", name));
