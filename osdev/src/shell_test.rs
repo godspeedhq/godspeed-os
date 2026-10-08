@@ -902,6 +902,24 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("designed, not built yet"), "hardware: a word not built yet says so"),
         None => { println!("shell-test: FAIL - timed out after `hardware problems`"); fail += 1; }
     }
+    // events log boot (utilities/47_events.md): the KERNEL'S fixed copy of the boot, which never wraps.
+    // It must hold lines from before the shell existed - the kernel's own core count and the supervisor
+    // coming up - which the sink's window does not, and say how much it holds.
+    send(&mut write_half, b"events log boot\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => {
+            check!(r.contains("cores ready"), "events log boot: holds the kernel's own boot lines");
+            check!(r.contains("supervisor: ready"), "events log boot: holds the services' boot lines");
+            check!(r.contains("boot record"), "events log boot: closes by saying how much the record holds");
+        }
+        None => { println!("shell-test: FAIL - timed out after `events log boot`"); fail += 3; }
+    }
+    send(&mut write_half, b"events log boot | match cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => check!(r.contains("cores ready") && !r.contains("supervisor: ready"),
+                          "events log boot: pipes as lines, to match"),
+        None => { println!("shell-test: FAIL - timed out after `events log boot | match cores`"); fail += 1; }
+    }
 
     // -------------------------------------------------------------------
     // trace - the IPC blocked-chain reader (utilities/46_trace.md)

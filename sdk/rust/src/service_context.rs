@@ -601,6 +601,10 @@ pub const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
 /// Upper bound on a spawn name payload (`name` + NUL-separated peers). Matches the kernel's limit.
 pub const SPAWN_PAYLOAD_MAX: usize = 128;
 
+/// The most one boot-record read copies (InspectKernel query 27). Equal to the kernel's
+/// `log::BOOT_READ_CHUNK`; a reader's buffer is exactly this size, so the kernel never writes past it.
+pub const BOOT_READ_CHUNK: usize = 512;
+
 const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D5;
 /// MUST match `kernel::task::MAX_SEND_PEERS` - this indexes the kernel-written context page.
 const MAX_SEND_PEERS:      usize = 6;
@@ -2913,6 +2917,29 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=25 = the endpoint awaited in a CALL.
         let ret = unsafe { raw_syscall(13, 25, slot as u64, 0) };
         if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// The kernel's BOOT RECORD size: `(held, capacity)` in bytes, or `None` without INTROSPECT
+    /// (InspectKernel query 27). The record is a fixed copy of the first bytes ever logged, which
+    /// never wraps; `held == capacity` means it filled and later lines are only on serial.
+    pub fn boot_record_size(&self) -> Option<(usize, usize)> {
+        let held = self.boot_record_query(0, 0);
+        let cap = self.boot_record_query(1, 0);
+        if held < 0 || cap < 0 { None } else { Some((held as usize, cap as usize)) }
+    }
+
+    /// Copy the boot record from `offset` into `buf`: `Some(n)` bytes, `Some(0)` at the end, `None`
+    /// refused (InspectKernel query 27, INTROSPECT). The buffer is the kernel's chunk size exactly, so
+    /// no read can ask it to write past the end of one.
+    pub fn boot_record_read(&self, offset: usize, buf: &mut [u8; BOOT_READ_CHUNK]) -> Option<usize> {
+        let r = self.boot_record_query(offset as u64, buf.as_mut_ptr() as u64);
+        if r < 0 { None } else { Some(r as usize) }
+    }
+
+    fn boot_record_query(&self, a1: u64, a2: u64) -> i64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=27 = the boot record. `a2` is 0 or a buffer of
+        // BOOT_READ_CHUNK bytes the caller holds mutably; the kernel validates the range before writing.
+        unsafe { raw_syscall(13, 27, a1, a2) }
     }
 
     /// The wall-clock datetime captured by the kernel at **boot** (InspectKernel query 12, ungated).

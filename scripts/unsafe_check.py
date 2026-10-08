@@ -38,7 +38,7 @@ SDK_PERMITTED = {"syscall.rs", "mmio.rs", "dma.rs", "adversarial.rs"}
 # would collapse ~86 of these to nothing. That is an SDK redesign on every service's call path, so it
 # is recorded rather than done here.
 SDK_GRANDFATHERED = {
-    "sdk/rust/src/service_context.rs": 83,
+    "sdk/rust/src/service_context.rs": 84,
     "sdk/rust/src/ipc.rs": 8,
 }
 AUDIT_FILE  = REPO_ROOT / "audits" / "unsafe-audit.md"

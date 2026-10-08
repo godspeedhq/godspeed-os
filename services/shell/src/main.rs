@@ -1037,6 +1037,7 @@ const COLUMN_STAGES: &[&str] = &["where", "select", "sort", "sum", "min", "max",
 /// drift - the exact complaint `CHAOS_RESTARTABLE`'s own comment makes about the other three copies.
 const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("events", "persist",      &["start", "stop", "status"]),
+    ("events", "log",          &["boot"]),
     // The storms take a SERVICE, and a misspelt service name is refused with a list - so completing
     // it is the difference between one keystroke and reading an error.
     ("chaos",  "kill-storm",   CHAOS_RESTARTABLE),
@@ -12301,7 +12302,19 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
         let a = split_first(stages[0]).1.trim();
         a.is_empty() || hw_sections(a).is_some()
     };
-    let mut s = if is_record_producer(c0) || wifi_records || hardware_records {
+    // `events log boot` is text, not records: the boot record is 32 KiB and a table holds 4.
+    let events_boot = c0 == "events" && {
+        let mut w = split_first(stages[0]).1.split_whitespace();
+        w.next() == Some("log") && w.next() == Some("boot") && w.next().is_none()
+    };
+    let mut s = if events_boot {
+        let mut cap = Cap::new();
+        if events_log_boot(ctx, &mut Out::Capture(&mut cap)).is_err() {
+            return Err(ShellError::Unknown);
+        }
+        if cap.overflow { ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)"); }
+        Stream::Bytes(cap)
+    } else if is_record_producer(c0) || wifi_records || hardware_records {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
             "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -12742,8 +12755,9 @@ const TRACE_SLOTS: u32 = 256;
 /// first, so the answer is the same whichever path the words take.
 fn events_sub_help(ctx: &ServiceContext, view: &str) -> bool {
     match view {
-        "log" => help_block(ctx, "events log", "the kernel log ring", &[
+        "log" => help_block(ctx, "events log", "log lines: the sink's recent window, or the kernel's copy of the boot", &[
             ("events log [n]", "the last n log lines the sink kept", "events log 20"),
+            ("events log boot", "the kernel's fixed copy of the first 32 KiB ever logged - it never wraps; pipes as lines", "events log boot | match xhci"),
         ], false),
         "metrics" => help_block(ctx, "events metrics", "per-service counters", &[
             ("events metrics", "published samples: owner, metric, value, age", "events metrics"),
@@ -12881,6 +12895,7 @@ fn cmd_events(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         "failures" => trace_events(ctx, true),
         // `persist` needs the whole remainder (`start /p svc 7d`), not the two tokens `sub`/`rest`.
         "persist" => events_persist(ctx, arg["persist".len()..].trim()),
+        "log" if rest == "boot" => events_log_boot(ctx, &mut Out::Console),
         "log" => events_log(ctx, rest),
         "metrics" => trace_metrics(ctx),
         "status" => trace_status(ctx),
@@ -14599,6 +14614,46 @@ fn events_log(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     Ok(())
 }
 
+/// `events log boot` - the kernel's BOOT RECORD: a fixed copy of the first bytes ever logged, which
+/// never wraps (CLAUDE.md 11.4, InspectKernel query 27). Not the sink's window: `events log` is what the
+/// `events` service kept of the last few minutes, this is what the KERNEL kept of the first ones.
+///
+/// Text, not records, and by necessity rather than taste: the record is 32 KiB and a table's arena is
+/// 4 KiB. Piped it is lines, to `match`; the pipe holds 16 KiB, and a longer record says it was cut.
+/// The closing sentence goes to the console, never into the pipe, so `| count` counts log lines.
+fn events_log_boot(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    let (held, cap) = match ctx.boot_record_size() {
+        Some(s) => s,
+        None => {
+            ctx.console_writeln("events: the kernel refused the boot record - reading it needs INTROSPECT");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let mut buf = [0u8; godspeed_sdk::service_context::BOOT_READ_CHUNK];
+    let mut off = 0usize;
+    while off < held {
+        match ctx.boot_record_read(off, &mut buf) {
+            Some(0) => break,
+            Some(n) => {
+                out.put_bytes(ctx, &buf[..n]);
+                off += n;
+            }
+            None => {
+                ctx.console_writeln_fmt(format_args!(
+                    "events: the kernel refused the boot record at byte {} of {}", off, held));
+                return Err(ShellError::Unknown);
+            }
+        }
+    }
+    if held >= cap {
+        ctx.console_writeln_fmt(format_args!(
+            "events: the boot record is FULL at {} KiB and stopped there - later lines are on serial, and the recent ones in `events log`", cap / 1024));
+    } else {
+        ctx.console_writeln_fmt(format_args!(
+            "events: the whole boot record, {} byte(s) of {} KiB. It is the KERNEL'S copy and never wraps; `events log` is the sink's recent window", held, cap / 1024));
+    }
+    Ok(())
+}
 
 fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {
     let t = match build_trace_metrics_table(ctx) {

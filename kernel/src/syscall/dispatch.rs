@@ -2227,6 +2227,30 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // whole reason the splice cost two wrong diagnoses before it was understood. 0 means every
         // diagnostic this boot was emitted cleanly.
         26 => crate::arch::imp::serial_unlocked_emit_count() as i64,
+        // 27: the BOOT RECORD - a fixed copy of the first bytes ever logged, which never wraps
+        // (`log.rs`). arg2 = 0 asks its size: arg1 = 0 the bytes held, arg1 = 1 its capacity, so a
+        // reader can tell a full record from a short boot. Otherwise arg1 = offset and arg2 = a user
+        // buffer of `BOOT_READ_CHUNK` bytes; returns the bytes copied, 0 at the end. A copy, never a
+        // drain, so reading changes nothing. Gated like everything off the ungated list: the boot log
+        // names every service and device on the machine.
+        27 => {
+            if arg2 == 0 {
+                return match arg1 {
+                    0 => crate::log::boot_record_len() as i64,
+                    1 => crate::log::BOOT_RECORD_SIZE as i64,
+                    _ => -1,
+                };
+            }
+            let mut chunk = [0u8; crate::log::BOOT_READ_CHUNK];
+            let n = crate::log::boot_record_read(arg1 as usize, &mut chunk);
+            if n == 0 {
+                return 0;
+            }
+            if !write_user_bytes(arg2, &chunk[..n]) {
+                return -1;
+            }
+            n as i64
+        }
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;

@@ -226,7 +226,14 @@ service_configs = [
 # event the kernel was already having; it does not create one. It was briefly written as UNGATED on
 # the reasoning that a health counter discloses no task state - which this pin caught, correctly. The
 # ungated set is a deliberate list, not a judgement call to be made per query at the call site.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26]
+#
+# 27 (added 2026-10-08) copies out the BOOT RECORD: a fixed copy of the first 32 KiB ever logged, kept
+# beside the ring in `log.rs`, which fills once and never wraps. It is §11.4's existing floor made
+# readable, not a new responsibility - the kernel already holds every one of these bytes in its ring and
+# has no way to give them back once the ring wraps, which on a busy machine is seconds after boot. A
+# copy, never a drain, so no log line depends on a reader (the reason nothing drains the ring stands).
+# INTROSPECT-gated: the boot log names every service and device on the machine. Read by `events log boot`.
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the

@@ -10,11 +10,11 @@ design for everything after it.
 - **A section the machine does not have is left out of the bare view; asked for by name, it is
   answered** ("pci: none on this machine"); a section that is there but empty shows its heading and
   says so. "The bus is not there" and "the bus is there with nothing on it" are different facts.
-- **The raw boot log does not belong here.** It is a log, and the shell already reads the kernel's log
-  ring with `events log`; two ways to read one log is two ways to ask. What the ring cannot do is keep
-  the boot: it is 16 KiB and wraps, so after a chaos run the boot lines are gone. That is `events log
-  boot` - a fixed copy of the boot output the kernel keeps - agreed with the operator the same day, as
-  its own change. `hardware` keeps what the boot FOUND (the bus, the IOMMU, the timer mode), as facts. Every example below is a
+- **The raw boot log does not belong here.** It is a log, and logs are read with `events log`; two
+  commands for one log is two ways to ask. What neither the sink's window nor the kernel's 16 KiB ring
+  could do was keep the boot - both move on, so after a chaos run the boot lines were gone. That is
+  `events log boot` - a fixed copy of the boot output the kernel keeps - agreed with the operator the
+  same day and built as its own change (`utilities/47_events.md`). `hardware` keeps what the boot FOUND (the bus, the IOMMU, the timer mode), as facts. Every example below is a
 MOCKUP: values seen in the T630's logs that day are real, and times, counts and anything not yet read are
 illustrative.
 

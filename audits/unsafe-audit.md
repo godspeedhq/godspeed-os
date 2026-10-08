@@ -19,7 +19,7 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 8 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **83** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed) |
+| `sdk/rust/src/service_context.rs` | **84** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
 **The 92 are not 92 defects.** 88 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
@@ -91,6 +91,17 @@ every boot. The fix is the posture the PCIe root complex and GENET already have:
 | File | Lines | Why |
 |------|-------|-----|
 | `arch/aarch64/mod.rs` | 71 -> 72 (+1) | `rng_probe`: one `uaccess::probe_read32` of the RNG200's CTRL register at its fixed address inside the Device peripheral mapping, 4-byte aligned. `probe_read32` is the existing one-instruction fixup that turns the external abort of an absent device into `None`; a fault anywhere else still halts loudly. Runs once, on the boot path, inside the probe window. |
+
+## 2026-10-08 - the boot record: `events log boot` (feat/wifi-driver)
+
+A new InspectKernel query (27), pinned in `COMMANDMENTS.baseline.toml`, with the constitution amended at
+11.4 and the floor at 18.5. The kernel side adds NO unsafe: the record is a fixed array beside the ring
+in `log.rs`, under the ring's existing SpinLock, and the query copies a chunk out through the existing
+`write_user_bytes`.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 83 -> 84 (+1) | `boot_record_query`: one more `unsafe { raw_syscall(13, 27, ..) }` call site, behind the two safe wrappers `boot_record_size` and `boot_record_read` - one block for both, which is why it is +1 and not +2. The read's buffer is typed `&mut [u8; BOOT_READ_CHUNK]`, so the length the kernel writes is the length the caller holds. Floor amended at CLAUDE.md 18.5, 2026-10-08. |
 
 ## 2026-10-01 - CpuClock: the Arm clock, for the `power` service (feat/wifi-driver)
 

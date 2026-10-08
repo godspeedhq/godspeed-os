@@ -1433,6 +1433,25 @@ Where the machine's only output device is a display, the floor also includes a *
 >
 > §22 has no new test: the property this pins is a *negative* one on a machine we cannot fail on demand in QEMU. It is pinned instead by `scripts/commandments.py`, which counts the kernel's modules against §4.3 and for which `fbcon` was the last standing violation.
 
+> **Amendment 2026-10-08 (`events log boot`): the floor keeps a fixed copy of the BOOT, and it is
+> readable.** The ring above wraps, and nothing reads it - so on a busy machine the boot was gone from
+> the kernel within seconds, and the only record of what a machine found as it came up was a serial
+> cable that is often not attached. The kernel already held every one of those bytes and had no way to
+> give them back.
+>
+> Beside the ring, `log.rs` now keeps the first 32 KiB ever logged, which fills once and then never
+> changes. InspectKernel query 27 copies a range of it out, INTROSPECT-gated, because the boot log names
+> every service and device on the machine; the shell shows it as `events log boot`. A full record says
+> so, and that later lines are on serial.
+>
+> **What this does NOT change is the point of the amendment above.** The record is read by COPY, never
+> drained, so no log line depends on a reader being up, and `ctx.log()` is exactly what it was. It is
+> the floor this section already defines, made readable - not a log service in the kernel. The kernel
+> does not parse a line, keep a line count, or know which lines matter: it keeps bytes in order and
+> stops when the array is full. No responsibility is added (it is 4.3's memory and the existing 11.4
+> ring); the new query is pinned in `COMMANDMENTS.baseline.toml` because a query is surface. The cost is
+> 32 KiB of kernel memory on every port.
+
 ---
 
 ## 12. Drivers and Interrupts
@@ -1975,6 +1994,13 @@ kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsa
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
 stayed at their floors with **no amendment needed**. Two amendments to the grandfathered floors stand (the floor has since fallen to 83, `audits/unsafe-audit.md`):
 
+> **Amendment 2026-10-08 (the boot record): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
+> `unsafe { raw_syscall(13, 27, ..) }` call site, `boot_record_query`, behind the safe
+> `boot_record_size` and `boot_record_read` of the 11.4 amendment of the same date - one block for both,
+> the same single design consequence as the two below. Necessity: a service cannot reach a syscall any
+> other way. Safety: the read's buffer is typed at the kernel's chunk size, and the kernel validates the
+> range before writing into it.
+>
 > **Amendment 2026-10-01 (`CpuClock`): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
 > `unsafe { raw_syscall(55, ..) }` call site, the wrapper `cpu_clock` behind the §12.3 amendment of the
 > same date - the same single design consequence as the `DevicePower` amendment below. Necessity: a
