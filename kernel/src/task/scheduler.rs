@@ -651,7 +651,7 @@ const WAKE_GAP_SAY_TICKS: u64 = 10;
 /// each wake and the state it lifted the task out of, each switch on and off a core, and each timed
 /// wake, each received message (sender, caps, length, first byte) and each `TakePendingCap` and what it
 /// returned. When net-stack has asked nic-driver and had no answer sent back for `FL_ASK_TICKS`, the ring
-/// is printed from that ask, so the second is read rather than inferred. (The first trigger, mail held at
+/// is printed from that ask (or its last `FL_DUMP_EVENTS`) up to now, so the second is read rather than inferred. (The first trigger, mail held at
 /// nic-driver, fired only at boot: the request is not waiting there.) Diagnostic; it goes with the fault.
 pub mod fl {
     pub const SEND: u8 = 1;      // a = (result << 32) | endpoint low 32; result 0 queued, 1 woke, 2 full, 3 err
@@ -697,7 +697,7 @@ pub fn fl_got_word(sender_ep: u64, caps: usize, len: usize, first: u8, timed: bo
     ((sender_ep & 0xFFFF) << 24) | ((caps as u64 & 7) << 21) | ((len as u64 & 0xFFF) << 9)
         | ((first as u64) << 1) | timed as u64
 }
-const FL_LEN: usize = 512;
+const FL_LEN: usize = 2048;
 static FL_CYC: [portable_atomic::AtomicU64; FL_LEN] = [const { portable_atomic::AtomicU64::new(0) }; FL_LEN];
 static FL_EV: [portable_atomic::AtomicU64; FL_LEN] = [const { portable_atomic::AtomicU64::new(0) }; FL_LEN];
 static FL_HEAD: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
@@ -710,6 +710,11 @@ fn fl_traced(slot: usize) -> bool {
 /// possible and harmless for a diagnostic.
 pub fn fl_note(kind: u8, slot: usize, a: u64) {
     if !fl_traced(slot) { return; }
+    // net-stack's sifted wait wakes every 20 ms and records nine scheduler events each time, which
+    // filled the first dump with its own polling and pushed out what came after the ask. Its messages,
+    // caps and sleeps are what say anything; a send that woke it is recorded by the sender.
+    if task_name(slot) == "net-stack" && matches!(kind, fl::RUN | fl::OFF | fl::BLOCK | fl::NOBLOCK
+        | fl::EMPTY | fl::TIMEOUT | fl::DEADLINE | fl::WAKE) { return; }
     if kind == fl::SEND {
         // An ASK is net-stack sending to nic-driver's endpoint; an ANSWER is nic-driver sending to
         // net-stack's. The trigger below fires on an ask left unanswered (`FL_ASK_TICKS`).
@@ -744,8 +749,9 @@ const FL_ASK_TICKS: u64 = 30;
 const FL_DUMPS_MAX: u32 = 3;
 /// 60 s in BSP ticks.
 const FL_QUIET_TICKS: u64 = 6000;
-/// Events printed: from a few before the ask, at most this many.
-const FL_DUMP_EVENTS: u64 = 150;
+/// Events printed: the LAST this many, so the dump always reaches the moment it fired - the first dump
+/// printed 150 from the ask and stopped 744 ms short of now, at the radio's request.
+const FL_DUMP_EVENTS: u64 = 400;
 
 fn lost_wake_check(now: u64) {
     if FL_DUMPS.load(Ordering::Relaxed) >= FL_DUMPS_MAX { return; }
@@ -758,8 +764,9 @@ fn lost_wake_check(now: u64) {
     let q = crate::arch::imp::boot::tsc_ticks_per_quantum().max(1);
     let t_now = crate::arch::imp::read_cycle_counter();
     let head = FL_HEAD.load(Ordering::Relaxed);
-    let from = FL_ASK_IDX.load(Ordering::Relaxed).saturating_sub(6).max(head.saturating_sub(FL_LEN as u64 - 1));
-    let to = head.min(from + FL_DUMP_EVENTS);
+    let from = FL_ASK_IDX.load(Ordering::Relaxed).saturating_sub(6)
+        .max(head.saturating_sub(FL_LEN as u64 - 1)).max(head.saturating_sub(FL_DUMP_EVENTS));
+    let to = head;
     let ep_of = |name: &str| (0..MAX_TASKS).find(|&t| TASK_VALID[t].load(Ordering::Acquire) && task_name(t) == name)
         .map_or(0, |t| TASK_ENDPOINT[t].load(Ordering::Relaxed));
     crate::kprintln!(
