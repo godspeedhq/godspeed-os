@@ -62,6 +62,12 @@ pci
 9 device(s) with a driver, 2 without - hardware <device> for one in full
 ```
 
+**Which device a driver drives.** A driver the supervisor names by PCI class is given the FIRST device
+of that class on the bus (the T630 has two HD audio controllers: the first shows `audio-driver`, the
+second `not driven`). A USB host asked for by kind (`ehci`, `xhci`) is shown on its PCI controller
+where the kernel resolves the kind on the bus, and in `soc` where it does not. A view that cannot hold
+every row says how many it left out.
+
 ## 3. Pipes (rule 12)
 
 Every section is one record shape - `section`, `device`, `kind`, `driver`, `state`, `detail` - so any

@@ -7164,7 +7164,10 @@ impl HwRow {
 /// bare view and answered by name when asked for (`docs/hardware-design.md` 1).
 const HW_SECTIONS: [&str; 6] = ["cpu", "memory", "pci", "soc", "display", "usb"];
 /// Rows gathered at most. A bound, not a fit: the PCs show about a dozen.
-const HW_ROWS: usize = 24;
+// 24 was one short of the T630 (4 cores, memory and 19 PCI devices fill it exactly), so its `soc`,
+// `display` and `usb` rows were dropped without a word. A row that does not fit is now COUNTED and said
+// (`dropped`); 48 holds 16 cores, 24 PCI devices and the rest with room.
+const HW_ROWS: usize = 48;
 /// The supervisor's spawn rows with a device, and its USB matches, kept for one gathering.
 const HW_DRIVERS: usize = 16;
 const HW_USB: usize = 4;
@@ -7182,6 +7185,8 @@ struct HwFacts {
     usb_host: bool,
     /// The supervisor answered `supcmd::DEVICES`; without it the DRIVER column cannot be filled.
     drivers_known: bool,
+    /// Rows that did not fit in `HW_ROWS`, said under the output rather than lost.
+    dropped: usize,
 }
 
 impl HwFacts {
@@ -7189,6 +7194,8 @@ impl HwFacts {
         if self.n < HW_ROWS {
             self.rows[self.n] = r;
             self.n += 1;
+        } else {
+            self.dropped += 1;
         }
     }
 }
@@ -7197,7 +7204,7 @@ impl HwFacts {
 /// on, not the PCI ID database. Anything else shows as its hex ID - never a guess.
 fn hw_vendor(v: u16) -> Option<&'static str> {
     Some(match v {
-        0x1022 => "AMD",
+        0x1022 | 0x1002 => "AMD",
         0x8086 => "Intel",
         0x10ec | 0x0bda => "Realtek",
         0x1af4 | 0x1b36 => "Red Hat (QEMU)",
@@ -7259,6 +7266,17 @@ fn hw_class(c: u32) -> Option<&'static str> {
 fn hw_usb_name(vid: u16, pid: u16) -> Option<&'static str> {
     match (vid, pid) {
         (0x0bda, 0x8176) => Some("WiFi (RTL8188CUS)"),
+        _ => None,
+    }
+}
+
+/// The PCI class a device KIND is, where the kernel resolves that kind on the PCI bus (x86): a USB host
+/// asked for by kind is the bus's controller of that class, not a separate device.
+fn hw_kind_pci_class(kind: u32) -> Option<u32> {
+    use godspeed_sdk::service_context::hwclass;
+    match kind {
+        hwclass::XHCI => Some(0x0c0330),
+        hwclass::EHCI => Some(0x0c0320),
         _ => None,
     }
 }
@@ -7372,10 +7390,19 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
             }
         }
     }
-    let driver_for_class = |class: u32| -> Option<&str> {
-        (0..nd).find(|&k| drv_hw[k] & hwclass::PCI != 0 && drv_hw[k] & 0x00FF_FFFF == class)
-            .map(|k| drv_name[k].as_str())
+    // A driver named by PCI class, or by a KIND that is a PCI class on a PCI machine: `ehci` asks for
+    // `hwclass::EHCI` and on x86 the kernel resolves that to the bus's EHCI controller, so on the T630 it
+    // drove 00:12.0 while this showed the device driverless and listed a separate `soc` row for it.
+    let driver_for_class = |class: u32| -> Option<usize> {
+        (0..nd).find(|&k| {
+            let hw = drv_hw[k];
+            (hw & hwclass::PCI != 0 && hw & 0x00FF_FFFF == class) || hw_kind_pci_class(hw) == Some(class)
+        })
     };
+    // ONE device per driver: a driver named by class is given the FIRST device of that class on the bus
+    // (`hw-enumerator` op 3, which the supervisor asks at spawn). The T630 has two HD audio controllers
+    // and showed `audio-driver` on both.
+    let mut claimed = [false; HW_DRIVERS];
 
     // pci: the bus as `hw-enumerator` found it (op 1, the count; op 2, each device).
     f.pci_bus = false;
@@ -7406,9 +7433,16 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
                     None => HwText::of(format_args!("class {:#08x}", d.class)),
                 };
                 match driver_for_class(d.class) {
-                    Some(name) => {
+                    Some(k) if !claimed[k] => {
+                        claimed[k] = true;
+                        let name = drv_name[k].as_str();
                         r.driver = HwText::of(format_args!("{}", name));
                         r.state = hw_running(ctx, name);
+                    }
+                    // Its class has a driver, which took the first such device.
+                    Some(_) => {
+                        r.driver = HwText::of(format_args!("-"));
+                        r.state = "not driven";
                     }
                     None => {
                         r.driver = HwText::of(format_args!("-"));
@@ -7433,7 +7467,8 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
 
     // soc and display: devices granted by kind, as the supervisor's spawn rows name them.
     for k in 0..nd {
-        if drv_hw[k] & hwclass::PCI != 0 { continue; }
+        // A PCI driver, or a kind already shown on its PCI device above.
+        if drv_hw[k] & hwclass::PCI != 0 || claimed[k] { continue; }
         let Some((section, dev, kind)) = hw_kind(drv_hw[k]) else { continue };
         if matches!(dev, "xhci" | "ehci" | "dwc2") { f.usb_host = true; }
         let name = drv_name[k].as_str();
@@ -7520,7 +7555,7 @@ fn cmd_hardware(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Sh
     }
     let mut f = HwFacts {
         rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
-        pci_bus: false, usb_host: false, drivers_known: false,
+        pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
     };
     hw_gather(ctx, &mut f);
 
@@ -7579,7 +7614,7 @@ fn hw_print(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8, explicit
     }
     if !explicit {
         let devices = f.rows[..f.n].iter().filter(|r| matches!(r.section, "pci" | "soc" | "display" | "usb"));
-        let without = devices.clone().filter(|r| r.state == "no driver").count();
+        let without = devices.clone().filter(|r| r.driver.as_str() == "-").count();
         let with = devices.count() - without;
         out.line(ctx, "");
         out.line_fmt(ctx, format_args!(
@@ -7587,6 +7622,9 @@ fn hw_print(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8, explicit
         if !f.drivers_known {
             out.line(ctx, "(the supervisor did not answer, so which service drives which device is not shown)");
         }
+    }
+    if f.dropped > 0 {
+        out.line_fmt(ctx, format_args!("({} more row(s) did not fit - the view holds {})", f.dropped, HW_ROWS));
     }
 }
 
@@ -7628,9 +7666,12 @@ fn build_hardware_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
     let mask = if arg.trim().is_empty() { 0xFF } else { hw_sections(arg)? };
     let mut f = HwFacts {
         rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
-        pci_bus: false, usb_host: false, drivers_known: false,
+        pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
     };
     hw_gather(ctx, &mut f);
+    if f.dropped > 0 {
+        ctx.console_writeln_fmt(format_args!("hardware: {} more row(s) did not fit - the view holds {}", f.dropped, HW_ROWS));
+    }
     let mut t = Table::new(&["section", "device", "kind", "driver", "state", "detail"]);
     for (i, sec) in HW_SECTIONS.iter().enumerate() {
         if mask & (1 << i) == 0 { continue; }
