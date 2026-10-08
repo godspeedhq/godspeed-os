@@ -264,8 +264,27 @@ impl Host for Heard<'_> {
             // each costs: the loop entered three times at boot, `/wifi.keys` loaded three times, and the
             // auto-join tried three times - harmless while a join is refused, and three real joins once R5
             // makes one. `main.rs` asked the same question of every notice before the loop was shared.
+            //
+            // EXCEPT WHILE THE RADIO IS DOWN. Then the same IDs are not a repeat worth ignoring: a host
+            // sends `NOTE_RADIO` when it binds the dongle, and the bring-up this loop was entered with has
+            // already stopped. Seen on the T630 on 2026-10-08: chaos killed `xhci` in the middle of the
+            // efuse read ("the service could not be reached"), the respawned `xhci` bound the same
+            // 0bda:8176 and said so, and this answered "the same as before" and stayed down until `wifi
+            // radio on` restarted it. The host that the stopped bring-up asked is gone; the one telling us
+            // now enumerated the dongle afresh (14.3: what hung off the old instance is not ours to keep).
+            // So a down radio takes the notice as a new binding and is brought up again - once per notice,
+            // a fact the host asserted, never on a timer. With a station up nothing changes, which is the
+            // case the repeated auto-join above was about.
             [usbfn::NOTE_RADIO] => {
-                if crate::bound(ctx) == self.serving { Notice::Taken } else { Notice::Changed }
+                let now = crate::bound(ctx);
+                if now != self.serving {
+                    Notice::Changed
+                } else if self.chip.is_none() && matches!(now, Ok(Some(_))) {
+                    ctx.log("wifi-usb: the host bound the dongle while its bring-up was stopped - bringing it up again");
+                    Notice::Changed
+                } else {
+                    Notice::Taken
+                }
             }
             _ => Notice::Ignored,
         }

@@ -449,5 +449,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         heard.serving = now;
         godspeed_wifi::serve::serve(
             &ctx, "wifi-usb", dongle.as_mut().map(|d| d as &mut dyn Station), &mut heard, why, crypto_ok);
+        // The loop ended on a binding notice. With no station up, the binding is read and brought up
+        // again even if the host names the same IDs - `rx.rs` says why (a host that bound the dongle
+        // while its bring-up was stopped).
+        if dongle.is_none() {
+            said = None;
+        }
     }
 }
