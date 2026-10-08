@@ -3080,3 +3080,12 @@ is chaos's flood.
   access point is not answered while the stack is idle, and `wifi-usb` does not notice the access point
   ending the association after the handshake. Which the access point did, renewal or inactivity, the log
   cannot say. Both are the next two changes.
+
+**The third 1000-round run (`c300666c`, the device-answer check):** all 1000 rounds, 7871 kills, the
+kernel alive; 6 stale device answers caught and discarded, no wrong device supplied, every confinement
+right. Then, 6 s after chaos ended and the dongle began receiving, a liveness panic - which the new
+instrument showed to be a timer the idle path kept restarting (`audits/kernel-audit.md`, A9-4
+diagnosed), fixed in `arch/x86_64/boot.rs`. **Open:** about 116,000 IOMMU faults from `xhci` in that
+run, every address inside its own arena, in bursts just after its restarts, with `xhci` working
+throughout - none in the 16:12 run and 2 in the 17:05 one. One suspect, not shown: the invalidation waits
+for the IOMMU to fetch its commands, not to complete them (AMD-Vi's COMPLETION_WAIT).

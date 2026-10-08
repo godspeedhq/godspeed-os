@@ -1866,3 +1866,30 @@ idle-halt counts at every progress stamp and the panic prints both since the las
 means the timer stopped arriving, and a halt since the stamp with nothing after it means the core slept
 with no wake armed. The next 100-round run on the T630 did not wedge, so A9-4 stays OPEN with that
 reading owed.
+
+## A9-4 diagnosed: the idle path restarted a periodic timer before it could fire (2026-10-08, `feat/wifi-driver`)
+
+The instrument `1c35b4b4` added took its first reading on the T630, 6 s after a 1000-round chaos run,
+when the USB dongle had just started receiving:
+
+```
+LIVENESS WEDGE: core 2 ... running IDLE (no task); since its last stamp it has taken 0 timer
+interrupts and halted 113 times in idle (308912 timer interrupts since boot, last vector 0x00000020)
+```
+
+Zero ticks and 113 halts in 3 s: the core was not stuck, it was being woken about every 26 ms and its
+timer never fired. The T630 runs the LAPIC timer in PERIODIC mode, where writing the initial count
+restarts the countdown, and the idle path wrote it on every pass - the idle period before a halt, the
+quantum after a wake. `xhci` runs on core 2 and its MSI targets core 2; at beacon rate the countdown was
+restarted every 26 ms and never reached zero, so no tick, no stamp, and the watchdog fired on a working
+machine. The earlier sighting this entry was opened for (core 0, at boot) and the second one (core 2,
+14:10 the same day, 6 s after the dongle rejoined) fit the same shape; neither had the reading to show
+it. The BSP was exposed the same way - it re-armed its quantum before every halt - and its tick drives
+the monotonic clock and the timed wakes.
+
+Fixed in `arch/x86_64/boot.rs`: each core records which period its timer is counting and when it last
+fired; a re-arm for the period already counting is skipped, and a timer that has not fired for 50 quanta
+is not rewritten until it does. Worst case between ticks about 1.5 s, inside the watchdog's 3 s. No
+neutral code changed. QEMU: identity 24/24 (Test 8, preemption, included), the x86 shell suite 215/0,
+chaos-repro 300 rounds clean; QEMU's TSC rate is uncalibrated, so the starvation rule is exercised only
+on hardware. **A9-4 is FIXED pending that card.**

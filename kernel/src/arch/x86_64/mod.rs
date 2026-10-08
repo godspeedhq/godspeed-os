@@ -409,6 +409,11 @@ pub fn note_irq(vector: u32) {
         IRQ_COUNT[cid].fetch_add(1, Ordering::Relaxed);
         IRQ_LAST_VEC[cid].store(vector, Ordering::Relaxed);
     }
+    // The timer path is the only caller; it says when this core's timer last fired, which the idle
+    // path's re-arm reads so it never restarts a countdown that is starving (`boot::TIMER_MODE`).
+    if vector == 32 {
+        boot::note_timer_fired(cid);
+    }
 }
 
 /// Publish this core's identity for interrupt-destination programming, once, at `smp::init`.
