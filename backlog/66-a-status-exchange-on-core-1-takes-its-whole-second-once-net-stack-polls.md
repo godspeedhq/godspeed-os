@@ -1,6 +1,6 @@
 # 66. A STATUS exchange between net-stack and nic-driver takes its whole second once net-stack is polling, and two fixes that should have touched it did not
 
-**Status: OPEN - PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well. The mechanism is measured to the point of naming the kernel path (below, "What the slot log said"); the fix is not attempted. The card carries the build that ran well (`kernel8.img` sha `e319dae6`), which is this tree.**
+**Status: FIXED 2026-10-08 (`e3fcf7ed`) - an empty reply was refused by the kernel on every port but ARM32 (the last entry below). Verified on the VisionFive over WiFi and over the cable; the Pi 4 has not yet run the fixed build. Was: PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well.**
 **Found:** 2026-09-30 on the Pi 4, as `ping` over the radio running at one echo every three seconds.
 
 **2026-10-02, the symptom is mostly gone, and nobody fixed it on purpose.** The boot of commit `5dd1f1b8`
@@ -179,7 +179,7 @@ the late answer is on the radio-bridged path on core 1 (which `nic-driver` share
 nothing to retry it but `net-stack`'s own bound. Still parked; `docs/wifi-usb.md` 49 has the split.
 
 **2026-10-07, the instrument this item named, built.** `kernel/src/task/scheduler.rs`: `wake_by_slot` stamps
-the BSP tick when it moves a task out of a BLOCKED state (`WOKEN_AT`), and every switch to a task
+the BSP tick when it moves a task out of a BLOCKED state, and every switch to a task
 (`core_release_current`) checks the stamp - `sched: '<task>' ran N ms after a wake made it Ready (core C,
 which halted in idle H time(s) meanwhile)` for 100 ms or more. Beside it, the direct test: when
 `pick_next` finds nothing and a task on that core has been Ready since a wake 100 ms or more ago, `sched:
@@ -195,3 +195,27 @@ line, if either, comes with the late answer.
 through the same shared bridge (`radio.rs`) on the same guest network and DNS server, every lookup
 resolved and `selfcheck`'s DNS check passed. What differs is the board: the Pi 4's AArch64 kernel, and
 `nic-driver` pinned to core 1 with `net-stack`, `block-driver` and `fs` (the Pi 2's is unpinned).
+
+**2026-10-08, FOUND AND FIXED: an empty message was refused by the kernel on three ports of four.** The
+one-question instruments above each ruled out one explanation, so they were replaced by a flight recorder
+in the kernel: every send, receive, block, wake, switch and cap-table change for `net-stack`,
+`nic-driver` and `wifi-driver`, in a ring printed when `net-stack` had asked `nic-driver` and heard nothing
+for 300 ms. On the VisionFive, cable out, it showed the whole exchange: `net-stack` asks for a frame (op 4)
+with a correct reply cap, `nic-driver` asks `wifi-driver`, which answers "none waiting" in 0.2 ms, and
+`nic-driver` answers `net-stack` with an EMPTY message - which never reached the queue.
+
+Each arch's user-range check (`validate_user_ptr`) refused a zero-length range on x86, AArch64 and RISC-V
+and accepted it on ARM32, so a zero-length send failed on three ports and worked on the Pi 2 - which is
+why the Pi 2 resolved over the same dongle, network and DNS server. `nic-driver` counted it (`reply send
+FAILED`); `net-stack` waited out its second and retried into the next empty drain. Over the radio most
+drains are empty while an answer is in flight, so DNS ran out of time; over the cable fewer are, which
+was the ~900 ms first-try miss seen there. The receive side had the same fault: an empty payload already
+taken off the queue failed its copy-out.
+
+`e3fcf7ed` makes an empty message a message on every port, in neutral code: `build_message` reads
+nothing for nothing, and the receive copy-outs succeed on an empty payload. VisionFive, the same day:
+twenty `net dns` lookups over WiFi, each answered first time, no failed reply, no flight dump; and with
+the cable in. The instruments came out in `b77c7dd5`, and `osdev test shell` no longer passes a `net
+dns` that `net-stack` did not answer - accepting that is how x86 hid it. Two readings made on the way
+were wrong and are recorded as such: that `net-stack`'s self-grant was being replaced, and that replies
+were addressed to another endpoint. The recorder showed neither.
