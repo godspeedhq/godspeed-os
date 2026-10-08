@@ -13,7 +13,7 @@
 /// request just sent, so an answer the shell had stopped waiting for was read as the next request's.
 /// The shell tried to count what it was owed, and could not: its reply mailbox takes every peer's
 /// replies, and nothing on a message says who sent it. A tag is a fact in the reply itself. Chosen
-/// outside every request op (1-11, and 0x10-0x12 for `OP_NET_*`).
+/// outside every request op (1-14, and 0x10-0x12 for `OP_NET_*`).
 pub const TAGGED: u8 = 0xE7;
 
 /// Networks follow.
@@ -31,8 +31,13 @@ pub const DOWN_TRAPPED: u8 = 1;
 pub const DOWN_BRINGUP: u8 = 2;
 /// No working radio answered on this driver's bus.
 pub const DOWN_NO_RADIO: u8 = 3;
-/// The board has a radio this driver does not drive YET: the VisionFive's AIC8800 while its protocol is
-/// being built (`docs/wifi-aic8800.md`). Nothing the operator can do changes it, so the shell's sentence
+/// The AIC8800's bring-up stopped before a station interface existed; the serial log names the step.
+/// **Corrected 2026-10-08:** this was "a radio this driver does not drive YET", written while the
+/// AIC8800's protocol was being built (`docs/wifi-aic8800.md`). That driver now runs to a station
+/// (V0-V6), and `wifi-driver` sends this reason only when that bring-up stops short. The rest of this
+/// comment, and the shell's sentence for this reason, still describe the old meaning - whether a power
+/// cycle should now be offered is the operator's decision, recorded in `audits/documentation-audit.md`
+/// Audit 12. As written then: nothing the operator can do changes it, so the shell's sentence
 /// for this reason suggests nothing - a power cycle advised here would be advice that cannot work. The
 /// verbs match the sentence: `wifi radio on` says it and restarts nothing, the driver answers a
 /// `powercycle` with this reason instead of cycling (unless the chip is powered down by `off hard`, when
@@ -79,11 +84,13 @@ pub const OP_SCAN_ABORT: u8 = 5;
 /// The link fields (10..23) are read from the firmware when asked, except while a sweep runs, when they
 /// are the driver's memory and the bssid, rssi and chanspec are zero.
 pub const OP_STATUS: u8 = 6;
-/// Request op byte: leave the current network; the radio stays up. Reply `[OK, was_joined(0|1)]`.
+/// Request op byte: leave the current network; the radio stays up. Reply `[OK, was_joined(0|1), len,
+/// name[32]]` - the name of the network left, so the shell can say it.
 pub const OP_DISCONNECT: u8 = 7;
 /// Request op byte: `[8, mode]` - power the radio. `mode` 0 = off (disconnects first), 1 = on (rejoins
-/// the network last joined), `RADIO_POWERCYCLE` = cut and restore the CHIP's power through the kernel's
-/// `DevicePower` and leave this instance to be killed and respawned onto the cold chip. Reply
+/// the network last joined), `RADIO_POWERCYCLE` = cut and restore the CHIP's power through the host
+/// (`Host::power_cycle`: the kernel's `DevicePower` on the Pi 4 and the VisionFive, a register power-down
+/// on the USB dongle) and leave this instance to be killed and respawned onto the cold chip. Reply
 /// `[status, was_joined, changed, rejoin_status, len, name...]`.
 pub const OP_RADIO: u8 = 8;
 /// The third `OP_RADIO` mode: `wifi radio powercycle`. Not a radio switch at all - the chip's power.
@@ -92,8 +99,8 @@ pub const RADIO_POWERCYCLE: u8 = 2;
 /// `OP_RADIO` mode 3: `wifi radio off hard` - cut the chip's power and stay powered down. `on` or
 /// `powercycle` restores the power and answers `COLD_START`.
 pub const RADIO_HARD_OFF: u8 = 3;
-/// Reply status while the chip is powered down: every op except status and the radio op gets this one
-/// byte. `wifi radio on` powers the chip up.
+/// Reply status while the chip is powered down: every op except status, the radio op and the hardware
+/// and use ops (12-14) gets this one byte. `wifi radio on` powers the chip up.
 pub const RADIO_POWERED_OFF: u8 = 18;
 /// `OP_RADIO` reply byte 3 after `on` on a powered-down chip: the power is back and this instance has
 /// no firmware to serve, so the caller restarts the driver and the respawn takes the boot's cold path.

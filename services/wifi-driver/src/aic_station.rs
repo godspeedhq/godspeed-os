@@ -856,7 +856,9 @@ impl Station for Aic<'_> {
     /// `wifi debug`, in the Broadcom's reply layout (`wire::dbg`): no trace ring is kept for this radio,
     /// so the trace is empty; the firmware's version and address are the ones its bring-up read; the
     /// counters are this module's, at the Broadcom's positions where a field means the same thing and zero
-    /// where it has no meaning here (superframes, event buckets, refused commands, the session clock).
+    /// where it has no meaning here (event buckets, refused commands, the session clock) - except word 7,
+    /// superframes on the Broadcom, which carries the data packets this driver refused, so the shell labels
+    /// that count `rx_glom` on this board (recorded in `audits/documentation-audit.md` Audit 12).
     fn debug(&mut self, sub: u8, _live: bool, out: &mut [u8], _ctx: &ServiceContext) -> usize {
         out[0] = reply::OK;
         match sub {

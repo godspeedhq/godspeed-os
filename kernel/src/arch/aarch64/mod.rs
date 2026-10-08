@@ -904,8 +904,9 @@ extern "C" fn boot_high() -> ! {
         // The machine can be asked, and asking is both safer and more honest than believing a
         // specification.
         //
-        // READS AND PRINTS, GRANTS NOTHING. `map_fixed_device` is untouched until the boot log says
-        // which window to name, because that table's comment records what getting it wrong costs: a
+        // READS AND PRINTS. Its answer (`sdio::radio_present`) is what gates the `WIFI_SDIO` window in
+        // `map_fixed_device` and the DEVICE_POWER mint - which this said it left untouched until the boot
+        // log named the window (corrected 2026-10-08), because that table's comment records what getting it wrong costs: a
         // service handed a range whose first read aborts dies on that read, forever.
         //
         // Inside the probe window on purpose - one of the two addresses is this author's recollection

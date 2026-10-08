@@ -1,6 +1,6 @@
 # Audio
 
-**Status: steps A1-A3 and the first half of A4 built and run in QEMU (2026-10-03), on branch
+**Status: steps A1-A5 built and run in QEMU (2026-10-03; A4's outputs, debug and system sounds not built), on branch
 `feat/audio`. The driver resets an Intel High Definition Audio controller, finds its codec and output
 path, moves codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's
 `audio` sets the volume, mutes, powers the codec down and up and plays tones (`utilities/57_audio.md`),

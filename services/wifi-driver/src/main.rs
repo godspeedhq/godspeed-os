@@ -290,9 +290,10 @@ fn requested_off_ms(units: u8) -> u64 {
     }
 }
 
-/// The VisionFive 2 Lite's radio, phases V0 and V1 (`docs/wifi-aic8800.md` 7): the grant proven, then the
-/// card IDENTIFIED - CMD5 answered, its function count, and the manufacturer and device codes read out of
-/// its own CIS. Nothing is uploaded; that is V2. Then it answers `radio down`, saying the driver is not built.
+/// The VisionFive 2 Lite's radio, phases V0 to V6 (`docs/wifi-aic8800.md`): the grant proven, the card
+/// IDENTIFIED - CMD5 answered, its function count, and the manufacturer and device codes read out of its own
+/// CIS - then the firmware uploaded and started, a station interface brought up, one scan, and the radio
+/// served under `serve_radio`. A bring-up that stops short answers `radio down` with `DOWN_NOT_BUILT`.
 ///
 /// The power-up is the vendor glue's (`aic8800_bsp`): the enable LOW for 10 ms, HIGH, 10 ms before the
 /// first command - with the host's card clock stopped across the edge, so the card powers up into a quiet
@@ -679,7 +680,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ));
     // THE VISIONFIVE'S RADIO LEAVES THE PI 4'S PATH HERE (docs/wifi-aic8800.md 7, phase V1): `v1_dw_mmc`
     // identifies the AIC8800 on the DesignWare host and never returns. Everything below drives the Pi 4's
-    // Arasan host and CYW43455; the AIC8800's own protocol starts at V2.
+    // Arasan host and CYW43455; the AIC8800's protocol, V2 onwards, is inside `v1_dw_mmc`.
     #[cfg(wifi_host_dw_mmc)]
     v1_dw_mmc(&ctx, &mmio);
     // THE CLOCK, BEFORE ANYTHING TOUCHES THE CHIP: a lease from `power` holds the Arm cores fast for the

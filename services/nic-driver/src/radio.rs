@@ -58,8 +58,9 @@ const RADIO_REACQUIRE_AFTER: u32 = 3;
 const RADIO_BACKOFF_MS: u64 = 1_000;
 
 /// The radio as a backend: the radio's service reached over the frame ops, the way the Pi 2's `nic-driver`
-/// reaches `dwc2` (`main.rs`, `kernel_net_main`) - one bounded request, one reacquire-and-retry when the
-/// cap is stale (the radio is spawned by the supervisor and may be respawned after us), and every reply
+/// reaches `dwc2` (`main.rs`, `kernel_net_main`) - one bounded request, never re-sent; after
+/// `RADIO_REACQUIRE_AFTER` silent requests in a row the cap is reacquired by name (the radio is spawned by
+/// the supervisor and may be respawned after us) and the radio held down for `RADIO_BACKOFF_MS`; and every reply
 /// checked against the op it answers, because the radio's endpoint also serves the `wifi` utility and a
 /// late reply would otherwise be read as the next answer.
 pub(crate) struct Radio {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The AICSemi AIC8800D80's SDIO message bus, the first exchange of phase V2 (`docs/wifi-aic8800.md` 5):
-//! function 1 set up and woken, one debug memory read sent to the chip's ROM, and its confirm read back.
+//! The AICSemi AIC8800D80's SDIO message bus, V2 to V4 (`docs/wifi-aic8800.md`): function 1 set up and
+//! woken, ROM memory reads and writes, the patch and firmware upload and start, the running firmware's
+//! bring-up to a station interface, and a one-shot scan. V2's first exchange was one debug memory read
+//! sent to the chip's ROM, and its confirm read back.
 //! The word it returns carries the chip revision, which decides the firmware set the upload will need.
 //!
 //! Every register, value and byte offset below is the vendor driver's, read from `radxa-pkg/aic8800` at

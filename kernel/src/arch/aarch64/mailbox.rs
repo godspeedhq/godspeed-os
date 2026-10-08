@@ -69,11 +69,6 @@ pub const EXPGPIO_WL_ON: u32 = 1;
 /// The same chip's Bluetooth power enable (docs/wifi.md 53): the other half of the CYW43455's power.
 pub const EXPGPIO_BT_ON: u32 = 0;
 
-/// Drive one firmware-expander GPIO through the `SET_GPIO_STATE` property tag (`0x00038041`). The
-/// expander's pins are numbered from 128 on the mailbox side, which is why Linux's `gpio-raspberrypi-exp`
-/// adds the same offset. `state` is the PHYSICAL level: for WL_ON, 1 is powered and 0 is off/reset.
-/// Returns whether the firmware took the request; it is a runtime caller of `property_call`, which does
-/// its own address translation and cache maintenance around the shared buffer.
 /// Read one firmware-expander GPIO back through `GET_GPIO_STATE` (`0x00030041`): the PHYSICAL level the
 /// firmware reports for the pin, or `None` if it did not answer. The instrument that says whether a
 /// `set_expander_gpio` took, because the SET tag answers "accepted" whether or not the pin moved.
@@ -94,6 +89,11 @@ pub fn get_expander_gpio(pin: u32) -> Option<u32> {
     Some(req[6])
 }
 
+/// Drive one firmware-expander GPIO through the `SET_GPIO_STATE` property tag (`0x00038041`). The
+/// expander's pins are numbered from 128 on the mailbox side, which is why Linux's `gpio-raspberrypi-exp`
+/// adds the same offset. `state` is the PHYSICAL level: for WL_ON, 1 is powered and 0 is off/reset.
+/// Returns whether the firmware took the request; it is a runtime caller of `property_call`, which does
+/// its own address translation and cache maintenance around the shared buffer.
 pub fn set_expander_gpio(pin: u32, on: bool) -> bool {
     // ONE RUNTIME CALLER AT A TIME. `MBOX` is one buffer and the channel is one register pair. This is
     // reached from a syscall with the MMU on, where a lock is sound and another core may be in a boot
@@ -175,8 +175,8 @@ pub struct BoardInfo {
 /// bus master on this board has.
 ///
 /// # Safety
-/// `MBOX` must not be in use by another caller. Boot is single-threaded, and the only later caller is
-/// the xHCI reset notify, which runs from the same boot path.
+/// `MBOX` must not be in use by another caller. Pre-MMU boot callers are single-threaded and take no
+/// lock; syscall-time callers (the expander GPIO and the Arm clock) hold `MBOX_LOCK`.
 unsafe fn call() -> bool {
     // SAFETY: mailbox MMIO through the kernel's peripheral mapping, single-threaded boot.
     unsafe {
@@ -229,7 +229,7 @@ unsafe fn call() -> bool {
 /// price of keeping that alignment guarantee in one place.
 ///
 /// # Safety of timing
-/// Like every other user of this mailbox, must run before `mmu::enable` - see the module header.
+/// Runs before or after `mmu::enable` - see the module header for which callers lock.
 pub fn property_call(req: &mut [u32]) -> Option<()> {
     if req.len() > 36 {
         return None; // larger than the shared buffer; a caller bug, refused rather than truncated

@@ -72,8 +72,8 @@ SERVICES = [
     # holds every service's image and cannot spawn one it was never given. The kernel had found the
     # controller, resolved its window and offered it; the driver simply was not in the build.
     "xhci",
-    # The VisionFive's radio (docs/wifi-aic8800.md). Phase V0: it proves the SD host's grant and its power
-    # pin, then serves `no radio`; on QEMU `virt` the kernel grants no window and it says so. The
+    # The VisionFive's AIC8800 radio (docs/wifi-aic8800.md, phases V0-V6): bring-up, scan, WPA2 join and
+    # frames through nic-driver's bridge; on QEMU `virt` the kernel grants no window and it says so. The
     # supervisor embeds it on this arch now (`radio` in services/supervisor/build.rs), so it must be built.
     "wifi-driver",
     # The USB WiFi dongle's driver (docs/wifi-usb.md), reached through xhci and started by the supervisor

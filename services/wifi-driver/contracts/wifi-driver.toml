@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# AARCH64 (Raspberry Pi 4) ONLY. The onboard CYW43455 radio, reached over SDIO.
+# AArch64 (Raspberry Pi 4: the onboard CYW43455 on the Arasan host) and riscv64 (VisionFive 2 Lite: the
+# AIC8800D80 on its dw_mmc host), each reached over SDIO. The notes and the window below are the Pi 4's; on
+# each board the kernel grants the window by device kind.
 #
 # The device this drives is not on a bus anything enumerates: it is the Arasan SD host controller at a
 # fixed SoC address, wired on this board to the radio rather than to a card slot (the vendor device
@@ -44,7 +46,7 @@ ipc_send    = ["fs", "power"]
 # NO `hw_interrupt`, deliberately. The driver POLLS, and so does everything above it: control commands
 # complete in microseconds on the CMD line, the scan and the join read frames one at a time between
 # requests, and the data path is pulled - `nic-driver` asks on `net-stack`'s pace and each ask reads what
-# the chip has waiting (`frames::pull`). A frame the access point sends waits in the chip until then; a
+# the chip has waiting (`frames::pull`). Joined and idle, the serve loop also pulls every 250 ms (`IDLE_PULL_MS`); a
 # card interrupt would let it be read sooner, and would be the first thing to add if that wait ever
 # shows in a measurement. Asking for a vector this service would not service is the failure invariant 12
 # exists to prevent, and a capability granted to nobody's benefit is standing authority a compromise

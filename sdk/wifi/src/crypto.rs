@@ -6,14 +6,14 @@
 //! The first of them is the pairwise master key: `PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32)`
 //! (IEEE 802.11-2020 §12.7.1.2). It is derived ONCE, when a passphrase arrives, and the passphrase is then
 //! gone; the PMK is what the driver keeps and what every later step (the PTK, the handshake MIC) is built
-//! from. Nothing here is clever. The primitives are public, because a driver uses them directly - the
-//! Broadcom driver calls `psk`, `Sha1`, `aes_key_unwrap` and `selftest` - and only internals such as the
-//! AES field arithmetic stay private to this crate.
+//! from. Nothing here is clever. The primitives are public because the serve loop and the supplicant use
+//! them (`psk`, `Sha1`, `aes_key_unwrap`) and each radio service runs `selftest` at start; only internals
+//! such as the AES field arithmetic stay private to this crate.
 //!
 //! **Every primitive is checked against a published vector at boot** (`selftest`), because a wrong hash does
 //! not fail - it produces a key the access point silently refuses, which would look exactly like a wrong
 //! passphrase. The vectors are the standards' own: FIPS 180-1 (`abc`), RFC 2202 case 2, RFC 6070 case 1,
-//! and IEEE 802.11-2020 Annex J.4.2 (`password` / `IEEE`).
+//! IEEE 802.11-2020 Annex J.4.2 (`password` / `IEEE`), FIPS 197 appendix C.1 and RFC 3394 section 4.1.
 //!
 //! Bounded and heap-free (§26.6.1): fixed blocks, fixed digests, the caller's output slice.
 

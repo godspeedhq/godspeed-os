@@ -74,8 +74,9 @@ fn host_name(ctx: &ServiceContext) -> &'static str {
         .or_else(|| HOSTS.iter().copied().find(|h| gs::cap::reacquire(ctx, h)))
         .unwrap_or(HOSTS[0])
 }
-/// The bound on one request to the host. A control transfer takes milliseconds; the host retries a
-/// transient itself, so a request still unanswered after this is a host that is not serving.
+/// The bound on one request to the host. A control transfer takes milliseconds, but a host retrying a
+/// dongle that does not answer can use up this bound (`xhci`: `CONTROL_TRIES` attempts of `CONTROL_MS`),
+/// so an unanswered request means the host or its dongle is not answering.
 const HOST_SECS: i64 = 2;
 
 /// `SYS_CFG` fields, as `rtl8192cu_identify_chip` reads them (`rtl8xxxu.h`): the cut in bits 15:12,

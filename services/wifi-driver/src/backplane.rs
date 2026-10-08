@@ -62,7 +62,7 @@ pub mod f1 {
     pub const SDIOPULLUP: u32 = 0x1_000F;
 }
 
-/// `CHIPCLKCSR` bits. Only the four this step uses are named.
+/// `CHIPCLKCSR` bits.
 pub mod clk {
     /// **Force the ALP clock ON**, as opposed to merely requesting that it become available. Part of
     /// `INIT` below, and the bit whose absence stalled every backplane read.
@@ -73,14 +73,14 @@ pub mod clk {
     pub const FORCE_ILP: u8 = 0x04;
     /// Request the ALP (active low power) clock, which is what the backplane needs to answer.
     pub const ALP_AVAIL_REQ: u8 = 0x08;
-    /// Request the HT clock. Not requested here, and part of the writable mask for the same reason.
+    /// Request the HT clock - `request_ht` and `bus::ht_clock` do, once the ARM is running.
     pub const HT_AVAIL_REQ: u8 = 0x10;
     /// Stop the hardware asserting its own clock request, so ours is the only one in play.
     pub const FORCE_HW_CLKREQ_OFF: u8 = 0x20;
     /// The ALP clock is available.
     pub const ALP_AVAIL: u8 = 0x40;
-    /// The HT (high throughput) clock is available. Not requested here; reported because a chip that
-    /// already has it says something about what state it was left in.
+    /// The HT (high throughput) clock is available - what `request_ht` polls for; also reported because a
+    /// chip that already has it says something about what state it was left in.
     pub const HT_AVAIL: u8 = 0x80;
 
     /// The clock word for the **SDIO** transport, quoted from `cyw43_ll.c`'s bus init:

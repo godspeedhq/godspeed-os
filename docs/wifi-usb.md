@@ -531,6 +531,7 @@ from `bss::classify`, the classifier every radio uses. `scan_step` only moves th
 
 **The shell** asks `wifi-driver`, then `wifi-usb` (`RADIOS`), and keeps the one it found for the
 command. A machine with both is answered by the onboard radio; choosing between two is not built.
+*(Built since: `wifi hardware use`, section 37.)*
 
 **Wiring.** `wifi-usb` gains `fs` as a peer, for `/wifi.keys` - pinned in `COMMANDMENTS.baseline.toml`
 with that reason, after the gate refused it unpinned. It is spawned after `fs` now, so both peers wire
@@ -597,6 +598,8 @@ back to `R3b done` with no STATUS-stage error, and the join stayed refused namin
 turned up something that is not WiFi's: two entries with one name in `/` (`backlog/75`).
 
 R4 is done on the Pi 2. Owed elsewhere: the Pi 4 and the VisionFive check card for the shared loop (above).
+*(Both ran on 2026-10-06 and passed - above in this section; the VisionFive's chaos run found a `nic-driver`
+dwmac fault, fixed and re-verified; section 50 has both boards again on 2026-10-08.)*
 
 ## 11. R5a (2026-10-06): the first frame sent - a probe request on every channel the sweep tunes - hardware-verified on the Pi 2
 
@@ -995,7 +998,7 @@ host that cannot (the default, so the dongle) is answered "no power control" wit
 the network. `wifi-driver`'s SDIO host says it can, so the Pi 4's and the VisionFive's hard off is
 unchanged.
 
-## 17. R8 (2026-10-06): the data rate is the firmware's - the rate mask taken; the speed-up not yet measured
+## 17. R8 (2026-10-06): the data rate is the firmware's - the rate mask taken; hardware-verified on the Pi 2 (the uplink shown faster than 1 Mb/s on the R9 card; the exact rate not measured)
 
 Since R6 every data frame went at the driver's rate, 1 Mb/s, the rate the management frames use. Linux
 does not send data that way. Once associated, `rtl8xxxu_bss_info_changed` gives the chip's firmware the
@@ -2833,7 +2836,7 @@ change. `selfcheck` not yet run on this image.
 the 18 failures gone - and hot-plug of the USB stick and the keyboard working, by the operator. Section
 47's change is hardware-verified on the Pi 2.
 
-## 48. The Pi 4 with `/wifi.radio` left on `usb` and no dongle in: `powercycle` waited on a join that was never coming (2026-10-07) - the watch asks now; built, not yet on hardware
+## 48. The Pi 4 with `/wifi.radio` left on `usb` and no dongle in: `powercycle` waited on a join that was never coming (2026-10-07) - the watch asks now; built, not yet on hardware - superseded by section 49 (with no dongle the onboard radio stands in, so this path now ends `joined`; the `USE_NOT` early exit has not been seen on hardware)
 
 The Pi 4 card for this branch's `xhci` and `net` changes, the dongle not plugged in. The stick still held
 `/wifi.radio` = `usb` from section 37's card. After `wifi radio powercycle` the onboard driver said

@@ -1,6 +1,6 @@
 # 64. The wifi driver does not answer a group-key rekey, so the link drops at the access point's rekey interval
 
-**Status: BUILT in full 2026-09-30 - the group-key half (`frames::group_rekey`) and, that evening, the pairwise
+**Status: BUILT in full 2026-09-30 - the group-key half (now `godspeed_wifi::supplicant::group_rekey`, moved out of `frames`) and, that evening, the pairwise
 half (`frames::pairwise_rekey`, driving the same `join::Handshake` the join uses). OPEN only for the evidence:
 neither has yet been seen on hardware, because the access point decides when to rekey. CLOSED when one of
 each has run with the link staying up.**

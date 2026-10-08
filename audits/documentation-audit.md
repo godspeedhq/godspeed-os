@@ -1210,3 +1210,68 @@ against `utilities/56_wifi.md` (`REJOIN_MIN_SECS` 60, once per drop, through `au
 recovered (`backlog/03`'s 2026-09-06 sighting, `backlog/14`, `backlog/48`, `backlog/57`, and CLAUDE.md's
 2026-08-09 amendment, which is prose, not a command), and `backlog/31`'s `DNS_RX_TRIES`, history of the
 fix before this one.
+
+## Audit 12 - the whole branch, documents and code comments, `feat/wifi-driver` since it left `main` (2026-10-08)
+
+Scope: everything `feat/wifi-driver` changed since `f605106d` - 346 commits, 274 files, about 54,000 lines -
+read in seven parts by independent readers (the shared WiFi library; `wifi-driver`; the USB dongle path
+through `wifi-usb`, `dwc2`, `xhci`, `nic-driver` and the supervisor; the branch's kernel, library and other
+service changes; `docs/wifi.md`, `docs/wifi-aic8800.md` and the `wifi` spec; `docs/wifi-usb.md` and the
+other changed documents; the backlog, the constitution's amendments and the scripts' headers). Each
+finding was checked against the code before it was changed. Every gate was green before and after, and
+the x86 shell suite ran 215/0 afterwards; the radio crates were also built for the Pi 4, VisionFive and
+Pi 2 targets. Nothing below is a thing the gates can see: they ask whether a name EXISTS, and these are
+names that exist and statements that are false.
+
+**About a hundred corrections, by kind:**
+- **Protocol descriptions the readers rely on.** `wire.rs` gave `OP_DISCONNECT`'s reply as two bytes (it
+  carries the network's name too), said every op but two is refused while powered off (the hardware and
+  use ops are served too), and put the power cycle through `DevicePower` on every radio (the dongle's is a
+  register power-down). `usbfn.rs` gave `OP_BULK_IN`'s `ST_FAILED` one cause of two. `nic-driver`'s
+  `Radio` promised a reacquire-and-retry its `rpc` never does.
+- **Status that moved on.** The VisionFive's check card for the shared loop "owed" in three places - it
+  ran and passed on 2026-10-06. The verified `off` and `off hard` "not yet run on hardware" in the spec -
+  verified 2026-10-01. The index calling the rekeys answered (built, not seen), R7 "not yet run" (run, the
+  rekey not seen), section 44's USB3 hub work verified (built, not on hardware), the NIC driver
+  IOMMU-confined (it is not; the document says so). `networking.md` 16, `audio.md`'s status line,
+  `porting.md`'s two counts (131 against 135 seam members; 9 against 15 sites in the supervisor's build
+  script), five backlog rows whose next step was done.
+- **Code that grew past its comment.** `wifi-driver` comments still describing phase V1 (the AIC8800
+  driver runs to V6), "none of this has run on hardware" over a verified scan, a superframe channel
+  "ignored" that is read, a reset vector "not implemented" that `upload::run` writes, a 512-byte frame
+  that is 4 KiB, a 16-byte trace entry that is 18, a PIO path "four bytes" that carries the firmware.
+  The kernel's device-power stubs naming the Pi 4 alone (the VisionFive answers too), five idle-mask
+  comments saying both ARM ports answer NO (the Pi 4 masks since 2026-09-30), arm32's "no per-task address
+  spaces yet" beside the L1 arena it has, `block-driver`'s EMMC grant the kernel removed.
+- **Doc comments on the wrong item**, which rustdoc then shows on the item below: `notice`, `untag`,
+  `set_expander_gpio`, `interface_up`, `collect`, `ladder` and `run`, and one orphan for a function that
+  no longer exists.
+- **The constitution, two counts.** The 2026-10-01 `DevicePower` amendment says every port but the Pi 4
+  answers `false`; a dated note says the VisionFive answers too. 18.5 said "one amendment" above two, and
+  not that the floor has since fallen to 83.
+
+**Found, and NOT changed, because each is a change to behaviour or to a gate - for the operator:**
+1. **Reason 4 (`DOWN_NOT_BUILT`) tells the operator something false.** It was "a radio this driver does
+   not drive yet". The AIC8800 driver now runs to a station, and `wifi-driver` sends reason 4 only when
+   that bring-up stops short. The shell still prints "its driver is not written yet ... nothing here can
+   bring it up", and `radio on` and `powercycle` refuse to retry on it. Whether a stopped AIC8800 bring-up
+   should be retried is a decision; the comments and the spec now say the meaning changed.
+2. **The VisionFive's `wifi debug` shows refused data packets as superframes.** `aic_station.rs` puts
+   `data_refused` in word 7, which the shell labels `rx_glom`.
+3. **`wifi-usb` can give up on a host that is still working.** `xhci` retries a control transfer up to
+   `CONTROL_TRIES` x `CONTROL_MS` = 2 s, which is all of `wifi-usb`'s `HOST_SECS`; a dongle slow to answer
+   can exhaust the driver's wait while the host is still trying.
+4. **`xhci` with no dongle bound drops a re-send it was asked for.** `answer_absent` gives back the
+   reply capability for `OP_SYNC` but does not re-send a named `NOTE_RADIO`; `dwc2` and `xhci`'s bound
+   path do.
+5. **Four log lines say what the comments now correct:** `upload.rs` (the reset vector "not" written,
+   twice), `scan.rs` ("glommed frame(s) ignored"), `firmware.rs` ("no `fs` peer").
+6. **`sdk/audio` is outside two gates.** `unsafe_check`'s `DENY_ROOTS` and the symbol checkers'
+   `SRC_DIRS` carry `sdk/wifi` but not `sdk/audio`, the same gap their own comments describe closing for
+   `sdk/wifi`.
+7. `dwc2`'s milestone-1 probe never compared its two reads; the comment claiming it did is removed rather
+   than the check added.
+
+**Left as they are:** dated sections true when written, with pointers added only where a later section
+reversed them and nothing said so; `backlog/03`, 14, 48 and 57's runs of the bare `chaos max-carnage`
+form (Audit 11).

@@ -36,7 +36,8 @@ pub const OP_CONTROL_ONCE: u8 = 0x22;
 /// was not armed - so the driver's first ask, once the chip's receive is set up, is what starts receiving.
 /// The host keeps one IN armed in the background and takes its completion on the USB interrupt, then sends
 /// `NOTE_BULK_IN`; it does not arm again until the transfer is collected, so the chip holds what arrives
-/// meanwhile and nothing is dropped between the two. `ST_FAILED` when the radio has no bulk IN endpoint.
+/// meanwhile and nothing is dropped between the two. `ST_FAILED` when the radio has no bulk IN endpoint, or the host could not repair it
+/// after a failed transfer.
 pub const OP_BULK_IN: u8 = 0x23;
 /// `[op, out, transfer...]` -> `[op, status]`: one bulk OUT transfer to the radio - a frame with the chip's
 /// transmit descriptor in front of it. `out` is the endpoint's POSITION among the radio's bulk OUT endpoints
@@ -53,7 +54,9 @@ pub const OP_BULK_OUT: u8 = 0x24;
 /// behind. The driver that receives a notice in place of an answer sends this, naming the notice: its call
 /// then returns the host's next message - the answer still on its way - and, since nothing answers this,
 /// no answer is left owed behind it. The host gives the reply capability back and sends the named notice
-/// again once the driver has been quiet (`docs/wifi-usb.md` 19).
+/// again once the driver has been quiet (`docs/wifi-usb.md` 19) - except `xhci` with no dongle bound,
+/// which gives the capability back and does not re-send a named `NOTE_RADIO` (`answer_absent`); recorded
+/// in `audits/documentation-audit.md` Audit 12.
 pub const OP_SYNC: u8 = 0x25;
 
 /// `[NOTE_BULK_IN]`, sent BY the host TO the driver, no reply expected: a bulk IN transfer is held, ask

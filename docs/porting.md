@@ -118,7 +118,7 @@ that the ISA was added.*
 
 | where | what it asks | what you must do |
 |-------|--------------|------------------|
-| `services/supervisor/build.rs` (9) | which USB host, which service images, whether PCI config space is reachable | **Add one arm to each table.** This is the designed place to answer, and it sets `has_xhci` / `has_dwc2` / `has_hw_enumerator` so `main.rs` needs nothing. |
+| `services/supervisor/build.rs` (15) | which USB host, which service images, whether PCI config space is reachable | **Add one arm to each table.** This is the designed place to answer, and it sets `has_xhci` / `has_dwc2` / `has_hw_enumerator` so `main.rs` needs nothing. |
 | `services/block-driver/build.rs` (4) | is the disk on a USB host, and which service owns it | **Add one arm.** Same shape. |
 | `services/shell/build.rs` (2) | what to call your arch in `version` | **Nothing** - it is derived from `CARGO_CFG_TARGET_ARCH`. Only add a line if your ISA needs a project-specific name, as arm32 does. |
 | `services/supervisor/src/main.rs` (4) | which peers `block-driver` and `nic-driver` need | **Add an arm** if your storage or NIC sits behind a USB host. |
@@ -141,7 +141,7 @@ godspeed/
 │   ├── src/
 │   │   ├── arch/
 │   │   │   ├── <isa>/                              ★ YOU WRITE THIS, and essentially only this.
-│   │   │   │                                         131 `arch::imp` members; the compiler and
+│   │   │   │                                         135 `arch::imp` members; the compiler and
 │   │   │   │                                         arch_seam_check.py name every one you owe.
 │   │   │   └── mod.rs                              + 2 lines: `pub mod <isa>;`
 │   │   │                                                      `pub use <isa> as imp;`

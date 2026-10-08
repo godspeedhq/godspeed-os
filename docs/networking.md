@@ -367,7 +367,8 @@ half of the same restartability story the storage stack tells (`docs/persistence
 ## 16. The clock is not the network's (2026-10-01)
 
 **Status:** fixed in code; passed the x86 shell suite 215/0 and a Pi 4 QEMU boot. NOT yet run on Pi 4
-hardware - the card carries the old `net-stack`.
+hardware - the card carries the old `net-stack`. *(Run on Pi 4 hardware 2026-10-02 at `5dd1f1b8`, the boot
+`backlog/66` records: `ping` over the radio at one echo a second, 19 of 19.)*
 
 **The coupling.** `net-stack` fetched the wall clock (SNTP: a DNS resolve, then up to three
 send-and-drain tries, up to about fifteen seconds when the server or resolver was silent) INSIDE its single serve loop, and started it three

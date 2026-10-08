@@ -15,8 +15,9 @@
 //! **WHY A PROBE RATHER THAN A CONSTANT.** Two addresses are involved and they have different standing,
 //! which matters more than it looks:
 //!
-//!   * `+0x30_0000` is an **in-repo fact**: `arch/arm/mod.rs` grants `block-driver` the Arasan EMMC at
-//!     `PERIPHERAL_BASE + 0x30_0000` on the BCM2836, and `sdhci.rs` documents the same offset. The
+//!   * `+0x30_0000` was an **in-repo fact** when this was written: `arch/arm/mod.rs` granted `block-driver`
+//!     the Arasan EMMC at `PERIPHERAL_BASE + 0x30_0000` on the BCM2836 until 2026-10-03, and `sdhci.rs`
+//!     still documents the same offset. The
 //!     peripheral base for this SoC, `0xFE00_0000`, is likewise already here (`mmu.rs`, and `PL011_BASE`
 //!     is derived from it).
 //!   * `+0x34_0000` was **NOT** an in-repo fact when this was written - it was recollection, and it was

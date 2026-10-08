@@ -417,8 +417,9 @@ impl<'a> Host<'a> {
         if !self.set_clock(id_div, ctx) {
             return false;
         }
-        // 1-bit bus, no high-speed, and NO DMA SELECTION. Every command this phase issues rides the
-        // CMD line alone, so 4-bit DAT and the 50 MHz mode are work with nothing yet to carry - and the
+        // 1-bit bus, no high-speed, and NO DMA SELECTION. Data moves on DAT0 by PIO, in byte or block
+        // mode (the firmware upload in blocks, frames up to 4 KiB); 4-bit DAT and the 50 MHz mode were
+        // left out when only commands rode the bus, and have not been needed since - and the
         // DMA-select field must be zero for PIO to work at all on some controllers (see
         // `CONTROL0_DMA_SELECT`). Written explicitly rather than inherited from whatever the firmware
         // left, which on this board is nothing at all: it boots from the other controller.
@@ -466,7 +467,7 @@ impl<'a> Host<'a> {
         const TIMEOUT_VAL: u32 = 0x0E;
         let c1 = (self.rd(CONTROL1) & !DATA_TOUNIT_MASK) | (TIMEOUT_VAL << DATA_TOUNIT_SHIFT);
         self.wr(CONTROL1, c1);
-        // No data transfers in this phase, but leave the block registers defined rather than at
+        // Leave the block registers defined rather than at
         // whatever reset left: a stale block count is the kind of thing that makes the FIRST data
         // command behave oddly, long after this code is out of mind.
         self.wr(BLKSIZECNT, 0);
@@ -575,8 +576,8 @@ impl<'a> Host<'a> {
     /// controller and this now matches it: wait DAT, set the block registers, `cmd_inner`, then the data.
     ///
     /// PIO, not DMA, for the two reasons `block-driver`'s backend gives: DMA on this SoC is not cache
-    /// coherent without explicit maintenance, and these transfers are four bytes. Whether a firmware
-    /// upload wants DMA is a MEASUREMENT for the phase that does one, not a guess for this one.
+    /// coherent without explicit maintenance, and when this was written these transfers were four
+    /// bytes. The firmware upload and every frame now go this way too, by PIO.
     pub fn cmd_data_word(&self, code: u32, arg: u32, blk: u32, buf: &mut [u32], read: bool)
         -> Result<(), &'static str>
     {

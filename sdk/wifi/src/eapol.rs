@@ -263,7 +263,8 @@ impl Key {
     }
 }
 
-/// Read an EAPOL-Key header out of an ethernet frame whose ethertype is `ETHERTYPE`. Logs what it read.
+/// Read an EAPOL-Key header out of an ethernet frame the caller has already matched to `ETHERTYPE_EAPOL`
+/// (the ethertype is not checked here). Logs what it read.
 ///
 /// `frame` starts at the ethernet header. Returns `None`, with the reason logged, for anything that is not
 /// a key descriptor this driver knows - which is reported, never silently skipped.

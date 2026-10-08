@@ -221,35 +221,6 @@ pub fn nvram_prepare(text: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(padded + 4)
 }
 
-/// Halt the ARM, write the firmware and the NVRAM, and let it run.
-/// Find out WHICH of three things a failing block write is, in one boot rather than three.
-///
-/// **What is already known.** `services/block-driver/src/sdhci.rs` does single-block PIO on this same
-/// controller family and works, at 512 bytes a block. Our own byte-mode CMD53 moves 4 bytes and works.
-/// Nothing in this repository has ever issued a MULTI-block transfer on it, and that is exactly where the
-/// firmware write fails - with the command accepted, no error bit set, and no data phase ever starting.
-///
-/// **So there are three separable candidates**, and guessing between them costs a flash each:
-///
-/// 1. the 64-byte block SIZE (the working driver only ever used 512),
-/// 2. the `SDHCI_TRNS_MULTI` bit,
-/// 3. the block COUNT.
-///
-/// This walks them in order, smallest difference first. The first rung to fail names the culprit:
-///
-/// | rung | mode  | MULTI | blocks | means, if this is the first to fail             |
-/// |------|-------|-------|--------|--------------------------------------------------|
-/// | 1    | byte  | no    | -      | the bus or the window is wrong, not block mode    |
-/// | 2    | block | no    | 1      | the 64-byte F1_BLOCK SIZE is the problem             |
-/// | 3    | block | yes   | 2      | the MULTI bit is the problem                      |
-/// | 4    | block | yes   | 16     | the block COUNT is the problem                    |
-///
-/// **Every rung reads back the first word it wrote**, because a write that reports success and lands
-/// nothing is a silent failure and worse than a loud one (§26.7). The read-back uses byte mode, which rung
-/// 1 has just proved on this very address.
-///
-/// It writes into the halted ARM's TCM at the firmware's own load address - where the bulk write is about
-/// to go anyway - so it needs no scratch region and costs nothing but the transfers themselves.
 /// Ask the chip whether its firmware BOOTED, rather than inferring it from the reset controller.
 ///
 /// `RESETCTRL 0` says the CPU is fetching. A CPU fetching garbage says the same thing, so releasing the
@@ -369,6 +340,34 @@ fn firmware_alive(h: &dyn SdioHost, w: &mut Window, ram: &Ram, token: u32, trapp
     false
 }
 
+/// Find out WHICH of three things a failing block write is, in one boot rather than three.
+///
+/// **What is already known.** `services/block-driver/src/sdhci.rs` does single-block PIO on this same
+/// controller family and works, at 512 bytes a block. Our own byte-mode CMD53 moves 4 bytes and works.
+/// Nothing in this repository has ever issued a MULTI-block transfer on it, and that is exactly where the
+/// firmware write fails - with the command accepted, no error bit set, and no data phase ever starting.
+///
+/// **So there are three separable candidates**, and guessing between them costs a flash each:
+///
+/// 1. the 64-byte block SIZE (the working driver only ever used 512),
+/// 2. the `SDHCI_TRNS_MULTI` bit,
+/// 3. the block COUNT.
+///
+/// This walks them in order, smallest difference first. The first rung to fail names the culprit:
+///
+/// | rung | mode  | MULTI | blocks | means, if this is the first to fail             |
+/// |------|-------|-------|--------|--------------------------------------------------|
+/// | 1    | byte  | no    | -      | the bus or the window is wrong, not block mode    |
+/// | 2    | block | no    | 1      | the 64-byte F1_BLOCK SIZE is the problem             |
+/// | 3    | block | yes   | 2      | the MULTI bit is the problem                      |
+/// | 4    | block | yes   | 16     | the block COUNT is the problem                    |
+///
+/// **Every rung reads back the first word it wrote**, because a write that reports success and lands
+/// nothing is a silent failure and worse than a loud one (§26.7). The read-back uses byte mode, which rung
+/// 1 has just proved on this very address.
+///
+/// It writes into the halted ARM's TCM at the firmware's own load address - where the bulk write is about
+/// to go anyway - so it needs no scratch region and costs nothing but the transfers themselves.
 fn ladder(h: &dyn SdioHost, w: &mut Window, addr: u32, ctx: &ServiceContext) -> bool {
     // Distinct per rung, so a read-back cannot pass on a stale value another rung left behind.
     const MARKS: [u32; 4] = [0xA1A1_0001, 0xB2B2_0002, 0xC3C3_0003, 0xD4D4_0004];
@@ -438,6 +437,7 @@ fn ladder(h: &dyn SdioHost, w: &mut Window, addr: u32, ctx: &ServiceContext) -> 
     true
 }
 
+/// Halt the ARM, write the firmware and the NVRAM, and let it run.
 pub fn run(
     h: &dyn SdioHost,
     w: &mut Window,

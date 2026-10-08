@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Fetch the vendor radio firmware a board needs, and VERIFY it. The blob never enters this repository.
+"""Fetch the vendor radio firmware a board needs, and VERIFY it.
+
+**Corrected 2026-10-08:** the CYW43455's files are in this repository now, under `nonfree/brcm43455/`
+with their LICENCE and PROVENANCE - `570d43ee` reversed `docs/wifi.md` section 8's decision the day it was
+made, and section 8 now says why the files ARE here. What follows is the reasoning as it stood before
+that; this script's remaining use is firmware whose licence forbids redistribution (`docs/licensing.md`).
 
 `docs/wifi.md` section 8 decides that no vendor firmware blob is committed here, following what Linux
 does: the kernel tree carries none, they live in a separate `linux-firmware` that distributions package,

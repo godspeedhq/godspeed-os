@@ -97,7 +97,7 @@
 //! - **The MAC itself is sanity-checked.** All-zero or all-`0xFF` is not an address, and a driver that
 //!   printed one would be reporting a successful exchange that returned nothing.
 //!
-//! Bounded and stack-only (§26.6.1): one 512-byte frame buffer, no heap, no allocation.
+//! Bounded and stack-only (§26.6.1): one `FRAME`-sized (4 KiB) buffer per reader, no heap, no allocation.
 
 use godspeed_sdk::ServiceContext;
 
@@ -280,7 +280,8 @@ pub struct Stats {
 /// `code::index` maps an event code to one of these; the last is "other".
 pub const EVENT_BUCKETS: usize = 10;
 
-/// One frame as the trace remembers it: 16 bytes, so 64 of them are one KiB.
+/// One frame as the trace remembers it: 18 bytes of fields (serialised at that stride by `bcm.rs`), so
+/// 64 of them are about 1.2 KiB.
 #[derive(Clone, Copy, Default)]
 pub struct TraceEntry {
     /// Milliseconds since the session began (0 when the clock is unavailable).
@@ -312,7 +313,7 @@ pub mod trace_kind {
     /// The glom descriptor: a list of lengths, not a frame with content.
     pub const RX_GLOMDESC: u8 = 9;
     /// A data frame this driver SENT: a handshake message, a rekey acknowledgement, or any frame the stack
-    /// handed down through `nic-driver` (`frames::OP_NET_TX`).
+    /// handed down through `nic-driver` (`godspeed_wifi::wire::OP_NET_TX`).
     pub const TX_DATA: u8 = 10;
 }
 
@@ -1041,8 +1042,9 @@ fn describe_frame(which: u32, f: &Frame, buf: &[u8], ctx: &ServiceContext) {
 
 /// Read one frame off function 2, whatever channel it is on.
 ///
-/// Returns `(chanflag, len)`, where `buf[..len]` is the frame **after** the SDIO hardware and software
-/// headers - so for an event that is the pseudo-ethernet frame, starting at its destination address. The
+/// Returns the `Frame` its headers describe: `buf[..body]` is everything **after** the SDIO hardware and
+/// software headers - for an event, the pseudo-ethernet frame from its destination address - and
+/// `off`/`len` locate the payload. The
 /// caller decides what the channel means; this function only delivers bytes.
 ///
 /// `None` means no frame was there. That is a normal, frequent answer rather than an error: the hardware
@@ -1330,10 +1332,6 @@ pub fn set_cmd(
     false
 }
 
-/// Raise the interface - `BRCMF_C_UP`, no payload.
-///
-/// Without this the firmware refuses a scan with `BCME_NOTUP` (-4), which is exactly what it did. brcmfmac
-/// issues this during bring-up before anything else touches the radio.
 /// `BWFM_C_DOWN` - take the interface down. `bwfm_stop`: `bwfm_fwvar_cmd_set_int(sc, BWFM_C_DOWN, 1)`.
 const CMD_DOWN: u32 = 3;
 /// `WLC_GET_UP` (162, Broadcom wlioctl.h): is the interface up? 0 is down.
@@ -1560,6 +1558,10 @@ pub fn report_power_mode(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx:
     }
 }
 
+/// Raise the interface - `BRCMF_C_UP` with the integer 0, then infrastructure mode on and AP mode off.
+///
+/// Without this the firmware refuses a scan with `BCME_NOTUP` (-4), which is exactly what it did. brcmfmac
+/// issues this during bring-up before anything else touches the radio.
 pub fn interface_up(h: &dyn SdioHost, w: &mut Window, s: &mut Session, ctx: &ServiceContext) -> bool {
     // UP takes the VALUE 0, which reads oddly and is what the reference passes.
     if !set_cmd_int(h, w, s, CMD_UP, 0, "interface up", ctx) {
@@ -1626,9 +1628,9 @@ pub fn set_cmd_int(
 /// **The CRC is explicitly zero, not computed.** Worth quoting, because computing one is the obvious wrong
 /// guess and the firmware would reject every chunk.
 ///
-/// **Chunked to this driver's frame rather than to `MAX_CHUNK_LEN`.** 1400 exceeds the 512-byte control
-/// frame, and the reference's constant is its buffer's limit rather than the protocol's - a chunked download
-/// is chunked either way. `DL_BEGIN` marks the first chunk and `DL_END` the last; a blob small enough for one
+/// **Chunked to `MAX_CHUNK` (1400, the references' `MAX_CHUNK_LEN`), or less if the frame leaves less
+/// room.** (This said the chunks followed a 512-byte frame instead, before `FRAME` became 4 KiB and
+/// 2000-byte chunks were seen refused; corrected 2026-10-08.) `DL_BEGIN` marks the first chunk and `DL_END` the last; a blob small enough for one
 /// chunk carries both, which is what the reference does too.
 pub fn download_blob(
     h: &dyn SdioHost,

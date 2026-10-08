@@ -51,6 +51,10 @@
 //!
 //! ## What is deliberately NOT here
 //!
+//! **Corrected 2026-10-08:** the reset vector IS written now - `upload::run` step 5 writes the image's
+//! first word to backplane address 0, taken from OpenBSD `bwfm` - just not in this module. What follows is
+//! the reasoning as it stood before that, kept because it is why the write lives in `upload`:
+//!
 //! `brcmf_sdio_buscore_activate` additionally writes the firmware's reset vector - the first four bytes of
 //! the image - to backplane address 0, conditionally (`if (rstvec)`). **That function could not be read**:
 //! it sits past the point where `sdio.c` truncates when fetched, and the vendor driver's post-download

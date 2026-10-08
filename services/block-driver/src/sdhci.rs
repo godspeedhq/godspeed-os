@@ -2,8 +2,9 @@
 //! `block-driver` ARM backend: BCM2835 EMMC (Arasan SDHCI), PIO/polled.
 //!
 //! The Raspberry Pi 2's SD card is on the Arasan EMMC (a standard SD Host Controller) at
-//! peripheral + 0x30_0000. The kernel grants this service an MMIO cap to that window at spawn
-//! (the §12.3 fixed-peripheral grant), so the driver reaches the
+//! peripheral + 0x30_0000. **The kernel no longer grants that window** (the EMMC is the Pi 2's boot card;
+//! `arch/arm`'s `map_fixed_device` dropped it on 2026-10-03), and this backend is not compiled in; a board
+//! that used it would need a device kind and a `map_fixed_device` entry. When granted, the driver reached the
 //! registers through the SDK `Mmio` wrapper - **no `unsafe` in the service** (§18.1/§18.2).
 //!
 //! PIO, not DMA: the CPU reads/writes each 512-byte block word-by-word through `EMMC_DATA`. This

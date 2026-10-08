@@ -78,8 +78,6 @@ pub trait Host {
     fn power_cycle(&mut self, _ctx: &ServiceContext, _units: u8) -> bool {
         false
     }
-    /// A message with no reply cap. `sweep` is the scan running now, so a host whose frames arrive as
-    /// notices can keep what a sweep hears.
     /// What this radio is, for `wifi hardware` (`wire::OP_HARDWARE`): the chip's name and the bus it is
     /// reached over. The host's to say, not the station's: it is true while the radio is down, when there
     /// is no station to ask.
@@ -90,6 +88,8 @@ pub trait Host {
     /// radio is down - the chip as identified, its IDs, the bus and its endpoints. The station adds the
     /// ones that need a running chip (`Station::details`).
     fn details(&self, _d: &mut Details) {}
+    /// A message with no reply cap. `sweep` is the scan running now, so a host whose frames arrive as
+    /// notices can keep what a sweep hears.
     fn notice(&mut self, _msg: &[u8], _sweep: Option<&mut Scan>, _ctx: &ServiceContext) -> Notice {
         Notice::Ignored
     }
@@ -109,7 +109,6 @@ fn say_fmt(ctx: &ServiceContext, who: &str, args: core::fmt::Arguments) {
     ctx.log_fmt(format_args!("{}: {}", who, args));
 }
 
-/// A request's correlation tag, if it carries one (`wire::TAGGED`), and the request without it.
 /// The labelled facts of `wire::OP_HARDWARE_DETAIL`, written into the reply as they are added. Bounded by
 /// the buffer it was given: a fact that does not fit is dropped, the ones before it kept. A label that is
 /// not one of `wire::DETAIL_LABELS` is dropped too, so the shell's record and the reply cannot disagree.
@@ -182,6 +181,7 @@ pub struct Hardware {
     pub bus: &'static str,
 }
 
+/// A request's correlation tag, if it carries one (`wire::TAGGED`), and the request without it.
 pub fn untag(raw: &[u8]) -> (Option<u8>, &[u8]) {
     match raw {
         [wire::TAGGED, tag, rest @ ..] => (Some(*tag), rest),
@@ -205,8 +205,9 @@ pub fn tagged_reply(tag: Option<u8>, body: &[u8]) -> Message {
 
 /// Serve the shell and `nic-driver`: sweeps as a state the loop advances, the cache, joins, keys, status,
 /// debug - and the frame interface (`wire::OP_NET_*`), over which the radio carries the stack's traffic
-/// when the cable is out. Without a radio, every request is answered "radio down", so a shell can never
-/// tell a down radio from a wedged one by waiting.
+/// when the cable is out. Without a radio, every request but the hardware and use ops and the power ops
+/// (`powercycle`, `off hard`) is answered "radio down", so a shell never has to tell a down radio from a
+/// wedged one by waiting.
 ///
 /// The loop never sits inside a sweep: `Station::scan_step` advances it one turn at a time and
 /// `try_recv` answers requests between turns, which is what lets `q` stop a sweep
@@ -257,7 +258,8 @@ pub fn serve<'s>(
     // it off, and `wifi radio on` re-runs the same chain.
     let mut radio_on = true;
     // `wifi radio off hard` cut the chip's power and this instance is still here to say so. While it is
-    // set, status and the radio op are served and everything else is answered RADIO_POWERED_OFF; `on`
+    // set, status, the radio op and the hardware and use ops are served and everything else is answered
+    // RADIO_POWERED_OFF; `on`
     // restores the power and asks to be restarted, because a cold chip needs the boot's own path.
     let mut powered_off = false;
     // The network the firmware last reported JOINED, cleared by a disconnect or a power-off.
@@ -473,7 +475,7 @@ pub fn serve<'s>(
     // every slot is held, the one JOINED LONGEST AGO is replaced. This table is the WORKING SET; the 48 most
     // recent keys and their names are also on disk in `/wifi.keys` (`godspeed_wifi::keyfile`), loaded when
     // the radio comes up and rewritten after every change.
-    // About 70 bytes each, some 4.5 KiB in all, against a 16 MiB limit: the count is a BOUND (26.6), chosen
+    // About 70 bytes each, some 4.5 KiB in all, against a service limit of 8 MiB or more: the count is a BOUND (26.6), chosen
     // so that nobody reaches it, not a fit to the memory - a table that grew to fill what is available is
     // the elastic growth 26.6.1 says to resist.
     struct Stored {
@@ -823,8 +825,8 @@ pub fn serve<'s>(
                 out[1] = count;
                 2 + len
             }
-            // ---- Powered down (`wifi radio off hard`): these four arms come first, so nothing below talks
-            // to a chip that has no power. ----
+            // ---- Powered down (`wifi radio off hard`): these three arms come before every arm that talks
+            // to the chip, so nothing below talks to a chip that has no power. ----
             (wire::OP_STATUS, _) if powered_off => {
                 // The status shape the shell knows, all zero: radio off, not associated, no cache claimed,
                 // and the trailing power byte at 0 - the one fact that tells this off from the soft one.
@@ -997,8 +999,9 @@ pub fn serve<'s>(
             }
             // `wifi radio powercycle`: the CHIP's power, not the firmware's radio switch. The operator's form of
             // the recovery this driver does for itself when it finds a firmware it cannot adopt
-            // (docs/wifi.md 47). The power is cut and restored here, because this service holds
-            // DEVICE_POWER; what follows is the SHELL's, because it holds restart authority: it kills this
+            // (docs/wifi.md 47). The power is cut and restored by the host (`Host::power_cycle`: the
+            // kernel's `DevicePower` on the Pi 4 and the VisionFive, a register power-down on the USB
+            // dongle); what follows is the SHELL's, because it holds restart authority: it kills this
             // instance, and the respawn finds a cold chip - the boot's own path.
             // The reply goes out before the kill arrives, so the operator is told the cycle happened (or
             // that this machine cannot do it) rather than left with a prompt that went quiet.
@@ -1263,7 +1266,8 @@ pub fn serve<'s>(
                         name
                     };
                     // ALREADY ON IT? Asked of the firmware, not remembered: `joined` names the network and
-                    // `CMD_GET_BSSID` says whether the link is still up. A join of the network we are on sends
+                    // `Station::link` (the firmware's or the station's own reading) says whether the link is
+                    // still up. A join of the network we are on sends
                     // nothing and says so; a stale memory of one is cleared and the join proceeds.
                     let on_this = joined
                         .as_ref()
@@ -1377,7 +1381,7 @@ pub fn serve<'s>(
                                     }
                                 }
                                 // A join that failed AFTER association leaves the firmware on the network with
-                                // no keys - and `link_now` would then report it as joined, which the first
+                                // no keys - and `Station::link` would then report it as joined, which the first
                                 // hardware run of the handshake showed as `wifi status` saying `joined 5 min
                                 // ago` to a `(hidden)` network after `wsec_key` was refused. The firmware's
                                 // state is made to match this driver's answer. Harmless when there was no
@@ -1440,7 +1444,7 @@ pub fn serve<'s>(
             // protocol. Every reply is tagged with its op, because the caller bounds its wait and a late
             // answer must not be read as the next one. ----
             (wire::OP_NET_INFO, Some(session)) => {
-                // `[op, ok, mac(6), link, peer(6)]`. The address is the chip's, asked once; the link is
+                // `[op, ok, mac(6), link, peer(6), use]`. The address is the chip's, asked once; the link is
                 // this driver's memory of the join, which every pull keeps honest. Not asked mid-sweep: a
                 // control exchange would eat the sweep's frames, and a sweep is a moment of no link.
                 //

@@ -1,6 +1,6 @@
 # 61 - the process friction the first dogfood feature measured
 
-**Status:** OPEN - six findings, none blocking, four of them cheap. Recorded because this was the first
+**Status:** OPEN - six findings, none blocking; items 2 and 3 done 2026-09-27 (`96939812`: `utilities/0_conventions.md` 2a and the `CONTRIBUTING.md` pointer); 1, 5 and 6 open, 4 kept open deliberately. Recorded because this was the first
 feature built *after* the rules became findable, so the friction it hit is data about the process rather
 than about the feature.
 **Found:** 2026-09-27, implementing the `wifi` verb (`1602f3df`). Each item below cost real time in that

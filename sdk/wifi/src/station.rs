@@ -4,8 +4,8 @@
 //! The loop owns the policy every radio shares - the scan cache, the credential table and `/wifi.keys`,
 //! auto-join and the rejoin after `radio on`, which key to join with, every reply's layout. A `Station`
 //! owns the chip: how a scan is started and read, how a join is done, what "up" and "the link" mean to
-//! this firmware, and how frames move. The Pi 4's Broadcom is the first; the VisionFive 2's AIC8800 is
-//! next, and a soft-MAC radio (the Pi 2's Realtek) becomes one through a host-side MLME.
+//! this firmware, and how frames move. The Pi 4's Broadcom, the VisionFive 2's AIC8800 and the Pi 2's
+//! Realtek (a soft-MAC radio, through a host-side MLME in `wifi-usb`) each implement it.
 //!
 //! Every method is a bounded exchange with the chip; none of them decides anything the loop does.
 

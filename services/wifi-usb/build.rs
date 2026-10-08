@@ -2,8 +2,8 @@
 //! Link this service, and embed the dongle's firmware in its own binary - for the reasons
 //! `services/wifi-driver/build.rs` gives at length: a live system carries what it uploads, and reading it
 //! through `fs` would make the radio depend on storage. One file today, `rtl8192cufw_TMSC.bin`
-//! (`nonfree/rtl8192cu/PROVENANCE`), with its length and a hash passed through so the service can check at
-//! start that the bytes really reached the binary.
+//! (`nonfree/rtl8192cu/PROVENANCE`), with an FNV-1a hash passed through so the service can check at start
+//! that the bytes really reached the binary.
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();

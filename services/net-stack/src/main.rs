@@ -99,7 +99,7 @@ const UDP_BUDGET_MS: u64 = 3000;
 
 /// The shortest deadline any CLIENT gives a single net-stack request.
 ///
-/// The shell's `net resolve` is the one: `ns_query(ctx, &req, 8)`. It is restated here because this
+/// The shell's `net resolve` is the one: `NET_RESOLVE_SECS` (8) in `services/shell`. It is restated here because this
 /// service cannot see that constant and the relationship between them is load-bearing.
 const CLIENT_MIN_DEADLINE_SECS: i64 = 8;
 

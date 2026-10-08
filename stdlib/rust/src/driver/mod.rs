@@ -19,7 +19,8 @@
 //! # How a mechanism gets in
 //!
 //! By being REPEATED, not by being imagined. Each module here was found written out by hand in more
-//! than one driver, differently each time, and then moved here and the drivers converted to it. A
+//! than one driver, differently each time, and then moved here and the drivers converted to it - except `irq`, whose originals (`xhci`, `ehci`,
+//! `dwc2`) are not converted yet; its users so far are the two audio drivers. A
 //! second, independent kind of driver using it naturally is the test of whether it is general; one
 //! that has to be bent to fit it means the abstraction is shaped like the driver it came from.
 //!

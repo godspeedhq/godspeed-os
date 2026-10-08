@@ -38,7 +38,7 @@ log_write = true
 # `wifi-driver` - the Pi 4's radio, the link's FIFTH backend (docs/wifi.md 2): when the cable is out and
 # the radio is joined, this service carries net-stack's frames to it over the same three ops (0x10 INFO /
 # 0x11 TX / 0x12 RX) it answers upward. Granted only where that image is embedded (the supervisor's
-# `has_wifi_driver` board fact); the policy - the cable always wins - is `Carrier` in `genet.rs`.
+# `has_wifi_driver` board fact); the policy - the cable always wins - is `Carrier` in `radio.rs`, shared by every backend with a radio.
 ipc_send  = ["dwc2", "wifi-driver", "wifi-usb", "events"]
 # ARM NOTE (userspace-audit Audit 5, A5-U1) - applies to BOTH ARM ports: on neither is there a PCIe NIC,
 # so `hw_device = "nic"` resolves to nothing; instead the kernel grants this service the NET_DEVICE

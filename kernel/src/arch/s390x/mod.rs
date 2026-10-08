@@ -92,8 +92,8 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 pub fn hw_random() -> Option<u32> { None }
 
 /// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
-/// one board with it is the Pi 4 (`arch/aarch64`), whose radio returns to power-on only when WL_ON is
-/// cut. `false` is the honest answer; the syscall reports it as "no control over it".
+/// boards with it are the Pi 4 (`arch/aarch64`, WL_ON), whose radio returns to power-on only when WL_ON
+/// is cut, and the VisionFive 2 Lite (`arch/riscv64`, the radio's power pin). `false` is the honest answer; the syscall reports it as "no control over it".
 pub fn device_power_control(_kind: u32) -> bool { false }
 pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 
@@ -378,7 +378,9 @@ pub mod interrupts {
 /// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
 /// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
 /// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
-/// narrower window; it is recorded here rather than silently left (26.7).
+/// narrower window; it is recorded here rather than silently left (26.7). **Since 2026-09-30 only the
+/// Pi 2 (`arch/arm`) answers NO:** the Pi 4 (`arch/aarch64`) masks, `wfi`s and unmasks, its USB stack and
+/// terminal being services now.
     pub fn idle_mask_before_halt() -> bool { false }
 
     pub fn idle_can_halt() -> bool { false }

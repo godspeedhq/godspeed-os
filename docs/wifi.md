@@ -3289,6 +3289,7 @@ of the radio's SD host and a grant of its window and power pin by the `WIFI_SDIO
 (`services/wifi-driver/src/dwmmc.rs`), is built and reaches identification only. Everything above
 identification is the plan in that document. The riscv64 kernel's `hw_random` is still a stub; the JH7110 has a hardware generator of its
 own, and filling that seam would help `net-stack` on the board whether or not the radio is ever driven.
+*(2026-10-05: V2-V6 hardware-verified and the TRNG wired - `docs/wifi-aic8800.md` 4 and 10.)*
 
 ## 45. The first chaos run with the radio: 397 respawns, one join (2026-09-30)
 
@@ -3620,7 +3621,7 @@ window. That is a wider kernel change than section 47's and needs the operator's
 **That condition is now met** (see the result below): the parked host still comes up warm. The pad
 experiment is the next one, and it waits on the operator's word; it has not been made.
 
-**`wifi radio powercycle` is bounded.** Three cycles per invocation, then the prompt, saying how each
+**`wifi radio powercycle` is bounded.** *(One cycle per invocation since section 52.)* Three cycles per invocation, then the prompt, saying how each
 ended; the command can be run again, and nothing needs a reboot. The hold-off is fixed at two seconds.
 
 **The prediction, specific enough to be wrong.** Ten `wifi radio powercycle` runs, each from a joined

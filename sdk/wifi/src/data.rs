@@ -17,7 +17,8 @@ const LLC_SNAP: [u8; 6] = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00];
 pub const ETH_HEADER: usize = 14;
 /// What `to_80211` puts in front of the ethernet payload: the 24-byte non-QoS header, LLC/SNAP and the
 /// ethertype - and the 8-byte CCMP header too when the frame is protected (`CCMP_HEADER`). An ethernet frame
-/// of `n` bytes becomes `n - ETH_HEADER + DATA_OVERHEAD` (+ `CCMP_HEADER`).
+/// of `n` bytes becomes `n - ETH_HEADER + DATA_OVERHEAD`, plus 2 for a QoS frame's QoS Control field and
+/// `CCMP_HEADER` for a protected one.
 pub const DATA_OVERHEAD: usize = 24 + 8;
 /// The CCMP header (IEEE 802.11-2020 12.5.3.2): the packet number's two low bytes, a reserved byte, the key
 /// id byte with the Ext IV bit, and the packet number's four high bytes. The MIC that ends a CCMP frame is

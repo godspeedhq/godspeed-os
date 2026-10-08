@@ -356,7 +356,7 @@ pub const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 /// As a request bit it is checked the same way every privilege is - the spawner may ask for it only
 /// because it could transfer such a cap itself.
 pub const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
-/// Report this task's death to the spawner's death-notification endpoint and count it as a restart. The
+/// Report this task's death to the supervisor's death-notification endpoint and count it as a restart. The
 /// supervisor sets it for every service it manages; the kernel keeps no list of which services those are
 /// (`docs/audio.md`, "No service names in the kernel").
 pub const SPAWN_FLAG_WATCHED:     u32 = 1 << 4;

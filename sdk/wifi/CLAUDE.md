@@ -1,7 +1,8 @@
 # sdk/wifi/
 
 The chip-independent half of every WiFi driver, as a library: `godspeed-wifi` (`godspeed_wifi`).
-`no_std`, `#![deny(unsafe_code)]`, depending only on `sdk/rust`.
+`no_std`, `#![deny(unsafe_code)]`, depending on `sdk/rust` and the standard library `stdlib/rust`
+(`gs`, for `gs::ipc` and the driver waits).
 
 | Module | What it is |
 |---|---|

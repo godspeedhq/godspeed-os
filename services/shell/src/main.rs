@@ -11707,7 +11707,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
 
     // Stage 1 - produce a Stream.
     let (c0, _) = split_first(stages[0]);
-    // `wifi list` is the one `wifi` verb that is a table; `status`, `info` and the rest are labelled lines.
+    // `wifi list` and `wifi hardware` are the `wifi` verbs that are tables; `status`, `info` and the rest are labelled lines.
     let wifi_records = c0 == "wifi" && matches!(split_first(stages[0]).1.trim(), "list" | "hardware");
     let mut s = if is_record_producer(c0) || wifi_records {
         let arg = split_first(stages[0]).1;
@@ -12165,7 +12165,7 @@ fn events_sub_help(ctx: &ServiceContext, view: &str) -> bool {
 fn chaos_sub_help(ctx: &ServiceContext, mode: &str) -> bool {
     match mode {
         "kill-storm" => help_block(ctx, "chaos kill-storm", "kill one service repeatedly and verify it recovers", &[
-            ("chaos kill-storm <svc> [n] [save <path>]", "kill <svc> n times (default 10); each round waits for the supervisor's restart; `save` writes the rounds to a file", "chaos kill-storm fs 20"),
+            ("chaos kill-storm <svc> [n] [save <path>]", "kill <svc> n times (default 20); each round waits for the supervisor's restart; `save` writes the rounds to a file", "chaos kill-storm fs 20"),
         ], false),
         "flood-storm" => help_block(ctx, "chaos flood-storm", "saturate a service's queue and verify it drains", &[
             ("chaos flood-storm <svc> [n]", "fill <svc>'s 16-deep endpoint n times; a service that wedges under a full queue is found here", "chaos flood-storm events 5"),
@@ -12174,10 +12174,10 @@ fn chaos_sub_help(ctx: &ServiceContext, mode: &str) -> bool {
             ("chaos mem-pressure [n]", "spawn the mem-pressure probe n times; each allocs to its contract limit (AllocDenied is the expected loud stop) and reclaims", "chaos mem-pressure 3"),
         ], false),
         "spawn-storm" => help_block(ctx, "chaos spawn-storm", "spawn to the task ceiling and watch the refusal", &[
-            ("chaos spawn-storm [n]", "spawn probe tasks until the kernel refuses; the refusal must be loud and the system must stay up", "chaos spawn-storm"),
+            ("chaos spawn-storm [n]", "spawn mem-pressure tasks until the kernel refuses; the refusal must be loud and the system must stay up", "chaos spawn-storm"),
         ], false),
         "max-carnage" => help_block(ctx, "chaos max-carnage", "the chaos monkey: random or aimed kills every round", &[
-            ("chaos max-carnage all-services <n> [yes]", "each round kills a RANDOM restartable service (the supervisor included), plus system-wide mem-pressure and spawn-storm; `yes` skips the confirm", "chaos max-carnage all-services 100"),
+            ("chaos max-carnage all-services <n> [yes]", "each round kills a RANDOM subset of the live services (the supervisor included), plus system-wide mem-pressure and spawn-storm; `yes` skips the confirm", "chaos max-carnage all-services 100"),
             ("chaos max-carnage <svc> <n>", "aim every round at one service", "chaos max-carnage fs 50"),
             ("chaos max-carnage <svc>,<svc>,... <n>", "kill EVERY listed service each round - cascade stress", "chaos max-carnage fs,events 100"),
         ], false),
@@ -14754,7 +14754,7 @@ fn is_record_producer_service(name: &str) -> bool {
 }
 
 /// Run a producer built-in (`cmd args`) with its output going to `out`.
-/// `false` when the producer FAILED - said only by `wifi`, whose failures (no scan yet, a scan running, the
+/// `false` when the producer FAILED - said only by `wifi` and `audio`, whose failures (no scan yet, a scan running, the
 /// radio down) must not reach a pipe as data: an empty `count` would say "no networks" about a radio
 /// nobody could ask (`utilities/56_wifi.md` section 3, "an error goes to nobody's pipe"). The other
 /// producers have always written their errors into the stream, and still do.

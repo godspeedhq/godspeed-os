@@ -2576,7 +2576,9 @@ pub mod interrupts {
 /// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
 /// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
 /// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
-/// narrower window; it is recorded here rather than silently left (26.7).
+/// narrower window; it is recorded here rather than silently left (26.7). **Since 2026-09-30 only the
+/// Pi 2 (`arch/arm`) answers NO:** the Pi 4 (`arch/aarch64`) masks, `wfi`s and unmasks, its USB stack and
+/// terminal being services now.
     /// **YES** - and for the same reason x86 says yes, reached differently.
     ///
     /// The idle loop masks interrupts, re-checks for work, and halts, relying on the halt not to
@@ -2585,7 +2587,8 @@ pub mod interrupts {
     /// so an interrupt raised after the re-check is latched and `wfi` returns immediately; the
     /// handler then runs once `SIE` is restored.
     ///
-    /// ARM answers no because its idle path does real work that needs interrupts enabled. This one
+    /// The Pi 2 (`arch/arm`) answers no because its idle path does real work that needs interrupts
+    /// enabled; the Pi 4 answers yes since 2026-09-30. This one
     /// does nothing but wait, so there is no such obligation.
     pub fn idle_mask_before_halt() -> bool { true }
 

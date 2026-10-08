@@ -76,7 +76,7 @@ const DW5_SHORT_GI: u32 = 1 << 6;
 
 /// `txdw5`'s data bits for a frame the FIRMWARE picks the rate of: `fill_txdesc_v1` ORs `0x0001ff00` in for
 /// every data frame, and sets no driver rate - the rate is the firmware's, adapting within the mask the
-/// driver gave it after the association (`rtl8188::rate_mask`, R8).
+/// driver gave it after the association (`rtl_tx::rate_mask`, given to the firmware by `rtl8188::joined`, R8).
 const DW5_DATA: u32 = 0x0001_FF00;
 
 /// The descriptor for a unicast DATA frame - the link's traffic (R6) - on the best-effort queue, protected

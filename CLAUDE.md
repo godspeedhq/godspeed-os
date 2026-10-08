@@ -1483,6 +1483,8 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > what firmware it runs, whether it is alive, or when its power should be cut: those are the driver's
 > (§26.10), and the hold-off and settle times are the device's and live in the driver with it. Every
 > other port answers the seam with `false`, and the syscall reports that honestly rather than pretending.
+> *(Note 2026-10-08: the VisionFive 2 Lite answers it too - its AIC8800's power pin, by device kind
+> `WIFI_SDIO`, result by read-back, `arch/riscv64`. Every port but those two answers `false`.)*
 >
 > **Why it is recorded.** A new syscall and a new resource widen the surface Commandment I pins, and
 > the gate refused this change until this paragraph existed - which is the gate working. The service
@@ -1965,7 +1967,7 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. One amendment to the grandfathered floors stands:
+stayed at their floors with **no amendment needed**. Two amendments to the grandfathered floors stand (the floor has since fallen to 83, `audits/unsafe-audit.md`):
 
 > **Amendment 2026-10-01 (`CpuClock`): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
 > `unsafe { raw_syscall(55, ..) }` call site, the wrapper `cpu_clock` behind the §12.3 amendment of the

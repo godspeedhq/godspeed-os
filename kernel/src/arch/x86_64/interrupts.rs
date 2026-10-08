@@ -469,7 +469,9 @@ pub fn set_idle_can_halt(v: bool) {
 /// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
 /// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
 /// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
-/// narrower window; it is recorded here rather than silently left (26.7).
+/// narrower window; it is recorded here rather than silently left (26.7). **Since 2026-09-30 only the
+/// Pi 2 (`arch/arm`) answers NO:** the Pi 4 (`arch/aarch64`) masks, `wfi`s and unmasks, its USB stack and
+/// terminal being services now.
 pub fn idle_mask_before_halt() -> bool { idle_can_halt() }
 
 pub fn idle_can_halt() -> bool {

@@ -602,7 +602,8 @@ impl HwClass {
         self != HwClass::None && self != HwClass::Framebuffer && self != HwClass::TestIrq
             && self != HwClass::WifiSdio && self.found()
     }
-    /// Arena size: xHCI needs room for its 256-buffer scratchpad; every other driver gets 64 KiB.
+    /// Arena size: a PCI spawn states its own (xHCI's room for its 256-buffer scratchpad among them); the
+    /// PWM audio jack gets `AUDIO_PWM_DMA_PAGES`; every other named class 64 KiB.
     fn dma_pages(self) -> u64 {
         match self {
             // The CALLER states it: how much DMA a driver needs is the driver's fact, and the

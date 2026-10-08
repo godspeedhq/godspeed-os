@@ -328,7 +328,8 @@ fn get_regaddr(h: &dyn SdioHost, w: &mut Window, at: &mut u32, ctx: &ServiceCont
     Some((regbase, wrapbase))
 }
 
-/// Walk the EROM and report every core, returning the two a firmware upload needs.
+/// Walk the EROM and report every core, returning the four the bring-up uses: the ARM, memory, SDIO
+/// device and 802.11 cores.
 pub fn scan(h: &dyn SdioHost, w: &mut Window, ctx: &ServiceContext) -> Option<Cores> {
     let eromaddr_reg = crate::backplane::CHIPCOMMON_BASE + CC_EROMPTR;
     let mut at = match w.read32(h, eromaddr_reg, ctx) {

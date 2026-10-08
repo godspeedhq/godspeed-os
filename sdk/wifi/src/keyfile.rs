@@ -9,8 +9,8 @@
 //! plain text. Nothing is encrypted at rest. There is no per-machine secret to encrypt with, and pretending
 //! otherwise would be the silent substitution 26.4 names.
 //!
-//! **The in-memory table stays the working set** (the radio driver's credential table; the Broadcom's is
-//! `Stored` in the serve loop, `serve.rs`). This file is where it is loaded
+//! **The in-memory table stays the working set** (the radio driver's credential table: `Stored` in the
+//! shared serve loop, `serve.rs`). This file is where it is loaded
 //! from when the radio comes up and written to after every change - a join that added or re-ordered a key,
 //! a `forget` - and where `fs` is absent or mid-restart the driver runs on the table alone, exactly as it
 //! did before the file existed. A load that cannot reach `fs` is retried a bounded number of times and

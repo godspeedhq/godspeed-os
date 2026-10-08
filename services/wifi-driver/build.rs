@@ -13,8 +13,8 @@
 //!   * `block-driver` on the Pi 4 is built `storage_is_usb`, so the disk is behind the **`xhci` service**.
 //!     The radio's firmware would then depend on the USB stack coming up AND a stick being plugged in -
 //!     a dependency chain three services long for a file that is already in this repository.
-//!   * it would need an `fs` send peer, which is new authority for a driver that has none (§3.1: granted
-//!     deliberately or not at all). Embedding needs no capability whatsoever.
+//!   * it would put the firmware behind the `fs` peer the driver holds only for `/wifi.keys` (it had none
+//!     when this was written). Embedding needs no capability whatsoever.
 //!   * and it would fail on any machine booted without storage, which is every first boot.
 //!
 //! So the service carries what it uploads, exactly as the supervisor carries the service ELFs it spawns.

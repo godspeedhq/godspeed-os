@@ -66,7 +66,8 @@
 //! reported separately (§30.6). A `datalen` consistent with the frame length is the self-check: if the
 //! offsets are wrong, `datalen` is nonsense, exactly as `frmlen ^ cksum` catches a frame that is not there.
 //!
-//! **None of this has run on hardware.** It was written away from the bench; §30 says so and so does this.
+//! Verified on hardware: ten networks on 2026-09-28 (docs/wifi.md 30). (This line said none of it had run
+//! on hardware, written away from the bench; corrected 2026-10-08.)
 
 use godspeed_sdk::ServiceContext;
 
@@ -81,6 +82,10 @@ pub const CHANNEL_EVENT: u8 = 0x01;
 /// `BWFM_SDIO_SWHDR_CHANNEL_DATA`.
 pub const CHANNEL_DATA: u8 = 0x02;
 /// `BWFM_SDIO_SWHDR_CHANNEL_GLOM` - several frames aggregated into one by the firmware.
+///
+/// **Corrected 2026-10-08: no longer ignored.** Superframes are read and split into sub-frames
+/// (`ctrl::subframes`) - the association events and handshake messages travel this way (docs/wifi.md 38) -
+/// and counted as `glom`. As written before that:
 ///
 /// **Ignored, and ignored on purpose.** The reference's receive path switches on CONTROL, EVENT and DATA and
 /// has **no GLOM case at all** - a glommed frame falls through and is dropped - and its scans work. So the
@@ -555,11 +560,6 @@ fn parse_results(payload: &[u8], scan: &mut Scan, ctx: &ServiceContext) {
     }
 }
 
-/// Read event frames for up to `ms`, feeding anything that parses into `scan`.
-///
-/// **Bounded, and it says which bound ended it.** The truth being waited on is the firmware reporting the
-/// scan complete; the deadline underneath is the bound §26.6 requires of every wait. Reporting which one
-/// finished is the difference between a result and a guess.
 
 /// Advance a running sweep by ONE frame. This is the body `collect` used to loop over, split out so the
 /// serve loop can do the same one frame at a time and still answer requests between frames - which is what
@@ -654,6 +654,11 @@ pub fn abort(h: &dyn SdioHost, w: &mut Window, s: &mut ctrl::Session, ctx: &Serv
     ctrl::set_cmd(h, w, s, CMD_SCAN, &params, "scan abort (a one-channel scan of channel -1)", ctx)
 }
 
+/// Read event frames for up to `ms`, feeding anything that parses into `scan`.
+///
+/// **Bounded, and it says which bound ended it.** The truth being waited on is the firmware reporting the
+/// scan complete; the deadline underneath is the bound §26.6 requires of every wait. Reporting which one
+/// finished is the difference between a result and a guess.
 pub fn collect(
     h: &dyn SdioHost,
     w: &mut Window,
@@ -690,10 +695,6 @@ pub fn collect(
     ));
 }
 
-/// Run a scan and report what came back.
-///
-/// Returns false when nothing was heard at all, which is a different outcome from "no networks here" and is
-/// reported as such.
 /// The bound on EMPTY polls before giving up on a firmware that never says the scan is over. Not a
 /// duration: each empty poll is one CMD53 and a 1 ms sleep, so this is on the order of tens of seconds
 /// of silence, and the log says which of the two ended the wait. The scan itself ends when the firmware

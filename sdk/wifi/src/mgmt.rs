@@ -149,7 +149,7 @@ pub fn ht_cap(ies: &[u8]) -> Option<HtCap> {
     Some(HtCap { cap: u16::from_le_bytes([e[0], e[1]]), mcs: [e[3], e[4]] })
 }
 
-/// Management subtype Action (9.3.3.13), and the Block Ack category's ADDBA request and response.
+/// Management subtype Action (9.3.3.14), and the Block Ack category's ADDBA request and response.
 const FC_ACTION: u8 = 0xD0;
 const CATEGORY_BLOCK_ACK: u8 = 3;
 const ADDBA_REQUEST: u8 = 0;

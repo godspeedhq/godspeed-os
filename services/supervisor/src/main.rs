@@ -615,10 +615,11 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // supervisor spawned as `wifi-driver` got the radio (`docs/audio.md`, "No service names in the
     // kernel").
     //
-    // No DMA arena and no interrupt, deliberately: every command this phase issues rides the SDIO
-    // command line and completes in microseconds. Both arrive with the firmware upload that needs
-    // them, which is how a capability stays something granted for a reason (§3.1).
-    // NO SEND PEERS. The obvious one to grant is `events`, and every other driver here has it - but
+    // No DMA arena and no interrupt, deliberately: the firmware upload and every frame move by PIO
+    // (the contract says the same, and that it stays true), so neither was ever needed. This said both
+    // would arrive with the upload; it came without them (corrected 2026-10-08).
+    // Its send peers are `fs` (for `/wifi.keys`) and `power` (the Arm clock lease), in the row below.
+    // NOT `events`, though every other driver here has it - the reasoning as written when it had none:
     // it buys exactly one thing, automatic IPC tracing, and this service makes almost no IPC calls in
     // this phase. Everything it reports goes through `ctx.log()`, which is the kernel ring and the
     // serial line and needs no capability at all (§11.4). A grant that buys nothing is standing

@@ -2,7 +2,8 @@
 //! The USB WiFi dongle, behind `xhci` (U2, `docs/wifi-usb.md` 7 for the design, 25 and 27 for U2a, 28 for
 //! U2b, 29 for U2c). This host binds it by VID:PID and serves
 //! `godspeed_wifi::usbfn` for it to `wifi-usb` - the protocol `dwc2` serves on the Pi 2, answered the same
-//! way, so the dongle's driver cannot tell the hosts apart.
+//! way for everything the driver depends on; this host adds `OP_INFO`'s optional location part, which
+//! `dwc2` does not send.
 //!
 //! **U2a (2026-10-06): who it is, and its control transfers, both directions.** That is everything
 //! `wifi-usb`'s bring-up asks of a host up to and including the firmware, the MAC, baseband and RF tables
@@ -38,8 +39,8 @@ use crate::{
     TRB_DATA_STAGE, TRB_LINK, TRB_NORMAL, TRB_SETUP_STAGE, TRB_SIZE, TRB_STATUS_STAGE, TRB_TRANSFER_EVENT,
 };
 
-/// The bulk IN ring: the second half of the slice's report page, whose first half is EP0's data stage
-/// (`usbfn::CONTROL_MAX` bytes). Its received transfer lands in the slice's interrupt-ring page, which the
+/// The bulk IN ring: the second half of the slice's report page, whose first half holds EP0's data stage
+/// (`usbfn::CONTROL_MAX` bytes) and the bulk OUT rings (`OUT_RINGS_AT`). Its received transfer lands in the slice's interrupt-ring page, which the
 /// dongle has no interrupt endpoint to use - a data buffer, so the VL805 reading past the EP0 ring into it
 /// does no harm.
 pub const IN_RING_AT: usize = 0x800;
@@ -217,7 +218,8 @@ impl Radio {
 /// One EP0 ring's bytes - a page, the slice's.
 const RING_BYTES: usize = 0x1000;
 /// How long one control transfer may take. A register access is a few hundred microseconds; the bound is
-/// for a dongle that stopped answering, and it sits well inside `wifi-usb`'s two-second wait on the host.
+/// for a dongle that stopped answering. `CONTROL_TRIES` of these add up to `wifi-usb`'s two-second wait
+/// on the host (`HOST_SECS`), so a dongle that never answers can use all of it.
 const CONTROL_MS: u64 = 500;
 /// Completions for anyone else - other slots, or another endpoint of this one - tolerated while waiting for
 /// ours: an event storm must not livelock the wait.

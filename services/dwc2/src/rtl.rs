@@ -172,7 +172,7 @@ const HS_BULK_MPS: u16 = 512;
 
 /// Bind the dongle as the radio: configured, as Linux's USB core configures a device before a driver sees
 /// it - this host never did, and control transfers worked without it, but a bulk endpoint exists only in a
-/// configured device - then milestone 1's two reads, then its bulk IN found. Bound whatever happens, so
+/// configured device - with its bulk endpoints found, then milestone 1's two reads. Bound whatever happens, so
 /// `wifi-usb` reaches its registers and says itself what failed.
 pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, pid: u16, gen: u32) -> Radio {
     stop(ctx, mmio);
@@ -544,7 +544,8 @@ const DRIVER_QUIET_MS: u64 = 5;
 const CONTROL_TRIES: u32 = 4;
 
 /// Serve one `usbfn` request for the bound radio - `None` when none is bound - and answer on `reply`, which
-/// this reclaims. Every op is answered, a request for a radio that is not here included, so a client is
+/// this reclaims. Every op but `OP_SYNC` (never answered, by design) is answered, a request for a radio
+/// that is not here included, so a client is
 /// never left to time out against a clean log.
 pub fn serve(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, radio: Option<&mut Radio>, msg: &Message, reply: Cap,
@@ -653,8 +654,7 @@ fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], t
 ///
 /// What the reads DO establish, which is the whole point of the increment:
 ///   * the vendor control interface works in both directions of setup,
-///   * the chip is powered and clocked enough to answer,
-///   * and the two offsets differ, so the answer is a register file rather than one latched value.
+///   * and the chip is powered and clocked enough to answer.
 ///
 /// `0x00000000` and `0xFFFFFFFF` are both treated as failures: a floating bus and a dead chip read as
 /// those, and accepting either would let this report success on a device that never replied. That is

@@ -42,7 +42,8 @@ on every run so a drop is visible, and entries that are no longer needed are nam
 can be tightened rather than quietly carried.
 
 SCOPE. Rust under `kernel/src`, `services`, `sdk/rust/src`, `sdk/wifi/src`, `stdlib/rust/src`, `osdev/src` and
-`examples`. Names are matched only in backticks and only when they carry an underscore, because a
+`examples`. Names are matched only in backticks: snake_case or SCREAMING_CASE with an underscore, CamelCase
+(backlog/58), and the last segment of an `a::b` path; each must equal a whole identifier in code. A
 single bare word in a comment is prose far more often than it is an identifier - the same rule
 `doc_symbols_check` settled on for the same reason.
 """
