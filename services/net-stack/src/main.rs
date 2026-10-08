@@ -3591,11 +3591,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if gw_known {
                 // THE CLIENT'S OWN PATIENCE, halved, because this tries TWO servers.
                 //
-                // Byte 1 of every request is the caller's deadline in seconds. Reserve `DNS_REPLY_MARGIN_SECS`
-                // so the answer still has time to travel back, then split what is left between the two
-                // attempts - otherwise the first server's timeout consumes the whole window and the
-                // second is asked a question nobody is waiting for.
-                let patience = pl.get(1).copied().filter(|p| *p > 0)
+                // Byte 1 of every request's HEADER is the caller's deadline in seconds - the header the
+                // dispatch above strips off `pl_raw`, so it is read there, not from `pl`. Reserve
+                // `DNS_REPLY_MARGIN_SECS` so the answer still has time to travel back, then split what is
+                // left between the two attempts - otherwise the first server's timeout consumes the whole
+                // window and the second is asked a question nobody is waiting for.
+                //
+                // THIS READ `pl.get(1)`, which is the first letter of the host name: `g` is 103, so a
+                // lookup of google.com waited 50.5 s per server. Invisible while a fixed twelve polls
+                // bounded the wait (about 130 ms); `20e43490` made the clock the bound, and on the T630
+                // on 2026-10-08 a lookup over a dead link held `net-stack` for 50 s and the shell said
+                // "net-stack unavailable". A request with no header (shorter than its two bytes) says
+                // nothing about its patience and gets `CLIENT_MIN_DEADLINE_SECS`.
+                let header_patience = if pl_raw.len() == pl.len() + 2 { pl_raw.get(1).copied() } else { None };
+                let patience = header_patience.filter(|p| *p > 0)
                                  .map(|p| p as i64).unwrap_or(CLIENT_MIN_DEADLINE_SECS);
                 let usable = (patience - DNS_REPLY_MARGIN_SECS).max(1);
                 let per_server_ms = ((usable * 1000) / 2).max(500) as u64;
