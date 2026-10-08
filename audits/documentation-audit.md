@@ -1148,3 +1148,65 @@ is about the idle halt and true; `dispatch.rs`'s `build_message` and `copy_out`.
 (`docs/wifi.md` 3439, the earlier entries of `backlog/66`). The one-byte replies themselves are left in the
 code: they are correct protocol with or without the kernel's refusal, and changing them is a code change,
 not an audit.
+
+## Audit 11 - documents and code comments, `feat/wifi-driver` since `7a41ab42` (2026-10-08)
+
+Scope: everything changed since Audit 10 - six commits: the drop-rejoin (`9261f7d5`), the hardware record
+of the three boards (`70d0d41b`, `7c40ac94`), `net-stack`'s DNS wait on the clock (`20e43490`), the
+liveness panic's since-the-stamp counts (`1c35b4b4`), and `wifi-usb` bringing a down radio up again
+(`32798620`) - and what they made untrue elsewhere. The mechanical gates (`dash_check`, `doc_refs`,
+`docs_index_check`, `doc_symbols_check`, `comment_symbol_check`, `facts_check`, `line_ref_check`,
+`site_check`, `backlog_check`, `foreign_word_check`, `doc_command_check`, `line_ending_check`) were green
+before and after; nothing below is a thing they can see.
+
+**This session's own comments, left untrue by its own code.** `dns_resolve`'s doc said it gives up at an
+absolute TSC `deadline`; since `20e43490` it takes `budget_ms` and starts its own clock. `DNS_BUDGET_SECS`
+said it was the default budget for a request with no patience byte; the default has been
+`CLIENT_MIN_DEADLINE_SECS` throughout, and after `20e43490` nothing reads the constant as a budget at all.
+Both corrected. The second is also a finding about a gate: the assertion beside the constant and
+`scripts/facts_check.py`'s budget ordering both check it, so the ordering rule is checked against a number
+that bounds nothing - the real wait is the client's patience less `DNS_REPLY_MARGIN_SECS`, halved per
+server. Recorded at the constant, not changed: removing it is a change to a gate (CLAUDE.md 21).
+
+**A drop-rejoin documented for a radio that cannot see a drop.** `utilities/56_wifi.md` says an access
+point that drops the link is rejoined once. True of the Pi 4's and the VisionFive's onboard radios, whose
+frame pulls report the drop. `wifi-usb`'s pull reports none - it watches for a deauthentication only during
+the handshake - so a dongle the access point drops reads as joined and is not rejoined. Recorded in the
+spec as a limitation. The same bullet's first half said a drop is NOT noticed behind a cable that is in;
+the driver's idle read, every 250 ms while joined, notices it there too, and the next sentence of the same
+bullet already said so. Corrected.
+
+**`chaos max-carnage` without a target, refused by the shell since July and documented anyway.**
+`0cb8985b` (2026-07-09) made the shell require a target and a round count. `utilities/38_chaos.md` section
+5b still gave `chaos max-carnage [rounds]`, a bare example command, a sample report from the one-victim
+form, the restarted set as a fixed list, and a note that `events`, `xhci` and `ehci` are not watched -
+they are, as `MANAGED` members (`services/CLAUDE.md`); section 8 named a test command `osdev test shell`
+does not send. All corrected, and the sample is now marked as the old form beside a real report from the
+T630. `docs/wifi-usb.md` carried the bare form five times in this branch's own records (sections 47 and
+50) and `backlog/02` once as an instruction; every `max-carnage` panel in this session's logs reads
+`target: all-services`, and the shell refuses the bare form, so they now say `all-services`. Found while
+writing the T630 test instructions, which gave the bare form and were refused. **A gate finding:**
+`doc_command_check` asks whether a documented subcommand exists, not whether its arguments are ones the
+shell takes, so a refused invocation passes it. `chaos`'s own comment said `all-services` swept every
+live service each round, contradicting the comment under it and the logs (4 to 12 a round on the T630);
+corrected.
+
+**Stale beside the new instrument:** the panic site's comment said the interrupt tally tells the two
+wedges apart; one since-boot reading cannot, which is what `1c35b4b4` is for. It says so now. The kernel
+audit's A9-5 made the same claim ("the next reproduction now carries real evidence"); an appended entry
+there records the second A9-4 sighting and what A9-5 could not tell.
+
+**Not recorded anywhere until now:** the T630's three cards today. `docs/wifi-usb.md` section 51 and the
+index entry carry them, including the fault left open (a dongle that stops transmitting after an `xhci`
+restart under it) and the DNS-after-idle case that has not been re-run.
+
+**Checked and correct, recorded so it is not re-chased:** `rejoin_after_drop` and its three call sites
+against `utilities/56_wifi.md` (`REJOIN_MIN_SECS` 60, once per drop, through `auto_join`, which honours
+`/wifi.radio`); `IDLE_PULL_MS` 250; `UDP_BUDGET_MS` 3000 against `SOCKET_SECS` 30; both reply waits on
+`Deadline::paced`; the rebind comment in `wifi-usb`'s `rx.rs` against `main.rs` (`serve` returns only on
+`Notice::Changed`, and `said` is cleared only with no station up); section 50's counts against its commits.
+
+**Left as they are:** dated records that use the bare form before `0cb8985b` or whose target cannot be
+recovered (`backlog/03`'s 2026-09-06 sighting, `backlog/14`, `backlog/48`, `backlog/57`, and CLAUDE.md's
+2026-08-09 amendment, which is prose, not a command), and `backlog/31`'s `DNS_RX_TRIES`, history of the
+fix before this one.

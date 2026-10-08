@@ -2777,7 +2777,7 @@ decrypt`; pings 2/2, 3/3, 2/2, 3/3, 3/3 and one 3 of 5 just after a move. No pan
 
 ## 47. A 1000-round chaos run on the Pi 2, and the 18 `selfcheck` failures after it: the ARMv7 page-table arena (2026-10-07) - a kernel change, operator-approved; hardware-verified on the Pi 2
 
-**The run.** Cable out, dongle in: `chaos max-carnage 1000` - 1000 rounds, 6405 kills, no kernel panic,
+**The run.** Cable out, dongle in: `chaos max-carnage all-services 1000` - 1000 rounds, 6405 kills, no kernel panic,
 every service back - then `selfcheck`: 517 run, **18 failed**. Every failure was one cause: an on-demand
 program - `greet`, `upper`, `roster`, `copier` - could not be started, `supervisor: spawn '...' from image
 FAILED (InvalidArgument)`. The same refusal hit chaos itself from its first round: 982 of its 1000
@@ -2819,11 +2819,11 @@ services run, `observe now` runs. The exhausted-arena line has not fired in QEMU
 enough distinct tasks.
 
 **Prediction, Pi 2, the same card as before:** `selfcheck` with no failures from a refused spawn; then a
-short `chaos max-carnage 100` whose report shows few refused spawns and not the "none ran" note, and no
+short `chaos max-carnage all-services 100` whose report shows few refused spawns and not the "none ran" note, and no
 `arena is full` line in the log.
 
 **The card's run (Pi 2, 2026-10-07), the chaos half.** `loader selftest's page table returned` at boot.
-`chaos max-carnage 1000`: 6726 kills, no kernel panic, every service back, the dongle receiving
+`chaos max-carnage all-services 1000`: 6726 kills, no kernel panic, every service back, the dongle receiving
 afterwards; report `1000 spawns (999 refused)` - and every refusal in the kernel log is `rejected: already
 running`, the by-design one (the first `mem-pressure` runs and holds memory; later ones are refused by
 name). No `FrameAllocFailed`, no `arena is full` - against 1799 arena refusals on the same card before the
@@ -2980,10 +2980,10 @@ What changed since section 49, all of it on the cards below:
 
 | Board | radio | `net dns example.com` | chaos | after chaos | `selfcheck` |
 |---|---|---|---|---|---|
-| VisionFive 2 Lite (`0a179048`) | AIC8800, onboard | 9 of 9 at boot | `max-carnage 1000`: 7019 kills, kernel alive | the radio rejoined on its own (as a stand-in, section 49) | 526 run, 0 failed - before chaos, and after a `wifi join` |
+| VisionFive 2 Lite (`0a179048`) | AIC8800, onboard | 9 of 9 at boot | `max-carnage all-services 1000`: 7019 kills, kernel alive | the radio rejoined on its own (as a stand-in, section 49) | 526 run, 0 failed - before chaos, and after a `wifi join` |
 | VisionFive 2 Lite (`9261f7d5`) | AIC8800, onboard | - | `max-carnage all-services 100`: 701 kills, `wifi-driver` killed 24 times | rejoined on its own; `ping` 4 of 4 | - |
 | Raspberry Pi 4 (`9261f7d5`) | CYW43455, onboard | 7 of 7 at boot, 6 of 6 after chaos | `max-carnage all-services 1000`: 7488 kills, kernel alive | rejoined on its own 8 s after; `ping` 2 of 2 | 526 run, 0 failed, 0 skipped |
-| Raspberry Pi 2 (`9261f7d5`) | RTL8188CUS dongle | 9 of 9 after chaos | `max-carnage 1000`: 6682 kills, kernel alive, no page-table arena refusal (section 47) | the dongle rejoined on its own 6 s after; `ping` 2 of 2 | 517 run, 0 failed, 1 skipped (`hw-enumerator`: no PCI) |
+| Raspberry Pi 2 (`9261f7d5`) | RTL8188CUS dongle | 9 of 9 after chaos | `max-carnage all-services 1000`: 6682 kills, kernel alive, no page-table arena refusal (section 47) | the dongle rejoined on its own 6 s after; `ping` 2 of 2 | 517 run, 0 failed, 1 skipped (`hw-enumerator`: no PCI) |
 
 The VisionFive also resolved twenty of twenty over WiFi on `e3fcf7ed`, and with the cable in, before the
 instruments came out.
@@ -2999,3 +2999,42 @@ instruments came out.
   why; the kernel's `already running` before it does.
 - **`reply send FAILED` lines** in the chaos runs are all inside them, from requesters chaos had killed.
 - **The Pi 4's `selfcheck` DNS check passes again** - the one it failed on 2026-10-07, section 49.
+
+## 51. The T630 on the same build (2026-10-08): DNS over the dongle 20 of 20; what three chaos runs found, and what answers each - partly hardware-verified
+
+The fourth board, and the first PC, on the build of section 50 (`9261f7d5`, imaged at `7c40ac94`), with
+the RTL8168's cable out and the RTL8188CUS dongle carrying the link through `xhci`.
+
+**The first card.** `net dns` resolved 20 times of 20 at boot (`google.com` 12, `example.com` 8), the
+gateway pinged, and `selfcheck` ran 524, 0 failed, 0 skipped. `chaos max-carnage all-services 1000` ran
+1000 rounds - 7442 kills, 495 of them `xhci` - with the kernel alive, and the dongle rejoined on its own,
+leased and pinged. Then three faults, one per run:
+
+- **DNS gave up in 130 ms per server** (`20e43490`). After six idle minutes two lookups failed in a
+  quarter second, `0 frames, 0 UDP, 0 timeouts`, with the radio receiving throughout. `net-stack`'s DNS
+  wait had a clock budget and a backstop of twelve polls 10 ms apart; until `e3fcf7ed` an empty drain cost
+  a one-second timeout here, so the clock bound first, and once it answered at once the count did. A
+  lookup slower than 130 ms - a resolver's cold cache - failed. Both of `net-stack`'s reply waits are on
+  a `gs` paced deadline now. On the T630 since: 6 of 6 at boot, and after chaos 4 of 4 and `selfcheck`'s
+  own. **The case that failed - a lookup after several idle minutes - has not been run again.**
+- **The dongle stopped transmitting after `xhci` was restarted under it** (not answered). Three rounds
+  into a second all-services run, `xhci` was killed while `wifi-usb`, joined, survived. The respawned
+  host set the dongle up again and its first bulk OUT never completed (`cc=0`, three times); from then
+  every frame it sent failed, receiving kept working, and a fresh `wifi-usb` with clean firmware could
+  not send either. Unplugging and replugging the dongle cleared it. Once in roughly 500 `xhci` restarts
+  that day; the trigger is not shown.
+- **A bring-up `xhci`'s death cut short stayed down** (`32798620`, built, not yet on hardware). In a
+  100-round run chaos killed `xhci` during `wifi-usb`'s efuse read. The respawned host bound the same
+  dongle and said so, and `wifi-usb`, judging a binding change by its IDs, took it as a repeat and
+  answered `radio down` until `wifi radio on` restarted it - which joined in 3 s. A down radio now takes
+  that notice as a new binding and is brought up again; with a station up a repeat is still ignored.
+
+**A liveness wedge, after a 100-round run on `20e43490`.** Eight seconds after the run returned, the
+kernel's watchdog stopped the machine: core 2, idle, had stamped no progress for 3 s. This is the
+kernel audit's open A9-4 on another core; the panic's interrupt count was since boot, which cannot tell a
+timer that stopped arriving from a stamp that was skipped, so `1c35b4b4` makes it print the counts
+since the last stamp. The next 100-round run did not wedge, so that reading is still owed.
+
+**Read with them:** `PANIC in service ... recv failed: EndpointDead` lines during chaos are services
+dying on purpose after their endpoint was killed; `a request arrived with no reply cap` from `wifi-usb`
+is chaos's flood.

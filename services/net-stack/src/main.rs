@@ -82,7 +82,6 @@ const DANCE_TRIES: u32 = 6;
 // DNS collects frames after ONE query TX (the [4] RX-only path): frames pulled without
 // re-transmitting, so a reply behind stray broadcasts is caught (a re-TX would drain+discard it).
 //
-//
 // THE CLOCK BOUNDS THESE POLL LOOPS, NOT A COUNT - a `gs` paced `Deadline`, which falls back to as many
 // looks as the pace fits into the budget only on a machine whose clock is uncalibrated. Both loops were
 // bounded by a fixed twelve polls, and a count is not a duration in EITHER direction: twelve polls that
@@ -110,8 +109,14 @@ const CLIENT_MIN_DEADLINE_SECS: i64 = 8;
 /// the exact moment the caller gives up, and the reply would land stale anyway.
 const DNS_REPLY_MARGIN_SECS: i64 = 2;
 
-/// The DEFAULT budget for one DNS resolve, used when a request carries no patience byte (a background
-/// lookup, or an older client). A request that states its own patience overrides this.
+/// **Corrected 2026-10-08: nothing reads this as a budget any more.** It said it was the default budget
+/// for a resolve whose request carries no patience byte; that default is `CLIENT_MIN_DEADLINE_SECS`, and
+/// since `20e43490` each server's wait is the client's patience less `DNS_REPLY_MARGIN_SECS`, halved - 3 s
+/// each for the shell's 8. What still reads this number is the assertion below and `scripts/facts_check.py`'s
+/// budget ordering: the rule they state is right, and the number they check bounds nothing. Recorded
+/// rather than removed, because removing it changes a gate (CLAUDE.md 21).
+///
+/// The rule, as it was written:
 ///
 /// **THIS MUST BE LESS THAN THE CLIENT'S DEADLINE, and that is the whole point.** When this service
 /// can spend longer on a request than its caller will wait, the caller ALWAYS gives up first and the
@@ -1088,7 +1093,7 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
 /// standard A-record query, sends it THROUGH nic-driver, and parses the first A answer. Returns the
 /// IP, or None (no gateway, malformed name, or no answer - DNS depends on the host's resolver, which
 /// slirp forwards to, so a failure here is a real "no answer", not a bug).
-/// Resolve `hostname`, giving up at `deadline` (absolute TSC) whatever state it is in.
+/// Resolve `hostname`, giving up once `budget_ms` has passed, whatever state it is in.
 ///
 /// **The deadline comes from the CLIENT, not from a constant here.** Every request carries its
 /// caller's patience on the wire (`ns_build` puts it at byte 1), and this service already reads it to

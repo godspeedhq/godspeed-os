@@ -123,15 +123,16 @@ blocking `send`** (§8.9): blocking into a full queue would hang the shell flood
 
 ## 5b. `max-carnage` - the chaos monkey
 
-`chaos max-carnage [rounds]` reads the **live task set** (exactly what `observe now` shows) and, each
-round, picks **one at random** and rolls a **creative action mix** - kill, flood, flood-then-kill, or
+`chaos max-carnage <target> <rounds> [yes]` reads the **live task set** (exactly what `observe now`
+shows) and, each round, picks its victims by the target - `all-services` a random subset of every live
+service, a service name that one, a comma list every one listed - and rolls a **creative action mix** - kill, flood, flood-then-kill, or
 kill-then-flood (the §8.6 queue-drained-on-death and EndpointDead-back-pressure cases) - everything is
 fair game **except the shell** (killing it would kill
 this very command, which runs *inside* the shell) and the **kernel** (not a task, cannot be killed).
 The shell is itself restartable - a direct `kill shell` respawns a fresh prompt - but `max-carnage`
 can't be the one to kill it, because a fresh shell wouldn't resume the in-flight carnage loop.
-Directly-restarted victims (the whole named set - supervisor, block-driver, fs, shell, xhci, ehci,
-events) are confirmed back up each round; only demo services like `ping`/`pong` (full build) revive on
+Directly-restarted victims (every service in the supervisor's `MANAGED` set) are confirmed back up
+each round; only demo services like `ping`/`pong` (full build) revive on
 the next supervisor respawn (see below). The victim is chosen with a tiny `xorshift64` PRNG seeded
 from the **TSC** (so the sequence differs every run).
 
@@ -148,7 +149,7 @@ shows progress, a running ETA, and the abort hint - `q` stops it early. The fina
 line:
 
 ```
-gsh> chaos max-carnage 1000000
+gsh> chaos max-carnage all-services 1000000
 chaos max-carnage: 1000000 rounds - kill a RANDOM live service each round (all but the shell). Press q to quit.
 max-carnage: 250000 / 1000000 (25%) - 250000 kills - ETA 9m00s - kernel alive - q to quit   ← live, refreshes in place
 === chaos max-carnage: report ===
@@ -165,6 +166,19 @@ survivors (live now): supervisor events block-driver fs shell xhci ehci  (7 live
 verdict: PASS (kernel survived)
 ```
 
+**Corrected 2026-10-08.** This section described `chaos max-carnage [rounds]` until today. Since
+`0cb8985b` (2026-07-09) the shell refuses a run without a target and a round count, and the sample
+report above is the one-victim form from before that, and before floods, memory pressure and spawns
+joined every round. The serial report ends with one line now; on the T630 on 2026-10-08:
+
+```
+=== chaos max-carnage: report ===
+total: 100 rounds, 783 kills, 682 flooded, 100 mem-pressure, 100 spawns (99 refused). kernel: alive (this command returned).
+```
+
+`99 refused` is by design: the first `mem-pressure` holds its memory until the run ends, and every later
+one is refused as already running.
+
 All output is **ASCII** (the framebuffer font has no em-dash/ellipsis - they render as `?` on the
 panel) and `[q] quit` matches the rest of the shell (`observe`, `paginate`).
 
@@ -177,6 +191,10 @@ panel) and `[q] quit` matches the rest of the shell (`observe`, `paginate`).
 > max-carnage 30` killed the supervisor 6× and every service was alive again at the end (`observe`:
 > xhci/ehci/events all `Ready`, no kernel panic). A *re-init*, not a resume (§14.2/§25) - a revived
 > driver re-enumerates its devices and resumes polling; in-flight state is not preserved.
+>
+> **Corrected 2026-10-08:** `events`, `xhci` and `ehci` are watched now - every service in the
+> supervisor's `MANAGED` set is respawned on its own death (`services/CLAUDE.md`) - so the tree no
+> longer waits for a supervisor kill to regrow. The T630 run above is from when it did.
 
 ## 6. Capabilities
 
@@ -200,7 +218,8 @@ explicit, through `chaos kill-storm supervisor`.
 ## 8. Tested
 
 - `osdev test shell` - `chaos kill-storm block-driver 5` (5/5), `chaos kill-storm supervisor 4` (4/4),
-  and `chaos max-carnage 8` (kernel survived the random carnage), each asserting the kernel stays alive.
+  and `chaos max-carnage all-services 5` (a report with its round count, kills and floods, and the
+  kernel alive), each asserting the kernel stays alive.
 - `osdev test files` - `chaos kill-storm fs` storms + the directory-reacquire regression (a client
   reacquires `fs` by name after its restart).
 - Hardware-proven on the HP T630: `chaos kill-storm fs 30` → 30/30; the supervisor stormed dozens of

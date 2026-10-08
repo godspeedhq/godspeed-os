@@ -94,9 +94,10 @@ What every verb does, and what was seen:
   the sentence names the network only. `wifi info` reads both live, so they are one command away.
 - An access point that drops the station is noticed by the frame pull - the next time the stack asks for
   frames, which is every hundred milliseconds while there is a link - and by `wifi status` or `wifi
-  info` reading the link. It is NOT noticed while the radio is standing by behind a cable that is in,
-  because nobody is pulling then; the driver still does not watch `LINK` events on its own. Joined and
-  idle, the driver's own loop reads the radio every 250 ms, so a drop is noticed then too.
+  info` reading the link - and, joined and idle, by the driver's own loop, which reads the radio every
+  250 ms, standing by behind a cable that is in included. (This said a drop was NOT noticed behind a
+  cable, which stopped being true when that read was added; corrected 2026-10-08.) The driver still
+  does not watch `LINK` events on its own.
 - **A drop is rejoined once.** When the access point drops a link that had lasted a minute or more, the
   driver rejoins the same network with the key it holds, through the same path as the boot rejoin - so
   it honours `/wifi.radio` - and says `joining the network last joined, after the access point dropped
@@ -104,6 +105,10 @@ What every verb does, and what was seen:
   is NOT rejoined, and the line says so - an access point that drops every join would otherwise be
   rejoined forever. (Seen 2026-10-08: a VisionFive idle for half an hour, disassociated for inactivity,
   reason 4.)
+- **Not on the USB dongle.** `wifi-usb` reports no dropped link from its frame pull - it looks for the
+  access point's deauthentication or disassociation only during the handshake - so a dongle the access
+  point drops goes on reading as joined, and is not rejoined; `wifi join` brings it back. The onboard
+  radios (the Pi 4's and the VisionFive's) report the drop. Recorded 2026-10-08.
 
 One limitation of the record format, recorded rather than left for a pipe to find: SSIDs may contain
 spaces, and `ssid` is the first field, so a positional filter on the second field will misread such a row.

@@ -1677,6 +1677,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // The IRQ tally is what tells a reader WHICH wedge this is: a frozen count
                     // means the core is not taking interrupts at all, a climbing one means it is and
                     // the tick inside the handler is being skipped. Same symptom, opposite causes.
+                    // One since-boot reading shows neither - frozen and climbing need two - which is why
+                    // the panic now prints the count since the core's last stamp (`CORE_IRQS_AT_STAMP`).
                     let (irqs, last_src) = crate::arch::imp::core_irq_debug(other as u32);
                     // SINCE THE LAST STAMP, which is the reading that separates the two causes; the
                     // since-boot total above cannot (see `CORE_IRQS_AT_STAMP`). The count is a u32

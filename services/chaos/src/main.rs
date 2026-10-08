@@ -281,10 +281,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.yield_cpu();
         }
     }
-    // The TARGET: DEFAULT (no target) = "random" - a RANDOM subset of the restartable set each round (the
-    // honest chaos-monkey storm; supervisor is a normal victim, nothing protected-last). "all-services" =
-    // a full even sweep of every live service each round; a service name = aim every round at THAT one; a
-    // comma-list = kill every listed one each round. mem-pressure + spawn-storm are system-wide in all modes.
+    // The TARGET, which the shell requires (`0cb8985b`): "all-services" = a RANDOM subset of the live set
+    // each round (the honest chaos-monkey storm; supervisor is a normal victim, nothing protected-last); a
+    // service name = aim every round at THAT one; a comma-list = kill every listed one each round. (This
+    // said "all-services" was a full even sweep of every service each round, which the line below
+    // contradicts and the logs do too: a 100-round run on the T630 swept between 4 and 12 a round.) mem-pressure + spawn-storm are system-wide in all modes.
     let target: &str = if tlen == 0 { "random" } else { str_of(&tbuf[..tlen]) };
     // all-services = the RANDOM whole-set storm (a random subset each round). The shell now REQUIRES a target
     // (a bare max-carnage is refused there), so tlen==0 should not occur; keep it -> random defensively.

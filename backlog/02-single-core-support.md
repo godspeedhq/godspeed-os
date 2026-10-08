@@ -248,5 +248,5 @@ BUS - freezing every core... the log died between `halted` and `done`".
    silently ignores every pin, so nothing learned about placement is trustworthy.
 2. Run the STORAGE build single-core (`osdev test script --smp 1` equivalent) and get a selfcheck
    tally. That is the real test: `fs` and `block-driver` on one queue with the shell.
-3. Run `chaos max-carnage 100` single-core. Expect this to be the one that finds something.
+3. Run `chaos max-carnage all-services 100` single-core. Expect this to be the one that finds something.
 4. For each pinned contract, record the reason or remove the pin.

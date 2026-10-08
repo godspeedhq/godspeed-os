@@ -1843,3 +1843,26 @@ violation is the wrong fix.
 Recorded rather than papered over (§26.7): the fix touches the most safety-critical output path in
 the system, on a defect that predates this branch, so it is written down for a decision rather than
 changed unprompted alongside unrelated work.
+
+## A9-4 seen again, and what A9-5 could not tell (2026-10-08, `feat/wifi-driver` @ `20e43490`)
+
+**A9-4, a second sighting, on another core.** On the T630, eight seconds after `chaos max-carnage
+all-services 100` returned:
+
+```
+LIVENESS WEDGE: core 2 made NO progress for 6000714568 counter ticks (1x the 5988721200 allowed); it was
+running IDLE (no task) 0 ''; it has taken 57444 timer interrupts, last vector 0x00000020; detected by core 0.
+```
+
+The first was core 0 at boot. This is an application core, idle, after a storm - so the hole is not only
+the BSP's, and `rearm_quantum_timer`'s four call sites still do not show which path halts with no wake
+armed.
+
+**A9-5's instrument could not answer the question it was added for.** A9-5 says the count separates the
+two causes - a frozen count, the timer stopped reaching the core; a climbing one, the handler skips the
+stamp - and that A9-4's next reproduction "now carries real evidence". A since-boot total from one panic
+is neither frozen nor climbing; it is nonzero in both cases. `1c35b4b4` records each core's interrupt and
+idle-halt counts at every progress stamp and the panic prints both since the last one: 0 interrupts since
+means the timer stopped arriving, and a halt since the stamp with nothing after it means the core slept
+with no wake armed. The next 100-round run on the T630 did not wedge, so A9-4 stays OPEN with that
+reading owed.
