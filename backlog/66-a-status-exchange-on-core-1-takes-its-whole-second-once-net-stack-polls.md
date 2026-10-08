@@ -1,6 +1,6 @@
 # 66. A STATUS exchange between net-stack and nic-driver takes its whole second once net-stack is polling, and two fixes that should have touched it did not
 
-**Status: FIXED 2026-10-08 (`e3fcf7ed`) for what this item had become - `net dns` failing over the radio: an empty reply was refused by the kernel on every port but ARM32 (the last entry below). Verified on the VisionFive over WiFi and over the cable; the Pi 4 has not yet run the fixed build. The item's FIRST form, a STATUS exchange (op 3) taking its second, is not explained by it - a STATUS reply is never empty - and had stopped appearing by 2026-10-04 (below). Was: PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well.**
+**Status: FIXED 2026-10-08 (`e3fcf7ed`) for what this item had become - `net dns` failing over the radio: an empty reply was refused by the kernel on every port but ARM32 (the last entry below). Verified on the VisionFive over WiFi and over the cable, and on the Pi 4 over WiFi (`9261f7d5`, the same day). The item's FIRST form, a STATUS exchange (op 3) taking its second, is not explained by it - a STATUS reply is never empty - and had stopped appearing by 2026-10-04 (below). Was: PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well.**
 **Found:** 2026-09-30 on the Pi 4, as `ping` over the radio running at one echo every three seconds.
 
 **2026-10-02, the symptom is mostly gone, and nobody fixed it on purpose.** The boot of commit `5dd1f1b8`
@@ -224,3 +224,10 @@ the cable in. The instruments came out in `b77c7dd5`, and `osdev test shell` no 
 dns` that `net-stack` did not answer - accepting that is how x86 hid it. Two readings made on the way
 were wrong and are recorded as such: that `net-stack`'s self-grant was being replaced, and that replies
 were addressed to another endpoint. The recorder showed neither.
+
+**2026-10-08, the Pi 4 on the fixed build (`9261f7d5`), cable out, WiFi carrying the link.** `net dns
+example.com` resolved seven times of seven at boot; `chaos max-carnage all-services 1000` ran 1000 rounds,
+7488 kills, the kernel alive, and the radio rejoined on its own 8 s after the run; then `ping 8.8.8.8` 2 of
+2, `net dns example.com` six of six, and `selfcheck` 526 run, 0 failed, 0 skipped - its DNS check among
+them, the one the Pi 4 failed on 2026-10-07. The `reply send FAILED` lines in that log are all inside the
+chaos run, from requesters it had killed.
