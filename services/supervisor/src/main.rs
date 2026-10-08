@@ -78,6 +78,8 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
 
     // The new service's endpoint cap, when the spawn produced one - returned to the caller below.
     let mut spawned_cap: Option<CapHandle> = None;
+    // ...and when that cap is one the supervisor does not keep, it is SENT rather than copied (below).
+    let mut handed: Option<CapHandle> = None;
     let status = if payload.len() >= 6 && (payload[1] == supcmd::RESTART || payload[1] == supcmd::SPAWN) {
         let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         match core::str::from_utf8(&payload[6..]) {
@@ -136,7 +138,14 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                 if ok {
                     // For the kernel-catalogue paths the cap was recorded in the name map by
                     // `spawn_mapped`; read it back so every successful spawn answers the same way.
-                    if spawned_cap.is_none() { spawned_cap = map.get(name).map(CapHandle); }
+                    // A program the map does not keep left its cap held for this answer instead.
+                    if spawned_cap.is_none() {
+                        spawned_cap = map.get(name).map(CapHandle);
+                        if spawned_cap.is_none() {
+                            handed = map.take_handoff();
+                            spawned_cap = handed;
+                        }
+                    }
                     supcmd::OK
                 } else { supcmd::FAILED }
             }
@@ -160,7 +169,9 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
     // table slot leaked per request (26.6).
     if let Some(reply_cap) = ctx.take_pending_cap() {
         let msg = Message::from_bytes(&[status]);
-        let sent = match spawned_cap.and_then(|c| ctx.derive_cap(c)) {
+        // A cap the supervisor does not keep goes as it is: copying it would leave the supervisor holding
+        // the original, which is what `map_keeps` exists to stop.
+        let sent = match handed.or_else(|| spawned_cap.and_then(|c| ctx.derive_cap(c))) {
             Some(granted) => {
                 let r = ctx.send_with_cap_by_handle(reply_cap, granted, &msg);
                 if r.is_err() { ctx.remove_cap(granted); }
@@ -172,6 +183,8 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
         // on a reply that is not coming (invariant 12). It gets the status alone.
         if !sent { let _ = try_send_slot(ctx, reply_cap, &msg); }
         ctx.remove_cap(reply_cap);
+    } else if let Some(c) = handed {
+        map.hold_handoff(ctx, c);   // no one to hand it to: let go with the rest, after this message
     }
     true
 }
@@ -854,6 +867,11 @@ struct NameCapMap {
     lens:  [u8; NAME_MAP_MAX],
     caps:  [u32; NAME_MAP_MAX],       // endpoint cap slot; u32::MAX = empty
     count: usize,
+    /// The cap to a program the map does NOT keep (`map_keeps`), held only until whoever asked for the
+    /// spawn is answered: a `SPAWN` command hands it to its caller, and every other path lets it go
+    /// (`release_handoff`, once per message). One slot - a new one frees the old - so the supervisor
+    /// never holds more than one cap to an on-demand program, and none between messages.
+    handoff: u32,
 }
 impl NameCapMap {
     const fn new() -> Self {
@@ -862,7 +880,22 @@ impl NameCapMap {
             lens:  [0u8; NAME_MAP_MAX],
             caps:  [u32::MAX; NAME_MAP_MAX],
             count: 0,
+            handoff: u32::MAX,
         }
+    }
+    /// Hold `cap` for the caller of the spawn that produced it, freeing any cap held before.
+    fn hold_handoff(&mut self, ctx: &ServiceContext, cap: CapHandle) {
+        self.release_handoff(ctx);
+        self.handoff = cap.0;
+    }
+    /// The held cap, now the taker's to send or remove.
+    fn take_handoff(&mut self) -> Option<CapHandle> {
+        let c = core::mem::replace(&mut self.handoff, u32::MAX);
+        (c != u32::MAX).then_some(CapHandle(c))
+    }
+    /// Let go of a held cap nobody took.
+    fn release_handoff(&mut self, ctx: &ServiceContext) {
+        let_go(ctx, self.take_handoff());
     }
     /// Record `name → cap_slot`, **updating in place** if `name` is already mapped (so a restart
     /// refreshes the cap - and a kill-storm can't grow the map past its bound, §26.6). Returns
@@ -987,10 +1020,15 @@ fn record_name_quiet(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap
     // there is no old one to free as well. The map is bounded at `NAME_MAP_MAX`, and these used to stay in
     // it for the life of the machine: on the Pi 4 a `selfcheck` filled it, and the USB dongle's driver
     // arriving after was dropped (`docs/wifi-usb.md` 49).
-    let keep = map_keeps(name);
-    let let_go = if keep { map.get(name).map(CapHandle) } else { Some(cap) };
-    if let Some(c) = let_go { ctx.remove_cap(c); }
-    if !keep { return false; }
+    //
+    // Let go AFTER the caller is answered, not here: a `SPAWN` command's caller is owed a cap to what it
+    // started (`handle_command`), and dropping it here left `spawncap upper` with nothing to send on
+    // (`osdev test shell`, 2026-10-08). So it is held for that one answer (`hold_handoff`).
+    if !map_keeps(name) {
+        map.hold_handoff(ctx, cap);
+        return false;
+    }
+    let_go(ctx, map.get(name).map(CapHandle));
     if map.record(name, cap.0) { return true; }
     ctx.log_fmt(format_args!("supervisor: name-map FULL - dropped {}", name));
     false
@@ -1337,6 +1375,11 @@ fn map_keeps(name: &str) -> bool {
     is_watched(name)
         || USB_MATCH.iter().any(|m| m.driver == name)
         || IMAGES.iter().chain(USB_IMAGES.iter()).any(|row| row.5.contains(&name))
+}
+
+/// The supervisor letting go of a cap it held in the name map, or held for a caller: one site.
+fn let_go(ctx: &ServiceContext, cap: Option<CapHandle>) {
+    if let Some(c) = cap { ctx.remove_cap(c); }
 }
 
 /// The supervisor's one non-blocking send on a capability it holds in hand - a reply capability, or a
@@ -1962,6 +2005,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         let msg = ctx.recv();
         handle_message(&ctx, &mut name_map, &mut usb, &msg);
+        name_map.release_handoff(&ctx);
         // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
         // multi-kill it found the services whose notifications were still QUEUED behind this one, respawned
         // them, and logged "missed death notification" for each - and then each notification arrived and
@@ -1976,6 +2020,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         while drained < DRAIN_MAX {
             let Some(next) = ctx.try_recv() else { break };
             handle_message(&ctx, &mut name_map, &mut usb, &next);
+            name_map.release_handoff(&ctx);
             drained += 1;
         }
         // Reconcile backstop: catch any managed service whose death notification never reached us - our
@@ -1984,6 +2029,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // gone from observe after a storm" bug). Cheap when nothing is dead.
         reconcile(&ctx, &mut name_map, &usb);
         tell_radio_of_dongle(&ctx, &name_map, &usb, &mut told_radio);
+        name_map.release_handoff(&ctx);
     }
 }
 
