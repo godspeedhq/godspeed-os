@@ -70,6 +70,17 @@ pub enum Error {
     /// not paper over: for anything that changes state, report it or re-read the truth, never
     /// re-send.
     OutcomeUnknown,
+    /// The request ARRIVED and the service died before answering it (the kernel's `ReplyDead`,
+    /// CLAUDE.md 8.6). **The operation may have completed**, exactly as with [`Error::OutcomeUnknown`],
+    /// so this is not safe to re-send blindly either.
+    ///
+    /// It is its own variant because the caller does two things differently. It does not wait out a
+    /// deadline or call the peer "silent" - the peer is gone, and saying it was slow sends an operator
+    /// after the wrong fault. And it REACQUIRES before anything else, because the instance it asked no
+    /// longer exists. For an operation that is safe to repeat - a read, a block transfer of the same
+    /// sector - reacquire and ask again; that was what callers did before this variant existed, and
+    /// now they say so.
+    PeerDied,
 
     // ---- the answer arrived and made no sense ------------------------------------------------
     /// A reply came back that this library could not parse: too short, wrong tag, or a status byte
@@ -145,6 +156,7 @@ impl Error {
             Error::Unreachable      => "the service could not be reached (nothing happened)",
             Error::Busy             => "the service is busy (nothing happened)",
             Error::OutcomeUnknown   => "no answer before the deadline - THE OUTCOME IS UNKNOWN",
+            Error::PeerDied         => "the service died before answering - THE OUTCOME IS UNKNOWN",
             Error::Revoked          => "the capability was revoked - re-open it (nothing happened)",
             Error::Cancelled        => "cancelled",
             Error::Malformed        => "the service sent a reply this library could not parse",
@@ -184,6 +196,7 @@ mod tests {
         assert!(Error::Unreachable.retry_is_safe(), "the send never left");
         assert!(Error::Busy.retry_is_safe(), "the queue was full; nothing left either");
         assert!(!Error::OutcomeUnknown.retry_is_safe(), "IT MAY HAVE COMMITTED");
+        assert!(!Error::PeerDied.retry_is_safe(), "it arrived before the peer died: IT MAY HAVE COMMITTED");
         assert!(!Error::Cancelled.retry_is_safe(),
                 "cancelling stops this caller listening; it does not un-send the request");
 

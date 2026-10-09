@@ -26,7 +26,7 @@ Two halves, using only the standard library (`gs`):
 | Reach `fs` | `gs::cap::acquire(&ctx, "fs")` | resolve `fs` by name via the kernel directory; `None` -> degrade |
 | **Load-on-spawn** | `gs::call::request_within(&ctx, "fs", read_op, FS_SECS)` | read `/counter.dat` and parse the saved count (reconstruct from the durable copy) |
 | **Save-on-change** | `gs::call::request_within(&ctx, "fs", write_op, FS_SECS)` | after each increment, overwrite `/counter.dat` with the new count |
-| Recover from `fs` restart | inside `gs::call::request_within` | on a send that never left (cap went `EndpointDead`), `request_within` reacquires by name and sends once more; a request that reached `fs` and got no answer is NOT re-sent (§14.3) |
+| Recover from `fs` restart | inside `gs::call::request_within` | on a send that never left (cap went `EndpointDead`), `request_within` reacquires by name and sends once more; if `fs` took the request and died (`PeerDied`) the example reacquires and asks again itself, because a read and a whole-file write of the same count are both safe to repeat (§14.3) |
 
 The shape of the lifecycle:
 

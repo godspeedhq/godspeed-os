@@ -92,6 +92,11 @@ fn execute(ctx: &ServiceContext, line: &str) {
                     },
                     Err(gs::Error::OutcomeUnknown) => ctx.log_fmt(format_args!(
                         "control: restart failed: supervisor did not answer within 10s ({})", name)),
+                    // It took the request and died before answering, so the restart may have happened.
+                    // NOT re-sent: a restart is not safe to repeat blind. Said as what it is - the
+                    // supervisor did not go quiet, it died - so nobody goes looking for a slow one.
+                    Err(gs::Error::PeerDied) => ctx.log_fmt(format_args!(
+                        "control: restart outcome unknown: the supervisor died while handling it ({}) - it may or may not have happened", name)),
                     Err(e)   => ctx.log_fmt(format_args!(
                         "control: restart failed: supervisor unreachable ({:?}) - {}", e, name)),
                 }

@@ -1777,8 +1777,17 @@ answers and removes in one call, which is how it was seen and how it is fixed.
 **`gs::call::request_within` re-sent a request that had already arrived.** It retries once when the
 send never left, and decided "never left" with a catch-all that swallowed `ReplyDead` - the kernel
 saying the request WAS delivered and its replier died holding the reply capability (CLAUDE.md 8.6). That
-is the `OutcomeUnknown` case this module's own header says must never be re-sent. It was, silently,
-whenever a peer died mid-request. `ReplyDead` is `OutcomeUnknown` now.
+is the "it may have happened" case this module's own header says must never be re-sent. It was,
+silently, whenever a peer died mid-request.
+
+The first fix folded `ReplyDead` into `OutcomeUnknown`, and an independent review of the whole change
+caught what that cost: four callers had leaned on the silent retry for operations that ARE safe to
+repeat - `block-driver`'s block transfers through `xhci`, `nic-driver`'s frames through `dwc2`, `counter`'s
+read - and every one of them now gave up, while their logs blamed a peer that was "silent" when it had
+died. So it is its own variant, `Error::PeerDied`: not safe to re-send blind, like `OutcomeUnknown`, but a
+different obligation - reacquire first, then ask again only if the operation is safe to repeat. Each of
+those callers now does that ITSELF, at the call site, where the knowledge that the operation is
+idempotent actually lives; `control` reports a restart whose outcome is unknown instead of re-sending it.
 
 ### And a rule about authority that was false
 
@@ -1798,6 +1807,7 @@ refuses a `console_push` declaration nothing uses.
 | `driver::wait::ticks`, `ticks_per_10ms`; `Since::elapsed_ms`, `elapsed_ticks` | tick-domain code: key repeat, `console`'s adaptive paint, TCP timers, benchmarks |
 | `driver::irq::Irq::vector` | `xhci` logs and compares its MSI vector |
 | `call::request_once` | `block-driver` and `nic-driver`, which own their retry and log whether the reacquire worked |
+| `Error::PeerDied` | the request arrived and the peer died: may have happened, reacquire before asking again |
 | `ipc::exact` | the conformance probes and chaos's flood, which must tell `EndpointDead` from a stale capability |
 | `impl From<CapHandle> for Cap` | handles from SDK calls `gs` does not wrap (spawn, mint); the type never made a capability unforgeable - the kernel's check on every use does |
 | `#[inline(always)]` on the receives | a `Message` is 4 KiB by value; the shell's stack is tight on pipe paths |

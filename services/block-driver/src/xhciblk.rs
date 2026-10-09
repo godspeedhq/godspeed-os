@@ -111,7 +111,10 @@ fn rpc_within(ctx: &ServiceContext, req: &[u8], secs: i64) -> Option<Message> {
                  controller)", XHCI, secs));
             return None;
         }
-        Err(_) => {}   // the SEND failed (stale or full): no request is outstanding, so a retry is safe
+        // The SEND failed (stale or full): no request is outstanding, so a retry is safe. Or `xhci` took
+        // the request and DIED (`PeerDied`): nothing will answer it, and a block transfer of the same
+        // sectors is safe to repeat against the new instance - which is what this path has always done.
+        Err(_) => {}
     }
     // WHEN BOTH ATTEMPTS FAIL, SAY WHETHER THE REACQUIRE WORKED. That is the one distinction left
     // between the two causes this path can have, and they need opposite fixes:

@@ -126,13 +126,15 @@ pub fn request_within_notice(
 /// [`request_within`] with NO retry: one send, one bounded wait, and the reason it failed.
 ///
 /// For a caller that owns its own recovery - one that reacquires and says so in its log, or that does
-/// pace and retry a full queue because it knows its peer drains fast. The three failures are the ones
+/// pace and retry a full queue because it knows its peer drains fast. The four failures are the ones
 /// [`request_within`] tells apart, and nothing is done about any of them:
 ///
 /// - [`Error::Unreachable`] - the request never left (a stale capability, a peer mid-restart). Nothing
 ///   happened; reacquire the name ([`crate::cap::reacquire`]) and ask again if you want to.
 /// - [`Error::Busy`] - the peer's queue was full. Nothing happened.
 /// - [`Error::OutcomeUnknown`] - no reply in time. **It may have happened.**
+/// - [`Error::PeerDied`] - it arrived and the peer died before answering. **It may have happened**;
+///   reacquire before asking again, and ask again only if the operation is safe to repeat.
 ///
 /// Prefer [`request_within`], which does the one safe retry for you. This exists so that a caller with
 /// a different, deliberate policy does not have to leave the library to keep it.
@@ -142,7 +144,7 @@ pub fn request_once(
     match ctx.request_with_reply_call_err(peer, msg, secs) {
         Ok(Some(r))              => Ok(r),
         Ok(None)                 => Err(Error::OutcomeUnknown),
-        Err(IpcError::ReplyDead) => Err(Error::OutcomeUnknown),
+        Err(IpcError::ReplyDead) => Err(Error::PeerDied),
         Err(IpcError::QueueFull) => Err(Error::Busy),
         Err(_)                   => Err(Error::Unreachable),
     }
@@ -165,8 +167,10 @@ pub fn request_once(
 ///
 /// - [`Error::Unreachable`] - the request never left, twice. Nothing happened.
 /// - [`Error::Busy`] - the peer's queue is full. Nothing happened.
-/// - [`Error::OutcomeUnknown`] - no reply in time, or the peer died after the request reached it
-///   (`ReplyDead`). **It may have happened.**
+/// - [`Error::OutcomeUnknown`] - no reply in time. **It may have happened.**
+/// - [`Error::PeerDied`] - the request reached the peer and it died before answering (`ReplyDead`).
+///   **It may have happened.** Not retried here; a caller whose operation is safe to repeat
+///   reacquires and asks again itself.
 pub fn request_within(
     ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64,
 ) -> Result<Message, Error> {
@@ -193,7 +197,7 @@ pub fn request_within(
         // the arm below with every send failure and be re-sent - the one thing this module exists to
         // refuse, done silently whenever a peer died mid-request. Found moving every service onto this
         // library (2026-10-09).
-        Err(IpcError::ReplyDead) => Err(Error::OutcomeUnknown),
+        Err(IpcError::ReplyDead) => Err(Error::PeerDied),
 
         // NOT retried, deliberately. Congestion clears on its own and the caller knows its own
         // pacing; a library that retries a full queue on your behalf turns one late request into
@@ -210,7 +214,7 @@ pub fn request_within(
             match ctx.request_with_reply_call_err(peer, msg, secs) {
                 Ok(Some(r))              => Ok(r),
                 Ok(None)                 => Err(Error::OutcomeUnknown),
-                Err(IpcError::ReplyDead) => Err(Error::OutcomeUnknown),
+                Err(IpcError::ReplyDead) => Err(Error::PeerDied),
                 Err(IpcError::QueueFull) => Err(Error::Busy),
                 Err(_)                   => Err(Error::Unreachable),
             }

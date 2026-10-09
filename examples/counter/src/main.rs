@@ -56,10 +56,12 @@ const COUNTER_PATH: &[u8] = b"/counter.dat";
 /// the kernel's own calibration and is right on every machine.
 const TICK_MS: u64 = 1_000; // ~1 s, on any host
 
-/// How long one `fs` request may take before it counts as no answer. Generous: a first request can
-/// land while `fs` is still mounting, and a slow disk is not a failure. A bound at all is the point
-/// (CLAUDE.md 26.6) - a live `fs` that never answers must not hold this service forever.
-const FS_SECS: i64 = 30;
+/// How long one `fs` request may take before it counts as no answer. Generous, because the cost of
+/// giving up is real here: a load that times out reads as "no saved count", and the next save then
+/// overwrites the file. A first request can land while `fs` is still mounting and replaying its journal
+/// on a slow USB stick. A bound at all is the point (CLAUDE.md 26.6) - a live `fs` that never answers
+/// must not hold this service forever.
+const FS_SECS: i64 = 120;
 
 // ── fs round-trips, modelled on the shell's `fs_request` ────────────────────────
 
@@ -97,7 +99,16 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
         let p = r.payload_bytes();
         if p.first() == Some(&tag) { Some(Message::from_bytes(&p[1..])) } else { None }
     };
-    gs::call::request_within(ctx, "fs", &msg, FS_SECS).ok().and_then(strip)
+    match gs::call::request_within(ctx, "fs", &msg, FS_SECS) {
+        Ok(r) => strip(r),
+        // `fs` took the request and died before answering. Both of this example's requests are safe to
+        // repeat - a read, and a write of the whole file with the same count - so reacquire the new
+        // instance and ask once more. A request that is NOT safe to repeat must not do this
+        // (`gs::Error::PeerDied`).
+        Err(gs::Error::PeerDied) if gs::cap::reacquire(ctx, "fs") =>
+            gs::call::request_within(ctx, "fs", &msg, FS_SECS).ok().and_then(strip),
+        Err(_) => None,
+    }
 }
 
 /// Vary the correlation tag per request; never 0, so an untagged sender is recognisable.
