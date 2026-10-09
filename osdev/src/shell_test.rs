@@ -5065,15 +5065,14 @@ pub fn run_reply_server(image_path: &Path, smp: u32) {
 }
 
 /// Reply-side death-wake: a caller blocked awaiting a reply wakes with `ReplyDead`, it does NOT hang
-/// (§8.6, Commandment VIII; `sdk/rust/src/service_context.rs::request_with_reply` -> kernel syscall 41
-/// `Call`). Reuses the reply-test build (bare-metal set + reply-server + asker), COM1 for logs, COM2
+/// (§8.6, Commandment VIII; `gs::call::request_within` -> kernel syscall 50 `CallDeadline`). Reuses the reply-test build (bare-metal set + reply-server + asker), COM1 for logs, COM2
 /// for the control channel. `asker` (see examples/asker) sends one request the server never answers
 /// (b"HANG") and blocks for the reply; we then KILL `reply-server` over COM2. Before this change the
 /// blocked `recv` would hang forever; now the kernel finds the outstanding reply cap of the blocked
-/// caller in the endpoint-death path and wakes it with `ReplyDead`, so `request_with_reply` returns
-/// None and `asker` carries on.
+/// caller in the endpoint-death path and wakes it with `ReplyDead`, which `gs::call` reports as
+/// `OutcomeUnknown` (never re-sent - the request arrived), and `asker` carries on.
 ///
-/// THE PROOF is asker logging `HANG woke with no reply ... (ReplyDead recovered)` AFTER the server was
+/// THE PROOF is asker logging `HANG woke with no reply after N ms` AFTER the server was
 /// killed while it was demonstrably blocked (server logged it withheld the reply first). No hang, no
 /// panic. This is the reply-side twin of §22 Test 4 (a blocked *sender* wakes with `EndpointDead`).
 /// `trace` against a REAL blocked chain (`utilities/46_trace.md` mechanism A).
@@ -5156,6 +5155,19 @@ pub fn run_trace_chain(image_path: &Path, smp: u32) {
            "setup: asker sent the request that is never answered");
     check!(collect_until(&buf, &mut cursor, b"reply-server: HANG received", Duration::from_secs(30 * sc)).is_some(),
            "setup: reply-server withheld its reply - asker is now genuinely blocked");
+
+    // SYNC ON A PROMPT THIS TEST ASKED FOR, before the first command. The HANG lands while the system is
+    // still booting - before the shell has drawn its first `gsh>` - so the cursor sits ahead of that
+    // boot prompt, and the first `collect_until(gsh>)` below returned it at once: every check then read
+    // the PREVIOUS command's output. It failed the same three checks on `main` (2026-10-09) while the
+    // `trace` output itself was right. An echo of a unique word is unambiguous: its output line starts
+    // with the word, which the echoed command line does not, and the prompt after it is ours.
+    send(&mut write_half, b"echo trace-sync\r");
+    if collect_until(&buf, &mut cursor, b"\ntrace-sync", Duration::from_secs(30 * sc)).is_none()
+        || collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10 * sc)).is_none() {
+        println!("trace: FAIL - the shell never answered a sync echo");
+        fail += 1;
+    }
 
     // PROOF 1 + 2: the blocked table names the stuck task AND resolves what it waits on to a peer.
     send(&mut write_half, b"trace blocked\r");

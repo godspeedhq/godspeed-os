@@ -1755,3 +1755,78 @@ Recorded because the pattern is the lesson, not the four:
 
 All four surfaced within a minute of `cargo build`. The method that catches them is building the
 module as it is written rather than writing the crate and then checking it.
+
+## 25. Every service on the standard library, and what that found (2026-10-09)
+
+The operator, finding the dogfood had not been done: every service should be written on `gs`. The
+one-way gate (`scripts/one_way_check.py`, 2026-10-05) only stopped NEW raw calls; 1085 calls with a `gs`
+equivalent were still in 28 crates. All of them moved, the gate's baseline is empty, and every crate -
+new or old - is held at zero.
+
+The rule for each call was the one this document has always used: **behaviour must not change.** Where
+the library's answer was different, the library gained the missing piece rather than the call staying
+on the SDK. (An earlier attempt at the same work, 2026-10-01, stopped at about 190 calls with the gaps
+left open and was never merged; its console fix is the first commit of this one.)
+
+### The two defects it found
+
+**`console` leaked a reply capability on every terminal-size and scrollback request.** It answered and
+never gave the one-shot capability back, so each query used a slot in its table for good. `gs::ipc::reply`
+answers and removes in one call, which is how it was seen and how it is fixed.
+
+**`gs::call::request_within` re-sent a request that had already arrived.** It retries once when the
+send never left, and decided "never left" with a catch-all that swallowed `ReplyDead` - the kernel
+saying the request WAS delivered and its replier died holding the reply capability (CLAUDE.md 8.6). That
+is the `OutcomeUnknown` case this module's own header says must never be re-sent. It was, silently,
+whenever a peer died mid-request. `ReplyDead` is `OutcomeUnknown` now.
+
+### And a rule about authority that was false
+
+`gs::io` and `scripts/contract_check.py` said printing needs `console_push`. It does not: the kernel's
+`ConsoleWrite` checks `LOG_WRITE`, which every task holds in slot 0, and the project's own test log
+showed a program with no `CONSOLE_PUSH` printing. The rule came from a Stranger Test conclusion drawn
+from documentation and never run (`docs/stranger-test.md` has the correction). It surfaced here because
+the gate fired on four drivers the moment their notices went through `gs::io`, and obeying it would have
+granted `net-stack` the authority to type commands (SEC-2). The gate now checks the true rule, and also
+refuses a `console_push` declaration nothing uses.
+
+### What `gs` gained, every piece a wrapper over an SDK call that already existed
+
+| Addition | Pulled in by |
+|---|---|
+| `task::sleep_quantum`, `sleep_us`, `sleep_ticks` | `sleep(1)` everywhere; `dwc2`'s measured split-transaction timing |
+| `driver::wait::ticks`, `ticks_per_10ms`; `Since::elapsed_ms`, `elapsed_ticks` | tick-domain code: key repeat, `console`'s adaptive paint, TCP timers, benchmarks |
+| `driver::irq::Irq::vector` | `xhci` logs and compares its MSI vector |
+| `call::request_once` | `block-driver` and `nic-driver`, which own their retry and log whether the reacquire worked |
+| `ipc::exact` | the conformance probes and chaos's flood, which must tell `EndpointDead` from a stale capability |
+| `impl From<CapHandle> for Cap` | handles from SDK calls `gs` does not wrap (spawn, mint); the type never made a capability unforgeable - the kernel's check on every use does |
+| `#[inline(always)]` on the receives | a `Message` is 4 KiB by value; the shell's stack is tight on pipe paths |
+
+The gate's table also turned out narrower than the library - console writes (`gs::io`, 827 of them in
+the shell), `trace_as`, `metric`, `resource_revoke`, `last_recv_badge` and `send_peer_handle` all had
+`gs` equivalents and were not counted. They are counted and converted.
+
+### What is still SDK, and why
+
+Recorded as evidence, not as a plan (26.2):
+
+1. **Hardware**: `Mmio`, `Dma`, `device_power`, `cpu_clock`. `gs::driver` gaps (`docs/driver-library.md`).
+2. **Spawning** and the supervisor's name map, which flows into `spawn_with_caps`.
+3. **The delegated-resource invoke** (`resource_invoke` + `recv_abortable_deadline`) in the shell's
+   `fcap` and `examples/holder`. `gs::resource::invoke` exists and is better, but `pub(crate)`.
+4. **Request forms with no `gs` shape**: the sifted and millisecond-bounded requests `net-stack` uses
+   while it must keep client requests that arrive mid-wait, and the `_into` forms `fs` and the supervisor
+   use to keep a second 4 KiB frame off their stacks. Section 20's gap, from the other side.
+5. **Two drivers' wait loops** (`xhci`, `dwc2`): call sites moved, structure did not. `Irq::wait` is the
+   destination, one hardware card per board.
+
+### Small differences, all deliberate
+
+`Since::passed` is `>=` where three checks were `>`, one tick. On an UNCALIBRATED machine two shell lines
+that printed a nonsense duration now do not, and a `dwc2` pass budget drains nothing where it drained one
+tick's worth. Two log lines print `gs::Error` names (`Busy`) where they printed `IpcError` names
+(`QueueFull`). `asker` and `counter` used an unbounded request and now have deadlines (26.6).
+
+### Validated on
+
+QEMU, x86: see the commit that closes this section. Hardware: not yet.

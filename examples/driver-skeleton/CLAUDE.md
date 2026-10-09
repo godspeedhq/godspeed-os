@@ -19,9 +19,9 @@ compromised driver from taking down the system.
 | Phase | The shape | SDK |
 |-------|-----------|-----|
 | Acquire | get the kernel-granted MMIO window + DMA arena | `ctx.mmio()`, `ctx.dma_region()` |
-| Bring up | identity-check, reset, poll for ready, install a DMA ring, enable + unmask the IRQ | `Mmio::read32`/`write32`, `Dma::zero`/`phys_base`, `ctx.irq_unmask(v)` |
-| Serve | block for an interrupt or a request, handle it, re-arm | `ctx.recv()`, `Mmio`/`Dma` |
-| Degrade | no device mapped, or bring-up fails -> log loudly and idle, never panic | `ctx.try_recv()` + `ctx.yield_cpu()` |
+| Bring up | identity-check, reset, poll for ready, install a DMA ring, enable + unmask the IRQ | `Mmio::read32`/`write32`, `Dma::zero`/`phys_base`, `gs::driver::irq::Irq::granted(ctx).rearm(ctx)` (the vector the kernel granted, never a number of ours) |
+| Serve | block for an interrupt or a request, handle it, re-arm | `gs::ipc::recv`, `Mmio`/`Dma` |
+| Degrade | no device mapped, or bring-up fails -> log loudly and idle, never panic | `gs::ipc::try_recv` + `gs::task::yield_now` |
 
 Every register and DMA access goes through the SDK's `Mmio`/`Dma` wrappers. The driver itself
 contains no `unsafe`.
@@ -55,7 +55,7 @@ where the discipline matters most.
   their own restart (`services/CLAUDE.md`). *(COMMANDMENTS.md V, IX; CLAUDE.md §6.2, §14.)*
 - **Commandment VIII (wait for truth, not time).** Bring-up resets the device and then **polls the
   STATUS_READY bit** - bounded, so a dead device gives up loudly instead of wedging the core - because
-  the bit is the truth; the `yield_cpu()` in the loop only conserves CPU, it never decides readiness.
+  the bit is the truth; the `gs::task::yield_now` in the loop only conserves CPU, it never decides readiness.
   The serve loop blocks on the interrupt **event**, never a fixed sleep guessing the device is done.
   *(COMMANDMENTS.md VIII; CLAUDE.md §8.6, §9.3.)*
 - **Commandment II (love Chaos; survive Maximum Carnage).** A driver is a prime chaos target - it is

@@ -42,10 +42,12 @@ use godspeed::{self as gs, ipc::Message, ServiceContext};
 /// How long an ordinary echo may take. An echo server answers at once; this bounds a wedged one.
 const ASK_SECS: i64 = 5;
 
-/// How long the HANG request waits before giving up on its own. Long enough that the harness has
-/// killed the server well before it (the wake that test asserts is the kernel's `ReplyDead`, not this),
-/// and finite so a server that stays alive and silent cannot hold asker forever (CLAUDE.md 26.6).
-const HANG_SECS: i64 = 120;
+/// How long the HANG request waits before giving up on its own. Ten minutes, and the size is the
+/// point: `osdev test reply-dead` kills the server and allows up to 120 s for the wake (30 s, times 4
+/// under TCG), so this must be far outside that window or a deadline expiring could pass for the
+/// kernel's `ReplyDead` wake the test exists to prove. Finite, so a server that stays alive and silent
+/// still cannot hold asker forever (CLAUDE.md 26.6).
+const HANG_SECS: i64 = 600;
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]

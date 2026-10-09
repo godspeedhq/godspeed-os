@@ -19,14 +19,14 @@ it and reload it - that is what makes it genuinely restartable (§14, Invariant 
 
 ## What it demonstrates
 
-Two halves, using only real `ServiceContext` methods:
+Two halves, using only the standard library (`gs`):
 
 | Half | Call | What happens |
 |------|------|--------------|
 | Reach `fs` | `gs::cap::acquire(&ctx, "fs")` | resolve `fs` by name via the kernel directory; `None` -> degrade |
-| **Load-on-spawn** | `ctx.request_with_reply("fs", read_op)` | read `/counter.dat` and parse the saved count (reconstruct from the durable copy) |
-| **Save-on-change** | `ctx.request_with_reply("fs", write_op)` | after each increment, overwrite `/counter.dat` with the new count |
-| Recover from `fs` restart | `gs::cap::reacquire(&ctx, "fs")` | on a missed reply (cap went `EndpointDead`), reacquire by name and retry once (§14.3) |
+| **Load-on-spawn** | `gs::call::request_within(&ctx, "fs", read_op, FS_SECS)` | read `/counter.dat` and parse the saved count (reconstruct from the durable copy) |
+| **Save-on-change** | `gs::call::request_within(&ctx, "fs", write_op, FS_SECS)` | after each increment, overwrite `/counter.dat` with the new count |
+| Recover from `fs` restart | inside `gs::call::request_within` | on a send that never left (cap went `EndpointDead`), `request_within` reacquires by name and sends once more; a request that reached `fs` and got no answer is NOT re-sent (§14.3) |
 
 The shape of the lifecycle:
 
@@ -82,7 +82,7 @@ log_write   = true
 
 Everything the service can do is on this list and nowhere else (Commandment VII). It needs a SEND cap
 to `fs` (to send ops) and its own endpoint (so `fs` can reply, via the per-request reply cap that
-`request_with_reply` embeds). No `[placement]` - the supervisor round-robins it.
+`gs::call::request_within` embeds). No `[placement]` - the supervisor round-robins it.
 
 ## What you must NOT do
 

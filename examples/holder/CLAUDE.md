@@ -28,14 +28,14 @@ The client side, using only real `ServiceContext` methods:
 
 | Step | Call | What happens |
 |------|------|--------------|
-| Receive the grant | `ctx.recv()` + `ctx.take_pending_cap()` | the kernel moved the granted cap into holder's table (§7.6, §8.5); this hands back its slot |
+| Receive the grant | `gs::ipc::recv` + `gs::ipc::take_sent_cap` | the kernel moved the granted cap into holder's table (§7.6, §8.5); this hands back its slot |
 | Use it | `ctx.resource_invoke(cap, RIGHT_READ, reply, &op)` | the kernel validates the cap holds READ and routes the op to the OWNER, badged - holder never names the owner |
 | Over-reach (denied) | `ctx.resource_invoke(cap, RIGHT_WRITE, …)` | the READ-ONLY cap lacks WRITE -> the kernel returns `CapInsufficientRights`; the request never reaches the owner |
 | Trigger revoke | `ctx.resource_invoke(cap, RIGHT_READ, reply, &[OP_CLOSE])` | the owner alone revokes what it owns (a generation bump, §7.5) |
 | Use after revoke | `ctx.resource_invoke(cap, RIGHT_READ, …)` | the cap is now stale -> `CapRevoked` |
 
-The reply cap holder embeds per invoke is a SEND copy of its OWN endpoint (`derive_cap` of
-`self_grant_handle`) - the only channel the owner has to answer it. This is the same dance the shell's
+The reply cap holder embeds per invoke is a SEND copy of its OWN endpoint (`gs::cap::duplicate` of
+`gs::cap::self_grant`) - the only channel the owner has to answer it. This is the same dance the shell's
 `fcap` command uses against `fs` (`services/shell`, `fc_invoke`); holder is the example-sized version.
 
 ## Why it is built this way (the Commandments)
@@ -72,12 +72,12 @@ survive-the-failure discipline every example owes `chaos max-carnage`.
   names no one; it acts only through the granted cap. Authority is by capability, not ancestry.
   *(Commandment VII.)*
 - **Do not assume a leaked reply slot is free.** On a rejected invoke holder reclaims the per-invoke
-  reply cap (`remove_cap`) - the kernel did not consume it, so dropping it would leak a slot (§26.6).
+  reply cap (`gs::cap::remove`) - the kernel did not consume it, so dropping it would leak a slot (§26.6).
 
 ## How to adapt this
 
 This is the skeleton of any client that is *granted* a capability to a resource it does not own:
-receive the cap (`take_pending_cap`), use it with `resource_invoke` (deriving a reply cap from your
+receive the cap (`gs::ipc::take_sent_cap`), use it with `resource_invoke` (deriving a reply cap from your
 own endpoint), and be ready for `CapInsufficientRights` (you tried an op past your rights) and
 `CapRevoked`/`EndpointDead` (the owner took it away) as ordinary results. `services/shell`'s `fcap`
 against `services/fs` is this exact shape, fully grown.

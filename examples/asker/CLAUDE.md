@@ -17,16 +17,18 @@ that what comes back is what it sent.
 ## Purpose
 
 Show the **client** half of RPC end to end, so reply-server's server half has something to answer. The
-whole round-trip is one SDK call:
+whole round-trip is one standard-library call:
 
 ```rust
-let reply = ctx.request_with_reply("reply-server", &request);   // Some(reply) | None
+let reply = gs::call::request_within(&ctx, "reply-server", &request, ASK_SECS);   // Ok(reply) | Err(gs::Error)
 ```
 
-which (see `sdk/rust/src/service_context.rs`) derives a per-request reply cap from asker's OWN endpoint,
+which (see `stdlib/rust/src/call.rs`) derives a per-request reply cap from asker's OWN endpoint,
 embeds it in the request, sends it to reply-server, and blocks on asker's endpoint for the reply. It is
-a synchronous kernel `Call` (§8.2), so it waits on truth **without hanging**: if reply-server dies
-mid-request the kernel wakes asker with `ReplyDead` and the call returns `None`, never an infinite wait.
+a synchronous kernel `Call` with a deadline (§8.2), so it waits on truth **without hanging**: if
+reply-server dies mid-request the kernel wakes asker with `ReplyDead` at once, which the library reports
+as `Err(OutcomeUnknown)` - the request arrived, so it may have been acted on, and it is NOT re-sent - and
+a server that stays alive and silent is bounded by the deadline instead of waited on forever.
 
 ## What it demonstrates
 
@@ -34,47 +36,48 @@ mid-request the kernel wakes asker with `ReplyDead` and the call returns `None`,
 |------|------|--------------|
 | Own an endpoint | (from the contract's `ipc_receive`) | reply-server sends the reply here |
 | Build a request | `Message::from_bytes(...)` | the payload (an incrementing decimal here) |
-| Round-trip | `ctx.request_with_reply("reply-server", &req)` | derive reply cap from our endpoint, GRANT it embedded in the request, block for the reply |
+| Round-trip | `gs::call::request_within(&ctx, "reply-server", &req, ASK_SECS)` | derive reply cap from our endpoint, GRANT it embedded in the request, block for the reply |
 | Check the echo | `reply.payload_bytes() == request` | the reply must equal the request - proof the round-trip closed |
-| Recover | `gs::cap::reacquire(&ctx, "reply-server")` | on `None` (peer still spawning / restarted) reacquire by name and retry |
+| Recover | `gs::cap::reacquire(&ctx, "reply-server")` | on an error (peer still spawning / restarted) reacquire by name and retry next tick |
 
 ## Why it is built this way (the Commandments)
 
 - **Commandment VII (no ambient authority).** asker grants reply-server the authority to call it back by
   embedding a reply cap - a SEND|GRANT copy of its OWN endpoint cap (`gs::cap::duplicate` of `gs::cap::self_grant`,
-  packaged inside `request_with_reply`). The server gets exactly that cap and nothing else; there is no
+  packaged inside `gs::call::request_within`). The server gets exactly that cap and nothing else; there is no
   "reply to the sender" channel in the kernel. *(COMMANDMENTS.md VII; CLAUDE.md §7, §8.5, §8.9.)*
 - **Commandment VIII (wait on truth, not time - and the truth must include failure).** asker blocks for
   the *reply* - the truth that the work is done - never for a fixed sleep. And it never assumes a send
   arrived: a successful send is *queued*, not processed (§8.6). Crucially, the truth it waits on includes
-  **failure**: `request_with_reply` is a synchronous `Call`, so if reply-server dies mid-request the
+  **failure**: `gs::call::request_within` is a synchronous `Call`, so if reply-server dies mid-request the
   kernel wakes asker with `ReplyDead` (the reply-side twin of `EndpointDead`, §8.6) and the call returns
-  `None` instead of hanging forever - asker's `b"HANG"` path (a request reply-server deliberately never
+  `Err(OutcomeUnknown)` instead of hanging forever - asker's `b"HANG"` path (a request reply-server deliberately never
   answers) drives exactly this in the reply-test build. A reply-server restart is settled by the
-  generation check (a stale peer cap returns `None`), not by a delay. *(COMMANDMENTS.md VIII; CLAUDE.md
+  generation check (a stale peer cap is reacquired by name and the request sent once more, inside
+  `request_within`), not by a delay. *(COMMANDMENTS.md VIII; CLAUDE.md
   §8.6, §7.5.)*
 - **Commandment IX (assume you will be killed; recover by reacquiring).** When reply-server is not yet up,
-  or has just restarted, the exchange returns `None`; asker reacquires "reply-server" **by name** through
+  or has just restarted, the exchange returns an error; asker reacquires "reply-server" **by name** through
   the kernel directory and retries on the next tick - it does not hang or die. *(COMMANDMENTS.md IX;
   CLAUDE.md §14.3.)*
 - **Commandment X (place complexity where it belongs).** The request's *meaning* is policy in asker and
   reply-server; the kernel only routes the message and validates the cap. *(COMMANDMENTS.md X; §26.10.)*
 
-**Cross-cutting: Commandment II (love Chaos).** asker assumes its peer can vanish mid-exchange: a `None`
+**Cross-cutting: Commandment II (love Chaos).** asker assumes its peer can vanish mid-exchange: an error
 is met with reacquire-and-retry, never a panic. That is the same survive-the-kill-storm discipline every
 example owes `chaos max-carnage`.
 
 ## What you must NOT do
 
 - **Do not block-`send` the request while the server might block replying to you.** That re-opens the
-  §8.9 deadlock. `request_with_reply` is safe because the *server's* reply is non-blocking
+  §8.9 deadlock. `gs::call::request_within` is safe because the *server's* reply is non-blocking
   (`gs::ipc::try_send_to`); the cycle cannot form. *(Commandment VIII.)*
 - **Do not treat a returned reply as guaranteed-correct without checking it.** Here asker compares the
   echo to what it sent - the actual proof the round-trip closed, not just that *a* message arrived.
 - **Do not reach for the server by identity or a hardcoded endpoint id.** Resolve it by name and embed a
   reply cap; on failure reacquire by name. Authority and addressing are by capability, not ancestry.
   *(Commandment VII/IX.)*
-- **Do not panic when the peer is missing.** A `None` is normal during boot and restart - reacquire and
+- **Do not panic when the peer is missing.** An error is normal during boot and restart - reacquire and
   retry. *(§26.7.)*
 
 ## How to adapt this
@@ -90,7 +93,7 @@ richer protocols, badge the request payload with an operation code and have the 
 - **Commandments VII, VIII, IX, X** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §8 (IPC), §8.5 (embedded capabilities), §8.6 (queued, not processed), §8.9 (deadlock
   avoidance), §14.3 (reacquire by name on `EndpointDead`).
-- `sdk/rust/src/service_context.rs` - `request_with_reply`, `derive_cap`, `self_grant_handle`.
+- `stdlib/rust/src/call.rs` - `request_within`, and why a request that reached its peer is never re-sent.
 - `osdev test reply-dead` - pins the peer-death path (the `b"HANG"` request: asker wakes with `ReplyDead`,
-  returns `None`, and does NOT hang when reply-server is killed mid-request).
+  reported as `Err(OutcomeUnknown)`, and does NOT hang when reply-server is killed mid-request).
 - `examples/ping` + `examples/pong` - the one-way-IPC contrast (a producer, no reply).
