@@ -81,3 +81,11 @@ boot/**   text eol=lf
 *.ppm    binary
 *.zip    binary
 *.gz     binary
+
+# ─── Vendor firmware: the bytes are the vendor's, never git's to rewrite ──────
+# Every file under nonfree/ is checked against the SHA-256 its PROVENANCE records, and some are TEXT
+# (the CYW43455's NVRAM, `brcmfmac43455-sdio.txt`). `* text=auto` checked that one out with CRLF on
+# Windows, so the digest no longer matched and the v0.22.0 release build failed at `nonfree_check` -
+# and a Pi 4 image built from such a checkout embedded NVRAM that was not the vendor's. Binary means
+# the working copy is the stored bytes on every OS. A later rule wins, so this stays at the end.
+nonfree/** binary
