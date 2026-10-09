@@ -76,9 +76,20 @@ impl Cap {
         self.0
     }
 
-    /// Wrap a handle the SDK produced. Crate-internal: a program gets a `Cap` from an operation that
-    /// grants one, never by constructing it, because a capability you can invent is not a capability.
+    /// Wrap a handle the SDK produced.
     pub(crate) fn from_handle(h: CapHandle) -> Self {
+        Cap(h)
+    }
+}
+
+/// Adopt a handle an SDK call outside this library returned - a spawn that hands back an endpoint, a
+/// minted resource, a capability looked up by contract name - so the rest of its life is spent here.
+///
+/// This grants nothing and forges nothing. A handle is a slot number anyone can type; what makes a
+/// capability unforgeable is the kernel, which checks the slot, its generation and its rights on every
+/// use (CLAUDE.md 7.3). Wrapping a number that is not a capability yields a `Cap` every call refuses.
+impl From<CapHandle> for Cap {
+    fn from(h: CapHandle) -> Self {
         Cap(h)
     }
 }

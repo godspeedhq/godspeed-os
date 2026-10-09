@@ -32,6 +32,28 @@ pub fn sleep_ms(ctx: &ServiceContext, ms: u64) {
     ctx.sleep_ms(ms);
 }
 
+/// Sleep for one scheduler quantum, parked: the shortest sleep there is.
+///
+/// Not [`yield_now`]. A yield returns at once when nothing else is runnable, so a loop built on it
+/// spins a core; this parks the task until the next tick on every architecture (CLAUDE.md 9.1). For a
+/// loop that has nothing to wait on but must not hammer the CPU between looks.
+pub fn sleep_quantum(ctx: &ServiceContext) {
+    // One counter tick: the kernel floors any sleep to the next scheduler tick, so this is one quantum
+    // on every machine, calibrated or not.
+    ctx.sleep(1);
+}
+
+/// Sleep for `us` microseconds, at the kernel's resolution.
+///
+/// The kernel's sleep ends on a scheduler tick, so anything under a quantum becomes a quantum; this is
+/// for a pace written in microseconds, not a hardware hold - a hold that must not be cut short or
+/// stretched belongs to `gs::driver::delay`. On a machine whose clock the kernel could not calibrate
+/// it is one quantum, the same floor [`sleep_ms`] has there.
+pub fn sleep_us(ctx: &ServiceContext, us: u64) {
+    let per_10ms = ctx.tsc_ticks_per_10ms();
+    ctx.sleep(if per_10ms == 0 { 1 } else { crate::driver::wait::ticks_for(per_10ms, us) });
+}
+
 /// Seconds since this machine booted.
 ///
 /// Monotonic and always available, including before any clock is set, which is what makes it the

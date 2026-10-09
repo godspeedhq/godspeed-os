@@ -45,6 +45,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
 mod render;
@@ -119,14 +120,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("console");
+    gs::trace::as_name(&ctx, "console");
     // The framebuffer grant. Without one there is no display to own - which is the normal case on a
     // machine with no framebuffer, and on the Pi 4 until its mapping is made non-cacheable. Say so and
     // park: a console with nothing to render is not a failure, but it must not pretend to work.
     let Some(fb) = ctx.framebuffer() else {
         ctx.log("console: no framebuffer grant - nothing to render, parking");
         loop {
-            let _ = ctx.recv();
+            let _ = gs::ipc::recv(&ctx);
         }
     };
 
@@ -178,7 +179,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // from it would be meaningless. Bound by count then, and say so rather than silently painting
     // per line.
     const DRAIN_BOUND: usize = 16;
-    let per_10ms = ctx.tsc_ticks_per_10ms();
+    let per_10ms = gs::driver::wait::ticks_per_10ms(&ctx);
     // Cycles per microsecond, for reporting a paint in units a human can compare against a frame.
     let per_us = (per_10ms / 10_000).max(1);
     let mut paint_deadline: u64 = if per_10ms == 0 {
@@ -270,15 +271,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // busy near the elapsed time -> the console is the bottleneck, and `put_bytes` is where to
         // look, since the paint is already known to be free. busy near zero -> this service is idle
         // and waiting, the producer or the IPC path is slow, and no console change would help.
-        let mut msg = ctx.recv();
+        let mut msg = gs::ipc::recv(&ctx);
         // Pass start, for the paint deadline below. Not diagnostics: this is what bounds the drain.
-        let t_pass0 = ctx.read_tsc();
+        let t_pass0 = gs::driver::wait::Since::now(&ctx);
         let mut drained: usize = 0;
         loop {
             // A request carries a REPLY CAP; console output never does. That, not the payload, is what
             // tells the two apart - a byte stream can contain any bytes at all, so discriminating on
             // content would mean a console write of the wrong single byte silently became a request.
-            match ctx.take_pending_cap() {
+            match gs::ipc::take_sent_cap(&ctx) {
                 // Answered immediately and NOT batched: the caller is blocked on this reply, and a
                 // dimensions query is cheap. Deferring it behind a paint would make every client wait
                 // for pixels it is not asking about.
@@ -294,13 +295,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             drained += 1;
             // Deadline first; the count is only the uncalibrated-clock fallback.
             if paint_deadline != 0 {
-                if ctx.read_tsc().wrapping_sub(t_pass0) >= paint_deadline {
+                if t_pass0.elapsed_ticks(&ctx) >= paint_deadline {
                     break;
                 }
             } else if drained >= DRAIN_BOUND {
                 break;
             }
-            match ctx.try_recv() {
+            match gs::ipc::try_recv(&ctx) {
                 Some(next) => msg = next,
                 None => break,
             }
@@ -349,7 +350,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Quiet by construction: only over 250 ms, and only the first few plus every 32nd, so a
         // healthy display prints nothing and a sick one cannot flood the log it is struggling with.
         if per_us > 1 {
-            let pass_us = ctx.read_tsc().wrapping_sub(t_pass0) / per_us;
+            let pass_us = t_pass0.elapsed_ticks(&ctx) / per_us;
             if pass_us > 250_000 {
                 long_passes += 1;
                 if long_passes <= 3 || long_passes % 32 == 0 {
@@ -369,9 +370,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ));
             }
         }
-        let t0 = ctx.read_tsc();
+        let t0 = gs::driver::wait::Since::now(&ctx);
         term.flush();
-        let this_paint_cycles = ctx.read_tsc().wrapping_sub(t0);
+        let this_paint_cycles = t0.elapsed_ticks(&ctx);
         if per_10ms != 0 {
             // EWMA over the last few paints, then aim at twice it.
             paint_ewma = if paint_ewma == 0 {
@@ -412,7 +413,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 /// to be non-blocking or a slow caller can wedge the terminal for everyone. A failure is reported rather
 /// than swallowed - the caller is blocked on this reply, and dropping it silently would leave it to time
 /// out with no idea why (§26.7).
-fn serve_request(ctx: &ServiceContext, reply_cap: godspeed_sdk::CapHandle, term: &mut Term, req: &[u8]) {
+///
+/// AND THE REPLY CAP IS GIVEN BACK, on every path, which `gs::ipc::reply` does as part of answering. It
+/// used not to be: DIMS and HISTORY sent their answer and kept the one-shot cap, so every terminal-size
+/// or scrollback query leaked a slot in this service's capability table until the table was full and the
+/// terminal could not take another request. Found by moving this service onto the stdlib (2026-10-01),
+/// whose `reply` makes the two halves one call.
+fn serve_request(ctx: &ServiceContext, reply_cap: gs::cap::Cap, term: &mut Term, req: &[u8]) {
     let reply = match req.first() {
         Some(&REQ_DIMS) => {
             let (rows, cols) = term.dims();
@@ -428,19 +435,19 @@ fn serve_request(ctx: &ServiceContext, reply_cap: godspeed_sdk::CapHandle, term:
             out[2] = (total >> 8) as u8;
             out[3] = u8::from(aged);
             let msg = Message::from_bytes(&out[..HISTORY_HDR + used]);
-            if ctx.try_send_by_handle(reply_cap, &msg).is_err() {
+            if gs::ipc::reply(ctx, reply_cap, &msg).is_err() {
                 ctx.log("console: could not reply to a history request - the caller will see it as unavailable");
             }
             return;
         }
         _ => {
             ctx.log("console: request with an unknown opcode - dropping it");
-            ctx.remove_cap(reply_cap);
+            gs::cap::remove(ctx, reply_cap);
             return;
         }
     };
     let reply = Message::from_bytes(&reply);
-    if ctx.try_send_by_handle(reply_cap, &reply).is_err() {
+    if gs::ipc::reply(ctx, reply_cap, &reply).is_err() {
         ctx.log("console: could not reply to a request - the caller will see it as unavailable");
     }
 }
