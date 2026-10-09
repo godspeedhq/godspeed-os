@@ -984,7 +984,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     // Only the verbs that are BUILT: completing one that answers "not built yet" would teach a word
     // the utility cannot act on. `outputs`, `output`, `debug` and `system` join as they land. `play`
     // takes a PATH, which is why `audio` is not in NO_PATH_CMDS: Tab after `audio play ` offers files.
-    ("audio",   &["status", "info", "hardware", "outputs", "output", "volume", "mute", "unmute", "on", "off", "tone", "play"]),
+    ("audio",   &["status", "info", "hardware", "outputs", "output", "volume", "mute", "unmute", "on", "off", "tone", "play", "debug"]),
     // The sections that are built; a device name is the other first word, and it is the machine's.
     ("hardware", &["cpu", "memory", "pci", "soc", "display", "usb", "interrupts", "report", "why",
                    "problems", "tree", "firmware", "compare", "events"]),
@@ -1052,6 +1052,7 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     // The radios by name (`wifi_radio_service`), and `use` to choose between them.
     ("wifi",   "hardware",     &["onboard", "usb", "use"]),
     ("audio",  "off",          &["hard"]),
+    ("audio",  "debug",        &audio_wire::DEBUG_VIEWS),
     ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
 ];
 
@@ -5316,6 +5317,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio on | off | off hard", "the codec's power: off powers it down, off hard holds the controller in reset, on brings either back", "audio off"),
             ("audio tone <hz> [seconds]", "play a sine the driver makes itself, 2 s unless told; q stops it", "audio tone 440 2"),
             ("audio play <path>", "play a WAV file: 16-bit PCM, mono or stereo, 44100 or 48000 Hz; q stops it", "audio play /music/test.wav"),
+            ("audio debug [view]", "the driver's own account: stats (bare), codec, stream, trace, registers", "audio debug codec"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
         "hardware" => help_block(ctx, "hardware", "what this machine is, and what drives each part of it", &[
@@ -5682,6 +5684,13 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("audio hardware", "one row each: address, kind, maker, driver, state; * on the one audio talks to", "audio hardware"),
             ("audio hardware <device>", "one in full, named as audio hardware names it: why it is driven or not, and its grant", "audio hardware 00:09.2"),
             ("audio hardware | match driver", "a report is data: records with device, kind, made_by, driver, state, in_use", "audio hardware | count"),
+        ], false),
+        ("audio", "debug") => help_block(ctx, "audio debug", "the driver's own account of itself", &[
+            ("audio debug", "stats: verbs sent and unanswered, interrupts, underruns, ring fill, the last sound's rate by the clock", "audio debug"),
+            ("audio debug codec", "the whole widget graph: every node, type, capabilities, connections, pin configuration", "audio debug codec | write /codec.txt"),
+            ("audio debug stream", "the output stream's registers and its buffer descriptors", "audio debug stream"),
+            ("audio debug trace", "the last 64 verbs said to the codec, and their answers", "audio debug trace"),
+            ("audio debug registers", "the controller's global registers - the first look when nothing works", "audio debug registers"),
         ], false),
         ("audio", "outputs") => help_block(ctx, "audio outputs", "the outputs the device has", &[
             ("audio outputs", "each output, whether something is plugged in (where the jack can tell), and * on the one playing", "audio outputs"),
@@ -9279,9 +9288,13 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
             return Err(ShellError::Unknown);
         }
         "hardware" => return audio_hardware(ctx, out, rest),
-        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" | "outputs" | "output" => {}
+        "debug" if rest.contains(' ') => {
+            out.line_fmt(ctx, format_args!("audio: debug takes one view - stats, codec, stream, trace or registers"));
+            return Err(ShellError::Unknown);
+        }
+        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" | "outputs" | "output" | "debug" => {}
         // Agreed and not built: said as such, never as a fault (docs/audio.md has the plan).
-        "debug" | "system" => {
+        "system" => {
             out.line_fmt(ctx, format_args!("audio: `audio {}` is not built yet - docs/audio.md has where it comes in", verb));
             return Err(ShellError::Unknown);
         }
@@ -9314,6 +9327,7 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
         "status" => audio_status(ctx, out),
         "info" => audio_info(ctx, out),
         "outputs" => audio_outputs(ctx, out),
+        "debug" => audio_debug(ctx, out, rest),
         "output" => audio_output_select(ctx, out, rest),
         "volume" => audio_volume(ctx, out, volume.unwrap_or(0)),
         "mute" => audio_mute(ctx, out, true),
@@ -9692,6 +9706,42 @@ fn build_audio_hardware_table(ctx: &ShellCtx) -> Table {
         t.add_row(&row);
     }
     t
+}
+
+/// `audio debug [view]` - the driver's own account of itself (`docs/audio.md`, "`audio debug`"): one view
+/// as labelled lines, fetched a page at a time until the driver says there is no more. A bare `audio
+/// debug` is `stats`. Text, so it pipes like `audio info` - `audio debug codec | write /codec.txt` is how a
+/// new machine's codec is captured.
+fn audio_debug(ctx: &ShellCtx, out: &mut Out, view: &str) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let view = if view.is_empty() { "stats" } else { view };
+    let Some(v) = DEBUG_VIEWS.iter().position(|w| *w == view) else {
+        out.line_fmt(ctx, format_args!("audio: debug takes one of: stats, codec, stream, trace, registers - not '{}'", view));
+        return Err(ShellError::Unknown);
+    };
+    for page in 0..DEBUG_PAGES_MAX {
+        let r = match audio_reply(ctx, out, audio_ask(ctx, &[OP_DEBUG, v as u8, page], AUDIO_REPLY_MS), 2) {
+            Ok(r) => r,
+            Err(e) => {
+                if v as u8 == DEBUG_STATS || v as u8 == DEBUG_STREAM {
+                    out.line_fmt(ctx, format_args!(
+                        "  (with no device to play on, `audio debug codec`, `trace` and `registers` still answer where the driver got as far as the codec)"));
+                }
+                return Err(e);
+            }
+        };
+        let p = r.payload_bytes();
+        for line in p[2..].split(|&b| b == b'\n') {
+            if !line.is_empty() {
+                out.line_fmt(ctx, format_args!("{}", core::str::from_utf8(line).unwrap_or("?")));
+            }
+        }
+        if p[1] == 0 {
+            return Ok(());
+        }
+    }
+    out.line_fmt(ctx, format_args!("audio: the view went past {} pages - the rest is not shown", DEBUG_PAGES_MAX));
+    Err(ShellError::Unknown)
 }
 
 fn audio_volume(ctx: &ShellCtx, out: &mut Out, v: u8) -> Result<(), ShellError> {
@@ -10077,7 +10127,7 @@ fn audio_say_if_silent(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
 /// Which `audio` verbs may start a pipe: the REPORTS. The actions refuse, naming the reports (rule 12).
 fn audio_pipe_refusal(arg: &str) -> Option<&'static str> {
     match arg.split_whitespace().next().unwrap_or("") {
-        "status" | "info" | "outputs" | "hardware" | "version" => None,
+        "status" | "info" | "outputs" | "hardware" | "debug" | "version" => None,
         "" => Some("pipe: bare 'audio' prints its usage, which is not data - pipe a report: audio status, info, hardware or outputs"),
         _ => Some("pipe: that 'audio' verb is an action, not a report, so it cannot start a pipe - the reports are: audio status, info, hardware and outputs"),
     }

@@ -174,6 +174,65 @@ pub const PRESENCE_EMPTY: u8 = 2;
 /// changing the path under a running stream would cut it mid-sound; `AUDIO_OFF` when audio is off.
 pub const OP_OUTPUT: u8 = 12;
 
+/// `[13, view, page]` - the driver's own account of itself (`audio debug`): one `DEBUG_*` view as
+/// labelled lines of text, a page of at most `DEBUG_PAGE` bytes at a time. Answer `[OK, more, text...]`,
+/// `more` 1 when another page follows; the asker fetches pages until it is 0 and joins them. A view this
+/// device does not have is ONE line saying so, never an error - a PWM jack has no codec to dump. `BAD_ARG`
+/// for a view this protocol does not name.
+pub const OP_DEBUG: u8 = 13;
+/// Text in one page. A message carries 4096 bytes; this leaves room for the tag and status around it.
+pub const DEBUG_PAGE: usize = 3800;
+/// Pages one view may take, so a reader looping on `more` is bounded too (CLAUDE.md 26.6).
+pub const DEBUG_PAGES_MAX: u8 = 16;
+pub const DEBUG_STATS: u8 = 0;
+pub const DEBUG_CODEC: u8 = 1;
+pub const DEBUG_STREAM: u8 = 2;
+pub const DEBUG_TRACE: u8 = 3;
+pub const DEBUG_REGISTERS: u8 = 4;
+/// The views by the word `audio debug` takes, in `DEBUG_*` order.
+pub const DEBUG_VIEWS: [&str; 5] = ["stats", "codec", "stream", "trace", "registers"];
+
+/// One page of a debug view, written with `write!` as the whole view is rendered: bytes before the page
+/// are counted and dropped, bytes after it set `more`. Rendering the whole view for every page keeps the
+/// driver stateless between pages - nothing is held for an asker that may never come back for page 2.
+pub struct Page<'a> {
+    buf: &'a mut [u8],
+    skip: usize,
+    at: usize,
+    len: usize,
+    more: bool,
+}
+
+impl<'a> Page<'a> {
+    /// Page `page` (from 0) of a view, into `buf`, whose length is the page size.
+    pub fn new(buf: &'a mut [u8], page: u8) -> Self {
+        let skip = page as usize * buf.len();
+        Page { buf, skip, at: 0, len: 0, more: false }
+    }
+
+    /// The bytes written into the page, and whether the view went on past it.
+    pub fn finish(self) -> (usize, bool) {
+        (self.len, self.more)
+    }
+}
+
+impl core::fmt::Write for Page<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.at >= self.skip {
+                if self.len < self.buf.len() {
+                    self.buf[self.len] = b;
+                    self.len += 1;
+                } else {
+                    self.more = true;
+                }
+            }
+            self.at += 1;
+        }
+        Ok(())
+    }
+}
+
 /// What a pin's default-device field (bits 23:20 of its configuration default) names, as the driver's log
 /// and the shell's `audio` both say it.
 pub fn device_name(dev: u32) -> &'static str {

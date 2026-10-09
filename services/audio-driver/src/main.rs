@@ -243,15 +243,41 @@ struct Hda<'a> {
     dma: Option<&'a Dma>,
     corb_wp: u16,
     rirb_rp: u16,
+    /// The last `TRACE_LEN` verbs and their answers, for `audio debug trace` - exactly what was said to
+    /// the codec, as `wifi debug trace` is for frames. A fixed ring: the oldest is overwritten.
+    trace: [Traced; TRACE_LEN],
+    /// Verbs sent since the driver started, and how many of them had no answer.
+    verbs: u64,
+    verbs_failed: u64,
 }
 
+/// One verb in the trace: the word sent and the answer, or `None` when none came.
+#[derive(Clone, Copy)]
+struct Traced {
+    verb: u32,
+    answer: Option<u32>,
+}
+
+/// Verbs `audio debug trace` keeps.
+const TRACE_LEN: usize = 64;
+
 impl<'a> Hda<'a> {
+    fn new(ctx: &'a ServiceContext, m: &'a Mmio) -> Self {
+        Hda { ctx, m, dma: None, corb_wp: 0, rirb_rp: 0, trace: [Traced { verb: 0, answer: None }; TRACE_LEN], verbs: 0, verbs_failed: 0 }
+    }
+
     /// One codec command, by whichever path is up. `None` names the failure in the log.
     fn send(&mut self, word: u32) -> Option<u32> {
-        match self.dma {
+        let answer = match self.dma {
             Some(d) => self.send_ring(d, word),
             None => self.send_immediate(word),
+        };
+        self.trace[(self.verbs % TRACE_LEN as u64) as usize] = Traced { verb: word, answer };
+        self.verbs += 1;
+        if answer.is_none() {
+            self.verbs_failed += 1;
         }
+        answer
     }
 
     /// A twelve-bit verb with an eight-bit payload.
@@ -747,6 +773,10 @@ struct Player<'a> {
     underruns_total: u32,
     /// The silence the last stream had written in its place, for `status` after it ends.
     last_silence_ms: u32,
+    /// The last sound to end, for `audio debug stats`: what it was, how much it played and how long that
+    /// took by the clock - the measured play rate, which proves the DMA engine and the link clock run at
+    /// the speed they were set to.
+    last: Option<LastPlay>,
     /// A change to the volume or the mute not yet written to `/audio.settings`. Written when nothing is
     /// playing: an `fs` write blocks the serve loop, and a slow one mid-tone would starve the ring.
     settings_dirty: bool,
@@ -754,10 +784,27 @@ struct Player<'a> {
     settings_failing: bool,
 }
 
+/// How the last sound went (`audio debug stats`).
+#[derive(Clone, Copy)]
+struct LastPlay {
+    /// The tone's frequency, or 0 for a stream.
+    hz: u32,
+    rate: u32,
+    played_ms: u32,
+    took_ms: u32,
+    underruns: u32,
+    watchdog: u32,
+}
+
 /// Why there is nothing to play on, when there is not (`wire::no_device`).
 enum Device<'a> {
     Ready(Player<'a>),
     Absent(u8),
+    /// The codec was surveyed and the driver stopped short of playing - on the T630 today, a codec
+    /// playback has not been verified on (A6). The controller is kept, so `audio debug` can still show
+    /// the codec, the verbs and the registers: the dump that finds a real codec's path is needed most
+    /// exactly here.
+    Surveyed(u8, Hda<'a>, OutPath),
 }
 
 /// Ticks per millisecond of the counter, or 0 when it is uncalibrated.
@@ -1142,6 +1189,13 @@ impl<'a> Player<'a> {
             ctx.log("audio-driver: the output stream did not report stopping");
         }
         if let Some(t) = self.tone.take() {
+            if t.started != 0 {
+                self.last = Some(LastPlay {
+                    hz: if t.feed.is_some() { 0 } else { t.hz }, rate: t.rate,
+                    played_ms: (t.played / FRAME_BYTES * 1000 / t.rate as usize) as u32,
+                    took_ms: ms_since(ctx, t.started), underruns: t.underruns, watchdog: t.watchdog,
+                });
+            }
             self.underruns_total = self.underruns_total.saturating_add(t.underruns);
             if t.feed.is_some() {
                 self.last_silence_ms = (t.silence / FRAME_BYTES * 1000 / t.rate as usize) as u32;
@@ -1265,6 +1319,210 @@ impl<'a> Player<'a> {
         }
     }
 
+    /// `audio debug`: one view as text, one page of it (`wire::OP_DEBUG`). The whole view is rendered for
+    /// every page and the page cut from it, so nothing is held between an asker's pages.
+    fn debug(&mut self, irq: &Irq, view: u8, page: u8, out: &mut [u8]) -> usize {
+        let now = self.path.nodes[0];
+        debug_page(out, page, |w| match view {
+            wire::DEBUG_STATS => self.debug_stats(irq, w),
+            wire::DEBUG_CODEC => debug_codec(&mut self.h, &self.path, now, w),
+            wire::DEBUG_STREAM => self.debug_stream(w),
+            wire::DEBUG_TRACE => debug_trace(&self.h, w),
+            _ => debug_registers(self.h.m, w),
+        })
+    }
+
+    fn debug_stats(&mut self, irq: &Irq, w: &mut wire::Page) {
+        use core::fmt::Write;
+        let _ = writeln!(w, "verbs        {} sent, {} unanswered", self.h.verbs, self.h.verbs_failed);
+        let _ = writeln!(w, "commands     {}", if self.h.dma.is_some() { "through the CORB and RIRB" } else { "by immediate command" });
+        let _ = writeln!(w, "interrupts   {} taken; refill {}", irq.seen(),
+            if irq.routed() { "on the stream's interrupt" } else { "by polling - none was routed" });
+        let _ = writeln!(w, "underruns    {} since the driver started", self.underruns_total);
+        match self.tone.as_ref() {
+            Some(t) => {
+                let ahead = t.filled.saturating_sub(t.played);
+                let _ = writeln!(w, "playing      {}, ring {} of {} bytes ahead of the stream ({} ms)",
+                    if t.feed.is_some() { "a stream" } else { "a tone" }, ahead, PCM_LEN,
+                    ahead as u64 * 1000 / (t.rate as u64 * FRAME_BYTES as u64));
+            }
+            None => {
+                let _ = writeln!(w, "playing      nothing");
+            }
+        }
+        match self.last {
+            Some(l) => {
+                // Per mille of real time: 1000 is exact, below it the stream ran slow by the clock.
+                let rate = if l.took_ms == 0 { 0 } else { l.played_ms as u64 * 1000 / l.took_ms as u64 };
+                let what = if l.hz == 0 { "a stream at" } else { "a tone of" };
+                let _ = writeln!(w, "last sound   {} {} Hz: {} ms of sound in {} ms by the clock - played at {}.{}% of real time",
+                    what, if l.hz == 0 { l.rate } else { l.hz }, l.played_ms, l.took_ms, rate / 10, rate % 10);
+                let _ = writeln!(w, "             {} underrun(s), {} watchdog wake(s)", l.underruns, l.watchdog);
+            }
+            None => {
+                let _ = writeln!(w, "last sound   none since the driver started");
+            }
+        }
+        if !wait::calibrated(self.h.ctx) {
+            let _ = writeln!(w, "clock        UNCALIBRATED - every time above is a count of looks, not milliseconds");
+        }
+        if self.settings_failing {
+            let _ = writeln!(w, "settings     the last write of /audio.settings failed");
+        }
+    }
+
+}
+
+/// `[OK, more, text]` for one page of a debug view: `render` writes the whole view, and the page is cut
+/// from it (`wire::Page`).
+fn debug_page(out: &mut [u8], page: u8, render: impl FnOnce(&mut wire::Page)) -> usize {
+    let text_len = wire::DEBUG_PAGE.min(out.len().saturating_sub(2));
+    let (len, more) = {
+        let mut w = wire::Page::new(&mut out[2..2 + text_len], page);
+        render(&mut w);
+        w.finish()
+    };
+    out[0] = wire::OK;
+    out[1] = more as u8;
+    2 + len
+}
+
+/// The whole widget graph of the codec: every node, its type, capabilities, connections and (for a pin)
+/// its configuration - what finds a real codec's output path, not an assumption. `now` is the pin playing.
+fn debug_codec(h: &mut Hda, path: &OutPath, now: u32, w: &mut wire::Page) {
+    use core::fmt::Write;
+    let (cad, afg) = (path.cad, path.afg);
+    let _ = writeln!(w, "codec {} - vendor {:04x} device {:04x}, audio function group {:#04x}", cad,
+        path.vendor, path.device, afg);
+    let Some(ws) = h.param(cad, afg, PARAM_SUB_NODE_COUNT) else {
+        let _ = writeln!(w, "the function group did not answer how many widgets it has");
+        return;
+    };
+    let (start, count) = ((ws >> 16) & 0xFF, ws & 0xFF);
+    let power = match h.verb(cad, afg, GET_POWER_STATE, 0) {
+        Some(ps) => match (ps >> 4) & 0xF { 0 => "D0", 1 => "D1", 2 => "D2", 3 => "D3", _ => "D3cold" },
+        None => "no answer",
+    };
+    let _ = writeln!(w, "widgets      {:#04x}..{:#04x} ({}); function group power {}", start, start + count.max(1) - 1, count, power);
+    for nid in start..start + count {
+        let Some(caps) = h.param(cad, nid, PARAM_AUDIO_WIDGET_CAP) else {
+            let _ = writeln!(w, "node {:#04x}  no answer", nid);
+            continue;
+        };
+        let t = (caps >> 20) & 0xF;
+        let name = match t {
+            0x0 => "output", 0x1 => "input", 0x2 => "mixer", 0x3 => "selector", 0x4 => "pin",
+            0x5 => "power", 0x6 => "volume knob", 0x7 => "beep", 0xF => "vendor", _ => "?",
+        };
+        let _ = write!(w, "node {:#04x}  {:<11} caps {:#010x}", nid, name, caps);
+        if caps & WCAP_OUT_AMP != 0 {
+            let amp = h.param(cad, nid, PARAM_OUT_AMP_CAP).unwrap_or(0);
+            let _ = write!(w, "  amp-out {:#010x} ({} steps)", amp, (amp >> 8) & 0x7F);
+        }
+        if t == W_PIN {
+            let cfg = h.verb(cad, nid, GET_CONFIG_DEFAULT, 0).unwrap_or(0);
+            let pc = h.param(cad, nid, PARAM_PIN_CAP).unwrap_or(0);
+            let ctl = h.verb(cad, nid, GET_PIN_WIDGET_CONTROL, 0).unwrap_or(0);
+            let _ = write!(w, "  config {:#010x} ({}{})  pincap {:#010x}  control {:#04x}{}", cfg,
+                device_name((cfg >> 20) & 0xF), if cfg >> 30 == 0b01 { ", nothing attached" } else { "" }, pc, ctl,
+                if nid == now { "  <- playing" } else { "" });
+        }
+        let mut conns = [0u32; 8];
+        let n = connections(h, cad, nid, &mut conns);
+        if n > 0 {
+            let _ = write!(w, "  from");
+            for c in &conns[..n] {
+                let _ = write!(w, " {:#04x}", c);
+            }
+            if n > 1 {
+                if let Some(sel) = h.verb(cad, nid, 0xF01, 0) {
+                    let _ = write!(w, " (selected {})", sel & 0xFF);
+                }
+            }
+        }
+        let _ = writeln!(w);
+    }
+}
+
+impl<'a> Player<'a> {
+    /// The output stream's registers and its buffer descriptors.
+    fn debug_stream(&mut self, w: &mut wire::Page) {
+        use core::fmt::Write;
+        let (m, d, sd) = (self.h.m, self.d, self.sd);
+        let ctl = m.read32(sd + SD_CTL);
+        let fmt = m.read16(sd + SD_FMT);
+        let _ = writeln!(w, "descriptor   {:#06x} (the first output stream)", sd);
+        let _ = writeln!(w, "control      {:#08x}: run {}, reset {}, stream tag {}, interrupt on completion {}",
+            ctl & 0x00FF_FFFF, ctl & SD_RUN != 0, ctl & SD_SRST != 0, (ctl >> 20) & 0xF, ctl & SD_IOCE != 0);
+        let sts = m.read8(sd + SD_STS);
+        let _ = writeln!(w, "status       {:#04x}: period done {}, FIFO error {}, descriptor error {}",
+            sts, sts & 0x04 != 0, sts & 0x08 != 0, sts & 0x10 != 0);
+        let _ = writeln!(w, "position     {} of {} bytes (LPIB of CBL), last valid index {}",
+            m.read32(sd + SD_LPIB), m.read32(sd + SD_CBL), m.read16(sd + SD_LVI));
+        let _ = writeln!(w, "format       {:#06x}: {} Hz base, {} bits, {} channel(s)", fmt,
+            if fmt & 0x4000 != 0 { 44_100 } else { 48_000 },
+            match (fmt >> 4) & 0x7 { 0 => 8, 1 => 16, 2 => 20, 3 => 24, 4 => 32, _ => 0 }, (fmt & 0xF) + 1);
+        let _ = writeln!(w, "BDL at       {:#010x}{:08x}", m.read32(sd + SD_BDPU), m.read32(sd + SD_BDPL));
+        for i in 0..BDL_ENTRIES {
+            let e = BDL_OFF + i * 16;
+            let _ = writeln!(w, "  entry {}    address {:#012x}, {} bytes, flags {:#x}", i, d.read64(e), d.read32(e + 8), d.read32(e + 12));
+        }
+        match self.tone.as_ref() {
+            Some(t) => {
+                let _ = writeln!(w, "ring         {} bytes written, {} played, at {} Hz", t.filled, t.played, t.rate);
+            }
+            None => {
+                let _ = writeln!(w, "ring         idle - nothing playing");
+            }
+        }
+    }
+}
+
+/// The last verbs sent to the codec and their answers, oldest first.
+fn debug_trace(h: &Hda, w: &mut wire::Page) {
+    use core::fmt::Write;
+    let n = h.verbs.min(TRACE_LEN as u64);
+    let _ = writeln!(w, "the last {} of {} verb(s), oldest first: codec, node, verb, payload -> answer", n, h.verbs);
+    for k in 0..n {
+        let i = ((h.verbs - n + k) % TRACE_LEN as u64) as usize;
+        let t = h.trace[i];
+        let v = t.verb;
+        // Two verb shapes share the word: a 12-bit verb (always 0x7.. or 0xF..) with an 8-bit payload, and
+        // a 4-bit verb (format, amplifier) with a 16-bit payload. Split each the way it was sent.
+        if matches!((v >> 16) & 0xF, 0x7 | 0xF) {
+            let _ = write!(w, "{:#010x}  codec {} node {:#04x} verb {:#05x} payload {:#04x} -> ",
+                v, v >> 28, (v >> 20) & 0x7F, (v >> 8) & 0xFFF, v & 0xFF);
+        } else {
+            let _ = write!(w, "{:#010x}  codec {} node {:#04x} verb {:#03x} payload {:#06x} -> ",
+                v, v >> 28, (v >> 20) & 0x7F, (v >> 16) & 0xF, v & 0xFFFF);
+        }
+        match t.answer {
+            Some(a) => { let _ = writeln!(w, "{:#010x}", a); }
+            None => { let _ = writeln!(w, "NO ANSWER"); }
+        }
+    }
+}
+
+/// The controller's global registers: the first look when nothing works.
+fn debug_registers(m: &Mmio, w: &mut wire::Page) {
+    use core::fmt::Write;
+    let gcap = m.read16(GCAP);
+    let _ = writeln!(w, "GCAP      {:#06x}: {} output, {} input, {} bidirectional stream(s), 64-bit {}",
+        gcap, (gcap >> 12) & 0xF, (gcap >> 8) & 0xF, (gcap >> 3) & 0x1F, gcap & 1 != 0);
+    let _ = writeln!(w, "VMAJ.VMIN {}.{}", m.read8(VMAJ), m.read8(VMIN));
+    let _ = writeln!(w, "GCTL      {:#010x} (bit 0: out of reset)", m.read32(GCTL));
+    let _ = writeln!(w, "STATESTS  {:#06x} (a bit per codec that answered)", m.read16(STATESTS));
+    let _ = writeln!(w, "INTCTL    {:#010x}", m.read32(INTCTL));
+    let _ = writeln!(w, "INTSTS    {:#010x}", m.read32(0x24));
+    let _ = writeln!(w, "WALCLK    {:#010x}", m.read32(0x30));
+    let _ = writeln!(w, "CORB      WP {:#06x} RP {:#06x} CTL {:#04x} SIZE {:#04x}",
+        m.read16(CORBWP), m.read16(CORBRP), m.read8(CORBCTL), m.read8(CORBSIZE));
+    let _ = writeln!(w, "RIRB      WP {:#06x} CTL {:#04x} STS {:#04x} SIZE {:#04x} RINTCNT {}",
+        m.read16(RIRBWP), m.read8(RIRBCTL), m.read8(RIRBSTS), m.read8(RIRBSIZE), m.read16(RINTCNT));
+    let _ = writeln!(w, "window    {} bytes", m.len());
+}
+
+impl<'a> Player<'a> {
     /// One request, answered into `out`. Returns the answer's length.
     fn answer(&mut self, irq: &Irq, op: u8, args: &[u8], out: &mut [u8]) -> usize {
         let on = self.power == wire::POWER_ON;
@@ -1359,6 +1617,13 @@ impl<'a> Player<'a> {
                 let (rate, ch, bits, frames) = (wire::get_u32(args, 0), args[4], args[5], wire::get_u32(args, 6));
                 self.open_stream(irq, rate, ch, bits, frames, out)
             }
+            wire::OP_DEBUG => {
+                let (view, page) = (args.first().copied().unwrap_or(0xFF), args.get(1).copied().unwrap_or(0));
+                if view as usize >= wire::DEBUG_VIEWS.len() || page >= wire::DEBUG_PAGES_MAX {
+                    return bad(out);
+                }
+                self.debug(irq, view, page, out)
+            }
             wire::OP_OUTPUTS => self.outputs_answer(out),
             wire::OP_OUTPUT => {
                 let Some(&pin) = args.first() else { return bad(out) };
@@ -1442,7 +1707,7 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
         Some(c) => c,
     };
     ctx.log_fmt(format_args!("audio-driver: codec(s) answered at mask {:#06x}", codecs));
-    let mut h = Hda { ctx, m, dma: None, corb_wp: 0, rirb_rp: 0 };
+    let mut h = Hda::new(ctx, m);
     // Every codec is surveyed, so the log names each; the outputs offered are the first codec's that has
     // any - one codec plays at a time.
     let mut outputs = Outputs { paths: [None; wire::OUTPUTS_MAX], n: 0 };
@@ -1460,21 +1725,21 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
         ctx.log_fmt(format_args!(
             "audio-driver: codec vendor {:04x} is not the one playback was verified on - stopping after the survey (docs/audio.md, A6)",
             path.vendor));
-        return Device::Absent(wire::no_device::UNVERIFIED_CODEC);
+        return Device::Surveyed(wire::no_device::UNVERIFIED_CODEC, h, path);
     }
     let Some(d) = dma else {
         ctx.log("audio-driver: no DMA arena was granted - the survey is all this driver can do");
-        return Device::Absent(wire::no_device::NO_ARENA);
+        return Device::Surveyed(wire::no_device::NO_ARENA, h, path);
     };
     if d.len() < ARENA_NEEDED {
         ctx.log_fmt(format_args!(
             "audio-driver: the DMA arena is {} bytes and this driver needs {} - stopping after the survey",
             d.len(), ARENA_NEEDED));
-        return Device::Absent(wire::no_device::NO_ARENA);
+        return Device::Surveyed(wire::no_device::NO_ARENA, h, path);
     }
     d.zero();
     if !start_rings(&mut h, d) {
-        return Device::Absent(wire::no_device::BRINGUP_FAILED);
+        return Device::Surveyed(wire::no_device::BRINGUP_FAILED, h, path);
     }
     // The rings proved by asking again what the survey already asked: same codec, same answer.
     match h.param(path.cad, 0, PARAM_VENDOR_ID) {
@@ -1485,12 +1750,12 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
             ctx.log_fmt(format_args!(
                 "audio-driver: the rings answered {:?} where the survey read vendor {:04x} - stopping",
                 other, path.vendor));
-            return Device::Absent(wire::no_device::BRINGUP_FAILED);
+            return Device::Surveyed(wire::no_device::BRINGUP_FAILED, h, path);
         }
     }
     if !configure_path(&mut h, &path) {
         ctx.log("audio-driver: the output path could not be configured");
-        return Device::Absent(wire::no_device::BRINGUP_FAILED);
+        return Device::Surveyed(wire::no_device::BRINGUP_FAILED, h, path);
     }
     let amp = volume_amp(&mut h, &path);
     let pin_device = h.verb(path.cad, path.nodes[0], GET_CONFIG_DEFAULT, 0).map_or(0, |c| (c >> 20) & 0xF);
@@ -1499,7 +1764,7 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
         h, d, path, outputs, output_chosen: None, pin_device, amp,
         sd: SD_BASE + iss * SD_STRIDE, // the first output stream follows the input streams
         power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false, tone: None, underruns_total: 0,
-        last_silence_ms: 0,
+        last_silence_ms: 0, last: None,
         settings_dirty: false, settings_failing: false,
     };
     if let Some(s) = settings::load(ctx, &mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), "audio-driver", DEFAULT_VOLUME) {
@@ -1574,8 +1839,10 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
         }),
         Device::Absent(r) => ctx.log_fmt(format_args!(
             "audio-driver: serving with no device to play on (reason {}) - every request is answered with that", r)),
+        Device::Surveyed(r, ..) => ctx.log_fmt(format_args!(
+            "audio-driver: serving with no device to play on (reason {}) - every request is answered with that, and `audio debug` still shows the codec, the verbs and the registers", r)),
     }
-    let mut out = [0u8; 64];
+    let mut out = [0u8; 4096];
     loop {
         let playing = matches!(&dev, Device::Ready(p) if p.tone.is_some());
         let within = match (playing, irq.routed()) {
@@ -1614,6 +1881,22 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
                     out[2] = wire::NO_DEVICE;
                     out[3] = *r;
                     4
+                }
+                Device::Surveyed(r, h, path) => {
+                    let b = req.payload_bytes();
+                    let (op, view, page) = (b.get(2).copied().unwrap_or(0), b.get(3).copied().unwrap_or(0xFF), b.get(4).copied().unwrap_or(0));
+                    if op == wire::OP_DEBUG && matches!(view, wire::DEBUG_CODEC | wire::DEBUG_TRACE | wire::DEBUG_REGISTERS)
+                        && page < wire::DEBUG_PAGES_MAX {
+                        2 + debug_page(&mut out[2..], page, |w| match view {
+                            wire::DEBUG_CODEC => debug_codec(h, path, 0xFF, w),
+                            wire::DEBUG_TRACE => debug_trace(h, w),
+                            _ => debug_registers(h.m, w),
+                        })
+                    } else {
+                        out[2] = wire::NO_DEVICE;
+                        out[3] = *r;
+                        4
+                    }
                 }
                 Device::Ready(p) => {
                     let b = req.payload_bytes();

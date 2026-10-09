@@ -10284,6 +10284,24 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
         "hardware <device>: why it is driven, and the driver's account");
     let r = run!(b"audio hardware 99:99.9\r");
     check!(r.contains("no audio device called '99:99.9'"), "an unknown device is refused with the list");
+    // `audio debug`: each view answers from the driver, after a tone has played (so `stats` has a last
+    // sound). The rate it measures is NOT asserted: TCG's clock is not the device's.
+    let r = run!(b"audio debug\r");
+    check!(r.contains("verbs") && r.contains("unanswered") && r.contains("last sound") && r.contains("of real time"),
+        "debug stats: verbs, and the last sound's rate by the clock");
+    let r = run!(b"audio debug codec\r");
+    check!(r.contains("codec 0") && r.contains("pin") && r.contains("<- playing") && r.contains("output"),
+        "debug codec: the widget graph, the playing pin marked");
+    let r = run!(b"audio debug stream\r");
+    check!(r.contains("descriptor") && r.contains("entry 3"), "debug stream: the registers and the four BDL entries");
+    let r = run!(b"audio debug trace\r");
+    check!(r.contains("oldest first") && r.contains(" -> 0x"), "debug trace: verbs and their answers");
+    let r = run!(b"audio debug registers\r");
+    check!(r.contains("GCAP") && r.contains("CORB") && r.contains("RIRB"), "debug registers: the controller's globals");
+    let r = run!(b"audio debug codec | match pin\r");
+    check!(r.contains("pin") && !r.contains("cannot start a pipe"), "debug pipes as text");
+    let r = run!(b"audio debug noise\r");
+    check!(r.contains("debug takes one of"), "an unknown view is refused with the list");
     let r = run!(b"audio off\r");
     check!(r.contains("audio off - the codec is powered down"), "off");
     let r = run!(b"audio tone 440 1\r");

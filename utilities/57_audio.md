@@ -16,10 +16,10 @@ jack); the Pi 2 is built and not yet heard. Not run on hardware on x86: on the T
 answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
 
 The verbs in section 1 are built, and the volume, the mute and the output survive a reboot (section 5).
-`hardware`, `outputs` and `output` were built on 2026-10-09 (`feat/audio-finish`) and run in QEMU, which
-has ONE audio controller with ONE output - so the reports, the in-use marks and a refused name are shown
-there; a second controller and switching between two outputs are not, until hardware with them. The rest
-of the surface the operator agreed - `debug`, `system sounds` and the keyboard shortcuts - is designed in
+`hardware`, `outputs`, `output` and `debug` were built on 2026-10-09 (`feat/audio-finish`) and run in
+QEMU, which has ONE audio controller with ONE output - so the reports, the in-use marks and a refused name
+are shown there; a second controller and switching between two outputs are not, until hardware with them.
+The rest of the surface the operator agreed - `system sounds` and the keyboard shortcuts - is designed in
 `docs/audio.md` and not built yet; each of those words answers `not built yet` rather than being mistaken
 for a fault.
 
@@ -42,6 +42,7 @@ for a fault.
 | `audio off hard` | action | stop anything playing and hold the whole controller in reset - the closest HD Audio has to cutting the power. `audio on` brings it back |
 | `audio tone <hz> [seconds]` | action | play a sine the driver generates itself, 20 to 20000 Hz, 2 s unless told (tenths allowed: `0.5`, up to 600). Blocks with `[q] quit`; `q` STOPS the tone (rule 11) |
 | `audio play <path>` | action | play a WAV file from disk: 16-bit PCM, mono or stereo, 44100 or 48000 Hz where the codec offers it. Blocks with `[q] quit`; `q` STOPS it. Anything else is refused with the reason |
+| `audio debug [view]` | report, pipes | BUILT: the driver's own account of itself, one view of `stats` (bare), `codec`, `stream`, `trace` or `registers` - verbs sent and unanswered, interrupts, underruns and the last sound's rate by the clock; the whole widget graph; the output stream's registers and buffer descriptors; the last 64 verbs and their answers; the controller's globals. On a driver that surveyed its codec and stopped (the T630 today), `codec`, `trace` and `registers` still answer. The Pis' jack answers every view, `codec` and `trace` with a line saying it has neither |
 | `audio help` | | usage, one real example per row |
 | `audio version` | | the version and the collective copyright line (rules 5 and 6) |
 
@@ -87,7 +88,8 @@ something else` when it disagrees.
 
 `status` and `info` start pipes, as labelled lines: `audio status | match volume`, `audio info | write
 /audio-info.txt`. `outputs` pipes as records - `output`, `plugged`, `in_use` - so `audio outputs | count`
-is how many there are; `hardware` pipes as records too - `device`, `kind`, `made_by`, `driver`, `state`,
+is how many there are; `debug` pipes as text (`audio debug codec | write /codec.txt` captures a new
+machine's codec); `hardware` pipes as records too - `device`, `kind`, `made_by`, `driver`, `state`,
 `in_use`. The actions refuse with a sentence naming the reports. Piping sound IN will be refused
 in the design: a pipe carries 16 KiB, a tenth of a second of sound, so `play` takes a PATH and the file is
 the adapter (`docs/audio.md`).

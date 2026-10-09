@@ -51,7 +51,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A1** | Reset, find the codecs, walk the widget graph, report an output path. Immediate Command registers; no DMA, no interrupt | QEMU - **built** |
 | **A2** | CORB/RIRB, the command rings the spec requires (Immediate Command is optional, and unknown on the T630's FCH). The first DMA - used only on QEMU's codec until A6, for the T630's own reasons | QEMU - **built** |
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
-| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `outputs` and `output` built 2026-10-09**; `hardware`, debug, system sounds and the shortcuts to come |
+| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `hardware`, `outputs`, `output` and `debug` built 2026-10-09**; system sounds and the shortcuts to come |
 | **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
 | A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
@@ -998,3 +998,40 @@ the wrong device - and a machine with no audio driver at all still has its devic
 **QEMU has one controller**, so `osdev test audio` shows the row, the mark, the pipe, one device in full
 and a refused name (50 checks, all passing). The T630 is the machine with two, and is where this shows
 `backlog/80` K2 in one line.
+
+## Step A4: `audio debug` (2026-10-09, `feat/audio-finish`)
+
+**One op, five views, paged.** `OP_DEBUG` takes a view and a page and answers labelled lines of text, at
+most `wire::DEBUG_PAGE` bytes at a time with a flag saying whether more follows. The driver renders the
+WHOLE view for every page and cuts the page from it (`wire::Page`, shared by both drivers), so it holds
+nothing between an asker's pages - an asker that never comes back for page 2 costs nothing. Pages are
+bounded too (`DEBUG_PAGES_MAX`), so a reader looping on "more" cannot loop forever.
+
+**What each view reads, on the HD Audio driver:**
+- `stats` - verbs sent and unanswered (counted in the one place every verb goes, `Hda::send`), how
+  commands travel (rings or immediate), interrupts taken, underruns, what is playing and how far the ring
+  is ahead, and the LAST sound: how much it played against how long that took by the clock, as a percent
+  of real time. That last line is the one that proves the DMA engine and the link clock run at the rate
+  they were set to; QEMU's TCG clock is not the device's, so the test does not assert its value.
+- `codec` - every widget of the codec's audio function group: type, capabilities, output amplifier,
+  connections and the selected one, and for a pin its configuration default, pin capabilities and
+  control, with the pin playing marked. Read live, with verbs.
+- `stream` - the output stream descriptor's control, status, position, length, last valid index and
+  format, the BDL's address and every entry.
+- `trace` - the last 64 verbs and their answers, from a fixed ring in `Hda`, decoded by shape: a 12-bit
+  verb (0x7.. and 0xF..) with an 8-bit payload, or a 4-bit verb (format, amplifier) with a 16-bit one.
+- `registers` - GCAP, the version, GCTL, STATESTS, INTCTL, INTSTS, the wall clock, and the CORB and RIRB.
+
+**The views outlive a stopped bring-up.** On the T630 the driver surveys the ALC255 and stops before
+playback (A6). It used to keep nothing past that point, so the dump A6 begins from was unavailable on
+exactly the machine that needs it. The driver now keeps the surveyed controller (`Device::Surveyed`):
+every request is still answered with why there is no device, except `debug codec`, `trace` and
+`registers`, which answer as on a working one. `audio debug codec | write /codec.txt` on the T630 is the
+first step of A6.
+
+**On the Pis** `pwm-audio` answers all five: `stats` with the clock, the PWM range and the pacing check
+its start-up already measured (kept now, not only logged), `stream` with the DMA channel's control, its
+control block and where in the ring it is reading, `registers` with the PWM's and the channel's, and
+`codec` and `trace` with one line each saying a PWM jack has neither.
+
+`osdev test audio` runs every view and the pipe: 57 checks, all passing.
