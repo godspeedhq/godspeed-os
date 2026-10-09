@@ -581,6 +581,12 @@ fn presence(h: &mut Hda, cad: u32, pin: u32) -> u8 {
     if caps & PINCAP_PRESENCE == 0 {
         return wire::PRESENCE_UNKNOWN;
     }
+    // A FIXED pin - an internal speaker, its connectivity field 0b10 - is not a jack, and what its sense
+    // reads means nothing: the T630's speaker pin reports nothing present with the speaker fitted and
+    // playing. Linux does not consult it either. Unknown, so `audio` does not say nothing will be heard.
+    if matches!(h.verb(cad, pin, GET_CONFIG_DEFAULT, 0), Some(cfg) if cfg >> 30 == 0b10) {
+        return wire::PRESENCE_UNKNOWN;
+    }
     if caps & PINCAP_TRIGGER != 0 {
         let _ = h.verb(cad, pin, SET_PIN_SENSE, 0);
     }
