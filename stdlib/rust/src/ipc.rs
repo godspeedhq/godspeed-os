@@ -49,6 +49,58 @@ use crate::error::Error;
 /// [`crate::fs`] does, rather than looking for a way to raise the limit.
 pub const MAX_BYTES: usize = godspeed_sdk::ipc::MAX_PAYLOAD;
 
+// THE RECEIVES ARE `#[inline(always)]`, AND THAT IS LOAD-BEARING. A `Message` is 4 KiB by value, so a
+// receive that is its own frame costs every caller a second 4 KiB of stack - and the shell, whose user
+// stack is tight on pipe paths, has overflowed on less. The SDK's `recv_timeout` says the same.
+
+/// The kernel's exact refusal, for the few programs whose job is to tell refusals apart.
+///
+/// [`Error`] is deliberately coarse: a sender is told whether the message left, not which of the
+/// kernel's reasons stopped it, because almost every caller does the same thing about all of them
+/// (CLAUDE.md 7.7). Two kinds of program genuinely act on the difference, and this is for them:
+///
+/// - **a conformance test**, whose whole purpose is to assert that the kernel answered `EndpointDead`
+///   and not `CapNotHeld` (`services/probe`, the section 22 suites);
+/// - **a fault injector that counts deaths** (`chaos`), where a dead endpoint is a kill landing and a
+///   stale or revoked capability is not.
+///
+/// An ordinary service uses the functions above. Reaching for these to log a more specific reason is
+/// the wrong trade: the coarse answer is the one with a defined obligation attached to it.
+pub mod exact {
+    use godspeed_sdk::ipc::Message;
+    use godspeed_sdk::service_context::ServiceContext;
+
+    use crate::cap::Cap;
+
+    pub use godspeed_sdk::capability::CapError;
+    pub use godspeed_sdk::ipc::IpcError;
+
+    /// [`super::send`], reporting the kernel's own refusal.
+    pub fn send(ctx: &ServiceContext, peer: &str, msg: &Message) -> Result<(), IpcError> {
+        ctx.send(peer, msg)
+    }
+
+    /// [`super::try_send`], reporting the kernel's own refusal.
+    pub fn try_send(ctx: &ServiceContext, peer: &str, msg: &Message) -> Result<(), IpcError> {
+        ctx.try_send(peer, msg)
+    }
+
+    /// [`super::send_to`], reporting the kernel's own refusal.
+    pub fn send_to(ctx: &ServiceContext, cap: Cap, msg: &Message) -> Result<(), IpcError> {
+        ctx.send_by_handle(cap.handle(), msg)
+    }
+
+    /// [`super::try_send_to`], reporting the kernel's own refusal.
+    pub fn try_send_to(ctx: &ServiceContext, cap: Cap, msg: &Message) -> Result<(), IpcError> {
+        ctx.try_send_by_handle(cap.handle(), msg)
+    }
+
+    /// [`super::send_granting`], reporting the kernel's own refusal.
+    pub fn send_granting(ctx: &ServiceContext, to: Cap, granting: Cap, msg: &Message) -> Result<(), IpcError> {
+        ctx.send_with_cap_by_handle(to.handle(), granting.handle(), msg)
+    }
+}
+
 /// Translate a transport failure into the one error type a program handles.
 ///
 /// The mapping is about what the CALLER should do rather than about which syscall said no: to a
@@ -132,6 +184,7 @@ pub fn send_granting(
 /// and drop it. That is not hypothetical; it cost this project a day (CLAUDE.md 8.2). When you are
 /// waiting for an answer to something you asked, use [`crate::call`], which matches the reply to its
 /// own reply capability and leaves everything else queued.
+#[inline(always)]
 pub fn recv(ctx: &ServiceContext) -> Message {
     ctx.recv()
 }
@@ -139,6 +192,7 @@ pub fn recv(ctx: &ServiceContext) -> Message {
 /// Take a message if one is already waiting, without blocking.
 ///
 /// `None` means the queue was empty at that instant and nothing more.
+#[inline(always)]
 pub fn try_recv(ctx: &ServiceContext) -> Option<Message> {
     ctx.try_recv()
 }
@@ -148,6 +202,7 @@ pub fn try_recv(ctx: &ServiceContext) -> Option<Message> {
 /// `Ok(None)` is the deadline passing - a fact about time, not a failure of the peer. Prefer this to
 /// a bare [`recv`] anywhere a missing message would otherwise hang the service forever, which is
 /// every place a peer can die (CLAUDE.md 26.6).
+#[inline(always)]
 pub fn recv_within(ctx: &ServiceContext, secs: i64) -> Option<Message> {
     ctx.recv_timeout(ctx.duration_cycles((secs.max(0) as u64) * 1000))
 }
@@ -157,6 +212,7 @@ pub fn recv_within(ctx: &ServiceContext, secs: i64) -> Option<Message> {
 /// For a driver or a poller whose rhythm is shorter than a second. Same contract: `None` is the
 /// deadline passing, and the wait takes whatever arrives next - see [`recv`] on why that matters to a
 /// task that also awaits replies.
+#[inline(always)]
 pub fn recv_within_ms(ctx: &ServiceContext, ms: u64) -> Option<Message> {
     ctx.recv_timeout(ctx.duration_cycles(ms))
 }

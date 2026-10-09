@@ -54,6 +54,17 @@ pub fn sleep_us(ctx: &ServiceContext, us: u64) {
     ctx.sleep(if per_10ms == 0 { 1 } else { crate::driver::wait::ticks_for(per_10ms, us) });
 }
 
+/// Sleep for `ticks` of the counter [`crate::driver::wait::ticks`] reads.
+///
+/// For code that already works in counter ticks - a driver that measured how long the kernel's sleep
+/// really lasts on this board and schedules against that measurement. Anything written in time uses
+/// [`sleep_ms`] or [`sleep_us`], which convert for you and know what an uncalibrated machine means;
+/// a hand-converted tick count here is the copy those exist to replace. Zero is treated as one: a
+/// sleep of nothing is a yield, and [`yield_now`] says so.
+pub fn sleep_ticks(ctx: &ServiceContext, ticks: u64) {
+    ctx.sleep(ticks.max(1));
+}
+
 /// Seconds since this machine booted.
 ///
 /// Monotonic and always available, including before any clock is set, which is what makes it the
