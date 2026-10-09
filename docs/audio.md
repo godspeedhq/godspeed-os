@@ -53,7 +53,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
 | **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `hardware`, `outputs`, `output`, `debug`, system sounds and the keyboard shortcuts built 2026-10-09** |
 | **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
-| A6 | Real sound on hardware. **HEARD on the Wyse 5070 (2026-10-09)**, which needs neither kernel fix nor a snoop bit; then the T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD. A person listening on each | Wyse, then T630 |
+| A6 | Real sound on hardware. **HEARD on the Wyse 5070 and, through headphones, on the T630 (2026-10-09)**, which needs neither kernel fix nor a snoop bit; then the T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD. A person listening on each | Wyse, then T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
 
 **Before A3, the library work the process asks for.** Two things audio needs are already written by
@@ -1392,3 +1392,15 @@ nodes are not where Linux has them on this part, and bring-up stops there. Silen
 moving - the stream is not running, so the codec was never the question: the controller (and its missing
 interrupt, or the IOMMU) is. Silence with the position moving - the samples reach the codec and are lost
 inside it, which leaves the converter's stream tag and format, read in `audio debug codec`.
+
+**The card (2026-10-09, same day): HEARD on the T630, through headphones.** Every coefficient of
+`alc256_init` read back the same - 0x57/0x04 `0xa09c -> 0xa099` and back, 0x53/0x02 pulsed, 0x36 `0x0004 ->
+0x5757` - then `ready ... refills by polling`. After `audio output headphone` (`output now pin 0x21
+(headphone)`), `audio debug codec` showed pin 0x21 `control 0xc0 <- playing`, and the operator heard the
+tone in the headphones: the HDA driver now plays on both x86 machines, the T630 on a controller with no
+interrupt at all. A 10 s tone through the speaker pin played its full length with 0 underruns; whether the
+T630 has a speaker fitted for it to reach is still not known.
+
+**What this does not cover, recorded:** the Wyse's headphone jack now gets the headphone amplifier too
+(0xc0 on any pin that can drive headphones) and has not been listened to since; the Wyse's ALC225 has its
+own Linux headphone sequence (`alc225_init`), not done; and the T630's speaker remains unexplained.
