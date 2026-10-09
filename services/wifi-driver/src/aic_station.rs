@@ -853,6 +853,21 @@ impl Station for Aic<'_> {
         }
     }
 
+    /// `wifi hardware onboard`, after the host's facts: the address and the version of the firmware running
+    /// on the radio, as its bring-up read them (`aic::FwFacts`) - nothing is asked of the chip here. The
+    /// Broadcom's station has always added these; this one did not, so `hardware firmware` on the
+    /// VisionFive said `(not reported)` about a firmware that was running (2026-10-09).
+    fn details(&mut self, d: &mut godspeed_wifi::serve::Details, _live: bool, _ctx: &ServiceContext) {
+        let m = self.mac;
+        d.add("address", format_args!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (from the firmware)", m[0], m[1], m[2], m[3], m[4], m[5]));
+        let v = &self.version[..self.version_len];
+        let end = v.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(v.len());
+        match core::str::from_utf8(&v[..end]) {
+            Ok(text) if !text.trim().is_empty() => d.add("firmware", format_args!("fmacfw {}, running", text.trim())),
+            _ => d.add("firmware", format_args!("fmacfw, running (its version string did not come back)")),
+        }
+    }
+
     /// `wifi debug`, in the Broadcom's reply layout (`wire::dbg`): no trace ring is kept for this radio,
     /// so the trace is empty; the firmware's version and address are the ones its bring-up read; the
     /// counters are this module's, at the Broadcom's positions where a field means the same thing and zero
