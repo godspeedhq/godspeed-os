@@ -7,7 +7,7 @@
 //! # The whole of it
 //!
 //! ```ignore
-//! use godspeed::{fs, io};
+//! use godspeed::{fs, io, ipc, ServiceContext};
 //!
 //! #[no_mangle]
 //! pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -18,7 +18,7 @@
 //!         Ok(n)  => io::println(&ctx, core::str::from_utf8(&buf[..n]).unwrap_or("<not utf-8>")),
 //!         Err(e) => io::report(&ctx, "read", e),
 //!     }
-//!     loop { ctx.yield_cpu(); }
+//!     ipc::park(&ctx) // finished: hold still, using no CPU (see "Why `service_main`" below)
 //! }
 //! ```
 //!
@@ -26,8 +26,8 @@
 //!
 //! **It does not grant authority.** Every entry point takes a `&ServiceContext`, because that is
 //! where authority lives. `fs::Fs::new(&ctx)` is a convenience, not a capability: a task whose
-//! contract never asked for the filesystem gets [`Error::Unreachable`] from it, the same as for any
-//! peer it cannot reach. There is no global, no ambient handle, and no `print!` that finds a stdout
+//! spawn request never named the filesystem as a peer (CLAUDE.md 13.6), and that holds no
+//! `ACQUIRE_ANY`, gets [`Error::Unreachable`] from it, the same as for any peer it cannot reach. There is no global, no ambient handle, and no `print!` that finds a stdout
 //! on its own - a global would be ambient authority wearing a familiar name.
 //!
 //! **It does not hide failure.** In particular it does not hide the difference between "the request
@@ -42,7 +42,7 @@
 //! # Why `service_main` and not `fn main`
 //!
 //! Because GodspeedOS has no terminating task yet. Every runnable thing is a service, entered at
-//! `service_main(ctx) -> !`, and of the 52 syscalls the only one that ends a task is `Kill` - which
+//! `service_main(ctx) -> !`, and of the 54 syscalls the only one that ends a task is `Kill` - which
 //! kills by name and is gated behind `service_control`, a capability no application should hold.
 //!
 //! That gap is real and is written up in `docs/stdlib-design.md` rather than papered over here. It

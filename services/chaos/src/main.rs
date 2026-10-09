@@ -32,7 +32,8 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, CapHandle, Message, IpcError};
+use godspeed as gs;
+use godspeed_sdk::{ServiceContext, Message};
 use core::fmt::Write as _;
 
 // Tuning - mirrors the shell's former max-carnage, bounded (§26.6).
@@ -50,18 +51,18 @@ const SHELL_SETTLE_YIELDS: u32 = 200_000; // hard cap on that beat if the clock 
 // keeps a spin cap next to its time bound).
 const HANDOFF_MAX_YIELDS: u32 = 200_000;  // the post-run wait for a live shell to hand the console to
 const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's argument message
-/// The between-rounds beat, in SECONDS - because a yield COUNT is not a duration.
-///
-/// This was `3000` yields, tuned where a yield is cheap. A yield costs a full scheduler quantum whenever
+// The between-rounds beat - bounded by the clock, because a yield COUNT is not a duration.
+//
+// This was `3000` yields, tuned where a yield is cheap. A yield costs a full scheduler quantum whenever
 /// the yielding task is the only runnable one - which is exactly the state chaos creates, with every
 /// service killed and mid-restart - so on the Pi 2 (100 Hz) those 3000 yields are 30.03 SECONDS, and
-/// only on the rounds where everything else happens to be blocked. That is why the pauses looked random,
-/// why they clustered on exactly 30.0 s, and why the operator repeatedly took a healthy machine for a
-/// wedged one and reached for the power switch.
-///
-/// The harness was measuring itself in units whose cost it does not control (Commandment VIII: a proxy
-/// is not the truth). The beat is now bounded by the CLOCK, so it is the same beat on every arch, with
-/// `PACE_YIELDS` kept only as the hard cap that stops a stuck clock spinning forever (§26.6).
+// only on the rounds where everything else happens to be blocked. That is why the pauses looked random,
+// why they clustered on exactly 30.0 s, and why the operator repeatedly took a healthy machine for a
+// wedged one and reached for the power switch.
+//
+// The harness was measuring itself in units whose cost it does not control (Commandment VIII: a proxy
+// is not the truth). The beat is now bounded by the CLOCK, so it is the same beat on every arch. (It is
+// SLEPT in `PACE_CHUNK_MS` chunks; `PACE_YIELDS` below is declared but no longer read.)
 /// The beat between rounds, in MILLISECONDS.
 ///
 /// This was one SECOND, which made a 100-round run take 100 seconds of almost pure waiting. Seconds
@@ -76,7 +77,7 @@ const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's ar
 const PACE_MS: u64 = 250;
 /// Slept in chunks so `q` still lands promptly - the abort must not wait out a whole beat.
 const PACE_CHUNK_MS: u64 = 25;
-const PACE_YIELDS: u32 = 200_000;   // hard cap on the beat if the clock never advances
+const PACE_YIELDS: u32 = 200_000;   // was the hard cap on a yielded beat; unread since the beat is slept
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
 
@@ -130,9 +131,9 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 }
 
 /// A bounded frame buffer. The whole panel is built into one of these, then flushed in a couple of
-/// `console_write`s (not one per line), in <=240-byte chunks broken AT A NEWLINE: `console_write` caps at
-/// 256 bytes (BOTH the SDK wrapper and the kernel syscall), and a chunk must never split a CSI escape /
-/// line across two writes. NOTE: do NOT collapse this to one whole-panel write to "stop flicker" - the
+/// `gs::io::print`s (not one per line), in <=240-byte chunks broken AT A NEWLINE: `gs::io::print`
+/// caps at 256 bytes (BOTH the SDK `console_write` under it and the kernel syscall), and a chunk must
+/// never split a CSI escape / line across two writes. NOTE: do NOT collapse this to one whole-panel write to "stop flicker" - the
 /// per-round redraw showing the counters change IS the intended feedback, not a rendering bug, and a
 /// >256B write is silently dropped by the SDK cap so the panel vanishes (tried 2026-06-27, reverted).
 struct FrameBuf { buf: [u8; 2048], len: usize }
@@ -147,7 +148,7 @@ impl FrameBuf {
                 while b > s && self.buf[b - 1] != b'\n' { b -= 1; }
                 if b > s { e = b; }
             }
-            if let Ok(st) = core::str::from_utf8(&self.buf[s..e]) { ctx.console_write(st); }
+            if let Ok(st) = core::str::from_utf8(&self.buf[s..e]) { gs::io::print(ctx, st); }
             s = e;
         }
     }
@@ -159,9 +160,6 @@ impl core::fmt::Write for FrameBuf {
     }
 }
 
-/// Write a compact, bounded duration ("45s", "1m23s", "2h05m", "3d04h") into the frame: a chaos run can
-/// span days, so cascade d/h/m/s and show the two most-significant units. Seconds come from the RTC
-/// (year-guarded), so the value is plausible by construction.
 /// When this run STARTED, in wall-clock terms, worked out after the fact.
 ///
 /// A chaos run usually begins before the clock is known: this board has no RTC, so the time only
@@ -185,21 +183,21 @@ impl core::fmt::Write for FrameBuf {
 /// in that order. Reading the raw RTC here would be a second, worse answer to a question somebody else
 /// already owns (Commandment III).
 fn learn_wall_offset(ctx: &ServiceContext) -> Option<i64> {
-    // ACQUIRE BY NAME FIRST. Chaos declares NO `ipc_send` peers at all - it reaches every service
+    // ACQUIRE BY NAME FIRST. Chaos's only declared peer is `supervisor` - it reaches every other service
     // through the kernel's name directory, which is how it can kill things it was never wired to. So a
     // name-addressed request finds nothing until the cap is acquired, and the first version of this
     // silently failed on every call: the report kept saying the clock was not set while `date` was
-    // showing the time perfectly, because chaos had no way to ask. `reacquire_by_name` fills the cache
+    // showing the time perfectly, because chaos had no way to ask. `gs::cap::reacquire` fills the cache
     // the name-addressed call reads.
     //
     // It is re-acquired rather than cached across calls on purpose: chaos kills `time` constantly, so a
     // handle held from a previous round is usually stale, and this runs at most a handful of times
     // before the answer is known and it stops asking altogether.
-    if !ctx.reacquire_by_name("time") {
+    if !gs::cap::reacquire(ctx, "time") {
         return None;
     }
     // OP_NOW = 1 -> [ok, epoch(8 LE), source, age(8 LE)]
-    let r = ctx.request_with_reply_deadline("time", &Message::from_bytes(&[1u8]), 1)?;
+    let r = gs::call::request_within(ctx, "time", &Message::from_bytes(&[1u8]), 1).ok()?;
     let p = r.payload_bytes();
     if p.len() < 10 || p[0] == 0 {
         return None;
@@ -211,9 +209,12 @@ fn learn_wall_offset(ctx: &ServiceContext) -> Option<i64> {
     // The OFFSET, taken at one instant: wall clock minus monotonic. Any past or present moment's wall
     // time is then that moment's monotonic reading plus this, which is what keeps `started` and
     // `elapsed` from ever contradicting each other.
-    if now >= 1_577_836_800 { Some(now - ctx.epoch_secs_monotonic()) } else { None }
+    if now >= 1_577_836_800 { Some(now - gs::task::epoch_secs_monotonic(ctx)) } else { None }
 }
 
+/// Write a compact, bounded duration ("45s", "1m23s", "2h05m", "3d04h") into the frame: a chaos run can
+/// span days, so cascade d/h/m/s and show the two most-significant units. The seconds are a monotonic
+/// elapsed (or an extrapolation of one), so the value is plausible by construction.
 fn write_dur(f: &mut FrameBuf, secs: u64) {
     if secs >= 86400 { let _ = write!(f, "{}d{:02}h", secs / 86400, (secs % 86400) / 3600); }
     else if secs >= 3600 { let _ = write!(f, "{}h{:02}m", secs / 3600, (secs % 3600) / 60); }
@@ -223,21 +224,26 @@ fn write_dur(f: &mut FrameBuf, secs: u64) {
 
 /// One flood pass: get-or-reuse a cached SEND cap to `name`, then burst `try_send` (never blocking
 /// `send`, §8.9) until the queue saturates, the service dies, or we hit the burst cap. Returns
-/// `(sent, saturated, died)`, or None if unreachable. Reclaims the dead cap on `EndpointDead` BEFORE
-/// clearing the cache, else a long run leaks a slot per flood-death and fills the 64-slot cap table.
-fn flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Option<(u32, bool, bool)> {
+/// `(sent, saturated, died)`, or None if unreachable. Reclaims the dead cap BEFORE clearing the cache,
+/// else a long run leaks a slot per flood-death and fills the 64-slot cap table.
+///
+/// A DEATH and a full queue are different answers and `gs::Error` keeps them apart: `Unreachable` is
+/// the endpoint gone (dead, or the cap no longer valid - either way it will never take another message,
+/// so it is reclaimed), `Busy` is a live service that is saturated, and anything else stops the burst
+/// with the cap kept.
+fn flood(ctx: &ServiceContext, name: &str, cache: &mut Option<gs::cap::Cap>) -> Option<(u32, bool, bool)> {
     const BURST: u32 = 64; // > queue depth (16) so saturation shows
     let h = match *cache {
         Some(h) => h,
-        None => match ctx.acquire_send_cap(name) { Some(h) => { *cache = Some(h); h } None => return None },
+        None => match gs::cap::acquire(ctx, name) { Ok(h) => { *cache = Some(h); h } Err(_) => return None },
     };
     let msg = Message::from_bytes(&[0x01]); // minimal benign payload; the target drains + drops it
     let (mut sent, mut sat, mut died) = (0u32, false, false);
     while sent < BURST {
-        match ctx.try_send_by_handle(h, &msg) {
+        match gs::ipc::try_send_to(ctx, h, &msg) {
             Ok(())                      => sent += 1,
-            Err(IpcError::QueueFull)    => { sat = true; break; }
-            Err(IpcError::EndpointDead) => { died = true; ctx.remove_cap(h); *cache = None; break; }
+            Err(gs::Error::Busy)        => { sat = true; break; }
+            Err(gs::Error::Unreachable) => { died = true; gs::cap::remove(ctx, h); *cache = None; break; }
             Err(_)                      => break,
         }
     }
@@ -252,7 +258,7 @@ fn flood(ctx: &ServiceContext, name: &str, cache: &mut Option<CapHandle>) -> Opt
 /// eventually appeared looked like the run finishing early rather than the abort landing. One line at
 /// the moment of the keypress is the difference between "it works" and "it appears not to".
 fn ack_quit(ctx: &ServiceContext) {
-    ctx.console_write("\r\n  aborting at the next safe point...\r\n");
+    gs::io::print(ctx, "\r\n  aborting at the next safe point...\r\n");
 }
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
@@ -270,10 +276,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // ship in one image, so the layout changed with both of them.
     let mut given_seed: Option<u64> = None;
     {
-        let t0 = ctx.epoch_secs_monotonic();
+        let t0 = gs::task::epoch_secs_monotonic(&ctx);
         let mut aw = 0u32;
         loop {
-            if let Some(msg) = ctx.try_recv() {
+            if let Some(msg) = gs::ipc::try_recv(&ctx) {
                 let b = msg.payload_bytes();
                 if b.len() >= 4 { rounds = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64; }
                 if b.len() >= 13 && b[4] == 1 {
@@ -284,10 +290,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if b.len() > 13 { let n = (b.len() - 13).min(128); tbuf[..n].copy_from_slice(&b[13..13 + n]); tlen = n; }
                 break;
             }
-            if ctx.epoch_secs_monotonic() - t0 >= 2 { break; }
+            if gs::task::epoch_secs_monotonic(&ctx) - t0 >= 2 { break; }
             aw += 1;
             if aw >= ARGWAIT_MAX_YIELDS { break; }   // RTC-free hardware: the clock above never moves
-            ctx.yield_cpu();
+            gs::task::yield_now(&ctx);
         }
     }
     // The TARGET, which the shell requires (`0cb8985b`): "all-services" = a RANDOM subset of the live set
@@ -325,14 +331,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.claim_console_foreground();
     // chaos owns the screen now: the foreground gate sends every backgrounded task's console output to
     // serial only, so the muted shell can no longer smear our display. Clear it for a fresh canvas.
-    ctx.console_write("\x1b[2J\x1b[H");
+    gs::io::print(&ctx, "\x1b[2J\x1b[H");
 
     // Per-service aggregate tally (bounded; constant memory regardless of round count).
     let mut sv_name:    [[u8; 24]; MAX_SVC] = [[0u8; 24]; MAX_SVC];
     let mut sv_nlen:    [usize;    MAX_SVC] = [0usize;    MAX_SVC];
     let mut sv_killed:  [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // AIMED, per-service
     let mut sv_flooded: [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // AIMED, per-service
-    let mut sv_floodcap:[Option<CapHandle>; MAX_SVC] = [None; MAX_SVC];
+    let mut sv_floodcap:[Option<gs::cap::Cap>; MAX_SVC] = [None; MAX_SVC];
     // Why a service's flood column is N/A rather than a misleading 0: 0 = floodable (show the count),
     // 1 = reply-style (we kill it instead - flooding corrupts its reply stream), 2 = no acquirable send
     // endpoint (acquire_send_cap returned None). Discovered at runtime, not hardcoded.
@@ -350,7 +356,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // clock slice 3 the wall clock lives in the `time` service, which chaos deliberately does not
     // depend on - it may have just killed it. So an unset clock is REPORTED as unset below rather than
     // rendered as 1970. Elapsed and the ETA ride the monotonic clock and are unaffected either way.
-    let start_dt = ctx.datetime();
+    let start_dt = gs::task::datetime(&ctx);
     let start_epoch = start_dt.epoch_secs();
     // How the wall clock relates to the monotonic counter, ONCE ANYBODY KNOWS. See `learn_wall_offset`.
     // ASK BEFORE THE STORM, WHILE THE SYSTEM IS STILL CALM.
@@ -373,7 +379,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // the machine and does not change while the clock holds. Both displayed values are then derived from
     // the same `start_mono`, so they are consistent by construction rather than by care.
     let mut wall_offset: Option<i64> = if start_dt.year >= 2000 {
-        Some(start_epoch - ctx.epoch_secs_monotonic())
+        Some(start_epoch - gs::task::epoch_secs_monotonic(&ctx))
     } else {
         learn_wall_offset(&ctx)
     };
@@ -381,7 +387,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (SNTP sets it on the RTC-less Pi), so a sync landing mid-run would make `now - start` jump by the
     // whole correction and report an absurd elapsed/ETA. The datetime above is kept for the "started ..."
     // readout, which is exactly what a wall clock IS for.
-    let start_mono = ctx.epoch_secs_monotonic();
+    let start_mono = gs::task::epoch_secs_monotonic(&ctx);
     // Seed the random-storm PRNG. Advanced each round so the subset differs round-to-round; only read
     // in the `target_random` branch.
     //
@@ -407,11 +413,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ^ ((start_mono as u64) << 17));
     let mut rng = Rng::new(seed);
     if target_random {
-        ctx.console_writeln_fmt(format_args!(
+        gs::io::println_fmt(&ctx, format_args!(
             "chaos: seed {} ({}) - `chaos max-carnage all-services <n> seed {}` replays these draws, not this run's timing",
             seed, if given_seed.is_some() { "given" } else { "drawn" }, seed));
     } else if given_seed.is_some() {
-        ctx.console_writeln("chaos: a seed has no effect on an aimed run - only `all-services` draws at random");
+        gs::io::println(&ctx, "chaos: a seed has no effect on an aimed run - only `all-services` draws at random");
     }
 
     // Reap ORPHANED mem-pressure tasks left by a PRIOR chaos run that was itself killed mid-run before
@@ -436,11 +442,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         round += 1;
 
-        // ONE ROUND = ONE SWEEP over EVERY live service, not one random victim. So `all-services N` hits
-        // every service N times over, evenly, instead of N scattered pokes landing on a random few (the old
-        // behaviour: at N=10 only ~2 services were ever touched). Snapshot the live set: for "all-services"
-        // every live task except chaos, the mem-pressure tasks it spawns, and transient observe-*; for a
-        // specific target, just that one service.
+        // Pick this round's victims. For "all-services", a coin flip per live task (about half, at least
+        // one), skipping only chaos's own apparatus (`is_transient`: chaos and its mem-pressure tasks -
+        // `observe*` is NOT skipped, see the C2-1 note there); for a comma list, every listed service; for
+        // a single target, that one. (This said "one sweep over EVERY live service, evenly", which the
+        // random subset below contradicts.)
         let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
         let mut ncand = 0usize;
         if target_random {
@@ -484,11 +490,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             cand[0].0[..l].copy_from_slice(&tb[..l]); cand[0].1 = l; ncand = 1;
         }
 
-        // Per sweep: FLOOD every floodable service and KILL every reply-style one (shell/fs can't be flooded
-        // - it corrupts their reply stream - so a kill is how they get hit). PLUS kill ONE rotating floodable
-        // service, walking the set across rounds, so the floodable ones are RESTART-tested too (the other
-        // resilience axis), not only drain-tested. cand order can shift as services respawn into new slots,
-        // but the rotor still spreads those kills across the floodable set over the run.
+        // Per sweep: FLOOD every floodable victim and KILL every reply-style one (shell/fs can't be flooded
+        // - it corrupts their reply stream - so a kill is how they get hit). A floodable victim is then
+        // killed too: always in a random or list run, and in a single-target run whenever the rotor
+        // `kill_pick` lands on it - which, with one candidate, is every round.
         let kill_pick = if ncand > 0 { ((round - 1) % ncand as u64) as usize } else { usize::MAX };
         let (mut sweep_killed, mut sweep_flooded) = (0u64, 0u64);
         for c in 0..ncand {
@@ -515,7 +520,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let _ = ctx.kill(name);
                 killed += 1; sv_killed[s] += 1; sweep_killed += 1;
                 sv_flood_na[s] = 1;
-                if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
+                if let Some(h) = sv_floodcap[s].take() { gs::cap::remove(&ctx, h); }
             } else {
                 // Floodable: FLOOD every sweep...
                 match flood(&ctx, name, &mut sv_floodcap[s]) {
@@ -525,13 +530,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     Some(_) => { flooded += 1; sv_flooded[s] += 1; sweep_flooded += 1; sv_flood_na[s] = 0; }
                     None    => { if sv_flood_na[s] == 0 { sv_flood_na[s] = 2; } } // no endpoint right now
                 }
-                // ...and KILL it: when the rotor lands here (all-services / single target), OR always in a
-                // multi-target list run (semantics B) or the RANDOM storm (every service the round PICKED
-                // goes down this round).
+                // ...and KILL it: when the rotor lands here (a single target - every round, as it is the
+                // only candidate), OR always in a multi-target list run (semantics B) or the RANDOM storm
+                // (every service the round PICKED goes down this round).
                 if c == kill_pick || target_list || target_random {
                     let _ = ctx.kill(name);
                     killed += 1; sv_killed[s] += 1; sweep_killed += 1;
-                    if let Some(h) = sv_floodcap[s].take() { ctx.remove_cap(h); }
+                    if let Some(h) = sv_floodcap[s].take() { gs::cap::remove(&ctx, h); }
                 }
             }
         }
@@ -562,7 +567,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let _ = write!(f, "  round {} / {} ({}%)\x1b[K\r\n", round, rounds, pct);
         // Wall-clock status line: when it began, how long it has run, and a linear ETA (no outside truth -
         // a pure extrapolation of elapsed over round progress). until-q has no total, so remains is n/a.
-        let elapsed = (ctx.epoch_secs_monotonic() - start_mono).max(0) as u64;
+        let elapsed = (gs::task::epoch_secs_monotonic(&ctx) - start_mono).max(0) as u64;
         // Say "clock not set" rather than render a zero date as if it were a time.
         //
         // This board has no RTC, so before SNTP lands the wall clock is epoch 0 and this printed
@@ -625,8 +630,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Pace the round. With the recovery wait gone the loop would otherwise spin in milliseconds,
         // flooding the serial log and outrunning the eye. Yield a modest beat, still polling `q` (from the
         // SERIAL console - the keyboard is a chaos target) so an abort lands promptly.
-        // Bounded by the clock, capped by the yield count - the same shape as the handoff wait above.
-        // The clock read is a syscall, so it is sampled every POLL_EVERY yields rather than every one.
         // SLEEP the beat, do not spin it. The old loop yielded up to 200 000 times to burn one second,
         // which pegs a core for the whole run and inflates CORE_TOTAL_TICKS - the observer distorting
         // what it observes, the same trap the shell's muted branch documents. Sleeping in short chunks
@@ -635,7 +638,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut waited = 0u64;
         while waited < PACE_MS {
             if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break 'carnage; } }
-            ctx.sleep_ms(PACE_CHUNK_MS);
+            gs::task::sleep_ms(&ctx, PACE_CHUNK_MS);
             waited += PACE_CHUNK_MS;
         }
     }
@@ -643,21 +646,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The live per-service TABLE above IS the report - the user wanted the end to LOOK like the table, not
     // switch to a separate screen. So leave the final frame in place (no `\x1b[2J`) and just append one
     // summary line below it (which also carries the substrings the shell test greps for).
-    ctx.console_writeln("=== chaos max-carnage: report ===");
+    gs::io::println(&ctx, "=== chaos max-carnage: report ===");
     if target_random {
-        ctx.console_writeln_fmt(format_args!("seed: {}", seed));
+        gs::io::println_fmt(&ctx, format_args!("seed: {}", seed));
     }
-    ctx.console_writeln_fmt(format_args!(
+    gs::io::println_fmt(&ctx, format_args!(
         "total: {} rounds, {} kills, {} flooded, {} mem-pressure, {} spawns ({} refused). kernel: alive (this command returned).",
         round, killed, flooded, mempr, spawns, spawns_refused));
     // Later spawns are EXPECTED to be refused once a mem-pressure task holds memory; every one refused
     // means none ever ran, and the memory-pressure dimension of this run was not exercised at all.
     if spawns != 0 && spawns_refused == spawns {
-        ctx.console_writeln("NOTE: every mem-pressure spawn was refused - no memory-pressure task ran, so that dimension was not exercised (see the kernel log for why).");
+        gs::io::println(&ctx, "NOTE: every mem-pressure spawn was refused - no memory-pressure task ran, so that dimension was not exercised (see the kernel log for why).");
     }
 
     // Reclaim any flood caps still cached, so the run leaves the cap table as it found it.
-    for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }
+    for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { gs::cap::remove(&ctx, h); } }
     // The sweep spawned one mem-pressure task per sweep (the spawn-storm dimension), so reclaim them ALL:
     // kill one at a time until none remain, not just one, else a long run leaks the parked tasks + their
     // held memory. Bounded so a kill racing a respawn cannot spin forever. This runs BEFORE the shell-wait
@@ -671,18 +674,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (bounded) for a live shell to hand the keyboard back to, THEN release the foreground so that shell
     // resumes reading, THEN self-terminate so a finished run leaves no chaos task behind. Releasing
     // before a live shell exists would leave a window with no keyboard owner.
-    let t0 = ctx.epoch_secs_monotonic();
+    let t0 = gs::task::epoch_secs_monotonic(&ctx);
     let mut k = 0u32;
     while slot_of(&ctx, "shell").is_none() {
-        ctx.yield_cpu(); k += 1;
-        if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - t0 >= RECOVER_SECS { break; }
+        gs::task::yield_now(&ctx); k += 1;
+        if k % POLL_EVERY == 0 && gs::task::epoch_secs_monotonic(&ctx) - t0 >= RECOVER_SECS { break; }
         // THE hang. Without this, a run that ends with no live shell spins here forever on any board
         // without an RTC - and because the release below never runs, the console stays claimed by a
         // task that will never finish: no prompt, no overlay, nothing. The foreground made that
         // failure visible; it did not create it (before, the gate was hardwired open, so a stuck
         // owner cost nothing). A missed handoff must degrade to "release anyway", never to a wedge.
         if k >= HANDOFF_MAX_YIELDS {
-            ctx.console_writeln("chaos: no live shell after the run - releasing the console anyway");
+            gs::io::println(&ctx, "chaos: no live shell after the run - releasing the console anyway");
             break;
         }
     }
@@ -693,16 +696,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Clock-bounded for the same reason as the round beat: 4000 yields is a blink where a yield is cheap
     // and ~40 s on the Pi 2, where a lone runnable task pays a full quantum per yield. Cosmetic pacing
     // should cost a moment on every machine, not most of a minute on one.
-    let settle_t0 = ctx.epoch_secs_monotonic();
+    let settle_t0 = gs::task::epoch_secs_monotonic(&ctx);
     for k in 0..SHELL_SETTLE_YIELDS {
-        ctx.yield_cpu();
-        if k % POLL_EVERY == 0 && ctx.epoch_secs_monotonic() - settle_t0 >= SETTLE_SECS { break; }
+        gs::task::yield_now(&ctx);
+        if k % POLL_EVERY == 0 && gs::task::epoch_secs_monotonic(&ctx) - settle_t0 >= SETTLE_SECS { break; }
     }
     // Print our last line FIRST, then release. The muted shell only draws its prompt once it regains the
     // foreground, so releasing BEFORE this printed "done" made the shell's `gsh>` land before the text
     // (the "switches screen, press Enter to see the prompt" glitch). done -> release -> the shell draws a
     // clean prompt right below.
-    ctx.console_writeln("chaos: done - foreground returned to the shell");
+    gs::io::println(&ctx, "chaos: done - foreground returned to the shell");
     ctx.release_console_foreground();
 
     // Self-terminate so chaos does not linger in the task list (`observe` showed a parked chaos long
@@ -710,5 +713,5 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // current_task_is_dead -> yield_current), so this never returns - no "no running task" panic (the
     // bug that forced the earlier park-and-reap). The park is an unreachable safety net for `-> !`.
     let _ = ctx.kill("chaos");
-    ctx.park();
+    gs::ipc::park(&ctx);
 }

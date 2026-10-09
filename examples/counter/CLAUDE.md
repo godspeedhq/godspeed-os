@@ -19,14 +19,14 @@ it and reload it - that is what makes it genuinely restartable (§14, Invariant 
 
 ## What it demonstrates
 
-Two halves, using only real `ServiceContext` methods:
+Two halves, using only the standard library (`gs`):
 
 | Half | Call | What happens |
 |------|------|--------------|
-| Reach `fs` | `gs::cap::acquire(&ctx, "fs")` | resolve `fs` by name via the kernel directory; `None` -> degrade |
-| **Load-on-spawn** | `ctx.request_with_reply("fs", read_op)` | read `/counter.dat` and parse the saved count (reconstruct from the durable copy) |
-| **Save-on-change** | `ctx.request_with_reply("fs", write_op)` | after each increment, overwrite `/counter.dat` with the new count |
-| Recover from `fs` restart | `gs::cap::reacquire(&ctx, "fs")` | on a missed reply (cap went `EndpointDead`), reacquire by name and retry once (§14.3) |
+| Reach `fs` | `gs::cap::acquire(&ctx, "fs")` | resolve `fs` by name via the kernel directory; an `Err` -> degrade |
+| **Load-on-spawn** | `gs::call::request_within(&ctx, "fs", read_op, FS_SECS)` | read `/counter.dat` and parse the saved count (reconstruct from the durable copy) |
+| **Save-on-change** | `gs::call::request_within(&ctx, "fs", write_op, FS_SECS)` | after each increment, overwrite `/counter.dat` with the new count |
+| Recover from `fs` restart | inside `gs::call::request_within` | on a send that never left (cap went `EndpointDead`), `request_within` reacquires by name and sends once more; if `fs` took the request and died (`PeerDied`) the example reacquires and asks again itself, because a read and a whole-file write of the same count are both safe to repeat (§14.3) |
 
 The shape of the lifecycle:
 
@@ -36,7 +36,8 @@ spawn ─▶ load_count() from fs ─▶ count = saved (or 0 if fs absent)
 kill  ─▶ supervisor respawns ─▶ load_count() recovers the SAME count ─▶ continue
 ```
 
-The fs wire protocol (`[op, path_len, path, data…]` request, `[status, …]` reply) is modelled
+The fs wire protocol (`[tag, op, path_len, path, data…]` request, `[tag, status, …]` reply, the tag a
+per-request correlation byte `fs` echoes) is modelled
 directly on the shell's `fs_request` / `fs_read_at` / `fs_write_new` helpers, so a real client
 talks to `fs` exactly as the shell does.
 
@@ -67,7 +68,7 @@ The kernel holds no service state (§15): memory, scheduling, IPC, capabilities,
 and nothing else. A service that must survive restart therefore persists OUTSIDE itself and
 reconstructs on startup. `fs` is the externalization mechanism for everyone else, and `fs` itself is
 restartable precisely because it gained crash-consistent recovery (it re-mounts to a consistent state
-via its redo-journal, §6.8) - which is what **§22 Test 13** proves: *fs survives its own restart*,
+via its redo-journal, `docs/persistence.md` §6.8) - which is what **§22 Test 13** proves: *fs survives its own restart*,
 persisted data intact. `counter` is the client-side mirror of that property: it survives its own
 restart by trusting `fs` to hold the durable copy.
 
@@ -81,8 +82,8 @@ log_write   = true
 ```
 
 Everything the service can do is on this list and nowhere else (Commandment VII). It needs a SEND cap
-to `fs` (to send ops) and its own endpoint (so `fs` can reply, via the per-request reply cap that
-`request_with_reply` embeds). No `[placement]` - the supervisor round-robins it.
+to `fs` (to send ops) and its own endpoint (`SPAWN_FLAG_REQ_RECV` in its spawn row), which also gets it
+the reply mailbox `fs` answers on, via the per-request reply cap `gs::call::request_within` embeds. No `[placement]` - the supervisor round-robins it.
 
 ## What you must NOT do
 
@@ -109,7 +110,7 @@ on a received message).
 
 - **Commandments III, V, VIII, IX** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §14 (service lifecycle / restart + cap rebinding), §15 (state and persistence),
-  §22 Test 13 (fs survives its own restart), §6.8 (fs crash-consistent recovery).
+  §22 Test 13 (fs survives its own restart); `docs/persistence.md` §6.8 (fs crash-consistent recovery).
 - `services/fs` - the externalization mechanism and its crash-consistency journal.
 - `services/shell` - real fs client; `fs_request` / `fs_read_at` / `fs_write_new` are the helpers
   this example is modelled on.

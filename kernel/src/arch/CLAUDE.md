@@ -125,7 +125,7 @@ being incomplete; the compiler is naming the surface you still owe.
 ## Two rules the boundary is built on
 
 **No inline asm and no named-arch reference outside `arch/`.** `scripts/arch_boundary_check.py`
-(a CI guard, run in `.github/workflows/build.yml`) fails the build if any kernel file outside `arch/`
+(run by every `osdev` build through its `EXTRA_CHECKS`, and by `.github/workflows/build.yml`) fails the build if any kernel file outside `arch/`
 contains `asm!`/`naked_asm!`, names `arch::<specific>::`, or uses `core::arch::<specific>::`
 intrinsics. Arch-specific instructions live only here, reached through an `arch::imp` primitive
 (`read_page_table_base`, `invalidate_tlb_page`, `local_irq_save`, ...). This is the arch-boundary
@@ -183,7 +183,7 @@ is, the *writer* stores the data **before** the flag with **Release**, and every
 with **Acquire** before touching the data. Both are now in the code:
 - `reserve_task_slot` writes `TASK_CORE[i]` first, then `TASK_VALID[i] = true` (**Release**) - the flag
   publishes the data, not the reverse.
-- All 34 `TASK_VALID[..].load(..)` reader sites are **Acquire**. On x86 an Acquire load / Release store is
+- Every `TASK_VALID[..].load(..)` reader site is **Acquire** (35, all in `task/scheduler.rs`, on 2026-10-09). On x86 an Acquire load / Release store is
   a plain `mov` (identical codegen); on AArch64/RISC-V/ARMv7 it emits the barrier that establishes
   happens-before. `commit_task` already publishes fields then `TASK_STATE = Ready` (Release); the SEC-1
   switch-in path is already `SeqCst`.
@@ -200,7 +200,7 @@ cross-core TLB shootdown for a pinned task ("a CR3 reload flushes non-global TLB
 explicit `sfence.vma`. So the `arch::imp` context-switch / `write_page_table_base` primitive on a weak
 arch MUST either (a) flush the outgoing address space's non-global entries on the switch, or (b) the
 neutral kill path must issue the cross-core shootdown it currently elides. On the **armv7 port** the
-context switch takes route (a): `switch_context` writes TTBR0 then `TLBIALL`+`dsb`+`isb` on an
+context switch takes route (a): `switch_context` writes TTBR0, `isb`, then `TLBIALL`+`dsb`+`isb` on an
 address-space change, satisfying SEC-26 for the pinned single-core model. Note the arm
 `invalidate_tlb_page` is **local** (`TLBIMVA`, `c8,c7,1`), *not* an inner-shareable broadcast - correct
 for per-task pinned address spaces where an unmap runs on the task's own core, but a future *cross-core*
@@ -296,7 +296,7 @@ DEAD service's text out of a recycled frame.
 
 ### 4. A liveness watchdog that is armed with a stubbed number - NO WEDGE DETECTION AT ALL
 
-`ticks_before_wedge` (or whatever the port calls its quantum) gates the neutral watchdog. A stub
+`liveness_deadline_cycles` (the seam the neutral liveness watchdog reads) gates it. A stub
 returning `0` does not mean "no limit"; on this codebase it meant the watchdog never armed, and the
 ARM port ran for its whole bring-up with **no cross-core wedge detection**, so every hang was silent
 instead of a loud panic naming the core and its last task.
@@ -350,8 +350,8 @@ What that means in practice:
   (halt all host channels at init; clock the FS PHY at 30/60 MHz not 48); reading the working driver
   would have collapsed that.
 - **Reimplement, never translate.** A Linux driver is soaked in `struct device`/URB/workqueue/DMA-API/
-  `kmalloc`/threaded-IRQ/sysfs. None of that exists here. Our driver is a **service** (or, until ARM
-  routes device IRQs to userspace, a kernel module polled from the tick - see `arch/arm/CLAUDE.md`):
+  `kmalloc`/threaded-IRQ/sysfs. None of that exists here. Our driver is a **service** (on every port now:
+  ARM's tick-polled in-kernel USB stack was deleted in 2026-08 once ARM routed device IRQs to userspace):
   explicit MMIO/IRQ/DMA-arena caps, IPC, bounded arenas (no heap), **every hardware wait bounded**, loud
   failure + restart. The OS-integration half does not map, so the *understanding* is the only thing that
   crosses - which is also what keeps it clean.

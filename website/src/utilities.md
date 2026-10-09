@@ -14,8 +14,8 @@ environment inheritance, no signals. What replaces them is capabilities.
    UNIX                              GODSPEEDOS
    ls /data | grep .txt              dir /data | match .txt
    ────────────────────              ──────────────────────
-   fork + exec + pipe(2)             the shell creates an ENDPOINT
-   fd 1 inherited by the child       and grants one end to each side
+   fork + exec + pipe(2)             the shell carries each stage's output
+   fd 1 inherited by the child       on; a SERVICE stage gets an endpoint
    ambient access to /data           `dir` holds a cap to `fs`, or it
                                      cannot read anything at all
 ```
@@ -125,7 +125,7 @@ fails.
 
 | | |
 |---|---|
-| [Conventions](utilities/conventions.md) | the thirteen rules every utility above obeys |
+| [Conventions](utilities/conventions.md) | the fourteen rules every utility above obeys |
 
 ## One page worth reading even if you skip the rest
 

@@ -285,6 +285,9 @@ const TX_DESCS: usize = 4;
 /// without being asked. That needs somewhere to put frames nobody has requested yet, which is real
 /// work and is recorded in `backlog/` rather than half-done here (26.7).
 ///
+/// (The paragraphs below were written when the ring was sixteen deep; the argument holds at
+/// twenty-four.)
+///
 /// The driver is polled: net-stack drains once per scheduler tick, so every frame arriving in a
 /// 10 ms window has to fit in the ring or the MAC drops it - and four 2 KiB buffers is four frames.
 /// A quiet LAN still bursts well past four frames in 10 ms (ARP, mDNS, broadcast), and each burst
@@ -457,11 +460,10 @@ impl Dwmac {
             return Err((d.m, d.a));
         }
         ctx.log_fmt(format_args!("nic-driver: dwmac DMA reset cleared in {} us", took_us));
-        // Reported rather than programmed. The AXI burst-length field lives here, and its reset
-        // value permits undefined-length bursts - which is what this needs. Writing a burst policy
-        // read off another SoC's device tree would be borrowing their INTEGRATION, not the silicon's
-        // requirement (26.14), so the value is printed and left alone until something measures a
-        // reason to change it.
+        // The reset value, reported before `program` below writes this board's own AXI settings
+        // (`snps,fixed-burst` and the `stmmac-axi-config` node - see the constants). (Note 2026-10-09:
+        // this said the register was left alone; `program` now writes it, so the log line's "left at
+        // reset" describes the moment it is printed, not the configuration the MAC runs with.)
         ctx.log_fmt(format_args!(
             "nic-driver: dwmac sys-bus mode 0x{:08x} (left at reset; bursts undefined-length)",
             d.m.read32(DMA_SYS_BUS_MODE)
@@ -675,7 +677,7 @@ impl Dwmac {
     }
 
     /// What the MAC itself says about the frames it was given: `(tx_gb, tx_good, underflow, carrier,
-    /// rx_gb, rx_crc, debug)`.
+    /// rx_gb, rx_crc, rx_octets, debug)`.
     ///
     /// Read together and reported together, because each number is only meaningful beside the
     /// others. `tx_gb` climbing with `tx_good` flat is the MAC telling us the transmissions are
@@ -707,7 +709,7 @@ impl Dwmac {
     /// every fault counter is zero AND `OCTETCOUNT_G` is zero while `OCTETCOUNT_GB` counts, the
     /// good-side counters are unpopulated in this part and the whole thread closes for good.
     ///
-    /// Read-only, and reported only when there is a gap to explain.
+    /// Read-only. (Note 2026-10-09: nothing calls this today, so it is reported nowhere.)
     pub fn tx_fault_counters(&self) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
         (
             self.m.read32(MMC_TX_SINGLECOL_G),
@@ -847,7 +849,7 @@ impl Dwmac {
             }
         }
         // Give the descriptor straight back, whether the frame was good or not - a descriptor left
-        // in our hands is one the engine cannot use, and four of those is a receiver that stops.
+        // in our hands is one the engine cannot use, and a ring of those is a receiver that stops.
         let buf = self.a.phys_at(RX_BUF_OFF + i * BUF_BYTES);
         self.desc_write(off, 0, (buf & 0xffff_ffff) as u32);
         self.desc_write(off, 1, (buf >> 32) as u32);

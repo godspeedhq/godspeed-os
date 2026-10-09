@@ -1,12 +1,13 @@
 # Service contract for `hello` - the minimal service (your first one; copy this folder).
 # This is a BUILD-TIME declaration. Nothing parses TOML at spawn (13.6) - authority comes from
-# the spawn request, and this file is reconciled against it by `scripts/contract_check.py`. A service
+# the spawn request (the supervisor's spawn row). `scripts/contract_check.py` reconciles only
+# `services/` contracts, so for an example this file is kept in step with its row by hand. A service
 # can do ONLY what it was granted, and this states what that should be (Commandment VII).
 name    = "hello"
 version = "0.1.0"
 
 [resources.memory]
-# request = the minimum to START (the supervisor will not spawn it with less).
+# request = the minimum to START (stated for review: no spawn row carries it today; only `limit` is sent).
 # limit   = the most it may ever allocate.
 # Asking past `limit` returns AllocDenied (RECOVERABLE: the service can back off and
 # degrade). Touching UNMAPPED memory is a page fault (FATAL: the service is killed).
@@ -20,14 +21,14 @@ limit   = "64MiB"
 #
 # WHERE TO FIND THE FULL LIST: the declarable capabilities are defined in
 # `contracts/schema/service.schema.json` (the JSON Schema that `osdev validate` enforces)
-# and documented in `contracts/CLAUDE.md`. The complete set of options:
+# and documented in `contracts/CLAUDE.md`. The ones you will meet first:
 #   ipc_send     = ["peer", ...]      services this service may SEND IPC to
 #   ipc_receive  = ["myname", ...]    endpoint names this service OWNS and receives on
 #   log_write    = true               write the kernel log ring + serial (syscall 5)
-#   hw_mmio      = ["0xBASE+0xSIZE"]  a device MMIO register window (drivers; CLAUDE.md §12.3)
-#   hw_interrupt = [IRQ, ...]         IRQ lines (0-255) routed to this service (drivers; §12.2)
-#   hw_pio       = ["0xBASE+0xLEN"]   kernel-mediated I/O port ranges (drivers)
-#   service_control = true            supervisor-only: authority to kill/restart services
+#   hw_device / hw_pci_class / hw_pci_bar / hw_pci_irq   the device a driver is granted (drivers)
+#   hw_mmio / hw_interrupt            a driver's window and IRQ, stated for REVIEW only (§12.3)
+#   service_control = true            kill/restart services (supervisor, shell, control, chaos)
+# plus console_push, resource_mint, cpu_clock and pci_cfg; the schema has the full list.
 # Declare the MINIMUM your service needs - that minimum IS its security boundary.
 log_write = true   # the ONLY authority hello holds
 

@@ -32,8 +32,10 @@ A respawned recorder would not know its target path. It would be **alive and wri
 `events persist status` said "running" - worse than dead, because dead is visible.
 
 Instead the capture file opens with a header line and closes with a footer, so a file with a header and
-no footer says plainly that the recorder died. Staying out of the kernel's managed-service lists is
-also what keeps this whole feature a zero-kernel-change one.
+no footer says plainly that the recorder died. It stays out of the supervisor's `MANAGED` set, so
+nothing restarts it. (This said staying out of "the kernel's managed-service lists" kept the feature a
+zero-kernel-change one; the kernel keeps no such list now - CLAUDE.md 12.3, 2026-10-03 - and the
+feature needed no kernel change either way.)
 
 ## Bounded by construction, not by counting
 
@@ -69,8 +71,8 @@ I/O: 800 ms on a SATA SSD, over twelve seconds on the Pi 4's USB stick, where th
 the capture never began. The size was never the real defect - blocking a caller on an unbounded amount
 of device I/O is, and it would have bitten again on any slower medium. `start` allocates and answers at
 once; the fill runs in this service's own loop, which reports `preparing` until it is done. While
-preparing the loop does NOT park on `recv_timeout`: two seconds between slices capped the fill at about
-85 KB a tick, so a megabyte took half a minute.
+preparing the loop does NOT park on a timed receive (`gs::ipc::recv_within_ms`): two seconds between
+slices capped the fill at about 85 KB a tick, so a megabyte took half a minute.
 
 **`fs` replies `[tag, status]`, not `[status]`.** Reading byte 0 as the status made every successful
 write look like a failure - the file was created AND the service reported that it could not be. Both

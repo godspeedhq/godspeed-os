@@ -24,8 +24,8 @@ ipc_receive = ["time"]
 # arrives, matched in this service's loop by tag and checked by nonce. Nothing waits on it - the send
 # answers `QueueFull` rather than blocking, and the answer is just another tagged message. `net-stack`
 # never sends to this service at all, so there is no call cycle for §8.9 to forbid.
-# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
-# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# `events` - the observability sink: automatic IPC traces, plus the metric samples the SDK publishes
+# for this service (`msgs.received`). It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
 ipc_send    = ["fs", "net-stack", "events"]

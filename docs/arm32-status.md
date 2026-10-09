@@ -16,7 +16,8 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   services from its manifest through the neutral spawn path (per-task address spaces, PL0 user mode,
   banked-register trap frames, fault-survival: a PL0 fault kills just that task and the kernel continues).
 - **Services:** `supervisor`, `events`, `recorder`, `copier`, `console`, `shell`, `ping`, `pong`, the driver services
-  (`dwc2`, `block-driver` + `fs`, `nic-driver` + `net-stack`, `time`, `control`) and the example services
+  (`dwc2`, `block-driver` + `fs`, `nic-driver` + `net-stack`, `time`, `control`, `pwm-audio`, `power`,
+  `wifi-usb`) and the example services
   (`observe`, `chaos`, `mem-pressure`, `counter`, `greet`, `upper`, `roster`, `reply-server`, `asker`,
   `resource-server`, `holder`) - all cross-compiled to `armv7a-none-eabi` and embedded. The embedded set
   is `arm_built` in `kernel/build.rs`, which is the single source of truth (see "Running a new service").
@@ -78,7 +79,8 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   and the keyboard still types **while** the network is live - the shape the real Pi 2's LAN9514
   (hub + integrated ethernet, plus external keyboard ports) needs.
 - **Graceful degradation (loud, not silent):** `xhci`/`ehci` (the x86 USB hosts) are not spawned on ARM at
-  all - the supervisor `cfg`-excludes them, because this board's host controller is `dwc2`. Without a USB
+  all - the supervisor's USB host table is built per arch in `services/supervisor/build.rs`, and on this
+  board it holds only `dwc2`. Without a USB
   storage stick `block-driver` reports no disk and `fs` serves storage-unavailable (loud, not a hang);
   without a `--usbnet` device net-stack degrades - exactly §9.2/§11.3 ("continue with the services that
   started").
@@ -133,7 +135,7 @@ into the ARM image there is **one** list to edit:
    > you would expect: the `console` service was added to one and not the other, so it shipped as an empty
    > placeholder. Every log line reported success and the display just quietly stayed on the kernel's boot
    > floor. The second list is deleted rather than checked.
-4. Rebuild: `python scripts/arm_build.py --release`. If the supervisor should *spawn* it at boot, that is
+3. Rebuild: `python scripts/arm_build.py --release`. If the supervisor should *spawn* it at boot, that is
    a supervisor-manifest change (same as x86), not an ARM-specific step.
 
 A **hardware** driver is different - see `kernel/src/arch/arm/CLAUDE.md` (the ARM syscall ABI, the
@@ -218,6 +220,12 @@ GodspeedOS way.
   bug fell out: `now_epoch_monotonic()` was a `0` stub, so `calibrate_tsc_hz` spun ~100M yields and every
   deadline wait never expired, hanging net-stack before its serve loop - now wired to the generic timer
   (`cntpct()/timer_hz()`).
+
+  *(Note 2026-10-09: the three entries above are the 2026-07-23 state, when the USB stack was in the
+  kernel. It is not any more: `arch/arm/dwc2.rs` is deleted, CDC-ECM and mass storage are driven by the
+  `dwc2` SERVICE, `nic-driver` reaches it over IPC (ops `0x10+` on `dwc2`'s endpoint), and the
+  `NET_DEVICE` syscalls 42-44 are stubs that answer "no device" on this arch (see "Networking" above).
+  The USB stick IS the `block-driver` backend now; there is no SD/EMMC backend beside it.)*
 - **LAN9514 (`smsc95xx`) for the real Pi 2** - **DONE + HW-verified, ZERO packet loss.** Lives in
   `services/dwc2/src/net.rs` (`smsc_bring_up`, `link_up`, `link_reconfigure`). DHCP, ARP and internet
   ping all work on real hardware: 56 ping replies, 0 timeouts, 117 frames parsed = 117 handed out (tag
@@ -430,8 +438,9 @@ consideration* - but the cable was never one of them, so "the only difference is
   flags off with `DR & 0xFF`, which promoted genuine line errors to input. Free on a healthy line. Note
   this did NOT fix the fault above, because those bytes carry no flags - it is a separate real bug found
   along the way.
-- The receiver **shuts itself off** after 4096 bytes dropped for lack of ring space, reports loudly, and
-  hands the ring to the keyboard. Serial output is untouched. It latches until reboot rather than
+- The receiver **shuts itself off** once the ring has overflowed WITHOUT PAUSE for 2 seconds
+  (`RX_OVERFLOW_FAULT_US`, `arch/arm/mod.rs`; it was first 4096 dropped bytes, which at ~141 drops/s
+  took 29 s to engage), reports loudly, and hands the ring to the keyboard. Serial output is untouched. It latches until reboot rather than
   retrying, because silently resuming a line just declared faulty is the fallback §26.7 forbids.
 
 **A note on that threshold, because the first two attempts were wrong.** It first fired at 2000 discarded
@@ -441,6 +450,8 @@ never fired, because occasional `0x00`s among the `0xFF`s reset the run counter.
 proxy. The third measures the harm itself - bytes dropped because the ring was full - which is exactly the
 starvation that matters and is indifferent to what the bytes contain. **A check that cannot fire in its
 own worked example is worse than no check: it reads as "the line is fine".**
+*(2026-10-09: the third was the right quantity in the wrong units, and was replaced by the duration
+above; `arch/arm/mod.rs`, at `RX_OVERFLOW_FAULT_US`, records all three.)*
 
 > **Unproven in the field.** The shut-off has been verified in QEMU not to false-positive on a healthy
 > line, but has never been observed *firing* on real hardware - the Pi it was written for was fixed by

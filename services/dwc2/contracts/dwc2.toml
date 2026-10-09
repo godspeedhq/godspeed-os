@@ -5,8 +5,10 @@
 # network with it.
 #
 # Its real authority is wider than this file can express: a fixed MMIO window and DMA arena granted at
-# spawn by hardware class, CONSOLE_PUSH to deliver keystrokes, and USB_DISK. Those are kernel by-name
-# grants (C4-1), not contract capabilities.
+# spawn by device kind (`hwclass::DWC2`), and CONSOLE_PUSH to deliver keystrokes - both carried in the
+# supervisor's spawn request (CLAUDE.md 13.6), not contract capabilities. (Note 2026-10-09: this said
+# USB_DISK too, and called these kernel by-name grants (C4-1); nothing holds USB_DISK now, and the
+# kernel grants no service anything by name.)
 name    = "dwc2"
 version = "0.1.0"
 
@@ -17,7 +19,7 @@ limit   = "64MiB"
 [capabilities]
 ipc_receive = ["dwc2"]
 # `events` - the observability sink: automatic IPC traces, plus the metric samples this service
-# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# publishes with `gs::trace::metric` (the SDK's `metric` under it). It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
 # `supervisor` - the USB device report (`usbdev`): the WiFi dongle attached or not, so its driver is

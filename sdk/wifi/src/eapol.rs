@@ -106,7 +106,7 @@ pub struct Key {
     pub key_len: u16,
     pub replay: u64,
     pub pay_len: u16,
-    /// The authenticator's nonce (message 1 and 3 carry it; 2 and 4 carry ours).
+    /// The authenticator's nonce (messages 1 and 3 carry it; 2 carries ours, and 4 is all zeros).
     pub nonce: [u8; 32],
     /// The Key RSC: the group key's packet number as the access point last sent under it, the lowest a
     /// receiver may accept next. LITTLE-endian, unlike this header's other fields - mac80211 loads it into a

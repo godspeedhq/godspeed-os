@@ -225,7 +225,7 @@ fn clock_release(ctx: &ServiceContext, lease: Option<u8>) {
 /// enough for one CMD52, and parks it again. `true` means the chip still answers - the cut did NOT take.
 fn chip_still_answers(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
     const RAIL_FALL_MS: u64 = 50;
-    ctx.sleep_ms(RAIL_FALL_MS);
+    godspeed::task::sleep_ms(ctx, RAIL_FALL_MS);
     let answers = h.reset(ctx) && sdio::initialised_card_answers(h);
     h.park(ctx);
     answers
@@ -253,7 +253,7 @@ pub(crate) fn power_on_device(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
     if !ctx.device_power(true) {
         return false;
     }
-    ctx.sleep_ms(POWER_ON_SETTLE_MS);
+    godspeed::task::sleep_ms(ctx, POWER_ON_SETTLE_MS);
     true
 }
 
@@ -270,7 +270,7 @@ pub(crate) fn power_cycle_device_ms(ctx: &ServiceContext, h: &dyn SdioHost, off_
     // Tried as the warm-start fix and it was not one (one cold start in three loads, docs/wifi.md 48); kept,
     // because a quiet host across the edge is still the reference's order.
     h.park(ctx);
-    ctx.sleep_ms(off_ms);
+    godspeed::task::sleep_ms(ctx, off_ms);
     if !power_on_device(ctx, h) {
         ctx.log("wifi-driver: the radio's power was cut and could NOT be restored - the kernel refused the second request");
         return false;
@@ -309,9 +309,9 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
     let why = scan::reply::DOWN_NOT_BUILT;
     h.park(ctx);
     let off = ctx.device_power(false);
-    ctx.sleep_ms(POWER_HOLD_MS);
+    godspeed::task::sleep_ms(ctx, POWER_HOLD_MS);
     let on = ctx.device_power(true);
-    ctx.sleep_ms(POWER_HOLD_MS);
+    godspeed::task::sleep_ms(ctx, POWER_HOLD_MS);
     ctx.log_fmt(format_args!(
         "wifi-driver: radio power cycled for a clean power-up - off {}, on {}",
         if off { "confirmed" } else { "REFUSED" }, if on { "confirmed" } else { "REFUSED" }));
@@ -470,9 +470,9 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
     const STATUS_LEN: usize = 30 + join::MAX_SSID;
     let mut out = [0u8; 256];
     loop {
-        let req = ctx.recv();
+        let req = godspeed::ipc::recv(ctx);
         // No reply cap means there is nothing to answer on, and dropping is all that is left.
-        let Some(reply) = ctx.take_pending_cap() else { continue };
+        let Some(reply) = godspeed::ipc::take_sent_cap(ctx) else { continue };
         // The reply cap is RECLAIMED after use (26.6): see the serve loop for what not doing so cost.
         // One byte at least, not an empty message: the kernel refused a zero-length send on three ports
         // until `e3fcf7ed`, so an "empty reply" was no reply at all; a byte says what happened.
@@ -581,8 +581,7 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
             out[1] = why;
             2
         };
-        let _ = ctx.try_send_by_handle(reply, &godspeed_wifi::serve::tagged_reply(tag, &out[..n]));
-        ctx.remove_cap(reply);
+        let _ = godspeed::ipc::reply(ctx, reply, &godspeed_wifi::serve::tagged_reply(tag, &out[..n]));
     }
 }
 
@@ -655,7 +654,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // DECLARE THIS SERVICE'S NAME, once. Identity is not ambient - a service cannot ask what it is
     // called - so a traced service says. Without it every event reads `?` in the caller column and
     // every metric published lands under a blank owner.
-    ctx.trace_as("wifi-driver");
+    godspeed::trace::as_name(&ctx, "wifi-driver");
 
     // ---- Stage 1: the register window. -------------------------------------------------------------
     // Numbered because this IS a sequence and each stage can only be reached through the one before

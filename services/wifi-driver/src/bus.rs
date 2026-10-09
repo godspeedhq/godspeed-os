@@ -119,7 +119,7 @@ fn ht_clock(h: &dyn SdioHost, ctx: &ServiceContext) -> bool {
                 return false;
             }
         }
-        ctx.sleep_ms(1);
+        godspeed::task::sleep_ms(ctx, 1);
     }
     ctx.log_fmt(format_args!(
         "wifi-driver: the chip never reported HT_AVAIL - CHIPCLKCSR {:#04x} after {} reads over ~{} ms. It \

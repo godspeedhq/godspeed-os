@@ -589,7 +589,7 @@ seq  sec  caller  peer          op   outcome
 6    2    fs      block-driver  183  REPLY
 ```
 
-**The caller is self-declared** (`ctx.trace_as("fs")`, once at startup), and that deserves the
+**The caller is self-declared** (`gs::trace::as_name(&ctx, "fs")`, once at startup), and that deserves the
 argument rather than an apology:
 
 - A service **cannot ask** what it is called. There is no name in its context page and no query for

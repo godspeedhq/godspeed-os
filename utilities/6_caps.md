@@ -26,17 +26,22 @@ any other (authority is explicit, not hidden).
 
 ```
 gsh> caps
-caps for shell
-  resource 2  spawn            rights: WRITE
-  resource 5  introspect       rights: READ
-  resource 6  service_control  rights: WRITE
+caps for shell:
+  RESOURCE (target)  RIGHTS (read/write/send/recv/grant/revoke)
+  spawn             write
+  introspect        read
+  service_control   write
   ...
 ```
 
-Each row is one held cap: the resource it targets and its rights bitfield (READ,
-WRITE, SEND, RECV, GRANT, REVOKE). Stable kernel resources have well-known ids
+Each row is one held cap: the resource it targets and its rights spelled out (read,
+write, send, recv, grant, revoke). The kernel's fixed resources, ids 1-18, are named
 (1=log_write, 2=spawn, 3=console_read, 4=console_push, 5=introspect,
-6=service_control); larger ids are IPC endpoints or other grants.
+6=service_control, 7=resource_mint, 8=reboot, 9=acquire_any, 10=net_device,
+11=gpio_device, 12=usb_disk, 13=set_clock, 14=fire_irq, 15=image_spawn, 16=pci_cfg,
+17=device_power, 18=cpu_clock); any larger id is an IPC endpoint and prints as
+`endpoint#N`. A task holding nothing prints `(none)`; a name with no live task is
+`caps: no such live service` and an `Err`.
 
 ## 3a. As a record producer (typed pipes)
 

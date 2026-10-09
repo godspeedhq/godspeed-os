@@ -10,7 +10,9 @@ ipc_receive = ["fs"]
 ipc_send    = ["block-driver", "events"]
 log_write   = true
 # fs mints a delegated FILE capability per open file (§7.10, file-as-capability). resource_mint is the
-# authority to mint those; the kernel grants it from this declaration (service_hw, audit T1 Phase B).
+# authority to mint those. The kernel grants it from the supervisor's spawn request (fs's IMAGES row
+# carries `privbits::RESOURCE_MINT`), never from this file (CLAUDE.md 13.6); this declares it, and
+# `IV-contract-authority` checks the two agree.
 resource_mint = true
 
 [placement]

@@ -13,8 +13,10 @@
 //!   everything the legacy controller raises.
 //!
 //! The ARM generic timer is per-core by construction - each core has its own `CNTP_TVAL` - so its
-//! interrupt is routed through the core-local block. That is what this module programs. The legacy
-//! controller is left alone until something needs a peripheral interrupt (a UART RX IRQ, say).
+//! interrupt is routed through the core-local block. That is what this module programs first. The
+//! legacy controller now carries two peripheral lines, both through the core-local GPU funnel to core
+//! 0: USB (line 9, handed to the `dwc2` service as `USB_VECTOR`) and System Timer compare 3 (line 3,
+//! the microsecond one-shot). The UART is still polled, not interrupt-driven.
 //!
 //! **This is not a GIC.** A Pi 4 (BCM2711) has a GIC-400, which is a completely different programming
 //! model. Nothing here transfers to the AArch64 port - another instance of the two ARM ports sharing
@@ -46,11 +48,11 @@ const CORE_IRQ_GPU: u32 = 1 << 8;
 ///
 /// Two hops, because the Pi 2 has two interrupt controllers (see the module header): the legacy
 /// controller must be told to raise line 9 at all, and the core-local block must be told which core the
-/// resulting GPU funnel lands on. Core 0 is the single DWC2 poller/owner, so both point there. The USB
+/// resulting GPU funnel lands on. Core 0 takes the GPU funnel, so both point there. The USB
 /// interrupt is level-triggered - it stays asserted until its underlying condition is cleared (an HPRT
-/// change bit, or a channel's HCINT) - so the handler MUST clear what it services or the line re-fires
-/// forever. That is why channel interrupts are gated at HAINTMSK to only the channels the ISR actually
-/// drives (`dwc2::init`): a polled channel left with a pending HCINT would storm this line.
+/// change bit, or a channel's HCINT) - so whoever services it MUST clear what it services or the line
+/// re-fires forever. (The `dwc2::init` HAINTMSK gating this cited went with the in-kernel driver; the
+/// `dwc2` service clears the condition and then unmasks through `IrqUnmask`.)
 pub fn route_usb_irq_to_core0() {
     // GPU IRQ -> core 0 (leave FIQ routing at core 0 too; we do not use USB FIQ).
     local_write(GPU_INT_ROUTING, 0);
@@ -78,13 +80,12 @@ pub const USB_VECTOR: u8 = 0x29;
 ///
 /// THE one predicate for that question, so ownership cannot be decided two different ways.
 /// Registration for `USB_VECTOR` is the fact; everything else follows from it - the IRQ dispatch
-/// routes to whoever registered, and the in-kernel driver's periodic hooks stand down when someone
-/// has. There is no separate flag, because a second copy of a fact is a second chance to disagree
-/// with it (Commandment III).
+/// delivers to whoever registered, and masks the line when nobody has. There is no separate flag,
+/// because a second copy of a fact is a second chance to disagree with it (Commandment III).
 ///
-/// It is also what makes the transition reversible from the prompt: `spawn dwc2` quiets the kernel
-/// driver, `kill dwc2` (whose death releases the route via `route::unregister_endpoint`) hands the
-/// hardware straight back.
+/// There is no in-kernel driver to hand the hardware back to (arm32 slice 5 deleted it): when `dwc2`
+/// dies its route is released and the line masked (`route::unregister_endpoint`), and USB is down
+/// until the supervisor's respawn registers again.
 pub fn usb_owned_by_userspace() -> bool {
     crate::interrupt::route::registered_endpoint(USB_VECTOR).is_some()
 }
@@ -172,8 +173,8 @@ fn hires_rearm(q: &HiRes) {
 /// Four hypotheses about one userspace number have now each been wrong, because that number cannot
 /// tell "never took the hi-res path" from "took it and the interrupt never came" from "was woken and
 /// not run". Those are three different bugs with three different fixes and one symptom. These count
-/// them, and the tally prints itself every 16 arms - so the next boot answers the question instead of
-/// narrowing it.
+/// them, and the tally prints itself once per boot, at the 64th arm (`hires_arm` says why not every
+/// 16) - so the next boot answers the question instead of narrowing it.
 static HR_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static HR_ELAPSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static HR_FULL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -271,7 +272,7 @@ fn hires_fire() -> bool {
     any
 }
 
-/// Doorbells received, per core./// Doorbells received, per core. Exists so the boot selftest can prove the path end to end on the
+/// Doorbells received, per core. Exists so the boot selftest can prove the path end to end on the
 /// machine actually running, rather than trusting that a register write meant something.
 static DOORBELLS: [core::sync::atomic::AtomicU32; 4] = [
     core::sync::atomic::AtomicU32::new(0), core::sync::atomic::AtomicU32::new(0),
@@ -303,11 +304,6 @@ fn usb_irq_pending() -> bool {
     (unsafe { (IC_PENDING_1 as *const u32).read_volatile() }) & (1 << USB_IRQ_LINE) != 0
 }
 
-/// Per-core timer interrupt control. One register per core at `+0x40 + 4*core`.
-///
-/// Bits 0-3 route the four generic timers to IRQ, bits 4-7 route the same to FIQ:
-/// 0 = CNTPS (secure physical), **1 = CNTPNS (non-secure physical)**, 2 = CNTHP (hypervisor),
-/// 3 = CNTV (virtual).
 /// Per-core MAILBOX interrupt control, at `+0x50 + 4*core`. Bits 0-3 enable an IRQ for mailboxes
 /// 0-3. This is the BCM2836 inter-processor doorbell, and it is what makes a cross-core wake
 /// immediate instead of "whenever that core next takes a timer tick".
@@ -326,6 +322,11 @@ const CORE_IRQ_MBOX0: u32 = 1 << 4;
 /// means exactly that, so encoding the vector number would store a fact nobody reads.
 const MBOX_WAKE_BIT: u32 = 1 << 0;
 
+/// Per-core timer interrupt control. One register per core at `+0x40 + 4*core`.
+///
+/// Bits 0-3 route the four generic timers to IRQ, bits 4-7 route the same to FIQ:
+/// 0 = CNTPS (secure physical), **1 = CNTPNS (non-secure physical)**, 2 = CNTHP (hypervisor),
+/// 3 = CNTV (virtual).
 const CORE_TIMER_IRQCNTL: usize = LOCAL_BASE + 0x40;
 
 /// Per-core IRQ source (read to discover what fired), at `+0x60 + 4*core`. Same bit assignment as
@@ -490,10 +491,10 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
     IRQ_COUNT[this_core() & 3].fetch_add(1, Ordering::Relaxed);
     IRQ_LAST_SRC[this_core() & 3].store(source, Ordering::Relaxed);
 
-    // A GPU-funnel interrupt (bit 8) is a legacy-controller peripheral IRQ. The USB stack is the only
-    // peripheral IRQ we enable, and it is routed to core 0, so service it here and fall through to the
-    // timer check (both can be pending at once). Confirm the line is USB before acting, so an
-    // unexpected peripheral IRQ is left asserted and obvious rather than silently swallowed.
+    // A GPU-funnel interrupt (bit 8) is a legacy-controller peripheral IRQ. Two peripheral lines are
+    // enabled, USB and System Timer compare 3, both funnelled to core 0, so service them here and fall
+    // through to the timer check (all can be pending at once). Confirm the line is USB before acting,
+    // so an unexpected peripheral IRQ is left asserted and obvious rather than silently swallowed.
     // The microsecond one-shot arrives through the same GPU funnel as USB, so check it here and
     // let the USB test below still run - both can be pending in one interrupt.
     // WAKING IS NOT RUNNING, and forgetting that cost the whole feature.
@@ -522,12 +523,13 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         // read as an architectural constraint. Worth stating plainly so it is not read that way a
         // third time.
         //
-        // The route is chosen by who has REGISTERED for the vector, not by a build flag. With no
-        // userspace driver the in-kernel stack still owns the controller and behaviour is bit-for-bit
-        // what it was; the moment a service is granted `hw_irqs = [0x29]` the interrupt goes there
-        // instead. That makes the transition testable in one step, and it means there is never a
-        // build in which both drivers believe they own the hardware - the failure mode the AArch64
-        // feature flag actually produced before it was deleted.
+        // The route is chosen by who has REGISTERED for the vector, not by a build flag, so there is
+        // never a build in which two drivers believe they own the hardware - the failure mode the
+        // AArch64 feature flag actually produced before it was deleted.
+        //
+        // (Note 2026-10-09: the two paragraphs above are history. CLAUDE.md 6.4 was amended on
+        // 2026-08-17: `arch/arm/dwc2.rs` is deleted and the `dwc2` service owns this line. With no
+        // service registered there is no in-kernel fallback any more; the line is masked below.)
         if usb_owned_by_userspace() {
             // MASK FIRST. The line is level-triggered and the userspace driver has not run yet, so
             // without this it re-asserts immediately and the core never leaves the handler. The
@@ -647,7 +649,8 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
         return frame_sp;
     }
 
-    // Other sources (mailboxes) are not enabled, so nothing else should arrive. If something does,
+    // Mailbox 0 (the doorbell) was handled above; mailboxes 1-3, the PMU and the other timers are not
+    // enabled, so nothing else should arrive. If something does,
     // leaving it asserted is the loud outcome: it will re-enter and be obvious, rather than being
     // quietly discarded.
 

@@ -8,7 +8,9 @@ limit   = "64MiB"   # the kernel's tested grant (audit T1 reconcile); the superv
                     # respawns forever (§6.2)
 
 [capabilities]
-# service_control is the exclusive restart/kill capability (§14.4).
+# service_control is the restart/kill capability (§14.4). Not exclusive: the supervisor delegates
+# SERVICE_CONTROL in the spawn requests of `shell`, `chaos` and `control` (their IMAGES rows) and of
+# every test probe (`probes::privileges_of`).
 service_control = true
 # SPAWN, IMAGE_SPAWN, INTROSPECT and ACQUIRE_ANY, which this service also holds, have no contract
 # key: the kernel is their single source (U15). The schema HAS a `spawn` key and marks it a DEAD

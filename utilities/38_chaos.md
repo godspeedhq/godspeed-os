@@ -26,7 +26,10 @@ identity tests; `chaos` lets an operator reproduce the *between* cases live on r
 | `chaos kill-storm <svc> [n] save <path>` | Same, and also write the report to a file at the end. |
 | `chaos flood-storm <svc> [rounds]` | **Saturate** `<svc>`'s IPC queue with a `try_send` burst until `QueueFull`, then verify it drains and stays alive. The *other* axis: "overwhelmed", not "gone". |
 | `chaos max-carnage <target> <rounds> [yes] [seed <n>]` | **The chaos monkey:** each round, `all-services` picks a random subset of the live services - the shell and the supervisor included - floods each one it can and kills every one it picked (5b). Runs exactly the count you type; a live progress line ticks `%`/ETA; `q` aborts. A `[y/N]` confirm precedes the run; a 4th word **`yes`** skips it for unattended runs, and the warning still prints in full. `seed <n>` gives the random storm its seed; every random run prints the one it used (5b). |
-| `chaos help` / `chaos version` | Self-documentation (`0_conventions.md`). |
+| `chaos mem-pressure [rounds]` | Spawn a `mem-pressure` task that allocates to its limit, kill it, and confirm the memory is reclaimed. |
+| `chaos spawn-storm [count]` | Spawn `mem-pressure` tasks until the task pool or memory ceiling REFUSES one (a loud `Err`, no panic), then kill them all and confirm full reclaim. |
+| `chaos link-flap [n]` | Simulate a cable unplug/replug `n` times (default 1); `net-stack` reconfigures itself. Needs a live `nic-driver`. |
+| `chaos help` / `chaos version` | Self-documentation (`0_conventions.md`). Bare `chaos` prints a short list of the modes. |
 
 `kill-storm` clamps `rounds` to `1..=100` (`CHAOS_MAX_ROUNDS`, §26.6) - it stores per-round generation
 detail in fixed stack arrays. **`max-carnage` has no round cap**: its report is a constant-size
@@ -37,21 +40,25 @@ console-only (§5b).
 
 ### Targets (`<svc>`)
 
-Only **recoverable** services are valid targets - the kernel itself **cannot be killed**, and
-killing a non-recoverable thing would just wedge:
+Only **recoverable** services are valid `kill-storm` targets - the kernel itself **cannot be killed**,
+and killing a non-recoverable thing would just wedge. The list is `CHAOS_RESTARTABLE` in the shell
+(the same list `kill all-services` expands to); anything else is refused:
 
 | Target | Recovered by |
 |---|---|
 | `supervisor` | **the kernel** - Path C / Phase 6 (§6.2): the kernel respawns the supervisor on death, *unconditionally and forever* (no bound - a bound would re-introduce the reboot and be a DoS). |
 | `block-driver` | the **supervisor** (Phase D, §6.1) - re-inits the controller on respawn. |
 | `fs` | the **supervisor** (Phase D) - re-mounts to a consistent state via its crash-consistency journal (`docs/persistence.md` §6.8). |
-| `shell` | the **supervisor** - a fresh prompt (the in-flight command is lost - a re-init, not a resume, §14.2). |
-| `xhci` / `ehci` / `events` | the **supervisor** - drivers re-grant MMIO/DMA/IRQ + re-enumerate; events re-drains the ring buffer. |
+| `xhci` / `ehci` / `dwc2` | the **supervisor** - a fresh driver is granted its device again and re-enumerates. |
+| `events`, `nic-driver`, `net-stack`, `time`, `control` | the **supervisor** - a fresh instance. (`events` holds the trace ring, which a restart empties; nothing in it is a log line, §11.4.) |
 
-The kernel notifies the supervisor on the death of this **directly-restartable set** so it respawns
-them immediately. And on death a service's name is **unregistered from the kernel directory** (§14.2),
-so even if its death-notification is lost (e.g. the supervisor was itself mid-respawn during a storm),
-the supervisor's reconcile finds the name *missing* and respawns it - services self-heal.
+`shell` is NOT a `kill-storm` target (the storm runs inside it); `max-carnage` kills it, and `kill
+shell` recycles it. The supervisor respawns each of these on its own death because the supervisor's
+`MANAGED` roster marks them watched (`SPAWN_FLAG_WATCHED`), so the kernel sends the supervisor a
+death notification - the kernel restarts only the supervisor itself. Even if a death notification is
+lost (e.g. the supervisor was itself mid-respawn during a storm), the supervisor's reconcile scans the
+task table (`managed_alive`: a `task_stat` slot that is valid and not Dead) and respawns any managed
+service with no live task - services self-heal.
 
 > The **only unkillable component is the kernel** (`{kernel}`). `chaos` can storm anything above it;
 > there is nothing it can do to bring the kernel down - "do anything except shotgun the kernel."
@@ -116,10 +123,10 @@ blocking `send`** (§8.9): blocking into a full queue would hang the shell flood
   A flood that *crashes* a service is caught and reported - a finding, not a hang; a restartable one
   respawns and the storm continues.
 
-> **Aside (hardening note).** `AcquireSendCap` is currently **ungated** - any task can mint a SEND cap
-> to any named service. That is what makes broad flooding possible, and it is also an ambient-authority
-> gap (§3.1) the naming design meant to close (Path C / Phase 4). Flooding stays compatible with a
-> future gate (the shell would hold the recovery cap). On the hardening list with the reboot gate.
+> **Aside (hardening note).** This said `AcquireSendCap` was **ungated**. It is gated now: the kernel
+> mints a SEND cap by name only to a caller holding `ACQUIRE_ANY` (the shell, the supervisor, the
+> probes) or for a name the caller was spawned with as a send peer (`handle_acquire_send_cap`). The
+> shell holds `ACQUIRE_ANY`, which is what lets it flood any named service.
 
 ## 5b. `max-carnage` - the chaos monkey
 
@@ -135,7 +142,7 @@ what lets the shell be a victim: killing the shell does not end the run. It read
 What happens to a victim: every one picked is **flooded and then killed** - its queue filled with a
 `try_send` burst (the §8.6 back-pressure and queue-drained-on-death cases), then the kill. `shell` and
 `fs` are only killed, never flooded, because a flood corrupts their reply streams. (In an aimed run at
-one service, the flood is every round and the kill rotates.) This said the run "rolls a creative action
+one service, it is flooded and killed every round.) This said the run "rolls a creative action
 mix - kill, flood, flood-then-kill, or kill-then-flood" and spared the shell; neither has been true since
 the run moved into its own service. `chaos` waits for a live shell before it hands the console back.
 
@@ -181,7 +188,7 @@ total: 1000 rounds, 7014 kills, 6045 flooded, 1000 mem-pressure, 1000 spawns (99
 used to show a report with per-service "recovered" counts and a verdict line, from before `0cb8985b`
 (2026-07-09) and before floods, memory pressure and spawns joined every round; no run prints that now.
 
-`99 refused` is by design: the first `mem-pressure` holds its memory until the run ends, and every later
+`999 refused` is by design: the first `mem-pressure` holds its memory until the run ends, and every later
 one is refused as already running.
 
 All output is **ASCII** (the framebuffer font has no em-dash/ellipsis - they render as `?` on the
@@ -203,11 +210,12 @@ panel) and `[q] quit` matches the rest of the shell (`observe`, `paginate`).
 
 ## 6. Capabilities
 
-`chaos` is capability-clean: it uses only `kill` (`SERVICE_CONTROL`, held by the shell) and
-`task_stat` (`INTROSPECT`) - both already held, nothing ambient. It cannot kill the kernel because the
-kernel is not a task; it cannot kill the supervisor *casually* through the normal `kill`/`restart`
-commands (those refuse `CORE_SERVICES` at the command layer) - deliberate supervisor chaos is
-explicit, through `chaos kill-storm supervisor`.
+`chaos` is capability-clean: it uses only `kill` (`SERVICE_CONTROL`), `task_stat` (`INTROSPECT`),
+`AcquireSendCap` (`ACQUIRE_ANY`) for the floods, and `spawn` for the memory modes - nothing ambient.
+The shell holds these for the modes it runs itself; `max-carnage` runs in the `chaos` SERVICE, whose
+own spawn row in the supervisor grants it `SPAWN`, `INTROSPECT`, `SERVICE_CONTROL` and `ACQUIRE_ANY`. It cannot kill the kernel because the kernel is not
+a task. (This said the normal commands refuse the supervisor; only `spawn` and `restart` do - `kill
+supervisor` is allowed and the kernel respawns it, `11_kill.md` §3.)
 
 ## 7. Bounded & loud (§26.6 / §26.7)
 

@@ -38,9 +38,13 @@
 //! **Slice 1 of 3** (the C1-6 commandment walk; see `audits/userspace-audit.md` Audit 11): the service exists and owns the policy, reading the
 //! raw RTC through the kernel query that already exists. Slice 2 moves the shell and `net-stack` onto
 //! it; slice 3 deletes the kernel's two modules, the `SetClock` syscall and the wall-clock queries -
-//! the first time in this audit a pinned kernel surface gets SMALLER.
+//! the first time in this audit a pinned kernel surface gets SMALLER. (Note 2026-10-09: all three
+//! slices are done, with `kernel/src/clock.rs` kept as the paragraph above records, and since
+//! 2026-10-01 this service also runs the NTP exchange itself - `net-stack` no longer calls it.)
 
 use godspeed_sdk::{ServiceContext, Message};
+
+use godspeed as gs;
 
 /// The protocol. One byte of opcode, because the reply shape differs per op and a shared opcode space
 /// is how two protocols on one endpoint collide (the lesson from `dwc2` serving block and frames).
@@ -115,8 +119,8 @@ impl Clock {
     /// The current epoch, in the order the operator asked for: hardware RTC, then whatever we were
     /// told (network), then the persisted floor, then nothing.
     fn now(&mut self, ctx: &ServiceContext) -> i64 {
-        let mono = ctx.epoch_secs_monotonic();
-        let raw = ctx.datetime().epoch_secs();
+        let mono = gs::task::epoch_secs_monotonic(ctx);
+        let raw = gs::task::datetime(ctx).epoch_secs();
 
         // 1. A HARDWARE RTC, where there is one. It is battery-backed and authoritative, so it wins and
         //    re-bases everything else. An implausible reading is not a clock, it is a misread.
@@ -155,7 +159,7 @@ impl Clock {
         }
         self.last = epoch;
         self.source = SRC_NTP;
-        self.synced_at = ctx.epoch_secs_monotonic();
+        self.synced_at = gs::task::epoch_secs_monotonic(ctx);
         // RE-BASE. `now` advances from (`last`, `base_mono`), so a new reading without a new base would
         // be instantly re-aged by however long the service had been up.
         self.base_mono = self.synced_at;
@@ -164,9 +168,8 @@ impl Clock {
     }
 }
 
-fn reply(ctx: &ServiceContext, cap: godspeed_sdk::CapHandle, body: &[u8]) {
-    let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(body));
-    ctx.remove_cap(cap);
+fn reply(ctx: &ServiceContext, cap: gs::cap::Cap, body: &[u8]) {
+    let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(body));
 }
 
 /// Where the clock floor lives on disk.
@@ -175,16 +178,6 @@ const FLOOR_PATH: &[u8] = b"/clock.last";
 const FS_OP_WRITE: u8 = 10;
 const FS_OP_READ: u8 = 11;
 const FS_OK: u8 = 0;
-/// How long an fs request may take before this service gives up on it for now.
-///
-/// Correlation tags for this service's own `fs` requests.
-///
-/// `fs` echoes the tag byte back, which is what lets the main loop recognise ITS OWN replies among the
-/// requests it is serving - and that is what makes the floor I/O below non-blocking. A client request
-/// arrives carrying a reply cap; an `fs` reply arrives without one and with one of these tags.
-///
-/// Distinct from 0 on purpose: 0 is what a caller sends who has not thought about tags, and it is also
-/// `FS_OK`, a collision that has already hidden one bug in this file.
 /// Telling `fs` the wall clock: `[FS_CLOCK_PUSH, epoch:i64]`, one way, no reply capability.
 /// Mirrors `FS_CLOCK_PUSH` in `fs`, where the reasoning for it being a push is written out.
 const FS_CLOCK_PUSH: u8 = 0xC1;
@@ -221,8 +214,8 @@ struct NtpAsk {
 /// Send an NTP query through `net-stack`, without waiting. `Some` if it went.
 fn ntp_ask(ctx: &ServiceContext) -> Option<NtpAsk> {
     let nonce: [u8; 8] = {
-        let hi = ctx.hw_random().unwrap_or((ctx.read_tsc() >> 13) as u32);
-        let lo = ctx.hw_random().unwrap_or(ctx.read_tsc() as u32);
+        let hi = ctx.hw_random().unwrap_or((gs::driver::wait::ticks(ctx) >> 13) as u32);
+        let lo = ctx.hw_random().unwrap_or(gs::driver::wait::ticks(ctx) as u32);
         let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
         [h[0], h[1], h[2], h[3], l[0], l[1], l[2], l[3]]
     };
@@ -237,7 +230,7 @@ fn ntp_ask(ctx: &ServiceContext) -> Option<NtpAsk> {
     ntp[0] = 0x23;                                // LI 0, version 4, mode 3 (client)
     ntp[40..48].copy_from_slice(&nonce);          // transmit timestamp = the nonce
     if send_noblock(ctx, "net-stack", &req) {
-        Some(NtpAsk { nonce, sent_at: ctx.epoch_secs_monotonic() })
+        Some(NtpAsk { nonce, sent_at: gs::task::epoch_secs_monotonic(ctx) })
     } else {
         None
     }
@@ -258,6 +251,14 @@ fn ntp_answer(ask: &NtpAsk, ntp: &[u8]) -> Result<i64, &'static str> {
     Ok((secs - NTP_UNIX_OFFSET) as i64)
 }
 
+/// Correlation tags for this service's own `fs` requests.
+///
+/// `fs` echoes the tag byte back, which is what lets the main loop recognise ITS OWN replies among the
+/// requests it is serving - and that is what makes the floor I/O below non-blocking. A client request
+/// arrives carrying a reply cap; an `fs` reply arrives without one and with one of these tags.
+///
+/// Distinct from 0 on purpose: 0 is what a caller sends who has not thought about tags, and it is also
+/// `FS_OK`, a collision that has already hidden one bug in this file.
 const TAG_FLOOR_READ: u8 = 0xF1;
 const TAG_FLOOR_WRITE: u8 = 0xF2;
 /// How often to retry loading the floor while it has not been loaded yet.
@@ -353,22 +354,23 @@ fn send_noblock(ctx: &ServiceContext, peer: &str, req: &[u8]) -> bool {
     // been written on any boot: not a protocol fault, not a slow disk, simply no cap to send on.
     //
     // The kernel name directory is the answer to exactly this (§14.3): ask for the peer when you need
-    // it, not when you started. Cached by the SDK after the first success, and re-acquired for free if
-    // `fs` is restarted under us.
-    let target = match ctx.send_peer_handle(peer) {
+    // it, not when you started. Cached by the SDK after the first success. A handle held across a
+    // restart of the peer is NOT refreshed by itself: a send on it fails, and the reacquire below is
+    // what replaces it. (`fs` here and throughout; `ntp_ask` sends to `net-stack` the same way.)
+    let target = match gs::ipc::peer(ctx, peer) {
         Some(t) => t,
         None => {
-            if !ctx.reacquire_by_name(peer) { return false; }
-            match ctx.send_peer_handle(peer) { Some(t) => t, None => return false }
+            if !gs::cap::reacquire(ctx, peer) { return false; }
+            match gs::ipc::peer(ctx, peer) { Some(t) => t, None => return false }
         }
     };
-    let Some(self_grant) = ctx.self_grant_handle() else { return false };
-    let Some(reply_cap) = ctx.derive_cap(self_grant) else { return false };
+    let Ok(self_grant) = gs::cap::self_grant(ctx) else { return false };
+    let Ok(reply_cap) = gs::cap::duplicate(ctx, self_grant) else { return false };
     // The reply cap is CONSUMED by `fs` when it answers. If the send itself fails, reclaim it here so a
     // dead `fs` cannot leak one cap-table slot per attempt (§8.5: a transfer that failed leaves the cap
     // with the sender, and it is the sender's job to notice).
-    if ctx.send_with_cap_by_handle(target, reply_cap, &Message::from_bytes(req)).is_err() {
-        ctx.remove_cap(reply_cap);
+    if gs::ipc::send_granting(ctx, target, reply_cap, &Message::from_bytes(req)).is_err() {
+        gs::cap::remove(ctx, reply_cap);
         // A HELD CAP CAN GO STALE, and that is not the same as not having one.
         //
         // The reacquire above only runs when there is NO handle. A handle we already hold keeps being
@@ -380,13 +382,13 @@ fn send_noblock(ctx: &ServiceContext, peer: &str, req: &[u8]) -> bool {
         // §14.3 is explicit that a client reacquires by name after a restart. Doing it only on absence
         // covers the peer that never existed and misses the peer that came back, which is the far more
         // common case under chaos.
-        if !ctx.reacquire_by_name(peer) {
+        if !gs::cap::reacquire(ctx, peer) {
             return false;
         }
-        let Some(target) = ctx.send_peer_handle(peer) else { return false };
-        let Some(reply_cap) = ctx.derive_cap(self_grant) else { return false };
-        if ctx.send_with_cap_by_handle(target, reply_cap, &Message::from_bytes(req)).is_err() {
-            ctx.remove_cap(reply_cap);
+        let Some(target) = gs::ipc::peer(ctx, peer) else { return false };
+        let Ok(reply_cap) = gs::cap::duplicate(ctx, self_grant) else { return false };
+        if gs::ipc::send_granting(ctx, target, reply_cap, &Message::from_bytes(req)).is_err() {
+            gs::cap::remove(ctx, reply_cap);
             return false;
         }
     }
@@ -460,7 +462,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("time");
+    gs::trace::as_name(&ctx, "time");
     ctx.log("time: starting - the wall clock is a service now (C1-6)");
     let mut clock = Clock::new();
 
@@ -489,18 +491,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut ntp_said: Option<&'static str> = None; // the last NTP outcome logged, so a repeat stays quiet
     let mut no_cap: u32 = 0;                      // capless messages seen (a flood, usually)
     loop {
-        // Wake on a timer only while there is still housekeeping OUTSTANDING - a floor to read, or a
-        // floor to write that has not been acknowledged. Once both are settled this is a plain blocking
-        // `recv` and the service costs nothing at all.
-        // Keep waking while the clock is still unresolved, so the NTP query below can go out. This is
-        // bounded by success - once the network sets the clock, `unsynced` is false and this service
-        // goes back to blocking on `recv` with no timer at all.
+        // (Two earlier designs, both superseded by "ALWAYS a timed wait" below: waking only while a floor
+        // read or write was outstanding, and then only while the clock was unsynced. Once settled the
+        // loop now wakes every `SETTLED_WAKE_MS`, so a re-sync is never waiting on somebody to ask.)
         let unsynced = clock.source != SRC_NTP;
         // WHEN IS THE NEXT NETWORK CHECK DUE? Two rhythms, because two situations: with no clock at all
         // this service asks often, and with a good one it asks rarely to keep it good. It never stops
         // asking - a clock fetched once at boot drifts, and never looking again is trusting a number
         // that ages.
-        let mono_top = ctx.epoch_secs_monotonic();
+        let mono_top = gs::task::epoch_secs_monotonic(&ctx);
         let interval = if unsynced { SYNC_NUDGE_SECS } else { RESYNC_SECS };
         let sync_due = mono_top - last_nudge >= interval;
         // ALWAYS a timed wait, never an indefinite block. The clock is never "settled" in the sense of
@@ -532,10 +531,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let mut push = [0u8; 9];
                 push[0] = FS_CLOCK_PUSH;
                 push[1..9].copy_from_slice(&now.to_le_bytes());
-                if ctx.try_send("fs", &Message::from_bytes(&push)).is_err() {
+                if gs::ipc::try_send(&ctx, "fs", &Message::from_bytes(&push)).is_err() {
                     // A stale cap after an `fs` restart presents as a failed send, not as silence
                     // (§14.3). Reacquire and let the next tick carry it - never retry in a loop here.
-                    let _ = ctx.reacquire_by_name("fs");
+                    let _ = gs::cap::reacquire(&ctx, "fs");
                 }
             }
         }
@@ -545,7 +544,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             SETTLED_WAKE_MS
         };
         let req = {
-            match ctx.recv_timeout(ctx.duration_cycles(wake_ms)) {
+            match gs::ipc::recv_within_ms(&ctx, wake_ms) {
                 Some(m) => m,
                 None => {
                     // A pending WRITE first: the clock is already known, and this is the copy that
@@ -575,7 +574,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     // A QUERY NOBODY ANSWERED is given up on, so a new one can go - see `NTP_GIVE_UP_SECS`.
                     if let Some(a) = ntp {
-                        if ctx.epoch_secs_monotonic() - a.sent_at >= NTP_GIVE_UP_SECS {
+                        if gs::task::epoch_secs_monotonic(&ctx) - a.sent_at >= NTP_GIVE_UP_SECS {
                             ntp = None;
                             if ntp_said != Some("lost") {
                                 ntp_said = Some("lost");
@@ -592,7 +591,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // ONLY A SENT QUERY COUNTS AGAINST THE INTERVAL: a failed send is retried at the
                         // heartbeat, not rewarded with the full twenty seconds (see `SYNC_NUDGE_SECS`).
                         if ok {
-                            last_nudge = ctx.epoch_secs_monotonic();
+                            last_nudge = gs::task::epoch_secs_monotonic(&ctx);
                         }
                         if nudge_ok != Some(ok) {
                             nudge_ok = Some(ok);
@@ -627,7 +626,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // ordinary receive loop - is what lets the floor be written reliably without ever blocking an
         // answer: the acknowledgement is read, and a failure is retried, on the same loop that serves
         // `date`.
-        let cap = match ctx.take_pending_cap() {
+        let cap = match gs::ipc::take_sent_cap(&ctx) {
             Some(c) => c,
             None => {
                 let p = req.payload_bytes();
@@ -666,7 +665,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     store_left = FLOOR_STORE_TRIES;
                                     let _ = floor_store(&ctx, store_epoch);
                                     floor_settled = true;
-                                    last_nudge = ctx.epoch_secs_monotonic();
+                                    last_nudge = gs::task::epoch_secs_monotonic(&ctx);
                                 }
                             }
                             // SAID ONCE PER CHANGE: a cable left out answers "no route" every twenty
@@ -741,7 +740,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 //
                 // -1 means NEVER SYNCED, which is not the same as "synced 0 seconds ago". Collapsing
                 // the two would let a clock that was never set read as freshly authoritative.
-                let age = if clock.source == SRC_NTP { ctx.epoch_secs_monotonic() - clock.synced_at }
+                let age = if clock.source == SRC_NTP { gs::task::epoch_secs_monotonic(&ctx) - clock.synced_at }
                           else { -1 };
                 let mut out = [0u8; 18];
                 out[0] = 1;
@@ -760,7 +759,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if ntp.is_none() {
                     ntp = ntp_ask(&ctx);
                     if ntp.is_some() {
-                        last_nudge = ctx.epoch_secs_monotonic();
+                        last_nudge = gs::task::epoch_secs_monotonic(&ctx);
                         ntp_said = None;     // an operator asked: say the outcome again even if it repeats
                     }
                 }

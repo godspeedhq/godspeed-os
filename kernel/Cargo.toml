@@ -129,40 +129,27 @@ pi4-smp = []
 # share one non-relocatable image. The honest fix that would remove it is a position-independent
 # kernel, which is real work and is recorded in backlog/14 rather than pretended at.
 visionfive = []
-# Hand the Pi 4's GENET ethernet MAC to the `nic-driver` SERVICE, and take it out of the kernel.
-#
-# `kernel/src/arch/aarch64/genet.rs` is a ~1500-line ethernet driver living in ring 0, which is a
-# direct breach of Commandment I ("thou shalt not expand the responsibilities of the kernel - use a
-# service") and of §4.4's kernel anti-scope. x86 has never had this problem: its NIC driver is a
-# restartable, IOMMU-confinable userspace service, and this feature is aarch64 catching up.
-#
-# With it on, the kernel's whole involvement with ethernet is the boot probe: it establishes that the
-# controller answers, sets `NIC_FOUND` so the spawn path grants the arena, and stops. The service gets
-# the register window (`map_fixed_device`, by kind `NIC`) and the DMA arena, and drives the MAC itself through
-# the SDK's `Mmio`/`Dma` wrappers with no `unsafe` of its own.
-#
-# It is a feature rather than the default for one reason: the in-kernel driver is HARDWARE-VERIFIED on
-# a real Pi 4 and the service one is not yet, and a working machine does not get replaced by an
-# unproven one on the strength of an argument. Build both sides with it (`pi4_build.py
+# (The GENET feature that stood here was DELETED with the in-kernel driver it selected: the Pi 4's
+# ethernet is the `nic-driver` SERVICE in every build. `arch/aarch64/genet.rs` is now discovery only -
+# it reads one register to learn the controller is present, and the spawn path grants its window by
+# kind `NIC`. There is no build-time choice left, so nothing here to turn on.)
 # Run the neutral scheduler over 3 cooperative kernel tasks on ARM (arch/arm/sched_demo.rs).
 arm-sched-demo = []
-# Run a real USER service (`events`) THROUGH the neutral scheduler on ARM, preemptively, alongside
-# spinning kernel tasks (arch/arm/sched_user.rs). Proves per-task address spaces + user-mode preemption.
 # Run TWO USER services under the scheduler at once (arch/arm/sched_ipc.rs). Proves the banked-register
 # trap frame (SP_usr/LR_usr per task) and is the base the real IPC send/recv proof grows on.
 arm-sched-ipc = []
-# Spawn a service (events) through the NEUTRAL spawn path on ARM (arch/arm/sched_spawn.rs). Proves
-# task::spawn_service_with_config - the machinery the supervisor's spawn syscall uses - works on ARM.
+# (The single-user-service and kernel-direct-spawn bring-up features are gone, with their files - see
+# the C1-1 note above: the kernel spawns the supervisor and nothing else.)
 # The real OS bootstrap: kernel spawns the SUPERVISOR, which spawns the services (arch/arm/sched_supervisor.rs).
+# The shell is one of those services; there is no separate ARM shell feature any more.
 arm-supervisor = []
-# The interactive shell on ARM: gsh> prompt reading serial input (arch/arm/sched_shell.rs).
-# Hands-off chaos demo: a few seconds after boot the kernel INJECTS `chaos max-carnage all-services 10`
-# (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
-# storm. Build with `arm-supervisor,arm-autochaos`.
 # The 22 Tests 2 and 3 scaffolding (capability enforcement, IPC routing), run pre-scheduler.
 # OFF by default: they panic on failure and they register test resources and endpoints in the LIVE
 # tables, so a shipping boot must not run them. `osdev test identity` turns them on.
 kernel-selftest = []
+# Hands-off chaos demo: a few seconds after boot the kernel INJECTS `chaos max-carnage all-services 10`
+# (+ confirm) into the input ring, so a serial-output-only setup (no keyboard) still runs + shows the
+# storm. Build with `arm-supervisor,arm-autochaos`.
 arm-autochaos = []
 # (The `qemu` feature was DELETED here. It selected the DWC2 USB DMA bus-address translation back when
 # the USB stack was `arch/arm/dwc2.rs`; that stack is now the `dwc2` SERVICE, which carries its own

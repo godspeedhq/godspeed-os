@@ -40,6 +40,11 @@ Measured since: **five hits in ten unassisted cuts** across all five boards - Wy
 T630 (first), Pi 2 (third), Pi 4 (first), VisionFive 2 (first). Two misses then a hit is unremarkable
 at a rate near a half.
 
+*(Note 2026-10-09: `CLAUDE.md` 6.1's amendment of 2026-09-23, the canonical record, counts **six hits
+in twelve** - T630 two of two, Pi 2 third of three, Pi 4 first, VisionFive first, Wyse one of five -
+so the tally above is an earlier count of the same series, and the Wyse figure there is "one of
+five", not "fourth attempt".)*
+
 What an unaimed cut DOES test, and what the two runs did answer, is REORDERING: home blocks reaching
 the medium before the commit record, which leaves torn metadata with no record to replay from. That
 needs no window and is caught by `churn verify` (content) and `drives check` (structure). Both runs
@@ -253,6 +258,10 @@ leaves the accounting drifted will now SAY so, where before it would have repair
 
 ### 2.6 Pi 4 and VisionFive: no storage, so the shell half only
 
+*(Note 2026-10-09: written before either board had storage. Both have since run the full pass on a
+USB stick behind `xhci`, unassisted power cut included (the status at the top), so this step is
+superseded; `backlog/34` is about QEMU, not the boards.)*
+
 Neither board has a working disk path today (`backlog/34`). Run 2.1 and confirm the shell, the
 renamed command and the listing render correctly on their consoles. A `dir` on a machine with no
 filesystem must say storage is unavailable rather than hang - the rule above the rules.
@@ -295,3 +304,7 @@ checkpoint. The operator then cuts power into a window they can see, and the nex
 That is a test-only build feature, in the same shape as `io-error-test` and `write-tap`, and it
 converts "we never hit the window" into a test that hits it every time. NOT BUILT - recorded here
 because the three clean runs are what showed it was needed.
+
+*(Note 2026-10-09: built since, as `fs`'s `crash-window` feature (`services/fs/Cargo.toml`; the hold
+is `CRASH_WINDOW_SECS` in `services/fs/src/main.rs`), and used for the Pi 4 and VisionFive cuts of
+2026-09-22. Those cuts were then superseded by unassisted ones, as the status at the top says.)*

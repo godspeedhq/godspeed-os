@@ -1,6 +1,7 @@
 # Service contract for `roster` - a pipe-stage RECORD PRODUCER (examples/roster). It emits a typed
-# `Table` over the binary record codec into a shell pipe (e.g. `roster | where role=core`). The
-# kernel mints EXACTLY these capabilities at spawn.
+# `Table` over the binary record codec into a shell pipe (e.g. `roster | where role=core`). A
+# BUILD-TIME declaration: nothing parses TOML at spawn (13.6); the kernel mints what the SPAWN
+# REQUEST asks for, and this file states what that should be.
 name    = "roster"
 version = "0.1.0"
 
@@ -13,7 +14,7 @@ limit   = "64MiB"
 [capabilities]
 # Like `greet`, a record producer declares only `log_write` and NO send peers (no `ipc_send`): zero
 # standing authority to send (Commandment VII); its only way out is the SEND cap the SHELL delegates
-# at spawn (send_peers[0], via ctx.send_peer_at(0)). The record typing/codec is pure SDK
+# at spawn (send_peers[0], via gs::ipc::peer_at(&ctx, 0)). The record typing/codec is pure SDK
 # (sdk/rust/src/record.rs) and needs NO extra capability and NO kernel change - so a record producer
 # is no more privileged than `greet` (Commandment X / §4.4). (`log_write` is a v1 default minted to
 # every service; listed for clarity.) Full capability list: contracts/schema/service.schema.json +

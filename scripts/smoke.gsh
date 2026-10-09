@@ -1,8 +1,8 @@
 # Small host-baked smoke suite. `osdev test script` bakes THIS as a file into a GSFS disk
 # and runs `run /smoke.gsh` - proving the script-disk → run-from-file path (including a piped
 # assert, which a file can carry but on-device `write` cannot author). The extensive coverage
-# lives in the embedded suite (`selfcheck` / scripts/selfcheck.gsh). Passes iff "failed 0".
-# Which build produced this log? Same reason as selfcheck.gsh: a run that cannot identify its own
+# lives in the embedded suite (`selfcheck` / scripts/selfcheck/*.gsh). Passes iff "failed 0".
+# Which build produced this log? Same reason as `selfcheck/00-language.gsh`: a run that cannot identify its own
 # image is worth less than it looks.
 version
 assert ok echo hi

@@ -1334,3 +1334,127 @@ public; a panic an unprivileged service or a network peer can cause is a securit
 
 **One comment moved:** the explanation of the x86 timer modes sat on `TIMER_CORES` while three
 comments sent readers to `TIMER_MODE`; it is on `TIMER_MODE` now.
+
+## Audit 14 - documents and code comments, `feat/dogfood-gs` since it left `main` (2026-10-09)
+
+Scope: the branch that moved every service and example onto `gs` (1,085 raw SDK calls to zero), plus
+everything that describes it - `docs/`, `README.md`, `CONTRIBUTING.md`, `GETTING_STARTED.md`,
+`website/src/`, `utilities/0_conventions.md`, every example's guide, `sdk/rust/CLAUDE.md`, and the code
+comments of every service, `stdlib/` and `sdk/`. Six independent readers, one per area; every finding
+was checked against the code before it was changed, and one was refuted (below). About 870 of the
+branch's call sites were converted by script, so the comment BESIDE a converted call was the main
+suspect, and it was: comments still named `recv_timeout`, `request_with_reply`, `ctx.metric` and
+`ctx.duration_cycles` beside code that no longer calls them, and one script rewrote a HISTORICAL quote
+of the old code into `gs` calls that never existed (`block-driver`, restored from `main`).
+
+**Two claims this branch made false, still taught elsewhere.** `gs::call::request_within` returns
+`Error::PeerDied` after a `ReplyDead` now and never re-sends; CONTRIBUTING, the asker and reply-server
+guides, `sdk/rust/CLAUDE.md`, `call.rs`'s own doc and `persistence.md` still taught "reacquire and
+retry". And printing needs `log_write`, not `console_push`: `copier`'s source, guide and contract,
+`services/CLAUDE.md` and `docs/job-control-design.md` all said a detached job cannot write over a prompt
+BECAUSE it lacks `console_push`. It can; it stays quiet by convention (it never calls `gs::io`). That was
+a security claim, so it is corrected as one: no keystroke injection, yes console output.
+
+**Four defects in code, found by reading the comments, and fixed:**
+- The shell reported a mutation as FAILED when `fs` died holding it. Its rename, move, delete, mkdir,
+  write and pipe arms matched only `OutcomeUnknown` as "may have happened", so the new `PeerDied` fell
+  into the plain failure arm - exactly the confident wrong answer their comments said could not happen.
+  Introduced by this branch; they now match both, and the messages say "no answer came back".
+- `gs::io` dropped a string over 256 bytes and truncated a formatted one at 256, silently, because the
+  SDK's `console_write` does. It is the first call a stranger makes. It now writes in pieces cut on
+  character boundaries; its doc also said printing "does not block", and the kernel parks a writer
+  when the console's queue is full.
+- `examples/resource-server` answered with a plain blocking send and never removed the reply cap: one
+  table slot leaked per invocation, the console leak this branch fixed, in the example that teaches the
+  pattern. It answers through `gs::ipc::reply` now.
+- `nic-driver` (GENET) logged "the reply cap is dead" for a rights refusal; it says which now.
+
+**A gate that had been failing unseen.** `scripts/stdlib_gap_check.py` reported 10 against a baseline of
+8 on `main` and here, and nothing ran it: its hand-kept driver list predated `audio-driver`, `pwm-audio`
+and `wifi-driver`, so their `Mmio`/`Dma` use counted as ordinary programs. The list is corrected and the
+check is on `osdev build`'s path (`EXTRA_CHECKS`). The one-way gate also gained `resource_mint` (one
+`fs` call, converted), and its 2026-10-09 note now says what zero does NOT cover: the SDK's deadline
+variants, which `gs::call` has no equivalent for.
+
+**Refuted:** that `xhci`'s 250 ms idle wake became one quantum on an uncalibrated clock. The old code
+passed 25 CYCLES to `recv_timeout`, also under a quantum. No behaviour changed.
+
+**Counts:** the `gs` surface is 164 public items across 13 modules plus 33 in `gs::driver` (README said
+149; method in `docs/stdlib-brief.md`); 54 syscalls, not 52; 58 utilities, not 55.
+
+**Recorded, not changed (SDK behaviour, noted at the code):** `spawn_via_supervisor` retries after any
+error including `ReplyDead`, so a supervisor that dies mid-spawn could start a service twice;
+`DeadlineOutcomeInto::SendFailed` includes `ReplyDead` (harmless for `fs`'s block transfers, which are
+safe to repeat); and the SDK traces a full queue as a lost peer, so `gs::trace` shows `Busy` from
+`gs::call` as `PeerLost`.
+
+## Audit 15 - every document and code comment in the tree, whatever its age (2026-10-09)
+
+Scope: the deeper pass the operator asked for after Audit 14. Audit 14 read what `feat/dogfood-gs`
+changed; this one read every factual claim in the repository against the code that owns it - names,
+numbers, behaviour, authority and present-tense history - in twelve areas by twelve independent readers
+(the neutral kernel; x86-64 with RISC-V; ARM and AArch64 with the stub ports and `boot/`; the shell in two
+halves; the 58 utility specs; `docs/` in two halves with the website; the SDK, `gs` and `contracts/`; the
+core services; the driver and network services; the tooling, root documents, examples, tests and backlog
+index), then one more for findings that crossed areas. About 370 files; documents and comments only.
+
+**The rule this audit ran under, set by the operator mid-pass: an audit of documents and comments
+changes documents and comments.** A code defect it finds is recorded, not fixed. They are in
+`backlog/80` - about ninety, from a kernel syscall that answers a caller without the capability with the
+value for success, to `drives flash` erasing drive 0 on a mistyped label. Verified after the pass: the
+only Rust files whose code tokens differ from HEAD are the six Audit 14 fixes it already records, plus one
+enum variant moved under its own doc in `stdlib/rust/src/error.rs`.
+
+**What was wrong, by kind, with one example each:**
+- **Detached doc comments** - the commonest finding, in every area: a `///` block left sitting on the
+  next item after code moved, so rustdoc attaches it to the wrong function (`ask_with_quit_notice`
+  inherited `fs_op_q`'s; `kernel_main`'s attributes apply to `banner`).
+- **Authority stated as the contract** - dozens of comments and contracts said the kernel grants "from
+  the contract" or "by name"; it grants from the spawn request, and knows only `supervisor` by name
+  (CLAUDE.md 13.6, 12.3). `service_control` was "supervisor-only" in many places; the shell, `chaos`,
+  `control` and every probe hold it.
+- **Deleted subsystems in the present tense** - the in-kernel USB, DWC2, xHCI and fbcon stacks, `init`,
+  the registry, `logger`, `kernel/src/control.rs` and the ATA PIO backend all appeared as live somewhere.
+- **Numbers that drifted** - check counts in `osdev/CLAUDE.md`, buffer sizes in the shell (16 KiB
+  where the code says 12), the InspectKernel query count, ring and reply sizes, probe sample counts.
+- **Specs that described the plan, not the build** - the utility specs had samples from before
+  `init`/`registry` were removed, and seven commands claimed a `q` that no longer exists (backlog/80 H16).
+
+**Constitution findings, for the operator - not edited** (CLAUDE.md and COMMANDMENTS.md change only by
+amendment with a rationale):
+- 9.2, 13.2, 11.3: "strict" contract placement is not what the code does. A contract's core reaches the
+  kernel as a preference and is rerouted, loudly; only `--core` and a restart override are strict
+  (`resolve_spawn_core`, `SPAWN_FLAG_CORE_STRICT`); `smp::placement::resolve` is dead; backlog/01 is open.
+- 14.4 and 7.4: `service_control` is not held only by the supervisor (above), and nothing holds `REVOKE`
+  - `resource_revoke` is gated by ownership.
+- 8.9 names a supervisor quantum-starvation watchdog that does not exist (also `kernel/src/ipc/CLAUDE.md`).
+- 16 describes an update model in the present tense; none of it is built (`docs/service-ownership.md`,
+  step 2).
+- 17: no dev-mode check guards `--core`; `osdev shell` and `osdev conform` are not listed.
+- 11.1: "PSCI on ARM" - the Pi 4 uses the firmware spin table, the Pi 2 a BCM2836 mailbox; "spawn events
+  on Core 0" - its row prefers core 2; "no kernel name resolution" - the kernel still name-wires every
+  declared peer the spawner did not supply.
+- 10.5: the kill path does no TLB shootdown and no code calls `broadcast_tlb_shootdown`; it relies on
+  every other core having switched CR3.
+- 11.4, 2026-09-04 amendment: "no log line has ever been sent to `events`" - `events` now keeps an 8 KiB
+  copy (`TRACE_OP_LOG`, `events log`); the property that logging does not depend on it still holds.
+- 12.3: `DevicePower` answers a caller without the capability with its success value (backlog/80 K3).
+- 19: the NMI broadcast is x86 only (the others use a `PANIC_HALT` flag), and the panic reason also
+  reaches the framebuffer and the ring, not serial only.
+- 22: F2's `UnknownSyscall` does not exist (an unknown syscall returns -1); 22.3 says Tests 11 and 15
+  are A/B (they are single cases; 24 is right); 22.2's `tests/qemu/` tree is not the tree on disk.
+- 4.1: 53 arch-conditional sites (2 + 51), not 54; "three stubs that boot and print" - s390x's
+  `sclp_putc` is a no-op.
+- 5: `bugs/` holds three bugs, not four; `stdlib/` is missing from the map; `dash_check` does not check
+  commit messages and `doc_refs` does not scan CLAUDE.md; 238 files is now 298; "eleven files" is twelve.
+- 18.4: no CI compares the unsafe audit to source (every test workflow is dispatch-only), and the four
+  SDK-permitted files are not compared at all.
+- Dated-note candidates: 11.4 "its first line" (line 6); Appendix C.2 "25 queries" (26); 22 Test 14
+  "9/9" (15 checks); 23.2 "every second"; Appendix B.2's System V ABI is x86 only.
+- COMMANDMENTS.md III says `fsck`, which the shell refuses as a foreign word (`drives check`), and
+  `foreign_word_check` does not scan that file.
+
+**Gates touched:** `scripts/COMMENT-SYMBOLS.baseline.txt` and `scripts/DOC-SYMBOLS.baseline.txt` each lost
+the entries the corrected comments no longer need (four in all) - the ratchets tightened. `facts_check`
+fell from 47 statements to 46 mid-pass, when a rewrite of `CONTRIBUTING.md` dropped the sentence it
+verified; it was restored, and the check reads 48. Every documentation gate is green.

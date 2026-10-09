@@ -50,9 +50,9 @@ unsafe extern "C" fn task_entry_trampoline() -> ! {
 ///   [RSP+8]  user_rsp   - initial user-space stack pointer
 ///
 /// GS invariant: this function always runs in ring-0 with GS.base = kernel ptr.
-/// `swapgs` restores the user's GS (0) into GS.base before IRETQ, so that the
-/// ring-3 task sees GS.base=0 and its first SYSCALL's `swapgs` correctly loads
-/// the kernel ptr back into GS.base.
+/// `swapgs` before IRETQ keeps the swap parity the entry stubs expect. (Both GS MSRs
+/// hold the same per-core pointer - see `syscall_entry::init_per_core_syscall` - so
+/// ring-3 actually sees that pointer, not 0, in GS.base.)
 ///
 /// We use IRETQ (not SYSRETQ) to enter ring-3 so that SS is explicitly loaded
 /// from a kernel-constructed frame with SS=0x23 (RPL=3).  SYSRETQ derives SS
@@ -168,8 +168,8 @@ impl TaskContext {
     ) -> Self {
         // Kernel-stack layout built here (high → low addresses, K0T = kernel_stack_top):
         //
-        //   [K0T-368]: user_rsp  - ring3_entry_trampoline's `pop rsp` target
-        //   [K0T-376]: user_rip  - ring3_entry_trampoline's `pop rcx` target
+        //   [K0T-368]: user_rsp  - ring3_entry_trampoline's `pop rbx` target
+        //   [K0T-376]: user_rip  - ring3_entry_trampoline's `pop rax` target
         //   [K0T-384]: ring3_entry_trampoline - switch_context `ret` target; ctx.rsp
         //
         // WHY K0T-384, not the obvious K0T-32:
@@ -189,8 +189,9 @@ impl TaskContext {
         //   • Below the early-return ISR depth (~K0T-260) - the timer ISR on the
         //     no-switch path cannot reach it, so [K0T-384] is never overwritten
         //     before the first real context switch updates TASK_CTX[slot].rsp.
-        //   • Above the SYSCALL kernel_rsp (K0T-512) - SYSCALL grows downward
-        //     from K0T-512, so it can never write upward to K0T-384.
+        //   • Above the syscall stack's top, `kernel_rsp` = K0T-2048 (set by the
+        //     scheduler's `prepare_ring3_switch`) - the syscall chain grows downward
+        //     from there, so it can never write upward to K0T-384.
         //   • After the first real context switch, switch_context saves the current
         //     RSP (inside the ISR frame, ~K0T-200) into TASK_CTX[slot].rsp, making
         //     [K0T-384] dead data that is never consulted again.

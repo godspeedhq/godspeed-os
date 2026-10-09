@@ -19,6 +19,14 @@ Three facts had to agree and nothing checked that they did:
 (3) no longer exists as a separate fact: both build scripts now DERIVE it from (2). This closes the
 remaining gap, (1) against (2).
 
+NOTE 2026-10-09: on every port the kernel now `include_bytes!`s only the supervisor
+(`SVC_SUPERVISOR_ELF`, kernel/src/task/mod.rs); the supervisor embeds the rest. The `arm_built` and
+`aarch64_built` lists in kernel/build.rs still name ~25 services, but they only decide which
+`SVC_*_ELF` paths point at real files, and no kernel code reads those beyond the supervisor and the
+arm bring-up scaffolding. So for arm and aarch64 this check still compares MANAGED against a list that
+no longer decides what boots; only riscv64 (whose list is `["supervisor"]`) is checked against the
+supervisor's own roster below, and x86_64 has no `_built` list and is not checked at all.
+
 A name may be absent from an arch's list only by being named here, with a reason. That is the whole
 design: an exemption is a sentence someone wrote, not a silence.
 """
@@ -145,12 +153,14 @@ def _supervisor_embedded(root, arch):
     first port to ship on that model: `riscv64_built` in kernel/build.rs is literally `["supervisor"]`.
     Checking the KERNEL's list on such a port asks the wrong file - every managed service is "missing"
     from a list that is correct at one entry, which is a FALSE FAILURE on the only port that has
-    finished the migration. (arm and aarch64 still embed ~25 images in the kernel; they are the ones
-    yet to move.)
+    finished the migration. (arm and aarch64 still LIST ~25 images in kernel/build.rs, though the
+    kernel embeds only the supervisor there too - see the 2026-10-09 note at the top.)
 
     So when the kernel's arm is supervisor-only, the roster comes from services/supervisor/build.rs
-    instead: its flat `EMBEDDED` array, plus the two arch-conditional groups it adds - the USB host
-    (per-controller, not per-ISA) and the PCI enumerator (only where config space is reachable).
+    instead: its flat `EMBEDDED` array, plus the arch-conditional groups it adds - the USB host
+    (per-controller, not per-ISA), the PCI enumerator (only where config space is reachable), the
+    onboard radio and the USB dongle's driver. The `audio` group is NOT read; riscv64 exempts both
+    audio drivers, so nothing it embeds is missed today.
     """
     src = io.open(os.path.join(root, "services", "supervisor", "build.rs"), encoding="utf-8").read()
     names = list(re.findall(NAME, _block(src, "const EMBEDDED: &[&str] = ",

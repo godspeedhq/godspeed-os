@@ -26,7 +26,7 @@ The owner side, using only real `ServiceContext` methods:
 | Step | Call | What happens |
 |------|------|--------------|
 | Mint | `gs::resource::mint(&ctx, gs::cap::READ \| gs::cap::GRANT)` | the kernel allocates a fresh opaque `ResourceId` at generation 0, records THIS service as its owner, and mints a real cap for it - returns `(resource_id, cap)` |
-| Make a copy to give | `gs::cap::duplicate(&ctx, cap)` | a derived copy; rights can only narrow, never widen (§7.3) |
+| Make a copy to give | `gs::cap::duplicate(&ctx, cap)` | a derived copy with the SAME rights (READ\|GRANT here); it can never widen (§7.3) |
 | Hand it to a client | `gs::ipc::send_granting(&ctx, client, copy, &note)` | the kernel **moves** the copy into the client's table (§7.6, §8.5); we drop our own cap and serve via the badge |
 | Serve a use | `gs::resource::last_badge(&ctx)` -> `(resource_id, right)` | a holder's `resource_invoke` is kernel-validated and routed here, **badged** with which resource and the right the kernel already checked |
 | Enforce non-escalation | `op <= right` | a READ-validated cap must never drive a WRITE - the owner's matching check (§7.3) |
@@ -49,22 +49,24 @@ contract carries it), as the build-time statement of that grant, reconciled by
 > minters "(today: `fs`)" and is "deliberately NOT a contract capability field (not in the schema)".
 > The schema has `resource_mint`, this example's contract declares it, and the `service_hw` arm the
 > claim rested on has no arms left. Three places in this file said it and the contract said it a
-> fourth time, nine lines below its own `resource_mint = true`. The kernel grants it
-to `resource-server` too - but ONLY in the `resource-test` build (`osdev test resource-server`), the
-only build that spawns this service - so the grant is effectively test-only, exactly as
-`reply-server`/`asker` are spawned only in the `reply-test` build (the kernel always embeds them; the
-supervisor feature gates whether they run). Built that way, the grant is present and the example runs
-for real against its client `examples/holder`. Built standalone (a plain `cargo build` of this crate
-alone, never spawned), the grant is absent, so `ctx.resource_mint` returns `None` and the service logs
-and idles - loud, bounded degradation (Commandment V); `fs` is the production proof.
+> fourth time, nine lines below its own `resource_mint = true`.
+
+The supervisor carries this service's image, and its spawn row passes `RESOURCE_MINT` in the spawn
+request. It spawns it ONLY in the `resource-test` build (`osdev test resource-server`), so the grant
+is effectively test-only, exactly as `reply-server`/`asker` are spawned only in the `reply-test` build
+(the supervisor feature gates whether they run). Built that way, the grant is present and the example
+runs for real against its client `examples/holder`. Spawned from a row without the grant, the
+authority is absent, so `gs::resource::mint` returns `Err(PermissionDenied)` and the service logs and
+idles - loud, bounded degradation (Commandment V);
+`fs` is the production proof.
 
 ## Why it is built this way (the Commandments)
 
 - **Commandment VII (minting is gated, never ambient).** Issuing a new authority is itself a
-  privileged act. `resource_mint` needs the `RESOURCE_MINT` capability, granted by name in the kernel
-  to legitimate minters - it is not in any contract and cannot be requested. No service mints
-  resources because it feels entitled to; only because the kernel granted it that authority, exactly
-  as a driver reaches its BAR only because the kernel mapped it. *(COMMANDMENTS.md VII; CLAUDE.md
+  privileged act. `resource_mint` needs the `RESOURCE_MINT` capability, which arrives in the spawn request
+  and is refused unless the supervisor itself may delegate it. Declaring it in a contract states the
+  grant; it does not make it. No service mints resources because it feels entitled to; only because
+  it was granted that authority, exactly as a driver reaches its BAR only because the kernel mapped it. *(COMMANDMENTS.md VII; CLAUDE.md
   §7.10, §3.1, Invariant 1.)*
 - **Commandment III (the service owns the resource's meaning).** The kernel tracks only an opaque
   `ResourceId` and its owning endpoint - nothing more. It never learns what the resource *is*; this
@@ -113,7 +115,7 @@ To serve any resource-as-capability: have the supervisor's spawn row grant your 
 `RESOURCE_MINT` (and declare it in your contract so the two agree), `gs::resource::mint` a resource
 per client, hand each client a `gs::cap::duplicate` copy, then serve invocations off
 `gs::resource::last_badge` - resolving the `ResourceId` to your own meaning, enforcing `op <= right`, and
-`resource_revoke`-ing when the resource goes away. `services/fs` is this exact shape, fully grown.
+calling `gs::resource::revoke` when the resource goes away. `services/fs` is this exact shape, fully grown.
 
 ## See also
 
@@ -122,10 +124,11 @@ per client, hand each client a `gs::cap::duplicate` copy, then serve invocations
 - `services/fs` - the real resource server: a file is a delegated resource cap, minted on `Open`,
   served via the badge, revoked on delete/close.
 - The shell `fcap <file>` command + **CLAUDE.md §22 Test 14** (file-is-a-capability) - proves every
-  property above end to end (`osdev test file-cap`, 9/9; hardware-validated on the T630).
+  property above end to end (`osdev test file-cap`, 15 assertions today; hardware-validated on the T630).
 - `examples/cap-grant` - capability **transfer** (the operation before this one).
-- `examples/e1000` - the by-name kernel grant this example needs for `RESOURCE_MINT`, shown for a NIC
-  BAR; `examples/driver-skeleton` - the compilable-template-without-a-kernel-hook pattern.
+- `examples/e1000` - the same spawn-request grant route, for a device class instead of a privilege
+  (there is no by-name kernel grant any more); `examples/driver-skeleton` - the compilable-template
+  pattern.
 - **Commandments III, VII, X** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §7.10 (delegated resource capabilities), §7.3 (cap properties), §4.4 (the kernel knows
   no files), §26.10 (mechanism vs policy).

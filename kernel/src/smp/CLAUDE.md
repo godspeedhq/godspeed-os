@@ -1,6 +1,6 @@
 # kernel/src/smp/
 
-Multi-core coordination (§9, §11). Unsafe boundary: APIC MMIO writes in `ipi.rs`.
+Multi-core coordination (§9, §11). The IPI protocol lives in `ipi.rs`; the interrupt-controller register writes behind it live in `arch::imp` (`send_ipi_to_lapic`), so `ipi.rs` holds the protocol, not the MMIO.
 
 ## Files
 
@@ -10,12 +10,13 @@ Multi-core coordination (§9, §11). Unsafe boundary: APIC MMIO writes in `ipi.r
 | `core.rs`       | `CoreState` per core; `mark_ready(core_id)`, `ready_count()`, `is_ready(core_id)` |
 | `ipi.rs`        | `send_ipi(core_id, vector)`, `broadcast_tlb_shootdown(virt)`, `ipi_handler(vector)` |
 | `percpu.rs`     | `PerCore<T>` - boot-allocated per-core arenas (§26.6.1), sized to N cores at boot from the frame allocator (not `[_; MAX_CORES]`); all `unsafe` isolated here behind safe `get()` |
-| `placement.rs`  | `resolve(contract_core)` → `Ok(core_id)` or `Err(PlacementInvalid)` |
+| `placement.rs`  | `resolve(contract_core)` → `Ok(core_id)` or `Err(PlacementInvalid)` - DEAD CODE: the live placement is `task::resolve_spawn_core` |
+| `names.rs`      | `NameTable` / `AtomicNameSet` - fixed-size task-name and peer-name storage, so `task/` needs no `unsafe` for them |
 | `spinlock.rs`   | `SpinLock<T>` / `SpinLockGuard<T>` - RAII spinlock for safe mutable statics throughout the kernel |
 
 ## SpinLock usage
 
-`SpinLock<T>` is the standard way to protect mutable kernel globals outside the permitted unsafe layers. All unsafe code lives in `spinlock.rs` itself (4 lines: `unsafe impl Send`, `unsafe impl Sync`, two `UnsafeCell::get()` deref calls in `Deref`/`DerefMut`). Call sites are entirely unsafe-free:
+`SpinLock<T>` is the standard way to protect mutable kernel globals outside the permitted unsafe layers. All unsafe code lives in `spinlock.rs` itself (5 lines: `unsafe impl Send`, `unsafe impl Sync`, the `ZEROED` constant's `mem::zeroed()`, two `UnsafeCell::get()` deref calls in `Deref`/`DerefMut`). Call sites are entirely unsafe-free:
 
 ```rust
 static FOO: SpinLock<[T; N]> = SpinLock::new([...]);
@@ -27,7 +28,7 @@ guard[i] = value;
 
 ## Core lifecycle (§9.5)
 
-Cores discovered at boot are fixed for the system lifetime. No hotplug. The core count is `BootInfo.ap_ids.len() + 1` (the +1 is the BSP). Any core that fails to call `mark_ready` within the timeout is logged as a warning and excluded from placement (§11.3).
+Cores discovered at boot are fixed for the system lifetime. No hotplug. The core count is `arch::imp::ap_count() + 1` (the +1 is the BSP), set once in `percpu_init`. Any core that fails to call `mark_ready` within the timeout is logged as a warning and excluded from placement (§11.3).
 
 ## IPI vectors
 
@@ -57,11 +58,13 @@ sequenceDiagram
     C0->>C0: free_frame(reclaimed_frame)
 ```
 
-This is a synchronous barrier. It is a real cost on every unmap. v1 minimises unmap frequency by reclaiming memory only at service death.
+This is a synchronous barrier. **Nothing in the kernel calls it today** (`broadcast_tlb_shootdown` and `broadcast_full_tlb_flush` have no callers): memory is reclaimed only at service death, and the kill path relies on every other core having switched to a different address space first (its spin-wait) rather than on a shootdown - see the reclaim comment in `scheduler::kill_task_by_slot`. The protocol below is kept for the day an unmap happens while a task lives.
 
 **Concurrent shootdowns are safe (per-core requests).** Each *initiating* core has its own request slot in `ipi.rs` - `SHOOTDOWN_ADDR[core]` plus a per-initiator ack **bitmask** (`SHOOTDOWN_ACK_MASK[core]`: bit *y* = receiver *y* has serviced this request; one bit per core-pair, `N²/8` bytes) - and a core waiting for its own acks also services every other core's pending request (`service_pending`, called from both the IPI handler and the ack-wait spin). So two cores unmapping at the same time ack each other instead of deadlocking. The single-global `TLB_ACK`/`TLB_SHOOTDOWN_ADDR` counter this replaced **deadlocked** under concurrent reclaims: each initiator spun IF=0 waiting for the other's ack while being a target of the other's all-excluding-self broadcast, so neither could ack - the `chaos max-carnage` 71K-round wedge on the T630. The diagram above is still the single-unmapper common case; the per-core slots generalise it to N simultaneous unmappers.
 
 ## Placement (§9.2)
+
+`resolve` below is dead code; the live rule is `task::resolve_spawn_core` (a strict override, else a preferred core with a loud round-robin fallback, else round-robin). What follows describes `resolve`.
 
 `resolve(contract_core)` returns the core a new service instance should run on:
 - `Some(n)` → requires core `n`; returns `PlacementInvalid` if `!is_ready(n)`.

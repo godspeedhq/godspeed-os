@@ -180,9 +180,9 @@ enum Device<'a> {
 }
 
 fn ms_since(ctx: &ServiceContext, t0: u64) -> u32 {
-    match ctx.tsc_ticks_per_10ms() / 10 {
+    match wait::ticks_per_10ms(ctx) / 10 {
         0 => 0,
-        per => (ctx.read_tsc().wrapping_sub(t0) / per).min(u32::MAX as u64) as u32,
+        per => (wait::ticks(ctx).wrapping_sub(t0) / per).min(u32::MAX as u64) as u32,
     }
 }
 
@@ -367,7 +367,7 @@ impl<'a> Pwm<'a> {
         self.play = Some(Play {
             sine: Sine::new(hz, RATE_DEFAULT), hz, ms, left: frames, frames, filled: at + GUARD, played: at,
             last: at, begin: at + GUARD, end_at: usize::MAX, underruns: 0, silence: 0,
-            started: self.ctx.read_tsc(), feed: None,
+            started: wait::ticks(self.ctx), feed: None,
         });
         self.ctx.log_fmt(format_args!("pwm-audio: playing {} Hz for {} ms", hz, ms));
         self.service();
@@ -390,7 +390,7 @@ impl<'a> Pwm<'a> {
             // heard, the price of not stuttering at its start.
             frames: frames as usize, filled: at + RING_FRAMES / 2, played: at, last: at, begin: at + RING_FRAMES / 2,
             end_at: usize::MAX, underruns: 0, silence: 0,
-            started: ctx.read_tsc(), feed: Some(Feed { channels, ended: false, last_feed: ctx.read_tsc() }),
+            started: wait::ticks(ctx), feed: Some(Feed { channels, ended: false, last_feed: wait::ticks(ctx) }),
         });
         ctx.log_fmt(format_args!("pwm-audio: stream opened - {} Hz, {} channel(s), {} frames", rate, channels, frames));
         out[0] = wire::OK;
@@ -400,7 +400,7 @@ impl<'a> Pwm<'a> {
 
     fn feed_pcm(&mut self, data: &[u8], out: &mut [u8]) -> usize {
         let free = self.free_frames() as usize;
-        let now = self.ctx.read_tsc();
+        let now = wait::ticks(self.ctx);
         let (channels, filled) = match self.play.as_ref() {
             Some(Play { feed: Some(f), filled, .. }) => (f.channels as usize, *filled),
             _ => { out[0] = wire::NOT_OPEN; return 1; }
@@ -669,7 +669,7 @@ fn bad(out: &mut [u8]) -> usize {
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.trace_as("pwm-audio");
+    gs::trace::as_name(&ctx, "pwm-audio");
     let mmio = ctx.mmio();
     let dma = ctx.dma_region();
     let irq = Irq::granted(&ctx);

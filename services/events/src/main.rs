@@ -8,7 +8,8 @@
 // lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
 //! `events` - the diagnostic sink (§11.4). Restartable.
 //!
-//! Two jobs, both "somewhere to put diagnostic data that someone reads later":
+//! Its jobs, all "somewhere to put diagnostic data that someone reads later" (the metric table and the
+//! log window joined the two below later - `CLAUDE.md` here lists all three stores):
 //!
 //! 1. **Drain its endpoint.** The endpoint EXISTS, so anything sent here must be consumed or the
 //!    16-deep queue sits full forever (a stub that only parks never recv's, and a `chaos flood-storm`
@@ -35,6 +36,10 @@
 //! `events` already exists in all three lists, is already managed and watched, and its entire purpose
 //! is diagnostic data. Putting the ring here costs the kernel **exactly nothing**.
 //!
+//! (Note 2026-10-09: those kernel lists are gone - the kernel's catalogue holds only the supervisor, and
+//! death notification and the restart count follow `SPAWN_FLAG_WATCHED` from the supervisor's `MANAGED`
+//! (CLAUDE.md 12.3 amendment 2026-10-03). The conclusion stands; the cost it weighed no longer exists.)
+//!
 //! It is worth being precise about one tension: `docs/logging.md` calls this service "a stateless
 //! broker, not a store", and that is about PERSISTENCE - an `events` that writes through `fs` makes
 //! observing a storage failure depend on storage. A fixed in-memory ring is not persistence. It
@@ -54,7 +59,10 @@ use godspeed_sdk::trace::{
     EV_LEN, MET_LEN, MET_NAME_LEN, PEER_LEN, TRACE_OP_LOG, TRACE_OP_LOGS, TRACE_OP_DUMP, TRACE_OP_EVENT, TRACE_OP_METRIC, TRACE_OP_METRICS,
     TRACE_OP_STATUS,
 };
+use godspeed::driver::wait::{Budget, Since};
 use godspeed_sdk::{Message, ServiceContext};
+
+use godspeed as gs;
 
 /// Events retained. 192 x 34 B is about 6.5 KiB, inside this service's existing footprint.
 ///
@@ -65,8 +73,8 @@ use godspeed_sdk::{Message, ServiceContext};
 /// HERE, where it costs one service more memory and costs the kernel nothing.
 const RING: usize = 192;
 
-/// Distinct metric samples retained: 64 x 36 B is about 2.3 KiB, and the whole table fits in one 4 KiB
-/// reply message with room to spare.
+/// Distinct metric samples retained: 64 x 44 B (a `MET_LEN` 40-byte record plus the sink's 4-byte
+/// stamp, `MET_OUT`) is about 2.8 KiB, and the whole table fits in one 4 KiB reply message.
 ///
 /// A FIXED table, not a map that grows with distinct names, because a counter keyed by arbitrary
 /// strings is unbounded state wearing a small hat (§26.6.1). 64 is a bound a reader can read off this
@@ -125,17 +133,16 @@ struct Ev {
 /// emitter's `try_send`, so a blocking reply here would let one stalled reader stall the sink for the
 /// whole system. Dropped on failure - the caller retries, and a lost answer costs nothing.
 fn reply(ctx: &ServiceContext, out: &[u8]) {
-    if let Some(cap) = ctx.take_pending_cap() {
-        let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(out));
-        // RECLAIM IT. A reply capability is a one-shot return address handed to us inside the request;
-        // sending on it does not consume it, so leaving it behind burns a cap-table slot per reply
-        // until the table is full. `block-driver`, `console` and `fs` all do this - this service was
-        // the one that did not.
+    if let Some(cap) = gs::ipc::take_sent_cap(ctx) {
+        // `gs::ipc::reply` answers AND reclaims. A reply capability is a one-shot return address handed
+        // to us inside the request; sending on it does not consume it, so leaving it behind burns a
+        // cap-table slot per reply until the table is full. `block-driver`, `console` and `fs` all
+        // reclaim it - this service was the one that did not.
         //
         // It was visible before it was fatal: `events deps fs` drew `events -> shell`, because a
         // retained return address is indistinguishable from a wired peer (both SEND|GRANT to a live
         // task's endpoint). A leak that shows up as a wrong arrow in a diagram is a lucky leak.
-        ctx.remove_cap(cap);
+        let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(out));
     }
 }
 
@@ -161,15 +168,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // instruction, so read THAT every time and refresh the seconds only when a second has actually
     // passed. Events within the same second share a stamp, which is exactly the resolution the field
     // has anyway.
-    let per_sec = ctx.duration_cycles(1000);
-    let mut at_s = ctx.epoch_secs_monotonic() as u32;
-    let mut at_tsc = ctx.read_tsc();
+    const SECOND: Budget = Budget::ms(1000);
+    let mut at_s = gs::task::epoch_secs_monotonic(&ctx) as u32;
+    let mut at = Since::now(&ctx);
 
-    ctx.trace_as("events");
+    gs::trace::as_name(&ctx, "events");
     ctx.log("events: ready (drains its endpoint; holds the IPC trace ring)");
 
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         let b = msg.payload_bytes();
         if b.is_empty() {
             continue;
@@ -180,10 +187,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // observability path, and the opposite of the one made on a correctness path.
             TRACE_OP_EVENT if b.len() >= 1 + EV_LEN => {
                 let e = &b[1..1 + EV_LEN];
-                let tsc = ctx.read_tsc();
-                if tsc.wrapping_sub(at_tsc) >= per_sec {
-                    at_s = ctx.epoch_secs_monotonic() as u32;
-                    at_tsc = tsc;
+                if at.passed(&ctx, SECOND) {
+                    at_s = gs::task::epoch_secs_monotonic(&ctx) as u32;
+                    at = Since::now(&ctx);
                 }
                 if next == RING {
                     next = 0;
@@ -243,10 +249,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // used `try_send` and did not wait, so this must never be the reason a service is slow.
             TRACE_OP_METRIC if b.len() >= 1 + MET_LEN => {
                 let m = &b[1..1 + MET_LEN];
-                let tsc = ctx.read_tsc();
-                if tsc.wrapping_sub(at_tsc) >= per_sec {
-                    at_s = ctx.epoch_secs_monotonic() as u32;
-                    at_tsc = tsc;
+                if at.passed(&ctx, SECOND) {
+                    at_s = gs::task::epoch_secs_monotonic(&ctx) as u32;
+                    at = Since::now(&ctx);
                 }
                 let mut owner = [0u8; PEER_LEN];
                 owner.copy_from_slice(&m[0..PEER_LEN]);

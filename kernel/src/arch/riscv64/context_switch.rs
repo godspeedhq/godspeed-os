@@ -31,8 +31,9 @@
 //! EVERY switch into an address space and with no same-root shortcut, so the neutral kill path's
 //! x86-shaped assumption ("a page-table reload flushes non-global entries") holds here too.
 //! `arch/CLAUDE.md` names this as an obligation a port must meet by construction; it is met here
-//! rather than deferred. The shortcut that used to sit here, and why comparing root ADDRESSES is not
-//! comparing address SPACES once frames are recycled, is written out at the fence itself.
+//! rather than deferred. A same-root shortcut used to sit here and was removed: comparing root
+//! ADDRESSES is not comparing address SPACES once frames are recycled, because a freed root can come
+//! back as a different task's.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -222,9 +223,9 @@ unsafe extern "C" fn user_entry_trampoline() -> ! {
 
 /// Switch from `current` to `next`.
 ///
-/// Saves the callee-saved set into `*current`, installs `next`'s address space if it differs from
-/// the live one, restores `next`'s set, and returns - into `next`'s resume address rather than the
-/// caller's.
+/// Saves the callee-saved set into `*current`, installs `next`'s address space whenever its root is
+/// non-zero (every such switch, no same-root shortcut), restores `next`'s set, and returns - into
+/// `next`'s resume address rather than the caller's.
 ///
 /// **Does NOT save or restore the interrupt-enable state**, deliberately, exactly as the x86 and ARM
 /// switches do not. Whether interrupts are on across a switch is the scheduler's business (it masks
@@ -336,8 +337,8 @@ unsafe extern "C" fn riscv64_switch_registers(current: *mut TaskContext, next: *
         "sd s10, 0x60(a0)",
         "sd s11, 0x68(a0)",
         // ---- address space ----
-        // A root of zero means "no opinion" and leaves translation alone, which is what a kernel task
-        // that shares whatever map is live wants. See `new_kernel` for the constraint that puts on
+        // Nothing here: the Rust half (`switch_context`) has already installed `next`'s root, or left
+        // translation alone for a root of zero. See `new_kernel` for the constraint that puts on
         // such a task.
         // ---- restore the incoming context from *a1 ----
         "ld ra, 0x00(a1)",

@@ -614,7 +614,9 @@ For now:
 - A **string** toolkit (length, slice, split) - interpolation covers *building* strings; richer
   string ops wait. (Integer arithmetic is **in** - §3.)
 - **Cross-file include / `source`**, and **record values held in variables** (hold a whole table in
-  a `let`) - bigger storage stories; iterate with `for` for now.
+  a `let`) - bigger storage stories; iterate with `for` for now. *(2026-10-09: function libraries
+  are the exception - `import <path>` and `from <path> import <name>` are built, see "Libraries"
+  under What is built. A general `source` of a script's statements is still not.)*
 - **A heap, and huge / streamed scripts.** gsh stays `no_std`/fixed-storage (§9). Heap-backed values,
   multi-block-file streaming, and 10K-line scripts are explicitly **not** gsh's job - by the time a
   script wants them it's a program, and that's the **Godspeed language** (`.gs`). The `.gsh`/`.gs`

@@ -9,4 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }
 noto-sans-mono-bitmap = { version = "0.3", default-features = false, features = ["regular", "size_20", "unicode-basic-latin"] }

@@ -99,7 +99,7 @@ echo ''
 echo '===== 5. CAPTURE - $( ) puts a producer OR a function ($(fn)) output into a variable ====='
 let phrase = $(echo hi there)            # -> "hi there"
 echo got:$phrase | assert contains got:hi
-fn greeting who { echo hello-$who }      # $(fn): capture a FUNCTION's output (bounded 4 KiB, no heap)
+fn greeting who { echo hello-$who }      # $(fn): capture a FUNCTION's output (bounded 512 B, no heap)
 let g = $(greeting Ada)
 echo capfn:$g | assert contains capfn:hello-Ada
 # A SKIP IS NOT A PASS - and two of these lines said it was.

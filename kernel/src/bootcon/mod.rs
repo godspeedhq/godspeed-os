@@ -29,11 +29,12 @@
 //!
 //! ## Ownership is explicit, and one-way until a panic
 //!
-//! The kernel owns the framebuffer from `init` until the `console` service says it has taken the screen
-//! ([`release`]), after which every write here is a no-op - two writers to one framebuffer would fight
+//! The kernel owns the framebuffer from `init` until it GRANTS the framebuffer to the `console` service
+//! at spawn ([`release`]), after which every write here is a no-op - two writers to one framebuffer would fight
 //! over the same pixels, and the service's shadow grid would be silently wrong about what is on screen.
 //! [`reclaim_for_panic`] takes it back unconditionally, because at that point the service is not
-//! running any more and correctness of its grid has stopped mattering.
+//! running any more and correctness of its grid has stopped mattering; [`reclaim_on_death`] takes it
+//! back when the service dies.
 //!
 //! ## The arch contract
 //!
@@ -49,8 +50,10 @@
 //! - **Where the framebuffer is also granted to the `console` service, it must be mapped
 //!   non-cacheable**, because the service maps the same physical pages and ARM leaves mismatched memory
 //!   attributes for one physical page UNPREDICTABLE - and a service cannot do cache maintenance at all
-//!   (§18.2). The Pi 2 does this (`mmu::section_fb`); the Pi 4 does not yet, which is exactly why it
-//!   does not yet grant the framebuffer.
+//!   (§18.2). The Pi 2 does this (`mmu::section_fb`). The Pi 4 does NOT, and grants the framebuffer
+//!   anyway: its kernel direct map of those pages is still Normal cacheable while the `console`
+//!   service maps them non-cacheable, so the mismatch is live there (see the note beside `fb_commit`
+//!   in `arch/aarch64/mod.rs`; 2026-10-09).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

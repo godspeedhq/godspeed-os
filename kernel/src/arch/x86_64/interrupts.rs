@@ -6,7 +6,8 @@
 //!   - Hardware IRQs (vectors 32+): dispatched to `interrupt::route` which
 //!     forwards them to the registered driver service via IPC.
 //!
-//! SAFETY boundary: raw interrupt frames are manipulated here and nowhere else.
+//! SAFETY boundary: raw interrupt frames are manipulated here and in `boot.rs`'s exception stubs
+//! (`exception_halt`, `exc_stub_*`, `gpf_stub`, `pf_stub`, the IPI stubs), and nowhere else.
 
 /// CPU exception frame pushed by the processor on entry to an ISR.
 #[repr(C)]
@@ -28,11 +29,11 @@ pub struct ExceptionFrame {
 /// then returns from interrupt.  The scheduler's `switch_context` may change
 /// RSP inside `timer_tick_from_irq`; that is intentional - see §9.1.
 ///
-/// GS invariant (§8.2): ring-0 code always runs with GS.base = kernel ptr;
-/// ring-3 code runs with GS.base = 0.  An interrupt from ring-3 arrives with
-/// GS.base = 0 (the user's GS), so we must `swapgs` to load the kernel ptr
-/// before any `gs:`-relative access, and undo it before `iretq`.
-/// Interrupts from ring-0 arrive with GS.base = kernel ptr and need no swap.
+/// GS invariant (§8.2): ring-0 code always runs with GS.base = kernel ptr. An
+/// interrupt from ring-3 must `swapgs` before any `gs:`-relative access and undo it
+/// before `iretq`; interrupts from ring-0 need no swap. (Both GS MSRs hold the same
+/// per-core pointer - `syscall_entry::init_per_core_syscall` - so ring-3's GS.base is
+/// that pointer, not 0; the swap keeps parity rather than changing the value.)
 ///
 /// After a context switch inside `timer_tick_from_irq`, the interrupt frame
 /// at RSP belongs to the newly scheduled task; its CS tells us whether to
@@ -258,10 +259,6 @@ pub fn msi_pool_stub(i: usize) -> u64 {
     }) as u64
 }
 
-/// IDT vector AND `IRQ_TABLE` index for the xHCI controller's MSI. MSI lets us pick the
-/// vector freely (it is written into the device's message-data register), so vector and
-/// the route's pseudo-irq are the same number - no PCI interrupt-line / IOAPIC GSI mapping.
-/// Chosen clear of the timer (32), COM1 (36), syscall (0x80), and the IPIs (0xF0-0xF2).
 pub use crate::task::scheduler::Armed;
 /// This arch has no sub-tick one-shot wired up, so every request falls through to the tick path -
 /// which is what every port but arm32 did anyway, previously by not being compiled at all.
@@ -269,6 +266,10 @@ pub use crate::task::scheduler::Armed;
 pub fn hires_arm(_slot: u32, _us: u32) -> Armed { Armed::Full }
 pub fn hires_release(_slot: u32) {}
 
+/// IDT vector AND `IRQ_TABLE` index for the xHCI controller's MSI. MSI lets us pick the
+/// vector freely (it is written into the device's message-data register), so vector and
+/// the route's pseudo-irq are the same number - no PCI interrupt-line / IOAPIC GSI mapping.
+/// Chosen clear of the timer (32), COM1 (36), syscall (0x80), and the IPIs (0xF0-0xF2).
 pub const XHCI_MSI_VECTOR: u8 = 0x28;
 
 /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller
@@ -424,16 +425,7 @@ pub fn local_irq_restore(was_enabled: bool) {
     }
 }
 
-/// Enable interrupts and return immediately (pure busy-spin, no C-state hint).
-///
-/// Used in the idle loop. On Goldmont+ (Apollo Lake / Gemini Lake), both `hlt`
-/// and `pause` trigger firmware C-state promotion that power-gates the local
-/// APIC, silencing both APIC timer ticks and cross-core IPIs.  Issuing only
-/// `sti` - with no low-power hint of any kind - keeps the core fully active
-/// and prevents C-state entry entirely.  The outer scheduler loop's
-/// `compiler_fence(SeqCst)` ensures every iteration re-reads TASK_STATE,
-/// so wakeups written by other cores are not missed.
-/// True when idle cores may safely `hlt` - set once per core at boot (see `init_apic_timer`). Halting is
+/// True when idle cores may safely `hlt` - set by each core at boot (see `init_local_apic`). Halting is
 /// safe only if a halted core is GUARANTEED to wake, i.e. the APIC will not be power-gated: either the
 /// package C-state limit was applied (Intel; or AMD, which has no such gate), OR ARAT
 /// (CPUID.06H:EAX[2], "Always Running APIC Timer") keeps the periodic LAPIC timer ticking through
@@ -444,12 +436,12 @@ pub fn local_irq_restore(was_enabled: bool) {
 static IDLE_CAN_HALT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Record (once, at BSP boot) whether idle cores may halt. See `IDLE_CAN_HALT`.
+/// Record whether idle cores may halt. Called by every core from `init_local_apic` into one global
+/// flag. See `IDLE_CAN_HALT`.
 pub fn set_idle_can_halt(v: bool) {
     IDLE_CAN_HALT.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether idle cores halt (true) or spin (false). See `IDLE_CAN_HALT`.
 /// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
 /// halt to unmask and halt in one indivisible step?
 ///
@@ -474,10 +466,16 @@ pub fn set_idle_can_halt(v: bool) {
 /// terminal being services now.
 pub fn idle_mask_before_halt() -> bool { idle_can_halt() }
 
+/// Whether idle cores halt (true) or spin (false). See `IDLE_CAN_HALT`.
 pub fn idle_can_halt() -> bool {
     IDLE_CAN_HALT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Enable interrupts and wait for one, in the idle loop. Two behaviours, chosen by `IDLE_CAN_HALT`:
+/// `sti; hlt` where a halted core is guaranteed to wake, and `sti` alone (a busy spin with no C-state
+/// hint) where it is not - on Goldmont+ (Apollo Lake / Gemini Lake) both `hlt` and `pause` let firmware
+/// C-state promotion power-gate the local APIC, silencing timer ticks and cross-core IPIs. The outer
+/// scheduler loop re-reads task state each iteration, so wakeups from other cores are not missed.
 #[inline]
 pub fn wait_for_interrupt() {
     if IDLE_CAN_HALT.load(core::sync::atomic::Ordering::Relaxed) {
@@ -510,11 +508,11 @@ pub fn send_eoi() {
     unsafe { crate::arch::x86_64::boot::apic_send_eoi() }
 }
 
-/// Fire a test IRQ synchronously from the control channel.
+/// Fire a test IRQ synchronously.
 ///
-/// Disables interrupts, calls `deliver(irq)` (which requires IF=0), then
-/// re-enables interrupts. Used only by the `FIRE_IRQ` COM2 control command
-/// (§22 Tests IR1A/IR1B). EOI inside `deliver` is idempotent when no real
+/// Disables interrupts, calls `deliver(irq)` (which requires IF=0), then restores
+/// the caller's IF. Only caller: the `FireIrq` syscall, which the userspace `control`
+/// service issues for its `FIRE_IRQ` COM2 command (§22 Tests IR1A/IR1B). EOI inside `deliver` is idempotent when no real
 /// hardware interrupt is pending.
 #[inline]
 pub fn fire_test_irq(irq: u8) {

@@ -13,7 +13,8 @@
 
 # ===== events persist: capture to disk, via a service that is NOT `events` =====
 # `recorder` drains `events` and writes the file. It is spawned ON DEMAND by the line below and is
-# absent from the kernel managed-service lists, so this whole feature costs the kernel nothing.
+# absent from the supervisor's `MANAGED` set (the kernel keeps no service list), so this whole feature
+# costs the kernel nothing.
 #
 # Why it is a separate service at all: a file write BLOCKS on a reply, and a blocked `events` stops
 # draining its endpoint and drops the very events worth capturing. Here the blocking is harmless -
@@ -21,7 +22,7 @@
 # NOT asserted: the exact idle STATE. On the first selfcheck of a boot `recorder` has never been
 # spawned and status says "not running"; on a second run it is already there and says "idle". Both mean
 # "not capturing", and asserting one of them made the suite pass only on a fresh boot - the same
-# re-runnability trap as the `delete /sc` line above. It must ANSWER; which flavour of not-capturing it
+# re-runnability trap as the `delete /sc` line in `30-events.gsh`. It must ANSWER; which flavour of not-capturing it
 # is carries no information.
 assert ok events persist status
 assert ok events persist start /sc/cap.log 256KiB
@@ -31,7 +32,7 @@ assert ok events persist start /sc/cap.log 256KiB
 #
 # SO WAIT ON THE TRUTH, NOT ON A CLOCK (Commandment VIII). This was `wait 3` racing a variable
 # pre-fill and it lost intermittently - `backlog/36` has the post-mortem. Staged through a file
-# because gsh refuses to capture a pipeline (see the hw-enumerator probe above); `count` counts DATA
+# because gsh refuses to capture a pipeline (see the hw-enumerator probe in `20-hardware.gsh`); `count` counts DATA
 # rows, so a match is 1 and no match is 0.
 let mut capready = 0
 for i in range 30 {
@@ -50,7 +51,7 @@ if $capready > 0 {
 # THE RECORDER IS ALIVE - assert it before trusting anything below (`backlog/23`). Every assertion
 # from here to `capacity` reads the SHELL's rendering of a status line, and that rendering does not
 # need `recorder` to exist. On the Pi 4 it crashed mid-section and four of them passed over the
-# corpse, so `ran 461, failed 0` slept through a service fault. Same pattern as hw-enumerator above.
+# corpse, so `ran 461, failed 0` slept through a service fault. Same pattern as hw-enumerator (`20-hardware.gsh`).
 status | where name contains recorder | assert contains recorder
 status | where name contains recorder | assert lacks Dead
 # BOUNDED AT TWO FILES, forever. The cap is not a policy the recorder enforces by counting - `fs`
@@ -108,7 +109,7 @@ events persist status | assert contains idle
 
 # NOT asserted here: filtering for a SPECIFIC owner. Which services have logged inside the 8 KiB
 # window varies by machine and by how far it has wrapped, so any such assertion is a coin flip on
-# hardware. Filtering by owner is already pinned above, on the metrics view, where the rows are stable.
+# hardware. Filtering by owner is already pinned in `30-events.gsh`, on the metrics view, where the rows are stable.
 #
 # One owner can NEVER appear, and it is worth knowing why: `events` itself. It holds no send cap to
 # itself, so its `ctx.log()` copy resolves to `u32::MAX` and goes nowhere - the same cut that stops the

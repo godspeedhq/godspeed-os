@@ -27,9 +27,9 @@ accidentally produce a non-Pi image:
     python scripts/pi4_build.py --features pi4-sched-demo
 
 (The former `--xhci-userspace` flag is gone: the in-kernel USB driver was deleted, so the
-service is the only driver and there is nothing to switch. It used to have to reach TWO
-crates: the kernel (stop driving the VL805) and the `supervisor` (start spawning
-the `xhci` service that drives it instead). See where it is handled below.
+service is the only driver and there is nothing to switch. It used to have to reach the
+kernel (stop driving the VL805), the `supervisor` (start spawning the `xhci` service that
+drives it instead) and `block-driver`.)
 
 usage:  python scripts/pi4_build.py [--debug] [--features a,b]
 """
@@ -126,8 +126,8 @@ if "--features" in sys.argv:
 # AND block-driver, and setting only some of them gave you two drivers fighting over one controller,
 # or none, with both halves booting fine on their own.)
 #
-# arm32 (Pi 2) is unaffected: no PCIe and no device-IRQ routing to userspace, so its USB stack is
-# still in the kernel - see arch/arm/CLAUDE.md.
+# arm32 (Pi 2) went the same way on 2026-08-17: `services/dwc2` drives its USB host from userspace
+# on `USB_VECTOR`, and `arch/arm/dwc2.rs` is deleted (CLAUDE.md 6.4).
 EL0_FAULT_TEST = "--el0-fault-test" in sys.argv
 CRASH_WINDOW = "--crash-window" in sys.argv
 # Also build and spawn the five examples nothing else ever runs (hello, stdlib-hello,
@@ -159,7 +159,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import service_embed_check
 service_embed_check.enforce(str(ROOT), "aarch64")
 
-# 1. The services first - the kernel embeds their ELFs, so a stale service is baked into the image.
+# 1. The services first - the supervisor embeds their ELFs, so a stale service is baked into the image.
 # THE SUPERVISOR IS BUILT LAST - it `include_bytes!`s every other service, so building it earlier
 # (it was index 6 of 24) ships the PREVIOUS build of everything after it. See scripts/embed_order_check.py.
 _ORDERED = [s for s in PI4_SERVICES if s != "supervisor"] +            (["supervisor"] if "supervisor" in PI4_SERVICES else [])
@@ -171,12 +171,8 @@ for svc in _ORDERED:
     # the x86 `osdev test examples` uses, so the proof is the same proof.
     feats = (["--features", "bare-metal,examples-test" if EXAMPLES_ON else "bare-metal"]
              if svc == "supervisor" else [])
-    # The THIRD crate the one switch has to reach. block-driver must be told to fetch its sectors
-    # from the `xhci` SERVICE over IPC instead of from the in-kernel stack by syscall; without it the
-    # service drives the disk and block-driver asks a kernel that is no longer driving anything, so
-    # storage silently disappears with every individual piece looking correct.
-    # Prove the EL0 fault-recovery path actually fires (see mem-pressure's feature doc). Test builds
-    # only; it kills mem-pressure on every boot by design.
+    # Prove the EL0 fault-recovery path actually fires (net-stack's `el0-fault-test` feature, a
+    # deliberate null read). Test builds only; it kills net-stack on every boot by design.
     if svc == "net-stack" and EL0_FAULT_TEST:
         feats = ["--features", "el0-fault-test"]
     # CRASH-WINDOW, so this port can take a DETERMINISTIC power cut like the other three. `fs` holds

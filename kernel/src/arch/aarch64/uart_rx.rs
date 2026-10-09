@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Serial input: draining the PL011 receive FIFO into a ring the console reader pops from.
 //!
-//! Nothing on this port has read input before. Output has been one-way since milestone 1, which is why
-//! there is still no prompt - a shell that cannot be typed at is not a shell.
+//! Nothing on this port read input before this module. Output had been one-way since milestone 1, which
+//! is why there was no prompt then - a shell that cannot be typed at is not a shell.
 //!
 //! ## The lesson inherited from the 32-bit port, which is not optional
 //!

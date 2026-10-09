@@ -30,8 +30,9 @@
 // it as the thing most likely to stop its program compiling - so the library re-exports it now.
 use godspeed::{self as gs, Error, ServiceContext};
 
-/// Where the text comes from. `selfcheck` writes this file, so the program has something to find
-/// on a running machine.
+/// Where the text comes from. `selfcheck`'s files part (`scripts/selfcheck/50-files.gsh`) writes this
+/// file, so the program has something to find - but a FULL `selfcheck` ends with its cleanup part,
+/// which deletes `/sc` again, so after one the honest answer is "not there".
 const PATH: &str = "/sc/a.txt";
 
 #[allow(unsafe_code)] // the exported entry symbol; see `stdlib/rust/src/lib.rs` on why `fn main` is not available yet
@@ -40,7 +41,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("stdlib-hello: starting");
 
     // The filesystem handle. This grants NOTHING - it borrows the context, and the context can only
-    // reach what the contract asked for. A program without `ipc_send = ["fs"]` gets this same
+    // reach what the spawn request granted (the contract is its reviewable statement). A program without `ipc_send = ["fs"]` gets this same
     // handle and every call through it fails with `Unreachable`.
     let mut disk = gs::fs::Fs::new(&ctx);
 

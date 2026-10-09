@@ -1,7 +1,7 @@
 # Design Note: Gating Introspection Behind a Capability (§3.1)
 
-**Status:** **BUILT.** `InspectKernel` and `TaskStat` are gated by the `INTROSPECT` capability (26
-references in `kernel/src/`), and the adversarial suite pins the denial (A11,
+**Status:** **BUILT.** `InspectKernel` and `TaskStat` are gated by the `INTROSPECT` capability
+(`INTROSPECT_RESOURCE`, `kernel/src/capability/mod.rs`), and the adversarial suite pins the denial (A11,
 `introspection_denied_without_cap`).
 
 *(This said "approved, not yet implemented" after it had been implemented AND pinned by a test.)*
@@ -20,7 +20,7 @@ holding no capability:
 - `TaskStat` (syscall 16) - full per-task snapshot for *any* scheduler slot: name,
   core, state, memory used/limit, queue depth, restart generation.
 
-`handle_task_stat` says so explicitly in source: *"No capability required -
+`handle_task_stat` said so explicitly in source: *"No capability required -
 read-only kernel state."* This was a deliberate convenience for the §22
 property/perf harness, which calls these from many `probe` instances.
 
@@ -69,6 +69,7 @@ reading only your own state, or a hardware clock, does not.*
 | `InspectKernel` 24 | the endpoint a given task owns |
 | `InspectKernel` 25 | the endpoint a given task is blocked in `Call` awaiting |
 | `InspectKernel` 26 | the count of fault diagnostics emitted without the serial lock |
+| `InspectKernel` 27 | the boot record (the first 32 KiB ever logged; CLAUDE.md 11.4) |
 
 ### Ambient (no capability)
 
@@ -79,6 +80,7 @@ reading only your own state, or a hardware clock, does not.*
 | `InspectKernel` 13 | whether the CALLER owns the console foreground - caller-specific, like 0 |
 | `InspectKernel` 10, 11, 12, 16, 17 | board-neutral timing: input-ready, the RTC now/boot reads, TSC-per-quantum, deglitched monotonic seconds |
 | `InspectKernel` 14, 15, 18, 19, 20, 21, 23 | board facts and transport: NIC identity and BAR, driver-presence bits, a hardware random word, the EMMC base clock, one byte off the COM2 operator channel, the board's own MAC |
+| `InspectKernel` 9, 22 | deleted queries (console geometry moved to the `console` service, clock provenance to `time`); still in the ungated list, so they answer `-1` rather than `CapNotHeld` |
 
 The gate is a single `matches!` on the ungated set in `handle_inspect_kernel`, so a
 query added without thought lands on the gated side - the right default. The line is
@@ -182,8 +184,11 @@ The services that legitimately read cross-task/system state:
 | `observe` | `task_stat` + aggregates | the metrics utility itself |
 | `probe` | `inspect_endpoint_generation` (query 2) | test harness; query 0 + TSC stay ambient so most probe paths are unaffected |
 
-The kernel mints `INTROSPECT_RESOURCE` (READ) into each declaring task's cap table
-at spawn (§14.1). The grant lands on exactly the probes that need query 2 and on no
+Since written, `chaos` and `control` hold it too (their rows in the supervisor's spawn table,
+`services/supervisor/src/main.rs`), so the table above is the original three, not the full list.
+
+The kernel mints `INTROSPECT_RESOURCE` (READ) into the cap table of each task whose
+spawn request carries `privbits::INTROSPECT`, at spawn (§14.1). The grant lands on exactly the probes that need query 2 and on no
 others: the `prop-` and `stress-` drivers read their victims' generations, while
 `adv-a11` - whose whole subject is a service WITHOUT the cap - is excluded by name,
 which is why it cannot be "every probe".

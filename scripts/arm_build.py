@@ -9,10 +9,12 @@ objcopies it to a flat kernel7.img the Pi firmware / QEMU raspi2b can boot.
 `osdev` is x86-only; this is the ARM equivalent of `osdev build` until ARM is a
 first-class osdev target. Usage:
 
-    python scripts/arm_build.py [--feature arm-supervisor] [--release]
+    python scripts/arm_build.py [--feature X] [--release] [--qemu] [--crash-window] [--examples]
 
-The default feature is arm-supervisor (the full stack: supervisor -> events +
-ping/pong). The kernel spawns only the supervisor (C1-1), so there is no kernel-spawned
+(`scripts/board.py pi2` is the front door; it always passes --release.) The boot-path
+feature arm-supervisor is always present - `--feature` ADDS to it. The kernel spawns
+the supervisor, which spawns the supervisor's `bare-metal` set (the usable OS with a
+gsh> prompt). The kernel spawns only the supervisor (C1-1), so there is no kernel-spawned
 bring-up build any more - the supervisor path IS the bring-up path.
 """
 import argparse, subprocess, sys, os, shutil
@@ -23,8 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGET = "armv7a-none-eabi"
 
 # Services that build for ARM (arch-neutral: SDK + syscalls only, no x86 hardware
-# probe). Must stay in sync with `arm_built` in kernel/build.rs. Hardware drivers
-# DERIVED from `kernel/build.rs`, not declared here. Two lists of one fact is the shape that keeps
+# probe), DERIVED from `arm_built` in `kernel/build.rs`, not declared here. Two lists of one fact is the shape that keeps
 # biting: `kernel/build.rs` decides which services are embedded as REAL ELFs on ARM (`arm_built`), and
 # this script decides which are CROSS-COMPILED - and you cannot embed what was never built. They are the
 # same set, and keeping a second copy here means a service added to one and not the other silently
@@ -134,6 +135,10 @@ def main():
     # recover would be ambiguous between "recovery is impossible here, as recorded" and "we missed
     # the ten-millisecond window". Holding the window open for ten seconds removes the second
     # reading, so whatever happens means something.
+    #
+    # (Note 2026-10-09: the premise above is superseded. The CLAUDE.md 6.1 amendment of 2026-09-23
+    # records that the Pi 2's stick DOES accept SYNCHRONIZE CACHE, and an unassisted power cut on
+    # this board recovered the journal. The flag remains the way to aim a cut at the window.)
     ap.add_argument("--crash-window", action="store_true",
                     help="build `fs` with the crash-window feature: a transaction touching /cutme... "
                          "holds the commit-to-checkpoint window open for 10 s, so a power cut is "

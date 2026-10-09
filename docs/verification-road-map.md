@@ -5,6 +5,13 @@
 > **Context:** GodspeedOS v1 shipped with all 130 tests passing across seven categories (the suite is 147 entries now) (identity, property, fuzz, stress, performance, adversarial, chaos), each with brutal variants. The kernel is correct against its spec. The work below sharpens what is already there: finding what the tests miss, what QEMU hides, and what only emerges over time.
 >
 > **Progress (2026-05-16):** Items 1, 3-6 complete. Item 2 and items 7-9 deferred pending hardware arrival.
+>
+> **Note (2026-10-09):** the hardware arrived. Item 2 has happened in substance - the OS boots and runs
+> on five machines across four ISAs (CLAUDE.md 23.3, `docs/multi-arch.md`) - but not in the form
+> step 6 below asks for: the bare-metal supervisors gate out the test probes, so the identity suite
+> itself has not run on hardware, and `docs/hardware-findings.md` was never written; the divergences
+> are in `bugs/` and `backlog/` instead. The "deferred pending hardware" markers below are dated
+> history, left as written.
 
 ---
 

@@ -82,8 +82,9 @@ const RING_RUN: u8 = 1 << 1; // CORBCTL.CORBRUN and RIRBCTL.RIRBDMAEN are both b
 /// RIRBCTL.RINTCTL: raise the response status every RINTCNT responses. NOT optional in practice: the
 /// controller stops taking commands from the CORB once RINTCNT responses are outstanding, until software
 /// clears that status - and the status is only ever set with this bit on. A2 shipped without it and
-/// QEMU answered one command and then nothing. Linux sets it (with RINTCNT 1). The CPU interrupt is a
-/// separate enable (INTCTL), left off: the driver still polls.
+/// QEMU answered one command and then nothing. Linux sets it (with RINTCNT 1). The CPU interrupt for it
+/// is a separate enable (INTCTL.CIE), left off: the driver polls the RIRB for responses. (Only the
+/// output stream's interrupt is enabled, in `run_stream`.)
 const RIRB_RINTCTL: u8 = 1 << 0;
 const CORBRP_RST: u16 = 1 << 15;
 const RIRBWP_RST: u16 = 1 << 15;
@@ -695,13 +696,13 @@ enum Device<'a> {
 
 /// Ticks per millisecond of the counter, or 0 when it is uncalibrated.
 fn ticks_per_ms(ctx: &ServiceContext) -> u64 {
-    ctx.tsc_ticks_per_10ms() / 10
+    wait::ticks_per_10ms(ctx) / 10
 }
 
 fn ms_since(ctx: &ServiceContext, t0: u64) -> u32 {
     match ticks_per_ms(ctx) {
         0 => 0,
-        per => (ctx.read_tsc().wrapping_sub(t0) / per).min(u32::MAX as u64) as u32,
+        per => (wait::ticks(ctx).wrapping_sub(t0) / per).min(u32::MAX as u64) as u32,
     }
 }
 
@@ -860,7 +861,7 @@ impl<'a> Player<'a> {
         let (ctx, m, sd) = (self.h.ctx, self.h.m, self.sd);
         m.write32(INTCTL, INTCTL_GIE | 1 << (sd - SD_BASE) / SD_STRIDE);
         if let Some(t) = self.tone.as_mut() {
-            t.started = ctx.read_tsc();
+            t.started = wait::ticks(ctx);
             if let Some(f) = t.feed.as_mut() {
                 f.running = true;
             }
@@ -935,7 +936,7 @@ impl<'a> Player<'a> {
             sine: quiet, hz: 0, ms: (frames as u64 * 1000 / rate as u64) as u32, left: 0,
             bytes: frames as usize * FRAME_BYTES, filled: 0, played: 0, last: 0, underruns: 0, started: 0,
             watchdog: 0, interrupts_at_start: irq.seen(), rate, silence: 0,
-            feed: Some(Feed { channels, ended: false, running: false, last_feed: ctx.read_tsc(), frames }),
+            feed: Some(Feed { channels, ended: false, running: false, last_feed: wait::ticks(ctx), frames }),
         });
         ctx.log_fmt(format_args!("audio-driver: stream opened - {} Hz, {} channel(s), {} frames", rate, channels, frames));
         out[0] = wire::OK;
@@ -966,7 +967,7 @@ impl<'a> Player<'a> {
             d.write32(PCM_OFF + (t.filled + i * FRAME_BYTES) % PCM_LEN, l | r << 16);
         }
         t.filled += n * FRAME_BYTES;
-        f.last_feed = ctx.read_tsc();
+        f.last_feed = wait::ticks(ctx);
         let start = !f.running && t.filled >= PCM_LEN / 2;
         if start {
             self.run_stream();
@@ -1263,7 +1264,7 @@ fn bad(out: &mut [u8]) -> usize {
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.trace_as("audio-driver");
+    gs::trace::as_name(&ctx, "audio-driver");
     let mmio = ctx.mmio();
     let dma = ctx.dma_region();
     let irq = Irq::granted(&ctx);

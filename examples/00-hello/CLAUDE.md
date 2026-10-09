@@ -41,7 +41,8 @@ the contract, the service cannot do it.
   When a future `hello` needs to log AND talk to a peer, you add that to the contract; you do not
   invent a side path. *(COMMANDMENTS.md IV; CLAUDE.md §13.)*
 - **Commandment VII (no ambient authority).** At spawn the kernel mints `hello` exactly the caps its
-  contract named, here just `log_write`, and nothing else. `hello` cannot send IPC, touch hardware,
+  SPAWN REQUEST names (the supervisor's spawn row; nothing reads the `.toml` at spawn, CLAUDE.md
+  13.6), here just `log_write`, and nothing else. `hello` cannot send IPC, touch hardware,
   or read another task's state, because it never asked for those rights. Authority comes only from a
   held capability, never from identity or ancestry. *(COMMANDMENTS.md VII; CLAUDE.md §7, Invariant 1.)*
 
@@ -56,7 +57,7 @@ request = "32MiB"   # minimum the service needs to start
 limit   = "64MiB"   # maximum it may ever allocate (AllocDenied past this)
 
 [capabilities]
-log_write = true    # the ONLY authority hello holds: write to `events`
+log_write = true    # the ONLY authority hello holds: write the kernel log ring + serial
 
 # No [placement] section: omitting it (as hello does) makes the supervisor ROUND-ROBIN the service
 # across the ready cores - the right default. (Omitting does NOT mean "core 0".) Pin a core only with
@@ -68,8 +69,8 @@ whether to grant it (CLAUDE.md §13.3).
 
 ## What you must NOT do
 
-- **Do not call an operation you did not declare.** `ctx.try_send(...)` from here would return
-  `CapNotHeld`, correctly. Reaching for authority you did not ask for breaks **Commandment VII**. The
+- **Do not call an operation you did not declare.** `gs::ipc::try_send(&ctx, ...)` from here would
+  fail with `gs::Error::Unreachable`, correctly: there is no send capability to use. Reaching for authority you did not ask for breaks **Commandment VII**. The
   fix is always to add the capability to the contract, never to bypass the check.
 - **Do not add a `static mut` to keep state.** A service owns its state on its own stack; an unowned
   global mutable is forbidden (Invariant 9) and it breaks isolation. If state must be shared, expose
@@ -82,11 +83,14 @@ whether to grant it (CLAUDE.md §13.3).
 
 Your next service starts by copying this folder and editing two files:
 
-1. Add what you need to `contracts/<name>.toml` (`ipc_send`, `ipc_receive`, `log_write`, `hw_mmio`,
-   and so on). Declare the minimum; that is the whole point.
-2. In `src/main.rs`, reach each granted capability through `ctx` (for example
-   `ctx.try_send("peer", &msg)`), and handle the failures the OS can return (`EndpointDead`,
-   `QueueFull`, `CapNotHeld`).
+1. Add what you need to `contracts/<name>.toml` (`ipc_send`, `ipc_receive`, `log_write`, `hw_device`,
+   and so on). Declare the minimum; that is the whole point. The grant itself is the service's row in
+   the supervisor's spawn table, which must say the same thing (`scripts/contract_check.py` checks
+   that for `services/`; for an example, only the authority keys are checked, by `IV-contract-authority`).
+2. In `src/main.rs`, reach each granted capability through the standard library, passing it `&ctx`
+   (for example `gs::ipc::try_send(&ctx, "peer", &msg)`), and handle the failures it returns:
+   `gs::Error::Unreachable` (nothing was sent: reacquire the peer by name with `gs::cap::reacquire`)
+   and `gs::Error::Busy` (the peer's queue is full: pace and try again).
 
 For IPC, see `examples/ping` and `examples/pong`. For capabilities you mint and hand out, see
 `examples/cap-grant` and `examples/resource-server`. For hardware, see `examples/driver-skeleton`.

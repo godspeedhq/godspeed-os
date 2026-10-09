@@ -47,11 +47,11 @@ pub fn assert_tcb_alive() {
     // that is simply absent from this configuration is skipped - only a service
     // that exists and is Dead (or whose endpoint was killed) is a violation.
     //
-    // This absence-tolerance is NOT fail-open: the only syscall that can kill a
-    // service (`handle_kill`) rejects TCB targets before any kill happens, so a
-    // TCB name absent here can only mean "never spawned in this configuration",
-    // never "killed-and-reclaimed". A TCB service that dies by fault (kill_current)
-    // is caught while still present-and-Dead by the `state == DEAD` check above.
+    // Should a name ever be added here, this absence-tolerance would be fail-open
+    // unless `handle_kill` were taught to refuse it again: it rejected TCB targets
+    // while the supervisor was one, and has refused nothing since Phase 6. A TCB
+    // service that dies by fault (kill_current) is caught while still
+    // present-and-Dead by the `state == DEAD` check below.
     'next: for &name in TCB {
         for slot in 0..crate::task::scheduler::MAX_TASKS {
             let stat = crate::task::scheduler::task_stat(slot);

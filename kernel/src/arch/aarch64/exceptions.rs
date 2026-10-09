@@ -24,11 +24,10 @@
 //!
 //! ## What it does today
 //!
-//! Saves the general-purpose registers plus `ELR_EL1`/`SPSR_EL1`, reports the vector, `ESR_EL1`,
-//! `FAR_EL1`, `ELR_EL1` and `SPSR_EL1`, and halts. It deliberately does **not** return: nothing here
-//! can yet handle a fault, and returning to a faulting instruction would loop forever printing. When
-//! the scheduler and userspace arrive, group 2 grows a real syscall path and a task-kill path; the
-//! frame is already laid out for that.
+//! Saves the general-purpose registers plus `ELR_EL1`/`SPSR_EL1` (and `SP_EL0`), and dispatches: IRQs
+//! to `aarch64_irq_dispatch`, `svc` from EL0 to the neutral syscall path, a fault from EL0 to the
+//! task-kill path, and a kernel fault to a report of the vector, `ESR_EL1`, `FAR_EL1`, `ELR_EL1` and
+//! `SPSR_EL1` and a halt. (This section described the first milestone, when every exception halted.)
 
 use core::arch::global_asm;
 
@@ -355,7 +354,6 @@ fn fault_was_write(esr: u64) -> bool {
 
 /// Ticks seen, so the boot can report progress instead of asserting the timer works.
 pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Said once: an SPI too high to express in the neutral routing table's `u8` key.
 /// The BCM2711 PCIe controller's MSI interrupt: GIC SPI 148, so INTID 32 + 148.
 pub const PCIE_MSI_SPI: u32 = 32 + 148;
 /// The neutral IRQ number the `xhci` service is granted (`hw_irqs: &[0x28]`). It began as an x86 MSI
@@ -368,14 +366,9 @@ pub const GENET_SPI: u32 = 32 + 157;
 /// The neutral vector `nic-driver` is granted for it.
 pub const GENET_VECTOR: u8 = 0x2A;
 
+/// Said once: an SPI too high to express in the neutral routing table's `u8` key.
 static SPI_TOO_HIGH_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// IRQ entry. Acknowledge at the GIC, handle, end-of-interrupt, return.
-///
-/// The EOI is not optional bookkeeping: the CPU interface keeps a priority active for every
-/// acknowledged interrupt, so skipping it silently blocks all later interrupts of equal or lower
-/// priority. The symptom is "interrupts stopped" with nothing to point at, which is why the retire
-/// happens on every path out of here including the spurious one.
 /// Interrupts dispatched per core, and the last GIC interrupt ID each saw.
 ///
 /// Exists for one question the liveness watchdog could not answer on this port: when a core stops
@@ -404,6 +397,13 @@ pub fn core_irq_debug(core: u32) -> (u32, u32) {
     )
 }
 
+/// IRQ entry. Acknowledge at the GIC, handle, end-of-interrupt, return.
+///
+/// The EOI is not optional bookkeeping: the CPU interface keeps a priority active for every
+/// acknowledged interrupt, so skipping it silently blocks all later interrupts of equal or lower
+/// priority. The symptom is "interrupts stopped" with nothing to point at, which is why every path
+/// out of here that acknowledged a real ID retires it. The spurious ID (1023) is the one exception:
+/// it was never raised, so it is not EOI'd.
 #[no_mangle]
 extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     let id = super::gic::acknowledge();
@@ -423,10 +423,10 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     IRQ_LAST_ID[core].store(id, core::sync::atomic::Ordering::Relaxed);
     // IDs 0..15 are Software Generated Interrupts - one core waking another. Acknowledging and retiring
     // them is the whole job: the wake's PURPOSE is to make this core leave `wfi` and re-enter the
-    // scheduler, which it does on the way out of this handler. There is no per-vector work to do, which
-    // is exactly why the 32-bit port runs four cores with its IPI senders still stubbed - every core
-    // ticks on its own timer and picks up work then, so an IPI is a latency improvement rather than a
-    // correctness requirement.
+    // scheduler, which it does on the way out of this handler. There is no per-vector work to do:
+    // every core also ticks on its own timer and would pick the work up then, so an IPI is a latency
+    // improvement rather than a correctness requirement. (This once said the 32-bit port ran with its
+    // IPI senders stubbed; it has had a real mailbox doorbell since, `arch/arm/irq.rs::ring_doorbell`.)
     if id < 16 {
         super::gic::eoi(id);
         return;
@@ -629,8 +629,8 @@ extern "C" fn aarch64_sync_current_dispatch(vector: u64, frame: *mut TrapFrame) 
 /// Linux is safe because its syscalls sit behind a non-inlined wrapper; ours are not.
 ///
 /// Anything that is NOT an SVC is a genuine userspace fault (a bad address, an illegal instruction).
-/// Those still report and halt: killing the task is what a real port does, and there is no task
-/// structure to kill yet. Reporting beats returning to re-fault forever.
+/// Those go to `aarch64_trap_report`, which reports the fault and kills the task
+/// (`task::kill_current`); the kernel and every other service continue.
 #[no_mangle]
 extern "C" fn aarch64_sync_lower_dispatch(vector: u64, frame: *mut TrapFrame) {
     let esr: u64;
@@ -659,11 +659,12 @@ extern "C" fn aarch64_sync_lower_dispatch(vector: u64, frame: *mut TrapFrame) {
     f.x[0] = ret as u64;
 }
 
-/// Report an exception and halt.
+/// Report an exception, then kill the faulting task (an EL0 fault) or halt (a kernel fault).
 ///
-/// Deliberately does not return. Nothing here can handle a fault yet, and returning to the faulting
-/// instruction would loop forever re-faulting and re-printing - a machine that looks busy while making
-/// no progress, which is worse than one that stops with a reason.
+/// Deliberately does not return. Returning to the faulting instruction would loop forever re-faulting
+/// and re-printing - a machine that looks busy while making no progress, which is worse than one that
+/// stops with a reason. An EL0 fault ends in `task::kill_current`, which reschedules and never comes
+/// back; a fault at EL1 halts.
 #[no_mangle]
 extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     let (esr, far): (u64, u64);

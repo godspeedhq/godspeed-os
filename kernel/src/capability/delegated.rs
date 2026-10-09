@@ -10,9 +10,10 @@
 //!
 //! **The band.** Delegated ids occupy `[DELEGATED_BASE, DELEGATED_BASE+DELEGATED_CAP)`,
 //! kept inside `[0, DIRECT_CAP=8192)` so the global resource table direct-indexes them
-//! (the overflow table is tiny). Endpoint ids climb monotonically from 100 and never
-//! reach `DELEGATED_BASE` in practice (the restart-storm tests do ≤200 spawns); a loud
-//! guard in `ipc::alloc_endpoint_id` makes a pathological collision a panic, never silent
+//! (the overflow table is tiny). Endpoint ids are allocated from 100 and reclaimed on
+//! death for reuse (`ipc::free_endpoint_id`), so the live range stays bounded by the
+//! routing table and does not reach `DELEGATED_BASE`; a loud guard in
+//! `ipc::alloc_endpoint_id` makes a pathological collision a panic, never silent
 //! cap-table corruption (invariant 12).
 //!
 //! **ABA-safe reuse (§7.4 decision 1).** A freed delegated id is reusable. If it

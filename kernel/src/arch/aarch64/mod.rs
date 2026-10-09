@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! AArch64 arch layer - STUB scaffold for the demarcation test (docs/aarch64.md).
+//! AArch64 arch layer - the Raspberry Pi 4 (BCM2711) port, complete and hardware-verified
+//! (`docs/aarch64.md`).
 //!
-//! Every item here mirrors the `arch::imp` surface `arch/x86_64/` exposes, so the arch-NEUTRAL kernel
-//! compiles for `aarch64-unknown-none` with only this file written. Bodies are `unimplemented!()` /
-//! stubs for now - the POINT of this stage is to prove the boundary: a clean compile means no neutral
-//! file names anything x86-specific; any error OUTSIDE arch/aarch64/ is a leak to fix. Real AArch64
-//! bodies (GIC, MMU, EL0/EL1, PSCI, PL011, generic timer) come next, incrementally, toward a QEMU boot.
+//! Every item here mirrors the `arch::imp` surface `arch/x86_64/` exposes. It began as a stub scaffold
+//! for the demarcation test - a clean compile with only this file written proved no neutral file named
+//! anything x86-specific - and the real bodies (GIC, MMU, EL0/EL1, PL011, generic timer, SMP via the
+//! firmware spin table) were filled in behind the `pi4` feature. Without `pi4` (the QEMU `virt`
+//! variant) the board modules are left out and their seam members answer with stubs.
 
 #![allow(unused_variables, dead_code)]
 
@@ -63,11 +64,10 @@ pub mod usermode;
 
 /// The exception level the firmware handed this kernel over at.
 ///
-/// **This decides whether PSCI exists.** If we were handed EL3 then nothing else owns it: the kernel
-/// performs its own drop, leaves no handler behind, and an `smc` traps to a vector nobody installed -
-/// which hangs the machine rather than returning "not supported". If we were handed EL2, something is
-/// still resident at EL3 and may answer. Under QEMU it is the first case; on a Pi with the GIC armstub
-/// it is the second, and the difference is not visible any other way once the drop has happened.
+/// Recorded for the PSCI decision, which no longer exists: nothing reads `booted_at_el3` today, because
+/// SMP releases the secondaries through the firmware spin table and never issues an `smc`.
+/// `smp_boot.rs` records why: handed EL3 (QEMU) there is no handler behind an `smc`, and handed EL2
+/// (the stock Pi 4 armstub) there is none either, and an unanswered `smc` hangs the machine.
 #[cfg(feature = "pi4")]
 static mut ENTRY_EL: u64 = 1;
 
@@ -370,7 +370,7 @@ pub unsafe extern "C" fn _start() -> ! {
 ///
 /// This comment described a milestone-1 stub that printed one line and halted, and said the function
 /// would one day "finally call the neutral `kernel_main`". Neither half is true: the function is the
-/// full boot (MMU, EL1 exceptions, GIC, generic timer, PSCI, SMP) and `kernel_main` has exactly one
+/// full boot (MMU, EL1 exceptions, GIC, generic timer, SMP through the firmware spin table) and `kernel_main` has exactly one
 /// call site in the tree, in `arch/x86_64`. The statement four hundred lines below - "this port does
 /// not reach `kernel_main`, so the call is here rather than there" - is the accurate one.
 ///
@@ -871,7 +871,7 @@ extern "C" fn boot_high() -> ! {
         // does notice is the STRICT contracted-placement rule (§9.2), which refuses an explicitly
         // requested core that is not ready - correctly, and with `PlacementInvalid`, which reads like a
         // spec decision rather than a missing init call. Marked here rather than in `smp::init`, which
-        // this port does not run yet (it starts APs; PSCI SMP is a later milestone).
+        // this port does not run: it starts its secondaries itself (`smp_boot`, the firmware spin table).
         // The boot core registers its own mapping too. `mark_ready` alone is not enough: the lookup
         // matches on the lapic-id TABLE, not on the ready flag, and core 0 only resolved correctly
         // because an unregistered core falls back to 0 - the right answer for exactly one core.
@@ -962,20 +962,6 @@ extern "C" fn boot_high() -> ! {
         unsafe { PCIE_XHCI = pcie::init(ram_top) };
         // SAFETY: read-once of the static just written, still single-threaded.
         if let Some(dev) = unsafe { PCIE_XHCI } {
-            // Publish the controller the PCIe scan found, so the SPAWN PATH can hand it to a driver
-            // service. These three statics are the neutral kernel's whole vocabulary for "there is a
-            // USB host controller and here is where it lives" (`task::HwClass::Xhci`): x86 fills them
-            // from its PCI bus scan, and until now aarch64 left them at their stub values while the
-            // BAR it had just assigned sat in a private `Option<Device>` that nothing above the arch
-            // layer could see.
-            //
-            // Filling them is a statement of FACT about the machine, so it is not gated on the
-            // feature below. It is inert without one: the only consumer is the spawn of a service
-            // NAMED `xhci`, which is not spawned unless the userspace driver is built in.
-            //
-            // The BDF is the encoding `pci::clear_bus_master` and friends take on x86. Those are all
-            // stubs here (there is no generic config-space accessor exposed at this layer), so it is
-            // recorded for the log and for whoever wires the quiesce path, not acted on.
             // NOTHING TO RECORD HERE ANY MORE. This stored the VL805's BAR0, BDF and a
             // "found" flag into three per-class statics; `pcie::init` has already put the same
             // device in the generic table, and `pci::xhci()` is a lookup in that table (D3d). The
@@ -1311,12 +1297,12 @@ pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u
 
 // NO in-kernel network device on this arch, by design.
 //
-// These three hooks exist because the neutral `NET_DEVICE` syscalls (42-44) are arch-agnostic, and on
-// the Pi 2 they front an in-kernel USB-net adapter. Here they are deliberately inert: the NIC is driven
-// by the `nic-driver` SERVICE through its own register window, so a frame never passes through the
-// kernel at all. `nic-driver` still holds the NET_DEVICE capability and simply does not use it on this
-// board - an unused grant is a smaller problem than a driver that cannot reach its device, and the
-// kernel cannot see which backend the service was built with.
+// These three hooks exist because the neutral `NET_DEVICE` syscalls (42-44) are arch-agnostic. Here
+// they are deliberately inert: the NIC is driven by the `nic-driver` SERVICE through its own register
+// window, so a frame never passes through the kernel at all. (Note 2026-10-09: this said the Pi 2's
+// hooks front an in-kernel USB-net adapter and that `nic-driver` still holds NET_DEVICE here. Neither
+// holds now: every port's hooks answer "no device", and the supervisor's spawn table no longer grants
+// NET_DEVICE - see the `console` row's neighbour in `services/supervisor/src/main.rs`.)
 //
 // Returning false/0/None is the honest answer, not a fallback: there IS no kernel network device, and
 // a service that asked would be told so rather than quietly given nothing.
@@ -1575,13 +1561,12 @@ pub fn board_mac_packed() -> Option<u64> { None }
 ///
 /// **The kernel drives no USB at all, so there is no in-kernel disk: reported, not hidden.**
 /// These four entry points exist only because the USB stack was in the kernel; hand the controller to
-/// the `xhci` SERVICE and the kernel has no way to reach a mass-storage device - nor should it. The
-/// service is HID-only (it releases the slot of anything that is not a keyboard, mouse or hub), so
-/// nothing else picks the job up either. Answering 0/false makes `usb_disk_absent()` true, which is
-/// the syscall's existing "no stick plugged in" answer: `block-driver` logs it and serves 0 sectors,
-/// `fs` mounts nothing, and the shell says so. A degraded machine that SAYS it is degraded (§26.7),
-/// not a fabricated success. The honest close is bulk transfers in the service - not a syscall back
-/// into a kernel that no longer has a driver behind it.
+/// the `xhci` SERVICE and the kernel has no way to reach a mass-storage device - nor should it.
+/// Answering 0/false makes `usb_disk_absent()` true, which is the syscall's existing "no stick plugged
+/// in" answer. (Note 2026-10-09: this once said the service was HID-only, so nothing picked the disk
+/// up. That closed the way it said it should: the `xhci` service drives mass storage too, and
+/// `block-driver` reaches the stick through it over IPC - the boot line beside the PCIe probe says so.
+/// These entry points are simply unused on this port.)
 #[cfg(feature = "pi4")]
 pub fn usb_disk_sectors() -> u64 {
     0
@@ -1607,18 +1592,6 @@ pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 #[cfg(not(feature = "pi4"))]
 pub fn usb_disk_flush() -> bool { false }
-/// Counter ticks a core may make NO forward progress before the liveness watchdog panics.
-///
-/// Ten seconds of `CNTPCT_EL0`, from the frequency the hardware reports in `CNTFRQ_EL0` rather than a
-/// constant - the Pi 4 runs the generic timer at 54 MHz where QEMU says 62.5 MHz, so a hardcoded rate
-/// would make the margin wrong on one of them.
-///
-/// **This is answered rather than left at `0` deliberately.** `0` disables the check, and the 32-bit
-/// ARM port spent its entire bring-up silently undefended that way - the watchdog was inert because it
-/// keyed off an unrelated stubbed constant, so a real wedge produced no diagnostic at all. A safety net
-/// that is absent should at least be absent loudly (§26.4); here it is simply present.
-/// (interrupts dispatched, last GIC interrupt ID) for `core` - what the liveness panic reports.
-/// Tallied at IRQ entry in `exceptions.rs`; the 32-bit port's twin lives in `arch/arm/irq.rs`.
 /// No-op: this arch counts every IRQ in its own dispatcher, not on the timer path.
 pub fn note_irq(_vector: u32) {}
 
@@ -1632,10 +1605,22 @@ pub fn note_irq(_vector: u32) {}
 /// thing x86 was missing, so there is nothing left to do here.
 pub fn publish_bsp_lapic_id() {}
 
+/// (interrupts dispatched, last GIC interrupt ID) for `core` - what the liveness panic reports.
+/// Tallied at IRQ entry in `exceptions.rs`; the 32-bit port's twin lives in `arch/arm/irq.rs`.
 pub fn core_irq_debug(core: u32) -> (u32, u32) {
     exceptions::core_irq_debug(core)
 }
 
+/// Counter ticks a core may make NO forward progress before the liveness watchdog panics.
+///
+/// Ten seconds of `CNTPCT_EL0`, from the frequency the hardware reports in `CNTFRQ_EL0` rather than a
+/// constant - the Pi 4 runs the generic timer at 54 MHz where QEMU says 62.5 MHz, so a hardcoded rate
+/// would make the margin wrong on one of them.
+///
+/// **This is answered rather than left at `0` deliberately.** `0` disables the check, and the 32-bit
+/// ARM port spent its entire bring-up silently undefended that way - the watchdog was inert because it
+/// keyed off an unrelated stubbed constant, so a real wedge produced no diagnostic at all. A safety net
+/// that is absent should at least be absent loudly (§26.4); here it is simply present.
 #[cfg(feature = "pi4")]
 pub fn liveness_deadline_cycles() -> u64 { timer::frequency().saturating_mul(10) }
 #[cfg(not(feature = "pi4"))]
@@ -1653,11 +1638,14 @@ pub fn note_user_task(_slot: usize) {}
 // map as Normal CACHEABLE memory, so a written rectangle genuinely has to be cleaned to the point of
 // coherency before the GPU can see it.
 //
-// That cacheable mapping is also why this port does not yet hand the framebuffer to the `console`
-// service: the service would map the same physical pages non-cacheable, and ARM leaves mismatched
-// memory attributes UNPREDICTABLE. Carving the framebuffer out of a blanket block mapping is real
-// page-table work and needs Pi 4 hardware to verify, so it is deliberately not bundled here. Until
-// then the Pi 4 renders through the floor exactly as it does today.
+// That cacheable mapping is why this said the port did not yet hand the framebuffer to the `console`
+// service: the service maps the same physical pages Normal non-cacheable (`WRITE_COMBINE`, MAIR slot
+// 2), and ARM leaves mismatched memory attributes for one physical page UNPREDICTABLE.
+// (Note 2026-10-09: the grant DOES happen now. `video::start_console` gives `bootcon` the physical
+// base, so `bootcon::grant` answers and the spawn path maps the framebuffer into the task whose
+// request names the `FRAMEBUFFER` kind - the supervisor's `console` row. The kernel's direct map of
+// those pages is still Normal cacheable, so the mismatch this paragraph warned about is live.
+// Carving the framebuffer out of the blanket block mapping is the open work.)
 #[cfg(feature = "pi4")]
 pub use video::fb_commit;
 
@@ -2259,8 +2247,8 @@ pub fn serial_write_bytes_lockfree(s: &[u8]) {
 /// the display while kernel logging continues.
 ///
 /// `to_fb` is the foreground gate: false means a full-screen app owns the display and this text belongs
-/// on serial only. This port has no framebuffer console yet, so serial is the only destination and the
-/// gate has nothing to select - honoured as soon as one exists.
+/// on serial only; otherwise the text is also mirrored to the kernel's framebuffer floor (`video::mirror`,
+/// a no-op until `start_console` has run).
 #[cfg(feature = "pi4")]
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     // TAKES THE SAME CLAIM AS THE KERNEL LOG, because the UART does not care which side of the
@@ -3258,22 +3246,6 @@ pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU32};
     use portable_atomic::AtomicU64;
 
-    /// The Pi 4 HAS PCIe and a real table - what it has NOT is a PCI ethernet controller. GENET is on the
-    /// SoC (`soc_nic_present`), so a class lookup is the right question and `None` is the right
-    /// answer. (This comment previously said "no PCI on this port", copied from the arm32 stub where
-    /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it
-    /// next looking for the table that does exist twenty lines below.)
-    /// The xHCI controller on this machine, from the generic table - `None` if there is none.
-    ///
-    /// Replaces `XHCI_FOUND`/`XHCI_MMIO_BASE`/`XHCI_IRQ`/`XHCI_BDF` and, with them, a four-entry array of
-    /// every xHCI on the bus plus a picker that took index 0. The comment above that picker said what it
-    /// was: "a general design would enumerate every controller + device and bind by class". This is that
-    /// design, and it is one line, because `find_by_class` already returns the first match - the pick the
-    /// array existed to make.
-    ///
-    /// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
-    /// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
-    /// answers only "is there one, and what is it" when nobody said.
     /// No EHCI on this port - the Pi 4's USB is the VL805 xHCI.
     pub fn ehci() -> Option<PciDevice> { None }
     /// The Pi 4's USB host is a VL805 xHCI over PCIe, not a DWC2.
@@ -3287,8 +3259,24 @@ pub mod pci {
     /// `#[cfg(target_arch = "x86_64")]`, which is a fact about firmware written into a neutral file.
     pub fn ehci_bios_handoff() {}
 
+    /// The xHCI controller on this machine, from the generic table - `None` if there is none.
+    ///
+    /// Replaces `XHCI_FOUND`/`XHCI_MMIO_BASE`/`XHCI_IRQ`/`XHCI_BDF` and, with them, a four-entry array of
+    /// every xHCI on the bus plus a picker that took index 0. The comment above that picker said what it
+    /// was: "a general design would enumerate every controller + device and bind by class". This is that
+    /// design, and it is one line, because `find_by_class` already returns the first match - the pick the
+    /// array existed to make.
+    ///
+    /// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
+    /// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
+    /// answers only "is there one, and what is it" when nobody said.
     pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
 
+    /// The Pi 4 HAS PCIe and a real table - what it has NOT is a PCI ethernet controller. GENET is on the
+    /// SoC (`soc_nic_present`), so a class lookup is the right question and `None` is the right
+    /// answer. (This comment previously said "no PCI on this port", copied from the arm32 stub where
+    /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it
+    /// next looking for the table that does exist twenty lines below.)
     pub fn nic() -> Option<PciDevice> { None }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
 

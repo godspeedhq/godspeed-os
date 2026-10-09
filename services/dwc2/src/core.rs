@@ -10,6 +10,7 @@
 //! Those comments travel with the code; a "cleaner" rewrite that dropped them would be a rewrite of
 //! the hard-won part.
 
+use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Mmio, ServiceContext};
 
@@ -19,9 +20,9 @@ use crate::regs::*;
 ///
 /// Bounded by time rather than by an iteration count, because a count means a different duration on
 /// every board and on this project it has been wrong seven times (`docs/xhci-completion-correlation.md`
-/// records the last). The kernel version spins on iteration counts (`waited > 1_000_000`) - fine
-/// there, where it ran once at boot on one board; not fine in a service that must behave the same
-/// under load as idle.
+/// records the last). The kernel version (since deleted) spun on iteration counts
+/// (`waited > 1_000_000`) - fine there, where it ran once at boot on one board; not fine in a service
+/// that must behave the same under load as idle.
 ///
 /// Returns false on timeout, and the caller REPORTS it. A hardware wait that quietly gives up is the
 /// silent-failure case invariant 12 exists to prevent.
@@ -77,7 +78,7 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
         ok = false;
     }
     // Let the PHY settle after reset.
-    ctx.sleep(ctx.duration_cycles(10));
+    gs::task::sleep_ms(ctx, 10);
 
     // 4. Select the PHY interface + force HOST mode (Circle's working Pi 2 sequence).
     //
@@ -160,14 +161,16 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
         // So this measurement may be reporting the console, not the timer. `sweep()` is called again
         // later from the serve loop, on a quiet system, and the two together say which.
         const N: u64 = 16;
-        let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
+        let per_us = (wait::ticks_per_10ms(ctx) / 10_000).max(1);
         for want_us in [125u64, 500, 2000] {
             let want = per_us.saturating_mul(want_us).max(1);
             let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
             for _ in 0..N {
-                let t0 = ctx.read_tsc();
-                ctx.sleep(want);
-                let d = ctx.read_tsc().wrapping_sub(t0);
+                let t0 = wait::Since::now(ctx);
+                // In counter ticks: `want` from the truncated per-us rate this measurement has always
+                // used; `gs::task::sleep_us` rounds the rate and would change the measurement.
+                gs::task::sleep_ticks(ctx, want);
+                let d = t0.elapsed_ticks(ctx);
                 lo = lo.min(d); hi = hi.max(d); sum += d;
             }
             ctx.log_fmt(format_args!(
@@ -239,7 +242,7 @@ pub fn port_bring_up(ctx: &ServiceContext, mmio: &Mmio) -> Option<u32> {
     if hprt & HPRT_PRTPWR == 0 {
         mmio.write32(HPRT, (hprt & !w1c) | HPRT_PRTPWR);
         // The port needs time to settle after power before a device is detectable.
-        ctx.sleep(ctx.duration_cycles(100));
+        gs::task::sleep_ms(ctx, 100);
     }
 
     let hprt = mmio.read32(HPRT);
@@ -250,10 +253,10 @@ pub fn port_bring_up(ctx: &ServiceContext, mmio: &Mmio) -> Option<u32> {
 
     // Drive reset for 60 ms - USB 2.0 requires at least 10 ms, and the Pi's hub wants the longer end.
     mmio.write32(HPRT, (mmio.read32(HPRT) & !w1c) | HPRT_PRTRST);
-    ctx.sleep(ctx.duration_cycles(60));
+    gs::task::sleep_ms(ctx, 60);
     mmio.write32(HPRT, mmio.read32(HPRT) & !w1c & !HPRT_PRTRST);
     // The core enables the port itself after reset; give it a moment to report the speed.
-    ctx.sleep(ctx.duration_cycles(30));
+    gs::task::sleep_ms(ctx, 30);
 
     let hprt = mmio.read32(HPRT);
     if hprt & HPRT_PRTENA == 0 {

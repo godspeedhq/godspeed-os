@@ -13,12 +13,14 @@
 //!
 //! v1 reclaims memory only at DEATH (no free syscall), so `chaos mem-pressure` "frees" this
 //! service's memory by KILLING it: it watches the kernel's free-frame count drop while we hold our
-//! allocation and return to baseline once we die (the no-leak check). Not in any auto-spawn set;
-//! the shell spawns it by name only when running the command.
+//! allocation and return to baseline once we die (the no-leak check). Not in any auto-spawn set:
+//! the shell spawns it by name when running that command, and the `chaos` service spawns one every
+//! `max-carnage` round as its spawn-storm ammunition (and kills them all when the run ends).
 
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, service_context::AllocError};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
@@ -60,5 +62,5 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Hold the allocation and idle until the chaos command kills us (death = the only way memory is
     // reclaimed in v1, §10.5). Park rather than busy-yield so the core can still halt.
-    ctx.park();
+    gs::ipc::park(&ctx);
 }

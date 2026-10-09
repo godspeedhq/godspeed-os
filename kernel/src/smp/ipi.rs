@@ -245,6 +245,8 @@ unsafe fn request_and_wait(addr: u64) {
 
 /// Broadcast a single-page TLB shootdown to all other cores and wait for acks (§10.5).
 ///
+/// No caller in the kernel today (see `broadcast_full_tlb_flush`).
+///
 /// # Safety
 /// Interrupts should be disabled on the calling core before this call.
 pub unsafe fn broadcast_tlb_shootdown(virt_addr: u64) {
@@ -277,9 +279,11 @@ pub unsafe fn ipi_handler(vector: u8) {
 
 /// Broadcast a full TLB flush to all other cores and flush locally (§10.5).
 ///
-/// Used when an entire address space is torn down (task death) so that all
-/// non-global TLB entries are invalidated on every core before the backing
-/// frames are returned to the allocator.
+/// Meant for when an entire address space is torn down, so that all non-global
+/// TLB entries are invalidated on every core before the backing frames are
+/// returned to the allocator. NOTHING CALLS IT: task death relies on every other
+/// core having switched address space (the kill path's spin-wait) instead - see
+/// the reclaim comment in `scheduler::kill_task_by_slot`.
 ///
 /// Saves and restores the caller's interrupt flag, so this may be called
 /// with interrupts either enabled or disabled.

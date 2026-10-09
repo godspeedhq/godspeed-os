@@ -23,6 +23,12 @@ stick behind xHCI. One image, two transports, two instruction sets - which is th
 
 The volume is left on disk either way (`build/tests/cross_isa.img`): a run that failed IS the
 evidence, and a fresh one is written at the start of every run so a pass can never be inherited.
+
+WHAT IT IS NOT (2026-10-09): a gate on any build path - nothing in `osdev` or `.github/workflows` runs
+it; it runs when someone types it. It rebuilds the riscv64 kernel every run but NOT the x86 image: it
+boots whatever `build/os.img` holds, which `osdev`'s QEMU suites stage (`osdev image` writes
+`build/os-usb.img`). And several string checks below can be satisfied by the shell's ECHO of the
+command that was typed, not only by its answer - read the logs before trusting a pass.
 """
 import argparse
 import os

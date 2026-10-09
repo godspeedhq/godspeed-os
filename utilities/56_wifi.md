@@ -641,8 +641,8 @@ cable, switch to wifi automatically."*
   it is joined. Plug it back and they return to the cable. Nothing is typed for either switch.
 - **`wifi leave` and `radio off` take the radio out of that choice**; with the cable out too, the link is
   down and `net` says so.
-- **`net` names the carrier**: `link  up via the cable`, `link  up via wifi (the cable is out)`, or
-  `link  down - no cable, and the radio is not joined`. `wifi status` says whether the radio is JOINED,
+- **`net` names the carrier**: `link     up via the cable`, `link     up via wifi (the cable is out)`,
+  or `link     down - no cable, and the radio is not joined`. `wifi status` says whether the radio is JOINED,
   which is a different fact: a joined radio with the cable in is standing by.
 - **A switch re-configures the network.** The radio has its own address, so the stack sees a different
   link and asks for a lease again (`docs/wifi.md` 41). A `ping` in flight across the switch loses its

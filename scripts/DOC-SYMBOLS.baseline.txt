@@ -23,7 +23,6 @@ configure_cdc_ecm                  # docs/arm32-status.md
 ctrl_xfer                          # docs/arm32-usb-userspace.md
 decode_report                      # docs/arm32-status.md
 dims_packed                        # docs/console-service.md
-dir_read                           # docs/persistence.md
 dropped_log_count                  # backlog/04-serial-splice.md
 entry_table_blocks                 # docs/persistence.md
 fs_record                          # docs/persistence.md

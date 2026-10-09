@@ -1,6 +1,7 @@
 # Service contract for `counter` - a STATEFUL service that survives its own restart by persisting
-# state externally to `fs` (CLAUDE.md §14 restart, §15 state/persistence). The supervisor reads this
-# at spawn and the kernel mints EXACTLY these capabilities (Commandment VII, no ambient authority).
+# state externally to `fs` (CLAUDE.md §14 restart, §15 state/persistence). A BUILD-TIME declaration:
+# nothing parses TOML at spawn (13.6); the kernel mints what the supervisor's SPAWN REQUEST asks for,
+# and this file states what that should be (Commandment VII, no ambient authority).
 name    = "counter"
 version = "0.1.0"
 
@@ -14,7 +15,8 @@ limit   = "64MiB"
 # Explicit grants only - this service can do ONLY what is listed (Commandment VII, no ambient
 # authority). The FULL set of declarable capabilities is in `contracts/schema/service.schema.json`
 # (validated by `osdev validate`) and `contracts/CLAUDE.md`. The options are: ipc_send,
-# ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+# ipc_receive, log_write, the authority keys
+# (console_push, resource_mint, service_control, cpu_clock, pci_cfg) and the driver hw_* keys.
 ipc_send    = ["fs"]        # send file-API ops (read/write /counter.dat) to the fs service
 ipc_receive = ["counter"]   # OWNS its endpoint - fs replies here (load needs the reply round-trip)
 log_write   = true          # may write progress + recovery messages to the kernel log (syscall 5)

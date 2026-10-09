@@ -1,6 +1,9 @@
 # `drives` - drive management from the shell
 
-> **Status:** Design doc, non-normative, **not yet built**. Records the `drives`
+> **Status:** Design doc, non-normative, **partly built**. Hierarchical GSFS and the
+> single-drive data verbs (`drives` list, `flash`, `label`, plus `check`, `scrub` and
+> `reset`, which this doc does not cover) are built over `fs`; the default flag, multi-drive
+> and `[N:]label/path` addressing are not (`utilities/15_drives.md` §8). Records the `drives`
 > shell utility and the multi-drive model, decided in conversation. Builds on the
 > GSFS filesystem (`docs/persistence.md`) and the AHCI block driver (`docs/ahci.md`).
 > Trails `CLAUDE.md`; does not amend it.
@@ -216,8 +219,8 @@ A real multi-part feature, layered:
   hold several **mounted** drives at once (bounded slots) with a **current** drive +
   **current directory**; auto-mount the default on boot; resolve `[N:]label/path`
   addressing; drives API = `list` / `flash` / `label` / `mount` / `use` / `use default`.
-- **block-driver:** enumerate *all* SATA disks; the block IPC gains a **drive index**;
-  a **capacity** request so a flash sizes the filesystem to the disk.
+  (As built, the API is `list` / `flash` / `label` / `reset` / `check` / `scrub`; `mount`
+  and `use` were dropped, note at the top.)
 - **shell:** `drives` (+ subcommands) and the file commands (`dir` / `read` / `write` /
   `cd` / `mkdir`) with `[N:]label/path` addressing.
 
@@ -235,7 +238,8 @@ A real multi-part feature, layered:
 
 ## 9. Open questions
 
-- Bound on simultaneously-mounted drives (4?), label length (16?), path depth / name
+- Bound on simultaneously-mounted drives (4?), label length (settled: 31 bytes,
+  `LABEL_MAX` in `services/fs/src/main.rs`), path depth / name
   length, max files per directory.
 - Label clashes: **resolved - duplicates allowed, disambiguated by index** (§4.2).
   No forced relabel on import, no UUID; `drives label` is available but optional.

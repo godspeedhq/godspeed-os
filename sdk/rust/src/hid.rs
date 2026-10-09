@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! USB HID boot-protocol decoding, shared by the USB host drivers (`xhci`, `ehci`).
+//! USB HID boot-protocol decoding, shared by the USB host drivers (`xhci`, `ehci`, `dwc2`).
 //!
 //! Pure logic - no syscalls, no I/O. Each driver reads the fixed 8-byte boot
 //! report from its controller's DMA and hands it here; the side effects (pushing
@@ -243,12 +243,6 @@ pub const KEY_DELETE: u8 = 0x4C;
 /// so the host toggles a `caps` flag on each fresh press (see `decode_keyboard`).
 pub const KEY_CAPS_LOCK: u8 = 0x39;
 
-/// True if a **keyboard** boot report is the Ctrl+Alt+Del chord: either Ctrl (left 0x01 / right
-/// 0x10) **and** either Alt (left 0x04 / right 0x40) held, with the Delete key down. This is the
-/// secure-attention reboot combo - a driver checks it each poll for a keyboard device and, when
-/// true, issues the reboot syscall. Because reboot does not return, no edge-tracking is needed
-/// (the first detection reboots). Apply this ONLY to keyboard reports: a mouse boot report's
-/// button byte (byte 0) can alias the Ctrl/Alt modifier bits, so it must never be tested here.
 /// Console-stream signal for the Ctrl+Alt+Del secure-attention chord (the SEC-2 follow-up).
 ///
 /// SEC-2 removed `REBOOT` from the USB drivers, so a driver can no longer hard-reset the machine
@@ -263,6 +257,13 @@ pub const KEY_CAPS_LOCK: u8 = 0x39;
 /// drift apart.
 pub const CTRL_ALT_DEL_SIGNAL: u8 = 0x80;
 
+/// True if a **keyboard** boot report is the Ctrl+Alt+Del chord: either Ctrl (left 0x01 / right
+/// 0x10) **and** either Alt (left 0x04 / right 0x40) held, with the Delete key down. This is the
+/// secure-attention combo - a driver checks it each poll for a keyboard device and, when true,
+/// pushes [`CTRL_ALT_DEL_SIGNAL`] for the shell to act on; the driver itself cannot reboot (SEC-2).
+/// (This said the driver "issues the reboot syscall", which SEC-2 removed.) Apply this ONLY to
+/// keyboard reports: a mouse boot report's button byte (byte 0) can alias the Ctrl/Alt modifier
+/// bits, so it must never be tested here.
 pub fn is_ctrl_alt_del(report: &[u8; 8]) -> bool {
     if report[1] != 0 { return false; }                  // reserved byte ≠ 0 → invalid/stale report
     let mods = report[0];

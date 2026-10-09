@@ -28,11 +28,13 @@
 //! ```
 //!
 //! **On a calibrated machine [`hold`] spins** for the duration, measured by the counter. It does not
-//! sleep: the kernel's sleep floors at a scheduler quantum, nominally 10 ms (CLAUDE.md 9.1), which would
+//! sleep: on every port but ARMv7 (whose sub-tick sleep is not relied on here) the kernel's sleep
+//! floors at a scheduler quantum, nominally 10 ms (CLAUDE.md 9.1), which would
 //! turn a 10 us hold into a thousand times that. **[`hold_parked`] sleeps first and spins out the
 //! rest**, for holds of tens of milliseconds where the core matters more than the microsecond: it can
-//! run up to a quantum long, which a minimum allows, and is never short. It has two callers (`ehci`, and
-//! `wifi-usb`'s rtl8188 backend), and it is in on probation: `docs/driver-library.md` 1l says why.
+//! run up to a quantum long, which a minimum allows, and is never short. It has three callers (`ehci`,
+//! `wifi-usb`'s rtl8188 backend, and `sdk/audio`'s settings read, pausing between retries), and it is
+//! in on probation: `docs/driver-library.md` 1l says why.
 //!
 //! **On an uncalibrated one both sleep whole quanta**, as many as the duration needs at the nominal
 //! 10 ms: the quantum is measured by the kernel's tick rather than the counter nobody could calibrate,

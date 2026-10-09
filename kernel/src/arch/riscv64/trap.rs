@@ -174,8 +174,8 @@ impl TrapFrame {
 /// Rust side of a trap.
 ///
 /// RETURNS for anything it can handle, so the stub restores and `sret`s back to what was
-/// interrupted. Diverges only by halting, and only for a fault - which is honest while there is no
-/// task to kill instead.
+/// interrupted. A USER fault kills the task (`kill_current` reschedules and does not come back); a
+/// KERNEL fault, or an interrupt nothing claimed, halts this hart loudly.
 #[unsafe(no_mangle)]
 extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     let (scause, stval): (u64, u64);
@@ -241,9 +241,6 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
-    // Every other `ecall` from user mode is a SYSCALL. This is the line that makes the trap vector a
-    // gateway rather than only a reporter: from here a task asks the kernel for something and is
-    // answered, instead of the machine stopping to describe what it did.
     // The user-TASK selftest, gated separately and equally narrowly. It is offered before the
     // syscall path for the same reason as above: while it is armed its magic number is its own, and
     // once it is not, the number is an ordinary unknown syscall. This one never returns when it
@@ -252,6 +249,9 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
+    // Every other `ecall` from user mode is a SYSCALL. This is the line that makes the trap vector a
+    // gateway rather than only a reporter: from here a task asks the kernel for something and is
+    // answered, instead of the machine stopping to describe what it did.
     if !interrupt && code == CAUSE_ECALL_U {
         // STAMPED BOTH SIDES. The number is recorded before the call and cleared after, so a hart
         // caught between them is unambiguously inside that syscall - and one caught outside them
@@ -612,11 +612,6 @@ pub fn init() -> bool {
     true
 }
 
-/// Enable supervisor timer interrupts and take the first one.
-///
-/// Two enables, and both are needed: `sie.STIE` admits the timer specifically, `sstatus.SIE` admits
-/// interrupts at all. Setting one without the other is a machine that either never ticks or ticks
-/// for everything.
 /// Admit inter-processor interrupts on this hart.
 ///
 /// Separate from the timer because the two are needed at different moments: the boot hart wants the
@@ -629,6 +624,11 @@ pub fn enable_software_interrupts() {
     }
 }
 
+/// Enable supervisor timer interrupts and take the first one.
+///
+/// Two enables, and both are needed: `sie.STIE` admits the timer specifically, `sstatus.SIE` admits
+/// interrupts at all. Setting one without the other is a machine that either never ticks or ticks
+/// for everything.
 pub fn enable_timer_interrupts() {
     // SAFETY: setting the two enable bits. Sound because `stvec` is already installed - doing this
     // first would mean the first tick had nowhere to go.

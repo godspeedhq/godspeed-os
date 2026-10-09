@@ -7,7 +7,8 @@
 // lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
 #![deny(unsafe_code)]
 //! `block-driver` - userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3,
-//! docs/ahci.md, docs/persistence.md).
+//! docs/ahci.md, docs/persistence.md) on x86, and the same block protocol over a USB stick on every
+//! USB board (`usbdisk`, through the `dwc2` or `xhci` service - see `backend_run`).
 //!
 //! An MMIO + DMA driver: the kernel maps the AHCI HBA's ABAR and grants a
 //! physically-contiguous DMA arena at spawn (the same path as the USB drivers).
@@ -20,10 +21,12 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::ServiceContext;
 
-// Backend by architecture: x86 talks AHCI (SATA, MMIO+DMA); ARM (Raspberry Pi 2) storage is a USB stick
-// (`usbdisk`, through the in-kernel DWC2 stack). Both satisfy the same block-IPC protocol below.
+// Backend by board: x86 talks AHCI (SATA, MMIO+DMA); every USB board (Pi 2, Pi 4, VisionFive 2) stores
+// on a USB stick (`usbdisk`, which reaches it over IPC through `xhciblk` - the `dwc2` or `xhci`
+// SERVICE, never the kernel). Both satisfy the same block-IPC protocol below.
 //
 // The BCM2835 EMMC / Arasan SDHCI backend (`sdhci.rs`) is DELIBERATELY NOT COMPILED IN. On the Pi 2 the
 // EMMC IS the SD card the board boots from - firmware + kernel + FAT boot partition - and using it as
@@ -44,7 +47,7 @@ use godspeed_sdk::ServiceContext;
 /// forgotten: there is no way to answer a request without it, and the compiler says so.
 #[derive(Clone, Copy)]
 pub struct Reply {
-    pub cap: godspeed_sdk::CapHandle,
+    pub cap: gs::cap::Cap,
     pub tag: u8,
     /// What to do to this completion (carnage §3.7). `Fault::None` on every shipping build.
     ///
@@ -60,7 +63,7 @@ pub struct Reply {
 
 impl Reply {
     /// A reply that will be answered faithfully - every path except the one injecting faults.
-    pub fn plain(cap: godspeed_sdk::CapHandle, tag: u8) -> Self {
+    pub fn plain(cap: gs::cap::Cap, tag: u8) -> Self {
         Reply { cap, tag, fault: Fault::None }
     }
 }
@@ -188,10 +191,20 @@ impl Reply {
 
     /// One send, with the undelivered report. Split out so a fault can emit zero, one or two.
     fn emit(&self, ctx: &godspeed_sdk::ServiceContext, msg: &[u8]) {
-        if ctx.try_send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(msg)).is_err() {
+        if gs::ipc::try_send_to(ctx, self.cap, &godspeed_sdk::Message::from_bytes(msg)).is_err() {
             ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
         }
     }
+}
+
+/// Counter ticks in `ms` milliseconds, exactly as the SDK's `duration_cycles` computes them: never 0,
+/// and 1 on a machine whose counter the kernel could not calibrate. For measurements kept in counter
+/// ticks (the slow-op report); a WAIT is written on `gs::driver::wait`, never on this.
+#[cfg(not(storage_is_usb))]
+pub(crate) fn ms_ticks(ctx: &ServiceContext, ms: u64) -> u64 {
+    let per_10ms = gs::driver::wait::ticks_per_10ms(ctx);
+    if per_10ms == 0 { return 1; }
+    (per_10ms.saturating_mul(ms) / 10).max(1)
 }
 
 // WHICH BACKEND, asked as a board fact rather than as an instruction set. `storage_is_usb` and
@@ -207,8 +220,9 @@ mod usbdisk;
 mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
-//   Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
-//   Reply   : [status:u8, (ReadBlock only: 512 data bytes)]
+//   Request : [tag:u8, op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
+//   Reply   : [tag:u8, status:u8, (ReadBlock only: 512 data bytes)]
+// `tag` is the caller's correlation byte, echoed unread (`Reply`); the op lines below omit it.
 // The LBA is u64 (persistence §6.3): GSFS capacity fields are u64, so the block
 // address reaches the device at full width.
 const OP_READ_BLOCK: u8 = 1;
@@ -252,8 +266,7 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ct
 /// no-disk state (capacity 0, every read/write refused) WITHOUT touching the card.
 #[cfg(storage_is_usb)]
 fn backend_run(ctx: &ServiceContext) -> ! {
-    // Where the sector count comes from is the same build-time choice usbdisk.rs documents: the
-    // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
+    // The sector count comes from the USB host SERVICE by IPC (`xhciblk`). No probe, no fallback.
     // arm32 now asks the `dwc2` SERVICE over IPC, exactly as aarch64 asks `xhci` - the in-kernel
     // stack's `usb_disk_*` syscalls are no longer the path. Same client, same wire format, different
     // service name (`xhciblk::XHCI`), which is why this is a cfg flip rather than a port.
@@ -304,7 +317,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("block-driver");
+    gs::trace::as_name(&ctx, "block-driver");
     // A USB board's backend needs NO MMIO: the disk is reached by IPC to the service that owns the
     // host controller (`STORAGE_HOST`), so this service is granted no window and asks for none. Going
     // through the `ctx.mmio()` gate would refuse a perfectly good USB stick on any board that does not
@@ -312,8 +325,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // (This used to say the USB stack was in the kernel and the disk reached through syscalls. That
     // stopped being true on aarch64 in 2026-08 and on arm32 a week later - both stacks are services
-    // now, and `xhciblk.rs` is the client. The syscall route survives in `usbdisk.rs` for a board
-    // that has no such service, and no shipping port is one.)
+    // now, and `xhciblk.rs` is the client. There is no syscall route left: `usbdisk.rs` reaches the
+    // device through `xhciblk` too.)
     #[cfg(storage_is_usb)]
     backend_run(&ctx);
     #[cfg(not(storage_is_usb))]
@@ -345,8 +358,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // gives (a cross-core flood must not depend on waking a deeply-blocked recv), so the
             // answer path is inlined here rather than delegating to the blocking version.
             loop {
-                while let Some(msg) = ctx.try_recv() {
-                    let reply = match ctx.take_pending_cap() {
+                while let Some(msg) = gs::ipc::try_recv(&ctx) {
+                    let reply = match gs::ipc::take_sent_cap(&ctx) {
                         Some(c) => c,
                         None => continue,   // nothing to answer on; dropping is all that is left
                     };
@@ -367,9 +380,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         1
                     };
                     reply.send(&ctx, &out[..n]);
-                    ctx.remove_cap(reply.cap);
+                    gs::cap::remove(&ctx, reply.cap);
                 }
-                ctx.yield_cpu();
+                gs::task::yield_now(&ctx);
             }
         }
     }

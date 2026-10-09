@@ -18,3 +18,4 @@ el0-fault-test = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }

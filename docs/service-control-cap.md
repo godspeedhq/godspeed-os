@@ -21,6 +21,15 @@ chaos suites must stay green).
   no name enumeration. (Strategy (a) below.)
 - `caps <service>` maps id 6 → `service_control`.
 
+> **Note (2026-10-09): the gate is unchanged, the mint is not.** `handle_kill` still checks
+> holdings of `SERVICE_CONTROL_RESOURCE` (`kernel/src/syscall/dispatch.rs`). But nothing is minted
+> by name or by ELF identity any more: the kernel no longer holds `PROBE_ELF` (the probe image moved
+> to the supervisor, `docs/probe-params-design.md`), and `SERVICE_CONTROL` is a privilege bit
+> (`privbits::SERVICE_CONTROL`, `kernel/src/task/mod.rs`) carried in the SPAWN REQUEST and refused
+> unless the spawner holds it itself (CLAUDE.md 13.6). The probes' bits come from
+> `probes::privileges_of`. The COM2 control channel below is the `services/control` service now,
+> not a kernel `control.rs`.
+
 ### Verification (kill path exercised, all green)
 - identity **22/22** - Test 4A kills `probe-victim`; 6A/6B/10A/10B restart.
 - property **10/10** - P2/P5/P7/P8/P9 kill victims.

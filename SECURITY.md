@@ -15,7 +15,7 @@ public issue or pull request for a security problem until it is fixed.
 
 Please include:
 
-- the **commit**, from the first line of the boot banner (`GodspeedOS 0.21.0 x86_64 (f54aafef) - kernel`);
+- the **commit**, from the first line of the boot banner (`GodspeedOS 0.22.0 x86_64 (f54aafef) - kernel`);
 - the **machine** - the board, or the QEMU command line;
 - **what you did and what happened**, and the **capability** the attacker held - which service, or which
   of the attackers below;

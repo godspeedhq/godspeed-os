@@ -22,6 +22,8 @@
 //!
 //! The driver currently has three, in three functions, that disagree: a definite "disconnected"
 //! needs 2, a failed probe needs 20, and a failed block operation needs 1. Here there is one:
+//! (Note 2026-10-09: main.rs has since stopped counting failed probes toward removal - at 20 it only
+//! logs, and at 200 it repairs the endpoint - so that middle rule is gone there too.)
 //!
 //! * an answer of PRESENT moves evidence up,
 //! * an answer of ABSENT moves it down,

@@ -3,9 +3,9 @@
 """Boot the ARM32 GodspeedOS kernel in QEMU raspi2b and capture serial output.
 
 Usage:
-    python scripts/arm_run.py [--secs N] [--usb] [--cmd "help" --cmd "version"]
+    python scripts/arm_run.py [--secs N] [--debug] [--usb] [--usbnet] [--usbdisk IMG] [--cmd "help" --cmd "version"]
 
-By default boots for --secs seconds (headless, serial captured to
+Boots the RELEASE kernel unless --debug. By default boots for --secs seconds (headless, serial captured to
 build/arm_serial.log) and prints the tail. --usb attaches an emulated usb-kbd to
 the root port (note: QEMU's DWC2 does not complete transfers, so this only
 exercises detection). --cmd sends a line to the shell (char-by-char, since the
@@ -28,7 +28,7 @@ def find_kernel(profile):
 def announce_kernel(path, profile):
     """Say WHICH kernel is booting, and shout if the other profile is newer.
 
-    This default (`debug`) silently booted a stale kernel through several "verified in QEMU" runs whose
+    The old default (`debug`; it is `release` now) silently booted a stale kernel through several "verified in QEMU" runs whose
     builds had all been `--release`. Every result was wrong in the same believable direction: the fix
     under test appeared not to work, because the image under test predated it. Nothing was broken - the
     runner answered a question about a different binary and said nothing about which.
@@ -66,7 +66,8 @@ def main():
     # overflow (a ~503 KiB service_main frame against a 256 KiB user stack) - a bisect across two
     # commits that booted the same stale binary both times and compared nothing.
     #
-    # arm_build.py already refuses to build a debug image for this reason. A runner that quietly boots
+    # (Correction 2026-10-09: arm_build.py does NOT refuse a debug image - it builds debug unless given
+    # --release. `scripts/board.py pi2` is what always passes --release.) A runner that quietly boots
     # one anyway leaves the same trap one flag away, and the flag that avoids it is the one you forget.
     ap.add_argument("--release", action="store_true",
                     help="(default) boot the release kernel")
@@ -102,7 +103,9 @@ def main():
         cmd += ["-drive", f"if=none,id=usbstick,format=raw,file={args.usbdisk}",
                 "-device", "usb-storage,drive=usbstick"]
     if args.sd:
-        # Attach an SD-card image so the block-driver (BCM2835 EMMC) has a disk to serve to fs.
+        # Attach an SD-card image. NOTE (2026-10-09): block-driver no longer serves the SD card - its
+        # EMMC backend is not compiled in and the kernel grants no EMMC window (the SD card is the Pi 2's
+        # boot card; services/block-driver/src/main.rs). Use --usbdisk for a disk `fs` can mount.
         cmd += ["-drive", f"if=sd,format=raw,file={args.sd}"]
 
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

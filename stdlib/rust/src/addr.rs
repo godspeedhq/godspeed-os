@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Addresses. Pure parsing - no service and no SDK. (There is no formatter here; this said "parsing and formatting".)
+//! Addresses. Pure parsing - no service, no SDK, and no formatter.
 //!
 //! Separate from [`crate::net`] for one reason: this is the only part of the network surface a
 //! caller feeds UNTRUSTED TEXT to, it is the classic place to be off by one, and it has no

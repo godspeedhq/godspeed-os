@@ -31,6 +31,12 @@ Verified by running it rather than by reading the PEP:
     def f():
         v: totally_undefined_name[int] = []   # never evaluated, so never a NameError
         return v
+
+NOT CHECKED, found 2026-10-09: a builtin generic in a FUNCTION SIGNATURE (`def f() -> list[str]:`,
+`def f(x: dict[str, int])`). Those annotations ARE evaluated, at `def` time, so on 3.8 they raise
+`TypeError` at import unless the module has `from __future__ import annotations`. None of the patterns
+above matches a `def` line, and `arch_boundary_check.py`, `dash_check.py` and `unsafe_check.py` each
+carry one, so a pass here does not yet mean those three import on 3.8.
 """
 import io
 import os

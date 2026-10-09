@@ -15,8 +15,9 @@
 //!
 //! # Cost when not tracing
 //!
-//! One `Relaxed` load, branch not taken. A service is tracing only if its contract granted it
-//! `ipc_send = ["events"]` and the lazy resolution below found that cap - so tracing is AUTHORITY,
+//! One `Relaxed` load, branch not taken. A service is tracing only if its spawn request granted it a
+//! send cap to `events` (declared in its contract as `ipc_send = ["events"]`, CLAUDE.md 13.6) and the
+//! lazy resolution below found that cap - so tracing is AUTHORITY,
 //! visible in `caps <service>`, revocable, and absent by default (§3.1: no ambient anything).
 //!
 //! # Never blocks, never fails loudly
@@ -81,8 +82,14 @@ pub const TRACE_OP_METRICS: u8 = 5;
 /// What this cannot carry, stated rather than discovered: lines written BEFORE `events` exists. Those
 /// live in the kernel's 16 KiB ring, which no syscall exposes to userspace, so `events log` begins at
 /// the moment `events` does. Boot output is serial's job, and always was.
+/// (2026-10-09: the kernel now also keeps a fixed copy of the first 32 KiB ever logged, readable as
+/// `events log boot` through InspectKernel query 27 - CLAUDE.md 11.4, amendment 2026-10-08. The
+/// wrapping 16 KiB ring is still exposed by no syscall.)
 pub const TRACE_OP_LOG: u8 = 6;
-/// Ask for recent log lines; byte 1 = how many bytes are wanted (0 = as many as fit).
+/// Ask for recent log lines: `[7][since:u64 le]`, where `since` is the last line number the caller
+/// has already seen (absent or 0 = everything held). The reply is a 25-byte header - next cursor
+/// (u64), oldest line still held (u64), lines in the window (u64), wrapped (u8) - then the text,
+/// one line per `\n`, owner and text separated by 0x1f. (This said byte 1 was a byte count.)
 pub const TRACE_OP_LOGS: u8 = 7;
 
 /// Bytes of a METRIC's name. Deliberately NOT `PEER_LEN`.
@@ -339,23 +346,10 @@ pub fn sink_slot() -> u32 {
     TRACER_SLOT.load(Ordering::Relaxed)
 }
 
-/// Build one event payload. Split out from the send so the caller owns the buffer and this stays
-/// allocation-free (§26.6.1 - fixed stack, no heap).
 #[inline]
-/// Build one event. **The timestamp field is left ZERO and stamped by the SINK** - reading a clock
-/// here is a CMOS RTC read on the caller's hot path (see `ServiceContext::trace_emit`), and an
-/// observer that costs the observed a millisecond of port I/O per IPC is not an observer, it is a
-/// brake.
-/// Encode one metric sample.
-///
-/// The OWNER is this service's declared name (`trace_as`), exactly as for an event: identity is not
-/// ambient, so the emitter says who it is, and the sample is its own testimony - no more and no less
-/// trustworthy than the value beside it.
-///
-/// No clock read. The sink stamps the sample, for the reason recorded on `trace_emit`: a CMOS RTC read
-/// on every publish would put up to a millisecond of port I/O on the emitting service's path, and that
-/// once cost the shell its keystrokes. An observer must not be able to slow what it observes.
-/// Encode one log copy. Text is truncated to `max` bytes at a char boundary by the caller.
+/// Encode one log copy. Text past [`LOG_TEXT_MAX`] bytes is cut HERE, at that byte count and not at
+/// a character boundary, so a clipped copy can end mid-character. (This said the CALLER truncated at
+/// a char boundary; `ServiceContext::log_copy` passes the text through unclipped.)
 pub fn encode_log(text: &[u8], out: &mut [u8; 1 + PEER_LEN + LOG_TEXT_MAX]) -> usize {
     out[0] = TRACE_OP_LOG;
     CALLER.read_into(&mut out[1..1 + PEER_LEN]);
@@ -368,6 +362,15 @@ pub fn encode_log(text: &[u8], out: &mut [u8; 1 + PEER_LEN + LOG_TEXT_MAX]) -> u
 /// queryable copy is clipped - so the loss is bounded and the authoritative record is untouched.
 pub const LOG_TEXT_MAX: usize = 240;
 
+/// Encode one metric sample.
+///
+/// The OWNER is this service's declared name (`trace_as`), exactly as for an event: identity is not
+/// ambient, so the emitter says who it is, and the sample is its own testimony - no more and no less
+/// trustworthy than the value beside it.
+///
+/// No clock read. The sink stamps the sample, for the reason recorded on `trace_emit`: a CMOS RTC read
+/// on every publish would put up to a millisecond of port I/O on the emitting service's path, and that
+/// once cost the shell its keystrokes. An observer must not be able to slow what it observes.
 pub fn encode_metric(name: &str, value: u64) -> [u8; 1 + MET_LEN] {
     let mut b = [0u8; 1 + MET_LEN];
     b[0] = TRACE_OP_METRIC;
@@ -379,6 +382,12 @@ pub fn encode_metric(name: &str, value: u64) -> [u8; 1 + MET_LEN] {
     b
 }
 
+/// Build one event payload. Split out from the send so the caller owns the buffer and this stays
+/// allocation-free (§26.6.1 - fixed stack, no heap).
+///
+/// **The timestamp field is left ZERO and stamped by the SINK** - reading a clock here is a CMOS RTC
+/// read on the caller's hot path (see `ServiceContext::trace_emit`), and an observer that costs the
+/// observed a millisecond of port I/O per IPC is not an observer, it is a brake.
 pub fn encode(peer: &str, op: u8, kind: u8) -> [u8; 1 + EV_LEN] {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let mut b = [0u8; 1 + EV_LEN];

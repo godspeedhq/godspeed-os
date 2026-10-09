@@ -82,7 +82,8 @@ pub const UNSUPPORTED: u8 = 4;
 /// `power` in a status answer and the `mode` of `OP_POWER`.
 pub const POWER_OFF: u8 = 0;
 pub const POWER_ON: u8 = 1;
-/// The controller is held in reset - the closest HD Audio has to cutting the power.
+/// The controller is held in reset - the closest HD Audio has to cutting the power. The Pis' PWM jack has
+/// no deeper off: `pwm-audio` treats it as off and answers its verify byte `UNSUPPORTED`.
 pub const POWER_HARD_OFF: u8 = 2;
 
 // ---- Ops ----------------------------------------------------------------------------------------------
@@ -139,7 +140,8 @@ pub const OP_STOP: u8 = 7;
 /// `[8, rate u32, channels u8, bits u8, frames u32]` - open a stream of samples the caller will send.
 /// Answer `[OK, free_frames u32]`, or `FORMAT` with a reason, `AUDIO_OFF`, `BUSY`. Nothing plays yet:
 /// the stream starts once half the ring is filled, or at `OP_END`, so a sender's first moments of
-/// jitter are absorbed rather than heard.
+/// jitter are absorbed rather than heard. (`pwm-audio`'s engine never stops, so it gets the same cushion
+/// by starting the stream half a ring of silence ahead of where the engine is.)
 pub const OP_OPEN: u8 = 8;
 /// `[9, samples...]` - whole frames of 16-bit little-endian samples, interleaved if stereo, at most
 /// `PCM_MAX` bytes. Answer `[OK, accepted_frames u32, free_frames u32]` at once; frames past the free

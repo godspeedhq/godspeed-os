@@ -15,12 +15,12 @@ That is composition without coupling.
 
 ## What it demonstrates
 
-- The input side: `ctx.recv()` on the filter's own endpoint. The shell resolves "upper" by name
+- The input side: `gs::ipc::recv(&ctx)` on the filter's own endpoint. The shell resolves "upper" by name
   through the kernel name directory and routes the upstream stage's messages here (Path C: no
   self-registration; the kernel records the name at spawn).
 - The transform: uppercase each ASCII byte into a fixed `[u8; 4096]` buffer (one message's worth).
 - The output side: send the result over `send_peers[0]` - the SEND cap the shell delegated at
-  spawn (`ctx.send_peer_at(0)`), the same mechanism `greet` uses.
+  spawn (`gs::ipc::peer_at(&ctx, 0)`), the same mechanism `greet` uses.
 - The protocol: forward a lone EOT (`0x04`) downstream so the shell stops draining this stream.
 
 ## Why it is built this way (the Commandments)
@@ -41,7 +41,7 @@ That is composition without coupling.
 `upper` has a **minimal contract** (`examples/upper/contracts/upper.toml`) declaring **only
 `log_write` and no send peers** (no `ipc_send`). Its input endpoint is named by the kernel name
 directory at spawn, so it declares no `ipc_receive` either; the output SEND cap is delegated by the
-shell at spawn (`send_peers[0]`, via `ctx.send_peer_at(0)`). The shell brokers **both** ends, so the
+shell at spawn (`send_peers[0]`, via `gs::ipc::peer_at(&ctx, 0)`). The shell brokers **both** ends, so the
 filter holds zero standing authority. Declaring a fixed downstream peer would be held authority (a
 small breach of **VII**) and would freeze the stage into one position in one chain - exactly what a
 composable filter must avoid. `log_write` is itself a v1 default minted to every service - the
@@ -51,16 +51,16 @@ omitting the contract: it is *present*, and it pointedly grants nothing to send 
 
 ## What you must NOT do
 
-- **Do not assume a global `stdin`/`stdout`.** Read from your endpoint with `ctx.recv()`; write to
-  `ctx.send_peer_at(0)`. There are no inherited streams (breaks **VI**/**VII**).
+- **Do not assume a global `stdin`/`stdout`.** Read from your endpoint with `gs::ipc::recv(&ctx)`; write to
+  `gs::ipc::peer_at(&ctx, 0)`. There are no inherited streams (breaks **VI**/**VII**).
 - **Do not forward without honoring EOT.** Pass the `0x04` marker on, or downstream sinks hang.
 - **Do not grow the buffer unbounded.** One message is at most `MAX_PAYLOAD` (4 KiB); a larger
   transform must chunk, never allocate without bound (bounded behaviour, §26.6).
 
 ## How to adapt this
 
-To write your own filter (grep, tr, a decoder): loop on `ctx.recv()`, transform into a fixed
-buffer, send over `ctx.send_peer_at(0)`, and forward the EOT byte unchanged. Keep it `no_std` and
+To write your own filter (grep, tr, a decoder): loop on `gs::ipc::recv(&ctx)`, transform into a fixed
+buffer, send over `gs::ipc::peer_at(&ctx, 0)`, and forward the EOT byte unchanged. Keep it `no_std` and
 bounded. Declare only `log_write`; let the shell broker both ends.
 
 ## See also

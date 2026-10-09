@@ -9,13 +9,13 @@
 //! net-stack - the model-AGNOSTIC half of networking (docs/networking.md, Phase 2).
 //!
 //! nic-driver knows one NIC and speaks raw Ethernet frames; net-stack knows no hardware and speaks
-//! ARP/IPv4/ICMP/UDP over those frames. The seam between them is the **frame interface**: a
-//! request/reply (§8.2) where the request payload IS a frame to transmit and the reply payload IS the
-//! frame that came back. So the protocols live HERE, in net-stack, over raw frames - not in the
-//! driver. This is Commandment X: the driver is mechanism (put bytes on the wire), the protocol is
+//! ARP/IPv4/ICMP/UDP/DHCP/DNS/TCP over those frames. The seam between them is the **frame interface**:
+//! a request/reply (§8.2) where a multi-byte request payload IS a frame to transmit (answered with one
+//! status byte) and a one-byte request is an op - [3] status, [4] one received frame, [9] a batch of
+//! them. So the protocols live HERE, in net-stack, over raw frames - not in the driver. This is Commandment X: the driver is mechanism (put bytes on the wire), the protocol is
 //! policy (what the bytes mean), and they live in different services.
 //!
-//! Phase 2 progress:
+//! Phase 2 progress (history; UDP, the socket capability, DHCP, DNS and TCP have all landed since):
 //!  - step 1: ARP - resolve the QEMU user-net gateway (10.0.2.2) to its hardware address.
 //!  - step 2 (this commit): ICMP - PING the gateway. Build an ICMP echo request inside an IPv4 packet
 //!    inside an Ethernet frame (to the MAC ARP just resolved), send it THROUGH nic-driver, and read
@@ -26,8 +26,23 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome, CapHandle};
+use godspeed_sdk::{ServiceContext, Message, DeadlineOutcome};
+use godspeed::cap::Cap;
 use godspeed::driver::wait::{Deadline, Budget};
+
+use godspeed as gs;
+
+/// Counter ticks in `ms` milliseconds, for the deadlines this service keeps in counter units (the
+/// stash's per-request patience, the poll and pass timers). Never 0, and 1 on a machine whose counter
+/// the kernel could not calibrate - the floor the SDK's `duration_cycles` had, kept so a converted
+/// deadline behaves exactly as it did.
+fn ticks_ms(ctx: &ServiceContext, ms: u64) -> u64 {
+    let per_10ms = gs::driver::wait::ticks_per_10ms(ctx);
+    if per_10ms == 0 {
+        return 1;
+    }
+    (per_10ms.saturating_mul(ms) / 10).max(1)
+}
 
 // Our MAC is LEARNED from the NIC, never hardcoded (audit U9 / Commandment III). The controller's
 // burned-in MAC is the one source of truth for our hardware identity; nic-driver reads it (RTL8168
@@ -39,12 +54,12 @@ use godspeed::driver::wait::{Deadline, Budget};
 const FALLBACK_IP: [u8; 4] = [10, 0, 2, 15]; // used ONLY if DHCP returns no offer (no NIC)
 const GATEWAY_IP:  [u8; 4] = [10, 0, 2, 2];
 
-/// The 16-bit one's-complement checksum used by IPv4 and ICMP (RFC 1071): sum the 16-bit big-endian
-/// words, fold the carries, invert. The field being covered must be zero when this is computed.
 /// TCP lives in its own module: `docs/tcp-design.md` explains why, and it keeps the protocol
 /// separable from the request/response services around it.
 mod tcp;
 
+/// The 16-bit one's-complement checksum used by IPv4 and ICMP (RFC 1071): sum the 16-bit big-endian
+/// words, fold the carries, invert. The field being covered must be zero when this is computed.
 fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
@@ -147,17 +162,6 @@ const _: () = assert!(DNS_BUDGET_SECS < CLIENT_MIN_DEADLINE_SECS,
 /// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
 const PING_MAX_PAYLOAD: usize = 1024;
 
-/// Send a request to nic-driver and await the reply, RECOVERING from a nic-driver restart (audit M3).
-/// If the cached send cap has gone stale - nic-driver was killed and respawned (a real event:
-/// `chaos max-carnage nic-driver`), so its endpoint generation bumped - the first send fails and the
-/// deadline wait returns `None`. We then reacquire the driver by name from the kernel directory
-/// (§14.3, the same recovery `dhcp_discover`/`udp_roundtrip` already do in their loops) and retry once.
-/// Returns `None` only if the driver is genuinely absent or silent past the deadline. Use this for the
-/// FIRST request of each interactive path (`link_is_up`/`ping`/`dns`/`arp`); the poll-loop requests
-/// that follow reuse the now-reacquired cached cap. Without it a configured stack never self-heals
-/// after a driver restart on the ping/net/dns/arp surface - it needs a manual `net renew`. Because the
-/// reply is `request_with_reply` under the hood, a driver that dies mid-request wakes us with
-/// `ReplyDead` (never a hang), and the reacquire fixes a *stale* cap the fast-fail send exposes.
 /// A STATUS query (op 3: MAC + link), with the receive channel cleared first.
 ///
 /// Only status queries do this, and the distinction matters. When a `nic_req` times out its reply is
@@ -180,36 +184,40 @@ const PING_MAX_PAYLOAD: usize = 1024;
 /// is `docs/net-tags-design.md` phase-2 behaviour: it times out and retries, which is defined and
 /// recoverable, where consuming it corrupts both sides silently.
 fn nic_status_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
-    while let Some(m) = ctx.try_recv() {
+    while let Some(m) = gs::ipc::try_recv(ctx) {
         // Read the badge for EVERY message, not only the ones with a reply cap. It reads and CLEARS,
         // so a badge left unread here would still be sitting there when the next message arrives and
         // would be attributed to it - a socket invocation misread onto an unrelated request.
-        let badge = ctx.last_recv_badge();
-        if let Some(cap) = ctx.take_pending_cap() {
+        let badge = gs::resource::last_badge(ctx);
+        if let Some(cap) = gs::ipc::take_sent_cap(ctx) {
             pending.note(ctx, &m, badge, cap);
         }
     }
     nic_req(ctx, pending, msg, secs)
 }
 
-// (The NIC_BUSY_MS / NIC_BUSY_TRIES pacing that lived here is GONE. It existed because a burst of
-// DHCP REQUESTs filled nic-driver's 16-deep queue faster than the driver was scheduled to drain it,
-// and a full queue meant a DROPPED frame the caller had to re-offer. `nic_req` now goes through the
-// kernel's `CallDeadline`, which BLOCKS the send until the peer has room rather than dropping it, so
-// there is nothing left to pace: congestion is handled by the primitive instead of by a retry loop
-// that could give up and report a frame as refused.)
-
 /// A busy nic-driver is congestion, not absence: back off briefly and re-ask, up to a bound.
+///
+/// (Note 2026-10-09: a comment here once said this pacing was GONE because `nic_req` went through the
+/// kernel's `CallDeadline`. `nic_req` does not - see `nic_req_inner` - and a full queue still comes back
+/// as `DeadlineOutcome::QueueFull`, which is what these two bound.)
 const NIC_BUSY_MS: u64 = 2;
 const NIC_BUSY_TRIES: u32 = 8;
 
+/// Send a request to nic-driver and await the reply, RECOVERING from a nic-driver restart (audit M3).
+/// If the cached send cap has gone stale - nic-driver was killed and respawned (a real event:
+/// `chaos max-carnage nic-driver`), so its endpoint generation bumped - the first attempt fails. We then
+/// reacquire the driver by name from the kernel directory (§14.3) and retry once; a timeout reacquires
+/// too (see `nic_req_inner`). Returns `None` only if the driver is genuinely absent or silent past the
+/// deadline. Without it a configured stack never self-heals after a driver restart on the
+/// ping/net/dns/arp surface - it needs a manual `net renew`.
 fn nic_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
     // Timed from the side that pays: an exchange with the NIC that takes over 300 ms is named with the
     // op it asked, because every client request that arrives meanwhile is held behind it.
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     let r = nic_req_inner(ctx, pending, msg, secs);
-    let t1 = ctx.read_tsc();
-    let per_ms = ctx.duration_cycles(1).max(1);
+    let t1 = gs::driver::wait::ticks(ctx);
+    let per_ms = ticks_ms(ctx, 1);
     let took_ms = t1.wrapping_sub(t0) / per_ms;
     if took_ms >= 300 {
         // Both ends print the same clock (cycles since boot, in ms) so the log can say whether the
@@ -223,7 +231,8 @@ fn nic_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i
 }
 
 fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
-    // `request_with_reply_deadline_outcome`, NOT the `Call` primitive. Switching this to `Call`
+    // A plain bounded request (`request_with_reply_deadline_sifted`, in `sifted_req`), NOT the `Call`
+    // primitive. Switching this to `Call`
     // during the x86 work is what stopped Pi 2 networking, and it was isolated by elimination on
     // hardware: with `Call`, nic-driver answers with an EMPTY status - no MAC, no link - so
     // net-stack never configures, DHCP never runs and every ping dies. Measured on the same board
@@ -243,10 +252,10 @@ fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, s
         match sifted_req(ctx, pending, msg, secs) {
             DeadlineOutcome::Reply(r) => return Some(r),
             DeadlineOutcome::QueueFull => {
-                ctx.sleep(ctx.duration_cycles(NIC_BUSY_MS));
+                gs::task::sleep_ms(ctx, NIC_BUSY_MS);
                 continue;
             }
-            DeadlineOutcome::SendFailed if ctx.reacquire_by_name("nic-driver") =>
+            DeadlineOutcome::SendFailed if gs::cap::reacquire(ctx, "nic-driver") =>
                 return match sifted_req(ctx, pending, msg, secs) {
                     DeadlineOutcome::Reply(r) => Some(r),
                     _ => None,
@@ -271,7 +280,7 @@ fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, s
                     _ => "was refused",
                 };
                 let op = msg.payload_bytes().first().copied().unwrap_or(0);
-                if ctx.reacquire_by_name("nic-driver") {
+                if gs::cap::reacquire(ctx, "nic-driver") {
                     return match sifted_req(ctx, pending, msg, secs) {
                         DeadlineOutcome::Reply(r) => {
                             ctx.log_fmt(format_args!(
@@ -311,8 +320,8 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
     ctx.request_with_reply_deadline_sifted("nic-driver", msg, secs, |m| {
         // Read and CLEAR the badge for every message, so a socket invocation's badge cannot survive
         // to be attributed to whatever arrives next.
-        let badge = ctx.last_recv_badge();
-        match ctx.take_pending_cap() {
+        let badge = gs::resource::last_badge(ctx);
+        match gs::ipc::take_sent_cap(ctx) {
             // A CLIENT, met mid-question to the driver. KEEP IT - stash the request with its reply
             // capability - and tell this wait that it is not the answer it asked for.
             //
@@ -379,7 +388,7 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
 /// file-cap invocations take the other path and are untagged".
 #[derive(Clone, Copy)]
 struct Reply {
-    cap: CapHandle,
+    cap: Cap,
     tag: Option<u8>,
 }
 
@@ -406,34 +415,34 @@ impl Reply {
         debug_assert!(!body.is_empty(),
             "a reply carries at least one byte - say nothing with a byte that means it");
         match self.tag {
-            None => { let _ = ctx.try_send_by_handle(self.cap, &Message::from_bytes(body)); }
+            None => { let _ = gs::ipc::try_send_to(ctx, self.cap, &Message::from_bytes(body)); }
             Some(t) => {
                 let mut out = [0u8; 4096];
                 let n = body.len().min(out.len() - 1);
                 out[0] = t;
                 out[1..1 + n].copy_from_slice(&body[..n]);
-                let _ = ctx.try_send_by_handle(self.cap, &Message::from_bytes(&out[..1 + n]));
+                let _ = gs::ipc::try_send_to(ctx, self.cap, &Message::from_bytes(&out[..1 + n]));
             }
         }
     }
 
     /// Answer the client with a capability embedded (the socket `open` path). `true` if it was sent.
     #[inline(never)]
-    fn send_with_cap(&self, ctx: &ServiceContext, granted: CapHandle, body: &[u8]) -> bool {
+    fn send_with_cap(&self, ctx: &ServiceContext, granted: Cap, body: &[u8]) -> bool {
         match self.tag {
-            None => ctx.send_with_cap_by_handle(self.cap, granted, &Message::from_bytes(body)).is_ok(),
+            None => gs::ipc::send_granting(ctx, self.cap, granted, &Message::from_bytes(body)).is_ok(),
             Some(t) => {
                 let mut out = [0u8; 64];
                 let n = body.len().min(out.len() - 1);
                 out[0] = t;
                 out[1..1 + n].copy_from_slice(&body[..n]);
-                ctx.send_with_cap_by_handle(self.cap, granted, &Message::from_bytes(&out[..1 + n])).is_ok()
+                gs::ipc::send_granting(ctx, self.cap, granted, &Message::from_bytes(&out[..1 + n])).is_ok()
             }
         }
     }
 
     /// Reclaim the capability once the request is answered (§8.5 - an unreclaimed slot leaks).
-    fn done(&self, ctx: &ServiceContext) { ctx.remove_cap(self.cap); }
+    fn done(&self, ctx: &ServiceContext) { gs::cap::remove(ctx, self.cap); }
 }
 
 /// How many client requests were displaced by a conversation with `nic-driver`, and dropped.
@@ -485,12 +494,12 @@ pub struct Displaced {
 ///
 /// All three are captured at the moment of arrival and none can be recovered afterwards: the badge
 /// and the pending capability are per-task kernel state describing THE MESSAGE JUST RECEIVED
-/// (`last_recv_badge` reads and clears it, `take_pending_cap` pops a FIFO), so both are overwritten
+/// (`gs::resource::last_badge` reads and clears it, `gs::ipc::take_sent_cap` pops a FIFO), so both are overwritten
 /// by whatever lands next.
 pub struct Held {
     len: usize,
     badge: Option<(u64, u8)>,
-    reply: CapHandle,
+    reply: Cap,
     /// The cycle counter when it was displaced. See `HOLD_MS`.
     at: u64,
     /// How long THIS request's client said it will wait. See `HOLD_MS`.
@@ -529,7 +538,7 @@ const HELD_BYTES: usize = 1024;
 /// 1500 ms remains a sensible default for the badged case: a capability invocation is a single round
 /// trip against a client that is actively holding the capability, not a long transaction.
 ///
-/// On a board whose cycle counter is not calibrated, `duration_cycles` floors to one quantum
+/// On a board whose cycle counter is not calibrated, `ticks_ms` floors to one quantum
 /// (`backlog/27`), so the budget collapses and every held request expires at once - the stack then
 /// behaves as it did before the stash existed, which is the right way for it to fail.
 const HOLD_MS: u64 = 1_500;
@@ -547,7 +556,7 @@ impl Displaced {
     }
 
     /// A client request met during a driver conversation: keep it, so the work is not lost.
-    fn note(&mut self, ctx: &ServiceContext, m: &Message, badge: Option<(u64, u8)>, cap: CapHandle) {
+    fn note(&mut self, ctx: &ServiceContext, m: &Message, badge: Option<(u64, u8)>, cap: Cap) {
         let pl = m.payload_bytes();
         if pl.len() > HELD_BYTES {
             // REFUSED, not truncated. See HELD_BYTES.
@@ -576,7 +585,7 @@ impl Displaced {
         let hold_ms = pl.get(1).map(|p| (*p as u64).saturating_mul(1_000)).unwrap_or(HOLD_MS);
         let _ = badge;
         let mut h = Held {
-            len: pl.len(), badge, reply: cap, at: ctx.read_tsc(), hold_ms,
+            len: pl.len(), badge, reply: cap, at: gs::driver::wait::ticks(ctx), hold_ms,
             body: [0u8; HELD_BYTES],
         };
         h.body[..pl.len()].copy_from_slice(pl);
@@ -605,19 +614,19 @@ impl Displaced {
     /// Entries are expired from the FRONT only, which is sound because they were kept in arrival
     /// order: once the head is young enough, so is everything behind it.
     fn take(&mut self, ctx: &ServiceContext, out: &mut [u8; HELD_BYTES])
-            -> Option<(usize, Option<(u64, u8)>, CapHandle)> {
-        let now = ctx.read_tsc();
+            -> Option<(usize, Option<(u64, u8)>, Cap)> {
+        let now = gs::driver::wait::ticks(ctx);
         while self.live > 0 {
             let h = match self.held[self.head].take() { Some(h) => h, None => return None };
             self.head = (self.head + 1) % STASH_N;
             self.live -= 1;
             // Per request, not one budget for the whole stash - entries hold for different lengths
             // now, so each is checked against its own client's word.
-            let budget = ctx.duration_cycles(h.hold_ms);
+            let budget = ticks_ms(ctx, h.hold_ms);
             // wrapping_sub, so a counter that wraps while something is held reads as a small elapsed
             // rather than an enormous one that expires a request which just arrived.
             if now.wrapping_sub(h.at) >= budget {
-                ctx.remove_cap(h.reply);
+                gs::cap::remove(ctx, h.reply);
                 self.n = self.n.saturating_add(1);
                 // REPORT EVERY ONE, not just the first. A "said once" latch is exactly what hid this
                 // for three sessions: the first drop was reported at boot and every later one - each
@@ -634,7 +643,7 @@ impl Displaced {
                 continue;
             }
             out[..h.len].copy_from_slice(&h.body[..h.len]);
-            let age_ms = now.wrapping_sub(h.at) / ctx.duration_cycles(1).max(1);
+            let age_ms = now.wrapping_sub(h.at) / ticks_ms(ctx, 1);
             if age_ms >= 300 {
                 ctx.log_fmt(format_args!(
                     "net-stack: serving a held client request (op {}) after {} ms in the stash",
@@ -646,8 +655,8 @@ impl Displaced {
     }
 
     /// Reclaim a capability for a request that will not be answered, and report the first one.
-    fn drop_one(&mut self, ctx: &ServiceContext, cap: CapHandle, why: &str) {
-        ctx.remove_cap(cap);
+    fn drop_one(&mut self, ctx: &ServiceContext, cap: Cap, why: &str) {
+        gs::cap::remove(ctx, cap);
         self.n = self.n.saturating_add(1);
         if self.n <= 8 || self.n % 8 == 0 {
             ctx.log_fmt(format_args!(
@@ -656,35 +665,33 @@ impl Displaced {
     }
 }
 
-/// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
-/// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
-/// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
-/// this to LEARN its own IP instead of hardcoding it; here it demonstrates the round-trip.
-/// Drain RX-ring batches ([9]) and call `on_frame` for each frame until it returns true (matched) or the
-/// deadline elapses. On a busy LAN the reply arrives amid a FLOOD of broadcast, so every path that waits
-/// for a specific reply must SCAN every frame, not take the one coupled frame back - the shared receive.
-/// Like `drain_scan`, but RETURNS whether the closure matched.
-///
-/// The captured-flag form (`let mut hit = false; drain_scan(.., |f| { hit = true; true }); if hit`)
-/// compiled away entirely for the DHCP ACK check: the branch and its log never reached the binary, so
-/// on hardware neither the success nor the failure line ever printed and the REQUEST looked as though
-/// it had never run. Returning the answer instead of writing it through a capture leaves nothing for
-/// that to happen to. Verified by grepping the built ELF for the log strings.
+/// While a dance waits on the wire, answer up to 16 queued client requests (the endpoint depth, §8.5)
+/// with `status` - a short "not configured yet" sentence - instead of leaving them to time out. `None`
+/// does nothing.
 fn serve_while_dancing(ctx: &ServiceContext, pending: &mut Displaced, serve_status: Option<&[u8; 19]>) {
     // `None` means this wait is NOT a dance - it is the ping or DNS path, reached while already
     // handling a client request. Serving there would be re-entrant, so it does not.
     let Some(status) = serve_status else { return };
     // 16 = the per-endpoint queue depth (§8.5); draining at most that many bounds this pass.
     for _ in 0..16 {
-        let Some(req) = ctx.try_recv() else { return };
-        let Some(reply) = ctx.take_pending_cap() else { continue };
-        let _ = ctx.try_send_by_handle(reply, &Message::from_bytes(status));
-        ctx.remove_cap(reply);
+        let Some(req) = gs::ipc::try_recv(ctx) else { return };
+        let Some(reply) = gs::ipc::take_sent_cap(ctx) else { continue };
+        let _ = gs::ipc::reply(ctx, reply, &Message::from_bytes(status));
     }
 }
+
+/// Like `drain_scan`, but RETURNS whether the closure matched.
+///
+/// The captured-flag form (`let mut hit = false; drain_scan(.., |f| { hit = true; true }); if hit`)
+/// compiled away entirely for the DHCP ACK check: the branch and its log never reached the binary, so
+/// on hardware neither the success nor the failure line ever printed and the REQUEST looked as though
+/// it had never run. Returning the answer instead of writing it through a capture leaves nothing for
+/// that to happen to. Verified by grepping the built ELF for the log strings. (Note 2026-10-09:
+/// `dhcp_request`'s own comment later found the cause - an out-of-bounds frame index the compiler
+/// could prove, which deleted everything after it - and fixed it.)
 fn drain_scan_hit(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_status: Option<&[u8; 19]>,
                   mut on_frame: impl FnMut(&[u8], &mut Displaced) -> bool) -> bool {
-    let t0 = ctx.epoch_secs_monotonic();
+    let t0 = gs::task::epoch_secs_monotonic(ctx);
     let mut empty_polls: u32 = 0;
     loop {
         let mut got_frames = false;
@@ -702,7 +709,7 @@ fn drain_scan_hit(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serv
                 pos += fl;
             }
         }
-        if ctx.epoch_secs_monotonic() - t0 >= secs { return false; }
+        if gs::task::epoch_secs_monotonic(ctx) - t0 >= secs { return false; }
         // SERVE AND PACE ONLY WHEN THE WIRE CAME BACK EMPTY.
         //
         // Both of these used to run on EVERY pass, including immediately after a burst arrived, and
@@ -737,9 +744,9 @@ fn drain_scan_hit(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serv
             // up the core, but resuming at the next opportunity instead of adding a floor to it -
             // then fall back to the pace once the wire really has nothing.
             if empty_polls <= EMPTY_YIELDS {
-                ctx.yield_cpu();
+                gs::task::yield_now(ctx);
             } else {
-                ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+                gs::task::sleep_ms(ctx, RX_POLL_PACE_MS);
             }
         }
     }
@@ -762,9 +769,12 @@ const RX_POLL_PACE_MS: u64 = 10;
 /// length, not a 10 ms one.
 const EMPTY_YIELDS: u32 = 12;
 
+/// Drain RX-ring batches ([9]) and call `on_frame` for each frame until it returns true (matched) or the
+/// deadline elapses. On a busy LAN the reply arrives amid a FLOOD of broadcast, so every path that waits
+/// for a specific reply must SCAN every frame - the shared receive.
 fn drain_scan(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_status: Option<&[u8; 19]>,
               mut on_frame: impl FnMut(&[u8], &mut Displaced) -> bool) {
-    let t0 = ctx.epoch_secs_monotonic();
+    let t0 = gs::task::epoch_secs_monotonic(ctx);
     let mut empty_polls: u32 = 0;
     loop {
         let mut got_frames = false;
@@ -782,7 +792,7 @@ fn drain_scan(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_st
                 pos += fl;
             }
         }
-        if ctx.epoch_secs_monotonic() - t0 >= secs { return; }
+        if gs::task::epoch_secs_monotonic(ctx) - t0 >= secs { return; }
         // Serve and pace only on an EMPTY poll - see the twin of this loop in `drain_scan_hit` for
         // why giving a receive window away mid-burst kills a host-polled NIC. On an empty poll,
         // `sleep` parks the task so the core is free for the driver trying to hand us a frame.
@@ -804,9 +814,9 @@ fn drain_scan(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_st
             // up the core, but resuming at the next opportunity instead of adding a floor to it -
             // then fall back to the pace once the wire really has nothing.
             if empty_polls <= EMPTY_YIELDS {
-                ctx.yield_cpu();
+                gs::task::yield_now(ctx);
             } else {
-                ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+                gs::task::sleep_ms(ctx, RX_POLL_PACE_MS);
             }
         }
     }
@@ -964,6 +974,9 @@ fn dhcp_lease(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6],
     Some(cfg)
 }
 
+/// DHCP DISCOVER, then for the first OFFER the REQUEST that claims it (`dhcp_request`), up to
+/// `DANCE_TRIES` times. Returns `(address, gateway, dns server)` once an address is ACKed, or None (no
+/// NIC, nothing answered, or no offer acknowledged). `bcast` sets the BOOTP broadcast flag (`dhcp_lease`).
 fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6], bcast: bool,
                  serve_status: Option<&[u8; 19]>) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     let mut send_fail = 0u32;
@@ -1027,15 +1040,15 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
                     if opt == 6 && len >= 4 && o + 6 <= f.len() { dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; have_dns = true; }
                     // Option 54, the SERVER IDENTIFIER. A REQUEST must name the server whose offer it
                     // is accepting, or every DHCP server on the segment has to guess whether it was
-                    // chosen. We never sent a REQUEST at all, so this was never needed - and never
-                    // read.
+                    // chosen. Until `dhcp_request` existed we never sent a REQUEST at all, so this was
+                    // never needed - and never read.
                     if opt == 54 && len >= 4 && o + 6 <= f.len() { srv = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; }
                     o += 2 + len;
                 }
                 if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
-                // WHAT DID WE ACTUALLY GET? Placed in THIS closure deliberately: it is the one that
-                // demonstrably survives optimisation, where the same logging inside `dhcp_request`
-                // does not reach the binary at all.
+                // WHAT DID WE ACTUALLY GET? Placed in THIS closure when the logging inside
+                // `dhcp_request` did not reach the binary at all (the out-of-bounds index its own
+                // comment describes, since fixed).
                 //
                 // Three unknowns, one line: the frame LENGTH (the option walk starts at offset 282, so
                 // anything shorter than 284 means options are unreachable and every option-derived
@@ -1077,7 +1090,7 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
             // gateway. Fall through and re-DISCOVER rather than pretend.
             ctx.log("net-stack: DHCP - REQUEST not acknowledged; the address is not ours, retrying");
         }
-        let _ = ctx.reacquire_by_name("nic-driver");   // best-effort: we retry either way
+        let _ = gs::cap::reacquire(ctx, "nic-driver");   // best-effort: we retry either way
     }
     if send_fail > 0 {
         ctx.log_fmt(format_args!(
@@ -1089,10 +1102,10 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
     None
 }
 
-/// Resolve a hostname to an IPv4 address via DNS (UDP to slirp's resolver at 10.0.2.3). Builds a
+/// Resolve a hostname to an IPv4 address via DNS (UDP to `dns_server`, through the gateway). Builds a
 /// standard A-record query, sends it THROUGH nic-driver, and parses the first A answer. Returns the
-/// IP, or None (no gateway, malformed name, or no answer - DNS depends on the host's resolver, which
-/// slirp forwards to, so a failure here is a real "no answer", not a bug).
+/// IP, or None (no gateway, malformed name, or no answer).
+///
 /// Resolve `hostname`, giving up once `budget_ms` has passed, whatever state it is in.
 ///
 /// **The deadline comes from the CLIENT, not from a constant here.** Every request carries its
@@ -1116,7 +1129,7 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
     // The whole exchange, the query's send included, runs against this one clock.
     let mut deadline = Deadline::paced(ctx, Budget::ms(budget_ms), Budget::ms(RX_POLL_PACE_MS));
     let mut frame = [0u8; 512];
-    // Ethernet: to the gateway; slirp routes the datagram to its DNS at 10.0.2.3.
+    // Ethernet: to the gateway, which routes the datagram on to `dns_server`.
     frame[0..6].copy_from_slice(gw_mac);
     frame[6..12].copy_from_slice(our_mac);
     frame[12] = 0x08; frame[13] = 0x00;              // IPv4
@@ -1163,7 +1176,7 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
     frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
 
     // Send THROUGH nic-driver, bounded + retrying past stray frames (Stage B: never block on a busy/
-    // silent driver). Match the reply to OUR query: a UDP packet to our source port 5353 (0x14e9).
+    // silent driver). Match the reply to OUR query: a UDP packet to our source port 49153 (0xc001).
     // Send the query ONCE, then RX-ONLY poll ([4]) for subsequent frames - so a reply arriving BEHIND
     // stray broadcasts on a busy LAN is caught WITHOUT re-transmitting (a re-TX drains+discards it).
     let req     = Message::from_bytes(&frame[..frame_len]);
@@ -1306,8 +1319,6 @@ const COP_CLOSE: u8 = 2;
 /// Connection: report state, bytes readable, and bytes unacknowledged - without moving any of it.
 const COP_STAT: u8 = 3;
 
-/// Send a UDP datagram (src_port -> dest_ip:dest_port carrying `data`) THROUGH nic-driver and copy the
-/// response's UDP payload into `out`. Returns the payload length, or None (no gateway / no reply).
 /// Build one UDP datagram from `src_port` to `dest_ip:dest_port`, addressed through `gw_mac`, into `frame`.
 /// Returns the frame's length. The UDP checksum is left zero, which IPv4 permits.
 fn build_udp(frame: &mut [u8; 1600], gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
@@ -1332,6 +1343,8 @@ fn build_udp(frame: &mut [u8; 1600], gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac
     42 + dlen
 }
 
+/// Send a UDP datagram (src_port -> dest_ip:dest_port carrying `data`) THROUGH nic-driver and copy the
+/// response's UDP payload into `out`. Returns the payload length, or None (no gateway / no reply).
 fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
                  src_port: u16, dest_ip: &[u8; 4], dest_port: u16, data: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut frame = [0u8; 1600];
@@ -1413,7 +1426,8 @@ const TCP_STEPS: usize = 20_000;
 /// traffic until its phase 2/3 land: net-stack serves clients and receives nic-driver replies on ONE
 /// untagged endpoint, so a background poll consumes client messages. That makes a BACKGROUND TCP
 /// engine a prerequisite-blocked change, and it is recorded as the next step rather than smuggled in
-/// here.
+/// here. (Note 2026-10-09: phases 2 and 3 have since landed, and `poll_step` now lets every live
+/// connection progress between requests; this function is still the client-driven transaction.)
 ///
 /// What is not blocked is driving the same state machine from inside a request, which is exactly how
 /// `udp_roundtrip` and `ping` already work and opens no window that is not already open. So this
@@ -1440,8 +1454,8 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
     t.tx_n = 0; t.tx_log = [0u8; 24];
     let i = match t.connect(ctx, 1, dst, dport, net.peer_mac) { Some(i) => i, None => return Err(tcp::Fault::None) };
 
-    // The opening SYN. Sent through the same path every other frame uses, and its reply may already
-    // carry the SYN-ACK - nic-driver answers a TX with whatever it has received.
+    // The opening SYN. Sent through the same path every other frame uses; the SYN-ACK comes back
+    // through the drain below, since nic-driver answers a TX with one status byte and no frame.
     let n = t.syn_frame(ctx, net, i, &mut frame);
     if n > 0 {
         t.stat_sent = t.stat_sent.saturating_add(1);
@@ -1492,9 +1506,9 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
         // once the wire really has nothing.
         if empty > 0 {
             if empty <= EMPTY_YIELDS {
-                ctx.yield_cpu();
+                gs::task::yield_now(ctx);
             } else {
-                ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+                gs::task::sleep_ms(ctx, RX_POLL_PACE_MS);
             }
         }
 
@@ -1559,13 +1573,6 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
     true
 }
 
-/// Feed a DRAIN BATCH (op 9) into the state machine.
-///
-/// A drain reply is `[count, (len_u16_le, frame) x count]` - NOT a bare frame. Treating it as one is
-/// what made the first end-to-end run fail with the peer retransmitting its SYN-ACK six times while
-/// this stack sat in SynSent: the segment arrived every time and was parsed as garbage every time.
-/// The pcap is what made that readable, because the guest's own log could only say "nothing came".
-/// The batch shape is `drain_scan`'s, and it is read the same way here rather than re-derived.
 /// How often the serve loop wakes to answer for itself when no client is asking.
 ///
 /// A hundred milliseconds. The things it has to be quick enough for are an ARP request (a peer
@@ -1591,8 +1598,8 @@ const POLL_TX_MS: u64 = 200;
 /// The whole poll step's budget. Checked between frames, so the step stops issuing new work once it
 /// is spent rather than running to completion however long that takes.
 ///
-/// Half a second: long enough for a few frames on a slow driver, and a tenth of the five seconds a
-/// client waits before it gives up. The failure this exists to prevent is a poll outlasting the
+/// A quarter of a second (it was half a second; see the budget ordering below): long enough for a few
+/// frames on a slow driver, and well inside any client's deadline. The failure this exists to prevent is a poll outlasting the
 /// request it is keeping waiting.
 const POLL_BUDGET_MS: u64 = 250;
 
@@ -1640,8 +1647,8 @@ const _: () = assert!(POLL_BUDGET_MS < HOLD_MS,
 
 /// One bounded pass of work nobody asked for: drain the NIC once and answer for ourselves.
 ///
-/// **This is the tick that was reverted, and it is only safe to bring back now.** The revert note in
-/// this file says why it went: net-stack serves clients and receives driver replies on one endpoint,
+/// **This is the tick that was reverted, and it is only safe to bring back now.** The revert note at
+/// the top of the serve loop says why it went: net-stack serves clients and receives driver replies on one endpoint,
 /// so anything that talked to the driver unasked stole client messages, and a once-a-second tick
 /// turned a latent race into a permanent one. `docs/net-tags-design.md` set the precondition in
 /// capitals - do not add a tick before the correlation is fixed. Phase 2 (sifting) and phase 3 (the
@@ -1660,9 +1667,9 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
              t: &mut tcp::Tcp, net: &tcp::Net, asks: &mut UdpAsks) -> bool {
     // THE BUDGET. Everything below checks it before issuing more driver work, so this step cannot
     // outlast its own interval and starve the client the service exists to answer.
-    let t0 = ctx.read_tsc();
-    let budget = ctx.duration_cycles(POLL_BUDGET_MS);
-    let spent = |ctx: &ServiceContext| ctx.read_tsc().wrapping_sub(t0) >= budget;
+    let t0 = gs::driver::wait::ticks(ctx);
+    let budget = ticks_ms(ctx, POLL_BUDGET_MS);
+    let spent = |ctx: &ServiceContext| gs::driver::wait::ticks(ctx).wrapping_sub(t0) >= budget;
 
     let batch = nic_drain_ms(ctx, pending, POLL_TX_MS);
     let m = match batch { Some(m) => m, None => return false };
@@ -1734,7 +1741,7 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
         if c.rid != 0 && c.state == tcp::State::Closed && c.readable() == 0 {
             let rid = c.rid;
             t.forget(rid);
-            let _ = ctx.resource_revoke(rid);
+            let _ = gs::resource::revoke(ctx, rid);
             ctx.log("net-stack: a finished connection was reaped and its slot released");
         }
     }
@@ -1765,6 +1772,13 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     any
 }
 
+/// Feed a DRAIN BATCH (op 9) into the state machine.
+///
+/// A drain reply is `[count, (len_u16_le, frame) x count]` - NOT a bare frame. Treating it as one is
+/// what made the first end-to-end run fail with the peer retransmitting its SYN-ACK six times while
+/// this stack sat in SynSent: the segment arrived every time and was parsed as garbage every time.
+/// The pcap is what made that readable, because the guest's own log could only say "nothing came".
+/// The batch shape is `drain_scan`'s, and it is read the same way here rather than re-derived.
 #[inline(never)]
 fn feed_batch(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
     let m = match reply { Some(m) => m, None => return false };
@@ -1784,8 +1798,9 @@ fn feed_batch(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
     any
 }
 
-/// Feed the reply to a TRANSMISSION, which carries at most one raw frame (the shape
-/// `udp_roundtrip` already relies on).
+/// Feed the reply to a TRANSMISSION into the state machine. (Note 2026-10-09: that reply carried at
+/// most one raw frame when this was written; `nic-driver` now answers a transmit with one status byte,
+/// so this feeds nothing - a frame arrives only through the drain, `feed_batch`.)
 #[inline(never)]
 fn feed_tx(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
     match reply {
@@ -1862,7 +1877,7 @@ impl UdpAsks {
     /// A source port no open ask is using, chosen at random in 50000..59999 (sockets use 40000 + n).
     fn pick_port(&self, ctx: &ServiceContext) -> u16 {
         loop {
-            let r = ctx.hw_random().unwrap_or(ctx.read_tsc() as u32);
+            let r = ctx.hw_random().unwrap_or(gs::driver::wait::ticks(ctx) as u32);
             let p = 50_000 + (r % 10_000) as u16;
             if !self.slots.iter().flatten().any(|a| a.src_port == p) { return p; }
         }
@@ -1890,7 +1905,7 @@ impl UdpAsks {
 
     /// Tell every asker whose deadline has passed that no reply came. Run on every serve pass.
     fn expire(&mut self, ctx: &ServiceContext) {
-        let now = ctx.epoch_secs_monotonic();
+        let now = gs::task::epoch_secs_monotonic(ctx);
         for s in self.slots.iter_mut() {
             if matches!(s, Some(a) if now >= a.until_secs) {
                 if let Some(a) = s.take() {
@@ -1918,15 +1933,6 @@ impl UdpAsks {
     }
 }
 
-/// Send an ICMP echo request to `dest_ip` (via the gateway's MAC) and return true if the matching echo
-/// REPLY comes back. Used to probe the gateway (LAN) and a public IP (internet reachability through NAT).
-/// If `f` is an inbound ARP REQUEST for `our_ip`, build the matching ARP REPLY into `out` and return
-/// true. net-stack MUST answer these: once the gateway's ARP entry for us (the OUR_MAC we advertise)
-/// ages out it re-ARPs before it can address our UNICAST replies - stay silent and it only ever reaches
-/// us with broadcasts, so the echo/DNS reply never arrives (exactly the T630 serve-loop symptom: 20
-/// frames collected, all broadcast, no reply). This fires ONLY when someone is actively asking for us,
-/// so on QEMU (slirp already learned us from our own query) it emits nothing - which is why it is safe
-/// where a blind gratuitous ARP before every query was not.
 /// Turn an inbound ICMP ECHO REQUEST addressed to us into the echo REPLY. Returns its length, or 0
 /// if `f` is not an echo request for this machine.
 ///
@@ -1967,6 +1973,13 @@ fn build_icmp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8
     flen
 }
 
+/// If `f` is an inbound ARP REQUEST for `our_ip`, build the matching ARP REPLY into `out` and return
+/// true. net-stack MUST answer these: once the gateway's ARP entry for us (the MAC we advertise)
+/// ages out it re-ARPs before it can address our UNICAST replies - stay silent and it only ever reaches
+/// us with broadcasts, so the echo/DNS reply never arrives (exactly the T630 serve-loop symptom: 20
+/// frames collected, all broadcast, no reply). This fires ONLY when someone is actively asking for us,
+/// so on QEMU (slirp already learned us from our own query) it emits nothing - which is why it is safe
+/// where a blind gratuitous ARP before every query was not.
 fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8; 42]) -> bool {
     if f.len() < 42 { return false; }
     if f[12] != 0x08 || f[13] != 0x06 { return false; }              // not ARP
@@ -2087,7 +2100,7 @@ fn arp_resolve(ctx: &ServiceContext, pending: &mut Displaced, our_ip: &[u8; 4], 
 
 /// Calibrate the TSC frequency (Hz) against the RTC - the portable ground truth. The kernel's CPUID/PIT
 /// calibration yields 0 on the AMD T630 (CPUID has no usable leaf; the PIT channel-2 output bit misbehaves),
-/// but the RTC and `read_tsc` both work, so measure directly: align to a wall-clock second boundary, sample
+/// but the RTC and the counter (`gs::driver::wait::ticks`) both work, so measure directly: align to a wall-clock second boundary, sample
 /// the TSC, wait one more second, sample again - the delta is one second of TSC. Uses the DEGLITCHED epoch
 /// so a CMOS misread cannot shorten the window; returns 0 (RTT then shows 0) if the result is implausible.
 fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
@@ -2099,28 +2112,28 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
     // Both bailouts SAY SO rather than returning a bare 0, for the same reason the range rejection
     // below does: "the wall clock never advanced" and "the counter reads implausibly" are different
     // faults with different fixes, and both used to arrive at `ping` as the identical symptom.
-    let s0 = ctx.epoch_secs_monotonic();
+    let s0 = gs::task::epoch_secs_monotonic(ctx);
     let mut n = 0u64;
-    while ctx.epoch_secs_monotonic() == s0 {
-        ctx.yield_cpu(); n += 1;
+    while gs::task::epoch_secs_monotonic(ctx) == s0 {
+        gs::task::yield_now(ctx); n += 1;
         if n > SPIN_MAX {
             ctx.log("net-stack: TSC calibration ABANDONED - the wall clock never advanced past its \
                      first reading (it is frozen or unavailable). RTT will read 0.");
             return 0;
         }
     }
-    let t0 = ctx.read_tsc();
-    let s1 = ctx.epoch_secs_monotonic();
+    let t0 = gs::driver::wait::ticks(ctx);
+    let s1 = gs::task::epoch_secs_monotonic(ctx);
     n = 0;
-    while ctx.epoch_secs_monotonic() == s1 {
-        ctx.yield_cpu(); n += 1;
+    while gs::task::epoch_secs_monotonic(ctx) == s1 {
+        gs::task::yield_now(ctx); n += 1;
         if n > SPIN_MAX {
             ctx.log("net-stack: TSC calibration ABANDONED - the wall clock advanced once and then \
                      stopped. RTT will read 0.");
             return 0;
         }
     }
-    let hz = ctx.read_tsc().wrapping_sub(t0);
+    let hz = gs::driver::wait::ticks(ctx).wrapping_sub(t0);
     // The floor is PER-ARCH, not one range widened to cover both. The ARM generic timer advances ~1 MHz
     // (the old 100 MHz floor rejected it, returning 0 -> the ping poll window `tsc_hz/3` collapsed to ~0
     // cycles and ping only caught a reply inside the initial drain - the ~50% "random" loss, RTT 0). But
@@ -2180,9 +2193,9 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
 /// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
 /// `Some((rtt_us, reply_ttl))` on an echo reply, `None` on timeout. The round trip is timed with the TSC
 /// and converted to microseconds via `tsc_hz` (RTC-calibrated; 0 -> reported as 0).
-/// Sends ONCE (the reply arrives with it), then, if the first frame back was a stray broadcast, drains a
-/// BATCH of frames in ONE bounded [9] round-trip and scans it - so a reply behind broadcasts on a busy
-/// LAN is caught without N slow re-queries (which pushed net-stack past the shell's deadline).
+/// Sends ONCE, then drains BATCHES of frames ([9]) and scans each until the reply window closes - so a
+/// reply behind broadcasts on a busy LAN is caught without N slow re-queries (which pushed net-stack past
+/// the shell's deadline).
 fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6], dest_ip: &[u8; 4],
         payload_len: usize, seq: u16, tsc_hz: u64, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
     let plen = payload_len.min(PING_MAX_PAYLOAD);
@@ -2210,7 +2223,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
     let icmp_ck = checksum(&frame[34..42 + plen]);
     frame[36] = (icmp_ck >> 8) as u8; frame[37] = icmp_ck as u8;
 
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let req = Message::from_bytes(&frame[..flen]);
     let mut arp_out = [0u8; 42];
 
@@ -2235,7 +2248,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
     // us = cycles * 1e6 / tsc_hz (RTC-calibrated; the kernel's CPUID/PIT calib yields 0 on the AMD T630).
     // Finer than ms so a sub-ms LAN RTT is distinguishable from a WAN one; capped at 65 ms (u16).
     let rtt_us = || -> u16 {
-        let dt = ctx.read_tsc().wrapping_sub(t1);
+        let dt = gs::driver::wait::ticks(ctx).wrapping_sub(t1);
         if tsc_hz > 0 { (dt.saturating_mul(1_000_000) / tsc_hz).min(65535) as u16 } else { 0 }
     };
 
@@ -2248,7 +2261,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
     //    ([9]) each round and scanning it. The reply for a WAN host arrives tens of ms AFTER the echo -
     //    AFTER a single drain - so the old ONE-drain code raced the reply and lost, then discarded the
     //    late reply on the next seq (frames were being RETRIEVED, the ping still timed out). The window
-    //    is bounded by read_tsc (tsc_hz-calibrated), a real sub-second wait, so a fast reply returns at
+    //    is bounded by the counter (tsc_hz-calibrated), a real sub-second wait, so a fast reply returns at
     //    once and a lost one gives up quickly - not the 1 s-granular epoch clock. Batch = [count:u8]
     //    then [len:u16 LE, bytes] per frame; nic-driver stays pure mechanism, the ICMP match lives here.
     // ~900 ms, NOT ~330 ms. The window must cover the worst case of the DELIVERY path, not of the
@@ -2275,7 +2288,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
     // calibrated the FIRST ping of every boot got a one-drain window and declared the host dead. The
     // Pi 4 shows exactly that: `tsc_hz 0`, `budget 0 us`, closed after 0 us. A coarse bound is worse
     // than a fine one and far better than none.
-    let coarse_t0 = ctx.epoch_secs_monotonic();
+    let coarse_t0 = gs::task::epoch_secs_monotonic(ctx);
     let mut drains: u32 = 0;
     // WHO IS ASKING FOR US, AND WHAT ACTUALLY ARRIVES ADDRESSED TO US.
     //
@@ -2299,7 +2312,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
     // actually cost - if those disagree, the bound is not the number this code believes it is.
     let mut drain_reported = false;
     loop {
-        let d_t0 = ctx.read_tsc();
+        let d_t0 = gs::driver::wait::ticks(ctx);
         let d_msg = nic_drain_ms(ctx, pending, DRAIN_SLICE_MS);
         if let Some(b) = d_msg {
             let p = b.payload_bytes();
@@ -2345,7 +2358,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
         // time. First pass only, and only when it overran, so a healthy window prints nothing.
         if !drain_reported {
             drain_reported = true;
-            let pass = ctx.read_tsc().wrapping_sub(d_t0);
+            let pass = gs::driver::wait::ticks(ctx).wrapping_sub(d_t0);
             if tsc_hz > 0 && deadline_cycles > 0 && pass > deadline_cycles / 2 {
                 ctx.log_fmt(format_args!(
                     "net-stack: ping pass #1 took {} us of a {} us window - the window is being spent before the reply can arrive",
@@ -2354,9 +2367,9 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
             }
         }
         let window_closed = if deadline_cycles == 0 {
-            ctx.epoch_secs_monotonic().saturating_sub(coarse_t0) >= 1
+            gs::task::epoch_secs_monotonic(ctx).saturating_sub(coarse_t0) >= 1
         } else {
-            ctx.read_tsc().wrapping_sub(t1) >= deadline_cycles
+            gs::driver::wait::ticks(ctx).wrapping_sub(t1) >= deadline_cycles
         };
         if window_closed {
             // SAY HOW THE WINDOW WAS SPENT. A timeout here is indistinguishable, from the outside, from
@@ -2365,7 +2378,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
             // ~1.9 s, so the window is not lasting 900 ms. Guessing why has been wrong three times; this
             // prints the three numbers that settle it - how long we actually waited, how many times we
             // asked, and how many frames we saw while asking.
-            let spent = ctx.read_tsc().wrapping_sub(t1);
+            let spent = gs::driver::wait::ticks(ctx).wrapping_sub(t1);
             let us = if tsc_hz > 0 { spent.saturating_mul(1_000_000) / tsc_hz } else { 0 };
             ctx.log_fmt(format_args!(
                 "net-stack: ping window closed after {} us ({} drains, {} frames seen, {} to-our-mac, {} arp-for-us, {} nic timeouts) [budget {} us, deadline {} cycles, tsc_hz {}]",
@@ -2388,7 +2401,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
         //
         // `sleep` parks the task, so the core is free for the driver mid-fetch. 10 ms is one quantum:
         // fast enough that a reply is picked up promptly, slow enough to leave the driver alone.
-        ctx.sleep(ctx.duration_cycles(RX_POLL_PACE_MS));
+        gs::task::sleep_ms(ctx, RX_POLL_PACE_MS);
     }
 }
 
@@ -2513,23 +2526,18 @@ fn run_dance(ctx: &ServiceContext, pending: &mut Displaced, serve_status: Option
     NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status }
 }
 
-/// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
-/// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
-/// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
-
-
 /// Announce a cable coming or going on the CONSOLE, the way the USB drivers announce a keyboard or a
 /// stick. Same idea, same place on screen, so "something was plugged in" reads the same whatever it was.
 ///
-/// Uses `console_write` only, NOT `console_push`. That distinction is the whole security story here:
-/// `console_write` is gated on LOG_WRITE, which this service already holds, while `console_push`
+/// Uses `gs::io::print` (ConsoleWrite) only, NOT `console_push`. That distinction is the whole security
+/// story here: ConsoleWrite is gated on LOG_WRITE, which this service already holds, while `console_push`
 /// injects into the shell's INPUT ring and puts its holder inside the shell's trust perimeter (§6.4,
 /// SEC-2 - keystrokes are commands). A network service has no business holding that, so the newline
 /// goes inside the written string instead of being pushed. No new authority for a cosmetic feature.
 fn link_notify(ctx: &ServiceContext, msg: &str) {
-    ctx.console_write("
+    gs::io::print(ctx, "
  NET: ");
-    ctx.console_write(msg);
+    gs::io::print(ctx, msg);
     // Just the fact, and NOTHING about what to do next.
     //
     // This printed "(press Enter to return to the prompt)" for one build. It is wrong whenever the
@@ -2540,39 +2548,10 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
     // That is the SAME mistake as the redraw it replaced, in cheaper clothing. Both assume knowledge
     // of another service's state that this one does not have. The only honest thing to print is what
     // we actually know - the cable moved - so that is all we print.
-    ctx.console_write("
+    gs::io::print(ctx, "
 ");
 }
 
-/// Ask `nic-driver` for waiting frames, and PACE AN EMPTY ANSWER.
-///
-/// Three drain loops asked for frames as fast as the replies came back - one IPC round trip per
-/// iteration, tens of thousands inside a ~900 ms ping window. That fills the driver's 16-deep queue
-/// and costs both services a large slice of the core they share with `fs` and `block-driver`.
-/// Observed on hardware as `nic-driver` at 50% with a full queue, which is what a flood looks like
-/// from the receiving end. The user saw it in `observe` before any test did.
-///
-/// Only the EMPTY case pauses. A drain that returned frames goes straight back for more, so a busy
-/// link is never slowed and a measured RTT is unaffected beyond the last idle millisecond. The
-/// request rate falls from tens of thousands per window to about nine hundred.
-///
-/// RECORDED AS A COMPROMISE, not presented as the answer (26.7, Commandment VIII): a frame arriving
-/// is truth and a millisecond is not. The honest fix is for `nic-driver` to notify on RX so this can
-/// BLOCK instead of ask, which needs a protocol addition and is real work rather than a constant.
-/// Living in one helper means that change lands in one place, and that a fourth drain loop cannot
-/// quietly reintroduce the flood.
-/// `nic_drain`, bounded in MILLISECONDS so it can fit inside a sub-second window.
-///
-/// The ping window is ~900 ms and cycle-based; this call was bounded by `LINK_SECS = 1` on the
-/// WHOLE-SECOND clock, so ONE drain could outlast the entire window. It did: the Pi 4 reported
-/// `closed after 1017663 us [budget 900000 us]` with `0 drains` - that counter increments after the
-/// deadline check, so zero means the loop completed exactly one pass and that pass ate the budget.
-/// Ping paces at 1 s, so a window running 1.018 s misses about every third reply, which reads as a
-/// flaky network and is arithmetic.
-///
-/// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
-/// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
-/// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
 /// A frame request bounded in MILLISECONDS, for work this service does unasked.
 ///
 /// `nic_req` waits `LINK_SECS` (one second) and retries, so a single call can hold this service for
@@ -2586,27 +2565,51 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
 /// connection that was working perfectly. Bounded in work is not bounded in time (§26.6).
 fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: u64) -> Option<Message> {
     ctx.request_with_reply_ms_sifted("nic-driver", msg, ms, |m| {
-        let badge = ctx.last_recv_badge();
-        match ctx.take_pending_cap() {
+        let badge = gs::resource::last_badge(ctx);
+        match gs::ipc::take_sent_cap(ctx) {
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
             None => true,
         }
     })
 }
 
+/// `nic_drain`, bounded in MILLISECONDS so it can fit inside a sub-second window.
+///
+/// The ping window is ~900 ms and cycle-based; this call was bounded by `LINK_SECS = 1` on the
+/// WHOLE-SECOND clock, so ONE drain could outlast the entire window. It did: the Pi 4 reported
+/// `closed after 1017663 us [budget 900000 us]` with `0 drains` - that counter increments after the
+/// deadline check, so zero means the loop completed exactly one pass and that pass ate the budget.
+/// Ping paces at 1 s, so a window running 1.018 s misses about every third reply, which reads as a
+/// flaky network and is arithmetic.
+///
+/// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
+/// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
+/// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
 fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Option<Message> {
     // SIFTED, like every other conversation with the driver. This was the last unsifted one, and it
     // is on the ping and TCP paths - the busiest moment in this service, and so the likeliest moment
     // for a client to speak into a wait that would have swallowed it.
     ctx.request_with_reply_ms_sifted("nic-driver", &Message::from_bytes(&[9u8]), ms, |m| {
-        let badge = ctx.last_recv_badge();
-        match ctx.take_pending_cap() {
+        let badge = gs::resource::last_badge(ctx);
+        match gs::ipc::take_sent_cap(ctx) {
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
             None => true,
         }
     })
 }
 
+/// Ask `nic-driver` for waiting frames (op 9). The PACING of an empty answer is the caller's.
+///
+/// Three drain loops once asked for frames as fast as the replies came back - one IPC round trip per
+/// iteration, tens of thousands inside a ~900 ms ping window. That fills the driver's 16-deep queue
+/// and costs both services a large slice of the core they share with `fs` and `block-driver`.
+/// Observed on hardware as `nic-driver` at 50% with a full queue, which is what a flood looks like
+/// from the receiving end. The user saw it in `observe` before any test did. This helper slept on an
+/// empty answer then; each drain loop now paces its own empty polls instead (see the note below).
+///
+/// RECORDED AS A COMPROMISE, not presented as the answer (26.7, Commandment VIII): a frame arriving
+/// is truth and a millisecond is not. The honest fix is for `nic-driver` to notify on RX so this can
+/// BLOCK instead of ask, which needs a protocol addition and is real work rather than a constant.
 fn nic_drain(ctx: &ServiceContext, pending: &mut Displaced) -> Option<Message> {
     let r = nic_req(ctx, pending, &Message::from_bytes(&[9u8]), LINK_SECS);
     let empty = match r.as_ref() {
@@ -2618,6 +2621,10 @@ fn nic_drain(ctx: &ServiceContext, pending: &mut Displaced) -> Option<Message> {
     // outstanding every millisecond not spent asking is a millisecond of frames its FIFO drops.
     r
 }
+
+/// Read the NIC link state from nic-driver's `[3]` status: byte 7 = link up. Every backend answers at
+/// least eight bytes now; a shorter non-empty reply is still read as "up". Cheap; lets net-stack notice
+/// a cable plugged in after boot and self-configure without `net renew`.
 fn link_is_up(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
     match nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
@@ -2638,7 +2645,8 @@ fn link_is_up(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
 }
 
 /// The link's state, address and carrier from one status query: `(up, mac, radio)`, `radio` true when
-/// the Pi 4's genet backend says the radio carries the link. `None` is a timeout or an unreadable
+/// a backend with a radio bridge (`radio::status` in nic-driver - GENET, dwmac, the RTL8168 and the
+/// Pi 2's) says the radio carries the link. `None` is a timeout or an unreadable
 /// answer, not a reading - the caller must not act on it.
 fn link_addr(ctx: &ServiceContext, pending: &mut Displaced) -> Option<(bool, [u8; 6], bool)> {
     let r = nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS)?;
@@ -2675,7 +2683,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("net-stack");
+    gs::trace::as_name(&ctx, "net-stack");
     // Force the EL0 fault the kernel's recovery path must survive (this crate's `el0-fault-test`
     // feature). The kernel must KILL this task and keep running, and the supervisor must restart it.
     // If the machine stops here instead, the recovery is broken and the last log line names the task.
@@ -2742,7 +2750,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // ONE calibration, shared: TCP's clock and ping's RTT and window both read it (see `tsc_hz` below).
     let boot_tsc_hz = calibrate_tsc_hz(&ctx);
-    let mut tcpst = tcp::Tcp::new(boot_tsc_hz, ctx.read_tsc());
+    let mut tcpst = tcp::Tcp::new(boot_tsc_hz, gs::driver::wait::ticks(&ctx));
     tcpst.warn_if_no_clock(&ctx);
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
@@ -2762,6 +2770,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // dance the moment a cable appears, so a machine booted unplugged configures itself on plug-in
     // rather than needing `net renew` or a reboot. Cheap too - one status query to the NIC, seconds
     // saved on every diskless-network boot.
+    // (Superseded by the paragraph after this one - the boot dance is back, and serves while it runs.)
     // SERVE FIRST, CONFIGURE FROM INSIDE THE LOOP. This used to run the whole DHCP -> ARP -> ICMP
     // dance HERE, before the serve loop existed - so on a machine whose link is up but whose DHCP
     // server never answers, net-stack was DEAF for the ~45 s its budgets take. Nothing could reach it:
@@ -2856,7 +2865,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // request into the stash - `pending.take()` at the top of this loop is the only thing that
     // drains it. See the `has_work` call site.
     'serve: loop {
-        // A BARE BLOCK, deliberately - the idle tick that was here is REVERTED (audit A10-1/A5-2).
+        // THE IDLE TICK THAT WAS HERE WAS REVERTED (audit A10-1/A5-2). (Note 2026-10-09: it came back
+        // as `poll_step`, driven from the wait below, once the correlation this note asks for was in -
+        // see `poll_step`'s doc. What follows is why it went.)
         //
         // The tick called `link_is_up()` every second to announce a cable, and that goes through
         // `nic_req` -> a wait loop that `try_recv`s THIS SAME serve endpoint and returns whatever
@@ -2904,7 +2915,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // UNCONFIGURED. With no address of our own there is nothing on the wire that is ours
                 // to answer, so blocking is both correct and free.
                 //
-                // NO CALIBRATED CLOCK. `duration_cycles` floors to ONE QUANTUM when the counter is
+                // NO CALIBRATED CLOCK. `ticks_ms` floors to ONE QUANTUM when the counter is
                 // uncalibrated (`backlog/27`), so a bounded wait silently becomes a spin and this
                 // loop would ask the driver for frames as fast as it can be scheduled - saturating
                 // `nic-driver` and, behind it, the USB stack. That is the silent-clock trap the
@@ -2926,13 +2937,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Measured on a Dell Wyse, where the SAME command took 0.49 s, 4.8 s and 20 s to
                     // reach dispatch on one boot (backlog/29). Reported rather than counted silently,
                     // and only when it is genuinely slow, so a healthy service still prints nothing.
-                    let now_pass = ctx.read_tsc();
+                    let now_pass = gs::driver::wait::ticks(&ctx);
                     if last_pass != 0 {
                         let gap = now_pass.wrapping_sub(last_pass);
-                        if gap >= ctx.duration_cycles(SLOW_PASS_MS) {
+                        if gap >= ticks_ms(&ctx, SLOW_PASS_MS) {
                             slow_passes = slow_passes.saturating_add(1);
                             // BOUNDED BY RATE. Unbounded, this is one line per pass on any board
-                            // where `duration_cycles` under-reports - an uncalibrated counter floors
+                            // where `ticks_ms` under-reports - an uncalibrated counter floors
                             // to a quantum (`backlog/27`), which would make every pass look slow and
                             // bury the console in its own report. The same shape as the drop reports,
                             // and for the same reason: never a latch (which hides the twentieth
@@ -2940,7 +2951,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             if slow_passes <= 8 || slow_passes % 8 == 0 {
                             ctx.log_fmt(format_args!(
                                 "net-stack: a serve pass took {} ms (over {}) - not asking for client requests during it (slow pass #{})",
-                                gap / ctx.duration_cycles(1).max(1), SLOW_PASS_MS, slow_passes));
+                                gap / ticks_ms(&ctx, 1), SLOW_PASS_MS, slow_passes));
                             }
                         }
                     }
@@ -2952,8 +2963,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // ms ... not asking for client requests during it" - while it was blocked doing
                         // exactly that (VisionFive, 2026-10-04). The clock restarts when the wait ends,
                         // so the gap is the serving, which is what the line claims to measure.
-                        let m = ctx.recv();
-                        last_pass = ctx.read_tsc();
+                        let m = gs::ipc::recv(&ctx);
+                        last_pass = gs::driver::wait::ticks(&ctx);
                         break m;
                     }
                     // ---- THE POLL IS A PERIODIC OBLIGATION, NOT AN IDLE-TIME FILLER ----
@@ -2961,7 +2972,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Checked BEFORE the wait, and on every pass, so it happens at least every
                     // `POLL_MS` no matter how busy this service is.
                     //
-                    // **It used to run only when `recv_timeout` EXPIRED, and hardware found what
+                    // **It used to run only when the timed receive EXPIRED, and hardware found what
                     // that costs.** `serve` polls accept about ten times a second, which is roughly
                     // the poll interval - so the timeout almost never fired, the poll almost never
                     // ran, and the machine stopped answering ARP while it was waiting to be
@@ -2977,8 +2988,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Any work owed on a schedule has to be driven by the schedule. Gating it on the
                     // service being idle means the busier it gets, the less it keeps its promises -
                     // which is exactly backwards.
-                    if ctx.read_tsc().wrapping_sub(last_poll) >= ctx.duration_cycles(POLL_MS) {
-                        last_poll = ctx.read_tsc();
+                    if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= ticks_ms(&ctx, POLL_MS) {
+                        last_poll = gs::driver::wait::ticks(&ctx);
                         let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased,
                                             dns_server, status };
                         // The gateway is the FALLBACK address for anything this poll originates;
@@ -2993,7 +3004,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // in QEMU, an NTP query nobody answered got its "no reply" eight seconds late, after
                     // `time` had already given up on it (2026-10-02).
                     asks.expire(&ctx);
-                    if let Some(m) = ctx.recv_timeout(ctx.duration_cycles(POLL_MS)) { break m; }
+                    if let Some(m) = gs::ipc::recv_within_ms(&ctx, POLL_MS) { break m; }
                     // ---- DO NOT SLEEP ON WORK WE ALREADY HAVE ----
                     //
                     // The poll step just ran, and `nic_req`'s sifting displaces any client request
@@ -3015,8 +3026,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 };
                 // A nonzero badge = a SOCKET-CAPABILITY invocation the kernel validated (§7.10). A plain
                 // name-addressed request (status / DNS / open-socket) carries no badge.
-                let badge = ctx.last_recv_badge();
-                let reply_cap = match ctx.take_pending_cap() {
+                let badge = gs::resource::last_badge(&ctx);
+                let reply_cap = match gs::ipc::take_sent_cap(&ctx) {
                     Some(c) => c,
                     // A request with no reply cap cannot be answered - but dropping it SILENTLY means the
                     // client waits out its deadline and calls net-stack unresponsive while our log shows a
@@ -3133,10 +3144,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             && !leased
             && gw_known
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6))
-            && ctx.epoch_secs_monotonic() - last_redhcp_at >= RESYNC_SECS
+            && gs::task::epoch_secs_monotonic(&ctx) - last_redhcp_at >= RESYNC_SECS
             && link_is_up(&ctx, pending)
         {
-            last_redhcp_at = ctx.epoch_secs_monotonic();
+            last_redhcp_at = gs::task::epoch_secs_monotonic(&ctx);
             ctx.log("net-stack: running on the fallback address without a lease - retrying DHCP");
             let d = run_dance(&ctx, pending, Some(&status));
             asks.abandon(&ctx);
@@ -3168,10 +3179,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // unspaced re-dance in a steady state is a blocking storm that starves every other request.
         if badge.is_none() && !leased && !gw_known
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&12))
-            && ctx.epoch_secs_monotonic() - last_redhcp_at >= RESYNC_SECS
+            && gs::task::epoch_secs_monotonic(&ctx) - last_redhcp_at >= RESYNC_SECS
             && link_is_up(&ctx, pending)
         {
-            last_redhcp_at = ctx.epoch_secs_monotonic();
+            last_redhcp_at = gs::task::epoch_secs_monotonic(&ctx);
             // No settle here. One was added on the theory that a hot-plugged PHY needed time to
             // negotiate before DHCP, and the measurement disproved it: the failure was ZERO frames
             // arriving, because nic-driver only programmed MAC speed and DMA burst during `bring_up`
@@ -3212,9 +3223,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // stack, and a radio does.
         if badge.is_none() && our_mac != [0u8; 6]
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&12))
-            && ctx.epoch_secs_monotonic() - last_addr_check_at >= ADDR_CHECK_SECS
+            && gs::task::epoch_secs_monotonic(&ctx) - last_addr_check_at >= ADDR_CHECK_SECS
         {
-            last_addr_check_at = ctx.epoch_secs_monotonic();
+            last_addr_check_at = gs::task::epoch_secs_monotonic(&ctx);
             if let Some((true, mac, radio)) = link_addr(&ctx, pending) {
                 // A DIFFERENT ACCESS POINT IS A DIFFERENT LINK TOO, and our address cannot show it: the
                 // radio keeps its address when it rejoins somewhere else. Seen on a mesh where each
@@ -3256,10 +3267,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
         if badge.is_none() && leased && !gw_known
             && matches!(pl.first(), Some(&0) | Some(&1) | Some(&3) | Some(&6) | Some(&12))
-            && ctx.epoch_secs_monotonic() - last_gw_arp_at >= RESYNC_SECS
+            && gs::task::epoch_secs_monotonic(&ctx) - last_gw_arp_at >= RESYNC_SECS
             && link_is_up(&ctx, pending)
         {
-            last_gw_arp_at = ctx.epoch_secs_monotonic();
+            last_gw_arp_at = gs::task::epoch_secs_monotonic(&ctx);
             let gateway = [status[4], status[5], status[6], status[7]];
             ctx.log("net-stack: leased but the gateway never answered ARP - retrying the gateway only");
             if let Some(m) = arp_resolve(&ctx, pending, &our_ip, &our_mac, &gateway, None) {
@@ -3284,7 +3295,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // machine does on the wire.
                     let closed = right & RIGHT_WRITE != 0 && tcpst.unlisten(rid);
                     if closed {
-                        let _ = ctx.resource_revoke(rid);
+                        let _ = gs::resource::revoke(&ctx, rid);
                         ctx.log("net-stack: a listener was closed and its port released");
                     }
                     reply.send(&ctx, &[if closed { 1 } else { 0 }]);
@@ -3298,18 +3309,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // the connection is a thing the client HOLDS: closing it is a revoke, and a
                         // stale handle gets `CapRevoked` from the kernel rather than a wrong answer
                         // from us (§7.10, exactly as `fs` does for a file).
-                        if let Some((crid, cap)) = ctx.resource_mint(RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT) {
+                        if let Some((crid, cap)) = gs::resource::mint(&ctx, RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT).ok() {
                             tcpst.conns[i].rid = crid;
-                            granted = ctx.derive_cap(cap)
+                            granted = gs::cap::duplicate(&ctx, cap).ok()
                                 .map(|c| reply.send_with_cap(&ctx, c, &[1]))
                                 .unwrap_or(false);
-                            ctx.remove_cap(cap);
+                            gs::cap::remove(&ctx, cap);
                             if !granted {
                                 // The cap did not reach the client, so neither did the success
                                 // reply. Put the connection back to unclaimed rather than stranding
                                 // it owned by nobody, and tell the caller (§26.7).
                                 tcpst.conns[i].rid = 0;
-                                let _ = ctx.resource_revoke(crid);
+                                let _ = gs::resource::revoke(&ctx, crid);
                             }
                         }
                     }
@@ -3379,8 +3390,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     "net-stack: a capability invocation named resource {} which is not a listener,                      a connection or a socket here - answering empty", rid));
             }
 
-            // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
-            // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload (empty on none).
+            // Socket-cap invocation: transmit a UDP datagram through this socket. Payload =
+            // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload, or `[0]` on none.
             // Sending needs WRITE; the kernel already checked the cap holds `right`, we enforce op<=right.
             let mut resp = [0u8; 1500];
             let n = if right & RIGHT_WRITE != 0 && pl.len() >= 6 && gw_known {
@@ -3402,17 +3413,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // OPEN a UDP socket: mint a delegated socket cap (READ|WRITE) and GRANT it to the client -
             // the fs `open_file` pattern (§7.10). Reply carries [1] + the embedded cap on success.
             let slot = sockets.iter().position(|s| s.rid == 0);
-            let minted = slot.and_then(|sl| ctx.resource_mint(RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT).map(|m| (sl, m)));
+            let minted = slot.and_then(|sl| gs::resource::mint(&ctx, RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT).ok().map(|m| (sl, m)));
             match minted {
                 Some((sl, (rid, cap))) => {
                     sockets[sl] = Socket { rid, port: 40000 + sl as u16 };
-                    let granted = ctx.derive_cap(cap)
+                    let granted = gs::cap::duplicate(&ctx, cap).ok()
                         .map(|c| reply.send_with_cap(&ctx, c, &[1]))
                         .unwrap_or(false);
-                    ctx.remove_cap(cap);        // net-stack drops its own copy; the client holds it now
+                    gs::cap::remove(&ctx, cap);        // net-stack drops its own copy; the client holds it now
                     if !granted {
                         sockets[sl].rid = 0;
-                        let _ = ctx.resource_revoke(rid);
+                        let _ = gs::resource::revoke(&ctx, rid);
                         // The cap did not reach the client, so the success reply above didn't either.
                         // Tell the caller loudly (audit U10) instead of leaving it blocked on a reply
                         // that will never come (inv12 / VIII). A failed [0] send is fine - the caller's
@@ -3433,18 +3444,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let ok = pl.len() >= 3 && gw_known;
             let port = if ok { ((pl[1] as u16) << 8) | pl[2] as u16 } else { 0 };
             let minted = if ok && port != 0 {
-                ctx.resource_mint(RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT)
+                gs::resource::mint(&ctx, RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT).ok()
             } else { None };
             let mut granted = false;
             if let Some((rid, cap)) = minted {
                 if tcpst.listen(port, rid) {
-                    granted = ctx.derive_cap(cap)
+                    granted = gs::cap::duplicate(&ctx, cap).ok()
                         .map(|c| reply.send_with_cap(&ctx, c, &[1]))
                         .unwrap_or(false);
                     if !granted { tcpst.unlisten(rid); }
                 }
-                ctx.remove_cap(cap);
-                if !granted { let _ = ctx.resource_revoke(rid); }
+                gs::cap::remove(&ctx, cap);
+                if !granted { let _ = gs::resource::revoke(&ctx, rid); }
             }
             if granted {
                 ctx.log_fmt(format_args!("net-stack: listening on TCP port {}", port));
@@ -3467,7 +3478,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // Driven inside the request, not from a background poll, because
             // `docs/net-tags-design.md` forbids unsolicited driver traffic until its phase 2/3 land.
-            // That is the next step and it is recorded, not smuggled in here.
+            // That is the next step and it is recorded, not smuggled in here. (Note 2026-10-09: both
+            // phases have landed and `poll_step` drives live connections between requests; this op is
+            // still the one-shot transaction.)
             // 3 KiB, not 1.4 KiB: a reply that fits in ONE segment never exercises the receive
             // path's reassembly, window updates or ACK-driven advancement. The Message ceiling is
             // 4 KiB (§8.5), so this leaves headroom while guaranteeing more than one segment.
@@ -3626,7 +3639,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         } else if pl.first() == Some(&3) && pl.len() >= 5 {
             // Ping an IP (byte 0 = 3, then 4 IP bytes, then an OPTIONAL le-u16 payload size): ICMP echo,
             // no DNS. Runs HERE in the serve loop, so `ping <gateway>` proves the post-boot request path
-            // and `ping 8.8.8.8` probes the internet. Reply: [alive, rtt_ms(le u16), reply_ttl].
+            // and `ping 8.8.8.8` probes the internet. Reply: [alive, rtt_us(le u16), reply_ttl].
             let dip = [pl[1], pl[2], pl[3], pl[4]];
             let bytes = if pl.len() >= 7 { u16::from_le_bytes([pl[5], pl[6]]) as usize } else { 32 };
             // Check the link FIRST. With the cable out, an ICMP polls its FULL budget (~seconds) and the
@@ -3710,7 +3723,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     asks.slots[slot] = Some(UdpAsk {
                         src_port, dest_ip, dest_port,
                         reply: Reply { cap: reply.cap, tag: reply.tag },
-                        until_secs: ctx.epoch_secs_monotonic() + wait,
+                        until_secs: gs::task::epoch_secs_monotonic(&ctx) + wait,
                     });
                     continue;
                 }

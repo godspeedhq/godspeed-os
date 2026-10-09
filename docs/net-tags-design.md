@@ -449,7 +449,10 @@ is SEC-35 one channel over: the kernel has already installed the cap and queued 
 dropping the message leaves an entry that the next socket `open` reads as its own - the `fcap` bug.
 Fixed here. **Two more blind `while ctx.try_recv().is_some() {}` drains remain in the shell with the
 same hole**; they are on other paths and are left recorded rather than swept up in a networking
-change.
+change. *(2026-10-09: a search of the shell finds ONE blind drain left, `fc_invoke`'s
+`while gs::ipc::try_recv(ctx).is_some() {}` - spelled on `gs` since the shell moved onto the standard
+library. Its reply is tag-checked now, but a discarded message's embedded capability is still not
+reclaimed there, as `drain_stale_fs_replies` and `net_query` do.)*
 
 ---
 

@@ -197,9 +197,9 @@ fn log_idle_tick_config() {
 static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
 
 #[no_mangle]
-// Called from Limine assembly; safety is enforced by the bootloader contract,
-// not by Rust's type system. The function cannot be `unsafe fn` because Limine
-// requires a specific extern "C" signature.
+// NOTE: these two attributes were written for `kernel_main` below, but the `banner` doc comment and
+// fn now sit between them and it, so they apply to `banner`. `kernel_main` is reached as a Rust
+// path from x86's `_start` (`arch/x86_64/mod.rs`), not by symbol name, so it builds either way.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 /// Which image, and which MACHINE - the first thing every boot log says about itself.
 ///
@@ -293,12 +293,12 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // Hardening: unmap a guard page below each kernel-stack slot so an overflow
     // faults loudly instead of corrupting the neighbouring stack. Done here - BSP
     // only, before APs and before any kstack is allocated, so no TLB shootdown is
-    // needed and init's stack already carries its guard. (Safe fn - boot-ordering
+    // needed and the first stack handed out (the supervisor's) already carries its guard. (Safe fn - boot-ordering
     // contract, not UB; the page-unmap unsafe lives in the arch layer.)
     task::install_kstack_guards();
 
-    // Stage 1 of the USB stack: locate the xHCI controller (§12). Records its
-    // MMIO base + IRQ for a future userspace driver's hw_mmio/hw_interrupt caps.
+    // The kernel's PCI scan (§12): records the controllers it finds (xHCI, EHCI, AHCI, NIC, ...)
+    // so a driver's spawn request can name a device CLASS and be granted that device's window.
     arch::imp::pci::init();
 
     // EHCI INTx routing needs the IOAPIC mapped; map it now (CPU MMIO, AP-independent).
@@ -320,11 +320,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     //
     // Handoff is only needed for a controller we confine (otherwise firmware SMM
     // keeps running its DMA out of firmware memory, which faults under
-    // confinement). It is gated on the same master switch as confinement: with
-    // CONFINE_USB_DRIVERS off (the working daily-driver default) NO handoff runs,
-    // so firmware keeps co-owning both controllers exactly as before the H1 branch
-    // - the configuration in which both keyboards work. Flip the switch to
-    // re-enable the xHCI confinement flagship (hands off + confines xHCI only).
+    // confinement). It is gated on the same master switch as confinement,
+    // `task::CONFINE_USB_DRIVERS`, which is ON (xHCI handed off + confined, xHCI only).
+    // With it off, NO handoff runs and firmware keeps co-owning both controllers
+    // exactly as before the H1 branch.
     if task::CONFINE_USB_DRIVERS {
         arch::imp::pci::xhci_bios_handoff();
     }

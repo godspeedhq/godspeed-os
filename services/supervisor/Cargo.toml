@@ -8,11 +8,9 @@ name = "supervisor"
 path = "src/main.rs"
 
 [features]
-# Spawn only the 15 identity-test probe services; skip property/fuzz/stress/perf/
-# adversarial/chaos probes.  Used by `osdev test identity` to keep the supervisor
-# spawn loop under 10 s on TCG so WithRestart tests have plenty of deadline margin.
-# Spawn only pong + ping - no probe services at all.  Used by `osdev image`
-# (bare-metal USB) so core 0 is not loaded with harness-driven probes that
+# The daily-driver set (shell, block-driver, fs, the drivers this board has), settling at `gsh>`:
+# no ping/pong, no `observe` and no probe services at all - this build carries no probe image.
+# Used by `osdev image` (bare-metal USB) so core 0 is not loaded with harness-driven probes that
 # require the QEMU control port to complete (e.g. probe-4b, probe-hog).
 bare-metal = []
 blockdev = []
@@ -42,6 +40,9 @@ reply-test = []
 # to it wires at spawn (it grants the cap to holder). Kept OUT of the daily-driver image and identity
 # build so the example's per-boot mint/grant log lines are test-only noise.
 resource-test = []
+# Keep the 16 identity-test probe services (and pong/ping); skip property/fuzz/stress/perf/
+# adversarial/chaos probes, `observe` and the shell. Used by `osdev test identity` to keep the
+# supervisor spawn loop under 10 s on TCG so WithRestart tests have plenty of deadline margin.
 identity-only = []
 # Spawn only the regular performance-benchmark probe services (perf-b1…perf-b10
 # and their echo/victim partners).  Used by `osdev test perf` to eliminate the
@@ -54,7 +55,7 @@ perf-brutal-only = []
 # Spawn only the S1-S10 stress probe services (and pong/ping).
 # Used by `osdev image --mode stress` for a self-contained hardware stress run.
 stress-only = []
-# Spawn only the A1-A10 adversarial probe services (and pong/ping).
+# Spawn only the A1-A15 adversarial probe services (and pong/ping; A14/A15 are the adv-fault-* probes).
 # Used by `osdev image --mode adv` for a self-contained hardware adversarial run.
 adv-only = []
 # Spawn only the C2-C7 chaos probe services (and pong/ping).

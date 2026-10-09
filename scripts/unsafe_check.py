@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Verify every unsafe usage in kernel/src/ is accounted for in audits/unsafe-audit.md.
 
-Rules enforced:
-  - A file not in the audit that gains unsafe lines          -> FAIL
-  - A file whose unsafe count exceeds its audited baseline   -> FAIL
-  - A file whose unsafe count dropped below its baseline     -> INFO
+Rules enforced (a "line" is a line containing the word `unsafe` that does not START with `//`):
+  - kernel/src: a file not in the audit's inventory that has unsafe lines   -> FAIL
+  - kernel/src: a file whose unsafe count exceeds its audited baseline      -> FAIL
+  - kernel/src: a file whose unsafe count dropped below its baseline        -> INFO
     (safe to update the audit to lock in the reduction)
+  - an inventory row naming a file that no longer exists                    -> FAIL
+  - services/: any unsafe line at all                                       -> FAIL
+  - sdk/: unsafe outside SDK_PERMITTED (matched by FILE NAME) beyond the
+    SDK_GRANDFATHERED floor                                                 -> FAIL
+  - services/examples/osdev/stdlib/sdk/wifi: a crate root without
+    `#![deny(unsafe_code)]`, or an `#[allow(unsafe_code)]` not on `#[no_mangle]` -> FAIL
 
-Every FAIL means either a new unsafe block was added without a SAFETY comment
-and an audit entry, or an out-of-policy file grew its unsafe surface.
+What it does NOT check: whether a block carries a `// SAFETY:` comment (18.3 is enforced by review,
+not here), and the COUNT in the four SDK_PERMITTED files - those are exempt outright, so their rows in
+the audit's top table are not compared against the source.
 
 Exit: 0 if no failures, 1 if any.
 """

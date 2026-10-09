@@ -1,5 +1,6 @@
 # Service contract for `upper` - a pipe-stage FILTER (examples/upper). It runs in the middle of a
-# shell pipe (e.g. `echo hi | upper | write /f`). The kernel mints EXACTLY these capabilities at spawn.
+# shell pipe (e.g. `echo hi | upper | write /f`). A BUILD-TIME declaration: nothing parses TOML at
+# spawn (13.6); the kernel mints what the SPAWN REQUEST asks for, and this file states what that should be.
 name    = "upper"
 version = "0.1.0"
 
@@ -14,7 +15,7 @@ limit   = "64MiB"
 # lesson: it holds ZERO standing authority, and the SHELL brokers BOTH ends (Commandment VII). Its
 # INPUT arrives on its own endpoint, which the kernel name directory records under "upper" at spawn
 # (no self-registration); its OUTPUT goes over the SEND cap the shell delegates at spawn (send_peers[0],
-# via ctx.send_peer_at(0)). (`log_write` is a v1 default minted to every service; listed for clarity.)
+# via gs::ipc::peer_at(&ctx, 0)). (`log_write` is a v1 default minted to every service; listed for clarity.)
 # Full capability list: contracts/schema/service.schema.json + contracts/CLAUDE.md.
 log_write = true   # the only STATIC capability a pipe stage needs (both pipe ends are brokered by the shell)
 

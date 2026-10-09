@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Minimal PCI enumeration (§12) - Stage 1 of the USB stack.
+//! Minimal PCI enumeration and configuration (§12). It began as Stage 1 of the USB stack.
 //!
 //! Uses legacy PCI configuration mechanism #1 (port `0xCF8` address / `0xCFC`
-//! data) to scan the bus and locate the xHCI USB host controller. The
-//! discovered MMIO base and IRQ line are recorded so the kernel can later mint
-//! an `hw_mmio` + `hw_interrupt` capability for the userspace `xhci` driver
-//! service (§12.3) - the driver owns the controller; the kernel only routes its
-//! interrupt and grants register access.
+//! data) to scan the bus into a generic device table (class code, BARs, IRQ
+//! line - see "THE GENERIC DEVICE TABLE" below), from which the kernel mints a
+//! driver's MMIO and interrupt grants at spawn (§12.3). It also does the config
+//! work the kernel keeps: BIOS handoff, bus-master enable/clear, D0, MSI/MSI-X
+//! and INTx routing, and the gated `PciCfgRead`. The driver owns the controller;
+//! the kernel only routes its interrupt and grants register access.
 //!
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
 
@@ -51,17 +52,15 @@ const SUBCLASS_USB: u8 = 0x03;
 const PROGIF_XHCI: u8 = 0x30;
 const PROGIF_EHCI: u8 = 0x20;
 
-/// Discovered-xHCI record. Written once by `init` on the BSP during boot,
-/// read later when minting the driver's caps. Plain atomics: single writer at
-/// boot, no concurrent access.
 // ---------------------------------------------------------------------------
 // THE GENERIC DEVICE TABLE (step D1) - what is on the bus, with NO opinion about it.
 //
-// Every static below this block names a device CLASS the kernel was taught: XHCI_FOUND, EHCI_BDF,
-// NIC_BDF. That is what forces a KERNEL REBUILD to add a driver for a device nobody taught it about,
+// The per-class statics this replaced each named a device CLASS the kernel was taught: XHCI_FOUND,
+// EHCI_BDF, NIC_BDF (all gone now; `xhci()`, `ehci()` and `nic()` below look the table up by class
+// code). That is what forced a KERNEL REBUILD to add a driver for a device nobody taught it about,
 // and driver porting is the roadmap - so the kernel stops interpreting and starts reporting.
 //
-// The set is SHRINKING and this list is maintained with it: `AHCI_*` is gone (D3c), because
+// The set shrank one class at a time, and is now empty: `AHCI_*` went first (D3c), because
 // `block-driver` names the class code 0x010601 like any other device and nothing asked the kernel for
 // "the AHCI controller" any more. An example list that names a static which no longer exists is the
 // same defect as a counter nobody increments - it reads as fact and is not.
@@ -165,25 +164,6 @@ pub fn first_memory_bar(d: &PciDevice) -> u64 {
     d.bar.iter().copied().find(|&b| b != 0).unwrap_or(0)
 }
 
-/// The ethernet controller on this machine, from the generic table - `None` if there is none.
-///
-/// This replaces four per-class statics (`NIC_FOUND`, `NIC_MMIO_BASE`, `NIC_BDF`,
-/// `NIC_VENDOR_DEVICE`) that the boot scan filled in for the first device of class 0x020000 it saw.
-/// The facts are identical; where they LIVE is the point. A per-class static is the kernel having been
-/// taught that "NIC" is a thing it should hold a variable for, and adding a driver for a class nobody
-/// taught it about meant adding four more. A lookup by class code needs teaching nothing: 0x020000 is
-/// the device's own claim about what it is, and the table records claims.
-/// The xHCI controller on this machine, from the generic table - `None` if there is none.
-///
-/// Replaces `XHCI_FOUND`/`XHCI_MMIO_BASE`/`XHCI_IRQ`/`XHCI_BDF` and, with them, a four-entry array of
-/// every xHCI on the bus plus a picker that took index 0. The comment above that picker said what it
-/// was: "a general design would enumerate every controller + device and bind by class". This is that
-/// design, and it is one line, because `find_by_class` already returns the first match - the pick the
-/// array existed to make.
-///
-/// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
-/// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
-/// answers only "is there one, and what is it" when nobody said.
 /// The EHCI controller on this machine, from the generic table - `None` if there is none.
 ///
 /// Replaces `EHCI_FOUND`/`EHCI_MMIO_BASE`/`EHCI_IRQ`/`EHCI_BDF`. This one has more kernel-side callers
@@ -198,8 +178,27 @@ pub fn ehci() -> Option<PciDevice> { find_by_class(0x0C_03_20) }
 /// `HwClass::found` asked `cfg!(target_arch = "arm")` here before this existed.
 pub fn dwc2_present() -> bool { false }
 
+/// The xHCI controller on this machine, from the generic table - `None` if there is none.
+///
+/// Replaces `XHCI_FOUND`/`XHCI_MMIO_BASE`/`XHCI_IRQ`/`XHCI_BDF` and, with them, a four-entry array of
+/// every xHCI on the bus plus a picker that took index 0. The comment above that picker said what it
+/// was: "a general design would enumerate every controller + device and bind by class". This is that
+/// design, and it is one line, because `find_by_class` already returns the first match - the pick the
+/// array existed to make.
+///
+/// The kernel choosing WHICH of several controllers a driver gets is exactly the interpretation step D
+/// removes. Where there is more than one, the supervisor supplies a BDF and that wins (D3); this
+/// answers only "is there one, and what is it" when nobody said.
 pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
 
+/// The ethernet controller on this machine, from the generic table - `None` if there is none.
+///
+/// This replaces four per-class statics (`NIC_FOUND`, `NIC_MMIO_BASE`, `NIC_BDF`,
+/// `NIC_VENDOR_DEVICE`) that the boot scan filled in for the first device of class 0x020000 it saw.
+/// The facts are identical; where they LIVE is the point. A per-class static is the kernel having been
+/// taught that "NIC" is a thing it should hold a variable for, and adding a driver for a class nobody
+/// taught it about meant adding four more. A lookup by class code needs teaching nothing: 0x020000 is
+/// the device's own claim about what it is, and the table records claims.
 pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
 
 
@@ -210,10 +209,10 @@ const SUBCLASS_SATA: u8 = 0x06;
 const PROGIF_AHCI: u8 = 0x01;
 
 
-// Network controller (PCI class 0x02) - the NIC. Networking Phase 0 (docs/networking.md): identify
-// what NIC hardware is present so we know whether QEMU's e1000 and the T630's chipset share a driver.
-// The first NIC found is recorded for the future `nic-driver` to receive its MMIO BAR + IRQ at spawn,
-// exactly as `block-driver` gets the AHCI ABAR. No driver is bound yet - this is pure identification.
+// Network controller (PCI class 0x02) - the NIC. Networking Phase 0 (docs/networking.md) began as pure
+// identification; the userspace `nic-driver` now receives its MMIO BAR and IRQ at spawn from the
+// generic table (`nic()`), as `block-driver` gets the AHCI ABAR. (The AHCI constants above and
+// `PROGIF_EHCI` have no users left in this file.)
 const CLASS_NETWORK: u8 = 0x02;
 
 /// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) - the IOMMU device-table index.
@@ -753,18 +752,18 @@ pub fn ehci_flr_probe() {
     }
 }
 
-/// Program a device's MSI capability to deliver interrupts to local-APIC `vector` on the
-/// BSP, then enable MSI. Returns `true` if an MSI capability (id 0x05) was found and
+/// Program a device's MSI capability to deliver interrupts to local-APIC `vector` on
+/// `dest_apic`, then enable MSI. Returns `true` if an MSI capability (id 0x05) was found and
 /// programmed. Edge-triggered, fixed delivery, a single message vector.
 ///
 /// MSI is the kernel's device-interrupt path (§12): the device writes the message -
-/// address `0xFEE00000` (LAPIC, dest BSP) and data = `vector` - straight to the local APIC,
+/// address `0xFEE00000 | dest_apic << 12` and data = `vector` - straight to the local APIC,
 /// so no IOAPIC or ACPI `_PRT` routing is needed. The caller must have installed an IDT
 /// handler for `vector` (→ `interrupt::route::deliver`) before the device starts raising it.
 ///
 /// Note: only legacy MSI (cap 0x05) here, not MSI-X (cap 0x11, a separate MMIO table). USB
-/// controllers expose MSI; if a device is MSI-X-only this returns false and the caller keeps
-/// polling.
+/// controllers expose MSI; if a device is MSI-X-only this returns false and every caller then
+/// tries `program_msix`.
 pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
     let bus = ((bdf >> 8) & 0xff) as u8;
     let dev = ((bdf >> 3) & 0x1f) as u8;
@@ -843,7 +842,7 @@ pub fn program_msi(bdf: u32, vector: u8, dest_apic: u8) -> bool {
 }
 
 /// Program a device's MSI-X capability (id 0x11): point table entry 0 at local-APIC
-/// `vector` on the BSP, unmask it, and enable MSI-X. Returns `true` if MSI-X was found and
+/// `vector` on `dest_apic`, unmask it, and enable MSI-X. Returns `true` if MSI-X was found and
 /// programmed. Most modern controllers (incl. `qemu-xhci`) expose MSI-X rather than MSI.
 ///
 /// MSI-X's message table lives in **MMIO** (inside a BAR), not config space, so this maps
@@ -1021,16 +1020,23 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
 /// (P1, USB interrupts). No-op (returns false) if no xHCI was found. The controller's own
 /// interrupter must be enabled by the driver before any MSI actually fires (P2); this only
 /// sets up the message so it *can*. Call after `init()` and after the local APIC is up.
+///
+/// HAS NO CALLERS today: the xHCI's MSI is programmed at spawn by `task::pci_msi_vector`, through
+/// `msi_dest_lapic`.
 pub fn program_xhci_msi() -> bool {
     let Some(dev) = xhci() else { return false };
     let bdf = dev.bdf;
     let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
     let dest = usb_irq_dest_lapic(crate::task::XHCI_CORE);
     // Prefer plain MSI; fall back to MSI-X only when the device offers no MSI (what `qemu-xhci` does).
-    // See `msi_ordering` below for WHY this order - it looks backwards against the usual advice and is
+    // See `msi_ordering` above for WHY this order - it looks backwards against the usual advice and is
     // not.
     program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest)
 }
+
+/// The LAPIC id an allocated pool vector should be delivered to. Same rule as the named USB
+/// vectors: the core the owning driver is pinned to, so a device event wakes that core directly.
+pub fn msi_dest_lapic(core_id: u32) -> u8 { usb_irq_dest_lapic(core_id) }
 
 /// LAPIC id to deliver a USB controller's interrupt to: the core `driver_core` the owning driver is
 /// pinned to (`task::XHCI_CORE` / `task::EHCI_CORE`, the single source of truth). Delivering the IRQ to
@@ -1039,10 +1045,6 @@ pub fn program_xhci_msi() -> bool {
 /// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if that core is not
 /// ready (single-core), where the driver runs on the BSP anyway. Previously hardcoded core 1, which had
 /// drifted away from the drivers' actual cores (2/3) - the co-location is now real (docs/power.md).
-/// The LAPIC id an allocated pool vector should be delivered to. Same rule as the named USB
-/// vectors: the core the owning driver is pinned to, so a device event wakes that core directly.
-pub fn msi_dest_lapic(core_id: u32) -> u8 { usb_irq_dest_lapic(core_id) }
-
 fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
     if crate::smp::core::is_ready(driver_core) {
         crate::smp::core::core_lapic_id(driver_core) as u8
@@ -1086,11 +1088,11 @@ pub fn route_ehci_intx() {
     let Some(dev_pci) = ehci() else { return };
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
     // Deliver to the BSP (core 0) - a legacy PCI INTx pin routes through the IOAPIC only to the
-    // BSP on this hardware (unlike an MSI, which can target any core). The EHCI driver is pinned
-    // to core 0 to match (task/mod.rs), so the keypress wakes core 0 from its idle hlt, deliver()
-    // runs on core 0, and the wake to the core-0 driver is local - no cross-core wake (which an
-    // idle, halted AP doesn't service promptly). Verified on the T630: INTx delivers to the BSP;
-    // routing it to an AP's LAPIC id silently dropped it.
+    // BSP on this hardware (unlike an MSI, which can target any core). Verified on the T630: INTx
+    // delivers to the BSP; routing it to an AP's LAPIC id silently dropped it.
+    // (2026-10-09: this used to say the EHCI driver is pinned to core 0 to match. `task::EHCI_CORE`
+    // is 3, so on a multi-core machine deliver() runs on core 0 and the wake to the driver crosses
+    // cores - the case the MSI path's co-location exists to avoid.)
     let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
     let legacy = dev_pci.irq_line;
 
@@ -1129,8 +1131,9 @@ pub fn route_ehci_intx() {
     );
 }
 
-/// Scan the PCI bus for the xHCI controller and record its MMIO base + IRQ.
-/// Called once on the BSP during boot. Logs the result either way.
+/// Scan every bus/device/function and record each present function in the generic device table
+/// (class code, all six BARs, IRQ line, vendor/device); log every USB host controller and NIC, then
+/// cross-check the table against a fresh read by BDF. Called once on the BSP during boot.
 pub fn init() {
     for bus in 0u16..256 {
         for dev in 0u8..32 {
@@ -1146,8 +1149,8 @@ pub fn init() {
 
                 // RECORD IT, whatever it is, BEFORE any per-class branch below cares what it is.
                 // This is the whole of step D1 on the scan side: the table is what the kernel knows,
-                // and it knows nothing about what any of it MEANS. The per-class statics below are
-                // now a derived view of this table and go away with the last reader.
+                // and it knows nothing about what any of it MEANS. (The per-class statics that were
+                // once a derived view of this table are gone; the branches below only log.)
                 {
                     let device_id = ((config_read32(bus as u8, dev, func, 0x00) >> 16) & 0xFFFF) as u16;
                     // All six BARs (0x10..0x24). A 64-bit memory BAR (bits[2:1] = 10) consumes
@@ -1201,13 +1204,13 @@ pub fn init() {
                         "pci: {} at {:02x}:{:02x}.{} vendor={:#06x} MMIO={:#x} IRQ={}",
                         kind, bus, dev, func, vendor, mmio_base, irq
                     );
-                    // Record every xHCI into the array.
+                    // An empty branch: it once recorded every xHCI into an array, and the next line
+                    // once recorded the first EHCI. Both now come from the generic table above.
                     if progif == PROGIF_XHCI {
                     }
-                    // Record the first EHCI controller (T630 back ports, §12).
                 }
                 // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
-                // identify what NIC is present. Log EVERY one; record the first for the future nic-driver.
+                // identify what NIC is present. Log EVERY one (recording is the generic table's job).
                 if class == CLASS_NETWORK {
                     // The NIC's register space = its first MEMORY BAR. The e1000's is BAR0; the
                     // RTL8168's BAR0 is an I/O port and its MMIO lives in BAR2 - so SCAN the BARs for
@@ -1240,10 +1243,10 @@ pub fn init() {
             }
         }
     }
-    // CROSS-CHECK: the generic table against the per-class statics it will replace.
+    // CROSS-CHECK: the generic table against a fresh read of config space by BDF (the check against
+    // the per-class statics it replaced is gone with them - see the end of this function).
     //
-    // Two independent views of one truth must agree BEFORE anything is switched over to the new one.
-    // Printed once at boot, so the agreement is evidence in the log rather than an assumption in a
+    // Two independent views of one truth must agree. Printed once at boot, so the agreement is evidence in the log rather than an assumption in a
     // commit message - and the day they disagree, the log says which device and which fact.
     let n = DEVICE_COUNT.load(Ordering::Relaxed);
     crate::kprintln!("pci: device table - {} device(s) recorded (generic, no class knowledge)", n);

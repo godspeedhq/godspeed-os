@@ -46,6 +46,11 @@ token that is a PATH, a PLACEHOLDER, a number or a flag is an argument and is sk
 `write <path>`, `events log 5` all pass. A bare `` `events` `` is prose and must keep passing.
 
 `audits/`, `milestones/` and `bugs/` are exempt: dated records of what was typed on a day.
+
+WHAT IT DOES NOT CHECK: that the COMMAND itself exists (a prompt line is judged only when its first
+word is a key of `SUBCMD_FIRST`, so `gsh> nosuchcmd x` passes - `foreign_word_check.py` covers the
+POSIX/DOS words only); any file that is not `.md`; and anything inside a fence whose preceding line
+carries `<!-- doc-command-ok -->`.
 """
 import io
 import os

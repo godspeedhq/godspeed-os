@@ -21,8 +21,8 @@ limit   = "8MiB"
 
 [capabilities]
 ipc_receive = ["hw-enumerator"]
-# `events` - the observability sink: automatic IPC traces, plus the metric samples this service
-# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# `events` - the observability sink: automatic IPC traces, plus the metric samples the SDK publishes
+# for this service (`msgs.received`). It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
 ipc_send    = ["events"]
@@ -47,8 +47,9 @@ log_write   = true
 # hypothetical about future services.
 #
 # PLATFORM-INDEPENDENT AUTHORITY, platform-specific meaning. x86 reaches config space through the
-# CF8/CFC ports; the Pi 4 through a memory-mapped window on its root complex. The capability is the
-# same either way because the OPERATION is the same; what differs is the selector encoding, and that
-# lives in the service. The Pi 2 has no PCI at all, so there the kernel can only refuse - which it
+# CF8/CFC ports, the Pi 4 through a memory-mapped window on its root complex, riscv64 through a flat
+# ECAM window. The capability is the same either way because the OPERATION is the same; what differs is
+# the selector encoding, which the service packs and each arch's kernel side also reads (`cfg_read` in
+# src/main.rs; `backlog/25`). The Pi 2 has no PCI at all, so there the kernel can only refuse - which it
 # says, rather than handing back a plausible zero that would read as an empty machine.
 pci_cfg = true

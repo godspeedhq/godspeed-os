@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! RISC-V (rv32) arch layer - STUB scaffold that BOOTS in QEMU `virt` (docs/aarch64.md pattern).
 //!
-//! The 32-bit testitecture. Exposes the SAME `arch::imp` surface as arch/x86_64/ and arch/aarch64/, so
+//! The 32-bit RISC-V architecture. Exposes the SAME `arch::imp` surface as arch/x86_64/ and arch/aarch64/, so
 //! the arch-NEUTRAL kernel compiles for riscv32 with only this file written - the boundary, generalised
-//! to a third ISA. Bodies are stubs; real bodies (Sv39 MMU, S-mode trap vec, PLIC/CLINT, SBI) come later.
+//! to a third ISA. Bodies are stubs; real bodies (Sv32 MMU - Sv39 is RV64-only - S-mode trap vec, PLIC/CLINT, SBI) come later.
 //!
 //! **BEFORE YOU WRITE THE TRAP HANDLER, read "How an arch implementation HALTS THE MACHINE" in
 //! `kernel/src/arch/CLAUDE.md`.** The single most expensive bug on the RISC-V port was a fault
@@ -16,7 +16,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
-// ============================ Boot bring-up (QEMU `virt`, M-mode) ============================
+// ============================ Boot bring-up (QEMU `virt`, S-mode under OpenSBI) ============================
 // QEMU riscv `virt` UART is an NS16550 at 0x1000_0000; writing the transmit-hold register (offset 0) sends
 // a byte (QEMU accepts it directly, like early x86 COM1 output).
 const UART_THR: *mut u8 = 0x1000_0000 as *mut u8;
@@ -46,7 +46,7 @@ pub unsafe extern "C" fn _start() -> ! {
     )
 }
 
-/// Rust side of boot. Milestone: write to the 16550 UART and halt. Later: Sv39 MMU, S-mode trap vector
+/// Rust side of boot. Milestone: write to the 16550 UART and halt. Later: Sv32 MMU, S-mode trap vector
 /// (stvec) for ecall/faults/IRQ, PLIC/CLINT, SBI HSM for SMP - toward the neutral `kernel_main`.
 extern "C" fn riscv_boot_main() -> ! {
     for &b in b"
@@ -109,8 +109,8 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 pub fn hw_random() -> Option<u32> { None }
 
 /// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
-/// boards with it are the Pi 4 (`arch/aarch64`, WL_ON), whose radio returns to power-on only when WL_ON
-/// is cut, and the VisionFive 2 Lite (`arch/riscv64`, the radio's power pin). `false` is the honest answer; the syscall reports it as "no control over it".
+/// boards with it are the Pi 4 (`arch/aarch64`, WL_ON), whose radio's power is WL_ON on the firmware's
+/// GPIO expander, and the VisionFive 2 Lite (`arch/riscv64`, the radio's power pin). `false` is the honest answer; the syscall reports it as "no control over it".
 pub fn device_power_control(_kind: u32) -> bool { false }
 pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 
@@ -162,7 +162,8 @@ pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
 pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
-/// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
+/// Switch to a new stack top - `sp` on this ISA. `#[inline(always)]` for the same reason as x86.
+/// Unimplemented on this stub.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
 #[inline(always)]
 pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_to_boot_stack") }
@@ -174,12 +175,10 @@ pub const ELF_MACHINE: u16 = 243;
 pub const ELF_CLASS: u8 = 1; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
-/// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
-/// see the aarch64 implementation for the shape (a published flag, checked here).
-/// Called from the timer tick on every core so a panic can stop the machine rather than one core.
+/// panicking core. See the aarch64 implementation for the shape (a published flag, checked here).
 ///
 /// **STUB: a no-op here means the panic on another core never reaches this one.** Pairs with
-/// `halt_all_cores` above and is useless until that signals anybody. `arch/CLAUDE.md`, item 5.
+/// `halt_all_cores` below and is useless until that signals anybody. `arch/CLAUDE.md`, item 5.
 pub fn panic_halt_check() {}
 
 /// Stop EVERY core, not just this one. Called from the panic path (§6.2, §19).
@@ -254,10 +253,8 @@ pub fn fb_commit(
 pub mod page_tables {
 
     /// Arch hook run once a service's address space is built. x86 needs nothing; ARM clones the kernel
-    /// identity mapping into it.
+    /// identity mapping into it. Its other job is the one below:
     ///
-    /// # Safety
-    /// `_root` must be a page-table root this task owns.
     /// Make a service's freshly written TEXT visible to the INSTRUCTION fetcher, on every hart that
     /// could run it.
     ///
@@ -272,7 +269,10 @@ pub mod page_tables {
     ///
     /// x86-64 is a legitimate no-op here (coherent with respect to instruction fetch). **Copying that
     /// no-op onto a weak arch is the mistake.** See `arch/CLAUDE.md`, item 3, and
-    /// `arch/aarch64/mod.rs` / `arch/arm/usermode.rs` for real bodies.
+    /// `arch/aarch64/mod.rs` / `arch/arm/page_tables.rs` for real bodies.
+    ///
+    /// # Safety
+    /// `_root` must be a page-table root this task owns.
     pub unsafe fn finalize_service_address_space(_root: u64) {}
 
     /// Free a task's page-table root and the structure below it, at task death.

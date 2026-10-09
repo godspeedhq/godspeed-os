@@ -23,10 +23,10 @@ The server side, using only real `ServiceContext` methods:
 
 | Step | Call | What happens |
 |------|------|--------------|
-| Own an endpoint | (from the contract's `ipc_receive`) | clients send requests here |
+| Own an endpoint | (`SPAWN_FLAG_REQ_RECV` in its spawn row; the contract's `ipc_receive` declares it) | clients send requests here |
 | Block for a request | `gs::ipc::recv(&ctx)` | returns the next `Message`; idle (parked) when none - the graceful degrade |
 | Take the reply cap | `gs::ipc::take_sent_cap(&ctx)` | the SEND cap the client embedded, now in OUR table - the ONLY way we can call back (§7.10, §8.5) |
-| Compute a reply | (service logic) | echo the payload, or its byte length as text - this is policy, and it lives here |
+| Compute a reply | (service logic) | echo the payload back - this is policy, and it lives here |
 | Reply, non-blocking | `gs::ipc::try_send_to(&ctx, reply_cap, &reply)` | answers without ever blocking on the client (§8.9) |
 | Reclaim the slot | `gs::cap::remove(&ctx, reply_cap)` | keeps a long-running server bounded (§26.6) |
 
@@ -60,9 +60,12 @@ let reply = gs::ipc::recv(&ctx);
 let _ = reply.payload_bytes();   // "echo me"
 ```
 
-(The SDK packages this exact dance as `ctx.request_with_reply("reply-server", &request)` - read it in
-`sdk/rust/src/service_context.rs` to see the same three steps, plus reply-cap reclamation on a failed
-send. The block above is spelled out so the mechanism is visible.) The runnable client is
+(The standard library packages this exact dance as
+`gs::call::request_within(&ctx, "reply-server", &request, secs)` - read it in `stdlib/rust/src/call.rs`.
+It does the same three steps as one bounded kernel `Call` - deriving the reply cap from the client's
+reply mailbox, a second endpoint the kernel gives a receiving task for replies, where it has one - which also leaves any other message on the
+endpoint queued rather than taking it as the reply. The block above is spelled out so the mechanism is
+visible; a real client calls the library.) The runnable client is
 `examples/asker`, spawned next to this server by `osdev test reply-server`.
 
 ## Why it is built this way (the Commandments)
@@ -99,10 +102,11 @@ loud-failure trade GodspeedOS wants (§26.7). The client retries; it does not ha
 This server carries a deliberate test hook (`src/main.rs`): a request whose payload is exactly `b"HANG"`
 is **never answered** - the server consumes the reply cap and loops, leaving the client blocked awaiting
 a reply that will never come. This is the case that used to hang a caller forever. It no longer does.
-The client's `request_with_reply` is a synchronous kernel `Call` (§8.2), so when `osdev test reply-dead`
-kills this server while the client is blocked on the withheld reply, the kernel wakes the client with
-`ReplyDead` - `request_with_reply` returns `None` - instead of hanging it. The client then reacquires
-by name and retries (Commandment IX). This is the executable form of **Commandment VIII**: the client
+The client's `gs::call::request_within` is a synchronous kernel `Call` (§8.2), so when `osdev test
+reply-dead` kills this server while the client is blocked on the withheld reply, the kernel wakes the
+client with `ReplyDead` - `request_within` returns `Err(gs::Error::PeerDied)` - instead of hanging it.
+The client then reacquires by name (Commandment IX) and does NOT re-send that request: it arrived, so
+it may have been acted on. This is the executable form of **Commandment VIII**: the client
 waits on the *truth* of the reply, and that truth includes the server's **death** - a wait that could
 not observe failure would have quietly become an infinite wait on time (CLAUDE.md §8.6). The hook is
 inert in every other build; no real client sends `b"HANG"`. Pinned by `osdev test reply-dead`, the
@@ -126,7 +130,7 @@ This is the skeleton of every real GodspeedOS server. Replace step 3 (the echo) 
 logic: parse the request payload, do the work (read a block, open a file, look up a name), and
 `gs::ipc::try_send_to` the result back over the embedded reply cap. For richer protocols, badge requests
 with an operation code in the payload and branch on it. To make a request *from* the client side, follow
-the code block above (or call `ctx.request_with_reply`).
+the code block above (or, as a real client should, call `gs::call::request_within`).
 
 ## Status
 
@@ -142,7 +146,7 @@ runnable proof of this pattern in production is `services/fs` and `services/bloc
 
 - **Commandments VII, VIII, X** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §8 (IPC), §8.6 (failure semantics - queued, not processed), §8.9 (deadlock avoidance),
-  §7.10 (delegated/reply caps), §8.5 (embedded capabilities).
+  §8.2 (`Call` and the reply cap), §8.5 (embedded capabilities).
 - `services/fs`, `services/block-driver` - real request/reply servers (the runnable proof).
 - `examples/ping` + `examples/pong` - one-way IPC, the contrast (a producer with `ipc_send`, no reply).
 - `examples/cap-grant` - the embed-a-cap-in-a-message mechanism this RPC is built on.

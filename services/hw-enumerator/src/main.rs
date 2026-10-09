@@ -53,6 +53,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
 /// Buses to walk, at most.
@@ -160,7 +161,10 @@ fn cfg_read(ctx: &ServiceContext, bus: u8, dev: u8, func: u8, offset: u8) -> Opt
 /// SError that halts the machine, not a harmless all-ones. The kernel's admissibility check refuses
 /// out-of-RANGE buses, and its own scan reads bus 1 device 1 safely - so widening is probably safe -
 /// but "probably safe" is not the bar for a change whose failure mode is a dead board, and this is a
-/// REPORTER with no clients, so the cost of the gap today is one unlisted device in a log.
+/// REPORTER with no clients, so the cost of the gap today is one unlisted device in a log. (Note
+/// 2026-10-09: it has clients now - the supervisor asks op 3 for each PCI driver's BDF at spawn, and
+/// `hardware` reads ops 1, 2 and 4 - so an unlisted device is also one whose driver is resolved by the
+/// kernel's own scan instead, and one `hardware` cannot show.)
 ///
 /// To close it: probe all 32 slots per admitted bus, and prove it on the Pi 4 before believing it.
 fn slots_on(bus: u8) -> u8 {
@@ -262,7 +266,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("hw-enumerator");
+    gs::trace::as_name(&ctx, "hw-enumerator");
     ctx.log("hw-enumerator: starting - PCI discovery in USERSPACE (step D2)");
 
     // GROUND TRUTH before the walk. An empty result is ambiguous on its own - it means either "this
@@ -307,10 +311,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //   op 4 + idx  -> that device's configuration space, read NOW: [bdf, 256 bytes]
     //   op 3 + class -> the BDF of the first device with that class code (0 = none), and the class
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         // The caller's one-shot reply cap. No cap means nobody is waiting for an answer, so there is
         // nothing to do but carry on - and NOT reply into the void.
-        let Some(reply_cap) = ctx.take_pending_cap() else { continue };
+        let Some(reply_cap) = gs::ipc::take_sent_cap(&ctx) else { continue };
         let p = msg.payload_bytes();
         let reply = match (p.first().copied(), p.get(1).copied()) {
             (Some(1), _) => Message::from_bytes(&(n as u32).to_le_bytes()),
@@ -372,9 +376,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the hang nothing above the kernel may cause.
             _ => Message::from_bytes(b"?"),
         };
-        let _ = ctx.try_send_by_handle(reply_cap, &reply);
-        // Reclaim the slot every time, on every path - a cap left behind on each request fills the
-        // table over a long run (§26.6).
-        ctx.remove_cap(reply_cap);
+        // `reply` reclaims the slot every time, on every path - a cap left behind on each request fills
+        // the table over a long run (§26.6).
+        let _ = gs::ipc::reply(&ctx, reply_cap, &reply);
     }
 }

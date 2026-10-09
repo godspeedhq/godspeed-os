@@ -110,12 +110,23 @@ impl Irq {
         self.vector.is_some()
     }
 
+    /// The vector the kernel routed, for a driver that reports it or tells its notice apart itself.
+    ///
+    /// Reading it is not routing it: the vector is the kernel's to choose (see [`Irq::granted`]), and a
+    /// driver that knows the number still cannot ask for another one.
+    pub fn vector(&self) -> Option<u8> {
+        self.vector
+    }
+
     /// Interrupts seen by [`Irq::wait`] so far - evidence, for a driver to report.
     pub fn seen(&self) -> u64 {
         self.seen.get()
     }
 
     /// Wait for the interrupt, a request or `within`, whichever is first.
+    ///
+    /// On a machine whose clock the kernel could not calibrate, `within` is not a duration: the wait
+    /// ends after one scheduler quantum whatever was asked (see `deadline_ticks`).
     ///
     /// `#[inline(always)]` because it returns a 4 KiB message by value; as its own frame that would be
     /// 4 KiB of stack on every caller (the SDK's `recv_timeout` says the same).

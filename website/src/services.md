@@ -39,7 +39,8 @@ Two properties follow, and they are the reason the rest of this page is shaped t
   possibly different core with a new endpoint generation. Clients see `EndpointDead`, reacquire by
   name, and carry on. Nobody tracks where anything runs.
 - **Authority is explicit** (invariant 1, 3). A service can only reach a peer it was granted, or one
-  it declared in its contract and reacquired by name. There is no ambient directory to browse.
+  it was spawned declaring (the peer list in its spawn request, not its contract) and reacquired by
+  name. `ACQUIRE_ANY` lifts that for the operator instruments - the shell, the supervisor, the probes. There is no ambient directory to browse.
 
 ---
 
@@ -118,8 +119,9 @@ thing in the system is the kernel (§6.2, §6.3).
               (files, pipes)         (drives)        (clock)    (spawn/kill)
 ```
 
-There is no `stdin` and no `fork`. A pipe `A | B` is the shell creating an endpoint and granting one
-end to each side (Appendix D.3). A killed shell respawns as a fresh prompt - the in-flight command is
+There is no `stdin` and no `fork`. A pipe `A | B` is the shell carrying each stage's output to the
+next: in-process between built-ins, and for a service stage a SEND cap to the shell's own endpoint,
+granted at spawn (Appendix D.3, `docs/pipes.md`). A killed shell respawns as a fresh prompt - the in-flight command is
 lost, the session is not.
 
 **Peers:** `fs`, `block-driver`, `time`, `console`, `events`, `supervisor`.
@@ -186,6 +188,10 @@ the granted DMA arena and they leave the trusted computing base entirely (§6.4)
        │
        └──▶ a socket is a capability (the same mechanism as a file)
 ```
+
+Where a board has a radio - `wifi-driver` (Pi 4, VisionFive 2) or `wifi-usb` (a USB dongle) -
+`nic-driver` bridges frames to it when the cable is out (not on QEMU's e1000, which has no bridge),
+and the cable always wins.
 
 The kernel gains nothing from networking: it routes messages, and a socket is a delegated resource
 capability owned by `net-stack`. There is no ambient network any more than there is an ambient
@@ -299,10 +305,10 @@ on it and never fails because of it.
    ctx.log()  ──syscall 5──▶  kernel ring + serial          (always, never via events)
                      └──────▶  events  (a best-effort COPY, offered after the fact)
 
-   ctx.metric() / IPC trace ──▶ events ──▶ three VOLATILE stores:
-                                             192-event IPC trace ring
-                                             64-slot metric table, keyed (owner, name)
-                                             8 KiB log window
+   gs::trace::metric() / IPC trace ──▶ events ──▶ three VOLATILE stores:
+                                                    192-event IPC trace ring
+                                                    64-slot metric table, keyed (owner, name)
+                                                    8 KiB log window
 ```
 
 That ordering is the whole point and must not be inverted: re-pointing logs AT this service would

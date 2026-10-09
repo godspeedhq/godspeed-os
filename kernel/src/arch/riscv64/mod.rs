@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! RISC-V (rv64) arch layer - STUB scaffold that BOOTS in QEMU `virt` (docs/aarch64.md pattern).
+//! RISC-V (rv64) arch layer - a complete port, hardware-verified on the StarFive VisionFive 2 Lite and
+//! run under QEMU `virt` (see `CLAUDE.md` in this directory).
 //!
-//! The THIRD architecture. Exposes the SAME `arch::imp` surface as arch/x86_64/ and arch/aarch64/, so
-//! the arch-NEUTRAL kernel compiles for riscv64 with only this file written - the boundary, generalised
-//! to a third ISA. Bodies are stubs; real bodies (Sv39 MMU, S-mode trap vec, PLIC/CLINT, SBI) come later.
+//! It began as the third architecture's stub scaffold (the docs/aarch64.md pattern): the SAME
+//! `arch::imp` surface as the other ports, so the arch-NEUTRAL kernel compiled for riscv64 with only
+//! this directory written. The bodies are real now - Sv39 (`sv39.rs`), the S-mode trap vector
+//! (`trap.rs`), SBI timer, IPI and HSM hart start (`sbi.rs`). There is still NO PLIC: no device
+//! interrupt reaches the kernel, so the UART is polled from the tick and drivers poll.
 
 #![allow(unused_variables, dead_code)]
 
@@ -322,9 +325,7 @@ pub unsafe extern "C" fn _start() -> ! {
     )
 }
 
-/// Rust side of boot. Milestone: write to the 16550 UART and halt. Later: Sv39 MMU, S-mode trap vector
-/// (stvec) for ecall/faults/IRQ, PLIC/CLINT, SBI HSM for SMP - toward the neutral `kernel_main`.
-/// Boot hart id and device tree, exactly as the firmware left them.
+/// Rust side of boot: the boot hart id and device tree, exactly as the firmware left them.
 ///
 /// `_start` never touches `a0` or `a1` - it writes `sp`, `t0` and `t1` only - so the two arguments
 /// the RISC-V boot protocol puts there are still live at the `call`, and taking them as parameters is
@@ -1136,7 +1137,8 @@ pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u
     Some((DRIVER_MMIO_VA, 0x1000))
 }
 
-// USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
+// USB-net bridge stubs: on this arch the NIC is a userspace driver (the e1000 on PCI under QEMU, the
+// SoC's `dwmac` on the VisionFive), not an in-kernel USB device.
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // ---- THE JH7110's TRUE RANDOM NUMBER GENERATOR (`hw_random`, InspectKernel query 19) ----------------
 //
@@ -1389,8 +1391,8 @@ pub const ELF_MACHINE: u16 = 243;
 pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
-/// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
-/// see the aarch64 implementation for the shape (a published flag, checked here).
+/// panicking core. Not a no-op here: once `halt_all_cores` has published `DUMPED`, every other hart
+/// halts on its next tick (the aarch64 shape - a published flag, checked here).
 pub fn panic_halt_check() {
     note_stage(stage::NEUTRAL_TICK);
     // AND STOP, IF THE MACHINE IS ALREADY DYING. x86 leaves this a stub because it halts its
@@ -1590,7 +1592,7 @@ pub fn hardware_reset() -> ! {
     }
 }
 
-// ---- Serial / console (NS16550 on QEMU virt @ 0x1000_0000; stubbed) ----
+// ---- Serial / console (the 16550 at 0x1000_0000 on QEMU virt and the JH7110; layout from the DT) ----
 /// One byte, under the lock. Used for single characters; a whole message goes through the function
 /// below so it cannot be split.
 pub fn serial_write_byte(b: u8) {
@@ -1757,8 +1759,7 @@ pub mod boot {
     pub fn init_gdt_arenas(n: usize) {}
     /// Idle-tick pacing (v0.7.0 power work, x86 Phase 2a). Neutral `scheduler.rs` calls these around
     /// its idle `wait_for_interrupt`: slow the timer while a core sleeps, restore the quantum on wake.
-    /// A no-op here is CORRECT for a stub - the tick simply never slows - and a real port implements
-    /// them on its own timer (generic timer on ARM, CLINT/mtimecmp on RISC-V).
+    ///
     /// Re-arm an idle core - at the QUANTUM on this port, not at the usual ~1 s idle rate.
     ///
     /// **Because here the idle tick IS the keystroke latency.** A task blocked in `ConsoleRead` is
@@ -1901,12 +1902,13 @@ pub mod boot {
 
 // ---------------------------------------------------------------------------
 /// Hook called when the scheduler commits a **user** task. x86 ignores it; ARM records the slot so the
-/// timer runs its syscalls atomically. Nothing to do on this stub yet.
+/// timer runs its syscalls atomically. Nothing to do on this port.
 pub fn note_user_task(_slot: usize) {}
 
 // --- Boot/panic console floor backend (`crate::bootcon`) ---
-// The kernel's boot/panic floor owes each arch one item (see `crate::bootcon`). No framebuffer is
-// mapped on this stub, so the console never initialises and every entry point no-ops.
+// The kernel's boot/panic floor owes each arch one item (see `crate::bootcon`): `fb_commit` below.
+// On the VisionFive `display.rs` brings up the HDMI framebuffer and hands it to `bootcon::init`; under
+// QEMU `virt` there is none, so the floor never initialises and its entry points no-op.
 
 /// The last-level cache, and the memory window used to flush it. Zero until the boot finds them.
 static CCACHE_BASE: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
@@ -2616,7 +2618,7 @@ pub mod rtc {
     }
     pub fn boot_datetime() -> u64 { 0 }
     pub fn read_datetime() -> u64 { 0 }
-    pub fn set_wall_clock(_epoch: i64) -> bool { false } // no RTC on this stub; SNTP wall clock unused (arm is the live RTC-less port)
+    pub fn set_wall_clock(_epoch: i64) -> bool { false } // no RTC on this port; the wall clock is the `time` service's (this seam has no callers on any arch)
     /// Seconds since boot, from the machine's own counter.
     ///
     /// **Returning 0 from the stub this replaces was not harmless.** The shell's `wait` paces on this
@@ -2648,21 +2650,18 @@ pub fn fixed_device_present(kind: u32) -> bool {
     kind == crate::task::kind::WIFI_SDIO && sdio::present()
 }
 
-// PCI seam. QEMU `virt` DOES have a PCIe host bridge (ECAM at 0x3000_0000, described in the FDT), and
-// the VisionFive 2 has one too - so unlike arm32 this is a stub by STAGE, not by platform. Everything
-// answers "nothing here", which is honest for a kernel that has not yet read the device tree: it
-// reports no devices rather than guessing at fixed addresses.
-//
-// Ported from `arch/arm`'s no-PCI seam so the surface matches exactly. Filling it in means walking the
-// FDT for `pci-host-ecam-generic` and enumerating from there - the arch's own work, not the neutral
-// kernel's, which is the whole point of this boundary.
+// PCI seam. (2026-10-09: this block used to call the seam a stub that answers "nothing here". It is
+// not any more: the `pci` module below reads the ECAM window's base from the device tree's
+// `pci-host-ecam-generic` node and enumerates from there - the arch's own work, not the neutral
+// kernel's, which is the whole point of this boundary. QEMU `virt` has that node; the VisionFive's
+// StarFive bridge is not that binding, so there it finds nothing - see `ECAM_BASE`.)
 // ---------------------------------------------------------------------------
 // Seam members the neutral kernel grew after this stub was written.
 //
 // Every one of these is a compile error, not a runtime one, which is the boundary working: the neutral
 // layers may only reach hardware through `arch::imp`, so a new member is felt by every arch at once.
-// What it did NOT do is TELL anyone - nothing builds this target, so the stub rotted silently until
-// someone tried. Wiring riscv64 into a build path is therefore worth more than any single body below.
+// What it did NOT do is TELL anyone - nothing built this target then, so the stub rotted silently until
+// someone tried. (It is built now: `scripts/riscv_build.py`, and `scripts/board.py visionfive`.)
 // ---------------------------------------------------------------------------
 
 /// Interrupts this core has taken, and the last cause it saw.

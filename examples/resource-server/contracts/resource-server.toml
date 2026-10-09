@@ -1,7 +1,7 @@
 # Service contract for `resource-server` - demonstrates MINTING delegated resource capabilities
 # (§7.10, "a file is a capability"). This is a BUILD-TIME declaration, not what the kernel
-# reads at spawn - nothing parses TOML there (13.6). It is reconciled against the authority
-# really granted by `scripts/contract_check.py` (Commandment VII, no ambient authority).
+# reads at spawn - nothing parses TOML there (13.6). Its authority keys are reconciled against the
+# authority really granted by `IV-contract-authority` in `scripts/commandments.py` (Commandment VII).
 name    = "resource-server"
 version = "0.1.0"
 
@@ -15,7 +15,8 @@ limit   = "64MiB"
 # Explicit grants only - this service can do ONLY what is listed (Commandment VII, no ambient
 # authority). The FULL set of declarable capabilities is in `contracts/schema/service.schema.json`
 # (validated by `osdev validate`) and `contracts/CLAUDE.md`. The options are: ipc_send,
-# ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+# ipc_receive, log_write, the authority keys
+# (console_push, resource_mint, service_control, cpu_clock, pci_cfg) and the driver hw_* keys.
 ipc_receive = ["resource-server"]  # OWNS its endpoint - a cap holder's `resource_invoke` is routed here, badged
 ipc_send    = ["holder"]           # may SEND to `holder` - so it can GRANT holder the minted resource cap
                                    # (an embedded cap, §8.5). holder is the client half (examples/holder);
@@ -32,7 +33,7 @@ resource_mint = true
 # RESOURCE_MINT arrives in the SPAWN REQUEST, checked against what the supervisor may itself delegate
 # (`SUPERVISOR_DELEGATABLE`). The `resource_mint = true` line above is the build-time DECLARATION of
 # that, reconciled by `IV-contract-authority`; nothing parses TOML at spawn (13.6). Without the grant
-# `ctx.resource_mint` returns None and this example idles (graceful degrade, 7.10 / 3.12).
+# `gs::resource::mint` returns Err(PermissionDenied) and this example idles (graceful degrade, 7.10 / 3.12).
 #
 # CORRECTED 2026-09-26, and this one was self-contradicting. It read: "the authority to MINT resources
 # (RESOURCE_MINT) is NOT a contract capability field - it is not in the schema and cannot be requested

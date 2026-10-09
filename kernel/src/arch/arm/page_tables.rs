@@ -13,8 +13,8 @@
 //! - **L2**: 256 entries x 4 bytes = 1 KiB, each a 4 KiB *small page* (bits `[1:0] = 0b1x`).
 //!
 //! **Permissions use the AP + APX split**, and getting it wrong is how a port ends up with either no
-//! protection or unusable memory. The four cases this file needs: kernel RW is `APX=0, AP=0b01`;
-//! kernel RO is `APX=1, AP=0b01`. (PL0/user variants arrive with real user tasks.)
+//! protection or unusable memory. The four cases this file encodes: kernel RW is `APX=0, AP=0b01`;
+//! kernel RO is `APX=1, AP=0b01`; user RW is `AP=0b11`; user RO is `AP=0b10` (`l2_small_page`).
 //!
 //! **The frame source is a static arena, deliberately.** `PageTable::new` on x86 pulls L1/L2 frames
 //! from the neutral `alloc_frame`, which needs `memory::init` and a real memory map - and that pulls
@@ -37,7 +37,8 @@ pub struct VirtAddr(pub u64);
 bitflags::bitflags! {
     /// Neutral page flags. The names are x86-flavoured (the documented leak, `arch/CLAUDE.md`); the
     /// ARM encoder below maps them onto short-descriptor bits. `WRITABLE` off = read-only; `NO_EXEC`
-    /// sets XN; `USER` is accepted for signature parity but PL0 mappings are not built yet.
+    /// sets XN; `USER` grants PL0 access (`l2_small_page`). `WRITE_COMBINE` is not read by this
+    /// encoder: arm32 selects Normal non-cacheable from `PCD | PWT` (`fb_extra_page_flags`).
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct PageFlags: u64 {
         const PRESENT  = 1 << 0;
@@ -302,9 +303,11 @@ pub fn read_page_table_base() -> u64 {
     ttbr0 as u64
 }
 
-/// Install a new address space (`TTBR0`), then ISB so the next fetch uses it. Per SEC-26/27 a real
-/// ASID switch also needs TLB maintenance; while every task shares the identity map that never
-/// happens, and the obligation is documented for when private address spaces land.
+/// Install a new address space (`TTBR0`), then ISB so the next fetch uses it. NO TLB maintenance:
+/// an ARMv7 TTBR0 write does not flush non-global entries (SEC-26/27). Every service now has its own
+/// L1, so the flush is owed - and it is paid in `context_switch.rs`, which issues `TLBIALL` whenever
+/// TTBR0 changes, not here. The one neutral caller of this function, the `!0` reload in
+/// `smp::ipi::invalidate`, therefore flushes nothing on this port (`arch/CLAUDE.md`).
 pub unsafe fn write_page_table_base(base: u64) {
     // SAFETY: `mcr p15, 0, _, c2, c0, 0` writes TTBR0 at PL1; ISB ensures the following instruction
     // is fetched under the new tables. Caller guarantees `base` is a valid 16 KiB-aligned L1.

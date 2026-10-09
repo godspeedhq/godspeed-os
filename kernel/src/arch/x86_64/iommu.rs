@@ -1,19 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! AMD-Vi IOMMU detection (H1 Phase 0) - DMA confinement feasibility probe.
+//! AMD-Vi IOMMU (H1): detection, bring-up, and per-device DMA confinement (§6.4).
 //!
-//! GodspeedOS has no IOMMU today, so a DMA-capable driver (`xhci`, `ehci`) that
-//! is programmed with a physical address can make the controller read or write
-//! *anywhere* in physical RAM - kernel-equivalent power. That is why those
-//! drivers are still in the TCB (§6.1). The flagship hardening item H1 is to put
-//! an AMD-Vi IOMMU translation domain in front of each driver so it can only
-//! touch its own granted arena, then drop it from the TCB.
+//! Without an IOMMU, a DMA-capable driver that is programmed with a physical
+//! address can make its controller read or write *anywhere* in physical RAM -
+//! kernel-equivalent power, which keeps it in the TCB (§6.1, §6.4). H1 puts an
+//! AMD-Vi translation domain in front of a driver so it can only touch its own
+//! granted arena.
 //!
-//! That is a large, hardware-specific subsystem. Before building it we must know
-//! whether this machine even exposes a usable AMD-Vi IOMMU - embedded G-series
-//! APUs vary and firmware often disables it. This module does **detection only**:
-//! it walks the ACPI tables (RSDP → RSDT/XSDT → IVRS) and reports whether an
-//! IVRS table exists and the IOMMU MMIO base it advertises. No behaviour change,
-//! loud output (§3.12). Phase 1 (translation setup) is gated on this saying yes.
+//! The phases, all in this file:
+//! - Phase 0 (`detect`): walk the ACPI tables (RSDP → RSDT/XSDT → IVRS) and report
+//!   whether an IVRS table exists and the IOMMU MMIO base it advertises. Loud either
+//!   way (§3.12); everything after it is gated on it saying yes.
+//! - Phase 1a-1c (`bringup`): map the MMIO, read the capabilities, build the device
+//!   table (every entry passthrough), command buffer and event log, and enable
+//!   translation.
+//! - Phase 1d (`confine_device` / `release_device`): give one device a private I/O
+//!   page table covering only its arena, under its own domain ID (`domain_of`), with
+//!   a structural selftest; revert it on the driver's death.
+//! - `drain_event_log`: report translation faults from the core-0 timer tick.
+//!
+//! Whether a driver is confined is its spawn request's `confine` bit (`HwClass::Pci` in
+//! `task/mod.rs`), gated by `CONFINE_USB_DRIVERS`; per the §6.4 amendments `xhci` and the HD Audio
+//! controller are confined, and `ehci`, `block-driver` and `nic-driver` run in passthrough. x86 only: the other ports' `iommu::` entry points are stubs.
 //!
 //! ACPI table access is hardware/firmware memory, so this lives in the arch
 //! layer (§18.1). Every raw read carries a SAFETY argument.
@@ -260,7 +268,7 @@ unsafe fn mmio_write64(va: u64, off: u64, val: u64) {
 // by the originating device's PCI BDF. We allocate the full 64K-entry table (one
 // 256-bit DTE each = 2 MiB) so every device has an entry, default every entry to
 // *passthrough* (so the disk and everything else keep DMAing untranslated), and
-// later switch just the USB controllers' entries to a confined domain (Phase 1c).
+// later switch just the confined devices' entries to a domain of their own (Phase 1d).
 // The command buffer and event log are the IOMMU's two rings: we issue cache
 // invalidations through the command buffer and read translation faults from the
 // event log.
@@ -328,8 +336,8 @@ fn setup_structures(hhdm: u64, mmio_va: u64) -> bool {
     // Linux amd_iommu's PAGE_MODE_NONE passthrough). mode=0 with TV=1 means "no
     // translation, GPA passed straight through" - the IOMMU walks no page table.
     // (The earlier V=1,TV=0 encoding was NOT transparent on this hardware: it
-    // broke the firmware-co-owned EHCI controller even in passthrough.) The USB
-    // controllers are switched to a confined domain in Phase 1d.
+    // broke the firmware-co-owned EHCI controller even in passthrough.) Confined
+    // devices are switched to a domain of their own in Phase 1d.
     for bdf in 0..DEV_TABLE_ENTRIES {
         // SAFETY: dt_va is the freshly-allocated mapped table; bdf in range.
         unsafe { write_dte(dt_va, bdf as u32, DTE_V | DTE_TV | DTE_IR | DTE_IW, 0) };
@@ -791,7 +799,7 @@ pub fn release_device(bdf: u32) -> bool {
 /// Drain and decode any new IOMMU fault events, printing each (device, fault
 /// type, faulting address). Safe; cheap when quiet (just a head/tail compare).
 /// Bounded per call so it is safe to invoke from the timer-tick path. Called from
-/// `scheduler::run` on core 0 (the idle path), which is where it moved when the COM2 control channel
+/// the core-0 timer tick (`scheduler::timer_tick_from_irq`), which is where it moved when the COM2 control channel
 /// became a userspace service - it is ISOLATION reporting and has no business sharing a function
 /// with an operator channel (C1-6). It named `control::process_pending` until 2026-08-31; that
 /// function no longer exists.
@@ -934,8 +942,10 @@ pub fn event_log_state() -> (u64, u64) {
     }
 }
 
-/// Map the IOMMU MMIO block and report its capabilities. Detection-and-readout
-/// only - programs nothing. Call after [`detect`]; no-op if no IOMMU was found.
+/// Map the IOMMU MMIO block and report its capabilities (Phase 1a), then build and
+/// program the device table, command buffer and event log (1b) and enable
+/// translation with every device in passthrough (1c). Call after [`detect`]; no-op
+/// if no IOMMU was found.
 pub fn bringup(hhdm: u64) {
     if !IOMMU_PRESENT.load(Ordering::Relaxed) {
         return;

@@ -12,7 +12,8 @@ check disabled. They were worked through on 2026-09-20 and coverage reached 38 o
 ratchet closed the same day it could.
 
 What the line must say: `**Status:` within the first 12 lines, carrying CLOSED, OPEN, RESOLVED or
-FIXED in capitals. Capitals because two entries said "open" in lowercase, which reads perfectly to a
+FIXED in capitals. (As implemented, the verdict word is looked for anywhere in those 12 lines, not on
+the `**Status` line itself, so a capitalised OPEN in the title satisfies it.) Capitals because two entries said "open" in lowercase, which reads perfectly to a
 person and is invisible to every survey - and an unsurveyable backlog is how entries 33 to 38 came
 to be linked from nowhere while the index claimed to be the index.
 """

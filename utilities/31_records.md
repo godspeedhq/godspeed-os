@@ -24,12 +24,14 @@ real fields. The names say what they do with no POSIX heritage to learn (§ conv
 
 They are **pipe-only stages** - there is no `where /file`. They appear in a pipeline after a
 record producer (`status | where …`, `dir | where …`) or after `from`
-(`read x.json | from json | where …`). The record producers so far are all shell-side:
-**`status`** (task roster, `slot`/`name`/`core`/`state`/`mem`/`queue`/`restarts`), **`dir`**
-(`name`/`type`/`size`), **`caps`** (`resource`/`rights`), **`drives`**
-(`index`/`label`/`status`/`size_mib`/`free_mib`), **`find`** (`name`/`type`/`path`), and
+(`read x.json | from json | where …`). The shell-side record producers include **`status`**
+(task roster, `slot`/`name`/`core`/`state`/`mem`/`queue`/`restarts`), **`dir`**
+(`name`/`type`/`size`/`sealed`), **`caps`** (`resource`/`rights`), **`drives`**
+(`index`/`label`/`status`/`size_mib`/`free_mib`), **`find`** (`name`/`type`/`path`/`size`),
 **`observe now`** (the roster plus a `ticks` cumulative-cpu-time column - `observe now | sort
-reverse ticks` is the native "top"). Only the one-shot `observe now` is pipeable; the bare live
+reverse ticks` is the native "top"), and `uptime`, `events`, `trace`, `jobs` and `wifi list`
+(`is_record_producer` and `0_conventions.md` rule 12 have the full list). One record producer is
+a SERVICE, `roster` (`examples/roster`). Only the one-shot `observe now` is pipeable; the bare live
 `observe` owns the screen and refuses to be piped (a loud error, `docs/records.md`).
 
 ## 2. Usage
@@ -72,6 +74,14 @@ unknown column is a loud error.
 the **edge** of the pipeline - terminal output or, piped to `write`, export. A record never *is*
 JSON; JSON is one way to *print* it. With no `to`, the default rendering is the aligned table grid.
 
+### `sum` / `min` / `max` / `avg <col>` - reduce a numeric column
+Four more pipe-only stages collapse a record stream into one bare number: the total, smallest,
+largest, or mean of a numeric column (`status | sum mem`, `status | avg queue`). The mean is an
+integer (truncated). A missing column (`sum: no such column 'x'`) or a non-numeric one (`sum:
+column 'x' is not numeric (never a silent 0)`) is loud, and on a byte stream they refuse and
+point at `from json`. Each has its own `help` and `version`. One gap: over ZERO rows all four
+answer `0` (`Table::aggregate`), which for `min` and `max` is a number no row had.
+
 ### `from <json>` - the bridge into the typed world
 `read` gives **text**; `where`/`select` need **records**. `from json` parses a flat
 `[ {…}, … ]` array (string / number / `true`|`false` / `null`, no nesting; the first object
@@ -97,14 +107,10 @@ or kernel surface: these operate on data already in the pipeline.
 
 ## 5. Later (separate so it can grow)
 
-- A JSON string-escaper; `from yaml`; record streams larger than one IPC message (chunked
-  `encode`). The **SDK record API** and the bounded **wire codec** (`encode`/`decode`) are
-  **done** - `examples/roster` is a record-producing *service* (`roster | where role=core`, no
-  `from json`). `status`/`dir`/`caps`/`drives`/`find`/`observe now` (shell-side) are done.
-- `from yaml`; a JSON string-escaper (values are plain ASCII today).
-- The bounded **wire codec** - only when a record first needs to cross a *service* boundary
-  (today every producer is shell-side, so records pass by value). Emphatically not JSON on the
-  wire (`docs/records.md`).
+- A JSON string-escaper (values are plain ASCII today); `from yaml`; record streams larger than
+  one IPC message (chunked `encode`). The **SDK record API** and the bounded **wire codec**
+  (`encode`/`decode`, emphatically not JSON on the wire, `docs/records.md`) are **done** -
+  `examples/roster` is a record-producing *service* (`roster | where role=core`, no `from json`).
 - Heterogeneous (differently-shaped) records.
 
 ## 6. Conformance

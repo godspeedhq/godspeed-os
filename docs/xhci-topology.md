@@ -1,5 +1,10 @@
 # The xhci service needs a topology model
 
+> **Status (2026-10-09):** step 1 of the order of work below is built, as `services/xhci/src/topo.rs`
+> (a shadow `Topo` fed through `Topo::note` from the observations the driver already makes, logging
+> transitions only; there is no separate `observe_topology()`). Steps 2-4 are not done: `hub_tried`,
+> `disk_absent_seen` and the scattered announce/drop paths are still in `services/xhci/src/main.rs`.
+
 ## Why this document exists
 
 Seven fixes over two days, each correct, each revealing another face of the same problem. The pattern:

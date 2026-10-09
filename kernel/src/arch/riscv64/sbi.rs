@@ -27,8 +27,9 @@ const FID_SET_TIMER: u64 = 0;
 /// Hart State Management ("HSM"), which is how a secondary hart is STARTED on RISC-V.
 ///
 /// There is no trampoline to write and no INIT/SIPI dance to time. OpenSBI parks every hart but the
-/// boot one, and this asks it to release a named hart at a named address - so the whole of x86's
-/// `ap_boot.rs` real-mode trampoline is replaced by one firmware call. What the firmware will NOT do
+/// boot one, and this asks it to release a named hart at a named address - one firmware call, the
+/// RISC-V counterpart of x86's `ap_boot.rs` handing each AP to Limine's `bootstrap` (which is what
+/// spares x86 its real-mode trampoline). What the firmware will NOT do
 /// is set up that hart's stack, page table or trap vector; those arrive in the same state the boot
 /// hart did, which is why the AP entry has to repeat the work `_start` does.
 pub const EXT_HSM: u64 = 0x0048_534D;

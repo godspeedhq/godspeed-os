@@ -15,8 +15,10 @@
 //!     ipc_receive = ["ping"]
 //!     log_write   = true
 //!            │
-//!            │   the supervisor spawns it, and the KERNEL mints exactly
-//!            │   these capabilities into its table. Not one more.
+//!            │   the supervisor spawns it with a spawn REQUEST (its spawn
+//!            │   row, held to this contract by contract_check), and the
+//!            │   KERNEL mints exactly what that request grants. Not one more.
+//!            │   The kernel never reads the contract (CLAUDE.md 13.6).
 //!            ▼
 //!   ┌──────────────────────────────────────────────────────────┐
 //!   │  ServiceContext        the only door to the outside      │
@@ -31,12 +33,13 @@
 //!
 //! Three consequences, and they are the whole model:
 //!
-//! - **What the contract did not ask for, the service cannot do.** There is no ambient authority to
+//! - **What the spawn request did not grant, the service cannot do.** There is no ambient authority to
 //!   fall back on: no root, no inherited handles, no global namespace. A call whose capability was
 //!   never granted returns `CapNotHeld` - it does not fail late or half-succeed.
 //! - **`ServiceContext` is the only way out.** Everything crossing the boundary goes through it, so
-//!   the answer to "what can this service reach?" is its contract plus this type, and nothing else
-//!   needs reading to be sure.
+//!   the answer to "what can this service reach?" is its spawn request plus this type, and nothing
+//!   else needs reading to be sure. (The contract is where a reviewer reads that request, and the
+//!   checkers hold the two together.)
 //! - **Failure is a value, never a surprise.** `EndpointDead`, `CapRevoked`, `AllocDenied` are
 //!   ordinary `Result`s a service is expected to handle: a peer that died is reacquired by name and
 //!   the work retried. Services are killed and restarted routinely, including by the chaos suite, so
@@ -47,9 +50,10 @@
 //! # Where the unsafe lives
 //!
 //! Service code contains none. §18.1 designates `syscall.rs`, `mmio.rs`, `dma.rs` and
-//! `adversarial.rs`; in practice the largest holder is `service_context.rs` (82 lines) with `ipc.rs`
-//! (8), both recorded as GRANDFATHERED FLOORS by §18.5's 2026-09-12 amendment - 86 of those 90 are
-//! `unsafe { raw_syscall(..) }` call sites, and they may only fall. Every block carries a SAFETY
+//! `adversarial.rs`; in practice the largest holder is `service_context.rs` (84 lines) with `ipc.rs`
+//! (8), both recorded as GRANDFATHERED FLOORS by §18.5's 2026-09-12 amendment and the three
+//! amendments after it (`audits/unsafe-audit.md` has the counts) - nearly all of them are
+//! `unsafe { raw_syscall(..) }` call sites, and they may rise only by a §18.5 amendment. Every block carries a SAFETY
 //! argument. (This said the unsafe "is confined to `syscall.rs`, `mmio.rs` and `dma.rs`", which left
 //! the largest holder unnamed.) `scripts/unsafe_check.py` fails the build on an `unsafe` in any
 //! service, which is what keeps that true rather than merely intended.

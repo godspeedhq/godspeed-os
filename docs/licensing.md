@@ -4,6 +4,12 @@
 > `LICENSE` files: the OS is **GPL-2.0-only** (repo-root `LICENSE`) and the SDK + examples
 > are **Apache-2.0** (`sdk/LICENSE`). Per-file `SPDX-License-Identifier` tags mark every
 > source file's zone. This document records the *strategy* and *rationale* behind that text.
+>
+> **Checked 2026-10-09, two gaps.** `sdk/LICENSE` names only `sdk/` in its own header; the standard
+> library (`stdlib/rust`) and `examples/` carry Apache-2.0 by their SPDX tags and have no `LICENSE`
+> file of their own. And "every source file" is not quite true: 13 `.rs` files carry no SPDX tag
+> (nine in `services/dwc2`, plus `net-stack/src/tcp.rs`, `probe/src/table.rs`,
+> `wifi-driver/src/main.rs` and `osdev/src/fs_model.rs`).
 
 ## 1. The decision
 

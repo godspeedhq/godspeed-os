@@ -8,11 +8,11 @@
 #![deny(unsafe_code)]
 //! `probe` - single-binary identity test probe service (§22 Group A).
 //!
-//! One binary, multiple service_config entries with different `probe_mode` values.
-//! The kernel writes `probe_mode` into ServiceContextData at spawn time; the SDK
+//! One binary, 193 rows in `table.rs` with different `probe_mode` values. The spawner's request
+//! carries the mode, the kernel writes it into ServiceContextData at spawn time, and the SDK
 //! exposes it via `ctx.probe_mode()`.
 //!
-//! Modes:
+//! Modes (a selection - the `MODE_*` constants below are the full list):
 //!   0 = PASSIVE         - idle; exists only to be a kill target
 //!   1 = ECHO_RECV       - recv one message; log "probe: 3A recv OK"              (Test 3A)
 //!   2 = ECHO_SEND       - send to probe-recv; log "probe: 3A send OK"            (Test 3A)
@@ -22,7 +22,7 @@
 //!   6 = YIELD_EVENTS    - yield then log; proves preemption/yield path             (Test 8A)
 //!   7 = HOG             - tight loop; proves preemption via ping output            (Test 8B)
 //!   8 = CAP_FORGE       - try_send on slot 99 (out of range) → CapNotHeld         (Test 9B)
-//!   9 = GRANT_RECV      - recv then take_pending_cap; log pass                    (Test 5A)
+//!   9 = GRANT_RECV      - recv then gs::ipc::take_sent_cap; log pass             (Test 5A)
 //!  10 = GRANT_SEND      - send_with_cap to probe-5a-recv; log pass                (Test 5A)
 //!  11 = NO_GRANT_SEND   - send_with_cap without GRANT right → CapNotGrantable     (Test 5B)
 //!  12 = ALLOC_OK        - alloc within limit twice; both succeed                   (Test 7A)
@@ -48,32 +48,32 @@
 //!
 //! Chaos-test modes - Milestone 14.
 //!  91 = CHAOS_C2     - null-deref → page fault → kernel kills service           (C2)
-//!  92 = CHAOS_C2_MON - 1,000 yields then log pass (C2 witness)                  (C2)
+//!  92 = CHAOS_C2_MON - 100 yields then log pass (C2 witness)                    (C2)
 //!  93 = CHAOS_C3     - 500 alloc-deny cycles without panic                      (C3)
-//!  94 = CHAOS_C5     - 100-level recursive yield_cpu(); kernel stack depth probe (C5)
+//!  94 = CHAOS_C5     - 100-level recursive yield_now(); kernel stack depth probe (C5)
 //!  95 = CHAOS_C6_MON - 200 yields then log pass on core 0 (C6 witness)          (C6)
 //!  96 = CHAOS_C7     - 30 cross-core kill/respawn cycles; TLB shootdowns         (C7)
 //!
 //! Brutal chaos-test modes - Milestone 21.
 //! 155 = CHAOS_BC2_MON - 500 yields; proves 5 simultaneous faults survived        (BC2)
 //! 156 = CHAOS_BC3     - 2,500 alloc-deny cycles (5× C3)                          (BC3)
-//! 157 = CHAOS_BC5     - 500-level recursive yield_cpu() stack probe (5× C5)      (BC5)
-//! 158 = CHAOS_BC6_MON - 1,000 yields on core 0; 2-hog starvation witness         (BC6)
+//! 157 = CHAOS_BC5     - 500-level recursive yield_now() stack probe (5× C5)      (BC5)
+//! 158 = CHAOS_BC6_MON - 200 yields on core 0; 2-hog starvation witness           (BC6)
 //! 159 = CHAOS_BC7     - 15 cross-core kill/respawn TLB cycles (brutal concurrent)  (BC7)
 //!
 //! Brutal performance-benchmark modes - Milestone 19.
-//! 132 = PERF_BP1      - same-core IPC roundtrip, 1000 samples (5× B1)
+//! 132 = PERF_BP1      - same-core IPC roundtrip, 100 samples (2× B1)
 //! 133 = PERF_BP1_ECHO - B1 echo (core 0)
-//! 134 = PERF_BP2      - cross-core IPC roundtrip, 1000 samples (5× B2)
+//! 134 = PERF_BP2      - cross-core IPC roundtrip, 100 samples (2× B2)
 //! 135 = PERF_BP2_ECHO - B2 echo (core 1)
-//! 136 = PERF_BP3      - yield floor, 5000 yields (5× B3)
+//! 136 = PERF_BP3      - yield floor, 2000 yields
 //! 137 = PERF_BP4      - cap validation, 50000 checks (5× B4)
 //! 138 = PERF_BP5      - spawn+restart cost, 50 cycles (5× B5/B6)
 //! 139 = PERF_BP7      - cap I/R throughput, 5000 cycles (5× B7)
 //! 140 = PERF_BP8      - allocator throughput, alloc to limit
-//! 141 = PERF_BP9      - 4 KiB message copy sender, 1000 sends (5× B9)
+//! 141 = PERF_BP9      - 4 KiB message copy sender, 400 sends
 //! 142 = PERF_BP9_RECV - B9 recv
-//! 143 = PERF_BP10     - scheduler pick-next, 5000 yields (5× B10)
+//! 143 = PERF_BP10     - scheduler pick-next, 200 yields
 
 #![no_std]
 #![no_main]
@@ -119,13 +119,13 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: table::Row) -> Result<(), godspe
     // reacquire by name and retry, exactly as `spawn_via_supervisor` does.
     let mut sent = false;
     for attempt in 0..20_000 {
-        match ctx.try_send("supervisor", &msg) {
+        match gs::ipc::try_send(ctx, "supervisor", &msg) {
             Ok(())  => { sent = true; break; }
             Err(_) => {
                 // Distinguish "queue full, wait" from "peer gone, reacquire": a stale cap never
                 // drains, so retrying it forever would hang exactly as the blocking send did.
-                if attempt % 256 == 255 { let _ = ctx.reacquire_by_name("supervisor"); }
-                ctx.yield_cpu();
+                if attempt % 256 == 255 { let _ = gs::cap::reacquire(ctx, "supervisor"); }
+                gs::task::yield_now(ctx);
             }
         }
     }
@@ -140,18 +140,19 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: table::Row) -> Result<(), godspe
     // traffic means more chance of interleaving mid-`kprintln`, and a test whose pass string arrives
     // as "adv:? A7 pas" fails on a system that behaved correctly.
     for _ in 0..1_000 {
-        if let Some(c) = ctx.acquire_send_grant_cap(name) {
+        if let Some(c) = gs::cap::acquire_grantable(ctx, name).ok() {
             // Reclaim it: this is a liveness probe, not a peer we intend to keep, and a cap left
             // behind on every respawn would fill the table over a 100k-cycle restart storm (§26.6).
-            ctx.remove_cap(c);
+            gs::cap::remove(ctx, c);
             return Ok(());
         }
-        for _ in 0..32 { ctx.yield_cpu(); }
+        for _ in 0..32 { gs::task::yield_now(ctx); }
     }
     ctx.log_fmt(format_args!("probe: '{}' never registered after a spawn request", name));
     Err(godspeed_sdk::Error::InvalidArgument)
 }
 
+use godspeed as gs;
 use godspeed_sdk::{adversarial, service_context::AllocError, CapError, CapHandle, IpcError, Message, ServiceContext};
 
 #[allow(dead_code)]
@@ -239,7 +240,7 @@ const MODE_ADV_A10:         u32 = 90; // kernel addresses as syscall args → re
 
 // Chaos-test modes - Milestone 14.
 const MODE_CHAOS_C2:        u32 = 91; // null-deref → page fault → kernel kills service
-const MODE_CHAOS_C2_MON:    u32 = 92; // 1,000 yields then log pass (C2 witness)
+const MODE_CHAOS_C2_MON:    u32 = 92; // 100 yields then log pass (C2 witness)
 // A14 (kernel-audit regression): a ring-3 CPU exception must KILL the task, never halt the kernel.
 const MODE_ADV_FAULT_GP:    u32 = 210; // ring-3 #GP (non-canonical read) → kernel kills service
 const MODE_ADV_FAULT_DE:    u32 = 211; // ring-3 #DE (inline-asm div0)    → kernel kills service
@@ -247,15 +248,15 @@ const MODE_ADV_FAULT_MON:   u32 = 212; // witness: yields then logs pass (system
 const MODE_ADV_FAULT_UC:    u32 = 213; // A15/V1: bad user pointer to `log` → kernel kills caller (USER-COPY PF)
 const MODE_ADV_FAULT_UC_MON: u32 = 214; // A15 witness: yields then logs pass (system survived the user-copy fault)
 const MODE_CHAOS_C3:        u32 = 93; // 500 alloc-deny cycles without panic
-const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_cpu(); stack depth probe
+const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_now(); stack depth probe
 const MODE_CHAOS_C6_MON:    u32 = 95; // 200 yields then log pass on core 0 (C6 witness)
 const MODE_CHAOS_C7:        u32 = 96; // 30 cross-core kill/respawn cycles; TLB shootdowns
 
 // Brutal chaos-test modes - Milestone 21.
 const MODE_CHAOS_BC2_MON:   u32 = 155; // 500 yields; 5-simultaneous-fault witness
 const MODE_CHAOS_BC3:       u32 = 156; // 2,500 alloc-deny cycles (5× C3)
-const MODE_CHAOS_BC5:       u32 = 157; // 500-level recursive yield_cpu() (5× C5)
-const MODE_CHAOS_BC6_MON:   u32 = 158; // 1,000 yields on core 0; 2-hog witness
+const MODE_CHAOS_BC5:       u32 = 157; // 500-level recursive yield_now() (5× C5)
+const MODE_CHAOS_BC6_MON:   u32 = 158; // 200 yields on core 0; 2-hog witness
 const MODE_CHAOS_BC7:       u32 = 159; // 15 cross-core kill/respawn cycles (brutal concurrent load)
 
 // Cross-core try_send diagnostic - isolates the one-way send cost that C7's "send"
@@ -297,9 +298,9 @@ const MODE_FUZZ_BF7:        u32 = 118; // BF7: stale cap / generation - 200 kill
 const MODE_FUZZ_BF8:        u32 = 119; // BF8: memory request sizes - 10 edge + 5k random
 
 // Brutal performance-benchmark modes - Milestone 19.
-const MODE_PERF_BP1:        u32 = 132; // BP1: same-core IPC roundtrip - 1000 samples (5× B1)
+const MODE_PERF_BP1:        u32 = 132; // BP1: same-core IPC roundtrip - 100 samples (2× B1)
 const MODE_PERF_BP1_ECHO:   u32 = 133; // BP1 echo (core 0)
-const MODE_PERF_BP2:        u32 = 134; // BP2: cross-core IPC roundtrip - 1000 samples (5× B2)
+const MODE_PERF_BP2:        u32 = 134; // BP2: cross-core IPC roundtrip - 100 samples (2× B2)
 const MODE_PERF_BP2_ECHO:   u32 = 135; // BP2 echo (core 1)
 const MODE_PERF_BP3:        u32 = 136; // BP3: yield floor - 2000 yields under brutal load
 const MODE_PERF_BP4:        u32 = 137; // BP4: cap validation - 50000 checks (5× B4)
@@ -308,7 +309,7 @@ const MODE_PERF_BP7:        u32 = 139; // BP7: cap I/R throughput - 5000 cycles 
 const MODE_PERF_BP8:        u32 = 140; // BP8: allocator throughput - alloc to limit
 const MODE_PERF_BP9:        u32 = 141; // BP9: 4 KiB message copy sender - 400 sends under brutal load
 const MODE_PERF_BP9_RECV:   u32 = 142; // BP9 recv
-const MODE_PERF_BP10:       u32 = 143; // BP10: scheduler pick-next - 2000 yields under brutal load
+const MODE_PERF_BP10:       u32 = 143; // BP10: scheduler pick-next - 200 yields
 
 // Brutal adversarial modes - Milestone 20.
 const MODE_ADV_BA1:          u32 = 144; // BA1: 50k cap forgery attempts (5× A1)
@@ -506,7 +507,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 fn mode_irq_recv(ctx: &ServiceContext) -> ! {
     // Signal harness that the probe is alive and blocking on recv.
     ctx.log("probe: 11A ready");
-    let msg = ctx.recv(); // blocks until FIRE_IRQ 33 delivers an interrupt event
+    let msg = gs::ipc::recv(ctx); // blocks until FIRE_IRQ 33 delivers an interrupt event
     let irq = if msg.payload_len > 0 { msg.payload[0] } else { 0 };
     if irq == 33 {
         ctx.log("probe: 11A pass irq=33");
@@ -517,18 +518,18 @@ fn mode_irq_recv(ctx: &ServiceContext) -> ! {
 }
 
 fn idle(ctx: &ServiceContext) -> ! {
-    loop { ctx.yield_cpu(); }
+    loop { gs::task::yield_now(ctx); }
 }
 
 fn mode_echo_recv(ctx: &ServiceContext) -> ! {
-    ctx.recv(); // blocks until probe-sender delivers the message
+    gs::ipc::recv(ctx); // blocks until probe-sender delivers the message
     ctx.log("probe: 3A recv OK");
     idle(ctx)
 }
 
 fn mode_echo_send(ctx: &ServiceContext) -> ! {
     let msg = Message::from_bytes(b"probe-3a-msg");
-    match ctx.send("probe-recv", &msg) {
+    match gs::ipc::send(ctx, "probe-recv", &msg) {
         Ok(()) => ctx.log("probe: 3A send OK"),
         Err(_) => ctx.log("probe: 3A send FAIL"),
     }
@@ -542,7 +543,7 @@ fn mode_no_send_right(ctx: &ServiceContext) -> ! {
     // fallback, but if probe-3b has a recv endpoint it will always be slot 2.
     let handle = ctx.recv_handle().unwrap_or(CapHandle(2));
     let msg = Message::from_bytes(b"test");
-    match ctx.try_send_by_handle(handle, &msg) {
+    match gs::ipc::exact::try_send_to(ctx, gs::cap::Cap::from(handle), &msg) {
         Err(IpcError::CapError(CapError::CapInsufficientRights)) =>
             ctx.log("probe: 3B pass - CapInsufficientRights"),
         _ => ctx.log("probe: 3B FAIL"),
@@ -555,7 +556,7 @@ fn mode_send_after_kill(ctx: &ServiceContext) -> ! {
     // The SEND cap held by probe-4a now has a stale generation → EndpointDead.
     let msg = Message::from_bytes(b"after-kill");
     let _ = ctx.kill("probe-victim");
-    match ctx.try_send("probe-victim", &msg) {
+    match gs::ipc::exact::try_send(ctx, "probe-victim", &msg) {
         Err(IpcError::EndpointDead) => ctx.log("probe: 4A pass - EndpointDead after kill"),
         Ok(())                      => ctx.log("probe: 4A FAIL - expected EndpointDead"),
         Err(_)                      => ctx.log("probe: 4A FAIL - unexpected error"),
@@ -569,10 +570,10 @@ fn mode_fill_and_block(ctx: &ServiceContext) -> ! {
     // Then block on the 17th send; the KILL wakes us with EndpointDead.
     let fill = Message::from_bytes(b"fill");
     for _ in 0u8..16 {
-        let _ = ctx.send("probe-4b-recv", &fill);
+        let _ = gs::ipc::send(ctx, "probe-4b-recv", &fill);
     }
     ctx.log("probe: 4B sender blocked");
-    match ctx.send("probe-4b-recv", &fill) {
+    match gs::ipc::exact::send(ctx, "probe-4b-recv", &fill) {
         Err(IpcError::EndpointDead) => ctx.log("probe: 4B pass - EndpointDead"),
         Ok(())                      => ctx.log("probe: 4B FAIL - expected EndpointDead"),
         Err(_)                      => ctx.log("probe: 4B FAIL - unexpected error"),
@@ -581,7 +582,7 @@ fn mode_fill_and_block(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_yield_events(ctx: &ServiceContext) -> ! {
-    for _ in 0u32..10 { ctx.yield_cpu(); }
+    for _ in 0u32..10 { gs::task::yield_now(ctx); }
     ctx.log("probe: 8A yielder ticked");
     idle(ctx)
 }
@@ -590,7 +591,7 @@ fn mode_cap_forge(ctx: &ServiceContext) -> ! {
     // Test 9B: slot 99 is beyond the 64-slot cap table → CapNotHeld (-2).
     let fake = CapHandle(99);
     let msg  = Message::from_bytes(b"forge");
-    match ctx.try_send_by_handle(fake, &msg) {
+    match gs::ipc::exact::try_send_to(ctx, gs::cap::Cap::from(fake), &msg) {
         Err(IpcError::CapError(CapError::CapNotHeld)) =>
             ctx.log("probe: 9B pass - cap forgery rejected"),
         _ => ctx.log("probe: 9B FAIL"),
@@ -600,9 +601,9 @@ fn mode_cap_forge(ctx: &ServiceContext) -> ! {
 
 fn mode_grant_recv(ctx: &ServiceContext) -> ! {
     // Test 5A receiver: wait for the message from probe-5a-send, then verify
-    // that an embedded cap arrived via take_pending_cap.
-    ctx.recv();
-    match ctx.take_pending_cap() {
+    // that an embedded cap arrived via gs::ipc::take_sent_cap.
+    gs::ipc::recv(ctx);
+    match gs::ipc::take_sent_cap(ctx) {
         Some(_) => ctx.log("probe: 5A recv OK"),
         None    => ctx.log("probe: 5A recv FAIL - no pending cap"),
     }
@@ -682,8 +683,8 @@ fn mode_prop_p1(ctx: &ServiceContext) -> ! {
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 20;
     let msg = Message::from_bytes(b"p1");
     for _ in 0..10_000u32 {
-        let slot = CapHandle(xorshift64(&mut rng) as u32);
-        if ctx.try_send_by_handle(slot, &msg).is_ok() {
+        let slot = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
+        if gs::ipc::try_send_to(ctx, slot, &msg).is_ok() {
             ctx.log("prop: P1 FAIL - random cap slot accepted as valid SEND");
             idle(ctx);
         }
@@ -698,15 +699,15 @@ fn mode_prop_p9(ctx: &ServiceContext) -> ! {
     // same endpoint). Kill the victim, then verify every slot returns
     // EndpointDead - not just the first one the kernel happens to find.
     let msg  = Message::from_bytes(b"p9");
-    let h0   = ctx.send_peer_at(0);
-    let h1   = ctx.send_peer_at(1);
-    let h2   = ctx.send_peer_at(2);
+    let h0   = gs::ipc::peer_at(ctx, 0);
+    let h1   = gs::ipc::peer_at(ctx, 1);
+    let h2   = gs::ipc::peer_at(ctx, 2);
     match (h0, h1, h2) {
         (Some(h0), Some(h1), Some(h2)) => {
             let _ = ctx.kill("prop-p9-victim");
-            let dead0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
-            let dead1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
-            let dead2 = matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead));
+            let dead0 = matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead));
+            let dead1 = matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead));
+            let dead2 = matches!(gs::ipc::exact::try_send_to(ctx, h2, &msg), Err(IpcError::EndpointDead));
             if dead0 && dead1 && dead2 {
                 ctx.log("prop: P9 pass - all 3 cap slots returned EndpointDead");
             } else {
@@ -725,10 +726,10 @@ fn mode_prop_p10(ctx: &ServiceContext) -> ! {
     // Any return value (Ok or Err) is accepted - correctness is timing, not value.
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 22;
     for _ in 0..10_000u32 {
-        let slot    = CapHandle(xorshift64(&mut rng) as u32);
+        let slot    = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
         let raw     = xorshift64(&mut rng);
         let msg     = Message::from_bytes(&raw.to_le_bytes());
-        let _       = ctx.try_send_by_handle(slot, &msg);
+        let _       = gs::ipc::try_send_to(ctx, slot, &msg);
     }
     ctx.log("prop: P10 pass (10000/10000)");
     idle(ctx)
@@ -768,7 +769,7 @@ fn mode_prop_p3(ctx: &ServiceContext) -> ! {
     // SEND|GRANT (= 4 | 16 = 20) - no widening, no bit-flipping.
     const SEND_GRANT: u64 = (1 << 2) | (1 << 4); // Rights::SEND | Rights::GRANT = 20
 
-    let mut cap_handle = match ctx.acquire_send_grant_cap("prop-p3") {
+    let mut cap_handle = match gs::cap::acquire_grantable(ctx, "prop-p3").ok() {
         Some(h) => h,
         None => {
             ctx.log("prop: P3 FAIL - could not acquire SEND|GRANT cap to self");
@@ -779,22 +780,22 @@ fn mode_prop_p3(ctx: &ServiceContext) -> ! {
     let msg = Message::from_bytes(b"p3");
 
     for _iter in 0..5000u32 {
-        match ctx.send_with_cap_by_handle(cap_handle, cap_handle, &msg) {
+        match gs::ipc::send_granting(ctx, cap_handle, cap_handle, &msg) {
             Ok(()) => {}
             Err(_) => {
                 ctx.log("prop: P3 FAIL - send_with_cap_by_handle failed");
                 idle(ctx);
             }
         }
-        ctx.recv();
-        let new_handle = match ctx.take_pending_cap() {
+        gs::ipc::recv(ctx);
+        let new_handle = match gs::ipc::take_sent_cap(ctx) {
             Some(h) => h,
             None => {
                 ctx.log("prop: P3 FAIL - no pending cap after recv");
                 idle(ctx);
             }
         };
-        let rights = match ctx.query_cap_rights(new_handle) {
+        let rights = match ctx.query_cap_rights(new_handle.handle()) {
             Some(r) => r,
             None => {
                 ctx.log("prop: P3 FAIL - cap slot empty after transfer");
@@ -829,7 +830,7 @@ fn mode_prop_p6(ctx: &ServiceContext) -> ! {
         let depth = (iter % (QUEUE_DEPTH + 1)) as u8;
 
         for _ in 0..depth {
-            match ctx.try_send("prop-p6", &msg) {
+            match gs::ipc::try_send(ctx, "prop-p6", &msg) {
                 Ok(()) => {}
                 Err(_) => {
                     ctx.log("prop: P6 FAIL - try_send failed before expected queue depth");
@@ -839,8 +840,8 @@ fn mode_prop_p6(ctx: &ServiceContext) -> ! {
         }
 
         if depth == QUEUE_DEPTH as u8 {
-            match ctx.try_send("prop-p6", &msg) {
-                Err(IpcError::QueueFull) => {}
+            match gs::ipc::try_send(ctx, "prop-p6", &msg) {
+                Err(gs::Error::Busy) => {}
                 Ok(()) => {
                     ctx.log("prop: P6 FAIL - queue accepted more than 16 messages");
                     idle(ctx);
@@ -1112,7 +1113,7 @@ fn mode_fuzz_f5(ctx: &ServiceContext) -> ! {
             *b = xorshift64(&mut rng) as u8;
         }
         let msg = Message::from_bytes(&buf[..size.min(4096)]);
-        let _ = ctx.try_send("fuzz-f5-recv", &msg);
+        let _ = gs::ipc::try_send(ctx, "fuzz-f5-recv", &msg);
     }
     ctx.log("fuzz: F5 pass (1000/1000)");
     idle(ctx)
@@ -1126,9 +1127,9 @@ fn mode_fuzz_f6(ctx: &ServiceContext) -> ! {
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 33;
     let msg = Message::from_bytes(b"f6");
     for _ in 0..1_000u32 {
-        let ep_slot  = CapHandle(xorshift64(&mut rng) as u32);
-        let cap_slot = CapHandle(xorshift64(&mut rng) as u32);
-        let _ = ctx.send_with_cap_by_handle(ep_slot, cap_slot, &msg);
+        let ep_slot  = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
+        let cap_slot = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
+        let _ = gs::ipc::send_granting(ctx, ep_slot, cap_slot, &msg);
     }
     ctx.log("fuzz: F6 pass (1000/1000)");
     idle(ctx)
@@ -1141,27 +1142,27 @@ fn mode_fuzz_f7(ctx: &ServiceContext) -> ! {
     // that cap must return EndpointDead (or another error), never Ok and never panic.
     // After each kill, high-value cap slots (never issued) are also tried → CapNotHeld.
     let msg   = Message::from_bytes(b"f7");
-    let stale = ctx.send_peer_at(0); // SEND cap to fuzz-f7-victim (slot index 0)
+    let stale = gs::ipc::peer_at(ctx, 0); // SEND cap to fuzz-f7-victim (slot index 0)
 
     for _ in 0..50u32 {
         let _ = ctx.kill("fuzz-f7-victim");
 
         // Stale cap must not return Ok.
         if let Some(h) = stale {
-            if ctx.try_send_by_handle(h, &msg).is_ok() {
+            if gs::ipc::try_send_to(ctx, h, &msg).is_ok() {
                 ctx.log("fuzz: F7 FAIL - send to killed endpoint succeeded");
                 idle(ctx);
             }
         }
 
         // High-value slot (never issued) must return CapNotHeld, not panic.
-        let _ = ctx.try_send_by_handle(CapHandle(0xBEEF), &msg);
-        let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
+        let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(0xBEEF)), &msg);
+        let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(u32::MAX)), &msg);
 
         let _ = table::probe(ctx, "fuzz-f7-victim");
         // stale cap still has old generation → still EndpointDead after respawn.
         if let Some(h) = stale {
-            let _ = ctx.try_send_by_handle(h, &msg);
+            let _ = gs::ipc::try_send_to(ctx, h, &msg);
         }
     }
     ctx.log("fuzz: F7 pass (50/50)");
@@ -1207,7 +1208,7 @@ fn mode_stress_s1(ctx: &ServiceContext) -> ! {
     // Queue fills to depth 16 after the first 16 calls; QueueFull is acceptable.
     let msg = Message::from_bytes(b"s1");
     for _ in 0..10_000u32 {
-        let _ = ctx.try_send("stress-s1-recv", &msg);
+        let _ = gs::ipc::try_send(ctx, "stress-s1-recv", &msg);
     }
     ctx.log("stress: S1 pass (10000/10000)");
     idle(ctx)
@@ -1218,7 +1219,7 @@ fn mode_stress_s2(ctx: &ServiceContext) -> ! {
     // Initial alive-check, then 50 kill/respawn cycles of stress-s2-victim.
     // If kstack freeing is broken the pool exhausts by cycle ~24 and spawn fails.
     let msg = Message::from_bytes(b"s2-ping");
-    match ctx.try_send("stress-s2-victim", &msg) {
+    match gs::ipc::try_send(ctx, "stress-s2-victim", &msg) {
         Ok(()) => {}
         Err(_) => {
             ctx.log("stress: S2 FAIL - victim not reachable at start");
@@ -1246,7 +1247,7 @@ fn mode_stress_s3_send(ctx: &ServiceContext) -> ! {
     // tasks spawn at line ~980 (~280 s of boot overhead). BS3 extends to 2000 msgs.
     let msg = Message::from_bytes(b"s3");
     for _ in 0..50u32 {
-        let _ = ctx.send("stress-s3-recv", &msg);
+        let _ = gs::ipc::send(ctx, "stress-s3-recv", &msg);
     }
     idle(ctx)
 }
@@ -1255,7 +1256,7 @@ fn mode_stress_s3_recv(ctx: &ServiceContext) -> ! {
     // S3 receiver (§22 Stress S3).
     // Drain 50 cross-core messages from stress-s3-send on core 0.
     for _ in 0..50u32 {
-        ctx.recv();
+        gs::ipc::recv(ctx);
     }
     ctx.log("stress: S3 pass (50/50)");
     idle(ctx)
@@ -1269,14 +1270,14 @@ fn mode_stress_s4(ctx: &ServiceContext) -> ! {
     // First kill: verify both caps go EndpointDead simultaneously.
     // 50 cycles: spawn+kill, confirm generation strictly monotonic, confirm
     // both stale caps remain EndpointDead throughout.
-    let h0 = match ctx.send_peer_at(0) {
+    let h0 = match gs::ipc::peer_at(ctx, 0) {
         Some(h) => h,
         None => {
             ctx.log("stress: S4 FAIL - no peer handle h0");
             idle(ctx);
         }
     };
-    let h1 = match ctx.send_peer_at(1) {
+    let h1 = match gs::ipc::peer_at(ctx, 1) {
         Some(h) => h,
         None => {
             ctx.log("stress: S4 FAIL - no peer handle h1");
@@ -1285,22 +1286,22 @@ fn mode_stress_s4(ctx: &ServiceContext) -> ! {
     };
     let msg = Message::from_bytes(b"s4");
 
-    if ctx.try_send_by_handle(h0, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h0, &msg).is_err() {
         ctx.log("stress: S4 FAIL - cap A not valid pre-kill");
         idle(ctx);
     }
-    if ctx.try_send_by_handle(h1, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h1, &msg).is_err() {
         ctx.log("stress: S4 FAIL - cap B not valid pre-kill");
         idle(ctx);
     }
 
     let _ = ctx.kill("stress-s4-victim");
 
-    if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+    if !matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead)) {
         ctx.log("stress: S4 FAIL - cap A survived first kill");
         idle(ctx);
     }
-    if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+    if !matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead)) {
         ctx.log("stress: S4 FAIL - cap B survived first kill");
         idle(ctx);
     }
@@ -1328,11 +1329,11 @@ fn mode_stress_s4(ctx: &ServiceContext) -> ! {
         }
         prev_gen = gen;
         let _ = ctx.kill("stress-s4-victim");
-        if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+        if !matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: S4 FAIL - cap A not stale during churn");
             idle(ctx);
         }
-        if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+        if !matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: S4 FAIL - cap B not stale during churn");
             idle(ctx);
         }
@@ -1407,14 +1408,14 @@ fn mode_stress_s6(ctx: &ServiceContext) -> ! {
     ctx.log("stress: S6 start");
     let msg = Message::from_bytes(b"s6");
     for _ in 0..500u32 {
-        match ctx.send("stress-s6", &msg) {
+        match gs::ipc::send(ctx, "stress-s6", &msg) {
             Ok(()) => {}
             Err(_) => {
                 ctx.log("stress: S6 FAIL - send to self returned error");
                 idle(ctx);
             }
         }
-        ctx.recv();
+        gs::ipc::recv(ctx);
     }
     ctx.log("stress: S6 pass (500/500)");
     idle(ctx)
@@ -1427,7 +1428,7 @@ fn mode_stress_s8(ctx: &ServiceContext) -> ! {
     // costs ~500 ms wall-clock; 5 yields keeps the test well within 200 s.
     ctx.log("stress: S8 start");
     for _ in 0..5u32 {
-        ctx.yield_cpu();
+        gs::task::yield_now(ctx);
     }
     ctx.log("stress: S8 pass (5 yields)");
     idle(ctx)
@@ -1442,9 +1443,9 @@ fn mode_stress_s9_send(ctx: &ServiceContext) -> ! {
     let msg = Message::from_bytes(b"s9");
     for _ in 0..50u32 {
         loop {
-            match ctx.try_send("stress-s9-recv", &msg) {
+            match gs::ipc::try_send(ctx, "stress-s9-recv", &msg) {
                 Ok(()) => break,
-                Err(_) => ctx.yield_cpu(),
+                Err(_) => gs::task::yield_now(ctx),
             }
         }
     }
@@ -1455,7 +1456,7 @@ fn mode_stress_s9_recv(ctx: &ServiceContext) -> ! {
     // S9 receiver (§22 Stress S9).
     // Drains 100 messages from the two S9 senders (50 each from cores 0 and 1).
     for _ in 0..100u32 {
-        ctx.recv();
+        gs::ipc::recv(ctx);
     }
     ctx.log("stress: S9 pass (100/100)");
     idle(ctx)
@@ -1468,21 +1469,21 @@ fn mode_stress_s10(ctx: &ServiceContext) -> ! {
     // Kill victim → all 3 caps must return EndpointDead simultaneously,
     // proving that the generation bump propagates to all cap-table holders
     // on a different core without any synchronous notification.
-    let h0 = match ctx.send_peer_at(0) {
+    let h0 = match gs::ipc::peer_at(ctx, 0) {
         Some(h) => h,
         None => {
             ctx.log("stress: S10 FAIL - no peer handle h0");
             idle(ctx);
         }
     };
-    let h1 = match ctx.send_peer_at(1) {
+    let h1 = match gs::ipc::peer_at(ctx, 1) {
         Some(h) => h,
         None => {
             ctx.log("stress: S10 FAIL - no peer handle h1");
             idle(ctx);
         }
     };
-    let h2 = match ctx.send_peer_at(2) {
+    let h2 = match gs::ipc::peer_at(ctx, 2) {
         Some(h) => h,
         None => {
             ctx.log("stress: S10 FAIL - no peer handle h2");
@@ -1491,24 +1492,24 @@ fn mode_stress_s10(ctx: &ServiceContext) -> ! {
     };
     let msg = Message::from_bytes(b"s10");
 
-    if ctx.try_send_by_handle(h0, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h0, &msg).is_err() {
         ctx.log("stress: S10 FAIL - cap A not valid pre-kill");
         idle(ctx);
     }
-    if ctx.try_send_by_handle(h1, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h1, &msg).is_err() {
         ctx.log("stress: S10 FAIL - cap B not valid pre-kill");
         idle(ctx);
     }
-    if ctx.try_send_by_handle(h2, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h2, &msg).is_err() {
         ctx.log("stress: S10 FAIL - cap C not valid pre-kill");
         idle(ctx);
     }
 
     let _ = ctx.kill("stress-s10-victim");
 
-    let dead0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
-    let dead1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
-    let dead2 = matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead));
+    let dead0 = matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead));
+    let dead1 = matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead));
+    let dead2 = matches!(gs::ipc::exact::try_send_to(ctx, h2, &msg), Err(IpcError::EndpointDead));
 
     if dead0 && dead1 && dead2 {
         ctx.log("stress: S10 pass (3/3 caps dead)");
@@ -1540,8 +1541,8 @@ fn mode_perf_b1(ctx: &ServiceContext) -> ! {
     // B1: same-core IPC round-trip latency (§22 Perf B1).
     // Dynamically acquire a SEND cap to the echo partner (which registered after us).
     let echo_cap = loop {
-        if let Some(cap) = ctx.acquire_send_cap("perf-b1-echo") { break cap; }
-        ctx.yield_cpu();
+        if let Some(cap) = gs::cap::acquire(ctx, "perf-b1-echo").ok() { break cap; }
+        gs::task::yield_now(ctx);
     };
 
     let msg = Message::from_bytes(b"b1");
@@ -1551,10 +1552,10 @@ fn mode_perf_b1(ctx: &ServiceContext) -> ! {
     let mut samples = [0u64; N];
 
     for i in 0..N {
-        let t0 = ctx.read_tsc();
-        let _ = ctx.send_by_handle(echo_cap, &msg);
-        ctx.recv();
-        let t1 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
+        let _ = gs::ipc::send_to(ctx, echo_cap, &msg);
+        gs::ipc::recv(ctx);
+        let t1 = gs::driver::wait::ticks(ctx);
         samples[i] = t1.wrapping_sub(t0);
     }
 
@@ -1570,8 +1571,8 @@ fn mode_perf_b1_echo(ctx: &ServiceContext) -> ! {
     // B1 echo: recv message, send it back (same core, no measurement).
     let msg = Message::from_bytes(b"b1e");
     loop {
-        ctx.recv();
-        let _ = ctx.send("perf-b1", &msg);
+        gs::ipc::recv(ctx);
+        let _ = gs::ipc::send(ctx, "perf-b1", &msg);
     }
 }
 
@@ -1579,8 +1580,8 @@ fn mode_perf_b2(ctx: &ServiceContext) -> ! {
     // B2: cross-core IPC round-trip latency (§22 Perf B2).
     // Same structure as B1 but echo lives on a different core.
     let echo_cap = loop {
-        if let Some(cap) = ctx.acquire_send_cap("perf-b2-echo") { break cap; }
-        ctx.yield_cpu();
+        if let Some(cap) = gs::cap::acquire(ctx, "perf-b2-echo").ok() { break cap; }
+        gs::task::yield_now(ctx);
     };
 
     let msg = Message::from_bytes(b"b2");
@@ -1590,10 +1591,10 @@ fn mode_perf_b2(ctx: &ServiceContext) -> ! {
     let mut samples = [0u64; N];
 
     for i in 0..N {
-        let t0 = ctx.read_tsc();
-        let _ = ctx.send_by_handle(echo_cap, &msg);
-        ctx.recv();
-        let t1 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
+        let _ = gs::ipc::send_to(ctx, echo_cap, &msg);
+        gs::ipc::recv(ctx);
+        let t1 = gs::driver::wait::ticks(ctx);
         samples[i] = t1.wrapping_sub(t0);
     }
 
@@ -1609,8 +1610,8 @@ fn mode_perf_b2_echo(ctx: &ServiceContext) -> ! {
     // B2 echo: recv message, send it back (cross-core, no measurement).
     let msg = Message::from_bytes(b"b2e");
     loop {
-        ctx.recv();
-        let _ = ctx.send("perf-b2", &msg);
+        gs::ipc::recv(ctx);
+        let _ = gs::ipc::send(ctx, "perf-b2", &msg);
     }
 }
 
@@ -1620,9 +1621,9 @@ fn mode_perf_b3(ctx: &ServiceContext) -> ! {
     // cost 3-5s wall under full QEMU TCG load; 50×3.4s ≈ 170s > post-spawn headroom.
     // 10 samples still produce a valid TSC mean for baseline tracking.
     const N: u64 = 10;
-    let t0 = ctx.read_tsc();
-    for _ in 0..N { ctx.yield_cpu(); }
-    let t1 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
+    for _ in 0..N { gs::task::yield_now(ctx); }
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: B3 mean={mean} cycles/yield"));
     ctx.log("perf: B3 done");
@@ -1636,9 +1637,9 @@ fn mode_perf_b4(ctx: &ServiceContext) -> ! {
         None    => { ctx.log("perf: B4 FAIL - no recv cap"); idle(ctx); }
     };
     const N: u64 = 10_000;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     for _ in 0..N { ctx.query_cap_rights(handle); }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: B4 mean={mean} cycles/cap-check"));
     ctx.log("perf: B4 done");
@@ -1654,9 +1655,9 @@ fn mode_perf_b5(ctx: &ServiceContext) -> ! {
     let _ = ctx.kill("perf-b5-victim"); // kill initially-running victim
     let mut total_spawn: u64 = 0;
     for _ in 0..N {
-        let t0 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
         let _ = table::probe(ctx, "perf-b5-victim");
-        let t1 = ctx.read_tsc();
+        let t1 = gs::driver::wait::ticks(ctx);
         total_spawn += t1.wrapping_sub(t0);
         let _ = ctx.kill("perf-b5-victim");
     }
@@ -1668,10 +1669,10 @@ fn mode_perf_b5(ctx: &ServiceContext) -> ! {
     let _ = table::probe(ctx, "perf-b5-victim"); // ensure alive before cycling
     let mut total_restart: u64 = 0;
     for _ in 0..N {
-        let t0 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
         let _ = ctx.kill("perf-b5-victim");
         let _ = table::probe(ctx, "perf-b5-victim");
-        let t1 = ctx.read_tsc();
+        let t1 = gs::driver::wait::ticks(ctx);
         total_restart += t1.wrapping_sub(t0);
     }
     let restart_mean = total_restart / N as u64;
@@ -1683,13 +1684,13 @@ fn mode_perf_b5(ctx: &ServiceContext) -> ! {
 fn mode_perf_b7(ctx: &ServiceContext) -> ! {
     // B7: cap table insert/remove throughput - acquire SEND cap to self then remove (§22 Perf B7).
     const N: u64 = 1_000;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     for _ in 0..N {
-        if let Some(cap) = ctx.acquire_send_cap("perf-b7") {
-            ctx.remove_cap(cap);
+        if let Some(cap) = gs::cap::acquire(ctx, "perf-b7").ok() {
+            gs::cap::remove(ctx, cap);
         }
     }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: B7 mean={mean} cycles/cap-insert-remove"));
     ctx.log("perf: B7 done");
@@ -1699,7 +1700,7 @@ fn mode_perf_b7(ctx: &ServiceContext) -> ! {
 fn mode_perf_b8(ctx: &ServiceContext) -> ! {
     // B8: allocator throughput - alloc 4 KiB pages until memory limit (§22 Perf B8).
     let mut n_alloc: u64 = 0;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     loop {
         match ctx.alloc_mem(4096) {
             Ok(_)                   => n_alloc += 1,
@@ -1707,7 +1708,7 @@ fn mode_perf_b8(ctx: &ServiceContext) -> ! {
             Err(_)                  => break,
         }
     }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = if n_alloc > 0 { t1.wrapping_sub(t0) / n_alloc } else { 0 };
     ctx.log_fmt(format_args!("perf: B8 n={n_alloc} mean={mean} cycles/alloc-4kib"));
     ctx.log("perf: B8 done");
@@ -1721,11 +1722,11 @@ fn mode_perf_b9(ctx: &ServiceContext) -> ! {
     msg.payload_len = 4096;
 
     const N: u64 = 200;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     for _ in 0..N {
-        let _ = ctx.send("perf-b9-recv", &msg);
+        let _ = gs::ipc::send(ctx, "perf-b9-recv", &msg);
     }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: B9 mean={mean} cycles/4kib-send"));
     ctx.log("perf: B9 done");
@@ -1734,7 +1735,7 @@ fn mode_perf_b9(ctx: &ServiceContext) -> ! {
 
 fn mode_perf_b9_recv(ctx: &ServiceContext) -> ! {
     // B9 receiver: drain all incoming messages so sender never permanently blocks.
-    loop { ctx.recv(); }
+    loop { gs::ipc::recv(ctx); }
 }
 
 fn mode_perf_b10(ctx: &ServiceContext) -> ! {
@@ -1743,9 +1744,9 @@ fn mode_perf_b10(ctx: &ServiceContext) -> ! {
     // N=10: mirrors B3 - brutal stress tasks make each yield cost 3-5s wall;
     // 10 samples fit within post-spawn headroom and still produce a valid mean.
     const N: u64 = 10;
-    let t0 = ctx.read_tsc();
-    for _ in 0..N { ctx.yield_cpu(); }
-    let t1 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
+    for _ in 0..N { gs::task::yield_now(ctx); }
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: B10 mean={mean} cycles/yield"));
     ctx.log("perf: B10 done");
@@ -1759,13 +1760,13 @@ fn mode_perf_b10(ctx: &ServiceContext) -> ! {
 fn mode_adv_a1(ctx: &ServiceContext) -> ! {
     // A1 - Cap unforgeability under adversarial input (§22 Adversarial A1, §7.3).
     // 10,000 random u32 slot indices. adv-a1 holds no SEND caps; every
-    // try_send_by_handle must return Err. An Ok return proves a forged cap -
+    // gs::ipc::try_send_to must return Err. An Ok return proves a forged cap -
     // a constitutional violation.
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 80;
     let msg = Message::from_bytes(b"a1");
     for _ in 0..10_000u32 {
-        let slot = CapHandle(xorshift64(&mut rng) as u32);
-        if ctx.try_send_by_handle(slot, &msg).is_ok() {
+        let slot = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
+        if gs::ipc::try_send_to(ctx, slot, &msg).is_ok() {
             ctx.log("adv: A1 FAIL - random cap slot accepted as valid SEND");
             idle(ctx);
         }
@@ -1780,10 +1781,10 @@ fn mode_adv_a2(ctx: &ServiceContext) -> ! {
     // an extreme out-of-range value. Every call must return a defined error.
     let msg = Message::from_bytes(b"a2");
     for slot in 0u32..128u32 {
-        let _ = ctx.try_send_by_handle(CapHandle(slot), &msg);
+        let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(slot)), &msg);
     }
-    let _ = ctx.try_send_by_handle(CapHandle(0xFFFF), &msg);
-    let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
+    let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(0xFFFF)), &msg);
+    let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(u32::MAX)), &msg);
     ctx.log("adv: A2 pass - all slot values returned defined errors");
     idle(ctx)
 }
@@ -1816,7 +1817,7 @@ fn mode_adv_a4(ctx: &ServiceContext) -> ! {
     // to try_send_by_handle must return CapInsufficientRights - the SEND right is absent.
     let handle = ctx.recv_handle().unwrap_or(CapHandle(2));
     let msg = Message::from_bytes(b"a4");
-    match ctx.try_send_by_handle(handle, &msg) {
+    match gs::ipc::exact::try_send_to(ctx, gs::cap::Cap::from(handle), &msg) {
         Err(IpcError::CapError(CapError::CapInsufficientRights)) =>
             ctx.log("adv: A4 pass - CapInsufficientRights on RECV cap used as SEND"),
         Ok(())  => ctx.log("adv: A4 FAIL - RECV cap accepted as SEND cap"),
@@ -1831,7 +1832,7 @@ fn mode_adv_a5(ctx: &ServiceContext) -> ! {
     // now has a stale generation. The kernel's generation check (§8.7) must catch this.
     let msg = Message::from_bytes(b"a5");
     let _ = ctx.kill("adv-a5-victim");
-    match ctx.try_send("adv-a5-victim", &msg) {
+    match gs::ipc::exact::try_send(ctx, "adv-a5-victim", &msg) {
         Err(IpcError::EndpointDead) => ctx.log("adv: A5 pass - EndpointDead after kill"),
         Ok(())  => ctx.log("adv: A5 FAIL - send succeeded after victim killed"),
         Err(_)  => ctx.log("adv: A5 FAIL - unexpected error after kill"),
@@ -1840,13 +1841,13 @@ fn mode_adv_a5(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_adv_a6(ctx: &ServiceContext) -> ! {
-    // A6 - Fill own cap table via acquire_send_cap loop (§22 Adversarial A6).
+    // A6 - Fill own cap table via gs::cap::acquire loop (§22 Adversarial A6).
     // adv-a6 has recv endpoint (slot 2=RECV, pre-filled). Slots 0=log, 1=spawn.
-    // acquire_send_cap("adv-a6") inserts a SEND cap each call, up to table capacity.
+    // gs::cap::acquire("adv-a6") inserts a SEND cap each call, up to table capacity.
     // When None is returned the table is full - kernel must not panic on exhaustion.
     let mut count = 0u32;
     loop {
-        match ctx.acquire_send_cap("adv-a6") {
+        match gs::cap::acquire(ctx, "adv-a6").ok() {
             Some(_) => count += 1,
             None    => break,
         }
@@ -1863,11 +1864,11 @@ fn mode_adv_a7(ctx: &ServiceContext) -> ! {
     // the loop so timing statistics are logged. No panic.
     let msg = Message::from_bytes(b"a7");
     const N: u64 = 100;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     for _ in 0..N {
-        let _ = ctx.try_send("adv-a7-recv", &msg);
+        let _ = gs::ipc::try_send(ctx, "adv-a7-recv", &msg);
     }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("adv: A7 timing mean={mean} cycles/try_send"));
     ctx.log("adv: A7 pass - timing analysis completed without panic");
@@ -1878,7 +1879,7 @@ fn mode_adv_a8_witness(ctx: &ServiceContext) -> ! {
     // A8 witness - yields 1,000 times then logs pass (§22 Adversarial A8).
     // Runs alongside adv-a8 (tight loop hog). Timer-driven preemption (§9.1)
     // must give this service enough quanta to complete all yields.
-    for _ in 0..1_000u32 { ctx.yield_cpu(); }
+    for _ in 0..1_000u32 { gs::task::yield_now(ctx); }
     ctx.log("adv: A8 pass - witness ran despite tight-loop hog");
     idle(ctx)
 }
@@ -1974,7 +1975,7 @@ fn mode_adv_a11(ctx: &ServiceContext) -> ! {
     }
     // Ambient queries stay open with no cap: the TSC clock (InspectKernel 3) must
     // still return a nonzero value.
-    if ctx.read_tsc() == 0 {
+    if gs::driver::wait::ticks(ctx) == 0 {
         ctx.log("adv: A11 FAIL - ambient TSC query (InspectKernel 3) returned 0");
         idle(ctx);
     }
@@ -2001,9 +2002,9 @@ fn mode_adv_a12(ctx: &ServiceContext) -> ! {
 fn mode_adv_a13(ctx: &ServiceContext) -> ! {
     // A13 - AcquireSendCap is gated by ACQUIRE_ANY-or-declared-peer (§3.1). adv-a13 holds NO ACQUIRE_ANY
     // (excluded from the probe grant) and declares NO send-peers, so minting a SEND cap to ANY service
-    // must be DENIED (CapNotHeld -> acquire_send_cap returns None). `events` is a real registered
+    // must be DENIED (CapNotHeld -> gs::cap::acquire returns Err). `events` is a real registered
     // service, so a `Some` here would mean the gate is open (ambient send authority).
-    if ctx.acquire_send_cap("events").is_some() {
+    if gs::cap::acquire(ctx, "events").ok().is_some() {
         ctx.log("adv: A13 FAIL - acquired a SEND cap to a non-peer without ACQUIRE_ANY (gate open)");
         idle(ctx);
     }
@@ -2020,8 +2021,8 @@ fn mode_adv_ba1(ctx: &ServiceContext) -> ! {
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 144;
     let msg = Message::from_bytes(b"ba1");
     for _ in 0..50_000u32 {
-        let slot = CapHandle(xorshift64(&mut rng) as u32);
-        if ctx.try_send_by_handle(slot, &msg).is_ok() {
+        let slot = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
+        if gs::ipc::try_send_to(ctx, slot, &msg).is_ok() {
             ctx.log("adv: BA1 FAIL - random cap slot accepted as valid SEND");
             idle(ctx);
         }
@@ -2034,10 +2035,10 @@ fn mode_adv_ba2(ctx: &ServiceContext) -> ! {
     // BA2: Brute-force cap slots 0..=511 + 4 extreme values (§22 Brutal Adv BA2).
     let msg = Message::from_bytes(b"ba2");
     for slot in 0u32..512u32 {
-        let _ = ctx.try_send_by_handle(CapHandle(slot), &msg);
+        let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(slot)), &msg);
     }
     for &slot in &[0xFFFF_u32, 0x0001_0000, 0x7FFF_FFFF, u32::MAX] {
-        let _ = ctx.try_send_by_handle(CapHandle(slot), &msg);
+        let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(slot)), &msg);
     }
     ctx.log("adv: BA2 pass - extended slot sweep returned defined errors");
     idle(ctx)
@@ -2061,14 +2062,14 @@ fn mode_adv_ba4(ctx: &ServiceContext) -> ! {
     let recv_handle = ctx.recv_handle().unwrap_or(CapHandle(2));
     let msg = Message::from_bytes(b"ba4");
     for _ in 0..5u32 {
-        match ctx.try_send_by_handle(recv_handle, &msg) {
+        match gs::ipc::exact::try_send_to(ctx, gs::cap::Cap::from(recv_handle), &msg) {
             Err(IpcError::CapError(CapError::CapInsufficientRights)) => {}
             Ok(()) => { ctx.log("adv: BA4 FAIL - RECV cap accepted as SEND"); idle(ctx); }
             Err(_) => {}
         }
     }
-    let _ = ctx.try_send_by_handle(CapHandle(0), &msg); // log_write - not SEND
-    let _ = ctx.try_send_by_handle(CapHandle(1), &msg); // spawn - not SEND
+    let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(0)), &msg); // log_write - not SEND
+    let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(1)), &msg); // spawn - not SEND
     ctx.log("adv: BA4 pass - 5× RECV-cap-as-SEND rejected; non-SEND caps rejected");
     idle(ctx)
 }
@@ -2079,8 +2080,8 @@ fn mode_adv_ba5(ctx: &ServiceContext) -> ! {
     let mut pass = 0u32;
     for _ in 0..5u32 {
         let _ = ctx.kill("adv-ba5-victim");
-        match ctx.try_send("adv-ba5-victim", &msg) {
-            Err(IpcError::EndpointDead) | Err(_) => pass += 1,
+        match gs::ipc::try_send(ctx, "adv-ba5-victim", &msg) {
+            Err(gs::Error::Unreachable) | Err(_) => pass += 1,
             Ok(()) => { ctx.log("adv: BA5 FAIL - send succeeded after victim killed"); idle(ctx); }
         }
     }
@@ -2091,21 +2092,21 @@ fn mode_adv_ba5(ctx: &ServiceContext) -> ! {
 fn mode_adv_ba6(ctx: &ServiceContext) -> ! {
     // BA6: fill the cap table to exhaustion, DRAIN it, and repeat 5x - each cycle must genuinely hit
     // exhaustion and recover (§22 Brutal Adv BA6). Draining between cycles is what makes all 5 real:
-    // without the remove_cap below, cycle 0 filled the table and cycles 1-4 saw it ALREADY full and did
+    // without the gs::cap::remove below, cycle 0 filled the table and cycles 1-4 saw it ALREADY full and did
     // nothing (filled=0) - a trivially-passing test proves nothing (audit L6). CAP_MAX exceeds the
     // kernel per-task cap-table size, so every acquired handle is tracked and returned.
     const CAP_MAX: usize = 128;
-    let mut held = [CapHandle(0); CAP_MAX];
+    let mut held = [gs::cap::Cap::from(CapHandle(0)); CAP_MAX];
     for cycle in 0..5u32 {
         let mut count = 0usize;
         loop {
-            match ctx.acquire_send_cap("adv-ba6") {
+            match gs::cap::acquire(ctx, "adv-ba6").ok() {
                 Some(h) => { if count < CAP_MAX { held[count] = h; } count += 1; }
                 None    => break,
             }
         }
         // Drain every cap we took so the NEXT cycle fills from EMPTY - a real exhaustion again, not a no-op.
-        for h in held.iter().take(count.min(CAP_MAX)) { ctx.remove_cap(*h); }
+        for h in held.iter().take(count.min(CAP_MAX)) { gs::cap::remove(ctx, *h); }
         ctx.log_fmt(format_args!("adv: BA6 cycle={cycle} filled={count}"));
     }
     ctx.log("adv: BA6 pass - 5x fill-to-exhaustion + drain, each cycle real, no panic");
@@ -2116,11 +2117,11 @@ fn mode_adv_ba7(ctx: &ServiceContext) -> ! {
     // BA7: 500 timing samples (5× A7) (§22 Brutal Adv BA7).
     let msg = Message::from_bytes(b"ba7");
     const N: u64 = 500;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     for _ in 0..N {
-        let _ = ctx.try_send("adv-ba7-recv", &msg);
+        let _ = gs::ipc::try_send(ctx, "adv-ba7-recv", &msg);
     }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("adv: BA7 timing mean={mean} cycles/try_send"));
     ctx.log("adv: BA7 pass - 500 timing sends completed without panic");
@@ -2132,7 +2133,7 @@ fn mode_adv_ba8_witness(ctx: &ServiceContext) -> ! {
     // 1000 was still too slow once the full brutal-suite load hits core 3.
     // Spawned early (before property/stress kill-respawn loops) so 200 yields
     // suffice to prove preemption fires while the system is still quiet.
-    for _ in 0..200u32 { ctx.yield_cpu(); }
+    for _ in 0..200u32 { gs::task::yield_now(ctx); }
     ctx.log("adv: BA8 pass - witness ran 200 yields despite tight-loop hog");
     idle(ctx)
 }
@@ -2187,7 +2188,7 @@ fn mode_chaos_c2(_ctx: &ServiceContext) -> ! {
 fn mode_chaos_c2_monitor(ctx: &ServiceContext) -> ! {
     // C2 witness - 100 yields then log pass, proving the system continued after
     // chaos-c2 was killed by the kernel's page-fault handler (§22 Chaos C2).
-    for _ in 0..100u32 { ctx.yield_cpu(); }
+    for _ in 0..100u32 { gs::task::yield_now(ctx); }
     ctx.log("chaos: C2 pass - system continued after non-TCB page fault");
     idle(ctx)
 }
@@ -2215,7 +2216,7 @@ fn mode_adv_fault_mon(ctx: &ServiceContext) -> ! {
     // then log pass - proving the kernel KILLED the ring-3 faulters and the system continued rather than
     // wedging (invariant 12; kernel-audit C1/C2). If the fix were wrong the kernel would halt and this
     // line would never print (the test times out / trips its KERNEL-fault fail_on).
-    for _ in 0..1000u32 { ctx.yield_cpu(); }
+    for _ in 0..1000u32 { gs::task::yield_now(ctx); }
     ctx.log("adv: A14 pass - ring-3 #GP + #DE killed the task, kernel alive");
     idle(ctx)
 }
@@ -2236,7 +2237,7 @@ fn mode_adv_fault_usercopy_mon(ctx: &ServiceContext) -> ! {
     // A15 witness: the faulter passes a bad pointer to `log` on another core; yield long enough for it to
     // fault and be killed, then log pass - proving the kernel killed the CALLER at the user-copy rather
     // than halting (invariant 12; kernel-audit V1). A wrong fix halts every core and this never prints.
-    for _ in 0..1000u32 { ctx.yield_cpu(); }
+    for _ in 0..1000u32 { gs::task::yield_now(ctx); }
     ctx.log("adv: A15 pass - bad user pointer killed the caller, kernel alive");
     idle(ctx)
 }
@@ -2262,7 +2263,7 @@ fn mode_chaos_c3(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_chaos_c5(ctx: &ServiceContext) -> ! {
-    // C5 - Kernel stack depth probe: 100 nested recursive yield_cpu() calls (§22 Chaos C5).
+    // C5 - Kernel stack depth probe: 100 nested recursive yield_now() calls (§22 Chaos C5).
     // Each frame issues one syscall; the kernel's per-syscall stack usage must not
     // accumulate across the 100 user-side recursion levels.
     let depth = chaos_c5_recurse(ctx, 100, 0);
@@ -2273,7 +2274,7 @@ fn mode_chaos_c5(ctx: &ServiceContext) -> ! {
 #[inline(never)]
 fn chaos_c5_recurse(ctx: &ServiceContext, remaining: u32, depth: u32) -> u32 {
     if remaining == 0 { return depth; }
-    ctx.yield_cpu();
+    gs::task::yield_now(ctx);
     chaos_c5_recurse(ctx, remaining - 1, depth + 1)
 }
 
@@ -2281,7 +2282,7 @@ fn mode_chaos_c6_monitor(ctx: &ServiceContext) -> ! {
     // C6 witness (core 0) - 200 yields then log pass (§22 Chaos C6).
     // chaos-c6-hog runs a tight loop on core 3 (simulating timer starvation on that core).
     // This probe on core 0 verifies that the other cores remain scheduled normally.
-    for _ in 0..200u32 { ctx.yield_cpu(); }
+    for _ in 0..200u32 { gs::task::yield_now(ctx); }
     ctx.log("chaos: C6 pass - core 0 alive despite core 3 hog");
     idle(ctx)
 }
@@ -2295,25 +2296,25 @@ fn mode_chaos_c7(ctx: &ServiceContext) -> ! {
     // settle) and report mean cycles-per-section at each iter marker. This attributes
     // the ~1.56 s/cycle uncontended cost measured on the T630 - confirming whether it
     // lives in the cross-core kill (TLB-shootdown broadcast) or elsewhere, and proving
-    // the 50-yield settle loop is negligible. read_tsc is InspectKernel query 3
+    // the 50-yield settle loop is negligible. gs::driver::wait::ticks is InspectKernel query 3
     // (ungated, no cap); its own per-call cost sits inside every bracket equally, so
     // the *relative* split is honest even though absolutes carry a small fixed offset.
     let msg = Message::from_bytes(b"c7");
     let (mut c_send, mut c_kill, mut c_spawn, mut c_yield) = (0u64, 0u64, 0u64, 0u64);
     for i in 0..30u32 {
         // try_send exercises the generation-check on a live (or recently-dead) endpoint.
-        let t0 = ctx.read_tsc();
-        let _ = ctx.try_send("chaos-c7-victim", &msg);
-        let t1 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
+        let _ = gs::ipc::try_send(ctx, "chaos-c7-victim", &msg);
+        let t1 = gs::driver::wait::ticks(ctx);
         // Kill victim on core 2 → IPI → TLB shootdown → page frames reclaimed.
         let _ = ctx.kill("chaos-c7-victim");
-        let t2 = ctx.read_tsc();
+        let t2 = gs::driver::wait::ticks(ctx);
         // Respawn on core 2 → new page table mapping → another TLB shootdown on core 2.
         let _ = table::probe(ctx, "chaos-c7-victim");
-        let t3 = ctx.read_tsc();
+        let t3 = gs::driver::wait::ticks(ctx);
         // Brief yield to allow the new victim to be scheduled and its pages faulted in.
-        for _ in 0..50u32 { ctx.yield_cpu(); }
-        let t4 = ctx.read_tsc();
+        for _ in 0..50u32 { gs::task::yield_now(ctx); }
+        let t4 = gs::driver::wait::ticks(ctx);
 
         c_send  = c_send.wrapping_add(t1.wrapping_sub(t0));
         c_kill  = c_kill.wrapping_add(t2.wrapping_sub(t1));
@@ -2340,7 +2341,7 @@ fn mode_xsend_recv(ctx: &ServiceContext) -> ! {
     // blocks when the queue is empty, so the sender on core 1 finds us either
     // blocked-on-recv (its send fires a cross-core IPI wake) or with queue space.
     // No echo - this isolates the ONE-WAY send cost, never a round-trip.
-    loop { let _ = ctx.recv(); }
+    loop { let _ = gs::ipc::recv(ctx); }
 }
 
 fn mode_xsend(ctx: &ServiceContext) -> ! {
@@ -2349,24 +2350,24 @@ fn mode_xsend(ctx: &ServiceContext) -> ! {
     // victim (stale cap → EndpointDead). Here the receiver is always LIVE.
     //
     // Reports mean RDTSC cyc/op (T630 ~2 GHz → cyc/2000 = µs) over N iters:
-    //   tsc-overhead : back-to-back read_tsc - subtract this from every figure below
+    //   tsc-overhead : back-to-back wait::ticks - subtract this from every figure below
     //   paced-handle : 30 yields between sends so the receiver is blocked → each send
     //                  enqueues + fires the cross-core IPI wake (by handle, no lookup)
     //   tight-handle : back-to-back sends - queue saturates → mostly QueueFull fast path
     //   paced-name   : paced, via try_send(name) → adds the userspace cap-cache lookup
     // paced-handle is the apples-to-apples comparison against C7's ~249 ms "send".
-    let h = match ctx.send_peer_at(0) {
+    let h = match gs::ipc::peer_at(ctx, 0) {
         Some(h) => h,
         None => { ctx.log("xsend: FAIL - no send cap to xsend-recv"); idle(ctx); }
     };
     let msg = Message::from_bytes(b"x");
     const N: u64 = 2000;
 
-    // Baseline: empty read_tsc→read_tsc bracket (the fixed per-measurement offset).
+    // Baseline: empty ticks→ticks bracket (the fixed per-measurement offset).
     let mut acc = 0u64;
     for _ in 0..N {
-        let t0 = ctx.read_tsc();
-        let t1 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
+        let t1 = gs::driver::wait::ticks(ctx);
         acc = acc.wrapping_add(t1.wrapping_sub(t0));
     }
     let tsc_overhead = acc / N;
@@ -2374,10 +2375,10 @@ fn mode_xsend(ctx: &ServiceContext) -> ! {
     // paced-handle: receiver blocked → cross-core IPI wake on each send.
     acc = 0;
     for _ in 0..N {
-        for _ in 0..30u32 { ctx.yield_cpu(); }
-        let t0 = ctx.read_tsc();
-        let _ = ctx.try_send_by_handle(h, &msg);
-        let t1 = ctx.read_tsc();
+        for _ in 0..30u32 { gs::task::yield_now(ctx); }
+        let t0 = gs::driver::wait::ticks(ctx);
+        let _ = gs::ipc::try_send_to(ctx, h, &msg);
+        let t1 = gs::driver::wait::ticks(ctx);
         acc = acc.wrapping_add(t1.wrapping_sub(t0));
     }
     let paced_handle = acc / N;
@@ -2385,9 +2386,9 @@ fn mode_xsend(ctx: &ServiceContext) -> ! {
     // tight-handle: back-to-back, queue saturates.
     acc = 0;
     for _ in 0..N {
-        let t0 = ctx.read_tsc();
-        let _ = ctx.try_send_by_handle(h, &msg);
-        let t1 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
+        let _ = gs::ipc::try_send_to(ctx, h, &msg);
+        let t1 = gs::driver::wait::ticks(ctx);
         acc = acc.wrapping_add(t1.wrapping_sub(t0));
     }
     let tight_handle = acc / N;
@@ -2395,10 +2396,10 @@ fn mode_xsend(ctx: &ServiceContext) -> ! {
     // paced-name: adds the find_send_slot userspace cache lookup.
     acc = 0;
     for _ in 0..N {
-        for _ in 0..30u32 { ctx.yield_cpu(); }
-        let t0 = ctx.read_tsc();
-        let _ = ctx.try_send("xsend-recv", &msg);
-        let t1 = ctx.read_tsc();
+        for _ in 0..30u32 { gs::task::yield_now(ctx); }
+        let t0 = gs::driver::wait::ticks(ctx);
+        let _ = gs::ipc::try_send(ctx, "xsend-recv", &msg);
+        let t1 = gs::driver::wait::ticks(ctx);
         acc = acc.wrapping_add(t1.wrapping_sub(t0));
     }
     let paced_name = acc / N;
@@ -2420,22 +2421,22 @@ fn mode_xlife(ctx: &ServiceContext) -> ! {
     // coordination cost (remote deschedule IPI + TLB-shootdown wait) from the
     // task-creation cost. Attributes C7's ~1.04 s respawn: if spawn_far ≫ spawn_near
     // the cost is cross-core; if spawn_near ≈ spawn_far ≫ BP5 (~23 ms) the cost is
-    // task creation itself. read_tsc is InspectKernel q3 (ungated). Victims exist
+    // task creation itself. gs::driver::wait::ticks is InspectKernel q3 (ungated). Victims exist
     // at boot (supervisor spawns them first), so the first kill always has a target.
     let (mut k_near, mut s_near, mut k_far, mut s_far) = (0u64, 0u64, 0u64, 0u64);
     const N: u32 = 20;
     for i in 0..N {
         // same-core: kill + respawn xlife-near (core 1, the controller's own core).
-        let a = ctx.read_tsc();
+        let a = gs::driver::wait::ticks(ctx);
         let _ = ctx.kill("xlife-near");
-        let b = ctx.read_tsc();
+        let b = gs::driver::wait::ticks(ctx);
         let _ = table::probe(ctx, "xlife-near");
-        let c = ctx.read_tsc();
+        let c = gs::driver::wait::ticks(ctx);
         // cross-core: kill + respawn xlife-far (core 2).
         let _ = ctx.kill("xlife-far");
-        let d = ctx.read_tsc();
+        let d = gs::driver::wait::ticks(ctx);
         let _ = table::probe(ctx, "xlife-far");
-        let e = ctx.read_tsc();
+        let e = gs::driver::wait::ticks(ctx);
 
         k_near = k_near.wrapping_add(b.wrapping_sub(a));
         s_near = s_near.wrapping_add(c.wrapping_sub(b));
@@ -2463,8 +2464,8 @@ fn mode_prop_bp1(ctx: &ServiceContext) -> ! {
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 104;
     let msg = Message::from_bytes(b"bp1");
     for _ in 0..100_000u32 {
-        let slot = CapHandle(xorshift64(&mut rng) as u32);
-        if ctx.try_send_by_handle(slot, &msg).is_ok() {
+        let slot = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
+        if gs::ipc::try_send_to(ctx, slot, &msg).is_ok() {
             ctx.log("prop: BP1 FAIL - random cap slot accepted as valid SEND");
             idle(ctx);
         }
@@ -2495,22 +2496,22 @@ fn mode_prop_bp3(ctx: &ServiceContext) -> ! {
     // Self-referential: acquires SEND|GRANT cap to own endpoint, bounces it
     // through the queue 10k times, asserting rights are exactly preserved each round.
     const SEND_GRANT: u64 = (1 << 2) | (1 << 4);
-    let mut cap_handle = match ctx.acquire_send_grant_cap("prop-bp3") {
+    let mut cap_handle = match gs::cap::acquire_grantable(ctx, "prop-bp3").ok() {
         Some(h) => h,
         None => { ctx.log("prop: BP3 FAIL - could not acquire SEND|GRANT cap to self"); idle(ctx); }
     };
     let msg = Message::from_bytes(b"bp3");
     for _iter in 0..10_000u32 {
-        match ctx.send_with_cap_by_handle(cap_handle, cap_handle, &msg) {
+        match gs::ipc::send_granting(ctx, cap_handle, cap_handle, &msg) {
             Ok(()) => {}
             Err(_) => { ctx.log("prop: BP3 FAIL - send_with_cap_by_handle failed"); idle(ctx); }
         }
-        ctx.recv();
-        let new_handle = match ctx.take_pending_cap() {
+        gs::ipc::recv(ctx);
+        let new_handle = match gs::ipc::take_sent_cap(ctx) {
             Some(h) => h,
             None => { ctx.log("prop: BP3 FAIL - no pending cap after recv"); idle(ctx); }
         };
-        let rights = match ctx.query_cap_rights(new_handle) {
+        let rights = match ctx.query_cap_rights(new_handle.handle()) {
             Some(r) => r,
             None => { ctx.log("prop: BP3 FAIL - cap slot empty after transfer"); idle(ctx); }
         };
@@ -2582,7 +2583,7 @@ fn mode_prop_bp6(ctx: &ServiceContext) -> ! {
     for iter in 0..2_000u32 {
         let depth = (iter % (QUEUE_DEPTH + 1)) as u8;
         for _ in 0..depth {
-            match ctx.try_send("prop-bp6", &msg) {
+            match gs::ipc::try_send(ctx, "prop-bp6", &msg) {
                 Ok(()) => {}
                 Err(_) => {
                     ctx.log("prop: BP6 FAIL - try_send failed before expected queue depth");
@@ -2591,8 +2592,8 @@ fn mode_prop_bp6(ctx: &ServiceContext) -> ! {
             }
         }
         if depth == QUEUE_DEPTH as u8 {
-            match ctx.try_send("prop-bp6", &msg) {
-                Err(IpcError::QueueFull) => {}
+            match gs::ipc::try_send(ctx, "prop-bp6", &msg) {
+                Err(gs::Error::Busy) => {}
                 Ok(()) => {
                     ctx.log("prop: BP6 FAIL - queue accepted more than 16 messages");
                     idle(ctx);
@@ -2666,27 +2667,27 @@ fn mode_prop_bp9(ctx: &ServiceContext) -> ! {
     // After each kill: all 3 wired SEND caps must return EndpointDead (not just some).
     // After each respawn: stale caps must STILL return EndpointDead (no auto-update to new gen).
     let msg  = Message::from_bytes(b"bp9");
-    let h0   = ctx.send_peer_at(0);
-    let h1   = ctx.send_peer_at(1);
-    let h2   = ctx.send_peer_at(2);
+    let h0   = gs::ipc::peer_at(ctx, 0);
+    let h1   = gs::ipc::peer_at(ctx, 1);
+    let h2   = gs::ipc::peer_at(ctx, 2);
     let (h0, h1, h2) = match (h0, h1, h2) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => { ctx.log("prop: BP9 FAIL - could not read all 3 send peer handles"); idle(ctx); }
     };
     for cycle in 0..10u32 {
         let _ = ctx.kill("prop-bp9-victim");
-        let dead0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
-        let dead1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
-        let dead2 = matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead));
+        let dead0 = matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead));
+        let dead1 = matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead));
+        let dead2 = matches!(gs::ipc::exact::try_send_to(ctx, h2, &msg), Err(IpcError::EndpointDead));
         if !dead0 || !dead1 || !dead2 {
             ctx.log_fmt(format_args!("prop: BP9 FAIL - not all 3 slots EndpointDead after kill at cycle {}", cycle));
             idle(ctx);
         }
         let _ = table::probe(ctx, "prop-bp9-victim");
         // Stale caps must NOT auto-update to the new instance's generation.
-        let still0 = matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead));
-        let still1 = matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead));
-        let still2 = matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead));
+        let still0 = matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead));
+        let still1 = matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead));
+        let still2 = matches!(gs::ipc::exact::try_send_to(ctx, h2, &msg), Err(IpcError::EndpointDead));
         if !still0 || !still1 || !still2 {
             ctx.log_fmt(format_args!("prop: BP9 FAIL - stale cap updated to new instance at cycle {}", cycle));
             idle(ctx);
@@ -2700,10 +2701,10 @@ fn mode_prop_bp10(ctx: &ServiceContext) -> ! {
     // BP10 - Every try_send returns a defined outcome - 100k iterations (§8.6, §8.2).
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 113;
     for _ in 0..100_000u32 {
-        let slot = CapHandle(xorshift64(&mut rng) as u32);
+        let slot = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
         let raw  = xorshift64(&mut rng);
         let msg  = Message::from_bytes(&raw.to_le_bytes());
-        let _    = ctx.try_send_by_handle(slot, &msg);
+        let _    = gs::ipc::try_send_to(ctx, slot, &msg);
     }
     ctx.log("prop: BP10 pass (100000/100000)");
     idle(ctx)
@@ -2773,7 +2774,7 @@ fn mode_fuzz_bf5(ctx: &ServiceContext) -> ! {
             *b = xorshift64(&mut rng) as u8;
         }
         let msg = Message::from_bytes(&buf[..size.min(4096)]);
-        let _ = ctx.try_send("fuzz-bf5-recv", &msg);
+        let _ = gs::ipc::try_send(ctx, "fuzz-bf5-recv", &msg);
     }
     ctx.log("fuzz: BF5 pass (5000/5000)");
     idle(ctx)
@@ -2784,9 +2785,9 @@ fn mode_fuzz_bf6(ctx: &ServiceContext) -> ! {
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 117;
     let msg = Message::from_bytes(b"bf6");
     for _ in 0..5_000u32 {
-        let ep_slot  = CapHandle(xorshift64(&mut rng) as u32);
-        let cap_slot = CapHandle(xorshift64(&mut rng) as u32);
-        let _ = ctx.send_with_cap_by_handle(ep_slot, cap_slot, &msg);
+        let ep_slot  = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
+        let cap_slot = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
+        let _ = gs::ipc::send_granting(ctx, ep_slot, cap_slot, &msg);
     }
     ctx.log("fuzz: BF6 pass (5000/5000)");
     idle(ctx)
@@ -2795,24 +2796,24 @@ fn mode_fuzz_bf6(ctx: &ServiceContext) -> ! {
 fn mode_fuzz_bf7(ctx: &ServiceContext) -> ! {
     // BF7 - Stale cap / generation fuzzing (§22 Fuzz BF7). 200 kill cycles (4× F7).
     let msg   = Message::from_bytes(b"bf7");
-    let stale = ctx.send_peer_at(0); // SEND cap to fuzz-bf7-victim
+    let stale = gs::ipc::peer_at(ctx, 0); // SEND cap to fuzz-bf7-victim
 
     for _ in 0..200u32 {
         let _ = ctx.kill("fuzz-bf7-victim");
 
         if let Some(h) = stale {
-            if ctx.try_send_by_handle(h, &msg).is_ok() {
+            if gs::ipc::try_send_to(ctx, h, &msg).is_ok() {
                 ctx.log("fuzz: BF7 FAIL - send to killed endpoint succeeded");
                 idle(ctx);
             }
         }
 
-        let _ = ctx.try_send_by_handle(CapHandle(0xBEEF), &msg);
-        let _ = ctx.try_send_by_handle(CapHandle(u32::MAX), &msg);
+        let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(0xBEEF)), &msg);
+        let _ = gs::ipc::try_send_to(ctx, gs::cap::Cap::from(CapHandle(u32::MAX)), &msg);
 
         let _ = table::probe(ctx, "fuzz-bf7-victim");
         if let Some(h) = stale {
-            let _ = ctx.try_send_by_handle(h, &msg);
+            let _ = gs::ipc::try_send_to(ctx, h, &msg);
         }
     }
     ctx.log("fuzz: BF7 pass (200/200)");
@@ -2853,7 +2854,7 @@ fn mode_stress_bs1(ctx: &ServiceContext) -> ! {
     // 50,000 try_send calls to stress-bs1-recv (passive). QueueFull acceptable.
     let msg = Message::from_bytes(b"bs1");
     for _ in 0..50_000u32 {
-        let _ = ctx.try_send("stress-bs1-recv", &msg);
+        let _ = gs::ipc::try_send(ctx, "stress-bs1-recv", &msg);
     }
     ctx.log("stress: BS1 pass (50000/50000)");
     idle(ctx)
@@ -2863,7 +2864,7 @@ fn mode_stress_bs2(ctx: &ServiceContext) -> ! {
     // BS2 - Restart storm, 4× S2 (§22 Brutal Stress BS2).
     // 200 kill/respawn cycles of stress-bs2-victim.
     let msg = Message::from_bytes(b"bs2-ping");
-    match ctx.try_send("stress-bs2-victim", &msg) {
+    match gs::ipc::try_send(ctx, "stress-bs2-victim", &msg) {
         Ok(()) => {}
         Err(_) => {
             ctx.log("stress: BS2 FAIL - victim not reachable at start");
@@ -2889,7 +2890,7 @@ fn mode_stress_bs3_send(ctx: &ServiceContext) -> ! {
     // 2000 blocking sends to stress-bs3-recv on core 1.
     let msg = Message::from_bytes(b"bs3");
     for _ in 0..2_000u32 {
-        let _ = ctx.send("stress-bs3-recv", &msg);
+        let _ = gs::ipc::send(ctx, "stress-bs3-recv", &msg);
     }
     idle(ctx)
 }
@@ -2897,7 +2898,7 @@ fn mode_stress_bs3_send(ctx: &ServiceContext) -> ! {
 fn mode_stress_bs3_recv(ctx: &ServiceContext) -> ! {
     // BS3 receiver - drain 2000 cross-core messages (§22 Brutal Stress BS3).
     for _ in 0..2_000u32 {
-        ctx.recv();
+        gs::ipc::recv(ctx);
     }
     ctx.log("stress: BS3 pass (2000/2000)");
     idle(ctx)
@@ -2906,14 +2907,14 @@ fn mode_stress_bs3_recv(ctx: &ServiceContext) -> ! {
 fn mode_stress_bs4(ctx: &ServiceContext) -> ! {
     // BS4 - Cap table churn, 5× S4 (§22 Brutal Stress BS4).
     // 50 churn cycles with 2 SEND caps; generation monotonic and both caps stale.
-    let h0 = match ctx.send_peer_at(0) {
+    let h0 = match gs::ipc::peer_at(ctx, 0) {
         Some(h) => h,
         None => {
             ctx.log("stress: BS4 FAIL - no peer handle h0");
             idle(ctx);
         }
     };
-    let h1 = match ctx.send_peer_at(1) {
+    let h1 = match gs::ipc::peer_at(ctx, 1) {
         Some(h) => h,
         None => {
             ctx.log("stress: BS4 FAIL - no peer handle h1");
@@ -2922,22 +2923,22 @@ fn mode_stress_bs4(ctx: &ServiceContext) -> ! {
     };
     let msg = Message::from_bytes(b"bs4");
 
-    if ctx.try_send_by_handle(h0, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h0, &msg).is_err() {
         ctx.log("stress: BS4 FAIL - cap A not valid pre-kill");
         idle(ctx);
     }
-    if ctx.try_send_by_handle(h1, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h1, &msg).is_err() {
         ctx.log("stress: BS4 FAIL - cap B not valid pre-kill");
         idle(ctx);
     }
 
     let _ = ctx.kill("stress-bs4-victim");
 
-    if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+    if !matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead)) {
         ctx.log("stress: BS4 FAIL - cap A survived first kill");
         idle(ctx);
     }
-    if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+    if !matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead)) {
         ctx.log("stress: BS4 FAIL - cap B survived first kill");
         idle(ctx);
     }
@@ -2955,11 +2956,11 @@ fn mode_stress_bs4(ctx: &ServiceContext) -> ! {
         }
         prev_gen = gen;
         let _ = ctx.kill("stress-bs4-victim");
-        if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+        if !matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: BS4 FAIL - cap A not stale during churn");
             idle(ctx);
         }
-        if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+        if !matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: BS4 FAIL - cap B not stale during churn");
             idle(ctx);
         }
@@ -2997,14 +2998,14 @@ fn mode_stress_bs6(ctx: &ServiceContext) -> ! {
     // 20,000 self-ping rounds; IPC path must not drift or corrupt.
     let msg = Message::from_bytes(b"bs6");
     for _ in 0..20_000u32 {
-        match ctx.send("stress-bs6", &msg) {
+        match gs::ipc::send(ctx, "stress-bs6", &msg) {
             Ok(()) => {}
             Err(_) => {
                 ctx.log("stress: BS6 FAIL - send to self returned error");
                 idle(ctx);
             }
         }
-        ctx.recv();
+        gs::ipc::recv(ctx);
     }
     ctx.log("stress: BS6 pass (20000/20000)");
     idle(ctx)
@@ -3044,7 +3045,7 @@ fn mode_stress_bs8(ctx: &ServiceContext) -> ! {
     // BS8 - Scheduler heartbeat, 5× S8 (§22 Brutal Stress BS8).
     // 3000 yield cycles; scheduler must correctly return from idle each time.
     for _ in 0..3_000u32 {
-        ctx.yield_cpu();
+        gs::task::yield_now(ctx);
     }
     ctx.log("stress: BS8 pass (3000 yields)");
     idle(ctx)
@@ -3056,9 +3057,9 @@ fn mode_stress_bs9_send(ctx: &ServiceContext) -> ! {
     let msg = Message::from_bytes(b"bs9");
     for _ in 0..2_500u32 {
         loop {
-            match ctx.try_send("stress-bs9-recv", &msg) {
+            match gs::ipc::try_send(ctx, "stress-bs9-recv", &msg) {
                 Ok(()) => break,
-                Err(_) => ctx.yield_cpu(),
+                Err(_) => gs::task::yield_now(ctx),
             }
         }
     }
@@ -3068,7 +3069,7 @@ fn mode_stress_bs9_send(ctx: &ServiceContext) -> ! {
 fn mode_stress_bs9_recv(ctx: &ServiceContext) -> ! {
     // BS9 receiver - drain 5000 msgs from two senders (§22 Brutal Stress BS9).
     for _ in 0..5_000u32 {
-        ctx.recv();
+        gs::ipc::recv(ctx);
     }
     ctx.log("stress: BS9 pass (5000/5000)");
     idle(ctx)
@@ -3078,21 +3079,21 @@ fn mode_stress_bs10(ctx: &ServiceContext) -> ! {
     // BS10 - Cascading revocation with 50 cycles (§22 Brutal Stress BS10).
     // 3 SEND caps to stress-bs10-victim on core 1; probe on core 0.
     // Pre-validate, first kill, then 50 respawn+kill cycles confirming all 3 stay stale.
-    let h0 = match ctx.send_peer_at(0) {
+    let h0 = match gs::ipc::peer_at(ctx, 0) {
         Some(h) => h,
         None => {
             ctx.log("stress: BS10 FAIL - no peer handle h0");
             idle(ctx);
         }
     };
-    let h1 = match ctx.send_peer_at(1) {
+    let h1 = match gs::ipc::peer_at(ctx, 1) {
         Some(h) => h,
         None => {
             ctx.log("stress: BS10 FAIL - no peer handle h1");
             idle(ctx);
         }
     };
-    let h2 = match ctx.send_peer_at(2) {
+    let h2 = match gs::ipc::peer_at(ctx, 2) {
         Some(h) => h,
         None => {
             ctx.log("stress: BS10 FAIL - no peer handle h2");
@@ -3101,30 +3102,30 @@ fn mode_stress_bs10(ctx: &ServiceContext) -> ! {
     };
     let msg = Message::from_bytes(b"bs10");
 
-    if ctx.try_send_by_handle(h0, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h0, &msg).is_err() {
         ctx.log("stress: BS10 FAIL - cap A not valid pre-kill");
         idle(ctx);
     }
-    if ctx.try_send_by_handle(h1, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h1, &msg).is_err() {
         ctx.log("stress: BS10 FAIL - cap B not valid pre-kill");
         idle(ctx);
     }
-    if ctx.try_send_by_handle(h2, &msg).is_err() {
+    if gs::ipc::try_send_to(ctx, h2, &msg).is_err() {
         ctx.log("stress: BS10 FAIL - cap C not valid pre-kill");
         idle(ctx);
     }
 
     let _ = ctx.kill("stress-bs10-victim");
 
-    if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+    if !matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead)) {
         ctx.log("stress: BS10 FAIL - cap A survived first kill");
         idle(ctx);
     }
-    if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+    if !matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead)) {
         ctx.log("stress: BS10 FAIL - cap B survived first kill");
         idle(ctx);
     }
-    if !matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead)) {
+    if !matches!(gs::ipc::exact::try_send_to(ctx, h2, &msg), Err(IpcError::EndpointDead)) {
         ctx.log("stress: BS10 FAIL - cap C survived first kill");
         idle(ctx);
     }
@@ -3132,15 +3133,15 @@ fn mode_stress_bs10(ctx: &ServiceContext) -> ! {
     for _ in 0..50u32 {
         let _ = table::probe(ctx, "stress-bs10-victim");
         let _ = ctx.kill("stress-bs10-victim");
-        if !matches!(ctx.try_send_by_handle(h0, &msg), Err(IpcError::EndpointDead)) {
+        if !matches!(gs::ipc::exact::try_send_to(ctx, h0, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: BS10 FAIL - cap A not stale during cycle");
             idle(ctx);
         }
-        if !matches!(ctx.try_send_by_handle(h1, &msg), Err(IpcError::EndpointDead)) {
+        if !matches!(gs::ipc::exact::try_send_to(ctx, h1, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: BS10 FAIL - cap B not stale during cycle");
             idle(ctx);
         }
-        if !matches!(ctx.try_send_by_handle(h2, &msg), Err(IpcError::EndpointDead)) {
+        if !matches!(gs::ipc::exact::try_send_to(ctx, h2, &msg), Err(IpcError::EndpointDead)) {
             ctx.log("stress: BS10 FAIL - cap C not stale during cycle");
             idle(ctx);
         }
@@ -3159,7 +3160,7 @@ fn mode_brutal_id_11(ctx: &ServiceContext) -> ! {
     // try_send to its own endpoint. Verifies the 16-deep queue limit exactly.
     let msg = Message::from_bytes(b"t11");
     for i in 0..16u32 {
-        match ctx.try_send("brutal-id-11", &msg) {
+        match gs::ipc::try_send(ctx, "brutal-id-11", &msg) {
             Ok(()) => {}
             Err(_) => {
                 ctx.log_fmt(format_args!("identity: T11 FAIL - send {} failed before queue full", i));
@@ -3168,8 +3169,8 @@ fn mode_brutal_id_11(ctx: &ServiceContext) -> ! {
         }
     }
     // 17th send must be QueueFull - not Ok, not any other error.
-    match ctx.try_send("brutal-id-11", &msg) {
-        Err(IpcError::QueueFull) => {}
+    match gs::ipc::try_send(ctx, "brutal-id-11", &msg) {
+        Err(gs::Error::Busy) => {}
         Ok(()) => {
             ctx.log("identity: T11 FAIL - 17th send succeeded (queue not bounded at 16)");
             idle(ctx);
@@ -3180,8 +3181,8 @@ fn mode_brutal_id_11(ctx: &ServiceContext) -> ! {
         }
     }
     // Drain one message; the next send must succeed (queue has room again).
-    let _ = ctx.recv();
-    match ctx.try_send("brutal-id-11", &msg) {
+    let _ = gs::ipc::recv(ctx);
+    match gs::ipc::try_send(ctx, "brutal-id-11", &msg) {
         Ok(()) => {}
         Err(_) => {
             ctx.log("identity: T11 FAIL - send after drain failed");
@@ -3203,7 +3204,7 @@ fn mode_brutal_id_12_a(ctx: &ServiceContext) -> ! {
     // Revised: brutal-id-12-b has send_peers = ["brutal-id-12-c"] so it has a
     // wired SEND cap to C. A sends "fwd-to-c" to B; B recvs and sends to C.
     let msg = Message::from_bytes(b"fwd-to-c");
-    match ctx.try_send("brutal-id-12-b", &msg) {
+    match gs::ipc::try_send(ctx, "brutal-id-12-b", &msg) {
         Ok(()) => {}
         Err(_) => {
             ctx.log("identity: T12 FAIL - chain-a: send to chain-b failed");
@@ -3215,9 +3216,9 @@ fn mode_brutal_id_12_a(ctx: &ServiceContext) -> ! {
 
 fn mode_brutal_id_12_b(ctx: &ServiceContext) -> ! {
     // T12 chain middle - receives from A, forwards to C using its wired SEND cap.
-    let _ = ctx.recv();
+    let _ = gs::ipc::recv(ctx);
     let msg = Message::from_bytes(b"via-b");
-    match ctx.try_send("brutal-id-12-c", &msg) {
+    match gs::ipc::try_send(ctx, "brutal-id-12-c", &msg) {
         Ok(()) => {}
         Err(_) => {
             ctx.log("identity: T12 FAIL - chain-b: forward to chain-c failed");
@@ -3229,7 +3230,7 @@ fn mode_brutal_id_12_b(ctx: &ServiceContext) -> ! {
 
 fn mode_brutal_id_12_c(ctx: &ServiceContext) -> ! {
     // T12 chain end - receives the message that traveled A→B→C.
-    let _ = ctx.recv();
+    let _ = gs::ipc::recv(ctx);
     ctx.log("identity: T12 pass - cap delegation chain A→B→C: message arrived at C");
     idle(ctx)
 }
@@ -3240,7 +3241,7 @@ fn mode_brutal_id_13_send(ctx: &ServiceContext) -> ! {
     // (core 1) kills the receiver, which should wake this task with EndpointDead.
     let msg = Message::from_bytes(b"t13");
     for i in 0..16u32 {
-        match ctx.try_send("brutal-id-13-recv", &msg) {
+        match gs::ipc::try_send(ctx, "brutal-id-13-recv", &msg) {
             Ok(()) => {}
             Err(_) => {
                 ctx.log_fmt(format_args!("identity: T13 FAIL - fill send {} failed", i));
@@ -3249,7 +3250,7 @@ fn mode_brutal_id_13_send(ctx: &ServiceContext) -> ! {
         }
     }
     // Queue is now full. Blocking send must block until the receiver is killed.
-    match ctx.send("brutal-id-13-recv", &msg) {
+    match gs::ipc::exact::send(ctx, "brutal-id-13-recv", &msg) {
         Err(IpcError::EndpointDead) => {
             ctx.log("identity: T13 pass - cross-core blocked send woke with EndpointDead");
         }
@@ -3266,7 +3267,7 @@ fn mode_brutal_id_13_send(ctx: &ServiceContext) -> ! {
 fn mode_brutal_id_13_kill(ctx: &ServiceContext) -> ! {
     // T13 killer - yields to let the sender fill the queue and block, then kills recv.
     // Runs on core 1; recv is on core 2; sender is on core 0.
-    for _ in 0..200u32 { ctx.yield_cpu(); }
+    for _ in 0..200u32 { gs::task::yield_now(ctx); }
     let _ = ctx.kill("brutal-id-13-recv");
     idle(ctx)
 }
@@ -3279,8 +3280,8 @@ fn mode_perf_bp1(ctx: &ServiceContext) -> ! {
     // BP1: same-core IPC roundtrip latency - 100 samples (2× B1) (§22 Brutal Perf BP1).
     // Each round-trip costs ~800ms on QEMU TCG; 100 samples = ~80s, well within 600s timeout.
     let echo_cap = loop {
-        if let Some(cap) = ctx.acquire_send_cap("perf-bp1-echo") { break cap; }
-        ctx.yield_cpu();
+        if let Some(cap) = gs::cap::acquire(ctx, "perf-bp1-echo").ok() { break cap; }
+        gs::task::yield_now(ctx);
     };
 
     let msg = Message::from_bytes(b"bp1");
@@ -3288,10 +3289,10 @@ fn mode_perf_bp1(ctx: &ServiceContext) -> ! {
     let mut samples = [0u64; N];
 
     for i in 0..N {
-        let t0 = ctx.read_tsc();
-        let _ = ctx.send_by_handle(echo_cap, &msg);
-        ctx.recv();
-        let t1 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
+        let _ = gs::ipc::send_to(ctx, echo_cap, &msg);
+        gs::ipc::recv(ctx);
+        let t1 = gs::driver::wait::ticks(ctx);
         samples[i] = t1.wrapping_sub(t0);
     }
 
@@ -3307,8 +3308,8 @@ fn mode_perf_bp1(ctx: &ServiceContext) -> ! {
 fn mode_perf_bp1_echo(ctx: &ServiceContext) -> ! {
     let msg = Message::from_bytes(b"bp1e");
     loop {
-        ctx.recv();
-        let _ = ctx.send("perf-bp1", &msg);
+        gs::ipc::recv(ctx);
+        let _ = gs::ipc::send(ctx, "perf-bp1", &msg);
     }
 }
 
@@ -3317,8 +3318,8 @@ fn mode_perf_bp2(ctx: &ServiceContext) -> ! {
     // Each cross-core round-trip costs ~800ms on QEMU TCG; 100 samples = ~80s, well within 600s.
     ctx.log("perf: BP2 sender start");
     let echo_cap = loop {
-        if let Some(cap) = ctx.acquire_send_cap("perf-bp2-echo") { break cap; }
-        ctx.yield_cpu();
+        if let Some(cap) = gs::cap::acquire(ctx, "perf-bp2-echo").ok() { break cap; }
+        gs::task::yield_now(ctx);
     };
     ctx.log("perf: BP2 sender cap-acquired");
 
@@ -3327,14 +3328,14 @@ fn mode_perf_bp2(ctx: &ServiceContext) -> ! {
     let mut samples = [0u64; N];
 
     for i in 0..N {
-        let t0 = ctx.read_tsc();
-        let _ = ctx.send_by_handle(echo_cap, &msg);
+        let t0 = gs::driver::wait::ticks(ctx);
+        let _ = gs::ipc::send_to(ctx, echo_cap, &msg);
         if i == 0 { ctx.log("perf: BP2 sender sent-0"); }
         match ctx.recv_result() {
             Ok(_) => { if i == 0 { ctx.log("perf: BP2 sender recv-0 OK"); } }
             Err(_) => { if i == 0 { ctx.log("perf: BP2 sender recv-0 ERR"); } loop {} }
         }
-        let t1 = ctx.read_tsc();
+        let t1 = gs::driver::wait::ticks(ctx);
         samples[i] = t1.wrapping_sub(t0);
     }
 
@@ -3354,12 +3355,12 @@ fn mode_perf_bp2_echo(ctx: &ServiceContext) -> ! {
     let msg = Message::from_bytes(b"bp2e");
     let mut count = 0u32;
     loop {
-        ctx.recv();
+        gs::ipc::recv(ctx);
         count += 1;
         if count == 1 { ctx.log("perf: BP2 echo recv-0"); }
         loop {
-            if ctx.try_send("perf-bp2", &msg).is_ok() { break; }
-            ctx.yield_cpu();
+            if gs::ipc::try_send(ctx, "perf-bp2", &msg).is_ok() { break; }
+            gs::task::yield_now(ctx);
         }
         if count == 1 { ctx.log("perf: BP2 echo sent-0"); }
     }
@@ -3369,9 +3370,9 @@ fn mode_perf_bp3(ctx: &ServiceContext) -> ! {
     // BP3: syscall yield floor - 2000 yields under brutal 200-task load (§22 Brutal Perf BP3).
     // 5000 was too slow: brutal stress probes' kill/spawn cycles starve the yield task past 600s.
     const N: u64 = 2_000;
-    let t0 = ctx.read_tsc();
-    for _ in 0..N { ctx.yield_cpu(); }
-    let t1 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
+    for _ in 0..N { gs::task::yield_now(ctx); }
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: BP3 mean={mean} cycles/yield"));
     ctx.log("perf: BP3 done");
@@ -3385,9 +3386,9 @@ fn mode_perf_bp4(ctx: &ServiceContext) -> ! {
         None    => { ctx.log("perf: BP4 FAIL - no recv cap"); idle(ctx); }
     };
     const N: u64 = 50_000;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     for _ in 0..N { ctx.query_cap_rights(handle); }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: BP4 mean={mean} cycles/cap-check"));
     ctx.log("perf: BP4 done");
@@ -3402,9 +3403,9 @@ fn mode_perf_bp5(ctx: &ServiceContext) -> ! {
     let _ = ctx.kill("perf-bp5-victim");
     let mut total_spawn: u64 = 0;
     for _ in 0..N {
-        let t0 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
         let _ = table::probe(ctx, "perf-bp5-victim");
-        let t1 = ctx.read_tsc();
+        let t1 = gs::driver::wait::ticks(ctx);
         total_spawn += t1.wrapping_sub(t0);
         let _ = ctx.kill("perf-bp5-victim");
     }
@@ -3416,10 +3417,10 @@ fn mode_perf_bp5(ctx: &ServiceContext) -> ! {
     let _ = table::probe(ctx, "perf-bp5-victim");
     let mut total_restart: u64 = 0;
     for _ in 0..N {
-        let t0 = ctx.read_tsc();
+        let t0 = gs::driver::wait::ticks(ctx);
         let _ = ctx.kill("perf-bp5-victim");
         let _ = table::probe(ctx, "perf-bp5-victim");
-        let t1 = ctx.read_tsc();
+        let t1 = gs::driver::wait::ticks(ctx);
         total_restart += t1.wrapping_sub(t0);
     }
     let restart_mean = total_restart / N as u64;
@@ -3431,13 +3432,13 @@ fn mode_perf_bp5(ctx: &ServiceContext) -> ! {
 fn mode_perf_bp7(ctx: &ServiceContext) -> ! {
     // BP7: cap table insert/remove - 5000 cycles (5× B7) (§22 Brutal Perf BP7).
     const N: u64 = 5_000;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     for _ in 0..N {
-        if let Some(cap) = ctx.acquire_send_cap("perf-bp7") {
-            ctx.remove_cap(cap);
+        if let Some(cap) = gs::cap::acquire(ctx, "perf-bp7").ok() {
+            gs::cap::remove(ctx, cap);
         }
     }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: BP7 mean={mean} cycles/cap-insert-remove"));
     ctx.log("perf: BP7 done");
@@ -3447,7 +3448,7 @@ fn mode_perf_bp7(ctx: &ServiceContext) -> ! {
 fn mode_perf_bp8(ctx: &ServiceContext) -> ! {
     // BP8: allocator throughput - alloc to limit (same bound as B8) (§22 Brutal Perf BP8).
     let mut n_alloc: u64 = 0;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     loop {
         match ctx.alloc_mem(4096) {
             Ok(_)                   => n_alloc += 1,
@@ -3455,7 +3456,7 @@ fn mode_perf_bp8(ctx: &ServiceContext) -> ! {
             Err(_)                  => break,
         }
     }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = if n_alloc > 0 { t1.wrapping_sub(t0) / n_alloc } else { 0 };
     ctx.log_fmt(format_args!("perf: BP8 n={n_alloc} mean={mean} cycles/alloc-4kib"));
     ctx.log("perf: BP8 done");
@@ -3470,11 +3471,11 @@ fn mode_perf_bp9(ctx: &ServiceContext) -> ! {
     msg.payload_len = 4096;
 
     const N: u64 = 400;
-    let t0 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
     for _ in 0..N {
-        let _ = ctx.send("perf-bp9-recv", &msg);
+        let _ = gs::ipc::send(ctx, "perf-bp9-recv", &msg);
     }
-    let t1 = ctx.read_tsc();
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: BP9 mean={mean} cycles/4kib-send"));
     ctx.log("perf: BP9 done");
@@ -3482,16 +3483,16 @@ fn mode_perf_bp9(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_perf_bp9_recv(ctx: &ServiceContext) -> ! {
-    loop { ctx.recv(); }
+    loop { gs::ipc::recv(ctx); }
 }
 
 fn mode_perf_bp10(ctx: &ServiceContext) -> ! {
     // BP10: scheduler pick-next - 200 yields (§22 Brutal Perf BP10).
     // perf-brutal-only spawns ~30 services (not the full 200-task load the old N=2000 assumed).
     const N: u64 = 200;
-    let t0 = ctx.read_tsc();
-    for _ in 0..N { ctx.yield_cpu(); }
-    let t1 = ctx.read_tsc();
+    let t0 = gs::driver::wait::ticks(ctx);
+    for _ in 0..N { gs::task::yield_now(ctx); }
+    let t1 = gs::driver::wait::ticks(ctx);
     let mean = t1.wrapping_sub(t0) / N;
     ctx.log_fmt(format_args!("perf: BP10 mean={mean} cycles/yield"));
     ctx.log("perf: BP10 done");
@@ -3506,7 +3507,7 @@ fn mode_chaos_bc2_monitor(ctx: &ServiceContext) -> ! {
     // BC2 witness - 500 yields prove the system survived 5 simultaneous non-TCB
     // page faults (§22 Brutal Chaos BC2). 5× C2's single fault, same outcome:
     // kernel kills each faulter; everything else keeps running.
-    for _ in 0..500u32 { ctx.yield_cpu(); }
+    for _ in 0..500u32 { gs::task::yield_now(ctx); }
     ctx.log("chaos: BC2 pass - 5 simultaneous non-TCB faults; system survived");
     idle(ctx)
 }
@@ -3530,7 +3531,7 @@ fn mode_chaos_bc3(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_chaos_bc5(ctx: &ServiceContext) -> ! {
-    // BC5 - 500-level recursive yield_cpu() depth probe (5× C5's 100) (§22 Brutal Chaos BC5).
+    // BC5 - 500-level recursive yield_now() depth probe (5× C5's 100) (§22 Brutal Chaos BC5).
     let depth = chaos_bc5_recurse(ctx, 500, 0);
     ctx.log_fmt(format_args!("chaos: BC5 pass - {depth}/500 recursive yields without stack overflow"));
     idle(ctx)
@@ -3539,7 +3540,7 @@ fn mode_chaos_bc5(ctx: &ServiceContext) -> ! {
 #[inline(never)]
 fn chaos_bc5_recurse(ctx: &ServiceContext, remaining: u32, depth: u32) -> u32 {
     if remaining == 0 { return depth; }
-    ctx.yield_cpu();
+    gs::task::yield_now(ctx);
     chaos_bc5_recurse(ctx, remaining - 1, depth + 1)
 }
 
@@ -3548,7 +3549,7 @@ fn mode_chaos_bc6_monitor(ctx: &ServiceContext) -> ! {
     // Two hogs run on cores 2 and 3, simulating two timer-starved cores.
     // This probe on core 0 proves the remaining cores are scheduled normally.
     // 200 yields matches C6; the brutal intensity is the 2-hog pressure, not yield count.
-    for _ in 0..200u32 { ctx.yield_cpu(); }
+    for _ in 0..200u32 { gs::task::yield_now(ctx); }
     ctx.log("chaos: BC6 pass - 2-core hog starvation; core 0 still alive");
     idle(ctx)
 }
@@ -3561,10 +3562,10 @@ fn mode_chaos_bc7(ctx: &ServiceContext) -> ! {
     // the cycle count.
     let msg = Message::from_bytes(b"bc7");
     for i in 0..15u32 {
-        let _ = ctx.try_send("chaos-bc7-victim", &msg);
+        let _ = gs::ipc::try_send(ctx, "chaos-bc7-victim", &msg);
         let _ = ctx.kill("chaos-bc7-victim");
         let _ = table::probe(ctx, "chaos-bc7-victim");
-        for _ in 0..10u32 { ctx.yield_cpu(); }
+        for _ in 0..10u32 { gs::task::yield_now(ctx); }
         if i % 5 == 4 {
             ctx.log_fmt(format_args!("chaos: BC7 iter {}/15", i + 1));
         }

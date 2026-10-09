@@ -257,6 +257,15 @@ supervisor - **stand unchanged**; only the endgame's target moves.
 - SDK `reacquire_via_registry` / the userspace registry **lookup path**, and the **registry service**
   itself (Path C, §3.7) - its recovery role moves to the kernel directory.
 
+> **Note (2026-10-09): the first bullet did not happen as written.** The kernel's spawn path
+> (`spawn_service_with_image` in `kernel/src/task/mod.rs`; `spawn_service_with_config` no longer
+> exists) still runs a `names::lookup` loop that name-wires every declared send-peer the caller did
+> NOT provide - the Phase 0b **merge**, kept. The supervisor provides caps only where it passes them
+> (`spawn_wired`); a spawn with no install list (`spawn_by_image(.., &[], &[])`) sends the declared
+> peer list and the kernel name-wires all of it, and `spawn_wired` logs `kernel will name-wire it`
+> for any peer missing from its map. So "the kernel no longer resolves names to wire anyone" is not
+> true of the code: the directory is still consulted at spawn for unprovided peers.
+
 **Keeps (the Path C exception - was "delete" under the original plan):**
 
 - `kernel/src/ipc/names.rs` - the flat `name → EndpointId` **recovery directory** (`names::register`

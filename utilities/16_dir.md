@@ -162,9 +162,10 @@ renderer was changed to pad explicitly. A column of ragged numbers is not a colu
 
 `dir` is a **record producer** (`docs/records.md`, `utilities/31_records.md`): bare it prints
 the text listing above, but **in a pipe** it emits a typed **table** with columns
-**`name` / `type` / `size`** (`type` is `file`/`dir`; `size` is the byte count for files and
-empty for directories). So the structured verbs operate on real fields instead of re-parsing
-text:
+**`name` / `type` / `size` / `sealed`** (`type` is `file`/`dir`; `size` is the byte count for files
+and empty for directories; `sealed` is `true`/`false`, so a sealed file stays `type=file` in a query
+rather than reading `seal` as the text listing does). The table holds at most 64 rows
+(`REC_MAX_ROWS`). So the structured verbs operate on real fields instead of re-parsing text:
 
 ```
 dir | where type=file               only files
@@ -199,7 +200,12 @@ entries: the request says which entry to resume at and the reply says where to c
 directory of any size is listed in full (`backlog/33`). The count `dir` prints is therefore the
 number of entries it actually rendered, and it is printed LAST - the total is not known until the
 walk ends, and a header that can disagree with the rows under it is the wrong answer this whole
-mechanism exists to remove.
+mechanism exists to remove. An empty directory prints `(empty)`. The walk is bounded at
+`gs::fs::DIR_PAGE_MAX` (512) pages; a directory larger than that ends with an `INCOMPLETE - ...`
+line under the count rather than a count that reads as the whole truth.
+
+(The paging now lives in the library: both paths call `gs::fs::Fs::list_dir`, which drives the
+cursor. The shell's own `DirCursor` remains only for `copy ... recursive`.)
 
 ## 5. Later (separate doc so it can grow)
 
@@ -215,7 +221,8 @@ mechanism exists to remove.
 Conforms: `dir help` (usage with a real example per row) and `dir version` (number +
 creator credit) per `0_conventions.md` (the shared `help_block` helper).
 
-Also conforms to **rule 10** (`0_conventions.md` §1.10): the `fs` request is **q-abortable** via
-`fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to the prompt (a fast
-reply prints nothing). This replaced a bare `request_with_reply`, which rule 10 forbids for an
-interactive command.
+Also conforms to **rule 10** (`0_conventions.md` §1.10): the listing goes through a `gs::fs::Fs`
+handle lent a notice (`Fs::noticing`), so a wait past 2 s (`gs::call::NOTICE_AFTER_SECS`) prints
+`  [q] quit` and `q`/`Q`/ESC returns to the prompt with no error (a fast reply prints nothing). This
+replaced a bare `request_with_reply`, which rule 10 forbids for an interactive command. The piped
+form (`build_dir_table`) lends no notice, so `dir | ...` is bounded but cannot be ended with `q`.

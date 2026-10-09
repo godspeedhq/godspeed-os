@@ -36,6 +36,10 @@ park-wait, the inline prompt) are workarounds for *not having this separation*.
 
 ## 2. Current state (what exists today)
 
+*(Note 2026-10-09: "today" is 2026-06-05. The output diagram below shows the in-kernel fbcon that
+§9 removed, so `fb::put_byte` is not the path any more and the TV is drawn by the `console`
+service. §9.2 has the split as built.)*
+
 **Output** - all one path:
 ```
 kprintln! / ctx.log (syscall 5) / ctx.print (syscall 22)
@@ -51,7 +55,7 @@ USB keyboard → xhci driver → ctx.console_push (syscall 20)
 shell → ConsoleRead (syscall 17) → reads the ring
 ```
 
-**`events`** holds the bounded IPC trace ring (461 lines, `utilities/47_events.md`)
+**`events`** holds the bounded IPC trace ring (469 lines, `utilities/47_events.md`)
 - it was a stub that logged "ready" and parked when this was written. What has NOT
 changed is the half that matters here: all logging still short-circuits through the
 kernel ring buffer to serial and the framebuffer, and no log line goes *to* the
@@ -315,7 +319,7 @@ font renderer and is serial-blind") is answered below.
 
 ### 9.2 The split
 
-| | Kernel (`bootcon/`, 536 lines) | `console` service (1,756 lines) |
+| | Kernel (`bootcon/`, 536 lines) | `console` service (1,763 lines) |
 |---|---|---|
 | Serial | owns it, unchanged - **still the source of truth** | never touches it |
 | Framebuffer | a minimal boot/panic blit | the whole terminal |
@@ -354,12 +358,16 @@ Two writers to one framebuffer is not a race the service can defend against: its
 silently wrong about what is on screen. So ownership is a state, not a convention:
 
 ```
-kernel owns it  --(service has mapped + cleared: bootcon::release)-->  service owns it
-       ^                                                                      |
-       +-------------------- bootcon::reclaim_for_panic ----------------------+
+kernel owns it  --(framebuffer GRANTED at spawn: bootcon::release)-->  service owns it
+       ^                                                                       |
+       +------ bootcon::reclaim_on_death (the service died) --------------------+
+       +------ bootcon::reclaim_for_panic -------------------------------------+
 ```
 
-The service calls `release` only *after* it can draw, so there is no window with no writer. The panic path
+*(Corrected 2026-10-09: this diagram and the sentence under it said the service calls `release` once
+it has mapped and cleared. The kernel calls it, from the spawn path (`task/mod.rs`), when it grants
+the framebuffer - §9.8 item 3 records why the grant became the handover - and takes the screen back
+on the service's death as well as on a panic.)* The panic path
 reclaims unconditionally and clears, because by then the service is halted and its grid describes nothing.
 
 ### 9.5 Memory attributes - the constraint that shapes the mapping
@@ -442,7 +450,7 @@ requirement, not the other port's answer (§26.14).
 
 | | |
 |---|---|
-| **Added** | a framebuffer grant in the spawn path; one `service_config` row. **No new syscall** - see the correction below |
+| **Added** | a framebuffer grant in the spawn path; one `service_config` row (since step C, a row in the supervisor's spawn table, `services/supervisor/src/main.rs`; the grant is by the `FRAMEBUFFER` device kind, CLAUDE.md 12.3). **No new syscall** - see the correction below |
 | **Removed** | `InspectKernel` query 9 (`dims_packed`) - the shell asked the KERNEL for terminal geometry, which is a service's question; `FB_READBACK_CHEAP` from the arch contract, halving the framebuffer surface an arch owes to `fb_commit` alone; ~840 lines of ring-0 code |
 
 The introspection pin shrinks by one, and the syscall pin does NOT grow. That is better than the
@@ -517,7 +525,7 @@ well matched rather than one being decorative.
 raises it. The service may use 8 MiB, but `Term` is a local of `service_main` and the user
 stack is 256 KiB. The first cut (64 KiB + 1024 lines) put `Term::new` at 180 KiB and
 `service_main` at 118 KiB - 299 KiB together, which faults on the first store of its own
-prologue. See §10.6.
+prologue. See §10.7, item 3.
 
 Addressing is **monotonic**: `wpos` counts every byte ever written and never wraps, and the
 storage index is `wpos % SB_BYTES`. That turns "has this line been overwritten?" into one
@@ -615,3 +623,8 @@ whole difference between the two pagers.
 Verified in QEMU (`osdev test shell`): PgUp enters history, output returns the view to live by
 itself, End returns to live while scrolled, Home is taken as a scroll while scrolled **and
 still edits the line when it is not**.
+
+*(Note 2026-10-09: the two verifications above, on the Wyse and in QEMU, were of the scrolled VIEW
+that §10.4 records as deleted. PgUp now opens the `scrollback` utility one page back
+(`utilities/54_scrollback.md`), which reads the ring through `REQ_HISTORY`; there is no scrolled
+state at the prompt for output or End to return from.)*

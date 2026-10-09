@@ -4,8 +4,9 @@
 //! Fixed depth: 16 messages per endpoint (worst-case 64 KiB per queue).
 //! Not configurable per endpoint in v1; per-endpoint depth is v2 work.
 //!
-//! The queue lives on the core that owns the endpoint. Cross-core enqueue
-//! goes through the routing table + IPI path, not a shared pointer.
+//! The queue lives in the endpoint's routing-table entry (`routing::TABLE`), which
+//! every core reaches under the one table lock; a cross-core wake is an IPI
+//! (`scheduler::wake_by_slot`).
 
 use crate::ipc::message::Message;
 

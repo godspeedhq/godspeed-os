@@ -61,14 +61,15 @@ assert fails-with FileNotFound read /sc/missing.txt
 # `fs` publishes `requests` and `blk.outages` every 32 requests it serves, and the SDK publishes
 # `msgs.received` on a service's first message and every 64th. The sink's table is VOLATILE - a chaos
 # storm that restarts `events` wipes it - so these rows exist only once their owner has served enough
-# traffic SINCE that restart. Asserting them in the metrics section above meant asserting them before
+# traffic SINCE that restart. Asserting them in the metrics section (`30-events.gsh`) meant asserting them before
 # this suite had done any file work, which is why they failed on the T630 after a 100-round storm and
 # passed everywhere else: pure luck about where each service sat in its publish interval.
 #
-# By this line the suite has written a 256 KiB capture and this whole files section through `fs`, so
-# both owners are far past their interval. Deterministic, and no extra runtime.
+# By this line a full run has written a 256 KiB capture (`40-persist.gsh`) and the start of this files
+# section through `fs`, so both owners are far past their interval. Deterministic, and no extra runtime.
+# (`selfcheck files` alone skips the capture; the write and read just below still drive the traffic.)
 #
-# AND IT IS DELIBERATELY AFTER `chaos kill-storm events` ABOVE, which makes this a regression test for
+# AND IT IS DELIBERATELY AFTER `chaos kill-storm events` IN `40-persist.gsh`, which makes this a regression test for
 # the bug it caught: a service whose FIRST emission landed while the sink was mid-restart used to latch
 # "no sink" for its entire life and go permanently silent, because it never sent again and so never
 # reached the reacquire path. `fs` did exactly that on the T630 - six rows before the storm, zero for

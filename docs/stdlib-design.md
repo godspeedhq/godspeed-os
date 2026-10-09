@@ -6,8 +6,9 @@
 `services/recorder` migrated. Option A was taken (services only, no kernel change); the terminating
 task of §1 remains open and unimplemented, which is the point of recording it here.
 
-What follows is the report as written before any code, kept as it was argued. §7 at the end records
-what building it changed.
+What follows is the report as written before any code, kept as it was argued. §7 onwards records
+what building it changed, section by dated section; §25 (2026-10-09) is the latest, every service
+moved onto `gs`.
 
 ---
 
@@ -767,7 +768,10 @@ remains wherever else a delegated resource cap is invoked:
 - **`net-stack`'s socket and listener caps** carry no tag, so `sock` still relies on draining.
 - **`examples/holder`** still does a bare `ctx.recv()` and hangs forever if its owner dies - hole 2,
   the missing `ReplyDead`, which a tag does NOT fix. That one is genuinely about the mechanism, not
-  the protocol, and is left recorded rather than papered over.
+  the protocol, and is left recorded rather than papered over. *(Since corrected: its wait after a
+  `resource_invoke` is bounded by `recv_abortable_deadline`, so a dead owner costs a deadline, not a
+  hang. It still hand-rolls the invoke rather than using `gs::resource::invoke`, which is
+  `pub(crate)` - §24 and §25.)*
 
 ## 15. The target-side tests, and the error the restart found
 
@@ -791,7 +795,7 @@ count) and the absence of both error lines, which makes it an assertion rather t
 
 ### `gs::cap` across a real restart: `fcap gsreuse`
 
-A new command holds a `gs::cap::File` across a real `fs` kill and reads through it afterwards.
+A new command holds a `gs::cap::File` (now `gs::file::File`) across a real `fs` kill and reads through it afterwards.
 Pinned by four named assertions in `osdev test fs-reuse`, which went from 8 cases to 12.
 
 **Scope, stated rather than quietly narrowed.** `fcap reuse` additionally deletes the original and
@@ -1170,6 +1174,13 @@ there; it is just a different shape, and this library does not fit it.
 
 **Five migrations, and the sixth candidate correctly refused.** `recorder`, the shell's `tcp`, `dir`,
 `fcap`, `sock` and `copier` all shrank and all found defects. `time` would have grown a bug.
+
+> **2026-10-09: `time`'s CALLS are on `gs` now; its SHAPE is not, and the refusal above still holds.**
+> When every service moved onto the standard library (§25), `time`'s sends, replies, peer lookups,
+> reacquires and clock reads went to `gs::ipc`, `gs::cap` and `gs::task` like everyone's. What did not
+> move is what this section is about: it still never waits for a reply, still tags its requests and
+> demultiplexes the answers in its own loop, and still uses no `gs::fs` or `gs::net` - which remain
+> send-then-wait. The gap is unchanged.
 
 ## 21. TCP listen and accept, and the objection that was wrong
 
@@ -1704,6 +1715,16 @@ flags, so `gs::cap::READ` at an `fs.open` call site reads correctly and no call 
 > different totals have been published across two days (93, 130, 143) precisely because nobody fixed
 > the method first. It is fixed now, and stated in the README next to the figure so the next person
 > can re-derive it instead of trusting it.
+>
+> **Recounted 2026-10-09: 164 items across the 13 modules, plus the `gs::driver` tier's 33.** By the
+> README's rule - free functions, constants, types, the methods on those types, and every re-export -
+> applied to each module's own file, so the crate root's re-exports of `Error` and `ServiceContext` and
+> its `prelude` are not counted a second time. The 13 EXCLUDE `driver`, a 14th public module: its
+> `wait`, `delay` and `irq` are counted separately because `backlog/71` puts that tier outside the
+> first covered surface. The same count on the 2026-09-26 tree gives 151 where 149 was published, so
+> two of the gap are method; the other 13 are the surface growing (`call::request_once`,
+> `task::sleep_quantum`/`sleep_us`/`sleep_ticks`, `ipc::reply`, `ipc::recv_within_ms`, the five-call
+> `ipc::exact` module and its two error-type re-exports, `IpcError` and `CapError`).
 
 ### `gs::record` is a re-export and that is a decision, not laziness
 
@@ -1755,3 +1776,101 @@ Recorded because the pattern is the lesson, not the four:
 
 All four surfaced within a minute of `cargo build`. The method that catches them is building the
 module as it is written rather than writing the crate and then checking it.
+
+## 25. Every service on the standard library, and what that found (2026-10-09)
+
+The operator, finding the dogfood had not been done: every service should be written on `gs`. The
+one-way gate (`scripts/one_way_check.py`, 2026-10-05) only stopped NEW raw calls; 1085 calls with a `gs`
+equivalent were still in 28 crates. All of them moved, the gate's baseline is empty, and every crate -
+new or old - is held at zero.
+
+The rule for each call was the one this document has always used: **behaviour must not change.** Where
+the library's answer was different, the library gained the missing piece rather than the call staying
+on the SDK. (An earlier attempt at the same work, 2026-10-01, stopped at about 190 calls with the gaps
+left open and was never merged; its console fix is the first commit of this one.)
+
+### The two defects it found
+
+**`console` leaked a reply capability on every terminal-size and scrollback request.** It answered and
+never gave the one-shot capability back, so each query used a slot in its table for good. `gs::ipc::reply`
+answers and removes in one call, which is how it was seen and how it is fixed.
+
+**`gs::call::request_within` re-sent a request that had already arrived.** It retries once when the
+send never left, and decided "never left" with a catch-all that swallowed `ReplyDead` - the kernel
+saying the request WAS delivered and its replier died holding the reply capability (CLAUDE.md 8.6). That
+is the "it may have happened" case this module's own header says must never be re-sent. It was,
+silently, whenever a peer died mid-request.
+
+The first fix folded `ReplyDead` into `OutcomeUnknown`, and an independent review of the whole change
+caught what that cost: four callers had leaned on the silent retry for operations that ARE safe to
+repeat - `block-driver`'s block transfers through `xhci`, `nic-driver`'s frames through `dwc2`, `counter`'s
+read - and every one of them now gave up, while their logs blamed a peer that was "silent" when it had
+died. So it is its own variant, `Error::PeerDied`: not safe to re-send blind, like `OutcomeUnknown`, but a
+different obligation - reacquire first, then ask again only if the operation is safe to repeat. Each of
+those callers now does that ITSELF, at the call site, where the knowledge that the operation is
+idempotent actually lives; `control` reports a restart whose outcome is unknown instead of re-sending it.
+
+### And a rule about authority that was false
+
+`gs::io` and `scripts/contract_check.py` said printing needs `console_push`. It does not: the kernel's
+`ConsoleWrite` checks `LOG_WRITE`, which every task holds in slot 0, and the project's own test log
+showed a program with no `CONSOLE_PUSH` printing. The rule came from a Stranger Test conclusion drawn
+from documentation and never run (`docs/stranger-test.md` has the correction). It surfaced here because
+the gate fired on four drivers the moment their notices went through `gs::io`, and obeying it would have
+granted `net-stack` the authority to type commands (SEC-2). The gate now checks the true rule, and also
+refuses a `console_push` declaration nothing uses.
+
+### What `gs` gained, every piece a wrapper over an SDK call that already existed
+
+| Addition | Pulled in by |
+|---|---|
+| `task::sleep_quantum`, `sleep_us`, `sleep_ticks` | `sleep(1)` everywhere; `dwc2`'s measured split-transaction timing |
+| `driver::wait::ticks`, `ticks_per_10ms`; `Since::elapsed_ms`, `elapsed_ticks` | tick-domain code: key repeat, `console`'s adaptive paint, TCP timers, benchmarks |
+| `driver::irq::Irq::vector` | `xhci` logs and compares its MSI vector |
+| `call::request_once` | `block-driver` and `nic-driver`, which own their retry and log whether the reacquire worked |
+| `Error::PeerDied` | the request arrived and the peer died: may have happened, reacquire before asking again |
+| `ipc::exact` | the conformance probes and chaos's flood, which must tell `EndpointDead` from a stale capability |
+| `impl From<CapHandle> for Cap` | handles from SDK calls `gs` does not wrap (spawn, mint); the type never made a capability unforgeable - the kernel's check on every use does |
+| `#[inline(always)]` on the receives | a `Message` is 4 KiB by value; the shell's stack is tight on pipe paths |
+
+The gate's table also turned out narrower than the library - console writes (`gs::io`, 827 of them in
+the shell), `trace_as`, `metric`, `resource_revoke`, `last_recv_badge` and `send_peer_handle` all had
+`gs` equivalents and were not counted. They are counted and converted.
+
+### What is still SDK, and why
+
+Recorded as evidence, not as a plan (26.2):
+
+1. **Hardware**: `Mmio`, `Dma`, `device_power`, `cpu_clock`. `gs::driver` gaps (`docs/driver-library.md`).
+2. **Spawning** and the supervisor's name map, which flows into `spawn_with_caps`.
+3. **The delegated-resource invoke** (`resource_invoke` + `recv_abortable_deadline`) in the shell's
+   `fcap` and `examples/holder`. `gs::resource::invoke` exists and is better, but `pub(crate)`.
+4. **Request forms with no `gs` shape**: the sifted and millisecond-bounded requests `net-stack` uses
+   while it must keep client requests that arrive mid-wait, and the `_into` forms `fs` and the supervisor
+   use to keep a second 4 KiB frame off their stacks. Section 20's gap, from the other side.
+5. **Two drivers' wait loops** (`xhci`, `dwc2`): call sites moved, structure did not. `Irq::wait` is the
+   destination, one hardware card per board.
+
+### Small differences, all deliberate
+
+`Since::passed` is `>=` where three checks were `>`, one tick. On an UNCALIBRATED machine two shell lines
+that printed a nonsense duration now do not, and a `dwc2` pass budget drains nothing where it drained one
+tick's worth. Two log lines print `gs::Error` names (`Busy`) where they printed `IpcError` names
+(`QueueFull`). `asker` and `counter` used an unbounded request and now have deadlines (26.6).
+
+### Validated on
+
+**QEMU, 2026-10-09, on the branch as committed.** x86: identity 24/24; the embedded `selfcheck` 539/0,
+twice in one boot (`osdev test script`); shell 246/0; files 245/0; examples 11/0; reply-server,
+reply-dead (`HANG woke with no reply after 129 ms (the service died before answering ...)`), counter,
+resource-server, file-cap 15/0, fs-restart 11/0, trace 10/10, adv 15/15, chaos 8/8, property 10/10.
+RISC-V `virt` with a USB stick behind xHCI - the `block-driver` -> `xhci` path this work changed -
+`selfcheck` 541/0, 4 skipped. Pi 4 (`raspi4b`, which emulates no disk): every one of selfcheck's 241
+checks that does not need storage passed. Pi 2 (`raspi2b`): `chaos max-carnage all-services` to round
+18 of 20 inside the run's window, supervisor respawned 8 times, no kernel panic.
+
+`osdev test trace` failed 3 checks here and on unmodified `main` alike - a harness race, fixed in the
+same branch (the test now syncs on a prompt it asked for).
+
+**Hardware: not yet.** Owed on each of the five boards: boot, `selfcheck`, and a chaos soak, because
+four drivers' waits and replies changed call shape even though their timing did not.

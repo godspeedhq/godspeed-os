@@ -152,7 +152,7 @@ pub trait SdioHost {
 /// resets the card's whole I/O side back to the state a fresh power-up leaves it in.
 pub const CCCR_IO_ABORT: u32 = 0x06;
 pub const CCCR_IO_ABORT_RES: u8 = 0x08;
-/// The voltage window to ask for: the 3.2-3.4 V bits of the OCR.
+/// The voltage window to ask for: OCR bits 23:15, 2.7-3.6 V, ANDed with the window the card reported.
 ///
 /// Deliberately NOT bit 24 (S18R, "switch to 1.8 V signalling"). That request must be followed by a
 /// CMD11 voltage switch, and asking for a switch this driver does not perform is a way to leave a real
@@ -680,7 +680,7 @@ pub fn read_fifo(h: &dyn SdioHost, func: u8, addr: u32, words: &mut [u32], block
 /// Tell the card to abandon a transfer on `func` - CCCR `IO_ABORT`, written to function 0.
 ///
 /// **Without this, one failed data transfer poisons every command after it.** A CMD53 the card ACCEPTS
-/// moves it into the transfer state, and `Host` resetting its own lines says nothing to the card - so the
+/// moves it into the transfer state, and the host resetting its own lines says nothing to the card - so the
 /// card sits holding the transfer open and refuses what comes next. Measured, not supposed: the CMD52
 /// after a failed CMD53 came back with R5 flags `0x28`, ERROR set and `IO_CURRENT_STATE` reading TRN. It
 /// is also why that CMD52's refusal had nothing to do with the address it was reading.
@@ -694,8 +694,8 @@ pub fn read_fifo(h: &dyn SdioHost, func: u8, addr: u32, words: &mut [u32], block
 /// altogether, and that is worth seeing.
 pub fn abort(h: &dyn SdioHost, func: u8, ctx: &ServiceContext) {
     // Bits 2:0 name the function to abort; the RES bit (`CCCR_IO_ABORT_RES`) would reset the card
-    // outright, which is a bigger hammer than a failed register read deserves - `identify` uses it, on
-    // purpose, for a card an earlier instance left running.
+    // outright, which is a bigger hammer than a failed register read deserves - `identify_once` uses it, on
+    // purpose, before every CMD0, as Linux's `sdio_reset` does.
     if write_reg(h, 0, CCCR_IO_ABORT, func & 0x7).is_none() {
         ctx.log_fmt(format_args!(
             "wifi-driver:   and the IO_ABORT for function {} was itself refused - INT={:#010x}. The card \
@@ -1104,7 +1104,8 @@ pub fn walk_cis(h: &dyn SdioHost, start: u32, ctx: &ServiceContext) -> Option<Ma
             }
         } else if code == cistpl::FUNCID && len >= 1 {
             if let Some(f) = read_reg(h, 0, body) {
-                // 0x0C is the SDIO function class for a "network adapter" in the CIS encoding. Logged
+                // 0x0C is the function code the SDIO specification gives every SDIO card in this tuple -
+                // it says "SDIO", not "network adapter" (the log line below says otherwise). Logged
                 // as a raw byte with the note rather than decoded into a table, because one value is
                 // all this phase needs and a lookup table nobody reads is the kind of speculative
                 // machinery §26.2 asks not to build.

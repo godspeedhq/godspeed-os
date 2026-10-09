@@ -131,6 +131,14 @@ learns what a file is; `fs` never touches a port.
 
 ## 5. Block driver - ATA PIO
 
+> **Note (2026-10-09): §4's diagram and all of §5 are the Phase 1 bring-up backend, which is
+> RETIRED.** `block-driver` is AHCI on x86 (MMIO + a DMA arena, `services/block-driver/src/ahci.rs`,
+> `docs/ahci.md`) and a USB stick through the `dwc2` or `xhci` service on every other board
+> (`usbdisk.rs`, `xhciblk.rs`). There is no `hw_pio` capability, no `PortRead`/`PortWrite` syscall, no
+> `capability/hw_pio.rs` and no SDK `pio.rs` in the tree; the driver's own header says ATA PIO was
+> retired once AHCI proved out. "No DMA" and "least-privilege by construction" therefore describe a
+> driver that no longer exists - see §9's 2026-09-26 correction for the TCB consequence.
+
 ### 5.1 Why ATA PIO
 
 - **No DMA → least-privilege by construction.** A PIO driver moves sectors through I/O
@@ -449,11 +457,12 @@ that snaps on when search arrives.
 1. **Superblock CRC32** - a `sb_crc32` (u32 @124) over the superblock's first 124 bytes,
    **verified on mount**. A corrupt superblock is a loud refusal (§3.12), never trusted or
    silently repaired - alongside the existing bad-magic refusal. Re-stamped on every
-   superblock write (`persist_super`).
+   superblock write (`persist_super`). *(2026-10-09: the CRC has since moved to @136,
+   `SB_CRC_OFF`, widened to cover the GSFS0008 feature masks at @124..@136 - §6.15.)*
 2. **Per-directory-block CRC32** - each 512-byte directory block now holds **7**
    `file_record`s (was 8) and reserves its last 64 bytes as a trailer; the first 4 trailer
    bytes are a CRC32 over the block's 448-byte record region. Verified on **every**
-   directory read (`dir_read`) and stamped on every write (`dir_write`), so corruption in
+   directory read (`Fs::td_read`) and stamped on every write (`dir_write`), so corruption in
    the metadata that *defines the tree* surfaces loudly instead of returning garbage
    records. The `file_record` layout is otherwise unchanged - **names stay 38 bytes**.
    *(The other 60 trailer bytes, 452..512, went unused until Phase O put timestamps there -
@@ -532,7 +541,8 @@ in an in-memory buffer instead of writing them to disk - with **read-your-writes
 op sees its own staged changes. `commit_txn` then:
 
 1. writes the staged blocks into the journal region;
-2. writes a **checksummed commit record** (magic + the home LBAs + a CRC32) - *the atomic
+2. writes a **checksummed commit record** (magic + the block count + the home LBAs + a CRC of
+   the staged payload + a CRC32 over all of that at @508, `COMMIT_CRC_OFF`) - *the atomic
    point*;
 3. checkpoints each staged block to its home LBA;
 4. invalidates the commit record.
@@ -546,6 +556,9 @@ means a committed-but-unfinished transaction → replay its blocks to their home
 (idempotent) and invalidate. An absent/torn commit (no magic, or a CRC mismatch) → do
 nothing. So a crash *before* the commit record is discarded (home untouched); a crash *after*
 it is completed. There is no third outcome **on a backend that attests durability** (see the note below).
+*(2026-10-09: recovery also re-reads the staged blocks and checks them against the payload CRC
+before applying any of them. A mismatch applies nothing and leaves the journal intact for the next
+mount, with a loud log saying the tree is not known consistent - `Fs::recover`.)*
 
 **Backends that cannot be ordered (2026-07-25, corrected 2026-09-23).** The rule is BACKEND-specific
 rather than architectural: a device that refuses or lies about a flush cannot enforce the journal-data
@@ -563,6 +576,11 @@ to be an unorderable backend. The rule stands and is worth keeping; the example 
 **Why ordered durability is free.** `block-driver` flushes every sector write to the medium
 before replying (`FLUSH EXT`), and `fs` serializes requests, so the journal-data → commit →
 checkpoint ordering the protocol needs holds without any extra barrier op.
+*(2026-10-09: no longer true, and the paragraph above is history. Since 2026-08-22 `ahci` issues
+`FLUSH CACHE EXT` only when `fs` sends `OP_FLUSH`, and `commit_txn` sends it at its barriers
+(`durable_or_warn`) - staged blocks before the commit record, the commit record before any home
+block moves. The ordering rests on those explicit barriers, not on a flush per sector. `CLAUDE.md`
+§6.1, the 2026-07-25 amendment as amended.)*
 
 **Bounds (§26.6).** A transaction stages at most `TXN_CAP` (56) blocks - comfortably more
 than any single op needs; an op that would exceed it fails loudly rather than committing
@@ -589,21 +607,27 @@ active on every mutation.
 **Mechanism (mirrors the kernel name-directory recovery path).**
 - The kernel's death path notifies the supervisor for `fs` and `block-driver`
   (sending the dead service's name); `assert_tcb_alive` guards only `supervisor`, so
-  killing `fs`/`block-driver` never panics.
+  killing `fs`/`block-driver` never panics. *(2026-10-09: no longer by name - the kernel notifies
+  for any task the supervisor spawned with `SPAWN_FLAG_WATCHED`, which it sets from its `MANAGED`
+  roster; CLAUDE.md 12.3, 2026-10-03.)*
 - The supervisor's death-notification loop respawns the named service. `block-driver` respawns
   before `fs` (fs's send-peer cap to it wires from the kernel name table at spawn).
 - `fs` and `block-driver` are **recorded in the kernel name directory** at spawn, so clients can
   reacquire a fresh cap by name after a restart.
 - On restart, `fs` re-mounts - replaying the journal if the crash interrupted a commit (§6.8) -
   so it always comes back consistent. The persisted data is intact.
-- Clients reacquire + retry on `EndpointDead` **or `ReplyDead`** (§14.3): the shell's `fs_request`
-  reacquires `fs`, and `fs`'s block I/O (`block_rpc`) reacquires `block-driver`. `block_rpc` is a
-  synchronous request/reply (`request_with_reply`), so if `block-driver` dies *after* receiving the
-  request but *before* replying, the kernel wakes `fs` with `ReplyDead` (the reply-side twin of
-  `EndpointDead`, §8.6) instead of hanging it on a reply that will never come - `fs` then reacquires
-  `block-driver` by name and retries, exactly as for a failed send. It waits on truth (the peer's
-  liveness), never on a timer (Commandment VIII). One retry covers the common case; the next command
-  covers the window before the service has re-registered.
+- Clients reacquire on `EndpointDead` **or `ReplyDead`** (§14.3), and re-send only what is safe to
+  repeat. `fs`'s block I/O (`block_rpc`) reacquires `block-driver`: it is a synchronous request/reply
+  bounded at 30 s (`request_with_reply_deadline_outcome_into`), so if `block-driver` dies *after*
+  receiving the request but *before* replying, the kernel wakes `fs` with `ReplyDead` (the reply-side
+  twin of `EndpointDead`, §8.6) instead of hanging it on a reply that will never come - `fs` then
+  reacquires `block-driver` by name and retries once, as for a failed send, because a block transfer of
+  the same sectors is safe to repeat. A reply that does not come within the 30 s is NOT re-sent: the
+  request may still be in flight, and a second one would desync the replies. The shell's `fs_request`
+  reacquires `fs` and retries **read-only operations only**: a mutating op (`op_is_mutating`: write,
+  mkdir, rename, delete, move) whose reply was lost is reported as possibly done and never re-sent,
+  because a repeat can repeat a destructive operation. The next command covers the window before the
+  service has re-registered.
 
 **Verified:** `osdev test fs-restart` (§22 Test 13, 7 checks) - the shell writes a file, `KILL
 fs` over the control channel, the supervisor respawns `fs`, `fs` re-mounts + re-registers, and
@@ -625,7 +649,7 @@ is now realized.
 **508 bytes of payload + a 4-byte CRC32 trailer @508** (mirroring the directory-block trailer).
 A file of N bytes spans `ceil(N/508)` data blocks; each block's CRC covers its own 508-byte
 payload, verified on every read (`data_read`) and stamped on every write (`data_write`). This
-makes **every block in the filesystem self-verifying** - superblock (CRC @124), directory block
+makes **every block in the filesystem self-verifying** - superblock (CRC @124, @136 since GSFS0008 - §6.15), directory block
 (CRC @448), data block (CRC @508) - a uniform, whiteboardable model with no side structure and
 no read-modify-write.
 
@@ -1048,7 +1072,7 @@ client.**
 It falls out of two facts rather than any locking:
 
 1. **`fs` is single-threaded and serves one request to completion before dequeuing the next.** The
-   serve loop is `loop { let msg = ctx.recv(); ... }` - there is no second thread, because nothing
+   serve loop is `loop { let msg = gs::ipc::recv(&ctx); ... }` - there is no second thread, because nothing
    in this system has one (§9: a task is a service). A request is received, served, replied to, and
    only then is the next taken.
 2. **Every mutating op commits through the redo-journal** (§6.8). Its blocks are staged, the commit
@@ -1179,7 +1203,11 @@ table, and returns it. `is_delegated(id)`, `owner_of(id)`, `revoke_owned(id, cal
   the badge **`[resource_id:u64, right:u8]` prepended to the payload**, reusing `routing::enqueue`
   with the *owner endpoint's* current generation (so the routing gen-check passes; the file gen was
   already validated against the global table). A reply cap is embedded exactly as `SendWithCap` does
-  today, so `fs` replies on the normal path.
+  today, so `fs` replies on the normal path. *(2026-10-09: as built, the badge is NOT prepended to the
+  payload - it rides in kernel-set `Message` fields and the owner reads it with `LastRecvBadge`
+  (syscall 33), which is what makes it unforgeable; `kernel/src/syscall/dispatch.rs`. The RESOURCE_MINT
+  grant is a privilege bit in the spawn request now, held by `fs`, `net-stack` and the
+  `resource-server` example in the supervisor's spawn table, not a name-keyed mint.)*
 
 > **Correctness decision 2 - rights are enforced by the kernel, per operation, without the kernel
 > knowing what a file is.** A read needs `READ`, a write needs `WRITE`. The kernel can't read the
@@ -1206,6 +1234,14 @@ before 2b wires `fs` onto it. Then 2b (`fs` issues file caps), 2c (SDK `File` + 
 Test 14).
 
 ## 8. IPC protocols (proposed)
+
+> **Note (2026-10-09): the proposal, not the protocol.** What shipped is opcode-addressed with a
+> correlation tag at byte 0. `fs` <-> `block-driver`: `[tag, op, lba:u64 LE, ...]` -> `[tag, status,
+> ...]`, ops 1 `READ_BLOCK`, 2 `WRITE_BLOCK`, 3 `CAPACITY`, 4 `WRITE_ZEROS`, 5 `FLUSH` - one block per
+> request, not a count. Client <-> `fs`: ops 10-31 (`OP_WRITE_FILE` 10, `OP_READ_FILE` 11,
+> `OP_STAT_FILE` 12, directories, rename/move/delete, drives, streaming `OP_WRITE_NEW`/`OP_WRITE_AT`/
+> `OP_READ_AT` 24-26, check, scrub, `OP_OPEN` 30, `OP_SEAL` 31). The constants are the definition:
+> `services/fs/src/main.rs` and `services/block-driver/src/main.rs`.
 
 **Client ↔ fs** (Phase 1, name-addressed):
 
@@ -1250,6 +1286,10 @@ All replies are exactly one of `{Ok-with-data, defined error}` - never silent
   what `docs/ahci.md` and the 2026-09-12 DMA-census amendment both say.
 
 ## 10. Phased build plan
+
+*(Note 2026-10-09: the record of Phase 1 as it was built. Steps 1-3 name the ATA-PIO machinery -
+`hw_pio`, `PortRead`/`PortWrite`, `capability/hw_pio.rs`, `pio.rs`, `if=ide` - all since retired
+with that backend; see the note at the head of §5.)*
 
 1. **Block driver read path. ✅ done** (`osdev test blockdev`). Added the `hw_pio`
    grant (kernel-mediated `PortRead`/`PortWrite` syscalls validated per access,

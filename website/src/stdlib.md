@@ -48,7 +48,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
 ### And a contract, or it reaches nothing
 
-Authority is granted, never assumed. A program with no contract entry for `fs` gets
+Authority is granted, never assumed. A program granted no `fs` peer gets
 `Error::Unreachable` from its first call - not a crash, and not a silent nothing. Put this beside
 your `Cargo.toml`, in `contracts/<name>.toml`:
 
@@ -61,25 +61,34 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-ipc_send     = ["fs"]     # talk to the filesystem. Drop this and `read_into` returns Unreachable
+ipc_send     = ["fs"]     # talk to the filesystem; the spawn row must grant it too (below)
 ipc_receive  = ["hello"]  # your own endpoint, named after you
-console_push = true       # PUT TEXT ON THE SCREEN. Drop this and `io::println` runs and nothing
-                          # appears - no error, no warning, just a silent program
+log_write    = true       # the log (`ctx.log`) AND the screen (`io::println`, `io::report`)
 ```
 
-Note what is **not** there: `log_write`. That grants `ctx.log()`, which writes the kernel log ring and
-serial - a different destination from the screen - and the program above never calls it. Everything
-in `gs::io`, `io::report` included, goes to the screen and needs `console_push`. Add `log_write` when
-you actually call `ctx.log`, and not before.
+Printing is `log_write`. Everything in `gs::io`, `io::report` included, makes the kernel's
+`ConsoleWrite` call, and `LOG_WRITE` is the capability the kernel checks before it. Every task holds
+it, so output appears regardless; declaring it is the contract saying truthfully what the program does,
+and `scripts/contract_check.py` requires it of every program that prints.
 
-A program that declares only `log_write` and calls `io::println` compiles, passes `osdev validate`,
-passes every checker, and prints nothing at all - its error messages included, because `io::report`
-goes to the screen too.
+**Never ask for `console_push` to print.** It is the authority to push bytes into the keyboard ring,
+which the shell reads as typed commands (SEC-2). A keyboard driver needs it; your program does not, and
+the same checker refuses a `console_push` declaration that nothing in the code uses.
 
-**If your output is missing, read your contract before you read your code.**
+*This page said the opposite until 2026-10-09 - that printing needs `console_push` and that a program
+without it is silent. That was a conclusion drawn from documentation and never run; the kernel's code
+and the project's own test log both refute it (`docs/stranger-test.md`, "Run 4 was wrong about the
+screen").*
 
 Ask for what you use and nothing more: the contract is the reviewable statement of what your program
 may do (CLAUDE.md 26.9).
+
+**The contract declares; it does not grant.** The kernel cannot read TOML. What a running program
+actually holds comes from the SPAWN REQUEST the supervisor sends, built from the program's row in the
+supervisor's spawn table (`IMAGES` in `services/supervisor/src/main.rs`) - for this program,
+`("stdlib-hello", .., &["fs"], ..)`. A peer in the contract with no matching row is a program that
+looks authorised on paper and is not (CLAUDE.md 13.6). For services, `scripts/contract_check.py`
+reconciles the two.
 
 `examples/stdlib-hello` is this same program, complete and buildable.
 
@@ -96,13 +105,14 @@ match fs.write("/data/log.txt", b"hello") {
 }
 ```
 
-`Error::OutcomeUnknown` means the request left and no answer came back. The write may have
-committed. Retrying it is not a retry, it is a **second write**, and for anything that is not
-idempotent that is a different bug from the one you were recovering from.
+`Error::OutcomeUnknown` means the request left and no answer came back before the deadline.
+`Error::PeerDied` means the request arrived and the service died before answering. Either way the
+write may have committed. Retrying it is not a retry, it is a **second write**, and for anything that
+is not idempotent that is a different bug from the one you were recovering from.
 
-`retry_is_safe()` returns `false` for it, so that nobody has to derive the rule themselves. This is
-the single failure the [Stranger Test](constitution.md) watches hardest, because it is invisible in
-a passing build.
+`retry_is_safe()` returns `false` for both, so that nobody has to derive the rule themselves. This is
+the failure the [Stranger Test](constitution.md) watches hardest, because it is invisible in a passing
+build.
 
 ## If your program SERVES other tasks
 
@@ -119,10 +129,15 @@ to drain anything, and nothing you did not ask for is consumed.
 // A service loop. `fs.read_into` may block for seconds; a client that speaks during it is still
 // waiting on your endpoint afterwards, not lost.
 loop {
-    let req = gs::ipc::recv(&ctx);
-    let mut buf = [0u8; 4096];
-    let n = fs.read_into("/data/answer.txt", &mut buf)?;
-    reply(&req, &buf[..n]);
+    let _req = gs::ipc::recv(&ctx);
+    let client = gs::ipc::take_sent_cap(&ctx);   // the reply capability the client sent with it
+    let mut buf = [0u8; gs::ipc::MAX_BYTES];
+    let n = fs.read_into("/data/answer.txt", &mut buf).unwrap_or(0);
+    if let Some(c) = client {
+        // Answers without blocking, AND gives the one-shot capability's slot back. A plain send
+        // would keep it, and leak one slot per request until the table is full.
+        let _ = gs::ipc::reply(&ctx, c, &gs::ipc::Message::from_bytes(&buf[..n]));
+    }
 }
 ```
 

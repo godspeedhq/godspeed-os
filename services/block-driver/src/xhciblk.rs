@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Reach the USB disk through the **`xhci` SERVICE** instead of the in-kernel USB stack.
+//! Reach the USB disk through the **USB host SERVICE** (`xhci`, or `dwc2` on the Pi 2) instead of the
+//! in-kernel USB stack that used to carry it.
 //!
-//! `usbdisk.rs` reaches its device through four syscalls - `usb_disk_sectors/read/write/flush` -
-//! which exist to expose a USB stack that lives IN THE KERNEL. That was true on aarch64 when this
+//! `usbdisk.rs` used to reach its device through four syscalls - `usb_disk_sectors/read/write/flush` -
+//! which existed to expose a USB stack that lived IN THE KERNEL. That was true on aarch64 when this
 //! module was written; it is not now. `kernel/src/arch/aarch64/xhci.rs` (2742 lines of ring-0 code
 //! parsing descriptors supplied by whatever was plugged in) was DELETED, along with the feature flags
 //! that used to select between the two drivers, so on this port the service below is the only route
 //! and Commandment I is closed (CLAUDE.md §6.4, amendment 2026-08-09).
 //!
-//! The syscall route in `usbdisk.rs` survives for a board with no such service, and **no shipping
-//! port is one**: arm32's DWC2 stack left the kernel a week after aarch64's xHCI did (CLAUDE.md §6.4,
-//! amendment 2026-08-17), so every USB board now comes through here.
+//! There is no syscall route left: arm32's DWC2 stack left the kernel a week after aarch64's xHCI did
+//! (CLAUDE.md §6.4, amendment 2026-08-17), and `usbdisk.rs` now calls this module for every operation,
+//! so every USB board comes through here.
 //!
 //! Which service to ask is `STORAGE_HOST`, set by `build.rs` from the target. It used to be a build
 //! FEATURE, which was a footgun - the switch had to reach three crates by hand, and setting only some
 //! gave two drivers on one controller, or none. A value DERIVED from the target cargo is already
 //! building for cannot be half-set, which is the property that was actually wanted.
 //!
-//! This module is the other route. Same four operations, addressed to the `xhci` service by name
-//! over IPC, using the block protocol that service already serves (`services/xhci/src/msc.rs`).
+//! This module is that route. Four operations, addressed to the host service by name (`XHCI`, which is
+//! `STORAGE_HOST`) over IPC, using the block protocol that service already serves
+//! (`services/xhci/src/msc.rs`; `dwc2` serves the same wire format).
 //!
 //! ## Why this is a proxy and not a rewrite
 //!
@@ -38,6 +40,7 @@
 //! often means the service restarted and our cap went stale (§14.3), which is recovery rather than
 //! fallback - it re-establishes the SAME path.
 
+use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
 use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_OK};
@@ -55,12 +58,6 @@ use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_OK};
 /// nothing fails loudly rather than reaching some other service by accident.
 pub(crate) const XHCI: &str = env!("STORAGE_HOST");
 
-/// One request/reply to `xhci`, with a single reacquire-and-retry.
-///
-/// The retry exists for one specific, expected condition: the service restarted and this cap went
-/// stale. Reacquiring by name re-establishes the same path (§14.3). It is ONE retry, not a loop -
-/// a service that is genuinely gone must surface as a failure rather than as an operation that
-/// never returns.
 /// How long ONE question to the USB host service may take. Two numbers, because the two kinds of
 /// question have nothing in common:
 ///
@@ -74,6 +71,11 @@ const CAPACITY_RPC_SECS: i64 = 2;
 const IO_RPC_SECS: i64 = 10;
 
 /// One request to the USB host service, BOUNDED.
+///
+/// With a single reacquire-and-retry. The retry exists for one specific, expected condition: the
+/// service restarted and this cap went stale. Reacquiring by name re-establishes the same path
+/// (§14.3). It is ONE retry, not a loop - a service that is genuinely gone must surface as a failure
+/// rather than as an operation that never returns.
 ///
 /// This used `request_with_reply`, whose own SDK comment says it plainly: "No deadline on this
 /// variant, so `None` is always a lost peer, never a timeout." An unbounded `call` wakes on a reply
@@ -94,20 +96,27 @@ const IO_RPC_SECS: i64 = 10;
 /// returns is never evaluated. An outer deadline cannot rescue an unbounded inner call.
 fn rpc_within(ctx: &ServiceContext, req: &[u8], secs: i64) -> Option<Message> {
     let msg = Message::from_bytes(req);
-    match ctx.request_with_reply_call_err(XHCI, &msg, secs) {
-        Ok(Some(r)) => return Some(r),
-        Ok(None) => {
+    // `request_once`, not `request_within`: this path owns its retry - it retries a FULL queue as well
+    // as a failed send, and says whether the reacquire worked - so the library's one built-in retry
+    // would be a second policy on top of this one.
+    match gs::call::request_once(ctx, XHCI, &msg, secs) {
+        Ok(r) => return Some(r),
+        Err(gs::Error::OutcomeUnknown) => {
             // THE DEADLINE PASSED, AND THIS IS NOT RETRIED. The request may still be in flight, so a
             // second one would leave the first reply to arrive as an orphan and desync every exchange
             // after it - the same reason `fs` refuses to re-send a request we did not answer in time.
-            // Retry belongs to `Err` alone, which means the SEND failed and nothing is outstanding.
+            // Retry belongs to the other errors: a send that never left (nothing is outstanding), or
+            // a peer that died holding the request (`PeerDied`), which nothing will now answer.
             ctx.log_fmt(format_args!(
                 "block-driver: '{}' did not answer within {} s - reporting storage UNAVAILABLE rather \
                  than waiting on it (it is reachable but silent: busy, wedged, or idling with no \
                  controller)", XHCI, secs));
             return None;
         }
-        Err(_) => {}   // the SEND failed: no request is outstanding, so a retry is safe
+        // The SEND failed (stale or full): no request is outstanding, so a retry is safe. Or `xhci` took
+        // the request and DIED (`PeerDied`): nothing will answer it, and a block transfer of the same
+        // sectors is safe to repeat against the new instance - which is what this path has always done.
+        Err(_) => {}
     }
     // WHEN BOTH ATTEMPTS FAIL, SAY WHETHER THE REACQUIRE WORKED. That is the one distinction left
     // between the two causes this path can have, and they need opposite fixes:
@@ -118,11 +127,8 @@ fn rpc_within(ctx: &ServiceContext, req: &[u8], secs: i64) -> Option<Message> {
     //
     // Logged only when the RETRY also fails, so an ordinary stale-cap recovery - which is the common
     // case and works - stays silent.
-    let reacquired = ctx.reacquire_by_name(XHCI);
-    let out = match ctx.request_with_reply_call_err(XHCI, &msg, secs) {
-        Ok(v)  => v,
-        Err(_) => None,
-    };
+    let reacquired = gs::cap::reacquire(ctx, XHCI);
+    let out = gs::call::request_once(ctx, XHCI, &msg, secs).ok();
     if out.is_none() {
         ctx.log_fmt(format_args!(
             "block-driver: '{}' did not answer, and the retry after reacquire {} - {}",
@@ -165,7 +171,7 @@ const CAPACITY_TIMEOUT_MS: u64 = 20_000;
 /// never answers is a failure-truth, not a reason to wait forever, so we come up with no disk and
 /// say so.
 pub fn sectors(ctx: &ServiceContext) -> u64 {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(CAPACITY_TIMEOUT_MS));
+    let started = gs::driver::wait::Since::now(ctx);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -183,9 +189,9 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
             }
         }
         // Not up yet, or its cap went stale across a restart. Both are recovered the same way.
-        let _ = ctx.reacquire_by_name(XHCI);
-        ctx.yield_cpu();
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        let _ = gs::cap::reacquire(ctx, XHCI);
+        gs::task::yield_now(ctx);
+        if started.passed(ctx, gs::driver::wait::Budget::ms(CAPACITY_TIMEOUT_MS)) {
             break;
         }
     }

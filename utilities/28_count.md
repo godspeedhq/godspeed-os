@@ -40,6 +40,9 @@ column is which.
 - **words** - runs of non-whitespace bytes.
 - **bytes** - the raw size.
 
+**On a record stream it counts ROWS** and prints the bare number (`status | count` → `14`), since
+lines, words and bytes mean nothing for a table.
+
 `count` consumes input; it is never a pipe *producer*. In a pipe it is normally the last stage
 (it collapses many lines into one summary), but being a filter it can also feed onward
 (`find *.txt | count | write /n.txt` writes the summary to a file).
@@ -49,8 +52,11 @@ column is which.
 A shell built-in FILTER (`run_filter_builtin`, alongside `match`): it runs **in-process**, so it
 is **not** subject to the 4 KiB pipe service-boundary cap and can count a full 16 KiB stage
 buffer. The pipe form consumes the previous stage's buffer (`write_count` in
-`run_filter_builtin`); the direct form `read`s the file itself (`fs` `ReadFile`, op 11) - no new
-`fs` surface.
+`run_filter_builtin`); the direct form reads the file itself (`gs::fs::Fs::read_into`, streaming
+`READ_AT`) - no new `fs` surface - into a fixed `FILTER_READ_MAX` (8192-byte) buffer, and refuses
+a larger file loudly rather than counting part of it (pipe it instead: `read <path> | count`).
+`count` with neither a path nor piped input prints `count: a path is required (or pipe input:
+<producer> | count)`.
 
 ## 5. Later (separate so it can grow)
 
@@ -63,7 +69,9 @@ buffer. The pipe form consumes the previous stage's buffer (`write_count` in
 Conforms to `0_conventions.md`: its own `count help` (usage with a real example per row) and
 `count version` (number + creator credit), via the shared `help_block` helper.
 
-Also conforms to **rule 10** (`0_conventions.md` §1.10): when reading a file, the `fs` request is
-**q-abortable** via `fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to
-the prompt (a fast reply prints nothing). This replaced a bare `request_with_reply`, which rule 10
-forbids for an interactive command.
+**Does NOT currently conform to rule 10** (`0_conventions.md` §1.10), found 2026-10-09. The `fs`
+read of a file goes through a `gs::fs::Fs` handle that is lent no notice, so each request is bounded
+(`gs::call::DEFAULT_SECS`, 5 s) but prints no `[q] quit` and cannot be ended with `q`; the
+`Cancelled` branches in the handler are unreachable. This said the request was q-abortable via
+`fs_request_q`, which no longer exists. `dir` is the one fs-backed command that still lends the
+notice (`16_dir.md` §6); the same `.noticing(...)` here is the fix.

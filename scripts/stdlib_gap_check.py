@@ -10,7 +10,8 @@ way, and the same blind spot produced a second round of missing modules a branch
 
 So this asks the question in the direction that can fail. For every FREE public item of
 `godspeed_sdk`, is there a `gs` route - and where there is not, does an ordinary (non-driver,
-non-harness) service use it anyway? That last group is the number this ratchets. It may fall freely.
+non-harness) service use it anyway? That last group is the number this ratchets. It may fall, and
+when it does the check fails until BASELINE is lowered to match, so a closed gap cannot quietly reopen.
 It may not RISE without someone editing the figure below and saying why, which is the point: adding
 SDK surface that ordinary programs need is now a deliberate act with a paper trail, not an oversight
 discovered by an audit two branches later.
@@ -42,7 +43,11 @@ STD = 'stdlib/rust/src'
 BASELINE = 8
 
 # 18.1 designates the SDK for device work; these crates are its intended callers.
-DRIVERS = {'block-driver', 'dwc2', 'ehci', 'nic-driver', 'xhci', 'driver-skeleton', 'console'}
+# Hand-kept, so it drifts: `audio-driver`, `pwm-audio` and `wifi-driver` arrived after it was written and
+# were counted as ordinary programs for using `Mmio` and `Dma`, which failed this check by 2 on `main`
+# and on every branch since, unnoticed because nothing ran it (2026-10-09).
+DRIVERS = {'block-driver', 'dwc2', 'ehci', 'nic-driver', 'xhci', 'driver-skeleton', 'console',
+           'audio-driver', 'pwm-audio', 'wifi-driver'}
 # Harness, adversarial and control surface - also 18.1, also not ordinary programs.
 HARNESS = {'probe', 'mem-pressure', 'control', 'chaos'}
 # Services that IMPLEMENT a wire protocol `gs` is the client for. `events` is the trace sink, so it
@@ -138,7 +143,8 @@ def main():
         print('')
         print('An ordinary program should not need `godspeed_sdk`. Either add the route to `gs`, or')
         print('raise BASELINE in this file and say in the commit message which item and why.')
-        print('Run with --list for the full set. Drivers, harness and protocol implementers are exempt.')
+        print('Run with --list for the full set. Drivers, harness and protocol implementers are exempt:')
+        print('an item is counted only when some user is NOT one of them (every user is listed above).')
         return 1
 
     if n < BASELINE:

@@ -27,7 +27,7 @@ there and why, so when in doubt, open the one nearest the code you are editing.
 | I want to ... | Start here |
 |---------------|-----------|
 | Understand the philosophy before touching anything | [`COMMANDMENTS.md`](COMMANDMENTS.md), then skim [`CLAUDE.md`](CLAUDE.md) |
-| Write a new userspace service | [`GETTING_STARTED.md`](GETTING_STARTED.md) - the 5-minute quickstart (copy [`examples/00-hello/`](examples/00-hello/), read its `CLAUDE.md` + [`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md)) |
+| Write a new userspace service | [`GETTING_STARTED.md`](GETTING_STARTED.md) - the 5-minute quickstart (copy [`examples/00-hello/`](examples/00-hello/), read its `CLAUDE.md` + [the standard library guide](website/src/stdlib.md); [`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md) is the layer underneath) |
 | Learn one pattern (IPC, caps, composition, persistence, drivers) | The matching `examples/*/CLAUDE.md` (index: [`examples/README.md`](examples/README.md)) |
 | Add or change a syscall | `kernel/src/syscall/CLAUDE.md`, then `syscall/mod.rs` |
 | Add a new CPU architecture | [`kernel/src/arch/CLAUDE.md`](kernel/src/arch/CLAUDE.md) (the seam + the five-place checklist) |
@@ -106,7 +106,7 @@ Every `all-services` run prints its **seed** when it starts and again in its rep
 on has:
 
 - the **seed** and the **round** it broke at;
-- the **commit**, from the first line of the boot banner (`GodspeedOS 0.21.0 x86_64 (f54aafef) - kernel`);
+- the **commit**, from the first line of the boot banner (`GodspeedOS 0.22.0 x86_64 (f54aafef) - kernel`);
 - the **machine** - the board, or the QEMU command line and `-smp`;
 - the **serial log**, the whole of it. It matters more than anything else on this list: `events log
   boot` holds only the boot, and the supervisor's `hardware events` record restarts whenever chaos kills
@@ -130,14 +130,24 @@ server - the dependent **blocks on its dependency's reply, never on a fixed amou
 Commandment VIII made concrete: wait on truth (the reply, or the loud fact of the peer's death), never
 on a timer, a yield count, or a tick.
 
-The standard pattern is the SDK's `request_with_reply` (`sdk/rust/src/service_context.rs`): it sends
-the request carrying a one-shot reply cap and blocks for the reply. It now waits on truth **without
-ever hanging** - it is a synchronous kernel CALL (syscall 41), so if the peer dies after receiving the
-request but before replying, the kernel wakes the caller with `ReplyDead` (the reply-side twin of
-`EndpointDead`, CLAUDE.md section 8.6) instead of blocking it forever. On either `EndpointDead` or
-`ReplyDead` the caller gets `None`, reacquires the peer **by name** through the kernel directory
-(section 14.3), and retries. That is the whole discipline: block on the reply, and on failure
-reacquire-by-name and retry.
+The standard pattern is the standard library's `gs::call::request_within(&ctx, peer, &msg, secs)`
+(`stdlib/rust/src/call.rs`): it sends the request carrying a one-shot reply cap and blocks for the
+reply, bounded by `secs`. It waits on truth **without ever hanging** - it is a synchronous kernel
+CALL (syscall 41) in its bounded form, `CallDeadline` (syscall 50, CLAUDE.md section 8.2), so if the
+peer dies after receiving the request but
+before replying, the kernel wakes the caller with `ReplyDead` (the reply-side twin of `EndpointDead`,
+CLAUDE.md section 8.6) instead of blocking it forever. What the caller gets back says which failure it
+was, and they are not handled alike:
+
+- **`Error::Unreachable`** - the request never left (a stale cap, a peer mid-restart). Nothing
+  happened. `request_within` has already reacquired the peer **by name** through the kernel directory
+  (section 14.3) and sent once more for you.
+- **`Error::PeerDied`** - the request arrived and the peer died before answering. **It may have
+  happened.** Reacquire (`gs::cap::reacquire`), and ask again only if the operation is safe to repeat.
+- **`Error::OutcomeUnknown`** - no reply before the deadline. **It may have happened**, exactly as above.
+
+That is the whole discipline: block on the reply, and on failure reacquire by name - re-sending only
+what `retry_is_safe()` says, or what you know is safe to repeat.
 
 Do **not** paper over a dependency that might be slow or restarting with `yield` a fixed number of
 times, a `sleep`, or a tick-count deadline "to give it time to come up". That is waiting on time, and
@@ -217,7 +227,7 @@ still saying one thing, the gate no longer noticing, and nobody finding out unti
 document.
 
 Before you open a pull request, run **`osdev conform --check`**. It runs every gate a build runs and
-gives you one verdict instead of eighteen. It needs Python 3.8 or newer on your `PATH` as `python`,
+gives you one verdict instead of twenty-four. It needs Python 3.8 or newer on your `PATH` as `python`,
 which is a declared dependency of this project alongside Rust and QEMU.
 
 ## A note on scope
@@ -240,7 +250,7 @@ the seam, the surface a port must expose, the exact five-place checklist, and th
 gotchas found by actually booting. Two rules matter most, and both are load-bearing:
 
 - **No inline `asm!` and no named-arch reference (`arch::x86_64::`, `core::arch::<isa>::`) outside
-  `arch/`.** This is enforced by `scripts/arch_boundary_check.py` in CI - a violation means a neutral
+  `arch/`.** This is enforced by `scripts/arch_boundary_check.py` on every `osdev build` - a violation means a neutral
   file made an arch-specific assumption, and the fix is to add an `arch::imp` primitive, never to
   special-case an arch at the call site.
 - **Never use `core::sync::atomic::AtomicU64` directly - import `portable_atomic::AtomicU64`.** That

@@ -24,7 +24,7 @@ pub(crate) const GHWCFG2:  usize = 0x048; // hardware config 2 (architecture, HS
 pub(crate) const GHWCFG3:  usize = 0x04C; // hardware config 3 (bits 31:16 = total DFIFO depth in 32-bit words)
 pub(crate) const GHWCFG4:  usize = 0x050; // hardware config 4 (bit 30 = descriptor/scatter-gather DMA)
 
-/// GHWCFG2 bits 2:3 - OTG architecture. 2 = internal DMA (what buffer-DMA mode requires).
+/// GHWCFG2 bits 4:3 - OTG architecture. 2 = internal DMA (what buffer-DMA mode requires).
 pub(crate) const GHWCFG2_ARCH_SHIFT: u32 = 3;
 pub(crate) const GHWCFG2_ARCH_MASK: u32 = 0x3;
 /// GHWCFG4 bit 30 - the core implements DESCRIPTOR (scatter/gather) DMA.

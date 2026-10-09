@@ -15,7 +15,15 @@ WHAT IS DELIBERATELY EXEMPT, and why it is not a loophole:
                are evidence, CLAUDE.md is law.
 
   CLAUDE.md    Its amendment blocks are ratified history and name files that were REMOVED by the very
-               amendment recording the removal. The body outside them is still checked.
+               amendment recording the removal. (Correction 2026-10-09: the BODY is not checked
+               either. The root CLAUDE.md is not in PATTERNS at all - no code here separates an
+               amendment from the body - so a dead path anywhere in the constitution passes.)
+
+SCOPE, stated so a pass is not read as wider than it is. Paths are checked only in the PATTERNS files
+below (so not COMMANDMENTS.md, CONTRIBUTING.md, SECURITY.md, backlog/*.md, examples/**, tests/**,
+osdev/CLAUDE.md or kernel/CLAUDE.md), only when BACKTICKED, and only with a .rs/.md/.toml/.py/.json/
+.gsh extension - a directory or a `.sh`/`.ps1`/`.txt` path is never checked. `backlog/NN` citations
+are checked over PATTERNS plus SOURCE_PATTERNS plus backlog/README.md.
 
 Exit 0 when every referenced path resolves, 1 otherwise.
 """

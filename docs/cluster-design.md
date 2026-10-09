@@ -65,9 +65,8 @@ ipc_send_remote = ["ledger"]   # explicit cross-node send, different failure dom
 **SDK call sites:**
 
 ```rust
-// Local service - identical to today
-let pong = ctx.acquire_send_cap("pong")?;
-pong.send(msg)?;
+// Local service - as today (gs::ipc::send), unchanged by clustering
+gs::ipc::send(&ctx, "pong", &msg)?;
 
 // Remote service - developer explicitly opts into a different failure domain
 let ledger = ctx.remote_send_cap("ledger")?;
@@ -139,7 +138,7 @@ This should be stated explicitly in the API documentation for `send_remote` so d
 
 ## 7. The naming problem
 
-The bullet "the name directory must become cluster-aware" in the current spec is doing enormous work in one sentence. It covers at minimum:
+The phrase "the registry consistency model" in Appendix C.4 of the current spec (the registry service is retired; read it as the name directory) is doing enormous work in one sentence. It covers at minimum:
 
 1. **Distributed name resolution.** How does node A learn about endpoints on node B? Push (nodes announce services on join), pull (query a central directory), or gossip? Each has failure modes.
 2. **Node membership tracking.** What nodes are in the cluster? Who decides? How is the membership list kept consistent across nodes?
@@ -227,4 +226,4 @@ No option is obviously correct. The choice shapes the entire cluster security mo
 | Ordering guarantee level | §6 | No - "transport-dependent" with documentation is acceptable |
 | Delivery acknowledgment semantics | §4 | No - "Unknown" is a valid stated answer |
 
-The three blocking questions (transport, naming, TCB authority) are interdependent: the cert trust model in §8.1 connects all three. They cannot be resolved independently and should be addressed together in a dedicated threat-model exercise before any cluster implementation begins.
+The four blocking questions (transport, membership and cert trust, naming, TCB authority) are interdependent: the cert trust model in §8.1 connects all three. They cannot be resolved independently and should be addressed together in a dedicated threat-model exercise before any cluster implementation begins.

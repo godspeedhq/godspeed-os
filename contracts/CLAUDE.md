@@ -6,8 +6,17 @@ Service contracts and JSON Schema (§13.5). Every service declares what it needs
 
 | File                          | Purpose |
 |-------------------------------|---------|
-| `schema/service.schema.json`  | JSON Schema (draft 2020-12) for all `contracts/<name>.toml` contract files |
-| `*.toml`                      | One contract per service |
+| `schema/service.schema.json`  | JSON Schema (draft 2020-12) for every `contracts/<name>.toml` contract file |
+
+There are no contracts in this directory. Each crate carries its own, at
+`services/<name>/contracts/<name>.toml` or `examples/<name>/contracts/<name>.toml`.
+
+A contract is a build-time DECLARATION. The kernel never reads it: a service's authority comes from
+the supervisor's spawn request (CLAUDE.md §13.6). `scripts/contract_check.py` reconciles a service
+contract's memory limit, placement core, `ipc_send`, `hw_device`/`hw_pci_*` and `resource_mint`
+against that spawn row, and requires `log_write` of a crate that prints through `godspeed::io`;
+`IV-contract-authority` in `scripts/commandments.py` reconciles `service_control`, `resource_mint`,
+`pci_cfg` and `cpu_clock` against what is actually granted.
 
 ## Contract format (§13.1)
 
@@ -30,7 +39,8 @@ core = 0    # optional; omit for round-robin
 
 ## What the schema validates (§13.4)
 
-- Required fields: `name`, `version`, `resources.memory.request`, `resources.memory.limit`.
+- Required fields: `name`, `version`, `resources.memory.request`, `resources.memory.limit`, and a
+  `[capabilities]` table (which may be empty).
 - Name format: lowercase alphanumeric + hyphens.
 - Version: SemVer `N.N.N`.
 - Memory sizes: `NNN(KiB|MiB|GiB)`.
@@ -52,7 +62,10 @@ Build-time validation is structural, not behavioral. Behavioral enforcement is r
 osdev validate
 ```
 
-Runs against every `contracts/*.toml` file. CI must pass `osdev validate` before any PR is merged.
+Runs against every `.toml` directly inside any `contracts/` directory in the tree (up to five levels
+deep, skipping `target/` and `build/`). It is on no developer build path: `osdev`'s `EXTRA_CHECKS`
+does not include it, and the only workflow that runs it, `build.yml`, is `workflow_dispatch`-only and
+paused. Run it by hand after touching a contract or this schema.
 
 ## Placement field semantics (§13.2)
 

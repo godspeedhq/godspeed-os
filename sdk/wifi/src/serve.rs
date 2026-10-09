@@ -475,7 +475,7 @@ pub fn serve<'s>(
     // every slot is held, the one JOINED LONGEST AGO is replaced. This table is the WORKING SET; the 48 most
     // recent keys and their names are also on disk in `/wifi.keys` (`godspeed_wifi::keyfile`), loaded when
     // the radio comes up and rewritten after every change.
-    // About 70 bytes each, some 4.5 KiB in all, against a service limit of 8 MiB or more: the count is a BOUND (26.6), chosen
+    // About 80 bytes each (88 as an `Option`), some 5.5 KiB in all, against a service limit of 8 MiB or more: the count is a BOUND (26.6), chosen
     // so that nobody reaches it, not a fit to the memory - a table that grew to fill what is available is
     // the elastic growth 26.6.1 says to resist.
     struct Stored {
@@ -1025,13 +1025,15 @@ pub fn serve<'s>(
                 5
             }
             (wire::OP_RADIO, Some(session)) => {
-                // Reply: `[status, was_joined, changed]`. `changed` is 0 when the radio was already in the
+                // Reply: `[status, was_joined, changed, verdict_or_rejoin, len, name[32]]` (`wire::OP_RADIO`).
+                // `changed` is 0 when the radio was already in the
                 // state asked for - and then NOTHING is sent to the firmware, because a DOWN to a radio that
                 // is down is not a no-op on every firmware and an UP chain re-run resets a live interface.
                 let on = payload.get(1).copied().unwrap_or(1) != 0;
                 let was_joined = joined.is_some();
                 out[2] = (on != radio_on) as u8;
-                // EVERY byte the reply carries is written on EVERY path. `out` is one buffer reused for
+                // Bytes 0-4 are written on EVERY path; the name bytes after them are written only by a
+                // rejoin, and otherwise `len` (byte 4) is 0 so none is read. `out` is one buffer reused for
                 // every request, and the "already on" branch left byte 3 - the rejoin status - holding
                 // whatever the previous reply put there. The shell read it as a rejoin outcome it had no
                 // words for. Boot 2026-09-30 15:17: `radio already on` followed by "a reply this shell

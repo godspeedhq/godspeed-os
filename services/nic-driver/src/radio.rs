@@ -8,15 +8,16 @@
 //! WHICH SERVICE IS THE RADIO is the backend's to say (`Radio::new`): `wifi-driver` beside GENET and
 //! `dwmac`, whose radios are on the board, and `wifi-usb` beside the Pi 2's USB ethernet and the PCs'
 //! RTL8168, whose radio is a USB dongle (`docs/wifi-usb.md`, R6 and 39). Both answer the same frame ops
-//! through the same serve loop.
+//! through the same serve loop. GENET and `dwmac` also follow `wifi-usb` as the OTHER radio
+//! (`Radio::with_other`), for a dongle plugged into a board with its own.
 
-use godspeed_sdk::{CapHandle, Message, ServiceContext};
+use godspeed_sdk::{Message, ServiceContext};
 use godspeed::driver::wait::{self, Budget};
 
 /// Which link carries `net-stack`'s frames.
 ///
 /// **THE CABLE ALWAYS WINS.** While the PHY reports a link, frames go over the cable; the moment it does
-/// not, they go to the radio's service (`wifi-driver` or `wifi-usb`, `Radio::new`) over the same three ops this service answers upward (`docs/wifi.md` 2) - if
+/// not, they go to the radio's service (`wifi-driver` or `wifi-usb`, `Radio::new`) over the frame ops 0x10 to 0x12, the three `dwc2` answers on the Pi 2 (`docs/wifi.md` 2) - if
 /// the radio is joined - and come back to the cable the moment it returns. Decided by the operator on
 /// 2026-09-29, in these words: "cable always wins. unplug the cable, switch to wifi automatically." One
 /// link at a time, chosen by the cable rather than by a command, and the choice lives here because this
@@ -89,7 +90,7 @@ pub(crate) struct Radio {
     /// is kept here and served before the next `recv`. Two slots, because one `serve` iteration can
     /// ask the radio more than once; a third is dropped loudly with its cap reclaimed, and the client
     /// times out and re-asks, which is defined (26.6, 26.7).
-    held: [Option<(Message, CapHandle)>; RADIO_HELD_MAX],
+    held: [Option<(Message, godspeed::cap::Cap)>; RADIO_HELD_MAX],
     rescued: u32,
     held_dropped: u32,
     /// The OTHER radio service on a board with two (`wifi hardware use`, `utilities/56_wifi.md` 11): the
@@ -156,7 +157,7 @@ impl Radio {
     }
 
     /// The oldest held request, if any - served before the next `recv`, because it arrived first.
-    pub(crate) fn take_held(&mut self) -> Option<(Message, CapHandle)> {
+    pub(crate) fn take_held(&mut self) -> Option<(Message, godspeed::cap::Cap)> {
         let first = self.held[0].take()?;
         self.held[0] = self.held[1].take();
         Some(first)
@@ -169,19 +170,19 @@ impl Radio {
         // - which is how net-stack's exchanges came to queue fifteen seconds behind a wifi-driver that
         // was busy bringing its chip up from cold. When the window ends, exactly one probe goes through.
         if self.down_until != 0 {
-            if ctx.read_tsc() < self.down_until {
+            if godspeed::driver::wait::ticks(ctx) < self.down_until {
                 return None;
             }
             self.down_until = 0;
         }
-        let t0 = ctx.read_tsc();
+        let t0 = godspeed::driver::wait::ticks(ctx);
         // SIFTED, not the first thing that lands. A message carrying a reply cap is a client's
         // request - net-stack asking for a frame or the link - and is kept for the serve loop; the
-        // wait goes on for the radio's actual answer. `take_pending_cap` reads and CLEARS the cap the
+        // wait goes on for the radio's actual answer. `take_sent_cap` reads and CLEARS the cap the
         // kernel installed for THIS message, so it must be asked here, at arrival (see `held`).
         let name = self.name;
         let got = ctx.request_with_reply_ms_sifted(name, msg, RADIO_MS, |m| {
-            let Some(cap) = ctx.take_pending_cap() else { return true; };
+            let Some(cap) = godspeed::ipc::take_sent_cap(ctx) else { return true; };
             let op = m.payload_bytes().first().copied().unwrap_or(0);
             if let Some(slot) = self.held.iter_mut().find(|s| s.is_none()) {
                 *slot = Some((Message::from_bytes(m.payload_bytes()), cap));
@@ -192,7 +193,7 @@ impl Radio {
                         op, self.rescued));
                 }
             } else {
-                ctx.remove_cap(cap);
+                godspeed::cap::remove(ctx, cap);
                 self.held_dropped = self.held_dropped.saturating_add(1);
                 if self.held_dropped == 1 || self.held_dropped % 16 == 0 {
                     ctx.log_fmt(format_args!(
@@ -202,7 +203,7 @@ impl Radio {
             }
             false
         });
-        let took_ms = ctx.read_tsc().wrapping_sub(t0) / ctx.duration_cycles(1).max(1);
+        let took_ms = godspeed::driver::wait::ticks(ctx).wrapping_sub(t0) / crate::cycles(ctx, 1).max(1);
         let got = match got {
             Some(r) => {
                 self.answered = self.answered.saturating_add(1);
@@ -245,7 +246,7 @@ impl Radio {
                     // Held down from here until the window ends (`down_until`); said once per entry
                     // into the window and every sixteenth after, so a radio that is simply gone is a
                     // count rather than a flood.
-                    self.down_until = ctx.read_tsc().wrapping_add(ctx.duration_cycles(RADIO_BACKOFF_MS));
+                    self.down_until = godspeed::driver::wait::ticks(ctx).wrapping_add(crate::cycles(ctx, RADIO_BACKOFF_MS));
                     self.backoffs = self.backoffs.saturating_add(1);
                     if self.backoffs == 1 || self.backoffs % 16 == 0 {
                         ctx.log_fmt(format_args!(
@@ -261,7 +262,7 @@ impl Radio {
                 // lookup once a second while the radio is down costs nothing; said once and then every
                 // sixteenth, so a radio that is simply gone is a count.
                 if self.silent_run >= RADIO_REACQUIRE_AFTER {
-                    if ctx.reacquire_by_name(self.name) {
+                    if godspeed::cap::reacquire(ctx, self.name) {
                         self.restale = self.restale.saturating_add(1);
                         if self.restale == 1 || self.restale % 16 == 0 {
                             ctx.log_fmt(format_args!(
@@ -384,8 +385,8 @@ impl Radio {
 pub(crate) fn status(ctx: &ServiceContext, radio: &mut Radio, cable: bool, mac: [u8; 6], carrier: &mut Carrier) -> [u8; 9] {
     // STATUS: [ok, mac(6), link, carrier] - net-stack reads the MAC at [1..7] and the link at
     // [7]. The ninth byte names the carrier for `net` (1 the cable, 2 the radio, 0 neither), and
-    // is what makes this reply nine bytes where every other backend's is eight or more, so a
-    // reader can tell whose it is. The link is LIVE either way: the cable from the PHY, the radio
+    // is what makes this reply exactly nine bytes, which no other backend's is (eight, or the
+    // RTL8168's thirty-two with the cable in), so a reader can tell whose it is. The link is LIVE either way: the cable from the PHY, the radio
     // from the radio service's own word on its join.
     let mut out = [0u8; 9];
     out[0] = 1;

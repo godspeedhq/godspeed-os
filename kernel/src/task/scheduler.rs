@@ -3,8 +3,8 @@
 //!
 //! Each core has a static run queue of up to MAX_TASKS slots.  Tasks are
 //! pinned to cores at enqueue time and never migrate (§9.1).  The 10 ms
-//! preemption quantum is enforced by the local APIC timer; `yield` is
-//! advisory (§9.3).
+//! preemption quantum is enforced by each core's local timer (the local APIC on
+//! x86-64); `yield` is advisory (§9.3).
 //!
 //! Cross-core wakeups (§8.4, §9.4): `wake_by_slot` sends a WAKE_RECEIVER
 //! IPI when the target task lives on a different core.
@@ -42,24 +42,15 @@ static mut TASK_CAP:   [MaybeUninit<CapTable>; MAX_TASKS] =
 /// and `block_and_reschedule` (CAS) are race-free (§8.4 lost-wakeup fix).
 static TASK_STATE: [AtomicU8; MAX_TASKS] =
     [const { AtomicU8::new(TaskState::Dead as u8) }; MAX_TASKS];
-/// Per-task NAME, owned rather than borrowed.
-///
-/// This was `[&'static str; MAX_TASKS]`, which quietly required every task name to be a string
-/// literal compiled into the kernel - and that is why the kernel holds a `service_config` row per
-/// service: a caller-supplied name had nowhere to live. Owning the bytes is what lets a SPAWNER name
-/// the task it is spawning, which is the whole point of moving the service catalogue out of ring 0
-/// (`docs/probe-params-design.md`).
-///
-/// Bounded and flat (26.6): a fixed 32 bytes per slot, no heap, no interner, no lifetimes. 32 is what
-/// `TaskStat` already exposes to userspace, so the two representations now agree instead of one being
-/// converted into the other.
+/// Bytes of a task name the kernel keeps (`TASK_NAMES` below). Bounded and flat (26.6): a fixed 32
+/// bytes per slot, no heap, no interner, no lifetimes.
 const TASK_NAME_MAX: usize = 32;
 
 /// Per-task NAME, OWNED rather than borrowed.
 ///
 /// This was `[&'static str; MAX_TASKS]`, which quietly required every task name to be a string
 /// literal compiled into the kernel - and that is why the kernel held a `service_config` row per
-/// service: a caller-supplied name had nowhere to live. Owning the bytes is what lets a SPAWNER name
+/// service (it now holds one, `supervisor`): a caller-supplied name had nowhere to live. Owning the bytes is what lets a SPAWNER name
 /// the task it is spawning (`docs/probe-params-design.md`).
 ///
 /// The interior mutability that needs lives in `smp::names::NameTable`, a permitted layer (18.1),
@@ -80,12 +71,6 @@ fn core_still_using(cid: usize, slot: usize) -> bool {
         || CORE_LEAVING.get(cid).0.load(Ordering::SeqCst) == slot as u64
 }
 
-/// This core has re-entered the scheduler, so whatever it was leaving, it has left.
-///
-/// The first provable moment: re-entry means the previous `switch_context` completed, so the core is
-/// on a different stack and in a different address space. Called at every scheduler entry rather than
-/// after each `switch_context` call, because the switch into a FRESH task never returns - it `sret`s
-/// to user through the trampoline - so "after the call" is a point some paths never reach.
 /// Stop claiming the task this core is running, and start claiming that it is still LEAVING it.
 ///
 /// **Every release goes through here so that no site can forget the second half.** The first attempt
@@ -105,6 +90,12 @@ fn core_release_current(cid: usize, to: usize) {
     CORE_CURRENT.get(cid).store(to, Ordering::SeqCst);
 }
 
+/// This core has re-entered the scheduler, so whatever it was leaving, it has left.
+///
+/// The first provable moment: re-entry means the previous `switch_context` completed, so the core is
+/// on a different stack and in a different address space. Called at every scheduler entry rather than
+/// after each `switch_context` call, because the switch into a FRESH task never returns - it `sret`s
+/// to user through the trampoline - so "after the call" is a point some paths never reach.
 #[inline]
 fn core_finished_leaving(cid: usize) {
     CORE_LEAVING.get(cid).0.store(IDLE as u64, Ordering::SeqCst);
@@ -209,9 +200,9 @@ fn next_restart_count(name: &str) -> u64 {
 }
 
 /// Record that restartable service `name` died (and will be respawned): bump its per-name restart
-/// count. Called ONLY from the death path for the supervisor-managed/restartable set (`fs`,
-/// `block-driver`, `shell`, `xhci`, `ehci`, `events`, `supervisor`). Transient utilities the shell
-/// re-invokes are never bumped, so they never show a restart. The respawn reads the new count via
+/// count. Called ONLY from the death path, for a task spawned `SPAWN_FLAG_WATCHED` (the supervisor's
+/// managed set) or the supervisor itself. Transient utilities the shell re-invokes are not watched and
+/// never bumped, so they never show a restart. The respawn reads the new count via
 /// `next_restart_count`; the first death of a name records count 1.
 fn bump_name_restart(name: &str) {
     if name.is_empty() {
@@ -239,8 +230,6 @@ fn bump_name_restart(name: &str) {
         );
     }
 }
-/// The recv endpoint owned by each task (None if the task has no endpoint). `AtomicU64` (0 = None;
-/// endpoint ids start at 100, so 0 is never a real recv endpoint) so the accessors stay unsafe-free.
 /// A task's SECOND endpoint - its reply mailbox - so death can reclaim it.
 ///
 /// It leaked, and the leak PANICKED THE KERNEL. The reply endpoint is allocated at spawn, but only
@@ -265,6 +254,8 @@ pub fn set_task_reply_endpoint(slot: usize, endpoint: Option<crate::ipc::Endpoin
         TASK_REPLY_ENDPOINT[slot].store(ep_to_u64(endpoint), Ordering::Relaxed);
     }
 }
+/// The recv endpoint owned by each task (None if the task has no endpoint). `AtomicU64` (0 = None;
+/// endpoint ids start at 100, so 0 is never a real recv endpoint) so the accessors stay unsafe-free.
 static TASK_ENDPOINT: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
 
@@ -272,11 +263,6 @@ static TASK_ENDPOINT: [AtomicU64; MAX_TASKS] =
 #[inline] fn ep_to_u64(e: Option<EndpointId>) -> u64 { match e { Some(EndpointId(id)) => id, None => 0 } }
 #[inline] fn ep_from_u64(v: u64) -> Option<EndpointId> { if v == 0 { None } else { Some(EndpointId(v)) } }
 
-/// Timed-wake deadline (TSC cycles) for a task blocked in `recv_timeout` (§12). 0 = no
-/// timed wake. Set before the task blocks; the core-0 timer ISR scans these and wakes any
-/// blocked task whose deadline has passed (so a driver can wait on an interrupt yet still
-/// wake on a timer for auto-repeat). Wake granularity is the timer period (coarse - fine
-/// for repeat). The owning task clears its entry on every `recv_timeout` return path.
 /// Each slot's `recv_timeout` wake deadline, expressed in **BSP timer ticks** (`MONOTONIC_TICKS`),
 /// not TSC cycles - `0` = disarmed. Ticks, not cycles, because the deadline is set on the task's
 /// core but evaluated by core 0's scan, and AMD cores need not share a TSC (a TSC deadline set on
@@ -973,8 +959,6 @@ pub fn enqueue(
 // Per-task capability access - used by syscall dispatch (§8.2, §7.5).
 // ---------------------------------------------------------------------------
 
-/// Validate and return a copy of the capability at `slot` in the current
-/// task's table.
 /// Set which task slot is "current" on a core. Used by a minimal/direct-entry bring-up (e.g. the ARM
 /// port's first service run) that enters a task without going through `scheduler::run`'s pick loop, so
 /// that `current_task_lookup_cap` and the user-copy path resolve to the right task. Arch-neutral.
@@ -987,6 +971,8 @@ pub fn set_current_task(core_id: u32, slot: usize) {
     CORE_CURRENT.get(core_id as usize).store(slot, Ordering::SeqCst);
 }
 
+/// Validate and return a copy of the capability at `slot` in the current
+/// task's table (`CapTable::get`: held, generation current, right present).
 pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability, CapError> {
     let cid  = current_core_id();
     // SAFETY: IF=0 in syscall context; CORE_CURRENT is stable for this core.
@@ -1000,10 +986,10 @@ pub fn current_task_lookup_cap(slot: usize, right: Rights) -> Result<Capability,
     }
 }
 
-/// Return true if the current task holds a live capability on `rid` carrying
-/// `right`. Used to gate the introspection syscalls (§3.1), which consume all
-/// argument registers and so cannot pass a cap-slot. See
-/// `docs/introspection-capability.md`.
+/// Return true if the current task holds a capability on `rid` carrying `right` - WITHOUT a
+/// generation check (`CapTable::holds_resource`), so it is for the stable gate resources only.
+/// Used to gate the syscalls that cannot pass a cap-slot (the introspection reads, `Kill`, `Reboot`,
+/// the device syscalls and more - `syscall/CLAUDE.md`). See `docs/introspection-capability.md`.
 pub fn current_task_holds_resource(
     rid: crate::capability::ResourceId,
     right: Rights,
@@ -1088,10 +1074,6 @@ pub fn for_each_cap_of<F: FnMut(&Capability)>(slot: usize, mut f: F) {
     unsafe { TASK_CAP[slot].assume_init_ref() }.for_each_slot(&mut f);
 }
 
-/// Push a cap slot into the current task's pending-received-caps buffer.
-///
-/// Called by handle_recv when it installs an embedded cap into the receiver's
-/// table. The slot is retrieved by the service via syscall 12 (TakePendingCap).
 /// Record the delegated-resource badge of a just-delivered message for the current (receiving)
 /// task (§7.10). `badge_id == 0` clears it (an ordinary, unbadged message). Packed so the
 /// `LastRecvBadge` syscall returns it in one register.
@@ -1115,6 +1097,12 @@ pub fn take_last_recv_badge() -> u64 {
     }
 }
 
+/// Push a cap slot into the current task's pending-received-caps buffer.
+///
+/// Called by the receive paths when they install an embedded cap into the receiver's
+/// table. The slot is retrieved by the service via syscall 12 (TakePendingCap). Holds at
+/// most `MAX_PENDING_RECV_CAPS`; a slot pushed past that is not recorded (the cap stays
+/// installed in the table, but the service is never told its slot).
 pub fn push_pending_recv_cap(cap_slot: u32) {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
@@ -1521,15 +1509,15 @@ pub fn run(core_id: u32) -> ! {
                     }
                 }
 
-                // Excluded: the BSP (it drives MONOTONIC_TICKS, scan_timed_wakes and the COM2/COM1
-                // polling, which must stay ~100 Hz), and any core that cannot halt (a Goldmont+
+                // Excluded: the BSP (it drives MONOTONIC_TICKS, scan_timed_wakes and the console
+                // UART polling, which must stay ~100 Hz), and any core that cannot halt (a Goldmont+
                 // sti-spin core gains nothing from a slower timer, so its behaviour is untouched).
                 let slow_idle = cid != 0 && crate::arch::imp::interrupts::idle_can_halt();
                 if slow_idle {
                     crate::arch::imp::boot::rearm_idle_timer();
                 } else if crate::arch::imp::interrupts::idle_can_halt() {
                     // The BSP is excluded from the SLOW idle tick above (it must keep driving
-                    // MONOTONIC_TICKS, scan_timed_wakes and the COM polling at full rate) - but it is
+                    // MONOTONIC_TICKS, scan_timed_wakes and the UART polling at full rate) - but it is
                     // still about to HALT. On a one-shot timer that means halting on a deadline that is
                     // already in flight, and if that deadline was consumed the core never wakes.
                     //
@@ -1606,9 +1594,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             crate::arch::imp::boot::rearm_tsc_deadline();
         }
 
-        // Poll the COM2 control channel and COM1 UART RX on every core-0 timer
-        // tick (§17).  The idle branch can't be relied on when core 0 always
-        // has ready tasks.  COM1 polling replaces IRQ 4 (fully masked by PIC).
+        // Poll the console UART's RX on every core-0 timer tick. The idle branch
+        // can't be relied on when core 0 always has ready tasks. On x86, COM1
+        // polling replaces IRQ 4 (fully masked by PIC). (COM2, the control channel,
+        // is no longer polled here: the `control` service reads it through
+        // `InspectKernel` query 21.)
         if cid == 0 {
             // H1: surface any IOMMU translation fault - a confined device's DMA blocked outside its
             // granted arena (§6.4). Cheap when quiet (a head/tail compare). This is ISOLATION
@@ -2544,9 +2534,7 @@ pub fn kill_task_by_slot(slot: usize) {
             // A driver that registered a hw_interrupt line left a route in IRQ_TABLE; the id is about to
             // be freed and REUSED, and IRQ_TABLE keys on a bare endpoint id, so a reused id could inherit
             // the dead driver's interrupts. Clear the route and mask the line now (while the id is still
-            // ours); the respawned driver re-registers and re-opens its gate. The vectors mirror the
-            // ServiceConfig hw_irqs (task/mod.rs) - the same by-name device coupling the DMA-quiesce block
-            // below already uses; block-driver + nic-driver currently declare no hw_irq.
+            // ours); the respawned driver re-registers and re-opens its gate.
             // RELEASE BY ENDPOINT, not by service NAME. This was a hardcoded list - "xhci" =>
             // 0x28, "ehci" => 0x29, anything else => release nothing - and `dwc2` was not on it, so
             // the ARM USB driver kept its IRQ route across every restart. The kernel said so every
@@ -2611,14 +2599,11 @@ pub fn kill_task_by_slot(slot: usize) {
         // kernel directory (§14.3). "Nothing escapes" - every service recovers; the kernel is the only
         // unkillable thing. Gated to WATCHED tasks so ordinary probe/app churn never floods the supervisor.
         // `enqueue_from_interrupt` is the kernel→endpoint path (no cap needed); wake the supervisor.
-        // `counter` (examples/counter) is restartable too: it persists its state to `fs` and
-        // reconstructs it on respawn (§14/§15), so its own death notifies the supervisor, which
-        // respawns it (counter-test build only - it is absent elsewhere, so this never fires there).
+        // (The two notes below are history from when this was a list of names; they are why it is not.)
         // C5-1: `dwc2` was MISSING from this set, and it is the ARM32 USB host - storage, keyboard and
         // networking all ride on it. It was spawned and never watched, so its death took all three down
         // until reboot: a service made special by omission rather than by decision, which is the version
-        // of that violation nobody argues for and everybody ships. It is arm-only, so on other ports the
-        // name simply never appears here (the same shape as `counter`, which exists in one build).
+        // of that violation nobody argues for and everybody ships.
         // `time` and `control` were MISSING here for exactly as long as they existed - the same
         // omission as `dwc2` above, committed in the same session that wrote the comment warning about
         // it. Hardware showed it plainly: a 100-round storm killed `time` 41 times and `control` 47,
@@ -2686,8 +2671,8 @@ pub fn kill_task_by_slot(slot: usize) {
         }
 
         // Path C / Phase 6: the supervisor is restartable - the KERNEL is its recovery anchor (the
-        // one thing that cannot die, §3.7). Flag a respawn to run from the next Core-0 control tick
-        // (NOT inline: we are mid-teardown of this very task). The new instance re-registers its
+        // one thing that cannot die, §3.7). Flag a respawn for `poll_supervisor_respawn` at the Core-0
+        // scheduler loop top (NOT inline: we are mid-teardown of this very task). The new instance re-registers its
         // endpoint in `ipc::names`, so death notifications re-point to it automatically, and it
         // reconciles live services on boot. (§6.2 amended - supervisor death is no longer a panic.)
         if task_name == "supervisor" {
@@ -2882,7 +2867,7 @@ pub fn kill_task_by_slot(slot: usize) {
         //   any TLB miss (e.g. reading a .rodata format string) → KERNEL PF.
         //
         //   Fix: skip freeing the PML4 frame in the self-kill path; store it
-        //   in CORE_PENDING_PML4[my_core] and release it in drain_pending_pml4
+        //   in CORE_PENDING_PML4[my_core] and release it in drain_pending_kstack
         //   (called from the scheduler loop / timer tick) where CR3 has already
         //   been switched to a different page table.
         let my_core = current_core_id();

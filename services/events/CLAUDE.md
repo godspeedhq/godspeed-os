@@ -7,8 +7,8 @@ a log line in its life (see the syscall floor below). Full command surface: `uti
 
 ## What it holds - three streams, all VOLATILE
 
-1. **The IPC trace ring** - 192 request/reply events emitted by services whose contract grants
-   `ipc_send = ["events"]`. Full = overwrite the oldest and **count** it; `events status` reports the
+1. **The IPC trace ring** - 192 request/reply events emitted by services whose spawn request gives
+   them a send cap to `events` (declared in the contract as `ipc_send = ["events"]`; CLAUDE.md 13.6). Full = overwrite the oldest and **count** it; `events status` reports the
    count, because a silent loss is the bug (invariant 12). **The kernel records nothing**: the emitter
    knows its own peer's NAME and its own protocol's opcode, and the kernel is forbidden to know either
    (§4.4, §26.10), which is why the instrumentation lives in the SDK and the ring lives here.
@@ -36,13 +36,15 @@ What arrives here is a best-effort **copy**, offered after the syscall has alrea
 ordering is the whole design, and it must not be inverted: re-pointing logs AT this service would make
 observing a failure depend on a service that can fail, which is §15's storage argument one layer up.
 
-Consequence, stated rather than discovered: lines printed **before** `events` exists are on serial
-only. They live in the kernel ring, which no syscall exposes to userspace.
+Consequence, stated rather than discovered: lines printed **before** `events` exists never reach
+this service. They are on serial, and the first 32 KiB ever logged are readable with `events log boot`
+(the kernel's fixed boot record, InspectKernel query 27, CLAUDE.md 11.4). The wrapping kernel ring itself
+is still exposed by no syscall.
 
 ## Self-observation is a local write, never a message
 
 `events` publishes its own rows (`ring.recorded`, `ring.dropped`, `metrics.held`, `metrics.refused`) by
-writing straight into the table it already owns, at read time. It cannot use `ctx.metric()` and needs
+writing straight into the table it already owns, at read time. It cannot use `gs::trace::metric` and needs
 no guard against it: it holds no send cap to itself, so the call resolves to `u32::MAX` and returns -
 the same cut that stops the sink tracing its own sends.
 
@@ -83,7 +85,8 @@ the sink comes back. `docs/observability.md` §13 is the full account and the ru
 
 ## Still not implemented
 
-`ctx.drain_kernel_ring_buffer()` is a no-op stub, so `events log` begins when this service does.
+`ctx.drain_kernel_ring_buffer()` is a no-op stub, so `events log` begins when this service does. The
+boot itself is not lost: `events log boot` reads the kernel's fixed copy of the first 32 KiB logged.
 Tracked, with the reasoning and the cost, in
 [`backlog/06-kernel-ring-not-drainable.md`](../../backlog/06-kernel-ring-not-drainable.md).
 

@@ -99,6 +99,10 @@ declined to make for a test.
 
 ### Already found, before the suite exists
 
+> **Fixed since (note 2026-10-09):** this subsection is the finding as it stood. `move_path` now
+> refuses a destination at or beneath the source (`path_is_ancestor`, `services/fs/src/main.rs`), as
+> §1c above records, so the present tense below describes the code before that fix.
+
 **`fs` does not enforce its own tree-acyclicity invariant. The only guard is in a client.**
 
 `move_path` walks the source, walks the destination's parent, checks the destination does not

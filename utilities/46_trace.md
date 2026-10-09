@@ -88,7 +88,9 @@ service interprets (§26.10).
   up endpoint, enqueue, IPI). Recording them adds no new knowledge - it writes down what it just
   computed.
 - The precedent is the **kernel log ring** (§11.4): a bounded in-kernel buffer whose contents are
-  observability, not correctness, drained by userspace. A trace ring is that shape exactly.
+  observability, not correctness. A trace ring is that shape exactly. *(Note 2026-10-09: nothing
+  drains the kernel log ring - CLAUDE.md §11.4 makes non-drainage the design - and mechanism B was
+  built as a SERVICE, not a kernel ring: `47_events.md` §8b.)*
 - It stays mechanism: `(sender, receiver, endpoint, generation, event)` are IPC facts. The kernel
   never learns what a message *means*.
 
@@ -119,7 +121,8 @@ What the kernel can honestly produce:
 ```
 
 Endpoint names come from the name directory (already there). `op` is **byte 0 of the message**, which
-this document proposes the kernel records as an opaque `u8` and never interprets - see §7 for why that
+this document proposes the kernel records as an opaque `u8` and never interprets - see
+`47_events.md` §7 for why that
 is a defensible line and where it could still be argued.
 
 Getting from `op=11` to `read` requires a **service-published decoder** - the requirement's own
@@ -277,7 +280,11 @@ endpoint. Three shapes of answer:
 
 ---
 
-### `trace blocked` - the whole point, in one screen
+### `trace blocked` - the whole point, in one screen  *(as PROPOSED; see the reference above for what shipped)*
+
+The sketch below is the original design. What shipped has the columns `slot` / `name` / `blocked` /
+`awaiting` / `held_by` (see `trace blocked` at the top) and no `FOR` duration: the kernel does not
+stamp when a task blocked (§9 question 4).
 
 ```
 gsh> trace blocked
@@ -462,10 +469,10 @@ service-to-service with the kernel uninvolved.
 ## 9. Open questions for review
 
 1. **Is mechanism B wanted at all**, given A answers the stated question? B is where all the kernel
-   growth is. **ANSWERED: yes, and with zero kernel growth** - it is a service (§8b). The question
+   growth is. **ANSWERED: yes, and with zero kernel growth** - it is a service (`47_events.md` §8b). The question
    that resolved it was "why can't the trace be a service?", and every objection to B was really an
    objection to B *being in the kernel*.
-2. **`op`/`first_byte`** (§7) - record it, or refuse it on principle? **ANSWERED: the dilemma
+2. **`op`/`first_byte`** (`47_events.md` §7) - record it, or refuse it on principle? **ANSWERED: the dilemma
    dissolved.** The recorder is the service that owns the protocol, and a service is entitled to
    interpret its own messages. Nothing privileges a convention inside the kernel, because the kernel
    is not involved.
@@ -481,8 +488,9 @@ service-to-service with the kernel uninvolved.
 
 ## The instrument must not hang on what it measures
 
-Every ask to `events` is bounded at 5 seconds and escapable with `q`, advertising `(q to quit)` once
-the wait lingers. That matters more here than for an ordinary command: `events failures` is what you
+Every ask to `events` is bounded at 5 seconds and escapable with `q`, advertising `[q] quit` once
+the wait lingers past 2 s (`trace_ask`, through `gs::call::request_within_notice`; a timeout is
+retried twice, reacquiring `events` by name between attempts). That matters more here than for an ordinary command: `events failures` is what you
 reach for WHEN something is wedged, so an instrument that can itself wedge takes the prompt with it
 and leaves you with a power button. It used to use a bare `request_with_reply`, which parks the shell
 inside the syscall where it cannot read the keyboard (`backlog/29`, conventions rule 10).

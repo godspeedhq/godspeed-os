@@ -9,7 +9,7 @@
 ## 1. Purpose
 
 `about` answers **what is this system?** - a one-shot identity card: what the OS is,
-how many cores it is running on, and who made it.
+which build, how many cores it is running on, and who made it.
 
 ## 2. Invocation
 
@@ -23,6 +23,7 @@ how many cores it is running on, and who made it.
 gsh> about
 GodspeedOS: a capability-based microkernel
   Small enough to understand. Rigorous enough to trust.
+  Version 0.22.0 x86_64 (f7a6946a)
   Running on 4 core(s).
   Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.
 ```
@@ -32,7 +33,8 @@ non-ASCII glyphs (an unsupported codepoint renders as `?` on the TV - visible, n
 
 ## 4. Data source
 
-Static identity text, plus `inspect_core_count()` (`InspectKernel` query 8) for the
+Static identity text; the same version, architecture and build SHA `version` prints
+(`43_version.md` §4); and `inspect_core_count()` (`InspectKernel` query 8) for the
 core count.
 
 ## 5. Capabilities

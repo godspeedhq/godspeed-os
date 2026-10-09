@@ -1,7 +1,7 @@
 # The driver library: `gs::driver`
 
-**Status: adopted 2026-10-02, from the operator's design guidance. Two mechanisms built (`wait`,
-`delay`); nine drivers converted across all four ports. "Current state" below says what exists; the
+**Status: adopted 2026-10-02, from the operator's design guidance. Three mechanisms built (`wait`,
+`delay`, `irq`); nine drivers converted across all four ports. "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -40,7 +40,7 @@ device-neutral machinery a driver builds on - one mechanism at a time, each one 
 first. `backlog/71` (the path to a v1 promise) depends on this shape: it puts `gs::driver` OUTSIDE the
 first covered surface, because hardware support keeps growing.
 
-## Current state (2026-10-03)
+## Current state (2026-10-09)
 
 What exists now. The dated steps after the method sections are the record of how each piece got here,
 and why; read them for the reasoning, not to find out what the library contains.
@@ -52,18 +52,28 @@ and why; read them for the reasoning, not to find out what the library contains.
   `expired`, `pause` and `elapsed_us`; `calibrated`. On an uncalibrated clock a polling wait gets
   `UNCALIBRATED_POLLS` (200,000) looks and a paced one the paces that fit its budget. It never logs.
   `Since` (2026-10-06) is a moment KEPT across calls, which a `Deadline` cannot be because it borrows the
-  context: `now`, `passed(budget)` and `elapsed_us`. Its first users are the shared WiFi serve loop and
-  the USB dongle's channel sweep. Uncalibrated, every budget has passed, so a dwell cannot become a hang.
+  context: `now`, `passed(budget)`, `elapsed_us`, and (2026-10-09) `elapsed_ms` and `elapsed_ticks`. Its
+  first users were the shared WiFi serve loop and the USB dongle's channel sweep; since every service
+  moved onto `gs` (2026-10-09) it is how every driver keeps a heartbeat or a backoff. Uncalibrated,
+  every budget has passed, so a dwell cannot become a hang. `ticks` and `ticks_per_10ms` (2026-10-09)
+  are the counter and its rate, for code that MEASURES in ticks - the SDK's key repeat, `xhci`'s segment
+  counters, `dwc2`'s sleep-accuracy sweep - and are documented as never the way to write a wait.
 - **`delay`** - holds, for gaps nothing reports the end of. `hold` spins on a calibrated clock;
   `hold_parked` sleeps first and spins the rest, for holds of tens of milliseconds. On an uncalibrated
   clock both sleep whole scheduler quanta, erring long, because a hold is a minimum.
-  **`hold_parked` has one caller (`ehci`)** and is in on probation - step 1l says why.
+  **`hold_parked` came in with one caller (`ehci`)**, on probation - step 1l says why. It has three
+  now (checked 2026-10-09): `ehci`, `wifi-usb` (`rtl8188.rs`) and `sdk/audio`'s settings retry, so
+  the second driver step 1l waited for has arrived, though not the `xhci` hold it named.
 - **`irq`** - waiting for a device's interrupt on the endpoint its clients also send to. `Irq::granted`,
   `routed`, `seen`; `wait(budget)` returns `Interrupt`, `Request(message)` or `Timeout`, so a request is
   handed back to be served and never dropped; `rearm` re-opens a level-triggered line (a no-op for MSI).
   With no interrupt routed the same loop is a timed wait that still serves requests. Its users are
-  `audio-driver` (step 2) and `pwm-audio`, which runs on the no-interrupt path; `xhci`, `ehci` and `dwc2`, whose hand-written copies it was built from, are
-  not converted yet.
+  `audio-driver` (step 2) and `pwm-audio`, which runs on the no-interrupt path. `ehci` and `dwc2` re-arm
+  through it (2026-10-09): each used to unmask a vector NUMBER of its own, and each number was proven
+  equal to the one the kernel grants it (0x29, `hw_irqs_for`), so `Irq::granted(..).rearm` is the same
+  unmask without a driver naming a vector. `xhci` reads its MSI vector through `Irq::vector`. Their WAIT
+  loops are still hand-written - moving those onto `Irq::wait` changes a driver's structure and is owed
+  its own hardware card on each board.
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f), `sdk/wifi`
 (1d), `dwc2` (1g, 1h), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l - **not yet
@@ -74,7 +84,6 @@ verified on hardware**). `audio-driver` and `pwm-audio` were written on the libr
 | Site | Board | Why | Step |
 |---|---|---|---|
 | `nic-driver` `RX_POLL_MAX` | x86 | waits for traffic, tuned against `net-stack`'s deadline; needs a measurement | 1j |
-| `block-driver` `xhciblk.rs` capacity deadline | Pi 4, VisionFive | same crate on other boards; its own step | 1k |
 | `dwc2`'s complete-split NYET retry | Pi 2 | a retry count of sleeps on the keyboard path | 1g |
 | `dwmac`'s `rgmii_loopback_sweep` | VisionFive | compiled but never run | 1i |
 | `block-driver` `sdhci.rs` | none | not compiled | 1b |
@@ -84,8 +93,8 @@ verified on hardware**). `audio-driver` and `pwm-audio` were written on the libr
 - Where one LOOK is a whole transfer - `dwc2`'s hub reset and `net::bulk`, `xhci`'s disk transfer - the
   uncalibrated bound of 200,000 looks can be hours. It ends, which the one-look deadlines it replaced
   did not do correctly; but no one chose it as a bound.
-- `xhci`'s 55 ms reset-recovery hold still spins (`delay::hold`). It is the candidate to make
-  `hold_parked` a mechanism two drivers use.
+- `xhci`'s 55 ms reset-recovery hold still spins (`delay::hold`). It was the named candidate to make
+  `hold_parked` a mechanism two drivers use; `wifi-usb` became the second instead.
 - None of the boards this work was tested on is uncalibrated, so every uncalibrated path above is
   reasoned and unit-tested, not observed.
 

@@ -2,12 +2,14 @@
 //!
 //! This table used to live in `kernel/src/task/mod.rs`, as 193 `service_config` rows: the same
 //! `probe` ELF, differing by a test-mode number. A parameter is policy, and policy belongs to a
-//! service (§26.10) - so the kernel now holds ONE `probe` entry (the image and the defaults) and the
-//! supervisor, which already decides which probes to run and when, supplies the rest at spawn.
+//! service (§26.10) - so the kernel now holds no `probe` entry at all: the supervisor holds the image
+//! (`PROBE_ELF`, absent from a bare-metal build) and, since it already decides which probes to run and
+//! when, supplies the parameters at spawn.
 //!
-//! What is deliberately NOT here: `probe-11a`'s IRQ-33 route and `probe-5a-send`'s grantable peer
-//! caps. Those are AUTHORITY, not settings, and they travel in the SUPERVISOR's spawn request
-//! (`probes::privileges_of`), refused by the kernel unless the supervisor may delegate them itself.
+//! What is deliberately NOT in the rows: `probe-11a`'s test-IRQ class and `probe-5a-send`'s grantable
+//! peer caps. Those are AUTHORITY, not settings - `hw_class_of`, `peers_grant_of` and `privileges_of`
+//! below - and they travel in the SUPERVISOR's spawn request, refused by the kernel unless the
+//! supervisor may delegate them itself.
 //! A caller may say what a probe IS; it may not assert what it may DO.
 //!
 //! This said the kernel "keeps them keyed by name (`task::probe_authority`)". It does not, and that

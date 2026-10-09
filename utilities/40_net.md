@@ -28,6 +28,7 @@ serves it. `net` is the window onto it: the shell acquires `net-stack` by name a
 | `net arp <ip>` | Resolve one host's hardware (MAC) address by ARP. |
 | `net scan` | ARP-sweep the local /24 and list the hosts that answer. |
 | `net renew` | Re-run DHCP/ARP to reconfigure the network in place - recover a link that came up after boot (a cable plugged in later), no reboot. |
+| `net lease` | One word for scripts: is there a DHCP lease (`ok` when there is no link to lease on). |
 | `net version` | Print the version. |
 | `net help` | Print usage. |
 
@@ -47,11 +48,13 @@ the chip's own hardware counters, then the L3 status:
 gsh> net
 nic      10ec:8168  mmio 0xfea04000  (RTL8168)
 nic-mac  xx:xx:xx:xx:xx:xx  reset ok
+link     up via the cable
 nic-link UP 1000M full  |  tx ok (4 sent)  |  rx 90B (4 recv)
 nic-hw   RxOk=1832 TxOk=7 RxBcast=1210 RxErr=0 Miss=0
 ip       192.168.4.80
 gateway  192.168.4.1 at xx:xx:xx:xx:xx:xx
 ping     ok
+lease    ok (DHCP)
 dns      192.168.4.1
 ```
 
@@ -166,7 +169,8 @@ the shell. `net` performs no network I/O itself - it asks the service that does.
 
 - **Service:** `net-stack` (`services/net-stack`). After its boot dance (DHCP -> ARP -> ICMP)
   it freezes a 19-byte record - our IP (4), gateway IP (4), gateway MAC (6), a flags byte (bit 0
-  = gateway resolved, bit 1 = ping OK), and the learned DNS server (4) - and serves it. It also
+  = gateway resolved, bit 1 = ping OK, bit 2 = the address came from a DHCP lease), and the learned
+  DNS server (4) - and serves it (byte 0 = 0). It also
   answers live requests: `net dns` (byte 0 = 1, then the hostname), `ping <ip>` (byte 0 = 3, then the 4 IP
   bytes), `net arp <ip>` (byte 0 = 6, then the 4 IP bytes -> `[found, mac(6)]`), and `net renew` (byte 0 = 8
   -> re-runs the boot dance `run_dance` in place and replies the fresh status). `net scan` reuses op 6
@@ -184,6 +188,8 @@ the shell. `net` performs no network I/O itself - it asks the service that does.
 ## 6. Capabilities
 
 - **Console output** to print the lines.
+- **`ACQUIRE_ANY`**, which lets the shell acquire `nic-driver` by name for the two diagnostic
+  queries.
 - **A SEND cap to `net-stack`, acquired by name** - the same brokering the file commands use
   to reach `fs`. `net` gains no network authority of its own; it can only *ask* `net-stack`,
   which is the sole holder of the frame interface to `nic-driver`.

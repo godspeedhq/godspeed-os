@@ -406,7 +406,7 @@ fn firmware(ctx: &ServiceContext) -> bool {
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.trace_as("wifi-usb");
+    gs::trace::as_name(&ctx, "wifi-usb");
     ctx.log("wifi-usb: starting - the USB WiFi dongle's driver; asks its USB host once whether a dongle is bound, then waits to be told");
     // What was last said, so each change is said once: none yet, bound (vid, pid), gone, or a host fault.
     let mut said: Option<Result<Option<(u16, u16)>, &'static str>> = None;

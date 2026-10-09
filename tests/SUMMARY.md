@@ -3,6 +3,13 @@
 **Total: 130 tests across 7 categories, all passing.**  
 All normal and brutal variants complete. v1 milestone closed at commit `b8a079b`.
 
+> **Note 2026-10-09: this is a SNAPSHOT of the suite at `b8a079b`, not its current shape.** Since then
+> the identity suite grew to 24 cases (Tests 11 and 15, IR1A/IR1B; Tests 12-14 are `osdev test iommu`,
+> `fs-restart` and `file-cap`), adversarial to A1-A15, and chaos gained C1B (single-core boot). The
+> `registry` service is retired, so `WithBadTcb` now builds `kernel/test-bad-supervisor`, not
+> `test-bad-registry`; and a service's caps come from the supervisor's SPAWN REQUEST, not a kernel
+> `ServiceConfig` (CLAUDE.md 13.6). The `TestSpec` tables in `osdev/src/validator.rs` are the current list.
+
 ---
 
 ## Overview

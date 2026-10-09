@@ -5,16 +5,17 @@
 //! physically-contiguous DMA arena at spawn (same path as the USB drivers). This
 //! replaces ATA PIO on modern machines (the T630's SSD is AHCI-only).
 //!
-//! **Steps A+B (this file): detect + port init + IDENTIFY.** Map the ABAR, enable
-//! AHCI mode, enumerate ports, then on the disk port set up the command list / FIS
-//! / command table in the arena, start the port, and issue IDENTIFY DEVICE to read
-//! the model + sector count. Read/write (READ/WRITE DMA EXT) come next.
+//! **Detect + port init + IDENTIFY, then serve.** Map the ABAR, enable AHCI mode, enumerate ports,
+//! then on the disk port set up the command list / FIS / command table in the arena, start the port,
+//! and issue IDENTIFY DEVICE to read the model + sector count. Then a boot read self-test and the
+//! block-IPC serve loop: READ/WRITE DMA EXT, batched write-zeros, and FLUSH CACHE EXT on `OP_FLUSH`.
 
 use core::cell::Cell;
 
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{CapHandle, Dma, Message, Mmio, ServiceContext};
+use godspeed as gs;
+use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 // HBA Generic Host Control registers (offsets from ABAR).
 const HBA_CAP: usize = 0x00;
@@ -472,7 +473,7 @@ impl<'a> Ahci<'a> {
     #[cfg(not(feature = "write-tap"))]
     fn write_tap(&self, _ctx: &ServiceContext, _lba: u64, _data: &[u8; 512]) {}
 
-    /// Write one 512-byte sector of `data` to `lba` (WRITE DMA EXT + FLUSH), with bounded retry.
+    /// Write one 512-byte sector of `data` to `lba` (WRITE DMA EXT, no flush - see below), with bounded retry.
     fn write_block(&self, ctx: &ServiceContext, lba: u64, data: &[u8; 512]) -> Result<(), &'static str> {
         for i in 0..128 {
             let w = (data[i * 4] as u32)
@@ -776,8 +777,8 @@ fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
 fn serve_no_disk(ctx: &ServiceContext) -> ! {
     use super::{OP_CAPACITY, STATUS_ERR, STATUS_OK};
     loop {
-        let msg = ctx.recv();
-        let reply = match ctx.take_pending_cap() {
+        let msg = gs::ipc::recv(ctx);
+        let reply = match gs::ipc::take_sent_cap(ctx) {
             Some(c) => c,
             None => continue,
         };
@@ -795,11 +796,12 @@ fn serve_no_disk(ctx: &ServiceContext) -> ! {
         } else {
             reply.send(ctx, &[STATUS_ERR]);
         }
-        ctx.remove_cap(reply.cap);
+        gs::cap::remove(ctx, reply.cap);
     }
 }
 
-/// Steps A+B: detect the HBA + disk, init the port, IDENTIFY. Idles afterwards.
+/// Detect the HBA + disk, init the port, IDENTIFY, read-self-test sector 0, then serve block I/O to
+/// `fs` forever. With no disk or no DMA arena it serves the no-disk answers instead (`serve_no_disk`).
 pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     let cap = hba.read32(HBA_CAP);
     let vs = hba.read32(HBA_VS);
@@ -927,7 +929,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     // then every 64th, because the point is to learn the magnitude, not to narrate every request -
     // and a driver that logs per-request under load becomes its own bottleneck. The counter is loop
     // state, owned here, not a module static (Invariant 9).
-    let slow_threshold = ctx.duration_cycles(5);
+    let slow_threshold = crate::ms_ticks(ctx, 5);
     let mut slow_seen: u64 = 0;
     // LOOP STATE, OWNED HERE, exactly as `slow_seen` above and for the same reason (Invariant 9).
     // This is the loop that actually serves `fs`; the injector was first wired into the no-disk path
@@ -935,8 +937,8 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     // before asserting anything about them.
     let mut chaos = crate::Chaos::new();
     loop {
-        let msg = ctx.recv();
-        let reply = match ctx.take_pending_cap() {
+        let msg = gs::ipc::recv(ctx);
+        let reply = match gs::ipc::take_sent_cap(ctx) {
             Some(c) => c,
             None => continue,
         };
@@ -947,18 +949,18 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
             None => (0, &p[..0]),
         };
         let op = body.first().copied().unwrap_or(0);
-        let t_serve = ctx.read_tsc();
+        let t_serve = gs::driver::wait::Since::now(ctx);
         ahci.serve(ctx, body, crate::Reply { cap: reply, tag, fault: chaos.fault(ctx) });
-        let spent = ctx.read_tsc().wrapping_sub(t_serve);
+        let spent = t_serve.elapsed_ticks(ctx);
         if slow_threshold > 0 && spent >= slow_threshold {
             slow_seen += 1;
             if slow_seen <= 3 || slow_seen % 64 == 0 {
                 ctx.log_fmt(format_args!(
                     "block-driver: op {} spent {} us in the driver (slow #{})",
-                    op, spent.saturating_mul(1_000_000) / ctx.duration_cycles(1_000).max(1),
+                    op, spent.saturating_mul(1_000_000) / crate::ms_ticks(ctx, 1_000),
                     slow_seen));
             }
         }
-        ctx.remove_cap(reply);
+        gs::cap::remove(ctx, reply);
     }
 }

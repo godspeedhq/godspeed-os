@@ -1,5 +1,6 @@
-# Service contract for `reply-server` - demonstrates the request/reply (RPC) IPC pattern. The
-# supervisor declares this at BUILD time; nothing parses TOML at spawn (13.6). These capabilities (Commandment VII).
+# Service contract for `reply-server` - demonstrates the request/reply (RPC) IPC pattern. A
+# BUILD-TIME declaration: nothing parses TOML at spawn (13.6); the kernel mints what the supervisor's
+# SPAWN REQUEST asks for, and this file states what that should be (Commandment VII).
 name    = "reply-server"
 version = "0.1.0"
 
@@ -13,7 +14,8 @@ limit   = "64MiB"
 # Explicit grants only - this service can do ONLY what is listed (Commandment VII, no ambient
 # authority). The FULL set of declarable capabilities is in `contracts/schema/service.schema.json`
 # (validated by `osdev validate`) and `contracts/CLAUDE.md`. The options are: ipc_send,
-# ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+# ipc_receive, log_write, the authority keys
+# (console_push, resource_mint, service_control, cpu_clock, pci_cfg) and the driver hw_* keys.
 ipc_receive = ["reply-server"]   # OWNS its endpoint - the address clients send requests to
 log_write   = true               # may write the kernel log ring + serial (syscall 5); NOT to any service
 

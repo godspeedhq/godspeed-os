@@ -1,11 +1,12 @@
 # GodspeedOS - Raspberry Pi 4 (BCM2711, AArch64) boot config.
 #
-# Canonical copy. `scripts/pi4_build.py` copies this next to the built kernel as
-# build/config.txt; deploy by copying it and build/kernel8.img to the FAT boot
-# partition of a card that already carries the Pi firmware (start4.elf /
+# Canonical copy. `scripts/pi4_build.py` stages it as build/config-pi4.txt (not
+# build/config.txt, which the Pi 2 build would overwrite). Deploy by copying it AS
+# config.txt, and build/kernel8.img AS godspeed8.img (see `kernel=` below), to the
+# FAT boot partition of a card that already carries the Pi firmware (start4.elf /
 # fixup4.dat - written by the Raspberry Pi Imager, or restored from a backup).
-# This is the Pi 4 twin of boot/pi2/config.txt; the two ports differ in the three
-# lines below and nowhere else.
+# This is the Pi 4 twin of boot/pi2/config.txt; the two differ in the `kernel=` and
+# `arm_64bit=` values and in the `dtoverlay=disable-bt` line, and nowhere else.
 
 # Load OUR image under a NAME OF OUR OWN, not `kernel8.img`. The firmware's default
 # name is what a stock Raspberry Pi OS card already uses, so overwriting it destroys

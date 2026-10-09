@@ -30,7 +30,7 @@ Do NOT add assertions that:
 |-------------------------------------|-------------------------------|
 | `assert_cap_validated`              | §3.1 - no ambient authority   |
 | `assert_no_mid_execution_migration` | §3.11 / §9.1                  |
-| `assert_tcb_alive`                  | §6.2                          |
+| `assert_tcb_alive`                  | §6.2 - a no-op today: the non-restartable task set is empty since Phase 6 |
 | `assert_cap_table_consistent`       | §7.8                          |
 
 ## Adding a new assertion

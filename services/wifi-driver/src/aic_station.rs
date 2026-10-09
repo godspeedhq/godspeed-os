@@ -335,7 +335,7 @@ impl<'a> Aic<'a> {
             match self.scan_step(&mut sc, ctx) {
                 ScanStep::Ended(_) => return,
                 ScanStep::Frame => {}
-                ScanStep::Empty => ctx.sleep_ms(1),
+                ScanStep::Empty => godspeed::task::sleep_ms(ctx, 1),
             }
             if d.expired() {
                 ctx.log("wifi-driver: AIC the sweep for the join did not end in time - joining from what it heard");

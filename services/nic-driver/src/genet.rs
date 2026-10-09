@@ -3,14 +3,16 @@
 //!
 //! ## Why this file exists
 //!
-//! This is `kernel/src/arch/aarch64/genet.rs` where it belongs. That file is about 1500 lines of
+//! This is `kernel/src/arch/aarch64/genet.rs` where it belongs. That file was about 1500 lines of
 //! ethernet driver running in ring 0, which Commandment I forbids in one sentence ("thou shalt not
 //! expand the responsibilities of the kernel - it is complete; use a service") and §4.4 forbids again
-//! by name ("the kernel does not contain ... a network stack, drivers"). x86 has never had the
-//! problem: its NIC driver has always been a restartable, IOMMU-confinable userspace service. This is
+//! by name ("the kernel does not contain ... a network stack, drivers"); what is left of it is
+//! discovery only - it reads one revision register and writes none. x86 has never had the
+//! problem: its NIC driver has always been a restartable userspace service. This is
 //! aarch64 catching up, and the port is possible only because three things landed first - device IRQs
-//! now route to userspace, `nic-driver` is granted the GENET register window by name, and its DMA
-//! arena is mapped UNCACHED because AArch64 DMA is not coherent.
+//! now route to userspace, `nic-driver` is granted the GENET register window (today by device kind,
+//! `hwclass::NIC`, in its spawn request), and its DMA arena is mapped UNCACHED because AArch64 DMA is
+//! not coherent.
 //!
 //! ## What is the same, and what had to change
 //!
@@ -411,7 +413,7 @@ fn dma_reg(block: usize, reg: usize) -> usize {
 
 impl<'a> Genet<'a> {
     pub fn new(ctx: &'a ServiceContext, m: Mmio, a: Dma) -> Self {
-        Genet { ctx, m, a, per_10ms: ctx.tsc_ticks_per_10ms() }
+        Genet { ctx, m, a, per_10ms: godspeed::driver::wait::ticks_per_10ms(ctx) }
     }
 
     fn rd(&self, off: usize) -> u32 {
@@ -962,7 +964,7 @@ impl<'a> Genet<'a> {
             return None;
         }
         // The revision field encoding, from Linux's `bcmgenet_probe`: bits 27:24 hold the major, offset
-        // by one from v4 onward (4 means v4 is reported as 5, 5 as 6), and bits 19:16 hold the minor.
+        // by one from v4 onward (v4 reads as 5, v5 as 6), and bits 19:16 hold the minor.
         // The offset is not a detail to skip - reading the raw field gives a version number one higher
         // than the part actually is, and picking a register layout from that is how a driver ends up
         // addressing the wrong block on the right chip.
@@ -1199,14 +1201,15 @@ impl<'a> Genet<'a> {
 //
 // Byte-for-byte the contract `kernel_net_main` serves, because `net-stack` must not be able to tell
 // which backend is underneath it (Commandment X: the driver is mechanism, the stack is policy). A
-// 1-byte payload of 3/4/5/6/7/8/9 is an opcode; anything else is a raw ethernet frame to transmit.
+// 1-byte payload of 3/4/5/6/7/8/9/10 is an opcode; anything else is a raw ethernet frame to transmit.
 // ---------------------------------------------------------------------------------------------
 
 /// The `nic-driver` entry point on a Pi 4 that hands GENET to userspace.
 ///
-/// Degrades rather than hangs at every step (§26.7). No register window (no controller on the board),
-/// no DMA arena, or a bring-up that refused: all three fall through to the shared empty-reply server,
-/// so `net-stack` sees a NIC that reports itself down instead of a request that never comes back.
+/// Degrades rather than hangs at every step (§26.7). No register window (no controller on the board)
+/// or no DMA arena falls through to the shared empty-reply server, so `net-stack` sees a NIC that
+/// reports itself down instead of a request that never comes back. A bring-up that refused still
+/// serves the frame interface, with the radio as the link, and retries the MAC when a cable arrives.
 pub fn genet_main(ctx: ServiceContext) -> ! {
     let (Some(m), Some(a)) = (ctx.mmio(), ctx.dma_region()) else {
         ctx.log("nic-driver: no GENET register window or DMA arena granted - serving empty replies");
@@ -1248,13 +1251,18 @@ fn say_up(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) {
 /// what backlog/66 was first taken for (its DNS failure turned out to be an empty reply the kernel
 /// refused, fixed in `e3fcf7ed`). The old line latched once and named neither. First failure and
 /// every sixteenth after, so a run of them is a count and not a flood.
-fn reply_failed(ctx: &ServiceContext, e: godspeed_sdk::ipc::IpcError, n: &mut u32) {
+fn reply_failed(ctx: &ServiceContext, e: godspeed::Error, n: &mut u32) {
     *n = n.saturating_add(1);
     if *n == 1 || *n % 16 == 0 {
         let why = match e {
-            godspeed_sdk::ipc::IpcError::QueueFull => "the requester's queue is full",
-            godspeed_sdk::ipc::IpcError::EndpointDead | godspeed_sdk::ipc::IpcError::CapError(_) =>
+            godspeed::Error::Busy => "the requester's queue is full",
+            godspeed::Error::Unreachable =>
                 "the reply cap is dead - the requester stopped waiting before this reply",
+            // NOT a dead cap: `gs` maps insufficient rights, not grantable and wrong scope here
+            // (`from_ipc`, stdlib `ipc.rs`). A reply cap the kernel minted should never produce it,
+            // so if one does, say what it is rather than blame a requester that gave up.
+            godspeed::Error::PermissionDenied =>
+                "the reply cap lacks the right to answer (rights or scope) - not a requester that gave up",
             _ => "another error",
         };
         ctx.log_fmt(format_args!(
@@ -1277,7 +1285,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
     let mut rxbuf = [0u8; FRAME_MAX];
     // WHICH LINK CARRIES THE FRAMES - see `Carrier`. Between re-reads, `cable` is the answer.
     let mut cable = link_was_up && mac.is_some();
-    let mut cable_read_at = ctx.read_tsc();
+    let mut cable_read_at = godspeed::driver::wait::ticks(ctx);
     let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
     // The onboard radio first, and the USB dongle's service as the other: the bridge follows whichever
     // says it is the one in use (`wifi hardware use`, `Radio::info`).
@@ -1295,7 +1303,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
         let (req, reply_cap) = match radio.take_held() {
             Some(h) => h,
             None => {
-                let req = ctx.recv();
+                let req = godspeed::ipc::recv(ctx);
                 // The reply cap is the ONLY authority to answer net-stack (§8.5).
                 //
                 // A request that carries none cannot be answered, and dropping it SILENTLY leaves no evidence
@@ -1306,7 +1314,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
                 //
                 // Rate-limited to once, because the condition repeats per request and the report must not
                 // become the flood it is reporting.
-                let Some(reply_cap) = ctx.take_pending_cap() else {
+                let Some(reply_cap) = godspeed::ipc::take_sent_cap(ctx) else {
                     if !capless_logged {
                         capless_logged = true;
                         ctx.log("nic-driver: a message with no reply cap - dropping (a request nobody can be answered on, or a late reply from the radio after this driver stopped waiting for it)");
@@ -1322,8 +1330,8 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
         // link that came up after bring-up gets the MAC speed and DMA burst re-applied, edge-triggered,
         // exactly as the STATUS request used to do it alone; if the re-apply does not take, the edge
         // stays pending and is retried on the next read.
-        let now = ctx.read_tsc();
-        if now.wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
+        let now = godspeed::driver::wait::ticks(ctx);
+        if now.wrapping_sub(cable_read_at) >= crate::cycles(ctx, CABLE_RECHECK_MS) {
             cable_read_at = now;
             let up_now = g.link_is_up();
             if up_now && !link_was_up && mac.is_none() {
@@ -1357,17 +1365,17 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
             if status_served <= 5 || status_served % 50 == 0 {
                 ctx.log_fmt(format_args!(
                     "nic-driver: serving STATUS #{} at {} ms",
-                    status_served, ctx.read_tsc() / ctx.duration_cycles(1).max(1)));
+                    status_served, godspeed::driver::wait::ticks(ctx) / crate::cycles(ctx, 1).max(1)));
             }
             let out = radio::status(ctx, &mut radio, cable, mac.unwrap_or([0; 6]), &mut carrier);
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
+            if let Err(e) = godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 10 {
             let out = radio::peer(ctx, &mut radio, cable);
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
+            if let Err(e) = godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
             let n = if cable { g.receive(&mut rxbuf) } else { radio.rx(ctx, &mut rxbuf) };
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])) { reply_failed(ctx, e, &mut reply_failures); }
+            if let Err(e) = godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&rxbuf[..n])) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes]. Bounded three ways - by
             // BATCH_MAX, by the reply buffer, and by the ring emptying - so it always terminates.
@@ -1393,18 +1401,19 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
                 count += 1;
             }
             out[0] = count;
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])) { reply_failed(ctx, e, &mut reply_failures); }
+            if let Err(e) = godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&out[..opos])) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
             // UNSUPPORTED on this backend - answered `[0]`, not `[1]`. Ops 6/7/8 are the chaos
             // force-link override and op 5 is a Realtek/e1000-shaped register dump; acking any of them
             // with success would make `chaos link-flap` print that it had exercised link recovery
             // having exercised nothing. A test that cannot fail is worse than absent when it reads as
             // passing. The caller needs an ANSWER, and "not supported here" is one.
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
+            if let Err(e) = godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
         } else {
             // TX FRAME (any multi-byte payload) : transmit and acknowledge. The frame is NOT coupled to a receive - see below.
             if !cable {
-                // The radio's turn (`Carrier`): the frame goes to `wifi-driver` as op 0x11 and the answer
+                // The radio's turn (`Carrier`): the frame goes to the radio in use (`wifi-driver`, or
+                // `wifi-usb` when `wifi hardware use` chose the dongle) as op 0x11 and the answer
                 // is its word. A refusal is counted and reported sparingly: the stack retries on its own
                 // pace, and a radio that is not joined refuses every frame, correctly.
                 if !radio.tx(ctx, p) {
@@ -1449,8 +1458,8 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
             // the shared path was changed to match and THIS backend was not, so the Pi 4 kept the old
             // coupled behaviour under the new caller. Frames stay in the ring for the drain (ops 4
             // and 9), which is the path whose job that is.
-            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
+            if let Err(e) = godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
         }
-        ctx.remove_cap(reply_cap);
+        godspeed::cap::remove(ctx, reply_cap);
     }
 }

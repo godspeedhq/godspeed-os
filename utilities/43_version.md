@@ -14,34 +14,38 @@ whole-system counterpart to the per-utility `<util> version` (which reports one 
 version); this reports the OS.
 
 It does **not** overlap with `about`: `about` is the identity card (name, slogan, core
-count, credits), `version` is the version fact. `about` carries no version number, so
-`version` is where the build lives.
+count, credits) and repeats this line as prose; `version` is the version fact on its
+own, the form to pipe or compare.
 
 ## 2. Invocation
 
 | Command | Meaning |
 |---|---|
-| `version` | Print the version + build stamp and return. |
+| `version` | Print the version, architecture and build stamp and return. |
 
 ## 3. Output
 
 ```
 gsh> version
-GodspeedOS 0.21.0 x86_64 (f7a6946)
+GodspeedOS 0.22.0 x86_64 (f7a6946a)
 ```
 
-The number is the system version (kept in lockstep with the crate versions and the shell's
-`UTIL_VERSION`); the parenthesised value is the short git commit SHA stamped at build time.
-A build made outside a git checkout reports `(unknown)`.
+The number is the system version (the workspace version every crate inherits; it is NOT the
+shell's `UTIL_VERSION`, which versions the utilities and is a separate number). The word after
+it is the architecture the build targets, as the project names it (`arm32` for 32-bit ARM,
+otherwise Rust's own name). The parenthesised value is the git commit SHA, 8 characters,
+stamped at build time. A build made outside a git checkout reports `(unknown)`.
 
 ASCII only - the framebuffer console's font is ASCII (no non-ASCII glyphs).
 
 ## 4. Data source
 
-- **Version:** the compile-time `UTIL_VERSION` constant (the shell's version, == the OS
-  version by the release convention; see `CONTRIBUTING.md`).
+- **Version:** `env!("CARGO_PKG_VERSION")`, the workspace version in the root `Cargo.toml`
+  (the shell's `Cargo.toml` has `version.workspace = true`; see `CONTRIBUTING.md`).
+- **Architecture:** `env!("GODSPEED_ARCH")`, derived by the shell's `build.rs` from
+  `CARGO_CFG_TARGET_ARCH`.
 - **Build SHA:** `env!("GODSPEED_GIT_SHA")`, stamped by the shell's `build.rs` from
-  `git rev-parse --short HEAD` at compile time. `build.rs` watches `.git/logs/HEAD`, so the
+  `git rev-parse --short=8 HEAD` at compile time. `build.rs` watches `.git/logs/HEAD`, so the
   stamp refreshes when HEAD moves.
 
 ## 5. Capabilities

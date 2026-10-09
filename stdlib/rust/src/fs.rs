@@ -202,7 +202,7 @@ impl<'n> DirEntry<'n> {
 ///
 /// Constructed from a `&ServiceContext`, and carries no authority of its own. Holding one does not
 /// grant filesystem access: every call goes through the context's existing send capability for
-/// `fs`, and a task whose contract never asked for it gets [`Error::Unreachable`], exactly as it
+/// `fs`, and a task whose spawn request granted none gets [`Error::Unreachable`], exactly as it
 /// would for any other peer it cannot reach. **This handle makes the filesystem convenient to use,
 /// never available where it was not granted.**
 ///
@@ -213,6 +213,15 @@ impl<'n> DirEntry<'n> {
 /// moved out of a `static AtomicU8` for exactly that reason (audit finding C6-1). So the counter
 /// lives here, owned by the handle, which is also why this type takes `&mut self` on operations
 /// that send.
+///
+/// # A missing path is not always [`Error::NotFound`]
+///
+/// `services/fs` answers `FS_NOTFOUND` only from its READS - stat, read and list. Every operation
+/// that changes something (write, create, delete, rename, move, seal, open) reports an absent path
+/// as `FS_ERR` with a reason such as "not found", "path not found" or "source not found", which this
+/// library returns as [`Error::Failed`] with that text in [`reason`](Fs::reason) - except
+/// [`open`](Fs::open), whose `FS_ERR` carries no reason at all. Ask
+/// [`exists`](Fs::exists) first where the difference matters.
 pub struct Fs<'a> {
     ctx: &'a ServiceContext,
     tag: u8,
@@ -339,16 +348,16 @@ impl<'a> Fs<'a> {
         self.next_tag()
     }
 
-    /// The next request tag: wrapping +1, never 0.
-    ///
-    /// Identical to the rule `services/shell` uses, so one counter can be shared across both (see
-    /// [`from_tag`](Fs::from_tag)). Zero is skipped because a zero tag can only have come from a
-    /// sender that does not tag at all, and that must stay distinguishable.
     /// The deadline an ordinary operation waits: the caller's, or the library's default.
     fn secs(&self) -> i64 {
         self.patience.unwrap_or(call::DEFAULT_SECS)
     }
 
+    /// The next request tag: wrapping +1, never 0.
+    ///
+    /// Identical to the rule `services/shell` uses, so one counter can be shared across both (see
+    /// [`from_tag`](Fs::from_tag)). Zero is skipped because a zero tag can only have come from a
+    /// sender that does not tag at all, and that must stay distinguishable.
     fn next_tag(&mut self) -> u8 {
         let t = self.tag.wrapping_add(1);
         self.tag = if t == 0 { 1 } else { t };
@@ -535,9 +544,9 @@ impl<'a> Fs<'a> {
     /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
-    /// [`Error::NotFound`] if the source is absent; [`Error::Failed`] with
-    /// [`reason`](Fs::reason) for a refused move ("name already exists", "cannot move root", a
-    /// destination inside the source). A move MUTATES - do not retry on a no-answer error without
+    /// [`Error::Failed`] with [`reason`](Fs::reason) - "source not found" for an absent source
+    /// (NOT [`Error::NotFound`]; see the type's note), or the refusal ("name already exists",
+    /// "cannot move root", a destination inside the source). A move MUTATES - do not retry on a no-answer error without
     /// first checking what happened.
     pub fn move_to(&mut self, path: impl AsRef<[u8]>, dest: impl AsRef<[u8]>) -> Result<(), Error> {
         if dest.as_ref().len() > PATH_MAX {
@@ -562,10 +571,13 @@ impl<'a> Fs<'a> {
     /// **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
-    /// [`Error::NotFound`] if the path is absent; [`Error::Failed`] with [`reason`](Fs::reason)
-    /// otherwise. **Never retry this on [`Error::OutcomeUnknown`]**: the service batches its
-    /// frees, so a deadline that passes mid-delete may leave the tree partly removed, and a blind
-    /// retry cannot tell that from never having started.
+    /// [`Error::Failed`] with [`reason`](Fs::reason), "not found" included (NOT
+    /// [`Error::NotFound`]; see the type's note). **Never retry this on
+    /// [`Error::OutcomeUnknown`]**: the service unlinks the subtree in one transaction and then
+    /// frees its blocks in many, so a deadline that passes mid-delete may leave the entry already
+    /// gone, and a retry then fails with "not found" for work that succeeded. A failure DURING the
+    /// freeing is also reported as [`Error::Failed`] although the unlink has committed; the blocks
+    /// it did not free are leaked until [`check`](Fs::check) rebuilds the bitmap.
     pub fn delete_all(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
         self.call(OP_DELETE_TREE, path.as_ref(), &[], SWEEP_SECS)?;
         Ok(())
@@ -595,10 +607,12 @@ impl<'a> Fs<'a> {
     /// - opening a file grants nothing the contract did not already grant.
     ///
     /// # Errors
-    /// - [`Error::NotFound`] - no such file.
     /// - [`Error::PermissionDenied`] - a writable capability was asked for on a sealed file and no
-    ///   read-only fallback was available.
-    /// - [`Error::Failed`] - `fs` replied without a capability. Retrying an open is safe.
+    ///   read-only fallback was available (`rights` did not include [`cap::READ`](crate::cap::READ)).
+    /// - [`Error::Failed`] - no such file, a directory, a path longer than `fs`'s 96-byte open
+    ///   table allows, too many files open, or `fs` replied without a capability. `fs` sends this
+    ///   one WITHOUT a reason, so [`reason`](Fs::reason) is empty and the cause is in `fs`'s log
+    ///   only. Retrying an open is safe.
     pub fn open<'f>(&'f mut self, path: impl AsRef<[u8]>, rights: u8) -> Result<crate::file::File<'f, 'a>, Error> {
         let ctx = self.ctx;
         self.call(OP_OPEN, path.as_ref(), &[rights], self.secs())?;
@@ -617,8 +631,10 @@ impl<'a> Fs<'a> {
     /// **Blocks** up to [`SWEEP_SECS`]. It walks the whole volume.
     ///
     /// # Errors
-    /// [`Error::Failed`] on a read-only mount, with [`reason`](Fs::reason) saying so;
-    /// [`Error::NoFilesystem`] if nothing is mounted. Rebuilding is idempotent - it derives the
+    /// [`Error::Failed`] on a read-only mount or a failed sweep, with an EMPTY
+    /// [`reason`](Fs::reason) (`fs` logs why but sends a bare `FS_ERR`);
+    /// [`Error::NoFilesystem`] if nothing is mounted, or [`Error::Unavailable`] if storage is
+    /// present but unreadable. Rebuilding is idempotent - it derives the
     /// bitmap from the tree either way - so a repeat is safe, though it costs another full sweep.
     pub fn check(&mut self) -> Result<Check, Error> {
         let r = self.call(OP_CHECK, &[], &[], SWEEP_SECS)?;
@@ -644,7 +660,9 @@ impl<'a> Fs<'a> {
     /// **Blocks** up to [`SWEEP_SECS`]. It reads the whole volume.
     ///
     /// # Errors
-    /// [`Error::NoFilesystem`] if nothing is mounted. A scrub writes nothing, so every no-answer
+    /// [`Error::NoFilesystem`] if nothing is mounted ([`Error::Unavailable`] if storage is present
+    /// but unreadable); [`Error::Failed`], with no reason, if the sweep itself failed. A scrub
+    /// writes nothing, so every no-answer
     /// error here is safe to retry.
     pub fn scrub(&mut self) -> Result<Scrub, Error> {
         let r = self.call(OP_SCRUB, &[], &[], SWEEP_SECS)?;
@@ -675,9 +693,9 @@ impl<'a> Fs<'a> {
     /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
-    /// - [`Error::NotFound`] - no such path.
-    /// - [`Error::Failed`] - with [`reason`](Fs::reason) saying why; "only a file can be sealed" is
-    ///   the common one, because a directory cannot be.
+    /// - [`Error::Failed`] - with [`reason`](Fs::reason) saying why: "not found" for an absent path
+    ///   (NOT [`Error::NotFound`]; see the type's note), or "only a file can be sealed", because a
+    ///   directory cannot be.
     /// - Sealing twice is harmless - the second call finds it already sealed - so a no-answer error
     ///   here may be retried, unlike most mutations.
     pub fn seal(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
@@ -696,7 +714,8 @@ impl<'a> Fs<'a> {
     pub fn stat(&mut self, path: impl AsRef<[u8]>) -> Result<Stat, Error> {
         let r = self.call(OP_STAT_FILE, path.as_ref(), &[], self.secs())?;
         let b = r.body();
-        // [status, exists, size:u64, is_dir] after the tag - 11 bytes from the tag inclusive.
+        // [status, exists, size:u64, is_dir] after the tag - 11 bytes, 12 with the tag. `body` has
+        // stripped the tag and the status, leaving [exists, size, is_dir].
         if b.len() < 10 {
             return Err(Error::Malformed);
         }
@@ -721,7 +740,9 @@ impl<'a> Fs<'a> {
     /// [`patience_secs`](Fs::patience_secs) if it was given one. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
-    /// - [`Error::NotFound`] - no such file, or it is a directory.
+    /// - [`Error::NotFound`] - no such file, or it is a directory. **Also a data block that failed
+    ///   its CRC**: `services/fs` answers every read failure with `FS_NOTFOUND`, so a damaged file
+    ///   reads as an absent one. [`stat`](Fs::stat) tells the two apart.
     /// - A read changes nothing, so **every no-answer error here is safe to retry** - which is what
     ///   makes a resumable copy possible at all. See [`Error::retry_is_safe`].
     pub fn read_at(&mut self, path: impl AsRef<[u8]>, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
@@ -753,7 +774,8 @@ impl<'a> Fs<'a> {
     /// **Blocks**, once per chunk. **Authority:** the caller's existing `fs` capability.
     ///
     /// # Errors
-    /// - [`Error::NotFound`] - no such file, or it is a directory.
+    /// - [`Error::NotFound`] - no such file, or it is a directory, or (as for
+    ///   [`read_at`](Fs::read_at)) a data block failed its CRC part way through.
     /// - [`Error::BufferTooSmall`] - the file does not fit. **Nothing is written**; call again with
     ///   room, having learned the size from [`stat`](Fs::stat).
     /// - A read is idempotent, so every no-answer error here may safely be retried.
@@ -799,14 +821,24 @@ impl<'a> Fs<'a> {
     /// If it returns [`Error::OutcomeUnknown`], the write may have happened. Do not call it again
     /// to "make sure": read the file back, or report the uncertainty. [`Error::retry_is_safe`]
     /// answers this for you, and says `false` for that case on purpose.
+    ///
+    /// # Known defect (2026-10-09): `data` longer than [`IO_CHUNK`] fails
+    ///
+    /// The first chunk creates a file sized for that chunk alone, and `services/fs` refuses a
+    /// positional write past a file's extent ("write past extent"), so the second chunk fails with
+    /// [`Error::Failed`] and leaves a file holding only the first [`IO_CHUNK`] bytes. Until this is
+    /// fixed, write a larger file with [`create_sized`](Fs::create_sized) and then
+    /// [`write_at`](Fs::write_at) from offset 0.
     pub fn write(&mut self, path: impl AsRef<[u8]>, data: &[u8]) -> Result<(), Error> {
         if data.len() <= IO_CHUNK {
             self.call(OP_WRITE_FILE, path.as_ref(), data, self.secs())?;
             return Ok(());
         }
         // Larger than one message: create it, then fill it positionally. `OP_WRITE_AT` at a fixed
-        // offset is positionally idempotent: the same bytes at the same offset land the same way twice (`services/fs` does not enumerate such a pair - this cited one that does not exist),
-        // which is what makes a chunked write safe to resume at all.
+        // offset is positionally idempotent - the same bytes at the same offset land the same way
+        // twice - which is what makes a chunked write safe to resume at all. BUT the file created
+        // below is sized for its first chunk only, so `fs` refuses every later chunk as "write past
+        // extent": see the known defect in this function's doc.
         self.call(OP_WRITE_FILE, path.as_ref(), &data[..IO_CHUNK], self.secs())?;
         let mut off = IO_CHUNK;
         while off < data.len() {
@@ -820,7 +852,8 @@ impl<'a> Fs<'a> {
         Ok(())
     }
 
-    /// Create a directory. Fails if the parent does not exist.
+    /// Create a directory. Fails if the parent does not exist, or if the name already does
+    /// ([`Error::Failed`], reason "path not found" or "already exists").
     ///
     /// **Blocks**. Changes state: see the note on [`write`] about [`Error::OutcomeUnknown`].
     pub fn create_dir(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
@@ -831,8 +864,9 @@ impl<'a> Fs<'a> {
     /// Delete one file or one empty directory.
     ///
     /// **Blocks**. **Destructive, and not idempotent in the way that matters**: on
-    /// [`Error::OutcomeUnknown`] the file may already be gone, and a second delete would report
-    /// `NotFound` for work that succeeded. Report the uncertainty; do not re-send.
+    /// [`Error::OutcomeUnknown`] the file may already be gone, and a second delete would fail
+    /// ([`Error::Failed`], reason "not found") for work that succeeded. Report the uncertainty; do
+    /// not re-send. A non-empty directory is refused with reason "directory not empty".
     pub fn delete(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
         self.call(OP_DELETE, path.as_ref(), &[], self.secs())?;
         Ok(())
@@ -844,8 +878,12 @@ impl<'a> Fs<'a> {
     /// the file's. That is what makes a long append-style writer bounded: it cannot run out of room
     /// halfway and leave a half-file behind.
     ///
-    /// **Blocks. Changes state**: on [`Error::OutcomeUnknown`] the file may exist. Use [`exists`](Fs::exists) to
-    /// find out rather than calling this again, which would fail differently depending on timing.
+    /// **An existing file at `path` is REPLACED**: `services/fs` truncates it to a fresh extent of
+    /// this size (a sealed file is refused). A directory there is refused.
+    ///
+    /// **Blocks. Changes state**: on [`Error::OutcomeUnknown`] the file may exist. Use
+    /// [`exists`](Fs::exists) to find out rather than calling this again, which would succeed and
+    /// replace the file a second time, discarding anything written into it in between.
     ///
     /// Added because `services/recorder` needed it during migration. It is a real filesystem
     /// operation, so it belongs in the typed surface rather than behind an opcode escape hatch.
@@ -858,8 +896,13 @@ impl<'a> Fs<'a> {
     ///
     /// **Blocks. Changes state.** Unusually among the write operations, a positional write at a
     /// FIXED offset into an already-allocated extent is idempotent: repeating it puts the same bytes
-    /// in the same place. it is safe to re-send because it is positional, not appending (this claimed `services/fs` names it one of exactly two such operations; it names no such set),
-    /// which is what makes a chunked write resumable at all.
+    /// in the same place. It is safe to re-send because it is positional, not appending, which is
+    /// what makes a chunked write resumable at all.
+    ///
+    /// **`offset` must be a multiple of 508** (one data block's payload; [`IO_CHUNK`] is seven of
+    /// them), and `offset + data.len()` must lie inside the file's existing extent - `fs` does not
+    /// grow a file here. Either violation is [`Error::Failed`], reason "unaligned offset" or
+    /// "write past extent". Size the file first with [`create_sized`](Fs::create_sized).
     ///
     /// Even so this returns [`Error::OutcomeUnknown`] honestly on a timeout, because the DECISION to
     /// re-send belongs to the caller who knows the offset is fixed - not to a library that would be
@@ -878,7 +921,7 @@ impl<'a> Fs<'a> {
     /// Rename a file within its directory. `new_name` is a bare name, not a path.
     ///
     /// **Blocks. Changes state, and is NOT idempotent**: a second rename after a successful one
-    /// fails with [`Error::NotFound`], because the source is already gone. On
+    /// fails with [`Error::Failed`], reason "entry not found", because the source is already gone. On
     /// [`Error::OutcomeUnknown`] check with [`exists`](Fs::exists) rather than re-sending - this is precisely
     /// the case where a retry reports failure for work that succeeded.
     pub fn rename(&mut self, path: impl AsRef<[u8]>, new_name: impl AsRef<[u8]>) -> Result<(), Error> {

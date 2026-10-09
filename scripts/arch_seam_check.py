@@ -19,7 +19,13 @@ THE SEAM IS DEFINED BY USE, not by a list somebody maintains. A list would drift
 describes, which is the failure being fixed. So the members are discovered by scanning the neutral
 kernel for what it calls, and any arch missing one is named.
 
-Exit 0 when every arch answers the seam, 1 otherwise.
+WHAT "ANSWERS" MEANS, so a pass is not read as more than it is: a member counts as present when a
+`pub fn/const/static/struct/enum/type/mod` of that name, or a `pub use` naming it, appears ANYWHERE in
+the arch's directory. It does not prove the item is reachable as `arch::imp::NAME`, nor that it has the
+signature the neutral kernel calls; the compiler is the only check of that. An arch dir with no
+`mod.rs` is not examined, and the SCAFFOLDS below are reported every run but never fail it.
+
+Exit 0 when every port (every arch not in SCAFFOLDS) answers the seam, 1 otherwise.
 """
 
 import os

@@ -2,8 +2,8 @@
 # `recorder` - drains the `events` log to a file so a capture outlives the screen.
 #
 # NOT SPAWNED AT BOOT. The shell starts it on `events persist start` and it idles until told what to
-# capture. That is what keeps this feature a zero-kernel-change one: a service that runs at boot and
-# survives its own death has to join the kernel's managed-service lists, and this one does not.
+# capture. It needed no kernel change: a service that survives its own death joins the supervisor's
+# `MANAGED` set (the kernel keeps no list of names, CLAUDE.md 12.3), and this one does not.
 #
 # It is deliberately NOT restarted on death either. A respawned recorder would not know its target
 # path, so it would be alive and writing nothing while `status` said "running" - worse than dead. The

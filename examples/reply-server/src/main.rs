@@ -12,7 +12,7 @@
 //! endpoint, block for a request, do work, send a reply BACK. The twist that makes
 //! it a capability system - the server has no ambient way to call anyone. It can
 //! reply only because each request carries an embedded REPLY capability (a cap to
-//! the client's own endpoint). The server retrieves it with `gs::ipc::take_sent_cap`
+//! the client's reply mailbox, or its own endpoint if it has none). The server retrieves it with `gs::ipc::take_sent_cap`
 //! and answers over it.
 //!
 //! The one discipline this example exists to teach is §8.9: the reply is sent with
@@ -40,7 +40,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let request = gs::ipc::recv(&ctx);
 
         // 2. The request must carry an embedded REPLY capability - a SEND cap to the
-        //    client's own endpoint. This is the ONLY authority the server has to call
+        //    client's reply mailbox (or its own endpoint). This is the ONLY authority the server has to call
         //    back: no ambient channel, no identity-based reach (Commandment VII, §7).
         let reply_cap = match gs::ipc::take_sent_cap(&ctx) {
             Some(cap) => cap,
@@ -55,7 +55,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Peer-death test hook (Commandment VIII / §8.6 reply-side death-wake). A request of exactly
         // b"HANG" is deliberately NOT answered: we consume its reply cap and loop, leaving the client
         // blocked awaiting a reply that never comes. `osdev test reply-dead` then kills this server and
-        // asserts the kernel wakes the blocked client with `ReplyDead` (`request_with_reply` -> None)
+        // asserts the kernel wakes the blocked client with `ReplyDead` (`gs::call::request_within` -> `Err(PeerDied)`)
         // rather than hanging it forever. This is inert in every other build - no real client sends
         // "HANG" (`asker` sends it only in the reply-test build, once, to drive exactly this test).
         if request.payload_bytes() == b"HANG" {
@@ -78,8 +78,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             Err(_)  => ctx.log("reply-server: client unreachable; dropping reply (it must retry)"),
         }
 
-        // 5. The reply cap was installed into our table by `gs::ipc::take_sent_cap`; we are
-        //    done with it. Reclaim its slot so a long-running server stays bounded and
+        // 5. The kernel installed the reply cap into our table when `recv` took the request
+        //    (`gs::ipc::take_sent_cap` only told us its slot); we are done with it. Reclaim its slot so a long-running server stays bounded and
         //    does not leak cap-table entries over many requests (§26.6).
         gs::cap::remove(&ctx, reply_cap);
     }

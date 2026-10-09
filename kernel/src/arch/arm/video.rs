@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! VideoCore framebuffer for the Pi 2 (BCM2836) - the ARM has no Limine to hand it a framebuffer the
-//! way x86 does, so it asks the GPU for one through the **mailbox property interface** and renders the
-//! console into it. This module owns only the acquisition (the arch-specific half); the glyph renderer
-//! is shared with x86 (the arch-neutral half).
+//! way x86 does, so it asks the GPU for one through the **mailbox property interface**. This module owns
+//! the acquisition and the mapping (the arch-specific half); what draws into it is the arch-neutral
+//! boot/panic floor (`crate::bootcon`) and, once granted, the `console` service. The other boot-time
+//! mailbox questions (USB and SD power, the board MAC, the EMMC clock) live here too, for the same
+//! caches-off reason.
 //!
 //! Bring-up order (like the rest of the port): prove the pipeline with a solid-colour fill first, then
 //! layer text on top. A colour on the TV means the mailbox, the returned base/pitch, the device mapping,
@@ -34,7 +36,7 @@ static mut MBOX: MboxBuf = MboxBuf { data: [0; 36] };
 
 #[derive(Clone, Copy)]
 pub struct FbInfo {
-    pub base:   u32, // ARM physical base of the framebuffer (device-mapped after `init`)
+    pub base:   u32, // ARM physical base of the framebuffer (mapped Normal non-cacheable by `map`)
     pub pitch:  u32, // bytes per scanline
     pub width:  u32,
     pub height: u32,
@@ -57,7 +59,7 @@ fn mbox_call(channel: u32) -> bool {
         core::arch::asm!("dsb", options(nostack)); // request is in RAM (caches off) before we signal
         // Every mailbox wait is bounded: an absent/wedged VideoCore that never drains (FULL stuck),
         // never fills (EMPTY stuck), or never posts our matching response must NOT hang the boot before
-        // the scheduler (invariant 12 / 26.6 - the same discipline dwc2.rs applies). On timeout report
+        // the scheduler (invariant 12 / 26.6 - the same discipline every hardware wait owes). On timeout report
         // loudly and return false; every caller treats false as "no framebuffer" and falls back to serial.
         let mut spins = 0u32;
         while MBOX_STATUS.read_volatile() & MBOX_FULL != 0 {
@@ -113,8 +115,8 @@ static mut BOARD_MAC: u64 = 0;
 const BOARD_MAC_VALID: u64 = 1 << 63;
 
 /// Read the board's Ethernet MAC from the GPU (`GET_BOARD_MAC_ADDRESS`, tag 0x00010003) and stash it for
-/// the LAN9514 driver. The Pi 2 has no EEPROM, so this is the only source of the real `b8:27:eb:..` MAC;
-/// without it the driver falls back to a locally-administered address. **Must run with the MMU + caches
+/// the LAN9514 driver, which lives in the `dwc2` service and reads it back through InspectKernel query 23
+/// (`board_mac_packed`). The Pi 2 has no EEPROM, so this is the only source of the real `b8:27:eb:..` MAC. **Must run with the MMU + caches
 /// OFF** (before `mmu::enable`), like every mailbox call. A missing/failed reply just leaves the default.
 pub fn read_board_mac() {
     // SAFETY: single-threaded, caches-off boot; MBOX is filled then read here only.
@@ -223,8 +225,8 @@ pub fn query_display_size() -> Option<(u32, u32)> {
 
 /// Ask the GPU for a 32-bpp framebuffer at `width` x `height` and return its descriptor. `None`
 /// (logged) if the mailbox call fails or returns nothing. **Must run with the MMU + caches OFF** (before
-/// `mmu::enable`) so the mailbox exchange is coherent with the GPU; the framebuffer is mapped and drawn
-/// later via `map_and_fill` once translation is on.
+/// `mmu::enable`) so the mailbox exchange is coherent with the GPU; the framebuffer is mapped later by
+/// `map` once translation is on.
 pub fn request(width: u32, height: u32) -> Option<FbInfo> {
     // SAFETY: single-threaded boot; MBOX is filled then read here only.
     unsafe {
@@ -299,7 +301,8 @@ pub fn map_and_fill(fb: &FbInfo, color: u32) {
 pub fn fill(fb: &FbInfo, color: u32) {
     let words = (fb.pitch / 4) * fb.height;
     let p = fb.base as *mut u32;
-    // SAFETY: [base, base + pitch*height) is the GPU-allocated framebuffer, Device-mapped by `init`.
+    // SAFETY: [base, base + pitch*height) is the GPU-allocated framebuffer, mapped Normal non-cacheable
+    // by `map` (`mmu::section_fb`).
     unsafe {
         for i in 0..words {
             p.add(i as usize).write_volatile(color);

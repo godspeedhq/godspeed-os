@@ -123,9 +123,17 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     stuck). The primitive is `ServiceContext::request_with_reply_abortable` (send once, poll `q`
     while waiting); never block an interactive command on a bare `request_with_reply` to a peer
     that can be slow. The **fs-backed** interactive commands (`dir`/`cd`/`read`/`find`/`tree` and the
-    file-reading filters `match`/`count`/`sort`) use the delayed-hint variant `fs_request_q` (SDK
-    `request_with_reply_qhint`): silent on a fast reply, it advertises `[q] quit` only once the wait
-    lingers past ~2s - the just-in-time form of the advertisement above, so a snappy op stays quiet.
+    file-reading filters `match`/`count`/`sort`) use the delayed-hint variant: a `gs::fs::Fs`
+    handle lent a notice (`Fs::with_notice` / `Fs::noticing`), which waits through
+    `gs::call::request_within_notice`. Silent on a fast reply, it advertises `[q] quit` only once the
+    wait lingers past `gs::call::NOTICE_AFTER_SECS` (2 s) - the just-in-time form of the advertisement
+    above, so a snappy op stays quiet.
+
+    *(Note 2026-10-09: of that list, only `dir`'s text listing lends the notice today. `cd`, `read`,
+    `find`, `tree` and the file-reading filters go through `gs::fs::Fs` handles built with no notice
+    (`fs_stat_r`, `fs_read_at`, `filter_read`, the walks in `cmd_find`/`cmd_tree`), so they are
+    bounded at `gs::call::DEFAULT_SECS` but cannot be ended with `q` - a code defect against this
+    rule, recorded in each utility's own spec.)*
 
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,
@@ -181,6 +189,10 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     | `churn <seconds>`, `churn tear`, `churn reset` | Actions; `churn verify` is the report and pipes |
     | `chaos`, `fcap` | Exercisers whose value is what they prove while running; `chaos` writes its report with `save` |
     | `serve`, `gpio` | `serve` runs until stopped; `gpio` drives pins - the one read it offers is a single line on the Pi 2 only |
+
+    *(Note 2026-10-09: the count above is dated. `audio` and `hardware` have since joined `UTILS` and
+    both are in `is_producer_builtin`, so `UTILS` now holds 68 names and 29 of them start a pipe; the
+    17 stages and the 22 non-sources are unchanged.)*
 13. **If it does not fit the common pipes, `write` still captures it.** Any producer's output
     snapshots to a file with `| write <path>` (redirection is `| write`; there is no `>`, see
     `19_write.md`). So even a utility that is not a record source is never trapped on screen -

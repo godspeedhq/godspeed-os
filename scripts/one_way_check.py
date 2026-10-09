@@ -6,9 +6,11 @@ The operator, 2026-10-05, preparing v1: "I want there to be a consistent way of 
 drivers ... I can't have different ways." The one way is `gs` (`backlog/71`): a service or a driver is
 written on the standard library, and where it needs a mechanism `gs` does not have yet, `gs` gains it.
 
-This counts, per service crate (`services/*`, `examples/*`), the calls on a `ServiceContext` to SDK methods
-that HAVE a `gs` equivalent - `ctx.recv()` where `gs::ipc::recv` exists, `ctx.sleep_ms()` where
-`gs::task::sleep_ms` does - and holds each count to a baseline that may FALL freely and may not RISE. A
+This counts, per service crate (`services/*`, `examples/*`), the calls to SDK methods that HAVE a `gs`
+equivalent - `ctx.recv()` where `gs::ipc::recv` exists, `ctx.sleep_ms()` where `gs::task::sleep_ms`
+does - and holds each count to a baseline that may FALL freely and may not RISE. It matches the
+spelling `ctx.<method>(` (or `.ctx.<method>(`), the NAME every service gives its `ServiceContext`; a
+context bound to any other name would not be seen. A
 crate missing from the baseline - a new service - is held to zero, so new code is written the one way
 from its first line, and the old code converges as it is touched (the stdlib-dogfood work).
 
@@ -18,7 +20,9 @@ WHAT IT DOES NOT COUNT, on purpose:
     those are `gs::driver`'s gaps to close (`docs/driver-library.md`), recorded there, not here.
   - `ctx.log` / `ctx.log_fmt`: logging is the kernel floor every service writes to directly, by design
     (CLAUDE.md 11.4), and there is no second way to do it.
-  - Anything in a comment.
+  - Anything after `//` on a line, which is every line comment and doc comment. Two edges, both
+    checked absent on 2026-10-09: a call inside a `/* */` block comment IS counted, and a call later on
+    a line whose string literal contains `//` is NOT.
 
 `--bless` rewrites the baseline from the tree; say why in the commit. `--report` prints each crate's calls by
 method, with the `gs` replacement for each.
@@ -47,7 +51,7 @@ REPLACEMENT = {
     "send_peer_at": "gs::ipc::peer_at",
     "park": "gs::ipc::park",
     "request_with_reply": "gs::call::request / request_within",
-    "request_with_reply_call_err": "gs::call::request_within",
+    "request_with_reply_call_err": "gs::call::request_once (no retry), or request_within to have gs reacquire and re-send a send that never left",
     "request_with_reply_qhint": "gs::call::request_within_notice",
     "reacquire_by_name": "gs::cap::reacquire",
     "reacquire_cap": "gs::cap::reacquire",
@@ -58,16 +62,36 @@ REPLACEMENT = {
     "self_grant_handle": "gs::cap::self_grant",
     "yield_cpu": "gs::task::yield_now",
     "sleep_ms": "gs::task::sleep_ms, or gs::driver::delay for a hardware hold",
-    "sleep": "gs::driver::delay::hold / hold_parked",
+    "sleep": "gs::task::sleep_ticks (the same call), sleep_ms / sleep_us / sleep_quantum, or gs::driver::delay for a hardware hold",
     "uptime_secs": "gs::task::uptime_secs",
     "epoch_secs_monotonic": "gs::task::epoch_secs_monotonic",
     "datetime": "gs::task::datetime",
     "core_id": "gs::task::core_id",
     "irq_unmask": "gs::driver::irq",
     "irq_vector": "gs::driver::irq",
-    "read_tsc": "gs::driver::wait (Deadline, elapsed_us)",
-    "duration_cycles": "gs::driver::wait::Budget",
-    "tsc_ticks_per_10ms": "gs::driver::wait::calibrated",
+    "read_tsc": "gs::driver::wait (Deadline, Since), or wait::ticks where code measures in ticks",
+    "duration_cycles": "gs::driver::wait::Budget, gs::task::sleep_ms, gs::ipc::recv_within_ms",
+    "tsc_ticks_per_10ms": "gs::driver::wait::ticks_per_10ms, or wait::calibrated",
+    # Added 2026-10-09, when every service was moved onto `gs` and the table turned out narrower than the
+    # library: these had a `gs` equivalent all along and were not counted, so "zero" meant less than it
+    # said. The shell alone held 827 console writes.
+    #
+    # STILL NOT COUNTED, and so "zero" means "zero calls `gs` covers", NOT "zero SDK calls":
+    # `request_with_reply_deadline` (the shell 15, `net-stack` 2, `fs` 1 on 2026-10-09) and the SDK's
+    # other deadline variants (`_deadline_outcome_into`, `_deadline_sifted`, `_ms_sifted`, `_abortable`).
+    # `gs::call` has no equivalent with the same outcome shape - they collapse or sift the answer in
+    # ways `gs::Error` does not reproduce - so naming one here would point at a call that behaves
+    # differently. Those are `gs::call`'s gaps, not converted code.
+    "console_writeln": "gs::io::println",
+    "console_writeln_fmt": "gs::io::println_fmt",
+    "console_write": "gs::io::print",
+    "console_write_fmt": "gs::io::print_fmt",
+    "trace_as": "gs::trace::as_name",
+    "metric": "gs::trace::metric",
+    "resource_revoke": "gs::resource::revoke",
+    "resource_mint": "gs::resource::mint",
+    "last_recv_badge": "gs::resource::last_badge",
+    "send_peer_handle": "gs::ipc::peer",
 }
 CALL = re.compile(r"(?:\bctx|\.ctx)\s*\.\s*(" + "|".join(sorted(REPLACEMENT, key=len, reverse=True)) + r")\s*\(")
 COMMENT = re.compile(r"//[^\n]*")

@@ -73,9 +73,10 @@ gsh> write /audit.log tampered
 write: failed - file is sealed - its content cannot be changed
 
 gsh> dir /
-/  (1 entries)
-  NAME                  TYPE        SIZE  MODIFIED
-  audit.log             seal         812  2026-09-17 07:33
+/
+  NAME                  TYPE       SIZE  MODIFIED
+  audit.log             seal      812 B  2026-09-17 07:33
+  1 entries
 ```
 
 **The refusal says WHY, and did not always.** It read `write: failed (bad path, or parent missing?)`

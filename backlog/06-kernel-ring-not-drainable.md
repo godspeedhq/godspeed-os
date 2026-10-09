@@ -4,6 +4,11 @@
 is two comments (`sdk/rust/src/service_context.rs`), so `events log` still begins when `events`
 does and everything logged before that is on serial alone.
 
+*(2026-10-09: the BOOT half is answered another way. Since 2026-10-08 the kernel keeps a fixed copy of
+the first 32 KiB ever logged, read by copy through InspectKernel query 27 and shown as `events log
+boot` (CLAUDE.md 11.4). The ring itself is still not drainable, and `drain_kernel_ring_buffer` is
+still the stub, with no caller.)*
+
 **Severity:** feature. A known, recorded gap - not a defect.
 
 ## What it costs today

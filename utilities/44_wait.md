@@ -35,7 +35,10 @@ hour-plus wait at the prompt is a typo, not a plan (§26.6 bounded).
 - **`q` aborts, and the abort is an `Err`.** That is what makes it compose:
   `if !wait 2 { break }` ends a watch loop the instant the user quits. At the prompt, an
   aborted `wait` shows as `Err` in `result`.
-- **Idles politely.** The pause yields between clock checks; it does not spin a core hot.
+- **Yields, but does not sleep.** The pause calls `yield_now` between clock checks, so other
+  tasks on the core run - but with nothing else runnable the loop comes straight back, which keeps
+  the core busy for the whole wait. (`cores ticks` and the `observe` painter sleep between polls
+  instead; `wait` doing the same is the fix.)
 
 ## 4. Commandment VIII note (read this before imitating)
 

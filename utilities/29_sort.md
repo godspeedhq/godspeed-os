@@ -56,8 +56,10 @@ A shell built-in FILTER (`run_filter_builtin`, with `match`/`count`): it runs **
 it is **not** subject to the 4 KiB pipe service-boundary cap and can sort a full 16 KiB stage
 buffer. It records each line as a `(start, end)` pair into a fixed `SORT_MAX_LINES` array on the
 stack and `sort_unstable_by`s the index array (no heap - `sort_unstable` is in-place), then emits
-the lines in order. The direct form `read`s the file itself (`fs` `ReadFile`, op 11) - no new
-`fs` surface.
+the lines in order. The direct form reads the file itself (`gs::fs::Fs::read_into`, streaming
+`READ_AT`) - no new `fs` surface - into a fixed `FILTER_READ_MAX` (8192-byte) buffer, and refuses
+a larger file loudly (pipe it instead: `read <path> | sort`). With neither a path nor piped input
+it prints `sort: a path is required (or pipe input: <producer> | sort)`.
 
 ## 5. Later (separate so it can grow)
 
@@ -72,7 +74,9 @@ Conforms to `0_conventions.md`: its own `sort help` (usage with a real example p
 `sort reverse help` subcommand help, and `sort version` (number + creator credit), via the
 shared `help_block` helper.
 
-Also conforms to **rule 10** (`0_conventions.md` §1.10): when reading a file, the `fs` request is
-**q-abortable** via `fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to
-the prompt (a fast reply prints nothing). This replaced a bare `request_with_reply`, which rule 10
-forbids for an interactive command.
+**Does NOT currently conform to rule 10** (`0_conventions.md` §1.10), found 2026-10-09. The `fs`
+read of a file goes through a `gs::fs::Fs` handle that is lent no notice, so each request is bounded
+(`gs::call::DEFAULT_SECS`, 5 s) but prints no `[q] quit` and cannot be ended with `q`; the
+`Cancelled` branches in the handler are unreachable. This said the request was q-abortable via
+`fs_request_q`, which no longer exists. `dir` is the one fs-backed command that still lends the
+notice (`16_dir.md` §6); the same `.noticing(...)` here is the fix.

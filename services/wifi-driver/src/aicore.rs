@@ -44,7 +44,7 @@
 //! that the write landed.
 //!
 //! **The two 1 ms waits are not decoration either.** They are in the reference and they are the silicon's
-//! requirement, not the reference's design (§26.14). They use the SDK's `sleep_ms`, which SLEEPS rather than
+//! requirement, not the reference's design (§26.14). They use `gs::task::sleep_ms`, which SLEEPS rather than
 //! spins and converts through the kernel's own calibration so it is right on any machine. A hand-rolled
 //! spin was written first and thrown away on finding it: reaching for the sanctioned bounded tool is the
 //! rule, and reinventing it is the mistake §26.6.1 names by name.
@@ -228,12 +228,12 @@ pub fn reset_bits(
     if w.write32(h, wrapper + off::RESETCTRL, 0, ctx).is_none() {
         return false;
     }
-    ctx.sleep_ms(1);
+    godspeed::task::sleep_ms(ctx, 1);
     if w.write32(h, wrapper + off::IOCTRL, postreset | bit::CLOCK_EN, ctx).is_none() {
         return false;
     }
     let final_ioctrl = w.read32(h, wrapper + off::IOCTRL, ctx);
-    ctx.sleep_ms(1);
+    godspeed::task::sleep_ms(ctx, 1);
     let rc = w.read32(h, wrapper + off::RESETCTRL, ctx);
     let up = matches!(rc, Some(v) if v & bit::AIRC_RESET == 0);
     ctx.log_fmt(format_args!(
@@ -270,14 +270,14 @@ pub fn reset(
     if w.write32(h, wrapper + off::RESETCTRL, 0, ctx).is_none() {
         return false;
     }
-    ctx.sleep_ms(1);
+    godspeed::task::sleep_ms(ctx, 1);
 
     // Then the clock without the force-gated-clock bit, which is the settled state.
     if w.write32(h, wrapper + off::IOCTRL, halt_bit | bit::CLOCK_EN, ctx).is_none() {
         return false;
     }
     let final_ioctrl = w.read32(h, wrapper + off::IOCTRL, ctx);
-    ctx.sleep_ms(1);
+    godspeed::task::sleep_ms(ctx, 1);
 
     // AND CONFIRM IT IS OUT, rather than assuming the write landed. `is_up` is the reference's own
     // post-condition (`device_core_is_up`), and a core still in reset after this is a failure worth naming

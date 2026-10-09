@@ -8,6 +8,7 @@
 //! needs a split. That is worth stating rather than assuming - if a full-speed stick ever appears on
 //! a hub port, `bind` takes the split descriptor exactly as `hid::bind` does and the rest follows.
 
+use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
@@ -35,8 +36,8 @@ pub struct Disk {
     pub mps: u16,
     /// EP0's max packet size, kept because a later control transfer to this device - clearing a
     /// stalled endpoint, resetting the interface - must be framed with EP0's size and NOT the bulk
-    /// endpoint's. The kernel driver captures this for exactly that reason, before the bulk size
-    /// replaces it in its target state.
+    /// endpoint's. The kernel driver (since deleted) captured this for exactly that reason, before
+    /// the bulk size replaced it in its target state.
     pub ep0_mps: u16,
     /// The endpoint data toggles, one per DIRECTION, for the DEVICE'S LIFETIME.
     ///
@@ -336,7 +337,7 @@ pub fn bot(
 
     // A SHORT DATA PHASE IS A FAILED TRANSFER, even when the device says it passed.
     //
-    // This is the invariant the kernel driver is most emphatic about, and it earned that: a device is
+    // This is the invariant the kernel driver was most emphatic about, and it earned that: a device is
     // entitled to return a short data phase with status 0, so 100 bytes of a 512-byte read with
     // residue 412 was accepted as a good block, and `fs` received 412 bytes of stale zeros PRESENTED
     // AS DATA. Silent corruption arriving through the device's verdict rather than through the DMA
@@ -531,14 +532,14 @@ fn with_busy_retry(
     }
 }
 
-/// Serve one block request. Returns false if the message was not one.
+/// Serve one block request on `reply`, the cap `dispatch` already took. Returns false only for an
+/// empty payload; an unknown op is answered `STATUS_ERR`.
 ///
-/// The reply cap is the ONLY authority to answer (§8.5), and a request without one cannot be
-/// answered at all - so it is dropped LOUDLY rather than silently, which is the fault the userspace
-/// audit found in the GENET backend and fixed for the same reason.
+/// The reply cap is the ONLY authority to answer (§8.5). A reply that cannot be delivered is said
+/// once (`capless_logged` doubles as that latch) rather than dropped silently.
 pub fn serve(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
-    msg: &godspeed_sdk::Message, sectors: u64, reply: godspeed_sdk::CapHandle,
+    msg: &godspeed_sdk::Message, sectors: u64, reply: gs::cap::Cap,
     capless_logged: &mut bool,
 ) -> bool {
     let p = msg.payload_bytes();
@@ -608,12 +609,11 @@ pub fn serve(
 
     // The outcome is CHECKED, not discarded. A failed reply means the client waits out its deadline
     // and calls this driver unresponsive while our log shows a clean run (userspace audit A8-3).
-    if ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n])).is_err()
+    if gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&out[..n])).is_err()
         && !*capless_logged
     {
         *capless_logged = true;
         ctx.log("dwc2-svc: block reply send FAILED - the requester will time out");
     }
-    ctx.remove_cap(reply);
     true
 }

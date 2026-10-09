@@ -42,8 +42,9 @@ Introspection is reached through shell **commands**, not raw spawn: `observe` (l
 ## Spawn order in `service_main`
 
 The kernel spawns the supervisor **directly** (Path C / Phase 5 - init is removed). The supervisor
-spawns the **events first** (moved from init), then pong/ping, then services it wires from its
-`name → cap` map. Names resolve via the kernel's directory (`ipc::names` + `AcquireSendCap`). The
+spawns **events first** (moved from init), then console, then pong/ping and the probes, then the
+services it wires from its `name → cap` map (the full order is `services/CLAUDE.md`, "Supervisor spawn
+order"). Names resolve via the kernel's directory (`ipc::names` + `AcquireSendCap`). The
 probe spawn loop takes
 18-120 s on Windows TCG; spawning pong/ping early ensures cross-core IPC between them is established
 within ~10 s of boot.
@@ -59,17 +60,22 @@ service_main():
   7. loop: drain the queue (death notices, operator commands, USB device reports), then the reconcile sweep
 ```
 
-`"supervisor: ready"` appears after **all** spawns complete. Identity tests that trigger a service restart use this string as the `wait_for` gate to ensure the restart fires only when supervisor is safely in its yield loop - no restart-mid-spawn conflict.
+`"supervisor: ready"` appears after **all** spawns complete. Identity tests that trigger a service restart use this string as the `wait_for` gate to ensure the restart fires only when supervisor is safely in its receive loop - no restart-mid-spawn conflict.
 
-## Sole holder of `service_control`
+## Who holds `service_control`
 
-The `service_control` capability is held **only** by supervisor. No other service can kill or restart another service. This is the enforcement mechanism for §3.1 (no ambient authority) at the service lifecycle level.
+The supervisor holds `service_control`, and DELEGATES it in the spawn requests of three services -
+`shell` (`kill`, `restart`), `chaos` (its storms) and `control` (the operator channel) - and of every
+test probe (`probes::privileges_of`, which kill their victims; absent from a bare-metal image). No
+other service can kill another. The kernel refuses any privilege the supervisor does not itself hold, so this passes the
+authority on rather than minting it (CLAUDE.md 13.6, 14.1). This is the enforcement mechanism for §3.1
+(no ambient authority) at the service lifecycle level: a service kills only if its `IMAGES` row says so.
 
 ## Placement on restart (§9.2, §14.4)
 
 When supervisor calls `restart(name, placement_override)`:
 - If `placement_override` is `Some(n)`: requires core `n`; fails with `PlacementInvalid` if that core is unavailable.
-- If `placement_override` is `None`: re-evaluates from the service contract - same rules as initial spawn.
+- If `placement_override` is `None`: re-evaluates from the service's `IMAGES` row (its preferred core, which `contract_check.py` reconciles with the contract) - same rules as initial spawn.
 - **The previous core is NOT remembered.** A service on core 1 that is restarted without an override may land on core 2.
 
 ## Restart flow
@@ -104,4 +110,4 @@ supervisor.kill(service_name)                              -> Result<()>
 supervisor.restart(service_name, placement_override?)      -> Result<()>
 ```
 
-Both require the `service_control` capability which only supervisor holds.
+Both require the `service_control` capability (the supervisor, and those it delegates it to above).

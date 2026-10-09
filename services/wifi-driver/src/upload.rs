@@ -327,7 +327,7 @@ fn firmware_alive(h: &dyn SdioHost, w: &mut Window, ram: &Ram, token: u32, trapp
                 return false;
             }
         }
-        ctx.sleep_ms(10);
+        godspeed::task::sleep_ms(ctx, 10);
     }
     ctx.log_fmt(format_args!(
         "wifi-driver: the last word of RAM still holds OUR NVRAM token {:#010x} after {} reads over \

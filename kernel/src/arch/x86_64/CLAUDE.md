@@ -6,10 +6,15 @@ The unsafe hardware boundary (§18.1). All direct hardware access in the kernel 
 
 | File                | Responsibility |
 |---------------------|---------------|
-| `mod.rs`            | Public API surface for the rest of the kernel; re-exports `BootInfo`, `init()`, `ap_init()`, `serial_write_byte()`, `halt_all_cores()` |
-| `boot.rs`           | BSP init: GDT, IDT, paging, local APIC; consumes Limine boot protocol responses (§11.1) |
-| `ap_boot.rs`        | AP startup: real-mode trampoline, INIT+SIPI sequence (§11.2) |
-| `interrupts.rs`     | IDT entries, IRQ dispatch stubs, page-fault handler (§12, §10.3) |
+| `mod.rs`            | Public API surface for the rest of the kernel (the `arch::imp` seam): the Limine requests and `_start`, `BootInfo`, `init()`, `ap_init()`, the COM1/COM2 serial paths and console input ring, `halt_all_cores()`, `hardware_reset()` |
+| `boot.rs`           | BSP init: GDT, IDT (including the exception and page-fault handlers), local APIC and timer calibration, SYSCALL MSRs (§11.1) |
+| `ap_boot.rs`        | AP startup: Limine's `goto_address` per AP, then per-AP init (§11.2) |
+| `interrupts.rs`     | IRQ and MSI dispatch stubs, `wait_for_interrupt` and the idle-halt decision, EOI (§12) |
+| `syscall_entry.rs`  | SYSCALL entry stub, per-core syscall data, user-pointer validation and copies (§8.2) |
+| `ioapic.rs`         | I/O APIC: routing legacy INTx device interrupts to a local APIC (§12) |
+| `pci.rs`            | PCI configuration access and enumeration (§12) |
+| `iommu.rs`          | AMD-Vi IOMMU: detection from IVRS, per-device DMA confinement, the event log (§6.4) |
+| `rtc.rs`            | MC146818 CMOS real-time clock |
 | `context_switch.rs` | Naked function: save/restore callee-saved registers + CR3 (§9) |
 | `page_tables.rs`    | Four-level page table manipulation: map/unmap, CR3 values (§10) |
 | `fb.rs`             | Boot/panic-console **backend** only: binds Limine's descriptor to a slice for `crate::bootcon`, recovers its PHYSICAL base for the `console` service's framebuffer grant, and publishes writes (`fb_commit` = `sfence`, because the mapping is write-combining). The terminal itself is the userspace `console` service - see `kernel/CLAUDE.md` and `docs/console-service.md` 9 |
@@ -22,7 +27,7 @@ These functions in `arch::x86_64` expose hardware operations as a safe API. If y
 |------------------------------|---------------|
 | `disable_interrupts()`       | `cli` |
 | `enable_interrupts()`        | `sti` |
-| `wait_for_interrupt()`       | **Two behaviours, chosen at boot by `IDLE_CAN_HALT`:** `sti; hlt` where a halted core is guaranteed to wake (AMD, or ARAT in periodic mode), else `sti` only - no C-state hint, because on Goldmont+ both `hlt` and `pause` let firmware power-gate the LAPIC and drop ticks/IPIs. **A caller must arm a wake before it halts** - see below. |
+| `wait_for_interrupt()`       | **Two behaviours, chosen at boot by `IDLE_CAN_HALT`:** `sti; hlt` where a halted core is guaranteed to wake (AMD; Intel with the package C-state limit applied; or ARAT in periodic mode), else `sti` only - no C-state hint, because on Goldmont+ both `hlt` and `pause` let firmware power-gate the LAPIC and drop ticks/IPIs. **A caller must arm a wake before it halts** - see below. |
 | `validate_user_ptr(ptr, len)`| Range check: ptr..ptr+len must be below `USER_END` (0x0000_8000_0000_0000) |
 | `read_user_bytes(ptr, len)`  | Validated `from_raw_parts` into user VA |
 | `write_user_bytes(dst, src)` | Validated `copy_nonoverlapping` to user VA |
@@ -45,24 +50,30 @@ This was found the hard way (2026-07-31): the BSP was excluded from the idle re-
 with `core 0 made NO progress ... slot 224` (224 = `IDLE`) ~5 s after boot. It had been latent for the
 life of the port, invisible only because userspace spin-yielded and the BSP never actually reached idle.
 
-**Periodic mode needs none of this** - the hardware auto-reloads, so a halted core keeps being woken.
+**Periodic mode needs no fresh deadline** - the hardware auto-reloads, so a halted core keeps being
+woken. It has the opposite trap instead: every write of the initial count RESTARTS the countdown, so
+an idle path that rewrites it on each pass can keep a frequently-woken core from ever taking a tick
+(the T630, 2026-10-08). `boot.rs`'s `TIMER_MODE` records which period a core is counting so neither
+re-arm restarts a countdown it does not have to. (Which machine runs which mode is printed at boot:
+QEMU and the T630 run periodic, the Wyse 5070 TSC-Deadline.)
 
 ## Boot protocol: Limine
 
-`boot.rs` uses the Limine Boot Protocol (`limine` crate). Request structures are declared as Rust statics; Limine fills them in before jumping to `kernel_main`. Requests consumed:
-- `MemoryMapRequest` - physical memory layout
+The kernel uses the Limine Boot Protocol (`limine` crate). Request structures are declared as Rust statics in `mod.rs`; Limine fills them in before jumping to `_start`, which builds `BootInfo` and calls `kernel_main`. Requests consumed:
+- `MemmapRequest` - physical memory layout
 - `HhdmRequest` - higher-half direct map base address
-- `SmpRequest` - AP APIC IDs (eliminates need for ACPI/MADT parsing)
+- `MpRequest` - AP LAPIC IDs, and the per-AP `bootstrap` that starts them (eliminates need for ACPI/MADT parsing)
 - `FramebufferRequest` - early output
-- `KernelAddressRequest` - physical/virtual base for KASLR handling
+- `ExecutableAddressRequest` - physical/virtual base of the kernel image, so the frame allocator can exclude it
+- `RsdpRequest` - the ACPI RSDP, from which `iommu.rs` finds the IVRS table
 
 ## Invariants
 
 - `init()` is called exactly once, by the BSP, before any other kernel subsystem.
 - `ap_init(core_id)` is called exactly once per AP, from `ap_main`.
-- Every function in this module that touches hardware is `unsafe` with a SAFETY comment.
-- `serial_write_byte` is the only path that writes to COM1; the ring buffer in `log.rs` calls it.
-- COM2 is reserved for the control channel (`control.rs`); do not write to COM2 from the arch layer.
+- Every `unsafe` block carries a SAFETY comment. Many hardware operations are exposed as safe `fn`s wrapping one (`com2_init`, `serial_write_byte`); a precondition that is only boot ordering is a documented contract, not an `unsafe fn` (§18.5).
+- COM1 is written only by `serial_write_byte` and `serial_write_bytes_lockfree` (and the `_nolck` fault writers); `log.rs` calls `serial_write_bytes_lockfree`.
+- COM2 is the operator control channel, read by the userspace `control` service through `com2_try_read_byte` (there is no `control.rs` in the kernel); the arch layer only configures and probes it (`com2_init`).
 
 ## Context switch contract
 
@@ -73,4 +84,4 @@ life of the port, invisible only because userspace spin-yielded and the BSP neve
 
 ## Page table contract
 
-`PageTable::unmap` returns the physical frame but does NOT issue a TLB shootdown. The caller (`memory::ownership` on task death) must call `smp::ipi::broadcast_tlb_shootdown` before returning the frame to the allocator (§10.5). See also the PML4 deferred-free note in `kernel/src/task/CLAUDE.md`.
+`PageTable::unmap` returns the physical frame but does NOT issue a TLB shootdown; a caller that unmaps a page another core may have cached must flush it (§10.5). Today only selftests call it. Task death does not unmap page by page: the kill path (`task/scheduler.rs`) waits until every other core has loaded a different CR3, relies on that reload having flushed the task's non-global entries, and deliberately issues NO `smp::ipi::broadcast_tlb_shootdown` (which has no caller). That reliance is an x86 semantic - see `arch/CLAUDE.md`, SEC-26. See also the PML4 deferred-free note in `kernel/src/task/CLAUDE.md`.

@@ -6,9 +6,10 @@ Ten Commandments** (`../COMMANDMENTS.md`) through real code.
 
 ## How to use these
 
-Each example is one concept in its own folder, with a `CLAUDE.md` written to be **pointed at an AI**:
-a contributor adapting an example for their own service can hand its `CLAUDE.md` to their assistant
-as the pattern primer. Every `CLAUDE.md` follows the same shape:
+Each example is one concept in its own folder. All but one carry a `CLAUDE.md` written to be
+**pointed at an AI**: a contributor adapting an example for their own service can hand its `CLAUDE.md`
+to their assistant as the pattern primer. The exception is `stdlib-hello`, whose explanation is the
+header of its own `src/main.rs`. Every `CLAUDE.md` follows the same shape:
 
 > Purpose - What it demonstrates - **Why it is built this way (the Commandments)** - The contract,
 > annotated - **What you must NOT do** (each anti-pattern tagged with the Commandment it breaks) -
@@ -23,7 +24,7 @@ so you learn the *rule*, see it enforced in code, and learn the failure it preve
 |---|---|---|
 | `00-hello` | The minimal service, on the standard library | **I** (it is a service, not a kernel change), **IV** (declares its needs via a contract), **VII** (gets only the caps it declares) |
 | `stdlib-hello` | Doing real WORK with the standard library: read a file and print it, with the opcodes, framing, reply tags and streaming all behind `gs::fs` | **VII** (the contract's `ipc_send = ["fs"]` is why the read can work at all), **IX** (a failure is reported, not retried until something looks fine) |
-| `ping` / `pong` | Cross-core one-way IPC + restart/reacquire | **VI** (IPC, not shared memory), **V** (every service is restartable), **VIII** (the generation check settles the restart race, not a sleep), **IX** (reacquire by name + retry on `EndpointDead`) |
+| `ping` / `pong` | Cross-core one-way IPC + restart/reacquire | **VI** (IPC, not shared memory), **V** (every service is restartable), **VIII** (the generation check settles the restart race, not a sleep), **IX** (reacquire by name when a send comes back `gs::Error::Unreachable`) |
 | `reply-server` / `asker` | Request/reply (RPC) + the deadlock rule - server (`reply-server`) and its client (`asker`), paired like `pong`/`ping` | **VII** (the server replies only via the client's embedded reply cap), **VIII** (a send is queued, not processed; the reply uses non-blocking `try_send`, §8.9), **IX** (the client reacquires the server by name + retries), **X** (request/reply is service policy; the kernel only routes) |
 | `cap-grant` | Transfer a capability over IPC (the GRANT right) | **VII** (authority by capability + the GRANT right), **VI**, **IX**, **X** |
 | `resource-server` / `holder` | Mint a delegated resource cap ("a file is a capability", §7.10) - owner (`resource-server`) and its client (`holder`), paired like `pong`/`ping`; holder proves use / non-escalation / revoke | **VII** (minting is gated, never ambient; a granted cap cannot widen its rights), **III** (the service owns the resource's meaning; the kernel tracks only an opaque id), **IX** (a revoked cap fails loud, never silently succeeds), **X** (kernel mints/routes/revokes; the service defines meaning) |
@@ -47,7 +48,7 @@ now runs somewhere, and this is where:
 | `resource-server` / `holder` | `osdev test resource-server` | mint, use, non-escalation refused, `CapRevoked` after revoke |
 | `greet` / `upper` / `roster` | the shell, ON DEMAND, whenever a pipe names them (`spawn_via_supervisor`) - so `osdev test shell` and any `selfcheck` run exercise them | they spawn, reach `ready`, and survive repeated chaos respawns. Observed: `greet` + `upper` in the x86 shell suite; all three on the VisionFive 2, `roster` twenty times across a 1000-round chaos run |
 | `00-hello` | `osdev test examples` | it starts, holds one capability, and yields through `gs::task` |
-| `stdlib-hello` | `osdev test examples` | the `gs::fs` + `gs::io` path reaches a definite outcome |
+| `stdlib-hello` | `osdev test examples` | the `gs::fs` + `gs::io` path reaches a definite outcome. *(2026-10-09: the outcome in `build/tests/examples_serial.log` is "the service could not be reached" - its spawn row asks for no endpoint, so it has nowhere to receive `fs`'s reply - and the test accepts `stdlib-hello: done` alone, so it passes. The file has not actually been read in this test.)* |
 | `cap-grant` | `osdev test examples` | `gs::cap::self_grant` and `gs::cap::duplicate` really succeed |
 | `e1000` | `osdev test examples` | its DEGRADE path: no device, so it logs and idles |
 | `driver-skeleton` | `osdev test examples` | the same, which is the discipline it exists to teach |

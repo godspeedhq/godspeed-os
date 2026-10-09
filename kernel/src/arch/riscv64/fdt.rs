@@ -2,8 +2,8 @@
 //! Flattened Device Tree reader - how this arch learns what machine it is on.
 //!
 //! **This is the file that keeps RISC-V from being special.** Every board-specific number the port
-//! needs - the UART's base and register stride, where RAM starts and how much there is, the PLIC,
-//! the timer's frequency, which harts actually exist - is a question the machine already answers, in
+//! needs - the UART's base and register stride, where RAM starts and how much there is, the timer's
+//! frequency, which harts actually exist, and the board's device windows - is a question the machine already answers, in
 //! a blob the firmware hands us in `a1`. Reading it lets `arch::imp` report facts to the neutral
 //! kernel without anything above the seam learning that a JH7110 exists. Hard-coding the same
 //! numbers would work just as well on this board and teach the kernel a board, which is the thing

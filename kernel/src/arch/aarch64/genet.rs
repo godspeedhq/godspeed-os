@@ -9,7 +9,7 @@
 //!
 //! The driver now lives in `services/nic-driver/src/genet.rs` as a restartable userspace service
 //! with NO `unsafe`, reaching the controller only through an MMIO capability and a DMA arena
-//! granted by name. Hardware-proven: PHY at 1000 Mbit, DHCP, ARP, SNTP, ping at 0% loss - and
+//! granted by device kind (`NIC`, `map_fixed_device`) - never by service name. Hardware-proven: PHY at 1000 Mbit, DHCP, ARP, SNTP, ping at 0% loss - and
 //! chaos killed it 46 times during a carnage run while the machine stayed up. That last part is
 //! the property the kernel copy could never have had: a fault in a kernel driver is a dead
 //! machine, a fault in a service is a restart.

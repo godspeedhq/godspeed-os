@@ -118,9 +118,9 @@ impl core::fmt::Write for Line {
     }
 }
 
-/// Write the settings. A failure is returned for the caller to report; `OutcomeUnknown` means the file may
-/// or may not hold them, and is never re-sent as though it had not happened.
-/// Write the settings through the driver's `fs` handle (see [`load`]).
+/// Write the settings through the driver's `fs` handle (see [`load`]). A failure is returned for the caller
+/// to report; `OutcomeUnknown` means the file may or may not hold them, and is never re-sent as though it
+/// had not happened.
 pub fn save(fs: &mut gs::fs::Fs, s: Settings) -> Result<(), gs::Error> {
     use core::fmt::Write;
     let mut l = Line { buf: [0; 64], len: 0, overflow: false };

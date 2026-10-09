@@ -58,14 +58,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 To make it *your* service, edit just two files:
 
 1. **`contracts/<name>.toml`** - declare the minimum you need (`ipc_send`, `ipc_receive`, `log_write`,
-   `hw_mmio`, ...). That minimum *is* your security boundary; there is no ambient authority, so anything
-   you do not declare, you cannot do.
-2. **`src/main.rs`** - reach each granted capability through `ctx` (for example
-   `ctx.try_send("peer", &msg)`), and handle the errors the OS can return (`EndpointDead`, `CapNotHeld`,
-   ...).
+   `hw_device`, ...). That minimum is the reviewable statement of your security boundary; the grant
+   itself is your service's row in the supervisor's spawn table, which must say the same thing
+   (CLAUDE.md 13.6). There is no ambient authority, so anything that row does not grant, you cannot do.
+2. **`src/main.rs`** - reach each granted capability through the standard library, passing it `&ctx`
+   (for example `gs::ipc::try_send(&ctx, "peer", &msg)`), and handle the `gs::Error` it returns
+   (`Unreachable`: nothing was sent, reacquire the peer by name; `Busy`: its queue is full, pace and
+   try again; ...).
 
-Add your new crate to the workspace `Cargo.toml` members list, then `cargo run -p osdev -- build` and
-boot. (Copy `examples/00-hello` as your starting point - `osdev new` is not implemented yet.)
+Add your new crate to the workspace `Cargo.toml` members list. To have it run, the supervisor must
+also embed its image and spawn it (`services/supervisor/build.rs`, its `IMAGES` row and an
+`ensure_mapped` call; `hello` itself is embedded only for `osdev test examples`). Then
+`cargo run -p osdev -- build` and boot. (Copy `examples/00-hello` as your starting point - `osdev new` is not implemented yet.)
 
 ## 3. The one gotcha that will bite you: `#[no_mangle]` on `service_main`
 

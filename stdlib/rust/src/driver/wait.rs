@@ -118,6 +118,27 @@ pub fn calibrated(ctx: &ServiceContext) -> bool {
     ctx.tsc_ticks_per_10ms() != 0
 }
 
+/// The counter itself, in its own units.
+///
+/// For code that MEASURES in counter ticks rather than waits on them: a benchmark that reports cycles,
+/// or a domain library that takes a timestamp (the SDK's key repeat, `godspeed_sdk::hid::KeyRepeat`).
+/// **A wait is never written on this.** A loop that compares two of these against a hand-converted
+/// budget is the copy [`Deadline`] exists to replace, and it disagrees with it on exactly the machine
+/// that matters - one whose clock is uncalibrated, where this still counts but [`ticks_per_10ms`] is 0.
+#[cfg(not(test))]
+pub fn ticks(ctx: &ServiceContext) -> u64 {
+    ctx.read_tsc()
+}
+
+/// How many [`ticks`] make 10 ms on this machine, or 0 if the kernel could not calibrate the counter.
+///
+/// For converting a measurement in ticks into time for a report, and for configuring a domain library
+/// that counts in ticks. Zero is a real answer, not an error: say so rather than divide by it.
+#[cfg(not(test))]
+pub fn ticks_per_10ms(ctx: &ServiceContext) -> u64 {
+    ctx.tsc_ticks_per_10ms()
+}
+
 /// A running bound. Make it with [`Deadline::start`] (polling) or [`Deadline::paced`] (sleeping), ask
 /// [`Deadline::expired`] once per look, and call [`Deadline::pause`] between looks.
 #[cfg(not(test))]
@@ -151,8 +172,10 @@ impl<'a> Deadline<'a> {
     }
 
     /// A deadline whose looks are `pace` apart: call [`Deadline::pause`] between them. The pace is in
-    /// whole milliseconds, the kernel's sleep resolution, and at least one. On an uncalibrated machine
-    /// the budget becomes as many looks as the pace fits into it.
+    /// whole milliseconds, the unit `sleep_ms` takes, and at least one. Only ARMv7 (the Pi 2) has a
+    /// sub-tick timer for a sleep; every other port ends one on its scheduler tick, so there a pace
+    /// shorter than a quantum (nominally 10 ms) lasts about one. On an
+    /// uncalibrated machine the budget becomes as many looks as the pace fits into it.
     pub fn paced(ctx: &'a ServiceContext, budget: Budget, pace: Budget) -> Self {
         let pace_ms = (pace.as_us() / 1000).max(1);
         let mut d = Deadline::start(ctx, budget);
@@ -226,6 +249,17 @@ impl Since {
     /// Microseconds since this moment; 0 when uncalibrated, where it cannot be known.
     pub fn elapsed_us(&self, ctx: &ServiceContext) -> u64 {
         us_for(self.per_10ms, ctx.read_tsc().wrapping_sub(self.start))
+    }
+
+    /// Milliseconds since this moment; 0 when uncalibrated, where it cannot be known.
+    pub fn elapsed_ms(&self, ctx: &ServiceContext) -> u64 {
+        self.elapsed_us(ctx) / 1000
+    }
+
+    /// Counter ticks since this moment - the unit a benchmark reports in. Counts even when the machine
+    /// is uncalibrated, because the counter runs whether or not anyone knows its rate.
+    pub fn elapsed_ticks(&self, ctx: &ServiceContext) -> u64 {
+        ctx.read_tsc().wrapping_sub(self.start)
     }
 }
 

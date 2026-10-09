@@ -64,11 +64,12 @@ pub fn ready() -> bool {
 pub fn init(base: u32, pitch: u32, width: u32, height: u32) {
     let len = (pitch as usize) * (height as usize);
     // SAFETY: the GPU mailbox reported this framebuffer's base and geometry (`video::request`) and
-    // `video::map` mapped [base, base + pitch*height) cacheable before this runs, so the region is
+    // `video::map` mapped [base, base + pitch*height) Normal non-cacheable before this runs, so the region is
     // valid for writes for exactly that length and stays mapped for the system lifetime - hence
-    // 'static. This runs once on the boot core before the tick or any AP starts, and nothing else
-    // touches the framebuffer after `video::map`, so this is the only live reference and the
-    // exclusivity of `&mut` holds.
+    // 'static. This runs once on the boot core before the tick or any AP starts, and no other KERNEL
+    // code touches the framebuffer after `video::map`, so this is the only live kernel reference and
+    // the exclusivity of `&mut` holds. (The `console` service later maps the same pages into its own
+    // address space; the kernel stops drawing when it grants them - `crate::bootcon`.)
     let mem: &'static mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(base as usize as *mut u8, len) };
     let phys = base as u64;
@@ -103,8 +104,9 @@ static RENDERING: AtomicBool = AtomicBool::new(false);
 /// Serial is the source of truth and has already taken these bytes; the framebuffer is a mirror, so
 /// dropping a contended write costs nothing visible but avoids two hazards:
 ///
-/// - **Re-entrancy.** The tick ISR polls DWC2 and can log (a hot-plug notice, say) while boot code is
-///   part-way through rendering. The neutral console is behind a spinlock, and a spinlock is not
+/// - **Re-entrancy.** An interrupt handler can log (the USB line with no driver registered, say) while
+///   boot code is part-way through rendering. (This named the tick's DWC2 hot-plug poll, gone with the
+///   in-kernel driver.) The neutral console is behind a spinlock, and a spinlock is not
 ///   reentrant, so a same-core re-entry would spin until the lock watchdog panicked. This flag makes
 ///   the ISR's mirror a no-op instead - the bytes still reach serial.
 /// - **Cross-core contention.** `pl011_write` already declines to mirror when it could not claim

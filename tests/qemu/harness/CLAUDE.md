@@ -1,20 +1,20 @@
 # tests/qemu/harness/
 
-Shared test infrastructure (§22.3). Used by all test suites under `tests/qemu/`.
+Shared test infrastructure (§22.3). There is no code in this directory: the harness is `osdev/src/qemu.rs` (launch) and `osdev/src/validator.rs` (`run_one`, `poll_serial`).
 
 ## Responsibilities
 
 | Component           | What it does |
 |---------------------|--------------|
-| QEMU launcher       | Spawns `qemu-system-x86_64` with configurable `-smp N`; enables `-enable-kvm -cpu host` when `/dev/kvm` exists |
-| Serial reader       | Reads from a temp file QEMU writes to; polls every 200 ms; accumulates lines for assertion |
+| QEMU launcher       | Spawns `qemu-system-x86_64` with configurable `-smp N`; adds `-enable-kvm` when `/dev/kvm` exists |
+| Serial reader       | Re-reads the serial file QEMU writes (`build/tests/<suite>/<id>-<name>.log`) every 200 ms and searches the whole content |
 | Test runner         | Drives `TestKind` variants; manages deadline; reports PASS/FAIL |
 | COM2 control channel| Opens a TCP socket to QEMU's COM2 to inject `RESTART`/`KILL` commands for `WithRestart` tests |
-| Artifact upload     | On failure, preserves the serial log for post-mortem inspection |
+| Serial logs         | Every run's serial log is left under `build/tests/`, pass or fail |
 
 ## TestKind variants
 
-The harness supports three test kinds, each with its own drive loop:
+The identity suite uses three of the `TestKind` variants (the enum also has `WithBadElf`, `WithBadElfBrutal`, `ContractFuzz`, `DegradedSmp`, `DegradedEnv` and `Blocked`, used by the other suites):
 
 ```
 WatchSerial { expect, fail_on, timeout_secs }
@@ -53,17 +53,17 @@ sequenceDiagram
 
 ## Per-test timeouts
 
-Timeouts are per-test, not a global 30 s. On Linux KVM (CI), all tests complete in <30 s. On Windows TCG (no hardware virtualisation), the supervisor spawns 178+ probe services before logging "supervisor: ready", taking 18-120 s. Timeouts are sized to cover the TCG worst case:
+Timeouts are per-test `timeout_secs`, calibrated for KVM. Without KVM (TCG, e.g. Windows) `qemu::timeout_scale` multiplies every one by 4 (override: `GODSPEED_TIMEOUT_SCALE=<n>`). The identity cases use:
 
 | Category            | Typical timeout |
 |---------------------|-----------------|
 | Simple WatchSerial  | 30s             |
 | Probe-dependent     | 60-120s         |
-| WithRestart (pong)  | 180s            |
+| WithRestart         | 60s (Test 15: 90s) |
 
 ## KVM detection
 
-`QemuTestInstance::new` checks for `/dev/kvm` at construction time:
+`qemu::spawn_for_test` (and the other launchers) call `kvm_available()`, which checks for `/dev/kvm`:
 
 ```rust
 fn kvm_available() -> bool {
@@ -71,19 +71,19 @@ fn kvm_available() -> bool {
 }
 ```
 
-If KVM is present, `-enable-kvm -cpu host` is appended to the QEMU args. Falls back silently to TCG on Windows and on Linux hosts without KVM (e.g., nested VMs).
+If KVM is present, `-enable-kvm` is appended to the QEMU args. Otherwise QEMU runs under TCG (Windows, and Linux hosts without KVM such as nested VMs) with the timeouts scaled as above.
 
 ## QEMU binary path
 
-The harness looks for `qemu-system-x86_64` on PATH.
+`qemu::qemu_binary()` uses `C:\Program Files\qemu\qemu-system-x86_64.exe` on Windows when that file exists, and otherwise `qemu-system-x86_64` from PATH.
 - Linux: typically `/usr/bin/qemu-system-x86_64`
-- Windows: typically `C:\Program Files\qemu\qemu-system-x86_64.exe` - ensure this is on PATH.
+- Windows: the default install path above needs no PATH entry.
 
 ## Failure modes
 
 A test FAILS if:
 - Any `fail_on` string appears on serial.
-- `KERNEL PANIC` appears when not expected.
+- `KERNEL PANIC` appears, for the cases that list it in `fail_on` (nearly all of them; it is a `fail_on` entry, not a separate rule).
 - The per-test timeout fires without all `expect` strings seen.
-- QEMU exits with a non-zero code before the timeout.
+- QEMU exits early: the harness does not watch the process, so this shows up as the timeout firing with the `expect` lines unseen.
 - The COM2 TCP connection fails for a `WithRestart` test.

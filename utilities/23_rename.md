@@ -31,14 +31,16 @@ usage:
 ## 3. Behaviour
 
 `rename` rewrites the directory entry's name in place - no blocks are read or freed, so it
-is cheap and reclamation-free. `<newname>` is one component (slashes are a loud error - to
-move across directories, use `move`). Renaming to a name that already exists in the
-directory is a defined error, not an overwrite.
+is cheap and reclamation-free. `<newname>` is one component: `fs` refuses a slash or a control
+byte (`rename: failed - bad new name`) - to move across directories, use `move`. Renaming to a
+name that already exists in the directory is a defined error (`rename: failed - name already
+exists`), not an overwrite. Success prints `renamed <path> → <newname>`; a request whose answer
+never came prints `rename: OUTCOME UNKNOWN - ...` and is not re-sent.
 
 ## 4. Implementation
 
 Mutating, least-authority shape of the writers (`19_write.md` §4): `fs` edits the parent
-directory block (a `Rename` op) and persists it.
+directory block (`RENAME`, op 15) and persists it.
 
 ## 5. Later (separate doc so it can grow)
 

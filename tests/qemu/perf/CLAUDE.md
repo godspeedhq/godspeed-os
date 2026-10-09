@@ -5,7 +5,7 @@ Brutal performance benchmarks (§22.2, BP1-BP10). **Complete - 10/10 passing.**
 
 ## Status
 
-All ten regular benchmarks pass in the full suite (`osdev test perf`). All ten brutal benchmarks pass in `osdev test perf-brutal`. Results are committed to `baseline.json` and serve as the regression baseline going forward.
+All ten regular benchmarks pass in the full suite (`osdev test perf`). All ten brutal benchmarks pass in `osdev test perf-brutal`. A regular run that passes anything REWRITES `tests/qemu/perf/baseline.json`; a brutal run writes `build/tests/12_PERFORMANCE_BRUTAL/baseline.json`, which is not committed.
 
 ### Brutal benchmark iteration counts (TCG-calibrated)
 
@@ -25,20 +25,20 @@ Benchmarks for the IPC fast path and syscall paths. Per §20:
 
 | ID  | Benchmark                  | Metric                          |
 |-----|----------------------------|---------------------------------|
-| B1  | `ipc_same_core_roundtrip`  | Latency p50/p99/p99.9 (cycles)  |
-| B2  | `ipc_cross_core_roundtrip` | Latency p50/p99/p99.9 (cycles)  |
+| B1  | `ipc_same_core_roundtrip_latency` | Latency p50/p99/p99.9 (cycles)  |
+| B2  | `ipc_cross_core_roundtrip_latency` | Latency p50/p99/p99.9 (cycles)  |
 | B3  | `syscall_yield_floor`      | Round-trip cycles (no-op)       |
-| B4  | `cap_validation_cost`      | Cycles per cap + gen check      |
-| B5  | `spawn_cost`               | Time supervisor.spawn → "ready" |
-| B6  | `restart_cost`             | kill + spawn wall time          |
-| B7  | `cap_table_contention`     | Throughput at 1, 2, 4 cores     |
+| B4  | `cap_validation_throughput` | Cycles per cap + gen check      |
+| B5  | `spawn_syscall_cost`       | Time supervisor.spawn → "ready" |
+| B6  | `restart_kill_plus_spawn_cost` | kill + spawn wall time          |
+| B7  | `cap_table_throughput`     | Throughput at 1, 2, 4 cores     |
 | B8  | `allocator_throughput`     | Pages/sec under contention      |
-| B9  | `message_copy_4k`          | Cycles for 4 KiB message copy   |
-| B10 | `scheduler_decision`       | Cycles for pick-next            |
+| B9  | `message_copy_4kib`        | Cycles for 4 KiB message copy   |
+| B10 | `scheduler_decision_cost`  | Cycles for pick-next            |
 
 ## Baseline
 
-Results are committed to `tests/qemu/perf/baseline.json`. CI compares each run against baseline and flags regressions ≥ 10%. The §7.8 single global `RwLock` on the capability table will surface most visibly in B7 - record the baseline now so the v2 sharding migration has a concrete regression target.
+Results go to `tests/qemu/perf/baseline.json`. **Comparison is manual**: nothing reads the file back, the `regression_threshold_pct: 10` field in it is inert, and no workflow runs the perf suite (CLAUDE.md §22.2). The §7.8 single global lock on the capability table (a `SpinLock`, not an `RwLock`) will surface most visibly in B7 - record the baseline now so the v2 sharding migration has a concrete regression target.
 
 ## Windows / TCG harness note
 
@@ -48,8 +48,8 @@ B2 and B4 are the benchmarks most sensitive to this: they are spawned late in th
 
 ## Format
 
-Each benchmark runs in QEMU with `-smp 4` and KVM when available. Metrics are emitted as structured JSON lines on the serial console and parsed by the harness:
+Each benchmark runs in QEMU with `-smp 4` and KVM when available. Metrics are emitted on the serial console as `perf: <ID> key=value ...` lines, and `collect_perf_baseline` keeps every integer `key=value` from them, keyed by ID:
 
-```json
-{"benchmark":"ipc_same_core_roundtrip","p50":1240,"p99":1890,"p999":3420,"unit":"cycles"}
+```
+perf: B1 p50=1240 p99=1890
 ```
