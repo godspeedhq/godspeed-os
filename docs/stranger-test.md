@@ -437,3 +437,26 @@ same contract over-granted `log_write` while `io::report`'s true requirement was
 
 Four strangers, four defects, none caught by review beforehand. The interface is better than it was
 this morning and is not finished, and those are the same sentence.
+
+## Run 4 was wrong about the screen (correction, 2026-10-09)
+
+Runs 3 and 4 above conclude that `gs::io` needs `console_push`, that a program without it prints
+nothing, and that `log_write` "is a different capability for a different destination which this module
+never uses". **All three are false**, and nobody ran them: they were derived from documentation, the
+documentation was then rewritten to say them, and `scripts/contract_check.py` began enforcing them.
+
+- `gs::io` makes the kernel's `ConsoleWrite` (syscall 23), and `handle_console_write` in
+  `kernel/src/syscall/dispatch.rs` checks **LOG_WRITE** and nothing else.
+- Every task is minted LOG_WRITE at spawn, in slot 0 (`kernel/src/task/mod.rs`, "always present").
+- `stdlib-hello` declared `console_push`, was granted nothing (privilege word 0), and its `io::report`
+  and `io::println` lines are in `build/tests/examples_serial.log` regardless.
+
+It surfaced when every service moved onto the standard library: the gate fired on four drivers that
+print a notice, one of them `net-stack`, whose own comment refuses keystroke authority because
+`console_push` is the power to TYPE COMMANDS (SEC-2). Obeying the gate would have granted it. That is
+the cost of an untested rule about authority: it does not fail safe, it pushes authority outward.
+
+The runs above are left as written - they are the record of what was believed and why. The rule, the
+gate, `stdlib/rust/src/io.rs`, `website/src/stdlib.md` and `examples/stdlib-hello` now say what the
+kernel does. The lesson is this document's own, one level up: **a stranger's conclusion is evidence
+about the documentation, not about the system.** Check it against the code before it becomes law.

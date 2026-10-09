@@ -63,20 +63,22 @@ limit   = "16MiB"
 [capabilities]
 ipc_send     = ["fs"]     # talk to the filesystem. Drop this and `read_into` returns Unreachable
 ipc_receive  = ["hello"]  # your own endpoint, named after you
-console_push = true       # PUT TEXT ON THE SCREEN. Drop this and `io::println` runs and nothing
-                          # appears - no error, no warning, just a silent program
+log_write    = true       # the log (`ctx.log`) AND the screen (`io::println`, `io::report`)
 ```
 
-Note what is **not** there: `log_write`. That grants `ctx.log()`, which writes the kernel log ring and
-serial - a different destination from the screen - and the program above never calls it. Everything
-in `gs::io`, `io::report` included, goes to the screen and needs `console_push`. Add `log_write` when
-you actually call `ctx.log`, and not before.
+Printing is `log_write`. Everything in `gs::io`, `io::report` included, makes the kernel's
+`ConsoleWrite` call, and `LOG_WRITE` is the capability the kernel checks before it. Every task holds
+it, so output appears regardless; declaring it is the contract saying truthfully what the program does,
+and `scripts/contract_check.py` requires it of every program that prints.
 
-A program that declares only `log_write` and calls `io::println` compiles, passes `osdev validate`,
-passes every checker, and prints nothing at all - its error messages included, because `io::report`
-goes to the screen too.
+**Never ask for `console_push` to print.** It is the authority to push bytes into the keyboard ring,
+which the shell reads as typed commands (SEC-2). A keyboard driver needs it; your program does not, and
+the same checker refuses a `console_push` declaration that nothing in the code uses.
 
-**If your output is missing, read your contract before you read your code.**
+*This page said the opposite until 2026-10-09 - that printing needs `console_push` and that a program
+without it is silent. That was a conclusion drawn from documentation and never run; the kernel's code
+and the project's own test log both refute it (`docs/stranger-test.md`, "Run 4 was wrong about the
+screen").*
 
 Ask for what you use and nothing more: the contract is the reviewable statement of what your program
 may do (CLAUDE.md 26.9).
