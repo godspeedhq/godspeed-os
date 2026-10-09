@@ -1320,3 +1320,38 @@ were.
 **QEMU.** `audio-driver` 16384 bytes, `block-driver` (AHCI) 4096, `nic-driver` (e1000) 131072 - the
 e1000's window GREW, because its BAR is 128 KiB and the fixed window had been half of it. The audio suite:
 69 checks, all passing.
+
+## Step A6 on the T630: the K1 and K2 card, and the second image (2026-10-09)
+
+**The card held every line of the prediction.** `task: BDF 0x004a supplied for class 0x040300, the first
+of that class is 0x0009 - the supplied one is granted`; the IOMMU confined 00:09.2, not 00:01.1; and every
+window is its BAR now - audio 16384 bytes, `xhci` 8192, `ehci` 256, AHCI 1024, the RTL8168 4096. The driver
+surveyed a Realtek **10ec:0255** at 00:09.2 and stopped, as it must on a codec not in `PLAYABLE`.
+`selfcheck` ran 537 with 0 failed before and after a 100-round `chaos max-carnage all-services`, every
+service panic in it the expected `EndpointDead`, and no driver faulted in its smaller window.
+
+**Three facts the card added:**
+
+- **The speaker path goes through a mixer**: converter 0x02 -> mixer 0x0c -> pin 0x14, and 0x0c's other
+  input is 0x0b, the loopback mix of the microphones. A mixer has input amplifiers, and the driver set
+  only output ones. Neither QEMU's codec nor the Wyse's has a mixer on its path, so this never arose.
+- **The snoop bit is already on.** Configuration offset 0x42 reads `0x03`; the bit Linux sets for this
+  controller (`ATI_SB450_HDAUDIO_ENABLE_SNOOP`, 0x02) is set. Linux writes the field as exactly 0x02, so
+  it would also clear bit 0, whose meaning is not known here. Recorded, not acted on: the driver cannot
+  write configuration space, and coherence is what the bit is for.
+- **No interrupt at all.** The controller has no MSI capability and no INTx line (255), so the kernel says
+  `accepted neither MSI nor MSI-X - no interrupt, must poll` and the driver refills every 10 ms, as it was
+  built to.
+
+**The second image, one concern: set up this codec's path as Linux does.** `PLAYABLE` gains
+`10ec:0255` with the one coefficient Linux sets at probe (`alc_fill_eapd_coef`: 0x10 bit 9 clear), and
+`configure_path` sets a mixer's input amplifiers: the input from the next node on the path unmuted at
+0 dB (the amplifier's offset), the others muted, the first read back. The gate without the mixer would
+very likely be silent, and the mixer cannot be seen without the gate. QEMU's audio suite: 69, all passing.
+
+**Prediction:** the coefficient line `0x10: ... read back the same`, then `audio-driver: ready - serving
+requests; NO interrupt was routed, so playback refills by polling`, and `node 0x02 has no mute - muting on
+node 0x14`; `audio tone 440` HEARD from the T630's speaker; `audio debug codec` shows pin 0x14 `<- playing`.
+Falsified by: a mixer line (`mixer 0x0c input 0 ... reads`), which says the amplifier would not unmute; or
+`ready` with the link position moving and silence, which points past the mixer at the pin or the speaker
+amplifier; or underruns, which would be the 10 ms polling, not the codec.

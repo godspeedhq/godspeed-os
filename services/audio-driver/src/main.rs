@@ -126,6 +126,7 @@ const PARAM_AUDIO_WIDGET_CAP: u32 = 0x09;
 const PARAM_PIN_CAP: u32 = 0x0C;
 const PARAM_CONN_LIST_LEN: u32 = 0x0E;
 const PARAM_OUT_AMP_CAP: u32 = 0x12;
+const PARAM_IN_AMP_CAP: u32 = 0x0D;
 const PARAM_SUPPORTED_POWER_STATES: u32 = 0x0F;
 /// Supported PCM sizes and rates: bit 5 44.1 kHz, bit 6 48 kHz, bit 17 16-bit samples.
 const PARAM_PCM: u32 = 0x0A;
@@ -135,6 +136,7 @@ const PCM_BITS_16: u32 = 1 << 17;
 
 const FG_AUDIO: u32 = 0x01;
 const WCAP_OUT_AMP: u32 = 1 << 2;
+const WCAP_IN_AMP: u32 = 1 << 1;
 const WCAP_POWER: u32 = 1 << 10;
 const PINCAP_EAPD: u32 = 1 << 16;
 const PINCAP_TRIGGER: u32 = 1 << 1; // presence is measured only when asked (SET_PIN_SENSE)
@@ -143,6 +145,7 @@ const SENSE_PRESENT: u32 = 1 << 31;
 const PIN_OUT_EN: u32 = 0x40;
 const EAPD_ON: u32 = 0x02;
 const AMP_OUT_LR_UNMUTED: u32 = 0xB000; // output amp, left and right, mute clear
+const AMP_IN_LR: u32 = 0x7000; // input amp, left and right; bits 11:8 the input index
 const AMP_MUTE: u32 = 1 << 7; // in a gain/mute word, set or read
 const AMPCAP_MUTE: u32 = 1 << 31; // in an amplifier's capabilities: it can mute
 // GET_AMP_GAIN_MUTE's payload: which amplifier (bit 15 output) and which side (bit 13 left, clear right).
@@ -171,6 +174,9 @@ struct Playable {
 const PLAYABLE: &[Playable] = &[
     // QEMU's `hda-output` - the codec A2 and A3 were verified on.
     Playable { vendor: 0x1af4, device: None, coefs: &[] },
+    // The HP T630's Realtek ALC255. One coefficient at probe, the same `alc_fill_eapd_coef` gives it:
+    // 0x10 bit 9 clear. Its other ALC255 tables are the headset jack's.
+    Playable { vendor: 0x10ec, device: Some(0x0255), coefs: &[(0x10, 1 << 9, 0)] },
     // The Dell Wyse 5070's Realtek. The three coefficients are what Linux sets for this codec at probe,
     // before anything plays (`alc_fill_eapd_coef`, sound/pci/hda/patch_realtek.c, 6.12). What each bit
     // does is not documented there; they are the silicon's want, not our design (CLAUDE.md 26.14).
@@ -701,6 +707,36 @@ fn set_coefs(h: &mut Hda, cad: u32, coefs: &[(u32, u32, u32)]) -> bool {
     true
 }
 
+/// A mixer's input amplifiers: the one from `from` unmuted at 0 dB, every other muted, then the first read
+/// back. False, with the reason in the log, when the codec reads back something else or does not answer.
+fn unmute_mixer_input(h: &mut Hda, p: &OutPath, mixer: u32, from: u32) -> bool {
+    let cad = p.cad;
+    let mut conns = [0u32; 8];
+    let n = connections(h, cad, mixer, &mut conns);
+    let Some(idx) = conns[..n].iter().position(|&c| c == from) else {
+        h.ctx.log_fmt(format_args!("audio-driver: mixer {:#04x} does not list {:#04x} as an input", mixer, from));
+        return false;
+    };
+    let amp = match h.param(cad, mixer, PARAM_IN_AMP_CAP) {
+        Some(0) | None => h.param(cad, p.afg, PARAM_IN_AMP_CAP).unwrap_or(0),
+        Some(a) => a,
+    };
+    let zero_db = amp & 0x7F; // the offset: the step that is 0 dB
+    for k in 0..n {
+        let word = AMP_IN_LR | (k as u32) << 8 | if k == idx { zero_db } else { AMP_MUTE };
+        let _ = h.verb16(cad, mixer, SET_AMP_GAIN_MUTE, word);
+    }
+    match h.verb16(cad, mixer, GET_AMP_GAIN_MUTE, AMP_GET_LEFT | idx as u32) {
+        Some(r) if r & 0xFF == zero_db => true,
+        other => {
+            h.ctx.log_fmt(format_args!(
+                "audio-driver: mixer {:#04x} input {} ({:#04x}) reads {:?} after {:#04x} was set",
+                mixer, idx, from, other.map(|r| r & 0xFF), zero_db));
+            false
+        }
+    }
+}
+
 /// Set up the path for playback: power, amplifiers unmuted at full gain, each node's selection of the
 /// next, the pin's output enable and EAPD where it has one, and the converter's format and stream tag.
 fn configure_path(h: &mut Hda, p: &OutPath) -> bool {
@@ -723,6 +759,16 @@ fn configure_path(h: &mut Hda, p: &OutPath) -> bool {
             };
             let steps = (amp >> 8) & 0x7F;
             let _ = h.verb16(cad, nid, SET_AMP_GAIN_MUTE, AMP_OUT_LR_UNMUTED | steps);
+        }
+        // A MIXER on the path mixes its inputs through input amplifiers, which can come up muted: the
+        // T630's ALC255 plays converter 0x02 into its speaker through mixer 0x0c, whose other input is the
+        // loopback mix. The input from the next node on the path is unmuted at 0 dB (the amplifier's own
+        // offset) and the others muted, as Linux's path activation does; QEMU's codec and the Wyse's have
+        // no mixer on the path, so this never arose before.
+        if i + 1 < p.len && caps & WCAP_IN_AMP != 0 && (caps >> 20) & 0xF == W_MIXER
+            && !unmute_mixer_input(h, p, nid, p.nodes[i + 1])
+        {
+            return false;
         }
         // A node with more than one input listens to the next node on the path.
         if i + 1 < p.len {
