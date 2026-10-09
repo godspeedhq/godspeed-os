@@ -19,6 +19,12 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   `kernel/src/arch/x86_64/pci.rs` `find_by_class` returns the FIRST device of a class; the 2026-10-08 log
   shows 00:01.1 (HDMI) confined, not 00:09.2 (Azalia). Fix: finish step D3, so a supplied BDF selects the
   window, arena and vector, not only bus mastering.
+  **FIXED in QEMU on `feat/audio-finish`, 2026-10-09, T630 card pending.** One resolver, `HwClass::pci_dev`,
+  decides the device for the window, the arena, the vector, the confinement and the bus mastering; a supplied
+  BDF whose device is of another class is REFUSED (built, not yet seen firing). Which device: `hw-enumerator`
+  op 3 takes a `PREFER_OWN` byte - the first device of the class that is not a display's companion function -
+  and the supervisor sets it; `hardware` asks the same question to say which device a driver holds. Pinned by
+  `osdev test audio`, which now boots a decoy HD Audio controller as function 1 of a display, first on the bus.
 - **K3. `DevicePower`, `CpuClock` and `PciCfgRead` answer a caller WITHOUT the capability with 0.**
   VERIFIED. `kernel/src/syscall/dispatch.rs` (`handle_device_power`, `handle_cpu_clock`,
   `handle_pci_cfg_read`) return `CapError::CapNotHeld as i64` - the enum discriminant, 0 - not

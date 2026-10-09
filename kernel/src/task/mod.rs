@@ -520,11 +520,36 @@ impl HwClass {
             // Not a device: the software-generated test interrupt (`FireIrq`) that IR1 delivers.
             // Always "present" because the kernel raises it itself - there is nothing to scan for.
             HwClass::TestIrq => true,
-            // Present iff the scan met a device claiming this class code.
-            HwClass::Pci { class_code, .. } =>
-                crate::arch::imp::pci::find_by_class(class_code).is_some(),
+            // Present iff the device this request names is on the bus (`pci_dev`).
+            HwClass::Pci { .. } => self.pci_dev().is_some(),
             HwClass::None => false,
         }
+    }
+
+    /// THE device a PCI spawn request names - the one place that decides it, so the window, the arena,
+    /// the vector, the confinement and the bus mastering cannot each pick a different one.
+    ///
+    /// A supplied BDF selects the device; with none (0), the first device of the class, as before
+    /// step D3. A supplied BDF whose device is NOT of the requested class is refused, loudly, rather than
+    /// granted: the caller asked for a class and named something else, and on the T630 on 2026-10-08 a
+    /// stale answer did exactly that and confined the SATA controller to `xhci`'s arena. Before this, a
+    /// supplied BDF chose only the bus mastering and the confinement while the window, arena and vector
+    /// came from the first device of the class - so on the T630 `audio-driver` was granted the HDMI audio
+    /// controller's registers whatever it was told (docs/audio.md, "Found while preparing", 2).
+    fn pci_dev(self) -> Option<crate::arch::imp::pci::PciDevice> {
+        use crate::arch::imp::pci;
+        let HwClass::Pci { class_code, bdf, .. } = self else { return None };
+        if bdf == 0 {
+            return pci::find_by_class(class_code);
+        }
+        let d = (0..pci::MAX_DEVICES).filter_map(pci::device_at).find(|d| d.bdf == bdf)?;
+        if d.class_code != class_code {
+            crate::kprintln!(
+                "task: BDF {:#06x} was supplied for class {:#08x} but that device is class {:#08x} - REFUSED, no device granted",
+                bdf, class_code, d.class_code);
+            return None;
+        }
+        Some(d)
     }
     /// The controller's first MMIO BAR base, or 0 if absent (or, for a NIC, not a model we can drive -
     /// an Intel e1000 or a Realtek RTL8168; on any other NIC the driver gets no mapping and idles).
@@ -555,13 +580,12 @@ impl HwClass {
             // e1000 uses BAR0, while the RTL8168 on the Wyse puts I/O ports there and its registers
             // in BAR2. Both are "the first memory BAR". Still not an address - a rule the kernel
             // evaluates over its own scan, exactly as an index is.
-            HwClass::Pci { class_code, bar_ix: BAR_AUTO, .. } =>
-                crate::arch::imp::pci::find_by_class(class_code)
+            HwClass::Pci { bar_ix: BAR_AUTO, .. } =>
+                self.pci_dev()
                     .and_then(|d| d.bar.iter().copied().find(|&b| b != 0))
                     .unwrap_or(0),
-            HwClass::Pci { class_code, bar_ix, .. } =>
-                crate::arch::imp::pci::find_by_class(class_code)
-                    .map_or(0, |d| d.bar[(bar_ix as usize).min(5)]),
+            HwClass::Pci { bar_ix, .. } =>
+                self.pci_dev().map_or(0, |d| d.bar[(bar_ix as usize).min(5)]),
             HwClass::Dwc2 => 0,
             // ZERO for the same reason as the DWC2: not on a bus, so not a BAR. The framebuffer has its
             // own grant path (the `HwClass::Framebuffer` branch in the spawn MMIO block) because it
@@ -629,8 +653,8 @@ impl HwClass {
             // by accident would alias it (TestIrq did, until `needs_dma` was corrected).
             // Per DEVICE, not per class - a device the kernel cannot name still needs its arena
             // handed back on restart. `index` is the scan slot, stable for the boot.
-            HwClass::Pci { class_code, .. } =>
-                match crate::arch::imp::pci::find_by_class(class_code) {
+            HwClass::Pci { .. } =>
+                match self.pci_dev() {
                     Some(d) if d.index < crate::arch::imp::pci::MAX_DEVICES => &PCI_DMA_PHYS[d.index],
                     // Unreachable: `needs_dma()` gates every caller and is false when the device is
                     // absent. Returns a real slot rather than panicking, as the arms below do.
@@ -666,11 +690,16 @@ impl HwClass {
             // with two devices of one class it picks by scan order - which is not a decision the
             // kernel has any basis to make. Zero means "not supplied": fall back to the class.
             HwClass::Pci { class_code, bdf, .. } if bdf != 0 => {
+                // The device `pci_dev` resolved, so the bus mastering and the confinement are the same
+                // device the window, arena and vector came from. One it refused gets none of them.
+                if self.pci_dev().is_none() {
+                    return 0xFFFF;
+                }
                 // Cross-check while both paths exist (step D3 is additive until the scan goes).
                 let by_class = crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf);
                 if by_class != 0xFFFF && by_class != bdf {
                     crate::kprintln!(
-                        "task: BDF {:#06x} supplied for class {:#08x}, but the scan says {:#06x} - using the supplied one",
+                        "task: BDF {:#06x} supplied for class {:#08x}, the first of that class is {:#06x} - the supplied one is granted",
                         bdf, class_code, by_class);
                 } else {
                     // SAID OUT LOUD, because agreement and absence look identical otherwise. Without
@@ -760,9 +789,10 @@ static MSI_POOL_NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// Returns 0 when there is nothing to route: no such device, the pool is exhausted, or the device
 /// refused MSI. Every one of those is reported - a driver silently left without interrupts presents
 /// later as a device that never responds, which is the diagnosis this saves (invariant 12).
-fn pci_msi_vector(class_code: u32, core_id: u32) -> u8 {
+fn pci_msi_vector(hw: HwClass, core_id: u32) -> u8 {
     use core::sync::atomic::Ordering;
-    let Some(d) = crate::arch::imp::pci::find_by_class(class_code) else { return 0 };
+    let HwClass::Pci { class_code, .. } = hw else { return 0 };
+    let Some(d) = hw.pci_dev() else { return 0 };
     if d.index >= crate::arch::imp::pci::MAX_DEVICES { return 0; }
 
     // Deliver to the core the driver is pinned to, so a device event wakes that core directly out
@@ -1391,8 +1421,8 @@ pub fn spawn_from_image(
     // programmed into its MSI. Held in a local so it can be passed as a slice - `hw_irqs_for`
     // returns 'static and cannot carry an allocated value.
     let pci_irq: [u8; 1] = match hw {
-        HwClass::Pci { class_code, .. } if hw_class & HW_PCI_IRQ != 0 =>
-            [pci_msi_vector(class_code, core_id)],
+        HwClass::Pci { .. } if hw_class & HW_PCI_IRQ != 0 =>
+            [pci_msi_vector(hw, core_id)],
         _ => [0],
     };
     let irqs: &[u8] = if pci_irq[0] != 0 { &pci_irq } else { hw_irqs_for(hw) };

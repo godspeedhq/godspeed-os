@@ -1146,7 +1146,11 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 /// `TRIES` times. Still no matching answer is 0 - the kernel's own scan - never a wrong device.
 #[cfg(has_hw_enumerator)]
 fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
-    const OP_BY_CLASS: u8 = 3;
+    use godspeed_sdk::service_context::hwclass::{BY_CLASS as OP_BY_CLASS, PREFER_OWN};
+    // A driver drives a device that stands for itself, not a display's companion function: the T630
+    // has two HD Audio controllers, the HDMI one at 00:01.1 beside its GPU and the analog one at
+    // 00:09.2, and the first of the class is the HDMI one (docs/audio.md, "Found while preparing", 2).
+    // The reporter says which device is a companion; preferring the other is this decision.
     const ANSWER_SECS: i64 = 2;
     // One stale answer costs one more ask; more than that in a row is a reporter that is not answering
     // this question, and the kernel's scan is the better answer.
@@ -1155,7 +1159,7 @@ fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
     let mut buf = [0u8; 16];
     for _ in 0..TRIES {
         match ctx.request_with_reply_deadline_outcome_into(
-            "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2]], &mut buf, ANSWER_SECS)
+            "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2], PREFER_OWN], &mut buf, ANSWER_SECS)
         {
             DeadlineOutcomeInto::Reply(n) if n >= 8 => {
                 let bdf = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);

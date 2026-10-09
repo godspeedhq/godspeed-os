@@ -7520,9 +7520,26 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
             (hw & hwclass::PCI != 0 && hw & 0x00FF_FFFF == class) || hw_kind_pci_class(hw) == Some(class)
         })
     };
-    // ONE device per driver: a driver named by class is given the FIRST device of that class on the bus
-    // (`hw-enumerator` op 3, which the supervisor asks at spawn). The T630 has two HD audio controllers
-    // and showed `audio-driver` on both.
+    // ONE device per driver, and WHICH one is the question the supervisor asked at spawn: `hw-enumerator`'s
+    // `BY_CLASS` with `PREFER_OWN` - the first device of the class that is not a display's companion - whose
+    // answer the kernel grants by its BDF. Asked again here, so the row shows the device the driver holds;
+    // the T630 has two HD audio controllers and the first of the class is the HDMI one. 0 when it cannot be
+    // asked, and then the first device of the class, the rule before step D3. A driver named by KIND (`ehci`
+    // asks for `hwclass::EHCI`) is resolved by the kernel's own scan, first of the class, and stays 0.
+    let mut held = [0u32; HW_DRIVERS];
+    if slot_of(ctx, "hw-enumerator").is_some() {
+        for k in 0..nd {
+            let hw = drv_hw[k];
+            if hw & hwclass::PCI == 0 { continue; }
+            let c = (hw & 0x00FF_FFFF).to_le_bytes();
+            if let Some(m) = hw_ask(ctx, "hw-enumerator", &[hwclass::BY_CLASS, c[0], c[1], c[2], hwclass::PREFER_OWN]) {
+                let q = m.payload_bytes();
+                if q.len() >= 8 && u32::from_le_bytes([q[4], q[5], q[6], q[7]]) == hw & 0x00FF_FFFF {
+                    held[k] = u32::from_le_bytes([q[0], q[1], q[2], q[3]]);
+                }
+            }
+        }
+    }
     let mut claimed = [false; HW_DRIVERS];
 
     // pci: the bus as `hw-enumerator` found it (op 1, the count; op 2, each device).
@@ -7559,7 +7576,7 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
                     None => HwText::of(format_args!("class {:#08x}", d.class)),
                 };
                 match driver_for_class(d.class) {
-                    Some(k) if !claimed[k] => {
+                    Some(k) if !claimed[k] && (held[k] == 0 || held[k] == d.bdf) => {
                         claimed[k] = true;
                         let name = drv_name[k].as_str();
                         r.driver = HwText::of(format_args!("{}", name));
@@ -8127,7 +8144,7 @@ fn hw_why(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
             dev, name, name));
     } else if r.hw & hwclass::PCI != 0 {
         out.line_fmt(ctx, format_args!(
-            "{} is driven by {}: the supervisor starts {} for class {:#08x}, and the kernel grants it the first device of that class",
+            "{} is driven by {}: the supervisor starts {} for class {:#08x} on the device hw-enumerator names - the first of that class that is not a display's companion - and the kernel grants it that device",
             dev, name, name, r.hw & 0x00FF_FFFF));
     } else if let Some((_, _, kind)) = hw_kind(r.hw) {
         out.line_fmt(ctx, format_args!(

@@ -10140,7 +10140,14 @@ fn boot_audio(image_path: &Path, persist_path: &str, wav: &str, smp: u32)
         // The same audio device `osdev run` and `osdev shell` attach (`qemu.rs`): `mixer=on`, so the
         // codec has an amplifier and QEMU applies the volume to the samples the WAV holds.
         "-audiodev", &format!("wav,id=snd0,path={wav},out.frequency=48000,out.channels=2,out.format=s16"),
-        "-device", "intel-hda", "-device", "hda-output,audiodev=snd0,mixer=on",
+        // A DECOY first, shaped like the T630's HDMI audio: an HD Audio controller with no codec, as
+        // function 1 of a display at 00:06.0 (QEMU's own NIC holds slot 2), so it is the FIRST device of its class on the bus. The
+        // driver must be granted the other one - the controller that stands for itself - or it finds
+        // no codec, plays nothing into the WAV, and the checks below fail (docs/audio.md, K2).
+        "-vga", "none",
+        "-device", "VGA,addr=0x6.0,multifunction=on",
+        "-device", "intel-hda,addr=0x6.1,id=decoy",
+        "-device", "intel-hda,addr=0x8.0,id=hda0", "-device", "hda-output,bus=hda0.0,audiodev=snd0,mixer=on",
         "-display", "none", "-no-reboot", "-no-shutdown",
     ])
     .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -10236,6 +10243,10 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(log(&buf).contains("audio-driver: ready - serving requests; playback refills on the stream's interrupt"),
         "the driver refills on its interrupt, not by polling");
     check!(log(&buf).contains("no /audio.settings yet"), "a fresh disk starts at the defaults");
+    // K2: the decoy at 00:06.1 is the first of the class, and the driver was granted the other one -
+    // by the BDF the supervisor supplied, which now selects the window, the arena and the vector too.
+    check!(log(&buf).contains("supplied for class 0x040300, the first of that class is 0x0031 - the supplied one is granted"),
+        "the driver is granted the controller that is not a display's companion, not the first of the class");
     // System sounds OFF for the rest of boot 1: this session types commands that fail on purpose, and
     // each would sound into the capture below, which must hold only the tones asked for. Boot 2 turns
     // them on and plays one.
@@ -10278,14 +10289,18 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(r.contains("already playing through line out"), "choosing the output in use sends nothing");
     let r = run!(b"audio output headphone\r");
     check!(r.contains("no output called 'headphone'") && r.contains("line out"), "an output it does not have is refused with the list");
-    // QEMU has ONE audio controller, so the second-controller case (the T630's) is not shown here; the
-    // report, its pipe, one device in full and a refused name are.
+    // TWO controllers, the T630's case: the decoy at 00:06.1 not driven, and the one the driver holds,
+    // 00:08.0, ready and in use. Then its pipe, one device in full and a refused name.
     let r = run!(b"audio hardware\r");
-    check!(r.contains("HD audio") && r.contains("audio-driver") && r.contains("ready") && r.contains("*"),
-        "hardware: the HD audio controller, its driver, ready, in use");
-    let dev = r.lines().find(|l| l.contains("HD audio")).and_then(|l| l.split_whitespace().next()).unwrap_or("").to_string();
+    let row = |r: &str, dev: &str| r.lines().find(|l| l.starts_with(dev)).unwrap_or("").to_string();
+    let (held, decoy) = (row(&r, "00:08.0"), row(&r, "00:06.1"));
+    check!(held.contains("HD audio") && held.contains("audio-driver") && held.contains("ready") && held.contains('*'),
+        "hardware: the controller the driver holds, ready, in use");
+    check!(decoy.contains("HD audio") && decoy.contains("not driven") && !decoy.contains('*'),
+        "hardware: the display's companion controller, not driven");
+    let dev = "00:08.0".to_string();
     let r = run!(b"audio hardware | count\r");
-    check!(r.contains('1'), "hardware pipes as records: one row");
+    check!(r.contains('2'), "hardware pipes as records: two rows");
     let r = run!(format!("audio hardware {}\r", dev).as_bytes());
     check!(!dev.is_empty() && r.contains("driven by audio-driver") && r.contains("the driver's account"),
         "hardware <device>: why it is driven, and the driver's account");

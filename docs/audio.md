@@ -1272,3 +1272,29 @@ held: `node 0x02 has no mute - muting on node 0x14` at boot, `muted - verified` 
 and silent, `volume 50 - verified`. Each tone played 2000 ms in 2028 by the clock, 0 underruns, 23
 interrupts. The operator: "mute works and all the commands too". A6 is done on the Wyse; the T630 is
 what remains of it - the two kernel fixes and the AMD snoop bit come before its codec is the question.
+
+## Step A6 on the T630, K2: the controller the driver is granted (2026-10-09)
+
+**The fault.** A class code picks the FIRST device of the class, and on the T630 that is the HDMI audio
+controller at 00:01.1, beside its GPU at 00:01.0; the analog one with the Realtek is 00:09.2. The
+supervisor already supplied a BDF, but the kernel used it only for bus mastering and confinement - the
+window, the arena and the vector still came from the first of the class.
+
+**Kernel: one device per request.** `HwClass::pci_dev` decides the device a PCI spawn names, and every
+grant goes through it: window, arena, vector, confinement, bus mastering. A supplied BDF selects it; none
+means the first of the class, as before. A supplied BDF whose device is of a different class is refused
+with no device granted, because a stale answer did exactly that on 2026-10-08 and confined the SATA
+controller to `xhci`'s arena. That refusal is built and not yet seen firing.
+
+**Which device: a fact from the reporter, a choice by the supervisor.** `hw-enumerator`'s class question
+takes an optional byte, `PREFER_OWN` (`hwclass` in the SDK, one definition): the first device of the class
+that is not a display's companion - a function other than 0 whose function 0 is a display controller -
+or, if every one is, the first. The supervisor sets it. `hardware` asks the same question to say which
+device a driver holds, so the report cannot show the driver on one controller while the kernel granted
+another; QEMU caught exactly that the first time the suite ran with two.
+
+**Pinned in QEMU.** `osdev test audio` now boots a decoy: an HD Audio controller with no codec as function
+1 of a VGA at 00:06.0, so it is the first of its class, and the real one at 00:08.0. The driver is granted
+00:08.0 (`BDF 0x0040 supplied for class 0x040300, the first of that class is 0x0031 - the supplied one is
+granted`), finds QEMU's codec, plays into the WAV, and `audio hardware` shows the decoy `not driven`: 69
+checks, all passing. The two controllers' registers are 16 KiB apart there, which is K1 in miniature.
