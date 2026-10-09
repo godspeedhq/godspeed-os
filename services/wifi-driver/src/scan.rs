@@ -681,7 +681,7 @@ pub fn collect(
             Step::Frame => {}
             Step::Empty => {
                 empty += 1;
-                ctx.sleep_ms(1);
+                godspeed::task::sleep_ms(ctx, 1);
             }
             Step::Ended(why) => {
                 ended_by = why;

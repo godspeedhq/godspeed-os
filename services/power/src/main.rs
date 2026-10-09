@@ -111,6 +111,14 @@ fn apply(ctx: &ServiceContext, fast: bool, why: &str, no_control_said: &mut bool
     }
 }
 
+/// Counter ticks in `ms` milliseconds - the unit a lease's expiry is kept in, so a lease compares with
+/// one counter read. Never zero, and 1 on a machine whose counter the kernel could not calibrate,
+/// where no tick count is a duration.
+fn cycles(ctx: &ServiceContext, ms: u64) -> u64 {
+    let per_10ms = gs::driver::wait::ticks_per_10ms(ctx);
+    if per_10ms == 0 { 1 } else { (per_10ms.saturating_mul(ms) / 10).max(1) }
+}
+
 /// Answer on the client's one-shot reply capability, then give the slot back - a reply cap that is
 /// answered and kept is a slot leaked per request (CLAUDE.md 8.5). `try_send`, because a client that
 /// stopped waiting must not stall this service; a failed answer is that client's timeout, not ours.
@@ -121,7 +129,7 @@ fn reply(ctx: &ServiceContext, cap: gs::cap::Cap, body: &[u8]) {
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.trace_as("power");
+    gs::trace::as_name(&ctx, "power");
     let mut leases = Leases { slots: [None; SLOTS], next_id: 0 };
     let mut no_control_said = false;
     // NOBODY HAS ASKED YET, so the clock goes to its minimum. On a first boot this ends the firmware's
@@ -135,7 +143,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     loop {
         // WAIT FOR THE EARLIEST EXPIRY, or block outright when nothing is open: an idle machine costs
         // this service nothing at all.
-        let now = ctx.read_tsc();
+        let now = gs::driver::wait::ticks(&ctx);
         let next = leases.slots.iter().flatten().map(|l| l.until).min();
         // Whole seconds, rounded UP, because `gs::ipc::recv_within` counts in seconds: waking a fraction
         // late is a lease running a fraction long, and waking early would only loop back here.
@@ -146,7 +154,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if left == 0 {
                     None
                 } else {
-                    let per_sec = ctx.duration_cycles(1000).max(1);
+                    let per_sec = cycles(&ctx, 1000).max(1);
                     gs::ipc::recv_within(&ctx, ((left + per_sec - 1) / per_sec) as i64)
                 }
             }
@@ -154,7 +162,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         // EXPIRE whatever is due, whether or not a message arrived - a busy endpoint must not keep a
         // lease alive past its bound.
-        let now = ctx.read_tsc();
+        let now = gs::driver::wait::ticks(&ctx);
         let before = leases.open();
         for slot in leases.slots.iter_mut() {
             if let Some(l) = slot {
@@ -195,7 +203,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     continue;
                 };
                 let id = leases.take_id();
-                let until = ctx.read_tsc().wrapping_add(ctx.duration_cycles(secs * 1000));
+                let until = gs::driver::wait::ticks(&ctx).wrapping_add(cycles(&ctx, secs * 1000));
                 let first = leases.open() == 0;
                 leases.slots[free] = Some(Lease { id, until, secs });
                 ctx.log_fmt(format_args!("power: lease {} opened for {} s ({} open)", id, secs, leases.open()));

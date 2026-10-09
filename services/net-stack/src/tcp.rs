@@ -635,7 +635,7 @@ impl Tcp {
     /// the same silent-plausible-value defect `backlog/27` records one layer down.
     pub fn now_ms(&self, ctx: &ServiceContext) -> Option<u64> {
         if self.cyc_per_ms == 0 { return None; }
-        Some(ctx.read_tsc().wrapping_sub(self.base_tsc) / self.cyc_per_ms)
+        Some(godspeed::driver::wait::ticks(ctx).wrapping_sub(self.base_tsc) / self.cyc_per_ms)
     }
 
     pub fn have_clock(&self) -> bool { self.cyc_per_ms != 0 }
@@ -727,7 +727,7 @@ impl Tcp {
     /// fast, which this one does.
     pub fn connect(&mut self, ctx: &ServiceContext, rid: u64, dst: [u8; 4], dport: u16,
                    peer_mac: [u8; 6]) -> Option<usize> {
-        let iss = (ctx.read_tsc() as u32) ^ 0x5a5a_0000;
+        let iss = (godspeed::driver::wait::ticks(ctx) as u32) ^ 0x5a5a_0000;
         let port = self.next_port;
         self.next_port = if self.next_port >= 65000 { 49152 } else { self.next_port + 1 };
         let now = self.now_ms(ctx).unwrap_or(0);
@@ -1215,7 +1215,7 @@ impl Tcp {
             // to ask for.
             let mut pmac = [0u8; 6];
             pmac.copy_from_slice(&f[6..12]);
-            let iss = (ctx.read_tsc() as u32) ^ 0x7a7a_0000;
+            let iss = (godspeed::driver::wait::ticks(ctx) as u32) ^ 0x7a7a_0000;
             let mss = seg.mss;
             let wnd = seg.wnd;
             let sseq = seg.seq;

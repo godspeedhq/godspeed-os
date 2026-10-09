@@ -28,6 +28,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{CapHandle, Message, ServiceContext};
 use godspeed_sdk::service_context::{AcquireFailure, DeadlineOutcomeInto};
 
@@ -589,7 +590,7 @@ const MOUNT_RETRY_MS: u64 = 20;
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Name this service in the trace ring. It cannot ask what it is called (identity is not ambient),
     // so a traced service says - see `sdk::trace` for why that costs nothing in trust.
-    ctx.trace_as("fs");
+    gs::trace::as_name(&ctx, "fs");
     // block-driver requests carry a correlation tag at byte 0 (`treq[0] = tag`), opcode at byte 1.
     ctx.trace_op_at("block-driver", 1);
     ctx.log("fs: starting");
@@ -613,13 +614,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // failed attempt returns almost instantly when the device is absent, so the count alone
         // measured loop speed, not how long the disk was given - it meant a different wait on every
         // board. 20 s is a real duration and covers a stick enumerating behind a hub.
-        let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(MOUNT_MAX_MS));
+        let started = gs::driver::wait::Since::now(&ctx);
         for attempt in 1..=MOUNT_MAX_ATTEMPTS {
             match block_capacity(&ctx) {
                 Some(cap) => { got = cap; break; }
                 None => {
-                    let _ = ctx.reacquire_by_name("block-driver");
-                    let out_of_time = ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63);
+                    let _ = gs::cap::reacquire(&ctx, "block-driver");
+                    let out_of_time = started.passed(&ctx, gs::driver::wait::Budget::ms(MOUNT_MAX_MS));
                     if out_of_time || attempt == MOUNT_MAX_ATTEMPTS {
                         // SAY WHICH BOUND ENDED THE WAIT. They are not the same fact.
                         //
@@ -649,7 +650,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // 1000 attempts * 20 ms exceeds the 20 s deadline on any board, so the clock binds
                     // everywhere and the count goes back to being what it claims to be - a runaway
                     // backstop that should never fire.
-                    ctx.sleep(ctx.duration_cycles(MOUNT_RETRY_MS));
+                    gs::task::sleep_ms(&ctx, MOUNT_RETRY_MS);
                 }
             }
         }
@@ -716,7 +717,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     break;
                 }
                 Err(e) if e == E_IO => {
-                    let _ = ctx.reacquire_by_name("block-driver");
+                    let _ = gs::cap::reacquire(&ctx, "block-driver");
                     match block_capacity(&ctx) {
                         // block-driver is not answering: it is restarting. Wait on its truth, retry -
                         // but BOUNDED (Commandment VIII's second half): a persistent I/O failure is a
@@ -729,7 +730,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 ctx.log("fs: storage unreadable after bounded mount attempts - serving storage-unavailable (data intact; do NOT run 'drives flash', awaiting block-driver recovery)");
                                 break;
                             }
-                            ctx.yield_cpu();
+                            gs::task::yield_now(&ctx);
                         }
                         // block-driver answered yet the read still failed (after its COMRESET + retries):
                         // authoritative. Serve raw, honestly - never invite a data-destroying flash.
@@ -793,11 +794,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     const PUBLISH_EVERY: u64 = 32;
     let mut served = 0u64;
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         served += 1;
         if served % PUBLISH_EVERY == 0 {
-            ctx.metric("requests", served);
-            ctx.metric("blk.outages", PEER_OUTAGES.load(core::sync::atomic::Ordering::Relaxed) as u64);
+            gs::trace::metric(&ctx, "requests", served);
+            gs::trace::metric(&ctx, "blk.outages", PEER_OUTAGES.load(core::sync::atomic::Ordering::Relaxed) as u64);
         }
         // LS1 self-heal: if we came up DEGRADED on a storage I/O error, re-attempt the mount when a
         // request arrives, before serving it. block-driver's AHCI disk detection can transiently miss
@@ -855,7 +856,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // every new drop path silently opts out of healing (§26.7 - a failed recovery must not be
         // quietly skipped; not attempting one is the quietest skip there is).
         if fs.is_none() {
-            let _ = ctx.reacquire_by_name("block-driver");
+            let _ = gs::cap::reacquire(&ctx, "block-driver");
             // Never probe an absent disk: capacity 0 -> block_capacity None, so a cardless boot does
             // not re-flood LBA-0 reads on every request. Only attempt the re-mount once block-driver
             // reports a real capacity again (a disk is back) - this preserves the LS1 self-heal for a
@@ -879,9 +880,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // A delegated-resource badge (§7.10) is set ONLY by the kernel after it validated a real
         // file cap - so its presence means "this is a trusted file-cap invocation", impossible to
         // forge over the ordinary fs send-cap. No badge → a name-addressed request.
-        let badge = ctx.last_recv_badge();
+        let badge = gs::resource::last_badge(&ctx);
 
-        let reply = match ctx.take_pending_cap() {
+        let reply = match gs::ipc::take_sent_cap(&ctx) {
             Some(c) => c,
             None => {
                 // NO REPLY CAPABILITY. A real request always carries one, so this is either the
@@ -950,7 +951,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             None => serve(&ctx, &mut fs, capacity, storage_unreadable, msg.payload_bytes(), reply,
                           &mut reply_fails, &mut lose),
         }
-        ctx.remove_cap(reply);
+        gs::cap::remove(&ctx, reply);
     }
 }
 
@@ -1356,6 +1357,15 @@ impl DropRequest {
     pub fn discard(&mut self, _ctx: &ServiceContext, _op: u8) -> bool { false }
 }
 
+/// Counter ticks in `ms` milliseconds, never zero: the unit the cycle accounting below is kept in, and
+/// the divisor that turns it back into time. One tick when the counter is uncalibrated.
+fn ticks_in_ms(ctx: &ServiceContext, ms: u64) -> u64 {
+    match gs::driver::wait::ticks_per_10ms(ctx) {
+        0 => 1,
+        per_10ms => (per_10ms.saturating_mul(ms) / 10).max(1),
+    }
+}
+
 fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
     if r.is_err() {
         *fails = fails.saturating_add(1);
@@ -1366,7 +1376,7 @@ fn reply_nonblocking<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32)
     }
 }
 
-fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: CapHandle,
+fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8], reply: gs::cap::Cap,
          reply_fails: &mut u32, lose: &mut LoseReply) {
     // Split the CORRELATION TAG off the front. A name-addressed request carries one byte the client
     // chose, and its reply carries the same byte back, so the client can tell an answer to ITS question
@@ -1384,7 +1394,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         f.blk_ops.set(0);
         f.blk_cycles.set(0);
     }
-    let c_start = ctx.read_tsc();
+    let c_start = gs::driver::wait::ticks(ctx);
     serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
@@ -1436,7 +1446,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         if len == 0 { out[1] = FS_ERR; len = 1; }
         // +1 for the tag at out[0]
         if lose.swallow(ctx, p.first().copied().unwrap_or(0) & 0x7F) { return; }
-        reply_nonblocking(ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..1 + len])), ctx, reply_fails);
+        reply_nonblocking(gs::ipc::try_send_to(ctx, reply, &Message::from_bytes(&out[..1 + len])), ctx, reply_fails);
     }
 
     // WHERE THE TIME WENT, for the requests that actually cost something.
@@ -1454,8 +1464,8 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     // mattered: after a fix, when the question is whether the remaining "1s" lines are real. The
     // multi-second readings were always sound (you cannot cross seventeen boundaries by accident) -
     // it is the 1s ones that carried no information, and I read meaning into them anyway.
-    let all_c = ctx.read_tsc().saturating_sub(c_start).max(1);
-    let per_sec = ctx.duration_cycles(1_000).max(1);
+    let all_c = gs::driver::wait::ticks(ctx).saturating_sub(c_start).max(1);
+    let per_sec = ticks_in_ms(ctx, 1_000);
     let call_us = all_c.saturating_mul(1_000_000) / per_sec;
     if call_us >= 200_000 {
         let ops = vol.as_ref().map_or(0, |f| f.blk_ops.get());
@@ -1485,7 +1495,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
 /// with no suite typing `flash` at all. If an arm needs a fresher capacity, refresh it at the CALLER
 /// (see the serve loop), where the selftest is not involved.
 fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
-              tag: u8, reply: CapHandle, out: &mut [u8], out_len: &mut usize) {
+              tag: u8, reply: gs::cap::Cap, out: &mut [u8], out_len: &mut usize) {
     let mut send = |bytes: &[u8]| {
         let n = bytes.len().min(out.len());
         // TRUNCATION MUST NOT BE SILENT. The clamp is a bounds guard, not a policy: every reply this
@@ -1866,7 +1876,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
 /// after the cap check), so reaching here means the caller holds a real, live cap. We resolve the
 /// resource id → the open file's path, enforce that the operation needs **≤ the validated right**
 /// (the load-bearing non-escalation check, §7.3 - a READ cap can never write), and act.
-fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: CapHandle,
+fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8, unreadable: bool, p: &[u8], reply: gs::cap::Cap,
                  reply_fails: &mut u32) {
     // THE CORRELATION TAG, which this protocol lacked while the NAMED one in this same file has
     // always had it. Byte 0 of the request, echoed at byte 0 of every reply.
@@ -1888,7 +1898,7 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
         out[0] = tag;
         let n = bytes.len().min(out.len() - 1);
         out[1..1 + n].copy_from_slice(&bytes[..n]);
-        let r = ctx.try_send_by_handle(reply, &Message::from_bytes(&out[..1 + n]));
+        let r = gs::ipc::try_send_to(ctx, reply, &Message::from_bytes(&out[..1 + n]));
         reply_nonblocking(r, ctx, reply_fails);
     };
     let nofs: u8 = if unreadable { FS_UNAVAIL } else { FS_NOFS };
@@ -1898,7 +1908,7 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
 
     // FOP_CLOSE needs no path (the holder retires its own handle).
     if fop == FOP_CLOSE {
-        let _ = ctx.resource_revoke(rid); // gen bump → this cap (and any copies) go stale
+        let _ = gs::resource::revoke(ctx, rid); // gen bump → this cap (and any copies) go stale
         fs.open_free(rid);
         send(&[FS_OK]);
         return;
@@ -2240,9 +2250,9 @@ impl Fs {
                 // wait on the truth - time actually passing - not on a loop count that only measures
                 // scheduler load). Worst case ~3 s, spent only on this failure path, against the
                 // alternative of declaring a healthy tree dead and prescribing a reformat.
-                let t0 = ctx.epoch_secs_monotonic();
+                let t0 = gs::task::epoch_secs_monotonic(ctx);
                 let mut spins = 0u32;
-                while ctx.epoch_secs_monotonic() <= t0 && spins < 200_000 { ctx.yield_cpu(); spins += 1; }
+                while gs::task::epoch_secs_monotonic(ctx) <= t0 && spins < 200_000 { gs::task::yield_now(ctx); spins += 1; }
                 // Still displace the firmware's cached answer before re-asking (result discarded).
                 if lba != 0 { let _ = block_read(ctx, 0); }
                 let Some(again) = self.tb_read(ctx, lba) else { break };
@@ -2298,11 +2308,11 @@ impl Fs {
     /// `fs` compute, when the journal writes it does not see are the obvious other candidate.
     fn blk_begin(&self, ctx: &ServiceContext) -> u64 {
         self.blk_ops.set(self.blk_ops.get().saturating_add(1));
-        ctx.read_tsc()
+        gs::driver::wait::ticks(ctx)
     }
     fn blk_end(&self, ctx: &ServiceContext, t0: u64) {
         self.blk_cycles.set(self.blk_cycles.get()
-            .saturating_add(ctx.read_tsc().saturating_sub(t0)));
+            .saturating_add(gs::driver::wait::ticks(ctx).saturating_sub(t0)));
     }
 
     fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
@@ -2367,7 +2377,7 @@ impl Fs {
             CRASH_WINDOW_SECS));
         for left in (1..=CRASH_WINDOW_SECS).rev() {
             ctx.log_fmt(format_args!("fs: [crash-window] {}...", left));
-            ctx.sleep(ctx.duration_cycles(1000));
+            gs::task::sleep_ms(ctx, 1000);
         }
         ctx.log("fs: [crash-window] window closed - applying the checkpoint normally. \
                  A boot after a cut inside it must say `journal recovered`.");
@@ -2451,7 +2461,7 @@ impl Fs {
         self.crash_window(ctx);
         if self.crash_after_commit {
             ctx.log("fs: [journal-crash-test] commit record durable - halting before checkpoint (simulated crash)");
-            loop { ctx.yield_cpu(); }
+            loop { gs::task::yield_now(ctx); }
         }
         // 3. Checkpoint: write each staged block to its home LBA.
         for i in 0..n {
@@ -2637,7 +2647,7 @@ fn replay_window(ctx: &ServiceContext) {
     ctx.log("fs: [replay-window] A REPLAY IS HALF APPLIED - CUT THE POWER NOW (8s). The journal is still intact, so the next boot must finish it.");
     for left in (1..=8u64).rev() {
         ctx.log_fmt(format_args!("fs: [replay-window] {}...", left));
-        ctx.sleep(ctx.duration_cycles(1000));
+        gs::task::sleep_ms(ctx, 1000);
     }
     ctx.log("fs: [replay-window] window closed - finishing the replay normally.");
 }
@@ -3684,7 +3694,7 @@ fn replay_window(_ctx: &ServiceContext) {}
     /// The client operates the file by invoking that cap (the kernel badges the request with the
     /// resource id + right; `serve_filecap` resolves it back here). Minted with `GRANT` so fs can
     /// transfer a copy; fs drops its own copy afterward (it serves via the badge, not the cap).
-    fn open_file(&mut self, ctx: &ServiceContext, path: &[u8], want: u8, tag: u8, reply: CapHandle)
+    fn open_file(&mut self, ctx: &ServiceContext, path: &[u8], want: u8, tag: u8, reply: gs::cap::Cap)
         -> Result<(), &'static str> {
         let e = self.walk(ctx, path).ok_or("not found")?;
         if !is_file(e.itype) { return Err("not a file"); }
@@ -3702,11 +3712,12 @@ fn replay_window(_ctx: &ServiceContext) {}
         of.path[..path.len()].copy_from_slice(path);
         self.open_files[slot] = of;
         // Hand a derived copy to the client; drop fs's original either way.
-        let granted = match ctx.derive_cap(cap) {
+        let cap = gs::cap::Cap::from(cap);
+        let granted = match gs::cap::duplicate(ctx, cap) {
             // Carries the correlation tag like every other reply - this one is built here rather than
             // in `serve`'s buffer because it must embed the file CAPABILITY, and authority does not fit
             // in a byte buffer. Same wire shape, different construction site.
-            Some(c) => {
+            Ok(c) => {
                 // A9-7: reclaim the DERIVED cap when the send fails.
                 //
                 // The kernel removes an embedded cap only on a CONFIRMED transfer (§8.5), so a failed
@@ -3715,21 +3726,21 @@ fn replay_window(_ctx: &ServiceContext) {}
                 // Note the mirror hazard, which is why this removes ONLY on failure: on success the
                 // cap is already gone, and removing it again is the stale-index bug that deleted a
                 // file cap out of a reused slot (1ecfd98e).
-                match ctx.send_with_cap_by_handle(reply, c, &Message::from_bytes(&[tag, FS_OK])) {
+                match gs::ipc::send_granting(ctx, reply, c, &Message::from_bytes(&[tag, FS_OK])) {
                     Ok(()) => true,
                     Err(e) => {
-                        ctx.remove_cap(c);
+                        gs::cap::remove(ctx, c);
                         ctx.log_fmt(format_args!("fs: file-cap grant send failed ({:?}) - slot reclaimed", e));
                         false
                     }
                 }
             }
-            None    => false,
+            Err(_)  => false,
         };
-        ctx.remove_cap(cap);
+        gs::cap::remove(ctx, cap);
         if !granted {
             self.open_files[slot].rid = 0;
-            let _ = ctx.resource_revoke(rid); // nothing was handed out - undo the mint
+            let _ = gs::resource::revoke(ctx, rid); // nothing was handed out - undo the mint
             return Err("grant failed");
         }
         Ok(())
@@ -3743,7 +3754,7 @@ fn replay_window(_ctx: &ServiceContext) {}
     fn now_epoch(&self, ctx: &ServiceContext) -> u32 {
         let (epoch, at) = self.clock.get();
         if epoch == 0 { return TIME_UNKNOWN; }          // nobody has told us the time yet
-        let age = ctx.epoch_secs_monotonic().saturating_sub(at);
+        let age = gs::task::epoch_secs_monotonic(ctx).saturating_sub(at);
         if age < 0 || age > CLOCK_MAX_AGE_S { return TIME_UNKNOWN; }
         epoch.saturating_add(age as u32)
     }
@@ -3753,7 +3764,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         // Refuse a value that cannot be a date. A clock this service cannot believe leaves the cache
         // alone, so files keep reading "unknown" rather than acquiring a nonsense stamp.
         if epoch <= 0 || epoch >= u32::MAX as i64 { return; }
-        self.clock.set((epoch as u32, ctx.epoch_secs_monotonic()));
+        self.clock.set((epoch as u32, gs::task::epoch_secs_monotonic(ctx)));
     }
 
     /// Seal a file: its content can never change again.
@@ -3825,7 +3836,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         for i in 0..self.open_files.len() {
             let rid = self.open_files[i].rid;
             if rid != 0 {
-                let _ = ctx.resource_revoke(rid);
+                let _ = gs::resource::revoke(ctx, rid);
                 self.open_files[i].rid = 0;
             }
         }
@@ -3844,7 +3855,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         for i in 0..MAX_OPEN {
             let o = self.open_files[i];
             if o.rid != 0 && &o.path[..o.plen as usize] == path {
-                let _ = ctx.resource_revoke(o.rid);
+                let _ = gs::resource::revoke(ctx, o.rid);
                 self.open_files[i].rid = 0;
             }
         }
@@ -3871,7 +3882,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         for i in 0..MAX_OPEN {
             let o = self.open_files[i];
             if o.rid != 0 && Self::path_in_subtree(&o.path[..o.plen as usize], path) {
-                let _ = ctx.resource_revoke(o.rid);
+                let _ = gs::resource::revoke(ctx, o.rid);
                 self.open_files[i].rid = 0;
             }
         }
@@ -4332,7 +4343,7 @@ fn protocol_selftest(ctx: &ServiceContext) {
         // A capability handle that names nothing. Safe because no arm can reach a mint or a send
         // without a mounted volume, and every one of those is behind the `None => no filesystem`
         // guard this runs under.
-        serve_once(ctx, vol, 0, false, p, 0, CapHandle(0), &mut out[..], &mut len);
+        serve_once(ctx, vol, 0, false, p, 0, gs::cap::Cap::from(CapHandle(0)), &mut out[..], &mut len);
         *checked += 1;
         if len == 0 {
             *empty += 1;
@@ -4858,7 +4869,7 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
                     return None;
                 }
                 last = "queue full";
-                ctx.yield_cpu();   // let the driver drain before asking again
+                gs::task::yield_now(ctx);   // let the driver drain before asking again
                 continue;
             }
             // The one worth retrying.

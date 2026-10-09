@@ -20,6 +20,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::ServiceContext;
 
 // Backend by architecture: x86 talks AHCI (SATA, MMIO+DMA); ARM (Raspberry Pi 2) storage is a USB stick
@@ -44,7 +45,7 @@ use godspeed_sdk::ServiceContext;
 /// forgotten: there is no way to answer a request without it, and the compiler says so.
 #[derive(Clone, Copy)]
 pub struct Reply {
-    pub cap: godspeed_sdk::CapHandle,
+    pub cap: gs::cap::Cap,
     pub tag: u8,
     /// What to do to this completion (carnage §3.7). `Fault::None` on every shipping build.
     ///
@@ -60,7 +61,7 @@ pub struct Reply {
 
 impl Reply {
     /// A reply that will be answered faithfully - every path except the one injecting faults.
-    pub fn plain(cap: godspeed_sdk::CapHandle, tag: u8) -> Self {
+    pub fn plain(cap: gs::cap::Cap, tag: u8) -> Self {
         Reply { cap, tag, fault: Fault::None }
     }
 }
@@ -188,10 +189,20 @@ impl Reply {
 
     /// One send, with the undelivered report. Split out so a fault can emit zero, one or two.
     fn emit(&self, ctx: &godspeed_sdk::ServiceContext, msg: &[u8]) {
-        if ctx.try_send_by_handle(self.cap, &godspeed_sdk::Message::from_bytes(msg)).is_err() {
+        if gs::ipc::try_send_to(ctx, self.cap, &godspeed_sdk::Message::from_bytes(msg)).is_err() {
             ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
         }
     }
+}
+
+/// Counter ticks in `ms` milliseconds, exactly as the SDK's `duration_cycles` computes them: never 0,
+/// and 1 on a machine whose counter the kernel could not calibrate. For measurements kept in counter
+/// ticks (the slow-op report); a WAIT is written on `gs::driver::wait`, never on this.
+#[cfg(not(storage_is_usb))]
+pub(crate) fn ms_ticks(ctx: &ServiceContext, ms: u64) -> u64 {
+    let per_10ms = gs::driver::wait::ticks_per_10ms(ctx);
+    if per_10ms == 0 { return 1; }
+    (per_10ms.saturating_mul(ms) / 10).max(1)
 }
 
 // WHICH BACKEND, asked as a board fact rather than as an instruction set. `storage_is_usb` and
@@ -304,7 +315,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("block-driver");
+    gs::trace::as_name(&ctx, "block-driver");
     // A USB board's backend needs NO MMIO: the disk is reached by IPC to the service that owns the
     // host controller (`STORAGE_HOST`), so this service is granted no window and asks for none. Going
     // through the `ctx.mmio()` gate would refuse a perfectly good USB stick on any board that does not
@@ -329,7 +340,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // flood-storm pin); the self-driven poll drains every quantum with no wake needed. Pinned by the
             // shell-test `chaos flood-storm block-driver` step (QEMU's pc machine has no AHCI, so it sits here).
             // ANSWER while draining. The loop here used to be
-            //     loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+            //     loop { while gs::ipc::try_recv(&ctx).is_some() {} gs::task::yield_now(&ctx); }
             // which retired every request and replied to none - so `fs` blocked forever in its first
             // `block_capacity()`, never reached its own storage-unavailable degraded path, and never
             // printed `fs: serving file API`; every file command in the shell hung behind it. On any
@@ -345,8 +356,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // gives (a cross-core flood must not depend on waking a deeply-blocked recv), so the
             // answer path is inlined here rather than delegating to the blocking version.
             loop {
-                while let Some(msg) = ctx.try_recv() {
-                    let reply = match ctx.take_pending_cap() {
+                while let Some(msg) = gs::ipc::try_recv(&ctx) {
+                    let reply = match gs::ipc::take_sent_cap(&ctx) {
                         Some(c) => c,
                         None => continue,   // nothing to answer on; dropping is all that is left
                     };
@@ -367,9 +378,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         1
                     };
                     reply.send(&ctx, &out[..n]);
-                    ctx.remove_cap(reply.cap);
+                    gs::cap::remove(&ctx, reply.cap);
                 }
-                ctx.yield_cpu();
+                gs::task::yield_now(&ctx);
             }
         }
     }

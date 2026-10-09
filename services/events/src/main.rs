@@ -54,7 +54,10 @@ use godspeed_sdk::trace::{
     EV_LEN, MET_LEN, MET_NAME_LEN, PEER_LEN, TRACE_OP_LOG, TRACE_OP_LOGS, TRACE_OP_DUMP, TRACE_OP_EVENT, TRACE_OP_METRIC, TRACE_OP_METRICS,
     TRACE_OP_STATUS,
 };
+use godspeed::driver::wait::{Budget, Since};
 use godspeed_sdk::{Message, ServiceContext};
+
+use godspeed as gs;
 
 /// Events retained. 192 x 34 B is about 6.5 KiB, inside this service's existing footprint.
 ///
@@ -125,17 +128,16 @@ struct Ev {
 /// emitter's `try_send`, so a blocking reply here would let one stalled reader stall the sink for the
 /// whole system. Dropped on failure - the caller retries, and a lost answer costs nothing.
 fn reply(ctx: &ServiceContext, out: &[u8]) {
-    if let Some(cap) = ctx.take_pending_cap() {
-        let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(out));
-        // RECLAIM IT. A reply capability is a one-shot return address handed to us inside the request;
-        // sending on it does not consume it, so leaving it behind burns a cap-table slot per reply
-        // until the table is full. `block-driver`, `console` and `fs` all do this - this service was
-        // the one that did not.
+    if let Some(cap) = gs::ipc::take_sent_cap(ctx) {
+        // `gs::ipc::reply` answers AND reclaims. A reply capability is a one-shot return address handed
+        // to us inside the request; sending on it does not consume it, so leaving it behind burns a
+        // cap-table slot per reply until the table is full. `block-driver`, `console` and `fs` all
+        // reclaim it - this service was the one that did not.
         //
         // It was visible before it was fatal: `events deps fs` drew `events -> shell`, because a
         // retained return address is indistinguishable from a wired peer (both SEND|GRANT to a live
         // task's endpoint). A leak that shows up as a wrong arrow in a diagram is a lucky leak.
-        ctx.remove_cap(cap);
+        let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(out));
     }
 }
 
@@ -161,15 +163,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // instruction, so read THAT every time and refresh the seconds only when a second has actually
     // passed. Events within the same second share a stamp, which is exactly the resolution the field
     // has anyway.
-    let per_sec = ctx.duration_cycles(1000);
-    let mut at_s = ctx.epoch_secs_monotonic() as u32;
-    let mut at_tsc = ctx.read_tsc();
+    const SECOND: Budget = Budget::ms(1000);
+    let mut at_s = gs::task::epoch_secs_monotonic(&ctx) as u32;
+    let mut at = Since::now(&ctx);
 
-    ctx.trace_as("events");
+    gs::trace::as_name(&ctx, "events");
     ctx.log("events: ready (drains its endpoint; holds the IPC trace ring)");
 
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         let b = msg.payload_bytes();
         if b.is_empty() {
             continue;
@@ -180,10 +182,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // observability path, and the opposite of the one made on a correctness path.
             TRACE_OP_EVENT if b.len() >= 1 + EV_LEN => {
                 let e = &b[1..1 + EV_LEN];
-                let tsc = ctx.read_tsc();
-                if tsc.wrapping_sub(at_tsc) >= per_sec {
-                    at_s = ctx.epoch_secs_monotonic() as u32;
-                    at_tsc = tsc;
+                if at.passed(&ctx, SECOND) {
+                    at_s = gs::task::epoch_secs_monotonic(&ctx) as u32;
+                    at = Since::now(&ctx);
                 }
                 if next == RING {
                     next = 0;
@@ -243,10 +244,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // used `try_send` and did not wait, so this must never be the reason a service is slow.
             TRACE_OP_METRIC if b.len() >= 1 + MET_LEN => {
                 let m = &b[1..1 + MET_LEN];
-                let tsc = ctx.read_tsc();
-                if tsc.wrapping_sub(at_tsc) >= per_sec {
-                    at_s = ctx.epoch_secs_monotonic() as u32;
-                    at_tsc = tsc;
+                if at.passed(&ctx, SECOND) {
+                    at_s = gs::task::epoch_secs_monotonic(&ctx) as u32;
+                    at = Since::now(&ctx);
                 }
                 let mut owner = [0u8; PEER_LEN];
                 owner.copy_from_slice(&m[0..PEER_LEN]);

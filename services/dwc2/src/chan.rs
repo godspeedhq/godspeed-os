@@ -12,6 +12,7 @@
 //! memory directly and the device's writes are visible without an invalidate. Ring-0 cache ops are
 //! not available to a service, and this is why they are not needed.
 
+use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
@@ -402,12 +403,17 @@ fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
         // matters and the cost is bounded to a single 125 us window.
         let togo = (target.wrapping_sub(cur)) & 7;
         if togo >= 2 {
-            // Wake one microframe SHORT of the target and spin in from there. `duration_cycles` takes
-            // whole milliseconds, so the sub-millisecond figure is derived from the board's own
+            // Wake one microframe SHORT of the target and spin in from there. A millisecond sleep
+            // is too coarse, so the sub-millisecond figure is derived from the board's own
             // calibration instead - a cycle count is not a portable duration.
-            let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
+            //
+            // The sleep is in counter TICKS (`gs::task::sleep_ticks`), not `sleep_us`: it is
+            // `per_us * us` with `per_us` TRUNCATED to a whole number, and `sleep_us` rounds the rate
+            // instead. On a 19.2 MHz counter that is 19 against 19.2 ticks a microsecond, and this wait
+            // is placed to the microframe - so it keeps the arithmetic it was measured with.
+            let per_us = (wait::ticks_per_10ms(ctx) / 10_000).max(1);
             let sleep_us = (togo as u64 - 1) * 125;
-            ctx.sleep(per_us.saturating_mul(sleep_us).max(1));
+            gs::task::sleep_ticks(ctx, per_us.saturating_mul(sleep_us).max(1));
         }
     }
 }
@@ -487,7 +493,7 @@ fn stage_split_one(
                 if nyet > 500 {
                     break;
                 }
-                ctx.sleep(ctx.duration_cycles(1));
+                gs::task::sleep_ms(ctx, 1);
                 continue;
             }
             break; // NAK or XactErr: re-issue the start-split

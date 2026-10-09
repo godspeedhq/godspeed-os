@@ -26,6 +26,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
@@ -45,7 +46,7 @@ fn idle_draining(ctx: &ServiceContext) -> ! {
     // Drain by POLLING (try_recv), not a blocking recv: a cross-core flood that must WAKE a deeply-blocked
     // recv on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven
     // poll drains every quantum with no wake needed. Busy-yield is fine for this rare no-controller path.
-    loop { while ctx.try_recv().is_some() {} ctx.sleep(POLL_SLEEP_CYCLES); }
+    loop { while gs::ipc::try_recv(ctx).is_some() {} gs::task::sleep_quantum(ctx); }
 }
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
@@ -56,7 +57,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("ehci");
+    gs::trace::as_name(&ctx, "ehci");
     ctx.log("ehci: driver starting");
 
     let mmio = match ctx.ehci_mmio() {
@@ -732,8 +733,8 @@ fn wait_for_connection(
         // steps rather than a loop.
         // Drain our IPC endpoint while we idle here with no HID attached (the active path drains in
         // poll_devices). Without it a flood-storm clogs our 16-deep queue permanently - see xhci.
-        while ctx.try_recv().is_some() {}
-        ctx.sleep_ms(HOTPLUG_POLL_MS); // no HID attached: park - and actually park
+        while gs::ipc::try_recv(ctx).is_some() {}
+        gs::task::sleep_ms(ctx, HOTPLUG_POLL_MS); // no HID attached: park - and actually park
     }
 }
 
@@ -883,7 +884,7 @@ fn poll_devices(
     // nothing.
     let mut passes: u64 = 0;
     let mut work_cycles: u64 = 0;
-    let mut last_beat = ctx.read_tsc();
+    let mut last_beat = wait::Since::now(ctx);
     // Was the current pass woken by our INTx? Set from the wait, read where a report is harvested.
     let mut irq_this_pass = false;
     // Proof that interrupts are not covering HID here, so the tick floor must be polled for.
@@ -894,11 +895,14 @@ fn poll_devices(
     // the coarse kernel tick), CALIBRATED to this machine's TSC rate so ~300 ms initial / ~50 ms
     // interval holds on any CPU - hardcoding ~2 GHz made one keypress repeat into `qqqqq` on the
     // Goldmont+ Wyse. 0 (QEMU, no USB HID) falls back to the ~2 GHz cycle counts.
-    let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms());
+    let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new_calibrated(wait::ticks_per_10ms(ctx));
     let mut kb_caps = false; // Caps Lock latch (host-tracked toggle)
+    // The interrupt the kernel routed at spawn: `hwclass::EHCI` -> `EHCI_MSI_VECTOR`, the same 0x29 as
+    // `EHCI_INT_VECTOR` below. `rearm` unmasks it, as the raw unmask of `EHCI_INT_VECTOR` did.
+    let irq = gs::driver::irq::Irq::granted(ctx);
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
-        let work_t0 = ctx.read_tsc();
+        let work_t0 = wait::Since::now(ctx);
         for i in 0..n {
             let qh = POLL_BASE + i * POLL_STRIDE;
             let qtd = qh + 0x40;
@@ -927,7 +931,7 @@ fn poll_devices(
                 } else {
                     if !irq_this_pass { hid_needs_poll = true; }
                     godspeed_sdk::hid::decode_keyboard(
-                        &rep, &mut kb_last, &mut kb_rep, &mut kb_caps, ctx.read_tsc(),
+                        &rep, &mut kb_last, &mut kb_rep, &mut kb_caps, wait::ticks(ctx),
                         |ch| ctx.console_push(ch),
                         |code| ctx.log_fmt(format_args!(
                             "ehci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)),
@@ -949,7 +953,7 @@ fn poll_devices(
         }
         // Typematic auto-repeat: a held key sends no further reports, so synthesise
         // repeats from the monotonic tick while the key stays down.
-        kb_rep.poll(ctx.read_tsc(), |ch| ctx.console_push(ch));
+        kb_rep.poll(wait::ticks(ctx), |ch| ctx.console_push(ch));
         // Diagnostic (E2): does the controller actually ASSERT its interrupt? If USBSTS.USBINT
         // sets but no IPC arrives below, the controller is asserting INTx but the IOAPIC route
         // (GSI / destination) is wrong; if it never sets, the controller isn't completing
@@ -973,12 +977,12 @@ fn poll_devices(
         // (USBINTR + the drain/unmask below are belt-and-suspenders: if an INTx ever does post an
         // IPC, we drain + ack it so it can't storm; the qTD scan above is what actually reads
         // the keyboard.)
-        while ctx.try_recv().is_some() {
+        while gs::ipc::try_recv(ctx).is_some() {
             let sts = mmio.read32(op + OP_USBSTS);
             if sts & STS_INT_BITS != 0 {
                 mmio.write32(op + OP_USBSTS, sts & STS_INT_BITS); // ack: clear W1C status bits
             }
-            ctx.irq_unmask(EHCI_INT_VECTOR);
+            irq.rearm(ctx);
         }
         // PACED POLL (was a bare `yield_cpu`). Everything above still holds: this controller's INTx
         // will not drive a block-and-wake loop, so the driver must keep its own self-driven re-arm
@@ -1025,24 +1029,24 @@ fn poll_devices(
         // driver next door. Proof, not assumption: one such report and the deadline drops to the tick
         // floor for good.
         let deadline = if hid_needs_poll {
-            ctx.duration_cycles(POLL_FLOOR_MS)
+            POLL_FLOOR_MS
         } else {
-            ctx.duration_cycles(POLL_DEADLINE_MS)
+            POLL_DEADLINE_MS
         };
         if hid_needs_poll && !hid_poll_noted {
             ctx.log("ehci: a HID report arrived with no interrupt - polling input at the 10ms tick");
             hid_poll_noted = true;
         }
         passes = passes.wrapping_add(1);
-        work_cycles = work_cycles.wrapping_add(ctx.read_tsc().wrapping_sub(work_t0));
-        if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(60_000) {
-            last_beat = ctx.read_tsc();
+        work_cycles = work_cycles.wrapping_add(work_t0.elapsed_ticks(ctx));
+        if last_beat.passed(ctx, Budget::ms(60_000)) {
+            last_beat = wait::Since::now(ctx);
             ctx.log_fmt(format_args!(
                 "ehci: alive - {} passes, work {}ms, polling {}",
-                passes, work_cycles / ctx.duration_cycles(1).max(1),
+                passes, work_cycles / (wait::ticks_per_10ms(ctx) / 10).max(1),
                 if hid_needs_poll { "yes (interrupt does not cover HID)" } else { "no (interrupt-driven)" }));
         }
-        let woke = ctx.recv_timeout(deadline);
+        let woke = gs::ipc::recv_within_ms(ctx, deadline);
         // Was this pass woken by our INTx, or did the deadline simply expire? The notification is a
         // one-byte payload equal to the vector, exactly as the xHCI identifies its MSI.
         irq_this_pass = woke.as_ref().is_some_and(|m| m.payload_bytes() == [EHCI_INT_VECTOR]);
@@ -1064,8 +1068,8 @@ fn notify(ctx: &ServiceContext, msg: &str) {
     // Leading "\n " - the space is sacrificial: the framebuffer drops the first
     // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the
     // 'U' of "USB:". (Serial is unaffected.)
-    ctx.console_write("\n USB: ");
-    ctx.console_write(msg);
+    gs::io::print(ctx, "\n USB: ");
+    gs::io::print(ctx, msg);
     ctx.console_push(b'\n');
 }
 
@@ -1101,16 +1105,15 @@ const OP_CONFIGFLAG: usize = 0x40;
 const INT_USB:        u32 = 1 << 0; // USB Interrupt (a transfer with IOC completed)
 const INT_PCD:        u32 = 1 << 2; // Port Change Detect (hot-plug)
 const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
-/// Pacing for every wait in this driver. `sleep` PARKS the task, so the core can halt between
-/// passes; `yield_cpu` (what these sites used) does not sleep at all - it spins the core at ~100%.
-/// Granularity is one scheduler quantum, so any non-zero value means "one quantum": ~10 ms now that
-/// the APIC timer is PIT-calibrated, which is also the keyboard's own bInterval.
-const POLL_SLEEP_CYCLES: u64 = 1;
+// Pacing for the idle drain (`idle_draining`) is `gs::task::sleep_quantum`. It PARKS the task, so the
+// core can halt between passes; `yield_now` does not sleep at all - it spins the core at ~100%. One
+// scheduler quantum is ~10 ms now that the APIC timer is PIT-calibrated, which is also the keyboard's
+// own bInterval. (This was a constant, `POLL_SLEEP_CYCLES = 1`, passed to the raw cycle-count sleep.)
 /// Input polling floor in MILLISECONDS, for when the interrupt is proven not to cover HID.
 ///
-/// SEPARATE FROM `POLL_SLEEP_CYCLES` BECAUSE THE UNITS ARE DIFFERENT, and nothing but hardware can
-/// tell them apart: `ctx.sleep` takes CYCLES and `ctx.duration_cycles` takes MILLISECONDS, both as a
-/// bare `u64`. Passing the cycle constant to the millisecond function asked for a 1 ms deadline
+/// SEPARATE FROM the one-quantum idle pace BECAUSE THE UNITS WERE DIFFERENT, and nothing but hardware
+/// could tell them apart: the raw sleep took CYCLES and the raw deadline conversion took MILLISECONDS,
+/// both as a bare `u64`. Passing the cycle constant to the millisecond function asked for a 1 ms deadline
 /// instead of the 10 ms tick floor this comment claimed - about a thousand wakes a second, which
 /// `observe` reported as `ehci` at 100% of the core while the log looked entirely healthy.
 ///
@@ -1136,7 +1139,7 @@ const HOTPLUG_POLL_MS: u64 = 50;
 const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
 
 // Typematic auto-repeat is CALIBRATED per-machine from the TSC rate at keyboard-poll setup
-// (`KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms())`); a held key sends no further reports, so
+// (`KeyRepeat::new_calibrated(wait::ticks_per_10ms(ctx))`); a held key sends no further reports, so
 // kb_rep synthesises the repeat off its own read_tsc clock. Hardcoding ~2 GHz repeated too fast on
 // the Goldmont+ Wyse (one keypress -> `qqqqq`).
 const OP_PORTSC0:    usize = 0x44; // PORTSC[0]; +4 bytes per additional port
@@ -1218,7 +1221,7 @@ fn await_hw(ctx: &ServiceContext, budget: Budget, mut cond: impl FnMut() -> bool
         if spin.expired() {
             deadline.pause(); // a millisecond, which floors to one scheduler quantum
         } else {
-            ctx.yield_cpu();
+            gs::task::yield_now(ctx);
         }
     }
 }

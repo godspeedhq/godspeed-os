@@ -221,11 +221,11 @@ impl Job {
 }
 
 fn reply(ctx: &ServiceContext, out: &[u8]) {
-    if let Some(cap) = ctx.take_pending_cap() {
-        let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(out));
-        // Reclaim it: a reply cap is a one-shot return address handed to us inside the request, and
-        // sending on it does not consume it. Leaving it behind burns a cap-table slot per reply.
-        ctx.remove_cap(cap);
+    if let Some(cap) = gs::ipc::take_sent_cap(ctx) {
+        // `reply` sends AND reclaims: a reply cap is a one-shot return address handed to us inside the
+        // request, and sending on it does not consume it. Leaving it behind burns a cap-table slot per
+        // reply, which is why the two halves are one call.
+        let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(out));
     }
 }
 
@@ -333,7 +333,7 @@ fn fs_idempotent(ctx: &ServiceContext, mut attempt: impl FnMut() -> Fs) -> Fs {
                 }
                 // Let the machine get on with whatever is holding `fs` - a scrub, another client's
                 // transaction - instead of spending the next deadline the same way.
-                ctx.yield_cpu();
+                gs::task::yield_now(ctx);
             }
             other => return other,
         }
@@ -377,7 +377,7 @@ fn discard_partial(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &Job) {
 fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
     if job.copied >= job.total {
         job.state = ST_DONE;
-        job.ended_at = ctx.epoch_secs_monotonic() as u64;
+        job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
         ctx.log_fmt(format_args!("copier: done, {} bytes", job.total));
         return;
     }
@@ -393,7 +393,7 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
         Fs::Slow => {
             job.state = ST_FAILED;
             job.why = WHY_UNANSWERED;
-            job.ended_at = ctx.epoch_secs_monotonic() as u64;
+            job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
             ctx.log("copier: `fs` did not answer a read within the retry budget");
             discard_partial(ctx, fs, job);
             return;
@@ -401,7 +401,7 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
         _ => {
             job.state = ST_FAILED;
             job.why = WHY_READ;
-            job.ended_at = ctx.epoch_secs_monotonic() as u64;
+            job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
             discard_partial(ctx, fs, job);
             return;
         }
@@ -412,7 +412,7 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
         // gets the same answer rather than a quiet "done".
         job.state = ST_FAILED;
         job.why = WHY_READ;
-        job.ended_at = ctx.epoch_secs_monotonic() as u64;
+        job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
         ctx.log("copier: the source ended early - it changed under the copy");
         discard_partial(ctx, fs, job);
         return;
@@ -425,7 +425,7 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
         Fs::Slow => {
             job.state = ST_FAILED;
             job.why = WHY_UNANSWERED;
-            job.ended_at = ctx.epoch_secs_monotonic() as u64;
+            job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
             ctx.log("copier: `fs` did not answer a write within the retry budget");
             discard_partial(ctx, fs, job);
             return;
@@ -433,7 +433,7 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
         Fs::Failed => {
             job.state = ST_FAILED;
             job.why = WHY_WRITE;
-            job.ended_at = ctx.epoch_secs_monotonic() as u64;
+            job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
             discard_partial(ctx, fs, job);
             return;
         }
@@ -441,7 +441,7 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
     job.copied += got as u64;
     if job.copied >= job.total {
         job.state = ST_DONE;
-        job.ended_at = ctx.epoch_secs_monotonic() as u64;
+        job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
         ctx.log_fmt(format_args!("copier: done, {} bytes", job.total));
     }
 }
@@ -460,14 +460,14 @@ fn churn_step(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
     const SLOTS: u64 = 8;
     const SIZES: [usize; 4] = [64, 500, 1200, 3000];
 
-    let elapsed = (ctx.epoch_secs_monotonic() as u64).saturating_sub(job.started_at);
+    let elapsed = (gs::task::epoch_secs_monotonic(ctx) as u64).saturating_sub(job.started_at);
     if elapsed >= job.total {
         job.state = ST_DONE;
         // THE CLOCK STOPS AT THE FULL DURATION. Without this the last figure recorded was the
         // second before the deadline, so a finished churn sat at 91% - which reads as a run that
         // stopped short rather than one that completed.
         job.copied = job.total;
-        job.ended_at = ctx.epoch_secs_monotonic() as u64;
+        job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
         let mut line = [0u8; 160];
         let n = render_churn(&mut line, job);
         job.out.write(&line[..n]);
@@ -586,7 +586,7 @@ fn reply_status(ctx: &ServiceContext, job: &Job) {
     // MEASURED, not predicted. A finished job's clock stops at `ended_at`, so `jobs` does not show
     // a `done` row whose elapsed time keeps climbing - which reads as "still working" at a glance
     // and is the kind of small lie that costs an operator a real minute.
-    let now = ctx.epoch_secs_monotonic() as u64;
+    let now = gs::task::epoch_secs_monotonic(ctx) as u64;
     let end = if job.state == ST_RUNNING || job.state == ST_IDLE { now } else { job.ended_at };
     out[21..29].copy_from_slice(&end.saturating_sub(job.started_at).to_le_bytes());
     let mut n = 29;
@@ -604,7 +604,7 @@ fn reply_status(ctx: &ServiceContext, job: &Job) {
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.trace_as("copier");
+    gs::trace::as_name(&ctx, "copier");
     // ONE filesystem handle for the life of the service, because the correlation tag belongs to the
     // CHANNEL and must differ between consecutive requests. The previous code used a CONSTANT tag,
     // so a late reply to a request that had already timed out passed its own check and was read as
@@ -612,7 +612,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reachable rather than theoretical.
     let mut gfs = gs::fs::Fs::new(&ctx);
     let mut job = Job::new();
-    let wait = ctx.duration_cycles(IDLE_MS);
     ctx.log("copier: ready (idle - `background copy <src> <dst>` begins a copy)");
 
     loop {
@@ -623,7 +622,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // answered every iteration. Exactly the shape `recorder`'s pre-fill needed, for the same
         // reason and after the same mistake.
         let running = job.state == ST_RUNNING;
-        let incoming = if running { ctx.try_recv() } else { ctx.recv_timeout(wait) };
+        let incoming = if running { gs::ipc::try_recv(&ctx) } else { gs::ipc::recv_within_ms(&ctx, IDLE_MS) };
 
         if let Some(msg) = incoming {
             let p = msg.payload_bytes();
@@ -672,7 +671,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // unbounded churn is a service that never stops writing to somebody's disk.
                         fresh.total = if param == 0 || param > 3600 { 30 } else { param };
                         fresh.state = ST_RUNNING;
-                        fresh.started_at = ctx.epoch_secs_monotonic() as u64;
+                        fresh.started_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
                         job = fresh;
                         job.out.clear();
                         job.out.write(b"churn: writing continuously - CUT THE POWER AT ANY POINT\n");
@@ -684,7 +683,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
                     if kind == KIND_CHECK || kind == KIND_SCRUB {
                         fresh.state = ST_RUNNING;
-                        fresh.started_at = ctx.epoch_secs_monotonic() as u64;
+                        fresh.started_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
                         job = fresh;
                         job.out.clear();
                         job.out.write(if kind == KIND_SCRUB {
@@ -708,7 +707,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         } else {
                             gfs.check().map(|v| (v.files, v.dirs, v.bad, v.free, v.free_before))
                         };
-                        job.ended_at = ctx.epoch_secs_monotonic() as u64;
+                        job.ended_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
                         match fsr(&ctx, if kind == KIND_SCRUB { "scrub" } else { "check" },
                                   verdict.map(|_| 0)) {
                             Fs::Ok(_) => {
@@ -740,7 +739,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // wait for both.
                     if kind == KIND_DELETE_TREE {
                         fresh.state = ST_RUNNING;
-                        fresh.started_at = ctx.epoch_secs_monotonic() as u64;
+                        fresh.started_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
                         job = fresh;
                         job.out.clear();
                         job.out.write(b"deleting a subtree\n");
@@ -755,7 +754,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         let outcome = fsr(&ctx, "delete-tree",
                                           gfs.delete_all(&job.src[..job.slen]).map(|_| 0));
                         let _ = &mut sink;
-                        job.ended_at = ctx.epoch_secs_monotonic() as u64;
+                        job.ended_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
                         match outcome {
                             Fs::Ok(_) => {
                                 job.state = ST_DONE;
@@ -812,7 +811,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         continue;
                     }
                     fresh.state = ST_RUNNING;
-                    fresh.started_at = ctx.epoch_secs_monotonic() as u64;
+                    fresh.started_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
                     job = fresh;
                     job.out.clear();
                     job.out.write(b"copying\n");
@@ -828,7 +827,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // be a cancel that says it worked and did nothing.
                     if job.state == ST_RUNNING {
                         job.state = ST_CANCELLED;
-                        job.ended_at = ctx.epoch_secs_monotonic() as u64;
+                        job.ended_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
                         if job.kind == KIND_COPY {
                             discard_partial(&ctx, &mut gfs, &job);
                         }

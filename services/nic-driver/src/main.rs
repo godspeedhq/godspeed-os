@@ -31,7 +31,7 @@
 
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{CapHandle, ServiceContext, Message, Mmio, Dma};
+use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
 ///
@@ -248,7 +248,7 @@ const RTL_QUIESCE_MS: u64 = 10;
 fn await_tx(ctx: &ServiceContext, mut done: impl FnMut() -> bool) {
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(TX_CONFIRM_MS));
     while !done() && !deadline.expired() {
-        ctx.yield_cpu();
+        godspeed::task::yield_now(ctx);
     }
 }
 
@@ -352,12 +352,18 @@ fn rtl_arm_rx(arena: &Dma, i: usize) {
 }
 
 /// Answer a request on `reply_cap` and give the capability back - both halves, every time, so a reply
-/// slot cannot leak (CLAUDE.md 8.5). `gs::ipc::reply` is the same call on a `gs` capability; the
-/// radio bridge keeps the raw handle a held request arrived with (`radio.rs`), so this serve loop
-/// answers by handle. The outcome is counted, never discarded (`note_reply`).
-fn answer(ctx: &ServiceContext, reply_cap: CapHandle, body: &[u8], fails: &mut u32) {
-    note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(body)), ctx, fails);
-    ctx.remove_cap(reply_cap);
+/// slot cannot leak (CLAUDE.md 8.5); `gs::ipc::reply` is the two as one call. The outcome is counted,
+/// never discarded (`note_reply`).
+fn answer(ctx: &ServiceContext, reply_cap: godspeed::cap::Cap, body: &[u8], fails: &mut u32) {
+    note_reply(godspeed::ipc::reply(ctx, reply_cap, &Message::from_bytes(body)), ctx, fails);
+}
+
+/// Counter ticks in `ms` milliseconds, for the deadlines this driver keeps in ticks: at least one, and
+/// one on a machine whose counter the kernel could not calibrate. The conversion the SDK's
+/// `duration_cycles` made, kept exactly, because a deadline here is compared with one counter read.
+pub(crate) fn cycles(ctx: &ServiceContext, ms: u64) -> u64 {
+    let per_10ms = godspeed::driver::wait::ticks_per_10ms(ctx);
+    if per_10ms == 0 { 1 } else { (per_10ms.saturating_mul(ms) / 10).max(1) }
 }
 
 /// Realtek RTL8168 C+ TX/RX (Phase 4, STAGE B): set up the C+ descriptor rings in the DMA arena, enable
@@ -450,7 +456,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             Some(h) => h,
             None => {
                 let req = godspeed::ipc::recv(ctx);
-                match godspeed::ipc::take_sent_cap(ctx) { Some(c) => (req, c.handle()), None => continue }
+                match godspeed::ipc::take_sent_cap(ctx) { Some(c) => (req, c), None => continue }
             }
         };
         // THE CABLE, read live on every request: PHYSTATUS is one register read, not the MDIO
@@ -500,7 +506,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             mmio.write32(RTL_DTCCR + 4, (tbuf >> 32) as u32);
             mmio.write32(RTL_DTCCR, ((tbuf as u32) & !0x3F) | 0x08);   // 64B-aligned addr | Dump
             let mut td = 0u32;
-            while td < TALLY_POLL_MAX && mmio.read32(RTL_DTCCR) & 0x08 != 0 { ctx.yield_cpu(); td += 1; }
+            while td < TALLY_POLL_MAX && mmio.read32(RTL_DTCCR) & 0x08 != 0 { godspeed::task::yield_now(ctx); td += 1; }
             if td >= TALLY_POLL_MAX && !tally_wedged_logged {
                 // The counter dump did not complete - the NIC's DMA is slow/wedged. Report it ONCE (not
                 // per query - that would spam) and carry on: the counters read zero (a degraded `net stats`),
@@ -562,7 +568,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                     rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                     break;
                 }
-                ctx.yield_cpu();
+                godspeed::task::yield_now(ctx);
                 rs += 1;
             }
             if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
@@ -614,7 +620,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                     rtl_arm_rx(arena, rx_idx);                  // give the descriptor back to the NIC
                     rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                 } else {
-                    ctx.yield_cpu();
+                    godspeed::task::yield_now(ctx);
                     rs += 1;
                 }
             }
@@ -649,7 +655,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                     mmio.write32(RTL_DTCCR, ((tb as u32) & !0x3F) | 0x08);
                     let mut td = 0u32;
                     while td < TALLY_POLL_MAX && mmio.read32(RTL_DTCCR) & 0x08 != 0 {
-                        ctx.yield_cpu(); td += 1;
+                        godspeed::task::yield_now(ctx); td += 1;
                     }
                     let phy = mmio.read8(RTL_PHYSTATUS);
                     ctx.log_fmt(format_args!(
@@ -823,18 +829,18 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
     loop {
-        let req = ctx.recv();
-        let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        let req = godspeed::ipc::recv(ctx);
+        let reply_cap = match godspeed::ipc::take_sent_cap(ctx) { Some(c) => c, None => continue };
         let p = req.payload_bytes();
         if p.len() == 1 && p[0] == 3 {
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(sreply)), &ctx, &mut reply_fails);
+            note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(sreply)), &ctx, &mut reply_fails);
         } else {
             // Unrecognised op: still ANSWER. An empty reply was undeliverable on three ports until
             // `e3fcf7ed`, so this used to leave the caller waiting out its deadline for a request the
             // driver had already decided it would not serve. One byte says so.
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1u8])), &ctx, &mut reply_fails);
+            note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&[1u8])), &ctx, &mut reply_fails);
         }
-        ctx.remove_cap(reply_cap);
+        godspeed::cap::remove(ctx, reply_cap);
     }
 }
 
@@ -957,7 +963,8 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         // the desync described at length above and must not happen. `Err(_)` is the send FAILING -
         // our wiring names a dwc2 that no longer exists, so nothing is in flight and nothing can
         // arrive late. Those are opposite conditions and only the second is safe to repeat, which is
-        // why `request_with_reply_call` (which collapses both to `None`) is the wrong primitive here.
+        // why `request_with_reply_call` (which collapses both to `None`) is the wrong primitive here, and why
+        // this is `gs::call::request_once` rather than `request_within`: the retry is this code's own.
         //
         // It matters because it is the ordinary case, not an edge one. `find_send_slot` reads
         // spawn-time wiring, so a dwc2 respawned AFTER us is unreachable forever unless we reacquire
@@ -969,19 +976,19 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         //
         // ONE retry, not a loop: a dwc2 that is genuinely gone must surface as a failure rather than
         // as a request that never returns.
-        let got = match ctx.request_with_reply_call_err("dwc2", msg, DWC2_SECS) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
+        let got = match godspeed::call::request_once(ctx, "dwc2", msg, DWC2_SECS) {
+            Ok(r) => r,
+            Err(godspeed::Error::OutcomeUnknown) => {
                 rpc_timeouts.set(rpc_timeouts.get().saturating_add(1));
                 return None;
             }
             Err(_) => {
-                if !ctx.reacquire_by_name("dwc2") {
+                if !godspeed::cap::reacquire(ctx, "dwc2") {
                     rpc_sendfail.set(rpc_sendfail.get().saturating_add(1));
                     return None;
                 }
-                match ctx.request_with_reply_call_err("dwc2", msg, DWC2_SECS) {
-                    Ok(Some(r)) => {
+                match godspeed::call::request_once(ctx, "dwc2", msg, DWC2_SECS) {
+                    Ok(r) => {
                         // Loud ONCE (§26.7): a silent recovery here is how the stale cap went
                         // unnoticed in the first place. Bounded so a genuinely absent dwc2 cannot
                         // turn this into a log flood on a service that runs per frame.
@@ -993,7 +1000,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                         }
                         r
                     }
-                    Ok(None) => {
+                    Err(godspeed::Error::OutcomeUnknown) => {
                         rpc_timeouts.set(rpc_timeouts.get().saturating_add(1));
                         return None;
                     }
@@ -1103,7 +1110,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         for _ in 0..RX_TRIES {
             let n = dev_rx(ctx, buf);
             if n > 0 { return n; }
-            ctx.yield_cpu();                      // give the device / QEMU a moment to queue a frame
+            godspeed::task::yield_now(ctx);                       // give the device / QEMU a moment to queue a frame
         }
         0
     };
@@ -1117,7 +1124,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             Some(h) => h,
             None => {
                 let r = godspeed::ipc::recv(&ctx);
-                match godspeed::ipc::take_sent_cap(&ctx) { Some(c) => (r, c.handle()), None => continue }
+                match godspeed::ipc::take_sent_cap(&ctx) { Some(c) => (r, c), None => continue }
             }
         };
         let p = _req.payload_bytes();
@@ -1141,16 +1148,16 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 mac.copy_from_slice(&ni[0..6]);
             }
             let out = radio::status(&ctx, &mut radio, cable, mac, &mut carrier);
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 10 {
             // WHICH ACCESS POINT carries the radio's link - asked only after STATUS has said the radio does.
             let out = radio::peer(&ctx, &mut radio, cable);
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
             let mut rx = [0u8; FRAME_MAX];
             let n = if cable { rx_one(&ctx, &mut rx) } else { radio.rx(&ctx, &mut rx) };
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n])), &ctx, &mut reply_fails);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&rx[..n])), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes].
             let mut out = [0u8; BATCH_MSG_MAX];
@@ -1172,7 +1179,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 count += 1;
             }
             out[0] = count;
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
             // UNSUPPORTED on this backend - answered `[0]`, not `[1]`.
             //
@@ -1185,7 +1192,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // Op 5 is a register dump; answering 1 byte to a caller expecting 25 is the same lie in
             // miniature. The original comment was right that a caller must not hang and wrong that an
             // ack was the remedy: the caller needs an ANSWER, and "not supported here" is one.
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
         } else {
             // TX FRAME (any multi-byte payload). TRANSMIT ONLY - the reply carries NO received frame.
             //
@@ -1242,9 +1249,9 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             //
             // 0 = sent. `fs` reached the same conclusion for its own protocol and wrote it down
             // there: an empty reply is not an answer.
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
         }
-        ctx.remove_cap(reply_cap);
+        godspeed::cap::remove(&ctx, reply_cap);
     }
 }
 
@@ -1256,7 +1263,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("nic-driver");
+    godspeed::trace::as_name(&ctx, "nic-driver");
     ctx.log("nic-driver: starting");
 
     // ---- WHICH MAC IS ON THIS BOARD. The one decision in this service that is still asked of the
@@ -1420,9 +1427,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
     loop {
-        let req = ctx.recv();
+        let req = godspeed::ipc::recv(&ctx);
         // The reply cap is the ONLY authority to answer net-stack (Commandment VII, §8.5).
-        let reply_cap = match ctx.take_pending_cap() {
+        let reply_cap = match godspeed::ipc::take_sent_cap(&ctx) {
             Some(c) => c,
             None => { ctx.log("nic-driver: frame request had no reply cap - dropping"); continue; }
         };
@@ -1446,8 +1453,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             sreply[1..7].copy_from_slice(&e1000_mac);
             sreply[7] = mmio.as_ref()
                 .map_or(0, |m| ((m.read32(REG_STATUS) >> 1) & 1) as u8);
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&sreply)), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&sreply)), &ctx, &mut reply_fails);
+            godspeed::cap::remove(&ctx, reply_cap);
             continue;
         }
 
@@ -1469,8 +1476,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                 }
             }
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&rxbuf[..n])), &ctx, &mut reply_fails);
+            godspeed::cap::remove(&ctx, reply_cap);
             continue;
         }
 
@@ -1511,8 +1518,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
             }
             out[0] = nfr;
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
+            godspeed::cap::remove(&ctx, reply_cap);
             continue;
         }
 
@@ -1528,8 +1535,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 s[17..21].copy_from_slice(&m.read32(REG_RDH).to_le_bytes());
                 s[21..25].copy_from_slice(&m.read32(REG_RDT).to_le_bytes());
             }
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
+            godspeed::cap::remove(&ctx, reply_cap);
             continue;
         }
 
@@ -1596,7 +1603,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // TX_CONFIRM_MS. No caller needs the distinction today, but a driver that knows and says
         // nothing is the silent degradation §26.7 forbids.
         let tx_status: u8 = if tx_confirmed { 0 } else { 1 };
-        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[tx_status])), &ctx, &mut reply_fails);
-        ctx.remove_cap(reply_cap);
+        note_reply(godspeed::ipc::try_send_to(&ctx, reply_cap, &Message::from_bytes(&[tx_status])), &ctx, &mut reply_fails);
+        godspeed::cap::remove(&ctx, reply_cap);
     }
 }

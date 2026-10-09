@@ -359,8 +359,8 @@ impl Session {
             reqid: 0,
             stats: Stats::default(),
             trace: Trace::new(),
-            t0: ctx.read_tsc(),
-            cycles_per_ms: ctx.tsc_ticks_per_10ms() / 10,
+            t0: godspeed::driver::wait::ticks(ctx),
+            cycles_per_ms: godspeed::driver::wait::ticks_per_10ms(ctx) / 10,
             glom_lengths: [0; MAX_SUBS],
             glom_count: 0,
             tx_max_seq: 0,
@@ -383,7 +383,7 @@ impl Session {
         if self.cycles_per_ms == 0 {
             return 0;
         }
-        (ctx.read_tsc().wrapping_sub(self.t0) / self.cycles_per_ms) as u32
+        (godspeed::driver::wait::ticks(ctx).wrapping_sub(self.t0) / self.cycles_per_ms) as u32
     }
 
     /// A control request went out.
@@ -919,7 +919,7 @@ fn query_raw(
                 }
                 return Some(n);
             }
-            None => ctx.sleep_ms(1),
+            None => godspeed::task::sleep_ms(ctx, 1),
         }
     }
     s.stats.ctrl_unanswered += 1;
@@ -1321,7 +1321,7 @@ pub fn set_cmd(
             // is what prevents it; the trace shows the match.
             return true;
         }
-        ctx.sleep_ms(1);
+        godspeed::task::sleep_ms(ctx, 1);
     }
     s.stats.ctrl_unanswered += 1;
     ctx.log_fmt(format_args!(

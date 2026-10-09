@@ -39,6 +39,7 @@ mod regs;
 mod rtl;
 
 use godspeed as gs;
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
 
 /// How often to report, in ms. Long enough not to be noise, short enough that a boot answers the
@@ -111,9 +112,9 @@ fn usb_irq(
     *irq_frames = irq_frames.saturating_add(got as u64);
     let radio_halted = radio.map(|r| rtl::service(ctx, m, d, r)).unwrap_or(false);
     if got == 0 && !radio_halted {
-        ctx.sleep(ctx.duration_cycles(REARM_SERVICED_MS));
+        gs::task::sleep_ms(ctx, REARM_SERVICED_MS);
     }
-    ctx.irq_unmask(USB_VECTOR);
+    gs::driver::irq::Irq::granted(ctx).rearm(ctx);
 }
 
 /// Route one request to the block server or the frame server.
@@ -151,8 +152,8 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // CONSOLE ONLY. The port-level detail is already logged beside every call site, and
     // logging here as well printed each notice TWICE in the serial capture - once from the
     // events and once from the console, which shares the same line.
-    ctx.console_write("\r\n");
-    ctx.console_writeln_fmt(args);
+    gs::io::print(ctx, "\r\n");
+    gs::io::println_fmt(ctx, args);
     // GIVE THE PROMPT BACK. The shell reads byte 10 as Enter, so this makes it redraw `gsh>`
     // under the notice - otherwise the cursor is left below a line the user did not type and
     // the machine looks like it is waiting for something.
@@ -167,13 +168,12 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
 }
 
 fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
-    match ctx.take_pending_cap() {
+    match gs::ipc::take_sent_cap(ctx) {
         Some(reply) => {
             // STATUS_ERR, and one byte only: shorter than any real reply, so a reader that checks
             // the status and a reader that checks the length both take their error path.
-            let _ = ctx.try_send_by_handle(
-                reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
-            ctx.remove_cap(reply);
+            let _ = gs::ipc::reply(
+                ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
         }
         None => {
             if !*capless {
@@ -201,8 +201,8 @@ fn dispatch(
         rtl::report_device(ctx, radio.as_deref());
         return true;
     }
-    // Taken through `gs`: the radio answers with `gs::ipc::reply`; the disk and net servers still take the
-    // raw handle (`Cap::handle`).
+    // Taken through `gs`, and answered through it: every server below replies with `gs::ipc::reply`,
+    // which gives the one-shot capability back as part of answering.
     let reply = match gs::ipc::take_sent_cap(ctx) {
         Some(c) => c,
         None => {
@@ -219,15 +219,13 @@ fn dispatch(
         rtl::serve(ctx, m, d, radio, msg, reply);
         return true;
     }
-    let reply = reply.handle();
     if p[0] >= net::OP_NET_INFO {
         if let Some((n, nt)) = nic {
             return net::serve(ctx, m, d, nt, n, msg, reply);
         }
         // A net request with no NIC bound is answered, not ignored: the client is blocked waiting,
         // and an empty reply degrades it where silence would hang it.
-        let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&[0u8]));
-        ctx.remove_cap(reply);
+        let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[0u8]));
         return true;
     }
     match disk {
@@ -237,8 +235,7 @@ fn dispatch(
         // EVERY request this way, net and radio included, because the no-disk paths never routed by
         // op: `wifi-usb`'s first QEMU boot got a disk error back to its INFO (2026-10-05).
         None => {
-            let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
-            ctx.remove_cap(reply);
+            let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
             true
         }
     }
@@ -252,7 +249,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("dwc2");
+    gs::trace::as_name(&ctx, "dwc2");
     // PREFIX `dwc2-svc:`, not `dwc2:`.
     //
     // The IN-KERNEL driver already owns the `dwc2:` prefix and prints heavily - hub ports, MSC
@@ -521,8 +518,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // shared path, not an arm32-only shim. The vector is `USB_VECTOR`, at the top of this file.
     let mut irqs: u64 = 0;
     let mut msgs: u64 = 0;
-    let mut last_report = ctx.read_tsc();
-    let boot_tsc = ctx.read_tsc();
+    let mut last_report = wait::Since::now(&ctx);
+    let boot_tsc = wait::ticks(&ctx);
     let mut quiet_swept = false;
     let mut first_logged = false;
 
@@ -545,10 +542,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // announced giving up. Both reset the moment the keyboard actually works again.
         let mut recoveries_in_a_row = 0u32;
         let mut recovery_gave_up = false;
-        let mut gave_up_at = 0u64;
+        let mut gave_up_at: Option<wait::Since> = None;
         // When the hub's transaction translator was last reset. Rate-limits the rung so a fault it
         // cannot fix falls through to the port reset instead of looping on it.
-        let mut tt_reset_at = 0u64;
+        let mut tt_reset_at: Option<wait::Since> = None;
         // Set when the keyboard has been re-bound but has not yet delivered a report.
         //
         // The driver used to announce "RECOVERED by re-enumeration" the instant the device re-bound.
@@ -561,7 +558,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         /// dead device costs nothing, short enough that a transient storm is not a permanent loss.
         const RECOVERY_BACKOFF_MS: u64 = 10_000;
         let mut reports: u64 = 0;
-        let mut last_beat = ctx.read_tsc();
+        let mut last_beat = wait::Since::now(&ctx);
         // The interval the DEVICE asked for, floored to something a service can actually schedule.
         // `cycles_to_ticks` clamps sub-quantum sleeps to one 10 ms tick, so anything finer is
         // fiction here - and saying so beats pretending to honour a 1 ms interval.
@@ -611,12 +608,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // This says ARMED, not "interrupt-driven". Whether interrupts actually arrive is a fact
         // about the hardware, and the `USB IRQ` counters below are what report it. A status line
         // that asserts the outcome is how a claim outlives the thing it described.
-        ctx.irq_unmask(USB_VECTOR);
+        // The vector the kernel routed at spawn: `hwclass::DWC2` -> `DWC2_VECTORS`, which on arm is
+        // `[USB_VECTOR]` - the same 0x29 this file names. `rearm` unmasks it.
+        gs::driver::irq::Irq::granted(&ctx).rearm(&ctx);
         ctx.log("dwc2-svc: USB vector armed - see the 'USB IRQ' counters for whether it fires");
 
         loop {
             passes = passes.wrapping_add(1);
-            let t_pass = ctx.read_tsc();
+            let t_pass = wait::Since::now(&ctx);
             let mut served_this_pass = 0u32;
             // Drain block requests, BOUNDED - the endpoint queue is 16 deep, so this is a storm
             // detector rather than a throttle (the same bound the xhci service needed after an
@@ -627,7 +626,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // either way.
             if disk.is_none() {
                 let mut drained = 0u32;
-                while let Some(msg) = ctx.try_recv() {
+                while let Some(msg) = gs::ipc::try_recv(&ctx) {
                     drained += 1;
                     if is_usb_irq(&msg) {
                         usb_irq(&ctx, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
@@ -663,8 +662,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 //
                 // What this cannot bound alone is a SINGLE slow operation, which is why the transmit
                 // budget was cut to match. The two together bound the pass.
-                while ctx.read_tsc().wrapping_sub(t_pass) <= ctx.duration_cycles(PASS_BUDGET_MS) {
-                    let msg = match ctx.try_recv() {
+                while !t_pass.passed(&ctx, Budget::ms(PASS_BUDGET_MS)) {
+                    let msg = match gs::ipc::try_recv(&ctx) {
                         Some(m) => m,
                         None => break,
                     };
@@ -820,8 +819,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
 
-            let t_kbd = ctx.read_tsc();
-            seg_serve = seg_serve.wrapping_add(t_kbd.wrapping_sub(t_pass));
+            seg_serve = seg_serve.wrapping_add(t_pass.elapsed_ticks(&ctx));
+            let t_kbd = wait::Since::now(&ctx);
             if let Some((k, kt, ksplt)) = kbd.as_ref() {
             // AN ENDPOINT STUCK IN XACTERR IS RE-ENUMERATED, not polled forever.
             //
@@ -850,8 +849,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // Cold, with no clear behind it, the generous budget stays: ordinary XACTERR noise on a
             // low-speed device behind a translator must never trigger a port reset.
-            let recently_cleared = state.cleared_at != 0
-                && ctx.read_tsc().wrapping_sub(state.cleared_at) < ctx.duration_cycles(2000);
+            let recently_cleared = state.cleared_at
+                .is_some_and(|at| !at.passed(&ctx, Budget::ms(2000)));
             // 30 after a failed clear, not 10. Ten was part of the same regression: paired with a
             // NYET threshold below the noise floor it turned every ordinary error run into a port
             // reset, 394 times over. Thirty (~300 ms) still shortens the pause materially against the
@@ -876,8 +875,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // 500 ms without end. Three attempts at tuning the THRESHOLD produced this same shape
             // three times; the floor is what none of them had.
             const REENUM_MIN_MS: u64 = 10_000;
-            let reenum_ready = state.reenum_at == 0
-                || ctx.read_tsc().wrapping_sub(state.reenum_at) >= ctx.duration_cycles(REENUM_MIN_MS);
+            let reenum_ready = state.reenum_at
+                .map_or(true, |at| at.passed(&ctx, Budget::ms(REENUM_MIN_MS)));
             let clears_stuck = state.clears_since_data >= CLEARS_STUCK && reenum_ready;
             if (state.xacterr_run >= stuck_at && reenum_ready) || clears_stuck {
                 state.xacterr_run = 0;
@@ -897,12 +896,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // 3 s window. If the fault survives that, the run climbs again and the port reset
                 // below still happens - this rung delays the expensive one by ~300 ms, never replaces
                 // it.
-                let now_tsc = ctx.read_tsc();
-                let recently_reset_tt = tt_reset_at != 0
-                    && now_tsc.wrapping_sub(tt_reset_at) < ctx.duration_cycles(3000);
+                let now_tsc = wait::Since::now(&ctx);
+                let recently_reset_tt = tt_reset_at
+                    .is_some_and(|at| !at.passed(&ctx, Budget::ms(3000)));
                 if recently_cleared && !recently_reset_tt {
-                    tt_reset_at = now_tsc;
-                    state.cleared_at = 0;
+                    tt_reset_at = Some(now_tsc);
+                    state.cleared_at = None;
                     let _ = hub::reset_tt(&ctx, &m, &d, &hub_t, hub_port, hub_multi_tt);
                     continue;
                 }
@@ -917,8 +916,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         hub_port));
                 }
                 state.clears_since_data = 0;
-                state.reenum_at = ctx.read_tsc();
-                state.cleared_at = 0;
+                state.reenum_at = Some(wait::Since::now(&ctx));
+                state.cleared_at = None;
                 let mut addr = kt.addr; // re-assign the address it already had
                 // A RECOVERY THAT RUNS IN A LOOP IS NOT A RECOVERY.
                 //
@@ -945,12 +944,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // per backoff window, not a loop.
                     if !recovery_gave_up {
                         recovery_gave_up = true;
-                        gave_up_at = ctx.read_tsc();
+                        gave_up_at = Some(wait::Since::now(&ctx));
                         ctx.log_fmt(format_args!(
                             "dwc2-svc: keyboard re-enumerated {} times without settling - backing off for                              {} s. Input is dead meanwhile; storage and networking are unaffected.",
                             recoveries_in_a_row, RECOVERY_BACKOFF_MS / 1000));
                     }
-                    if ctx.read_tsc().wrapping_sub(gave_up_at) < ctx.duration_cycles(RECOVERY_BACKOFF_MS) {
+                    if gave_up_at.is_some_and(|at| !at.passed(&ctx, Budget::ms(RECOVERY_BACKOFF_MS))) {
                         continue;
                     }
                     // Window elapsed: allow ONE fresh attempt, and say so, so a keyboard that keeps
@@ -1007,7 +1006,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // A real report is proof the endpoint is healthy: the streak starts over.
                 recoveries_in_a_row = 0;
                 recovery_gave_up = false;
-                tt_reset_at = 0;
+                tt_reset_at = None;
                 if awaiting_report {
                     awaiting_report = false;
                     ctx.log("dwc2-svc: keyboard RECOVERED - reports are flowing again");
@@ -1018,10 +1017,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
             }
-            let t_rest = ctx.read_tsc();
-            seg_kbd = seg_kbd.wrapping_add(t_rest.wrapping_sub(t_kbd));
-            if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
-                last_beat = ctx.read_tsc();
+            seg_kbd = seg_kbd.wrapping_add(t_kbd.elapsed_ticks(&ctx));
+            if last_beat.passed(&ctx, Budget::ms(HEARTBEAT_MS)) {
+                last_beat = wait::Since::now(&ctx);
                 // Report the busy counts as a RATIO against completed commands. A total says the
                 // device is slow; a ratio says which stage is making it slow, which is the thing
                 // that can be acted on.
@@ -1029,7 +1027,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     .as_ref()
                     .map(|(d, _, _)| (d.busy_cbw, d.busy_data, d.busy_csw, d.commands))
                     .unwrap_or((0, 0, 0, 0));
-                let ms = ctx.duration_cycles(1).max(1);
+                let ms = (wait::ticks_per_10ms(&ctx) / 10).max(1);
                 // THE DRIVER CHECKS ITS OWN HARDWARE, on its own heartbeat.
                 //
                 // This check used to run only inside the OP_NET_INFO handler - so it happened only
@@ -1059,14 +1057,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // callers, and it cost two boots to notice.
                 if !quiet_swept {
                     quiet_swept = true;
-                    let per_us = (ctx.tsc_ticks_per_10ms() / 10_000).max(1);
+                    let per_us = (wait::ticks_per_10ms(&ctx) / 10_000).max(1);
                     for want_us in [125u64, 2000] {
                         let want = per_us.saturating_mul(want_us).max(1);
                         let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
                         for _ in 0..16 {
-                            let t0 = ctx.read_tsc();
-                            ctx.sleep(want);
-                            let d = ctx.read_tsc().wrapping_sub(t0);
+                            let t0 = wait::Since::now(&ctx);
+                            // A sleep of `want` counter ticks, from the truncated per-us rate this
+                            // measurement has always used. `gs::task::sleep_us` rounds the rate
+                            // differently, which would change what is being measured.
+                            gs::task::sleep_ticks(&ctx, want);
+                            let d = t0.elapsed_ticks(&ctx);
                             lo = lo.min(d); hi = hi.max(d); sum += d;
                         }
                         ctx.log_fmt(format_args!(
@@ -1174,8 +1175,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let _ = rtl::service(&ctx, &m, &d, r);
             }
             if served_this_pass == 0 {
-                let t_sleep = ctx.read_tsc();
-                if let Some(msg) = ctx.recv_timeout(ctx.duration_cycles(period_ms)) {
+                let t_sleep = wait::Since::now(&ctx);
+                if let Some(msg) = gs::ipc::recv_within_ms(&ctx, period_ms) {
                     if is_usb_irq(&msg) {
                         usb_irq(&ctx, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
                     } else if let Some(bound_disk) = disk.as_mut() {
@@ -1191,7 +1192,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         }
                     }
                 }
-                seg_sleep = seg_sleep.wrapping_add(ctx.read_tsc().wrapping_sub(t_sleep));
+                seg_sleep = seg_sleep.wrapping_add(t_sleep.elapsed_ticks(&ctx));
             }
         }
     }
@@ -1206,10 +1207,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `try_recv` below then found an empty queue, and the service reported `0 USB IRQ(s)` on a
         // boot where the kernel's own `deliver() vector=0x29` line proves the interrupt had been
         // delivered. A discarded return value, reporting the opposite of what happened.
-        let mut first = ctx.recv_timeout(ctx.duration_cycles(REPORT_MS));
+        let mut first = gs::ipc::recv_within_ms(&ctx, REPORT_MS);
 
         let mut drained = 0u32;
-        while let Some(m) = first.take().or_else(|| ctx.try_recv()) {
+        while let Some(m) = first.take().or_else(|| gs::ipc::try_recv(&ctx)) {
             drained += 1;
             if drained >= MSG_DRAIN_MAX {
                 ctx.log("dwc2-svc: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
@@ -1240,8 +1241,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // A real driver will not need this: it earns its unmask by servicing the device, which
                 // deasserts the line. This is the cheapest way to ask "can it happen twice?" without
                 // writing the driver first.
-                ctx.sleep(ctx.duration_cycles(REARM_MS));
-                ctx.irq_unmask(USB_VECTOR);
+                gs::task::sleep_ms(&ctx, REARM_MS);
+                gs::driver::irq::Irq::granted(&ctx).rearm(&ctx);
 
                 // (Retained for the record - the reasoning that made the previous build a proof of
                 // delivery rather than a livelock.)
@@ -1265,8 +1266,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
 
-        if ctx.read_tsc().wrapping_sub(last_report) > ctx.duration_cycles(REPORT_MS) {
-            last_report = ctx.read_tsc();
+        if last_report.passed(&ctx, Budget::ms(REPORT_MS)) {
+            last_report = wait::Since::now(&ctx);
             // Report BOTH counts, because they answer different questions: `irqs` says the routing
             // works, `msgs` says whether anything else is arriving on this endpoint. Zero irqs with
             // nonzero msgs would mean the endpoint is live and the ROUTE is not - a different fault

@@ -12,6 +12,7 @@
 //! transfers nothing. Enumerating the hub first means that risk is faced on its own, against a device
 //! tree already known to be reachable, rather than tangled with "does addressing even work".
 
+use godspeed as gs;
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::chan::{self, Target};
@@ -99,7 +100,7 @@ fn set_address(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, addr: u
     }
     // USB 2.0 9.2.6.3: the device has 2 ms to commit the new address. Everything after this talks to
     // a different address, so going early loses the device with no error anywhere.
-    ctx.sleep(ctx.duration_cycles(5));
+    gs::task::sleep_ms(ctx, 5);
     true
 }
 

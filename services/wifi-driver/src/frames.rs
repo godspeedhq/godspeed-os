@@ -179,7 +179,7 @@ fn pairwise_rekey(
             Some(f) => f,
             None => {
                 empty += 1;
-                ctx.sleep_ms(1);
+                godspeed::task::sleep_ms(ctx, 1);
                 continue;
             }
         };

@@ -14,6 +14,7 @@
 //! Register sequence reimplemented from the behaviour of a working polled bare-metal reference (bztsrc's
 //! raspi tutorial `sd.c`) + the BCM2835 peripherals datasheet section 5 (EMMC); no code copied.
 
+use godspeed as gs;
 use godspeed_sdk::{Message, Mmio, ServiceContext};
 
 // Register offsets from the EMMC base.
@@ -410,14 +411,14 @@ impl<'a> Sd<'a> {
 /// Reply non-blocking, and say so if it could not be delivered. See `Reply::send` in main.rs for why a
 /// blocking reply here is a deadlock and not a style preference (§8.9), and why logging every failure
 /// is bounded by the protocol rather than needing a rate limit.
-fn reply_send(ctx: &ServiceContext, reply: godspeed_sdk::CapHandle, msg: &Message) {
-    if ctx.try_send_by_handle(reply, msg).is_err() {
+fn reply_send(ctx: &ServiceContext, reply: gs::cap::Cap, msg: &Message) {
+    if gs::ipc::try_send_to(ctx, reply, msg).is_err() {
         ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
     }
 }
 
 /// Decode one block-IPC request and reply. Mirrors the AHCI backend's `serve` (same wire protocol).
-fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: godspeed_sdk::CapHandle) {
+fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: gs::cap::Cap) {
     use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
     let err = |ctx: &ServiceContext| { reply_send(ctx, reply, &Message::from_bytes(&[STATUS_ERR])); };
     if p.is_empty() { return err(ctx); }
@@ -476,18 +477,18 @@ pub fn run(ctx: &ServiceContext, mmio: &Mmio) -> ! {
     if !sd.init(ctx) {
         ctx.log("block-driver: no usable SD card - serving errors so fs never hangs");
         loop {
-            let _msg = ctx.recv();
-            if let Some(reply) = ctx.take_pending_cap() {
+            let _msg = gs::ipc::recv(ctx);
+            if let Some(reply) = gs::ipc::take_sent_cap(ctx) {
                 reply_send(ctx, reply, &Message::from_bytes(&[super::STATUS_ERR]));
-                ctx.remove_cap(reply);
+                gs::cap::remove(ctx, reply);
             }
         }
     }
     ctx.log("block-driver: SD (EMMC/PIO) serving block I/O");
     loop {
-        let msg = ctx.recv();
-        let reply = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        let msg = gs::ipc::recv(ctx);
+        let reply = match gs::ipc::take_sent_cap(ctx) { Some(c) => c, None => continue };
         serve(&sd, ctx, msg.payload_bytes(), reply);
-        ctx.remove_cap(reply);
+        gs::cap::remove(ctx, reply);
     }
 }

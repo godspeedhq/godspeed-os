@@ -400,7 +400,7 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
     let mut asked: u64 = 0; // drain requests received (ops 4 and 9)
     let mut handed: u64 = 0; // frames actually returned
     let mut empty: u64 = 0; // drains that found the ring empty
-    let mut last_report = ctx.read_tsc();
+    let mut last_report = godspeed::driver::wait::ticks(ctx);
     // Once-only latches, OUTSIDE the loop they guard: one declared inside resets every iteration and
     // reports every time, which is the flood it exists to prevent.
     let mut capless_logged = false;
@@ -412,7 +412,7 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
     // is the answer, re-read at most every `CABLE_RECHECK_MS` on whatever request arrives.
     // The cable carries frames only through a MAC that is up.
     let mut cable = link_was_up && matches!(w, Wire::Up(_));
-    let mut cable_read_at = ctx.read_tsc();
+    let mut cable_read_at = godspeed::driver::wait::ticks(ctx);
     let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
     // The onboard radio first, and the USB dongle's service as the other: the bridge follows whichever
     // says it is the one in use (`wifi hardware use`, `Radio::info`).
@@ -424,8 +424,8 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
         let (req, reply_cap) = match radio.take_held() {
             Some(h) => h,
             None => {
-                let req = ctx.recv();
-                let Some(reply_cap) = ctx.take_pending_cap() else {
+                let req = godspeed::ipc::recv(ctx);
+                let Some(reply_cap) = godspeed::ipc::take_sent_cap(ctx) else {
                     if !capless_logged {
                         capless_logged = true;
                         ctx.log("nic-driver: request had no reply cap - dropping (cannot answer without one, or a late reply from the radio after this driver stopped waiting for it)");
@@ -441,8 +441,8 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
         // bring-up has its speed re-applied, because a MAC left at the wrong clock receives nothing at
         // all - and the edge is consumed only if the re-apply took, so one unlucky MDIO read cannot
         // leave the receiver dead until a physical replug.
-        if ctx.read_tsc().wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
-            cable_read_at = ctx.read_tsc();
+        if godspeed::driver::wait::ticks(ctx).wrapping_sub(cable_read_at) >= crate::cycles(ctx, CABLE_RECHECK_MS) {
+            cable_read_at = godspeed::driver::wait::ticks(ctx);
             let (up, speed, fd) = link(ctx, w.m(), 0);
             // A MAC that did not come up is tried again when a cable ARRIVES - the clock a reset needs is
             // the PHY's - once per arrival: a failed reset waits a second, and retrying it on every
@@ -492,12 +492,12 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
             // out. Nine bytes, as GENET's: net-stack and the shell read eight and take the ninth as the
             // carrier for `net` (1 the cable, 2 the radio, 0 neither).
             let out = radio::status(ctx, &mut radio, cable, LOCAL_MAC, &mut carrier);
-            crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), ctx, &mut fails);
+            crate::note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&out)), ctx, &mut fails);
         } else if p.len() == 1 && p[0] == 10 {
             // WHICH ACCESS POINT carries the radio's link. Until the radio, a one-byte 10 here was
             // taken for a frame to send; net-stack asks it only after STATUS has named the radio.
             let out = radio::peer(ctx, &mut radio, cable);
-            crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), ctx, &mut fails);
+            crate::note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&out)), ctx, &mut fails);
         } else if p.len() == 1 && p[0] == 4 {
             asked += 1;
             let n = match &mut w {
@@ -505,7 +505,7 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
                 _ => radio.rx(ctx, &mut rxbuf),
             };
             if n == 0 { empty += 1 } else { handed += 1 }
-            crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), ctx, &mut fails);
+            crate::note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&rxbuf[..n])), ctx, &mut fails);
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count][len:u16 LE][bytes]... Bounded three ways - the count, the
             // reply buffer, and the ring emptying - so it always terminates.
@@ -533,12 +533,12 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
                 count += 1;
             }
             out[0] = count as u8;
-            crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), ctx, &mut fails);
+            crate::note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&out[..opos])), ctx, &mut fails);
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
             // Not supported on this backend, answered `[0]` rather than `[1]`: acking a chaos
             // link-flap override we did not perform would make a test print that it had exercised
             // link recovery having exercised nothing.
-            crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
+            crate::note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
         } else {
             // A frame to transmit. The acknowledgement carries NOTHING, deliberately: answering a
             // send with a received frame hands it to a caller that did not ask for one (destroying
@@ -561,8 +561,8 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
                             p.len(), radio_tx_fail));
                     }
                 }
-                crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
-                ctx.remove_cap(reply_cap);
+                crate::note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
+                godspeed::cap::remove(ctx, reply_cap);
                 continue;
             };
             let sent = d.transmit(ctx, p);
@@ -584,16 +584,16 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
                     tg, tgb, tuf, tce, rgb, rcrc,
                     d.dma_status(), dbg));
             }
-            crate::note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
+            crate::note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
         }
-        ctx.remove_cap(reply_cap);
+        godspeed::cap::remove(ctx, reply_cap);
 
         // Paced on a WALL CLOCK, not per request: a drain-rate report printed per drain would be
         // ninety lines a second, and an instrument that floods the console changes the timing of the
         // thing it is measuring.
-        let per_10ms = ctx.tsc_ticks_per_10ms();
-        if per_10ms != 0 && ctx.read_tsc().wrapping_sub(last_report) > per_10ms * 500 {
-            last_report = ctx.read_tsc();
+        let per_10ms = godspeed::driver::wait::ticks_per_10ms(ctx);
+        if per_10ms != 0 && godspeed::driver::wait::ticks(ctx).wrapping_sub(last_report) > per_10ms * 500 {
+            last_report = godspeed::driver::wait::ticks(ctx);
             // The MAC's counters exist only for a MAC that is up.
             let Wire::Up(d) = &w else { continue };
             let (tgb, _tg, _tuf, _tce, rgb, _rcrc, _rocts, _dbg) = d.mac_counters();
@@ -923,7 +923,7 @@ pub fn rgmii_loopback_sweep(ctx: &ServiceContext, d: &mut Dwmac, phy: u32) {
             continue;
         }
         // Let the PHY settle after a timing change before trusting anything it does.
-        ctx.sleep_ms(20);
+        godspeed::task::sleep_ms(ctx, 20);
         while d.receive(&mut rx) != 0 {} // discard anything already in the ring
 
         let mut sent = 0usize;
@@ -961,7 +961,7 @@ pub fn rgmii_loopback_sweep(ctx: &ServiceContext, d: &mut Dwmac, phy: u32) {
     // delay the device tree asked for rather than whichever one the sweep ended on.
     let _ = ytphy_write_ext(ctx, &d.m, phy, YT8521_RGMII_CONFIG1, cfg0);
     let _ = mdio_write(ctx, &d.m, phy, PHY_BMCR, bmcr0);
-    ctx.sleep_ms(20);
+    godspeed::task::sleep_ms(ctx, 20);
     ctx.log("nic-driver: dwmac loopback sweep done - PHY restored");
 }
 
@@ -989,7 +989,7 @@ fn phy_reset(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
     // Self-clearing, and bounded because a PHY that never clears it is a PHY that is not there.
     // 100 ms is ten times the datasheet figure for a clause-22 reset.
     for _ in 0..20 {
-        ctx.sleep_ms(5);
+        godspeed::task::sleep_ms(ctx, 5);
         if let Some(v) = mdio_read(ctx, m, phy, PHY_BMCR) {
             if v & BMCR_RESET == 0 {
                 return true;
@@ -1029,7 +1029,7 @@ fn wait_for_link(ctx: &ServiceContext, m: &Mmio, phy: u32) -> (bool, u32, bool) 
                 waited));
             return (false, 0, false);
         }
-        ctx.sleep_ms(STEP_MS);
+        godspeed::task::sleep_ms(ctx, STEP_MS);
         waited += STEP_MS;
     }
 }

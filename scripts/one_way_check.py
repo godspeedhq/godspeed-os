@@ -58,16 +58,28 @@ REPLACEMENT = {
     "self_grant_handle": "gs::cap::self_grant",
     "yield_cpu": "gs::task::yield_now",
     "sleep_ms": "gs::task::sleep_ms, or gs::driver::delay for a hardware hold",
-    "sleep": "gs::driver::delay::hold / hold_parked",
+    "sleep": "gs::task::sleep_ms / sleep_us / sleep_quantum, or gs::driver::delay for a hardware hold",
     "uptime_secs": "gs::task::uptime_secs",
     "epoch_secs_monotonic": "gs::task::epoch_secs_monotonic",
     "datetime": "gs::task::datetime",
     "core_id": "gs::task::core_id",
     "irq_unmask": "gs::driver::irq",
     "irq_vector": "gs::driver::irq",
-    "read_tsc": "gs::driver::wait (Deadline, elapsed_us)",
-    "duration_cycles": "gs::driver::wait::Budget",
-    "tsc_ticks_per_10ms": "gs::driver::wait::calibrated",
+    "read_tsc": "gs::driver::wait (Deadline, Since), or wait::ticks where code measures in ticks",
+    "duration_cycles": "gs::driver::wait::Budget, gs::task::sleep_ms, gs::ipc::recv_within_ms",
+    "tsc_ticks_per_10ms": "gs::driver::wait::ticks_per_10ms, or wait::calibrated",
+    # Added 2026-10-09, when every service was moved onto `gs` and the table turned out narrower than the
+    # library: these had a `gs` equivalent all along and were not counted, so "zero" meant less than it
+    # said. The shell alone held 827 console writes.
+    "console_writeln": "gs::io::println",
+    "console_writeln_fmt": "gs::io::println_fmt",
+    "console_write": "gs::io::print",
+    "console_write_fmt": "gs::io::print_fmt",
+    "trace_as": "gs::trace::as_name",
+    "metric": "gs::trace::metric",
+    "resource_revoke": "gs::resource::revoke",
+    "last_recv_badge": "gs::resource::last_badge",
+    "send_peer_handle": "gs::ipc::peer",
 }
 CALL = re.compile(r"(?:\bctx|\.ctx)\s*\.\s*(" + "|".join(sorted(REPLACEMENT, key=len, reverse=True)) + r")\s*\(")
 COMMENT = re.compile(r"//[^\n]*")

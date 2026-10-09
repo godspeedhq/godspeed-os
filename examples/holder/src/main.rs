@@ -42,7 +42,7 @@
 
 use godspeed::{self as gs, ServiceContext};
 // The raw SDK, for the hand-rolled `invoke` below ONLY - see the note on that function.
-use godspeed_sdk::{CapError, CapHandle, IpcError, Message, ReqOutcome};
+use godspeed_sdk::{CapError, IpcError, Message, ReqOutcome};
 
 
 // Resource operations - the FIRST payload byte of a badged invocation (mirrors resource-server's
@@ -60,12 +60,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("holder: starting");
 
     // 1. Receive the GRANTED resource cap. resource-server sent us a message carrying an embedded
-    //    cap (§8.5); the kernel placed the cap in OUR table and `take_pending_cap` hands us the slot.
+    //    cap (§8.5); the kernel placed the cap in OUR table and `gs::ipc::take_sent_cap` hands it to us.
     //    We block until it arrives - wait on truth, not a sleep (Commandment VIII). Any plain message
     //    with no embedded cap is not what we want; loop until we actually hold the cap.
     let cap = loop {
-        let _ = ctx.recv();
-        if let Some(c) = ctx.take_pending_cap() {
+        let _ = gs::ipc::recv(&ctx);
+        if let Some(c) = gs::ipc::take_sent_cap(&ctx) {
             ctx.log("holder: received a resource cap (granted by resource-server)");
             break c;
         }
@@ -112,7 +112,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("holder: done (use / non-escalation / revoke all checked)");
 
     // Nothing left to do - park rather than spin (Commandment V: bounded, quiet idle).
-    ctx.park()
+    gs::ipc::park(&ctx)
 }
 
 /// How long `holder` waits for an owner to answer an invocation before calling it dead.
@@ -138,17 +138,17 @@ const INVOKE_SECS: i64 = 5;
 /// 8.2). That wrapper is crate-internal today because its signature carries the stash, and
 /// making it public is an API decision rather than a rename; `gs::file::File` is the wrapped
 /// form for files. This example keeps the long hand so the protocol is visible.
-fn invoke(ctx: &ServiceContext, cap: CapHandle, right: u8, op: u8) -> Result<Message, IpcError> {
+fn invoke(ctx: &ServiceContext, cap: gs::cap::Cap, right: u8, op: u8) -> Result<Message, IpcError> {
     // Our endpoint's own SEND|GRANT handle, then a fresh per-invoke copy to embed as the reply cap.
-    let self_grant = match ctx.self_grant_handle() {
-        Some(h) => h,
-        None    => return Err(IpcError::EndpointDead), // no endpoint to reply on (should not happen)
+    let self_grant = match gs::cap::self_grant(ctx) {
+        Ok(h)  => h,
+        Err(_) => return Err(IpcError::EndpointDead), // no endpoint to reply on (should not happen)
     };
-    let reply = match ctx.derive_cap(self_grant) {
-        Some(r) => r,
-        None    => return Err(IpcError::EndpointDead), // cap table full (should not happen)
+    let reply = match gs::cap::duplicate(ctx, self_grant) {
+        Ok(r)  => r,
+        Err(_) => return Err(IpcError::EndpointDead), // cap table full (should not happen)
     };
-    match ctx.resource_invoke(cap, right, reply, &Message::from_bytes(&[op])) {
+    match ctx.resource_invoke(cap.handle(), right, reply.handle(), &Message::from_bytes(&[op])) {
         // Routed. Now WAIT ON TRUTH INCLUDING FAILURE (Commandment VIII).
         //
         // This was `ctx.recv()` - unbounded - and it is the reason this example is being corrected:
@@ -171,6 +171,6 @@ fn invoke(ctx: &ServiceContext, cap: CapHandle, right: u8, op: u8) -> Result<Mes
             // replier dying, which is exactly what `ReplyDead` names.
             _ => Err(IpcError::ReplyDead),
         },
-        Err(e)  => { ctx.remove_cap(reply); Err(e) } // rejected: reclaim the unused reply slot, report
+        Err(e)  => { gs::cap::remove(ctx, reply); Err(e) } // rejected: reclaim the unused reply slot, report
     }
 }

@@ -100,11 +100,11 @@ fn reply_op(ctx: &ServiceContext, op: u8, status: u8) {
 }
 
 fn reply(ctx: &ServiceContext, out: &[u8]) {
-    if let Some(cap) = ctx.take_pending_cap() {
-        let _ = ctx.try_send_by_handle(cap, &Message::from_bytes(out));
-        // Reclaim it: a reply cap is a one-shot return address handed to us inside the request, and
-        // sending on it does not consume it. Leaving it behind burns a cap-table slot per reply.
-        ctx.remove_cap(cap);
+    if let Some(cap) = gs::ipc::take_sent_cap(ctx) {
+        // `reply` sends AND reclaims: a reply cap is a one-shot return address handed to us inside the
+        // request, and sending on it does not consume it. Leaving it behind burns a cap-table slot per
+        // reply, which is why the two halves are one call.
+        let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(out));
     }
 }
 
@@ -511,9 +511,8 @@ fn drain(ctx: &ServiceContext, cap: &mut Capture) {
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    ctx.trace_as("recorder");
+    gs::trace::as_name(&ctx, "recorder");
     let mut cap = Capture::new();
-    let wait = ctx.duration_cycles(DRAIN_MS);
     ctx.log("recorder: ready (idle - `events persist start` begins a capture)");
 
     loop {
@@ -525,7 +524,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Non-blocking here instead, so the fill runs as fast as the device allows while control
         // messages are still served every iteration.
         let preparing = cap.on && cap.filled < cap.capacity;
-        let incoming = if preparing { ctx.try_recv() } else { ctx.recv_timeout(wait) };
+        let incoming = if preparing { gs::ipc::try_recv(&ctx) } else { gs::ipc::recv_within_ms(&ctx, DRAIN_MS) };
         if let Some(msg) = incoming {
             let p = msg.payload_bytes();
             // The op being answered, echoed into every reply so a caller can tell this reply from a
@@ -553,7 +552,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // "64MiB" means 64 MiB on disk rather than 64 per file. Asking for a budget and
                     // quietly using a multiple of it is the kind of small lie that is found late.
                     cap.capacity = (total / PIECES as u64).max(64 * 1024);
-                    cap.started_at = ctx.epoch_secs_monotonic() as u64;
+                    cap.started_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
                     let mut path = [0u8; PATH_MAX];
                     path[..plen].copy_from_slice(&cap.path[..plen]);
                     // ALLOCATE ONLY, then answer. The extent is one cheap `fs` call; the pre-fill is
@@ -592,7 +591,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // out the real fill rate and therefore what the capture actually covers - which is
                     // the only honest answer, because a duration asked for is a prediction about how
                     // chatty the machine will be and the machine decides that.
-                    let now = ctx.epoch_secs_monotonic() as u64;
+                    let now = gs::task::epoch_secs_monotonic(&ctx) as u64;
                     let elapsed = now.saturating_sub(cap.started_at);
                     out[44..52].copy_from_slice(&elapsed.to_le_bytes());
                     out[52..60].copy_from_slice(&cap.total_written.to_le_bytes());

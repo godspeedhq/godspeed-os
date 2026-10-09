@@ -53,6 +53,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
 /// Buses to walk, at most.
@@ -262,7 +263,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("hw-enumerator");
+    gs::trace::as_name(&ctx, "hw-enumerator");
     ctx.log("hw-enumerator: starting - PCI discovery in USERSPACE (step D2)");
 
     // GROUND TRUTH before the walk. An empty result is ambiguous on its own - it means either "this
@@ -307,10 +308,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //   op 4 + idx  -> that device's configuration space, read NOW: [bdf, 256 bytes]
     //   op 3 + class -> the BDF of the first device with that class code (0 = none), and the class
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         // The caller's one-shot reply cap. No cap means nobody is waiting for an answer, so there is
         // nothing to do but carry on - and NOT reply into the void.
-        let Some(reply_cap) = ctx.take_pending_cap() else { continue };
+        let Some(reply_cap) = gs::ipc::take_sent_cap(&ctx) else { continue };
         let p = msg.payload_bytes();
         let reply = match (p.first().copied(), p.get(1).copied()) {
             (Some(1), _) => Message::from_bytes(&(n as u32).to_le_bytes()),
@@ -372,9 +373,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the hang nothing above the kernel may cause.
             _ => Message::from_bytes(b"?"),
         };
-        let _ = ctx.try_send_by_handle(reply_cap, &reply);
-        // Reclaim the slot every time, on every path - a cap left behind on each request fills the
-        // table over a long run (§26.6).
-        ctx.remove_cap(reply_cap);
+        // `reply` reclaims the slot every time, on every path - a cap left behind on each request fills
+        // the table over a long run (§26.6).
+        let _ = gs::ipc::reply(&ctx, reply_cap, &reply);
     }
 }

@@ -15,6 +15,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
@@ -215,13 +216,22 @@ const SCRATCHPAD_SBA_OFF: usize = 0x1F000; // = DEV_BASE + MAX_SLICES*DEV_STRIDE
 const SCRATCHPAD_BUF_BASE: usize = 0x20000; // = SCRATCHPAD_SBA_OFF + 0x1000
 const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (288) - 32
 
+/// Counter ticks in `ms` milliseconds, exactly as the SDK's `duration_cycles` computes them: never 0,
+/// and 1 on a machine whose counter the kernel could not calibrate. For the tick-domain instruments
+/// (the pass report, the work-segment accumulators); a WAIT is written on `gs::driver::wait`.
+fn ms_ticks(ctx: &ServiceContext, ms: u64) -> u64 {
+    let per_10ms = wait::ticks_per_10ms(ctx);
+    if per_10ms == 0 { return 1; }
+    (per_10ms.saturating_mul(ms) / 10).max(1)
+}
+
 /// Maximum HID devices bound on one controller at once (keyboard + mouse).
 const MAX_HID: usize = 2;
 
 // Typematic auto-repeat delays are CALIBRATED per-machine from the TSC rate at the keyboard-poll
-// setup (`KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms())`), not hardcoded here: assuming ~2 GHz
-// made one keypress repeat into `qqqqq` on the differently-clocked Goldmont+ Wyse. read_tsc is
-// hardware-proven to advance (perf §22); tsc_ticks_per_10ms is the kernel's PIT-calibrated rate.
+// setup (`KeyRepeat::new_calibrated(wait::ticks_per_10ms(ctx))`), not hardcoded here: assuming ~2 GHz
+// made one keypress repeat into `qqqqq` on the differently-clocked Goldmont+ Wyse. The counter is
+// hardware-proven to advance (perf §22); `wait::ticks_per_10ms` is the kernel's PIT-calibrated rate.
 // The four timing budgets that used to live here are now MILLISECONDS, next to `spin` below, because
 // the cycle counts they were could not survive leaving x86. See `RESET_RECOVERY_MS` and friends.
 const DEV_BASE: usize = 0x7000;
@@ -404,7 +414,7 @@ fn deliver_hid_report(
             &mut kb_last[d],
             &mut kb_rep[d],
             &mut kb_caps[d],
-            ctx.read_tsc(),
+            wait::ticks(ctx),
             |ch| ctx.console_push(ch),
             |code| {
                 ctx.log_fmt(format_args!(
@@ -879,7 +889,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
         {
             // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
             let mut drained = 0u32;
-            while let Some(m) = ctx.try_recv() {
+            while let Some(m) = gs::ipc::try_recv(&ctx) {
                 // A radio request is answered "no device" - nothing is enumerated here (U2a).
                 radio::answer_absent(ctx, &m);
                 drained += 1;
@@ -889,7 +899,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
                 }
             }
         }
-        ctx.sleep(ctx.duration_cycles(IDLE_WAIT_MS));
+        gs::task::sleep_ms(ctx, IDLE_WAIT_MS);
     }
 }
 
@@ -903,8 +913,8 @@ fn notify(ctx: &ServiceContext, msg: &str) {
     // Leading "\n " - the space is sacrificial: the framebuffer drops the first
     // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the
     // 'U' of "USB:". (Serial is unaffected.)
-    ctx.console_write("\n USB: ");
-    ctx.console_write(msg);
+    gs::io::print(ctx, "\n USB: ");
+    gs::io::print(ctx, msg);
     ctx.console_push(b'\n');
 }
 
@@ -924,7 +934,7 @@ fn idle(ctx: &ServiceContext) -> ! {
         {
             // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
             let mut drained = 0u32;
-            while let Some(m) = ctx.try_recv() {
+            while let Some(m) = gs::ipc::try_recv(&ctx) {
                 // A radio request is answered "no device" - nothing is enumerated here (U2a).
                 radio::answer_absent(ctx, &m);
                 drained += 1;
@@ -934,7 +944,7 @@ fn idle(ctx: &ServiceContext) -> ! {
                 }
             }
         }
-        ctx.sleep(ctx.duration_cycles(IDLE_WAIT_MS));
+        gs::task::sleep_ms(ctx, IDLE_WAIT_MS);
     }
 }
 
@@ -2208,7 +2218,7 @@ fn serve_if_block(
     if !is_block_op {
         return true; // not a block request; the disk is unaffected
     }
-    let Some(reply) = ctx.take_pending_cap() else {
+    let Some(reply) = gs::ipc::take_sent_cap(ctx) else {
         // Counted SEPARATELY from `n`, which counts every block-path message. Gating on `n == 1`
         // could only ever fire if the very FIRST message a fresh instance saw was the malformed one -
         // a guard whose trigger cannot occur in the failing case, which is the eighth instance of that
@@ -2236,13 +2246,13 @@ fn serve_if_block(
     //
     // A dropped reply is recoverable and a deadlock is not: the caller's own deadline fires, it
     // reacquires and retries (§14.3). So a full queue costs one retry instead of the machine.
-    if let Err(e) = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n])) {
+    // `reply` sends non-blocking and then gives the one-shot cap back, on every path.
+    if let Err(e) = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&out[..n])) {
         // Reported, never swallowed (§26.7). The caller will time out and retry; this line is how an
         // operator knows WHY a block request went unanswered rather than inferring it.
         ctx.log_fmt(format_args!(
             "xhci: block reply not delivered ({:?}) - caller's queue full or gone; it will retry", e));
     }
-    ctx.remove_cap(reply);
     // A data operation that FAILED means the device stopped answering - which on this board is
     // usually that it was unplugged. Report it so the caller can re-enumerate rather than answer
     // errors forever against a device that is no longer there: an unplugged stick left the disk
@@ -3057,7 +3067,7 @@ fn enumerate_one(
     // bPwrOn2PwrGood in the hub descriptor gives this in 2 ms units and would be the precise answer;
     // 200 ms is the reference driver's figure and covers every hub it has met. Paid once per hub at
     // enumeration.
-    ctx.sleep(ctx.duration_cycles(PORT_POWER_SETTLE_MS));
+    gs::task::sleep_ms(ctx, PORT_POWER_SETTLE_MS);
     // For each CONNECTED downstream port: reset it, read its speed, Address Device it with a route
     // string (this hub port, tier 1) + parent-TT into its OWN slice, then read its config and bind it
     // if it's a boot HID - exactly like a root-port device (read_config_and_bind). This is what makes
@@ -3129,7 +3139,7 @@ fn enumerate_one(
         // twelfth of the ring cost. The budget was never the scarce resource; the ring was.
         let mut pstatus = 0u16;
         for _ in 0..12 {
-            ctx.sleep(ctx.duration_cycles(20));
+            gs::task::sleep_ms(ctx, 20);
             let ok = control(
                 dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0xA3, 0, 0,
                 dp as u32, 4, DATA_BUF_OFF,
@@ -3176,7 +3186,7 @@ fn enumerate_one(
                 dp, pstatus));
             continue; // no slice allocated yet at this point - nothing to release
         }
-        ctx.sleep(ctx.duration_cycles(PORT_RECOVERY_MS));
+        gs::task::sleep_ms(ctx, PORT_RECOVERY_MS);
         let _ = control(
             dma,
             mmio,
@@ -3434,7 +3444,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("xhci");
+    gs::trace::as_name(&ctx, "xhci");
     ctx.log("xhci: driver starting");
 
     let mmio = match ctx.xhci_mmio() {
@@ -3557,7 +3567,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reaching its threshold.
     let mut topo = topo::Topo::new();
     // Heartbeat state - ABOVE `'reenum` so a re-enumeration cannot reset it (see its comment below).
-    let mut last_beat = ctx.read_tsc();
+    let mut last_beat = wait::Since::now(&ctx);
     let mut passes: u64 = 0;
     // Interrupts actually delivered, as distinct from messages received. Reported in the heartbeat so
     // "are we using interrupts?" is answered by a number instead of by a log line that could not tell.
@@ -3658,7 +3668,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // `None` means no interrupt was granted, and then NOTHING is an IRQ - which is the honest reading,
     // not a reason to guess. The loop's 10 ms poll already covers that case.
-    let msi_vector: Option<u8> = ctx.irq_vector();
+    let msi_vector: Option<u8> = gs::driver::irq::Irq::granted(&ctx).vector();
     ctx.log_fmt(format_args!(
         "xhci: IRQ vector granted by the kernel: {}",
         match msi_vector { Some(v) => v, None => 0 }));
@@ -3671,7 +3681,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut reset_failures: u32 = 0;
     let mut passes_at_report: u64 = 0;
     let mut reenums_at_report: u64 = 0;
-    let mut last_pass_report = ctx.read_tsc();
+    let mut last_pass_report = wait::Since::now(&ctx);
 
     'reenum: loop {
         reenums += 1;
@@ -4100,7 +4110,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     {
                         // BOUNDED: see MSG_DRAIN_MAX. "it stops when the sender stops" is not a bound.
                         let mut drained = 0u32;
-                        while let Some(m) = ctx.try_recv() {
+                        while let Some(m) = gs::ipc::try_recv(&ctx) {
                 // A radio request is answered "no device" - nothing is enumerated here (U2a).
                 radio::answer_absent(&ctx, &m);
                             drained += 1;
@@ -4373,7 +4383,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // On failure the seeded `hub_off` value stands - no worse than before, and the probe
             // failure path still repairs. Never silently assume the re-point happened (§26.7).
         }
-        let mut last_hub_poll = ctx.read_tsc();
+        let mut last_hub_poll = wait::Since::now(&ctx);
         // LIVENESS HEARTBEAT. The driver must be able to say "I am still running".
         //
         // On hardware this driver went completely silent for two minutes - keyboard dead, hot-plug
@@ -4404,7 +4414,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Auto-repeat delays calibrated to THIS machine's TSC rate (0 under QEMU -> ~2 GHz fallback),
         // so the repeat feels the same on any CPU instead of assuming ~2 GHz (the Goldmont+ Wyse ran
         // the old hardcoded delays too fast - one keypress became `qqqqq`).
-        let rep_ticks = ctx.tsc_ticks_per_10ms();
+        let rep_ticks = wait::ticks_per_10ms(&ctx);
         let mut kb_rep = [
             godspeed_sdk::hid::KeyRepeat::new_calibrated(rep_ticks),
             godspeed_sdk::hid::KeyRepeat::new_calibrated(rep_ticks),
@@ -4444,9 +4454,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // given pass reaches the bottom. See `PASS_REPORT_MS` for why that is the whole design:
             // the two instruments this replaces both live below six early exits.
             passes += 1;
-            let since = ctx.read_tsc().wrapping_sub(last_pass_report);
-            if since > ctx.duration_cycles(PASS_REPORT_MS) {
-                last_pass_report = ctx.read_tsc();
+            let since = last_pass_report.elapsed_ticks(&ctx);
+            if since > ms_ticks(&ctx, PASS_REPORT_MS) {
+                last_pass_report = wait::Since::now(&ctx);
                 // Rates, not raw totals, and the elapsed time is MEASURED rather than assumed to be
                 // PASS_REPORT_MS: the check fires on the first pass after the interval, which on a
                 // driver that blocks can be far later than the interval itself. Reporting the
@@ -4455,7 +4465,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Converted ONCE, here at the report, rather than carrying a unit around: the
                 // per-10ms figure is what the kernel measured at boot, so this is the same clock the
                 // deadlines above use and cannot disagree with them.
-                let per_10ms = ctx.tsc_ticks_per_10ms();
+                let per_10ms = wait::ticks_per_10ms(&ctx);
                 let ms = if per_10ms == 0 { 0 } else { since * 10 / per_10ms }.max(1);
                 ctx.log_fmt(format_args!(
                     "xhci: [pass] {} passes and {} re-enums in {} ms ({} passes/s)",
@@ -4512,7 +4522,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // (docs/power.md §11). A held key emits no new USB reports, so while one is armed we
             // wake briskly (~20 ms) to synthesise typematic auto-repeat below; when idle we sleep
             // ~250 ms as the hot-plug watchdog. Never pass 0 (recv_timeout(0) blocks FOREVER).
-            let base = rep_ticks.max(1);
+            // In MILLISECONDS: one 10 ms tick, which is what `rep_ticks.max(1)` (ticks per 10 ms) was
+            // in counter ticks - `recv_within_ms` converts it back to exactly that, and never to 0.
+            let base: u64 = 10;
             // HID slots whose transfer events something else consumed this pass. BOTH the block
             // server below and the hub status checks further down can swallow a keyboard completion,
             // and either one owes the endpoint a re-arm - so the set spans them.
@@ -4645,10 +4657,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // from then on. Interrupt-driven boards never set it and keep the 2-wakes/sec idle that
             // the power work bought; boards where MSI is silent - or is delivered but not for HID -
             // pay one slow keystroke, once, and are at the tick floor forever after.
-            let deadline = if wake_fast {
+            let deadline_ms = if wake_fast {
                 base
             } else if polling {
-                ctx.duration_cycles(HUB_POLL_MS)
+                HUB_POLL_MS
             } else {
                 base.saturating_mul(25)
             };
@@ -4661,14 +4673,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // wait excluded, which is the quantity `observe` charges us for and the one number this
             // investigation never had.
             if work_t0 != 0 {
-                let now = ctx.read_tsc();
+                let now = wait::ticks(&ctx);
                 work_cycles = work_cycles.wrapping_add(now.wrapping_sub(work_t0));
                 // Whatever is left after the ack: the PORTSC sweep and the hub scan, which is where
                 // the probe spin lives and therefore the first place to look for the 4.7 ms.
                 seg_hub = seg_hub.wrapping_add(now.wrapping_sub(seg_mark));
             }
-            let woke = ctx.recv_timeout(deadline);
-            work_t0 = ctx.read_tsc();
+            let woke = gs::ipc::recv_within_ms(&ctx, deadline_ms);
+            work_t0 = wait::ticks(&ctx);
             // Delivered event = something is waking us. Timeout = it is not.
             // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not.
             //
@@ -4770,7 +4782,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // into one struct first.
             let mut served = 0u32;
             while served < 1 {
-                let Some(m) = ctx.try_recv() else { break };
+                let Some(m) = gs::ipc::try_recv(&ctx) else { break };
                 served += 1;
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
                 match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
@@ -4807,7 +4819,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // 4096 is far above any real burst - a full event ring is 256 TRBs - so reaching it means
             // a storm, not a busy moment. The next pass drains the rest; nothing is lost.
-            let seg_a = ctx.read_tsc();          // block serving + HID re-arm, before the drain
+            let seg_a = wait::ticks(&ctx);          // block serving + HID re-arm, before the drain
             seg_serve = seg_serve.wrapping_add(seg_a.wrapping_sub(work_t0));
             let mut drained = 0u32;
             loop {
@@ -4849,7 +4861,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
 
-            let seg_b = ctx.read_tsc();
+            let seg_b = wait::ticks(&ctx);
             seg_drain = seg_drain.wrapping_add(seg_b.wrapping_sub(seg_a));
             seg_mark = seg_b;
 
@@ -4896,8 +4908,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // ~50 ms, which is exactly `PROBE_ANSWER_MS` - the hub probe budget, which this driver
             // SPINS on rather than blocking. If that is where the time goes, the fix is to stop
             // busy-waiting, and no amount of adjusting wake rates would ever have found it.
-            if ctx.read_tsc().wrapping_sub(last_beat) > ctx.duration_cycles(HEARTBEAT_MS) {
-                last_beat = ctx.read_tsc();
+            if last_beat.passed(&ctx, Budget::ms(HEARTBEAT_MS)) {
+                last_beat = wait::Since::now(&ctx);
                 // Carries the DEVICE's own elapsed seconds, so the beat can be checked against
                 // itself rather than against host timestamps.
                 //
@@ -4914,18 +4926,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // clocks. Either way the log answers it without a rebuild.
                 ctx.log_fmt(format_args!(
                     "xhci: alive - t={}s, {} passes ({} fast/{} idle), work {}ms (serve {} drain {} hub {}), probes {}/{} ok {} late, {} MSI, {} msg, {} HID, disk {}, {} dropped (no reply cap)",
-                    ctx.epoch_secs_monotonic(), passes, fast_waits, idle_waits,
-                    work_cycles / ctx.duration_cycles(1).max(1),
-                    seg_serve / ctx.duration_cycles(1).max(1),
-                    seg_drain / ctx.duration_cycles(1).max(1),
-                    seg_hub   / ctx.duration_cycles(1).max(1),
+                    gs::task::epoch_secs_monotonic(&ctx), passes, fast_waits, idle_waits,
+                    work_cycles / ms_ticks(&ctx, 1),
+                    seg_serve / ms_ticks(&ctx, 1),
+                    seg_drain / ms_ticks(&ctx, 1),
+                    seg_hub   / ms_ticks(&ctx, 1),
                     hub_ok, hub_posted, hub_late,
                     msi_count, msg_count, ndev,
                     if disk.is_some() { "yes" } else { "no" },
                     no_cap_drops));
             }
-            let hub_due =
-                ctx.read_tsc().wrapping_sub(last_hub_poll) > ctx.duration_cycles(HUB_POLL_MS);
+            let hub_due = last_hub_poll.passed(&ctx, Budget::ms(HUB_POLL_MS));
             // (declared above, before the block-serving calls - a DISK transfer can consume a HID
             // completion just as a hub check can, and both owe the same re-arm)
             for d in 0..ndev {
@@ -5495,7 +5506,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 continue 'reenum;
             }
             if hub_due {
-                last_hub_poll = ctx.read_tsc();
+                last_hub_poll = wait::Since::now(&ctx);
             }
             // DELIVER the report a hub check consumed, then re-arm.
             //
@@ -5561,7 +5572,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Typematic auto-repeat: a held key sends no further USB reports, so synthesise
             // repeats from the TSC cycle counter. While a key is held we woke on the timer
             // (short timeout above), so this fires the repeats at ~the repeat interval.
-            let now = ctx.read_tsc();
+            let now = wait::ticks(&ctx);
             for d in 0..ndev {
                 if !devs[d].is_mouse {
                     kb_rep[d].poll(now, |ch| ctx.console_push(ch));

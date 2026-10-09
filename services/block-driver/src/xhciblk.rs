@@ -38,6 +38,7 @@
 //! often means the service restarted and our cap went stale (§14.3), which is recovery rather than
 //! fallback - it re-establishes the SAME path.
 
+use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
 use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_OK};
@@ -94,9 +95,12 @@ const IO_RPC_SECS: i64 = 10;
 /// returns is never evaluated. An outer deadline cannot rescue an unbounded inner call.
 fn rpc_within(ctx: &ServiceContext, req: &[u8], secs: i64) -> Option<Message> {
     let msg = Message::from_bytes(req);
-    match ctx.request_with_reply_call_err(XHCI, &msg, secs) {
-        Ok(Some(r)) => return Some(r),
-        Ok(None) => {
+    // `request_once`, not `request_within`: this path owns its retry - it retries a FULL queue as well
+    // as a failed send, and says whether the reacquire worked - so the library's one built-in retry
+    // would be a second policy on top of this one.
+    match gs::call::request_once(ctx, XHCI, &msg, secs) {
+        Ok(r) => return Some(r),
+        Err(gs::Error::OutcomeUnknown) => {
             // THE DEADLINE PASSED, AND THIS IS NOT RETRIED. The request may still be in flight, so a
             // second one would leave the first reply to arrive as an orphan and desync every exchange
             // after it - the same reason `fs` refuses to re-send a request we did not answer in time.
@@ -107,7 +111,7 @@ fn rpc_within(ctx: &ServiceContext, req: &[u8], secs: i64) -> Option<Message> {
                  controller)", XHCI, secs));
             return None;
         }
-        Err(_) => {}   // the SEND failed: no request is outstanding, so a retry is safe
+        Err(_) => {}   // the SEND failed (stale or full): no request is outstanding, so a retry is safe
     }
     // WHEN BOTH ATTEMPTS FAIL, SAY WHETHER THE REACQUIRE WORKED. That is the one distinction left
     // between the two causes this path can have, and they need opposite fixes:
@@ -118,11 +122,8 @@ fn rpc_within(ctx: &ServiceContext, req: &[u8], secs: i64) -> Option<Message> {
     //
     // Logged only when the RETRY also fails, so an ordinary stale-cap recovery - which is the common
     // case and works - stays silent.
-    let reacquired = ctx.reacquire_by_name(XHCI);
-    let out = match ctx.request_with_reply_call_err(XHCI, &msg, secs) {
-        Ok(v)  => v,
-        Err(_) => None,
-    };
+    let reacquired = gs::cap::reacquire(ctx, XHCI);
+    let out = gs::call::request_once(ctx, XHCI, &msg, secs).ok();
     if out.is_none() {
         ctx.log_fmt(format_args!(
             "block-driver: '{}' did not answer, and the retry after reacquire {} - {}",
@@ -165,7 +166,7 @@ const CAPACITY_TIMEOUT_MS: u64 = 20_000;
 /// never answers is a failure-truth, not a reason to wait forever, so we come up with no disk and
 /// say so.
 pub fn sectors(ctx: &ServiceContext) -> u64 {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(CAPACITY_TIMEOUT_MS));
+    let started = gs::driver::wait::Since::now(ctx);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -183,9 +184,9 @@ pub fn sectors(ctx: &ServiceContext) -> u64 {
             }
         }
         // Not up yet, or its cap went stale across a restart. Both are recovered the same way.
-        let _ = ctx.reacquire_by_name(XHCI);
-        ctx.yield_cpu();
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        let _ = gs::cap::reacquire(ctx, XHCI);
+        gs::task::yield_now(ctx);
+        if started.passed(ctx, gs::driver::wait::Budget::ms(CAPACITY_TIMEOUT_MS)) {
             break;
         }
     }

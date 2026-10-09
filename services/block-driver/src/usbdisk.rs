@@ -23,6 +23,7 @@
 //! hold the core waiting and then answers `-2` (busy) rather than `-1` (failed), and the waiting happens
 //! HERE, between yields, where interrupts are on and every other task still runs.
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, USB_DISK_BUSY, USB_DISK_ABSENT};
 
 /// Re-ask while the device says BUSY, yielding in between.
@@ -116,7 +117,7 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
                 if let (true, Some(start)) = (announced, t0) {
                     ctx.log_fmt(format_args!(
                         "block-driver: {} lba {} completed after {}s - the device was busy, not broken",
-                        what, lba, ctx.epoch_secs_monotonic() - start));
+                        what, lba, gs::task::epoch_secs_monotonic(ctx) - start));
                 }
                 return true;
             }
@@ -128,7 +129,7 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
                 // misleading. Said ONCE per request, not per attempt, and costing a clock read only
                 // every CLOCK_SAMPLE_EVERY attempts (see above - this loop cannot afford a syscall).
                 if !announced && n % CLOCK_SAMPLE_EVERY == 0 {
-                    let now = ctx.epoch_secs_monotonic();
+                    let now = gs::task::epoch_secs_monotonic(ctx);
                     match t0 {
                         // First time we have actually had to wait: start the clock here, not at entry.
                         None => t0 = Some(now),
@@ -148,11 +149,11 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
                 // momentarily-busy case, then poll at 1 kHz so the device gets real time and this core
                 // is genuinely free in between.
                 if n < SPIN_ATTEMPTS {
-                    ctx.yield_cpu();
+                    gs::task::yield_now(ctx);
                 } else {
-                    ctx.sleep_ms(BUSY_POLL_MS);
+                    gs::task::sleep_ms(ctx, BUSY_POLL_MS);
                     if let Some(start) = t0 {
-                        if ctx.epoch_secs_monotonic() - start >= BUSY_BUDGET_SECS {
+                        if gs::task::epoch_secs_monotonic(ctx) - start >= BUSY_BUDGET_SECS {
                             break; // the budget is a duration, and it is spent
                         }
                     }
@@ -201,7 +202,7 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
     // Report the ELAPSED TIME, not the attempt count. The count was the misleading number all along:
     // "gave up after 6000 busy retries" reads like half a minute of patience and was a sixth of a
     // second, and nothing in the line said which. Seconds are the fact an operator can act on.
-    let waited = t0.map(|s| ctx.epoch_secs_monotonic() - s).unwrap_or(0);
+    let waited = t0.map(|s| gs::task::epoch_secs_monotonic(ctx) - s).unwrap_or(0);
     ctx.log_fmt(format_args!(
         "block-driver: {} lba {} gave up after {}s busy - the device stayed busy, it did not fail",
         what, lba, waited));
@@ -321,8 +322,8 @@ pub fn run(ctx: &ServiceContext, sectors: u64) -> ! {
     ctx.log_fmt(format_args!("block-driver: USB mass storage serving block I/O ({} sectors = {} MiB)",
                              sectors, sectors / 2048));
     loop {
-        let msg = ctx.recv();
-        let cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        let msg = gs::ipc::recv(ctx);
+        let cap = match gs::ipc::take_sent_cap(ctx) { Some(c) => c, None => continue };
         // The correlation tag is byte 0 of every request; the backend below never sees it and parses
         // exactly as it always did. Splitting it off HERE, once, is why fourteen reply sites did not
         // each have to learn about it.
@@ -332,6 +333,6 @@ pub fn run(ctx: &ServiceContext, sectors: u64) -> ! {
             None => (0, &p[..0]),
         };
         serve(sectors, ctx, body, crate::Reply::plain(cap, tag));
-        ctx.remove_cap(cap);
+        gs::cap::remove(ctx, cap);
     }
 }

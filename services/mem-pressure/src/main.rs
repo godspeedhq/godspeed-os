@@ -19,6 +19,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, service_context::AllocError};
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
@@ -60,5 +61,5 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Hold the allocation and idle until the chaos command kills us (death = the only way memory is
     // reclaimed in v1, §10.5). Park rather than busy-yield so the core can still halt.
-    ctx.park();
+    gs::ipc::park(&ctx);
 }

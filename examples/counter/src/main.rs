@@ -56,17 +56,24 @@ const COUNTER_PATH: &[u8] = b"/counter.dat";
 /// the kernel's own calibration and is right on every machine.
 const TICK_MS: u64 = 1_000; // ~1 s, on any host
 
+/// How long one `fs` request may take before it counts as no answer. Generous: a first request can
+/// land while `fs` is still mounting, and a slow disk is not a failure. A bound at all is the point
+/// (CLAUDE.md 26.6) - a live `fs` that never answers must not hold this service forever.
+const FS_SECS: i64 = 30;
+
 // ── fs round-trips, modelled on the shell's `fs_request` ────────────────────────
 
 /// Send one fs file-API request `[op, path_len, path, data]` and return the reply.
 ///
-/// Uses `request_with_reply`, which embeds a per-request reply cap (a SEND|GRANT
-/// copy of our own endpoint cap) so `fs` can answer us - the same mechanism the
-/// shell uses. On a miss (usually `fs` restarted and our cached cap is now
-/// `EndpointDead`, §14.3) we reacquire a fresh `fs` cap by NAME via the kernel
-/// directory and retry once. Reacquire-and-retry IS the recovery contract: a
+/// Uses `gs::call::request_within`, which embeds a per-request reply cap (a SEND|GRANT
+/// copy of our own endpoint cap) so `fs` can answer us, and bounds the wait by
+/// `FS_SECS`. On a send that never left (usually `fs` restarted and our cached cap is
+/// now `EndpointDead`, §14.3) it reacquires a fresh `fs` cap by NAME via the kernel
+/// directory and sends once more. Reacquire-and-retry IS the recovery contract: a
 /// client whose dependency restarts reacquires and retries, it does not crash
-/// (Commandment IX, §14.3).
+/// (Commandment IX, §14.3). A request that reached `fs` and got no answer is NOT
+/// re-sent - it may have been done - and comes back as no answer, which the callers
+/// below already treat as "fs is not there right now".
 fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 64];
@@ -90,13 +97,7 @@ fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<
         let p = r.payload_bytes();
         if p.first() == Some(&tag) { Some(Message::from_bytes(&p[1..])) } else { None }
     };
-    if let Some(r) = ctx.request_with_reply("fs", &msg).and_then(strip) {
-        return Some(r);
-    }
-    if gs::cap::reacquire(&ctx, "fs") {
-        return ctx.request_with_reply("fs", &msg).and_then(strip);
-    }
-    None
+    gs::call::request_within(ctx, "fs", &msg, FS_SECS).ok().and_then(strip)
 }
 
 /// Vary the correlation tag per request; never 0, so an untagged sender is recognisable.

@@ -8,6 +8,7 @@
 //! needs a split. That is worth stating rather than assuming - if a full-speed stick ever appears on
 //! a hub port, `bind` takes the split descriptor exactly as `hid::bind` does and the rest follows.
 
+use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
@@ -538,7 +539,7 @@ fn with_busy_retry(
 /// audit found in the GENET backend and fixed for the same reason.
 pub fn serve(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
-    msg: &godspeed_sdk::Message, sectors: u64, reply: godspeed_sdk::CapHandle,
+    msg: &godspeed_sdk::Message, sectors: u64, reply: gs::cap::Cap,
     capless_logged: &mut bool,
 ) -> bool {
     let p = msg.payload_bytes();
@@ -608,12 +609,11 @@ pub fn serve(
 
     // The outcome is CHECKED, not discarded. A failed reply means the client waits out its deadline
     // and calls this driver unresponsive while our log shows a clean run (userspace audit A8-3).
-    if ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n])).is_err()
+    if gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&out[..n])).is_err()
         && !*capless_logged
     {
         *capless_logged = true;
         ctx.log("dwc2-svc: block reply send FAILED - the requester will time out");
     }
-    ctx.remove_cap(reply);
     true
 }

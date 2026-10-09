@@ -440,7 +440,7 @@ pub fn request_ht(h: &dyn SdioHost, ctx: &ServiceContext) -> bool {
                 return true;
             }
         }
-        ctx.sleep_ms(1);
+        godspeed::task::sleep_ms(ctx, 1);
     }
     ctx.log_fmt(format_args!(
         "wifi-driver: HT never became available - CHIPCLKCSR {:?} -> {:?} after {} polls ~1 ms apart. The ALP \

@@ -192,22 +192,23 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     // A copy is DERIVED for the caller and the supervisor keeps its own (it needs it to wire
     // dependents later) - for a service the map keeps. One it does not is sent itself (`handed`). If the send fails the derived copy is reclaimed - an orphaned cap is a
     // table slot leaked per request (26.6).
-    if let Some(reply_cap) = ctx.take_pending_cap() {
+    if let Some(reply_cap) = gs::ipc::take_sent_cap(ctx) {
         let msg = if body_len > 0 { Message::from_bytes(&body[..body_len]) } else { Message::from_bytes(&[status]) };
         // A cap the supervisor does not keep goes as it is: copying it would leave the supervisor holding
         // the original, which is what `map_keeps` exists to stop.
-        let sent = match handed.or_else(|| spawned_cap.and_then(|c| ctx.derive_cap(c))) {
+        let copied = || spawned_cap.and_then(|c| gs::cap::duplicate(ctx, c.into()).ok().map(gs::cap::Cap::handle));
+        let sent = match handed.or_else(copied) {
             Some(granted) => {
-                let r = ctx.send_with_cap_by_handle(reply_cap, granted, &msg);
-                if r.is_err() { ctx.remove_cap(granted); }
+                let r = gs::ipc::send_granting(ctx, reply_cap, granted.into(), &msg);
+                if r.is_err() { gs::cap::remove(ctx, granted.into()); }
                 r.is_ok()
             }
             None => false,
         };
         // No cap to send, or sending it failed: still ANSWER, so the caller is never left waiting
         // on a reply that is not coming (invariant 12). It gets the status alone.
-        if !sent { let _ = try_send_slot(ctx, reply_cap, &msg); }
-        ctx.remove_cap(reply_cap);
+        if !sent { let _ = try_send_slot(ctx, reply_cap.handle(), &msg); }
+        gs::cap::remove(ctx, reply_cap);
     } else if let Some(c) = handed {
         map.hold_handoff(ctx, c);   // no one to hand it to: let go with the rest, after this message
     }
@@ -1190,7 +1191,7 @@ fn probe_hw_enumerator(ctx: &ServiceContext) {
     /// Devices to read back. The reporter's own table is 32; this is the log's bound, not its.
     const MAX_REPORT: u32 = 32;
 
-    if !ctx.reacquire_by_name("hw-enumerator") {
+    if !gs::cap::reacquire(ctx, "hw-enumerator") {
         ctx.log("supervisor: hw-enumerator not reachable by name - skipping the device probe");
         return;
     }
@@ -1264,7 +1265,8 @@ fn probe_hw_enumerator(ctx: &ServiceContext) {
 /// `managed_alive` already uses, and its comment says exactly why a cap-acquire cannot serve here.
 fn ensure_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
     if name_alive(ctx, name) {
-        if let Some(cap) = ctx.acquire_send_grant_cap(name) {
+        if let Ok(cap) = gs::cap::acquire_grantable(ctx, name) {
+            let cap = cap.handle();
             record_name_quiet(ctx, map, name, cap);
             ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
             return true;
@@ -1278,7 +1280,8 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
     // Same liveness gate as `ensure_mapped` - see its header for why a successful cap-acquire is not
     // evidence the service is alive.
     if name_alive(ctx, name) {
-        if let Some(cap) = ctx.acquire_send_grant_cap(name) {
+        if let Ok(cap) = gs::cap::acquire_grantable(ctx, name) {
+            let cap = cap.handle();
             record_name_quiet(ctx, map, name, cap);
             ctx.log_fmt(format_args!("supervisor: adopted running {} (slot {})", name, cap.0));
             return true;
@@ -1582,14 +1585,14 @@ fn map_keeps(name: &str) -> bool {
 
 /// The supervisor letting go of a cap it held in the name map, or held for a caller: one site.
 fn let_go(ctx: &ServiceContext, cap: Option<CapHandle>) {
-    if let Some(c) = cap { ctx.remove_cap(c); }
+    if let Some(c) = cap { gs::cap::remove(ctx, c.into()); }
 }
 
 /// The supervisor's one non-blocking send on a capability it holds in hand - a reply capability, or a
-/// service's cap from the name map. One site, because the supervisor reaches the SDK directly: `gs` can
-/// only send on a `Cap` it granted itself, and these slots come from the map (scripts/one_way_check.py).
+/// service's cap from the name map. One site: the map keeps raw slots because they flow into the spawn
+/// calls `gs` does not wrap (`spawn_with_caps`, `set_installs`), so the slot is adopted as a `Cap` here.
 fn try_send_slot(ctx: &ServiceContext, cap: CapHandle, msg: &Message) -> bool {
-    ctx.try_send_by_handle(cap, msg).is_ok()
+    gs::ipc::try_send_to(ctx, cap.into(), msg).is_ok()
 }
 
 /// Ask every reporting USB host for its report (`usbdev::ASK`): how a supervisor that has just started -
@@ -1657,7 +1660,7 @@ fn respawn_retry(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool
     const TRIES: u32 = 5;
     for _ in 0..TRIES {
         if respawn_managed(ctx, map, name) { return true; }
-        ctx.yield_cpu();   // let a transient resource shortage (mid-reclaim) clear before retrying
+        gs::task::yield_now(ctx);   // let a transient resource shortage (mid-reclaim) clear before retrying
     }
     false
 }
@@ -1724,7 +1727,7 @@ fn converge(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState) {
             respawn_managed(ctx, map, MANAGED[i]);
         }
         if all_settled { break; }
-        ctx.yield_cpu(); // let respawns/reclaims settle before the next truth check
+        gs::task::yield_now(ctx); // let respawns/reclaims settle before the next truth check
     }
 }
 
@@ -1741,7 +1744,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // supervisor now spawns `events` - moved here from init. events is not TCB (§11.3): retry
     // once on failure and continue without it (its output falls back to the kernel ring buffer).
     ctx.log("supervisor: spawning events...");
-    if let Some(cap) = ctx.acquire_send_grant_cap("events") {
+    if let Ok(cap) = gs::cap::acquire_grantable(&ctx, "events").map(gs::cap::Cap::handle) {
         // Supervisor RESPAWN: `events` is still alive (only the supervisor died). Adopt it - reacquire
         // its endpoint by name - instead of trying to spawn a duplicate the kernel's singleton guard
         // rejects, which used to print a misleading "events spawn failed" on every `kill supervisor`.
@@ -1761,7 +1764,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Like `events` it is not TCB: if it fails to spawn, console output still reaches serial (which
     // is the source of truth) and the kernel's boot floor keeps the display - degraded, never silent.
     ctx.log("supervisor: spawning console...");
-    if let Some(cap) = ctx.acquire_send_grant_cap("console") {
+    if let Ok(cap) = gs::cap::acquire_grantable(&ctx, "console").map(gs::cap::Cap::handle) {
         record_name_quiet(&ctx, &mut name_map, "console", cap);
         ctx.log("supervisor: adopted running console");
     } else if !spawn_mapped(&ctx, &mut name_map, "console", 0xFFFF) {
@@ -2207,10 +2210,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // If this build gave us no endpoint (minimal test manifests), fall back to park.
     if ctx.recv_handle().is_none() {
-        ctx.park();
+        gs::ipc::park(&ctx);
     }
     loop {
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(&ctx);
         handle_message(&ctx, &mut name_map, &mut usb, &mut events, &msg);
         name_map.release_handoff(&ctx);
         // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
@@ -2225,7 +2228,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         const DRAIN_MAX: u32 = 64;
         let mut drained = 0;
         while drained < DRAIN_MAX {
-            let Some(next) = ctx.try_recv() else { break };
+            let Some(next) = gs::ipc::try_recv(&ctx) else { break };
             handle_message(&ctx, &mut name_map, &mut usb, &mut events, &next);
             name_map.release_handoff(&ctx);
             drained += 1;

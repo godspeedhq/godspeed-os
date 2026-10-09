@@ -22,6 +22,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, Mmio, Dma, Message};
 
 // --- Device register map (byte offsets into the MMIO window) -----------------
@@ -38,7 +39,6 @@ const CTRL_IRQ_EN:  u32 = 1 << 2;
 const STATUS_READY: u32 = 1 << 0;
 
 const EXPECTED_ID:  u32 = 0xC0FF_EE00; // the device's identity magic (illustrative)
-const IRQ_VECTOR:   u8  = 11;          // must match `hw_interrupt` in the contract
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -57,7 +57,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // Drain our IPC endpoint forever (the flood-endpoint discipline): a
             // registered service that idles without recv'ing lets a queue flood
             // sit at 16/16 forever. Poll + yield so the core still idles.
-            loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+            loop { while gs::ipc::try_recv(&ctx).is_some() {} gs::task::yield_now(&ctx); }
         }
     };
 
@@ -66,7 +66,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //    (Commandments V + IX). On failure, log loudly and degrade.
     if !bring_up(&ctx, &mmio, &dma) {
         ctx.log("driver-skeleton: device bring-up FAILED - idling");
-        loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
+        loop { while gs::ipc::try_recv(&ctx).is_some() {} gs::task::yield_now(&ctx); }
     }
     ctx.log("driver-skeleton: device ready, serving");
 
@@ -98,7 +98,7 @@ fn bring_up(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> bool {
     while mmio.read32(REG_STATUS) & STATUS_READY == 0 {
         spins += 1;
         if spins > 100_000 { return false; } // give up loudly, never hang
-        ctx.yield_cpu();                       // time only conserves CPU here ...
+        gs::task::yield_now(ctx);                       // time only conserves CPU here ...
     }                                          // ... the BIT is what proves ready.
 
     // Build a ring/buffer in OUR DMA arena (the arena is the driver's own, not
@@ -110,27 +110,30 @@ fn bring_up(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> bool {
     mmio.write32(REG_RING_HI, (ring_phys >> 32) as u32);
 
     // Enable the device and its interrupt, then unmask our IRQ line so the kernel
-    // routes the device's interrupt to our endpoint (§12.2).
+    // routes the device's interrupt to our endpoint (§12.2). The line is the one the
+    // kernel GRANTED at spawn (`Irq::granted`); a driver never names a vector itself,
+    // because routing a vector is authority the kernel keeps.
     mmio.write32(REG_CTRL, CTRL_ENABLE | CTRL_IRQ_EN);
-    ctx.irq_unmask(IRQ_VECTOR);
+    gs::driver::irq::Irq::granted(ctx).rearm(ctx);
     true
 }
 
 /// Main loop: block on the endpoint for a hardware interrupt or a client request,
 /// handle it, then re-arm. Never returns.
 fn serve(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> ! {
+    let irq = gs::driver::irq::Irq::granted(ctx);
     loop {
         // Block for truth. recv() parks the task until a message arrives, so the
         // core idles between events - but it is the EVENT that wakes us, never a
         // timer we guessed (Commandment VIII).
-        let msg = ctx.recv();
+        let msg = gs::ipc::recv(ctx);
 
         if is_interrupt(&msg) {
             // The device raised its IRQ: drain what it produced from the ring in
             // our DMA arena, acknowledge (write-1-to-clear), then re-arm the line.
             let _completed = dma.read32(0);          // e.g. a finished descriptor
             mmio.write32(REG_STATUS, mmio.read32(REG_STATUS));
-            ctx.irq_unmask(IRQ_VECTOR);
+            irq.rearm(ctx);
         } else {
             // A client asked for device work. Do it, then REPLY explicitly - a
             // successful send means queued, not processed (Commandment VIII), so

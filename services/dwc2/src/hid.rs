@@ -10,6 +10,7 @@
 //! into a preemptible task. Binding first means that when polling is attempted, everything under it
 //! is known good.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::chan::{self, Target};
@@ -414,7 +415,7 @@ pub fn poll(
             let _ = crate::hub::clear_tt_buffer(
                 ctx, mmio, dma, &hub, t.addr, kbd.ep, 3 /* interrupt */, true /* IN */, hub_port,
                 multi_tt);
-            state.cleared_at = ctx.read_tsc();
+            state.cleared_at = Some(wait::Since::now(ctx));
             // ESCALATE WHEN CLEARING IS NOT WORKING.
             //
             // Three clears with no report in between means the buffer flush is not the remedy for
@@ -425,12 +426,11 @@ pub fn poll(
             const CLEARS_BEFORE_RESET: u32 = 3;
             // ...but no more than once every TT_RESET_MIN_MS, whatever the counter says.
             const TT_RESET_MIN_MS: u64 = 2_000;
-            let now = ctx.read_tsc();
+            let now = wait::Since::now(ctx);
             if state.clears_since_data >= CLEARS_BEFORE_RESET
-                && (state.tt_reset_at == 0
-                    || now.wrapping_sub(state.tt_reset_at) >= ctx.duration_cycles(TT_RESET_MIN_MS))
+                && state.tt_reset_at.map_or(true, |at| at.passed(ctx, Budget::ms(TT_RESET_MIN_MS)))
             {
-                state.tt_reset_at = now;
+                state.tt_reset_at = Some(now);
                 ctx.log_fmt(format_args!(
                     "dwc2-svc: {} TT clears with no report - resetting the translator",
                     state.clears_since_data));
@@ -440,7 +440,7 @@ pub fn poll(
             // there is no software state to reset here.
         }
 
-        let now = ctx.read_tsc();
+        let now = wait::ticks(ctx);
         if hcint & crate::regs::HCINT_NAK != 0 {
             let proven = state.last_data != 0
                 && now.wrapping_sub(state.last_data) < state.repeat_window;
@@ -464,11 +464,11 @@ pub fn poll(
     let any = (0..8).any(|i| dma.read8(REPORT_OFF + i) != 0);
     if !any {
         state.pid = chan::pid_from_hctsiz(mmio, chan::CH_KBD);
-        state.last_data = ctx.read_tsc(); // a release report is proof the path works
+        state.last_data = wait::ticks(ctx); // a release report is proof the path works
         let rel = [0u8; 8];
         godspeed_sdk::hid::decode_keyboard(
             &rel, &mut state.last, &mut state.repeat, &mut state.caps,
-            ctx.read_tsc(), |ch| ctx.console_push(ch), |_| {});
+            wait::ticks(ctx), |ch| ctx.console_push(ch), |_| {});
         // (a release report emits nothing; counted for symmetry only if it ever does)
         return false;
     }
@@ -488,13 +488,13 @@ pub fn poll(
         rep[i] = dma.read8(REPORT_OFF + i);
     }
     let mut state_emitted = 0u32;
-    state.last_data = ctx.read_tsc(); // a data report is proof the path works
+    state.last_data = wait::ticks(ctx); // a data report is proof the path works
     godspeed_sdk::hid::decode_keyboard(
         &rep,
         &mut state.last,
         &mut state.repeat,
         &mut state.caps,
-        ctx.read_tsc(),
+        wait::ticks(ctx),
         |ch| { state_emitted += 1; ctx.console_push(ch) },
         |code| ctx.log_fmt(format_args!("dwc2-svc: unmapped HID key usage {:#04x}", code)),
     );
@@ -558,7 +558,7 @@ pub struct KeyState {
     /// When the TT buffer was last cleared. A clear that does not restore data tells us the endpoint
     /// itself is in trouble, and waiting out the full cold-start error budget after that is three
     /// seconds spent proving something already known.
-    pub cleared_at: u64,
+    pub cleared_at: Option<wait::Since>,
     /// How many TT clears this binding has needed. Rate-limits the log without muting the remedy.
     pub clears: u32,
     /// When the translator was last reset, and when the port was last re-enumerated.
@@ -573,8 +573,8 @@ pub struct KeyState {
     /// that was actually missing. A port reset takes ~310 ms and the device needs time afterwards, so
     /// the floor below is a hard one: no threshold, however badly chosen, can drive the remedy faster
     /// than the device can recover from it.
-    pub tt_reset_at: u64,
-    pub reenum_at: u64,
+    pub tt_reset_at: Option<wait::Since>,
+    pub reenum_at: Option<wait::Since>,
     /// Polls still to be traced. Bounded so the trace cannot flood a wedged keyboard's log.
     pub diag_left: u32,
     /// Clears since the last DELIVERED report - the counter the escalation should have been using.
@@ -596,7 +596,7 @@ impl KeyState {
             last: [0u8; 6],
             // Auto-repeat delays calibrated from THIS machine's timer rate, not assumed - the same
             // assumption cost the Wyse a keypress that repeated into `qqqqq`.
-            repeat: godspeed_sdk::hid::KeyRepeat::new_calibrated(ctx.tsc_ticks_per_10ms()),
+            repeat: godspeed_sdk::hid::KeyRepeat::new_calibrated(wait::ticks_per_10ms(ctx)),
             caps: false,
             // An interrupt endpoint starts at DATA0 after configuration.
             pid: chan::PID_DATA0,
@@ -605,16 +605,16 @@ impl KeyState {
             emitted_report: 0,
             last_data: 0,
             n_data: 0, n_nak: 0, n_nyet: 0, n_stall: 0, n_xacterr: 0, n_silent: 0,
-            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: 0, clears: 0,
-            clears_since_data: 0, tt_reset_at: 0, reenum_at: 0, diag_left: 12,
+            n_other: 0, last_other: 0, nyet_run: 0, xacterr_run: 0, cleared_at: None, clears: 0,
+            clears_since_data: 0, tt_reset_at: None, reenum_at: None, diag_left: 12,
             // ~1.5 s. Long enough that a deliberate hold keeps repeating through the initial 600 ms
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.
-            repeat_window: (ctx.tsc_ticks_per_10ms() * 150).max(1),
+            repeat_window: (wait::ticks_per_10ms(ctx) * 150).max(1),
             // ~150 ms: comfortably more than the 10 ms poll period (so ordinary jitter and a busy
             // core do not cancel a legitimate hold) and far less than the 2 s deschedule that loses
             // a release report.
-            stale_after: (ctx.tsc_ticks_per_10ms() * 15).max(1),
+            stale_after: (wait::ticks_per_10ms(ctx) * 15).max(1),
         }
     }
 }

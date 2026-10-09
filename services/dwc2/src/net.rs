@@ -8,6 +8,7 @@
 //! device class `0xff` (vendor-specific), which is why the endpoint walk does NOT filter by class:
 //! there is no standard class to match, only bulk endpoints to find.
 
+use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
@@ -164,7 +165,7 @@ pub struct Nic {
     /// answer is cached and refreshed at a bounded rate. Stale by at most `LINK_TTL_MS`, which is far
     /// shorter than any human notices a cable going in and far longer than a frame burst.
     pub link_up: bool,
-    pub link_at: u64,
+    pub link_at: Option<wait::Since>,
     /// Consecutive failed transmits, and when the backoff they triggered began.
     ///
     /// A device that refuses one frame refuses the next, and hardware showed how expensive believing
@@ -179,7 +180,7 @@ pub struct Nic {
     /// attempt is free and reversible: one probe per window finds the moment the device is willing
     /// again, and a single success clears it.
     pub tx_fail_run: u32,
-    pub tx_backoff_at: u64,
+    pub tx_backoff_at: Option<wait::Since>,
     /// HCINT from the last failed transmit, and whether the channel simply never halted.
     ///
     /// TX passed `None` for this while RX recorded it, so the log could say a transmit failed but
@@ -349,7 +350,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
             }
             break;
         }
-        ctx.sleep(ctx.duration_cycles(50));
+        gs::task::sleep_ms(ctx, 50);
     }
     if !set_ok {
         ctx.log("dwc2-svc: NIC SET_CONFIGURATION FAILED after 8 attempts");
@@ -367,8 +368,8 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<
                rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0, irq_enabled: false, rx0: [0; 4], last_bmsr: 0, bmsr_changes: 0,
                in_armed: false,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
-               link_up: false, link_at: 0,
-               tx_fail_run: 0, tx_backoff_at: 0, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0,
+               link_up: false, link_at: None,
+               tx_fail_run: 0, tx_backoff_at: None, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0,
                ping_out: false, tx_fifo_free: 0 })
 }
 
@@ -577,8 +578,8 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) {
 /// trusting a default. An unreadable PHY counts as down, for the same reason `OP_NET_INFO` says so:
 /// an unanswerable question is not a yes.
 fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic) -> bool {
-    let now = ctx.read_tsc();
-    if nic.link_at == 0 || now.wrapping_sub(nic.link_at) >= ctx.duration_cycles(LINK_TTL_MS) {
+    let now = wait::Since::now(ctx);
+    if nic.link_at.map_or(true, |at| at.passed(ctx, Budget::ms(LINK_TTL_MS))) {
         let up = link_up(ctx, m, d, t, nic);
         link_observed(ctx, m, d, t, nic, up, now);
     }
@@ -596,12 +597,12 @@ fn link_fresh(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic
 /// One writer, one place the edge is decided. Two callers updating the same cached state is how a
 /// transition goes missing.
 fn link_observed(
-    ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic, up: bool, now: u64,
+    ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &mut Nic, up: bool, now: wait::Since,
 ) {
     let was = nic.link_up;
-    let first = nic.link_at == 0;
+    let first = nic.link_at.is_none();
     nic.link_up = up;
-    nic.link_at = now;
+    nic.link_at = Some(now);
     if up && (!was || first) {
         link_reconfigure(ctx, m, d, t);
     }
@@ -1053,14 +1054,14 @@ pub fn tx(
     // A probe is still let through every window, so nothing is latched: the moment the device accepts
     // a frame the run clears and full rate resumes. Costs at most one budget per window rather than
     // one per request.
-    let now = ctx.read_tsc();
+    let now = wait::Since::now(ctx);
     if nic.tx_fail_run >= TX_FAIL_RUN {
-        if now.wrapping_sub(nic.tx_backoff_at) < ctx.duration_cycles(TX_BACKOFF_MS) {
+        if nic.tx_backoff_at.is_some_and(|at| !at.passed(ctx, Budget::ms(TX_BACKOFF_MS))) {
             nic.stats.tx_fail += 1;
             return false;
         }
         // Window elapsed: let ONE frame through to ask whether the device is willing yet.
-        nic.tx_backoff_at = now;
+        nic.tx_backoff_at = Some(now);
         // FLUSH THE FIFO BEFORE THE PROBE, when the signature says the core stalled rather than the
         // device refusing.
         //
@@ -1242,7 +1243,7 @@ pub fn tx(
         nic.tx_nptxsts = mmio.read32(crate::regs::GNPTXSTS);
         nic.tx_fail_run = nic.tx_fail_run.saturating_add(1);
         if nic.tx_fail_run == TX_FAIL_RUN {
-            nic.tx_backoff_at = now;
+            nic.tx_backoff_at = Some(now);
             // ASK THE DEVICE, do not infer it. The USB endpoint NAKing means the chip has no room for
             // the frame - but "no room" has several causes on this part and they are distinguishable
             // from its own registers, which nothing has ever read at the moment of failure:
@@ -1657,7 +1658,7 @@ pub const OP_NET_RX: u8 = 0x12;
 /// Serve one frame request. Returns false if the message was not one.
 pub fn serve(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
-    msg: &godspeed_sdk::Message, reply: godspeed_sdk::CapHandle,
+    msg: &godspeed_sdk::Message, reply: gs::cap::Cap,
 ) -> bool {
     let p = msg.payload_bytes();
     if p.is_empty() {
@@ -1703,7 +1704,7 @@ pub fn serve(
             // zeros as measurements of the network.
             health_check(ctx, mmio, dma, t, nic);
             let up = link_up(ctx, mmio, dma, t, nic);
-            let now = ctx.read_tsc();
+            let now = wait::Since::now(ctx);
             link_observed(ctx, mmio, dma, t, nic, up, now);
             nic.stats.bmsr = mii_read(ctx, mmio, dma, t, SMSC_MII_BMSR).map_or(0xFFFF, u32::from);
             // Fallible here: these three feed the periodic report, where a fabricated zero reads as a
@@ -1761,7 +1762,6 @@ pub fn serve(
         }
     };
     // `n` is the BODY length; the tag at byte 0 rides in front of it.
-    let _ = ctx.try_send_by_handle(reply, &godspeed_sdk::Message::from_bytes(&out[..n + 1]));
-    ctx.remove_cap(reply);
+    let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&out[..n + 1]));
     true
 }

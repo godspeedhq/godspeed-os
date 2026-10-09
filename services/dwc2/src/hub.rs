@@ -9,6 +9,7 @@
 //! means that when splits are attempted, the port they are attempted through is already known to
 //! report the right thing.
 
+use godspeed as gs;
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
@@ -326,7 +327,7 @@ pub fn power_all(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, ports
     // bPwrOn2PwrGood is in the hub descriptor in 2 ms units; 100 ms is comfortably past every hub's
     // value and this runs once. A device is not detectable before its port's power is good, so
     // surveying early reports an empty hub on a populated one.
-    ctx.sleep(ctx.duration_cycles(100));
+    gs::task::sleep_ms(ctx, 100);
 }
 
 /// Reset a downstream port so its device is addressable, and report the speed the hub then sees.
@@ -491,7 +492,7 @@ pub fn enumerate_downstream(
     // answering, not that it rejected the request. The split machinery had already done its job by
     // then, since the complete-split is only ever issued after the transaction translator ACKed the
     // start-split.
-    ctx.sleep(ctx.duration_cycles(15));
+    gs::task::sleep_ms(ctx, 15);
     // Split ONLY when the device actually needs one.
     let splt = if st.needs_split() { chan::hcsplt(hub.addr, port) } else { 0 };
 
@@ -577,14 +578,14 @@ pub fn enumerate_downstream(
             addressed = true;
             break;
         }
-        ctx.sleep(ctx.duration_cycles(5)); // let the bus settle before trying again
+        gs::task::sleep_ms(ctx, 5); // let the bus settle before trying again
     }
     if !addressed {
         ctx.log_fmt(format_args!(
             "dwc2-svc: port {} SET_ADDRESS {} FAILED after {} tries", port, addr, ENUM_TRIES));
         return None;
     }
-    ctx.sleep(ctx.duration_cycles(5)); // USB 2.0 9.2.6.3: 2 ms to commit the new address
+    gs::task::sleep_ms(ctx, 5); // USB 2.0 9.2.6.3: 2 ms to commit the new address
     t.addr = addr;
 
     let mut full = [0u8; 18];
@@ -598,7 +599,7 @@ pub fn enumerate_downstream(
             got = true;
             break;
         }
-        ctx.sleep(ctx.duration_cycles(5));
+        gs::task::sleep_ms(ctx, 5);
     }
     if !got {
         ctx.log_fmt(format_args!(

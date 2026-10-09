@@ -27,6 +27,7 @@
 //! holds every authority - so writing them down is a reduction even though the syscall and capability
 //! pins grew by one each to make it possible.
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, ipc::Message};
 use godspeed_sdk::service_context::supcmd;
 
@@ -70,23 +71,26 @@ fn execute(ctx: &ServiceContext, line: &str) {
                     None    => { ctx.log("control: RESTART name too long"); return; }
                 };
                 // The supervisor is restartable, so a cached cap to it goes stale on every respawn.
-                // Reacquire and retry ONCE on `Err` (the send failed - the peer is gone), never on
-                // `Ok(None)` (the deadline passed and the request may have landed).
+                // Retry ONCE when the send failed - the peer is gone, or its queue was full - and never
+                // when the deadline passed (`OutcomeUnknown`: the request may have landed).
+                // `request_within` already reacquires and resends once when the send never left; a FULL
+                // queue it hands back, and this channel retries that once too, after a reacquire, as it
+                // always has.
                 let msg = Message::from_bytes(&buf[..n]);
-                let mut answer = ctx.request_with_reply_call_err("supervisor", &msg, 10);
-                if answer.is_err() && ctx.reacquire_by_name("supervisor") {
-                    answer = ctx.request_with_reply_call_err("supervisor", &msg, 10);
+                let mut answer = gs::call::request_within(ctx, "supervisor", &msg, 10);
+                if answer.as_ref().err() == Some(&gs::Error::Busy) && gs::cap::reacquire(ctx, "supervisor") {
+                    answer = gs::call::request_within(ctx, "supervisor", &msg, 10);
                 }
                 // A spawn reply may carry a cap; control does not want it, so reclaim it (26.6).
-                if let Some(c) = ctx.take_pending_cap() { ctx.remove_cap(c); }
+                if let Some(c) = gs::ipc::take_sent_cap(ctx) { gs::cap::remove(ctx, c); }
                 match answer {
-                    Ok(Some(reply)) => match reply.payload_bytes().first() {
+                    Ok(reply) => match reply.payload_bytes().first() {
                         Some(&supcmd::OK) => ctx.log_fmt(format_args!("control: {} restarted", name)),
                         Some(&supcmd::UNKNOWN) =>
                             ctx.log_fmt(format_args!("control: restart failed: supervisor did not understand the request for {}", name)),
                         _ => ctx.log_fmt(format_args!("control: restart failed: supervisor could not restart {}", name)),
                     },
-                    Ok(None) => ctx.log_fmt(format_args!(
+                    Err(gs::Error::OutcomeUnknown) => ctx.log_fmt(format_args!(
                         "control: restart failed: supervisor did not answer within 10s ({})", name)),
                     Err(e)   => ctx.log_fmt(format_args!(
                         "control: restart failed: supervisor unreachable ({:?}) - {}", e, name)),
@@ -116,7 +120,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // worse, every METRIC published lands under a BLANK owner: the metric key is (owner, name), so
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
-    ctx.trace_as("control");
+    gs::trace::as_name(&ctx, "control");
     ctx.log("control: serving the COM2 operator channel (C1-6: out of the kernel)");
     let mut buf = [0u8; LINE_MAX];
     let mut len = 0usize;
@@ -174,7 +178,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // after which the reset above restores full speed for the rest of the line. The growth
             // factor keeps the period off any exact multiple of the quantum, so it cannot settle into
             // that resonance again.
-            ctx.sleep(ctx.duration_cycles(idle_ms));
+            gs::task::sleep_ms(&ctx, idle_ms);
             idle_ms = (idle_ms * IDLE_GROWTH).min(IDLE_MAX_MS);
         }
     }

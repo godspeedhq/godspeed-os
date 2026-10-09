@@ -56,3 +56,4 @@ data-journal-test = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }

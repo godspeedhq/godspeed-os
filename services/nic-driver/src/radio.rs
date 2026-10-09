@@ -10,7 +10,7 @@
 //! RTL8168, whose radio is a USB dongle (`docs/wifi-usb.md`, R6 and 39). Both answer the same frame ops
 //! through the same serve loop.
 
-use godspeed_sdk::{CapHandle, Message, ServiceContext};
+use godspeed_sdk::{Message, ServiceContext};
 use godspeed::driver::wait::{self, Budget};
 
 /// Which link carries `net-stack`'s frames.
@@ -89,7 +89,7 @@ pub(crate) struct Radio {
     /// is kept here and served before the next `recv`. Two slots, because one `serve` iteration can
     /// ask the radio more than once; a third is dropped loudly with its cap reclaimed, and the client
     /// times out and re-asks, which is defined (26.6, 26.7).
-    held: [Option<(Message, CapHandle)>; RADIO_HELD_MAX],
+    held: [Option<(Message, godspeed::cap::Cap)>; RADIO_HELD_MAX],
     rescued: u32,
     held_dropped: u32,
     /// The OTHER radio service on a board with two (`wifi hardware use`, `utilities/56_wifi.md` 11): the
@@ -156,7 +156,7 @@ impl Radio {
     }
 
     /// The oldest held request, if any - served before the next `recv`, because it arrived first.
-    pub(crate) fn take_held(&mut self) -> Option<(Message, CapHandle)> {
+    pub(crate) fn take_held(&mut self) -> Option<(Message, godspeed::cap::Cap)> {
         let first = self.held[0].take()?;
         self.held[0] = self.held[1].take();
         Some(first)
@@ -169,19 +169,19 @@ impl Radio {
         // - which is how net-stack's exchanges came to queue fifteen seconds behind a wifi-driver that
         // was busy bringing its chip up from cold. When the window ends, exactly one probe goes through.
         if self.down_until != 0 {
-            if ctx.read_tsc() < self.down_until {
+            if godspeed::driver::wait::ticks(ctx) < self.down_until {
                 return None;
             }
             self.down_until = 0;
         }
-        let t0 = ctx.read_tsc();
+        let t0 = godspeed::driver::wait::ticks(ctx);
         // SIFTED, not the first thing that lands. A message carrying a reply cap is a client's
         // request - net-stack asking for a frame or the link - and is kept for the serve loop; the
-        // wait goes on for the radio's actual answer. `take_pending_cap` reads and CLEARS the cap the
+        // wait goes on for the radio's actual answer. `take_sent_cap` reads and CLEARS the cap the
         // kernel installed for THIS message, so it must be asked here, at arrival (see `held`).
         let name = self.name;
         let got = ctx.request_with_reply_ms_sifted(name, msg, RADIO_MS, |m| {
-            let Some(cap) = ctx.take_pending_cap() else { return true; };
+            let Some(cap) = godspeed::ipc::take_sent_cap(ctx) else { return true; };
             let op = m.payload_bytes().first().copied().unwrap_or(0);
             if let Some(slot) = self.held.iter_mut().find(|s| s.is_none()) {
                 *slot = Some((Message::from_bytes(m.payload_bytes()), cap));
@@ -192,7 +192,7 @@ impl Radio {
                         op, self.rescued));
                 }
             } else {
-                ctx.remove_cap(cap);
+                godspeed::cap::remove(ctx, cap);
                 self.held_dropped = self.held_dropped.saturating_add(1);
                 if self.held_dropped == 1 || self.held_dropped % 16 == 0 {
                     ctx.log_fmt(format_args!(
@@ -202,7 +202,7 @@ impl Radio {
             }
             false
         });
-        let took_ms = ctx.read_tsc().wrapping_sub(t0) / ctx.duration_cycles(1).max(1);
+        let took_ms = godspeed::driver::wait::ticks(ctx).wrapping_sub(t0) / crate::cycles(ctx, 1).max(1);
         let got = match got {
             Some(r) => {
                 self.answered = self.answered.saturating_add(1);
@@ -245,7 +245,7 @@ impl Radio {
                     // Held down from here until the window ends (`down_until`); said once per entry
                     // into the window and every sixteenth after, so a radio that is simply gone is a
                     // count rather than a flood.
-                    self.down_until = ctx.read_tsc().wrapping_add(ctx.duration_cycles(RADIO_BACKOFF_MS));
+                    self.down_until = godspeed::driver::wait::ticks(ctx).wrapping_add(crate::cycles(ctx, RADIO_BACKOFF_MS));
                     self.backoffs = self.backoffs.saturating_add(1);
                     if self.backoffs == 1 || self.backoffs % 16 == 0 {
                         ctx.log_fmt(format_args!(
@@ -261,7 +261,7 @@ impl Radio {
                 // lookup once a second while the radio is down costs nothing; said once and then every
                 // sixteenth, so a radio that is simply gone is a count.
                 if self.silent_run >= RADIO_REACQUIRE_AFTER {
-                    if ctx.reacquire_by_name(self.name) {
+                    if godspeed::cap::reacquire(ctx, self.name) {
                         self.restale = self.restale.saturating_add(1);
                         if self.restale == 1 || self.restale % 16 == 0 {
                             ctx.log_fmt(format_args!(

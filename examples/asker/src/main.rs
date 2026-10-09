@@ -13,11 +13,12 @@
 //! request carrying an embedded REPLY capability, blocks for the reply, and checks
 //! that what came back is what it sent. The whole round-trip in one call:
 //!
-//!   ctx.request_with_reply("reply-server", &req)
+//!   gs::call::request_within(&ctx, "reply-server", &req, ASK_SECS)
 //!
-//! Under the hood (`sdk/rust/src/service_context.rs`) that call derives a per-request
-//! reply cap - a SEND|GRANT copy of asker's OWN endpoint cap - embeds it in the
-//! request, sends it to reply-server, and blocks on asker's endpoint for the reply.
+//! Under the hood (`stdlib/rust/src/call.rs`, over the kernel's `CallDeadline`) that
+//! call derives a per-request reply cap - a SEND|GRANT copy of asker's OWN endpoint
+//! cap - embeds it in the request, sends it to reply-server, and blocks for the reply
+//! until it arrives, the server dies, or `ASK_SECS` passes.
 //! The reply cap is the ONLY authority the server has to call asker back: no ambient
 //! channel, no identity-based reach (Commandment VII, §7, §8.5).
 //!
@@ -27,8 +28,8 @@
 //!          own endpoint - explicit, minted, non-ambient.
 //!   VIII - a successful send is QUEUED, not processed (§8.6); asker then waits for the
 //!          REPLY (truth), never for a fixed sleep (time). The generation check, not a
-//!          delay, settles a reply-server restart: a stale peer cap returns None, and
-//!          asker reacquires by name and retries.
+//!          delay, settles a reply-server restart: a stale peer cap is reacquired by
+//!          name and the request sent once more, inside `request_within`.
 //!   IX   - on a failed exchange (reply-server still spawning, or restarted) asker
 //!          reacquires "reply-server" by name via the kernel directory and retries.
 //!   X    - the request's meaning is policy in the two services; the kernel only routes.
@@ -37,6 +38,14 @@
 #![no_main]
 
 use godspeed::{self as gs, ipc::Message, ServiceContext};
+
+/// How long an ordinary echo may take. An echo server answers at once; this bounds a wedged one.
+const ASK_SECS: i64 = 5;
+
+/// How long the HANG request waits before giving up on its own. Long enough that the harness has
+/// killed the server well before it (the wake that test asserts is the kernel's `ReplyDead`, not this),
+/// and finite so a server that stays alive and silent cannot hold asker forever (CLAUDE.md 26.6).
+const HANG_SECS: i64 = 120;
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
@@ -51,15 +60,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Commandment VIII / §8.6 peer-death demonstration (driven by `osdev test reply-dead`). Once,
         // after the round-trip has proven itself, send a request the server deliberately never answers
         // (b"HANG") and block for the reply. If the server is killed while we wait, the kernel wakes us
-        // with `ReplyDead` - `request_with_reply` returns None - instead of hanging us forever. We
-        // survive it and carry on. (In the plain reply-server test the server stays alive and this
-        // simply parks asker here after its echoes - by then the round-trip is already proven.)
+        // with `ReplyDead` at once, which the library reports as `OutcomeUnknown` - the request ARRIVED,
+        // so it may have been acted on, and it is not re-sent. We survive it and carry on. The deadline
+        // is the other bound: a server that stays alive and silent ends the wait after `HANG_SECS`
+        // rather than never. (In the plain reply-server test that is what happens, long after the
+        // round-trip has proven itself.)
         if counter == 3 {
             ctx.log("asker: sending HANG - blocking for a reply the server withholds (peer-death test)");
             let hang = Message::from_bytes(b"HANG");
-            match ctx.request_with_reply("reply-server", &hang) {
-                Some(_) => ctx.log("asker: HANG unexpectedly answered"),
-                None    => ctx.log("asker: HANG woke with no reply - peer died, did NOT hang (ReplyDead recovered)"),
+            let asked = gs::driver::wait::Since::now(&ctx);
+            match gs::call::request_within(&ctx, "reply-server", &hang, HANG_SECS) {
+                Ok(_)  => ctx.log("asker: HANG unexpectedly answered"),
+                Err(e) => ctx.log_fmt(format_args!(
+                    "asker: HANG woke with no reply after {} ms ({}) - did NOT hang",
+                    asked.elapsed_ms(&ctx), e.as_str())),
             }
             gs::cap::reacquire(&ctx, "reply-server");
             gs::task::yield_now(&ctx);
@@ -70,10 +84,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let req = Message::from_bytes(&payload[..payload_len(&payload)]);
 
         // The whole RPC round-trip: embed a reply cap, send, block for the reply.
-        // None => the peer could not be reached (still spawning, or just restarted),
+        // An error => the peer could not be reached (still spawning, or just restarted),
         // in which case the embedded reply cap was reclaimed for us (no leak, §26.6).
-        match ctx.request_with_reply("reply-server", &req) {
-            Some(reply) => {
+        match gs::call::request_within(&ctx, "reply-server", &req, ASK_SECS) {
+            Ok(reply) => {
                 // THE PROOF of a correct round-trip: the reply echoes the exact request
                 // bytes. reply-server is an echo server, so reply == request iff the
                 // request reached it AND its reply reached us back over the embedded cap.
@@ -83,7 +97,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     ctx.log("asker: reply MISMATCH - echo did not round-trip");
                 }
             }
-            None => {
+            Err(_) => {
                 // reply-server not reachable yet (first ticks of boot) or mid-restart.
                 // Reacquire it by name through the kernel directory and retry next tick
                 // (§14.3) - wait for truth, not a sleep (Commandment VIII/IX).

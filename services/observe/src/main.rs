@@ -15,6 +15,7 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::ServiceContext;
 
 const MAX_SLOTS:      u32 = 224;
@@ -63,7 +64,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `observe now`, so at most one lingers. PARK (not yield) so the parked
         // instance does not peg its core until it is killed.
         print_state(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, &mut prev_tsc, false);
-        ctx.park();
+        gs::ipc::park(&ctx);
     }
 
     if ctx.probe_mode() == MODE_LIVE_FG {
@@ -72,7 +73,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // FRAME_CYCLES, and poll `q` to quit. On exit we restore the console and
         // park; the shell detects the park, cleans up, and reprints its prompt.
         run_live(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, &mut prev_tsc);
-        ctx.park();
+        gs::ipc::park(&ctx);
     }
 
     // MODE_LIVE (full `osdev run` builds): refresh every ~500 yields to the log
@@ -81,7 +82,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("observe: ready");
     let mut tick: u32 = 0;
     loop {
-        ctx.yield_cpu();
+        gs::task::yield_now(&ctx);
         tick += 1;
         if tick < YIELD_INTERVAL { continue; }
         tick = 0;
@@ -100,10 +101,10 @@ fn run_live(
     // Take the screen: stop echoing keystrokes (we paint the display ourselves),
     // hide the underline cursor, and clear once.
     ctx.console_echo(false);
-    ctx.console_write("\x1b[?25l\x1b[2J");
+    gs::io::print(ctx, "\x1b[?25l\x1b[2J");
 
     // Home + paint the first frame immediately.
-    ctx.console_write("\x1b[H");
+    gs::io::print(ctx, "\x1b[H");
     print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, prev_tsc, true);
 
     // Pace repaints by the monotonic WALL CLOCK (~1 s), not a raw TSC-cycle delta. The cycle approach
@@ -112,17 +113,17 @@ fn run_live(
     // even on x86 the cycle rate is a fragile assumption (the T630's TSC calibration is separately off).
     // epoch_secs_monotonic is the same reliable clock on every arch - RTC-deglitched on x86,
     // cntpct/timer_hz on ARM - so the refresh cadence no longer depends on knowing the cycle rate.
-    let mut last = ctx.epoch_secs_monotonic();
+    let mut last = gs::task::epoch_secs_monotonic(ctx);
     // Paint forever; the SHELL owns `q` while we run (it polls the console and KILLS us when pressed,
     // then restores the screen). We do NOT read input ourselves - one reader avoids a race over the
     // keyboard - and we SLEEP between polls so we never peg our core (a busy refresh loop would make
     // every task on this core read as ~100% in our own display, the bug this fixes). Never returns.
     loop {
-        ctx.sleep_ms(POLL_SLEEP_MS);   // short yield so we never peg our core between clock checks
-        let now = ctx.epoch_secs_monotonic();
+        gs::task::sleep_ms(ctx, POLL_SLEEP_MS);   // short yield so we never peg our core between clock checks
+        let now = gs::task::epoch_secs_monotonic(ctx);
         if now != last {                // a monotonic second elapsed -> repaint
             last = now;
-            ctx.console_write("\x1b[H");
+            gs::io::print(ctx, "\x1b[H");
             print_state(ctx, prev_core_active, prev_core_total, prev_task_ticks, prev_tsc, true);
         }
     }
@@ -157,10 +158,10 @@ fn print_state(
     // length. Residual error is sampling, not bias: a task that blocks early still gets the tick it
     // was running for. The first sample has no baseline and reports 0 rather than a fabricated
     // number.
-    let now_tsc      = ctx.read_tsc();
+    let now_tsc      = gs::driver::wait::ticks(ctx);
     let elapsed_cyc  = if *prev_tsc == 0 { 0 } else { now_tsc.saturating_sub(*prev_tsc) };
     *prev_tsc        = now_tsc;
-    let quantum_cyc  = ctx.tsc_ticks_per_10ms();
+    let quantum_cyc  = gs::driver::wait::ticks_per_10ms(ctx);
     let pct = |ticks: u64| -> u32 {
         if elapsed_cyc == 0 || quantum_cyc == 0 { return 0; }
         ((ticks.saturating_mul(quantum_cyc).saturating_mul(100)) / elapsed_cyc).min(100) as u32
@@ -249,7 +250,7 @@ fn print_state(
     ctx.console_line_fmt(live, format_args!("{}------------------------- system state ({} live) -------------------------", p, live_count));
 
     // Uptime since boot (resets on reboot) - wall-clock RTC, same source as the `uptime` command.
-    let up = ctx.uptime_secs() as u64;
+    let up = gs::task::uptime_secs(ctx) as u64;
     ctx.console_line_fmt(live, format_args!(
         "{}UPTIME: {}d {:02}:{:02}:{:02}", p, up / 86400, (up / 3600) % 24, (up / 60) % 60, up % 60));
 
@@ -385,7 +386,7 @@ fn print_state(
     // In the live view, clear any rows left over below the frame (e.g. if a task
     // count shrank between frames). The quit hint lives in the title bar up top.
     if live {
-        ctx.console_write("\x1b[J"); // erase from cursor to end of screen
+        gs::io::print(ctx, "\x1b[J"); // erase from cursor to end of screen
     }
 }
 
