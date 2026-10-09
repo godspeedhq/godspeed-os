@@ -20,11 +20,12 @@
 //!   polling and played once at start as a self-test; both are gone - the ring is refilled on the stream's
 //!   interrupt (with a watchdog for a lost one), and a tone plays only when a request asks for it (A4).
 //!
-//! **DMA is used only on the codec A2 and A3 were verified on - QEMU's (`1af4`).** On any other codec the
-//! driver stops after A1's survey and says so: on the T630 the class lookup hands it the HDMI
-//! controller, not the analog one, and the AMD controller needs its snoop bit set (docs/audio.md,
-//! "Found while preparing"). Both are A6's. On this driver's death the kernel clears its device's bus
-//! mastering, keyed on the device it was given (`kernel/src/task/scheduler.rs`).
+//! **DMA is used only on a codec in `PLAYABLE`** - QEMU's (`1af4`), where A2 and A3 were verified, and
+//! the Dell Wyse 5070's Realtek (`10ec:0225`), A6's first machine, with the setup Linux gives that codec
+//! at probe. On any other codec the driver stops after A1's survey and says so: on the T630 the class
+//! lookup hands it the HDMI controller, not the analog one, and the AMD controller needs its snoop bit
+//! set (docs/audio.md, "Found while preparing"). On this driver's death the kernel clears its device's
+//! bus mastering, keyed on the device it was given (`kernel/src/task/scheduler.rs`).
 //!
 //! **Every wait is `gs::driver`'s** - this driver is the library's independent test (docs/driver-library.md,
 //! "Wi-Fi discovers; audio tests"). A wait that has to be bent to fit is a finding about the library, and
@@ -156,8 +157,35 @@ const W_MIXER: u32 = 0x2;
 const W_SELECTOR: u32 = 0x3;
 const W_PIN: u32 = 0x4;
 
-/// QEMU's `hda-output` codec - the one A2 and A3 were verified on. See the module documentation.
-const VENDOR_QEMU: u32 = 0x1af4;
+/// A codec this driver will play on, and the setup it is given first. See the module documentation.
+struct Playable {
+    vendor: u32,
+    /// `None`: any device from this vendor.
+    device: Option<u32>,
+    /// Realtek processing coefficients set before the path is configured, each `(index, mask, bits)`:
+    /// the bits under `mask` become `bits`, the rest are kept.
+    coefs: &'static [(u32, u32, u32)],
+}
+
+const PLAYABLE: &[Playable] = &[
+    // QEMU's `hda-output` - the codec A2 and A3 were verified on.
+    Playable { vendor: 0x1af4, device: None, coefs: &[] },
+    // The Dell Wyse 5070's Realtek. The three coefficients are what Linux sets for this codec at probe,
+    // before anything plays (`alc_fill_eapd_coef`, sound/pci/hda/patch_realtek.c, 6.12). What each bit
+    // does is not documented there; they are the silicon's want, not our design (CLAUDE.md 26.14).
+    Playable { vendor: 0x10ec, device: Some(0x0225), coefs: &[(0x67, 0xF000, 0x3000), (0x36, 1 << 13, 0), (0x10, 1 << 9, 0)] },
+];
+
+fn playable(vendor: u32, device: u32) -> Option<&'static Playable> {
+    PLAYABLE.iter().find(|p| p.vendor == vendor && p.device.map_or(true, |d| d == device))
+}
+
+/// Realtek's processing-coefficient widget, and the three verbs that reach a coefficient through it -
+/// four-bit verbs with a sixteen-bit payload.
+const REALTEK_COEF_NODE: u32 = 0x20;
+const SET_COEF_INDEX: u32 = 0x5;
+const SET_PROC_COEF: u32 = 0x4;
+const GET_PROC_COEF: u32 = 0xC;
 
 // ---- Timing ------------------------------------------------------------------------------------------
 /// How long the controller has to show a change of GCTL.CRST. The spec gives no figure - "software
@@ -643,6 +671,35 @@ fn power_up(h: &mut Hda, cad: u32, nid: u32) -> bool {
     reached
 }
 
+/// Set the codec's processing coefficients, each read back so the log says what it was and what it
+/// became. False when the codec did not answer one of them.
+fn set_coefs(h: &mut Hda, cad: u32, coefs: &[(u32, u32, u32)]) -> bool {
+    let n = REALTEK_COEF_NODE;
+    for &(idx, mask, bits) in coefs {
+        let before = h.verb16(cad, n, SET_COEF_INDEX, idx).and_then(|_| h.verb16(cad, n, GET_PROC_COEF, 0));
+        let Some(before) = before else {
+            h.ctx.log_fmt(format_args!("audio-driver: codec {} coefficient {:#04x} did not answer", cad, idx));
+            return false;
+        };
+        let want = (before & 0xFFFF & !mask) | bits;
+        let after = h.verb16(cad, n, SET_COEF_INDEX, idx)
+            .and_then(|_| h.verb16(cad, n, SET_PROC_COEF, want))
+            .and_then(|_| h.verb16(cad, n, SET_COEF_INDEX, idx))
+            .and_then(|_| h.verb16(cad, n, GET_PROC_COEF, 0));
+        h.ctx.log_fmt(format_args!(
+            "audio-driver: codec {} coefficient {:#04x}: {:#06x} -> {:#06x}, read back {}",
+            cad, idx, before & 0xFFFF, want, match after {
+                Some(a) if a & 0xFFFF == want => "the same",
+                Some(_) => "DIFFERENT",
+                None => "nothing",
+            }));
+        if after.is_none() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Set up the path for playback: power, amplifiers unmuted at full gain, each node's selection of the
 /// next, the pin's output enable and EAPD where it has one, and the converter's format and stream tag.
 fn configure_path(h: &mut Hda, p: &OutPath) -> bool {
@@ -920,6 +977,11 @@ impl<'a> Player<'a> {
             }
             self.h.dma = None;
             if !start_rings(&mut self.h, self.d) {
+                return wire::CONTRADICTED;
+            }
+            // A link reset resets the codec, and its coefficients with it.
+            let coefs = playable(self.path.vendor, self.path.device).map_or(&[][..], |p| p.coefs);
+            if !set_coefs(&mut self.h, self.path.cad, coefs) {
                 return wire::CONTRADICTED;
             }
         }
@@ -1782,13 +1844,13 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
     }
     let Some(path) = outputs.get(0).copied() else { return Device::Absent(wire::no_device::NO_PATH) };
 
-    // From here on, DMA - on the codec it was verified on, and nowhere else (see the module docs).
-    if path.vendor != VENDOR_QEMU {
+    // From here on, DMA - on a codec in `PLAYABLE`, and nowhere else (see the module docs).
+    let Some(known) = playable(path.vendor, path.device) else {
         ctx.log_fmt(format_args!(
-            "audio-driver: codec vendor {:04x} is not the one playback was verified on - stopping after the survey (docs/audio.md, A6)",
-            path.vendor));
+            "audio-driver: codec {:04x}:{:04x} is not one this driver plays on yet - stopping after the survey (docs/audio.md, A6)",
+            path.vendor, path.device));
         return Device::Surveyed(wire::no_device::UNVERIFIED_CODEC, h, path);
-    }
+    };
     let Some(d) = dma else {
         ctx.log("audio-driver: no DMA arena was granted - the survey is all this driver can do");
         return Device::Surveyed(wire::no_device::NO_ARENA, h, path);
@@ -1814,6 +1876,9 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
                 other, path.vendor));
             return Device::Surveyed(wire::no_device::BRINGUP_FAILED, h, path);
         }
+    }
+    if !set_coefs(&mut h, path.cad, known.coefs) {
+        return Device::Surveyed(wire::no_device::BRINGUP_FAILED, h, path);
     }
     if !configure_path(&mut h, &path) {
         ctx.log("audio-driver: the output path could not be configured");

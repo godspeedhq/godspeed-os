@@ -53,7 +53,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
 | **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `hardware`, `outputs`, `output`, `debug`, system sounds and the keyboard shortcuts built 2026-10-09** |
 | **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
-| A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
+| A6 | Real sound on hardware. **Started on the Wyse 5070 (2026-10-09)**, which needs neither kernel fix nor a snoop bit; then the T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD. A person listening on each | Wyse, then T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
 
 **Before A3, the library work the process asks for.** Two things audio needs are already written by
@@ -1195,3 +1195,42 @@ snoop bit before its codec is even the question. On the evidence above the Wyse 
 first-of-class fix nor the snoop bit; what is left is the codec itself - pins, EAPD, and the open
 question of node 0x20. Which machine A6 starts on is the operator's choice; this records that the Wyse
 is the shorter road.
+
+## Step A6 on the Wyse 5070, first image (2026-10-09)
+
+**The change.** The driver played only on QEMU's codec. It now plays on any codec in `PLAYABLE`, a table
+of `(vendor, device, coefficients)`, and the Wyse's Realtek `10ec:0225` is the second row. Nothing else
+about the path is new: the survey, the command rings, power, amplifiers, the pin's output enable and
+EAPD were already applied to whatever path the survey found.
+
+**What Linux does for this machine, read rather than assumed** (`sound/pci/hda/hda_intel.c` and
+`patch_realtek.c`, 6.12):
+
+- The controller, `8086:3198`, is Gemini Lake: `AZX_DRIVER_SKL | AZX_DCAPS_INTEL_BROXTON`. Of what that
+  turns on, two touch configuration space, which this driver cannot write: the snoop bit (`DEVC`, 0x78
+  bit 11, written only if it is not already as wanted) and a clock-gating bit cleared around controller
+  reset (`CGCTL`, 0x48). The reset already works here - the codecs answered - so the second is not in
+  the way. The first is read on the card instead (`hardware 00:0e.0 debug`). `bxt_reduce_dma_latency` is
+  for Apollo Lake only, and the link-clock setup applies only where the clock is still at 6 MHz.
+- The codec, `10ec:0225`, gets three processing coefficients at probe, through vendor widget 0x20
+  (`alc_fill_eapd_coef`): 0x67 bits 15:12 to 3, 0x36 bit 13 clear, 0x10 bit 9 clear. They are set before
+  the path is configured, each read back and logged, and again after a hard off, since a link reset
+  resets the codec. `alc225_init`'s headphone sequence is not done: this image plays through the
+  internal speaker, pin 0x14, the first path the survey finds.
+
+**The prediction, written before the boot:**
+
+- The log says `codec commands now go through the CORB and RIRB`, then names three coefficients, each
+  `read back the same`, then `audio-driver: ready`. `audio hardware` says `ready`, not `surveyed`.
+- `audio tone 440` is HEARD from the Wyse's own speaker, and `audio status` shows it playing with the
+  underrun count at 0.
+- `audio volume 20` and then `audio volume 80` are audibly different; `audio mute` silences it.
+
+**What would falsify it, and what each says:**
+
+- A coefficient `DIFFERENT` or `did not answer`: the vendor widget is not where Linux expects it on this
+  codec, and the bring-up stops there by design.
+- `ready`, the stream running (`audio debug stream`: the link position moving) and SILENCE: the DMA is
+  fine and the sound is lost after the converter - the speaker amplifier, a coefficient, or
+  `alc225_init`'s sequence. If the position does not move, it is the controller: read `DEVC` first.
+- `ready` and noise or clicks instead of a tone: the snoop bit, read from `hardware 00:0e.0 debug`.
