@@ -63,7 +63,7 @@ is a kill order we did not think of.
 
 This is about recovery, **not security**. A capability bypass, a way to gain authority you were not
 granted, or anything else that is an attack rather than a failure to recover, is not reported here -
-do not post it in a public issue; contact the maintainer privately first.
+do not post it in a public issue; report it privately as [`SECURITY.md`](SECURITY.md) describes.
 
 ### What counts as a break
 
