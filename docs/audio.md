@@ -51,7 +51,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A1** | Reset, find the codecs, walk the widget graph, report an output path. Immediate Command registers; no DMA, no interrupt | QEMU - **built** |
 | **A2** | CORB/RIRB, the command rings the spec requires (Immediate Command is optional, and unknown on the T630's FCH). The first DMA - used only on QEMU's codec until A6, for the T630's own reasons | QEMU - **built** |
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
-| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `hardware`, `outputs`, `output`, `debug` and system sounds built 2026-10-09**; the shortcuts to come |
+| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `hardware`, `outputs`, `output`, `debug`, system sounds and the keyboard shortcuts built 2026-10-09** |
 | **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
 | A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
@@ -1070,3 +1070,36 @@ off`, the status line and that `off` survives the reboot; then in boot 2 switche
 refused command, and finds the 220 Hz refusal in that boot's capture. 62 checks, all passing. The "done"
 and plug sounds need a background job and a USB dongle with an audio device present, and are owed a
 hardware check.
+
+## Step A4: the keyboard shortcuts (2026-10-09, `feat/audio-finish`)
+
+**The Ctrl+Alt+Del pattern, as agreed.** The keyboard drivers decode the chord and put a signal byte on
+the console stream (`hid::VOLUME_UP_SIGNAL`, `VOLUME_DOWN_SIGNAL`, `MUTE_TOGGLE_SIGNAL`, 0x81-0x83,
+outside ASCII); the shell, which reads the console, does the same request the typed verb would, so the
+driver reads it back and keeps it in `/audio.settings`. No keyboard driver gains a capability or speaks to
+the audio driver.
+
+**In the decoder, not in each driver.** The chord is recognised inside `hid::emit_key`, which both a fresh
+key press and the auto-repeat pass through - so it works in `xhci`, `ehci` and `dwc2` alike with no change
+to any of them, a held Ctrl+Alt+Up sweeps the volume, and Ctrl+Alt+M is kept out of auto-repeat so a held
+key does not flap the mute. Ctrl+Alt+M is no longer the Ctrl+M carriage return it would otherwise be, and
+Ctrl+Alt+Up no longer a cursor-up; every other key means what it did. Host-tested (`sdk/rust/src/hid.rs`).
+
+**The notice, at the prompt**, is one line above it, as read back - `volume 65  [#############-------]`,
+`volume 0 - silent`, `muted (volume 65)` - with the prompt and the half-typed line put back under it. A
+press while that notice is still the line above overwrites it, so holding the keys gives one line; any
+other key ends that, since it may have moved the screen. When it cannot be done, the line says why: `no
+audio hardware on this machine`, or `audio: the audio driver is not answering`.
+
+**During `audio tone` and `audio play`** the spec has the volume join the status line those commands
+redraw. They redraw none - each prints its line once - so a shortcut there is done at once and said on a
+line of its own. Recorded as the difference from the spec rather than papered over.
+
+**`gs::io::keys`** re-exports the four signal bytes, so the shell names them from the standard library and
+the drivers from the SDK - one definition. It also closed one of the gaps `stdlib_gap_check` counts (the
+shell's Ctrl+Alt+Del byte), and that check's baseline went from 8 to 7.
+
+**What QEMU shows.** It cannot press the chord, so `osdev test audio` sends the signal bytes down the serial
+line - the byte a keyboard driver would put on the console - and checks up, down, mute and unmute as read
+back, and that `audio status` agrees: 67 checks, all passing. The chord itself is owed a hardware check on
+a real keyboard.

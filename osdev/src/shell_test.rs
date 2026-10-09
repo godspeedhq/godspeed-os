@@ -10369,6 +10369,20 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     }
     let r = run!(b"audio status\r");
     check!(r.contains("volume     30"), "status after the restart says volume 30");
+    // The keyboard shortcuts, from the shell's side: the byte a keyboard driver puts on the console for
+    // Ctrl+Alt+Up, Down and M (`hid::*_SIGNAL`, tested on the host for the driver's side), sent down the
+    // serial line here because QEMU cannot press the chord. Up, down, mute, unmute: back at 30, unmuted,
+    // so boot 2's check of what was kept still holds.
+    let r = run!(&[0x81u8]);
+    check!(r.contains("volume 35  [#######-------------]"), "Ctrl+Alt+Up: volume 35, read back, with the bar");
+    let r = run!(&[0x82u8]);
+    check!(r.contains("volume 30  [######--------------]"), "Ctrl+Alt+Down: volume 30");
+    let r = run!(&[0x83u8]);
+    check!(r.contains("muted (volume 30)"), "Ctrl+Alt+M: muted, the volume kept");
+    let r = run!(&[0x83u8]);
+    check!(r.contains("volume 30  [######"), "Ctrl+Alt+M again: unmuted, back to the volume");
+    let r = run!(b"audio status\r");
+    check!(r.contains("volume     30") && r.contains("muted      no"), "status agrees with what the shortcuts said");
     let _ = std::fs::write("build/tests/audio_test_serial.log", &buf.lock().unwrap()[..]);
     quit_qemu(&mut child, mon_port);
 

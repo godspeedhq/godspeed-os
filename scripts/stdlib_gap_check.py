@@ -40,7 +40,7 @@ STD = 'stdlib/rust/src'
 
 # The ratchet. Lower it freely when you close a gap. Raising it needs a line in the commit message
 # saying which SDK item an ordinary service now needs and why `gs` does not cover it.
-BASELINE = 8
+BASELINE = 7
 
 # 18.1 designates the SDK for device work; these crates are its intended callers.
 # Hand-kept, so it drifts: `audio-driver`, `pwm-audio` and `wifi-driver` arrived after it was written and

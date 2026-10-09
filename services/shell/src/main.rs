@@ -525,6 +525,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // /.gsh_history (bounded, best-effort) and merges it behind the session; startup touches fs zero times.
     // See `History::load` + the up-arrow arm in `handle_csi`. nav starts at 0 (empty ring = live line).
     let mut nav = hist.len();
+    // The last line above the prompt is an audio shortcut's notice, so the next one overwrites it.
+    let mut notice_above = false;
     // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
     // local session state - no global (services hold no global mutable state, §3.9).
     let mut last_result: Result<(), ShellError> = Ok(());
@@ -703,6 +705,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // the fix; putting it where it belongs is separate work, recorded rather than faked.
         // (Note 2026-10-09: that work is done - `time` loads and persists `/clock.last` itself.)
         let b = ctx.console_read();
+        // Any other key may have moved the screen (Tab lists completions below the prompt), so the next
+        // shortcut writes a fresh notice rather than overwriting what is no longer the line above.
+        if !matches!(b, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+            | gs::io::keys::MUTE_TOGGLE_SIGNAL) {
+            notice_above = false;
+        }
 
         match b {
             // Ctrl+Alt+Del (the SEC-2 follow-up). The USB driver cannot reboot - SEC-2 took REBOOT
@@ -711,11 +719,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // restores the chord's UX without handing the driver back a direct reset from any
             // context, which is what SEC-2 actually removed. The signal byte is outside ASCII, so
             // no typed key produces it, and the chord is a deliberate three-key combination.
-            godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL => {
+            gs::io::keys::CTRL_ALT_DEL_SIGNAL => {
                 gs::io::print(ctx, "\r\n");
                 cmd_reboot(&ctx);
             }
+            // The audio shortcuts (`docs/audio.md`, "Keyboard shortcuts"): the keyboard driver only
+            // signals the chord, as for Ctrl+Alt+Del, and the shell asks the audio driver. The result is
+            // ONE notice line above the prompt, as read back, with the half-typed line put back under it;
+            // a press while that notice is still the line above overwrites it, so holding the keys gives
+            // one line that counts rather than twenty.
+            gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+                | gs::io::keys::MUTE_TOGGLE_SIGNAL => {
+                let notice = audio_shortcut(&ctx, b);
+                if notice_above {
+                    gs::io::print(ctx, "\r\x1b[2K\x1b[A\x1b[2K");
+                } else {
+                    gs::io::print(ctx, "\r\x1b[2K");
+                }
+                gs::io::println(ctx, notice.as_str());
+                line.reprint(&ctx);
+                notice_above = true;
+            }
             b'\r' | b'\n' => {
+                notice_above = false;
                 // We own echo now, so move to a fresh line ourselves (the kernel used
                 // to echo the Enter as "\r\n").
                 gs::io::print(ctx, "\r\n");
@@ -9760,6 +9786,56 @@ fn audio_debug(ctx: &ShellCtx, out: &mut Out, view: &str) -> Result<(), ShellErr
     Err(ShellError::Unknown)
 }
 
+/// One audio shortcut (Ctrl+Alt+Up, Ctrl+Alt+Down, Ctrl+Alt+M), done, and the line that says what it did,
+/// AS READ BACK from the driver - never what was asked for. Volume steps by 5 and stops at 0 and 100; M
+/// mutes, or unmutes if muted. Each is the same request as the typed verb, so the driver writes it to
+/// `/audio.settings` like one. When it cannot be done the line says why - never a silent no-op.
+fn audio_shortcut(ctx: &ShellCtx, sig: u8) -> HwText<64> {
+    use audio_wire::*;
+    if audio_driver(ctx).is_none() {
+        return HwText::of(format_args!("no audio hardware on this machine"));
+    }
+    let Some(st) = audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS) else {
+        return HwText::of(format_args!("audio: the audio driver is not answering"));
+    };
+    let p = st.payload_bytes();
+    if p.first() != Some(&OK) || p.len() < STATUS_LEN {
+        return HwText::of(format_args!("audio: no device to play on - `audio status` says why"));
+    }
+    let (volume, muted) = (p[3], p[2] != 0);
+    let answer = if sig == gs::io::keys::MUTE_TOGGLE_SIGNAL {
+        audio_ask(ctx, &[OP_MUTE, !muted as u8], AUDIO_REPLY_MS)
+    } else {
+        let v = if sig == gs::io::keys::VOLUME_UP_SIGNAL { volume.saturating_add(5).min(VOLUME_MAX) } else { volume.saturating_sub(5) };
+        audio_ask(ctx, &[OP_VOLUME, v], AUDIO_REPLY_MS)
+    };
+    let Some(r) = answer else { return HwText::of(format_args!("audio: the audio driver is not answering")) };
+    let q = r.payload_bytes();
+    if !matches!(q.first(), Some(&OK) | Some(&ALREADY)) || q.len() < 3 {
+        return HwText::of(format_args!("audio: the audio driver refused that"));
+    }
+    let v = q[1];
+    let now_muted = if sig == gs::io::keys::MUTE_TOGGLE_SIGNAL { !muted } else { muted };
+    let bar = |v: u8| -> HwText<24> {
+        let mut t = HwText::<24>::EMPTY;
+        let _ = core::fmt::Write::write_str(&mut t, "[");
+        for i in 0..20u8 {
+            let _ = core::fmt::Write::write_str(&mut t, if i < v / 5 { "#" } else { "-" });
+        }
+        let _ = core::fmt::Write::write_str(&mut t, "]");
+        t
+    };
+    if q[2] == CONTRADICTED {
+        HwText::of(format_args!("audio: the codec reads back something else - the serial log says what"))
+    } else if now_muted {
+        HwText::of(format_args!("muted (volume {})", v))
+    } else if v == 0 {
+        HwText::of(format_args!("volume 0 - silent"))
+    } else {
+        HwText::of(format_args!("volume {}  {}", v, bar(v).as_str()))
+    }
+}
+
 /// `audio system sounds on|off`: the short sounds the system makes on its own (`docs/audio.md`, "System
 /// sounds"). The driver keeps the switch, in `/audio.settings`.
 fn audio_system_sounds(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError> {
@@ -9903,6 +9979,12 @@ fn audio_tone(ctx: &ShellCtx, out: &mut Out, rest: &str) -> Result<(), ShellErro
                 let played = get_u32(r.payload_bytes(), 2);
                 out.line_fmt(ctx, format_args!("stopped after {}.{} s", played / 1000, played % 1000 / 100));
                 return Ok(());
+            }
+            // An audio shortcut while the tone plays: done at once, and said on its own line - this loop
+            // redraws no status line for the volume to join (the spec's wish; recorded in docs/audio.md).
+            if matches!(k, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+                | gs::io::keys::MUTE_TOGGLE_SIGNAL) {
+                gs::io::println(ctx, audio_shortcut(ctx, k).as_str());
             }
         }
         gs::task::sleep_ms(ctx, 50);
@@ -10081,6 +10163,11 @@ fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(),
             if k == b'q' || k == b'Q' || k == 0x1b {
                 return audio_stop_said(ctx, out);
             }
+            // An audio shortcut while the file plays: done at once, said on its own line.
+            if matches!(k, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+                | gs::io::keys::MUTE_TOGGLE_SIGNAL) {
+                gs::io::println(ctx, audio_shortcut(ctx, k).as_str());
+            }
         }
         if t0.passed(ctx, limit) {
             let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
@@ -10117,6 +10204,11 @@ fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(),
         if let Some(k) = ctx.try_console_read() {
             if k == b'q' || k == b'Q' || k == 0x1b {
                 return audio_stop_said(ctx, out);
+            }
+            // An audio shortcut while the file plays: done at once, said on its own line.
+            if matches!(k, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+                | gs::io::keys::MUTE_TOGGLE_SIGNAL) {
+                gs::io::println(ctx, audio_shortcut(ctx, k).as_str());
             }
         }
         gs::task::sleep_ms(ctx, 100);

@@ -135,6 +135,15 @@ pub fn print_fmt(ctx: &ServiceContext, args: core::fmt::Arguments) {
     write_fmt(ctx, args);
 }
 
+/// The bytes a keyboard driver puts on the console stream for a chord that is not a keystroke - outside
+/// ASCII, so no typed key produces one - and that the program reading the console acts on: Ctrl+Alt+Del
+/// (`CTRL_ALT_DEL_SIGNAL`, the shell reboots), and the audio shortcuts Ctrl+Alt+Up, Ctrl+Alt+Down and
+/// Ctrl+Alt+M (`docs/audio.md`). The drivers write them from the SDK's `hid` module; this is the same
+/// definition, so the two ends cannot drift.
+pub mod keys {
+    pub use godspeed_sdk::hid::{CTRL_ALT_DEL_SIGNAL, MUTE_TOGGLE_SIGNAL, VOLUME_DOWN_SIGNAL, VOLUME_UP_SIGNAL};
+}
+
 /// Report a failed operation in one line, in the house style: `<what>: <why>`.
 ///
 /// Exists because every utility writes this by hand and they do not agree on the wording. Takes the
