@@ -144,6 +144,7 @@ const PIN_OUT_EN: u32 = 0x40;
 const EAPD_ON: u32 = 0x02;
 const AMP_OUT_LR_UNMUTED: u32 = 0xB000; // output amp, left and right, mute clear
 const AMP_MUTE: u32 = 1 << 7; // in a gain/mute word, set or read
+const AMPCAP_MUTE: u32 = 1 << 31; // in an amplifier's capabilities: it can mute
 // GET_AMP_GAIN_MUTE's payload: which amplifier (bit 15 output) and which side (bit 13 left, clear right).
 const AMP_GET_OUTPUT: u32 = 1 << 15;
 const AMP_GET_LEFT: u32 = 1 << 13;
@@ -809,6 +810,11 @@ struct Amp {
     node: u32,
     /// The amplifier's top step (its NumSteps field); 0 when the path has no amplifier to set.
     steps: u32,
+    /// Where `mute` is done: the node, and the gain it keeps while unmuted (its top step). The volume
+    /// amplifier itself when it has a mute; otherwise the nearest amplifier towards the pin that has one
+    /// - the Wyse's converter amplifier has none, and its speaker pin does. `None`: no amplifier on the
+    /// path can mute, and silence is the volume amplifier at gain 0.
+    mute: Option<(u32, u32)>,
 }
 
 /// The playing half of the driver: the codec path, what the operator asked for, and a tone if one plays.
@@ -895,27 +901,44 @@ impl<'a> Player<'a> {
         (volume as u32 * steps + 50) / 100
     }
 
-    /// Set the amplifier to the volume and the mute, and read it back. Volume 0 sets the amplifier's
-    /// own mute too - silent - while `muted` stays false: the two are separate states.
+    /// Set the volume amplifier and the mute, and read each back. Volume 0 mutes too - silent - while
+    /// `muted` stays false: the two are separate states. The mute is set where `Amp::mute` says, which
+    /// may be a different node from the volume's.
     fn apply_volume(&mut self) -> u8 {
         let Some(a) = self.amp else { return wire::UNVERIFIED };
-        let gain = self.gain_for(self.volume, a.steps);
         let silent = self.muted || self.volume == 0;
-        let word = AMP_OUT_LR_UNMUTED | if silent { AMP_MUTE } else { 0 } | gain;
+        let mut gain = self.gain_for(self.volume, a.steps);
+        let mute_here = matches!(a.mute, Some((n, _)) if n == a.node);
+        if silent && a.mute.is_none() {
+            gain = 0; // nothing on the path can mute: the lowest step is as near silence as it goes
+        }
+        let mut verdict = self.set_amp(a.node, gain, silent && mute_here);
+        if let Some((n, top)) = a.mute.filter(|&(n, _)| n != a.node) {
+            let v = self.set_amp(n, top, silent);
+            if verdict == wire::VERIFIED || v == wire::CONTRADICTED {
+                verdict = v;
+            }
+        }
+        verdict
+    }
+
+    /// One output amplifier, both sides, set to `gain` and the mute, then read back.
+    fn set_amp(&mut self, node: u32, gain: u32, mute: bool) -> u8 {
         let cad = self.cad();
-        if self.h.verb16(cad, a.node, SET_AMP_GAIN_MUTE, word).is_none() {
+        let word = AMP_OUT_LR_UNMUTED | if mute { AMP_MUTE } else { 0 } | gain;
+        if self.h.verb16(cad, node, SET_AMP_GAIN_MUTE, word).is_none() {
             return wire::UNVERIFIED;
         }
         // Read both sides back: GET_AMP_GAIN_MUTE answers the mute bit and the gain for one side.
-        let want = if silent { AMP_MUTE } else { 0 } | gain;
+        let want = if mute { AMP_MUTE } else { 0 } | gain;
         let mut verdict = wire::VERIFIED;
         for side in [AMP_GET_LEFT, AMP_GET_RIGHT] {
-            match self.h.verb16(cad, a.node, GET_AMP_GAIN_MUTE, AMP_GET_OUTPUT | side) {
+            match self.h.verb16(cad, node, GET_AMP_GAIN_MUTE, AMP_GET_OUTPUT | side) {
                 Some(r) if r & 0xFF == want => {}
                 Some(r) => {
                     self.h.ctx.log_fmt(format_args!(
                         "audio-driver: node {:#04x} amplifier reads {:#04x} after {:#04x} was set",
-                        a.node, r & 0xFF, want));
+                        node, r & 0xFF, want));
                     return wire::CONTRADICTED;
                 }
                 None => verdict = wire::UNVERIFIED,
@@ -1917,9 +1940,17 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
     }
     let v = p.apply_volume();
     match amp {
-        Some(a) => ctx.log_fmt(format_args!(
-            "audio-driver: volume {}{} on node {:#04x} ({} steps) - {}",
-            p.volume, if p.muted { ", muted," } else { "" }, a.node, a.steps, verdict_word(v))),
+        Some(a) => {
+            ctx.log_fmt(format_args!(
+                "audio-driver: volume {}{} on node {:#04x} ({} steps) - {}",
+                p.volume, if p.muted { ", muted," } else { "" }, a.node, a.steps, verdict_word(v)));
+            match a.mute {
+                Some((n, _)) if n == a.node => {}
+                Some((n, _)) => ctx.log_fmt(format_args!(
+                    "audio-driver: node {:#04x} has no mute - muting on node {:#04x}", a.node, n)),
+                None => ctx.log("audio-driver: no amplifier on the output path can mute - mute is the lowest volume step"),
+            }
+        }
         None => ctx.log("audio-driver: the output path has no amplifier - volume cannot be set on this codec"),
     }
     Device::Ready(p)
@@ -1930,20 +1961,31 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
 fn volume_amp(h: &mut Hda, p: &OutPath) -> Option<Amp> {
     for i in (0..p.len).rev() {
         let nid = p.nodes[i];
-        let caps = h.param(p.cad, nid, PARAM_AUDIO_WIDGET_CAP)?;
-        if caps & WCAP_OUT_AMP == 0 {
-            continue;
-        }
-        let amp = match h.param(p.cad, nid, PARAM_OUT_AMP_CAP) {
-            Some(0) | None => h.param(p.cad, p.afg, PARAM_OUT_AMP_CAP).unwrap_or(0),
-            Some(a) => a,
-        };
+        let Some(amp) = out_amp_caps(h, p, nid) else { continue };
         let steps = (amp >> 8) & 0x7F;
         if steps > 0 {
-            return Some(Amp { node: nid, steps });
+            // The mute: here if this amplifier has one, else the nearest one towards the pin that does.
+            let mute = (0..=i).rev().find_map(|j| {
+                let n = p.nodes[j];
+                out_amp_caps(h, p, n).filter(|c| c & AMPCAP_MUTE != 0).map(|c| (n, (c >> 8) & 0x7F))
+            });
+            return Some(Amp { node: nid, steps, mute });
         }
     }
     None
+}
+
+/// A node's output amplifier capabilities - its own, or the function group's defaults when it reports
+/// none - or `None` when the node has no output amplifier.
+fn out_amp_caps(h: &mut Hda, p: &OutPath, nid: u32) -> Option<u32> {
+    let caps = h.param(p.cad, nid, PARAM_AUDIO_WIDGET_CAP)?;
+    if caps & WCAP_OUT_AMP == 0 {
+        return None;
+    }
+    Some(match h.param(p.cad, nid, PARAM_OUT_AMP_CAP) {
+        Some(0) | None => h.param(p.cad, p.afg, PARAM_OUT_AMP_CAP).unwrap_or(0),
+        Some(a) => a,
+    })
 }
 
 fn verdict_word(v: u8) -> &'static str {

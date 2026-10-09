@@ -53,7 +53,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
 | **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `hardware`, `outputs`, `output`, `debug`, system sounds and the keyboard shortcuts built 2026-10-09** |
 | **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
-| A6 | Real sound on hardware. **Started on the Wyse 5070 (2026-10-09)**, which needs neither kernel fix nor a snoop bit; then the T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD. A person listening on each | Wyse, then T630 |
+| A6 | Real sound on hardware. **HEARD on the Wyse 5070 (2026-10-09)**, which needs neither kernel fix nor a snoop bit; then the T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD. A person listening on each | Wyse, then T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
 
 **Before A3, the library work the process asks for.** Two things audio needs are already written by
@@ -1234,3 +1234,34 @@ EAPD were already applied to whatever path the survey found.
   fine and the sound is lost after the converter - the speaker amplifier, a coefficient, or
   `alc225_init`'s sequence. If the position does not move, it is the controller: read `DEVC` first.
 - `ready` and noise or clicks instead of a tone: the snoop bit, read from `hardware 00:0e.0 debug`.
+
+## Step A6 on the Wyse 5070: HEARD (2026-10-09)
+
+**The prediction held, all of it except the mute.** The rings came up, the three coefficients were each
+`read back the same` (0x67 and 0x10 already as Linux wants them; 0x36 went 0x77d7 -> 0x57d7), the
+driver said `ready`, and `audio hardware` said `ready`. `audio tone 440` was HEARD from the Wyse's own
+speaker - a clean tone, the operator's words - the first sound this HDA driver has made on hardware.
+`played 440 Hz for 2000 ms in 2028 ms by the clock, 0 underrun(s); 23 interrupt(s), 0 watchdog
+wake(s)`: one interrupt per 85 ms period, so the stream ran on its MSI in real time. A 10 s tone at
+880 Hz stopped on `q`, and volume 20 was quieter.
+
+**The snoop bit was the wrong way and did not matter.** Configuration offset 0x78 read `0x2800`: bit 11
+set, the device permitted to read without snooping, which Linux clears on this controller. The tone was
+clean anyway, so on this machine the controller is not reading stale samples. Recorded rather than
+explained: why it does not matter here is not known, and it is the first thing to look at if a later
+machine plays noise.
+
+**The mute did not work, and the driver said so.** `muted FAILED - the codec reads back something else`,
+with the serial line `node 0x02 amplifier reads 0x11 after 0x91 was set`. The driver muted on the volume
+amplifier, the converter's, and this codec's converter amplifier has no mute: bit 31 of its capabilities
+(`0x00025757`) is clear, so the codec dropped the bit. QEMU's converter amplifier has one, which is why
+QEMU could not show it. The read-back is what caught it.
+
+**The fix:** the mute goes on an amplifier that has one. The volume stays on the converter's amplifier;
+the mute is set there if it can mute, else on the nearest amplifier towards the pin that can - here the
+speaker pin 0x14, `amp-out 0x80000000`, a mute and no steps - and if none on the path can, silence is
+the volume amplifier's lowest step, said in the log. Both are read back. The log says where the mute
+went (`node 0x02 has no mute - muting on node 0x14`).
+
+**Prediction for the next card:** that log line at boot; `audio mute` answers `muted - verified` and a
+tone is silent; `audio unmute` brings it back at the same level; volume 0 is silent too.
