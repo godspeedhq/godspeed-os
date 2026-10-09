@@ -87,7 +87,7 @@ which is the closest device-control utility, and held to the fourteen rules of `
 | `audio info` | report, pipes | the detail a fault needs: controller and codec identity, outputs the codec offers, supported rates, ring size, interrupt or polling, position |
 | `audio outputs` | report, pipes as records | the outputs the codec actually has - speaker, headphone, line out - with which is selected and whether something is plugged into each |
 | `audio output <name>` | action | choose the output: `audio output headphone`. Names come from `audio outputs`; an unknown one is refused with the list |
-| `audio hardware` | report, pipes as records | (agreed 2026-10-09) every audio device on the machine, one row each: name, what it is, where (PCI address or SoC), its driver or that none drives it, its state, and `*` on the one `audio` talks to. See "Which device: `audio hardware`" below |
+| `audio hardware` | report, pipes as records | (agreed and built 2026-10-09) every audio device on the machine, one row each: its PCI address or `jack`, what it is, who made it, its driver or `-`, its state, and `*` on the one `audio` talks to. See "Which device: `audio hardware`" below |
 | `audio hardware <device>` | report, pipes | (agreed 2026-10-09) one device in full: identity, bus address, what was granted, and why it is or is not driven |
 | `audio volume <0-100>` | action | set the volume. Reading it is `audio status` - one way to ask (rule 3) |
 | `audio mute` | action | silence the output, keeping the volume |
@@ -234,10 +234,13 @@ class-0x0403 controllers - its analog Azalia with the ALC255, and the Radeon's H
 kernel binds the FIRST, the HDMI one ("Found while preparing" 2, `backlog/80` K2). A report listing both,
 with which one the driver holds, would have shown that on the first boot instead of in an audit.
 
-- **`audio hardware`** is a report, one row per audio device, and pipes as records: a short name
-  (`analog`, `hdmi`, `jack`), what it is (an HD Audio controller and its codec, or the PWM jack), where
-  (a PCI address, or the SoC), the service that drives it or `none`, its state, and `*` on the one every
-  other `audio` verb talks to.
+- **`audio hardware`** is a report, one row per audio device, and pipes as records: its name, what it
+  is (an HD Audio controller, or the PWM jack), who made it by the bus's IDs, the service that drives it
+  or `-`, its state, and `*` on the one every other `audio` verb talks to.
+- **Named by bus address, not `analog` or `hdmi`** (decided while building it, 2026-10-09): a device is
+  named as `hardware` names it - `00:09.2` - or `jack` on the Pis. A controller no driver holds has a
+  codec nobody has asked, so calling it `analog` or `hdmi` would be a guess; the vendor IDs beside it
+  (an AMD GPU's against an AMD chipset's) say which is which without one.
 - **`audio hardware <device>`** is one device in full, as labelled lines: controller and codec identity,
   the bus address, what the grant gave (window, interrupt, IOMMU confinement) and why it is or is not
   driven.
@@ -977,3 +980,21 @@ checks the list, the in-use mark, the pipe as records, that choosing the output 
 that an output the codec lacks is refused with the list - 46 checks, all passing. Switching between two
 outputs needs a codec with two: the T630's ALC255 has a headphone jack, a speaker and a line out, and is
 A6's.
+
+## Step A4: `audio hardware` (2026-10-09, `feat/audio-finish`)
+
+**Built from `hardware`'s own gathering**, so the two commands can never disagree about what is on the
+machine or who drives it: the rows are `hardware`'s multimedia-class PCI devices and the Pis' jack, and
+the device `audio` talks to is the one the running audio driver was given - which `hardware` marks by the
+rule the supervisor spawns by, the first device of the driver's class. For that one device the state is
+the driver's own word, read live: `ready`, `off`, or why it stopped (`surveyed, not played (A6)` on the
+T630 today). Every other device's state is `hardware`'s: `not driven` with the driver that took the first
+of its class, or `no driver`. `audio hardware <device>` adds `hardware why`'s reason and `hardware
+<device>`'s registers and grant, and `audio info` for the one in use.
+
+**It answers whether or not an audio driver runs**, because the case it exists for is a driver holding
+the wrong device - and a machine with no audio driver at all still has its devices listed.
+
+**QEMU has one controller**, so `osdev test audio` shows the row, the mark, the pipe, one device in full
+and a refused name (50 checks, all passing). The T630 is the machine with two, and is where this shows
+`backlog/80` K2 in one line.

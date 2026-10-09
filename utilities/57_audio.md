@@ -16,10 +16,10 @@ jack); the Pi 2 is built and not yet heard. Not run on hardware on x86: on the T
 answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
 
 The verbs in section 1 are built, and the volume, the mute and the output survive a reboot (section 5).
-`outputs` and `output` were built on 2026-10-09 (`feat/audio-finish`) and run in QEMU, whose codec has ONE
-output - so the list, the in-use mark and a refused name are shown there, and switching between two
-outputs is not, until hardware with two. The rest of the surface the operator agreed - `hardware`
-(agreed 2026-10-09), `debug`, `system sounds` and the keyboard shortcuts - is designed in
+`hardware`, `outputs` and `output` were built on 2026-10-09 (`feat/audio-finish`) and run in QEMU, which
+has ONE audio controller with ONE output - so the reports, the in-use marks and a refused name are shown
+there; a second controller and switching between two outputs are not, until hardware with them. The rest
+of the surface the operator agreed - `debug`, `system sounds` and the keyboard shortcuts - is designed in
 `docs/audio.md` and not built yet; each of those words answers `not built yet` rather than being mistaken
 for a fault.
 
@@ -32,8 +32,8 @@ for a fault.
 | `audio info` | report, pipes | the detail a fault needs: controller version, codec, the path from converter to pin, the amplifier and the step it is at, the format, the ring, interrupt or polling |
 | `audio outputs` | report, pipes as records | BUILT: the outputs the device has - line out, speaker, headphone - with `*` on the one playing, and whether something is plugged into each where the jack can tell (`plugged in`, `empty`, or `cannot tell`). Two of a kind are numbered: `line out`, `line out 2` |
 | `audio output <name>` | action | BUILT: play through that output - `audio output headphone`. Names come from `audio outputs`; an unknown one is refused with the list. Refused while something plays, and kept in `/audio.settings` |
-| `audio hardware` | report, pipes as records | AGREED 2026-10-09, not built yet: every audio device on this machine, one row each - its name (`analog`, `hdmi`, `jack`), what it is, where it is (a PCI address, or the SoC), the service that drives it or that none does, its state, and `*` on the one `audio` talks to. The T630 has two (its analog codec and the Radeon's HDMI audio), which is why this exists |
-| `audio hardware <device>` | report, pipes | AGREED 2026-10-09, not built yet: one device in full - controller and codec identity, bus address, what was granted (window, interrupt, IOMMU confinement), and why it is or is not driven |
+| `audio hardware` | report, pipes as records | BUILT 2026-10-09: every audio device on this machine, one row each - its PCI address as `hardware` names it (or `jack` on the Pis), what it is, who made it, the service that drives it or `-`, its state (the driver's own word for the one it holds: `ready`, `off`, `surveyed, not played (A6)`), and `*` on the one `audio` talks to. Answers with or without an audio driver running. The T630 has two controllers (its analog codec and the Radeon's HDMI audio), which is why this exists |
+| `audio hardware <device>` | report, pipes | BUILT 2026-10-09: one device in full, by the name `audio hardware` gives it - why it is or is not driven, its registers and grant as `hardware <device>` shows them, and the driver's account (`audio info`) for the one in use. `audio hardware use` is not built: no machine has two audio devices a driver can play on |
 | `audio volume <0-100>` | action | set the volume. Reading it is `audio status` - one way to ask (rule 3) |
 | `audio mute` | action | silence the output, keeping the volume |
 | `audio unmute` | action | restore the volume set before `mute` |
@@ -87,7 +87,8 @@ something else` when it disagrees.
 
 `status` and `info` start pipes, as labelled lines: `audio status | match volume`, `audio info | write
 /audio-info.txt`. `outputs` pipes as records - `output`, `plugged`, `in_use` - so `audio outputs | count`
-is how many there are. The actions refuse with a sentence naming the reports. Piping sound IN will be refused
+is how many there are; `hardware` pipes as records too - `device`, `kind`, `made_by`, `driver`, `state`,
+`in_use`. The actions refuse with a sentence naming the reports. Piping sound IN will be refused
 in the design: a pipe carries 16 KiB, a tenth of a second of sound, so `play` takes a PATH and the file is
 the adapter (`docs/audio.md`).
 

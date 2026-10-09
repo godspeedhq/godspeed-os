@@ -10271,6 +10271,19 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(r.contains("already playing through line out"), "choosing the output in use sends nothing");
     let r = run!(b"audio output headphone\r");
     check!(r.contains("no output called 'headphone'") && r.contains("line out"), "an output it does not have is refused with the list");
+    // QEMU has ONE audio controller, so the second-controller case (the T630's) is not shown here; the
+    // report, its pipe, one device in full and a refused name are.
+    let r = run!(b"audio hardware\r");
+    check!(r.contains("HD audio") && r.contains("audio-driver") && r.contains("ready") && r.contains("*"),
+        "hardware: the HD audio controller, its driver, ready, in use");
+    let dev = r.lines().find(|l| l.contains("HD audio")).and_then(|l| l.split_whitespace().next()).unwrap_or("").to_string();
+    let r = run!(b"audio hardware | count\r");
+    check!(r.contains('1'), "hardware pipes as records: one row");
+    let r = run!(format!("audio hardware {}\r", dev).as_bytes());
+    check!(!dev.is_empty() && r.contains("driven by audio-driver") && r.contains("the driver's account"),
+        "hardware <device>: why it is driven, and the driver's account");
+    let r = run!(b"audio hardware 99:99.9\r");
+    check!(r.contains("no audio device called '99:99.9'"), "an unknown device is refused with the list");
     let r = run!(b"audio off\r");
     check!(r.contains("audio off - the codec is powered down"), "off");
     let r = run!(b"audio tone 440 1\r");
