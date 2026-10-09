@@ -1992,7 +1992,7 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Two amendments to the grandfathered floors stand (the floor has since fallen to 83, `audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84 (`audits/unsafe-audit.md`):
 
 > **Amendment 2026-10-08 (the boot record): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
 > `unsafe { raw_syscall(13, 27, ..) }` call site, `boot_record_query`, behind the safe

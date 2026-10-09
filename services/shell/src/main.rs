@@ -5641,7 +5641,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("hardware interrupts | where <col><op><val>", "records: device, route, driver", "hardware interrupts | where driver=xhci"),
         ], false),
         ("hardware", "report") => help_block(ctx, "hardware report", "everything, for a bug report", &[
-            ("hardware report", "the overview, the interrupts, every driven device in full, the cores", "hardware report"),
+            ("hardware report", "the overview, problems, interrupts, firmware, events, every driven device in full, the cores", "hardware report"),
             ("hardware report | write <path>", "keep it; the pipe holds 16 KiB and says when it cut", "hardware report | write /hw.txt"),
         ], false),
         ("hardware", "problems") => help_block(ctx, "hardware problems", "what is wrong now, from what each owner answers", &[
@@ -7214,9 +7214,10 @@ impl HwRow {
 /// bare view and answered by name when asked for (`docs/hardware-design.md` 1).
 const HW_SECTIONS: [&str; 6] = ["cpu", "memory", "pci", "soc", "display", "usb"];
 /// Rows gathered at most. A bound, not a fit: the PCs show about a dozen.
-// 24 was one short of the T630 (4 cores, memory and 19 PCI devices fill it exactly), so its `soc`,
-// `display` and `usb` rows were dropped without a word. A row that does not fit is now COUNTED and said
-// (`dropped`); 48 holds 16 cores, 24 PCI devices and the rest with room.
+// 24 was one short of the T630 (4 cores, memory and 22 PCI devices filled it), so its `soc`, `display`
+// and `usb` rows were dropped without a word. A row over `HW_ROWS` is now COUNTED and said (`dropped`).
+// Not counted, and bounded before a row is made: more than 16 cores, 32 PCI devices, `HW_DRIVERS`
+// spawn rows or `HW_USB` USB matches.
 const HW_ROWS: usize = 48;
 /// The supervisor's spawn rows with a device, and its USB matches, kept for one gathering.
 const HW_DRIVERS: usize = 16;
@@ -7350,7 +7351,8 @@ fn hw_running(ctx: &ServiceContext, name: &str) -> &'static str {
     if slot_of(ctx, name).is_some() { "running" } else { "not running" }
 }
 
-/// Ask once, bounded; any failure is no answer.
+/// Ask, bounded: `request_within` sends again once if the first send failed on a stale capability, and
+/// never repeats a question that timed out. Any failure is no answer.
 fn hw_ask(ctx: &ServiceContext, peer: &str, body: &[u8]) -> Option<Message> {
     const ANSWER_SECS: i64 = 2;
     gs::call::request_within(ctx, peer, &Message::from_bytes(body), ANSWER_SECS).ok()
@@ -8080,8 +8082,9 @@ fn hw_why(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
     }
 }
 
-/// `hardware report`: everything, for a bug report - the overview, the interrupts, each device with a
-/// driver in full, the cores. Text, to paste or `| write`; the pipe holds 16 KiB and says when it cut.
+/// `hardware report`: everything, for a bug report - the overview, problems, interrupts, firmware, events,
+/// each device with a driver in full, the cores. Text, to paste or `| write`; the pipe holds 16 KiB and
+/// says when it cut.
 fn hw_report(ctx: &ShellCtx, out: &mut Out, f: &HwFacts) {
     out.line_fmt(ctx, format_args!("GodspeedOS hardware report - {}", ARCH));
     hw_print(ctx, out, f, 0xFF, false);
@@ -8500,6 +8503,7 @@ fn build_hw_events(ctx: &ServiceContext, f: &HwFacts) -> Option<(Table, u32, u32
             supcmd::EV_ATTACHED => ("attached", HwText::of(format_args!("{} started for it", name))),
             supcmd::EV_DETACHED => ("removed", HwText::of(format_args!("{} stopped", name))),
             supcmd::EV_SWEPT => ("driver died", HwText::of(format_args!("{}, found dead by the sweep and restarted", name))),
+            supcmd::EV_START_FAILED => ("attached", HwText::of(format_args!("{} could NOT be started for it", name))),
             _ => ("event", HwText::of(format_args!("{} (code {})", name, what))),
         };
         let time = HwText::<12>::of(format_args!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60));
@@ -8523,7 +8527,7 @@ fn hw_events(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) -> Result<(), She
     out.line(ctx, "");
     let lost = recorded.saturating_sub(t.nrows() as u32);
     out.line_fmt(ctx, format_args!(
-        "time is uptime; recorded by the supervisor since it started at {:02}:{:02}:{:02}{}",
+        "time is uptime; recorded by the supervisor since {:02}:{:02}:{:02}, when it last started and finished its boot spawns{}",
         since / 3600, (since / 60) % 60, since % 60,
         if lost > 0 { HwText::<48>::of(format_args!(", {} older event(s) overwritten", lost)) } else { HwText::EMPTY }.as_str()));
     out.line(ctx, "not recorded: what the kernel does - grants, IOMMU confinement and release, controller resets");
@@ -13781,7 +13785,7 @@ fn chaos_sub_help(ctx: &ServiceContext, mode: &str) -> bool {
         ], false),
         "max-carnage" => help_block(ctx, "chaos max-carnage", "the chaos monkey: random or aimed kills every round", &[
             ("chaos max-carnage all-services <n> [yes]", "each round kills a RANDOM subset of the live services (the supervisor included), plus system-wide mem-pressure and spawn-storm; `yes` skips the confirm", "chaos max-carnage all-services 100"),
-            ("chaos max-carnage all-services <n> seed <s>", "replay a run's random draws: every run prints its seed at the start and in its report. It replays the draws, not the timing, so a run can part ways with the one it repeats", "chaos max-carnage all-services 100 seed 1234567890"),
+            ("chaos max-carnage all-services <n> seed <s>", "replay a run's random draws: every all-services run prints its seed at the start and in its report (an aimed run draws nothing). It replays the draws, not the timing, so a run can part ways with the one it repeats", "chaos max-carnage all-services 100 seed 1234567890"),
             ("chaos max-carnage <svc> <n>", "aim every round at one service", "chaos max-carnage fs 50"),
             ("chaos max-carnage <svc>,<svc>,... <n>", "kill EVERY listed service each round - cascade stress", "chaos max-carnage fs,events 100"),
         ], false),
@@ -15646,9 +15650,9 @@ fn events_log_boot(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError
         ctx.console_writeln_fmt(format_args!(
             "events: the boot record is FULL at {} KiB and stopped there - later lines are on serial, and the recent ones in `events log`", cap / 1024));
     } else {
-        // Not yet full: it holds EVERYTHING logged since boot, and keeps filling until it is. The Pi 2
-        // read 29323 bytes and then 29591 seconds later; "the whole boot record" read as final when it
-        // was still growing.
+        // Not yet full: it holds EVERYTHING logged since boot, and keeps filling until it is. On the Pi 2
+        // it read 29323 bytes, and 29591 bytes a few seconds later; "the whole boot record" read as final
+        // when it was still growing.
         ctx.console_writeln_fmt(format_args!(
             "events: the boot record holds everything logged since boot, {} byte(s) - it fills to {} KiB and then stops. It is the KERNEL'S copy and never wraps; `events log` is the sink's recent window", held, cap / 1024));
     }

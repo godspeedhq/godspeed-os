@@ -77,7 +77,8 @@ use godspeed_sdk::service_context::usbdev;
 fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &DevEvents, payload: &[u8]) -> bool {
     if payload.first() != Some(&supcmd::MARKER) { return false; }
 
-    // `supcmd::DEVICES` answers with a body rather than a status byte; everything else leaves it empty.
+    // `supcmd::DEVICES`, `EVENTS` and `WHY` answer with a body rather than a status byte; everything else
+    // leaves it empty.
     let mut body = [0u8; DEVICES_REPLY_MAX];
     let mut body_len = 0usize;
 
@@ -1154,9 +1155,9 @@ fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
             }
             DeadlineOutcomeInto::Reply(n) => {
                 // Too short to name its question: the device count (4 bytes) or an unknown-op `?` (1).
-                // Not this question's, so not used. (A late 17-byte device record carries its class at
-                // the same offset, so it reaches the arm above and is used only if it is a device of
-                // the class asked about - whose address is then a right answer anyway.)
+                // Not this question's, so not used. (A late 17-byte device record never gets here: the
+                // reply buffer is 16 bytes, the kernel refuses a reply larger than the buffer it was
+                // told of, and that refusal ends the asking below - the kernel's own scan answers.)
                 ctx.log_fmt(format_args!(
                     "supervisor: hw-enumerator answered {} byte(s) where a class answer is 8 (an answer to another question) - discarded, asking again",
                     n));
@@ -1534,8 +1535,10 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, ev
     }
     ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached (binding {}) - starting {}",
         r.vid, r.pid, r.gen, m.driver));
-    events.note(ctx, supcmd::EV_ATTACHED, m.driver, m.vid, m.pid);
-    if !spawn_wired(ctx, map, m.driver, m.peers) {
+    if spawn_wired(ctx, map, m.driver, m.peers) {
+        events.note(ctx, supcmd::EV_ATTACHED, m.driver, m.vid, m.pid);
+    } else {
+        events.note(ctx, supcmd::EV_START_FAILED, m.driver, m.vid, m.pid);
         ctx.log_fmt(format_args!("supervisor: {} could not be started for its device", m.driver));
     }
 }

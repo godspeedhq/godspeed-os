@@ -132,8 +132,9 @@ assert ok events status
 events ipc | assert contains outcome
 
 # ===== the `hardware` utility: the model holds on this machine (docs/hardware-design.md 13) =====
-# Read only, and read from what the owners answer: no kernel query, so what only the kernel holds -
-# IOMMU faults, interrupt counts - is not asserted here, and `hardware problems` says it did not look.
+# Read only, and read from what the owners already answer - the kernel's existing introspection
+# queries included, with no kernel change - so what the kernel does not report (IOMMU faults, interrupt
+# counts) is not asserted here, and `hardware problems` says it did not look.
 echo ''
 echo '===== hardware: every device it shows, driven by a running service ====='
 assert ok hardware

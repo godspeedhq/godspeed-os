@@ -734,6 +734,12 @@ fn periodic_timer_count() -> u32 {
     if t > 0 { t as u32 } else { PERIODIC_TIMER_COUNT }
 }
 
+const TIMER_CORES: usize = 64;
+const TIMER_UNSET: u8 = 0;
+const TIMER_QUANTUM: u8 = 1;
+const TIMER_IDLE: u8 = 2;
+/// About half a second of quanta (10 ms each, calibrated).
+const TIMER_STARVE_QUANTA: u64 = 50;
 /// WHICH PERIOD THIS CORE'S TIMER IS COUNTING, AND WHEN IT LAST FIRED - so the idle path never
 /// restarts a countdown it does not have to.
 ///
@@ -752,12 +758,6 @@ fn periodic_timer_count() -> u32 {
 /// - a timer that has not fired for `TIMER_STARVE_QUANTA` quanta is not rewritten until it does, so
 ///   a core switching between idle and work faster than either period still ticks - at worst every
 ///   ~1.5 s, inside the watchdog's 3 s.
-const TIMER_CORES: usize = 64;
-const TIMER_UNSET: u8 = 0;
-const TIMER_QUANTUM: u8 = 1;
-const TIMER_IDLE: u8 = 2;
-/// About half a second of quanta (10 ms each, calibrated).
-const TIMER_STARVE_QUANTA: u64 = 50;
 static TIMER_MODE: [core::sync::atomic::AtomicU8; TIMER_CORES] =
     [const { core::sync::atomic::AtomicU8::new(TIMER_UNSET) }; TIMER_CORES];
 static TIMER_LAST_FIRED: [core::sync::atomic::AtomicU64; TIMER_CORES] =

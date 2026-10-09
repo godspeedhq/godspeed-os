@@ -1275,3 +1275,62 @@ names that exist and statements that are false.
 **Left as they are:** dated sections true when written, with pointers added only where a later section
 reversed them and nothing said so; `backlog/03`, 14, 48 and 57's runs of the bare `chaos max-carnage`
 form (Audit 11).
+
+## Audit 13 - documents and code comments, `feat/wifi-driver` since `a0cb2991` (2026-10-09)
+
+Scope: the 21 commits since Audit 12 - `events log boot`, the `hardware` utility's three steps, the
+chaos seed, `SECURITY.md` and `CONTRIBUTING.md`'s "Break it", the x86 timer and IOMMU fixes - about
+3,400 lines over 36 files. Read by two independent readers, one for documents against the code and one
+for code comments against the code beside them; every finding was checked in the code before it was
+changed. All eleven documentation gates were green before and after.
+
+**Wire formats, checked at both ends and consistent:** the chaos launch message (`rounds | has_seed |
+seed | target`), `supcmd::DEVICES`, `EVENTS` and `WHY`, and `hw-enumerator` ops 3 and 4.
+
+**Wrong, and fixed:**
+- `utilities/38_chaos.md` 5b said `max-carnage` spares the shell and rolls "a creative action mix -
+  kill, flood, flood-then-kill, or kill-then-flood", and showed a report with per-service "recovered"
+  counts. The run lives in the `chaos` service so that the shell CAN be a victim; `all-services` flips a
+  coin per live service, floods and kills each one picked (`shell` and `fs` killed, never flooded), and
+  tracks no recovery. Rewritten from the code, with the Pi 4's report of 2026-10-09 as the sample. This
+  was flagged as unconfirmed when the seed text was added beside it, and is confirmed now.
+- `hardware events` reported "`<driver>` started for it" when the start FAILED: the supervisor noted the
+  attach before `spawn_wired` ran. It now notes after, and a failed start is its own event
+  (`supcmd::EV_START_FAILED`, "could NOT be started"). The one behaviour change in this audit.
+- `ask_bdf_for_class`: a comment said a late 17-byte device record reaches the class check. The reply
+  buffer is 16 bytes and the kernel refuses a larger reply, so that refusal ends the asking and the
+  kernel's own scan answers. Safe, but not the path described.
+- `docs/hardware-design.md`: "`hardware` keeps what the boot FOUND (the bus, the IOMMU, the timer
+  mode)" - it shows neither of the last two; "each core's timer mode ... nothing reads it" - the idle
+  path reads it since `bdc7adaa`, nothing REPORTS it; `hardware events` "on the `events` service" - the
+  supervisor keeps it; `hardware report [write <path>]` - the built form is `| write`.
+- `utilities/58_hardware.md`: the problems bullet "an interrupt on a device showing none" - the check
+  is for no MSI enabled.
+- `scripts/selfcheck/20-hardware.gsh` said `hardware` makes "no kernel query" - it uses the existing
+  introspection queries; what it makes is no kernel CHANGE.
+- An `events log boot` comment read "29591 seconds later" for 29591 bytes.
+
+**Stale, and fixed:** the 58 spec's step-3 "not yet run on hardware" (the T630, Pi 2, Pi 4 and
+VisionFive have since run it - `tree` and `compare` only in QEMU, said); `hardware-design.md`'s status
+lines and four rows of its section 9 table (DEVICES, the SoC rows, radio firmware, the `why` reasons -
+all answered now); CLAUDE.md 18.5's lead-in ("two amendments ... fallen to 83" - three stand, and the
+floor is 84); `audits/kernel-audit.md` A9-4 "FIXED pending that card" (a dated note added: the card
+ran); the `HW_ROWS` comment's "19 PCI devices" (22); `hw_report`'s doc and help (it also prints
+problems, firmware and events); `handle_command`'s "only DEVICES has a body" (EVENTS and WHY too).
+
+**Overclaims, and fixed:** the `HW_ROWS` comment said every row that does not fit is counted - the
+caps on cores, PCI devices, drivers and USB matches are applied before a row is made and are not;
+`supcmd::EVENTS`'s `since` is when the record began, after the boot spawns, not the supervisor's start;
+`boot_record_size` said later lines are "only on serial" (the ring holds them too until it wraps); the
+seed help said every run prints a seed (only `all-services` draws one); `hw_ask` said "ask once" (a
+failed send is retried once after a reacquire; a timeout never is); `selfcheck hardware`'s summary
+said every device shown has a running driver and a report reads back unchanged (it asserts no driver
+is "not running", and no device added or removed).
+
+**A gap between two documents:** `SECURITY.md` sent a recovering crash to "Break it", whose list of
+breaks does not include one, and neither said where a panic CHAOS causes belongs. Both now say: `chaos`
+holds the authority to kill services, so what it breaks - a panic included - is a recovery bug, in
+public; a panic an unprivileged service or a network peer can cause is a security bug.
+
+**One comment moved:** the explanation of the x86 timer modes sat on `TIMER_CORES` while three
+comments sent readers to `TIMER_MODE`; it is on `TIMER_MODE` now.

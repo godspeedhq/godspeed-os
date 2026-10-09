@@ -61,8 +61,10 @@ it is to let anyone try to make it false. So: if you have a machine with cores a
 tell us. A break found by a stranger is worth more than a thousand rounds we ran ourselves, because it
 is a kill order we did not think of.
 
-This is about recovery, **not security**. A capability bypass, a way to gain authority you were not
-granted, or anything else that is an attack rather than a failure to recover, is not reported here -
+This is about recovery, **not security**. `chaos` holds the authority to kill services, so whatever it
+breaks - a kernel panic included - is a recovery bug and belongs here, in public. A panic that an
+unprivileged service or a network peer can cause, a capability bypass, a way to gain authority you were
+not granted, or anything else that is an attack rather than a failure to recover, is not reported here -
 do not post it in a public issue; report it privately as [`SECURITY.md`](SECURITY.md) describes.
 
 ### What counts as a break

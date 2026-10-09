@@ -516,7 +516,8 @@ pub mod supcmd {
     pub const WHY:     u8 = b'W';
     /// What has happened to the devices this supervisor drives since it started. Read only:
     /// `[MARKER, EVENTS]`, answered with `[OK, since u32 LE, recorded u32 LE, count, entries...]` - since:
-    /// the supervisor's start, in seconds of uptime; recorded: every event noted, so `recorded - count`
+    /// when this supervisor began its record (after its boot spawns), in seconds of uptime; recorded: every
+    /// event noted, so `recorded - count`
     /// were overwritten; per entry the uptime second (u32 LE), an `EV_*` code, the USB vid and pid (u16
     /// LE each, 0 for a driver event), and the driver's name (length byte, bytes). `hardware events`.
     pub const EVENTS:  u8 = b'E';
@@ -530,6 +531,8 @@ pub mod supcmd {
     pub const EV_DETACHED: u8 = 4;
     /// A device's driver was found dead by the sweep - its death notice never arrived - and restarted.
     pub const EV_SWEPT: u8 = 5;
+    /// A USB device was reported attached and its driver could not be started.
+    pub const EV_START_FAILED: u8 = 6;
 
     /// Reply status, one byte, so a caller can log the truth rather than assume success.
     pub const OK:      u8 = 0;
@@ -2941,7 +2944,8 @@ impl ServiceContext {
 
     /// The kernel's BOOT RECORD size: `(held, capacity)` in bytes, or `None` without INTROSPECT
     /// (InspectKernel query 27). The record is a fixed copy of the first bytes ever logged, which
-    /// never wraps; `held == capacity` means it filled and later lines are only on serial.
+    /// never wraps; `held == capacity` means it filled, and later lines are only in the kernel's ring
+    /// (until it wraps) and on serial.
     pub fn boot_record_size(&self) -> Option<(usize, usize)> {
         let held = self.boot_record_query(0, 0);
         let cap = self.boot_record_query(1, 0);

@@ -1893,3 +1893,6 @@ is not rewritten until it does. Worst case between ticks about 1.5 s, inside the
 neutral code changed. QEMU: identity 24/24 (Test 8, preemption, included), the x86 shell suite 215/0,
 chaos-repro 300 rounds clean; QEMU's TSC rate is uncalibrated, so the starvation rule is exercised only
 on hardware. **A9-4 is FIXED pending that card.**
+
+*(2026-10-09, Audit 13: the card ran - the T630 at `bdc7adaa`, all 1000 rounds of `chaos max-carnage`,
+no liveness panic, operator-accepted, `docs/wifi-usb.md` 51. A9-4 is FIXED.)*

@@ -3,9 +3,9 @@
 
 **Status: STEPS 1 TO 3 BUILT (2026-10-08 and 09); step 4, `power`, designed and not built. No kernel
 change, by the operator's rule (section 10).** Agreed with the operator in conversation on
-2026-10-08, during the T630 cards of `docs/wifi-usb.md` 51. Step 1 of the build order (section 14) is
-built and its spec is `utilities/58_hardware.md`, which is what the shell answers; this note stays the
-design for everything after it.
+2026-10-08, during the T630 cards of `docs/wifi-usb.md` 51. Steps 1 to 3 of the build order (section 14) are
+built and their spec is `utilities/58_hardware.md`, which is what the shell answers; this note stays the
+design, and its record of why the utility makes no kernel change.
 
 **Two decisions made while building step 1:**
 - **A section the machine does not have is left out of the bare view; asked for by name, it is
@@ -15,7 +15,8 @@ design for everything after it.
   commands for one log is two ways to ask. What neither the sink's window nor the kernel's 16 KiB ring
   could do was keep the boot - both move on, so after a chaos run the boot lines were gone. That is
   `events log boot` - a fixed copy of the boot output the kernel keeps - agreed with the operator the
-  same day and built as its own change (`utilities/47_events.md`). `hardware` keeps what the boot FOUND (the bus, the IOMMU, the timer mode), as facts. Every example below is a
+  same day and built as its own change (`utilities/47_events.md`). `hardware` keeps what the running system ANSWERS - the bus and each device's live configuration, which
+service drives what - as facts; what only the kernel holds (IOMMU state, timer mode) it does not show (section 10). Every example below is a
 MOCKUP: values seen in the T630's logs that day are real, and times, counts and anything not yet read are
 illustrative.
 
@@ -68,7 +69,7 @@ are not right - and it adds the thing Device Manager cannot show: who holds auth
 | `hardware problems` | report, pipes | only what is wrong - the warning-icon view |
 | `hardware tree` | report, pipes | every device by how it connects, with a `parent` column |
 | `hardware why <device>` | report, pipes as lines | why a device is handled the way it is - passthrough, no driver, which service drives it |
-| `hardware report [write <path>]` | report | everything, for a bug report: overview, problems, debug for every device, the build |
+| `hardware report` | report, pipes as lines | everything, for a bug report: overview, problems, interrupts, firmware, events, every driven device in full; save it with `hardware report \| write <path>` |
 | `hardware events` | report, pipes | a timeline: attached, removed, driver died, granted, released, reset, faults |
 | `hardware compare <report>` | report, pipes | what changed since a saved report |
 | `hardware help` / `hardware version` | | the house conventions |
@@ -270,16 +271,16 @@ its raw hex ID, never a guess.
 | Field | Owner | Exists today? |
 |---|---|---|
 | PCI address, class, vendor, device, BAR, legacy IRQ | `hw-enumerator` (x86, Pi 4, VisionFive) | yes - ops 1, 2, 3 |
-| which service drives which device, restarts | the supervisor (its spawn rows, `MANAGED`) | yes, as state; no query yet |
+| which service drives which device, restarts | the supervisor (its spawn rows, `MANAGED`) | yes - `supcmd::DEVICES`, step 1 |
 | CPU cores, memory | the kernel, `InspectKernel` | yes - behind `cores` and `mem` |
 | USB devices with a driver here | the host drivers' `usbdev` reports | yes |
 | USB devices with NO driver here | the host drivers | **no** - the hosts report only what they bound |
-| fixed SoC blocks (the Pis) | the kernel, by device kind | yes, as boot lines; no query yet |
+| fixed SoC blocks (the Pis, the VisionFive) | the supervisor's spawn rows, by device kind | yes - `supcmd::DEVICES`, step 1 |
 | controller registers (`debug`) | the driver, over its own protocol | per driver; `wifi debug transport` is the pattern |
 | per-device grant, IOMMU domain and faults, timer state | the kernel | **no**, and not shown - section 10 |
 | a device's live BARs, command register and interrupt route (MSI target included) | the device's configuration space, via `hw-enumerator` op 4 | yes - built in step 2 |
-| radio firmware and its load check | the radio drivers | yes, as boot lines |
-| the reasons in `why` | fixed strings beside each decision in code | **no** - to be added with each decision |
+| radio firmware | the radio drivers | yes - their `OP_HARDWARE_DETAIL` facts, step 3 (the load check itself is still a boot line) |
+| the reasons in `why` | fixed strings beside the supervisor's spawn rows | yes - `DEVICE_WHY`, `supcmd::WHY`, step 2 |
 | events | the supervisor, for what it sees (deaths, restarts, USB attach and removal) | yes - `supcmd::EVENTS`, built in step 3; the kernel's part is not recorded |
 
 ## 10. No kernel change - the operator's rule, and what it costs
@@ -294,7 +295,7 @@ facts". That claim was false, and it is corrected here rather than left standing
   page, whose address the kernel does not keep.
 - It does not count interrupts per vector (on x86 only the timer is counted), does not record which
   core a vector targets, and buckets IOMMU faults as xhci / ehci / other, not per device.
-- Each core's timer mode is held, but nothing reads it.
+- Each core's timer mode is held, and read by the idle path, but nothing reports it.
 
 So the query would have needed the kernel to START recording, which is the growth the rule exists to
 prevent. Step 2 was built instead from what already answers (`utilities/58_hardware.md`): the
@@ -354,7 +355,7 @@ wrote /hw-report.txt - 11 devices, 5 problems, debug for every device, 18 KiB
 It holds the build and uptime, the overview, `problems`, and `debug` for every device - what CLAUDE.md
 19 asks a bug report for, without searching a serial log.
 
-`hardware events` - a timeline, on the `events` service:
+`hardware events` - a timeline, kept by the SUPERVISOR (section 9; the kernel's part is not recorded):
 
 <!-- doc-command-ok: a mockup of a designed view; only what utilities/58_hardware.md lists is built -->
 ```
@@ -436,9 +437,9 @@ run: ran 5, failed 1, skipped 0
 3. **Built 2026-10-09, with no kernel change:** `events` (a bounded record the SUPERVISOR keeps of what
    it sees - deaths, restarts, USB attach and removal; the kernel's part is not recorded), `firmware`
    (each radio's driver's own report), `compare`, and the invariants in `selfcheck hardware`. `problems`
-   and `tree`, left over from step 1, with them. `selfcheck hardware` asserts what can be read without
-   the kernel: every device shown has a running driver, no problem is an error, a report reads back as
-   unchanged. The section 13 checks that need kernel state - IOMMU faults, per-device domains, each
+   and `tree`, left over from step 1, with them. `selfcheck hardware` asserts what can be read without a
+   kernel change: no device shows a driver that is not running, no problem is an error, and a report
+   written and compared straight back finds no device added or removed. The section 13 checks that need kernel state - IOMMU faults, per-device domains, each
    core's last tick - are not made.
 4. `power` and temperature, when something needs them.
 

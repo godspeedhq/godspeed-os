@@ -59,7 +59,9 @@ the image.
 - **Remote compromise** - a network peer reaching beyond the service that parses its packets.
 
 **Not a vulnerability, but still wanted:** a service that crashes on bad input and recovers is a
-RECOVERY bug. Report it in public, as `CONTRIBUTING.md` asks under "Break it".
+RECOVERY bug - report it in a public issue. A failure `chaos` causes is also a recovery bug, even a
+panic: `chaos` holds the authority to kill services, so it is not unprivileged input
+(`CONTRIBUTING.md`, "Break it").
 
 ## Known limitations
 

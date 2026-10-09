@@ -52,12 +52,18 @@ either: reading it means writing all ones to the BAR, and this utility never wri
 
 **Step 3 is built (2026-10-09), still with no kernel change:** `problems`, `tree`, `firmware`, `compare`
 and `events`, and the hardware invariants in `selfcheck hardware`. QEMU-verified (`osdev test shell`
-and the `selfcheck` suite); not yet run on hardware. Where each comes from:
+and the `selfcheck` suite), and on hardware: the T630 at `f54aafef` ran `problems`, `firmware`,
+`events` and `selfcheck hardware`; the Pi 2 and the Pi 4 ran the whole `selfcheck` after 1000 chaos
+rounds; the VisionFive ran `hardware firmware` (`67c759f9`). `tree` and `compare` have run only in
+QEMU. `selfcheck hardware` is the existing part 3 of `selfcheck`, which also checks `hw-enumerator`'s
+authority and the lifecycle guardrails - including a supervisor kill, which starts the supervisor's
+event record afresh before the hardware checks run. Where each comes from:
 
 - `problems` - the same answers the overview uses: a driver named but not running, a device of a class
   whose driver took another, a device nothing drives (bridges left out - they are the bus), a driver
   that has restarted, a driven device whose memory decoding is off, and a spawn that asked for an
-  interrupt on a device showing none. It says, every time, that IOMMU faults and interrupt counts were
+  interrupt on a device showing no MSI enabled (the kernel gives such a driver an MSI vector, so a legacy
+  line there means the route was not set up). It says, every time, that IOMMU faults and interrupt counts were
   not checked.
 - `tree` - a PCI device on a bus behind a bridge hangs under that bridge, by the secondary bus number in
   the bridge's own configuration space; a USB device hangs under the host that bound it.

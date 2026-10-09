@@ -986,7 +986,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // what is asserted is that it answers and says what it does not record.
     send(&mut write_half, b"hardware events\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
-        Some(r) => check!(r.contains("recorded by the supervisor since it started") && r.contains("not recorded: what the kernel does"),
+        Some(r) => check!(r.contains("recorded by the supervisor since") && r.contains("not recorded: what the kernel does"),
                           "hardware events: the supervisor answers, from when, and what it does not record"),
         None => { println!("shell-test: FAIL - timed out after `hardware events`"); fail += 1; }
     }
