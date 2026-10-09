@@ -1103,3 +1103,95 @@ shell's Ctrl+Alt+Del byte), and that check's baseline went from 8 to 7.
 line - the byte a keyboard driver would put on the console - and checks up, down, mute and unmute as read
 back, and that `audio status` agrees: 67 checks, all passing. The chord itself is owed a hardware check on
 a real keyboard.
+
+## The Dell Wyse 5070's audio, as `audio debug` read it (2026-10-09)
+
+The A4 hardware card on the Wyse, and the first dump `Device::Surveyed` was kept for. The driver
+surveyed the codec and stopped, as it must on a codec playback has not been verified on; `audio
+hardware` showed `00:0e.0  HD audio  Intel 8086:3198  audio-driver  surveyed, not played (A6)`, every
+other verb answered with that reason, and Ctrl+Alt+Up and Down reached the shell from a real keyboard,
+repeating when held. `selfcheck` ran 537 with 0 failed before and after a 100-round `chaos max-carnage
+all-services`. Saved on the Wyse's disk as `/wyse-codec.txt`.
+
+`audio debug codec`:
+
+```
+codec 0 - vendor 10ec device 0225, audio function group 0x01
+widgets      0x02..0x24 (35); function group power D0
+node 0x02  output      caps 0x0000041d  amp-out 0x00025757 (87 steps)
+node 0x03  output      caps 0x0000041d  amp-out 0x00025757 (87 steps)
+node 0x04  vendor      caps 0x00f00000
+node 0x05  vendor      caps 0x00f00000
+node 0x06  output      caps 0x00000411
+node 0x07  input       caps 0x0010051b  from 0x24
+node 0x08  input       caps 0x0010051b  from 0x23
+node 0x09  input       caps 0x0010051b  from 0x22
+node 0x0a  vendor      caps 0x00f00000
+node 0x0b  vendor      caps 0x00f00000
+node 0x0c  vendor      caps 0x00f00000
+node 0x0d  vendor      caps 0x00f00000
+node 0x0e  vendor      caps 0x00f00000
+node 0x0f  vendor      caps 0x00f00000
+node 0x10  vendor      caps 0x00f00000
+node 0x11  vendor      caps 0x00f00000
+node 0x12  pin         caps 0x0040040b  config 0x40000000 (line out, nothing attached)  pincap 0x00000020  control 0x00
+node 0x13  pin         caps 0x0040040b  config 0x411111f0 (speaker, nothing attached)  pincap 0x00000020  control 0x00
+node 0x14  pin         caps 0x0040058d  amp-out 0x80000000 (0 steps)  config 0x90170110 (speaker)  pincap 0x00010014  control 0x00  from 0x02
+node 0x15  vendor      caps 0x00f00000
+node 0x16  pin         caps 0x0040058d  amp-out 0x80000000 (0 steps)  config 0x411111f0 (speaker, nothing attached)  pincap 0x0000001c  control 0x00  from 0x02 0x03 (selected 0)
+node 0x17  pin         caps 0x0040058d  amp-out 0x80000000 (0 steps)  config 0x411111f0 (speaker, nothing attached)  pincap 0x0000001c  control 0x00  from 0x02 0x03 0x06 (selected 0)
+node 0x18  pin         caps 0x0040048b  config 0x411111f0 (speaker, nothing attached)  pincap 0x00000024  control 0x00
+node 0x19  pin         caps 0x0040048b  config 0x411111f0 (speaker, nothing attached)  pincap 0x00003724  control 0x20
+node 0x1a  pin         caps 0x0040048b  config 0x411111f0 (speaker, nothing attached)  pincap 0x00003724  control 0x00
+node 0x1b  pin         caps 0x0040058f  amp-out 0x80000000 (0 steps)  config 0x02011020 (line out)  pincap 0x00013734  control 0x00  from 0x02 0x03 (selected 0)
+node 0x1c  vendor      caps 0x00f00000
+node 0x1d  pin         caps 0x00400400  config 0x40438029 (S/PDIF out, nothing attached)  pincap 0x00000020  control 0x20
+node 0x1e  pin         caps 0x00400501  config 0x411111f0 (speaker, nothing attached)  pincap 0x00000010  control 0x40  from 0x06
+node 0x1f  vendor      caps 0x00f00000
+node 0x20  vendor      caps 0x00f00040
+node 0x21  pin         caps 0x0040058d  amp-out 0x80000000 (0 steps)  config 0x0221101f (headphone)  pincap 0x0001001c  control 0x00  from 0x02 0x03 (selected 1)
+node 0x22  mixer       caps 0x0020010b  from 0x19 0x1a 0x1b 0x1d 0x13 (selected 0)
+node 0x23  mixer       caps 0x0020010b  from 0x19 0x1a 0x1b 0x1d 0x12 (selected 0)
+node 0x24  selector    caps 0x00300101  from 0x12 0x13 0x18 (selected 0)
+```
+
+`audio debug registers`:
+
+```
+GCAP      0x6701: 6 output, 7 input, 0 bidirectional stream(s), 64-bit true
+VMAJ.VMIN 1.0
+GCTL      0x00000001 (bit 0: out of reset)
+STATESTS  0x0005 (a bit per codec that answered)
+INTCTL    0x00000000
+INTSTS    0x40000000
+WALCLK    0x4a633987
+CORB      WP 0x0000 RP 0x0000 CTL 0x00 SIZE 0x42
+RIRB      WP 0x0000 CTL 0x00 STS 0x00 SIZE 0x42 RINTCNT 0
+window    65536 bytes
+```
+
+**What it says, read off the dump rather than a reference:**
+
+- **One audio controller, and it is Intel's** (`hardware` lists one class-0x0403 device, 00:0e.0). So
+  the first-of-class problem (Found while preparing, 2) does not bite here, and the AMD snoop bit is
+  not a question on this machine. Codec 0 is a Realtek 10ec:0225; codec 2, Intel 8086:280d, is the
+  display's audio and offers no path this driver uses.
+- **Immediate Command works on this controller**: the whole survey ran on it with CORB and RIRB
+  stopped (`CTL 0x00`). Across the boot and 25 restarts under chaos, two verbs went unanswered, both
+  while chaos was killing services around a driver that was mid-survey.
+- **Two converters, 0x02 and 0x03**, each with an 87-step output amplifier. The internal speaker, pin
+  0x14, connects only to 0x02. The headphone jack 0x21 and line out 0x1b can take either, and the
+  firmware left 0x21 on 0x03.
+- **Every output pin was left disabled** (`control 0x00`), so whatever plays has to enable the pin it
+  uses - which A3 already does on QEMU's codec.
+- **The speaker, headphone and line-out pins are EAPD-capable** (bit 16 of each pincap), so their
+  external amplifiers have to be switched on too. The pins carry no amplifier steps of their own, only
+  a mute (`amp-out 0x80000000`).
+- **Node 0x20 is a vendor widget.** Whether this codec needs vendor coefficients set before it makes a
+  sound has not been checked against a reference.
+
+**What this changes for A6.** The plan names the T630, which needs the two kernel fixes and the AMD
+snoop bit before its codec is even the question. On the evidence above the Wyse needs neither the
+first-of-class fix nor the snoop bit; what is left is the codec itself - pins, EAPD, and the open
+question of node 0x20. Which machine A6 starts on is the operator's choice; this records that the Wyse
+is the shorter road.
