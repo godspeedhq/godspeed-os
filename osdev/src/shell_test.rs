@@ -291,17 +291,74 @@ pub fn run(image_path: &Path, smp: u32) {
     let netver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(netver.contains(&format!("net {ver}")), "net: version reports the current version");
 
+    // ---- `wifi` (utilities/56_wifi.md): the wireless link verb ---------------------------------
+    //
+    // THE RADIO DOES NOT EXIST YET (`docs/wifi.md` has the phases), and what is asserted here is only
+    // what is already permanent. A QEMU x86 guest has no wireless hardware and never will, so the
+    // absence line is the FINAL answer on this machine rather than an interim one - the same status the
+    // T630 and the Wyse have. Nothing below would break by finishing phase 1.
+    // Bare `wifi` prints usage now (conventions rule 1, 2026-09-29); the hardware question is `wifi status`.
+    send(&mut write_half, b"wifi status\r");
+    let wifi_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_out.contains("no wireless radio on this machine"),
+           "wifi: says there is no radio, on a machine that has none");
+    // It must say WHY, not only what: a reader on a board that HAS a radio needs to know where to look.
+    check!(wifi_out.contains("wifi-driver"),
+           "wifi: names the service whose absence it is reporting");
+
+    // ASKING IS NOT AN ERROR. `wifi` on a radioless machine is a legitimate question with a definite
+    // answer, so it must not report failure - `result` would otherwise read as a fault where there is
+    // none, and a suite that accepts that teaches the reader to discount the result model.
+    send(&mut write_half, b"wifi status\rresult\r");
+    let wifi_res = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    let wifi_res2 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(!format!("{wifi_res}{wifi_res2}").contains("1"),
+           "wifi: asking about wireless on a radioless machine is not an error");
+
+    // THE SECURITY ASSERTION, and the one most worth having. A passphrase given as an argument would be
+    // recalled by up-arrow and written to /.gsh_history, so `connect` takes an SSID and nothing else.
+    // If this ever stops refusing, somebody has added a convenience that leaks a secret to disk.
+    send(&mut write_half, b"wifi join SomeSSID hunter2\r");
+    let wifi_pw = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_pw.contains("passphrase is asked for"),
+           "wifi: refuses a passphrase on the command line (it would land in /.gsh_history)");
+
+    // Usage and unknown-word refusals, which are permanent on every board.
+    send(&mut write_half, b"wifi join\r");
+    let wifi_usage = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_usage.contains("usage: wifi join <ssid>"),
+           "wifi: connect with no SSID prints usage rather than guessing");
+    send(&mut write_half, b"wifi nonsense\r");
+    let wifi_bogus = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifi_bogus.contains("unknown subcommand"),
+           "wifi: an unknown subcommand is refused by name, not silently treated as status");
+    send(&mut write_half, b"wifi radio sideways\r");
+    let wifi_radio = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    // The radio ladder (docs/wifi.md 47-48): four words, and the refusal names every one of them, so an
+    // operator who mistyped is told the whole vocabulary rather than half of it.
+    check!(wifi_radio.contains("radio takes `on`, `off`, `off hard` or `powercycle`"),
+           "wifi: radio takes on, off, off hard or powercycle and says so");
+
+    // Conventions rules 1 and 5: every utility self-documents.
+    send(&mut write_half, b"wifi version\r");
+    let wifiver = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifiver.contains(&format!("wifi {ver}")), "wifi: version reports the current version");
+    send(&mut write_half, b"wifi help\r");
+    let wifihelp = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
+    check!(wifihelp.contains("wifi join <ssid>"), "wifi: help lists the join row with an example");
+
     // net dns <host> (utilities/40_net.md): resolve a hostname via slirp's DNS. This is external-
-    // dependent - slirp forwards to the HOST's resolver - so the check is LENIENT: it verifies the
-    // command ran end to end and produced a well-formed line, EITHER a resolved IP ("example.com is
-    // a.b.c.d") OR a clean "no answer", never a hang or crash. A real resolution is a bonus, not required.
+    // dependent - slirp forwards to the HOST's resolver - so the DNS SERVER is allowed to fail: a
+    // resolved IP ("example.com is a.b.c.d"), no A record, or no reply from the server all pass. What
+    // does NOT pass is net-stack failing to answer the shell ("did not answer the resolve"): that is
+    // this machine's own IPC, and accepting it hid backlog/66 - an empty frame reply refused by the
+    // kernel on every port but ARM32, so net-stack waited out a second per empty drain.
     send(&mut write_half, b"net dns example.com\r");
     let dns_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
     check!(dns_out.contains("example.com is ")
             || dns_out.contains("returned no A record")
-            || dns_out.contains("no reply from the DNS server")
-            || dns_out.contains("did not answer the resolve"),
-           "net dns: resolves a hostname or reports no-answer cleanly (DNS via slirp)");
+            || dns_out.contains("no reply from the DNS server"),
+           "net dns: resolves a hostname, or the DNS server's own failure is reported (DNS via slirp)");
 
     // System library: `health` is a gsh script baked into the image and resolved PATH-like - typing
     // the name runs the baked script (a fresh, self-contained run). Proves the library model end to
@@ -812,6 +869,144 @@ pub fn run(image_path: &Path, smp: u32) {
             println!("shell-test: FAIL - timed out after `cores`");
             fail += 1;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // hardware (utilities/58_hardware.md): the overview from its owners - the kernel, hw-enumerator
+    // and the supervisor - one record shape for every section, and the words not built yet.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"hardware\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => {
+            check!(r.contains("cpu") && r.contains("core 0") && r.contains("memory") && r.contains("system RAM"),
+                   "hardware: the overview has the cpu and memory sections");
+            check!(r.contains("pci") && r.contains("DEVICE") && r.contains("DRIVER"),
+                   "hardware: the PCI bus is read from hw-enumerator, in the shared columns");
+            check!(r.contains("device(s) with a driver"), "hardware: the overview ends with its device count");
+            check!(!r.contains("the supervisor did not answer"), "hardware: the supervisor answered which service drives which device");
+            // A device of a class this system HAS a driver for is never shown driverless. The Wyse showed
+            // its xHCI controller as "no driver" while `xhci` ran: the supervisor answered from its main
+            // image table and the USB hosts are spawned from another (2026-10-08).
+            let driven = ["USB 3 (xHCI)", "USB 2 (EHCI)", "SATA (AHCI)", "ethernet", "HD audio"];
+            let wrong = r.lines().filter(|l| driven.iter().any(|k| l.contains(k)) && l.contains("no driver")).count();
+            check!(wrong == 0, "hardware: no device a driver exists for is shown without one");
+        }
+        None => { println!("shell-test: FAIL - timed out after `hardware`"); fail += 5; }
+    }
+    send(&mut write_half, b"hardware cpu,memory | count\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains(&format!("{}", smp + 1)), "hardware: two sections pipe as one table (cores + 1 rows)"),
+        None => { println!("shell-test: FAIL - timed out after `hardware cpu,memory | count`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware banana\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("no section or device 'banana'"), "hardware: an unknown name says so"),
+        None => { println!("shell-test: FAIL - timed out after `hardware banana`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware power\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("designed, not built yet"), "hardware: a word not built yet says so"),
+        None => { println!("shell-test: FAIL - timed out after `hardware power`"); fail += 1; }
+    }
+    // hardware step 2 (utilities/58_hardware.md), with NO kernel change: the live configuration space
+    // from hw-enumerator's op 4, the driver's capabilities, and the supervisor's recorded reason. The
+    // QEMU machine's e1000 at 00:03.0 is the device every check reads.
+    send(&mut write_half, b"hardware 00:03.0\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => {
+            check!(r.contains("command    0x") && r.contains("bus master"), "hardware <device>: the live command register");
+            check!(r.contains("interrupt  "), "hardware <device>: its interrupt route, from the configuration space");
+            check!(r.contains("authority  nic-driver holds") && r.contains("granted    "), "hardware <device>: what the driver holds, and where the grant was logged");
+        }
+        None => { println!("shell-test: FAIL - timed out after `hardware 00:03.0`"); fail += 3; }
+    }
+    send(&mut write_half, b"hardware 00:03.0 debug\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("vendor 8086") && r.contains("  00: 86 80"), "hardware <device> debug: configuration space decoded and raw"),
+        None => { println!("shell-test: FAIL - timed out after `hardware 00:03.0 debug`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware why 00:03.0\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("is driven by nic-driver") && r.contains("not confined"),
+                          "hardware why: who drives it, and the reason the supervisor records"),
+        None => { println!("shell-test: FAIL - timed out after `hardware why 00:03.0`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware why 00:00.0\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("has no service"), "hardware why: a device with no driver says why"),
+        None => { println!("shell-test: FAIL - timed out after `hardware why 00:00.0`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware interrupts\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("00:03.0") && r.contains("does not count interrupts"),
+                          "hardware interrupts: each device's route, and what is not counted said"),
+        None => { println!("shell-test: FAIL - timed out after `hardware interrupts`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware cpu debug\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("core 0") && r.contains("scheduler quanta"), "hardware cpu debug: each core's quanta"),
+        None => { println!("shell-test: FAIL - timed out after `hardware cpu debug`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware report\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => check!(r.contains("GodspeedOS hardware report") && r.contains("authority  nic-driver"),
+                          "hardware report: the overview and each driven device in full"),
+        None => { println!("shell-test: FAIL - timed out after `hardware report`"); fail += 1; }
+    }
+    // hardware step 3 (utilities/58_hardware.md): problems, tree, firmware - still no kernel change.
+    send(&mut write_half, b"hardware problems\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("problem(s):") && r.contains("not checked: IOMMU faults"),
+                          "hardware problems: a count by severity, and what it did not check said"),
+        None => { println!("shell-test: FAIL - timed out after `hardware problems`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware problems | where severity=error | count\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("0"), "hardware problems: records when piped, and no error on the QEMU machine"),
+        None => { println!("shell-test: FAIL - timed out after `hardware problems | where`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware tree\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("machine  ") && r.contains("- 00:03.0") && !r.contains("ehci"),
+                          "hardware tree: the machine, its PCI devices, and no row for a host this machine lacks"),
+        None => { println!("shell-test: FAIL - timed out after `hardware tree`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware firmware\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("no radio on this machine") && r.contains("only the firmware this OS loads"),
+                          "hardware firmware: no radio in QEMU, said, and what is listed at all"),
+        None => { println!("shell-test: FAIL - timed out after `hardware firmware`"); fail += 1; }
+    }
+    send(&mut write_half, b"hardware compare\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("name a saved report"), "hardware compare: with no report, says how to make one"),
+        None => { println!("shell-test: FAIL - timed out after `hardware compare`"); fail += 1; }
+    }
+    // The supervisor's device record. In QEMU nothing has died by this point, so the record may be empty;
+    // what is asserted is that it answers and says what it does not record.
+    send(&mut write_half, b"hardware events\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("recorded by the supervisor since") && r.contains("not recorded: what the kernel does"),
+                          "hardware events: the supervisor answers, from when, and what it does not record"),
+        None => { println!("shell-test: FAIL - timed out after `hardware events`"); fail += 1; }
+    }
+    // events log boot (utilities/47_events.md): the KERNEL'S fixed copy of the boot, which never wraps.
+    // It must hold lines from before the shell existed - the kernel's own core count and the supervisor
+    // coming up - which the sink's window does not, and say how much it holds.
+    send(&mut write_half, b"events log boot\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => {
+            check!(r.contains("cores ready"), "events log boot: holds the kernel's own boot lines");
+            check!(r.contains("supervisor: ready"), "events log boot: holds the services' boot lines");
+            check!(r.contains("boot record"), "events log boot: closes by saying how much the record holds");
+        }
+        None => { println!("shell-test: FAIL - timed out after `events log boot`"); fail += 3; }
+    }
+    send(&mut write_half, b"events log boot | match cores\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => check!(r.contains("cores ready") && !r.contains("supervisor: ready"),
+                          "events log boot: pipes as lines, to match"),
+        None => { println!("shell-test: FAIL - timed out after `events log boot | match cores`"); fail += 1; }
     }
 
     // -------------------------------------------------------------------
@@ -1767,7 +1962,15 @@ pub fn run(image_path: &Path, smp: u32) {
     // writes its report to the console either way, so we collect until its done-marker. (The launching
     // shell draws a `gsh>` right after the command, before chaos claims, so `gsh>` is NOT a usable
     // terminator here.)
-    send(&mut write_half, b"chaos max-carnage all-services 5\r");
+    // A seed that is not a number is refused, and nothing is launched (utilities: chaos, `seed <n>`).
+    send(&mut write_half, b"chaos max-carnage all-services 1 seed abc\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("takes a number"), "chaos: a seed that is not a number is refused"),
+        None => { println!("shell-test: FAIL - timed out after a bad chaos seed"); fail += 1; }
+    }
+    // The run takes a GIVEN seed, and must say so at the start and again in its report - the two places
+    // a report reader will look for it.
+    send(&mut write_half, b"chaos max-carnage all-services 5 seed 4242\r");
     // max-carnage shows a loud serial-required warning and waits for a y/N confirm (a bare Enter
     // cancels). Sync on the prompt, then type 'y' + Enter to proceed.
     let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(15));
@@ -1778,8 +1981,9 @@ pub fn run(image_path: &Path, smp: u32) {
             check!(r.contains("report") && r.contains("kills") && r.contains("flooded"), "chaos: max-carnage report (per-service kills + floods)");
             check!(r.contains("total:") && r.contains("rounds"), "chaos: max-carnage ran a bounded round count + self-terminated");
             check!(r.contains("kernel: alive"), "chaos: max-carnage - kernel survived the kill+flood carnage (shell included)");
+            check!(r.contains("chaos: seed 4242 (given)") && r.contains("seed: 4242"), "chaos: a given seed is used, and said at the start and in the report");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 4; }
+        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 5; }
     }
     // After chaos, the (possibly respawned) shell prints a startup banner and/or a regain prompt, so the
     // first `gsh>` we hit can precede the `cores` response. Drain prompts until the response appears -
@@ -1800,6 +2004,21 @@ pub fn run(image_path: &Path, smp: u32) {
         }
     }
     check!(responsive, "chaos: shell responsive after max-carnage");
+    // A run with no seed DRAWS one, and prints it - the seed a reporter quotes.
+    send(&mut write_half, b"chaos max-carnage all-services 2 yes\r");
+    match collect_until(&buf, &mut cursor, b"foreground returned to the shell", Duration::from_secs(120)) {
+        Some(r) => check!(r.contains("(drawn)") && r.contains("seed: "), "chaos: a run with no seed draws one and prints it"),
+        None => { println!("shell-test: FAIL - the drawn-seed chaos run timed out"); fail += 1; }
+    }
+    let mut again = false;
+    send(&mut write_half, b"cores\r");
+    for _ in 0..6 {
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+            Some(r) => { if r.contains(&format!("cores: {smp}")) { again = true; break; } }
+            None => send(&mut write_half, b"cores\r"),
+        }
+    }
+    check!(again, "chaos: shell responsive after the drawn-seed run");
 
     // -----------------------------------------------------------------------
     // chaos spawn-storm: the global-ceiling test. Spawn mem-pressure tasks until the task-pool/memory ceiling
@@ -6897,9 +7116,10 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
         check!(whole.contains("path guard selftest PASS"), "fs proved its path guards at startup");
         // 599 malformed requests through the REAL parser, on every boot. The assertion is not that
         // each gets the right answer - a malformed request has none - but that each gets SOME answer:
-        // a zero-length reply is undeliverable, so it leaves the caller waiting out its deadline.
+        // a zero-length reply is not an answer in fs's protocol (and was not even delivered on three
+        // ports until e3fcf7ed).
         check!(whole.contains("protocol selftest PASS"),
-               "fs answered every malformed request at startup (no undeliverable empty reply)");
+               "fs answered every malformed request at startup (no empty reply)");
     }
     let base = answered!("read /canary.txt", "the canary reads before the assault");
     check!(base.contains("canary-must-survive"), "the canary is intact before the assault");
@@ -7744,7 +7964,7 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     // ---- ATTACH, THEN DETACH WITH `b`. `foreground` on a running job does not return a prompt -
     //      it is attached - so wait for its own marker and then press the key.
     let attached = run_until!(b"foreground 1\r", b"[b] background", 60).unwrap_or_default();
-    check!(attached.contains("[q] cancel") && attached.contains("[b] background"),
+    check!(attached.contains("[q] quit") && attached.contains("[b] background"),
            "`foreground` on a RUNNING job attaches and shows what the two keys do");
     let detached = run_until!(b"b", b"gsh>", 60).unwrap_or_default();
     check!(detached.contains("[backgrounded] job 1"),
@@ -7905,7 +8125,7 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
 
     check!(!freed.contains("failed"), "the finished copy is deleted, making room for the next job");
     check!(cancel_start.contains("[backgrounded] job 2"), "a second job runs once the first has ended");
-    check!(cancel_attach.contains("[q] cancel"), "the second job can be attached to");
+    check!(cancel_attach.contains("[q] quit"), "the second job can be attached to");
     check!(cancelled.contains("job 2 stopped"), "`q` stops the JOB, and says so");
     check!(!after_cancel.contains("cancelme.bin"),
            "THE PARTIAL DESTINATION IS GONE - a cancelled copy does not leave a full-size file with an undefined tail");
@@ -9880,4 +10100,282 @@ pub fn run_fs_hostile_case(image_path: &Path, persist_path: &str, what: &str, sm
         return (false, "`tree` walked the crafted cycle and stopped SILENTLY - a wrong answer served as a right one".into());
     }
     (true, "answered every command, no panic, bystander intact".into())
+}
+
+// ---- osdev test audio --------------------------------------------------------------------------------
+
+/// QEMU for the audio test: the boot image, the formatted data disk, the HD Audio device with its sound
+/// to `wav`, the shell on a TCP serial port (QEMU waits for it), the control channel on another, and a
+/// monitor - so the run ends with `quit`, which FLUSHES the WAV. Killing QEMU loses its tail.
+fn boot_audio(image_path: &Path, persist_path: &str, wav: &str, smp: u32)
+    -> (std::process::Child, Arc<Mutex<Vec<u8>>>, TcpStream, u16, u16)
+{
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let (shell_port, ctrl_port, mon_port) = (pick_free_port(), pick_free_port(), pick_free_port());
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive", &format!("format=raw,file={image_str},if=ide"),
+        "-device", "ich9-ahci,id=ahci",
+        "-drive", &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device", "ide-hd,drive=data,bus=ahci.0",
+        "-smp", &smp.to_string(), "-m", "512M",
+        "-serial", &format!("tcp::{shell_port},server"),
+        "-serial", &format!("tcp::{ctrl_port},server,nowait"),
+        "-monitor", &format!("tcp::{mon_port},server,nowait"),
+        // The same audio device `osdev run` and `osdev shell` attach (`qemu.rs`): `mixer=on`, so the
+        // codec has an amplifier and QEMU applies the volume to the samples the WAV holds.
+        "-audiodev", &format!("wav,id=snd0,path={wav},out.frequency=48000,out.channels=2,out.format=s16"),
+        "-device", "intel-hda", "-device", "hda-output,audiodev=snd0,mixer=on",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("audio-test: QEMU launch failed at {qemu}: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("audio-test: could not connect to serial {shell_port}"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+    (child, buf, stream, ctrl_port, mon_port)
+}
+
+/// End QEMU through its monitor, so the WAV writer closes its file; kill it only if `quit` is ignored.
+fn quit_qemu(child: &mut std::process::Child, mon_port: u16) {
+    // The connection is held open until QEMU exits: dropped straight after the write, the monitor never
+    // acted on it. And a pause after connecting, before the monitor is reading.
+    let mon = retry_tcp_connect(mon_port, Duration::from_secs(5));
+    if let Some(mut m) = mon.as_ref().and_then(|m| m.try_clone().ok()) {
+        thread::sleep(Duration::from_millis(500));
+        send(&mut m, b"quit\n");
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() { drop(mon); return; }
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(mon);
+    println!("audio-test: QEMU ignored `quit` - killed, so the WAV may be missing its tail");
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// The left channel of a QEMU WAV, as 100 ms blocks of (RMS, frequency by zero crossings). The header's
+/// sizes are not trusted - QEMU writes them only on a clean exit - so the data runs to the end of the file.
+fn wav_blocks(path: &str) -> Vec<(u32, u32)> {
+    let raw = match std::fs::read(path) { Ok(r) => r, Err(_) => return Vec::new() };
+    let start = raw.windows(4).position(|w| w == b"data").map_or(44, |i| i + 8);
+    let data = &raw[start.min(raw.len())..];
+    let left: Vec<i32> = data.chunks_exact(4).map(|f| i16::from_le_bytes([f[0], f[1]]) as i32).collect();
+    left.chunks_exact(4800).map(|b| {
+        let rms = ((b.iter().map(|&s| (s as i64) * (s as i64)).sum::<i64>() / b.len() as i64) as f64).sqrt() as u32;
+        let zc = b.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count() as u32;
+        (rms, zc * 10 / 2) // crossings in 100 ms -> Hz
+    }).collect()
+}
+
+/// `osdev test audio` - the `audio` utility, the driver behind it, and the sound itself.
+///
+/// Two boots on one disk. Boot 1 drives every built verb at the prompt and checks each answer against
+/// `utilities/57_audio.md`; kills the driver over the control channel and checks the supervisor brings it
+/// back with the settings it had written; then quits QEMU cleanly and READS THE WAV: the tones must be
+/// there, at the frequency asked, at a level that follows the volume, and silent when muted. Boot 2 checks
+/// the volume came back from `/audio.settings` across a reboot.
+pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("audio-test: two boots on one disk; the shell on COM1, the control channel on COM2");
+    let _ = std::fs::create_dir_all("build/tests");
+    let wav = "build/tests/audio_test.wav";
+    let _ = std::fs::remove_file(wav);
+    let (mut pass, mut fail) = (0usize, 0usize);
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("audio-test: PASS - {}", $label); pass += 1; }
+        else   { println!("audio-test: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    // ---- Boot 1 ----
+    let (mut child, buf, mut w, ctrl_port, mon_port) = boot_audio(image_path, persist_path, wav, smp);
+    let mut cur = 0usize;
+    macro_rules! run { ($c:expr) => {{
+        send(&mut w, $c);
+        collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default()
+    }}; }
+    let booted = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(120)).is_some()
+        && collect_until(&buf, &mut 0usize, b"audio-driver: ready", Duration::from_secs(60)).is_some();
+    check!(booted, "booted to a prompt with audio-driver ready");
+    if !booted {
+        let _ = std::fs::write("build/tests/audio_test_serial.log", &buf.lock().unwrap()[..]);
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+    let log = |buf: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    check!(log(&buf).contains("audio-driver: ready - serving requests; playback refills on the stream's interrupt"),
+        "the driver refills on its interrupt, not by polling");
+    check!(log(&buf).contains("no /audio.settings yet"), "a fresh disk starts at the defaults");
+
+    let r = run!(b"audio status\r");
+    check!(r.contains("audio      on") && r.contains("volume     50") && r.contains("muted      no"),
+        "status: on, volume 50, not muted");
+    let r = run!(b"audio info\r");
+    check!(r.contains("1af4:0012") && r.contains("on the stream's interrupt"), "info: QEMU's codec, interrupt-driven");
+    let r = run!(b"audio tone 1000 1\r");
+    check!(r.contains("played 1000 Hz for 1.0 s"), "tone at volume 50 played");
+    let r = run!(b"audio volume 100\r");
+    check!(r.contains("volume 100 - verified"), "volume 100 read back from the codec");
+    let r = run!(b"audio tone 1000 1\r");
+    check!(r.contains("played 1000 Hz for 1.0 s"), "tone at volume 100 played");
+    let r = run!(b"audio mute\r");
+    check!(r.contains("muted - verified"), "mute read back");
+    let r = run!(b"audio tone 1000 1\r");
+    check!(r.contains("muted - nothing will be heard") && r.contains("played"), "a muted tone says nothing will be heard, and plays");
+    let r = run!(b"audio unmute\r");
+    check!(r.contains("unmuted - volume 100 - verified"), "unmute returns to the volume");
+    let r = run!(b"audio volume 101\r");
+    check!(r.contains("volume is 0 to 100"), "volume 101 refused");
+    let r = run!(b"audio tone 440 | count\r");
+    check!(r.contains("cannot start a pipe"), "an action refuses to start a pipe");
+    let r = run!(b"audio status | match volume\r");
+    check!(r.contains("volume     100"), "status pipes as labelled lines");
+    let r = run!(b"audio off\r");
+    check!(r.contains("audio off - the codec is powered down"), "off");
+    let r = run!(b"audio tone 440 1\r");
+    check!(r.contains("`audio on` first"), "a tone while off is refused");
+    let r = run!(b"audio on\r");
+    check!(r.contains("audio on - volume 100, unmuted") && r.contains("- verified"), "on re-applies the volume");
+    let r = run!(b"audio off hard\r");
+    check!(r.contains("held in reset") && r.contains("- verified"), "off hard holds the controller in reset");
+    let r = run!(b"audio on\r");
+    check!(r.contains("audio on - volume 100") && r.contains("- verified"), "on after off hard brings the codec back");
+    send(&mut w, b"audio tone 1000 3\r");
+    thread::sleep(Duration::from_millis(1200));
+    send(&mut w, b"q");
+    let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(r.contains("stopped after"), "q stops a tone (rule 11)");
+    // `audio play`: two files it plays, two it refuses with the reason, one that does not exist, and q.
+    let r = run!(b"audio play /song.wav\r");
+    check!(r.contains("playing /song.wav (48000 Hz, 16-bit, stereo, 0:02)") && r.contains("played 0:02"),
+        "play: a 48 kHz stereo WAV played");
+    // The shell's own sentence for a stream that ran dry, and the driver's count - not the bare word
+    // "silence", which the driver's log line carries on the same serial port even when it is zero.
+    check!(!r.contains("where the samples did not arrive") && r.contains("0 underrun(s), 0 ms of silence"),
+        "play: the feed kept up - no silence written in its place");
+    let r = run!(b"audio play /mono.wav\r");
+    check!(r.contains("playing /mono.wav (44100 Hz, 16-bit, mono, 0:01)") && r.contains("played 0:01"),
+        "play: a 44.1 kHz mono WAV played");
+    let r = run!(b"audio play /deep.wav\r");
+    check!(r.contains("is 24-bit - this plays 16-bit PCM"), "play: a 24-bit file is refused, and says why");
+    let r = run!(b"audio play /phone.wav\r");
+    check!(r.contains("is 8000 Hz - this codec plays 44100 or 48000 Hz"), "play: an 8 kHz file is refused, and says why");
+    let r = run!(b"audio play /nothere.wav\r");
+    check!(r.contains("not found"), "play: a missing file is not found");
+    send(&mut w, b"audio play /song.wav\r");
+    thread::sleep(Duration::from_millis(1500));
+    send(&mut w, b"q");
+    let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(r.contains("stopped after"), "play: q stops the file (rule 11)");
+    let r = run!(b"audio volume 30\r");
+    check!(r.contains("volume 30 - verified"), "volume 30");
+    let r = run!(b"read /audio.settings\r");
+    check!(r.contains("volume 30") && r.contains("muted no"), "/audio.settings holds what was set");
+
+    // The driver killed: the kernel quiesces its DMA, the supervisor restarts it, and it reads its
+    // settings back from the file it wrote.
+    match retry_tcp_connect(ctrl_port, Duration::from_secs(10)) {
+        Some(mut ctrl) => {
+            thread::sleep(Duration::from_millis(100));
+            send(&mut ctrl, b"\nKILL audio-driver\n");
+            let back = collect_until(&buf, &mut cur, b"supervisor: audio-driver restarted", Duration::from_secs(30));
+            check!(back.is_some(), "the supervisor restarted audio-driver after a kill");
+            let read = collect_until(&buf, &mut cur, b"settings read from /audio.settings - volume 30", Duration::from_secs(30));
+            check!(read.is_some(), "the restarted driver read its settings back");
+            let _ = collect_until(&buf, &mut cur, b"audio-driver: ready", Duration::from_secs(30));
+            check!(log(&buf).contains("bus-master DISABLED on driver death"), "the kernel stopped the controller's DMA on the death");
+            drop(ctrl);
+        }
+        None => { println!("audio-test: FAIL - no control channel"); fail += 1; }
+    }
+    let r = run!(b"audio status\r");
+    check!(r.contains("volume     30"), "status after the restart says volume 30");
+    let _ = std::fs::write("build/tests/audio_test_serial.log", &buf.lock().unwrap()[..]);
+    quit_qemu(&mut child, mon_port);
+
+    // ---- The sound ----
+    // Played in boot 1, in order: tones of 1 s at volume 50, 1 s at 100, 1 s muted (silence), about 1.2 s
+    // at 100 before q; then, at 100, /song.wav (2 s of 660 Hz), /mono.wav (1 s of 330 Hz, resampled by
+    // QEMU to 48 kHz) and /song.wav again until q at about 1.5 s. QEMU's WAV grows only while a stream
+    // runs, so the gaps between them are not in it.
+    let blocks = wav_blocks(wav);
+    let sounding: Vec<&(u32, u32)> = blocks.iter().filter(|(rms, _)| *rms > 500).collect();
+    let silent = blocks.iter().filter(|(rms, _)| *rms <= 50).count();
+    let at = |lo: u32, hi: u32| sounding.iter().filter(|(_, hz)| (lo..=hi).contains(hz)).count();
+    let (k1000, k660, k330) = (at(980, 1020), at(647, 673), at(323, 337));
+    println!("audio-test: the capture is {} block(s) of 100 ms: {} sounding ({} at 1000 Hz, {} at 660 Hz, {} at 330 Hz), {} silent",
+        blocks.len(), sounding.len(), k1000, k660, k330, silent);
+    check!((29..=36).contains(&k1000), "about 3.2 s of the 1000 Hz tones");
+    check!(silent >= 9, "the muted tone is silence");
+    let mid = sounding.iter().filter(|(rms, hz)| (4000..7500).contains(rms) && (980..=1020).contains(hz)).count();
+    let loud = sounding.iter().filter(|(rms, hz)| *rms >= 9500 && (980..=1020).contains(hz)).count();
+    check!(mid >= 8, "a tone at the level volume 50 gives (RMS 4000-7500)");
+    check!(loud >= 18, "tones at the level volume 100 gives (RMS 9500 and up)");
+    check!((30..=40).contains(&k660), "about 3.5 s of /song.wav at 660 Hz - the whole file, then the part before q");
+    check!((8..=12).contains(&k330), "about 1 s of /mono.wav at 330 Hz");
+    // A 100 ms block that straddles the JOIN between two sounds counts crossings from both, so it reads
+    // as neither - and where the two sounds' phases do not line up it loses crossings even when they are
+    // the same frequency. So a sound is (frequency, level), and an odd block is accepted only as part of
+    // a run of at most TWO that sits between sounds that DIFFER in either. A glitch INSIDE a steady sound
+    // - an odd block between two of the same sound - still fails. Measured, not assumed: the first runs
+    // found every odd block at a join, including one between the volume-50 and volume-100 tones (same
+    // frequency, different level) and a 660-to-330 join that spread over two blocks.
+    let sound = |b: &(u32, u32)| -> (u32, u32) {
+        let f = if b.0 <= 500 { 0 } else if (980..=1020).contains(&b.1) { 1000 }
+            else if (647..=673).contains(&b.1) { 660 } else if (323..=337).contains(&b.1) { 330 } else { u32::MAX };
+        let level = if b.0 <= 500 { 0 } else if b.0 < 7500 { 1 } else { 2 };
+        (f, level)
+    };
+    let mut stray = 0usize;
+    let mut j = 1;
+    while j + 1 < blocks.len() {
+        if sound(&blocks[j]).0 != u32::MAX {
+            j += 1;
+            continue;
+        }
+        let start = j;
+        while j + 1 < blocks.len() && sound(&blocks[j]).0 == u32::MAX {
+            j += 1;
+        }
+        let (before, after) = (sound(&blocks[start - 1]), sound(&blocks[j]));
+        if j - start > 2 || before == after {
+            println!("audio-test: odd block(s) {}..{} between {:?} and {:?}", start, j - 1, before, after);
+            stray += 1;
+        }
+    }
+    check!(stray == 0, "nothing in the capture but the three frequencies asked for, and the joins between them");
+
+    // ---- Boot 2: the settings across a reboot ----
+    let (mut child, buf, mut w, _ctrl, mon_port) = boot_audio(image_path, persist_path, "build/tests/audio_test_boot2.wav", smp);
+    let mut cur = 0usize;
+    let booted = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(120)).is_some()
+        && collect_until(&buf, &mut 0usize, b"audio-driver: ready", Duration::from_secs(60)).is_some();
+    check!(booted && log(&buf).contains("settings read from /audio.settings - volume 30, unmuted"),
+        "after a reboot the driver reads volume 30 back");
+    send(&mut w, b"audio status\r");
+    let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(r.contains("volume     30"), "and status says so");
+    let _ = std::fs::write("build/tests/audio_test_boot2_serial.log", &buf.lock().unwrap()[..]);
+    quit_qemu(&mut child, mon_port);
+
+    println!("\naudio-test: {pass} passed, {fail} failed (serial: build/tests/audio_test_serial.log, sound: {wav})");
+    if fail > 0 { std::process::exit(1); }
 }

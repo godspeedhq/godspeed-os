@@ -125,7 +125,10 @@ fn l1_table_ptr(l2_pa: u32) -> u32 {
 /// (`free_l2`) is handed out again by the next spawn. Without this a restart storm (`chaos max-carnage`)
 /// would exhaust the arena in a handful of respawns. Headroom is for the concurrent-live set plus the
 /// brief overlap of a dying and its replacement instance, NOT the cumulative spawn count.
-const L2_TABLES: usize = 128;
+///
+/// 256 since 2026-10-07, with `L1_TABLES` (see there): the live set grew to fourteen resident services
+/// on the Pi 2, and a table this arena cannot give is a spawn refused. 256 KiB, static.
+const L2_TABLES: usize = 256;
 #[repr(align(1024))]
 struct L2Arena([[u32; 256]; L2_TABLES]);
 static mut L2_ARENA: L2Arena = L2Arena([[0; 256]; L2_TABLES]);
@@ -156,13 +159,37 @@ fn l2_slot(pa: u32) -> Option<usize> {
     if idx < L2_TABLES { Some(idx) } else { None }
 }
 
-/// Fresh L1 tables (16 KiB each, 16 KiB aligned) for `PageTable::new`. One per address space (the boot
-/// loader selftest and each live service). Reclaimable like the L2 arena.
-const L1_TABLES: usize = 16;
+/// Fresh L1 tables (16 KiB each, 16 KiB aligned) for `PageTable::new`. One per live address space.
+/// Reclaimable like the L2 arena.
+///
+/// **32 since 2026-10-07, and why 16 stopped being enough.** The Pi 2 runs fourteen resident services
+/// once `wifi-usb` is one of them, and the boot loader selftest kept a table for the life of the machine
+/// (it returns it now - `loadtest.rs`, `PageTable::discard`). That left ONE root for everything
+/// transient: `observe`, `recorder`, a `selfcheck` program, chaos's `mem-pressure`, and the overlap of a
+/// dying service with its replacement. A 1000-round chaos run then had 982 of its memory-pressure spawns
+/// refused and `selfcheck` failed 18 checks, all of them a spawn this arena could not serve, with 9 MiB
+/// of 921 in use (`docs/wifi-usb.md` 47). 512 KiB, static - the bound stays visible (26.6.1).
+const L1_TABLES: usize = 32;
 #[repr(align(16384))]
 struct L1Arena([[u32; 4096]; L1_TABLES]);
 static mut L1_ARENA: L1Arena = L1Arena([[0; 4096]; L1_TABLES]);
 static L1_USED: [AtomicBool; L1_TABLES] = [const { AtomicBool::new(false) }; L1_TABLES];
+
+/// Requests the arenas could not serve, for the log. Said on the first and every 64th: an exhausted
+/// arena under a chaos storm refuses every spawn, and a line each would bury what it reports. The
+/// failure itself reaches the spawner as `MapError::FrameAllocFailed` - named for a frame, which is why
+/// the true cause is said HERE, once, where the arena knows it.
+static L1_REFUSED: AtomicU32 = AtomicU32::new(0);
+static L2_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+fn say_arena_full(which: &str, total: usize, refused: &AtomicU32) {
+    let n = refused.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        crate::kprintln!(
+            "page_tables: the {} arena is full - all {} tables in use (a bound of this arena, not of RAM); a spawn is refused (x{})",
+            which, total, n);
+    }
+}
 
 /// Hand out a zeroed L2 table for the address space rooted at `owner`; returns its physical
 /// (== virtual, identity-mapped) address. Claims the first free slot (CAS on its `used` flag) and
@@ -182,6 +209,7 @@ fn alloc_l2(owner: u32) -> Option<u32> {
             }
         }
     }
+    say_arena_full("L2", L2_TABLES, &L2_REFUSED);
     None
 }
 
@@ -207,6 +235,7 @@ fn alloc_l1() -> Option<u32> {
             }
         }
     }
+    say_arena_full("L1", L1_TABLES, &L1_REFUSED);
     None
 }
 
@@ -408,6 +437,24 @@ impl PageTable {
     }
     pub fn into_cr3(self) -> u64 {
         self.root as u64
+    }
+
+    /// Give back an address space that was built and never run: its pages and L2 tables
+    /// (`reclaim_user_frames`) and its L1 root (`free_page_table_root`) - the kill path's two steps,
+    /// for a table no task ever owned. Returns the pages freed.
+    ///
+    /// For the boot loader selftest, which built one to prove the loader and then dropped it - one L1
+    /// of the arena, and its L2s and frames, held for the life of the machine (`L1_TABLES`).
+    pub fn discard(self) -> usize {
+        let root = self.root as u64;
+        // SAFETY: `self` is consumed, so this is the only handle to the table; a `PageTable` that was
+        // never turned into a CR3 (`into_cr3` takes `self`) was never written to TTBR0 by any core, so
+        // no walker can reach it. Exactly the precondition both functions state for a Dead task's root.
+        unsafe {
+            let freed = reclaim_user_frames(root);
+            free_page_table_root(root);
+            freed
+        }
     }
 }
 

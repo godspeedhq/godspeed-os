@@ -19,10 +19,10 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 8 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **82** | **grandfathered floor** (§18.5) |
+| `sdk/rust/src/service_context.rs` | **84** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
-**The 90 are not 90 defects.** 86 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
+**The 92 are not 92 defects.** 88 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
 is an `unsafe fn` because it issues the trap instruction, so every caller must open a block - and
 these two files *are* the wrapper layer whose whole purpose is to keep services `unsafe`-free. That
 worked: `services/` is at **zero**. The isolation simply stopped one layer short of itself.
@@ -38,6 +38,153 @@ instead of attempted in the same change that made it visible (§26.7).
 
 Both floors are enforced: a new `unsafe` in any other `sdk/` file FAILS, and either floor growing
 FAILS. They may decrease freely.
+
+---
+
+## 2026-10-04 - Pi 4: ask the faulting core's own MMU (feat/wifi-driver)
+
+`backlog/72`: the page walk above came back the same way in four faults - every frame allocated and owned
+by the faulting task alone, the leaf valid and executable, and the core had nonetheless taken an L3
+translation fault. The software walk reads the tables through memory and cannot see what the core had
+cached, so the report now also asks the core: `AT S1E0R` on the faulting address at the very top of the
+trap report, then a local TLB flush and the same `AT` again. Stale cached state fails then succeeds; an
+entry that was briefly invalid succeeds at once.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/ptables.rs` | 27 -> 28 (+1) | `at_probe`: two `AT S1E0R` (write only `PAR_EL1`) and one `tlbi vmalle1` (drops only this core's cached translations). Touches no memory and no table. The faulting task is about to be killed, so the flush costs every other task on this core nothing but refills from tables that have not changed. |
+| `arch/aarch64/context.rs` | 9 -> 8 (-1) | Locked in: the reduction from `5ee446d2`, when `switch_context` stopped reading `TTBR0` to compare it with the incoming base (it now installs and flushes on every switch). |
+
+## 2026-10-04 - Pi 4: a page walk in the user-fault report (feat/wifi-driver)
+
+`backlog/72`: Pi 4 tasks take instruction aborts and permission faults on their own code - the shell on the
+first instruction of `service_main` - with the TLB flushed on every switch. The fault report now walks the
+faulting address through the table the core had installed and says whether each frame on the way has a
+second owner. Read-only throughout; nothing is written to any table or to the allocator.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/ptables.rs` | 24 -> 27 (+3) | `held_elsewhere`: a read-only walk of every OTHER live root's tables through the existing `get` accessor, which refuses any address that is not RAM, so a corrupt descriptor is skipped rather than followed. `fault_report`: one `mrs ttbr0_el1` (side-effect-free) and one read-only walk of the faulting address through `get`. The live-root set they consult is plain atomics, no `unsafe`. |
+| `memory/allocator.rs` | 47 -> 48 (+1) | `frame_is_free`: one read of the free bitmap through the existing `bitmap()` accessor, deliberately WITHOUT the allocator lock - it runs in a fault report, where taking a lock another core may hold would wedge the machine over a dead service. `phys_in_ram` bounds the index below `max_ram_frame`, which the bitmap was sized to cover. A racing read is at most one allocation stale, which is acceptable for a diagnostic. |
+
+## 2026-10-03 - the Pis' audio jack, prepared as part of its grant (feat/audio)
+
+`pwm-audio` drives the Pis' 3.5 mm jack: PWM fed by the SoC's DMA engine (`docs/audio.md`, "The Pis").
+Two of the steps live in SHARED blocks - every pin's function in the GPIO page, every clock in the clock
+manager's - so the kernel does them when it grants the jack, and the driver is granted only the PWM and
+DMA pages (CLAUDE.md 12.3, the 2026-10-03 amendment). One block per port.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/mod.rs` | 73 -> 74 (+1) | `pwm_probe` (Pi 4): one `uaccess::probe_read32` of PWM1's CTL register at its fixed address inside the Device peripheral mapping, 4-byte aligned - the `rng_probe` pattern. QEMU's `raspi4b` models no PWM, and the first boot that granted the jack there saw the driver's first write abort and the driver respawned forever. Probed once at boot; the jack is granted only where it answered. |
+| `arch/aarch64/mod.rs` | 72 -> 73 (+1) | `audio_jack_prepare` (Pi 4): read-modify-writes of GPFSEL4 (GPIO40/41 to ALT0, PWM1) and GPIO_PUP_PDN_CNTRL_REG2 (their pulls off) changing only those two pins' fields, then the clock manager's CM_PWMCTL/CM_PWMDIV with the 0x5A password: kill, a BOUNDED wait for BUSY, divider PLLD/6, source, enable - Circle's sequence (`gpioclock.cpp`), checked against the datasheet. All fixed BCM2711 registers reached through `mmio()`, all owned by the PWM clock or these two pins. No kernel memory touched. Runs at `pwm-audio`'s spawn, from `map_fixed_driver_mmio`. |
+| `arch/arm/mod.rs` | 52 -> 53 (+1) | `audio_jack_prepare` (Pi 2): the same for the BCM2836 - GPFSEL4 (GPIO40/45 to ALT0, PWM0), the GPPUD/GPPUDCLK1 strobe that clears only those two pins' pulls (the sequence `sd_route_to_emmc` already uses), and the PWM clock at PLLD/2, with the same bounded BUSY wait. Fixed registers in the Device-mapped peripheral window. |
+
+## 2026-10-01 - the RNG200 is probed before it is read (feat/wifi-driver)
+
+`hw_random` read the BCM2711's RNG200 unconditionally, behind `InspectKernel` query 19, which is UNGATED.
+QEMU's `raspi4b` models no RNG200, so there the first read is an external abort that halts the kernel -
+one unprivileged syscall from any service. Found when the `time` service began asking for an NTP nonce on
+every boot. The fix is the posture the PCIe root complex and GENET already have: probe once at boot with
+`uaccess::probe_read32`, record the answer, and never touch a block that did not answer.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/mod.rs` | 71 -> 72 (+1) | `rng_probe`: one `uaccess::probe_read32` of the RNG200's CTRL register at its fixed address inside the Device peripheral mapping, 4-byte aligned. `probe_read32` is the existing one-instruction fixup that turns the external abort of an absent device into `None`; a fault anywhere else still halts loudly. Runs once, on the boot path, inside the probe window. |
+
+## 2026-10-08 - the boot record: `events log boot` (feat/wifi-driver)
+
+A new InspectKernel query (27), pinned in `COMMANDMENTS.baseline.toml`, with the constitution amended at
+11.4 and the floor at 18.5. The kernel side adds NO unsafe: the record is a fixed array beside the ring
+in `log.rs`, under the ring's existing SpinLock, and the query copies a chunk out through the existing
+`write_user_bytes`.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 83 -> 84 (+1) | `boot_record_query`: one more `unsafe { raw_syscall(13, 27, ..) }` call site, behind the two safe wrappers `boot_record_size` and `boot_record_read` - one block for both, which is why it is +1 and not +2. The read's buffer is typed `&mut [u8; BOOT_READ_CHUNK]`, so the length the kernel writes is the length the caller holds. Floor amended at CLAUDE.md 18.5, 2026-10-08. |
+
+## 2026-10-01 - CpuClock: the Arm clock, for the `power` service (feat/wifi-driver)
+
+A new syscall (55) and a new resource (`CPU_CLOCK`, 18), with the constitution amended at 12.3 and the
+floor at 18.5. The kernel side adds NO unsafe: the handler checks a holding and calls the arch seam; the
+aarch64 rate request goes through the mailbox's existing `property_call` under `MBOX_LOCK`, exactly as
+the expander GPIO calls do. The six other ports answer the seam with safe stubs returning `None`.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 83 -> 84 (+1) | `cpu_clock`: one more `unsafe { raw_syscall(55, ..) }` call site, the same single design consequence as `device_power` below. One integer to a validating kernel; the capability is checked before the firmware is asked anything. Floor amended at CLAUDE.md 18.5, 2026-10-01. |
+
+## 2026-10-01 - DevicePower: the device grant made renewable (feat/wifi-driver)
+
+A new syscall (54) and a new resource (`DEVICE_POWER`, 17), with the constitution amended at 12.3 and
+the floor at 18.5 before the gate would pass it. The kernel side adds NO unsafe: the handler checks a
+holding and calls the arch seam; the aarch64 pin write goes through the mailbox's existing
+`property_call`, which already translates its buffer's address and does the cache maintenance (it has
+served `notify_xhci_reset` after the MMU came up since 2026-08) and now takes a lock so a syscall and a
+boot caller cannot share the buffer. The six other ports answer the seam with safe stubs returning
+`false`.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 82 -> 83 (+1) | `device_power`: one more `unsafe { raw_syscall(54, ..) }` call site - the same design consequence the 2026-09-12 amendment names (the SDK is the wrapper layer, so a new syscall is one block here and none in any service). Two integers to a validating kernel; the capability is checked before any pin is touched. Floor amended at CLAUDE.md 18.5, 2026-10-01. |
+
+## 2026-09-27 - Pi 4: routing the radio's pins, and the clock its controller needs (feat/wifi-driver)
+
+The census below established WHICH controller the radio is behind and deliberately granted nothing. This
+is the grant, and the two board-level facts that have to be true before a driver can use it.
+
+`map_fixed_driver_mmio` now names `0xFE30_0000` to `wifi-driver`, gated on the census having seen that
+controller ANSWER - not on a constant, because QEMU's `raspi4b` emulates no Arasan and an ungated grant
+would hand the service a window whose first register read aborts, forever.
+
+**The new `unsafe` is the first WRITE in this file**, which is why it gets its own row rather than being
+folded into the reads below. GPIO 34-39 in ALT3 is the Arasan's SD1 interface - the only path to the
+radio - and pin muxing is a BOARD fact rather than a driver's business: a driver service is granted its
+own controller's registers and nothing else (§12.3), so it cannot route the pins that connect it to the
+part it drives. arm32 makes exactly this argument at `sd_route_to_emmc`, one SoC generation earlier and
+with the older BCM2835 pull-strobe sequence instead of the BCM2711's direct pull registers.
+
+The read-back is logged BEFORE the write, for the same reason arm32 logs it: it is the one fact that
+separates "the radio was muxed away from us" from "it is ours and something else is wrong". On this
+board the firmware is expected to have done it already, so reading back ALT3 is the predicted case and a
+disagreement is the interesting one.
+
+Two mailbox calls come with it and need no `unsafe` at all - `mailbox::property_call` is a safe
+function - so the SD power domain and the Arasan's base clock are asked for and PRINTED rather than
+assumed. The clock matters more than it looks: `emmc_base_clock_hz` returned a flat 0 on this port, and
+0 is a refusal rather than a default, so without it the driver would correctly decline to set any card
+clock at all.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/mod.rs` | 70 -> 71 (+1) | `hw_random` (2026-09-30): the BCM2711 RNG200 behind `InspectKernel` query 19 - one block of 32-bit volatile reads and writes of six registers at a fixed address inside the Device-nGnRnE peripheral window, through `mmio()` so it holds on both sides of the jump to the high half. Registers, masks and the restart sequence are Linux's `iproc-rng200` quoted at the function (26.14). Enabled once behind an atomic swap; the restart runs only on a fail bit the block reported, once per read as Linux allows; the wait is a bound in reads of the count register and returns `None` rather than holding the core. No kernel memory is touched. It replaces a stub that returned `None` on every call, which left the wifi driver hashing its handshake nonce from a cycle counter (`docs/wifi.md` 40). |
+| `arch/aarch64/sdio.rs` | 2 -> 3 (+1) | `route_pins_to_arasan` - a read-modify-write of the BCM2711 GPIO block's `GPFSEL3` and `GPIO_PUP_PDN_CNTRL_REG2`, touching only GPIO34-39's fields in each, on the single-threaded boot path, through the kernel's Device peripheral mapping (`mmio()`, so it holds on both sides of the jump to the high half). One block covering both registers plus the read-back that is logged before either write; it carries its own SAFETY comment. No allocation, no loop bound to anything device-supplied, and the six pins are a compile-time range. |
+
+---
+
+## 2026-09-27 - Pi 4: which SD host controller is the WiFi radio behind (feat/wifi-driver)
+
+`docs/wifi.md` section 4 rests the whole Pi 4 phase-1 estimate on one board fact: the CYW43455 sitting
+behind the older Arasan controller - the block `services/block-driver/src/sdhci.rs` already drives - with
+the SD card on the other one. That was recorded as needing a device-tree read. It does not: the machine
+can be asked.
+
+`arch/aarch64/sdio.rs` asks it. Two candidate windows, two read-only SDHCI registers each, printed with
+which answered. It is `discovery` in `COMMANDMENTS.baseline.toml`, beside `genet.rs` and `pcie.rs`, and
+Commandment I's role check is what made that classification explicit rather than assumed.
+
+**It grants nothing.** `map_fixed_driver_mmio` is untouched until the boot log says which window to name,
+because that table's own comment records the cost of guessing: a service handed a range whose first
+register read aborts dies on that read, and the supervisor respawns it forever.
+
+One of the two offsets is an in-repo fact (`arch/arm/mod.rs` grants the Arasan at `PERIPHERAL_BASE +
+0x30_0000`, and `sdhci.rs` documents the same); the other is this author's recollection and is **labelled
+UNVERIFIED in the log line itself**, because a probe that cannot be told apart from a claim is worth less
+than no probe.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/aarch64/sdio.rs` | 0 -> 2 (+2) | Two `uaccess::probe_read32` calls, the same abort-catching read `genet::probe` and `pcie::init` use and for the same reason: on this SoC an address that decodes to nothing is an external abort, and one taken outside the boot probe window surfaces later as an SError blaming an unrelated userspace task. Each carries its own SAFETY comment noting 4-byte alignment and that the address is inside the peripheral Device mapping the kernel built at boot. Reads only; no write, no side effect intended, and the registers chosen are SDHCI's read-only ones. |
 
 ---
 
@@ -2489,18 +2636,19 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 70 | permitted |
+| arch/aarch64/mod.rs | 74 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
+| arch/aarch64/sdio.rs | 3 | permitted |
 | arch/aarch64/exceptions.rs | 17 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
-| arch/aarch64/context.rs | 9 | permitted |
+| arch/aarch64/context.rs | 8 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
 | arch/aarch64/mmu.rs | 23 | permitted |
-| arch/aarch64/ptables.rs | 24 | permitted |
+| arch/aarch64/ptables.rs | 28 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
 | arch/aarch64/memmap.rs | 8 | permitted |
@@ -2517,14 +2665,14 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/bootcon.rs | 2 | permitted |
-| arch/arm/page_tables.rs | 31 | permitted |
+| arch/arm/page_tables.rs | 32 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |
 | arch/arm/spawn.rs | 4 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 52 | permitted |
+| arch/arm/mod.rs | 53 | permitted |
 | arch/loongarch64/mod.rs | 25 | permitted |
 | arch/riscv32/mod.rs | 25 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
@@ -2551,7 +2699,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 16 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 47 | permitted |
+| memory/allocator.rs | 48 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
@@ -3469,3 +3617,19 @@ syscall for it would grow the kernel's responsibilities (§4.4). The marker only
 caller's OWN address space, and the kernel refuses any value that is not page-aligned and inside the
 user stack range, reporting the refusal rather than acting on it (invariant 12). It fires once per
 boot. All of it is diagnostic and goes when the fault does.
+
+## `arch/arm/page_tables.rs` 31 -> 32 (2026-10-07): `PageTable::discard`, and the arenas doubled
+
+One block: the body of `PageTable::discard`, which gives back an address space that was built and never
+run - `reclaim_user_frames` then `free_page_table_root`, the kill path's two steps. Sound for the same
+reason those are sound on a Dead task's root, and more simply: `discard` consumes the `PageTable`, and a
+table that was never turned into a CR3 (`into_cr3` takes `self`) was never written to TTBR0, so no
+core's walker can reach it. Its one caller is the ARMv7 loader selftest, which built a table to prove
+the loader and dropped it, keeping one of the arena's L1 roots with its L2s and frames for the life of
+the machine. `loadtest.rs` itself gains no `unsafe`.
+
+Beside it, constants only: `L1_TABLES` 16 -> 32 and `L2_TABLES` 128 -> 256 (512 + 256 KiB, static,
+the bound still visible per 26.6.1), and a rate-limited line naming an exhausted arena where it is
+known - the failure reaches the spawner as `FrameAllocFailed`, which named a frame when no frame was
+short. Found by a Pi 2 chaos run whose spawns were refused with 9 MiB of 921 in use
+(`docs/wifi-usb.md` 47).

@@ -190,13 +190,22 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         // The COM2 operator channel (C1-6). Inert on the Pi, which is driven from its own console, but
         // embedded so the service set does not differ per arch without a reason.
         "control",
-        // Persistence on the Pi 2: block-driver's ARM backend is the BCM2835 EMMC (SDHCI, PIO); fs is
-        // arch-neutral and rides on it. The kernel grants block-driver the EMMC MMIO window at spawn
-        // (arch::arm::map_fixed_driver_mmio).
+        // Persistence on the Pi 2: block-driver's ARM backend reaches a USB stick behind dwc2
+        // (storage_is_usb); fs is arch-neutral and rides on it. The kernel grants block-driver no
+        // EMMC window: the EMMC is the boot card (docs/audio.md, "No service names in the kernel").
         "block-driver", "fs",
         // Networking on the Pi 2: nic-driver's ARM backend bridges the frame IPC to the in-kernel DWC2
         // CDC-ECM USB-net device (NET_DEVICE syscalls); net-stack is arch-neutral and rides on it.
         "nic-driver", "net-stack",
+        // The audio jack, driven by PWM (docs/audio.md): the kernel routes its pins and starts its clock
+        // as part of the grant; the service drives the PWM block and the DMA engine.
+        "pwm-audio",
+        // The power policy (docs/power.md). Arch-neutral: on a board whose clock the OS cannot set it
+        // says so once and answers every lease "no control", which costs a holder nothing.
+        "power",
+        // The USB WiFi dongle's driver (docs/wifi-usb.md), reached through dwc2; started by the supervisor when
+        // dwc2 reports the dongle.
+        "wifi-usb",
     ];
     let arm_dir = workspace
         .join("target")
@@ -238,6 +247,17 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         &["events", "recorder", "copier", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
+          // The Pi 4's onboard radio, over SDIO: on aarch64, the board with a WiFi part soldered to an SD
+          // host controller (the VisionFive's is in its own list), and the Pi 2's dongle is a different problem
+          // (a USB soft-MAC part, docs/wifi.md phase 6).
+          "wifi-driver",
+          // The USB WiFi dongle's driver (docs/wifi-usb.md), reached through xhci and started when the
+          // dongle is plugged in; beside the onboard radio, not instead of it.
+          "wifi-usb",
+          // The power policy, which holds the Arm clock fast while the radio loads (docs/power.md).
+          "power",
+          // The audio jack, driven by PWM (docs/audio.md).
+          "pwm-audio",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
@@ -245,6 +265,9 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         &["events", "recorder", "copier", "console", "time", "control", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
+          // See the demo arm above. Present in BOTH arms because both can ship, which is the trap
+          // `service_embed_check.embedded_arms` refuses to union away.
+          "wifi-driver", "wifi-usb", "power", "pwm-audio",
           "counter", "greet", "upper", "roster", "reply-server", "asker", "resource-server", "holder"]
     };
     let aarch64_dir = workspace

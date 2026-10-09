@@ -288,7 +288,7 @@ pub fn run() -> bool {
     // untouched by the switch; TTBR0 is retired again immediately afterwards.
     unsafe {
         core::arch::asm!(
-            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            "msr ttbr0_el1, {t}", "isb", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
             t = in(reg) task.ttbr, options(nostack),
         );
     }
@@ -364,6 +364,7 @@ extern "C" fn enter_el0() -> ! {
         let ttbr = ENTER_TTBR;
         core::arch::asm!(
             "msr ttbr0_el1, {ttbr}",
+            "isb",
             "dsb ish",
             "tlbi vmalle1",
             "dsb ish",

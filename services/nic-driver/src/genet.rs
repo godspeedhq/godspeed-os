@@ -30,16 +30,24 @@
 //!   `dc civac` writing a stale line back over a freshly-DMA'd frame). An uncached mapping removes the
 //!   question rather than resting on the driver author remembering, which is exactly what SEC-28 asks
 //!   a non-coherent port to do.
-//! - **Waits are bounded by real time**, read from the same counter the kernel's `delay_us` used, but
-//!   through `ctx.read_tsc()`. A bound has to mean what it says: an iteration count is not a duration,
-//!   and the only place one appears here is the fallback for a machine that reports no calibration -
-//!   where it is named as what it is.
+//! - **Waits are bounded by real time**, through `gs::driver::wait`. A bound has to mean what it says:
+//!   an iteration count is not a duration, and the only place one applies is the library's fallback for
+//!   a machine that reports no calibration - which bring-up says out loud.
 //!
 //! Written against Linux's `drivers/net/ethernet/broadcom/genet/` as an executable datasheet, per the
 //! doctrine in `kernel/src/arch/CLAUDE.md`: the C driver says what the silicon wants, and we implement
 //! that want as a capability service.
 
+use godspeed::driver::delay;
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+
+// The radio as the link's second backend (`radio.rs`), shared with the VisionFive's `dwmac`. Included by
+// path from each backend that uses it rather than declared once behind a new `cfg`: only one backend is
+// compiled for any board, so the file is compiled once, and no board fact is added to say which.
+#[path = "radio.rs"]
+mod radio;
+use radio::{Carrier, Radio, CABLE_RECHECK_MS};
 
 // ---------------------------------------------------------------------------------------------
 // Register map. Byte offsets into the 64 KiB window `ctx.mmio()` hands us, which the spawn path
@@ -365,14 +373,14 @@ const BATCH_MSG_MAX: usize = 3072;
 
 /// How long the MDIO controller gets to clear `START_BUSY`. The kernel driver spent 10,000 iterations
 /// of a 10 us delay here; this is the same 100 ms, said as a duration.
-const MDIO_TIMEOUT_US: u64 = 100_000;
+const MDIO_WAIT: Budget = Budget::ms(100);
 /// How long a DMA engine gets to report itself started.
-const DMA_START_TIMEOUT_US: u64 = 100_000;
-/// The fallback ceiling for a machine that reports no timer calibration, where a real deadline cannot
-/// be computed. It is an iteration count and it is named as one: it bounds the loop, it does not
-/// promise a duration. Every caller that hits it reports the failure the same way, so a machine in this
-/// state is loud rather than merely slow.
-const UNCALIBRATED_POLLS: u32 = 200_000;
+const DMA_START_WAIT: Budget = Budget::ms(100);
+/// The gap Linux leaves after the MAC's reset writes for the bit to land. No register says when it has,
+/// so it is a hold (`gs::driver::delay`), not a wait.
+const REG_SETTLE: Budget = Budget::us(10);
+// On a machine with no timer calibration a deadline cannot be computed, and the bound is
+// `godspeed::driver::wait::UNCALIBRATED_POLLS` looks - the same 200,000 this file used to name itself.
 
 /// The GENET controller, as a userspace driver sees it: a register window, a DMA arena, and the
 /// service context that provides logging and the clock the waits are bounded by.
@@ -380,8 +388,8 @@ pub struct Genet<'a> {
     ctx: &'a ServiceContext,
     m: Mmio,
     a: Dma,
-    /// Counter ticks in 10 ms, from the kernel's own calibration. Zero means uncalibrated, which the
-    /// wait helpers handle explicitly rather than by dividing by it.
+    /// Counter ticks in 10 ms, from the kernel's own calibration, read once so bring-up can say when it
+    /// is 0 and the waits are counted rather than measured. The waits themselves are `gs::driver`'s.
     per_10ms: u64,
 }
 
@@ -414,52 +422,10 @@ impl<'a> Genet<'a> {
         self.m.write32(off, v);
     }
 
-    /// Counter ticks in `us` microseconds, floored at 1 so a bound is never zero.
-    fn cycles_for_us(&self, us: u64) -> u64 {
-        (self.per_10ms.saturating_mul(us) / 10_000).max(1)
-    }
-
-    /// Busy-wait `us` microseconds of REAL time. Terminates by construction: the counter is monotonic.
-    fn delay_us(&self, us: u64) {
-        if self.per_10ms == 0 {
-            // No calibration to convert with. Yielding once is an honest "give the hardware a moment"
-            // and, unlike a spin of guessed length, cannot silently become either nothing or minutes.
-            self.ctx.yield_cpu();
-            return;
-        }
-        let budget = self.cycles_for_us(us);
-        let start = self.ctx.read_tsc();
-        while self.ctx.read_tsc().wrapping_sub(start) < budget {
-            core::hint::spin_loop();
-        }
-    }
-
-    /// Spin until `read32(off) & mask` matches `want`, or the budget expires. Returns whether the
-    /// condition was reached, so every caller can report its own failure in its own words (§26.7).
-    fn wait_mask(&self, off: usize, mask: u32, want: bool, us: u64) -> bool {
-        let budget = self.cycles_for_us(us);
-        let start = self.ctx.read_tsc();
-        let mut polls: u32 = 0;
-        loop {
-            if ((self.rd(off) & mask) != 0) == want {
-                return true;
-            }
-            if self.per_10ms != 0 {
-                if self.ctx.read_tsc().wrapping_sub(start) >= budget {
-                    return false;
-                }
-            } else {
-                polls += 1;
-                if polls >= UNCALIBRATED_POLLS {
-                    return false;
-                }
-            }
-            core::hint::spin_loop();
-        }
-    }
-
-    fn wait_clear(&self, off: usize, mask: u32, us: u64) -> bool {
-        self.wait_mask(off, mask, false, us)
+    /// Spin until `read32(off) & mask` is clear, or the budget expires (`godspeed::driver::wait`).
+    /// Returns whether it cleared, so every caller can report its own failure in its own words (§26.7).
+    fn wait_clear(&self, off: usize, mask: u32, budget: Budget) -> bool {
+        wait::until(self.ctx, budget, || self.rd(off) & mask == 0).is_ok()
     }
 
     // --- MDIO ---------------------------------------------------------------------------------
@@ -481,7 +447,7 @@ impl<'a> Genet<'a> {
         };
         self.wr(UMAC_MDIO_CMD, cmd);
 
-        if !self.wait_clear(UMAC_MDIO_CMD, MDIO_START_BUSY, MDIO_TIMEOUT_US) {
+        if !self.wait_clear(UMAC_MDIO_CMD, MDIO_START_BUSY, MDIO_WAIT) {
             return None; // the bus never went idle
         }
         let done = self.rd(UMAC_MDIO_CMD);
@@ -605,7 +571,7 @@ impl<'a> Genet<'a> {
     /// [`SYS_RBUF_FLUSH_CTRL`].
     fn release_sw_reset(&self) {
         self.wr(SYS_RBUF_FLUSH_CTRL, 0);
-        self.delay_us(10);
+        delay::hold(self.ctx, REG_SETTLE);
     }
 
     /// Reset the MAC and put it in a known, quiet state.
@@ -617,9 +583,9 @@ impl<'a> Genet<'a> {
         self.release_sw_reset();
 
         self.wr(UMAC_CMD, CMD_SW_RESET);
-        self.delay_us(10);
+        delay::hold(self.ctx, REG_SETTLE);
         self.wr(UMAC_CMD, 0);
-        self.delay_us(10);
+        delay::hold(self.ctx, REG_SETTLE);
 
         // Prove the release worked rather than trusting it. A register that cannot hold a bit is the
         // exact failure this function exists to clear, and it is invisible until frames fail to arrive
@@ -932,7 +898,7 @@ impl<'a> Genet<'a> {
 
         // Confirm the engine actually started. `DMA_STATUS` bit 0 reads SET while it is stopped, so a
         // controller that ignored the enable says so here rather than by silently moving nothing.
-        if !self.wait_clear(dma_reg(block, DMA_STATUS), DMA_DISABLED, DMA_START_TIMEOUT_US) {
+        if !self.wait_clear(dma_reg(block, DMA_STATUS), DMA_DISABLED, DMA_START_WAIT) {
             // Back out rather than leave a half-enabled engine pointing at our buffers.
             self.wr(dma_reg(block, DMA_CTRL), 0);
             self.wr(dma_reg(block, DMA_RING_CFG), 0);
@@ -1254,22 +1220,50 @@ pub fn genet_main(ctx: ServiceContext) -> ! {
         ctx.log("nic-driver: genet has no timer calibration - hardware waits fall back to an iteration ceiling, which is NOT a duration");
     }
 
-    let Some(mac) = g.bring_up() else {
-        ctx.log("nic-driver: genet did not come up - serving empty replies (net degrades, not hangs)");
-        crate::serve_status(&ctx, &[0u8; 8]);
-    };
-
-    ctx.log_fmt(format_args!(
-        "nic-driver: genet up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}  ({} rx / {} tx buffers of {} B in a {} KiB arena)",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-        if g.link_is_up() { "UP" } else { "down (no cable?)" },
-        RX_RING_DESCS, TX_RING_DESCS, RX_BUF_LENGTH, ARENA_NEEDED / 1024));
+    // A MAC that will not come up does NOT take the radio down with it - the dwmac's lesson from the
+    // VisionFive's chaos run (2026-10-06), where the same "serve empty replies to everything" left a
+    // rejoined radio carrying nothing. The radio is served, and the MAC is tried again when a cable arrives.
+    let mac = g.bring_up();
+    match mac {
+        Some(mac) => say_up(&ctx, &g, mac),
+        None => ctx.log("nic-driver: genet did not come up - the radio still carries the link, and the MAC is tried again when a cable arrives"),
+    }
     ctx.log("nic-driver: serving frame interface");
 
     serve(&ctx, &g, mac)
 }
 
-fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
+fn say_up(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) {
+    ctx.log_fmt(format_args!(
+        "nic-driver: genet up  MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  link {}  ({} rx / {} tx buffers of {} B in a {} KiB arena)",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        if g.link_is_up() { "UP" } else { "down (no cable?)" },
+        RX_RING_DESCS, TX_RING_DESCS, RX_BUF_LENGTH, ARENA_NEEDED / 1024));
+}
+
+
+/// A reply that could not be sent, said WITH ITS REASON. The two reasons are different faults: a full
+/// queue means the requester is alive and behind, a dead capability means the requester already gave
+/// up (timed out and reclaimed its reply cap) before this driver was scheduled to answer - which is
+/// what backlog/66 was first taken for (its DNS failure turned out to be an empty reply the kernel
+/// refused, fixed in `e3fcf7ed`). The old line latched once and named neither. First failure and
+/// every sixteenth after, so a run of them is a count and not a flood.
+fn reply_failed(ctx: &ServiceContext, e: godspeed_sdk::ipc::IpcError, n: &mut u32) {
+    *n = n.saturating_add(1);
+    if *n == 1 || *n % 16 == 0 {
+        let why = match e {
+            godspeed_sdk::ipc::IpcError::QueueFull => "the requester's queue is full",
+            godspeed_sdk::ipc::IpcError::EndpointDead | godspeed_sdk::ipc::IpcError::CapError(_) =>
+                "the reply cap is dead - the requester stopped waiting before this reply",
+            _ => "another error",
+        };
+        ctx.log_fmt(format_args!(
+            "nic-driver: a reply send FAILED (#{}) - {} - the requester times out", *n, why));
+    }
+}
+
+/// `mac` is `None` while the MAC is down (`genet_main`): the cable then carries nothing, and the radio does.
+fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
     let mut tx_next: u32 = 0;
     // Bounds the post-transmit counter report, so a diagnostic cannot become a console flood (§26.6).
     // It lives here rather than in `transmit` because it is serve-loop state, not driver state, and
@@ -1281,66 +1275,70 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
     // a fresh transition - `bring_up` has just applied the settings for it.
     let mut link_was_up = g.link_is_up();
     let mut rxbuf = [0u8; FRAME_MAX];
+    // WHICH LINK CARRIES THE FRAMES - see `Carrier`. Between re-reads, `cable` is the answer.
+    let mut cable = link_was_up && mac.is_some();
+    let mut cable_read_at = ctx.read_tsc();
+    let mut carrier = if cable { Carrier::Cable } else { Carrier::None };
+    // The onboard radio first, and the USB dongle's service as the other: the bridge follows whichever
+    // says it is the one in use (`wifi hardware use`, `Radio::info`).
+    let mut radio = Radio::with_other("wifi-driver", "wifi-usb");
+    let mut radio_tx_fail: u32 = 0;
+    let mut status_served: u32 = 0;
 
     // Outside the loop deliberately: a once-only latch declared inside the loop it guards resets on
     // every iteration and reports every time, which is the flood it exists to prevent.
     let mut capless_logged = false;
-    let mut reply_failed_logged = false;
+    let mut reply_failures: u32 = 0;
     loop {
-        let req = ctx.recv();
-        // The reply cap is the ONLY authority to answer net-stack (§8.5).
-        //
-        // A request that carries none cannot be answered, and dropping it SILENTLY leaves no evidence
-        // anywhere: net-stack waits out its deadline and reports the driver unresponsive, while the
-        // driver's log shows a clean run. The sibling backend (`main.rs`) already logs this; GENET is
-        // the backend that actually runs on the Pi 4 and was the one that forgot (Commandment III -
-        // two implementations of one rule).
-        //
-        // Rate-limited to once, because the condition repeats per request and the report must not
-        // become the flood it is reporting.
-        let Some(reply_cap) = ctx.take_pending_cap() else {
-            if !capless_logged {
-                capless_logged = true;
-                ctx.log("nic-driver: request had no reply cap - dropping (cannot answer without one)");
+        // A REQUEST THE RADIO WAIT KEPT IS SERVED FIRST - it arrived before anything the recv below
+        // could return (`Radio::held`).
+        let (req, reply_cap) = match radio.take_held() {
+            Some(h) => h,
+            None => {
+                let req = ctx.recv();
+                // The reply cap is the ONLY authority to answer net-stack (§8.5).
+                //
+                // A request that carries none cannot be answered, and dropping it SILENTLY leaves no evidence
+                // anywhere: net-stack waits out its deadline and reports the driver unresponsive, while the
+                // driver's log shows a clean run. The sibling backend (`main.rs`) already logs this; GENET is
+                // the backend that actually runs on the Pi 4 and was the one that forgot (Commandment III -
+                // two implementations of one rule).
+                //
+                // Rate-limited to once, because the condition repeats per request and the report must not
+                // become the flood it is reporting.
+                let Some(reply_cap) = ctx.take_pending_cap() else {
+                    if !capless_logged {
+                        capless_logged = true;
+                        ctx.log("nic-driver: a message with no reply cap - dropping (a request nobody can be answered on, or a late reply from the radio after this driver stopped waiting for it)");
+                    }
+                    continue;
+                };
+                (req, reply_cap)
             }
-            continue;
         };
         let p = req.payload_bytes();
 
-        if p.len() == 1 && p[0] == 3 {
-            // STATUS: [ok, mac(6), link] - net-stack reads the MAC at [1..7] and the link at [7]. The
-            // link is read LIVE over MDIO, so a cable pulled after bring-up reports down.
-            let mut out = [0u8; 8];
-            out[0] = 1;
-            out[1..7].copy_from_slice(&mac);
-            // RE-APPLY the link settings when a cable arrives after bring-up.
-            //
-            // `apply_link_settings` (MAC speed + DMA burst) runs only during `bring_up`. Boot WITH a
-            // cable and the PHY has negotiated by then, so the speed is programmed and the receiver
-            // works. Boot WITHOUT one and it logs "PHY has not settled on a speed - leaving the MAC at
-            // its default", and nothing ever ran it again - so when the cable appeared the MAC was
-            // still unclocked and NOTHING was received. Measured, not guessed: net-stack's DHCP dance
-            // reported "saw 0 frames" on every hot-plug attempt, against 4-5 frames per attempt on a
-            // cable-at-boot run.
-            //
-            // Done HERE because this is the one place the link is already read live, on the status
-            // request net-stack makes before it dances - so the settings are applied a moment before
-            // the frames that need them, with no polling added anywhere.
-            //
-            // Edge-triggered: only on a down -> up TRANSITION. Re-running it on every status request
-            // would rewrite MAC registers under live traffic for no reason.
+        // THE CABLE, re-read at most every CABLE_RECHECK_MS on whatever request arrives (`Carrier`). A
+        // link that came up after bring-up gets the MAC speed and DMA burst re-applied, edge-triggered,
+        // exactly as the STATUS request used to do it alone; if the re-apply does not take, the edge
+        // stays pending and is retried on the next read.
+        let now = ctx.read_tsc();
+        if now.wrapping_sub(cable_read_at) >= ctx.duration_cycles(CABLE_RECHECK_MS) {
+            cable_read_at = now;
             let up_now = g.link_is_up();
-            if up_now && !link_was_up {
+            if up_now && !link_was_up && mac.is_none() {
+                // A cable arrived at a MAC that did not come up: try it again, once per arrival.
+                mac = g.bring_up();
+                match mac {
+                    Some(m) => {
+                        say_up(ctx, g, m);
+                        ctx.log("nic-driver: genet came up on a later try, with a cable - the cable carries the link again");
+                    }
+                    None => ctx.log("nic-driver: genet still did not come up with the cable - the radio carries on"),
+                }
+                link_was_up = true;
+            } else if up_now && !link_was_up {
                 ctx.log("nic-driver: genet link came up after bring-up - re-applying MAC speed and DMA burst");
-                // CONSUME THE EDGE ONLY IF THE RE-APPLY ACTUALLY WORKED (audit A5-1, Commandments V
-                // and IX). `apply_link_settings` returns 0 when the PHY has not settled - and it reads
-                // a DIFFERENT register (the aux status) from `link_is_up`'s BMSR bit, so it can fail on
-                // a link that genuinely is up, or on any failed MDIO read. Marking the edge consumed
-                // regardless meant one unlucky read left the MAC unclocked FOREVER: nothing received,
-                // and no second chance short of a physical replug.
-                //
-                // A recovery that fails must not be recorded as a recovery that happened. Leaving
-                // `link_was_up` false keeps the edge pending, so the next status request tries again.
                 if g.apply_link_settings() != 0 {
                     link_was_up = true;
                 } else {
@@ -1349,18 +1347,27 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             } else {
                 link_was_up = up_now;
             }
-            out[7] = up_now as u8;
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
+            cable = up_now && mac.is_some();
         }
+
+        if p.len() == 1 && p[0] == 3 {
+            // INSTRUMENT (2026-09-30): net-stack sees its STATUS answered ~950 ms after asking while this
+            // side answers in nothing; the same clock on both sides says which side the wait is on.
+            status_served = status_served.wrapping_add(1);
+            if status_served <= 5 || status_served % 50 == 0 {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: serving STATUS #{} at {} ms",
+                    status_served, ctx.read_tsc() / ctx.duration_cycles(1).max(1)));
+            }
+            let out = radio::status(ctx, &mut radio, cable, mac.unwrap_or([0; 6]), &mut carrier);
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
+        } else if p.len() == 1 && p[0] == 10 {
+            let out = radio::peer(ctx, &mut radio, cable);
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
-            let n = g.receive(&mut rxbuf);
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-        }
+            let n = if cable { g.receive(&mut rxbuf) } else { radio.rx(ctx, &mut rxbuf) };
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes]. Bounded three ways - by
             // BATCH_MAX, by the reply buffer, and by the ring emptying - so it always terminates.
@@ -1375,7 +1382,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                     break;
                 }
                 let mut rx = [0u8; FRAME_MAX];
-                let n = g.receive(&mut rx);
+                let n = if cable { g.receive(&mut rx) } else { radio.rx(ctx, &mut rx) };
                 if n == 0 {
                     break;
                 }
@@ -1386,23 +1393,29 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
                 count += 1;
             }
             out[0] = count;
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-        }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])) { reply_failed(ctx, e, &mut reply_failures); }
         } else if p.len() == 1 && matches!(p[0], 5 | 6 | 7 | 8) {
             // UNSUPPORTED on this backend - answered `[0]`, not `[1]`. Ops 6/7/8 are the chaos
             // force-link override and op 5 is a Realtek/e1000-shaped register dump; acking any of them
             // with success would make `chaos link-flap` print that it had exercised link recovery
             // having exercised nothing. A test that cannot fail is worse than absent when it reads as
             // passing. The caller needs an ANSWER, and "not supported here" is one.
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-        }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
         } else {
             // TX FRAME (any multi-byte payload) : transmit and acknowledge. The frame is NOT coupled to a receive - see below.
-            if !g.transmit(p, &mut tx_next) {
+            if !cable {
+                // The radio's turn (`Carrier`): the frame goes to `wifi-driver` as op 0x11 and the answer
+                // is its word. A refusal is counted and reported sparingly: the stack retries on its own
+                // pace, and a radio that is not joined refuses every frame, correctly.
+                if !radio.tx(ctx, p) {
+                    radio_tx_fail = radio_tx_fail.saturating_add(1);
+                    if radio_tx_fail == 1 || radio_tx_fail % 64 == 0 {
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio did not send a {} byte frame (x{}) - not joined, no credit, or no answer",
+                            p.len(), radio_tx_fail));
+                    }
+                }
+            } else if !g.transmit(p, &mut tx_next) {
                 // A failed transmit must not be dropped on the floor: the reply would still come back
                 // normally, so net-stack would wait out its whole deadline for an answer to a frame
                 // that never left the host - a send that did not happen, reported as one that did.
@@ -1422,9 +1435,9 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             // not want one (net-stack's send path checks only whether a reply arrived), so the frame
             // was consumed and destroyed: exactly what "every transmit a place a frame could be
             // destroyed by a caller who did not want an answer" describes. And when NO frame was
-            // waiting, `n` was 0, so the reply was EMPTY - and an empty reply cannot be delivered
-            // (d2f99b65), so the acknowledgement never arrived and net-stack waited out its whole
-            // one-second deadline.
+            // waiting, `n` was 0, so the reply was EMPTY - and an empty reply could not be delivered
+            // (d2f99b65; the kernel refused one on three ports until e3fcf7ed), so the acknowledgement
+            // never arrived and net-stack waited out its whole one-second deadline.
             //
             // That second case is the Pi 4's ping loss. The window is measured from BEFORE the send,
             // so a stalled acknowledgement spends the window the echo reply needed: the log showed
@@ -1436,10 +1449,7 @@ fn serve(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) -> ! {
             // the shared path was changed to match and THIS backend was not, so the Pi 4 kept the old
             // coupled behaviour under the new caller. Frames stay in the ring for the drain (ops 4
             // and 9), which is the path whose job that is.
-            if ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])).is_err() && !reply_failed_logged {
-            reply_failed_logged = true;
-            ctx.log("nic-driver: a reply send FAILED - the requester will time out (queue full or peer dead)");
-        }
+            if let Err(e) = ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])) { reply_failed(ctx, e, &mut reply_failures); }
         }
         ctx.remove_cap(reply_cap);
     }

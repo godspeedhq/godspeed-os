@@ -104,6 +104,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audio-driver"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-audio",
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,6 +170,7 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 name = "block-driver"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 
@@ -344,7 +354,9 @@ dependencies = [
 name = "dwc2"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
+ "godspeed-wifi",
 ]
 
 [[package]]
@@ -358,6 +370,7 @@ dependencies = [
 name = "ehci"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 
@@ -527,14 +540,30 @@ dependencies = [
 
 [[package]]
 name = "godspeed"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "godspeed-sdk",
 ]
 
 [[package]]
+name = "godspeed-audio"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "godspeed-sdk"
-version = "0.21.0"
+version = "0.22.0"
+
+[[package]]
+name = "godspeed-wifi"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-sdk",
+]
 
 [[package]]
 name = "greet"
@@ -867,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "bitflags 2.11.1",
  "limine",
@@ -949,6 +978,7 @@ dependencies = [
 name = "net-stack"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 
@@ -956,6 +986,7 @@ dependencies = [
 name = "nic-driver"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 
@@ -1080,7 +1111,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "osdev"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "clap",
  "fatfs",
@@ -1155,6 +1186,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "power"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-sdk",
+]
+
+[[package]]
 name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1202,6 +1241,15 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "pwm-audio"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-audio",
+ "godspeed-sdk",
 ]
 
 [[package]]
@@ -1473,10 +1521,12 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "godspeed",
+ "godspeed-audio",
  "godspeed-sdk",
+ "godspeed-wifi",
 ]
 
 [[package]]
@@ -1530,6 +1580,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 name = "supervisor"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
 ]
 
@@ -1906,6 +1957,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "wifi-driver"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-sdk",
+ "godspeed-wifi",
+]
+
+[[package]]
+name = "wifi-usb"
+version = "0.1.0"
+dependencies = [
+ "godspeed",
+ "godspeed-sdk",
+ "godspeed-wifi",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1998,7 +2067,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "xhci"
 version = "0.1.0"
 dependencies = [
+ "godspeed",
  "godspeed-sdk",
+ "godspeed-wifi",
 ]
 
 [[package]]

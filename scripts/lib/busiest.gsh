@@ -25,6 +25,12 @@ if $argcount == 0 {
     echo '      e.g. busiest restarts'
     echo '  busiest version             print the version'
     echo '  busiest help                print this message'
+} else if $arg2 == help {
+    echo "busiest $arg1 - rank services by that column, biggest first"
+    echo '  mem       footprint: who is heaviest'
+    echo '  restarts  deaths recovered: who churns'
+    echo '  queue     endpoint backlog: whose mailbox is filling'
+    echo "      e.g. busiest $arg1"
 } else {
     status | sort reverse $arg1
 }

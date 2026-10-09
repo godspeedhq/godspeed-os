@@ -7,6 +7,7 @@
 # debt. What the file prevents is the OTHER kind growing silently: a name this tree
 # once defined and has since deleted, still cited by a comment as if it were live.
 
+CAM_PAIRWISE_KEY_POSITION          # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
 CNTPCT_EL0
 CNTP_TVAL
 CNTP_TVAL_EL0
@@ -27,9 +28,9 @@ EMMC_DATA
 ETH_P_8021Q
 FB_READBACK_CHEAP
 GET_BOARD_MAC_ADDRESS
-GET_CLOCK_RATE
 GMAC0_RMII_RTX
 GMAC_CONFIG_ACS
+HUB_RESET_TIMEOUT                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by dwc2 for the attach debounce and the port reset bound (docs/wifi-usb.md 46) - external, 26.14
 IA32_KERNEL_GS_BASE
 INTRL2_0
 INT_EP_CTL
@@ -45,7 +46,8 @@ RBUF_FLUSH_CTRL_V1
 REQ_SCROLL
 RGMII_RXID
 RXPBL_MASK
-SET_POWER_STATE
+SCR_RXUSEDK                        # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
+SCR_TXUSEDK                        # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
 SP_EL1
 TCR_EL1
 TLB_ACK
@@ -89,6 +91,15 @@ dwc2_get_actual_xfer_length
 dwc2_hc_halt
 dwc2_hc_nak_intr
 dwc2_hc_nyet_intr
+dwc2_hc_xacterr_intr               # Linux drivers/usb/dwc2/hcd_intr.c, cited by dwc2 chan::stage for re-running a stage on a transaction error (R2c) - external, 26.14
+dwc2_update_urb_state_abn          # Linux drivers/usb/dwc2/hcd_intr.c, same citation - external, 26.14
+IEEE80211_MAX_FRAME_LEN            # Linux include/linux/ieee80211.h (2352), cited by usbfn::BULK_IN_MAX for the size of one unaggregated receive (R3b) - external, 26.14
+hub_activate                       # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
+hub_is_superspeed                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
+hub_port_debounce                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by dwc2 for the attach debounce and the port reset bound (docs/wifi-usb.md 46) - external, 26.14
+hub_port_reset                     # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
+rtl8xxxu_parse_usb                 # Linux rtl8xxxu_core.c, cited by dwc2 rtl::bulk_in for taking the one bulk IN endpoint (R3b) - external, 26.14
+rtl8xxxu_submit_rx_urb             # Linux rtl8xxxu_core.c, cited by usbfn::BULK_IN_MAX for how Linux sizes the receive buffer (R3b) - external, 26.14
 dwc2_release_channel
 dwmac4_dma_axi
 dwmac4_dma_init
@@ -130,6 +141,10 @@ rst_axi
 rst_core
 rst_noc_disp
 rst_vout_src
+rtl92ce_set_key                    # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
+rtl92cu_enable_hw_security_config  # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
+rtl_cam_add_one_entry              # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
+rtl_cam_program_entry              # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
 rtl_hw_start
 rx_desc_idx
 sbi_remote_fence_i
@@ -181,3 +196,465 @@ UnknownSyscall                     # project vocabulary for the -1 an unknown sy
 ReclaimBuffer                      # 'The old `ReclaimBuffer`' - a record of what freeing inline replaced
 UsbExclusive                       # the in-kernel dwc2's exclusion token, deleted in slice 5; both surviving sites now name it AS history
 SetClock                           # a syscall that never existed after clock slice 3; all 4 sites now name it while SAYING it does not exist (backlog/59)
+HOST_CONTROLLER_VERSION            # SDHCI SPEC register (2.2.26), cited so a reader with the spec can follow the offset arch/aarch64/sdio.rs reads - external, 26.14
+SLOT_INT_STATUS                    # SDHCI SPEC register (2.2.25); cited beside the version because ONE 32-bit read spans both - external, 26.14
+bcm2835_data                       # Linux sdhci-iproc platform data, cited because its .missing_caps=true is WHY the Arasan CAPABILITIES register reads 0 - external, 26.14
+CISTPL_MANFID                      # SDIO SPEC tuple code (CIS encoding) - the manufacturer/device pair that proves WHICH part is on the bus; external, 26.14
+mmc_power_up                       # Linux mmc core, cited because it raises the card power with the CLOCK AT ZERO and starts the init clock only after the power-on delay - the order services/wifi-driver copies before restoring the chip power - external, 26.14
+WLC_GET_UP                         # Broadcom wlioctl.h command 162 (is the interface up?), cited because services/wifi-driver verifies `wifi radio off` with it - external, 26.14
+brcmf_sdio_kso_init                # Linux brcmfmac sdio.c, cited because services/wifi-driver copies its KSO step - external, 26.14
+brcmf_sdio_probe_attach            # Linux brcmfmac sdio.c, cited for the order of the pre-download steps services/wifi-driver copies - external, 26.14
+brcmf_sdio_download_firmware       # Linux brcmfmac sdio.c, cited because it requests the HT clock before the download and releases it once the ARM runs - the clock order services/wifi-driver copies - external, 26.14
+brcmf_sdio_firmware_callback       # Linux brcmfmac sdio.c, cited for re-requesting HT after the download, before the bus is brought up - external, 26.14
+alp_only                           # a field of Linux brcmfmac's struct brcmf_sdio, cited because it is false for the 43455 so the HT clock is what gets requested - external, 26.14
+initial_turbo                      # Raspberry Pi firmware config.txt option, cited because it is why the Arm clock drops a minute after boot with no OS setting a rate - external, 26.14
+mmc_rescan_try_freq                # Linux mmc core, cited because it sends an SDIO I/O reset before CMD0 on every power-up, which services/wifi-driver copies - external, 26.14
+mmc_attach_sdio                    # Linux's SDIO attach sequence, cited because its ORDER is what services/wifi-driver reimplements (CMD5 ask, CMD5 commit, CMD3, CMD7) - external, 26.14
+TM_DAT_DIR                         # SDHCI SPEC CMDTM field (bit 4, transfer direction) - ditto, and cited beside CMD_ISDATA because one CMD53 word sets both
+brcmf_sdiod_set_backplane_window   # Linux brcmfmac, cited because its write-only-what-CHANGED behaviour is what services/wifi-driver copies and WHY - external, 26.14
+sdhci_set_transfer_mode            # Linux sdhci.c, cited because it sets SDHCI_TRNS_BLK_CNT_EN for ANY data command - the bit CMD53 was missing - external, 26.14
+TM_BLKCNT_EN                       # SDHCI SPEC CMDTM field (bit 1, block count enable) - the bit CMD53 was missing; sits beside CMD_ISDATA and TM_DAT_DIR, one CMD53 word sets all three
+brcmf_sdiod_abort                  # Linux brcmfmac, cited because IO_ABORT after a failed transfer is the write this driver was missing - external, 26.14
+sdhci_iproc_writew                 # Linux sdhci-iproc, cited for the SHADOW-FLUSH ORDER it imposes (block regs written when COMMAND is) - external, 26.14
+sdhci_send_command                 # Linux sdhci.c, cited because it is where the command FLAGS come from - CMD_CRC and CMD_INDEX were missing - external, 26.14
+sdio_io_rw_ext_helper              # Linux mmc core, cited because it is what chooses BYTE mode for a 4-byte SDIO read - external, 26.14
+CMD_CRC                            # SDHCI SPEC command-register flag (check the response CRC7); the spec's name for a bit set numerically - external, 26.14
+CMD_INDEX                          # SDHCI SPEC command-register flag (check the response index) - ditto, cited beside CMD_CRC because one word sets both
+IO_CURRENT_STATE                   # SDIO SPEC R5 response field (bits 5:4: DIS/CMD/TRN); reading TRN is what proved the card was left mid-transfer
+sdhci_config_dma                   # Linux sdhci.c, cited because it CLEARS the DMA-select field for PIO on every transfer and says some controllers cannot do PIO otherwise - external, 26.14
+sdhci_prepare_data                 # Linux sdhci.c, cited as WHERE sdhci_config_dma is called from - per transfer, not once at init - external, 26.14
+sdhci_transfer_data                # u-boot sdhci.c - the POLLED PIO loop, closest reference to ours; cited because it cross-checks PRESENT_STATE - external, 26.14
+PRESENT_STATE                      # SDHCI SPEC register 0x24 (the BCM2835 calls it STATUS); named as the spec does because u-boot is quoted using it
+SDHCI_DATA_AVAILABLE               # u-boot/SDHCI name for PRESENT_STATE bit 11, Buffer Read Enable - the second signal a polled driver may wait on
+DATA_AVAIL                         # SDHCI SPEC interrupt-status bit 5 (SDHCI_INT_DATA_AVAIL); quoted from u-boot beside SDHCI_DATA_AVAILABLE, which is the DIFFERENT register it cross-checks
+brcmf_sdiod_probe                  # Linux brcmfmac bcmsdh.c - the ordered sequence from card-present to chip access; cited because it sets BOTH function block sizes before enabling F1 - external, 26.14
+sdio_max_byte_size                 # Linux mmc core - cited because it clamps a BYTE-mode transfer by the function block size, which is why the two are not independent - external, 26.14
+SBSDIO_FUNC1_CHIPCLKCSR            # Linux brcmfmac name for function-1 register 0x1000E, quoted from its sdio.h - external, 26.14
+SDIO_CHIP_CLOCK_CSR                # cyw43-driver (Infineon, same chip family) name for the SAME register; both cited so the two references can be compared
+SDIO_PULL_UP                       # cyw43-driver name for function-1 register 0x1000F, which brcmfmac calls SBSDIO_FUNC1_SDIOPULLUP and writes 0
+is_expected_radio                  # REMOVED - it compared the CIS device code, which is not the field that identifies the part. The comment records what went and why, which is exactly what this baseline is for
+brcmf_chip_dmp_erom_scan           # Linux brcmfmac chip.c - the EROM walk services/wifi-driver/src/erom.rs reimplements - external, 26.14
+brcmf_chip_dmp_get_regaddr         # Linux brcmfmac chip.c - how a core entry yields its register and wrapper bases - external, 26.14
+brcmf_chip_dmp_get_desc            # Linux brcmfmac chip.c - reads one EROM descriptor and advances, skipping EMPTY ones - external, 26.14
+bp_addrlow                         # brcm80211 struct chipcregs field at 0xD0 - the indirect backplane window; recorded so the field count is not redone
+bp_addrhigh                        # struct chipcregs field at 0xD4 - as above
+bp_data                            # struct chipcregs field at 0xD8 - as above
+DMP_COMP_REVISION                  # Linux brcmfmac chip.c mask name, cited because ours is suffixed _MASK to avoid colliding with cccr::REVISION - external, 26.14
+brcmf_chip_disable_arm             # Linux brcmfmac chip.c - the CR4/CA7 path reads wrapbase + BCMA_IOCTL, which is WHY a wrapper of 0 blocks the upload - external, 26.14
+brcmf_chip_ai_coredisable          # Linux brcmfmac chip.c - computes wrapbase + BCMA_RESET_CTL and + BCMA_IOCTL throughout - external, 26.14
+brcmf_chip_ai_resetcore            # Linux brcmfmac chip.c - as above; both are why wrapbase is load-bearing rather than informational
+BCMA_IOCTL                         # BCMA SPEC register offset inside a core wrapper (io control); external, named as the reference does
+BCMA_RESET_CTL                     # BCMA SPEC register offset inside a core wrapper (reset control); external, named as the reference does
+brcmf_chip_get_raminfo             # Linux brcmfmac chip.c - its CR4 branch reads through the core BASE, which is why a zero wrapper does not block sizing the RAM - external, 26.14
+brcmf_chip_tcm_ramsize             # Linux brcmfmac chip.c - the bank walk services/wifi-driver/src/armcr4.rs reimplements - external, 26.14
+brcmf_chip_core_read32             # Linux brcmfmac chip.c - `core->pub.base + reg`, which is the fact that settles the wrapper question
+brcmf_chip_recognition             # Linux brcmfmac chip.c - the caller of the EROM scan; read to confirm no post-scan wrapbase fixup exists
+INVALID_RAMBASE                    # Linux brcmfmac chip.c sentinel for "no RAM base known for this part"; ours returns None instead
+BRCM_CC_4345_CHIP_ID               # Linux brcm80211 chip-id constant (0x4345); cited beside our literal so the table entry is traceable to its source line - external, 26.14
+cyw43_download_resource            # cyw43-driver (vendor) - the chunked firmware write services/wifi-driver/src/upload.rs follows, including setting the backplane window per chunk - external, 26.14
+device_core_is_up                  # cyw43-driver (vendor) - the post-condition after release, which aicore::reset checks rather than assuming
+in_reset_configure                 # Linux brcmf_chip_ai_coredisable LABEL - cited because the already-in-reset path still configures IOCTRL, which is easy to skip
+is_nvram_char                      # Linux brcmf_fw_nvram_strip helper - defines which characters survive the NVRAM transform - external, 26.14
+brcmf_fw_nvram_strip               # Linux brcmfmac firmware.c - the NVRAM transform (comments out, entries NUL-terminated, padded, token appended) that upload::nvram_prepare reimplements
+SDIO_FUNC1_BLOCKSIZE               # Linux brcmfmac constant 64, function 1 block size - external
+TM_MULTI_BLOCK                     # SDHCI SPEC transfer-mode bit 5; cited beside the multi-block command word
+SDHCI_TRNS_MULTI                   # SDHCI SPEC transfer-mode bit; sdhci_set_transfer_mode adds it whenever data->blocks > 1 - external, 26.14
+brcmf_sdiod_ramrw                  # Linux brcmfmac - the chunked backplane transfer; chunks by the 32 KiB window and sets it once per chunk
+BLK_CNT_EN                         # SDHCI SPEC transfer-mode bit 1 (short for SDHCI_TRNS_BLK_CNT_EN), cited beside TM_MULTI_BLOCK
+SBSDIO_SB_OFT_ADDR_LIMIT           # Linux brcmfmac chunk bound, the 32 KiB backplane window; ours is WINDOW in upload.rs - external, 26.14
+SBSDIO_SB_OFT_ADDR_MASK            # Linux brcmfmac 0x07FFF, the window offset mask; ours is OFFSET_MASK in backplane.rs - external, 26.14
+AI_IOCTRL                          # BCMA/cyw43 SPEC register at wrapper offset 0x408; ours is off::IOCTRL - external, 26.14
+AI_RESETCTRL                       # BCMA/cyw43 SPEC register at wrapper offset 0x800; ours is off::RESETCTRL - external, 26.14
+sdhci_transfer_pio                 # u-boot sdhci.c - the mover sdhci_transfer_data calls; cited because it moves ONE BLOCK per call with NO ready-bit re-check inside, which is the fault it fixed here - external, 26.14
+BUFFER_WRITE_ENABLE                # SDHCI SPEC present-state bit 10; this driver names it ST_BUF_WRITE_ENABLE - cited by its spec name where the measured STATUS word is decoded - external, 26.14
+TRANSFER_COMPLETE                  # SDHCI SPEC interrupt-status bit 1; this driver names it INT_DATA_DONE - cited by its spec name in the same decode - external, 26.14
+SDPCM_SHARED_VERSION               # Linux brcmfmac sdio.c - 0x0003, the newest SDPCM shared-structure layout it understands; this driver names the constant VERSION - external, 26.14
+SDPCM_SHARED_VERSION_MASK          # Linux brcmfmac sdio.c - 0x00FF, the version field inside the shared structure flags word; this driver names it VERSION_MASK - external, 26.14
+brcmf_chip_cr4_set_active          # Linux brcmfmac chip.c - calls activate(rstvec) and only THEN resetcore, which is where the reset-vector ORDER in upload::run comes from - external, 26.14
+SDPCMD_INTSTATUS                   # OpenBSD bwfm - offset 0x020 in the SDIO device core register block; this driver names it sdpcmd::INTSTATUS - external, 26.14
+SDPCMD_TOSBMAILBOXDATA             # OpenBSD bwfm - offset 0x048, the host-to-chip mailbox; this driver names it sdpcmd::TOSBMAILBOXDATA - external, 26.14
+SDPCM_PROT_VERSION                 # OpenBSD bwfm - 4, the SDPCM FRAMING version the host announces (not the shared-structure layout version); named PROT_VERSION here - external, 26.14
+SDPCM_PROT_VERSION_SHIFT           # OpenBSD bwfm - 16, the shift for the mailbox word; named PROT_VERSION_SHIFT here - external, 26.14
+BCDC_DCMD_ERROR                    # Linux brcmfmac bcdc.c - 0x01, the BCDC flag meaning the firmware refused a command; named DCMD_ERROR here - external, 26.14
+BCDC_DCMD_ID_MASK                  # Linux brcmfmac bcdc.c - 0xFFFF0000, the request-id field used to match a reply to its request; named DCMD_ID_MASK here - external, 26.14
+BCDC_DCMD_ID_SHIFT                 # Linux brcmfmac bcdc.c - 16, the shift for that field; named DCMD_ID_SHIFT here - external, 26.14
+BCDC_DCMD_SET                      # Linux brcmfmac bcdc.c - 0x02, set rather than get; not used here because this driver only queries so far - external, 26.14
+BRCMF_C_GET_VAR                    # Linux brcmfmac fwil.h - 262, the dongle command that reads an iovar; named GET_VAR here - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_CONTROL    # OpenBSD bwfm - 0x00, the SDPCM channel a control frame rides; named CHANNEL_CONTROL here - external, 26.14
+brcmf_proto_bcdc_dcmd              # Linux brcmfmac bcdc.c - the 16-byte BCDC command header (cmd/len/flags/status) ctrl.rs builds by hand - external, 26.14
+BRCMF_C_SET_VAR                    # Linux brcmfmac fwil.h - 263, writing an iovar; not used yet, cited beside GET_VAR - external, 26.14
+BWFM_ETHERTYPE_LINK_CTL            # OpenBSD bwfm - 0x886c, the ethertype marking a frame as an event rather than traffic; named ETHERTYPE_LINK_CTL here - external, 26.14
+BWFM_E_ASSOC                       # OpenBSD bwfm - event code 7; named code::ASSOC here - external, 26.14
+BWFM_E_ESCAN_RESULT                # OpenBSD bwfm - event code 69, a scan result; named code::ESCAN_RESULT here - external, 26.14
+BWFM_E_LINK                        # OpenBSD bwfm - event code 16; named code::LINK here - external, 26.14
+BWFM_E_SET_SSID                    # OpenBSD bwfm - event code 0; named code::SET_SSID here - external, 26.14
+BWFM_MAX_SSID_LEN                  # OpenBSD bwfm - 32; named MAX_SSID here - external, 26.14
+BWFM_SCANTYPE_ACTIVE               # OpenBSD bwfm - 0; named SCANTYPE_ACTIVE here - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_DATA       # OpenBSD bwfm - SDPCM channel 2; named CHANNEL_DATA here - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_EVENT      # OpenBSD bwfm - SDPCM channel 1; named CHANNEL_EVENT here - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_MASK       # OpenBSD bwfm - 0x0F, the channel field of the software header; named CHANNEL_MASK here - external, 26.14
+DOT11_BSSTYPE_ANY                  # OpenBSD bwfm - 2, scan for any BSS type; named BSSTYPE_ANY here - external, 26.14
+WL_ESCAN_ACTION_START              # OpenBSD bwfm - 1, start a scan; named ACTION_START here - external, 26.14
+brcmf_escan_prep                   # Linux brcmfmac cfg80211.c - where the scan parameter DEFAULTS are quoted from - external, 26.14
+bwfm_ethhdr                        # OpenBSD bwfm - the 10-byte packed header between the ethernet header and the event message - external, 26.14
+bwfm_event_msg                     # OpenBSD bwfm - the 48-byte packed event message; scan.rs reads it by offset rather than as a struct - external, 26.14
+ether_header                       # the standard 14-byte BSD ethernet header struct, which an event frame begins with; scan.rs reads it by offset - external, 26.14
+sync_id                            # OpenBSD bwfm scan params/result field, echoed back in every result; scan.rs names the constant SYNC_ID and the offset req::SYNC_ID - external, 26.14
+bcm2835_mmc_writel                 # Raspberry Pi bcm2835-mmc.c - the DELAYING register write accessor for this exact controller; the source of write_settle - external, 26.14
+mmc_raw_writel                     # Raspberry Pi bcm2835-mmc.c - the NON-delaying accessor its PIO block writer uses for SDHCI_BUFFER; the source of wr_raw - external, 26.14
+SDHCI_TIMEOUT_CONTROL              # SDHCI SPEC offset 0x2E, which on this family lives inside CONTROL1 as DATA_TOUNIT bits 19:16 - external, 26.14
+brcmf_fil_errstr                   # Linux brcmfmac fwil.c - the firmware error table the negative status indexes; the source of err_name - external, 26.14
+BWFM_E_LAST                        # OpenBSD bwfm - the event-code count its mask length derives from; deliberately NOT needed here because the mask is read from the firmware before it is written - external, 26.14
+BWFM_EVENT_MASK_LEN                # OpenBSD bwfm - roundup(BWFM_E_LAST, 8) / 8; cited to explain why the mask is read rather than sized from a constant - external, 26.14
+BWFM_C_SET_INFRA                   # OpenBSD bwfm - command 20, infrastructure mode; named CMD_SET_INFRA here - external, 26.14
+BWFM_C_SET_AP                      # OpenBSD bwfm - command 118, access-point mode; named CMD_SET_AP here - external, 26.14
+BWFM_C_SET_PM                      # OpenBSD bwfm - command 86, power management; deliberately not sent (26.2) - external, 26.14
+BWFM_C_UP                          # OpenBSD bwfm - command 2, raise the interface, sent with the value 0 - external, 26.14
+brcmf_c_preinit_dcmds              # Linux brcmfmac common.c - the bring-up command sequence read to find what precedes a scan - external, 26.14
+brcmf_c_process_clm_blob           # Linux brcmfmac common.c - downloads the CLM regulatory blob via the clmload iovar; the step this driver was missing - external, 26.14
+bwfm_init                          # OpenBSD bwfm - the bring-up function whose FULL order showed that UP comes after the event mask - external, 26.14
+bwfm_preinit                       # OpenBSD bwfm - what runs before bwfm_init; its brcmfmac twin downloads the CLM blob - external, 26.14
+join_pref                          # OpenBSD bwfm iovar - RSSI-based AP preference; deliberately not sent (26.2) - external, 26.14
+MAX_CHUNK_LEN                      # Linux brcmfmac - 1400, its download buffer limit; this driver chunks to its own 512-byte frame instead - external, 26.14
+SET_PM                             # OpenBSD bwfm BWFM_C_SET_PM - power management; deliberately not sent (26.2) - external, 26.14
+BWFM_DLOAD_FLAG_HANDLER_VER_1      # OpenBSD bwfm - (1 << 12), the download-handler protocol version set on EVERY chunk; named DL_HANDLER_VER_1 here - external, 26.14
+BWFM_DLOAD_FLAG_HANDLER_VER_MASK   # OpenBSD bwfm - (0xf << 12), which is what proves the flag high nibble is a version field rather than spare bits - external, 26.14
+BWFM_DLOAD_FLAG_BEGIN              # OpenBSD bwfm - (1 << 1), the same value brcmfmac calls DL_BEGIN - external, 26.14
+BWFM_DLOAD_FLAG_END                # OpenBSD bwfm - (1 << 2), the same value brcmfmac calls DL_END - external, 26.14
+BWFM_DLOAD_MAX_LEN                 # OpenBSD bwfm - 1400, its chunk limit; this driver chunks to its own 512-byte frame - external, 26.14
+BWFM_SDIO_SWHDR_CHANNEL_GLOM       # OpenBSD bwfm - SDPCM channel 3, firmware-aggregated frames; its receive switch has NO case for it and drops them, so this driver counts and ignores them too - external, 26.14
+BCDC_HEADER_LEN                    # Linux brcmfmac bcdc.c - 4, the DATA/EVENT frame header (distinct from the 16-byte dcmd a CONTROL reply carries); named BDC_HEADER here - external, 26.14
+brcmf_escan_result_le              # Linux brcmfmac fwil_types.h - the LITTLE-endian escan result body (buflen/version/sync_id/bss_count), which is why only the event header flips byte order - external, 26.14
+brcmf_bss_info_le                  # Linux brcmfmac fwil_types.h - the little-endian per-network record; its natural alignment lands on the same offsets as OpenBSD bwfm_bss_info - external, 26.14
+BWFM_E_STATUS_SUCCESS              # OpenBSD bwfm event status 0, the scan is over; this driver names it status::SUCCESS and stops listening on it - external, 26.14
+BWFM_E_STATUS_FAIL                 # OpenBSD bwfm event status 1; status::FAIL - external, 26.14
+BWFM_E_STATUS_TIMEOUT              # OpenBSD bwfm event status 2, timed out inside the firmware; status::TIMEOUT - external, 26.14
+BWFM_E_STATUS_NO_NETWORKS          # OpenBSD bwfm event status 3, complete with nothing found; status::NO_NETWORKS - external, 26.14
+BWFM_E_STATUS_ABORT                # OpenBSD bwfm event status 4; status::ABORT - external, 26.14
+BWFM_E_STATUS_PARTIAL              # OpenBSD bwfm event status 8, one batch of results; status::PARTIAL is what every result-bearing event carried on hardware - external, 26.14
+BRCMF_C_SET_AUTH                   # Linux brcmfmac fwil.h - 22, agreeing with cyw43 WLC_SET_AUTH - external, 26.14
+BRCMF_C_SET_SSID                   # Linux brcmfmac fwil.h - 26, the join command - external, 26.14
+BRCMF_C_SET_WSEC                   # Linux brcmfmac fwil.h - 134 - external, 26.14
+BRCMF_EVENT_MSG_LINK               # Linux brcmfmac fweh.h - 0x01 in a LINK event flags: link up - external, 26.14
+BWFM_E_AUTH                        # OpenBSD bwfm - event 3 - external, 26.14
+BWFM_E_DEAUTH                      # OpenBSD bwfm - event 5 - external, 26.14
+BWFM_E_DEAUTH_IND                  # OpenBSD bwfm - event 6, the AP deauthenticated us - external, 26.14
+BWFM_E_DISASSOC                    # OpenBSD bwfm - event 11 - external, 26.14
+BWFM_E_DISASSOC_IND                # OpenBSD bwfm - event 12 - external, 26.14
+BWFM_E_JOIN                        # OpenBSD bwfm - event 1 - external, 26.14
+BWFM_E_PSK_SUP                     # OpenBSD bwfm - event 46, the supplicant reporting - external, 26.14
+CYW43_WPA_MAX_PASSWORD_LEN         # cyw43-driver - 64, the passphrase buffer the firmware takes - external, 26.14
+IEEE80211_CAPINFO_PRIVACY          # OpenBSD net80211 ieee80211.h - 0x0010, the Privacy capability bit - external, 26.14
+IEEE80211_ELEMID_RSN               # OpenBSD net80211 ieee80211.h - 48, the RSN (WPA2) element - external, 26.14
+IEEE80211_ELEMID_VENDOR            # OpenBSD net80211 ieee80211.h - 221, the vendor element WPA rides in - external, 26.14
+IEEE80211_MAX_SSID_LEN             # IEEE 802.11 - 32 - external, 26.14
+WLC_SET_AUTH                       # cyw43-driver - 22 - external, 26.14
+WLC_SET_SSID                       # cyw43-driver - 26 - external, 26.14
+WLC_SET_WPA_AUTH                   # cyw43-driver - 165; Linux uses the wpa_auth iovar for the same setting - external, 26.14
+WLC_SET_WSEC                       # cyw43-driver - 134 - external, 26.14
+ie_length                          # OpenBSD bwfm bss_info field - the IE run length; this driver names the offset bss::IE_LENGTH - external, 26.14
+ie_offset                          # OpenBSD bwfm bss_info field - where the beacon IEs start, from the START of the record (the reference copies bss + iesoff); this driver names the offset bss::IE_OFFSET - external, 26.14
+brcmf_feat_attach                  # Linux brcmfmac feature.c - where firmware features are detected, after preinit and before UP; this driver asks its three questions at the same point - external, 26.14
+brcmf_feat_firmware_capabilities   # Linux brcmfmac feature.c - matches the `cap` iovar string against brcmf_fwcap_map - external, 26.14
+BWFM_AUTH_OPEN                     # OpenBSD bwfmreg.h - 0, open-system 802.11 authentication; this driver names it AUTH_OPEN_SYSTEM - external, 26.14
+BWFM_C_SET_SSID                    # OpenBSD bwfmreg.h - command 26; this driver names it CMD_SET_SSID - external, 26.14
+BWFM_MFP_NONE                      # OpenBSD bwfmreg.h - 0, no management frame protection; this driver names it MFP_NONE - external, 26.14
+BWFM_WPA_AUTH_WPA2_PSK             # OpenBSD bwfmreg.h - (1 << 7); this driver names it WPA2_AUTH_PSK - external, 26.14
+BWFM_WSEC_AES                      # OpenBSD bwfmreg.h - (1 << 2); this driver names it WSEC_AES - external, 26.14
+EAPOL_KEY                          # OpenBSD net80211/ieee80211.h - EAPOL packet type 3, a key descriptor; this driver names it TYPE_KEY - external, 26.14
+EAPOL_KEY_DESC_IEEE80211           # OpenBSD net80211/ieee80211.h - descriptor type 2, RSN; this driver names it DESC_RSN - external, 26.14
+EAPOL_KEY_DESC_WPA                 # OpenBSD net80211/ieee80211.h - descriptor type 254, pre-standard WPA; this driver names it DESC_WPA - external, 26.14
+bwfm_connect                       # OpenBSD bwfm.c - the join sequence (wpaie, wpa_auth, wsec, auth, mfp, SET_SSID) join.rs follows - external, 26.14
+bwfm_proto_bcdc_rx                 # OpenBSD bwfm.c - strips the BCDC header plus data_offset words; scan::ethernet_at is the same arithmetic - external, 26.14
+bwfm_rx                            # OpenBSD bwfm.c - the data receive path; hands EAPOL frames to net80211 - external, 26.14
+ieee80211_add_rsn                  # OpenBSD net80211 - builds the RSN element bwfm_connect sets as wpaie; eapol::RSN_IE is that element for CCMP/PSK - external, 26.14
+ieee80211_eapol_key_input          # OpenBSD net80211 - the 4-way handshake receive entry point bwfm_rx calls - external, 26.14
+BRCMF_C_SCAN                       # Linux brcmfmac fwil.h - command 50, the plain scan; how an escan is ABORTED (channel list [-1]); this driver names it CMD_SCAN - external, 26.14
+WLC_SCAN                           # cyw43-driver - command 50, the same plain scan command - external, 26.14
+BWFM_C_DISASSOC                    # OpenBSD bwfmreg.h - command 52, sent with no payload by bwfm_newstate; this driver names it CMD_DISASSOC - external, 26.14
+BWFM_C_DOWN                        # OpenBSD bwfmreg.h - command 3, sent with the value 1 by bwfm_stop; this driver names it CMD_DOWN - external, 26.14
+BWFM_WPA_AUTH_DISABLED             # OpenBSD bwfmreg.h - (0 << 0), an open network; this driver names it WPA_AUTH_DISABLED - external, 26.14
+BWFM_WSEC_NONE                     # OpenBSD bwfmreg.h - (0 << 0), no cipher; this driver names it WSEC_NONE - external, 26.14
+bwfm_newstate                      # OpenBSD bwfm.c - the net80211 state machine hook; on the way back to SCAN it sends DISASSOC with no payload - external, 26.14
+bwfm_stop                          # OpenBSD bwfm.c - the interface teardown: a zeroed SET_SSID, DOWN 1, the mode commands, UP 1 - external, 26.14
+BRCMF_C_GET_BSSID                  # Linux brcmfmac fwil.h - command 23, the access point address (all zeros when not associated); this driver names it CMD_GET_BSSID - external, 26.14
+BRCMF_C_GET_RSSI                   # Linux brcmfmac fwil.h - command 127, answered into brcmf_scb_val_le { val; ea[6] }; this driver names it CMD_GET_RSSI - external, 26.14
+brcmf_fil_cmd_data_get             # Linux brcmfmac fwil.c - a GET command whose sent structure is written back with the answer; ctrl::query_cmd is that shape - external, 26.14
+brcmf_sdio_hdparse                 # Linux brcmfmac sdio.c - validates a frame header by type: a superframe head must be channel 3 without the descriptor flag, a sub-frame must be on the event or data channel; ctrl::subframes applies the same rules - external, 26.14
+brcmf_sdio_rxglom                  # Linux brcmfmac sdio.c - reads a superframe in one transfer and walks its sub-frames back to back, each checked against the descriptor entry; ctrl::subframes is that walk - external, 26.14
+BWFM_CRYPTO_ALGO_AES_CCM           # OpenBSD bwfmreg.h - 4, the CCMP key algorithm in struct bwfm_wsec_key; this driver names it CRYPTO_ALGO_AES_CCM - external, 26.14
+BWFM_WSEC_PRIMARY_KEY              # OpenBSD bwfmreg.h - (1 << 1), the flag a GROUP key carries in bwfm_wsec_key; this driver names it WSEC_PRIMARY_KEY - external, 26.14
+EAPOL_KEY_DESC_V2                  # OpenBSD net80211/ieee80211.h - key descriptor version 2 (HMAC-SHA1 MIC, AES key wrap), the low bits of the key-info field - external, 26.14
+bwfm_sdio_rx_frames                # OpenBSD if_bwfm_sdio.c - the receive loop; sets sc_tx_max_seq from every frame`s swhdr->maxseqnr, as Session::note_frame does - external, 26.14
+bwfm_sdio_tx_dataframe             # OpenBSD if_bwfm_sdio.c - builds hwhdr + swhdr (channel DATA) + BCDC header + the ethernet frame; ctrl::send_data is that frame - external, 26.14
+bwfm_sdio_tx_ok                    # OpenBSD if_bwfm_sdio.c - the transmit credit check ((max_seq - seq) non-zero and below 0x80); Session::tx_ok is that check - external, 26.14
+bwfm_set_key_cb                    # OpenBSD bwfm.c - fills struct bwfm_wsec_key (pairwise: ea set, flags 0; group: PRIMARY_KEY) and sends the wsec_key iovar; ctrl::install_key is that - external, 26.14
+ieee80211_derive_ptk               # OpenBSD net80211/ieee80211_crypto.c - PRF-384 over min/max of the two addresses and nonces; eapol::derive_ptk is that - external, 26.14
+ieee80211_eapol_key_check_mic      # OpenBSD net80211/ieee80211_crypto.c - recompute the MIC with the field zeroed and compare; eapol::check_mic is that - external, 26.14
+ieee80211_eapol_key_mic            # OpenBSD net80211/ieee80211_crypto.c - HMAC-SHA1 over the EAPOL body, truncated to 16 (descriptor v2); eapol::mic_over is that - external, 26.14
+ieee80211_prf                      # OpenBSD net80211/ieee80211_crypto.c - the 802.11 PRF over HMAC-SHA1 with the label`s NUL included; crypto::prf_sha1 is that - external, 26.14
+ieee80211_recv_4way_msg1           # OpenBSD net80211/ieee80211_pae_input.c - message 1: save the ANonce, draw the SNonce, derive the PTK, send message 2; join.rs does the same - external, 26.14
+ieee80211_send_4way_msg2           # OpenBSD net80211/ieee80211_pae_output.c - message 2: PAIRWISE|KEYMIC, the AP`s replay counter, the SNonce, the RSN element, MIC`d - external, 26.14
+ieee80211_send_4way_msg4           # OpenBSD net80211/ieee80211_pae_output.c - message 4: PAIRWISE|KEYMIC|SECURE, empty key data, MIC`d - external, 26.14
+ieee80211_send_eapol_key           # OpenBSD net80211/ieee80211_pae_output.c - the frame builder: ethernet header, descriptor version by cipher, key->len and paylen, then the MIC; eapol::build_key_frame is that - external, 26.14
+ieee80211_recv_rsn_group_msg1      # OpenBSD net80211 ieee80211_pae_input.c - the group-key message 1 receiver `frames::group_rekey` follows step by step - external, 26.14
+ieee80211_send_group_msg2          # OpenBSD net80211 ieee80211_pae_output.c - the group-key acknowledgement (KEYMIC | SECURE, replay copied, no key data) - external, 26.14
+ni_replaycnt                       # OpenBSD net80211 node field - the last accepted EAPOL replay counter; `join::Keys::replay` is its counterpart - external, 26.14
+scb_val_t                          # Broadcom wlioctl.h - `int32 val; struct ether_addr ea;`, the GET_RSSI structure, sizeof 12 not 10; ctrl.rs sends it as a byte array - external, 26.14
+iproc_rng200_restart               # Linux drivers/char/hw_random/iproc-rng200.c - the disable / clear / RBG reset / RNG reset / enable sequence `arch/aarch64::hw_random` performs inline on a fail bit - external, 26.14
+cpu_do_idle                        # Linux arch/arm64/kernel/process.c - the idle sequence (wfi under the mask, then unmask) `arch/aarch64::wait_for_interrupt` follows - external, 26.14
+sdio_reset                         # Linux drivers/mmc/core/sdio_ops.c - the CCCR IO_ABORT RES write before every SDIO probe, which `sdio::identify` performs first for a card an earlier instance left initialised - external, 26.14
+D11_BCMA_IOCTL_PHYRESET            # Linux drivers/net/wireless/broadcom/brcm80211/brcmfmac/chip.c - the 802.11 core IOCTL bit `aicore::D11_PHYRESET` mirrors - external, 26.14
+D11_BCMA_IOCTL_PHYCLOCKEN          # Linux brcmfmac chip.c - the 802.11 core IOCTL bit `aicore::D11_PHYCLOCKEN` mirrors - external, 26.14
+SDIO_WAIT_F2RDY                    # Linux brcmfmac sdio.c - the 3000 ms function-2 ready timeout `sdio::enable_function` waits by - external, 26.14
+brcmf_chip_cr4_set_passive         # Linux brcmfmac chip.c - disable the ARM CR4, reset the 802.11 core: the passive step a firmware upload follows - external, 26.14
+SDPCM_SHARED_TRAP                  # Linux brcmfmac sdio.c - the shared-structure flag bit `upload::TRAP` mirrors: the firmware took a trap - external, 26.14
+brcmf_trap_info                    # Linux brcmfmac sdio.c - the trap record (type, epc, cpsr, spsr, r0-r7, pc, sp, lr) `upload` reads out when the firmware reports a trap - external, 26.14
+trap_addr                          # Linux brcmfmac sdio.c `sdpcm_shared_le.trap_addr` - the word after `flags` in the shared structure, the trap record pointer - external, 26.14
+mmc_sdio_resume                    # Linux drivers/mmc/core/sdio.c - resume reinitialises nothing for a powered, non-removable card; the model `sdio::identify` adopts a running firmware by - external, 26.14
+sdhci_reset                        # Linux sdhci.c, cited for its 100 ms bound on the same reset bits wifi-driver host.rs waits on - external, 26.14
+sdhci_enable_clk                   # Linux sdhci.c, cited for its 150 ms bound on the clock-stable bit - external, 26.14
+mmc_send_io_op_cond                # Linux drivers/mmc/core/sdio_ops.c, cited for its CMD5 retry - 100 asks 10 ms apart, the one-second bound sdk/wifi sdio.rs paces its OCR wait to - external, 26.14
+BRCMF_C_GET_PM                     # Linux brcmfmac fwil.h, cited as the source of command 85 that services/wifi-driver reads after a join - external, 26.14
+BWFM_C_GET_PM                      # OpenBSD bwfmreg.h, the same command 85, cited so the two references agree in the comment - external, 26.14
+PM_FAST                            # Linux brcmfmac power-save mode constant, cited for what that driver sets by default - external, 26.14
+PAR_EL1                            # AArch64 system register: the Physical Address Register that an AT instruction writes its result to; arch/aarch64/ptables.rs at_probe reads it in a user-fault report - external, 26.14
+aic8800_bsp                        # AICSemi's out-of-tree bus/upload driver (radxa-pkg/aic8800 at 09c65d61), cited in services/wifi-driver for the radio's power hold-offs - external, 26.14
+gpio_wl_reg_on                     # StarFive vendor device-tree property naming GPIO 33 as the VisionFive radio's enable, cited in arch/riscv64/sdio.rs and mod.rs - external, 26.14
+mmc1_pins                          # Linux jh7110-common.dtsi pinctrl node whose pad settings arch/riscv64/sdio.rs copies for the radio's SD host - external, 26.14
+dw_mci_probe                       # Linux dw_mmc.c, whose FIFO-depth warning dwmmc.rs follows (take the depth from the device tree) - external, 26.14
+dw_mci_ctrl_reset                  # Linux drivers/mmc/host/dw_mmc.c, the controller reset services/wifi-driver/src/dwmmc.rs copies - external, 26.14
+dw_mci_prepare_command             # Linux dw_mmc.c, the command-flag rules dwmmc.rs copies (STOP for CMD0 and the CCCR abort, HOLD_REG) - external, 26.14
+dw_mci_setup_bus                   # Linux dw_mmc.c, the clock-change sequence dwmmc.rs copies - external, 26.14
+dw_mci_start_command               # Linux dw_mmc.c, how dwmmc.rs issues a command - external, 26.14
+mci_send_cmd                       # Linux dw_mmc.c, the controller-only (clock update) command dwmmc.rs copies - external, 26.14
+DW_MMC_CARD_NEED_INIT              # Linux dw_mmc.h flag, cited for the INIT bit on a card's first command (dwmmc.rs) - external, 26.14
+DW_MMC_CARD_NO_LOW_PWR             # Linux dw_mmc.h flag, cited for never using the low-power clock with an SDIO card (dwmmc.rs) - external, 26.14
+DATA_240A_OFFSET                   # Linux dw_mmc.h, the FIFO window from controller version 0x240A that dwmmc.rs reads from VERID - external, 26.14
+DW_MCI_DATA_ERROR_FLAGS            # Linux dw_mmc.c, the data error bits dwmmc.rs ends a PIO transfer on - external, 26.14
+dw_mci_read_data_pio               # Linux dw_mmc.c, the PIO receive loop dwmmc.rs polls instead of taking its interrupt - external, 26.14
+dw_mci_write_data_pio              # Linux dw_mmc.c, the PIO transmit loop dwmmc.rs polls instead of taking its interrupt - external, 26.14
+dw_mci_submit_data                 # Linux dw_mmc.c, the data-phase setup (DMA off, BLKSIZ, BYTCNT) dwmmc.rs follows - external, 26.14
+dw_mci_wait_while_busy             # Linux dw_mmc.c, the wait for DAT0 busy before a data command (dwmmc.rs) - external, 26.14
+aicbsp_driver_fw_init              # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the chip-revision read aic.rs makes first - external, 26.14
+aicwf_process_rxframes             # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the receive packet walk aic.rs follows - external, 26.14
+aicwf_sdio_bus_start               # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the interrupt enables aic.rs sets - external, 26.14
+aicwf_sdio_flow_ctrl               # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the free-buffer check before a send (aic.rs) - external, 26.14
+aicwf_sdio_hal_irqhandler          # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the receive handler whose status register aic.rs polls instead - external, 26.14
+aicwf_sdio_tx_msg                  # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the frame padding and send aic.rs follows - external, 26.14
+aicwf_sdio_wakeup                  # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the wake sequence aic.rs copies - external, 26.14
+aicwf_sdiov3_func_init             # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the D80 function-1 setup aic.rs follows - external, 26.14
+crc8_ponl_107                      # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the bus header CRC-8 aic.rs computes - external, 26.14
+rwnx_set_cmd_tx                    # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the message frame layout aic.rs builds - external, 26.14
+sdio_readsb                        # Linux sdio_io.c, the fixed-address CMD53 read sdio.rs read_fifo mirrors - external, 26.14
+sdio_writesb                       # Linux sdio_io.c, the fixed-address CMD53 write sdio.rs write_fifo mirrors - external, 26.14
+CMD_BUF_MAX                        # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the largest frame the vendor driver sends, which aic.rs FRAME_MAX matches - external, 26.14
+aicbt_patch_info_unpack            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), how aic.rs patch_info reads the information group - external, 26.14
+aicbt_patch_table_alloc            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the table walk aic.rs Groups follows - external, 26.14
+dbg_mem_block_write_req            # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the block-write message aic.rs upload sends - external, 26.14
+rwnx_plat_bin_fw_upload_android    # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the 1 KiB chunking aic.rs upload follows - external, 26.14
+RAM_FMAC_FW_ADDR                   # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), where fmacfw is loaded and started, aic.rs FMAC_ADDR - external, 26.14
+aicbt_patch_table_load             # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the patch table writes aic.rs table_writes follows - external, 26.14
+aicwifi_init                       # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the fmacfw load sequence the driver stage 7 follows - external, 26.14
+aicwifi_patch_config_8800d80       # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the fmacfw patch configuration aic.rs patch_config follows - external, 26.14
+aicwifi_start_from_bootrom         # AICSemi aic8800_bsp (radxa-pkg/aic8800 @09c65d61), the start message aic.rs start_app sends - external, 26.14
+aicwf_sdio_probe                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the runtime driver probe whose wake check aic.rs bring_up repeats - external, 26.14
+aicwf_set_rf_config_8800d80        # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the RF messages aic.rs bring_up sends with the defaults - external, 26.14
+cmd_mgr_msgind                     # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), how a confirm is told from an indication (aic.rs find_cfm) - external, 26.14
+mm_set_rf_calib_req                # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the RF calibration message aic.rs rf_calib builds - external, 26.14
+rwnx_cfg80211_init                 # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the bring-up order aic.rs bring_up follows - external, 26.14
+rwnx_rx_handle_print               # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the firmware print packet aic.rs logs - external, 26.14
+txpwr_idx_lvl_v3                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the transmit power layout aic.rs txpwr_lvl_v3 fills - external, 26.14
+userconfig_info                    # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor defaults aic.rs sends with no user configuration file - external, 26.14
+regdom_00                          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor world regulatory domain whose 20 dBm aic_wire.rs CHAN_TX_POWER_DBM states - external, 26.14
+rwnx_handle_dynparams              # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the capability defaults ME_CONFIG in aic_wire.rs carries - external, 26.14
+rwnx_open                          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the start, coexistence and interface messages aic.rs bring_up_station sends - external, 26.14
+rwnx_send_me_chan_config_req       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the channel list aic_wire.rs chan_config builds - external, 26.14
+rwnx_send_me_config_req            # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the capability message aic_wire.rs ME_CONFIG is - external, 26.14
+rwnx_send_scanu_req                # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the scan request aic_wire.rs scanu_start builds - external, 26.14
+aicwf_sdio_aggr                    # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the data frame layout aic_wire.rs build_data_frame follows - external, 26.14
+rwnx_send_sm_connect_req           # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the connect request aic_wire.rs sm_connect builds - external, 26.14
+RWNX_RX_HD_DECR_CCMP128            # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's decrypt status for CCMP (aic_wire.rs) - external, 26.14
+SCANU_CANCEL_REQ                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the scan cancel aic_station.rs deliberately does not send - external, 26.14
+SCANU_START_CFM_ADDTIONAL          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor's own spelling of the scan request's confirm (aic.rs names it ..._ADDITIONAL) - external, 26.14
+WLAN_REASON_DEAUTH_LEAVING         # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), Linux's 802.11 reason code 3, which rwnx_close sends (aic_station.rs) - external, 26.14
+aic8800_fdrv                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the vendor's full-MAC runtime driver, the reference aic_station.rs follows - external, 26.14
+aicwf_sdio_send                    # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the bus send under flow control that push_frame follows (aic.rs) - external, 26.14
+flags_is_80211_mpdu                # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's management-frame flag (aic_wire.rs) - external, 26.14
+flags_upload                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header's hand-it-up flag (aic_wire.rs) - external, 26.14
+hw_rxhdr                           # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the receive header struct (aic_wire.rs) - external, 26.14
+rwnx_cfg80211_add_key              # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the key install aic_station.rs follows - external, 26.14
+rwnx_cfg80211_get_station          # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the signal query aic_wire.rs reads - external, 26.14
+rwnx_rx_mgmt_any                   # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), where the vendor driver sends management frames (aic_wire.rs) - external, 26.14
+rwnx_rxdataind_aicwf               # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the data receive path aic_wire.rs follows - external, 26.14
+rwnx_send_get_sta_info_req         # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the MM_GET_STA_INFO_REQ sender (aic_wire.rs) - external, 26.14
+rwnx_tx_push                       # AICSemi aic8800_fdrv (radxa-pkg/aic8800 @09c65d61), the transmit push that marks EAPOL for a confirm (aic_station.rs) - external, 26.14
+starfive_trng_init                 # Linux drivers/char/hw_random/jh7110-trng.c, the init sequence the riscv64 TRNG bring-up follows (arch/riscv64/mod.rs) - external, 26.14
+TRP_VAUX_EN                        # Linux rtl8xxxu (8192c.c / core.c / rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS register access and SYS_CFG decode - external, 26.14
+rtl8192cu_identify_chip            # Linux rtl8xxxu (8192c.c / core.c / rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS register access and SYS_CFG decode - external, 26.14
+rtl8192cu_load_firmware            # Linux rtl8xxxu (8192c.c / core.c / rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS register access and SYS_CFG decode - external, 26.14
+rtl8xxxu_read32                    # Linux rtl8xxxu (8192c.c / core.c / rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS register access and SYS_CFG decode - external, 26.14
+EFUSE_REAL_CONTENT_LEN_8192C       # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+PFM_ALDN                           # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+rtl8192cu_power_on                 # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+rtl8xxxu_init_device               # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+rtl8xxxu_read_efuse                # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+rtl8xxxu_read_efuse8               # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS efuse and power-on (R1) - external, 26.14
+REG_FW_START_ADDRESS               # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+RTL_FW_PAGE_SIZE                   # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+rtl8xxxu_download_firmware         # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+rtl8xxxu_load_firmware             # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+rtl8xxxu_reset_8051                # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+rtl8xxxu_start_firmware            # Linux rtl8xxxu (core.c, regs.h, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS firmware download (R2) - external, 26.14
+RQPN_LOAD                          # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl8xxxu_config_endpoints_no_sie   # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl8xxxu_config_endpoints_sie      # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl8xxxu_init_queue_priority       # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl8xxxu_init_queue_reserved_page  # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+rtl92c_download_fw                 # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+trxff_boundary                     # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+TX_TOTAL_PAGE_NUM                  # Linux rtl8xxxu / rtlwifi (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS transmit queues (R2) - external, 26.14
+GET_DESCRIPTOR                     # the USB standard request (USB 2.0 9.4.3), cited by wifi-usb for the dongle's configuration descriptor - external
+init_device                        # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+MODE_AG_BW_MASK                    # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+MODE_AG_CHANNEL_MASK               # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+no_pape                            # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8192cu_mac_init_table           # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8192cu_radioa_1t_init_table     # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8723a_phy_1t_init_table         # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8723a_phy_lc_calibrate          # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxx_agc_standard_table         # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_config_channel       # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_enable_rf            # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_init_aggregation     # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_init_phy_bb          # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_gen1_usb_quirks           # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_llt_table            # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_mac                  # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_phy_regs             # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_phy_rf               # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_init_rf_regs              # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_read_rfreg                # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_start                     # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+rtl8xxxu_write_rfreg               # Linux rtl8xxxu (core.c, 8192c.c, regs.h), cited by wifi-usb for the RTL8188CUS MAC/baseband/RF set-up (R3a) - external, 26.14
+cck_agc_rpt_ofdm_cfosho_a          # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+cck_sig_qual_ofdm_pwdb_all         # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+drvinfo_sz                         # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+rtl8723au_rx_parse_phystats        # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+rtl8xxxu_parse_rxdesc16            # Linux rtl8xxxu (core.c, 8723a.c, rtl8xxxu.h), cited by wifi-usb for the RTL8188CUS receive descriptor and signal (R3b) - external, 26.14
+
+# Added 2026-10-05 when names stopped resolving by SUBSTRING (comment_symbol_check.py): each was
+# cited on purpose and had been satisfied only by a longer name in the code. External, 26.14.
+AUTO_AGE                           # JH7110 TRNG register bits (CTRL/ISTAT), cited by riscv64 hw_random - external, 26.14
+AUTO_RQSTS                         # JH7110 TRNG register bits (CTRL/ISTAT), cited by riscv64 hw_random - external, 26.14
+SEC_AHB                            # JH7110 STG clock/reset names from the device tree, cited by riscv64 hw_random - external, 26.14
+SEC_MISC_AHB                       # JH7110 STG clock/reset names from the device tree, cited by riscv64 hw_random - external, 26.14
+GMAC0_GTXCLK                       # JH7110 SYSCRG clock name from the device tree, cited by riscv64 net - external, 26.14
+GET_CLOCK_RATE                     # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+GET_GPIO_STATE                     # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+GET_MAX_CLOCK_RATE                 # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+GET_MIN_CLOCK_RATE                 # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+SET_GPIO_STATE                     # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+SET_PHYS_WH                        # Raspberry Pi firmware mailbox property tags, cited by name (code has them as TAG_*) - external, 26.14
+CMD_DONE                           # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DATA_TOUNIT                        # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DATA_OFFSET                        # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DAT_EXP                            # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DAT_WR                             # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+PRV_DAT_WAIT                       # SDHCI / DesignWare MMC register bits by their datasheet names, cited by wifi-driver and sdk/wifi - external, 26.14
+DMA_CONTROL_ST                     # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+FRAMECOUNT_G                       # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+FRAMECOUNT_GB                      # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+OCTETCOUNT_G                       # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+OCTETCOUNT_GB                      # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+HW_FEATURE1                        # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+RTC_64                             # Synopsys dwmac (stmmac) register and MMC counter names, cited by nic-driver - external, 26.14
+READ_FAIL                          # Broadcom GENET UniMAC MDIO bits (Linux bcmgenet), cited by nic-driver - external, 26.14
+START_BUSY                         # Broadcom GENET UniMAC MDIO bits (Linux bcmgenet), cited by nic-driver - external, 26.14
+RX_FIFO_INF                        # SMSC LAN95xx register names (Linux smsc95xx), cited by dwc2 - external, 26.14
+TX_FIFO_INF                        # SMSC LAN95xx register names (Linux smsc95xx), cited by dwc2 - external, 26.14
+cur_ether                          # Broadcom firmware iovar cur_etheraddr, split by markup in the comment, cited by wifi-driver - external, 26.14
+WRITE_RDY                          # SDHCI interrupt-status bit by its datasheet name (code has INT_WRITE_RDY), cited by wifi-driver - external, 26.14
+BUFFER_SIZE                        # AICSemi aic8800 (Linux) names, cited by wifi-driver - external, 26.14
+MM_STA                             # AICSemi aic8800 (Linux) names, cited by wifi-driver - external, 26.14
+EFUSE_CTRL                         # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
+EFUSE_TEST                         # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
+SYS_CLKR                           # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
+SYS_FUNC                           # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
+rtl8723a_cck_rssi                  # Linux rtl8xxxu (8723a.c), cited by wifi-usb for the CCK signal (R3b) - external, 26.14
+sort_unstable                      # Rust core slice method, cited by the shell for its ordering - external, 26.14
+atomic64_inc_return                # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+BSS_CHANGED_BSSID                  # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+bss_info_changed                   # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+ccmp_encrypt_skb                   # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+ccmp_hdr2pn                        # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+ccmp_pn2hdr                        # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+DESC_RATE_1M                       # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+DISABLE_KEY                        # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+ETH_HLEN                           # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+H2C_EXT                            # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+ieee80211_add_link_elems           # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+IEEE80211_ASSOC_TIMEOUT            # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+IEEE80211_AUTH_TIMEOUT             # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+ieee80211_crypto_ccmp_decrypt      # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+IEEE80211_KEY_FLAG_PAIRWISE        # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+ieee80211_send_assoc               # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+mask_hi                            # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+mask_lo                            # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+pkt_offset                         # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+RCR_ACCEPT_PHYS_MATCH              # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+RCR_APPEND_FCS                     # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+RCR_APPEND_MIC                     # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_add_interface             # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_bss_info_changed          # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_calc_tx_desc_csum         # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_cam_write                 # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_fill_txdesc_v1            # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_gen1_disable_rf           # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_gen1_h2c_cmd              # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_gen1_report_connect       # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_legacy_ratetable          # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+RTL8XXXU_OUT_ENDPOINTS             # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_queue_select              # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_set_bssid                 # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_set_key                   # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_set_linktype              # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_set_mac                   # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_stop                      # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_stop_tx_beacon            # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_tx                        # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+rtl8xxxu_update_rate_mask          # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+RX_DESC_ENC_AES                    # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+RX_FLAG_DECRYPTED                  # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+RX_FLAG_MIC_STRIPPED               # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+RX_FLAG_PN_VALIDATED               # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+TXDESC_BROADMULTICAST              # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+TXDESC_QUEUE_BE                    # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+TXDESC_QUEUE_MGNT                  # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+TXDESC_QUEUE_SHIFT                 # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+TXDESC_SEC_AES                     # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+TXDESC32_AGG_BREAK                 # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+TXDESC32_RETRY_LIMIT_ENABLE        # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+TXDESC32_SEQ_SHIFT                 # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+TXDESC32_USE_DRIVER_RATE           # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+update_rate_mask                   # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
+WLAN_CIPHER_SUITE_CCMP             # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
+rf_regulatory                      # Linux rtl8xxxu.h struct rtl8192cu_efuse field, cited by wifi-usb for the 8188RU test in the power-off (R9) - external, 26.14
+rtl8192cu_parse_efuse              # Linux rtl8xxxu 8192c.c, cited by wifi-usb for where the 8188RU is recognised (R9) - external, 26.14
+RF6052_MAX_TX_PWR                  # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8188r_power_base                # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8192c_power_base                # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8xxxu_config                    # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8xxxu_gen1_channel_to_group     # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+rtl8xxxu_gen1_set_tx_power         # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h), cited by wifi-usb for the transmit power from the efuse (R11) - external, 26.14
+ieee80211_add_ht_ie                # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+ieee80211_add_wmm_info_ie          # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+IEEE80211_HT_MCS_TX_DEFINED        # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+IEEE80211_NUM_TIDS                 # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+rtl8xxxu_probe                     # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+SMPS_OFF                           # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+TXDESC32_QOS                       # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+TXDESC32_SHORT_GI                  # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+WLAN_STATUS_REQUEST_DECLINED       # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
+XHCI_TRB_OVERFETCH                 # Linux xhci.h - the quirk (BIT_ULL 45) giving every ring segment a dummy page after it, enabled for the VIA VL805 - external, 26.14
+XHCI_AVOID_DQ_ON_LINK              # Linux xhci.h (Raspberry Pi kernel) - the VL805 cannot have an endpoint dequeue set to a Link TRB - external, 26.14

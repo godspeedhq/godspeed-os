@@ -68,7 +68,7 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   Both halves are wired as of 2026-08-25 (the vector is armed from the loop that owns the hardware, and
   the host-channel interrupt is enabled at the device), and interrupts now do arrive - but they harvest
   almost nothing, because the client poll path reaches each completion first. Receive is therefore still
-  poll-driven in practice, and the honest claim is the one above. The `net IRQ` counters report it
+  poll-driven in practice, and the honest claim is the one above. The `USB IRQ` counters (once `net IRQ`) report it
   rather than leaving it to be inferred. Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
 - **Multiple USB devices coexist:** `enumerate_downstream` walks *every* hub port, gives each device a
   distinct address, and configures all of them; the single DWC2 host channel is time-shared by having each
@@ -149,8 +149,9 @@ method").
 - **No RTC on the Pi 2** (and QEMU raspi2b emulates none) - the x86 MC146818 CMOS RTC has no Pi
   equivalent. Both consequences are now **fixed rather than accepted**: `uptime` reads the monotonic
   generic timer (not a wall-clock delta from a frozen stamp), and the wall clock is set from the network
-  by **SNTP** - net-stack fetches it and hands it to the **`time` SERVICE** over IPC (`OP_SET`), which
-  owns plausibility, provenance and the floor and can refuse it. (This used to be a gated `SetClock`
+  by **NTP** - the **`time` SERVICE** fetches it itself, through `net-stack`'s op 12 (a UDP datagram
+  answered when the reply arrives; `docs/networking.md` 16.1), and owns plausibility, provenance and the
+  floor. (Until 2026-10-01 net-stack fetched it and pushed it in with `OP_SET`.) (This used to be a gated `SetClock`
   syscall; that syscall and `kernel/src/clock.rs`/`wallclock.rs` are deleted - the wall clock is not a
   kernel responsibility.) With no cable, `date` reads zeros and
   says so rather than inventing a time.

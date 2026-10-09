@@ -35,8 +35,8 @@ comparable. The instrument was consistent throughout; the pairing was not.
 
 Not the cause, though all three were real and are fixed:
 
-- `delay_cycles` was a bare `while read_tsc() {}` holding the core for the whole delay. Now sleeps for
-  the bulk and spins only the remainder, which preserves the USB 2.0 7.1.7.5 minimum-hold contract.
+- The reset-timing delay (then delay_cycles, now `delay::hold_parked`) was a bare `while read_tsc() {}`
+  holding the core for the whole delay. It now sleeps for the bulk and spins only the remainder, which preserves the USB 2.0 7.1.7.5 minimum-hold contract.
 - `wait()` polled MMIO with `yield_cpu` for up to 250 ms. `yield_cpu` leaves the task RUNNABLE, so a
   single-core scheduler hands the core straight back - yielding is not the same as not using the core.
   Now yields 2 ms then parks.

@@ -52,6 +52,77 @@ with a harsher "brutal" variant (see the "Tried by Fire" section of `COMMANDMENT
 test is necessary, never sufficient. In particular, every service must survive `chaos max-carnage`
 (Commandment II): if Chaos finds a bug, the bug already existed.
 
+## Break it: an open invitation
+
+GodspeedOS claims that **the kernel is the only thing that cannot be restarted** - every service,
+the supervisor included, dies and comes back. That is a claim about RECOVERY, and the honest way to hold
+it is to let anyone try to make it false. So: if you have a machine with cores and hours to spare, run
+`chaos` against GodspeedOS for as long as you like - a million rounds, a billion - and if it breaks,
+tell us. A break found by a stranger is worth more than a thousand rounds we ran ourselves, because it
+is a kill order we did not think of.
+
+This is about recovery, **not security**. `chaos` holds the authority to kill services, so whatever it
+breaks - a kernel panic included - is a recovery bug and belongs here, in public. A panic that an
+unprivileged service or a network peer can cause, a capability bypass, a way to gain authority you were
+not granted, or anything else that is an attack rather than a failure to recover, is not reported here -
+do not post it in a public issue; report it privately as [`SECURITY.md`](SECURITY.md) describes.
+
+### What counts as a break
+
+- **A kernel panic**, or a **liveness wedge** (a core goes dark and the watchdog fires) - the one thing
+  that must never happen.
+- **A service that never comes back** - dead at the end of the run, and still dead after the
+  supervisor's sweep has had time to find it.
+- **A recovery that comes back wrong** - `selfcheck` fails after the soak, a file reads back different
+  from what was written, the network answers wrongly after it has answered rightly.
+- **A resource that keeps going** - free memory falling run over run, restarts that start failing and
+  keep failing. Recovery that leaks is recovery on a timer.
+
+What does **not** count: a fault in the hardware itself, an image you modified, and recovery that is
+slow but bounded - a service that takes several seconds to return after a storm is doing its job.
+
+### How to run it
+
+On real hardware, at the prompt:
+
+```
+gsh> chaos max-carnage all-services 1000000 yes
+```
+
+In QEMU, from a checkout, one boot running the storm repeatedly: `osdev test chaos-repro:<rounds>:<iterations>`
+(the serial lands in `build/tests/chaos_repro_serial.log`).
+
+**A powerful machine buys parallel runs, not a faster one.** A round is a sweep that kills, floods and
+waits for recovery, and it takes about two seconds - a Raspberry Pi 4 ran 547 rounds in 21 minutes on
+2026-10-09 - so one run of a billion rounds is not a weekend; it is decades. What a machine with
+many cores CAN do is run dozens of instances at once, each soaking independently, and that is genuinely
+valuable. Use a separate checkout for each QEMU instance: the test harness writes fixed paths under
+`build/`, so two runs in one checkout overwrite each other. QEMU's timing is not a board's - a break
+under QEMU still counts, and is worth saying it was QEMU.
+
+### What to send
+
+Every `all-services` run prints its **seed** when it starts and again in its report. A report we can act
+on has:
+
+- the **seed** and the **round** it broke at;
+- the **commit**, from the first line of the boot banner (`GodspeedOS 0.21.0 x86_64 (f54aafef) - kernel`);
+- the **machine** - the board, or the QEMU command line and `-smp`;
+- the **serial log**, the whole of it. It matters more than anything else on this list: `events log
+  boot` holds only the boot, and the supervisor's `hardware events` record restarts whenever chaos kills
+  the supervisor.
+
+**What a seed does and does not do.** `chaos max-carnage all-services <n> seed <s>` replays a run's
+random DRAWS, not the run: one draw is made per live service each round, and which services are live
+depends on restart timing across the cores, so two runs on one seed part ways at the first round whose
+timing differs. Rerunning your seed and seeing no failure does not mean the bug is gone; send it anyway.
+The seed narrows a break from "somewhere in a billion rounds" to one run's decision stream, which is
+what the person fixing it needs.
+
+A break you find is credited the way every contribution is: in git history. The commit that fixes it
+carries a `Reported-by:` trailer with your name, so the record of who found it is permanent and sits
+next to the fix.
+
 ## Interdependent services wait on truth, not time
 
 When one service depends on another - `fs` on `block-driver`, the shell on `fs`, any client on any
@@ -125,6 +196,10 @@ stop noticing. Each of these is a weakening, however reasonable it looks in a di
   unhelpful message is a finding, not a pass.** That is why `tests/conformance/ui/` holds the exact
   text of every diagnostic and `py scripts/conform.py --selftest` compares the render against it. If
   you change a message, run it and read the diff.
+
+**Adding a user-facing command?** `utilities/0_conventions.md` §2a lists the eight places a new verb has
+to be registered and the rule that decides whether its spec belongs in `utilities/` or in `docs/` - both
+are enforced by checkers, and both were written down only after a verb was implemented without them.
 
 **One question settles a hard case:** after your change, does the gate still refuse what it was written
 to refuse? A green run is not the answer to that - a check that has stopped working is also green, and

@@ -41,6 +41,13 @@ pub mod uart_rx;
 pub mod genet;
 #[cfg(feature = "pi4")]
 pub mod pcie;
+// Every address in this module is a BCM2711 fact - the peripheral base, the two SD controller
+// offsets, the GPIO block - and it reaches the machine through `uaccess` and `mailbox`, both of which
+// are pi4-gated themselves. It was declared unconditionally, so on the QEMU `virt` variant it failed to
+// compile against two modules that are not there: an ungated module whose every dependency is gated
+// only ever looks correct on the board it was written for.
+#[cfg(feature = "pi4")]
+pub mod sdio;
 // Always compiled, even when SMP is off: `_start` branches secondaries here, and a `naked_asm!` symbol
 // reference cannot be conditional. With the feature off nothing ever sets `AP_TABLES_READY`, so a
 // secondary that reaches it simply parks in `wfe` - exactly the behaviour it had before, and reached by
@@ -602,7 +609,7 @@ fn allocator_selftest() {
 ///    so the walk allocates a fresh L2 and L3 rather than colliding with a kernel block. See `ptables`
 ///    for why a VA *below* 4 GiB cannot be used yet: it would shadow the kernel's identity mapping.
 /// 3. **The switch actually takes**: install the new TTBR0, and read back a value written through the
-///    new mapping. This is the first time the address-space branch of `switch_context` is exercised.
+///    new mapping. This is the first time `switch_context`'s TTBR0 install is exercised.
 /// 4. **The kernel survived the switch** - it is still executing, printing, and its own data reads
 ///    back correctly under the task's table.
 /// 5. **Switching back and reclaiming** returns every table frame, checked against the free count.
@@ -670,7 +677,7 @@ fn page_table_selftest() {
     // TTBR0 flushes nothing on AArch64 (SEC-26).
     unsafe {
         core::arch::asm!(
-            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            "msr ttbr0_el1, {t}", "isb", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
             t = in(reg) new_ttbr, options(nostack),
         );
     }
@@ -685,7 +692,7 @@ fn page_table_selftest() {
     // SAFETY: `old_ttbr` is the boot L1 that was live a moment ago.
     unsafe {
         core::arch::asm!(
-            "msr ttbr0_el1, {t}", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
+            "msr ttbr0_el1, {t}", "isb", "dsb ish", "tlbi vmalle1", "dsb ish", "isb",
             t = in(reg) old_ttbr, options(nostack),
         );
     }
@@ -889,6 +896,33 @@ extern "C" fn boot_high() -> ! {
         let ram_top = bi.memory_map.iter().map(|r| r.base + r.len).max().unwrap_or(0);
         // The on-board ethernet controller. Identified here, next to the other device probes, and
         // inside the same window: an absent controller answers with an abort, not a value.
+        // WHICH SD HOST CONTROLLER IS THE WIFI RADIO BEHIND - a census, not a driver.
+        //
+        // `docs/wifi.md` section 4 rests its whole phase-1 estimate on the CYW43455 sitting behind the
+        // older Arasan block (the one `services/block-driver/src/sdhci.rs` already drives) with the SD
+        // card on the other controller. That was recorded as needing a device-tree read; it does not.
+        // The machine can be asked, and asking is both safer and more honest than believing a
+        // specification.
+        //
+        // READS AND PRINTS. Its answer (`sdio::radio_present`) is what gates the `WIFI_SDIO` window in
+        // `map_fixed_device` and the DEVICE_POWER mint - which this said it left untouched until the boot
+        // log named the window (corrected 2026-10-08), because that table's comment records what getting it wrong costs: a
+        // service handed a range whose first read aborts dies on that read, forever.
+        //
+        // Inside the probe window on purpose - one of the two addresses is this author's recollection
+        // rather than an in-repo fact, and it is labelled as such in the log.
+        #[cfg(feature = "pi4")]
+        sdio::census();
+        // The random-number generator, probed like every other device a model of this board may lack:
+        // query 19 reaches it from ANY service with no capability, so an absent block must answer
+        // "unavailable" rather than abort the kernel (see `rng_probe`).
+        #[cfg(feature = "pi4")]
+        rng_probe();
+        // The audio jack's PWM block, the same way: QEMU's `raspi4b` models none, and a driver granted
+        // a block that aborts on its first write dies and is respawned forever (found that way,
+        // 2026-10-03). Probed here, so `pwm-audio` is granted the jack only where it answers.
+        #[cfg(feature = "pi4")]
+        pwm_probe();
         if genet::probe().is_some() {
             // The controller answered, and that is the LAST thing this kernel does about ethernet.
             // Commandment I: an ethernet driver is not the kernel's business (§4.4). The kernel
@@ -1194,8 +1228,8 @@ pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tl
 /// Chosen well above any service image and below the 39-bit VA ceiling this MMU translates.
 pub const DRIVER_MMIO_VA: u64 = 0x6000_0000;
 
-/// Grant a named driver service the MMIO window its device lives at - by NAME, at spawn, and nothing
-/// else (§3.1: authority is granted deliberately or not at all).
+/// Grant a driver the MMIO window its device lives at - by the device KIND its spawn request names, at
+/// spawn, and nothing else (§3.1: authority is granted deliberately or not at all).
 ///
 /// This returned `None`, which is why `genet` and `xhci` were still IN the kernel: a service cannot
 /// drive a device whose registers it cannot name. Step 2 of getting them out (step 1 was routing the
@@ -1210,12 +1244,16 @@ pub const DRIVER_MMIO_VA: u64 = 0x6000_0000;
 ///
 /// Mapped Device-nGnRnE via `PCD` (`ptables::map_raw` reads that as the device attribute) and
 /// NO_EXEC - a register window is never code. USER because the point is for EL0 to reach it.
-pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Option<(u64, u64)> {
+///
+/// **BY DEVICE KIND, NEVER BY SERVICE NAME** (`docs/audio.md`, "No service names in the kernel"). Keyed
+/// on the name, this was the name-keyed authority table `docs/service-ownership.md` says cannot be
+/// enforced once the supervisor holds the images. The kind is what the spawn request asks for.
+pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u64, u64)> {
     #[cfg(not(feature = "pi4"))]
     {
         // No fixed peripheral windows on the QEMU `virt` variant: it has no GENET and no Pi
-        // peripherals at all, so there is nothing to name.
-        let _ = (pt, name);
+        // peripherals at all, so there is nothing to grant.
+        let _ = (pt, kind);
         None
     }
 
@@ -1224,13 +1262,40 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
         use crate::memory::frame::PhysAddr;
         use page_tables::{PageFlags, VirtAddr};
 
-        // One entry per device this port knows how to grant. A name that is not here gets NOTHING,
+        // One entry per device this port knows how to grant. A kind that is not here gets NOTHING,
         // which is the default that keeps this a grant rather than an ambient window.
-        let (phys, pages): (u64, u64) = match name {
+        use crate::task::kind as k;
+        let (phys, pages): (u64, u64) = match kind {
             // The GENET v5 ethernet MAC. 64 KiB covers the SYS/EXT/RBUF/UMAC/MDIO blocks, both DMA
             // register files (the RDMA/TDMA rings sit at +0x2000 and +0x4000), and the hardware
             // filter block at +0x8000 that has to be cleared before a frame can reach the DMA.
-            "nic-driver" if genet::present() => (0xFD58_0000, 16),
+            k::NIC if genet::present() => (0xFD58_0000, 16),
+            // The Arasan SD host controller, which on THIS board is the CYW43455 WiFi radio's SDIO
+            // bus - the vendor device tree's `mmcnr@7e300000` (bus-width 4, `sdio_pins`), the same
+            // controller as `sdhci@7e300000` under a different driver's name. 0x100 of registers, so
+            // one page.
+            //
+            // Gated on the census having SEEN it answer, for the reason this function's header gives
+            // and QEMU makes concrete: `raspi4b` emulates no Arasan, so an ungated grant would hand
+            // the service a window whose first read aborts, and the supervisor would respawn it
+            // forever. The census runs earlier in the same boot (`sdio::census`).
+            k::WIFI_SDIO if sdio::radio_present() => (0xFE30_0000, 1),
+            // The audio jack (`docs/audio.md`): TWO pages that are not adjacent, mapped side by side -
+            // the PWM block at +0 (PWM1 is at +0x800 within it) and the DMA engine at +0x1000. The DMA
+            // page holds all fifteen channels and their shared status, so granting it grants every
+            // channel: no more DMA reach than an unconfined driver has on this board anyway (6.4), and
+            // more than the grant names, which is recorded.
+            k::AUDIO_PWM if fixed_device_present(k::AUDIO_PWM) => {
+                if !audio_jack_prepare() {
+                    crate::kprintln!("audio: the PWM clock did not report stopping - started anyway; the driver will say what it hears");
+                }
+                let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+                    | PageFlags::NO_EXEC | PageFlags::PCD;
+                pt.map(VirtAddr(DRIVER_MMIO_VA), PhysAddr(0xFE20_C000), flags).ok()?;
+                pt.map(VirtAddr(DRIVER_MMIO_VA + 0x1000), PhysAddr(0xFE00_7000), flags).ok()?;
+                crate::kprintln!("audio: jack pins 40/41 on PWM1, PWM clock PLLD/{} - granting PWM + DMA", AUDIO_PWM_DIVI);
+                return Some((DRIVER_MMIO_VA, 0x2000));
+            }
             _ => return None,
         };
 
@@ -1258,12 +1323,240 @@ pub fn map_fixed_driver_mmio(pt: &mut page_tables::PageTable, name: &str) -> Opt
 pub fn net_frame_tx(_frame: &[u8]) -> bool {
     false
 }
-// No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
+/// The BCM2711's RNG200 block.
+#[cfg(feature = "pi4")]
+const RNG200_BASE: usize = 0xFE10_4000;
+
+/// Whether the RNG200 ANSWERED the boot probe (`rng_probe`). `hw_random` touches the block only if it
+/// did. On the board it always does; QEMU's `raspi4b` models no RNG200, and there the first read is an
+/// external abort that halts the kernel - reached from an unprivileged syscall (query 19), so any
+/// service could take the machine down with one call. Found when the `time` service began asking for a
+/// nonce on every boot (2026-10-01); until then only a configured `net-stack` asked, which never happens
+/// in that emulator. The same posture as `GENET_PRESENT` and the PCIe root complex: probe once, then
+/// believe the answer.
+#[cfg(feature = "pi4")]
+static RNG_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the audio jack's PWM block (PWM1) answered the boot probe - see `pwm_probe`.
+#[cfg(feature = "pi4")]
+static PWM_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Probe PWM1 once at boot and record whether it is there, said either way. The posture of `rng_probe`
+/// and GENET: probe once, then believe the answer.
+#[cfg(feature = "pi4")]
+fn pwm_probe() {
+    // SAFETY: 4-byte aligned (PWM1's CTL register), inside the peripheral Device mapping the kernel
+    // built; `probe_read32` survives the external abort an absent block raises.
+    let answered = unsafe { uaccess::probe_read32(mmio(0xFE20_C800) as u64) }.is_some();
+    PWM_PRESENT.store(answered, core::sync::atomic::Ordering::Release);
+    put_str(if answered {
+        b"audio: PWM1 present - the 3.5 mm jack can be driven" as &[u8]
+    } else {
+        b"audio: no PWM1 at 0xFE20C800 (this machine has none) - no audio jack" as &[u8]
+    });
+    put_str(b"
+");
+}
+
+/// Probe the RNG200 once at boot, inside the probe window, and record whether it is there. Said either
+/// way, so a missing `rng:` line means this never ran rather than that the block is absent.
+#[cfg(feature = "pi4")]
+fn rng_probe() {
+    // SAFETY: 4-byte aligned (the block's CTRL register), inside the peripheral Device mapping the
+    // kernel built; `probe_read32` survives the external abort an absent block raises.
+    let answered = unsafe { uaccess::probe_read32(mmio(RNG200_BASE) as u64) }.is_some();
+    RNG_PRESENT.store(answered, core::sync::atomic::Ordering::Release);
+    put_str(if answered {
+        b"rng: RNG200 present - hardware random numbers available" as &[u8]
+    } else {
+        b"rng: no RNG200 at 0xFE104000 (this machine has none) - hardware random numbers unavailable" as &[u8]
+    });
+    put_str(b"\r\n");
+}
+
+/// One 32-bit word from the BCM2711's hardware random number generator - the RNG200 block, `rng@7e104000`
+/// in the device tree, `iproc-rng200` in Linux - or `None` when it has produced nothing inside a bounded
+/// wait or is locked out and one reset did not clear it. Serves `InspectKernel` query 19; the wifi
+/// driver's handshake nonce is what asked for it (`docs/wifi.md` 40: until this existed the nonce was
+/// hashed from the cycle counter and the driver said so on every join).
+///
+/// Registers and sequence as Linux's driver names them (26.14: the silicon's requirement, not its model):
+/// `CTRL` +0x00 (bits 0x1FFF are the generator enable field, 1 = on), `RNG_SOFT_RESET` +0x04 and
+/// `RBG_SOFT_RESET` +0x08 (write 1 then 0), `INT_STATUS` +0x18 (0x8000_0000 master-fail lockout, 0x20
+/// NIST fail; writing clears), `FIFO_DATA` +0x20, `FIFO_COUNT` +0x24 (low byte = words waiting). Linux
+/// allows one restart per read on a fail bit and then gives up; so does this. The block is inside the
+/// 0xFC00_0000+ window `mmu.rs` maps Device-nGnRnE, and is reached through `mmio()` so it holds on both
+/// sides of the jump to the high half.
+///
+/// The wait is a bound in READS of the count register, not a duration: it is there so a block that never
+/// fills - unclocked, or absent on a board this feature was built for by mistake - returns `None` rather
+/// than holding the core, and `None` is the honest answer the caller already handles.
+#[cfg(feature = "pi4")]
+pub fn hw_random() -> Option<u32> {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    // Never touch a block the boot probe did not find - see `RNG_PRESENT`.
+    if !RNG_PRESENT.load(Ordering::Acquire) {
+        return None;
+    }
+    const CTRL: usize = 0x00;
+    const RNG_SOFT_RESET: usize = 0x04;
+    const RBG_SOFT_RESET: usize = 0x08;
+    const INT_STATUS: usize = 0x18;
+    const FIFO_DATA: usize = 0x20;
+    const FIFO_COUNT: usize = 0x24;
+    const CTRL_RBGEN_MASK: u32 = 0x0000_1FFF;
+    const CTRL_ENABLE: u32 = 0x0000_0001;
+    const INT_MASTER_FAIL_LOCKOUT: u32 = 0x8000_0000;
+    const INT_NIST_FAIL: u32 = 0x0000_0020;
+    const FIFO_COUNT_MASK: u32 = 0x0000_00FF;
+    /// Reads of the count register before giving up. A word is ready within microseconds when the block
+    /// runs at all; this is thousands of times that.
+    const WAIT_READS: u32 = 200_000;
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    // SAFETY: the RNG200's registers, at a fixed BCM2711 address inside the Device-nGnRnE peripheral
+    // window `mmu.rs` maps, through `mmio()` like every other peripheral in this file. Each access is a
+    // 32-bit volatile read or write of one register the datasheet (Linux's driver, quoted above) defines;
+    // no memory the kernel owns is touched. The enable is done once (the swap) and the restart sequence
+    // only on a fail bit the block itself reported. Two cores calling at once each read their own word
+    // from the FIFO; the block serialises the FIFO pop. Every loop is bounded.
+    unsafe {
+        let ctrl = mmio(RNG200_BASE + CTRL) as *mut u32;
+        let rng_reset = mmio(RNG200_BASE + RNG_SOFT_RESET) as *mut u32;
+        let rbg_reset = mmio(RNG200_BASE + RBG_SOFT_RESET) as *mut u32;
+        let int_status = mmio(RNG200_BASE + INT_STATUS) as *mut u32;
+        let fifo_data = mmio(RNG200_BASE + FIFO_DATA) as *const u32;
+        let fifo_count = mmio(RNG200_BASE + FIFO_COUNT) as *const u32;
+
+        if !ENABLED.swap(true, Ordering::Relaxed) {
+            ctrl.write_volatile((ctrl.read_volatile() & !CTRL_RBGEN_MASK) | CTRL_ENABLE);
+        }
+        let mut restarted = false;
+        let mut reads = 0u32;
+        loop {
+            let status = int_status.read_volatile();
+            if status & (INT_MASTER_FAIL_LOCKOUT | INT_NIST_FAIL) != 0 {
+                if restarted {
+                    return None;
+                }
+                restarted = true;
+                // `iproc_rng200_restart`: disable, clear every status bit, RBG reset, RNG reset, enable.
+                ctrl.write_volatile(ctrl.read_volatile() & !CTRL_RBGEN_MASK);
+                int_status.write_volatile(0xFFFF_FFFF);
+                rbg_reset.write_volatile(1);
+                rbg_reset.write_volatile(0);
+                rng_reset.write_volatile(1);
+                rng_reset.write_volatile(0);
+                ctrl.write_volatile((ctrl.read_volatile() & !CTRL_RBGEN_MASK) | CTRL_ENABLE);
+                continue;
+            }
+            if fifo_count.read_volatile() & FIFO_COUNT_MASK != 0 {
+                return Some(fifo_data.read_volatile());
+            }
+            reads += 1;
+            if reads > WAIT_READS {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+/// Without the `pi4` feature this port names no board, so there is no RNG to reach. `None` is the honest
+/// answer and the caller (query 19) already reports it as unavailable.
+#[cfg(not(feature = "pi4"))]
 pub fn hw_random() -> Option<u32> { None }
+
+/// Whether the device of fixed `kind` can have its power cut and restored by this port. The one such device is the Pi 4's radio: the CYW43455 behind the Arasan SDIO host, powered
+/// through WL_ON on the firmware's GPIO expander. Answered at spawn, so `DEVICE_POWER` is minted only to
+/// the service that holds that window, and only where the boot census saw the radio's controller.
+#[cfg(feature = "pi4")]
+pub fn device_power_control(kind: u32) -> bool {
+    let ok = kind == crate::task::kind::WIFI_SDIO && sdio::radio_present();
+    // THE OTHER HALF OF THE CHIP'S POWER, measured once per spawn (docs/wifi.md 53): BT_ON as the firmware
+    // left it. A cut that drops WL_ON alone leaves the chip's shared domain powered if this is high.
+    #[cfg(feature = "pi4")]
+    if ok {
+        match mailbox::get_expander_gpio(mailbox::EXPGPIO_BT_ON) {
+            Some(l) => crate::kprintln!("device-power: BT_ON (the same chip's Bluetooth enable) reads {}", l),
+            None => crate::kprintln!("device-power: BT_ON did not answer the read"),
+        }
+    }
+    ok
+}
+
+/// Cut (`on = false`) or restore (`on = true`) the power of the device of fixed `kind`. The
+/// `DevicePower` syscall has already checked the caller holds `DEVICE_POWER`; this resolves WHICH pin
+/// and drives it - the same WL_ON that Linux's `mmc-pwrseq-simple` toggles to power-cycle this chip. How
+/// long to hold it off and how long to wait after is the driver's to decide, in the driver (26.10).
+#[cfg(feature = "pi4")]
+pub fn device_power(kind: u32, on: bool) -> bool {
+    if kind != crate::task::kind::WIFI_SDIO { return false; }
+    // WL_ON ALONE. BT_ON - the same chip's Bluetooth enable - reads 0 on this board (logged at spawn), so
+    // there is no second enable holding the chip's shared domain up through a cut (docs/wifi.md 53).
+    let took = mailbox::set_expander_gpio(mailbox::EXPGPIO_WL_ON, on);
+    // READ IT BACK, because the SET tag answers "accepted" whether or not the pin moved, and three
+    // reloads on hardware (2026-10-01) gave one cold chip and two that reset without losing their warm
+    // state. What the firmware says the pin is NOW is the one fact that separates "the write did not
+    // take" from "the chip keeps state in a domain this pin does not cut".
+    // And the RESULT follows the read-back: a pin that reads back the wrong level is a request that did not
+    // happen, and reporting success for it - which this did, in QEMU, where the pin is not emulated - would
+    // let the caller verify a cut that never occurred.
+    let want = if on { 1 } else { 0 };
+    match mailbox::get_expander_gpio(mailbox::EXPGPIO_WL_ON) {
+        Some(level) => {
+            crate::kprintln!("device-power: WL_ON asked {} - the firmware reads the pin back as {}", want, level);
+            took && level == want
+        }
+        None => {
+            crate::kprintln!("device-power: WL_ON asked {} - the firmware did not answer the read-back", want);
+            false
+        }
+    }
+}
+
+/// Without the `pi4` feature this port names no board, so no device's power is reachable.
+#[cfg(not(feature = "pi4"))]
+pub fn device_power_control(_kind: u32) -> bool { false }
+#[cfg(not(feature = "pi4"))]
+pub fn device_power(_kind: u32, _on: bool) -> bool { false }
+
+/// Set the Arm cores to the firmware's minimum (`max = false`) or maximum (`max = true`) rate, and return
+/// what they read back in Hz. The two rates are the FIRMWARE'S - `GET_MIN_CLOCK_RATE` and
+/// `GET_MAX_CLOCK_RATE` for the ARM clock - so the caller can only choose between the firmware's own ends
+/// of the range, never name a frequency. `None` when the firmware does not answer.
+///
+/// Why a board needs this at all: with no OS asking for a rate, the Pi firmware holds the cores at turbo
+/// for `initial_turbo` seconds after boot (60 by default) and then at their minimum for good
+/// (`docs/wifi.md` 55). The `power` service decides which end, and when (`docs/power.md`).
+#[cfg(feature = "pi4")]
+pub fn cpu_clock(max: bool) -> Option<u32> {
+    let target = mailbox::arm_clock(if max { mailbox::TAG_GET_MAX_CLOCK_RATE } else { mailbox::TAG_GET_MIN_CLOCK_RATE })?;
+    let set = mailbox::set_arm_clock(target)?;
+    let now = mailbox::arm_clock(mailbox::TAG_GET_CLOCK_RATE);
+    crate::kprintln!("cpu-clock: {} rate {} Hz asked - the firmware set {} Hz, the clock reads back {:?}",
+                     if max { "maximum" } else { "minimum" }, target, set, now);
+    Some(now.unwrap_or(set))
+}
+#[cfg(not(feature = "pi4"))]
+pub fn cpu_clock(_max: bool) -> Option<u32> { None }
 
 /// The SD/EMMC controller's base clock in Hz, or 0 where the platform does not report one
 /// (the block driver then refuses to guess a divider). Only the Pi's ARM port learns this,
 /// from the VideoCore mailbox at boot.
+/// The Arasan's base clock in Hz, as the VideoCore reported it at boot (InspectKernel query 20).
+///
+/// This returned a flat 0, which on this port meant `wifi-driver` could not set a card clock at all -
+/// and 0 is a REFUSAL, not a default, so the honest consequence was a driver that declined to start.
+/// The mailbox knows the answer and is asked for it beside the SD census; arm32 has asked the same
+/// question (clock id 1 = EMMC) since its card worked.
+///
+/// Zero still means "the firmware declined to say", and a driver reading it must refuse rather than
+/// guess: every card clock derives from this, and a divider from a wrong base runs the identification
+/// clock at the wrong speed so that nothing answers - silently, and on hardware only.
+#[cfg(feature = "pi4")]
+pub fn emmc_base_clock_hz() -> u32 { sdio::base_clock_hz() }
+/// No Pi peripherals on the QEMU `virt` variant, so no SD controller and no clock to report.
+#[cfg(not(feature = "pi4"))]
 pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
 pub fn board_mac_packed() -> Option<u64> { None }
@@ -2323,20 +2616,22 @@ pub mod page_tables {
     /// Free a task's page-table root and the structure below it, at task death.
     ///
     /// # Safety
-    /// `root` must belong to a task already marked Dead, after a TLB shootdown, so no page-walker can
-    /// still reach it.
+    /// `root` must belong to a task already marked Dead, and no core may be RUNNING it. A core that last
+    /// ran it may still hold it in `TTBR0_EL1` while it idles and walk it speculatively; that is tolerated
+    /// because the flush below drops what it cached, and the next `switch_context` on that core installs
+    /// a live root and flushes again before anything runs (`context.rs`, `backlog/72`).
     #[cfg(feature = "pi4")]
     pub unsafe fn free_page_table_root(root: u64) {
         // Invalidate every translation this address space owned, on EVERY core, BEFORE its frames go
         // back to the allocator.
         //
-        // Without this a respawn can inherit the dead space's TLB. `switch_context` skips the TTBR
-        // install when the incoming base equals the outgoing one - a sound optimisation only while a
-        // TTBR value identifies an address space, and it stops identifying one the moment root frames
-        // are recycled. The allocator hands a just-freed frame straight back, so a service that dies
-        // and respawns can get the SAME root physical address with entirely different contents: the
-        // switch is skipped as a no-op, and the new task runs on the dead task's mappings, whose frames
-        // have already been reclaimed and handed to somebody else.
+        // Without this a respawn could inherit the dead space's TLB. `switch_context` USED TO skip the
+        // TTBR install when the incoming base equalled the outgoing one - sound only while a TTBR value
+        // identifies an address space, which stops being true the moment root frames are recycled: the
+        // allocator hands a just-freed frame straight back, so a respawn can get the SAME root physical
+        // address with entirely different contents. It now installs and flushes on every switch
+        // (`context.rs`); this flush is still owed, because it drops the dead space's entries on cores
+        // that will not switch again soon.
         //
         // That is what killed `chaos kill-storm supervisor` on this port. Seven fresh boot spawns were
         // fine - all distinct roots - and the first RESPAWN took an instruction abort (ESR 0x82000007,
@@ -2734,9 +3029,19 @@ pub mod interrupts {
         //
         // Hot-plug is the driver's own outer `'reenum` loop, which is preemptible because it is a
         // task rather than the idle path of a core. Nothing to poll here.
+        //
+        // CALLED WITH INTERRUPTS MASKED (`idle_mask_before_halt` answers yes below), so this is the
+        // arm64 idle sequence Linux's `cpu_do_idle` uses: `wfi` under the mask, then unmask. WFI wakes on
+        // an interrupt that is PENDING whether or not PSTATE.I masks it - that is the architectural
+        // property the sequence rests on - and the interrupt is then taken the instant the mask clears.
+        // A wake that landed between the scheduler's "nothing to run" and this instruction is therefore
+        // still pending when `wfi` executes and returns at once, instead of being consumed by the
+        // handler beforehand and slept through. Unmasking when already unmasked is harmless, so this
+        // holds for a caller that did not mask.
         // SAFETY: WFI at EL1 is always valid. It returns on any pending interrupt (or spuriously),
         // so every caller must re-check its condition rather than assume a wake means progress.
         unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        enable_interrupts();
     }
     #[cfg(feature = "pi4")]
     /// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the
@@ -2753,13 +3058,22 @@ pub mod interrupts {
     /// executing it cannot lose an interrupt raised in between - it is latched while masked and taken
     /// the instant `sti` retires.
     ///
-    /// ARM says NO, and this is the reason the guard is a question rather than a rule: both ARM ports do
-    /// real work inside `wait_for_interrupt` (draining the UART so a keystroke can wake a blocked shell,
-    /// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
-    /// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
-    /// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
-    /// narrower window; it is recorded here rather than silently left (26.7).
-    pub fn idle_mask_before_halt() -> bool { false }
+    /// This port said NO when the question was written, for a reason that was true then: both ARM ports
+    /// did real work inside `wait_for_interrupt` (draining the UART so a keystroke could wake a blocked
+    /// shell, watching hub ports so a replug was noticed), and that work needed interrupts enabled.
+    /// On the Pi 4 that work is gone - the USB stack and the terminal are services now, and the halt
+    /// above is a bare `wfi` whose own comment says "nothing to poll here" - but the answer was never
+    /// revisited, and on 2026-09-30 the window it leaves was measured: `net-stack` in its polling mode
+    /// blocks and wakes every 20-100 ms on core 1, the core idles hundreds of times a minute, and a
+    /// cross-core wake (the radio answering `nic-driver` from core 3, or core 0's deadline scan waking
+    /// `net-stack`) fell into the gap almost every time. `nic-driver` woke to serve each request about
+    /// 950 ms after it was sent, every wake on a one-second grid, and `ping` over the radio ran at one
+    /// echo every three seconds - the x86 "slow filesystem" of August, on this board, one core over.
+    ///
+    /// So this port says YES now, by the arm64 idiom rather than x86's: mask, re-check, `wfi` (which
+    /// wakes on a pending interrupt even under the mask), unmask - see `wait_for_interrupt`. The Pi 2
+    /// (`arch/arm`) still polls its UART in the halt and keeps its own answer.
+    pub fn idle_mask_before_halt() -> bool { true }
 
     /// The idle loop may `wfi`: the generic timer keeps ticking through it, so a halted core is woken
     /// by its own 100 Hz tick even if nothing else ever targets it.
@@ -2867,6 +3181,76 @@ pub mod rtc {
 /// set was `pci::NIC_FOUND`, which put a non-PCI device into a PCI variable and is exactly the
 /// conflation step D removes.
 pub fn soc_nic_present() -> bool { GENET_PRESENT.load(core::sync::atomic::Ordering::Acquire) }
+
+/// Is a device of this fixed kind (`task::kind`) on this board - answered by KIND, never by the name of a
+/// service (`docs/audio.md`, "No service names in the kernel"). The audio jack (`AUDIO_PWM`): the Pi 4 has
+/// PWM1's two channels on GPIO 40 (right) and 41 (left), through the board's filter to the 3.5 mm jack.
+/// Only where the boot probe found PWM1 answering (`pwm_probe`): not QEMU's `raspi4b`, which models
+/// none, and not the `virt` variant, which has no Pi peripherals at all.
+pub fn fixed_device_present(kind: u32) -> bool {
+    use crate::task::kind as k;
+    match kind {
+        #[cfg(feature = "pi4")]
+        k::AUDIO_PWM => PWM_PRESENT.load(core::sync::atomic::Ordering::Acquire),
+        #[cfg(feature = "pi4")]
+        k::WIFI_SDIO => sdio::radio_present(),
+        _ => false,
+    }
+}
+
+/// The clock manager's PWM pair and the GPIO registers the jack needs (BCM2711 peripherals). Every
+/// clock-manager write carries the password in the top byte, or the block ignores it.
+#[cfg(feature = "pi4")]
+const CM_PWMCTL: usize = 0xFE10_10A0;
+#[cfg(feature = "pi4")]
+const CM_PWMDIV: usize = 0xFE10_10A4;
+#[cfg(feature = "pi4")]
+const CM_PASSWORD: u32 = 0x5A << 24;
+/// PLLD, 750 MHz on this board: the steady source. PLLC is the core clock and moves with it.
+#[cfg(feature = "pi4")]
+const CM_SRC_PLLD: u32 = 6;
+/// PLLD / 6 = 125 MHz, the PWM clock `pwm-audio` divides into its sample rate (`probe_mode` 4).
+#[cfg(feature = "pi4")]
+const AUDIO_PWM_DIVI: u32 = 6;
+
+/// Make the audio jack usable, as part of granting it: route its two pins to PWM1 and start the PWM
+/// clock. Both live in SHARED blocks - every pin's function in the GPIO page, every clock in the clock
+/// manager's - so the kernel does them here, as it powers the SD domain before granting the radio's
+/// window, and the driver is granted only the PWM block and the DMA engine (CLAUDE.md 12.3, as amended
+/// for audio). The PWM1 DMA request is muxed with DSI0, and its reset value already selects PWM1.
+///
+/// Circle's sequence (`lib/gpioclock.cpp`): kill the clock and wait for BUSY to clear, set the divider,
+/// set the source, then enable. The BUSY wait is bounded and its failure reported, not fatal.
+#[cfg(feature = "pi4")]
+fn audio_jack_prepare() -> bool {
+    // SAFETY: GPFSEL4, GPIO_PUP_PDN_CNTRL_REG2 and the clock manager's PWM pair are BCM2711 MMIO reached
+    // through `mmio()`. Read-modify-write of GPFSEL4 and the pull register changes only pins 40 and 41;
+    // CM_PWMCTL/DIV belong to the PWM clock alone.
+    unsafe {
+        let fsel4 = mmio(GPIO_BASE + 0x10) as *mut u32;
+        let mut v = fsel4.read_volatile();
+        v = (v & !((7 << 0) | (7 << 3))) | (4 << 0) | (4 << 3); // GPIO40, GPIO41 -> ALT0 = PWM1
+        fsel4.write_volatile(v);
+        // No pull on either: outputs now. REG2 covers GPIO32-47, two bits a pin.
+        let pud2 = mmio(GPIO_BASE + 0xEC) as *mut u32;
+        let p = pud2.read_volatile() & !((3 << 16) | (3 << 18));
+        pud2.write_volatile(p);
+
+        let ctl = mmio(CM_PWMCTL) as *mut u32;
+        let div = mmio(CM_PWMDIV) as *mut u32;
+        ctl.write_volatile(CM_PASSWORD | (1 << 5)); // KILL
+        let mut stopped = false;
+        for _ in 0..1_000_000 {
+            if ctl.read_volatile() & (1 << 7) == 0 { stopped = true; break; } // BUSY clear
+        }
+        div.write_volatile(CM_PASSWORD | (AUDIO_PWM_DIVI << 12));
+        for _ in 0..1000 { core::hint::spin_loop(); }
+        ctl.write_volatile(CM_PASSWORD | CM_SRC_PLLD);
+        for _ in 0..1000 { core::hint::spin_loop(); }
+        ctl.write_volatile(CM_PASSWORD | CM_SRC_PLLD | (1 << 4)); // ENAB
+        stopped
+    }
+}
 static GENET_PRESENT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

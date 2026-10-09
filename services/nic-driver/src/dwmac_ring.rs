@@ -27,6 +27,7 @@
 //! Cited individually at each constant. The DEVICE's requirements are borrowed; how the ring is
 //! owned, bounded and reported is ours (26.14).
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 // ---- DMA block. `dwmac4_dma.h`. -----------------------------------------------------------------
@@ -371,22 +372,10 @@ const RESET_US: u64 = 1_000_000;
 /// still bounded well under the caller's own deadline.
 const TX_US: u64 = 20_000;
 
-/// Polls to allow when the machine reports no counter calibration at all.
-///
-/// The honest fallback, and it is deliberately NOT presented as a duration: with no calibration
-/// there is no way to convert one, so this is a plain iteration ceiling whose only job is to
-/// TERMINATE. Said out loud at bring-up rather than left to silently change what every bound above
-/// means.
-const UNCALIBRATED_POLLS: u32 = 200_000;
-
 pub struct Dwmac {
     pub m: Mmio,
     pub a: Dma,
     pub mac: [u8; 6],
-    /// Counter ticks in ten milliseconds, so a microsecond budget can be converted into something
-    /// the monotonic counter can be compared against. Zero means the machine could not tell us, and
-    /// every bound below falls back to an iteration ceiling that is honest about being one.
-    per_10ms: u64,
     /// The last TDES3 the hardware wrote back, kept so the serve loop can report WHY a transmit
     /// failed rather than only that it did.
     pub last_tx_status: u32,
@@ -398,37 +387,17 @@ pub struct Dwmac {
 }
 
 impl Dwmac {
-    /// Counter ticks in `us` microseconds, floored at one so a budget is never zero.
-    fn ticks_for_us(&self, us: u64) -> u64 {
-        (self.per_10ms.saturating_mul(us) / 10_000).max(1)
-    }
-
     /// Spin until `reg & bit` clears, or the budget expires. Returns whether it cleared, and how
     /// many microseconds it took - the second half matters because "cleared in 900 ms" and "cleared
-    /// instantly" are the same success with very different meanings for the next person.
+    /// instantly" are the same success with very different meanings for the next person. On success
+    /// the time is 0 on an uncalibrated machine, where it cannot be known; on expiry it is the budget.
+    ///
+    /// The wait is `gs::driver::wait` (`docs/driver-library.md`), which also owns the uncalibrated
+    /// ceiling this file used to declare for itself.
     fn wait_clear(&self, ctx: &ServiceContext, reg: usize, bit: u32, us: u64) -> (bool, u64) {
-        if self.per_10ms == 0 {
-            let mut polls = 0u32;
-            while polls < UNCALIBRATED_POLLS {
-                if self.m.read32(reg) & bit == 0 {
-                    return (true, 0);
-                }
-                polls += 1;
-                core::hint::spin_loop();
-            }
-            return (false, 0);
-        }
-        let budget = self.ticks_for_us(us);
-        let start = ctx.read_tsc();
-        loop {
-            let waited = ctx.read_tsc().wrapping_sub(start);
-            if self.m.read32(reg) & bit == 0 {
-                return (true, waited.saturating_mul(10_000) / self.per_10ms);
-            }
-            if waited >= budget {
-                return (false, us);
-            }
-            core::hint::spin_loop();
+        match wait::until(ctx, Budget::us(us), || self.m.read32(reg) & bit == 0) {
+            Ok(took_us) => (true, took_us),
+            Err(wait::TimedOut) => (false, us),
         }
     }
 }
@@ -446,18 +415,20 @@ impl Dwmac {
         mac: [u8; 6],
         speed: u32,
         full_duplex: bool,
-    ) -> Option<Self> {
+    ) -> Result<Self, (Mmio, Dma)> {
+        // A failure HANDS THE GRANT BACK: the caller keeps the window, serves the radio without the MAC,
+        // and tries again when a cable arrives (`dwmac::serve`).
         if a.len() < ARENA_NEEDED {
             ctx.log_fmt(format_args!(
                 "nic-driver: dwmac needs {} bytes of DMA arena and was granted {} - not bringing the MAC up",
                 ARENA_NEEDED,
                 a.len()
             ));
-            return None;
+            return Err((m, a));
         }
 
-        let mut d = Dwmac { m, a, mac, per_10ms: ctx.tsc_ticks_per_10ms(), last_tx_status: 0, rbu: 0, tx_next: 0, rx_next: 0 };
-        if d.per_10ms == 0 {
+        let mut d = Dwmac { m, a, mac, last_tx_status: 0, rbu: 0, tx_next: 0, rx_next: 0 };
+        if !wait::calibrated(ctx) {
             // Said once, here, rather than letting every bound below quietly change meaning. The
             // machine still works; its timeouts are counted instead of measured.
             ctx.log("nic-driver: dwmac has no counter calibration - hardware waits fall back to an iteration ceiling, which is NOT a duration");
@@ -482,8 +453,8 @@ impl Dwmac {
             ctx.log_fmt(format_args!(
                 "nic-driver: dwmac DMA reset did not clear in {} us - bus mode was 0x{:08x}, now 0x{:08x}",
                 RESET_US, before, d.m.read32(DMA_BUS_MODE)));
-            ctx.log("nic-driver: dwmac not brought up - serving empty replies (net degrades, it does not hang)");
-            return None;
+            ctx.log("nic-driver: dwmac not brought up - the radio still carries the link, and the MAC is tried again when a cable arrives");
+            return Err((d.m, d.a));
         }
         ctx.log_fmt(format_args!("nic-driver: dwmac DMA reset cleared in {} us", took_us));
         // Reported rather than programmed. The AXI burst-length field lives here, and its reset
@@ -500,7 +471,7 @@ impl Dwmac {
         d.arm_rx_ring();
         d.program(speed, full_duplex);
         d.log_filter_addr(ctx);
-        Some(d)
+        Ok(d)
     }
 
     fn desc_write(&self, off: usize, word: usize, v: u32) {
@@ -815,19 +786,10 @@ impl Dwmac {
         // Wait for the engine to hand the descriptor back. Waiting is what makes the reply to
         // net-stack mean "sent" rather than "queued"; the bound is what stops a wedged engine from
         // wedging this service. A DURATION, for the reason RESET_US spells out.
-        if self.per_10ms == 0 {
-            let mut polls = 0u32;
-            while polls < UNCALIBRATED_POLLS {
-                if self.desc_read(off, 3) & TDES3_OWN == 0 {
-                    return true;
-                }
-                polls += 1;
-                core::hint::spin_loop();
-            }
-            return false;
-        }
-        let budget = self.ticks_for_us(TX_US);
-        let start = ctx.read_tsc();
+        //
+        // `gs::driver::wait`'s deadline, which also keeps the write-back on an uncalibrated machine:
+        // the separate uncalibrated loop this replaced returned without recording it.
+        let mut deadline = wait::Deadline::start(ctx, Budget::us(TX_US));
         loop {
             let d3 = self.desc_read(off, 3);
             if d3 & TDES3_OWN == 0 {
@@ -836,7 +798,7 @@ impl Dwmac {
                 self.last_tx_status = d3;
                 return true;
             }
-            if ctx.read_tsc().wrapping_sub(start) >= budget {
+            if deadline.expired() {
                 self.last_tx_status = d3;
                 return false;
             }

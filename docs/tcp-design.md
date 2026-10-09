@@ -382,7 +382,7 @@ So the phase order changes. What was P0 is now this, and everything after it dep
 | | |
 |---|---|
 | **done** | every conversation with `nic-driver` goes through a SIFTING wait, so a client request met during one is identified rather than consumed and mis-served. Dropped with its capability reclaimed and counted - `docs/net-tags-design.md` phase 2, which previously guarded one call site out of sixteen |
-| **done** | a client displaced by net-stack's OWN unsolicited work (the clock nudge) is HELD for up to 500 ms and served, instead of lost. Scoped to that one region on purpose; net-tags §7.4 has the measurement and the reason the broad version was withdrawn |
+| **done** | a client displaced by net-stack's OWN unsolicited work is HELD for up to `HOLD_MS` (1.5 s) in a bounded stash and served, instead of lost. First scoped to the clock nudge on purpose (net-tags §7.4 has the measurement and the reason the broad version was withdrawn); since 2026-10-01 the nudge no longer blocks, and the stash serves requests displaced by the dance and by every driver exchange |
 | **done** | the protocol itself: a maximum-segment-size option on every SYN and the peer's honoured, RFC 5681 congestion control (slow start, congestion avoidance, fast retransmit, NewReno fast recovery), and the persist timer this page used to record as missing |
 | **next** | correlation on the CLIENT hop: a tag net-stack echoes, so a client can discard a reply to a question it is no longer asking. This is the real prerequisite for deferring a request at all, and it is NOT the tag `docs/net-tags-design.md` describes - that one is for the driver hop |
 | then | the bounded stash (net-tags phase 3), which needs the above. It was built, measured and withdrawn first; §7.2 there has the log that killed it |
@@ -471,6 +471,11 @@ had plainly worked: net-stack reaped the connection 400 ms later, which only hap
 The kernel's `validate_user_ptr` rejects `len == 0`, so a zero-length `try_send` fails, the reply
 never leaves, and the caller waits out its entire deadline for a message that could not have been
 sent. Silent at both ends: the sender discards the failed send, the receiver sees only a timeout.
+
+**Corrected 2026-10-08:** that held on x86, AArch64 and RISC-V; ARM32's check accepted an empty range,
+which is the other reason the Pi 2 never showed it. It is gone on every port since `e3fcf7ed`
+(`backlog/66`, where the same refusal cost `net dns` over WiFi). The status bytes below stay, for the
+reason the next paragraph gives.
 
 `COP_CLOSE` replied with nothing, and so did the refusal path and the UDP socket path when a datagram
 drew no answer. Every other reply in the service happens to carry a byte, which is the only reason

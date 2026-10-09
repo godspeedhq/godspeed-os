@@ -85,7 +85,8 @@ not "feature-complete."
   │   - owns the host IP + ports (a resource)    │   mints + revokes SOCKET caps (§7.10)
   │   - routes datagrams <-> sockets             │
   ├─────────────────────────────────────────────┤
-  │  nic-driver  (service, NOT IOMMU-confined)   │   per-board: e1000, RTL8168, GENET, dwmac
+  │  nic-driver  (service, NOT IOMMU-confined)   │   per-board: e1000, RTL8168, GENET, dwmac;
+  │                                              │   Pi 4: + the radio via wifi-driver (cable wins)
   │   - raw Ethernet frames in/out via DMA rings │   MMIO + DMA + IRQ caps (§12.3, §6.4)
   ├─────────────────────────────────────────────┤
   │  Kernel  (routes opaque socket caps only)    │   NO networking - delegated-resource-cap routing
@@ -113,8 +114,8 @@ A userspace driver service, structurally identical to `block-driver` (AHCI) and 
   **DMA arena** for the TX/RX descriptor rings + packet buffers.
 - **NOT IOMMU-confined (§6.4).** This said the opposite, and the correction matters because it is a
   trust claim. `nic-driver` is spawned `hwclass::pci(0x02_00_00, BAR_AUTO, false)` - the third argument
-  is `confine`, and it is `false` (`services/supervisor/src/main.rs`, the `nic-driver` spawn row). **`xhci` is the only confined
-  driver in the system**; `ehci` and `block-driver` are deliberately left in passthrough because they
+  is `confine`, and it is `false` (`services/supervisor/src/main.rs`, the `nic-driver` spawn row). **`xhci` (and, in QEMU only,
+  `audio-driver`) are the only confined drivers in the system**; `ehci` and `block-driver` are deliberately left in passthrough because they
   keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs, the `confine` flag on `HwClass::Pci``). So the
   NIC driver's DMA is unconfined: a *buggy* one is bounded by the arena it was granted, but a
   *compromised* one can point the controller anywhere in RAM, which is kernel-equivalent reach by
@@ -362,3 +363,89 @@ from the live set, so no single kill-ordering is special-cased. Result on hardwa
 and `ping` resumes after every round, with no kernel panic - *"not even a blip."* This is the networking
 half of the same restartability story the storage stack tells (`docs/persistence.md` §6.16,
 `docs/naming-design.md` §8 risk #11): the system reconverges from any perturbation.
+
+## 16. The clock is not the network's (2026-10-01)
+
+**Status:** fixed in code; passed the x86 shell suite 215/0 and a Pi 4 QEMU boot. NOT yet run on Pi 4
+hardware - the card carries the old `net-stack`. *(Run on Pi 4 hardware 2026-10-02 at `5dd1f1b8`, the boot
+`backlog/66` records: `ping` over the radio at one echo a second, 19 of 19.)*
+
+**The coupling.** `net-stack` fetched the wall clock (SNTP: a DNS resolve, then up to three
+send-and-drain tries, up to about fifteen seconds when the server or resolver was silent) INSIDE its single serve loop, and started it three
+ways while the clock was unset: at the end of the dance that configures the network, on the `time`
+service's nudge every twenty seconds, and on ordinary client requests - status, DNS, ping and ARP each
+could start one. For the whole exchange the loop served nobody. Boot 2026-10-01 11:17-11:18 on the Pi 4 shows the
+cost: `ping echo 2 was answered after 7092 ms`, while that same echo's wire round trip was 39 ms. `date sync`
+appeared to cure it only because a success latched the clock and quietened the nudges.
+
+**The decoupling.**
+
+- No client request starts clock work. The per-request retry is gone.
+- Configuring the network does not fetch the clock. The dance ends when the network is configured.
+- `time` pursues the clock, as it owns it: its nudge (op 11) starts a BACKGROUND query. `net-stack` sends it
+  and returns to the loop; the poll step, which already drains frames every `POLL_MS`, records the
+  answer; the loop hands it to `time`, or after a deadline resends or gives up - and says so.
+- The nudge is recorded where it used to be lost. It is one capless byte, `[11]`, and it used to be
+  dropped by the dance and taken for the driver's answer by every driver wait (orphaning the real
+  reply). It is now recorded as owed by the sifted driver waits (`nic_req`, `nic_req_ms`,
+  `nic_drain_ms`), the dance's serve pass and the capless arm, and the loop serves it between requests.
+  A nudge that finds no network stays wanted, and is served on the first pass after the network is
+  configured. **Still NOT covered:** `nic_status_req`'s `try_recv` clear (used by `link_is_up`) discards
+  capless messages, and the unsifted waits in `dns_resolve` (its ARP and its rx-only drain, which would
+  parse the nudge as a frame batch) and the ping drain's ARP acknowledgement eat it. A nudge there is
+  lost, and `time` re-sends it 20 s later.
+- `date sync` (op 10) stays synchronous, because the operator asked and is waiting - the only
+  synchronous fetch apart from the fallback below. On an unleased, unconfigured stack it can run the whole dance first.
+- Where the poll cannot run - `net-stack`'s cycle counter never calibrated - a nudge falls back to the
+  old synchronous fetch, and the log says so: a background query there could never be answered.
+- A nudge that finds the cable in but the stack unconfigured runs the dance first, and the dance still
+  blocks the loop (below).
+- The background query goes straight to the anycast fallback (162.159.200.123, time.cloudflare.com),
+  with no DNS: a DNS lookup would block the loop. A network that blocks that address but allows
+  pool.ntp.org gets a clock only from `date sync`, which resolves the pool first. And a reply that lands
+  while another operation is draining frames is not recorded by the job; it is recovered only by the
+  resend.
+
+**What this does not fix, recorded rather than smoothed over.** Two things still hold the serve loop.
+The dance itself (DHCP and ARP) blocks it while the network is being configured - `backlog/28` and
+`backlog/29` describe the incremental dance that would fix that. And on the Pi 4 every exchange with
+`nic-driver` can cost a second: `backlog/66`, then read as a lost wake-up in the kernel's blocked-receiver
+path. **Corrected 2026-10-08:** no wake was ever shown lost. What later failed `net dns` over the radio was
+`nic-driver` answering a drain that found no frame with an empty message, which the kernel refused on
+every port but ARM32 (fixed in `e3fcf7ed`); the one-second STATUS tax itself had stopped appearing by
+2026-10-04, unexplained (`backlog/66`). The decoupling should remove the multi-second
+stalls the clock caused - not yet run on hardware; it does not touch that one-second tax, and a slow `ping` after this change is that.
+
+### 16.1 Later the same day: the clock leaves `net-stack` entirely
+
+The decoupling above still left clock work inside `net-stack`: the SNTP query and its parsing, the nudge
+and the four places that had to catch it, a bounded wait on `time` for every result it pushed (up to two
+seconds, twice, with every client queued behind it), and `date sync` running the whole exchange in the
+loop. The operator's call: "I don't want it in the way of a ping. We have a time service right?"
+
+**What `net-stack` has now: no clock code, and one generic operation.** Op 12, a UDP ask:
+`[wait_secs, ip(4), port(2), datagram..]`. The datagram goes out at once from a random source port, the
+asker's reply capability is held in a four-slot table (`UdpAsk`), and the loop goes on serving. The poll
+step, which reads every frame anyway, hands the first datagram back from that address and port to that
+source port straight to the asker - `[ASK_OK, payload]` - and a deadline (at most 10 s) answers
+`[ASK_TIMEOUT]`. A reconfigured network answers every open ask `[ASK_ABANDONED]`. It knows nothing about
+what is inside, and it needs no more authority than opening a socket. Op 10 is retired and says so;
+the nudge (op 11), `SET_CLOCK` and the send capability to `time` are gone.
+
+**What `time` has now: the whole NTP client.** It builds the 48-byte query with a hardware-random nonce
+in the transmit timestamp, sends it with op 12 through its existing non-blocking send, and matches the
+answer in its loop by tag - exactly as it already matched `fs` replies. It checks what `net-stack` used
+to check (server mode, a synchronised server, a real stratum, and its own nonce echoed as the originate
+timestamp), and `Clock::set_network` judges plausibility as before. A query with no answer after 8 s is
+given up on, and a late answer to it is refused by its nonce. `OP_SET` is retired: it let any client set
+the clock, and the only caller was `net-stack`. `OP_SYNC` (5) is `date sync`: `time` sends a query at once
+and answers immediately, and the shell watches the sync age in `OP_NOW` drop - bounded at 10 s, `q` quits.
+
+**Why a late answer is safe here** when it was not for the stash (`docs/net-tags-design.md` 7.2): the
+client can tell. A reply that arrives after `time` gave up and asked again carries the old nonce, and
+the new question's check refuses it.
+
+**What is lost, said plainly:** `date sync` no longer resolves `pool.ntp.org` first - every query goes to
+the anycast address (162.159.200.123), because a DNS lookup would block `net-stack`'s loop. A network
+that blocks that address and allows the pool gets no clock. And an NTP answer that lands while another
+operation is draining frames is not delivered by the poll step; `time` gives up after 8 s and asks again.

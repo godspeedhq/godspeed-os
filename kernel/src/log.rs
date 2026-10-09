@@ -8,6 +8,12 @@
 //! amendment makes it the design: `ctx.log()` is syscall 5 writing this ring and serial DIRECTLY, so
 //! logging never depends on a service that can die. Do not wire this up.
 //!
+//! THE BOOT RECORD is the one part of this that IS read. Beside the ring sits a fixed copy of the first
+//! `BOOT_RECORD_SIZE` bytes ever logged, which fills once and then freezes: the ring wraps within
+//! seconds of a busy machine, and the boot is exactly what a reader most often wants back. It is read
+//! by copy (InspectKernel query 27, INTROSPECT-gated), never drained, so reading it changes nothing and
+//! the property above holds - no log line depends on a reader. The shell shows it as `events log boot`.
+//!
 //! Unsafe boundary: none. The ring buffer is protected by a SpinLock.
 
 use core::fmt;
@@ -17,18 +23,32 @@ use crate::smp::SpinLock;
 
 const RING_SIZE: usize = 16 * 1024;
 
+/// How much of the boot the record keeps. A T630 reaches its prompt in about 18 KiB of log; the rest
+/// holds the driver bring-up that follows it. Past this the record is full and stays as it is - later
+/// lines are in the ring and on serial, and the reader says so rather than pretending it has them.
+pub const BOOT_RECORD_SIZE: usize = 32 * 1024;
+
+/// The most one read copies out, so the copy held under the lock (interrupts masked) stays short.
+pub const BOOT_READ_CHUNK: usize = 512;
+
 struct RingBuffer {
     buf: [u8; RING_SIZE],
     head: usize,
     len: usize,
+    boot: [u8; BOOT_RECORD_SIZE],
+    boot_len: usize,
 }
 
 impl RingBuffer {
     const fn new() -> Self {
-        Self { buf: [0u8; RING_SIZE], head: 0, len: 0 }
+        Self { buf: [0u8; RING_SIZE], head: 0, len: 0, boot: [0u8; BOOT_RECORD_SIZE], boot_len: 0 }
     }
 
     fn write_byte(&mut self, b: u8) {
+        if self.boot_len < BOOT_RECORD_SIZE {
+            self.boot[self.boot_len] = b;
+            self.boot_len += 1;
+        }
         let tail = (self.head + self.len) % RING_SIZE;
         if self.len == RING_SIZE {
             // Overwrite oldest byte, advance head.
@@ -107,6 +127,26 @@ pub fn write_fmt(args: fmt::Arguments) {
         let _ = sink.write_fmt(args);
         sink.flush();
     });
+}
+
+/// How many bytes the boot record holds so far (at most `BOOT_RECORD_SIZE`).
+pub fn boot_record_len() -> usize {
+    crate::smp::without_interrupts(|| RING.lock().boot_len)
+}
+
+/// Copy the boot record from `offset` into `out`, returning how many bytes were copied: 0 at or past
+/// the end. A copy, never a drain - the record is the same after any number of reads. Masked for the
+/// reason `write_fmt` states; the caller bounds `out` to `BOOT_READ_CHUNK` so the hold stays short.
+pub fn boot_record_read(offset: usize, out: &mut [u8]) -> usize {
+    crate::smp::without_interrupts(|| {
+        let ring = RING.lock();
+        if offset >= ring.boot_len {
+            return 0;
+        }
+        let n = out.len().min(ring.boot_len - offset);
+        out[..n].copy_from_slice(&ring.boot[offset..offset + n]);
+        n
+    })
 }
 
 /// Drain the ring buffer into a sink.

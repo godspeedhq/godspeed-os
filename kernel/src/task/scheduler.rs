@@ -402,6 +402,54 @@ pub fn task_hw_bdf(slot: usize) -> u32 {
     if slot < MAX_TASKS { TASK_HW_BDF[slot].load(Ordering::Relaxed) } else { 0xFFFF }
 }
 
+/// Whether this task's death is reported to the supervisor and counted as a restart - the SPAWNER's
+/// request (`SPAWN_FLAG_WATCHED`), recorded at every spawn. This replaced two lists of service names: the
+/// kernel no longer knows which services matter, only which tasks it was asked to watch.
+static TASK_WATCHED: [core::sync::atomic::AtomicBool; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TASKS];
+
+/// The device kind this task was granted (`task::kind`, 0 for none or a PCI device), recorded at every
+/// spawn. Lets the kernel find "the task granted the display" without a name for it.
+static TASK_HW_KIND: [core::sync::atomic::AtomicU32; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TASKS];
+
+pub fn set_task_watched(slot: usize, watched: bool) {
+    if slot < MAX_TASKS { TASK_WATCHED[slot].store(watched, Ordering::Release); }
+}
+pub fn task_watched(slot: usize) -> bool {
+    slot < MAX_TASKS && TASK_WATCHED[slot].load(Ordering::Acquire)
+}
+pub fn set_task_hw_kind(slot: usize, kind: u32) {
+    if slot < MAX_TASKS { TASK_HW_KIND[slot].store(kind, Ordering::Release); }
+}
+pub fn task_hw_kind(slot: usize) -> u32 {
+    if slot < MAX_TASKS { TASK_HW_KIND[slot].load(Ordering::Acquire) } else { 0 }
+}
+
+/// The receive endpoint of the live task granted device `kind`, if there is one. A device kind has at
+/// most one holder - a window is granted once - so the first live match is the only one.
+pub fn live_endpoint_of_kind(kind: u32) -> Option<EndpointId> {
+    for i in 0..MAX_TASKS {
+        if TASK_VALID[i].load(Ordering::Acquire)
+            && TASK_HW_KIND[i].load(Ordering::Acquire) == kind
+            && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead
+        {
+            return ep_from_u64(TASK_ENDPOINT[i].load(Ordering::Relaxed));
+        }
+    }
+    None
+}
+
+/// The device this task was given, READ AND RESET to `0xFFFF` in one step.
+///
+/// The record is written only by a DMA driver's spawn, so a slot later reused by any other task would
+/// otherwise INHERIT the device of whoever held it before. While the kill path quiesced by service name
+/// that was invisible; keyed on the record, a probe dying in a slot `xhci` once held would stop the LIVE
+/// `xhci` controller. So the kill path takes the record, and a failed spawn takes it too.
+pub fn take_task_hw_bdf(slot: usize) -> u32 {
+    if slot < MAX_TASKS { TASK_HW_BDF[slot].swap(0xFFFF, Ordering::Relaxed) } else { 0xFFFF }
+}
+
 /// `now_epoch_monotonic()` seconds captured at each task's spawn. Per-service uptime = `now_epoch_monotonic()
 /// - this` (surfaced by `task_stat`), both on the one deglitched monotonic timeline. It was a packed RTC
 /// datetime, which needed an `epoch_secs()` conversion and - fatally - read 0 on a board with no RTC (the
@@ -544,6 +592,18 @@ static WEDGE_PANICKED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 static CORE_LEAVING: PerCore<CachePaddedU64> = PerCore::new();
 
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
+/// This core's interrupt count and idle-halt count AT its last progress stamp (`CORE_LAST_TICK_TSC`).
+///
+/// The liveness panic printed the interrupt count SINCE BOOT, and its comment says that count is what
+/// tells the two wedges apart: a core that stopped receiving its timer, and a core that receives it
+/// but whose handler skips the stamp. A since-boot total cannot do that - it is nonzero in both, and
+/// on the T630 on 2026-10-08 it read 57444 for an idle core 2 that had been dark for 3 s, which says
+/// nothing either way. The panic now subtracts these, so it reports what arrived AFTER the last stamp:
+/// 0 interrupts means the timer stopped reaching the core; any more means the stamp is being skipped.
+/// The halt count says the same of the idle path: a core that halted after its last stamp and took
+/// nothing since went to sleep with no wake armed.
+static CORE_IRQS_AT_STAMP: PerCore<CachePaddedU64> = PerCore::new();
+static CORE_HALTS_AT_STAMP: PerCore<CachePaddedU64> = PerCore::new();
 /// A wake that arrived for a task which was RUNNABLE at the time, and so left no other trace.
 ///
 /// The block-then-wake handshake detects a racing wake by CAS: `block_and_reschedule` moves the task
@@ -702,6 +762,8 @@ pub fn init_arenas(n: usize) {
     CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LAST_TICK_TSC.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_IRQS_AT_STAMP.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
+    CORE_HALTS_AT_STAMP.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LEAVING.init_with(n, |_| CachePaddedU64(AtomicU64::new(IDLE as u64)));
     CORE_IDLE_HALTS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
@@ -1577,6 +1639,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // shootdown/critical-section is milliseconds, so the ~3 s deadline cannot false-fire.
         let now = crate::arch::imp::read_cycle_counter();
         CORE_LAST_TICK_TSC.get(cid).0.store(now, Ordering::Relaxed);
+        // What this core had taken at this stamp, so a panic can say what came AFTER it (see
+        // `CORE_IRQS_AT_STAMP`). Two relaxed stores per tick; the reader is a panic.
+        let (irqs_now, _) = crate::arch::imp::core_irq_debug(cid as u32);
+        CORE_IRQS_AT_STAMP.get(cid).0.store(irqs_now as u64, Ordering::Relaxed);
+        CORE_HALTS_AT_STAMP.get(cid).0.store(CORE_IDLE_HALTS.get(cid).0.load(Ordering::Relaxed), Ordering::Relaxed);
         // The deadline comes from the ARCH, in the same units as `read_cycle_counter`, because the two
         // must agree and only the arch knows both. It used to be derived here from
         // `tsc_ticks_per_quantum() * 300`, which silently disabled the whole watchdog on any arch whose
@@ -1610,7 +1677,16 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     // The IRQ tally is what tells a reader WHICH wedge this is: a frozen count
                     // means the core is not taking interrupts at all, a climbing one means it is and
                     // the tick inside the handler is being skipped. Same symptom, opposite causes.
+                    // One since-boot reading shows neither - frozen and climbing need two - which is why
+                    // the panic now prints the count since the core's last stamp (`CORE_IRQS_AT_STAMP`).
                     let (irqs, last_src) = crate::arch::imp::core_irq_debug(other as u32);
+                    // SINCE THE LAST STAMP, which is the reading that separates the two causes; the
+                    // since-boot total above cannot (see `CORE_IRQS_AT_STAMP`). The count is a u32
+                    // on every arch, so the difference is taken in u32 and survives a wrap.
+                    let irqs_at = CORE_IRQS_AT_STAMP.get(other).0.load(Ordering::Relaxed) as u32;
+                    let irqs_since = irqs.wrapping_sub(irqs_at);
+                    let halts_since = CORE_IDLE_HALTS.get(other).0.load(Ordering::Relaxed)
+                        .wrapping_sub(CORE_HALTS_AT_STAMP.get(other).0.load(Ordering::Relaxed));
                     // SAY "IDLE" WHEN IT WAS IDLE. `CORE_CURRENT` holds `IDLE` (== MAX_TASKS) when a
                     // core has nothing to run, and printing that as "last running task slot 224" sent
                     // a reader hunting a task that does not exist - 224 is not a slot, it is the
@@ -1642,9 +1718,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     }
                     panic!(
                         "LIVENESS WEDGE: core {} made NO progress for {} counter ticks ({}x the {} \
-                         allowed); it was running {} {} '{}'; it has taken {} timer interrupts, last vector \
-                         {:#010x}; detected by core {}. No forward progress = loud stop.",
-                        other, dark, dark / deadline, deadline, what, slot_num, stuck_name, irqs, last_src, cid
+                         allowed); it was running {} {} '{}'; since its last stamp it has taken {} timer \
+                         interrupts and halted {} times in idle ({} timer interrupts since boot, last vector \
+                         {:#010x}); detected by core {}. No forward progress = loud stop.",
+                        other, dark, dark / deadline, deadline, what, slot_num, stuck_name, irqs_since,
+                        halts_since, irqs, last_src, cid
                     );
                 }
             }
@@ -2340,6 +2418,14 @@ pub fn kill_task_by_slot(slot: usize) {
             crate::capability::table::mark_dead_resource(
                 crate::capability::cap::ResourceId::from(rep_id));
             TASK_REPLY_ENDPOINT[slot].store(0, Ordering::Relaxed);
+            // A watched task's mailbox is owed back to its respawn (`routing::MAILBOX_CREDITS`,
+            // `backlog/74`): the reserve would refuse it, and the respawn needs it as much as the boot
+            // instance did. `TASK_WATCHED` still holds this task's value - it is only set by a spawn.
+            // The supervisor too: the kernel respawns it, so it is not watched, and its respawn needs its
+            // mailbox back like any other (the spawn side says the same, `task::spawn`).
+            if task_watched(slot) || task_name == "supervisor" {
+                crate::ipc::routing::bank_mailbox_credit();
+            }
             // RECLAIM THE ID, exactly as the primary endpoint's is reclaimed below. Without this a
             // spawn took TWO ids and a death gave ONE back, so every restart leaked one id and a
             // sustained restart storm marched the counter into the delegated/file-cap band and
@@ -2503,16 +2589,14 @@ pub fn kill_task_by_slot(slot: usize) {
         // restart when it dies + gets respawned. A transient utility the shell re-invokes (observe-*,
         // greet, ...) is never bumped, so it never shows a restart - RESTARTS means "blew up and was
         // recovered", not "legitimately closed". The respawn reads the new count via next_restart_count.
-        // `time` and `control` were missing here too, which is the SECOND half of the same hardware
-        // symptom: even once their deaths notify the supervisor, a name absent from THIS set never
-        // accrues a restart, so `observe` reports 0 for a service that died 41 times. The operator's
-        // only view of recovery said nothing happened.
-        if matches!(task_name,
-            "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console" | "supervisor"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
-            // hw-enumerator is MANAGED, so its death is a restart like any other - and a restart that
-            // is not COUNTED cannot be observed: `observe` would report 0 for a service that died.
-            | "hw-enumerator")
+        // WATCHED, NOT NAMED. This was a list of service names (two lists, this and the notification set
+        // below, about nineteen names between them), and every service added to the
+        // supervisor's roster had to be added here too - `time` and `control` were missed once, and a
+        // storm that killed them 41 times showed 0 restarts in `observe`. The SUPERVISOR now says, in the
+        // spawn request, which tasks it manages (`SPAWN_FLAG_WATCHED`), so the kernel holds no roster and
+        // cannot disagree with one. The supervisor itself is the one name the kernel knows, because the
+        // kernel spawns and respawns it.
+        if task_watched(slot) || task_name == "supervisor"
         {
             bump_name_restart(task_name);
         }
@@ -2520,14 +2604,12 @@ pub fn kill_task_by_slot(slot: usize) {
         // Restartable-service death notification. These are restartable userspace services (not
         // trusted root): when one dies, notify the supervisor over its death-notification endpoint so
         // it respawns the service IMMEDIATELY - its own death, not only a lucky supervisor respawn.
-        // The set: `fs` + `block-driver` (Phase D); `shell` (the user's prompt); and the drivers
-        // `xhci` / `ehci` + `events`. Without the drivers here, a `chaos max-carnage` that killed
-        // them in its last rounds left them dead until the supervisor happened to be respawned (it
-        // re-runs its boot sequence and re-spawns them) - so the keyboard could stay dead. Now their
-        // own death respawns them. `fs` re-mounts via its journal (Phase C); clients reacquire by
-        // name via the kernel directory (§14.3). "Nothing escapes" - every service recovers; the
-        // kernel is the only unkillable thing.
-        // Gated to this NAMED set so ordinary probe/app churn never floods the supervisor.
+        // The set is every task spawned `SPAWN_FLAG_WATCHED` - the supervisor's `MANAGED` roster - and
+        // the kernel names none of them. It was once a named set (`fs`, `block-driver`, `shell`, the USB
+        // drivers, `events`), and a driver missing from it stayed dead after a storm until a lucky
+        // supervisor respawn. `fs` re-mounts via its journal (Phase C); clients reacquire by name via the
+        // kernel directory (§14.3). "Nothing escapes" - every service recovers; the kernel is the only
+        // unkillable thing. Gated to WATCHED tasks so ordinary probe/app churn never floods the supervisor.
         // `enqueue_from_interrupt` is the kernel→endpoint path (no cap needed); wake the supervisor.
         // `counter` (examples/counter) is restartable too: it persists its state to `fs` and
         // reconstructs it on respawn (§14/§15), so its own death notifies the supervisor, which
@@ -2546,21 +2628,20 @@ pub fn kill_task_by_slot(slot: usize) {
         // both, because the counter tracks the notification path. A service that recovers by luck reads
         // as a service that never fell over.
         //
-        // The rule is now DERIVED and enforced (`V-managed-watched`): every name the supervisor manages
-        // must appear here. Two lists describing one fact is the shape that caused this, and it is the
-        // third time this session (ARM_SERVICES vs arm_built was the second).
+        // The rule is now one fact in one place: the supervisor marks what it manages WATCHED, and
+        // `V-managed-watched` checks that chain. Two lists describing one fact is the shape that caused
+        // this, and it was the third time (ARM_SERVICES vs arm_built was the second).
         // The terminal died, so nothing is rendering the display any more. Hand the screen back to the
         // kernel's boot floor until the respawned instance takes it, or the machine goes dark with no
         // way to say why (invariant 12).
-        if task_name == "console" {
+        // The task granted the DISPLAY, not whatever is called `console`: the kernel gave it the framebuffer
+        // and takes it back from the same record.
+        if task_hw_kind(slot) == crate::task::kind::FRAMEBUFFER {
             crate::bootcon::reclaim_on_death();
         }
-        if matches!(task_name, "fs" | "block-driver" | "shell" | "xhci" | "ehci" | "events" | "console"
-            | "counter" | "nic-driver" | "net-stack" | "dwc2" | "time" | "control"
-            // hw-enumerator: MANAGED, so its death must REACH the supervisor. Without this it would
-            // still come back - on the next reconcile sweep - which is exactly why the omission hides:
-            // not dead forever, just dead for a while, and nothing says so.
-            | "hw-enumerator") {
+        // Reported to the supervisor because the supervisor ASKED, at spawn, to hear of this task's death -
+        // not because its name is on a list here. See the restart counter above.
+        if task_watched(slot) {
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
                 crate::ipc::message::Message::new(task_name.as_bytes()),
@@ -2624,25 +2705,27 @@ pub fn kill_task_by_slot(slot: usize) {
         // so nothing else stops the stray write. We clear PCI Bus-Master-Enable BEFORE the frame reclaim
         // below (the controller cannot start new DMA; any in-flight transaction drains during the kill's
         // remaining work + the spin-wait); the respawned driver re-enables bus-mastering during init.
-        // block-driver (AHCI) is included; xhci is confined (its stray DMA would fault, not corrupt) but
-        // quiescing it too is harmless + correct on a no-IOMMU machine where it is passthrough as well.
-        if task_name == "xhci" || task_name == "ehci" || task_name == "block-driver"
-            || task_name == "nic-driver"
-        {
-            use core::sync::atomic::Ordering::Relaxed;
+        // xhci is confined (its stray DMA would fault, not corrupt) but quiescing it too is harmless +
+        // correct on a no-IOMMU machine where it is passthrough as well.
+        //
+        // KEYED ON THE DEVICE THIS TASK WAS GIVEN, not on its name. This was a list of four names (xhci,
+        // ehci, block-driver, nic-driver), so a fifth DMA driver - audio-driver - died with its
+        // controller still mastering until somebody remembered to add it. The record is written only by
+        // a DMA driver's spawn, so it IS the question, and the kernel learns nothing it did not hold.
+        let bdf = take_task_hw_bdf(slot);
+        if bdf != 0xFFFF {
             use crate::arch::imp::pci;
             // THE DEVICE THIS TASK WAS GIVEN, remembered from its own spawn - not a table of which
-            // service drives which controller. See `TASK_HW_BDF`. A task that drives nothing reports
-            // 0xFFFF and the quiesce below is skipped, which is also the fix for the old default arm
-            // quiescing the DISK on the death of any service it did not recognise.
-            let bdf = task_hw_bdf(slot);
+            // service drives which controller. See `TASK_HW_BDF`. TAKEN, not read: see
+            // `take_task_hw_bdf` for what a stale record in a reused slot would otherwise stop.
             pci::clear_bus_master(bdf);
             // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
-            // cleanly (no-op if the device wasn't confined). Confined USB drivers (xhci/ehci) only; AHCI
-            // + nic-driver run in IOMMU passthrough, so there is no DTE to revert.
-            if task_name == "xhci" || task_name == "ehci" {
-                crate::arch::imp::iommu::release_device(bdf);
-            }
+            // cleanly. For ANY device, not by name: this was `xhci`/`ehci` only, so a third confined
+            // driver (audio-driver) would have leaked its I/O page table on every restart, the respawn
+            // overwriting the record that pointed at it. `release_device` looks the device up in its
+            // own table of confined devices and does nothing for one that was never confined (AHCI and
+            // nic-driver run in passthrough), so asking for every device is exact, not approximate.
+            let _ = crate::arch::imp::iommu::release_device(bdf);
         }
 
         // SMP safety: spin until no other core has CORE_CURRENT[c] == slot.

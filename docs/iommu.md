@@ -19,6 +19,8 @@
 >    `kernel/src/task/mod.rs`), and `nic-driver` is
 >    spawned `confine=false`. "Confinement is applied per driver" (§6.4) is doing
 >    more work in that sentence than it looks: today it selects exactly one.
+>    *(2026-10-03: two - `audio-driver` is confined too, verified in QEMU only; on the
+>    T630 it does not use DMA yet, so there `xhci` is still the one. CLAUDE.md §6.4.)*
 
 This is the narrative behind H1, the flagship trusted-base reduction. The spec
 (`CLAUDE.md`) is the authority; this document explains the *why* and the *how*.
@@ -48,6 +50,15 @@ central promise - "no ambient authority" - has a hole exactly the size of a DMA
 engine.
 
 ## 2. The mechanism: an IOMMU translation domain per driver
+
+> **Corrected 2026-10-08: until today every confined device got the SAME domain ID, 1.** The page table
+> was per device, as below, but the ID that tags the IOMMU's cached translations was shared, on the
+> reasoning that each device only reaches its own arena. AMD-Vi caches translations and page directory
+> entries by domain ID, so two devices with different tables under one ID can be translated through each
+> other's cached entries. It was harmless while `xhci` was the only confined device, and became live
+> when the audio controller was confined beside it (2026-10-03). Each device's ID is now its BDF plus
+> one (`domain_of`), so the logs below that say `domain 1` are from before the fix. Found under an
+> `xhci` that stopped completing commands mid-chaos on the T630 (`docs/wifi-usb.md` 51).
 
 An IOMMU (AMD calls it AMD-Vi) sits between devices and memory and translates
 every device DMA through a per-device page table, exactly as the MMU translates
@@ -276,7 +287,8 @@ amendment fixed:
      iommu: confined BDF 00:10.0 -> domain 1 arena 0x1cf9000..0x1e1d000 (292 pages); DTE invalidated
      ```
 
-     So the only confined driver in the system holds no path to its own MSI message.
+     So the only driver confined on the T630 holds no path to its own MSI message. (`audio-driver`,
+     confined in QEMU since 2026-10-03, is the same case: QEMU's HD Audio controller uses plain MSI.)
    - **MSI-X (capability 0x11)** keeps the message table in **MMIO inside a BAR** (`bir=0` on
      every controller observed here, so BAR0 - the window a driver is granted), and the driver
      holds that BAR. A compromised driver could point its own interrupt elsewhere. Observed on

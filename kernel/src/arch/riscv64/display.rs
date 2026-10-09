@@ -205,8 +205,8 @@ const CLK_ENABLE: u32 = 1 << 31;
 
 /// Reset registers: id `n` is bit `n % 32` of the word at `offset + (n / 32) * 4`, and DEASSERTING
 /// is clearing that bit, then waiting for the matching status bit to follow.
-const SYSCRG_RESET_ASSERT: usize = 0x2f8;
-const SYSCRG_RESET_STATUS: usize = 0x308;
+pub(super) const SYSCRG_RESET_ASSERT: usize = 0x2f8;
+pub(super) const SYSCRG_RESET_STATUS: usize = 0x308;
 const VOUTCRG_RESET_ASSERT: usize = 0x48;
 const VOUTCRG_RESET_STATUS: usize = 0x4c;
 

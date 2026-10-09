@@ -225,11 +225,30 @@ impl<'a> Fdt<'a> {
         want: &[&str],
         out: &mut [Option<u32>],
     ) -> Option<Reg> {
+        self.find_compatible_nth(compat, 0, want, out)
+    }
+
+    /// As [`Self::find_compatible`], for the `n`th matching node in tree order (0 is the first).
+    ///
+    /// For a SoC with several instances of one block under one `compatible` - the JH7110's two SD hosts are
+    /// both `starfive,jh7110-mmc` - where WHICH instance is wired to what is the board's fact, stated by the
+    /// caller that knows it. Nodes are told apart by name, as the second pass below always has.
+    pub fn find_compatible_nth(
+        &self,
+        compat: &str,
+        n: usize,
+        want: &[&str],
+        out: &mut [Option<u32>],
+    ) -> Option<Reg> {
         let mut target: Option<&'a str> = None;
+        let mut seen = 0usize;
         self.walk(|node, prop, val, _, _| {
             if prop == "compatible" && val.split(|&c| c == 0).any(|s| s == compat.as_bytes()) {
-                target = Some(node);
-                return true;
+                if seen == n {
+                    target = Some(node);
+                    return true;
+                }
+                seen += 1;
             }
             false
         });

@@ -93,6 +93,16 @@ pub enum SyscallNumber {
     /// whichever register the other selected. Atomic here, that window does not exist - and a caller
     /// can no longer WRITE anything at all, which is strictly less authority than the pair carried.
     PciCfgRead             = 53,
+    /// Cut (`arg0 = 0`) or restore (`arg0 = 1`) the power of the one device whose fixed peripheral
+    /// window the caller holds. Gated by `DEVICE_POWER`, which only the holder of such a window is
+    /// minted. The kernel resolves the device behind the caller's grant in `arch/` and drives its
+    /// power there; it learns nothing about what the device is or why the holder asked. Mechanism:
+    /// the grant the kernel made at spawn, made renewable (§12.3 amendment 2026-10-01).
+    DevicePower            = 54,
+    /// Set the Arm cores to the platform's minimum (`arg0 = 0`) or maximum (`arg0 = 1`) clock, and return
+    /// the rate they read back in Hz. Gated by `CPU_CLOCK`, which the `power` service alone is spawned
+    /// with. The kernel learns two rates and nothing about why one is wanted (`docs/power.md`).
+    CpuClock               = 55,
 }
 
 /// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
@@ -165,6 +175,8 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::ResourceRevoke as u64 => handle_resource_revoke(arg0),
         n if n == SyscallNumber::LastRecvBadge  as u64 => scheduler::take_last_recv_badge() as i64,
         n if n == SyscallNumber::PciCfgRead as u64 => handle_pci_cfg_read(arg0, arg1),
+        n if n == SyscallNumber::DevicePower as u64 => handle_device_power(arg0),
+        n if n == SyscallNumber::CpuClock as u64 => handle_cpu_clock(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -286,12 +298,14 @@ const CONSOLE_LOSS_REPORT: u64 = 100;
 fn deliver_to_console_service(bytes: &[u8]) -> i64 {
     // Never feed the console's own output back to it. Nothing does this today (the service logs through
     // the serial log path, not the console path), but the loop it would make is unbounded and silent.
-    if scheduler::task_stat(scheduler::current_task_slot()).name == "console" {
+    // THE CONSOLE IS THE TASK GRANTED THE DISPLAY, not whatever is called `console`: the kernel granted
+    // that task the framebuffer, so it already knows who renders it, and needs no name for it.
+    if scheduler::task_hw_kind(scheduler::current_task_slot()) == crate::task::kind::FRAMEBUFFER {
         return 0;
     }
     // No terminal on this machine (or not up yet): serial already has the bytes, which is the whole
     // guarantee. Return without blocking - there is nothing to wait for.
-    let Some(ep) = crate::ipc::names::lookup("console") else { return 0 };
+    let Some(ep) = scheduler::live_endpoint_of_kind(crate::task::kind::FRAMEBUFFER) else { return 0 };
     let Ok(msg) = crate::ipc::message::Message::new(bytes) else { return 0 };
 
     let my_slot = scheduler::current_task_slot();
@@ -421,7 +435,7 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 // Copy payload to the caller's user-space buffer.
                 let payload  = msg.payload_bytes();
                 let copy_len = payload.len().min(buf_len);
-                if !write_user_bytes(out_buf, &payload[..copy_len]) {
+                if !copy_out(out_buf, &payload[..copy_len]) {
                     return -1;
                 }
                 return copy_len as i64;
@@ -473,7 +487,7 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             }
             let payload  = msg.payload_bytes();
             let copy_len = payload.len().min(buf_len);
-            if !write_user_bytes(out_buf, &payload[..copy_len]) {
+            if !copy_out(out_buf, &payload[..copy_len]) {
                 return -1;
             }
             copy_len as i64
@@ -533,7 +547,7 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 }
                 let payload  = msg.payload_bytes();
                 let copy_len = payload.len().min(buf_len);
-                if !write_user_bytes(out_buf, &payload[..copy_len]) { break -1; }
+                if !copy_out(out_buf, &payload[..copy_len]) { break -1; }
                 break copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
@@ -666,15 +680,31 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // Helpers.
 // ---------------------------------------------------------------------------
 
+/// Copy a received payload out to the receiver. An empty one copies nothing and succeeds, on every port
+/// (see `build_message`): it was refused by the arch's range check, which failed the receive after the
+/// message had already been taken off the queue.
+fn copy_out(dst: u64, bytes: &[u8]) -> bool {
+    bytes.is_empty() || write_user_bytes(dst, bytes)
+}
+
 /// Build a kernel `Message` from a user-space pointer + length.
 fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
     let len = msg_len as usize;
     if len > MAX_MESSAGE_SIZE {
         return Err(ipc_err_to_i64(IpcError::MessageTooLarge));
     }
-    let bytes = match read_user_bytes(msg_ptr, len) {
-        Some(b) => b,
-        None    => return Err(-1),
+    // An EMPTY message is a message, on every port. Each arch's `read_user_bytes` refuses an empty range
+    // except arm32's, so a zero-length send failed on x86, AArch64 and RISC-V and worked on the Pi 2 -
+    // and nic-driver answers a drain that found no frame with exactly that (backlog/66): the reply was
+    // refused, net-stack waited out its second, and over the radio, where most drains are empty, `net
+    // dns` ran out of time. No bytes are read for no bytes; the pointer is not looked at.
+    let bytes: &[u8] = if len == 0 {
+        &[]
+    } else {
+        match read_user_bytes(msg_ptr, len) {
+            Some(b) => b,
+            None    => return Err(-1),
+        }
     };
     let mut msg = Message::new(bytes).map_err(|e| ipc_err_to_i64(e))?;
     // Stamp the sender's primary endpoint (kernel-set, unforgeable by userspace - the payload cannot
@@ -861,6 +891,9 @@ const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
 /// `core` is a STRICT placement (a restart's `--core N`), not a table's PREFERRED core. See §9.2 and
 /// the SDK constant of the same name for why conflating the two stops a machine booting.
 const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
+/// Report this task's death to the supervisor and count it as a restart. The SPAWNER says so; the kernel
+/// keeps no list of which services matter (`docs/audio.md`, "No service names in the kernel").
+const SPAWN_FLAG_WATCHED: u32 = 1 << 4;
 /// Mint the child's peer caps with GRANT (§22 Test 5A). See the SDK constant.
 const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 /// Ceiling on a caller-requested DMA arena, in 4 KiB pages. 2048 = 8 MiB, comfortably above the
@@ -1108,6 +1141,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.dma_pages,
         req.bdf,
         req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
+        req.flags & SPAWN_FLAG_WATCHED     != 0,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it
@@ -1544,7 +1578,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 /// rights - never wider - and the GRANT gate means the caller could already transfer
 /// the whole cap wholesale, so duplicating it grants no authority it lacked. Endpoint
 /// caps already permit many concurrent senders, so duplication matches the IPC model.
-/// The generation check inside `lookup_cap` also forbids deriving from a stale cap.
+/// The generation check inside `current_task_lookup_cap` also forbids deriving from a stale cap.
 fn handle_derive_cap(held_slot: u64, _a1: u64, _a2: u64) -> i64 {
     let held = match scheduler::current_task_lookup_cap(held_slot as usize, Rights::GRANT) {
         Ok(c)  => c,
@@ -1796,7 +1830,7 @@ fn do_call(
                     break ipc_err_to_i64(IpcError::MessageTooLarge);
                 }
                 let copy_len = payload.len().min(reply_buf_cap);
-                if !write_user_bytes(buf_ptr, &payload[..copy_len]) { break -1; }
+                if !copy_out(buf_ptr, &payload[..copy_len]) { break -1; }
                 break copy_len as i64;
             }
             Err(IpcError::QueueEmpty) => {
@@ -2193,6 +2227,30 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // whole reason the splice cost two wrong diagnoses before it was understood. 0 means every
         // diagnostic this boot was emitted cleanly.
         26 => crate::arch::imp::serial_unlocked_emit_count() as i64,
+        // 27: the BOOT RECORD - a fixed copy of the first bytes ever logged, which never wraps
+        // (`log.rs`). arg2 = 0 asks its size: arg1 = 0 the bytes held, arg1 = 1 its capacity, so a
+        // reader can tell a full record from a short boot. Otherwise arg1 = offset and arg2 = a user
+        // buffer of `BOOT_READ_CHUNK` bytes; returns the bytes copied, 0 at the end. A copy, never a
+        // drain, so reading changes nothing. Gated like everything off the ungated list: the boot log
+        // names every service and device on the machine.
+        27 => {
+            if arg2 == 0 {
+                return match arg1 {
+                    0 => crate::log::boot_record_len() as i64,
+                    1 => crate::log::BOOT_RECORD_SIZE as i64,
+                    _ => -1,
+                };
+            }
+            let mut chunk = [0u8; crate::log::BOOT_READ_CHUNK];
+            let n = crate::log::boot_record_read(arg1 as usize, &mut chunk);
+            if n == 0 {
+                return 0;
+            }
+            if !write_user_bytes(arg2, &chunk[..n]) {
+                return -1;
+            }
+            n as i64
+        }
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;
@@ -2614,6 +2672,58 @@ const NET_FRAME_MAX: usize = 1600;
 // (§26.10, docs/service-ownership.md D2). This is the whole of the kernel's involvement.
 // ---------------------------------------------------------------------------
 
+/// DevicePower (54): `arg0` = 0 to cut the power of the caller's device, 1 to restore it. Gated by
+/// `DEVICE_POWER_RESOURCE` + WRITE, which is minted only to a service granted a fixed peripheral window
+/// whose device the arch layer can power - so the device is identified by the GRANT, through the device
+/// KIND this task was granted, never by an argument or a name. Returns 0 only when the pin reads back at
+/// the level asked for, -1 otherwise (no power control for that device, or a request that did not take).
+///
+/// WHY THIS IS MECHANISM AND NOT A SEVENTH RESPONSIBILITY: the kernel already owns the device grant
+/// (§12.3), and a grant includes power - it powers the Pi 4's SD domain at boot before the radio's
+/// window can mean anything. What it could not do was renew that grant. The decision to cut power -
+/// when, and whether at all - is the driver's (26.10); what the kernel learns is which pin, in `arch/`.
+fn handle_device_power(on: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::DEVICE_POWER_RESOURCE, Rights::WRITE) {
+        crate::kprintln!("device-power: refused - caller does not hold DEVICE_POWER");
+        return CapError::CapNotHeld as i64;
+    }
+    // BY THE DEVICE KIND THIS TASK WAS GRANTED, not by its name: this resolved the pin from the caller's
+    // name, so any task called `wifi-driver` that held the capability reached the radio's power pin.
+    let slot = scheduler::current_task_slot();
+    let name = scheduler::task_name(slot);
+    if crate::arch::imp::device_power(scheduler::task_hw_kind(slot), on != 0) {
+        crate::kprintln!("device-power: '{}' turned its device {}", name, if on != 0 { "ON" } else { "OFF" });
+        0
+    } else {
+        crate::kprintln!("device-power: '{}' asked for its device {} and this machine has no control over it",
+                         name, if on != 0 { "ON" } else { "OFF" });
+        -1
+    }
+}
+
+/// CpuClock (55): `arg0` = 0 for the platform's minimum Arm clock, 1 for its maximum. Gated by
+/// `CPU_CLOCK_RESOURCE` + WRITE. Returns the rate the cores read back afterwards, in Hz, or -1 where this
+/// machine gives the OS no control over its clock (every port but the Pi 4 today).
+///
+/// MECHANISM, NOT A SEVENTH RESPONSIBILITY: the kernel already owns the firmware mailbox - the SD power,
+/// the GPIO expander, the radio's power cut - and this is one more request on it. Only two rates are on
+/// offer, the firmware's own minimum and maximum, so the caller cannot ask for a value the firmware did
+/// not choose. When to be fast and for how long is the `power` service's (26.10).
+fn handle_cpu_clock(max: u64) -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::CPU_CLOCK_RESOURCE, Rights::WRITE) {
+        crate::kprintln!("cpu-clock: refused - caller does not hold CPU_CLOCK");
+        return CapError::CapNotHeld as i64;
+    }
+    match crate::arch::imp::cpu_clock(max != 0) {
+        Some(hz) => hz as i64,
+        None => {
+            crate::kprintln!("cpu-clock: asked for the {} rate and this machine has no control over its clock",
+                             if max != 0 { "maximum" } else { "minimum" });
+            -1
+        }
+    }
+}
+
 /// PciCfgRead (53): `arg0` = configuration selector, `arg1` = register offset. Gated by
 /// `PCI_CFG_RESOURCE` + READ.
 ///
@@ -2720,7 +2830,7 @@ fn handle_usb_disk_info() -> i64 {
 /// A USB-disk syscall's "the device NAKed, re-ask" answer.
 ///
 /// Deliberately OUTSIDE the capability-error range (-2..-7, `cap_err_to_i64`). BUSY was first given
-/// `-2`, which is `CapNotHeld` - so a task calling these syscalls WITHOUT the `USB_DISK` capability got
+/// `-2`, which is `CapNotHeld` - so a task calling these syscalls WITHOUT the `USB_DISK_RESOURCE` capability got
 /// the same answer as one whose device was merely occupied. `block-driver` believes the second reading
 /// and re-asks 6000 times before reporting "the device stayed busy, it did not fail", which is a false
 /// diagnosis of an authority failure, and `fs` then degrades storage on the strength of it (Invariant

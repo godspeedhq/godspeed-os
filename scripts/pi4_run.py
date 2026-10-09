@@ -60,6 +60,11 @@ def main():
     # does not touch the filesystem still runs. The flag is here because attaching the drive is the
     # half we control; the missing half is emulation, and that is recorded rather than worked around.
     ap.add_argument("--drive", default=None, help="raw disk image to attach as USB mass storage")
+    # A command that runs for minutes (a chaos storm) reads the serial line itself, so the fixed 4 s gap
+    # typed the NEXT command into it and lost it. With this, each command after the first waits for a
+    # fresh prompt - or the run's bound - before it is typed.
+    ap.add_argument("--await-prompt", action="store_true",
+                    help="type each later --cmd only after a new gsh> prompt appears")
     args = ap.parse_args()
 
     profile = "debug" if args.debug else "release"
@@ -99,7 +104,13 @@ def main():
     # newline before the real commands (an empty line the shell ignores) to absorb the drop.
     if args.cmd:
         p.stdin.write(b"\n"); p.stdin.flush(); time.sleep(0.5)
-    for c in args.cmd:
+    prompts_before = 0
+    for i, c in enumerate(args.cmd):
+        if args.await_prompt and i > 0:
+            while time.time() - t < args.secs and bytes(buf).count(b"gsh>") <= prompts_before:
+                time.sleep(0.5)
+            time.sleep(2.0)
+        prompts_before = bytes(buf).count(b"gsh>")
         for ch in (c + "\n").encode():
             p.stdin.write(bytes([ch])); p.stdin.flush(); time.sleep(args.chardelay)
         time.sleep(4.0)
@@ -114,8 +125,13 @@ def main():
         except Exception as e:
             print(f"screendump FAILED: {e}")
 
+    # WAIT OUT THE BOUND EVEN WHEN COMMANDS WERE TYPED. This used to stop the moment the last command had
+    # been sent, so under TCG - where one shell command takes 10 to 30 s - the output of everything after
+    # the first command or two was simply never captured, and a run that typed seven `help` forms
+    # showed one of them and looked like a hang. `--secs` is the whole run, typing included; a command
+    # whose output is wanted needs the bound to cover its execution.
     end = time.time() + max(0.0, args.secs - (time.time() - t))
-    while time.time() < end and not args.cmd:
+    while time.time() < end:
         time.sleep(0.2)
 
     data = bytes(buf)

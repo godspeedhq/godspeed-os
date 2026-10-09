@@ -11,6 +11,40 @@
 # No part may declare a `fn` or a `let` another part uses: each is interpreted on its own, with a
 # fresh variable table. What DOES carry across is the working directory and the disk.
 
+# ---- wifi: the PARSE contract, asserted; the radio, reported -----------------------------------
+#
+# `wifi` is the wireless link verb (`utilities/56_wifi.md`). The radio itself does not exist yet -
+# `docs/wifi.md` has the phases - so what is worth asserting here is the part that is already final and
+# stays final: the shape of the command.
+#
+# WHY THESE ARE THE ASSERTIONS AND `assert ok wifi` IS NOT. Asking about wireless on a machine with no
+# radio is not an error, so bare `wifi` succeeds today; on a machine whose driver is running but not yet
+# wired it deliberately fails, because implying the radio is fine when the shell cannot reach it is the
+# silent fallback invariant 12 forbids. An assertion over that line would therefore pass now and break
+# the day somebody finishes phase 1 - a landmine planted for the person doing the work. So the verdict
+# below is REPORTED, the way the lease check above reports, and only the refusals are asserted.
+echo '===== wifi: the command shape (the radio is phase 1, docs/wifi.md) ====='
+assert ok wifi help
+assert ok wifi version
+# A bare subcommand that needs an argument must say so rather than guess.
+assert fails wifi join
+assert fails wifi forget
+assert fails wifi radio
+# `radio` takes two words and no others.
+assert fails wifi radio sideways
+# An unknown subcommand is refused by name, never silently treated as `wifi status`.
+assert fails wifi nonsense
+# THE PASSPHRASE MUST NOT BE ACCEPTED AS AN ARGUMENT. This is the assertion that defends a security
+# decision rather than a behaviour: a passphrase on the command line is recalled by up-arrow and
+# written to /.gsh_history, so `connect` takes an SSID and nothing else. If this ever starts passing,
+# somebody has added a convenience that leaks a secret to disk.
+assert fails wifi join SomeSSID hunter2
+# And the radio itself, reported rather than asserted (see the note above). Under `if`, so its words
+# print and a radio that is down - or absent - counts as nothing. This was `for line in (wifi) { ... }`,
+# which failed every run since bare `wifi` became its usage (rule 1) and was never capturable anyway:
+# the ONE failure of the whole suite, which the summary could not even name (2026-10-02).
+if wifi status { echo 'wifi: reported above' } else { echo 'wifi: reported above (the radio is not up, or not here - not a selfcheck failure)' }
+
 # ---- network: RECEIVE must work, checked without sending anything ----------------------------
 #
 # A pure READ of state: it asks what already happened, it does not make anything happen.

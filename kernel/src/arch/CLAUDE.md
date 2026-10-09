@@ -211,8 +211,15 @@ on `write_page_table_base` to flush. (kernel-audit Audit 5, Findings 3/4 - doc c
 
 **Every `arch::imp` primitive owes a documented SEMANTIC, not just a signature (SEC-27).** When you add
 `arch/<isa>/`, treat each primitive's memory-ordering, TLB, and broadcast behaviour as part of the
-contract: `write_page_table_base` flushes the old ASID's non-global TLB; `invalidate_tlb_page` covers the
-VA on the required cores; the atomics keep the ordering item 1 assumes. Matching the x86 *signature* is
+contract: `invalidate_tlb_page` covers the VA on the required cores, and an address-space switch drops
+the outgoing space's translations. **Where that drop happens differs, and the difference is a trap.** On
+x86 `write_page_table_base` is a CR3 write that flushes as a side effect, and on riscv64 it is a `satp`
+write followed by `sfence.vma`; on arm32 and aarch64 it is a bare
+`TTBR0` write plus `isb` and flushes NOTHING - those ports flush in `switch_context` instead (aarch64
+writes TTBR0, then `isb`, then `tlbi`, on every switch: `backlog/72`). So `smp/ipi.rs`'s full-flush
+sentinel, which reloads the base through `write_page_table_base`, flushes on x86 and riscv64 only.
+`broadcast_full_tlb_flush` has no callers today; a weak-arch caller must not rely on it until the
+sentinel calls a real flush seam; the atomics keep the ordering item 1 assumes. Matching the x86 *signature* is
 necessary but not sufficient - the seam pins names, and this section pins the semantics behind them.
 
 **3. DMA cache coherence (SEC-28).** The SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) maps the arena
@@ -360,6 +367,80 @@ What that means in practice:
 
 Grokking cuts the *discovery* cost, not the *iteration* cost: QEMU is not silicon, and the OS plumbing
 (e.g. routing device IRQs to userspace on ARM) plus real-hardware verification are still our work.
+
+### Never assemble a register value out of bit names. Copy the one the reference writes.
+
+The rules above are about not importing another system's DESIGN. This one is about not inventing the
+silicon's REQUIREMENT, and it is the rule that costs the most when it is broken:
+
+> **When a register's contents are not obvious, the answer is never "this bit looks like the one, try it".
+> It is "find what the mature driver writes there, for the transport and the command in use, and why".**
+> Then translate that requirement into GodspeedOS.
+
+Assembling a word out of individually-plausible named bits feels like engineering and is not. Every bit can
+be correctly named, correctly documented, and the word still wrong, because **which bits go together is
+itself a hardware fact** - and it is the fact a reference encodes and a datasheet usually does not.
+
+**Hardware is the worst possible place to guess, because it answers uninformatively.** A compiler refuses a
+bad program and names the line. A device accepts a wrong register write and goes quiet, or half-works, or
+works until it is loaded. There is no diagnostic in the reply, so a wrong guess costs a full
+build-flash-boot-read cycle and buys almost no information - whereas reading the reference costs minutes and
+either finds the answer or eliminates a candidate outright.
+
+#### The worked example, with numbers (CYW43455 over SDIO, 2026-09-28)
+
+Bringing up the Pi 4's radio, `docs/wifi.md` 15-20. The SDIO backplane would not answer a 32-bit read. Five
+changes were made on the strength of reasoning about which bits ought to matter, and **all five were wrong**:
+a reimplemented command path, `TM_BLKCNT_EN`, `CMD_CRC`/`CMD_INDEX`, the DMA-select field, and the pin mux.
+Each was eliminated by a measurement rather than by an argument - the block registers, the command word, the
+pin mux and the backplane window were all read BACK and all correct.
+
+The actual fault was one bit, in the one value that had been **assembled from bit names instead of copied**:
+
+```text
+cyw43-driver, the chip vendor's own driver:
+    #if !CYW43_USE_SPI
+        SBSDIO_FORCE_HW_CLKREQ_OFF | SBSDIO_ALP_AVAIL_REQ | SBSDIO_FORCE_ALP    /* 0x29, SDIO */
+    #else
+        SBSDIO_ALP_AVAIL_REQ                                                    /* 0x08, SPI  */
+    #endif
+
+ours:                                                                           /* 0x28       */
+```
+
+`ALP_AVAIL` reports that the clock is AVAILABLE; `FORCE_ALP` is what RUNS it. Our value was **neither**
+branch of that `#if` - the SPI form plus one bit - and the `#if` is precisely the reference telling you that
+the answer depends on the transport. The same mistake in kind had already been made one layer up: the
+command word left CRC and index checking off for every command because CMD5's R4 carries neither, applied to
+a CMD53 whose R5 carries both.
+
+**And here is what the device said about it**, which is the whole argument for this rule:
+
+```text
+the command completed and no data came
+the card ACCEPTED it - R5 flags 0x10 are clean
+the data phase was active from poll 1 to poll 2000001 of 2000000
+INTERRUPT was ever 0x00000000
+```
+
+A completed command, a clean response, a data phase that started and never finished, no error, no timeout.
+Nothing in that points at a clock bit. One read of the vendor driver did, in minutes.
+
+#### What to do instead
+
+- **Find the transport-specific value.** A `#if` on the bus type, a per-chip `switch`, a quirk table: those
+  are the reference telling you the answer is not universal. `brcmf_chip_tcm_rambase` is a `switch` on chip
+  id with no arithmetic relating the entries, so ours is a table too - an unknown part gets `None`, never an
+  extrapolation.
+- **Read the value BACK and report it.** Every register this driver writes is read back and printed against
+  what was intended. That is what turned four of the five dead hypotheses into one-boot eliminations instead
+  of arguments, and it is what caught a backplane window and a pin mux that were fine.
+- **Instrument rather than theorise.** The reading that finally cornered the fault accumulated the OR of
+  every status value seen during a wait and reported it - which proved the transfer STARTED, something no
+  amount of reasoning about the setup would have established.
+- **When the reference and your value differ, the reference wins by default.** Not because it is sacred, but
+  because the difference is a hardware fact you have not learned yet. Record the deviation if you keep one;
+  do not improvise around it.
 
 ## See also
 

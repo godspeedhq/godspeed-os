@@ -46,16 +46,24 @@ the chip's own hardware counters, then the L3 status:
 ```
 gsh> net
 nic      10ec:8168  mmio 0xfea04000  (RTL8168)
-nic-mac  7c:d3:0a:2b:b0:e3  reset ok
+nic-mac  xx:xx:xx:xx:xx:xx  reset ok
 nic-link UP 1000M full  |  tx ok (4 sent)  |  rx 90B (4 recv)
 nic-hw   RxOk=1832 TxOk=7 RxBcast=1210 RxErr=0 Miss=0
 ip       192.168.4.80
-gateway  192.168.4.1 at 00:ab:48:da:1b:0d
+gateway  192.168.4.1 at xx:xx:xx:xx:xx:xx
 ping     ok
 dns      192.168.4.1
 ```
 
-- **nic** - PCI vendor:device, the MMIO register base, and the chip name (from the kernel).
+- **nic** - PCI vendor:device, the MMIO register base, and the chip name (from the kernel). A
+  controller built into the SoC has no PCI identity, so there it reads `built in, not on PCI` with its
+  register window (the VisionFive's dwmac), or `no PCI network card` where the kernel granted none
+  (the Pis, whose driver reaches its controller another way).
+- **link** - which link is up: `up via the cable` or `down - no cable` on a single-link backend (the
+  e1000, QEMU's), and on every board with a radio bridge (the Pi 2, the Pi 4, the VisionFive, the PCs'
+  RTL8168) `up via the cable`, `up via wifi (the cable is out)` or `down - no cable, and the radio is
+  not joined`. When it says down,
+  the address lines below say so too rather than showing the last address held.
 - **nic-mac** - the MAC read off the chip, and whether the chip reset succeeded (queries
   `nic-driver`; `TIMEOUT` here means MMIO is not reaching the chip).
 - **nic-link** - link up/down, negotiated speed/duplex, and the driver's TX/RX request counts.
@@ -66,9 +74,13 @@ dns      192.168.4.1
 - **ip** - the address `net-stack` holds (learned by DHCP, or the fallback if there was no offer).
 - **gateway** - the gateway IP and the MAC ARP resolved for it, or `unresolved` if ARP got no answer.
 - **ping** - `ok` if the gateway answered an ICMP echo; `no` otherwise.
+- **lease** - `ok (DHCP)` when the address was granted, `NONE` when the link is up but the stack is on
+  its fallback address (the one genuinely wrong case), and `n/a` when there is no link to lease on.
+  `net lease` answers the same question in one word for scripts, and says `ok` for no link.
 - **dns** - the DNS server `net-stack` will use (DHCP option 6, or the gateway as a fallback).
 
-On QEMU's e1000 the `[3]` status reply is shorter, so only `nic` + `nic-mac` show (no link/hw lines);
+On QEMU's e1000 the `[3]` status reply is shorter, so only `nic`, `nic-mac` and `link` show (no
+`nic-link`/`nic-hw` lines);
 and when there is no drivable NIC, `nic-driver` serves empty replies and `net-stack` reports
 `gateway unresolved` / `ping no` plainly rather than faking it.
 
@@ -117,7 +129,7 @@ landed and the driver has not consumed it yet. (On QEMU the e1000 path prints CT
 
 ```
 gsh> net arp 192.168.4.1
-192.168.4.1 is at 00:ab:48:da:1b:0d
+192.168.4.1 is at xx:xx:xx:xx:xx:xx
 gsh> net scan
 Scanning 192.168.4.0/24 for live hosts [q] quit
   192.168.4.1

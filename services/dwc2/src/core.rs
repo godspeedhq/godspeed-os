@@ -10,6 +10,7 @@
 //! Those comments travel with the code; a "cleaner" rewrite that dropped them would be a rewrite of
 //! the hard-won part.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Mmio, ServiceContext};
 
 use crate::regs::*;
@@ -24,16 +25,11 @@ use crate::regs::*;
 ///
 /// Returns false on timeout, and the caller REPORTS it. A hardware wait that quietly gives up is the
 /// silent-failure case invariant 12 exists to prevent.
+///
+/// The wait is `gs::driver::wait` (`docs/driver-library.md`). Built by hand from `duration_cycles` it
+/// floored to one counter tick on an uncalibrated clock, so every core reset gave up after one look.
 fn wait_until(ctx: &ServiceContext, mmio: &Mmio, off: usize, mask: u32, want_set: bool, ms: u64) -> bool {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(ms));
-    loop {
-        if ((mmio.read32(off) & mask) != 0) == want_set {
-            return true;
-        }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
-            return false;
-        }
-    }
+    wait::until(ctx, Budget::ms(ms), || ((mmio.read32(off) & mask) != 0) == want_set).is_ok()
 }
 
 /// Identify the controller. `None` if this is not a DesignWare OTG core.

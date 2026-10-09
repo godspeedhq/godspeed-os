@@ -14,10 +14,13 @@
 //! What it does, in order:
 //!   1. Spawns `events`, then `console` (the display changes hands once, early).
 //!   2. In non-bare-metal builds, `pong` on core 1 then `ping` on core 0 (§23.2), then the probes.
-//!   3. Spawns the service set: time, control, hw-enumerator, the USB host, block-driver, fs,
-//!      shell, nic-driver, net-stack - in dependency order (`services/CLAUDE.md`).
-//!   4. Logs "supervisor: ready" once every spawn has completed.
-//!   5. Runs the death-notification restart loop, forever.
+//!   3. Spawns the service set: time, control, power, hw-enumerator, the USB hosts, block-driver, fs,
+//!      shell, the radio and audio drivers, nic-driver, net-stack - in dependency order
+//!      (`services/CLAUDE.md`).
+//!   4. Asks each reporting USB host for its device report, converges, and logs "supervisor: ready". A
+//!      USB device's driver - `wifi-usb` - is started on that report and on every later one (`usb_report`),
+//!      never in step 3.
+//!   5. Runs the main loop - death notices, operator commands, USB device reports - forever.
 //!
 //! This header said "Non-restartable" and "Yields indefinitely (death-notification restart loop
 //! deferred to Phase 6)". Phase 6 shipped: the loop is ~1,400 lines below, and the supervisor is the
@@ -30,9 +33,11 @@
 #![no_std]
 #![no_main]
 
+use godspeed as gs;
 use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
 use godspeed_sdk::service_context::DeadlineOutcomeInto;
 use godspeed_sdk::service_context::supcmd;
+use godspeed_sdk::service_context::usbdev;
 
 // ONE table, shared by source with the other principal that spawns probes: a probe respawns its own
 // victim, and a second copy of these parameters would be a second truth (Commandment III).
@@ -69,12 +74,38 @@ use godspeed_sdk::service_context::supcmd;
 /// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
 /// must never block the supervisor, which is the one service everything else depends on, and a
 /// retained return address burns a cap-table slot per request (the `events` leak, §26.6).
-fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) -> bool {
+fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &DevEvents, payload: &[u8]) -> bool {
     if payload.first() != Some(&supcmd::MARKER) { return false; }
+
+    // `supcmd::DEVICES`, `EVENTS` and `WHY` answer with a body rather than a status byte; everything else
+    // leaves it empty.
+    let mut body = [0u8; DEVICES_REPLY_MAX];
+    let mut body_len = 0usize;
 
     // The new service's endpoint cap, when the spawn produced one - returned to the caller below.
     let mut spawned_cap: Option<CapHandle> = None;
-    let status = if payload.len() >= 6 && (payload[1] == supcmd::RESTART || payload[1] == supcmd::SPAWN) {
+    // ...and when that cap is one the supervisor does not keep, it is SENT rather than copied (below).
+    let mut handed: Option<CapHandle> = None;
+    let status = if payload.len() == 2 && payload[1] == supcmd::DEVICES {
+        body_len = devices_answer(usb, &mut body);
+        supcmd::OK
+    } else if payload.len() == 2 && payload[1] == supcmd::EVENTS {
+        body_len = events.answer(&mut body);
+        supcmd::OK
+    } else if payload.len() > 2 && payload[1] == supcmd::WHY {
+        let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        match DEVICE_WHY.iter().find(|(n, _)| *n == name) {
+            Some((_, why)) => {
+                let w = why.as_bytes();
+                let len = w.len().min(body.len() - 1);
+                body[0] = supcmd::OK;
+                body[1..1 + len].copy_from_slice(&w[..len]);
+                body_len = 1 + len;
+                supcmd::OK
+            }
+            None => supcmd::UNKNOWN,
+        }
+    } else if payload.len() >= 6 && (payload[1] == supcmd::RESTART || payload[1] == supcmd::SPAWN) {
         let core = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
         match core::str::from_utf8(&payload[6..]) {
             // `name` may carry a NUL-separated PEER LIST after it, exactly as SpawnRequest's payload
@@ -132,7 +163,14 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
                 if ok {
                     // For the kernel-catalogue paths the cap was recorded in the name map by
                     // `spawn_mapped`; read it back so every successful spawn answers the same way.
-                    if spawned_cap.is_none() { spawned_cap = map.get(name).map(CapHandle); }
+                    // A program the map does not keep left its cap held for this answer instead.
+                    if spawned_cap.is_none() {
+                        spawned_cap = map.get(name).map(CapHandle);
+                        if spawned_cap.is_none() {
+                            handed = map.take_handoff();
+                            spawned_cap = handed;
+                        }
+                    }
                     supcmd::OK
                 } else { supcmd::FAILED }
             }
@@ -152,11 +190,13 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
     // delegate access to it.
     //
     // A copy is DERIVED for the caller and the supervisor keeps its own (it needs it to wire
-    // dependents later). If the send fails the derived copy is reclaimed - an orphaned cap is a
+    // dependents later) - for a service the map keeps. One it does not is sent itself (`handed`). If the send fails the derived copy is reclaimed - an orphaned cap is a
     // table slot leaked per request (26.6).
     if let Some(reply_cap) = ctx.take_pending_cap() {
-        let msg = Message::from_bytes(&[status]);
-        let sent = match spawned_cap.and_then(|c| ctx.derive_cap(c)) {
+        let msg = if body_len > 0 { Message::from_bytes(&body[..body_len]) } else { Message::from_bytes(&[status]) };
+        // A cap the supervisor does not keep goes as it is: copying it would leave the supervisor holding
+        // the original, which is what `map_keeps` exists to stop.
+        let sent = match handed.or_else(|| spawned_cap.and_then(|c| ctx.derive_cap(c))) {
             Some(granted) => {
                 let r = ctx.send_with_cap_by_handle(reply_cap, granted, &msg);
                 if r.is_err() { ctx.remove_cap(granted); }
@@ -166,8 +206,10 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, payload: &[u8]) ->
         };
         // No cap to send, or sending it failed: still ANSWER, so the caller is never left waiting
         // on a reply that is not coming (invariant 12). It gets the status alone.
-        if !sent { let _ = ctx.try_send_by_handle(reply_cap, &msg); }
+        if !sent { let _ = try_send_slot(ctx, reply_cap, &msg); }
         ctx.remove_cap(reply_cap);
+    } else if let Some(c) = handed {
+        map.hold_handoff(ctx, c);   // no one to hand it to: let go with the rest, after this message
     }
     true
 }
@@ -217,6 +259,7 @@ static FS_ELF: &[u8] = include_bytes!(env!("SVC_FS_ELF"));
 static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_BLOCK_DRIVER_ELF"));
 static NET_STACK_ELF: &[u8] = include_bytes!(env!("SVC_NET_STACK_ELF"));
 static TIME_ELF: &[u8] = include_bytes!(env!("SVC_TIME_ELF"));
+static POWER_ELF: &[u8] = include_bytes!(env!("SVC_POWER_ELF"));
 /// Hardware discovery in userspace (step D2), on a board where configuration space is REACHABLE:
 /// x86 through the CF8/CFC ports, aarch64 through the Pi 4's memory-mapped INDEX/DATA window,
 /// riscv64 through a flat ECAM window. Not the Pi 2, which has no PCI bus at all, so the service
@@ -250,6 +293,23 @@ static XHCI_ELF: &[u8] = include_bytes!(env!("SVC_XHCI_ELF"));
 static EHCI_ELF: &[u8] = include_bytes!(env!("SVC_EHCI_ELF"));
 #[cfg(has_dwc2)]
 static DWC2_ELF: &[u8] = include_bytes!(env!("SVC_DWC2_ELF"));
+// The onboard radio (the Pi 4's CYW43455, the VisionFive's AIC8800). Same shape as the USB gates above and for the same
+// reason: `build.rs` decides what it embedded and sets the cfg, so this is that one fact rather than a
+// second copy of it.
+#[cfg(has_wifi_driver)]
+static WIFI_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_WIFI_DRIVER_ELF"));
+// The USB WiFi dongle's driver, where a USB host serves its function protocol (`build.rs`, `usb_radio`).
+#[cfg(has_wifi_usb)]
+static WIFI_USB_ELF: &[u8] = include_bytes!(env!("SVC_WIFI_USB_ELF"));
+#[cfg(has_audio_driver)]
+static AUDIO_DRIVER_ELF: &[u8] = include_bytes!(env!("SVC_AUDIO_DRIVER_ELF"));
+#[cfg(has_pwm_audio)]
+static PWM_AUDIO_ELF: &[u8] = include_bytes!(env!("SVC_PWM_AUDIO_ELF"));
+/// Which Pi `pwm-audio` runs on, as its `mode` (2 = Pi 2, 4 = Pi 4): a board fact from `build.rs`.
+#[cfg(all(has_pwm_audio, pwm_audio_pi4))]
+const PWM_AUDIO_BOARD: u32 = 4;
+#[cfg(all(has_pwm_audio, not(pwm_audio_pi4)))]
+const PWM_AUDIO_BOARD: u32 = 2;
 
 /// `(name, image, flags, memory limit, preferred core, send peers, privileges, mode, hw class)` for
 /// every service whose image the supervisor holds.
@@ -320,18 +380,71 @@ mod board {
     pub const BLOCK_CORE:   u32 = if cfg!(has_dwc2) { 2 } else { 1 };
     pub const CONSOLE_CORE: u32 = if cfg!(has_dwc2) { 3 } else { 0 };
 
-    /// The USB host this board's NIC sits behind. Only the Pi 2 puts ethernet on USB (the LAN9514);
-    /// every other board's NIC is on a bus its driver reaches directly.
-    pub const NIC_PEERS: &[&str] = if cfg!(target_arch = "arm") {
-        &["dwc2", "events"]
+    /// `dwc2`'s send peers: `events`, and the dongle's driver wherever it is embedded (see the IMAGES row).
+    /// `supervisor` where it reports the dongle to it, so the dongle's driver is started when the dongle is
+    /// there and stopped when it leaves (`usbdev`, `docs/usb-device-drivers.md`).
+    pub const DWC2_PEERS: &[&str] =
+        if cfg!(has_wifi_usb) { &["events", "wifi-usb", "supervisor"] } else { &["events"] };
+    /// `xhci`'s send peers: `events`, and the dongle's driver where it is embedded (U2a) - the same notice
+    /// `dwc2` sends, `NOTE_RADIO`.
+    /// And `supervisor`, for the dongle's report (`usbdev`), as `dwc2` has.
+    pub const XHCI_PEERS: &[&str] =
+        if cfg!(has_wifi_usb) { &["events", "wifi-usb", "supervisor"] } else { &["events"] };
+    /// The dongle driver's peers: the USB host that serves its dongle, and `fs` for `/wifi.keys`. `dwc2` on
+    /// the board that has it, `xhci` on the others (U2a).
+    pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
+
+    /// `nic-driver`'s send peers: the USB host its NIC sits behind where it has one (only the Pi 2 puts
+    /// ethernet on USB, the LAN9514), the radio service or services its bridge reaches, and `events`.
+    pub const NIC_PEERS: &[&str] = if cfg!(has_dwc2) {
+        // The Pi 2: its ethernet is behind `dwc2`, and the USB WiFi dongle's driver - always embedded with
+        // `dwc2` - is the link's other backend (`docs/wifi-usb.md`, R6), the same rule as the radio below:
+        // the cable always wins. Keyed on `dwc2`, not on `wifi-usb`, since `wifi-usb` is embedded on the
+        // PCs too (U2a) and their NIC has no USB host for a peer. Flat, because `contract_check.py` reads
+        // this chain as text and does not follow a nested `if`.
+        &["dwc2", "events", "wifi-usb"]
+    } else if cfg!(nic_radio_bridge) {
+        // The radio is the link's other backend where there is one (docs/wifi.md 2): the cable always
+        // wins, and when it is out nic-driver carries the frames to wifi-driver over the frame ops. A
+        // board fact of its own (build.rs), held by the Pi 4's GENET and, since phase V6, the VisionFive's
+        // dwmac - both through `services/nic-driver/src/radio.rs`. And the USB dongle's driver, embedded on
+        // both: the bridge follows whichever radio says it is the one in use (`wifi hardware use`,
+        // `utilities/56_wifi.md` 11). One branch, not a second keyed on `has_wifi_usb` as well, because
+        // `contract_check.py` reads this chain as text and takes one `cfg!` per branch. A declared peer
+        // whose service is not running is only reacquired later, so a bridge board without the dongle's
+        // driver would lose nothing by it.
+        &["wifi-driver", "wifi-usb", "events"]
+    } else if cfg!(has_wifi_usb) {
+        // The PCs: no onboard radio, and the USB dongle's driver is the link's other backend, carried by
+        // the RTL8168's serve loop through the same `radio.rs` (`docs/wifi-usb.md` 39). The cable wins.
+        &["events", "wifi-usb"]
     } else {
         &["events"]
     };
 }
 
+/// WHY each driver's device is handled as it is, for `hardware why` (`supcmd::WHY`). Kept here, beside
+/// the rows that make the decisions, so the explanation is edited where the decision is: a row whose
+/// confinement or device changes changes its line here in the same edit. A reason not recorded is
+/// said to be not recorded - `nic-driver` - rather than invented.
+const DEVICE_WHY: &[(&str, &str)] = &[
+    ("xhci", "confined by the IOMMU where the machine has one: every DMA the controller makes is inside its arena, so confinement refuses nothing it does legitimately (CLAUDE.md 6.4)"),
+    ("ehci", "IOMMU passthrough, not confined: the controller legitimately reaches firmware and hub regions outside any arena that could be granted (the 0xffffffc0 accesses), so a tight confinement does not fit it (docs/iommu.md 4a)"),
+    ("block-driver", "IOMMU passthrough, not confined: the AHCI controller keeps a stale firmware DMA pointer that confinement would fault (CLAUDE.md 6.4)"),
+    ("audio-driver", "confined by the IOMMU where the machine has one: the command rings, the buffer list and the ring of sound are all inside its arena (CLAUDE.md 6.4)"),
+    ("nic-driver", "not confined: its spawn row asks for no confinement and no reason is recorded beside it; on a machine with no IOMMU it is trust-critical either way (CLAUDE.md 6.4)"),
+    ("console", "granted the framebuffer by kind; the kernel takes the screen back if it dies, so the machine is never mute (CLAUDE.md 11.4)"),
+    ("wifi-usb", "holds no hardware: the USB host that bound the dongle serves every request it makes, and the supervisor starts it when that host reports the dongle attached (docs/wifi-usb.md)"),
+];
+
 const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("pong", PONG_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 1, &[], 0, 0, 0),
     ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack", "events"], 0, 0, 0),
+    // The power policy (docs/power.md). Carries CPU_CLOCK, which sets the Arm cores to the firmware's
+    // minimum or maximum and nothing else; ONE holder, because the clock is one machine-wide setting and
+    // a second holder would silently overwrite this one. No peers: it only ever answers.
+    ("power", POWER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &[],
+     godspeed_sdk::service_context::privbits::CPU_CLOCK, 0, 0),
     // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one
     // operation: READ one configuration register, select-and-fetch indivisibly. It cannot write
     // config space at all - that would be write access to every BAR and command register of every
@@ -434,9 +547,10 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
     ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
-    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, 1, &["nic-driver", "time", "events"],
-     godspeed_sdk::service_context::privbits::RESOURCE_MINT
-     | godspeed_sdk::service_context::privbits::SET_CLOCK, 0, 0),
+    // No `time` peer and no SET_CLOCK: the clock left net-stack on 2026-10-01 (`time` asks for its own NTP
+    // datagram through net-stack's op 12, and net-stack never calls `time`).
+    ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, 1, &["nic-driver", "events"],
+     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
     // FIRST DRIVER to move. AHCI: an MMIO BAR, a DMA arena and a PCI BDF for the bus-master enable -
     // and no IRQ line, which is why it is the right one to prove the path on.
     // block-driver reaches the disk THROUGH A USB HOST-CONTROLLER SERVICE on both ARM targets:
@@ -532,6 +646,58 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
          godspeed_sdk::service_context::hwclass::pci(
              0x02_00_00, godspeed_sdk::service_context::hwclass::BAR_AUTO, false)
      } else { godspeed_sdk::service_context::hwclass::NIC }),
+    // The Pi 4's onboard CYW43455 radio, over SDIO (docs/wifi.md). Named by its device KIND,
+    // `hwclass::WIFI_SDIO`: the Arasan SD host controller it drives is at a FIXED SoC address on no
+    // enumerable bus, so the kernel grants the window - and the radio's power control - by that kind,
+    // and only where its boot census saw the controller answer. This row said `NONE` and the kernel
+    // granted both BY NAME, which is the name-keyed authority table step D removes: any service the
+    // supervisor spawned as `wifi-driver` got the radio (`docs/audio.md`, "No service names in the
+    // kernel").
+    //
+    // No DMA arena and no interrupt, deliberately: the firmware upload and every frame move by PIO
+    // (the contract says the same, and that it stays true), so neither was ever needed. This said both
+    // would arrive with the upload; it came without them (corrected 2026-10-08).
+    // Its send peers are `fs` (for `/wifi.keys`) and `power` (the Arm clock lease), in the row below.
+    // NOT `events`, though every other driver here has it - the reasoning as written when it had none:
+    // it buys exactly one thing, automatic IPC tracing, and this service makes almost no IPC calls in
+    // this phase. Everything it reports goes through `ctx.log()`, which is the kernel ring and the
+    // serial line and needs no capability at all (§11.4). A grant that buys nothing is standing
+    // authority a compromise inherits (§3.1, §26.9), and it would also be a cap with no reacquisition
+    // path - Commandment IX - for a peer chaos restarts. It comes back with the phase that has traffic
+    // worth tracing, and with the reacquire-and-retry that then means something.
+    //
+    // Its device class is `WIFI_SDIO`, the kind the kernel grants the radio's window and power by (see
+    // the paragraph above).
+    #[cfg(has_wifi_driver)]
+    ("wifi-driver", WIFI_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 3, &["fs", "power"], 0, 0,
+     godspeed_sdk::service_context::hwclass::WIFI_SDIO),
+    // The HD Audio controller (docs/audio.md). Named by the bus, like every PCI driver since step D:
+    // 0x040300 is class 0x04 multimedia, subclass 0x03 HD Audio, and the registers are in BAR0.
+    //
+    // A2 ADDS A DMA ARENA (`dma_pages` below): the command rings and a ring of sound. On this driver's
+    // death the kernel clears its device's bus mastering, keyed on the device it was given
+    // (`kernel/src/task/scheduler.rs`). WITH an interrupt (`pci_irq`): the stream interrupts as each
+    // period is played and the driver refills then; the kernel picks the vector from its MSI pool.
+    // One peer, `fs`, for `/audio.settings` - the volume and the mute kept across a restart (A4).
+    //
+    // CONFINED behind the IOMMU (§6.4), where there is one: every DMA the controller makes - the command
+    // rings, the buffer descriptor list, the ring of sound - is inside the arena, so nothing it does
+    // legitimately is refused, and a driver that pointed it elsewhere would fault instead of writing.
+    // The second confined driver after `xhci`; the kernel releases the confinement on its death by the
+    // device it was given, not its name (`kernel/src/task/scheduler.rs`).
+    #[cfg(has_audio_driver)]
+    ("audio-driver", AUDIO_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 2, &["fs"], 0, 0,
+     godspeed_sdk::service_context::hwclass::pci_irq(0x04_03_00, 0, true)),
+    // The Pis' 3.5 mm jack (docs/audio.md, "The Pis"): PWM fed by the SoC's DMA engine. Named by its
+    // device kind - the kernel routes the jack's pins and starts the PWM clock as part of the grant,
+    // then maps the PWM and DMA pages and grants a DMA arena. `mode` says which Pi. One peer, `fs`, for
+    // `/audio.settings`.
+    #[cfg(has_pwm_audio)]
+    ("pwm-audio", PWM_AUDIO_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     16 * 1024 * 1024, 2, &["fs"], 0, PWM_AUDIO_BOARD,
+     godspeed_sdk::service_context::hwclass::AUDIO_PWM),
     ("ping", PING_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, 0, &["pong"], 0, 0, 0),
     ("upper", UPPER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     ("mem-pressure", MEM_PRESSURE_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
@@ -555,7 +721,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
 const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     #[cfg(has_xhci)]
     ("xhci", XHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 2, &["events"],
+     64 * 1024 * 1024, 2, board::XHCI_PEERS,
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      // Named by the bus, and WITH an interrupt where the kernel can route one (step D1b). 0x0C0330
      // is the industry-standard class code for an xHCI controller - class 0x0C serial bus, subclass
@@ -583,11 +749,24 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      godspeed_sdk::service_context::hwclass::EHCI),
     // arm32's USB host: keyboard, mass storage and USB-net all sit behind it, which is why
     // `nic-driver` and `block-driver` both name it as a peer on that port.
+    //
+    // `wifi-usb` is its second peer where that service exists: the host TELLS the dongle's driver when it
+    // binds or loses the dongle (`godspeed_wifi::usbfn::NOTE_RADIO`), so the driver blocks instead of
+    // asking on a timer. One message kind, no reply expected, sent with `try_send` (docs/wifi-usb.md, U1b).
     #[cfg(has_dwc2)]
     ("dwc2", DWC2_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 0, &["events"],
+     64 * 1024 * 1024, 0, board::DWC2_PEERS,
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::DWC2),
+    // The USB WiFi dongle's driver (docs/wifi-usb.md). NO hardware grant - no window, no arena, no
+    // interrupt, no device class: everything it does to the chip is a request to the USB host that bound
+    // the dongle, which answers for that one device only (`godspeed_wifi::usbfn`). Its peers are that host
+    // and `fs`, which holds `/wifi.keys` for the serve loop every radio shares (`godspeed_wifi::serve`, R4)
+    // - the same reason `wifi-driver` has it. Unplaced: it is idle until a dongle is there, and a radio's
+    // work is milliseconds at a time.
+    #[cfg(has_wifi_usb)]
+    ("wifi-usb", WIFI_USB_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
+     8 * 1024 * 1024, u32::MAX, board::WIFI_USB_PEERS, 0, 0, 0),
 ];
 
 /// A build that EMBEDDED a USB host image must have a row to spawn it with.
@@ -602,8 +781,8 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
 const _: () = assert!(!USB_IMAGES.is_empty(),
     "a USB host image was embedded but USB_IMAGES has no row for it");
 
-/// Spawn `name` from a supervisor-held image, if we hold one. `None` means "not ours - use the
-/// kernel catalogue", which is how the two coexist while services move across one at a time.
+/// Spawn `name` from a supervisor-held image, if we hold one. `None` means no image by that name is
+/// held here; the caller then asks the kernel, whose catalogue holds only the supervisor (step C).
 fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
                   installs: &[(&str, CapHandle)])
     -> Option<Result<Option<CapHandle>, godspeed_sdk::Error>>
@@ -618,7 +797,8 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // spawn at all on a 2-core machine instead of landing on another core.
     let caller_chose = !(core == 0xFFFF || core == u32::MAX);
     req.core         = if caller_chose { core } else { table_core };
-    req.flags        = flags | if caller_chose { godspeed_sdk::service_context::SPAWN_FLAG_CORE_STRICT } else { 0 };
+    req.flags        = flags | if caller_chose { godspeed_sdk::service_context::SPAWN_FLAG_CORE_STRICT } else { 0 }
+                     | if is_watched(name) { godspeed_sdk::service_context::SPAWN_FLAG_WATCHED } else { 0 };
     req.memory_limit = mem;
     // Privileges the supervisor asks the child be given. The kernel refuses any bit the SUPERVISOR
     // does not itself hold, so this passes authority on rather than minting it.
@@ -648,6 +828,9 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
         "xhci" => 32 + 256 + 4,
         // 64 KiB - the `_ => EHCI_DMA_PAGES` default the NIC used to fall through to.
         "nic-driver" => 16,
+        // 68 KiB used, rounded up: the command rings (CORB 1 KiB, RIRB 2 KiB), the buffer descriptor
+        // list, and a 64 KiB ring of sound - about a third of a second at 48 kHz stereo (docs/audio.md).
+        "audio-driver" => 24,
         _ => 0,
     };
     // Peers likewise: a caller that has caps to provide passes them, otherwise the declared list.
@@ -724,6 +907,11 @@ struct NameCapMap {
     lens:  [u8; NAME_MAP_MAX],
     caps:  [u32; NAME_MAP_MAX],       // endpoint cap slot; u32::MAX = empty
     count: usize,
+    /// The cap to a program the map does NOT keep (`map_keeps`), held only until whoever asked for the
+    /// spawn is answered: a `SPAWN` command hands it to its caller, and every other path lets it go
+    /// (`release_handoff`, once per message). One slot - a new one frees the old - so the supervisor
+    /// never holds more than one cap to an on-demand program, and none between messages.
+    handoff: u32,
 }
 impl NameCapMap {
     const fn new() -> Self {
@@ -732,7 +920,22 @@ impl NameCapMap {
             lens:  [0u8; NAME_MAP_MAX],
             caps:  [u32::MAX; NAME_MAP_MAX],
             count: 0,
+            handoff: u32::MAX,
         }
+    }
+    /// Hold `cap` for the caller of the spawn that produced it, freeing any cap held before.
+    fn hold_handoff(&mut self, ctx: &ServiceContext, cap: CapHandle) {
+        self.release_handoff(ctx);
+        self.handoff = cap.0;
+    }
+    /// The held cap, now the taker's to send or remove.
+    fn take_handoff(&mut self) -> Option<CapHandle> {
+        let c = core::mem::replace(&mut self.handoff, u32::MAX);
+        (c != u32::MAX).then_some(CapHandle(c))
+    }
+    /// Let go of a held cap nobody took.
+    fn release_handoff(&mut self, ctx: &ServiceContext) {
+        let_go(ctx, self.take_handoff());
     }
     /// Record `name → cap_slot`, **updating in place** if `name` is already mapped (so a restart
     /// refreshes the cap - and a kill-storm can't grow the map past its bound, §26.6). Returns
@@ -851,7 +1054,22 @@ fn record_name(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapH
 /// used to discard this and then print "adopted running X" - a line that was not true if the record
 /// had just been dropped. Announcing the outcome is optional; hiding a failure is not (invariant 12).
 fn record_name_quiet(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, cap: CapHandle) -> bool {
-    if let Some(old) = map.get(name) { ctx.remove_cap(CapHandle(old)); }
+    // For a name the map keeps, the old instance's cap is let go here. For a name it does not, the new
+    // one is held until the caller is answered (below) and then let go. An on-demand program - `upper`,
+    // `recorder`, a selfcheck's `greet` - is restarted by nothing and wired to nothing, so the supervisor
+    // holds no capability to it once that message is done, and it is never in the map, so there is no old
+    // one to free as well. The map is bounded at `NAME_MAP_MAX`, and these used to stay in
+    // it for the life of the machine: on the Pi 4 a `selfcheck` filled it, and the USB dongle's driver
+    // arriving after was dropped (`docs/wifi-usb.md` 49).
+    //
+    // Let go AFTER the caller is answered, not here: a `SPAWN` command's caller is owed a cap to what it
+    // started (`handle_command`), and dropping it here left `spawncap upper` with nothing to send on
+    // (`osdev test shell`, 2026-10-08). So it is held for that one answer (`hold_handoff`).
+    if !map_keeps(name) {
+        map.hold_handoff(ctx, cap);
+        return false;
+    }
+    let_go(ctx, map.get(name).map(CapHandle));
     if map.record(name, cap.0) { return true; }
     ctx.log_fmt(format_args!("supervisor: name-map FULL - dropped {}", name));
     false
@@ -902,19 +1120,55 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 /// one IPC round trip per driver spawn. The checker refused it, correctly.
 ///
 /// Best effort: any failure returns 0 and the machine boots exactly as it did before.
+///
+/// **AN ANSWER IS TAKEN ONLY FOR THE QUESTION IT NAMES.** The reply comes back on this service's
+/// mailbox, where an answer that missed its deadline is still waiting - and the next question takes it.
+/// On the T630 on 2026-10-08 that put a restarted supervisor one answer behind for a whole spawn round:
+/// the NIC was handed `0x0016`, the SATA controller the NIC's address, `xhci` the SATA controller's,
+/// the audio driver `xhci`'s; the kernel logged each disagreement with its own scan, used the supplied
+/// address, and confined the SATA controller to `xhci`'s arena and `xhci` to the audio driver's. So
+/// `hw-enumerator` echoes the class it was asked about, and an answer for another class is said and
+/// discarded: the question is asked again, which takes the answer that is now waiting, up to
+/// `TRIES` times. Still no matching answer is 0 - the kernel's own scan - never a wrong device.
 #[cfg(has_hw_enumerator)]
 fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
     const OP_BY_CLASS: u8 = 3;
     const ANSWER_SECS: i64 = 2;
+    // One stale answer costs one more ask; more than that in a row is a reporter that is not answering
+    // this question, and the kernel's scan is the better answer.
+    const TRIES: u32 = 3;
     let c = class_code.to_le_bytes();
     let mut buf = [0u8; 16];
-    match ctx.request_with_reply_deadline_outcome_into(
-        "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2]], &mut buf, ANSWER_SECS)
-    {
-        DeadlineOutcomeInto::Reply(n) if n >= 4 =>
-            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-        _ => 0,
+    for _ in 0..TRIES {
+        match ctx.request_with_reply_deadline_outcome_into(
+            "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2]], &mut buf, ANSWER_SECS)
+        {
+            DeadlineOutcomeInto::Reply(n) if n >= 8 => {
+                let bdf = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let answered = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                if answered == class_code {
+                    return bdf;
+                }
+                ctx.log_fmt(format_args!(
+                    "supervisor: hw-enumerator's answer was for class {:#08x}, not {:#08x} (a late answer to an earlier question) - discarded, asking again",
+                    answered, class_code));
+            }
+            DeadlineOutcomeInto::Reply(n) => {
+                // Too short to name its question: the device count (4 bytes) or an unknown-op `?` (1).
+                // Not this question's, so not used. (A late 17-byte device record never gets here: the
+                // reply buffer is 16 bytes, the kernel refuses a reply larger than the buffer it was
+                // told of, and that refusal ends the asking below - the kernel's own scan answers.)
+                ctx.log_fmt(format_args!(
+                    "supervisor: hw-enumerator answered {} byte(s) where a class answer is 8 (an answer to another question) - discarded, asking again",
+                    n));
+            }
+            _ => return 0,
+        }
     }
+    ctx.log_fmt(format_args!(
+        "supervisor: no answer from hw-enumerator named class {:#08x} in {} asks - the kernel resolves it from its own scan",
+        class_code, TRIES));
+    0
 }
 
 /// Ask `hw-enumerator` for its device list and log what came back.
@@ -1036,7 +1290,7 @@ fn ensure_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &
 /// The restartable services the supervisor is responsible for (§6.1). Hoisted so the scan, `reconcile`,
 /// and `converge` share ONE roster. Order matters: block-driver before fs before shell (each wires to
 /// the previous); nic-driver before net-stack.
-const MANAGED_N: usize = 13;
+const MANAGED_N: usize = 18;
 const MANAGED: [&str; MANAGED_N] =
     ["block-driver", "fs", "shell", "xhci", "ehci", "events", "console", "nic-driver", "net-stack",
      // C1-6: both moved OUT of the kernel and so must be started BY someone. `time` owns the wall
@@ -1048,10 +1302,310 @@ const MANAGED: [&str; MANAGED_N] =
      // reconcile list at all - so a DROPPED notification left the Pi's storage, keyboard and network
      // down with no backstop to notice.
      "time", "control", "dwc2",
-     // Hardware discovery in userspace (step D2). x86-only in practice - the image is embedded only
-     // there - and reconcile skips any name absent from the map, so listing it unconditionally costs
-     // the ARM ports nothing, exactly as `dwc2` above costs x86 nothing.
-     "hw-enumerator"];
+     // Hardware discovery in userspace (step D2). Embedded where configuration space is reachable
+     // (x86_64, aarch64, riscv64 - `enumerator` in build.rs), and reconcile skips any name absent from
+     // the map, so listing it unconditionally costs the Pi 2 nothing, exactly as `dwc2` costs x86 nothing.
+     "hw-enumerator",
+     // The onboard radio. Listed unconditionally for the reason `dwc2` and `hw-enumerator` above are:
+     // reconcile skips any name absent from the name-cap map, so a service only one board spawns costs
+     // the others nothing - and being absent from this list is what left arm32's storage, keyboard and
+     // network down with no backstop when a death notification was dropped.
+     "wifi-driver",
+     // The USB WiFi dongle's driver: listed unconditionally for the same reason.
+     "wifi-usb",
+     // The power policy (docs/power.md). A respawn knows of no lease and puts the clock at its minimum,
+     // which is why its absence from this list would matter: dead, nothing would answer a lease at all.
+     "power",
+     // The audio drivers (docs/audio.md): HD Audio on x86, the PWM jack on the Pis. Listed
+     // unconditionally for the reason above.
+     "audio-driver", "pwm-audio"];
+
+/// Does this supervisor want the kernel to report `name`'s death and count it as a restart? Every service
+/// it MANAGES, and `counter` (an example with its own death-loop arm). Said in the spawn request as
+/// `SPAWN_FLAG_WATCHED`, so this roster is the ONLY list of watched services in the system: the kernel's
+/// two copies of it (death notification, restart count) are gone, and with them the drift that cost `time`
+/// and `control` their restarts (`docs/audio.md`, "No service names in the kernel").
+fn is_watched(name: &str) -> bool {
+    MANAGED.contains(&name) || name == "counter"
+}
+
+/// WHAT HAS HAPPENED TO THE DEVICES THIS SUPERVISOR DRIVES - for `hardware events` (`supcmd::EVENTS`).
+///
+/// Only events this supervisor itself sees and acts on: a device driver's death and its restart, a USB
+/// device reported attached or gone. What the KERNEL does on those occasions - granting, confining,
+/// releasing, resetting - is not seen here and not recorded (`hardware` makes no kernel change).
+///
+/// Bounded (26.6): the newest `DEV_EVENTS` are kept, `recorded` counts every one, so a reader knows how
+/// many were overwritten. Volatile: a respawned supervisor starts an empty record, and says from when.
+const DEV_EVENTS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct DevEvent {
+    secs: u32,
+    what: u8,
+    vid: u16,
+    pid: u16,
+    name: [u8; 16],
+    nlen: u8,
+}
+
+struct DevEvents {
+    ring: [DevEvent; DEV_EVENTS],
+    recorded: u32,
+    since: u32,
+}
+
+impl DevEvents {
+    fn new(ctx: &ServiceContext) -> Self {
+        let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; 16], nlen: 0 };
+        DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32 }
+    }
+
+    /// Note an event for `name`, if `name` drives a device - every other service's life is not a
+    /// hardware event, and the record is short.
+    fn note(&mut self, ctx: &ServiceContext, what: u8, name: &str, vid: u16, pid: u16) {
+        if !drives_device(name) { return; }
+        let mut e = DevEvent { secs: gs::task::uptime_secs(ctx).max(0) as u32, what, vid, pid, name: [0; 16], nlen: 0 };
+        let n = name.len().min(e.name.len());
+        e.name[..n].copy_from_slice(&name.as_bytes()[..n]);
+        e.nlen = n as u8;
+        self.ring[self.recorded as usize % DEV_EVENTS] = e;
+        self.recorded = self.recorded.wrapping_add(1);
+    }
+
+    /// `[OK, since, recorded, count, entries...]`, oldest first, as `supcmd::EVENTS` documents.
+    fn answer(&self, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+        out[0] = supcmd::OK;
+        out[1..5].copy_from_slice(&self.since.to_le_bytes());
+        out[5..9].copy_from_slice(&self.recorded.to_le_bytes());
+        let held = (self.recorded as usize).min(DEV_EVENTS);
+        let first = self.recorded as usize - held;
+        let mut n = 10usize;
+        let mut count = 0u8;
+        for k in first..self.recorded as usize {
+            let e = &self.ring[k % DEV_EVENTS];
+            let need = 4 + 1 + 4 + 1 + e.nlen as usize;
+            if n + need > out.len() { break; }
+            out[n..n + 4].copy_from_slice(&e.secs.to_le_bytes());
+            out[n + 4] = e.what;
+            out[n + 5..n + 7].copy_from_slice(&e.vid.to_le_bytes());
+            out[n + 7..n + 9].copy_from_slice(&e.pid.to_le_bytes());
+            out[n + 9] = e.nlen;
+            out[n + 10..n + 10 + e.nlen as usize].copy_from_slice(&e.name[..e.nlen as usize]);
+            n += need;
+            count += 1;
+        }
+        out[9] = count;
+        n
+    }
+}
+
+/// Does `name` drive a device - a spawn row that names one, or a USB device's driver?
+fn drives_device(name: &str) -> bool {
+    use godspeed_sdk::service_context::hwclass;
+    IMAGES.iter().chain(USB_IMAGES.iter())
+        .any(|row| row.0 == name && row.8 != hwclass::NONE && row.8 != hwclass::TEST_IRQ)
+        || USB_MATCH.iter().any(|m| m.driver == name)
+}
+
+/// A USB device whose driver this supervisor starts when a USB host reports it attached, and stops when
+/// the host reports it gone (`docs/usb-device-drivers.md`). The policy half of "a device that appears gets
+/// its driver": the host reports facts (`usbdev`) and never names a driver, so which image runs for a
+/// device is decided here, by the service that decides what runs.
+struct UsbMatch {
+    vid: u16,
+    pid: u16,
+    driver: &'static str,
+    peers: &'static [&'static str],
+}
+
+/// The table, wherever the dongle's driver is embedded: both of its hosts, `dwc2` and `xhci`, report.
+const USB_MATCH: &[UsbMatch] = if cfg!(has_wifi_usb) {
+    &[UsbMatch { vid: 0x0bda, pid: 0x8176, driver: "wifi-usb", peers: board::WIFI_USB_PEERS }]
+} else {
+    &[]
+};
+const USB_MATCH_MAX: usize = 1;
+const _: () = assert!(USB_MATCH.len() <= USB_MATCH_MAX);
+const USB_ON_DEMAND: bool = !USB_MATCH.is_empty();
+/// The USB hosts that report, asked for their report when this supervisor starts (`usbdev::ASK`).
+const USB_HOSTS: &[&str] = if !USB_ON_DEMAND { &[] } else if cfg!(has_dwc2) { &["dwc2"] } else { &["xhci"] };
+
+/// Whether each `USB_MATCH` row's device is attached, as its host last reported. A new supervisor knows
+/// nothing - false until a host says otherwise, which it is asked to do at once. Owned by the main loop.
+struct UsbState {
+    present: [bool; USB_MATCH_MAX],
+    /// A host has reported at least once. Until then `present` is only this supervisor's starting value,
+    /// and "absent" must not be told to anyone (`tell_radio_of_dongle`).
+    heard: bool,
+}
+
+impl UsbState {
+    const fn new() -> Self { UsbState { present: [false; USB_MATCH_MAX], heard: false } }
+
+    /// Should `name` be running? A device's driver only while its device is attached; everything else,
+    /// always. What keeps the restart paths (the death arm, `reconcile`, `converge`) from bringing back a
+    /// driver that was stopped because its device left.
+    fn wanted(&self, name: &str) -> bool {
+        match USB_MATCH.iter().position(|m| m.driver == name) {
+            Some(i) => self.present[i],
+            None => true,
+        }
+    }
+}
+
+/// The longest `supcmd::DEVICES` answer: room for every spawn row with a device and every USB match.
+const DEVICES_REPLY_MAX: usize = 1024;
+
+/// `supcmd::DEVICES`: which devices this supervisor drives, for the `hardware` utility's DRIVER column
+/// (`docs/hardware-design.md`). Read only - it reports the spawn table and the USB match table, which
+/// are this service's own decisions about what runs for which device, and changes nothing. Whether
+/// each named service is running is the asker's to read (`task_stat`); whether a PCI device is
+/// present is `hw-enumerator`'s. Bounded: an entry that does not fit is left out and the count says
+/// what was sent.
+fn devices_answer(usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+    use godspeed_sdk::service_context::hwclass;
+    out[0] = supcmd::OK;
+    let mut n = 2usize;
+    let mut count = 0u8;
+    let mut put = |bytes: &[&[u8]], out: &mut [u8; DEVICES_REPLY_MAX], n: &mut usize| -> bool {
+        let need: usize = bytes.iter().map(|b| b.len()).sum();
+        if *n + need > out.len() { return false; }
+        for b in bytes { out[*n..*n + b.len()].copy_from_slice(b); *n += b.len(); }
+        true
+    };
+    // BOTH tables: the USB hosts (`xhci`, `ehci`) are spawned from `USB_IMAGES`, and reading `IMAGES`
+    // alone left every host controller reported as having no driver while it ran (the Wyse, 2026-10-08).
+    for row in IMAGES.iter().chain(USB_IMAGES.iter()) {
+        let hw = row.8;
+        // No device, or the test vector that is not a device at all.
+        if hw == hwclass::NONE || hw == hwclass::TEST_IRQ { continue; }
+        let name = row.0.as_bytes();
+        if put(&[b"H", &hw.to_le_bytes(), &[name.len() as u8], name], out, &mut n) { count += 1; }
+    }
+    let host = USB_HOSTS.first().copied().unwrap_or("");
+    for (i, m) in USB_MATCH.iter().enumerate() {
+        let attached = usb.present.get(i).copied().unwrap_or(false) as u8;
+        if put(&[b"U", &m.vid.to_le_bytes(), &m.pid.to_le_bytes(), &[attached],
+                 &[host.len() as u8], host.as_bytes(), &[m.driver.len() as u8], m.driver.as_bytes()], out, &mut n) {
+            count += 1;
+        }
+    }
+    out[1] = count;
+    n
+}
+
+/// A host's report (`usbdev::Report`): start the device's driver if it is attached and not running, stop
+/// it if the device is gone. One host reports today, with one such device, so "absent" means every row.
+fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, r: usbdev::Report) {
+    usb.heard = true;
+    if !r.present {
+        // Said once per report, which is rare: a host reports at its boot, on a plug or unplug, and when a
+        // new supervisor asks.
+        ctx.log("supervisor: USB host reports no device with a driver here attached");
+        for (i, m) in USB_MATCH.iter().enumerate() {
+            usb.present[i] = false;
+            if name_alive(ctx, m.driver) {
+                match ctx.kill(m.driver) {
+                    Ok(()) => {
+                        events.note(ctx, supcmd::EV_DETACHED, m.driver, m.vid, m.pid);
+                        ctx.log_fmt(format_args!(
+                            "supervisor: {} stopped - its USB device {:04x}:{:04x} is not attached", m.driver, m.vid, m.pid))
+                    }
+                    Err(e) => ctx.log_fmt(format_args!(
+                        "supervisor: {} could not be stopped ({:?}) - its device is not attached", m.driver, e)),
+                }
+            }
+        }
+        return;
+    }
+    let Some(i) = USB_MATCH.iter().position(|m| m.vid == r.vid && m.pid == r.pid) else {
+        ctx.log_fmt(format_args!("supervisor: USB device {:04x}:{:04x} attached - no driver for it here", r.vid, r.pid));
+        return;
+    };
+    usb.present[i] = true;
+    let m = &USB_MATCH[i];
+    if name_alive(ctx, m.driver) {
+        // Already running - a repeated report, or a supervisor respawn finding it. Adopted into the map if
+        // this supervisor does not hold it yet, so its restarts are wired like any other.
+        if map.get(m.driver).is_none() { ensure_wired(ctx, map, m.driver, m.peers); }
+        ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached (binding {}) - {} running",
+            r.vid, r.pid, r.gen, m.driver));
+        return;
+    }
+    ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached (binding {}) - starting {}",
+        r.vid, r.pid, r.gen, m.driver));
+    if spawn_wired(ctx, map, m.driver, m.peers) {
+        events.note(ctx, supcmd::EV_ATTACHED, m.driver, m.vid, m.pid);
+    } else {
+        events.note(ctx, supcmd::EV_START_FAILED, m.driver, m.vid, m.pid);
+        ctx.log_fmt(format_args!("supervisor: {} could not be started for its device", m.driver));
+    }
+}
+
+/// TELL THE ONBOARD RADIO WHETHER THE DONGLE IS ATTACHED (`godspeed_wifi::wire::NOTE_USB_RADIO`, 0x2D -
+/// a literal here, as `nic-driver` writes the wire's ops, since this crate does not link `sdk/wifi`).
+/// The fact a radio that `/wifi.radio` does not choose stands in on, for a chosen dongle that is not
+/// there, and stands down on when it arrives (`docs/wifi-usb.md` 49).
+///
+/// Said when the pair (the onboard driver's endpoint, the dongle attached) differs from the last one told,
+/// so it reaches a respawned driver - a new endpoint - and every attach and detach, whichever spawn or
+/// report path made the change. Nothing is told before a host has reported (`UsbState::heard`): before
+/// that "absent" is only a starting value, and acting on it would stand the onboard radio in at every
+/// boot, ahead of the dongle's driver. Only where both radios exist: the onboard driver and a USB device
+/// driver for the dongle.
+fn tell_radio_of_dongle(ctx: &ServiceContext, map: &NameCapMap, usb: &UsbState, told: &mut Option<(u32, bool)>) {
+    if !cfg!(has_wifi_driver) || !usb.heard {
+        return;
+    }
+    let Some(row) = USB_MATCH.iter().position(|m| m.driver == "wifi-usb") else { return };
+    let Some(slot) = map.get("wifi-driver") else { return };
+    let now = (slot, usb.present[row]);
+    if *told == Some(now) {
+        return;
+    }
+    if try_send_slot(ctx, CapHandle(slot), &Message::from_bytes(&[0x2D, now.1 as u8])) {
+        *told = Some(now);
+    }
+    // Not delivered (its queue full, or it is mid-respawn): left untold, so the next pass tries again -
+    // the loop runs on every message, and a driver's death is one.
+}
+
+/// Whether the name map keeps `name`: a service this supervisor RESTARTS (`is_watched`), starts for a USB
+/// device (`USB_MATCH`), or wires other services to (a peer in some image row - `pong`, which `ping` and
+/// `greet` name). Every other spawn is on demand, and is not kept (`record_name_quiet`).
+fn map_keeps(name: &str) -> bool {
+    is_watched(name)
+        || USB_MATCH.iter().any(|m| m.driver == name)
+        || IMAGES.iter().chain(USB_IMAGES.iter()).any(|row| row.5.contains(&name))
+}
+
+/// The supervisor letting go of a cap it held in the name map, or held for a caller: one site.
+fn let_go(ctx: &ServiceContext, cap: Option<CapHandle>) {
+    if let Some(c) = cap { ctx.remove_cap(c); }
+}
+
+/// The supervisor's one non-blocking send on a capability it holds in hand - a reply capability, or a
+/// service's cap from the name map. One site, because the supervisor reaches the SDK directly: `gs` can
+/// only send on a `Cap` it granted itself, and these slots come from the map (scripts/one_way_check.py).
+fn try_send_slot(ctx: &ServiceContext, cap: CapHandle, msg: &Message) -> bool {
+    ctx.try_send_by_handle(cap, msg).is_ok()
+}
+
+/// Ask every reporting USB host for its report (`usbdev::ASK`): how a supervisor that has just started -
+/// at boot, or respawned by the kernel (6.2) - learns which devices are attached. No reply: the answer is
+/// the host's ordinary report, read by the main loop. A host not in the map yet is skipped; it reports on
+/// its own when its boot enumeration ends.
+fn ask_usb_hosts(ctx: &ServiceContext, map: &NameCapMap) {
+    let msg = Message::from_bytes(&[usbdev::ASK]);
+    for h in USB_HOSTS {
+        if let Some(slot) = map.get(h) {
+            if !try_send_slot(ctx, CapHandle(slot), &msg) {
+                ctx.log_fmt(format_args!("supervisor: could not ask {} for its USB devices", h));
+            }
+        }
+    }
+}
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
 /// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
@@ -1113,7 +1667,7 @@ fn respawn_retry(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool
 /// and a dropped name is silently never restarted (the "fs gone from observe after a storm" bug).
 /// `acquire_*_cap` cannot detect this (the kernel directory keeps a dead name), so we scan REAL liveness
 /// via `task_stat`. Returns how many it respawned. (One pass; the death-loop backstop.)
-fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
+fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &mut DevEvents) -> u32 {
     let alive = managed_alive(ctx);
     let mut n = 0;
     for i in 0..MANAGED_N {
@@ -1121,7 +1675,7 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
         // the PCI scan did not find (ehci/nic-driver/net-stack, below). Without this, reconcile would
         // "resurrect" a deliberately-skipped driver on the first death notification, undoing the skip.
         // Mirrors converge's `map.get(...).is_none()` guard.
-        if alive[i] || map.get(MANAGED[i]).is_none() { continue; }
+        if alive[i] || map.get(MANAGED[i]).is_none() || !usb.wanted(MANAGED[i]) { continue; }
         // respawn_RETRY, not a single respawn_managed: the reconcile backstop recovers a service whose
         // death NOTIFICATION was dropped (endpoint overflow under a storm), so a transient respawn
         // failure here has no later death to ride - it must retry to satisfaction like the death arms
@@ -1129,6 +1683,7 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
         if respawn_retry(ctx, map, MANAGED[i]) {
             n += 1;
             ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
+            events.note(ctx, supcmd::EV_SWEPT, MANAGED[i], 0, 0);
         }
     }
     n
@@ -1147,7 +1702,7 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap) -> u32 {
 /// that will not come up after `MAX_TRIES` is given up LOUDLY, so this can never hang on an impossible
 /// truth. Once consistent it returns to the recv loop and the live-supervisor notification path carries
 /// every future death.
-fn converge(ctx: &ServiceContext, map: &mut NameCapMap) {
+fn converge(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState) {
     const MAX_TRIES: u32 = 7;
     let mut attempts = [0u32; MANAGED_N];
     let mut given_up = [false; MANAGED_N];
@@ -1156,7 +1711,7 @@ fn converge(ctx: &ServiceContext, map: &mut NameCapMap) {
         let mut all_settled = true;
         for i in 0..MANAGED_N {
             // Only reconverge a service this build actually manages (`ensure_*` recorded it in the map).
-            if given_up[i] || alive[i] || map.get(MANAGED[i]).is_none() { continue; }
+            if given_up[i] || alive[i] || map.get(MANAGED[i]).is_none() || !usb.wanted(MANAGED[i]) { continue; }
             all_settled = false;
             attempts[i] += 1;
             if attempts[i] > MAX_TRIES {
@@ -1318,11 +1873,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // neither can delay the prompt the way a driver bring-up would.
     ensure_mapped(&ctx, &mut name_map, "time", 0xFFFF);
     ensure_mapped(&ctx, &mut name_map, "control", 0xFFFF);
+    // power: the clock policy (docs/power.md). Early, and before every service that leases the clock -
+    // `wifi-driver` wires to it at spawn, and a peer not yet in the name-cap map costs a failed lease.
+    ensure_mapped(&ctx, &mut name_map, "power", 0xFFFF);
     // hw-enumerator: hardware discovery in userspace (step D2). Started here because it holds no
     // device and blocks nothing - it reads PCI config space once, reports, then answers questions.
     //
-    // x86 ONLY, and the cfg is load-bearing rather than tidiness. ARM has no port I/O address space,
-    // so the image is not embedded there - and asking to spawn a name the kernel has no image for
+    // Embedded where configuration space is reachable (x86, aarch64, riscv64; `has_hw_enumerator`), and
+    // the cfg is load-bearing rather than tidiness. The Pi 2 has no PCI, so the image is not embedded there - and asking to spawn a name the kernel has no image for
     // does NOT quietly do nothing: the kernel embeds an empty placeholder and the spawn fails with
     // `LoadFailed(TooSmall)`. An earlier version of this line was unconditional with a comment
     // asserting it was "a no-op on ARM", which was simply untrue; `scripts/service_embed_check.py`
@@ -1356,7 +1914,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // `ensure_mapped` adopts a running instance rather than spawning a second: the supervisor is
     // restartable (Phase 6), so this line runs again on every respawn, and two drivers on one
     // controller is a worse failure than the one being fixed.
-    // Gated on the ARCHITECTURE only, deliberately. The test-build feature list that guards `xhci`
+    // Gated on the board having a DWC2 (`has_dwc2`) only, deliberately. The test-build feature list that guards `xhci`
     // below buys nothing here: on this board `dwc2` is not one driver among several, it is the only
     // path to storage, keyboard and network, so every arm32 build that boots at all wants it. Fewer
     // conditions also means fewer ways for this spawn to silently not happen - which is the exact
@@ -1412,6 +1970,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // fs needs a disk → bare-metal / blockdev only.
     #[cfg(any(feature = "bare-metal", feature = "blockdev"))]
     ensure_wired(&ctx, &mut name_map, "fs", &["block-driver"]);
+
+    // The dongle's driver (`wifi-usb`) is NOT started here. Both of its hosts, `dwc2` and `xhci`, report
+    // the dongle (`usbdev`), and the supervisor starts it when one is attached and stops it when it leaves
+    // (`usb_report`, docs/usb-device-drivers.md).
 
     // shell: the interactive prompt. Spawned in bare-metal (the USB image rests here) and full builds;
     // excluded from test-specific builds. Its `fs` peer is wired from the supervisor's map.
@@ -1561,7 +2123,40 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // They were simply missed when adoption came in with Path C / Phase 6; `fs`, `shell`, `dwc2`,
     // `block-driver`, `time` and `control` were all converted. Nothing else about them is special.
-    ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
+
+    // wifi-driver: the onboard radio (docs/wifi.md). Gated on the IMAGE being embedded and nothing
+    // else - the kernel is the one that decides whether this board actually has the controller, and it
+    // refuses the MMIO grant where its census found none. So on a radioless aarch64 machine this
+    // service starts, reports "no radio to drive on this machine", and serves; it does not die on a
+    // register read, and it does not need a second presence question here that could disagree with the
+    // kernel's.
+    //
+    // Not in the test-build feature list that guards `xhci`: those builds are x86 harness images and
+    // never carry this image at all, so the cfg above already excludes them.
+    //
+    // `ensure_mapped` ADOPTS a running instance rather than spawning a second. The supervisor is
+    // restartable (Phase 6), so this line runs again on every respawn, and two drivers on one SD host
+    // controller is a worse failure than the one it would be fixing.
+    //
+    // BEFORE nic-driver, because nic-driver declares this service as a peer (the radio is the link's
+    // fifth backend, docs/wifi.md 2) and a peer already in the name-cap map wires at spawn; one that is
+    // not costs a round of failure and reacquire (services/CLAUDE.md, the spawn order is a dependency
+    // order). The radio's own bring-up runs in its task and holds nobody up.
+    // Wired to `fs` for `/wifi.keys` (the storage chain is up by here, so the cap wires at spawn).
+    #[cfg(has_wifi_driver)]
+    ensure_wired(&ctx, &mut name_map, "wifi-driver", &["fs", "power"]);
+
+    // audio-driver (docs/audio.md). MANAGED: the kernel stops a dead driver's bus mastering by the
+    // device it was given (not by name), so a death is quiesced and restarted like any other driver's.
+    // Wired to `fs` for `/audio.settings` (the storage chain is up by here, so the cap wires at spawn);
+    // `ensure_wired` adopts a running instance on a supervisor respawn.
+    #[cfg(has_audio_driver)]
+    ensure_wired(&ctx, &mut name_map, "audio-driver", &["fs"]);
+    // The Pis' jack, the same way (docs/audio.md).
+    #[cfg(has_pwm_audio)]
+    ensure_wired(&ctx, &mut name_map, "pwm-audio", &["fs"]);
+
+   ensure_mapped(&ctx, &mut name_map, "nic-driver", 0xFFFF);
 
     // net-stack: the model-agnostic half of networking (docs/networking.md). Speaks ARP/IP over raw
     // frames THROUGH nic-driver's frame interface, so it is spawned right AFTER nic-driver and WIRED
@@ -1588,7 +2183,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // catches any managed service still Dead/settling in the churn - including a shell that `ensure_*`
     // adopted as a stale cap - and only returns once the roster is truly satisfied. From here the recv
     // loop plus the live-supervisor notification path carry every future death.
-    converge(&ctx, &mut name_map);
+    // Which USB devices are attached is the hosts' to say. Asked before the convergence, which leaves a
+    // device's driver alone until its host has answered (`UsbState::wanted`).
+    let mut usb = UsbState::new();
+    // What happens to the devices from here on (`hardware events`). Started before the hosts are asked,
+    // so the attaches their answers cause are in it.
+    let mut events = DevEvents::new(&ctx);
+    ask_usb_hosts(&ctx, &name_map);
+    converge(&ctx, &mut name_map, &usb);
+    // What the onboard radio was last told about the dongle (`tell_radio_of_dongle`).
+    let mut told_radio: Option<(u32, bool)> = None;
 
     ctx.log("supervisor: ready");
 
@@ -1607,105 +2211,95 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     loop {
         let msg = ctx.recv();
-        // A command, or a death notification? The first byte decides (see supcmd::MARKER).
-        if handle_command(&ctx, &mut name_map, msg.payload_bytes()) { continue; }
-        let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
-        // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
-        // ALREADY respawned this service before its queued death notification reached us. If it is
-        // already alive, a restart here hits the kernel singleton guard ("already running") and logs a
-        // FALSE "restart FAILED" - a loud non-failure that erodes trust in the signal (§26.4). Skip the
-        // doomed restart quietly (log "already recovered"); still run the reconcile backstop below so a
-        // genuinely-dropped OTHER death is caught this iteration. Same `task_stat` liveness the
-        // convergence uses, so the two paths agree on "alive".
-        if !name.is_empty() && name_alive(&ctx, name) {
-            ctx.log_fmt(format_args!("supervisor: {} already recovered (reconcile won the race)", name));
-            reconcile(&ctx, &mut name_map);
-            continue;
+        handle_message(&ctx, &mut name_map, &mut usb, &mut events, &msg);
+        name_map.release_handoff(&ctx);
+        // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
+        // multi-kill it found the services whose notifications were still QUEUED behind this one, respawned
+        // them, and logged "missed death notification" for each - and then each notification arrived and
+        // logged that it had already recovered. On the T630 a 50-round storm printed 174 of
+        // the first and 293 of the second, with the kernel reporting no notification lost at all. Handling
+        // the queue first makes the sweep what it says it is: a backstop for a death nobody was told about.
+        //
+        // BOUNDED, because a flood can keep this endpoint full: after DRAIN_MAX the sweep runs anyway, so
+        // a storm cannot starve the backstop (26.6). 64 is four queue-fulls.
+        const DRAIN_MAX: u32 = 64;
+        let mut drained = 0;
+        while drained < DRAIN_MAX {
+            let Some(next) = ctx.try_recv() else { break };
+            handle_message(&ctx, &mut name_map, &mut usb, &mut events, &next);
+            name_map.release_handoff(&ctx);
+            drained += 1;
         }
-        // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
-        // respawn WIRED FROM THE MAP - same peers as at boot - and the spawn refreshes the map with
-        // the new instance's cap (record updates in place, so a kill-storm can't grow the map). The
-        // restarted service is supervisor-wired just like at boot; clients reacquire it by name via
-        // the kernel directory (§14.3). The "died/restarted" log lines are kept (tests gate on them).
-        match name {
-            "block-driver" => {
-                ctx.log("supervisor: block-driver died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "block-driver") { ctx.log("supervisor: block-driver restarted"); }
-                else { ctx.log("supervisor: block-driver restart FAILED"); }
-            }
-            "fs" => {
-                ctx.log("supervisor: fs died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "fs") { ctx.log("supervisor: fs restarted"); }
-                else { ctx.log("supervisor: fs restart FAILED"); }
-            }
-            "shell" => {
-                // The user's interface is restartable too ("nothing escapes"): a crash or a
-                // deliberate `kill shell` respawns a FRESH prompt. spawn_wired spawns a new instance
-                // (the singleton guard only blocks a LIVE duplicate), re-granting its console-read +
-                // service_control caps and wiring its `fs` peer from the map. The in-flight command
-                // is lost (state is not resumed, §14.2/§25) but the session recovers.
-                ctx.log("supervisor: shell died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "shell") { ctx.log("supervisor: shell restarted"); }
-                else { ctx.log("supervisor: shell restart FAILED"); }
-            }
-            // The USB host drivers + events are directly restartable now: their OWN death respawns
-            // them immediately (re-granting MMIO/DMA/IRQ caps + re-initialising the controller),
-            // instead of waiting for a lucky supervisor respawn. This is what keeps a `chaos
-            // max-carnage` that kills `xhci`/`ehci` in its last rounds from leaving the keyboard dead.
-            "xhci" => {
-                ctx.log("supervisor: xhci died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "xhci") { ctx.log("supervisor: xhci restarted"); }
-                else { ctx.log("supervisor: xhci restart FAILED"); }
-            }
-            "ehci" => {
-                ctx.log("supervisor: ehci died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "ehci") { ctx.log("supervisor: ehci restarted"); }
-                else { ctx.log("supervisor: ehci restart FAILED"); }
-            }
-            // dwc2 (ARM32 only): the Pi 2's USB host. block-driver and nic-driver both name it as a
-            // peer, so its permanent death takes storage, the keyboard and networking with it - which
-            // is exactly why nothing may be exempt from restart (C5-1). Its respawn re-grants the
-            // DWC2 MMIO window, DMA arena and IRQ, re-initialises the controller and re-enumerates;
-            // clients reacquire it by name and retry (§14.3).
-            "dwc2" => {
-                ctx.log("supervisor: dwc2 died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "dwc2") { ctx.log("supervisor: dwc2 restarted"); }
-                else { ctx.log("supervisor: dwc2 restart FAILED"); }
-            }
-            "events" => {
-                ctx.log("supervisor: events died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "events") { ctx.log("supervisor: events restarted"); }
-                else { ctx.log("supervisor: events restart FAILED"); }
-            }
-            // counter (examples/counter, counter-test build): respawn it wired to `fs` - the fresh
-            // instance reconstructs its count from /counter.dat (§14/§15). The "died/restarted" lines
-            // are what `osdev test counter` gates on. (Only ever sent when counter is actually live.)
-            "counter" => {
-                ctx.log("supervisor: counter died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "counter") { ctx.log("supervisor: counter restarted"); }
-                else { ctx.log("supervisor: counter restart FAILED"); }
-            }
-            // The NIC stack is restartable too: nic-driver re-grants its MMIO/DMA/IRQ (its DMA arena is
-            // reserved once and reused, NIC_DMA_PHYS) + re-inits the controller; net-stack re-runs its
-            // DHCP/ARP/ICMP dance and re-registers. Clients (the shell's net/ping) reacquire net-stack by
-            // name (§14.3). net-stack also reacquires nic-driver by name, so either death order recovers.
-            "nic-driver" => {
-                ctx.log("supervisor: nic-driver died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "nic-driver") { ctx.log("supervisor: nic-driver restarted"); }
-                else { ctx.log("supervisor: nic-driver restart FAILED"); }
-            }
-            "net-stack" => {
-                ctx.log("supervisor: net-stack died, restarting");
-                if respawn_retry(&ctx, &mut name_map, "net-stack") { ctx.log("supervisor: net-stack restarted"); }
-                else { ctx.log("supervisor: net-stack restart FAILED"); }
-            }
-            _ => {}
+        // Reconcile backstop: catch any managed service whose death notification never reached us - our
+        // 16-deep endpoint overflowed under a storm, or we were ourselves dead and respawning when it was
+        // sent (the kernel says which, `UNHEARD` / dropped). It would otherwise stay dead forever (the "fs
+        // gone from observe after a storm" bug). Cheap when nothing is dead.
+        reconcile(&ctx, &mut name_map, &usb, &mut events);
+        tell_radio_of_dongle(&ctx, &name_map, &usb, &mut told_radio);
+        name_map.release_handoff(&ctx);
+    }
+}
+
+/// One message on the supervisor's endpoint: an operator command, or a death notification. Taken out of
+/// the main loop so the loop can drain its queue before the reconcile sweep (see there).
+fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, msg: &Message) {
+    // A USB host's device report, before the commands it shares `supcmd::MARKER` with: it carries no reply
+    // capability and is never answered.
+    if let Some(r) = usbdev::decode(msg.payload_bytes()) {
+        usb_report(ctx, name_map, usb, events, r);
+        return;
+    }
+    // A command, or a death notification? The first byte decides (see supcmd::MARKER).
+    if handle_command(ctx, name_map, usb, events, msg.payload_bytes()) { return; }
+    let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
+    // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
+    // ALREADY respawned this service before its queued death notification reached us. If it is
+    // already alive, a restart here hits the kernel singleton guard ("already running") and logs a
+    // FALSE "restart FAILED" - a loud non-failure that erodes trust in the signal (§26.4). Skip the
+    // doomed restart quietly (log that it was already respawned); the main loop still runs the reconcile backstop so a
+    // genuinely-dropped OTHER death is caught this iteration. Same `task_stat` liveness the
+    // convergence uses, so the two paths agree on "alive".
+    if !name.is_empty() && name_alive(ctx, name) {
+        // WHO won is said honestly: since the loop drains its queue before sweeping, the sweep almost
+        // never gets here first. What does is a NEW supervisor's startup convergence, which restores
+        // every dead service before it reads the notices that queued for it while it was down - on the
+        // T630 all 152 of these in a 50-round storm followed one of its 27 respawns, and none other.
+        ctx.log_fmt(format_args!("supervisor: {} already respawned when its death notice was read", name));
+        return;
+    }
+    // Restartable services (§6.1): fs + block-driver (Phase D). Phase 3c/4 (docs/naming-design.md):
+    // respawn WIRED FROM THE MAP - same peers as at boot - and the spawn refreshes the map with
+    // the new instance's cap (record updates in place, so a kill-storm can't grow the map). The
+    // restarted service is supervisor-wired just like at boot; clients reacquire it by name via
+    // the kernel directory (§14.3). The "died/restarted" log lines are kept (tests gate on them).
+    // ONE ARM FOR EVERY WATCHED SERVICE. This was fourteen arms, each the same three lines, and so a
+    // third copy of the `MANAGED` roster - which drifted exactly as the kernel's two copies did:
+    // `console`, `control`, `time` and `hw-enumerator` had none. Their notification ARRIVED, matched
+    // nothing, and the reconcile sweep below respawned them and logged "missed death notification",
+    // which was false - the T630 showed it for a single `kill console` with nothing else happening.
+    // The roster is `is_watched` now, the same answer the spawn request gives the kernel.
+    //
+    // What the respawn does is the service's, not this arm's, and is the same for every one: the
+    // kernel re-grants what the spawn row names (MMIO, DMA arena, IRQ, display, power control), the
+    // fresh instance re-initialises its device or reconstructs its state (fs replays its journal,
+    // counter re-reads /counter.dat, net-stack re-runs DHCP, a USB host re-enumerates, the shell
+    // gives a fresh prompt), and clients reacquire it by name and retry (14.2, 14.3). An in-flight
+    // operation is lost, never resumed (25). The "died/restarted" lines are what tests gate on.
+    // A device's driver whose device has gone: stopped on purpose (`usb_report`), so not restarted. It
+    // comes back when its host reports the device attached again.
+    if !name.is_empty() && !usb.wanted(name) {
+        ctx.log_fmt(format_args!("supervisor: {} ended - not restarted, its USB device is not attached", name));
+        return;
+    }
+    if !name.is_empty() && is_watched(name) {
+        ctx.log_fmt(format_args!("supervisor: {} died, restarting", name));
+        if respawn_retry(ctx, name_map, name) {
+            ctx.log_fmt(format_args!("supervisor: {} restarted", name));
+            events.note(ctx, supcmd::EV_RESTARTED, name, 0, 0);
+        } else {
+            ctx.log_fmt(format_args!("supervisor: {} restart FAILED", name));
+            events.note(ctx, supcmd::EV_RESTART_FAILED, name, 0, 0);
         }
-        // Reconcile backstop: catch any managed service whose death notification was DROPPED under the
-        // storm (our 16-deep endpoint overflowed, or a flood clogged it) - it would otherwise stay dead
-        // forever (the "fs gone from observe after a storm" bug). A storm always has a next death to
-        // ride, so a dropped one is recovered on the following notification. Cheap when nothing is dead.
-        reconcile(&ctx, &mut name_map);
     }
 }
 

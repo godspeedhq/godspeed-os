@@ -58,6 +58,9 @@
 - [2026-09-12 to 2026-09-13 - The day "it boots" stopped being the standard](#2026-09-12-to-2026-09-13---the-day-it-boots-stopped-being-the-standard)
 - [2026-09-13 to 2026-09-14 - The day the enforcement layer was pointed at itself](#2026-09-13-to-2026-09-14---the-day-the-enforcement-layer-was-pointed-at-itself)
 - [2026-09-26 to 2026-09-27 - The day a rule nobody could read stopped counting as enforced](#2026-09-26-to-2026-09-27---the-day-a-rule-nobody-could-read-stopped-counting-as-enforced)
+- [2026-09-27 to 2026-09-28 - The day the radio scanned the room](#2026-09-27-to-2026-09-28---the-day-the-radio-scanned-the-room)
+- [2026-09-29 to 2026-09-30 - The day the radio joined, and the cable learned to step aside](#2026-09-29-to-2026-09-30---the-day-the-radio-joined-and-the-cable-learned-to-step-aside)
+- [2026-09-30 to 2026-10-02 - The day the warm chip turned out to be a slow host](#2026-09-30-to-2026-10-02---the-day-the-warm-chip-turned-out-to-be-a-slow-host)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -1583,3 +1586,254 @@ Not one byte of any shipping binary. Eighteen checkers before, eighteen after; t
 verdicts. What changed is that a contributor can now ask, and be answered in words that name the law
 and the fix - and that the answer itself is held to a standard, because it is written down where a diff
 can see it.
+
+## 2026-09-27 to 2026-09-28 - The day the radio scanned the room
+
+The Pi 4's onboard WiFi - a Broadcom CYW43455 behind the Arasan SDIO block at `fe300000` - went from a
+device nobody had proven was a radio to one that listed the ten networks in the room, with names, signal
+strength and channel, in two days and about twenty-five boots. `docs/wifi.md` sections 13 through 35 are the
+record; this is what the record is about.
+
+### A radio is a second computer
+
+The chip has an ARM Cortex-R4 with 800 KiB of memory and no firmware of its own. Until the host writes 609 KB
+into that memory and releases the processor, there is no 802.11 anywhere inside it - nothing to ask, nothing
+to enumerate. Every other device this project has driven is fixed-function silicon that works from reset.
+This one boots from us. That single fact shaped the whole effort: phase 2 was a bootloader for someone else's
+CPU, and its bugs were bootloader bugs - the core held in reset when it should have been clocked and halted,
+the reset vector left unwritten, a token at the top of memory that the firmware overwrites to say it is alive.
+
+### The failures that read as facts
+
+The chip refused a scan with `BCME_NOTUP` through four boots of bring-up commands that were all accepted.
+The cause was regulatory data: a blob called CLM, which says which channels may be used at what power, and
+which was vendored in this repository the whole time with a comment explaining exactly how it is delivered
+and why it was not yet. A radio with no channel rules will not transmit or scan, and from outside that is
+indistinguishable from an interface that is down. The firmware was telling the truth; it was being asked the
+wrong question.
+
+Before that, the first control reply came back as sixteen bytes containing fragments of the driver's own
+request - `cur_` where a command number belonged, `dd` from `cur_ether**add**r` in the request-id field, and
+`-24`. The driver had told the firmware its header began 16 bytes after where it actually was, so the
+firmware parsed the iovar name as a header and complained about the length. The correct line from the
+reference was quoted in the driver's own documentation, three paragraphs above the code that contradicted
+it. **A correct citation next to wrong code reads as verification**, and cost three boots.
+
+### Read the whole function
+
+Ten of the twenty-five boots were spent on bugs that were mine rather than the protocol's, and they share a
+cause. Asking a reference for "the line that sets X" returns a true line that hides its neighbours: a flag
+that is a parameter, a value assembled from a constants list, a sequence returned in the order it was found
+rather than the order it runs. Every time a complete function was read in execution order - the CR4 halt,
+the bring-up sequence, the blob download - the answer was in it and correct first time. The rule already
+existed in `arch/CLAUDE.md` from an earlier bug in the same effort; this was the cost of knowing it and not
+applying it.
+
+### Boot the other operating system
+
+The single most useful line of the two days was in a Raspberry Pi OS boot log, and it was not about WiFi:
+`mmc-bcm2835 fe300000.mmcnr`. Linux does not drive this controller with generic SDHCI at all; the Pi
+Foundation has its own driver for the block, with a settling delay after every register write, a data
+timeout, and a PIO loop that moves a whole block between checks. Every host-side comparison until that boot
+had been against the wrong driver. It was the operator's idea, and it replaced a day of inference with a
+morning of transcription.
+
+### Wait on the truth
+
+The scan worked one boot before anyone could see it. Twelve result events and a completion marker arrived,
+every one decoded, and the network list never printed - because the collection loop bounded itself by a
+count of polls named as milliseconds, and each empty poll was a bus transaction plus a sleep. Four thousand
+"milliseconds" was two minutes; the capture ended first. The firmware had said `complete` at the two-second
+mark. The loop ends on that word now, and the count is a bound underneath it with an honest name. It is the
+project's oldest lesson - a count is not a duration - and the eighth Commandment as a fix rather than a rule.
+
+### What was borrowed and what was not
+
+The silicon's requirements came from Linux, OpenBSD and the Pi Foundation's driver, quoted at every point of
+use: register sequences, header layouts, byte orders, the four-byte integer an integer command carries. What
+did not come along is how those systems organise a scan - dynamic result lists, callbacks into a wireless
+subsystem, work queues. The results live in a fixed array of thirty-two on the stack that counts what it
+could not keep; the driver reads frames in its own loop; the state belongs to the call that made it. Ten
+glommed frames were dropped on the floor because the reference drops them too and its scans work.
+
+### What is not done, said plainly
+
+The driver scans at boot as its own self-test. The shell cannot ask it to yet, so `wifi` at the prompt still
+answers `unavailable`; that path, the numbered picker the operator designed, `wifi join <ssid>`, and
+secure-versus-open from the beacon's information elements are the next work. Association, the credential
+path and data frames are phases 4 and 5. The network identifiers from the successful scan are in the
+operator's capture and not in this repository, because the neighbours did not agree to appear in it.
+
+### Later the same night - it became a command
+
+`wifi list` at the prompt: the shell asks the driver over IPC, the radio sweeps, eleven records print in
+the order the specification set, and a second run scans again on the same session. Neither contract
+changed - the shell already reaches drivers by name, and the driver already replies through the cap it is
+handed. It cost one boot, to the oldest bug in the notes: a peer spawned after you has to be reacquired by
+name before the first request has anywhere to go. Phase 3's deliverable - *`wifi list` lists the SSIDs in
+the room* - is met as written. Security stays `unknown` until the beacon's information elements are read,
+and quitting does not yet stop the radio's sweep; both are recorded in the driver rather than pretended.
+
+## 2026-09-29 to 2026-09-30 - The day the radio joined, and the cable learned to step aside
+
+The scan had shown the room. Joining a network in it was supposed to be the firmware's job - phase 4's
+row in the plan says "firmware-offloaded" - and the firmware said no, three ways: the switch that hands it
+the WPA2 handshake does not exist on this build. So the host runs the handshake, as OpenBSD's does, and
+the driver grew the cryptography a station needs and nothing more: SHA-1, HMAC, PBKDF2, the 802.11 PRF,
+AES-128 with a computed S-box, the RFC 3394 unwrap, every one checked against a published vector at boot.
+Then the four messages, each quoted from net80211 at the line where it is answered.
+
+### Two bytes, twice
+
+The first run of the handshake verified message 3 - which settles that the passphrase, the key derivation
+and the signature path were all right, since the access point's MIC is computed with a key derived from
+the same passphrase - and was refused at the key install. The key structure had been sized by adding up
+its fields: 162. `sizeof` is 164, because C pads a 4-aligned struct's tail, and the firmware checks
+`sizeof`. The operator had rechecked the passphrase several times; the log says it was never in question.
+The next morning the signal reading fell to the same lesson: ten bytes of fields, twelve of `sizeof`,
+refused for a day as `BADARG`. A hand count of a C struct cannot see the padding. Read `sizeof` off a
+compiler.
+
+### A key is kept only once it has joined
+
+The driver kept the derived key the moment the passphrase arrived, so a join that failed left behind a
+key nothing had proved, and the next `wifi join` used it without asking. The operator had to `forget`
+between every attempt. Now a typed passphrase becomes a key in a working buffer, enters the table after
+`JOINED` and not before, and is zeroed either way. Store on success, never on receipt.
+
+### The cable always wins
+
+With the join working the operator pulled the ethernet cable and expected `ping` to follow the radio. It
+did not, because nothing above the join existed - and when asked which link should carry the frames when
+both are there, the answer was five words: "cable always wins. unplug the cable, switch to wifi
+automatically." So the radio became the fifth backend of `nic-driver`, the link front end, over the same
+three frame ops the Pi 2's USB adapter answers, and the cable decides: while the PHY reports a link the
+frames go over it, when it does not they go to the radio if it is joined, and back when it returns.
+`net-stack` needed one rule the design had not foreseen - a link whose address changes is a different
+link, and a cable never did that - and re-configures when the address under it moves.
+
+### The first boot proved it and then went deaf
+
+Cable out, the stack configured itself over the radio on the first try: discover, offer, acknowledge, ARP,
+an echo to the gateway, all through the air. Then every exchange with the radio began timing out at
+exactly its bound, and `observe` showed the shape: `nic-driver` blocked with sixteen stale requests behind
+it, the radio idle with an empty queue. The radio was answering nothing because it had nothing to answer
+on: the driver had never released a reply cap, a task holds sixty-four, and from the fiftieth request on
+the kernel could install no more. Three lines. The `wifi` commands alone had never reached sixty-four in a
+boot; the stack's polling reached it in seconds. The same shape exposed two more things, both recorded:
+a one-second bound on the radio lets a caller's inbox fill behind the call, so it is a hundred
+milliseconds now; and the kernel, handed a message for a blocked receiver whose queue is full, drops it
+and says it was delivered - a silent fallback in the IPC path, held for the next kernel change (and fixed
+that afternoon: it returns `QueueFull` now, `backlog/65`).
+
+### Works beautifully
+
+The second boot: `ping` over the radio, 36 of 38 with the two lost being the switch itself, then none;
+cable in, a new lease, `ping` over the cable; out again, over the radio with no new join; twice round.
+The radio answers in under a millisecond. The operator's words were "Works beautifully (ethernet cable
+plugged and unplugged)", and the sentence after the join, which had four quote marks in it, was rewritten
+to have none. Later that day the driver learned to answer the access point's periodic group-key rekey,
+which would otherwise have taken the link down on the router's timer; it cannot be provoked and has not
+yet been seen. The network's name and the access point's addresses are in the operator's captures and
+not in this repository.
+
+## 2026-09-30 to 2026-10-02 - The day the warm chip turned out to be a slow host
+
+The radio joined, and then the operator ran `chaos` with it carrying the link: 826 rounds, the kernel never
+panicked, nothing wedged, and the radio was dead from the first round. Every one of 397 respawns of
+`wifi-driver` found a chip that would not take a new firmware. Three days later the same test ran 100
+rounds and 50 rounds with the radio up at the end of both, and a power cycle came up cold every time. Most
+of what lay between was learning which of the things the logs said were true. `docs/wifi.md` 45 to 58 is
+the record, kept with its wrong turns in it.
+
+### Adopt, do not restart
+
+The first fix was to stop doing the thing that broke. A kill of the SERVICE does nothing to the CHIP: the
+firmware the dead instance loaded is still running, still associated. The respawn was resetting the chip
+and loading a new firmware over a live one, which is the case the chip's ROM will not boot. So a respawn
+now looks first, with two register reads, and a firmware found running is ADOPTED - its keys are read back
+and the link is back in about seven seconds. The best recovery is often to notice there is nothing to
+recover.
+
+### Power, granted twice
+
+For a firmware that has truly stopped, every reference driver cuts the chip's power, and on the Pi 4 the
+pin that does it lives behind the firmware mailbox the kernel owns. The kernel was already powering the
+SD domain at boot, because a window onto an unpowered device is not a grant. What it could not do was
+grant it again. So `DevicePower` is the device grant made renewable: given only to the service holding
+that device's window, and it reports what the pin READS BACK, not that the request was accepted. In QEMU,
+where the pin is not emulated, the first version reported a cut that never happened.
+
+### The chip was never warm
+
+Six host-side resets, a RAM clear, and the "warm chip" theory with every one of them: whatever survived
+a reset, it made the next firmware trap at `pc 0x25`. The number that ended it was a stopwatch, not a
+register. A cold upload took 3.26 s and every upload after a cut took 7.19 s, five times out of five, on
+the same bus. The reason was in the firmware's own documentation: `initial_turbo` holds the Arm cores fast
+for the first minute after boot, "or until `cpufreq` sets a frequency" - and nothing in GodspeedOS had
+ever set one. So a minute in, the cores dropped to their minimum and stayed there. Every load inside that
+minute came up cold; every load after it was slow, and trapped. `force_turbo=1` proved it on the card: five
+power cycles, every one cold. Six resets had been tested against a host running at a fraction of its
+speed, and the chip was blamed for it.
+
+Why a slow upload makes the firmware trap is still not known, and is written down as not known.
+
+### Mechanism here, policy there
+
+`force_turbo` holds the cores fast forever to make a three-second load work. The operator asked whether
+the kernel had to own the clock at all, and whether a fast clock could be left stuck on if the service
+asking for it died. Both questions shaped the answer. The kernel learned one thing, `CpuClock`: set the
+clock to the firmware's own minimum or maximum, and read back what it is. It cannot name a rate and never
+decides when. A new service, `power`, owns that: it hands out LEASES of up to 30 seconds, holds the clock
+at its maximum while any is open and at its minimum when none is, and a lease nobody returns expires on
+its own. The driver takes one for each load. On the card: 600 MHz between loads, 1500 MHz during them,
+five loads, every one cold. A grant that can outlive its holder needs a deadline, and the deadline
+belongs with the policy, not the mechanism.
+
+### The clock left the network stack
+
+`net-stack` used to fetch the time itself, inside its serve loop, so a `ping` could queue behind a time
+server. Now `net-stack` knows nothing about clocks. It offers one general operation, "send this datagram
+and answer me when the reply comes", and serves everyone else while it waits. `time` builds its own
+query with a random nonce and checks it comes back. Testing that in the emulator found two bugs that the
+real board could never show. The emulated Pi 4 has no random-number block, so the first `time` service
+that asked for a nonce took the KERNEL down from an unprivileged call; the kernel now probes the block at
+boot like any other device. And a deliberately unanswerable time server showed `net-stack`'s "no reply"
+arriving eight seconds late, because its deadlines were checked only when some unrelated message woke it.
+On real hardware the server always answers, and neither would ever have been seen.
+
+### An answer is not a reply to the question you just asked
+
+The kernel's `Call` takes the oldest reply FROM the peer, not the reply to the request just sent. So an
+answer the shell had stopped waiting for was read as the next command's: a stale `OK` made `powercycle`
+kill the driver mid-cycle and leave the chip unpowered, and late `radio down`s were counted as chips that
+"came up warm" in 150 ms. The first fix drained the queue; the second COUNTED what the driver still owed
+and skipped that many. QEMU then showed why the count could never be right: it was counted by watching the
+reply mailbox, every peer's replies land there, and nothing on a message says who sent it. A stray
+two-byte answer from another service cancelled an owed radio answer, and the next `wifi status` printed
+the previous one's. Now every request carries a tag the driver hands back, and every wait takes only the
+reply with its own tag. A fact carried in the reply beats a count kept beside it.
+
+The same hunt found the SDK destroying other services' capabilities. After a request is sent, the kernel
+moves the reply capability to the peer and empties the sender's slot, and the next capability the sender
+receives lands in that slot. On a timeout the SDK "reclaimed" the slot by number, and so deleted whatever
+had arrived in it - another client's way to be answered. It was on every service's request path, on every
+port. The boot that morning logged `reply cap is dead` twice; the boot after the fix, through a 50-round
+chaos run, logged it none. A slot number is not a name for what is in it.
+
+### Chaos, again
+
+`chaos max-carnage`, 100 rounds and 701 kills with the radio carrying the link, every service restarted
+between 45 and 56 times, and at the end the radio rejoined, `time` set the clock from the network, and 19
+pings out of 19 came back. Fifty more rounds two boots later, with the same ending. The chip is a second
+computer that chaos cannot touch; the driver is Godspeed's, and it recovers the way everything else does.
+
+### And it pipes
+
+The specification had said `wifi list | count` worked; the shell refused it, because `wifi` had never been
+added to its list of things that can start a pipe. Now the reports pipe and the actions refuse with a
+sentence - `join` asks for a passphrase, and in a pipe its prompt would vanish. Then `wifi list` became
+RECORDS in a pipe, so `wifi list | sort reverse dbm` puts the strongest network first. That needed a
+number the record model did not have: signal is measured in dBm, always below zero, and every number in a
+table had been unsigned. Writing the magnitude would be a different fact, and text sorts `-9` after `-80`.
+So the record model gained a signed number, pulled into existence by the one column that needed it.

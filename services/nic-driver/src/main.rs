@@ -29,7 +29,9 @@
 #![no_std]
 #![no_main]
 
-use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
+use godspeed::driver::delay;
+use godspeed::driver::wait::{self, Budget};
+use godspeed_sdk::{CapHandle, ServiceContext, Message, Mmio, Dma};
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
 ///
@@ -118,11 +120,15 @@ const TALLY_OFF:     usize = 0x7000;
 
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
-const RESET_POLL_MAX: u32 = 1_000_000;
-// A healthy RTL8168 clears the TX descriptor's OWN bit in ~us (the first few poll iterations). The old
-// 1_000_000-yield bound meant a NIC that FAILED to complete a transmit froze the whole ping for ~1s per
-// send. Bound it TIGHT so a stuck TX fails FAST and is recovered (§26.6 bounded, §26.7 loud), instead of
-// stalling the box. 30_000 is ~30x headroom over a us-scale success but ~ms, not seconds, on failure.
+// `RESET_WAIT` and `TX_CONFIRM_MS` are clocks (`gs::driver::wait`). `RX_POLL_MAX` is still a count of
+// yields, and a miss there is an ordinary empty reply, not a failure (`docs/driver-library.md` 1j).
+//
+// How long a controller reset may take to self-clear, for both chips. It was a COUNT - 1,000,000
+// yields here and 300,000 in the RTL8168 path - and a count of yields is no time at all: on the T630
+// 50,000 of them took over two seconds, so the RTL bound was over twelve seconds and the e1000's over
+// forty. Linux's r8169 polls the same bit 100 times 100 us apart, 10 ms; this allows ten times that
+// (`gs::driver::wait`).
+const RESET_WAIT: Budget = Budget::ms(100);
 /// How long to wait for the NIC to confirm a transmit, IN MILLISECONDS.
 ///
 /// It used to be a count - 30,000 yields - and a count is not a duration: the same loop is a
@@ -232,6 +238,20 @@ const RTL_MTPS_VALUE: u8 = 0x3B;
 /// in-flight DMA burst time to retire instead of being reset underneath itself.
 const RTL_QUIESCE_MS: u64 = 10;
 
+/// Wait, up to `TX_CONFIRM_MS`, for the NIC to say a transmit is done, yielding between looks: a send
+/// that has not landed at the first look is usually microseconds away, and the core is better given
+/// back than spun. Both chips call it; the caller reads the descriptor again for the answer.
+///
+/// `gs::driver::wait`'s deadline. The loops it replaced compared `read_tsc() < end`, which a counter
+/// wrapping mid-wait ends at once. On an uncalibrated machine the bound is the library's look count,
+/// and with a yield between looks that is not a time either.
+fn await_tx(ctx: &ServiceContext, mut done: impl FnMut() -> bool) {
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(TX_CONFIRM_MS));
+    while !done() && !deadline.expired() {
+        ctx.yield_cpu();
+    }
+}
+
 /// Realtek RTL8168 (the T630's NIC). Networking Phase 4, STAGE A: reset the controller, read the MAC
 /// (IDR0-5) and link (PHYSTATUS), and log them - proving the MMIO BAR + register access work on real
 /// hardware. TX/RX descriptor rings are Stage B; until then it serves the frame interface with EMPTY
@@ -240,8 +260,6 @@ fn realtek_main(ctx: ServiceContext) -> ! {
     const R_CR:        usize = 0x37; // Command: RST=0x10, RE=0x08, TE=0x04
     const R_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
     const CR_RST:      u8    = 0x10;
-
-    const REALTEK_RESET_MAX: u32 = 300_000; // SMALL - a wedged chip must not freeze the box for minutes
 
     let mmio = match ctx.mmio() {
         Some(m) => m,
@@ -262,16 +280,15 @@ fn realtek_main(ctx: ServiceContext) -> ! {
     // that path was correct and this one was not, on the same machine, for the same cause.
     mmio.write16(RTL_IMR, 0x0000);              // no interrupts while we take the chip down
     mmio.write8(R_CR, 0x00);                    // Rx and Tx OFF - stop the engine before resetting it
-    let t_quiesce = ctx.read_tsc().wrapping_add(ctx.duration_cycles(RTL_QUIESCE_MS));
-    while ctx.read_tsc() < t_quiesce { ctx.yield_cpu(); }
+    // A hold, not a wait: nothing reports the burst has retired (`gs::driver::delay`). It was a yield
+    // loop against `read_tsc() < end`, which a counter wrapping mid-wait ends at once.
+    delay::hold(&ctx, Budget::ms(RTL_QUIESCE_MS));
     mmio.write16(RTL_ISR, 0xFFFF);              // drop anything latched by the work we just stopped
 
     // Reset: set CR.RST, wait on the bit self-clearing (bounded SMALL + loud). If MMIO is not reaching
     // the chip (D3 / no memory-space) every read is 0xff, so RST never clears - we TIME OUT, not spin.
     mmio.write8(R_CR, CR_RST);
-    let mut spins = 0u32;
-    while spins < REALTEK_RESET_MAX && mmio.read8(R_CR) & CR_RST != 0 { ctx.yield_cpu(); spins += 1; }
-    let reset_ok = spins < REALTEK_RESET_MAX;
+    let reset_ok = wait::until(&ctx, RESET_WAIT, || mmio.read8(R_CR) & CR_RST == 0).is_ok();
     // MAC = IDR0-5 (two 32-bit reads); link = PHYSTATUS bit 1.
     let lo = mmio.read32(0x00);
     let hi = mmio.read32(0x04);
@@ -332,6 +349,15 @@ fn rtl_arm_rx(arena: &Dma, i: usize) {
     let mut o1 = RTL_DESC_OWN | (RX_BUF_SIZE as u32 & 0x3FFF);
     if i == RX_RING_COUNT - 1 { o1 |= RTL_DESC_EOR; }
     arena.write32(d, o1);
+}
+
+/// Answer a request on `reply_cap` and give the capability back - both halves, every time, so a reply
+/// slot cannot leak (CLAUDE.md 8.5). `gs::ipc::reply` is the same call on a `gs` capability; the
+/// radio bridge keeps the raw handle a held request arrived with (`radio.rs`), so this serve loop
+/// answers by handle. The outcome is counted, never discarded (`note_reply`).
+fn answer(ctx: &ServiceContext, reply_cap: CapHandle, body: &[u8], fails: &mut u32) {
+    note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(body)), ctx, fails);
+    ctx.remove_cap(reply_cap);
 }
 
 /// Realtek RTL8168 C+ TX/RX (Phase 4, STAGE B): set up the C+ descriptor rings in the DMA arena, enable
@@ -406,9 +432,31 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     // All three look identical from outside, and they are three different bugs.
     let mut empty_drains = 0u32;
     let mut rx_silence_logged = false;
+
+    // THE RADIO AS THE LINK'S SECOND BACKEND (`docs/wifi-usb.md` 39): the USB WiFi dongle's service,
+    // `wifi-usb`, reached over the same frame ops as on the Pi 2, Pi 4 and VisionFive, with the same rule
+    // - the cable always wins. Included by path, as those three include it. A PC has no onboard radio, so
+    // there is no second radio to follow (`Radio::new`, not `with_other`).
+    #[path = "radio.rs"]
+    mod radio;
+    use radio::{Carrier, Radio};
+    let mut radio = Radio::new("wifi-usb");
+    let mut carrier = Carrier::None;
+    let mut radio_tx_fail: u32 = 0;
     loop {
-        let req = ctx.recv();
-        let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        // A REQUEST THE RADIO WAIT KEPT IS SERVED FIRST - it arrived before anything the recv below could
+        // return (`Radio::held`).
+        let (req, reply_cap) = match radio.take_held() {
+            Some(h) => h,
+            None => {
+                let req = godspeed::ipc::recv(ctx);
+                match godspeed::ipc::take_sent_cap(ctx) { Some(c) => (req, c.handle()), None => continue }
+            }
+        };
+        // THE CABLE, read live on every request: PHYSTATUS is one register read, not the MDIO
+        // transactions GENET pays, so nothing is gained by remembering it. A `chaos link-flap` override
+        // counts as the cable, so a forced DOWN hands the frames to the radio as an unplug would.
+        let cable = force_link.unwrap_or(mmio.read8(RTL_PHYSTATUS) & 0x02 != 0);
         // ACK any latched RX/TX interrupt status before servicing. We POLL (IMR=0), and an UNCLEARED RDU
         // (Rx Descriptor Unavailable) or FOVW (Rx FIFO Overflow) HALTS the RTL8168 receiver - `net stats`
         // showed ISR=0x95 (RDU+TDU latched). But acking ALONE does not un-halt it once the ring actually
@@ -425,8 +473,16 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         }
         // [3] STATUS query (the `net` nic-mac diagnostic) - answer the MAC, do NOT treat it as a frame.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
-            // Fresh 15-byte status: reset_ok, mac(6), CURRENT link, last-TX-done, last-RX len, TX/RX
-            // counts. The link is read LIVE (it negotiates over a few seconds after reset).
+            // THE CABLE OUT: the nine-byte answer every radio backend gives (`radio::status`) - the
+            // radio's address and link while it is joined, and its last byte naming the carrier, which is
+            // how `net-stack` and `net` tell the radio carries the frames. The chip's tally below is the
+            // cable's, so it is not sent while the cable carries nothing.
+            let rs = radio::status(&ctx, &mut radio, cable, *mac, &mut carrier);
+            if !cable {
+                answer(ctx, reply_cap, &rs, &mut reply_fails);
+                continue;
+            }
+            // The link is read LIVE (it negotiates over a few seconds after reset).
             // 32-byte NIC hardware status (Layer-1 ground truth). [0] reset_ok, [1..7] mac, [7] link,
             // [8] last-TX-done, [9..11] last-RX len, [11..13] TX req count, [13..15] RX req count,
             // [15] speed|duplex, then the CHIP's OWN cumulative tally counters (DTCCR dump, independent
@@ -472,15 +528,28 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             s[24..28].copy_from_slice(&rx_brd.to_le_bytes());
             s[28..30].copy_from_slice(&rx_er.to_le_bytes());
             s[30..32].copy_from_slice(&miss.to_le_bytes());
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &s, &mut reply_fails);
+            continue;
+        }
+
+        // [10] WHICH ACCESS POINT carries the radio's link - asked only after STATUS has said the radio
+        // does. Before the bridge this backend took the one byte for a frame and sent it.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 10 } {
+            let out = radio::peer(&ctx, &mut radio, cable);
+            answer(ctx, reply_cap, &out, &mut reply_fails);
             continue;
         }
 
         // [4] RX-ONLY: poll the RX ring for ONE frame and return it (or empty) - NO drain, NO TX. Lets
         // net-stack collect frames AFTER a single query TX, so a reply arriving behind stray broadcasts
         // (mDNS etc. on a busy LAN) is caught WITHOUT re-transmitting - a re-TX drains+discards the reply.
+        // With the cable out, the frame is the radio's.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 4 } {
+            if !cable {
+                let n = radio.rx(&ctx, &mut rxbuf);
+                answer(ctx, reply_cap, &rxbuf[..n], &mut reply_fails);
+                continue;
+            }
             let mut n = 0usize;
             let mut rs = 0u32;
             while rs < RX_POLL_MAX {
@@ -497,8 +566,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 rs += 1;
             }
             if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rxbuf[..n])), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &rxbuf[..n], &mut reply_fails);
             continue;
         }
 
@@ -506,6 +574,26 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         // poll, length-prefixed, so net-stack scans past stray broadcasts for its reply in a single
         // round-trip. Ready descriptors are drained back-to-back (no yield); when the ring is empty we
         // poll (RX_POLL_MAX total) for more to arrive - so the whole call is ONE bounded poll, not N.
+        if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 && !cable } {
+            // THE CABLE OUT: the same batch, from the radio, one frame per ask until it has none (as on
+            // the Pi 2). The room check comes BEFORE the ask, so a frame is never taken from the radio
+            // only to be dropped for lack of space.
+            let mut out = [0u8; BATCH_MSG_MAX];
+            let mut opos = 1usize;
+            let mut nfr = 0u8;
+            while (nfr as usize) < BATCH_MAX && opos + 2 + FRAME_MAX <= out.len() {
+                let n = radio.rx(&ctx, &mut rxbuf);
+                if n == 0 { break; }
+                out[opos..opos + 2].copy_from_slice(&(n as u16).to_le_bytes());
+                opos += 2;
+                out[opos..opos + n].copy_from_slice(&rxbuf[..n]);
+                opos += n;
+                nfr += 1;
+            }
+            out[0] = nfr;
+            answer(ctx, reply_cap, &out[..opos], &mut reply_fails);
+            continue;
+        }
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 } {
             let mut out = [0u8; BATCH_MSG_MAX];
             let mut opos = 1usize;   // out[0] = frame count, filled at the end
@@ -576,8 +664,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                         if phy & 0x02 != 0 { "up" } else { "DOWN" }, rx_idx));
                 }
             }
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out[..opos])), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &out[..opos], &mut reply_fails);
             continue;
         }
 
@@ -613,8 +700,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 let o = STAT_FIXED + i * 4;
                 s[o..o + 4].copy_from_slice(&opts1.to_le_bytes());
             }
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&s)), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &s, &mut reply_fails);
             continue;
         }
 
@@ -627,8 +713,24 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             force_link = match req.payload_bytes()[0] { 6 => Some(false), 7 => Some(true), _ => None };
             ctx.log_fmt(format_args!("nic-driver: force-link {} (chaos link-flap)",
                 match force_link { Some(false) => "DOWN", Some(true) => "UP", None => "CLEAR (live)" }));
-            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1])), &ctx, &mut reply_fails);
-            ctx.remove_cap(reply_cap);
+            answer(ctx, reply_cap, &[1], &mut reply_fails);
+            continue;
+        }
+
+        // THE CABLE OUT: the frame is the radio's (`Carrier`), sent to `wifi-usb` as op 0x11, and none of
+        // the cable's receive-ring or transmit work below is done. A refusal is counted and said
+        // sparingly - a dongle that is not joined refuses every frame, correctly. One byte back, for the
+        // reason given at the end of the cable's path.
+        if !cable {
+            if !radio.tx(&ctx, req.payload_bytes()) {
+                radio_tx_fail = radio_tx_fail.saturating_add(1);
+                if radio_tx_fail == 1 || radio_tx_fail % 64 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: the radio did not send a {} byte frame (x{}) - not joined, or no answer",
+                        req.payload_bytes().len(), radio_tx_fail));
+                }
+            }
+            answer(ctx, reply_cap, &[0u8], &mut reply_fails);
             continue;
         }
 
@@ -669,10 +771,8 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         let o1 = RTL_DESC_OWN | RTL_DESC_EOR | RTL_DESC_FS | RTL_DESC_LS | (flen as u32 & 0x3FFF);
         arena.write32(td, o1);
         mmio.write8(RTL_TPPOLL, RTL_TPPOLL_NPQ);
-        let mut ts = 0u32;
         // Same clock bound as the e1000 path - see TX_CONFIRM_MS for why a yield COUNT was wrong.
-        let t_end = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TX_CONFIRM_MS));
-        while arena.read32(td) & RTL_DESC_OWN != 0 && ctx.read_tsc() < t_end { ctx.yield_cpu(); ts += 1; }
+        await_tx(&ctx, || arena.read32(td) & RTL_DESC_OWN == 0);
         let tx_done = arena.read32(td) & RTL_DESC_OWN == 0;
         if !tx_done {
             // With a single descriptor a ring desync is impossible, so a timeout here is a genuine NIC
@@ -708,17 +808,16 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         last_tx_done = tx_done;
         tx_count = tx_count.saturating_add(1);
 
-        // ONE BYTE, NOT EMPTY - a zero-length message cannot be delivered at all. The kernel rejects
-        // the send (`validate_user_ptr` fails on `len == 0`), so the caller waits out its full
-        // deadline for a reply that never left. Same defect and same fix as the transmit reply
-        // further down; no caller of a transmit reads its payload.
-        note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
-        ctx.remove_cap(reply_cap);
+        // ONE BYTE, NOT EMPTY. Until `e3fcf7ed` the kernel refused a zero-length send on three ports
+        // (`validate_user_ptr` failed on `len == 0`), and the caller waited out its full deadline for
+        // a reply that never left. Same fix as the transmit reply further down, and kept: no caller of
+        // a transmit reads its payload, and a byte says the frame was taken.
+        answer(ctx, reply_cap, &[0u8], &mut reply_fails);
     }
 }
 
 /// Serve the frame interface. A 1-byte `[3]` STATUS query gets `sreply` ([ok, mac(6)]) back - the
-/// `net` nic-mac diagnostic. Every other request (a frame from net-stack) gets an EMPTY reply, so
+/// `net` nic-mac diagnostic. Every other request (a frame from net-stack) gets a one-byte `[1]`, so
 /// net-stack degrades rather than hangs (§26.7). Never returns.
 fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     // Counts replies that could not be delivered; see `note_reply`.
@@ -730,9 +829,9 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
         if p.len() == 1 && p[0] == 3 {
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(sreply)), &ctx, &mut reply_fails);
         } else {
-            // Unrecognised op: still ANSWER. An empty reply is undeliverable (the kernel refuses a
-            // zero-length send), so this used to leave the caller waiting out its deadline for a
-            // request the driver had already decided it would not serve. One byte says so.
+            // Unrecognised op: still ANSWER. An empty reply was undeliverable on three ports until
+            // `e3fcf7ed`, so this used to leave the caller waiting out its deadline for a request the
+            // driver had already decided it would not serve. One byte says so.
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[1u8])), &ctx, &mut reply_fails);
         }
         ctx.remove_cap(reply_cap);
@@ -984,6 +1083,21 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     }
     ctx.log("nic-driver: serving frame interface");
 
+    // THE RADIO AS THE LINK'S SECOND BACKEND (R6, `docs/wifi-usb.md` 14): the USB WiFi dongle's service,
+    // `wifi-usb`, reached over the same frame ops as GENET's and dwmac's `wifi-driver`, with the same rule -
+    // the cable always wins. Included by path from inside this function, the backend it serves, as those
+    // two include it from theirs: no board fact is added to say which board has it.
+    #[path = "radio.rs"]
+    mod radio;
+    use radio::{Carrier, Radio, CABLE_RECHECK_MS};
+    let mut radio = Radio::new("wifi-usb");
+    let mut carrier = Carrier::None;
+    let mut radio_tx_fail: u32 = 0;
+    // The cable: the USB ethernet's own link bit (`dev_info`), re-read at most every `CABLE_RECHECK_MS`
+    // on whatever request arrives, and on every STATUS. With no USB ethernet at all there is no cable.
+    let mut cable = { let mut ni = [0u8; 7]; dev_info(&ctx, &mut ni) && ni[6] != 0 };
+    let mut cable_read_at = wait::Since::now(&ctx);
+
     // Poll the bulk IN endpoint up to RX_TRIES times for one received frame; returns its length (0 = none).
     let rx_one = |ctx: &ServiceContext, buf: &mut [u8]| -> usize {
         for _ in 0..RX_TRIES {
@@ -997,24 +1111,45 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
     loop {
-        let _req = ctx.recv();
-        let reply_cap = match ctx.take_pending_cap() { Some(c) => c, None => continue };
+        // A REQUEST THE RADIO WAIT KEPT IS SERVED FIRST - it arrived before anything the recv below could
+        // return (`Radio::held`, as in GENET's loop).
+        let (_req, reply_cap) = match radio.take_held() {
+            Some(h) => h,
+            None => {
+                let r = godspeed::ipc::recv(&ctx);
+                match godspeed::ipc::take_sent_cap(&ctx) { Some(c) => (r, c.handle()), None => continue }
+            }
+        };
         let p = _req.payload_bytes();
 
-        if p.len() == 1 && p[0] == 3 {
-            // STATUS: [ok, mac(6), link] - net-stack reads MAC at [1..7] and link at [7].
-            let mut out = [0u8; 8];
+        // THE CABLE, re-read at most every CABLE_RECHECK_MS (`Carrier`).
+        if cable_read_at.passed(&ctx, Budget::ms(CABLE_RECHECK_MS)) {
+            cable_read_at = wait::Since::now(&ctx);
             let mut ni = [0u8; 7];
-            if dev_info(&ctx, &mut ni) {
-                out[0] = 1;
-                out[1..7].copy_from_slice(&ni[0..6]);
-                out[7] = ni[6];
+            cable = dev_info(&ctx, &mut ni) && ni[6] != 0;
+        }
+
+        if p.len() == 1 && p[0] == 3 {
+            // STATUS: [ok, mac(6), link, carrier] (`radio::status`) - the cable's own address and link
+            // while it has one, the radio's when it does not and the dongle is joined. Read fresh.
+            let mut ni = [0u8; 7];
+            let have = dev_info(&ctx, &mut ni);
+            cable = have && ni[6] != 0;
+            cable_read_at = wait::Since::now(&ctx);
+            let mut mac = [0u8; 6];
+            if have {
+                mac.copy_from_slice(&ni[0..6]);
             }
+            let out = radio::status(&ctx, &mut radio, cable, mac, &mut carrier);
+            note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
+        } else if p.len() == 1 && p[0] == 10 {
+            // WHICH ACCESS POINT carries the radio's link - asked only after STATUS has said the radio does.
+            let out = radio::peer(&ctx, &mut radio, cable);
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&out)), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 4 {
             // RX-only: one frame, no TX.
             let mut rx = [0u8; FRAME_MAX];
-            let n = rx_one(&ctx, &mut rx);
+            let n = if cable { rx_one(&ctx, &mut rx) } else { radio.rx(&ctx, &mut rx) };
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&rx[..n])), &ctx, &mut reply_fails);
         } else if p.len() == 1 && p[0] == 9 {
             // BATCH RX drain: [count:u8] then per frame [len:u16 LE][bytes].
@@ -1027,7 +1162,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
                 // re-polls (op 4/9) for whatever we stop short of.
                 if opos + 2 + FRAME_MAX > out.len() { break; }
                 let mut rx = [0u8; FRAME_MAX];
-                let n = dev_rx(&ctx, &mut rx);
+                let n = if cable { dev_rx(&ctx, &mut rx) } else { radio.rx(&ctx, &mut rx) };
                 if n == 0 { break; }
                 out[opos] = (n & 0xff) as u8;
                 out[opos + 1] = ((n >> 8) & 0xff) as u8;
@@ -1072,17 +1207,29 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // Nothing is stranded by the change: not fetching the frame leaves it queued for the next
             // drain, and every caller that transmits already drains afterwards. What is lost is at most
             // one poll interval of latency on the first frame after a send.
-            if !dev_tx(&ctx, p) {
+            if !cable {
+                // The radio's turn (`Carrier`): the frame goes to `wifi-usb` as op 0x11, and a refusal is
+                // counted and said sparingly - a dongle that is not joined refuses every frame, correctly.
+                if !radio.tx(&ctx, p) {
+                    radio_tx_fail = radio_tx_fail.saturating_add(1);
+                    if radio_tx_fail == 1 || radio_tx_fail % 64 == 0 {
+                        ctx.log_fmt(format_args!(
+                            "nic-driver: the radio did not send a {} byte frame (x{}) - not joined, or no answer",
+                            p.len(), radio_tx_fail));
+                    }
+                }
+            } else if !dev_tx(&ctx, p) {
                 tx_fail = tx_fail.saturating_add(1);
                 if tx_fail == 1 || tx_fail % 64 == 0 {
                     ctx.log_fmt(format_args!("nic-driver: usb-net TX FAILED x{} (frame not sent)", tx_fail));
                 }
             }
-            // A ONE-BYTE ANSWER, BECAUSE AN EMPTY MESSAGE CANNOT BE DELIVERED AT ALL.
+            // A ONE-BYTE ANSWER, BECAUSE AN EMPTY MESSAGE COULD NOT BE DELIVERED WHEN THIS WAS FOUND.
             //
-            // The kernel rejects a zero-length send outright - `validate_user_ptr` returns false for
-            // `len == 0`, so `build_message` fails and the reply never leaves. The caller then waits
-            // out its whole deadline for an answer that was never on the wire. Measured on hardware:
+            // The kernel rejected a zero-length send outright - `validate_user_ptr` returned false for
+            // `len == 0`, so `build_message` failed and the reply never left (it accepts one on every
+            // port since `e3fcf7ed`, `backlog/66`). The caller then waited out its whole deadline for
+            // an answer that was never on the wire. Measured on hardware:
             // every ping cost `nic-driver gave NO ANSWER after 2012 ms (budget 1 s) for op 0 [why -1]`
             // - two attempts timing out - while the ICMP round trip itself took 66 ms. The ping was
             // not slow; this acknowledgement was undeliverable.
@@ -1094,7 +1241,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             // `is_some()` - none reads the payload. The comment outlived the code it described.
             //
             // 0 = sent. `fs` reached the same conclusion for its own protocol and wrote it down
-            // there: an empty reply is not an answer. It is not even a message.
+            // there: an empty reply is not an answer.
             note_reply(ctx.try_send_by_handle(reply_cap, &Message::from_bytes(&[0u8])), &ctx, &mut reply_fails);
         }
         ctx.remove_cap(reply_cap);
@@ -1180,8 +1327,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         // Reset to a known state (bring-up on EVERY spawn - Commandments V + IX), wait on the bit.
         m.write32(REG_CTRL, m.read32(REG_CTRL) | CTRL_RST);
-        let mut spins = 0u32;
-        while spins < RESET_POLL_MAX && m.read32(REG_CTRL) & CTRL_RST != 0 { ctx.yield_cpu(); spins += 1; }
+        if wait::until(&ctx, RESET_WAIT, || m.read32(REG_CTRL) & CTRL_RST == 0).is_err() {
+            ctx.log_fmt(format_args!(
+                "nic-driver: e1000 reset did not self-clear in {} ms - continuing from whatever state it is in",
+                RESET_WAIT.as_us() / 1000));
+        }
         // Bring the link UP (else nothing flows back on the wire).
         m.write32(REG_CTRL, m.read32(REG_CTRL) | CTRL_SLU | CTRL_ASDE);
 
@@ -1414,8 +1564,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             a.write8(td + 11, TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS);
             a.write8(td + 12, 0); // clear DD
             m.write32(REG_TDT, ((tx_idx + 1) % TX_RING_COUNT) as u32);
-            let t_end = ctx.read_tsc().wrapping_add(ctx.duration_cycles(TX_CONFIRM_MS));
-            while a.read8(td + 12) & TXD_STA_DD == 0 && ctx.read_tsc() < t_end { ctx.yield_cpu(); }
+            await_tx(&ctx, || a.read8(td + 12) & TXD_STA_DD != 0);
             tx_confirmed = a.read8(td + 12) & TXD_STA_DD != 0;
             tx_idx = (tx_idx + 1) % TX_RING_COUNT;
 

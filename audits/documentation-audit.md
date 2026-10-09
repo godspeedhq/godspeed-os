@@ -8,6 +8,110 @@
 > First audit: 2026-07-15.
 
 
+## Audit 9 - the `feat/wifi-driver` branch: does the prose match what shipped? (2026-10-04)
+
+**Scope:** `feat/wifi-driver` against `main` - 206 files, +34,281 lines, about 9,000 of them documentation:
+the Pi 4 radio end to end, the audio branch merged in (the HD Audio driver and the Pis' PWM jack), the
+kernel learning no service name but the supervisor, the `power` service and the CPU clock lease, the
+`gs::driver` library, the Pi 4 page-table fault (`backlog/72`) and the VisionFive AIC8800 phases V0-V1.
+Docs, per-directory `CLAUDE.md` files, utility specs and CODE COMMENTS. Run while the operator was away.
+The whole range against `main`, so it includes what Audit 8 (2026-10-02, at the end of this file) covered.
+
+**Method.** Six read-only reviewers in parallel, one slice each (`docs/wifi.md`; the `wifi` spec, `sdk/wifi`
+and the driver's comments; audio and the "no service names" claims; kernel comments and the arch docs;
+the driver library, power, networking and the services tables; the backlog, the almanac, the AIC8800
+design and `nonfree/`), each asked for contradictions WITH EVIDENCE and a list of what checked out. Every
+finding was confirmed against the code before it was fixed. One was partly wrong: the reviewer said
+`drain_stale_replies` and `drain_owed_replies` do not exist; they do, in the SDK - the shell simply no
+longer calls the second - and the fix says that instead.
+
+**Verdict: about 90 findings, 22 HIGH. All fixed but the eight recorded below.** No Commandment
+violation. Afterwards everything passes: the x86 build with every gate, the Pi 4 and VisionFive builds,
+`unsafe_check`, `shared_surface_check` and `commandments.py`.
+
+### The shape worth naming: a mechanism moves, and the sentences that described it keep its old name
+
+Audit 7's lesson was a behaviour changed and its three descriptions left behind. This branch's is the
+same at a larger scale, with one phrase doing most of the damage: **"by name"**. The kernel stopped
+granting by service name on 2026-10-03 (CLAUDE.md 12.3), and "granted by name" survived in a syscall's
+doc, the Pi 4 radio's grant function, the services table, the driver's module header, its host's header
+and `docs/wifi.md` section 47 - six places, four of them in the kernel, each beside code that now says
+`kind`. Nothing could fail: the grant is right, and no gate reads what a comment means.
+
+The second shape is a design document written in the future tense and read in the present. `docs/wifi.md`
+section 5 said "no crypto exists in this tree" and that the firmware would run the handshake; section 8
+said a restart re-uploads the firmware from a file. All three were true when written and all three are
+now false - the handshake is the host's, the firmware is embedded, a respawn adopts the running one - and
+none was marked. They are now, each pointing at the section that changed it.
+
+### Findings, by kind (all FIXED unless listed under "Left open")
+
+- **Grants and deaths by name** (HIGH): `syscall/dispatch.rs` `handle_device_power` (which also claimed
+  success when the firmware took the request; it is when the pin reads back), `arch/aarch64/mod.rs`
+  `map_fixed_device`, `services/CLAUDE.md` (the `wifi-driver`, `counter` and `recorder` rows),
+  `services/wifi-driver` `main.rs` and `host.rs`, `docs/wifi.md` 47, and the scheduler's comments on the
+  removed name lists.
+- **The page-table fault's own fix outdated its neighbours** (HIGH): `free_page_table_root` still explained
+  a skip `switch_context` no longer makes, and the safety contracts of it and `free_all` claimed TTBR0 had
+  been switched away, which an idling core does not do. `arch/CLAUDE.md` SEC-27 stated that
+  `write_page_table_base` flushes - true on x86 and riscv64, false on arm32 and aarch64 - which leaves
+  `smp/ipi.rs`'s full-flush sentinel a no-op there (latent: nothing calls it; recorded below).
+- **Shipped but documented as not** (HIGH): `utilities/57_audio.md` said the Pis' jack was never heard (the
+  Pi 4 was) and that only x86 has an audio driver; `docs/audio.md` said `play` and the Pi grant were not
+  built; the website said the `audio` command was not built; `backlog/65` still waited on closing
+  conditions both of which had been met.
+- **The `wifi` utility spec described an architecture that was never built** (HIGH): standalone services
+  holding an introspection-only capability, and a hidden network joinable by BSSID. Every verb is a shell
+  built-in on one send cap, and a hidden row cannot be joined. The status reply layout in
+  `sdk/wifi/src/wire.rs` - the shared definition both sides are meant to read - was wrong byte by byte.
+- **Stale user-visible text** (HIGH): the shell's `wifi` help offered `connect`, which it refuses, and said
+  stored keys die with a reboot (they persist in `/wifi.keys`).
+- **Doc blocks attached to the wrong item** (MED): later insertions had split `fault_report`'s,
+  `handle_pci_cfg_read`'s, `hw_class_of`'s and `hw_random`'s docs from their functions, so rustdoc attached
+  each to its neighbour.
+- **The services table and spawn order** (MED): the `events` row said a respawn drains the kernel ring
+  (nothing does), caps were "minted from the contract" (from the spawn request, 13.6), the riscv64 storage
+  caveat described an order the supervisor fixed, the radio and audio drivers were missing from the spawn
+  order, and step 1 of adding a service was the unimplemented `osdev new`.
+- **Counts and pointers** (LOW): `join::Keys` 40 -> 78 bytes, a record 44 -> 45 bytes, an upload chunk 2 KiB
+  -> 1 KiB, the website's SNTP in net-stack, `HOLD_MS` described as a fixed hold.
+- **Records**: `docs/wifi.md` gained section 61 (an idle link dropped for inactivity, reason 4, about six
+  minutes in; one echo a minute kept it up), the AIC8800 design a "V1 as built" note, the almanac the
+  same-day fix of the IPC silent fallback, and `backlog/66` the honest form of its SNTP line (run on the
+  Pi 4, not yet with an unset clock).
+
+### Left open, recorded rather than fixed
+
+1. **CLAUDE.md 12.3** (the `DevicePower` amendment) says every port but the Pi 4 answers the seam with
+   `false`; riscv64 now answers `true` for the VisionFive's radio. The constitution is the operator's to
+   amend.
+2. **CLAUDE.md 6.4** (the audio amendment) says the bus-master clear moved off names "in the same change";
+   `docs/audio.md` records it as a separate, earlier one. Same reason.
+3. **`smp/ipi.rs`'s full-flush sentinel flushes nothing on arm32 and aarch64.** Latent - nothing calls
+   `broadcast_full_tlb_flush` - and now documented at both ends; a real flush seam is owed before anything
+   on those ports calls it.
+4. **`wifi` on the VisionFive** (reason `DOWN_NOT_BUILT`): `wifi radio on` and `powercycle` still restart
+   the driver, and the radio watch reports any down radio as a chip that "came up warm". Code, in the
+   uncommitted V1 work; it is to be fixed with V1. **Closed the same day**, after V1 passed on the board:
+   both verbs now say the reason and restart nothing, and the watch calls only `DOWN_TRAPPED` warm.
+5. **`kernel/build.rs`** lists `pwm-audio` and `power` in `arm_built`, inert because neither is in the
+   services table above it - and whether that table still matters now the supervisor holds the images
+   (step C) is a larger question than a comment.
+6. **The `pwm-audio` arena** is granted 36 pages and needs 33; nothing records why.
+7. **`backlog/README.md`** rows 55-73 are out of numeric order. Cosmetic. **Closed the same day**: sorted.
+8. **Stale baseline entries** in `scripts/DOC-SYMBOLS.baseline.txt` and `COMMENT-SYMBOLS.baseline.txt`
+   (`sdio_io_rw_ext_helper`, `txbf`, and the others the doc gate lists): the ratchet can tighten. **Closed the same day**: 31 and 105 entries removed
+   (127 to 96, 509 to 404), each named by its own gate as no longer needed.
+
+### What came back clean
+
+The kernel acts on only one service name at runtime, `supervisor` (spawn privileges, the death path, the
+directory); death notification and restart counting follow `SPAWN_FLAG_WATCHED`; the display keys on the
+framebuffer kind; the two removed grants are gone. Every constant `docs/wifi.md` quotes for the frame path,
+the key file, power and the clock lease; the `power` lease rules; `networking.md` 16; the driver library's
+API; `backlog/67`, 72 and 73 as fixed; every `nonfree/` hash; the AIC8800 design's clock, reset, pin and
+census facts.
+
 ## Audit 7 - the `feat/gsfs` branch: does the prose match what shipped? (2026-09-23)
 
 **Scope:** `feat/gsfs` against `main` - 145 files, +19,879 lines. The filesystem carnage program, the
@@ -891,3 +995,342 @@ comment fixes are welcome, and a comment audit that finds four dead names in `ke
 to fix them has not done its job. All four are restored. The property the rule protects is checked by
 filtering the diff for non-comment lines, which returns 0. What stands from the revert is the part
 that was actually the failure: the commit ASSERTED the check passed without running it.
+
+## Audit 8 - documents and code comments, `feat/wifi-driver` since `50325b96` (2026-10-02)
+
+Scope: every document and Rust file the branch changed in its last three days - the clock leaving
+`net-stack`, the reply-cap and tag fixes, the wifi pipes and records, `Value::Signed`, and the WiFi code
+moving into `sdk/wifi` (steps 1, 2a, 2b-i). Two read-only audits, one of documents against the code, one of
+comments against the code beside them; every finding was checked against the source before it was fixed.
+
+**The finding that matters most was a gate, not a sentence.** `site_check`'s services coverage check read
+the kernel's restart set with `.{0,600}?`. The list is 936 characters now, so the pattern matched nothing,
+the set came back empty, and the check passed while checking nothing - and the services page went on
+omitting `wifi-driver` and `power`. It parses to the brace now and fails loudly if it cannot find the list,
+and it was PROVED to fire: with `wifi-driver` removed from a copy of the page it reports
+"services.md does not mention `wifi-driver`". The page has both sections.
+
+**Stale after the code moved** (comments): the credential table "not on disk" (it is the working set behind
+`/wifi.keys`); the shell's radio wait described as a sender-matched `Call` after it became a tag-sifted wait;
+`Card::warm` said to mean "the CCCR RES write was accepted" (only a driver's adopt path sets it); four SDK
+comments still promising a reply-cap reclaim that `backlog/67` removed; `Value::Signed` "not summed" after the
+aggregators learned to; the record size (32 x 45 + 2 is 1442, not 1410) and the security byte (43, not the
+last); shared-crate comments naming driver modules as if they lived beside them; host comments naming `cmd()`
+after it became `cmd_inner` and the trait.
+
+**Stale after the hardware said otherwise** (documents): `utilities/56_wifi.md` still described a five-second
+power-on wait (300 ms), a ten-second bound (15 s) and warm starts "one in three" (a slow host, gone with the
+clock lease); `services/CLAUDE.md` still said only a power cycle recovers the chip (open, `docs/wifi.md` 56);
+`backlog/66` and `67` still said their fixes were not yet booted; `docs/records.md` counted ten producers
+without `wifi list`; `docs/wifi.md` 59 described the `Station` trait as planned rather than as built.
+
+**Recorded, not changed:** the shared crate's log lines say `wifi-driver:`, true while that is the only radio
+service; a radio behind `dwc2` will need the prefix passed in (`sdk/wifi/src/lib.rs`, "Known gap").
+
+Verified rather than asserted: the Rust part of this audit is comments only - the uncommitted diff's
+non-comment Rust lines are the ten of the separate `keyfile` fix, counted, not assumed.
+
+## Audit 9 - documents and code comments, `feat/wifi-driver` since `5f501775` (2026-10-07)
+
+Scope: everything the branch changed since Audit 8 - 140 commits, 24 documents and the comments of 70 Rust
+files: the USB WiFi dongle end to end (`wifi-usb`, its hosts, the radio bridge on the PCs, `wifi hardware`),
+and the day's hub and key-store fixes. Three read-only audits ran in parallel - the long design note, the
+other documents, the comments - and every finding was checked against the source before it was fixed. The
+mechanical gates (`doc_refs`, `doc_symbols_check`, `comment_symbol_check`, `facts_check`, `line_ref_check`,
+`site_check`, `dash_check`) were green throughout; nothing below is a thing they can see.
+
+**The finding that matters most was a bug, found by reading a comment.** The shell's `net` sets
+`nic_link_up` from the eight-byte and the long status answers, and did not from the nine-byte one - the
+answer every radio-bridge board gives. So on a Pi 2, Pi 4, VisionFive or PC with the cable out and the radio
+not joined, `net` printed `link down - no cable, and the radio is not joined` and then the last address
+held, the gateway and `ping ok`, as if the link were up - the exact case `utilities/40_net.md` promises
+it does not ("when it says down, the address lines below say so too"). One line; the comment above it
+claimed smsc95xx and dwmac answer eight bytes, which is how it was missed.
+
+**Stale after the code moved (comments):**
+- `wifi-usb`'s `install_key` doc still described rtl8xxxu's first-free layout directly above the rtlwifi
+  code that replaced it (`docs/wifi-usb.md` 43); `drop_keys`'s doc line had been fused onto
+  `say_key_store`'s when the instrument went in.
+- The shell said `wifi hardware use` is "not built", the bridge "fixed per board ... none on the PCs", and
+  the PCs have "no wireless radio ... until a USB host other than the Pi 2's serves a dongle" - all three
+  done.
+- The supervisor's header listed `wifi-usb` in the boot spawn set (it is started on a USB report), and
+  `NIC_PEERS` had lost its doc to the `DWC2_PEERS` inserted above it.
+- `xhci`: "only its EP0 is driven so far" above the bulk endpoints' configuration; Set Hub Depth's comment
+  stated as fact a cause the Wyse card has not yet shown; the input-context comment still said the card
+  would show what it has shown.
+- `wifi-usb`'s header: the sweep "passive" (it probes since R5a) and `xhci` "on the T630" only;
+  `sdk/wifi`'s header: two radios "on the bench".
+- `dwc2`: the failure path "as the success path does" (it clears more); `radio.rs`: the cable re-read
+  justified by MDIO alone (the Pi 2's is an IPC); the RTL8168's "15-byte status" above a 32-byte one;
+  `dwmac.rs` "does not yet move frames".
+
+**Stale after the hardware said otherwise (documents):** `website/src/services.md` described `wifi-usb` as
+reading chip registers behind `dwc2` with peers `dwc2` (it joins and carries traffic behind either host,
+peers its host and `fs`); `utilities/56_wifi.md` called `wifi hardware use` and 11a QEMU-only and the PCs
+bridgeless; `utilities/40_net.md` listed smsc95xx and dwmac as single-link; `docs/usb-device-drivers.md`
+had the bridge on x86 and `use` as not built and "one host reports"; `docs/CLAUDE.md` said the Pi 4 owed a
+check card it passed; `services/supervisor/CLAUDE.md` started a USB device's driver "on the Pi 2 today";
+`sdk/wifi/CLAUDE.md` gave `xhci` control transfers only; `backlog/78` described the pre-fix code in the
+present tense. In `docs/wifi-usb.md`, five section headings carried a status later sections overtook (7,
+34, 39, 43) and section 38's reverted change was in the present tense; the overview said the choosing was
+not built; the `OP_INFO` row lacked `xhci`'s location tail.
+
+**Real addresses removed.** Four lines of `docs/wifi.md` carried the Pi's radio and ethernet MACs, and
+three lines of `utilities/40_net.md` a NIC's MAC and the gateway's - all written before this branch. They
+are placeholders now; the history still has them. `utilities/56_wifi.md`'s `02:1a:7e:c4:09:51` is locally
+administered and stands as an invented example.
+
+**Checked and correct, recorded so it is not re-chased:** the key-store constants and their comments
+(0xcc, entry 4, no group flag, the read-back of the two enables only); `dwc2`'s debounce and reset numbers
+(25/100/2000, 800) against their comments; `xhci`'s `MAX_SLICES` 6, the input-context clear, the protocol
+test and Set Hub Depth; no live comment still describes section 38's reverted per-port rebind or ring wrap;
+every `usbfn` opcode and size in the doc's table; the 54 arch-conditional sites in `CLAUDE.md` and
+`docs/porting.md`; `backlog/79` against the code.
+
+**Left as they are:** `docs/wifi-aic8800.md`'s "`serve_radio` waits at most 250 ms" is in dated text and was
+true then (the loop moved to `godspeed_wifi::serve` since). `install_key`'s group arm in `station.rs` still
+computes the BSSID it no longer uses - a dead branch, not a wrong comment, left for a code change rather
+than an audit.
+
+## Audit 10 - documents and code comments, `feat/wifi-driver` since `ff40a6fa` (2026-10-08)
+
+Scope: everything changed since Audit 9 - 14 files: the Pi 2 page-table arena, the radio stand-in, the
+supervisor's name map, `backlog/66` found and fixed, its instruments removed - and everything elsewhere
+those changes made untrue. The second half was the larger. The mechanical gates (`doc_refs`,
+`doc_symbols_check`, `comment_symbol_check`, `facts_check`, `line_ref_check`, `site_check`, `dash_check`,
+`backlog_check`, `docs_index_check`, `foreign_word_check`, `doc_command_check`) were green before and after;
+nothing below is a thing they can see, except the two names the doc-symbol gate caught the same day and
+`1e7319cb` fixed (`WOKEN_AT`, and a network name in `docs/wifi-usb.md` that should never have been
+committed).
+
+**A rule of the system stopped being true, and twenty places said it was.** `e3fcf7ed` made an empty
+message deliverable on every port; until then the kernel refused one on x86, AArch64 and RISC-V. That
+refusal had been found before - `d2f99b65`, the TCP close, the fs protocol selftest - and each time the
+answer was a one-byte reply at the site and a comment stating the refusal as a law: "a zero-length message
+cannot be delivered at all", "it is not even a message". Those comments were in `net-stack` (five, and a
+`debug_assert!` message), `nic-driver` (`main.rs` four, `genet.rs`, `dwmac.rs`), `wifi-driver`, `fs` (its
+selftest's doc and its failure line), `osdev`'s shell test, `examples/greet` and its index, and
+`docs/pipes.md`, `docs/gsfs-next.md` and `docs/tcp-design.md`. Each now says the kernel refused it on three
+ports until `e3fcf7ed`, and why the byte stays anyway: an answer should say what happened, and `fs`'s
+protocol reads a short reply as malformed. `docs/tcp-design.md` is dated text and got a correction note
+instead of an edit; it also now says the other reason the Pi 2 never showed it - ARM32's check accepted an
+empty range. `nic-driver`'s `serve_status` doc said it answered other requests EMPTY; it answers `[1]`.
+
+**`backlog/66` was read as a lost wake-up for a week, and four documents still said so.**
+`docs/networking.md`, `backlog/74`, the backlog index row and `docs/wifi-usb.md` section 49 each stated
+or leaned on it; each has a dated correction. `nic-driver`'s `radio.rs` called the held-request collision
+"the three-second ping of `backlog/66`" and `genet.rs` called failed replies "the shape backlog/66 is
+chasing"; both now say what 66's DNS failure turned out to be.
+
+**An overclaim of this session's own, caught on the read-back.** `backlog/66`'s status and the first draft
+of these corrections said the empty reply explained the item. It explains what the item had become - `net
+dns` failing over the radio, on drains that found no frame. It does not explain the item's title: a STATUS
+reply is nine bytes and never empty, so the one-second STATUS exchanges of 2026-09-30 had another cause,
+and they had stopped appearing by 2026-10-04 with nobody having shown why. The status line, its last
+entry, the index row and the three corrections that touched it now say exactly that much.
+
+**Stale after the code moved (comments):** the supervisor's `record_name_quiet` said an on-demand
+program's cap is "let go here", above the `0a179048` change that holds it until the caller is answered,
+and the reply comment said the supervisor always keeps the original; `docs/wifi-usb.md` section 49 said
+the cap is let go "at once". `net-stack`'s first-attempt log was labelled an INSTRUMENT for `backlog/66`;
+it is a permanent line that names both halves of an exchange, and says so now.
+
+**Checked and correct, recorded so it is not re-chased:** the Pi 2 arena comments (`L1_TABLES` 32 at 16
+KiB = 512 KiB, `L2_TABLES` 256 at 1 KiB = 256 KiB, the 982 refusals and 18 failures against `docs/wifi-usb.md`
+47) and `PageTable::discard`'s safety argument against `into_cr3`, `reclaim_user_frames` and
+`free_page_table_root`; `chaos`'s refused-spawn count; the stand-in's comments in `sdk/wifi/src/serve.rs`
+and `wire.rs` (`USE_STANDIN` 3, `NOTE_USB_RADIO` 0x2D, distinct from `usbfn`'s 0x2E and 0x2F) and the
+supervisor's `tell_radio_of_dongle`; the shell's `UpNotChosen`; the scheduler's lost-wakeup comment, which
+is about the idle halt and true; `dispatch.rs`'s `build_message` and `copy_out`.
+
+**Left as they are:** dated narrative that was true when written and is marked as history by its date
+(`docs/wifi.md` 3439, the earlier entries of `backlog/66`). The one-byte replies themselves are left in the
+code: they are correct protocol with or without the kernel's refusal, and changing them is a code change,
+not an audit.
+
+## Audit 11 - documents and code comments, `feat/wifi-driver` since `7a41ab42` (2026-10-08)
+
+Scope: everything changed since Audit 10 - six commits: the drop-rejoin (`9261f7d5`), the hardware record
+of the three boards (`70d0d41b`, `7c40ac94`), `net-stack`'s DNS wait on the clock (`20e43490`), the
+liveness panic's since-the-stamp counts (`1c35b4b4`), and `wifi-usb` bringing a down radio up again
+(`32798620`) - and what they made untrue elsewhere. The mechanical gates (`dash_check`, `doc_refs`,
+`docs_index_check`, `doc_symbols_check`, `comment_symbol_check`, `facts_check`, `line_ref_check`,
+`site_check`, `backlog_check`, `foreign_word_check`, `doc_command_check`, `line_ending_check`) were green
+before and after; nothing below is a thing they can see.
+
+**This session's own comments, left untrue by its own code.** `dns_resolve`'s doc said it gives up at an
+absolute TSC `deadline`; since `20e43490` it takes `budget_ms` and starts its own clock. `DNS_BUDGET_SECS`
+said it was the default budget for a request with no patience byte; the default has been
+`CLIENT_MIN_DEADLINE_SECS` throughout, and after `20e43490` nothing reads the constant as a budget at all.
+Both corrected. The second is also a finding about a gate: the assertion beside the constant and
+`scripts/facts_check.py`'s budget ordering both check it, so the ordering rule is checked against a number
+that bounds nothing - the real wait is the client's patience less `DNS_REPLY_MARGIN_SECS`, halved per
+server. Recorded at the constant, not changed: removing it is a change to a gate (CLAUDE.md 21).
+
+**A drop-rejoin documented for a radio that cannot see a drop.** `utilities/56_wifi.md` says an access
+point that drops the link is rejoined once. True of the Pi 4's and the VisionFive's onboard radios, whose
+frame pulls report the drop. `wifi-usb`'s pull reports none - it watches for a deauthentication only during
+the handshake - so a dongle the access point drops reads as joined and is not rejoined. Recorded in the
+spec as a limitation. The same bullet's first half said a drop is NOT noticed behind a cable that is in;
+the driver's idle read, every 250 ms while joined, notices it there too, and the next sentence of the same
+bullet already said so. Corrected.
+
+**`chaos max-carnage` without a target, refused by the shell since July and documented anyway.**
+`0cb8985b` (2026-07-09) made the shell require a target and a round count. `utilities/38_chaos.md` section
+5b still gave `chaos max-carnage [rounds]`, a bare example command, a sample report from the one-victim
+form, the restarted set as a fixed list, and a note that `events`, `xhci` and `ehci` are not watched -
+they are, as `MANAGED` members (`services/CLAUDE.md`); section 8 named a test command `osdev test shell`
+does not send. All corrected, and the sample is now marked as the old form beside a real report from the
+T630. `docs/wifi-usb.md` carried the bare form five times in this branch's own records (sections 47 and
+50) and `backlog/02` once as an instruction; every `max-carnage` panel in this session's logs reads
+`target: all-services`, and the shell refuses the bare form, so they now say `all-services`. Found while
+writing the T630 test instructions, which gave the bare form and were refused. **A gate finding:**
+`doc_command_check` asks whether a documented subcommand exists, not whether its arguments are ones the
+shell takes, so a refused invocation passes it. `chaos`'s own comment said `all-services` swept every
+live service each round, contradicting the comment under it and the logs (4 to 12 a round on the T630);
+corrected.
+
+**Stale beside the new instrument:** the panic site's comment said the interrupt tally tells the two
+wedges apart; one since-boot reading cannot, which is what `1c35b4b4` is for. It says so now. The kernel
+audit's A9-5 made the same claim ("the next reproduction now carries real evidence"); an appended entry
+there records the second A9-4 sighting and what A9-5 could not tell.
+
+**Not recorded anywhere until now:** the T630's three cards today. `docs/wifi-usb.md` section 51 and the
+index entry carry them, including the fault left open (a dongle that stops transmitting after an `xhci`
+restart under it) and the DNS-after-idle case that has not been re-run.
+
+**Checked and correct, recorded so it is not re-chased:** `rejoin_after_drop` and its three call sites
+against `utilities/56_wifi.md` (`REJOIN_MIN_SECS` 60, once per drop, through `auto_join`, which honours
+`/wifi.radio`); `IDLE_PULL_MS` 250; `UDP_BUDGET_MS` 3000 against `SOCKET_SECS` 30; both reply waits on
+`Deadline::paced`; the rebind comment in `wifi-usb`'s `rx.rs` against `main.rs` (`serve` returns only on
+`Notice::Changed`, and `said` is cleared only with no station up); section 50's counts against its commits.
+
+**Left as they are:** dated records that use the bare form before `0cb8985b` or whose target cannot be
+recovered (`backlog/03`'s 2026-09-06 sighting, `backlog/14`, `backlog/48`, `backlog/57`, and CLAUDE.md's
+2026-08-09 amendment, which is prose, not a command), and `backlog/31`'s `DNS_RX_TRIES`, history of the
+fix before this one.
+
+## Audit 12 - the whole branch, documents and code comments, `feat/wifi-driver` since it left `main` (2026-10-08)
+
+Scope: everything `feat/wifi-driver` changed since `f605106d` - 346 commits, 274 files, about 54,000 lines -
+read in seven parts by independent readers (the shared WiFi library; `wifi-driver`; the USB dongle path
+through `wifi-usb`, `dwc2`, `xhci`, `nic-driver` and the supervisor; the branch's kernel, library and other
+service changes; `docs/wifi.md`, `docs/wifi-aic8800.md` and the `wifi` spec; `docs/wifi-usb.md` and the
+other changed documents; the backlog, the constitution's amendments and the scripts' headers). Each
+finding was checked against the code before it was changed. Every gate was green before and after, and
+the x86 shell suite ran 215/0 afterwards; the radio crates were also built for the Pi 4, VisionFive and
+Pi 2 targets. Nothing below is a thing the gates can see: they ask whether a name EXISTS, and these are
+names that exist and statements that are false.
+
+**About a hundred corrections, by kind:**
+- **Protocol descriptions the readers rely on.** `wire.rs` gave `OP_DISCONNECT`'s reply as two bytes (it
+  carries the network's name too), said every op but two is refused while powered off (the hardware and
+  use ops are served too), and put the power cycle through `DevicePower` on every radio (the dongle's is a
+  register power-down). `usbfn.rs` gave `OP_BULK_IN`'s `ST_FAILED` one cause of two. `nic-driver`'s
+  `Radio` promised a reacquire-and-retry its `rpc` never does.
+- **Status that moved on.** The VisionFive's check card for the shared loop "owed" in three places - it
+  ran and passed on 2026-10-06. The verified `off` and `off hard` "not yet run on hardware" in the spec -
+  verified 2026-10-01. The index calling the rekeys answered (built, not seen), R7 "not yet run" (run, the
+  rekey not seen), section 44's USB3 hub work verified (built, not on hardware), the NIC driver
+  IOMMU-confined (it is not; the document says so). `networking.md` 16, `audio.md`'s status line,
+  `porting.md`'s two counts (131 against 135 seam members; 9 against 15 sites in the supervisor's build
+  script), five backlog rows whose next step was done.
+- **Code that grew past its comment.** `wifi-driver` comments still describing phase V1 (the AIC8800
+  driver runs to V6), "none of this has run on hardware" over a verified scan, a superframe channel
+  "ignored" that is read, a reset vector "not implemented" that `upload::run` writes, a 512-byte frame
+  that is 4 KiB, a 16-byte trace entry that is 18, a PIO path "four bytes" that carries the firmware.
+  The kernel's device-power stubs naming the Pi 4 alone (the VisionFive answers too), five idle-mask
+  comments saying both ARM ports answer NO (the Pi 4 masks since 2026-09-30), arm32's "no per-task address
+  spaces yet" beside the L1 arena it has, `block-driver`'s EMMC grant the kernel removed.
+- **Doc comments on the wrong item**, which rustdoc then shows on the item below: `notice`, `untag`,
+  `set_expander_gpio`, `interface_up`, `collect`, `ladder` and `run`, and one orphan for a function that
+  no longer exists.
+- **The constitution, two counts.** The 2026-10-01 `DevicePower` amendment says every port but the Pi 4
+  answers `false`; a dated note says the VisionFive answers too. 18.5 said "one amendment" above two, and
+  not that the floor has since fallen to 83.
+
+**Found, and NOT changed, because each is a change to behaviour or to a gate - for the operator:**
+1. **Reason 4 (`DOWN_NOT_BUILT`) tells the operator something false.** It was "a radio this driver does
+   not drive yet". The AIC8800 driver now runs to a station, and `wifi-driver` sends reason 4 only when
+   that bring-up stops short. The shell still prints "its driver is not written yet ... nothing here can
+   bring it up", and `radio on` and `powercycle` refuse to retry on it. Whether a stopped AIC8800 bring-up
+   should be retried is a decision; the comments and the spec now say the meaning changed.
+2. **The VisionFive's `wifi debug` shows refused data packets as superframes.** `aic_station.rs` puts
+   `data_refused` in word 7, which the shell labels `rx_glom`.
+3. **`wifi-usb` can give up on a host that is still working.** `xhci` retries a control transfer up to
+   `CONTROL_TRIES` x `CONTROL_MS` = 2 s, which is all of `wifi-usb`'s `HOST_SECS`; a dongle slow to answer
+   can exhaust the driver's wait while the host is still trying.
+4. **`xhci` with no dongle bound drops a re-send it was asked for.** `answer_absent` gives back the
+   reply capability for `OP_SYNC` but does not re-send a named `NOTE_RADIO`; `dwc2` and `xhci`'s bound
+   path do.
+5. **Four log lines say what the comments now correct:** `upload.rs` (the reset vector "not" written,
+   twice), `scan.rs` ("glommed frame(s) ignored"), `firmware.rs` ("no `fs` peer").
+6. **`sdk/audio` is outside two gates.** `unsafe_check`'s `DENY_ROOTS` and the symbol checkers'
+   `SRC_DIRS` carry `sdk/wifi` but not `sdk/audio`, the same gap their own comments describe closing for
+   `sdk/wifi`.
+7. `dwc2`'s milestone-1 probe never compared its two reads; the comment claiming it did is removed rather
+   than the check added.
+
+**Left as they are:** dated sections true when written, with pointers added only where a later section
+reversed them and nothing said so; `backlog/03`, 14, 48 and 57's runs of the bare `chaos max-carnage`
+form (Audit 11).
+
+## Audit 13 - documents and code comments, `feat/wifi-driver` since `a0cb2991` (2026-10-09)
+
+Scope: the 21 commits since Audit 12 - `events log boot`, the `hardware` utility's three steps, the
+chaos seed, `SECURITY.md` and `CONTRIBUTING.md`'s "Break it", the x86 timer and IOMMU fixes - about
+3,400 lines over 36 files. Read by two independent readers, one for documents against the code and one
+for code comments against the code beside them; every finding was checked in the code before it was
+changed. All eleven documentation gates were green before and after.
+
+**Wire formats, checked at both ends and consistent:** the chaos launch message (`rounds | has_seed |
+seed | target`), `supcmd::DEVICES`, `EVENTS` and `WHY`, and `hw-enumerator` ops 3 and 4.
+
+**Wrong, and fixed:**
+- `utilities/38_chaos.md` 5b said `max-carnage` spares the shell and rolls "a creative action mix -
+  kill, flood, flood-then-kill, or kill-then-flood", and showed a report with per-service "recovered"
+  counts. The run lives in the `chaos` service so that the shell CAN be a victim; `all-services` flips a
+  coin per live service, floods and kills each one picked (`shell` and `fs` killed, never flooded), and
+  tracks no recovery. Rewritten from the code, with the Pi 4's report of 2026-10-09 as the sample. This
+  was flagged as unconfirmed when the seed text was added beside it, and is confirmed now.
+- `hardware events` reported "`<driver>` started for it" when the start FAILED: the supervisor noted the
+  attach before `spawn_wired` ran. It now notes after, and a failed start is its own event
+  (`supcmd::EV_START_FAILED`, "could NOT be started"). The one behaviour change in this audit.
+- `ask_bdf_for_class`: a comment said a late 17-byte device record reaches the class check. The reply
+  buffer is 16 bytes and the kernel refuses a larger reply, so that refusal ends the asking and the
+  kernel's own scan answers. Safe, but not the path described.
+- `docs/hardware-design.md`: "`hardware` keeps what the boot FOUND (the bus, the IOMMU, the timer
+  mode)" - it shows neither of the last two; "each core's timer mode ... nothing reads it" - the idle
+  path reads it since `bdc7adaa`, nothing REPORTS it; `hardware events` "on the `events` service" - the
+  supervisor keeps it; `hardware report [write <path>]` - the built form is `| write`.
+- `utilities/58_hardware.md`: the problems bullet "an interrupt on a device showing none" - the check
+  is for no MSI enabled.
+- `scripts/selfcheck/20-hardware.gsh` said `hardware` makes "no kernel query" - it uses the existing
+  introspection queries; what it makes is no kernel CHANGE.
+- An `events log boot` comment read "29591 seconds later" for 29591 bytes.
+
+**Stale, and fixed:** the 58 spec's step-3 "not yet run on hardware" (the T630, Pi 2, Pi 4 and
+VisionFive have since run it - `tree` and `compare` only in QEMU, said); `hardware-design.md`'s status
+lines and four rows of its section 9 table (DEVICES, the SoC rows, radio firmware, the `why` reasons -
+all answered now); CLAUDE.md 18.5's lead-in ("two amendments ... fallen to 83" - three stand, and the
+floor is 84); `audits/kernel-audit.md` A9-4 "FIXED pending that card" (a dated note added: the card
+ran); the `HW_ROWS` comment's "19 PCI devices" (22); `hw_report`'s doc and help (it also prints
+problems, firmware and events); `handle_command`'s "only DEVICES has a body" (EVENTS and WHY too).
+
+**Overclaims, and fixed:** the `HW_ROWS` comment said every row that does not fit is counted - the
+caps on cores, PCI devices, drivers and USB matches are applied before a row is made and are not;
+`supcmd::EVENTS`'s `since` is when the record began, after the boot spawns, not the supervisor's start;
+`boot_record_size` said later lines are "only on serial" (the ring holds them too until it wraps); the
+seed help said every run prints a seed (only `all-services` draws one); `hw_ask` said "ask once" (a
+failed send is retried once after a reacquire; a timeout never is); `selfcheck hardware`'s summary
+said every device shown has a running driver and a report reads back unchanged (it asserts no driver
+is "not running", and no device added or removed).
+
+**A gap between two documents:** `SECURITY.md` sent a recovering crash to "Break it", whose list of
+breaks does not include one, and neither said where a panic CHAOS causes belongs. Both now say: `chaos`
+holds the authority to kill services, so what it breaks - a panic included - is a recovery bug, in
+public; a panic an unprivileged service or a network peer can cause is a security bug.
+
+**One comment moved:** the explanation of the x86 timer modes sat on `TIMER_CORES` while three
+comments sent readers to `TIMER_MODE`; it is on `TIMER_MODE` now.

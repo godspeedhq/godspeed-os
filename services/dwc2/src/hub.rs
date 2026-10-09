@@ -9,6 +9,8 @@
 //! means that when splits are attempted, the port they are attempted through is already known to
 //! report the right thing.
 
+use godspeed::driver::delay;
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 
@@ -229,11 +231,72 @@ pub fn status_change(
     Some(bits)
 }
 
-/// Clear a port's CONNECTION-CHANGE flag, so the hub stops reporting the same event forever.
-pub fn clear_connect_change(
+/// How long a port reset may take before it is given up: Linux's `HUB_RESET_TIMEOUT` (usb/core/hub.c).
+/// This was 200 ms, Linux's LONG reset time for one attempt rather than its bound on the wait.
+const RESET_TIMEOUT_MS: u64 = 800;
+
+/// The attach debounce, USB 2.0 7.1.7.3: at least 100 ms between connect detection and reset, the timer
+/// restarting on any disconnect. As Linux's `hub_port_debounce` does it: the port read every 25 ms, the
+/// connection unchanged for 100 ms, given up after 2 s.
+const DEBOUNCE_STEP_MS: u64 = 25;
+const DEBOUNCE_STABLE_MS: u64 = 100;
+const DEBOUNCE_TIMEOUT_MS: u64 = 2000;
+
+/// Wait for a port's connection to settle before it is reset: `Some(connected)` once it has held for
+/// `DEBOUNCE_STABLE_MS`, `None` if it has not within `DEBOUNCE_TIMEOUT_MS` (or the hub stopped answering).
+///
+/// Without it a device pushed in by hand was reset while its contacts were still making and breaking,
+/// and the reset did not finish: on the Pi 2 a dongle moved between ports was `connected, powered, not
+/// enabled` (0x0101) 200 ms later and was left unbound for as long as it stayed there (`docs/wifi-usb.md`
+/// 46). A connection change seen while waiting is acknowledged and restarts the count, as Linux does.
+pub fn debounce(
+    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, port: u8,
+) -> Option<bool> {
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(DEBOUNCE_TIMEOUT_MS));
+    let mut last: Option<bool> = None;
+    let mut stable_ms = 0u64;
+    loop {
+        let st = port_status(ctx, mmio, dma, t, port)?;
+        let connected = st.connected();
+        let changed = st.change & 1 != 0; // C_PORT_CONNECTION
+        if !changed && last == Some(connected) {
+            stable_ms += DEBOUNCE_STEP_MS;
+            if stable_ms >= DEBOUNCE_STABLE_MS {
+                return Some(connected);
+            }
+        } else {
+            stable_ms = 0;
+            last = Some(connected);
+        }
+        if changed {
+            let _ = port_feature(ctx, mmio, dma, t, false, FEAT_C_PORT_CONNECTION, port);
+        }
+        if deadline.expired() {
+            return None;
+        }
+        delay::hold(ctx, Budget::ms(DEBOUNCE_STEP_MS));
+    }
+}
+
+/// Read a port's status and acknowledge EVERY change bit it reports, so the hub stops reporting it.
+///
+/// A hub keeps a port in its status-change bitmap while ANY of the port's change bits is set (USB 2.0
+/// 11.24.2.7.2: connection, enable, suspend, over-current, reset - bits 0 to 4 of wPortChange, cleared
+/// by features 16 to 20). This cleared only the connection change. On the Pi 2 a dongle pulled while its
+/// port was being reset left the reset unfinished and its other change bits set, so the hub reported
+/// port 2 on every pass and the handler logged `device REMOVED` nine thousand times in a minute
+/// (`docs/wifi-usb.md` 45). The status returned is the one read BEFORE the clears, which is the one the
+/// change was about.
+pub fn clear_changes(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8,
-) {
-    let _ = port_feature(ctx, mmio, dma, hub, false, FEAT_C_PORT_CONNECTION, port);
+) -> Option<PortStatus> {
+    let st = port_status(ctx, mmio, dma, hub, port)?;
+    for bit in 0..5u16 {
+        if st.change & (1 << bit) != 0 {
+            let _ = port_feature(ctx, mmio, dma, hub, false, FEAT_C_PORT_CONNECTION + bit, port);
+        }
+    }
+    Some(st)
 }
 
 pub fn port_status(
@@ -279,7 +342,11 @@ pub fn reset_port(
     }
     // USB 2.0 requires at least 10 ms of reset; the hub drives it and clears PORT_RESET when done.
     // Poll for that rather than assuming a duration - the hub is the authority on when it finished.
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(200));
+    // `gs::driver::wait`'s deadline. A look here is a whole control transfer, so on an uncalibrated
+    // clock the library's 200,000 looks are 200,000 control transfers, which can be hours: it ends,
+    // where the one-tick deadline built from `duration_cycles` allowed a single look. Recorded in
+    // `docs/driver-library.md` as an open gap, not a bound anyone chose.
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(RESET_TIMEOUT_MS));
     loop {
         let st = port_status(ctx, mmio, dma, t, port)?;
         if st.status & PORT_RESET == 0 && st.enabled() {
@@ -289,10 +356,14 @@ pub fn reset_port(
             let _ = port_feature(ctx, mmio, dma, t, false, FEAT_C_PORT_CONNECTION, port);
             return Some(st);
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             ctx.log_fmt(format_args!(
-                "dwc2-svc: hub port {} did not finish reset within 200 ms (status={:#06x})",
-                port, st.status));
+                "dwc2-svc: hub port {} did not finish reset within {} ms (status={:#06x})",
+                port, RESET_TIMEOUT_MS, st.status));
+            // Acknowledged here too - every change bit, where the success path above clears the two it
+            // expects: a reset that never finished (the device pulled during it) leaves change bits the
+            // hub would otherwise report forever.
+            let _ = clear_changes(ctx, mmio, dma, t, port);
             return None;
         }
     }
@@ -475,10 +546,42 @@ pub fn enumerate_downstream(
     t.mps = mps0;
     let addr = *next_addr;
     *next_addr += 1;
+    // ONE XACTERR MUST NOT ABANDON THE DEVICE, which is what this did.
+    //
+    // Pi 2, 2026-09-27: the WiFi dongle on hub port 5 was detected, reset, sized and ADDRESSED - four
+    // transfers that all worked - and then one SETUP came back `HCINT=0x00000082 XACTERR` and it was
+    // dropped. `bugs/3` recorded this same dongle enumerating on this same board, and the T630's xhci
+    // read its descriptors twice the same afternoon, so it is not an unreadable device.
+    //
+    // The log says what it probably contended with: `dwc2-svc: sector 0 first bytes 47 53 46 53` lands
+    // immediately before the failure, so `block-driver` was pushing mass-storage I/O through this one
+    // DWC2 core while the SETUP went out. A single transaction error on a contended single-channel
+    // controller is flaky, not broken - and `ehci` had the identical defect at its own longest transfer
+    // (`backlog/63`), fixed the same day.
+    //
+    // Bounded (26.6) and loud: the attempt count is named when it finally gives up, so a device that
+    // needed two tries and a device that is genuinely unreadable do not read the same.
+    //
+    // WHY `xhci` NEEDS NO EQUIVALENT, so nobody adds one and nobody removes this for symmetry: every
+    // endpoint context that driver programs carries CErr = 3 (`(3 << 1)` in dword 1, at five sites), so
+    // the xHCI CONTROLLER retries a transaction three times in hardware before it reports a Transaction
+    // Error at all. The failure this retry exists for never reaches its `control()`. The rule is "retry
+    // where the controller does not", NOT "every USB driver retries" - and the evidence is on this very
+    // device: 2026-09-27, the same dongle enumerated cleanly on xhci twice and needed a retry here.
+    const ENUM_TRIES: u32 = 4;
     let sa = [0x00, 0x05, addr, 0, 0, 0, 0, 0];
     let mut none: [u8; 0] = [];
-    if !chan::control_split(ctx, mmio, dma, &t, &sa, &mut none, false, 0, splt) {
-        ctx.log_fmt(format_args!("dwc2-svc: port {} SET_ADDRESS {} FAILED", port, addr));
+    let mut addressed = false;
+    for _ in 0..ENUM_TRIES {
+        if chan::control_split(ctx, mmio, dma, &t, &sa, &mut none, false, 0, splt) {
+            addressed = true;
+            break;
+        }
+        ctx.sleep(ctx.duration_cycles(5)); // let the bus settle before trying again
+    }
+    if !addressed {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: port {} SET_ADDRESS {} FAILED after {} tries", port, addr, ENUM_TRIES));
         return None;
     }
     ctx.sleep(ctx.duration_cycles(5)); // USB 2.0 9.2.6.3: 2 ms to commit the new address
@@ -486,8 +589,21 @@ pub fn enumerate_downstream(
 
     let mut full = [0u8; 18];
     let getall = [0x80, 0x06, 0, 0x01, 0, 0, 18, 0];
-    if !chan::control_split(ctx, mmio, dma, &t, &getall, &mut full, true, 18, splt) {
-        ctx.log_fmt(format_args!("dwc2-svc: port {} full descriptor read FAILED at address {}", port, addr));
+    // The ADDRESS is deliberately not re-issued between attempts: the device already took it (9.2.6.3
+    // above), so re-sending SET_ADDRESS would be addressing a device that has already moved. Only the
+    // read repeats.
+    let mut got = false;
+    for _ in 0..ENUM_TRIES {
+        if chan::control_split(ctx, mmio, dma, &t, &getall, &mut full, true, 18, splt) {
+            got = true;
+            break;
+        }
+        ctx.sleep(ctx.duration_cycles(5));
+    }
+    if !got {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: port {} full descriptor read FAILED at address {} after {} tries",
+            port, addr, ENUM_TRIES));
         return None;
     }
 

@@ -87,6 +87,12 @@ is the first thing to make the cost visible. The same correlation is present in 
 
 **So the fix is the incremental dance, not anything in this file's title.** Until then a `serve`
 session will lose a connection whenever an SNTP query stalls, and the board says so on both lines.
+
+> **2026-10-01: SNTP should no longer stall the loop (not yet on hardware).** `time`'s nudge now starts a background query that
+> nothing waits for, and no client request or dance fetches the clock (`docs/networking.md` 16). The
+> SNTP half of this residual should be gone; the DHCP and ARP half of the dance still blocks. Not yet
+> re-measured on a `serve` session - that is what would close this paragraph.
+
 The parts of this entry above - the release being the client's job, and the two budgets that
 collided - are real and separate; this is what remains after both.
 
@@ -106,7 +112,7 @@ net-stack: SNTP - querying 185.51.192.62:123
 
 `time` nudges net-stack for the clock, the SNTP dance blocks it for seconds, the shell's ping
 requests pile into the stash, `STASH_N` (4) fills, and the rest are dropped. Same root cause as the
-section above.
+section above. (SNTP left the loop on 2026-10-01 - see the note above; not re-measured.)
 
 **Raising `STASH_N` would hide this rather than fix it.** The queue behind it is 16 deep and a
 multi-second block will fill any bound worth having; the fix is for the dance not to block.

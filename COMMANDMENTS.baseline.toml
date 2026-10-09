@@ -226,7 +226,14 @@ service_configs = [
 # event the kernel was already having; it does not create one. It was briefly written as UNGATED on
 # the reasoning that a health counter discloses no task state - which this pin caught, correctly. The
 # ungated set is a deliberate list, not a judgement call to be made per query at the call site.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26]
+#
+# 27 (added 2026-10-08) copies out the BOOT RECORD: a fixed copy of the first 32 KiB ever logged, kept
+# beside the ring in `log.rs`, which fills once and never wraps. It is §11.4's existing floor made
+# readable, not a new responsibility - the kernel already holds every one of these bytes in its ring and
+# has no way to give them back once the ring wraps, which on a busy machine is seconds after boot. A
+# copy, never a drain, so no log line depends on a reader (the reason nothing drains the ring stands).
+# INTROSPECT-gated: the boot log names every service and device on the machine. Read by `events log boot`.
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the
@@ -285,6 +292,8 @@ reacquire_api = [
   # credit given here is verified rather than assumed. Without that second half this list would be a
   # hole - "calls something that used to recover" is not the property IX is about.
   "gs::call::request", "call::request_within", "gs::fs::Fs",
+  # `gs::cap::reacquire`, verified the same way (its body must reach one of the five above).
+  "gs::cap::reacquire",
 ]
 
 # Services that send to a peer and have NO reacquisition path, as of 2026-09-14. SHRINK ONLY, and a
@@ -299,7 +308,14 @@ reacquire_api = [
 #
 # Recorded rather than fixed because the fix is Rust in five services, and that is the operator's
 # call. Each is small: reacquire `events` on `Err` from the emit path.
-peer_reacquire_debt = ["console", "dwc2", "ehci", "hw-enumerator", "xhci"]
+# `dwc2` LEFT this list on 2026-10-05 because its source now reaches `gs::cap::reacquire` - for its NEW
+# peer, `wifi-usb` (`rtl::notify_driver`, docs/wifi-usb.md U1b). Its `events` emission is NOT fixed by that
+# and still stops after the first time `events` dies. The check is coarse by design (any reacquisition
+# path at all, see `IX-peer-reacquire`), so it cannot keep an entry that is half paid; this line is where
+# the unpaid half is kept instead.
+# `xhci` LEFT on 2026-10-06 the same way: `radio::notify_driver` reaches `gs::cap::reacquire` for its new
+# peer, `wifi-usb` (U2a, docs/wifi-usb.md 7). Its `events` emission is the same unpaid half as `dwc2`'s.
+peer_reacquire_debt = ["console", "ehci", "hw-enumerator"]
 # Commandment III - constants declared in two files of one crate, as of 2026-09-14. Read by
 # `III-duplicate-constants`. SHRINK ONLY; a stale entry is itself a violation.
 #
@@ -343,7 +359,6 @@ duplicate_const_debt = [
   "svc/nic-driver:RX_RING_OFF",
   "svc/nic-driver:TX_BUF_OFF",
   "svc/nic-driver:TX_RING_OFF",
-  "svc/nic-driver:UNCALIBRATED_POLLS",
 ]
 # Verbs the shell answers that no spec in utilities/ describes, as of 2026-09-14. SHRINK ONLY;
 # a stale entry is itself a violation. utilities/0_conventions.md calls itself canonical for EVERY
@@ -456,6 +471,20 @@ IMAGE_SPAWN        = 15
 # worse than a refused one. The kernel itself drives that pair on its spawn and kill paths, so this
 # was never hypothetical: a split interface raced the kernel, not just other services.
 PCI_CFG            = 16
+# DEVICE POWER - cut or restore the power of the ONE device whose fixed peripheral window the holder
+# was granted (`DevicePower`, syscall 54). Derived from the device GRANT, not from a privilege bit: the
+# kernel mints it at spawn to the service it hands such a window to, where `arch/` can power the device
+# behind it, and to nobody else - a window has one holder. Power is already the kernel's (it powers the
+# SD domain at boot before the window can mean anything); this is the grant made renewable. Added for
+# the Pi 4 radio: six host-side resets each left a chip whose ROM will not boot a new firmware, and only
+# cutting its power is a power-on (docs/wifi.md 45-47). CLAUDE.md 12.3 amendment, 2026-10-01.
+DEVICE_POWER       = 17
+# CPU CLOCK - set the Arm cores to the firmware's minimum or maximum rate (`CpuClock`, syscall 55). A
+# privilege bit, delegatable, held by ONE service: `power`, which owns the policy - leases of bounded
+# length, the clock at its maximum while any is open (docs/power.md). One holder because the clock is one
+# machine-wide setting. Added because the Pi firmware drops the cores to their minimum a minute after
+# boot and the WiFi chip's firmware traps when loaded that slowly (docs/wifi.md 55). CLAUDE.md 12.3.
+CPU_CLOCK          = 18
 
 
 [kernel.arch_roles]
@@ -470,6 +499,11 @@ PCI_CFG            = 16
 "aarch64/mmu.rs"              = "mmu"
 "aarch64/mod.rs"              = "arch-entry"
 "aarch64/pcie.rs"             = "discovery"
+# Reads two SD-host-controller windows at boot and prints what answered, so that WHICH controller
+# the CYW43455 radio sits behind is measured rather than read off a specification. Discovery, and
+# deliberately nothing more: it grants no window and touches no card. The SD driver is
+# `services/block-driver` and the radio driver will be a service too (docs/wifi.md).
+"aarch64/sdio.rs"             = "discovery"
 "aarch64/ptables.rs"          = "mmu"
 "aarch64/sched_demo.rs"       = "scheduler-entry"
 "aarch64/sched_supervisor.rs" = "scheduler-entry"
@@ -505,6 +539,11 @@ PCI_CFG            = 16
 "riscv64/display.rs"          = "console"
 "riscv64/usb.rs"              = "discovery"
 "riscv64/net.rs"              = "discovery"
+# The VisionFive's WiFi radio's SD host (docs/wifi-aic8800.md, V0): clocks, reset and pins in the
+# SHARED clock and GPIO blocks, the radio's enable pin, and a census read of VERID/HCON before the
+# window is granted by kind. Discovery, like net.rs beside it: it sends nothing to the card, and the
+# AIC8800 driver is `services/wifi-driver`.
+"riscv64/sdio.rs"             = "discovery"
 "riscv64/fdt.rs"              = "discovery"
 "riscv64/sbi.rs"              = "clock"
 "riscv64/sv39.rs"             = "mmu"
@@ -597,6 +636,20 @@ FireIrq                  = 51
 # which is exactly why none is. Widening this to allow writes (destructive BAR sizing is the obvious
 # temptation) requires a different mechanism designed on its own terms, never this one relaxed.
 PciCfgRead               = 53
+# DEVICE POWER - cut or restore the power of the ONE device whose fixed peripheral window the caller
+# holds (`DevicePower`, syscall 54). Why isn't this a service? Because power is the kernel's already: the
+# device GRANT (12.3) includes powering the domain at boot before the window can mean anything, and this
+# is that grant made renewable. The kernel resolves the pin in `arch/` from the caller's own grant and
+# learns nothing about the device; when to cut power is the driver's decision (26.10). Added for the
+# Pi 4 radio, whose firmware cannot be restarted on a chip the host merely reset (docs/wifi.md 45-47).
+# Gated by DEVICE_POWER, minted at spawn with the window and to nobody else. CLAUDE.md 12.3, 2026-10-01.
+DevicePower              = 54
+# CPU CLOCK - the Arm cores to the firmware's own minimum or maximum, and the rate read back. Why isn't
+# this a service? It is, above the kernel: the kernel owns the firmware mailbox (the SD power, the GPIO
+# expander, the radio's power cut), and the only way to ask the firmware for a rate is a request on it.
+# Two rates are on offer and the caller cannot name a third. Who may be fast and for how long is the
+# `power` service's (26.10, docs/power.md). Gated by CPU_CLOCK. CLAUDE.md 12.3, 2026-10-01.
+CpuClock                 = 55
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47
@@ -665,6 +718,16 @@ SpawnImage               = 52
 # shell's trust perimeter, because keystrokes are commands).
 [kernel.service_grants]
 "asker" = ["peer:reply-server"]
+# audio-driver: its HD Audio controller, WITH an interrupt (docs/audio.md, "Interrupt-driven refill"):
+# the stream interrupts as each period plays and the driver refills then. The kernel picks the vector.
+# peer:fs - `/audio.settings`, the volume and the mute kept across a restart (utilities/57_audio.md).
+"audio-driver" = ["hw:pci_irq", "peer:fs"]
+# pwm-audio: the Pis' 3.5 mm jack (docs/audio.md, "The Pis"). hw:AUDIO_PWM - the PWM block and the DMA
+# engine's page, mapped side by side, and a DMA arena; the kernel routes the jack's pins and starts the
+# PWM clock as part of the grant (CLAUDE.md 12.3). The DMA page holds every channel: more than the
+# driver needs, recorded in docs/audio.md, and no more reach than an unconfined driver has on these
+# boards. peer:fs - `/audio.settings`, the volume and the mute kept across a restart.
+"pwm-audio" = ["hw:AUDIO_PWM", "peer:fs"]
 "block-driver" = ["hw:pci", "peer:dwc2", "peer:events", "peer:xhci"]
 # examples/cap-grant, examples-test build only. ACQUIRE_ANY so its lookup of "receiver" reaches the
 # kernel name directory: with no such service present the lookup MISSES, which is the standalone
@@ -677,8 +740,11 @@ SpawnImage               = 52
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "copier" = ["peer:fs"]
 "counter" = ["peer:fs"]
-"dwc2" = ["hw:DWC2", "hw:PCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
-"ehci" = ["hw:EHCI", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
+# dwc2: peer:supervisor (2026-10-06) - its USB device report (`usbdev`): the WiFi dongle attached or not,
+# so the supervisor starts the dongle's driver when it is there and stops it when it leaves
+# (docs/usb-device-drivers.md). Facts only, `try_send`, never answered - the host names no driver.
+"dwc2" = ["hw:DWC2", "peer:events", "peer:supervisor", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
+"ehci" = ["hw:EHCI", "peer:events", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]
 # examples/stdlib-hello, examples-test build only. It reads a file through `gs::fs`, which is
@@ -686,18 +752,34 @@ SpawnImage               = 52
 # grant `counter` and `copier` carry for the same reason.
 "stdlib-hello" = ["peer:fs"]
 "hw-enumerator" = ["peer:events", "priv:PCI_CFG"]
-"net-stack" = ["peer:events", "peer:nic-driver", "peer:time", "priv:RESOURCE_MINT", "priv:SET_CLOCK"]
-"nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci", "peer:dwc2", "peer:events"]
+"net-stack" = ["peer:events", "peer:nic-driver", "priv:RESOURCE_MINT"]
+# nic-driver: peer:wifi-usb (R6, 2026-10-06) - on the Pi 2 the USB WiFi dongle's driver is the link's
+# second backend, reached over the frame ops when the cable is out, as wifi-driver is on the Pi 4 and the
+# VisionFive (services/nic-driver/src/radio.rs).
+"nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci", "peer:dwc2", "peer:events", "peer:wifi-driver", "peer:wifi-usb"]
 "observe" = ["priv:INTROSPECT"]
 "observe-live" = ["priv:INTROSPECT"]
 "observe-now" = ["priv:INTROSPECT"]
 "ping" = ["peer:pong"]
+"power" = ["priv:CPU_CLOCK"]
 "recorder" = ["peer:events", "peer:fs"]
 "resource-server" = ["peer:holder", "priv:RESOURCE_MINT"]
 "shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
 "supervisor" = ["kernel-priv:acquire_any", "kernel-priv:image_spawn", "kernel-priv:introspect", "kernel-priv:recv_endpoint", "kernel-priv:service_control", "kernel-priv:spawn"]
 "time" = ["peer:events", "peer:fs", "peer:net-stack"]
-"xhci" = ["hw:XHCI", "hw:pci_irq", "kernel-priv:console_push", "peer:events", "priv:CONSOLE_PUSH"]
+# wifi-driver: hw:WIFI_SDIO - the Arasan SDIO host the radio sits on, and its power control, granted by
+# device KIND since 2026-10-03 (they were granted by NAME before, so the pin did not see them).
+"wifi-driver" = ["hw:WIFI_SDIO", "peer:fs", "peer:power"]
+# wifi-usb: peer:dwc2 - the USB host that bound the dongle and answers `usbfn` for it. peer:fs (R4,
+# 2026-10-06) - `/wifi.keys`, which the serve loop every radio shares (`godspeed_wifi::serve`) loads and
+# writes; the same grant wifi-driver carries for the same reason, now that both run that loop.
+# peer:xhci (U2a, 2026-10-06) - the same host role on the boards where `xhci` binds the dongle; one of the
+# two per board (`board::WIFI_USB_PEERS`), and `xhci` answers for that one device only, as `dwc2` does.
+"wifi-usb" = ["peer:dwc2", "peer:fs", "peer:xhci"]
+# xhci: peer:wifi-usb (U2a, 2026-10-06) - the one notice the host sends the dongle's driver, `NOTE_RADIO`,
+# when the binding changes; `try_send`, no reply expected - the grant `dwc2` carries for the same notice.
+# peer:supervisor (2026-10-06) - its USB device report (`usbdev`), as `dwc2`'s: facts only, never answered.
+"xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "peer:supervisor", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
 
 # --------------------------------------------------------------------------------------------------
 # Commandment IV - which contract capability key corresponds to which privilege bit. Read by
@@ -724,6 +806,7 @@ SpawnImage               = 52
 service_control = "SERVICE_CONTROL"
 resource_mint = "RESOURCE_MINT"
 pci_cfg = "PCI_CFG"
+cpu_clock = "CPU_CLOCK"
 
 # Commandment X - which utility spec covers which VERBS, where the filename is not the verb.
 # Read by `X-user-vocabulary`. Two specs each cover a set:

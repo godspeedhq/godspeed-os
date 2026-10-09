@@ -65,10 +65,20 @@ SERVICES = [
     "hw-enumerator",
     "ping", "pong", "greet", "upper", "roster", "counter", "reply-server", "asker",
     "resource-server", "holder", "block-driver", "fs", "nic-driver", "net-stack",
+    # The power policy (docs/power.md). Arch-neutral; on this board the OS has no clock control, so it
+    # says so once at start and answers every lease "no control".
+    "power",
     # `xhci` was missing, and that is the whole of "supervisor: spawn xhci FAILED" - the supervisor
     # holds every service's image and cannot spawn one it was never given. The kernel had found the
     # controller, resolved its window and offered it; the driver simply was not in the build.
     "xhci",
+    # The VisionFive's AIC8800 radio (docs/wifi-aic8800.md, phases V0-V6): bring-up, scan, WPA2 join and
+    # frames through nic-driver's bridge; on QEMU `virt` the kernel grants no window and it says so. The
+    # supervisor embeds it on this arch now (`radio` in services/supervisor/build.rs), so it must be built.
+    "wifi-driver",
+    # The USB WiFi dongle's driver (docs/wifi-usb.md), reached through xhci and started by the supervisor
+    # when the dongle is plugged in - beside the onboard radio (`usb_radio` in services/supervisor/build.rs).
+    "wifi-usb",
 ]
 
 

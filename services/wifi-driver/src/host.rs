@@ -1,0 +1,840 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! The SD host controller, as much of it as talking to an SDIO card on the CMD line needs.
+//!
+//! **This is the Arasan SDHCI block at `0xFE30_0000`** - the BCM2711's older SD controller, which on a
+//! Raspberry Pi 4 is wired not to the card slot but to the CYW43455 radio (the vendor device tree's
+//! `mmcnr@7e300000`, bus-width 4, `sdio_pins`). The kernel grants this service that one page of
+//! registers at spawn, by device kind (`WIFI_SDIO`) and only when its boot census saw the controller
+//! answer, so every
+//! access below goes through the SDK's safe `Mmio` wrapper and this crate contains no `unsafe`
+//! (§18.1/§18.2).
+//!
+//! ## Why this is a second SDHCI implementation and not a shared one
+//!
+//! `services/block-driver/src/sdhci.rs` drives the same silicon on the Pi 2 and is the reference this
+//! was written from - the reset dance, the ten-bit clock divider split across `CONTROL1`, the
+//! command-timeout bit that the error mask deliberately excludes, the Arasan's clock-domain write
+//! erratum and the `Ncc` gap between commands are all its hard-won lessons, kept here because they are
+//! facts about the part rather than about SD cards. What is NOT kept is everything about a MEMORY card:
+//! CMD8's voltage handshake, ACMD41's OCR negotiation, the CSD capacity decode, the 512-byte PIO block
+//! loops. An SDIO card answers none of those, so sharing the file would mean sharing a state machine
+//! whose larger half is inapplicable.
+//!
+//! Sharing it later is a real option and deliberately left open: what would move is exactly the code
+//! below (reset, clock, `cmd`), which is the part with no card protocol in it. That is a refactor
+//! across two ports and two boards, and §26.2 says a feature is pulled into existence by a need - so
+//! it waits until the SDIO path works on hardware and there is something to share rather than
+//! something to predict.
+//!
+//! ## What every wait here owes
+//!
+//! Every loop is bounded and every bound RETURNS A RESULT THE CALLER READS (`arch/CLAUDE.md`, rule 2).
+//! A hardware wait with no bound is a core that never comes back; a bounded wait nobody checks is
+//! worse, because it looks like it worked. `cmd` returns `Option`, and the interrupt register at the
+//! moment of failure is captured BEFORE the line reset clears it - without that, a caller logging
+//! `INTERRUPT` after a failure always reads 0 and cannot tell a timeout from an error.
+
+use godspeed_sdk::{Mmio, ServiceContext};
+use godspeed::driver::wait::{self, Budget};
+
+// Register offsets from the controller base. SDHCI-standard; the BCM2711's Arasan is a conforming
+// implementation of the parts used here.
+const BLKSIZECNT: usize = 0x04;
+const ARG1: usize = 0x08;
+const CMDTM: usize = 0x0C;
+const RESP0: usize = 0x10;
+/// The PIO data FIFO - 32 bits wide, which is why every transfer length here is a multiple of 4.
+const DATA: usize = 0x20;
+const STATUS: usize = 0x24;
+const CONTROL0: usize = 0x28;
+/// The DMA-select field of Host Control (`0x28` bits 3-4), which **must be zero for PIO**.
+///
+/// Linux clears this before EVERY transfer - `sdhci_config_dma`, called from `sdhci_prepare_data` - and
+/// says why in as many words: *"Always adjust the DMA selection as some controllers (e.g. JMicron) can't
+/// do PIO properly when the selection is ADMA."* Not an init-time setting; a per-transfer one.
+///
+/// **Why this port and not the Pi 2.** There the firmware BOOTS from this controller, so `CONTROL0` is
+/// left in a working PIO state and `block-driver`'s CMD17 inherits it. Here the firmware boots from
+/// `emmc2` and never touches the Arasan, so the register holds whatever reset left - and `SRST_HC` is not
+/// specified to clear this field. Copying a driver that is correct on a pre-configured controller is not
+/// enough on one nothing has configured.
+const CONTROL0_DMA_SELECT: u32 = 0x18;
+const CONTROL1: usize = 0x2C;
+const INTERRUPT: usize = 0x30;
+const INT_MASK: usize = 0x34;
+const INT_EN: usize = 0x38;
+/// A 32-bit read here spans `SLOT_INT_STATUS` (0xFC) and `HOST_CONTROLLER_VERSION` (0xFE). Both
+/// read-only. The kernel's boot census identifies the controller from exactly this register, for the
+/// reason recorded there: `CAPABILITIES` reads 0 on this part (Linux's `sdhci-iproc` carries
+/// `.missing_caps = true` for `bcm2835_data` and supplies them from the driver), so a presence test
+/// built on CAPS is built on the one register the silicon does not populate.
+const SLOTISR_VER: usize = 0xFC;
+
+// STATUS bits.
+const SR_CMD_INHIBIT: u32 = 1 << 0;
+const SR_DAT_INHIBIT: u32 = 1 << 1;
+
+// INTERRUPT bits.
+const INT_CMD_DONE: u32 = 1 << 0;
+/// Transfer complete. NOT the same as the last FIFO access: the controller still has to finish on the
+/// bus, and starting the next command before it does is a line conflict.
+const INT_DATA_DONE: u32 = 1 << 1;
+/// The FIFO can take a word (interrupt status).
+const INT_WRITE_RDY: u32 = 1 << 4;
+/// The FIFO has a word (interrupt status).
+const INT_READ_RDY: u32 = 1 << 5;
+/// **Buffer Read Enable, in STATUS - a different register from the interrupt status above.**
+///
+/// u-boot's polled `sdhci_transfer_data` checks BOTH: the interrupt status for `DATA_AVAIL` and then
+/// `PRESENT_STATE` for `SDHCI_DATA_AVAILABLE` (`0x800`). Linux cannot - it is interrupt-driven and must
+/// wait on the status bit - but a polled driver can read either, and waiting only on the interrupt flag
+/// means a controller that raises this bit without latching that flag is waited on forever. Which is
+/// precisely what a wrong interrupt-status-enable would produce.
+const ST_BUF_READ_ENABLE: u32 = 1 << 11;
+/// Buffer Write Enable, the write-side twin.
+const ST_BUF_WRITE_ENABLE: u32 = 1 << 10;
+/// DAT Line Active, in STATUS. The bit that says a data phase is in progress at all.
+const ST_DAT_ACTIVE: u32 = 1 << 2;
+/// The error mask `sdhci.rs` uses, which follows its own reference driver.
+const INT_ERR: u32 = 0x017E_8000;
+/// Command Timeout - the card did not respond to the command AT ALL. Kept out of `INT_ERR` above (as
+/// it is there) so that it is tested explicitly: it is the commonest real-hardware failure, and
+/// without naming it the wait simply ran to its bound with `INTERRUPT` reading 0, which looks like
+/// nothing happening rather than like a non-response.
+const INT_CMD_TIMEOUT: u32 = 0x0001_0000;
+
+// CONTROL1 bits.
+const C1_CLK_INTLEN: u32 = 1 << 0;
+const C1_CLK_STABLE: u32 = 1 << 1;
+const C1_CLK_EN: u32 = 1 << 2;
+const C1_TOUNIT_MAX: u32 = 0x000E_0000;
+const C1_SRST_HC: u32 = 1 << 24;
+const C1_SRST_CMD: u32 = 1 << 25;
+const C1_SRST_DATA: u32 = 1 << 26;
+
+/// The SDMA buffer-boundary field both references put in the block-size register.
+///
+/// Linux writes `SDHCI_MAKE_BLKSZ(host->sdma_boundary, blksz)` and u-boot
+/// `SDHCI_MAKE_BLKSZ(SDHCI_DEFAULT_BOUNDARY_ARG, blocksize)`, both giving 7 in bits 12-14. Irrelevant to a
+/// PIO transfer that cannot reach a boundary, and written because being the only one of three
+/// implementations that puts something different there is not a position worth defending.
+const BLK_BOUNDARY: u32 = 7 << 12;
+
+
+
+/// How long a CONTROLLER-side wait may take: a reset bit clearing, the clock stabilising, the command
+/// and data lines leaving inhibit.
+///
+/// These were iteration counts (`t > 1_000_000`), which is a duration only on the machine it was tried
+/// on. Measured on the Pi 4 at the Arm clock's maximum, one look at a register here costs about 250 ns
+/// (the firmware upload: ~320 completion looks per command, ~5 ms per 1 KiB command), so a million looks
+/// was about a quarter of a second. The budget is twice that, so no wait that succeeded under the count
+/// can expire under the clock, and expiry now means the same thing on every core clock. Linux's own
+/// bounds for the same waits are shorter (`sdhci_reset` 100 ms, `sdhci_enable_clk` 150 ms).
+const CONTROL_WAIT: Budget = Budget::ms(500);
+
+/// How long a CARD-side wait may take: the command completing, the FIFO becoming ready, the transfer
+/// completing. Twice `CONTROL_WAIT`, as the two million looks it replaces were twice the million.
+const CARD_WAIT: Budget = Budget::ms(1_000);
+
+/// A short delay. Spins rather than sleeps because these are microsecond-scale hardware settling gaps
+/// on a path that holds no lock and serves nobody yet; a count is not a duration (`arch/CLAUDE.md`),
+/// which is why nothing here uses one as a TIMEOUT - the timeouts below are separate bounded loops on
+/// a register condition, and this is only ever a minimum gap.
+fn spin() {
+    for _ in 0..2000 {
+        core::hint::spin_loop();
+    }
+}
+
+/// The gap this controller requires after a register write, quoted from the driver written for it.
+///
+/// ```c
+/// #define MIN_FREQ 400000
+/// #define BCM2835_SDHCI_WRITE_DELAY(f)	(((2 * 1000000) / f) + 1)
+///
+/// static inline void bcm2835_mmc_writel(struct bcm2835_host *host, u32 val, int reg, int from)
+/// {
+/// 	writel(val, host->ioaddr + reg);
+/// 	udelay(BCM2835_SDHCI_WRITE_DELAY(max(host->clock, MIN_FREQ)));
+/// ```
+///
+/// Two card-clock periods, floored at 1 us, after EVERY register write. This driver had none.
+///
+/// **The worst case is used rather than the current clock's**: the formula's largest value is at the
+/// 400 kHz floor, which is 6 us. The card clock is not tracked here, and the requirement is a MINIMUM gap,
+/// so overshooting removes the need to know the clock and cannot err in the unsafe direction.
+///
+/// `spin()` is about 2 us on this machine, so four of them clear 6 us with room. A count is not a duration
+/// (`arch/CLAUDE.md`) - which is exactly why this is only ever used as a minimum gap and never as a
+/// timeout.
+fn write_settle() {
+    for _ in 0..4 {
+        spin();
+    }
+}
+
+pub struct Host<'a> {
+    /// For the clock that bounds the command and data waits (`godspeed::driver::wait`), which take no
+    /// `ctx` of their own. `park`, `reset` and `set_clock` are handed one and use that.
+    ctx: &'a ServiceContext,
+    m: &'a Mmio,
+    /// The controller's base clock in Hz, from the platform. **0 means refuse**, never guess: every
+    /// card clock derives from this, the Arasan reports it wrongly in CAPS on this family, and a
+    /// divider from a wrong base runs the identification clock at the wrong speed - so nothing
+    /// answers, silently, and only on hardware.
+    base_clock: u32,
+    /// `INTERRUPT` captured at the moment a command failed, before the line reset that clears it.
+    last_int: core::cell::Cell<u32>,
+    /// `CONTROL0` as it stood before the last data command cleared its DMA-select field.
+    last_ctrl0: core::cell::Cell<u32>,
+    /// The OR of every `INTERRUPT` value seen while waiting for the FIFO, and the same for `STATUS`.
+    ///
+    /// **This is the measurement four hypotheses were substituting for.** Reporting the registers AFTER
+    /// a timeout cannot distinguish "the controller never moved" from "it moved and settled back"; an
+    /// accumulated OR can. If these read the same as they did going in, the data phase did not happen at
+    /// all, and no amount of adjusting the setup is the answer.
+    seen_int: core::cell::Cell<u32>,
+    seen_status: core::cell::Cell<u32>,
+    /// The poll iteration at which DAT Line Active was first and last seen. 0 = never.
+    dat_first: core::cell::Cell<u32>,
+    dat_last: core::cell::Cell<u32>,
+    /// `BLKSIZECNT` as it read back after being written for the last data command.
+    last_blk: core::cell::Cell<u32>,
+    /// `CMDTM` as it read back after the last command was issued.
+    last_cmdtm: core::cell::Cell<u32>,
+    /// `RESP0` from the last command a DATA transfer issued.
+    ///
+    /// **This was being thrown away, and it is the answer to the failure it was hiding.** `cmd_data_word`
+    /// calls `cmd_inner`, which returns the response, and discarded it - so when a CMD53 completed and no
+    /// data followed there was no way to see whether the CARD had refused. A refusal looks exactly like
+    /// that: the command completes, the card answers with its flags set, and no data comes. Same shape
+    /// as `last_int` and kept for the same reason.
+    last_resp: core::cell::Cell<u32>,
+    /// Poll iterations spent waiting on the CARD across data commands since the last `take_waits`: for
+    /// the FIFO to accept a block, and for the transfer to complete. Where an upload's time goes - the
+    /// host's own work is fixed per command, so a slower upload with the same counts is the host, and
+    /// a slower one with larger counts is the chip (docs/wifi.md 54).
+    wait_ready: core::cell::Cell<u64>,
+    wait_done: core::cell::Cell<u64>,
+}
+
+impl<'a> Host<'a> {
+    pub fn new(ctx: &'a ServiceContext, m: &'a Mmio, base_clock: u32) -> Self {
+        Host {
+            ctx,
+            m,
+            base_clock,
+            last_int: core::cell::Cell::new(0),
+            last_resp: core::cell::Cell::new(0),
+            last_blk: core::cell::Cell::new(0),
+            last_cmdtm: core::cell::Cell::new(0),
+            last_ctrl0: core::cell::Cell::new(0),
+            seen_int: core::cell::Cell::new(0),
+            seen_status: core::cell::Cell::new(0),
+            dat_first: core::cell::Cell::new(0),
+            dat_last: core::cell::Cell::new(0),
+            wait_ready: core::cell::Cell::new(0),
+            wait_done: core::cell::Cell::new(0),
+        }
+    }
+
+    /// The card-wait poll counts accumulated since the last call (FIFO ready, transfer complete), reset.
+    pub fn take_waits(&self) -> (u64, u64) {
+        (self.wait_ready.replace(0), self.wait_done.replace(0))
+    }
+
+    fn rd(&self, off: usize) -> u32 {
+        self.m.read32(off)
+    }
+    /// Write a register, then wait out the controller's settling gap.
+    ///
+    /// The gap is the reference's `bcm2835_mmc_writel`. The FIFO is the one exception and uses `wr_raw`,
+    /// because the reference's PIO block writer uses `mmc_raw_writel`, which does not delay - so the split
+    /// here mirrors the split there rather than being a judgement about which writes "need" it.
+    fn wr(&self, off: usize, v: u32) {
+        self.wr_raw(off, v);
+        write_settle();
+    }
+
+    /// Write a register with NO settling gap - the FIFO data port only.
+    ///
+    /// `mmc_raw_writel(host, scratch, SDHCI_BUFFER)` is what the reference's block writer uses, and it
+    /// applies no delay. Putting a 6 us gap on every FIFO word would also make a 512-byte block take
+    /// 768 us for no reason the reference recognises.
+    fn wr_raw(&self, off: usize, v: u32) {
+        self.m.write32(off, v)
+    }
+
+    /// The version register the kernel's census identified this controller by, for the service to
+    /// print and compare. Reading the SAME register the kernel did is deliberate: if the two disagree,
+    /// the MMIO grant is pointed somewhere other than where the census looked, and that is worth
+    /// catching in the one line where both numbers are visible.
+    pub fn version_reg(&self) -> u32 {
+        self.rd(SLOTISR_VER)
+    }
+
+    pub fn status(&self) -> u32 {
+        self.rd(STATUS)
+    }
+
+    /// `INTERRUPT` as it was when the last command failed. 0 if none has.
+    pub fn last_int(&self) -> u32 {
+        self.last_int.get()
+    }
+
+    /// `RESP0` from the last command a data transfer issued - the R5 for a CMD53.
+    pub fn last_resp(&self) -> u32 {
+        self.last_resp.get()
+    }
+
+    /// `BLKSIZECNT` and `CMDTM` as they READ BACK - what the controller is actually holding, rather than
+    /// what this driver believes it wrote.
+    pub fn last_setup(&self) -> (u32, u32) {
+        (self.last_blk.get(), self.last_cmdtm.get())
+    }
+
+    /// `CONTROL0` as it stood going into the last data command, before its DMA-select field was cleared.
+    pub fn last_ctrl0(&self) -> u32 {
+        self.last_ctrl0.get()
+    }
+
+    /// Every bit ever seen in `INTERRUPT` and in `STATUS` while waiting for the FIFO.
+    pub fn seen(&self) -> (u32, u32) {
+        (self.seen_int.get(), self.seen_status.get())
+    }
+
+    /// The poll iterations at which the data phase was first and last seen active. `(0, 0)` = never.
+    pub fn dat_window(&self) -> (u32, u32) {
+        (self.dat_first.get(), self.dat_last.get())
+    }
+
+    /// The ten-bit SDHCI clock divider for a target clock, from the controller's REAL base clock.
+    ///
+    /// Card clock is `base / (2 * divisor)`. Ceiling division, so the result is never FASTER than
+    /// asked - on the identification clock, faster means no card answers.
+    fn divider_for(&self, target_hz: u32) -> u32 {
+        if self.base_clock == 0 || target_hz == 0 {
+            return 0;
+        }
+        let d = (self.base_clock + (2 * target_hz) - 1) / (2 * target_hz);
+        if d > 0x3FF {
+            0x3FF
+        } else {
+            d
+        }
+    }
+
+    /// PARK the controller across a cut of the chip's power: a full software reset (SRST_HC), which
+    /// leaves the card clock and the internal clock off and no command or data transfer in flight, so
+    /// nothing this host does drives the SDIO lines into the chip while its rail is down, or at the
+    /// instant WL_REG_ON rises - the edge at which a Broadcom part samples its boot straps. At mains boot
+    /// the VideoCore raises WL_ON with this controller untouched and the chip comes up cold every time;
+    /// every earlier power cycle here left the 25 MHz card clock toggling into the unpowered chip for the
+    /// whole off window and came up cold only some of the time, and gating the clock alone just before
+    /// power-on came up cold in none of seven (docs/wifi.md 48).
+    /// Parking across the whole window was then tried and came up cold in one of three loads - it did not
+    /// fix the warm start either; docs/wifi.md 48 names the pads (GPIO pulls, kernel-owned) as next.
+    ///
+    /// Nothing here re-enables a clock. The next user of the host - the respawned instance's stage 2, or
+    /// `reset` in this one after an in-place cycle - brings it back from reset after the power-on delay,
+    /// which is also Linux's order (`mmc_power_up`: power with the clock at zero, the init clock after).
+    /// `false` if the reset never completed; it is said, and the caller proceeds - a host that will not
+    /// reset is no reason to keep a dead firmware's chip powered.
+    pub fn park(&self, ctx: &ServiceContext) -> bool {
+        // How long SRST_HC may take to self-clear. A bound in TIME, not in reads: a read count is a
+        // different duration on every core clock.
+        const PARK_MS: u64 = 100;
+        self.wr(CONTROL1, self.rd(CONTROL1) | C1_SRST_HC);
+        if wait::until(ctx, Budget::ms(PARK_MS), || self.rd(CONTROL1) & C1_SRST_HC == 0).is_err() {
+            ctx.log("wifi-driver: SRST_HC did not clear while parking the host - its lines may still be driven across the power edge");
+            return false;
+        }
+        // SRST_HC returns CONTROL1 to its reset value, clocks off. Cleared explicitly as well, so the
+        // parked state does not rest on one controller's reading of "reset".
+        self.wr(CONTROL1, self.rd(CONTROL1) & !(C1_CLK_EN | C1_CLK_INTLEN));
+        true
+    }
+
+    /// Program the card clock. Returns false if it never reports stable.
+    fn set_clock(&self, divisor: u32, ctx: &ServiceContext) -> bool {
+        self.wr(CONTROL1, self.rd(CONTROL1) & !C1_CLK_EN);
+        for _ in 0..5 {
+            spin();
+        }
+        let c1 = (self.rd(CONTROL1) & !0x0000_FFE0)
+            | C1_CLK_INTLEN
+            | ((divisor & 0xFF) << 8) // divider low 8 bits  [15:8]
+            | (((divisor >> 8) & 0x3) << 6) // divider high 2 bits [7:6], SDHCI 3.0 ten-bit mode
+            | C1_TOUNIT_MAX;
+        self.wr(CONTROL1, c1);
+        // The Arasan loses successive writes to the same register that land within two card-clock
+        // cycles of each other - a clock-domain-crossing erratum Linux's `sdhci-iproc` spaces out
+        // explicitly. At 400 kHz two cycles is ~5 us, so the CONTROL1 writes are spaced generously.
+        for _ in 0..40 {
+            spin();
+        }
+        if wait::until(ctx, CONTROL_WAIT, || self.rd(CONTROL1) & C1_CLK_STABLE != 0).is_err() {
+            ctx.log_fmt(format_args!(
+                "wifi-driver: card clock never reported stable (divisor={}, CONTROL1={:#010x})",
+                divisor,
+                self.rd(CONTROL1)
+            ));
+            return false;
+        }
+        self.wr(CONTROL1, self.rd(CONTROL1) | C1_CLK_EN);
+        for _ in 0..40 {
+            spin();
+        }
+        true
+    }
+
+    /// Reset the controller and bring it up at the 400 kHz identification clock.
+    ///
+    /// Returns false with a reason logged. Each step reports WHICH one failed, because on hardware the
+    /// difference between "the controller never left reset" and "the clock never stabilised" and "the
+    /// platform would not tell us the base clock" is three different bugs, and a bare false is a
+    /// debugging session (invariant 12).
+    pub fn reset(&self, ctx: &ServiceContext) -> bool {
+        self.wr(CONTROL1, self.rd(CONTROL1) | C1_SRST_HC);
+        if wait::until(ctx, CONTROL_WAIT, || self.rd(CONTROL1) & C1_SRST_HC == 0).is_err() {
+            ctx.log("wifi-driver: SRST_HC never cleared - the controller did not leave reset");
+            return false;
+        }
+        if self.base_clock == 0 {
+            ctx.log(
+                "wifi-driver: the platform reported NO base clock, so no card clock can be derived. \
+                 Refusing rather than guessing: a divider from a wrong base runs the identification \
+                 clock at the wrong speed and nothing answers, silently",
+            );
+            return false;
+        }
+        let id_div = self.divider_for(400_000);
+        ctx.log_fmt(format_args!(
+            "wifi-driver: base clock {} Hz, identification divisor {} (target 400 kHz)",
+            self.base_clock, id_div
+        ));
+        if !self.set_clock(id_div, ctx) {
+            return false;
+        }
+        // 1-bit bus, no high-speed, and NO DMA SELECTION. Data moves on DAT0 by PIO, in byte or block
+        // mode (the firmware upload in blocks, frames up to 4 KiB); 4-bit DAT and the 50 MHz mode were
+        // left out when only commands rode the bus, and have not been needed since - and the
+        // DMA-select field must be zero for PIO to work at all on some controllers (see
+        // `CONTROL0_DMA_SELECT`). Written explicitly rather than inherited from whatever the firmware
+        // left, which on this board is nothing at all: it boots from the other controller.
+        //
+        // LOGGED BEFORE AND AFTER, because whether those bits were set is the question. A reader should
+        // not have to take "cleared it" on trust when "it was already clear" means something different.
+        let c0_before = self.rd(CONTROL0);
+        self.wr(CONTROL0, c0_before & !((1 << 1) | (1 << 2) | CONTROL0_DMA_SELECT));
+        let c0_after = self.rd(CONTROL0);
+        ctx.log_fmt(format_args!(
+            "wifi-driver: CONTROL0 {:#010x} -> {:#010x} (DMA select was {:#x}, must be 0 for PIO)",
+            c0_before,
+            c0_after,
+            (c0_before & CONTROL0_DMA_SELECT) >> 3
+        ));
+        // Latch every status bit so `cmd` can read them; the controller is polled, not interrupt
+        // driven, so nothing is unmasked to the CPU.
+        self.wr(INT_EN, 0xFFFF_FFFF);
+        self.wr(INT_MASK, 0xFFFF_FFFF);
+
+        // THE DATA TIMEOUT, which two references write and this driver did not.
+        //
+        // ```c
+        // if (data || (cmd->flags & MMC_RSP_BUSY)) {
+        // 	count = TIMEOUT_VAL;
+        // 	bcm2835_mmc_writeb(host, count, SDHCI_TIMEOUT_CONTROL);
+        // }
+        // ```
+        //
+        // and u-boot writes `0xe` to the same register before every data command. Left at whatever reset
+        // gives, a data phase can time out sooner than a slow device answers - and this controller would
+        // report that as a DATA_TIMEOUT, which `INT_ERR` covers, so it is not today's silent failure. It is
+        // still a requirement being ignored.
+        //
+        // `SDHCI_TIMEOUT_CONTROL` is offset 0x2E, which on this family is not a register of its own: it
+        // sits inside the 32-bit word at 0x2C (`CONTROL1`) as `DATA_TOUNIT`, bits 19:16. The reference's
+        // `writeb` wraps `writel`, so writing 0x0E there sets exactly these four bits - which is what this
+        // does directly, since 32-bit is the only access width this controller allows.
+        //
+        // SET ONCE rather than per command, deliberately: the field is sticky and `set_clock` masks with
+        // `!0x0000_FFE0`, which preserves bits 19:16. Equivalent to the reference's per-command write with
+        // three fewer writes per command, and stated here rather than left as a silent difference.
+        const DATA_TOUNIT_SHIFT: u32 = 16;
+        const DATA_TOUNIT_MASK: u32 = 0x000F_0000;
+        const TIMEOUT_VAL: u32 = 0x0E;
+        let c1 = (self.rd(CONTROL1) & !DATA_TOUNIT_MASK) | (TIMEOUT_VAL << DATA_TOUNIT_SHIFT);
+        self.wr(CONTROL1, c1);
+        // Leave the block registers defined rather than at
+        // whatever reset left: a stale block count is the kind of thing that makes the FIRST data
+        // command behave oddly, long after this code is out of mind.
+        self.wr(BLKSIZECNT, 0);
+        true
+    }
+
+    /// Set the operating clock once a card has been identified. Separate from `reset` so the caller
+    /// decides when identification is over; bounded and reported like everything else.
+    pub fn set_operating_clock(&self, hz: u32, ctx: &ServiceContext) -> bool {
+        let d = self.divider_for(hz);
+        ctx.log_fmt(format_args!("wifi-driver: raising the card clock to ~{} Hz (divisor {})", hz, d));
+        self.set_clock(d, ctx)
+    }
+
+    /// Issue one command and wait for it to complete. Returns `RESP0`, or `None` with `last_int` set.
+    ///
+    /// `code` is the SDHCI `CMDTM` word: `index << 24 | flags << 16 | transfer mode`.
+    ///
+    /// **Whether CRC and index checking are on is PER COMMAND, and this used to get it wrong.** The
+    /// comment here said they were "deliberately left OFF because two of the responses this driver reads
+    /// - R4 from CMD5 and R3 - carry neither a CRC7 nor a command index". That is true of CMD5, and it
+    /// was applied to every command through one shared template. **R5 carries both**, and Linux sets
+    /// both for it from `MMC_RSP_R5 = PRESENT | CRC | OPCODE` - see the per-command constants in
+    /// `godspeed_wifi::sdio` (`Cmd`), encoded by `cmdtm` below into the values `sdhci_send_command` computes.
+    pub fn cmd_word(&self, code: u32, arg: u32) -> Option<u32> {
+        self.cmd_inner(code, arg, None)
+    }
+
+    /// The one command path. `blk` is the `BLKSIZECNT` word for a command that carries data.
+    ///
+    /// **`BLKSIZECNT` is written HERE, between the argument and the command**, because that is the order
+    /// this controller actually sees from Linux: `sdhci_iproc_writew` defers the block registers into a
+    /// shadow and flushes them when the COMMAND register is written, and `sdhci_send_command` writes
+    /// ARGUMENT then COMMAND. It was previously written by the caller, before the status clear and the
+    /// argument. Both are before the write that starts the transfer, so this is unlikely to matter - it
+    /// is here because matching the reference where there is no reason to differ is the method.
+    fn cmd_inner(&self, code: u32, arg: u32, blk: Option<u32>) -> Option<u32> {
+        if wait::until(self.ctx, CONTROL_WAIT, || self.rd(STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) == 0).is_err() {
+            self.last_int.set(self.rd(INTERRUPT));
+            return None;
+        }
+        self.wr(INTERRUPT, self.rd(INTERRUPT)); // clear stale status
+        self.wr(ARG1, arg);
+        if let Some(b) = blk {
+            // PER TRANSFER, not once at init, because that is where Linux does it: `sdhci_config_dma`
+            // runs from `sdhci_prepare_data`. The pre-clear value is kept so a failure can report
+            // whether the field had drifted back.
+            let c0 = self.rd(CONTROL0);
+            self.last_ctrl0.set(c0);
+            if c0 & CONTROL0_DMA_SELECT != 0 {
+                self.wr(CONTROL0, c0 & !CONTROL0_DMA_SELECT);
+            }
+            self.wr(BLKSIZECNT, b);
+            // READ IT BACK. If the block registers did not take, everything after this is a transfer
+            // the controller was never set up for - and a zero block size gives it nothing to move and
+            // no reason to report an error, which is exactly what a silent data phase looks like.
+            // Recorded rather than acted on: the value is evidence for the caller's log line.
+            self.last_blk.set(self.rd(BLKSIZECNT));
+        }
+        self.wr(CMDTM, code);
+        // And the command word as the controller holds it, for the same reason: SDHCI starts a transfer
+        // when a command with Data Present Select completes, so a controller that started nothing either
+        // has a zero block size or does not have that bit set.
+        self.last_cmdtm.set(self.rd(CMDTM));
+        let mut d = wait::Deadline::start(self.ctx, CARD_WAIT);
+        loop {
+            let i = self.rd(INTERRUPT);
+            if i & INT_CMD_DONE != 0 {
+                break;
+            }
+            if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
+                // Record WHY before recovering: `reset_cmd_dat` clears INTERRUPT, so a caller that
+                // logs the register afterwards reads 0 and cannot tell a timeout from an error.
+                self.last_int.set(i);
+                self.reset_cmd_dat();
+                return None;
+            }
+            if d.expired() {
+                self.last_int.set(self.rd(INTERRUPT));
+                self.reset_cmd_dat();
+                return None;
+            }
+        }
+        self.wr(INTERRUPT, INT_CMD_DONE);
+        // Ncc: the SD spec wants at least 8 card-clock cycles between the end of one command and the
+        // start of the next. At 400 kHz that is 20 us, and issuing back-to-back can catch the card
+        // still driving CMD - which the controller reports as a line conflict (timeout AND CRC
+        // together), the exact signature that cost the Pi 2's card a debugging session.
+        for _ in 0..10 {
+            spin();
+        }
+        Some(self.rd(RESP0))
+    }
+
+    /// Issue a command that carries a DATA phase, and move `buf` through the FIFO by PIO.
+    ///
+    /// `Err` names WHICH wait expired, because they mean different things and the interrupt register
+    /// cannot tell them apart: `CMD_DONE` is cleared once the command lands, so a register reading zero
+    /// while waiting for the FIFO is exactly what a healthy command looks like. "The command never
+    /// issued" and "the command was fine and no data came" need different fixes.
+    ///
+    /// **The command phase is `cmd_inner`**, the same function CMD0, CMD3, CMD5, CMD7 and CMD52 all go
+    /// through. This used to inline its own copy of that logic - the inhibit wait, the stale-status
+    /// clear, the ARG1/CMDTM writes, the CMD_DONE poll - which is four chances to differ subtly from
+    /// code already proven on this silicon. `block-driver`'s backend has the shape that works on this
+    /// controller and this now matches it: wait DAT, set the block registers, `cmd_inner`, then the data.
+    ///
+    /// PIO, not DMA, for the two reasons `block-driver`'s backend gives: DMA on this SoC is not cache
+    /// coherent without explicit maintenance, and when this was written these transfers were four
+    /// bytes. The firmware upload and every frame now go this way too, by PIO.
+    pub fn cmd_data_word(&self, code: u32, arg: u32, blk: u32, buf: &mut [u32], read: bool)
+        -> Result<(), &'static str>
+    {
+        let bytes = buf.len() * 4;
+        if buf.is_empty() || bytes > 0xFFFF {
+            return Err("the caller asked for a transfer this driver will not do");
+        }
+        // RESET THE INSTRUMENTS, so they describe THIS transfer. They accumulate with `|=`, and
+        // without this they carried every bit seen since boot - which reads as an answer and is
+        // not one. A stale instrument is worse than no instrument, because it is believed.
+        self.seen_int.set(0);
+        self.seen_status.set(0);
+        self.dat_first.set(0);
+        self.dat_last.set(0);
+        // The DAT line before the block registers, which is the order the working backend uses.
+        if wait::until(self.ctx, CONTROL_WAIT, || self.rd(STATUS) & SR_DAT_INHIBIT == 0).is_err() {
+            self.last_int.set(self.rd(INTERRUPT));
+            return Err("the DAT line never came out of inhibit");
+        }
+        // THE BLOCK REGISTERS COME FROM THE CALLER, because byte mode and block mode need different
+        // words and only the caller knows which it is issuing (`blk_byte_mode` / `blk_block_mode`). It is
+        // handed to `cmd_inner` rather than written here so it lands between the argument and the command,
+        // exactly as the references' shadow-flush order puts it.
+
+        // THE COMMAND PHASE IS THE ONE EVERY OTHER COMMAND USES. It clears stale status, writes ARG1,
+        // the block registers, CMDTM, polls CMD_DONE, captures `last_int` on failure and resets the
+        // lines.
+        // KEEP THE RESPONSE. For a CMD53 this is the R5, whose flag byte says whether the card accepted
+        // the transfer - and a refusal is indistinguishable, from the controller's side, from the data
+        // phase simply not happening.
+        match self.cmd_inner(code, arg, Some(blk)) {
+            Some(r) => self.last_resp.set(r),
+            None => return Err("the command itself did not complete"),
+        }
+
+        // Then the FIFO, one word at a time. The ready bit is latched, so it is cleared before each
+        // word rather than once - otherwise the first word's flag would satisfy every later wait and
+        // this would read the FIFO faster than the controller fills it.
+        // ONE BLOCK BETWEEN WAITS, which is the whole shape of a PIO transfer and was wrong here.
+        //
+        // u-boot's `sdhci_transfer_pio` moves `data->blocksize` bytes per call - `for (i = 0; i <
+        // data->blocksize; i += 4)` - with NO re-check of any ready bit inside that loop, and its
+        // caller clears the flag BEFORE calling it and waits again for the next block.
+        //
+        // This waited for the ready bit per WORD and cleared it per word. For a four-byte byte-mode
+        // transfer that is accidentally right, because one word IS one block - which is why every
+        // register read worked. For a 64-byte block it deadlocks: the controller raises the flag once
+        // when the block buffer is free, one word goes in, the flag is cleared, and the loop then
+        // waits for a flag that cannot set again until a block completes. Observed exactly, with the
+        // card holding DAT0 low waiting for the other 60 bytes.
+        //
+        // The geometry comes from the `BLKSIZECNT` word the caller already gave, so the two cannot
+        // disagree about how big a block is.
+        let ready = if read { INT_READ_RDY } else { INT_WRITE_RDY };
+        let ready_st = if read { ST_BUF_READ_ENABLE } else { ST_BUF_WRITE_ENABLE };
+        let blocks = (blk >> 16).max(1) as usize;
+        let words_per_block = ((blk & 0xFFF) as usize).max(4) / 4;
+        let mut done = 0usize;
+
+        for _ in 0..blocks {
+            if done >= buf.len() {
+                break;
+            }
+            // WAIT ONCE PER BLOCK. `t` counts looks for the instruments; the bound is the clock.
+            let mut t = 0u32;
+            let mut d = wait::Deadline::start(self.ctx, CARD_WAIT);
+            loop {
+                let i = self.rd(INTERRUPT);
+                let s = self.rd(STATUS);
+                self.seen_int.set(self.seen_int.get() | i);
+                self.seen_status.set(self.seen_status.get() | s);
+                if s & ST_DAT_ACTIVE != 0 {
+                    if self.dat_first.get() == 0 {
+                        self.dat_first.set(t + 1);
+                    }
+                    self.dat_last.set(t + 1);
+                }
+                if i & ready != 0 || s & ready_st != 0 {
+                    break;
+                }
+                if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
+                    self.last_int.set(i);
+                    self.reset_cmd_dat();
+                    return Err("the controller reported an error during the data phase");
+                }
+                t = t.saturating_add(1);
+                if d.expired() {
+                    self.last_int.set(self.rd(INTERRUPT));
+                    self.reset_cmd_dat();
+                    return Err("the FIFO never became ready - the command completed and no data came");
+                }
+            }
+            self.wait_ready.set(self.wait_ready.get() + t as u64);
+            // CLEARED BEFORE THE BLOCK MOVES, as the reference does, not after each word.
+            self.wr(INTERRUPT, ready);
+            // THEN THE WHOLE BLOCK, with no further checks. This is the part that was missing.
+            let end = (done + words_per_block).min(buf.len());
+            for w in buf[done..end].iter_mut() {
+                if read {
+                    *w = self.rd(DATA);
+                } else {
+                    // RAW: no settling gap on the data port. See `wr_raw`.
+                    self.wr_raw(DATA, *w);
+                }
+            }
+            done = end;
+        }
+
+        // TRANSFER COMPLETE, waited for rather than assumed. The last FIFO access is not the end of the
+        // transaction - the controller still has to finish on the bus - and issuing the next command
+        // before it does is a line conflict.
+        let mut t = 0u32;
+        let mut d = wait::Deadline::start(self.ctx, CARD_WAIT);
+        loop {
+            let i = self.rd(INTERRUPT);
+            if i & INT_DATA_DONE != 0 {
+                break;
+            }
+            if i & (INT_ERR | INT_CMD_TIMEOUT) != 0 {
+                self.last_int.set(i);
+                self.reset_cmd_dat();
+                return Err("the controller reported an error after the data moved");
+            }
+            t = t.saturating_add(1);
+            if d.expired() {
+                self.last_int.set(self.rd(INTERRUPT));
+                self.reset_cmd_dat();
+                return Err("the data moved and the transfer never reported complete");
+            }
+        }
+        self.wait_done.set(self.wait_done.get() + t as u64);
+        self.wr(INTERRUPT, INT_DATA_DONE);
+        for _ in 0..10 {
+            spin(); // Ncc, as in `cmd_inner`
+        }
+        Ok(())
+    }
+
+    /// After a command error both lines stay inhibited (SDHCI 3.10), so every later command would spin
+    /// to its bound. Reset them (bounded) and clear the latched bits, so one transient does not wedge
+    /// the driver.
+    fn reset_cmd_dat(&self) {
+        self.wr(CONTROL1, self.rd(CONTROL1) | C1_SRST_CMD | C1_SRST_DATA);
+        // Not reported HERE: this runs on a path already returning its own failure, and a line reset
+        // that did not finish shows up as the NEXT command's inhibit wait expiring, which is reported.
+        let _ = wait::until(self.ctx, CONTROL_WAIT, || self.rd(CONTROL1) & (C1_SRST_CMD | C1_SRST_DATA) == 0);
+        self.wr(INTERRUPT, self.rd(INTERRUPT));
+    }
+}
+
+// ------------------------------------------------------------- the shared protocol's host, on SDHCI
+
+use godspeed_wifi::sdio::{Cmd, Geometry, Resp, SdioHost, Xfer};
+
+/// A command in this controller's terms: the SDHCI `CMDTM` word, `index << 24 | flags << 16 | mode`.
+///
+/// flags: response type (0 none, 2 = 48-bit, 3 = 48-bit + busy) | `CMD_CRC` 0x08 | `CMD_INDEX` 0x10 |
+/// CMD_DATA 0x20. mode, for a data command: `TM_BLKCNT_EN` (the spec's `BLK_CNT_EN`) 0x02 | `TM_DAT_DIR` read 0x10 |
+/// `TM_MULTI_BLOCK` 0x20.
+///
+/// **Every field here was read off Linux rather than reasoned about, after two flashes lost to
+/// reasoning.** `sdhci_send_command` builds the flags from the mmc response flags and
+/// `sdhci_set_transfer_mode` the transfer mode. `TM_BLKCNT_EN` is set for ANY data command, single block
+/// included: the spec invites leaving it off for one block, and on hardware the card then ACCEPTED the
+/// transfer (R5 clean) while the controller ran no data phase at all. `CMD_CRC` and `CMD_INDEX` come from
+/// `MMC_RSP_R5 = PRESENT | CRC | OPCODE`; CMD5's R4 has neither, which is why they are per command (`godspeed_wifi::sdio::Cmd`).
+/// Were CMD3, CMD7 and CMD52 to turn their checks on, their words would be `0x031A_0000`, `0x071B_0000`
+/// and `0x341A_0000` - recorded so the choice is visible.
+const fn cmdtm(c: Cmd, x: Option<Xfer>) -> u32 {
+    let mut flags = match c.resp {
+        Resp::None => 0,
+        Resp::Short => 2,
+        Resp::ShortBusy => 3,
+    };
+    if c.check_crc {
+        flags |= 0x08;
+    }
+    if c.check_index {
+        flags |= 0x10;
+    }
+    let mut mode = 0;
+    if let Some(x) = x {
+        flags |= 0x20;
+        mode = 0x02;
+        if x.read {
+            mode |= 0x10;
+        }
+        if x.multi {
+            mode |= 0x20;
+        }
+    }
+    ((c.index as u32) << 24) | (flags << 16) | mode
+}
+
+/// A geometry in this controller's terms: `BLKSIZECNT`, `count << 16 | boundary | size`.
+const fn blksizecnt(g: Geometry) -> u32 {
+    ((g.count & 0xFFFF) << 16) | BLK_BOUNDARY | (g.size & 0xFFF)
+}
+
+// PINNED TO THE WORDS THIS DRIVER USED BEFORE THE TRAIT EXISTED, so moving to it changed nothing the
+// controller sees. Each is the value that worked on the Pi 4.
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::GO_IDLE, None) == 0x0000_0000);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_SEND_OP_COND, None) == 0x0502_0000);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::SEND_REL_ADDR, None) == 0x0302_0000);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::SELECT_CARD, None) == 0x0703_0000);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_DIRECT, None) == 0x3402_0000);
+const PIN_GEOM: Geometry = godspeed_wifi::sdio::blk_byte_mode(4);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_EXTENDED,
+    Some(Xfer { geom: PIN_GEOM, read: true, multi: false })) == 0x353A_0012);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_EXTENDED,
+    Some(Xfer { geom: PIN_GEOM, read: true, multi: true })) == 0x353A_0032);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_EXTENDED,
+    Some(Xfer { geom: PIN_GEOM, read: false, multi: false })) == 0x353A_0002);
+const _: () = assert!(cmdtm(godspeed_wifi::sdio::IO_RW_EXTENDED,
+    Some(Xfer { geom: PIN_GEOM, read: false, multi: true })) == 0x353A_0022);
+const _: () = assert!(blksizecnt(godspeed_wifi::sdio::blk_byte_mode(4)) == (1 << 16) | BLK_BOUNDARY | 4);
+const _: () = assert!(blksizecnt(godspeed_wifi::sdio::blk_block_mode(3, 512))
+    == (3 << 16) | BLK_BOUNDARY | 512);
+
+impl SdioHost for Host<'_> {
+    fn reset(&self, ctx: &ServiceContext) -> bool {
+        Host::reset(self, ctx)
+    }
+    fn park(&self, ctx: &ServiceContext) -> bool {
+        Host::park(self, ctx)
+    }
+    fn set_operating_clock(&self, hz: u32, ctx: &ServiceContext) -> bool {
+        Host::set_operating_clock(self, hz, ctx)
+    }
+    fn cmd(&self, c: Cmd, arg: u32) -> Option<u32> {
+        self.cmd_word(cmdtm(c, None), arg)
+    }
+    fn cmd_data(&self, c: Cmd, arg: u32, x: Xfer, buf: &mut [u32]) -> Result<(), &'static str> {
+        self.cmd_data_word(cmdtm(c, Some(x)), arg, blksizecnt(x.geom), buf, x.read)
+    }
+    fn status(&self) -> u32 {
+        Host::status(self)
+    }
+    fn last_int(&self) -> u32 {
+        Host::last_int(self)
+    }
+    fn last_resp(&self) -> u32 {
+        Host::last_resp(self)
+    }
+    fn last_setup(&self) -> (u32, u32) {
+        Host::last_setup(self)
+    }
+    fn last_ctrl0(&self) -> u32 {
+        Host::last_ctrl0(self)
+    }
+    fn seen(&self) -> (u32, u32) {
+        Host::seen(self)
+    }
+    fn dat_window(&self) -> (u32, u32) {
+        Host::dat_window(self)
+    }
+    fn take_waits(&self) -> (u64, u64) {
+        Host::take_waits(self)
+    }
+}

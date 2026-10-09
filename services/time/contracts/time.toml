@@ -19,16 +19,11 @@ limit   = "8MiB"
 ipc_receive = ["time"]
 # `fs`, so the clock owns its own floor: read /clock.last at start-up, persist it when the clock is set.
 #
-# `net-stack` is here for ONE message and one only: a one-way "sync now" nudge carrying no reply cap.
-# The old note said `time` must NEVER send here, and the reason it gave is still true - `net-stack`
-# calls `time` after SNTP, so two single-threaded services making REQUESTS of each other deadlock. What
-# changed is that pursuing the time is this service's job, and it could not do it: the clock sat unset
-# on an idle machine until an operator typed `date sync`, which put resolution in the shell's hands.
-#
-# A message with nothing to answer breaks the cycle rather than joining it. `time` sends and forgets;
-# `net-stack` does the work and pushes the result back exactly as it already did. Neither ever waits on
-# the other, which is all §8.9 requires. The nudge is `try_send` at the call site, so even a full or
-# dead `net-stack` cannot stall the clock.
+# `net-stack`, for the NTP query (2026-10-01). This service fetches the network time itself: it builds
+# the query and sends it through `net-stack`'s op 12, a UDP datagram whose answer comes back when it
+# arrives, matched in this service's loop by tag and checked by nonce. Nothing waits on it - the send
+# answers `QueueFull` rather than blocking, and the answer is just another tagged message. `net-stack`
+# never sends to this service at all, so there is no call cycle for §8.9 to forbid.
 # `events` - the observability sink: automatic IPC traces, plus the metric samples this service
 # publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is

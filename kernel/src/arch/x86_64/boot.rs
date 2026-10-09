@@ -685,6 +685,7 @@ unsafe fn arm_tsc_deadline_now(ticks: u64) {
 /// Only valid when `TSC_DEADLINE_MODE` is `true`.
 #[inline]
 pub unsafe fn rearm_tsc_deadline() {
+    set_timer_mode(TIMER_QUANTUM);
     let ticks = TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed);
     // SAFETY: delegated to arm_tsc_deadline_now - same preconditions.
     unsafe { arm_tsc_deadline_now(ticks) };
@@ -733,6 +734,69 @@ fn periodic_timer_count() -> u32 {
     if t > 0 { t as u32 } else { PERIODIC_TIMER_COUNT }
 }
 
+const TIMER_CORES: usize = 64;
+const TIMER_UNSET: u8 = 0;
+const TIMER_QUANTUM: u8 = 1;
+const TIMER_IDLE: u8 = 2;
+/// About half a second of quanta (10 ms each, calibrated).
+const TIMER_STARVE_QUANTA: u64 = 50;
+/// WHICH PERIOD THIS CORE'S TIMER IS COUNTING, AND WHEN IT LAST FIRED - so the idle path never
+/// restarts a countdown it does not have to.
+///
+/// In PERIODIC mode every write of the initial count restarts the countdown, and the idle path wrote
+/// one on every pass: the idle period before a halt, the quantum after any wake. A core woken more
+/// often than its period therefore never took a timer interrupt at all, and with no tick there is no
+/// progress stamp. On the T630 on 2026-10-08 that was core 2, running `xhci` and taking its MSI, woken
+/// every ~26 ms once the USB dongle was receiving: "since its last stamp it has taken 0 timer
+/// interrupts and halted 113 times in idle", and the liveness watchdog stopped a machine that was
+/// working. The same restart would have stopped the BSP's tick - the clock and the timed wakes - had
+/// it been woken more often than every 10 ms, because it re-armed its quantum before every halt.
+///
+/// Two rules, in `rearm_idle_timer` and `rearm_quantum_timer`, both modes:
+/// - a timer already counting the period asked for is left alone (the BSP's 10 ms tick is never
+///   restarted, an idle core's ~1 s countdown runs out);
+/// - a timer that has not fired for `TIMER_STARVE_QUANTA` quanta is not rewritten until it does, so
+///   a core switching between idle and work faster than either period still ticks - at worst every
+///   ~1.5 s, inside the watchdog's 3 s.
+static TIMER_MODE: [core::sync::atomic::AtomicU8; TIMER_CORES] =
+    [const { core::sync::atomic::AtomicU8::new(TIMER_UNSET) }; TIMER_CORES];
+static TIMER_LAST_FIRED: [core::sync::atomic::AtomicU64; TIMER_CORES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; TIMER_CORES];
+
+fn timer_core() -> usize {
+    crate::task::scheduler::current_core_id()
+}
+
+fn timer_mode() -> u8 {
+    let c = timer_core();
+    if c < TIMER_CORES { TIMER_MODE[c].load(Ordering::Relaxed) } else { TIMER_UNSET }
+}
+
+fn set_timer_mode(m: u8) {
+    let c = timer_core();
+    if c < TIMER_CORES { TIMER_MODE[c].store(m, Ordering::Relaxed); }
+}
+
+/// This core's timer interrupt arrived (called from the timer path's arrival stamp, `note_irq`).
+pub fn note_timer_fired(core: usize) {
+    if core < TIMER_CORES {
+        TIMER_LAST_FIRED[core].store(super::syscall_entry::read_cycle_counter(), Ordering::Relaxed);
+    }
+}
+
+/// Has this core's timer gone `TIMER_STARVE_QUANTA` without firing? False when the TSC rate is not
+/// calibrated (no quantum to count in) or the timer has not fired yet since boot.
+fn timer_starved() -> bool {
+    let c = timer_core();
+    let q = TSC_TICKS_PER_QUANTUM.load(Ordering::Relaxed);
+    if c >= TIMER_CORES || q == 0 {
+        return false;
+    }
+    let last = TIMER_LAST_FIRED[c].load(Ordering::Relaxed);
+    last != 0
+        && super::syscall_entry::read_cycle_counter().wrapping_sub(last) > q.saturating_mul(TIMER_STARVE_QUANTA)
+}
+
 /// Re-arm this core's timer for the long IDLE interval (~1 s) instead of the normal preemption
 /// period (Phase 2a). Handles **both** timer modes:
 ///  - **TSC-Deadline** (one-shot, software re-armed each tick): arm the next deadline
@@ -747,6 +811,11 @@ fn periodic_timer_count() -> u32 {
 /// Safe per §18.5: writing a timer register is not memory-unsafe, and the only precondition is
 /// ordering (call from the steady-state scheduler loop) - a documented contract, not an unsafe one.
 pub fn rearm_idle_timer() {
+    // Already counting the idle period, or starved: leave the countdown to finish (see `TIMER_MODE`).
+    if timer_mode() == TIMER_IDLE || timer_starved() {
+        return;
+    }
+    set_timer_mode(TIMER_IDLE);
     if TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
         let ticks = TSC_TICKS_PER_QUANTUM
             .load(Ordering::Relaxed)
@@ -782,10 +851,17 @@ pub fn rearm_idle_timer() {
 ///   while services spin-yielded, because the BSP never actually reached idle. The rule the idle path
 ///   was missing is **never halt without a freshly armed wake**.
 pub fn rearm_quantum_timer() {
+    // Already counting the quantum - in TSC-Deadline mode a deadline is always in flight then, since
+    // the timer path re-arms one on every tick - or starved: leave it (see `TIMER_MODE`). "Never halt
+    // without a freshly armed wake" is kept by the first: an armed quantum IS a wake in flight.
+    if timer_mode() == TIMER_QUANTUM || timer_starved() {
+        return;
+    }
     if TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
         // SAFETY: as `rearm_idle_timer` - ring-0, TSC-Deadline confirmed active.
         unsafe { rearm_tsc_deadline() };
     } else {
+        set_timer_mode(TIMER_QUANTUM);
         // SAFETY: as `rearm_idle_timer` - ring-0, this core's own LAPIC initial count.
         unsafe { write_apic(APIC_VIRT_BASE, APIC_TIMER_INIT, periodic_timer_count()) };
     }

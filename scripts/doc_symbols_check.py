@@ -47,7 +47,9 @@ BASELINE = os.path.join(ROOT, "scripts", "DOC-SYMBOLS.baseline.txt")
 # library at all: every symbol `docs/stdlib-design.md` named was checked against a source set
 # that excluded the crate the document is about. A checker that silently covers nothing is
 # worse than no checker, because its silence reads as a pass.
-SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "stdlib/rust/src", "osdev/src",
+# `sdk/wifi/src` (2026-10-02): the radios' shared crate. When its modules moved out of `services/`,
+# four names `docs/wifi.md` cites stopped resolving - which is this list doing its job, late.
+SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "sdk/wifi/src", "stdlib/rust/src", "osdev/src",
             "examples", "scripts"]
 DOC_DIRS = ["docs", "utilities", "backlog"]
 DOC_FILES = ["CLAUDE.md", "COMMANDMENTS.md", "README.md", "osdev/CLAUDE.md"]

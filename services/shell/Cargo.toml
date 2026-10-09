@@ -16,4 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+godspeed-wifi = { path = "../../sdk/wifi" }
+godspeed-audio = { path = "../../sdk/audio" }
 godspeed = { path = "../../stdlib/rust" }

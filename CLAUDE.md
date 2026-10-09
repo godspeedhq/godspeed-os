@@ -221,8 +221,13 @@ These are the laws that bound every design choice. Any change that violates an i
 > (`shared_surface_check.py`); the neutral kernel had none.
 >
 > It does now - the same one, which is the honest shape since it is one property asked of two layers.
-> **The standing figure is 46 arch-conditional sites outside `arch/`: 2 in the neutral kernel, 44
-> above it.** It may fall freely and may not rise without a recorded reason. What is left is listed
+> **The standing figure is 54 arch-conditional sites outside `arch/`: 2 in the neutral kernel, 52
+> above it** (46 and 44 when this was written; the rise is board facts in `services/supervisor/build.rs` and
+> `services/wifi-driver/build.rs` - the Pi 4's radio (+1), the audio drivers (+4) and, on 2026-10-04,
+> the VisionFive's radio and nic-driver's radio bridge as its own fact (+4) - blessed together that day;
+> and on 2026-10-05 one fewer, when the VisionFive gained the bridge too and the bridge fact became the
+> radio fact by derivation rather than a second test of the instruction set (-1); `docs/porting.md` has the per-file tree). It may fall freely and may not rise without a
+> recorded reason. What is left is listed
 > rather than implied. **The neutral kernel is down to 2**, and both are `target_pointer_width` on
 > one constant - a 32-bit address space genuinely cannot hold a 4 GiB virtual address, so the width
 > IS the question rather than an ISA standing in for one. Above the kernel, `nic-driver` picks its MAC by ISA on three
@@ -371,6 +376,10 @@ os/
                          #   exercises the claim, because a count is a proxy and a build is not
     shared_surface_check.py #  ratchets arch-conditional code ABOVE the kernel (the other axis:
                          #   `target_arch` there is usually "which BOARD am I on")
+    one_way_check.py     #   ONE way to write a service or a driver: `gs`. Ratchets, per crate, the raw
+                         #   SDK calls the standard library already covers - may fall, may not rise, and
+                         #   a NEW crate starts at zero. Counts only methods with a `gs` replacement, which
+                         #   it names; a gap in `gs` is closed in `gs` (backlog/71, 2026-10-05)
     port_scope_check.py  #   ...and the one the other four cannot answer: did the port EDIT anything
                          #   outside `arch/<isa>/` and the eleven files `docs/porting.md` marks `+`.
                          #   They all ask whether a RULE was broken; an ordinary edit to a neutral
@@ -721,6 +730,33 @@ official, not the runtime behaviour.
 > hardware (no SMMU is wired up on any non-x86 board) and on a firmware quirk (the stale pointer), not
 > on effort. `docs/networking.md` and `docs/ahci.md` each carried the opposite claim for their own
 > driver and are corrected in the same change.
+
+> **Amendment 2026-10-03 (audio): there are TWO confined drivers now, and the kernel releases a
+> confinement by the device, not by name.** The amendment above says `xhci` is the only confined driver
+> in the system. `audio-driver` (Intel High Definition Audio, `docs/audio.md`) is spawned confined as
+> well: every DMA its controller makes - the command rings, the buffer descriptor list, the ring of
+> sound - is inside its arena, so confinement refuses nothing it does legitimately. Verified in QEMU on
+> q35 with `amd-iommu`: the confinement selftest passes, the tone plays through the confined domain, and
+> a kill and restart releases and re-confines the device (`build/audio_iommu_qemu.log`). Its controller
+> uses plain MSI, so the interrupt message is in configuration space, out of the driver's reach.
+>
+> **The kernel change it needed adds no responsibility.** On a driver's death the kernel reverted the
+> device's confinement only for `xhci` and `ehci`, named; a third confined driver would have leaked its
+> I/O page table on every restart. It now releases for ANY task that holds a device, which is exact
+> because the release does nothing for a device that was never confined. The bus-master clear beside it
+> moved from a list of four names to the same per-task device record in the same change. Both are
+> memory isolation the kernel already enforced (§4.3), now keyed on what a task holds.
+>
+> **What does not change:** AMD-Vi is still x86-only, `ehci`, `block-driver` and `nic-driver` are still
+> in passthrough, and on the T630 the audio driver does not yet use DMA at all (`docs/audio.md`, A6), so
+> on real hardware `xhci` is still the one confined device. The mechanism now bounds two devices, on one
+> architecture, one of them in QEMU only.
+>
+> *(Note 2026-10-08: the T630 confines the audio controller too - its log shows `xhci` and 00:01.1 each
+> confined with an arena - so on real hardware there were two confined devices, and they shared one IOMMU
+> domain ID. AMD-Vi caches translations by domain ID, so that sharing was a defect; each confined device
+> now has its own (`kernel/src/arch/x86_64/iommu.rs`, `domain_of`). Found under an `xhci` that stopped
+> completing commands in a chaos run, `docs/wifi-usb.md` 51.)*
 
 > **Amendment 2026-07-16 (SEC-2): a confined USB driver's least-privilege claim is bounded by the
 > console it drives.** A USB *keyboard* driver is, by function, the machine's input path: it delivers
@@ -1397,6 +1433,25 @@ Where the machine's only output device is a display, the floor also includes a *
 >
 > §22 has no new test: the property this pins is a *negative* one on a machine we cannot fail on demand in QEMU. It is pinned instead by `scripts/commandments.py`, which counts the kernel's modules against §4.3 and for which `fbcon` was the last standing violation.
 
+> **Amendment 2026-10-08 (`events log boot`): the floor keeps a fixed copy of the BOOT, and it is
+> readable.** The ring above wraps, and nothing reads it - so on a busy machine the boot was gone from
+> the kernel within seconds, and the only record of what a machine found as it came up was a serial
+> cable that is often not attached. The kernel already held every one of those bytes and had no way to
+> give them back.
+>
+> Beside the ring, `log.rs` now keeps the first 32 KiB ever logged, which fills once and then never
+> changes. InspectKernel query 27 copies a range of it out, INTROSPECT-gated, because the boot log names
+> every service and device on the machine; the shell shows it as `events log boot`. A full record says
+> so, and that later lines are on serial.
+>
+> **What this does NOT change is the point of the amendment above.** The record is read by COPY, never
+> drained, so no log line depends on a reader being up, and `ctx.log()` is exactly what it was. It is
+> the floor this section already defines, made readable - not a log service in the kernel. The kernel
+> does not parse a line, keep a line count, or know which lines matter: it keeps bytes in order and
+> stops when the array is full. No responsibility is added (it is 4.3's memory and the existing 11.4
+> ring); the new query is pinned in `COMMANDMENTS.baseline.toml` because a query is surface. The cost is
+> 32 KiB of kernel memory on every port.
+
 ---
 
 ## 12. Drivers and Interrupts
@@ -1433,6 +1488,122 @@ hw_mmio      = ["0xfee00000+0x1000"]      # MMIO region
 ```
 
 The kernel validates these at spawn time and grants caps only for the specified resources.
+
+> **Amendment 2026-10-01 (`DevicePower`, syscall 54): the device grant is RENEWABLE - a service granted a
+> device's window may ask the kernel to cut and restore that device's power.** This is not a seventh
+> responsibility. The grant above already includes power: on the Pi 4 the kernel powers the SD domain
+> through the firmware mailbox at boot BEFORE it can hand `wifi-driver` the radio's window, because a
+> window to an unpowered device is not a grant. What the kernel could not do was renew it, and the
+> CYW43455 made that matter: six host-side resets - I/O reset, core halt, 802.11 reset, chipcommon and
+> PMU watchdogs, a RAM clear - each left a chip whose ROM will not boot a new firmware (`docs/wifi.md`
+> 45). Only cutting its power is a power-on, and every reference driver's recovery path cuts power.
+>
+> **What the kernel learns, and what it does not.** It mints `DEVICE_POWER` at spawn to the one service
+> it hands a fixed peripheral window to, where the arch layer can power the device behind it
+> (`arch::imp::device_power_control`) - derived from the grant, not from a privilege bit the spawner
+> passes, and never to anyone else, because a window has exactly one holder. `DevicePower(on)` checks
+> that holding and drives the pin the arch layer names for the CALLER'S device (`device_power`): on the
+> Pi 4, `WL_ON` on the firmware's GPIO expander, through the mailbox `SET_GPIO_STATE` tag - the pin
+> Linux's `mmc-pwrseq-simple` toggles for the same chip. The kernel does not know what the device is,
+> what firmware it runs, whether it is alive, or when its power should be cut: those are the driver's
+> (§26.10), and the hold-off and settle times are the device's and live in the driver with it. Every
+> other port answers the seam with `false`, and the syscall reports that honestly rather than pretending.
+> *(Note 2026-10-08: the VisionFive 2 Lite answers it too - its AIC8800's power pin, by device kind
+> `WIFI_SDIO`, result by read-back, `arch/riscv64`. Every port but those two answers `false`.)*
+>
+> **Why it is recorded.** A new syscall and a new resource widen the surface Commandment I pins, and
+> the gate refused this change until this paragraph existed - which is the gate working. The service
+> that uses it does so as its LAST resort, after adopting the firmware it finds running (`docs/wifi.md`
+> 46); the power cycle is for a firmware that has stopped, and it is what turns "reboot the machine" into
+> "the driver recovers in a few seconds" (`docs/wifi.md` 47). It is also the first brick of a shutdown:
+> the grants run in reverse, with power the last thing taken.
+>
+> **Amendment 2026-10-01 (later still): the paragraph two above overstates what was shown.** It says six
+> host-side resets "each left a chip whose ROM will not boot a new firmware" and that "only cutting its
+> power is a power-on". Every one of those resets, and every warm power-up after them, ran with the Arm cores
+> at their minimum clock - the Pi firmware drops them a minute after boot when no cpufreq sets one - and
+> with the cores held at turbo (`force_turbo=1`, `docs/wifi.md` 55) every power cycle comes up cold. So the
+> power cut is shown to WORK, not shown to be the only thing that would; whether the resets alone recover a
+> fast host's chip is open (`docs/wifi.md` 56). The grant itself stands on its own: cutting a device's
+> power is still the one recovery that cannot depend on the device's cooperation.
+>
+> **Amendment 2026-10-01 (`CpuClock`, syscall 55): the kernel sets the Arm clock to one of the firmware's
+> two ends, and a SERVICE decides which.** The Pi firmware owns the Arm clock and, with no OS asking it
+> for a rate, drops the cores to their minimum a minute after boot and leaves them there. The CYW43455's
+> firmware traps when it is uploaded that slowly (`docs/wifi.md` 55), so something has to be able to ask
+> for speed. The only way to ask is the firmware mailbox, which the kernel already owns - the SD power,
+> the GPIO expander and the radio's power cut all go through it - and a channel with one owner cannot be
+> handed to a service as well.
+>
+> **What the kernel learns, and what it does not.** `CpuClock(max)` sets the clock to the firmware's own
+> `GET_MIN_CLOCK_RATE` or `GET_MAX_CLOCK_RATE` and returns what it reads back. The caller cannot name a
+> rate. It is gated by `CPU_CLOCK` (resource 18), a privilege bit the supervisor may delegate and grants to
+> ONE service, `power`, because the clock is one machine-wide setting and a second holder would silently
+> overwrite the first. Who may be fast, for how long, and when to go back are `power`'s: a LEASE of at
+> most 30 s, the clock at its maximum while any is open and its minimum otherwise, and a lease nobody
+> releases expiring on its own, so a holder that dies cannot pin the machine fast (`docs/power.md` 15,
+> 26.10). Every port but the Pi 4 answers the seam with `None` and the syscall says so.
+>
+> **Why it is recorded.** A new syscall, a new resource and a new privilege bit widen the surface
+> Commandment I pins. This is mechanism on a channel the kernel already owns, not a seventh responsibility
+> - the same argument as `DevicePower` above - and the `power` service is where the policy, and any future
+> power policy, lives.
+>
+> **Amendment 2026-10-01 (later): the result follows the pin's READ-BACK.** `DevicePower` used to report
+> success whenever the firmware accepted the `SET_GPIO_STATE` request, which it does whether or not the pin
+> moved - and in QEMU, where the expander is not emulated, a cut that never happened was reported as done.
+> It now returns success only when `WL_ON` reads back at the level asked for. The spawn also logs `BT_ON`,
+> the same chip's Bluetooth enable: it reads 0 on this board, so `WL_ON` really is the whole of the radio's
+> power and nothing else needs cutting (`docs/wifi.md` 53). No syscall, resource or authority changes.
+>
+> **Amendment 2026-10-03 (audio on the Pis): a grant may include routing the device's pins and starting
+> its clock, and the Pis' DMA page is granted whole.** The Pis' 3.5 mm jack is two PWM channels fed by the
+> SoC's DMA engine (`docs/audio.md`, "The Pis"). Two of the steps that make it usable live in SHARED
+> blocks: every pin's function in the GPIO page, every clock in the clock manager's. So the kernel does
+> them as part of the grant, at spawn, exactly as it powers the SD domain before granting the radio's
+> window - routes the jack's two pins to the PWM and starts the PWM clock at a fixed rate - and the driver
+> (`pwm-audio`) is granted the PWM page and the DMA engine's page, mapped side by side, and a DMA arena.
+> The device is a new kind (`HwClass::AudioPwm`), present where the arch says so (`fixed_device_present`,
+> renamed from audio_pwm_present by the amendment below).
+>
+> **What this is not.** No syscall, no privilege bit, no runtime role: the kernel acts once at spawn and
+> holds no policy - the sample rate (the PWM's range), the volume and when to play are the driver's
+> (26.10). Not a seventh responsibility: it is the grant made usable, the reasoning of the `DevicePower`
+> amendment above.
+>
+> **What it costs, recorded rather than hidden (26.7).** The DMA engine's page holds all fifteen channels
+> and their shared status, so the driver is granted more than the one channel it uses. It is no more
+> REACH than it already has - on these boards no IOMMU confines any DMA-capable driver (6.4), so a driver
+> that can point one channel anywhere can already reach all of memory - but it is more than the grant
+> names. The alternative, a kernel-mediated "start this channel" syscall, would grow the kernel to narrow
+> a grant that confers nothing new, and was declined for that reason. The kernel also learns one more
+> service name (`pwm-audio`, in the Pis' fixed-window table and the two restart lists), the existing
+> name-keyed practice that step D's classes are replacing. **[Superseded the same day by the amendment
+> below: the kernel learns no service name for audio, or for any other driver.]**
+>
+> **Amendment 2026-10-03 (later): the kernel knows ONE service by name, the supervisor, and nothing it
+> grants or reports is keyed on a name any more.** The amendment above recorded the kernel learning
+> `pwm-audio` as "the existing practice". The operator asked whether that was normal, and it was not: it
+> was debt, and `docs/service-ownership.md` had already said why it cannot be enforced - once the
+> supervisor supplies the images, any image started under a matching name inherits whatever a name-keyed
+> table grants that name. Six decisions moved off the name:
+>
+> - **Fixed device windows** (the Pis' SoC blocks) are granted by the device KIND the spawn request names
+>   (`arch::imp::map_fixed_device(pt, kind)`, `fixed_device_present(kind)`), the same trust as a PCI class
+>   code. The Pi 4 radio gained the kind it lacked, `WIFI_SDIO`.
+> - **`DevicePower`** reaches the pin of the kind the caller was GRANTED, not of the name it has.
+> - **Death notification and the restart count** follow `SPAWN_FLAG_WATCHED`, set by the supervisor from
+>   its `MANAGED` roster. The kernel's two lists of nineteen names are gone, and with them the drift that
+>   once left `time` and `control` uncounted; `V-managed-watched` checks the chain that replaced them.
+> - **The display** is reclaimed from, and console output delivered to, the task granted the
+>   `FRAMEBUFFER` kind, not whatever is called `console`.
+> - **Two grants were removed** because nothing used them: the Pi 2 `block-driver`'s EMMC window (its disk
+>   is USB; the EMMC is the boot card) and a name-matched `console_push` mint that matched nothing.
+>
+> **No responsibility moves and no authority widens**: every change narrows who a grant reaches, from
+> "anything with this name" to "the request that names this device". One spawn flag is added to a
+> request the kernel already validates. The name the kernel still knows is `supervisor`, because the
+> kernel spawns and respawns it (6.2). `docs/audio.md`, "No service names in the kernel".
 
 ---
 
@@ -1821,8 +1992,28 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. There are currently no
-amendments to the grandfathered floors.
+stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84 (`audits/unsafe-audit.md`):
+
+> **Amendment 2026-10-08 (the boot record): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
+> `unsafe { raw_syscall(13, 27, ..) }` call site, `boot_record_query`, behind the safe
+> `boot_record_size` and `boot_record_read` of the 11.4 amendment of the same date - one block for both,
+> the same single design consequence as the two below. Necessity: a service cannot reach a syscall any
+> other way. Safety: the read's buffer is typed at the kernel's chunk size, and the kernel validates the
+> range before writing into it.
+>
+> **Amendment 2026-10-01 (`CpuClock`): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
+> `unsafe { raw_syscall(55, ..) }` call site, the wrapper `cpu_clock` behind the §12.3 amendment of the
+> same date - the same single design consequence as the `DevicePower` amendment below. Necessity: a
+> service cannot reach a syscall any other way. Safety: one integer to a kernel that checks the
+> capability before asking the firmware anything.
+>
+> **Amendment 2026-10-01 (`DevicePower`): `sdk/rust/src/service_context.rs` 82 -> 83.** One more
+> `unsafe { raw_syscall(54, ..) }` call site, the wrapper `device_power` behind the §12.3 amendment of
+> the same date. It is the same single design consequence the 2026-09-12 amendment describes - the
+> SDK IS the wrapper layer, so a new syscall is one more block here and zero in any service - and the
+> safe `raw_syscall` that would collapse all of them remains the recorded route. Necessity: a service
+> cannot reach a syscall any other way. Safety: the kernel validates the capability before touching
+> any pin, and the call passes two integers.
 
 ---
 

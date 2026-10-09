@@ -93,6 +93,7 @@ fence on **every** switch, not only when the `satp` value changes.
 | `sbi.rs` | SBI calls, including HSM hart start |
 | `fdt.rs` | the device-tree reader |
 | `display.rs`, `net.rs`, `usb.rs` | board device discovery handed to userspace services |
+| `sdio.rs` | the VisionFive radio's SD host (`docs/wifi-aic8800.md`, V0): its clocks, reset and pins, the radio's enable on GPIO 33, and the census whose answer gates the `WIFI_SDIO` grant and `DevicePower` |
 
 ## Scripts
 

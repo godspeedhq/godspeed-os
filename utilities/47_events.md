@@ -13,10 +13,42 @@ For LIVE kernel state - what is stuck right now, who can reach whom - see `utili
   events ipc                    what happened - the ring, paged and pipeable
   events failures               the same ring, only the failures
   events log [n]                the last n log lines the sink kept (default 20)
+  events log boot               the kernel's fixed copy of the boot - never wraps
   events metrics                published samples: owner, metric, value, age
   events status                 ring size, recorded, dropped
   events persist start|stop|status   capture the log to disk
 ```
+
+---
+
+### `events log boot` - the boot, kept by the kernel
+
+```text
+events log boot                  the first 32 KiB this machine ever logged, then a line saying how much
+events log boot | match xhci     the lines that name xhci
+events log boot | count          how many lines the boot was
+```
+
+`events log` is the SINK's window: the last lines a service sent, which on a busy machine has moved
+past the boot within minutes. The boot is what a reader most often wants back - what the machine found
+as it came up, and what each driver said about it - and on a machine with no serial cable it was gone.
+
+So the kernel keeps it. Beside its log ring, which wraps and which nothing reads, it keeps a fixed copy
+of the first 32 KiB ever logged, kernel lines and service lines alike, in the order they were written.
+It fills once and then never changes. This view copies it out (InspectKernel query 27, INTROSPECT); it
+is never drained, so reading it twice gives the same answer, and it changes nothing about how logging
+works (CLAUDE.md 11.4, 2026-10-08).
+
+**A full record says so.** A T630 reaches its prompt in about 18 KiB and the record holds the driver
+bring-up after it; a machine that logs more stops at 32 KiB and the closing line says the record is
+full and that later lines are on serial. It does not pretend to have them.
+
+**Text, not records.** The record is 32 KiB and a table holds 4, so it pipes as lines, to `match` and
+`count`. The pipe holds 16 KiB; a full record piped is cut there, and the pipe says it was. The
+closing sentence goes to the console, never into the pipe.
+
+**No timestamps.** The kernel keeps bytes, not times. A serial capture's timestamps are the terminal
+program's, not the machine's.
 
 ---
 

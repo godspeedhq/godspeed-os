@@ -14,9 +14,16 @@ members = [
     "services/chaos",
     "services/block-driver",
     "services/nic-driver",
+    "services/wifi-driver",
+    "services/wifi-usb",
+    "services/power",
+    "services/audio-driver",
+    "services/pwm-audio",
     "services/net-stack",
     "services/fs",
     "sdk/rust",
+    "sdk/wifi",
+    "sdk/audio",
     "stdlib/rust",
     "osdev",
     "examples/ping",
@@ -46,7 +53,7 @@ members = [
 # that make up a release (kernel, osdev, sdk, and the shell that displays it) inherit
 # this with `version.workspace = true`, so a release bump is a one-line change here.
 [workspace.package]
-version = "0.21.0"
+version = "0.22.0"
 
 # kernel and all services/examples build for the bare-metal target;
 # osdev builds for the host. Use `cargo build -p osdev` for the host tool,

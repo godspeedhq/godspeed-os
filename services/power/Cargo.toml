@@ -1,0 +1,12 @@
+[package]
+name = "power"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "power"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }

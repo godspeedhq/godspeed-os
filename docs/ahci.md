@@ -43,8 +43,8 @@ T630's BIOS hands the SATA controller over carrying a stale firmware DMA pointer
 confining the device makes the controller's first access fault - the same quirk that
 keeps `ehci` in passthrough. The kernel states it at the policy site:
 `kernel/src/task/mod.rs, the `confine` flag on `DeviceSpec::Pci``, *"ehci + block-driver keep a stale firmware DMA pointer
-that confinement would fault, so they stay in passthrough"*. **`xhci` is the only
-confined driver in the system.** So `block-driver` is trust-critical on every machine,
+that confinement would fault, so they stay in passthrough"*. **`xhci` and, in QEMU only,
+`audio-driver` are the only confined drivers in the system.** So `block-driver` is trust-critical on every machine,
 IOMMU or not, exactly as §6.4 says an unconfined DMA driver must be.
 
 ## 4. Build steps (incremental, against QEMU `ich9-ahci`)

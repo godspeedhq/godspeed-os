@@ -105,7 +105,7 @@ impl CapTable {
     /// (the introspection syscalls, §3.1). See `docs/introspection-capability.md`.
     ///
     /// **Intended for STABLE kernel resources only** (generation 0 forever -
-    /// `LOG_WRITE`, `SPAWN`, `INTROSPECT`, …). Those are never revoked, so a held
+    /// `LOG_WRITE_RESOURCE`, `SPAWN`, `INTROSPECT`, …). Those are never revoked, so a held
     /// cap always matches the record; we deliberately skip the generation check -
     /// and the `GLOBAL_RESOURCES` lock it would need - to keep this off the syscall
     /// hot path (the v1 global lock is the §7.8 contention point). Do NOT use for

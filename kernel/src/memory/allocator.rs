@@ -579,6 +579,24 @@ pub unsafe fn free_frame(frame: Frame) {
     })
 }
 
+/// Whether the allocator holds the frame at `phys` as FREE, or `None` for an address that is not RAM.
+///
+/// A diagnostic read, taken WITHOUT the allocator lock: it runs in a fault report, where taking a lock
+/// another core may hold would turn a dead service into a wedged machine. A racing read can be one
+/// allocation stale, which is fine for its one job - saying whether a frame a live page table points at
+/// has been handed back to the pool (`backlog/72`). A table frame the allocator calls free is a frame two
+/// owners can write.
+pub fn frame_is_free(phys: u64) -> Option<bool> {
+    if !phys_in_ram(phys) {
+        return None;
+    }
+    let idx = (phys / FRAME_SIZE) as usize;
+    // SAFETY: read-only and lock-free on purpose (see above); `phys_in_ram` bounds `idx` below
+    // `max_ram_frame`, which the bitmap was sized to cover, so `idx / 8 < BITMAP_LEN`.
+    let bm = unsafe { bitmap() };
+    Some(bm[idx / 8] & (1u8 << (idx % 8)) != 0)
+}
+
 /// Total free frames available (used for diagnostic output in memory::init).
 pub fn free_frame_count() -> usize {
     // SAFETY: read-only; racing reads are harmless for diagnostic use.

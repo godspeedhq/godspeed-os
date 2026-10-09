@@ -8,6 +8,7 @@
 //! needs a split. That is worth stating rather than assuming - if a full-speed stick ever appears on
 //! a hub port, `bind` takes the split descriptor exactly as `hid::bind` does and the rest follows.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::chan::{self, Target};
@@ -182,7 +183,7 @@ const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
 /// recovers. Treating the first as the second is not a cosmetic error on this board: the kernel
 /// driver issued a Mass Storage Reset plus two clear-halts for every busy hand-back and logged 564
 /// spurious recoveries in ONE selfcheck, resetting a stick that was never broken.
-pub enum XferErr {
+pub(crate) enum XferErr {
     /// Out of time with no transport error - the device is pacing us.
     Busy,
     /// STALL, repeated transaction errors, or a channel that never halted.
@@ -196,15 +197,16 @@ pub enum XferErr {
 /// difference between a driver that survives this board's stick and one that declares it broken: it
 /// goes BUSY for tens of seconds under load, and a 45-second stall was observed on this branch.
 #[allow(clippy::too_many_arguments)]
-fn bulk_xfer(
+pub(crate) fn bulk_xfer(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target, mps: u16,
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
 ) -> Result<u32, XferErr> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    // Paced a millisecond apart by `gs::driver::wait`, which sleeps the pace itself (`pause`).
+    let mut deadline = wait::Deadline::paced(ctx, Budget::ms(budget_ms), Budget::ms(1));
     let mut xact_errs = 0u32;
     loop {
-        chan::program(mmio, &bt, chan::CH_BULK, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
+        chan::program(ctx, mmio, &bt, chan::CH_BULK, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
         match chan::wait_halt(ctx, mmio, chan::CH_BULK, 100) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
                 // HCTSIZ counts DOWN the bytes still outstanding, so what moved is the difference.
@@ -220,7 +222,13 @@ fn bulk_xfer(
                 // other direction: there a stale toggle made the device RETRANSMIT, here it makes the
                 // device IGNORE.
                 *pid = chan::pid_from_hctsiz(mmio, chan::CH_BULK);
-                return Ok(len.saturating_sub(left));
+                // AN OUT THAT COMPLETED MOVED ALL OF IT. `HCTSIZ`'s byte count is no measure of an OUT in
+                // buffer-DMA mode (the BOT notes below found it reading 0 for transfers that were right),
+                // and Linux's `dwc2_get_actual_xfer_length` (`hcd_intr.c`) never reads it for one: a
+                // non-split OUT halted with transfer-complete is `chan->xfer_len`, the length asked for.
+                // The disk never looked at an OUT's count; the radio's first transmit did, and reported
+                // 26 frames "not sent" while an access point answered the probe they carried (R5a).
+                return Ok(if dir_in { len.saturating_sub(left) } else { len });
             }
             Some(hcint) if hcint & crate::regs::HCINT_STALL != 0 => {
                 ctx.log_fmt(format_args!("dwc2-svc: bulk ep {} STALLed", ep));
@@ -241,14 +249,14 @@ fn bulk_xfer(
                 return Err(XferErr::Failed);
             }
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             // Out of time with NO transport error is the device pacing us, not failing. It is
             // returned as BUSY and deliberately NOT logged: logging it printed 564 lines in one
             // selfcheck for entirely normal flow control, and loud is a budget - spending it on the
             // expected case is how a real line gets ignored.
             return Err(if xact_errs == 0 { XferErr::Busy } else { XferErr::Failed });
         }
-        ctx.sleep(ctx.duration_cycles(1));
+        deadline.pause();
     }
 }
 
@@ -509,15 +517,17 @@ pub fn write_block(
 fn with_busy_retry(
     ctx: &ServiceContext, budget_ms: u64, mut attempt: impl FnMut() -> bool,
 ) -> bool {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    // Paced 5 ms apart by `gs::driver::wait`, which owns the sleep and so bounds an uncalibrated clock
+    // by the paces that fit the budget.
+    let mut deadline = wait::Deadline::paced(ctx, Budget::ms(budget_ms), Budget::ms(5));
     loop {
         if attempt() {
             return true;
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             return false;
         }
-        ctx.sleep(ctx.duration_cycles(5));
+        deadline.pause();
     }
 }
 

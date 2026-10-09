@@ -218,49 +218,122 @@ const OPTIONAL_RESERVE: usize = MAX_ENDPOINTS * 3 / 4;
 /// refusal happens, so the count cannot disagree with the decision.
 static REFUSED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// Reply mailboxes released by WATCHED tasks that died holding one, not yet taken back (`backlog/74`).
+///
+/// A watched task is one the supervisor restarts (`SPAWN_FLAG_WATCHED`). Its boot instance is spawned
+/// early and gets a mailbox above the reserve; its respawn comes when the table is past the reserve and
+/// was refused one - every respawn, on every board image. A respawned `wifi-usb` then awaited its host's
+/// replies on the endpoint the host's notices also reach, and the kernel matches a reply by sender, so a
+/// notice was taken as the answer (`docs/wifi-usb.md` 19).
+///
+/// So the death of a watched task holding a mailbox leaves a CREDIT here, and a watched spawn the reserve
+/// would refuse may spend one. A mailbox is therefore granted either above the reserve, as before, or in
+/// place of one a watched task released: the respawn takes back what its dead instance held, and the
+/// footprint is what boot already granted. Not keyed on any name - the kernel learns nothing about which
+/// service is which, only that one watched mailbox was given back and one is being asked for. Owned here,
+/// beside the decision that spends it.
+static MAILBOX_CREDITS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The slots a credit may NEVER spend into, whatever the credits say: a hard floor under the reserve, kept
+/// for MANDATORY endpoints - the receive endpoint every task needs to exist at all. Credits are pooled,
+/// not tied to the task that banked them, so an unusual order of deaths and spawns could in principle
+/// have mailboxes hold a few more slots past the reserve than boot granted; this makes that harmless
+/// rather than merely unlikely. An eighth of the table.
+const CREDIT_FLOOR: usize = MAX_ENDPOINTS / 8;
+
+/// A watched task - or the supervisor, which the kernel respawns and never marks watched - died holding a
+/// reply mailbox: its respawn may take one back past the reserve.
+pub fn bank_mailbox_credit() {
+    MAILBOX_CREDITS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+/// Take one credit if there is one.
+fn take_mailbox_credit() -> bool {
+    MAILBOX_CREDITS
+        .fetch_update(core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire,
+            |c| c.checked_sub(1))
+        .is_ok()
+}
+
+/// How a reply mailbox was granted.
+pub enum OptionalGrant {
+    /// Above the reserve, as every grant was before credits.
+    Free,
+    /// Past the reserve, in place of one released by a service that died (watched, or the supervisor). The counts at the decision, for
+    /// the caller's line, as `OptionalRefusal` carries them.
+    Credit { free: usize, total: usize, reserve: usize },
+}
+
+/// Why `try_register_optional` refused, for the caller to report. The caller reports it because the
+/// caller knows WHOSE endpoint it was and this table does not.
+pub struct OptionalRefusal {
+    /// Slots free when the decision was made.
+    pub free: usize,
+    /// The table's size.
+    pub total: usize,
+    /// The reserve the free count fell to.
+    pub reserve: usize,
+    /// Refusals since boot, this one included.
+    pub count: usize,
+}
+
 /// `try_register` for an endpoint the caller can do WITHOUT.
 ///
 /// Refuses once free slots fall to the reserve, so a convenience can never consume what a mandatory
 /// registration needs. Degraded, not broken - and degraded in the direction that keeps services
 /// spawnable.
-pub fn try_register_optional(id: EndpointId, core_id: u32, generation: Generation) -> bool {
-    // Count under the lock, decide and REPORT outside it. A serial write is ~9 ms on the ARM ports
-    // and it is not preemptible, so logging while holding the routing table would stall every IPC on
-    // the machine for the duration - the routing table is on the path of every send. The scope here
-    // is deliberate and not stylistic.
+///
+/// THE REFUSAL IS RETURNED, NOT PRINTED. This printed its own line, which could not say whose endpoint
+/// it refused - the table holds ids, not tasks - and printed only the first three and then every 64th.
+/// On a board image that hid exactly the fact worth knowing: the refusals land on the LAST services
+/// spawned, which on the radio boards are `nic-driver` and `net-stack`, and a service respawned after a
+/// chaos storm could lose its reply mailbox with nothing in the log naming it (`backlog/74`). The spawn
+/// path prints every refusal with the task's name instead; it is one line per spawn at most, bounded by
+/// the spawn rate exactly like the `spawned OK` line beside it.
+/// `watched`: the task is one that is restarted - by the supervisor, or the supervisor itself by the
+/// kernel - so it may spend a credit (`MAILBOX_CREDITS`) where the reserve would refuse it.
+pub fn try_register_optional(
+    id: EndpointId, core_id: u32, generation: Generation, watched: bool,
+) -> Result<OptionalGrant, OptionalRefusal> {
+    // Count under the lock, decide outside it. The caller prints, and a serial write is ~9 ms on the
+    // ARM ports and not preemptible, so it must never happen while holding the routing table, which is
+    // on the path of every send. The scope here is deliberate and not stylistic.
     let free = {
         let table = TABLE.lock_irq();
         table.iter()
             .filter(|e| !e.valid || e.liveness == EndpointLiveness::Dead)
             .count()
     };
-    if free <= OPTIONAL_RESERVE {
-        // LOUD, because a silent refusal leaves no trace of a real degradation (invariant 12). The
-        // caller does fall back correctly - it awaits replies on its shared endpoint - but that
-        // fallback is the very hazard the reply mailbox exists to remove (a service cannot drain
-        // client traffic while waiting on the endpoint it also serves), so it is a fact an operator
-        // needs rather than an implementation detail.
-        //
-        // IT FIRES. This said "never observed firing" on the strength of the shell, identity and
-        // property suites and a full arm32 boot - and that is no longer true: a bare-metal T630 boot
-        // refuses three times during `selfcheck` (71 of 96 free against a reserve of 72), and the
-        // probe-heavy builds refuse considerably more. The claim is corrected rather than deleted,
-        // because the log did its job: it turned a suspicion into a measurement, which is what it was
-        // added for.
-        //
-        // The threshold is still unchanged, deliberately. What the evidence shows is a reserve that
-        // is tight for a system with ~25 live endpoints, not one that is starving anything: the
-        // refused callers fall back to awaiting replies on their own endpoint and the T630 run was
-        // 377/0 with no panic. Raising it is a real change with its own measurement, not a reflex.
-        let n = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-        if n <= 3 || n % 64 == 0 {
-            crate::kprintln!(
-                "routing: reply endpoint refused - {} of {} slots free, reserve {} ({} refused so far)",
-                free, MAX_ENDPOINTS, OPTIONAL_RESERVE, n);
+    if free <= OPTIONAL_RESERVE && free > CREDIT_FLOOR && watched && take_mailbox_credit() {
+        // A watched task's mailbox, given back by its own death or a sibling's, taken back. Spent only
+        // on a registration that happens: a table that has filled meanwhile refunds it.
+        if try_register(id, core_id, generation) {
+            return Ok(OptionalGrant::Credit { free, total: MAX_ENDPOINTS, reserve: OPTIONAL_RESERVE });
         }
-        return false;
+        bank_mailbox_credit();
+        let count = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        return Err(OptionalRefusal { free: 0, total: MAX_ENDPOINTS, reserve: OPTIONAL_RESERVE, count });
     }
-    try_register(id, core_id, generation)
+    if free <= OPTIONAL_RESERVE {
+        // LOUD, by the caller, because a silent refusal leaves no trace of a real degradation
+        // (invariant 12). The caller does fall back correctly - it awaits replies on its shared
+        // endpoint - but that fallback is the very hazard the reply mailbox exists to remove (a service
+        // cannot drain client traffic while waiting on the endpoint it also serves), so it is a fact an
+        // operator needs rather than an implementation detail.
+        //
+        // IT FIRES, on every board image: two or three times at boot on the VisionFive and the Pi 4,
+        // three during `selfcheck` on a bare-metal T630, more in the probe-heavy builds. The threshold
+        // is unchanged, deliberately: whether those services lose anything measurable is `backlog/74`'s
+        // next step, and changing the reserve is a real change with its own measurement, not a reflex.
+        let count = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        return Err(OptionalRefusal { free, total: MAX_ENDPOINTS, reserve: OPTIONAL_RESERVE, count });
+    }
+    if try_register(id, core_id, generation) { Ok(OptionalGrant::Free) } else {
+        // The table filled between the count and the insert. Reported as the same refusal, so the
+        // caller has one case to handle and the operator one line to read.
+        let count = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        Err(OptionalRefusal { free: 0, total: MAX_ENDPOINTS, reserve: OPTIONAL_RESERVE, count })
+    }
 }
 
 pub fn try_register(id: EndpointId, core_id: u32, generation: Generation) -> bool {
@@ -341,9 +414,29 @@ fn enqueue_locked(
     check_live(&table[idx], cap_gen)?;
 
     if let Some(slot) = table[idx].blocked_receiver.take() {
-        // Queue was empty; a receiver was waiting - deliver directly.
-        table[idx].queue.enqueue(msg).ok();
-        return Ok(Some(slot));
+        match table[idx].queue.enqueue(msg) {
+            // The usual case: the queue was empty, a receiver was waiting - deliver and wake it.
+            Ok(()) => return Ok(Some(slot)),
+            Err(msg) => {
+                // A blocked receiver whose queue is FULL. Impossible on a plain `recv`, which blocks only
+                // on an empty queue - and routine on a `Call` (§8.2): the caller waits for one specific
+                // reply while every other message sent to it fills its queue behind it. This branch used
+                // to `.ok()` the failed enqueue and return `Ok` - the message dropped, the sender told it
+                // was delivered, the receiver woken for nothing. That is a silent fallback at the kernel
+                // boundary (invariant 12; §21), seen on the Pi 4 as `nic-driver BlockRecv 16/16!` with
+                // every exchange timing out at exactly its bound (`backlog/65`). The interrupt path
+                // (`enqueue_from_interrupt`) already put the receiver back and reported the loss; this,
+                // the path every userspace `send` takes, did not. The receiver is still waiting, so it
+                // stays recorded as blocked; the sender is refused exactly as it is below, and recorded
+                // as blocked if it asked to be.
+                table[idx].blocked_receiver = Some(slot);
+                if let Some(s) = blocked_sender_slot {
+                    table[idx].blocked_sender = Some(s);
+                    table[idx].pending_send   = Some(msg);
+                }
+                return Err(IpcError::QueueFull);
+            }
+        }
     }
 
     match table[idx].queue.enqueue(msg) {
@@ -615,8 +708,18 @@ pub fn enqueue_from_kernel_blocking(
         return Err(IpcError::EndpointDead);
     }
     if let Some(slot) = table[idx].blocked_receiver.take() {
-        table[idx].queue.enqueue(msg).ok();
-        return Ok(Some(slot));
+        match table[idx].queue.enqueue(msg) {
+            Ok(()) => return Ok(Some(slot)),
+            Err(msg) => {
+                // A blocked receiver whose queue is full - a `Call` waiting behind a full inbox (see
+                // `enqueue_locked`, `backlog/65`). The receiver keeps waiting; the writer is blocked
+                // exactly as it is on the plain full path below.
+                table[idx].blocked_receiver = Some(slot);
+                table[idx].blocked_sender = Some(sender_slot);
+                table[idx].pending_send = Some(msg);
+                return Err(IpcError::QueueFull);
+            }
+        }
     }
     match table[idx].queue.enqueue(msg) {
         Ok(()) => Ok(None),

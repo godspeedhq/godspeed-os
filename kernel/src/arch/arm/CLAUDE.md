@@ -59,8 +59,9 @@ the worked example a new driver should copy. That file no longer exists: the USB
 tick. A porting guide that teaches a deleted file as the model is worse than no guide, because it is
 followed.
 
-A new Pi driver (SD/EMMC, etc.) is therefore a **service**: an `arch::imp::map_fixed_driver_mmio` entry
-granting its register window at spawn, safe MMIO through the SDK's `Mmio` wrapper (no `unsafe` in a
+A new Pi driver (SD/EMMC, etc.) is therefore a **service**: a device kind (`task::kind`) and an `arch::imp::map_fixed_device` entry
+granting its register window at spawn to whichever service's request names that kind (never by service
+name - `docs/audio.md`, "No service names in the kernel"), safe MMIO through the SDK's `Mmio` wrapper (no `unsafe` in a
 service, §18.2), a DMA arena if it needs one, and **every hardware wait bounded** - a dead or absent
 device must never hang the caller (invariant 12). `services/dwc2` and `services/console` are the two
 worked examples; `video.rs` and `timer.rs` remain the models for the bring-up code that genuinely

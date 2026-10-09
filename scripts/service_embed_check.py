@@ -40,21 +40,32 @@ ARCH_EXEMPT = {
     "arm": {
         "ehci": "x86-only USB2 controller driver; the Pi 2 has no EHCI",
         "xhci": "the Pi 2 has no PCIe and no xHCI controller; its USB host is dwc2",
+        "wifi-driver": "the Pi 2's WiFi is a USB DONGLE, not an SDIO part on an SD host "
+                       "controller - a soft-MAC device behind `dwc2` where the host runs the whole "
+                       "802.11 state machine. That is a different driver, not this one ported "
+                       "(docs/wifi.md, phase 6).",
         "hw-enumerator": "its authority is legacy PCI CF8/CFC PORT I/O, and ARM has no port I/O "
                          "address space at all - `in`/`out` are x86 instructions with no equivalent. "
                          "Not 'not ported yet': there is nothing here for it to read. A hardware "
                          "enumerator for this board would reach devices by device tree instead, "
                          "which is a different implementation behind the same service contract "
                          "(docs/service-ownership.md, D2).",
+        "audio-driver": "Intel High Definition Audio, a PCI controller this board does not have; its sound is the Pi's PWM headphone jack, a different driver, `pwm-audio` (docs/audio.md, The Pis)",
     },
     "aarch64": {
         "ehci": "x86-only USB2 controller driver; the Pi 4's USB host is the VL805 xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver; the Pi 4 drives xhci over PCIe",
+        "audio-driver": "Intel High Definition Audio, a PCI controller this board does not have; its sound is the Pi's PWM headphone jack, a different driver, `pwm-audio` (docs/audio.md, The Pis)",
     },
     "riscv64": {
         "ehci": "x86-only USB2 controller driver; the VisionFive 2's USB host is a Cadence USB3 "
                 "whose host half is an xHCI",
         "dwc2": "arm32-only (Pi 2) USB host driver",
+        "pwm-audio": "the Pis' PWM-driven 3.5 mm jack; the VisionFive 2 Lite has no analog audio at all - "
+                     "its PWM-DAC is disabled in the vendor device tree and its Linux finds no sound "
+                     "card (docs/audio.md)",
+        "audio-driver": "Intel High Definition Audio, a PCI controller the VisionFive 2 Lite does not "
+                        "have; this tree drives no audio hardware on it (docs/audio.md)",
     },
 }
 
@@ -163,6 +174,26 @@ def _supervisor_embedded(root, arch):
         cond = enum_src.split(marker, 1)[1].split("{", 1)[0]
         if (chr(34) + arch + chr(34)) in cond:
             names.append("hw-enumerator")
+
+    # The radio groups, read the way build.rs decides them, because a roster that skips a group reports
+    # everything in it as missing - which is how the VisionFive's `wifi-driver` came to need an
+    # exemption it never deserved: the board embeds it, and this function never looked. `radio` is an
+    # `if arch == ...` like the enumerator; `usb_radio` (the USB dongle's driver) follows whether this
+    # arch's `usb` arm has a host that serves the dongle - ANY host the condition names (`dwc2`, `xhci`).
+    # This read only the first, which was right while the condition named `dwc2` alone; when `xhci`
+    # joined, riscv64 was reported missing the driver it embeds.
+    marker = "let radio: &[&str] = if "
+    if marker in enum_src:
+        cond, rest = enum_src.split(marker, 1)[1].split("{", 1)
+        if (chr(34) + arch + chr(34)) in cond:
+            names += re.findall(NAME, rest.split("}", 1)[0])
+    marker = "let usb_radio: &[&str] = if usb.contains(&"
+    if marker in enum_src:
+        cond, body = enum_src.split(marker, 1)[1].split("{", 1)
+        hosts = re.findall(NAME, cond)
+        rest = body.split("}", 1)[0]
+        if any(h in names for h in hosts):
+            names += re.findall(NAME, rest)
 
     seen, out = set(), []
     for n in names:

@@ -409,6 +409,23 @@ pub struct ShellCtx {
     /// unknown and was deliberately not retried. Read by the handlers that report failures, so they
     /// say "unknown" rather than "failed" - the distinction carnage §3.5 is about.
     fs_unknown: core::cell::Cell<bool>,
+    /// Replies the radio driver still owes this shell: requests it gave up waiting for, which the driver
+    /// will answer later and in order. See `wifi_ask`.
+    wifi_owed: core::cell::Cell<u32>,
+    /// When the oldest still-owed reply was given up on (monotonic seconds); see `wifi_ask`.
+    wifi_owed_since: core::cell::Cell<i64>,
+    /// Non-zero when the last `wifi_ask` returned nothing WITHOUT SENDING, because the driver still owed
+    /// this many earlier answers. `wifi_not_answering` reads it to say so instead of "not answering".
+    wifi_unsent: core::cell::Cell<u32>,
+    /// The radio request correlation tag (see `next_wifi_tag`).
+    wifi_tag: core::cell::Cell<u8>,
+    /// Byte 1 of the last `radio down` answer - WHY the driver says it is down (0 = it did not say).
+    wifi_down_reason: core::cell::Cell<u8>,
+    /// The radio service this `wifi` command is talking to (`RADIOS`), found once per command by
+    /// `cmd_wifi`, because finding it is a walk of every task slot and one command asks many times.
+    wifi_radio: core::cell::Cell<&'static str>,
+    /// The audio request correlation tag (see `audio_ask`). Its own counter, as `wifi_tag` has.
+    audio_tag: core::cell::Cell<u8>,
     /// The job table: what `background` started, what `jobs` lists, what `foreground` attaches to.
     /// Owned here for the reason `pipe_stack_hwm` and `last_write_err` are - a module-level `static`
     /// is the anonymous singleton invariant 9 forbids.
@@ -442,6 +459,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         pipe_stack_hwm: core::cell::Cell::new(0),
         last_write_err: core::cell::RefCell::new(LastWriteErr::new()),
         fs_unknown: core::cell::Cell::new(false),
+        wifi_owed: core::cell::Cell::new(0),
+        wifi_owed_since: core::cell::Cell::new(0),
+        wifi_unsent: core::cell::Cell::new(0),
+        wifi_tag: core::cell::Cell::new(0),
+        wifi_down_reason: core::cell::Cell::new(0),
+        wifi_radio: core::cell::Cell::new(RADIOS[0]),
+        audio_tag: core::cell::Cell::new(0),
         jobs: core::cell::RefCell::new(JobTable::new()),
     };
     let ctx = &ctx;
@@ -553,8 +577,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // reason two fixes inside the USB driver made no visible difference - they are upstream of
         // this quantiser.
         //
-        // 30 s is far longer than a successful sync takes (measured: ~5 s from boot on this board when
-        // the network answers at all), so this cannot rob a machine that was going to sync. After it,
+        // 30 s is far longer than a successful sync takes (measured ~5 s from boot on this board when the
+        // network answers at all - measured while the boot dance itself fetched the clock; since 2026-10-01
+        // the first sync is one background query after the network is configured, docs/networking.md 16,
+        // not yet re-measured), so this cannot rob a machine that was going to sync. After it,
         // polling can accomplish nothing - the condition it is waiting for cannot become true without
         // a network - so continuing to pay for it is pure cost.
         //
@@ -919,6 +945,12 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
     "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve",
+    // An SSID is not a path. Completing one from the filesystem would be nonsense, and
+    // completing it from the last scan would leak the names of networks in range into a shell
+    // that records its history - so `wifi` offers keywords and nothing else.
+    "wifi",
+    // Sections and device names, never a path.
+    "hardware",
     // `paginate` takes NO arguments at all, so Tab after it must offer nothing rather than a
     // directory listing for a position that accepts neither a path nor a keyword.
     "paginate",
@@ -946,6 +978,14 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("date",    &["epoch", "sync"]),
     ("net",     &["dns", "stats", "arp", "scan", "renew", "lease"]),
     ("drives",  &["flash", "label", "reset", "check", "scrub"]),
+    ("wifi",    &["scan", "list", "join", "leave", "status", "info", "debug", "forget", "stored", "radio", "hardware"]),
+    // Only the verbs that are BUILT: completing one that answers "not built yet" would teach a word
+    // the utility cannot act on. `outputs`, `output`, `debug` and `system` join as they land. `play`
+    // takes a PATH, which is why `audio` is not in NO_PATH_CMDS: Tab after `audio play ` offers files.
+    ("audio",   &["status", "info", "volume", "mute", "unmute", "on", "off", "tone", "play"]),
+    // The sections that are built; a device name is the other first word, and it is the machine's.
+    ("hardware", &["cpu", "memory", "pci", "soc", "display", "usb", "interrupts", "report", "why",
+                   "problems", "tree", "firmware", "compare", "events"]),
     // `dir` is in BOTH tables, because its words may come before or after the path (`ls long /d` and
     // `ls /d long` are the same command, and documented as such). A first-position token that
     // matches no keyword falls through to PATH completion, which is what keeps `ls /do<tab>` working.
@@ -998,6 +1038,7 @@ const COLUMN_STAGES: &[&str] = &["where", "select", "sort", "sum", "min", "max",
 /// drift - the exact complaint `CHAOS_RESTARTABLE`'s own comment makes about the other three copies.
 const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("events", "persist",      &["start", "stop", "status"]),
+    ("events", "log",          &["boot"]),
     // The storms take a SERVICE, and a misspelt service name is refused with a list - so completing
     // it is the difference between one keystroke and reading an error.
     ("chaos",  "kill-storm",   CHAOS_RESTARTABLE),
@@ -1005,13 +1046,85 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("chaos",  "max-carnage",  CHAOS_RESTARTABLE),
     ("trace",  "deps",         CHAOS_RESTARTABLE),
     ("trace",  "chain",        CHAOS_RESTARTABLE),
+    ("wifi",   "radio",        &["on", "off", "powercycle"]),
+    // The radios by name (`wifi_radio_service`), and `use` to choose between them.
+    ("wifi",   "hardware",     &["onboard", "usb", "use"]),
+    ("audio",  "off",          &["hard"]),
+    ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
 ];
 
 /// THIRD-LEVEL words: valid at position 3 given positions 1 and 2. Only where the surface genuinely
 /// has one - `events persist start <path> <size> [sticky]` is the deepest thing in the shell, and
 /// `sticky` was reachable by typing it in full and no other way.
+/// `wifi join <Tab>` / `wifi forget <Tab>`: the names a key is held for, asked of the driver now, plus `help`.
+///
+/// Never the last scan (spec 56_wifi.md 8): completion writes into a line that history records, and a
+/// neighbour's network name has no business there. A driver that does not answer within the bound, or is
+/// not running, leaves `help` alone on offer - a completion is not the place for a loud sentence.
+fn complete_wifi_stored(ctx: &ServiceContext, line: &mut Line, tok_start: usize) -> bool {
+    /// One record in the reply: `len, ssid[32]`.
+    const ENTRY: usize = 1 + 32;
+    /// The driver holds at most 64.
+    const MAX: usize = 64;
+    let mut store = [0u8; MAX * 32];
+    let mut lens = [0usize; MAX];
+    let mut count = 0usize;
+    // Tagged and sifted like every radio request (`wifi_sift`), with the completion's own tag.
+    let msg = wifi_tagged(&[9u8], wifi_wire::COMPLETION_TAG);
+    let ours = |m: &Message| wifi_is_answer(m, Some(wifi_wire::COMPLETION_TAG));
+    // Completion runs without the shell's state, so it finds the radio itself.
+    let reply = match find_radio(ctx) {
+        None => None,
+        Some(radio) => match ctx.request_with_reply_ms_sifted(radio, &msg, 1500, ours) {
+            Some(r) => Some(r),
+            None if ctx.reacquire_by_name(radio) => ctx.request_with_reply_ms_sifted(radio, &msg, 1500, ours),
+            None => None,
+        },
+    };
+    if let Some(r) = reply {
+        let r = wifi_untag(&r);
+        let p = r.payload_bytes();
+        if p.first() == Some(&0) && p.len() >= 2 {
+            let n = core::cmp::min(p[1] as usize, MAX);
+            for i in 0..n {
+                let at = 2 + i * ENTRY;
+                if at + ENTRY > p.len() { break; }
+                let len = core::cmp::min(p[at] as usize, 32);
+                // Only names that are plain text can be typed back; a binary SSID cannot be completed.
+                if len == 0 || !p[at + 1..at + 1 + len].iter().all(|&b| (0x21..0x7F).contains(&b)) { continue; }
+                store[count * 32..count * 32 + len].copy_from_slice(&p[at + 1..at + 1 + len]);
+                lens[count] = len;
+                count += 1;
+            }
+        }
+    }
+    let mut cands: [&str; MAX + 1] = [""; MAX + 1];
+    let mut n = 0usize;
+    for i in 0..count {
+        if let Ok(s) = core::str::from_utf8(&store[i * 32..i * 32 + lens[i]]) {
+            cands[n] = s;
+            n += 1;
+        }
+    }
+    cands[n] = "help";
+    n += 1;
+    complete_from_list(ctx, line, tok_start, &cands[..n])
+}
+
+/// Offer `cands` plus the word `help`, deduped, at a position below the first. Position 1 appends
+/// `version` and `help` itself; below it only `help` applies (a subcommand has no version of its own,
+/// rule 5), and it applies everywhere because every depth answers it (rule 2).
+fn complete_with_help(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) -> bool {
+    let mut all: [&str; 40] = [""; 40];
+    let mut n = 0usize;
+    for &c in cands { if n < all.len() { all[n] = c; n += 1; } }
+    if !cands.contains(&"help") && n < all.len() { all[n] = "help"; n += 1; }
+    complete_from_list(ctx, line, tok_start, &all[..n])
+}
+
 const SUBCMD_THIRD: &[(&str, &str, &str, &[&str])] = &[
     ("events", "persist", "start", &["sticky"]),
+    ("wifi", "hardware", "use", &["onboard", "usb"]),
 ];
 
 /// Commands whose FIRST argument is a command name rather than a path or a keyword.
@@ -1194,14 +1307,26 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
         if let (Some(a1), Some(a2)) = (first_arg, second_arg) {
             if let Some((_, _, _, cands)) = SUBCMD_THIRD.iter().find(
                 |(c, f, sd, _)| c.as_bytes() == cmd && f.as_bytes() == a1 && sd.as_bytes() == a2) {
-                // Offer only what is not already present, like the trailing-modifier table.
-                let mut avail = [""; 8];
+                // Offer only what is not already present, like the trailing-modifier table - plus `help`,
+                // which every depth answers (rule 2) and so every depth completes (rule 9).
+                let mut avail = [""; 9];
                 let mut a = 0usize;
                 for &k in *cands {
                     let used = head.split(|&b| b == b' ').any(|w| w == k.as_bytes());
                     if !used && a < avail.len() { avail[a] = k; a += 1; }
                 }
-                if a > 0 { return complete_from_list(ctx, line, tok_start, &avail[..a]); }
+                if a < avail.len() { avail[a] = "help"; a += 1; }
+                return complete_from_list(ctx, line, tok_start, &avail[..a]);
+            }
+            // `wifi debug trace h<Tab>`, `wifi radio off h<Tab>`: a keyword of a keyword, with no table of
+            // its own. It answers `help` (rule 2, the parent's block), so it offers it (rule 9).
+            if prior == 2 && NO_PATH_CMDS.iter().any(|c| c.as_bytes() == cmd) {
+                if let Some((_, _, cands)) = SUBCMD_SECOND.iter().find(
+                    |(c, f, _)| c.as_bytes() == cmd && f.as_bytes() == a1) {
+                    if cands.iter().any(|w| w.as_bytes() == a2) {
+                        return complete_from_list(ctx, line, tok_start, &["help"]);   // depth-3 help
+                    }
+                }
             }
         }
     }
@@ -1221,7 +1346,19 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
             }
             if let Some((_, _, cands)) = SUBCMD_SECOND.iter().find(
                 |(c, f, _)| c.as_bytes() == cmd && f.as_bytes() == a1) {
-                return complete_from_list(ctx, line, tok_start, cands);
+                return complete_with_help(ctx, line, tok_start, cands);
+            }
+            // A FIRST-LEVEL WORD WITH NO TABLE BELOW IT, on a keyword utility: `wifi join h<Tab>`, `wifi list
+            // h<Tab>`, `net dns h<Tab>`. The word answers `help`, so Tab offers it - and for the two wifi words
+            // that take a network NAME, the names a key is held for (spec 8: from `wifi stored`, never from a
+            // scan, so a neighbour's name never lands in a history a completion writes).
+            if NO_PATH_CMDS.iter().any(|c| c.as_bytes() == cmd)
+                && SUBCMD_FIRST.iter().any(|(c, ws)| c.as_bytes() == cmd && ws.iter().any(|w| w.as_bytes() == a1))
+            {
+                if cmd == b"wifi" && (a1 == b"join" || a1 == b"forget") {
+                    return complete_wifi_stored(ctx, line, tok_start);
+                }
+                return complete_from_list(ctx, line, tok_start, &["help"]);   // depth-2 help
             }
         }
     }
@@ -1876,6 +2013,14 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
     if argc == 3 && args[2] == "help" && is_util(args[0]) {
         if sub_help(ctx, args[0], args[1]) { return Ok(()); }
     }
+    // DEEPER: `wifi debug trace help`, `events persist start help`, `wifi radio off help`. Rule 2 says every
+    // subcommand has help, and the surfaces three deep had none - the word `help` reached the command as an
+    // argument and was refused or acted on. The block for the word ABOVE names each of its leaves with one
+    // line, so it is the answer at any depth; `scripts/subcmd_help_check.py` holds every first-level word to
+    // having one.
+    if argc >= 4 && args[argc - 1] == "help" && is_util(args[0]) {
+        if sub_help(ctx, args[0], args[1]) { return Ok(()); }
+    }
 
     // Commands on the Ok/Err Result model (converted incrementally). These `return` their result.
     match args[0] {
@@ -1941,12 +2086,15 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "trace"   => cmd_trace(ctx, s["trace".len()..].trim()),
         "date"    => cmd_date(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "net"     => cmd_net(ctx, s["net".len()..].trim(), out),
+        "wifi"    => cmd_wifi(ctx, s["wifi".len()..].trim(), out),
+        "audio"   => cmd_audio(ctx, cwd, s["audio".len()..].trim(), out),
+        "hardware" => cmd_hardware(ctx, cwd, s["hardware".len()..].trim(), out),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
         "serve"   => cmd_serve(ctx, &args[..argc], out),
         "uptime"  => cmd_uptime(ctx),
-        "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }),
+        "random"  => cmd_random(ctx, if argc >= 2 { args[1] } else { "" }, out),
         "gpio"    => cmd_gpio(ctx, if argc >= 2 { args[1] } else { "" }, if argc >= 3 { args[2] } else { "" }),
         "wait"    => cmd_wait(ctx, if argc >= 2 { args[1] } else { "" }),
         "whatis"  => cmd_whatis(ctx, if argc >= 2 { args[1] } else { "" }, out),
@@ -4900,6 +5048,12 @@ const FOREIGN_HINTS: &[(&str, &str)] = &[
     ("uname", "about"),
     ("man",   "help"),
     ("which", "whatis"),
+    // Sound (utilities/57_audio.md).
+    ("aplay", "audio play"),
+    ("beep",  "audio tone"),
+    ("speaker-test", "audio tone"),
+    ("amixer", "audio volume"),
+    ("alsamixer", "audio volume"),
 ];
 
 /// The hint for a word we do not have, if there is one worth giving.
@@ -4919,6 +5073,9 @@ const UTILS: &[&str] = &[
     // `events ipc` still reach their own dispatch untouched.
     "events", "trace", "docs", "scrollback",
     "mkdir", "copy", "move", "rename", "delete", "seal", "churn", "find", "tree", "match", "count", "sort",
+    "wifi",
+    "audio",
+    "hardware",
     "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -5129,6 +5286,49 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("net renew", "re-run DHCP/ARP after plugging in a cable (recover without a reboot)", "net renew"),
             ("net | write <path>", "snapshot the status to a file", "net | write /netstat.txt"),
         ], true),
+        "wifi" => help_block(ctx, "wifi", "join and inspect a wireless network", &[
+            ("wifi", "this usage (rule 1: a bare utility name teaches its verbs)", "wifi"),
+            ("wifi scan", "sweep for networks; ends in a numbered picker (q stops the sweep, b backgrounds it)", "wifi scan"),
+            ("wifi list", "the last complete scan, one record per network; never scans", "wifi list"),
+            ("wifi join <ssid>", "join a network (asks the passphrase once if needed; never takes it as an argument)", "wifi join Bankole-WiFi"),
+            ("wifi leave", "leave the current network; the radio stays up", "wifi leave"),
+            ("wifi status", "what is true now: radio, network, signal, security, time joined, last scan", "wifi status"),
+            ("wifi info", "the link in detail: bssid, band, channel, signal, security; for the address, type net", "wifi info"),
+            ("wifi debug [events|stats|firmware|transport|trace]", "the driver's own account: counters, the firmware's words, the last 64 frames", "wifi debug trace"),
+            ("wifi stored", "which networks a passphrase is held for (names only, never secrets)", "wifi stored"),
+            ("wifi forget <ssid>", "delete a stored passphrase; does not disconnect", "wifi forget Bankole-WiFi"),
+            ("wifi radio on|off|off hard|powercycle", "the radio's switch and the chip's power: `off` is the firmware's switch, `off hard` cuts the chip's power, `on` brings it back from either (cold from `off hard`), `powercycle` is off hard and on in one", "wifi radio off"),
+            ("wifi hardware", "the radios this machine has, one record each: radio, chip, bus, state, network, in use", "wifi hardware"),
+            ("wifi hardware <radio>", "one radio in full: chip, id, address, firmware, bus, endpoints, queues", "wifi hardware usb"),
+            ("wifi hardware use <radio>", "choose the radio the wifi verbs address and the link goes through", "wifi hardware use usb"),
+        ], true),
+        "audio" => help_block(ctx, "audio", "sound: what is playing, the volume, the codec's power, a test tone", &[
+            ("audio", "this usage (rule 1: a bare utility name teaches its verbs)", "audio"),
+            ("audio status", "on or off, volume, muted, output, what is playing, underruns", "audio status"),
+            ("audio info", "the detail a fault needs: codec, path, amplifier, format, ring, interrupt or polling", "audio info"),
+            ("audio volume <0-100>", "set the volume; 0 is silent and is NOT mute - each stays as set", "audio volume 60"),
+            ("audio mute | unmute", "silence the output, keeping the volume; unmute returns to it", "audio mute"),
+            ("audio on | off | off hard", "the codec's power: off powers it down, off hard holds the controller in reset, on brings either back", "audio off"),
+            ("audio tone <hz> [seconds]", "play a sine the driver makes itself, 2 s unless told; q stops it", "audio tone 440 2"),
+            ("audio play <path>", "play a WAV file: 16-bit PCM, mono or stereo, 44100 or 48000 Hz; q stops it", "audio play /music/test.wav"),
+            ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
+        ], true),
+        "hardware" => help_block(ctx, "hardware", "what this machine is, and what drives each part of it", &[
+            ("hardware", "every section: cpu, memory, pci, soc, display, usb - only the ones this machine has", "hardware"),
+            ("hardware <section>[,<section>]", "those sections; one this machine lacks says so", "hardware cpu,memory"),
+            ("hardware <device>", "one device in full, as `hardware` names it: its registers, interrupt and authority", "hardware 00:10.0"),
+            ("hardware <device> debug", "the device as the hardware sees it, read now: configuration space decoded and raw", "hardware 00:10.0 debug"),
+            ("hardware <section> debug", "debug for every device in the section; `cpu debug` is each core's ticks", "hardware cpu debug"),
+            ("hardware interrupts", "how each PCI device interrupts, and the service that drives it", "hardware interrupts"),
+            ("hardware why <device>", "why a device is handled as it is: who drives it, and the reason recorded", "hardware why 00:12.0"),
+            ("hardware report", "everything, for a bug report", "hardware report | write /hw.txt"),
+            ("hardware problems", "what is wrong now: severity, device, problem, detail", "hardware problems | where severity=error"),
+            ("hardware tree", "every device by how it connects - behind its bridge, under its USB host", "hardware tree"),
+            ("hardware firmware", "the firmware this OS loads, as the driver that loaded it reports it", "hardware firmware"),
+            ("hardware compare <report>", "what changed since a saved report: added, removed, changed", "hardware compare /hw.txt"),
+            ("hardware events", "what happened to the devices, as the supervisor saw it: deaths, restarts, USB attach and removal", "hardware events | last 6"),
+            ("hardware | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware | where driver=-"),
+        ], true),
         "ping" => help_block(ctx, "ping", "continuous ICMP echo to a raw IPv4 address (no DNS)", &[
             ("ping <ip>", "ping continuously (round-trip time + TTL per reply); q quits, then stats", "ping 192.168.4.1"),
             ("ping count <N> <ip>", "send N echoes then stop and print statistics", "ping count 4 8.8.8.8"),
@@ -5333,11 +5533,173 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
 /// `<util> <sub> help` - focused help for a subcommand. Returns false if not a subcommand.
 fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
     match (util, sub) {
+        // Commands with their own per-word help keep it in one place and are reached from here too, so
+        // `<util> <word> help` has exactly one answer whichever way it arrives.
+        // `trace_sub_help` explains a view's COLUMNS (`events ipc help` used to, and the suite checks it);
+        // `events_sub_help` fills only the two words it does not cover.
+        ("events", v) => return trace_sub_help(ctx, v) || events_sub_help(ctx, v),
+        ("trace", v) => return trace_sub_help(ctx, v),
+        ("chaos", v) => return chaos_sub_help(ctx, v),
+        ("net", "stats") => help_block(ctx, "net stats", "the NIC's raw registers", &[
+            ("net stats", "dump the NIC's raw registers (chip state: RE/RCR/RX ring)", "net stats"),
+        ], false),
+        ("net", "lease") => help_block(ctx, "net lease", "one word: is there a DHCP lease", &[
+            ("net lease", "prints `ok` (DHCP granted an address, or no link so nothing to lease), `none` (link up, on the fallback address), or nothing if net-stack does not answer - built for `selfcheck`", "net lease"),
+        ], false),
+        ("churn", "verify") => help_block(ctx, "churn verify", "check every file a churn wrote", &[
+            ("churn verify", "after a cut: is any file a MIX of two writes? (content, not structure) - reports each torn file, or NONE torn", "churn verify"),
+        ], false),
+        ("churn", "tear") => help_block(ctx, "churn tear", "deliberately tear one file, to prove verify sees it", &[
+            ("churn tear", "deliberately make one churn file a MIX of two generations, so `churn verify` can be seen firing - a detector never observed firing is not evidence", "churn tear"),
+        ], false),
+        ("churn", "reset") => help_block(ctx, "churn reset", "remove /churn", &[
+            ("churn reset", "remove /churn and its files (never automatic - they are the evidence)", "churn reset"),
+        ], false),
+        ("dir", "bytes") => help_block(ctx, "dir bytes", "sizes in exact bytes", &[
+            ("dir bytes [path]", "list with sizes as exact byte counts instead of rounded units; may come before or after the path", "dir bytes /"),
+        ], false),
+        ("to", "json") => help_block(ctx, "to json", "render records as JSON", &[
+            ("<records> | to json", "a JSON array of objects, one per record; the last stage of a record pipe", "status | to json"),
+        ], false),
+        ("to", "grid") => help_block(ctx, "to grid", "render records as the plain table", &[
+            ("<records> | to grid", "the plain table - useful when a producer draws something else", "trace deps fs | to grid"),
+        ], false),
+        ("to", "yaml") => help_block(ctx, "to yaml", "render records as YAML", &[
+            ("<records> | to yaml", "a YAML list of mappings, one per record", "status | where mem>0 | to yaml"),
+        ], false),
+        ("from", "json") => help_block(ctx, "from json", "parse JSON into records", &[
+            ("<text> | from json", "parse a flat JSON array of objects into records, so `where`/`select` compose after it", "read /svc.json | from json | where core=1"),
+        ], false),
+        ("wifi", "debug") => help_block(ctx, "wifi debug", "the driver's own account of itself (utilities/56_wifi.md 4g)", &[
+            ("wifi debug", "stats, transport and events together", "wifi debug"),
+            ("wifi debug stats", "the control channel: requests sent, accepted, refused, unanswered; the session's age", "wifi debug stats"),
+            ("wifi debug transport", "the SDIO side: bytes each way, frames by channel, flow-control frames, frames lost to the scan", "wifi debug transport"),
+            ("wifi debug events", "how many of each firmware event has arrived, and the last one", "wifi debug events"),
+            ("wifi debug firmware", "chip, image, the running firmware's version and capability words, MAC, supplicant", "wifi debug firmware"),
+            ("wifi debug trace", "the last 64 frames on the bus, oldest first, on the driver's own clock", "wifi debug trace"),
+        ], false),
+        ("wifi", "scan") => help_block(ctx, "wifi scan", "sweep for networks and pick one", &[
+            ("wifi scan", "rows appear as heard, numbered; q stops the sweep, b leaves it running; then a number and Enter joins", "wifi scan"),
+        ], false),
+        ("wifi", "hardware") => help_block(ctx, "wifi hardware", "which radios this machine has (utilities/56_wifi.md 11)", &[
+            ("wifi hardware", "RADIO CHIP BUS STATE NETWORK IN-USE, one record per radio running now", "wifi hardware | where state=joined"),
+            ("wifi hardware use <radio>", "make it the radio in use: it joins your network first, then carries the link; the other leaves", "wifi hardware use usb"),
+            ("wifi hardware <radio>", "one radio in full: chip, id, address, firmware, bus, endpoints, queues, state - labelled lines", "wifi hardware usb"),
+        ], false),
+        ("wifi", "list") => help_block(ctx, "wifi list", "the last complete scan, as records", &[
+            ("wifi list", "NETWORK BAND SIGNAL SECURITY NOTE, one line per network; never scans - an error while a sweep runs or before any", "wifi list | match saved"),
+        ], false),
+        ("wifi", "join") => help_block(ctx, "wifi join", "join a network by name", &[
+            ("wifi join <ssid>", "uses a held key, joins open, or asks the passphrase once (never on the command line); `already joined` if you are on it", "wifi join Bankole-WiFi"),
+        ], false),
+        ("wifi", "leave") => help_block(ctx, "wifi leave", "leave the current network", &[
+            ("wifi leave", "the radio stays up; the held key is kept", "wifi leave"),
+        ], false),
+        ("wifi", "status") => help_block(ctx, "wifi status", "the human answer", &[
+            ("wifi status", "radio, network and band, signal as a word then dBm, security, time joined, last scan", "wifi status"),
+        ], false),
+        ("wifi", "info") => help_block(ctx, "wifi info", "the link in detail", &[
+            ("wifi info", "bssid, band, channel, signal, security, time joined, scan facts; for the address, type net", "wifi info"),
+        ], false),
+        ("wifi", "stored") => help_block(ctx, "wifi stored", "which networks a key is held for", &[
+            ("wifi stored", "names only, never a key; kept across reboots in /wifi.keys", "wifi stored"),
+        ], false),
+        ("wifi", "forget") => help_block(ctx, "wifi forget", "drop a held key", &[
+            ("wifi forget <ssid>", "the key is wiped; the link, if any, is not touched", "wifi forget Bankole-WiFi"),
+        ], false),
+        ("wifi", "radio") => help_block(ctx, "wifi radio", "power the radio", &[
+            ("wifi radio on|off", "the firmware's switch: off disconnects first and says so; on rejoins", "wifi radio off"),
+            ("wifi radio off hard", "cut the CHIP's power and stay powered down; `wifi radio on` brings it back cold (~20 s)", "wifi radio off hard"),
+            ("wifi radio powercycle", "cut and restore the CHIP's power and restart the driver on it - the radio comes back from power-on and rejoins", "wifi radio powercycle"),
+        ], false),
+        ("hardware", "cpu") => help_block(ctx, "hardware cpu", "the cores the kernel brought up", &[
+            ("hardware cpu", "this section; on a machine without it, says so", "hardware cpu"),
+            ("hardware cpu | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware cpu | count"),
+        ], false),
+        ("hardware", "memory") => help_block(ctx, "hardware memory", "system RAM, as the frame allocator sees it", &[
+            ("hardware memory", "this section; on a machine without it, says so", "hardware memory"),
+            ("hardware memory | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware memory | count"),
+        ], false),
+        ("hardware", "pci") => help_block(ctx, "hardware pci", "the PCI bus as hw-enumerator found it, and which service drives each device", &[
+            ("hardware pci", "this section; on a machine without it, says so", "hardware pci"),
+            ("hardware pci | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware pci | count"),
+        ], false),
+        ("hardware", "soc") => help_block(ctx, "hardware soc", "devices granted by kind, as the supervisor's spawn rows name them", &[
+            ("hardware soc", "this section; on a machine without it, says so", "hardware soc"),
+            ("hardware soc | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware soc | count"),
+        ], false),
+        ("hardware", "display") => help_block(ctx, "hardware display", "the framebuffer, and the service that renders to it", &[
+            ("hardware display", "this section; on a machine without it, says so", "hardware display"),
+            ("hardware display | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware display | count"),
+        ], false),
+        ("hardware", "usb") => help_block(ctx, "hardware usb", "USB devices the supervisor starts a driver for, while attached", &[
+            ("hardware usb", "this section; on a machine without it, says so", "hardware usb"),
+            ("hardware usb | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware usb | count"),
+        ], false),
+        ("hardware", "interrupts") => help_block(ctx, "hardware interrupts", "how each PCI device interrupts, read from its configuration space", &[
+            ("hardware interrupts", "MSI vector and target, MSI-X, or the legacy line; how often each fires is not counted by the kernel", "hardware interrupts"),
+            ("hardware interrupts | where <col><op><val>", "records: device, route, driver", "hardware interrupts | where driver=xhci"),
+        ], false),
+        ("hardware", "report") => help_block(ctx, "hardware report", "everything, for a bug report", &[
+            ("hardware report", "the overview, problems, interrupts, firmware, events, every driven device in full, the cores", "hardware report"),
+            ("hardware report | write <path>", "keep it; the pipe holds 16 KiB and says when it cut", "hardware report | write /hw.txt"),
+        ], false),
+        ("hardware", "problems") => help_block(ctx, "hardware problems", "what is wrong now, from what each owner answers", &[
+            ("hardware problems", "errors, warnings and notices; IOMMU faults and interrupt counts are not checked - the kernel does not report them", "hardware problems"),
+            ("hardware problems | where severity=error", "records: severity, device, problem, detail", "hardware problems | where severity=error"),
+        ], false),
+        ("hardware", "tree") => help_block(ctx, "hardware tree", "every device by how it connects", &[
+            ("hardware tree", "a PCI device behind its bridge, a USB device under the host that bound it", "hardware tree"),
+            ("hardware tree | where parent=<device>", "records: device, parent, kind, driver", "hardware tree | where parent=xhci"),
+        ], false),
+        ("hardware", "events") => help_block(ctx, "hardware events", "what happened to the devices, as the supervisor saw it", &[
+            ("hardware events", "a driver's death and restart, a USB device attached or removed - since the supervisor started; the kernel's part is not recorded", "hardware events"),
+            ("hardware events | where event=attached", "records: time, device, event, detail", "hardware events | where event=attached"),
+        ], false),
+        ("hardware", "firmware") => help_block(ctx, "hardware firmware", "the firmware this OS loads", &[
+            ("hardware firmware", "each radio's chip and firmware, as its driver reports them", "hardware firmware"),
+        ], false),
+        ("hardware", "compare") => help_block(ctx, "hardware compare", "what changed since a saved report", &[
+            ("hardware compare <report>", "devices added, removed, or with a different kind, driver or state", "hardware compare /hw.txt"),
+            ("hardware report | write <path>", "save one to compare against later", "hardware report | write /hw.txt"),
+        ], false),
+        ("hardware", "why") => help_block(ctx, "hardware why", "why a device is handled the way it is", &[
+            ("hardware why <device>", "who drives it, why that service, and the reason the supervisor records beside its spawn row", "hardware why 00:12.0"),
+        ], false),
+        ("audio", "status") => help_block(ctx, "audio status", "what audio is doing now, read live from the driver", &[
+            ("audio status", "on or off, volume, muted, output, what is playing and how far, underruns", "audio status"),
+            ("audio status | match volume", "a report is data: labelled lines", "audio status | match volume"),
+        ], false),
+        ("audio", "info") => help_block(ctx, "audio info", "the detail a fault needs", &[
+            ("audio info", "controller, codec, path, amplifier step, format, ring, interrupt or polling", "audio info"),
+        ], false),
+        ("audio", "volume") => help_block(ctx, "audio volume", "set the volume, read back from the codec", &[
+            ("audio volume <0-100>", "0 is silent and is NOT mute; off, it is kept and set at `audio on`", "audio volume 60"),
+        ], false),
+        ("audio", "mute") => help_block(ctx, "audio mute", "silence the output, keeping the volume", &[
+            ("audio mute", "already muted sends nothing; unmute returns to the volume", "audio mute"),
+        ], false),
+        ("audio", "unmute") => help_block(ctx, "audio unmute", "restore the volume set before mute", &[
+            ("audio unmute", "says the volume it returned to, and that it is silent if that is 0", "audio unmute"),
+        ], false),
+        ("audio", "on") => help_block(ctx, "audio on", "power the codec back up", &[
+            ("audio on", "from off or off hard; the volume and the mute are re-applied and read back", "audio on"),
+        ], false),
+        ("audio", "off") => help_block(ctx, "audio off", "power the codec down", &[
+            ("audio off", "stops anything playing; the codec goes to its lowest power state", "audio off"),
+            ("audio off hard", "the whole controller held in reset - the closest HD Audio has to cutting power", "audio off hard"),
+        ], false),
+        ("audio", "play") => help_block(ctx, "audio play", "play a WAV file from disk", &[
+            ("audio play <path>", "16-bit PCM, mono or stereo, 44100 or 48000 Hz; anything else is refused and the reason said; q STOPS it", "audio play /music/test.wav"),
+        ], false),
+        ("audio", "tone") => help_block(ctx, "audio tone", "a sine the driver generates itself", &[
+            ("audio tone <hz> [seconds]", "20 to 20000 Hz, 2 s unless told, tenths allowed; q STOPS it", "audio tone 440 2"),
+        ], false),
         ("date", "epoch") => help_block(ctx, "date epoch", "seconds since 1970-01-01", &[
             ("date epoch", "print epoch seconds (not POSIX 'unix')", "date epoch"),
         ], false),
         ("date", "sync") => help_block(ctx, "date sync", "sync the clock from the internet NOW", &[
-            ("date sync", "the clock already syncs itself once the network is up, and re-tries about once a minute while it is unset; this asks for it immediately instead of waiting (q aborts)", "date sync"),
+            ("date sync", "the clock already syncs itself once the network is up - the clock service asks about every 20 s while it is unset; this asks for it immediately instead of waiting (q aborts)", "date sync"),
         ], false),
         ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
             ("net dns <host>", "DNS A-record lookup via net-stack (slirp resolver)", "net dns example.com"),
@@ -5481,12 +5843,15 @@ static HELP: &[HelpRow] = &[
     Row("version", "GodspeedOS version + architecture + build stamp"),
     Row("cores", "CPU core count"),
     Row("mem", "physical memory usage"),
+    Row("hardware [section|device]", "this machine's devices and their drivers (records when piped)"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - watch is built on it)"),
     Row("whatis <name>", "what a name is: built-in / library script / pipe stage / service"),
     Row("net", "network status: IP, gateway, ping"),
     Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
+    Row("wifi [scan|list|join <ssid>|status]", "wireless: what is in range, and join one"),
+    Row("audio [status|volume <0-100>|tone <hz>]", "sound: what is playing, the volume, a test tone"),
     Gap,
     Sec("Services"),
     Row("status", "list all live tasks"),
@@ -6480,10 +6845,23 @@ const INPUT_MAX: usize = 256;
 /// (invisible entry, like `sudo`). Backspace erases the last char (and un-echoes it for a visible
 /// line). Returns bytes read. Blocks for a real user - `input` is interactive (docs/scripting.md §8).
 fn read_input_line(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> usize {
+    read_input_line_abortable(ctx, secret, buf).unwrap_or(0)
+}
+
+/// `read_input_line`, with a way out: Escape or Ctrl+Q ends the entry and returns `None`, and whatever
+/// was typed is zeroed before the return. A secret prompt in particular must be abandonable - the
+/// `wifi` spec says so (`utilities/56_wifi.md` 4) - and the only ways out used to be Enter, which SENDS
+/// what was typed, or a passphrase too short to send.
+fn read_input_line_abortable(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> Option<usize> {
     let mut len = 0usize;
     loop {
         let c = ctx.console_read();
         match c {
+            0x1b | 0x11 => {
+                for b in buf.iter_mut().take(len) { *b = 0; }
+                ctx.console_write("\r\n");
+                return None;
+            }
             b'\r' | b'\n' => { ctx.console_write("\r\n"); break; }
             0x7f | 0x08 => { if len > 0 { len -= 1; if !secret { ctx.console_write("\x08 \x08"); } } }
             b if (0x20..0x7f).contains(&b) => {
@@ -6492,10 +6870,10 @@ fn read_input_line(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> usize 
                     if !secret { let one = [b]; if let Ok(t) = core::str::from_utf8(&one) { ctx.console_write(t); } }
                 }
             }
-            _ => {} // ignore control / escape bytes
+            _ => {} // ignore other control bytes
         }
     }
-    len
+    Some(len)
 }
 
 /// `input [secret] "prompt"` - print the prompt to the CONSOLE, read one line, emit it to `out`
@@ -6753,6 +7131,1505 @@ fn cmd_cores(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Shell
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// `hardware` - what this machine is, and what drives each part of it (`utilities/58_hardware.md`,
+// `docs/hardware-design.md`). STEP 1 of the design's build order: only facts that already exist, from
+// their owners - the kernel's introspection (cores, memory), `hw-enumerator` (the PCI bus), and the
+// supervisor (which service it runs for which device, `supcmd::DEVICES`). Read only, always.
+// ---------------------------------------------------------------------------------------------
+
+/// A bounded text field for one cell (26.6.1: fixed arrays, no heap). Longer text is cut, never
+/// overflowed; everything written here is ASCII.
+#[derive(Clone, Copy)]
+struct HwText<const N: usize> {
+    b: [u8; N],
+    n: u8,
+}
+
+impl<const N: usize> HwText<N> {
+    const EMPTY: Self = HwText { b: [0; N], n: 0 };
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.b[..self.n as usize]).unwrap_or("")
+    }
+    fn of(args: core::fmt::Arguments) -> Self {
+        let mut t = Self::EMPTY;
+        let _ = core::fmt::write(&mut t, args);
+        t
+    }
+}
+
+impl<const N: usize> core::fmt::Write for HwText<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() {
+            if (self.n as usize) < N.min(255) {
+                self.b[self.n as usize] = c;
+                self.n += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A PCI device's facts as `hw-enumerator` reported them (its op 2 record).
+#[derive(Clone, Copy)]
+struct HwPci {
+    bdf: u32,
+    class: u32,
+    vendor: u16,
+    device: u16,
+    bar0: u32,
+    irq: u8,
+    /// Its index in `hw-enumerator`'s list, which op 4 (the live configuration space) takes.
+    idx: u8,
+}
+
+/// One device: the same columns in every section, so any combination of sections pipes as one table
+/// (`docs/hardware-design.md` 3).
+#[derive(Clone, Copy)]
+struct HwRow {
+    section: &'static str,
+    device: HwText<16>,
+    kind: HwText<32>,
+    driver: HwText<20>,
+    state: &'static str,
+    detail: HwText<48>,
+    pci: Option<HwPci>,
+    /// The supervisor's device word for the driver (`hwclass`), 0 when it has none: what the spawn
+    /// ASKED for - a class or kind, a BAR, confinement, an interrupt.
+    hw: u32,
+    /// For a device its class's driver did not take: that driver's name (`hardware why`).
+    takes: HwText<20>,
+    /// For a USB device: the host that bound it (`hardware tree` hangs it there).
+    host: HwText<12>,
+}
+
+impl HwRow {
+    const EMPTY: Self = HwRow {
+        section: "", device: HwText::EMPTY, kind: HwText::EMPTY, driver: HwText::EMPTY,
+        state: "", detail: HwText::EMPTY, pci: None, hw: 0, takes: HwText::EMPTY, host: HwText::EMPTY,
+    };
+}
+
+/// The sections, in the order they print. A section the machine does not have is left out of the
+/// bare view and answered by name when asked for (`docs/hardware-design.md` 1).
+const HW_SECTIONS: [&str; 6] = ["cpu", "memory", "pci", "soc", "display", "usb"];
+/// Rows gathered at most. A bound, not a fit: the PCs show about a dozen.
+// 24 was one short of the T630 (4 cores, memory and 22 PCI devices filled it), so its `soc`, `display`
+// and `usb` rows were dropped without a word. A row over `HW_ROWS` is now COUNTED and said (`dropped`).
+// Not counted, and bounded before a row is made: more than 16 cores, 32 PCI devices, `HW_DRIVERS`
+// spawn rows or `HW_USB` USB matches.
+const HW_ROWS: usize = 48;
+/// The supervisor's spawn rows with a device, and its USB matches, kept for one gathering.
+const HW_DRIVERS: usize = 16;
+const HW_USB: usize = 4;
+
+/// Everything one `hardware` gathers before it prints or pipes.
+struct HwFacts {
+    rows: [HwRow; HW_ROWS],
+    n: usize,
+    cores: u32,
+    total_frames: u64,
+    free_frames: u64,
+    /// `hw-enumerator` answered: this machine has a PCI bus the OS can read.
+    pci_bus: bool,
+    /// A USB host is here (a USB controller row in `pci` or `soc`).
+    usb_host: bool,
+    /// The supervisor answered `supcmd::DEVICES`; without it the DRIVER column cannot be filled.
+    drivers_known: bool,
+    /// Rows that did not fit in `HW_ROWS`, said under the output rather than lost.
+    dropped: usize,
+}
+
+impl HwFacts {
+    fn push(&mut self, r: HwRow) {
+        if self.n < HW_ROWS {
+            self.rows[self.n] = r;
+            self.n += 1;
+        } else {
+            self.dropped += 1;
+        }
+    }
+}
+
+/// Who made a PCI or USB device, by its vendor ID: a small table for the hardware this project runs
+/// on, not the PCI ID database. Anything else shows as its hex ID - never a guess.
+fn hw_vendor(v: u16) -> Option<&'static str> {
+    Some(match v {
+        0x1022 | 0x1002 => "AMD",
+        0x8086 => "Intel",
+        0x10ec | 0x0bda => "Realtek",
+        0x1af4 | 0x1b36 => "Red Hat (QEMU)",
+        0x1234 => "QEMU",
+        0x1106 => "VIA",
+        0x14e4 => "Broadcom",
+        0x046d => "Logitech",
+        _ => return None,
+    })
+}
+
+/// What a PCI class code means, in words. Unknown classes show their code.
+fn hw_class(c: u32) -> Option<&'static str> {
+    Some(match c {
+        0x0c0330 => "USB 3 (xHCI)",
+        0x0c0320 => "USB 2 (EHCI)",
+        0x0c0310 => "USB 1 (OHCI)",
+        0x0c0300 => "USB 1 (UHCI)",
+        0x010601 => "SATA (AHCI)",
+        0x010802 => "NVMe",
+        0x020000 => "ethernet",
+        0x028000 => "network",
+        0x040300 => "HD audio",
+        0x040100 => "audio",
+        0x030000 => "display (VGA)",
+        0x038000 => "display",
+        0x060000 => "host bridge",
+        0x060100 => "ISA bridge",
+        0x060400 => "PCI bridge",
+        0x0c0500 => "SMBus",
+        0x080600 => "IOMMU",
+        0x108000 => "encryption",
+        0x050000 => "RAM controller",
+        0x058000 => "memory controller",
+        0x010180 | 0x01018a | 0x01018f => "IDE",
+        0x080500 | 0x080501 => "SD host",
+        // A subclass not listed above: what its base class is, rather than a bare number. The PCI base
+        // classes, as the specification names them.
+        c => match c >> 16 {
+            0x01 => "storage",
+            0x02 => "network",
+            0x03 => "display",
+            0x04 => "multimedia",
+            0x05 => "memory controller",
+            0x06 => "bridge",
+            0x07 => "communication",
+            0x08 => "system peripheral",
+            0x09 => "input",
+            0x0c => "serial bus",
+            0x0d => "wireless",
+            0x10 => "encryption",
+            0x11 => "signal processing",
+            _ => return None,
+        },
+    })
+}
+
+/// A USB device the supervisor starts a driver for, in words.
+fn hw_usb_name(vid: u16, pid: u16) -> Option<&'static str> {
+    match (vid, pid) {
+        (0x0bda, 0x8176) => Some("WiFi (RTL8188CUS)"),
+        _ => None,
+    }
+}
+
+/// The PCI class a device KIND is, where the kernel resolves that kind on the PCI bus (x86): a USB host
+/// asked for by kind is the bus's controller of that class, not a separate device.
+fn hw_kind_pci_class(kind: u32) -> Option<u32> {
+    use godspeed_sdk::service_context::hwclass;
+    match kind {
+        hwclass::XHCI => Some(0x0c0330),
+        hwclass::EHCI => Some(0x0c0320),
+        _ => None,
+    }
+}
+
+/// A device granted by KIND rather than by bus (`hwclass`): its section, its name, and what it is.
+fn hw_kind(kind: u32) -> Option<(&'static str, &'static str, &'static str)> {
+    use godspeed_sdk::service_context::hwclass;
+    Some(match kind {
+        hwclass::NIC         => ("soc", "nic", "ethernet"),
+        hwclass::XHCI        => ("soc", "xhci", "USB 3 host (xHCI)"),
+        hwclass::EHCI        => ("soc", "ehci", "USB 2 host (EHCI)"),
+        hwclass::DWC2        => ("soc", "dwc2", "USB host (DWC2)"),
+        hwclass::FRAMEBUFFER => ("display", "framebuffer", "framebuffer"),
+        hwclass::AUDIO_PWM   => ("soc", "audio-pwm", "audio jack (PWM)"),
+        hwclass::WIFI_SDIO   => ("soc", "wifi-sdio", "WiFi (SDIO)"),
+        _ => return None,
+    })
+}
+
+fn hw_running(ctx: &ServiceContext, name: &str) -> &'static str {
+    if slot_of(ctx, name).is_some() { "running" } else { "not running" }
+}
+
+/// Ask, bounded: `request_within` sends again once if the first send failed on a stale capability, and
+/// never repeats a question that timed out. Any failure is no answer.
+fn hw_ask(ctx: &ServiceContext, peer: &str, body: &[u8]) -> Option<Message> {
+    const ANSWER_SECS: i64 = 2;
+    gs::call::request_within(ctx, peer, &Message::from_bytes(body), ANSWER_SECS).ok()
+}
+
+/// Gather every row from its owner. `#[inline(never)]`: the facts are a few KiB, kept off every other
+/// command's frame.
+#[inline(never)]
+fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
+    use godspeed_sdk::service_context::{hwclass, supcmd};
+    f.n = 0;
+    f.cores = ctx.inspect_core_count();
+    f.total_frames = ctx.inspect_kernel_total_frames();
+    f.free_frames = ctx.inspect_kernel_free_frames();
+
+    // cpu: the cores the kernel brought up.
+    for c in 0..f.cores.min(16) {
+        let mut r = HwRow::EMPTY;
+        r.section = "cpu";
+        r.device = HwText::of(format_args!("core {}", c));
+        r.kind = HwText::of(format_args!("cpu core"));
+        r.driver = HwText::of(format_args!("kernel"));
+        r.state = "up";
+        if c == 0 { r.detail = HwText::of(format_args!("boot core")); }
+        f.push(r);
+    }
+
+    // memory: the frame allocator's view.
+    let mut r = HwRow::EMPTY;
+    r.section = "memory";
+    r.device = HwText::of(format_args!("ram"));
+    r.kind = HwText::of(format_args!("system RAM"));
+    r.driver = HwText::of(format_args!("kernel"));
+    r.state = "in use";
+    r.detail = HwText::of(format_args!("{} MiB total, {} MiB free", f.total_frames / 256, f.free_frames / 256));
+    f.push(r);
+
+    // Which service the supervisor runs for which device (`supcmd::DEVICES`).
+    let mut drv_hw = [0u32; HW_DRIVERS];
+    let mut drv_name = [HwText::<20>::EMPTY; HW_DRIVERS];
+    let mut nd = 0usize;
+    let mut usb_ids = [(0u16, 0u16, false); HW_USB];
+    let mut usb_host = [HwText::<12>::EMPTY; HW_USB];
+    let mut usb_drv = [HwText::<20>::EMPTY; HW_USB];
+    let mut nu = 0usize;
+    f.drivers_known = false;
+    if let Some(m) = hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::DEVICES]) {
+        let p = m.payload_bytes();
+        if p.len() >= 2 && p[0] == supcmd::OK {
+            f.drivers_known = true;
+            let mut i = 2usize;
+            fn text<'a>(p: &'a [u8], i: &mut usize) -> Option<&'a str> {
+                let l = *p.get(*i)? as usize;
+                let s = core::str::from_utf8(p.get(*i + 1..*i + 1 + l)?).ok()?;
+                *i += 1 + l;
+                Some(s)
+            }
+            for _ in 0..p[1] {
+                match p.get(i).copied() {
+                    Some(b'H') if i + 5 <= p.len() => {
+                        let hw = u32::from_le_bytes([p[i + 1], p[i + 2], p[i + 3], p[i + 4]]);
+                        i += 5;
+                        let Some(name) = text(p, &mut i) else { break };
+                        if nd < HW_DRIVERS {
+                            drv_hw[nd] = hw;
+                            drv_name[nd] = HwText::of(format_args!("{}", name));
+                            nd += 1;
+                        }
+                    }
+                    Some(b'U') if i + 6 <= p.len() => {
+                        let vid = u16::from_le_bytes([p[i + 1], p[i + 2]]);
+                        let pid = u16::from_le_bytes([p[i + 3], p[i + 4]]);
+                        let attached = p[i + 5] != 0;
+                        i += 6;
+                        let Some(host) = text(p, &mut i) else { break };
+                        let host = HwText::<12>::of(format_args!("{}", host));
+                        let Some(name) = text(p, &mut i) else { break };
+                        if nu < HW_USB {
+                            usb_ids[nu] = (vid, pid, attached);
+                            usb_host[nu] = host;
+                            usb_drv[nu] = HwText::of(format_args!("{}", name));
+                            nu += 1;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    // A driver named by PCI class, or by a KIND that is a PCI class on a PCI machine: `ehci` asks for
+    // `hwclass::EHCI` and on x86 the kernel resolves that to the bus's EHCI controller, so on the T630 it
+    // drove 00:12.0 while this showed the device driverless and listed a separate `soc` row for it.
+    let driver_for_class = |class: u32| -> Option<usize> {
+        (0..nd).find(|&k| {
+            let hw = drv_hw[k];
+            (hw & hwclass::PCI != 0 && hw & 0x00FF_FFFF == class) || hw_kind_pci_class(hw) == Some(class)
+        })
+    };
+    // ONE device per driver: a driver named by class is given the FIRST device of that class on the bus
+    // (`hw-enumerator` op 3, which the supervisor asks at spawn). The T630 has two HD audio controllers
+    // and showed `audio-driver` on both.
+    let mut claimed = [false; HW_DRIVERS];
+
+    // pci: the bus as `hw-enumerator` found it (op 1, the count; op 2, each device).
+    f.pci_bus = false;
+    f.usb_host = false;
+    // Asked only where it runs: a board with no PCI bus (the Pi 2) has no `hw-enumerator`, and asking
+    // for it by name there made the kernel log a failed lookup for a question with a known answer.
+    if slot_of(ctx, "hw-enumerator").is_none() {
+        // No PCI bus the OS can read; `pci_bus` stays false and the section says so.
+    } else if let Some(m) = hw_ask(ctx, "hw-enumerator", &[1]) {
+        let p = m.payload_bytes();
+        if p.len() >= 4 {
+            f.pci_bus = true;
+            let count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]).min(32);
+            for idx in 0..count {
+                let Some(m) = hw_ask(ctx, "hw-enumerator", &[2, idx as u8]) else { continue };
+                let q = m.payload_bytes();
+                if q.len() < 17 { continue; }
+                let d = HwPci {
+                    bdf: u32::from_le_bytes([q[0], q[1], q[2], q[3]]),
+                    class: u32::from_le_bytes([q[4], q[5], q[6], q[7]]),
+                    vendor: u16::from_le_bytes([q[8], q[9]]),
+                    device: u16::from_le_bytes([q[10], q[11]]),
+                    bar0: u32::from_le_bytes([q[12], q[13], q[14], q[15]]),
+                    irq: q[16],
+                    idx: idx as u8,
+                };
+                if d.class >> 8 == 0x0c03 { f.usb_host = true; }
+                let mut r = HwRow::EMPTY;
+                r.section = "pci";
+                r.device = HwText::of(format_args!("{:02x}:{:02x}.{}", (d.bdf >> 8) & 0xff, (d.bdf >> 3) & 0x1f, d.bdf & 7));
+                r.kind = match hw_class(d.class) {
+                    Some(k) => HwText::of(format_args!("{}", k)),
+                    None => HwText::of(format_args!("class {:#08x}", d.class)),
+                };
+                match driver_for_class(d.class) {
+                    Some(k) if !claimed[k] => {
+                        claimed[k] = true;
+                        let name = drv_name[k].as_str();
+                        r.driver = HwText::of(format_args!("{}", name));
+                        r.state = hw_running(ctx, name);
+                        r.hw = drv_hw[k];
+                    }
+                    // Its class has a driver, which took the first such device.
+                    Some(k) => {
+                        r.driver = HwText::of(format_args!("-"));
+                        r.state = "not driven";
+                        r.takes = HwText::of(format_args!("{}", drv_name[k].as_str()));
+                    }
+                    // The IOMMU is the kernel's own (AMD-Vi, CLAUDE.md 6.4): it is driven, by no service.
+                    None if d.class == 0x080600 && ARCH == "x86_64" => {
+                        r.driver = HwText::of(format_args!("kernel"));
+                        r.state = "in use";
+                    }
+                    None => {
+                        r.driver = HwText::of(format_args!("-"));
+                        r.state = "no driver";
+                    }
+                }
+                // The configuration space's interrupt LINE, which 255 means "not connected" - printed as
+                // "IRQ 255" it read like a vector. A driver that asks for an interrupt is given an MSI
+                // vector instead, which this line does not show.
+                let v = hw_vendor(d.vendor).unwrap_or("");
+                let sp = if v.is_empty() { "" } else { " " };
+                r.detail = if d.irq == 0xff {
+                    HwText::of(format_args!("{}{}{:04x}:{:04x}, no IRQ line", v, sp, d.vendor, d.device))
+                } else {
+                    HwText::of(format_args!("{}{}{:04x}:{:04x}, IRQ line {}", v, sp, d.vendor, d.device, d.irq))
+                };
+                r.pci = Some(d);
+                f.push(r);
+            }
+        }
+    }
+
+    // soc and display: devices granted by kind, as the supervisor's spawn rows name them.
+    for k in 0..nd {
+        // A PCI driver, or a kind already shown on its PCI device above.
+        if drv_hw[k] & hwclass::PCI != 0 || claimed[k] { continue; }
+        // A kind the kernel resolves on the PCI bus, with no device of its class there and no driver
+        // running: the device is not on this machine (QEMU's `ehci`), so it is not a row - a row would
+        // say "not running" about hardware that does not exist.
+        if f.pci_bus && hw_kind_pci_class(drv_hw[k]).is_some() && slot_of(ctx, drv_name[k].as_str()).is_none() {
+            continue;
+        }
+        let Some((section, dev, kind)) = hw_kind(drv_hw[k]) else { continue };
+        if matches!(dev, "xhci" | "ehci" | "dwc2") { f.usb_host = true; }
+        let name = drv_name[k].as_str();
+        let mut r = HwRow::EMPTY;
+        r.section = section;
+        r.device = HwText::of(format_args!("{}", dev));
+        r.kind = HwText::of(format_args!("{}", kind));
+        r.driver = HwText::of(format_args!("{}", name));
+        r.state = hw_running(ctx, name);
+        r.hw = drv_hw[k];
+        f.push(r);
+    }
+
+    // usb: the devices the supervisor starts a driver for, while they are attached. A device with no
+    // driver here is not reported by its host yet (`docs/hardware-design.md` 9).
+    for u in 0..nu {
+        let (vid, pid, attached) = usb_ids[u];
+        if !attached { continue; }
+        let name = usb_drv[u].as_str();
+        let mut r = HwRow::EMPTY;
+        r.section = "usb";
+        r.device = HwText::of(format_args!("{:04x}:{:04x}", vid, pid));
+        r.kind = match hw_usb_name(vid, pid) {
+            Some(k) => HwText::of(format_args!("{}", k)),
+            None => HwText::of(format_args!("USB device")),
+        };
+        r.driver = HwText::of(format_args!("{}", name));
+        r.state = hw_running(ctx, name);
+        r.host = usb_host[u];
+        r.detail = match hw_vendor(vid) {
+            Some(v) => HwText::of(format_args!("{}, on {}", v, usb_host[u].as_str())),
+            None => HwText::of(format_args!("on {}", usb_host[u].as_str())),
+        };
+        f.push(r);
+    }
+}
+
+/// The sections named in `arg` (`cpu,memory`), as a bit per `HW_SECTIONS` entry, or `None` when `arg`
+/// is not a list of sections.
+fn hw_sections(arg: &str) -> Option<u8> {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.contains(' ') { return None; }
+    let mut mask = 0u8;
+    for part in arg.split(',') {
+        let i = HW_SECTIONS.iter().position(|s| *s == part)?;
+        mask |= 1 << i;
+    }
+    Some(mask)
+}
+
+/// Is this section here at all? A missing PCI bus or USB host is a fact about the machine.
+fn hw_section_present(f: &HwFacts, section: &str) -> bool {
+    match section {
+        "pci" => f.pci_bus,
+        "usb" => f.usb_host,
+        _ => f.rows[..f.n].iter().any(|r| r.section == section),
+    }
+}
+
+/// What to say for a section asked for by name that this machine does not have.
+fn hw_absent_reason(section: &str) -> &'static str {
+    match section {
+        "pci" => "none on this machine (no PCI bus the OS can read)",
+        "usb" => "none on this machine (no USB host)",
+        "soc" => "none on this machine (no devices granted by kind)",
+        "display" => "none on this machine (no framebuffer)",
+        _ => "none on this machine",
+    }
+}
+
+/// The words of the design that are not built yet, answered as such rather than mistaken for a device.
+const HW_NOT_BUILT: &[&str] = &["power"];
+
+/// `hardware [section[,section...] | device]` - see `utilities/58_hardware.md`.
+fn cmd_hardware(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let arg = arg.trim();
+    let first = arg.split_whitespace().next().unwrap_or("");
+    let last = arg.split_whitespace().last().unwrap_or("");
+    if HW_NOT_BUILT.contains(&first) || (first != last && HW_NOT_BUILT.contains(&last)) {
+        let word = if HW_NOT_BUILT.contains(&first) { first } else { last };
+        out.line_fmt(ctx, format_args!(
+            "hardware: '{}' is designed, not built yet (docs/hardware-design.md)", word));
+        return Err(ShellError::Unknown);
+    }
+    let mut f = HwFacts {
+        rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+        pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+    };
+    hw_gather(ctx, &mut f);
+
+    if arg.is_empty() {
+        hw_print(ctx, out, &f, 0xFF, false);
+        return Ok(());
+    }
+    if let Some(mask) = hw_sections(arg) {
+        hw_print(ctx, out, &f, mask, true);
+        return Ok(());
+    }
+    match (first, last) {
+        ("interrupts", "interrupts") => { hw_interrupts(ctx, out, &f); return Ok(()); }
+        ("problems", "problems") => { hw_problems(ctx, out, &f); return Ok(()); }
+        ("tree", "tree") => { hw_tree(ctx, out, &f); return Ok(()); }
+        ("firmware", "firmware") => { hw_firmware(ctx, out); return Ok(()); }
+        ("events", "events") => return hw_events(ctx, out, &f),
+        ("compare", _) if first != last => return hw_compare(ctx, cwd, out, &f, arg["compare".len()..].trim()),
+        ("compare", _) => {
+            out.line(ctx, "hardware compare: name a saved report - `hardware report | write /hw.txt`, then later `hardware compare /hw.txt`");
+            return Err(ShellError::Unknown);
+        }
+        ("report", "report") => { hw_report(ctx, out, &f); return Ok(()); }
+        ("why", _) if first != last => {
+            let name = arg["why".len()..].trim();
+            return match hw_find(&f, name) {
+                Some(r) => { hw_why(ctx, out, r); Ok(()) }
+                None => hw_unknown(ctx, out, name),
+            };
+        }
+        (_, "debug") if first != last => {
+            let what = arg[..arg.len() - "debug".len()].trim();
+            if let Some(mask) = hw_sections(what) {
+                hw_section_debug(ctx, out, &f, mask);
+                return Ok(());
+            }
+            return match hw_find(&f, what) {
+                Some(r) => { hw_debug(ctx, out, r); Ok(()) }
+                None => hw_unknown(ctx, out, what),
+            };
+        }
+        _ => {}
+    }
+    match hw_find(&f, arg) {
+        Some(r) => { hw_device(ctx, out, r); Ok(()) }
+        None => hw_unknown(ctx, out, arg),
+    }
+}
+
+fn hw_find<'a>(f: &'a HwFacts, name: &str) -> Option<&'a HwRow> {
+    f.rows[..f.n].iter().find(|r| r.device.as_str().eq_ignore_ascii_case(name))
+}
+
+fn hw_unknown(ctx: &ServiceContext, out: &mut Out, name: &str) -> Result<(), ShellError> {
+    out.line_fmt(ctx, format_args!(
+        "hardware: no section or device '{}' - the sections are cpu, memory, pci, soc, display, usb; `hardware` lists the devices", name));
+    Err(ShellError::Unknown)
+}
+
+fn hw_print(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8, explicit: bool) {
+    if !explicit {
+        let mib = f.total_frames / 256;
+        if mib >= 1024 {
+            out.line_fmt(ctx, format_args!("{} - {} core(s), {} GiB", ARCH, f.cores, (mib + 512) / 1024));
+        } else {
+            out.line_fmt(ctx, format_args!("{} - {} core(s), {} MiB", ARCH, f.cores, mib));
+        }
+    }
+    for (i, sec) in HW_SECTIONS.iter().enumerate() {
+        if mask & (1 << i) == 0 { continue; }
+        let present = hw_section_present(f, sec);
+        if !present {
+            if explicit {
+                out.line_fmt(ctx, format_args!("{}: {}", sec, hw_absent_reason(sec)));
+            }
+            continue;
+        }
+        out.line(ctx, "");
+        out.line_fmt(ctx, format_args!("{}", sec));
+        let rows = f.rows[..f.n].iter().filter(|r| r.section == *sec);
+        if rows.clone().count() == 0 {
+            out.line(ctx, if *sec == "usb" {
+                "  (no device with a driver here attached)"
+            } else {
+                "  (no devices found)"
+            });
+            continue;
+        }
+        out.line_fmt(ctx, format_args!("  {:<12} {:<20} {:<14} {:<11} {}", "DEVICE", "KIND", "DRIVER", "STATE", "DETAIL"));
+        for r in rows {
+            out.line_fmt(ctx, format_args!("  {:<12} {:<20} {:<14} {:<11} {}",
+                r.device.as_str(), r.kind.as_str(), r.driver.as_str(), r.state, r.detail.as_str()));
+        }
+    }
+    if !explicit {
+        let devices = f.rows[..f.n].iter().filter(|r| matches!(r.section, "pci" | "soc" | "display" | "usb"));
+        let without = devices.clone().filter(|r| r.driver.as_str() == "-").count();
+        let with = devices.count() - without;
+        out.line(ctx, "");
+        out.line_fmt(ctx, format_args!(
+            "{} device(s) with a driver, {} without - hardware <device> for one in full", with, without));
+        if !f.drivers_known {
+            out.line(ctx, "(the supervisor did not answer, so which service drives which device is not shown)");
+        }
+    }
+    if f.dropped > 0 {
+        out.line_fmt(ctx, format_args!("({} more row(s) did not fit - the view holds {})", f.dropped, HW_ROWS));
+    }
+}
+
+/// One device in full, as labelled lines (`docs/hardware-design.md` 4), with its authority as far as a
+/// reader can see it WITHOUT a kernel change: what the driver holds (its capabilities), what its spawn
+/// asked for (the supervisor's device word), and what the device itself says it was given (its live
+/// configuration space - the BARs and the interrupt route the kernel programmed). The grant's addresses
+/// as the kernel recorded them are not reported by the kernel, and the view says where they were logged.
+fn hw_device(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
+    out.line_fmt(ctx, format_args!("device     {}", r.device.as_str()));
+    out.line_fmt(ctx, format_args!("section    {}", r.section));
+    out.line_fmt(ctx, format_args!("kind       {}", r.kind.as_str()));
+    let cfg = r.pci.and_then(|d| hw_config(ctx, d.idx));
+    if let Some(d) = r.pci {
+        match hw_vendor(d.vendor) {
+            Some(v) => out.line_fmt(ctx, format_args!("id         {:04x}:{:04x} ({})", d.vendor, d.device, v)),
+            None => out.line_fmt(ctx, format_args!("id         {:04x}:{:04x}", d.vendor, d.device)),
+        }
+        out.line_fmt(ctx, format_args!("class      {:#08x}", d.class));
+    } else if !r.detail.as_str().is_empty() {
+        out.line_fmt(ctx, format_args!("detail     {}", r.detail.as_str()));
+    }
+    out.line_fmt(ctx, format_args!("driver     {}", r.driver.as_str()));
+    let name = r.driver.as_str();
+    match slot_of(ctx, name) {
+        Some(slot) if name != "kernel" => {
+            let st = ctx.task_stat(slot);
+            out.line_fmt(ctx, format_args!("state      {}, on core {}, restarted {} time(s)", r.state, st.core, st.restart_count));
+        }
+        _ => out.line_fmt(ctx, format_args!("state      {}", r.state)),
+    }
+    if let Some(c) = cfg.as_ref() {
+        out.line_fmt(ctx, format_args!("command    {}", hw_command_text(c).as_str()));
+        hw_bars(ctx, out, c);
+        out.line_fmt(ctx, format_args!("interrupt  {}", hw_irq_route(c).as_str()));
+    } else if r.pci.is_some() {
+        out.line(ctx, "config     hw-enumerator did not answer - the live configuration is not shown");
+    }
+    if matches!(r.section, "pci" | "soc" | "display" | "usb") && name != "-" && name != "kernel" {
+        hw_authority(ctx, out, r, name);
+    }
+    if r.section != "cpu" && r.section != "memory" {
+        out.line_fmt(ctx, format_args!("why        hardware why {}", r.device.as_str()));
+    }
+}
+
+/// What the driver holds, and what its spawn asked for. Two sources a reader can reach; the third - the
+/// kernel's record of the grant's addresses - the kernel does not report, and this says so once.
+fn hw_authority(ctx: &ServiceContext, out: &mut Out, r: &HwRow, name: &str) {
+    use godspeed_sdk::service_context::hwclass;
+    if let Some(slot) = slot_of(ctx, name) {
+        let mut caps = [CapInfo::default(); 64];
+        let n = ctx.task_caps(slot, &mut caps);
+        let mut line = HwText::<160>::EMPTY;
+        let mut endpoints = 0usize;
+        for c in caps.iter().take(n) {
+            // Ids above the kernel's fixed set are endpoints (`cap_resource_name`).
+            if c.resource_id > 18 { endpoints += 1; continue; }
+            let mut b = [0u8; 24];
+            let l = cap_resource_name(c.resource_id, &mut b);
+            let sep = if line.n == 0 { "" } else { ", " };
+            let _ = core::fmt::Write::write_fmt(&mut line, format_args!(
+                "{}{}", sep, core::str::from_utf8(&b[..l]).unwrap_or("?")));
+        }
+        out.line_fmt(ctx, format_args!("authority  {} holds {}{}{} endpoint(s)", name,
+            line.as_str(), if line.n == 0 { "" } else { ", and " }, endpoints));
+    }
+    let hw = r.hw;
+    if hw & hwclass::PCI != 0 {
+        let bar = (hw >> 24) & 7;
+        let which = if bar == hwclass::BAR_AUTO {
+            HwText::<24>::of(format_args!("the first memory BAR"))
+        } else {
+            HwText::<24>::of(format_args!("BAR {}", bar))
+        };
+        out.line_fmt(ctx, format_args!("asked      class {:#08x}, {}{}{}", hw & 0x00FF_FFFF, which.as_str(),
+            if hw & hwclass::PCI_CONFINE != 0 { ", IOMMU confinement" } else { ", no confinement" },
+            if hw & hwclass::PCI_IRQ != 0 { ", an interrupt" } else { "" }));
+    } else if let Some((_, _, kind)) = hw_kind(hw) {
+        out.line_fmt(ctx, format_args!("asked      the device kind '{}'", kind));
+    } else {
+        // No device word: a driver the kernel grants no hardware - the USB dongle's, whose host serves
+        // every request it makes. The T630's report said "it logged them at spawn" about a grant that
+        // does not exist, which is the line below said of the wrong kind of driver.
+        out.line(ctx, "asked      no hardware - the kernel grants it none; the host it is attached through does the work");
+        return;
+    }
+    out.line_fmt(ctx, format_args!(
+        "granted    the kernel does not report its grant's addresses; it logged them at spawn - events log boot | match {}", name));
+}
+
+/// The device's configuration space, read now by `hw-enumerator` (its op 4).
+fn hw_config(ctx: &ServiceContext, idx: u8) -> Option<[u8; 256]> {
+    let m = hw_ask(ctx, "hw-enumerator", &[4, idx])?;
+    let p = m.payload_bytes();
+    if p.len() < 4 + 256 { return None; }
+    let mut c = [0u8; 256];
+    c.copy_from_slice(&p[4..4 + 256]);
+    Some(c)
+}
+
+fn c16(c: &[u8; 256], o: usize) -> u16 { u16::from_le_bytes([c[o & 0xff], c[(o + 1) & 0xff]]) }
+fn c32(c: &[u8; 256], o: usize) -> u32 {
+    u32::from_le_bytes([c[o & 0xff], c[(o + 1) & 0xff], c[(o + 2) & 0xff], c[(o + 3) & 0xff]])
+}
+
+/// The command register, decoded.
+fn hw_command_text(c: &[u8; 256]) -> HwText<64> {
+    let cmd = c16(c, 0x04);
+    let on = |b: u16| if cmd & b != 0 { "on" } else { "off" };
+    HwText::of(format_args!("{:#06x} (memory {}, I/O {}, bus master {}, INTx {})", cmd,
+        on(2), on(1), on(4), if cmd & 0x400 != 0 { "off" } else { "on" }))
+}
+
+/// Every BAR the header has, one line each. Sizes are not shown: reading a BAR's size means writing
+/// all ones to it, and this view never writes.
+fn hw_bars(ctx: &ServiceContext, out: &mut Out, c: &[u8; 256]) {
+    let count = if c[0x0e] & 0x7f == 0 { 6 } else { 2 };
+    let mut i = 0usize;
+    let mut any = false;
+    while i < count {
+        let v = c32(c, 0x10 + i * 4);
+        let label = HwText::<8>::of(format_args!("bar{}", i));
+        if v == 0 { i += 1; continue; }
+        any = true;
+        if v & 1 != 0 {
+            out.line_fmt(ctx, format_args!("{:<10} {:#x} (I/O ports)", label.as_str(), v & !3));
+            i += 1;
+        } else if (v >> 1) & 3 == 2 && i + 1 < count {
+            let hi = c32(c, 0x10 + (i + 1) * 4) as u64;
+            out.line_fmt(ctx, format_args!("{:<10} {:#x} (64-bit memory{})", label.as_str(),
+                (hi << 32) | (v & !0xf) as u64, if v & 8 != 0 { ", prefetchable" } else { "" }));
+            i += 2;
+        } else {
+            out.line_fmt(ctx, format_args!("{:<10} {:#x} (32-bit memory{})", label.as_str(),
+                v & !0xf, if v & 8 != 0 { ", prefetchable" } else { "" }));
+            i += 1;
+        }
+    }
+    if !any { out.line(ctx, "bars       none"); }
+}
+
+/// The capability list, as `(id, offset)` pairs; bounded, since a corrupt list could loop.
+fn hw_cap_list(c: &[u8; 256], out: &mut [(u8, u8); 16]) -> usize {
+    if c16(c, 0x06) & 0x10 == 0 { return 0; }
+    let mut at = c[0x34] & 0xfc;
+    let mut n = 0usize;
+    while at >= 0x40 && n < out.len() {
+        out[n] = (c[at as usize], at);
+        n += 1;
+        at = c[at as usize + 1] & 0xfc;
+    }
+    n
+}
+
+fn hw_cap_name(id: u8) -> &'static str {
+    match id {
+        0x01 => "power management", 0x05 => "MSI", 0x09 => "vendor specific", 0x0d => "bridge subsystem",
+        0x10 => "PCI Express", 0x11 => "MSI-X", 0x12 => "SATA", 0x13 => "advanced features",
+        _ => "capability",
+    }
+}
+
+/// How the device interrupts, as its configuration space says now: an enabled MSI (vector and, on x86,
+/// the APIC it is sent to), MSI-X (its vectors live in device memory, not read here), or a legacy line.
+fn hw_irq_route(c: &[u8; 256]) -> HwText<96> {
+    let mut caps = [(0u8, 0u8); 16];
+    let n = hw_cap_list(c, &mut caps);
+    for &(id, at) in &caps[..n] {
+        let at = at as usize;
+        if id == 0x05 && c16(c, at + 2) & 1 != 0 {
+            let ctrl = c16(c, at + 2);
+            let addr = c32(c, at + 4);
+            let data = if ctrl & 0x80 != 0 { c16(c, at + 12) } else { c16(c, at + 8) };
+            return if ARCH == "x86_64" {
+                HwText::of(format_args!("MSI, vector {:#04x} -> APIC {}", data & 0xff, (addr >> 12) & 0xff))
+            } else {
+                HwText::of(format_args!("MSI, address {:#x}, data {:#06x}", addr, data))
+            };
+        }
+        if id == 0x11 && c16(c, at + 2) & 0x8000 != 0 {
+            let ctrl = c16(c, at + 2);
+            return HwText::of(format_args!("MSI-X, {} entries, table in BAR {} (vectors in device memory, not read)",
+                (ctrl & 0x7ff) + 1, c32(c, at + 4) & 7));
+        }
+    }
+    let pin = c[0x3d];
+    if pin == 0 || pin > 4 {
+        HwText::of(format_args!("none"))
+    } else if c16(c, 0x04) & 0x400 != 0 {
+        HwText::of(format_args!("none enabled (INTx pin {} masked, no MSI on)", (b'A' + pin - 1) as char))
+    } else if c[0x3c] == 0xff {
+        HwText::of(format_args!("INTx pin {}, no IRQ line", (b'A' + pin - 1) as char))
+    } else {
+        HwText::of(format_args!("INTx pin {}, IRQ line {}", (b'A' + pin - 1) as char, c[0x3c]))
+    }
+}
+
+/// `hardware <device> debug`: the device as the hardware sees it, read now.
+fn hw_debug(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
+    if r.section == "cpu" || r.section == "memory" {
+        hw_cpu_debug(ctx, out);
+        return;
+    }
+    let Some(d) = r.pci else {
+        out.line_fmt(ctx, format_args!(
+            "hardware: {} is not on a PCI bus - its registers are its driver's ({}) to report", r.device.as_str(), r.driver.as_str()));
+        return;
+    };
+    let Some(c) = hw_config(ctx, d.idx) else {
+        out.line(ctx, "hardware: hw-enumerator did not answer - the configuration space is not shown");
+        return;
+    };
+    out.line_fmt(ctx, format_args!("device     {}  (bus {}, device {:#x}, function {})",
+        r.device.as_str(), (d.bdf >> 8) & 0xff, (d.bdf >> 3) & 0x1f, d.bdf & 7));
+    out.line_fmt(ctx, format_args!("config     vendor {:04x} device {:04x} rev {:02x} class {:06x} header {:02x}",
+        c16(&c, 0), c16(&c, 2), c[8], c32(&c, 8) >> 8, c[0x0e]));
+    out.line_fmt(ctx, format_args!("command    {}", hw_command_text(&c).as_str()));
+    out.line_fmt(ctx, format_args!("status     {:#06x}", c16(&c, 0x06)));
+    hw_bars(ctx, out, &c);
+    let mut caps = [(0u8, 0u8); 16];
+    let n = hw_cap_list(&c, &mut caps);
+    for &(id, at) in &caps[..n] {
+        out.line_fmt(ctx, format_args!("cap {:#04x}   {} ({:#04x})", at, hw_cap_name(id), id));
+    }
+    out.line_fmt(ctx, format_args!("interrupt  {}", hw_irq_route(&c).as_str()));
+    out.line_fmt(ctx, format_args!("intx       line {}, pin {}", c[0x3c], c[0x3d]));
+    out.line(ctx, "raw        the first 256 bytes of configuration space, as read now:");
+    for row in 0..16usize {
+        let b = &c[row * 16..row * 16 + 16];
+        out.line_fmt(ctx, format_args!(
+            "  {:02x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}  {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            row * 16, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]));
+    }
+    out.line(ctx, "read now - registers change; run it again to compare");
+}
+
+/// `hardware cpu debug`: what the kernel already reports per core.
+fn hw_cpu_debug(ctx: &ServiceContext, out: &mut Out) {
+    let cores = ctx.inspect_core_count();
+    out.line_fmt(ctx, format_args!("cores      {} ready", cores));
+    for core in 0..cores {
+        let active = ctx.inspect_core_active_ticks(core);
+        let total = ctx.inspect_core_total_ticks(core);
+        let busy = if total > 0 { active * 100 / total } else { 0 };
+        let label = HwText::<8>::of(format_args!("core {}", core));
+        // QUANTA, not time: the kernel counts a timer tick AND every yield, so a core whose tasks yield
+        // a lot counts faster. The ratio is what it is for - how much of its scheduling went to a task.
+        out.line_fmt(ctx, format_args!("{:<10} {} scheduler quanta, {} given to a task ({}%)", label.as_str(), total, active, busy));
+    }
+    out.line(ctx, "quanta     timer ticks and yields together, so a count is not a time");
+    out.line(ctx, "not shown  each core's timer mode and interrupt count - the kernel does not report them");
+}
+
+/// `hardware <section> debug`.
+fn hw_section_debug(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8) {
+    let mut cores_done = false;
+    for (i, sec) in HW_SECTIONS.iter().enumerate() {
+        if mask & (1 << i) == 0 { continue; }
+        match *sec {
+            "cpu" | "memory" => {
+                if !cores_done { hw_cpu_debug(ctx, out); cores_done = true; }
+            }
+            _ => {
+                for r in f.rows[..f.n].iter().filter(|r| r.section == *sec) {
+                    out.line(ctx, "");
+                    hw_debug(ctx, out, r);
+                }
+            }
+        }
+    }
+}
+
+/// `hardware interrupts`: how each PCI device interrupts, from its configuration space, with the
+/// service that drives it. How OFTEN each fires is not counted by the kernel, and the view says so.
+fn hw_interrupts(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+    if !f.pci_bus {
+        out.line(ctx, "interrupts: no PCI bus the OS can read - a SoC device's interrupt is its driver's to report");
+        return;
+    }
+    out.line_fmt(ctx, format_args!("  {:<12} {:<44} {}", "DEVICE", "ROUTE", "DRIVER"));
+    for r in f.rows[..f.n].iter().filter(|r| r.section == "pci") {
+        let Some(d) = r.pci else { continue };
+        let route = match hw_config(ctx, d.idx) {
+            Some(c) => hw_irq_route(&c),
+            None => HwText::of(format_args!("(hw-enumerator did not answer)")),
+        };
+        if route.as_str() == "none" { continue; }
+        out.line_fmt(ctx, format_args!("  {:<12} {:<44} {}", r.device.as_str(), route.as_str(), r.driver.as_str()));
+    }
+    out.line(ctx, "");
+    out.line(ctx, "how often each fires is not shown - the kernel does not count interrupts per vector");
+}
+
+/// `hardware why <device>`: why a device is handled the way it is - who drives it and why it was given
+/// to that service, from the same decisions the overview shows, and the reason the supervisor keeps
+/// beside the spawn row (`supcmd::WHY`).
+fn hw_why(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
+    use godspeed_sdk::service_context::{hwclass, supcmd};
+    let dev = r.device.as_str();
+    let name = r.driver.as_str();
+    if r.section == "cpu" || r.section == "memory" {
+        out.line_fmt(ctx, format_args!("{} is the kernel's: it schedules the cores and owns memory, and no service drives either", dev));
+        return;
+    }
+    if r.state == "not driven" {
+        out.line_fmt(ctx, format_args!(
+            "{} ({}) has no service: {} drives the FIRST device of this class on the bus, and a driver here drives one device",
+            dev, r.kind.as_str(), r.takes.as_str()));
+        return;
+    }
+    if name == "-" {
+        match r.pci {
+            Some(d) => out.line_fmt(ctx, format_args!(
+                "{} ({}) has no service: nothing in this image asks the supervisor for class {:#08x}", dev, r.kind.as_str(), d.class)),
+            None => out.line_fmt(ctx, format_args!("{} has no service in this image", dev)),
+        }
+        return;
+    }
+    if r.section == "usb" {
+        out.line_fmt(ctx, format_args!(
+            "{} is driven by {}: its USB host bound it by vendor and product and reported it attached, and the supervisor starts {} for it",
+            dev, name, name));
+    } else if r.hw & hwclass::PCI != 0 {
+        out.line_fmt(ctx, format_args!(
+            "{} is driven by {}: the supervisor starts {} for class {:#08x}, and the kernel grants it the first device of that class",
+            dev, name, name, r.hw & 0x00FF_FFFF));
+    } else if let Some((_, _, kind)) = hw_kind(r.hw) {
+        out.line_fmt(ctx, format_args!(
+            "{} is driven by {}: the supervisor starts {} for the device kind '{}', and the kernel resolves the kind to this device",
+            dev, name, name, kind));
+    } else {
+        out.line_fmt(ctx, format_args!("{} is driven by {}", dev, name));
+    }
+    let mut req = [0u8; 2 + 32];
+    req[0] = supcmd::MARKER;
+    req[1] = supcmd::WHY;
+    let l = name.len().min(32);
+    req[2..2 + l].copy_from_slice(&name.as_bytes()[..l]);
+    match hw_ask(ctx, "supervisor", &req[..2 + l]) {
+        Some(m) if m.payload_bytes().first() == Some(&supcmd::OK) && m.payload_bytes().len() > 1 => {
+            let text = core::str::from_utf8(&m.payload_bytes()[1..]).unwrap_or("?");
+            out.line_fmt(ctx, format_args!("  {}", text));
+        }
+        Some(_) => out.line_fmt(ctx, format_args!("  the supervisor records no reason beside {}'s spawn row", name)),
+        None => out.line(ctx, "  the supervisor did not answer, so its recorded reason is not shown"),
+    }
+}
+
+/// `hardware report`: everything, for a bug report - the overview, problems, interrupts, firmware, events,
+/// each device with a driver in full, the cores. Text, to paste or `| write`; the pipe holds 16 KiB and
+/// says when it cut.
+fn hw_report(ctx: &ShellCtx, out: &mut Out, f: &HwFacts) {
+    out.line_fmt(ctx, format_args!("GodspeedOS hardware report - {}", ARCH));
+    hw_print(ctx, out, f, 0xFF, false);
+    out.line(ctx, "");
+    out.line(ctx, "problems");
+    hw_problems(ctx, out, f);
+    out.line(ctx, "");
+    out.line(ctx, "interrupts");
+    hw_interrupts(ctx, out, f);
+    out.line(ctx, "");
+    out.line(ctx, "firmware");
+    hw_firmware(ctx, out);
+    out.line(ctx, "");
+    out.line(ctx, "events");
+    let _ = hw_events(ctx, out, f);
+    for r in f.rows[..f.n].iter().filter(|r| matches!(r.section, "pci" | "soc" | "display" | "usb")) {
+        if r.driver.as_str() == "-" { continue; }
+        out.line(ctx, "");
+        hw_device(ctx, out, r);
+    }
+    out.line(ctx, "");
+    hw_cpu_debug(ctx, out);
+}
+
+/// Print a record table as a grid through `out`, so a view reads the same at the prompt, inside
+/// `hardware report` and in a capture. An empty table prints `empty` instead, indented as rows are.
+fn hw_grid(ctx: &ServiceContext, out: &mut Out, t: &Table, empty: &str) {
+    if t.nrows() == 0 {
+        out.line_fmt(ctx, format_args!("  {}", empty));
+        return;
+    }
+    let w = t.grid_widths();
+    let mut sink = OutSink { ctx, out };
+    t.grid_header(&mut sink, &w);
+    for r in 0..t.nrows() {
+        t.grid_row(&mut sink, r, &w);
+    }
+}
+
+/// `hardware problems`: what is wrong now, collected from what each owner already answers - the
+/// warning-icon view. One record per problem: `severity` (error, warning, notice), `device`, `problem`,
+/// `detail`. What only the kernel could tell - IOMMU faults, interrupt counts - is not checked, and the
+/// view says so rather than reporting a clean machine it did not look at.
+#[inline(never)]
+fn build_hw_problems(ctx: &ServiceContext, f: &HwFacts) -> Table {
+    use godspeed_sdk::service_context::hwclass;
+    let mut t = Table::new(&["severity", "device", "problem", "detail"]);
+    fn add(t: &mut Table, sev: &str, dev: &str, problem: &str, detail: core::fmt::Arguments) {
+        let d = HwText::<96>::of(detail);
+        let row = [
+            t.intern(sev.as_bytes()),
+            t.intern(dev.as_bytes()),
+            t.intern(problem.as_bytes()),
+            t.intern(d.as_str().as_bytes()),
+        ];
+        t.add_row(&row);
+    }
+    if !f.drivers_known {
+        add(&mut t, "warning", "supervisor", "did not answer", format_args!("which service drives which device is not known"));
+    }
+    if f.dropped > 0 {
+        add(&mut t, "warning", "hardware", "rows left out", format_args!("{} row(s) did not fit - the view holds {}", f.dropped, HW_ROWS));
+    }
+    // A driver counted once, however many rows name it.
+    let mut seen = [HwText::<20>::EMPTY; HW_ROWS];
+    let mut nseen = 0usize;
+    for r in f.rows[..f.n].iter().filter(|r| matches!(r.section, "pci" | "soc" | "display" | "usb")) {
+        let dev = r.device.as_str();
+        let name = r.driver.as_str();
+        match r.state {
+            "not running" => add(&mut t, "error", dev, "driver not running",
+                format_args!("{} is not running, so nothing serves this device", name)),
+            "not driven" => add(&mut t, "notice", dev, "not driven",
+                format_args!("{} drives the first device of this class, and one device only", r.takes.as_str())),
+            "no driver" => {
+                // A bridge is the bus itself, not a device that wants a service.
+                let bridge = r.pci.is_some_and(|d| d.class >> 16 == 0x06);
+                if !bridge {
+                    add(&mut t, "notice", dev, "no driver", format_args!("{} - nothing in this image asks for it", r.kind.as_str()));
+                }
+            }
+            _ => {}
+        }
+        if r.state == "running" && !seen[..nseen].iter().any(|s| s.as_str() == name) {
+            if nseen < seen.len() {
+                seen[nseen] = HwText::of(format_args!("{}", name));
+                nseen += 1;
+            }
+            if let Some(slot) = slot_of(ctx, name) {
+                let st = ctx.task_stat(slot);
+                if st.restart_count > 0 {
+                    add(&mut t, "notice", dev, "restarted",
+                        format_args!("{} restarted {} time(s) this boot", name, st.restart_count));
+                }
+            }
+        }
+        if r.state != "running" { continue; }
+        let Some(d) = r.pci else { continue };
+        let Some(c) = hw_config(ctx, d.idx) else { continue };
+        let has_mem_bar = (0..6).any(|i| { let v = c32(&c, 0x10 + i * 4); v != 0 && v & 1 == 0 });
+        if has_mem_bar && c16(&c, 0x04) & 2 == 0 {
+            add(&mut t, "error", dev, "registers not decoded",
+                format_args!("memory decoding is off, so {} cannot reach its registers", name));
+        }
+        if r.hw & hwclass::PCI_IRQ != 0 {
+            let route = hw_irq_route(&c);
+            if !route.as_str().starts_with("MSI") {
+                add(&mut t, "warning", dev, "no interrupt enabled",
+                    format_args!("its spawn asked for an interrupt; the device shows {}", route.as_str()));
+            }
+        }
+    }
+    t
+}
+
+fn hw_problems(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+    let t = build_hw_problems(ctx, f);
+    hw_grid(ctx, out, &t, "(nothing wrong found)");
+    let mut counts = [0usize; 3];
+    for r in 0..t.nrows() {
+        match t.cell_bytes(r, 0) {
+            b"error" => counts[0] += 1,
+            b"warning" => counts[1] += 1,
+            _ => counts[2] += 1,
+        }
+    }
+    out.line(ctx, "");
+    out.line_fmt(ctx, format_args!("{} problem(s): {} error(s), {} warning(s), {} notice(s)",
+        t.nrows(), counts[0], counts[1], counts[2]));
+    out.line(ctx, "not checked: IOMMU faults and interrupt counts - the kernel does not report them");
+}
+
+/// `hardware tree`: every device by how it connects. A PCI device on a bus behind a bridge hangs under
+/// that bridge (its configuration space names the bus it leads to); a USB device hangs under the host
+/// that bound it. Records: `device`, `parent`, `kind`, `driver`.
+#[inline(never)]
+fn hw_tree_parents(ctx: &ServiceContext, f: &HwFacts, parent: &mut [Option<usize>; HW_ROWS]) {
+    // Which bridge leads to which bus: a bridge's secondary bus number, from its configuration space.
+    let mut buses: [(u8, usize); 16] = [(0, 0); 16];
+    let mut nb = 0usize;
+    for (i, r) in f.rows[..f.n].iter().enumerate() {
+        let Some(d) = r.pci else { continue };
+        if d.class >> 8 != 0x0604 || nb == buses.len() { continue; }
+        if let Some(c) = hw_config(ctx, d.idx) {
+            buses[nb] = (c[0x19], i);
+            nb += 1;
+        }
+    }
+    for (i, r) in f.rows[..f.n].iter().enumerate() {
+        parent[i] = None;
+        if let Some(d) = r.pci {
+            let bus = (d.bdf >> 8) as u8;
+            if bus != 0 {
+                parent[i] = buses[..nb].iter().find(|(b, _)| *b == bus).map(|&(_, at)| at);
+            }
+        } else if r.section == "usb" {
+            let host = r.host.as_str();
+            parent[i] = f.rows[..f.n].iter().position(|h| h.section != "usb" && h.driver.as_str() == host);
+        }
+    }
+}
+
+fn hw_tree(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+    let mut parent = [None; HW_ROWS];
+    hw_tree_parents(ctx, f, &mut parent);
+    let mib = f.total_frames / 256;
+    out.line_fmt(ctx, format_args!("machine  {}", ARCH));
+    out.line_fmt(ctx, format_args!("|- cpu       {} core(s)", f.cores));
+    out.line_fmt(ctx, format_args!("|- memory    {} MiB", mib));
+    // Roots: every device with no parent, grouped under its section.
+    for sec in ["pci", "soc", "display", "usb"] {
+        let roots = (0..f.n).filter(|&i| f.rows[i].section == sec && parent[i].is_none()).count();
+        if roots == 0 { continue; }
+        out.line_fmt(ctx, format_args!("|- {}", sec));
+        // Depth-first with an explicit, bounded stack (26.6.1): (row, depth, is the last child).
+        let mut stack: [(usize, usize, bool); HW_ROWS] = [(0, 0, false); HW_ROWS];
+        let mut sp = 0usize;
+        let mut kids = [0usize; HW_ROWS];
+        let mut nk = 0usize;
+        for i in (0..f.n).rev() {
+            if f.rows[i].section == sec && parent[i].is_none() && nk < kids.len() { kids[nk] = i; nk += 1; }
+        }
+        for (k, &i) in kids[..nk].iter().enumerate() {
+            if sp < stack.len() { stack[sp] = (i, 1, k == 0); sp += 1; }
+        }
+        // Whether each depth's ancestor was the last of its siblings, which decides `|` or a space.
+        let mut last_at = [false; 8];
+        while sp > 0 {
+            sp -= 1;
+            let (i, depth, last) = stack[sp];
+            if depth < last_at.len() { last_at[depth] = last; }
+            let mut lead = HwText::<32>::EMPTY;
+            for d in 1..depth.min(last_at.len()) {
+                let _ = core::fmt::Write::write_str(&mut lead, if last_at[d] { "   " } else { "|  " });
+            }
+            let r = &f.rows[i];
+            out.line_fmt(ctx, format_args!("|  {}{}- {:<12} {:<20} {}", lead.as_str(),
+                if last { "`" } else { "|" }, r.device.as_str(), r.kind.as_str(), r.driver.as_str()));
+            if depth + 1 >= last_at.len() { continue; }
+            nk = 0;
+            for j in (0..f.n).rev() {
+                if parent[j] == Some(i) && nk < kids.len() { kids[nk] = j; nk += 1; }
+            }
+            for (k, &j) in kids[..nk].iter().enumerate() {
+                if sp < stack.len() { stack[sp] = (j, depth + 1, k == 0); sp += 1; }
+            }
+        }
+    }
+}
+
+#[inline(never)]
+fn build_hw_tree(ctx: &ServiceContext, f: &HwFacts) -> Table {
+    let mut parent = [None; HW_ROWS];
+    hw_tree_parents(ctx, f, &mut parent);
+    let mut t = Table::new(&["device", "parent", "kind", "driver"]);
+    for (i, r) in f.rows[..f.n].iter().enumerate() {
+        let p = match parent[i] {
+            Some(at) => f.rows[at].device,
+            None => HwText::of(format_args!("{}", if matches!(r.section, "cpu" | "memory") { "machine" } else { r.section })),
+        };
+        let row = [
+            t.intern(r.device.as_str().as_bytes()),
+            t.intern(p.as_str().as_bytes()),
+            t.intern(r.kind.as_str().as_bytes()),
+            t.intern(r.driver.as_str().as_bytes()),
+        ];
+        t.add_row(&row);
+    }
+    t
+}
+
+/// `hardware firmware`: the firmware this OS loads, as the driver that loaded it reports it - today the
+/// radios (`OP_HARDWARE_DETAIL`'s `chip` and `firmware` facts). A controller's own ROM is not read.
+/// Records: `device`, `driver`, `chip`, `firmware`.
+#[inline(never)]
+fn build_hw_firmware(ctx: &ShellCtx) -> Table {
+    use wifi_wire::*;
+    let mut t = Table::new(&["device", "driver", "chip", "firmware"]);
+    let was = ctx.wifi_radio.get();
+    for (i, &svc) in RADIOS.iter().enumerate() {
+        if slot_of(ctx, svc).is_none() { continue; }
+        ctx.wifi_radio.set(svc);
+        let reply = wifi_ask(ctx, &[OP_HARDWARE_DETAIL], 3000);
+        let mut chip: &[u8] = b"-";
+        let mut fw: &[u8] = b"(the driver did not answer)";
+        let p = reply.as_ref().map(|m| m.payload_bytes()).unwrap_or(&[]);
+        if p.first() == Some(&OK) {
+            fw = b"(not reported)";
+            let count = p.get(1).copied().unwrap_or(0) as usize;
+            let mut at = 2;
+            for _ in 0..count {
+                let Some(&ll) = p.get(at) else { break };
+                let ll = ll as usize;
+                let Some(&vl) = p.get(at + 1 + ll) else { break };
+                let vl = vl as usize;
+                if at + 2 + ll + vl > p.len() { break; }
+                let label = &p[at + 1..at + 1 + ll];
+                let value = &p[at + 2 + ll..at + 2 + ll + vl];
+                if label == b"chip" { chip = value; }
+                if label == b"firmware" { fw = value; }
+                at += 2 + ll + vl;
+            }
+        }
+        let row = [
+            t.intern(if i == 0 { b"onboard" } else { b"usb" }),
+            t.intern(svc.as_bytes()),
+            t.intern(chip),
+            t.intern(fw),
+        ];
+        t.add_row(&row);
+    }
+    ctx.wifi_radio.set(was);
+    t
+}
+
+fn hw_firmware(ctx: &ShellCtx, out: &mut Out) {
+    let t = build_hw_firmware(ctx);
+    hw_grid(ctx, out, &t, "(no radio on this machine - nothing here loads firmware this OS supplies)");
+    out.line(ctx, "only the firmware this OS loads is listed; a controller's own ROM is not read");
+}
+
+/// The saved overview rows `compare` reads back: the fixed columns `hw_print` writes.
+#[derive(Clone, Copy)]
+struct HwSaved {
+    device: HwText<16>,
+    kind: HwText<32>,
+    driver: HwText<20>,
+    state: HwText<12>,
+}
+
+/// One field of a saved overview line, by the column `hw_print` puts it in.
+fn hw_col(line: &str, from: usize, to: usize) -> &str {
+    let b = line.as_bytes();
+    if from >= b.len() { return ""; }
+    let to = to.min(b.len());
+    core::str::from_utf8(&b[from..to]).unwrap_or("").trim()
+}
+
+/// `hardware compare <report>`: what changed since a saved `hardware` or `hardware report` - a device
+/// added, removed, or now with a different kind, driver or state. The detail column is not compared:
+/// it carries live numbers (free memory) that differ on every run. Records: `change`, `device`, `was`,
+/// `now`; `None` when the file cannot be read, said on the console.
+#[inline(never)]
+fn build_hw_compare(ctx: &ShellCtx, cwd: &Cwd, f: &HwFacts, path: &str) -> Option<(Table, usize)> {
+    let mut pbuf = [0u8; PATH_MAX];
+    let Some(pl) = resolve_path(cwd.as_str(), path, &mut pbuf) else {
+        ctx.console_writeln_fmt(format_args!("hardware compare: '{}' is not a path", path));
+        return None;
+    };
+    let mut buf = [0u8; 16 * 1024];
+    let Some(n) = fs_read_file(ctx, &pbuf[..pl], &mut buf, 10) else {
+        ctx.console_writeln_fmt(format_args!(
+            "hardware compare: cannot read '{}' - save one first with `hardware report | write {}`", path, path));
+        return None;
+    };
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut saved = [HwSaved { device: HwText::EMPTY, kind: HwText::EMPTY, driver: HwText::EMPTY, state: HwText::EMPTY }; HW_ROWS];
+    let mut ns = 0usize;
+    let mut in_section = false;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if !line.starts_with(' ') {
+            in_section = HW_SECTIONS.contains(&line.trim());
+            continue;
+        }
+        if !in_section || !line.starts_with("  ") || line.trim_start().starts_with("DEVICE") || line.trim_start().starts_with('(') {
+            continue;
+        }
+        if ns == saved.len() { break; }
+        saved[ns] = HwSaved {
+            device: HwText::of(format_args!("{}", hw_col(line, 2, 14))),
+            kind: HwText::of(format_args!("{}", hw_col(line, 15, 35))),
+            driver: HwText::of(format_args!("{}", hw_col(line, 36, 50))),
+            state: HwText::of(format_args!("{}", hw_col(line, 51, 62))),
+        };
+        ns += 1;
+    }
+    if ns == 0 {
+        ctx.console_writeln_fmt(format_args!(
+            "hardware compare: '{}' holds no hardware overview - it should be the output of `hardware` or `hardware report`", path));
+        return None;
+    }
+    let mut t = Table::new(&["change", "device", "was", "now"]);
+    let mut same = 0usize;
+    for s in saved[..ns].iter() {
+        let now = f.rows[..f.n].iter().find(|r| r.device.as_str() == s.device.as_str());
+        let was = HwText::<64>::of(format_args!("{}, {}, {}", s.kind.as_str(), s.driver.as_str(), s.state.as_str()));
+        match now {
+            None => {
+                let row = [t.intern(b"removed"), t.intern(s.device.as_str().as_bytes()), t.intern(was.as_str().as_bytes()), t.intern(b"-")];
+                t.add_row(&row);
+            }
+            Some(r) if r.kind.as_str() != s.kind.as_str() || r.driver.as_str() != s.driver.as_str() || r.state != s.state.as_str() => {
+                let is = HwText::<64>::of(format_args!("{}, {}, {}", r.kind.as_str(), r.driver.as_str(), r.state));
+                let row = [t.intern(b"changed"), t.intern(s.device.as_str().as_bytes()), t.intern(was.as_str().as_bytes()), t.intern(is.as_str().as_bytes())];
+                t.add_row(&row);
+            }
+            Some(_) => same += 1,
+        }
+    }
+    for r in f.rows[..f.n].iter() {
+        if saved[..ns].iter().any(|s| s.device.as_str() == r.device.as_str()) { continue; }
+        let is = HwText::<64>::of(format_args!("{}, {}, {}", r.kind.as_str(), r.driver.as_str(), r.state));
+        let row = [t.intern(b"added"), t.intern(r.device.as_str().as_bytes()), t.intern(b"-"), t.intern(is.as_str().as_bytes())];
+        t.add_row(&row);
+    }
+    Some((t, same))
+}
+
+fn hw_compare(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, f: &HwFacts, path: &str) -> Result<(), ShellError> {
+    let Some((t, same)) = build_hw_compare(ctx, cwd, f, path) else { return Err(ShellError::Unknown) };
+    hw_grid(ctx, out, &t, "(no change)");
+    out.line(ctx, "");
+    out.line_fmt(ctx, format_args!("{} changed, {} unchanged - kind, driver and state are compared; the live detail column is not", t.nrows(), same));
+    Ok(())
+}
+
+/// `hardware events`: what has happened to the devices, as the supervisor saw it - a driver's death and
+/// restart, a USB device attached or gone (`supcmd::EVENTS`). Records: `time` (uptime), `device`,
+/// `event`, `detail`. The kernel's own part - grants, confinement, releases, resets - is not recorded,
+/// because `hardware` makes no kernel change; the view says so, and says from when its record runs.
+#[inline(never)]
+fn build_hw_events(ctx: &ServiceContext, f: &HwFacts) -> Option<(Table, u32, u32)> {
+    use godspeed_sdk::service_context::supcmd;
+    let m = hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::EVENTS])?;
+    let p = m.payload_bytes();
+    if p.len() < 10 || p[0] != supcmd::OK { return None; }
+    let since = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+    let recorded = u32::from_le_bytes([p[5], p[6], p[7], p[8]]);
+    let count = p[9] as usize;
+    let mut t = Table::new(&["time", "device", "event", "detail"]);
+    let mut at = 10usize;
+    for _ in 0..count {
+        if at + 10 > p.len() { break; }
+        let secs = u32::from_le_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
+        let what = p[at + 4];
+        let vid = u16::from_le_bytes([p[at + 5], p[at + 6]]);
+        let pid = u16::from_le_bytes([p[at + 7], p[at + 8]]);
+        let nl = p[at + 9] as usize;
+        if at + 10 + nl > p.len() { break; }
+        let name = core::str::from_utf8(&p[at + 10..at + 10 + nl]).unwrap_or("?");
+        at += 10 + nl;
+        // The device, named as the overview names it: a USB device by its IDs, a driver's device by
+        // the row it drives - or the driver's name, when its device is not in the view now.
+        let device = if vid != 0 || pid != 0 {
+            HwText::<16>::of(format_args!("{:04x}:{:04x}", vid, pid))
+        } else {
+            match f.rows[..f.n].iter().find(|r| r.driver.as_str() == name && r.section != "usb") {
+                Some(r) => r.device,
+                None => HwText::of(format_args!("{}", name)),
+            }
+        };
+        let (event, detail) = match what {
+            supcmd::EV_RESTARTED => ("driver died", HwText::<64>::of(format_args!("{}, restarted", name))),
+            supcmd::EV_RESTART_FAILED => ("driver died", HwText::of(format_args!("{}, restart FAILED", name))),
+            supcmd::EV_ATTACHED => ("attached", HwText::of(format_args!("{} started for it", name))),
+            supcmd::EV_DETACHED => ("removed", HwText::of(format_args!("{} stopped", name))),
+            supcmd::EV_SWEPT => ("driver died", HwText::of(format_args!("{}, found dead by the sweep and restarted", name))),
+            supcmd::EV_START_FAILED => ("attached", HwText::of(format_args!("{} could NOT be started for it", name))),
+            _ => ("event", HwText::of(format_args!("{} (code {})", name, what))),
+        };
+        let time = HwText::<12>::of(format_args!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60));
+        let row = [
+            t.intern(time.as_str().as_bytes()),
+            t.intern(device.as_str().as_bytes()),
+            t.intern(event.as_bytes()),
+            t.intern(detail.as_str().as_bytes()),
+        ];
+        t.add_row(&row);
+    }
+    Some((t, since, recorded))
+}
+
+fn hw_events(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) -> Result<(), ShellError> {
+    let Some((t, since, recorded)) = build_hw_events(ctx, f) else {
+        out.line(ctx, "hardware events: the supervisor did not answer - it keeps the record");
+        return Err(ShellError::Unknown);
+    };
+    hw_grid(ctx, out, &t, "(nothing has happened to a device since the supervisor started)");
+    out.line(ctx, "");
+    let lost = recorded.saturating_sub(t.nrows() as u32);
+    out.line_fmt(ctx, format_args!(
+        "time is uptime; recorded by the supervisor since {:02}:{:02}:{:02}, when it last started and finished its boot spawns{}",
+        since / 3600, (since / 60) % 60, since % 60,
+        if lost > 0 { HwText::<48>::of(format_args!(", {} older event(s) overwritten", lost)) } else { HwText::EMPTY }.as_str()));
+    out.line(ctx, "not recorded: what the kernel does - grants, IOMMU confinement and release, controller resets");
+    Ok(())
+}
+
+/// `hardware` or `hardware <sections>` as records (`docs/hardware-design.md` 3). `#[inline(never)]`
+/// like the other builders: the facts and the table are kept off every other pipeline's frame.
+#[inline(never)]
+fn build_hardware_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
+    match arg.trim() {
+        "interrupts" => return build_hw_interrupts_table(ctx),
+        "firmware" => return Some(build_hw_firmware(ctx)),
+        a @ ("problems" | "tree" | "events") => {
+            let mut f = HwFacts {
+                rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+                pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+            };
+            hw_gather(ctx, &mut f);
+            return match a {
+                "problems" => Some(build_hw_problems(ctx, &f)),
+                "tree" => Some(build_hw_tree(ctx, &f)),
+                _ => match build_hw_events(ctx, &f) {
+                    Some((t, _, _)) => Some(t),
+                    None => {
+                        ctx.console_writeln("hardware events: the supervisor did not answer - it keeps the record");
+                        None
+                    }
+                },
+            };
+        }
+        a if a.starts_with("compare ") => {
+            let mut f = HwFacts {
+                rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+                pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+            };
+            hw_gather(ctx, &mut f);
+            return build_hw_compare(ctx, cwd, &f, a["compare".len()..].trim()).map(|(t, _)| t);
+        }
+        _ => {}
+    }
+    let mask = if arg.trim().is_empty() { 0xFF } else { hw_sections(arg)? };
+    let mut f = HwFacts {
+        rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+        pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+    };
+    hw_gather(ctx, &mut f);
+    if f.dropped > 0 {
+        ctx.console_writeln_fmt(format_args!("hardware: {} more row(s) did not fit - the view holds {}", f.dropped, HW_ROWS));
+    }
+    let mut t = Table::new(&["section", "device", "kind", "driver", "state", "detail"]);
+    for (i, sec) in HW_SECTIONS.iter().enumerate() {
+        if mask & (1 << i) == 0 { continue; }
+        if !hw_section_present(&f, sec) {
+            if !arg.trim().is_empty() {
+                ctx.console_writeln_fmt(format_args!("hardware: {}: {}", sec, hw_absent_reason(sec)));
+            }
+            continue;
+        }
+        for r in f.rows[..f.n].iter().filter(|r| r.section == *sec) {
+            let row = [
+                t.intern(r.section.as_bytes()),
+                t.intern(r.device.as_str().as_bytes()),
+                t.intern(r.kind.as_str().as_bytes()),
+                t.intern(r.driver.as_str().as_bytes()),
+                t.intern(r.state.as_bytes()),
+                if r.detail.n == 0 { Value::Empty } else { t.intern(r.detail.as_str().as_bytes()) },
+            ];
+            t.add_row(&row);
+        }
+    }
+    Some(t)
+}
+
+/// `hardware interrupts` as records: `device`, `route`, `driver`.
+#[inline(never)]
+fn build_hw_interrupts_table(ctx: &ServiceContext) -> Option<Table> {
+    let mut f = HwFacts {
+        rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+        pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+    };
+    hw_gather(ctx, &mut f);
+    let mut t = Table::new(&["device", "route", "driver"]);
+    if !f.pci_bus {
+        ctx.console_writeln("hardware: interrupts: no PCI bus the OS can read");
+        return Some(t);
+    }
+    for r in f.rows[..f.n].iter().filter(|r| r.section == "pci") {
+        let Some(d) = r.pci else { continue };
+        let Some(c) = hw_config(ctx, d.idx) else { continue };
+        let route = hw_irq_route(&c);
+        if route.as_str() == "none" { continue; }
+        let row = [
+            t.intern(r.device.as_str().as_bytes()),
+            t.intern(route.as_str().as_bytes()),
+            t.intern(r.driver.as_str().as_bytes()),
+        ];
+        t.add_row(&row);
+    }
+    Some(t)
+}
+
 /// Where the last-known-good time is recorded. Deliberately a plain visible file, not a hidden one: it is
 /// a fact about this machine an operator may want to read or delete (§26.4 - keep the mechanism visible).
 const CLOCK_FLOOR_PATH: &[u8] = b"/clock.last";
@@ -6857,46 +8734,64 @@ fn clock_floor_seed(ctx: &ShellCtx) {
 /// floor is recorded at explicit moments only (`date sync`, and before `reboot`).
 fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    // `date sync` - fetch the time from the network (SNTP) via net-stack and set the wall clock. The Pi 2
-    // has no battery-backed RTC, so `date` reads zeros until this runs (also done automatically at boot).
+    // `date sync` - have the `time` service fetch the time from the network (NTP) now. The Pi 2
+    // has no battery-backed RTC, so the clock is unset until the network sets it: automatically when
+    // `time` reaches the network on its own (about every 20 s until it has the time), or immediately by
+    // this command.
     if arg == "sync" {
         // Seed the floor HERE, where it is used: it exists to let the kernel refuse a fetched time from
         // before we last ran, so the moment we are about to fetch one is exactly when it must be known.
         // Reading it at boot instead put fs I/O on the startup path at fs's slowest moment - see the note
         // in service_main for what that cost.
         clock_floor_seed(ctx);
-        out.line_fmt(ctx, format_args!("Asking the network for the time now (SNTP)... (q aborts)"));
-        // The budget must cover net-stack's WORST case, not a guess: op 10 can run SNTP_TRIES rounds of a
-        // DANCE_SECS drain (plus a DNS attempt) before it can honestly answer "no time". Timing out early
-        // and RE-SENDING would queue a second full sync behind the first, and net-stack's serve loop is
-        // single-threaded - so every other client op (net/ping/dns) would block behind our own retry.
-        // `net renew`, the sibling that also triggers the boot dance, uses 30 s for exactly this reason.
-        const SYNC_SECS: i64 = 30;
-        let outcome = ns_abortable(ctx, &[10u8], SYNC_SECS);
-        // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
-        if let ReqOutcome::Aborted = outcome {
-            out.line_fmt(ctx, format_args!("date sync: aborted"));
-            return Ok(());
-        }
-        let synced = match &outcome {
-            ReqOutcome::Reply(r) if r.payload_bytes().first() == Some(&1) && r.payload_bytes().len() >= 5 => {
-                let p = r.payload_bytes();
-                Some(u32::from_le_bytes([p[1], p[2], p[3], p[4]]))
-            }
-            _ => None,
-        };
-        let epoch = match synced {
-            Some(e) => e,
-            None => {
-                out.line_fmt(ctx, format_args!("date sync: no time from the network (is the cable in?)"));
+        out.line_fmt(ctx, format_args!("Asking the network for the time now (NTP, by the time service)... (q aborts)"));
+        // ASK `time`, THEN WATCH THE CLOCK (2026-10-01). The clock is the `time` service's, and so is
+        // fetching it: `net-stack` no longer runs the exchange, so a `ping` never waits behind a time
+        // server. `time` answers at once - "a query is on its way" - and the result shows up as the
+        // sync age in `OP_NOW` dropping to (about) zero. So this waits on a FACT about the clock rather
+        // than on any one reply, which is what lets nobody in the path block: `time` keeps answering
+        // `date` from memory, `net-stack` keeps serving, and only this command waits, bounded, with `q`.
+        //
+        // The bound covers `time`'s give-up (8 s) with room: a query lost in transit is retried by
+        // `time` itself, and the next sync on its own cadence still sets the clock.
+        const SYNC_WAIT_SECS: i64 = 10;
+        const SYNC_POLL_MS: u64 = 250;
+        match time_rpc(ctx, &[5]) {                  // OP_SYNC -> [1] query on its way, [0] could not send
+            Some(r) if r.payload_bytes().first() == Some(&1) => {}
+            Some(_) => {
+                out.line_fmt(ctx, format_args!("date sync: the clock service could not send the query (is net-stack running?)"));
                 return Ok(());
             }
-        };
-        // The floor is NOT recorded here. `net-stack` hands the epoch to `time`, and `time` persists
-        // its own floor at the moment the clock is set - it owns the clock, so it owns the clock's
-        // state (§3.8). The shell writing it as well was a second owner for one piece of state, and a
-        // second owner is how the two drift.
-        let _ = epoch;
+            None => {
+                out.line_fmt(ctx, format_args!("date sync: the clock service did not answer"));
+                return Ok(());
+            }
+        }
+        let t0 = ctx.epoch_secs_monotonic();
+        let mut synced = false;
+        loop {
+            let waited = ctx.epoch_secs_monotonic() - t0;
+            // Synced SINCE WE ASKED: an age no older than the wait so far. An older sync is not this one.
+            if matches!(time_synced_secs_ago(ctx), Some(age) if age <= waited) {
+                synced = true;
+                break;
+            }
+            if waited >= SYNC_WAIT_SECS { break; }
+            if let Some(b) = ctx.try_console_read() {
+                // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
+                if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
+                    out.line_fmt(ctx, format_args!("date sync: aborted (the clock service may still finish the sync)"));
+                    return Ok(());
+                }
+            }
+            ctx.sleep_ms(SYNC_POLL_MS);
+        }
+        if !synced {
+            out.line_fmt(ctx, format_args!("date sync: no time from the network (is the cable in?)"));
+            return Ok(());
+        }
+        // The floor is NOT recorded here. `time` persists its own floor at the moment the clock is set -
+        // it owns the clock, so it owns the clock's state (§3.8).
         // fall through to display the freshly-set time
     }
     let dt = Datetime::from_epoch_secs(time_now(ctx).unwrap_or(0));
@@ -6918,12 +8813,12 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         out.line_fmt(ctx, format_args!(
             "the clock is not set: this board has no RTC, so the time can only come from the network"));
         if linked {
-            // Precise about WHEN, because the retry is request-driven: net-stack re-asks at most once a
-            // minute, and only while it is handling a network request. On a machine nobody is using it
-            // does not fire on its own - net-stack deliberately has no idle tick (an earlier one stole
-            // client messages; see the note at its serve loop). So `date sync` is the reliable "now".
+            // Precise about WHEN. The `time` service asks net-stack for the network time on its own,
+            // about every 20 s while the clock is unset, and net-stack normally fetches it in the background
+            // without holding other clients (docs/networking.md 16). Network activity does not fetch it - it used to,
+            // and that is what held a `ping` behind a time server. `date sync` is the "now".
             out.line_fmt(ctx, format_args!(
-                "        the network is up; it re-tries on network activity, or 'date sync' asks now"));
+                "        the network is up; the clock service asks about every 20 s, or 'date sync' asks now"));
         } else {
             out.line_fmt(ctx, format_args!(
                 "        no network link - plug the cable in and it will set itself, or run 'date sync'"));
@@ -7075,7 +8970,14 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         sent += 1;
         // ABORTABLE per echo, so q quits DURING the wait for a reply, not only in the pace between echoes
         // (a blocking request_with_reply here left q feeling unresponsive). Reacquire once on a timeout.
+        let echo_t0 = ctx.read_tsc();
         let outcome = ns_abortable(ctx, &[3, ip[0], ip[1], ip[2], ip[3], bl[0], bl[1]], 5);
+        let echo_ms = ctx.read_tsc().wrapping_sub(echo_t0) / ctx.duration_cycles(1).max(1);
+        if echo_ms >= 1000 {
+            // The echo's own round trip is tens of milliseconds; a second here is the request waiting
+            // somewhere, and the log should say so next to net-stack's own account of it.
+            ctx.log_fmt(format_args!("shell: ping echo {} was answered after {} ms", sent, echo_ms));
+        }
         match outcome {
             ReqOutcome::Reply(r) => {
                 let p = r.payload_bytes();
@@ -7245,6 +9147,2760 @@ fn cmd_net(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
         return Err(ShellError::Unknown);
     }
     net_status(ctx, out)
+}
+
+// ---- audio (utilities/57_audio.md) ----------------------------------------------------------------------
+
+/// The audio drivers, one per kind of device, all speaking `sdk/audio`'s protocol: HD Audio on x86, the
+/// PWM jack on the Pis. A machine runs at most one; `audio` asks whichever it is.
+const AUDIO_DRIVERS: [&str; 2] = ["audio-driver", "pwm-audio"];
+
+/// The audio driver this machine runs, or `None` when it runs none.
+fn audio_driver(ctx: &ShellCtx) -> Option<&'static str> {
+    AUDIO_DRIVERS.iter().copied().find(|n| slot_of(ctx, n).is_some())
+}
+
+/// The `audio-driver` request/reply vocabulary: ONE definition, in the shared crate (`godspeed_audio::wire`),
+/// read by this shell and by the driver - the shape `wifi_wire` arrived at after a hand-kept mirror drifted.
+mod audio_wire {
+    pub use godspeed_audio::wire::*;
+}
+
+/// One question to the audio driver, answered at once or not at all.
+///
+/// Every audio answer is IMMEDIATE by design (`sdk/audio`'s `wire`): a tone is started and answered, then
+/// followed with status. So the radio's machinery for answers it is owed does not apply - but the TAG does,
+/// for the reason it exists (backlog/70): a receive takes what is next, and an answer to a request this
+/// shell gave up on must never be read as the answer to the next one. The wait takes only the reply
+/// carrying this request's tag; a late audio answer is passed over, and anything else that arrives is
+/// dropped with any capability it carries released, as `wifi_sift` does.
+fn audio_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
+    let t = ctx.audio_tag.get().wrapping_add(1);
+    let tag = if t == 0 { 1 } else { t };
+    ctx.audio_tag.set(tag);
+    let mut msg = Message::from_bytes(&[audio_wire::TAGGED, tag]);
+    let k = req.len().min(msg.payload.len() - 2);
+    msg.payload[2..2 + k].copy_from_slice(&req[..k]);
+    msg.payload_len = 2 + k;
+    let sift = |m: &Message| -> bool {
+        match m.payload_bytes() {
+            [audio_wire::TAGGED, t, ..] => *t == tag,
+            _ => {
+                while let Some(c) = ctx.take_pending_cap() {
+                    ctx.remove_cap(c);
+                }
+                false
+            }
+        }
+    };
+    // A send that fails at once is a stale capability (the driver restarted since this shell wired it),
+    // never a deadline: reacquire by name and send ONCE. A real timeout is never re-sent.
+    let driver = audio_driver(ctx)?;
+    let s0 = ctx.read_tsc();
+    let mut got = ctx.request_with_reply_ms_sifted(driver, &msg, max_ms, sift);
+    if got.is_none() && ctx.read_tsc().wrapping_sub(s0) < ctx.duration_cycles(250) {
+        if !ctx.reacquire_by_name(driver) {
+            return None;
+        }
+        got = ctx.request_with_reply_ms_sifted(driver, &msg, max_ms, sift);
+    }
+    got.map(|r| Message::from_bytes(r.payload_bytes().get(2..).unwrap_or(&[])))
+}
+
+/// How long an answer may take. Every op is quick; `audio on` after `off hard` resets the controller and
+/// restarts the command rings, which is the longest, and is well inside this.
+const AUDIO_REPLY_MS: u64 = 3000;
+
+/// `audio` - sound: what is playing, the volume, the codec's power, and a test tone.
+fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let arg = arg.trim();
+    // A bare utility name prints usage (`0_conventions.md` rule 1).
+    if arg.is_empty() {
+        util_help(ctx, "audio");
+        return Ok(());
+    }
+    let (verb, rest) = split_first(arg);
+    let rest = rest.trim();
+    // Argument shape first: a usage error is not a missing sound card.
+    match verb {
+        "status" | "info" | "mute" | "unmute" | "on" if !rest.is_empty() => {
+            out.line_fmt(ctx, format_args!("audio: `audio {}` takes nothing after it", verb));
+            return Err(ShellError::Unknown);
+        }
+        "off" if !rest.is_empty() && rest != "hard" => {
+            out.line_fmt(ctx, format_args!("audio: off takes `hard` or nothing, not '{}'", rest));
+            return Err(ShellError::Unknown);
+        }
+        "volume" if rest.is_empty() => {
+            out.line_fmt(ctx, format_args!("audio: usage: audio volume <0-100>  (e.g. audio volume 60) - the volume now is in `audio status`"));
+            return Err(ShellError::Unknown);
+        }
+        "tone" if rest.is_empty() => {
+            out.line_fmt(ctx, format_args!("audio: usage: audio tone <hz> [seconds]  (e.g. audio tone 440 2)"));
+            return Err(ShellError::Unknown);
+        }
+        "play" if rest.is_empty() => {
+            out.line_fmt(ctx, format_args!("audio: usage: audio play <path>  (e.g. audio play /music/test.wav)"));
+            return Err(ShellError::Unknown);
+        }
+        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" => {}
+        // Agreed and not built: said as such, never as a fault (docs/audio.md has the plan).
+        "outputs" | "output" | "debug" | "system" => {
+            out.line_fmt(ctx, format_args!("audio: `audio {}` is not built yet - docs/audio.md has where it comes in", verb));
+            return Err(ShellError::Unknown);
+        }
+        _ => {
+            out.line_fmt(ctx, format_args!(
+                "audio: unknown subcommand - try audio status, info, volume <0-100>, mute, unmute, on, off,"));
+            out.line_fmt(ctx, format_args!("       off hard, tone <hz> [seconds], play <path>, or audio help"));
+            return Err(ShellError::Unknown);
+        }
+    }
+    let volume = if verb == "volume" {
+        match rest.parse::<u8>() {
+            Ok(v) if v <= audio_wire::VOLUME_MAX => Some(v),
+            _ => {
+                out.line_fmt(ctx, format_args!("audio: volume is 0 to 100, not '{}'", rest));
+                return Err(ShellError::Unknown);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Then the hardware question, which every verb shares.
+    if audio_driver(ctx).is_none() {
+        out.line_fmt(ctx, format_args!("no audio hardware on this machine"));
+        out.line_fmt(ctx, format_args!("  (no audio driver is running - `audio-driver` on x86, `pwm-audio` on the Pis - so there is none to ask)"));
+        return Ok(());
+    }
+    match verb {
+        "status" => audio_status(ctx, out),
+        "info" => audio_info(ctx, out),
+        "volume" => audio_volume(ctx, out, volume.unwrap_or(0)),
+        "mute" => audio_mute(ctx, out, true),
+        "unmute" => audio_mute(ctx, out, false),
+        "on" => audio_power(ctx, out, audio_wire::POWER_ON),
+        "off" if rest == "hard" => audio_power(ctx, out, audio_wire::POWER_HARD_OFF),
+        "off" => audio_power(ctx, out, audio_wire::POWER_OFF),
+        "play" => audio_play(ctx, cwd, out, rest),
+        _ => audio_tone(ctx, out, rest),
+    }
+}
+
+/// The driver's answer had the status asked for and at least `len` bytes - or the sentence that says why
+/// not, already printed.
+fn audio_reply(ctx: &ShellCtx, out: &mut Out, r: Option<Message>, len: usize) -> Result<Message, ShellError> {
+    use audio_wire::*;
+    let Some(r) = r else {
+        out.line_fmt(ctx, format_args!("audio: the audio driver is not answering"));
+        return Err(ShellError::Unknown);
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(NO_DEVICE) => {
+            out.line_fmt(ctx, format_args!("audio: {}", match p.get(1).copied().unwrap_or(0) {
+                no_device::NO_CONTROLLER => "no audio hardware on this machine",
+                no_device::RESET_FAILED => "the controller is there and did not come out of reset - the serial log says more",
+                no_device::NO_CODEC => "the controller is up but no codec answered",
+                no_device::NO_PATH => "the codec offers no output this driver can use",
+                no_device::UNVERIFIED_CODEC => "this codec has not had playback verified yet - the driver surveyed it and stopped (docs/audio.md, A6)",
+                no_device::NO_ARENA => "the driver has no DMA memory to play from",
+                _ => "the driver could not bring the device up - the serial log says why",
+            }));
+            Err(ShellError::Unknown)
+        }
+        Some(OK) | Some(ALREADY) if p.len() >= len => Ok(r),
+        Some(OK) | Some(ALREADY) => {
+            out.line_fmt(ctx, format_args!("audio: the audio driver gave a short answer ({} bytes)", p.len()));
+            Err(ShellError::Unknown)
+        }
+        Some(s) => {
+            out.line_fmt(ctx, format_args!("audio: the audio driver refused that ({})", match s {
+                UNKNOWN_OP => "it does not know the request - the shell and the driver disagree about the protocol",
+                BAD_ARG => "an argument was out of range",
+                AUDIO_OFF => "audio is off - `audio on` first",
+                BUSY => "something is already playing",
+                _ => "an answer this shell does not know",
+            }));
+            Err(ShellError::Unknown)
+        }
+        None => {
+            out.line_fmt(ctx, format_args!("audio: the audio driver gave an empty answer"));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `- verified`, `- unverified` or `FAILED`, for the last byte of an answer to a change of state.
+fn audio_verdict(v: u8) -> &'static str {
+    match v {
+        audio_wire::VERIFIED => "- verified",
+        audio_wire::CONTRADICTED => "FAILED - the codec reads back something else (the serial log says what)",
+        audio_wire::UNSUPPORTED => "- unconfirmed (this codec does not report it, so it cannot say)",
+        _ => "- unverified (the codec could not be asked)",
+    }
+}
+
+fn audio_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS), STATUS_LEN)?;
+    let p = r.payload_bytes();
+    out.line_fmt(ctx, format_args!("audio      {}", match p[1] {
+        POWER_ON => "on",
+        POWER_HARD_OFF => "off (hard - the controller is held in reset; audio on brings it back)",
+        _ => "off (the codec is powered down; audio on brings it back)",
+    }));
+    if p[3] == 0 {
+        out.line_fmt(ctx, format_args!("volume     0 - silent"));
+    } else {
+        out.line_fmt(ctx, format_args!("volume     {}", p[3]));
+    }
+    out.line_fmt(ctx, format_args!("muted      {}", if p[2] != 0 { "yes - nothing will be heard" } else { "no" }));
+    out.line_fmt(ctx, format_args!("output     {}", device_name(p[20] as u32)));
+    if p[4] != 0 {
+        let (hz, len, at) = (get_u16(p, 5), get_u32(p, 7), get_u32(p, 11));
+        out.line_fmt(ctx, format_args!("playing    {} Hz, {}.{} s of {}.{} s",
+            hz, at / 1000, at % 1000 / 100, len / 1000, len % 1000 / 100));
+    } else {
+        out.line_fmt(ctx, format_args!("playing    nothing"));
+    }
+    out.line_fmt(ctx, format_args!("underruns  {}", get_u32(p, 15)));
+    Ok(())
+}
+
+fn audio_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_INFO], AUDIO_REPLY_MS), INFO_LEN)?;
+    let p = r.payload_bytes();
+    if p[26] == KIND_PWM {
+        // A jack driven by PWM: no codec to name, and the resolution is the PWM's own.
+        let (rate, ring, range) = (get_u32(p, 11), get_u32(p, 15), get_u16(p, 27) as u32);
+        let bits = 31 - range.max(1).leading_zeros();
+        out.line_fmt(ctx, format_args!("controller PWM, driving the 3.5 mm jack through the board's filter"));
+        out.line_fmt(ctx, format_args!("resolution {} steps per sample (about {} bits) at {} Hz", range, bits, rate));
+        out.line_fmt(ctx, format_args!("volume     applied to the samples by the driver - there is no amplifier"));
+        out.line_fmt(ctx, format_args!("ring       {} ms", ring as u64 * 1000 / (rate.max(1) as u64 * 4)));
+        out.line_fmt(ctx, format_args!("refill     by polling the DMA engine's position"));
+        return Ok(());
+    }
+    out.line_fmt(ctx, format_args!("controller HD Audio {}.{}", p[24], p[25]));
+    out.line_fmt(ctx, format_args!("codec      {:04x}:{:04x} at address {}", get_u16(p, 1), get_u16(p, 3), p[5]));
+    out.line_fmt(ctx, format_args!("path       converter {:#04x} -> pin {:#04x} ({})", p[6], p[7], device_name(p[8] as u32)));
+    if p[9] == 0 {
+        out.line_fmt(ctx, format_args!("amplifier  none - this codec's path has no volume to set"));
+    } else {
+        out.line_fmt(ctx, format_args!("amplifier  {} steps, now at step {}", p[9], p[10]));
+    }
+    let (rate, ring) = (get_u32(p, 11), get_u32(p, 15));
+    out.line_fmt(ctx, format_args!("format     {} Hz, 16-bit, stereo", rate));
+    out.line_fmt(ctx, format_args!("ring       {} bytes ({} ms)", ring, ring as u64 * 1000 / (rate.max(1) as u64 * 4)));
+    if p[19] != 0 {
+        out.line_fmt(ctx, format_args!("refill     on the stream's interrupt ({} so far)", get_u32(p, 20)));
+    } else {
+        out.line_fmt(ctx, format_args!("refill     by polling - no interrupt was routed to the driver"));
+    }
+    Ok(())
+}
+
+fn audio_volume(ctx: &ShellCtx, out: &mut Out, v: u8) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_VOLUME, v], AUDIO_REPLY_MS), 3)?;
+    let p = r.payload_bytes();
+    if p[2] == UNVERIFIED && audio_power_now(ctx) != Some(POWER_ON) {
+        out.line_fmt(ctx, format_args!("volume {} - kept; audio is off, so it is set at `audio on`", p[1]));
+    } else if p[1] == 0 {
+        out.line_fmt(ctx, format_args!("volume 0 - silent {}", audio_verdict(p[2])));
+    } else {
+        out.line_fmt(ctx, format_args!("volume {} {}", p[1], audio_verdict(p[2])));
+    }
+    if p[2] == CONTRADICTED { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+fn audio_mute(ctx: &ShellCtx, out: &mut Out, mute: bool) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_MUTE, mute as u8], AUDIO_REPLY_MS), 3)?;
+    let p = r.payload_bytes();
+    match (p[0], mute) {
+        (ALREADY, true) => out.line_fmt(ctx, format_args!("already muted")),
+        (ALREADY, false) => out.line_fmt(ctx, format_args!("not muted")),
+        (_, true) => out.line_fmt(ctx, format_args!("muted {}", audio_verdict(p[2]))),
+        (_, false) if p[1] == 0 => out.line_fmt(ctx, format_args!("unmuted - volume 0, silent {}", audio_verdict(p[2]))),
+        (_, false) => out.line_fmt(ctx, format_args!("unmuted - volume {} {}", p[1], audio_verdict(p[2]))),
+    }
+    if p[2] == CONTRADICTED { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+/// The power state now, from the driver; `None` if it could not be asked.
+fn audio_power_now(ctx: &ShellCtx) -> Option<u8> {
+    let r = audio_ask(ctx, &[audio_wire::OP_STATUS], AUDIO_REPLY_MS)?;
+    let p = r.payload_bytes();
+    (p.first() == Some(&audio_wire::OK) && p.len() >= audio_wire::STATUS_LEN).then(|| p[1])
+}
+
+fn audio_power(ctx: &ShellCtx, out: &mut Out, mode: u8) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_POWER, mode], AUDIO_REPLY_MS), 2)?;
+    let p = r.payload_bytes();
+    if p[0] == ALREADY {
+        out.line_fmt(ctx, format_args!("{}", if mode == POWER_ON { "already on" } else { "already off" }));
+        return Ok(());
+    }
+    match mode {
+        POWER_ON => {
+            // Say what came back with it, read live: the volume, the mute and the output re-applied.
+            let s = audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS);
+            match s.as_ref().map(|m| m.payload_bytes()) {
+                Some(q) if q.first() == Some(&OK) && q.len() >= STATUS_LEN => out.line_fmt(ctx, format_args!(
+                    "audio on - volume {}, {}, output {} {}",
+                    q[3], if q[2] != 0 { "muted" } else { "unmuted" }, device_name(q[20] as u32), audio_verdict(p[1]))),
+                _ => out.line_fmt(ctx, format_args!("audio on {}", audio_verdict(p[1]))),
+            }
+        }
+        POWER_HARD_OFF => out.line_fmt(ctx, format_args!(
+            "audio off (hard - the controller is held in reset; audio on brings it back) {}", audio_verdict(p[1]))),
+        _ => out.line_fmt(ctx, format_args!(
+            "audio off - the codec is powered down; audio on brings it back {}", audio_verdict(p[1]))),
+    }
+    if p[1] == CONTRADICTED { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+/// `audio tone <hz> [seconds]`: start the tone, then watch it with status until it has played, or until
+/// `q` - which STOPS it (rule 11: quitting ends the task, not just the shell's view of it).
+fn audio_tone(ctx: &ShellCtx, out: &mut Out, rest: &str) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let mut words = rest.split_whitespace();
+    let hz = match words.next().and_then(|w| w.parse::<u16>().ok()) {
+        Some(h) if (TONE_HZ_MIN..=TONE_HZ_MAX).contains(&h) => h,
+        _ => {
+            out.line_fmt(ctx, format_args!("audio: a tone is {} to {} Hz", TONE_HZ_MIN, TONE_HZ_MAX));
+            return Err(ShellError::Unknown);
+        }
+    };
+    // Seconds, whole or with tenths: `2`, `0.5`, `1.5`.
+    let ms = match words.next() {
+        None => 2000,
+        Some(w) => match parse_tenths(w) {
+            Some(t) if t >= 1 && t as u64 * 100 <= TONE_MS_MAX as u64 => t * 100,
+            _ => {
+                out.line_fmt(ctx, format_args!("audio: a tone lasts 0.1 to {} seconds, not '{}'", TONE_MS_MAX / 1000, w));
+                return Err(ShellError::Unknown);
+            }
+        },
+    };
+    if words.next().is_some() {
+        out.line_fmt(ctx, format_args!("audio: usage: audio tone <hz> [seconds]"));
+        return Err(ShellError::Unknown);
+    }
+    // Nothing is ever silent without saying why.
+    let before = audio_reply(ctx, out, audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS), STATUS_LEN)?;
+    let b = before.payload_bytes();
+    if b[1] != POWER_ON {
+        out.line_fmt(ctx, format_args!("audio is off - `audio on` first"));
+        return Err(ShellError::Unknown);
+    }
+    if b[2] != 0 {
+        out.line_fmt(ctx, format_args!("muted - nothing will be heard"));
+    } else if b[3] == 0 {
+        out.line_fmt(ctx, format_args!("volume is 0 - nothing will be heard"));
+    }
+    let under0 = get_u32(b, 15);
+    let mut req = [OP_TONE, 0, 0, 0, 0, 0, 0];
+    put_u16(&mut req, 1, hz);
+    put_u32(&mut req, 3, ms);
+    audio_reply(ctx, out, audio_ask(ctx, &req, AUDIO_REPLY_MS), 1)?;
+    ctx.console_writeln_fmt(format_args!("playing {} Hz for {}.{} s  [q] quit", hz, ms / 1000, ms % 1000 / 100));
+    // Watch: a status every 200 ms, the key every 50. Bounded by the tone's length plus five seconds, so a
+    // driver that stops answering costs this shell a bounded wait, never the prompt.
+    let t0 = ctx.read_tsc();
+    let limit = ctx.duration_cycles(ms as u64 + 5000);
+    let mut since_status = 0u32;
+    loop {
+        if let Some(k) = ctx.try_console_read() {
+            if k == b'q' || k == b'Q' || k == 0x1b {
+                let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS), 6)?;
+                let played = get_u32(r.payload_bytes(), 2);
+                out.line_fmt(ctx, format_args!("stopped after {}.{} s", played / 1000, played % 1000 / 100));
+                return Ok(());
+            }
+        }
+        ctx.sleep_ms(50);
+        since_status += 50;
+        if since_status < 200 {
+            continue;
+        }
+        since_status = 0;
+        let s = audio_reply(ctx, out, audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS), STATUS_LEN)?;
+        let p = s.payload_bytes();
+        if p[4] == 0 {
+            let under = get_u32(p, 15).saturating_sub(under0);
+            if under == 0 {
+                out.line_fmt(ctx, format_args!("played {} Hz for {}.{} s", hz, ms / 1000, ms % 1000 / 100));
+            } else {
+                out.line_fmt(ctx, format_args!("played {} Hz for {}.{} s, {} underrun(s)", hz, ms / 1000, ms % 1000 / 100, under));
+            }
+            return Ok(());
+        }
+        if ctx.read_tsc().wrapping_sub(t0) >= limit {
+            let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
+            out.line_fmt(ctx, format_args!("audio: the tone was still playing {} s after it should have ended - stopped", (ms / 1000) + 5));
+            return Err(ShellError::Unknown);
+        }
+    }
+}
+
+/// `2` -> 20, `0.5` -> 5, `1.5` -> 15: seconds in tenths. `None` for anything else.
+fn parse_tenths(w: &str) -> Option<u32> {
+    let (whole, frac) = match w.split_once('.') {
+        Some((a, b)) if b.len() == 1 => (a, b),
+        Some(_) => return None,
+        None => (w, "0"),
+    };
+    let whole: u32 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let tenth: u32 = frac.parse().ok()?;
+    whole.checked_mul(10)?.checked_add(tenth)
+}
+
+/// A WAV file's format and where its samples are, from its header.
+struct WavInfo {
+    rate: u32,
+    channels: u8,
+    bits: u16,
+    /// Byte offset of the samples in the file, and how many bytes of them there are (whole frames).
+    data_at: u64,
+    data_len: u64,
+}
+
+/// Read a WAV header from the first bytes of a file: `RIFF` / `WAVE`, then chunks until `fmt ` and
+/// `data` have both been seen. PCM only (format 1, or WAVE_FORMAT_EXTENSIBLE carrying PCM). `Err` is the
+/// sentence that says why not, ready to print.
+fn wav_parse(head: &[u8], file_len: u64) -> Result<WavInfo, &'static str> {
+    let le16 = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    if head.len() < 12 || &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return Err("is not a WAV file");
+    }
+    let mut at = 12usize;
+    let mut fmt: Option<(u16, u8, u32, u16)> = None;
+    while at + 8 <= head.len() {
+        let id = &head[at..at + 4];
+        let size = le32(head, at + 4) as u64;
+        let body = at + 8;
+        if id == b"fmt " {
+            if body + 16 > head.len() {
+                return Err("has a format chunk this reader cannot see whole");
+            }
+            let tag = le16(head, body);
+            // WAVE_FORMAT_EXTENSIBLE: the real format is the first two bytes of its sub-format GUID.
+            let tag = if tag == 0xFFFE && body + 26 <= head.len() { le16(head, body + 24) } else { tag };
+            fmt = Some((tag, le16(head, body + 2) as u8, le32(head, body + 4), le16(head, body + 14)));
+        } else if id == b"data" {
+            let Some((tag, channels, rate, bits)) = fmt else { return Err("has its samples before its format") };
+            if tag != 1 {
+                return Err("is compressed - this plays uncompressed PCM");
+            }
+            let frame = (bits as u64 / 8) * channels.max(1) as u64;
+            let avail = file_len.saturating_sub(body as u64);
+            let len = size.min(avail) / frame.max(1) * frame.max(1);
+            return Ok(WavInfo { rate, channels, bits, data_at: body as u64, data_len: len });
+        }
+        // Chunks are padded to an even length.
+        at = body + size as usize + (size as usize & 1);
+    }
+    Err("has no samples in the first 3.5 KiB - a header this large is not one this reader follows")
+}
+
+/// `m:ss` for a number of milliseconds.
+fn audio_clock(ms: u64) -> (u64, u64) {
+    let s = ms / 1000;
+    (s / 60, s % 60)
+}
+
+/// `audio play <path>`: read the file's header, open a stream at its format, then send the samples as
+/// the driver makes room, watching for `q` - which STOPS the sound (rule 11). The driver answers every
+/// send at once with the room it has left, so this never waits on the driver for longer than one
+/// answer; it waits on the RING, in 20 ms sleeps, when the ring is full.
+fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let mut pbuf = [0u8; PATH_MAX];
+    let Some(path) = resolve_or_err(ctx, cwd, arg, &mut pbuf) else { return Err(ShellError::Unknown) };
+    let size = match fs_stat_r(ctx, path) {
+        Ok(st) if !st.is_dir => st.size,
+        Ok(_) => {
+            out.line_fmt(ctx, format_args!("audio: {} is a directory", str_of(path)));
+            return Err(ShellError::Unknown);
+        }
+        Err(gs::Error::NotFound) => {
+            out.line_fmt(ctx, format_args!("audio: not found: {}", str_of(path)));
+            return Err(ShellError::FileNotFound);
+        }
+        Err(_) => {
+            out.line_fmt(ctx, format_args!("audio: storage unavailable"));
+            return Err(ShellError::Unknown);
+        }
+    };
+    let mut chunk = [0u8; IO_CHUNK];
+    let n = match fs_read_at(ctx, path, 0, &mut chunk) {
+        Some(n) => n,
+        None => {
+            out.line_fmt(ctx, format_args!("audio: storage error reading {}", str_of(path)));
+            return Err(ShellError::Unknown);
+        }
+    };
+    let w = match wav_parse(&chunk[..n], size) {
+        Ok(w) => w,
+        Err(why) => {
+            out.line_fmt(ctx, format_args!("audio: {} {}", str_of(path), why));
+            return Err(ShellError::Unknown);
+        }
+    };
+    if w.bits != 16 {
+        out.line_fmt(ctx, format_args!("audio: {} is {}-bit - this plays 16-bit PCM", str_of(path), w.bits));
+        return Err(ShellError::Unknown);
+    }
+    if w.channels != 1 && w.channels != 2 {
+        out.line_fmt(ctx, format_args!("audio: {} has {} channels - this plays mono or stereo", str_of(path), w.channels));
+        return Err(ShellError::Unknown);
+    }
+    let frame = 2 * w.channels as u64;
+    let frames = (w.data_len / frame).min(u32::MAX as u64) as u32;
+    let length_ms = frames as u64 * 1000 / w.rate.max(1) as u64;
+
+    // Nothing is ever silent without saying why.
+    audio_say_if_silent(ctx, out)?;
+    let mut req = [OP_OPEN, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    put_u32(&mut req, 1, w.rate);
+    req[5] = w.channels;
+    req[6] = 16;
+    put_u32(&mut req, 7, frames);
+    let r = audio_ask(ctx, &req, AUDIO_REPLY_MS);
+    if let Some(p) = r.as_ref().map(|m| m.payload_bytes()) {
+        if p.first() == Some(&FORMAT) {
+            out.line_fmt(ctx, format_args!("audio: {} is {} Hz - this codec plays 44100 or 48000 Hz", str_of(path), w.rate));
+            return Err(ShellError::Unknown);
+        }
+    }
+    let r = audio_reply(ctx, out, r, 5)?;
+    let mut free = get_u32(r.payload_bytes(), 1) as u64;
+    let (mm, ss) = audio_clock(length_ms);
+    ctx.console_writeln_fmt(format_args!("playing {} ({} Hz, 16-bit, {}, {}:{:02})  [q] quit",
+        str_of(path), w.rate, if w.channels == 2 { "stereo" } else { "mono" }, mm, ss));
+
+    // Send. A chunk is whole frames, at most one file read and one message.
+    let per_msg = (PCM_MAX.min(IO_CHUNK) as u64 / frame) * frame;
+    let mut sent = 0u64;
+    let mut msg = [0u8; 1 + PCM_MAX];
+    msg[0] = OP_PCM;
+    // Bounded: the file's own length twice over, plus ten seconds - a driver that stops taking samples
+    // costs this shell a bounded wait, never the prompt.
+    let t0 = ctx.read_tsc();
+    let limit = ctx.duration_cycles(length_ms * 2 + 10_000);
+    while sent < w.data_len {
+        if let Some(k) = ctx.try_console_read() {
+            if k == b'q' || k == b'Q' || k == 0x1b {
+                return audio_stop_said(ctx, out);
+            }
+        }
+        if ctx.read_tsc().wrapping_sub(t0) >= limit {
+            let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
+            out.line_fmt(ctx, format_args!("audio: the driver stopped taking samples - stopped"));
+            return Err(ShellError::Unknown);
+        }
+        // Send when a whole chunk fits; otherwise the ring is full.
+        let want = per_msg.min(w.data_len - sent);
+        if free * frame < want {
+            // The ring is full: wait for it to drain, and ask how much it has room for.
+            ctx.sleep_ms(20);
+            let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_PCM], AUDIO_REPLY_MS), 9)?;
+            free = get_u32(r.payload_bytes(), 5) as u64;
+            continue;
+        }
+        let got = match fs_read_at(ctx, path, w.data_at + sent, &mut msg[1..1 + want as usize]) {
+            Some(g) if g > 0 => (g as u64 / frame) * frame,
+            _ => {
+                let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
+                out.line_fmt(ctx, format_args!("audio: storage error reading {} - stopped", str_of(path)));
+                return Err(ShellError::Unknown);
+            }
+        };
+        let r = audio_reply(ctx, out, audio_ask(ctx, &msg[..1 + got as usize], AUDIO_REPLY_MS), 9)?;
+        let p = r.payload_bytes();
+        // Frames the driver did not take are sent again next time round, from where it stopped.
+        sent += get_u32(p, 1) as u64 * frame;
+        free = get_u32(p, 5) as u64;
+    }
+    audio_reply(ctx, out, audio_ask(ctx, &[OP_END], AUDIO_REPLY_MS), 1)?;
+
+    // Played out: watch status until the stream has stopped.
+    loop {
+        if let Some(k) = ctx.try_console_read() {
+            if k == b'q' || k == b'Q' || k == 0x1b {
+                return audio_stop_said(ctx, out);
+            }
+        }
+        ctx.sleep_ms(100);
+        let s = audio_reply(ctx, out, audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS), STATUS_LEN)?;
+        let p = s.payload_bytes();
+        if p[4] == PLAYING_NOTHING {
+            let sil = get_u32(p, 21);
+            if sil == 0 {
+                out.line_fmt(ctx, format_args!("played {}:{:02}", mm, ss));
+            } else {
+                out.line_fmt(ctx, format_args!("played {}:{:02}, {} ms of silence where the samples did not arrive in time", mm, ss, sil));
+            }
+            return Ok(());
+        }
+        if ctx.read_tsc().wrapping_sub(t0) >= limit {
+            let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
+            out.line_fmt(ctx, format_args!("audio: the stream was still playing long after it should have ended - stopped"));
+            return Err(ShellError::Unknown);
+        }
+    }
+}
+
+/// `q`: stop the sound, and say how far it got.
+fn audio_stop_said(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[audio_wire::OP_STOP], AUDIO_REPLY_MS), 6)?;
+    let played = audio_wire::get_u32(r.payload_bytes(), 2);
+    out.line_fmt(ctx, format_args!("stopped after {}.{} s", played / 1000, played % 1000 / 100));
+    Ok(())
+}
+
+/// Before playing: refuse if audio is off, and say so if nothing will be heard.
+fn audio_say_if_silent(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let before = audio_reply(ctx, out, audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS), STATUS_LEN)?;
+    let b = before.payload_bytes();
+    if b[1] != POWER_ON {
+        out.line_fmt(ctx, format_args!("audio is off - `audio on` first"));
+        return Err(ShellError::Unknown);
+    }
+    if b[2] != 0 {
+        out.line_fmt(ctx, format_args!("muted - nothing will be heard"));
+    } else if b[3] == 0 {
+        out.line_fmt(ctx, format_args!("volume is 0 - nothing will be heard"));
+    }
+    Ok(())
+}
+
+/// Which `audio` verbs may start a pipe: the REPORTS. The actions refuse, naming the reports (rule 12).
+fn audio_pipe_refusal(arg: &str) -> Option<&'static str> {
+    match arg.split_whitespace().next().unwrap_or("") {
+        "status" | "info" | "version" => None,
+        "" => Some("pipe: bare 'audio' prints its usage, which is not data - pipe a report: audio status or audio info"),
+        _ => Some("pipe: that 'audio' verb is an action, not a report, so it cannot start a pipe - the reports are: audio status and audio info"),
+    }
+}
+
+/// The services that can own a radio, in the order they are asked: the onboard radio's driver
+/// (`docs/wifi.md`), then a USB dongle's (`docs/wifi-usb.md`). Each answers the same protocol through the
+/// same serve loop (`godspeed_wifi::serve`), so which one is running is the only thing this shell needs
+/// to know. On a machine with BOTH, `wifi hardware use` chooses (`radio_in_use`).
+const RADIOS: [&str; 2] = ["wifi-driver", "wifi-usb"];
+
+/// The first of `RADIOS` with a live task, if any. A walk of every task slot (`slot_of`), so a command
+/// asks once and keeps the answer in `ShellCtx::wifi_radio`.
+fn find_radio(ctx: &ServiceContext) -> Option<&'static str> {
+    RADIOS.iter().copied().find(|r| slot_of(ctx, r).is_some())
+}
+
+/// `wifi` - join and inspect a wireless network (`utilities/56_wifi.md` is the surface; `docs/wifi.md` the
+/// design and the bring-up record).
+///
+/// Every verb here is a question put over IPC, by name, to whichever radio service is running (`RADIOS`:
+/// `wifi-driver` for an onboard radio, `wifi-usb` for a USB dongle), and the answers are that service's
+/// (`sdk/wifi/src/wire.rs`); this file formats them and asks for a passphrase where the driver says one
+/// is needed. The vocabulary lives once, in `wifi_wire`.
+///
+/// **On a machine with neither, the absence line is not a stub, it is the answer.** The T630 and the
+/// Wyse have no onboard radio, so "no wireless radio on this machine" is the answer there whenever no
+/// dongle is plugged in (`xhci` serves one when it is, `docs/wifi-usb.md` U2). That is why the absence path
+/// was built first rather than last: it is the only part that is correct on every board.
+///
+/// **Absence is told apart from a wedge**, because `utilities/56_wifi.md` section 5 says the user's
+/// real question is whose fault it is. `slot_of` - the same introspection `caps` uses - answers it: no
+/// live task by that name means no radio; a live task that will not answer is a different sentence and
+/// gets one. Neither is a timer: Commandment VIII wants the reply or the loud fact, never a guess.
+fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+    let arg = arg.trim();
+    // A bare utility name prints usage (`0_conventions.md` rule 1) - on every machine, radio or not. It used
+    // to alias `wifi status`, which was a second way to say one thing (rule 3).
+    if arg.is_empty() {
+        util_help(ctx, "wifi");
+        return Ok(());
+    }
+
+    // Argument shape first, because it does not depend on hardware and a usage error should not be
+    // reported as a missing radio. `connect` taking no passphrase argument is a SECURITY decision, not
+    // an ergonomic one (it would land in /.gsh_history, where an up-arrow recovers it), so a second
+    // word here is refused by name rather than ignored.
+    match arg {
+        "join" => {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi join <ssid>  (e.g. wifi join Bankole-WiFi)"));
+            return Err(ShellError::Unknown);
+        }
+        // The words this utility used until 2026-09-29. Not aliases (rule 3): a hint that teaches the word,
+        // the way `ls` answers `try dir`. `join` is what the 802.11 layer calls it and what the driver's log
+        // has always said; `connect` is the socket word and stays with `tcp`.
+        "connect" | "disconnect" => {
+            out.line_fmt(ctx, format_args!("wifi: `{}` is not a word here - try `wifi {}`", arg,
+                if arg == "connect" { "join <ssid>" } else { "leave" }));
+            return Err(ShellError::Unknown);
+        }
+        "forget" => {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi forget <ssid>  (e.g. wifi forget Bankole-WiFi)"));
+            return Err(ShellError::Unknown);
+        }
+        "radio" => {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi radio on | off | off hard | powercycle"));
+            return Err(ShellError::Unknown);
+        }
+        _ => {}
+    }
+    if let Some(rest) = arg.strip_prefix("connect ") {
+        out.line_fmt(ctx, format_args!("wifi: `connect` is not a word here - try `wifi join {}`",
+            rest.trim().split_whitespace().next().unwrap_or("<ssid>")));
+        return Err(ShellError::Unknown);
+    }
+    if let Some(rest) = arg.strip_prefix("join ") {
+        if rest.trim().split_whitespace().count() > 1 {
+            out.line_fmt(ctx, format_args!(
+                "wifi: join takes only an SSID - the passphrase is asked for, never typed on the"));
+            out.line_fmt(ctx, format_args!(
+                "      command line, because a command line is recalled by up-arrow and written to"));
+            out.line_fmt(ctx, format_args!("      /.gsh_history. Try: wifi join {}", rest.trim().split_whitespace().next().unwrap_or("<ssid>")));
+            return Err(ShellError::Unknown);
+        }
+    }
+    // `wifi hardware` is a report about which radios EXIST, so it is answered before the question every
+    // other verb shares - and on a machine with none, "none" is its answer (`utilities/56_wifi.md` 11).
+    if arg == "hardware" {
+        return wifi_hardware(ctx, out);
+    }
+    if let Some(rest) = arg.strip_prefix("hardware ") {
+        let rest = rest.trim();
+        if rest == "use" {
+            out.line_fmt(ctx, format_args!("wifi: usage: wifi hardware use <radio>  (onboard or usb - wifi hardware lists them)"));
+            return Err(ShellError::Unknown);
+        }
+        if let Some(name) = rest.strip_prefix("use ") {
+            return wifi_hardware_use(ctx, out, name.trim());
+        }
+        return wifi_hardware_one(ctx, out, rest);
+    }
+    if let Some(word) = arg.strip_prefix("radio ") {
+        let word = word.trim();
+        if word != "on" && word != "off" && word != "off hard" && word != "powercycle" {
+            out.line_fmt(ctx, format_args!("wifi: radio takes `on`, `off`, `off hard` or `powercycle`, not '{}'", word));
+            return Err(ShellError::Unknown);
+        }
+    }
+    let known = arg.is_empty()
+        || matches!(arg, "scan" | "list" | "status" | "info" | "debug" | "leave" | "stored")
+        || arg.starts_with("debug ")
+        || arg.starts_with("join ") || arg.starts_with("forget ") || arg.starts_with("radio ");
+    if !known {
+        out.line_fmt(ctx, format_args!(
+            "wifi: unknown subcommand - try wifi, wifi scan, wifi list, wifi join <ssid>, wifi leave,"));
+        out.line_fmt(ctx, format_args!("      wifi stored, wifi forget <ssid>, wifi radio on|off|off hard|powercycle, wifi hardware, or wifi help"));
+        return Err(ShellError::Unknown);
+    }
+
+    // Then the hardware question, which every verb shares: the radio in use, which the operator may have
+    // chosen (`wifi hardware use`), else the first running one.
+    match radio_in_use(ctx) {
+        None => {
+            out.line_fmt(ctx, format_args!("no wireless radio on this machine"));
+            // Say WHY rather than only what, so a reader on a board that HAS a radio knows where to
+            // look. Asking is never an error (`utilities/56_wifi.md` section 5), so this is Ok.
+            out.line_fmt(ctx, format_args!(
+                "  (neither `{}` nor `{}` is running - this machine has no radio, or none is driven yet)",
+                RADIOS[0], RADIOS[1]));
+            Ok(())
+        }
+        Some(radio) => {
+            ctx.wifi_radio.set(radio);
+            match arg {
+                "scan" => return wifi_scan(ctx, out),
+                "list" => return wifi_list(ctx, out),
+                "status" => return wifi_status(ctx, out),
+                "info" => return wifi_info(ctx, out),
+                "stored" => return wifi_stored(ctx, out),
+                "leave" => return wifi_leave(ctx, out),
+                "radio on" => return wifi_radio(ctx, out, true),
+                "radio off" => return wifi_radio(ctx, out, false),
+                "radio off hard" => return wifi_radio_hard_off(ctx, out),
+                "radio powercycle" => return wifi_radio_powercycle(ctx, out),
+                _ => {}
+            }
+            if let Some(ssid) = arg.strip_prefix("join ") {
+                return wifi_join_by_name(ctx, out, ssid.trim());
+            }
+            if let Some(ssid) = arg.strip_prefix("forget ") {
+                return wifi_forget(ctx, out, ssid.trim());
+            }
+            if arg == "debug" {
+                return wifi_debug(ctx, out, "");
+            }
+            if let Some(sub) = arg.strip_prefix("debug ") {
+                return wifi_debug(ctx, out, sub.trim());
+            }
+            // Every spec verb is routed above; what reaches here is a verb the shell parses and the driver (`docs/wifi.md` 6): there is
+            // nothing to list or delete until a credential can be held. Loud and specific: the one thing
+            // this must never do is imply the radio failed.
+            out.line_fmt(ctx, format_args!("wifi: `{}` is running, and this shell cannot ask it that yet", radio));
+            out.line_fmt(ctx, format_args!("  (`wifi {}` arrives with the phase that needs it - `docs/wifi.md` has the phases)",
+                arg.split_whitespace().next().unwrap_or("status")));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// The `wifi-driver` request/reply vocabulary: ONE definition, in the shared crate (`godspeed_wifi::wire`),
+/// read by this shell and by every radio driver. It used to be a hand-kept mirror of the driver's
+/// constants here - the same fact twice, kept equal by hope.
+mod wifi_wire {
+    pub use godspeed_wifi::wire::*;
+}
+
+/// One bounded question to the driver, reacquiring it by name once if the send never left.
+///
+/// The shell is spawned BEFORE the wifi driver, so at spawn there was no cap to wire and the first request
+/// has nowhere to go: the SDK reports that as an immediate `Err`, not a lapsed deadline (`Ok(None)`). Observed on
+/// hardware as "not answering" in 15 ms. The name directory resolves the driver that is running now; a
+/// driver that is genuinely dead fails the reacquire and the caller's loud sentence stays true.
+fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
+    // A DEADLINE IS NEVER RE-SENT, AND THE REPLY IS THE ONE CARRYING THIS REQUEST'S TAG (`wifi_sift`); the
+    // drain clears what is already queued, and late tagged answers are counted off `owed`. This used
+    // `request_with_reply_ms`,
+    // which takes the next message in this shell's queue whatever it answers, and on its deadline
+    // reacquired the driver and SENT THE REQUEST AGAIN. Boot 2026-09-30 14:51: the driver took three
+    // seconds over the first `wifi scan`, the shell gave up and sent a second, the driver answered both -
+    // one sweep started, one "already scanning" - and from then on every reply the shell read was the
+    // answer to the PREVIOUS command: `wifi scan` said "refused" while the driver logged "accepted", `wifi
+    // list` got a reply it did not understand, `wifi radio on` was told the power command was not taken.
+    // A late answer is not a refusal, and a re-sent request is a second request.
+    //
+    // THE QUEUE IS DRAINED FIRST: anything queued before a request is stale by construction. History, and
+    // why the tag below exists: this used the `Call` form, which takes "the oldest queued message SENT BY"
+    // the driver (the kernel's `dequeue_reply_locked`) - it matches by SENDER - so a late answer to a request
+    // this shell already gave up on was read as the answer to whatever was asked next. Draining only after a deadline, as this
+    // did, is too early: the abandoned answer has not arrived yet. Boot 2026-10-01 13:58: the powercycle
+    // watch gave up on six status polls while the driver brought a cold chip up, the driver answered all
+    // six once it was serving, and every later command read the next one - `wifi radio on` said "already
+    // on", `wifi radio off` "already off", `wifi status` "joined 0 s ago" for a minute, and a stale OK made
+    // `powercycle` kill the driver in the middle of its power cycle, leaving the chip unpowered. The shell
+    // asks one thing at a time and reads keys from the kernel ring, so anything queued before a request
+    // is stale by construction (`wifi_drain_stale`).
+    //
+    // AND EVERY ANSWER IS RECOGNISED BY ITS TAG (backlog/70). The drain could not clear an answer still in
+    // flight, so the shell COUNTED what it was owed and skipped that many - and counted them by watching
+    // its reply mailbox, which takes every peer's replies: a late `time` or `fs` answer cancelled an owed
+    // radio answer, and the next request read the old one (reproduced in QEMU, 2026-10-02). The tag is a
+    // fact in the reply itself. A request goes out as `[TAGGED, tag, op...]`, the wait takes only the reply
+    // carrying that tag, and a reply carrying an OLDER tag is the late answer it is - counted off `owed`
+    // by `wifi_sift`, which is now exact. The wait is the sifted one on the main endpoint, not the Call:
+    // a Call can only take the oldest reply FROM the driver, which is the very thing that is wrong.
+    ctx.wifi_unsent.set(0);
+    let (late, other) = wifi_drain_stale(ctx);
+    if late + other > 0 {
+        ctx.log_fmt(format_args!(
+            "shell: {} stale message(s) cleared before op {:#04x} ({} of them late radio answers)",
+            late + other, req.first().copied().unwrap_or(0), late));
+    }
+    // WAIT FOR WHAT IS STILL OWED, and do not ask again until it has come. A driver that still owes answers
+    // is busy (bringing a chip up, typically), and a request queued behind them waits as long anyway while
+    // holding a slot of the driver's queue, which `nic-driver`'s frames share. Boot 2026-10-01 14:30: the
+    // powercycle watch gave up on status polls while the driver brought a cold chip up. FORGIVEN AFTER A
+    // BOUND: an answer that never comes - the driver crashed and the supervisor, not this shell, respawned
+    // it; or it dropped the request - would hold `owed` above zero for ever. Longer than a cold bring-up
+    // (~12-15 s), so a busy driver is not forgiven.
+    const OWED_MAX_SECS: i64 = 30;
+    let owed = ctx.wifi_owed.get();
+    if owed > 0 && ctx.epoch_secs_monotonic() - ctx.wifi_owed_since.get() > OWED_MAX_SECS {
+        ctx.log_fmt(format_args!(
+            "shell: {} radio answer(s) owed for over {} s never came - forgotten; asking afresh", owed, OWED_MAX_SECS));
+        ctx.wifi_owed.set(0);
+    }
+    if ctx.wifi_owed.get() > 0 && !wifi_await_owed(ctx, max_ms) {
+        // NOTHING WAS SENT, and the caller must not say the driver failed to answer it: the request never
+        // left. `wifi_not_answering` reads this and says what happened.
+        ctx.wifi_unsent.set(ctx.wifi_owed.get());
+        return None;
+    }
+    let tag = next_wifi_tag(ctx);
+    let msg = wifi_tagged(req, tag);
+    let secs = ((max_ms + 999) / 1000).max(1) as i64;
+    let t0 = ctx.read_tsc();
+    // One attempt: the answer, and whether the request LEFT. A `None` that comes back at once is a send
+    // that failed (no send slot, or a dead driver), never a deadline.
+    let attempt = || {
+        let s0 = ctx.read_tsc();
+        let got = ctx.request_with_reply_ms_sifted(ctx.wifi_radio.get(), &msg, max_ms, |m| wifi_sift(ctx, m, Some(tag)));
+        let left = got.is_some() || ctx.read_tsc().wrapping_sub(s0) >= ctx.duration_cycles(250);
+        (got, left)
+    };
+    let (mut got, mut left) = attempt();
+    if !left {
+        // Reacquire and send ONCE - nothing is in flight to a live driver, so this is a first request, not
+        // a repeat. A respawned driver owes nothing: its dead predecessor's answers will never come.
+        ctx.wifi_owed.set(0);
+        if !ctx.reacquire_by_name(ctx.wifi_radio.get()) {
+            return None;
+        }
+        (got, left) = attempt();
+    }
+    if got.is_none() && left {
+        wifi_owe(ctx);
+    }
+    let got = got.map(|r| wifi_untag(&r));
+    if let Some(r) = got.as_ref() {
+        let p = r.payload_bytes();
+        if p.first().copied() == Some(wifi_wire::RADIO_DOWN) {
+            ctx.wifi_down_reason.set(p.get(1).copied().unwrap_or(0));
+        }
+    }
+    let took_ms = ctx.read_tsc().wrapping_sub(t0) / ctx.duration_cycles(1).max(1);
+    match &got {
+        Some(_) if took_ms >= 1000 => {
+            ctx.log_fmt(format_args!("shell: the radio driver answered op {:#04x} after {} ms", req.first().copied().unwrap_or(0), took_ms));
+        }
+        None if left => {
+            ctx.log_fmt(format_args!(
+                "shell: the radio driver did not answer op {:#04x} within {} s - its answer is owed ({} owed)",
+                req.first().copied().unwrap_or(0), secs, ctx.wifi_owed.get()));
+        }
+        _ => {}
+    }
+    got
+}
+
+/// The radio request correlation tag. Its own counter in `ShellCtx`, for the reason `fs_tag` and `net_tag`
+/// have theirs (Invariant 9). Never 0: that one is `wifi_wire::COMPLETION_TAG`.
+fn next_wifi_tag(ctx: &ShellCtx) -> u8 {
+    let t = ctx.wifi_tag.get().wrapping_add(1);
+    let t = if t == 0 { 1 } else { t };
+    ctx.wifi_tag.set(t);
+    t
+}
+
+/// `req` as a tagged request: `[TAGGED, tag, req...]`.
+fn wifi_tagged(req: &[u8], tag: u8) -> Message {
+    let mut m = Message::from_bytes(&[wifi_wire::TAGGED, tag]);
+    let k = req.len().min(m.payload.len() - 2);
+    m.payload[2..2 + k].copy_from_slice(&req[..k]);
+    m.payload_len = 2 + k;
+    m
+}
+
+/// A tagged answer without its tag: the reply as the driver wrote it.
+fn wifi_untag(r: &Message) -> Message {
+    let p = r.payload_bytes();
+    Message::from_bytes(p.get(2..).unwrap_or(&[]))
+}
+
+/// Is this an answer from the radio driver - and, when `tag` is given, the answer carrying it?
+fn wifi_is_answer(m: &Message, tag: Option<u8>) -> bool {
+    match m.payload_bytes() {
+        [wifi_wire::TAGGED, t, ..] => tag.map_or(true, |want| *t == want),
+        _ => false,
+    }
+}
+
+/// THE ONE PLACE A MESSAGE ON THIS SHELL'S ENDPOINT IS JUDGED while it waits on the radio. `true` for the
+/// answer carrying `tag`. A radio answer carrying any OTHER tag is late - a request this shell gave up on
+/// - and is counted off `wifi_owed`, which is how that count stays exact. Anything else is not the
+/// radio's, and is dropped with any cap it carries released (the shell reads keys from the kernel ring,
+/// not from this endpoint, so nothing it needs arrives here unasked).
+fn wifi_sift(ctx: &ShellCtx, m: &Message, tag: Option<u8>) -> bool {
+    if tag.is_some() && wifi_is_answer(m, tag) {
+        return true;
+    }
+    if wifi_is_answer(m, None) {
+        ctx.wifi_owed.set(ctx.wifi_owed.get().saturating_sub(1));
+    } else {
+        while let Some(c) = ctx.take_pending_cap() {
+            ctx.remove_cap(c);
+        }
+    }
+    false
+}
+
+/// One more answer the driver owes: a request that LEFT and was not answered in time.
+fn wifi_owe(ctx: &ShellCtx) {
+    if ctx.wifi_owed.get() == 0 {
+        ctx.wifi_owed_since.set(ctx.epoch_secs_monotonic());
+    }
+    ctx.wifi_owed.set(ctx.wifi_owed.get() + 1);
+}
+
+/// Wait up to `max_ms` for the driver's owed answers to arrive, discarding them (`wifi_sift`). `true` when
+/// nothing is owed any more.
+fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64) -> bool {
+    let t0 = ctx.read_tsc();
+    let limit = ctx.duration_cycles(max_ms);
+    while ctx.wifi_owed.get() > 0 && ctx.read_tsc().wrapping_sub(t0) < limit {
+        if let Some(m) = ctx.recv_timeout(ctx.duration_cycles(20)) {
+            wifi_sift(ctx, &m, None);
+        }
+    }
+    ctx.wifi_owed.get() == 0
+}
+
+/// A wifi request whose wait may be long enough to want a way out: `[q] quit` appears once the wait passes
+/// `hint_secs` (a power command carries a whole join behind it, three seconds on hardware; a leave is a
+/// disassociate and a DOWN), and `q` stops the WAIT - the driver finishes what it was asked regardless, and
+/// `wifi status` has the outcome. A "timeout" that comes back at once is a failed send (a respawned driver);
+/// it is reacquired and asked once more, as `wifi_ask` does. A real timeout is never re-sent.
+fn wifi_ask_q(ctx: &ShellCtx, req: &[u8], hint_secs: i64, max_secs: i64) -> ReqOutcome {
+    wifi_ask_keys(ctx, req, hint_secs, max_secs, || ctx.console_writeln("  [q] quit"))
+}
+
+/// The tagged, key-abortable radio request behind `wifi_ask_q` and the join. The answer is the one carrying
+/// this request's tag (`wifi_sift`); a request that LEFT and got none - abandoned with a key, or timed out
+/// - is owed, so its late answer is counted off when it comes.
+fn wifi_ask_keys(ctx: &ShellCtx, req: &[u8], hint_secs: i64, max_secs: i64, on_linger: impl Fn()) -> ReqOutcome {
+    let _ = wifi_drain_stale(ctx);
+    let tag = next_wifi_tag(ctx);
+    let msg = wifi_tagged(req, tag);
+    let ask = || {
+        let t0 = ctx.read_tsc();
+        let out = ctx.request_with_reply_keyhint_sifted(ctx.wifi_radio.get(), &msg, hint_secs, max_secs,
+            ServiceContext::QUIT_KEYS, &on_linger, |m| wifi_sift(ctx, m, Some(tag)));
+        (out, ctx.read_tsc().wrapping_sub(t0) < ctx.duration_cycles(250))
+    };
+    let (mut outcome, mut at_once) = ask();
+    if matches!(outcome, ReqOutcome::Timeout) && at_once && ctx.reacquire_by_name(ctx.wifi_radio.get()) {
+        ctx.wifi_owed.set(0);
+        (outcome, at_once) = ask();
+    }
+    match outcome {
+        ReqOutcome::Reply(r) => ReqOutcome::Reply(wifi_untag(&r)),
+        ReqOutcome::Timeout if at_once => ReqOutcome::Timeout,
+        other => {
+            wifi_owe(ctx);
+            other
+        }
+    }
+}
+
+/// The two ways a `wifi_ask_q` wait ends without an answer, said the same way everywhere.
+fn wifi_no_answer(ctx: &ShellCtx, out: &mut Out, outcome: &ReqOutcome, doing: &str) -> Result<(), ShellError> {
+    match outcome {
+        ReqOutcome::Aborted => {
+            out.line_fmt(ctx, format_args!("stopped waiting - the radio is still {}; `wifi status` has the outcome", doing));
+            Err(ShellError::Unknown)
+        }
+        _ => wifi_not_answering(ctx, out),
+    }
+}
+
+/// Clear stale replies: the reply MAILBOX first (`drain_stale_replies`), where other peers' late replies land
+/// and hold slots of a 16-deep queue, then the main endpoint, where radio answers arrive and are judged by
+/// their tag (`wifi_sift`). Everything queued here is stale by
+/// construction: the shell asks one thing at a time and reads console input from the kernel ring, not from
+/// its endpoint, and a late `net-stack` reply is discarded by its own tag check either way.
+///
+/// Returns `(late, other)`: late radio answers - recognised by their tag, and counted off `wifi_owed` by
+/// `wifi_sift` - and everything else. Until the tag (backlog/70) the count was set against every reply in
+/// the mailbox, which takes EVERY peer's replies: in QEMU a stray `[1, 4]` from another service cancelled
+/// an owed radio answer, the next `wifi status` was sent behind it, and it read the first one's answer.
+fn wifi_drain_stale(ctx: &ShellCtx) -> (u32, u32) {
+    // The REPLY MAILBOX: no radio answer lands there any more (the radio waits are on the main endpoint,
+    // so they can sift), but other peers' late replies do, and they hold slots of a 16-deep queue.
+    let mut other = ctx.drain_stale_replies() as u32;
+    let mut late = 0u32;
+    while let Some(m) = ctx.try_recv() {
+        if wifi_is_answer(&m, None) {
+            late = late.saturating_add(1);
+        } else {
+            other = other.saturating_add(1);
+        }
+        wifi_sift(ctx, &m, None);
+    }
+    (late, other)
+}
+
+/// The printable form of an SSID. The name is whatever the access point beacons and is NOT trusted to be
+/// text: bytes outside printable ASCII become dots rather than reaching the terminal as control codes, and
+/// a network that withholds its name prints `(hidden)`.
+fn wifi_ssid_text<'a>(ssid: &[u8], shown: &'a mut [u8; wifi_wire::SSID_MAX]) -> &'a str {
+    let len = core::cmp::min(ssid.len(), wifi_wire::SSID_MAX);
+    if len == 0 {
+        return "(hidden)";
+    }
+    for k in 0..len {
+        let c = ssid[k];
+        shown[k] = if (0x20..0x7F).contains(&c) { c } else { b'.' };
+    }
+    core::str::from_utf8(&shown[..len]).unwrap_or("(unprintable)")
+}
+
+/// The word beside a dBm figure, in every wifi view. The number is the fact and is always printed; the word
+/// is a stated rule over it, so a reader can check it: -50 or stronger excellent, -60 good, -70 fair, weaker
+/// is weak (`utilities/56_wifi.md` 3). In a row the word comes first and the header carries the unit; in
+/// `wifi status` and `wifi info` the word comes first too, with ` dBm` after the number (`excellent  -41 dBm`).
+fn wifi_signal_word(dbm: i32) -> &'static str {
+    if dbm >= -50 {
+        "excellent"
+    } else if dbm >= -60 {
+        "good"
+    } else if dbm >= -70 {
+        "fair"
+    } else {
+        "weak"
+    }
+}
+
+fn wifi_security_word(sec: u8) -> &'static str {
+    match sec {
+        0 => "open",
+        1 => "WEP",
+        2 => "WPA",
+        3 => "WPA2",
+        4 => "WPA2/WPA",
+        _ => "unknown",
+    }
+}
+
+/// One network as a row. Fixed-width columns, because the widest is known: an SSID is at most 32 bytes
+/// (the beacon field's size), so nothing is ever truncated (`utilities/56_wifi.md` 3). Numbered inside the
+/// `wifi scan` surface only; `wifi list` prints the same columns without the number, so a pipe never sees
+/// a number it did not ask for.
+fn wifi_row(ctx: &ShellCtx, out: &mut Out, number: Option<usize>, rec: &[u8]) {
+    let d = wifi_decode(rec);
+    let mut shown = [b'.'; wifi_wire::SSID_MAX];
+    let name = wifi_ssid_text(&d.ssid[..d.ssid_len], &mut shown);
+    let (band, word, rssi, security, note) = (d.band, d.word, d.rssi, d.security, d.note);
+    // NETWORK 32, BAND 6, SIGNAL as word then dBm (the header carries the unit once), SECURITY 8, NOTE.
+    // 78 columns with the number, so a serial terminal does not wrap.
+    match number {
+        Some(n) => out.line_fmt(ctx, format_args!("{:>2}  {:<32}  {:<6}  {:<9} {:>4}  {:<8}  {}", n, name, band, word, rssi, security, note)),
+        None => out.line_fmt(ctx, format_args!("{:<32}  {:<6}  {:<9} {:>4}  {:<8}  {}", name, band, word, rssi, security, note)),
+    }
+}
+
+/// One network record from the driver, decoded: the facts both the text row and the record row show.
+struct WifiRec {
+    ssid: [u8; wifi_wire::SSID_MAX],
+    ssid_len: usize,
+    band: &'static str,
+    word: &'static str,
+    rssi: i16,
+    security: &'static str,
+    note: &'static str,
+}
+
+/// Decode `bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security note` (`wifi_wire::RECORD`).
+fn wifi_decode(rec: &[u8]) -> WifiRec {
+    let rssi = i16::from_le_bytes([rec[6], rec[7]]);
+    let chanspec = u16::from_le_bytes([rec[8], rec[9]]);
+    let len = core::cmp::min(rec[10] as usize, wifi_wire::SSID_MAX);
+    let mut ssid = [0u8; wifi_wire::SSID_MAX];
+    ssid[..len].copy_from_slice(&rec[11..11 + len]);
+    // chanspec band bits 15:14 - 0 is 2.4 GHz, 3 is 5 GHz - and every value seen on hardware decodes under it.
+    let band = match chanspec >> 14 {
+        0 => "2.4GHz",
+        3 => "5GHz",
+        _ => "band?",
+    };
+    // NOTE: what a person picking this row most needs to know - is it the network we are on, is its key held.
+    let note = match rec[44] & (wifi_wire::NOTE_JOINED | wifi_wire::NOTE_SAVED) {
+        n if n & wifi_wire::NOTE_JOINED != 0 => "joined",
+        n if n & wifi_wire::NOTE_SAVED != 0 => "saved",
+        _ => "",
+    };
+    WifiRec { ssid, ssid_len: len, band, word: wifi_signal_word(rssi as i32), rssi, security: wifi_security_word(rec[43]), note }
+}
+
+/// The header above the numbered rows of `wifi scan`. `wifi list` prints none, so its output is records only.
+fn wifi_header(ctx: &ShellCtx, out: &mut Out) {
+    out.line_fmt(ctx, format_args!("    {:<32}  {:<6}  {:<14}  {:<8}  {}", "NETWORK", "BAND", "SIGNAL (dBm)", "SECURITY", "NOTE"));
+}
+
+/// The sentence for a driver that did not answer at all - the same one everywhere it can happen.
+fn wifi_not_answering(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    // Unless the request was never SENT: the driver still owed this shell answers to earlier requests, and
+    // asking again behind them is how a late answer gets read as a new one (`wifi_ask`). "Not answering"
+    // was the wrong sentence for that - the driver had not been asked.
+    let owed = ctx.wifi_unsent.get();
+    if owed > 0 {
+        out.line_fmt(ctx, format_args!(
+            "wifi: not sent - the radio driver still owes {} answer(s) to earlier requests (it is busy, typically bringing the chip up); try again in a few seconds",
+            owed));
+    } else {
+        out.line_fmt(ctx, format_args!("wifi: the radio driver is not answering"));
+    }
+    Err(ShellError::Unknown)
+}
+
+/// Restart the radio driver. A killed driver will never answer what it owed this shell, so the count of
+/// owed replies goes to zero with it (see `wifi_ask`).
+fn wifi_kill_driver(ctx: &ShellCtx) -> Result<(), ShellError> {
+    ctx.wifi_owed.set(0);
+    let _ = wifi_drain_stale(ctx);
+    cmd_kill(&**ctx, ctx.wifi_radio.get())
+}
+
+/// The states in which nothing can be asked of the radio (down, off, powered off), said the same way by
+/// every verb.
+fn wifi_radio_unavailable(ctx: &ShellCtx, out: &mut Out, status: u8) -> Result<(), ShellError> {
+    match status {
+        // WHY it is down, as the driver knows it - not a guess about when.
+        wifi_wire::RADIO_DOWN => match ctx.wifi_down_reason.get() {
+            1 => out.line_fmt(ctx, format_args!(
+                "wifi: the radio is down - its firmware trapped at start (the chip came up warm); `wifi radio powercycle` cuts its power and tries again")),
+            3 => out.line_fmt(ctx, format_args!(
+                "wifi: the radio is down - the driver found no working radio on its bus; `wifi radio powercycle` restores the chip's power and tries again")),
+            2 => out.line_fmt(ctx, format_args!(
+                "wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again")),
+            4 => out.line_fmt(ctx, format_args!(
+                "wifi: this board's radio is there, but its driver is not written yet (the AIC8800 - docs/wifi-aic8800.md); nothing here can bring it up")),
+            _ => out.line_fmt(ctx, format_args!(
+                "wifi: the radio is down; `wifi radio powercycle` tries again")),
+        },
+        wifi_wire::RADIO_OFF => out.line_fmt(ctx, format_args!("wifi: the radio is off - `wifi radio on` powers it")),
+        wifi_wire::RADIO_POWERED_OFF => out.line_fmt(ctx, format_args!("wifi: the chip is powered down (`wifi radio off hard`) - `wifi radio on` powers it up and starts the driver cold")),
+        _ => out.line_fmt(ctx, format_args!("wifi: the radio driver gave a reply this shell does not understand")),
+    }
+    Err(ShellError::Unknown)
+}
+
+/// `wifi scan` - ask the radio to sweep, show what it hears as it hears it, and end in a numbered picker
+/// (`utilities/56_wifi.md` 4). `q` stops the SWEEP, not just the watching (rule 11); `b` leaves it
+/// running and returns the prompt - the results land in the driver's cache for `wifi list`.
+fn wifi_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    /// How long one question to the driver may take. It answers between frames, so this is generous.
+    const REPLY_MS: u64 = 3000;
+    /// The pause between polls. Rows appear in batches about a second apart, so this is finer than the
+    /// data and coarse enough not to load the driver.
+    const POLL_MS: u64 = 150;
+    /// A sweep on hardware ends in about three seconds; this is the loud floor for one that does not end.
+    const MAX_SECS: i64 = 30;
+
+    let r = match wifi_ask(ctx, &[OP_SCAN_START], REPLY_MS) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    match r.payload_bytes().first().copied() {
+        Some(OK) => {}
+        Some(SCANNING) => out.line_fmt(ctx, format_args!("a sweep is already running - attaching to it")),
+        Some(SCAN_FAILED) => {
+            out.line_fmt(ctx, format_args!("wifi: the radio refused to start a sweep"));
+            return Err(ShellError::Unknown);
+        }
+        Some(s) => return wifi_radio_unavailable(ctx, out, s),
+        None => return wifi_not_answering(ctx, out),
+    }
+
+    out.line_fmt(ctx, format_args!("scanning  [q] quit  [b] background"));
+    wifi_header(ctx, out);
+
+    let t0 = ctx.epoch_secs_monotonic();
+    let mut records = [0u8; MAX_RECORDS * RECORD];
+    let mut shown = 0usize;
+    loop {
+        // KEYS FIRST, so a q pressed during the pause is acted on before another poll.
+        while let Some(b) = ctx.try_console_read() {
+            match b {
+                b'q' | b'Q' | 0x1b => {
+                    let heard = match wifi_ask(ctx, &[OP_SCAN_ABORT], REPLY_MS) {
+                        Some(r) => r.payload_bytes().get(1).copied().unwrap_or(shown as u8) as usize,
+                        None => return wifi_not_answering(ctx, out),
+                    };
+                    // The last complete scan stands; say what it is so the operator knows what `list` holds.
+                    match wifi_ask(ctx, &[OP_STATUS], REPLY_MS) {
+                        Some(s) if s.payload_bytes().len() >= 9 && s.payload_bytes()[3] == 1 => {
+                            let p = s.payload_bytes();
+                            let age = u32::from_le_bytes([p[5], p[6], p[7], p[8]]);
+                            out.line_fmt(ctx, format_args!(
+                                "scan stopped - {} heard, not kept; the last complete scan ({} networks, {} s ago) stands",
+                                heard, p[4], age));
+                        }
+                        _ => out.line_fmt(ctx, format_args!("scan stopped - {} heard, not kept; there is no complete scan to list", heard)),
+                    }
+                    return Ok(());
+                }
+                b'b' | b'B' => {
+                    out.line_fmt(ctx, format_args!("scan continues in the driver - wifi list when it finishes, wifi status meanwhile"));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        let r = match wifi_ask(ctx, &[OP_SCAN_POLL, shown as u8], REPLY_MS) {
+            Some(r) => r,
+            None => return wifi_not_answering(ctx, out),
+        };
+        let p = r.payload_bytes();
+        let status = p.first().copied().unwrap_or(0xFF);
+        match status {
+            SCANNING | SCAN_DONE => {
+                let mut at = 2;
+                while at + RECORD <= p.len() && shown < MAX_RECORDS {
+                    records[shown * RECORD..(shown + 1) * RECORD].copy_from_slice(&p[at..at + RECORD]);
+                    wifi_row(ctx, out, Some(shown + 1), &p[at..at + RECORD]);
+                    shown += 1;
+                    at += RECORD;
+                }
+            }
+            SCAN_FAILED => {
+                out.line_fmt(ctx, format_args!("wifi: the sweep fell silent and was discarded; the last complete scan stands"));
+                return Err(ShellError::Unknown);
+            }
+            NO_SCAN_YET => {
+                // The driver forgot a sweep this shell started: it was respawned underneath us.
+                out.line_fmt(ctx, format_args!("wifi: the driver restarted mid-sweep - run wifi scan again"));
+                return Err(ShellError::Unknown);
+            }
+            s => return wifi_radio_unavailable(ctx, out, s),
+        }
+        if status == SCAN_DONE {
+            break;
+        }
+        if ctx.epoch_secs_monotonic() - t0 >= MAX_SECS {
+            out.line_fmt(ctx, format_args!("wifi: the sweep has not finished in {} s - it continues in the driver; wifi status says", MAX_SECS));
+            return Err(ShellError::Unknown);
+        }
+        ctx.sleep_ms(POLL_MS);
+    }
+
+    let secs = ctx.epoch_secs_monotonic() - t0;
+    if secs <= 0 {
+        out.line_fmt(ctx, format_args!("{} networks in under a second", shown));
+    } else {
+        out.line_fmt(ctx, format_args!("{} networks in {} s", shown, secs));
+    }
+    if shown == 0 {
+        return Ok(());
+    }
+
+    // ---- The picker. Digits are not text here, so q is free to mean leave (rule 10a). ----
+    loop {
+        ctx.console_write("join: type a number and Enter, [q] quit: ");
+        let mut buf = [0u8; 8];
+        let n = read_input_line(ctx, false, &mut buf);
+        let typed = core::str::from_utf8(&buf[..n]).unwrap_or("").trim();
+        if typed.is_empty() || typed == "q" || typed == "Q" {
+            return Ok(());
+        }
+        let k = match typed.parse::<usize>() {
+            Ok(k) if (1..=shown).contains(&k) => k,
+            _ => {
+                out.line_fmt(ctx, format_args!("pick 1 to {}, or q", shown));
+                continue;
+            }
+        };
+        let rec = &records[(k - 1) * RECORD..k * RECORD];
+        wifi_row(ctx, out, Some(k), rec);
+        let len = core::cmp::min(rec[10] as usize, SSID_MAX);
+        let ssid = &rec[11..11 + len];
+        match rec[43] {
+            SEC_WEP => {
+                out.line_fmt(ctx, format_args!("WEP is not supported, and will not be (`utilities/56_wifi.md` 9) - pick another"));
+                continue;
+            }
+            // Open, stored or asked-for: the driver decides which from the cache and its slot, and this
+            // asks for a passphrase only when it says to.
+            _ => return wifi_join(ctx, out, ssid, &[]),
+        }
+    }
+}
+
+/// Ask for the passphrase invisibly and check its length. `None` means nothing was sent and the reason was
+/// printed. The buffer is the caller's, so the caller zeroes it - after the bytes have been used.
+fn wifi_read_passphrase(ctx: &ShellCtx, out: &mut Out, pass: &mut [u8; INPUT_MAX]) -> Option<usize> {
+    /// A WPA2 passphrase is 8 to 63 characters (IEEE 802.11i). Refused here, before anything is sent.
+    const MIN_PASS: usize = 8;
+    const MAX_PASS_CHARS: usize = 63;
+    ctx.console_write("passphrase (not shown): ");
+    let n = match read_input_line_abortable(ctx, true, pass) {
+        Some(n) => n,
+        None => {
+            out.line_fmt(ctx, format_args!("wifi: passphrase entry abandoned - nothing was sent"));
+            return None;
+        }
+    };
+    if n < MIN_PASS || n > MAX_PASS_CHARS {
+        for b in pass.iter_mut() { *b = 0; }
+        out.line_fmt(ctx, format_args!("wifi: a WPA2 passphrase is {} to {} characters - nothing was sent", MIN_PASS, MAX_PASS_CHARS));
+        return None;
+    }
+    Some(n)
+}
+
+/// `wifi join <ssid>` - the stable-identity path: a name, a passphrase asked for invisibly, a join.
+///
+/// The passphrase is read through `read_input_line(.., secret = true, ..)` - the same invisible-entry path
+/// `input secret` uses, which never echoes and is excluded from the recall ring and `/.gsh_history`
+/// (`utilities/56_wifi.md` 2 says why this is a security decision and not an ergonomic one). It lives in
+/// one stack buffer here and one request buffer in `wifi_join`, both zeroed before they return, and is
+/// never printed.
+fn wifi_join_by_name(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellError> {
+    if ssid.is_empty() || ssid.len() > wifi_wire::SSID_MAX {
+        out.line_fmt(ctx, format_args!("wifi: an SSID is 1 to {} bytes", wifi_wire::SSID_MAX));
+        return Err(ShellError::Unknown);
+    }
+    // No passphrase yet: the driver joins with its stored key, or open if the last sweep heard the network
+    // as open, and only otherwise says NEEDS_PASSPHRASE - at which point `wifi_join` asks. So a network
+    // joined once this boot is rejoined by name alone, and a passphrase is never asked for when it is not
+    // needed.
+    wifi_join(ctx, out, ssid.as_bytes(), &[])
+}
+
+/// Hand a name and a passphrase to the driver and report how the join went. An EMPTY passphrase means an
+/// open network - the picker's path for a row marked `open`.
+///
+/// The sentences are the spec's (`utilities/56_wifi.md` 5): a network that is not there is named, a refused
+/// passphrase says so rather than "connection failed", and a driver that does not answer says that after a
+/// bounded wait. Association is reported here; addressing is `net`'s to report, and neither editorialises
+/// about the other.
+fn wifi_join(ctx: &ShellCtx, out: &mut Out, ssid: &[u8], pass: &[u8]) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    /// The bound under the wait. A join completes in a few seconds; an access point that never answers is
+    /// named rather than waited out.
+    const MAX_SECS: i64 = 30;
+
+    let mut shown = [b'.'; SSID_MAX];
+    let name = wifi_ssid_text(ssid, &mut shown);
+    if ssid.is_empty() || ssid.len() > SSID_MAX || pass.len() > PASS_MAX {
+        out.line_fmt(ctx, format_args!("wifi: the name or passphrase is out of range - nothing was sent"));
+        return Err(ShellError::Unknown);
+    }
+
+    // At most two sends: one without a passphrase, and - only if the driver answers NEEDS_PASSPHRASE - one
+    // with. A loop rather than a recursive call, because a reply message is a few KiB of stack and this
+    // shell's stack is not deep.
+    let mut typed = [0u8; INPUT_MAX];
+    let mut pass: &[u8] = pass;
+    let mut asked = false;
+    let result = loop {
+        let mut req = [0u8; JOIN_REQ];
+        req[0] = OP_CONNECT;
+        req[1] = ssid.len() as u8;
+        req[2..2 + ssid.len()].copy_from_slice(ssid);
+        req[2 + SSID_MAX] = pass.len() as u8;
+        req[3 + SSID_MAX..3 + SSID_MAX + pass.len()].copy_from_slice(pass);
+
+        out.line_fmt(ctx, format_args!("joining {}  [q] quit", name));
+        // Reacquire and ask once more ONLY for a send that failed - which the abortable form reports as a
+        // `Timeout` that returns at once, since it cannot tell the two apart. A timeout that took its full
+        // thirty seconds is the driver not answering, and re-sending a join to it would be a second join
+        // whose answer arrives when nobody is listening (see `wifi_ask`).
+        // Tagged like every radio request (`wifi_ask_keys`); the "joining ... [q] quit" line above is the
+        // hint, so none is printed on a linger.
+        let outcome = wifi_ask_keys(ctx, &req, MAX_SECS + 1, MAX_SECS, || {});
+        for b in req.iter_mut() { *b = 0; }
+
+        let status = match &outcome {
+            ReqOutcome::Reply(r) => r.payload_bytes().first().copied(),
+            _ => None,
+        };
+        if status == Some(NEEDS_PASSPHRASE) && pass.is_empty() && !asked {
+            asked = true;
+            match wifi_read_passphrase(ctx, out, &mut typed) {
+                Some(n) => {
+                    pass = &typed[..n];
+                    continue;
+                }
+                None => break Err(ShellError::Unknown),
+            }
+        }
+        break wifi_join_outcome(ctx, out, name, outcome);
+    };
+    for b in typed.iter_mut() { *b = 0; }
+    result
+}
+
+/// The sentence for how a join ended - the spec's (`utilities/56_wifi.md` 5), one per reply status.
+fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutcome) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    match outcome {
+        ReqOutcome::Reply(r) => match r.payload_bytes().first().copied() {
+            Some(JOINED) => {
+                out.line_fmt(ctx, format_args!("joined {}", name));
+                out.line_fmt(ctx, format_args!("  (for the address, type net)"));
+                Ok(())
+            }
+            Some(ALREADY_JOINED) => {
+                out.line_fmt(ctx, format_args!("already joined {}", name));
+                Ok(())
+            }
+            Some(NEEDS_PASSPHRASE) => {
+                out.line_fmt(ctx, format_args!("not joined - {} needs a passphrase and none was given", name));
+                Err(ShellError::Unknown)
+            }
+            Some(NOT_FOUND) => {
+                out.line_fmt(ctx, format_args!("not joined - no network named {} in range", name));
+                Err(ShellError::Unknown)
+            }
+            Some(PASSPHRASE_REFUSED) => {
+                // The one way this arises: our message 2 carried a MIC the access point could not verify, so
+                // it repeated message 1 and gave up. Nothing else produces that pattern.
+                out.line_fmt(ctx, format_args!("not joined - incorrect passphrase"));
+                Err(ShellError::Unknown)
+            }
+            Some(JOIN_FAILED) => {
+                out.line_fmt(ctx, format_args!("not joined - the radio refused a step of joining {}", name));
+                Err(ShellError::Unknown)
+            }
+            Some(JOIN_TIMEOUT) => {
+                out.line_fmt(ctx, format_args!("not joined - no decision from {} within the wait", name));
+                Err(ShellError::Unknown)
+            }
+            Some(HANDSHAKE_UNIMPLEMENTED) => {
+                out.line_fmt(ctx, format_args!("not joined - {} began the WPA2 handshake, which this driver did not answer", name));
+                out.line_fmt(ctx, format_args!("  (no current driver gives this reply; the handshake is built - `docs/wifi.md` 40)"));
+                Err(ShellError::Unknown)
+            }
+            Some(s) => wifi_radio_unavailable(ctx, out, s),
+            None => wifi_not_answering(ctx, out),
+        },
+        ReqOutcome::Aborted => {
+            out.line_fmt(ctx, format_args!("not joined - aborted"));
+            Ok(())
+        }
+        ReqOutcome::Timeout => wifi_not_answering(ctx, out),
+    }
+}
+
+/// `wifi list` - the last complete scan, one record per network, instant. Never scans: a sweep in progress
+/// and no sweep yet are both ERRORS, because a derived view is not served as current when it is not
+/// (`utilities/56_wifi.md` 3).
+/// One radio, as `wifi hardware` shows it (`utilities/56_wifi.md` 11).
+struct WifiHw {
+    radio: &'static str,
+    chip: [u8; wifi_wire::HW_TEXT_MAX],
+    chip_len: usize,
+    bus: [u8; wifi_wire::HW_TEXT_MAX],
+    bus_len: usize,
+    state: &'static str,
+    network: [u8; wifi_wire::SSID_MAX],
+    network_len: usize,
+    in_use: bool,
+}
+
+/// Every radio service running now, asked what it is (`OP_HARDWARE`) and what it is doing (`OP_STATUS`),
+/// in `RADIOS` order. Named by what it is - `onboard`, `usb` - never by where (invariant 11). The radio in
+/// use is `radio_in_use`'s: the one that says it is (`OP_USE`, the operator's `wifi hardware use`), else the
+/// first running one. `nic-driver`'s bridge follows the same choice from the radios' own answers
+/// (`radio.rs`, `with_other`), so this row and the bridge agree. A radio that does not answer is still a
+/// row, saying so: a running service IS a radio this machine has.
+fn wifi_hardware_rows(ctx: &ShellCtx) -> [Option<WifiHw>; 2] {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    let mut rows: [Option<WifiHw>; 2] = [None, None];
+    let using = radio_in_use(ctx);
+    for (i, &svc) in RADIOS.iter().enumerate() {
+        if slot_of(ctx, svc).is_none() {
+            continue;
+        }
+        ctx.wifi_radio.set(svc);
+        let mut row = WifiHw {
+            radio: radio_name(svc),
+            chip: [0; HW_TEXT_MAX], chip_len: 0, bus: [0; HW_TEXT_MAX], bus_len: 0,
+            state: "not answering", network: [0; SSID_MAX], network_len: 0, in_use: using == Some(svc),
+        };
+        if let Some(r) = wifi_ask(ctx, &[OP_HARDWARE], REPLY_MS) {
+            let p = r.payload_bytes();
+            if p.first() == Some(&OK) {
+                let cl = (*p.get(1).unwrap_or(&0) as usize).min(HW_TEXT_MAX).min(p.len().saturating_sub(2));
+                row.chip[..cl].copy_from_slice(&p[2..2 + cl]);
+                row.chip_len = cl;
+                let at = 2 + cl;
+                let bl = (*p.get(at).unwrap_or(&0) as usize).min(HW_TEXT_MAX).min(p.len().saturating_sub(at + 1));
+                row.bus[..bl].copy_from_slice(&p[at + 1..at + 1 + bl]);
+                row.bus_len = bl;
+            }
+        }
+        if let Some(r) = wifi_ask(ctx, &[OP_STATUS], REPLY_MS) {
+            let p = r.payload_bytes();
+            row.state = match p.first().copied() {
+                Some(OK) if p.len() >= 30 + SSID_MAX => {
+                    if p[61] == 0 {
+                        "off hard"
+                    } else if p[9] == 0 {
+                        "off"
+                    } else if p[10] != 0 {
+                        let jlen = core::cmp::min(p[28] as usize, SSID_MAX);
+                        row.network[..jlen].copy_from_slice(&p[29..29 + jlen]);
+                        row.network_len = jlen;
+                        "joined"
+                    } else {
+                        "on"
+                    }
+                }
+                Some(OK) => "short reply",
+                Some(_) => "down",
+                None => "not answering",
+            };
+        }
+        rows[i] = Some(row);
+    }
+    ctx.wifi_radio.set(RADIOS[0]);
+    rows
+}
+
+/// `wifi hardware` on the console: one line per radio, `*` on the one in use; no radio is the answer, not
+/// an error (`utilities/56_wifi.md` 11).
+fn wifi_hardware(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    let rows = wifi_hardware_rows(ctx);
+    if rows.iter().all(|r| r.is_none()) {
+        out.line_fmt(ctx, format_args!("no wireless radio on this machine"));
+        out.line_fmt(ctx, format_args!(
+            "  (neither `{}` nor `{}` is running - this machine has no radio, or none is driven yet)",
+            RADIOS[0], RADIOS[1]));
+        return Ok(());
+    }
+    out.line_fmt(ctx, format_args!("{:<9}  {:<14}  {:<10}  {:<13}  {:<20}  {}", "RADIO", "CHIP", "BUS", "STATE", "NETWORK", "IN USE"));
+    for r in rows.iter().flatten() {
+        let chip = core::str::from_utf8(&r.chip[..r.chip_len]).unwrap_or("?");
+        let bus = core::str::from_utf8(&r.bus[..r.bus_len]).unwrap_or("?");
+        let mut shown = [b'.'; wifi_wire::SSID_MAX];
+        let net = if r.network_len == 0 { "-" } else { wifi_ssid_text(&r.network[..r.network_len], &mut shown) };
+        out.line_fmt(ctx, format_args!("{:<9}  {:<14}  {:<10}  {:<13}  {:<20}  {}",
+            r.radio, if chip.is_empty() { "?" } else { chip }, if bus.is_empty() { "?" } else { bus },
+            r.state, net, if r.in_use { "*" } else { "" }));
+    }
+    Ok(())
+}
+
+/// The radio every `wifi` verb addresses: the one that says it is in use (`wire::OP_USE`, the operator's
+/// choice in `/wifi.radio`), else the first running one in `RADIOS` order - which is also what a choice of
+/// a radio that is not running falls back to (`utilities/56_wifi.md` 11). With one radio running nothing
+/// is asked.
+fn radio_in_use(ctx: &ShellCtx) -> Option<&'static str> {
+    use wifi_wire::*;
+    let first = find_radio(ctx)?;
+    let running = RADIOS.iter().filter(|r| slot_of(ctx, r).is_some()).count();
+    if running < 2 {
+        return Some(first);
+    }
+    let mut found = None;
+    for &svc in RADIOS.iter() {
+        if slot_of(ctx, svc).is_none() {
+            continue;
+        }
+        ctx.wifi_radio.set(svc);
+        if let Some(r) = wifi_ask(ctx, &[OP_USE], 1500) {
+            if r.payload_bytes() == [OK, USE_THIS] {
+                found = Some(svc);
+                break;
+            }
+        }
+    }
+    ctx.wifi_radio.set(RADIOS[0]);
+    found.or(Some(first))
+}
+
+/// The network the radio `ctx.wifi_radio` names is joined to, if it is: `(ssid, len)`.
+fn wifi_joined_to(ctx: &ShellCtx) -> Option<([u8; wifi_wire::SSID_MAX], usize)> {
+    use wifi_wire::*;
+    let r = wifi_ask(ctx, &[OP_STATUS], 3000)?;
+    let p = r.payload_bytes();
+    if p.first() != Some(&OK) || p.len() < 30 + SSID_MAX || p[9] == 0 || p[10] == 0 {
+        return None;
+    }
+    let len = core::cmp::min(p[28] as usize, SSID_MAX);
+    let mut ssid = [0u8; SSID_MAX];
+    ssid[..len].copy_from_slice(&p[29..29 + len]);
+    Some((ssid, len))
+}
+
+/// Where the shell keeps the operator's choice (`wifi hardware use`); the radios and, through them,
+/// `nic-driver` read it (`godspeed_wifi::keyfile::RADIO_PATH`).
+const RADIO_FILE: &[u8] = b"/wifi.radio";
+
+/// `wifi hardware use <radio>` (`utilities/56_wifi.md` 11): make `radio` the one every `wifi` verb
+/// addresses and the one `nic-driver` carries frames through when the cable is out.
+///
+/// In this order, so a step that fails loses nothing: the chosen radio joins the network the radio in use
+/// is on (its key from `/wifi.keys`, which both drivers share; asked for if it is not held); only once it
+/// is joined is the choice written to `/wifi.radio` and told to every radio (`wire::OP_USE`); then the radio
+/// that was in use leaves and stays up. `nic-driver` follows on its next look at the radios. Choosing the
+/// default radio - the first running one - removes the file rather than writing it, so no choice is
+/// recorded.
+fn wifi_hardware_use(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    let svc = match wifi_radio_service(name) {
+        Some(s) if slot_of(ctx, s).is_some() => s,
+        _ => {
+            out.line_fmt(ctx, format_args!("wifi: no radio called '{}' - wifi hardware lists them", name));
+            return Err(ShellError::Unknown);
+        }
+    };
+    let cur = radio_in_use(ctx);
+    if cur == Some(svc) {
+        out.line_fmt(ctx, format_args!("wifi: {} is already the radio in use", name));
+        return Ok(());
+    }
+    let cur_name = cur.map(radio_name).unwrap_or("none");
+    // 1. The chosen radio joins the network the one in use is on, before anything moves.
+    let net = cur.and_then(|c| {
+        ctx.wifi_radio.set(c);
+        wifi_joined_to(ctx)
+    });
+    if let Some((ssid, len)) = net {
+        ctx.wifi_radio.set(svc);
+        let already = wifi_joined_to(ctx).is_some_and(|(s2, l2)| s2[..l2] == ssid[..len]);
+        if !already {
+            let mut shown = [b'.'; SSID_MAX];
+            out.line_fmt(ctx, format_args!("wifi: joining {} on {} first - {} keeps the link until it has",
+                wifi_ssid_text(&ssid[..len], &mut shown), name, cur_name));
+            if wifi_join(ctx, out, &ssid[..len], &[]).is_err() {
+                ctx.wifi_radio.set(RADIOS[0]);
+                out.line_fmt(ctx, format_args!("wifi: {} did not join, so nothing changed - {} is still the radio in use", name, cur_name));
+                return Err(ShellError::Unknown);
+            }
+        }
+    }
+    // 2. The choice, written, then told to every radio. The default radio clears the file instead.
+    let default = find_radio(ctx);
+    let recorded = if default == Some(svc) {
+        let mut probe = [0u8; 16];
+        sh_delete(ctx, RADIO_FILE) || fs_read_file(ctx, RADIO_FILE, &mut probe, 2).is_none()
+    } else {
+        sh_write_within(ctx, RADIO_FILE, name.as_bytes(), 4)
+    };
+    if !recorded {
+        ctx.wifi_radio.set(RADIOS[0]);
+        out.line_fmt(ctx, format_args!("wifi: /wifi.radio could not be written - nothing changed; {} is still the radio in use", cur_name));
+        return Err(ShellError::Unknown);
+    }
+    let told: &[u8] = if default == Some(svc) { &[] } else { name.as_bytes() };
+    let mut req = [0u8; 2 + 16];
+    req[0] = OP_USE;
+    req[1] = told.len() as u8;
+    req[2..2 + told.len()].copy_from_slice(told);
+    for &r in RADIOS.iter() {
+        if slot_of(ctx, r).is_some() {
+            ctx.wifi_radio.set(r);
+            let _ = wifi_ask(ctx, &req[..2 + told.len()], 1500);
+        }
+    }
+    // 3. The radio that was in use leaves its network and stays up.
+    if let (Some(c), Some(_)) = (cur, net) {
+        ctx.wifi_radio.set(c);
+        let _ = wifi_leave(ctx, out);
+    }
+    ctx.wifi_radio.set(RADIOS[0]);
+    out.line_fmt(ctx, format_args!(
+        "wifi: {} is the radio in use{} - the wifi verbs address it, and it carries the link when the cable is out (nic-driver follows within a few seconds)",
+        name, if default == Some(svc) { " (the default; /wifi.radio removed)" } else { "" }));
+    Ok(())
+}
+
+/// The service behind a radio's name in `wifi hardware` (`wifi_hardware_rows` names them).
+fn wifi_radio_service(name: &str) -> Option<&'static str> {
+    match name {
+        "onboard" => Some(RADIOS[0]),
+        "usb" => Some(RADIOS[1]),
+        _ => None,
+    }
+}
+
+/// `wifi hardware <radio>`: one radio in full (`utilities/56_wifi.md` 11a) - labelled lines, as `wifi info`
+/// gives, so it pipes the same way. The radio's name and driver, then the driver's own facts
+/// (`wire::OP_HARDWARE_DETAIL`), in the order `wire::DETAIL_LABELS` lists them, then its state.
+fn wifi_hardware_one(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    let svc = match wifi_radio_service(name) {
+        Some(s) if slot_of(ctx, s).is_some() => s,
+        _ => {
+            out.line_fmt(ctx, format_args!("wifi: no radio called '{}' - wifi hardware lists them", name));
+            return Err(ShellError::Unknown);
+        }
+    };
+    let rows = wifi_hardware_rows(ctx);
+    let row = rows.iter().flatten().find(|r| r.radio == name);
+    ctx.wifi_radio.set(svc);
+    let reply = wifi_ask(ctx, &[OP_HARDWARE_DETAIL], 3000);
+    ctx.wifi_radio.set(RADIOS[0]);
+    out.line_fmt(ctx, format_args!("{:<10} {}", "radio", name));
+    out.line_fmt(ctx, format_args!("{:<10} {}", "driver", svc));
+    match reply.as_ref().map(|m| m.payload_bytes()) {
+        Some(p) if p.first() == Some(&OK) => {
+            // Read every fact, then print them in `DETAIL_LABELS` order: the host gives its facts and the
+            // station its own after, so the reply's order is the driver's, not the reader's.
+            let count = p.get(1).copied().unwrap_or(0) as usize;
+            let mut facts: [(&[u8], &[u8]); 16] = [(&[], &[]); 16];
+            let mut n = 0;
+            let mut at = 2;
+            for _ in 0..count.min(facts.len()) {
+                let Some(&ll) = p.get(at) else { break };
+                let ll = ll as usize;
+                let Some(&vl) = p.get(at + 1 + ll) else { break };
+                let vl = vl as usize;
+                if at + 2 + ll + vl > p.len() {
+                    break;
+                }
+                facts[n] = (&p[at + 1..at + 1 + ll], &p[at + 2 + ll..at + 2 + ll + vl]);
+                n += 1;
+                at += 2 + ll + vl;
+            }
+            for label in DETAIL_LABELS {
+                if let Some((_, v)) = facts[..n].iter().find(|(l, _)| *l == label.as_bytes()) {
+                    out.line_fmt(ctx, format_args!("{:<10} {}", label, core::str::from_utf8(v).unwrap_or("?")));
+                }
+            }
+        }
+        Some(_) => out.line_fmt(ctx, format_args!("{:<10} {} refused the question - a driver older than `wifi hardware <radio>`", "details", svc)),
+        None => out.line_fmt(ctx, format_args!("{:<10} {} did not answer", "details", svc)),
+    }
+    match row {
+        Some(r) if r.network_len > 0 => {
+            let mut shown = [b'.'; SSID_MAX];
+            out.line_fmt(ctx, format_args!("{:<10} {} {}", "state", r.state, wifi_ssid_text(&r.network[..r.network_len], &mut shown)));
+        }
+        Some(r) => out.line_fmt(ctx, format_args!("{:<10} {}", "state", r.state)),
+        None => out.line_fmt(ctx, format_args!("{:<10} not answering", "state")),
+    }
+    out.line_fmt(ctx, format_args!("{:<10} {}", "in use", if row.is_some_and(|r| r.in_use) { "yes" } else { "no" }));
+    Ok(())
+}
+
+/// `wifi hardware` in a pipe: the same rows as records - `radio`, `chip`, `bus`, `state`, `network`,
+/// `in_use` (`yes`, or empty). No radio is no rows, with the reason on the console.
+fn build_wifi_hardware_table(ctx: &ShellCtx) -> Table {
+    let mut t = Table::new(&["radio", "chip", "bus", "state", "network", "in_use"]);
+    let rows = wifi_hardware_rows(ctx);
+    if rows.iter().all(|r| r.is_none()) {
+        ctx.console_writeln("wifi: no wireless radio on this machine");
+    }
+    for r in rows.iter().flatten() {
+        let mut shown = [b'.'; wifi_wire::SSID_MAX];
+        let net = if r.network_len == 0 { None } else { Some(wifi_ssid_text(&r.network[..r.network_len], &mut shown)) };
+        let row = [
+            t.intern(r.radio.as_bytes()),
+            t.intern(&r.chip[..r.chip_len]),
+            t.intern(&r.bus[..r.bus_len]),
+            t.intern(r.state.as_bytes()),
+            match net { Some(n) => t.intern(n.as_bytes()), None => Value::Empty },
+            if r.in_use { t.intern(b"yes") } else { Value::Empty },
+        ];
+        t.add_row(&row);
+    }
+    t
+}
+
+fn wifi_list(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    let r = wifi_list_fetch(ctx, out)?;
+    let p = r.payload_bytes();
+    let count = p.get(1).copied().unwrap_or(0) as usize;
+    if count == 0 {
+        // Not a row: `wifi list | count` must say 0. On the console it is the answer; in a pipe it is a note.
+        match out {
+            Out::Console => out.line_fmt(ctx, format_args!("no networks in range")),
+            _ => ctx.console_writeln("wifi: no networks in range"),
+        }
+        return Ok(());
+    }
+    for i in 0..count {
+        let at = 2 + i * RECORD;
+        if at + RECORD > p.len() {
+            out.line_fmt(ctx, format_args!("wifi: the reply ended after {} of {} network(s)", i, count));
+            break;
+        }
+        wifi_row(ctx, out, None, &p[at..at + RECORD]);
+    }
+    Ok(())
+}
+
+/// The driver's answer to `wifi list`, or the reason there is none said on `out` - a scan running, no scan
+/// yet, the radio down, no answer. Both forms of `wifi list` go through here, so they fail the same way.
+fn wifi_list_fetch(ctx: &ShellCtx, out: &mut Out) -> Result<Message, ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    let r = match wifi_ask(ctx, &[OP_LIST], REPLY_MS) {
+        Some(r) => r,
+        None => return Err(wifi_not_answering(ctx, out).err().unwrap_or(ShellError::Unknown)),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) => Ok(r),
+        Some(SCANNING) => {
+            out.line_fmt(ctx, format_args!("scanning - {} heard so far; wifi list when it finishes", p.get(1).copied().unwrap_or(0)));
+            Err(ShellError::Unknown)
+        }
+        Some(NO_SCAN_YET) => {
+            out.line_fmt(ctx, format_args!("no scan yet - run wifi scan"));
+            Err(ShellError::Unknown)
+        }
+        Some(s) => Err(wifi_radio_unavailable(ctx, out, s).err().unwrap_or(ShellError::Unknown)),
+        None => Err(wifi_not_answering(ctx, out).err().unwrap_or(ShellError::Unknown)),
+    }
+}
+
+/// `wifi list` in a pipe: one RECORD per network - `network`, `band`, `signal` (the word), `dbm` (the raw
+/// reading, a signed integer, so `sort reverse dbm` is strongest first and `where dbm>-60` works), `security`,
+/// `note` (`joined`, `saved`, or empty). The same decode as the text row (`wifi_decode`), so the two forms
+/// cannot disagree. A failure says why on the CONSOLE and builds nothing: an error is not a row.
+#[inline(never)]
+fn build_wifi_table(ctx: &ShellCtx) -> Option<Table> {
+    use wifi_wire::*;
+    let r = wifi_list_fetch(ctx, &mut Out::Console).ok()?;
+    let p = r.payload_bytes();
+    let count = p.get(1).copied().unwrap_or(0) as usize;
+    let mut t = Table::new(&["network", "band", "signal", "dbm", "security", "note"]);
+    if count == 0 {
+        ctx.console_writeln("wifi: no networks in range");
+    }
+    for i in 0..count {
+        let at = 2 + i * RECORD;
+        if at + RECORD > p.len() {
+            ctx.console_writeln_fmt(format_args!("wifi: the reply ended after {} of {} network(s)", i, count));
+            break;
+        }
+        let d = wifi_decode(&p[at..at + RECORD]);
+        let mut shown = [b'.'; SSID_MAX];
+        let name = wifi_ssid_text(&d.ssid[..d.ssid_len], &mut shown);
+        let row = [
+            t.intern(name.as_bytes()),
+            t.intern(d.band.as_bytes()),
+            t.intern(d.word.as_bytes()),
+            Value::Signed(d.rssi as i64),
+            t.intern(d.security.as_bytes()),
+            if d.note.is_empty() { Value::Empty } else { t.intern(d.note.as_bytes()) },
+        ];
+        t.add_row(&row);
+    }
+    if t.overflow() {
+        ctx.console_writeln("wifi: the network list did not fit in a record table - rows are missing");
+    }
+    Some(t)
+}
+
+/// `wifi status` - what is true NOW, as labelled lines so it pipes (`wifi status | match signal`).
+///
+/// The link facts are READ from the firmware on each call (`BSSID`, `RSSI`, `chanspec`), not remembered from
+/// the last join - except while a sweep runs, when the driver reports its memory and says the sweep is on.
+/// Addressing is `net`'s, deliberately; nothing here is an IP address.
+fn wifi_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    /// Reply: `[OK, sweeping, heard, has_cache, cache_count, age u32, radio_on, associated, bssid[6],
+    /// rssi i32, chanspec u16, security, joined_secs u32, ssid_len, ssid[32]]`.
+    const LEN: usize = 29 + SSID_MAX;
+    let r = match wifi_ask(ctx, &[OP_STATUS], REPLY_MS) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) if p.len() >= LEN => {}
+        Some(OK) => {
+            out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short status reply"));
+            return Err(ShellError::Unknown);
+        }
+        Some(s) => return wifi_radio_unavailable(ctx, out, s),
+        None => return wifi_not_answering(ctx, out),
+    }
+    if p[9] == 0 {
+        if p.get(61).copied() == Some(0) {
+            out.line_fmt(ctx, format_args!("radio      off (hard - the chip is powered down; wifi radio on powers it up)"));
+        } else {
+            out.line_fmt(ctx, format_args!("radio      off (soft - the firmware's switch; the chip stays powered; wifi radio on turns it back on)"));
+        }
+    } else {
+        out.line_fmt(ctx, format_args!("radio      on"));
+    }
+    if p[10] == 0 {
+        out.line_fmt(ctx, format_args!("network    none (not associated)"));
+    } else {
+        let jlen = core::cmp::min(p[28] as usize, SSID_MAX);
+        let mut shown = [b'.'; SSID_MAX];
+        let name = wifi_ssid_text(&p[29..29 + jlen], &mut shown);
+        let chanspec = u16::from_le_bytes([p[21], p[22]]);
+        let band = match chanspec >> 14 {
+            0 => "2.4GHz",
+            3 => "5GHz",
+            _ => "band?",
+        };
+        let rssi = i32::from_le_bytes([p[17], p[18], p[19], p[20]]);
+        let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+        out.line_fmt(ctx, format_args!("network    {}  {}", name, band));
+        // 0 dBm is not a reading - no receiver hears a signal that strong - it is the driver saying the
+        // firmware gave none, and a word derived from it would be a strength nobody measured.
+        if rssi == 0 {
+            out.line_fmt(ctx, format_args!("signal     unknown  (the firmware gave no reading)"));
+        } else {
+            out.line_fmt(ctx, format_args!("signal     {}  {} dBm", wifi_signal_word(rssi), rssi));
+        }
+        out.line_fmt(ctx, format_args!("security   {}", wifi_security_word(p[23])));
+        if since >= 120 {
+            out.line_fmt(ctx, format_args!("joined     {} min ago", since / 60));
+        } else {
+            out.line_fmt(ctx, format_args!("joined     {} s ago", since));
+        }
+    }
+    if p[1] != 0 {
+        out.line_fmt(ctx, format_args!("scan       running - {} heard so far", p[2]));
+    } else if p[3] != 0 {
+        let age = u32::from_le_bytes([p[5], p[6], p[7], p[8]]);
+        out.line_fmt(ctx, format_args!("last scan  {} s ago, {} networks", age, p[4]));
+    } else {
+        out.line_fmt(ctx, format_args!("last scan  none - run wifi scan"));
+    }
+    Ok(())
+}
+
+/// `wifi info` - the link in detail, from the same live read `wifi status` uses: name, bssid, band, channel,
+/// signal, security, time joined, and the scan facts. Addressing is `net`'s (spec section 1) and the last
+/// line says where to find it rather than printing a second copy of one truth.
+fn wifi_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    const LEN: usize = 29 + SSID_MAX;
+    let r = match wifi_ask(ctx, &[OP_STATUS], REPLY_MS) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) if p.len() >= LEN => {}
+        Some(OK) => {
+            out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short status reply"));
+            return Err(ShellError::Unknown);
+        }
+        Some(s) => return wifi_radio_unavailable(ctx, out, s),
+        None => return wifi_not_answering(ctx, out),
+    }
+    out.line_fmt(ctx, format_args!("radio       {}", if p[9] != 0 { "on" } else if p.get(61).copied() == Some(0) { "off (hard - powered down)" } else { "off (soft - the chip stays powered)" }));
+    if p[10] == 0 {
+        out.line_fmt(ctx, format_args!("network     none (not associated)"));
+    } else {
+        let jlen = core::cmp::min(p[28] as usize, SSID_MAX);
+        let mut shown = [b'.'; SSID_MAX];
+        let name = wifi_ssid_text(&p[29..29 + jlen], &mut shown);
+        let chanspec = u16::from_le_bytes([p[21], p[22]]);
+        let band = match chanspec >> 14 {
+            0 => "2.4GHz",
+            3 => "5GHz",
+            _ => "band?",
+        };
+        let rssi = i32::from_le_bytes([p[17], p[18], p[19], p[20]]);
+        let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+        out.line_fmt(ctx, format_args!("network     {}", name));
+        out.line_fmt(ctx, format_args!("bssid       {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", p[11], p[12], p[13], p[14], p[15], p[16]));
+        out.line_fmt(ctx, format_args!("band        {}", band));
+        // chanspec: the channel number is the low 8 bits (802.11ac layout; the band bits above decode it).
+        out.line_fmt(ctx, format_args!("channel     {}", chanspec & 0xFF));
+        if rssi == 0 {
+            out.line_fmt(ctx, format_args!("signal      unknown  (the firmware gave no reading)"));
+        } else {
+            out.line_fmt(ctx, format_args!("signal      {}  {} dBm", wifi_signal_word(rssi), rssi));
+        }
+        out.line_fmt(ctx, format_args!("security    {}", wifi_security_word(p[23])));
+        if since >= 120 {
+            out.line_fmt(ctx, format_args!("joined      {} min ago", since / 60));
+        } else {
+            out.line_fmt(ctx, format_args!("joined      {} s ago", since));
+        }
+    }
+    if p[1] != 0 {
+        out.line_fmt(ctx, format_args!("scan        running - {} heard so far", p[2]));
+    } else if p[3] != 0 {
+        let age = u32::from_le_bytes([p[5], p[6], p[7], p[8]]);
+        out.line_fmt(ctx, format_args!("last scan   {} s ago", age));
+        out.line_fmt(ctx, format_args!("networks    {}", p[4]));
+    } else {
+        out.line_fmt(ctx, format_args!("last scan   none - run wifi scan"));
+    }
+    out.line_fmt(ctx, format_args!("addressing  type net (an IP address has one owner, and it is not this command)"));
+    Ok(())
+}
+
+/// `wifi debug [events|stats|firmware|transport|trace]` - the driver's own account of itself, for whoever is
+/// debugging it. Raw counts (rule 7). `trace` is the instrument this port was built without: the last 64
+/// frames on the bus, from a ring the driver keeps, timestamped by its own clock in milliseconds since it
+/// started (0 everywhere if the kernel gave it no rate - said rather than invented).
+fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    /// Sub-codes the driver answers (`wire::dbg` in `sdk/wifi`; restated here, not imported).
+    const DBG_STATS: u8 = 0;
+    const DBG_TRACE: u8 = 1;
+    const DBG_FIRMWARE: u8 = 2;
+    /// The stats reply: 30 u32 words after the status byte.
+    const STAT_WORDS: usize = 30;
+    /// A trace entry on the wire.
+    const ENTRY: usize = 18;
+
+    let word = |p: &[u8], i: usize| -> u32 {
+        let at = 1 + 4 * i;
+        u32::from_le_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]])
+    };
+
+    match sub {
+        "" | "stats" | "transport" | "events" => {
+            let r = match wifi_ask(ctx, &[OP_DEBUG, DBG_STATS], REPLY_MS) {
+                Some(r) => r,
+                None => return wifi_not_answering(ctx, out),
+            };
+            let p = r.payload_bytes();
+            match p.first().copied() {
+                Some(OK) if p.len() >= 1 + 4 * STAT_WORDS => {}
+                Some(OK) => {
+                    out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short debug reply"));
+                    return Err(ShellError::Unknown);
+                }
+                Some(s) => return wifi_radio_unavailable(ctx, out, s),
+                None => return wifi_not_answering(ctx, out),
+            }
+            let ms = word(p, 27);
+            if sub == "" || sub == "stats" {
+                out.line_fmt(ctx, format_args!("session     {} s on the driver's clock, {} frames traced", ms / 1000, word(p, 28)));
+                out.line_fmt(ctx, format_args!("control"));
+                out.line_fmt(ctx, format_args!("  sent      {}", word(p, 0)));
+                out.line_fmt(ctx, format_args!("  accepted  {}", word(p, 1)));
+                out.line_fmt(ctx, format_args!("  refused   {}  (last: command {} status {})", word(p, 2), word(p, 25), word(p, 26) as i32));
+                out.line_fmt(ctx, format_args!("  silent    {}", word(p, 3)));
+            }
+            if sub == "" || sub == "transport" {
+                out.line_fmt(ctx, format_args!("sdio"));
+                out.line_fmt(ctx, format_args!("  function  2, block 512 (control, event and data frames); function 1, block 64 (the backplane)"));
+                out.line_fmt(ctx, format_args!("  tx_bytes  {}", word(p, 10)));
+                out.line_fmt(ctx, format_args!("  rx_bytes  {}", word(p, 11)));
+                out.line_fmt(ctx, format_args!("  rx_ctrl   {}", word(p, 4)));
+                out.line_fmt(ctx, format_args!("  rx_event  {}", word(p, 5)));
+                out.line_fmt(ctx, format_args!("  rx_data   {}", word(p, 6)));
+                out.line_fmt(ctx, format_args!("  rx_glom   {}  (superframes; each descriptor and each superframe counts one)", word(p, 7)));
+                out.line_fmt(ctx, format_args!("  rx_glom_sub {}  (event and data frames delivered out of them)", word(p, 29)));
+                out.line_fmt(ctx, format_args!("  rx_flow   {}  (header-only frames: flow control)", word(p, 8)));
+                out.line_fmt(ctx, format_args!("  rx_other  {}", word(p, 9)));
+                out.line_fmt(ctx, format_args!("  skipped   {}  (event/data frames read during a control wait - lost to the scan)", word(p, 12)));
+            }
+            if sub == "" || sub == "events" {
+                out.line_fmt(ctx, format_args!("events"));
+                const NAMES: [&str; 9] = ["set_ssid", "join", "auth", "deauth_ind", "assoc", "disassoc_ind", "link", "psk_sup", "escan_result"];
+                for (i, name) in NAMES.iter().enumerate() {
+                    let n = word(p, 13 + i);
+                    if n != 0 {
+                        out.line_fmt(ctx, format_args!("  {:<12} {}", name, n));
+                    }
+                }
+                let other = word(p, 22);
+                if other != 0 {
+                    out.line_fmt(ctx, format_args!("  {:<12} {}", "other", other));
+                }
+                out.line_fmt(ctx, format_args!("  last        code {} status {}", word(p, 23), word(p, 24)));
+            }
+            Ok(())
+        }
+        "firmware" => {
+            let r = match wifi_ask(ctx, &[OP_DEBUG, DBG_FIRMWARE], REPLY_MS) {
+                Some(r) => r,
+                None => return wifi_not_answering(ctx, out),
+            };
+            let p = r.payload_bytes();
+            match p.first().copied() {
+                Some(OK) if p.len() >= 1 + 1 + 128 + 2 + 512 + 6 => {}
+                Some(OK) => {
+                    out.line_fmt(ctx, format_args!("wifi: the radio driver gave a short firmware reply"));
+                    return Err(ShellError::Unknown);
+                }
+                Some(s) => return wifi_radio_unavailable(ctx, out, s),
+                None => return wifi_not_answering(ctx, out),
+            }
+            let vlen = core::cmp::min(p[1] as usize, 128);
+            let ver = core::str::from_utf8(&p[2..2 + vlen]).unwrap_or("(not text)").trim();
+            let clen = core::cmp::min(u16::from_le_bytes([p[130], p[131]]) as usize, 512);
+            let cap = &p[132..132 + clen];
+            let mac = &p[644..650];
+            out.line_fmt(ctx, format_args!("chip        CYW43455 (chip id 0x4345 rev 6), over SDIO"));
+            out.line_fmt(ctx, format_args!("image       brcmfmac43455-sdio.bin + clm_blob + nvram (nonfree/brcm43455, PROVENANCE has the hashes)"));
+            if vlen == 0 {
+                out.line_fmt(ctx, format_args!("version     (not asked - the radio is off or a sweep is running)"));
+            } else {
+                out.line_fmt(ctx, format_args!("version     {}", ver));
+            }
+            out.line_fmt(ctx, format_args!("mac         {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
+            out.line_fmt(ctx, format_args!("supplicant  none in the firmware (sup_wpa refused) - the host runs the handshake"));
+            // The capability string is a few hundred bytes of words; printed in pieces a line can hold.
+            let mut at = 0;
+            let mut first = true;
+            while at < cap.len() {
+                let to = core::cmp::min(at + 88, cap.len());
+                let piece = core::str::from_utf8(&cap[at..to]).unwrap_or("(not text)");
+                out.line_fmt(ctx, format_args!("{}  {}", if first { "cap       " } else { "          " }, piece));
+                first = false;
+                at = to;
+            }
+            Ok(())
+        }
+        "trace" => {
+            let r = match wifi_ask(ctx, &[OP_DEBUG, DBG_TRACE], REPLY_MS) {
+                Some(r) => r,
+                None => return wifi_not_answering(ctx, out),
+            };
+            let p = r.payload_bytes();
+            match p.first().copied() {
+                Some(OK) if p.len() >= 2 => {}
+                Some(s) => return wifi_radio_unavailable(ctx, out, s),
+                None => return wifi_not_answering(ctx, out),
+            }
+            let count = p[1] as usize;
+            if count == 0 {
+                out.line_fmt(ctx, format_args!("no frames traced yet"));
+                return Ok(());
+            }
+            out.line_fmt(ctx, format_args!("{:>10}  {:<9} {:<6} {}", "ms", "frame", "id", "what"));
+            for i in 0..count {
+                let at = 2 + i * ENTRY;
+                if at + ENTRY > p.len() {
+                    break;
+                }
+                let e = &p[at..at + ENTRY];
+                let ms = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                let kind = e[4];
+                let id = u16::from_le_bytes([e[6], e[7]]);
+                let what = u32::from_le_bytes([e[8], e[9], e[10], e[11]]);
+                let status = i32::from_le_bytes([e[12], e[13], e[14], e[15]]);
+                let len = u16::from_le_bytes([e[16], e[17]]);
+                // A trailing `*` marks a frame taken out of a glommed superframe; `RX GLOM` is the superframe
+                // itself and `RX GDESC` the descriptor (its `what` is the number of lengths it lists).
+                let kind_word = match kind {
+                    1 => "TX CTRL",
+                    2 => "RX CTRL",
+                    3 => "RX EVENT",
+                    4 => "RX DATA",
+                    5 => "RX GLOM",
+                    7 => "RX EVENT*",
+                    8 => "RX DATA*",
+                    9 => "RX GDESC",
+                    10 => "TX DATA",
+                    _ => "RX other",
+                };
+                let stamp_ms = ms % 1000;
+                let stamp_s = ms / 1000;
+                match kind {
+                    1 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} id={:<3} cmd={} len={}", stamp_s, stamp_ms, kind_word, id, what, len)),
+                    2 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} id={:<3} cmd={} status={} len={}", stamp_s, stamp_ms, kind_word, id, what, status, len)),
+                    3 | 7 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} event={} status={} len={}", stamp_s, stamp_ms, kind_word, "", what, status, len)),
+                    9 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} lists {} sub-frame length(s)", stamp_s, stamp_ms, kind_word, "", what)),
+                    10 => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} seq={:<3} len={}", stamp_s, stamp_ms, kind_word, id, len)),
+                    _ => out.line_fmt(ctx, format_args!("{:>6}.{:03}  {:<9} {:<6} len={}", stamp_s, stamp_ms, kind_word, "", len)),
+                }
+            }
+            Ok(())
+        }
+        other => {
+            out.line_fmt(ctx, format_args!("wifi debug: `{}` is not a view - try events, stats, firmware, transport or trace", other));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `wifi stored` - the networks a key is held for, one per line. Names, never secrets; the table
+/// (`utilities/56_wifi.md` 6) persists in `/wifi.keys`, which the driver reads back when the radio comes up.
+fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    let r = match wifi_ask(ctx, &[OP_STORED], REPLY_MS) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) if p.len() >= 2 => {
+            // `[OK, count, (len, ssid[32]) * count]` - one name per line, so it pipes like any list.
+            let count = p[1] as usize;
+            if count == 0 {
+                out.line_fmt(ctx, format_args!("no stored networks - `wifi join` keeps a passphrase, in /wifi.keys"));
+                return Ok(());
+            }
+            let mut at = 2;
+            for i in 0..count {
+                if at + 1 + SSID_MAX > p.len() {
+                    out.line_fmt(ctx, format_args!("wifi: the reply ended after {} of {} name(s)", i, count));
+                    break;
+                }
+                let len = core::cmp::min(p[at] as usize, SSID_MAX);
+                let mut shown = [b'.'; SSID_MAX];
+                let name = wifi_ssid_text(&p[at + 1..at + 1 + len], &mut shown);
+                out.line_fmt(ctx, format_args!("{}", name));
+                at += 1 + SSID_MAX;
+            }
+            Ok(())
+        }
+        Some(s) => wifi_radio_unavailable(ctx, out, s),
+        None => wifi_not_answering(ctx, out),
+    }
+}
+
+/// `wifi forget <ssid>` - drop the held key for that network. Does not disconnect.
+fn wifi_forget(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const REPLY_MS: u64 = 3000;
+    if ssid.is_empty() || ssid.len() > SSID_MAX {
+        out.line_fmt(ctx, format_args!("wifi: an SSID is 1 to {} bytes", SSID_MAX));
+        return Err(ShellError::Unknown);
+    }
+    let mut req = [0u8; 2 + SSID_MAX];
+    req[0] = OP_FORGET;
+    req[1] = ssid.len() as u8;
+    req[2..2 + ssid.len()].copy_from_slice(ssid.as_bytes());
+    let r = match wifi_ask(ctx, &req, REPLY_MS) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    // The other radio too: both read and write `/wifi.keys`, and one that still held the key would put it
+    // back in the file on its next save (`godspeed_wifi::keyfile::save`).
+    let asked = ctx.wifi_radio.get();
+    for &other in RADIOS.iter() {
+        if other != asked && slot_of(ctx, other).is_some() {
+            ctx.wifi_radio.set(other);
+            let _ = wifi_ask(ctx, &req, REPLY_MS);
+        }
+    }
+    ctx.wifi_radio.set(asked);
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) if p.get(1).copied().unwrap_or(0) != 0 => {
+            out.line_fmt(ctx, format_args!("forgot {} - the key is gone; the link, if any, is not touched", ssid));
+            Ok(())
+        }
+        Some(OK) => {
+            out.line_fmt(ctx, format_args!("no key is held for {} - nothing to forget", ssid));
+            Ok(())
+        }
+        Some(s) => wifi_radio_unavailable(ctx, out, s),
+        None => wifi_not_answering(ctx, out),
+    }
+}
+
+/// `wifi leave` - leave the current network. The radio stays up.
+fn wifi_leave(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    const HINT_SECS: i64 = 1;
+    const MAX_SECS: i64 = 10;
+    let outcome = wifi_ask_q(ctx, &[OP_DISCONNECT], HINT_SECS, MAX_SECS);
+    let r = match outcome {
+        ReqOutcome::Reply(r) => r,
+        other => return wifi_no_answer(ctx, out, &other, "leaving"),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) if p.get(1).copied().unwrap_or(0) != 0 => {
+            // `[OK, 1, len, name]` from a driver that names what it left; an older two-byte reply is
+            // still a leave, just an unnamed one.
+            if p.len() >= 3 + SSID_MAX && p[2] != 0 {
+                let len = core::cmp::min(p[2] as usize, SSID_MAX);
+                let mut shown = [0u8; SSID_MAX];
+                let name = wifi_ssid_text(&p[3..3 + len], &mut shown);
+                out.line_fmt(ctx, format_args!("left {}", name));
+            } else {
+                out.line_fmt(ctx, format_args!("left the network"));
+            }
+            Ok(())
+        }
+        Some(OK) => {
+            out.line_fmt(ctx, format_args!("nothing to leave - not joined"));
+            Ok(())
+        }
+        Some(s) => wifi_radio_unavailable(ctx, out, s),
+        None => wifi_not_answering(ctx, out),
+    }
+}
+
+/// `wifi radio on|off` - power the radio. `off` disconnects first and says so.
+fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    // Through `wifi_ask`, like `wifi status` and `wifi scan`: the reply must come from the driver, the reply
+    // mailbox is drained and owed answers are waited out first, which keeps a late answer to an earlier,
+    // abandoned request from being read as this one's in the cases the shell can see (the matching is by
+    // sender, not by request - see `wifi_ask`). The round trip blocks; the only wait
+    // here that is ever long is the watch below, and it keeps `q`.
+    const MAX_SECS: i64 = 15;
+    let r = match wifi_ask(ctx, &[OP_RADIO, on as u8], (MAX_SECS as u64) * 1000) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) => {
+            let was_joined = p.get(1).copied().unwrap_or(0) != 0;
+            // The third byte says whether anything changed; a driver that does not send one is read as
+            // "changed", which is what the two-byte reply always meant.
+            let changed = p.get(2).copied().unwrap_or(1) != 0;
+            if on && p.get(3).copied() == Some(COLD_START) {
+                // The chip was powered down (`off hard`) and the driver has restored its power. It has no
+                // firmware to serve and cannot bring a cold chip up in place; restart it, and watch the
+                // respawn take the boot's own path - the same watch `powercycle` uses.
+                out.line_fmt(ctx, format_args!("radio powered up - starting the driver on the cold chip"));
+                if let Err(e) = wifi_kill_driver(ctx) {
+                    out.line_fmt(ctx, format_args!("radio on failed - the chip is powered but the driver could not be restarted; `kill {}` by hand brings it back", ctx.wifi_radio.get()));
+                    return Err(e);
+                }
+                let outcome = wifi_powercycle_watch(ctx, out, "radio on");
+                return wifi_radio_on_outcome(ctx, out, outcome);
+            }
+            match (on, changed, was_joined) {
+                (true, false, _) => out.line_fmt(ctx, format_args!("radio already on")),
+                (false, false, _) => out.line_fmt(ctx, format_args!("radio already off")),
+                (true, true, _) => out.line_fmt(ctx, format_args!("radio on")),
+                (false, true, joined) => {
+                    // Byte 3: the driver's check of the off (1 verified, 2 unverified, 3 contradicted).
+                    let lead = if joined { "left the network, then radio off" } else { "radio off" };
+                    match p.get(3).copied() {
+                        Some(1) => out.line_fmt(ctx, format_args!("{} - verified: the firmware reports it is down", lead)),
+                        Some(3) => {
+                            out.line_fmt(ctx, format_args!("radio off FAILED - the firmware accepted DOWN but still reports it is up; `wifi status` shows it"));
+                            return Err(ShellError::Unknown);
+                        }
+                        Some(2) => out.line_fmt(ctx, format_args!("{} - not verified: the firmware did not answer whether it is down", lead)),
+                        _ => out.line_fmt(ctx, format_args!("{}", lead)),
+                    }
+                }
+            }
+            // Bytes 3.. of an `on` reply: the rejoin of the network last joined, `[status, len, name]`,
+            // status 0 when there was none. Its sentence is `wifi join`'s own, from the same table.
+            if on && p.len() >= 5 + SSID_MAX && p[3] != 0 {
+                let len = core::cmp::min(p[4] as usize, SSID_MAX);
+                let mut shown = [0u8; SSID_MAX];
+                let name = wifi_ssid_text(&p[5..5 + len], &mut shown);
+                return wifi_join_outcome(ctx, out, name, ReqOutcome::Reply(Message::from_bytes(&[p[3]])));
+            }
+            Ok(())
+        }
+        // THE HARD ON. The driver is up and its radio is not - the firmware trapped at start, or never
+        // ran - so the soft switch has nothing to switch. `on` is the one word the operator can always
+        // type without knowing the state (docs/wifi.md 47), so it does the hard thing here: restart the
+        // driver, which adopts a live firmware or power-cycles a dead one, and watch it join. `off` on a
+        // down radio stays a statement of fact: there is nothing to switch off.
+        // A radio this driver does not drive yet: a restart would run the same identification and come
+        // back down for the same reason, so say the reason and do nothing.
+        Some(RADIO_DOWN) if on && p.get(1).copied() == Some(DOWN_NOT_BUILT) => wifi_radio_unavailable(ctx, out, RADIO_DOWN),
+        Some(RADIO_DOWN) if on => {
+            let outcome = wifi_restart_and_watch(ctx, out, "radio on", "the radio is down (no firmware behind it)")?;
+            wifi_radio_on_outcome(ctx, out, outcome)
+        }
+        Some(RADIO_DOWN) => wifi_radio_unavailable(ctx, out, RADIO_DOWN),
+        Some(NO_POWER_CONTROL) => {
+            out.line_fmt(ctx, format_args!("radio on failed - the chip is powered down and the kernel refused to restore its power: this machine has no control over it"));
+            Err(ShellError::Unknown)
+        }
+        Some(_) => {
+            out.line_fmt(ctx, format_args!("wifi: the radio did not take the power command"));
+            Err(ShellError::Unknown)
+        }
+        None => wifi_not_answering(ctx, out),
+    }
+}
+
+/// The end of a `wifi radio on` that went the hard way (a cold or a down chip, watched back up). A chip
+/// that came up warm is reported, not retried: a second cycle on the same chip gives the same result
+/// (docs/wifi.md 52), and `wifi radio powercycle` is there to try once more by hand.
+fn wifi_radio_on_outcome(ctx: &ShellCtx, out: &mut Out, outcome: WatchOutcome) -> Result<(), ShellError> {
+    match outcome {
+        WatchOutcome::Joined | WatchOutcome::Left | WatchOutcome::UpNotChosen => Ok(()),
+        // ONE attempt, as `powercycle` makes: a second cycle on the same chip gives the same result.
+        WatchOutcome::Warm => {
+            out.line_fmt(ctx, format_args!("radio on failed - the chip came up warm (its firmware trapped at start; docs/wifi.md 52); `wifi radio powercycle` tries once more"));
+            Err(ShellError::Unknown)
+        }
+        WatchOutcome::Down => wifi_radio_unavailable(ctx, out, wifi_wire::RADIO_DOWN),
+        WatchOutcome::TimedOut => Err(ShellError::Unknown),
+    }
+}
+
+/// `wifi radio powercycle`: the chip's power, cut and restored, then the driver restarted on the cold
+/// chip - VERIFIED by watching it rejoin. One cycle per run (`MAX_ATTEMPTS`, docs/wifi.md 52): a chip that
+/// comes up warm is reported, and `wifi radio powercycle` again is the operator's to choose.
+///
+/// Two principals, each with what it already holds. The DRIVER holds `DEVICE_POWER` and cuts the power
+/// when asked (the radio op's third mode), parking its SDIO host for the whole off window. This shell
+/// holds restart authority and kills the driver once the chip is cold; the supervisor's respawn finds a
+/// card that does not answer the CCCR, which is the boot's own path, and the radio comes up from power-on
+/// and rejoins from `/wifi.keys` (docs/wifi.md 47). The order is the point: power first, then the kill - a
+/// respawn onto a chip whose firmware still runs would ADOPT it (46), the opposite of a power cycle.
+///
+/// BOUNDED, at the operator's word: `MAX_ATTEMPTS` cycles per invocation, then the prompt comes back with
+/// what happened. A warm chip is reported, never chased forever, and the command can be run again -
+/// nothing here needs a reboot. The hold-off is FIXED: seventy-five seconds off still came up warm, so its
+/// length is not the variable. Parking the SDIO host across the cut was tried (docs/wifi.md 48) and did not
+/// fix it - one cold start in three loads - so the warm start's cause is still open; the pads are the next
+/// suspect.
+fn wifi_radio_powercycle(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    // The power-off hold, in the request's 100 ms units.
+    const OFF_UNITS: u8 = 20;
+    // ONE cycle per invocation. The attempts were not independent - the same steps on the same chip gave
+    // the same result, three warm out of three, run after run - so a retry only hid the cause (the
+    // operator's call, 2026-10-01). The command can be run again.
+    const MAX_ATTEMPTS: u32 = 1;
+    // The request (through `wifi_ask`, queue drained first) blocks until the driver has cut, held and
+    // restored the power: the hold plus the settle, with margin. Acting on a STALE OK here is what killed
+    // the driver mid-cycle (boot 2026-10-01 13:58, at 13:59) and left the chip unpowered. `q` belongs to
+    // the watch below, which is where the long wait is.
+    // The hold (2 s) plus the driver's power-on settle (`POWER_ON_SETTLE_MS`, 300 ms) plus a wide margin.
+    const OP_MAX_MS: u64 = 15_000;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let outcome = match wifi_ask(ctx, &[OP_RADIO, RADIO_POWERCYCLE, OFF_UNITS], OP_MAX_MS) {
+            // A driver that does not answer is mid-bring-up or wedged: restart it and watch.
+            None => wifi_restart_and_watch(ctx, out, "powercycle", "the radio driver is not answering")?,
+            Some(r) => {
+                let p = r.payload_bytes();
+                match p.first().copied() {
+                    Some(OK) => {
+                        let was_joined = p.get(1).copied().unwrap_or(0) != 0;
+                        out.line_fmt(ctx, format_args!(
+                            "radio powered down for {}.{} s{} - restarting the driver on the cold chip",
+                            OFF_UNITS / 10, OFF_UNITS % 10,
+                            if was_joined { " (the network is left)" } else { "" }));
+                        if let Err(e) = wifi_kill_driver(ctx) {
+                            out.line_fmt(ctx, format_args!("powercycle failed - the chip was power-cycled but the driver could not be restarted; `kill {}` by hand brings it back", ctx.wifi_radio.get()));
+                            return Err(e);
+                        }
+                        wifi_powercycle_watch(ctx, out, "powercycle")
+                    }
+                    // The driver is up and its radio is not - no firmware behind it. It serves the power
+                    // ops in that state, so this is an older driver or a radio that went down between the
+                    // question and the answer; the act is the same. The exception is a radio this driver
+                    // does not drive yet, whose driver refuses the cycle: nothing a restart could change.
+                    Some(RADIO_DOWN) if p.get(1).copied() == Some(DOWN_NOT_BUILT) => return wifi_radio_unavailable(ctx, out, RADIO_DOWN),
+                    Some(RADIO_DOWN) => wifi_restart_and_watch(ctx, out, "powercycle", "the radio is down (no firmware behind it)")?,
+                    Some(NO_POWER_CONTROL) => {
+                        out.line_fmt(ctx, format_args!("powercycle failed - the radio's power is not under its driver's control here (the kernel refused, or a USB dongle, whose power is its port's)"));
+                        return Err(ShellError::Unknown);
+                    }
+                    Some(_) => {
+                        out.line_fmt(ctx, format_args!("powercycle failed - the radio driver did not take the powercycle command"));
+                        return Err(ShellError::Unknown);
+                    }
+                    None => return wifi_not_answering(ctx, out),
+                }
+            }
+        };
+        match outcome {
+            WatchOutcome::Joined => {
+                if attempt > 1 {
+                    out.line_fmt(ctx, format_args!("  (on attempt {} of {})", attempt, MAX_ATTEMPTS));
+                }
+                return Ok(());
+            }
+            WatchOutcome::Left | WatchOutcome::UpNotChosen => return Ok(()),
+            WatchOutcome::Warm if attempt < MAX_ATTEMPTS => {
+                out.line_fmt(ctx, format_args!(
+                    "  the chip came up warm - its firmware trapped at start; cycling again (attempt {} of {})",
+                    attempt + 1, MAX_ATTEMPTS));
+            }
+            WatchOutcome::Warm => {}
+            WatchOutcome::Down => return wifi_radio_unavailable(ctx, out, RADIO_DOWN),
+            WatchOutcome::TimedOut => return Err(ShellError::Unknown),
+        }
+    }
+    out.line_fmt(ctx, format_args!(
+        "powercycle failed - the chip came up warm (its firmware trapped at start; docs/wifi.md 52). The driver is up and answering; `wifi radio powercycle` can be run again{}",
+        if MAX_ATTEMPTS > 1 { " (every attempt came up warm)" } else { "" }));
+    Err(ShellError::Unknown)
+}
+
+/// Restart the radio driver and watch it come back. The one act this shell has for a driver that is
+/// not answering (mid-bring-up or wedged) and for one that answers RADIO_DOWN (up, with no firmware
+/// behind it - the firmware trapped at start, or never ran): this shell holds restart authority, and the
+/// respawn does the right thing by itself - it adopts a firmware that is alive and power-cycles one that
+/// is dead (docs/wifi.md 46-47). `verb` names the command for the lines the watch prints.
+fn wifi_restart_and_watch(ctx: &ShellCtx, out: &mut Out, verb: &str, why: &str) -> Result<WatchOutcome, ShellError> {
+    out.line_fmt(ctx, format_args!("{} - restarting the driver (its respawn adopts a live firmware or power-cycles a dead one)", why));
+    if let Err(e) = wifi_kill_driver(ctx) {
+        out.line_fmt(ctx, format_args!("{} failed - the driver could not be restarted; `kill {}` by hand brings it back", verb, ctx.wifi_radio.get()));
+        return Err(e);
+    }
+    Ok(wifi_powercycle_watch(ctx, out, verb))
+}
+
+/// What the watch saw the radio do after a power cycle.
+enum WatchOutcome {
+    /// Joined, and the join is younger than the watch: the new instance's.
+    Joined,
+    /// The operator pressed `q` or `b`; the power cycle continues unwatched.
+    Left,
+    /// The driver came back and reports its firmware trapped at start (`DOWN_TRAPPED`): a warm chip, the
+    /// one DOWN that another power cycle is for.
+    Warm,
+    /// The driver came back and reports its radio DOWN for any OTHER reason - the bring-up stopped, no
+    /// radio on the bus, a radio this driver does not drive yet, or a driver too old to say. It is not a
+    /// warm chip and is not called one; the reason is in `wifi_down_reason` and `wifi_radio_unavailable`
+    /// says it.
+    Down,
+    /// Nothing conclusive within the bound; said on the way out.
+    TimedOut,
+    /// The radio is up and will NOT rejoin, by its own word: `/wifi.radio` names the other radio
+    /// (`OP_USE` answers `USE_NOT`). A power cycle that succeeded, said with the reason and the remedy,
+    /// rather than ninety seconds spent waiting for a join the driver has already decided against.
+    UpNotChosen,
+}
+
+/// Watch the radio come back after a power cycle, blocking until it has rejoined. `b` backgrounds, `q`
+/// quits the watch; neither stops the power cycle, because there is nothing to stop once the power has
+/// been cut - the driver is being respawned and will join on its own - and the line each prints says so
+/// (rule 11 applies to a task that can be stopped; the hint keeps the convention, `[q] quit`).
+///
+/// Progress is what the driver answers to its status question, asked once a second with a one-second
+/// bound: no answer while it brings the chip up from cold (~12-15 s), `radio_on` 0 while the bus is coming up,
+/// `associated` 0 while it joins, then the name. SUCCESS IS A JOIN YOUNGER THAN THIS WATCH: the status
+/// reply carries how long ago the join happened, and a stale reply from before the kill - which the
+/// second cycle of 2026-10-01 08:29 produced, "succeeded" 157 ms after the ON write - reports a join that is
+/// minutes old. The shell's queue is also drained of stale replies first. A driver that answers RADIO_DOWN
+/// with `DOWN_TRAPPED` came back and found its firmware trapped: a warm chip (`Warm`). Any other reason is
+/// `Down`, and the caller says that reason rather than calling it warm. Bounded at
+/// POWERCYCLE_WATCH_SECS, after which it says where the radio got to rather than waiting forever (26.6).
+fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutcome {
+    use wifi_wire::*;
+    const POWERCYCLE_WATCH_SECS: i64 = 90;
+    const POLL_MS: u64 = 1_000;
+    let (stale, other) = wifi_drain_stale(ctx);
+    if stale + other > 0 {
+        ctx.log_fmt(format_args!("shell: {} stale message(s) cleared before watching the power cycle", stale + other));
+    }
+    out.line_fmt(ctx, format_args!("the radio is coming back from power-on  [q] quit  [b] background"));
+    let t0 = ctx.epoch_secs_monotonic();
+    let mut last = "";
+    // Whether the radio, once up and not joined, has been asked if it will rejoin at all (`OP_USE`).
+    let mut asked_use = false;
+    loop {
+        while let Some(b) = ctx.try_console_read() {
+            match b {
+                b'q' | b'Q' | 0x1b => {
+                    out.line_fmt(ctx, format_args!("quit - the driver is still coming back; `wifi status` says where it is, and `wifi radio powercycle` can be run again"));
+                    return WatchOutcome::Left;
+                }
+                b'b' | b'B' => {
+                    out.line_fmt(ctx, format_args!("[backgrounded] the driver is still coming back; `wifi status` says where it is, and `wifi radio powercycle` can be run again"));
+                    return WatchOutcome::Left;
+                }
+                _ => {}
+            }
+        }
+        let elapsed = (ctx.epoch_secs_monotonic() - t0).max(0) as u32;
+        let state = match wifi_ask(ctx, &[OP_STATUS], POLL_MS) {
+            None => "waiting for the driver (identifying the chip, uploading its firmware)",
+            Some(r) => {
+                let p = r.payload_bytes();
+                if p.first().copied() == Some(RADIO_DOWN) {
+                    // `wifi_ask` has recorded the reason. Only a trapped firmware is a warm chip; calling
+                    // every DOWN one told the VisionFive's operator its AIC8800 "came up warm" when its
+                    // driver is simply not written yet.
+                    return if p.get(1).copied() == Some(DOWN_TRAPPED) { WatchOutcome::Warm } else { WatchOutcome::Down };
+                }
+                if p.len() < 29 || p[0] != OK {
+                    "the driver answers, radio not up yet"
+                } else if p[9] == 0 {
+                    "radio coming up"
+                } else if p[10] == 0 {
+                    // ASK, ONCE, WHETHER IT WILL. A radio that `/wifi.radio` does not choose does not
+                    // rejoin at start (`godspeed_wifi::serve`), and waited on, this read "radio up,
+                    // joining" for the whole bound: the Pi 4 with the choice left on `usb` and no dongle
+                    // in (`docs/wifi-usb.md` 48). The driver knows; the watch asks rather than waits.
+                    if !asked_use {
+                        asked_use = true;
+                        if let Some(u) = wifi_ask(ctx, &[OP_USE], POLL_MS) {
+                            if u.payload_bytes() == [OK, USE_NOT] {
+                                let me = radio_name(ctx.wifi_radio.get());
+                                out.line_fmt(ctx, format_args!(
+                                    "{} succeeded - the radio is up, and does not rejoin: /wifi.radio chooses the other radio. `wifi hardware use {}` makes this one the one in use",
+                                    verb, me));
+                                return WatchOutcome::UpNotChosen;
+                            }
+                        }
+                    }
+                    "radio up, joining"
+                } else {
+                    let since = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+                    if since > elapsed + 2 {
+                        // A join older than this watch is the OLD instance's answer, not the new one's.
+                        "an answer from before the power cycle - waiting for the new driver"
+                    } else {
+                        let jlen = core::cmp::min(p[28] as usize, SSID_MAX);
+                        let mut shown = [0u8; SSID_MAX];
+                        let name = wifi_ssid_text(&p[29..29 + jlen], &mut shown);
+                        out.line_fmt(ctx, format_args!("{} succeeded - joined {}", verb, name));
+                        return WatchOutcome::Joined;
+                    }
+                }
+            }
+        };
+        if state != last {
+            out.line_fmt(ctx, format_args!("  {}", state));
+            last = state;
+        }
+        if ctx.epoch_secs_monotonic() - t0 >= POWERCYCLE_WATCH_SECS {
+            // Not a warm chip - that returns above - so not a case for another cycle: the radio is up and
+            // did not join, or the driver never answered. Both are the radio's or the network's to say.
+            out.line_fmt(ctx, format_args!(
+                "{} failed - the radio did not rejoin within {} s (last seen: {}). `wifi status` says where it is; `wifi radio powercycle` can be run again",
+                verb, POWERCYCLE_WATCH_SECS, state));
+            return WatchOutcome::TimedOut;
+        }
+        ctx.sleep_ms(POLL_MS);
+    }
+}
+
+/// `wifi radio off hard`: the chip's power, cut and left cut. The driver leaves the network first (the
+/// firmware can still send), then asks the kernel to cut the power through its own grant, and stays alive
+/// to answer `wifi status` with "powered down" and every other request with RADIO_POWERED_OFF. `wifi radio
+/// on` restores the power and restarts the driver onto the cold chip (docs/wifi.md 47).
+fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    use wifi_wire::*;
+    // Through `wifi_ask` like the rest of the radio ladder: stale replies drained and owed ones waited out
+    // first, since the Call matches by sender, not by request. It blocks until the driver has left the
+    // network, cut the power and checked the chip is silent on its bus - about three seconds - and says so
+    // first. There is no [b]: a blocking Call cannot poll the console mid-flight (the kernel dequeue is
+    // welded to the send), and three seconds does not earn a new kernel syscall to make it abortable.
+    const MAX_SECS: i64 = 15;
+    // Said as a question, not as what happens: a driver with no power to cut (a USB dongle's is its port's)
+    // answers NO_POWER_CONTROL without leaving the network (`serve::Host::can_cut_power`).
+    out.line_fmt(ctx, format_args!("asking the driver to cut the chip's power - one that can leaves the network first"));
+    let r = match wifi_ask(ctx, &[OP_RADIO, RADIO_HARD_OFF], (MAX_SECS as u64) * 1000) {
+        Some(r) => r,
+        None => return wifi_not_answering(ctx, out),
+    };
+    let p = r.payload_bytes();
+    match p.first().copied() {
+        Some(OK) => {
+            let was_joined = p.get(1).copied().unwrap_or(0) != 0;
+            let changed = p.get(2).copied().unwrap_or(1) != 0;
+            if p.get(3).copied() == Some(3) {
+                out.line_fmt(ctx, format_args!("radio off hard FAILED - the driver's check after the power-down contradicts it (an SDIO radio still answers on its bus; a USB dongle still has a firmware marked running) - the serial log has what it read"));
+                return Err(ShellError::Unknown);
+            }
+            if !changed {
+                out.line_fmt(ctx, format_args!("radio already off (hard)"));
+            } else if p.get(3).copied() == Some(1) {
+                out.line_fmt(ctx, format_args!("{}radio off (hard) - verified by its driver (an SDIO radio no longer answers on its bus; a USB dongle's firmware is stopped); `wifi radio on` powers it up",
+                    if was_joined { "left the network, then " } else { "" }));
+            } else if was_joined {
+                out.line_fmt(ctx, format_args!("left the network, then radio off (hard) - the chip is powered down; `wifi radio on` powers it up"));
+            } else {
+                out.line_fmt(ctx, format_args!("radio off (hard) - the chip is powered down; `wifi radio on` powers it up"));
+            }
+            Ok(())
+        }
+        Some(NO_POWER_CONTROL) => {
+            // Byte 1 says whether the driver left the network before the refusal: only one that could cut
+            // the power gets that far (the kernel then refusing it); one that cannot changes nothing.
+            if p.get(1).copied().unwrap_or(0) != 0 {
+                out.line_fmt(ctx, format_args!("radio off hard failed - the driver left the network, then could not power the chip down (the kernel refused, or the device stopped answering - the serial log says which); `wifi join` rejoins, and a USB dongle that stopped answering needs unplugging"));
+            } else {
+                out.line_fmt(ctx, format_args!("radio off hard failed - this radio's power is not under its driver's control (a USB dongle's is its port's); nothing changed - `wifi radio off` turns the radio off"));
+            }
+            Err(ShellError::Unknown)
+        }
+        Some(RADIO_DOWN) => {
+            // An older driver that does not serve the power ops with its radio down. Nothing was cut.
+            out.line_fmt(ctx, format_args!("radio off hard failed - the radio is down and the driver did not cut the power; `kill {}` restarts it, and the respawn serves the command", ctx.wifi_radio.get()));
+            Err(ShellError::Unknown)
+        }
+        Some(_) => {
+            out.line_fmt(ctx, format_args!("radio off hard failed - the radio driver did not take the command"));
+            Err(ShellError::Unknown)
+        }
+        None => wifi_not_answering(ctx, out),
+    }
 }
 
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
@@ -7579,10 +12235,21 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // KERNEL discovered - vendor:device and which register BAR it mapped. This is which chip nic-driver
     // should be driving (Phase 4).
     let vd = ctx.nic_vendor_device();
-    let chip = if vd == 0x8168_10EC { "RTL8168" } else if vd == 0x100E_8086 { "e1000" }
-               else if vd == 0 { "none" } else { "unknown" };
-    out.line_fmt(ctx, format_args!(
-        "nic      {:04x}:{:04x}  mmio {:#x}  ({})", vd & 0xFFFF, vd >> 16, ctx.nic_mmio_base(), chip));
+    // vendor:device is a PCI fact, so a controller built into the SoC (the VisionFive's dwmac, the Pi 4's
+    // GENET) has none, and this line used to print `(none)` above a driver that was working. Say what
+    // the zero means instead: no PCI card, and where the kernel granted a window, a built-in controller.
+    let mmio = ctx.nic_mmio_base();
+    if vd == 0 {
+        if mmio != 0 {
+            out.line_fmt(ctx, format_args!("nic      built in, not on PCI  mmio {:#x}", mmio));
+        } else {
+            out.line(ctx, "nic      no PCI network card - a built-in or USB one, if driven, answers below");
+        }
+    } else {
+        let chip = if vd == 0x8168_10EC { "RTL8168" } else if vd == 0x100E_8086 { "e1000" } else { "unknown" };
+        out.line_fmt(ctx, format_args!(
+            "nic      {:04x}:{:04x}  mmio {:#x}  ({})", vd & 0xFFFF, vd >> 16, mmio, chip));
+    }
 
     // Query nic-driver directly (the shell holds ACQUIRE_ANY) for its MAC + link/TX/RX - proves whether
     // MMIO reaches the NIC (Phase 4). Abortable: press q if it stalls.
@@ -7599,10 +12266,36 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
                     p[1], p[2], p[3], p[4], p[5], p[6],
                     if p[0] == 1 { "ok" } else { "TIMEOUT (MMIO not reaching the chip)" }));
             }
+            // An EIGHT-byte answer ([ok, mac(6), link]) is a backend with one link - e1000 today; every
+            // other backend has a radio bridge and answers nine. Its link byte went unprinted, so `net`
+            // never said whether the cable was up. It also ties the address lines below to the live link,
+            // as the 15-byte answer does.
+            if p.len() == 8 {
+                nic_link_up = p[7] != 0;
+                out.line(ctx, if nic_link_up { "link     up via the cable" } else { "link     down - no cable" });
+            }
+            // A nine-byte answer is a backend with a radio bridge, and its last byte says which link
+            // carries the frames (`Carrier` in nic-driver's `radio.rs`): 1 the cable, 2 the radio, 0 neither. The cable
+            // always wins; the radio carries the link only while the cable is out and it is joined.
+            if p.len() == 9 {
+                // The live link, for the address lines below - as the eight- and long answers set it. It
+                // was not set here, so a radio-bridge board with the cable out and the radio not joined
+                // said `link down` and then printed the old address and `ping ok` as if it were up.
+                nic_link_up = p[7] != 0;
+                out.line_fmt(ctx, format_args!("link     {}", match p[8] {
+                    1 => "up via the cable",
+                    2 => "up via wifi (the cable is out)",
+                    _ => "down - no cable, and the radio is not joined",
+                }));
+            }
             // Extended status (RTL8168 Stage B, 15 bytes): live link + TX/RX counts, so the TV shows the
             // whole bring-up story without the serial log.
             if p.len() >= 15 {
                 nic_link_up = p[7] != 0;   // remember the live link for the net-stack lines below
+                // The carrier in the same words as the eight- and nine-byte answers above. A backend with
+                // a radio answers nine bytes while the cable is out, so a long answer is the cable's; on
+                // the PCs `link up via wifi` and this line are the two halves of one switch.
+                out.line(ctx, if nic_link_up { "link     up via the cable" } else { "link     down - no cable" });
                 let rx_len = u16::from_le_bytes([p[9], p[10]]);
                 let tx_cnt = u16::from_le_bytes([p[11], p[12]]);
                 let rx_cnt = u16::from_le_bytes([p[13], p[14]]);
@@ -7654,6 +12347,19 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // bit1 ping ok). Formatting is the shell's job; net-stack reports raw facts.
     // Reflect the LIVE link, not the frozen record. If the cable is out, EVERY net-stack line is degraded -
     // showing the stale (often fallback, e.g. 10.0.2.x) IP/gateway/DNS as if current is the "stale info" bug.
+    // net-stack's status while it has never had a link is a SENTINEL, nineteen bytes of text rather
+    // than nineteen bytes of addresses, and printing it as numbers gave `ip 108.105.110.107` - the
+    // word "link" - with a gateway at "32.100.111.119". Seen the first time a machine booted
+    // unplugged and joined a radio before the stack looked again.
+    if p.len() >= 19 && &p[..19] == b"link down (no cable" {
+        out.line(ctx, "ip       unassigned (net-stack has had no link since boot - it configures on the next request once one is up)");
+        out.line(ctx, "gateway  unresolved");
+        out.line(ctx, "ping     no");
+        // The same two lines as the link-lost branch below: NONE is for a live link with no lease.
+        out.line(ctx, "lease    n/a (no link - nothing to lease)");
+        out.line(ctx, "dns      unresolved");
+        return Ok(());
+    }
     if nic_link_up {
         let flags = p[14];
         out.line_fmt(ctx, format_args!("ip       {}.{}.{}.{}", p[0], p[1], p[2], p[3]));
@@ -7682,7 +12388,8 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         // it passes when a lease is held AND when there is no link to get one on, and fails only in the
         // case that is genuinely wrong, a live link with no lease. A machine without a cable is not a
         // failing machine.
-        out.line(ctx, "lease    ok (no link - nothing to lease)");
+        // `selfcheck` itself asks `net lease`, which still answers `ok` here; this line is for a person.
+        out.line(ctx, "lease    n/a (no link - nothing to lease)");
         out.line(ctx, "dns      unresolved");
     }
     Ok(())
@@ -8194,20 +12901,20 @@ fn cmd_uptime(ctx: &ServiceContext) -> Result<(), ShellError> {
 
 /// `random [n]` - one (or n, bounded 1..64) hardware-random u32 from the SoC RNG (the BCM2835 RNG on the
 /// Pi 2), printed as hex + decimal. Reports loudly if the machine exposes no hardware RNG.
-fn cmd_random(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn cmd_random(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     // Bare `random` = 1; a given count must be a number - reject junk LOUDLY, not silently as 1
     // (userspace-audit Audit 5, A5-U3; matches cmd_gpio's loud rejection).
     let a = arg.trim();
     let n = if a.is_empty() { 1 } else {
         match a.parse::<u32>() {
             Ok(v) => v.clamp(1, 64),
-            Err(_) => { ctx.console_writeln("random: count must be a number 1..64"); return Ok(()); }
+            Err(_) => { out.line(ctx, "random: count must be a number 1..64"); return Ok(()); }
         }
     };
     for _ in 0..n {
         match ctx.hw_random() {
-            Some(v) => ctx.console_writeln_fmt(format_args!("{:#010x}  {}", v, v)),
-            None => { ctx.console_writeln("random: no hardware RNG on this machine"); break; }
+            Some(v) => out.line_fmt(ctx, format_args!("{:#010x}  {}", v, v)),
+            None => { out.line(ctx, "random: no hardware RNG on this machine"); break; }
         }
     }
     Ok(())
@@ -8387,6 +13094,8 @@ fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
         14 => write_bytes(buf, &mut p, b"fire_irq"),
         15 => write_bytes(buf, &mut p, b"image_spawn"),
         16 => write_bytes(buf, &mut p, b"pci_cfg"),
+        17 => write_bytes(buf, &mut p, b"device_power"),
+        18 => write_bytes(buf, &mut p, b"cpu_clock"),
         other => { write_bytes(buf, &mut p, b"endpoint#"); write_u32(buf, &mut p, other as u32); }
     }
     p
@@ -8578,7 +13287,27 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
 
     // Stage 1 - produce a Stream.
     let (c0, _) = split_first(stages[0]);
-    let mut s = if is_record_producer(c0) {
+    // `wifi list` and `wifi hardware` are the `wifi` verbs that are tables; `status`, `info` and the rest are labelled lines.
+    let wifi_records = c0 == "wifi" && matches!(split_first(stages[0]).1.trim(), "list" | "hardware");
+    // `hardware` and `hardware <sections>` are a table; one device is labelled lines.
+    let hardware_records = c0 == "hardware" && {
+        let a = split_first(stages[0]).1.trim();
+        a.is_empty() || matches!(a, "interrupts" | "problems" | "tree" | "firmware" | "events")
+            || a.starts_with("compare ") || hw_sections(a).is_some()
+    };
+    // `events log boot` is text, not records: the boot record is 32 KiB and a table holds 4.
+    let events_boot = c0 == "events" && {
+        let mut w = split_first(stages[0]).1.split_whitespace();
+        w.next() == Some("log") && w.next() == Some("boot") && w.next().is_none()
+    };
+    let mut s = if events_boot {
+        let mut cap = Cap::new();
+        if events_log_boot(ctx, &mut Out::Capture(&mut cap)).is_err() {
+            return Err(ShellError::Unknown);
+        }
+        if cap.overflow { ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)"); }
+        Stream::Bytes(cap)
+    } else if is_record_producer(c0) || wifi_records || hardware_records {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
             "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -8588,6 +13317,9 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
             "jobs"    => build_jobs_table(ctx),
+            "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
+            "hardware" => match build_hardware_table(ctx, cwd, arg) { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "wifi"    => match build_wifi_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
             // `events ipc` / `events failures` are record sources; the other subcommands are readers
             // of live kernel state that print a tree, and a tree is not a table. Piping one of those
             // is refused loudly rather than quietly yielding the wrong thing.
@@ -8637,8 +13369,17 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             Err(why) => { ctx.console_writeln_fmt(format_args!("{}: bad record stream - {}", c0, why)); return Err(ShellError::Unknown); }
         }
     } else if is_producer_builtin(c0) {
+        if let Some(why) = producer_refusal(c0, split_first(stages[0]).1) {
+            ctx.console_writeln(why);
+            return Err(ShellError::Unknown);
+        }
         let mut cap = Cap::new();
-        run_producer(ctx, cwd, stages[0], &mut Out::Capture(&mut cap));
+        if !run_producer(ctx, cwd, stages[0], &mut Out::Capture(&mut cap)) {
+            // What the producer said goes to the CONSOLE, where the person is, and the pipe stops:
+            // an error is not a row.
+            Out::Console.put_bytes(ctx, cap.bytes());
+            return Err(ShellError::Unknown);
+        }
         if cap.overflow { ctx.console_writeln("pipe: producer output exceeded the pipe buffer (truncated)"); }
         Stream::Bytes(cap)
     } else if is_pipe_producer_service(c0) {
@@ -8772,7 +13513,14 @@ fn assert_stream(ctx: &ServiceContext, s: &Stream, arg: &str) -> Result<(), Shel
     let held = match check {
         "contains" => contains(bytes, want.as_bytes()),
         "lacks"    => !contains(bytes, want.as_bytes()),
-        "empty"    => trim_bytes(bytes).is_empty(),
+        // A RECORD stream is empty when it has no rows. Its rendering always carries the header line, so
+        // judging the text made `| where ... | assert empty` impossible to pass - found by the first
+        // check that asked it of a table (`selfcheck hardware`, `hardware problems | where
+        // severity=error | assert empty`, 2026-10-09).
+        "empty"    => match s {
+            Stream::Table(t) => t.nrows() == 0,
+            Stream::Bytes(_) => trim_bytes(bytes).is_empty(),
+        },
         _ => {
             ctx.console_writeln_fmt(format_args!("assert: unknown check '{}' (try: contains, lacks, empty)", check));
             return Err(ShellError::Unknown);
@@ -9002,6 +13750,53 @@ const TRACE_SLOTS: u32 = 256;
 /// turned a reference into something you had to page through to find one line. A view's columns are
 /// only interesting once you are looking at that view, so they live with it. `events help` is now the
 /// map; this is the detail, one screen at a time, and neither needs a pager.
+/// `events <view> help` for the two views `trace_sub_help` does not explain (`log`, `metrics`). Every other
+/// view's help - columns and all - is `trace_sub_help`'s, and both `sub_help` and `cmd_events` try that
+/// first, so the answer is the same whichever path the words take.
+fn events_sub_help(ctx: &ServiceContext, view: &str) -> bool {
+    match view {
+        "log" => help_block(ctx, "events log", "log lines: the sink's recent window, or the kernel's copy of the boot", &[
+            ("events log [n]", "the last n log lines the sink kept", "events log 20"),
+            ("events log boot", "the kernel's fixed copy of the first 32 KiB ever logged - it never wraps; pipes as lines", "events log boot | match xhci"),
+        ], false),
+        "metrics" => help_block(ctx, "events metrics", "per-service counters", &[
+            ("events metrics", "published samples: owner, metric, value, age", "events metrics"),
+        ], false),
+        _ => return false,
+    }
+    true
+}
+
+/// `chaos <mode> help` - one block per mode (conventions rule 2). Four of the six modes had no help at all:
+/// `chaos kill-storm help` read `help` as a service name and refused it with the list.
+fn chaos_sub_help(ctx: &ServiceContext, mode: &str) -> bool {
+    match mode {
+        "kill-storm" => help_block(ctx, "chaos kill-storm", "kill one service repeatedly and verify it recovers", &[
+            ("chaos kill-storm <svc> [n] [save <path>]", "kill <svc> n times (default 20); each round waits for the supervisor's restart; `save` writes the rounds to a file", "chaos kill-storm fs 20"),
+        ], false),
+        "flood-storm" => help_block(ctx, "chaos flood-storm", "saturate a service's queue and verify it drains", &[
+            ("chaos flood-storm <svc> [n]", "fill <svc>'s 16-deep endpoint n times; a service that wedges under a full queue is found here", "chaos flood-storm events 5"),
+        ], false),
+        "mem-pressure" => help_block(ctx, "chaos mem-pressure", "a service allocates to its limit, then frees", &[
+            ("chaos mem-pressure [n]", "spawn the mem-pressure probe n times; each allocs to its contract limit (AllocDenied is the expected loud stop) and reclaims", "chaos mem-pressure 3"),
+        ], false),
+        "spawn-storm" => help_block(ctx, "chaos spawn-storm", "spawn to the task ceiling and watch the refusal", &[
+            ("chaos spawn-storm [n]", "spawn mem-pressure tasks until the kernel refuses; the refusal must be loud and the system must stay up", "chaos spawn-storm"),
+        ], false),
+        "max-carnage" => help_block(ctx, "chaos max-carnage", "the chaos monkey: random or aimed kills every round", &[
+            ("chaos max-carnage all-services <n> [yes]", "each round kills a RANDOM subset of the live services (the supervisor included), plus system-wide mem-pressure and spawn-storm; `yes` skips the confirm", "chaos max-carnage all-services 100"),
+            ("chaos max-carnage all-services <n> seed <s>", "replay a run's random draws: every all-services run prints its seed at the start and in its report (an aimed run draws nothing). It replays the draws, not the timing, so a run can part ways with the one it repeats", "chaos max-carnage all-services 100 seed 1234567890"),
+            ("chaos max-carnage <svc> <n>", "aim every round at one service", "chaos max-carnage fs 50"),
+            ("chaos max-carnage <svc>,<svc>,... <n>", "kill EVERY listed service each round - cascade stress", "chaos max-carnage fs,events 100"),
+        ], false),
+        "link-flap" => help_block(ctx, "chaos link-flap", "simulate a cable unplug and replug", &[
+            ("chaos link-flap [n]", "force the NIC's reported link DOWN then UP n times (default 1) so net-stack reconfigures on the up edge; q quits and clears the override", "chaos link-flap 3"),
+        ], false),
+        _ => return false,
+    }
+    true
+}
+
 fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
     match view {
         "blocked" => help_block(ctx, "trace blocked", "every task stuck on ANOTHER task", &[
@@ -9096,11 +13891,12 @@ fn cmd_events(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             Ok(())
         }
         // `events <view> help` - the detail for one view, before the view itself runs.
-        v if rest == "help" && trace_sub_help(ctx, v) => Ok(()),
+        v if rest == "help" && (trace_sub_help(ctx, v) || events_sub_help(ctx, v)) => Ok(()),
         "ipc" => trace_events(ctx, false),
         "failures" => trace_events(ctx, true),
         // `persist` needs the whole remainder (`start /p svc 7d`), not the two tokens `sub`/`rest`.
         "persist" => events_persist(ctx, arg["persist".len()..].trim()),
+        "log" if rest == "boot" => events_log_boot(ctx, &mut Out::Console),
         "log" => events_log(ctx, rest),
         "metrics" => trace_metrics(ctx),
         "status" => trace_status(ctx),
@@ -10819,6 +15615,49 @@ fn events_log(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
     Ok(())
 }
 
+/// `events log boot` - the kernel's BOOT RECORD: a fixed copy of the first bytes ever logged, which
+/// never wraps (CLAUDE.md 11.4, InspectKernel query 27). Not the sink's window: `events log` is what the
+/// `events` service kept of the last few minutes, this is what the KERNEL kept of the first ones.
+///
+/// Text, not records, and by necessity rather than taste: the record is 32 KiB and a table's arena is
+/// 4 KiB. Piped it is lines, to `match`; the pipe holds 16 KiB, and a longer record says it was cut.
+/// The closing sentence goes to the console, never into the pipe, so `| count` counts log lines.
+fn events_log_boot(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+    let (held, cap) = match ctx.boot_record_size() {
+        Some(s) => s,
+        None => {
+            ctx.console_writeln("events: the kernel refused the boot record - reading it needs INTROSPECT");
+            return Err(ShellError::Unknown);
+        }
+    };
+    let mut buf = [0u8; godspeed_sdk::service_context::BOOT_READ_CHUNK];
+    let mut off = 0usize;
+    while off < held {
+        match ctx.boot_record_read(off, &mut buf) {
+            Some(0) => break,
+            Some(n) => {
+                out.put_bytes(ctx, &buf[..n]);
+                off += n;
+            }
+            None => {
+                ctx.console_writeln_fmt(format_args!(
+                    "events: the kernel refused the boot record at byte {} of {}", off, held));
+                return Err(ShellError::Unknown);
+            }
+        }
+    }
+    if held >= cap {
+        ctx.console_writeln_fmt(format_args!(
+            "events: the boot record is FULL at {} KiB and stopped there - later lines are on serial, and the recent ones in `events log`", cap / 1024));
+    } else {
+        // Not yet full: it holds EVERYTHING logged since boot, and keeps filling until it is. On the Pi 2
+        // it read 29323 bytes, and 29591 bytes a few seconds later; "the whole boot record" read as final
+        // when it was still growing.
+        ctx.console_writeln_fmt(format_args!(
+            "events: the boot record holds everything logged since boot, {} byte(s) - it fills to {} KiB and then stops. It is the KERNEL'S copy and never wraps; `events log` is the sink's recent window", held, cap / 1024));
+    }
+    Ok(())
+}
 
 fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {
     let t = match build_trace_metrics_table(ctx) {
@@ -11517,7 +16356,39 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help")
+                 | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help"
+                 | "wifi" | "audio" | "hardware" | "random" | "tcp" | "churn")
+}
+
+/// Which `wifi` verbs may start a pipe: the REPORTS, whose value is their output (`utilities/56_wifi.md`
+/// section 3 - `wifi list | where security=WPA2`, `wifi list | count`). The ACTIONS refuse, because their value is
+/// their effect and their output is a conversation: `scan` draws a picker and waits on a key, `join` reads a
+/// passphrase from the console - piped, its prompt would vanish into the pipe while it waited - and the
+/// power verbs print progress. `None` when the verb may be piped, else the sentence that says why not.
+fn wifi_pipe_refusal(arg: &str) -> Option<&'static str> {
+    let a = arg.trim();
+    // `hardware` and `hardware <radio>` are reports; `hardware use` is an action.
+    if a == "hardware" || (a.starts_with("hardware ") && !a["hardware ".len()..].trim().starts_with("use")) {
+        return None;
+    }
+    match arg.split_whitespace().next().unwrap_or("") {
+        "list" | "stored" | "status" | "info" | "debug" | "version" => None,
+        "" => Some("pipe: bare 'wifi' prints its usage, which is not data - pipe a report: wifi list, stored, status, info, debug or hardware"),
+        _ => Some("pipe: that 'wifi' verb is an action, not a report, so it cannot start a pipe - the reports are: wifi list, stored, status, info, debug and hardware"),
+    }
+}
+
+/// A producer whose verbs are not all reports: the sentence refusing this one, or `None` to run it. `wifi`
+/// and `churn` are the two - `churn <seconds>`, `tear` and `reset` change the disk and narrate it, while
+/// `churn verify` is the verdict a power-cut test exists to read (`churn verify | write /verdict.txt`).
+fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
+    match cmd {
+        "wifi" => wifi_pipe_refusal(arg),
+        "audio" => audio_pipe_refusal(arg),
+        "churn" if arg.split_whitespace().next() == Some("verify") => None,
+        "churn" => Some("pipe: only 'churn verify' is a report - 'churn <seconds>', 'tear' and 'reset' are actions and cannot start a pipe"),
+        _ => None,
+    }
 }
 
 /// Producer SERVICES that emit without needing input, so they can start a pipe (and follow the
@@ -11535,7 +16406,11 @@ fn is_record_producer_service(name: &str) -> bool {
 }
 
 /// Run a producer built-in (`cmd args`) with its output going to `out`.
-fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
+/// `false` when the producer FAILED - said only by `wifi` and `audio`, whose failures (no scan yet, a scan running, the
+/// radio down) must not reach a pipe as data: an empty `count` would say "no networks" about a radio
+/// nobody could ask (`utilities/56_wifi.md` section 3, "an error goes to nobody's pipe"). The other
+/// producers have always written their errors into the stream, and still do.
+fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) -> bool {
     let (cmd, arg) = split_first(cmdline);
     match cmd {
         "echo"         => { let _ = cmd_echo(ctx, arg, out); }
@@ -11550,12 +16425,24 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) {
         "cores"        => { let _ = cmd_cores(ctx, "", out); }
         "date"         => { let _ = cmd_date(ctx, arg, out); }
         "net"          => { let _ = cmd_net(ctx, arg, out); }
+        "wifi"         => return cmd_wifi(ctx, arg, out).is_ok(),
+        "audio"        => return cmd_audio(ctx, cwd, arg, out).is_ok(),
+        "hardware"     => return cmd_hardware(ctx, cwd, arg, out).is_ok(),
+        "random"       => { let _ = cmd_random(ctx, arg, out); }
+        "tcp"          => {
+            let mut a = [""; MAX_ARGS];
+            let n = tokenize(cmdline, &mut a);
+            let _ = cmd_tcp(ctx, &a[..n], out);
+        }
+        // Only `verify` gets here (`producer_refusal`).
+        "churn"        => { let _ = cmd_churn_verify(ctx, out); }
         "ping"         => { let _ = cmd_ping(ctx, arg, out); }
         "sock"         => { let _ = cmd_sock(ctx, out); }
         "help"         => help_to_out(ctx, out),
         "input"        => run_input(ctx, arg, out),
         _ => {}
     }
+    true
 }
 
 /// Run `inner` (a command or pipeline) with its output written to `out` - the machinery behind
@@ -11576,10 +16463,13 @@ fn run_captured(ctx: &ShellCtx, cwd: &Cwd, inner: &str, out: &mut Out) -> bool {
         ctx.console_writeln("gsh: $( ) cannot capture a pipeline (bounded stack). Stage it: 'greet | count | write /t.txt' then 'let n = $(read /t.txt)'");
         return false;
     }
-    let (c0, _) = split_first(inner);
+    let (c0, rest) = split_first(inner);
     if is_producer_builtin(c0) {
-        run_producer(ctx, cwd, inner, out);
-        return true;
+        if let Some(why) = producer_refusal(c0, rest) {
+            ctx.console_writeln(why);
+            return false;
+        }
+        return run_producer(ctx, cwd, inner, out);
     }
     if is_pipe_producer_service(c0) {
         // A bare producer service has no coexisting pipe_run Stream, so a 16 KiB drain Cap fits.
@@ -12088,15 +16978,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
             // firehose is just a big N (`all-services 5000`) and `q` aborts a long run early. `help` = usage.
             // tok[1] = target, tok[2] = rounds.
             if ntok >= 2 && tok[1] == "help" {
-                ctx.console_writeln("usage: chaos max-carnage <all-services | svc | svc,svc,...> <rounds>");
-                ctx.console_writeln("  all-services   RANDOM carnage over the whole restartable set each round (the honest");
-                ctx.console_writeln("                 chaos-monkey: supervisor a normal victim, nothing protected-last)");
-                ctx.console_writeln("  <service>      aim every round at one service (e.g. fs, events)");
-                ctx.console_writeln("  svc,svc,...    a comma-separated list: kill EVERY listed service each round (cascade stress)");
-                ctx.console_writeln("  <rounds>       REQUIRED for every form - the run is bounded (a firehose is a big N; q aborts early)");
-                ctx.console_writeln("  yes            optional 4th word: skip the [y/N] confirm (the warning still prints)");
-                ctx.console_writeln("  all run system-wide mem-pressure + spawn-storm. 'q' aborts (SERIAL if the run kills the kbd).");
-                ctx.console_writeln("  e.g. chaos max-carnage all-services 5000 | chaos max-carnage fs 50 | chaos max-carnage fs,events 100");
+                chaos_sub_help(ctx, "max-carnage");
                 Ok(())
             } else {
                 // A run needs a TARGET (all-services / a service / a comma-list) AND a positive ROUNDS count.
@@ -12133,11 +17015,33 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                     ctx.console_writeln("  (block-driver | fs | events | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     return Ok(());
                 }
-                // An optional 4th word skips the confirm: `chaos max-carnage all-services 100 yes`.
-                // A WORD, not `-y` - utilities/0_conventions.md 4: "Subcommands are words, never
-                // single-letter flags", so that a word means the same thing across every utility.
-                let preconfirmed = ntok >= 4 && tok[3] == "yes";
-                chaos_launch(ctx, target, rounds, preconfirmed)
+                // Optional words after the rounds, in either order: `yes` skips the confirm, `seed <n>`
+                // sets the random storm's seed. WORDS, not `-y` - utilities/0_conventions.md 4:
+                // "Subcommands are words, never single-letter flags".
+                let mut preconfirmed = false;
+                let mut seed: Option<u64> = None;
+                let mut i = 3;
+                while i < ntok {
+                    match tok[i] {
+                        "yes" => preconfirmed = true,
+                        "seed" => {
+                            match tok.get(i + 1).and_then(|t| parse_seed(t)) {
+                                Some(v) if i + 1 < ntok => { seed = Some(v); i += 1; }
+                                _ => {
+                                    ctx.console_writeln("max-carnage: `seed` takes a number - the one a run printed, e.g. seed 1234567890");
+                                    return Err(ShellError::Unknown);
+                                }
+                            }
+                        }
+                        other => {
+                            ctx.console_writeln_fmt(format_args!(
+                                "max-carnage: unknown word '{}' - after the rounds: yes, seed <n>", other));
+                            return Err(ShellError::Unknown);
+                        }
+                    }
+                    i += 1;
+                }
+                chaos_launch(ctx, target, rounds, preconfirmed, seed)
             }
         }
         "link-flap"    => chaos_link_flap(ctx, &tok, ntok),
@@ -12174,10 +17078,7 @@ fn hold_or_abort(ctx: &ServiceContext, secs: i64) -> bool {
 /// (net-stack's link) is its own scenario (do not build a speculative framework, §26.2).
 fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     if ntok >= 2 && tok[1] == "help" {
-        ctx.console_writeln("chaos link-flap [N] - simulate a cable unplug/replug N times (default 1)");
-        ctx.console_writeln("  forces the NIC link DOWN then UP (a report override, no hardware touch) so net-stack");
-        ctx.console_writeln("  notices the loss and self-configures on the up edge. tests LINK recovery, not process death.");
-        ctx.console_writeln("  [q] quit  (quitting clears the override)");
+        chaos_sub_help(ctx, "link-flap");
         return Ok(());
     }
     let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };
@@ -12253,6 +17154,9 @@ fn chaos_launch(
     // The warning still prints in full - it is the reason the confirm existed, and an unattended run
     // is exactly when the log needs to say what was about to happen.
     preconfirmed: bool,
+    // `seed <n>`: the random storm's seed, to replay a reported run's draws. None lets chaos draw one,
+    // which it prints.
+    seed: Option<u64>,
 ) -> Result<(), ShellError> {
     // Loud pre-flight warning + confirm, TAILORED to the target in three cases. all-services storms EVERY
     // driver, so the keyboard dies for sure (serial only). A single USB host driver (xhci/ehci) kills the
@@ -12307,18 +17211,22 @@ fn chaos_launch(
     // comma-list). Best-effort: chaos waits briefly for it; if it never arrives chaos runs a safe no-op
     // (0 rounds). Reclaim the cap (no leak).
     if let Some(cap) = ctx.acquire_send_cap("chaos") {
-        // rounds(4) + target string. The target may be a comma-separated list (e.g. "nic-driver,net-stack"),
-        // so the buffer is sized for a bounded list, not one name.
-        let mut buf = [0u8; 4 + 128];
+        // rounds(4) + has_seed(1) + seed(8) + target string. The target may be a comma-separated list
+        // (e.g. "nic-driver,net-stack"), so the buffer is sized for a bounded list, not one name.
+        let mut buf = [0u8; 13 + 128];
         buf[..4].copy_from_slice(&rounds.to_le_bytes());
+        if let Some(s) = seed {
+            buf[4] = 1;
+            buf[5..13].copy_from_slice(&s.to_le_bytes());
+        }
         let tb = target.as_bytes(); let n = tb.len().min(128);
-        buf[4..4 + n].copy_from_slice(&tb[..n]);
+        buf[13..13 + n].copy_from_slice(&tb[..n]);
         // TRY_SEND from the SHELL, because the shell is the user's only way back in. A blocking send
         // here hands `chaos` the power to hang the prompt just by having a full queue, which is the one
         // thing nothing above the kernel may do. A refused send is reported and the bounded wait below
         // then reports the real symptom - chaos never took the foreground - instead of the shell simply
         // never returning (§8.9, §26.7).
-        if ctx.try_send_by_handle(cap, &Message::from_bytes(&buf[..4 + n])).is_err() {
+        if ctx.try_send_by_handle(cap, &Message::from_bytes(&buf[..13 + n])).is_err() {
             ctx.console_writeln("chaos: could not be reached (its queue is full or it is restarting)");
         }
         ctx.remove_cap(cap);
@@ -14380,12 +19288,12 @@ fn fc_invoke(ctx: &ShellCtx, file: CapHandle, right: u8, payload: &[u8]) -> Opti
         return None;
     }
     // Await the reply FAILURE-AWARE (Commandment VIII): a bare `recv` here would hang forever if fs
-    // died after receiving the badged invocation but before replying. Reclaim the reply slot on every
-    // outcome (the reply cap is one-shot; Aborted/Timeout means it was never consumed).
-    // Same rule as the SDK: on a REPLY the cap is already gone (the send embedded it, and §8.5 removes
-    // an embedded cap from the sender's table), so removing it here removes whatever the kernel has
-    // since placed in that slot - which is how the file cap was being deleted. Reclaim it only on the
-    // paths where the send never delivered it.
+    // died after receiving the badged invocation but before replying.
+    // Same rule as the SDK: once the invoke above SUCCEEDED the cap is already gone (the send embedded
+    // it, and §8.5 removes an embedded cap from the sender's table), so removing it here removes
+    // whatever the kernel has since placed in that slot - which is how the file cap was being deleted.
+    // That holds on EVERY outcome below, an abort or a timeout included: they are waits after a
+    // delivered invoke, not sends that failed. Only the failed invoke above reclaims (backlog/67).
     let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
     match outcome {
         ReqOutcome::Reply(m) => {
@@ -14395,7 +19303,7 @@ fn fc_invoke(ctx: &ShellCtx, file: CapHandle, right: u8, payload: &[u8]) -> Opti
             if b.first() != Some(&tag) { return None; }
             Some(Message::from_bytes(&b[1..]))
         }
-        _ => { ctx.remove_cap(reply); None }
+        _ => None,
     }
 }
 
@@ -14724,7 +19632,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // log's integrity rested on the writer being well-behaved. A capability that cannot write
     // backwards makes it unrewritable by construction instead (§7.3).
     //
-    // Shaped like a real log, because that is what it is for: `WRITE_NEW` allocates the whole extent
+    // Shaped like a real log, because that is what it is for: `OP_WRITE_NEW` allocates the whole extent
     // up front and chunks go in at block-aligned offsets, exactly as `recorder` does it. So the rule
     // is against the resource's own HIGH-WATER MARK, not against end-of-file - the file is its final
     // size from the first moment.
@@ -16544,7 +21452,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         return Ok(());
     }
 
-    ctx.console_writeln("[q] cancel   [b] background");
+    ctx.console_writeln("[q] quit   [b] background");
     let mut shown = 101u32; // impossible, so the first sample always prints
     loop {
         if let Some(b) = ctx.try_console_read() {
@@ -17881,6 +22789,17 @@ fn u32_to_str(n: u32, buf: &mut [u8; 10]) -> &str {
         v /= 10;
     }
     core::str::from_utf8(&buf[i..]).unwrap_or("?")
+}
+
+/// A chaos seed as the run printed it: decimal, up to the full 64 bits.
+fn parse_seed(s: &str) -> Option<u64> {
+    if s.is_empty() || s.len() > 20 { return None; }
+    let mut v: u64 = 0;
+    for b in s.bytes() {
+        if !b.is_ascii_digit() { return None; }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(v)
 }
 
 fn parse_u32(s: &str) -> Option<u32> {

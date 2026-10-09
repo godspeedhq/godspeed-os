@@ -39,7 +39,8 @@ let msg = my_endpoint.recv()?;
 // Synchronous request/reply (waits on truth, never hangs): sends the request carrying a
 // one-shot reply cap and blocks for the reply. If the peer dies mid-request the kernel wakes
 // the caller with ReplyDead (CLAUDE.md §8.6) instead of hanging; the caller gets None,
-// reacquires the peer by name, and retries. This is the primitive fs's block_rpc rides on.
+// reacquires the peer by name, and retries. It waits without a bound; a client that must not
+// (fs's block_rpc among them) uses a `request_with_reply_deadline*` form of the same exchange.
 let reply = ctx.request_with_reply("fs", &request_msg);   // Option<Message>
 
 // Logging - plain, and formatted. `log_fmt` takes `format_args!` and renders through a
@@ -64,7 +65,7 @@ number by hand instead of using `log_fmt`).
 | **Capabilities** | `capability(name) -> Result<CapHandle>`; `derive_cap(h) -> Option<CapHandle>`; `remove_cap(h)`; `query_cap_rights(h)`; `self_grant_handle() -> Option<CapHandle>` |
 | **IPC** | `recv()`; `try_recv() -> Option`; `recv_timeout(cycles)`; `send(peer, &msg)`; `try_send(peer, &msg)`; `send_by_handle(h, &msg)`; `request_with_reply(peer, &msg) -> Option<Message>` (sync, waits on truth); `reacquire_by_name(peer) -> bool` |
 | **Delegated resource caps (§7.10)** | `resource_mint(rights) -> Option<(id, cap)>`; `resource_invoke(cap, right, reply, &msg)`; `resource_revoke(id) -> bool`; `last_recv_badge() -> Option<(id, right)>`; `take_pending_cap() -> Option<CapHandle>`; `send_with_cap_by_handle(peer_h, cap, &msg)`; `acquire_send_cap(peer) -> Option<CapHandle>` |
-| **Hardware (drivers, §12)** | `mmio() -> Option<Mmio>`; `dma_region() -> Option<Dma>`; `irq_unmask(vector)` |
+| **Hardware (drivers, §12)** | `mmio() -> Option<Mmio>`; `dma_region() -> Option<Dma>`; `irq_unmask(vector)`; `device_power(on) -> bool` (needs `DEVICE_POWER`, minted with a fixed device window the arch can power; §12.3); `cpu_clock(max) -> Option<u32>` (needs `CPU_CLOCK`, held by `power` alone) |
 | **CPU / lifecycle** | `yield_cpu()`; `park() -> !`; `spawn_on(name, core)` (TCB-only) |
 
 ## Records and pipe-friendly services (`record.rs`)

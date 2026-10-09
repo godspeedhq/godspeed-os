@@ -225,11 +225,20 @@ def check_services_peers():
 def check_services_covered():
     """A service the supervisor manages should be on the page describing the services."""
     page = read(os.path.join(SITE, "services.md"))
-    sched = read(os.path.join(ROOT, "kernel", "src", "task", "scheduler.rs"))
-    m = re.search(r'if matches!\(task_name,(.{0,600}?)\)\s*\{', sched, re.S)
-    managed = set(re.findall(r'"([a-z0-9-]+)"', m.group(1))) if m else set()
+    sup = read(os.path.join(ROOT, "services", "supervisor", "src", "main.rs"))
+    # FROM THE SUPERVISOR'S ROSTER. This read the kernel's restart list, which is gone: the supervisor
+    # now tells the kernel which tasks to watch (`SPAWN_FLAG_WATCHED`, from `MANAGED`), so `MANAGED` is
+    # the one list (docs/audio.md, "No service names in the kernel"). Comments are stripped first - a
+    # prose semicolon inside the array once truncated a parse of it - and the match runs to the `];`,
+    # not a fixed length: a fixed length once let this check pass while reading nothing.
+    code = re.sub(r"//[^\n]*", "", sup)
+    m = re.search(r"const MANAGED:\s*\[&str;[^\]]*\]\s*=\s*\[(.*?)\]\s*;", code, re.S)
+    if not m or not re.findall(r'"([a-z0-9-]+)"', m.group(1)):
+        return ["site_check: cannot find a non-empty `const MANAGED` in services/supervisor/src/main.rs "
+                "- refusing to call a check passed that read nothing"]
+    managed = set(re.findall(r'"([a-z0-9-]+)"', m.group(1)))
     managed -= {"counter", "supervisor"}          # a test service, and the page's own subject
-    return ["services.md does not mention `%s`, which the kernel manages (scheduler.rs restart set)"
+    return ["services.md does not mention `%s`, which the supervisor manages (`MANAGED`)"
             % n for n in sorted(managed) if "`%s`" % n not in page]
 
 

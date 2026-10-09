@@ -66,3 +66,29 @@ screendump*
 *.temp
 *.core
 *.dmp
+
+# ─── VENDOR FIRMWARE: COMMITTED, NOT IGNORED (docs/wifi.md 8) ─────────────────
+#
+# This block used to ignore `*.bin` firmware patterns, on the reasoning that Linux keeps no blobs in its
+# kernel tree. THAT DECISION WAS REVERSED THE SAME DAY, and the patterns are gone rather than left to
+# forbid what the policy now requires - a guard that contradicts its own rule is worse than none, because
+# the next person trusts it.
+#
+# What changed: Linux's separation is Debian's social contract and the DFSG, not a technical conclusion,
+# and a fetch-at-setup script has to reimplement someone else's packaging logic. Proven the hard way in
+# one sitting - the board-specific name is a symlink, into a SIBLING directory, to a filename that does
+# not exist in the tree because the packaging rules create it at build time. Every one of those failures
+# would have been a user's failure with a silent radio.
+#
+# So redistributable device firmware IS committed, under `nonfree/<part>/`, with its LICENCE beside it and
+# a PROVENANCE record carrying the upstream URL and a SHA-256 per file. `scripts/nonfree_check.py` enforces
+# both on every build, so the policy is mechanical rather than remembered. Firmware whose licence does NOT
+# permit redistribution stays out and is fetched on the owner's machine by `scripts/get_firmware.py`.
+#
+# THE EXCEPTION BELOW IS LOAD-BEARING. A pre-existing `*.bin` rule above this line silently kept
+# `nonfree/brcm43455/brcmfmac43455-sdio.bin` out of its own commit: the licence, the provenance and the
+# two smaller files went in, the firmware did not, and the gate certified all three because it was
+# reading the filesystem rather than git. Both halves are fixed - this un-ignore, and a tracked-file
+# check in `nonfree_check.py` so the same omission cannot pass again.
+!nonfree/
+!nonfree/**

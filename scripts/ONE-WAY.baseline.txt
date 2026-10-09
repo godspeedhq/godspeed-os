@@ -1,0 +1,30 @@
+# Raw-SDK calls that `gs` already covers, per crate (scripts/one_way_check.py). MAY FALL, MAY
+# NOT RISE; a crate absent from this list is held to zero. Rewritten by `--bless`.
+    2  examples/asker
+    2  examples/counter
+    8  examples/driver-skeleton
+    6  examples/holder
+    5  services/audio-driver
+   39  services/block-driver
+   24  services/chaos
+   13  services/console
+    7  services/control
+   24  services/copier
+  102  services/dwc2
+   20  services/ehci
+   11  services/events
+   34  services/fs
+    4  services/hw-enumerator
+    1  services/mem-pressure
+   94  services/net-stack
+   82  services/nic-driver
+    9  services/observe
+    5  services/power
+  270  services/probe
+    6  services/pwm-audio
+    8  services/recorder
+  194  services/shell
+   17  services/supervisor
+   28  services/time
+   25  services/wifi-driver
+   45  services/xhci

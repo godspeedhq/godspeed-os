@@ -7,9 +7,12 @@
 # This file may SHRINK freely - the checker says so when it can. It may not grow without
 # somebody deciding the new entry is one of those two things.
 
+HMB_DATA_FWHALT                    # docs/wifi.md - Linux brcmfmac, EXTERNAL; the to-host mailbox bit that triggers its automatic recovery
+force_turbo                        # docs/wifi.md - Raspberry Pi firmware config.txt option, EXTERNAL; holds the Arm cores at turbo, used 2026-10-01 and replaced by the power service (wifi.md 55, 57)
 CONSOLE_RENDER                     # docs/console-service.md
 FILE_FLAG_NO_BUFFERING             # backlog/26-visionfive-uboot-cannot-load-large-files.md
 MAX_FILES                          # docs/persistence.md
+mmc_io_rw_extended                 # docs/wifi.md - Linux mmc core, EXTERNAL; cited for the CMD53 argument this driver reimplements
 USE_FUA                            # CLAUDE.md, docs/arm32-usb-userspace.md, docs/pi2-deploy.md
 async_bulk_watchdog                # docs/arm32-usb-userspace.md
 bot_command                        # docs/arm32-status.md, docs/arm32-usb-userspace.md
@@ -55,3 +58,28 @@ ns_request                         # backlog/29 + docs/stdlib-design.md + utilit
 sock_invoke                        # docs/stdlib-design.md 16 - DELETED by 00b273ea, replaced by gs::resource's held-not-drained invoke; the section records the design it had
 split_txn                          # docs/arm32-usb-userspace.md - the IN-KERNEL dwc2 driver's split path, deleted with arch/arm/dwc2.rs; the port journal names what it was read against
 split_txn_periodic                 # docs/arm32-usb-userspace.md - ditto; `periodic_split_in` in services/dwc2 is what it became
+WRITE_TRANSFER_ACTIVE              # SDHCI SPEC present-state bit 8 - this driver has no constant for it and reads it only as part of the measured STATUS word; cited by its spec name where that word is decoded - external, 26.14
+active_time                        # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+bss_type                           # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+home_time                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+passive_time                       # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+scan_type                          # OpenBSD bwfm struct field named in the phase 3 layout tables; scan.rs names the OFFSET (req::/bss::) rather than the C field - external, 26.14
+bwfm_scan_v0                       # OpenBSD bwfm - the v0 scan path this driver targets; cited in the recorded v0-vs-v2 conflict - external, 26.14
+bwfm_scan_v2                       # OpenBSD bwfm - the v2 scan path, the first thing to try if a v0 scan returns nothing - external, 26.14
+brcmf_create_bsscfg                # Linux brcmfmac fwil.c - builds the `bsscfg:<name>` iovar payload (prefix, name, NUL, index u32, value); docs/wifi.md 37 quotes its 23-byte layout - external, 26.14
+brcmf_fwcap_map                    # Linux brcmfmac feature.c - the table the `cap` string is matched against (`sae `, `sae_ext`, `idauth`, ...) - external, 26.14
+sae_ext                            # a word in the firmware `cap` string (and brcmf_fwcap_map): WPA3 authentication done by the HOST; read off this board 2026-09-29 - external, 26.14
+bwfm_sdio_rx_glom                  # OpenBSD if_bwfm_sdio.c - reads one chunk per descriptor entry, strips the superframe header from the first, then parses each sub-frame by its own header; ctrl::subframes does the parsing half - external, 26.14
+aic8800_sdio                       # docs/wifi.md 44 - the AICSemi vendor Linux module for the VisionFive 2 Lite radio, named as the executable datasheet a riscv64 port would read - external, 26.14
+brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+si_watchdog                        # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+CHIP_REV_U03                       # docs/wifi-aic8800.md - AICSemi aic8800_bsp chip_rev enum, EXTERNAL; revision 7
+set_pmk                            # docs/wifi-aic8800.md - Linux cfg80211 op, EXTERNAL; cited as the handshake offload this firmware lacks
+dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXTERNAL; the second init order compared
+ap_max_inactivity                  # backlog/64 - hostapd configuration option, EXTERNAL; the access point idle timer that matches reason 4 after ~300 s
+mkeep_alive                        # backlog/64 - Broadcom firmware iovar Linux brcmfmac sets only for suspend, EXTERNAL
+SRVC_RQST                          # docs/wifi-aic8800.md - Linux jh7110-trng.c, STAT bit 27, EXTERNAL; cited because it is set after the first seed and nothing reads it
+IEEE80211_AUTH_MAX_TRIES           # docs/wifi-usb.md - Linux mac80211 mlme.c, EXTERNAL; the authentication retries R5b matches
+GENERATE_IV                        # docs/wifi-usb.md - Linux mac80211 key flag (IEEE80211_KEY_FLAG_GENERATE_IV), EXTERNAL; why the CCMP header is written by the host (R6)
+rtl8xxxu_disconnect                # docs/wifi-usb.md - Linux rtl8xxxu core.c, EXTERNAL; the unplug path that runs the power-off R9 ports

@@ -81,7 +81,7 @@
         },
         "hw_device": {
           "type": "string",
-          "enum": ["ahci", "nic", "xhci", "ehci", "dwc2", "framebuffer", "test-irq"],
+          "enum": ["ahci", "nic", "xhci", "ehci", "dwc2", "framebuffer", "test-irq", "audio_pwm", "wifi_sdio"],
           "description": "A NON-PCI device kind, named because nothing enumerates it: an SoC or boot fact (`dwc2` is soldered to the BCM283x, `framebuffer` is a Limine/mailbox handoff, `test-irq` is software). These are the names the kernel decodes to a `HwClass` variant. Reconciled against the supervisor's spawn row by scripts/contract_check.py. PCI devices do NOT belong here - they are named by what the bus says they are, via `hw_pci_class` below (step D1). `ahci` is retained only because removing an enum member narrows the schema (13.5); nothing uses it - block-driver is `hw_pci_class = \"010601\"` now."
         },
         "hw_pci_class": {
@@ -99,6 +99,10 @@
         "hw_pci_irq": {
           "type": "boolean",
           "description": "This driver takes an interrupt, so the kernel allocates a vector and programs MSI/MSI-X at spawn. Without it the driver polls. Reconciled against the supervisor's spawn row: a contract that stops declaring it while the row still asks for a vector is a FAIL, not a silent downgrade."
+        },
+        "cpu_clock": {
+          "type": "boolean",
+          "description": "Authority to set the Arm cores to the platform's minimum or maximum clock (syscall 55). Held by `power` alone, because the clock is one machine-wide setting and a second holder would silently overwrite the first; everyone else asks `power` for a lease over IPC (docs/power.md)."
         },
         "pci_cfg": {
           "type": "boolean",

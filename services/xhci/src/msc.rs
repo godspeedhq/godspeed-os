@@ -41,9 +41,10 @@
 //!   buffer on any keypress, regardless of which driver code thinks it holds the device. The disk's
 //!   CBW/CSW page here is the disk's alone - see `DISK_BASE`.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
-use crate::{next_event, EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
+use crate::{EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
 
 /// The disk's own DMA region, past the scratchpad tail (`SCRATCHPAD_BUF_BASE + MAX_SCRATCHPAD`).
 ///
@@ -93,7 +94,7 @@ const XFER_TIMEOUT_MS: u64 = 30_000;
 
 /// Poll iterations per `next_event` call. Small on purpose: it is only the granularity at which the
 /// CLOCK is re-checked, never the bound itself.
-const POLL_GRANULARITY: u32 = 4096;
+pub(crate) const POLL_GRANULARITY: u32 = 4096;
 
 /// Unrelated transfer events tolerated while waiting for ours. Bounds an event storm (a keyboard
 /// held down) without bounding the WAIT, which is the clock's job.
@@ -126,7 +127,9 @@ impl Ring {
     }
 
     /// Post one Normal TRB pointing at `buf_phys` for `len` bytes, with Interrupt On Completion.
-    fn push(&mut self, dma: &Dma, buf_phys: u64, len: u32) {
+    /// Returns the TRB's physical address: the pointer its transfer event will carry, which is how
+    /// the wait knows the completion is this TD's (`await_on_slot`).
+    fn push(&mut self, dma: &Dma, buf_phys: u64, len: u32) -> u64 {
         // Wrap if this TRB plus the Link that would follow it do not both fit. The Link is written
         // AT the cursor (where the controller's dequeue pointer sits), so there is no stale gap in
         // front of it for the controller to stop on.
@@ -151,6 +154,7 @@ impl Ring {
         // Cycle | IOC (bit 5) | type. IOC is what makes the transfer produce the event we await.
         dma.write32(t + 12, self.pcs | (1 << 5) | (TRB_NORMAL << 10));
         self.cur += TRB_SIZE;
+        dma.phys_at(t)
     }
 }
 
@@ -170,6 +174,8 @@ pub struct Disk {
     in_ring: Ring,
     /// CBW tag, incremented per command. Only its match in the CSW is meaningful.
     tag: u32,
+    /// Completions for this slot that retired a TRB no stage was waiting for (`await_on_slot`).
+    stale: u32,
     /// Total addressable sectors, from READ CAPACITY(10).
     pub sectors: u64,
     /// The root port the device sits on, so a disconnect can be noticed.
@@ -206,6 +212,7 @@ impl Disk {
             out_ring: Ring::new(OUT_RING),
             in_ring: Ring::new(IN_RING),
             tag: 1,
+            stale: 0,
             sectors: 0,
             port,
             hub_slot: 0,
@@ -231,7 +238,17 @@ impl Disk {
     }
 }
 
-/// Await the completion of a transfer on `slot`, ignoring events belonging to anything else.
+/// Await the completion of the TD at `want` on `slot`, ignoring events belonging to anything else.
+///
+/// **MATCHED ON THE TRB, not on the slot.** This took the first transfer event for the disk's slot
+/// as the answer to whatever stage was waiting. A stage whose wait ran out leaves its TD on the
+/// ring, and when that TD completes later its event lands in the NEXT command's wait: the CBW stage
+/// then ends on the old CSW, the data stage on the new CBW, and the caller reads `DATA_BUF` before
+/// the device has written it - the previous block's bytes, handed up as this block's. The CSW tag
+/// catches the status shifting, not the data. Seen on the Pi 4 across the re-scans the dongle's
+/// download fault causes: lba 7699 read back as the superblock, and `fs` logged `the transport served
+/// garbage as a complete transfer` (`docs/wifi-usb.md` 37). A completion for this slot that retires
+/// another TRB is now counted and passed over, never taken.
 ///
 /// A keyboard's interrupt endpoint stays ARMED, so its completions arrive at any time - including in
 /// the middle of a disk command. Matching on slot is what keeps a keystroke from being read as this
@@ -249,21 +266,38 @@ fn await_on_slot(
     mmio: &Mmio,
     ir0: usize,
     slot: u32,
+    want: u64,
+    stale: &mut u32,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     eaten: &mut EvMail,
 ) -> Option<u32> {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(XFER_TIMEOUT_MS));
+    // `gs::driver::wait`'s deadline. It does not sleep: a completion is looked for every poll window.
+    // On an uncalibrated clock the hand-built one was a single tick, so a transfer got one window of
+    // 4096 reads and was declared dead; the library's look count applies instead, and a look here is
+    // a whole window - a long bound, but one that ends.
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(XFER_TIMEOUT_MS));
     let mut unrelated = 0u32;
     // Our answer may already be in hand: another consumer of the shared event ring can have
     // dequeued it and filed it for us. Check the mailbox before touching the ring, or we would wait
     // out a deadline for a completion that already arrived.
-    if let Some(cc) = eaten.take(slot) {
-        return Some(cc);
+    let mut passed_over = |ctx: &ServiceContext, trb: u64, stale: &mut u32| {
+        *stale = stale.saturating_add(1);
+        if *stale <= 3 || *stale % 64 == 0 {
+            ctx.log_fmt(format_args!(
+                "xhci: a disk completion for TRB {:#x} while this stage waits on {:#x} - a TD an earlier wait gave up on; passed over, not taken ({} so far)",
+                trb, want, *stale));
+        }
+    };
+    match eaten.take_trb(slot, want) {
+        Some(Ok(cc)) => return Some(cc),
+        Some(Err(trb)) => passed_over(ctx, trb, stale),
+        None => {}
     }
     loop {
-        match next_event(dma, mmio, ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
-            Some((TRB_TRANSFER_EVENT, cc, sid)) if sid == slot => return Some(cc),
+        match crate::next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, POLL_GRANULARITY) {
+            Some((TRB_TRANSFER_EVENT, cc, sid, ptr, _, _)) if sid == slot && ptr == want => return Some(cc),
+            Some((TRB_TRANSFER_EVENT, _, sid, ptr, _, _)) if sid == slot => passed_over(ctx, ptr, stale),
             // Another consumer's transfer completed. FILE IT - do not just note that it happened.
             //
             // This arm used to record a re-arm bit and DISCARD the completion, which was fine for a
@@ -276,8 +310,8 @@ fn await_on_slot(
             // Measured: 328 probes posted, 151 answered, and ZERO late answers seen by the drain -
             // because they never reached the drain. They were eaten here.
             // `docs/xhci-completion-correlation.md`.
-            Some((TRB_TRANSFER_EVENT, cc, sid)) => {
-                eaten.put(sid, cc);
+            Some((TRB_TRANSFER_EVENT, cc, sid, ptr, ep, res)) => {
+                eaten.put(sid, ep, cc, res, ptr);
                 unrelated += 1;
                 if unrelated >= MAX_UNRELATED_EVENTS {
                     ctx.log("xhci: gave up waiting for a disk transfer - too many unrelated events");
@@ -287,7 +321,7 @@ fn await_on_slot(
             Some(_) => {} // port change or command completion; not ours
             None => {}    // this poll window saw nothing; the clock below decides whether to stop
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             ctx.log_fmt(format_args!(
                 "xhci: disk transfer got no completion in {} s - the device stopped answering",
                 XFER_TIMEOUT_MS / 1000
@@ -337,9 +371,9 @@ pub fn bot(
         dma.write8(CMD_PAGE + 15 + i, *b);
     }
 
-    d.out_ring.push(dma, dma.phys_at(CMD_PAGE), 31);
+    let trb = d.out_ring.push(dma, dma.phys_at(CMD_PAGE), 31);
     mmio.write32(dboff + d.slot as usize * 4, d.out_dci);
-    let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
+    let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, trb, &mut d.stale, ev_idx, ev_cycle, eaten)?;
     if cc != 1 && cc != 13 {
         return None;
     }
@@ -351,18 +385,18 @@ pub fn bot(
         } else {
             &mut d.out_ring
         };
-        ring.push(dma, dma.phys_at(DATA_BUF), data_len);
+        let trb = ring.push(dma, dma.phys_at(DATA_BUF), data_len);
         mmio.write32(dboff + d.slot as usize * 4, dci);
-        let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
+        let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, trb, &mut d.stale, ev_idx, ev_cycle, eaten)?;
         // 13 is Short Packet: the device sent less than asked, which for a data stage is normal.
         if cc != 1 && cc != 13 {
             return None;
         }
     }
 
-    d.in_ring.push(dma, dma.phys_at(CSW_OFF), 13);
+    let trb = d.in_ring.push(dma, dma.phys_at(CSW_OFF), 13);
     mmio.write32(dboff + d.slot as usize * 4, d.in_dci);
-    let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, ev_idx, ev_cycle, eaten)?;
+    let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, trb, &mut d.stale, ev_idx, ev_cycle, eaten)?;
     if cc != 1 && cc != 13 {
         return None;
     }

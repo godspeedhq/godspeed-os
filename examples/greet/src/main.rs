@@ -44,8 +44,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             // End-of-stream marker: a one-byte EOT (0x04). A built-in sink (the shell draining
             // `greet | write file`) recvs until it sees this, so it knows the stream is done
-            // without waiting forever. (A zero-length message is not a reliable signal - the
-            // IPC path does not deliver an empty body.) A service sink like `upper` just
+            // without waiting forever. (A byte says what it means; an empty body was not even
+            // delivered on three ports until 2026-10-08, `e3fcf7ed`.) A service sink like `upper` just
             // uppercases the control byte harmlessly.
             let _ = gs::ipc::send_to(&ctx, sink, &Message::from_bytes(&[0x04]));
             ctx.log("greet: sent 3 lines + EOF through the delegated pipe cap");

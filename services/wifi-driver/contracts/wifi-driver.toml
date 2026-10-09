@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# AArch64 (Raspberry Pi 4: the onboard CYW43455 on the Arasan host) and riscv64 (VisionFive 2 Lite: the
+# AIC8800D80 on its dw_mmc host), each reached over SDIO. The notes and the window below are the Pi 4's; on
+# each board the kernel grants the window by device kind.
+#
+# The device this drives is not on a bus anything enumerates: it is the Arasan SD host controller at a
+# fixed SoC address, wired on this board to the radio rather than to a card slot (the vendor device
+# tree's `mmcnr@7e300000`). So there is no PCI class code to name, and the window is granted BY DEVICE
+# KIND at spawn (`hw_device = "wifi_sdio"`, `arch::aarch64::map_fixed_device`, the §12.3 fixed-peripheral
+# grant) - never by this service's name - and only where the
+# kernel's boot census saw that controller answer. `hw_mmio` below declares the window truthfully; it is
+# a reviewable statement of what this service may reach (§13.3), not the mechanism that grants it, which
+# is the spawn request (§13.6).
+name    = "wifi-driver"
+version = "0.1.0"
+
+[resources.memory]
+request = "8MiB"
+limit   = "16MiB"
+
+[capabilities]
+# The Arasan SDHCI register block: 0x100 of registers, so one page. Reached through the SDK's safe
+# `Mmio` wrapper via `ctx.mmio()`, which is what keeps this service free of `unsafe` (§18.1/§18.2).
+hw_device   = "wifi_sdio"
+hw_mmio     = ["0xfe300000+0x1000"]
+ipc_receive = ["wifi-driver"]
+log_write   = true
+# `fs` - ONE peer, for one file: `/wifi.keys`, the credential table on disk (`keyfile.rs`;
+# `utilities/56_wifi.md` 6). Read once when the radio comes up, written after every change to the
+# table. Reacquired by name when `fs` restarts (Commandment IX), and every request to it is bounded:
+# an `fs` that is absent or mid-restart costs the driver a line in the log and nothing else - it runs
+# on the table in memory, as it did before the file existed.
+# `power` - for a LEASE on the Arm clock while the firmware loads (`docs/power.md`, `docs/wifi.md` 55):
+# the chip's firmware traps when it is uploaded with the cores at their minimum clock. Bounded both
+# ways - the request has a deadline, and the lease expires on its own if this driver dies holding it -
+# and optional: a `power` that is absent or refuses costs a line in the log, and the load goes ahead.
+ipc_send    = ["fs", "power"]
+#
+# NOTHING ELSE is sent. The shell's `wifi` requests and `nic-driver`'s frame ops (0x10 INFO / 0x11 TX /
+# 0x12 RX) are answered through the reply cap each request carries, and everything this service reports
+# goes through `log_write` above, which reaches the kernel ring and the serial line and depends on no
+# service at all (§11.4). Every other driver declares `events` for automatic IPC tracing; here the grant
+# would be standing authority a compromise inherits (§3.1, §26.9), for traffic that is traced from the
+# other end (`nic-driver` measures every exchange).
+#
+# NO `hw_interrupt`, deliberately. The driver POLLS, and so does everything above it: control commands
+# complete in microseconds on the CMD line, the scan and the join read frames one at a time between
+# requests, and the data path is pulled - `nic-driver` asks on `net-stack`'s pace and each ask reads what
+# the chip has waiting (`frames::pull`). Joined and idle, the serve loop also pulls every 250 ms (`IDLE_PULL_MS`); a
+# card interrupt would let it be read sooner, and would be the first thing to add if that wait ever
+# shows in a measurement. Asking for a vector this service would not service is the failure invariant 12
+# exists to prevent, and a capability granted to nobody's benefit is standing authority a compromise
+# inherits (§3.1, §26.9).
+#
+# NO DMA arena either, and this stays true: the firmware upload (CMD53, 600 KiB), every control frame
+# and every data frame go through the host controller's data port by programmed I/O. The SDIO host on
+# this board can master DMA; this driver does not ask it to, so it holds no physical memory to point a
+# device at (§6.4).
+
+[placement]
+# Core 3, which on this four-core board is the one the boot roster leaves quietest: the shell and the
+# console are on core 0, `block-driver` on 1, `xhci` on 2. This is a PREFERENCE - the supervisor falls
+# back to round-robin if that core is not ready - so it costs nothing on a machine that comes up with
+# fewer cores.
+core = 3

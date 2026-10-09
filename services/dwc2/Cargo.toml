@@ -14,3 +14,8 @@ qemu = []
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+# `gs::driver` (docs/driver-library.md): the bounded waits.
+godspeed = { path = "../../stdlib/rust" }
+# `godspeed_wifi::usbfn`: the radio function protocol this host serves to `wifi-usb` (docs/wifi-usb.md).
+# Constants only; nothing of 802.11 is linked into this service.
+godspeed-wifi = { path = "../../sdk/wifi" }

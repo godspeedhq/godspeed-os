@@ -8,6 +8,7 @@
 //! device class `0xff` (vendor-specific), which is why the endpoint walk does NOT filter by class:
 //! there is no standard class to match, only bulk endpoints to find.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::chan::{self, Target};
@@ -1099,7 +1100,7 @@ pub fn tx(
     // the device holds them in its own FIFO, which is the whole reason RX_FIFO_INF is non-zero while
     // this happens. Receive latency is a fair price for transmit existing at all.
     if nic.in_armed {
-        chan::halt(mmio, CH_NET_RX);
+        chan::halt(ctx, mmio, CH_NET_RX);
         // CARRY THE DATA TOGGLE ACROSS THE HALT.
         //
         // A bulk endpoint's toggle alternates per packet and BOTH ends track it; if they disagree the
@@ -1288,7 +1289,7 @@ pub fn tx(
     // Arming here closes the gap to the length of the transmit itself.
     if !nic.in_armed {
         nic.rx0[0] = nic.rx0[0].saturating_add(1);
-        arm_in(mmio, dma, t, nic);
+        arm_in(ctx, mmio, dma, t, nic);
     }
     ok
 }
@@ -1341,12 +1342,12 @@ impl Nic {
 ///
 /// Extracted so `tx` can call it the moment it finishes, rather than leaving the channel unarmed until
 /// the next receive poll - see the call there for what that gap cost.
-fn arm_in(mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic) {
+fn arm_in(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic) {
     // Clear HCINT before arming: it is write-1-to-clear and holds whatever the LAST transfer on this
     // channel left behind. Arming without clearing means the first check reads a stale completion and
     // harvests a buffer the device has not written yet.
     mmio.write32(chan::hcint_at(CH_NET_RX), 0xFFFF_FFFF);
-    chan::program(mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET_RX,
+    chan::program(ctx, mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET_RX,
                   true, nic.pid_in, RX_BURST as u32, dma.phys_at(RX_OFF) as u32,
                   nic.ep_in as u32, 2, 0);
     // Unmask this channel's terminal halt, exactly as the working kernel driver does before it arms its
@@ -1404,7 +1405,7 @@ pub fn rx(
     // kernel driver's background-armed IN, in the shape this service can use: a non-blocking poll per
     // pass instead of an interrupt, because the frame path here is driven by the serve loop.
     if !nic.in_armed {
-        arm_in(mmio, dma, t, nic);
+        arm_in(ctx, mmio, dma, t, nic);
         return 0;   // nothing yet - the device answers when it has something
     }
     // COMPLETION IS ChEna GOING CLEAR, not an HCINT bit.
@@ -1543,13 +1544,17 @@ fn bulk(
     why: Option<&mut (u32, u32)>, ping: Option<&mut bool>,
 ) -> Option<u32> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(budget_ms));
+    // `gs::driver::wait`'s deadline. A look is a whole channel attempt (up to `wait_halt`'s 50 ms), so
+    // on an uncalibrated clock the library's 200,000 looks are 200,000 attempts, which can be hours: it
+    // ends, where the one-tick deadline built from `duration_cycles` allowed a single attempt. Recorded
+    // in `docs/driver-library.md` as an open gap, not a bound anyone chose.
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(budget_ms));
     let mut last = 0u32;
     let mut halted = 0u32;
     // PING applies to an OUT endpoint only; an IN never pings (Linux: `ep_is_in` => do_ping = 0).
     let mut do_ping = !dir_in && ping.as_ref().map_or(false, |p| **p);
     loop {
-        chan::program_ping(mmio, &bt, CH_NET, dir_in, *pid, len, buf_phys, ep as u32, 2, 0, do_ping);
+        chan::program_ping(ctx, mmio, &bt, CH_NET, dir_in, *pid, len, buf_phys, ep as u32, 2, 0, do_ping);
         match chan::wait_halt(ctx, mmio, CH_NET, 50) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
                 // HOW MANY BYTES WENT - and for an OUT the answer is NOT in HCTSIZ.
@@ -1591,7 +1596,7 @@ fn bulk(
             }
             None => {}
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             break;
         }
     }

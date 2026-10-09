@@ -17,7 +17,8 @@ handed the producer at composition time.
 - A producer sends each line as an IPC `Message` over `send_peers[0]` - the SEND cap the
   **shell** delegated to it at spawn (`ctx.send_peer_at(0)`).
 - It ends the stream with a one-byte EOT marker (`0x04`) so a sink knows the stream is done
-  without waiting forever (a zero-length message is not a reliable signal).
+  without waiting forever (a byte says what it means; an empty message was not even delivered on
+  three ports until 2026-10-08).
 - It declares **no** send peers of its own. Its only reach is the one cap the shell wired in.
 
 ## Why it is built this way (the Commandments)

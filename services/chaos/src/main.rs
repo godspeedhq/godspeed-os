@@ -265,6 +265,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut rounds: u64 = 0;
     let mut tbuf = [0u8; 128];   // target string; may be a comma-separated list, so sized for a bounded list
     let mut tlen = 0usize;
+    // The operator's seed (`chaos max-carnage ... seed <n>`), or None for one drawn here. The message is
+    // `rounds u32 | has_seed u8 | seed u64 | target`, written by the shell's `chaos_launch` - both ends
+    // ship in one image, so the layout changed with both of them.
+    let mut given_seed: Option<u64> = None;
     {
         let t0 = ctx.epoch_secs_monotonic();
         let mut aw = 0u32;
@@ -272,7 +276,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if let Some(msg) = ctx.try_recv() {
                 let b = msg.payload_bytes();
                 if b.len() >= 4 { rounds = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64; }
-                if b.len() > 4 { let n = (b.len() - 4).min(128); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
+                if b.len() >= 13 && b[4] == 1 {
+                    let mut s = [0u8; 8];
+                    s.copy_from_slice(&b[5..13]);
+                    given_seed = Some(u64::from_le_bytes(s));
+                }
+                if b.len() > 13 { let n = (b.len() - 13).min(128); tbuf[..n].copy_from_slice(&b[13..13 + n]); tlen = n; }
                 break;
             }
             if ctx.epoch_secs_monotonic() - t0 >= 2 { break; }
@@ -281,10 +290,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.yield_cpu();
         }
     }
-    // The TARGET: DEFAULT (no target) = "random" - a RANDOM subset of the restartable set each round (the
-    // honest chaos-monkey storm; supervisor is a normal victim, nothing protected-last). "all-services" =
-    // a full even sweep of every live service each round; a service name = aim every round at THAT one; a
-    // comma-list = kill every listed one each round. mem-pressure + spawn-storm are system-wide in all modes.
+    // The TARGET, which the shell requires (`0cb8985b`): "all-services" = a RANDOM subset of the live set
+    // each round (the honest chaos-monkey storm; supervisor is a normal victim, nothing protected-last); a
+    // service name = aim every round at THAT one; a comma-list = kill every listed one each round. (This
+    // said "all-services" was a full even sweep of every service each round, which the line below
+    // contradicts and the logs do too: a 100-round run on the T630 swept between 4 and 12 a round.) mem-pressure + spawn-storm are system-wide in all modes.
     let target: &str = if tlen == 0 { "random" } else { str_of(&tbuf[..tlen]) };
     // all-services = the RANDOM whole-set storm (a random subset each round). The shell now REQUIRES a target
     // (a bare max-carnage is refused there), so tlen==0 should not occur; keep it -> random defensively.
@@ -330,6 +340,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut nsv = 0usize;
 
     let (mut round, mut killed, mut flooded, mut mempr, mut spawns) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // Of `spawns`, the ones refused. The count above is what chaos FIRED, deliberately; this is what the
+    // system did with it, so a run in which NO mem-pressure task ever ran says so instead of reading as a
+    // pass (a Pi 2 run refused 982 of 1000 for want of a page-table root, `docs/wifi-usb.md` 47).
+    let mut spawns_refused = 0u64;
     // Wall-clock start (RTC, year-guarded): the datetime for the "started HH:MM:SS" readout, and its epoch
     // for elapsed + the linear ETA (a pure extrapolation of elapsed over round progress, no outside truth).
     // `datetime()` is the kernel's RAW RTC. Machines without one (the Pi) read zero here, and since
@@ -379,10 +393,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //   - the hardware RNG where the SoC has one (the Pi's BCM2835; ungated, entropy grants nothing),
     //   - the monotonic counter, which is real from boot even with no clock at all,
     //   - the wall clock, when it happens to be set.
-    let mut rng = Rng::new((start_epoch as u64)
+    //
+    // AND IT IS SAID. A seed nobody can see makes a run nobody can name: a break at round 400 million
+    // could be reported only as "somewhere". So the seed is printed when the run starts and again in its
+    // report, and `seed <n>` sets it. What that buys is stated with it, because it is easy to overclaim:
+    // a seed replays the DRAWS, not the run. One draw is made per LIVE service per round, and which are
+    // live depends on restart timing across cores, so two runs on one seed part ways at the first round
+    // whose timing differs. It narrows a report to one run's decision stream; it does not make a break
+    // repeat on demand.
+    let seed = given_seed.unwrap_or((start_epoch as u64)
         ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40)
         ^ ((ctx.hw_random().unwrap_or(0) as u64) << 8)
         ^ ((start_mono as u64) << 17));
+    let mut rng = Rng::new(seed);
+    if target_random {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: seed {} ({}) - `chaos max-carnage all-services <n> seed {}` replays these draws, not this run's timing",
+            seed, if given_seed.is_some() { "given" } else { "drawn" }, seed));
+    } else if given_seed.is_some() {
+        ctx.console_writeln("chaos: a seed has no effect on an aimed run - only `all-services` draws at random");
+    }
 
     // Reap ORPHANED mem-pressure tasks left by a PRIOR chaos run that was itself killed mid-run before
     // its end-of-run cleanup (below) could reap them (audit L5). chaos cannot clean up after its own
@@ -514,7 +544,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // exhausted (later spawns are refused). The system holding IS the point; the offense is what we count.
         // (Reclaimed at cleanup below.)
         let _ = ctx.alloc_mem(MEMP_CHUNK); mempr += 1;
-        let _ = ctx.spawn("mem-pressure"); spawns += 1;
+        if ctx.spawn("mem-pressure").is_err() { spawns_refused += 1; }
+        spawns += 1;
 
         // Redraw the per-service TABLE in place. We build the whole frame into one buffer and flush it in
         // a couple of writes (not ~one per line), so the framebuffer redraws without flicker. Home the
@@ -613,9 +644,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // switch to a separate screen. So leave the final frame in place (no `\x1b[2J`) and just append one
     // summary line below it (which also carries the substrings the shell test greps for).
     ctx.console_writeln("=== chaos max-carnage: report ===");
+    if target_random {
+        ctx.console_writeln_fmt(format_args!("seed: {}", seed));
+    }
     ctx.console_writeln_fmt(format_args!(
-        "total: {} rounds, {} kills, {} flooded, {} mem-pressure, {} spawns. kernel: alive (this command returned).",
-        round, killed, flooded, mempr, spawns));
+        "total: {} rounds, {} kills, {} flooded, {} mem-pressure, {} spawns ({} refused). kernel: alive (this command returned).",
+        round, killed, flooded, mempr, spawns, spawns_refused));
+    // Later spawns are EXPECTED to be refused once a mem-pressure task holds memory; every one refused
+    // means none ever ran, and the memory-pressure dimension of this run was not exercised at all.
+    if spawns != 0 && spawns_refused == spawns {
+        ctx.console_writeln("NOTE: every mem-pressure spawn was refused - no memory-pressure task ran, so that dimension was not exercised (see the kernel log for why).");
+    }
 
     // Reclaim any flood caps still cached, so the run leaves the cap table as it found it.
     for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { ctx.remove_cap(h); } }

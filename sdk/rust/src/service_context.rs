@@ -356,6 +356,10 @@ pub const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 /// As a request bit it is checked the same way every privilege is - the spawner may ask for it only
 /// because it could transfer such a cap itself.
 pub const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
+/// Report this task's death to the supervisor's death-notification endpoint and count it as a restart. The
+/// supervisor sets it for every service it manages; the kernel keeps no list of which services those are
+/// (`docs/audio.md`, "No service names in the kernel").
+pub const SPAWN_FLAG_WATCHED:     u32 = 1 << 4;
 
 /// Bits for `SpawnRequest::privileges`. A spawner may only request what it HOLDS ITSELF - the kernel
 /// checks, and refuses otherwise - so this passes authority on, it never mints it (3.1, 7.3).
@@ -379,6 +383,9 @@ pub mod privbits {
     /// Read PCI configuration space through the legacy CF8/CFC ports (step D2). READ-ONLY and held
     /// by ONE service - see `docs/service-ownership.md` D2 for why the write side is not on offer.
     pub const PCI_CFG:         u32 = 1 << 12;
+    /// Set the Arm cores to the platform's minimum or maximum clock (`CpuClock`, syscall 55). Held by
+    /// ONE service, `power`, because the clock is one machine-wide setting (`docs/power.md`).
+    pub const CPU_CLOCK:       u32 = 1 << 13;
 }
 
 /// Device classes a spawner can name in `SpawnRequest::hw_flags`. The kernel resolves the class to
@@ -394,6 +401,15 @@ pub mod hwclass {
     /// Not a device: the software-raised test interrupt (§22 IR1). A class, so that the probe which
     /// receives it names a CLASS like any driver and the kernel states the vector.
     pub const TEST_IRQ:    u32 = 7;
+    /// An audio jack driven by PWM and fed by the SoC's DMA engine (the Pis, `docs/audio.md`). The kernel
+    /// routes the jack's pins and starts the PWM clock as part of the grant, then maps the PWM block and
+    /// the DMA engine side by side and grants a DMA arena.
+    pub const AUDIO_PWM:   u32 = 8;
+    /// A WiFi radio on an SDIO host at a fixed SoC address (the Pi 4's CYW43455 behind the Arasan, the
+    /// VisionFive 2 Lite's AIC8800 behind a DesignWare `dw_mmc`). The
+    /// kernel grants the host's window - and, where it can, the radio's power control - to the service
+    /// whose request names this kind, never to a service because of its name.
+    pub const WIFI_SDIO:   u32 = 9;
 
     /// Bit 31: the value is a PCI CLASS CODE, not one of the named kinds above.
     pub const PCI:         u32 = 1 << 31;
@@ -488,6 +504,35 @@ pub mod supcmd {
     pub const RESTART: u8 = b'R';
     /// Spawn a service that is not running.
     pub const SPAWN:   u8 = b'S';
+    /// Which devices does the supervisor drive? Read only: `[MARKER, DEVICES]`, answered with
+    /// `[OK, count, entries...]` - per entry `b'H'`, the spawn row's device word (u32 LE, `hwclass`),
+    /// the service's name (length byte, bytes); or `b'U'`, a USB device it starts a driver for (vid
+    /// u16 LE, pid u16 LE, attached 0/1, the reporting host's name, the driver's name, each a length
+    /// byte and bytes). The `hardware` utility's DRIVER column (`docs/hardware-design.md`).
+    pub const DEVICES: u8 = b'D';
+    /// Why is this driver's device handled as it is? Read only: `[MARKER, WHY, name...]`, answered
+    /// with `[OK, text...]` - the reason the supervisor keeps beside the spawn rows - or `[UNKNOWN]`
+    /// for a service with none recorded. `hardware why` (`docs/hardware-design.md` 11).
+    pub const WHY:     u8 = b'W';
+    /// What has happened to the devices this supervisor drives since it started. Read only:
+    /// `[MARKER, EVENTS]`, answered with `[OK, since u32 LE, recorded u32 LE, count, entries...]` - since:
+    /// when this supervisor began its record (after its boot spawns), in seconds of uptime; recorded: every
+    /// event noted, so `recorded - count`
+    /// were overwritten; per entry the uptime second (u32 LE), an `EV_*` code, the USB vid and pid (u16
+    /// LE each, 0 for a driver event), and the driver's name (length byte, bytes). `hardware events`.
+    pub const EVENTS:  u8 = b'E';
+    /// A device's driver died and was restarted.
+    pub const EV_RESTARTED: u8 = 1;
+    /// A device's driver died and its restart failed.
+    pub const EV_RESTART_FAILED: u8 = 2;
+    /// A USB device was reported attached and its driver started.
+    pub const EV_ATTACHED: u8 = 3;
+    /// A USB device was reported gone and its driver stopped.
+    pub const EV_DETACHED: u8 = 4;
+    /// A device's driver was found dead by the sweep - its death notice never arrived - and restarted.
+    pub const EV_SWEPT: u8 = 5;
+    /// A USB device was reported attached and its driver could not be started.
+    pub const EV_START_FAILED: u8 = 6;
 
     /// Reply status, one byte, so a caller can log the truth rather than assume success.
     pub const OK:      u8 = 0;
@@ -518,6 +563,57 @@ pub mod supcmd {
     }
 }
 
+/// A USB host's report to the supervisor about a device it does not drive itself, so the supervisor can
+/// start that device's driver when it arrives and stop it when it leaves (`docs/usb-device-drivers.md`).
+///
+/// The host reports FACTS - present or not, VID:PID, how many times it has bound one - and never names a
+/// driver: which driver a device gets is the supervisor's table. Sent with `try_send` and never answered,
+/// so a host never waits on the supervisor (8.9). Each report is the host's whole state for that device,
+/// not a change, so a duplicate is harmless and a lost one is corrected by the next.
+pub mod usbdev {
+    /// The report's opcode, after `supcmd::MARKER`: `[MARKER, REPORT, present, gen(4 LE), vid(2 LE), pid(2 LE)]`.
+    pub const REPORT: u8 = b'U';
+    /// Supervisor to host, one byte and no reply capability: send your report again. How a respawned
+    /// supervisor learns what is attached (6.2). In the host's request space beside `usbfn`'s ops (0x20 up),
+    /// clear of them and of every block and net op.
+    pub const ASK: u8 = 0x26;
+    pub const LEN: usize = 11;
+
+    /// One report. `gen` counts every bind on that host, so the same dongle bound again - a replug, or the
+    /// host re-enumerating it - reads differently from the same dongle still bound.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Report {
+        pub present: bool,
+        pub gen: u32,
+        pub vid: u16,
+        pub pid: u16,
+    }
+
+    pub fn encode(r: &Report) -> [u8; LEN] {
+        let mut b = [0u8; LEN];
+        b[0] = super::supcmd::MARKER;
+        b[1] = REPORT;
+        b[2] = r.present as u8;
+        b[3..7].copy_from_slice(&r.gen.to_le_bytes());
+        b[7..9].copy_from_slice(&r.vid.to_le_bytes());
+        b[9..11].copy_from_slice(&r.pid.to_le_bytes());
+        b
+    }
+
+    /// `None` for anything that is not exactly a report.
+    pub fn decode(p: &[u8]) -> Option<Report> {
+        if p.len() != LEN || p[0] != super::supcmd::MARKER || p[1] != REPORT || p[2] > 1 {
+            return None;
+        }
+        Some(Report {
+            present: p[2] == 1,
+            gen: u32::from_le_bytes([p[3], p[4], p[5], p[6]]),
+            vid: u16::from_le_bytes([p[7], p[8]]),
+            pid: u16::from_le_bytes([p[9], p[10]]),
+        })
+    }
+}
+
 
 /// Probe parameters ride in the upper 32 bits of `Spawn`'s `arg0`, which were unused:
 /// `[55..48] flags  [47..32] mode  [31..16] core  [15..0] spawn cap slot`.
@@ -527,6 +623,10 @@ pub const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
 
 /// Upper bound on a spawn name payload (`name` + NUL-separated peers). Matches the kernel's limit.
 pub const SPAWN_PAYLOAD_MAX: usize = 128;
+
+/// The most one boot-record read copies (InspectKernel query 27). Equal to the kernel's
+/// `log::BOOT_READ_CHUNK`; a reader's buffer is exactly this size, so the kernel never writes past it.
+pub const BOOT_READ_CHUNK: usize = 512;
 
 const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D5;
 /// MUST match `kernel::task::MAX_SEND_PEERS` - this indexes the kernel-written context page.
@@ -623,7 +723,23 @@ const _: () = assert!(
 // Safe: each service is a single-threaded process with its own BSS.
 // ---------------------------------------------------------------------------
 
-const CACHE_SIZE: usize = 8;
+/// How many reacquired peers a service can hold at once.
+///
+/// **It must cover every peer a service names, because a peer that does not fit used to be dropped in
+/// silence.** It was 8. The shell is wired at spawn with `fs` alone and reaches every other peer through
+/// this cache, and it names more than eight - net-stack, wifi-driver, events, time, console, block-driver,
+/// power, supervisor, nic-driver, recorder and more. After a chaos storm the respawned shell's `selfcheck`
+/// filled the cache before reaching the network, so `reacquire_by_name("net-stack")` returned `true` while
+/// storing nothing: every `ping` then found no send slot, reported `net-stack not responding` at once, and
+/// leaked the capability it had just acquired - and killing net-stack could not help (Pi 4, 2026-10-04).
+///
+/// 32 is above the supervisor's whole managed roster. A full cache now EVICTS (see `reacquire_cap_detail`)
+/// and says so, rather than refusing the newcomer quietly.
+const CACHE_SIZE: usize = 32;
+
+/// The next entry to evict when the cache is full - round robin, so no one peer is always the victim.
+// SAFETY: single-threaded service process; no concurrent access.
+static mut CACHE_NEXT_EVICT: usize = 0;
 
 struct CacheEntry {
     slot:     u32,
@@ -721,30 +837,6 @@ pub enum AllocError {
 // ServiceContext.
 // ---------------------------------------------------------------------------
 
-/// Point the dynamic send-cap cache entry for `name` at `new_slot`, so the next
-/// `find_send_slot(name)` resolves to the freshly-acquired cap. Mirrors the inline
-/// update in `reacquire_cap`.
-fn cache_send_slot(name: &str, new_slot: u32) {
-    let bytes = name.as_bytes();
-    let len   = bytes.len().min(PEER_NAME_BYTES);
-    // SAFETY: single-threaded service process; no concurrent cache writers.
-    // addr_of_mut! avoids materialising a &mut to the `static mut` directly
-    // (silences the static_mut_refs lint).
-    unsafe {
-        for entry in (*core::ptr::addr_of_mut!(SEND_CAP_CACHE)).iter_mut() {
-            if entry.slot == u32::MAX
-                || (entry.name_len as usize == len && &entry.name[..len] == &bytes[..len])
-            {
-                entry.slot     = new_slot;
-                entry.name_len = len as u8;
-                entry.name     = [0u8; PEER_NAME_BYTES];
-                entry.name[..len].copy_from_slice(&bytes[..len]);
-                break;
-            }
-        }
-    }
-}
-
 /// These wait helpers POLL (`try_recv` + `yield_cpu`); they do not block. That is deliberate, and it is
 /// a REVERSAL - they were made to block earlier on this branch, and the change was wrong twice over.
 ///
@@ -778,7 +870,7 @@ pub struct ServiceContext {
 ///
 /// Outside the capability-error range (-2..-7) ON PURPOSE, and this must stay in step with the kernel's
 /// `USB_DISK_BUSY` (`kernel/src/syscall/dispatch.rs`). It was originally `-2`, which is `CapNotHeld`, so
-/// a driver missing its `USB_DISK` capability was indistinguishable from a busy device and got retried
+/// a driver missing its `USB_DISK_RESOURCE` capability was indistinguishable from a busy device and got retried
 /// thousands of times before being reported as a device that "stayed busy" - a cap failure wearing an
 /// I/O failure's name.
 pub const USB_DISK_BUSY: i64 = -20;
@@ -1064,7 +1156,13 @@ impl ServiceContext {
         // entry first also prevents creating a duplicate entry when a free slot precedes it.
         // SAFETY: single-threaded service; no concurrent cache writes. addr_of_mut! avoids a direct
         // &mut to the static (static_mut_refs lint).
+        //
+        // NEVER DROP THE NEW CAP. If the peer has no entry and no entry is free, an existing one is
+        // evicted - its cap reclaimed, its peer reacquired on next use - and the eviction is logged. This
+        // used to fall through doing nothing and still return Ok: the caller believed the peer was
+        // reacquired, `find_send_slot` could not find it, and the cap just acquired leaked (CACHE_SIZE).
         let mut stale: Option<u32> = None;
+        let mut evicted: Option<([u8; PEER_NAME_BYTES], usize)> = None;
         let mut placed = false;
         unsafe {
             let cache = &mut *core::ptr::addr_of_mut!(SEND_CAP_CACHE);
@@ -1077,18 +1175,32 @@ impl ServiceContext {
                 }
             }
             if !placed {
-                for entry in cache.iter_mut() {
-                    if entry.slot == u32::MAX {
-                        entry.slot     = new_slot;
-                        entry.name_len = len as u8;
-                        entry.name     = [0u8; PEER_NAME_BYTES];
-                        entry.name[..len].copy_from_slice(bytes);
-                        break;
+                let free = cache.iter().position(|e| e.slot == u32::MAX);
+                let i = match free {
+                    Some(i) => i,
+                    None => {
+                        let next = &mut *core::ptr::addr_of_mut!(CACHE_NEXT_EVICT);
+                        let i = *next % CACHE_SIZE;
+                        *next = next.wrapping_add(1);
+                        stale = Some(cache[i].slot);
+                        evicted = Some((cache[i].name, cache[i].name_len as usize));
+                        i
                     }
-                }
+                };
+                let entry = &mut cache[i];
+                entry.slot     = new_slot;
+                entry.name_len = len as u8;
+                entry.name     = [0u8; PEER_NAME_BYTES];
+                entry.name[..len].copy_from_slice(bytes);
             }
         }
         if let Some(old) = stale { self.remove_cap(CapHandle(old)); }
+        if let Some((name, nlen)) = evicted {
+            let gone = core::str::from_utf8(&name[..nlen.min(PEER_NAME_BYTES)]).unwrap_or("?");
+            self.log_fmt(format_args!(
+                "sdk: the send-cap cache is full ({} peers) - dropped the cap to '{}' to hold '{}'; '{}' is reacquired when next used",
+                CACHE_SIZE, gone, peer, gone));
+        }
 
         Ok(CapHandle(new_slot))
     }
@@ -1159,8 +1271,9 @@ impl ServiceContext {
     /// the mailbox was granted.
     ///
     /// Measured rather than assumed: an arm32 Pi 2 run logged ZERO refusals, so `fs` had its mailbox
-    /// and the repair was live on that port. `routing: reply endpoint refused` in a log is how you
-    /// know a machine is in the other case.
+    /// and the repair was live on that port. `spawn[ipc]: '<name>' gets no reply mailbox` in a log
+    /// names each service in the other case (it read `routing: reply endpoint refused`, unnamed, until
+    /// `backlog/74`).
     pub fn drain_stale_replies(&self) -> usize {
         let Some((recv, _)) = self.reply_mailbox() else { return 0 };
         let mut n = 0usize;
@@ -1173,6 +1286,30 @@ impl ServiceContext {
             }
         }
         n
+    }
+
+    /// Wait, bounded by `max_ms`, for up to `owed` replies to arrive in the reply MAILBOX, and discard
+    /// them. Returns how many were discarded, or `None` when this service has no mailbox - in which case
+    /// owed-reply accounting cannot work (replies land on the shared endpoint) and the caller must fall
+    /// back. For a synchronous caller that gave up on `owed` requests whose answers are still in flight:
+    /// `drain_stale_replies` clears what has ARRIVED; this also waits for what has not.
+    pub fn drain_owed_replies(&self, owed: usize, max_ms: u64) -> Option<usize> {
+        let (recv, _) = self.reply_mailbox()?;
+        let t0 = self.read_tsc();
+        let limit = self.duration_cycles(max_ms);
+        let mut n = 0usize;
+        while n < owed {
+            match crate::ipc::try_recv(recv) {
+                Ok(Some(_)) => n += 1,
+                _ => {
+                    if self.read_tsc().wrapping_sub(t0) >= limit {
+                        break;
+                    }
+                    self.sleep_ms(10);
+                }
+            }
+        }
+        Some(n)
     }
 
     pub fn recv_handle(&self) -> Option<crate::capability::CapHandle> {
@@ -1624,7 +1761,7 @@ impl ServiceContext {
     /// - a client request carries a reply cap, a driver reply does not.
     ///
     /// Everything else matches [`Self::request_with_reply_deadline_outcome`] exactly, including the
-    /// reply-cap reclaim on every failure path and the warning attached to `Timeout`: the request was
+    /// reply-cap reclaim on a failed send (a delivered request's cap is the peer's - backlog/67) and the warning attached to `Timeout`: the request was
     /// SENT, so a late reply is still coming and re-sending desyncs the protocol.
     #[inline]
     pub fn request_with_reply_deadline_sifted(
@@ -1674,7 +1811,10 @@ impl ServiceContext {
             // wrapping_sub, so a counter that wraps mid-wait reads as a small elapsed rather than as
             // an enormous one that expires the deadline instantly.
             if self.read_tsc().wrapping_sub(t0) >= budget {
-                self.remove_cap(reply_cap);
+                // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
+                // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
+                // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
+                // into a dead cap (backlog/67). The peer removes the cap after answering.
                 self.trace_out(peer, op, crate::trace::KIND_TIMEOUT);
                 return None;
             }
@@ -1702,8 +1842,49 @@ impl ServiceContext {
         &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
         on_linger: impl FnOnce(),
     ) -> ReqOutcome {
+        self.request_with_reply_keyhint(peer, msg, hint_after_secs, max_secs, Self::QUIT_KEYS, on_linger)
+    }
+
+    /// The keys [`Self::request_with_reply_qhint`] leaves on: `q`, `Q` and Escape.
+    pub const QUIT_KEYS: &'static [u8] = &[b'q', b'Q', 0x1b];
+
+    /// [`Self::request_with_reply_qhint`] with the LEAVE KEYS chosen by the caller. The convention
+    /// (`utilities/0_conventions.md`) gives `q` to a task that STOPS when the operator leaves and `b` to
+    /// one that keeps running; a request whose peer finishes the work whether or not this caller waits -
+    /// `wifi radio off hard`, where the driver cuts the chip's power either way - is the second kind, and
+    /// offering `q` for it would promise a stop that cannot happen. `Aborted` means one of `leave_keys`
+    /// was pressed; what that means for the task is the caller's to say.
+    pub fn request_with_reply_keyhint(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        leave_keys: &[u8], on_linger: impl FnOnce(),
+    ) -> ReqOutcome {
         let op = self.trace_in(peer, msg);
-        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, on_linger);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, |_| true);
+        self.trace_out(peer, op, match &out {
+            ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
+            ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
+            ReqOutcome::Timeout  => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
+    /// [`Self::request_with_reply_keyhint`] that SIFTS what arrives, as
+    /// [`Self::request_with_reply_deadline_sifted`] does for the unabortable wait. `mine` is asked about
+    /// each message as it lands; `true` ends the wait with it, `false` hands it to the caller - who must
+    /// release any cap it carries - and the wait goes on, its deadline unchanged by how many arrive.
+    /// Messages ALREADY queued when it is called are drained first without being asked (the stale-reply
+    /// drain every abortable wait opens with), so a caller that counts late answers drains before calling.
+    ///
+    /// For a peer whose replies the caller can recognise (a correlation tag) on an endpoint that also
+    /// takes other traffic: the unsifted form returns the first message whatever it is, so a late
+    /// answer to a request this caller already gave up on is read as the answer to this one.
+    pub fn request_with_reply_keyhint_sifted(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        leave_keys: &[u8], on_linger: impl FnOnce(),
+        mine: impl FnMut(&crate::ipc::Message) -> bool,
+    ) -> ReqOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine);
         self.trace_out(peer, op, match &out {
             ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
             ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
@@ -1727,8 +1908,10 @@ impl ServiceContext {
             Ok(reply) => Some(reply),
             Err(_) => {
                 // Send failed (dead endpoint) or the peer died before replying (ReplyDead): the
-                // embedded reply cap may not have been transferred, so reclaim it (remove_cap is
-                // idempotent if the kernel already moved it out on a successful send). Without this, a
+                // embedded reply cap may not have been transferred, so reclaim it. Safe when the kernel
+                // DID move it out: a Call receives nothing but its own reply, so no other cap can have
+                // been inserted into the emptied slot, and removing an empty slot does nothing. (The
+                // send-then-recv paths cannot say that, and do not reclaim - backlog/67.) Without this, a
                 // storm of failed calls would leak reply caps until the table fills and every request
                 // returns None.
                 self.remove_cap(reply_cap);
@@ -1800,7 +1983,7 @@ impl ServiceContext {
     /// buffers, and only a length is returned.
     ///
     /// Same deadline discipline as `request_with_reply_deadline` - block on the endpoint in slices,
-    /// give up when the caller's time is spent, and reclaim the reply cap either way (§8.5).
+    /// give up when the caller's time is spent, and reclaim the reply cap only when the send failed (§8.5, backlog/67).
     /// Send `req` to `peer` and receive the reply into `buf`, bounded by `max_secs`.
     ///
     /// **This used to be send + `recv_timeout_into`, and that was wrong in a way that cost days.**
@@ -1865,7 +2048,8 @@ impl ServiceContext {
         match crate::ipc::call_deadline_into(target, reply_cap, recv, &msg.payload_bytes()[..n],
                                              &mut buf, secs) {
             Ok(Some(len)) => Ok(Some(crate::ipc::Message::from_bytes(&buf[..len]))),
-            Ok(None)      => { self.remove_cap(reply_cap); Ok(None) }
+            // Delivered, deadline passed: the reply cap is the peer's now (backlog/67).
+            Ok(None)      => Ok(None),
             Err(e)        => { self.remove_cap(reply_cap); Err(e) }
         }
     }
@@ -1915,11 +2099,12 @@ impl ServiceContext {
         };
         let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
         let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
-        // The kernel consumes the reply cap on a delivered call; on any other outcome it is ours to
-        // reclaim, or the slot leaks one per failed request (§8.5, the three checks).
+        // The kernel consumes the reply cap on a delivered call - and `Ok(None)` is a delivered call
+        // whose deadline passed, so it is the peer's then too (backlog/67). On a failed send it is ours
+        // to reclaim, or the slot leaks one per failed request (§8.5, the three checks).
         match out {
             Ok(Some(n)) => DeadlineOutcomeInto::Reply(n),
-            Ok(None) => { self.remove_cap(reply_cap); DeadlineOutcomeInto::Timeout }
+            Ok(None) => DeadlineOutcomeInto::Timeout,
             Err(crate::ipc::IpcError::QueueFull) => {
                 self.remove_cap(reply_cap);
                 DeadlineOutcomeInto::QueueFull
@@ -1969,11 +2154,12 @@ impl ServiceContext {
         let reply_cap = self.derive_cap(grant)?;
         let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
         let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
-        // The kernel consumes the reply cap on a delivered call; on any other outcome it is ours to
-        // reclaim, or the slot leaks one per failed request (§8.5, the three checks).
+        // The kernel consumes the reply cap on a delivered call - and `Ok(None)` is a delivered call
+        // whose deadline passed, so it is the peer's then too (backlog/67). On a failed send it is ours
+        // to reclaim, or the slot leaks one per failed request (§8.5, the three checks).
         match out {
             Ok(Some(n)) => Some(n),
-            Ok(None) => { self.remove_cap(reply_cap); None }
+            Ok(None) => None,
             Err(_)   => { self.remove_cap(reply_cap); None }
         }
     }
@@ -2086,8 +2272,11 @@ impl ServiceContext {
             // unreliable, `now - t0` can read huge and expire the deadline on the first pass.
             if now >= t0 && now - t0 >= max_secs {
                 // Abandoned: the reply may still arrive later and sit in our queue, which is the
-                // hazard `..._outcome` documents. Reclaim the cap; the caller reports the failure.
-                self.remove_cap(reply_cap);
+                // hazard `..._outcome` documents. The caller reports the failure.
+                // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
+                // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
+                // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
+                // into a dead cap (backlog/67). The peer removes the cap after answering.
                 let _ = recv;
                 return None;
             }
@@ -2136,7 +2325,10 @@ impl ServiceContext {
             // wrapping_sub, so a counter that wraps mid-wait reads as a small elapsed rather than as
             // an enormous one that expires the deadline instantly.
             if self.read_tsc().wrapping_sub(t0) >= budget {
-                self.remove_cap(reply_cap);
+                // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
+                // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
+                // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
+                // into a dead cap (backlog/67). The peer removes the cap after answering.
                 let _ = recv;
                 return None;
             }
@@ -2172,9 +2364,12 @@ impl ServiceContext {
             // beneath it polled, which is how the claim survived so long unexamined.
             if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) { return DeadlineOutcome::Reply(r); }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
-                self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
+                // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
+                // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
+                // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
+                // into a dead cap (backlog/67). The peer removes the cap after answering.
                 // CALLER BEWARE: the request was already SENT, so the peer will reply into our endpoint
-                // whether we are listening or not. Reclaiming the reply CAP does not remove that message
+                // whether we are listening or not. Leaving the reply cap alone does not remove that message
                 // from the queue - the NEXT `try_recv` on this endpoint may return the ABANDONED reply
                 // instead of the answer it expects. That has bitten for real: a timed-out fs read left a
                 // 1-byte `[FS_NOTFOUND]` behind, and the next command consumed it and reported a healthy
@@ -2226,7 +2421,10 @@ impl ServiceContext {
                 if mine(&r) { return DeadlineOutcome::Reply(r); }
             }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
-                self.remove_cap(reply_cap);   // reply never consumed - reclaim its slot
+                // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
+                // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
+                // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
+                // into a dead cap (backlog/67). The peer removes the cap after answering.
                 // Same caveat as the unsifted twin: the request WAS sent, so the peer answers whether
                 // or not anyone is still listening, and that answer will arrive later. A caller that
                 // times out must expect to meet it - here, `mine` will simply be asked about it and
@@ -2286,8 +2484,8 @@ impl ServiceContext {
                 // sub-checks "passed" vacuously because no invoke could get that far.
                 //
                 // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
-                // fcap. The abort and timeout paths below still remove it: there the send never
-                // delivered, so the cap IS still ours.
+                // fcap - and the abort and timeout paths below are no different: the send DID deliver
+                // there too, so the slot is not ours either, and they leave it alone (backlog/67).
                 return ReqOutcome::Reply(r);
             }
             while let Some(b) = self.try_console_read() {
@@ -2297,10 +2495,9 @@ impl ServiceContext {
                 // "Immediately" still holds: the abort does not wait on the peer. What the block adds is
                 // up to one poll interval before the keypress is LOOKED at - tens of milliseconds, under
                 // the threshold at which a person can tell, and the same trade the observe loop makes.
-                if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
+                if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
             }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
-                self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
             }
         }
@@ -2319,7 +2516,9 @@ impl ServiceContext {
         msg:  &crate::ipc::Message,
         hint_after_secs: i64,
         max_secs: i64,
+        leave_keys: &[u8],
         on_linger: impl FnOnce(),
+        mut mine: impl FnMut(&crate::ipc::Message) -> bool,
     ) -> ReqOutcome {
         // Drain any stale reply a prior INSTANT-abort left in our endpoint (see the abortable variant).
         while self.try_recv().is_some() {}
@@ -2351,19 +2550,23 @@ impl ServiceContext {
                 // sub-checks "passed" vacuously because no invoke could get that far.
                 //
                 // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
-                // fcap. The abort and timeout paths below still remove it: there the send never
-                // delivered, so the cap IS still ours.
-                return ReqOutcome::Reply(r);
+                // fcap - and the abort and timeout paths below are no different: the send DID deliver
+                // there too, so the slot is not ours either, and they leave it alone (backlog/67).
+                //
+                // Asked at the moment of arrival, so a cap the message carries is still pending for
+                // `mine` to take; `false` hands the message to the caller and the wait goes on.
+                if mine(&r) {
+                    return ReqOutcome::Reply(r);
+                }
             }
             while let Some(b) = self.try_console_read() {
-                if b == b'q' || b == b'Q' || b == 0x1b { self.remove_cap(reply_cap); return ReqOutcome::Aborted; }
+                if leave_keys.contains(&b) { return ReqOutcome::Aborted; }
             }
             let elapsed = self.epoch_secs_monotonic() - t0;
             if elapsed >= hint_after_secs {
                 if let Some(f) = on_linger.take() { f(); }
             }
             if elapsed >= max_secs {
-                self.remove_cap(reply_cap);
                 return ReqOutcome::Timeout;
             }
             self.yield_cpu();
@@ -2379,7 +2582,7 @@ impl ServiceContext {
     /// [`Self::request_with_reply_abortable`] (which does its own send) does not fit. This is the wait
     /// half of the abortable request, factored out: a peer that received our invocation but died before
     /// replying, or a filter that wedges mid-stream, can no longer hang us (Commandment VIII - wait on
-    /// truth *including failure*). The caller owns any reply cap it derived and reclaims it on every
+    /// truth *including failure*). The caller owns any reply cap it derived and reclaims it only when the send failed (backlog/67), not on every
     /// outcome. A service with no console foreground never sees input, so this degrades to a plain
     /// deadline wait. Does NOT drain a stale reply first - a caller that can be re-entered after an
     /// abort should `while self.try_recv().is_some() {}` before it sends (as the request variants do).
@@ -2576,7 +2779,7 @@ impl ServiceContext {
     }
 
     /// Capacity of the in-kernel USB mass-storage device in 512-byte sectors, 0 if none is attached.
-    /// Requires the `USB_DISK` capability. Syscall 46.
+    /// Requires the `USB_DISK_RESOURCE` capability. Syscall 46.
     pub fn usb_disk_sectors(&self) -> u64 {
         // SAFETY: syscall(46) = UsbDiskInfo; no arguments, gated by the USB_DISK capability.
         let ret = unsafe { raw_syscall(46, 0, 0, 0) };
@@ -2584,7 +2787,7 @@ impl ServiceContext {
     }
 
     /// Read the 512-byte block at `lba` from the USB mass-storage device into `dst`. Returns false if
-    /// there is no device, the LBA is past the end, or the transfer failed. Requires `USB_DISK`.
+    /// there is no device, the LBA is past the end, or the transfer failed. Requires `USB_DISK_RESOURCE`.
     /// Syscall 47.
     #[must_use = "the destination buffer is NOT valid data if this is false"]
     pub fn usb_disk_read(&self, lba: u64, dst: &mut [u8; 512]) -> bool {
@@ -2595,7 +2798,7 @@ impl ServiceContext {
         ret == 0
     }
 
-    /// Write `src` as the 512-byte block at `lba` on the USB mass-storage device. Requires `USB_DISK`.
+    /// Write `src` as the 512-byte block at `lba` on the USB mass-storage device. Requires `USB_DISK_RESOURCE`.
     /// Syscall 48.
     #[must_use = "the block did NOT reach the medium if this is false"]
     pub fn usb_disk_write(&self, lba: u64, src: &[u8; 512]) -> bool {
@@ -2624,7 +2827,7 @@ impl ServiceContext {
     }
 
     /// Make previously written blocks durable on the USB mass-storage device (SCSI SYNCHRONIZE CACHE).
-    /// Requires `USB_DISK` WRITE. Syscall 49.
+    /// Requires `USB_DISK_RESOURCE` WRITE. Syscall 49.
     ///
     /// A write is only ACKNOWLEDGED when `usb_disk_write` returns - the device may still be holding the
     /// bytes in a volatile buffer. Anything that promises durability (a format, a journal commit) has to
@@ -2737,6 +2940,30 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=25 = the endpoint awaited in a CALL.
         let ret = unsafe { raw_syscall(13, 25, slot as u64, 0) };
         if ret < 0 { 0 } else { ret as u64 }
+    }
+
+    /// The kernel's BOOT RECORD size: `(held, capacity)` in bytes, or `None` without INTROSPECT
+    /// (InspectKernel query 27). The record is a fixed copy of the first bytes ever logged, which
+    /// never wraps; `held == capacity` means it filled, and later lines are only in the kernel's ring
+    /// (until it wraps) and on serial.
+    pub fn boot_record_size(&self) -> Option<(usize, usize)> {
+        let held = self.boot_record_query(0, 0);
+        let cap = self.boot_record_query(1, 0);
+        if held < 0 || cap < 0 { None } else { Some((held as usize, cap as usize)) }
+    }
+
+    /// Copy the boot record from `offset` into `buf`: `Some(n)` bytes, `Some(0)` at the end, `None`
+    /// refused (InspectKernel query 27, INTROSPECT). The buffer is the kernel's chunk size exactly, so
+    /// no read can ask it to write past the end of one.
+    pub fn boot_record_read(&self, offset: usize, buf: &mut [u8; BOOT_READ_CHUNK]) -> Option<usize> {
+        let r = self.boot_record_query(offset as u64, buf.as_mut_ptr() as u64);
+        if r < 0 { None } else { Some(r as usize) }
+    }
+
+    fn boot_record_query(&self, a1: u64, a2: u64) -> i64 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=27 = the boot record. `a2` is 0 or a buffer of
+        // BOOT_READ_CHUNK bytes the caller holds mutably; the kernel validates the range before writing.
+        unsafe { raw_syscall(13, 27, a1, a2) }
     }
 
     /// The wall-clock datetime captured by the kernel at **boot** (InspectKernel query 12, ungated).
@@ -3479,6 +3706,28 @@ impl ServiceContext {
         // SAFETY: a plain syscall; the kernel validates the capability and the access before any I/O.
         let r = unsafe { crate::syscall::raw_syscall(53, sel as u64, offset as u64, 0) };
         if r < 0 { None } else { Some(r as u32) }
+    }
+
+    /// Cut (`false`) or restore (`true`) the power of the device this service was granted a fixed
+    /// peripheral window to (`DevicePower`, syscall 54). Needs `DEVICE_POWER`, which the kernel mints
+    /// with the window wherever the machine can power the device; everywhere else, and for every
+    /// service without such a window, this returns `false` and the kernel says why on the serial log.
+    /// How long to hold the device off and how long to wait after restoring it are the caller's to know
+    /// - they are properties of the device, not of the kernel (`docs/wifi.md` 47).
+    pub fn device_power(&self, on: bool) -> bool {
+        // SAFETY: a plain syscall; the kernel validates the capability before touching any pin.
+        let r = unsafe { crate::syscall::raw_syscall(54, if on { 1 } else { 0 }, 0, 0) };
+        r == 0
+    }
+
+    /// Set the Arm cores to the platform's maximum (`true`) or minimum (`false`) clock, and return the rate
+    /// they read back in Hz (`CpuClock`, syscall 55). Needs `CPU_CLOCK`, which only the `power` service is
+    /// spawned with; everyone else asks `power` for a lease over IPC. `None` is a refusal or a machine with
+    /// no control over its clock, and the kernel says which on the serial log.
+    pub fn cpu_clock(&self, max: bool) -> Option<u32> {
+        // SAFETY: a plain syscall; the kernel validates the capability before asking the firmware.
+        let r = unsafe { crate::syscall::raw_syscall(55, if max { 1 } else { 0 }, 0, 0) };
+        if r > 0 { Some(r as u32) } else { None }
     }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.

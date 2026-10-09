@@ -13,6 +13,7 @@ pub mod sv39;
 pub mod context_switch;
 pub mod display;
 mod net;
+mod sdio;
 mod usb;
 pub mod syscall;
 pub mod trap;
@@ -781,6 +782,45 @@ riscv64: S-mode entered, 16550 UART alive
             net::set_bases(aon, sys.unwrap_or(0), mac, net_syscon);
             net::init();
         }
+
+        // THE RADIO'S SD HOST, last of all and for the same reason: a read into an unclocked block on
+        // this interconnect stalls, so it goes where a stall still leaves the whole boot log readable
+        // (docs/wifi-aic8800.md 3, V0). The SECOND `jh7110-mmc` node is the board's fact - the first is
+        // the SD card this board boots from, which is never touched - and `sdio::init` prints the address
+        // it found so the log shows which one it took.
+        {
+            let mut w15: [Option<u32>; 0] = [];
+            let host = tree
+                .find_compatible_nth("starfive,jh7110-mmc", 1, &[], &mut w15)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            let mut w16: [Option<u32>; 0] = [];
+            let pinctrl = tree
+                .find_compatible("starfive,jh7110-sys-pinctrl", &[], &mut w16)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            sdio::set_bases(sys.unwrap_or(0), pinctrl, host);
+            sdio::init();
+        }
+
+        // THE TRUE RANDOM NUMBER GENERATOR, after everything else that might stall: its two clocks and
+        // its reset are in the system-top generator, and a read of it unclocked would stop the boot as
+        // any other block's does. Taken by the device tree's `starfive,jh7110-trng` node; its clocks and
+        // reset are that node's own on this board (system-top clocks 15 and 16, reset 3), the same three
+        // Linux's driver asks for.
+        {
+            let mut w17: [Option<u32>; 0] = [];
+            let rng = tree
+                .find_compatible("starfive,jh7110-trng", &[], &mut w17)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            let mut w18: [Option<u32>; 0] = [];
+            let stg = tree
+                .find_compatible("starfive,jh7110-stgcrg", &[], &mut w18)
+                .map(|r| r.base)
+                .unwrap_or(0);
+            trng_bring_up(stg, rng);
+        }
     }
 
     // What the firmware beneath us offers. Probed rather than assumed: the two machines disagree
@@ -1072,13 +1112,204 @@ pub fn ap_init(core_id: u32) { unimplemented!("riscv64::ap_init") }
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
-/// Non-PCI fixed-physical peripheral MMIO grant (ARM Pi path); no fixed windows on this arch stub.
-pub fn map_fixed_driver_mmio(_pt: &mut page_tables::PageTable, _name: &str) -> Option<(u64, u64)> { None }
+/// Where a fixed peripheral window is mapped in the service that is granted it - the same address the
+/// Pi ports use, between the heap and the DMA arena.
+pub const DRIVER_MMIO_VA: u64 = 0x6000_0000;
+
+/// A fixed-physical peripheral window, granted BY DEVICE KIND, never by service name (`docs/audio.md`,
+/// "No service names in the kernel"). One on this port: the VisionFive's WiFi radio's SD host, `mmc1`,
+/// and only where the boot census saw it answer (`sdio::present`) - QEMU's `virt` has none, so it gets
+/// nothing. One page: the `dw_mmc` registers and its FIFO window (at +0x100 or +0x200) both fit in it.
+pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u64, u64)> {
+    use crate::memory::frame::PhysAddr;
+    use page_tables::{PageFlags, VirtAddr};
+    if kind != crate::task::kind::WIFI_SDIO {
+        return None;
+    }
+    let phys = sdio::window();
+    if phys == 0 {
+        return None;
+    }
+    let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE
+        | PageFlags::NO_EXEC | PageFlags::PCD;
+    pt.map(VirtAddr(DRIVER_MMIO_VA), PhysAddr(phys), flags).ok()?;
+    Some((DRIVER_MMIO_VA, 0x1000))
+}
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
-// No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
-pub fn hw_random() -> Option<u32> { None }
+// ---- THE JH7110's TRUE RANDOM NUMBER GENERATOR (`hw_random`, InspectKernel query 19) ----------------
+//
+// The seam every port answers (`aarch64` with the Pi 4's RNG200). Until this, riscv64 answered `None`,
+// so the WiFi handshake's nonce was hashed from the cycle counter and the driver said so on every join
+// (`docs/wifi-aic8800.md` 10). Registers and sequence from Linux's `jh7110-trng.c` (26.14: the silicon's
+// requirement, not its model): `CTRL` +0x00 takes a command (2 reseed, 1 generate), `STAT` +0x04 says
+// whether it is busy (bit 30 generating, bit 31 seeding), `MODE` +0x08 bit 3 selects 256-bit output,
+// `IE` +0x10 and `ISTAT` +0x14 hold the ready, seed-done and LFSR-lockup bits (write 1 to clear), the
+// words are at `RAND0` +0x20, and the auto-reseed counters `AUTO_RQSTS` +0x60 / `AUTO_AGE` +0x64 are left
+// at 0 as Linux leaves them. Linux waits for the INTERRUPT; this port has no interrupt controller driver,
+// so the same status bits are polled, each wait bounded on the timebase. `IE` is still written as Linux
+// writes it, so the status latches exactly as it does there; nothing routes the line, so nothing fires.
+
+const TRNG_CTRL: usize = 0x00;
+const TRNG_STAT: usize = 0x04;
+const TRNG_MODE: usize = 0x08;
+const TRNG_IE: usize = 0x10;
+const TRNG_ISTAT: usize = 0x14;
+const TRNG_RAND0: usize = 0x20;
+const TRNG_AUTO_RQSTS: usize = 0x60;
+const TRNG_AUTO_AGE: usize = 0x64;
+const TRNG_CMD_GENERATE: u32 = 0x1;
+const TRNG_CMD_RESEED: u32 = 0x2;
+const TRNG_STAT_BUSY: u32 = (1 << 30) | (1 << 31);
+const TRNG_MODE_R256: u32 = 1 << 3;
+const TRNG_IE_ALL: u32 = (1 << 31) | (1 << 0) | (1 << 1) | (1 << 4);
+const TRNG_ISTAT_RAND_RDY: u32 = 1 << 0;
+const TRNG_ISTAT_SEED_DONE: u32 = 1 << 1;
+const TRNG_ISTAT_LFSR_LOCKUP: u32 = 1 << 4;
+/// The block's clocks and reset in the system-top generator, from the device tree's `rng@1600c000` on
+/// this board: `hclk` is `SEC_AHB` (15), `ahb` is `SEC_MISC_AHB` (16), and the reset is 3.
+const STGCLK_SEC_AHB: usize = 15;
+const STGCLK_SEC_MISC_AHB: usize = 16;
+const STGRST_SEC_AHB: u32 = 3;
+/// Bounds, in milliseconds of the timebase. Linux allows 1 ms for a command and 100 ms for the block to
+/// go idle; the command bound is wider because a poll is slower to notice than an interrupt, and a bound
+/// reached is `None`, which every caller already handles.
+const TRNG_COMMAND_MS: u64 = 10;
+const TRNG_IDLE_MS: u64 = 100;
+
+/// The generator's base, set only once it has been clocked, released and SEEDED; zero means none here.
+static TRNG_BASE: AtomicU64 = AtomicU64::new(0);
+/// One caller at a time: a command and the read of its result are one transaction on the block.
+static TRNG_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// The timebase reading `ms` milliseconds from now.
+fn trng_deadline(ms: u64) -> u64 {
+    let hz = timebase_hz() as u64;
+    sbi::time().wrapping_add(if hz == 0 { 1_000_000 } else { hz / 1000 * ms })
+}
+
+/// Wait until `(reg & mask) != 0` equals `set`, at most `ms`; the register's value when it did, else `None`.
+fn trng_wait(base: u64, off: usize, mask: u32, set: bool, ms: u64) -> Option<u32> {
+    let deadline = trng_deadline(ms);
+    loop {
+        let v = display::mmio_read(base, off);
+        if (v & mask != 0) == set {
+            return Some(v);
+        }
+        if sbi::time().wrapping_sub(deadline) as i64 >= 0 {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Clock it, release it, set it up as Linux's `starfive_trng_init` does, and SEED it - saying each step's
+/// outcome, so a missing `rng` line means this never ran rather than that the block is absent.
+fn trng_bring_up(stg: u64, base: u64) {
+    if stg == 0 || base == 0 {
+        print_str("riscv64: rng - no starfive,jh7110-trng in the device tree; hardware random numbers unavailable\n");
+        return;
+    }
+    print_str("riscv64: rng - the TRNG is at ");
+    print_hex(base);
+    print_str("\n");
+    // Clocks before the reset, as everywhere on this SoC: releasing a reset whose clock is gated can hang.
+    let hclk = display::clk_enable(stg, STGCLK_SEC_AHB);
+    let ahb = display::clk_enable(stg, STGCLK_SEC_MISC_AHB);
+    if !(hclk && ahb) {
+        print_str("riscv64: rng - a clock did not enable (sec_ahb ");
+        print_str(if hclk { "on" } else { "FAIL" });
+        print_str(", sec_misc_ahb ");
+        print_str(if ahb { "on" } else { "FAIL" });
+        print_str("); not touching the block\n");
+        return;
+    }
+    if !display::reset_deassert(stg, usb::STGCRG_RESET_ASSERT, usb::STGCRG_RESET_STATUS, STGRST_SEC_AHB) {
+        print_str("riscv64: rng - its reset did not report released; not reading it\n");
+        return;
+    }
+    display::mmio_write(base, TRNG_AUTO_AGE, 0);
+    display::mmio_write(base, TRNG_AUTO_RQSTS, 0);
+    let pending = display::mmio_read(base, TRNG_ISTAT);
+    display::mmio_write(base, TRNG_ISTAT, pending);
+    display::mmio_write(base, TRNG_IE, TRNG_IE_ALL);
+    let mode = display::mmio_read(base, TRNG_MODE);
+    display::mmio_write(base, TRNG_MODE, mode | TRNG_MODE_R256);
+    let t0 = sbi::time();
+    display::mmio_write(base, TRNG_CTRL, TRNG_CMD_RESEED);
+    match trng_wait(base, TRNG_ISTAT, TRNG_ISTAT_SEED_DONE, true, TRNG_COMMAND_MS) {
+        Some(_) => {
+            display::mmio_write(base, TRNG_ISTAT, TRNG_ISTAT_SEED_DONE);
+            let hz = timebase_hz() as u64;
+            let us = if hz == 0 { 0 } else { sbi::time().wrapping_sub(t0) * 1_000_000 / hz };
+            TRNG_BASE.store(base, Ordering::Release);
+            print_str("riscv64: rng - seeded in ");
+            print_dec(us);
+            print_str(" us (STAT ");
+            print_hex(display::mmio_read(base, TRNG_STAT) as u64);
+            print_str("); hardware random numbers available\n");
+        }
+        None => {
+            print_str("riscv64: rng - the reseed did not report done within the bound (STAT ");
+            print_hex(display::mmio_read(base, TRNG_STAT) as u64);
+            print_str(", ISTAT ");
+            print_hex(display::mmio_read(base, TRNG_ISTAT) as u64);
+            print_str("); hardware random numbers unavailable\n");
+        }
+    }
+}
+
+/// One 32-bit word from the TRNG, or `None` when there is none on this machine, another caller holds it
+/// past the bound, or a command did not complete in time. A lockup the block reports is answered as
+/// Linux's interrupt handler answers it - with a reseed - before the word is asked for.
+pub fn hw_random() -> Option<u32> {
+    let base = TRNG_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    let deadline = trng_deadline(TRNG_COMMAND_MS);
+    while TRNG_BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if sbi::time().wrapping_sub(deadline) as i64 >= 0 {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+    let word = trng_word(base);
+    TRNG_BUSY.store(false, Ordering::Release);
+    word
+}
+
+/// The transaction `hw_random` holds the block for: idle, any lockup reseeded, generate, read.
+fn trng_word(base: u64) -> Option<u32> {
+    trng_wait(base, TRNG_STAT, TRNG_STAT_BUSY, false, TRNG_IDLE_MS)?;
+    if display::mmio_read(base, TRNG_ISTAT) & TRNG_ISTAT_LFSR_LOCKUP != 0 {
+        display::mmio_write(base, TRNG_ISTAT, TRNG_ISTAT_LFSR_LOCKUP);
+        display::mmio_write(base, TRNG_CTRL, TRNG_CMD_RESEED);
+        trng_wait(base, TRNG_ISTAT, TRNG_ISTAT_SEED_DONE, true, TRNG_COMMAND_MS)?;
+        display::mmio_write(base, TRNG_ISTAT, TRNG_ISTAT_SEED_DONE);
+    }
+    display::mmio_write(base, TRNG_CTRL, TRNG_CMD_GENERATE);
+    trng_wait(base, TRNG_ISTAT, TRNG_ISTAT_RAND_RDY, true, TRNG_COMMAND_MS)?;
+    display::mmio_write(base, TRNG_ISTAT, TRNG_ISTAT_RAND_RDY);
+    Some(display::mmio_read(base, TRNG_RAND0))
+}
+
+/// Device power behind a fixed peripheral window (`DevicePower`, syscall 54). On the VisionFive it is the
+/// radio's enable, GPIO 33 (`gpio_wl_reg_on` in the vendor tree), and only where the census saw the
+/// radio's SD host answer. How long to hold it off, and how long to wait after, is the driver's (26.10).
+pub fn device_power_control(kind: u32) -> bool {
+    kind == crate::task::kind::WIFI_SDIO && sdio::present()
+}
+/// Drive that pin. The result follows the pad's READ-BACK, as the Pi 4's does (CLAUDE.md 12.3).
+pub fn device_power(kind: u32, on: bool) -> bool {
+    kind == crate::task::kind::WIFI_SDIO && sdio::set_radio_power(on)
+}
+
+/// The Arm cores' clock (`CpuClock`, syscall 55): no control on this port. The one board with it is the
+/// Pi 4 (`arch/aarch64`), whose firmware takes a rate request over the mailbox. `None` is the honest
+/// answer; the syscall reports it as "no control over its clock".
+pub fn cpu_clock(_max: bool) -> Option<u32> { None }
 
 /// Who made this CPU - see the x86 implementation for what this is for. RISC-V reports its vendor in
 /// `mvendorid`, which is an M-mode CSR: this port runs under OpenSBI in S-mode and cannot read it, so
@@ -2345,7 +2576,9 @@ pub mod interrupts {
 /// watching hub ports so a replug is noticed) and that work REQUIRES interrupts enabled - their own
 /// comments say masking there would freeze the machine for the ~100 ms an enumeration takes. Masking
 /// them to fix an x86 race would be importing our answer into their design (26.14). They keep the
-/// narrower window; it is recorded here rather than silently left (26.7).
+/// narrower window; it is recorded here rather than silently left (26.7). **Since 2026-09-30 only the
+/// Pi 2 (`arch/arm`) answers NO:** the Pi 4 (`arch/aarch64`) masks, `wfi`s and unmasks, its USB stack and
+/// terminal being services now.
     /// **YES** - and for the same reason x86 says yes, reached differently.
     ///
     /// The idle loop masks interrupts, re-checks for work, and halts, relying on the halt not to
@@ -2354,7 +2587,8 @@ pub mod interrupts {
     /// so an interrupt raised after the re-check is latched and `wfi` returns immediately; the
     /// handler then runs once `SIE` is restored.
     ///
-    /// ARM answers no because its idle path does real work that needs interrupts enabled. This one
+    /// The Pi 2 (`arch/arm`) answers no because its idle path does real work that needs interrupts
+    /// enabled; the Pi 4 answers yes since 2026-09-30. This one
     /// does nothing but wait, so there is no such obligation.
     pub fn idle_mask_before_halt() -> bool { true }
 
@@ -2407,6 +2641,12 @@ pub mod rtc {
 /// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
 /// See the x86 original for why this is not a second source for `pci::nic()`.
 pub fn soc_nic_present() -> bool { false }
+/// Is a device of this fixed kind (`task::kind`) on this board? The arch answers by KIND, never by the
+/// name of a service (`docs/audio.md`, "No service names in the kernel"). One on this port: the
+/// VisionFive's WiFi radio's SD host, where the boot census saw it answer.
+pub fn fixed_device_present(kind: u32) -> bool {
+    kind == crate::task::kind::WIFI_SDIO && sdio::present()
+}
 
 // PCI seam. QEMU `virt` DOES have a PCIe host bridge (ECAM at 0x3000_0000, described in the FDT), and
 // the VisionFive 2 has one too - so unlike arm32 this is a stub by STAGE, not by platform. Everything

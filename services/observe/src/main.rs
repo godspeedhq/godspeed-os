@@ -307,7 +307,14 @@ fn print_state(
 
     // --- Task table ---
     ctx.console_line_fmt(live, format_args!(
-        "{}TASK NAME             CORE STATE      MEM_USED/LIMIT/%     RESTARTS  QUEUE  CPU%  UPTIME", p));
+        "{}TASK NAME             CORE STATE      MEM_USED/LIMIT/%      RESTARTS  QUEUE  CPU%  UPTIME", p));
+    // ROWS ARE IN SLOT ORDER, and that is the operator's decision rather than an accident.
+    //
+    // This briefly collected every row, sorted by name and printed - on the reasoning that slot order is
+    // boot order, so a service drifts up and down the table between runs. Reverted on sight: the FIRST
+    // COLUMN IS THE SLOT, so ordering the rows by anything else makes that column non-monotonic, and a
+    // table whose leading column jumps around reads as a rendering fault rather than as information.
+    // Sorting by name is what a pipe is for.
     for slot in 0..MAX_SLOTS {
         let stat = ctx.task_stat(slot);
         if !stat.valid {
@@ -353,8 +360,12 @@ fn print_state(
         let nm = stat.name_str();
         let over = if nm.chars().count() > NAME_COL { "+" } else { " " };
 
+        // The used value is FOUR wide: `bytes_fmt` reports KiB up to 1023, and a service sitting at
+        // 1004 KiB (wifi-driver, on the Pi 4) printed four digits into a three-wide field, shoving
+        // every column after it one place right on that row alone - the same fault the name column
+        // above was widened for. The limit stays two wide; no contract grants a limit under 1 MiB.
         ctx.console_line_fmt(live, format_args!(
-            "{}{:<4} {:<w$.w$}{} C{:<3} {:<10} {:>3} {:3}/{:>2} {:3}/{:>3}%  {:<8} {:>2}/{}{}  {:>3}%  {:>5}{}",
+            "{}{:<4} {:<w$.w$}{} C{:<3} {:<10} {:>4} {:3}/{:>2} {:3}/{:>3}%  {:<8} {:>2}/{}{}  {:>3}%  {:>5}{}",
             p,
             slot,
             nm,

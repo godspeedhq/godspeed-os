@@ -19,7 +19,7 @@ fn main() {
     // The images this supervisor carries.
     const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure",
         "ping", "time", "events", "recorder", "copier", "asker", "resource-server", "chaos", "control", "observe", "greet",
-        "counter", "shell", "fs", "net-stack", "block-driver", "console", "nic-driver"];
+        "counter", "shell", "fs", "net-stack", "block-driver", "console", "nic-driver", "power"];
 
     // The USB host drivers exist only where their controller does, so they are embedded PER ARCH -
     // the same split, for the same reasons, that `scripts/service_embed_check.py` spells out:
@@ -78,6 +78,44 @@ fn main() {
         &[]
     };
 
+    // The onboard WiFi radio, which on this board sits on an SD host controller rather than any bus
+    // that enumerates. aarch64 and riscv64: the Pi 4's CYW43455 and the VisionFive 2 Lite's AIC8800D80, each a
+    // full-MAC part on an SD host. Split out as its own list rather than added to `usb` for the same reason `enumerator` is -
+    // it answers a different question about the board, and a list that answers two questions stops
+    // being readable as either.
+    //
+    // A BOARD fact, not an ISA one, exactly as `nic_on_pci` is: another aarch64 machine with no radio
+    // would want this empty, and would get that by saying so here rather than by becoming an exception
+    // inside `main.rs`. The kernel still refuses the MMIO grant on a board whose census found no
+    // controller, so an embedded-but-radioless build reports "no radio" and serves rather than dying.
+    // riscv64 joined on 2026-10-04: the VisionFive 2 Lite's AIC8800D80 sits on its second SD host
+    // (docs/wifi-aic8800.md). Its driver is hardware-verified through V6 (scan, join, frames);
+    // on QEMU's `virt` no window is granted at all.
+    let radio: &[&str] = if arch == "aarch64" || arch == "riscv64" { &["wifi-driver"] } else { &[] };
+
+    // The USB WiFi dongle's driver (docs/wifi-usb.md), embedded where a USB host serves the radio
+    // function protocol (`godspeed_wifi::usbfn`) for a dongle it has bound. Derived from the `usb` list, so
+    // it names no instruction set: `dwc2` serves it since U1, and `xhci` since U2a. The Pi 4 and the
+    // VisionFive have an onboard radio as well, so there both can run: the dongle's driver is started only
+    // when the dongle is plugged in (`usbdev`), and choosing which radio carries the link is `wifi hardware
+    // use` (`utilities/56_wifi.md` 11). Its own list rather than part of `radio`, because a board may have
+    // both as separate services.
+    let usb_radio: &[&str] = if usb.contains(&"dwc2") || usb.contains(&"xhci") {
+        &["wifi-usb"]
+    } else {
+        &[]
+    };
+
+    // The audio driver (docs/audio.md), a BOARD fact like `radio`: an Intel High Definition Audio
+    // controller on x86 (the T630's chipset audio, QEMU's `intel-hda`), and on the Pis a 3.5 mm jack
+    // driven by PWM - a different driver for a different device, speaking the same protocol. The
+    // VisionFive 2 Lite has no audio output at all, so it embeds neither.
+    let audio: &[&str] = match arch.as_str() {
+        "x86_64" => &["audio-driver"],
+        "arm" | "aarch64" => &["pwm-audio"],
+        _ => &[],
+    };
+
     // ---- ONE CFG PER IMAGE THIS BUILD ACTUALLY EMBEDS. ------------------------------------------
     //
     // Derived from the SAME two lists that decide the embedding, three lines above - so `main.rs`
@@ -99,17 +137,36 @@ fn main() {
     // a board that has never had an EHCI image embedded.
     //
     // `values(none())` because these are bare flags: `#[cfg(has_xhci)]`, never `has_xhci = "..."`.
-    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "xhci_msi", "nic_on_pci"] {
+    for flag in ["has_xhci", "has_ehci", "has_dwc2", "has_hw_enumerator", "has_wifi_driver", "has_wifi_usb", "has_audio_driver",
+                 "has_pwm_audio", "pwm_audio_pi4",
+                 "xhci_msi", "nic_on_pci", "nic_radio_bridge"] {
         println!("cargo::rustc-check-cfg=cfg({flag}, values(none()))");
     }
-    for name in usb.iter().chain(enumerator.iter()) {
+    for name in usb.iter().chain(enumerator.iter()).chain(radio.iter()).chain(usb_radio.iter()).chain(audio.iter()) {
         println!("cargo:rustc-cfg=has_{}", name.replace('-', "_"));
+    }
+    // Whether `nic-driver` carries frames to the radio when the cable is out (docs/wifi.md 2). Its Pi 4
+    // backend (GENET) has had that bridge since the radio worked, and its VisionFive backend (`dwmac`)
+    // since phase V6 (`docs/wifi-aic8800.md`); both share `services/nic-driver/src/radio.rs`. A separate
+    // fact by NAME, so a reader of `main.rs` sees which question it asks; derived from `radio` because
+    // the two now agree on every board, and a second arch test for the same answer is how the counts
+    // drift. It was its own test while the VisionFive drove a radio its NIC could not reach - a peer
+    // nic-driver never called, standing authority for nothing (3.1). A future board with a radio and
+    // no bridge splits them again, here.
+    if radio.contains(&"wifi-driver") {
+        println!("cargo:rustc-cfg=nic_radio_bridge");
     }
     // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides
     // between the `pci_irq` hardware class and the plain one. NOT the same question as "is it on
     // PCI": the Pi 4's VL805 is a PCIe device and still takes the plain class, because what it lacks
     // is the routable vector, not the bus. Asking for an interrupt that can never arrive is the
     // failure invariant 12 exists to prevent, which is why this is its own fact.
+    // WHICH Pi the jack is on, for `pwm-audio`'s `mode`: the PWM block, its DMA request line and the
+    // PWM clock differ between the Pi 2 and the Pi 4 (docs/audio.md, "The Pis"). Stated here, once,
+    // as the board fact it is, so the service never infers its board from its instruction set.
+    if arch == "aarch64" {
+        println!("cargo:rustc-cfg=pwm_audio_pi4");
+    }
     if arch == "x86_64" {
         println!("cargo:rustc-cfg=xhci_msi");
         // This board's ethernet controller is on the PCI bus, so `nic-driver` is addressed by CLASS
@@ -143,7 +200,8 @@ fn main() {
                                    cannot locate the profile directory"))
         .to_path_buf();
 
-    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(probe.iter()).chain(examples.iter()) {
+    for name in EMBEDDED.iter().chain(usb.iter()).chain(enumerator.iter()).chain(radio.iter()).chain(usb_radio.iter()).chain(audio.iter())
+                        .chain(probe.iter()).chain(examples.iter()) {
         let elf = target_dir.join(name);
         // LOUD, not a fallback (invariant 12). An embedded image that silently resolved to nothing
         // would produce a supervisor that cannot start the service, failing far from the cause.

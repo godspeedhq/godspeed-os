@@ -36,7 +36,7 @@ JOB  STATE      COMMAND
 
 gsh> foreground 7
 Copying... 38%
-[q] cancel   [b] background
+[q] quit   [b] background
 ```
 
 Four surfaces, one idea:

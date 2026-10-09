@@ -80,6 +80,52 @@ These were the open questions; they are now decided:
 4. **Contributor terms:** a `CONTRIBUTING`/DCO (sign-off) vs a CLA - how inbound
    contributions are licensed. *(Still to formalize; does not affect the license of the code in tree.)*
 
+## 5a. Vendor device firmware, and the `nonfree/` tree
+
+**Decided 2026-09-27.** Some devices are not fixed-function silicon. The Pi 4's CYW43455 radio carries its
+own processor with no ROM firmware for the MAC, so it does nothing until a host uploads a vendor binary
+into it. Nobody writes that binary - not Linux, not the Pi's own boot firmware, not Windows - and its
+licence forbids modifying, reverse engineering, decompiling or disassembling it. There is no source to
+read and no permission to study the object, which makes it the one exception to §26.14's method in this
+whole project.
+
+**Such firmware IS committed here**, under `nonfree/<part>/`, when its licence permits redistribution:
+
+- `LICENCE` beside it, because the terms require the notice to accompany every copy and a repository is a
+  copy;
+- `PROVENANCE` - upstream URL, retrieval date, and a **SHA-256 per file**, so anyone can verify the copy
+  against upstream without trusting this project;
+- `scripts/nonfree_check.py` enforces both on every build. A blob with no licence, or whose digest does not
+  match its content, fails the build.
+
+**Where it does NOT permit redistribution**, the blob stays out and `scripts/get_firmware.py` fetches it on
+the owner's machine. Two mechanisms for two legal situations, each declared rather than assumed.
+
+**The one exception: `nonfree/aic8800d80/` (2026-10-04, the operator's decision).** The VisionFive 2 Lite's
+AICSemi AIC8800D80 radio needs host-uploaded firmware like the CYW43455, and AICSemi has published NO
+licence for it that this project could find. It is in a THIRD situation, neither of the two above: not
+permitted, not forbidden, simply unstated. The files were committed anyway, on the operator's decision,
+from Radxa's packaging repository at the commit whose bytes match - MD5 for MD5 - what the board's own
+StarFive image loaded. Its `LICENCE` reproduces the only written term they travel under (Radxa's
+repository-wide GPL-3+ stanza, which this project does not read as a grant from AICSemi), names Gentoo's
+"freedist" label and StarFive's shipping of the same files, and says plainly that none of these is the
+vendor's licence. `nonfree_check.py` accepts it because the check guarantees that terms are PRESENT and
+bytes ACCOUNTED FOR, never that the terms permit redistribution - that was always a human reading, and here
+the reading is recorded rather than implied. If the vendor's terms appear and forbid redistribution, the
+files move to `scripts/get_firmware.py`.
+
+**Why not Linux's model.** Linux keeps blobs in a separate `linux-firmware` repository, but that separation
+is Debian's social contract and the DFSG rather than a technical conclusion - a non-linked binary beside
+GPL code is mere aggregation, and Linux shipped them in-tree for years. GodspeedOS is not a distribution
+with a package manager, and fetch-at-setup was tried and failed three times on one file in an afternoon:
+the board name is a symlink, into a sibling directory, to a filename the packaging creates at build time.
+Absorbing that fragility once, here, beats pushing it onto every user.
+
+The aggregation point matters and is worth stating plainly: the firmware is **data uploaded to a device**,
+not code linked into a GPL work. It does not make the OS a derivative of it, nor the reverse.
+
+---
+
 ## 6. Scope of this document
 
 The `LICENSE` files (repo-root GPL-2.0-only, `sdk/LICENSE` Apache-2.0) are the legal

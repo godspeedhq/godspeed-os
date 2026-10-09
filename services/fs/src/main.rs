@@ -4312,10 +4312,10 @@ fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// `fs-fuzz` and `fs-hostile`, against real disks.
 ///
 /// **The assertion is that every request produces a non-empty answer.** Not the right answer - a
-/// malformed request has no right answer - but SOME answer. A zero-length reply is undeliverable
-/// (the kernel refuses a zero-length send), so a request that produces one leaves its caller waiting
-/// out a deadline for a reply that can never arrive. This project has shipped that bug before, on a
-/// different service, and it cost a day.
+/// malformed request has no right answer - but SOME answer. A zero-length reply is not an answer in
+/// this protocol (a caller reads a short reply as malformed), and until `e3fcf7ed` it was not even
+/// delivered on three ports, so a request that produced one left its caller waiting out a deadline.
+/// This project has shipped that bug before, on a different service, and it cost a day.
 ///
 /// `#[inline(never)]`: the buffers below are a frame this service does not otherwise carry.
 #[inline(never)]
@@ -4383,10 +4383,10 @@ fn protocol_selftest(ctx: &ServiceContext) {
             "fs: protocol selftest PASS - {} malformed requests, every one answered", checked));
     } else {
         // LOUD, because the failure is invisible from the other end: the caller does not see a bad
-        // reply, it sees NO reply, and waits out its whole deadline for one that cannot arrive.
+        // reply it can name, it sees an empty one it cannot read.
         ctx.log_fmt(format_args!(
             "fs: protocol selftest FAILED - {} of {} malformed requests produced a ZERO-LENGTH reply \
-             (undeliverable; the caller would wait out its deadline). Last opcode: {}",
+             (not an answer in this protocol). Last opcode: {}",
             empty, checked, worst));
     }
 }

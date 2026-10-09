@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The USB WiFi dongle's driver (docs/wifi-usb.md): a Realtek RTL8188CUS today, reached through whichever
+# USB host service has bound it as the radio - `dwc2` on the Pi 2, `xhci` elsewhere - over
+# `godspeed_wifi::usbfn`.
+#
+# It holds no hardware grant at all: no MMIO, no DMA, no interrupt. Everything it does to the chip is a
+# request to the host, which serves only the one device it bound. Started by the supervisor when a host
+# reports the dongle attached, and stopped when it leaves (`usbdev`). `fs` holds `/wifi.keys`, which the serve loop every radio
+# shares (`godspeed_wifi::serve`) loads and writes - the same reason `wifi-driver` has it.
+name    = "wifi-usb"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["wifi-usb"]
+log_write   = true
+ipc_send    = ["dwc2", "xhci", "fs"]

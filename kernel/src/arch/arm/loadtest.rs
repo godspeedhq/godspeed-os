@@ -61,6 +61,13 @@ pub fn selftest() {
                 if !mapped_ok { pl011_write(b"arm32:   suspiciously little mapped for a service\r\n"); }
                 pl011_write(b"arm32: loader FAIL - see above\r\n");
             }
+            // GIVE IT BACK. The table was built to be checked, never to run, and dropping it kept one of
+            // the arena's L1 roots - with its L2s and frames - for the life of the machine. On the Pi 2
+            // that was the last root a transient spawn could have had (`page_tables::L1_TABLES`).
+            let freed = loaded.page_table.discard();
+            pl011_write(b"arm32: loader selftest's page table returned - ");
+            write_dec_pub(freed as u32);
+            pl011_write(b" page(s) and its L1 root\r\n");
         }
         Err(e) => {
             use crate::loader::LoadError::*;

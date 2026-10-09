@@ -197,6 +197,15 @@ RULES = {
         help="Run it and paste what it does. The accepted words are read from the shell's `SUBCMD_FIRST` "
              "and osdev's own `match suite`, so this cannot drift from either."),
 
+    "subcmd_help_check.py": dict(
+        code="GS0410", fixable=False, commandment=None, section="utilities/0_conventions.md rules 2 and 9",
+        title="a subcommand Tab can reach answers no `help`, or `help` does not complete at its depth",
+        why="Rule 2 says every subcommand has help; rule 9 says every word completes. 22 words Tab offered "
+            "answered nothing to `help` - `chaos kill-storm help` read `help` as a service name - and the "
+            "surfaces three deep (`wifi debug trace help`) had no answer at all.",
+        help="Add an arm to `sub_help` in services/shell/src/main.rs, or a delegating arm to the command's "
+             "own `<util>_sub_help`. The words checked are read from `SUBCMD_FIRST`, so this cannot drift."),
+
     "docs_index_check.py": dict(
         code="GS0408", fixable=False, commandment=None, section="CLAUDE.md 5",
         title="a file in docs/ is not reachable from the docs index",

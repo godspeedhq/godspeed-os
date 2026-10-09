@@ -41,8 +41,9 @@ can never come back without a deliberate edit - and may not GROW without one. Th
 on every run so a drop is visible, and entries that are no longer needed are named so the ratchet
 can be tightened rather than quietly carried.
 
-SCOPE. Rust under `kernel/src`, `services`, `sdk/rust/src`, `stdlib/rust/src`, `osdev/src` and
-`examples`. Names are matched only in backticks and only when they carry an underscore, because a
+SCOPE. Rust under `kernel/src`, `services`, `sdk/rust/src`, `sdk/wifi/src`, `stdlib/rust/src`, `osdev/src` and
+`examples`. Names are matched only in backticks: snake_case or SCREAMING_CASE with an underscore, CamelCase
+(backlog/58), and the last segment of an `a::b` path; each must equal a whole identifier in code. A
 single bare word in a comment is prose far more often than it is an identifier - the same rule
 `doc_symbols_check` settled on for the same reason.
 """
@@ -56,7 +57,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "COMMENT-SYMBOLS.baseline.txt")
 
 # Scanned for comments AND contributing to the code corpus.
-SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "stdlib/rust/src", "osdev/src", "examples"]
+SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "sdk/wifi/src", "stdlib/rust/src", "osdev/src", "examples"]
 
 # Contribute to the CODE corpus only. A comment may legitimately name the checker that enforces it
 # (`util_help_coverage_problems`), and a driver comment may name a declared CONTRACT field
@@ -183,7 +184,13 @@ def scan():
                     # `#` comments in a contract are prose and are stripped for the same reason.
                     code_corpus.append("\n".join(
                         ln.split("#", 1)[0] for ln in read(p).split("\n")))
-    code_text = "\n".join(code_corpus)
+    # A name resolves only as a WHOLE identifier. This was a substring test (`tok not in code_text`),
+    # which let a cited name be satisfied by any longer one containing it: `lookup_cap` by
+    # `current_task_lookup_cap`, a deleted kernel probe spawn by the supervisor's `spawn_probe_row`,
+    # and a stale `is_probe` by a new, unrelated method - which is how it was found (2026-10-05).
+    # Fifty names were resolving that way; the ones naming this tree were corrected, and the rest -
+    # registers, firmware and Linux names cited on purpose - baselined with what they are.
+    code_text = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", "\n".join(code_corpus)))
 
     hits = collections.defaultdict(list)
     for p, comments in per_file:

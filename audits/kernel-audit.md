@@ -1843,3 +1843,56 @@ violation is the wrong fix.
 Recorded rather than papered over (§26.7): the fix touches the most safety-critical output path in
 the system, on a defect that predates this branch, so it is written down for a decision rather than
 changed unprompted alongside unrelated work.
+
+## A9-4 seen again, and what A9-5 could not tell (2026-10-08, `feat/wifi-driver` @ `20e43490`)
+
+**A9-4, a second sighting, on another core.** On the T630, eight seconds after `chaos max-carnage
+all-services 100` returned:
+
+```
+LIVENESS WEDGE: core 2 made NO progress for 6000714568 counter ticks (1x the 5988721200 allowed); it was
+running IDLE (no task) 0 ''; it has taken 57444 timer interrupts, last vector 0x00000020; detected by core 0.
+```
+
+The first was core 0 at boot. This is an application core, idle, after a storm - so the hole is not only
+the BSP's, and `rearm_quantum_timer`'s four call sites still do not show which path halts with no wake
+armed.
+
+**A9-5's instrument could not answer the question it was added for.** A9-5 says the count separates the
+two causes - a frozen count, the timer stopped reaching the core; a climbing one, the handler skips the
+stamp - and that A9-4's next reproduction "now carries real evidence". A since-boot total from one panic
+is neither frozen nor climbing; it is nonzero in both cases. `1c35b4b4` records each core's interrupt and
+idle-halt counts at every progress stamp and the panic prints both since the last one: 0 interrupts since
+means the timer stopped arriving, and a halt since the stamp with nothing after it means the core slept
+with no wake armed. The next 100-round run on the T630 did not wedge, so A9-4 stays OPEN with that
+reading owed.
+
+## A9-4 diagnosed: the idle path restarted a periodic timer before it could fire (2026-10-08, `feat/wifi-driver`)
+
+The instrument `1c35b4b4` added took its first reading on the T630, 6 s after a 1000-round chaos run,
+when the USB dongle had just started receiving:
+
+```
+LIVENESS WEDGE: core 2 ... running IDLE (no task); since its last stamp it has taken 0 timer
+interrupts and halted 113 times in idle (308912 timer interrupts since boot, last vector 0x00000020)
+```
+
+Zero ticks and 113 halts in 3 s: the core was not stuck, it was being woken about every 26 ms and its
+timer never fired. The T630 runs the LAPIC timer in PERIODIC mode, where writing the initial count
+restarts the countdown, and the idle path wrote it on every pass - the idle period before a halt, the
+quantum after a wake. `xhci` runs on core 2 and its MSI targets core 2; at beacon rate the countdown was
+restarted every 26 ms and never reached zero, so no tick, no stamp, and the watchdog fired on a working
+machine. The earlier sighting this entry was opened for (core 0, at boot) and the second one (core 2,
+14:10 the same day, 6 s after the dongle rejoined) fit the same shape; neither had the reading to show
+it. The BSP was exposed the same way - it re-armed its quantum before every halt - and its tick drives
+the monotonic clock and the timed wakes.
+
+Fixed in `arch/x86_64/boot.rs`: each core records which period its timer is counting and when it last
+fired; a re-arm for the period already counting is skipped, and a timer that has not fired for 50 quanta
+is not rewritten until it does. Worst case between ticks about 1.5 s, inside the watchdog's 3 s. No
+neutral code changed. QEMU: identity 24/24 (Test 8, preemption, included), the x86 shell suite 215/0,
+chaos-repro 300 rounds clean; QEMU's TSC rate is uncalibrated, so the starvation rule is exercised only
+on hardware. **A9-4 is FIXED pending that card.**
+
+*(2026-10-09, Audit 13: the card ran - the T630 at `bdc7adaa`, all 1000 rounds of `chaos max-carnage`,
+no liveness panic, operator-accepted, `docs/wifi-usb.md` 51. A9-4 is FIXED.)*

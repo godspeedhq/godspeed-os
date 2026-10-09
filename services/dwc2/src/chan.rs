@@ -12,6 +12,7 @@
 //! memory directly and the device's writes are visible without an invalidate. Ring-0 cache ops are
 //! not available to a service, and this is why they are not needed.
 
+use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
 
 use crate::regs::*;
@@ -44,6 +45,9 @@ pub const CH_KBD: u32 = 1;
 /// the keyboard would mean a hot-plug check could destroy a split mid-flight, which is the class of
 /// bug the channel-per-stream split was introduced to prevent.
 pub const CH_HUB: u32 = 4;
+/// The WiFi dongle's bulk IN (`rtl.rs`): armed in the background, like the NIC's receive on 3, and taken on
+/// the USB interrupt. Its own channel for the reason every stream has one.
+pub const CH_RADIO_RX: u32 = 5;
 
 /// Channel-enable / disable bits in HCCHAR.
 const HCCHAR_CHENA: u32 = 1 << 31;
@@ -99,16 +103,28 @@ pub const HCTSIZ_DOPNG: u32 = 1 << 31;
 /// high-speed OUT endpoint and must be false for everything else.
 #[allow(clippy::too_many_arguments)]
 pub fn program_ping(
-    mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
     len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, ping: bool,
 ) {
     let mps = t.mps as u32;
     let pkts = if len == 0 { 1 } else { (len + mps - 1) / mps };
 
+    // THE RADIO'S IN STANDS ASIDE for every other non-periodic transfer. An armed bulk IN the device NAKs is
+    // retried by the core in hardware, and every retry takes an entry in the NON-PERIODIC REQUEST QUEUE that
+    // control and bulk transfers on every other channel need - `net::tx` found it starving a transmit, with
+    // GNPTXSTS reporting zero entries free. Whether it starves a control transfer too has not been measured
+    // on this board (no run has had the NIC's IN armed), and a SETUP takes the same queue, so it stands
+    // aside for both. `rtl::service` puts it back, from where it stopped, with its data toggle. The NIC's own
+    // background IN is left alone: arming it is not a transfer that has to complete. Periodic transfers - the
+    // keyboard, the hub's status - ride the periodic queue and are not affected. A no-op when it is not armed.
+    if ch != CH_RADIO_RX && ch != crate::regs::CH_NET_RX && (ep_type == 0 || ep_type == 2) {
+        halt(ctx, mmio, CH_RADIO_RX);
+    }
+
     // Channel-reuse hygiene: if a prior transaction left the channel ENABLED - a timeout that never
     // truly halted, or a split phase re-arm - disable it cleanly before reprogramming. Never reuse a
     // half-live channel.
-    halt(mmio, ch);
+    halt(ctx, mmio, ch);
 
     mmio.write32(hcint_at(ch), 0xFFFF_FFFF);
     let dopng = if ping { HCTSIZ_DOPNG } else { 0 };
@@ -144,10 +160,10 @@ pub fn program_ping(
 /// Program a channel with no PING. The shape every caller but a high-speed bulk OUT wants.
 #[allow(clippy::too_many_arguments)]
 pub fn program(
-    mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
     len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32,
 ) {
-    program_ping(mmio, t, ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false);
+    program_ping(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false);
 }
 
 /// The data PID the controller has advanced to, read back from HCTSIZ [30:29].
@@ -178,7 +194,13 @@ pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
 ///
 /// Bounded, and it waits for the halt to actually land: an abort that returns before the core has
 /// finished is the same abandoned-channel bug in a smaller window.
-pub fn halt(mmio: &Mmio, ch: u32) {
+///
+/// Bounded by the CLOCK (`gs::driver::wait`, `docs/driver-library.md`). It was 100,000 reads, a count
+/// - however long that many peripheral reads take, which nobody measured on this board.
+/// [`HALT_WAIT`] is an upper estimate of the time the count took, so it should not be SHORTER than the
+/// count was (uncalibrated it is 200,000 looks, which is not): a budget that ran out before a halt that
+/// used to land would abandon the channel, the failure this function exists to prevent.
+pub fn halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32) {
     let hcchar = mmio.read32(hcchar_at(ch));
     if hcchar & HCCHAR_CHENA == 0 {
         return;                       // already idle - nothing queued to retire
@@ -186,41 +208,105 @@ pub fn halt(mmio: &Mmio, ch: u32) {
     mmio.write32(hcchar_at(ch), hcchar | HCCHAR_CHENA | HCCHAR_CHDIS);
     // Spin for the core to retire it. This is a register handshake with the controller, not a wait on
     // a device, so a bounded spin is the right shape - and if it ever expires the channel is left
-    // exactly as an unbounded wait would leave it, minus the hang.
-    let mut t = 0u32;
-    while mmio.read32(hcchar_at(ch)) & HCCHAR_CHENA != 0 {
-        t += 1;
-        if t > 100_000 {
-            break;
-        }
-    }
+    // exactly as an unbounded wait would leave it, minus the hang. Expiry stays quiet as it was: this
+    // runs before every transfer, and the transfer that follows reports the channel's state itself.
+    let _ = wait::until(ctx, HALT_WAIT, || mmio.read32(hcchar_at(ch)) & HCCHAR_CHENA == 0);
 }
 
+/// How long [`halt`] waits for the core to retire a channel. 100,000 reads at the slowest a Pi 2
+/// peripheral read is likely to be (about 0.5 us) - an upper estimate of the count it replaced, so the
+/// change can only wait longer, and only when a halt is not landing anyway. A shorter figure needs a
+/// measurement of how long a halt really takes.
+const HALT_WAIT: Budget = Budget::ms(50);
+
 pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(ms));
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(ms));
     loop {
         let hcint = mmio.read32(hcint_at(ch));
         if hcint & HCINT_CHHLTD != 0 {
             return Some(hcint);
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             // Leave the channel clean for the next user rather than abandoning it enabled - the
             // failure this driver's channel-per-stream split exists to prevent. `halt` is what makes
             // that true: it retires the core's outstanding request, which the old open-coded disable
             // did not.
-            halt(mmio, ch);
+            halt(ctx, mmio, ch);
             return None;
         }
     }
 }
 
-/// One stage of a control transfer: program, wait for the halt, decide success from HCINT.
+/// A single-packet stage that halts on a transaction error is run again, up to this many errors in all -
+/// Linux's `dwc2_hc_xacterr_intr` and `dwc2_release_channel`, read from the source: an XACTERR halts the
+/// channel, the control phase is NOT advanced (it moves only on transfer-complete), and the transfer is
+/// failed with `-EPROTO` at the third error. So Linux re-runs the STAGE, never the whole transfer.
+///
+/// Before this, one XACTERR failed the whole control transfer, and the caller retried it from SETUP - which
+/// re-sent a DATA stage the device had already taken. On a Pi 2 a firmware block whose STATUS stage
+/// failed that way reached the RTL8188CUS twice and its checksum was never reported; refusing the re-send
+/// (`OP_CONTROL_ONCE`) instead left the chip NAKing every read after it until it was unplugged
+/// (`docs/wifi-usb.md` 6, R2b and R2c). Re-running the stage is what neither tried.
+///
+/// Only a stage of at most ONE packet is re-run: a SETUP, a STATUS, a register's few bytes. A longer DATA
+/// stage that errors part-way has moved packets Linux resumes from (`dwc2_update_urb_state_abn` and the
+/// saved toggle), and this driver programs a stage from its start, so such a stage still fails at once.
+const STAGE_XACTERR_TRIES: u32 = 3;
+
+/// One stage of a control transfer: program, wait for the halt, decide success from HCINT. A
+/// single-packet stage that halts on a transaction error alone is run again (`STAGE_XACTERR_TRIES`).
 #[allow(clippy::too_many_arguments)]
 fn stage(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, what: &str,
 ) -> bool {
-    program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, 0);
+    let one_packet = len <= t.mps as u32;
+    let mut errors = 0;
+    loop {
+        match stage_once(ctx, mmio, t, ch, dir_in, pid, buf_phys, len, what) {
+            Ok(()) => {
+                if errors > 0 {
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: {} stage completed after {} transaction error(s), re-run as Linux does", what, errors));
+                }
+                return true;
+            }
+            Err(Some(hcint)) if one_packet && hcint & HCINT_XACTERR != 0 && hcint & HCINT_STALL == 0 => {
+                errors += 1;
+                if errors >= STAGE_XACTERR_TRIES {
+                    log_failed(ctx, what, hcint);
+                    ctx.log_fmt(format_args!("dwc2-svc: {} stage gave up after {} transaction errors", what, errors));
+                    return false;
+                }
+            }
+            Err(Some(hcint)) => {
+                log_failed(ctx, what, hcint);
+                return false;
+            }
+            Err(None) => return false,
+        }
+    }
+}
+
+fn log_failed(ctx: &ServiceContext, what: &str, hcint: u32) {
+    // XFERCOMPL is the only success. A halt with anything else latched is a real failure and is named,
+    // because "the transfer did not work" and "the device STALLed" want different responses and a single
+    // false would merge them.
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: {} stage FAILED (HCINT={:#010x}{}{}{})", what, hcint,
+        if hcint & HCINT_STALL != 0 { " STALL" } else { "" },
+        if hcint & HCINT_XACTERR != 0 { " XACTERR" } else { "" },
+        if hcint & HCINT_NAK != 0 { " NAK" } else { "" }));
+}
+
+/// One attempt at a stage: `Ok` on transfer-complete, `Err(Some(hcint))` on a halt with anything else
+/// latched, `Err(None)` when the channel never halted (already logged, with the core's state).
+#[allow(clippy::too_many_arguments)]
+fn stage_once(
+    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, what: &str,
+) -> Result<(), Option<u32>> {
+    program(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, 0);
     match wait_halt(ctx, mmio, ch, 100) {
         None => {
             // SAY WHAT THE CORE LOOKED LIKE, not just that we gave up.
@@ -249,23 +335,10 @@ fn stage(
                 nptx, (nptx >> 16) & 0xFF,
                 mmio.read32(crate::regs::GINTSTS),
                 mmio.read32(hcchar_at(ch))));
-            false
+            Err(None)
         }
-        Some(hcint) => {
-            // XFERCOMPL is the only success. A halt with anything else latched is a real failure and
-            // is named, because "the transfer did not work" and "the device STALLed" want different
-            // responses and a single false would merge them.
-            if hcint & HCINT_XFERCOMPL != 0 {
-                true
-            } else {
-                ctx.log_fmt(format_args!(
-                    "dwc2-svc: {} stage FAILED (HCINT={:#010x}{}{}{})", what, hcint,
-                    if hcint & HCINT_STALL != 0 { " STALL" } else { "" },
-                    if hcint & HCINT_XACTERR != 0 { " XACTERR" } else { "" },
-                    if hcint & HCINT_NAK != 0 { " NAK" } else { "" }));
-                false
-            }
-        }
+        Some(hcint) if hcint & HCINT_XFERCOMPL != 0 => Ok(()),
+        Some(hcint) => Err(Some(hcint)),
     }
 }
 
@@ -281,8 +354,8 @@ pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
     (hub_port as u32 & 0x7F) | ((hub_addr as u32 & 0x7F) << 7) | (0b11 << 14) | (1 << 31)
 }
 
-/// Wait until the controller reports the given microframe. Bounded: one full frame is 8 microframes
-/// at 125 us, so a whole sweep cannot take more than a millisecond even if the target never appears.
+/// Wait until the controller reports the given microframe. Bounded by a 2 ms deadline: a whole sweep of
+/// 8 microframes is 1 ms, so the target is either reached or gone.
 // The microframe/halt cycle counters that lived here are REMOVED, along with the three
 // `pub static ...: Atomic*` they used. They answered the question they were added for - the
 // channel-halt wait is ~97% of the keyboard's CPU and the microframe wait ~3%, which is why
@@ -297,13 +370,18 @@ pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
 // a measurement worth keeping would need its own home rather than a parameter on a shared path.
 
 fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    // PACED, though it sleeps its own sub-millisecond gaps below rather than calling `pause`: what the
+    // pace buys is the uncalibrated bound. That sleep is a whole scheduler quantum on such a machine, so
+    // the polling bound of 200,000 looks would be minutes; paced, it is the two looks a 2 ms budget holds.
+    // Every look counts, the spun last microframe included, so uncalibrated this can return before the
+    // target; a missed microframe is a missed split, which every caller already handles.
+    let mut deadline = wait::Deadline::paced(ctx, Budget::ms(2), Budget::ms(1));
     loop {
         let cur = mmio.read32(HFNUM) & 7;
         if cur == target {
             return;
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             return;
         }
         // SLEEP THE BULK OF THE WAIT, SPIN ONLY THE LAST MICROFRAME.
@@ -355,7 +433,7 @@ fn stage_split_one(
         // STATE 1 - the Start-Split (CompleteSplit = 0). The hub's transaction translator legitimately
         // NAKs or transaction-errors while busy, and USB 2.0 11.17.5 says the host re-issues the whole
         // start-split rather than treating it as a failure.
-        program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt);
+        program(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt);
         let ss = match wait_halt(ctx, mmio, ch, 50) {
             Some(v) => v,
             None => continue,
@@ -376,7 +454,7 @@ fn stage_split_one(
         // STATE 2 - poll the Complete-Split for the low/full-speed device's answer.
         let mut nyet = 0u32;
         loop {
-            program(mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt | (1 << 16));
+            program(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, splt | (1 << 16));
             let cs = match wait_halt(ctx, mmio, ch, 50) {
                 Some(v) => v,
                 None => break,
@@ -447,14 +525,14 @@ fn uframe_now(mmio: &Mmio) -> u32 {
 /// still holds the result for a few) while waiting for an exact value we have already gone by would
 /// cost a whole frame. False means too far past to be worth asking.
 fn wait_until_at_least(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> bool {
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(2));
     loop {
         let ahead = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
         if ahead == 0 || ahead > 0x2000 {
             // At it, or past it. Past is only useful while the TT still holds the result.
             return ahead == 0 || (0x4000 - ahead) <= 6;
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             return false;
         }
         core::hint::spin_loop();
@@ -487,7 +565,7 @@ enum Uframe {
 fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
     // Bounded: a few microframes is all a legitimate wait ever needs; anything longer means the target
     // is gone and spinning cannot bring it back.
-    let deadline = ctx.read_tsc().wrapping_add(ctx.duration_cycles(2));
+    let mut deadline = wait::Deadline::start(ctx, Budget::ms(2));
     loop {
         let delta = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
         if delta == 0 {
@@ -496,7 +574,7 @@ fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
         if delta > 0x2000 {
             return Uframe::Missed;      // target is behind us
         }
-        if ctx.read_tsc().wrapping_sub(deadline) < (1u64 << 63) {
+        if deadline.expired() {
             return Uframe::Missed;      // could not get there in time - say so
         }
         core::hint::spin_loop();
@@ -510,7 +588,7 @@ fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
 ///
 ///   1. START-SPLIT in microframe (current+1)&7, SKIPPING microframe 6: too little of the frame is
 ///      left after it for the complete-split at +2. ODDFRM must match that microframe's parity, which
-///      `program` derives from HFNUM - correct only because the channel is enabled AFTER `wait_uframe`
+///      `program` derives from HFNUM - correct only because the channel is enabled AFTER `wait_uframe_abs`
 ///      has reached the scheduled microframe.
 ///   2. COMPLETE-SPLIT at +2, retrying NYET in the following microframes (3 tries).
 ///
@@ -537,7 +615,7 @@ pub fn interrupt_in(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32,
 ) -> u32 {
-    program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, 0); // ep_type 3 = interrupt, no HCSPLT
+    program(ctx, mmio, t, ch, true, pid, len, buf_phys, ep, 3, 0); // ep_type 3 = interrupt, no HCSPLT
     wait_halt(ctx, mmio, ch, 5).unwrap_or(0)
 }
 
@@ -589,7 +667,7 @@ pub fn periodic_split_in(
         }
         return 0;   // could not reach the boundary - skip this poll rather than send a malformed split
     }
-    program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
+    program(ctx, mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt); // ep_type 3 = interrupt
     let ss = match wait_halt(ctx, mmio, ch, 5) {
         Some(v) => v,
         None => return 0,
@@ -649,7 +727,7 @@ pub fn periodic_split_in(
             return last;
         }
         let cs_uf = uframe_now(mmio) & 7;
-        program(mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
+        program(ctx, mmio, t, ch, true, pid, len, buf_phys, ep, 3, splt | (1 << 16));
         let cs = match wait_halt(ctx, mmio, ch, 5) {
             Some(v) => v,
             None => {

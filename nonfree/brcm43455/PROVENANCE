@@ -1,0 +1,46 @@
+# PROVENANCE - nonfree/brcm43455
+
+Cypress/Broadcom CYW43455 radio firmware, for the Raspberry Pi 4 Model B's onboard WiFi.
+
+**Why this is here at all, and why it is not source.** This part contains its own processor and RAM with
+no ROM firmware for the MAC: until a host uploads code into it there is no 802.11 inside to talk to. The
+register-level interface to the radio is not published - only the protocol you speak to the firmware once
+it runs. So these files are the program for a second CPU, and nobody writes them. Not Linux, not the Pi's
+own boot firmware, not Windows. See `docs/wifi.md` section 8.
+
+**Licence.** `LICENCE` in this directory, fetched with the files. It permits redistribution in binary
+form with the copyright notice attached - which is what that file is - and explicitly forbids any attempt
+to modify, reverse engineer, decompile or disassemble. GodspeedOS does none of those: it uploads them to
+the device and speaks the documented protocol.
+
+**Retrieved** 2026-09-27 from `RPi-Distro/firmware-nonfree`, branch `bookworm`. That repository is Debian
+PACKAGING SOURCE rather than the installed layout, which is why the paths below are not the names the
+files carry here: the board-specific `brcmfmac43455-sdio.raspberrypi,4-model-b.*` names upstream are
+symlinks into `cypress/`, and the unsuffixed `.bin` name is produced by the packaging rules at build
+time. The files are stored here under the names the driver loads; the SHA-256 is of the CONTENT, so a
+rename costs nothing in verifiability - fetch the upstream path and compare.
+
+| file here | bytes | sha256 | upstream path | what it is |
+|---|---|---|---|---|
+| `brcmfmac43455-sdio.bin` | 609309 | `d608f866582519c0a28d86db43040f4f1b98dd1d153e72e9752586546b4a36c3` | `debian/config/brcm80211/cypress/cyfmac43455-sdio-standard.bin` | the firmware image the chip's own processor runs (standard variant, as Pi OS installs) |
+| `brcmfmac43455-sdio.clm_blob` | 2676 | `9823842cae9fb9a5dd1e5fb31f595516ec7deee341354bef30bb3026eee29cc1` | `debian/config/brcm80211/cypress/cyfmac43455-sdio.clm_blob` | CLM blob - regulatory limits per country/channel |
+| `brcmfmac43455-sdio.txt` | 2074 | `ca709be81a78bdb6932936374f39943acbd7af07fae6151011127599a3ce9e3d` | `debian/config/brcm80211/brcm/brcmfmac43455-sdio.txt` | NVRAM calibration text, board-specific |
+
+**To verify a copy**, fetch `https://raw.githubusercontent.com/RPi-Distro/firmware-nonfree/bookworm/<upstream path>`
+and compare the SHA-256. Nothing here has to be trusted on this project's word.
+
+**`-standard` rather than `-minimal`, and what the difference actually is.** Upstream ships both
+(548,728 and 609,309 bytes) and its own `cypress/README.txt` says what the smaller one gives up. It is
+not a compressed equivalent: `-minimal` REMOVES features to free memory so the chip can hold more client
+state in ACCESS-POINT mode - about 19 clients - namely
+
+  * 802.11k / 802.11v / 802.11r advanced roaming,
+  * `dfsradar`, which lets an AP use channels shared with radar systems,
+  * `obss-obssdump`, automatic channel selection,
+  * `swdiv`, antenna diversity - and upstream notes this is irrelevant with a single antenna anyway.
+
+Worth noticing: **none of those matter to GodspeedOS**, because `docs/wifi.md` section 9 rules out AP
+mode and roaming as non-goals, and the Pi 4 has one antenna. So `-minimal` would very likely work here
+too. `-standard` is taken because it is the full part and the default the Pi distribution installs, and
+there is no reason to accept a cut-down build when the thing it buys - AP client capacity - is something
+this OS does not do. Chosen on what the variants DO, not on their size.

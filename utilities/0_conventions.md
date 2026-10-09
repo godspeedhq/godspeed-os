@@ -17,6 +17,16 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    the system must teach its own verbs at the point of use.
 2. **Every subcommand has `help`.** `<util> <subcommand> help` describes that
    subcommand specifically (e.g. `observe now help`).
+
+   **At every depth, and checked.** Below the first word the answer is the block for the word above -
+   `wifi debug trace help` prints `wifi debug`'s block, which names `trace` with one line - because a
+   leaf's one line IS its help and a block per leaf would repeat it. Amended 2026-09-29: an audit of every
+   word Tab could reach found 22 first-level words with no help at all (`chaos kill-storm help` read `help`
+   as a service name and refused it with the list) and nothing at depth three. The answers live in one
+   place, `sub_help` in `services/shell/src/main.rs` - a command with its own per-word help (`events`,
+   `trace`, `chaos`) is reached from there by a delegating arm, so `<util> <word> help` has exactly one
+   answer whichever way the words arrive. `scripts/subcmd_help_check.py` reads `SUBCMD_FIRST` and
+   `sub_help` and fails on any word Tab offers that answers nothing; it runs on every build.
 3. **`help` is the word - the only form. No flags, no synonyms.** There is exactly
    one way to ask for help: the word `help`. No `-h`, no `--help`, no hidden
    aliases. A tolerated-but-undocumented synonym would itself be a hidden, unsaid
@@ -127,6 +137,13 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     waiting returns the machine to its operator. The `events` channel (`trace_ask`) had the same shape
     and was worse for it, since `events failures` is the instrument you reach for WHEN something is
     wedged; an instrument that can hang on the thing it is measuring takes the prompt with it.
+
+    **Recorded exception: the `wifi` radio power requests.** `wifi radio on`, `wifi radio off`,
+    `wifi radio off hard` and the power request at the start of `wifi radio powercycle` block in a
+    kernel `Call` with no `q`, because a shell blocked in one cannot read the console. Each is
+    BOUNDED at 15 s (`MAX_SECS` in `wifi_radio` and `wifi_radio_hard_off`, `OP_MAX_MS` in
+    `wifi_radio_powercycle`), and the usual wait is two to three seconds. The long waits that follow
+    - the watch after a restart of the driver - keep `q`. `56_wifi.md` section 2 records this per verb.
 11. **Quitting stops the TASK, not just the shell.** When a utility is escaped (rule 10), the
     escape must abort the actual WORK the utility set in motion - not merely stop the shell from
     *waiting* on it. If the utility handed a long job to a peer service and the escape only stops
@@ -141,6 +158,29 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     emits either a typed record `Table` (`docs/records.md`, so `| where` / `| select` /
     `| to json` compose) or plain labelled lines (so `| match` / `| count` compose). Piping is
     the composition model; output that cannot flow onward is a dead end.
+
+    **Which utilities start a pipe, and why the rest do not** (counted 2026-10-02 against the shell's
+    `UTILS` and its three producer lists, `is_producer_builtin`, `is_record_producer` and
+    `is_pipe_producer_service`). Of the shell's utilities (its `UTILS` list), 27 start a pipe (two, `wifi` and `churn`, for some verbs only): the record sources (`status`, `dir`,
+    `find`, `caps`, `drives`, `observe now`, `uptime`, `events`, `trace`, `jobs`, and `wifi list`), the
+    text sources (`echo`, `read`, `tree`, `input`, `about`, `version`, `whatis`, `mem`, `cores`, `date`,
+    `net`, `ping`, `sock`, `help`, `wifi`'s other reports, `churn verify`), and the `roster` service; plus
+    `random` and `tcp` (made sources that day) and the `greet` example, which are not in `UTILS`. Seventeen more are pipe STAGES or SINKS rather than
+    sources - `match`, `count`, `sort`, `first`, `last`, `where`, `select`, `to`, `from`, `sum`, `min`,
+    `max`, `avg`, `paginate`, `write`, `assert`, `result` - and `result`/`assert` refuse to start a pipe
+    with a sentence that names the idiom they belong to. The other 22, each for a reason rather than an
+    omission (the library scripts, `serve` and `gpio` are not in `UTILS` and are listed with them):
+
+    | Not a pipe source | Why |
+    |---|---|
+    | `run`, `selfcheck` | Orchestrators: they run their own sub-pipelines, so capturing one nests a pipe inside a pipe on a 256 KiB stack - a hardware-proven crash. They write their own output with `save <path>` instead |
+    | `health`, `online`, `size`, `busiest`, `watch` (the library) | Scripts, run by the interpreter: the same class as `run`, refused inside another script for the same stack reason. Their contents pipe directly - `busiest` IS `status \| sort reverse mem` |
+    | `docs`, `scrollback`, `edit`, bare `observe` | Full-screen: a pipe cannot carry a screen you scroll. `scrollback save` and `observe now` are the capturable forms |
+    | `clear`, `wait`, `cd`, `mkdir`, `copy`, `move`, `rename`, `delete`, `seal`, `spawn`, `kill`, `restart`, `reboot`, `background`, `foreground` | Actions: the value is the effect, and what they print is a confirmation, not data |
+    | `wifi scan`, `join`, `leave`, `forget`, `radio ...` | Actions; `join` also reads a passphrase from the console, and piped its prompt would vanish. Refused with a sentence naming the reports |
+    | `churn <seconds>`, `churn tear`, `churn reset` | Actions; `churn verify` is the report and pipes |
+    | `chaos`, `fcap` | Exercisers whose value is what they prove while running; `chaos` writes its report with `save` |
+    | `serve`, `gpio` | `serve` runs until stopped; `gpio` drives pins - the one read it offers is a single line on the Pi 2 only |
 13. **If it does not fit the common pipes, `write` still captures it.** Any producer's output
     snapshots to a file with `| write <path>` (redirection is `| write`; there is no `>`, see
     `19_write.md`). So even a utility that is not a record source is never trapped on screen -
@@ -205,6 +245,41 @@ Two implementation shapes exist, and each utility's doc states which it is:
 
 The dividing question is least authority: if a command would otherwise execute in
 the same domain as `spawn`/`kill`/`restart`, prefer a standalone service.
+
+---
+
+## 2a. Adding a utility: the eight sites, and where its spec lives
+
+Written down because it was learned by failing. Implementing one verb (`wifi`, 2026-09-27) needed eight
+registrations in `services/shell/src/main.rs`, and the two that were missed were reported by two
+different checkers rather than by any list - which works, but late. The knowledge lived only in the
+checkers that enforce it.
+
+| Site | What it gives you | What fails if you miss it |
+|---|---|---|
+| `SUBCMD_FIRST` | tab completion of the first argument | rule 9; Tab falls through to a directory listing |
+| `SUBCMD_SECOND` | completion one level deeper, where the surface has one | rule 9, silently |
+| `NO_PATH_CMDS` | Tab offers keywords, not paths, where no argument is a path | a path menu for a keyword position |
+| `UTILS` | the `<util> help` / `<util> version` intercept | rules 1 and 5 |
+| the command dispatch | the verb runs at all | nothing runs |
+| the producer dispatch | `<util> \| write <path>` captures it | rules 12 and 13 |
+| a `help_block` arm | `<util> help` prints something | caught by `util_help_coverage_problems` |
+| a `Row` in the `help` listing | anybody can DISCOVER the verb | caught by `facts_check` - *"an omission ships the feature to nobody who was not watching it being built"* |
+
+**And where the spec goes, which is not a preference.** A spec under `utilities/` **asserts that the
+shell answers that verb**, and `X-user-vocabulary` (Commandment X) enforces it in both directions:
+
+- A spec here for a verb the shell does not answer fails. Implement it, delete it, or document the
+  ABSENCE (`14_poweroff.md` is the worked example, and the head must say "not provided" or "removed").
+- A verb the shell DOES answer with no spec here also fails - a verb discoverable only by reading the
+  source is complexity pushed onto the user (CLAUDE.md 26.11).
+
+So a surface designed before its verb exists belongs in `docs/` and moves here the day the shell answers
+it. `docs/tcp-design.md` against `48_tcp.md` is that split; `docs/wifi.md` against `56_wifi.md` is the
+same, and the file moved three times before anyone wrote this paragraph.
+
+**Do not reach for `utility_vocab_debt` to make either direction quiet.** A baseline entry instead of a
+fix is what `CONTRIBUTING.md` names as weakening a gate.
 
 ---
 

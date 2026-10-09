@@ -1,0 +1,40 @@
+# PROVENANCE - nonfree/aic8800d80
+
+AICSemi AIC8800D80 WiFi/Bluetooth firmware, for the StarFive VisionFive 2 Lite's onboard radio (SDIO,
+DesignWare `dw_mmc` host at `0x16020000`, SDIO IDs `C8A1:0082` and `C8A1:0182`). `docs/wifi.md` section 44.
+
+**Why this is here at all, and why it is not source.** Like the Pi 4's CYW43455, this part carries its own
+processor and RAM, and the host uploads the program it runs - several patches and then `fmacfw`, the
+full-MAC firmware. Nobody writes these but the vendor. See `docs/wifi.md` section 8.
+
+**Licence.** Read `LICENCE` in this directory before anything else: these files have NO licence from
+AICSemi. That file records the only written terms they travel under, what they do and do not mean, and
+`docs/licensing.md` section 5a records that carrying them is an exception taken on the operator's decision
+of 2026-10-04.
+
+**Retrieved** 2026-10-04 from `radxa-pkg/aic8800`, commit `09c65d618f5ccde3233f8f41ef2f55b205ef11db`
+("feat: update to aic8800d_linux_sdk_V4.0_2025_0410_b99ca8b6", 2025-07-22), path
+`src/SDIO/driver_fw/fw/aic8800D80/`. **Not Radxa's current `main`:** at `main` (`d13d0796`, 2026-09-29)
+four of the five files are a newer release. The commit above was chosen because it is the one whose files
+match, byte for byte, what the board's own vendor image loaded - the VisionFive 2 Lite's StarFive Debian
+boot log printed an MD5 for each file as its driver read it, and every one matches:
+
+| file here | bytes | sha256 | md5 (and the board's logged md5) | what it is |
+|---|---|---|---|---|
+| `fw_patch_table_8800d80_u02.bin` | 1264 | `788422a697a5ae3b9eb4fdca85c40ba20ea7da2bcdc78cd20690aa0c6eb3cda2` | `cf3ad67820e4659c02b2e76498d85eb3` | the patch table: where the patches below go in the chip's memory |
+| `fw_adid_8800d80_u02.bin` | 1708 | `a526cbd02fcdc495f049f3ad6b5933cb08cd984b16790c716a060d582fee1a56` | `f546881a81b960d89a672578eb45a809` | the ADID patch, loaded first |
+| `fw_patch_8800d80_u02.bin` | 30944 | `0cd045e94e225d7dfe2e14c0bd5045db76e68b2c7a41278885ca75c1908da4eb` | `8a96b6d133dfc768aadf1ac3b1e15bd2` | the ROM patch |
+| `fw_patch_8800d80_u02_ext0.bin` | 13296 | `73e86a5d8a4a79463763f35de708102e67125e2a83d2d2a356faab5dcacc786a` | `7f0966305d8637e86ad1c13b24a0a728` | the extension patch the patch table names (`ext_patch_id 0`) |
+| `fmacfw_8800d80_u02.bin` | 327440 | `eca42fbbc756d18b94c63774e2be13a0aafa6112b8b0726d1954b54231dca431` | `2a1b4cfb1d8f590b719f43b10ff65a89` | the full-MAC WiFi firmware itself |
+
+The load order on the board was the order of this table: patch table, ADID, patch, extension patch, then,
+after the Bluetooth patch-table pass, `fmacfw`. The SDIO clock was 5 MHz for the loads.
+
+**To verify a copy**, fetch
+`https://raw.githubusercontent.com/radxa-pkg/aic8800/09c65d618f5ccde3233f8f41ef2f55b205ef11db/src/SDIO/driver_fw/fw/aic8800D80/<file>`
+and compare the SHA-256. Nothing here has to be trusted on this project's word.
+
+**Not carried, deliberately.** The same directory upstream also holds `fmacfw_8800d80_u02_ipc.bin`,
+`fmacfwbt_8800d80_u02.bin` and `lmacfw_rf_8800d80_u02.bin`. The board's vendor image did not load them, and
+a blob nothing loads is a blob nobody can vouch for (26.2). They join this directory when a driver needs
+one, with their own row here.

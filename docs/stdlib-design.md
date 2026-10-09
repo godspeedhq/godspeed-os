@@ -1715,6 +1715,14 @@ thing (Commandment III).
 
 ### MMIO and DMA stay in the SDK, permanently
 
+> **Superseded in part, 2026-10-02 - see `docs/driver-library.md`.** The line drawn below is MOVED, not
+> erased. Hardware authority still comes only through the SDK's audited layer and `unsafe` still lives
+> only there (CLAUDE.md 18.1) - that half stands exactly as written. What changed is the other half:
+> `gs` now has a `driver` tier for the safe, device-neutral MACHINERY a driver builds on (bounded waits
+> first), so "reach for the SDK only if you are writing a driver" becomes "a driver reaches for the SDK
+> only where `gs::driver` has no mechanism yet". Each mechanism is added only after it is found
+> repeated in real drivers. The text below is kept as the reasoning that held until then.
+
 The rule this work exists to make true is **use `gs`; reach for `godspeed-sdk` only if you are writing
 a driver**. That rule is clean precisely because MMIO and DMA are on the other side of it. A
 `gs::mmio` would either be a second name for `sdk/rust/src/mmio.rs` - which CLAUDE.md 18.1 designates

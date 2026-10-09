@@ -80,8 +80,10 @@ fails.
 | [`events`](utilities/events.md) | what was recorded: IPC ring, metrics, logs, capture to disk |
 | [`mem`](utilities/mem.md) | memory |
 | [`cores`](utilities/cores.md) | the cores that came up |
+| [`hardware`](utilities/hardware.md) | this machine's devices, and what drives each |
 | [`uptime`](utilities/uptime.md) | how long since boot |
 | [`date`](utilities/date.md) | the wall clock |
+| [`audio`](utilities/audio.md) | sound: what is playing, the volume, a test tone |
 | [`about`](utilities/about.md) | what this system is |
 | [`version`](utilities/version.md) | version, of anything |
 | [`clear`](utilities/clear.md) | clear the screen |
@@ -103,6 +105,7 @@ fails.
 | | |
 |---|---|
 | [`net`](utilities/net.md) | am I on the network? |
+| [`wifi`](utilities/wifi.md) | what wireless networks are there, and join one |
 | [`sock`](utilities/sock.md) | a UDP socket as a capability |
 | [`ping`](utilities/ping.md) | continuous ICMP echo |
 | [`tcp`](utilities/tcp.md) | one TCP transaction: connect, send, read, close |

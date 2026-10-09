@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! `/wifi.keys`: the credential table on disk, so a machine that boots with a radio joins the network it
+//! last joined and is ready to go (`utilities/56_wifi.md` 6, decided by the operator 2026-09-30).
+//!
+//! **What is on the card, said plainly.** The DERIVED KEY of each network - the 32-byte pairwise master
+//! key the passphrase becomes the moment it arrives (`crypto::psk`) - never the passphrase itself. A key
+//! joins the network exactly as the passphrase would, so whoever holds the card can join it; that is
+//! accepted. It does not reveal the passphrase text, which people reuse elsewhere. Network names are in
+//! plain text. Nothing is encrypted at rest. There is no per-machine secret to encrypt with, and pretending
+//! otherwise would be the silent substitution 26.4 names.
+//!
+//! **The in-memory table stays the working set** (the radio driver's credential table: `Stored` in the
+//! shared serve loop, `serve.rs`). This file is where it is loaded
+//! from when the radio comes up and written to after every change - a join that added or re-ordered a key,
+//! a `forget` - and where `fs` is absent or mid-restart the driver runs on the table alone, exactly as it
+//! did before the file existed. A load that cannot reach `fs` is retried a bounded number of times and
+//! then given up with a line, never waited for.
+//!
+//! **Format**, version 1, little-endian, most recently used first: `"GSWK"`, version byte, count byte,
+//! then `count` entries of `[len, ssid[32], security, pmk[32]]` (66 bytes). At most `MAX_SAVED` entries,
+//! which keeps the whole file inside one `fs` write; the in-memory table's 64 is the larger bound and the
+//! sixteen least recent are simply not saved. Open networks hold no key and are not saved.
+
+use godspeed_sdk::{Message, ServiceContext};
+
+pub const PATH: &[u8] = b"/wifi.keys";
+const MAGIC: [u8; 4] = *b"GSWK";
+const FILE_VERSION: u8 = 1;
+pub use crate::crypto::PMK_LEN;
+pub use crate::wire::SSID_MAX;
+pub const MAX_SAVED: usize = 48;
+const HEADER: usize = 6;
+const ENTRY: usize = 1 + SSID_MAX + 1 + PMK_LEN;
+
+/// `fs`'s whole-file ops: `[tag, op, path_len, path, data...]` in, `[tag, status, ...]` out; a read answers
+/// `[tag, FS_OK, len:u32, bytes]`. The tag is echoed and interpreted no further.
+const FS_OP_WRITE: u8 = 10;
+const FS_OP_READ: u8 = 11;
+const FS_OK: u8 = 0;
+/// `fs`'s "no such file" - the one answer that means there is nothing to load (`services/fs`, `FS_NOTFOUND`).
+const FS_NOTFOUND: u8 = 2;
+/// `fs`'s "no filesystem on this disk" - nothing to load either, and asking again will not make one.
+const FS_NOFS: u8 = 3;
+const TAG: u8 = 0xA7;
+/// One exchange with `fs`. A read of a 3 KiB file is milliseconds; two seconds is the loud floor.
+const FS_SECS: i64 = 2;
+
+#[derive(Clone, Copy)]
+pub struct Entry {
+    pub ssid: [u8; SSID_MAX],
+    pub len: u8,
+    pub sec: u8,
+    pub pmk: [u8; PMK_LEN],
+}
+
+impl Entry {
+    pub const EMPTY: Entry = Entry { ssid: [0; SSID_MAX], len: 0, sec: 0, pmk: [0; PMK_LEN] };
+}
+
+pub enum Load {
+    /// This many entries read, most recent first.
+    Loaded(usize),
+    /// `fs` answered and there is no file, no filesystem, or a file this version cannot read: settled,
+    /// nothing to adopt.
+    NoFile,
+    /// `fs` did not answer, or answered that its storage is in trouble (unavailable, an I/O error): not
+    /// settled, worth asking again.
+    Unreachable,
+}
+
+/// One request to `fs`, matched to its own reply, with one reacquire-and-retry when the send itself failed
+/// (an `fs` respawned since this driver was wired). A deadline is never re-sent.
+fn ask(ctx: &ServiceContext, req: &[u8]) -> Option<Message> {
+    let msg = Message::from_bytes(req);
+    match ctx.request_with_reply_call_err("fs", &msg, FS_SECS) {
+        Ok(r) => r,
+        Err(_) => {
+            if !ctx.reacquire_by_name("fs") {
+                return None;
+            }
+            match ctx.request_with_reply_call_err("fs", &msg, FS_SECS) {
+                Ok(r) => r,
+                Err(_) => None,
+            }
+        }
+    }
+}
+
+pub fn load(ctx: &ServiceContext, who: &str, out: &mut [Entry; MAX_SAVED]) -> Load {
+    let mut req = [0u8; 3 + 32];
+    req[0] = TAG;
+    req[1] = FS_OP_READ;
+    req[2] = PATH.len() as u8;
+    req[3..3 + PATH.len()].copy_from_slice(PATH);
+    let r = match ask(ctx, &req[..3 + PATH.len()]) {
+        Some(r) => r,
+        None => return Load::Unreachable,
+    };
+    let p = r.payload_bytes();
+    // ONLY "NO SUCH FILE" AND "NO FILESYSTEM" SETTLE IT. Every other refusal is storage in trouble - `fs`
+    // answers `FS_UNAVAIL` while its block driver is being respawned - and reading that as "no file"
+    // settled the load and gave up on it for the life of this instance, so a driver started then never
+    // rejoined from `/wifi.keys` (Pi 4, chaos max-carnage, 2026-10-02: "no /wifi.keys - nothing to
+    // rejoin" logged one millisecond after `fs: re-mount after I/O error FAILED`). The caller's retry is
+    // bounded, so a disk that never comes back is still given up on, and says so.
+    match p.get(1).copied() {
+        Some(FS_OK) if p.len() >= 6 => {}
+        Some(FS_NOTFOUND) | Some(FS_NOFS) => return Load::NoFile,
+        _ => return Load::Unreachable,
+    }
+    let n = u32::from_le_bytes([p[2], p[3], p[4], p[5]]) as usize;
+    let data = &p[6..core::cmp::min(p.len(), 6 + n)];
+    if data.len() < HEADER || data[..4] != MAGIC || data[4] != FILE_VERSION {
+        ctx.log_fmt(format_args!(
+            "{}: /wifi.keys is {} bytes and not a version {} key file - ignored, and it will be rewritten by the next join",
+            who, data.len(), FILE_VERSION
+        ));
+        return Load::NoFile;
+    }
+    let count = core::cmp::min(data[5] as usize, MAX_SAVED);
+    let mut got = 0usize;
+    for i in 0..count {
+        let at = HEADER + i * ENTRY;
+        if at + ENTRY > data.len() {
+            break;
+        }
+        let e = &data[at..at + ENTRY];
+        let len = e[0] as usize;
+        if len == 0 || len > SSID_MAX {
+            continue;
+        }
+        let mut entry = Entry::EMPTY;
+        entry.len = len as u8;
+        entry.ssid.copy_from_slice(&e[1..1 + SSID_MAX]);
+        entry.sec = e[1 + SSID_MAX];
+        entry.pmk.copy_from_slice(&e[2 + SSID_MAX..2 + SSID_MAX + PMK_LEN]);
+        out[got] = entry;
+        got += 1;
+    }
+    Load::Loaded(got)
+}
+
+/// Write the table, most recent first, at most `MAX_SAVED` entries. True when `fs` accepted it.
+///
+/// **MERGED WITH THE FILE, not written over it.** Two radio drivers keep this file - the onboard radio's
+/// and the dongle's (`utilities/56_wifi.md` 11) - each from its own table, so a save of one table alone
+/// would drop a key the other radio added. So the file is read first and its entries that this table does
+/// not hold are kept, after this table's, up to `MAX_SAVED`. `forgotten` is the network a `wifi forget`
+/// asked to drop: it is the one entry of the file NOT kept.
+pub fn save(ctx: &ServiceContext, who: &str, entries: &[Entry], forgotten: Option<&[u8]>) -> bool {
+    let mut file = [Entry::EMPTY; MAX_SAVED];
+    let in_file = match load(ctx, who, &mut file) {
+        Load::Loaded(n) => n,
+        _ => 0,
+    };
+    let mut merged = [Entry::EMPTY; MAX_SAVED];
+    let mut m = 0usize;
+    for e in entries.iter().take(MAX_SAVED) {
+        if forgotten.is_some_and(|f| f == &e.ssid[..e.len as usize]) {
+            continue;
+        }
+        merged[m] = *e;
+        m += 1;
+    }
+    for e in file.iter().take(in_file) {
+        if m == MAX_SAVED {
+            break;
+        }
+        let name = &e.ssid[..e.len as usize];
+        if forgotten.is_some_and(|f| f == name) || merged[..m].iter().any(|x| &x.ssid[..x.len as usize] == name) {
+            continue;
+        }
+        merged[m] = *e;
+        m += 1;
+    }
+    for e in file.iter_mut() {
+        e.pmk.fill(0);
+    }
+    let ok = write(ctx, who, &merged[..m]);
+    for e in merged.iter_mut() {
+        e.pmk.fill(0);
+    }
+    ok
+}
+
+/// The radio the operator chose (`wifi hardware use`), as the shell wrote it: `/wifi.radio`, holding the
+/// radio's name (`wire::radio_name`). Read beside `/wifi.keys`, with the same settling rules.
+pub const RADIO_PATH: &[u8] = b"/wifi.radio";
+
+/// What `/wifi.radio` says.
+pub enum Choice {
+    /// The radio by this name, `len` bytes of it.
+    Named([u8; 16], usize),
+    /// No choice recorded - no file, or no filesystem.
+    None,
+    /// `fs` did not answer, or its storage is in trouble: worth asking again.
+    Unreachable,
+}
+
+pub fn load_choice(ctx: &ServiceContext) -> Choice {
+    let mut req = [0u8; 3 + 32];
+    req[0] = TAG;
+    req[1] = FS_OP_READ;
+    req[2] = RADIO_PATH.len() as u8;
+    req[3..3 + RADIO_PATH.len()].copy_from_slice(RADIO_PATH);
+    let Some(r) = ask(ctx, &req[..3 + RADIO_PATH.len()]) else { return Choice::Unreachable };
+    let p = r.payload_bytes();
+    match p.get(1).copied() {
+        Some(FS_OK) if p.len() >= 6 => {}
+        Some(FS_NOTFOUND) | Some(FS_NOFS) => return Choice::None,
+        _ => return Choice::Unreachable,
+    }
+    let n = u32::from_le_bytes([p[2], p[3], p[4], p[5]]) as usize;
+    let data = &p[6..core::cmp::min(p.len(), 6 + n)];
+    let text = data.iter().position(|&b| b == b'\n' || b == 0).map_or(data, |i| &data[..i]);
+    if text.is_empty() || text.len() > 16 {
+        return Choice::None;
+    }
+    let mut name = [0u8; 16];
+    name[..text.len()].copy_from_slice(text);
+    Choice::Named(name, text.len())
+}
+
+/// Write `entries` as the whole file.
+fn write(ctx: &ServiceContext, who: &str, entries: &[Entry]) -> bool {
+    let count = core::cmp::min(entries.len(), MAX_SAVED);
+    let mut req = [0u8; 3 + 32 + HEADER + MAX_SAVED * ENTRY];
+    req[0] = TAG;
+    req[1] = FS_OP_WRITE;
+    req[2] = PATH.len() as u8;
+    req[3..3 + PATH.len()].copy_from_slice(PATH);
+    let mut at = 3 + PATH.len();
+    req[at..at + 4].copy_from_slice(&MAGIC);
+    req[at + 4] = FILE_VERSION;
+    req[at + 5] = count as u8;
+    at += HEADER;
+    for e in entries.iter().take(count) {
+        req[at] = e.len;
+        req[at + 1..at + 1 + SSID_MAX].copy_from_slice(&e.ssid);
+        req[at + 1 + SSID_MAX] = e.sec;
+        req[at + 2 + SSID_MAX..at + 2 + SSID_MAX + PMK_LEN].copy_from_slice(&e.pmk);
+        at += ENTRY;
+    }
+    let ok = match ask(ctx, &req[..at]) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            p.len() >= 2 && p[1] == FS_OK
+        }
+        None => false,
+    };
+    // The keys do not linger in this buffer once the write is decided.
+    req.fill(0);
+    if !ok {
+        ctx.log_fmt(format_args!(
+            "{}: /wifi.keys was NOT written ({} entr{}) - fs refused or did not answer; the table in memory is unchanged and the next join tries again",
+            who, count,
+            if count == 1 { "y" } else { "ies" }
+        ));
+    }
+    ok
+}

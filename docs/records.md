@@ -1,7 +1,7 @@
 # Structured records - typed pipes (PowerShell/nushell-style)
 
 > **Status:** Built + QEMU-verified (`osdev test shell`, `osdev test files`): the `Table` model,
-> ten record producers, `where` / `select` / `sort`, `to json` / `to yaml` / the grid, `from json`,
+> eleven shell-side record producers (`wifi list` the eleventh) plus the `roster` service, `where` / `select` / `sort`, `to json` / `to yaml` / the grid, `from json`,
 > the binary wire codec, and the unified byte-or-record pipeline. What is NOT built is listed under
 > *What's built vs next*. Non-normative - does not amend `CLAUDE.md`.
 
@@ -39,7 +39,12 @@ is therefore a **typed value**, with text/JSON as *renderings* of it - never the
 ## The model - a bounded `Table`
 
 The canonical value is a **table**: static column names + rows of typed `Value`
-(`Str` interned in a byte arena, `Int`, …). Most introspection output is naturally tabular
+(`Str` interned in a byte arena, `Int` unsigned, `Signed`, `Empty`). `Signed` arrived on 2026-10-02 for
+`wifi list`'s `dbm`, a reading that is always below zero: the magnitude would be a different number and a
+string sorts by bytes. It is its own variant rather than a change to `Int`, so every count and size kept
+its type; `sort`, `where` and the reducers compare the two kinds numerically, JSON writes it as a number,
+and the wire codec carries it as cell tag 3 (`Empty` 0, `Int` 1, `Str` 2). `from json` now reads a
+negative integer as `Signed` - it used to arrive as `null`. Most introspection output is naturally tabular
 (`status`, `dir`, `find`, `caps` are all uniform rows), so a table covers the realistic cases and
 is simpler than arbitrary records. It is **bounded** (§26.6): `REC_MAX_COLS`, `REC_MAX_ROWS`, a
 fixed `REC_ARENA` - all on the stack, no heap, loud on overflow. Heterogeneous (differently
@@ -68,7 +73,7 @@ grammar is deliberately **terse and code-like**, not an English sentence:
 The text filters (`match`/`count`/`sort`/`first`/`last`) stay - for genuinely-text streams like
 a file's contents. A pipeline is routed to the **record** path when its first stage is a record
 producer (`is_record_producer` - `status`, `dir`, `caps`, `drives`, `find`, `uptime`, `events`,
-`trace`, `jobs`, `observe now`), else
+`trace`, `jobs`, `observe now` - and `wifi list`, routed by name beside it), else
 the **byte** path. They coexist; the default rendering (no `to`) is the table grid. A *text*
 filter applied to a record stream (e.g. `dir | match foo`) is a loud, guided error - use
 `where`/`select`/`sort <col>`, or `to json` to drop back to text first.
@@ -150,7 +155,7 @@ pair.
   `sort [reverse] <col>`; **the shell-side record producers - `status` (task roster),
   `dir` (`name`/`type`/`size`/`sealed`), `caps` (`resource`/`rights`), `drives`
   (`index`/`label`/`status`/`size_mib`/`free_mib`), `find` (`name`/`type`/`path`),
-  `uptime`, `events`, `trace`, `jobs`, and
+  `uptime`, `events`, `trace`, `jobs`, `wifi list` (`network`/`band`/`signal`/`dbm`/`security`/`note`), and
   `observe now` (the roster + a `ticks` cumulative-cpu-time column - the native "top",
   `observe now | sort reverse ticks`)**; **`from json`** (text → records); and the **unified
   byte↔record pipeline** (`Stream = Bytes | Table`, dispatched by command + data type, `from`/`to`

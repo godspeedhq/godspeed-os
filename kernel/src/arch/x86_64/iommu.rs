@@ -433,10 +433,22 @@ const IO_PTE_PR: u64 = 1 << 0;   // present
 const IO_PTE_IR: u64 = 1 << 61;  // read permission
 const IO_PTE_IW: u64 = 1 << 62;  // write permission
 
-/// Domain ID assigned to confined USB controllers. Any non-zero ID distinct from
-/// the (unused) passthrough domain 0 works; one shared domain is fine since each
-/// controller only ever reaches its own arena.
-const CONFINED_DOMAIN: u64 = 1;
+/// The domain ID a confined device's table entry carries: ONE PER DEVICE, its BDF plus one, so it is
+/// never 0 (the passthrough domain) and two devices never share one.
+///
+/// This was a single shared ID, the constant 1, on the reasoning that "each controller only
+/// ever reaches its own arena". That is not how AMD-Vi works: the IOMMU caches translations and page
+/// directory entries BY DOMAIN ID, so two devices with different page tables under one ID can be
+/// translated through each other's cached entries - and the invalidate-pages command for one device's
+/// release flushes the other's too. It was harmless while `xhci` was the only confined device, and
+/// stopped being harmless when the audio controller was confined beside it (2026-10-03). On the T630
+/// on 2026-10-08 `xhci` stopped completing commands 70 ms into a fresh instance, with no fault logged,
+/// and never reset again until a power cycle; this is the defect found under it, fixed whether or not
+/// it is the whole cause (`docs/wifi-usb.md` 51).
+fn domain_of(bdf: u32) -> u64 {
+    // `confine_device` and `release_device` refuse 0xFFFF, so this is 1..=0xFFFF - DomainID is 16 bits.
+    (bdf as u64 & 0xFFFF) + 1
+}
 
 /// Record of one confined device so its I/O page table can be reclaimed and its
 /// DTE reverted to passthrough when the driver dies (restartability - a
@@ -570,7 +582,7 @@ unsafe fn confinement_selftest(l4_phys: u64, arena_phys: u64, arena_len: u64, hh
 ///
 /// # Safety
 /// IOMMU must be enabled with a programmed command buffer (`bringup` ran).
-unsafe fn invalidate_device(mmio_va: u64, cmd_buf_va: u64, bdf: u32) {
+unsafe fn invalidate_device(mmio_va: u64, cmd_buf_va: u64, bdf: u32, domain: u64) {
     let _g = CMD_LOCK.lock();
     // Two 16-byte commands written at the current tail, then advance tail.
     // SAFETY: command buffer is the mapped 4 KiB ring; tail register is valid.
@@ -578,8 +590,8 @@ unsafe fn invalidate_device(mmio_va: u64, cmd_buf_va: u64, bdf: u32) {
         let mut tail = mmio_read64(mmio_va, reg::COMMAND_BUF_TAIL) & 0xFFF;
         // INVALIDATE_DEVTAB_ENTRY (opcode 0x2): dw0 = DeviceID.
         let inval_dte = [(bdf & 0xFFFF) as u32, 0x2 << 28, 0, 0];
-        // INVALIDATE_IOMMU_PAGES (opcode 0x3), entire address space for our domain.
-        let inval_pages = [0u32, (CONFINED_DOMAIN as u32) | (0x3 << 28), 0xFFFF_F003, 0xFFFF_FFFF];
+        // INVALIDATE_IOMMU_PAGES (opcode 0x3), entire address space for THIS device's domain.
+        let inval_pages = [0u32, ((domain as u32) & 0xFFFF) | (0x3 << 28), 0xFFFF_F003, 0xFFFF_FFFF];
         for cmd in [inval_dte, inval_pages] {
             let slot = cmd_buf_va + tail;
             for (i, w) in cmd.iter().enumerate() {
@@ -663,7 +675,7 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
     // Switch the device's DTE to the confined domain. V|TV|mode=4|root|IR|IW all
     // go in data[0]; data[1] holds only the DomainID.
     let data0 = DTE_V | DTE_TV | (4u64 << DTE_MODE_SHIFT) | (l4 & PT_ROOT_MASK) | DTE_IR | DTE_IW;
-    let data1 = CONFINED_DOMAIN;
+    let data1 = domain_of(bdf);
     // SAFETY: dt_va is the mapped device table; bdf < 65536 (16-bit BDF).
     unsafe { write_dte(dt_va, bdf, data0, data1) };
     // SAFETY: order the DTE write before the invalidation reads it.
@@ -671,7 +683,7 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
 
     // Drop the cached passthrough DTE so the new confined entry takes effect.
     // SAFETY: IOMMU enabled in bringup; command buffer programmed.
-    unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_va_phys, hhdm), bdf) };
+    unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_va_phys, hhdm), bdf, domain_of(bdf)) };
 
     // Record so release_device can reclaim this on driver death.
     {
@@ -688,7 +700,7 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
     crate::kprintln!(
         "iommu: confined BDF {:02x}:{:02x}.{} -> domain {} arena {:#x}..{:#x} ({} pages); DTE invalidated",
         (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7,
-        CONFINED_DOMAIN, first, last + 0xFFF + 1, pages
+        domain_of(bdf), first, last + 0xFFF + 1, pages
     );
     true
 }
@@ -763,7 +775,7 @@ pub fn release_device(bdf: u32) -> bool {
     // SAFETY: order the DTE write before invalidation/free.
     unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)) };
     // SAFETY: IOMMU enabled; command buffer programmed.
-    unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_phys, hhdm), bdf) };
+    unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_phys, hhdm), bdf, domain_of(bdf)) };
 
     // Now safe to free the I/O page-table frames (device can't reach them).
     // SAFETY: rec.l4_phys was built by confine_device and is now unreachable.

@@ -25,7 +25,7 @@ identity tests; `chaos` lets an operator reproduce the *between* cases live on r
 | `chaos kill-storm <svc> [rounds]` | Kill one `<svc>` `rounds` times; verify it recovers each round (default 20). |
 | `chaos kill-storm <svc> [n] save <path>` | Same, and also write the report to a file at the end. |
 | `chaos flood-storm <svc> [rounds]` | **Saturate** `<svc>`'s IPC queue with a `try_send` burst until `QueueFull`, then verify it drains and stays alive. The *other* axis: "overwhelmed", not "gone". |
-| `chaos max-carnage <target> <rounds> [yes]` | **The chaos monkey:** each round, kill **OR flood** a *random* live service (everything but the shell), rolling a creative mix (kill / flood / flood-then-kill / kill-then-flood). Runs exactly the count you type; a live progress line ticks `%`/ETA; `q` aborts. A `[y/N]` confirm precedes the run; a 4th word **`yes`** skips it for unattended runs, and the warning still prints in full. |
+| `chaos max-carnage <target> <rounds> [yes] [seed <n>]` | **The chaos monkey:** each round, `all-services` picks a random subset of the live services - the shell and the supervisor included - floods each one it can and kills every one it picked (5b). Runs exactly the count you type; a live progress line ticks `%`/ETA; `q` aborts. A `[y/N]` confirm precedes the run; a 4th word **`yes`** skips it for unattended runs, and the warning still prints in full. `seed <n>` gives the random storm its seed; every random run prints the one it used (5b). |
 | `chaos help` / `chaos version` | Self-documentation (`0_conventions.md`). |
 
 `kill-storm` clamps `rounds` to `1..=100` (`CHAOS_MAX_ROUNDS`, §26.6) - it stores per-round generation
@@ -123,47 +123,66 @@ blocking `send`** (§8.9): blocking into a full queue would hang the shell flood
 
 ## 5b. `max-carnage` - the chaos monkey
 
-`chaos max-carnage [rounds]` reads the **live task set** (exactly what `observe now` shows) and, each
-round, picks **one at random** and rolls a **creative action mix** - kill, flood, flood-then-kill, or
-kill-then-flood (the §8.6 queue-drained-on-death and EndpointDead-back-pressure cases) - everything is
-fair game **except the shell** (killing it would kill
-this very command, which runs *inside* the shell) and the **kernel** (not a task, cannot be killed).
-The shell is itself restartable - a direct `kill shell` respawns a fresh prompt - but `max-carnage`
-can't be the one to kill it, because a fresh shell wouldn't resume the in-flight carnage loop.
-Directly-restarted victims (the whole named set - supervisor, block-driver, fs, shell, xhci, ehci,
-events) are confirmed back up each round; only demo services like `ping`/`pong` (full build) revive on
-the next supervisor respawn (see below). The victim is chosen with a tiny `xorshift64` PRNG seeded
-from the **TSC** (so the sequence differs every run).
+`chaos max-carnage <target> <rounds> [yes]` runs in the `chaos` SERVICE, not in the shell, and that is
+what lets the shell be a victim: killing the shell does not end the run. It reads the **live task set**
+(exactly what `observe now` shows) and, each round, picks its victims by the target:
 
-The point is **not** per-service recovery - it is that the **kernel survives any sequence of random
-service deaths**. The verdict is therefore about kernel survival: the report existing at all proves no
-panic (a panic reboots before it could print). A recoverable victim that did not come back in budget is
-reported per-service (`recovered < killed`), but does not fail the verdict - it may be the §6.2
-supervisor-downtime edge case (a service that died while the supervisor was itself mid-respawn), a
-known service-level limitation, not a kernel failure.
+- **`all-services`** - a coin flip per live service, so about half of them each round, at least one. The
+  shell and the supervisor are victims like any other; the only tasks never picked are `chaos` itself
+  and the `mem-pressure` tasks it spawns, and the kernel, which is not a task.
+- **a service name** - that one every round; **a comma list** - every one listed, every round.
 
-While it runs, a single **self-updating heartbeat line** (so the screen isn't frozen for a long run)
-shows progress, a running ETA, and the abort hint - `q` stops it early. The final report is a
-**per-service aggregate** (constant size for any round count) plus a built-in `observe now` survivor
-line:
+What happens to a victim: every one picked is **flooded and then killed** - its queue filled with a
+`try_send` burst (the §8.6 back-pressure and queue-drained-on-death cases), then the kill. `shell` and
+`fs` are only killed, never flooded, because a flood corrupts their reply streams. (In an aimed run at
+one service, the flood is every round and the kill rotates.) This said the run "rolls a creative action
+mix - kill, flood, flood-then-kill, or kill-then-flood" and spared the shell; neither has been true since
+the run moved into its own service. `chaos` waits for a live shell before it hands the console back.
+
+Every service in the supervisor's `MANAGED` set is respawned on its own death; `chaos` does NOT check
+that it came back - asking the supervisor, which is itself being killed, would not be ground truth. The victims are chosen with a tiny `xorshift64` PRNG. (This
+said it was seeded from the TSC; it is not - the TSC is unreliable on the T630 - and the seed mixes the
+hardware random number where there is one, the monotonic counter, and the wall clock when it is set.)
+
+**The seed is printed, and can be given.** An `all-services` run says its seed when it starts and again in
+its report, and `chaos max-carnage all-services <rounds> seed <n>` runs on that seed. On a display the
+start line is overwritten as soon as the table draws; it stays on serial, and the report repeats it:
 
 ```
-gsh> chaos max-carnage 1000000
-chaos max-carnage: 1000000 rounds - kill a RANDOM live service each round (all but the shell). Press q to quit.
-max-carnage: 250000 / 1000000 (25%) - 250000 kills - ETA 9m00s - kernel alive - q to quit   ← live, refreshes in place
+gsh> chaos max-carnage all-services 1000 yes seed 4242
+chaos: seed 4242 (given) - `chaos max-carnage all-services <n> seed 4242` replays these draws, not this run's timing
+...
 === chaos max-carnage: report ===
-rounds: 1000000; victims killed: 1000000
-  supervisor     killed 166k, recovered 166k
-  block-driver   killed 142k, recovered 142k
-  fs             killed 143k, recovered 143k
-  xhci           killed 137k, recovered 137k
-  ehci           killed 139k, recovered 139k
-  events         killed 133k, recovered 133k
-directly-restarted recoveries confirmed: 1000000/1000000
-kernel: SURVIVED 1000000 random kills (no panic - this command returned)
-survivors (live now): supervisor events block-driver fs shell xhci ehci  (7 live)
-verdict: PASS (kernel survived)
+seed: 4242
 ```
+
+What that buys, stated so it is not overclaimed: **a seed replays the draws, not the run.** One draw is
+made per *live* service each round, and which services are live depends on restart timing across the
+cores, so two runs on one seed part ways at the first round whose timing differs. A seed turns a break
+"somewhere in a long run" into one run's named decision stream; it does not make the break repeat on
+demand. An aimed run (one service, or a list) draws nothing, and a seed given to one says so.
+
+The point is that the **kernel survives any sequence of random service deaths**. The verdict is
+therefore about kernel survival: the report existing at all proves no panic (a panic reboots before it
+could print). Whether every service came back is a separate question, and the run does not answer it:
+ask afterwards - `status`, `hardware`, and `selfcheck`, which fails if a service it needs did not return.
+
+While it runs, a table redraws in place with each service's kill and flood counts, and the serial log
+gets one line per round (`chaos round N: swept ...`) - the panel overwrites itself, so serial is the
+history. `q` stops it early, from the serial console in an `all-services` run (it kills the USB keyboard
+drivers). The report, on the Raspberry Pi 4 on 2026-10-09:
+
+```
+=== chaos max-carnage: report ===
+total: 1000 rounds, 7014 kills, 6045 flooded, 1000 mem-pressure, 1000 spawns (999 refused). kernel: alive (this command returned).
+```
+
+(A seeded run also prints `seed: <n>` after the header line; this run predates the seed.) This section
+used to show a report with per-service "recovered" counts and a verdict line, from before `0cb8985b`
+(2026-07-09) and before floods, memory pressure and spawns joined every round; no run prints that now.
+
+`99 refused` is by design: the first `mem-pressure` holds its memory until the run ends, and every later
+one is refused as already running.
 
 All output is **ASCII** (the framebuffer font has no em-dash/ellipsis - they render as `?` on the
 panel) and `[q] quit` matches the rest of the shell (`observe`, `paginate`).
@@ -177,6 +196,10 @@ panel) and `[q] quit` matches the rest of the shell (`observe`, `paginate`).
 > max-carnage 30` killed the supervisor 6× and every service was alive again at the end (`observe`:
 > xhci/ehci/events all `Ready`, no kernel panic). A *re-init*, not a resume (§14.2/§25) - a revived
 > driver re-enumerates its devices and resumes polling; in-flight state is not preserved.
+>
+> **Corrected 2026-10-08:** `events`, `xhci` and `ehci` are watched now - every service in the
+> supervisor's `MANAGED` set is respawned on its own death (`services/CLAUDE.md`) - so the tree no
+> longer waits for a supervisor kill to regrow. The T630 run above is from when it did.
 
 ## 6. Capabilities
 
@@ -200,7 +223,8 @@ explicit, through `chaos kill-storm supervisor`.
 ## 8. Tested
 
 - `osdev test shell` - `chaos kill-storm block-driver 5` (5/5), `chaos kill-storm supervisor 4` (4/4),
-  and `chaos max-carnage 8` (kernel survived the random carnage), each asserting the kernel stays alive.
+  and `chaos max-carnage all-services 5` (a report with its round count, kills and floods, and the
+  kernel alive), each asserting the kernel stays alive.
 - `osdev test files` - `chaos kill-storm fs` storms + the directory-reacquire regression (a client
   reacquires `fs` by name after its restart).
 - Hardware-proven on the HP T630: `chaos kill-storm fs 30` → 30/30; the supervisor stormed dozens of

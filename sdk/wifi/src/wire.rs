@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! The request/reply vocabulary between a radio driver and the shell's `wifi` utility. One definition, read
+//! by both sides (the frame ops `nic-driver` uses, `OP_NET_*` 0x10-0x12, are below) - it used to be the
+//! driver's `scan::reply` and a hand-kept mirror of it in the shell (`wifi_wire`), the same fact twice.
+//!
+//! A reply's first byte is its status. A request may be TAGGED (`TAGGED`): see that constant.
+
+/// A TAGGED request: `[TAGGED, tag, op, ...]`. The driver serves `[op, ...]` as usual and its reply
+/// goes back as `[TAGGED, tag, status, ...]`, so the asker can tell its own answer from a late one.
+/// The shell tags every request; `nic-driver`'s frame ops do not, and are served as they always were.
+///
+/// Why it exists (backlog/70): a `Call` takes the oldest reply FROM this driver, not the reply to the
+/// request just sent, so an answer the shell had stopped waiting for was read as the next request's.
+/// The shell tried to count what it was owed, and could not: its reply mailbox takes every peer's
+/// replies, and nothing on a message says who sent it. A tag is a fact in the reply itself. Chosen
+/// outside every request op (1-14, and 0x10-0x12 for `OP_NET_*`).
+pub const TAGGED: u8 = 0xE7;
+
+/// Networks follow.
+pub const OK: u8 = 0;
+/// The scan ran and failed; the driver's log says where.
+pub const SCAN_FAILED: u8 = 1;
+/// The radio is not up (at boot or after a respawn), so there is nothing to scan with; byte 1 says why.
+pub const RADIO_DOWN: u8 = 2;
+/// Byte 1 of a `RADIO_DOWN` answer: WHY the radio is down, so the shell can say it rather than guess.
+/// 0 means a driver too old to say.
+///
+/// `DOWN_TRAPPED`: the firmware was loaded and trapped at start (`SDPCM_SHARED_TRAP`).
+pub const DOWN_TRAPPED: u8 = 1;
+/// The bring-up stopped at a stage other than the firmware's start; the serial log names the stage.
+pub const DOWN_BRINGUP: u8 = 2;
+/// No working radio answered on this driver's bus.
+pub const DOWN_NO_RADIO: u8 = 3;
+/// The AIC8800's bring-up stopped before a station interface existed; the serial log names the step.
+/// **Corrected 2026-10-08:** this was "a radio this driver does not drive YET", written while the
+/// AIC8800's protocol was being built (`docs/wifi-aic8800.md`). That driver now runs to a station
+/// (V0-V6), and `wifi-driver` sends this reason only when that bring-up stops short. The rest of this
+/// comment, and the shell's sentence for this reason, still describe the old meaning - whether a power
+/// cycle should now be offered is the operator's decision, recorded in `audits/documentation-audit.md`
+/// Audit 12. As written then: nothing the operator can do changes it, so the shell's sentence
+/// for this reason suggests nothing - a power cycle advised here would be advice that cannot work. The
+/// verbs match the sentence: `wifi radio on` says it and restarts nothing, the driver answers a
+/// `powercycle` with this reason instead of cycling (unless the chip is powered down by `off hard`, when
+/// restoring the power is the point), and the shell's radio watch calls only `DOWN_TRAPPED` a warm chip.
+pub const DOWN_NOT_BUILT: u8 = 4;
+/// Byte 3 of an `off` / `off hard` answer: the driver checked, and the radio IS off.
+pub const OFF_VERIFIED: u8 = 1;
+/// The check could not be made (the firmware did not answer the question); the off was not confirmed.
+pub const OFF_UNVERIFIED: u8 = 2;
+/// The check CONTRADICTS the off: the firmware still says it is up, or the chip still answers its bus.
+pub const OFF_CONTRADICTED: u8 = 3;
+/// Not a request this driver understands.
+pub const UNKNOWN_OP: u8 = 3;
+
+/// Bytes per network record: bssid[6] rssi(i16 LE) chanspec(u16 LE) ssid_len ssid[32] security note.
+pub const RECORD: usize = 45;
+/// The record's NOTE byte: bit 0 - a key for this name is held; bit 1 - this is the network joined.
+pub const NOTE_SAVED: u8 = 1;
+pub const NOTE_JOINED: u8 = 2;
+/// Request op byte: scan and list.
+pub const OP_LIST: u8 = 1;
+/// Request op byte: join a network. Payload: `ssid_len, ssid[32], pass_len, pass[64]`. A `pass_len`
+/// of 0 means "with what you have": the held key for that name, or open if the last sweep heard the
+/// network as open, else `NEEDS_PASSPHRASE`.
+pub const OP_CONNECT: u8 = 2;
+/// Request op byte: start a sweep and return at once. Reply `[OK, 0]`, or `[SCANNING, heard]` when one
+/// is already running (the caller attaches to it), or `[SCAN_FAILED]` / `[RADIO_DOWN]`.
+pub const OP_SCAN_START: u8 = 3;
+/// Request op byte: `[4, from]` - the records heard so far from index `from`. Reply
+/// `[SCANNING | SCAN_DONE, total, records from..total]`, `[SCAN_FAILED]` if the last sweep died by the
+/// poll bound, `[NO_SCAN_YET]` if nothing has ever been swept.
+pub const OP_SCAN_POLL: u8 = 4;
+/// Request op byte: stop the sweep. The partial hearing is DISCARDED - the cache keeps the last complete
+/// scan. Reply `[OK, heard]`.
+pub const OP_SCAN_ABORT: u8 = 5;
+/// Request op byte: what the radio is doing. Reply, 62 bytes, by offset:
+/// - 0 `OK`; 1 sweeping (0|1); 2 heard so far in the sweep; 3 has_cache (0|1); 4 cache_count;
+/// - 5..9 the cache's age in seconds, u32 LE (`u32::MAX` with no cache); 9 radio_on (0|1);
+/// - 10 associated (0|1); 11..17 bssid[6]; 17..21 rssi i32 LE (0 when the firmware gave none);
+/// - 21..23 chanspec u16 LE; 23 security of the joined network; 24..28 seconds joined, u32 LE;
+/// - 28 joined ssid_len; 29..61 joined ssid[32];
+/// - 61 power: 1 when the chip is powered, 0 after `wifi radio off hard`, when every other byte is 0 too.
+///
+/// The link fields (10..23) are read from the firmware when asked, except while a sweep runs, when they
+/// are the driver's memory and the bssid, rssi and chanspec are zero.
+pub const OP_STATUS: u8 = 6;
+/// Request op byte: leave the current network; the radio stays up. Reply `[OK, was_joined(0|1), len,
+/// name[32]]` - the name of the network left, so the shell can say it.
+pub const OP_DISCONNECT: u8 = 7;
+/// Request op byte: `[8, mode]` - power the radio. `mode` 0 = off (disconnects first), 1 = on (rejoins
+/// the network last joined), `RADIO_POWERCYCLE` = cut and restore the CHIP's power through the host
+/// (`Host::power_cycle`: the kernel's `DevicePower` on the Pi 4 and the VisionFive, a register power-down
+/// on the USB dongle) and leave this instance to be killed and respawned onto the cold chip. Reply
+/// `[status, was_joined, changed, rejoin_status, len, name...]`.
+pub const OP_RADIO: u8 = 8;
+/// The third `OP_RADIO` mode: `wifi radio powercycle`. Not a radio switch at all - the chip's power.
+/// `[8, 2, units]`: `units` of 100 ms to hold the power off, 0 for the driver's default.
+pub const RADIO_POWERCYCLE: u8 = 2;
+/// `OP_RADIO` mode 3: `wifi radio off hard` - cut the chip's power and stay powered down. `on` or
+/// `powercycle` restores the power and answers `COLD_START`.
+pub const RADIO_HARD_OFF: u8 = 3;
+/// Reply status while the chip is powered down: every op except status, the radio op and the hardware
+/// and use ops (12-14) gets this one byte. `wifi radio on` powers the chip up.
+pub const RADIO_POWERED_OFF: u8 = 18;
+/// `OP_RADIO` reply byte 3 after `on` on a powered-down chip: the power is back and this instance has
+/// no firmware to serve, so the caller restarts the driver and the respawn takes the boot's cold path.
+pub const COLD_START: u8 = 19;
+/// Reply status when the KERNEL refused to drive the device's power - this machine has no control
+/// over it. Distinct from `RADIO_DOWN`, which says the radio is down and nothing about power; the two
+/// were one byte on 2026-10-01 and a shell read a down radio as a powerless machine.
+pub const NO_POWER_CONTROL: u8 = 20;
+/// The radio was powered off by `wifi radio off`; a sweep or a join is refused until `radio on`. Distinct
+/// from `RADIO_DOWN`, which is a radio that never came up.
+pub const RADIO_OFF: u8 = 7;
+/// Request op byte: which networks a key is held for. Reply `[OK, count, (len, ssid[32]) * count]` - names
+/// only, never a key (`utilities/56_wifi.md` §3); 64 slots at most.
+pub const OP_STORED: u8 = 9;
+/// Request op byte: `[10, len, ssid[32]]` - drop the held key for that network. Reply `[OK, dropped(0|1)]`.
+pub const OP_FORGET: u8 = 10;
+/// `OP_CONNECT` with no passphrase, for a network that is neither open (by the cache) nor stored: the
+/// shell must ask for one and send again. Never a guess about which it is.
+pub const NEEDS_PASSPHRASE: u8 = 16;
+/// `OP_CONNECT` for the network the radio is already on, checked live, not from memory (on the Broadcom,
+/// `CMD_GET_BSSID`; each radio asks its own firmware). Nothing is sent to the firmware.
+pub const ALREADY_JOINED: u8 = 17;
+/// Request op byte: `[11, sub]` - the driver's own account of itself, for `wifi debug` (`dbg::*`).
+pub const OP_DEBUG: u8 = 11;
+/// Request op byte: what this radio IS, for `wifi hardware` (`utilities/56_wifi.md` 11). Reply
+/// `[OK, chip_len, chip..., bus_len, bus...]` - the chip's name and the bus it is reached over, each at
+/// most `HW_TEXT_MAX` bytes. Answered whatever state the radio is in, down or powered off included: it is a
+/// fact about the hardware, not a reading from it.
+pub const OP_HARDWARE: u8 = 12;
+pub const HW_TEXT_MAX: usize = 24;
+/// Request op byte: one radio in full, for `wifi hardware <radio>` (`utilities/56_wifi.md` 11a). Reply
+/// `[OK, count, (label_len, label..., value_len, value...) * count]`: the driver's facts about its radio as
+/// labelled text, each label one of `DETAIL_LABELS` and at most `DETAIL_LABEL_MAX` bytes, each value at
+/// most `DETAIL_VALUE_MAX`. The facts that are the hardware's (the chip, its IDs, the bus) are given in
+/// any state; those that need a running chip say why they are missing instead. In any order: the host's
+/// facts come first and the station's after, and the shell prints them in `DETAIL_LABELS` order.
+pub const OP_HARDWARE_DETAIL: u8 = 13;
+pub const DETAIL_LABEL_MAX: usize = 12;
+pub const DETAIL_VALUE_MAX: usize = 96;
+/// The labels a `OP_HARDWARE_DETAIL` reply may carry, in the order a record has them. One list, so the
+/// shell's record and every driver's reply agree on the fields; a driver gives the ones it knows.
+pub const DETAIL_LABELS: [&str; 7] = ["chip", "id", "address", "firmware", "bus", "endpoints", "queues"];
+/// Request op byte: the radio the operator chose (`wifi hardware use`, `utilities/56_wifi.md` 11). `[14]`
+/// asks, `[14, len, name...]` tells - the name the shell wrote to `/wifi.radio`, or an empty name for no
+/// choice. Reply `[OK, use]`, one of the `USE_*` values, for this radio. The radio reads `/wifi.radio`
+/// itself at start, beside `/wifi.keys`; this keeps it current when the choice changes while it runs.
+pub const OP_USE: u8 = 14;
+/// Another radio is the one in use: this one does not rejoin at start, and `nic-driver` looks elsewhere.
+pub const USE_NOT: u8 = 0;
+/// This is the radio in use.
+pub const USE_THIS: u8 = 1;
+/// No choice is recorded: the default order decides (the onboard radio, else the dongle).
+pub const USE_DEFAULT: u8 = 2;
+/// The choice names the other radio, and that radio is NOT attached: this one serves in its place until it
+/// is (`NOTE_USB_RADIO`). `nic-driver` stays on it, as on the radio in use.
+pub const USE_STANDIN: u8 = 3;
+/// The supervisor's notice to the onboard radio's driver: `[NOTE_USB_RADIO, attached]`, whether the USB
+/// dongle is attached, from its host's report. Sent once a host has reported, again on every attach and
+/// detach, and to a respawned driver. No reply. What lets a radio the choice does not name stand in for a
+/// chosen dongle that is not there, and stand down when it arrives (`docs/wifi-usb.md` 49). Distinct from
+/// the USB hosts' notices (`usbfn::NOTE_*`, 0x2E and 0x2F), which share the capless path.
+pub const NOTE_USB_RADIO: u8 = 0x2D;
+/// The name a radio service goes by in `wifi hardware` and `/wifi.radio`: by what it is, not where.
+pub fn radio_name(service: &str) -> &'static str {
+    if service == "wifi-usb" { "usb" } else { "onboard" }
+}
+
+/// Sub-codes of `OP_DEBUG`, and their reply layouts.
+pub mod dbg {
+    /// `[OK, 30 x u32 LE]`: ctrl sent/accepted/refused/unanswered, rx ctrl/event/data/glom/header-only/
+    /// other, tx_bytes, rx_bytes, rx skipped in a control wait, the 10 event buckets, last_event_code,
+    /// last_event_status, last_refused_cmd, last_refused_status (i32), session ms, frames ever traced,
+    /// sub-frames delivered out of superframes.
+    /// `wifi debug`, `wifi debug stats`, `wifi debug events` and `wifi debug transport` all read this;
+    /// they print different rows of it.
+    pub const STATS: u8 = 0;
+    /// `[OK, count u8, entries x 18 bytes]` - the trace ring, oldest first. Entry: ms u32, kind u8,
+    /// chanflag u8, id u16, what u32, status i32, len u16.
+    pub const TRACE: u8 = 1;
+    /// `[OK, ver_len u8, ver[128], cap_len u16 LE, cap[512], mac[6]]` - asked of the firmware now.
+    pub const FIRMWARE: u8 = 2;
+}
+
+/// THE FRAME INTERFACE: what `nic-driver` asks a radio when the cable is out (`docs/wifi.md` 2). Its ops
+/// start at 0x10 because they share the radio's endpoint with the `wifi` ops above; every reply opens
+/// with its op, because the caller bounds its wait and a late answer must not be read as the next one.
+///
+/// `[0x10]` -> `[0x10, ok, mac(6), link, peer(6), use]`; `peer` is the access point, zeros when not known;
+/// `use` is one of the `USE_*` values, so `nic-driver` follows the radio the operator chose
+/// (`wifi hardware use`, `utilities/56_wifi.md` 11) without holding the choice itself.
+pub const OP_NET_INFO: u8 = 0x10;
+/// `[0x11, ethernet frame...]` -> `[0x11, sent]`.
+pub const OP_NET_TX: u8 = 0x11;
+/// `[0x12]` -> `[0x12, len_lo, len_hi, ethernet frame...]`; a length of 0 is "nothing waiting".
+pub const OP_NET_RX: u8 = 0x12;
+
+/// A sweep is running. For `OP_LIST` this is a REFUSAL: the cache is not served while it is about to be
+/// replaced (`utilities/56_wifi.md` §3, Commandment III). Byte 1 is the count heard so far.
+pub const SCANNING: u8 = 4;
+/// Nothing has been swept since the driver started, so there is no list to give - an error, not an
+/// empty room.
+pub const NO_SCAN_YET: u8 = 5;
+/// `OP_SCAN_POLL` only: the sweep ended and these are its records.
+pub const SCAN_DONE: u8 = 6;
+
+// CONNECT statuses start at 10 so they never share a byte with the list statuses above:
+// RADIO_DOWN (2) is answered to BOTH ops and must mean one thing.
+/// Reply status for `OP_CONNECT`: associated and the handshake completed.
+pub const JOINED: u8 = 10;
+/// No network of that name answered the join.
+pub const NOT_FOUND: u8 = 11;
+/// The network refused the passphrase - the handshake timed out or the AP deauthenticated us.
+pub const PASSPHRASE_REFUSED: u8 = 12;
+/// A command in the join sequence was refused; the driver's log names it.
+pub const JOIN_FAILED: u8 = 13;
+/// Nothing decisive arrived within the bound.
+pub const JOIN_TIMEOUT: u8 = 14;
+/// Kept for the table: the reply the join gave while the host handshake was unbuilt (2026-09-29, before
+/// the evening). No path produces it now; a shell reading it names the state it stood for.
+pub const HANDSHAKE_UNIMPLEMENTED: u8 = 15;
+
+// ---- Request shapes the SHELL builds, kept beside the replies so both sides read one definition. ----
+
+/// The tag tab completion asks with. It runs without the shell's state, so it cannot draw from the
+/// shell's tag counter - which never hands out 0, so the two cannot collide.
+pub const COMPLETION_TAG: u8 = 0;
+/// The most records the driver holds, and so the most a sweep can number.
+pub const MAX_RECORDS: usize = 32;
+/// `IEEE80211_MAX_SSID_LEN`: an SSID is at most 32 bytes, the size of the field in the beacon.
+pub const SSID_MAX: usize = 32;
+/// `CYW43_WPA_MAX_PASSWORD_LEN`, the longest passphrase a join request carries.
+pub const PASS_MAX: usize = 64;
+/// Request layout for a join: `[op, ssid_len, ssid[32], pass_len, pass[64]]`.
+pub const JOIN_REQ: usize = 1 + 1 + SSID_MAX + 1 + PASS_MAX;
+/// Security bytes, the driver's reading of the beacon.
+pub const SEC_WEP: u8 = 1;

@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }
 
 [features]
 # NOTE: there is no `genet-userspace` feature any more, and no in-kernel GENET driver for it to select

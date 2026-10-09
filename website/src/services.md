@@ -179,9 +179,10 @@ the granted DMA arena and they leave the trusted computing base entirely (§6.4)
 ```
    net-stack ──frames──▶ nic-driver ──▶ e1000 / RTL8168 (x86, own MMIO cap)
        │                            └──▶ dwc2 (Pi 2, USB ethernet)
-       │                            └──▶ GENET (Pi 4, on the SoC)
+       │                            └──▶ GENET (Pi 4, on the SoC; the radio when the cable is out)
+       │                            └──▶ dwmac (VisionFive 2, on the SoC)
        ▼
-   ARP · IPv4 · ICMP · UDP · DHCP · DNS · SNTP
+   ARP · IPv4 · ICMP · UDP · DHCP · DNS
        │
        └──▶ a socket is a capability (the same mechanism as a file)
 ```
@@ -190,7 +191,9 @@ The kernel gains nothing from networking: it routes messages, and a socket is a 
 capability owned by `net-stack`. There is no ambient network any more than there is an ambient
 filesystem.
 
-**Peers:** `net-stack` → `nic-driver`, `time`.
+The clock is not the network's: `net-stack` never calls the clock service, which fetches its own NTP answer through `net-stack`'s op 12, a UDP datagram answered when the reply arrives.
+
+**Peers:** `net-stack` → `nic-driver`.
 
 ### `console` - the terminal
 
@@ -206,10 +209,80 @@ cannot ask a service to report it (§11.4).
 
 **Peers:** `events` only - everything else writes *to* it.
 
+### `wifi-driver` - the radio
+
+```
+   shell (wifi) ──▶ wifi-driver ──▶ SDIO host ──▶ the radio chip (its own firmware, uploaded at start)
+   nic-driver   ──▶ wifi-driver     (frames, once the cable is out - the cable always wins)
+                      ├──▶ fs     (/wifi.keys: the keys a join earned)
+                      └──▶ power  (a lease on the Arm clock while it loads the chip)
+```
+
+The Pi 4's onboard radio, and the VisionFive 2 Lite's AIC8800 (`docs/wifi-aic8800.md`: scan, WPA2 join,
+DHCP and ping over it, the cable taking the link back). The chip-independent half - the handshake, the key file, the wire protocol, the
+SDIO protocol and the `Station` a serve loop drives - is a library, `sdk/wifi`, shared with the radios to
+come. A respawn adopts a firmware still running; a stopped one is power-cycled cold.
+
+**Peers:** `fs`, `power`.
+
+### `wifi-usb` - a USB WiFi dongle
+
+```
+   wifi-usb ──usbfn──▶ USB host (dwc2 or xhci) ──▶ the dongle it bound (a Realtek RTL8188CUS)
+```
+
+The driver for a WiFi dongle, separate from `wifi-driver` so a board with an onboard radio can run both.
+It holds no hardware: the USB host that enumerated the dongle binds it as the radio and answers
+`godspeed_wifi::usbfn` for that one device - who it is, its control transfers and its frames. Behind
+`dwc2` on the Pi 2 and `xhci` everywhere else, it scans, joins WPA2 and carries the machine's traffic
+through `nic-driver` when the cable is out; the supervisor starts it when the host reports the dongle and
+stops it when the dongle leaves (`docs/wifi-usb.md`).
+
+**Peers:** its USB host (`dwc2` or `xhci`), and `fs` for `/wifi.keys`.
+
+### `power` - the machine's power policy
+
+```
+   wifi-driver ──lease──▶ power ──CpuClock──▶ kernel ──▶ firmware mailbox (the Arm clock)
+```
+
+Holds `CPU_CLOCK` alone. Leases of up to 30 s keep the Arm clock at its maximum while any is open; a
+lease nobody returns expires on its own, so a holder that dies cannot pin the machine fast.
+
+**Peers:** none - it answers, it does not ask.
+
+### `audio-driver` - sound
+
+```
+   HD Audio controller ──MSI──▶ audio-driver ──▶ CORB/RIRB ──▶ codec (power, amps, pin, converter)
+                                     │
+                                     └──▶ a ring of sound in its DMA arena, refilled per period
+```
+
+Intel High Definition Audio, x86 only, built so far in QEMU. The stream interrupts as each period of
+the ring is played and the driver refills it then; its DMA is confined behind the IOMMU where there is
+one. On its death the kernel stops the controller's DMA and releases the confinement, keyed on the
+device it was given rather than its name.
+
+**Peers:** `fs`, for `/audio.settings`.
+
+### `pwm-audio` - sound on the Pis
+
+```
+   shell (audio) ──▶ pwm-audio ──▶ DMA engine ──▶ PWM FIFO ──▶ the 3.5 mm jack
+                         └──▶ fs (/audio.settings)
+```
+
+The same protocol as `audio-driver`, for a different device: the Pis have no codec, so each sample is a
+PWM duty cycle, moved by the DMA engine as the PWM asks. The kernel routes the jack's pins and starts the
+PWM clock when it grants the device, because both live in blocks shared with every other pin and clock.
+
+**Peers:** `fs`, for `/audio.settings`.
+
 ### `time` - the wall clock
 
 ```
-   shell ──▶ time ──▶ net-stack (SNTP)
+   shell ──▶ time ──▶ net-stack (op 12: one NTP datagram, answered when it arrives)
                  └──▶ fs (persist a clock floor across boots)
 ```
 
