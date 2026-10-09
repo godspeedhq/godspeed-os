@@ -10236,10 +10236,17 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(log(&buf).contains("audio-driver: ready - serving requests; playback refills on the stream's interrupt"),
         "the driver refills on its interrupt, not by polling");
     check!(log(&buf).contains("no /audio.settings yet"), "a fresh disk starts at the defaults");
+    // System sounds OFF for the rest of boot 1: this session types commands that fail on purpose, and
+    // each would sound into the capture below, which must hold only the tones asked for. Boot 2 turns
+    // them on and plays one.
+    let r = run!(b"audio system sounds off\r");
+    check!(r.contains("system sounds off"), "system sounds switched off");
+    let r = run!(b"audio system sounds off\r");
+    check!(r.contains("already off"), "switching them off again sends nothing");
 
     let r = run!(b"audio status\r");
-    check!(r.contains("audio      on") && r.contains("volume     50") && r.contains("muted      no"),
-        "status: on, volume 50, not muted");
+    check!(r.contains("audio      on") && r.contains("volume     50") && r.contains("muted      no")
+        && r.contains("system     sounds off"), "status: on, volume 50, not muted, system sounds off");
     let r = run!(b"audio info\r");
     check!(r.contains("1af4:0012") && r.contains("on the stream's interrupt"), "info: QEMU's codec, interrupt-driven");
     let r = run!(b"audio tone 1000 1\r");
@@ -10427,8 +10434,21 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     send(&mut w, b"audio status\r");
     let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
     check!(r.contains("volume     30"), "and status says so");
+    check!(r.contains("system     sounds off"), "system sounds off survived the reboot");
+    // A system sound, from the prompt: sounds on, then a refused command. The driver plays the refusal
+    // (220 Hz for 160 ms, a whole 100 ms block of it), and the capture of THIS boot must hold it.
+    send(&mut w, b"audio system sounds on\r");
+    let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(r.contains("system sounds on"), "system sounds switched back on");
+    send(&mut w, b"spawn supervisor\r");
+    let _ = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30));
+    thread::sleep(Duration::from_millis(1500));
     let _ = std::fs::write("build/tests/audio_test_boot2_serial.log", &buf.lock().unwrap()[..]);
     quit_qemu(&mut child, mon_port);
+    let b2 = wav_blocks("build/tests/audio_test_boot2.wav");
+    let refused = b2.iter().filter(|(rms, hz)| *rms > 500 && (205..=235).contains(hz)).count();
+    println!("audio-test: boot 2's capture is {} block(s), {} of them the 220 Hz refusal", b2.len(), refused);
+    check!(refused >= 1, "a refused command at the prompt played the refusal sound");
 
     println!("\naudio-test: {pass} passed, {fail} failed (serial: build/tests/audio_test_serial.log, sound: {wav})");
     if fail > 0 { std::process::exit(1); }

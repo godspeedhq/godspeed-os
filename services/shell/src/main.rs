@@ -728,6 +728,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
                     }
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
+                    // A typed command that failed makes a system sound - only here, at the prompt, never
+                    // in a script, so fifty errors in a script do not sound fifty times.
+                    match last_result {
+                        Err(ShellError::Denied) => audio_system_sound(&ctx, audio_wire::SOUND_REFUSED),
+                        Err(_) => audio_system_sound(&ctx, audio_wire::SOUND_ERROR),
+                        Ok(()) => {}
+                    }
                     line.len = 0;
                     line.cur = 0;
                 }
@@ -984,7 +991,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     // Only the verbs that are BUILT: completing one that answers "not built yet" would teach a word
     // the utility cannot act on. `outputs`, `output`, `debug` and `system` join as they land. `play`
     // takes a PATH, which is why `audio` is not in NO_PATH_CMDS: Tab after `audio play ` offers files.
-    ("audio",   &["status", "info", "hardware", "outputs", "output", "volume", "mute", "unmute", "on", "off", "tone", "play", "debug"]),
+    ("audio",   &["status", "info", "hardware", "outputs", "output", "volume", "mute", "unmute", "on", "off", "tone", "play", "debug", "system"]),
     // The sections that are built; a device name is the other first word, and it is the machine's.
     ("hardware", &["cpu", "memory", "pci", "soc", "display", "usb", "interrupts", "report", "why",
                    "problems", "tree", "firmware", "compare", "events"]),
@@ -1053,6 +1060,7 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("wifi",   "hardware",     &["onboard", "usb", "use"]),
     ("audio",  "off",          &["hard"]),
     ("audio",  "debug",        &audio_wire::DEBUG_VIEWS),
+    ("audio",  "system",       &["sounds"]),
     ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
 ];
 
@@ -5318,6 +5326,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio tone <hz> [seconds]", "play a sine the driver makes itself, 2 s unless told; q stops it", "audio tone 440 2"),
             ("audio play <path>", "play a WAV file: 16-bit PCM, mono or stereo, 44100 or 48000 Hz; q stops it", "audio play /music/test.wav"),
             ("audio debug [view]", "the driver's own account: stats (bare), codec, stream, trace, registers", "audio debug codec"),
+            ("audio system sounds on | off", "the short sounds the system makes on its own: an error, a refusal, a finished job, a USB plug", "audio system sounds off"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
         "hardware" => help_block(ctx, "hardware", "what this machine is, and what drives each part of it", &[
@@ -5684,6 +5693,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("audio hardware", "one row each: address, kind, maker, driver, state; * on the one audio talks to", "audio hardware"),
             ("audio hardware <device>", "one in full, named as audio hardware names it: why it is driven or not, and its grant", "audio hardware 00:09.2"),
             ("audio hardware | match driver", "a report is data: records with device, kind, made_by, driver, state, in_use", "audio hardware | count"),
+        ], false),
+        ("audio", "system") => help_block(ctx, "audio system", "the system's own sounds", &[
+            ("audio system sounds on | off", "an error, a refusal, a finished background job, a USB device plugged or unplugged; on by default, kept across a reboot", "audio system sounds off"),
         ], false),
         ("audio", "debug") => help_block(ctx, "audio debug", "the driver's own account of itself", &[
             ("audio debug", "stats: verbs sent and unanswered, interrupts, underruns, ring fill, the last sound's rate by the clock", "audio debug"),
@@ -9288,20 +9300,20 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
             return Err(ShellError::Unknown);
         }
         "hardware" => return audio_hardware(ctx, out, rest),
+        "system" if rest != "sounds on" && rest != "sounds off" => {
+            out.line_fmt(ctx, format_args!("audio: usage: audio system sounds on | off  - which they are now is in `audio status`"));
+            return Err(ShellError::Unknown);
+        }
         "debug" if rest.contains(' ') => {
             out.line_fmt(ctx, format_args!("audio: debug takes one view - stats, codec, stream, trace or registers"));
             return Err(ShellError::Unknown);
         }
-        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" | "outputs" | "output" | "debug" => {}
-        // Agreed and not built: said as such, never as a fault (docs/audio.md has the plan).
-        "system" => {
-            out.line_fmt(ctx, format_args!("audio: `audio {}` is not built yet - docs/audio.md has where it comes in", verb));
-            return Err(ShellError::Unknown);
-        }
+        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" | "outputs" | "output"
+            | "debug" | "system" => {}
         _ => {
             out.line_fmt(ctx, format_args!(
                 "audio: unknown subcommand - try audio status, info, hardware, outputs, output <name>, volume <0-100>, mute,"));
-            out.line_fmt(ctx, format_args!("       unmute, on, off, off hard, tone <hz> [seconds], play <path>, or audio help"));
+            out.line_fmt(ctx, format_args!("       unmute, on, off, off hard, tone <hz> [seconds], play <path>, debug, system sounds on|off, or audio help"));
             return Err(ShellError::Unknown);
         }
     }
@@ -9328,6 +9340,7 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
         "info" => audio_info(ctx, out),
         "outputs" => audio_outputs(ctx, out),
         "debug" => audio_debug(ctx, out, rest),
+        "system" => audio_system_sounds(ctx, out, rest == "sounds on"),
         "output" => audio_output_select(ctx, out, rest),
         "volume" => audio_volume(ctx, out, volume.unwrap_or(0)),
         "mute" => audio_mute(ctx, out, true),
@@ -9410,7 +9423,10 @@ fn audio_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     }
     out.line_fmt(ctx, format_args!("muted      {}", if p[2] != 0 { "yes - nothing will be heard" } else { "no" }));
     out.line_fmt(ctx, format_args!("output     {}", device_name(p[20] as u32)));
-    if p[4] != 0 {
+    out.line_fmt(ctx, format_args!("system     sounds {}", if p[25] != 0 { "on" } else { "off" }));
+    if p[4] == PLAYING_SOUND {
+        out.line_fmt(ctx, format_args!("playing    a system sound"));
+    } else if p[4] != 0 {
         let (hz, len, at) = (get_u16(p, 5), get_u32(p, 7), get_u32(p, 11));
         out.line_fmt(ctx, format_args!("playing    {} Hz, {}.{} s of {}.{} s",
             hz, at / 1000, at % 1000 / 100, len / 1000, len % 1000 / 100));
@@ -9742,6 +9758,30 @@ fn audio_debug(ctx: &ShellCtx, out: &mut Out, view: &str) -> Result<(), ShellErr
     }
     out.line_fmt(ctx, format_args!("audio: the view went past {} pages - the rest is not shown", DEBUG_PAGES_MAX));
     Err(ShellError::Unknown)
+}
+
+/// `audio system sounds on|off`: the short sounds the system makes on its own (`docs/audio.md`, "System
+/// sounds"). The driver keeps the switch, in `/audio.settings`.
+fn audio_system_sounds(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_SYSTEM_SOUNDS, on as u8], AUDIO_REPLY_MS), 1)?;
+    let word = if on { "on" } else { "off" };
+    if r.payload_bytes()[0] == ALREADY {
+        out.line_fmt(ctx, format_args!("system sounds already {}", word));
+    } else {
+        out.line_fmt(ctx, format_args!("system sounds {}", word));
+    }
+    Ok(())
+}
+
+/// Ask for a system sound, and do not wait for it. Sent with no reply capability, so the driver answers
+/// nobody and the shell is never held up: no audio driver, a driver mid-restart, a full queue or sounds
+/// switched off all mean no sound, and the error the user caused has already been printed either way.
+/// The driver decides whether to play it (on, not busy, not within `SOUND_GAP_MS` of the last).
+fn audio_system_sound(ctx: &ShellCtx, kind: u8) {
+    let Some(driver) = audio_driver(ctx) else { return };
+    let msg = Message::from_bytes(&[audio_wire::TAGGED, 0, audio_wire::OP_SOUND, kind]);
+    let _ = gs::ipc::try_send(ctx, driver, &msg);
 }
 
 fn audio_volume(ctx: &ShellCtx, out: &mut Out, v: u8) -> Result<(), ShellError> {

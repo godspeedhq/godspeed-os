@@ -182,6 +182,8 @@ impl Transcript {
 
 struct Job {
     state: u8,
+    /// The "done" sound was asked for: once per job, whichever of the five paths finished it.
+    sounded: bool,
     why: u8,
     kind: u8,
     out: Transcript,
@@ -206,6 +208,7 @@ impl Job {
     const fn new() -> Self {
         Job {
             state: ST_IDLE,
+            sounded: false,
             why: WHY_NONE,
             kind: KIND_COPY,
             out: Transcript::new(),
@@ -869,6 +872,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 KIND_CHURN => churn_step(&ctx, &mut gfs, &mut job),
                 _ => {}
             }
+        }
+        // ONE place for the "done" sound, after whichever of the five paths finished the job.
+        if job.state == ST_DONE && !job.sounded {
+            job.sounded = true;
+            sound_done(&ctx);
+        }
+    }
+}
+
+/// The "done" system sound (`docs/audio.md`, "System sounds"), to whichever audio driver this board has.
+/// Sent with no reply capability and never waited for: no audio driver, a full queue or sounds switched
+/// off all mean no sound, and a job's finishing is never held up by one - which is why the result is
+/// not looked at.
+fn sound_done(ctx: &ServiceContext) {
+    use godspeed_audio::wire;
+    let msg = Message::from_bytes(&[wire::TAGGED, 0, wire::OP_SOUND, wire::SOUND_DONE]);
+    for driver in ["audio-driver", "pwm-audio"] {
+        if gs::ipc::try_send(ctx, driver, &msg).is_ok() {
+            return;
         }
     }
 }

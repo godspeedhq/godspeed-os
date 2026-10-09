@@ -738,7 +738,12 @@ SpawnImage               = 52
 "chaos" = ["peer:supervisor", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "console" = ["hw:FRAMEBUFFER", "peer:events"]
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
-"copier" = ["peer:fs"]
+# copier: peer:audio-driver and peer:pwm-audio (2026-10-09) - the "done" system sound when a background job
+# finishes (docs/audio.md, "System sounds"): one `OP_SOUND`, sent by `try_send` with no reply capability and
+# never waited for, to whichever audio driver the board embeds (`board::COPIER_PEERS` - the PCs' or the
+# Pis'). It can ask for a sound and nothing else: the driver plays it only when the sounds are on and
+# nothing else is playing, at most one in half a second.
+"copier" = ["peer:audio-driver", "peer:fs", "peer:pwm-audio"]
 "counter" = ["peer:fs"]
 # dwc2: peer:supervisor (2026-10-06) - its USB device report (`usbdev`): the WiFi dongle attached or not,
 # so the supervisor starts the dongle's driver when it is there and stops it when it leaves

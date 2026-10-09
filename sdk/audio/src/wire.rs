@@ -89,17 +89,20 @@ pub const POWER_HARD_OFF: u8 = 2;
 // ---- Ops ----------------------------------------------------------------------------------------------
 
 /// What audio is doing now. Answer `[OK, power, muted, volume, playing, hz u16, length_ms u32,
-/// elapsed_ms u32, underruns u32, interrupts u8, output u8, silence_ms u32]` - `STATUS_LEN` bytes.
+/// elapsed_ms u32, underruns u32, interrupts u8, output u8, silence_ms u32, system_sounds u8]` -
+/// `STATUS_LEN` bytes. `system_sounds` is 1 when they are on (`OP_SYSTEM_SOUNDS`).
 /// `playing` is a `PLAYING_*`; `hz` is the tone's, 0 for a stream. `interrupts` is 1 when the driver
 /// refills on its interrupt, 0 when it polls. `underruns` counts since the driver started, and
 /// `silence_ms` is the silence a stream that ran dry has had written in its place, for the stream
 /// playing or last played. `output` is the output pin's default-device field, as in `OP_INFO`.
 /// Or `[NO_DEVICE, reason]`.
 pub const OP_STATUS: u8 = 1;
-pub const STATUS_LEN: usize = 25;
+pub const STATUS_LEN: usize = 26;
 pub const PLAYING_NOTHING: u8 = 0;
 pub const PLAYING_TONE: u8 = 1;
 pub const PLAYING_STREAM: u8 = 2;
+/// A system sound (`OP_SOUND`).
+pub const PLAYING_SOUND: u8 = 3;
 
 /// The detail a fault needs. Answer `[OK, vendor u16, device u16, codec_addr, dac_node, pin_node,
 /// pin_device, amp_steps, amp_step_now, rate u32, ring_bytes u32, interrupts u8, interrupts_seen u32,
@@ -173,6 +176,28 @@ pub const PRESENCE_EMPTY: u8 = 2;
 /// sends nothing. `BAD_ARG` when `pin` is not one of `OP_OUTPUTS`'s; `BUSY` while something plays, since
 /// changing the path under a running stream would cut it mid-sound; `AUDIO_OFF` when audio is off.
 pub const OP_OUTPUT: u8 = 12;
+
+/// `[14, on]` - the system sounds on (1) or off (0). Answer `[OK | ALREADY]`. Kept in `/audio.settings`;
+/// on by default.
+pub const OP_SYSTEM_SOUNDS: u8 = 14;
+
+/// `[15, kind]` - play a system sound (`SOUND_*`). SENT WITHOUT A REPLY CAPABILITY and answered by
+/// nobody: whoever asks never waits for a sound, so an absent or restarting driver means no sound, never a
+/// delay. A driver plays it only when the system sounds are on, audio is on, nothing else is playing, and
+/// `SOUND_GAP_MS` has passed since the last - which is what stops a burst of errors machine-gunning.
+/// Mute and the volume apply as to anything else. Answered `[OK, played]` only if a reply capability came.
+pub const OP_SOUND: u8 = 15;
+/// A command was not found, or failed.
+pub const SOUND_ERROR: u8 = 1;
+/// An action was not allowed.
+pub const SOUND_REFUSED: u8 = 2;
+/// A background job finished.
+pub const SOUND_DONE: u8 = 3;
+/// A USB device arrived, or left.
+pub const SOUND_PLUGGED: u8 = 4;
+pub const SOUND_UNPLUGGED: u8 = 5;
+/// At most one system sound in this many milliseconds; a request inside it is dropped, not queued.
+pub const SOUND_GAP_MS: u32 = 500;
 
 /// `[13, view, page]` - the driver's own account of itself (`audio debug`): one `DEBUG_*` view as
 /// labelled lines of text, a page of at most `DEBUG_PAGE` bytes at a time. Answer `[OK, more, text...]`,

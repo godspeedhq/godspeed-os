@@ -16,11 +16,11 @@ jack); the Pi 2 is built and not yet heard. Not run on hardware on x86: on the T
 answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
 
 The verbs in section 1 are built, and the volume, the mute and the output survive a reboot (section 5).
-`hardware`, `outputs`, `output` and `debug` were built on 2026-10-09 (`feat/audio-finish`) and run in
+`hardware`, `outputs`, `output`, `debug` and `system sounds` were built on 2026-10-09 (`feat/audio-finish`) and run in
 QEMU, which has ONE audio controller with ONE output - so the reports, the in-use marks and a refused name
 are shown there; a second controller and switching between two outputs are not, until hardware with them.
-The rest of the surface the operator agreed - `system sounds` and the keyboard shortcuts - is designed in
-`docs/audio.md` and not built yet; each of those words answers `not built yet` rather than being mistaken
+The rest of the surface the operator agreed - the keyboard shortcuts - is designed in `docs/audio.md` and
+not built yet; each of those words answers `not built yet` rather than being mistaken
 for a fault.
 
 ## 1. Verbs
@@ -43,6 +43,7 @@ for a fault.
 | `audio tone <hz> [seconds]` | action | play a sine the driver generates itself, 20 to 20000 Hz, 2 s unless told (tenths allowed: `0.5`, up to 600). Blocks with `[q] quit`; `q` STOPS the tone (rule 11) |
 | `audio play <path>` | action | play a WAV file from disk: 16-bit PCM, mono or stereo, 44100 or 48000 Hz where the codec offers it. Blocks with `[q] quit`; `q` STOPS it. Anything else is refused with the reason |
 | `audio debug [view]` | report, pipes | BUILT: the driver's own account of itself, one view of `stats` (bare), `codec`, `stream`, `trace` or `registers` - verbs sent and unanswered, interrupts, underruns and the last sound's rate by the clock; the whole widget graph; the output stream's registers and buffer descriptors; the last 64 verbs and their answers; the controller's globals. On a driver that surveyed its codec and stopped (the T630 today), `codec`, `trace` and `registers` still answer. The Pis' jack answers every view, `codec` and `trace` with a line saying it has neither |
+| `audio system sounds on` / `off` | action | BUILT: the short sounds the system makes on its own - two falling tones for a command that failed at the prompt, one low tone for one that was refused, a rising chirp for a finished background job, a rising or falling pair for a USB device the supervisor starts a driver for arriving or leaving. On by default; kept in `/audio.settings`; `audio status` shows which. Never from a script, at most one in half a second, and the volume and mute apply |
 | `audio help` | | usage, one real example per row |
 | `audio version` | | the version and the collective copyright line (rules 5 and 6) |
 
@@ -131,6 +132,7 @@ output headphone
   know is ignored and said once in the log; no file means the defaults (volume 50, unmuted). Where `fs`
   is absent - no data disk - or does not answer, the driver says so once, carries on with what it holds,
   and says a failed write once rather than on every change.
+- `system sounds off` is written when they are switched off; no line means on, the default.
 - `output` is written only once one has been chosen with `audio output`; until then the driver plays
   through the first output its survey found. At boot it is restored if the codec still has an output of
   that kind, and the log says so either way. The Pis' jack is one output, so `pwm-audio` keeps no line.

@@ -26,5 +26,7 @@ limit   = "16MiB"
 ipc_receive = ["copier"]
 # `fs` - both ends of the copy. The source is read and the destination written through the same
 # service, so the job needs exactly one peer.
-ipc_send    = ["fs"]
+# `fs` for the files, and the board's audio driver for the "done" sound a finished job makes
+# (`board::COPIER_PEERS`: `audio-driver` on the PCs, `pwm-audio` on the Pis).
+ipc_send    = ["fs", "audio-driver", "pwm-audio"]
 log_write   = true

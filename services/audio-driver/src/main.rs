@@ -36,6 +36,7 @@ use godspeed::driver::irq::{Irq, Woke};
 use godspeed::driver::wait::{self, Budget};
 use godspeed_audio::settings::{self, Settings};
 use godspeed_audio::sine::Sine;
+use godspeed_audio::sounds::{self, Chime};
 use godspeed_audio::wire;
 use godspeed_sdk::mmio::Mmio;
 use godspeed_sdk::{Dma, Message, ServiceContext};
@@ -729,6 +730,8 @@ struct Tone {
     feed: Option<Feed>,
     /// Bytes of silence written because the sender fell behind.
     silence: usize,
+    /// A system sound (`OP_SOUND`), rendered whole into the ring before it started.
+    sound: bool,
 }
 
 /// A stream fed by a sender, through `OP_PCM`.
@@ -773,6 +776,10 @@ struct Player<'a> {
     underruns_total: u32,
     /// The silence the last stream had written in its place, for `status` after it ends.
     last_silence_ms: u32,
+    /// The system sounds (`audio system sounds on|off`), and when the last one started - at most one per
+    /// `wire::SOUND_GAP_MS`.
+    system_sounds: bool,
+    last_sound: Option<u64>,
     /// The last sound to end, for `audio debug stats`: what it was, how much it played and how long that
     /// took by the clock - the measured play rate, which proves the DMA engine and the link clock run at
     /// the speed they were set to.
@@ -992,12 +999,42 @@ impl<'a> Player<'a> {
         let mut t = Tone {
             sine: Sine::new(hz, RATE), hz, ms, left: bytes, bytes, filled: PCM_LEN, played: 0, last: 0,
             underruns: 0, started: 0, watchdog: 0, interrupts_at_start: irq.seen(), rate: RATE, feed: None,
-            silence: 0,
+            silence: 0, sound: false,
         };
         fill(self.d, 0, PCM_LEN, &mut t.sine, &mut t.left); // the whole ring before RUN; the BDL is read at RUN
         self.tone = Some(t);
         self.run_stream();
         self.h.ctx.log_fmt(format_args!("audio-driver: playing {} Hz for {} ms", hz, ms));
+        true
+    }
+
+    /// A system sound (`wire::OP_SOUND`): rendered whole into the ring - every one is far shorter than it -
+    /// then RUN, and played out by `service` like a tone whose sine has run out. Played only when the
+    /// sounds are on, audio is on, nothing else plays and `SOUND_GAP_MS` has passed; otherwise dropped.
+    fn start_sound(&mut self, irq: &Irq, kind: u8) -> bool {
+        let ctx = self.h.ctx;
+        let frames = sounds::frames(kind, RATE);
+        let gap_ok = self.last_sound.map_or(true, |t| ms_since(ctx, t) >= wire::SOUND_GAP_MS);
+        if !self.system_sounds || self.power != wire::POWER_ON || self.tone.is_some() || !gap_ok
+            || frames == 0 || frames * FRAME_BYTES > PCM_LEN - GUARD {
+            return false;
+        }
+        let Some(mut chime) = Chime::new(kind, RATE) else { return false };
+        if !self.prepare_stream(RATE) {
+            return false;
+        }
+        for i in 0..PCM_LEN / FRAME_BYTES {
+            let v = chime.next().unwrap_or(0) as u16 as u32;
+            self.d.write32(PCM_OFF + i * FRAME_BYTES, v | v << 16);
+        }
+        let bytes = frames * FRAME_BYTES;
+        self.tone = Some(Tone {
+            sine: Sine::new(1, RATE), hz: 0, ms: (frames * 1000 / RATE as usize) as u32, left: 0, bytes,
+            filled: PCM_LEN, played: 0, last: 0, underruns: 0, started: 0, watchdog: 0,
+            interrupts_at_start: irq.seen(), rate: RATE, feed: None, silence: 0, sound: true,
+        });
+        self.last_sound = Some(wait::ticks(ctx));
+        self.run_stream();
         true
     }
 
@@ -1048,7 +1085,7 @@ impl<'a> Player<'a> {
         self.tone = Some(Tone {
             sine: quiet, hz: 0, ms: (frames as u64 * 1000 / rate as u64) as u32, left: 0,
             bytes: frames as usize * FRAME_BYTES, filled: 0, played: 0, last: 0, underruns: 0, started: 0,
-            watchdog: 0, interrupts_at_start: irq.seen(), rate, silence: 0,
+            watchdog: 0, interrupts_at_start: irq.seen(), rate, silence: 0, sound: false,
             feed: Some(Feed { channels, ended: false, running: false, last_feed: wait::ticks(ctx), frames }),
         });
         ctx.log_fmt(format_args!("audio-driver: stream opened - {} Hz, {} channel(s), {} frames", rate, channels, frames));
@@ -1165,7 +1202,12 @@ impl<'a> Player<'a> {
         if t.played >= t.bytes {
             let (hz, ms, u, took, w, n) = (t.hz, t.ms, t.underruns, ms_since(ctx, t.started), t.watchdog,
                 irq.seen() - t.interrupts_at_start);
+            let sound = t.sound;
             self.end_stream();
+            // A system sound ends without a line: a line for each would fill the log with every typo.
+            if sound {
+                return;
+            }
             ctx.log_fmt(format_args!(
                 "audio-driver: played {} Hz for {} ms in {} ms by the clock, {} underrun(s); {} interrupt(s), {} watchdog wake(s)",
                 hz, ms, took, u, n, w));
@@ -1189,7 +1231,7 @@ impl<'a> Player<'a> {
             ctx.log("audio-driver: the output stream did not report stopping");
         }
         if let Some(t) = self.tone.take() {
-            if t.started != 0 {
+            if t.started != 0 && !t.sound {
                 self.last = Some(LastPlay {
                     hz: if t.feed.is_some() { 0 } else { t.hz }, rate: t.rate,
                     played_ms: (t.played / FRAME_BYTES * 1000 / t.rate as usize) as u32,
@@ -1222,6 +1264,7 @@ impl<'a> Player<'a> {
         out[2] = self.muted as u8;
         out[3] = self.volume;
         let (playing, hz, len, elapsed, under, sil) = match self.tone.as_ref() {
+            Some(t) if t.sound => (wire::PLAYING_SOUND, 0, t.ms, ms_since(self.h.ctx, t.started), t.underruns, 0),
             Some(t) if t.feed.is_some() => (wire::PLAYING_STREAM, 0, t.ms,
                 (t.played / FRAME_BYTES * 1000 / t.rate as usize) as u32, t.underruns,
                 (t.silence / FRAME_BYTES * 1000 / t.rate as usize) as u32),
@@ -1236,6 +1279,7 @@ impl<'a> Player<'a> {
         out[19] = irq.routed() as u8;
         out[20] = self.pin_device as u8;
         wire::put_u32(out, 21, sil);
+        out[25] = self.system_sounds as u8;
         wire::STATUS_LEN
     }
 
@@ -1624,6 +1668,24 @@ impl<'a> Player<'a> {
                 }
                 self.debug(irq, view, page, out)
             }
+            wire::OP_SYSTEM_SOUNDS => {
+                let want = args.first().copied().unwrap_or(1) != 0;
+                out[0] = if want == self.system_sounds { wire::ALREADY } else { wire::OK };
+                if want != self.system_sounds {
+                    self.system_sounds = want;
+                    self.settings_dirty = true;
+                }
+                1
+            }
+            wire::OP_SOUND => {
+                let Some(&kind) = args.first() else { return bad(out) };
+                if sounds::shape(kind).is_none() {
+                    return bad(out);
+                }
+                out[0] = wire::OK;
+                out[1] = self.start_sound(irq, kind) as u8;
+                2
+            }
             wire::OP_OUTPUTS => self.outputs_answer(out),
             wire::OP_OUTPUT => {
                 let Some(&pin) = args.first() else { return bad(out) };
@@ -1764,12 +1826,13 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
         h, d, path, outputs, output_chosen: None, pin_device, amp,
         sd: SD_BASE + iss * SD_STRIDE, // the first output stream follows the input streams
         power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false, tone: None, underruns_total: 0,
-        last_silence_ms: 0, last: None,
+        last_silence_ms: 0, last: None, system_sounds: true, last_sound: None,
         settings_dirty: false, settings_failing: false,
     };
     if let Some(s) = settings::load(ctx, &mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), "audio-driver", DEFAULT_VOLUME) {
         p.volume = s.volume;
         p.muted = s.muted;
+        p.system_sounds = s.system_sounds;
         // The output chosen last time, if this codec still has one of that kind; said either way.
         if let Some(dev) = s.output {
             p.output_chosen = Some(dev);
@@ -1915,7 +1978,7 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
             p.service(irq);
             if p.settings_dirty && p.tone.is_none() {
                 p.settings_dirty = false;
-                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted, output: p.output_chosen }) {
+                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted, output: p.output_chosen, system_sounds: p.system_sounds }) {
                     Ok(()) => p.settings_failing = false,
                     Err(e) if !p.settings_failing => {
                         p.settings_failing = true;

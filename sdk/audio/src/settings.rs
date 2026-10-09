@@ -30,6 +30,8 @@ pub struct Settings {
     /// The output chosen with `audio output`, as its default-device field (`wire::device_of`); `None`
     /// when none was ever chosen, and the driver plays through the first output it found.
     pub output: Option<u8>,
+    /// The system sounds (`audio system sounds on|off`); on unless the file says off.
+    pub system_sounds: bool,
 }
 
 /// Read the settings, or `None` for the defaults - with the reason said once in the log either way.
@@ -71,10 +73,10 @@ pub fn load(ctx: &ServiceContext, fs: &mut gs::fs::Fs, who: &str, default_volume
     None
 }
 
-/// `volume N`, `muted yes|no` and `output <name>`, one per line. A line this driver does not know is ignored and said once;
+/// `volume N`, `muted yes|no`, `output <name>` and `system sounds on|off`, one per line. A line this driver does not know is ignored and said once;
 /// a value out of range keeps the default for that setting and is said too.
 fn parse(ctx: &ServiceContext, who: &str, text: &[u8], default_volume: u8) -> Option<Settings> {
-    let mut s = Settings { volume: default_volume, muted: false, output: None };
+    let mut s = Settings { volume: default_volume, muted: false, output: None, system_sounds: true };
     let mut ignored = 0u32;
     for line in text.split(|&b| b == b'\n') {
         let line = core::str::from_utf8(line).unwrap_or("").trim();
@@ -89,6 +91,8 @@ fn parse(ctx: &ServiceContext, who: &str, text: &[u8], default_volume: u8) -> Op
             },
             ("muted", "yes") => s.muted = true,
             ("muted", "no") => s.muted = false,
+            ("system", "sounds on") => s.system_sounds = true,
+            ("system", "sounds off") => s.system_sounds = false,
             ("output", name) => match crate::wire::device_of(name) {
                 Some(d) => s.output = Some(d as u8),
                 None => ignored += 1,
@@ -109,7 +113,7 @@ fn parse(ctx: &ServiceContext, who: &str, text: &[u8], default_volume: u8) -> Op
 /// A line of text into a fixed buffer, for the settings file. Truncation is impossible at this size; if
 /// it ever happened the write would be refused rather than a cut file saved.
 struct Line {
-    buf: [u8; 64],
+    buf: [u8; 96],
     len: usize,
     overflow: bool,
 }
@@ -132,10 +136,13 @@ impl core::fmt::Write for Line {
 /// had not happened.
 pub fn save(fs: &mut gs::fs::Fs, s: Settings) -> Result<(), gs::Error> {
     use core::fmt::Write;
-    let mut l = Line { buf: [0; 64], len: 0, overflow: false };
+    let mut l = Line { buf: [0; 96], len: 0, overflow: false };
     let _ = write!(l, "volume {}\nmuted {}\n", s.volume, if s.muted { "yes" } else { "no" });
     if let Some(d) = s.output {
         let _ = write!(l, "output {}\n", crate::wire::device_name(d as u32));
+    }
+    if !s.system_sounds {
+        let _ = write!(l, "system sounds off\n");
     }
     if l.overflow {
         return Err(gs::Error::InvalidInput);

@@ -310,6 +310,7 @@ name = "copier"
 version = "0.1.0"
 dependencies = [
  "godspeed",
+ "godspeed-audio",
  "godspeed-sdk",
 ]
 
@@ -1591,6 +1592,7 @@ name = "supervisor"
 version = "0.1.0"
 dependencies = [
  "godspeed",
+ "godspeed-audio",
  "godspeed-sdk",
 ]
 
