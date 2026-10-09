@@ -13781,6 +13781,7 @@ fn chaos_sub_help(ctx: &ServiceContext, mode: &str) -> bool {
         ], false),
         "max-carnage" => help_block(ctx, "chaos max-carnage", "the chaos monkey: random or aimed kills every round", &[
             ("chaos max-carnage all-services <n> [yes]", "each round kills a RANDOM subset of the live services (the supervisor included), plus system-wide mem-pressure and spawn-storm; `yes` skips the confirm", "chaos max-carnage all-services 100"),
+            ("chaos max-carnage all-services <n> seed <s>", "replay a run's random draws: every run prints its seed at the start and in its report. It replays the draws, not the timing, so a run can part ways with the one it repeats", "chaos max-carnage all-services 100 seed 1234567890"),
             ("chaos max-carnage <svc> <n>", "aim every round at one service", "chaos max-carnage fs 50"),
             ("chaos max-carnage <svc>,<svc>,... <n>", "kill EVERY listed service each round - cascade stress", "chaos max-carnage fs,events 100"),
         ], false),
@@ -17010,11 +17011,33 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                     ctx.console_writeln("  (block-driver | fs | events | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
                     return Ok(());
                 }
-                // An optional 4th word skips the confirm: `chaos max-carnage all-services 100 yes`.
-                // A WORD, not `-y` - utilities/0_conventions.md 4: "Subcommands are words, never
-                // single-letter flags", so that a word means the same thing across every utility.
-                let preconfirmed = ntok >= 4 && tok[3] == "yes";
-                chaos_launch(ctx, target, rounds, preconfirmed)
+                // Optional words after the rounds, in either order: `yes` skips the confirm, `seed <n>`
+                // sets the random storm's seed. WORDS, not `-y` - utilities/0_conventions.md 4:
+                // "Subcommands are words, never single-letter flags".
+                let mut preconfirmed = false;
+                let mut seed: Option<u64> = None;
+                let mut i = 3;
+                while i < ntok {
+                    match tok[i] {
+                        "yes" => preconfirmed = true,
+                        "seed" => {
+                            match tok.get(i + 1).and_then(|t| parse_seed(t)) {
+                                Some(v) if i + 1 < ntok => { seed = Some(v); i += 1; }
+                                _ => {
+                                    ctx.console_writeln("max-carnage: `seed` takes a number - the one a run printed, e.g. seed 1234567890");
+                                    return Err(ShellError::Unknown);
+                                }
+                            }
+                        }
+                        other => {
+                            ctx.console_writeln_fmt(format_args!(
+                                "max-carnage: unknown word '{}' - after the rounds: yes, seed <n>", other));
+                            return Err(ShellError::Unknown);
+                        }
+                    }
+                    i += 1;
+                }
+                chaos_launch(ctx, target, rounds, preconfirmed, seed)
             }
         }
         "link-flap"    => chaos_link_flap(ctx, &tok, ntok),
@@ -17127,6 +17150,9 @@ fn chaos_launch(
     // The warning still prints in full - it is the reason the confirm existed, and an unattended run
     // is exactly when the log needs to say what was about to happen.
     preconfirmed: bool,
+    // `seed <n>`: the random storm's seed, to replay a reported run's draws. None lets chaos draw one,
+    // which it prints.
+    seed: Option<u64>,
 ) -> Result<(), ShellError> {
     // Loud pre-flight warning + confirm, TAILORED to the target in three cases. all-services storms EVERY
     // driver, so the keyboard dies for sure (serial only). A single USB host driver (xhci/ehci) kills the
@@ -17181,18 +17207,22 @@ fn chaos_launch(
     // comma-list). Best-effort: chaos waits briefly for it; if it never arrives chaos runs a safe no-op
     // (0 rounds). Reclaim the cap (no leak).
     if let Some(cap) = ctx.acquire_send_cap("chaos") {
-        // rounds(4) + target string. The target may be a comma-separated list (e.g. "nic-driver,net-stack"),
-        // so the buffer is sized for a bounded list, not one name.
-        let mut buf = [0u8; 4 + 128];
+        // rounds(4) + has_seed(1) + seed(8) + target string. The target may be a comma-separated list
+        // (e.g. "nic-driver,net-stack"), so the buffer is sized for a bounded list, not one name.
+        let mut buf = [0u8; 13 + 128];
         buf[..4].copy_from_slice(&rounds.to_le_bytes());
+        if let Some(s) = seed {
+            buf[4] = 1;
+            buf[5..13].copy_from_slice(&s.to_le_bytes());
+        }
         let tb = target.as_bytes(); let n = tb.len().min(128);
-        buf[4..4 + n].copy_from_slice(&tb[..n]);
+        buf[13..13 + n].copy_from_slice(&tb[..n]);
         // TRY_SEND from the SHELL, because the shell is the user's only way back in. A blocking send
         // here hands `chaos` the power to hang the prompt just by having a full queue, which is the one
         // thing nothing above the kernel may do. A refused send is reported and the bounded wait below
         // then reports the real symptom - chaos never took the foreground - instead of the shell simply
         // never returning (§8.9, §26.7).
-        if ctx.try_send_by_handle(cap, &Message::from_bytes(&buf[..4 + n])).is_err() {
+        if ctx.try_send_by_handle(cap, &Message::from_bytes(&buf[..13 + n])).is_err() {
             ctx.console_writeln("chaos: could not be reached (its queue is full or it is restarting)");
         }
         ctx.remove_cap(cap);
@@ -22755,6 +22785,17 @@ fn u32_to_str(n: u32, buf: &mut [u8; 10]) -> &str {
         v /= 10;
     }
     core::str::from_utf8(&buf[i..]).unwrap_or("?")
+}
+
+/// A chaos seed as the run printed it: decimal, up to the full 64 bits.
+fn parse_seed(s: &str) -> Option<u64> {
+    if s.is_empty() || s.len() > 20 { return None; }
+    let mut v: u64 = 0;
+    for b in s.bytes() {
+        if !b.is_ascii_digit() { return None; }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(v)
 }
 
 fn parse_u32(s: &str) -> Option<u32> {

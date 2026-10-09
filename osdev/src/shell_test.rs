@@ -1962,7 +1962,15 @@ pub fn run(image_path: &Path, smp: u32) {
     // writes its report to the console either way, so we collect until its done-marker. (The launching
     // shell draws a `gsh>` right after the command, before chaos claims, so `gsh>` is NOT a usable
     // terminator here.)
-    send(&mut write_half, b"chaos max-carnage all-services 5\r");
+    // A seed that is not a number is refused, and nothing is launched (utilities: chaos, `seed <n>`).
+    send(&mut write_half, b"chaos max-carnage all-services 1 seed abc\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
+        Some(r) => check!(r.contains("takes a number"), "chaos: a seed that is not a number is refused"),
+        None => { println!("shell-test: FAIL - timed out after a bad chaos seed"); fail += 1; }
+    }
+    // The run takes a GIVEN seed, and must say so at the start and again in its report - the two places
+    // a report reader will look for it.
+    send(&mut write_half, b"chaos max-carnage all-services 5 seed 4242\r");
     // max-carnage shows a loud serial-required warning and waits for a y/N confirm (a bare Enter
     // cancels). Sync on the prompt, then type 'y' + Enter to proceed.
     let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(15));
@@ -1973,8 +1981,9 @@ pub fn run(image_path: &Path, smp: u32) {
             check!(r.contains("report") && r.contains("kills") && r.contains("flooded"), "chaos: max-carnage report (per-service kills + floods)");
             check!(r.contains("total:") && r.contains("rounds"), "chaos: max-carnage ran a bounded round count + self-terminated");
             check!(r.contains("kernel: alive"), "chaos: max-carnage - kernel survived the kill+flood carnage (shell included)");
+            check!(r.contains("chaos: seed 4242 (given)") && r.contains("seed: 4242"), "chaos: a given seed is used, and said at the start and in the report");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 4; }
+        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 5; }
     }
     // After chaos, the (possibly respawned) shell prints a startup banner and/or a regain prompt, so the
     // first `gsh>` we hit can precede the `cores` response. Drain prompts until the response appears -
@@ -1995,6 +2004,21 @@ pub fn run(image_path: &Path, smp: u32) {
         }
     }
     check!(responsive, "chaos: shell responsive after max-carnage");
+    // A run with no seed DRAWS one, and prints it - the seed a reporter quotes.
+    send(&mut write_half, b"chaos max-carnage all-services 2 yes\r");
+    match collect_until(&buf, &mut cursor, b"foreground returned to the shell", Duration::from_secs(120)) {
+        Some(r) => check!(r.contains("(drawn)") && r.contains("seed: "), "chaos: a run with no seed draws one and prints it"),
+        None => { println!("shell-test: FAIL - the drawn-seed chaos run timed out"); fail += 1; }
+    }
+    let mut again = false;
+    send(&mut write_half, b"cores\r");
+    for _ in 0..6 {
+        match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+            Some(r) => { if r.contains(&format!("cores: {smp}")) { again = true; break; } }
+            None => send(&mut write_half, b"cores\r"),
+        }
+    }
+    check!(again, "chaos: shell responsive after the drawn-seed run");
 
     // -----------------------------------------------------------------------
     // chaos spawn-storm: the global-ceiling test. Spawn mem-pressure tasks until the task-pool/memory ceiling

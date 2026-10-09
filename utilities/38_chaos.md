@@ -25,7 +25,7 @@ identity tests; `chaos` lets an operator reproduce the *between* cases live on r
 | `chaos kill-storm <svc> [rounds]` | Kill one `<svc>` `rounds` times; verify it recovers each round (default 20). |
 | `chaos kill-storm <svc> [n] save <path>` | Same, and also write the report to a file at the end. |
 | `chaos flood-storm <svc> [rounds]` | **Saturate** `<svc>`'s IPC queue with a `try_send` burst until `QueueFull`, then verify it drains and stays alive. The *other* axis: "overwhelmed", not "gone". |
-| `chaos max-carnage <target> <rounds> [yes]` | **The chaos monkey:** each round, kill **OR flood** a *random* live service (everything but the shell), rolling a creative mix (kill / flood / flood-then-kill / kill-then-flood). Runs exactly the count you type; a live progress line ticks `%`/ETA; `q` aborts. A `[y/N]` confirm precedes the run; a 4th word **`yes`** skips it for unattended runs, and the warning still prints in full. |
+| `chaos max-carnage <target> <rounds> [yes] [seed <n>]` | **The chaos monkey:** each round, kill **OR flood** a *random* live service (everything but the shell), rolling a creative mix (kill / flood / flood-then-kill / kill-then-flood). Runs exactly the count you type; a live progress line ticks `%`/ETA; `q` aborts. A `[y/N]` confirm precedes the run; a 4th word **`yes`** skips it for unattended runs, and the warning still prints in full. `seed <n>` gives the random storm its seed; every random run prints the one it used (5b). |
 | `chaos help` / `chaos version` | Self-documentation (`0_conventions.md`). |
 
 `kill-storm` clamps `rounds` to `1..=100` (`CHAOS_MAX_ROUNDS`, §26.6) - it stores per-round generation
@@ -133,8 +133,26 @@ The shell is itself restartable - a direct `kill shell` respawns a fresh prompt 
 can't be the one to kill it, because a fresh shell wouldn't resume the in-flight carnage loop.
 Directly-restarted victims (every service in the supervisor's `MANAGED` set) are confirmed back up
 each round; only demo services like `ping`/`pong` (full build) revive on
-the next supervisor respawn (see below). The victim is chosen with a tiny `xorshift64` PRNG seeded
-from the **TSC** (so the sequence differs every run).
+the next supervisor respawn (see below). The victims are chosen with a tiny `xorshift64` PRNG. (This
+said it was seeded from the TSC; it is not - the TSC is unreliable on the T630 - and the seed mixes the
+hardware random number where there is one, the monotonic counter, and the wall clock when it is set.)
+
+**The seed is printed, and can be given.** An `all-services` run says its seed when it starts and again in
+its report, and `chaos max-carnage all-services <rounds> seed <n>` runs on that seed:
+
+```
+gsh> chaos max-carnage all-services 1000 yes seed 4242
+chaos: seed 4242 (given) - `chaos max-carnage all-services <n> seed 4242` replays these draws, not this run's timing
+...
+=== chaos max-carnage: report ===
+seed: 4242
+```
+
+What that buys, stated so it is not overclaimed: **a seed replays the draws, not the run.** One draw is
+made per *live* service each round, and which services are live depends on restart timing across the
+cores, so two runs on one seed part ways at the first round whose timing differs. A seed turns a break
+"somewhere in a long run" into one run's named decision stream; it does not make the break repeat on
+demand. An aimed run (one service, or a list) draws nothing, and a seed given to one says so.
 
 The point is **not** per-service recovery - it is that the **kernel survives any sequence of random
 service deaths**. The verdict is therefore about kernel survival: the report existing at all proves no

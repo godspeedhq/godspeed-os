@@ -265,6 +265,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut rounds: u64 = 0;
     let mut tbuf = [0u8; 128];   // target string; may be a comma-separated list, so sized for a bounded list
     let mut tlen = 0usize;
+    // The operator's seed (`chaos max-carnage ... seed <n>`), or None for one drawn here. The message is
+    // `rounds u32 | has_seed u8 | seed u64 | target`, written by the shell's `chaos_launch` - both ends
+    // ship in one image, so the layout changed with both of them.
+    let mut given_seed: Option<u64> = None;
     {
         let t0 = ctx.epoch_secs_monotonic();
         let mut aw = 0u32;
@@ -272,7 +276,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if let Some(msg) = ctx.try_recv() {
                 let b = msg.payload_bytes();
                 if b.len() >= 4 { rounds = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64; }
-                if b.len() > 4 { let n = (b.len() - 4).min(128); tbuf[..n].copy_from_slice(&b[4..4 + n]); tlen = n; }
+                if b.len() >= 13 && b[4] == 1 {
+                    let mut s = [0u8; 8];
+                    s.copy_from_slice(&b[5..13]);
+                    given_seed = Some(u64::from_le_bytes(s));
+                }
+                if b.len() > 13 { let n = (b.len() - 13).min(128); tbuf[..n].copy_from_slice(&b[13..13 + n]); tlen = n; }
                 break;
             }
             if ctx.epoch_secs_monotonic() - t0 >= 2 { break; }
@@ -384,10 +393,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //   - the hardware RNG where the SoC has one (the Pi's BCM2835; ungated, entropy grants nothing),
     //   - the monotonic counter, which is real from boot even with no clock at all,
     //   - the wall clock, when it happens to be set.
-    let mut rng = Rng::new((start_epoch as u64)
+    //
+    // AND IT IS SAID. A seed nobody can see makes a run nobody can name: a break at round 400 million
+    // could be reported only as "somewhere". So the seed is printed when the run starts and again in its
+    // report, and `seed <n>` sets it. What that buys is stated with it, because it is easy to overclaim:
+    // a seed replays the DRAWS, not the run. One draw is made per LIVE service per round, and which are
+    // live depends on restart timing across cores, so two runs on one seed part ways at the first round
+    // whose timing differs. It narrows a report to one run's decision stream; it does not make a break
+    // repeat on demand.
+    let seed = given_seed.unwrap_or((start_epoch as u64)
         ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40)
         ^ ((ctx.hw_random().unwrap_or(0) as u64) << 8)
         ^ ((start_mono as u64) << 17));
+    let mut rng = Rng::new(seed);
+    if target_random {
+        ctx.console_writeln_fmt(format_args!(
+            "chaos: seed {} ({}) - `chaos max-carnage all-services <n> seed {}` replays these draws, not this run's timing",
+            seed, if given_seed.is_some() { "given" } else { "drawn" }, seed));
+    } else if given_seed.is_some() {
+        ctx.console_writeln("chaos: a seed has no effect on an aimed run - only `all-services` draws at random");
+    }
 
     // Reap ORPHANED mem-pressure tasks left by a PRIOR chaos run that was itself killed mid-run before
     // its end-of-run cleanup (below) could reap them (audit L5). chaos cannot clean up after its own
@@ -619,6 +644,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // switch to a separate screen. So leave the final frame in place (no `\x1b[2J`) and just append one
     // summary line below it (which also carries the substrings the shell test greps for).
     ctx.console_writeln("=== chaos max-carnage: report ===");
+    if target_random {
+        ctx.console_writeln_fmt(format_args!("seed: {}", seed));
+    }
     ctx.console_writeln_fmt(format_args!(
         "total: {} rounds, {} kills, {} flooded, {} mem-pressure, {} spawns ({} refused). kernel: alive (this command returned).",
         round, killed, flooded, mempr, spawns, spawns_refused));
