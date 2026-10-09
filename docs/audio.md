@@ -51,7 +51,7 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A1** | Reset, find the codecs, walk the widget graph, report an output path. Immediate Command registers; no DMA, no interrupt | QEMU - **built** |
 | **A2** | CORB/RIRB, the command rings the spec requires (Immediate Command is optional, and unknown on the T630's FCH). The first DMA - used only on QEMU's codec until A6, for the T630's own reasons | QEMU - **built** |
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
-| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built**; outputs, debug and system sounds to come |
+| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `outputs` and `output` built 2026-10-09**; `hardware`, debug, system sounds and the shortcuts to come |
 | **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
 | A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
 | **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
@@ -87,6 +87,8 @@ which is the closest device-control utility, and held to the fourteen rules of `
 | `audio info` | report, pipes | the detail a fault needs: controller and codec identity, outputs the codec offers, supported rates, ring size, interrupt or polling, position |
 | `audio outputs` | report, pipes as records | the outputs the codec actually has - speaker, headphone, line out - with which is selected and whether something is plugged into each |
 | `audio output <name>` | action | choose the output: `audio output headphone`. Names come from `audio outputs`; an unknown one is refused with the list |
+| `audio hardware` | report, pipes as records | (agreed 2026-10-09) every audio device on the machine, one row each: name, what it is, where (PCI address or SoC), its driver or that none drives it, its state, and `*` on the one `audio` talks to. See "Which device: `audio hardware`" below |
+| `audio hardware <device>` | report, pipes | (agreed 2026-10-09) one device in full: identity, bus address, what was granted, and why it is or is not driven |
 | `audio volume <0-100>` | action | set the volume. Reading it is `audio status` - one way to ask (rule 3) |
 | `audio mute` | action | silence the output, keeping the volume |
 | `audio unmute` | action | restore the volume that was set before `mute` |
@@ -223,6 +225,32 @@ the one `/wifi.keys` already proved (`utilities/56_wifi.md` 6):
 
 An absent, wedged or restarting driver makes `audio` return with a loud unavailable, never hang
 (Commandment VIII at the command layer).
+
+### Which device: `audio hardware` (agreed 2026-10-09)
+
+Asked for by the operator, on the model of `wifi hardware` (`utilities/56_wifi.md` 11). The reason is
+sharper than symmetry: the rest of `audio` assumes a machine has one audio device, and the T630 has two
+class-0x0403 controllers - its analog Azalia with the ALC255, and the Radeon's HDMI audio - of which the
+kernel binds the FIRST, the HDMI one ("Found while preparing" 2, `backlog/80` K2). A report listing both,
+with which one the driver holds, would have shown that on the first boot instead of in an audit.
+
+- **`audio hardware`** is a report, one row per audio device, and pipes as records: a short name
+  (`analog`, `hdmi`, `jack`), what it is (an HD Audio controller and its codec, or the PWM jack), where
+  (a PCI address, or the SoC), the service that drives it or `none`, its state, and `*` on the one every
+  other `audio` verb talks to.
+- **`audio hardware <device>`** is one device in full, as labelled lines: controller and codec identity,
+  the bus address, what the grant gave (window, interrupt, IOMMU confinement) and why it is or is not
+  driven.
+- **`audio hardware use <device>` is NOT agreed yet**: no machine has two audio devices a driver can play
+  on. It comes with A6, if the HDMI audio ever becomes one; until then it is not in the help.
+
+**No kernel change.** The rows come from what the `hardware` utility already gathers - the PCI class-0x04
+devices from `hw-enumerator` and the Pis' jack as a SoC device - and the driver adds what only it knows
+about the one it is bound to.
+
+**Not the same as the other reports.** `audio hardware` is what is on the machine; `audio outputs` the
+jacks on the device in use; `audio info` that device summarised; `audio debug` the driver's own account
+of itself. The same split `wifi` has.
 
 ### Keyboard shortcuts (agreed 2026-10-03)
 
@@ -922,3 +950,30 @@ Recorded here because they were found on the way and do not belong to audio alon
    refused only by the Pi 2 and VisionFive scripts. All three now run the same checks as `osdev build`,
    each shown to refuse by putting the mismatch back (2026-10-03). The Pi 4 one matters most: it builds
    the images the Wi-Fi work flashes.
+
+## Step A4: `audio outputs` and `audio output` (2026-10-09, `feat/audio-finish`)
+
+**The survey keeps every output, not the first.** It used to return the first pin with a path to a
+converter and forget the rest; it now records every such pin of the first codec that has one (up to
+`wire::OUTPUTS_MAX`, the rest said in the log), and plays through the first until told otherwise. Two
+ops join the protocol: `OP_OUTPUTS` lists each output's pin, its default-device field, whether it is the
+one playing and whether anything is plugged in, and `OP_OUTPUT` chooses one by pin.
+
+**Presence is the pin's own report, or "cannot tell".** A pin whose capabilities say it can sense a jack
+is asked (`GET_PIN_SENSE`, with the `SET_PIN_SENSE` trigger first where the pin needs one); a pin that
+cannot is listed as `cannot tell`, never guessed. QEMU's `hda-output` pin cannot.
+
+**Choosing an output** switches the old pin's output enable and EAPD off, configures the new path exactly
+as bring-up does (power, amplifiers, selections, output enable, EAPD, converter format), puts the volume
+on the new path's amplifier, and reads the new pin back: its output enable set is `verified`. Refused while
+something plays - a path changed under a running stream cuts it mid-sound - and while audio is off.
+
+**Kept across a reboot** as `output <name>` in `/audio.settings`, written only once an output has been
+chosen. At boot the driver restores it if the codec still has an output of that kind, and says either way.
+`pwm-audio` answers the same two ops for the Pis' one jack (`headphone`, `cannot tell`).
+
+**What QEMU can show, and what it cannot.** Its codec has one output, a line out, so `osdev test audio`
+checks the list, the in-use mark, the pipe as records, that choosing the output in use sends nothing, and
+that an output the codec lacks is refused with the list - 46 checks, all passing. Switching between two
+outputs needs a codec with two: the T630's ALC255 has a headphone jack, a speaker and a line out, and is
+A6's.

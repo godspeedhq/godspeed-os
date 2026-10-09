@@ -109,6 +109,11 @@ const FEED_TIMEOUT_MS: u32 = 5000;
 const RATE_DEFAULT: u32 = 44_100;
 const DEFAULT_VOLUME: u8 = 50;
 
+/// The jack, as `audio outputs` lists it: one output, named by the same default-device field an HD Audio
+/// pin carries (2, headphone). It has no node; 0 stands for it in `OP_OUTPUT`.
+const JACK_PIN: u8 = 0;
+const JACK_DEVICE: u8 = 2;
+
 /// What differs between the two boards. Everything else is the same driver.
 #[derive(Clone, Copy)]
 struct Board {
@@ -534,7 +539,7 @@ impl<'a> Pwm<'a> {
         wire::put_u32(out, 11, elapsed);
         wire::put_u32(out, 15, self.underruns_total.saturating_add(under));
         out[19] = 0; // no interrupt: the ring is polled
-        out[20] = 2; // the jack: headphones
+        out[20] = JACK_DEVICE;
         wire::put_u32(out, 21, sil);
         wire::STATUS_LEN
     }
@@ -644,6 +649,28 @@ impl<'a> Pwm<'a> {
                 }
                 self.open_stream(wire::get_u32(args, 0), args[4], args[5], wire::get_u32(args, 6), out)
             }
+            // One output, the jack: listed, always selected, and with no way to tell whether anything is
+            // plugged in - the jack has no sense line the SoC can read.
+            wire::OP_OUTPUTS => {
+                out[0] = wire::OK;
+                out[1] = 1;
+                out[2] = JACK_PIN;
+                out[3] = JACK_DEVICE;
+                out[4] = 1;
+                out[5] = wire::PRESENCE_UNKNOWN;
+                6
+            }
+            wire::OP_OUTPUT => match args.first() {
+                Some(&JACK_PIN) => {
+                    out[0] = wire::ALREADY;
+                    out[1] = wire::VERIFIED;
+                    2
+                }
+                _ => {
+                    out[0] = wire::BAD_ARG;
+                    1
+                }
+            },
             wire::OP_PCM => self.feed_pcm(args, out),
             wire::OP_END => self.end_feed(out),
             wire::OP_STOP => {
@@ -761,7 +788,7 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
             p.service();
             if p.settings_dirty && p.play.is_none() {
                 p.settings_dirty = false;
-                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted }) {
+                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted, output: None }) {
                     Ok(()) => p.settings_failing = false,
                     Err(e) if !p.settings_failing => {
                         p.settings_failing = true;

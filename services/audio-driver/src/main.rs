@@ -109,6 +109,9 @@ const SET_POWER_STATE: u32 = 0x705;
 const SET_CHANNEL_STREAMID: u32 = 0x706;
 const SET_PIN_WIDGET_CONTROL: u32 = 0x707;
 const SET_EAPD_BTLENABLE: u32 = 0x70C;
+const GET_PIN_WIDGET_CONTROL: u32 = 0xF07;
+const GET_PIN_SENSE: u32 = 0xF09;
+const SET_PIN_SENSE: u32 = 0x709; // "execute": a pin that needs a trigger measures when this is sent
 // Four-bit verbs, which carry a sixteen-bit payload.
 const SET_CONVERTER_FORMAT: u32 = 0x2;
 const SET_AMP_GAIN_MUTE: u32 = 0x3;
@@ -132,6 +135,9 @@ const FG_AUDIO: u32 = 0x01;
 const WCAP_OUT_AMP: u32 = 1 << 2;
 const WCAP_POWER: u32 = 1 << 10;
 const PINCAP_EAPD: u32 = 1 << 16;
+const PINCAP_TRIGGER: u32 = 1 << 1; // presence is measured only when asked (SET_PIN_SENSE)
+const PINCAP_PRESENCE: u32 = 1 << 2; // the pin can tell whether something is plugged in
+const SENSE_PRESENT: u32 = 1 << 31;
 const PIN_OUT_EN: u32 = 0x40;
 const EAPD_ON: u32 = 0x02;
 const AMP_OUT_LR_UNMUTED: u32 = 0xB000; // output amp, left and right, mute clear
@@ -406,17 +412,52 @@ struct OutPath {
     afg: u32,
     nodes: [u32; MAX_PATH],
     len: usize,
+    /// The pin's default-device field (`wire::device_name`): line out, speaker, headphone.
+    dev: u32,
 }
 
-/// Walk one codec: its audio function group, its widgets, and the output paths it offers. Returns the
-/// first usable path.
-fn survey_codec(h: &mut Hda, cad: u32) -> Option<OutPath> {
+/// Every output path one codec offers, in the order the survey found them; the first is the one played
+/// through until `audio output` chooses another.
+struct Outputs {
+    paths: [Option<OutPath>; wire::OUTPUTS_MAX],
+    n: usize,
+}
+
+impl Outputs {
+    fn get(&self, i: usize) -> Option<&OutPath> {
+        self.paths.get(i).and_then(|p| p.as_ref())
+    }
+
+    /// The output whose pin is `pin`.
+    fn by_pin(&self, pin: u32) -> Option<OutPath> {
+        (0..self.n).filter_map(|i| self.get(i).copied()).find(|p| p.nodes[0] == pin)
+    }
+}
+
+/// Walk one codec: its audio function group, its widgets, and the output paths it offers, every one of
+/// them into `outs` (up to `wire::OUTPUTS_MAX`, the rest said in the log). Returns how many it found.
+fn survey_codec(h: &mut Hda, cad: u32, outs: &mut Outputs) -> usize {
+    outs.n = 0;
+    let mut left_out = 0u32;
+    survey_paths(h, cad, outs, &mut left_out);
+    if left_out > 0 {
+        h.ctx.log_fmt(format_args!(
+            "audio-driver: codec {} offers {} more output(s) than the {} listed - not offered",
+            cad, left_out, wire::OUTPUTS_MAX));
+    }
+    if outs.n == 0 {
+        h.ctx.log_fmt(format_args!("audio-driver: codec {} offers no output path this step can use", cad));
+    }
+    outs.n
+}
+
+/// The survey proper: every pin that can play, and its path to a converter, recorded in `outs`.
+fn survey_paths(h: &mut Hda, cad: u32, outs: &mut Outputs, left_out: &mut u32) -> Option<()> {
     let ctx = h.ctx;
     let vid = h.param(cad, 0, PARAM_VENDOR_ID)?;
     ctx.log_fmt(format_args!("audio-driver: codec {}: vendor {:04x} device {:04x}", cad, vid >> 16, vid & 0xFFFF));
     let fgs = h.param(cad, 0, PARAM_SUB_NODE_COUNT)?;
     let (fg_start, fg_count) = ((fgs >> 16) & 0xFF, fgs & 0xFF);
-    let mut first: Option<OutPath> = None;
     for fg in fg_start..fg_start + fg_count {
         let Some(ty) = h.param(cad, fg, PARAM_FUNCTION_GROUP_TYPE) else { continue };
         if ty & 0xFF != FG_AUDIO {
@@ -448,8 +489,13 @@ fn survey_codec(h: &mut Hda, cad: u32) -> Option<OutPath> {
             match find_dac(h, cad, nid, &mut nodes, 0) {
                 Some(len) => {
                     log_path(ctx, cad, &nodes[..len], dev, cfg);
-                    if first.is_none() {
-                        first = Some(OutPath { cad, vendor: vid >> 16, device: vid & 0xFFFF, afg: fg, nodes, len });
+                    let p = OutPath { cad, vendor: vid >> 16, device: vid & 0xFFFF, afg: fg, nodes, len, dev };
+                    match outs.paths.get_mut(outs.n) {
+                        Some(slot) => {
+                            *slot = Some(p);
+                            outs.n += 1;
+                        }
+                        None => *left_out += 1,
                     }
                 }
                 None => ctx.log_fmt(format_args!(
@@ -458,10 +504,24 @@ fn survey_codec(h: &mut Hda, cad: u32) -> Option<OutPath> {
             }
         }
     }
-    if first.is_none() {
-        ctx.log_fmt(format_args!("audio-driver: codec {} offers no output path this step can use", cad));
+    Some(())
+}
+
+/// Whether something is plugged into `pin`, by the pin's own sense - `PRESENCE_UNKNOWN` for a pin that
+/// cannot tell, or a codec that did not answer.
+fn presence(h: &mut Hda, cad: u32, pin: u32) -> u8 {
+    let Some(caps) = h.param(cad, pin, PARAM_PIN_CAP) else { return wire::PRESENCE_UNKNOWN };
+    if caps & PINCAP_PRESENCE == 0 {
+        return wire::PRESENCE_UNKNOWN;
     }
-    first
+    if caps & PINCAP_TRIGGER != 0 {
+        let _ = h.verb(cad, pin, SET_PIN_SENSE, 0);
+    }
+    match h.verb(cad, pin, GET_PIN_SENSE, 0) {
+        Some(s) if s & SENSE_PRESENT != 0 => wire::PRESENCE_PLUGGED,
+        Some(_) => wire::PRESENCE_EMPTY,
+        None => wire::PRESENCE_UNKNOWN,
+    }
 }
 
 /// The path converter-first, the way sound flows: "0x02 -> 0x03".
@@ -669,7 +729,13 @@ struct Amp {
 struct Player<'a> {
     h: Hda<'a>,
     d: &'a Dma,
+    /// The output playing now - one of `outputs`.
     path: OutPath,
+    /// Every output the codec offers, for `audio outputs` and `audio output`.
+    outputs: Outputs,
+    /// The output chosen with `audio output`, kept in `/audio.settings` as its device field; `None` until
+    /// one is chosen, so a machine that never chose keeps playing through whatever the survey found first.
+    output_chosen: Option<u8>,
     pin_device: u32,
     amp: Option<Amp>,
     /// The first output stream's descriptor.
@@ -1145,6 +1211,60 @@ impl<'a> Player<'a> {
         wire::INFO_LEN
     }
 
+    /// `[OK, count, (pin, device, selected, presence) x count]` - every output, the one playing marked,
+    /// and whether something is plugged into each where the pin can tell.
+    fn outputs_answer(&mut self, out: &mut [u8]) -> usize {
+        out[0] = wire::OK;
+        let (cad, now) = (self.cad(), self.path.nodes[0]);
+        let mut at = 2;
+        let mut count = 0u8;
+        for i in 0..self.outputs.n {
+            let Some(p) = self.outputs.get(i).copied() else { continue };
+            if at + 4 > out.len() {
+                break;
+            }
+            let pin = p.nodes[0];
+            out[at] = pin as u8;
+            out[at + 1] = p.dev as u8;
+            out[at + 2] = (pin == now) as u8;
+            out[at + 3] = presence(&mut self.h, cad, pin);
+            at += 4;
+            count += 1;
+        }
+        out[1] = count;
+        at
+    }
+
+    /// Play through the output whose pin is `pin`: the old pin's output and EAPD switched off, the new
+    /// path configured as at bring-up, the volume re-applied on the new path's amplifier. The verdict is
+    /// the new pin's own report that its output is enabled - and the volume's, where that disagrees.
+    fn select_output(&mut self, p: OutPath) -> u8 {
+        let (cad, old) = (self.cad(), self.path.nodes[0]);
+        if old != p.nodes[0] {
+            let _ = self.h.verb(cad, old, SET_PIN_WIDGET_CONTROL, 0);
+            if matches!(self.h.param(cad, old, PARAM_PIN_CAP), Some(pc) if pc & PINCAP_EAPD != 0) {
+                let _ = self.h.verb(cad, old, SET_EAPD_BTLENABLE, 0);
+            }
+        }
+        if !configure_path(&mut self.h, &p) {
+            self.h.ctx.log_fmt(format_args!(
+                "audio-driver: the path to pin {:#04x} ({}) could not be configured", p.nodes[0], device_name(p.dev)));
+            return wire::CONTRADICTED;
+        }
+        self.path = p;
+        self.pin_device = p.dev;
+        self.amp = volume_amp(&mut self.h, &p);
+        let v = self.apply_volume();
+        let enabled = self.h.verb(cad, p.nodes[0], GET_PIN_WIDGET_CONTROL, 0);
+        self.h.ctx.log_fmt(format_args!("audio-driver: output now pin {:#04x} ({})", p.nodes[0], device_name(p.dev)));
+        match enabled {
+            Some(c) if c & PIN_OUT_EN == 0 => wire::CONTRADICTED,
+            None => wire::UNVERIFIED,
+            Some(_) if v == wire::CONTRADICTED => wire::CONTRADICTED,
+            Some(_) => wire::VERIFIED,
+        }
+    }
+
     /// One request, answered into `out`. Returns the answer's length.
     fn answer(&mut self, irq: &Irq, op: u8, args: &[u8], out: &mut [u8]) -> usize {
         let on = self.power == wire::POWER_ON;
@@ -1239,6 +1359,31 @@ impl<'a> Player<'a> {
                 let (rate, ch, bits, frames) = (wire::get_u32(args, 0), args[4], args[5], wire::get_u32(args, 6));
                 self.open_stream(irq, rate, ch, bits, frames, out)
             }
+            wire::OP_OUTPUTS => self.outputs_answer(out),
+            wire::OP_OUTPUT => {
+                let Some(&pin) = args.first() else { return bad(out) };
+                let Some(p) = self.outputs.by_pin(pin as u32) else { return bad(out) };
+                if p.nodes[0] == self.path.nodes[0] {
+                    out[0] = wire::ALREADY;
+                    out[1] = wire::VERIFIED;
+                    return 2;
+                }
+                if !on {
+                    out[0] = wire::AUDIO_OFF;
+                    return 1;
+                }
+                if self.tone.is_some() {
+                    out[0] = wire::BUSY;
+                    return 1;
+                }
+                out[0] = wire::OK;
+                out[1] = self.select_output(p);
+                if out[1] != wire::CONTRADICTED {
+                    self.output_chosen = Some(p.dev as u8);
+                    self.settings_dirty = true;
+                }
+                2
+            }
             wire::OP_PCM => self.feed_pcm(args, out),
             wire::OP_END => self.end_feed(out),
             wire::OP_STOP => {
@@ -1298,16 +1443,17 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
     };
     ctx.log_fmt(format_args!("audio-driver: codec(s) answered at mask {:#06x}", codecs));
     let mut h = Hda { ctx, m, dma: None, corb_wp: 0, rirb_rp: 0 };
-    let mut path: Option<OutPath> = None;
+    // Every codec is surveyed, so the log names each; the outputs offered are the first codec's that has
+    // any - one codec plays at a time.
+    let mut outputs = Outputs { paths: [None; wire::OUTPUTS_MAX], n: 0 };
+    let mut other = Outputs { paths: [None; wire::OUTPUTS_MAX], n: 0 };
     for cad in 0..15u32 {
         if codecs & (1 << cad) != 0 {
-            let p = survey_codec(&mut h, cad);
-            if path.is_none() {
-                path = p;
-            }
+            let into = if outputs.n == 0 { &mut outputs } else { &mut other };
+            survey_codec(&mut h, cad, into);
         }
     }
-    let Some(path) = path else { return Device::Absent(wire::no_device::NO_PATH) };
+    let Some(path) = outputs.get(0).copied() else { return Device::Absent(wire::no_device::NO_PATH) };
 
     // From here on, DMA - on the codec it was verified on, and nowhere else (see the module docs).
     if path.vendor != VENDOR_QEMU {
@@ -1350,7 +1496,7 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
     let pin_device = h.verb(path.cad, path.nodes[0], GET_CONFIG_DEFAULT, 0).map_or(0, |c| (c >> 20) & 0xF);
     let iss = ((m.read16(GCAP) >> 8) & 0xF) as usize;
     let mut p = Player {
-        h, d, path, pin_device, amp,
+        h, d, path, outputs, output_chosen: None, pin_device, amp,
         sd: SD_BASE + iss * SD_STRIDE, // the first output stream follows the input streams
         power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false, tone: None, underruns_total: 0,
         last_silence_ms: 0,
@@ -1359,6 +1505,22 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
     if let Some(s) = settings::load(ctx, &mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), "audio-driver", DEFAULT_VOLUME) {
         p.volume = s.volume;
         p.muted = s.muted;
+        // The output chosen last time, if this codec still has one of that kind; said either way.
+        if let Some(dev) = s.output {
+            p.output_chosen = Some(dev);
+            let want = (0..p.outputs.n).filter_map(|i| p.outputs.get(i).copied()).find(|o| o.dev == dev as u32);
+            match want {
+                Some(o) if o.nodes[0] != p.path.nodes[0] => {
+                    let v = p.select_output(o);
+                    ctx.log_fmt(format_args!("audio-driver: output {} restored from /audio.settings - {}",
+                        device_name(o.dev), verdict_word(v)));
+                }
+                Some(_) => {}
+                None => ctx.log_fmt(format_args!(
+                    "audio-driver: /audio.settings asks for the {} output and this codec has none - playing through {}",
+                    device_name(dev as u32), device_name(p.path.dev))),
+            }
+        }
     }
     let v = p.apply_volume();
     match amp {
@@ -1470,7 +1632,7 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
             p.service(irq);
             if p.settings_dirty && p.tone.is_none() {
                 p.settings_dirty = false;
-                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted }) {
+                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted, output: p.output_chosen }) {
                     Ok(()) => p.settings_failing = false,
                     Err(e) if !p.settings_failing => {
                         p.settings_failing = true;

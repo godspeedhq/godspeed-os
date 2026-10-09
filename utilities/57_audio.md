@@ -15,10 +15,13 @@ does not pace its DMA), and **heard on a Pi 4** (2026-10-03: tone, volume, mute 
 jack); the Pi 2 is built and not yet heard. Not run on hardware on x86: on the T630 the driver surveys the codec and stops before playback, and every verb below
 answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
 
-The verbs in section 1 are built, and the volume and the mute survive a reboot (section 5). The rest of
-the surface the operator agreed - `outputs`, `output`, `debug`, `system sounds` and the keyboard
-shortcuts - is designed in `docs/audio.md` and not built; each of those words answers `not built yet` rather than being
-mistaken for a fault.
+The verbs in section 1 are built, and the volume, the mute and the output survive a reboot (section 5).
+`outputs` and `output` were built on 2026-10-09 (`feat/audio-finish`) and run in QEMU, whose codec has ONE
+output - so the list, the in-use mark and a refused name are shown there, and switching between two
+outputs is not, until hardware with two. The rest of the surface the operator agreed - `hardware`
+(agreed 2026-10-09), `debug`, `system sounds` and the keyboard shortcuts - is designed in
+`docs/audio.md` and not built yet; each of those words answers `not built yet` rather than being mistaken
+for a fault.
 
 ## 1. Verbs
 
@@ -27,6 +30,10 @@ mistaken for a fault.
 | `audio` | help | usage (rule 1). Never an alias for `status` |
 | `audio status` | report, pipes | on or off, volume, muted, output, what is playing and how far through, underruns |
 | `audio info` | report, pipes | the detail a fault needs: controller version, codec, the path from converter to pin, the amplifier and the step it is at, the format, the ring, interrupt or polling |
+| `audio outputs` | report, pipes as records | BUILT: the outputs the device has - line out, speaker, headphone - with `*` on the one playing, and whether something is plugged into each where the jack can tell (`plugged in`, `empty`, or `cannot tell`). Two of a kind are numbered: `line out`, `line out 2` |
+| `audio output <name>` | action | BUILT: play through that output - `audio output headphone`. Names come from `audio outputs`; an unknown one is refused with the list. Refused while something plays, and kept in `/audio.settings` |
+| `audio hardware` | report, pipes as records | AGREED 2026-10-09, not built yet: every audio device on this machine, one row each - its name (`analog`, `hdmi`, `jack`), what it is, where it is (a PCI address, or the SoC), the service that drives it or that none does, its state, and `*` on the one `audio` talks to. The T630 has two (its analog codec and the Radeon's HDMI audio), which is why this exists |
+| `audio hardware <device>` | report, pipes | AGREED 2026-10-09, not built yet: one device in full - controller and codec identity, bus address, what was granted (window, interrupt, IOMMU confinement), and why it is or is not driven |
 | `audio volume <0-100>` | action | set the volume. Reading it is `audio status` - one way to ask (rule 3) |
 | `audio mute` | action | silence the output, keeping the volume |
 | `audio unmute` | action | restore the volume set before `mute` |
@@ -65,6 +72,8 @@ something else` when it disagrees.
 | `audio off` | `audio off - the codec is powered down; audio on brings it back - verified` |
 | `audio off hard` | `audio off (hard - the controller is held in reset; audio on brings it back) - verified` |
 | `audio on` | `audio on - volume 60, unmuted, output line out - verified`; if on: `already on` |
+| `audio output headphone` | `output headphone - verified`; already in use: `already playing through headphone` (nothing sent); nothing plugged in: says so on the next line |
+| `audio output speakers` | `audio: no output called 'speakers' - this device has:` and the list |
 | `audio tone 440 2` | `playing 440 Hz for 2.0 s  [q] quit`, then `played 440 Hz for 2.0 s` or `stopped after 1.2 s` |
 | `audio tone` while off | ``audio is off - `audio on` first`` |
 | `audio tone` muted, or at volume 0 | plays, and says first: `muted - nothing will be heard` / `volume is 0 - nothing will be heard` |
@@ -77,7 +86,8 @@ something else` when it disagrees.
 ## 3. Pipes (rule 12)
 
 `status` and `info` start pipes, as labelled lines: `audio status | match volume`, `audio info | write
-/audio-info.txt`. The actions refuse with a sentence naming the reports. Piping sound IN will be refused
+/audio-info.txt`. `outputs` pipes as records - `output`, `plugged`, `in_use` - so `audio outputs | count`
+is how many there are. The actions refuse with a sentence naming the reports. Piping sound IN will be refused
 in the design: a pipe carries 16 KiB, a tenth of a second of sound, so `play` takes a PATH and the file is
 the adapter (`docs/audio.md`).
 
@@ -100,11 +110,13 @@ is bounded, and every answer is immediate by design - a tone is started and answ
 
 ## 5. Settings that survive a reboot: `/audio.settings`
 
-**The volume and the mute are kept on disk**, in plain labelled lines, readable with `read /audio.settings`:
+**The volume, the mute and the output are kept on disk**, in plain labelled lines, readable with
+`read /audio.settings`:
 
 ```
 volume 60
 muted no
+output headphone
 ```
 
 - **The driver owns the file.** It reads it once when it comes up and writes it after a change the codec
@@ -116,7 +128,9 @@ muted no
   know is ignored and said once in the log; no file means the defaults (volume 50, unmuted). Where `fs`
   is absent - no data disk - or does not answer, the driver says so once, carries on with what it holds,
   and says a failed write once rather than on every change.
-- `output` joins the file with `audio output`, when that is built.
+- `output` is written only once one has been chosen with `audio output`; until then the driver plays
+  through the first output its survey found. At boot it is restored if the codec still has an output of
+  that kind, and the log says so either way. The Pis' jack is one output, so `pwm-audio` keeps no line.
 
 ## 6. Tab completion and words from elsewhere (rules 8 and 9)
 

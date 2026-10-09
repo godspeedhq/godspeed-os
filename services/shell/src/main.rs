@@ -984,7 +984,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     // Only the verbs that are BUILT: completing one that answers "not built yet" would teach a word
     // the utility cannot act on. `outputs`, `output`, `debug` and `system` join as they land. `play`
     // takes a PATH, which is why `audio` is not in NO_PATH_CMDS: Tab after `audio play ` offers files.
-    ("audio",   &["status", "info", "volume", "mute", "unmute", "on", "off", "tone", "play"]),
+    ("audio",   &["status", "info", "outputs", "output", "volume", "mute", "unmute", "on", "off", "tone", "play"]),
     // The sections that are built; a device name is the other first word, and it is the machine's.
     ("hardware", &["cpu", "memory", "pci", "soc", "display", "usb", "interrupts", "report", "why",
                    "problems", "tree", "firmware", "compare", "events"]),
@@ -5307,6 +5307,8 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio", "this usage (rule 1: a bare utility name teaches its verbs)", "audio"),
             ("audio status", "on or off, volume, muted, output, what is playing, underruns", "audio status"),
             ("audio info", "the detail a fault needs: codec, path, amplifier, format, ring, interrupt or polling", "audio info"),
+            ("audio outputs", "the outputs the device has, whether anything is plugged into each, and which plays", "audio outputs"),
+            ("audio output <name>", "play through that output; the names come from audio outputs, and the choice is kept", "audio output headphone"),
             ("audio volume <0-100>", "set the volume; 0 is silent and is NOT mute - each stays as set", "audio volume 60"),
             ("audio mute | unmute", "silence the output, keeping the volume; unmute returns to it", "audio mute"),
             ("audio on | off | off hard", "the codec's power: off powers it down, off hard holds the controller in reset, on brings either back", "audio off"),
@@ -5673,6 +5675,13 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("audio", "info") => help_block(ctx, "audio info", "the detail a fault needs", &[
             ("audio info", "controller, codec, path, amplifier step, format, ring, interrupt or polling", "audio info"),
+        ], false),
+        ("audio", "outputs") => help_block(ctx, "audio outputs", "the outputs the device has", &[
+            ("audio outputs", "each output, whether something is plugged in (where the jack can tell), and * on the one playing", "audio outputs"),
+            ("audio outputs | match plugged", "a report is data: records with output, plugged and in_use", "audio outputs | match plugged"),
+        ], false),
+        ("audio", "output") => help_block(ctx, "audio output", "choose the output", &[
+            ("audio output <name>", "a name from audio outputs; refused while something plays, and kept across a reboot", "audio output headphone"),
         ], false),
         ("audio", "volume") => help_block(ctx, "audio volume", "set the volume, read back from the codec", &[
             ("audio volume <0-100>", "0 is silent and is NOT mute; off, it is kept and set at `audio on`", "audio volume 60"),
@@ -9231,7 +9240,7 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
     let rest = rest.trim();
     // Argument shape first: a usage error is not a missing sound card.
     match verb {
-        "status" | "info" | "mute" | "unmute" | "on" if !rest.is_empty() => {
+        "status" | "info" | "mute" | "unmute" | "on" | "outputs" if !rest.is_empty() => {
             out.line_fmt(ctx, format_args!("audio: `audio {}` takes nothing after it", verb));
             return Err(ShellError::Unknown);
         }
@@ -9251,16 +9260,20 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
             out.line_fmt(ctx, format_args!("audio: usage: audio play <path>  (e.g. audio play /music/test.wav)"));
             return Err(ShellError::Unknown);
         }
-        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" => {}
+        "output" if rest.is_empty() => {
+            out.line_fmt(ctx, format_args!("audio: usage: audio output <name>  (e.g. audio output headphone) - audio outputs lists the names"));
+            return Err(ShellError::Unknown);
+        }
+        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" | "outputs" | "output" => {}
         // Agreed and not built: said as such, never as a fault (docs/audio.md has the plan).
-        "outputs" | "output" | "debug" | "system" => {
+        "debug" | "system" | "hardware" => {
             out.line_fmt(ctx, format_args!("audio: `audio {}` is not built yet - docs/audio.md has where it comes in", verb));
             return Err(ShellError::Unknown);
         }
         _ => {
             out.line_fmt(ctx, format_args!(
-                "audio: unknown subcommand - try audio status, info, volume <0-100>, mute, unmute, on, off,"));
-            out.line_fmt(ctx, format_args!("       off hard, tone <hz> [seconds], play <path>, or audio help"));
+                "audio: unknown subcommand - try audio status, info, outputs, output <name>, volume <0-100>, mute,"));
+            out.line_fmt(ctx, format_args!("       unmute, on, off, off hard, tone <hz> [seconds], play <path>, or audio help"));
             return Err(ShellError::Unknown);
         }
     }
@@ -9285,6 +9298,8 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
     match verb {
         "status" => audio_status(ctx, out),
         "info" => audio_info(ctx, out),
+        "outputs" => audio_outputs(ctx, out),
+        "output" => audio_output_select(ctx, out, rest),
         "volume" => audio_volume(ctx, out, volume.unwrap_or(0)),
         "mute" => audio_mute(ctx, out, true),
         "unmute" => audio_mute(ctx, out, false),
@@ -9409,6 +9424,115 @@ fn audio_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         out.line_fmt(ctx, format_args!("refill     by polling - no interrupt was routed to the driver"));
     }
     Ok(())
+}
+
+/// One output as `audio outputs` lists it, named for the user: the pin's device words, numbered when two
+/// share a kind (`line out`, `line out 2`) so every name picks exactly one.
+#[derive(Clone, Copy)]
+struct AudioOutput {
+    pin: u8,
+    device: u8,
+    selected: bool,
+    presence: u8,
+    name: [u8; 16],
+    name_len: usize,
+}
+
+impl AudioOutput {
+    fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?")
+    }
+}
+
+/// The outputs the driver offers, named, in its order - or the sentence that says why there are none,
+/// already printed.
+fn audio_outputs_fetch(ctx: &ShellCtx, out: &mut Out)
+    -> Result<([Option<AudioOutput>; audio_wire::OUTPUTS_MAX], usize), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_OUTPUTS], AUDIO_REPLY_MS), 2)?;
+    let p = r.payload_bytes();
+    let mut rows: [Option<AudioOutput>; OUTPUTS_MAX] = [None; OUTPUTS_MAX];
+    let mut n = 0;
+    for e in p[2..].chunks_exact(4).take((p[1] as usize).min(OUTPUTS_MAX)) {
+        let device = e[1];
+        let words = device_name(device as u32).as_bytes();
+        let mut name = [0u8; 16];
+        let mut len = words.len().min(14);
+        name[..len].copy_from_slice(&words[..len]);
+        let same = rows[..n].iter().flatten().filter(|o| o.device == device).count();
+        if same > 0 {
+            name[len] = b' ';
+            name[len + 1] = b'1' + same as u8;
+            len += 2;
+        }
+        rows[n] = Some(AudioOutput { pin: e[0], device, selected: e[2] != 0, presence: e[3], name, name_len: len });
+        n += 1;
+    }
+    Ok((rows, n))
+}
+
+fn audio_presence_word(p: u8) -> &'static str {
+    match p {
+        audio_wire::PRESENCE_PLUGGED => "plugged in",
+        audio_wire::PRESENCE_EMPTY => "empty",
+        _ => "cannot tell",
+    }
+}
+
+/// `audio outputs` - the outputs the device has, the one in use marked, and whether something is plugged
+/// into each where the jack can tell (`utilities/57_audio.md`).
+fn audio_outputs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    let (rows, n) = audio_outputs_fetch(ctx, out)?;
+    if n == 0 {
+        out.line_fmt(ctx, format_args!("audio: the device lists no outputs"));
+        return Err(ShellError::Unknown);
+    }
+    out.line_fmt(ctx, format_args!("{:<12}  {:<12}  {}", "OUTPUT", "PLUGGED", "IN USE"));
+    for o in rows.iter().flatten() {
+        out.line_fmt(ctx, format_args!("{:<12}  {:<12}  {}", o.name(), audio_presence_word(o.presence),
+            if o.selected { "*" } else { "" }));
+    }
+    Ok(())
+}
+
+/// `audio outputs` as records, for a pipe: `output`, `plugged`, `in_use`.
+fn build_audio_outputs_table(ctx: &ShellCtx) -> Option<Table> {
+    let mut t = Table::new(&["output", "plugged", "in_use"]);
+    let (rows, _) = audio_outputs_fetch(ctx, &mut Out::Console).ok()?;
+    for o in rows.iter().flatten() {
+        let row = [
+            t.intern(o.name().as_bytes()),
+            t.intern(audio_presence_word(o.presence).as_bytes()),
+            if o.selected { t.intern(b"yes") } else { Value::Empty },
+        ];
+        t.add_row(&row);
+    }
+    Some(t)
+}
+
+/// `audio output <name>` - play through the output `audio outputs` calls `name`. An unknown name is refused
+/// with the list; the choice is kept in `/audio.settings` by the driver.
+fn audio_output_select(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let (rows, _) = audio_outputs_fetch(ctx, out)?;
+    let Some(o) = rows.iter().flatten().find(|o| o.name() == name).copied() else {
+        out.line_fmt(ctx, format_args!("audio: no output called '{}' - this device has:", name));
+        for o in rows.iter().flatten() {
+            out.line_fmt(ctx, format_args!("  {}", o.name()));
+        }
+        return Err(ShellError::Unknown);
+    };
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_OUTPUT, o.pin], AUDIO_REPLY_MS), 2)?;
+    let p = r.payload_bytes();
+    if p[0] == ALREADY {
+        out.line_fmt(ctx, format_args!("already playing through {}", o.name()));
+        return Ok(());
+    }
+    out.line_fmt(ctx, format_args!("output {} {}", o.name(), audio_verdict(p[1])));
+    if o.presence == PRESENCE_EMPTY {
+        out.line_fmt(ctx, format_args!("  (nothing is plugged into it - nothing will be heard until something is)"));
+    }
+    if p[1] == CONTRADICTED { Err(ShellError::Unknown) } else { Ok(()) }
 }
 
 fn audio_volume(ctx: &ShellCtx, out: &mut Out, v: u8) -> Result<(), ShellError> {
@@ -9794,9 +9918,9 @@ fn audio_say_if_silent(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
 /// Which `audio` verbs may start a pipe: the REPORTS. The actions refuse, naming the reports (rule 12).
 fn audio_pipe_refusal(arg: &str) -> Option<&'static str> {
     match arg.split_whitespace().next().unwrap_or("") {
-        "status" | "info" | "version" => None,
-        "" => Some("pipe: bare 'audio' prints its usage, which is not data - pipe a report: audio status or audio info"),
-        _ => Some("pipe: that 'audio' verb is an action, not a report, so it cannot start a pipe - the reports are: audio status and audio info"),
+        "status" | "info" | "outputs" | "version" => None,
+        "" => Some("pipe: bare 'audio' prints its usage, which is not data - pipe a report: audio status, info or outputs"),
+        _ => Some("pipe: that 'audio' verb is an action, not a report, so it cannot start a pipe - the reports are: audio status, audio info and audio outputs"),
     }
 }
 
@@ -13298,6 +13422,8 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
     let (c0, _) = split_first(stages[0]);
     // `wifi list` and `wifi hardware` are the `wifi` verbs that are tables; `status`, `info` and the rest are labelled lines.
     let wifi_records = c0 == "wifi" && matches!(split_first(stages[0]).1.trim(), "list" | "hardware");
+    // `audio outputs` is the `audio` verb that is a table; `status` and `info` are labelled lines.
+    let audio_records = c0 == "audio" && split_first(stages[0]).1.trim() == "outputs";
     // `hardware` and `hardware <sections>` are a table; one device is labelled lines.
     let hardware_records = c0 == "hardware" && {
         let a = split_first(stages[0]).1.trim();
@@ -13317,7 +13443,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
         }
         if cap.overflow { gs::io::println(ctx, "pipe: producer output exceeded the pipe buffer (truncated)"); }
         Stream::Bytes(cap)
-    } else if is_record_producer(c0) || wifi_records || hardware_records {
+    } else if is_record_producer(c0) || wifi_records || hardware_records || audio_records {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
             "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -13328,6 +13454,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "uptime"  => build_uptime_table(ctx),
             "jobs"    => build_jobs_table(ctx),
             "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
+            "audio" => match build_audio_outputs_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
             "hardware" => match build_hardware_table(ctx, cwd, arg) { Some(t) => t, None => return Err(ShellError::Unknown) },
             "wifi"    => match build_wifi_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
             // `events ipc` / `events failures` are record sources; the other subcommands are readers

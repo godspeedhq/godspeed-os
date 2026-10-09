@@ -154,6 +154,26 @@ pub const OP_END: u8 = 10;
 /// The rates a stream may be opened at, where the codec offers them.
 pub const STREAM_RATES: [u32; 2] = [44_100, 48_000];
 
+/// The outputs the device has. Answer `[OK, count, (pin, device, selected, presence) x count]`: `pin` is
+/// the output's node (what `OP_OUTPUT` names), `device` its default-device field as in `OP_INFO`,
+/// `selected` 1 for the one playing, and `presence` a `PRESENCE_*`. At most `OUTPUTS_MAX` entries.
+/// Or `[NO_DEVICE, reason]`.
+pub const OP_OUTPUTS: u8 = 11;
+/// The most outputs one answer lists. A codec offering more is listed up to here and the driver's log
+/// says how many it left out.
+pub const OUTPUTS_MAX: usize = 8;
+/// The output cannot tell whether anything is plugged in (no presence detect).
+pub const PRESENCE_UNKNOWN: u8 = 0;
+/// Something is plugged into it.
+pub const PRESENCE_PLUGGED: u8 = 1;
+/// Nothing is plugged into it.
+pub const PRESENCE_EMPTY: u8 = 2;
+
+/// `[12, pin]` - play through the output whose node is `pin`. Answer `[OK | ALREADY, verify]`; `ALREADY`
+/// sends nothing. `BAD_ARG` when `pin` is not one of `OP_OUTPUTS`'s; `BUSY` while something plays, since
+/// changing the path under a running stream would cut it mid-sound; `AUDIO_OFF` when audio is off.
+pub const OP_OUTPUT: u8 = 12;
+
 /// What a pin's default-device field (bits 23:20 of its configuration default) names, as the driver's log
 /// and the shell's `audio` both say it.
 pub fn device_name(dev: u32) -> &'static str {
@@ -168,6 +188,12 @@ pub fn device_name(dev: u32) -> &'static str {
         0xA => "microphone",
         _ => "other",
     }
+}
+
+/// The default-device field a name from [`device_name`] stands for, for reading a name back - from
+/// `/audio.settings` or a typed `audio output headphone`. `None` for a name that table does not produce.
+pub fn device_of(name: &str) -> Option<u32> {
+    (0..16u32).find(|&d| device_name(d) == name && name != "other")
 }
 
 // ---- Byte helpers, so neither side hand-rolls them ----------------------------------------------------

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! `/audio.settings`: the volume and the mute, kept across a restart (`utilities/57_audio.md`), written
+//! `/audio.settings`: the volume, the mute and the output, kept across a restart (`utilities/57_audio.md`), written
 //! once for every audio driver - the HD Audio driver on x86 and the PWM jack driver on the Pis keep the
 //! same file in the same words.
 
@@ -27,6 +27,9 @@ const SETTINGS_RETRY_PAUSE: Budget = Budget::ms(1000);
 pub struct Settings {
     pub volume: u8,
     pub muted: bool,
+    /// The output chosen with `audio output`, as its default-device field (`wire::device_of`); `None`
+    /// when none was ever chosen, and the driver plays through the first output it found.
+    pub output: Option<u8>,
 }
 
 /// Read the settings, or `None` for the defaults - with the reason said once in the log either way.
@@ -68,10 +71,10 @@ pub fn load(ctx: &ServiceContext, fs: &mut gs::fs::Fs, who: &str, default_volume
     None
 }
 
-/// `volume N` and `muted yes|no`, one per line. A line this driver does not know is ignored and said once;
+/// `volume N`, `muted yes|no` and `output <name>`, one per line. A line this driver does not know is ignored and said once;
 /// a value out of range keeps the default for that setting and is said too.
 fn parse(ctx: &ServiceContext, who: &str, text: &[u8], default_volume: u8) -> Option<Settings> {
-    let mut s = Settings { volume: default_volume, muted: false };
+    let mut s = Settings { volume: default_volume, muted: false, output: None };
     let mut ignored = 0u32;
     for line in text.split(|&b| b == b'\n') {
         let line = core::str::from_utf8(line).unwrap_or("").trim();
@@ -86,6 +89,10 @@ fn parse(ctx: &ServiceContext, who: &str, text: &[u8], default_volume: u8) -> Op
             },
             ("muted", "yes") => s.muted = true,
             ("muted", "no") => s.muted = false,
+            ("output", name) => match crate::wire::device_of(name) {
+                Some(d) => s.output = Some(d as u8),
+                None => ignored += 1,
+            },
             _ => ignored += 1,
         }
     }
@@ -93,7 +100,9 @@ fn parse(ctx: &ServiceContext, who: &str, text: &[u8], default_volume: u8) -> Op
         ctx.log_fmt(format_args!("{}: /audio.settings has {} line(s) this driver does not understand - ignored", who, ignored));
     }
     ctx.log_fmt(format_args!(
-        "{}: settings read from /audio.settings - volume {}, {}", who, s.volume, if s.muted { "muted" } else { "unmuted" }));
+        "{}: settings read from /audio.settings - volume {}, {}{}{}", who, s.volume,
+        if s.muted { "muted" } else { "unmuted" }, if s.output.is_some() { ", output " } else { "" },
+        s.output.map_or("", |d| crate::wire::device_name(d as u32))));
     Some(s)
 }
 
@@ -125,6 +134,9 @@ pub fn save(fs: &mut gs::fs::Fs, s: Settings) -> Result<(), gs::Error> {
     use core::fmt::Write;
     let mut l = Line { buf: [0; 64], len: 0, overflow: false };
     let _ = write!(l, "volume {}\nmuted {}\n", s.volume, if s.muted { "yes" } else { "no" });
+    if let Some(d) = s.output {
+        let _ = write!(l, "output {}\n", crate::wire::device_name(d as u32));
+    }
     if l.overflow {
         return Err(gs::Error::InvalidInput);
     }

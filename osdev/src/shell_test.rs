@@ -10260,6 +10260,17 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(r.contains("cannot start a pipe"), "an action refuses to start a pipe");
     let r = run!(b"audio status | match volume\r");
     check!(r.contains("volume     100"), "status pipes as labelled lines");
+    // QEMU's `hda-output` has ONE output, a line out, so switching between two cannot be shown here; what
+    // can be is the list, the in-use mark, the refusal of a name it does not have, and that choosing the
+    // one in use sends nothing.
+    let r = run!(b"audio outputs\r");
+    check!(r.contains("OUTPUT") && r.contains("line out") && r.contains("*"), "outputs: the line out, marked in use");
+    let r = run!(b"audio outputs | count\r");
+    check!(r.contains('1'), "outputs pipes as records: one row");
+    let r = run!(b"audio output line out\r");
+    check!(r.contains("already playing through line out"), "choosing the output in use sends nothing");
+    let r = run!(b"audio output headphone\r");
+    check!(r.contains("no output called 'headphone'") && r.contains("line out"), "an output it does not have is refused with the list");
     let r = run!(b"audio off\r");
     check!(r.contains("audio off - the codec is powered down"), "off");
     let r = run!(b"audio tone 440 1\r");
