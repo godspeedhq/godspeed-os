@@ -1265,3 +1265,10 @@ went (`node 0x02 has no mute - muting on node 0x14`).
 
 **Prediction for the next card:** that log line at boot; `audio mute` answers `muted - verified` and a
 tone is silent; `audio unmute` brings it back at the same level; volume 0 is silent too.
+
+**The card (2026-10-09, same day): mute HARDWARE-VERIFIED on the Wyse.** Every line of the prediction
+held: `node 0x02 has no mute - muting on node 0x14` at boot, `muted - verified` and the tone silent,
+`unmuted - volume 50 - verified` and the tone back at the same level, `volume 0 - silent - verified`
+and silent, `volume 50 - verified`. Each tone played 2000 ms in 2028 by the clock, 0 underruns, 23
+interrupts. The operator: "mute works and all the commands too". A6 is done on the Wyse; the T630 is
+what remains of it - the two kernel fixes and the AMD snoop bit come before its codec is the question.
