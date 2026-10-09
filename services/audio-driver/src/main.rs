@@ -143,6 +143,8 @@ const PINCAP_TRIGGER: u32 = 1 << 1; // presence is measured only when asked (SET
 const PINCAP_PRESENCE: u32 = 1 << 2; // the pin can tell whether something is plugged in
 const SENSE_PRESENT: u32 = 1 << 31;
 const PIN_OUT_EN: u32 = 0x40;
+const PIN_HP_EN: u32 = 0x80; // the pin's headphone amplifier, where it has one
+const PINCAP_HP_DRIVE: u32 = 1 << 3;
 const EAPD_ON: u32 = 0x02;
 const AMP_OUT_LR_UNMUTED: u32 = 0xB000; // output amp, left and right, mute clear
 const AMP_IN_LR: u32 = 0x7000; // input amp, left and right; bits 11:8 the input index
@@ -169,18 +171,21 @@ struct Playable {
     /// Realtek processing coefficients set before the path is configured, each `(index, mask, bits)`:
     /// the bits under `mask` become `bits`, the rest are kept.
     coefs: &'static [(u32, u32, u32)],
+    /// A codec's own bring-up after the coefficients, where a reference driver has one: Linux's
+    /// `alc256_init` for the ALC255, which powers its headphone amplifier.
+    init: Option<fn(&mut Hda, u32) -> bool>,
 }
 
 const PLAYABLE: &[Playable] = &[
     // QEMU's `hda-output` - the codec A2 and A3 were verified on.
-    Playable { vendor: 0x1af4, device: None, coefs: &[] },
+    Playable { vendor: 0x1af4, device: None, coefs: &[], init: None },
     // The HP T630's Realtek ALC255. One coefficient at probe, the same `alc_fill_eapd_coef` gives it:
     // 0x10 bit 9 clear. Its other ALC255 tables are the headset jack's.
-    Playable { vendor: 0x10ec, device: Some(0x0255), coefs: &[(0x10, 1 << 9, 0)] },
+    Playable { vendor: 0x10ec, device: Some(0x0255), coefs: &[(0x10, 1 << 9, 0)], init: Some(alc256_init) },
     // The Dell Wyse 5070's Realtek. The three coefficients are what Linux sets for this codec at probe,
     // before anything plays (`alc_fill_eapd_coef`, sound/pci/hda/patch_realtek.c, 6.12). What each bit
     // does is not documented there; they are the silicon's want, not our design (CLAUDE.md 26.14).
-    Playable { vendor: 0x10ec, device: Some(0x0225), coefs: &[(0x67, 0xF000, 0x3000), (0x36, 1 << 13, 0), (0x10, 1 << 9, 0)] },
+    Playable { vendor: 0x10ec, device: Some(0x0225), coefs: &[(0x67, 0xF000, 0x3000), (0x36, 1 << 13, 0), (0x10, 1 << 9, 0)], init: None },
 ];
 
 fn playable(vendor: u32, device: u32) -> Option<&'static Playable> {
@@ -681,30 +686,54 @@ fn power_up(h: &mut Hda, cad: u32, nid: u32) -> bool {
 /// Set the codec's processing coefficients, each read back so the log says what it was and what it
 /// became. False when the codec did not answer one of them.
 fn set_coefs(h: &mut Hda, cad: u32, coefs: &[(u32, u32, u32)]) -> bool {
-    let n = REALTEK_COEF_NODE;
-    for &(idx, mask, bits) in coefs {
-        let before = h.verb16(cad, n, SET_COEF_INDEX, idx).and_then(|_| h.verb16(cad, n, GET_PROC_COEF, 0));
-        let Some(before) = before else {
-            h.ctx.log_fmt(format_args!("audio-driver: codec {} coefficient {:#04x} did not answer", cad, idx));
-            return false;
-        };
-        let want = (before & 0xFFFF & !mask) | bits;
-        let after = h.verb16(cad, n, SET_COEF_INDEX, idx)
-            .and_then(|_| h.verb16(cad, n, SET_PROC_COEF, want))
-            .and_then(|_| h.verb16(cad, n, SET_COEF_INDEX, idx))
-            .and_then(|_| h.verb16(cad, n, GET_PROC_COEF, 0));
-        h.ctx.log_fmt(format_args!(
-            "audio-driver: codec {} coefficient {:#04x}: {:#06x} -> {:#06x}, read back {}",
-            cad, idx, before & 0xFFFF, want, match after {
-                Some(a) if a & 0xFFFF == want => "the same",
-                Some(_) => "DIFFERENT",
-                None => "nothing",
-            }));
-        if after.is_none() {
-            return false;
-        }
-    }
-    true
+    coefs.iter().all(|&(idx, mask, bits)| update_coef(h, cad, REALTEK_COEF_NODE, idx, mask, bits))
+}
+
+/// One Realtek processing coefficient, reached through vendor node `node` (0x20 for most; the ALC255's
+/// headphone sequence uses hidden nodes 0x57 and 0x53 too): the bits under `mask` become `bits`, the
+/// rest are kept, and it is read back so the log says what it was and what it became. False when the
+/// codec did not answer.
+fn update_coef(h: &mut Hda, cad: u32, node: u32, idx: u32, mask: u32, bits: u32) -> bool {
+    let before = h.verb16(cad, node, SET_COEF_INDEX, idx).and_then(|_| h.verb16(cad, node, GET_PROC_COEF, 0));
+    let Some(before) = before else {
+        h.ctx.log_fmt(format_args!("audio-driver: codec {} node {:#04x} coefficient {:#04x} did not answer", cad, node, idx));
+        return false;
+    };
+    let want = (before & 0xFFFF & !mask) | bits;
+    let after = h.verb16(cad, node, SET_COEF_INDEX, idx)
+        .and_then(|_| h.verb16(cad, node, SET_PROC_COEF, want))
+        .and_then(|_| h.verb16(cad, node, SET_COEF_INDEX, idx))
+        .and_then(|_| h.verb16(cad, node, GET_PROC_COEF, 0));
+    h.ctx.log_fmt(format_args!(
+        "audio-driver: codec {} node {:#04x} coefficient {:#04x}: {:#06x} -> {:#06x}, read back {}{:#06x}",
+        cad, node, idx, before & 0xFFFF, want, match after {
+            Some(a) if a & 0xFFFF == want => "the same, ",
+            Some(_) => "DIFFERENT, ",
+            None => "nothing, ",
+        }, after.map_or(0, |a| a & 0xFFFF)));
+    after.is_some()
+}
+
+/// The ALC255's bring-up, as Linux's `alc256_init` does it (patch_realtek.c, 6.12; the ALC255 is given
+/// the ALC256's): the headphone amplifier taken to low power, the headphone pin muted and enabled as an
+/// output, coefficient 0x46 bits 13:12 cleared, the amplifier taken to high power, a bit on hidden node
+/// 0x53 pulsed, and coefficient 0x36 written whole. Linux waits 85 and 100 ms only when a headphone is
+/// plugged in; this waits always, which costs a fifth of a second at bring-up and nothing else. What each
+/// coefficient means is not documented there - the silicon's want, not our design (CLAUDE.md 26.14).
+fn alc256_init(h: &mut Hda, cad: u32) -> bool {
+    const HP: u32 = 0x21;
+    let ctx = h.ctx;
+    delay::hold(ctx, Budget::ms(30));
+    if !update_coef(h, cad, 0x57, 0x04, 0x0007, 0x1) { return false; } // low power
+    let _ = h.verb16(cad, HP, SET_AMP_GAIN_MUTE, AMP_OUT_LR_UNMUTED | AMP_MUTE);
+    delay::hold(ctx, Budget::ms(85));
+    let _ = h.verb(cad, HP, SET_PIN_WIDGET_CONTROL, PIN_OUT_EN);
+    delay::hold(ctx, Budget::ms(100));
+    update_coef(h, cad, REALTEK_COEF_NODE, 0x46, 3 << 12, 0)
+        && update_coef(h, cad, 0x57, 0x04, 0x0007, 0x4) // high power
+        && update_coef(h, cad, 0x53, 0x02, 0x8000, 0x8000)
+        && update_coef(h, cad, 0x53, 0x02, 0x8000, 0)
+        && update_coef(h, cad, REALTEK_COEF_NODE, 0x36, 0xFFFF, 0x5757)
 }
 
 /// A mixer's input amplifiers: the one from `from` unmuted at 0 dB, every other muted, then the first read
@@ -782,7 +811,10 @@ fn configure_path(h: &mut Hda, p: &OutPath) -> bool {
         }
     }
     let pin = p.nodes[0];
-    let _ = h.verb(cad, pin, SET_PIN_WIDGET_CONTROL, PIN_OUT_EN);
+    // A headphone pin that can drive headphones gets its headphone amplifier as well, as Linux gives it
+    // (its PIN_HP value, 0xc0); without it the T630's ALC255 headphone jack is a line-level output into headphones.
+    let hp = p.dev == 0x2 && matches!(h.param(cad, pin, PARAM_PIN_CAP), Some(pc) if pc & PINCAP_HP_DRIVE != 0);
+    let _ = h.verb(cad, pin, SET_PIN_WIDGET_CONTROL, PIN_OUT_EN | if hp { PIN_HP_EN } else { 0 });
     if matches!(h.param(cad, pin, PARAM_PIN_CAP), Some(pc) if pc & PINCAP_EAPD != 0) {
         let _ = h.verb(cad, pin, SET_EAPD_BTLENABLE, EAPD_ON);
     }
@@ -1049,8 +1081,11 @@ impl<'a> Player<'a> {
                 return wire::CONTRADICTED;
             }
             // A link reset resets the codec, and its coefficients with it.
-            let coefs = playable(self.path.vendor, self.path.device).map_or(&[][..], |p| p.coefs);
-            if !set_coefs(&mut self.h, self.path.cad, coefs) {
+            let known = playable(self.path.vendor, self.path.device);
+            let coefs = known.map_or(&[][..], |p| p.coefs);
+            if !set_coefs(&mut self.h, self.path.cad, coefs)
+                || !known.and_then(|p| p.init).map_or(true, |f| f(&mut self.h, self.path.cad))
+            {
                 return wire::CONTRADICTED;
             }
         }
@@ -1946,7 +1981,7 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
             return Device::Surveyed(wire::no_device::BRINGUP_FAILED, h, path);
         }
     }
-    if !set_coefs(&mut h, path.cad, known.coefs) {
+    if !set_coefs(&mut h, path.cad, known.coefs) || !known.init.map_or(true, |f| f(&mut h, path.cad)) {
         return Device::Surveyed(wire::no_device::BRINGUP_FAILED, h, path);
     }
     if !configure_path(&mut h, &path) {

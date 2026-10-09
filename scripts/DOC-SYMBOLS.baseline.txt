@@ -85,3 +85,4 @@ rtl8xxxu_disconnect                # docs/wifi-usb.md - Linux rtl8xxxu core.c, E
 alc225_init                        # docs/audio.md - Linux patch_realtek.c, EXTERNAL; the ALC225 headphone sequence A6's first image deliberately does not do
 bxt_reduce_dma_latency             # docs/audio.md - Linux hda_intel.c, EXTERNAL; the Apollo Lake DMA quirk A6 checked does not apply to Gemini Lake
 ATI_SB450_HDAUDIO_ENABLE_SNOOP     # docs/audio.md - Linux hda_intel.c, EXTERNAL; the AMD Azalia snoop bit at config 0x42 the T630 card read already set
+ALC256_FIXUP_HP_HEADSET_MIC        # docs/audio.md - Linux patch_realtek.c, EXTERNAL; the one quirk Linux applies to the T630 (103c:8158), headset-jack detection only

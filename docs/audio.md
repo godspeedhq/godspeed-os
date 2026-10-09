@@ -1355,3 +1355,40 @@ node 0x14`; `audio tone 440` HEARD from the T630's speaker; `audio debug codec` 
 Falsified by: a mixer line (`mixer 0x0c input 0 ... reads`), which says the amplifier would not unmute; or
 `ready` with the link position moving and silence, which points past the mixer at the pin or the speaker
 amplifier; or underruns, which would be the 10 ms polling, not the codec.
+
+## Step A6 on the T630: silent, and the third image (2026-10-09)
+
+**The second image was silent, on the speaker pin and on headphones.** Everything it predicted in the
+log held - the coefficient read back, `ready ... refills by polling`, `node 0x02 has no mute - muting on
+node 0x14`, no mixer line - and four 5-second tones each `played ... in 5003 ms by the clock, 0
+underrun(s)`. Nothing was heard. Three things this does and does not say:
+
+- **The 0 underruns prove less here than on the Wyse.** This controller has no interrupt, so the count
+  is the driver's clock against its own refills; it does not show the controller fetched a sample. The
+  link position during a tone (`audio debug stream`) is what shows that, and it was not read.
+- **The headphones could not have worked.** The driver plays through the first path the survey finds,
+  the speaker pin 0x14; the headphone jack is pin 0x21 and is reached by `audio output headphone`.
+- **Whether the T630 has an internal speaker is not known here.** The pin's default configuration says
+  fixed speaker (`0x90170110`), which is what the firmware claims, not proof one is fitted.
+
+**Linux has no speaker quirk for this board.** Its subsystem id is `103c:8158`, and Linux's one entry for
+it (`ALC256_FIXUP_HP_HEADSET_MIC`) only restarts headset-jack detection. What Linux DOES do for every
+ALC255 is `alc256_init`, the headphone amplifier's power-up, and `PIN_HP` (0xc0) on a pin that can drive
+headphones. Neither was done here.
+
+**The third image, one concern: the ALC255's headphone output as Linux brings it up.** `PLAYABLE` rows can
+carry a codec's own bring-up, and the ALC255's is `alc256_init`: node 0x57 coefficient 0x04 to low power,
+the headphone pin muted and enabled as an output, coefficient 0x46 bits 13:12 cleared, 0x57/0x04 to high
+power, node 0x53 coefficient 0x02 bit 15 pulsed, coefficient 0x36 written as 0x5757 - each read back and
+logged. Coefficients can now be on any vendor node, not only 0x20. A headphone pin that can drive
+headphones is enabled with its headphone amplifier (0xc0 rather than 0x40), on any codec.
+
+**Prediction:** each coefficient line `read back the same`, then `ready`. After `audio output headphone`,
+`audio debug codec` shows pin 0x21 `control 0xc0 <- playing`, and `audio tone 440` is HEARD in the
+headphones. During a tone, `audio debug stream` shows the link position moving.
+
+**What would falsify it, and what each says:** a coefficient `DIFFERENT` or `did not answer` - the hidden
+nodes are not where Linux has them on this part, and bring-up stops there. Silence with the position NOT
+moving - the stream is not running, so the codec was never the question: the controller (and its missing
+interrupt, or the IOMMU) is. Silence with the position moving - the samples reach the codec and are lost
+inside it, which leaves the converter's stream tag and format, read in `audio debug codec`.
