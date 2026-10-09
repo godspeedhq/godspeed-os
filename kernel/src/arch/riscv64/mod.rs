@@ -3271,6 +3271,10 @@ pub mod pci {
     /// A BAR's low bits are type flags, not address: bit 0 selects I/O versus memory, bits 2:1 give
     /// the width. Returning the raw register would hand a driver an address a few bytes off, which
     /// maps and then fails in a way that looks like a broken device.
+    /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
+    /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
+    /// backlog/80 K1).
+    pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(d: &PciDevice) -> u64 {
         let mut i = 0;
         while i < 6 {

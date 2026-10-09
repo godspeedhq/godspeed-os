@@ -504,6 +504,10 @@ pub mod pci {
 
     pub fn xhci() -> Option<PciDevice> { None }
     pub fn nic() -> Option<PciDevice> { None }
+    /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
+    /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
+    /// backlog/80 K1).
+    pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
     pub fn init() {}
     pub fn clear_bus_master(bdf: u32) {}

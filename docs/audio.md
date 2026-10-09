@@ -1298,3 +1298,25 @@ another; QEMU caught exactly that the first time the suite ran with two.
 00:08.0 (`BDF 0x0040 supplied for class 0x040300, the first of that class is 0x0031 - the supplied one is
 granted`), finds QEMU's codec, plays into the WAV, and `audio hardware` shows the decoy `not driven`: 69
 checks, all passing. The two controllers' registers are 16 KiB apart there, which is K1 in miniature.
+
+## Step A6 on the T630, K1: the window is the BAR (2026-10-09)
+
+**Worse than recorded.** "Found while preparing", 1, said the T630's audio window covers the HDMI audio
+controller. Its BAR is at `0xfeb60000` and the window was 64 KiB, so it also reached `xhci`
+(`0xfeb68000`), EHCI (`0xfeb6c000`) and the AHCI disk controller (`0xfeb6d000`) - and each of those
+drivers' windows reached the ones above it.
+
+**The fix.** x86 `pci::bar_len` measures a memory BAR when it is first granted - memory decode off, all
+ones written, the mask read back, BAR and decode restored, the whole sequence under the configuration
+lock so no other reader sees the mask - and caches it. The window is the BAR: whole pages mapped, the
+`Mmio` length the BAR's exact size, so `Mmio`'s bounds check stops a driver at its device's last byte
+even inside a shared page. At most 16 MiB per grant. Sizing happens at grant time and never at the boot
+scan, where it would turn off a display controller's decode under the boot console.
+
+**What is not fixed.** Only x86 measures. The other ports answer 0 and keep the fixed 64 KiB window,
+and the spawn line says so; the Pi 4's and the VisionFive's `xhci` are PCIe devices this leaves as they
+were.
+
+**QEMU.** `audio-driver` 16384 bytes, `block-driver` (AHCI) 4096, `nic-driver` (e1000) 131072 - the
+e1000's window GREW, because its BAR is 128 KiB and the fixed window had been half of it. The audio suite:
+69 checks, all passing.

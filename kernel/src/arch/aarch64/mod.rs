@@ -3278,6 +3278,10 @@ pub mod pci {
     /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it
     /// next looking for the table that does exist twenty lines below.)
     pub fn nic() -> Option<PciDevice> { None }
+    /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
+    /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
+    /// backlog/80 K1).
+    pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
 
     // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.

@@ -15,6 +15,13 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   `kernel/src/task/mod.rs` (`XHCI_MMIO_PAGES`, the PCI grant). On the T630 the audio grant then also
   covers the HDMI audio controller at `0xfeb64000`: authority beyond what the grant names (CLAUDE.md 3.1).
   Fix: size the window from the BAR.
+  **FIXED in QEMU on `feat/audio-finish`, 2026-10-09, x86 only; T630 card pending.** It was worse than this
+  says: on the T630 the audio BAR at `0xfeb60000` plus 64 KiB reaches the HDMI audio (`0xfeb64000`), `xhci`
+  (`0xfeb68000`), EHCI (`0xfeb6c000`) and AHCI (`0xfeb6d000`). x86 `pci::bar_len` sizes a memory BAR at grant
+  time (the standard probe, under the config lock) and the window is the BAR, its pages whole and the `Mmio`
+  length exact; at most 16 MiB. The other six ports answer 0 and keep the fixed window, said at spawn - the
+  Pi 4's and VisionFive's PCIe `xhci` among them, which is the part left open. QEMU: audio 16 KiB, AHCI 4 KiB,
+  e1000 128 KiB (wider than before: its BAR is twice the old window).
 - **K2. The T630's `audio-driver` is probably bound to the HDMI audio controller, not the analog codec.**
   `kernel/src/arch/x86_64/pci.rs` `find_by_class` returns the FIRST device of a class; the 2026-10-08 log
   shows 00:01.1 (HDMI) confined, not 00:09.2 (Azalia). Fix: finish step D3, so a supplied BDF selects the

@@ -148,6 +148,9 @@ pub const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
 pub const XHCI_MMIO_VA:    u64 = 0x1_0000_0000;
 /// Pages of MMIO to map for the xHCI BAR (64 KiB - cap/op/runtime/doorbell regs).
 const XHCI_MMIO_PAGES:     u64 = 16;
+/// The most of one BAR a single grant maps: 16 MiB, so a device with a huge BAR (a GPU's aperture) costs a
+/// bounded number of page-table frames (26.6). Every driver here has a BAR well under it.
+const MMIO_WINDOW_MAX:     u64 = 16 * 1024 * 1024;
 
 /// Master switch for IOMMU confinement of the USB drivers (H1).
 ///
@@ -536,6 +539,19 @@ impl HwClass {
     /// supplied BDF chose only the bus mastering and the confinement while the window, arena and vector
     /// came from the first device of the class - so on the T630 `audio-driver` was granted the HDMI audio
     /// controller's registers whatever it was told (docs/audio.md, "Found while preparing", 2).
+    /// The bus device behind `mmio_bar`, for sizing its window: the one `pci_dev` resolves for a class
+    /// request, the scan's for the three legacy names. `None` for anything not on a bus.
+    fn bar_device(self) -> Option<crate::arch::imp::pci::PciDevice> {
+        use crate::arch::imp::pci;
+        match self {
+            HwClass::Pci { .. } => self.pci_dev(),
+            HwClass::Xhci => pci::xhci(),
+            HwClass::Ehci => pci::ehci(),
+            HwClass::Nic => pci::nic(),
+            _ => None,
+        }
+    }
+
     fn pci_dev(self) -> Option<crate::arch::imp::pci::PciDevice> {
         use crate::arch::imp::pci;
         let HwClass::Pci { class_code, bdf, .. } = self else { return None };
@@ -2193,14 +2209,36 @@ fn spawn_service_with_image(
                 | PageFlags::NO_EXEC
                 | PageFlags::PCD
                 | PageFlags::PWT;
-            for i in 0..XHCI_MMIO_PAGES {
+            // THE WINDOW IS THE BAR, sized by the arch (backlog/80 K1). It was a fixed 64 KiB whatever
+            // the device had, and on the T630 the audio controller's 64 KiB reached the HDMI audio,
+            // `xhci`, EHCI and AHCI registers - authority the grant never named (CLAUDE.md 3.1). The
+            // pages mapped are whole; the length the driver's `Mmio` is given is the BAR's own, and
+            // `Mmio` checks every access against it, so a sub-page BAR is not widened to the page. A port
+            // that cannot measure a BAR answers 0 and keeps the fixed window, said in the line below.
+            let measured = hw.bar_device()
+                .and_then(|d| d.bar.iter().position(|&b| b == bar).map(|ix| crate::arch::imp::pci::bar_len(&d, ix)))
+                .unwrap_or(0);
+            let len = match measured {
+                0 => XHCI_MMIO_PAGES * PAGE_SIZE as u64,
+                n => n.min(MMIO_WINDOW_MAX),
+            };
+            for i in 0..len.div_ceil(PAGE_SIZE as u64) {
                 let off = i * PAGE_SIZE as u64;
                 page_table
                     .map(VirtAddr(XHCI_MMIO_VA + off), PhysAddr(bar + off), mmio_flags)
                     .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
             }
-            crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
-            (XHCI_MMIO_VA, XHCI_MMIO_PAGES * PAGE_SIZE as u64)
+            match measured {
+                0 => crate::kprintln!(
+                    "spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}, {} bytes - the BAR's size is not measured on this port, so the fixed window",
+                    name, bar, XHCI_MMIO_VA, len),
+                n if n > len => crate::kprintln!(
+                    "spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}, the first {} of its {} bytes - the most one grant maps",
+                    name, bar, XHCI_MMIO_VA, len, n),
+                _ => crate::kprintln!(
+                    "spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}, {} bytes, the BAR's own size", name, bar, XHCI_MMIO_VA, len),
+            }
+            (XHCI_MMIO_VA, len)
         } else if hw == HwClass::Framebuffer {
             // The display's framebuffer, for the task that asked for the FRAMEBUFFER kind - the `console`
             // service in practice (docs/console-service.md 9).
