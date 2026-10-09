@@ -15,7 +15,7 @@ handed the producer at composition time.
 ## What it demonstrates
 
 - A producer sends each line as an IPC `Message` over `send_peers[0]` - the SEND cap the
-  **shell** delegated to it at spawn (`ctx.send_peer_at(0)`).
+  **shell** delegated to it at spawn (`gs::ipc::peer_at(&ctx, 0)`).
 - It ends the stream with a one-byte EOT marker (`0x04`) so a sink knows the stream is done
   without waiting forever (a byte says what it means; an empty message was not even delivered on
   three ports until 2026-10-08).
@@ -42,7 +42,7 @@ handed the producer at composition time.
 `log_write` and - the lesson - no send peers** (no `ipc_send`). A producer that declared a fixed
 peer would hold standing authority to reach it (a small violation of VII). Instead the shell
 delegates the SEND cap dynamically at spawn, installed as `send_peers[0]` (reached via
-`ctx.send_peer_at(0)`); authority is granted at composition time, never held. `log_write` is itself
+`gs::ipc::peer_at(&ctx, 0)`); authority is granted at composition time, never held. `log_write` is itself
 a v1 default minted to every service - the contract lists it for clarity and consistency. Every
 service should have a contract (CLAUDE.md §13), so a minimal contract is the conformant, clearer way
 to teach "no standing send authority": the contract is *present*, and it pointedly grants nothing to
@@ -51,7 +51,7 @@ send with.
 ## What you must NOT do
 
 - **Do not assume a global `stdout`/`stdin`.** There is none (breaks **VI**/**VII**). Send only
-  over the delegated cap (`ctx.send_peer_at(0)`); if it is `None`, you were not wired to a sink.
+  over the delegated cap (`gs::ipc::peer_at(&ctx, 0)`); if it is `None`, you were not wired to a sink.
 - **Do not hardcode the consumer** (for example, look up "upper" by name and send to it). That is
   held authority and invisible coupling (breaks **VII**/**VI**). Let the shell broker the link.
 - **Do not skip the EOT marker.** A sink that drains until EOT would hang forever otherwise.
@@ -59,7 +59,7 @@ send with.
 ## How to adapt this
 
 To write your own producer (a log tailer, a sensor reader, a generator): build each chunk as a
-`Message`, send it over `ctx.send_peer_at(0)`, and finish with the `0x04` EOT byte. Keep buffers
+`Message`, send it over `gs::ipc::peer_at(&ctx, 0)`, and finish with the `0x04` EOT byte. Keep buffers
 fixed-size and `no_std` (Commandment-adjacent: bounded behaviour, CLAUDE.md §26.6). Declare only
 `log_write`; let the shell grant the pipe cap.
 

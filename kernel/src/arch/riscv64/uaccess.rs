@@ -25,6 +25,11 @@
 //! and this port adopts it when it has a scheduler to kill into. Recorded rather than glossed
 //! (§26.7), because a walk that looks like validation and is really a race is worse than neither.
 //!
+//! (2026-10-09: "no kill path yet" and "when it has a scheduler" are out of date - the scheduler runs
+//! and `trap.rs` kills a task for a fault taken in USER mode. What is still true is the point that
+//! matters here: a fault during one of these copies is taken in S-mode, and `trap.rs` halts on an
+//! S-mode fault, so the walk-first design and its multi-hart TOCTOU gap both still stand.)
+//!
 //! **`USER_END` is an Sv39 fact, not an x86 one.** The stub this replaces carried x86's
 //! `0x0000_8000_0000_0000`, which would have accepted addresses in the hole Sv39 leaves between its
 //! two halves - a range no access can reach, so a "validated" pointer there would fault on use.

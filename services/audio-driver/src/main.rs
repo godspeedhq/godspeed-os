@@ -82,8 +82,9 @@ const RING_RUN: u8 = 1 << 1; // CORBCTL.CORBRUN and RIRBCTL.RIRBDMAEN are both b
 /// RIRBCTL.RINTCTL: raise the response status every RINTCNT responses. NOT optional in practice: the
 /// controller stops taking commands from the CORB once RINTCNT responses are outstanding, until software
 /// clears that status - and the status is only ever set with this bit on. A2 shipped without it and
-/// QEMU answered one command and then nothing. Linux sets it (with RINTCNT 1). The CPU interrupt is a
-/// separate enable (INTCTL), left off: the driver still polls.
+/// QEMU answered one command and then nothing. Linux sets it (with RINTCNT 1). The CPU interrupt for it
+/// is a separate enable (INTCTL.CIE), left off: the driver polls the RIRB for responses. (Only the
+/// output stream's interrupt is enabled, in `run_stream`.)
 const RIRB_RINTCTL: u8 = 1 << 0;
 const CORBRP_RST: u16 = 1 << 15;
 const RIRBWP_RST: u16 = 1 << 15;

@@ -2,6 +2,8 @@
 
 **Opened:** 2026-09-24
 **Status:** OPEN - one instance PROVEN (`backlog/48`), the class audited, no fix attempted.
+*(2026-10-09: the PROVEN instance is fixed - `backlog/48` closed 2026-09-25 by deleting the kill-path
+panic. The other four were not re-checked for this note.)*
 **Raised by:** the operator, ruling on `backlog/48`: *"Nothing above the kernel should have influence
 to panic or wedge the kernel. Nothing. If the kernel panics it'll be because of the logic inside the
 kernel itself."*

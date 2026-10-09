@@ -26,9 +26,10 @@ Userspace issues **`svc #0`**. The register convention (matched by the SDK's `ra
   takes `u32`s (one register each) and widens. Every current syscall arg - pointer, handle, cap slot,
   length - genuinely fits in 32 bits on this arch, so the widening is loss-free **for those**.
 - **The one exception: a value that can exceed 32 bits.** A `recv_timeout` in generic-timer ticks can
-  (u32::MAX ticks is ~68 s at the Pi 2's ~62.5 MHz CNTFRQ). Such an arg is **truncated** by the single-
-  register ABI, so its SDK wrapper must **pre-clamp it on ARM** before the syscall (`recv_timeout`
-  saturates to `[1, u32::MAX]`; a genuine 0 = block-forever is preserved). **Any new syscall passing a
+  (u32::MAX ticks is ~68 s under QEMU `raspi2b`, whose counter runs at 62.5 MHz, and ~71 min on a real
+  Pi 2, whose counter the firmware prescales to 1 MHz - `timer.rs`). Such an arg is **truncated** by the
+  single-register ABI, so its SDK wrapper must **pre-clamp it** before the syscall (`abi_timeout` in
+  `sdk/rust/src/ipc.rs` saturates to `[1, u32::MAX]`; a genuine 0 = block-forever is preserved). **Any new syscall passing a
   wider-than-u32 value on ARM must do the same** (clamp in the wrapper, or split into a register pair).
   This is userspace-audit A-U1 - the class of bug to watch for on a 32-bit ABI.
 - The `i64` result returns in `r0:r1` (low:high), sign-extended, so negative error codes reconstruct
@@ -38,10 +39,12 @@ Userspace issues **`svc #0`**. The register convention (matched by the SDK's `ra
 
 `_start` (Pi firmware enters in HYP when a device tree is loaded) `eret`s down to SVC, sets up a stack,
 and calls `arm_boot_main` (`mod.rs`). That runs the machine bring-up (MMU short-descriptor tables,
-exception vectors at `VBAR`, generic timer, PL011, frame allocator, DWC2 probe) + boot selftests, then
-dispatches to **one** boot path selected by a cargo feature: `arm-supervisor` (the real OS: kernel spawns
-the supervisor, which spawns events + shell + ping/pong) or `arm-shell` (kernel spawns events + shell
-directly). The shipping build is `arm-supervisor` with the supervisor's `bare-metal` feature (clean
+exception vectors at `VBAR`, generic timer, PL011, frame allocator, the VideoCore mailbox requests for
+the framebuffer and the USB/SD power domains) + boot selftests, then dispatches to **one** boot path
+selected by a cargo feature: `arm-supervisor` (the real OS: the kernel spawns the supervisor, which
+spawns everything else), or one of the bring-up demos `arm-sched-demo` / `arm-sched-ipc`. (An
+`arm-shell` path, in which the kernel spawned services by name, is gone; the kernel spawns only the
+supervisor.) The shipping build is `arm-supervisor` with the supervisor's `bare-metal` feature (clean
 `gsh>` prompt). `docs/arm32-status.md` has the build/run commands.
 
 > **The cr3/TTBR0-seed rule (every boot path):** mask IRQs (`irq::disable_interrupts()`) **before**
@@ -77,8 +80,9 @@ what the silicon wants, throw away the OS integration.
 
 - **SEC-25 (task-slot publication ordering): DONE** - the scheduler writes data before the `TASK_VALID`
   Release flag and reads it Acquire.
-- **SEC-26/27 (TLB flush on address-space switch): DONE** - `switch_context` writes TTBR0 then
-  `TLBIALL`+`dsb`+`isb`. Note `invalidate_tlb_page` is **local** (`TLBIMVA`), correct for pinned per-task
+- **SEC-26/27 (TLB flush on address-space switch): DONE** - on an address-space change `switch_context`
+  does `dsb`, writes TTBR0, `isb`, then `TLBIALL`+`dsb`+`isb` (`context_switch.rs` says why each barrier
+  is there). Note `invalidate_tlb_page` is **local** (`TLBIMVA`), correct for pinned per-task
   address spaces; a future cross-core unmap would need the inner-shareable variant.
 - **SEC-28 (DMA cache coherence): ANSWERED, by mapping.** The A7's DMA is **not** cache-coherent, so a
   driver that DMAs must either map its arena **non-cacheable** or bracket every transfer with cache
@@ -93,7 +97,9 @@ what the silicon wants, throw away the OS integration.
 
 - **Build the usable OS in `--release`.** Debug (unoptimized) shell pipe frames (~600 KiB) exceed the
   256 KiB user stack and fault the shell (it recovers via supervisor restart); release frames fit.
-- **No RTC on the Pi 2** (QEMU raspi2b emulates none) - `date`/`uptime` read zeros. Not a bug.
+- **No RTC on the Pi 2** (QEMU raspi2b emulates none) - the wall clock reads zero until the `time`
+  service sets it over SNTP (which needs the network up). Not a bug. Uptime comes from the counter and
+  is unaffected.
 - **Serial console: 115200 8N1** on the Pi's PL011 (GPIO14/15), same as x86.
 - **DWC2 register lessons** (halt-all-channels at init, `FSLSPClkSel=0` for the HS PHY, HPRT write-1-to-
   disable trap) are in the `services/dwc2` comments + git log - the kind of hard-won quirk the doctrine says to

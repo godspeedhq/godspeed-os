@@ -90,9 +90,10 @@ brought with it - the kind of drift `scripts/facts_check.py` exists to catch.)*
 
 ## Escaping it
 
-`q`, `Q` or ESC aborts the wait and returns to the prompt, and `(q to quit)` is advertised once the
-wait lingers past about two seconds. A transaction that gets no answer at all gives up after 20
-seconds with `net-stack did not answer within 20s`.
+`q`, `Q` or ESC aborts the wait and returns to the prompt (`tcp: aborted`), and `[q] quit` is
+advertised once the wait lingers past about two seconds (`gs::net::Net::with_notice`). A transaction
+that gets no answer at all gives up after 20 seconds (`gs::net::TCP_SECS`) with `tcp: net-stack did
+not answer within 20s - see its log`.
 
 **This was not always true, and its absence cost a power cycle.** The request used a bare
 `request_with_reply`, which parks the shell inside the syscall where it cannot read the keyboard - so
@@ -105,6 +106,8 @@ issued immediately after an abort can wait behind the one you abandoned.
 
 ## Conventions
 
-Obeys `utilities/0_conventions.md`: `tcp help` prints usage, arguments are words rather than flags,
-and the command reports raw facts without editorialising. Its arguments are an address and a port,
+Obeys most of `utilities/0_conventions.md`: arguments are words rather than flags, and the command
+reports raw facts without editorialising. `tcp help` prints a one-line usage from `cmd_tcp` itself,
+not a versioned `help_block`: `tcp` is not in the shell's `UTILS` list, so `tcp version` prints that
+usage instead of a version - rules 5 and 6 unmet, a code defect. Its arguments are an address and a port,
 never a path, so it is in the shell's `NO_PATH_CMDS` (rule 9). Rule 10: the wait is `q`-escapable.

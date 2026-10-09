@@ -109,11 +109,13 @@ impl<'f, 'a: 'f> File<'f, 'a> {
         File { fs, ctx, cap, right, held: Held::new(), closed: false }
     }
 
-    /// The rights this capability actually carries.
+    /// The rights you ASKED [`Fs::open`](crate::fs::Fs::open) for.
     ///
-    /// May be NARROWER than you asked for: `fs` refuses a writable capability to a sealed file and
-    /// hands back a read-only one rather than minting a cap it cannot honour (7.3 - rights narrow).
-    /// Check this rather than assuming the open succeeded on your terms.
+    /// **Not necessarily what the capability carries (known defect, 2026-10-09).** `fs` refuses a
+    /// writable capability to a sealed file and hands back a read-only one rather than minting a
+    /// cap it cannot honour (7.3 - rights narrow), but `open` records the mask it sent, not what
+    /// came back, so this does not show the narrowing. A write through a narrowed capability is
+    /// refused by the kernel with [`Error::PermissionDenied`].
     pub fn rights(&self) -> u8 {
         self.right
     }
@@ -139,7 +141,8 @@ impl<'f, 'a: 'f> File<'f, 'a> {
     ///
     /// # Errors
     /// - [`Error::PermissionDenied`] - this capability does not carry `READ`.
-    /// - [`Error::NotFound`] - the file was deleted; the capability has been revoked.
+    /// - [`Error::Revoked`] - the file was deleted or closed, or `fs` restarted: the capability is
+    ///   finished, and the answer is to re-open rather than to retry.
     /// - A read changes nothing, so every no-answer error here is safe to retry.
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let want = buf.len().min(IO_CHUNK);
@@ -169,7 +172,9 @@ impl<'f, 'a: 'f> File<'f, 'a> {
     ///
     /// # Errors
     /// - [`Error::PermissionDenied`] - no `WRITE`, or an `APPEND`-only capability was asked to write
-    ///   back over bytes it had already written.
+    ///   below the furthest offset it has already written.
+    /// - [`Error::Failed`] - `offset` is not a multiple of 508, or the write runs past the file's
+    ///   extent; as for [`Fs::write_at`](crate::fs::Fs::write_at), `fs` does not grow a file here.
     /// - [`Error::InvalidInput`] - more than [`IO_CHUNK`] bytes in one call. **Nothing is written**;
     ///   split it rather than assuming a partial write happened.
     /// - **A write MUTATES.** Do not retry on [`Error::OutcomeUnknown`] without first reading back
@@ -204,6 +209,12 @@ impl<'f, 'a: 'f> File<'f, 'a> {
     /// Consumes the handle, and returns what the service said. Dropping a `File` without calling
     /// this also closes it, but a `Drop` cannot report a failure - so close explicitly wherever the
     /// outcome matters.
+    ///
+    /// **Known defect (2026-10-09):** the close is invoked under the mask [`rights`](File::rights)
+    /// reports, which the kernel checks against the capability. Where the two differ - an
+    /// [`APPEND`](crate::cap::APPEND)-only open (the APPEND bit is never in the minted capability),
+    /// or a sealed file narrowed to read-only - the kernel refuses the close with
+    /// [`Error::PermissionDenied`], `fs` never hears it, and its open-file slot stays taken.
     pub fn close(mut self) -> Result<(), Error> {
         self.close_inner()
     }

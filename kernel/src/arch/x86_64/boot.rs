@@ -196,24 +196,22 @@ static TSC_TICKS_PER_QUANTUM: AtomicU64 = AtomicU64::new(0);
 static PERIODIC_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
-// Diagnostic exception flags - set as the very first action inside each
-// exception stub, before any serial output that might stall with IF=0.
-// Reported by timer ISR ticks 10/11/12 on whichever cores are still alive.
+// Diagnostic exception flags - set early inside each exception stub, before
+// any serial output that might stall with IF=0. NOTHING READS THEM today: the
+// timer-tick reports (ticks 10/11/12) that once printed them are gone, so they
+// are visible only to a debugger or a memory dump.
 // ---------------------------------------------------------------------------
 
-/// Set (to 1) by the `exception_halt` stub before `cli`.
-/// Tick 10 reports [EXC-HALT-YES/NO].
+/// Set (to 1) by the `exception_halt` stub before `cli`. Not read anywhere (see above).
 pub static EXCEPTION_HALT_REACHED: AtomicBool = AtomicBool::new(false);
 
-/// Set (to 1) by `pf_stub` as its very first instruction (before swapgs).
-/// Tick 11 reports [PF-YES/NO] and the stored CR2 value.
+/// Set (to 1) by `pf_stub` (before swapgs). Not read anywhere (see above).
 pub static PF_REACHED: AtomicBool = AtomicBool::new(false);
 
-/// CR2 at the time of the first #PF; written by `pf_stub` before swapgs.
+/// CR2 at the time of the first #PF; written by `pf_stub` before swapgs. Not read anywhere.
 pub static PF_CR2_STORED: AtomicU64 = AtomicU64::new(0);
 
-/// Set (to 1) by `gpf_stub` as its very first instruction.
-/// Tick 12 reports [GP-YES/NO].
+/// Set (to 1) by `gpf_stub`. Not read anywhere (see above).
 pub static GP_REACHED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
@@ -282,7 +280,8 @@ pub fn audit_wx() {
     // one left W+X, is covered there too (it runs after harden_hhdm_nx).
 }
 
-/// Program the local APIC timer for a ~10 ms periodic interrupt on vector 32.
+/// Program the local APIC timer for a ~10 ms tick on vector 32: TSC-Deadline one-shot where CPUID
+/// reports it and the TSC calibrated, PIT-calibrated periodic otherwise.
 /// Must be called after `memory::init` (needs HHDM offset).
 ///
 /// # Safety
@@ -371,6 +370,10 @@ pub unsafe fn init_local_apic() {
     // cycles_to_ticks conversion wrong. The periodic timer is now PIT-calibrated to a true ~10 ms
     // (see PERIODIC_TIMER_TICKS), so the two finally agree and calibrating always is the correct
     // thing rather than a hazard.
+    //
+    // (2026-10-09: the paragraph above names the T630 as the TSC-Deadline machine. Its boot log says
+    // otherwise - `apic: core 16 periodic timer, init=62386 (PIT-calibrated ~10ms)`; the machine that
+    // runs TSC-Deadline is the Wyse 5070. QEMU calibrates too now, so it is not "0" there either.)
     //
     // This also repairs what silently depended on it. `KeyRepeat::new_calibrated` derives its
     // ~600 ms initial delay and ~50 ms typematic interval from `tsc_ticks_per_10ms()`; returning 0
@@ -546,13 +549,6 @@ unsafe fn calibrate_tsc_ticks_per_10ms(lapic_id: u32) -> u64 {
     0
 }
 
-/// Measure TSC ticks per 10 ms by gating PIT channel 2 for a known 50 ms interval and counting TSC
-/// cycles across it. Portable - correct on AMD (which exposes no usable CPUID TSC frequency) and Intel
-/// alike. Returns 0 if the PIT never reaches terminal count, so the caller can fall back.
-///
-/// # Safety
-/// Ring-0 only. Interrupts disabled. Uses PIT channel 2 (data 0x42, command 0x43) and control port 0x61;
-/// channel 0 (the legacy tick) is untouched. Saves and restores 0x61.
 /// Measure the LAPIC timer against the PIT and return the periodic initial count for one ~10 ms
 /// quantum, or 0 if the measurement is unavailable or implausible (the caller then keeps the
 /// `PERIODIC_TIMER_COUNT` fallback).
@@ -613,6 +609,13 @@ unsafe fn pit_calibrate_apic_ticks_per_10ms(apic_virt: u64) -> u64 {
     per_10ms
 }
 
+/// Measure TSC ticks per 10 ms by gating PIT channel 2 for a known 50 ms interval and counting TSC
+/// cycles across it. Portable - correct on AMD (which exposes no usable CPUID TSC frequency) and Intel
+/// alike. Returns 0 if the PIT never reaches terminal count, so the caller can fall back.
+///
+/// # Safety
+/// Ring-0 only. Interrupts disabled. Uses PIT channel 2 (data 0x42, command 0x43) and control port 0x61;
+/// channel 0 (the legacy tick) is untouched. Saves and restores 0x61.
 unsafe fn pit_calibrate_tsc_ticks_per_10ms() -> u64 {
     const PIT_HZ: u64 = 1_193_182;      // i8254 input clock
     const CAL_MS: u64 = 50;             // 50 ms window = 59_659 counts, well under the 16-bit max
@@ -697,22 +700,18 @@ pub unsafe fn rearm_tsc_deadline() {
 /// and the watchdog needs no change.
 pub const IDLE_QUANTUM_MULT: u64 = 100;
 
-/// LAPIC periodic-timer initial count: the normal preemption period. ~50 ms on the AMD GX-420GI
-/// (T630), ~100 ms at 1 GHz APIC bus / 16 divider (QEMU). The APIC bus frequency is not calibrated,
-/// so the absolute period is machine-dependent - only the ratio below is under our control.
+/// LAPIC periodic-timer initial count used ONLY when PIT calibration fails (`PERIODIC_TIMER_TICKS`
+/// is 0). Uncalibrated, its period is machine-dependent: ~100 ms at a 1 GHz APIC clock / 16 divider
+/// (QEMU), ~1 s on the T630, whose APIC clock is ~100 MHz (its calibrated count is 62386 per 10 ms).
 const PERIODIC_TIMER_COUNT: u32 = 6_250_000;
 
-/// Multiplier for an IDLE core's **periodic** timer. Deliberately smaller than `IDLE_QUANTUM_MULT`
-/// because the periodic period is already far longer than a 10 ms quantum (~50 ms on the T630), so
-/// 20x lands the idle tick near ~1 s there (~2 s on QEMU) instead of an unhelpfully long ~5 s. The
-/// liveness watchdog is inactive in periodic mode (it is gated on a calibrated
-/// `TSC_TICKS_PER_QUANTUM`), so the binding constraint here is lost-wake recovery latency rather
-/// than the wedge threshold.
+/// Multiplier for an IDLE core's **periodic** timer when calibration failed and the base period is
+/// the uncalibrated `PERIODIC_TIMER_COUNT` (see `idle_timer_count`). Smaller than `IDLE_QUANTUM_MULT`
+/// because that base is already far longer than 10 ms: 20x is ~2 s on QEMU, ~20 s on the T630. The
+/// liveness watchdog is gated on a calibrated `TSC_TICKS_PER_QUANTUM`, not on the timer mode, so it is
+/// active in periodic mode whenever the TSC calibrated.
 const IDLE_PERIODIC_MULT: u32 = 20;
 
-/// The periodic-timer initial count actually in use: the PIT-calibrated ~10 ms quantum, or the
-/// fixed fallback if calibration was unavailable. Everything that reprograms the periodic timer
-/// reads this, so the idle/restore path can never disagree with what boot programmed.
 /// Initial count for a SLOWED (idle) periodic timer.
 ///
 /// When the timer is PIT-calibrated the base really is ~10 ms, so 100 quanta lands the idle tick at
@@ -729,6 +728,9 @@ fn idle_timer_count() -> u32 {
     }
 }
 
+/// The periodic-timer initial count actually in use: the PIT-calibrated ~10 ms quantum, or the
+/// fixed fallback if calibration was unavailable. Everything that reprograms the periodic timer
+/// reads this, so the idle/restore path can never disagree with what boot programmed.
 fn periodic_timer_count() -> u32 {
     let t = PERIODIC_TIMER_TICKS.load(Ordering::Relaxed);
     if t > 0 { t as u32 } else { PERIODIC_TIMER_COUNT }
@@ -900,15 +902,16 @@ fn is_intel_cpu() -> bool {
 ///   [15]  CFG_LOCK - if set, MSR is read-only (WRMSR → #GP)
 ///
 /// Writes bits[2:0]=1 (PC1 limit) if the MSR is not locked.  PC1 keeps the
-/// APIC powered; PC2+ may not.  If the MSR is locked we cannot help via this
-/// path and must fall back to TSC-Deadline timer mode (see TODO).
+/// APIC powered; PC2+ may not.  If the MSR is locked this path cannot help; the
+/// TSC-Deadline timer (selected independently, by CPUID) still fires.
 ///
-/// # Safety
-/// Ring-0 only.  Called once per core from `init_local_apic` after APIC setup.
 /// Returns whether a halted core's wake is safe from the Goldmont+ APIC power-gate: `true` if the APIC
 /// will not be power-gated (AMD has no such gate, or the Intel C-state limit was applied), `false` if it
 /// could not be applied (Intel BIOS-locked the MSR) - in which case idle cores must NOT halt (see
-/// `init_apic_timer`), or a power-gated APIC drops the wake and freezes the core.
+/// `init_local_apic`), or a power-gated APIC drops the wake and freezes the core.
+///
+/// # Safety
+/// Ring-0 only.  Called once per core from `init_local_apic` after APIC setup.
 unsafe fn limit_package_cstates(core_id: u32) -> bool {
     // MSR 0xE2 (MSR_PKG_CST_CONFIG_CONTROL) is Intel-specific.
     // On AMD processors this MSR does not exist; RDMSR/WRMSR cause #GP(0). AMD has no Goldmont+ APIC
@@ -1066,7 +1069,7 @@ pub unsafe fn broadcast_nmi_all_but_self() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Lock-free serial helpers - used in fault handlers where LOG_LOCK may
+// Lock-free serial helpers - used in fault handlers where the log ring's lock may
 // already be held (nested kprintln → deadlock with IF=0).
 // ---------------------------------------------------------------------------
 
@@ -1484,9 +1487,12 @@ pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
 /// Install ISR stubs in all 256 IDT slots, then load the IDT.
 ///
 /// - All vectors default to `exception_halt`.
-/// - Vector 13  → GPF diagnostic handler (prints error + RIP, halts).
-/// - Vector 14  → Page-fault diagnostic handler (prints CR2 + error, halts).
+/// - CPU exceptions 0-31 → the CPL-discriminating `exc_stub_noec`/`exc_stub_ec` (a ring-3 fault
+///   kills the task, a ring-0 one halts), except: 2 (NMI) → `exception_halt`, 6 (#UD) → the `ud2`
+///   syscall entry, 13 → `gpf_stub`, 14 → `pf_stub` (both also kill on ring 3 and halt on ring 0).
 /// - Vector 32  → APIC timer preemption (§9.1).
+/// - Vector 36 (COM1), the xHCI/EHCI MSI vectors and the MSI pool → their stubs; 0x80 → `int80_entry`
+///   (DPL=3); 0xFF → `spurious_stub`.
 /// - Vector 0xF0 → WAKE_RECEIVER IPI.
 /// - Vector 0xF1 → TLB_SHOOTDOWN IPI.
 /// - Vector 0xF2 → SCHEDULER_TICK IPI.
@@ -1524,8 +1530,9 @@ pub(super) unsafe fn init_idt() {
         // just set: the receiving core must HALT regardless of ring, never kill-a-task-and-continue. No
         // other NMI source exists in the kernel, so any NMI means "stop".
         idt[2]    = IdtEntry::new(halt);
-        // IDT[6] = #UD handler: used as the syscall entry on AMD GX-420GI where
-        // both SYSCALL and int $0x80 silently stall from ring-3.  DPL=0 is
+        // IDT[6] = #UD handler: THE syscall entry on every x86 machine (the SDK traps with
+        // `ud2`), chosen because on the AMD GX-420GI both SYSCALL and int $0x80 silently
+        // stall from ring-3.  DPL=0 is
         // correct - CPU exceptions bypass the DPL check, so ud2 from ring-3
         // always dispatches here; int 6 from ring-3 would #GP (intended).
         idt[6]    = IdtEntry::new(super::syscall_entry::ud2_syscall_entry as *const () as u64);
@@ -1658,7 +1665,7 @@ unsafe extern "C" fn ipi_tick_stub() {
     )
 }
 
-/// No-op: Limine sets up identity-mapped paging before calling _start.
+/// No-op: the kernel keeps the page tables Limine built (higher-half kernel + HHDM) before `_start`.
 unsafe fn init_paging(_boot_info: &BootInfo) {}
 
 // ---------------------------------------------------------------------------
@@ -1675,8 +1682,8 @@ unsafe fn init_paging(_boot_info: &BootInfo) {}
 #[unsafe(naked)]
 unsafe extern "C" fn gpf_stub() -> ! {
     // SAFETY: vector 13 pushes error_code then RIP; reads are before any RSP change.
-    // GP_REACHED is set before any other work so timer ISR on other cores can
-    // report it even if gpf_handler stalls.
+    // GP_REACHED is set early so the fact survives even if gpf_handler stalls
+    // (nothing reads it today - see the flag's declaration).
     core::arch::naked_asm!(
         // Raw 'G' to COM1 as absolute first instruction.
         "mov dx, 0x3fd",
@@ -1781,7 +1788,7 @@ unsafe extern "C" fn pf_stub() -> ! {
 
 /// Handle a #GP: a RING-3 #GP kills the offending task (the system continues, invariant 12 / §10.3);
 /// a RING-0 #GP is genuine kernel-state corruption and halts loudly (§6.2). `saved_cs` bits 1:0 are the
-/// CPL. Uses lock-free serial (the fault may have interrupted a kprintln holding LOG_LOCK), mirroring
+/// CPL. Uses lock-free serial (the fault may have interrupted a kprintln holding the log ring's lock), mirroring
 /// pf_handler.
 #[no_mangle]
 unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64, saved_cs: u64) -> ! {
@@ -1867,7 +1874,7 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
         // does not leak to the next task scheduled on this core.
         crate::arch::x86_64::syscall_entry::clear_user_copy_active(uc_core);
     }
-    // Use lock-free serial to avoid a deadlock if LOG_LOCK is already held
+    // Use lock-free serial to avoid a deadlock if the log ring's lock is already held
     // by the kprintln that was interrupted (interrupt gate: IF=0).
     // Bit 2 of error_code is the user/supervisor flag: 1 = fault from ring 3.
     // Use different prefixes so monitors can distinguish: USER PF and USER-COPY PF are
@@ -1925,13 +1932,15 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
 // Stack layout on entry:
 //   No error code: [RSP+0]=RIP  [RSP+8]=CS  [RSP+16]=RFLAGS  [RSP+24]=RSP
 //   Error code:    [RSP+0]=err  [RSP+8]=RIP [RSP+16]=CS      [RSP+24]=RFLAGS
-// The CS value (0x08=kernel, 0x28=user) identifies which layout applies.
+// The CS value identifies which layout applies: 0x08 for a kernel frame, and for a user frame
+// 0x2B (selector 0x28 with RPL 3, as `context_switch.rs` pushes it). (2026-10-09: the handler
+// below tests for 0x28, which a ring-3 frame never carries, so a user frame prints no RIP.)
 // ---------------------------------------------------------------------------
 
 #[unsafe(naked)]
 unsafe extern "C" fn exception_halt() -> ! {
-    // EXCEPTION_HALT_REACHED set BEFORE cli so timer ISR on other cores
-    // can observe the flag even though Core 0 will lose its timer after cli.
+    // EXCEPTION_HALT_REACHED set BEFORE cli (nothing reads it today - see the
+    // flag's declaration).
     core::arch::naked_asm!(
         // Raw '?' to COM1 as absolute first instruction - fires for every
         // unhandled exception vector before cli or flag-set.
@@ -1968,12 +1977,13 @@ unsafe extern "C" fn exception_halt() -> ! {
 ///
 /// # Safety
 /// Called from raw exception context (IF=0, ring-0).  Uses only lock-free
-/// serial helpers to avoid deadlocking on LOG_LOCK if the exception fired
+/// serial helpers to avoid deadlocking on the log ring's lock if the exception fired
 /// inside a `kprintln!`.
 #[no_mangle]
 unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) {
     // Identify the likely frame layout by finding the CS slot.
-    // CS is zero-extended to 64 bits on the stack: 0x08 (kernel) or 0x28 (user).
+    // CS is zero-extended to 64 bits on the stack: 0x08 (kernel) or 0x2B (user, RPL 3) - the
+    // checks below test 0x28, so only kernel frames are recognised (see the block comment above).
     // Take SERIAL_LOCK if it can be taken safely (audits/kernel-audit.md Audit 10). The `_nolck`
     // writers below exist because this fault may have interrupted a `kprintln` ON THIS CORE that
     // holds the lock, where waiting would self-deadlock - and that stays true. But bypassing the
@@ -2028,7 +2038,7 @@ unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) 
 #[unsafe(naked)]
 unsafe extern "C" fn exc_stub_noec() -> ! {
     core::arch::naked_asm!(
-        // Raw '?' to COM1, then set the reached-flag BEFORE cli (so other cores can observe it).
+        // Raw '?' to COM1, then set the reached-flag BEFORE cli (nothing reads it today).
         "mov dx, 0x3fd",
         // Bounded THRE poll (mirrors SERIAL_THRE_NOLCK_CAP): a present-but-wedged COM1 (THRE stuck
         // clear) must NOT hang a fault handler forever - a ring-3 fault would otherwise spin this core
@@ -2103,7 +2113,7 @@ unsafe extern "C" fn exc_stub_ec() -> ! {
 
 /// A ring-3 CPU exception (`cs & 3 != 0`) kills the offending task and the system continues
 /// (invariant 12 / §10.3); a ring-0 exception is genuine kernel-state corruption and halts all cores
-/// (§6.2). Lock-free serial: the fault may have interrupted a kprintln holding LOG_LOCK.
+/// (§6.2). Lock-free serial: the fault may have interrupted a kprintln holding the log ring's lock.
 #[no_mangle]
 unsafe extern "C" fn exc_dispatch(w0: u64, w1: u64, w2: u64, w3: u64, cs: u64) -> ! {
     // SAFETY: raw fault context, IF=0, kernel GS installed (swapgs in the stub for ring-3).

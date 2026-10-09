@@ -12,7 +12,7 @@
 //!   enable state.
 //! - **CPU interface** (`GICC`, +0x2000): per-core. Acknowledge, priority mask, end-of-interrupt.
 //!
-//! Interrupt IDs on a GICv2 are banked: 0-15 are SGIs (software-generated, for IPIs later), 16-31 are
+//! Interrupt IDs on a GICv2 are banked: 0-15 are SGIs (software-generated, the IPIs: `SGI_*` below), 16-31 are
 //! PPIs (private per core - the generic timer lives here), 32+ are SPIs (shared peripherals).
 
 /// GIC-400 base on BCM2711.
@@ -85,8 +85,8 @@ pub fn init() {
         GICD_CTLR.write_volatile(0); // quiesce while we configure
         GICC_CTLR.write_volatile(0);
 
-        // Accept every priority. A mask of 0xFF means "do not filter", which is what we want while
-        // there is exactly one interrupt source; priority becomes interesting when there are several.
+        // Accept every priority. A mask of 0xFF means "do not filter"; every source `enable` turns on
+        // gets the same priority (0xA0), so there is nothing to filter between.
         GICC_PMR.write_volatile(0xFF);
 
         GICD_CTLR.write_volatile(1); // enable the distributor
@@ -110,10 +110,9 @@ pub fn init_secondary() {
 
 /// Enable one interrupt ID, at a middling priority, targeted at core 0.
 ///
-/// Priority and target are only meaningful for SPIs (ID >= 32): PPIs and SGIs are banked per core, so
-/// their target register is read-only and writing it is harmless but pointless. Setting both
-/// unconditionally keeps the function honest for the SPI case that arrives with the first real
-/// peripheral driver.
+/// The priority is written for every ID (for an SGI or PPI it is banked, so this sets the calling
+/// core's copy); the target only for an SPI (ID >= 32), because an SGI's or PPI's target register is
+/// read-only. Every SPI is therefore delivered to core 0.
 pub fn enable(id: u32) {
     // SAFETY: GIC-400 registers, Device-mapped. `id` indexes byte/bit arrays the controller defines to
     // be at least this large for any valid interrupt ID.

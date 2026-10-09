@@ -30,8 +30,9 @@
 //! calibration unnecessary; on this board it is necessary anyway, just for a different reason than on
 //! x86 - not because the frequency is undiscoverable, but because the register that reports it lies.
 //!
-//! This milestone gives a **counter and delays**, not preemption. A periodic tick additionally needs
-//! the BCM2836 interrupt controller to route the timer IRQ, which is the next step.
+//! This module gives a **counter, delays and the System Timer one-shot**. The periodic tick that drives
+//! preemption is programmed from `timer_hz()` by `irq::start_tick`, which routes the timer IRQ through
+//! the BCM2836 core-local block.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use portable_atomic::AtomicU64;

@@ -92,8 +92,8 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 pub fn hw_random() -> Option<u32> { None }
 
 /// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
-/// boards with it are the Pi 4 (`arch/aarch64`, WL_ON), whose radio returns to power-on only when WL_ON
-/// is cut, and the VisionFive 2 Lite (`arch/riscv64`, the radio's power pin). `false` is the honest answer; the syscall reports it as "no control over it".
+/// boards with it are the Pi 4 (`arch/aarch64`, WL_ON), whose radio's power is WL_ON on the firmware's
+/// GPIO expander, and the VisionFive 2 Lite (`arch/riscv64`, the radio's power pin). `false` is the honest answer; the syscall reports it as "no control over it".
 pub fn device_power_control(_kind: u32) -> bool { false }
 pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 
@@ -107,7 +107,8 @@ pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
 pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
-/// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
+/// Switch to a new stack top - r15 on this ISA. `#[inline(always)]` for the same reason as x86.
+/// Unimplemented on this stub.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
 #[inline(always)]
 pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_to_boot_stack") }
@@ -119,12 +120,10 @@ pub const ELF_MACHINE: u16 = 22;
 pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 
 /// A11-1 hook: called from the timer tick on every core so a panic can stop the machine, not just the
-/// panicking core. A no-op on this port until its `halt_all_cores` actually signals the other cores -
-/// see the aarch64 implementation for the shape (a published flag, checked here).
-/// Called from the timer tick on every core so a panic can stop the machine rather than one core.
+/// panicking core. See the aarch64 implementation for the shape (a published flag, checked here).
 ///
 /// **STUB: a no-op here means the panic on another core never reaches this one.** Pairs with
-/// `halt_all_cores` above and is useless until that signals anybody. `arch/CLAUDE.md`, item 5.
+/// `halt_all_cores` below and is useless until that signals anybody. `arch/CLAUDE.md`, item 5.
 pub fn panic_halt_check() {}
 
 /// Stop EVERY core, not just this one. Called from the panic path (§6.2, §19).
@@ -199,10 +198,8 @@ pub fn fb_commit(
 pub mod page_tables {
 
     /// Arch hook run once a service's address space is built. x86 needs nothing; ARM clones the kernel
-    /// identity mapping into it.
+    /// identity mapping into it. Its other job is the one below:
     ///
-    /// # Safety
-    /// `_root` must be a page-table root this task owns.
     /// Make a service's freshly written TEXT visible to the INSTRUCTION fetcher, on every hart that
     /// could run it.
     ///
@@ -217,7 +214,10 @@ pub mod page_tables {
     ///
     /// x86-64 is a legitimate no-op here (coherent with respect to instruction fetch). **Copying that
     /// no-op onto a weak arch is the mistake.** See `arch/CLAUDE.md`, item 3, and
-    /// `arch/aarch64/mod.rs` / `arch/arm/usermode.rs` for real bodies.
+    /// `arch/aarch64/mod.rs` / `arch/arm/page_tables.rs` for real bodies.
+    ///
+    /// # Safety
+    /// `_root` must be a page-table root this task owns.
     pub unsafe fn finalize_service_address_space(_root: u64) {}
 
     /// Free a task's page-table root and the structure below it, at task death.

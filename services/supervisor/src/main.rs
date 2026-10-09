@@ -27,8 +27,8 @@
 //! worked example of §6.2. Someone reading this file to learn the restart model was told the opposite
 //! of the system.
 //!
-//! The kernel wires send-peer SEND caps at spawn time, so supervisor does not
-//! need to coordinate cap distribution manually.
+//! The kernel wires a spawn request's declared send peers by name at spawn time; where the supervisor
+//! already holds a peer's cap it INSTALLS that cap instead (`spawn_wired`, from the name-cap map).
 
 #![no_std]
 #![no_main]
@@ -39,8 +39,9 @@ use godspeed_sdk::service_context::DeadlineOutcomeInto;
 use godspeed_sdk::service_context::supcmd;
 use godspeed_sdk::service_context::usbdev;
 
-// ONE table, shared by source with the other principal that spawns probes: a probe respawns its own
-// victim, and a second copy of these parameters would be a second truth (Commandment III).
+// The probe parameter table is ONE file, shared by source with the other principal that spawns probes
+// (a probe respawns its own victim): `mod probes`, included from `probe/src/table.rs` below. A second
+// copy of those parameters would be a second truth (Commandment III).
 
 
 // ---------------------------------------------------------------------------------------------
@@ -58,16 +59,12 @@ use godspeed_sdk::service_context::usbdev;
 // See `docs/service-ownership.md`.
 // ---------------------------------------------------------------------------------------------
 
-/// Restart: kill if alive, then spawn. `core` of `u32::MAX` means "re-evaluate placement" (9.2).
-
-/// Spawn: start a service that is not running. Same reason as RESTART - once an image lives here,
-/// the kernel has no row to spawn it from, so the shell's `spawn` must come through this channel.
-
-
-/// Reply status. One byte, so a caller can log the truth rather than assume success.
-
-
-
+// The command bytes, the reply status and the wire layout live in `godspeed_sdk::service_context::supcmd`,
+// shared with every caller. RESTART kills if alive, then spawns; a `core` of `u32::MAX` means
+// "re-evaluate placement" (9.2). SPAWN starts a service that is not running - for the same reason as
+// RESTART: once an image lives here the kernel has no row to spawn it from, so the shell's `spawn` must
+// come through this channel. The reply status is one byte, so a caller can log the truth rather than
+// assume success.
 
 /// Handle a command and answer it. Returns false if this was not a command at all.
 ///
@@ -218,8 +215,8 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
 // ---------------------------------------------------------------------------------------------
 // Images the SUPERVISOR carries (step C, docs/service-ownership.md)
 //
-// One entry today. Every service that moves here leaves a `service_config` row in the kernel, and
-// the `service_configs` pin shrinks by one - the pin is the score.
+// Every service image is here now: step C is complete, and the kernel's own catalogue holds the
+// supervisor alone (CLAUDE.md 14.1). Each image that moved deleted a `service_config` row in the kernel.
 //
 // The dispatch is in `spawn_by_image`, which every spawn path consults FIRST. That matters more than
 // it looks: a service the supervisor carries must be spawnable AND RESTARTABLE through this path,
@@ -324,10 +321,10 @@ const PWM_AUDIO_BOARD: u32 = 2;
 /// foreground. Leaving it at 0 made `observe-now` run the LIVE LOOP: 100% CPU, flooding the console
 /// until the shell blocked on a send.
 ///
-/// It carries everything the service's CONTRACT declares, deliberately. The contract is the source of
-/// truth (Commandment III) and `scripts/contract_check.py` reconciles it against wherever the config
-/// actually lives - so a service moving out of the kernel must not lose a field on the way, or the
-/// move would quietly weaken the check that keeps the two honest.
+/// It carries everything the service's CONTRACT declares, deliberately. This row, not the contract,
+/// is what the kernel grants from (CLAUDE.md 13.6): the contract is the build-time declaration, and
+/// `scripts/contract_check.py` (and `IV-contract-authority`) reconcile it against these rows - so a
+/// field missing here is authority the contract claims and the service does not have.
 ///
 /// `u32::MAX` as the core means "no preference" (9.2 round-robin); a caller-supplied core overrides it.
 /// The board facts the spawn table asks about, named once instead of asked inline as an ISA.
@@ -462,9 +459,9 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      godspeed_sdk::service_context::privbits::PCI_CFG, 0, 0),
     ("events", EVENTS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, 2, &[], 0, 0, 0),
     // NOT in the boot set - the shell spawns it on `events persist start` and it idles until told
-    // what to capture. Being absent from the kernel managed lists is what keeps the whole persistence
-    // feature a zero-kernel-change one, and a recorder that came back without its target path would
-    // be alive and writing nothing while `status` said running.
+    // what to capture. Absent from `MANAGED` too, so nothing restarts it: a recorder that came back
+    // without its target path would be alive and writing nothing while `status` said running. (The
+    // whole persistence feature needed no kernel change.)
     ("recorder", RECORDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      u32::MAX, &["events", "fs"], 0, 0, 0),
     // NOT in the boot set either - the shell spawns it on `background copy` and it idles until
@@ -598,17 +595,6 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("console", CONSOLE_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      8 * 1024 * 1024, board::CONSOLE_CORE, &["events"], 0, 0,
      godspeed_sdk::service_context::hwclass::FRAMEBUFFER),
-    // The four INTERRUPT-DRIVEN drivers. None of them names a vector: the kernel derives it from the
-    // device class (`hw_irqs_for`), because routing a vector IS authority - on ARM, granting the USB
-    // vector is exactly what takes the controller away from whoever held it.
-    //
-    // CONSOLE_PUSH is what makes a USB keyboard a keyboard. Its absence was once the whole of "the
-    // keyboard does not work": correct transfers, valid HID reports, every push rejected. It also puts
-    // these drivers inside the SHELL'S trust perimeter, because keystrokes are commands (SEC-2) - so
-    // it is granted deliberately, and REBOOT is deliberately NOT.
-    //
-    // Cores 2 and 3: both USB drivers busy-poll their controllers at ~100% CPU, and co-locating them
-    // on core 1 saturated it - starving networking and garbling the keyboard itself on the T630.
     // NO NET_DEVICE, AND THAT IS THE CHANGE. This row granted it on aarch64, described as "set where
     // it is used" - and it had not been used for a month. The Pi 4's GENET moved into `nic-driver`
     // itself in 2026-08 (CLAUDE.md 6.4), so the service drives the MAC through its own register
@@ -707,6 +693,19 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("holder", HOLDER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
 ];
 
+// The USB hosts below are INTERRUPT-DRIVEN where the kernel can route a vector (the xhci row says
+// where it cannot, and that driver polls). None of them names a vector: the
+// kernel derives it from the device class (`hw_irqs_for`), because routing a vector IS authority -
+// on ARM, granting the USB vector is exactly what takes the controller away from whoever held it.
+//
+// CONSOLE_PUSH is what makes a USB keyboard a keyboard. Its absence was once the whole of "the
+// keyboard does not work": correct transfers, valid HID reports, every push rejected. It also puts
+// these drivers inside the SHELL'S trust perimeter, because keystrokes are commands (SEC-2) - so
+// it is granted deliberately, and REBOOT is deliberately NOT.
+//
+// Cores 2 and 3 for xhci and ehci: when both busy-polled their controllers at ~100% CPU, co-locating
+// them on core 1 saturated it - starving networking and garbling the keyboard itself on the T630.
+//
 /// The USB host drivers, one row per controller, each present exactly where its image is.
 ///
 /// THIS WAS FIVE TABLES - one per arch, plus an empty catch-all - and the comment on that last one
@@ -730,8 +729,10 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      // vector from its MSI pool; the caller never names one, because routing a vector is authority.
      //
      // `xhci_msi` is NOT "is it on PCI". The Pi 4's VL805 is a PCIe device and still takes the plain
-     // class, because what it lacks is a routable vector, not a bus; the VisionFive's Cadence core
-     // has no interrupt controller wired up at all and the driver polls, which it is built to do.
+     // class: its MSI IS routed (`arch/aarch64/pcie.rs`, `enable_msi`), but to the fixed vector the
+     // plain class carries (`XHCI_MSI_VECTOR`), not one drawn from the pool `pci_irq` asks; the
+     // VisionFive's Cadence core has no interrupt controller wired up at all and the driver polls,
+     // which it is built to do. (2026-10-09: this said the VL805 lacked a routable vector.)
      // Asking for an interrupt that can never arrive is the failure invariant 12 exists to prevent.
      //
      // On x86 this is the strictest driver to move: the only IOMMU-CONFINED one, needing the largest
@@ -890,15 +891,15 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godsp
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Phase 1 of moving naming out of the kernel (docs/naming-design.md).
+// The name-cap map (docs/naming-design.md; Phase 1 introduced it, Phases 0b-3c made it load-bearing).
 //
-// As the supervisor spawns the real services it records, in a bounded no-heap map, the
-// SEND|GRANT endpoint cap the kernel hands back from `spawn_returning_endpoint` (syscall 38,
-// Phase 0a). This proves the supervisor can hold a cap to everything it starts - the future
-// name authority. It is a SHADOW map for now: nothing reads it to wire dependents yet (that is
-// Phase 0b/3). Scoped to the real services; the 193 test probes are test infra (out of scope)
-// and are spawned with their parameters from `probes.rs` - the table that used to be 193 rows of
-// the kernel service catalogue (docs/probe-params-design.md).
+// As the supervisor spawns the real services it records, in a bounded no-heap map, the SEND|GRANT
+// endpoint cap each spawn hands back. It is what wires dependents: `spawn_wired` installs a peer's
+// cap from here, and a restart refreshes the entry in place. Only what `map_keeps` names is kept -
+// watched services, USB device drivers, and peers some row names - so on-demand programs never fill
+// it. The 193 test probes are test infra (out of scope) and are spawned with their parameters from
+// `probe/src/table.rs` - the table that used to be 193 rows of the kernel service catalogue
+// (docs/probe-params-design.md).
 // ───────────────────────────────────────────────────────────────────────────────
 const NAME_MAP_MAX:      usize = 16;  // bounded (§26.6) - real services, not the test probes
 const NAME_MAP_NAME_MAX: usize = 16;
@@ -1182,7 +1183,7 @@ fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
 /// `acquire_send_grant_cap` returns a handle without recording it in the SDK's send-cap cache, and
 /// `request_with_reply` resolves peers through that cache - so a request made on the strength of the
 /// map's handle finds no slot and fails INSTANTLY rather than talking to anyone. That exact trap cost
-/// a silent `0 sectors` from `dwc2` once already; the comment above `RECOVERY` records it.
+/// a silent `0 sectors` from `dwc2` once already.
 #[cfg(has_hw_enumerator)]
 fn probe_hw_enumerator(ctx: &ServiceContext) {
     const OP_COUNT: u8 = 1;
@@ -1263,6 +1264,11 @@ fn probe_hw_enumerator(ctx: &ServiceContext) {
 /// `chaos max-carnage` produced 61 block-driver respawns against 57 name records, and the four gaps
 /// took storage down for the rest of the run. `name_alive` is the same `task_stat` discipline
 /// `managed_alive` already uses, and its comment says exactly why a cap-acquire cannot serve here.
+///
+/// (Note 2026-10-09: the kernel now clears a dying task's name when it reclaims it -
+/// `ipc::names::unregister_endpoint`, called from the death path in `kernel/src/task/scheduler.rs` - so
+/// "the directory keeps a name after its service dies" describes the defect this gate was written
+/// against. `name_alive` stays the check, because it does not depend on that clear having run yet.)
 fn ensure_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u32) -> bool {
     if name_alive(ctx, name) {
         if let Ok(cap) = gs::cap::acquire_grantable(ctx, name) {
@@ -1611,7 +1617,7 @@ fn ask_usb_hosts(ctx: &ServiceContext, map: &NameCapMap) {
 }
 
 /// Scan REAL liveness via `task_stat` (NOT a cap-acquire, which the kernel directory keeps succeeding
-/// for a dead name - the `ensure_*` stale-cap-adopt race, line ~149): which MANAGED services have a live
+/// for a dead name - the stale-cap-adopt race `ensure_mapped`'s header records): which MANAGED services have a live
 /// task (valid AND not Dead) right now. Index-aligned to `MANAGED`.
 fn managed_alive(ctx: &ServiceContext) -> [bool; MANAGED_N] {
     let mut alive = [false; MANAGED_N];
@@ -1742,13 +1748,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Path C / Phase 5: the kernel boots the supervisor directly (init is removed), so the
     // supervisor now spawns `events` - moved here from init. events is not TCB (§11.3): retry
-    // once on failure and continue without it (its output falls back to the kernel ring buffer).
+    // once on failure and continue without it (logging never depended on it: `ctx.log()` writes the
+    // kernel ring and serial directly, CLAUDE.md 11.4).
     ctx.log("supervisor: spawning events...");
     if let Ok(cap) = gs::cap::acquire_grantable(&ctx, "events").map(gs::cap::Cap::handle) {
         // Supervisor RESPAWN: `events` is still alive (only the supervisor died). Adopt it - reacquire
         // its endpoint by name - instead of trying to spawn a duplicate the kernel's singleton guard
         // rejects, which used to print a misleading "events spawn failed" on every `kill supervisor`.
-        // Mirrors the block-driver/fs/shell adopt lines in the reconcile path.
+        // The same adopt `ensure_mapped` does, but WITHOUT its `name_alive` gate (see its header): an
+        // `events` that died while the supervisor was down is adopted as a dead cap here, and recovered
+        // only by `converge` below, which checks real liveness.
         record_name_quiet(&ctx, &mut name_map, "events", cap);
         ctx.log("supervisor: adopted running events");
     } else if !spawn_mapped(&ctx, &mut name_map, "events", 0xFFFF) {
@@ -1850,30 +1859,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     let _ = ctx.spawn("observe");
 
-    // Persistence (v2; docs/persistence.md) - block-driver + fs. Spawned in bare-metal
-    // (so a usable OS / Prime sees its disk and `drives flash` can format it) and in the
-    // blockdev smoke-test. block-driver MUST precede fs (fs's send-peer cap to it wires
-    // from the name table at fs's spawn), and BOTH must precede the shell (the shell's
-    // send-peer cap to `fs` wires the same way). On a machine with no SATA disk both come
-    // up and idle gracefully (block-driver: "no controller"; fs: raw-tolerant).
-    // block-driver has no peers; fs's only peer is block-driver, provided from the map. Clients
-    // reacquire names via the kernel directory.
-    //
-    // block-driver is also spawned in `identity-only` builds - it idles harmlessly with no disk
-    // (QEMU has no -drive there: "no controller"), giving §22 Test 11 a restartable victim to kill.
+    // Persistence (v2; docs/persistence.md) - block-driver + fs, spawned further down. block-driver
+    // MUST precede fs (fs's send-peer cap to it is installed from the name-cap map at fs's spawn), and
+    // BOTH must precede the shell (whose `fs` cap is installed the same way). On a machine with no disk
+    // both come up and idle gracefully (block-driver: "no controller"; fs: raw-tolerant). block-driver's
+    // peers are its row's (`board::STORAGE_PEERS`: the USB host its disk sits behind, and `events`);
+    // fs's `block-driver` cap is provided from the map. Clients reacquire names via the kernel directory.
     // `ensure_*` (Phase 6): spawn on a fresh boot, ADOPT the running instance on a supervisor respawn.
+    //
+    // NOTE (2026-10-09): the `#[cfg]` just below was written for block-driver ("also spawned in
+    // `identity-only` builds ... giving 22 Test 11 a restartable victim"), but an attribute applies to
+    // the next STATEMENT and comments do not end it - so it gates the `time` spawn, and the
+    // block-driver spawn further down is unconditional. Reported, not changed here.
     #[cfg(any(feature = "bare-metal", feature = "blockdev", feature = "identity-only"))]
-    // block-driver: core 0 on ARM, unpinned elsewhere. On ARM it reaches a USB stick through the
-    // `dwc2` SERVICE (spawned just above), not through kernel syscalls - the in-kernel DWC2 stack was
-    // deleted in slice 5. The core-0 preference survives that change because the placement decision
-    // lives in the kernel's `ServiceConfig.preferred_core`, which both the boot and restart paths read.
-    // No override: the kernel's `ServiceConfig.preferred_core` decides, and it is arch-conditional
-    // (0 on ARM for the reason above). Overriding here pinned only the BOOT spawn - the restart path
-    // passes no override, so a respawned block-driver silently landed on a different core than the
-    // one it requires. One source of placement, consulted by both paths.
+    // block-driver's placement comes from its IMAGES row (`board::BLOCK_CORE`), which both the boot and
+    // the restart paths read; neither passes an override. An override here once pinned only the BOOT
+    // spawn, so a respawned block-driver silently landed elsewhere. One source of placement.
     // time + control: started BEFORE the shell, because the shell asks `time` for the clock source on
-    // its first prompt and net-stack asks it to accept an SNTP reading. Neither holds hardware, so
-    // neither can delay the prompt the way a driver bring-up would.
+    // its first prompt. Neither holds hardware, so neither can delay the prompt the way a driver
+    // bring-up would. (`time` asks net-stack for its own NTP datagram; net-stack never calls `time`.)
     ensure_mapped(&ctx, &mut name_map, "time", 0xFFFF);
     ensure_mapped(&ctx, &mut name_map, "control", 0xFFFF);
     // power: the clock policy (docs/power.md). Early, and before every service that leases the clock -
@@ -1887,7 +1891,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // does NOT quietly do nothing: the kernel embeds an empty placeholder and the spawn fails with
     // `LoadFailed(TooSmall)`. An earlier version of this line was unconditional with a comment
     // asserting it was "a no-op on ARM", which was simply untrue; `scripts/service_embed_check.py`
-    // refused the arm build and said so before any board booted.
+    // refused the arm build and said so before any board booted. (That was when the kernel held the
+    // images. Today the IMAGES row is absent there too, and the spawn falls through to a kernel whose
+    // catalogue holds only the supervisor - a failure still, and still loud.)
     //
     // Spawned EXPLICITLY rather than left to the MANAGED list, because MANAGED is the watch and
     // reconcile set - it says what to RESTART, not what to START. A service in MANAGED and nowhere
@@ -2046,7 +2052,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 
     // xhci: USB host-controller driver (§12). Spawned in bare-metal + full builds; the kernel maps its
-    // controller's MMIO BAR at spawn (Stage 2). ALWAYS spawned (unlike ehci/nic-driver below): xhci is
+    // controller's MMIO BAR at spawn (Stage 2). ALWAYS spawned (unlike ehci below): xhci is
     // the near-universal primary USB controller, and even with no controller its idle path signals
     // input-ready - the boot-screen clear that lets the shell show `gsh>`. Skipping it would leave the
     // serial shell waiting for a prompt forever, so the idle-core cost on a (rare) xHCI-less machine is
@@ -2055,28 +2061,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    // Not on the arm32 port: there the USB host controller (DWC2) is driven IN-KERNEL, because that
-    // port does not route device IRQs to userspace yet. There is no userspace driver ELF to load, so
-    // this spawn can only ever fail - and it failed LOUDLY every boot with `LoadFailed(TooSmall)`,
-    // which is a real error message for a service that was never supposed to exist here. Loud failure
-    // is right for a thing that should have worked (invariant 12); a permanent error for a thing that
-    // is not part of this architecture is just noise that trains the reader to ignore the log.
+    // Not on the arm32 port: its controller is a DWC2, not an xHCI - a different driver (`dwc2`,
+    // spawned above), and `has_xhci` is unset there, because `build.rs` embeds no xHCI image.
     //
-    // **aarch64 is off that list permanently - the in-kernel driver is deleted.** The Pi 4's
-    // VL805 is a PCIe endpoint the kernel already discovers and BAR-assigns; with the feature the
-    // kernel publishes it in `pci::XHCI_*` and stops driving it, and the SAME service x86 has always
-    // spawned takes over - same binary, same CONSOLE_PUSH capability, same MMIO/DMA grant path. That
-    // is the point of reusing it: a second xHCI implementation would be the duplication Commandment
-    // III forbids, and this controller is standards-conformant silicon behind a standards-conformant
-    // bus, so there was nothing to reimplement.
-    //
-    // Kept as a supervisor feature rather than an unconditional aarch64 spawn because the KERNEL side
-    // is a feature too. Spawn the service without it and two drivers own one controller.
-    // aarch64 spawns it unconditionally now: the in-kernel driver is DELETED, so this service is the
-    // only thing that can drive the controller. arm32 is excluded because its controller is a DWC2,
-    // not an xHCI - a different driver, spawned above. Its in-kernel stack is deleted too (slice 5);
-    // this comment used to say otherwise, and that stale sentence is exactly why nothing filled the
-    // gap when the kernel driver went away.
+    // aarch64 and riscv64 spawn the SAME service x86 always has: the in-kernel aarch64 driver is
+    // DELETED (CLAUDE.md 6.4, 2026-08-09) and the feature flags that once chose between the two are
+    // gone, so this service is the only thing that can drive the controller - same binary, same
+    // CONSOLE_PUSH, same MMIO/DMA grant path. A second xHCI implementation would be the duplication
+    // Commandment III forbids. On those boards the host was usually started earlier, ahead of
+    // block-driver (it is in `board::STORAGE_PEERS`), and this line ADOPTS it.
     #[cfg(has_xhci)]
     // Adopt if already running - the same omission `nic-driver` and `net-stack` had. Both USB
     // drivers are in MANAGED, so the supervisor watches them for death; on its own respawn a bare
@@ -2104,10 +2097,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("supervisor: no EHCI controller (PCI scan) - not starting ehci (frees a core)");
     }
 
-    // nic-driver: the userspace NIC driver (§12, docs/networking.md, Phase 1). Same builds as the
-    // USB drivers; the kernel maps the Intel e1000's BAR0 by name at spawn. On a non-e1000 NIC
-    // (the T630's Realtek) it gets no mapping and idles. Restart-on-death wiring (the MANAGED set)
-    // lands with the DMA/IRQ phase, when it holds device state worth recovering.
+    // nic-driver: the userspace NIC driver (§12, docs/networking.md). The kernel grants its device by
+    // the class its IMAGES row names - PCI class 0x020000 where `nic_on_pci`, the `NIC` kind elsewhere
+    // - and it drives e1000 / RTL8168 / GENET / smsc95xx / dwmac by port. It is in `MANAGED`, so a
+    // death is restarted like any other.
     //
     // ALWAYS spawned (unlike ehci above): a NIC exists on nearly all hardware, so a presence-gated skip
     // (`ctx.nic_present()`, query 18 bit2) was parked as low-value. The SDK accessor stays for an easy
@@ -2117,6 +2110,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
+    // NOTE (2026-10-09): the `#[cfg(not(any(...)))]` above applies to the next STATEMENT, and the
+    // comments below do not end it - so it gates the `wifi-driver` spawn, and the `nic-driver` spawn
+    // further down is unconditional (it runs in the test builds too). Reported, not changed here.
+    //
     // ADOPT if already running, like every other managed service. These two used `spawn_*`
     // directly, which always tries to SPAWN - so on a supervisor respawn the kernel refused
     // ("spawn 'net-stack' rejected: already running"), the supervisor got no endpoint cap back, and
@@ -2163,10 +2160,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // net-stack: the model-agnostic half of networking (docs/networking.md). Speaks ARP/IP over raw
     // frames THROUGH nic-driver's frame interface, so it is spawned right AFTER nic-driver and WIRED
-    // to it (its SEND cap to nic-driver comes from the name-cap map). Same builds as nic-driver; on a
-    // non-e1000 NIC, nic-driver serves empty replies, so net-stack degrades (no hang) rather than
-    // resolving. Restart-on-death wiring (the MANAGED set) lands with Phase 2, when it holds protocol
-    // state worth recovering.
+    // to it (its SEND cap to nic-driver comes from the name-cap map). With no link, net-stack stays
+    // unconfigured and responsive (no hang). It is in `MANAGED`, so a death is restarted like any other.
     #[cfg(not(any(feature = "identity-only", feature = "perf-only",
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
@@ -2176,9 +2171,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // spawn gave it - they live in its own table and a supervisor restart does not touch them.
     ensure_wired(&ctx, &mut name_map, "net-stack", &["nic-driver"]);
 
-    // Phase 1 (docs/naming-design.md): report the shadow name→cap map. Proves the supervisor now
-    // holds an endpoint cap to every real service it spawned - the future name authority. Nothing
-    // reads it yet (Phase 0b/3 wire dependents from it; Phase 4 brokers reacquisition through it).
+    // Report the name-cap map (docs/naming-design.md): the endpoint caps the supervisor holds to the
+    // services it keeps (`map_keeps`), from which it wires dependents at spawn and on restart.
     ctx.log_fmt(format_args!("supervisor: name-cap map holds {} service(s)", name_map.count));
 
     // Reconverge to consistency before trusting the notification stream (Path C / Phase 6). A no-op on a
@@ -2202,11 +2196,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
     // it. `recv` BLOCKS, so the core still reaches the idle/halt path and runs cool between
-    // deaths (no polling). Restartable services routed here: `block-driver`, `fs`, `shell`, `xhci`,
-    // `ehci`, `events`. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a dead
-    // task can't respawn itself; the only death that is unrecoverable is the kernel's. Other
-    // restart/kill commands still arrive via the
-    // COM2 control channel (control::process_pending in the timer ISR).
+    // deaths (no polling). Every task spawned `SPAWN_FLAG_WATCHED` (`is_watched`: `MANAGED` and
+    // `counter`) is routed here. The supervisor itself is restartable too (Phase 6) but by the KERNEL - a
+    // dead task can't respawn itself; the only death that is unrecoverable is the kernel's. Operator
+    // RESTART/SPAWN commands arrive on this same endpoint as `supcmd` messages (from `control`, the
+    // shell, `chaos`), and USB hosts' device reports as `usbdev` messages.
     //
     // If this build gave us no endpoint (minimal test manifests), fall back to park.
     if ctx.recv_handle().is_none() {
@@ -2333,7 +2327,7 @@ fn spawn_extended_probes(_ctx: &ServiceContext) {}
 fn spawn_extended_probes(_ctx: &ServiceContext) {}
 
 // perf-only: spawn only the regular performance benchmark probe services.
-// Cuts spawn wait from ~18-120 s (178 probes) to ~2-5 s (~30 services) on TCG.
+// Cuts spawn wait from ~18-120 s (183 probes) to ~2-5 s (~30 services) on TCG.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), feature = "perf-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // Sender/controller before echo/recv so the sender's endpoint is registered
@@ -2416,7 +2410,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = probes::probe(&ctx, "chaos-c7");          // TLB shootdown controller on core 1
 }
 
-// adv-only: spawn only the A1-A10 adversarial probe services.
+// adv-only: spawn only the A1-A15 adversarial probe services (A14/A15 are the adv-fault-* probes).
 // All adversarial probes are self-contained - no QEMU control port required.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {

@@ -38,16 +38,16 @@ Example:
 
 ```
 gsh> find *.txt
-  /docs/inside.txt
-  /docs/sub/note.txt
-  find: 2 match(es)
+/docs/inside.txt
+/docs/sub/note.txt
+find: 2 match(es)
 ```
 
 ### As a record producer (typed pipes)
 
 Bare `find` prints the matching paths (above); **in a pipe** it is a record producer
 (`docs/records.md`, `utilities/31_records.md`) emitting a typed table - columns
-**`name` / `type` / `path`** - so each hit's structure is filterable:
+**`name` / `type` / `path` / `size`** - so each hit's structure is filterable:
 
 ```
 find *.txt | where type=file        only file hits (not matching directories)
@@ -72,8 +72,10 @@ there is no chunked-reply problem - the shell just keeps asking `fs` to list dir
 
 The walk holds a **bounded stack** of pending directories (`FIND_QCAP`, currently 32). A
 tree wide/deep enough to exceed it does not silently drop results - `find` prints
-`search truncated …` so the user knows the answer is partial. The glob matcher is itself
-bounded: iterative backtracking (`glob_match`), no recursion and no allocation.
+`find: search truncated …` so the user knows the answer is partial. A directory that could
+not be read to the end (past `DIR_PAGE_MAX` pages, or any failed listing) prints `find:
+INCOMPLETE - ...`. The glob matcher is itself bounded: iterative backtracking (`glob_match`),
+no recursion and no allocation.
 
 ## 4. Why no `fs_index` yet
 
@@ -99,7 +101,9 @@ A shell built-in (like the other file commands) sending `LIST_DIR` to `fs`; `fs`
 disk authority. Conforms: `find help` (usage with a real example per row) and
 `find version` (number + creator credit) per `0_conventions.md`.
 
-Also conforms to **rule 10** (`0_conventions.md` §1.10): each `LIST_DIR` step is **q-abortable** via
-`fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to the prompt (a fast
-reply prints nothing). This replaced a bare `request_with_reply`, which rule 10 forbids for an
-interactive command; the shell already walks the tree step-by-step, so `q` ends the walk (rule 11).
+**Does NOT currently conform to rule 10** (`0_conventions.md` §1.10), found 2026-10-09. The `fs`
+requests of the walk go through a `gs::fs::Fs` handle that is lent no notice, so each request is bounded
+(`gs::call::DEFAULT_SECS`, 5 s) but prints no `[q] quit` and cannot be ended with `q`; the
+`Cancelled` branches in the handler are unreachable. This said the request was q-abortable via
+`fs_request_q`, which no longer exists. `dir` is the one fs-backed command that still lends the
+notice (`16_dir.md` §6); the same `.noticing(...)` here is the fix.

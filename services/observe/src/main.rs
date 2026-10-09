@@ -31,12 +31,13 @@ const NAME_COL: usize = 15;
 const QUEUE_MAX:      u8  = 16;
 const MAX_CORES:      u32 = 16;
 
-// Mode passed by the kernel at spawn (ServiceConfig.probe_mode).
+// Mode carried in the supervisor's spawn request (the `mode` column of the three IMAGES rows that
+// share this binary), written by the kernel into ServiceContextData as `probe_mode`.
 const MODE_LIVE:    u32 = 0; // `observe`      - refresh forever (full-build streaming)
 const MODE_NOW:     u32 = 1; // `observe now`  - one static frame, then park
 const MODE_LIVE_FG: u32 = 2; // `observe` live - full-screen foreground view
 
-/// Per-iteration sleep for the live loop, in TSC cycles (~30 ms at 2 GHz). The loop SLEEPS this
+/// Per-iteration sleep for the live loop, in milliseconds. The loop SLEEPS this
 /// long between `q`-polls/repaints instead of busy-`yield`ing, so the core halts in between and
 /// `observe` itself does not peg its core (which would make every task on that core read as
 /// ~100% busy - the very thing observe reports). `q` latency stays ≤ this; granularity is one
@@ -69,9 +70,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     if ctx.probe_mode() == MODE_LIVE_FG {
         // `observe` (live): the shell-brokered foreground view. We own the screen:
-        // hide the cursor, suppress keystroke echo, repaint in place every
-        // FRAME_CYCLES, and poll `q` to quit. On exit we restore the console and
-        // park; the shell detects the park, cleans up, and reprints its prompt.
+        // hide the cursor, suppress keystroke echo and repaint in place about once a
+        // second. The SHELL owns `q`: it kills this task and restores the console
+        // (see `run_live`), which never returns - the park below is unreachable.
         run_live(&ctx, &mut prev_core_active, &mut prev_core_total, &mut prev_task_ticks, &mut prev_tsc);
         gs::ipc::park(&ctx);
     }

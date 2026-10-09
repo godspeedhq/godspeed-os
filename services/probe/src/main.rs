@@ -8,11 +8,11 @@
 #![deny(unsafe_code)]
 //! `probe` - single-binary identity test probe service (§22 Group A).
 //!
-//! One binary, multiple service_config entries with different `probe_mode` values.
-//! The kernel writes `probe_mode` into ServiceContextData at spawn time; the SDK
+//! One binary, 193 rows in `table.rs` with different `probe_mode` values. The spawner's request
+//! carries the mode, the kernel writes it into ServiceContextData at spawn time, and the SDK
 //! exposes it via `ctx.probe_mode()`.
 //!
-//! Modes:
+//! Modes (a selection - the `MODE_*` constants below are the full list):
 //!   0 = PASSIVE         - idle; exists only to be a kill target
 //!   1 = ECHO_RECV       - recv one message; log "probe: 3A recv OK"              (Test 3A)
 //!   2 = ECHO_SEND       - send to probe-recv; log "probe: 3A send OK"            (Test 3A)
@@ -48,7 +48,7 @@
 //!
 //! Chaos-test modes - Milestone 14.
 //!  91 = CHAOS_C2     - null-deref → page fault → kernel kills service           (C2)
-//!  92 = CHAOS_C2_MON - 1,000 yields then log pass (C2 witness)                  (C2)
+//!  92 = CHAOS_C2_MON - 100 yields then log pass (C2 witness)                    (C2)
 //!  93 = CHAOS_C3     - 500 alloc-deny cycles without panic                      (C3)
 //!  94 = CHAOS_C5     - 100-level recursive yield_now(); kernel stack depth probe (C5)
 //!  95 = CHAOS_C6_MON - 200 yields then log pass on core 0 (C6 witness)          (C6)
@@ -58,22 +58,22 @@
 //! 155 = CHAOS_BC2_MON - 500 yields; proves 5 simultaneous faults survived        (BC2)
 //! 156 = CHAOS_BC3     - 2,500 alloc-deny cycles (5× C3)                          (BC3)
 //! 157 = CHAOS_BC5     - 500-level recursive yield_now() stack probe (5× C5)      (BC5)
-//! 158 = CHAOS_BC6_MON - 1,000 yields on core 0; 2-hog starvation witness         (BC6)
+//! 158 = CHAOS_BC6_MON - 200 yields on core 0; 2-hog starvation witness           (BC6)
 //! 159 = CHAOS_BC7     - 15 cross-core kill/respawn TLB cycles (brutal concurrent)  (BC7)
 //!
 //! Brutal performance-benchmark modes - Milestone 19.
-//! 132 = PERF_BP1      - same-core IPC roundtrip, 1000 samples (5× B1)
+//! 132 = PERF_BP1      - same-core IPC roundtrip, 100 samples (2× B1)
 //! 133 = PERF_BP1_ECHO - B1 echo (core 0)
-//! 134 = PERF_BP2      - cross-core IPC roundtrip, 1000 samples (5× B2)
+//! 134 = PERF_BP2      - cross-core IPC roundtrip, 100 samples (2× B2)
 //! 135 = PERF_BP2_ECHO - B2 echo (core 1)
-//! 136 = PERF_BP3      - yield floor, 5000 yields (5× B3)
+//! 136 = PERF_BP3      - yield floor, 2000 yields
 //! 137 = PERF_BP4      - cap validation, 50000 checks (5× B4)
 //! 138 = PERF_BP5      - spawn+restart cost, 50 cycles (5× B5/B6)
 //! 139 = PERF_BP7      - cap I/R throughput, 5000 cycles (5× B7)
 //! 140 = PERF_BP8      - allocator throughput, alloc to limit
-//! 141 = PERF_BP9      - 4 KiB message copy sender, 1000 sends (5× B9)
+//! 141 = PERF_BP9      - 4 KiB message copy sender, 400 sends
 //! 142 = PERF_BP9_RECV - B9 recv
-//! 143 = PERF_BP10     - scheduler pick-next, 5000 yields (5× B10)
+//! 143 = PERF_BP10     - scheduler pick-next, 200 yields
 
 #![no_std]
 #![no_main]
@@ -240,7 +240,7 @@ const MODE_ADV_A10:         u32 = 90; // kernel addresses as syscall args → re
 
 // Chaos-test modes - Milestone 14.
 const MODE_CHAOS_C2:        u32 = 91; // null-deref → page fault → kernel kills service
-const MODE_CHAOS_C2_MON:    u32 = 92; // 1,000 yields then log pass (C2 witness)
+const MODE_CHAOS_C2_MON:    u32 = 92; // 100 yields then log pass (C2 witness)
 // A14 (kernel-audit regression): a ring-3 CPU exception must KILL the task, never halt the kernel.
 const MODE_ADV_FAULT_GP:    u32 = 210; // ring-3 #GP (non-canonical read) → kernel kills service
 const MODE_ADV_FAULT_DE:    u32 = 211; // ring-3 #DE (inline-asm div0)    → kernel kills service
@@ -256,7 +256,7 @@ const MODE_CHAOS_C7:        u32 = 96; // 30 cross-core kill/respawn cycles; TLB 
 const MODE_CHAOS_BC2_MON:   u32 = 155; // 500 yields; 5-simultaneous-fault witness
 const MODE_CHAOS_BC3:       u32 = 156; // 2,500 alloc-deny cycles (5× C3)
 const MODE_CHAOS_BC5:       u32 = 157; // 500-level recursive yield_now() (5× C5)
-const MODE_CHAOS_BC6_MON:   u32 = 158; // 1,000 yields on core 0; 2-hog witness
+const MODE_CHAOS_BC6_MON:   u32 = 158; // 200 yields on core 0; 2-hog witness
 const MODE_CHAOS_BC7:       u32 = 159; // 15 cross-core kill/respawn cycles (brutal concurrent load)
 
 // Cross-core try_send diagnostic - isolates the one-way send cost that C7's "send"
@@ -298,9 +298,9 @@ const MODE_FUZZ_BF7:        u32 = 118; // BF7: stale cap / generation - 200 kill
 const MODE_FUZZ_BF8:        u32 = 119; // BF8: memory request sizes - 10 edge + 5k random
 
 // Brutal performance-benchmark modes - Milestone 19.
-const MODE_PERF_BP1:        u32 = 132; // BP1: same-core IPC roundtrip - 1000 samples (5× B1)
+const MODE_PERF_BP1:        u32 = 132; // BP1: same-core IPC roundtrip - 100 samples (2× B1)
 const MODE_PERF_BP1_ECHO:   u32 = 133; // BP1 echo (core 0)
-const MODE_PERF_BP2:        u32 = 134; // BP2: cross-core IPC roundtrip - 1000 samples (5× B2)
+const MODE_PERF_BP2:        u32 = 134; // BP2: cross-core IPC roundtrip - 100 samples (2× B2)
 const MODE_PERF_BP2_ECHO:   u32 = 135; // BP2 echo (core 1)
 const MODE_PERF_BP3:        u32 = 136; // BP3: yield floor - 2000 yields under brutal load
 const MODE_PERF_BP4:        u32 = 137; // BP4: cap validation - 50000 checks (5× B4)
@@ -309,7 +309,7 @@ const MODE_PERF_BP7:        u32 = 139; // BP7: cap I/R throughput - 5000 cycles 
 const MODE_PERF_BP8:        u32 = 140; // BP8: allocator throughput - alloc to limit
 const MODE_PERF_BP9:        u32 = 141; // BP9: 4 KiB message copy sender - 400 sends under brutal load
 const MODE_PERF_BP9_RECV:   u32 = 142; // BP9 recv
-const MODE_PERF_BP10:       u32 = 143; // BP10: scheduler pick-next - 2000 yields under brutal load
+const MODE_PERF_BP10:       u32 = 143; // BP10: scheduler pick-next - 200 yields
 
 // Brutal adversarial modes - Milestone 20.
 const MODE_ADV_BA1:          u32 = 144; // BA1: 50k cap forgery attempts (5× A1)

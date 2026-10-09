@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # `chaos` is the fault injector: it kills services, storms spawns, and floods queues to prove the system
-# recovers (Commandment II). It needs SERVICE_CONTROL to kill and SPAWN to storm - both granted by name
-# in the kernel rather than through this contract, so what is written here is not the whole of its
-# authority. That gap is finding C4-1 and is recorded, not hidden.
+# recovers (Commandment II). It needs SERVICE_CONTROL to kill and SPAWN to storm. Like all of its
+# authority, they come from the supervisor's spawn request (chaos's IMAGES row: SPAWN, INTROSPECT,
+# SERVICE_CONTROL, ACQUIRE_ANY, and the console-read flag), never from this file (CLAUDE.md 13.6) -
+# and no longer by name in the kernel, which was finding C4-1. SPAWN, INTROSPECT and ACQUIRE_ANY have
+# no contract key, so what is written here is still not the whole of it.
 name    = "chaos"
 version = "0.1.0"
 

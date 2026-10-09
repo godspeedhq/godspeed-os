@@ -138,7 +138,9 @@ jobs:
           test -f tools/limine/limine-bios.sys
 
       # ---- the same enforcement layer a local build runs -------------------------
-      # A release is the worst possible time to discover a checker was failing.
+      # A release is the worst possible time to discover a checker was failing. This step
+      # names a subset and runs it first so a failure is reported by name; the full list
+      # (`EXTRA_CHECKS` plus the commandments self-test) also runs inside `osdev image` below.
       - name: Enforcement layer (source-only checks)
         run: |
           set -e

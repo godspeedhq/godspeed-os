@@ -20,7 +20,8 @@ Five kinds of job, and the test for adding a sixth is **not** "is the command sl
 **The original test was "is the command's value its EFFECT or its OUTPUT", and it was wrong - this
 file named `drives check` as ruled out and `KIND_CHECK` is now the third row above.** The reasoning
 was that the service holds no `console_push` capability, so a command whose product is a report has
-nowhere to write it. The premise is true and the conclusion did not follow: a job does not need to
+nowhere to write it. The premise is true and the conclusion did not follow - `console_push` is not
+even what printing needs (that is `log_write`, which this service holds; see below): a job does not need to
 REACH the console, it needs its output to survive until somebody asks. The bounded transcript
 (`CP_OP_OUTPUT`, replayed by `foreground`) is where it survives, and `render_verdict` turns the
 counts `fs` answers with into the sentence a person reads - because passing the raw reply through
@@ -41,12 +42,15 @@ and a job that faults is a service that faults rather than a shell that faults.
 
 ## What it holds, and what it does not
 
-`fs` and its log. **No console**, no spawn, no reboot, no network. A detached job therefore cannot
-write over a prompt somebody is typing at, because it holds nothing that reaches the console.
+`fs` and its log. **No `console_push`**, so it cannot inject keystrokes into the shell's input
+(SEC-2). No spawn, no reboot, no network. It CAN write to the console, as every task can through
+`log_write` (ConsoleWrite checks nothing else). A detached job stays off a prompt somebody is typing
+at by convention - this service never calls `gs::io` - not because a capability stops it.
 
 The honest limit: the design describes minting a READ cap for the source and a WRITE cap for the
 destination and handing over exactly those. The shell's `spawn` takes a name and nothing else
-(`utilities/10_spawn.md` §5), so the real bound is this contract's `fs`, entire. Strictly less than
+(`utilities/10_spawn.md` §5), so the real bound is the `fs` peer its spawn request gives it (its
+`IMAGES` row; the contract declares the same), entire. Strictly less than
 the shell's own authority, and not the bound the design claimed.
 
 ## Spawned on demand, NOT restarted

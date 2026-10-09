@@ -2,8 +2,8 @@
 #
 # The live view for anything: `watch mem` shows memory changing, `watch net` the link,
 # `watch status` the service table. Each pass clears the screen and re-runs the command,
-# so the display refreshes in place (a real live view on the framebuffer console, which
-# has no scrollback). A failing command keeps being watched - that is the point of
+# so the display refreshes in place (a real live view on the framebuffer console;
+# each cleared pass replaces the last on screen). A failing command keeps being watched - that is the point of
 # watching (waiting for it to come good); q is the exit either way.
 #
 # Built on the `wait` utility (a q-abortable pause): `if !wait 2 { break }` ends the loop

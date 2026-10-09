@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Display bring-up on the JH7110 - starting with the power domain everything else needs.
+//! Display bring-up on the JH7110: the power domain, the clocks and resets, the DC8200 display
+//! controller, the HDMI path, and handing the result to the boot console (`adopt_as_boot_console`).
+//!
+//! (2026-10-09: the next three paragraphs were written when this file was only the FIRST stage, and
+//! say "nothing here touches the display controller". The later stages - `clocks_on`,
+//! `probe_dc8200`, `mode_set`, `hdmi_on` - live in this file now; what they say about the power
+//! domain still holds.)
 //!
 //! **The bootloader leaves the display switched off.** U-Boot on this board reports `In: serial /
 //! Out: serial` - it has no video device at all - so unlike the Raspberry Pi ports, where the

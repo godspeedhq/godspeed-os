@@ -1,12 +1,12 @@
 # TCP for GodspeedOS: the design, and the two facts that shaped it
 
-> **Status: BUILT and shipping** (this header said "design, being built" until 2026-09-26, while the same document's own "HARDWARE VERIFIED" and "Working, and verified on the wire" sections said otherwise). `services/net-stack/src/tcp.rs` is 1,745 lines; `OP_LISTEN`, the shell's `tcp` and `serve`, `tcp selftest` (53 checks) and `gs::net::Net::tcp` / `Listener::accept` are all live. `docs/networking.md` recorded the commitment on
+> **Status: BUILT and shipping** (this header said "design, being built" until 2026-09-26, while the same document's own "HARDWARE VERIFIED" and "Working, and verified on the wire" sections said otherwise). `services/net-stack/src/tcp.rs` is 1,747 lines (2026-10-09); op 22 (listen, `OP_LISTEN` in `gs::net`), the shell's `tcp` and `serve`, `tcp selftest` (53 checks) and `gs::net::Net::tcp` / `Listener::accept` are all live. `docs/networking.md` recorded the commitment on
 > 2026-07-04 ("TCP/IPv4 is committed from the start, not far-future"); this is how it gets built, and
 > why it is not a port of anyone else's stack.
 
 ## What is already here, measured rather than remembered
 
-`services/net-stack/src/main.rs` is 3,652 lines (this said 2,174, under a heading reading "measured rather than remembered") and implements ARP (resolve and reply), IPv4 with
+`services/net-stack/src/main.rs` is 3,749 lines as of 2026-10-09 (this said 3,652, and before that 2,174, under a heading reading "measured rather than remembered") and implements ARP (resolve and reply), IPv4 with
 checksum, ICMP echo, UDP, DHCP (discover / request / lease), DNS and SNTP. All hardware-proven on four
 boards.
 
@@ -392,6 +392,10 @@ So the phase order changes. What was P0 is now this, and everything after it dep
 
 Until the stash lands, one transaction per request is the honest ceiling, and `utilities/48_tcp.md`
 says so where a user would otherwise wonder.
+
+*(Note 2026-10-09: the "next" and "then" rows are the plan as it stood on 2026-09-14. The Pi 4
+section below (2026-09-15) records the client-hop correlation tag, the bounded stash and passive open
+as built, and congestion control is the third "done" row; `HOLD_MS` is 1,500 in `net-stack`.)*
 
 **The SDK change this predicted has been made, and it was the right one of the two.** net-stack could
 not write its own send-and-await: `find_send_slot` and `await_slice` are private, and

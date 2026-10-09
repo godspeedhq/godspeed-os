@@ -9,14 +9,14 @@
 //! `Dma` is only constructable inside this crate, from a kernel-granted region.
 
 /// A physically-contiguous DMA arena granted to a driver (e.g. via
-/// [`crate::ServiceContext::dma_region`]). The CPU accesses it through `base`
-/// (a normal cacheable mapping - x86 DMA is cache-coherent); the device through
+/// [`crate::ServiceContext::dma_region`]). The CPU accesses it through `base`, the device through
 /// `phys`. Both views cover the same `len` bytes one-to-one.
 ///
-/// SEC-28 (SMP-port contract, `kernel/src/arch/CLAUDE.md`): this cacheable, no-maintenance mapping
-/// assumes x86 DMA coherence. On a non-coherent arch (AArch64) a port must add cache maintenance here
-/// (clean before a device read of a CPU-written buffer; invalidate before a CPU read of a device-written
-/// one) or map the arena non-cacheable - else the CPU and the device can see stale copies.
+/// SEC-28 (SMP-port contract, `kernel/src/arch/CLAUDE.md`): this wrapper does NO cache maintenance.
+/// That is correct only because of how each port maps the arena (`DMA_ARENA_UNCACHED`): x86 maps it
+/// cacheable, its DMA being coherent; arm32 and aarch64, whose DMA is not, map it UNCACHED, which is
+/// their answer to SEC-28; riscv64 maps it cacheable. A port whose DMA is not coherent must map it
+/// uncached too, or add maintenance here - else the CPU and the device can see stale copies.
 #[derive(Clone, Copy)]
 pub struct Dma {
     base: *mut u8,
@@ -127,7 +127,7 @@ impl Dma {
         unsafe { core::ptr::read_volatile(self.base.add(off)) }
     }
 
-    /// Read a 16-bit value at byte offset `off` (2-byte aligned, `off < len`).
+    /// Read a 16-bit value at byte offset `off` (`off + 2 <= len`; any alignment - see ALIGNMENT above).
     #[inline]
     pub fn read16(&self, off: usize) -> u16 {
         self.check(off, 2);
@@ -138,7 +138,7 @@ impl Dma {
         unsafe { core::ptr::read_volatile(self.base.add(off) as *const u16) }
     }
 
-    /// Read a 32-bit value at byte offset `off` (4-byte aligned, `off < len`).
+    /// Read a 32-bit value at byte offset `off` (`off + 4 <= len`; any alignment - see ALIGNMENT above).
     #[inline]
     pub fn read32(&self, off: usize) -> u32 {
         self.check(off, 4);
@@ -151,7 +151,7 @@ impl Dma {
         unsafe { core::ptr::read_volatile(self.base.add(off) as *const u32) }
     }
 
-    /// Write a 32-bit value at byte offset `off` (4-byte aligned, `off < len`).
+    /// Write a 32-bit value at byte offset `off` (`off + 4 <= len`; any alignment - see ALIGNMENT above).
     #[inline]
     pub fn write32(&self, off: usize, val: u32) {
         self.check(off, 4);
@@ -173,7 +173,7 @@ impl Dma {
         unsafe { core::ptr::write_volatile(self.base.add(off), val) }
     }
 
-    /// Write a 16-bit value at byte offset `off` (2-byte aligned, `off < len`).
+    /// Write a 16-bit value at byte offset `off` (`off + 2 <= len`; any alignment - see ALIGNMENT above).
     #[inline]
     pub fn write16(&self, off: usize, val: u16) {
         self.check(off, 2);
@@ -187,7 +187,7 @@ impl Dma {
         unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u16, val) }
     }
 
-    /// Read a 64-bit value at byte offset `off` (8-byte aligned, `off < len`).
+    /// Read a 64-bit value at byte offset `off` (`off + 8 <= len`; any alignment - see ALIGNMENT above).
     #[inline]
     pub fn read64(&self, off: usize) -> u64 {
         self.check(off, 8);
@@ -198,7 +198,7 @@ impl Dma {
         unsafe { core::ptr::read_volatile(self.base.add(off) as *const u64) }
     }
 
-    /// Write a 64-bit value at byte offset `off` (8-byte aligned, `off < len`).
+    /// Write a 64-bit value at byte offset `off` (`off + 8 <= len`; any alignment - see ALIGNMENT above).
     #[inline]
     pub fn write64(&self, off: usize, val: u64) {
         self.check(off, 8);

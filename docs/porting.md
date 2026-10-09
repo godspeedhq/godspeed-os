@@ -110,7 +110,7 @@ answered by every arch including the scaffolds.
 | `sdk/rust/src/adversarial.rs` (6) | Deliberate ring-3 faults for §22 A14/C2 - a non-canonical read and a trapping divide, which have no portable spelling. **You do not need these to boot**; see `backlog/24` for why none of them currently runs off x86 anyway. |
 | `sdk/rust/src/ipc.rs` (1) | A timeout clamp on `target_pointer_width`, not on your ISA. If you are 64-bit it does not apply; if you are 32-bit it already covers you. |
 
-### 33 above the kernel - where the real work is left
+### 41 in the services - where the real work is left
 
 **Read this part before you assume a booting kernel means you are done.** CLAUDE.md §4.1: *an ISA
 port is not complete when it boots. It is complete when architecture-neutral code no longer knows
@@ -124,6 +124,7 @@ that the ISA was added.*
 | `services/supervisor/src/main.rs` (4) | which peers `block-driver` and `nic-driver` need | **Add an arm** if your storage or NIC sits behind a USB host. |
 | `services/nic-driver/src/main.rs` (10) | which MAC driver to run | **Add an arm, and know that this is the worst one.** Three of the four PORTS pick their NIC by instruction set, which fails on its own terms: a different NIC on a board of the same ISA drives the wrong silicon. `backlog/21` has the fix (a kernel query reporting which controller the boot probe found) and the reason it is not done. |
 | `services/hw-enumerator/src/main.rs` (3) | mechanism #1 or ECAM config-space selector | **Add an arm** if you have PCI. A port that is neither fails to COMPILE, which is deliberate - a wrong default would silently address the wrong registers. `backlog/25` has the clean form. |
+| `services/wifi-driver/build.rs` (2) | which SD host the board's radio sits behind (`dw_mmc` or Arasan) | **Add one arm** if your board has a radio. Same shape as the other build tables. |
 | `services/net-stack/src/main.rs` (1) | is this counter a CPU cycle count or a wall clock | **Nothing.** The default is the wall-clock floor, which is what every non-x86 port has turned out to need. If calibration fails it now says so in one line rather than surfacing as "ping feels slow" three layers away. |
 
 ---

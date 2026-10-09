@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Reach the USB disk through the **`xhci` SERVICE** instead of the in-kernel USB stack.
+//! Reach the USB disk through the **USB host SERVICE** (`xhci`, or `dwc2` on the Pi 2) instead of the
+//! in-kernel USB stack that used to carry it.
 //!
-//! `usbdisk.rs` reaches its device through four syscalls - `usb_disk_sectors/read/write/flush` -
-//! which exist to expose a USB stack that lives IN THE KERNEL. That was true on aarch64 when this
+//! `usbdisk.rs` used to reach its device through four syscalls - `usb_disk_sectors/read/write/flush` -
+//! which existed to expose a USB stack that lived IN THE KERNEL. That was true on aarch64 when this
 //! module was written; it is not now. `kernel/src/arch/aarch64/xhci.rs` (2742 lines of ring-0 code
 //! parsing descriptors supplied by whatever was plugged in) was DELETED, along with the feature flags
 //! that used to select between the two drivers, so on this port the service below is the only route
 //! and Commandment I is closed (CLAUDE.md §6.4, amendment 2026-08-09).
 //!
-//! The syscall route in `usbdisk.rs` survives for a board with no such service, and **no shipping
-//! port is one**: arm32's DWC2 stack left the kernel a week after aarch64's xHCI did (CLAUDE.md §6.4,
-//! amendment 2026-08-17), so every USB board now comes through here.
+//! There is no syscall route left: arm32's DWC2 stack left the kernel a week after aarch64's xHCI did
+//! (CLAUDE.md §6.4, amendment 2026-08-17), and `usbdisk.rs` now calls this module for every operation,
+//! so every USB board comes through here.
 //!
 //! Which service to ask is `STORAGE_HOST`, set by `build.rs` from the target. It used to be a build
 //! FEATURE, which was a footgun - the switch had to reach three crates by hand, and setting only some
 //! gave two drivers on one controller, or none. A value DERIVED from the target cargo is already
 //! building for cannot be half-set, which is the property that was actually wanted.
 //!
-//! This module is the other route. Same four operations, addressed to the `xhci` service by name
-//! over IPC, using the block protocol that service already serves (`services/xhci/src/msc.rs`).
+//! This module is that route. Four operations, addressed to the host service by name (`XHCI`, which is
+//! `STORAGE_HOST`) over IPC, using the block protocol that service already serves
+//! (`services/xhci/src/msc.rs`; `dwc2` serves the same wire format).
 //!
 //! ## Why this is a proxy and not a rewrite
 //!
@@ -56,12 +58,6 @@ use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_OK};
 /// nothing fails loudly rather than reaching some other service by accident.
 pub(crate) const XHCI: &str = env!("STORAGE_HOST");
 
-/// One request/reply to `xhci`, with a single reacquire-and-retry.
-///
-/// The retry exists for one specific, expected condition: the service restarted and this cap went
-/// stale. Reacquiring by name re-establishes the same path (§14.3). It is ONE retry, not a loop -
-/// a service that is genuinely gone must surface as a failure rather than as an operation that
-/// never returns.
 /// How long ONE question to the USB host service may take. Two numbers, because the two kinds of
 /// question have nothing in common:
 ///
@@ -75,6 +71,11 @@ const CAPACITY_RPC_SECS: i64 = 2;
 const IO_RPC_SECS: i64 = 10;
 
 /// One request to the USB host service, BOUNDED.
+///
+/// With a single reacquire-and-retry. The retry exists for one specific, expected condition: the
+/// service restarted and this cap went stale. Reacquiring by name re-establishes the same path
+/// (§14.3). It is ONE retry, not a loop - a service that is genuinely gone must surface as a failure
+/// rather than as an operation that never returns.
 ///
 /// This used `request_with_reply`, whose own SDK comment says it plainly: "No deadline on this
 /// variant, so `None` is always a lost peer, never a timeout." An unbounded `call` wakes on a reply
@@ -104,7 +105,8 @@ fn rpc_within(ctx: &ServiceContext, req: &[u8], secs: i64) -> Option<Message> {
             // THE DEADLINE PASSED, AND THIS IS NOT RETRIED. The request may still be in flight, so a
             // second one would leave the first reply to arrive as an orphan and desync every exchange
             // after it - the same reason `fs` refuses to re-send a request we did not answer in time.
-            // Retry belongs to `Err` alone, which means the SEND failed and nothing is outstanding.
+            // Retry belongs to the other errors: a send that never left (nothing is outstanding), or
+            // a peer that died holding the request (`PeerDied`), which nothing will now answer.
             ctx.log_fmt(format_args!(
                 "block-driver: '{}' did not answer within {} s - reporting storage UNAVAILABLE rather \
                  than waiting on it (it is reachable but silent: busy, wedged, or idling with no \

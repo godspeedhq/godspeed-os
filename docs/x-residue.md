@@ -21,7 +21,8 @@ into ring 0, and they are filed under I because that is the commandment they wer
 | `I-syscalls` | a syscall admitted to the surface without deliberation |
 | `I-kernel-deps` | a crate linked into ring 0 without deliberation |
 
-Plus `I-kernel-spawns`, `I-service-table`, `I-features` and `I-introspect` on the same axis. If X's
+Plus `I-kernel-spawns`, `I-service-table`, `I-features`, `I-introspect` and `I-authorities` on the
+same axis. If X's
 first sentence is violated, one of those fires.
 
 ## The user half: enforced as of 2026-09-14, narrowly
@@ -51,7 +52,7 @@ that a device's *class* is the kernel's fact while its *meaning* is the driver's
 an argument, made once, recorded in an amendment. A pattern cannot make it.
 
 What a checker CAN do is notice afterwards that the argument was never made: a new kernel module, a
-new syscall, a new ring-0 dependency, a verb with no documentation. That is what the eight checks
+new syscall, a new ring-0 dependency, a verb with no documentation. That is what the nine checks
 above do. They are a tripwire on the consequences, not a judge of the decision.
 
 **Three things are therefore still unguarded, and are listed so they are not mistaken for covered:**

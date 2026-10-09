@@ -57,9 +57,9 @@ has to pass is:
 
 > **is this command's value its EFFECT, or its OUTPUT?**
 
-A detached job holds no `console_push` capability (§4), so a command whose whole product is a report
-has nowhere to put it. That is a fact about what the job can reach, not a policy someone chose, and
-it sorts the candidates cleanly:
+A detached job does not print to the prompt (§4): what it says goes into its transcript (§4a) until
+somebody asks for it, so a command whose whole product is a report has nowhere useful to put it. That
+sorts the candidates cleanly:
 
 | command | detached? | why |
 |---|---|---|
@@ -156,9 +156,9 @@ the walk.
 ## 4a. The transcript: where a detached job's output lives
 
 A job holds no console. Its output goes into a **fixed 4 KiB ring inside the job service**, and
-`foreground` pulls it out when somebody asks. Nothing is ever pushed, so the property that makes the
-whole design safe is untouched: a job still cannot write over a prompt somebody is typing at,
-because it still holds no capability that reaches the console.
+`foreground` pulls it out when somebody asks. Nothing is ever pushed, so a job does not write over a
+prompt somebody is typing at. (That is by convention - the job never calls `gs::io` - not by
+capability: `copier` holds `log_write`, and printing is `log_write`. See §4.)
 
 ```
 gsh> background drives check
@@ -207,8 +207,10 @@ perfectly.
 ## 4. What a job can reach
 
 The `copier` service holds `fs` and its log. **It has no `console_push`**, so a detached job cannot
-write over a prompt somebody is typing at - not by convention but because it holds no capability
-that reaches the console (§3.1). It cannot spawn, reboot, or reach the network.
+inject keystrokes into the shell's input. It CAN write to the console - every task can, through
+`log_write` - and stays off the prompt by convention: it never calls `gs::io`. (This said a
+capability stopped it; printing needs only `log_write`, so none does. Corrected 2026-10-09, with the
+contract's own comment.) It cannot spawn, reboot, or reach the network.
 
 **The honest limit of that claim.** The design note describes minting a READ capability for the
 source and a WRITE capability for the destination and handing over exactly those, so a job could

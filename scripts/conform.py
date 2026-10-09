@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """`conform` - one front door to the enforcement layer, rendering like `rustc`.
 
-WHY THIS EXISTS. The rules of this project are mechanised and good: 40 scripts, and `osdev`'s
-`EXTRA_CHECKS` runs 16 of them plus `commandments.py` on every build. What there was no way to do was
+WHY THIS EXISTS. The rules of this project are mechanised and good: some fifty scripts, and `osdev`'s
+`EXTRA_CHECKS` runs 23 of them plus `commandments.py` on every build (counts as of 2026-10-09; the
+list is read from osdev at run time, never from this sentence). What there was no way to do was
 ASK. A contributor could not find out whether they were clear without compiling a kernel, there was no
 single verdict, and the rules were enforced without being DISCOVERABLE - you learned them by failing a
 build, which is exactly what CLAUDE.md 22.7 says the repository must not require of a stranger.
@@ -18,8 +19,9 @@ build, which is exactly what CLAUDE.md 22.7 says the repository must not require
 
 THE ONE DESIGN DECISION, and everything else follows from it: **decidable versus judgement.**
 
-  DECIDABLE  one right answer, no reader needed. An em-dash must be a hyphen; a CRLF must be an LF;
-             trailing whitespace goes. `conform` fixes these and NAMES each file it touched.
+  DECIDABLE  one right answer, no reader needed. An em-dash must be a hyphen; a CRLF must be an LF
+             where `.gitattributes` says `eol=lf`. `conform` fixes these two (and only these - it does
+             not touch trailing whitespace) and NAMES each file it touched.
   JUDGEMENT  the fix is not determined by the violation. A comment naming a dead symbol might want
              correcting, or might be correctly RECORDING a removal and want baselining - and only a
              human knows which. HALF of what the 2026-09-26 comment sweep found was the second kind.
@@ -40,8 +42,9 @@ checker added there is picked up here with no edit. `doc_command_check.py` reads
 for the same reason.
 
 NEVER RUNS `commandments_redteam.py`. It plants `static mut SNEAK`, a `sneaky-mode` feature and
-`ctx.spawn("probe-recv")` into source and restores with `git checkout`, which would destroy a
-contributor's uncommitted work. It proves a checker CAN fail; that is a maintainer tool, run
+`ctx.spawn("probe-recv")` into source and restores them afterwards. It once restored with
+`git checkout`, which destroyed uncommitted work; it restores from a snapshot now, but a run that is
+interrupted, or one alongside another process reading the tree, still leaves or reads planted code. It proves a checker CAN fail; that is a maintainer tool, run
 deliberately, never from a verb a newcomer types.
 """
 import io
@@ -388,7 +391,8 @@ def checkers():
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-# One stable code per Commandment. `commandments.py` covers all ten, so framing it under a single code
+# One stable code per Commandment. `commandments.py` reports against all ten (VIII has no check, so
+# GS0008 is never produced - `--list` says so), so framing it under a single code
 # threw away the only thing the frame is for: naming WHICH of the Ten a violation breaks.
 NUMERALS = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
 # GS0001..GS0010: the number IS the commandment numeral, so `GS0004` is IV and needs no decoder.

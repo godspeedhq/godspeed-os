@@ -31,7 +31,7 @@ A component takes on responsibility that belongs elsewhere.
 
 | Violation | The correct pattern |
 |-----------|---------------------|
-| Kernel parses TOML service contracts. | `osdev` validates contracts at build time (§13.4); the supervisor reads them; the kernel only mints caps *from* the parsed result at spawn (§13.6). |
+| Kernel parses TOML service contracts. | `osdev` validates contracts at build time (§13.4) and `scripts/contract_check.py` reconciles them with what is really granted; nothing parses TOML at spawn. The kernel mints caps from the supervisor's *spawn request* (§13.6). |
 | Kernel knows service names beyond the supervisor. | The kernel holds one minimal `name -> EndpointId` recovery directory (`ipc::names`, §3.7); all *policy* about names lives in the supervisor. |
 | Kernel decides restart policy. | The supervisor holds restart authority (§14.4). The kernel's one restart act is respawning the supervisor itself (§6.2) - the last-resort anchor, not a policy engine. |
 | Kernel retries failed IPC automatically. | The kernel returns the failure (`EndpointDead`/`CapRevoked`); the *client* retries, degrades, or fails (§14.3). Hidden kernel retries are a silent fallback (§26.4). |
@@ -51,7 +51,7 @@ mechanically enforced by `scripts/arch_boundary_check.py`.
 | Violation | The correct pattern |
 |-----------|---------------------|
 | Shared kernel imports `arch::x86_64::`. | Name only `arch::imp::`; a specific arch named outside `arch/` is exactly the leak the CI guard rejects. |
-| Generic code knows about the APIC (or any interrupt controller). | Reach it through an `arch::imp` primitive (e.g. `send_ipi`, `eoi`); the controller is arch-specific. |
+| Generic code knows about the APIC (or any interrupt controller). | Reach it through an `arch::imp` primitive (e.g. `boot::send_ipi_to_lapic`, `interrupts::send_eoi`); the controller is arch-specific. |
 | Generic code assumes a page size. | Take the page size from the arch layer; do not hardcode `4096` in neutral code. |
 | Common allocator assumes a cache-line size. | Parameterize from the arch layer; do not bake a constant into neutral code. |
 | Driver or neutral code assumes little-endian layout. | Convert explicitly (`to_le_bytes`/`from_le_bytes`); the neutral kernel compiles big-endian (s390x, `docs/multi-arch.md`), so implicit endianness is a bug. |
@@ -74,7 +74,7 @@ reconcilable, never a second truth), Invariant 9.
 | Kernel remembers mounted filesystems. | `fs` owns mount state; the kernel knows only opaque `ResourceId`s and owners (§4.4, §7.10). |
 | `net` caches the IP address instead of querying the network owner. | Query `net-stack` (or reflect its notification); do not keep a second authoritative IP that can drift (this is the exact `net` bug fixed in the networking robustness pass). |
 | Driver stores configuration already owned elsewhere. | Hold only what the driver irreducibly owns (device registers); derive the rest from the owner. |
-| Multiple sources of current time. | One clock source (the RTC/TSC via the kernel, §clock); everything else derives from it. |
+| Multiple sources of current time. | One clock source (the RTC/cycle counter via the kernel's `InspectKernel` queries); everything else derives from it. |
 | Cached health/status instead of querying the service. | Serve the live answer, or a *reconciled* view; never present a stale cache as authoritative (Honest Truth). |
 
 A stored cache/index/count is fine **if** it reduces to one source, reconciles when it drifts, and is
@@ -126,7 +126,7 @@ Invariant 7.
 
 | Violation | The correct pattern |
 |-----------|---------------------|
-| Use authority the contract never declared. | Declare it. A cap not in the contract is not minted at spawn; using it fails `CapNotHeld` (§13.6). Redesign the contract, not a back channel. |
+| Use authority the contract never declared. | Declare it in the contract AND grant it in the supervisor's spawn request: the kernel mints only what the request asks for, so a cap the request lacks fails `CapNotHeld` whatever the contract says (§13.6), and the checkers (`contract_check.py`, `IV-contract-authority`) fail a contract and a request that disagree. Redesign the contract, not a back channel. |
 | Behavior exceeds what the contract states. | The contract is the honest description of what the service does and needs; keep them in lockstep. |
 | Communicate outside declared endpoints. | All IPC goes through declared `ipc_send`/`ipc_receive` peers; there is no hidden path (Commandment IV). |
 | A contract that over-declares "just in case". | Declare the *minimum*; that minimum is the security boundary. Unused authority is latent risk. |
@@ -174,7 +174,7 @@ Recovery succeeds only on the happy path.
 
 | Violation | The correct pattern |
 |-----------|---------------------|
-| A retry assumes the same service instance still exists. | Reacquire the peer *by name* (a fresh instance, new generation) and retry (§14.3). |
+| A retry assumes the same service instance still exists. | Reacquire the peer *by name* (a fresh instance, new generation) and retry (§14.3) - but re-send only what never left (`Error::retry_is_safe`) or what is safe to repeat. A request that timed out (`OutcomeUnknown`) or whose peer died holding it (`PeerDied`) may already have happened. |
 | Restart skips rebuilding dependent state. | Reconstruct all state on spawn from its durable source; assume nothing survived (Commandment V, `examples/counter`). |
 | A handle reused across service generations. | Reacquiring the endpoint is not enough: a socket/id/generation/cached value from the *dead* incarnation is stale too, and must be re-established (§14.3). |
 | Recovery skips capability validation. | The reacquired cap is validated like any other; recovery is not a trusted path. |
@@ -227,7 +227,7 @@ failures), §3.12, §26.7.
 |-----------|---------------------|
 | Network always exists. | Query it; degrade loudly when it is absent (report "no link", never a fabricated status). |
 | Filesystem is always mounted. | Check the reply status; when `fs` is unreachable, say so and degrade, do not assume success. |
-| Logger never fails. | A send can fail; handle the error. The ring buffer + serial are the fallback the kernel owns, not an assumption you make. |
+| Logging never fails. | `ctx.log()` is a syscall to the kernel ring + serial (§11.4), not a send to `events`, and it can still be refused (`CapNotHeld` without `log_write`); handle the result. Logging does not depend on `events` being up, which is why it must not be re-pointed there. |
 | Supervisor never dies. | The supervisor is restartable; the kernel respawns it (§6.2). Nothing above the kernel is assumed immortal. |
 | Memory allocation always succeeds. | `AllocDenied` is a recoverable result (§10.4); handle it and degrade. |
 | Timer never jumps backwards. | Use monotonic sources for intervals; do not assume wall-clock monotonicity. |

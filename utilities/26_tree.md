@@ -33,12 +33,14 @@ usage:
 - **UTF-8.** The box glyphs (`U+2500..U+253C`) are emitted as UTF-8 and render on **both** the
   serial terminal and the display - the `console` service decodes UTF-8 and draws the box
   glyphs with **procedural strokes** (the antialiased Noto font it uses for text has no U+2500
-  block; procedural strokes also connect cell-to-cell exactly). See `kernel/src/arch/x86_64/fb.rs`.
+  block; procedural strokes also connect cell-to-cell exactly). See `services/console/src/render.rs`
+  (`cell_for_codepoint`, `box_arms`).
   Unsupported codepoints render as `?`, never silently dropped (§3.12).
 - The root line shows the path as given; deeper entries show their basename.
 - Ends with a blank line then a summary: `N directories, M files` (counting everything *under*
   the root).
-- A path that names a file prints just that file; a missing path is a loud error (§3.12).
+- A path that names a file prints just that file (then `0 directories, 1 file`); a missing path
+  is a loud error, `tree: not found: <path>` (§3.12).
 
 Example:
 
@@ -60,8 +62,12 @@ bounded-walk discipline** `find` uses (§26.6) - a fixed-capacity explicit stack
 **no recursion**. Every child (file or dir) is pushed so siblings nest correctly, and a
 directory's whole subtree drains before its next sibling (LIFO + reverse-push). If a tree is
 wider than the walk's capacity it reports truncation rather than silently dropping branches
-(§3.12), exactly like `find`. Path-length limits (`PATH_MAX`, the u8 wire `path_len`) bound
-real depth to ~60 levels, well within the walk.
+(§3.12), exactly like `find`. The walk's own limits are fixed: `TREE_CAP` (96) pending
+entries, `TREE_FANOUT` (64) children drawn per directory, and `TREE_MAX_DEPTH` (32) levels,
+which binds before the path-length limit (`PATH_MAX`) does. Hitting the depth or fan-out
+limit, a path too long to join, or a directory that could not be read to the end prints
+`tree: stopped early - a LIMIT was reached ...`; overflowing the stack prints `tree:
+truncated - ...`.
 
 The connectors come for free from the same DFS: each node carries whether it is its parent's
 **last** child (drives `└──` vs `├──`), and a small `level_last[depth]` array records each
@@ -78,7 +84,9 @@ storage.
 
 Conforms: own `tree help` / `tree version` (with a real example, per `0_conventions.md`).
 
-Also conforms to **rule 10** (`0_conventions.md` §1.10): each `LIST_DIR` step is **q-abortable** via
-`fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to the prompt (a fast
-reply prints nothing). This replaced a bare `request_with_reply`, which rule 10 forbids for an
-interactive command.
+**Does NOT currently conform to rule 10** (`0_conventions.md` §1.10), found 2026-10-09. The `fs`
+requests of the walk go through a `gs::fs::Fs` handle that is lent no notice, so each request is bounded
+(`gs::call::DEFAULT_SECS`, 5 s) but prints no `[q] quit` and cannot be ended with `q`; the
+`Cancelled` branches in the handler are unreachable. This said the request was q-abortable via
+`fs_request_q`, which no longer exists. `dir` is the one fs-backed command that still lends the
+notice (`16_dir.md` §6); the same `.noticing(...)` here is the fix.

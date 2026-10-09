@@ -4,7 +4,9 @@
 /// Actions a capability may authorise on its target resource.
 ///
 /// Rights are **non-escalating**: a `GRANT` transfer can only narrow rights,
-/// never widen them. The kernel enforces this on every cap insertion.
+/// never widen them. The kernel holds this by construction rather than by a check
+/// at insertion (`CapTable::insert` checks nothing): every transfer path installs a
+/// copy of a cap the sender already holds, or one narrowed by `without`/`narrow`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rights(pub(crate) u8);
 

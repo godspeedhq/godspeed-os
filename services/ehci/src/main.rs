@@ -11,13 +11,14 @@
 //! The T630's back USB sockets are wired to the EHCI controller (PCI 00:12.0),
 //! not the xHCI that the [`xhci`] driver handles - so a keyboard in the back is
 //! invisible to us. This service drives the EHCI to reach it, in the same spirit
-//! as the xHCI driver: a **userspace** service holding the controller's MMIO (and
-//! later DMA) capability, with the kernel only discovering the controller and
+//! as the xHCI driver: a **userspace** service holding the controller's MMIO and
+//! DMA capabilities, with the kernel only discovering the controller and
 //! granting access. The kernel stays small (§4.4); all USB 2.0 protocol lives
 //! here, `unsafe`-free behind the SDK's audited `Mmio`/`Dma` wrappers (§18.1).
 //!
-//! Staged build (mirrors how xHCI was grown):
-//!   E1  read capability registers (THIS stage)
+//! Staged build (mirrors how xHCI was grown; every stage below is built, and E6 adds the
+//! hot-plug loop):
+//!   E1  read capability registers
 //!   E2  DMA arena + reset + run
 //!   E3  root ports → rate-matching hub enumeration
 //!   E4  address the keyboard via split transactions
@@ -45,7 +46,7 @@ const CAP_HCCPARAMS:  usize = 0x08; // u32 - capability parameters
 fn idle_draining(ctx: &ServiceContext) -> ! {
     // Drain by POLLING (try_recv), not a blocking recv: a cross-core flood that must WAKE a deeply-blocked
     // recv on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven
-    // poll drains every quantum with no wake needed. Busy-yield is fine for this rare no-controller path.
+    // poll drains every quantum with no wake needed, parked in between (`sleep_quantum`), not spinning.
     loop { while gs::ipc::try_recv(ctx).is_some() {} gs::task::sleep_quantum(ctx); }
 }
 
@@ -209,7 +210,6 @@ const QTD_STATUS: usize = 0x080; // STATUS-stage qTD
 const SETUP_PKT:  usize = 0x100; // 8-byte USB setup packet
 const DATA_BUF:   usize = 0x200; // control-transfer data buffer
 
-// qTD token bits.
 /// C8-1: how long a control transfer may take before we stop waiting. A DURATION, not a read count.
 ///
 /// It was `2_000_000_000` raw counter cycles - a duration only on the board it was worked out on, ~1 s
@@ -217,6 +217,7 @@ const DATA_BUF:   usize = 0x200; // control-transfer data buffer
 const CTRL_XFER_WAIT: Budget = Budget::ms(1_000);
 /// One-shot guard for the control-transfer timeout notice.
 static TIMED_OUT_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// qTD token bits.
 const QTD_ACTIVE: u32 = 1 << 7;
 const QTD_HALTED: u32 = 1 << 6;
 const QTD_ERRMASK: u32 = (1 << 3) | (1 << 4) | (1 << 5); // XactErr | Babble | BufErr
@@ -386,9 +387,10 @@ fn control(
     Some(moved)
 }
 
-/// E3b/E3c - address and configure the high-speed hub on the port, then read its
-/// hub descriptor (downstream port count). The keyboard is on one of those ports;
-/// E3c-2 will power them and find it.
+/// E3b/E3c - address and configure the high-speed hub on the port, read its hub
+/// descriptor (downstream port count), then run the E6 hot-plug loop over its ports
+/// for the rest of the driver's life. Returns only when a step of the hub's own
+/// bring-up fails.
 fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     let dma = match ctx.dma_region() {
         Some(d) => d,
@@ -610,7 +612,7 @@ fn scan_devices(
         // keyboard to a front xHCI port. Same five tries as `setup_hid` uses, for the same reason.
         //
         // WHY `xhci` NEEDS NO EQUIVALENT, so nobody adds one and nobody removes this for symmetry: every
-        // endpoint context that driver programs carries CErr = 3 (`(3 << 1)` in dword 1, at five sites),
+        // endpoint context that driver programs carries CErr = 3 (`(3 << 1)` in dword 1, at every site - seven today),
         // so the xHCI CONTROLLER retries a transaction three times in hardware before it reports a
         // Transaction Error at all. The failure this retry exists for never reaches its `control()`. The
         // rule is "retry where the controller does not", NOT "every USB driver retries" - and the
@@ -973,7 +975,8 @@ fn poll_devices(
         // keeps the proven busy-poll: yield each pass (preemption still shares the core) and scan
         // again. The cost is its core runs hot - accepted, because it is the ONLY model in which
         // this controller's split-transaction keyboard works. It is pinned to its own core
-        // (task/mod.rs) so the system core and the interrupt-driven xHCI's core stay idle.
+        // (core 3, its spawn row in the supervisor) so the system core and the interrupt-driven
+        // xHCI's core stay idle.
         // (USBINTR + the drain/unmask below are belt-and-suspenders: if an INTx ever does post an
         // IPC, we drain + ack it so it can't storm; the qTD scan above is what actually reads
         // the keyboard.)
@@ -1012,7 +1015,7 @@ fn poll_devices(
         // `irq: FIRST delivery of vector 0x29 on core 0 (routed: yes)` - the interrupt arrives, and
         // it arrives at THIS endpoint.
         //
-        // So the wait is no longer a pace to be kept. `recv_timeout` returns EARLY on the interrupt
+        // So the wait is no longer a pace to be kept. `recv_within_ms` returns EARLY on the interrupt
         // and otherwise at the deadline, which makes the deadline a hot-plug watchdog instead of a
         // 100-times-a-second heartbeat. Same worst-case latency, and the core can actually halt
         // between keystrokes - the property the `sleep` above was reaching for and could not have,

@@ -108,7 +108,6 @@ dwmac4_setup
 ep_is_in
 eqos_free_pkt
 f_apic
-fb_barrier
 file_record
 fix_mac_speed
 fs_index
@@ -121,7 +120,6 @@ hdmitx0_pixelclk
 hub_irq
 hw_mmio_of
 hw_params
-init_apic_timer
 init_uart_clock
 is_probe
 link_update
@@ -175,7 +173,6 @@ usb_125m
 usb_hub_clear_tt_buffer
 vout_axi
 vs_dc_enable
-workflow_dispatch
 yt8531_link_change_notify
 ytphy_get_delay_reg_value
 hotplug_poll                       # arch/arm/mod.rs - the in-kernel dwc2's exclusion protocol, named as history at the point a reader asks why masking was rejected
@@ -597,7 +594,6 @@ ieee80211_add_link_elems           # Linux mac80211 / include (mlme.c, wpa.c, ke
 IEEE80211_ASSOC_TIMEOUT            # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 IEEE80211_AUTH_TIMEOUT             # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 ieee80211_crypto_ccmp_decrypt      # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
-IEEE80211_KEY_FLAG_PAIRWISE        # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 ieee80211_send_assoc               # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 mask_hi                            # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14
 mask_lo                            # Linux rtl8xxxu (core.c, 8192c.c, rtl8xxxu.h, regs.h), cited by wifi-usb and dwc2 for the RTL8188CUS transmit/receive descriptors, CAM, radio off and rate mask (R5-R8) - external, 26.14

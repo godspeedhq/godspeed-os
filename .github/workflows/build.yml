@@ -29,9 +29,9 @@ jobs:
         with:
           python-version: '3.8'
 
-      # Services must be built before the kernel: kernel/build.rs embeds service
-      # ELF bytes via include_bytes!(env!("SVC_*_ELF")), so the service binaries
-      # must exist in target/ before the kernel crate compiles.
+      # Services must be built before the kernel: kernel/build.rs embeds the supervisor's
+      # ELF via include_bytes!(env!("SVC_SUPERVISOR_ELF")) and the supervisor embeds every
+      # other service, so the binaries must exist in target/ before either crate compiles.
       - name: Build services (bare-metal)
         # THE SUPERVISOR EMBEDS THE OTHER SERVICES, so they must be built first. `--workspace` gives
         # cargo no ordering guarantee between members, so a plain workspace build can reach
@@ -81,7 +81,8 @@ jobs:
       - name: Arch-boundary check (no arch-specific code in neutral layers)
         run: python3 scripts/arch_boundary_check.py
 
-      # Silent on any branch that does not add an ISA. On one that does, it is the only check that
+      # Silent on any branch that neither adds an arch directory nor touches exactly one (its
+      # guide cross-check still runs everywhere). On a port branch, it is the only check that
       # can see an edit to a file `docs/porting.md` marks do-not-touch - the others all ask whether
       # a RULE was broken, and an ordinary neutral-kernel edit breaks none of them.
       - name: Port-scope check (a port writes arch/<isa>/ and eleven named files, nothing else)
@@ -110,8 +111,8 @@ jobs:
       - name: Site check (the hand-written pages still describe the real repository)
         run: python3 scripts/site_check.py
 
-      # The declared Python floor must be the TRUE one. Not in osdev's EXTRA_CHECKS yet (that is
-      # a Rust edit and the branch introducing it touches none), so CI carries it meanwhile.
+      # The declared Python floor must be the TRUE one. Also in osdev's EXTRA_CHECKS now, so a
+      # local build runs it too; CI carried it while that was pending.
       - name: Python floor matches what README.md declares
         run: python3 scripts/python_floor_check.py
 

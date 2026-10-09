@@ -1,13 +1,18 @@
 # GSFS maximum carnage - the guarantees, written down, then attacked
 
 **Status, as of 2026-09-22.** `osdev test fs-all` runs **33 suites**, all passing together (~60 min, each in its own process). That sweep is the point: two of them were sitting RED with nothing watching, and BOTH were faults in the TEST rather than the filesystem - `fs-tear-detect` assumed a precondition instead of establishing it, and `fs-tear`'s probe did not recognise one of the two answers its own oracle calls legal. A suite that rots quietly is what `backlog/32` exists to prevent.
-operations, 75 tear points, 35 exercising journal recovery), resource exhaustion (`fs-full` 14/0),
-power cuts aimed and random (`fs-window` 8/0, `fs-churn` 8/0), and the **independent oracle**
-(`fs-model`, §3.2), the block layer (§3.7 - `fs-blockchaos` for the completion stream,
-`fs-blockdeath` for the driver dying mid-request; hot-unplug is not), and the duplicate-destructive-op
-gap (§3.5, `fs-dupop`), and **cross-ISA** (§3.11, `cross_isa.py` 12/0 - one volume carried
-x86-64 -> riscv64 -> x86-64). NOT RUN: the rest of §3.5 (two clients on one path) and the
-remaining rows of §3.3.
+
+Built and passing in QEMU: torn writes (`fs-tear`, nine operations and 220 tear points, §3.1),
+resource exhaustion (`fs-full` 14/0, `fs-metafull`), power cuts aimed and random (`fs-window` 8/0,
+`fs-churn`), the **independent oracle** (`fs-model`, §3.2), the block layer (§3.7 - `fs-blockchaos`
+for the completion stream, `fs-blockdeath` for the driver dying mid-request, `fs-unplug` for the
+device vanishing), concurrency and retries (§3.5 - `fs-dupop`, `fs-lostreq`, `fs-twoclient`), stale
+authority (`fs-reuse`, §3.6), the interrupted recovery (`fs-rtear`, §3.8), and **cross-ISA** (§3.11,
+`cross_isa.py` 12/0 - one volume carried x86-64 -> riscv64 -> x86-64). NOT RUN: the remaining rows
+of §3.3.
+
+*(Repaired 2026-10-09: this paragraph had lost its first line, and still said hot-unplug and two
+clients on one path were not run; `fs-unplug` and `fs-twoclient` are both in `fs-all`.)*
 
 **Mostly QEMU-validated.** The hardware results are recorded in §4 and §3.12. The one that matters
 landed on 2026-09-18: a power cut during `churn` fell INSIDE the commit-to-checkpoint window on a
@@ -49,7 +54,7 @@ before `fs-tear` joined and roughly doubles with it, because `fs-tear` boots QEM
 | `fs-ioretry` | block commands forced to FAIL through a real injection hook in the AHCI driver |
 | `fs-restart` | `fs` killed and respawned; the volume re-mounts and the data is there |
 | `fs-time` | a full machine REBOOT, then the bytes and the dates are re-read from disk |
-| `fs-fuzz` | 599 malformed protocol requests, every one answered rather than crashed |
+| `fs-fuzz` | hostile arguments through the shell (83 checks, §3.9); the 599 malformed protocol requests are `fs`'s boot-time protocol selftest (`docs/gsfs-next.md` 1c), not this suite |
 | `fs-check` / `fs-scrub` | the bitmap rebuilt from the tree; a read-only CRC sweep that repairs nothing |
 | `fs-compat` | unknown `compat` / `ro_compat` / `incompat` bits drive mount, mount-read-only, refuse |
 | `fs-frag` / `fs-large` / `file-cap` | extent lists, multi-megabyte streaming, the capability surface |
@@ -182,6 +187,9 @@ line marking a successful write. The sweep is bounded instead by the tap high-wa
 moment the preceding (read-only) command finished - measured, not assumed, since the number of boot
 writes is not a constant.
 
+*(Note 2026-10-09: the "still to do" list below was written at three operations and is done; all
+nine rows of the results table above are built. The "54 passes" above is that earlier count.)*
+
 **Still to do here:** the remaining rows of section 2. `delete` is the next one worth having and
 needs a different oracle from the three above - present-and-allocated versus absent-and-free is not a
 question `dir` can answer, because a LEAK (absent but still allocated) looks identical to a clean
@@ -308,8 +316,9 @@ interrupted seal must be able to finish rather than be refused).
 - **No interruption.** The comparison is equality. Under injected faults it must become MEMBERSHIP
   of the permitted set in §2 - which is why that table had to exist first, and is the obvious next
   step now that both halves exist.
-- **Seven of the twelve operations.** Covered: `mkdir`, `write`, `delete`, `rename`, `seal`, `read`,
-  `dir`. Not: `move`, streaming `write-at`, `delete-tree`, `mkdir -p`, `label`, `copy`.
+- **Six operations.** Covered: `mkdir`, `write`, `delete`, `rename`, `seal`, `read`, `dir` (the
+  seven `Op` variants in `osdev/src/fs_model.rs`). Not: `move`, streaming `write-at`, `delete-tree`,
+  `mkdir -p`, `label`, `copy`.
 - **Small contents and a small namespace.** Nine paths over two levels, and contents short enough to
   ride one IPC message - so the streaming path and the extent-list path are untouched here
   (`fs-large` and `fs-frag` cover those, against assertions about GSFS).
@@ -317,7 +326,7 @@ interrupted seal must be able to finish rather than be refused).
 
 ### 3.3 Crash at every persistence boundary - PARTIAL (`fs-cache` 8/0, `fs-lyingflush` 7/0)
 
-3.1 does this for three operations, exhaustively. The remaining work is the other operations and the
+3.1 does this for nine operations, exhaustively (three when this was written). The remaining work is the other operations and the
 reordered/delayed/failed variants.
 
 **BUILT: the volatile-write-cache model**, which was the item on this list that mattered most.
@@ -530,6 +539,9 @@ What is NOT covered is the reuse case the checklist names: open A, restart `fs`,
 its storage, then use A's old handle. The generation mechanism should make this impossible, and
 "should" is exactly the word this programme exists to remove.
 
+*(Note 2026-10-09: covered since by `fs-reuse` 8/0 - the stale capability resolved to nothing, not
+to the replacement. Section 4's stale-handle row has the result.)*
+
 ### 3.7 Attack the block layer - BUILT (`fs-blockchaos` 10/0, `fs-blockdeath` 11/0, `fs-unplug` 8/0)
 
 Kill and restart `block-driver` with requests outstanding; simulate hot-unplug, delayed return, I/O
@@ -709,6 +721,10 @@ case where it came out ZERO would not have tested recovery at all, however many 
 
 **What is covered:** recovery RUNS, on 35 genuinely distinct interrupted states, and the result is
 inside the permitted set every time.
+
+*(Note 2026-10-09: the 35-of-75 count is the four-operation sweep this section was written against;
+`fs-tear` has nine operations and 220 tear points now. And the nested sweep described next is built,
+as `fs-rtear` - section 4's interrupted-recovery row.)*
 
 **What is NOT covered, and is the rest of this gate:** crashing DURING the recovery. Replay is itself
 a sequence of writes, so the same record-and-replay nests - boot an `A_k` that replays, record the
@@ -897,6 +913,10 @@ already correct rather than merely correctable.
 is a SATA SSD behind AHCI, which attests durability at the journal barriers. The Pi 2's USB stick
 refuses `SYNCHRONIZE CACHE` outright, so nothing here transfers to it.
 
+*(Note 2026-10-09: that last sentence is wrong. The stick accepts the flush, and the Pi 2 recovered
+an unassisted cut in the strong form on 2026-09-23 - `CLAUDE.md` 6.1, amendment of that date, and
+section 4's hardware row. The same applies to "the Pi 2's stick is not it" further down.)*
+
 #### Reproduced twice more, 2026-09-20 - and the POST-MORTEM is now one command
 
 Two further cuts on the same board landed in the window, so the sub-millisecond window has now been
@@ -947,7 +967,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Gate | Result | Evidence / notes |
 |---|---|---|
 | Feature and operation tests | PASS (QEMU) | `osdev test fs-all` 30 of 30 in ~41 min, including `fs-tear` and `fs-model`; `files` 239/0; `shell` 183/0 (measured 2026-09-21) |
-| Independent reference-model tests | PASS (QEMU) | `osdev test fs-model` - 8 seeds, ~1,500 operations, no disagreement. Found one real gap on its first run: `seal` idempotence was decided in the code and documented nowhere. Interruption, and 5 of the 12 operations, are named as uncovered in 3.2 |
+| Independent reference-model tests | PASS (QEMU) | `osdev test fs-model` - 8 seeds, ~1,500 operations, no disagreement. Found one real gap on its first run: `seal` idempotence was decided in the code and documented nowhere. Interruption, and six operations, are named as uncovered in 3.2 |
 | Crash-point and persistence matrix | **PASSES (QEMU)** | `osdev test fs-tear` - NINE operations, 220 tear points, every one inside the permitted set, plus a control proving the oracle can reject. Nine of the eleven rows of section 2; the two `write-at` forms have no shell verb that issues `OP_WRITE_AT` alone and section 2 permits any prefix of their chunks, so they are recorded as not separately reachable rather than faked (3.1). |
 | Data/metadata exhaustion | **PASSES (QEMU)** | 3.4 - `fs-full` 14/0 and `fs-metafull` 9/0. The second fills a DIRECTORY until a create is refused and found a real leak: one block stranded per refused create, with a control attributing it to the refusal rather than the writing. Fixed. Metadata and data are not separate pools here, so exhausting one independently is unreachable. Per-allocation-point injection is still not covered. |
 | Concurrency and retry ordering | **PASSES (QEMU)** | 3.5 - `fs-dupop` 5/0, `fs-lostreq` 10/0, `fs-twoclient` 8/0. Timeouts on BOTH sides of the commit, and two real clients on one directory. The ordering guarantee is documented in `docs/persistence.md` 6.18. The duplicate-request gap is still real and still recorded: closing it needs a client-supplied op id plus a bounded reply cache in `fs`. |

@@ -64,8 +64,8 @@ not individually watched; a supervisor respawn re-runs its boot sequence and re-
 
 | Service | Notes |
 |---------|-------|
-| `recorder/` | Drains the `events` log to a file (`events persist`). The shell spawns it on demand; it is absent from the boot set AND from the supervisor's `MANAGED`, which is what keeps the whole persistence feature free of a kernel change. It is not restarted on death **on purpose**: a respawned recorder would not know its target path, so it would be alive and writing nothing while `status` said "running" - worse than dead. The capture file opens with a header and closes with a footer, so one without a footer says it died. See `services/recorder/CLAUDE.md` |
-| `copier/` | The service behind `background` (`utilities/55_background.md`). The shell spawns it on `background copy ...` or `background delete ... recursive` and it idles until told what to do; it holds `fs` and its log and **no console capability**, which is what stops a detached job writing over a prompt somebody is typing at. Not restarted on death for the recorder's reason: a respawned copier would not know what it was copying, so it would be alive and doing nothing while `jobs` said `running`. The shell reports that death as the job being `lost`. See `services/copier/CLAUDE.md` |
+| `recorder/` | Drains the `events` log to a file (`events persist`). The shell spawns it on demand; it is absent from the boot set AND from the supervisor's `MANAGED`, so nothing restarts it, and the whole persistence feature needed no kernel change. It is not restarted on death **on purpose**: a respawned recorder would not know its target path, so it would be alive and writing nothing while `status` said "running" - worse than dead. The capture file opens with a header and closes with a footer, so one without a footer says it died. See `services/recorder/CLAUDE.md` |
+| `copier/` | The service behind `background` (`utilities/55_background.md`). The shell spawns it on `background copy ...` or `background delete ... recursive` and it idles until told what to do; it holds `fs` and its log and **no `console_push`**, so it cannot inject keystrokes. It CAN write to the console, as every task can through `log_write`; it stays off a prompt somebody is typing at by convention - it never calls `gs::io` - not because a capability stops it. Not restarted on death for the recorder's reason: a respawned copier would not know what it was copying, so it would be alive and doing nothing while `jobs` said `running`. The shell reports that death as the job being `lost`. See `services/copier/CLAUDE.md` |
 
 ## Supervisor spawn order
 
@@ -104,9 +104,16 @@ Pong and ping start communicating within ~10 s of boot. `"supervisor: ready"` ap
 
 1. Copy `examples/00-hello` - `osdev new` is not implemented (CLAUDE.md 17).
 2. Write `contracts/<name>.toml` - declare only what the service actually needs.
-3. Implement `service_main(ctx: ServiceContext)` - use `ctx.capability()` for every privileged action.
+3. Implement `service_main(ctx: ServiceContext)` on `gs` (`stdlib/rust`) - `scripts/one_way_check.py`
+   holds a new crate at zero raw SDK calls. Authority comes from the spawn request, not from anything
+   the service asks for at runtime (CLAUDE.md 13.6).
 4. Add the crate to the workspace `Cargo.toml`.
-5. Run `osdev validate` - must pass before any PR.
+5. Give the supervisor its image and its spawn request: the name in `EMBEDDED` (or a board list) in
+   `supervisor/build.rs`, a `static ..._ELF` and an `IMAGES` row in `supervisor/src/main.rs`, and a
+   spawn call in its `service_main` - plus `MANAGED` if it is to be restarted, which restarts and does
+   not start. The kernel holds no image but the supervisor's (CLAUDE.md 14.1), so a service with a
+   contract and no row is never started.
+6. Run `osdev validate` - must pass before any PR.
 
 ## Service rules
 

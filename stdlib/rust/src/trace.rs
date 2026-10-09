@@ -88,8 +88,11 @@ pub fn metric(ctx: &ServiceContext, name: &str, value: u64) {
 ///
 /// # Errors
 ///
-/// [`Error::Unreachable`] if the sink could not be reached, [`Error::OutcomeUnknown`] if it did not
-/// answer in time, [`Error::Failed`] if it answered with something this cannot parse.
+/// Whatever [`crate::call::request_within`] returns: [`Error::Unreachable`] if the sink could not be
+/// reached, [`Error::Busy`] if its queue was full, [`Error::OutcomeUnknown`] if it did not answer in
+/// time, [`Error::PeerDied`] if it died holding the question. Then [`Error::Failed`] - not
+/// [`Error::Malformed`], which is what the rest of this library uses - if it answered with something
+/// this cannot parse. All of these are reads, so any of them may be asked again.
 pub fn metrics(ctx: &ServiceContext) -> Result<Table, Error> {
     let reply = ask(ctx, godspeed_sdk::trace::TRACE_OP_METRICS)?;
     let b = reply.payload_bytes();

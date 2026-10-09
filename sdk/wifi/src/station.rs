@@ -76,8 +76,8 @@ pub struct Pulled {
     /// Pairwise rekeys answered: the access point restarted the four-way handshake on the live link, and
     /// it ran to message 4 with new keys installed.
     pub pairwise_rekeyed: u32,
-    /// Pairwise rekeys that did not complete - the log names the step; the access point will drop the
-    /// link and `wifi join` brings it back.
+    /// Pairwise rekeys that did not complete - the log names the step; if the access point then drops
+    /// the link, the serve loop rejoins it once (`serve`'s `rejoin_after_drop`).
     pub pairwise_failed: u32,
     /// The link went down: `(event code, reason)`. A `LINK` event without the up bit, or a
     /// deauthentication or disassociation, in either direction.

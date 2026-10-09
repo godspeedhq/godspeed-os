@@ -13,8 +13,13 @@ the real tree, through the real file-reading path - a different claim, and the g
 already hidden a bug once (a pin vanished into a TOML sub-table while every probe kept passing, because
 the probes handed in explicit pins and never read the file).
 
-Only the green checks are exercised. Three checks are already failing against real code right now
-(I-kernel-spawns, I-responsibilities, II-chaos-exclusions), so they are validated by reality.
+Only the green checks are exercised. When this was written three checks were failing against real code
+(I-kernel-spawns, I-responsibilities, II-chaos-exclusions) and so were validated by reality. (Note
+2026-10-09: all three pass now and have no CASES row here except II, which has its own block below; the
+case labels "52nd syscall", "23rd query" and "14th authority" are the counts of that time, not today's.)
+
+It does not gate anything: it is in no build path and exits 0 whatever it prints. Read the table - a
+MISSED or ANCHOR? row, or a RESTORED count unequal to the baseline, is the failure.
 """
 import io, os, re, subprocess, sys
 
@@ -240,8 +245,8 @@ for name, what, inject, paths, created, should_catch in CASES_II:
     out = run()
     n = out.count("  Commandment")
     changed = violations(out) - base_v
-    # baseline already carries ONE Commandment II violation (observe* escaping), so a catch shows as an
-    # increase, and a correct NEGATIVE case shows as a DECREASE (the escape removed) or no change.
+    # A catch shows as a violation line absent from the baseline; a correct NEGATIVE case shows none.
+    # (The baseline once carried one Commandment II violation, `observe*` escaping; it carries none now.)
     caught = changed != set()
     ok = caught if should_catch else not caught
     print("%-24s %-52s %-6s %s" % (name, what, "CAUGHT" if caught else "silent",

@@ -8,7 +8,8 @@
 // lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
 //! `events` - the diagnostic sink (§11.4). Restartable.
 //!
-//! Two jobs, both "somewhere to put diagnostic data that someone reads later":
+//! Its jobs, all "somewhere to put diagnostic data that someone reads later" (the metric table and the
+//! log window joined the two below later - `CLAUDE.md` here lists all three stores):
 //!
 //! 1. **Drain its endpoint.** The endpoint EXISTS, so anything sent here must be consumed or the
 //!    16-deep queue sits full forever (a stub that only parks never recv's, and a `chaos flood-storm`
@@ -34,6 +35,10 @@
 //!
 //! `events` already exists in all three lists, is already managed and watched, and its entire purpose
 //! is diagnostic data. Putting the ring here costs the kernel **exactly nothing**.
+//!
+//! (Note 2026-10-09: those kernel lists are gone - the kernel's catalogue holds only the supervisor, and
+//! death notification and the restart count follow `SPAWN_FLAG_WATCHED` from the supervisor's `MANAGED`
+//! (CLAUDE.md 12.3 amendment 2026-10-03). The conclusion stands; the cost it weighed no longer exists.)
 //!
 //! It is worth being precise about one tension: `docs/logging.md` calls this service "a stateless
 //! broker, not a store", and that is about PERSISTENCE - an `events` that writes through `fs` makes
@@ -68,8 +73,8 @@ use godspeed as gs;
 /// HERE, where it costs one service more memory and costs the kernel nothing.
 const RING: usize = 192;
 
-/// Distinct metric samples retained: 64 x 36 B is about 2.3 KiB, and the whole table fits in one 4 KiB
-/// reply message with room to spare.
+/// Distinct metric samples retained: 64 x 44 B (a `MET_LEN` 40-byte record plus the sink's 4-byte
+/// stamp, `MET_OUT`) is about 2.8 KiB, and the whole table fits in one 4 KiB reply message.
 ///
 /// A FIXED table, not a map that grows with distinct names, because a counter keyed by arbitrary
 /// strings is unbounded state wearing a small hat (§26.6.1). 64 is a bound a reader can read off this

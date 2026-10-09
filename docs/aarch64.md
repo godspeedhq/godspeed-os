@@ -597,6 +597,14 @@
 > **Not done:** hardware verification of the prompt, `arch::init` + the `kernel_main` handoff, PSCI SMP,
 > and the drivers the storage/network/USB commands need (SD/EMMC, GENET, VL805 xHCI).
 >
+> *(Note 2026-10-09: the "Not done" list above is the state on 2026-08-04 and is superseded: the
+> prompt, all four cores, GENET and the VL805 `xhci` run on the board (see the status at the top).
+> SMP did NOT come through PSCI - `arch/aarch64/smp_boot.rs` releases the cores from the armstub's spin
+> table, and records why a PSCI `smc` hung the board. Two names in this block have since moved:
+> `logger` is the `events` service, and `aarch64_built` in `kernel/build.rs` now lists the whole
+> service set rather than `logger` alone. `task::spawn_service_with_config` no longer exists; the
+> kernel's one direct spawn is `task::spawn_supervisor`.)*
+>
 > **Known unknown:** the image that worked fixed two things at once - the link address *and* the PL011
 > init. The wrong link address alone was fatal, so that was necessary; whether the firmware had already
 > enabled the UART, making our init merely redundant, is untested.
@@ -785,8 +793,10 @@ Mapped from the x86 surface, in dependency order:
 6. **Timer: the ARM generic timer.** `CNTFRQ_EL0` gives a known frequency, `CNTP_TVAL`/`CNTP_CTL` drive
    the tick. This *removes* the x86 TSC-calibration pain (the AMD `CPUID 0x15/0x16` mess on the T630).
 7. **UART: PL011** (the Pi's primary UART). Small MMIO backend for `serial_write_byte` and RX.
-8. **SMP bring-up: PSCI** (`CPU_ON` via `SMC`/`HVC`) on the Pi 4 firmware, or the spin-table fallback.
-   Replaces the x86 real-mode INIT+SIPI trampoline (cleaner - no real-mode).
+8. **SMP bring-up: the spin table** the stock armstub implements (write an entry to `0xE0`/`0xE8`/`0xF0`,
+   then `sev`). PSCI (`CPU_ON` via `SMC`) was the plan and was tried first; with no EL3 handler on the
+   stock firmware the `smc` hung the board, so it was removed (`arch/aarch64/smp_boot.rs`). Replaces the
+   x86 real-mode INIT+SIPI trampoline (cleaner - no real-mode).
 
 ## 4. Board specifics - Raspberry Pi 4 Model B (BCM2711)
 
@@ -809,8 +819,8 @@ Confirm the physical board first: **Pi 4** = two micro-HDMI, USB-C power, 2xUSB3
   their DMA arenas must live in low memory. Fits the existing "reserved DMA arena per driver" model -
   just constrain where the arena is allocated.
 - **No usable SMMU for these peripherals**, so **H1/§6.4 does not travel**: DMA-capable drivers go back
-  to trusted-on-this-machine, announced loudly at boot (the machine-dependent posture the spec already
-  allows). The same binary is least-privilege where an IOMMU confines it and trust-critical where none
+  to trusted-on-this-machine (the machine-dependent posture the spec already allows). The plan was to
+  announce that loudly at boot; nothing is printed either way yet on this port (SEC-34, §7 below). The same binary is least-privilege where an IOMMU confines it and trust-critical where none
   does - now literally true across x86-with-IOMMU and this Pi.
 
 ## 5. Boot path decision - settled: bare GPU bootloader + DTB
@@ -839,7 +849,7 @@ overwriting the stock `kernel8.img` and destroying the card's only known-good ke
    neutral kernel, so anything added to the x86 boot path does not run here (`CLAUDE.md` §11.1,
    amendment 2026-09-12).
 2. GIC + generic timer + MMU + EL0/EL1 exceptions + PL011 UART.
-3. SMP via PSCI (all 4 A72 cores ready).
+3. SMP via the armstub spin table (all 4 A72 cores ready; PSCI hung the board, see §3 item 8).
 4. **Identity suite green on the arch core** - this is the definition of "the port is done", because
    everything the 24 tests exercise above the arch line is already-hardened code.
 5. Drivers, in this order: **GENET (network first, USB-independent)** -> **PCIe** -> **xhci reuse**.

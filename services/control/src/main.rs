@@ -74,8 +74,9 @@ fn execute(ctx: &ServiceContext, line: &str) {
                 // Retry ONCE when the send failed - the peer is gone, or its queue was full - and never
                 // when the deadline passed (`OutcomeUnknown`: the request may have landed).
                 // `request_within` already reacquires and resends once when the send never left; a FULL
-                // queue it hands back, and this channel retries that once too, after a reacquire, as it
-                // always has.
+                // queue it hands back, and this channel retries that once, after a reacquire, and only
+                // that. (It used to re-send after any error, `ReplyDead` included - a restart repeated
+                // blind; see the `PeerDied` arm below.)
                 let msg = Message::from_bytes(&buf[..n]);
                 let mut answer = gs::call::request_within(ctx, "supervisor", &msg, 10);
                 if answer.as_ref().err() == Some(&gs::Error::Busy) && gs::cap::reacquire(ctx, "supervisor") {

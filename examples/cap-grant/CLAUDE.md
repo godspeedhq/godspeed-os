@@ -17,8 +17,8 @@ The granter side, using only real standard-library calls:
 | Step | Call | What happens |
 |------|------|--------------|
 | Hold a grantable cap | `gs::cap::self_grant(&ctx)` | our own SEND\|GRANT cap to our endpoint (minted at spawn, from the supervisor's spawn request) - the cap others use to call us back |
-| Make a copy to give | `gs::cap::duplicate(&ctx, self_cap)` | a derived cap; rights can only narrow, never widen (§7.3) |
-| Find the peer | `gs::cap::acquire(&ctx, "receiver")` | a SEND cap to the service we will grant to |
+| Make a copy to give | `gs::cap::duplicate(&ctx, self_cap)` | a derived cap with the SAME rights; rights narrow only where a cap is minted or granted, never widen (§7.3) |
+| Find the peer | `gs::cap::acquire(&ctx, "receiver")` | a SEND cap to the service we will grant to, from the kernel's name directory (allowed because the spawn row grants `ACQUIRE_ANY`) |
 | Transfer it | `gs::ipc::send_granting(&ctx, receiver, gift, &note)` | the kernel checks the cap carries GRANT, then **moves** it into the receiver's table and removes it from ours (§7.6, §8.5) |
 
 The receiver side, in its own service, completes the transfer:
@@ -60,8 +60,11 @@ ipc_send    = ["receiver"]    # the peer we transfer the grantable cap to
 log_write   = true
 ```
 
-Everything the service can do is on this list and nowhere else (Commandment VII). It owns an
-endpoint (so it has a SEND\|GRANT cap to itself to hand out) and a SEND cap to `receiver`.
+The list is the reviewable statement; the grant is the supervisor's spawn row (CLAUDE.md 13.6). It
+owns an endpoint (so it has a SEND\|GRANT cap to itself to hand out). Note the two differ today: the
+`examples-test` row names no send peer and grants `ACQUIRE_ANY` instead, which is how its lookup of
+`receiver` reaches the name directory, and this contract declares `ipc_send = ["receiver"]` and not
+`ACQUIRE_ANY`. No gate compares an example's peers with its row.
 
 ## What you must NOT do
 

@@ -21,8 +21,8 @@
 //! # A caution the rest of this library does not need
 //!
 //! `net-stack`'s request protocol has moved 34 times in three releases. `fs`'s has not. Every opcode
-//! below is therefore pinned with the source line that defines it, and the surface is kept to the
-//! operations with a demonstrated caller - because the cost of this module being wrong is not a
+//! below therefore names the `services/net-stack` dispatch arm or constant it mirrors (line numbers
+//! are not cited: they rot), and the surface is kept to the operations with a demonstrated caller - because the cost of this module being wrong is not a
 //! compile error, it is a machine that quietly talks to the wrong port.
 
 use godspeed_sdk::capability::{CapHandle, RIGHT_READ, RIGHT_WRITE};
@@ -155,8 +155,9 @@ impl Status {
 ///
 /// # Authority
 ///
-/// Carries none of its own. Every call rides the caller's existing `ipc_send = ["net-stack"]` grant;
-/// a task whose contract never asked for it gets [`Error::Unreachable`], exactly as for any peer it
+/// Carries none of its own. Every call rides the caller's existing send capability to `net-stack`,
+/// granted by its spawn request (a contract declares it as `ipc_send = ["net-stack"]`, CLAUDE.md
+/// 13.6); a task granted none gets [`Error::Unreachable`], exactly as for any peer it
 /// cannot reach. **There is no ambient network** (§3.1, and `docs/networking.md` says the same).
 pub struct Net<'a> {
     ctx: &'a ServiceContext,
@@ -173,7 +174,7 @@ impl<'a> Net<'a> {
     /// at which point operations return [`Error::Revoked`] and you open another.
     ///
     /// **Blocks** up to [`NET_SECS`]. **Authority:** the caller's existing `net-stack` capability;
-    /// opening a socket grants nothing the contract did not already grant.
+    /// opening a socket grants nothing the spawn request did not already grant.
     ///
     /// # Errors
     /// - [`Error::Unavailable`] - `net-stack` would not open one. Usually no usable NIC.
@@ -349,7 +350,7 @@ impl<'a> Net<'a> {
     ///
     /// Writes the reply into `buf` and returns how many bytes landed there.
     ///
-    /// **Blocks** up to [`NET_SECS`]. **This one changes state on the far side**: it is a request to
+    /// **Blocks** up to [`TCP_SECS`]. **This one changes state on the far side**: it is a request to
     /// somebody else's server, and that server may act on it. On [`Error::OutcomeUnknown`] the
     /// request may have been delivered and acted upon, and re-sending it is a SECOND transaction -
     /// which for anything that is not a plain fetch is exactly the double-submit problem.
@@ -431,7 +432,8 @@ impl<'n, 'a: 'n> Socket<'n, 'a> {
     ///
     /// # The ambiguity, stated
     ///
-    /// `net-stack` answers "nothing came back" with a single zero byte, which is byte-identical to a
+    /// `net-stack` answers "nothing came back" - and also "not sent at all", when it has no gateway
+    /// yet - with a single zero byte, which is byte-identical to a
     /// genuine one-byte response of `0x00`. This reports both as `Ok(0)`. The protocol makes them the
     /// same bytes, so no reading of it can tell them apart; recording that is better than choosing
     /// one and being quietly wrong for the other. (`services/shell` reports the sentinel as one byte
@@ -593,8 +595,12 @@ impl<'c, 'n: 'c, 'a: 'n> Conn<'c, 'n, 'a> {
     /// Read whatever has arrived, into `buf`. Returns how many bytes.
     ///
     /// **Zero means nothing has arrived YET**, not end of stream - TCP delivers when it delivers, so
-    /// a caller that wants more loops. Use [`is_closed`](Conn::is_closed) to tell "nothing yet" from
-    /// "the peer has gone".
+    /// a caller that wants more loops. Nothing here tells "nothing yet" from "the peer has gone":
+    /// [`is_closed`](Conn::is_closed) reports only whether THIS handle was closed.
+    ///
+    /// **Pass a buffer of at least 2048 bytes (known defect, 2026-10-09).** `net-stack` hands over
+    /// up to 2048 bytes per call and has already taken them off the connection; anything past
+    /// `buf.len()` is dropped here without an error.
     ///
     /// **Authority:** this connection's `READ` right.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {

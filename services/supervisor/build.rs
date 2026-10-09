@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Emits `cargo:rustc-env=SVC_<NAME>_ELF` for the service images the SUPERVISOR embeds.
 //!
-//! Step C moves service images out of the kernel and into here (`docs/service-ownership.md`). The
-//! kernel's `build.rs` does the same job for the shrinking set it still holds; this is the other end
-//! of that move, and the two will trade entries until the kernel's list is `supervisor` alone.
+//! Step C moved service images out of the kernel and into here (`docs/service-ownership.md`). It is
+//! complete: the kernel's catalogue - what it can spawn by name - is the supervisor alone (CLAUDE.md
+//! 14.1), and every other image is listed below.
 //!
 //! Build ORDER makes this work: `osdev` builds every service before the supervisor, and the
 //! supervisor before the kernel, so a service binary is already on disk when this runs.
@@ -26,6 +26,7 @@ fn main() {
     //   x86_64  - xhci (front ports) + ehci (USB 2.0 back ports); no DWC2 on a PC.
     //   arm     - dwc2 alone; the Pi 2 has no PCIe, no xHCI and no EHCI.
     //   aarch64 - xhci alone; the Pi 4 drives the VL805 over PCIe, and DWC2 is arm32-only.
+    //   riscv64 - xhci alone; the VisionFive 2's Cadence USB3 host half (the `usb` match below).
     //
     // This list was flat and unconditional first, and that was WORSE THAN WRONG: on x86 the absent
     // `dwc2` did not trip the panic below, it resolved to a TWELVE-DAY-OLD binary left in the target
@@ -118,7 +119,7 @@ fn main() {
 
     // ---- ONE CFG PER IMAGE THIS BUILD ACTUALLY EMBEDS. ------------------------------------------
     //
-    // Derived from the SAME two lists that decide the embedding, three lines above - so `main.rs`
+    // Derived from the SAME lists that decide the embedding, above - so `main.rs`
     // cannot disagree with this file. That mattered: `main.rs` restated the arch split for the USB
     // images FIVE times (a `USB_IMAGES` table per arch, plus one empty catch-all) and for
     // `hw-enumerator` SEVEN times, and its own comment says what that cost - "four places had to
@@ -156,11 +157,6 @@ fn main() {
     if radio.contains(&"wifi-driver") {
         println!("cargo:rustc-cfg=nic_radio_bridge");
     }
-    // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides
-    // between the `pci_irq` hardware class and the plain one. NOT the same question as "is it on
-    // PCI": the Pi 4's VL805 is a PCIe device and still takes the plain class, because what it lacks
-    // is the routable vector, not the bus. Asking for an interrupt that can never arrive is the
-    // failure invariant 12 exists to prevent, which is why this is its own fact.
     // WHICH Pi the jack is on, for `pwm-audio`'s `mode`: the PWM block, its DMA request line and the
     // PWM clock differ between the Pi 2 and the Pi 4 (docs/audio.md, "The Pis"). Stated here, once,
     // as the board fact it is, so the service never infers its board from its instruction set.
@@ -168,6 +164,12 @@ fn main() {
         println!("cargo:rustc-cfg=pwm_audio_pi4");
     }
     if arch == "x86_64" {
+        // Whether the kernel can route this xHCI an MSI vector from its pool, which is what decides
+        // between the `pci_irq` hardware class and the plain one. NOT the same question as "is it on
+        // PCI": the Pi 4's VL805 is a PCIe device and still takes the plain class, because its MSI goes
+        // to the fixed `XHCI_MSI_VECTOR` (`arch/aarch64/pcie.rs` `enable_msi`), not to a vector from
+        // this pool. Asking for an interrupt that can never arrive is
+        // the failure invariant 12 exists to prevent, which is why this is its own fact.
         println!("cargo:rustc-cfg=xhci_msi");
         // This board's ethernet controller is on the PCI bus, so `nic-driver` is addressed by CLASS
         // CODE (0x020000) and the kernel resolves the BAR from its own scan. Everywhere else the MAC

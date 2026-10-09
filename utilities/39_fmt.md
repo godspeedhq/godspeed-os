@@ -78,6 +78,8 @@ fmt <path>            format the script IN PLACE (the default; no subcommand)
     e.g. fmt /script.gsh
 fmt check <path>      is it already canonical? Ok + silent if yes; Err + loud if no. Never writes.
     e.g. fmt check /script.gsh
+fmt <a>,<b>,...       format (or check) several files - comma-separated, done one at a time
+    e.g. fmt /x.gsh,/y.gsh
 fmt version           print the version
 fmt help              print usage
 ```
@@ -127,5 +129,8 @@ original - so a failed write leaves the original intact. `fmt check` formats to 
 two files *sequentially* (never two concurrent reads of the same file). Pinned by `osdev test fmt-idem`
 (the format-twice boundary diff) and `osdev test fmt-demo` (the 10 MB).
 
-Conforms to `0_conventions.md`: its own `fmt help` / `fmt version` via the shared `help_block`, listed
-under **Console** in the top-level `help`.
+Has its own `help_block` and is listed under **Console** in the top-level `help`, but does **NOT
+currently conform** to `0_conventions.md` rules 1 and 5 (found 2026-10-09): `fmt` is missing from the
+shell's `UTILS` list, so `fmt help` and `fmt version` are not intercepted and reach `cmd_fmt`, which
+takes `help` / `version` as a PATH to format. The `help_block` is reachable through `help fmt`.
+A code defect; the fix is adding `"fmt"` to `UTILS`.

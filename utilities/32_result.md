@@ -70,7 +70,8 @@ there is no `Ok`-wrapping that could hide a failure:
 - **An unknown command is `Err`** (so `assert fails typo` holds; a typo in a script counts).
 - **The info commands** (`echo`/`about`/`mem`/`cores`/`date`/`status`/`clear`/`help`) genuinely
   can't fail, so they return `Ok` - uniformly on the model, not specially wrapped. (`reboot`
-  never returns.)
+  never returns.) **Exception, a code defect:** `date sync` reports `no time from the network`,
+  `the clock service did not answer` and the other sync failures and still returns `Ok`.
 
 `ShellError` variants in use: `FileNotFound`, `Denied`, `AssertFailed`, `Unknown`. New ones are
 added as a failure earns its own name (`StorageUnavailable`, `EndpointDead`, … reusing kernel
@@ -78,7 +79,8 @@ names where they surface - §7.7).
 
 ## 5. Later (separate so it can grow)
 
-- Convert the remaining commands (file ops, spawn/kill/restart, the record verbs, pipelines).
+- Converting the commands is **done** (§4); what remains is giving more failures their own
+  variant instead of `Unknown`.
 - **`run <script>`** - **built** (`utilities/33_run.md`): executes a file of commands,
   aggregating `result` into "ran N, failed M".
 - **`assert`** - **built** (`utilities/34_assert.md`): `assert ok/fails <cmd>` (result) and

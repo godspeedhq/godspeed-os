@@ -5,10 +5,10 @@
 //! in boot protocol. All of that is control transfers, which Slice 1 proved end to end - including
 //! through a transaction translator, which this keyboard needs (it is the low-speed device on port 4).
 //!
-//! POLLING the endpoint is the next part and is where the remaining risk of this port lives: a
-//! periodic split is microframe-scheduled, and that code moves from ring 0 with interrupts masked
-//! into a preemptible task. Binding first means that when polling is attempted, everything under it
-//! is known good.
+//! POLLING the endpoint (`poll`, below) is the part that carried the remaining risk of this port: a
+//! periodic split is microframe-scheduled, and that code moved from ring 0 with interrupts masked
+//! into a preemptible task. Binding came first so that when polling was attempted, everything under it
+//! was known good.
 
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::{Dma, Mmio, ServiceContext};
@@ -291,6 +291,8 @@ pub fn poll(
         if hcint & HCINT_NYET == 0 {
             state.nyet_run = 0; // anything else is the TT answering, so it is not wedged
         }
+        // (Superseded - the paragraph above is what the code does, and why. Kept as the record of
+        // the strict form that was tried.)
         // ERRORS SINCE THE LAST REPORT, not consecutive errors.
         //
         // This used to reset on ANY non-error outcome, including a NAK - and a degraded endpoint
@@ -370,6 +372,7 @@ pub fn poll(
         //
         // The cost is honest and bounded: holding a key for longer than this window stops repeating.
         // That is a small annoyance. Spraying 391 characters is a bug.
+        // (The "generous ~1 s" threshold in this paragraph is superseded by the EIGHT below.)
         // A WEDGED TT NEVER RECOVERS ON ITS OWN, so stop asking and clear it.
         //
         // Ordinary NYET means "the TT is not done yet, ask again" and resolves within a few
@@ -474,7 +477,7 @@ pub fn poll(
     }
     // READ THE TOGGLE BACK FROM THE HARDWARE. Do not flip it in software.
     //
-    // The DWC2 advances HCTSIZ.PID [30:29] itself, and the kernel driver reads it back for exactly
+    // The DWC2 advances HCTSIZ.PID [30:29] itself, and the kernel driver read it back for exactly
     // this reason. Flipping it in software makes the two disagree the moment they ever differ, and a
     // toggle mismatch does not error - the device RETRANSMITS its last report, which is delivered
     // again as a fresh keystroke.
@@ -513,7 +516,9 @@ pub struct KeyState {
     /// credible while these keep arriving; a long gap means a release may have been lost unseen.
     pub last_ok: u64,
     /// How stale that answer may be before a held key is treated as unproven. Derived from the
-    /// board's own timer rate, never a constant - a cycle count is not a duration.
+    /// board's own timer rate, never a constant - a cycle count is not a duration. (Note 2026-10-09:
+    /// neither this nor `last_ok` is read any more; repeat is anchored on `last_data` and
+    /// `repeat_window`.)
     pub stale_after: u64,
     /// Characters emitted by AUTO-REPEAT, and characters emitted by decoding a real report. Two
     /// mechanisms can produce a stream of one character - a repeat that will not stop, or the device

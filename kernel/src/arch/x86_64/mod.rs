@@ -230,7 +230,6 @@ fn collect_boot_info() -> BootInfo {
 // BootInfo - populated by collect_boot_info(), consumed by kernel_main.
 // ---------------------------------------------------------------------------
 
-/// Boot information passed from the bootloader to `kernel_main`.
 /// The highest local-APIC ID the kernel's **xAPIC** IPI path can address: the ICR destination field is
 /// 8 bits (`(lapic_id & 0xFF) << 24`). A core whose Limine LAPIC id exceeds this cannot receive a
 /// TARGETED IPI (cross-core wake, scheduler tick), so it is excluded - loudly (§26.7) - rather than
@@ -257,6 +256,7 @@ pub fn ap_count() -> usize {
     }
 }
 
+/// Boot information passed from the bootloader to `kernel_main`.
 #[repr(C)]
 pub struct BootInfo {
     pub memory_map: &'static [MemoryRegion],
@@ -352,21 +352,13 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 pub fn board_mac_packed() -> Option<u64> { None }
 
 /// USB mass-storage block device. NO port has an in-kernel USB stack any more - `arch/arm/dwc2.rs`
-/// and `arch/aarch64/xhci.rs` were both deleted (§6.4, 2026-08-09 and 2026-08-17) - so disks are
+/// and `arch/aarch64/xhci.rs` were both deleted (§6.4, 2026-08-17 and 2026-08-09 respectively) - so disks are
 /// userspace drivers everywhere and this always answers "no device". The USB_DISK syscalls (46-49)
 /// are a dead ABI; nothing holds the capability (`task/mod.rs`: `usb_disk: false`).
 pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
 pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 pub fn usb_disk_flush() -> bool { false }
-/// Counter ticks (in `read_cycle_counter` units) a core may make NO forward progress before the
-/// liveness watchdog declares it wedged and panics. `0` = this arch cannot say, so the check is off.
-///
-/// x86: unchanged from when this lived in the scheduler - 300 quanta of ~10 ms is ~3 s, and it is `0`
-/// until the TSC quantum is calibrated (QEMU's periodic tick never calibrates, so it stays off there).
-/// A normal shootdown or critical section is milliseconds, so ~3 s cannot false-fire.
-/// (interrupts dispatched, last IRQ source) for `core`. Not tracked on this port, so the liveness
-/// panic prints zeros rather than a wrong number - it was added to diagnose an arm32 wedge.
 /// Per-core interrupt evidence for the liveness watchdog: how many timer interrupts a core has
 /// TAKEN, and the vector of the last one.
 ///
@@ -425,6 +417,8 @@ pub fn publish_bsp_lapic_id() {
     ap_boot::publish_bsp_lapic_id();
 }
 
+/// `(timer interrupts taken, last vector)` for `core`, for the liveness panic. See `IRQ_DEBUG_CORES`
+/// above for what is counted and why.
 pub fn core_irq_debug(core: u32) -> (u32, u32) {
     use core::sync::atomic::Ordering;
     let i = core as usize;
@@ -432,6 +426,13 @@ pub fn core_irq_debug(core: u32) -> (u32, u32) {
     (IRQ_COUNT[i].load(Ordering::Relaxed), IRQ_LAST_VEC[i].load(Ordering::Relaxed))
 }
 
+/// Counter ticks (in `read_cycle_counter` units) a core may make NO forward progress before the
+/// liveness watchdog declares it wedged and panics. `0` = this arch cannot say, so the check is off.
+///
+/// x86: unchanged from when this lived in the scheduler - 300 quanta of ~10 ms is ~3 s, and it is `0`
+/// only if TSC calibration failed (`boot::calibrate_tsc_ticks_per_10ms`). It calibrates on every
+/// machine now, QEMU included, so the watchdog is on there too.
+/// A normal shootdown or critical section is milliseconds, so ~3 s cannot false-fire.
 pub fn liveness_deadline_cycles() -> u64 {
     boot::tsc_ticks_per_quantum().saturating_mul(300)
 }
@@ -462,12 +463,6 @@ pub unsafe fn switch_to_boot_stack(top: u64) {
     unsafe { core::arch::asm!("mov rsp, {0}", in(reg) top, options(nostack)); }
 }
 
-/// Halt EVERY core, permanently. The panic path calls this, so a panic on one core must stop the whole
-/// machine, not just the caller (§6.2, §19): otherwise the survivors keep running on the shared state
-/// whose corruption triggered the panic, and a lock the panicking core held live-wedges them.
-///
-/// SEC-18: broadcast an NMI to the other cores first (it reaches them even while spinning IF=0 on a
-/// lock; `idt[2]` routes it to `exception_halt`, which halts the receiving core), then halt this one.
 /// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (x86-64, ELFCLASS64).
 /// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
 /// service ELF or a 64-bit one without any arch-specific code in the loader itself.
@@ -480,6 +475,12 @@ pub const ELF_CLASS: u8 = 2; // 1 = ELFCLASS32, 2 = ELFCLASS64
 /// the neutral scheduler has one call, not a cfg.
 pub fn panic_halt_check() {}
 
+/// Halt EVERY core, permanently. The panic path calls this, so a panic on one core must stop the whole
+/// machine, not just the caller (§6.2, §19): otherwise the survivors keep running on the shared state
+/// whose corruption triggered the panic, and a lock the panicking core held live-wedges them.
+///
+/// SEC-18: broadcast an NMI to the other cores first (it reaches them even while spinning IF=0 on a
+/// lock; `idt[2]` routes it to `exception_halt`, which halts the receiving core), then halt this one.
 pub fn halt_all_cores() -> ! {
     // SAFETY: panic path - stop all execution permanently. The APIC is mapped by boot; a bare ICR write
     // is sound. If we panicked before the APIC came up the broadcast is a best-effort no-op and this
@@ -588,18 +589,18 @@ pub unsafe fn serial_init() {
     }
 }
 
-/// Write one byte to COM1. Spins until the transmit holding register is empty.
-///
-/// Thread-safe: serialized through `SERIAL_LOCK` so concurrent calls from
-/// multiple cores cannot interleave THRE polls with TX writes.
-///
-/// # Safety
-/// `serial_init` must have been called before the first call.
 /// Hook called by the neutral `commit_task` when it commits a user task. On x86 the ring is tracked by
 /// the scheduler's `TASK_IS_USER` and the SYSRET machinery, so nothing arch-local is needed here - a
 /// no-op. (ARM uses this to record the slot for its atomic-syscall timer check.)
 pub fn note_user_task(_slot: usize) {}
 
+/// Write one byte to COM1. Polls (bounded, `THRE_SPIN_CAP`) until the transmit holding register is
+/// empty, and drops the byte if it never is.
+///
+/// Serialized through `SERIAL_LOCK` so concurrent calls from multiple cores cannot interleave THRE
+/// polls with TX writes; the lock wait is bounded too, and on expiry the byte is written unlocked.
+///
+/// Precondition (not `unsafe`): `serial_init` must have been called before the first call.
 pub fn serial_write_byte(b: u8) {
     use core::sync::atomic::Ordering;
     // Bounded best-effort lock acquire: a wedged SERIAL_LOCK must never spin a
@@ -697,7 +698,7 @@ pub fn serial_fault_lock_release(held: bool) {
 /// **A COUNT IS NOT A DURATION** (Commandment VIII), and an earlier version of this comment claimed
 /// "microseconds, not milliseconds" - a claim about time made by a bound on iterations, which means
 /// something different on every machine and was measured on none of them. Elsewhere on this path that
-/// would be a defect: `claim_serial` bounds its wait with `read_cycle_counter` for exactly that reason.
+/// would be a defect: aarch64's `claim_serial` bounds its wait with `read_cycle_counter` for exactly that reason.
 ///
 /// Here the count is the right primitive, and the reason is the path it runs on. This spins inside a
 /// FAULT HANDLER, and a clock is a thing that can be part of what is broken - a wedged or
@@ -710,7 +711,8 @@ pub fn serial_fault_lock_release(held: bool) {
 /// spin can never succeed - costs little on any machine this runs on.
 const SERIAL_FAULT_SPIN_CAP: u32 = 2_000;
 
-/// Spin cap for best-effort `SERIAL_LOCK` acquisition (~seconds on real HW).
+/// Spin cap for best-effort `SERIAL_LOCK` acquisition. An iteration count, not a duration: its wall
+/// time differs per machine and has not been measured.
 const SERIAL_LOCK_SPIN_CAP: u32 = 5_000_000;
 /// Spin cap for the COM1 THRE (transmit-holding-register-empty) poll.
 const THRE_SPIN_CAP: u32 = 1_000_000;
@@ -1061,7 +1063,8 @@ pub fn input_ready() -> bool {
     INPUT_READY.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Enable COM1 RX interrupts (call once after com2_init, from kernel main).
+/// Enable COM1 RX interrupts. **Has no caller, deliberately:** `main.rs` says it must NOT be called -
+/// the PIC stays fully masked and COM1 RX is polled from the core-0 timer tick (`uart_rx_poll`).
 ///
 /// # Safety
 /// Must be called after serial_init and after the IDT is loaded with vector 36.
@@ -1076,10 +1079,12 @@ pub unsafe fn uart_rx_enable() {
     }
 }
 
-/// Push a byte into the COM1 RX ring buffer (called from IRQ handler).
+/// Push a byte into the COM1 RX ring buffer.
 ///
 /// # Safety
-/// Must be called only from the IRQ handler (single producer).
+/// Single-producer ring: the callers are `uart_rx_drain_fifo` (timer ISR, or `uart_rx_drain_now`
+/// under `cli`) and `console_push_byte` (a syscall). The last is NOT serialized against the other
+/// two - see the note on `console_push_byte`.
 pub unsafe fn uart_rx_push(b: u8) {
     use core::sync::atomic::Ordering;
     let tail = COM1_RX_TAIL.load(Ordering::Relaxed);
@@ -1206,10 +1211,11 @@ pub fn console_push_byte(b: u8) {
     }
 }
 
-/// Drain all available COM1 RX bytes into the ring buffer (called from IRQ).
+/// Drain all available COM1 RX bytes into the ring buffer.
 ///
 /// # Safety
-/// Must be called only from the IRQ handler with IF=0.
+/// Must be called with IF=0: from the core-0 timer tick (`uart_rx_poll`) or `uart_rx_drain_now`,
+/// which clears IF around it. (There is no COM1 IRQ: the PIC stays masked.)
 pub unsafe fn uart_rx_drain_fifo() {
     // SAFETY: port I/O to COM1; called from ISR with interrupts disabled.
     unsafe {

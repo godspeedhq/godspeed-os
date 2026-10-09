@@ -1,27 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! `block-driver` ARM backend: a USB mass-storage stick, served through the in-kernel DWC2 stack.
+//! `block-driver` USB backend: a USB mass-storage stick, reached over IPC through the USB host SERVICE
+//! (`xhciblk`: `dwc2` on the Pi 2, `xhci` on the Pi 4 and the VisionFive 2).
 //!
 //! **Why this backend exists.** The Pi has exactly one SD slot and the machine boots from it, so
 //! formatting that card destroys the boot medium (`fs` refuses to, see `foreign_disk`). A USB stick is
 //! the storage that can actually be given to GSFS on this board: boot from SD, store on USB.
 //!
 //! **Why it does not touch the hardware.** The USB stack - controller, enumeration, Bulk-Only transport
-//! - is the `dwc2` SERVICE (`services/dwc2`). It used to be in the kernel, because ARM did not route
+//! - is the host SERVICE (`services/dwc2` on the Pi 2, `services/xhci` elsewhere). On arm32 it used to be in the kernel, because ARM did not route
 //! device IRQs to userspace; it does now (`USB_VECTOR`, `arch/arm/irq.rs`), and `kernel/src/arch/arm/dwc2.rs`
-//! is deleted. This driver therefore holds the `USB_DISK_RESOURCE` capability and moves blocks over IPC, exactly
+//! is deleted. This driver therefore moves blocks over IPC to that service (`xhciblk`), exactly
 //! as the ARM `nic-driver` bridges USB ethernet frames to `net-stack`. The block protocol above them - the same one `fs` speaks to the AHCI
-//! and EMMC backends - is this driver's own, so `fs` cannot tell which disk it is talking to.
+//! backend - is this driver's own, so `fs` cannot tell which disk it is talking to.
 //!
-//! **Core affinity.** The kernel serves these syscalls only from core 0, because the DWC2 DMA buffer is
-//! shared with the keyboard poll that runs in core 0's timer ISR, kept mutually exclusive by an ARM
-//! syscall running with interrupts masked (the soundness invariant on `dwc2::DMA`). A request from
-//! another core is refused, so the supervisor spawns this driver on core 0. Storage and the keyboard no
-//! longer share a HOST CHANNEL - each stream has its own (`CH_BULK`/`CH_KBD`) - so what is shared is the
-//! one DMA scratch buffer, not the channel state.
+//! **Core affinity: none any more.** This used to say the kernel served its `usb_disk_*` syscalls only
+//! from core 0, because the in-kernel DWC2 stack shared one DMA buffer with the keyboard poll in core 0's
+//! timer ISR. Both the syscalls and that stack are gone; there is no syscall left on this path.
 //!
-//! **Busy is not failure.** A stick NAKs while its flash is occupied. The kernel bounds how long it will
-//! hold the core waiting and then answers `-2` (busy) rather than `-1` (failed), and the waiting happens
-//! HERE, between yields, where interrupts are on and every other task still runs.
+//! **Busy is not failure.** A stick NAKs while its flash is occupied. When the stack was in the kernel,
+//! its syscall bounded how long it held the core and then answered BUSY rather than failed, and the
+//! waiting happened HERE, between yields (`with_busy_retry`). (Note 2026-10-09: the service path never
+//! answers BUSY or ABSENT - `dev_read`/`dev_write` return 0 or -1, see below - so today those two arms
+//! of `with_busy_retry` are not reached, and the waiting happens inside the host service's BOT layer.)
 
 use godspeed as gs;
 use godspeed_sdk::{ServiceContext, USB_DISK_BUSY, USB_DISK_ABSENT};
@@ -182,10 +182,11 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
             // was only true of transport failures.
             code => {
                 ctx.log_fmt(format_args!(
-                    // WHO refused matters: under `usb-via-xhci` this failure came from the xhci
-                    // SERVICE, not the kernel, and naming the wrong one sends an operator to read
-                    // the wrong log. It said "refused by kernel" on the Pi 4's first userspace-USB
-                    // boot, where the kernel was not in the path at all.
+                    // WHO refused matters: this failure comes from the USB host SERVICE, not the
+                    // kernel, and naming the wrong one sends an operator to read the wrong log. It
+                    // said "refused by kernel" on the Pi 4's first userspace-USB boot, where the
+                    // kernel was not in the path at all. Today the code is always -1: `xhciblk`
+                    // already logged why (no answer, or the reacquire failed).
                     "block-driver: {} lba {} refused by the {} service, status {}",
                     what, lba, crate::xhciblk::XHCI, code));
                 return false;
@@ -212,19 +213,15 @@ fn with_busy_retry(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMu
 
 // --- Which USB stack backs this disk -----------------------------------------------------------
 //
-// Two routes to the same device, chosen at BUILD time and never at runtime. The in-kernel stack is
-// reached by syscall; the `xhci` SERVICE is reached by IPC. They are never mixed and there is no
-// fallback between them: a silent switch from the userspace driver to the kernel one would hide
-// exactly the failure this port exists to eliminate (§26.7), and would keep alive the in-kernel
-// stack that Commandment I says must go.
-//
-// The choice is a build flag rather than a probe because only the BUILD knows the answer: the
-// kernel's `xhci-userspace` feature is what stops it driving the controller, and a service cannot
-// ask the kernel whether it did. `scripts/pi4_build.py --xhci-userspace` sets both, which is why it
-// is one switch reaching several crates rather than a feature to remember per crate.
+// ONE route now: the USB host SERVICE, by IPC (`xhciblk`). There used to be two, chosen at BUILD
+// time and never at runtime - the in-kernel stack by syscall, or the `xhci` SERVICE by IPC - never
+// mixed, with no fallback between them: a silent switch from the userspace driver to the kernel one
+// would hide exactly the failure this port exists to eliminate (§26.7), and would keep alive the
+// in-kernel stack that Commandment I says must go. Both in-kernel stacks, and the build flags that
+// chose between the routes, are deleted (CLAUDE.md 6.4, amendments 2026-08-09 and 2026-08-17).
 
-// The return is the syscall's TRI-STATE i64 (0 = done, USB_DISK_BUSY, USB_DISK_ABSENT, other =
-// error), not a bool, because `with_busy_retry` acts differently on each and flattening them would
+// The return is the TRI-STATE i64 the old syscall returned (0 = done, USB_DISK_BUSY,
+// USB_DISK_ABSENT, other = error), not a bool, because `with_busy_retry` acts differently on each and flattening them would
 // turn "the stick is thinking" into "the read failed".
 //
 // The service path never reports BUSY, and that is correct rather than a gap: the BOT layer inside
@@ -242,8 +239,8 @@ fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 {
 
 fn dev_flush(ctx: &ServiceContext) -> bool { super::xhciblk::flush(ctx) }
 
-/// Serve one block-IPC request. Same wire protocol as the AHCI and EMMC backends - `fs` is unaware of
-/// which one it is talking to.
+/// Serve one block-IPC request. Same wire protocol as the AHCI backend - `fs` is unaware of which one
+/// it is talking to.
 fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
     use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
     let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
@@ -317,7 +314,8 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
     }
 }
 
-/// Serve block I/O from the USB mass-storage device. The caller has already confirmed one is attached.
+/// Serve block I/O from the USB mass-storage device. `sectors` is the startup count, for the log line
+/// only - it may be 0 (no stick yet, or the host not answering), and capacity is re-asked per request.
 pub fn run(ctx: &ServiceContext, sectors: u64) -> ! {
     ctx.log_fmt(format_args!("block-driver: USB mass storage serving block I/O ({} sectors = {} MiB)",
                              sectors, sectors / 2048));

@@ -201,10 +201,19 @@ hold the shell's own authority, including `spawn` and `reboot`. The claim is nar
 and `55_background.md` §4 carries the narrowed version.
 
 **§5's open question answered itself: option 1, and it costs nothing.** A detached job writes no
-output at all, because the service holds no `console_push` capability. "A background job must never
-write to the console unasked" stopped being a rule to obey and became a thing it cannot do. Progress
-is polled through `STATUS` when somebody asks for it, so there is no buffer to bound and no `save`
-to compose. Options 2 and 3 remain available if a job ever needs a transcript.
+output at all, because `copier` never prints: it makes no `gs::io` call. Progress is polled through
+`STATUS` when somebody asks for it, so there is no buffer to bound and no `save` to compose. Options 2
+and 3 remain available if a job ever needs a transcript.
+
+> **Corrected 2026-10-09: the silence is a CONVENTION, not a capability bound.** This paragraph said
+> the job cannot write to the console because it holds no `console_push` capability, so that "a
+> background job must never write to the console unasked" had become a thing it cannot do. That was
+> false. Printing is the kernel's `ConsoleWrite` (syscall 23), and `handle_console_write` in
+> `kernel/src/syscall/dispatch.rs` checks `LOG_WRITE` and nothing else - which every task is minted in
+> slot 0 at spawn. `console_push` is a different authority altogether: KEYSTROKE INJECTION into the
+> shell's input ring (CLAUDE.md 6.4, SEC-2), not output. So `copier` could print over a prompt; it does
+> not because nothing in it asks to. The rule is kept by the code, not enforced by the kernel
+> (`docs/stranger-test.md`, "Run 4 was wrong about the screen", is the same mistake one layer over).
 
 **§6's eight slots and four states shipped unchanged**, plus a fifth the design did not anticipate:
 **`lost`**. `copier` is deliberately not restarted on death, so a service that dies mid-job leaves a

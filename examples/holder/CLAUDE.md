@@ -29,10 +29,10 @@ The client side, using only real `ServiceContext` methods:
 | Step | Call | What happens |
 |------|------|--------------|
 | Receive the grant | `gs::ipc::recv` + `gs::ipc::take_sent_cap` | the kernel moved the granted cap into holder's table (§7.6, §8.5); this hands back its slot |
-| Use it | `ctx.resource_invoke(cap, RIGHT_READ, reply, &op)` | the kernel validates the cap holds READ and routes the op to the OWNER, badged - holder never names the owner |
-| Over-reach (denied) | `ctx.resource_invoke(cap, RIGHT_WRITE, …)` | the READ-ONLY cap lacks WRITE -> the kernel returns `CapInsufficientRights`; the request never reaches the owner |
-| Trigger revoke | `ctx.resource_invoke(cap, RIGHT_READ, reply, &[OP_CLOSE])` | the owner alone revokes what it owns (a generation bump, §7.5) |
-| Use after revoke | `ctx.resource_invoke(cap, RIGHT_READ, …)` | the cap is now stale -> `CapRevoked` |
+| Use it | `ctx.resource_invoke(cap, gs::cap::READ, reply, &op)` | the kernel validates the cap holds READ and routes the op to the OWNER, badged - holder never names the owner |
+| Over-reach (denied) | `ctx.resource_invoke(cap, gs::cap::WRITE, …)` | the READ-ONLY cap lacks WRITE -> the kernel returns `CapInsufficientRights`; the request never reaches the owner |
+| Trigger revoke | `ctx.resource_invoke(cap, gs::cap::READ, reply, &[OP_CLOSE])` | the owner alone revokes what it owns (a generation bump, §7.5) |
+| Use after revoke | `ctx.resource_invoke(cap, gs::cap::READ, …)` | the cap is now stale -> `CapRevoked` |
 
 The reply cap holder embeds per invoke is a SEND copy of its OWN endpoint (`gs::cap::duplicate` of
 `gs::cap::self_grant`) - the only channel the owner has to answer it. This is the same dance the shell's
@@ -45,7 +45,9 @@ The reply cap holder embeds per invoke is a SEND copy of its OWN endpoint (`gs::
   owner *by the cap itself*. A read-only cap that the kernel refuses to let write is non-escalation
   made mechanical - rights cannot widen (§7.3). *(COMMANDMENTS.md VII; CLAUDE.md §7.3, §7.10, §3.1.)*
 - **Commandment VIII (wait on truth, not time).** holder blocks for the owner's *reply* - the truth
-  the op happened - never a fixed sleep. A denial or a revoke is a returned error it *reads*, not a
+  the op happened - never a fixed sleep. The wait is BOUNDED (`INVOKE_SECS`): a `resource_invoke` is a
+  send, so the kernel is never told a reply is awaited and cannot wake holder with `ReplyDead` if the
+  owner dies holding it; the deadline is the bound instead. A denial or a revoke is a returned error it *reads*, not a
   timeout it guesses; a successful invoke means *routed*, not *processed* (§8.6). *(COMMANDMENTS.md
   VIII; CLAUDE.md §8.6, §7.5.)*
 - **Commandment IX (assume you will be killed; fail loud).** holder assumes the granted cap can be
@@ -86,7 +88,7 @@ against `services/fs` is this exact shape, fully grown.
 
 - **`examples/resource-server`** - the owner/mint half this client exercises (read it first).
 - `services/fs` + the shell `fcap` command (**CLAUDE.md §22 Test 14**) - the production resource
-  server and the same three properties proven against a real file (`osdev test file-cap`, 9/9).
+  server and the same three properties proven against a real file (`osdev test file-cap`, 15 assertions today).
 - `examples/cap-grant` - capability **transfer** (the operation that *moves* the cap to holder).
 - **Commandments VII, VIII, IX, X** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §7.10 (delegated resource capabilities), §7.3 (cap properties), §7.5 (generations /

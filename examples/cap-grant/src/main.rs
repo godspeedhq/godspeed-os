@@ -26,7 +26,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("cap-grant: starting");
 
     // 1. A grantable cap we already hold: our own SEND|GRANT cap to our endpoint,
-    //    minted from the contract at spawn. This is the cap a service hands out so
+    //    minted at spawn because our spawn request asked for an endpoint
+    //    (SPAWN_FLAG_REQ_RECV). This is the cap a service hands out so
     //    others may call it back (Commandment VII - authority is an explicit cap).
     let self_cap = match gs::cap::self_grant(&ctx) {
         Ok(c) => c,

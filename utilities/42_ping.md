@@ -36,7 +36,7 @@ with a clear message - use `net dns <host>` to resolve, then `ping` the IP.
 
 ```
 gsh> ping 192.168.4.1
-Pinging 192.168.4.1 with 32 bytes of data:
+Pinging 192.168.4.1 with 32 bytes of data:  [q] quit
 Reply from 192.168.4.1: bytes=32 time=2ms TTL=64
 Reply from 192.168.4.1: bytes=32 time=3ms TTL=64
 Request timed out.
@@ -45,15 +45,22 @@ Reply from 192.168.4.1: bytes=32 time=2ms TTL=64
 
 Ping statistics for 192.168.4.1:
     Packets: Sent = 4, Received = 3, Lost = 1 (25% loss)
-Approximate round trip times in milli-seconds:
+Approximate round trip times in milliseconds:
     Minimum = 2ms, Maximum = 3ms, Average = 2ms
 ```
 
-- **`time=Nms`** - the measured round trip. A reply that returns in under a millisecond prints
-  `time<1ms` (as on Windows). The time is measured with the CPU's TSC and converted to milliseconds
-  using the kernel's boot-time TSC calibration (InspectKernel query 16).
+(The `[q] quit` hint is on the header line of a continuous run only; a `count` run has none.)
+
+- **`time=`** - the measured round trip, in **microseconds** below 1 ms (`time=412us`, `time<1us`
+  for zero) and whole milliseconds above. The summary uses one unit for all three figures, chosen
+  by the average. `net-stack` times the round trip with the CPU's cycle counter, calibrated against
+  the wall clock, and reports microseconds as a u16 - so **a round trip over 65 ms reads as 65 ms**
+  (a silent cap, a code defect). On a host whose cycle counter is uncalibrated every reply reads
+  `time<1us` and the summary says the round-trip time is unavailable.
 - **`TTL=N`** - the time-to-live in the reply's IP header (the pinged host's, not ours).
 - **`Request timed out.`** - no matching echo reply arrived within the budget for that round.
+  `No reply from <ip>: link not confirmed - ...` means `net-stack` could not confirm a link, and
+  `No reply from <ip>: net-stack not responding` means the request itself got no answer.
 - The **statistics** summary prints whether you stopped with `q` or a `count` run finished.
 
 ## 4. Pipe behaviour
@@ -69,7 +76,8 @@ Approximate round trip times in milli-seconds:
    addressed to `<ip>` (Ethernet destination = the gateway's MAC, so it routes off-subnet), times
    the round trip with the TSC, sends it through `nic-driver`, and waits for the echo *reply* -
    matching the reply's source IP so a gateway ping and an internet ping cannot be confused.
-3. `net-stack` replies `[alive, rtt_ms(le u16), reply_ttl]`; the shell formats the `Reply from` line,
+3. `net-stack` replies `[alive, rtt_us(le u16), reply_ttl]` (`alive` 2 = no link confirmed); the
+   shell formats the `Reply from` line,
    accumulates min/max/average, and paces ~1 s to the next echo while polling for `q`.
 
 This reuses the same `ping()` helper `net-stack` runs at boot to check the gateway, so a working

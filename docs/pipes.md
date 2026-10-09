@@ -27,7 +27,9 @@ A pipeline is **one producer, zero or more filters, one sink**:
 
 - **PRODUCER** - emits text (or records), ignores input. Text built-ins
   (`is_producer_builtin`): `read`, `echo`, `tree`, `input`, and the system-info commands `about` /
-  `version` / `whatis` / `mem` / `cores` / `date` / `net` / `ping` / `sock` / `help`. Record
+  `version` / `whatis` / `mem` / `cores` / `date` / `net` / `ping` / `sock` / `help`, plus `random`,
+  `tcp`, `churn`, and the report verbs of `wifi`, `audio` and `hardware` (their action verbs
+  refuse). Record
   built-ins (`is_record_producer`): `status`, `dir`, `caps`, `drives`, `find`, `uptime`, `events`,
   `trace`, `jobs`, and `observe now`. Services: `greet` (text), `roster` (records). *(There is no
   `cat`: `read` is the one file reader - `utilities/18_read.md`, the replacement for POSIX `cat`,
@@ -36,8 +38,8 @@ A pipeline is **one producer, zero or more filters, one sink**:
 - **FILTER** - consumes input, emits output. Service: `upper`. Built-ins: `match`/`count`/`sort`/
   `first`/`last` (text) and the record verbs `where`/`select`/`sort`/`from`/`to` (`docs/records.md`).
 - **SINK** - consumes the final buffer. Built-in: `write [append|prepend] <file>` (plain
-  overwrites; the keywords add to the end / front - see *The `write` sink* below) and `assert`
-  (the verifying sink). A service filter used as the last stage prints to the console; with no
+  overwrites; the keywords add to the end / front - see *The `write` sink* below), `assert`
+  (the verifying sink) and `paginate`. A service filter used as the last stage prints to the console; with no
   recognised sink, the buffer is printed.
 
 The shell threads a bounded buffer down the chain: stage 1 fills it, each filter transforms it,
@@ -61,7 +63,8 @@ The governing idea is simple: **anything that displays information can be saved.
 pipe source iff its job is to *emit data*. That splits the command set three ways:
 
 - **Data / display commands → pipe sources.** Anything whose purpose is to show you something:
-  `about`, `version`, `whatis`, `mem`, `cores`, `date`, `net`, `ping`, `sock`, `help`, `status`,
+  `about`, `version`, `whatis`, `mem`, `cores`, `date`, `net`, `ping`, `sock`, `help`, `random`,
+  `tcp`, `churn`, the reports of `wifi` / `audio` / `hardware`, `status`,
   `dir`, `caps`, `drives`, `find`, `uptime`, `events`, `trace`, `jobs`, `tree`, `read`, `echo`,
   `input`, `observe now`. Each renders through an `Out` target that is the console when run
   bare and a capture buffer when piped - so `about` prints, and `about | write /f` saves, the same
@@ -171,14 +174,15 @@ added - built-ins already had these capabilities; the pipe just redirects their 
 
 A service stage is wired with **no new syscall**:
 
-1. The shell spawns the service with `spawn_pipe(service, "shell")`. The delegated SEND cap to
-   the shell's own endpoint is installed **first** (`send_peer_at(0)`) - that is the service's
+1. The shell asks the supervisor to spawn the service with `"shell"` as its peer
+   (`spawn_via_supervisor(service, 0xFFFF, &["shell"])` in `drain_service`). The delegated SEND cap
+   to the shell's own endpoint is installed **first** (`gs::ipc::peer_at(ctx, 0)`) - that is the service's
    "downstream". The service's contracted peers (e.g. `fs`) follow, so a filter that must
    reach them to receive input still can.
 2. If the stage has input (a filter/sink, not stage 1), the shell resolves the service's
    endpoint by name via the kernel directory (the kernel records the name at spawn) and sends the input buffer as
    **one message**, then an **EOT**.
-3. The service processes and sends its output back to the shell (`send_peer_at(0)`), ending with
+3. The service processes and sends its output back to the shell (`peer_at(ctx, 0)`), ending with
    an **EOT**.
 4. The shell drains its endpoint until EOT, then reaps the service.
 
@@ -196,7 +200,8 @@ knows when to stop. A zero-length message is **not** used: a byte says what it m
 
 ## Bounds and failure (loud, never silent - §26.6 / §3.12)
 
-- Each inter-stage buffer is 16 KiB; overflow is reported, not silently truncated.
+- Each inter-stage buffer is 16 KiB; overflow is reported, never silent: the capture keeps what
+  fits and the shell prints `pipe: producer output exceeded the pipe buffer (truncated)`.
 - A pipeline is capped at `MAX_STAGES` (8); more is refused.
 - **Stage 1 must be a producer.** A non-producer service in stage 1 would block the shell on a
   `recv` that never comes (no non-blocking `recv` in v1), so producer services are an explicit

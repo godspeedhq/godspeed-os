@@ -1,6 +1,7 @@
 name: storage
 
-# The fourteen `fs` suites, in one run (`backlog/32`).
+# Every `fs` suite, in one run (`backlog/32`). Fourteen when this was written; 33 on 2026-10-09
+# (`SUITES` in osdev's `run_fs_all_tests`), not all of them `fs-` by name.
 #
 # WHY THIS EXISTS: two of them were RED on `main` at the commit released as v0.18.0, and nothing
 # noticed. Not one `fs` suite runs in any other gate - `identity.yml` runs the identity suite and
@@ -11,8 +12,8 @@ name: storage
 #
 # `workflow_dispatch` ONLY, matching `identity.yml`, and that is deliberate rather than an oversight:
 # the push trigger there is paused with the note "re-add push/branches: [main] when CI minutes are
-# available", and this run is ~12 minutes. Adding it to every push would spend exactly what that note
-# is conserving. When the minutes are there, add `push: branches: [main]` here at the same time.
+# available", and this run is ~31 minutes (measured, see timeout-minutes). Adding it to every push
+# would spend exactly what that note is conserving. When the minutes are there, add `push: branches: [main]` here at the same time.
 
 on:
   workflow_dispatch:  # paused like identity.yml: re-add push/branches: [main] with it

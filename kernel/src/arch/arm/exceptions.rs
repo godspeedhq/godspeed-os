@@ -12,10 +12,10 @@
 //! mode** per exception - each with its own banked `SP`. A handler that runs before its mode has a
 //! stack will fault again inside the fault, so `install()` primes ABT/UND/IRQ/FIQ stacks up front.
 //!
-//! This milestone REPORTS and halts; it does not yet recover. Recovery (kill the faulting task, keep
-//! the kernel alive - the C2/A14/A15 property on x86) needs the MMU, tasks, and a scheduler, none of
-//! which exist on ARM yet. Reporting first is deliberate: it is the smallest thing that turns a
-//! mystery hang into a diagnosis.
+//! The first milestone REPORTED and halted. It recovers now: a USER-mode data abort, prefetch abort or
+//! UNDEF kills just that task (`task::kill_current`) and the kernel stays alive - the C2/A14/A15
+//! property x86 has. A fault in kernel code is a real kernel bug and still reports and halts.
+//! Reporting first was deliberate: it is the smallest thing that turns a mystery hang into a diagnosis.
 
 use super::{pl011_write, pl011_write_byte};
 

@@ -8,8 +8,9 @@
 #![deny(unsafe_code)]
 //! `pong` - receives messages from `ping` and logs them.
 //!
-//! No contract-specified placement → supervisor places via round-robin.
-//! Initially on Core 1; after `osdev restart pong --core 2`, may land elsewhere.
+//! No contract-specified placement. At boot the supervisor asks for core 1 (core 0 if
+//! that fails, its spawn row's preferred core); after `osdev restart pong --core 2` it
+//! lands on core 2. The core is never part of pong's identity.
 
 #![no_std]
 #![no_main]

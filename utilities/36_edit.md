@@ -40,14 +40,14 @@ shopping list                                                       ← the text
 - eggs
 _                                                                   ← the editing cursor
 
- ^S save   ^Q quit      Col 1   23 bytes   (buf 12/32768)           ← status bar (hints + position)
+ Ctrl-S save   Ctrl-Q quit      Col 1   23 bytes   (buf 12/32768)   ← status bar (hints + position)
 ```
 
 The title and status bars are drawn in reverse video on both a serial terminal and the display -
 the `console` service renders `ESC[7m` as inverted cells (there is no colour, only reverse). The status bar shows the two
 essential keys, the live column, the document size, and the **edit-buffer fill** (`buf N/32768`)
 - how much you've typed since the last save (§5). When that buffer fills it flips to a loud
-`edit buffer full - save (^S) to continue` prompt. There is no absolute line number: that would
+`edit buffer full - Ctrl-S to save & continue` prompt. There is no absolute line number: that would
 require scanning the file from the top on every keystroke, which is exactly the O(file) cost the
 windowed design exists to avoid.
 
@@ -59,7 +59,7 @@ windowed design exists to avoid.
 | **Enter** | split the line (insert a newline) |
 | **Backspace** | delete the character before the cursor |
 | **Delete** | delete the character at the cursor |
-| **Tab** | insert spaces (a fixed soft tab) |
+| **Tab** | insert 4 spaces (a fixed soft tab, `EDIT_TAB`) |
 | **←  →** | move by one character |
 | **↑  ↓** | move by one line (keeps the column where it can) |
 | **Home / End** | jump to start / end of the line |
@@ -87,7 +87,7 @@ millions of rows":
 
 So the only thing that is bounded is **how much you edit between saves**, not the file size. The add
 buffer holds **32 KiB** of new text and the span list holds 1024 pieces; if either fills, the next
-edit is **refused loudly** - the status bar shows `edit buffer full - save (^S) to continue` - and a
+edit is **refused loudly** - the status bar shows `edit buffer full - Ctrl-S to save & continue` - and a
 save empties both. Nothing is ever silently dropped or truncated, which is the failure the
 constitution forbids (§3.12, §26.7). All of this state is fixed-size stack arrays: no heap, bounded,
 loud on overflow.

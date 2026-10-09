@@ -64,7 +64,7 @@ pub const MAX_BYTES: usize = godspeed_sdk::ipc::MAX_PAYLOAD;
 /// - **a fault injector that counts deaths** (`chaos`), where a dead endpoint is a kill landing and a
 ///   stale or revoked capability is not.
 ///
-/// An ordinary service uses the functions above. Reaching for these to log a more specific reason is
+/// An ordinary service uses the functions below, at this module's top level. Reaching for these to log a more specific reason is
 /// the wrong trade: the coarse answer is the one with a defined obligation attached to it.
 pub mod exact {
     use godspeed_sdk::ipc::Message;
@@ -199,7 +199,9 @@ pub fn try_recv(ctx: &ServiceContext) -> Option<Message> {
 
 /// Block for a message, giving up after `secs`.
 ///
-/// `Ok(None)` is the deadline passing - a fact about time, not a failure of the peer. Prefer this to
+/// `None` is almost always the deadline passing - a fact about time, not a failure of the peer. It is
+/// also what a failed receive on this task's own endpoint returns (the SDK's `recv_timeout` folds its
+/// error into `None`), so `None` means "no message", not provably "the time ran out". Prefer this to
 /// a bare [`recv`] anywhere a missing message would otherwise hang the service forever, which is
 /// every place a peer can die (CLAUDE.md 26.6).
 #[inline(always)]
@@ -249,12 +251,13 @@ pub fn park(ctx: &ServiceContext) -> ! {
 
 /// A capability to a peer this service was WIRED TO at spawn, by position.
 ///
-/// Not a name lookup. These are the capabilities the supervisor installed from the contract's
-/// `ipc_send` list before this service ran, and position `0` is the first of them. A pipe stage
+/// Not a name lookup. These are the send peers this service's SPAWN REQUEST named - the supervisor's
+/// spawn row, not the `.toml` contract, which the kernel never reads (CLAUDE.md 13.6) - installed
+/// before this service ran, and position `0` is the first of them. A pipe stage
 /// reaches the next stage this way, which is what lets it send downstream while holding authority to
 /// reach nothing else (CLAUDE.md appendix D.3).
 ///
-/// `None` means no peer was wired at that position - the contract did not ask for one, or the
+/// `None` means no peer was wired at that position - the spawn request named none there, or the
 /// composition that would have supplied it did not happen.
 pub fn peer_at(ctx: &ServiceContext, idx: usize) -> Option<Cap> {
     ctx.send_peer_at(idx).map(Cap::from_handle)
@@ -262,8 +265,8 @@ pub fn peer_at(ctx: &ServiceContext, idx: usize) -> Option<Cap> {
 
 /// A capability to a peer this service was wired to at spawn, by name.
 ///
-/// The same set as [`peer_at`], addressed by the name in the contract rather than by position. Use
-/// this when the contract names several peers and position would be a guess.
+/// The same set as [`peer_at`], addressed by the peer's name rather than by position. Use this when
+/// the spawn request names several peers and position would be a guess.
 pub fn peer(ctx: &ServiceContext, name: &str) -> Option<Cap> {
     ctx.send_peer_handle(name).map(Cap::from_handle)
 }

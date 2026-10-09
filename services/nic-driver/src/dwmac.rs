@@ -550,7 +550,8 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
                 _ => None,
             };
             let Some(d) = d else {
-                // The radio's turn: the frame goes to `wifi-driver` as op 0x11 and its answer is the word.
+                // The radio's turn: the frame goes to the radio in use (`wifi-driver`, or `wifi-usb`
+                // when `wifi hardware use` chose the dongle) as op 0x11 and its answer is the word.
                 // A refusal is counted and said sparingly - a radio that is not joined refuses every
                 // frame, correctly, and the stack retries on its own pace.
                 if !radio.tx(ctx, p) {
@@ -733,10 +734,6 @@ fn ytphy_write_ext(ctx: &ServiceContext, m: &Mmio, phy: u32, ext: u16, val: u16)
     mdio_write(ctx, m, phy, YTPHY_PAGE_SELECT, ext) && mdio_write(ctx, m, phy, YTPHY_PAGE_DATA, val)
 }
 
-/// Apply the RGMII internal delays the board's device tree specifies, and say what took.
-///
-/// Returns false only when the PHY is not the part this knows how to configure, or MDIO failed -
-/// both of which leave the link exactly as it was rather than half-programmed.
 /// Set the transmit clock edge for the speed we actually negotiated. `yt8531_link_change_notify`.
 ///
 /// **Speed-dependent, so it cannot be done at bring-up with the delays.** Linux hangs this off the
@@ -785,6 +782,11 @@ pub fn configure_tx_clk_edge(ctx: &ServiceContext, m: &Mmio, phy: u32, speed: u3
         before, after, want));
 }
 
+/// Apply the RGMII internal delays the board's device tree specifies, and say what took.
+///
+/// Returns false when the PHY is not the part this knows how to configure, when MDIO failed, or when
+/// a delay register did not read back as written - the first two leave the link exactly as it was;
+/// the last means a write landed but did not take.
 pub fn configure_phy_delays(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
     let (Some(id1), Some(id2)) = (mdio_read(ctx, m, phy, PHY_ID1), mdio_read(ctx, m, phy, PHY_ID2))
     else {

@@ -125,6 +125,9 @@ impl Irq {
 
     /// Wait for the interrupt, a request or `within`, whichever is first.
     ///
+    /// On a machine whose clock the kernel could not calibrate, `within` is not a duration: the wait
+    /// ends after one scheduler quantum whatever was asked (see `deadline_ticks`).
+    ///
     /// `#[inline(always)]` because it returns a 4 KiB message by value; as its own frame that would be
     /// 4 KiB of stack on every caller (the SDK's `recv_timeout` says the same).
     #[inline(always)]

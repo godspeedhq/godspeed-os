@@ -507,10 +507,11 @@ def check_kernel_features(check, pins):
 def check_kernel_service_table(check, pins):
     """Commandment I / 26.10: the kernel holds per-service POLICY, so pin whose.
 
-    `service_config` gives the kernel a table of every service it can start - memory limit, placement
-    core, capabilities, send peers, embedded ELF. That is policy, and policy belongs in services (26.10);
-    the kernel keeps it because it is also the loader. Whatever the merits, the SET is a fact about how
-    much of userspace the kernel knows, and it should not grow unnoticed.
+    `service_config` gave the kernel a table of every service it could start - memory limit, placement
+    core, capabilities, send peers, embedded ELF. That is policy, and policy belongs in services (26.10).
+    Since step C (the supervisor owns every image) the table holds ONE entry, the supervisor, which the
+    kernel must bootstrap: the pin in COMMANDMENTS.baseline.toml is `["supervisor"]`, so the debt is
+    paid. The SET is still a fact about how much of userspace the kernel knows, and must not grow.
 
     Pinned by name, all of them, deliberately without trying to separate "real" services from test
     probes. Any rule for that split would be a judgment encoded as a pattern, and the next service named
@@ -817,11 +818,12 @@ def check_contract_authority(check, pins):
     least visible in the grant table and on a ratchet. An authority CLAIMED but never granted is
     visible nowhere.
 
-    And the documentation invites it: CLAUDE.md 14.1 step 5 says "Kernel mints capabilities per
-    contract" and 13.6 says the capability table is "populated from the contract at spawn time".
-    Neither is how it works - authority comes from the supervisor's spawn request and the kernel's
-    `service_config`, which is exactly why `contract_check.py` had to be written. A contributor adding
-    a line to a `.toml` is doing what the constitution tells them to.
+    And the documentation invited it: CLAUDE.md 14.1 step 5 said "Kernel mints capabilities per
+    contract" and 13.6 said the capability table is "populated from the contract at spawn time" (both
+    amended 2026-09-14 to say the spawn request).
+    Neither is how it works - authority comes from the supervisor's spawn request (and, for the
+    supervisor alone, the kernel's `service_config`), which is exactly why `contract_check.py` had to be
+    written. A contributor adding a line to a `.toml` was doing what the constitution told them to.
 
     BOTH DIRECTIONS, because they are different failures:
       - CLAIMED but not granted: the lie above.

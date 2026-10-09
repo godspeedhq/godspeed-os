@@ -48,7 +48,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
 ### And a contract, or it reaches nothing
 
-Authority is granted, never assumed. A program with no contract entry for `fs` gets
+Authority is granted, never assumed. A program granted no `fs` peer gets
 `Error::Unreachable` from its first call - not a crash, and not a silent nothing. Put this beside
 your `Cargo.toml`, in `contracts/<name>.toml`:
 
@@ -61,7 +61,7 @@ request = "8MiB"
 limit   = "16MiB"
 
 [capabilities]
-ipc_send     = ["fs"]     # talk to the filesystem. Drop this and `read_into` returns Unreachable
+ipc_send     = ["fs"]     # talk to the filesystem; the spawn row must grant it too (below)
 ipc_receive  = ["hello"]  # your own endpoint, named after you
 log_write    = true       # the log (`ctx.log`) AND the screen (`io::println`, `io::report`)
 ```
@@ -83,6 +83,13 @@ screen").*
 Ask for what you use and nothing more: the contract is the reviewable statement of what your program
 may do (CLAUDE.md 26.9).
 
+**The contract declares; it does not grant.** The kernel cannot read TOML. What a running program
+actually holds comes from the SPAWN REQUEST the supervisor sends, built from the program's row in the
+supervisor's spawn table (`IMAGES` in `services/supervisor/src/main.rs`) - for this program,
+`("stdlib-hello", .., &["fs"], ..)`. A peer in the contract with no matching row is a program that
+looks authorised on paper and is not (CLAUDE.md 13.6). For services, `scripts/contract_check.py`
+reconciles the two.
+
 `examples/stdlib-hello` is this same program, complete and buildable.
 
 ## The one thing to get right
@@ -98,13 +105,14 @@ match fs.write("/data/log.txt", b"hello") {
 }
 ```
 
-`Error::OutcomeUnknown` means the request left and no answer came back. The write may have
-committed. Retrying it is not a retry, it is a **second write**, and for anything that is not
-idempotent that is a different bug from the one you were recovering from.
+`Error::OutcomeUnknown` means the request left and no answer came back before the deadline.
+`Error::PeerDied` means the request arrived and the service died before answering. Either way the
+write may have committed. Retrying it is not a retry, it is a **second write**, and for anything that
+is not idempotent that is a different bug from the one you were recovering from.
 
-`retry_is_safe()` returns `false` for it, so that nobody has to derive the rule themselves. This is
-the single failure the [Stranger Test](constitution.md) watches hardest, because it is invisible in
-a passing build.
+`retry_is_safe()` returns `false` for both, so that nobody has to derive the rule themselves. This is
+the failure the [Stranger Test](constitution.md) watches hardest, because it is invisible in a passing
+build.
 
 ## If your program SERVES other tasks
 
@@ -121,10 +129,15 @@ to drain anything, and nothing you did not ask for is consumed.
 // A service loop. `fs.read_into` may block for seconds; a client that speaks during it is still
 // waiting on your endpoint afterwards, not lost.
 loop {
-    let req = gs::ipc::recv(&ctx);
-    let mut buf = [0u8; 4096];
-    let n = fs.read_into("/data/answer.txt", &mut buf)?;
-    reply(&req, &buf[..n]);
+    let _req = gs::ipc::recv(&ctx);
+    let client = gs::ipc::take_sent_cap(&ctx);   // the reply capability the client sent with it
+    let mut buf = [0u8; gs::ipc::MAX_BYTES];
+    let n = fs.read_into("/data/answer.txt", &mut buf).unwrap_or(0);
+    if let Some(c) = client {
+        // Answers without blocking, AND gives the one-shot capability's slot back. A plain send
+        // would keep it, and leak one slot per request until the table is full.
+        let _ = gs::ipc::reply(&ctx, c, &gs::ipc::Message::from_bytes(&buf[..n]));
+    }
 }
 ```
 

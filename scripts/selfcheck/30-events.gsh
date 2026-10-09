@@ -12,8 +12,9 @@
 # fresh variable table. What DOES carry across is the working directory and the disk.
 
 # ===== events: the METRIC table, in the same service that holds the ring =====
-# The half of `events` that is not the trace ring: it holds published samples, and it holds no log
-# lines at all - `ctx.log()` is syscall 5, straight to the kernel ring and serial (CLAUDE.md 11.4).
+# The half of `events` that is not the trace ring: it holds published samples. (Its log window is a
+# COPY - `ctx.log()` is syscall 5, straight to the kernel ring and serial first (CLAUDE.md 11.4) - and
+# is asserted under "the observability reader" below.)
 assert ok events metrics
 # THE SINK PUBLISHES ITS OWN NUMBERS BY LOCAL WRITE, NEVER BY SENDING ITSELF A MESSAGE. A send is
 # itself a reportable event, so a self-emit over IPC would feed the ring from the ring and fill it with

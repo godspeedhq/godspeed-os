@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""One escape marker, honoured by every checker: `conform-ok`.
+"""One escape marker for every checker to share: `conform-ok`.
+
+WHO HONOURS IT TODAY (2026-10-09): `line_ref_check.py` (GS0404) and nothing else. Every other checker
+ignores the marker, so a `conform-ok` naming any other code suppresses NOTHING - and is not reported
+as unhonoured either. "One marker" is the design; one consumer is the state.
 
 WHY THIS EXISTS. A document that writes ABOUT a violation contains one, and there was no way to say
 so. Writing `docs/conformance.md` failed four gates for exactly that reason, each time correctly in

@@ -23,6 +23,13 @@ is not, because **`reboot` never powers anything down.**
 
 So the two are not symmetric operations. One is a wire; the other is a protocol.
 
+> **Note 2026-10-09.** "One line" is no longer literal. The x86 reset
+> (`arch::x86_64::hardware_reset`) now tries the `0xCF9` reset control register
+> first (the Goldmont+ Wyse has no 8042, so `0x64 <- 0xFE` alone was a no-op there),
+> then the 8042 pulse, then a triple fault; the ARM and RISC-V ports reset through
+> their own firmware or SoC mechanisms. Every one is still a reset, not a power-down,
+> so the argument stands.
+
 ## What S5 actually requires
 
 Entering S5 is "write `SLP_TYPa | SLP_EN` to the `PM1a_CNT` I/O port" - but real

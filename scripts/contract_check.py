@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Reconcile each real service's `.toml` contract against the kernel's `service_config` (audit T1).
+"""Reconcile each real service's `.toml` contract against its spawn config (audit T1).
 
-The kernel is `no_std` and cannot parse TOML at spawn, so it carries a compiled `service_config(name)`
-table (`kernel/src/task/mod.rs`) that is the ACTUAL source of a service's caps/placement/memory at
-spawn. The human-facing `.toml` contract is a SECOND declaration - and the two drifted (audit M6: a
+The kernel is `no_std` and cannot parse TOML at spawn. What a service actually gets is its row in the
+supervisor's spawn table (`IMAGES` in `services/supervisor/src/main.rs`) - since step C every service
+but the supervisor lives there - or, for the supervisor alone, the kernel's `service_config`
+(`kernel/src/task/mod.rs`). This reads the kernel arm first and falls back to the IMAGES row; several
+messages below still say "kernel" for a value read from the supervisor. Only `services/*/contracts/`
+are reconciled here, not `examples/`. The human-facing `.toml` contract is a SECOND declaration - and the two drifted (audit M6: a
 contract that mis-stated the driver's authority; T1 found events/supervisor memory + supervisor peers
 diverged too). Commandment III: what RUNS cannot differ from what is DECLARED.
 
 This check makes drift impossible for the services that HAVE a contract: it parses each `.toml` and the
 kernel `service_config` for that name and fails CI on any mismatch of the reconcilable fields -
-`memory.limit` <-> `memory_limit`, `placement.core` <-> `preferred_core`, `ipc_send` <-> `send_peers`.
+`memory.limit` <-> `memory_limit`, `placement.core` <-> `preferred_core`, `ipc_send` <-> `send_peers`,
+the device class (`hw_device` / `hw_pci_*`), and `resource_mint`. The core compared is the x86 one
+where a row is arch-conditional; peers are compared as the union over every arch branch.
 Structural fields (elf, probe_mode, has_recv_endpoint) are kernel-only and not reconciled. Test/probe
 fixtures have no `.toml` (single source, the kernel) and are not checked.
 
@@ -19,7 +24,10 @@ by `IV-contract-authority` in `scripts/commandments.py`, against the grant set t
 reads (the supervisor's spawn rows plus the kernel's by-name table) rather than against `service_config`.
 Until 2026-09-14 nothing reconciled them at all, and a contract could claim an authority nothing granted.
 
-Exit: 0 if every contract matches its kernel config, 1 otherwise.
+A second check, `check_print_authority`, runs only when the reconcile passes: a crate that prints
+through `godspeed::io` must declare `log_write`, and a `console_push` declaration must be used.
+
+Exit: 0 if every contract matches its spawn config and the print check passes, 1 otherwise.
 """
 
 import re

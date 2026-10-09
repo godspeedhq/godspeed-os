@@ -13,30 +13,30 @@
 
 # ---- wifi: the PARSE contract, asserted; the radio, reported -----------------------------------
 #
-# `wifi` is the wireless link verb (`utilities/56_wifi.md`). The radio itself does not exist yet -
-# `docs/wifi.md` has the phases - so what is worth asserting here is the part that is already final and
-# stays final: the shape of the command.
+# `wifi` is the wireless link verb (`utilities/56_wifi.md`). Whether a radio is here, up and joined
+# varies by machine (the PCs have none unless a dongle is plugged in), so what is worth asserting here
+# is the part that is the same everywhere: the shape of the command.
 #
-# WHY THESE ARE THE ASSERTIONS AND `assert ok wifi` IS NOT. Asking about wireless on a machine with no
-# radio is not an error, so bare `wifi` succeeds today; on a machine whose driver is running but not yet
-# wired it deliberately fails, because implying the radio is fine when the shell cannot reach it is the
-# silent fallback invariant 12 forbids. An assertion over that line would therefore pass now and break
-# the day somebody finishes phase 1 - a landmine planted for the person doing the work. So the verdict
-# below is REPORTED, the way the lease check above reports, and only the refusals are asserted.
-echo '===== wifi: the command shape (the radio is phase 1, docs/wifi.md) ====='
+# WHY THESE ARE THE ASSERTIONS AND `assert ok wifi status` IS NOT. Asking about wireless on a machine
+# with no radio is not an error and succeeds; a radio that is down or not answering deliberately fails,
+# because implying the radio is fine when the shell cannot reach it is the silent fallback invariant 12
+# forbids. An assertion over that line would pass on one board and fail on the next for hardware
+# reasons. So the verdict below is REPORTED, the way the lease check below reports, and only the
+# refusals are asserted.
+echo '===== wifi: the command shape (the radio itself is reported, not asserted) ====='
 assert ok wifi help
 assert ok wifi version
 # A bare subcommand that needs an argument must say so rather than guess.
 assert fails wifi join
 assert fails wifi forget
 assert fails wifi radio
-# `radio` takes two words and no others.
+# `radio` takes `on`, `off`, `off hard` or `powercycle`, and nothing else.
 assert fails wifi radio sideways
 # An unknown subcommand is refused by name, never silently treated as `wifi status`.
 assert fails wifi nonsense
 # THE PASSPHRASE MUST NOT BE ACCEPTED AS AN ARGUMENT. This is the assertion that defends a security
 # decision rather than a behaviour: a passphrase on the command line is recalled by up-arrow and
-# written to /.gsh_history, so `connect` takes an SSID and nothing else. If this ever starts passing,
+# written to /.gsh_history, so `join` takes an SSID and nothing else. If this ever starts passing,
 # somebody has added a convenience that leaks a secret to disk.
 assert fails wifi join SomeSSID hunter2
 # And the radio itself, reported rather than asserted (see the note above). Under `if`, so its words

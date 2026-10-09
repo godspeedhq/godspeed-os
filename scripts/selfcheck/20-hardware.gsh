@@ -14,9 +14,9 @@
 # ===== hw-enumerator: hardware discovery in USERSPACE (step D2) =====
 echo ''
 echo '===== hw-enumerator: userspace PCI discovery + its narrow authority ====='
-# NOT EVERY MACHINE HAS PCI. This service exists on x86 and on the Pi 4; the Pi 2's peripherals hang
-# off a memory-mapped bus with no PCI at all, so there is nothing here to enumerate and no service to
-# ask. Probe for it and SKIP OUT LOUD, the same way the clock check does above - a silent skip is a
+# NOT EVERY MACHINE HAS PCI. This service exists on x86, the Pi 4 and the VisionFive 2; the Pi 2's
+# peripherals hang off a memory-mapped bus with no PCI at all, so there is nothing here to enumerate and
+# no service to ask. Probe for it and SKIP OUT LOUD, the same way the clock check in `10-meta.gsh` does - a silent skip is a
 # test that has quietly stopped testing, and asserting it unconditionally would fail the Pi 2 for
 # lacking hardware rather than for anything being wrong.
 # The probe has to survive BOTH machines, and getting it wrong is quiet rather than loud - which is
@@ -30,8 +30,8 @@ echo '===== hw-enumerator: userspace PCI discovery + its narrow authority ====='
 #
 # `count` is what makes the answer unambiguous: it counts DATA rows, not the header, so a match is 1
 # and no match is 0. Reading the raw table instead would see a header row either way and always say
-# "present". Root is used for the staging file because `/sc` is not created until much later in this
-# script, and writing into a missing parent fails.
+# "present". Root is used for the staging file because `/sc` is not created until a later part of the
+# suite, and writing into a missing parent fails.
 status | where name contains hw-enumerator | count | write /hwe.txt
 let mut hwe = 0
 for line in (read /hwe.txt) { if $line > 0 { hwe = 1 } }

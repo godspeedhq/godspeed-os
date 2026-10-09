@@ -5,9 +5,10 @@
 //! generation and liveness before touching the queue. The generation here must
 //! match the cap generation or the send returns `EndpointDead` (§8.7).
 //!
-//! SMP note (§7.8): a global spinlock serialises all routing table operations.
-//! This is the "single global RwLock" approach approved for v1. The lock is
-//! never held across a `block_and_reschedule` call.
+//! SMP note (§7.8): a global spinlock serialises all routing table operations -
+//! plain mutual exclusion, the single global lock §7.8 approves for v1 (there is
+//! no `RwLock` in the kernel). The lock is never held across a
+//! `block_and_reschedule` call.
 
 use core::sync::atomic::{Ordering};
 use portable_atomic::AtomicU64;
@@ -183,16 +184,6 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
     }
 }
 
-/// `register`, but returns `false` instead of panicking when the table is full.
-///
-/// For endpoints a task can do WITHOUT. The primary endpoint is not one of those - a service with no
-/// mailbox cannot be talked to, and failing quietly there would produce a service that exists and
-/// answers nothing, so that path still panics. The reply-only endpoint IS optional: without it a task
-/// falls back to awaiting replies on its shared endpoint, which is what every task did until now.
-///
-/// The distinction matters because the table is sized for services and the probe builds spawn ~178 of
-/// them. Handing every task a second endpoint unconditionally would have taken `osdev test identity`
-/// from working to a boot panic - the table holds 96.
 /// How many table slots stay reserved for endpoints a service CANNOT do without.
 ///
 /// A service's own receive endpoint is mandatory - without one it cannot be spawned at all. The
@@ -336,6 +327,13 @@ pub fn try_register_optional(
     }
 }
 
+/// `register`, but returns `false` instead of panicking when the table is full.
+///
+/// The spawn path uses it for a task's PRIMARY endpoint and refuses the spawn on `false`
+/// (`task::spawn_service_with_image`) - a service with no mailbox cannot be talked to, but a refused
+/// spawn is recoverable where a kernel panic is not. The optional reply-only endpoint goes through
+/// `try_register_optional`, which also keeps a reserve for primaries. The table holds 96 entries and
+/// the probe builds spawn ~178 services, so a second endpoint per task cannot be unconditional.
 pub fn try_register(id: EndpointId, core_id: u32, generation: Generation) -> bool {
     let mut table = TABLE.lock_irq();
     let slot = table.iter().position(|e| e.valid && e.id == id)
@@ -370,8 +368,9 @@ pub fn count_live_endpoints() -> u32 {
 
 /// Return the current generation of `id` in the routing table, or INITIAL if not found.
 ///
-/// Used by `spawn_service_with_config` to seed the new endpoint's generation from the
-/// killed endpoint's bumped generation, ensuring monotonicity across kill/respawn (P2, §7.5).
+/// Used by `ResourceInvoke` (syscall 31) to route to a delegated resource's owner at the owner
+/// endpoint's current generation. (It used to seed a respawned endpoint's generation in
+/// `spawn_service_with_config`; the spawn path now takes `capability::next_generation()`.)
 pub fn get_generation(id: EndpointId) -> Generation {
     let table = TABLE.lock_irq();
     table.iter()
@@ -616,14 +615,6 @@ pub fn take_call_waiter(dead_ep: EndpointId) -> Option<usize> {
     None
 }
 
-/// Kernel-internal interrupt delivery path. No capability or generation check -
-/// the caller is the kernel IDT, not a user task holding a capability.
-///
-/// Try-send semantics: if the queue is full the interrupt is silently discarded
-/// (driver overloaded; the APIC EOI still fires unconditionally in the caller).
-///
-/// Returns the blocked receiver slot if a task was waiting on `recv`, so the
-/// caller can call `scheduler::wake_by_slot` (which handles the cross-core IPI).
 /// What became of a kernel-originated enqueue. `Option<usize>` could not say, which is the point.
 ///
 /// This used to return `Option<usize>` - "the slot to wake, if one was blocked" - and swallow the
@@ -654,6 +645,13 @@ pub enum Enqueue {
     QueueFull,
 }
 
+/// Kernel-internal delivery path (interrupts, death notifications). No capability or generation
+/// check - the caller is the kernel, not a user task holding a capability.
+///
+/// Try-send semantics: if the queue is full the message is DROPPED, never blocked on, and the result
+/// says so (`Enqueue::QueueFull`) for the caller to report. `Enqueue::Woke(slot)` names a receiver
+/// that was blocked on `recv`, for the caller to wake with `scheduler::wake_by_slot` (which handles
+/// the cross-core IPI).
 pub fn enqueue_from_interrupt(endpoint: EndpointId, msg: Message) -> Enqueue {
     let mut table = TABLE.lock_irq();
     let idx = match find_index(&*table, endpoint) {
@@ -748,13 +746,15 @@ pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
         .unwrap_or(0)
 }
 
-/// Mark the endpoint dead: bump generation, drain queue, return blocked slots.
-///
-/// Returns `(blocked_receiver_slot, blocked_sender_slot)` - the caller must
-/// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`.
 /// Messages accepted into a queue and then lost when that endpoint died.
 static QUEUED_LOST: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
+/// Mark the endpoint dead: bump generation, drain queue, return blocked slots.
+///
+/// Returns `(blocked_receiver_slot, blocked_sender_slot)` - the caller must
+/// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`. Callers
+/// blocked in a `Call` awaiting this endpoint are NOT returned here: the kill path
+/// drains them separately with `take_call_waiter` and wakes them with `ReplyDead`.
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     let mut table = TABLE.lock_irq();
     let idx = match find_index(&*table, endpoint) {

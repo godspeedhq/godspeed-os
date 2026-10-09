@@ -8,7 +8,8 @@
 #![deny(unsafe_code)]
 #![no_std]
 #![no_main]
-//! `copier` - copies one file without owning the prompt.
+//! `copier` - runs one detached job without owning the prompt: a file copy, a tree delete, a check, a
+//! scrub, or a churn (the `KIND_*` constants below).
 //!
 //! **Why a service and not a loop in the shell.** This shell has no threads, and its main loop
 //! blocks reading keys, so detached work makes progress in exactly one of two ways: it is a task,
@@ -24,9 +25,10 @@
 //!    which is the one service whose death takes the session with it.
 //!
 //! **WHAT THIS SERVICE CANNOT DO IS THE POINT.** It holds `fs` and its log. It has no
-//! `console_push`, so it cannot write over a prompt somebody is typing at - not by convention but
-//! because it holds no cap that reaches the console (§3.1). It cannot spawn, reboot, or reach the
-//! network. That is strictly less authority than the shell's own, which is what a job running
+//! `console_push`, so it cannot inject keystrokes into the shell's input (§3.1, SEC-2). It CAN write
+//! to the console, as every task can through `log_write` (ConsoleWrite checks nothing else); it stays
+//! off the prompt by convention, because it never calls `gs::io`, not because a capability stops it.
+//! It cannot spawn, reboot, or reach the network. That is strictly less authority than the shell's own, which is what a job running
 //! inside the shell's loop would have had.
 //!
 //! **The honest limit of that claim, recorded rather than implied (§26.7).** The design note this
@@ -34,7 +36,8 @@
 //! handing over exactly those, so the job could reach nothing else *for its whole life*. That is
 //! not what this does, because the shell's `spawn` surface takes a name and nothing else -
 //! `utilities/10_spawn.md` §5 lists per-invocation cap delegation as future work. So the bound
-//! here is the CONTRACT's (`fs`, entire) rather than the two paths'. It is a real reduction from
+//! here is the spawn request's `fs` peer (entire; its `IMAGES` row, which the contract declares)
+//! rather than the two paths'. It is a real reduction from
 //! the alternative and it is not the one the design claimed; when `spawn` learns to delegate, this
 //! service should take its paths as caps and stop resolving them by name.
 //!
@@ -60,8 +63,9 @@ pub const CP_OK: u8 = 0;
 pub const CP_ERR: u8 = 1;
 
 /// WHAT KIND OF WORK a job is. Two, and the bar for a third is not "is it long" but "is its value
-/// its EFFECT rather than its OUTPUT" - a detached job holds no console capability, so a command
-/// whose whole product is printed text has nowhere to put it and must not be detached.
+/// its EFFECT rather than its OUTPUT" - a detached job does not print to the console (it could, through
+/// `log_write`, and keeps off the prompt by never doing so), so a command whose whole product is
+/// printed text has nowhere to put it and must not be detached.
 pub const KIND_COPY: u8 = 0;
 /// `delete <path> recursive`. Cheap to add because `fs` already does the walk in one operation
 /// (`OP_DELETE_TREE`), so this service issues ONE request and waits - no walking, no per-entry
@@ -133,8 +137,9 @@ const CHUNK_TRIES: u32 = 6;
 /// THE TRANSCRIPT: a fixed ring holding what a job had to say, replayed by `foreground`.
 ///
 /// This is the answer to "a detached job has nowhere to write its output" that does NOT involve
-/// giving the job a console. It holds no `console_push` capability and still does not; the bytes sit
-/// here until somebody asks for them, so a job can never write over a prompt.
+/// having the job print. It holds no `console_push` capability and still does not, and it never calls
+/// `gs::io`, though `log_write` would let it; the bytes sit here until somebody asks for them, so a job
+/// does not write over a prompt. That is this service's convention, not a capability bound.
 ///
 /// FIXED, and it says when it has dropped. 4 KiB of `.bss` - no heap, no growth (§26.6.1). When a
 /// job produces more than that the OLDEST bytes are aged out, exactly as `scrollback` does, and the
@@ -615,7 +620,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("copier: ready (idle - `background copy <src> <dst>` begins a copy)");
 
     loop {
-        // WHILE COPYING, DO NOT SLEEP. `recv_timeout` parks between messages, which is right when
+        // WHILE COPYING, DO NOT SLEEP. A timed receive (`gs::ipc::recv_within_ms`) parks between messages, which is right when
         // idle and hopeless while copying - it would cap the transfer at one chunk per park, so a
         // megabyte would take minutes of wall time doing nothing. Non-blocking here instead, so the
         // copy runs at whatever rate the device allows while `jobs` and `foreground` are still

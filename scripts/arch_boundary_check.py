@@ -4,7 +4,7 @@
 The whole kernel reaches hardware through ONE seam, `crate::arch::imp` (`kernel/src/arch/mod.rs`), which
 `#[cfg(target_arch)]`-selects the implementation module - one directory per ISA under `arch/`. For an
 architecture to be BOUNDED - "implement `arch/<new>/` to the same surface, touch zero neutral files" -
-two invariants must hold in every kernel file OUTSIDE `arch/`:
+these invariants must hold in every kernel file OUTSIDE `arch/`:
 
   1. No inline assembly (`asm!` / `naked_asm!`). Arch-specific instructions live only in `arch/`, reached
      through `arch::imp` primitives (e.g. `read_page_table_base`, `invalidate_tlb_page`, `local_irq_save`).
@@ -14,6 +14,11 @@ two invariants must hold in every kernel file OUTSIDE `arch/`:
      does not exist there; `portable_atomic` supplies it at zero cost everywhere else. This is the
      WORD-SIZE half of portability, and `arch/CLAUDE.md` calls it one of the two rules the boundary
      rests on - while nothing enforced it until a 32-bit port hit it as a compile error.
+  4. No `core::arch::<isa>::` intrinsics (e.g. `core::arch::x86_64::__cpuid`); wrap them in `arch/`.
+
+What it does NOT check: a `#[cfg(target_arch = ...)]` in a neutral file is neither of the above, so it
+passes here. That axis is ratcheted by `shared_surface_check.py` (CLAUDE.md 4.1). Only `//` comments
+are stripped before matching; block comments and string literals are scanned as code.
 
 This is the arch-boundary counterpart to `unsafe_check.py` (the unsafe boundary) and `contract_check.py`
 (the contract<->kernel reconcile): a boundary survives only if it is mechanically enforced (CLAUDE.md

@@ -2,9 +2,9 @@
 # (`examples/resource-server` is the owner half). resource-server MINTS a resource it owns, narrows
 # a READ-ONLY copy of the cap, and GRANTS it to `holder`; holder then exercises the three §7.3
 # properties a real capability keeps: USE (read works), NON-ESCALATION (a read-only cap cannot
-# write), REVOCABLE (after the owner revokes, the next use is CapRevoked). The supervisor reads this
-# at spawn and the kernel mints EXACTLY these capabilities; holder can do ONLY what is listed here
-# (Commandment VII, no ambient authority).
+# write), REVOCABLE (after the owner revokes, the next use is CapRevoked). A BUILD-TIME declaration:
+# nothing parses TOML at spawn (13.6); the kernel mints what the supervisor's SPAWN REQUEST asks for,
+# and this file states what that should be (Commandment VII, no ambient authority).
 name    = "holder"
 version = "0.1.0"
 
@@ -17,8 +17,8 @@ limit   = "64MiB"
 [capabilities]
 # Explicit grants only - holder can do ONLY what is listed (Commandment VII, no ambient authority).
 # The FULL set of declarable capabilities is in `contracts/schema/service.schema.json` (validated by
-# `osdev validate`) and `contracts/CLAUDE.md`: ipc_send, ipc_receive, log_write, hw_mmio,
-# hw_interrupt, hw_pio (+ service_control, supervisor-only).
+# `osdev validate`) and `contracts/CLAUDE.md`: ipc_send, ipc_receive, log_write, the
+# authority keys (console_push, resource_mint, service_control, cpu_clock, pci_cfg) and the hw_* keys.
 ipc_receive = ["holder"]   # OWNS its endpoint. resource-server GRANTs the resource cap here (an
                            # embedded cap on a message), and resource-server's REPLIES to holder's
                            # cap invocations land here too (the reply cap holder embeds per invoke is

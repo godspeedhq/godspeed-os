@@ -6,7 +6,11 @@ docs. Box-drawing characters (U+2500 etc.) are fine; this checks ONLY the two da
 was previously kept by hand-grepping each diff; this makes it a mechanical CI guard, like
 `unsafe_check.py` / `contract_check.py` / `arch_boundary_check.py` (discipline as mechanism, §26).
 
-Exit: 0 if no em/en dash is present in tracked text files, 1 otherwise.
+SCOPE, which is narrower than "anywhere": git-tracked files whose suffix is in TEXT_SUFFIXES below
+(so `.ps1`, `.svg` and suffix-less files are not read), excluding `tests/conformance/`. A file that is
+not valid UTF-8 is skipped silently. Commit messages are not checked.
+
+Exit: 0 if no em/en dash is present in those files, 1 otherwise.
 """
 
 import os

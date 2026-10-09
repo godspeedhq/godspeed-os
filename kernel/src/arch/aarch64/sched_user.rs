@@ -16,8 +16,8 @@
 //! - **Preemption across the EL boundary.** The timer fires while the core is at EL0; the IRQ vector
 //!   saves the frame on the task's kernel stack, the neutral tick switches away, and resuming unwinds
 //!   back through that vector to `eret` into EL0 again.
-//! - **A separate address space per task.** `switch_context` installs `TTBR0` on a change; the kernel
-//!   is in `TTBR1` and is untouched.
+//! - **A separate address space per task.** `switch_context` installs `TTBR0` (on every switch since
+//!   2026-10-03, not only on a change - `context.rs` says why); the kernel is in `TTBR1` and is untouched.
 //!
 //! The user payload counts and reports through a syscall, so its progress is visible. If its counter
 //! keeps rising while the kernel tasks also run, an EL0 task really is sharing the core.

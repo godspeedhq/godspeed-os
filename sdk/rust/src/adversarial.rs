@@ -9,7 +9,9 @@
 //! `unsafe`-free (§18.2), exactly as the SDK's ABI / MMIO / DMA modules keep the driver services
 //! `unsafe`-free (§18.1). This module is **test-only**: no production service should call it (a fault
 //! primitive merely kills the caller, which the kernel handles; the fuzz primitive is a raw trap the
-//! kernel validates).
+//! kernel validates). One production caller exists, by design: the SDK's own panic handler
+//! (`lib.rs`) calls [`fault_null_read`] so that a panicking service dies and is restarted instead of
+//! spinning.
 
 /// Issue a RAW syscall with an arbitrary number and arguments and return the raw `i64` result. This is
 /// the fuzz/adversarial entry point (F1/F2/A10/A15 ...): the kernel **validates every syscall**, so from
@@ -19,7 +21,8 @@
 /// any argument values, so it is isolated in [`crate::syscall::raw_syscall`] and wrapped safely here.
 #[inline]
 pub fn fuzz_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
-    // SAFETY: `raw_syscall` is the ABI trap (a `ud2` into ring-0). It is sound for ANY argument values -
+    // SAFETY: `raw_syscall` is the ABI trap (`ud2` on x86-64, `svc #0` on ARMv7, the native trap on the
+    // other ports - `syscall.rs`). It is sound for ANY argument values -
     // it just transitions to the kernel, which validates. Fuzzing arbitrary nr/args cannot violate this
     // task's Rust memory safety; rejecting bad input is the kernel's responsibility (exactly what the
     // fuzz/adversarial suite verifies). The worst outcome is that the kernel kills this task, not UB.

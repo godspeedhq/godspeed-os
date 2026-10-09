@@ -21,7 +21,7 @@ reports raw facts and renders no verdict (`0_conventions.md` §1 rule 7).
 
 ```
 gsh> mem
-mem: 2048 KiB used / 4096 MiB total (0.04% used, 4095 MiB free)
+mem: 2048 KiB used / 4096 MiB total (0.04% used, 4094 MiB free)
 ```
 
 The percentage is computed in hundredths with integer math, so the microkernel's

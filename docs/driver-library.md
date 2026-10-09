@@ -1,7 +1,7 @@
 # The driver library: `gs::driver`
 
-**Status: adopted 2026-10-02, from the operator's design guidance. Two mechanisms built (`wait`,
-`delay`); nine drivers converted across all four ports. "Current state" below says what exists; the
+**Status: adopted 2026-10-02, from the operator's design guidance. Three mechanisms built (`wait`,
+`delay`, `irq`); nine drivers converted across all four ports. "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -61,7 +61,9 @@ and why; read them for the reasoning, not to find out what the library contains.
 - **`delay`** - holds, for gaps nothing reports the end of. `hold` spins on a calibrated clock;
   `hold_parked` sleeps first and spins the rest, for holds of tens of milliseconds. On an uncalibrated
   clock both sleep whole scheduler quanta, erring long, because a hold is a minimum.
-  **`hold_parked` has one caller (`ehci`)** and is in on probation - step 1l says why.
+  **`hold_parked` came in with one caller (`ehci`)**, on probation - step 1l says why. It has three
+  now (checked 2026-10-09): `ehci`, `wifi-usb` (`rtl8188.rs`) and `sdk/audio`'s settings retry, so
+  the second driver step 1l waited for has arrived, though not the `xhci` hold it named.
 - **`irq`** - waiting for a device's interrupt on the endpoint its clients also send to. `Irq::granted`,
   `routed`, `seen`; `wait(budget)` returns `Interrupt`, `Request(message)` or `Timeout`, so a request is
   handed back to be served and never dropped; `rearm` re-opens a level-triggered line (a no-op for MSI).
@@ -91,8 +93,8 @@ verified on hardware**). `audio-driver` and `pwm-audio` were written on the libr
 - Where one LOOK is a whole transfer - `dwc2`'s hub reset and `net::bulk`, `xhci`'s disk transfer - the
   uncalibrated bound of 200,000 looks can be hours. It ends, which the one-look deadlines it replaced
   did not do correctly; but no one chose it as a bound.
-- `xhci`'s 55 ms reset-recovery hold still spins (`delay::hold`). It is the candidate to make
-  `hold_parked` a mechanism two drivers use.
+- `xhci`'s 55 ms reset-recovery hold still spins (`delay::hold`). It was the named candidate to make
+  `hold_parked` a mechanism two drivers use; `wifi-usb` became the second instead.
 - None of the boards this work was tested on is uncalibrated, so every uncalibrated path above is
   reasoned and unit-tested, not observed.
 

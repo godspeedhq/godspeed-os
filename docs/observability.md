@@ -99,7 +99,7 @@ service counts, and sends. This is the `events` shape again.
 data only the kernel has - and it **already exposes them, by PULL**:
 
 ```
-   InspectKernel (syscall 13)     25 queries
+   InspectKernel (syscall 13)     26 queries
    TaskStat                       per-task state
         |
         +-- gated by the INTROSPECT capability (3.1, docs/introspection-capability.md)
@@ -154,7 +154,9 @@ objections were decisive there:
 
 ## 5. The shape that already works: a bounded ring the kernel writes and a SERVICE drains
 
-This is not hypothetical - it is how kernel logs already reach userspace (11.4):
+This is the 11.4 shape. It is not yet how kernel logs reach userspace - nothing drains the ring (see
+below), and since 2026-10-08 the boot record is read by COPY through InspectKernel query 27 - but the
+shape is what a drainer would use:
 
 ```
    kernel  --writes-->  [ bounded ring, overwrites when full ]  <--drains--  events
@@ -560,7 +562,7 @@ What a service now has, and the shape of each:
 |---|---|---|
 | **logs** | `ctx.log()`, syscall 5 to the kernel floor | works even when `events` is dead |
 | **traces** | automatic in the SDK; needs only `ipc_send = ["events"]` | one relaxed load when not tracing |
-| **metrics** | `ctx.metric(name, value)`, `try_send` and discard | nothing it can be blocked or slowed by |
+| **metrics** | `gs::trace::metric(ctx, name, value)` (over the SDK's `metric`), `try_send` and discard | nothing it can be blocked or slowed by |
 
 Read back with `events metrics` (a record source, so it filters and formats like any other).
 
@@ -570,7 +572,9 @@ route needed one. `drain_kernel_ring_buffer()` is a no-op stub and no syscall ex
 `ctx.log()` performs its syscall FIRST and unconditionally, then offers a best-effort COPY to
 `events`. That is not the re-pointing section 1 forbids - the floor still fires first and a dead
 sink still loses no log output - it is a duplicate kept for querying. The limitation that follows is
-stated in the view itself: lines printed before `events` exists are on serial only.
+stated in the view itself: lines printed before `events` exists are on serial only. *(2026-10-08:
+and in the kernel's fixed boot record, which `events log boot` reads by copy through InspectKernel
+query 27 - CLAUDE.md 11.4. The 16 KiB ring itself is still exposed by no syscall.)*
 
 **Two things this phase settled that the plan above did not anticipate.**
 
@@ -587,9 +591,9 @@ borrowing one meant for service names, and REPORT the truncation once, because a
 a different name would merge two metrics into one row with the values interleaving.
 
 ```
-   InspectKernel (25 queries) --pull--+
+   InspectKernel (26 queries) --pull--+
    TaskStat                   --pull--+--> events --> exposition
-   kernel text ring           --drain-+      |
+   kernel text ring           --drain-+      |   (planned; nothing drains it today)
    its own 192-event trace ring ------+      +-- holds INTROSPECT + a log cap
 ```
 
@@ -653,8 +657,8 @@ Neither is a formality. The pin refusing a `tracer` service is what produced the
 > *"Deciding what to record is judgement, and judgement is policy (26.10) - the argument that kept
 > the trace ring out of the kernel."*
 
-The answer is that **the kernel already makes that judgement, about 60 times, in every `kprintln!`**
-it contains. It already decides that a failed spawn, an IOMMU fault and an SMP bring-up are worth
+The answer is that **the kernel already makes that judgement, in every `kprintln!`** it
+contains (296 call sites under `kernel/src` on 2026-10-09; this said about 60). It already decides that a failed spawn, an IOMMU fault and an SMP bring-up are worth
 reporting. Structured events do not ADD judgement to the kernel; they change the ENCODING of
 judgement it already exercises, from text a consumer must parse into records a consumer can read.
 

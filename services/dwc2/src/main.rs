@@ -7,23 +7,16 @@
 #![deny(unsafe_code)]
 //! `dwc2` - the Raspberry Pi 2's USB host controller, as a userspace service.
 //!
-//! This began as a skeleton that proved the IRQ path and drove nothing. It now drives the controller:
-//! it holds the hardware a driver needs - the DWC2 register window, a DMA
-//! arena, and the USB interrupt - and does nothing with it but report. It exists to answer one
-//! question before 3981 lines of driver are moved onto it:
+//! It drives the controller from the DWC2 register window, a DMA arena and the USB interrupt granted at
+//! spawn: the root hub and hot-plug (`hub.rs`), a boot keyboard (`hid.rs`), mass storage served to
+//! `block-driver` (`msc.rs`), the LAN9514's ethernet served to `nic-driver` (`net.rs`), and a USB WiFi
+//! dongle served to `wifi-usb` (`rtl.rs`). The in-kernel `arch/arm/dwc2.rs` it replaced is deleted
+//! (CLAUDE.md 6.4, 2026-08-17).
 //!
-//!   *does a device interrupt actually arrive in userspace on arm32?*
-//!
-//! `CLAUDE.md` §6.4 says it cannot ("ARM does not yet route device IRQs to userspace"), and Phase 1
-//! established that the claim describes an unwritten branch rather than the hardware. This service is
-//! the proof, and it is deliberately cheap: if the answer is no, one boot says so, and nothing has
-//! been ported yet. See `docs/arm32-usb-userspace.md`.
-//!
-//! **Claiming the vector takes the controller away from the kernel.** `arm_irq_dispatch` routes to
-//! whoever registered for `USB_VECTOR`, falling back to the in-kernel stack only when nobody has. The
-//! moment this service is spawned it IS the registrant, so the in-kernel driver stops receiving
-//! interrupts. That is intended - it is the whole point of the phase - but it means USB is expected
-//! to be degraded on a boot with this service running, and that is not a regression to chase.
+//! It began as a skeleton that drove nothing and asked one question - *does a device interrupt arrive
+//! in userspace on arm32?* (`docs/arm32-usb-userspace.md`). The answer was yes; the loop at the end of
+//! `service_main`, entered only when no register window or arena was granted, is what is left of that
+//! skeleton.
 
 #![no_std]
 #![no_main]
@@ -66,7 +59,8 @@ const MSG_DRAIN_MAX: u32 = 256;
 /// a missed report is the worst case rather than a dead input path.
 const PASS_BUDGET_MS: u64 = 20;
 
-/// How long to wait before re-arming the USB line after an interrupt.
+/// How long to wait before re-arming the USB line after an interrupt - in the skeleton loop only (no
+/// register window granted); the driving loop re-arms through `usb_irq`.
 ///
 /// The skeleton cannot clear the device condition, so the line is still asserted when it unmasks and
 /// the next interrupt is immediate. One second turns that into a metronome instead of a livelock:
@@ -117,23 +111,6 @@ fn usb_irq(
     gs::driver::irq::Irq::granted(ctx).rearm(ctx);
 }
 
-/// Route one request to the block server or the frame server.
-///
-/// ONE endpoint carries both protocols, so the opcode decides. The reply cap is taken HERE, once, so
-/// neither server can take it twice or forget to - and a request with none is dropped loudly, because
-/// it cannot be answered and silence would leave the client to time out against a clean log.
-
-/// Answer a block request when there is NO DISK, instead of consuming the message and going quiet.
-///
-/// `recv_timeout` CONSUMES. The two call sites below used to take a message and then drop it whenever
-/// `disk` was None, so a client blocked in request/reply waited forever for an answer that was never
-/// coming. `block-driver` asks for capacity as the very first thing it does, so with no stick in the
-/// machine it hung before printing a single line - and `fs` hung behind it - which reads as a dead
-/// service rather than an empty drive bay.
-///
-/// The net path in `dispatch` already got this right ("a net request with no NIC bound is answered,
-/// not ignored"). This is the same rule for storage: a missing dependency must RETURN, loudly, never
-/// hang. A short/failed reply is exactly what `sectors_now` treats as "no disk", which is the truth.
 /// Tell the OPERATOR, not just the log.
 ///
 /// Plugging something in is a physical act with an expectation attached: the person did it, and is
@@ -143,11 +120,13 @@ fn usb_irq(
 ///
 /// This writes OUTPUT to the console, which is not the mechanism that caused trouble before: that was
 /// `console_push`, which injects into the INPUT ring and made the shell reprint its prompt on every
-/// keyboard re-bind. Writing a line does not disturb the shell's input at all.
+/// keyboard re-bind. Writing a line does not disturb the shell's input at all. It then pushes ONE
+/// newline (`console_push`) so the shell redraws its prompt - restored, and why it is safe now, in the
+/// body.
 ///
 /// Leading newline so the line starts clean rather than merging into a half-typed command, and short
-/// enough to stay inside the 256-byte console write limit. Still logged as well - the serial capture
-/// is the record, the console is the notification.
+/// enough to stay inside the 256-byte console write limit. Not logged as well (see the body): the
+/// console write already reaches serial, and the call sites log the port-level detail.
 fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // CONSOLE ONLY. The port-level detail is already logged beside every call site, and
     // logging here as well printed each notice TWICE in the serial capture - once from the
@@ -167,6 +146,17 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     ctx.console_push(10);
 }
 
+/// Answer a block request when there is NO DISK, instead of consuming the message and going quiet.
+///
+/// `recv_timeout` CONSUMES. The two call sites below used to take a message and then drop it whenever
+/// `disk` was None, so a client blocked in request/reply waited forever for an answer that was never
+/// coming. `block-driver` asks for capacity as the very first thing it does, so with no stick in the
+/// machine it hung before printing a single line - and `fs` hung behind it - which reads as a dead
+/// service rather than an empty drive bay.
+///
+/// The net path in `dispatch` already got this right ("a net request with no NIC bound is answered,
+/// not ignored"). This is the same rule for storage: a missing dependency must RETURN, loudly, never
+/// hang. A short/failed reply is exactly what `sectors_now` treats as "no disk", which is the truth.
 fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
     match gs::ipc::take_sent_cap(ctx) {
         Some(reply) => {
@@ -184,6 +174,11 @@ fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
     }
 }
 
+/// Route one request to the radio, frame or block server.
+///
+/// ONE endpoint carries three protocols, so the opcode decides. The reply cap is taken HERE, once, so
+/// no server can take it twice or forget to - and a request with none is dropped loudly, because
+/// it cannot be answered and silence would leave the client to time out against a clean log.
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
     ctx: &ServiceContext, m: &godspeed_sdk::Mmio, d: &godspeed_sdk::Dma,
@@ -252,10 +247,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "dwc2");
     // PREFIX `dwc2-svc:`, not `dwc2:`.
     //
-    // The IN-KERNEL driver already owns the `dwc2:` prefix and prints heavily - hub ports, MSC
-    // capacity, FUA. With both writing to one serial console, an identical prefix makes the log
-    // unreadable exactly when it matters: the whole question this service exists to answer is which
-    // of the two is receiving the interrupt, and a shared prefix would hide that.
+    // Chosen while the IN-KERNEL driver still owned the `dwc2:` prefix and printed heavily - hub
+    // ports, MSC capacity, FUA - so the two could be told apart on one serial console. That driver is
+    // deleted (CLAUDE.md 6.4, 2026-08-17); the prefix stays because logs and tests match on it.
     ctx.log("dwc2-svc: starting - USB host (hub, keyboard, storage, ethernet)");
 
     // The two hardware grants, reported rather than assumed. A driver that cannot reach its
@@ -274,8 +268,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // SLICE 1a: bring the controller up ourselves.
     //
-    // The kernel driver has stood down (it gates on who holds the vector), so from here the service
-    // owns this controller. Everything below is reported rather than assumed: a driver that cannot
+    // There is no kernel driver for this controller any more, so from here the service owns it. Everything below is reported rather than assumed: a driver that cannot
     // reach or reset its hardware must say which step failed, not present as a driver that found no
     // devices.
     // Declared out here so the poll loop below can see it: the bring-up borrows `mmio`, and the
@@ -338,10 +331,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the safe minimum every device must accept for its first descriptor read.
             // SLICE 1c: address the root device and identify it.
             //
-            // The acceptance test is a COMPARISON, not a plausible-looking line: the VID/PID and port
-            // count must match what the in-kernel driver reports for the same hardware. Anything
-            // else means the transfers worked and the parsing did not, which a lone "looks like a
-            // hub" would hide.
+            // The acceptance test was a COMPARISON, not a plausible-looking line: the VID/PID and port
+            // count had to match what the in-kernel driver reported for the same hardware (that
+            // driver is deleted now). Anything else means the transfers worked and the parsing did
+            // not, which a lone "looks like a hub" would hide.
             if let Some(d) = ctx.dma_region() {
                 match enumerate::root_device(&ctx, &m, &d) {
                     Some(dev) => {
@@ -410,6 +403,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                             // the ordinary answer on most ports and is not logged.
                                             if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 kbd_port = p;
+                                                // (History - superseded by "NO CONSOLE SIGNAL HERE"
+                                                // below, which is what the code does.)
                                                 // TELL THE USER INPUT IS LIVE, once, by making the
                                                 // shell reprint its prompt. The prompt appears about
                                                 // 2.5 s before this - deliberately, so it never waits
@@ -461,7 +456,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 radio_binds = radio_binds.wrapping_add(1);
                                                 radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
-                                                // Prove the bulk path the way the kernel driver does:
+                                                // Prove the bulk path the way the kernel driver did:
                                                 // ask the device its size, then read block 0. Capacity
                                                 // alone would prove the command path; reading a block
                                                 // proves the DATA path, which is where a short
@@ -559,11 +554,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         const RECOVERY_BACKOFF_MS: u64 = 10_000;
         let mut reports: u64 = 0;
         let mut last_beat = wait::Since::now(&ctx);
-        // The interval the DEVICE asked for, floored to something a service can actually schedule.
-        // `cycles_to_ticks` clamps sub-quantum sleeps to one 10 ms tick, so anything finer is
-        // fiction here - and saying so beats pretending to honour a 1 ms interval.
         // The interval the DEVICE asked for, floored to what a service can actually schedule, and 10
-        // when there is no keyboard - the loop still has block requests to serve.
+        // when there is no keyboard - the loop still has block requests to serve. The kernel's sleep
+        // ends on a 10 ms tick, so anything finer is fiction here - and saying so beats pretending to
+        // honour a 1 ms interval.
         let period_ms = kbd.as_ref().map(|(k, _, _)| (k.interval as u64).max(10)).unwrap_or(10);
         ctx.log_fmt(format_args!("dwc2-svc: serving block I/O; keyboard poll every {} ms", period_ms));
         let mut capless = false;
@@ -579,7 +573,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // different faults - the current log cannot tell them apart, and every guess at the cause
         // implicitly assumes one of them.
         //
-        // `read_tsc` measures WALL time, so a segment that blocks reads the same as one that spins.
+        // The counter (`wait::Since`) measures WALL time, so a segment that blocks reads the same as one that spins.
         // That is the right unit here: the question is where the pass goes, not who is burning CPU.
         let mut passes: u64 = 0;
         let mut seg_serve: u64 = 0;
@@ -595,8 +589,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // The only `irq_unmask` used to sit in the fallback loop below, which a board with hardware
         // never reaches - so the line was never enabled and not one interrupt was ever delivered.
-        // The kernel routes this vector to us because the contract asks for it (`hw_interrupt =
-        // [41]`); until something unmasks, that routing goes nowhere.
+        // The kernel routes this vector to us because the spawn request names the device class
+        // (`hwclass::DWC2`), not because the contract lists `hw_interrupt = [41]` - the kernel never
+        // reads a contract (CLAUDE.md 13.6). Until something unmasks, that routing goes nowhere.
         //
         // Loud either way, once: whether receive is interrupt-driven or still client-polled is the
         // difference between a driver and a poller, and it should not have to be inferred from
@@ -662,6 +657,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 //
                 // What this cannot bound alone is a SINGLE slow operation, which is why the transmit
                 // budget was cut to match. The two together bound the pass.
+                //
+                // ON A MACHINE WHOSE CLOCK THE KERNEL COULD NOT CALIBRATE THIS LOOP TAKES NOTHING.
+                // `wait::Since::passed` is true at once there (no duration can be measured), so the
+                // budget is spent before the first look. Requests are then served by the timed wait at
+                // the bottom of the pass, ONE per pass and only on a pass that served nothing else.
                 while !t_pass.passed(&ctx, Budget::ms(PASS_BUDGET_MS)) {
                     let msg = match gs::ipc::try_recv(&ctx) {
                         Some(m) => m,
@@ -1160,11 +1160,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // gap costs a whole scheduler-stretched sleep before the next request is even LOOKED at.
             // The sleep was not conserving CPU during a quiet moment - it was inserting one.
             //
-            // `recv_timeout` blocks on the ENDPOINT: an arriving message wakes it immediately because
+            // `recv_within_ms` blocks on the ENDPOINT: an arriving message wakes it immediately because
             // that wake is event-driven, and the deadline still provides the keyboard's poll cadence
             // when nothing arrives. Same idle behaviour, none of the latency.
             //
-            // The message it returns must be SERVED, not dropped - `recv_timeout` consumes. That is
+            // The message it returns must be SERVED, not dropped - `recv_within_ms` consumes. That is
             // the exact bug that made the keyboard report `0 USB IRQ(s)` on a boot where the kernel
             // had delivered the interrupt, and it is one `let _ =` away from happening again.
 

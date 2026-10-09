@@ -21,7 +21,9 @@ graceful-shutdown mechanism.
 | Command | Meaning |
 |---|---|
 | `kill <name>` | Stop the running service named `<name>`. |
-| `kill` (no name) | Prints `usage: kill <name>`. |
+| `kill <a>,<b>,...` | Stop each named service (comma list, no spaces, at most 16 names; a refused or absent one does not stop the rest). `supervisor` goes after the others and `shell` last. |
+| `kill all-services` | Stop every service the supervisor restarts (`CHAOS_RESTARTABLE`), then the supervisor, then this shell - a whole-system recycle in which only the kernel survives. |
+| `kill` (no name) | Prints `usage: kill <svc> \| <svc>,<svc>,... \| all-services   ('help kill' for detail)`. |
 
 ## 3. Behaviour & guards
 
@@ -30,6 +32,9 @@ graceful-shutdown mechanism.
   `CapNotHeld`. This closes the §3.1/§14.4 ambient-authority hole - before it,
   any service could kill any other. Held only by the shell, supervisor, and test
   probes. See `docs/service-control-cap.md`.
+- **Results are one line each:** `killed: <name>`, `not running: <name>` (an `Err`),
+  or `kill failed: <name>` (an `Err`). The `observe` variants are refused with a
+  pointer to the `observe` command.
 - **There is NO TCB guard, and that is deliberate.** Nothing here is refused on
   trusted-root grounds, because the non-restartable set is `{kernel}` alone (§6.2,
   §6.3 - Path C / Phase 6). `fs` and `block-driver` are freely killable and the

@@ -21,6 +21,7 @@ delete 0.4.0 - remove a file or directory
 usage:
   delete <path>             remove the file or empty directory at <path>
   delete <path> recursive   remove the directory <path> and everything under it
+  delete <a>,<b>,...        remove each (comma list, no spaces, at most 16)
   delete version            print the version
   delete help               print this message
 
@@ -36,6 +37,11 @@ no accidental tree wipes - and the error names the opt-in (`use 'delete <path> r
 `delete <path> recursive` removes a non-empty directory and its whole subtree. The safe
 default is deliberate (mirrors `mkdir … parents`, `copy … recursive`): the destructive
 operation only happens when you spell it out. There is no trash and no undo (§26.7).
+
+The root (`/`) is refused. Success prints `deleted <path>` (or `deleted (recursive) <path>`).
+A request whose answer never came is reported as `OUTCOME UNKNOWN` - the path `MAY HAVE BEEN
+removed`, or for a recursive delete `may be PARTLY removed` - and is not re-sent. A recursive
+delete can also run detached: `background delete <path> recursive` (`55_background.md`).
 
 ## 4. Implementation
 

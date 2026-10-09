@@ -4,10 +4,11 @@
 //! # This is not a new failure model
 //!
 //! GodspeedOS already had one. `ServiceContext::request_with_reply_deadline_outcome` returns
-//! `DeadlineOutcome { Reply, SendFailed, QueueFull, Timeout }`, and those four states are exactly
-//! right. This module does not replace them; it carries them to the application unchanged, alongside
-//! the filesystem's own status byte, so that one `Error` answers both "what happened" and "what may
-//! I do about it".
+//! `DeadlineOutcome { Reply, SendFailed, QueueFull, Timeout }`, and those four states are right as
+//! far as they go. This module carries them to the application, with ONE more the kernel already
+//! reported and that enum folds away: a peer that died holding the request (`ReplyDead`, CLAUDE.md
+//! 8.6), which is [`Error::PeerDied`]. Alongside the filesystem's own status byte, one `Error` answers
+//! both "what happened" and "what may I do about it".
 //!
 //! # The distinction everything turns on
 //!
@@ -20,17 +21,19 @@
 //!   the peer's queue was full    -> Busy             RETRY IS SAFE
 //!     (peer alive, congested)                        nothing happened; pace yourself
 //!
+//!   the peer died holding it     -> PeerDied         RETRY IS NOT SAFE
+//!     (delivered, then ReplyDead)                    it may ALREADY have happened
+//!
 //!   the deadline passed in silence -> OutcomeUnknown RETRY IS NOT SAFE
-//!     (peer may be slow, or gone,                    it may ALREADY have happened
-//!      or may have done the work
-//!      and died before replying)
+//!     (peer may be slow or wedged)                   it may ALREADY have happened
 //! ```
 //!
-//! That last case is the whole reason this type is shaped the way it is. A `delete` that returns
-//! `OutcomeUnknown` may have deleted the file. Re-sending it is not "trying again", it is performing
-//! a second, different operation whose failure would look like success. `services/copier` says the
-//! same thing at its own call site, having learned it the hard way, and five services reached for a
-//! longer-named SDK function to recover a distinction the short one threw away.
+//! Those last two cases are the whole reason this type is shaped the way it is. A `delete` that
+//! returns `OutcomeUnknown` may have deleted the file. Re-sending it is not "trying again", it is
+//! performing a second, different operation whose failure would look like success. `services/copier`
+//! says the same thing at its own call site, having learned it the hard way, and before this library
+//! several services reached for a longer-named SDK function to recover a distinction the short one
+//! threw away.
 //!
 //! [`Error::retry_is_safe`] is the answer in one call, so nobody has to re-derive it.
 
@@ -56,17 +59,21 @@ pub enum Error {
     /// The service tried and failed, and said so. A real failure with a real answer behind it.
     Failed,
 
-    // ---- no answer came, and the three are NOT interchangeable --------------------------------
+    // ---- no answer came, and the four are NOT interchangeable ---------------------------------
     /// The request never left this task: the peer's capability is stale because it restarted
     /// (§14.2), or its name does not currently resolve. **Nothing happened.** Retrying after
-    /// reacquiring the peer by name reaches the fresh instance, which is what [`crate::call`]
-    /// already does for you once.
+    /// reacquiring the peer by name reaches the fresh instance, which [`crate::call::request_within`]
+    /// already does for you once - for a send that never left, and for nothing else. A request that
+    /// was delivered is never re-sent ([`Error::OutcomeUnknown`], [`Error::PeerDied`]).
     Unreachable,
     /// The peer is alive and its queue is full. **Nothing happened.** Congestion is transient by
     /// definition: pace and retry, and do not go looking for a peer that never went anywhere.
     Busy,
     /// The deadline passed with no reply. **The operation may have completed.** The peer may be
-    /// slow, or may have done the work and died before answering. This is the one failure you must
+    /// slow, or may be wedged. (A peer that DIED holding the request is [`Error::PeerDied`] on the
+    /// `CallDeadline` path, [`crate::call::request_within`]; only paths that wait with a plain timed
+    /// receive, such as [`crate::call::request_within_notice`] with a callback, report a death here
+    /// too, because no `ReplyDead` reaches them.) This is the one failure you must
     /// not paper over: for anything that changes state, report it or re-read the truth, never
     /// re-send.
     OutcomeUnknown,
@@ -97,6 +104,8 @@ pub enum Error {
     ///
     /// It is still not safe to retry blindly. The request may already have been delivered and acted
     /// on; cancelling only means this caller stopped listening.
+    Cancelled,
+
     /// The capability is no longer valid: whatever issued it revoked it, or died and was
     /// replaced (7.5 - a generation bump invalidates every outstanding cap).
     ///
@@ -112,7 +121,6 @@ pub enum Error {
     /// **Re-open the resource** - and remember that a capability obtained from a service's PREVIOUS
     /// instance is stale even after you reacquire that service by name (14.3).
     Revoked,
-    Cancelled,
 
     /// The caller's buffer is too small for the answer. Nothing was consumed; call again with room.
     BufferTooSmall,

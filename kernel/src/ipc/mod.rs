@@ -26,8 +26,8 @@ static NEXT_ENDPOINT_ID: AtomicU64 = AtomicU64::new(100);
 /// ID range bounded by the concurrent-endpoint count (≤ `MAX_ENDPOINTS`), so the counter no longer
 /// grows without bound. Sized just above `MAX_ENDPOINTS` (96): the free set can never exceed the
 /// number of endpoints that were ever simultaneously live, so it never overflows in practice; if it
-/// somehow did, the surplus ID is simply dropped (it falls back to the monotonic counter - bounded,
-/// loud, never silent corruption).
+/// somehow did, the surplus ID is simply dropped, without a log line (it falls back to the monotonic
+/// counter - bounded, never corruption; the loud backstop is the delegated-band panic below).
 const FREE_ID_CAP: usize = 128;
 struct EndpointIdFreeList {
     ids: [u64; FREE_ID_CAP],

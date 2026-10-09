@@ -117,7 +117,7 @@ no reboot.
 
 A USB mass-storage stick acknowledges a write when it has the data in its own buffer, not when it is on
 flash, so something has to force it to the medium. This section said our stick **refuses SCSI
-SYNCHRONIZE CACHE** and that durability therefore rode on **FUA** (`USE_FUA` in `services/dwc2`).
+SYNCHRONIZE CACHE** and that durability therefore rode on **FUA** (a `USE_FUA` switch, which is no longer in `services/dwc2`).
 
 **The refusal was never true.** Across seven sessions and three USB stacks the device has accepted
 `SYNCHRONIZE CACHE(10)`, and on 2026-09-23 an unassisted power cut on this board landed inside the

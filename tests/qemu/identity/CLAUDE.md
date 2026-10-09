@@ -1,6 +1,6 @@
 # tests/qemu/identity/
 
-The identity test suite (§22, Tests 1-15). **`osdev test identity` runs 24 cases (Tests 1-11 and 15, each with an A/B case, plus IR1A/IR1B) - all passing, no regressions allowed.** Tests 12-14 run as their own bare-metal subcommands (see below).
+The identity test suite (§22, Tests 1-15). **`osdev test identity` runs 24 cases (Tests 1-10 each with an A/B case, Tests 11 and 15 one case each, plus IR1A/IR1B) - all passing, no regressions allowed.** Tests 12-14 run as their own bare-metal subcommands (see below).
 
 If any test in this directory fails, the system is no longer the system the spec describes.
 
@@ -12,7 +12,7 @@ cases are **data-driven `TestSpec` entries in `osdev/src/validator.rs`** (each n
 
 | Case(s) in `osdev/src/validator.rs` | Spec test  | Constitutional invariant  | Timeout      |
 |-------------------------------------|------------|---------------------------|--------------|
-| `1A` / `1B`                         | §22 Test 1 | TCB integrity             | 30s / 120s   |
+| `1A` / `1B`                         | §22 Test 1 | TCB integrity             | 120s / 30s   |
 | `2A` / `2B`                         | §22 Test 2 | No ambient authority      | 30s          |
 | `3A` / `3B`                         | §22 Test 3 | Authority is explicit     | 30s          |
 | `4A` / `4B`                         | §22 Test 4 | Restartability            | 30s / 60s    |
@@ -23,7 +23,7 @@ cases are **data-driven `TestSpec` entries in `osdev/src/validator.rs`** (each n
 | `9A` / `9B`                         | §22 Test 9 | Identity over location    | 60s          |
 | `10A` / `10B`                       | §22 Test 10| Identity over location    | 60s / 60s    |
 | `11`                                | §22 Test 11| Naming out of kernel; restartability | 60s |
-| `15`                                | §22 Test 15| Unkillable set = {kernel} | 60s          |
+| `15`                                | §22 Test 15| Unkillable set = {kernel} | 90s          |
 | `IR1A` / `IR1B`                     | §12.2 §12.3| Interrupt delivery / discard-on-no-driver | 60s |
 
 Timeout column: positive case / negative case. Single value = both cases share the timeout.
@@ -41,19 +41,19 @@ Timeout column: positive case / negative case. Single value = both cases share t
 
 Each test:
 1. Builds a kernel + probe service image via `osdev build`.
-2. Boots QEMU with `-smp 4` (and `-enable-kvm -cpu host` when `/dev/kvm` is accessible).
+2. Boots QEMU with `-smp 4` (and `-enable-kvm` when `/dev/kvm` is accessible; without it every timeout is multiplied by 4, `qemu::timeout_scale`).
 3. Streams serial output line by line.
 4. Passes when all `expect` strings appear in order within the timeout.
 5. Fails if any `fail_on` string appears, or the timeout fires, or `KERNEL PANIC` appears unexpectedly.
 
 ## TestKind variants
 
-Tests are expressed as one of three harness kinds, defined in `osdev/src/validator.rs`:
+The identity cases use three of the harness kinds defined in `osdev/src/validator.rs` (the enum also has `WithBadElf`, `WithBadElfBrutal`, `ContractFuzz`, `DegradedSmp`, `DegradedEnv` and `Blocked`, used by the other suites):
 
 | Kind           | Trigger                          | Used by |
 |----------------|----------------------------------|---------|
 | `WatchSerial`  | Look for `expect` strings        | 1A, 2A/B, 3A/B, 4A, 5A/B, 7A/B, 8A/B, 9A/B |
-| `WithRestart`  | Wait for `wait_for` string, send `restart_cmd` via COM2, then look for `expect_after` | 4B, 6A/B, 10A/B |
+| `WithRestart`  | Wait for `wait_for` string, send `restart_cmd` via COM2, then look for `expect_after` | 4B, 6A/B, 10A/B, 11, 15, IR1A/B |
 | `WithBadTcb`   | Boot with a corrupted TCB binary, look for `KERNEL PANIC` | 1B |
 
 `WithRestart` tests use `"supervisor: ready"` as the `wait_for` guard on all tests that restart pong/ping. This ensures the restart fires only after the supervisor's spawn loop is complete - no risk of restart-mid-spawn on the timer ISR.
@@ -95,8 +95,8 @@ IR1A and IR1B added as part of post-v1 item 9 (interrupt routing tests). Verific
 
 ## Test structure (§22.5)
 
-Every test has a positive case (system permits what it should) and a negative case (system refuses what it shouldn't). Both must pass.
+Tests 1-10 each have a positive case (system permits what it should) and a negative case (system refuses what it shouldn't); both must pass. Tests 11 and 15 are single recovery scenarios, with no negative case.
 
 ## Adding tests
 
-Only add a test here if it pins a constitutional invariant from §3 or §6. Regression tests for specific bugs go in `tests/qemu/regression/`. If you add a test that invalidates a constitutional invariant, you must amend `CLAUDE.md` first.
+Only add a test here if it pins a constitutional invariant from §3 or §6. Regression tests for specific bugs go in the suite whose surface they exercise (a `TestSpec` in `osdev/src/validator.rs` or a check in `osdev/src/shell_test.rs`); there is no `tests/qemu/regression/` directory. If you add a test that invalidates a constitutional invariant, you must amend `CLAUDE.md` first.

@@ -14,8 +14,8 @@ live view ships (`cmd_observe_live`) and that string exists nowhere in `services
 
 `observe` answers one question: **what is the system doing right now?** It surfaces
 the per-task and per-core metrics the kernel already tracks (state, core, memory,
-queue depth, restarts, CPU time) plus a system summary (frames, per-core CPU%,
-endpoint count).
+queue depth, restarts, CPU time, uptime) plus a system summary (uptime, per-core
+CPU%, RAM).
 
 `observe` reports raw metrics. It does **not** render a verdict - "is everything
 OK?" is the future job of a separate `status` utility (see §9). Keeping the two
@@ -99,45 +99,53 @@ subcommand help:
 
 ### 4.1 Layout
 
-```
-observe 0.4.0  ·  snapshot
+As built (`services/observe/src/main.rs`, `print_state`; values illustrative):
 
-SLOT  NAME              CORE  STATE         MEM KiB (used/lim)   Q  RST
-----  ----------------  ----  ------------  ------------------  --  ---
-   0  init                 0  Running              256 / 65536   0    0
-   1  supervisor           0  BlockedRecv          512 / 65536   0    0
-   2  shell                0  Running              384 / 65536   0    0
-   3  xhci                 1  Running             1024 / 65536   0    0
-   4  registry             0  Ready                256 / 65536   0    0
-
-cores: 4    cpu:  c0 38%   c1 9%   c2 2%   c3 1%
-memory: 18.4 / 4096.0 MiB used  (4061 MiB free)
-endpoints: 14
 ```
+--------------------------------- legend ---------------------------------
+TASK scheduler slot | NAME service name | CORE cpu core | STATE task state
+MEM_USED/LIMIT/% memory in use (binary+stack+alloc) / limit / % of limit
+RESTARTS deaths recovered (not clean re-runs) | QUEUE/LIMIT inbound depth / max
+CPU% core share since boot | UPTIME since the service last (re)started
+------------------------- system state (14 live) -------------------------
+UPTIME: 0d 00:12:41
+CPU: not measurable from a single snapshot - it is a share of elapsed time, and this is the first sample (run the live view for rates)
+RAM: 18 MiB used / 4 GiB total (0%)
+TASK NAME             CORE STATE      MEM_USED/LIMIT/%      RESTARTS  QUEUE  CPU%  UPTIME
+0    supervisor       C0   BlockRecv   512 KiB/64 MiB/  0%  0         0/16     0%     12m
+1    events           C0   BlockRecv    96 KiB/ 8 MiB/  1%  0         0/16     0%     12m
+2    shell            C0   Running       2 MiB/64 MiB/  3%  0         0/16     0%     12m
+```
+
+The live view adds a two-line title bar (`observe - live ... (q to quit)` over a
+`====` rule), replaces the `CPU:` line with per-core shares (`CPU: C0  38%  C1   9%
+... total (12%)`), and labels CPU% `since last snapshot`.
 
 ### 4.2 Per-task columns
 
 | Column | Source (`TaskStat`) | Notes |
 |---|---|---|
-| SLOT | the slot index 0..N | scheduler slot, stable for task lifetime |
-| NAME | `name` / `name_len` | truncated to 16 |
-| CORE | `core` | pinned core (§9.1) |
-| STATE | `state` | Ready / Running / BlockedRecv / BlockedSend / Dead |
-| MEM | `mem_used` / `mem_limit` | shown in KiB |
-| Q | `queue_depth` | inbound IPC queue depth, 0-16 |
-| RST | `generation` | endpoint generation = restart counter (§7.5, §14.2) |
+| TASK | the slot index 0..223 | scheduler slot, stable for task lifetime |
+| NAME | `name` / `name_len` | 15 wide; a longer name is cut and marked `+` |
+| CORE | `core` | pinned core (§9.1), shown `C<n>` |
+| STATE | `state` | Ready / Running / BlockRecv / BlockSend / Dead |
+| MEM_USED/LIMIT/% | `mem_used` / `mem_limit` | KiB below 1 MiB, else MiB; % of limit |
+| RESTARTS | `restart_count` | deaths recovered (§7.5, §14.2) |
+| QUEUE | `queue_depth` | inbound IPC queue depth, 0-16, shown as `N/16`; `!` when full |
+| CPU% | `run_ticks` delta | this task's share of elapsed time; 0 with no baseline (one-shot) |
+| UPTIME | `uptime_secs` | since the service last (re)started, largest unit |
 
-Only slots with `valid == true` are listed.
+Only slots with `valid == true` are listed, and an `observe` instance only when it
+is the one rendering (`Running`).
 
 ### 4.3 Summary line
 
 | Field | Source | Notes |
 |---|---|---|
-| cores | `inspect_core_count()` | |
-| cpu cN% | `inspect_core_active_ticks(N) / inspect_core_total_ticks(N)` | cumulative-since-boot share for the static frame (see §5.3) |
-| memory used | `inspect_kernel_total_frames() - inspect_kernel_free_frames()` × 4 KiB | |
-| memory free/total | `inspect_kernel_free_frames()`, `inspect_kernel_total_frames()` | |
-| endpoints | `inspect_kernel_endpoint_count()` | |
+| live | count of valid slots | in the `system state (N live)` rule |
+| UPTIME | `gs::task::uptime_secs` | wall clock since boot |
+| CPU: CN% | `inspect_core_active_ticks(N)` delta over elapsed time | live view only; a one-shot has no baseline and says so (see §5.3) |
+| RAM used / total | `inspect_kernel_total_frames() - inspect_kernel_free_frames()` × 4 KiB, `inspect_kernel_total_frames()` | free >= total prints `RAM: ACCOUNTING INCONSISTENT` with the raw counts |
 
 **No kernel changes are required for the static frame** - every value above is an
 existing introspection syscall the shell already has authority to call.
@@ -162,10 +170,14 @@ with the prompt right there confirming the shell is back.
 
 ### 5.3 CPU% - cumulative vs instantaneous
 
-The static frame shows cumulative-since-boot CPU share (active/total ticks). The
-live view SHOULD show *instantaneous* CPU% - the delta in active/total ticks
-between successive frames - so the numbers reflect current load, not lifetime
-average. This requires the utility to remember the previous frame's tick counts.
+The live view shows *instantaneous* CPU% - the delta in active ticks (per core) and
+run ticks (per task) between successive frames, as a share of elapsed time - so the
+numbers reflect current load. It keeps the previous frame's counts on its stack.
+
+The static frame has no previous frame. It says `CPU: not measurable from a single
+snapshot ...` instead of a per-core line, and its per-task CPU% column reads 0. (The
+legend's `since boot` label for the one-shot is a code defect: no since-boot share is
+computed.)
 
 ### 5.4 Console prerequisite (kernel/console work - gates the live view)
 
@@ -185,10 +197,11 @@ input ring that the USB keyboard pushes into (closing the loop with the xHCI wor
 All present today in `sdk/rust/src/service_context.rs`:
 
 - `task_stat(slot) -> TaskStat` - per-task: `valid, state, core, mem_used,
-  mem_limit, name, generation, queue_depth, run_ticks`.
+  mem_limit, name, restart_count, queue_depth, run_ticks, uptime_secs`.
 - `inspect_core_count()`, `inspect_core_active_ticks(c)`, `inspect_core_total_ticks(c)`.
-- `inspect_kernel_free_frames()`, `inspect_kernel_total_frames()`,
-  `inspect_kernel_endpoint_count()`, `inspect_kernel_alloc_bytes()`.
+- `inspect_kernel_free_frames()`, `inspect_kernel_total_frames()`.
+- `gs::task::uptime_secs`, and `gs::driver::wait::ticks` / `ticks_per_10ms` for the
+  elapsed-time base of the CPU shares.
 
 ---
 
@@ -231,6 +244,12 @@ literal - it holds the introspection cap plus a console cap, never the shell's
 `spawn`/`kill`/`restart`. Done on branch `feat/introspect-cap`; see
 `docs/introspection-capability.md`.
 
+> **Note 2026-10-09.** "Name-gated" is no longer how the grant is made. The kernel
+> keys no grant on a service name (CLAUDE.md §12.3, 2026-10-03 amendment): the
+> supervisor's spawn table carries `INTROSPECT` in the privilege word of the
+> `observe`, `observe-now` and `observe-live` rows, and the kernel mints exactly that
+> from the spawn request (§13.6).
+
 ---
 
 ## 8. Capabilities required
@@ -238,14 +257,16 @@ literal - it holds the introspection cap plus a console cap, never the shell's
 `observe` runs as a standalone service (§7), so its **contract declares exactly what
 it needs and nothing more**:
 
-- an **introspection capability** - read-only access to the `inspect_*` / `task_stat`
-  surface (see the §7 note on making this explicit if it is currently ambient);
-- a **console output capability** to render its frame;
-- for the live view only, a **console input capability** to read the `q` keypress.
+- an **introspection capability** (`INTROSPECT`) - read-only access to the
+  `inspect_*` / `task_stat` surface;
+- **`log_write`** to render its frame (printing is `log_write`, not `console_push`);
+- for the live view, the console flag on its spawn request
+  (`SPAWN_FLAG_REQ_CONSOLE`); the painter turns echo off while it paints. It reads
+  no input: the **shell** polls for `q` and kills the painter.
 
 It does NOT hold `spawn`/`kill`/`restart` - that authority stays with the shell. The
-shell brokers the spawn; the kernel mints these caps from the contract at spawn time
-(§13, §14.1).
+shell asks the supervisor to spawn it, and the kernel mints these caps from the
+supervisor's spawn request, not from the contract (CLAUDE.md §13.6, §14.1).
 
 ---
 

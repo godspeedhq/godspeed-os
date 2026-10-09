@@ -2,10 +2,10 @@
 # Boot the bare-metal image under QEMU with an emulated AMD-Vi IOMMU and a
 # qemu-xhci controller behind it, for H1 (DMA-confinement) development.
 #
-# Usage: scripts/qemu_iommu.sh [seconds] [logfile] [extra-qemu-args...]
+# Usage: scripts/qemu_iommu.sh [seconds] [logfile] [iommu|noiommu]
 #   seconds  - how long to run before killing QEMU (default 22)
 #   logfile  - serial capture path (default build/iommu_qemu_serial.log)
-# Pass "noiommu" as the 3rd arg to omit the IOMMU (negative case).
+# Pass "noiommu" as the 3rd arg to omit the IOMMU (negative case). No other args are read.
 set -u
 SECS="${1:-22}"
 LOG="${2:-build/iommu_qemu_serial.log}"

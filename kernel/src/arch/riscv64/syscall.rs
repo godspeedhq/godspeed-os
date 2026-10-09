@@ -19,8 +19,9 @@
 //! is an array index and returning a result is a store - and `sepc` is a field too, which is how the
 //! `ecall` gets stepped over. Nothing here writes a CSR or touches the user's stack.
 //!
-//! **No real task exists yet**, and every genuine handler in the neutral dispatcher reads the current
-//! task's capability table. So the selftest proves what can honestly be proved now: that arguments
+//! **The boot selftest runs before any real task exists**, and every genuine handler in the neutral
+//! dispatcher reads the current task's capability table. So the selftest proves what can honestly be
+//! proved at that point (real tasks, from the supervisor on, exercise the handlers themselves): that arguments
 //! survive the privilege transition, that the path is re-entrant, and that the NEUTRAL dispatcher is
 //! genuinely reached and returns - the last via a number it does not know, which it rejects before
 //! touching any task state. What is left untested is the handlers themselves, which is a statement

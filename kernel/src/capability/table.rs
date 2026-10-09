@@ -4,14 +4,16 @@
 //! Two structures live here:
 //!
 //! 1. `CapTable` - one per task; maps a slot index to a `Capability`.
-//!    Populated at spawn time from the service contract; modified only on
-//!    GRANT transfer or explicit revocation.
+//!    Populated at spawn time from the spawn request (§13.6 - the kernel cannot
+//!    read a contract); modified by cap transfer, `DeriveCap`, `RemoveCap`, the
+//!    caps a syscall mints into the caller (`AcquireSendCap`, `ResourceMint`, the
+//!    spawn syscalls' returned endpoint cap), and task death.
 //!
 //! 2. `GlobalResourceTable` - one per kernel; maps `ResourceId` to its
 //!    current generation and liveness. Consulted on every cap validation.
 //!
-//! Concurrency (§7.8): v1 uses a single global `SpinLock` - the "global RwLock" §7.8 approves,
-//! implemented as plain mutual exclusion. EVERYTHING serialises: a read (lookup + generation check)
+//! Concurrency (§7.8): v1 uses a single global `SpinLock` - the single global lock §7.8 approves,
+//! plain mutual exclusion. EVERYTHING serialises: a read (lookup + generation check)
 //! takes the same exclusive lock a write (insertion on spawn, removal on death) does, and can spin
 //! behind it. This said "reads are concurrent", which was a claim about an `RwLock` the kernel does
 //! not have. A v2 sharded or RCU design requires benchmarks before adoption.
@@ -185,9 +187,9 @@ impl GlobalResourceTable {
     }
 
     fn bump_generation(&mut self, id: ResourceId, liveness: Liveness) {
-        // SEC-11: no STABLE gate resource (ids 1-13: LOG_WRITE..ACQUIRE_ANY, NET_DEVICE, GPIO_DEVICE,
-        // USB_DISK, SET_CLOCK) is ever revoked or killed. `holds_resource` (the by-holdings gate for
-        // Kill/Reboot/ResourceMint/Introspect/NetFrame*/UsbDisk*/SetClock) validates those WITHOUT a
+        // SEC-11: no STABLE gate resource (ids 1-18, `capability/mod.rs`: LOG_WRITE .. CPU_CLOCK) is
+        // ever revoked or killed. `holds_resource` (the by-holdings gate - Kill, Reboot, ResourceMint,
+        // the introspection reads, the device syscalls, SpawnImage's IMAGE_SPAWN) validates those WITHOUT a
         // generation check, which is sound only while they stay un-revocable. Revocable ids are always >= 100 (endpoints) or in the delegated band. This
         // pins the invariant, so a future change that makes a gated resource revocable fails loudly
         // in test/debug rather than silently letting a revoked holder keep passing the gate.

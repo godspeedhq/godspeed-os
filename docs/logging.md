@@ -1,14 +1,19 @@
-# Logging (design, not built)
+# Logging (design, partly built)
 
 > **Status: non-normative.** This records design intent for what the `events` service is *for*. Nothing
 > here amends the constitution; when it and `CLAUDE.md` disagree, `CLAUDE.md` wins. What exists today is
 > described under "What runs now" at the end.
+>
+> **Note 2026-10-09.** The CLAUDE.md 11.4 amendment (2026-09-04) settled what this design left open:
+> a log's path of record is the kernel floor (`ctx.log()`, syscall 5), and it must not be re-pointed
+> at `events`. Read "logging is a pipe" below as describing the queryable COPY that reaches `events`,
+> not the log itself.
 
 ## The one-line purpose
 
 **`events` is a broker, not a store.**
 
-The kernel's 16 KiB ring buffer (§11.4) is a *mechanism*: a bounded byte sink that drains to serial. It
+The kernel's 16 KiB ring buffer (§11.4) is a *mechanism*: a bounded byte sink mirrored to serial. It
 deliberately has no opinion about levels, formats, retention, or who may read what. All of that is
 policy, and policy belongs in a service (§26.10). `events` exists to be the place where "I have
 something to say" becomes "these particular consumers hear it".
@@ -50,8 +55,8 @@ for you until someone hands it to you.** That is the opposite of a Unix `/var/lo
 there and permissions are a filter on top.
 
 **Subscribing is itself gated.** There is no "open the firehose" call available for the asking - that
-would be ambient authority (invariant 1). The authority to subscribe arrives from a contract at spawn or
-from a broker. There is precedent in this codebase for treating this seriously: `InspectKernel` and
+would be ambient authority (invariant 1). The authority to subscribe arrives in the spawn request (CLAUDE.md
+13.6) or from a broker. There is precedent in this codebase for treating this seriously: `InspectKernel` and
 `TaskStat` sit behind an `INTROSPECT` capability precisely because **read-only is still authority**
 (`docs/introspection-capability.md`). Log subscription is the same family and arguably stronger - a log
 carries what a service was *doing*, not merely its state. "It is only output" is not a reason to leave it

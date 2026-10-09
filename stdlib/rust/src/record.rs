@@ -32,8 +32,10 @@
 //! # Bounded, and it will tell you
 //!
 //! Fixed capacity, no heap (CLAUDE.md 26.6.1): [`REC_MAX_ROWS`] rows, [`REC_MAX_COLS`] columns, and a
-//! [`REC_ARENA`]-byte string arena. Past that, rows are dropped and [`Table::overflow`] returns true
-//! - which is there to be CHECKED. A truncated table that renders cleanly is a report that lies by
+//! [`REC_ARENA`]-byte string arena. Past that, the row, column or string is dropped (a string that
+//! does not fit becomes `Value::Empty`) and [`Table::overflow`] returns true - which is there to be
+//! CHECKED. One case does NOT set it: an `add_row` given more values than the table has columns
+//! keeps the first `ncols` and silently ignores the rest. A truncated table that renders cleanly is a report that lies by
 //! omission, and the flag is how you avoid printing one.
 
 pub use godspeed_sdk::record::{

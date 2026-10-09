@@ -308,8 +308,8 @@ pub fn start_console(fb: FbInfo) {
 
     crate::bootcon::init(crate::bootcon::FbParams {
         mem,
-        // Physical base, for the `console` service's grant. Not granted on this port yet - see the
-        // mismatched-attributes note beside `fb_commit` in `mod.rs`.
+        // Physical base, for the `console` service's grant. Supplying it is what makes the grant
+        // happen (`bootcon::grant`) - see the mismatched-attributes note beside `fb_commit` in `mod.rs`.
         phys: fb.base,
         pitch: fb.pitch as usize,
         bpp: 4,

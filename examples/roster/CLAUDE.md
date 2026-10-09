@@ -42,7 +42,7 @@ the stream straight back into a `Table`, so `where`/`select`/`sort` work on a ge
 
 `roster` has a **minimal contract** (`examples/roster/contracts/roster.toml`) declaring **only
 `log_write` and no send peers** (no `ipc_send`): zero standing authority to send. The SEND cap to the
-sink is delegated by the shell at spawn (`send_peers[0]`, via `ctx.send_peer_at(0)`) - authority
+sink is delegated by the shell at spawn (`send_peers[0]`, via `gs::ipc::peer_at(&ctx, 0)`) - authority
 granted at composition time, never held (Commandment VII). The record machinery needs **no** extra
 capability and **no** kernel change - it is pure SDK, so a record producer is no more privileged than
 `greet`. `log_write` is itself a v1 default minted to every service - the contract lists it for
@@ -55,7 +55,7 @@ is *present*, and it pointedly grants nothing to send with.
 - **Do not emit JSON for service-to-service transport.** Use `Table::encode` (the binary codec);
   the shell decodes it directly. Reserve `to_json` for the human-facing edge. (Sending JSON between
   stages forces a needless parse and invites a second, drifting representation - against **III**.)
-- **Do not assume a global output.** Send only over `ctx.send_peer_at(0)`; finish with `0x04` EOT.
+- **Do not assume a global output.** Send only over `gs::ipc::peer_at(&ctx, 0)`; finish with `0x04` EOT.
 - **Do not let the encode buffer overflow silently.** Flag it (the `BufSink.overflow` flag), or
   chunk a larger table across messages - never a lone `0x04` (that is the EOT marker).
 

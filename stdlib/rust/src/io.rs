@@ -18,7 +18,7 @@
 //! worth recording because the whole design depends on authority being stated truthfully. A Stranger
 //! Test run concluded from the documentation that a program without `console_push` prints nothing,
 //! the documentation was rewritten to say so, and `scripts/contract_check.py` began failing any
-//! printer whose contract did not ask for `console_push`. Nobody had run it. `stdlib-hello` declares
+//! printer whose contract did not ask for `console_push`. Nobody had run it. `stdlib-hello` declared
 //! `console_push` and its spawn row grants it nothing (privilege word 0), and
 //! `build/tests/examples_serial.log` holds its `io::report` and `io::println` lines regardless. Moving
 //! every service onto this library made the gate fire on four drivers that print a notice - one of
@@ -42,38 +42,97 @@
 
 use godspeed_sdk::service_context::ServiceContext;
 
-/// Write a line to the console.
-///
-/// **Does not block** in any sense a caller needs to plan for: it hands bytes to the console
-/// service and returns. **Authority:** `log_write`.
-pub fn println(ctx: &ServiceContext, s: &str) {
-    ctx.console_writeln(s);
+/// The most one `ConsoleWrite` carries. The SDK's `console_write` DROPS a longer string outright and
+/// its formatted forms TRUNCATE at this length, both silently (CLAUDE.md 3.12 says a failure is loud).
+/// Every function here writes in pieces of at most this size instead, so a long line arrives whole.
+const CHUNK: usize = 256;
+
+/// Write `s` in pieces the SDK will carry, each cut on a character boundary.
+fn write_chunked(ctx: &ServiceContext, mut s: &str) {
+    while s.len() > CHUNK {
+        let mut cut = CHUNK;
+        while !s.is_char_boundary(cut) { cut -= 1; }
+        ctx.console_write(&s[..cut]);
+        s = &s[cut..];
+    }
+    if !s.is_empty() { ctx.console_write(s); }
 }
 
-/// Write without a trailing newline.
+/// Renders `format_args!` through one fixed stack buffer, flushing it whenever the next fragment
+/// would not fit, so output of any length is written in order and nothing is cut off. Bounded and
+/// heap-free (CLAUDE.md 26.6.1).
+struct Chunker<'a> {
+    ctx: &'a ServiceContext,
+    buf: [u8; CHUNK],
+    len: usize,
+}
+
+impl Chunker<'_> {
+    fn flush(&mut self) {
+        if self.len > 0 {
+            // Only whole `&str` fragments are ever copied in, so the buffer is always valid UTF-8.
+            if let Ok(t) = core::str::from_utf8(&self.buf[..self.len]) { self.ctx.console_write(t); }
+            self.len = 0;
+        }
+    }
+}
+
+impl core::fmt::Write for Chunker<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if self.len + s.len() > CHUNK { self.flush(); }
+        if s.len() > CHUNK {
+            write_chunked(self.ctx, s);
+        } else {
+            self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.len += s.len();
+        }
+        Ok(())
+    }
+}
+
+fn write_fmt(ctx: &ServiceContext, args: core::fmt::Arguments) {
+    let mut w = Chunker { ctx, buf: [0u8; CHUNK], len: 0 };
+    let _ = core::fmt::write(&mut w, args);
+    w.flush();
+}
+
+/// Write a line to the console.
+///
+/// A line of any length is written whole, in pieces of at most 256 bytes. **It may park the caller
+/// briefly**: serial output is synchronous, and when the `console` service's queue is full the kernel
+/// parks the writer until there is room (`handle_console_write`). A program printing in a tight loop
+/// runs at the speed of the screen. **Authority:** `log_write`.
+pub fn println(ctx: &ServiceContext, s: &str) {
+    write_chunked(ctx, s);
+    ctx.console_write("\n");
+}
+
+/// Write without a trailing newline. Any length; may park briefly, as [`println`].
 /// **Authority:** `log_write`.
 pub fn print(ctx: &ServiceContext, s: &str) {
-    ctx.console_write(s);
+    write_chunked(ctx, s);
 }
 
 /// Write a formatted line.
 ///
 /// Formatting is bounded and allocates nothing: it renders through a fixed stack buffer
 /// (CLAUDE.md §26.6.1 is explicit that `format_args!` is the sanctioned bounded tool, and that
-/// hand-rolling digit formatting to avoid a heap it never touches is the mistake).
+/// hand-rolling digit formatting to avoid a heap it never touches is the mistake). Output longer
+/// than the buffer is written in pieces, never cut off.
 ///
 /// ```ignore
 /// io::println_fmt(ctx, format_args!("read {} bytes from {}", n, path));
 /// ```
 /// **Authority:** `log_write`.
 pub fn println_fmt(ctx: &ServiceContext, args: core::fmt::Arguments) {
-    ctx.console_writeln_fmt(args);
+    write_fmt(ctx, args);
+    ctx.console_write("\n");
 }
 
 /// Write a formatted fragment, without the newline.
 /// **Authority:** `log_write`.
 pub fn print_fmt(ctx: &ServiceContext, args: core::fmt::Arguments) {
-    ctx.console_write_fmt(args);
+    write_fmt(ctx, args);
 }
 
 /// Report a failed operation in one line, in the house style: `<what>: <why>`.
@@ -84,5 +143,5 @@ pub fn print_fmt(ctx: &ServiceContext, args: core::fmt::Arguments) {
 /// which is the fact a user most needs and the one a hand-written message usually drops.
 /// **Authority:** `log_write` - this writes to the SCREEN (and serial), not to the kernel log ring.
 pub fn report(ctx: &ServiceContext, what: &str, e: crate::Error) {
-    ctx.console_writeln_fmt(format_args!("{}: {}", what, e.as_str()));
+    println_fmt(ctx, format_args!("{}: {}", what, e.as_str()));
 }

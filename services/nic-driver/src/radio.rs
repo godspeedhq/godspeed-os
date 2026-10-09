@@ -8,7 +8,8 @@
 //! WHICH SERVICE IS THE RADIO is the backend's to say (`Radio::new`): `wifi-driver` beside GENET and
 //! `dwmac`, whose radios are on the board, and `wifi-usb` beside the Pi 2's USB ethernet and the PCs'
 //! RTL8168, whose radio is a USB dongle (`docs/wifi-usb.md`, R6 and 39). Both answer the same frame ops
-//! through the same serve loop.
+//! through the same serve loop. GENET and `dwmac` also follow `wifi-usb` as the OTHER radio
+//! (`Radio::with_other`), for a dongle plugged into a board with its own.
 
 use godspeed_sdk::{Message, ServiceContext};
 use godspeed::driver::wait::{self, Budget};
@@ -16,7 +17,7 @@ use godspeed::driver::wait::{self, Budget};
 /// Which link carries `net-stack`'s frames.
 ///
 /// **THE CABLE ALWAYS WINS.** While the PHY reports a link, frames go over the cable; the moment it does
-/// not, they go to the radio's service (`wifi-driver` or `wifi-usb`, `Radio::new`) over the same three ops this service answers upward (`docs/wifi.md` 2) - if
+/// not, they go to the radio's service (`wifi-driver` or `wifi-usb`, `Radio::new`) over the frame ops 0x10 to 0x12, the three `dwc2` answers on the Pi 2 (`docs/wifi.md` 2) - if
 /// the radio is joined - and come back to the cable the moment it returns. Decided by the operator on
 /// 2026-09-29, in these words: "cable always wins. unplug the cable, switch to wifi automatically." One
 /// link at a time, chosen by the cable rather than by a command, and the choice lives here because this
@@ -384,8 +385,8 @@ impl Radio {
 pub(crate) fn status(ctx: &ServiceContext, radio: &mut Radio, cable: bool, mac: [u8; 6], carrier: &mut Carrier) -> [u8; 9] {
     // STATUS: [ok, mac(6), link, carrier] - net-stack reads the MAC at [1..7] and the link at
     // [7]. The ninth byte names the carrier for `net` (1 the cable, 2 the radio, 0 neither), and
-    // is what makes this reply nine bytes where every other backend's is eight or more, so a
-    // reader can tell whose it is. The link is LIVE either way: the cable from the PHY, the radio
+    // is what makes this reply exactly nine bytes, which no other backend's is (eight, or the
+    // RTL8168's thirty-two with the cable in), so a reader can tell whose it is. The link is LIVE either way: the cable from the PHY, the radio
     // from the radio service's own word on its join.
     let mut out = [0u8; 9];
     out[0] = 1;

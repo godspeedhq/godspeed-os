@@ -28,61 +28,48 @@ log_write = true
 # ARM32 (Pi 2) ONLY, and declared here because a communication path that exists in the kernel but not
 # in the contract is exactly what Commandment IV forbids. The USB stack moved out of the kernel into the
 # `dwc2` SERVICE, so this driver reaches its ethernet device by IPC (ops 0x10 INFO / 0x11 TX / 0x12 RX)
-# instead of the NET_DEVICE syscalls described below. The kernel grants the send cap only on arm; on x86
-# and aarch64 there is no such service and the grant is absent. That asymmetry is correct rather than
+# instead of the NET_DEVICE syscalls it once used. The supervisor's spawn request carries the send cap only
+# where `dwc2` is embedded (`board::NIC_PEERS`); elsewhere there is no such service and the grant is
+# absent. That asymmetry is correct rather than
 # sloppy: a contract states what the service NEEDS, and the OS decides whether to grant it (§13.3).
 # `events` - the observability sink: automatic IPC traces, plus the metric samples this service
-# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# publishes with `gs::trace::metric` (the SDK's `metric` under it). It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
-# `wifi-driver` - the Pi 4's radio, the link's FIFTH backend (docs/wifi.md 2): when the cable is out and
-# the radio is joined, this service carries net-stack's frames to it over the same three ops (0x10 INFO /
-# 0x11 TX / 0x12 RX) it answers upward. Granted only where that image is embedded (the supervisor's
-# `has_wifi_driver` board fact); the policy - the cable always wins - is `Carrier` in `radio.rs`, shared by every backend with a radio.
+# `wifi-driver` - the onboard radio of the Pi 4 and the VisionFive 2, the link's other backend
+# (docs/wifi.md 2): when the cable is out and the radio is joined, this service carries net-stack's frames
+# to it over the same three ops (0x10 INFO / 0x11 TX / 0x12 RX) it answers upward. Granted only where the
+# bridge is built (the supervisor's `nic_radio_bridge` board fact, `board::NIC_PEERS`); the policy - the
+# cable always wins - is `Carrier` in `radio.rs`, shared by every backend with a radio.
+# `wifi-usb` - the USB WiFi dongle's driver, the same bridge on the Pi 2 and the PCs, and the second
+# radio on the bridge boards (`wifi hardware use`); granted where that image is embedded (docs/wifi-usb.md).
 ipc_send  = ["dwc2", "wifi-driver", "wifi-usb", "events"]
-# ARM NOTE (userspace-audit Audit 5, A5-U1) - applies to BOTH ARM ports: on neither is there a PCIe NIC,
-# so `hw_device = "nic"` resolves to nothing; instead the kernel grants this service the NET_DEVICE
-# capability BY NAME (frame syscalls 42-44 - `service_privileges` in kernel `task/mod.rs`, arch-gated to
-# `arm` and `aarch64`). The device behind those syscalls differs per board - Pi 2: an in-kernel DWC2
-# CDC-ECM USB adapter; Pi 4: the on-board GENET Ethernet MAC - but the authority granted is identical.
-# NET_DEVICE is a kernel-only by-name grant (like the SEC-audit U15 privileges) and is deliberately NOT a
-# contract capability - `contract_check.py` does not reconcile it. So on either ARM port the real authority
-# of this service is: NET_DEVICE (move ethernet frames) + log_write. Stated here so a contract reader is
-# not misled by the x86-shaped `hw_device` line above.
+# OFF x86 (no PCI ethernet on any of the boards), the spawn request names the device kind `NIC` instead of
+# the class code above, and the kernel resolves it per board. Note 2026-10-09: this paragraph used to say
+# the kernel grants the NET_DEVICE capability BY NAME on both ARM ports (frame syscalls 42-44); nothing
+# holds NET_DEVICE any more (`service_privileges` in kernel `task/mod.rs` reads `net_device: false`), and
+# the syscalls have no caller (`backlog/21`). Per board:
 #
-# PI 4: none of the paragraph above applies - it describes the Pi 2 only. The GENET driver lives in THIS
-# service (`src/genet.rs`), not in the kernel, so the authority takes the x86 shape after all: a fixed
-# MMIO window (physical 0xFD58_0000, 64 KiB, reached via `ctx.mmio()`) plus a 64 KiB DMA arena, both
-# granted by name at spawn and only when the kernel's boot probe found a controller. The kernel's own
-# GENET code is now discovery ONLY (`arch/aarch64/genet.rs` reads one revision register and writes none);
-# there is no in-kernel driver left to fall back to, which is deliberate - a second path that is not
-# exercised does not stay working, and the unexercised one here was the one that obeyed Commandment I.
-# NET_DEVICE is still granted on aarch64 and simply goes unused; the service never calls those syscalls
-# on this board. The grant is unconditional because the kernel cannot see which board's backend the
-# embedded binary selected, and an unused capability is a smaller problem than a driver that cannot
-# reach its device.
-
-# PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
+# PI 2: no window and no arena. The LAN9514 is a USB device the `dwc2` SERVICE drives; this service
+# reaches it over IPC (the `dwc2` peer above).
 #
-# On x86 and aarch64 this service sits on core 1. On arm32 it is unpinned: cross-core wakes are
-# immediate there now (the BCM2836 mailbox doorbell), and core 0 is kept clear for `dwc2`, whose
-# split transactions must hit 125 us windows.
+# PI 4: the GENET driver lives in THIS service (`src/genet.rs`), not in the kernel, so the authority takes
+# the x86 shape: a fixed MMIO window (physical 0xFD58_0000, 64 KiB, reached via `ctx.mmio()`) plus a
+# 64 KiB DMA arena, granted at spawn by device kind and only when the kernel's boot probe found a
+# controller. The kernel's own GENET code is discovery ONLY (`arch/aarch64/genet.rs` reads one revision
+# register and writes none); there is no in-kernel driver left to fall back to, which is deliberate - a
+# second path that is not exercised does not stay working.
 #
-# A `[placement] core` line here would be a SECOND copy of that decision, and it would be wrong on
-# one of the two arches whatever value it carried - the drift Commandment III forbids. The single
-# source is `ServiceConfig.preferred_core` in kernel/src/task/mod.rs, which both the boot and the
-# RESTART paths consult. The comments that used to sit here saying "the kernel overrides this to
-# core 0" were describing exactly that duplication, and are now unnecessary as well as stale.
+# VISIONFIVE 2: the on-SoC dwmac, driven here as well (`src/dwmac.rs`, whose header says what it is granted).
 
 [placement]
-# DECLARED. The prose above argued that stating a core here would be a second copy of an
-# arch-conditional decision - and it is right that ONE number cannot be correct for both arches. But
-# saying nothing is not neutral: the kernel pins this service, the contract claims no opinion, and
-# `scripts/contract_check.py` reads that as what RUNS differing from what is DECLARED. It failed the
-# audit on exactly these three files.
+# Core 1 on every port, as a PREFERENCE: the supervisor's spawn row for this service asks for core 1, and
+# a preference falls back to round-robin when that core is not ready (only a caller's explicit core, a
+# RESTART override, is strict). That row is the source; this line restates it so
+# `scripts/contract_check.py` can reconcile the two.
 #
-# The convention the checker enforces resolves it: this line is the x86 value, which is what the
-# reconcile compares against, and the arch-conditional lives ONCE in `ServiceConfig.preferred_core`
-# (kernel/src/task/mod.rs), where arm32 puts it on core 1 beside net-stack. The reasoning for the ARM
-# choice sits beside that code rather than being restated here, so there is still one source per fact.
+# Note 2026-10-09: the paragraphs that stood here said the decision is arch-conditional, that arm32 leaves
+# this service unpinned (or puts it on core 1 beside net-stack), and that the single source is
+# `ServiceConfig.preferred_core` in kernel/src/task/mod.rs. The kernel's table now holds the supervisor
+# alone, and the supervisor's row carries one core for every port.
 core = 1

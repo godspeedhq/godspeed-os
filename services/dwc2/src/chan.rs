@@ -85,7 +85,6 @@ pub fn release(mmio: &Mmio, ch: u32) {
     mmio.write32(hcint_at(ch), 0xFFFF_FFFF);
 }
 
-/// Program a host channel and enable it.
 #[allow(clippy::too_many_arguments)]
 /// HCTSIZ bit 31, "Do Ping": run the USB 2.0 PING protocol before sending data.
 ///
@@ -176,7 +175,6 @@ pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
     (mmio.read32(hctsiz_at(ch)) >> 29) & 0x3
 }
 
-/// Wait for a channel to halt, bounded by the CLOCK. Returns the latched HCINT, or `None` on timeout.
 /// Abort a running channel, the way the core requires.
 ///
 /// **Both ChEna AND ChDis must be set.** This read as "clear ChEna, set ChDis" in two places, which
@@ -220,6 +218,7 @@ pub fn halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32) {
 /// measurement of how long a halt really takes.
 const HALT_WAIT: Budget = Budget::ms(50);
 
+/// Wait for a channel to halt, bounded by the CLOCK. Returns the latched HCINT, or `None` on timeout.
 pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(ms));
     loop {
@@ -503,12 +502,6 @@ fn stage_split_one(
     false
 }
 
-/// Wait until the controller reaches a given microframe, bounded by REAL TIME.
-///
-/// 1.5 ms, because reaching any target microframe takes at most one ~1 ms frame. Time and not a spin
-/// count: the kernel driver's comment records that a spin-count bound here "was the cause of the
-/// scheduler-starving hang", since spin latency depends on MMIO speed rather than on the clock the
-/// microframes actually advance on.
 /// The controller's microframe counter - all 14 bits of it.
 ///
 /// `HFNUM.FrmNum` increments every microframe (125 us) and wraps about every two seconds, so it is an
@@ -587,30 +580,7 @@ fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
     }
 }
 
-/// A PERIODIC (interrupt) IN split, frame-scheduled. Returns the latched HCINT.
-///
-/// Unlike a non-periodic split - which sweeps microframes across retries and tolerates bad timing -
-/// a periodic split must be SCHEDULED, and the schedule is the thing that makes it work:
-///
-///   1. START-SPLIT in microframe (current+1)&7, SKIPPING microframe 6: too little of the frame is
-///      left after it for the complete-split at +2. ODDFRM must match that microframe's parity, which
-///      `program` derives from HFNUM - correct only because the channel is enabled AFTER `wait_uframe_abs`
-///      has reached the scheduled microframe.
-///   2. COMPLETE-SPLIT at +2, retrying NYET in the following microframes (3 tries).
-///
-/// **ONE attempt per call, and that is what makes this safe in a preemptible task.** Any failure -
-/// including being descheduled at the wrong moment - simply reschedules a fresh start-split on the
-/// next poll. Combined with every wait being time-bounded, the whole poll is a few milliseconds and
-/// cannot wedge the service. The risk this port carried from the start turns out to be answered by
-/// the algorithm's own structure rather than by holding the CPU.
 #[allow(clippy::too_many_arguments)]
-/// One periodic split IN, with an optional trace of what the hardware actually did.
-///
-/// `diag` prints one compact line per poll: the microframe the start-split was synchronised to, the
-/// HCINT it returned, and the HCINT of every complete-split attempt with the microframe it was issued
-/// in. Three attempts at this scheduling have now been made by reasoning about what the hardware
-/// OUGHT to do; this is what it DOES. Bounded to a handful of polls after each bind so it cannot
-/// flood, and silent thereafter.
 #[allow(clippy::too_many_arguments)]
 /// A plain interrupt IN - no split.
 ///
@@ -625,6 +595,29 @@ pub fn interrupt_in(
     wait_halt(ctx, mmio, ch, 5).unwrap_or(0)
 }
 
+/// A PERIODIC (interrupt) IN split, frame-scheduled. Returns the latched HCINT.
+///
+/// Unlike a non-periodic split - which sweeps microframes across retries and tolerates bad timing -
+/// a periodic split must be SCHEDULED, and the schedule is the thing that makes it work:
+///
+///   1. START-SPLIT in the next microframe numbered 0..3, so its complete-splits stay inside the same
+///      frame (see the table in the body). ODDFRM must match that microframe's parity, which
+///      `program` derives from HFNUM - correct only because the channel is enabled AFTER `wait_uframe_abs`
+///      has reached the scheduled microframe.
+///   2. COMPLETE-SPLIT from +2, retrying NYET in the following microframes - at most six attempts,
+///      and never past the end of the frame.
+///
+/// **ONE attempt per call, and that is what makes this safe in a preemptible task.** Any failure -
+/// including being descheduled at the wrong moment - simply reschedules a fresh start-split on the
+/// next poll. Combined with every wait being time-bounded, the whole poll is a few milliseconds and
+/// cannot wedge the service. The risk this port carried from the start turns out to be answered by
+/// the algorithm's own structure rather than by holding the CPU.
+///
+/// `diag` prints one compact line per poll: the microframe the start-split was synchronised to, the
+/// HCINT it returned, and the HCINT of every complete-split attempt with the microframe it was issued
+/// in. Three attempts at this scheduling have now been made by reasoning about what the hardware
+/// OUGHT to do; this is what it DOES. Bounded to a handful of polls after each bind so it cannot
+/// flood, and silent thereafter.
 pub fn periodic_split_in(
     ctx: &ServiceContext, mmio: &Mmio, t: &Target,
     ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32, diag: bool,
@@ -711,7 +704,7 @@ pub fn periodic_split_in(
     // Giving up here does not merely lose one keystroke: the transaction translator is left holding
     // a transaction nobody collected, and that is what wedges it - after which the keyboard needs a
     // TT clear and, in practice on this board, a port re-enumeration, which the operator experiences
-    // as a a stutter of over a second. Each extra attempt is one microframe of waiting, so the whole
+    // as a stutter of over a second. Each extra attempt is one microframe of waiting, so the whole
     // retry budget costs well under a millisecond and buys a large reduction in stranding.
     //
     // Not unbounded: a translator that never finishes must still be given up on, or this poll would
@@ -781,8 +774,8 @@ pub fn periodic_split_in(
 ///
 /// **The DWC2 does not auto-continue a multi-packet split in buffer-DMA mode.** It halts with
 /// XferCompl after the FIRST packet, so software must sequence each mps-sized packet itself,
-/// advancing the buffer and toggling the data PID. The kernel driver says so in a comment that
-/// describes this exact failure, already diagnosed on this board:
+/// advancing the buffer and toggling the data PID. The kernel driver (since deleted) said so in a
+/// comment that described this exact failure, already diagnosed on this board:
 ///
 ///   "HW-proven (Pi 2 / LAN9514): an 18-byte device descriptor read whole came back as 8 correct
 ///    bytes + 10 stale, because only packet 1 was ever retrieved."

@@ -16,38 +16,26 @@ log_write   = true
 # NTP datagram through op 12 (a UDP exchange answered when the reply arrives) and this service never
 # calls `time` at all. A peer that is never sent to is a capability that buys nothing (§3.1).
 # `events` - the observability sink: automatic IPC traces, plus the metric samples this service
-# publishes with `ctx.metric()`. It is the ONLY gate on both: holding this send cap is what turns
+# publishes with `gs::trace::metric` (the SDK's `metric` under it). It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
 ipc_send    = ["nic-driver", "events"]
 ipc_receive = ["net-stack"]
 # net-stack mints a delegated SOCKET capability per open socket (§7.10, the same mechanism fs uses for
-# files). resource_mint is that authority; the kernel grants it from this declaration (service_hw, T1 B).
+# files). resource_mint is that authority; the kernel grants it because the supervisor's spawn request
+# asks for RESOURCE_MINT (CLAUDE.md 13.6) - this line declares it, the request is what grants it.
 resource_mint = true
 # NO CLOCK AUTHORITY (2026-10-01). This service used to be spawned with SET_CLOCK, for an SNTP exchange it
 # no longer runs and a syscall that never existed (`backlog/59`). The supervisor no longer asks for it.
 
-# PLACEMENT IS ARCH-CONDITIONAL, so it is NOT declared here.
-#
-# On x86 and aarch64 this service sits on core 1. On arm32 it is unpinned: cross-core wakes are
-# immediate there now (the BCM2836 mailbox doorbell), and core 0 is kept clear for `dwc2`, whose
-# split transactions must hit 125 us windows.
-#
-# A `[placement] core` line here would be a SECOND copy of that decision, and it would be wrong on
-# one of the two arches whatever value it carried - the drift Commandment III forbids. The single
-# source is `ServiceConfig.preferred_core` in kernel/src/task/mod.rs, which both the boot and the
-# RESTART paths consult. The comments that used to sit here saying "the kernel overrides this to
-# core 0" were describing exactly that duplication, and are now unnecessary as well as stale.
-
 [placement]
-# DECLARED. The prose above argued that stating a core here would be a second copy of an
-# arch-conditional decision - and it is right that ONE number cannot be correct for both arches. But
-# saying nothing is not neutral: the kernel pins this service, the contract claims no opinion, and
-# `scripts/contract_check.py` reads that as what RUNS differing from what is DECLARED. It failed the
-# audit on exactly these three files.
+# Core 1 on every port, as a PREFERENCE: the supervisor's spawn row for this service asks for core 1, and
+# a preference falls back to round-robin when that core is not ready (only a caller's explicit core, a
+# RESTART override, is strict). That row is the source; this line restates it so
+# `scripts/contract_check.py` can reconcile the two.
 #
-# The convention the checker enforces resolves it: this line is the x86 value, which is what the
-# reconcile compares against, and the arch-conditional lives ONCE in `ServiceConfig.preferred_core`
-# (kernel/src/task/mod.rs), where arm32 puts it on core 1 beside nic-driver. The reasoning for the ARM
-# choice sits beside that code rather than being restated here, so there is still one source per fact.
+# Note 2026-10-09: the paragraphs that stood here said the decision is arch-conditional, that arm32 leaves
+# this service unpinned (or puts it on core 1 beside nic-driver), and that the single source is
+# `ServiceConfig.preferred_core` in kernel/src/task/mod.rs. The kernel's table now holds the supervisor
+# alone, and the supervisor's row carries one core for every port.
 core = 1

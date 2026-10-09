@@ -56,8 +56,8 @@ and determining what abstractions naturally fit Godspeed.
 > **STATUS: two parts of that snippet cannot exist, and the inspection is why.**
 >
 > - `fn main()` has no meaning yet. Every runnable thing is a service entered at
->   `service_main(ctx) -> !`, all 15 examples return `!`, and of 52 syscalls the only one that ends a
->   task is `Kill` - gated behind `service_control`, which no application should hold. **This is the
+>   `service_main(ctx) -> !`, all 15 examples return `!`, and of the syscalls (numbered 0 to 55 as of
+>   2026-10-09; this said 52 when written) the only one that ends a task is `Kill` - gated behind `service_control`, which no application should hold. **This is the
 >   STOP condition the brief names below**, and it is open: `stdlib-design.md` §1 sets out three
 >   options and recommends adding an `Exit(status)` syscall as its own reviewed change.
 > - `read_to_string` cannot return an allocated `String`: there is no heap, deliberately (§26.6.1).
@@ -101,7 +101,15 @@ speculative framework.
 > **STATUS: shipped - 13 PUBLIC MODULES:** `addr`, `call`, `cap`, `error`, `file`, `fs`, `io`, `ipc`,
 > `net`, `record`, `resource`, `task`, `trace`. (This listed seven plus "a private `resource`";
 > `resource` is public now, and `file`/`ipc`/`task`/`trace`/`record` all arrived after it was written.)
-> 101 `pub fn` across the crate (149 public items in all - README.md states the counting rule). `cap` was recorded as "not built" for a day and then built: the blocker was
+> **164 public items across those 13 modules, 112 of them `pub fn`** (recounted 2026-10-09 by the rule
+> README.md states - free functions, constants, types, the methods on those types, and every
+> re-export - applied to each module's own file; the crate root's re-exports of `Error` and
+> `ServiceContext` and its `prelude` are not counted again). This said 101 and 149 on 2026-09-26; the
+> same count on that tree gives 151, so two of the difference are method, and +13 is the surface
+> growing since (`call::request_once`, `task::sleep_quantum`/`sleep_us`/`sleep_ticks`, `ipc::reply`,
+> `recv_within_ms`, the `ipc::exact` module and two error-type re-exports). The 13 EXCLUDES a 14th
+> public module, `driver`: the `gs::driver` tier (`wait`, `delay`, `irq`, 33 items) is counted
+> separately because `backlog/71` puts it outside the first covered surface. `cap` was recorded as "not built" for a day and then built: the blocker was
 > that the file-capability protocol carried no correlation tag, which is a protocol property and was
 > fixed in userspace. `task` SHIPPED, and carries the clock surface that answers "time":
 > `uptime_secs`, `epoch_secs_monotonic`, `datetime`, `clock_source`, `clock_is_set`. This said both
@@ -136,9 +144,12 @@ Investigate whether the system already represents these states. **Do not invent 
 model if one already exists.**
 
 > **STATUS: it did exist, and it was not reinvented.** `DeadlineOutcome { Reply, SendFailed,
-> QueueFull, Timeout }` is carried through one-to-one. `Error::retry_is_safe()` is the answer in one
-> call, and it returns `false` for `OutcomeUnknown` on purpose - a delete that timed out may have
-> deleted, and re-sending is a second delete whose failure looks like success.
+> QueueFull, Timeout }` is carried through, as `Ok`, `Unreachable`, `Busy` and `OutcomeUnknown`, plus
+> one outcome it folds away: a request that ARRIVED and whose replier then died (the kernel's
+> `ReplyDead`) is `Error::PeerDied` since 2026-10-09 (`stdlib-design.md` section 25 - before that
+> `gs::call` re-sent it). `Error::retry_is_safe()` is the answer in one call, and it returns `false`
+> for `OutcomeUnknown` and `PeerDied` on purpose - a delete that timed out, or whose service died
+> holding it, may have deleted, and re-sending is a second delete whose failure looks like success.
 
 ## Portability
 
@@ -187,6 +198,10 @@ creating giant convenience APIs.
 > unknown"), `dir` (which taught the LIBRARY about page caps and partial listings), `fcap` (which
 > caught the library reading a reply one byte off), and `sock` (which found a report that had been
 > claiming a response nobody sent, and two deadlines shorter than the service they waited on).
+>
+> **And then all of them (2026-10-09):** every service moved onto `gs` - 1085 raw SDK calls with a
+> `gs` equivalent, in 28 crates, to zero, held there by `scripts/one_way_check.py`
+> (`stdlib-design.md` section 25).
 
 ## First program test
 
@@ -216,7 +231,7 @@ pass.**
 > model, including that `retry_is_safe` is false for `OutcomeUnknown`. Host coverage stops there
 > because `godspeed_sdk` owns the `panic_handler` and so does `std`, so a dependent crate's host test build
 > hits `duplicate lang item`; the pure/SDK split follows the pattern `kernel/src/clock.rs` documents.
-> **The target-side tests exist now.** `osdev test fs-reuse` holds a `gs::cap::File` across a real
+> **The target-side tests exist now.** `osdev test fs-reuse` holds a `gs::file::File` (then `gs::cap::File`) across a real
 > `fs` kill and asserts the stale capability is refused with a NAMED error rather than a hang, a
 > silent success or a wrong answer (12 cases, was 8). `osdev test files` exercises `gs::fs` across a
 > real `chaos kill-storm fs 2` and now requires a real listing rather than merely the absence of an

@@ -3,7 +3,8 @@
 //!
 //! A sine wave from a phase accumulator, in fixed point - no floating point and no table. One full turn
 //! of the phase is 2^32. The polynomial is sin's Taylor series to x^7 over a quarter turn, folded to the
-//! other three: worst error about 1.6e-4, some 76 dB down, past what 16 bits can tell.
+//! other three: worst error about 1.6e-4, some 76 dB down - about 2.6 steps of the half-scale 16-bit
+//! output, so visible in the samples but far below anything a test tone is listened for.
 
 pub struct Sine {
     phase: u32,

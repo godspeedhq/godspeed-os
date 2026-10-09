@@ -6,7 +6,9 @@
 //! synchronous notification - the next use on any core returns `CapRevoked`
 //! or `EndpointDead` via the generation mismatch path (§7.5).
 //!
-//! Only the supervisor holds the `REVOKE` right (§7.4).
+//! §7.4 reserves the `REVOKE` right to the supervisor. Today no cap carries it and nothing calls
+//! `revoke` below: the live revocations are a delegated resource's owner revoking it
+//! (`delegated::revoke_owned`, syscall 32) and the kill path marking a dead endpoint Dead.
 
 use super::cap::ResourceId;
 use super::table::revoke_resource;

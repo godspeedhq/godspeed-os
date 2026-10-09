@@ -10,7 +10,8 @@
 //!
 //! **GSFS0008 - checksummed scalable format with extent lists (docs/persistence.md §6.4 +
 //! §6.6 + §6.12).** Three on-disk
-//! structures and no more: a **superblock**, a **free bitmap** (1 bit/block, read on
+//! structures for the tree (beside the fixed journal region, a backup superblock at the last LBA, and
+//! one extent block per fragmented file): a **superblock**, a **free bitmap** (1 bit/block, read on
 //! demand - the only global structure, a free *map* not a file index), and the
 //! **directory tree** of **self-describing `file_record` entries** (`{type, name, size,
 //! first_block, block_count}` - no inode table, no inode number, no global file cap). The
@@ -93,8 +94,10 @@ const EXT_MAX: usize = (EXT_CRC_OFF - EXT_ENTRIES_OFF) / EXT_ENTRY_SIZE; // 31 r
 
 // File-data block: 508 bytes of payload + a 4-byte CRC32 trailer @508 (GSFS0008). A file of N
 // bytes spans ceil(N/508) data blocks; each carries the CRC of its own payload, verified on
-// every read. (Directory blocks use a different split - 448 records + CRC; superblock/bitmap/
-// journal blocks are raw, with their own integrity schemes.)
+// every read. (Directory blocks use a different split - 448 records + CRC. The superblock carries its
+// CRC @136, an extent block and a journal commit record theirs @508; bitmap blocks carry none - the
+// bitmap is a derived view `drives check` rebuilds from the tree - and staged journal blocks are
+// verified by the commit record's payload CRC.)
 const DATA_PAYLOAD: usize = 508;
 const DATA_CRC_OFF: usize = DATA_PAYLOAD; // 508 - u32 CRC32 of the 508-byte payload
 
@@ -188,7 +191,9 @@ const JOURNAL_BLOCKS: u64 = 64; // 64 × 512 B = 32 KiB
 // One commit/header block + up to TXN_CAP data blocks must fit the journal region.
 const TXN_CAP: usize = 56; // max structural blocks one transaction may stage
 const JOURNAL_MAGIC: u32 = 0x474A_3034; // "GJ04" - marks a committed transaction
-const COMMIT_CRC_OFF: usize = 508; // commit record: CRC32 of [0..8+n*8] lives at @508
+// Commit record: magic @0, n @4, n home LBAs (u64) @8, payload CRC (u32) @8+n*8, and the record's
+// own CRC32 over [0..12+n*8) at @508 (`commit_txn`, `recover`).
+const COMMIT_CRC_OFF: usize = 508;
 
 // Recursive-delete depth cap (§26.6). Paths are capped well below this by the wire
 // `path_len` (u8) and the shell's PATH_MAX (120), so this is a backstop, not the binding
@@ -220,7 +225,8 @@ const SERVE_REPLY_MAX: usize = 4096;
 /// one arm (`OP_OPEN`) whose reply carries a capability and therefore cannot be buffered as bytes.
 const REPLY_SENT_DIRECTLY: usize = usize::MAX;
 
-// Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`.
+// Block IPC protocol (fs <-> block-driver). MUST match `services/block-driver`. Every request and
+// every reply is prefixed by a one-byte correlation tag that the driver echoes (`block_rpc`).
 const OP_READ_BLOCK: u8 = 1;
 const OP_WRITE_BLOCK: u8 = 2;
 const OP_CAPACITY: u8 = 3;
@@ -602,7 +608,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // stale after its restart (a chaos storm can restart it just before or alongside us). A `Some`
     // is its authoritative reply: a real sector count, or a true 0 = genuinely no disk. block-driver
     // serves requests only AFTER its own init (the AHCI COMRESET + IDENTIFY), so a `Some` reflects a
-    // settled controller, never a phantom 0. Reacquire and retry until it answers - no timeout.
+    // settled controller, never a phantom 0. Reacquire and retry until it answers - within a bound:
     // BOUNDED wait on block-driver's truth (Commandment VIII, and its second half). None means it is
     // still coming up OR our cached cap went stale (a chaos storm can restart it alongside us) OR the
     // reply mis-validated; we reacquire and retry. But we cap the retries: a persistent no-answer is
@@ -662,8 +668,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // mid-command kills the AHCI controller can be left wedged BSY, so a superblock read can fail
     // with a device I/O error (E_IO) though the disk is intact; the block-driver COMRESET
     // (services/block-driver/src/ahci.rs) hard-resets the port the way a cold boot does, so a
-    // re-attempt succeeds once the controller settles. We never time out: on E_IO we reacquire and
-    // ask block-driver itself. If it has gone quiet (`block_capacity` None) it is restarting, so we
+    // re-attempt succeeds once the controller settles. On E_IO we reacquire and ask block-driver
+    // itself (bounded by `MOUNT_MAX_ATTEMPTS` - see the `None` arm). If it has gone quiet (`block_capacity` None) it is restarting, so we
     // wait on its truth and retry the mount. If it ANSWERS, the read failed AFTER its own COMRESET +
     // retries, so the failure is authoritative - we serve raw, honestly, and NEVER invite a reformat
     // (§3.12, the data is intact). A genuine bad-magic / blank superblock is a legitimately raw
@@ -689,7 +695,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut fs: Option<Fs> = None;
     if capacity == 0 {
         // No usable disk: block-driver reported 0 capacity after the bounded probe above (a genuinely
-        // cardless boot - e.g. the Pi 2 before the SD/EMMC driver can read the card). There is nothing
+        // diskless boot - e.g. a Pi with no USB stick, whose SD card is never storage). There is nothing
         // to mount, and the loop below would probe LBA 0 up to MOUNT_MAX_ATTEMPTS times - each a
         // guaranteed-failing read that logs, a ~1000-line serial flood that drowns the console. "No
         // disk" is an authoritative truth, not an absence of answer (Commandment VIII): come up
@@ -2402,7 +2408,7 @@ impl Fs {
                 return Err("journal data write failed");
             }
         }
-        // 2. Write the commit record - the atomic point. magic + n + home LBAs + CRC32.
+        // 2. Write the commit record - the atomic point. magic + n + home LBAs + payload CRC + CRC32.
         let mut commit = [0u8; BLOCK];
         commit[0..4].copy_from_slice(&JOURNAL_MAGIC.to_le_bytes());
         commit[4..8].copy_from_slice(&(n as u32).to_le_bytes());
@@ -3707,12 +3713,11 @@ fn replay_window(_ctx: &ServiceContext) {}
         let append_only = want & OPEN_APPEND_ONLY != 0;
         let kernel_rights = (want & (RIGHT_READ | RIGHT_WRITE))
             | if append_only { RIGHT_WRITE } else { 0 };
-        let (rid, cap) = ctx.resource_mint(kernel_rights | RIGHT_GRANT).ok_or("mint failed")?;
+        let (rid, cap) = gs::resource::mint(ctx, kernel_rights | RIGHT_GRANT).map_err(|_| "mint failed")?;
         let mut of = OpenFile { rid, plen: path.len() as u8, append_only, write_hwm: 0, path: [0u8; OPEN_PATH_MAX] };
         of.path[..path.len()].copy_from_slice(path);
         self.open_files[slot] = of;
         // Hand a derived copy to the client; drop fs's original either way.
-        let cap = gs::cap::Cap::from(cap);
         let granted = match gs::cap::duplicate(ctx, cap) {
             // Carries the correlation tag like every other reply - this one is built here rather than
             // in `serve`'s buffer because it must embed the file CAPABILITY, and authority does not fit
@@ -4604,12 +4609,6 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-/// One block-driver RPC with restart recovery: if the reply is missing (block-driver may have
-/// restarted, leaving our cached cap EndpointDead), reacquire a fresh cap by name (via the kernel
-/// directory) and retry once (Phase D, §14.3). All block I/O goes through here.
-/// A block reply: the driver's bytes, past the correlation tag, in a buffer sized to the protocol.
-///
-/// 513 bytes, not the 4096 a `Message` carries. That difference is the whole reason the tag fits now.
 /// One block-protocol transfer buffer: big enough for the largest REQUEST (write: op + lba + block)
 /// as well as the largest reply (status + block), because the bounded call stages the request and
 /// receives the reply in the SAME buffer.
@@ -4635,6 +4634,9 @@ const BLK_REPLY_MAX: usize = 1024;
 const _: () = assert!(BLK_REPLY_MAX >= BLK_XFER_MAX && BLK_REPLY_MAX.is_power_of_two(),
     "the block buffer must hold a full transfer AND be a power of two - see the note above");
 
+/// A block reply: the driver's bytes, past the correlation tag, in a buffer sized to the protocol
+/// (`BLK_REPLY_MAX`, 1024 bytes - a full transfer rounded up to a power of two, see above) rather than
+/// the 4096 a `Message` carries. That difference is the whole reason the tag fits now.
 pub struct BlockReply {
     buf: [u8; BLK_REPLY_MAX],
     len: usize,
@@ -4709,6 +4711,12 @@ fn report_peer_recovered(ctx: &ServiceContext) {
         n));
 }
 
+/// One block-driver RPC with restart recovery (Phase D, §14.3). All block I/O goes through here.
+///
+/// Retried only where the request never left: a failed send (block-driver may have restarted, leaving
+/// our cached cap stale) reacquires a fresh cap by name through the kernel directory and sends once
+/// more, and a full queue yields and sends once more. A request that was delivered and not answered
+/// within `BLOCK_RPC_SECS` is NOT re-sent (see the gate below).
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
     // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.

@@ -6,13 +6,15 @@
 //! The SDK offers twelve `request_with_reply*` functions across three outcome enums. They are all
 //! correct; the problem is which one is shortest to type. `request_with_reply_deadline` returns
 //! `Option<Message>`, so "the request never left" and "the deadline passed" arrive as the same
-//! `None` - and those two demand opposite responses. Three services
-//! (`block-driver`, `control`, `nic-driver`) reach for the longer `_call_err` variant to get the
-//! distinction back. (This said five, naming `copier` and `recorder` too; both have since migrated to
-//! `gs::fs` / `gs::call` and make no `request_with_reply*` call at all.)
+//! `None` - and those two demand opposite responses. Services that needed the distinction used to
+//! reach for the longer `_call_err` variant to get it back; since every service moved onto this
+//! library (2026-10-09), none calls `_call_err` directly - they call [`request_within`], which rides it.
 //!
-//! This module offers ONE function. It keeps the distinction, and it does the one retry that is
-//! provably safe, so that the easy path and the correct path are the same path.
+//! This module offers ONE way to ask, in four shapes: [`request`] and [`request_within`] (the default,
+//! and the one to reach for), [`request_once`] (the same with no retry, for a caller that owns its own
+//! recovery) and [`request_within_notice`] (for a person waiting at a prompt). The default keeps the
+//! distinction and does the one retry that is provably safe, so that the easy path and the correct
+//! path are the same path.
 //!
 //! # What it does on your behalf, and what it refuses to
 //!
@@ -26,12 +28,18 @@
 //!        │
 //!        ├─▶ QueueFull ────▶ Err(Busy)            nothing happened; pace yourself
 //!        │
+//!        ├─▶ ReplyDead ────▶ Err(PeerDied)        IT MAY HAVE HAPPENED; the peer is gone
+//!        │
 //!        └─▶ Timeout ──────▶ Err(OutcomeUnknown)  IT MAY HAVE HAPPENED
 //! ```
 //!
-//! **It never retries a timeout.** That is not caution, it is correctness: a slow service is a live
-//! service, and re-sending a `delete` to one is not a retry, it is a second delete whose failure
-//! looks like success.
+//! **It never retries a timeout, or a peer that died holding the request.** That is not caution, it
+//! is correctness: a slow service is a live service, and re-sending a `delete` to one is not a retry,
+//! it is a second delete whose failure looks like success. `ReplyDead` says the request was DELIVERED
+//! (CLAUDE.md 8.6), so it is the same case with a dead peer instead of a slow one.
+//!
+//! This diagram is [`request_within`]. [`request_within_notice`] with a callback cannot draw it: see
+//! its own documentation.
 //!
 //! # ONE OF THESE IS SAFE FOR A SERVING CALLER, AND THE OTHER IS NOT
 //!
@@ -58,9 +66,12 @@
 //!
 //! # Authority
 //!
-//! Every call takes `&ServiceContext`. There is no global, no ambient handle, and no way to reach a
-//! service this task's contract did not grant. If the capability was never granted the call returns
-//! `Unreachable`, the same as any other peer this task cannot reach - it does not acquire one.
+//! Every call takes `&ServiceContext`. There is no global and no ambient handle. When this task holds
+//! no send capability for `peer`, [`request_within`] asks the kernel's name directory for one
+//! (`AcquireSendCap`), exactly as it does for a stale one - and the kernel grants that only to a task
+//! whose spawn request declared `peer` as a send peer, or that holds `ACQUIRE_ANY` (the shell, the
+//! probes). Anyone else gets `Unreachable`. So this library widens nothing, but it is not true that
+//! it never acquires: a task holding `ACQUIRE_ANY` can reach any named service through it.
 
 use godspeed_sdk::ipc::{IpcError, Message};
 use godspeed_sdk::service_context::{ReqOutcome, ServiceContext};
@@ -93,7 +104,22 @@ pub fn request(ctx: &ServiceContext, peer: &str, msg: &Message) -> Result<Messag
 /// dead; long enough that an ordinary answer never triggers it.
 pub const NOTICE_AFTER_SECS: i64 = 2;
 
-/// [`request_within`], plus a callback fired once if the wait drags on.
+/// A bounded request with a callback fired once if the wait drags on - and, with a callback, NOT the
+/// same machinery as [`request_within`].
+///
+/// With `notice` set to `None` this IS [`request_within`]. With a callback it rides the SDK's `_qhint`
+/// request, and three things differ:
+///
+/// - **No retry.** A stale capability is not reacquired, so after the peer restarts every call fails
+///   until something else reacquires the name ([`crate::cap::reacquire`]).
+/// - **A request that never left reads as [`Error::OutcomeUnknown`]**, and at once rather than at the
+///   deadline: `_qhint` reports a failed send and a passed deadline as the same `Timeout`, so this
+///   cannot tell "nothing happened" from "it may have happened" and must say the second.
+/// - **A peer that died holding the request is also [`Error::OutcomeUnknown`]**, never
+///   [`Error::PeerDied`]: the wait is a timed receive, so no `ReplyDead` reaches it.
+///
+/// It also adds [`Error::Cancelled`], for a person who pressed `q` - and it is not safe for a task
+/// that serves clients; see the module header.
 ///
 /// # Why this exists, given the rest of this module is about not being clever
 ///
@@ -162,17 +188,20 @@ pub fn request_once(
 /// **Blocks** until the reply arrives or the deadline passes. **Not cancellable**: the deadline is
 /// the only bound, which is why it is a parameter rather than a constant.
 ///
-/// **Authority:** uses this task's existing send capability for `peer`. It never creates one.
+/// **Authority:** uses this task's send capability for `peer`. When it holds none, or a stale one, it
+/// asks the kernel's name directory for a fresh one (`AcquireSendCap`), which the kernel grants only
+/// to a task whose spawn request declared `peer` or that holds `ACQUIRE_ANY` - see the module header.
 ///
 /// **If the peer restarts** while the request is in flight, the send fails rather than vanishing,
 /// and this reacquires the peer by name and sends once more - so an ordinary restart is invisible
-/// to the caller, which is what §14.3 asks of every client. If the peer restarts AFTER receiving
-/// the request, the deadline passes instead and you get [`Error::OutcomeUnknown`], because that is
-/// the truth.
+/// to the caller, which is what §14.3 asks of every client. If the peer dies AFTER receiving the
+/// request, the kernel wakes this call with `ReplyDead` and you get [`Error::PeerDied`], not
+/// re-sent, because the work may have been done.
 ///
 /// # Errors
 ///
-/// - [`Error::Unreachable`] - the request never left, twice. Nothing happened.
+/// - [`Error::Unreachable`] - the request never left, twice, or the name could not be reacquired
+///   between the two. Nothing happened.
 /// - [`Error::Busy`] - the peer's queue is full. Nothing happened.
 /// - [`Error::OutcomeUnknown`] - no reply in time. **It may have happened.**
 /// - [`Error::PeerDied`] - the request reached the peer and it died before answering (`ReplyDead`).

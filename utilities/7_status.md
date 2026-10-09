@@ -28,30 +28,30 @@ every live scheduler slot. It reports raw facts and renders no health verdict
 
 ```
 gsh> status
-SLOT  NAME               CORE STATE
-0     init               C0   BlockRecv
-1     supervisor         C0   BlockRecv
-2     shell              C0   Running
-3     registry           C0   BlockRecv
-4     xhci               C1   Ready
+slot  name          core  state      mem     queue  restarts
+0     supervisor    0     BlockRecv  131072  0      0
+1     events        0     BlockRecv  65536   0      0
+2     shell         0     Running    262144  0      0
+3     xhci          1     Ready      98304   0      0
 ...
 ```
 
-Only slots with a live task are listed. STATE is one of Ready / Running /
-BlockRecv / BlockSend / Dead.
+(Slot numbers and values illustrative.) Every valid scheduler slot is listed, at
+most `REC_MAX_ROWS` (a longer table ends with `status: more than N rows shown
+(bounded)`). STATE is one of Ready / Running / BlockRecv / BlockSend / Dead; `mem`
+is bytes.
 
 ## 4. Data source
 
-`task_stat(slot)` for each slot 0..N (valid slots only): name, pinned core, state.
-(The fuller per-task metrics - memory, queue depth, restarts, CPU% - are rendered
-by `observe`; `status` is the short roster.)
+`task_stat(slot)` for each slot 0..255 (valid slots only): name, pinned core, state,
+memory in use, queue depth and restart count. (CPU% is `observe`'s.)
 
 ## 4a. As a record producer (typed pipes)
 
 `status` is the first **record producer** of the structured-pipe subsystem
-(`docs/records.md`, `utilities/31_records.md`). Piped, it emits a typed **table** rather than the
-flat console text above - columns **slot / name / core / state / mem / queue / restarts** - so the
-record verbs operate on real fields:
+(`docs/records.md`, `utilities/31_records.md`). Bare or piped it is the same typed **table** -
+columns **slot / name / core / state / mem / queue / restarts** - so the record verbs operate on
+real fields:
 
 ```
 status | where mem>0                  only tasks holding memory
@@ -60,8 +60,8 @@ status | sort reverse mem | to json   ordered desc, rendered as JSON
 status | where name=shell | to yaml
 ```
 
-The bare `status` (no pipe) still prints the short SLOT/NAME/CORE/STATE roster; the extra
-columns surface only on the record path, where `select` can project whichever are wanted.
+The bare `status` renders that table as a grid (`build_status_table`, then `to_grid`), so the
+console and the pipe show the same columns; `select` projects whichever are wanted.
 
 ## 5. Capabilities
 
@@ -72,7 +72,7 @@ columns surface only on the record path, where `select` can project whichever ar
 ## 6. Non-goals
 
 - **No health verdict** (reserved for a future `status`-the-health-utility).
-- **No full metrics.** Memory/queue/restart/CPU columns belong to `observe`.
+- **No full metrics.** CPU% and the live view belong to `observe`.
 
 ## 7. Conformance
 

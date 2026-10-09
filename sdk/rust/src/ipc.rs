@@ -99,10 +99,6 @@ pub fn try_recv(endpoint: CapHandle) -> Result<Option<Message>, IpcError> {
     }
 }
 
-/// Blocking `recv` with a timeout in TSC cycles: `Ok(Some(msg))` on a message, `Ok(None)`
-/// on timeout, `Err` on a real error. `timeout_cycles == 0` blocks forever (like `recv`).
-/// (syscall 35 - `recv_timeout`) Lets a driver idle on its interrupt yet still wake on a
-/// timer (e.g. for keyboard auto-repeat while a key is held - §12).
 /// Receive into a buffer the CALLER owns, returning the byte count.
 ///
 /// A `Message` carries a 4096-byte payload BY VALUE, so `recv_timeout` below costs EIGHT kilobytes of
@@ -139,6 +135,10 @@ pub fn recv_timeout_into(
     }
 }
 
+/// Blocking `recv` with a timeout in counter ticks (the kernel waits at least one scheduler tick):
+/// `Ok(Some(msg))` on a message, `Ok(None)` on timeout, `Err` on a real error. `timeout_cycles == 0`
+/// blocks forever (like `recv`). (syscall 35 - `recv_timeout`) Lets a driver idle on its interrupt
+/// yet still wake on a timer (e.g. for keyboard auto-repeat while a key is held - §12).
 pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<Message>, IpcError> {
     const RECV_TIMED_OUT: i64 = -1001; // kernel sentinel for "timed out, no message"
     let mut payload = [0u8; MAX_PAYLOAD];
@@ -160,7 +160,8 @@ pub fn recv_timeout(endpoint: CapHandle, timeout_cycles: u64) -> Result<Option<M
 ///
 /// A 32-bit ABI carries each argument in ONE register and `raw_syscall` truncates a `u64` arg to
 /// `u32`. Every OTHER argument (pointer, handle, length) genuinely fits in 32 bits, but a timeout in
-/// generic-timer ticks does NOT: at the Pi 2's ~62.5 MHz CNTFRQ, `u32::MAX` ticks is only ~68 s. A
+/// generic-timer ticks does NOT: at QEMU raspi2b's 62.5 MHz, `u32::MAX` ticks is only ~68 s (~71 min
+/// at the real Pi 2's measured 1 MHz, `kernel/src/arch/arm/timer.rs`). A
 /// longer finite timeout would truncate to a tiny value (premature wake) or - if it landed on a
 /// multiple of 2^32 - to **0**, which the kernel reads as "block forever". A bounded Commandment VIII
 /// deadline turning into an infinite hang is the worst possible way for this to fail, which is why it
@@ -250,10 +251,6 @@ pub fn call(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Error conversion.
-// ---------------------------------------------------------------------------
-
 /// `call`, bounded, receiving into a caller-owned buffer.
 ///
 /// The reason this exists as a SYSCALL rather than the hand-rolled send + `recv_timeout_into` it
@@ -323,6 +320,10 @@ pub fn call_deadline_into(
         Ok(Some(ret as usize))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Error conversion.
+// ---------------------------------------------------------------------------
 
 pub(crate) fn i64_to_ipc_error(code: i64) -> IpcError {
     match code {

@@ -1,8 +1,10 @@
 # Example: e1000
 
-A real, runnable userspace driver for the Intel 82540EM ("e1000") NIC. This is the runnable
-counterpart to `examples/driver-skeleton`: where the skeleton is an annotated template, this driver
-actually boots under QEMU, reads a live NIC over MMIO, and logs what it finds. It is deliberately
+A minimal userspace driver for the Intel 82540EM ("e1000") NIC. This is the concrete counterpart to
+`examples/driver-skeleton`: where the skeleton is an annotated template, this driver reads a real
+NIC's registers over MMIO and logs what it finds - when it is granted one. Its only spawn row today
+(the `examples-test` build) names no device class, because `nic-driver` already owns the NIC, so
+what `osdev test examples` proves is its DEGRADE path, not its MMIO path (`examples/README.md`). It is deliberately
 small and **read-only** - it reports the link state and the MAC the NIC loaded from its EEPROM - so
 the whole thing fits in one screen and the discipline stays visible.
 
@@ -78,9 +80,9 @@ so the driver contains **no `unsafe`**.
 ```toml
 [capabilities]
 log_write = true
-# The NIC's MMIO BAR is granted at spawn because the supervisor's spawn row for this service names a
+# The NIC's MMIO BAR is granted at spawn only if the supervisor's spawn row for this service names a
 # device CLASS, which the kernel resolves against its own bus scan (the same route xhci, ehci and
-# block-driver take). NOT by name, and NOT from this file: nothing parses TOML at spawn (13.6). Reach
+# block-driver take); the examples-test row names none. NOT by name, and NOT from this file: nothing parses TOML at spawn (13.6). Reach
 # the window via ctx.mmio(). A read-only driver needs no DMA arena and no hw_interrupt; a full NIC
 # driver would add both (see examples/driver-skeleton for that shape).
 
@@ -90,15 +92,17 @@ core = 1
 
 ## How to run it
 
-Boot the OS under QEMU with an e1000 NIC attached (`-device e1000,netdev=n0 -netdev user,id=n0` - the
-shell test already boots this way) and the supervisor spawning `e1000`. On the wire you will see:
+Boot the OS under QEMU with an e1000 NIC attached (`-device e1000,netdev=n0 -netdev user,id=n0`) and
+a supervisor spawn row for `e1000` that names the NIC's class (the `examples-test` row does not, and
+granting it would put two drivers on one controller with `nic-driver`). With such a row, on the wire
+you would see:
 
 ```
 e1000: link UP  MAC 52:54:00:12:34:56
 ```
 
-(`52:54:00:12:34:56` is QEMU's default e1000 MAC.) On the T630, whose NIC is not an Intel e1000, the
-BAR is never mapped, so instead you see the honest idle line:
+(`52:54:00:12:34:56` is QEMU's default e1000 MAC.) With no class granted - which is every build today,
+including `osdev test examples` - the BAR is never mapped, so instead you see the honest idle line:
 
 ```
 e1000: no Intel e1000 mapped (absent, or a different NIC) - idling
@@ -106,9 +110,9 @@ e1000: no Intel e1000 mapped (absent, or a different NIC) - idling
 
 ## What it would take to make it a full driver
 
-Read-only "what NIC is this" is the first rung. A real driver would, in order: declare a DMA arena
-and `hw_interrupt` in its contract; build TX and RX descriptor rings in the arena and hand the device
-their physical addresses; enable the device and unmask its IRQ (`ctx.irq_unmask`); on each interrupt,
+Read-only "what NIC is this" is the first rung. A real driver would, in order: ask for a DMA arena
+and an interrupt in its spawn row (stating them in its contract for review); build TX and RX descriptor rings in the arena and hand the device
+their physical addresses; enable the device and unmask its IRQ (`gs::driver::irq::Irq::granted(ctx).rearm(ctx)`); on each interrupt,
 walk the rings for completed packets and hand them to a network stack over IPC; and re-initialise all
 of it on every restart (Commandments V + IX). `docs/networking.md` sketches that NIC driver and the
 "a socket is a capability" model it feeds.
@@ -117,8 +121,9 @@ of it on every restart (Commandments V + IX). `docs/networking.md` sketches that
 
 - **Do not write `unsafe` to poke the registers.** Use `ctx.mmio()` + `Mmio::read32`/`write32`. Raw
   pointers break §18.2 and **Commandment X**.
-- **Do not assume the NIC is an e1000.** The kernel gate already enforces this; mirror it in spirit -
-  degrade when `ctx.mmio()` is `None` rather than reading garbage and trusting it (**Commandment V**).
+- **Do not assume the NIC is an e1000.** The kernel grants a window by device CLASS, not by vendor,
+  so nothing guarantees the registers behind it are an e1000's. Degrade when `ctx.mmio()` is `None`,
+  and do not trust what you read from a device you have not identified (**Commandment V**).
 - **Do not widen the device class into "any NIC's BAR for anyone".** Ask for the specific class your
   driver was written for; a broad grant is ambient authority (**Commandment VII**).
 - **Do not panic on a down link or a zero MAC.** Report it and carry on; loud, bounded behaviour over
@@ -128,7 +133,7 @@ of it on every restart (Commandments V + IX). `docs/networking.md` sketches that
 
 To drive a different PCI device: give it a row in the supervisor's spawn table naming its device
 class - or its PCI class CODE, which is how AHCI is addressed - write the service against
-`ctx.mmio()` (and `ctx.dma_region()` / `ctx.irq_unmask()` if it needs DMA or interrupts), and add it
+`ctx.mmio()` (and `ctx.dma_region()` / `gs::driver::irq` if it needs DMA or interrupts), and add it
 to the workspace. **No kernel edit.** If your device needs a `HwClass` variant that does not exist
 yet, that is the one case that touches `kernel/`, and it is a new device CLASS rather than a new
 name.
@@ -138,7 +143,7 @@ name.
 
 - `examples/driver-skeleton` - the annotated driver pattern (reset, ring, interrupt, restart).
 - `services/block-driver` (AHCI), `services/xhci`, `services/ehci` - production drivers.
-- `docs/networking.md` - the future NIC driver and socket-as-capability.
+- `services/nic-driver` - the full NIC driver; `docs/networking.md` - it and socket-as-capability.
 - **Commandments I, II, V, VI, VII, X** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §12 (drivers and interrupts), §18.1 (the SDK hardware/ABI layer), §6.4 (IOMMU
   confinement); `milestones/hardware/iommu-and-dma.md` (the DMA-safety story).

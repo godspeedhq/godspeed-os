@@ -172,8 +172,10 @@ impl<'a> Deadline<'a> {
     }
 
     /// A deadline whose looks are `pace` apart: call [`Deadline::pause`] between them. The pace is in
-    /// whole milliseconds, the kernel's sleep resolution, and at least one. On an uncalibrated machine
-    /// the budget becomes as many looks as the pace fits into it.
+    /// whole milliseconds, the unit `sleep_ms` takes, and at least one. Only ARMv7 (the Pi 2) has a
+    /// sub-tick timer for a sleep; every other port ends one on its scheduler tick, so there a pace
+    /// shorter than a quantum (nominally 10 ms) lasts about one. On an
+    /// uncalibrated machine the budget becomes as many looks as the pace fits into it.
     pub fn paced(ctx: &'a ServiceContext, budget: Budget, pace: Budget) -> Self {
         let pace_ms = (pace.as_us() / 1000).max(1);
         let mut d = Deadline::start(ctx, budget);

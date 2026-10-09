@@ -57,17 +57,17 @@ pub fn init_percore_syscall_arena(n: usize) {
 /// Initialise per-core GS MSRs for the SYSCALL stub.
 ///
 /// GS invariant (enforced here and maintained by every ISR/trampoline):
-///   ring-0: GS.base = &PER_CORE_SYSCALL[core_id]   (kernel per-core data)
-///   ring-3: GS.base = 0                             (user's GS; no ring-3 GS use)
+///   ring-0: GS.base = this core's `PER_CORE_SYSCALL` slot (kernel per-core data)
 ///
-/// MSR layout:
-///   MSR_GS_BASE      (0xC000_0101) = kernel ptr  - active in ring-0
-///   IA32_KERNEL_GS_BASE (0xC000_0102) = 0         - active in ring-3; swapgs exchanges them
+/// MSR layout - BOTH hold the same per-core pointer (see the comment in the body for why):
+///   MSR_GS_BASE         (0xC000_0101) = kernel ptr
+///   IA32_KERNEL_GS_BASE (0xC000_0102) = kernel ptr, not 0
 ///
-/// `swapgs` on SYSCALL entry: GS.base(0) ↔ KERNEL_GS_BASE(kernel_ptr) → kernel ptr in GS.base ✓
-/// `swapgs` on SYSRETQ exit:  GS.base(kernel_ptr) ↔ KERNEL_GS_BASE(0) → 0 in GS.base ✓
-/// ring3_entry_trampoline and syscall_entry both do `swapgs` before IRETQ to
-/// restore user GS.  timer_isr_stub does conditional `swapgs` when interrupting ring-3.
+/// The entry and exit stubs still `swapgs` in pairs (ring3_entry_trampoline and syscall_entry
+/// before IRETQ, the ISR stubs conditionally when interrupting ring-3), as if ring-3's GS were 0;
+/// with both MSRs equal the swap is a no-op on the value, so GS.base is never 0 and ring-3 can
+/// read its core's slot through `gs:`. Many comments in this layer still describe the user's
+/// GS.base as 0; that was the original design, not the current state.
 ///
 /// # Safety
 /// Called once per core during init, before any ring-3 task runs.
@@ -187,13 +187,6 @@ pub fn clear_user_copy_active(core: usize) {
     }
 }
 
-/// Read a user-space byte range into this core's kernel scratch and return a slice into
-/// the SCRATCH (never raw user memory).  Returns `None` if the range is invalid or
-/// larger than one message page.
-///
-/// The returned slice is valid until the next `read_user_bytes` on this core; callers
-/// must consume it before the next read / any reschedule (the prior borrowed-user-slice
-/// return required the same).
 #[inline]
 /// Copy `len` bytes from a USER range into kernel memory, under the same page-fault guard as
 /// `read_user_bytes` - but into a CALLER-SUPPLIED destination rather than the per-core scratch slot.
@@ -225,6 +218,13 @@ pub fn copy_user_to_kernel(src: u64, dst: *mut u8, len: usize) -> bool {
     true
 }
 
+/// Read a user-space byte range into this core's kernel scratch and return a slice into
+/// the SCRATCH (never raw user memory).  Returns `None` if the range is invalid or
+/// larger than one message page.
+///
+/// The returned slice is valid until the next `read_user_bytes` on this core; callers
+/// must consume it before the next read / any reschedule (the prior borrowed-user-slice
+/// return required the same).
 pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     if !validate_user_ptr(ptr, len) { return None; }
     if len > crate::ipc::message::MAX_MESSAGE_SIZE { return None; }
@@ -360,8 +360,10 @@ pub unsafe extern "C" fn syscall_entry() {
     )
 }
 
-/// INT 0x80 syscall entry - kept for reference; superseded by `ud2_syscall_entry`
-/// on AMD GX-420GI where int $0x80 also stalls.
+/// INT 0x80 syscall entry - superseded by `ud2_syscall_entry` (the SDK traps with `ud2`
+/// on every x86 machine; int $0x80 stalls on the AMD GX-420GI), but still INSTALLED at
+/// IDT[0x80] with DPL=3, so ring-3 can still reach it. Unlike the `ud2` path it does not
+/// move onto the dedicated syscall stack (`kernel_rsp`).
 ///
 /// The CPU pushes a full hardware frame onto the kernel stack (via TSS.rsp0)
 /// before jumping here, so no manual stack switch is needed:

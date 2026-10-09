@@ -20,9 +20,9 @@ use crate::regs::*;
 ///
 /// Bounded by time rather than by an iteration count, because a count means a different duration on
 /// every board and on this project it has been wrong seven times (`docs/xhci-completion-correlation.md`
-/// records the last). The kernel version spins on iteration counts (`waited > 1_000_000`) - fine
-/// there, where it ran once at boot on one board; not fine in a service that must behave the same
-/// under load as idle.
+/// records the last). The kernel version (since deleted) spun on iteration counts
+/// (`waited > 1_000_000`) - fine there, where it ran once at boot on one board; not fine in a service
+/// that must behave the same under load as idle.
 ///
 /// Returns false on timeout, and the caller REPORTS it. A hardware wait that quietly gives up is the
 /// silent-failure case invariant 12 exists to prevent.

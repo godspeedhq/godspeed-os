@@ -80,7 +80,8 @@ identical exception for file capabilities.
 
 ## 5. How it works (the capability path)
 
-1. `net-stack` holds `RESOURCE_MINT` (granted by the kernel by name, exactly like `fs`).
+1. `net-stack` holds `RESOURCE_MINT`, from the privilege word in the supervisor's spawn request for
+   it, exactly like `fs` (the kernel keys no grant on a service name, CLAUDE.md §13.6).
 2. `sock` sends `net-stack` an "open socket" request; `net-stack` mints a socket cap
    (`resource_mint`, READ|WRITE) and grants it back (`send_with_cap_by_handle`).
 3. `sock` invokes the cap (`resource_invoke` with `RIGHT_WRITE` and a payload of `dest_ip, dest_port,
@@ -113,6 +114,9 @@ Conforms to `0_conventions.md`: `sock version` / `sock help`, words-not-flags, r
 `osdev test shell` (open + invoke a socket capability, and `net`'s tab-completion adjusted for the new
 `so`-prefixed verb).
 
-**Rule 10: opening the socket is `q`-escapable.** It goes through the shell's net-stack transaction
-helper, which polls `q` while it waits, advertises `(q to quit)` once the wait lingers, and gives up
-after 20 seconds. It used to block in the syscall with no way out (`backlog/29`).
+**Rule 10: NOT currently `q`-escapable** (found 2026-10-09). This said opening the socket went
+through a helper that polls `q`. It no longer does: the resolver lookup is `ns_deadline` (3 s, one
+reacquire-and-retry), and the open and the send go through `gs::net::Net::new`, which lends no
+notice - bounded at `gs::net::NET_SECS` (10 s) for the open and `SOCKET_SECS` (30 s) for the send,
+but with no `[q] quit` and no way to end the wait early. Bounded, so never a wedge; a code defect
+against `0_conventions.md` rule 10 all the same (`Net::with_notice` is the fix, as `tcp` uses).

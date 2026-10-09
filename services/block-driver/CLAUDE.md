@@ -1,8 +1,10 @@
 # services/block-driver/
 
 Userspace disk driver (persistence, v2; §6.3, `docs/ahci.md`, `docs/persistence.md`). **Two backends,
-one block-IPC protocol**, selected by `cfg(target_arch)`: **x86 = AHCI/SATA** (MMIO + DMA, `ahci.rs`);
-**ARM (Raspberry Pi 2) = a USB mass-storage stick** (`usbdisk.rs`, through the in-kernel DWC2 stack).
+one block-IPC protocol**, selected by the board fact `storage_is_usb` (set by `build.rs`): **x86 =
+AHCI/SATA** (MMIO + DMA, `ahci.rs`); **every USB board (Pi 2, Pi 4, VisionFive 2) = a USB mass-storage
+stick** (`usbdisk.rs`, reached over IPC through `xhciblk.rs` - the `dwc2` service on the Pi 2, `xhci` on
+the others; no USB stack is in the kernel any more).
 They serve `fs` identically; `fs` never knows which. The rest of this doc describes the AHCI backend.
 **Restartable, NOT a TCB member** (Phase D amendment, §6.1, 2026-06-17): it holds no persistent state,
 so its death is a supervisor restart (re-init the controller, re-register), not a reboot - `fs`
@@ -26,8 +28,10 @@ so the driver itself is `unsafe`-free (§18.1).
 
 Command shape: a command list (32 headers) + received-FIS area + a command table per
 slot (H2D Register FIS type 0x27 + PRDT). ATA commands: IDENTIFY `0xEC`, READ DMA EXT
-`0x25`, WRITE DMA EXT `0x35`, FLUSH EXT `0xEA` (writes flush to the medium so they
-survive reboot). See `docs/ahci.md` for the register cheat-sheet.
+`0x25`, WRITE DMA EXT `0x35`, FLUSH CACHE EXT `0xEA`. A write is NOT flushed on its own: FLUSH is
+issued only on `OP_FLUSH`, which `fs` sends at its two journal barriers and at the end of a format
+(§6.1, amendment 2026-07-25 as corrected 2026-08-22; `write_block` in `ahci.rs`). See `docs/ahci.md`
+for the register cheat-sheet.
 
 **I/O retry (Phase H).** Every read/write/zero goes through `issue_io`: a **bounded retry**
 (`MAX_IO_ATTEMPTS = 3`) with **port recovery** between attempts (`recover_port` clears
@@ -54,10 +58,19 @@ BIOS/OS handoff (BOHC) - a future step (`docs/ahci.md` step E).
 ## Block IPC protocol (fs ↔ block-driver)
 
 ```
-Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
-Reply   : [status:u8, (ReadBlock only: 512 data bytes)]
-OP_READ_BLOCK = 1, OP_WRITE_BLOCK = 2; STATUS_OK = 0, STATUS_ERR = 1
+Request : [tag:u8, op:u8, (op-specific fields below)]
+Reply   : [tag:u8, status:u8, (op-specific fields below)]
+OP_READ_BLOCK   = 1  [lba:u64 LE]                    -> [status, (OK only: 512 data bytes)]
+OP_WRITE_BLOCK  = 2  [lba:u64 LE, 512 data bytes]    -> [status]
+OP_CAPACITY     = 3  []                              -> [STATUS_OK, sectors:u64 LE]
+OP_WRITE_ZEROS  = 4  [lba:u64 LE, count:u64 LE]      -> [status]
+OP_FLUSH        = 5  []                              -> [status]
+STATUS_OK = 0, STATUS_ERR = 1
 ```
+
+The **tag** is a correlation byte `fs` puts at byte 0 of every request and block-driver echoes at byte
+0 of the reply (`Reply` in `main.rs`), so a reply that arrives out of order is detected rather than
+believed. The op constants live in `main.rs`, and `services/fs` must match them.
 
 The LBA is **u64** (persistence §6.3) so GSFS's u64 capacity fields reach the device at
 full width. One request moves one 512-byte block (= one sector). `fs` owns file layout;

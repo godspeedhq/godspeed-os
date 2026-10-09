@@ -7,8 +7,9 @@ boundary was doing its job - a new `arch::imp` member is a compile error for eve
 nothing ever COMPILED this target, so the errors were latent instead of loud.
 
 That is the same failure as a test outside the default path, and it has bitten this project before in
-both directions: the ARM build ran no checkers for an entire port, and the x86 build still runs no
-arch-boundary check. A rule enforced on one build path is enforced on none. So this script exists
+both directions: the ARM build ran no checkers for an entire port, and the x86 build ran no
+arch-boundary check (it does now, in osdev's `EXTRA_CHECKS`). A rule enforced on one build path is
+enforced on none. So this script exists
 before any real RISC-V work does, and it runs the checkers rather than only the compiler.
 
 Two machines, one arch. QEMU `virt` enters the kernel at 0x8020_0000; the StarFive VisionFive 2 Lite

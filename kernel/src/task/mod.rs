@@ -65,7 +65,7 @@ pub fn kstack_pool_base() -> u64 {
 /// **Boot-ordering contract** (not a memory-safety one, so this is a safe `fn`):
 /// run once on the BSP after `memory::init` (page tables live) and **before APs
 /// start and before the first kstack is allocated** - so only the BSP has a TLB
-/// (no shootdown needed) and `init`'s stack already carries its guard. Calling it
+/// (no shootdown needed) and the supervisor's stack, the first allocated, already carries its guard. Calling it
 /// out of order wedges boot; it is not UB. Same shape as `memory::init`/`smp::init`.
 pub fn install_kstack_guards() {
     let base = kstack_pool_base();
@@ -706,22 +706,18 @@ impl HwClass {
     }
 }
 
-/// The core each USB host-controller driver is pinned to - the SINGLE SOURCE OF TRUTH for USB driver
-/// placement. Both the `ServiceConfig.preferred_core` below AND the kernel's MSI/INTx destination
-/// routing (`arch::x86_64::pci`) read these, so a controller interrupt is always delivered to the core
-/// the driver actually runs on (§12). Co-location is required for interrupt-driven USB (docs/power.md):
+/// The core each USB host-controller driver is expected on, as the kernel's MSI/INTx destination
+/// routing (`arch::x86_64::pci`) reads it, so a controller interrupt is delivered to the core the
+/// driver runs on (§12). NOT a single source of truth any more: the drivers' placement now comes from
+/// the supervisor's `USB_IMAGES` rows (`services/supervisor/src/main.rs`), which carry the same 2 and 3
+/// as literals, and nothing checks that the two agree. (2026-10-09: this said `ServiceConfig.preferred_core`
+/// read these; the kernel catalogue is `supervisor` alone, so no catalogue row does.) Co-location is required for interrupt-driven USB (docs/power.md):
 /// a keypress MSI must wake the driver's OWN core out of its idle `hlt` locally, because a cross-core
 /// wake to a halted AP is not serviced promptly on this hardware. Both sit on cores 2/3 (off core 1)
 /// because busy-polling two controllers on one core saturated it; when they block, that can relax.
 pub const XHCI_CORE: u32 = 2;
 pub const EHCI_CORE: u32 = 3;
 
-/// The hardware class + resource-mint authority a service is granted, keyed by name. This is the ONE
-/// place the kernel declares which driver drives which discovered device and which service may mint
-/// delegated resource caps (§7.10) - the spawn path reads it, never a scattered `name ==` check (audit
-/// M7 / T1 Phase B). For the services that ship a `.toml`, `scripts/contract_check.py` reconciles this
-/// against the contract's `hw_device` / `resource_mint`, so the kernel and the contract cannot diverge
-/// (Commandment III). `xhci` / `ehci` / `resource-server` have no contract and are declared here only.
 /// Is this a device class this kernel understands? 0 = none.
 ///
 /// An UNKNOWN class is refused rather than treated as none: a spawner asking for a device this kernel
@@ -956,6 +952,10 @@ fn hw_irqs_for(class: HwClass) -> &'static [u8] {
     }
 }
 
+/// The hardware class + resource-mint authority a CATALOGUE spawn is granted, keyed by name (audit M7
+/// / T1 Phase B). Every arm has gone: drivers name their device class, and `fs`/`net-stack` carry
+/// RESOURCE_MINT, in the supervisor's spawn request. What is left answers `(None, false)` for every
+/// name, including `supervisor`.
 fn service_hw(name: &str) -> (HwClass, bool) {
     match name {
         // EVERY driver has moved to the supervisor (step C). Each names its device CLASS in the
@@ -969,13 +969,6 @@ fn service_hw(name: &str) -> (HwClass, bool) {
     }
 }
 
-/// The non-hardware system capabilities a service is granted at spawn (audit U15). Like `service_hw`,
-/// this is the ONE place the kernel declares who holds each privileged authority - previously six
-/// separate `name == "shell" || name == "supervisor" || ...` blocks scattered down the spawn path, each
-/// its own drift risk. Centralizing them here mirrors the `service_hw` doctrine (§26.4 no scattered
-/// authority; IV honor contracts declaratively): the spawn path reads these booleans, never a re-derived
-/// `name ==` check. The test-probe family is not named here at all: a probe's privileges travel in the
-/// supervisor's spawn request (`probes::privileges_of`), so none of them is missed by name.
 /// Bit positions for `SpawnRequest::privileges`. One bit per field of `Privileges` below, in
 /// declaration order, so the wire form and the struct cannot drift apart silently.
 ///
@@ -1000,19 +993,20 @@ pub mod privbits {
     /// authority that split was built to withhold, and would fail anyway (a WRITE cap does not satisfy
     /// a READ check).
     pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
-    /// SET_CLOCK with WRITE: SET the wall clock (net-stack, from SNTP, on RTC-less ARM). Distinct
+    /// SET_CLOCK with WRITE: SET the wall clock (net-stack held it for SNTP on RTC-less ARM; nothing does
+    /// since the clock moved to `time`, and no syscall spends it - `SET_CLOCK_RESOURCE`). Distinct
     /// from SET_CLOCK_FLOOR above, which is the same resource with READ - see the note there for why
     /// the split exists and must not be collapsed.
     pub const SET_CLOCK:       u32 = 1 << 10;
     /// NET_DEVICE: move ethernet frames through the in-kernel network device (`NetFrame*`/`NetInfo`,
-    /// syscalls 42-44). Held by `nic-driver` on aarch64, where the Pi 4's GENET sits behind those
-    /// syscalls; on arm32 the USB-net device moved into the `dwc2` SERVICE, so the driver reaches
-    /// frames over IPC and needs nothing here.
+    /// syscalls 42-44). HELD BY NOTHING NOW: on arm32 the USB-net device moved into the `dwc2`
+    /// SERVICE, and on aarch64 GENET moved into `nic-driver` itself, which drives the MAC through its
+    /// own register window. The syscalls are stubs, the supervisor does not hold the bit (so cannot
+    /// delegate it), and no spawn row asks for it - see `service_privileges` and `backlog/21`.
     ///
-    /// It gets a bit because `nic-driver`'s image moved to the supervisor, and a moved service must
-    /// still be able to receive an authority it genuinely uses. Without one the driver would come up,
-    /// look healthy, and have every frame call denied - a dead network with no error at spawn, which
-    /// is the failure shape this whole mechanism exists to prevent.
+    /// It got a bit when `nic-driver`'s image moved to the supervisor, so that a moved service could
+    /// still receive an authority it then used. The bit stays so that a request naming it is
+    /// understood and refused by `privileges_caller_lacks`, rather than silently ignored.
     pub const NET_DEVICE:      u32 = 1 << 11;
     /// PCI_CFG: read PCI configuration space through the legacy CF8/CFC ports (step D2).
     ///
@@ -1096,6 +1090,10 @@ const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
     (privbits::CPU_CLOCK,       CPU_CLOCK_RESOURCE),
 ];
 
+/// The privileges a CATALOGUE spawn is granted (`service_privileges`). The catalogue is `supervisor`
+/// alone, so in practice these are the supervisor's own; every other task's privileges arrive in its
+/// spawn request and are checked by `privileges_caller_lacks`. The per-field notes say who holds each
+/// authority on the running system, by either route.
 struct Privileges {
     spawn:           bool, // SPAWN: create tasks (supervisor, the shell, chaos' spawn-burst, probes)
     console_push:    bool, // CONSOLE_PUSH: inject keystrokes into the input ring (USB keyboard drivers)
@@ -1104,12 +1102,12 @@ struct Privileges {
     fire_irq:        bool, // FIRE_IRQ: inject a test interrupt (`control` only - C1-6)
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
-    net_device:      bool, // NET_DEVICE: move ethernet frames via the in-kernel USB-net bridge (ARM nic-driver)
+    net_device:      bool, // NET_DEVICE: move ethernet frames via an in-kernel net device (held by nothing now)
     pci_cfg:         bool, // PCI_CFG: read PCI config space via CF8/CFC (hw-enumerator, step D2)
     cpu_clock:       bool, // CPU_CLOCK: set the Arm cores to their minimum or maximum rate (power)
-    usb_disk:        bool, // USB_DISK: read/write blocks on the in-kernel USB mass-storage device (ARM block-driver)
+    usb_disk:        bool, // USB_DISK: read/write blocks on an in-kernel USB mass-storage device (held by nothing now)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
-    set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock from SNTP (RTC-less ARM; net-stack)
+    set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock (no syscall spends it now; SET_CLOCK_RESOURCE)
     set_clock_floor: bool, // SET_CLOCK (READ): raise the persisted clock floor only (the shell)
     /// IMAGE_SPAWN: start a task from a CALLER-SUPPLIED image (`SpawnImage`). The supervisor alone -
     /// see `IMAGE_SPAWN_RESOURCE` for why this is not the same authority as `spawn`, and why it is
@@ -1167,17 +1165,10 @@ fn service_privileges(name: &str) -> Privileges {
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
         acquire_any: matches!(name, "supervisor"),
-        // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK are SANCTIONED KERNEL-ONLY BY-NAME GRANTS (the U15 / userspace-audit
-        // A5-U1 doctrine): they are deliberately NOT contract capabilities - the kernel is their single
-        // source of truth, and `contract_check.py` does not reconcile them. Both are arch-gated to ARM
-        // (off ARM the syscalls are inert stubs; SEC-31) so no dormant authority is handed out elsewhere.
-        // nic-driver (which DOES ship a contract) carries an ARM note in nic-driver.toml so a contract
-        // reader is not misled; the shell ships no contract, so the kernel is trivially its only record.
-        //   nic-driver bridges ethernet frames to/from the in-kernel USB-net device (NetFrame*, 42-44).
-        // aarch64 joins arm here: the Pi 4's GENET driver backs the same NET_DEVICE syscalls the Pi 2's
-        // in-kernel USB-net bridge does, so `nic-driver` needs the same grant to reach it. Without it
-        // the service loads and runs and every frame call is denied, which looks like a dead network
-        // rather than a missing capability.
+        // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK were once kernel-only BY-NAME grants here (the
+        // U15 / userspace-audit A5-U1 doctrine). None is granted by name any more: GPIO and the clock
+        // bits travel in the spawn request like every other privilege, and NET_DEVICE and USB_DISK are
+        // held by nothing (below).
         // NOTHING HOLDS NET_DEVICE ANY MORE, for the same two reasons `usb_disk` below reads
         // `false`, and this arm is now dead in exactly the same way that one is.
         //
@@ -1201,20 +1192,6 @@ fn service_privileges(name: &str) -> Privileges {
         // CPU_CLOCK: the same shape as PCI_CFG above - `power` is a supervisor-owned service, which asks
         // for the bit in its spawn request; nothing in the kernel's own catalogue holds it.
         cpu_clock: false,
-        // USB_DISK: `block-driver` reaches a USB stick through syscalls 46-48 rather than MMIO, on
-        // the port where the USB stack is IN THE KERNEL - which is now ARM32 (Pi 2) ONLY. On aarch64
-        // the in-kernel driver was deleted (CLAUDE.md §6.4, 2026-08-09) and block-driver goes through
-        // the `xhci` SERVICE over IPC, so the grant buys it nothing there.
-        //
-        // KEPT for aarch64 all the same, deliberately, and this is the honest reason: the syscalls
-        // still EXIST on that port as stubs, and a grant that matches where the mechanism lives is
-        // easier to reason about than one that does not. It is also a vestigial authority (audit
-        // SEC-37) - whole-device read/write reach handed to a service that no longer uses it - so the
-        // right end state is to delete the aarch64 stubs and narrow this to `target_arch = "arm"`.
-        // Recorded rather than done, because removing syscalls is a separate change with its own test.
-        //
-        // (The original note here claimed the stack is in-kernel on BOTH ARM ports. That was true when
-        // it was written and stopped being true when the aarch64 driver was deleted.)
         // Nothing holds USB_DISK any more. It named `block-driver` alone, and `block-driver`'s image
         // moved to the supervisor - so this arm could not fire even if the authority were still
         // wanted, and it is not: the driver reaches its stick through the `dwc2` / `xhci` service over
@@ -1223,32 +1200,18 @@ fn service_privileges(name: &str) -> Privileges {
         usb_disk: false,
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: false, // delegated in the spawn request (step C)
-        //   SET_CLOCK, in two strengths (rights narrow, §7.4). WRITE = set the wall clock itself, held only
-        //   by net-stack, which runs the SNTP exchange (the RTC-less ARM port has no other time source).
-        //   READ = raise the persisted clock FLOOR only, held by the shell, which reads the last-known time
-        //   off the disk at startup and records it before a reboot. The shell needs the bound, not the
-        //   clock, so it does not get the power to step every task's time of day. A kernel-only by-name
-        //   grant like NET_DEVICE (not a contract cap). ARM-gated: x86's CMOS RTC is the authority there.
-        // aarch64 joins arm for the same reason arm has it: the Pi 4 has no RTC either, so SNTP is the
-        // only source of a wall clock. Without the grant net-stack does the whole query, gets a real
-        // answer, and is refused at the last step - the clock stays at the boot epoch while the log
-        // says the time was fetched.
-        set_clock:       false, // net-stack carries SET_CLOCK in its spawn request now (step C)
-        // aarch64 joins arm: the Pi 4 has no RTC either, so the floor the shell persists to
-        // /clock.last is what carries a network sync across a power cycle. READ, not WRITE - raising
-        // the floor only constrains which clock values are acceptable, where WRITE would let the shell
-        // step every task's view of the time of day. The narrower right already existed here; granting
-        // the shell plain `set_clock` instead would have handed it exactly the authority this split was
-        // built to withhold, and would have failed anyway - a WRITE cap does not satisfy a READ check.
+        //   SET_CLOCK, in two strengths (rights narrow, §7.4): WRITE = set the wall clock, READ = raise
+        //   the persisted clock FLOOR only. NO SYSCALL CHECKS EITHER any more: the wall clock moved to the
+        //   `time` SERVICE in clock slice 3, so `SET_CLOCK_RESOURCE` is minted and never spent (see its
+        //   note in `capability/mod.rs`, `backlog/59`). The supervisor still delegates SET_CLOCK_FLOOR to
+        //   the shell and no longer requests SET_CLOCK for net-stack.
+        set_clock:       false, // never by name; see above
         set_clock_floor: false, // delegated in the spawn request (step C)
     }
 }
 
-/// True if the calling task's contract declares `peer` as a send-peer (§13) - so reacquiring a SEND
-/// cap to it (`AcquireSendCap`) is contract-authorized recovery (§14.2), not ambient authority (§3.1).
-/// The caller's name comes from the existing `task_stat` snapshot and its declared peers from the
-/// static `service_config`, so this adds no new per-task kernel state and no new `unsafe`.
-/// Did the calling task declare `peer` as a send-peer at spawn?
+/// Did the calling task declare `peer` as a send-peer at spawn? If so, reacquiring a SEND cap to it
+/// (`AcquireSendCap`) is authorized recovery (§14.2), not ambient authority (§3.1).
 ///
 /// Reads what the task was ACTUALLY WIRED WITH, recorded by the spawn path, rather than looking the
 /// service up in the kernel catalogue. The catalogue answer is wrong for any service whose config has
@@ -1282,15 +1245,9 @@ fn service_config(name: &str) -> Option<(&'static str, ServiceConfig)> {
 // Public spawn API.
 // ---------------------------------------------------------------------------
 
-/// Spawn a named service by looking up its ELF and configuration.
-///
-/// Core placement:
-/// - If `core_override` is `Some(n)`, spawn on core `n` (§9.2 strict rule).
-/// - Otherwise, use `ServiceConfig::preferred_core`; u32::MAX = round-robin
-///   across ready cores.
-/// Resolve which core a spawn lands on: explicit override, else the contract's
-/// preferred core (falling back to round-robin if it isn't ready), else
-/// round-robin across ready cores.
+/// Resolve which core a spawn lands on: an explicit (strict) override, else the
+/// preferred core (falling back, loudly, to round-robin if it isn't ready), else
+/// round-robin across ready cores (`preferred_core == u32::MAX`).
 fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result<u32, SpawnError> {
     use core::sync::atomic::{AtomicU32, Ordering};
     static RR: AtomicU32 = AtomicU32::new(0);
@@ -1330,10 +1287,12 @@ fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result
 
 /// Spawn a producer and delegate it a SEND cap to `sink`'s endpoint as its
 /// `send_peers[0]` - the capability-broker primitive behind shell pipes
-/// (`producer | sink`). The producer's *contract* send peers are intentionally
-/// not used: its only send authority is this runtime-delegated pipe cap, so it
-/// can reach exactly the sink the shell wired it to and nothing else (§3.1, no
-/// ambient authority - composition grants, it doesn't assume).
+/// (`producer | sink`). The pipe peer goes first, followed by the producer's
+/// catalogue send peers (see the comment in the body).
+///
+/// `producer` is looked up in the kernel catalogue, which holds `supervisor` alone,
+/// so this refuses every producer today (`NotFound`). Its one caller is the
+/// supervisor's fallback for a name it holds no image for.
 ///
 /// `sink` must already be spawned and have registered its endpoint, so the SEND
 /// cap can be minted against it. The shell spawns the consumer before the producer.
@@ -1371,11 +1330,11 @@ pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>
 /// (`docs/service-ownership.md`).
 ///
 /// What it still refuses, and why the refusal is not a leftover: a caller may not claim a name the
-/// kernel's own catalogue still uses. While ANY name-keyed policy remains, letting a caller pick
-/// such a name would let it inherit that policy for arbitrary code - the same squatting hole
-/// the kernel's own probe spawn closed until the probe image left it (`dd5d176b`), and for the same reason (the kernel name directory is the recovery anchor).
-/// When the catalogue reaches its single `supervisor` entry this check narrows to that one name,
-/// which must never be claimable by anything.
+/// kernel's own catalogue uses. Letting a caller pick such a name would let it inherit that name's
+/// policy for arbitrary code - the same squatting hole the kernel's own probe spawn closed until the
+/// probe image left it (`dd5d176b`), and for the same reason (the kernel name directory is the
+/// recovery anchor). The catalogue has reached its single `supervisor` entry, so this check is now
+/// that one name, which must never be claimable by anything.
 pub fn spawn_from_image(
     name:              &str,
     image:             crate::loader::ImageSource,
@@ -1463,9 +1422,9 @@ pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<O
 
     // Singleton guard (§6.2, §26.6 bounded behaviour): refuse to spawn a service
     // whose name is already live. This blocks duplicate instances in general, and
-    // in particular a second trusted-root service - the supervisor is
-    // always live while the system runs, so this always rejects spawning/restarting
-    // them, the same protection `handle_kill` gives. It does NOT block boot: there
+    // in particular a second supervisor - while it is live, this rejects
+    // spawning another by name (`handle_kill` no longer refuses it: the kernel
+    // respawns the supervisor on death, §6.2). It does NOT block boot: there
     // each service is spawned exactly once, before any instance is live. Loud
     // rejection, never silent (§3.12).
     if scheduler::find_task_by_name(static_name).is_some() {
@@ -1607,7 +1566,8 @@ fn spawn_service_with_image(
 ) -> Result<Option<EndpointId>, SpawnError> {
     // The declared hardware class + mint authority for this service (audit M7 / T1 Phase B). Every
     // MMIO / DMA / IOMMU / bus-master / RESOURCE_MINT grant below is driven off these, not a `name ==`
-    // check - one declaration (`service_hw`), reconciled against the .toml for contracted services.
+    // check: the spawn request's `hw_override` / `priv_override` where there is one (every spawn but
+    // the supervisor's), else `service_hw`, which now answers none for every name.
     let (hw_by_name, resource_mint_by_name) = service_hw(name);
     let hw = hw_override.unwrap_or(hw_by_name);
     // RESOURCE_MINT is NOT a field of `Privileges` - it is a separate flag out of `service_hw`, so a
@@ -1669,18 +1629,17 @@ fn spawn_service_with_image(
     caps.insert(mint_cap(LOG_WRITE_RESOURCE, Rights::WRITE))
         .map_err(|_| { scheduler::release_task_slot(task_slot); SpawnError::CapTableFull })?;
 
-    // Spawn authority - least privilege (§3.1; H10 audit in
-    // security/hardening-strategy.md §9). Granted only to the services that
-    // actually start other services: init (spawns the trusted root), supervisor
-    // (spawns services + probes), the shell (brokers spawn/kill/restart), and the
-    // test-driver probes (property/stress/perf/chaos modes spawn victims; matched by
-    // ELF identity so no probe family is missed). events, the drivers,
+    // Spawn authority - least privilege (§3.1; the H10 audit). Granted only to the services that
+    // actually start other services: the supervisor (spawns services + probes), the shell (brokers
+    // spawn/kill/restart), and the test-driver probes (property/stress/perf/chaos modes spawn victims;
+    // their SPAWN bit is in their spawn request, `probes::privileges_of`). events, the drivers,
     // ping, pong, and observe never spawn and no longer hold the authority to.
     // Previously every service got this unconditionally ("spawn authority, every
     // service in v1") - a system-wide blast-radius widening this closes. Capture the
     // slot (u32::MAX when not granted); the SDK already treats MAX as "not held".
-    // The non-hardware authorities come from the ONE `service_privileges` table (audit U15), not a
-    // re-derived `name ==` check per grant.
+    // The non-hardware authorities come from the spawn request's privilege word, or for the
+    // supervisor's catalogue spawn from `service_privileges` (audit U15) - never a re-derived
+    // `name ==` check per grant.
     //
     // `is_probe` is GONE with the probe image. It compared the spawning ELF against the kernel's own
     // `PROBE_ELF` rodata to give the whole test-probe family its privileges by identity rather than
@@ -1884,8 +1843,8 @@ fn spawn_service_with_image(
         console_read_slot_u32 = cap_slot as u32;
     }
 
-    // CONSOLE_PUSH: inject decoded keystrokes into the console input ring (§12). WHO holds it is in
-    // `service_privileges` (the single authority table); here we only mint it.
+    // CONSOLE_PUSH: inject decoded keystrokes into the console input ring (§12). WHO holds it is the
+    // spawn request's privilege word (the USB host drivers' rows in the supervisor); here we only mint it.
     let mut console_push_slot_u32 = u32::MAX;
     if privs.console_push {
         let cp_cap = mint_cap(CONSOLE_PUSH_RESOURCE, Rights::WRITE);
@@ -1896,7 +1855,7 @@ fn spawn_service_with_image(
 
     // INTROSPECT: read another task's / system-wide kernel state via TaskStat + InspectKernel (§3.1;
     // docs/introspection-capability.md). Self-state (own alloc bytes) and the TSC stay ungated, so a
-    // service not in `service_privileges` needs nothing. No slot is stored - the gate scans holdings.
+    // service that was not given the privilege needs nothing. No slot is stored - the gate scans holdings.
     if privs.introspect {
         let in_cap = mint_cap(INTROSPECT_RESOURCE, Rights::READ);
         caps.insert(in_cap)
@@ -1904,7 +1863,7 @@ fn spawn_service_with_image(
     }
 
     // SERVICE_CONTROL: kill/restart other services (§3.1/§14.4; docs/service-control-cap.md). WHO holds
-    // it is in `service_privileges`; here we only mint it.
+    // it is `privs`, resolved above; here we only mint it.
     if privs.service_control {
         let sc_cap = mint_cap(SERVICE_CONTROL_RESOURCE, Rights::WRITE);
         caps.insert(sc_cap)
@@ -1937,8 +1896,8 @@ fn spawn_service_with_image(
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // REBOOT (§3.1): hardware-reset the machine (`Reboot`/18). WHO holds it is in `service_privileges`;
-    // here we only mint it. No other service can hardware-reset the machine.
+    // REBOOT (§3.1): hardware-reset the machine (`Reboot`/18). WHO holds it is `privs`, resolved above
+    // (the shell's spawn request); here we only mint it. No other service can hardware-reset the machine.
     // FIRE_IRQ (C1-6): inject a test interrupt. Held only by `control`, which needs it because the
     // interrupt-routing identity tests drive IRQ injection over the operator channel.
     if privs.fire_irq {
@@ -1952,17 +1911,18 @@ fn spawn_service_with_image(
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // ACQUIRE_ANY (§3.1): reach ARBITRARY services by name via `AcquireSendCap`. WHO holds it is in
-    // `service_privileges`; here we only mint it. Ordinary services get NONE - their AcquireSendCap is
-    // restricted to their contract-declared send-peers (recovery), so they hold no ambient send authority.
+    // ACQUIRE_ANY (§3.1): reach ARBITRARY services by name via `AcquireSendCap`. WHO holds it is the
+    // spawn request's privilege word (or `service_privileges` for the supervisor); here we only mint it.
+    // Ordinary services get NONE - their AcquireSendCap is restricted to the send-peers they were
+    // spawned with (recovery), so they hold no ambient send authority.
     if privs.acquire_any {
         let aa_cap = mint_cap(ACQUIRE_ANY_RESOURCE, Rights::WRITE);
         caps.insert(aa_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // NET_DEVICE: the ARM `nic-driver` moves ethernet frames via the in-kernel USB-net bridge
-    // (NetFrame*/NetInfo, syscalls 42-44). WHO holds it is in `service_privileges`; here we only mint it.
+    // NET_DEVICE: move ethernet frames via an in-kernel net device (NetFrame*/NetInfo, syscalls 42-44;
+    // stubs on every port now, and nothing requests it). WHO holds it is `privs`; here we only mint it.
     if privs.net_device {
         let nd_cap = mint_cap(NET_DEVICE_RESOURCE, Rights::WRITE);
         caps.insert(nd_cap)
@@ -2016,8 +1976,8 @@ fn spawn_service_with_image(
         crate::kprintln!("spawn[power]: '{}' may cut and restore its device's power (DEVICE_POWER)", name);
     }
 
-    // USB_DISK: the ARM `block-driver` reads/writes a USB stick through the in-kernel Bulk-Only stack
-    // (UsbDisk*, syscalls 46-48). Minted here; WHO holds it is in `service_privileges`.
+    // USB_DISK: read/write an in-kernel USB stick (UsbDisk*, syscalls 46-49). There is no in-kernel USB
+    // stack on any port now and `service_privileges` grants it to nobody, so this never mints.
     if privs.usb_disk {
         let ud_cap = mint_cap(USB_DISK_RESOURCE, Rights::WRITE);
         caps.insert(ud_cap)
@@ -2025,7 +1985,7 @@ fn spawn_service_with_image(
     }
 
     // GPIO_DEVICE: the shell's `gpio` command drives the SoC pins (ARM `Gpio` syscall). Minted here; WHO
-    // holds it is in `service_privileges`.
+    // holds it is `privs` (the shell's spawn request).
     if privs.gpio {
         let g_cap = mint_cap(GPIO_DEVICE_RESOURCE, Rights::WRITE);
         caps.insert(g_cap)
@@ -2033,15 +1993,16 @@ fn spawn_service_with_image(
     }
 
     // IMAGE_SPAWN: the supervisor starts services from images IT holds (`SpawnImage`, syscall 52).
-    // Minted here; WHO holds it is in `service_privileges` - and it is exactly one principal.
+    // Minted here; WHO holds it is `service_privileges` (no privilege bit carries it) - and it is
+    // exactly one principal.
     if privs.image_spawn {
         let is_cap = mint_cap(IMAGE_SPAWN_RESOURCE, Rights::WRITE);
         caps.insert(is_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // SET_CLOCK: net-stack sets the wall clock from SNTP on the RTC-less ARM port. Minted here; WHO
-    // holds it is in `service_privileges`.
+    // SET_CLOCK: once net-stack's, to set the wall clock from SNTP. Minted here if `privs` asks for it;
+    // the supervisor no longer requests it for anyone.
     //
     // MINTED AND CHECKED BY NOBODY, on every arch. This said the authority is spent through a
     // `SetClock` syscall, "inert (no-op syscall) off ARM" - implying it is live ON arm. There is no
@@ -2584,7 +2545,8 @@ fn spawn_service_with_image(
     Ok(own_endpoint)
 }
 
-/// Spawn `init` on Core 0. Called once by `kernel_main` (§11.1).
+/// Spawn the supervisor on core 0. Called once per boot, from every port's boot path (x86-64
+/// `kernel_main`, and each other port's `sched_supervisor` or boot entry; §11.1).
 /// The kernel's ONE direct spawn (Path C / Phase 5 - `init` is removed). The kernel boots the
 /// SUPERVISOR directly; the supervisor then spawns events and all services. Uses `SUPERVISOR_ELF`
 /// (garbage under `test-bad-supervisor` → §22 Test 1B). `has_recv_endpoint = true` (the supervisor

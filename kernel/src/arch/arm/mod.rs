@@ -35,8 +35,9 @@ pub use bootcon::fb_commit;
 
 /// USB-net bridge backends, kept as STUBS that say no.
 ///
-/// The syscalls above them (42-44) are shared with aarch64, whose GENET driver still uses them, so the
-/// syscalls stay and only ARM's implementation leaves. On this port the kernel no longer has a network
+/// The syscalls above them (42-44) are arch-neutral, so they stay and only ARM's implementation leaves.
+/// (They once served aarch64's in-kernel GENET too; that driver is deleted, and every port now answers
+/// "no device" here.) On this port the kernel no longer has a network
 /// device: `nic-driver` talks to the `dwc2` service over IPC instead (slice 4b). Answering "no device"
 /// is the truth, and a caller that ignores the answer fails loudly rather than reading stale bytes.
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
@@ -934,14 +935,16 @@ extern "C" fn arm_boot_main() -> ! {
     // Power on the USB HCD via the VideoCore mailbox BEFORE the MMU/caches (this exchange, like the
     // framebuffer one above, needs caches off). Circle does this before DWC2 init: the DWC2's AXI DMA
     // master is in a separate power/clock domain the firmware may leave off even though register reads
-    // work - the leading suspect for "the master never dispatches" on the Pi 2 (dwc2.rs).
+    // work - the leading suspect for "the master never dispatches" on the Pi 2 (found in the in-kernel
+    // `dwc2.rs`, since deleted; the controller is the `dwc2` service's now, and is powered here before its spawn).
     if video::set_usb_power_on() {
         pl011_write(b"arm32: USB HCD powered on via VideoCore mailbox\r\n");
     } else {
         pl011_write(b"arm32: WARN USB HCD power-on mailbox failed (firmware may already have it on)\r\n");
     }
-    // Read the board Ethernet MAC while caches are still off (mailbox coherency); the LAN9514 driver picks
-    // it up during USB enumeration. The Pi 2 has no EEPROM, so this is the only source of the real MAC.
+    // Read the board Ethernet MAC while caches are still off (mailbox coherency); a service reads it back
+    // through InspectKernel query 23 (`board_mac_packed`). The Pi 2 has no EEPROM, so this is the only
+    // source of the real MAC.
     video::read_board_mac();
     // SD card, same caches-off window: power the card's domain (the EMMC registers answer even when it is
     // off - the same trap as the USB HCD) and learn the EMMC base clock from the GPU. The base clock MUST
@@ -985,8 +988,8 @@ extern "C" fn arm_boot_main() -> ! {
     syscall::selftest();
     usermode::selftest();
     loadtest::selftest();
-    // USB host bring-up (DWC2): detect the controller + the attached device. Increment 1 - no transfers
-    // yet. Runs before the scheduler dispatch (which never returns).
+    // Dispatch to the ONE boot path the build selected (each never returns). There is no in-kernel USB
+    // bring-up here any more: the `dwc2` service owns the controller (slice 5).
     #[cfg(feature = "arm-sched-demo")]
     sched_demo::run(ram_end, reserve_end);
     #[cfg(feature = "arm-sched-ipc")]
@@ -1056,8 +1059,8 @@ pub fn init(_boot_info: &BootInfo) {}
 pub const DRIVER_MMIO_VA: u32 = 0x6000_0000;
 
 /// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
-/// boards with it are the Pi 4 (`arch/aarch64`, WL_ON), whose radio returns to power-on only when WL_ON
-/// is cut, and the VisionFive 2 Lite (`arch/riscv64`, the radio's power pin). `false` is the honest answer; the syscall reports it as "no control over it".
+/// boards with it are the Pi 4 (`arch/aarch64`, WL_ON), whose radio's power is WL_ON on the firmware's
+/// GPIO expander, and the VisionFive 2 Lite (`arch/riscv64`, the radio's power pin). `false` is the honest answer; the syscall reports it as "no control over it".
 pub fn device_power_control(_kind: u32) -> bool { false }
 pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 
@@ -1282,8 +1285,8 @@ pub fn board_mac_packed() -> Option<u64> {
 // granted at spawn.
 //
 // These backends remain as stubs that say NO rather than vanishing, because the syscalls above them are
-// shared with other ports: `net_frame_*` still serves aarch64's GENET. On arm they now answer "no
-// device", which is the truth - the kernel no longer has one - and a client that ignores the answer
+// arch-neutral (`net_frame_*` once also served aarch64's in-kernel GENET, since deleted; every port
+// answers "no device" now). On arm they answer "no device", which is the truth - the kernel no longer has one - and a client that ignores the answer
 // fails loudly rather than reading stale bytes.
 pub fn usb_disk_sectors() -> u64 { 0 }
 pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
@@ -1291,8 +1294,24 @@ pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
 /// No in-kernel USB disk on this port (slice 5): always false. Durability is the `dwc2` SERVICE's
 /// job, reached over IPC. (`dwc2::msc_sync_cache` went with `arch/arm/dwc2.rs`.)
 pub fn usb_disk_flush() -> bool { false }
-/// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
-/// failure at all - the caller should re-ask, with interrupts enabled in between.
+/// No-op: this arch counts every IRQ in `irq::arm_irq_dispatch`, which sees them all.
+pub fn note_irq(_vector: u32) {}
+
+/// Publish this core's identity for interrupt-destination programming, once, at `smp::init`.
+///
+/// Part of the `arch::imp` seam because the neutral scheduler needs it done BEFORE the branch that
+/// decides whether to start APs - on x86 the work used to live inside AP startup, so a single-core
+/// build skipped it and every fallback MSI was addressed to core 0's unwritten id.
+///
+/// ARM publishes each core's id from its own bring-up (`set_core_lapic_id(core_id, core_id)`),
+/// unconditionally and independently of AP startup, so there is nothing left to do here.
+pub fn publish_bsp_lapic_id() {}
+
+/// (interrupts dispatched, last IRQ source) for `core` - what the liveness panic reports.
+pub fn core_irq_debug(core: u32) -> (u32, u32) {
+    irq::core_irq_debug(core)
+}
+
 /// Counter ticks a core may make NO forward progress before the liveness watchdog panics. Same units as
 /// [`boot::read_cycle_counter`] (both are `CNTPCT`), which is the whole reason this lives in the arch.
 ///
@@ -1310,29 +1329,18 @@ pub fn usb_disk_flush() -> bool { false }
 /// the 20-30 s wedges a chaos run produced. A watchdog that panics a healthy machine is worse than none,
 /// so the margin is deliberately generous; it can tighten once the ARM worst case is measured rather
 /// than reasoned about.
-/// (interrupts dispatched, last IRQ source) for `core` - what the liveness panic reports.
-/// No-op: this arch counts every IRQ in `irq::arm_irq_dispatch`, which sees them all.
-pub fn note_irq(_vector: u32) {}
-
-/// Publish this core's identity for interrupt-destination programming, once, at `smp::init`.
 ///
-/// Part of the `arch::imp` seam because the neutral scheduler needs it done BEFORE the branch that
-/// decides whether to start APs - on x86 the work used to live inside AP startup, so a single-core
-/// build skipped it and every fallback MSI was addressed to core 0's unwritten id.
-///
-/// ARM publishes each core's id from its own bring-up (`set_core_lapic_id(core_id, core_id)`),
-/// unconditionally and independently of AP startup, so there is nothing left to do here.
-pub fn publish_bsp_lapic_id() {}
-
-pub fn core_irq_debug(core: u32) -> (u32, u32) {
-    irq::core_irq_debug(core)
-}
-
+/// (Note 2026-10-09: the reason given above no longer holds. The in-kernel USB stack was deleted in
+/// slice 5 and `services/dwc2` does those device waits in userspace, preemptibly. The 10 s stands
+/// until someone measures the ARM worst case and tightens it.)
 pub fn liveness_deadline_cycles() -> u64 {
     const LIVENESS_SECS: u64 = 10;
     (timer::timer_hz() as u64).saturating_mul(LIVENESS_SECS)
 }
 
+/// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
+/// failure at all - the caller should re-ask, with interrupts enabled in between. Always false on
+/// this port: there is no in-kernel USB disk (slice 5).
 pub fn usb_disk_busy() -> bool { false }
 /// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
 /// dispatch. Slice 5 took the USB stack out of the kernel (`services/dwc2` owns the controller), so
@@ -1341,8 +1349,9 @@ pub fn usb_disk_busy() -> bool { false }
 pub fn usb_disk_absent() -> bool { true }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
-/// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it. Best-effort under
-/// concurrent callers (an unlocked FIFO pop) - fine for a diagnostic, not fed to crypto.
+/// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it, and so does the
+/// WPA2 supplicant's SNonce (`sdk/wifi/src/supplicant.rs`, `snonce`, for `wifi-usb` on this board). Still
+/// an unlocked FIFO pop: two cores asking at once can both pass the "word available" check for one word.
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
     const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;
@@ -2545,6 +2554,10 @@ pub mod interrupts {
         // keystroke actually arrive and reschedule the shell. Then `cpsie i; wfi` (the x86 `sti; hlt`
         // twin) unmasks IRQs so a timer/IPI can also wake us instead of busy-spinning forever.
         super::uart_rx_poll();
+        // (Note 2026-10-09: everything from here to the empty `if` below is HISTORY. The hub and
+        // cable polls it describes went with the in-kernel DWC2 driver in slice 5; hot-plug and the
+        // cable watch now live in `services/dwc2`. The `if` has an empty body and does nothing.)
+        //
         // Watch the hub's ports so a replugged keyboard works without a reboot.
         //
         // This path is NOT atomic - the scheduler re-enables interrupts after every switch-back, so code
@@ -2561,6 +2574,9 @@ pub mod interrupts {
         // driver in slice 5. The REASONING is why masking is still the wrong answer here, which is what
         // this paragraph is for; the mechanism now lives in `services/dwc2`.)
         // NOTE: handing the vector back does NOT restore USB. Reboot to get the devices back.
+        // (2026-10-09: superseded. There is no in-kernel driver to hand it back to; releasing the
+        // route on death MASKS the line (`route::unregister_endpoint`), and USB returns when the
+        // supervisor respawns `dwc2`. The paragraphs below are the pre-slice-5 reasoning.)
         //
         // Releasing the route on death unmasks the line, but it cannot hand back DEVICE
         // STATE: while the service held the vector, the keyboard's completions went to a driver that

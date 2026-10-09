@@ -14,8 +14,10 @@
 //!
 //! **Console input is ready.** On x86 the shell's prompt is gated on an input-ready signal raised when
 //! `xhci` comes up, because a USB keyboard is the input path there. Here the input path is the PL011
-//! receiver, which has been up since milestone 1 - and `xhci` is a placeholder that never spawns. Left
-//! unsaid, the shell would wait for a prompt that never comes, with nothing in the log to explain it.
+//! receiver, which has been up since milestone 1, so nothing USB-shaped has to come up first. (This said
+//! `xhci` was a placeholder that never spawns; the `xhci` service runs on this board now and serves the
+//! USB keyboard too, but serial input does not wait for it.) Left unsaid, the shell would wait for a
+//! prompt that never comes, with nothing in the log to explain it.
 //! The 32-bit port raises the same flag for the same reason.
 
 use super::put_str;

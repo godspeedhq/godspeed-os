@@ -82,8 +82,9 @@ impl TestRoutingModel {
     }
 
     /// Most-recent generation for `id` (alive or dead).
-    /// Mirrors how `GLOBAL_RESOURCES` preserves the bumped generation so the
-    /// spawn path inherits it on restart (§14.2, task/mod.rs:2314-2329).
+    /// Models a restart that re-registers above the dead generation (§14.2). The real spawn
+    /// path now takes a globally monotonic `capability::next_generation()`, which is strictly
+    /// above every earlier one, so the property this models still holds there.
     pub fn get_generation(&self, id: EndpointId) -> Option<Generation> {
         self.entries.iter().rev()
             .find(|e| e.id == id)
@@ -233,8 +234,8 @@ mod tests {
 
             for _ in 0..cycles {
                 let bumped = model.kill(id).unwrap();
-                // Re-register at the bumped generation - mirrors spawn_service_with_config
-                // inheriting the bumped gen from GLOBAL_RESOURCES (task/mod.rs:2324-2335).
+                // Re-register at the bumped generation - the model's stand-in for the spawn
+                // path's `next_generation()`, which is likewise strictly above the dead one.
                 model.register(id, bumped);
                 let current = model.get_generation(id).unwrap();
                 prop_assert!(

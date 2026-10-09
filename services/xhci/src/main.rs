@@ -48,7 +48,8 @@ const OP_PORTSC_BASE: usize = 0x400; // PORTSC[n] = base + n*0x10
 
 const CMD_RS: u32 = 1 << 0;
 // Interrupter enable (P2, interrupt-driven USB §12). The kernel programmed the controller's
-// MSI-X to deliver to vector 0x28; these turn the controller's interrupt generation on.
+// MSI/MSI-X to deliver to the vector it allocated at spawn (it was a fixed 0x28 once); these turn the
+// controller's interrupt generation on.
 const CMD_INTE: u32 = 1 << 2; // USBCMD: global interrupter enable
 const IMAN_IE: u32 = 1 << 1; // Interrupter 0 Management: Interrupt Enable
 const IMAN_IP: u32 = 1 << 0; // Interrupter 0 Management: Interrupt Pending (write 1 to clear)
@@ -67,7 +68,8 @@ const PORT_PED: u32 = 1 << 1;
 const PORT_PR: u32 = 1 << 4;
 const PORT_RW1C: u32 = 0x00FE_0000; // change bits 17..23 (write 0 to preserve)
 
-// DMA arena layout (64 KiB). Shared controller structures up front, then a
+// DMA arena layout (its first 0x1F000 bytes; the scratchpad and the disk's region follow - see
+// below and `msc::DISK_BASE`). Shared controller structures up front, then a
 // per-device 4-page slice (device context + EP0 ring + interrupt ring + report
 // buffer) for each HID device we bind - so a keyboard AND a mouse can run on the
 // same controller at once. Device i occupies [DEV_BASE + i*DEV_STRIDE, +STRIDE).
@@ -206,15 +208,17 @@ impl EvMail {
 // scratchpad buffers, where N = HCSPARAMS2.MaxScratchpadBufs. Real AMD xHCI needs
 // 256 of them and malfunctions (devices drop, re-enumerate) without them. The SBA
 // lives at arena page 15; the buffers occupy pages 16.. (the arena's tail, sized
-// for this in the kernel's XHCI_DMA_PAGES).
+// for this in the arena size: the kernel's XHCI_DMA_PAGES, and the supervisor's `dma_pages` for `xhci`
+// on PCI).
 // Device slices sit first (DEV_BASE .. DEV_BASE + MAX_SLICES*DEV_STRIDE), then the SBA + scratchpad.
 // Hub enumeration needs several slices live at once - the hub's own slice plus each downstream
 // device's - so MAX_SLICES is larger than MAX_HID (docs/usb-hub.md). Keep these offsets in step with
-// the kernel's XHCI_DMA_PAGES (32 + 256): control(7) + 6 slices*4 pages(24) + SBA(1) = 32, then 256.
+// the arena size (32 + 256 + 4 pages): control(7) + 6 slices*4 pages(24) + SBA(1) = 32, then 256, then
+// the disk's 4 (`msc::DISK_BASE`).
 const MAX_SLICES: usize = 6; // per-device DMA slices (bound HIDs + transient hub/enum)
 const SCRATCHPAD_SBA_OFF: usize = 0x1F000; // = DEV_BASE + MAX_SLICES*DEV_STRIDE (0x7000 + 6*0x4000)
 const SCRATCHPAD_BUF_BASE: usize = 0x20000; // = SCRATCHPAD_SBA_OFF + 0x1000
-const MAX_SCRATCHPAD: usize = 256; // arena room = XHCI_DMA_PAGES (288) - 32
+const MAX_SCRATCHPAD: usize = 256; // arena room = 292 pages - 32 - the disk's 4
 
 /// Counter ticks in `ms` milliseconds, exactly as the SDK's `duration_cycles` computes them: never 0,
 /// and 1 on a machine whose counter the kernel could not calibrate. For the tick-domain instruments
@@ -645,7 +649,6 @@ pub(crate) const TRB_STATUS_STAGE: u32 = 4;
 pub(crate) const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
-/// Reset Endpoint (xHCI 4.6.8) - clears the HALTED state an errored transfer left on an endpoint.
 /// Consecutive hub-probe failures across ALL ports of a hub. A halt is a property of the shared EP0
 /// endpoint, so every port's probe fails together - which makes any of them evidence, and makes the
 /// count meaningful only when unbroken (a single success resets it).
@@ -656,12 +659,13 @@ static PROBE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 /// keystroke echo has to wait behind. Owned by this service, like `PROBE_FAILS` above.
 static DIAG_HINT_SAID: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// Reset Endpoint (xHCI 4.6.8) - clears the HALTED state an errored transfer left on an endpoint.
 const TRB_RESET_ENDPOINT: u32 = 14;
-/// Set TR Dequeue Pointer (xHCI 4.6.10) - tells the controller where to resume on that endpoint.
 /// Stop Endpoint (xHCI 4.6.9) - moves a RUNNING endpoint to Stopped, which is the state Set TR
 /// Dequeue requires. The counterpart to Reset Endpoint: reset repairs a Halted endpoint, stop
 /// quiesces a running one. Confusing the two costs a Context State Error and no repair at all.
 const TRB_STOP_ENDPOINT: u32 = 15;
+/// Set TR Dequeue Pointer (xHCI 4.6.10) - tells the controller where to resume on that endpoint.
 const TRB_SET_TR_DEQUEUE: u32 = 16;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
@@ -708,18 +712,14 @@ fn spin<F: Fn() -> bool>(ctx: &ServiceContext, what: &str, ms: u64, cond: F) -> 
 // cycle is not a portable unit - the AArch64 generic timer runs at 54 MHz on a Pi 4, where that same
 // literal asks for nearly two seconds and the hub rescan's (now `HUB_RESCAN_MS`) asks for the better part of a minute. So the
 // numbers below are DURATIONS, converted through the kernel's own calibration - by `gs::driver::wait`
-// and `delay` for waits and holds, and by `ctx.duration_cycles` for the remaining sleeps and report
-// intervals, the portable path the SDK already documents for exactly this mistake.
+// and `delay` for waits and holds, by `gs::task::sleep_ms` for the remaining sleeps, and by `ms_ticks`
+// and `wait::Since` for the report intervals - never a cycle literal, which is exactly this mistake.
 //
 /// Recovery hold after a root-port reset before addressing the device. USB 2.0 requires a
 /// reset-recovery interval (TRSTRCY >= 10 ms) before a device can accept transactions; without it a
 /// high-speed root-port device NAKs the Address Device SET_ADDRESS and returns a Transaction Error.
 /// Matches the behind-a-hub reset hold.
 const RESET_RECOVERY_MS: u64 = 55;
-/// How often the poll loop GET_STATUSes a hub's downstream port to notice a device unplugged from
-/// behind it (no root PORTSC reflects that). Responsive enough for a "keyboard disconnected" notice,
-/// infrequent enough not to load the hub or eat keystrokes off the shared event ring - the check runs
-/// a control transfer, and between checks the keyboard endpoint has the ring to itself.
 /// How long to hold a hub's downstream port in reset. USB 2.0 asks for at least 10 ms; hubs and
 /// devices vary, and being generous here costs one enumeration, not a running system.
 const PORT_RESET_HOLD_MS: u64 = 60;
@@ -748,15 +748,18 @@ const HCRST_CLEAR_MS: u64 = 1000;
 /// genuinely dead controller is a spin, not a recovery (§26.6).
 const HCRST_RETRIES: u32 = 3;
 
+/// How often the poll loop GET_STATUSes a hub's downstream port to notice a device unplugged from
+/// behind it (no root PORTSC reflects that). Responsive enough for a "keyboard disconnected" notice,
+/// infrequent enough not to load the hub or eat keystrokes off the shared event ring - the check runs
+/// a control transfer, and between checks the keyboard endpoint has the ring to itself.
 const HUB_POLL_MS: u64 = 500;
 /// How often the driver says it is still alive. See the heartbeat's comment in the poll loop: this
 /// exists because a STOPPED loop is otherwise indistinguishable from a quiet one, and every failure
 /// detector here counts failures that a stopped loop never produces.
-/// TEMPORARILY 5 s, not 60. Correcting this port's cycle-counter rate made every duration in this
-/// driver real for the first time, and the poll loop went from ~45 passes a second to roughly one
-/// per 45 SECONDS - so the minute-long heartbeat, which is checked once per pass, stopped printing
-/// altogether and took the only breakdown of where the time goes with it. A diagnostic that cannot
-/// report while the fault is happening is not a diagnostic. Back to 60_000 once the wait is found.
+/// It was TEMPORARILY 5 s, while correcting this port's cycle-counter rate had made the poll loop go
+/// from ~45 passes a second to roughly one per 45 SECONDS - so the minute-long heartbeat, checked once
+/// per pass, stopped printing and took the only breakdown of where the time goes with it. It is back
+/// at 60 s.
 const HEARTBEAT_MS: u64 = 60_000;
 
 /// How often the PASS COUNTER reports, in milliseconds of wall clock.
@@ -793,13 +796,6 @@ const HUB_RESCAN_MS: u64 = 1_500;
 /// whenever a hub is unresponsive.
 const PROBE_ANSWER_MS: u64 = 10;
 
-/// Cap on how many messages one drain retires before it gives up the pass.
-///
-/// The endpoint queue is 16 deep (CLAUDE.md 8.5), so any bound well above that is not a throttle -
-/// it is a storm detector. A sender enqueuing as fast as we dequeue would otherwise keep an
-/// unbounded drain running forever, and while it runs the USB poll loop is NOT polling: the keyboard
-/// stops. The event drain in this file already carries this exact bound and this exact reasoning;
-/// the message drain is the same shape with a different producer, and was missing it.
 /// How long to let the root ports settle after starting the controller before believing a census
 /// that says nothing is attached.
 ///
@@ -809,8 +805,18 @@ const PROBE_ANSWER_MS: u64 = 10;
 /// port reports a connection, so the only machine that pays it in full is one with nothing plugged in.
 const ROOT_PORT_SETTLE_MS: u64 = 200;
 
+/// Cap on how many messages one drain retires before it gives up the pass.
+///
+/// The endpoint queue is 16 deep (CLAUDE.md 8.5), so any bound well above that is not a throttle -
+/// it is a storm detector. A sender enqueuing as fast as we dequeue would otherwise keep an
+/// unbounded drain running forever, and while it runs the USB poll loop is NOT polling: the keyboard
+/// stops. The event drain in this file already carries this exact bound and this exact reasoning;
+/// the message drain is the same shape with a different producer, and was missing it.
 const MSG_DRAIN_MAX: u32 = 256;
 
+// `PROBE_ANSWER_MS`'s history (it is defined above, and is 10), newest first - so the later
+// paragraphs, which argue for 50 and recall 5, describe values it no longer has.
+//
 // 10, cut from 50, because the budget is spent WAITING FOR AN ANSWER THAT DOES NOT COME.
 //
 // Measured: the hub segment burns ~10 s of wall time per minute, i.e. the probes time out almost
@@ -948,15 +954,6 @@ fn idle(ctx: &ServiceContext) -> ! {
     }
 }
 
-/// Poll the event ring for the next event TRB. Returns (trb_type, completion,
-/// slot_id) and advances the dequeue pointer, or None.
-///
-/// Drain one event from the event ring. `max_tries` bounds how long to wait for an
-/// event whose cycle bit has flipped: the command path passes a large budget (it just
-/// rang a doorbell and expects a completion imminently); the **poll loop passes 1** so
-/// it is fully non-blocking - otherwise, while a key is held (no new transfer events),
-/// this would busy-spin millions of times before returning `None`, starving the
-/// typematic auto-repeat poll at the bottom of the loop.
 /// `next_event`, but also yielding the TRB POINTER the event refers to.
 ///
 /// A Transfer Event's first eight bytes are the address of the TRB that completed. `next_event`
@@ -1008,6 +1005,15 @@ pub(crate) fn next_event_at(
     None
 }
 
+/// Poll the event ring for the next event TRB. Returns (trb_type, completion, slot_id) and advances
+/// the dequeue pointer, or None.
+///
+/// `max_tries` bounds how many looks to take for an event whose cycle bit has flipped: the command
+/// path passes a large budget (it just rang a doorbell and expects a completion imminently); the
+/// **poll loop passes 1** so it is fully non-blocking - otherwise, while a key is held (no new
+/// transfer events), this would busy-spin millions of times before returning `None`, starving the
+/// typematic auto-repeat poll at the bottom of the loop.
+///
 /// The three fields every other caller wants. Delegates, so there is ONE event-ring walk: two copies
 /// of a ring dequeue that must advance exactly once is a bug waiting for the second one to drift.
 pub(crate) fn next_event(
@@ -1197,9 +1203,10 @@ fn control(
 /// hub (which changes no root PORTSC). Returns `Some(connected_bit)` (wPortStatus bit 0), or `None` on
 /// a transfer failure (treated as "unknown", not a disconnect). The hub's EP0 ring is managed with a
 /// persistent producer cursor `cur` + cycle `pcs` and a Link TRB at the ring tail, so the check can run
-/// indefinitely without overrunning the one-page ring. Only the hub's own completion (slot_id ==
-/// hub_slot) is accepted; a stray keyboard event landing in the tiny check window is skipped (a rare
-/// dropped keystroke, not a misread status).
+/// indefinitely without overrunning the one-page ring. Only the hub's own completion - the TRB it
+/// posted - is accepted. Any other transfer event (a keystroke, or a late answer to an earlier probe)
+/// is filed in the mailbox and the probe ABANDONED, so the caller delivers it at once
+/// (`deliver_hid_report`) rather than misreading it as status.
 #[allow(clippy::too_many_arguments)]
 fn hub_port_status(
     ctx: &ServiceContext,
@@ -1258,7 +1265,7 @@ fn hub_port_status(
     dma.write32(tr + 4, hub_port | (4 << 16));
     dma.write32(tr + 8, 8);
     dma.write32(tr + 12, c | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16)); // IDT, TRT=IN
-                                                                              // Data: 4 bytes IN into DATA_BUF_OFF (unused by the poll loop, so safe to reuse here).
+                                                                              // Data: 4 bytes IN into PROBE_BUF_OFF, the probe's own landing area.
     let dp = dma.phys_at(PROBE_BUF_OFF);
     dma.write32(tr + 16, dp as u32);
     dma.write32(tr + 20, (dp >> 32) as u32);
@@ -1418,7 +1425,7 @@ fn hub_port_status(
                 // ABANDON THE PROBE and let the caller deliver the keystroke NOW.
                 //
                 // This used to keep waiting for its own event, so a key pressed during a probe sat
-                // undelivered until the probe finished - up to PROBE_ANSWER_MS (50 ms) later. That is
+                // undelivered until the probe finished - up to PROBE_ANSWER_MS (50 ms then) later. That is
                 // the stutter felt while typing continuously: a 13 ms poll cadence with occasional
                 // 50 ms hitches on top.
                 //
@@ -1714,7 +1721,6 @@ fn address_downstream(
     Some((slot, (ids & 0xFFFF) as u16, (ids >> 16) as u16, class))
 }
 
-/// Fully enumerate the device on root-hub `port` into per-device DMA slice
 /// Given a device that already has an addressed slot and a working EP0 - either a root-port device
 /// addressed by `enumerate_one` or a downstream device addressed by `address_downstream` - read its
 /// configuration descriptor and, if it exposes a boot-protocol HID interrupt-IN endpoint, Configure
@@ -2123,14 +2129,14 @@ fn read_config_and_bind(
 ///
 /// The discriminator is the **reply cap**, not the payload. An interrupt wakeup from the kernel
 /// carries no reply cap and nothing that needs answering, so it is discarded exactly as before; a
-/// `request_with_reply` from `block-driver` carries one, and something is blocked awaiting the
+/// `gs::call::request_once` from `block-driver` carries one, and something is blocked awaiting the
 /// answer. Guessing from the payload instead would mean an interrupt wakeup whose first byte
 /// happened to be 1 got treated as a sector read.
 ///
 /// NOTE on the shared event ring: serving a request consumes transfer events, and a HID completion
-/// that lands in that window is recorded as "eaten" by `await_on_slot` - the same rare dropped
-/// keystroke the hub port-status poll can already cause. It is a lost report, not a stalled
-/// endpoint, and it is the honest cost of one event ring shared by input and storage.
+/// that lands in that window is filed in `eaten` by `await_on_slot`; the caller delivers it and
+/// re-arms that endpoint (see the `eaten` parameter - it was once thrown away, and that cost the
+/// keyboard, not one keystroke).
 #[allow(clippy::too_many_arguments)]
 fn serve_if_block(
     ctx: &ServiceContext,
@@ -2186,7 +2192,7 @@ fn serve_if_block(
     // waiting - but once per instance says everything a hundred repeats do, and this is the loop that
     // also polls the keyboard.
     // Is this OURS? Every block request carries an opcode in `1..=5` as its first byte, and arrives
-    // through the SDK's `request_with_reply`, which always embeds a reply cap. Anything else that
+    // through `gs::call::request_once`, which always embeds a reply cap. Anything else that
     // wakes this service - a `chaos` flood, a stray notification - is a plain `send` with no cap and
     // no opcode, and is simply not addressed to this path.
     //
@@ -2239,7 +2245,7 @@ fn serve_if_block(
     // A9-1: TRY_send the reply, and do NOT discard the verdict.
     //
     // This was a blocking `send` into a queue the caller cannot drain: `block-driver` is parked in
-    // `request_with_reply` waiting for exactly this reply, so if its 16-deep queue is full, it waits
+    // `gs::call::request_once` waiting for exactly this reply, so if its 16-deep queue is full, it waits
     // for us and we wait for it. §8.9 is explicit - where two services send to each other, at least
     // one direction MUST be non-blocking - and neither was. It is reachable: `chaos` floods every
     // service, and the one that wedges here owns the KEYBOARD.
@@ -2482,19 +2488,7 @@ fn bind_msc(
     }
 }
 
-/// Enumerate whatever is attached to root-hub `port`, binding every boot HID it finds - directly on
-/// the port, or behind a hub on the port - into `devs` (up to MAX_HID). A DMA slice is allocated per
-/// device from `sa`; a bound HID and an active (HID-bearing) hub keep their slice for the pass, while a
-/// transient probe - a non-HID device, or a hub with nothing usable behind it - frees its slice and
-/// Disable-Slots its controller slot so neither leaks. A hub is configured AS a hub and its downstream
-/// ports walked with route-string addressing + parent-TT, so a keyboard on a BACK port (behind the Wyse
-/// 5070's internal Realtek hub) is reached and bound (docs/usb-hub.md). Shares the command and event
-/// rings via the mutable bookkeeping refs.
 #[allow(clippy::too_many_arguments)]
-/// After a command failed or got no completion, read USBSTS and log it (HCH/HSE/HCE/CNR), returning
-/// `true` if the controller has WEDGED (Item 3, Fix 1). A wedged HC does not just fail this one command
-/// - it stops executing entirely, including an already-bound keyboard's interrupt transfers, so the
-/// caller must poison the offending port and re-initialise the controller rather than issue more doomed
 /// Write a 64-bit xHCI register as TWO 32-BIT WRITES, low half first.
 ///
 /// The SDK's `Mmio::write64` emits a single 64-bit store. The in-kernel driver this replaced (deleted 2026-08-09; read it in git history) - the one that had
@@ -2557,6 +2551,10 @@ fn dump_ring_state(
         mmio.read32(ir0 + 0x18), dma.phys_at(EVENT_RING_OFF)));
 }
 
+/// After a command failed or got no completion, read USBSTS and log it (HCH/HSE/HCE/CNR), returning
+/// `true` if the controller has WEDGED (Item 3, Fix 1). A wedged HC does not just fail this one command
+/// - it stops executing entirely, including an already-bound keyboard's interrupt transfers, so the
+/// caller must poison the offending port and re-initialise the controller rather than issue more doomed
 /// commands. Pure diagnosis when it returns false (e.g. a device-level Transaction Error with the HC
 /// still running); the log is the breadcrumb that tells us, on the Wyse, which case a port hit.
 fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize) -> bool {
@@ -2634,6 +2632,14 @@ fn usb3_port_mask(mmio: &Mmio, hcc1: u32, max_ports: u32) -> u64 {
     mask
 }
 
+/// Enumerate whatever is attached to root-hub `port`, binding every boot HID it finds - directly on
+/// the port, or behind a hub on the port - into `devs` (up to MAX_HID). A DMA slice is allocated per
+/// device from `sa`; a bound HID and an active (HID-bearing) hub keep their slice for the pass, while a
+/// transient probe - a non-HID device, or a hub with nothing usable behind it - frees its slice and
+/// Disable-Slots its controller slot so neither leaks. A hub is configured AS a hub and its downstream
+/// ports walked with route-string addressing + parent-TT, so a keyboard on a BACK port (behind the Wyse
+/// 5070's internal Realtek hub) is reached and bound (docs/usb-hub.md). Shares the command and event
+/// rings via the mutable bookkeeping refs.
 fn enumerate_one(
     ctx: &ServiceContext,
     dma: &Dma,
@@ -3795,7 +3801,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         wr64(&mmio, ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
         mmio.write32(op + OP_CONFIG, max_slots);
         // P2 (interrupt-driven, §12): enable the interrupter so the controller raises its
-        // MSI-X (kernel-programmed to vector 0x28) when it posts an event. IMAN: IE on, write
+        // MSI/MSI-X (kernel-programmed to the vector allocated at spawn, `msi_vector` above) when it posts an event. IMAN: IE on, write
         // 1 to IP to clear any stale pending; USBCMD.INTE gates interrupts globally. The poll
         // loop still runs and acks (clears IMAN.IP) - belt-and-suspenders until P4.
         mmio.write32(ir0 + 0x00, IMAN_IE | IMAN_IP);
@@ -4520,7 +4526,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // keypress wakes this core directly out of idle rather than paging a halted AP across
             // cores - the destination/placement drift that made the earlier attempt lag
             // (docs/power.md §11). A held key emits no new USB reports, so while one is armed we
-            // wake briskly (~20 ms) to synthesise typematic auto-repeat below; when idle we sleep
+            // wake briskly (one 10 ms tick, `base`) to synthesise typematic auto-repeat below; when idle we sleep
             // ~250 ms as the hot-plug watchdog. Never pass 0 (recv_timeout(0) blocks FOREVER).
             // In MILLISECONDS: one 10 ms tick, which is what `rep_ticks.max(1)` (ticks per 10 ms) was
             // in counter ticks - `recv_within_ms` converts it back to exactly that, and never to 0.
@@ -4535,19 +4541,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let mut disk_gone = false;
             // How long to wait before looking at the event ring ourselves.
             //
-            // Where the controller's MSI reaches us, `recv_timeout` returns EARLY on the interrupt
-            // and this is only a lost-wake safety net, so 250 ms costs nothing. On the Pi 4 nothing
-            // programs the VL805's MSI yet (`pci::program_xhci_msi` WAS a stub; it is now programmed in arch/aarch64/pcie.rs), so this timeout IS
-            // the polling interval - and 250 ms per keystroke is a quarter-second of lag on every
-            // character typed.
+            // Where the controller's MSI reaches us, `recv_within_ms` returns EARLY on the interrupt
+            // and this is only a lost-wake safety net, so 250 ms costs nothing. When this was written
+            // nothing programmed the Pi 4 VL805's MSI, so this timeout WAS the polling interval - and
+            // 250 ms per keystroke is a quarter-second of lag on every character typed. (Note
+            // 2026-10-09: the VL805's MSI is enabled now, by `enable_msi` in arch/aarch64/pcie.rs;
+            // `program_xhci_msi` there is still the `false` stub.)
             //
             // Rather than shorten it everywhere, which would burn ~100 wakeups/second on boards that
             // are already interrupt-driven and undo the power work, it ADAPTS: if several waits in a
             // row have timed out while a HID is bound, nothing is waking us and we must wake
             // ourselves. A single real wake-up restores the long interval.
             //
-            // This is a workaround and is labelled as one. The fix is MSI - the interrupt path
-            // itself now exists on this port, only the VL805's MSI programming is missing.
+            // This is a workaround and is labelled as one. The fix was MSI, which the Pi 4 has since
+            // gained (see the note above); the paragraphs below supersede this rule.
             // A BOUND HID means the short deadline, full stop - interrupts or not.
             //
             // This used to require `quiet_waits >= 4`, i.e. "only poll fast once we have proven
@@ -4557,7 +4564,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the 250 ms idle deadline. Typing was slower WITH interrupts working than without, and
             // the "quiet - polling" line never printed to say so.
             //
-            // An interrupt that arrives makes `recv_timeout` return early regardless, so the short
+            // An interrupt that arrives makes `recv_within_ms` return early regardless, so the short
             // deadline costs nothing where MSI is reliable and rescues latency where it is not. The
             // 250 ms deadline is now only for a controller with NO input device bound, where there is
             // nothing whose latency a human can feel.
@@ -4627,8 +4634,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //   - hub downstream status is polled every HUB_POLL_MS.
             // Only the first needs to be fast, and only while a key is down.
             //
-            // So: `base` (one tick) while any keyboard has a repeat armed, `HUB_POLL_MS` otherwise.
-            // At rest that is ~2 passes/sec instead of ~85, which is where the service's ~23% CPU
+            // So: `base` (one tick) while any keyboard has a repeat armed, `HUB_POLL_MS` otherwise
+            // while a HID is bound, and `base * 25` (250 ms) with none. At rest with a HID that is ~2 passes/sec instead of ~85, which is where the service's ~23% CPU
             // goes. Moving the other two onto events would let the timed wake go entirely.
             let repeat_armed = (0..ndev).any(|d| !devs[d].is_mouse && kb_rep[d].armed());
             // Which branch was actually taken, counted - because the observed pace (36 passes/sec,
@@ -4706,8 +4713,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     msg_count = msg_count.saturating_add(1);
                     // Say WHAT it is, once. Either something really is sending ~32 messages/sec, or
                     // `is_irq` is wrong and these ARE interrupts miscounted - the kernel's
-                    // notification carries the IRQ number, and if that is not 0x28 on this board the
-                    // test above silently fails. One line settles which, and a wrong diagnostic that
+                    // notification carries the IRQ number, and if that is not `msi_vector` the test
+                    // above silently fails (it once was: a hard-coded 0x28 against a pool vector). One line settles which, and a wrong diagnostic that
                     // ends an investigation is worse than none (see the "waking on interrupts" line
                     // that cost this session a day).
                     if msg_count == 1 {
@@ -4905,7 +4912,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // branches - and none has measured DURATION. That gap is why the two instruments cannot
             // be reconciled: `observe` charges xhci ~15% while it sits in BlockRecv, and the
             // heartbeat says it wakes 2.85 times a second. Both are consistent only if a wake costs
-            // ~50 ms, which is exactly `PROBE_ANSWER_MS` - the hub probe budget, which this driver
+            // ~50 ms, which was then exactly `PROBE_ANSWER_MS` (10 ms today) - the hub probe budget, which this driver
             // SPINS on rather than blocking. If that is where the time goes, the fix is to stop
             // busy-waiting, and no amount of adjusting wake rates would ever have found it.
             if last_beat.passed(&ctx, Budget::ms(HEARTBEAT_MS)) {

@@ -21,9 +21,6 @@ pub const PAGE_SIZE: usize = 4096;
 
 static mut HHDM_OFFSET: u64 = 0;
 
-/// Read the HHDM offset set during memory init.
-///
-/// # Safety
 /// True if physical RAM is directly addressable (VA == PA), so a zero HHDM offset is VALID
 /// rather than "unset". x86 reaches frames through Limine's higher-half direct map, so this is false.
 pub const PHYS_IS_IDENTITY: bool = false;
@@ -34,6 +31,8 @@ pub const PHYS_IS_IDENTITY: bool = false;
 pub const BOOTLOADER_PLACED_TABLES: bool = true;
 
 
+/// Read the HHDM offset set during memory init.
+///
 /// Returns 0 if called before `set_hhdm_offset`.
 #[inline]
 pub fn get_hhdm_offset() -> u64 {
@@ -226,7 +225,8 @@ impl PageTable {
 /// `PageTable::new()` copies PML4 entries 256-511, any mapping added here at
 /// a kernel virtual address automatically propagates to future address spaces.
 ///
-/// If the target PTE is already present this is a no-op (returns `Ok`).
+/// If the target PTE is already present this is a no-op (returns `Ok`, and the requested flags are
+/// NOT applied). If a large page already covers `virt`, returns `Err(AlreadyMapped)` (A9-1).
 ///
 /// `flags` - raw PTE flag bits (e.g. PRESENT | WRITABLE | PCD | PWT for MMIO).
 ///
@@ -235,7 +235,7 @@ impl PageTable {
 /// page-aligned; no TLB flush is issued (caller must invalidate if needed).
 pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
     let cr3: u64;
-    // SAFETY: RDMSR of CR3 is always valid in ring 0.
+    // SAFETY: reading CR3 is always valid in ring 0.
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)) };
     let pml4 = cr3 & !0xFFF;
 
@@ -261,10 +261,6 @@ pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(
 /// (1 GiB at PDPT level, 2 MiB at PD level) and the walk stops there.
 const PAGE_SIZE_BIT: u64 = 1 << 7;
 
-/// Return the raw PTE (or large-page entry) currently mapping `virt` in the active
-/// page tables, or `None` if `virt` is unmapped. Walks PML4→PDPT→PD→PT and stops
-/// early at a large-page entry. Read-only - it does not modify any table. Used to
-/// audit mapping permissions (the NX / W^X check in `boot::audit_wx`).
 /// Read the page-table base register - the physical address of the active root table, low bits included
 /// (caller masks). The arch seam for the MMU base: x86 CR3; RISC-V satp.PPN, AArch64 TTBR0_EL1.
 #[inline(always)]
@@ -317,6 +313,11 @@ pub unsafe fn invalidate_tlb_page(addr: u64) {
     unsafe { core::arch::asm!("invlpg [{a}]", a = in(reg) addr, options(nostack)); }
 }
 
+/// Return the raw PTE (or large-page entry) currently mapping `virt` in the active
+/// page tables, or `None` if `virt` is unmapped. Walks PML4→PDPT→PD→PT and stops
+/// early at a large-page entry. Read-only - it does not modify any table. Used to
+/// audit mapping permissions (the NX / W^X check in `boot::audit_wx`) and by
+/// `ioapic::init` to tell "not mapped" from "already mapped".
 pub fn entry_for_va(virt: u64) -> Option<u64> {
     let cr3: u64;
     // SAFETY: reading CR3 is always valid in ring 0.
@@ -399,7 +400,7 @@ pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
 /// bypass. The kernel only ever uses the HHDM for *data* (the page-table walks
 /// above, the allocator, copying service ELFs into fresh frames); nothing executes
 /// from it (the kernel runs from its own `.text`, services from the loader's RX
-/// mappings, the AP trampoline from identity-mapped low memory). So forcing the
+/// mappings; there is no AP trampoline of our own - Limine starts the APs). So forcing the
 /// whole HHDM `NO_EXEC` removes the executable alias without touching any code path.
 ///
 /// Walks the single PML4 entry that roots the HHDM (one entry covers 512 GiB -
@@ -594,8 +595,9 @@ unsafe fn free_phys_frame(phys: u64) {
 /// The kernel half (entries 256-511) is shared across all address spaces and
 /// is NOT collected.
 ///
-/// The caller must issue a full TLB flush on all cores before freeing the
-/// returned frames (§10.5).
+/// The frames are freed DURING the walk, so before calling, the caller must ensure no core can
+/// still translate through this address space (§10.5). The kill path does that without a
+/// shootdown: it waits until every other core has loaded a different CR3 (`task/scheduler.rs`).
 ///
 /// # Safety
 /// - `cr3` must be the root PML4 of a task already marked Dead.

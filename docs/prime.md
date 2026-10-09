@@ -30,7 +30,8 @@ Prime. Prime stays whiteboardable (§26.11): "boot, interact, reproduce."
 > **Prime ⊇ TCB, but it is not the same set.** The TCB (§6.1) is *what must be
 > trusted*. Prime is *what ships in the minimal bootable core*. `block-driver`/`fs`
 > are in Prime because you can't install or carry state without them; their TCB
-> status is the separate Phase-3 question (§6.3).
+> status is the separate Phase-3 question (§6.3). *(2026-10-09: settled - both left the
+> TCB in the Phase D amendment, CLAUDE.md 6.1, and are restartable.)*
 
 ## 2. Anatomy of a bootable GodspeedOS drive
 
@@ -296,8 +297,8 @@ ways, and this is the key sub-decision:
 
 ## 10. Suggested order (when built)
 
-1. **Hierarchical GSFS + `drives flash`/`use`** (the storage foundation -
-   `persistence.md`, `drives.md`).
+1. **Hierarchical GSFS + `drives flash`** (the storage foundation -
+   `persistence.md`, `drives.md`; this said `flash`/`use`, and `use` was dropped).
 2. **`drives install`** - write a bootable GodspeedOS drive (GPT + ESP/Limine +
    kernel) from the self-carried image (§6). Self-install USB → SSD; boot without the USB.
 3. **A/B `drives update`** (§8) - two kernel slots + the minimal FAT writer + boot-default
@@ -336,8 +337,8 @@ survive.** Recovery needs no special handshake - it is the ordinary restart path
 
 ```text
   1. reboot into the new kernel                 (A/B slot, rollback if bad, §8)
-  2. new kernel boots → supervisor RESPAWNS the services (per the manifest/contracts,
-        §14.1; or from the GSFS world, §5) → kernel RE-MINTS each cap per the contract
+  2. new kernel boots → supervisor RESPAWNS the services (per its spawn table,
+        §14.1; or from the GSFS world, §5) → kernel RE-MINTS each cap per the spawn request
   3. each service RECONSTRUCTS its state from GSFS (§15) and RE-ACQUIRES any runtime
         caps by name via the kernel name directory (§14.2) → carries on
 ```
@@ -403,8 +404,10 @@ standing on the rug that didn't know how to land.
 in-flight transactions, buffered writes, or open connections - genuinely benefits from a
 chance to wind down **cleanly** before a *planned* restart/Prime swap: commit the current
 transaction, flush, close - so there is **no journal replay and no partial-write window**
-at all. That gap is real, and wider today because GSFS Phase 1 has no journal (§6.3), so a
-clean flush is the difference between "consistent on disk" and "trusting recovery."
+at all. That gap is real, and was wider when this was written because GSFS Phase 1 had no journal
+(§6.3), so a clean flush was the difference between "consistent on disk" and "trusting recovery."
+*(2026-10-09: GSFS has since gained its redo journal, `docs/persistence.md` §6.8, so metadata is
+crash-consistent; a graceful wind-down still saves the replay and any unflushed file data.)*
 
 So GodspeedOS **will** support lifecycle notifications - but as a **subscribe-and-forget
 courtesy broadcast, not POSIX signals.** POSIX signals are async interrupts (they hijack

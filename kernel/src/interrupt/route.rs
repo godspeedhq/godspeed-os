@@ -6,9 +6,10 @@
 //! interrupt as an IPC message. If the driver is on a different core than the
 //! IRQ-receiving core, delivery goes through the cross-core IPC path (§12.2).
 //!
-//! Driver services register their IRQ lines at spawn time via their contract
-//! `hw_interrupt` capability (§12.3). The kernel validates the capability and
-//! inserts the route here.
+//! A driver's IRQ lines are routed at spawn time: the kernel derives the vectors
+//! from the device CLASS the spawn request names (`task::hw_irqs_for`, or a PCI
+//! MSI vector it allocates) and inserts the route here (§12.3, §14.1). Neither
+//! the contract nor the spawner names a vector.
 
 use crate::ipc::endpoint::EndpointId;
 use crate::smp::SpinLock;
@@ -26,7 +27,7 @@ static IRQ_TABLE: SpinLock<[Option<EndpointId>; MAX_IRQ]> = SpinLock::new([None;
 
 
 /// Register a driver endpoint to receive interrupts for `irq`.
-/// Called at spawn time when the kernel processes a `hw_interrupt` capability.
+/// Called by the spawn path for each vector the device class resolved to.
 pub fn register(irq: u8, endpoint: EndpointId) {
     let mut table = IRQ_TABLE.lock_irq();
     // SEC-16: never SILENTLY steal an IRQ line. On a clean driver restart the death path calls
@@ -85,7 +86,11 @@ pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
 
 /// Remove the driver endpoint registered for `irq` (driver-death quiesce, §12).
 ///
-/// Called on driver death so a route to the dead driver's endpoint is cleared before the
+/// NO CALLERS today: the kill path uses `unregister_endpoint` above, which MASKS each released
+/// line rather than unmasking it as this does. The rationale below for unmasking is therefore not
+/// what a driver death currently does.
+///
+/// Was called on driver death so a route to the dead driver's endpoint is cleared before the
 /// endpoint id is freed and REUSED. `IRQ_TABLE` stores a bare `EndpointId` (no generation),
 /// so a reused id would otherwise inherit the dead driver's interrupts;
 /// `enqueue_from_interrupt`'s liveness check only covers the still-Dead window, not a reused
@@ -101,7 +106,7 @@ pub fn unregister(irq: u8) {
     // registers correctly, waits for an interrupt that is switched off at the controller, and looks
     // like a driver that cannot see its hardware.
     //
-    // On arm32 nothing falls back: slice 5 deleted the in-kernel stack, and `arch/arm/irq.rs:553` says
+    // On arm32 nothing falls back: slice 5 deleted the in-kernel stack, and `arch/arm/irq.rs` says
     // so at the dispatch site. A masked line simply stays masked until the respawned `dwc2` service
     // registers again and unmasks it - which is why releasing the route must also unmask.
     //

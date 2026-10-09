@@ -1,6 +1,7 @@
 # kernel/
 
-The kernel crate. Bare-metal `#![no_std]` binary targeting `x86_64-unknown-none`.
+The kernel crate. Bare-metal `#![no_std]` binary, built once per ISA: `arch::imp` aliases the one
+directory under `arch/` being built (x86-64, ARMv7, AArch64, RISC-V 64, and three boot-only stubs).
 
 ## What lives here
 
@@ -13,21 +14,24 @@ Everything that runs in ring 0. The kernel is the only code that:
 
 ## What does NOT live here
 
-Filesystem logic, network stack, drivers (beyond minimal arch boot stubs), logging infrastructure, application logic. These belong in `services/`. If you are about to add something to the kernel that isn't on the list in `src/main.rs`, read §4.4 first.
+Filesystem logic, network stack, drivers (beyond minimal arch boot stubs), logging infrastructure, application logic. These belong in `services/`. If you are about to add a module to the kernel beyond the `mod` list at the top of `src/main.rs`, read §4.3 and §4.4 first.
 
 ## Build
 
 ```bash
-cargo build -p kernel --target x86_64-unknown-none
+cargo build -p kernel --target x86_64-unknown-none     # x86-64; osdev does this for you
+py scripts/board.py pi2|pi4|visionfive|x86             # a bootable image for any port
 ```
 
-The kernel requires a custom target spec. The binary is a flat ELF loaded by Limine.
+Each port has its own linker script (`kernel.ld`, `kernel-arm.ld`, `kernel-aarch64*.ld`,
+`kernel-riscv64*.ld`, ...). On x86-64 the binary is an ELF loaded by Limine; the other ports enter
+through their own boot path (§11.1, 2026-09-12 amendment).
 
 ## Module map
 
 | Module           | Spec section | Unsafe permitted? |
 |------------------|-------------|-------------------|
-| `arch/x86_64`    | §11, §12    | Yes - hardware boundary |
+| `arch/<isa>`     | §11, §12    | Yes - hardware boundary |
 | `memory/`        | §10         | Yes - physical addresses |
 | `capability/`    | §7          | Yes - global table |
 | `smp/`           | §9, §11     | Yes - APIC MMIO |
@@ -38,10 +42,11 @@ The kernel requires a custom target spec. The binary is a flat ELF loaded by Lim
 | `invariants/`    | §22         | No  |
 | `bootcon/`       | §11.4       | No - see below |
 | `log.rs`         | §11.4       | No  |
+| `main.rs`, `loader.rs` | §11, §14.1 | grandfathered: `main.rs` 2, `loader.rs` 1 - see audit |
 
 ## Unsafe policy (§18)
 
-`unsafe` is permitted **only** in `arch/`, `memory/`, `capability/`, `smp/`. Every `unsafe` block must have a `// SAFETY:` comment. The grandfathered lines in `task/`, `syscall/`, and `interrupt/` are documented in `audits/unsafe-audit.md` and frozen - they may decrease but increase only by a recorded §18.5 amendment with rationale. There are no such amendments: hardening that needs `unsafe` (e.g. the H4 W^X / kstack-guard work) puts it in a permitted layer (`arch/`) and uses safe `fn`s for boot-ordering call sites, so the grandfathered floors hold.
+`unsafe` is permitted **only** in `arch/`, `memory/`, `capability/`, `smp/`. Every `unsafe` block must have a `// SAFETY:` comment. The grandfathered lines in `task/`, `syscall/`, `interrupt/`, `main.rs` and `loader.rs` are documented in `audits/unsafe-audit.md` and frozen - they may decrease but increase only by a recorded §18.5 amendment with rationale. There are no such amendments: hardening that needs `unsafe` (e.g. the H4 W^X / kstack-guard work) puts it in a permitted layer (`arch/`) and uses safe `fn`s for boot-ordering call sites, so the grandfathered floors hold.
 
 A PR adding an unsafe block without a SAFETY comment is rejected without review.
 
@@ -73,11 +78,13 @@ takes the screen back if that service dies (`reclaim_on_death`) or on a panic (`
 
 ## Control channel (the `control` SERVICE, not kernel code)
 
-`kernel/src/control.rs` **does not exist**. This section described it, and `task/mod.rs:2432` says so
-in as many words: "not `control::process_pending` - which does not exist any more". The COM2 serial
-control channel the test harness drives (`RESTART`/`KILL`, §17) is `services/control`, a restartable
-userspace service that re-opens the port on respawn. It was moved out in C1-6, and
-`capability/mod.rs:111` records the move.
+`kernel/src/control.rs` **does not exist**. This section described it, and the supervisor-respawn
+note in `task/mod.rs` (above `poll_supervisor_respawn`) says so in as many words: "not
+`control::process_pending` - which does not exist any more". The COM2 serial control channel the test
+harness drives (`RESTART`/`KILL`, §17) is `services/control`, a restartable userspace service that
+re-opens the port on respawn. It was moved out in C1-6, and `FIRE_IRQ_RESOURCE` in
+`capability/mod.rs` records the move. The kernel still owns the UART and hands its bytes out
+through `InspectKernel` query 21.
 
 The kernel's only remaining stake in it is the gated `FireIrq` syscall (51), which `control` carries in
 its spawn request rather than receiving by name.

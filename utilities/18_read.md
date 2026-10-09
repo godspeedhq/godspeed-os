@@ -1,8 +1,8 @@
 # Utility: `read` - print a file's contents
 
 **Status:** **Built + QEMU-verified** (`osdev test files` 11/11) - a shell built-in over
-the `fs` READ_FILE API, on hierarchical GSFS (`docs/persistence.md`). Read-only. Trails
-`CLAUDE.md`; does not amend it.
+the `fs` STAT_FILE and READ_AT API, on hierarchical GSFS (`docs/persistence.md`). Read-only.
+Trails `CLAUDE.md`; does not amend it.
 
 ---
 
@@ -31,20 +31,25 @@ usage:
 
 ## 3. Behaviour & bounds
 
-`read` requests the file from `fs` (`ReadFile`, op 11) and writes the bytes to the console.
-A file travels in message-bounded chunks (§8.5: 4 KiB max IPC message; §2.5: no shared
-memory), so a large file is a sequence of copied reads - the honest, bounded data path
-(`docs/persistence.md` §6.1). Reading a directory is a loud error, not a silent dump.
+`read` stats the file through `fs` (`STAT_FILE`, op 12) to learn its size, then streams it
+with `READ_AT` (op 26) in `IO_CHUNK` pieces (3556 bytes) and writes the bytes out. A file
+travels in message-bounded chunks (§8.5: 4 KiB max IPC message; §2.5: no shared memory), so
+a large file is a sequence of copied reads - the honest, bounded data path
+(`docs/persistence.md` §6.1). A missing trailing newline is supplied. Reading a directory is
+a loud error, not a silent dump - though it is reported as `read: not found: <path>`, the
+same words as a missing file. A read that fails part way prints `read: storage error`.
 
 ## 4. Implementation
 
-Read-only, so a **shell built-in** sending `ReadFile` to `fs` over a narrow
-`ipc_send=["fs"]` cap. `fs` enforces; once file-as-capability lands (`docs/persistence.md`
-§7) `read` presents a per-file READ cap instead of a name.
+Read-only, so a **shell built-in** sending `STAT_FILE` and `READ_AT` to `fs` over a narrow
+`ipc_send=["fs"]` cap. `fs` enforces. File-as-capability has landed (`docs/persistence.md`
+§7, `35_fcap.md`), but `read` still addresses the file by name; presenting a per-file READ
+cap instead is not done.
 
 ## 5. Later (separate doc so it can grow)
 
-- Paging for long output (screenful at a time) - a console-service concern.
+- Paging for long output is **done**, as a pipe stage rather than a word on `read`:
+  `read <path> | paginate` (`52_paginate.md`).
 - A hex/binary view for non-text files.
 - Range reads (offset + length) once a real need pulls them in (§26.2).
 
@@ -53,7 +58,9 @@ Read-only, so a **shell built-in** sending `ReadFile` to `fs` over a narrow
 Conforms: `read help` (usage with a real example per row) and `read version` (number +
 creator credit) per `0_conventions.md` (the shared `help_block` helper).
 
-Also conforms to **rule 10** (`0_conventions.md` §1.10): the `fs` request is **q-abortable** via
-`fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to the prompt (a fast
-reply prints nothing). This replaced a bare `request_with_reply`, which rule 10 forbids for an
-interactive command.
+**Does NOT currently conform to rule 10** (`0_conventions.md` §1.10), found 2026-10-09. The `fs`
+requests go through a `gs::fs::Fs` handle that is lent no notice, so each request is bounded
+(`gs::call::DEFAULT_SECS`, 5 s) but prints no `[q] quit` and cannot be ended with `q`; the
+`Cancelled` branches in the handler are unreachable. This said the request was q-abortable via
+`fs_request_q`, which no longer exists. `dir` is the one fs-backed command that still lends the
+notice (`16_dir.md` §6); the same `.noticing(...)` here is the fix.

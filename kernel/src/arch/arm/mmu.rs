@@ -116,7 +116,7 @@ fn section(pa: u32, device: bool, execute: bool) -> u32 {
 /// **Normal** non-cacheable, not Device. Device semantics (no gathering, no reordering, no speculation)
 /// exist to protect stores that have side effects; a framebuffer store has none - it is memory the
 /// display happens to scan. Normal NC lets the write buffer gather, which for a blit is the difference
-/// between one burst and one bus transaction per pixel. `fb_barrier` (a `DSB`) drains it.
+/// between one burst and one bus transaction per pixel. `bootcon::fb_commit` (a `DSB`) drains it.
 ///
 /// Non-shareable keeps it off the SMP coherency fabric (only the CPU side writes it; the GPU sees it via
 /// the drain), which also avoids the QEMU TCG slow-path that a shareable mapping dragged the whole
@@ -190,23 +190,9 @@ fn translate(va: u32) -> Option<u32> {
     }
 }
 
-/// Turn the MMU on, then prove it is actually translating.
-///
-/// The enable sequence has a strict order and every step matters:
-/// 1. **Invalidate** TLBs, branch predictor and I-cache - stale entries from before the tables
-///    existed would be honoured over them.
-/// 2. **DACR = client for domain 0**, so permission bits are enforced (manager would skip the checks).
-/// 3. **TTBCR = 0**, so TTBR0 covers the whole 4 GB (no TTBR1 split yet).
-/// 4. **TTBR0 = table address.** Table walks are left non-cacheable here - one fewer attribute to get
-///    wrong on the first bring-up; making walks cacheable is a later optimisation, not correctness.
-/// 5. **DSB + ISB**, then set `SCTLR.M`, then DSB + ISB again. The barriers are not decoration: the
-///    instruction after the enable must be fetched under the new regime.
-///
-/// Identity mapping is what makes this survivable - PC, SP and VBAR all mean the same thing on both
-/// sides of the switch.
 /// Map the GPU framebuffer region `[base, base+size)` into the LIVE kernel L1 as **Normal
-/// non-cacheable** (see `section_fb` for why it is not cacheable); `fb_barrier` drains each batch out to
-/// the GPU with a `DSB`. The framebuffer sits in the gap between usable RAM and the peripherals, which
+/// non-cacheable** (see `section_fb` for why it is not cacheable); `bootcon::fb_commit` drains each batch
+/// out to the GPU with a `DSB`. The framebuffer sits in the gap between usable RAM and the peripherals, which
 /// `build_tables` leaves unmapped, so it must be added after the fact. Rounds to the enclosing 1 MiB
 /// sections. Runs after the MMU + caches are on, so the new descriptors are cleaned to RAM (the walker
 /// reads the table non-cacheable) and the TLB is flushed.
@@ -239,6 +225,20 @@ pub fn map_framebuffer(base: u32, size: u32) {
     }
 }
 
+/// Turn the MMU on, then prove it is actually translating.
+///
+/// The enable sequence has a strict order and every step matters:
+/// 1. **Invalidate** TLBs, branch predictor and I-cache - stale entries from before the tables
+///    existed would be honoured over them.
+/// 2. **DACR = client for domain 0**, so permission bits are enforced (manager would skip the checks).
+/// 3. **TTBCR = 0**, so TTBR0 covers the whole 4 GB (no TTBR1 split yet).
+/// 4. **TTBR0 = table address.** Table walks are left non-cacheable here - one fewer attribute to get
+///    wrong on the first bring-up; making walks cacheable is a later optimisation, not correctness.
+/// 5. **DSB + ISB**, then set `SCTLR.M`, then DSB + ISB again. The barriers are not decoration: the
+///    instruction after the enable must be fetched under the new regime.
+///
+/// Identity mapping is what makes this survivable - PC, SP and VBAR all mean the same thing on both
+/// sides of the switch.
 pub fn enable() {
     build_tables();
     // SAFETY: core 0, tables just built; enables translation + caches on this core.
@@ -294,8 +294,9 @@ pub unsafe fn enable_on_this_core() {
         );
     }
 
-    // Caches are enabled only after translation is proven, so that if the machine wedges we know
-    // which of the two steps did it. Memory attributes above (Normal WB/WA for RAM, Device for MMIO)
+    // Caches are enabled in a SEPARATE step after translation is on, so that if the machine wedges we
+    // know which of the two did it. (Not after it is proven: `enable` runs `selftest` once this
+    // function has returned, with the caches already on.) Memory attributes above (Normal WB/WA for RAM, Device for MMIO)
     // are what make this safe to do at all - with the MMU off, everything behaves as Strongly-ordered.
     // SAFETY: Same boot context. Sets SCTLR.C (data cache), .I (instruction cache) and .Z (branch
     // prediction); valid at PL1 and meaningful only now that translation supplies memory attributes.

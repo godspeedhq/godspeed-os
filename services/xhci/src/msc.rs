@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! USB mass storage (Bulk-Only Transport + SCSI transparent) for the `xhci` service.
 //!
-//! This is the piece that was missing from the userspace USB driver, and its absence is the whole
-//! reason the kernel still contains a USB stack: `services/xhci` drove keyboards and mice, so
-//! building with the driver in userspace cost the disk, and a build that costs the disk does not
-//! become the default. Bulk transfers are the last capability the in-kernel stack had that this one
-//! did not.
+//! This was the piece missing from the userspace USB driver, and its absence was the whole reason
+//! the kernel still contained a USB stack: `services/xhci` drove keyboards and mice, so building
+//! with the driver in userspace cost the disk, and a build that costs the disk does not become the
+//! default. Bulk transfers were the last capability the in-kernel stack had that this one did not.
+//! (Note 2026-10-09: that stack is deleted - CLAUDE.md 6.4, amendment 2026-08-09.)
 //!
 //! ## What BOT is
 //!
@@ -31,7 +31,8 @@
 //!
 //! ## Reference
 //!
-//! Reimplemented from our own hardware-proven `kernel/src/arch/aarch64/xhci.rs`, which carries two
+//! Reimplemented from our own hardware-proven `kernel/src/arch/aarch64/xhci.rs` (since deleted; it is
+//! in the git history), which carries two
 //! findings worth restating because they cost days:
 //!
 //! - **The recovery was causing the wedges.** A timeout budget of 2 s aborted commands a healthy
@@ -158,12 +159,12 @@ impl Ring {
     }
 }
 
-/// A bound mass-storage device: the coordinates needed to talk to it and the geometry it reported.
 /// Set once "no disk is bound" has been reported, so the refusal is not logged per request.
 static NO_DISK_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// As `NO_DISK_LOGGED`, for a bound disk whose reads have started failing.
 static READ_FAIL_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// A bound mass-storage device: the coordinates needed to talk to it and the geometry it reported.
 pub struct Disk {
     pub slot: u32,
     /// Device Context Index of the bulk-OUT endpoint (`num * 2`).
@@ -566,7 +567,8 @@ pub fn write10(
 
 /// SCSI SYNCHRONIZE CACHE(10) - the durability barrier a journal's ordering depends on.
 ///
-/// Its outcome is RETURNED, not swallowed. A device that refuses this (the Pi 2's stick does) leaves
+/// Its outcome is RETURNED, not swallowed. A device that refuses this (the Pi 2's stick was said to;
+/// CLAUDE.md 6.1, amendment 2026-09-23, found it does not) leaves
 /// the filesystem crash-recoverable only in the weaker, backend-conditional sense the constitution
 /// records in §6.1, and the caller must be able to say so rather than imply a guarantee it cannot
 /// deliver.
@@ -685,9 +687,10 @@ pub fn parse_msc(dma: &Dma, buf_off: usize, buf_len: usize) -> Option<MscInfo> {
 // ---------------------------------------------------------------------------------------------
 //
 // This is what makes the userspace disk REACHABLE. Reading sectors is useless if nothing can ask
-// for one, and until now the only way to reach a USB disk was the four `usb_disk_*` syscalls -
-// which exist solely to expose the IN-KERNEL stack. Serving the block protocol here is what lets
-// those syscalls, and the stack behind them, be deleted.
+// for one, and until this the only way to reach a USB disk was the four `usb_disk_*` syscalls -
+// which existed solely to expose the IN-KERNEL stack. Serving the block protocol here is what let
+// that stack be deleted. (Note 2026-10-09: the syscalls remain as a dead ABI whose arch side answers
+// "no disk", and nothing holds their capability - `arch/aarch64/mod.rs`, `usb_disk_sectors`.)
 //
 // The wire protocol is EXACTLY the one `block-driver` already speaks to `fs`, deliberately: `fs`
 // does not learn that its disk moved out of the kernel, and `block-driver` translates nothing. The

@@ -15,6 +15,12 @@ That is weaker than "the line is exactly right" and much stronger than nothing: 
 shrinking, the line drifting out of range, and the target being deleted, while tolerating the
 one-or-two-line drift that ordinary editing produces and that does not mislead anybody.
 
+LIMITS, so a pass is not read as more. The anchors are drawn from the WHOLE citing line, the cited
+path included, so a file-name word (`scheduler` from `task/scheduler.rs:NNN`) that also appears near
+the cited line satisfies it. Only citations under services/, kernel/, sdk/, osdev/, scripts/, examples/
+and tests/ ending `.rs` or `.py` are recognised (not `stdlib/`), in `.md`, `.rs` and `.py` files - code
+comments as well as documents. The printed count includes sites a `conform-ok` marker exempted.
+
 WHAT IS EXCLUDED, for a reason rather than convenience. `audits/`, `milestones/` and `bugs/` are
 append-only DATED evidence: a line number correct on the day an audit ran is a true record of what
 was seen, and rewriting it later would destroy the evidence. They are history, not claims about now.

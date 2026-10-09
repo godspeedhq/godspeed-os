@@ -38,7 +38,9 @@
 //! **Slice 1 of 3** (the C1-6 commandment walk; see `audits/userspace-audit.md` Audit 11): the service exists and owns the policy, reading the
 //! raw RTC through the kernel query that already exists. Slice 2 moves the shell and `net-stack` onto
 //! it; slice 3 deletes the kernel's two modules, the `SetClock` syscall and the wall-clock queries -
-//! the first time in this audit a pinned kernel surface gets SMALLER.
+//! the first time in this audit a pinned kernel surface gets SMALLER. (Note 2026-10-09: all three
+//! slices are done, with `kernel/src/clock.rs` kept as the paragraph above records, and since
+//! 2026-10-01 this service also runs the NTP exchange itself - `net-stack` no longer calls it.)
 
 use godspeed_sdk::{ServiceContext, Message};
 
@@ -176,16 +178,6 @@ const FLOOR_PATH: &[u8] = b"/clock.last";
 const FS_OP_WRITE: u8 = 10;
 const FS_OP_READ: u8 = 11;
 const FS_OK: u8 = 0;
-/// How long an fs request may take before this service gives up on it for now.
-///
-/// Correlation tags for this service's own `fs` requests.
-///
-/// `fs` echoes the tag byte back, which is what lets the main loop recognise ITS OWN replies among the
-/// requests it is serving - and that is what makes the floor I/O below non-blocking. A client request
-/// arrives carrying a reply cap; an `fs` reply arrives without one and with one of these tags.
-///
-/// Distinct from 0 on purpose: 0 is what a caller sends who has not thought about tags, and it is also
-/// `FS_OK`, a collision that has already hidden one bug in this file.
 /// Telling `fs` the wall clock: `[FS_CLOCK_PUSH, epoch:i64]`, one way, no reply capability.
 /// Mirrors `FS_CLOCK_PUSH` in `fs`, where the reasoning for it being a push is written out.
 const FS_CLOCK_PUSH: u8 = 0xC1;
@@ -259,6 +251,14 @@ fn ntp_answer(ask: &NtpAsk, ntp: &[u8]) -> Result<i64, &'static str> {
     Ok((secs - NTP_UNIX_OFFSET) as i64)
 }
 
+/// Correlation tags for this service's own `fs` requests.
+///
+/// `fs` echoes the tag byte back, which is what lets the main loop recognise ITS OWN replies among the
+/// requests it is serving - and that is what makes the floor I/O below non-blocking. A client request
+/// arrives carrying a reply cap; an `fs` reply arrives without one and with one of these tags.
+///
+/// Distinct from 0 on purpose: 0 is what a caller sends who has not thought about tags, and it is also
+/// `FS_OK`, a collision that has already hidden one bug in this file.
 const TAG_FLOOR_READ: u8 = 0xF1;
 const TAG_FLOOR_WRITE: u8 = 0xF2;
 /// How often to retry loading the floor while it has not been loaded yet.
@@ -354,8 +354,9 @@ fn send_noblock(ctx: &ServiceContext, peer: &str, req: &[u8]) -> bool {
     // been written on any boot: not a protocol fault, not a slow disk, simply no cap to send on.
     //
     // The kernel name directory is the answer to exactly this (§14.3): ask for the peer when you need
-    // it, not when you started. Cached by the SDK after the first success, and re-acquired for free if
-    // `fs` is restarted under us.
+    // it, not when you started. Cached by the SDK after the first success. A handle held across a
+    // restart of the peer is NOT refreshed by itself: a send on it fails, and the reacquire below is
+    // what replaces it. (`fs` here and throughout; `ntp_ask` sends to `net-stack` the same way.)
     let target = match gs::ipc::peer(ctx, peer) {
         Some(t) => t,
         None => {
@@ -490,12 +491,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut ntp_said: Option<&'static str> = None; // the last NTP outcome logged, so a repeat stays quiet
     let mut no_cap: u32 = 0;                      // capless messages seen (a flood, usually)
     loop {
-        // Wake on a timer only while there is still housekeeping OUTSTANDING - a floor to read, or a
-        // floor to write that has not been acknowledged. Once both are settled this is a plain blocking
-        // `recv` and the service costs nothing at all.
-        // Keep waking while the clock is still unresolved, so the NTP query below can go out. This is
-        // bounded by success - once the network sets the clock, `unsynced` is false and this service
-        // goes back to blocking on `recv` with no timer at all.
+        // (Two earlier designs, both superseded by "ALWAYS a timed wait" below: waking only while a floor
+        // read or write was outstanding, and then only while the clock was unsynced. Once settled the
+        // loop now wakes every `SETTLED_WAKE_MS`, so a re-sync is never waiting on somebody to ask.)
         let unsynced = clock.source != SRC_NTP;
         // WHEN IS THE NEXT NETWORK CHECK DUE? Two rhythms, because two situations: with no clock at all
         // this service asks often, and with a good one it asks rarely to keep it good. It never stops

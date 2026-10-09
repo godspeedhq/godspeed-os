@@ -52,8 +52,10 @@ Both consume input; neither is a pipe *producer*. Being filters they compose:
 Shell built-in FILTERS (`run_filter_builtin`, with `match`/`count`/`sort`): they run
 **in-process**, so they are **not** subject to the 4 KiB pipe service-boundary cap and can take
 from a full 16 KiB stage buffer. `cmd_take(last: bool)` serves both verbs; the pipe path routes
-through `run_filter_builtin`. The direct form `read`s the file itself (`fs` `ReadFile`, op 11) -
-no new `fs` surface.
+through `run_filter_builtin`. The direct form reads the file itself (`gs::fs::Fs::read_into`,
+streaming `READ_AT`) - no new `fs` surface - into a fixed `FILTER_READ_MAX` (8192-byte) buffer,
+and refuses a larger file loudly (pipe it instead: `read <path> | last 20`). On a record stream
+both refuse with a sentence pointing at `where`/`select`/`sort <col>`.
 
 ## 5. Later (separate so it can grow)
 

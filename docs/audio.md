@@ -1,7 +1,7 @@
 # Audio
 
-**Status: steps A1-A5 built and run in QEMU (2026-10-03; A4's outputs, debug and system sounds not built), on branch
-`feat/audio`. The driver resets an Intel High Definition Audio controller, finds its codec and output
+**Status: steps A1-A5 built and run in QEMU (2026-10-03; A4's outputs, debug and system sounds not built), built on
+`feat/audio` and since merged to `main`. The driver resets an Intel High Definition Audio controller, finds its codec and output
 path, moves codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's
 `audio` sets the volume, mutes, powers the codec down and up and plays tones (`utilities/57_audio.md`),
 each checked against the WAV QEMU wrote; the volume and the mute survive a reboot in `/audio.settings`.
@@ -608,6 +608,11 @@ Test 12, `xhci`) still passes on the changed kernel.
 the driver working through the confined domain. And the controller uses plain MSI, so its interrupt
 message sits in configuration space, out of the driver's reach (`docs/iommu.md`). On the T630 the
 driver does not use DMA yet (A6), so confinement there is untested.
+
+*(Note 2026-10-09: CLAUDE.md 6.4's note of 2026-10-08 records the T630 confining `00:01.1` with an
+arena - the Radeon HDMI audio controller, which is the device "Found while preparing" item 2 predicts a
+class-code lookup picks first. So on the T630 the confined audio device is not the analog Azalia at
+`00:09.2`, and what that confinement has been asked to carry is still untested.)*
 
 ## Step A4, first half: the protocol and the `audio` verbs (2026-10-03)
 

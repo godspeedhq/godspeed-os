@@ -27,9 +27,14 @@ time as a "does the file-cap model still hold end-to-end?" probe.
 | `fcap` | Run the self-check against an internal throwaway file. |
 | `fcap help` | Print usage. |
 | `fcap version` | Print the version (uniform across utilities). |
+| `fcap reuse` | Mint a file cap, restart `fs`, put a DIFFERENT file in the freed blocks, and prove the old cap reaches nothing (the stale-handle, confused-deputy question). Ends `fcap reuse: ok - ...`. |
+| `fcap gsreuse` | The same restart question asked through the standard library (`gs::fs` / `gs::cap`). |
 
 `fcap` takes **no path** - passing one is refused (`fcap: takes no argument …`). It uses its own
-hidden file (`/.fcap-selftest`) and removes it on exit, so it is leak-free and re-runnable.
+hidden files (`/.fcap-selftest`, then `/.fcap_append` and `/.fcap-gs`) and removes them, so it is
+leak-free and re-runnable. (`reuse` and `gsreuse` are NOT in `fcap help` and do not tab-complete,
+which `0_conventions.md` rules 2 and 9 require - a code defect, recorded here so the words are not
+discoverable only from the source.)
 
 ## 3. Output
 
@@ -43,6 +48,12 @@ fcap: fs refused write under read right (op<=right)
 fcap: forged handle rejected
 fcap: cap revoked after close
 fcap: cap revoked after rename
+fcap: opened append-only (file cap)
+fcap: append-only writes moving FORWARD accepted
+fcap: rewriting earlier bytes through an append-only cap DENIED
+fcap: a later forward write still accepted after the refusal
+fcap: gs::cap wrote and read the file THROUGH the capability
+fcap: gs::cap non-escalation holds - a READ cap cannot write
 fcap: all file-capability checks passed
 ```
 
@@ -61,6 +72,8 @@ The checks map one-to-one onto the §7.3 capability properties, applied to a *fi
 | fabricated handle rejected | **Unforgeable** - only the kernel mints valid caps; a made-up handle is not one. |
 | cap stale after **close** | **Revocable** - closing the file revokes the resource (generation bump); the next use is stale. |
 | cap stale after **rename** | **Revocable** on path rebinding - renaming revokes a still-open cap so it can never silently rebind to a different file later created at the old path (confused-deputy avoidance, §7.10). |
+| append-only cap: forward writes accepted, rewriting earlier bytes denied | An **append-only** right is enforced by `fs` against the resource's own high-water mark, and a refused write does not break it. |
+| the same through `gs::cap` | The standard library speaks the same protocol, on the same tag counter. |
 
 The unforgeable-badge detail: the right that authorises a file-cap invocation is carried to `fs`
 in an **unforgeable, kernel-set `Message` field**, not in the client's payload - so a client

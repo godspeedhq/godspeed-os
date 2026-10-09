@@ -11,7 +11,8 @@ mockup.
 The kernel comes up on all cores, spawns the supervisor directly, and the supervisor wires each
 service from its name-cap map. Here the USB stack has just enumerated a keyboard end to end, and the
 shell is ready. Boot output reaches the display through the kernel's own minimal framebuffer blit,
-which hands the screen to the `console` service once that service is up; the serial line keeps the
+which hands the screen to the `console` service when the kernel grants it the framebuffer at spawn;
+the serial line keeps the
 full log either way.
 
 ![GodspeedOS booting to steady state](images/boot.png)

@@ -9,13 +9,13 @@
 //! net-stack - the model-AGNOSTIC half of networking (docs/networking.md, Phase 2).
 //!
 //! nic-driver knows one NIC and speaks raw Ethernet frames; net-stack knows no hardware and speaks
-//! ARP/IPv4/ICMP/UDP over those frames. The seam between them is the **frame interface**: a
-//! request/reply (§8.2) where the request payload IS a frame to transmit and the reply payload IS the
-//! frame that came back. So the protocols live HERE, in net-stack, over raw frames - not in the
-//! driver. This is Commandment X: the driver is mechanism (put bytes on the wire), the protocol is
+//! ARP/IPv4/ICMP/UDP/DHCP/DNS/TCP over those frames. The seam between them is the **frame interface**:
+//! a request/reply (§8.2) where a multi-byte request payload IS a frame to transmit (answered with one
+//! status byte) and a one-byte request is an op - [3] status, [4] one received frame, [9] a batch of
+//! them. So the protocols live HERE, in net-stack, over raw frames - not in the driver. This is Commandment X: the driver is mechanism (put bytes on the wire), the protocol is
 //! policy (what the bytes mean), and they live in different services.
 //!
-//! Phase 2 progress:
+//! Phase 2 progress (history; UDP, the socket capability, DHCP, DNS and TCP have all landed since):
 //!  - step 1: ARP - resolve the QEMU user-net gateway (10.0.2.2) to its hardware address.
 //!  - step 2 (this commit): ICMP - PING the gateway. Build an ICMP echo request inside an IPv4 packet
 //!    inside an Ethernet frame (to the MAC ARP just resolved), send it THROUGH nic-driver, and read
@@ -54,12 +54,12 @@ fn ticks_ms(ctx: &ServiceContext, ms: u64) -> u64 {
 const FALLBACK_IP: [u8; 4] = [10, 0, 2, 15]; // used ONLY if DHCP returns no offer (no NIC)
 const GATEWAY_IP:  [u8; 4] = [10, 0, 2, 2];
 
-/// The 16-bit one's-complement checksum used by IPv4 and ICMP (RFC 1071): sum the 16-bit big-endian
-/// words, fold the carries, invert. The field being covered must be zero when this is computed.
 /// TCP lives in its own module: `docs/tcp-design.md` explains why, and it keeps the protocol
 /// separable from the request/response services around it.
 mod tcp;
 
+/// The 16-bit one's-complement checksum used by IPv4 and ICMP (RFC 1071): sum the 16-bit big-endian
+/// words, fold the carries, invert. The field being covered must be zero when this is computed.
 fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
@@ -162,17 +162,6 @@ const _: () = assert!(DNS_BUDGET_SECS < CLIENT_MIN_DEADLINE_SECS,
 /// Max ICMP echo DATA bytes `ping` will send (the Windows default is 32). Bounds the frame buffer.
 const PING_MAX_PAYLOAD: usize = 1024;
 
-/// Send a request to nic-driver and await the reply, RECOVERING from a nic-driver restart (audit M3).
-/// If the cached send cap has gone stale - nic-driver was killed and respawned (a real event:
-/// `chaos max-carnage nic-driver`), so its endpoint generation bumped - the first send fails and the
-/// deadline wait returns `None`. We then reacquire the driver by name from the kernel directory
-/// (§14.3, the same recovery `dhcp_discover`/`udp_roundtrip` already do in their loops) and retry once.
-/// Returns `None` only if the driver is genuinely absent or silent past the deadline. Use this for the
-/// FIRST request of each interactive path (`link_is_up`/`ping`/`dns`/`arp`); the poll-loop requests
-/// that follow reuse the now-reacquired cached cap. Without it a configured stack never self-heals
-/// after a driver restart on the ping/net/dns/arp surface - it needs a manual `net renew`. Because the
-/// reply is `request_with_reply` under the hood, a driver that dies mid-request wakes us with
-/// `ReplyDead` (never a hang), and the reacquire fixes a *stale* cap the fast-fail send exposes.
 /// A STATUS query (op 3: MAC + link), with the receive channel cleared first.
 ///
 /// Only status queries do this, and the distinction matters. When a `nic_req` times out its reply is
@@ -207,17 +196,21 @@ fn nic_status_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, 
     nic_req(ctx, pending, msg, secs)
 }
 
-// (The NIC_BUSY_MS / NIC_BUSY_TRIES pacing that lived here is GONE. It existed because a burst of
-// DHCP REQUESTs filled nic-driver's 16-deep queue faster than the driver was scheduled to drain it,
-// and a full queue meant a DROPPED frame the caller had to re-offer. `nic_req` now goes through the
-// kernel's `CallDeadline`, which BLOCKS the send until the peer has room rather than dropping it, so
-// there is nothing left to pace: congestion is handled by the primitive instead of by a retry loop
-// that could give up and report a frame as refused.)
-
 /// A busy nic-driver is congestion, not absence: back off briefly and re-ask, up to a bound.
+///
+/// (Note 2026-10-09: a comment here once said this pacing was GONE because `nic_req` went through the
+/// kernel's `CallDeadline`. `nic_req` does not - see `nic_req_inner` - and a full queue still comes back
+/// as `DeadlineOutcome::QueueFull`, which is what these two bound.)
 const NIC_BUSY_MS: u64 = 2;
 const NIC_BUSY_TRIES: u32 = 8;
 
+/// Send a request to nic-driver and await the reply, RECOVERING from a nic-driver restart (audit M3).
+/// If the cached send cap has gone stale - nic-driver was killed and respawned (a real event:
+/// `chaos max-carnage nic-driver`), so its endpoint generation bumped - the first attempt fails. We then
+/// reacquire the driver by name from the kernel directory (§14.3) and retry once; a timeout reacquires
+/// too (see `nic_req_inner`). Returns `None` only if the driver is genuinely absent or silent past the
+/// deadline. Without it a configured stack never self-heals after a driver restart on the
+/// ping/net/dns/arp surface - it needs a manual `net renew`.
 fn nic_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
     // Timed from the side that pays: an exchange with the NIC that takes over 300 ms is named with the
     // op it asked, because every client request that arrives meanwhile is held behind it.
@@ -238,7 +231,8 @@ fn nic_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i
 }
 
 fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
-    // `request_with_reply_deadline_outcome`, NOT the `Call` primitive. Switching this to `Call`
+    // A plain bounded request (`request_with_reply_deadline_sifted`, in `sifted_req`), NOT the `Call`
+    // primitive. Switching this to `Call`
     // during the x86 work is what stopped Pi 2 networking, and it was isolated by elimination on
     // hardware: with `Call`, nic-driver answers with an EMPTY status - no MAC, no link - so
     // net-stack never configures, DHCP never runs and every ping dies. Measured on the same board
@@ -671,20 +665,9 @@ impl Displaced {
     }
 }
 
-/// Phase 3: a DHCP DISCOVER over UDP - ask QEMU slirp's built-in DHCP server for our IP and read the
-/// OFFER. This proves the UDP transport (the layer the socket capability sits on) over the frame
-/// interface. Returns the offered IP, or None (no NIC / nothing answered). A real net-stack would use
-/// this to LEARN its own IP instead of hardcoding it; here it demonstrates the round-trip.
-/// Drain RX-ring batches ([9]) and call `on_frame` for each frame until it returns true (matched) or the
-/// deadline elapses. On a busy LAN the reply arrives amid a FLOOD of broadcast, so every path that waits
-/// for a specific reply must SCAN every frame, not take the one coupled frame back - the shared receive.
-/// Like `drain_scan`, but RETURNS whether the closure matched.
-///
-/// The captured-flag form (`let mut hit = false; drain_scan(.., |f| { hit = true; true }); if hit`)
-/// compiled away entirely for the DHCP ACK check: the branch and its log never reached the binary, so
-/// on hardware neither the success nor the failure line ever printed and the REQUEST looked as though
-/// it had never run. Returning the answer instead of writing it through a capture leaves nothing for
-/// that to happen to. Verified by grepping the built ELF for the log strings.
+/// While a dance waits on the wire, answer up to 16 queued client requests (the endpoint depth, §8.5)
+/// with `status` - a short "not configured yet" sentence - instead of leaving them to time out. `None`
+/// does nothing.
 fn serve_while_dancing(ctx: &ServiceContext, pending: &mut Displaced, serve_status: Option<&[u8; 19]>) {
     // `None` means this wait is NOT a dance - it is the ping or DNS path, reached while already
     // handling a client request. Serving there would be re-entrant, so it does not.
@@ -696,6 +679,16 @@ fn serve_while_dancing(ctx: &ServiceContext, pending: &mut Displaced, serve_stat
         let _ = gs::ipc::reply(ctx, reply, &Message::from_bytes(status));
     }
 }
+
+/// Like `drain_scan`, but RETURNS whether the closure matched.
+///
+/// The captured-flag form (`let mut hit = false; drain_scan(.., |f| { hit = true; true }); if hit`)
+/// compiled away entirely for the DHCP ACK check: the branch and its log never reached the binary, so
+/// on hardware neither the success nor the failure line ever printed and the REQUEST looked as though
+/// it had never run. Returning the answer instead of writing it through a capture leaves nothing for
+/// that to happen to. Verified by grepping the built ELF for the log strings. (Note 2026-10-09:
+/// `dhcp_request`'s own comment later found the cause - an out-of-bounds frame index the compiler
+/// could prove, which deleted everything after it - and fixed it.)
 fn drain_scan_hit(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_status: Option<&[u8; 19]>,
                   mut on_frame: impl FnMut(&[u8], &mut Displaced) -> bool) -> bool {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
@@ -776,6 +769,9 @@ const RX_POLL_PACE_MS: u64 = 10;
 /// length, not a 10 ms one.
 const EMPTY_YIELDS: u32 = 12;
 
+/// Drain RX-ring batches ([9]) and call `on_frame` for each frame until it returns true (matched) or the
+/// deadline elapses. On a busy LAN the reply arrives amid a FLOOD of broadcast, so every path that waits
+/// for a specific reply must SCAN every frame - the shared receive.
 fn drain_scan(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_status: Option<&[u8; 19]>,
               mut on_frame: impl FnMut(&[u8], &mut Displaced) -> bool) {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
@@ -978,6 +974,9 @@ fn dhcp_lease(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6],
     Some(cfg)
 }
 
+/// DHCP DISCOVER, then for the first OFFER the REQUEST that claims it (`dhcp_request`), up to
+/// `DANCE_TRIES` times. Returns `(address, gateway, dns server)` once an address is ACKed, or None (no
+/// NIC, nothing answered, or no offer acknowledged). `bcast` sets the BOOTP broadcast flag (`dhcp_lease`).
 fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6], bcast: bool,
                  serve_status: Option<&[u8; 19]>) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
     let mut send_fail = 0u32;
@@ -1041,15 +1040,15 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
                     if opt == 6 && len >= 4 && o + 6 <= f.len() { dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; have_dns = true; }
                     // Option 54, the SERVER IDENTIFIER. A REQUEST must name the server whose offer it
                     // is accepting, or every DHCP server on the segment has to guess whether it was
-                    // chosen. We never sent a REQUEST at all, so this was never needed - and never
-                    // read.
+                    // chosen. Until `dhcp_request` existed we never sent a REQUEST at all, so this was
+                    // never needed - and never read.
                     if opt == 54 && len >= 4 && o + 6 <= f.len() { srv = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; }
                     o += 2 + len;
                 }
                 if !have_dns { dns = gw; }            // no DNS option: the gateway usually forwards DNS
-                // WHAT DID WE ACTUALLY GET? Placed in THIS closure deliberately: it is the one that
-                // demonstrably survives optimisation, where the same logging inside `dhcp_request`
-                // does not reach the binary at all.
+                // WHAT DID WE ACTUALLY GET? Placed in THIS closure when the logging inside
+                // `dhcp_request` did not reach the binary at all (the out-of-bounds index its own
+                // comment describes, since fixed).
                 //
                 // Three unknowns, one line: the frame LENGTH (the option walk starts at offset 282, so
                 // anything shorter than 284 means options are unreachable and every option-derived
@@ -1103,10 +1102,10 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
     None
 }
 
-/// Resolve a hostname to an IPv4 address via DNS (UDP to slirp's resolver at 10.0.2.3). Builds a
+/// Resolve a hostname to an IPv4 address via DNS (UDP to `dns_server`, through the gateway). Builds a
 /// standard A-record query, sends it THROUGH nic-driver, and parses the first A answer. Returns the
-/// IP, or None (no gateway, malformed name, or no answer - DNS depends on the host's resolver, which
-/// slirp forwards to, so a failure here is a real "no answer", not a bug).
+/// IP, or None (no gateway, malformed name, or no answer).
+///
 /// Resolve `hostname`, giving up once `budget_ms` has passed, whatever state it is in.
 ///
 /// **The deadline comes from the CLIENT, not from a constant here.** Every request carries its
@@ -1130,7 +1129,7 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
     // The whole exchange, the query's send included, runs against this one clock.
     let mut deadline = Deadline::paced(ctx, Budget::ms(budget_ms), Budget::ms(RX_POLL_PACE_MS));
     let mut frame = [0u8; 512];
-    // Ethernet: to the gateway; slirp routes the datagram to its DNS at 10.0.2.3.
+    // Ethernet: to the gateway, which routes the datagram on to `dns_server`.
     frame[0..6].copy_from_slice(gw_mac);
     frame[6..12].copy_from_slice(our_mac);
     frame[12] = 0x08; frame[13] = 0x00;              // IPv4
@@ -1177,7 +1176,7 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
     frame[38] = (udp_len >> 8) as u8; frame[39] = udp_len as u8;
 
     // Send THROUGH nic-driver, bounded + retrying past stray frames (Stage B: never block on a busy/
-    // silent driver). Match the reply to OUR query: a UDP packet to our source port 5353 (0x14e9).
+    // silent driver). Match the reply to OUR query: a UDP packet to our source port 49153 (0xc001).
     // Send the query ONCE, then RX-ONLY poll ([4]) for subsequent frames - so a reply arriving BEHIND
     // stray broadcasts on a busy LAN is caught WITHOUT re-transmitting (a re-TX drains+discards it).
     let req     = Message::from_bytes(&frame[..frame_len]);
@@ -1320,8 +1319,6 @@ const COP_CLOSE: u8 = 2;
 /// Connection: report state, bytes readable, and bytes unacknowledged - without moving any of it.
 const COP_STAT: u8 = 3;
 
-/// Send a UDP datagram (src_port -> dest_ip:dest_port carrying `data`) THROUGH nic-driver and copy the
-/// response's UDP payload into `out`. Returns the payload length, or None (no gateway / no reply).
 /// Build one UDP datagram from `src_port` to `dest_ip:dest_port`, addressed through `gw_mac`, into `frame`.
 /// Returns the frame's length. The UDP checksum is left zero, which IPv4 permits.
 fn build_udp(frame: &mut [u8; 1600], gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
@@ -1346,6 +1343,8 @@ fn build_udp(frame: &mut [u8; 1600], gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac
     42 + dlen
 }
 
+/// Send a UDP datagram (src_port -> dest_ip:dest_port carrying `data`) THROUGH nic-driver and copy the
+/// response's UDP payload into `out`. Returns the payload length, or None (no gateway / no reply).
 fn udp_roundtrip(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6],
                  src_port: u16, dest_ip: &[u8; 4], dest_port: u16, data: &[u8], out: &mut [u8]) -> Option<usize> {
     let mut frame = [0u8; 1600];
@@ -1427,7 +1426,8 @@ const TCP_STEPS: usize = 20_000;
 /// traffic until its phase 2/3 land: net-stack serves clients and receives nic-driver replies on ONE
 /// untagged endpoint, so a background poll consumes client messages. That makes a BACKGROUND TCP
 /// engine a prerequisite-blocked change, and it is recorded as the next step rather than smuggled in
-/// here.
+/// here. (Note 2026-10-09: phases 2 and 3 have since landed, and `poll_step` now lets every live
+/// connection progress between requests; this function is still the client-driven transaction.)
 ///
 /// What is not blocked is driving the same state machine from inside a request, which is exactly how
 /// `udp_roundtrip` and `ping` already work and opens no window that is not already open. So this
@@ -1454,8 +1454,8 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
     t.tx_n = 0; t.tx_log = [0u8; 24];
     let i = match t.connect(ctx, 1, dst, dport, net.peer_mac) { Some(i) => i, None => return Err(tcp::Fault::None) };
 
-    // The opening SYN. Sent through the same path every other frame uses, and its reply may already
-    // carry the SYN-ACK - nic-driver answers a TX with whatever it has received.
+    // The opening SYN. Sent through the same path every other frame uses; the SYN-ACK comes back
+    // through the drain below, since nic-driver answers a TX with one status byte and no frame.
     let n = t.syn_frame(ctx, net, i, &mut frame);
     if n > 0 {
         t.stat_sent = t.stat_sent.saturating_add(1);
@@ -1573,13 +1573,6 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
     true
 }
 
-/// Feed a DRAIN BATCH (op 9) into the state machine.
-///
-/// A drain reply is `[count, (len_u16_le, frame) x count]` - NOT a bare frame. Treating it as one is
-/// what made the first end-to-end run fail with the peer retransmitting its SYN-ACK six times while
-/// this stack sat in SynSent: the segment arrived every time and was parsed as garbage every time.
-/// The pcap is what made that readable, because the guest's own log could only say "nothing came".
-/// The batch shape is `drain_scan`'s, and it is read the same way here rather than re-derived.
 /// How often the serve loop wakes to answer for itself when no client is asking.
 ///
 /// A hundred milliseconds. The things it has to be quick enough for are an ARP request (a peer
@@ -1605,8 +1598,8 @@ const POLL_TX_MS: u64 = 200;
 /// The whole poll step's budget. Checked between frames, so the step stops issuing new work once it
 /// is spent rather than running to completion however long that takes.
 ///
-/// Half a second: long enough for a few frames on a slow driver, and a tenth of the five seconds a
-/// client waits before it gives up. The failure this exists to prevent is a poll outlasting the
+/// A quarter of a second (it was half a second; see the budget ordering below): long enough for a few
+/// frames on a slow driver, and well inside any client's deadline. The failure this exists to prevent is a poll outlasting the
 /// request it is keeping waiting.
 const POLL_BUDGET_MS: u64 = 250;
 
@@ -1654,8 +1647,8 @@ const _: () = assert!(POLL_BUDGET_MS < HOLD_MS,
 
 /// One bounded pass of work nobody asked for: drain the NIC once and answer for ourselves.
 ///
-/// **This is the tick that was reverted, and it is only safe to bring back now.** The revert note in
-/// this file says why it went: net-stack serves clients and receives driver replies on one endpoint,
+/// **This is the tick that was reverted, and it is only safe to bring back now.** The revert note at
+/// the top of the serve loop says why it went: net-stack serves clients and receives driver replies on one endpoint,
 /// so anything that talked to the driver unasked stole client messages, and a once-a-second tick
 /// turned a latent race into a permanent one. `docs/net-tags-design.md` set the precondition in
 /// capitals - do not add a tick before the correlation is fixed. Phase 2 (sifting) and phase 3 (the
@@ -1779,6 +1772,13 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     any
 }
 
+/// Feed a DRAIN BATCH (op 9) into the state machine.
+///
+/// A drain reply is `[count, (len_u16_le, frame) x count]` - NOT a bare frame. Treating it as one is
+/// what made the first end-to-end run fail with the peer retransmitting its SYN-ACK six times while
+/// this stack sat in SynSent: the segment arrived every time and was parsed as garbage every time.
+/// The pcap is what made that readable, because the guest's own log could only say "nothing came".
+/// The batch shape is `drain_scan`'s, and it is read the same way here rather than re-derived.
 #[inline(never)]
 fn feed_batch(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
     let m = match reply { Some(m) => m, None => return false };
@@ -1798,8 +1798,9 @@ fn feed_batch(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
     any
 }
 
-/// Feed the reply to a TRANSMISSION, which carries at most one raw frame (the shape
-/// `udp_roundtrip` already relies on).
+/// Feed the reply to a TRANSMISSION into the state machine. (Note 2026-10-09: that reply carried at
+/// most one raw frame when this was written; `nic-driver` now answers a transmit with one status byte,
+/// so this feeds nothing - a frame arrives only through the drain, `feed_batch`.)
 #[inline(never)]
 fn feed_tx(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
     match reply {
@@ -1932,15 +1933,6 @@ impl UdpAsks {
     }
 }
 
-/// Send an ICMP echo request to `dest_ip` (via the gateway's MAC) and return true if the matching echo
-/// REPLY comes back. Used to probe the gateway (LAN) and a public IP (internet reachability through NAT).
-/// If `f` is an inbound ARP REQUEST for `our_ip`, build the matching ARP REPLY into `out` and return
-/// true. net-stack MUST answer these: once the gateway's ARP entry for us (the OUR_MAC we advertise)
-/// ages out it re-ARPs before it can address our UNICAST replies - stay silent and it only ever reaches
-/// us with broadcasts, so the echo/DNS reply never arrives (exactly the T630 serve-loop symptom: 20
-/// frames collected, all broadcast, no reply). This fires ONLY when someone is actively asking for us,
-/// so on QEMU (slirp already learned us from our own query) it emits nothing - which is why it is safe
-/// where a blind gratuitous ARP before every query was not.
 /// Turn an inbound ICMP ECHO REQUEST addressed to us into the echo REPLY. Returns its length, or 0
 /// if `f` is not an echo request for this machine.
 ///
@@ -1981,6 +1973,13 @@ fn build_icmp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8
     flen
 }
 
+/// If `f` is an inbound ARP REQUEST for `our_ip`, build the matching ARP REPLY into `out` and return
+/// true. net-stack MUST answer these: once the gateway's ARP entry for us (the MAC we advertise)
+/// ages out it re-ARPs before it can address our UNICAST replies - stay silent and it only ever reaches
+/// us with broadcasts, so the echo/DNS reply never arrives (exactly the T630 serve-loop symptom: 20
+/// frames collected, all broadcast, no reply). This fires ONLY when someone is actively asking for us,
+/// so on QEMU (slirp already learned us from our own query) it emits nothing - which is why it is safe
+/// where a blind gratuitous ARP before every query was not.
 fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8; 42]) -> bool {
     if f.len() < 42 { return false; }
     if f[12] != 0x08 || f[13] != 0x06 { return false; }              // not ARP
@@ -2194,9 +2193,9 @@ fn calibrate_tsc_hz(ctx: &ServiceContext) -> u64 {
 /// Send one ICMP echo of `payload_len` data bytes to `dest_ip` and wait for the reply. Returns
 /// `Some((rtt_us, reply_ttl))` on an echo reply, `None` on timeout. The round trip is timed with the TSC
 /// and converted to microseconds via `tsc_hz` (RTC-calibrated; 0 -> reported as 0).
-/// Sends ONCE (the reply arrives with it), then, if the first frame back was a stray broadcast, drains a
-/// BATCH of frames in ONE bounded [9] round-trip and scans it - so a reply behind broadcasts on a busy
-/// LAN is caught without N slow re-queries (which pushed net-stack past the shell's deadline).
+/// Sends ONCE, then drains BATCHES of frames ([9]) and scans each until the reply window closes - so a
+/// reply behind broadcasts on a busy LAN is caught without N slow re-queries (which pushed net-stack past
+/// the shell's deadline).
 fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip: &[u8; 4], our_mac: &[u8; 6], dest_ip: &[u8; 4],
         payload_len: usize, seq: u16, tsc_hz: u64, frames: &mut u16, timeouts: &mut u16) -> Option<(u16, u8)> {
     let plen = payload_len.min(PING_MAX_PAYLOAD);
@@ -2527,16 +2526,11 @@ fn run_dance(ctx: &ServiceContext, pending: &mut Displaced, serve_status: Option
     NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status }
 }
 
-/// Read the NIC link state from nic-driver's `[3]` status. RTL8168: byte 7 = link up. On the QEMU e1000
-/// path the reply is short (no link byte) - a non-empty reply means "up" (slirp's virtual link is always
-/// up). Cheap; lets net-stack notice a cable plugged in after boot and self-configure without `net renew`.
-
-
 /// Announce a cable coming or going on the CONSOLE, the way the USB drivers announce a keyboard or a
 /// stick. Same idea, same place on screen, so "something was plugged in" reads the same whatever it was.
 ///
-/// Uses `console_write` only, NOT `console_push`. That distinction is the whole security story here:
-/// `console_write` is gated on LOG_WRITE, which this service already holds, while `console_push`
+/// Uses `gs::io::print` (ConsoleWrite) only, NOT `console_push`. That distinction is the whole security
+/// story here: ConsoleWrite is gated on LOG_WRITE, which this service already holds, while `console_push`
 /// injects into the shell's INPUT ring and puts its holder inside the shell's trust perimeter (§6.4,
 /// SEC-2 - keystrokes are commands). A network service has no business holding that, so the newline
 /// goes inside the written string instead of being pushed. No new authority for a cosmetic feature.
@@ -2558,35 +2552,6 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
 ");
 }
 
-/// Ask `nic-driver` for waiting frames, and PACE AN EMPTY ANSWER.
-///
-/// Three drain loops asked for frames as fast as the replies came back - one IPC round trip per
-/// iteration, tens of thousands inside a ~900 ms ping window. That fills the driver's 16-deep queue
-/// and costs both services a large slice of the core they share with `fs` and `block-driver`.
-/// Observed on hardware as `nic-driver` at 50% with a full queue, which is what a flood looks like
-/// from the receiving end. The user saw it in `observe` before any test did.
-///
-/// Only the EMPTY case pauses. A drain that returned frames goes straight back for more, so a busy
-/// link is never slowed and a measured RTT is unaffected beyond the last idle millisecond. The
-/// request rate falls from tens of thousands per window to about nine hundred.
-///
-/// RECORDED AS A COMPROMISE, not presented as the answer (26.7, Commandment VIII): a frame arriving
-/// is truth and a millisecond is not. The honest fix is for `nic-driver` to notify on RX so this can
-/// BLOCK instead of ask, which needs a protocol addition and is real work rather than a constant.
-/// Living in one helper means that change lands in one place, and that a fourth drain loop cannot
-/// quietly reintroduce the flood.
-/// `nic_drain`, bounded in MILLISECONDS so it can fit inside a sub-second window.
-///
-/// The ping window is ~900 ms and cycle-based; this call was bounded by `LINK_SECS = 1` on the
-/// WHOLE-SECOND clock, so ONE drain could outlast the entire window. It did: the Pi 4 reported
-/// `closed after 1017663 us [budget 900000 us]` with `0 drains` - that counter increments after the
-/// deadline check, so zero means the loop completed exactly one pass and that pass ate the budget.
-/// Ping paces at 1 s, so a window running 1.018 s misses about every third reply, which reads as a
-/// flaky network and is arithmetic.
-///
-/// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
-/// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
-/// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
 /// A frame request bounded in MILLISECONDS, for work this service does unasked.
 ///
 /// `nic_req` waits `LINK_SECS` (one second) and retries, so a single call can hold this service for
@@ -2608,6 +2573,18 @@ fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: 
     })
 }
 
+/// `nic_drain`, bounded in MILLISECONDS so it can fit inside a sub-second window.
+///
+/// The ping window is ~900 ms and cycle-based; this call was bounded by `LINK_SECS = 1` on the
+/// WHOLE-SECOND clock, so ONE drain could outlast the entire window. It did: the Pi 4 reported
+/// `closed after 1017663 us [budget 900000 us]` with `0 drains` - that counter increments after the
+/// deadline check, so zero means the loop completed exactly one pass and that pass ate the budget.
+/// Ping paces at 1 s, so a window running 1.018 s misses about every third reply, which reads as a
+/// flaky network and is arithmetic.
+///
+/// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
+/// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
+/// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
 fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Option<Message> {
     // SIFTED, like every other conversation with the driver. This was the last unsifted one, and it
     // is on the ping and TCP paths - the busiest moment in this service, and so the likeliest moment
@@ -2621,6 +2598,18 @@ fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Optio
     })
 }
 
+/// Ask `nic-driver` for waiting frames (op 9). The PACING of an empty answer is the caller's.
+///
+/// Three drain loops once asked for frames as fast as the replies came back - one IPC round trip per
+/// iteration, tens of thousands inside a ~900 ms ping window. That fills the driver's 16-deep queue
+/// and costs both services a large slice of the core they share with `fs` and `block-driver`.
+/// Observed on hardware as `nic-driver` at 50% with a full queue, which is what a flood looks like
+/// from the receiving end. The user saw it in `observe` before any test did. This helper slept on an
+/// empty answer then; each drain loop now paces its own empty polls instead (see the note below).
+///
+/// RECORDED AS A COMPROMISE, not presented as the answer (26.7, Commandment VIII): a frame arriving
+/// is truth and a millisecond is not. The honest fix is for `nic-driver` to notify on RX so this can
+/// BLOCK instead of ask, which needs a protocol addition and is real work rather than a constant.
 fn nic_drain(ctx: &ServiceContext, pending: &mut Displaced) -> Option<Message> {
     let r = nic_req(ctx, pending, &Message::from_bytes(&[9u8]), LINK_SECS);
     let empty = match r.as_ref() {
@@ -2632,6 +2621,10 @@ fn nic_drain(ctx: &ServiceContext, pending: &mut Displaced) -> Option<Message> {
     // outstanding every millisecond not spent asking is a millisecond of frames its FIFO drops.
     r
 }
+
+/// Read the NIC link state from nic-driver's `[3]` status: byte 7 = link up. Every backend answers at
+/// least eight bytes now; a shorter non-empty reply is still read as "up". Cheap; lets net-stack notice
+/// a cable plugged in after boot and self-configure without `net renew`.
 fn link_is_up(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
     match nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS) {
         Some(r) => { let p = r.payload_bytes(); if p.len() > 7 { p[7] != 0 } else { !p.is_empty() } }
@@ -2652,7 +2645,8 @@ fn link_is_up(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
 }
 
 /// The link's state, address and carrier from one status query: `(up, mac, radio)`, `radio` true when
-/// the Pi 4's genet backend says the radio carries the link. `None` is a timeout or an unreadable
+/// a backend with a radio bridge (`radio::status` in nic-driver - GENET, dwmac, the RTL8168 and the
+/// Pi 2's) says the radio carries the link. `None` is a timeout or an unreadable
 /// answer, not a reading - the caller must not act on it.
 fn link_addr(ctx: &ServiceContext, pending: &mut Displaced) -> Option<(bool, [u8; 6], bool)> {
     let r = nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS)?;
@@ -2776,6 +2770,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // dance the moment a cable appears, so a machine booted unplugged configures itself on plug-in
     // rather than needing `net renew` or a reboot. Cheap too - one status query to the NIC, seconds
     // saved on every diskless-network boot.
+    // (Superseded by the paragraph after this one - the boot dance is back, and serves while it runs.)
     // SERVE FIRST, CONFIGURE FROM INSIDE THE LOOP. This used to run the whole DHCP -> ARP -> ICMP
     // dance HERE, before the serve loop existed - so on a machine whose link is up but whose DHCP
     // server never answers, net-stack was DEAF for the ~45 s its budgets take. Nothing could reach it:
@@ -2870,7 +2865,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // request into the stash - `pending.take()` at the top of this loop is the only thing that
     // drains it. See the `has_work` call site.
     'serve: loop {
-        // A BARE BLOCK, deliberately - the idle tick that was here is REVERTED (audit A10-1/A5-2).
+        // THE IDLE TICK THAT WAS HERE WAS REVERTED (audit A10-1/A5-2). (Note 2026-10-09: it came back
+        // as `poll_step`, driven from the wait below, once the correlation this note asks for was in -
+        // see `poll_step`'s doc. What follows is why it went.)
         //
         // The tick called `link_is_up()` every second to announce a cable, and that goes through
         // `nic_req` -> a wait loop that `try_recv`s THIS SAME serve endpoint and returns whatever
@@ -3393,8 +3390,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     "net-stack: a capability invocation named resource {} which is not a listener,                      a connection or a socket here - answering empty", rid));
             }
 
-            // Socket-cap invocation - SOP_SEND: transmit a UDP datagram through this socket. Payload =
-            // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload (empty on none).
+            // Socket-cap invocation: transmit a UDP datagram through this socket. Payload =
+            // [dest_ip(4), dest_port(2), data...]. Reply = the response's UDP payload, or `[0]` on none.
             // Sending needs WRITE; the kernel already checked the cap holds `right`, we enforce op<=right.
             let mut resp = [0u8; 1500];
             let n = if right & RIGHT_WRITE != 0 && pl.len() >= 6 && gw_known {
@@ -3481,7 +3478,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // Driven inside the request, not from a background poll, because
             // `docs/net-tags-design.md` forbids unsolicited driver traffic until its phase 2/3 land.
-            // That is the next step and it is recorded, not smuggled in here.
+            // That is the next step and it is recorded, not smuggled in here. (Note 2026-10-09: both
+            // phases have landed and `poll_step` drives live connections between requests; this op is
+            // still the one-shot transaction.)
             // 3 KiB, not 1.4 KiB: a reply that fits in ONE segment never exercises the receive
             // path's reassembly, window updates or ACK-driven advancement. The Message ceiling is
             // 4 KiB (§8.5), so this leaves headroom while guaranteeing more than one segment.
@@ -3640,7 +3639,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         } else if pl.first() == Some(&3) && pl.len() >= 5 {
             // Ping an IP (byte 0 = 3, then 4 IP bytes, then an OPTIONAL le-u16 payload size): ICMP echo,
             // no DNS. Runs HERE in the serve loop, so `ping <gateway>` proves the post-boot request path
-            // and `ping 8.8.8.8` probes the internet. Reply: [alive, rtt_ms(le u16), reply_ttl].
+            // and `ping 8.8.8.8` probes the internet. Reply: [alive, rtt_us(le u16), reply_ttl].
             let dip = [pl[1], pl[2], pl[3], pl[4]];
             let bytes = if pl.len() >= 7 { u16::from_le_bytes([pl[5], pl[6]]) as usize } else { 32 };
             // Check the link FIRST. With the cable out, an ICMP polls its FULL budget (~seconds) and the

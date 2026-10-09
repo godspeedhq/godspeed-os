@@ -72,7 +72,9 @@ pub const RTO_MAX_MS: u64 = 8_000;
 /// retry loop with no limit is an unbounded wait wearing a disguise (§26.6).
 pub const MAX_RETX: u8 = 6;
 /// Frames drained and connections advanced per poll step. One busy connection must not starve the
-/// serve path, so the poll step's cost has a ceiling like everything else.
+/// serve path, so the poll step's cost has a ceiling like everything else. (Note 2026-10-09: nothing
+/// reads this constant. `poll_step` in main.rs is bounded instead by one drain - at most the driver's
+/// batch of eight frames - and by `POLL_BUDGET_MS`.)
 pub const POLL_FRAMES: usize = 8;
 
 // ── Wire constants ─────────────────────────────────────────────────────────────────────────────
@@ -538,9 +540,6 @@ pub fn emit(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8;
 
 // ── The connection table and the state machine ─────────────────────────────────────────────────
 
-/// Everything TCP owns. Passed by `&mut` from `service_main` rather than living in a static, because
-/// a service may hold no unowned global mutable state (Commandment VI, and `VI-static-mut` enforces
-/// it). That also makes the footprint honest: this struct IS the memory cost of TCP here.
 /// A port this machine answers on.
 ///
 /// **Deliberately not a `Conn`.** BSD gives a listener a full socket and so does most of the
@@ -566,6 +565,9 @@ impl Listener {
 /// segment that matches no connection.
 pub const MAX_LISTEN: usize = 2;
 
+/// Everything TCP owns. Passed by `&mut` from `service_main` rather than living in a static, because
+/// a service may hold no unowned global mutable state (Commandment VI, and `VI-static-mut` enforces
+/// it). That also makes the footprint honest: this struct IS the memory cost of TCP here.
 pub struct Tcp {
     pub conns: [Conn; MAX_CONNS],
     /// Ports this machine answers on. See `Listener`.
@@ -656,9 +658,9 @@ impl Tcp {
         self.tx_n += 1;
     }
 
-    /// Any connection not closed. The serve loop uses this to decide whether it may block in
-    /// `recv()` (nothing to poll) or must use a bounded wait - so TCP costs nothing at all when it
-    /// is not in use.
+    /// Any connection not closed. (Note 2026-10-09: written for the serve loop to decide whether it
+    /// may block in `recv()`; nothing calls it now - the loop blocks only while unconfigured or
+    /// without a clock, and otherwise polls every `POLL_MS`.)
     pub fn active(&self) -> bool { self.conns.iter().any(|c| c.state != State::Closed) }
 
     pub fn by_rid(&mut self, rid: u64) -> Option<&mut Conn> {
@@ -1180,12 +1182,11 @@ pub struct Net {
 }
 
 impl Tcp {
-    /// Handle one inbound frame. Returns the length of a frame to transmit in `out`, or 0.
-    ///
-    /// Exactly one segment may be emitted per inbound segment, and it is always an ACK (or a RST).
-    /// DATA is never sent from here - that is `poll_one`'s job - which keeps "react to the peer" and
-    /// "make our own progress" separable, and means a flood of inbound segments cannot make this
-    /// function do unbounded work.
+    /// Handle one inbound frame. Always returns 0 and writes nothing to `out`: nothing is transmitted
+    /// from here (see `ack_due`). What the segment obliges us to send - an acknowledgement, a SYN-ACK -
+    /// is RECORDED, and `poll_one` sends it, which keeps "react to the peer" and "make our own
+    /// progress" separable, and means a flood of inbound segments cannot make this function do
+    /// unbounded work.
     pub fn on_frame(&mut self, ctx: &ServiceContext, net: &Net, f: &[u8], out: &mut [u8]) -> usize {
         self.stat_seen = self.stat_seen.saturating_add(1);
         let seg = match parse(f) { Some(s) => s, None => return 0 };
@@ -1597,9 +1598,9 @@ impl Tcp {
 
         // ---- the acknowledgement owed from the last inbound segment ----
         //
-        // FIRST, before retransmission or new data: the peer is waiting on this to complete its
-        // handshake or to release its window, and anything else we might send is less urgent than
-        // the thing it is blocked on.
+        // Before new data (a retransmission that was due has already gone out above): the peer is
+        // waiting on this to complete its handshake or to release its window, and anything else we
+        // might send is less urgent than the thing it is blocked on.
         if c.ack_due {
             c.ack_due = false;
             let w = c.window();

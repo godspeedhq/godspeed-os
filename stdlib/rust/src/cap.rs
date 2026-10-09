@@ -40,16 +40,22 @@ use godspeed_sdk::service_context::ServiceContext;
 
 use crate::error::Error;
 
-/// Read the file's contents.
+/// Read from the resource (CLAUDE.md 7.4) - a file's contents, a socket's datagrams.
 pub const READ: u8 = 1 << 0;
 
-/// Write the file's contents.
+/// Write to the resource (CLAUDE.md 7.4) - a file's contents, a socket's datagrams.
 pub const WRITE: u8 = 1 << 1;
 
-/// Write only PAST the end of what is already there: an append-only capability.
+/// Ask `fs` for an append-only capability: writes through it may only move FORWARD.
 ///
-/// Enforced by `fs` against the file's size at the moment of the write, so a holder cannot read the
-/// size, decide to overwrite, and send the old offset.
+/// **A flag in `fs`'s OPEN request, not a kernel right** - the kernel's rights are bits 0-5, and
+/// this bit never reaches it: `fs` mints an ordinary WRITE capability and records the restriction
+/// against the resource. Do not pass it where a kernel right is expected.
+///
+/// Enforced by `fs` against a HIGH-WATER MARK - the furthest offset written through this
+/// capability - not against the file's size: a write below the mark is refused
+/// ([`Error::PermissionDenied`](crate::Error)). The first write may land anywhere, so this does not
+/// protect content that existed before the open, and a fresh open starts a fresh mark.
 pub const APPEND: u8 = 1 << 6;
 
 /// Transfer this capability onward (CLAUDE.md 7.4).
@@ -97,9 +103,14 @@ impl From<CapHandle> for Cap {
 /// Acquire a SEND capability to a service, by name, from the kernel's name directory.
 ///
 /// This is how a client finds a service it was not wired to at spawn, and how it finds the NEW
-/// instance after one died (CLAUDE.md 14.2). It is gated: a service that was not granted the
-/// authority to acquire by name gets nothing, which is what stops name resolution being an ambient
-/// back door around the contract.
+/// instance after one died (CLAUDE.md 14.2). It is gated: the kernel answers only for a name that
+/// was among the send peers in this task's spawn request, or for a task holding the broad
+/// `ACQUIRE_ANY` authority (the shell, the supervisor, test probes). That is what stops name
+/// resolution being an ambient back door around the spawn grant.
+///
+/// [`Error::NotFound`] covers every refusal alike: a name this task may not acquire, a name not
+/// (yet, or currently) registered - a peer mid-restart is the common case - and a full capability
+/// table. The SDK call returns no reason to tell them apart.
 pub fn acquire(ctx: &ServiceContext, name: &str) -> Result<Cap, Error> {
     match ctx.acquire_send_cap(name) {
         Some(h) => Ok(Cap(h)),

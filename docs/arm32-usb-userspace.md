@@ -1,7 +1,7 @@
 # Taking the DWC2 USB stack out of the arm32 kernel
 
-> **Status: DONE.** `kernel/src/arch/arm/dwc2.rs` no longer exists, and `services/dwc2` (6173 lines
-> across its modules) drives the controller from userspace on `USB_VECTOR`. Keyboard, mass storage
+> **Status: DONE.** `kernel/src/arch/arm/dwc2.rs` no longer exists, and `services/dwc2` (7212 lines
+> across its modules on 2026-10-09) drives the controller from userspace on `USB_VECTOR`. Keyboard, mass storage
 > and LAN9514 networking all run through it on real hardware. The constitution records the move in
 > its 2026-08-17 amendment (§6.4).
 >
@@ -145,7 +145,7 @@ Each rung is therefore a working machine with FEWER DEVICES, which is testable a
 | **3c** | `block-driver` moves off the `usb_disk_*` syscalls to the block IPC protocol it already speaks on the Pi 4 | ✅ **hardware-verified 2026-08-12** - `drives` shows the GSFS volume, served over IPC |
 | **4a** | Find + configure the USB ethernet (LAN9514) | ✅ **hardware-verified 2026-08-12** - `bulk IN 1 OUT 2 mps 512`, matching the kernel driver |
 | **4b** | Frame TX/RX over the bulk endpoints; `nic-driver` moves off `NET_DEVICE` (42-44) to frame IPC | ✅ **HW-verified, ZERO packet loss** - DHCP, ARP, internet `ping`; 56 replies, 0 timeouts (tag `pi2-net-zero-loss`) |
-| **5** | Delete `arch/arm/dwc2.rs` and the tick hooks | ✅ **done** - the in-kernel DWC2 driver (3,981 lines) and the shared HID decoder (241) are both deleted, and the tick hooks with them; §6.4 amended 2026-08-17. The six syscall arms remain, answering "no device" |
+| **5** | Delete `arch/arm/dwc2.rs` and the tick hooks | ✅ **done** - the in-kernel DWC2 driver (3,981 lines) and the shared HID decoder (241) are both deleted, and the tick hooks with them; §6.4 amended 2026-08-17. The seven syscall arms (`NetFrameTx`/`NetFrameRx`/`NetInfo` and the four `UsbDisk*`) remain, answering "no device" |
 
 ### Two things to decide deliberately rather than inherit
 
@@ -709,6 +709,12 @@ Known costs, recorded rather than hidden:
   rather than a syscall. Bounded, but 8x the crossings per empty read. If this shows up in throughput
   the answer is the same one slice 3c reached for the disk: let the SERVICE wait, and reply once.
 - `OP_NET_INFO` reports link UP unconditionally; the PHY is not read yet.
+
+> **Note 2026-10-09: both costs above are closed.** `RX_TRIES` is now 1 (`services/nic-driver/src/main.rs`:
+> the bulk IN is armed continuously, so a second poll in one request could not make a frame arrive
+> sooner), and `OP_NET_INFO` reports the PHY's own link bit, an unreadable PHY counting as down
+> (`services/dwc2/src/net.rs`). The degraded-path log line below now reads `no usb-net device YET -
+> serving empty replies and re-probing every request`.
 
 QEMU (release, `--usbnet`): boots to `gsh>`, supervisor ready, `fs` serving, and with no `dwc2` service
 spawned `nic-driver` logs `no usb-net device - serving empty replies (net degrades, not hangs)` and

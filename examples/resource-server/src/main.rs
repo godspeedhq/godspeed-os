@@ -17,17 +17,15 @@
 //! does (Commandment III, §4.4). `services/fs` is this pattern grown up: its resource IS a
 //! file, minted on Open and revoked on delete.
 //!
-//! Minting is GATED (Commandment VII, §7.10): `resource_mint` needs a RESOURCE_MINT
-//! authority, granted BY NAME inside the kernel only to authorized minters like `fs` - the
-//! same by-name kernel-grant mechanism examples/e1000 uses for its NIC BAR. The kernel grants
-//! it to "resource-server" too, but ONLY in the `resource-test` build (`osdev test
-//! resource-server`), which is the only build that spawns this service; in every other build
-//! it is never spawned, so the grant never takes effect. With the grant, this example is REAL
-//! and QEMU-PROVEN: it mints a resource, narrows a READ-ONLY copy, grants it to its client
-//! `examples/holder`, and serves holder's invocations - holder then proves use / non-escalation
-//! / revoke (`osdev test resource-server`). Without the grant (a plain `cargo build` of this
-//! crate alone) `resource_mint` returns None and the service idles (loud, bounded degradation -
-//! Commandment V). `fs` is the production proof of the same pattern (shell `fcap`, §22 Test 14).
+//! Minting is GATED (Commandment VII, §7.10): `resource_mint` needs the RESOURCE_MINT
+//! authority, which arrives in the SPAWN REQUEST - the `privbits::RESOURCE_MINT` in this
+//! service's row in the supervisor's spawn table, as `fs`'s row carries it - and which the
+//! kernel refuses unless the supervisor may itself delegate it. Nothing is granted by name.
+//! Only the `resource-test` build (`osdev test resource-server`) spawns this service. There
+//! this example is REAL and QEMU-PROVEN: it mints a resource, narrows a READ-ONLY copy, grants
+//! it to its client `examples/holder`, and serves holder's invocations - holder then proves
+//! use / non-escalation / revoke. Spawned without the grant, `gs::resource::mint` returns
+//! `Err(PermissionDenied)` and the service idles (loud, bounded degradation - Commandment V). `fs` is the production proof of the same pattern (shell `fcap`, §22 Test 14).
 
 #![no_std]
 #![no_main]
@@ -57,8 +55,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // derive a copy to hand to a client - mirrors fs's `want | gs::cap::GRANT`): the copy `holder`
     // gets therefore CANNOT widen to WRITE (§7.3), which is what makes holder's write-denial a
     // REAL non-escalation rather than an arbitrary refusal. Minting is gated: without the
-    // RESOURCE_MINT authority (granted by name in the kernel to minters like fs - and, in the
-    // resource-test build, to us), this returns None and we degrade gracefully.
+    // RESOURCE_MINT authority (carried in the spawn request, as for fs), this returns an Err
+    // and we degrade gracefully.
     let (resource_id, cap) = match gs::resource::mint(&ctx, gs::cap::READ | gs::cap::GRANT) {
         Ok(minted) => minted,
         Err(_) => {
@@ -76,7 +74,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // READ | GRANT and can never out-reach the original, so holder genuinely cannot WRITE. We keep
     // the owned resource (we serve it via the kernel-set badge, not the cap) and drop our copy of
     // the handed-out cap on success - authority MOVES, it does not silently duplicate. `holder` is a
-    // contract-declared send-peer, so `acquire_send_cap` is allowed (not ambient, §3.1); the
+    // send peer our spawn request names, so `gs::cap::acquire` is allowed (not ambient, §3.1); the
     // supervisor spawns holder BEFORE us, so by here it is registered in the kernel directory.
     if let Ok(copy) = gs::cap::duplicate(&ctx, cap) {
         match gs::cap::acquire(&ctx, "holder") {
@@ -104,7 +102,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("resource-server: serving resource API");
     loop {
         let msg = gs::ipc::recv(&ctx);
-        // The reply cap the kernel embedded in the invocation (so we can answer the holder).
+        // The reply cap the holder embedded in the invocation (so we can answer it). It is
+        // ONE-SHOT and holds a slot in our table until removed, so every answer below goes through
+        // `gs::ipc::reply`, which answers without blocking and gives the slot back. Answering with a
+        // plain send kept the slot: one leaked per invocation until the table was full (CLAUDE.md
+        // 8.5) - the same leak the `console` service had, found by the 2026-10-09 audit.
         let reply = gs::ipc::take_sent_cap(&ctx);
 
         match gs::resource::last_badge(&ctx) {
@@ -121,7 +123,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 };
                 if op != OP_CLOSE && needed & right == 0 {
                     ctx.log("resource-server: denied - op needs a right the cap lacks (non-escalation)");
-                    if let Some(r) = reply { let _ = gs::ipc::send_to(&ctx, r, &Message::from_bytes(&[DENIED])); }
+                    if let Some(r) = reply { let _ = gs::ipc::reply(&ctx, r, &Message::from_bytes(&[DENIED])); }
                     continue;
                 }
 
@@ -129,7 +131,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     OP_READ | OP_WRITE => {
                         // ... act on the resource `rid` here (fs reads/writes the file it maps
                         // this id to). The kernel never learns what `rid` means - we do.
-                        if let Some(r) = reply { let _ = gs::ipc::send_to(&ctx, r, &Message::from_bytes(&[OK])); }
+                        if let Some(r) = reply { let _ = gs::ipc::reply(&ctx, r, &Message::from_bytes(&[OK])); }
                     }
                     OP_CLOSE => {
                         // Revoke the resource: a generation bump makes EVERY outstanding cap to
@@ -137,10 +139,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // Owner-gated by the kernel - ownership is the check. fs does this on
                         // delete/close.
                         gs::resource::revoke(&ctx, rid);
-                        if let Some(r) = reply { let _ = gs::ipc::send_to(&ctx, r, &Message::from_bytes(&[OK])); }
+                        if let Some(r) = reply { let _ = gs::ipc::reply(&ctx, r, &Message::from_bytes(&[OK])); }
                     }
                     _ => {
-                        if let Some(r) = reply { let _ = gs::ipc::send_to(&ctx, r, &Message::from_bytes(&[DENIED])); }
+                        if let Some(r) = reply { let _ = gs::ipc::reply(&ctx, r, &Message::from_bytes(&[DENIED])); }
                     }
                 }
             }
@@ -148,6 +150,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // No badge: an ordinary name-addressed message (not a cap invocation). A real
                 // server would handle its plain protocol here (fs serves Open this way).
                 ctx.log("resource-server: ignoring non-badged message (no resource cap invoked)");
+                // Nothing to answer, but a cap that arrived with it still holds a slot.
+                if let Some(r) = reply { gs::cap::remove(&ctx, r); }
             }
         }
     }

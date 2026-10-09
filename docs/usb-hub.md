@@ -1,7 +1,7 @@
 # USB Hub Enumeration (xHCI)
 
-**Status:** **BUILT.** The `xhci` service enumerates through hubs (438 hub references in
-`services/xhci/src/main.rs`), which is what makes the Wyse 5070's back-port keyboard - behind a
+**Status:** **BUILT.** The `xhci` service enumerates through hubs (`enumerate_one` and `read_config_and_bind`
+in `services/xhci/src/main.rs`), which is what makes the Wyse 5070's back-port keyboard - behind a
 Realtek hub - work. Trails `CLAUDE.md` (§12 drivers); does not amend it.
 
 *(This said "in-progress, on `feat/dell-wyse-5070-goldmont-plus`". That branch no longer exists: the
@@ -163,14 +163,17 @@ a slice from the pool; a bound HID and a hub-with-a-HID-behind-it keep theirs, w
 **empty hub** free their slice and `Disable_Slot` their controller slot - so the fixed `MAX_SLICES` pool
 never leaks and the step-2 completion=4 cascade (two hubs reusing slice 0) is gone. A tier-2 hub (hub behind
 a hub) is logged and skipped for now (single-tier support). Compiles; awaits the Wyse back-port keyboard
-test.
+test. *(2026-10-09: the status line at the top records the Wyse back-port keyboard working; a tier-2 hub
+is still logged and skipped, `xhci: downstream device is a hub (tier 2) - not recursing`.)*
 
 ### 5.4 Hot-plug
 
 The xHCI main loop already re-initialises the controller and re-scans every port on every pass. A
 device coming or going behind a hub is picked up by the **same full re-walk** - heavier than watching a
 hub's port-status-change bit, but correct and consistent with the current model. Incremental hub-port
-watching is a later optimisation, not part of this first cut.
+watching is a later optimisation, not part of this first cut. *(2026-10-09: that optimisation exists
+now - hub ports are probed for status every `HUB_POLL_MS`, fed to the shadow topology model, see
+`docs/xhci-topology.md` and `docs/xhci-completion-correlation.md`.)*
 
 ---
 

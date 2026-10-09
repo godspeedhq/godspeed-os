@@ -16,16 +16,18 @@
 //!   gs::call::request_within(&ctx, "reply-server", &req, ASK_SECS)
 //!
 //! Under the hood (`stdlib/rust/src/call.rs`, over the kernel's `CallDeadline`) that
-//! call derives a per-request reply cap - a SEND|GRANT copy of asker's OWN endpoint
-//! cap - embeds it in the request, sends it to reply-server, and blocks for the reply
-//! until it arrives, the server dies, or `ASK_SECS` passes.
+//! call derives a per-request reply cap - a SEND|GRANT copy of asker's REPLY MAILBOX,
+//! the second endpoint the kernel gives a receiving task for replies alone (its own
+//! served endpoint only if it got no mailbox) - embeds it in the request, sends it to
+//! reply-server, and blocks for the reply until it arrives, the server dies, or
+//! `ASK_SECS` passes.
 //! The reply cap is the ONLY authority the server has to call asker back: no ambient
 //! channel, no identity-based reach (Commandment VII, §7, §8.5).
 //!
 //! Commandments this teaches (the client half of request/reply):
 //!   VI   - it talks over IPC, never shared memory.
 //!   VII  - it hands the server authority to reply by GRANTing a cap derived from its
-//!          own endpoint - explicit, minted, non-ambient.
+//!          own reply mailbox - explicit, minted, non-ambient.
 //!   VIII - a successful send is QUEUED, not processed (§8.6); asker then waits for the
 //!          REPLY (truth), never for a fixed sleep (time). The generation check, not a
 //!          delay, settles a reply-server restart: a stale peer cap is reacquired by
@@ -62,7 +64,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Commandment VIII / §8.6 peer-death demonstration (driven by `osdev test reply-dead`). Once,
         // after the round-trip has proven itself, send a request the server deliberately never answers
         // (b"HANG") and block for the reply. If the server is killed while we wait, the kernel wakes us
-        // with `ReplyDead` at once, which the library reports as `OutcomeUnknown` - the request ARRIVED,
+        // with `ReplyDead` at once, which the library reports as `PeerDied` - the request ARRIVED,
         // so it may have been acted on, and it is not re-sent. We survive it and carry on. The deadline
         // is the other bound: a server that stays alive and silent ends the wait after `HANG_SECS`
         // rather than never. (In the plain reply-server test that is what happens, long after the
@@ -86,8 +88,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let req = Message::from_bytes(&payload[..payload_len(&payload)]);
 
         // The whole RPC round-trip: embed a reply cap, send, block for the reply.
-        // An error => the peer could not be reached (still spawning, or just restarted),
-        // in which case the embedded reply cap was reclaimed for us (no leak, §26.6).
+        // An error => no reply: the peer could not be reached (still spawning, or just
+        // restarted), it died holding the request, or the deadline passed. Where the request
+        // never left, the embedded reply cap was reclaimed for us (no leak, §26.6); where it
+        // was delivered, the cap is the peer's to answer on.
         match gs::call::request_within(&ctx, "reply-server", &req, ASK_SECS) {
             Ok(reply) => {
                 // THE PROOF of a correct round-trip: the reply echoes the exact request

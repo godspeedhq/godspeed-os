@@ -161,7 +161,10 @@ fn cfg_read(ctx: &ServiceContext, bus: u8, dev: u8, func: u8, offset: u8) -> Opt
 /// SError that halts the machine, not a harmless all-ones. The kernel's admissibility check refuses
 /// out-of-RANGE buses, and its own scan reads bus 1 device 1 safely - so widening is probably safe -
 /// but "probably safe" is not the bar for a change whose failure mode is a dead board, and this is a
-/// REPORTER with no clients, so the cost of the gap today is one unlisted device in a log.
+/// REPORTER with no clients, so the cost of the gap today is one unlisted device in a log. (Note
+/// 2026-10-09: it has clients now - the supervisor asks op 3 for each PCI driver's BDF at spawn, and
+/// `hardware` reads ops 1, 2 and 4 - so an unlisted device is also one whose driver is resolved by the
+/// kernel's own scan instead, and one `hardware` cannot show.)
 ///
 /// To close it: probe all 32 slots per admitted bus, and prove it on the Pi 4 before believing it.
 fn slots_on(bus: u8) -> u8 {

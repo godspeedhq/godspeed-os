@@ -6,12 +6,14 @@
 // `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is itself covered by this
 // lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
 #![deny(unsafe_code)]
-//! e1000 - a real, runnable userspace driver for the Intel 82540EM ("e1000") NIC.
+//! e1000 - a minimal userspace driver for the Intel 82540EM ("e1000") NIC.
 //!
-//! This is the runnable counterpart to `examples/driver-skeleton`. It is a SERVICE
-//! (Commandment I): the kernel grants it only the NIC's MMIO window - by name, in
-//! `kernel/src/task/mod.rs`, and only when the discovered NIC is actually an Intel
-//! e1000 - and all device logic lives here. It writes NO `unsafe`: every register
+//! The concrete counterpart to `examples/driver-skeleton`. It is a SERVICE
+//! (Commandment I): the kernel would grant it only the MMIO window of the device
+//! CLASS its spawn row names, resolved against the kernel's own bus scan - never by
+//! name or vendor - and all device logic lives here. Its one spawn row today
+//! (`examples-test`) names NO class, because `nic-driver` already owns the NIC, so
+//! what actually runs is the degrade path below. It writes NO `unsafe`: every register
 //! read goes through the SDK's safe `Mmio` wrapper (Commandment X / §18.1).
 //!
 //! Read-only: it reports the link state and the MAC address the NIC loaded from its
@@ -33,10 +35,10 @@ const REG_RAH0:   usize = 0x5404; // Receive Address High 0 (MAC bytes 4..6 in b
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("e1000: starting");
 
-    // The kernel mapped our BAR only if the discovered NIC is a real Intel e1000
-    // (Commandment VII: hardware reach is an explicit, kernel-granted capability,
-    // for exactly the device we were written for). On any other NIC there is no
-    // mapping, so we DEGRADE rather than crash (Commandment V: no service is special).
+    // The kernel maps a BAR only when our spawn row names a device CLASS and its own
+    // bus scan finds one (Commandment VII: hardware reach is an explicit, kernel-granted
+    // capability). With no grant there is no mapping, so we DEGRADE rather than crash
+    // (Commandment V: no service is special).
     let mmio = match ctx.mmio() {
         Some(m) => m,
         None => {

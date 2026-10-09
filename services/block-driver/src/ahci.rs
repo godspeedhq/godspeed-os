@@ -5,10 +5,10 @@
 //! physically-contiguous DMA arena at spawn (same path as the USB drivers). This
 //! replaces ATA PIO on modern machines (the T630's SSD is AHCI-only).
 //!
-//! **Steps A+B (this file): detect + port init + IDENTIFY.** Map the ABAR, enable
-//! AHCI mode, enumerate ports, then on the disk port set up the command list / FIS
-//! / command table in the arena, start the port, and issue IDENTIFY DEVICE to read
-//! the model + sector count. Read/write (READ/WRITE DMA EXT) come next.
+//! **Detect + port init + IDENTIFY, then serve.** Map the ABAR, enable AHCI mode, enumerate ports,
+//! then on the disk port set up the command list / FIS / command table in the arena, start the port,
+//! and issue IDENTIFY DEVICE to read the model + sector count. Then a boot read self-test and the
+//! block-IPC serve loop: READ/WRITE DMA EXT, batched write-zeros, and FLUSH CACHE EXT on `OP_FLUSH`.
 
 use core::cell::Cell;
 
@@ -473,7 +473,7 @@ impl<'a> Ahci<'a> {
     #[cfg(not(feature = "write-tap"))]
     fn write_tap(&self, _ctx: &ServiceContext, _lba: u64, _data: &[u8; 512]) {}
 
-    /// Write one 512-byte sector of `data` to `lba` (WRITE DMA EXT + FLUSH), with bounded retry.
+    /// Write one 512-byte sector of `data` to `lba` (WRITE DMA EXT, no flush - see below), with bounded retry.
     fn write_block(&self, ctx: &ServiceContext, lba: u64, data: &[u8; 512]) -> Result<(), &'static str> {
         for i in 0..128 {
             let w = (data[i * 4] as u32)
@@ -800,7 +800,8 @@ fn serve_no_disk(ctx: &ServiceContext) -> ! {
     }
 }
 
-/// Steps A+B: detect the HBA + disk, init the port, IDENTIFY. Idles afterwards.
+/// Detect the HBA + disk, init the port, IDENTIFY, read-self-test sector 0, then serve block I/O to
+/// `fs` forever. With no disk or no DMA arena it serves the no-disk answers instead (`serve_no_disk`).
 pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
     let cap = hba.read32(HBA_CAP);
     let vs = hba.read32(HBA_VS);

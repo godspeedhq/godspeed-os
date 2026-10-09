@@ -58,7 +58,7 @@ Three things to take from it:
   to a memory-mapped region and an interrupt line - nothing more. A crashed driver is a restart, not
   a reboot.
 - **Authority points downward and is always explicit.** Nothing is ambient: a service can do exactly
-  what its contract was granted and no more, checked on every privileged syscall.
+  what its spawn request was granted and no more, checked on every privileged syscall.
 
 ### The six things the kernel does
 
@@ -97,19 +97,19 @@ module serves none of the six.
 ## Portability
 
 One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in
-`arch/<isa>/`. Adding an ISA is bounded to that directory and enforced by CI - it does not touch a
-single arch-neutral file.
+`arch/<isa>/`. Adding an ISA is bounded to that directory plus the eleven registration files
+`docs/porting.md` marks; every `osdev build` refuses neutral code that reaches hardware outside the seam.
 
 | target | status |
 |---|---|
-| **x86-64** | **Full OS.** The `os.img` you flash: 4 cores, shell, AHCI storage, networking, USB (xHCI + EHCI), IOMMU-confined drivers. Verified on an HP T630 (AMD GX-420GI) and a Dell Wyse 5070 (Intel J5005). |
+| **x86-64** | **Full OS.** The `os-usb.img` you flash: 4 cores, shell, AHCI storage, networking, USB (xHCI + EHCI), IOMMU-confined drivers. Verified on an HP T630 (AMD GX-420GI) and a Dell Wyse 5070 (Intel J5005). |
 | **AArch64** (Raspberry Pi 4) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4-core SMP, GENET gigabit ethernet, USB keyboard and mass storage through the VL805 xHCI over PCIe, journalled filesystem. |
 | **32-bit ARM** (Raspberry Pi 2) | **Full OS.** Same neutral kernel: 4-core SMP, USB keyboard, USB mass storage and USB ethernet - all three through the one DWC2 controller - plus the filesystem and the shell. |
 | **RISC-V 64** (StarFive VisionFive 2 Lite) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4 harts on a JH7110, 1080p60 HDMI from a cold start, USB keyboard and mass storage through the onboard hub, DWMAC gigabit ethernet at zero packet loss, Sv39 paging, journalled filesystem. The first port finished with **no arch-neutral kernel code naming the ISA**. |
 | RISC-V 32, LoongArch | Compile and boot to their UART. |
 | s390x | Compiles clean (big-endian). |
 
-All four full ports are validated the same way and to the same bar: `selfcheck` (400-odd assertions),
+All four full ports are validated the same way and to the same bar: `selfcheck` (500-odd assertions),
 then `chaos max-carnage` killing every service repeatedly, then `selfcheck` again, then a USB hotplug,
 then `selfcheck` once more - **zero failures, zero kernel panics, zero liveness wedges**.
 
@@ -212,7 +212,7 @@ under a "figures below are from the current tree" line that made three-month-old
 
 | Check | Result |
 |-------|--------|
-| Unsafe confined to permitted layers (§18.1) **(current tree)** | audit passes: 1207 lines across 78 files, no unaccounted additions |
+| Unsafe confined to permitted layers (§18.1) **(current tree)** | audit passes: 1221 lines across 79 files, no unaccounted additions |
 | Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) *(2026-05-31)* | ✅ 0 |
 | Kernel build warnings *(2026-05-31)* | 104 → 57 (remaining are intentional unwired architecture) |
 | Hardware boot regression *(2026-05-31, T630)* | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
@@ -269,7 +269,7 @@ py scripts/conform.py --explain GS0403
 py scripts/conform.py --list
 ```
 
-A clean tree says `0 would be fixed, 0 need a decision - 18 checks ran, 18 passed`. The count of checks
+A clean tree says `0 would be fixed, 0 need a decision - 24 checks ran, 24 passed`. The count of checks
 that RAN is there on purpose: a run that silently skipped twelve of them and printed a clean verdict is
 the failure the whole thing exists to prevent.
 
@@ -279,24 +279,24 @@ boundary and unsafe, `GS03xx` contracts and authority, `GS04xx` documentation an
 `conform --list` prints the legend and every rule; `docs/conformance.md` has the reasoning.
 
 `osdev build` runs the same checkers and refuses to build if any fails, so `conform` is not an extra
-gate - it is the same gate, askable. It is `py scripts/conform.py` rather than `osdev conform` because
-the shim is not written yet; `docs/conformance.md` is the spec and records why.
+gate - it is the same gate, askable. `osdev conform` (with the same flags) is a shim that forwards to
+`scripts/conform.py` and passes its exit code through; `docs/conformance.md` is the spec.
 
 The build is pure Cargo plus the `osdev` CLI - identical on every platform. The full `osdev` CLI reference is in `CLAUDE.md §17` and `osdev/CLAUDE.md`.
 
 ### Flashing to real hardware
 
-`osdev image` builds a UEFI-bootable `build/os.img` for a USB stick. Two things make a boot on real hardware reliable:
+`osdev image` builds a UEFI-bootable `build/os-usb.img` for a USB stick (named apart from `build/os.img`, the BIOS image `osdev run` boots in QEMU, so the two cannot be confused). Two things make a boot on real hardware reliable:
 
-1. **Build clean, and copy the image *before* you boot it.** `osdev run` and `osdev test` rebuild `build/os.img` incrementally as a side effect, and an incrementally-built kernel can boot under QEMU yet be **rejected by real UEFI firmware** (it boots in emulation but the machine won't pick up the USB). So build the image clean and grab it immediately, before anything reboots it:
+1. **Build clean, and copy the image *before* you boot it.** `osdev run` and `osdev test` rebuild the kernel incrementally as a side effect, and an incrementally-built kernel can boot under QEMU yet be **rejected by real UEFI firmware** (it boots in emulation but the machine won't pick up the USB). So build the image clean and grab it immediately, before anything reboots it:
 
    ```bash
    cargo clean --target x86_64-unknown-none   # discard any incremental artifacts
-   cargo run -p osdev -- image                 # writes a clean build/os.img
-   cp build/os.img build/my-hw.img             # copy NOW, before any `osdev run` / `osdev test`
+   cargo run -p osdev -- image                 # writes a clean build/os-usb.img
+   cp build/os-usb.img build/my-hw.img         # copy NOW, before anything rebuilds it
    ```
 
-   **Booting in QEMU is not proof the on-hardware image is good - a clean build is.** If a copy is taken *after* an `osdev run`/`osdev test` (both rebuild `os.img`), you may hand hardware an incremental image that only works under QEMU.
+   **Booting in QEMU is not proof the on-hardware image is good - a clean build is.** If the image is built on top of an `osdev run`/`osdev test` (both rebuild the kernel incrementally) without the clean step, you may hand hardware an incremental image that only works under QEMU.
 
 2. **Flash the copy** with Rufus (DD Image mode) or `dd if=build/my-hw.img of=/dev/sdX bs=4M`, let the write fully finish, and boot the stick in **UEFI** mode. Serial console is 115200 8N1; a healthy boot prints `smp: N cores ready` then `supervisor: ready`.
 
@@ -324,7 +324,7 @@ website/      documentation site (mdBook; renders this repo's docs)
 API references under `/api`:
 
 - [**`godspeed`** - the standard library](https://godspeedhq.github.io/godspeed-os/api/godspeed/),
-  imported as `gs`. **This is what you write a program against** - 149 public items across 13 modules (counting free functions, constants and types, plus the methods on those types and every re-export; `scripts/stdlib_gap_check.py --list` shows the other side of the same surface):
+  imported as `gs`. **This is what you write a program against** - 164 public items across the 13 modules below, plus 33 in the `driver` tier (counting free functions, constants and types, plus the methods on those types and every re-export; recounted 2026-10-09, `docs/stdlib-brief.md` has the method; `scripts/stdlib_gap_check.py --list` shows the other side of the same surface):
 
   | Module | Covers |
   |--------|--------|
@@ -341,6 +341,7 @@ API references under `/api`:
   | [`record`](https://godspeedhq.github.io/godspeed-os/api/godspeed/record/index.html) | typed tables, and the views derived from them |
   | [`trace`](https://godspeedhq.github.io/godspeed-os/api/godspeed/trace/index.html) | metrics, the IPC event ring, and the log tail - publish, and read back |
   | [`addr`](https://godspeedhq.github.io/godspeed-os/api/godspeed/addr/index.html) | IPv4 addresses |
+  | [`driver`](https://godspeedhq.github.io/godspeed-os/api/godspeed/driver/index.html) | for drivers: bounded hardware waits, delays, and the interrupt the kernel granted |
 
   [**Writing a program for GodspeedOS**](https://godspeedhq.github.io/godspeed-os/stdlib.html) is the
   place to start.
@@ -353,7 +354,7 @@ API references under `/api`:
 Two sections worth knowing about:
 [**the services**](https://godspeedhq.github.io/godspeed-os/services.html) - what each one is, what it
 may *not* do, and diagrams of how they reach each other over endpoints - and
-[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), all 55 of them, each with
+[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), all 58 of them, each with
 its full specification.
 
 The docs in this repo also render as a browsable site built with

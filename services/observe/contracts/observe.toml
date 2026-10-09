@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# The live system view (top/htop equivalent, Appendix C.1). Reads per-task state through INTROSPECT and
-# can kill a service it has a holding for through SERVICE_CONTROL - both kernel by-name grants (C4-1).
+# The live system view (top/htop equivalent, Appendix C.1). Reads per-task state through INTROSPECT,
+# its one privilege, carried by the supervisor's spawn request (the `observe*` IMAGES rows; CLAUDE.md
+# 13.6) rather than a kernel by-name grant (C4-1). It holds no SERVICE_CONTROL and kills nothing.
 #
 # No placement: a transient the user invokes, wherever there is room.
 name    = "observe"

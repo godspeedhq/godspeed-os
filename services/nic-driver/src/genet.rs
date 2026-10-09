@@ -3,14 +3,16 @@
 //!
 //! ## Why this file exists
 //!
-//! This is `kernel/src/arch/aarch64/genet.rs` where it belongs. That file is about 1500 lines of
+//! This is `kernel/src/arch/aarch64/genet.rs` where it belongs. That file was about 1500 lines of
 //! ethernet driver running in ring 0, which Commandment I forbids in one sentence ("thou shalt not
 //! expand the responsibilities of the kernel - it is complete; use a service") and §4.4 forbids again
-//! by name ("the kernel does not contain ... a network stack, drivers"). x86 has never had the
-//! problem: its NIC driver has always been a restartable, IOMMU-confinable userspace service. This is
+//! by name ("the kernel does not contain ... a network stack, drivers"); what is left of it is
+//! discovery only - it reads one revision register and writes none. x86 has never had the
+//! problem: its NIC driver has always been a restartable userspace service. This is
 //! aarch64 catching up, and the port is possible only because three things landed first - device IRQs
-//! now route to userspace, `nic-driver` is granted the GENET register window by name, and its DMA
-//! arena is mapped UNCACHED because AArch64 DMA is not coherent.
+//! now route to userspace, `nic-driver` is granted the GENET register window (today by device kind,
+//! `hwclass::NIC`, in its spawn request), and its DMA arena is mapped UNCACHED because AArch64 DMA is
+//! not coherent.
 //!
 //! ## What is the same, and what had to change
 //!
@@ -962,7 +964,7 @@ impl<'a> Genet<'a> {
             return None;
         }
         // The revision field encoding, from Linux's `bcmgenet_probe`: bits 27:24 hold the major, offset
-        // by one from v4 onward (4 means v4 is reported as 5, 5 as 6), and bits 19:16 hold the minor.
+        // by one from v4 onward (v4 reads as 5, v5 as 6), and bits 19:16 hold the minor.
         // The offset is not a detail to skip - reading the raw field gives a version number one higher
         // than the part actually is, and picking a register layout from that is how a driver ends up
         // addressing the wrong block on the right chip.
@@ -1199,14 +1201,15 @@ impl<'a> Genet<'a> {
 //
 // Byte-for-byte the contract `kernel_net_main` serves, because `net-stack` must not be able to tell
 // which backend is underneath it (Commandment X: the driver is mechanism, the stack is policy). A
-// 1-byte payload of 3/4/5/6/7/8/9 is an opcode; anything else is a raw ethernet frame to transmit.
+// 1-byte payload of 3/4/5/6/7/8/9/10 is an opcode; anything else is a raw ethernet frame to transmit.
 // ---------------------------------------------------------------------------------------------
 
 /// The `nic-driver` entry point on a Pi 4 that hands GENET to userspace.
 ///
-/// Degrades rather than hangs at every step (§26.7). No register window (no controller on the board),
-/// no DMA arena, or a bring-up that refused: all three fall through to the shared empty-reply server,
-/// so `net-stack` sees a NIC that reports itself down instead of a request that never comes back.
+/// Degrades rather than hangs at every step (§26.7). No register window (no controller on the board)
+/// or no DMA arena falls through to the shared empty-reply server, so `net-stack` sees a NIC that
+/// reports itself down instead of a request that never comes back. A bring-up that refused still
+/// serves the frame interface, with the radio as the link, and retries the MAC when a cable arrives.
 pub fn genet_main(ctx: ServiceContext) -> ! {
     let (Some(m), Some(a)) = (ctx.mmio(), ctx.dma_region()) else {
         ctx.log("nic-driver: no GENET register window or DMA arena granted - serving empty replies");
@@ -1253,8 +1256,13 @@ fn reply_failed(ctx: &ServiceContext, e: godspeed::Error, n: &mut u32) {
     if *n == 1 || *n % 16 == 0 {
         let why = match e {
             godspeed::Error::Busy => "the requester's queue is full",
-            godspeed::Error::Unreachable | godspeed::Error::PermissionDenied =>
+            godspeed::Error::Unreachable =>
                 "the reply cap is dead - the requester stopped waiting before this reply",
+            // NOT a dead cap: `gs` maps insufficient rights, not grantable and wrong scope here
+            // (`from_ipc`, stdlib `ipc.rs`). A reply cap the kernel minted should never produce it,
+            // so if one does, say what it is rather than blame a requester that gave up.
+            godspeed::Error::PermissionDenied =>
+                "the reply cap lacks the right to answer (rights or scope) - not a requester that gave up",
             _ => "another error",
         };
         ctx.log_fmt(format_args!(
@@ -1404,7 +1412,8 @@ fn serve(ctx: &ServiceContext, g: &Genet, mut mac: Option<[u8; 6]>) -> ! {
         } else {
             // TX FRAME (any multi-byte payload) : transmit and acknowledge. The frame is NOT coupled to a receive - see below.
             if !cable {
-                // The radio's turn (`Carrier`): the frame goes to `wifi-driver` as op 0x11 and the answer
+                // The radio's turn (`Carrier`): the frame goes to the radio in use (`wifi-driver`, or
+                // `wifi-usb` when `wifi hardware use` chose the dongle) as op 0x11 and the answer
                 // is its word. A refusal is counted and reported sparingly: the stack retries on its own
                 // pace, and a radio that is not joined refuses every frame, correctly.
                 if !radio.tx(ctx, p) {

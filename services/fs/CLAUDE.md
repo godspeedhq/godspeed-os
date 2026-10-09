@@ -53,8 +53,9 @@ by `drives reset`.
 - **Directory block** (512 B): **7** `file_record`s × 64 B (`type u8` - 0 free, 1 contiguous
   file, 2 dir, 3 fragmented file; `name_len u8`, `name[38]`, `size u64`, `first_block u64`,
   `block_count u64`) + a 64-byte trailer whose first 4 bytes are the **block's CRC32** over its
-  448-byte record region - verified on every directory read (`dir_read`/`td_read`), stamped on
-  every write (`dir_write`/`td_write`).
+  448-byte record region - verified on every directory read (`td_read`), stamped on
+  every write (`dir_write`/`td_write`). The rest of the trailer holds 7 × (mtime, ctime) u32 times
+  @452 under their own CRC32 @508 (Phase O, `docs/persistence.md` §6.17).
 - **File-data block** (512 B): **508 bytes payload + CRC32 @508**. A file of N bytes spans
   `ceil(N/508)` data blocks; the CRC covers the payload, verified on every read (`data_read`),
   stamped on every write (`data_write`). The per-message streaming chunk is `7×508 = 3556`.
@@ -94,11 +95,16 @@ hard links. Bad magic **or** bad CRC is a loud mount refusal, never an auto-refo
 | `Scrub`     | 29 | -                 | scrub (Phase K): `Ok`, files/dirs/bad:u32, scanned:u64 - READ-ONLY CRC integrity sweep over the tree; reports bad blocks, **changes nothing** (unlike `Check`, which repairs) |
 | `Open`      | 30 | path, rights:u8   | file-as-capability (§7.10, P2): mint a delegated resource for the file, reply `[Ok]` + the **file cap** embedded. The holder then INVOKES the cap (kernel-badged) - `serve_filecap` resolves the badge's resource_id → file via the open-file table and enforces op ≤ the badged right (FOP_READ/WRITE/STAT/CLOSE). Proven by `osdev test file-cap` (§22 Test 14). |
 
+Not in the table, and served all the same (the `OP_*` constants in `src/main.rs` are the full list):
+`Rename` 15, `Delete` 16, `Move` 17, `MkdirP` 18, `DeleteTree` 19, the drives ops `DrivesInfo` 20,
+`Flash` 21, `Label` 22 and `Reset` 23, and `Seal` 31.
+
 **Large files (streaming).** `WriteFile`/`ReadFile` carry a whole *small* file in one ≤4 KiB
 IPC message. Files larger than one message use the offset-addressed ops: `WriteNew` allocates
 the full extent and sizes the file, then a sequence of `WriteAt` chunks fills it; read it back
 with `StatFile` (for the size) + a sequence of `ReadAt` chunks. Stateless - each request is
-self-contained (no open-file table; §8). Size is bounded only by free space: a file is a
+self-contained (the streaming ops keep no open-file state; the open-file table serves only file
+caps, `Open`; §8). Size is bounded only by free space: a file is a
 contiguous u64 extent when one is free, else fragmented across an extent list (GSFS0008, §6.12
 above), so a fragmented disk no longer refuses a write it has room for. The shell streams
 `read`/`copy` and the pipe `write` sink through these ops.
@@ -117,8 +123,8 @@ checkpoints them home, and invalidates the journal. File **data** is written dir
 extent nothing references until the transaction commits). On **mount**, `recover` replays a
 committed-but-unfinished transaction (valid commit magic + CRC) and discards a torn one - so a
 single power loss leaves the filesystem either entirely unchanged or fully applied, never
-half-updated - **on a backend that attests durability** (`ahci` flushes after every write; SD/EMMC
-completes only after the card releases its busy line). A backend that cannot be ordered cannot provide
+half-updated - **on a backend that attests durability** (`ahci` issues FLUSH CACHE EXT and a USB stick
+SYNCHRONIZE CACHE when `fs` asks at its journal barriers, `OP_FLUSH`; neither flushes per write). A backend that cannot be ordered cannot provide
 that, and `fs` warns once per mount rather than implying it (`CLAUDE.md` §6.1). **No board in this
 project is currently known to be such a backend**: the ARM USB stick was named as the example until
 2026-09-23, when it accepted the flush across seven sessions and recovered an unassisted power cut in
@@ -153,5 +159,5 @@ is operator-driven (no background-task primitive - "periodic" is policy, not a h
 Proven by `osdev test fs-scrub`.
 
 This is the transactional metadata recovery §6.3/§15 calls for. With it, fs no longer
-*needs* to be non-restartable on crash-safety grounds - dropping fs + block-driver from the
-TCB is the remaining Phase D step (a `CLAUDE.md` §6 amendment).
+*needs* to be non-restartable on crash-safety grounds, and Phase D dropped fs + block-driver from the
+TCB (`CLAUDE.md` §6.1 amendment 2026-06-17).

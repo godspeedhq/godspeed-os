@@ -6,6 +6,10 @@
 > §23.4). Non-normative until built and pinned by an identity test, at which point the relevant
 > decisions are amended into `CLAUDE.md`. This doc records the architecture and the phased plan,
 > mirroring `docs/persistence.md`.
+>
+> **Note (2026-10-09): TCP is built too.** `services/net-stack/src/tcp.rs` implements it (design:
+> `docs/tcp-design.md`; command surface: `utilities/48_tcp.md`). The sentences below that call TCP
+> "next" or "committed" were written before it landed and are left as the plan they recorded.
 
 > **Decision (2026-07-04, owner): TCP/IPv4 is committed from the start, not far-future.** The build
 > order is unchanged - the layers still stack NIC -> ARP -> IPv4 -> ICMP (ping) -> transport - but TCP
@@ -270,7 +274,7 @@ reliability on top of this best-effort substrate - not the kernel, not magic.
 | **2** | ARP + IPv4 + ICMP in `net-stack` | **`ping` the host** end to end - the networking ping/pong | ✅ done + HW-proven |
 | **3** | UDP + **socket-as-capability** (`resource_mint`/badge/revoke); a `net` shell utility | A service opens a UDP socket cap, send/recv a datagram; non-escalation + revoke pinned (a §22 "socket is a capability" test, mirroring Test 14) | ✅ done (DHCP + DNS ride UDP) |
 | **4** | The **Realtek RTL8168 driver** (`10ec:8168`, the T630's NIC), same frame interface - HW-only, no QEMU model | `ping` from bare metal on the T630 | ✅ done + HW-proven |
-| **5** | TCP - committed next (§8, no longer far-future) | A TCP echo against a real peer | next |
+| **5** | TCP - committed next (§8, no longer far-future) | A TCP echo against a real peer | built (`net-stack/src/tcp.rs`, `docs/tcp-design.md`) |
 
 Each phase gets a design beat in this doc plus QEMU + (where it applies) T630 verification, exactly like
 the AHCI/GSFS/file-cap ladder.

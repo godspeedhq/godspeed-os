@@ -113,8 +113,7 @@ pub struct Nic {
     /// string descriptor, which is why the parse below steps FOUR bytes per output byte - two UTF-16
     /// code units, each two bytes, per pair of hex digits.
     pub mac: [u8; 6],
-    /// Endpoint data toggles, per DIRECTION, for the device's lifetime - the level USB defines them
-    /// at, learned three times over on the disk path.
+    /// What the frame path has moved - see `Stats`.
     pub stats: Stats,
     /// Frames parsed from a burst but not yet collected by the client, oldest first.
     ///
@@ -147,8 +146,8 @@ pub struct Nic {
     /// shows the shape instead of sampling it.
     pub last_bmsr: u16,
     pub bmsr_changes: u32,
-    /// Consecutive polls that found the armed IN still enabled and not complete, and how many times we
-    /// have reported a long run of them. Diagnostic only - nothing acts on these.
+    /// Endpoint data toggles, per DIRECTION, for the device's lifetime - the level USB defines them
+    /// at, learned three times over on the disk path.
     pub pid_in: u32,
     pub pid_out: u32,
     /// Cached PHY link state, and when it was read.
@@ -188,8 +187,8 @@ pub struct Nic {
     /// faults with different fixes. Recording it costs a field and removes a guess.
     pub tx_hcint: u32,
     pub tx_nohalt: u32,
-    /// GNPTXSTS at the last failed transmit: bits [31:24] are request-queue entries FREE, [15:0] are
-    /// FIFO words free.
+    /// GNPTXSTS at the last failed transmit: bits [23:16] are request-queue entries FREE, [15:0] are
+    /// FIFO words free ([30:24] is the queue top - see the field order in `main.rs`'s report).
     ///
     /// This is the register that separates the two remaining explanations for a transaction that
     /// never happens. FIFO space with NO queue space means the core has nowhere to put the request -
@@ -609,7 +608,7 @@ fn link_observed(
 }
 /// RX burst size in 512-byte high-speed packets, and the IN transfer length that must match it.
 ///
-/// 8 packets / 4096 bytes, copied VERBATIM from the in-kernel driver that works on this exact board.
+/// 8 packets / 4096 bytes, copied VERBATIM from the in-kernel driver that worked on this exact board.
 /// I had chosen 4 / 2048 - self-consistent, and wrong. With the chip configured to accumulate a burst
 /// it evidently never considered complete, it NAKed every IN while its receive FIFO filled to 20,464
 /// bytes (`RX_FIFO=0x4ff0`, near the LAN9514's entire FIFO). Data in, nothing out, forever.
@@ -760,14 +759,12 @@ pub fn health_check(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target, nic: &m
 /// Reset the chip and its PHY, program the station MAC, enable turbo RX, start auto-negotiation, and
 /// turn TX + RX on. Returns the MAC the chip is now filtering on.
 ///
-/// The MAC is the one place this service is WEAKER than the in-kernel driver, and the log says so
-/// rather than hiding it. The kernel reads the real board MAC (b8:27:eb:..) from the VideoCore mailbox,
-/// which lives outside the DWC2 register window this service was granted. Reaching it would mean
-/// granting a second, much wider MMIO window for one identity fact - authority out of proportion to the
-/// need. So this asks the CHIP (which the Pi's firmware may have programmed) and, failing that, uses a
-/// locally-administered address. Networking works either way: an LAA is a valid unicast MAC and DHCP
-/// serves it normally. What is lost is the address matching the sticker, and the log names which case
-/// happened so nobody has to guess later.
+/// The MAC: the board's own, which the kernel reads from the VideoCore mailbox (outside the DWC2
+/// register window this service was granted) and hands over as InspectKernel query 23
+/// (`ctx.board_mac()`); failing that, whatever the firmware left in the CHIP; failing that, a
+/// locally-administered address. Granting the mailbox window itself would be authority out of
+/// proportion to one identity fact. The log names which case happened - see "THREE SOURCES" in the
+/// body.
 fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<[u8; 6]> {
     // Lite reset the chip.
     let hw = smsc_read(ctx, m, d, t, SMSC_HW_CFG)?;
@@ -950,8 +947,8 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Mmio, d: &Dma, t: &Target) -> Option<
     // Read the state back OFF THE CHIP rather than assuming the writes took. Every register here was
     // just written by us, so a value that disagrees says the vendor control path is not landing - and
     // that is a completely different bug from "frames do not flow". BMSR bit 2 is the PHY's own link
-    // bit: the only honest answer to "is the cable up", as against the UP this driver currently
-    // reports to net-stack unconditionally.
+    // bit: the only honest answer to "is the cable up" (`OP_NET_INFO` reports the same PHY bit to
+    // net-stack now; it once reported UP unconditionally).
     let cr  = smsc_read_for_log(ctx, m, d, t, SMSC_MAC_CR);
     let txc = smsc_read_for_log(ctx, m, d, t, SMSC_TX_CFG);
     let hwc = smsc_read_for_log(ctx, m, d, t, SMSC_HW_CFG);
@@ -1030,7 +1027,7 @@ pub fn tx(
     // REFUSE, CHEAPLY, WITH NO LINK.
     //
     // The frame cannot go anywhere, and the expensive part is not the failure - it is HOW LONG the
-    // failure takes. `bulk` below is given 2 s, so a client retrying a doomed transmit does not merely
+    // failure takes. `bulk` below was given 2 s (now `TX_BUDGET_MS`), so a client retrying a doomed transmit does not merely
     // waste its own time, it takes this service off the air: the keyboard poll shares this thread, and
     // a pass that spends seconds in a transmit polls the keyboard seconds apart. That is what a user
     // experiences as "the keyboard stopped working", and the driver looked crashed rather than busy
@@ -1295,10 +1292,6 @@ pub fn tx(
     ok
 }
 
-/// Receive one burst and hand each complete frame to `deliver`.
-///
-/// Returns the number of frames delivered. Zero is the ordinary answer on a quiet network and is not
-/// a failure.
 impl Nic {
     /// Append a frame, stored as `[len:u16 LE][bytes]`. Sized to a whole burst, so the overflow arm
     /// should never run - it counts rather than hides if it ever does.
@@ -1351,7 +1344,7 @@ fn arm_in(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Ni
     chan::program(ctx, mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET_RX,
                   true, nic.pid_in, RX_BURST as u32, dma.phys_at(RX_OFF) as u32,
                   nic.ep_in as u32, 2, 0);
-    // Unmask this channel's terminal halt, exactly as the working kernel driver does before it arms its
+    // Unmask this channel's terminal halt, exactly as the working kernel driver did before it armed its
     // background IN. `chan::program` zeroes HCINTMSK for every channel, which is invisible for a channel
     // programmed and polled in the same breath - and this is the only channel left RUNNING UNATTENDED,
     // so it is the one place the assumption carries weight.
@@ -1388,6 +1381,11 @@ fn arm_in(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Ni
     nic.in_armed = true;
 }
 
+/// Harvest one completed bulk-IN burst into the receive queue (`rxq_push`), arming the IN first if it is
+/// not armed.
+///
+/// Returns the number of frames queued. Zero is the ordinary answer on a quiet network and is not
+/// a failure.
 pub fn rx(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, nic: &mut Nic,
 ) -> u32 {
@@ -1648,9 +1646,10 @@ pub const CH_NET_RX: u32 = 3;
 
 // --- The frame IPC protocol -------------------------------------------------------------------
 //
-// **These opcodes must not collide with the BLOCK ones.** `dwc2` serves `block-driver` and
-// `nic-driver` on the SAME endpoint, and a shared opcode space with two independent protocols in it
-// is a bug waiting for the first person to add an op to either. Block uses 1..5; net starts at 0x10.
+// **These opcodes must not collide with the BLOCK ones.** `dwc2` serves `block-driver`, `nic-driver`
+// and `wifi-usb` on the SAME endpoint, and a shared opcode space with independent protocols in it
+// is a bug waiting for the first person to add an op to any of them. Block uses 1..5; net starts at
+// 0x10; the radio's `godspeed_wifi::usbfn` ops start at 0x20 (`dispatch` in `main.rs` routes them).
 pub const OP_NET_INFO: u8 = 0x10;
 pub const OP_NET_TX: u8 = 0x11;
 pub const OP_NET_RX: u8 = 0x12;
@@ -1688,9 +1687,8 @@ pub fn serve(
     let body = &mut out[1..];
     let n = match p[0] {
         OP_NET_INFO => {
-            // [ok, mac(6), link]. The link bit is reported as UP: this driver does not yet read the
-            // PHY, and saying so here rather than inventing a "down" keeps net-stack from concluding
-            // the cable is out. Reading it properly is the remaining piece of this slice.
+            // [ok, mac(6), link]. (Note 2026-10-09: the link bit was once reported UP because the PHY
+            // was not read; it is read now - see below.)
             body[0] = 1;
             body[1..7].copy_from_slice(&nic.mac);
             // The PHY's own link bit, not an assumption. Reporting a hardcoded UP made net-stack
@@ -1747,8 +1745,8 @@ pub fn serve(
         // ANSWER, do not return. The comment here used to read "not a net op - the block server gets a
         // look at it", and that was false: `dispatch` takes the reply cap BEFORE calling this, so
         // returning false meant the message was consumed, no reply was sent, and the cap was leaked -
-        // one table entry per hit. The caller (`nic-driver`, in an undeadlined request_with_reply)
-        // then waited forever, `net-stack` behind it, and the shell behind that.
+        // one table entry per hit. The caller (`nic-driver`, then in an undeadlined request_with_reply;
+        // it asks with a deadline now) waited forever, `net-stack` behind it, and the shell behind that.
         //
         // Reachable two ways: any first byte >= OP_NET_INFO that is not a known op, and OP_NET_TX
         // with a one-byte payload - which is exactly what `nic-driver` sends for a zero-length frame,

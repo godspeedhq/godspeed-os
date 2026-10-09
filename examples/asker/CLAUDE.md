@@ -1,9 +1,5 @@
 # Example: asker
 
-> **Verified by `osdev test reply-server`** - asker is the client that proves the pair: it sends
-> reply-server a request carrying an embedded reply cap and asserts the echoed reply comes back
-> (`asker: reply = N (echo OK)`). Run it yourself to re-confirm.
-
 The **request/reply (RPC) CLIENT** - the request-side counterpart to `examples/reply-server`, exactly
 as `ping` is the client to `pong`. asker is what makes reply-server a *real, exercised* service: it
 sends reply-server a request carrying an embedded reply capability, blocks for the answer, and checks
@@ -23,35 +19,36 @@ whole round-trip is one standard-library call:
 let reply = gs::call::request_within(&ctx, "reply-server", &request, ASK_SECS);   // Ok(reply) | Err(gs::Error)
 ```
 
-which (see `stdlib/rust/src/call.rs`) derives a per-request reply cap from asker's OWN endpoint,
-embeds it in the request, sends it to reply-server, and blocks on asker's endpoint for the reply. It is
+which (see `stdlib/rust/src/call.rs`) derives a per-request reply cap from asker's REPLY MAILBOX
+(a second endpoint the kernel gives a receiving task for replies alone; its own endpoint only if it got
+none), embeds it in the request, sends it to reply-server, and blocks for the reply matched to that cap. It is
 a synchronous kernel `Call` with a deadline (§8.2), so it waits on truth **without hanging**: if
 reply-server dies mid-request the kernel wakes asker with `ReplyDead` at once, which the library reports
-as `Err(OutcomeUnknown)` - the request arrived, so it may have been acted on, and it is NOT re-sent - and
+as `Err(PeerDied)` - the request arrived, so it may have been acted on, and it is NOT re-sent - and
 a server that stays alive and silent is bounded by the deadline instead of waited on forever.
 
 ## What it demonstrates
 
 | Step | Call | What happens |
 |------|------|--------------|
-| Own an endpoint | (from the contract's `ipc_receive`) | reply-server sends the reply here |
+| Own an endpoint | (`SPAWN_FLAG_REQ_RECV` in its spawn row; the contract's `ipc_receive` declares it) | its own endpoint, plus a reply mailbox the reply lands in |
 | Build a request | `Message::from_bytes(...)` | the payload (an incrementing decimal here) |
-| Round-trip | `gs::call::request_within(&ctx, "reply-server", &req, ASK_SECS)` | derive reply cap from our endpoint, GRANT it embedded in the request, block for the reply |
+| Round-trip | `gs::call::request_within(&ctx, "reply-server", &req, ASK_SECS)` | derive reply cap from our reply mailbox, GRANT it embedded in the request, block for the reply |
 | Check the echo | `reply.payload_bytes() == request` | the reply must equal the request - proof the round-trip closed |
 | Recover | `gs::cap::reacquire(&ctx, "reply-server")` | on an error (peer still spawning / restarted) reacquire by name and retry next tick |
 
 ## Why it is built this way (the Commandments)
 
 - **Commandment VII (no ambient authority).** asker grants reply-server the authority to call it back by
-  embedding a reply cap - a SEND|GRANT copy of its OWN endpoint cap (`gs::cap::duplicate` of `gs::cap::self_grant`,
-  packaged inside `gs::call::request_within`). The server gets exactly that cap and nothing else; there is no
+  embedding a reply cap - a SEND|GRANT copy of its reply mailbox's grant cap (the SDK's `derive_cap`, the call
+  `gs::cap::duplicate` wraps, packaged inside `gs::call::request_within`). The server gets exactly that cap and nothing else; there is no
   "reply to the sender" channel in the kernel. *(COMMANDMENTS.md VII; CLAUDE.md §7, §8.5, §8.9.)*
 - **Commandment VIII (wait on truth, not time - and the truth must include failure).** asker blocks for
   the *reply* - the truth that the work is done - never for a fixed sleep. And it never assumes a send
   arrived: a successful send is *queued*, not processed (§8.6). Crucially, the truth it waits on includes
   **failure**: `gs::call::request_within` is a synchronous `Call`, so if reply-server dies mid-request the
   kernel wakes asker with `ReplyDead` (the reply-side twin of `EndpointDead`, §8.6) and the call returns
-  `Err(OutcomeUnknown)` instead of hanging forever - asker's `b"HANG"` path (a request reply-server deliberately never
+  `Err(PeerDied)` instead of hanging forever - asker's `b"HANG"` path (a request reply-server deliberately never
   answers) drives exactly this in the reply-test build. A reply-server restart is settled by the
   generation check (a stale peer cap is reacquired by name and the request sent once more, inside
   `request_within`), not by a delay. *(COMMANDMENTS.md VIII; CLAUDE.md
@@ -95,5 +92,5 @@ richer protocols, badge the request payload with an operation code and have the 
   avoidance), §14.3 (reacquire by name on `EndpointDead`).
 - `stdlib/rust/src/call.rs` - `request_within`, and why a request that reached its peer is never re-sent.
 - `osdev test reply-dead` - pins the peer-death path (the `b"HANG"` request: asker wakes with `ReplyDead`,
-  reported as `Err(OutcomeUnknown)`, and does NOT hang when reply-server is killed mid-request).
+  reported as `Err(PeerDied)`, and does NOT hang when reply-server is killed mid-request).
 - `examples/ping` + `examples/pong` - the one-way-IPC contrast (a producer, no reply).

@@ -21,6 +21,9 @@
 >    more work in that sentence than it looks: today it selects exactly one.
 >    *(2026-10-03: two - `audio-driver` is confined too, verified in QEMU only; on the
 >    T630 it does not use DMA yet, so there `xhci` is still the one. CLAUDE.md §6.4.)*
+>    *(2026-10-09: CLAUDE.md §6.4's note of 2026-10-08 records that the T630 confines the
+>    audio controller too - its log shows `xhci` and 00:01.1 each confined with an arena -
+>    so on that board there are two confined devices, each with its own domain ID.)*
 
 This is the narrative behind H1, the flagship trusted-base reduction. The spec
 (`CLAUDE.md`) is the authority; this document explains the *why* and the *how*.
@@ -85,8 +88,8 @@ from the trusted base.
 The implementation lives in `kernel/src/arch/x86_64/iommu.rs` (the unsafe
 hardware boundary, §18.1). Every raw access carries a `// SAFETY:` argument; the
 file is fully accounted in `audits/unsafe-audit.md`. The rest of the kernel touches
-it only through three safe entry points: `bringup`, `confine_device`,
-`release_device`.
+it only through five safe entry points: `detect`, `bringup`, `confine_device`,
+`release_device` and `drain_event_log`.
 
 ### Phase 0 - detection (`detect`)
 
@@ -110,8 +113,9 @@ Allocate and program the IOMMU's three core structures:
 - **Device table** - one 256-bit Device Table Entry (DTE) per 16-bit PCI BDF
   (full 2 MiB table). Every entry defaults to **passthrough** (`V=1, TV=0,
   IR=1, IW=1`), so when translation is later switched on, the disk and every
-  other device keep DMAing untranslated. Only the USB controllers get switched
-  to a confined domain.
+  other device keep DMAing untranslated. Only a device whose spawn asks for
+  confinement gets switched to a confined domain (`xhci`, and since 2026-10-03
+  `audio-driver`).
 - **Command buffer** - the ring through which we issue cache-invalidation
   commands to the IOMMU.
 - **Event log** - the ring on which the IOMMU posts translation faults.
@@ -288,7 +292,9 @@ amendment fixed:
      ```
 
      So the only driver confined on the T630 holds no path to its own MSI message. (`audio-driver`,
-     confined in QEMU since 2026-10-03, is the same case: QEMU's HD Audio controller uses plain MSI.)
+     confined in QEMU since 2026-10-03, is the same case: QEMU's HD Audio controller uses plain MSI.
+     2026-10-09: the T630 confines its audio controller too (CLAUDE.md §6.4, note of 2026-10-08);
+     which MSI form that controller takes on the T630 is not recorded here.)
    - **MSI-X (capability 0x11)** keeps the message table in **MMIO inside a BAR** (`bir=0` on
      every controller observed here, so BAR0 - the window a driver is granted), and the driver
      holds that BAR. A compromised driver could point its own interrupt elsewhere. Observed on

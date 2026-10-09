@@ -17,10 +17,10 @@ secretly does both; GodspeedOS keeps them distinct because they are different ac
 ## 2. Usage
 
 ```
-move 0.4.0 - relocate a file
+move 0.4.0 - relocate a file or directory
 
 usage:
-  move <src> <dst>    move the file <src> to <dst>
+  move <src> <dst>    move <src> to <dst>
   move version        print the version
   move help           print this message
 
@@ -73,7 +73,10 @@ words, not a guess made at the prompt:
 | the destination already exists | `move: failed - dest exists` |
 | the destination's parent is a file | `move: failed - dest not a directory` |
 | moving a directory into itself or its subtree | `move: cannot move into itself` (the shell's own check, before the round trip) |
-| storage is not available | `move: storage unavailable` |
+| storage is not available | `storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)` |
+| no answer came back (a lost reply, or `fs` died holding it) | `move: OUTCOME UNKNOWN - ... it MAY HAVE SUCCEEDED. Not re-sent - ...` |
+
+Success prints `moved <src> → <dst>`.
 
 **This table used to say the first two were indistinguishable** - "the same line; `fs` distinguishes
 them in its log". That was true and it was the wrong place to leave it: the reason was already in

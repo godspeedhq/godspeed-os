@@ -11,7 +11,9 @@
 `uptime` answers **how long has the system been running since boot?** It reports a
 human-readable elapsed time (`Nd HH:MM:SS`) and the raw total in seconds. It is a **wall-clock
 delta** - the kernel records the RTC time at boot, and `uptime` subtracts it from the current
-RTC time. This is portable and accurate regardless of the APIC timer mode (a raw timer-tick
+time on the kernel's monotonic clock. On a board with no RTC the monotonic clock already counts
+from boot, so it is the uptime directly. This is portable and accurate regardless of the APIC
+timer mode (a raw timer-tick
 counter is *not*: it runs at ~100 Hz on TSC-deadline hardware but ~10 Hz under QEMU's periodic
 timer, so ticks→seconds would be platform-dependent).
 
@@ -41,20 +43,22 @@ gsh> uptime | to yaml
 
 ## 4. Data source
 
-`uptime_secs()` = `datetime().epoch_secs()` − `boot_datetime().epoch_secs()`, where:
-- `datetime()` → `InspectKernel` query 11 (current RTC time), and
+`ServiceContext::uptime_secs()` (through `gs::task::uptime_secs`) = `epoch_secs_monotonic()` −
+`boot_datetime().epoch_secs()`, where:
+- `epoch_secs_monotonic()` → `InspectKernel` query 17: the RTC's epoch seconds with backward and
+  wild-forward readings dropped on x86, and seconds since boot on the boards with no RTC; and
 - `boot_datetime()` → `InspectKernel` query 12 (`rtc::boot_datetime()`): the RTC time captured
-  once in `kernel_main` (`rtc::capture_boot_time`) at boot.
+  once at boot.
 
-Both packed datetimes are decoded by the SDK's `Datetime` (the same `epoch_secs` math `date`
-uses), so the delta is plain wall-clock seconds. Chosen over the kernel's monotonic tick counter
+A boot datetime before 2001 (a board with no RTC reports zeros) means the monotonic value is
+used as-is. The result never goes below 0. Chosen over the kernel's tick counter
 because that counter's *rate* is not portable (TSC-deadline HW ticks at 100 Hz; QEMU's periodic
 timer at ~10 Hz), which would make a ticks→seconds conversion platform-dependent.
 
 ## 5. Capabilities
 
-- **None gating the read.** Query 12 is **ungated** - uptime is task-neutral hardware-ish
-  info, like the TSC (query 3) and RTC (query 11). No `INTROSPECT` cap required.
+- **None gating the read.** Queries 12 and 17 are **ungated** - uptime is task-neutral
+  hardware-ish info, like the TSC (query 3) and RTC (query 11). No `INTROSPECT` cap required.
 - **Console output** to print the grid.
 
 ## 6. Non-goals

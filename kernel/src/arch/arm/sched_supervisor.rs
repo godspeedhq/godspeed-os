@@ -6,11 +6,12 @@
 //! (`task::spawn_supervisor`, Path C / Phase 5) - and the supervisor, a userspace service, reads its
 //! boot manifest and spawns everything else through the spawn syscall (which routes to the neutral
 //! `spawn_service_with_config`, proven on ARM in 4a). On the Pi 2 the supervisor spawns the services
-//! whose ARM ELFs exist (`events`, `pong`, `ping`); the hardware services (xhci/ehci/nic/block/fs) are
-//! empty placeholders here, so those spawns fail and are skipped (the supervisor ignores spawn errors),
-//! exactly the "system continues with the services that did start" behaviour §9.2/§11.3 specify. The
-//! kernel wires `ping`'s SEND cap to `pong` from the name directory at spawn, so ping->pong IPC runs -
-//! the same message flow as `sched_ipc`, now driven by the real supervisor rather than the kernel.
+//! whose ARM ELFs are embedded (the `arm_built` list in `kernel/build.rs`: the shell, `dwc2`,
+//! `block-driver`/`fs`, `nic-driver`/`net-stack` and the rest); a service still built as an empty
+//! placeholder (xhci/ehci among them) fails to spawn and is skipped, exactly the "system continues with
+//! the services that did start" behaviour §9.2/§11.3 specify. `ping`'s SEND cap to `pong` comes from
+//! the send peers in the supervisor's spawn request (CLAUDE.md 13.6), so ping->pong IPC runs - the same
+//! message flow as `sched_ipc`, now driven by the real supervisor rather than the kernel.
 
 use core::sync::atomic::Ordering;
 
@@ -43,7 +44,8 @@ pub fn run(ram_end: u32, reserve_end: u32) -> ! {
 
     // Mask IRQs before arming the neutral scheduler: the timer must not preempt this bootstrap into the
     // scheduler context before run(0) seeds its cr3, or that context is left with TTBR0=0 and the first
-    // task to block wedges core 0. Same fix as sched_shell; the scheduler loop re-enables IRQs.
+    // task to block wedges core 0. Same fix as the other `sched_*` paths; the scheduler loop
+    // re-enables IRQs.
     super::irq::disable_interrupts();
     super::irq::NEUTRAL_SCHED.store(true, Ordering::Relaxed);
     pl011_write(b"sched-supervisor: entering scheduler::run(0) - the supervisor now drives the boot.\r\n");

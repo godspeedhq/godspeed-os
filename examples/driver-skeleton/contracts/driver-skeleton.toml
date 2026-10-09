@@ -1,7 +1,7 @@
 # A userspace device driver contract. It declares EXACTLY the hardware it touches and nothing
-# more (Commandment VII: no ambient authority). The kernel validates these fields at spawn and
-# grants capabilities ONLY for the named MMIO range and IRQ line (CLAUDE.md §12.3, §13.6); the
-# driver can reach nothing else on the machine. Declare only what your device actually needs.
+# more (Commandment VII: no ambient authority). Nothing parses this file at spawn (CLAUDE.md 13.6):
+# the kernel grants only the window and interrupt of the device CLASS the supervisor's spawn row
+# names, so the driver can reach nothing else. Declare only what your device actually needs.
 name    = "driver-skeleton"
 version = "0.1.0"
 
@@ -14,22 +14,23 @@ limit   = "16MiB"
 [capabilities]
 # Explicit grants only (Commandment VII). The FULL set of declarable capabilities is in
 # `contracts/schema/service.schema.json` (validated by `osdev validate`) and `contracts/CLAUDE.md`.
-# The complete set of options: ipc_send, ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio
-# (+ service_control, supervisor-only). A driver uses the hw_* options:
+# The options: ipc_send, ipc_receive, log_write, the authority keys (console_push, resource_mint,
+# service_control, cpu_clock, pci_cfg) and the hw_* keys. A driver uses the hw_* options:
 
-# hw_mmio: the device's MMIO register window(s), as "0xBASE+0xSIZE" in hex. The kernel maps THIS
-# range (and only this range) into the driver's address space; reach it via ctx.mmio().
+# hw_mmio: the device's MMIO register window(s), as "0xBASE+0xSIZE" in hex. A STATEMENT for review,
+# not the grant: the kernel maps the window of the device class the spawn request names, from its own
+# bus scan, and never an address a request supplies (CLAUDE.md 13.6). Reach it via ctx.mmio().
 hw_mmio      = ["0xfeb00000+0x1000"]
 
-# hw_interrupt: the device's IRQ line(s), each 0-255. The kernel routes this interrupt to the
-# driver's endpoint as an IPC message (§12.2); the driver recv()s it and re-arms with
-# ctx.irq_unmask(vector).
+# hw_interrupt: the device's IRQ line(s), each 0-255, stated for review the same way. The kernel
+# routes the granted class's interrupt to the driver's endpoint as an IPC message (§12.2); the driver recv()s it and re-arms with
+# gs::driver::irq::Irq::granted(ctx).rearm(ctx) - the vector the kernel granted, never one of ours.
 hw_interrupt = [11]
 
-# hw_pio = ["0xBASE+0xLEN"] is the option for kernel-mediated I/O PORTS (not used here).
-# NOTE: a DMA arena is NOT a contract field - it is granted at spawn to recognised DMA drivers
-# (reach it via ctx.dma_region()); recognising a NEW driver is a small kernel-side hook, shown
-# working in the e1000 example.
+# hw_pio is a DEAD key (the ATA-PIO backend was retired; the schema keeps it only until v2): never declare it.
+# NOTE: a DMA arena is NOT a contract field - it is granted at spawn when the supervisor's spawn row
+# names the driver's device CLASS (reach it via ctx.dma_region()). A new driver needs a spawn row,
+# not a kernel change.
 log_write    = true   # may write the kernel log ring + serial (syscall 5); NOT to any service
 
 [placement]

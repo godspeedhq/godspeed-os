@@ -84,8 +84,9 @@ delete /sc_fmt.gsh
 #
 # THE FIRST BLOCK IS THE IMPORTANT ONE, and it is why churn belongs in here at all.
 #
-# `churn` exists to be INTERRUPTED. The commit-to-checkpoint window is sub-millisecond, so the only
-# way a human ever lands in it is to write thousands of transactions and pull the cord. When that
+# `churn` exists to be INTERRUPTED. The commit-to-checkpoint window is short (sub-millisecond on an
+# AHCI SSD, a large fraction of each transaction on a USB stick - CLAUDE.md 6.1, 2026-09-23), so the
+# way a human lands in it is to write thousands of transactions and pull the cord. When that
 # happens the machine reboots with `/churn` still on disk, holding the only evidence of whether
 # recovery held - and that evidence is destroyed by the next churn that overwrites it.
 #

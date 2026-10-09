@@ -21,7 +21,8 @@
 //! may ask, for how long, and when to go back. The rule is a LEASE - see `docs/power.md`:
 //!
 //! - `OP_HOLD [1, secs]` opens a lease of `secs` seconds (0 means `DEFAULT_SECS`, capped at `MAX_SECS`)
-//!   and answers `[status, lease, hz:u32]`. While any lease is open the clock is at its maximum.
+//!   and answers `[status, lease, hz:u32]` - `hz` is the rate this lease set, and 0 when another lease
+//!   already held the clock at its maximum. While any lease is open the clock is at its maximum.
 //! - `OP_RELEASE [2, lease]` closes it early and answers `[status]`. When none is open, the minimum.
 //! - A lease nobody releases EXPIRES. A holder that dies or hangs mid-way therefore cannot pin the
 //!   machine at full power: it lasts `MAX_SECS` at most, and the expiry is said (26.7). No death

@@ -9,15 +9,15 @@
 //! `osdev` - host-side developer CLI (§17).
 //!
 //! Commands:
-//!   osdev new <name>        - scaffold a new service
+//!   osdev new <name>        - scaffold a new service (NOT IMPLEMENTED: `todo!()`)
 //!   osdev build             - build kernel + all services
 //!   osdev run               - boot in QEMU (--smp N)
-//!   osdev publish           - package + serve a service
+//!   osdev publish           - package + serve a service (NOT IMPLEMENTED: `todo!()`)
 //!   osdev restart <service> - restart a service in the running OS
 //!   osdev logs <service>    - tail service logs
-//!   osdev status <service>  - show state + assigned core
-//!   osdev caps <service>    - show held capabilities
-//!   osdev test identity         - run §22 identity test suite (20 tests)
+//!   osdev status <service>  - show state + assigned core (NOT IMPLEMENTED: `todo!()`)
+//!   osdev caps <service>    - show held capabilities (NOT IMPLEMENTED: `todo!()`)
+//!   osdev test identity         - run §22 identity test suite (24 cases)
 //!   osdev test identity-brutal  - run brutal identity tests + SMP escalation (Milestone 15)
 //!   osdev test property         - run §22 property test suite
 //!   osdev test property-brutal  - run brutal property tests BP1-BP10 (Milestone 16)
@@ -31,8 +31,11 @@
 //!   osdev test adv-brutal   - run brutal adversarial tests BA1-BA10 (Milestone 20)
 //!   osdev test chaos        - run §22 chaos / graceful-degradation test suite (Milestone 14)
 //!   osdev test chaos-brutal - run brutal chaos tests BC1-BC7 (Milestone 21)
-//!   osdev test shell        - scripted shell smoke-test (help, cores, status, unknown)
-//!   osdev image [--mode M]  - build + create bootable USB image (build/os-usb.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8
+//!   osdev test shell        - scripted shell suite (help, cores, status, unknown, and much more)
+//!   osdev test <other>      - many more suites; `cmd_test` below is the full list
+//!   osdev image [--mode M]  - build + create bootable USB image (build/os-usb.img); M=bare-metal|perf|perf-brutal|identity|stress|adv|chaos|fuzz|s8 and more (`cmd_image`)
+//!   osdev conform           - the enforcement layer's front door (`docs/conformance.md`)
+//!   osdev validate | mkfs | script-disk | shell
 
 mod crc32;
 mod disk_image;
@@ -76,7 +79,7 @@ enum Commands {
     Status { service: String },
     /// Show capabilities held by a service.
     Caps { service: String },
-    /// Run the identity test suite (§22).
+    /// Run a test suite by name (`identity`, `fs-all`, `shell`, ...; see `cmd_test`).
     Test { suite: String },
     /// Build + create the bootable USB image at build/os-usb.img without launching QEMU.
     /// (Distinct from `osdev run`, which writes the QEMU/BIOS image at build/os.img.)
@@ -84,7 +87,7 @@ enum Commands {
     Image {
         /// Supervisor feature baked into the image.
         ///
-        /// bare-metal  - pong + ping + observe; no probe services (default; S6 24-hour stability)
+        /// bare-metal  - the daily-driver set, settling at `gsh>`; no ping/pong, no probe services (default)
         /// perf        - regular perf probes B1-B10
         /// perf-brutal - brutal perf probes BP1-BP10
         /// identity    - identity-only probes (WatchSerial tests; WithRestart needs COM2)
@@ -467,6 +470,11 @@ const EXTRA_CHECKS: &[&str] = &[
     // and may not rise, per crate, and a new crate starts at zero. On the build path from its first day, so
     // it is never a release-time surprise the way the shared-surface ratchet was.
     "scripts/one_way_check.py",
+    // ...and the other direction: an ordinary service that needs an SDK item `gs` has no route for. It
+    // was on NO build path and had been failing on `main` (10 against a baseline of 8) since the audio
+    // and radio drivers arrived, because its driver list is hand-kept. Found by the 2026-10-09 audit;
+    // the list was corrected the same day. A checker on one build path is a checker on none.
+    "scripts/stdlib_gap_check.py",
 
     // ---- AND THE COMMENTS, which the audit above could not finish ------------------------------
     //
@@ -499,7 +507,7 @@ const EXTRA_CHECKS: &[&str] = &[
 
 /// `osdev conform` - forward to `scripts/conform.py` and pass its exit code through.
 ///
-/// DELIBERATELY A SHIM. `conform` stays a script for the same reason the seventeen checkers do: it IS
+/// DELIBERATELY A SHIM. `conform` stays a script for the same reason the checkers in `EXTRA_CHECKS` do: it IS
 /// the enforcement layer, Python is already a hard dependency (this binary refuses to build without
 /// it), and re-implementing it in Rust is the optional half `docs/conformance.md` records as declined.
 /// A wrapper that forwards cannot drift from the thing it forwards to.
@@ -695,8 +703,8 @@ const SERVICE_CRATES: &[&str] = &[
     "resource-server", "holder", "power", "audio-driver", "wifi-usb",
 ];
 
-/// Build for bare-metal USB: supervisor with `--features bare-metal` (pong + ping only,
-/// no probe services that require the QEMU harness control port to complete).
+/// Build for bare-metal USB: supervisor with `--features bare-metal` (the daily-driver set, no
+/// ping/pong and no probe services that require the QEMU harness control port to complete).
 pub fn cmd_build_bare_metal() {
     clean_supervisor();
     let non_supervisor = SERVICE_CRATES;
@@ -737,11 +745,6 @@ pub fn cmd_build_bare_metal() {
     println!("build: kernel OK");
 }
 
-/// Build for `osdev test counter`: the bare-metal set PLUS `counter`. Same as `cmd_build_bare_metal`
-/// (shell + block-driver + fs over an AHCI disk) but the supervisor also gets the `counter-test`
-/// feature, so it spawns `examples/counter` - the stateful service that persists its count to `fs`
-/// and recovers it across its own restart (§14/§15). `counter` is kept out of the daily-driver image
-/// (plain `bare-metal`) so its per-tick disk writes are test-only.
 /// Build for `osdev test examples`: the bare-metal set PLUS the five examples nothing else runs.
 ///
 /// Same shape as `cmd_build_counter`, with `examples-test` in place of `counter-test`. The example
@@ -790,6 +793,11 @@ pub fn cmd_build_examples() {
     println!("build: kernel OK");
 }
 
+/// Build for `osdev test counter`: the bare-metal set PLUS `counter`. Same as `cmd_build_bare_metal`
+/// (shell + block-driver + fs over an AHCI disk) but the supervisor also gets the `counter-test`
+/// feature, so it spawns `examples/counter` - the stateful service that persists its count to `fs`
+/// and recovers it across its own restart (§14/§15). `counter` is kept out of the daily-driver image
+/// (plain `bare-metal`) so its per-tick disk writes are test-only.
 pub fn cmd_build_counter() {
     clean_supervisor();
     let non_supervisor = SERVICE_CRATES;
@@ -1231,8 +1239,6 @@ pub fn cmd_build_b2_only() {
     println!("build: kernel OK");
 }
 
-/// BP2 brutal-isolation build: spawns only perf-bp2 + perf-bp2-echo alongside pong/ping.
-/// Brutal equivalent of b2-only - 1000-sample iteration count, same isolation rationale.
 /// Per-probe isolation build (`perf-iso` umbrella + one `iso-bpN` sub-feature).
 /// Spawns exactly one brutal perf probe (+ its partners), no ping/pong, no other
 /// probes - for clean, uncontended per-op latency on hardware. `feature` is the
@@ -1278,6 +1284,9 @@ pub fn cmd_build_perf_iso(feature: &str) {
     println!("build: kernel OK");
 }
 
+/// BP2 brutal-isolation build: spawns only perf-bp2 + perf-bp2-echo, and NOT pong/ping (the
+/// supervisor's pong/ping spawn is compiled out under `bp2-only`).
+/// Brutal equivalent of b2-only - 1000-sample iteration count, same isolation rationale.
 pub fn cmd_build_bp2_only() {
     clean_supervisor();
     let non_supervisor = SERVICE_CRATES;
@@ -2936,12 +2945,6 @@ fn run_reply_server_test() {
     crate::shell_test::run_reply_server(&image_path, 4);
 }
 
-/// Reply-side death-wake: a caller blocked awaiting a reply wakes with `ReplyDead`, it does not hang
-/// (§8.6, Commandment VIII; kernel syscall 41 `Call`). Reuses the reply-test build (bare-metal set +
-/// reply-server + asker) with a COM2 control channel. `asker` sends the server a request it never
-/// answers (b"HANG") and blocks for the reply; the harness KILLs `reply-server` while asker is blocked
-/// and asserts asker wakes with `ReplyDead` (`request_with_reply` -> None) instead of hanging - the
-/// reply-side twin of §22 Test 4 (a blocked sender wakes with `EndpointDead`). No panic.
 /// `trace` against a REAL blocked chain (`utilities/46_trace.md`, mechanism A).
 ///
 /// The multi-hop walk is the one thing a healthy machine cannot prove: with nothing blocked, the
@@ -2961,6 +2964,12 @@ fn run_trace_chain_test() {
     crate::shell_test::run_trace_chain(&image_path, 4);
 }
 
+/// Reply-side death-wake: a caller blocked awaiting a reply wakes with `ReplyDead`, it does not hang
+/// (§8.6, Commandment VIII; kernel syscall 41 `Call`). Reuses the reply-test build (bare-metal set +
+/// reply-server + asker) with a COM2 control channel. `asker` sends the server a request it never
+/// answers (b"HANG") and blocks for the reply; the harness KILLs `reply-server` while asker is blocked
+/// and asserts asker wakes with `ReplyDead` (`request_with_reply` -> None) instead of hanging - the
+/// reply-side twin of §22 Test 4 (a blocked sender wakes with `EndpointDead`). No panic.
 fn run_reply_dead_test() {
     println!("\n=== reply-dead: a blocked caller wakes with ReplyDead on peer death, never hangs (§8.6, VIII) ===");
     cmd_build_reply();
@@ -3957,7 +3966,6 @@ fn run_fs_ioretry_test() {
     }
 }
 
-/// Build bare-metal image and run the scripted shell smoke-test.
 /// `osdev test chaos-repro[:rounds[:iters]]` - loop `chaos max-carnage` in one boot (`backlog/48`).
 fn run_chaos_repro_test(spec: &str) {
     let mut it = spec.split(':').skip(1);
@@ -3976,6 +3984,7 @@ fn run_chaos_repro_test(spec: &str) {
     crate::shell_test::run_chaos_repro(&image_path, 4, rounds, iters);
 }
 
+/// Build bare-metal image and run the scripted shell suite.
 fn run_shell_test() {
     cmd_build_bare_metal();
 

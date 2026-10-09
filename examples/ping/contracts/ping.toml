@@ -1,6 +1,8 @@
 # Service contract for `ping` - the demo client. This is a BUILD-TIME declaration, not what the
 # kernel reads at spawn - nothing parses TOML there (13.6). `ping` can do only what the SPAWN
-# REQUEST granted; this file is reconciled against it (Commandment VII).
+# REQUEST granted; for an example only the authority keys are
+# reconciled against it (`IV-contract-authority`); memory, placement and peers are kept in step by hand
+# (Commandment VII).
 name    = "ping"
 version = "0.1.0"
 
@@ -15,9 +17,10 @@ limit   = "64MiB"
 # Explicit grants only - `ping` can do ONLY what is listed (Commandment VII, no ambient
 # authority). The FULL set of declarable capabilities is in `contracts/schema/service.schema.json`
 # (what `osdev validate` checks) and `contracts/CLAUDE.md`. The options are: ipc_send,
-# ipc_receive, log_write, hw_mmio, hw_interrupt, hw_pio (+ service_control, supervisor-only).
+# ipc_receive, log_write, the authority keys
+# (console_push, resource_mint, service_control, cpu_clock, pci_cfg) and the driver hw_* keys.
 ipc_send    = ["pong"]   # may SEND to pong (the peer). Reacquiring pong after a restart goes through the
-                         # kernel NAME DIRECTORY (a syscall: ctx.reacquire_by_name -> reacquire_cap), not a
+                         # kernel NAME DIRECTORY (a syscall: gs::cap::reacquire -> reacquire_cap), not a
                          # contracted send-peer.
 ipc_receive = ["ping"]               # OWNS and receives on its own "ping" endpoint
 log_write   = true                   # may write the kernel log ring + serial (syscall 5); NOT to any service

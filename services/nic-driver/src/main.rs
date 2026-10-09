@@ -8,12 +8,18 @@
 #![deny(unsafe_code)]
 //! nic-driver - the userspace NIC driver service (docs/networking.md, Phase 1).
 //!
-//! Model-specific driver for the Intel 82540EM ("e1000"), the QEMU dev NIC. An ordinary restartable,
-//! IOMMU-confinable userspace service (Commandment I): the kernel grants it only the NIC's MMIO BAR +
-//! a DMA arena, by name, and only when the discovered NIC is a real Intel e1000; all device logic
-//! lives here, `unsafe`-free behind the SDK `Mmio`/`Dma` wrappers (§18.1). The T630's Realtek chipset
-//! is a separate Phase-4 driver behind the same frame interface, so `net-stack` never learns the
-//! difference.
+//! The link's front end, one backend per board behind one frame interface, so `net-stack` never
+//! learns the difference: the Intel 82540EM ("e1000", the QEMU dev NIC) and the Realtek RTL8168 (the
+//! T630) in this file, GENET (`genet.rs`, the Pi 4) and dwmac (`dwmac.rs`, the VisionFive 2), and on
+//! the Pi 2 a bridge to the SMSC LAN9514 that the `dwc2` service drives (`kernel_net_main`). Where a
+//! board has a radio, the same frame ops carry the frames to it when the cable is out (`radio.rs`).
+//! An ordinary restartable userspace service (Commandment I): the kernel grants it a register window
+//! and a DMA arena from the spawn request - by PCI class 0x020000 on x86, by device kind elsewhere -
+//! and all device logic lives here, `unsafe`-free behind the SDK `Mmio`/`Dma` wrappers (§18.1).
+//!
+//! The progress list below is the e1000's Phase 1 history (2026-10-09: step 5's "the reply payload IS
+//! the frame that came back" no longer holds - a transmit is answered with one status byte, and frames
+//! arrive only through the receive ops [4] and [9]).
 //!
 //! Phase 1 progress:
 //!  - step 2: reset the controller + read the link state and the MAC (from EEPROM).
@@ -41,8 +47,8 @@ use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
 /// is the ONLY path - the kernel drives no ethernet at all (Commandment I).
 #[cfg(target_arch = "aarch64")]
 mod genet;
-/// The VisionFive 2's Synopsys DesignWare MAC. Identification only so far - see the module header
-/// for why that is a step rather than a stub.
+/// The VisionFive 2's Synopsys DesignWare MAC: identification (`dwmac.rs`) and the rings that carry
+/// frames (`dwmac_ring.rs`).
 #[cfg(target_arch = "riscv64")]
 mod dwmac;
 #[cfg(target_arch = "riscv64")]
@@ -200,7 +206,6 @@ const RTL_TPPOLL_NPQ: u8 = 0x40;
 const RTL_ISR_RDU:  u16 = 1 << 4;  // Rx Descriptor Unavailable - the ring filled; RX HALTS until recovered
 const RTL_ISR_FOVW: u16 = 1 << 6;  // Rx FIFO Overflow - also halts RX until the ring is re-armed
 
-// C+ 16-byte descriptor word 0 (opts1): flags in the high bits, length/size in the low 14 bits.
 /// Empty RX drains before this driver reports the chip's own counters, once. TWO triggers, because
 /// "never received anything" and "stopped receiving" need very different thresholds.
 ///
@@ -218,6 +223,7 @@ const RX_SILENCE_NEVER: u32 = 256;
 /// legitimately, so it is high - and the report is one line per driver lifetime either way.
 const RX_SILENCE_STALLED: u32 = 20_000;
 
+// C+ 16-byte descriptor word 0 (opts1): flags in the high bits, length/size in the low 14 bits.
 const RTL_DESC_OWN: u32 = 1 << 31; // owned by the NIC (set = NIC's; it clears the bit when done)
 const RTL_DESC_EOR: u32 = 1 << 30; // end of ring (the last descriptor - the NIC wraps here)
 const RTL_DESC_FS:  u32 = 1 << 29; // first segment (TX)
@@ -315,8 +321,6 @@ fn realtek_main(ctx: ServiceContext) -> ! {
     }
 }
 
-/// Arm RX descriptor `i`: point it at its 2 KiB buffer and hand ownership to the NIC (OWN set), with
-/// EOR on the last descriptor so the NIC wraps the ring. Written OWN-last (the addr is valid first).
 /// Note a reply that could not be delivered, instead of discarding the outcome.
 ///
 /// Every reply here is `try_send` and not `send`, which is right: this is a server, and §8.9 requires
@@ -327,7 +331,7 @@ fn realtek_main(ctx: ServiceContext) -> ! {
 /// wedge. It is still a failure, and §26.7 says a failure is reported and never swallowed: without
 /// this, a caller timing out looks like a slow device rather than a reply the queue had no room for.
 ///
-/// Rate-limited on the same pattern as `tx_fail` above: the first, then every 64th. A reply fails when
+/// Rate-limited on the same pattern as `radio_tx_fail` in the serve loops: the first, then every 64th. A reply fails when
 /// the caller's queue is full, which under a chaos storm is a burst rather than a one-off, and an
 /// unbounded log there would bury the thing it is reporting.
 fn note_reply<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
@@ -340,6 +344,8 @@ fn note_reply<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
     }
 }
 
+/// Arm RX descriptor `i`: point it at its 2 KiB buffer and hand ownership to the NIC (OWN set), with
+/// EOR on the last descriptor so the NIC wraps the ring. Written OWN-last (the addr is valid first).
 fn rtl_arm_rx(arena: &Dma, i: usize) {
     let d = RX_RING_OFF + i * 16;
     let buf = arena.phys_at(RX_BUF_OFF + i * RX_BUF_SIZE);
@@ -369,8 +375,9 @@ pub(crate) fn cycles(ctx: &ServiceContext, ms: u64) -> u64 {
 /// Realtek RTL8168 C+ TX/RX (Phase 4, STAGE B): set up the C+ descriptor rings in the DMA arena, enable
 /// the receiver + transmitter, and serve the frame interface FOR REAL - transmit each request frame and
 /// hand back whatever arrives on the wire (§8.2, mirroring the e1000 serve loop with RTL8168 registers
-/// and 16-byte C+ descriptors). A 1-byte `[3]` STATUS query still returns [reset_ok, mac(6)] (the `net`
-/// nic-mac diagnostic). The receiver stays on, so background broadcasts are DRAINED before each TX.
+/// and 16-byte C+ descriptors). A 1-byte `[3]` STATUS query returns the 32-byte hardware status with
+/// the cable in, and the nine-byte `radio::status` answer with it out. The receiver stays on; each
+/// transmit re-arms the receive ring first (see "RESET THE RECEIVER per frame request" below).
 /// Never returns.
 fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool, mac: &[u8; 6]) -> ! {
     arena.zero();
@@ -822,7 +829,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     }
 }
 
-/// Serve the frame interface. A 1-byte `[3]` STATUS query gets `sreply` ([ok, mac(6)]) back - the
+/// Serve the frame interface. A 1-byte `[3]` STATUS query gets `sreply` ([ok, mac(6), link]) back - the
 /// `net` nic-mac diagnostic. Every other request (a frame from net-stack) gets a one-byte `[1]`, so
 /// net-stack degrades rather than hangs (§26.7). Never returns.
 fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
@@ -844,13 +851,14 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     }
 }
 
-/// Kernel-NIC backend: bridge the frame IPC (the request/reply contract net-stack speaks) to whatever
-/// network device the kernel drives, via the NET_DEVICE syscalls. Pure mechanism, mirroring the
-/// e1000/rtl serve loops - the frame IS the message; net-stack owns all protocol. A request payload of
-/// exactly 1 byte 3/4/5/6/7/8/9 is an opcode; any other payload is a raw ethernet frame to transmit.
+/// The Pi 2's backend (the name is history: it once reached a kernel-driven device through the
+/// NET_DEVICE syscalls): bridge the frame IPC (the request/reply contract net-stack speaks) to the USB
+/// ethernet the `dwc2` service drives. Pure mechanism, mirroring the e1000/rtl serve loops - the frame IS
+/// the message; net-stack owns all protocol. A request payload of exactly 1 byte 3/4/5/6/7/8/9/10 is an
+/// opcode; any other payload is a raw ethernet frame to transmit.
 ///
-/// **Pi 2 (arm32) only.** The device is a DWC2 CDC-ECM USB-net adapter driven by the `dwc2` SERVICE,
-/// so this reaches it by IPC (ops 0x10 INFO / 0x11 TX / 0x12 RX) rather than by syscall.
+/// **Pi 2 (arm32) only.** The device is the board's SMSC LAN9514 (smsc95xx) USB ethernet, driven by the
+/// `dwc2` SERVICE, so this reaches it by IPC (ops 0x10 INFO / 0x11 TX / 0x12 RX) rather than by syscall.
 ///
 /// It used to compile on aarch64 too, and carried a SECOND body - `ctx.net_info` / `net_frame_tx` /
 /// `net_frame_rx`, the NET_DEVICE syscalls - selected by `#[cfg(not(target_arch = "arm"))]` for the
@@ -895,8 +903,8 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
     // to the disk.
     // ONE request to `dwc2`, with a single reacquire-and-retry. `find_send_slot` does NOT resolve a
     // name - it reads the spawn-time wiring and a cache - so a peer spawned AFTER us is unreachable
-    // forever unless we reacquire. `dwc2` is exactly that peer (it is spawned by hand today), and the
-    // failure is silent from here: `request_with_reply` returns None INSTANTLY, which reads as a dead
+    // forever unless we reacquire. `dwc2` is exactly that peer whenever it restarts after us (the
+    // supervisor spawns it at boot; chaos restarts it in any order), and the failure is silent from here: the send fails INSTANTLY (`Err(Unreachable)`), which reads as a dead
     // cable rather than a missing cap. block-driver learned this in slice 3c; this is the same edge.
     // WHICH KIND of RPC failure, because `None` below means two opposite things. dwc2 reports 9 real
     // transmit failures out of 364 while this layer reported 320, so the frames ARE going out and
@@ -942,7 +950,9 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         //
         // The one legitimate retry is a SEND failure, which is distinguishable from a timeout:
         // `find_send_slot` reads spawn-time wiring, so a peer spawned after us is unreachable until
-        // reacquired. A send that never left is safe to repeat; a request that may already be
+        // reacquired. A send that never left is safe to repeat; a request that may already be in
+        // flight is not.
+        //
         // CALL, not send-then-plain-recv. A plain recv takes whatever is next on this endpoint, and
         // this service SERVES clients on the very endpoint it was awaiting dwc2's reply on - so it
         // was dequeuing net-stack's requests and dropping them. The log named them outright:
@@ -959,12 +969,13 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
         // reason the primitive exists; this path predates it.
         // THE ONE LEGITIMATE RETRY, and the reason this asks for the error instead of an Option.
         //
-        // `Ok(None)` is the DEADLINE passing: dwc2 is alive and may still answer, so re-sending is
-        // the desync described at length above and must not happen. `Err(_)` is the send FAILING -
-        // our wiring names a dwc2 that no longer exists, so nothing is in flight and nothing can
-        // arrive late. Those are opposite conditions and only the second is safe to repeat, which is
-        // why `request_with_reply_call` (which collapses both to `None`) is the wrong primitive here, and why
-        // this is `gs::call::request_once` rather than `request_within`: the retry is this code's own.
+        // `Err(OutcomeUnknown)` is the DEADLINE passing: dwc2 is alive and may still answer, so
+        // re-sending is the desync described at length above and must not happen. Every other `Err`
+        // is safe to repeat against a reacquired dwc2: a send that never left (our wiring names a dwc2
+        // that no longer exists, so nothing is in flight), or `PeerDied`, a dwc2 that took the request
+        // and died - the dead instance cannot answer late, though the frame may already have gone out,
+        // and a repeated frame is something the network above already survives. That is why this is
+        // `gs::call::request_once` rather than `request_within`: the retry is this code's own.
         //
         // It matters because it is the ordinary case, not an edge one. `find_send_slot` reads
         // spawn-time wiring, so a dwc2 respawned AFTER us is unreachable forever unless we reacquire
@@ -1271,14 +1282,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // Every backend below takes `ServiceContext` and diverges, so this is a dispatch and nothing more;
     // no backend is reachable from another and none of them returns. Each one is a whole MAC, so the
-    // module is gated too (line 33) - compiling GENET's ~1,450 lines into a RISC-V image would be dead
+    // module is gated too (the `mod` lines at the top of this file) - compiling GENET's ~1,450 lines into a RISC-V image would be dead
     // weight in a service with a 16 MiB limit, not just dead code.
     //
     // THE TWO HALVES OF THIS ARE NOT THE SAME KIND OF QUESTION, and the difference is the whole point:
     //
     //   * The x86 arm asks the DEVICE (`nic_vendor_device()`, a PCI identity the kernel discovered at
-    //     runtime). Put a third NIC in that machine and this service picks it up without a rebuild -
-    //     it is the shape `hw_pci_class = "020000"` in the contract exists to enable (step D).
+    //     runtime). Put a third NIC in that machine and the kernel hands it to this service without a
+    //     rebuild - the shape `hw_pci_class = "020000"` in the contract exists to enable (step D). This
+    //     service then drives it only if it is one of the two it knows: anything that is not the
+    //     RTL8168 is driven as an e1000, unchecked (see the e1000 path below).
     //   * The other three ask the ISA, because their MAC is on the SoC and there is nothing to ask.
     //     A SoC MAC has no enumerable identity: no bus to scan, no vendor/device pair, and probing a
     //     version register means reading an address that may not be a register at all on the next
@@ -1293,18 +1306,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // `backlog/21` carries it.
 
     // Pi 4: the GENET MAC is ours, reached through the register window and DMA arena the kernel
-    // granted this service by name. No NET_DEVICE syscall is involved and the kernel drives no
+    // granted this service by device kind (`hwclass::NIC` in its spawn request). No NET_DEVICE syscall is involved and the kernel drives no
     // ethernet at all - which is the whole point (Commandment I, §4.4).
     #[cfg(target_arch = "aarch64")]
     genet::genet_main(ctx);
 
-    // Pi 2: a DWC2 CDC-ECM USB adapter, driven by the `dwc2` SERVICE. This backend bridges the frame
+    // Pi 2: the SMSC LAN9514 USB ethernet, driven by the `dwc2` SERVICE. This backend bridges the frame
     // IPC net-stack speaks to dwc2's own IPC ops. Same request/reply contract, different transport.
     #[cfg(target_arch = "arm")]
     kernel_net_main(ctx);
 
     // VisionFive 2: the on-SoC DesignWare MAC, same posture as GENET on the Pi 4 - the kernel grants
-    // the controller's window and a DMA arena by name and drives no ethernet itself.
+    // the controller's window and a DMA arena by device kind and drives no ethernet itself.
     #[cfg(target_arch = "riscv64")]
     dwmac::dwmac_main(ctx);
 
@@ -1317,9 +1330,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
     }
 
-    // --- Intel e1000 path. The kernel mapped our BAR + DMA arena only if the discovered NIC is a real
-    // Intel e1000 (Commandment VII). On any other NIC or none, we still SERVE the frame interface -
-    // with empty replies - so net-stack degrades instead of hanging on a reply (§26.7).
+    // --- Intel e1000 path. The kernel maps the BAR + DMA arena of whatever ethernet controller
+    // (PCI class 0x020000) it found, and this path drives it as an e1000 WITHOUT checking the identity:
+    // anything that is not the RTL8168 above lands here. With no window or arena we still SERVE the
+    // frame interface - with empty replies - so net-stack degrades instead of hanging on a reply (§26.7).
     let mmio  = ctx.mmio();
     let arena = ctx.dma_region();
 
@@ -1407,7 +1421,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // the ring, and software consumes them at its own pace - that is what the ring is FOR, and it
         // is the silicon's design rather than a policy choice of ours (26.14). The Realtek path in
         // this same file already did exactly this; only e1000 was left as the step-4 stub the module
-        // header still describes.
+        // header's Phase 1 list records.
         m.write32(REG_RCTL, RCTL_VALUE);
         ctx.log("nic-driver: serving the frame interface");
     } else {
@@ -1418,8 +1432,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         ctx.log("nic-driver: no Intel e1000 mapped (absent, or a different NIC) - serving empty replies");
     }
 
-    // The frame interface: a request/reply server (§8.2, like examples/reply-server). Each request's
-    // payload is a frame to transmit; we reply with the frame that came back (empty if none / no NIC).
+    // The frame interface: a request/reply server (§8.2, like examples/reply-server). A one-byte request
+    // is an op ([3] status, [4] one frame, [9] batch drain, [5] register dump); any other payload is a
+    // frame to transmit, answered with one status byte (see the end of the loop).
     let mut rxbuf = [0u8; FRAME_MAX];
     let mut tx_idx = 0usize;
     // Next RX descriptor to clean. Persists across requests because the RING does - see the drain.
@@ -1458,9 +1473,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             continue;
         }
 
-        // [4] RX-ONLY: arm the receiver, poll for ONE frame, quiesce - NO TX. Mirrors the realtek RX-only
-        // so net-stack's collect-frames-after-one-TX DNS path works on both NICs (on QEMU/slirp there are
-        // no stray frames, so net-stack's first request already matches and this stays a safe no-op).
+        // [4] RX-ONLY: take ONE frame if the next descriptor holds one - NO TX, no wait. Mirrors the
+        // realtek RX-only so net-stack's collect-frames-after-one-TX DNS path works on both NICs. The
+        // receiver is already on (it is enabled once at init and left on).
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 4 } {
             let mut n = 0usize;
             if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
@@ -1481,10 +1496,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             continue;
         }
 
-        // [9] BATCH RX DRAIN (e1000): QEMU's slirp is quiet, so this yields at most the single frame the
-        // reset-and-read model gives, formatted as the batch [count:u8][len:u16 LE, bytes] - enough to
-        // exercise net-stack's batch scan. The multi-frame drain that matters is the RTL8168 path (a
-        // busy physical LAN).
+        // [9] BATCH RX DRAIN (e1000): every frame the ring holds, up to BATCH_MAX, formatted as the batch
+        // [count:u8][len:u16 LE, bytes]. Unlike the RTL8168 drain it does not poll for more to arrive.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 } {
             let mut out = [0u8; BATCH_MSG_MAX];
             let mut opos = 1usize;   // out[0] = frame count
@@ -1546,12 +1559,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let frame = req.payload_bytes();
             let flen = frame.len().min(FRAME_MAX);
 
-            // --- Arm the RECEIVER FIRST (reset the ring to head 0, then enable), BEFORE transmitting.
-            // The reply can come back faster than we could otherwise switch the receiver on - slirp's
-            // ICMP echo is a trivial src/dst swap, quicker than its ARP-table reply - and a frame that
-            // arrives with the receiver off is DROPPED (this is exactly why the ping's echo reply, on
-            // the wire in the pcap, was never seen). Resetting head/tail per request keeps each RX
-            // independent; RDH/RDT are written while the receiver is briefly off, which is safe.
             // TRANSMIT TOUCHES NOTHING ON THE RECEIVE SIDE. This used to wipe every RX descriptor's
             // status, reset RDH/RDT and cycle RCTL around each send - so every frame sent DESTROYED
             // the receive ring. Send a DISCOVER, the ring is wiped; the OFFER lands; the next send
@@ -1584,9 +1591,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
 
         // Reply NON-BLOCKING (§8.9): a slow/dead net-stack can never wedge us. Then reclaim the cap
-        // slot so a long-running server stays bounded (§26.6). EMPTY, not a status byte - callers
-        // already guard on `is_empty()` for "no frame", so nothing downstream changes and a status
-        // byte would be miscounted as a received frame by `udp_roundtrip`.
+        // slot so a long-running server stays bounded (§26.6).
+        //
         // A ONE-BYTE ANSWER, NEVER AN EMPTY ONE.
         //
         // This replied with a zero-length payload, and transmit was the ONLY op in this driver that

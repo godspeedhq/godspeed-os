@@ -21,6 +21,7 @@ back on a **different core**: identity is stable, location is not (§11, §14.2)
 |---|---|
 | `restart <name>` | Kill `<name>` then spawn it again (placement re-evaluated). |
 | `restart <name> <core>` | Restart and place it on the given core (dev-mode override). |
+| `restart <a>,<b>,...` | Restart each (comma list, no spaces, at most 16), each placed per its own contract; a core argument is ignored for a list. |
 | `restart` (no name) | Prints `usage: restart <name> [core]`. |
 
 ## 3. Behaviour & guards
@@ -30,7 +31,13 @@ back on a **different core**: identity is stable, location is not (§11, §14.2)
   fresh round-robin core is chosen. The previous core is **not** remembered - so a
   service can transparently move cores across a restart.
 - The optional `<core>` argument is the supervisor's `placement_override` (§14.4),
-  exposed for dev-mode use; it is subject to the same strict placement rules.
+  exposed for dev-mode use; it is subject to the same strict placement rules. The
+  shell does not check for a dev mode, and a `<core>` that is not a number is
+  ignored (the restart proceeds unplaced).
+- The shell's `restart` is the SDK's `ServiceContext::restart`: a `kill` whose
+  result is discarded, then a spawn through the supervisor. A service that was not
+  running is therefore simply spawned. Results print `restarted: <name>` or
+  `restart failed: <name>` (an `Err`).
 - **Same guards as `kill`** (it is the kill half): requires `SERVICE_CONTROL`.
   There is NO trusted-root refusal, and the shell refuses only `supervisor` and
   `shell` - `xhci` and `ehci` pass straight through. See `11_kill.md` §3, corrected

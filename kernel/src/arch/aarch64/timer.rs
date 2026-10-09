@@ -10,6 +10,11 @@
 //! guess at the counter frequency made every sleep and timeout on that board wrong by orders of
 //! magnitude, and the bug hid for months because nothing compared the assumption against the register.
 //! `CNTFRQ_EL0` is right there; there is no reason to guess.
+//!
+//! (Note 2026-10-09: the scar is misdescribed above. The 32-bit port did not guess - it TRUSTED
+//! `CNTFRQ`, which on the Pi 2 overstates the prescaled counter by 19.2x, and now measures the rate
+//! against the 1 MHz System Timer instead (`arch/arm/timer.rs`). It also uses the ARM generic timer,
+//! not a Broadcom local timer. This port trusts `CNTFRQ_EL0` with no cross-check.)
 
 /// The EL1 physical timer's interrupt is PPI 30 on a GICv2. PPIs are banked per core, which is why a
 /// per-core timer needs no routing configuration.

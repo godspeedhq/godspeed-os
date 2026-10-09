@@ -20,6 +20,10 @@ impl From<EndpointId> for ResourceId {
 }
 
 /// An IPC endpoint with its message queue and owner information.
+///
+/// NOT CONSTRUCTED anywhere in the kernel: the live per-endpoint state (core, generation,
+/// liveness, queue, blocked receiver and sender) is `routing::RoutingEntry`, keyed by
+/// `EndpointId`. This type is only re-exported from `ipc`.
 pub struct Endpoint {
     pub id: EndpointId,
     /// The task that owns this endpoint (the receiver).

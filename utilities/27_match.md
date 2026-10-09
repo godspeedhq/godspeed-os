@@ -26,7 +26,7 @@ match 0.4.0 - keep the lines that match a pattern
 
 usage:
   <producer> | match <pattern>   keep piped lines that match <pattern>
-  match <pattern> [path]         keep lines of <path> (or the cwd-relative file) that match
+  match <pattern> <path>         keep lines of <path> that match (the path is required)
   match except <pattern> [path]  keep the lines that do NOT match (the inverse)
   match version                  print the version
   match help                     print this message
@@ -74,7 +74,10 @@ A shell built-in **filter**: input bytes → matching lines out (`match_lines`, 
 dispatches the stage, and a text filter lands in `run_filter_builtin`); as a built-in it runs
 **in-process**, so
 it is **not** subject to the 4 KiB service-boundary cap and can filter a full 16 KiB stage
-buffer. The direct form `read`s the file itself (`fs` `ReadFile`, op 11) - no new `fs` surface.
+buffer. The direct form reads the file itself (`gs::fs::Fs::read_into`, streaming `READ_AT`) -
+no new `fs` surface - into a fixed `FILTER_READ_MAX` (8192-byte) buffer; a larger file is
+refused loudly (`match: <path> is larger than 8192 bytes - too big to filter in one pass`), so
+pipe it instead (`read <path> | match ...`).
 `match` is a FILTER, never a pipe producer: `match … /file | …` is refused (use `read /file |
 match …`). Minimal quoting lives in the shared `tokenize`/`strip_quotes` helpers, so it benefits
 every command, not just `match`.
@@ -86,7 +89,8 @@ every command, not just `match`.
   it. Default stays friendly (substring + glob). Needs a `no_std` regex engine, so it is a
   clear future opt-in, not the first cut.
 - Case-insensitive matching (an `ignore-case` keyword), if wanted.
-- `count` (how many matched), once a counting filter exists.
+- `count` (how many matched) is **done**, as a pipe stage: `... | match error | count`
+  (`28_count.md`).
 
 ## 7. Conformance
 
@@ -94,7 +98,9 @@ Conforms to `0_conventions.md`: its own `match help` (usage with a real example 
 `match except help` subcommand help, and `match version` (number + creator credit), via the
 shared `help_block` helper.
 
-Also conforms to **rule 10** (`0_conventions.md` §1.10): when reading a file, the `fs` request is
-**q-abortable** via `fs_request_q` - a wait past ~2s prints `(q to quit)` and `q`/`Q`/ESC returns to
-the prompt (a fast reply prints nothing). This replaced a bare `request_with_reply`, which rule 10
-forbids for an interactive command.
+**Does NOT currently conform to rule 10** (`0_conventions.md` §1.10), found 2026-10-09. The `fs`
+read of a file goes through a `gs::fs::Fs` handle that is lent no notice, so each request is bounded
+(`gs::call::DEFAULT_SECS`, 5 s) but prints no `[q] quit` and cannot be ended with `q`; the
+`Cancelled` branches in the handler are unreachable. This said the request was q-abortable via
+`fs_request_q`, which no longer exists. `dir` is the one fs-backed command that still lends the
+notice (`16_dir.md` §6); the same `.noticing(...)` here is the fix.

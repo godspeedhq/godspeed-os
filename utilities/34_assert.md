@@ -75,13 +75,17 @@ assert: ok
 > assert fails read /lsr/nope
 read: not found: /lsr/nope
 assert: ok
-run: ran 2, failed 0
+--- summary ---
+PASS  assert ok read /lsr/big.txt
+PASS  assert fails read /lsr/nope
+run: ran 2, failed 0, skipped 0
 ```
 
 `run: ran N, failed 0` is the green bar - the T630 telling you the suite passed, no eyeballing.
 
 > **Authoring a suite with piped asserts.** A script line containing `|` can't be written via the
-> on-device `write` (the shell pipes the `write` line itself). The answer is **host-side baking**:
+> on-device `write` (the shell pipes the `write` line itself). On-device, `edit` (`36_edit.md`)
+> writes such a line like any other text. Host-side, the answer is **baking**:
 > `osdev script-disk build/suite.img my_suite.gsh` produces a GSFS data disk with the suite baked
 > in; `dd` it to the data drive, boot, and `run /my_suite.gsh`. `osdev test script` runs exactly
 > this loop in CI (a suite full of piped asserts → `ran 6, failed 0`). Result-form asserts (no
@@ -98,7 +102,8 @@ run: ran 2, failed 0
 
 ## 6. Later (separate so it can grow)
 
-- `assert fails-with <Variant>` - pin the *specific* `Err` (needs more commands to name variants).
+- `assert fails-with <Variant>` is **built** (§2); what it still needs is more commands naming a
+  specific variant rather than `Unknown`.
 - More content checks (`is <text>` exact, `lines <N>`), if a suite needs them.
 - Host-side **image-baked `.gsh`** - **built** (`osdev script-disk`, `osdev test script`): a suite
   of piped asserts ships on a GSFS data disk and runs from a script on hardware.

@@ -13,8 +13,9 @@
 //!
 //! v1 reclaims memory only at DEATH (no free syscall), so `chaos mem-pressure` "frees" this
 //! service's memory by KILLING it: it watches the kernel's free-frame count drop while we hold our
-//! allocation and return to baseline once we die (the no-leak check). Not in any auto-spawn set;
-//! the shell spawns it by name only when running the command.
+//! allocation and return to baseline once we die (the no-leak check). Not in any auto-spawn set:
+//! the shell spawns it by name when running that command, and the `chaos` service spawns one every
+//! `max-carnage` round as its spawn-storm ammunition (and kills them all when the run ends).
 
 #![no_std]
 #![no_main]

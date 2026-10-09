@@ -36,8 +36,9 @@ use godspeed::{self as gs, ipc::Message, ServiceContext};
 
 // ── fs file-API wire protocol (client <-> fs) ───────────────────────────────────
 // MUST match `services/fs` and the shell's fs helpers (services/shell/src/main.rs).
-// A request is `[op, path_len:u8, path[path_len], data…]`; the reply's first byte
-// is a status code. We only need whole-file read and write here.
+// A request is `[tag, op, path_len:u8, path[path_len], data…]` (the tag is below);
+// the reply echoes the tag, then a status code. The op comments here show both AFTER
+// the tag. We only need whole-file read and write here.
 const OP_WRITE_FILE: u8 = 10; // [op, plen, path, data]            -> [FS_OK]
 const OP_READ_FILE:  u8 = 11; // [op, plen, path]                  -> [FS_OK, n:u32, bytes]
 const FS_OK: u8 = 0; // operation succeeded (any other status -> no durable value to load)
@@ -65,17 +66,20 @@ const FS_SECS: i64 = 120;
 
 // ── fs round-trips, modelled on the shell's `fs_request` ────────────────────────
 
-/// Send one fs file-API request `[op, path_len, path, data]` and return the reply.
+/// Send one fs file-API request `[tag, op, path_len, path, data]` and return the reply,
+/// tag stripped.
 ///
 /// Uses `gs::call::request_within`, which embeds a per-request reply cap (a SEND|GRANT
-/// copy of our own endpoint cap) so `fs` can answer us, and bounds the wait by
+/// copy of our reply mailbox, or of our own endpoint if we got none) so `fs` can answer
+/// us, and bounds the wait by
 /// `FS_SECS`. On a send that never left (usually `fs` restarted and our cached cap is
 /// now `EndpointDead`, §14.3) it reacquires a fresh `fs` cap by NAME via the kernel
 /// directory and sends once more. Reacquire-and-retry IS the recovery contract: a
 /// client whose dependency restarts reacquires and retries, it does not crash
-/// (Commandment IX, §14.3). A request that reached `fs` and got no answer is NOT
-/// re-sent - it may have been done - and comes back as no answer, which the callers
-/// below already treat as "fs is not there right now".
+/// (Commandment IX, §14.3). A request that reached `fs` and timed out is NOT re-sent -
+/// it may have been done - and comes back as no answer, which the callers below already
+/// treat as "fs is not there right now". One that `fs` died holding (`PeerDied`) is
+/// re-sent once below, because both of this example's requests are safe to repeat.
 fn fs_request(ctx: &ServiceContext, op: u8, path: &[u8], data: &[u8]) -> Option<Message> {
     let pl = path.len().min(255);
     let mut req = [0u8; 64];
@@ -169,8 +173,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("counter: ready");
 
     // Probe whether `fs` is reachable. `gs::cap::acquire` resolves "fs" by name via
-    // the kernel directory and installs a SEND cap; `None` means `fs` has not come
-    // up (or we hold no authority to send to it). Either way we keep running - the
+    // the kernel directory and mints a FRESH SEND cap into a new table slot each call
+    // (the handle is discarded here; `fs_request` uses the cap the spawn wired in, or
+    // reacquires its own). `Err` means `fs` is not in the directory yet (or we hold no
+    // authority to send to it). Either way we keep running - the
     // count just will not persist (graceful, loud degrade, never a silent fallback).
     let mut persist = gs::cap::acquire(&ctx, "fs").is_ok();
 

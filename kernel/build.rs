@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/// Emits `cargo:rustc-env=SVC_<NAME>_ELF=<path>` for each service binary.
+/// Emits `cargo:rustc-env=SVC_<NAME>_ELF=<path>` for each service binary in `services` below.
 ///
 /// `osdev build` compiles the service crates BEFORE the kernel so these
 /// paths exist by the time the kernel's `include_bytes!` macros run.
+///
+/// ONLY FOUR ARE READ. Since step C the kernel embeds one image it spawns, `SVC_SUPERVISOR_ELF`
+/// (`task/mod.rs`); `SVC_EVENTS_ELF`, `SVC_PING_ELF` and `SVC_PONG_ELF` are read by the arm32
+/// bring-up scaffolding (`arch/arm/loadtest.rs`, `arch/arm/sched_ipc.rs`). Every other service image
+/// is embedded by the SUPERVISOR (`services/supervisor/build.rs`), so the rest of this list, and the
+/// per-arch `*_built` lists, decide nothing the kernel uses - their notes below about `LoadFailed`
+/// describe the time before the images moved.
 fn main() {
     // Stamp the short git SHA into the KERNEL, so the very first boot line identifies the image.
     //
@@ -167,21 +174,28 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         ("HOLDER",     "holder"),   // examples/holder: the CLIENT that USEs the granted resource cap
     ];
 
+    // (Note 2026-10-09: read the two lists below with the riscv64 note further down. Since step C the
+    // only `SVC_*_ELF` kernel code includes is the supervisor's, plus `events`, `ping` and `pong` for
+    // the arm32 bring-up demos (`loadtest.rs`, `sched_ipc.rs`). The services the supervisor spawns are
+    // embedded by `services/supervisor/build.rs`, so the `LoadFailed(TooSmall)` trap described below is
+    // that build's to guard now, not this one's.)
     // ARM userspace is being brought up incrementally (docs/multi-arch.md): a service is embedded
     // for real only once it is built for armv7a-none-eabi. Any not yet ported keep the empty
     // placeholder, so the kernel still links. As each is ported, drop its name in here.
     // Userspace services that use only the arch-neutral SDK + syscalls (no hardware probe) run on ARM
-    // as-is. The hardware drivers (block-driver, fs, nic-driver, net-stack, xhci, ehci) compile but hunt
-    // for x86 hardware (PCI/AHCI/Realtek/xHCI) absent on the Pi 2, so they stay placeholders until real
-    // Pi drivers (SD/EMMC, DWC2, LAN9514) exist. `probe` does not build for ARM (x86-only fault module).
+    // as-is. The Pi 2's own drivers are listed below (`dwc2`, and `block-driver`/`nic-driver` reaching
+    // their devices through it); the PCI drivers (`xhci`, `ehci`, `hw-enumerator`, `audio-driver`) are
+    // not, because the Pi 2 has no PCI, so they stay placeholders. `probe` does not build for ARM
+    // (x86-only fault module).
     let arm_built: &[&str] = &[
         "events", "recorder", "copier", "console", "ping", "pong", "supervisor", "shell",
         "observe", "chaos", "mem-pressure",
         "counter", "greet", "upper", "roster",
         "reply-server", "asker", "resource-server", "holder",
-        // The userspace USB host driver (arm32 Phase 2). A SKELETON today: it holds the DWC2 MMIO
-        // window, a DMA arena and the USB vector, and reports whether the interrupt arrives. Built
-        // and embedded unconditionally; whether it SPAWNS is the supervisor's decision.
+        // The userspace USB host driver (arm32 Phase 2, since completed): the whole Pi 2 USB stack -
+        // keyboard, mass storage, the LAN9514 and the WiFi dongle's host - on the DWC2 MMIO window, a
+        // DMA arena and the USB vector. Built and embedded unconditionally; whether it SPAWNS is the
+        // supervisor's decision.
         "dwc2",
         // The wall clock (C1-6). REQUIRED on the Pi 2 rather than optional: the board has no
         // battery-backed RTC, so SNTP is the only way it learns the time, and the `SetClock` syscall
@@ -194,8 +208,8 @@ const ARM_ONLY: &[&str] = &["dwc2"];
         // (storage_is_usb); fs is arch-neutral and rides on it. The kernel grants block-driver no
         // EMMC window: the EMMC is the boot card (docs/audio.md, "No service names in the kernel").
         "block-driver", "fs",
-        // Networking on the Pi 2: nic-driver's ARM backend bridges the frame IPC to the in-kernel DWC2
-        // CDC-ECM USB-net device (NET_DEVICE syscalls); net-stack is arch-neutral and rides on it.
+        // Networking on the Pi 2: nic-driver reaches the USB-net device through the `dwc2` SERVICE over
+        // IPC (the in-kernel DWC2 stack and its NET_DEVICE path are gone); net-stack is arch-neutral.
         "nic-driver", "net-stack",
         // The audio jack, driven by PWM (docs/audio.md): the kernel routes its pins and starts its clock
         // as part of the grant; the service drives the PWM block and the DMA engine.
@@ -214,28 +228,29 @@ const ARM_ONLY: &[&str] = &["dwc2"];
 
     // AArch64 (Raspberry Pi 4) userspace is being brought up the same way, service by service, for the
     // same reason: a service is embedded for real only once it is built for aarch64-unknown-none. Any
-    // not yet ported keep the empty placeholder so the kernel still links. The hardware drivers stay
-    // placeholders until real Pi 4 drivers exist (SD/EMMC, GENET, VL805 xHCI over PCIe) - they compile,
-    // but hunt for x86 hardware that is not there.
+    // not yet ported keep the empty placeholder so the kernel still links. The Pi 4's own drivers are
+    // listed below (GENET through `nic-driver`, the VL805 through `xhci`, the radio through
+    // `wifi-driver`); `ehci` and `audio-driver` are x86 hardware and are not.
     // `ping`/`pong` are DEMO services: they send as fast as the scheduler runs them (they pace with
     // `yield_cpu`, not a sleep), which is ~500 log lines a second. That is fine when the point is to
     // prove IPC, and unusable when the point is to type at a prompt - the shell's output scrolls past
     // faster than a human can read it. Cross-service IPC is already hardware-proven (63,579 messages),
     // so they are opt-in via `pi4-demo-services` rather than always present.
     let aarch64_demo = std::env::var("CARGO_FEATURE_PI4_DEMO_SERVICES").is_ok();
-    // Networking on the Pi 4: nic-driver reaches the hardware through the NET_DEVICE syscalls, which
-    // the aarch64 arch layer now backs with the GENET driver (receive and transmit both hardware
-    // proven); net-stack is arch-neutral and rides on nic-driver without touching hardware at all.
+    // Networking on the Pi 4: nic-driver drives the GENET MAC itself through its own register window
+    // (the NET_DEVICE syscalls it once used here are stubs now, `task::service_privileges`); net-stack
+    // is arch-neutral and rides on nic-driver without touching hardware at all.
     // Neither needed porting - they needed BUILDING and then listing HERE. Being built is not enough:
     // a service missing from this list embeds the empty placeholder however well it compiled, and the
     // boot reports `LoadFailed(TooSmall)` - which reads like a broken binary rather than an absent one.
     // `xhci` is the userspace USB host-controller driver for the Pi 4's VL805. It is embedded
-    // unconditionally rather than behind `xhci-userspace`, and that is deliberate: an ELF the kernel
+    // unconditionally (the `xhci-userspace` flag that once chose between it and an in-kernel driver is
+    // deleted with that driver), and that is deliberate: an ELF the kernel
     // carries but never spawns costs image bytes and nothing else, whereas a service the supervisor
     // spawns and the kernel embedded as a PLACEHOLDER fails with `LoadFailed(TooSmall)` - which reads
     // like a broken binary rather than a build-list omission, and is exactly the trap this comment
     // block warns about two paragraphs up. Cheap insurance against the failure mode with the worst
-    // diagnostic. The spawn is what the feature gates (`services/supervisor`), not the embedding.
+    // diagnostic. Whether it spawns is the supervisor's decision, not the embedding's.
     // `time` and `control` are here for the same reason they are in `arm_built`, and their absence was
     // the Pi 4's first boot failure after the arm32 work: the supervisor SPAWNS both on every port, so
     // leaving them out of this list embedded placeholders and the boot reported two `LoadFailed(TooSmall)`

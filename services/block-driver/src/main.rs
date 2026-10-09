@@ -7,7 +7,8 @@
 // lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed even there.
 #![deny(unsafe_code)]
 //! `block-driver` - userspace **AHCI (SATA)** disk driver (persistence, v2; §6.3,
-//! docs/ahci.md, docs/persistence.md).
+//! docs/ahci.md, docs/persistence.md) on x86, and the same block protocol over a USB stick on every
+//! USB board (`usbdisk`, through the `dwc2` or `xhci` service - see `backend_run`).
 //!
 //! An MMIO + DMA driver: the kernel maps the AHCI HBA's ABAR and grants a
 //! physically-contiguous DMA arena at spawn (the same path as the USB drivers).
@@ -23,8 +24,9 @@
 use godspeed as gs;
 use godspeed_sdk::ServiceContext;
 
-// Backend by architecture: x86 talks AHCI (SATA, MMIO+DMA); ARM (Raspberry Pi 2) storage is a USB stick
-// (`usbdisk`, through the in-kernel DWC2 stack). Both satisfy the same block-IPC protocol below.
+// Backend by board: x86 talks AHCI (SATA, MMIO+DMA); every USB board (Pi 2, Pi 4, VisionFive 2) stores
+// on a USB stick (`usbdisk`, which reaches it over IPC through `xhciblk` - the `dwc2` or `xhci`
+// SERVICE, never the kernel). Both satisfy the same block-IPC protocol below.
 //
 // The BCM2835 EMMC / Arasan SDHCI backend (`sdhci.rs`) is DELIBERATELY NOT COMPILED IN. On the Pi 2 the
 // EMMC IS the SD card the board boots from - firmware + kernel + FAT boot partition - and using it as
@@ -218,8 +220,9 @@ mod usbdisk;
 mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
-//   Request : [op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
-//   Reply   : [status:u8, (ReadBlock only: 512 data bytes)]
+//   Request : [tag:u8, op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
+//   Reply   : [tag:u8, status:u8, (ReadBlock only: 512 data bytes)]
+// `tag` is the caller's correlation byte, echoed unread (`Reply`); the op lines below omit it.
 // The LBA is u64 (persistence §6.3): GSFS capacity fields are u64, so the block
 // address reaches the device at full width.
 const OP_READ_BLOCK: u8 = 1;
@@ -263,8 +266,7 @@ fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ct
 /// no-disk state (capacity 0, every read/write refused) WITHOUT touching the card.
 #[cfg(storage_is_usb)]
 fn backend_run(ctx: &ServiceContext) -> ! {
-    // Where the sector count comes from is the same build-time choice usbdisk.rs documents: the
-    // in-kernel stack by syscall, or the `xhci` service by IPC. No probe, no fallback.
+    // The sector count comes from the USB host SERVICE by IPC (`xhciblk`). No probe, no fallback.
     // arm32 now asks the `dwc2` SERVICE over IPC, exactly as aarch64 asks `xhci` - the in-kernel
     // stack's `usb_disk_*` syscalls are no longer the path. Same client, same wire format, different
     // service name (`xhciblk::XHCI`), which is why this is a cfg flip rather than a port.
@@ -323,8 +325,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // (This used to say the USB stack was in the kernel and the disk reached through syscalls. That
     // stopped being true on aarch64 in 2026-08 and on arm32 a week later - both stacks are services
-    // now, and `xhciblk.rs` is the client. The syscall route survives in `usbdisk.rs` for a board
-    // that has no such service, and no shipping port is one.)
+    // now, and `xhciblk.rs` is the client. There is no syscall route left: `usbdisk.rs` reaches the
+    // device through `xhciblk` too.)
     #[cfg(storage_is_usb)]
     backend_run(&ctx);
     #[cfg(not(storage_is_usb))]
@@ -340,7 +342,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // flood-storm pin); the self-driven poll drains every quantum with no wake needed. Pinned by the
             // shell-test `chaos flood-storm block-driver` step (QEMU's pc machine has no AHCI, so it sits here).
             // ANSWER while draining. The loop here used to be
-            //     loop { while gs::ipc::try_recv(&ctx).is_some() {} gs::task::yield_now(&ctx); }
+            //     loop { while ctx.try_recv().is_some() {} ctx.yield_cpu(); }
             // which retired every request and replied to none - so `fs` blocked forever in its first
             // `block_capacity()`, never reached its own storage-unavailable degraded path, and never
             // printed `fs: serving file API`; every file command in the shell hung behind it. On any

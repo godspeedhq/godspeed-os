@@ -130,11 +130,16 @@ ever does surface the bytes say which iteration wrote them.
 
 ```
 gsh> churn 60
-churn: writing continuously for 60s - CUT THE POWER AT ANY POINT [q] quit
+churn: writing continuously for 60s - CUT THE POWER AT ANY POINT  [q] quit
 churn: 1s elapsed, 47 writes
 churn: 2s elapsed, 95 writes
 ...
+churn: done - 2840 writes, 355 renames, 355 deletes, 3456120 bytes, 0 refused
 ```
+
+(Counts illustrative.) `<seconds>` is 1 to 3600. A run that finishes also names the two follow-ups
+(`churn verify`, `drives check`) and that `/churn` was left in place. A churn can run detached:
+`background churn <seconds>` (`55_background.md`).
 
 Pull the plug at any point. On the way back up:
 
@@ -186,7 +191,7 @@ arrives then with a reason attached.
 ## Conventions
 
 Obeys `utilities/0_conventions.md`: `churn help` and `churn version`, a word-not-flag argument, raw
-facts without editorialising, and `q` aborts (rule 9) - a command that runs for a minute and cannot be
+facts without editorialising, and `q` aborts (rule 10) - a command that runs for a minute and cannot be
 interrupted is one the operator has to reboot out of. Bounded (26.6): a fixed file rotation and fixed
 stack buffers, no heap (26.6.1).
 

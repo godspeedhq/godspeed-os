@@ -52,8 +52,9 @@ pub trait KeyPath {
 }
 
 /// What a WPA2 join KEEPS for the life of the association, and nothing more: the confirmation and
-/// encryption halves of the pairwise transient key, the last replay counter the access point used, and
-/// the two addresses the answers carry. The temporal key itself lives in the firmware from the moment it
+/// encryption halves of the pairwise transient key, the pairwise master key, the last replay counter the
+/// access point used, and our own address, which the answers carry (the access point's is read from each
+/// frame it sends). The temporal key itself lives in the firmware from the moment it
 /// is installed and is not kept here. These exist for one reason - the access point rekeys the group key
 /// on a timer and each rekey is a signed, wrapped frame that must be verified and answered
 /// (`group_rekey`) - and they are zeroed the moment the association ends (`forget`).
@@ -81,8 +82,9 @@ pub fn forget(keys: &mut Option<Keys>) {
 }
 
 /// The station's nonce for one handshake. The hardware RNG where the kernel exposes one (`hw_random`: the
-/// Pi 4's RNG200, the VisionFive's JH7110 TRNG); where it does not, or it fails, the cycle counter, the
-/// access point's own nonce and our address hashed together, and the log SAYS SO, because a nonce from a
+/// Pi 4's RNG200, the VisionFive's JH7110 TRNG, the Pi 2's BCM2835 RNG; x86 has none); where it does not,
+/// or it fails, the cycle counter, the monotonic clock, the access point's own nonce and our address hashed
+/// together, and the log SAYS SO, because a nonce from a
 /// counter is a real weakening that must not pass unremarked.
 fn snonce(ctx: &ServiceContext, who: &str, anonce: &[u8; 32], mac: &[u8; 6]) -> [u8; 32] {
     let mut out = [0u8; 32];

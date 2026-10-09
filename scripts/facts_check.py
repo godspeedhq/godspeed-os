@@ -20,6 +20,13 @@ WHAT IS DELIBERATELY NOT CHECKED. Dated evidence. `docs/ahci.md` recording "iden
 statement about a run in the past, and rewriting it would falsify the record - the same exemption
 `doc_refs.py` grants `audits/`. History states what WAS; only present-tense claims are checked.
 
+WHAT A PASS DOES NOT SAY. Each fact is added only when its source is FOUND (`if qd:`, `if ring:`,
+...; the seam size falls to 0 on any exception), so a constant that is renamed or moved silently drops
+its fact from the run instead of failing it. A pass means "every fact whose source still parses
+agrees", and the count printed is of matched doc statements, not of facts. A line carrying a date,
+`Amendment`, `Verified:` or `was ... now` is skipped unless it is a STATUS line. When a code-versus-
+code check fails, its failures are printed and the doc facts are not reported on that run.
+
 Exit 0 when every checked fact agrees with its source, 1 otherwise.
 """
 

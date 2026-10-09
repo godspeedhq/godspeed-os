@@ -81,7 +81,7 @@ mem | assert contains used
 # the system has stopped measuring it.
 #
 # `date epoch` yields 0 when the clock is unset, so iterating its output (`for line in (producer)`,
-# section 6 above) gives a testable value without touching anything. `assert contains` cannot serve as
+# section 6 of the language part, `00-language.gsh`) gives a testable value without touching anything. `assert contains` cannot serve as
 # the probe because it FAILS the suite rather than returning a boolean, and there is no bare
 # `contains` - that dead end is what made an earlier attempt invent syntax.
 #
@@ -90,8 +90,8 @@ mem | assert contains used
 # a test that has quietly stopped testing.
 #
 # (An earlier version of this hung the whole suite: it used `$var = ...`, which is not an assignment,
-# so a counter never incremented and a `wait 1` loop ran forever. Real grammar is in section 7 above:
-# `let mut` to declare, `name = $name + 1` to assign. Test script changes on hardware before shipping.)
+# so a counter never incremented and a `wait 1` loop ran forever. Real grammar is in section 1 of
+# `00-language.gsh`: `let mut` to declare, `name = $name + 1` to assign. Test script changes on hardware before shipping.)
 let mut clockset = 0
 for line in (date epoch) { if $line > 0 { clockset = 1 } }
 if $clockset > 0 {
@@ -114,7 +114,8 @@ status | assert contains shell
 status | where name=shell | assert contains shell
 status | where name!=shell | assert lacks shell
 # These two exercise the NUMERIC where-operators (= and <), and they used the shell's core as a
-# convenient value. That stopped being a fact: the shell moved to core 1 so the serial writer is not
+# convenient value. That stopped being a fact: the shell moved to core 1 on the Pi 2 (`board::SHELL_CORE`
+# in the supervisor; core 0 elsewhere) so the serial writer is not
 # sharing a core with the microframe-timed USB driver, and both lines failed - a test asserting a
 # placement DECISION while claiming to test an operator.
 #

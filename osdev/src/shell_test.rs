@@ -4747,11 +4747,6 @@ pub fn run_fs_restart(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
-/// `examples/counter` survives its OWN restart (§14 restart, §15 persistence). Bare-metal shell +
-/// AHCI disk + the `counter` service (counter-test build). Flash the disk so `fs` mounts, let
-/// `counter` persist a couple of increments to /counter.dat, KILL counter over the control channel,
-/// and - after the supervisor respawns it - assert the fresh instance RECOVERED a non-zero count
-/// from the file (not "starting at 0"). That single assertion is the proof the state survived.
 /// The five examples nothing else ever spawned, each asserted to actually RUN (`examples/`).
 ///
 /// `hello`, `stdlib-hello`, `cap-grant`, `e1000` and `driver-skeleton` compiled on four
@@ -4854,6 +4849,11 @@ pub fn run_examples(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `examples/counter` survives its OWN restart (§14 restart, §15 persistence). Bare-metal shell +
+/// AHCI disk + the `counter` service (counter-test build). Flash the disk so `fs` mounts, let
+/// `counter` persist a couple of increments to /counter.dat, KILL counter over the control channel,
+/// and - after the supervisor respawns it - assert the fresh instance RECOVERED a non-zero count
+/// from the file (not "starting at 0"). That single assertion is the proof the state survived.
 pub fn run_counter(image_path: &Path, persist_path: &str, smp: u32) {
     let sc = crate::qemu::timeout_scale();
     println!("counter: booting (smp={smp}) bare-metal + AHCI disk + counter; shell on COM1, control on COM2");

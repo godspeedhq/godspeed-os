@@ -153,16 +153,16 @@ pub fn set_mask(gsi: u8, masked: bool) {
 }
 
 /// BSP local-APIC id - the destination for level INTx routes. Captured at boot from the
-/// Limine SMP response (`mod.rs`). `0xFF` until set; `set_redir` then falls back to 0, the
-/// BSP id on essentially all machines, so routing still works if capture is skipped.
+/// Limine SMP response (`mod.rs`). `0xFF` until set; `bsp_lapic_id()` then falls back to 0 - the
+/// BSP id on QEMU, but NOT on every machine (the T630's BSP is LAPIC id 16).
 static BSP_LAPIC_ID: AtomicU8 = AtomicU8::new(0xFF);
 
-/// Record the BSP's local-APIC id (called once at boot before any device routing).
 /// Record the BSP's local APIC id. FIRST WRITER WINS, which is what makes this correct to call from
 /// the per-core APIC init: the BSP runs it before it starts any AP, so the first caller IS the BSP and
-/// a later AP cannot overwrite it with its own id.
+/// a later AP cannot overwrite it with its own id. Today the first caller is `collect_boot_info` in
+/// `_start` (Limine's `bsp_lapic_id`); `init_local_apic` and `publish_bsp_lapic_id` also call it.
 ///
-/// This had NO CALLERS. `BSP_LAPIC_ID` therefore sat at its 0xFF sentinel forever and `bsp_lapic_id()`
+/// This once had NO CALLERS. `BSP_LAPIC_ID` therefore sat at its 0xFF sentinel forever and `bsp_lapic_id()`
 /// returned the 0 fallback unconditionally - a hard-coded constant wearing the shape of a lookup, which
 /// is worse than the constant because it reads as though it were measured.
 ///

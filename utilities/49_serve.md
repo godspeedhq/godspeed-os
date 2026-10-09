@@ -59,12 +59,16 @@ its own (§26.2).
 ```
 gsh> serve 8080
 listening on 192.168.4.37:8080 - answering connections  [q] quit
-still listening - 10s (q aborts)
-accepted a connection
+still listening - 10s, 0 served  [q] quit
+accepted a connection (1)
 received 11 byte(s): knock knock
 echoed 11 byte(s) back
-closed
+closed - waiting for the next connection  [q] quit
 ```
+
+With a duration the reminder reads `still listening - 10s of 300s, 0 served`. When it ends it says
+`serve: 300s elapsed, N connection(s) served` (a duration ran out) or `serve: stopped after N
+connection(s)`.
 
 The address is asked of `net-stack` rather than remembered, so it is the one the stack holds now and
 cannot drift from a changed lease. `net-stack` logs the other side of the same story - an inbound SYN
@@ -76,7 +80,9 @@ Bytes outside printable ASCII render as `.`, so a peer cannot spray control code
 ## Bounds
 
 Waits for as long as you asked - by default until `q`, `Q` or ESC - and at most 10 seconds for an
-accepted peer to send something. A duration over a year is refused as a typo rather than honoured.
+accepted peer to send something. A duration whose NUMBER is over a year of seconds is refused as a
+typo rather than honoured; the check is made before the unit is applied, so `400d` is accepted (a
+code defect in `parse_duration`).
 
 While it waits it says so every ten seconds, because two minutes of a mute prompt is
 indistinguishable from a wedged one.
@@ -126,12 +132,14 @@ all: the segment reached us from that address, which is the one fact that never 
 |---|---|
 | the stack has no address yet | `net-stack would not listen on that port`, and net-stack's log says which of the three reasons it was |
 | the port is already listened on, or every listener slot is in use | the same line; net-stack's log distinguishes them |
-| nobody connected in time | `nobody connected within <n>s`, when a duration was given |
+| nobody connected in time | `serve: <n>s elapsed, 0 connection(s) served`, when a duration was given |
 | you pressed `q` | `serve: aborted`, and the port is released |
 | the peer connected and sent nothing | `the peer connected but sent nothing` |
 
 ## Conventions
 
-Obeys `utilities/0_conventions.md`: `serve help` prints usage, the argument is a word rather than a
-flag, raw facts without editorialising, and `q` escapes every blocking wait. Its argument is a port,
+Obeys most of `utilities/0_conventions.md`: the argument is a word rather than a flag, raw facts
+without editorialising, and `q` escapes every blocking wait. `serve help` prints a usage from
+`cmd_serve` itself, not a versioned `help_block`, and `serve` is not in the shell's `UTILS` list, so
+`serve version` is read as a port and refused - rules 5 and 6 unmet, a code defect. Its argument is a port,
 never a path, so it is in the shell's `NO_PATH_CMDS` (rule 9).

@@ -1,7 +1,7 @@
 # Utility: `write` - create, overwrite, append, or prepend a file
 
 **Status:** **Built + QEMU-verified** (`osdev test files`, `osdev test script`) - a shell
-built-in over the `fs` WRITE_FILE / WRITE_NEW / WRITE_AT / READ_FILE API, on hierarchical GSFS
+built-in over the `fs` WRITE_FILE / WRITE_NEW / WRITE_AT / READ_AT API, on hierarchical GSFS
 (`docs/persistence.md`). Mutating; inline content (`write <path> <text>`) with `append` and
 `prepend` modes, and the **pipe sink** (`<producer> | write [append|prepend] <path>`). GSFS0003
 reclaims freed blocks, so overwrite no longer leaks. Trails `CLAUDE.md`; does not amend it.
@@ -19,9 +19,11 @@ there is no `>` operator (a second syntax for one mechanism - see `docs/pipes.md
 no `>`"). `write` is both the inline primitive and that pipe sink.
 
 > **Why there is no `touch`.** `touch`'s real job is "update a file's modification
-> timestamp"; people abuse it to make an empty file. GSFS inodes carry **no timestamps**
-> (deliberate minimalism), so that purpose has no referent here - and "make an empty file"
-> is just `write <path>` with no content. One honest verb; no name that lies about its job.
+> timestamp"; people abuse it to make an empty file. GSFS now records a modification time
+> (`dir`'s MODIFIED column), but `fs` sets it itself when a file's content changes and no
+> verb sets it on its own, so that purpose still has no referent here - and "make an empty
+> file" is just `write <path>` with no content. One honest verb; no name that lies about its
+> job.
 
 ## 2. Usage
 
@@ -54,7 +56,10 @@ the additive behaviour is the explicit keyword `append`/`prepend`, never punctua
 
 Overwrite is **deliberate and announced** (`wrote /path (N bytes)`), never a silent clobber
 (§26.7). `append`/`prepend` add to the end / front (`appended N bytes to /path`), creating a
-missing file. The parent directory must exist (no implicit creation). `prepend` is honestly a
+missing file. With no arguments at all it prints `usage: write [append|prepend] <path>
+[content]`. A write whose answer never came (a deadline, or `fs` dying holding it) is reported
+as `write: OUTCOME UNKNOWN - <path> MAY HAVE BEEN written`, not as a failure, and is not
+re-sent. The parent directory must exist (no implicit creation). `prepend` is honestly a
 **full-file rewrite** - there is no insert-at-front in the filesystem, so it costs the same as
 rewriting the file (stated, not hidden, §26.7).
 

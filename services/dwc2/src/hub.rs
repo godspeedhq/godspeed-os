@@ -2,12 +2,12 @@
 //!
 //! Slice 1c-ii, first part (`docs/arm32-usb-userspace.md`).
 //!
-//! **Still no split transactions here, and that is the point.** Every request in this file is a class
-//! request addressed to the HUB, which sits directly on the root port at high speed - so they are all
-//! direct transfers on a path already proven by 1b. Splits become necessary only when addressing a
-//! device BEHIND the hub, which is the next and final piece of Slice 1. Getting the topology first
-//! means that when splits are attempted, the port they are attempted through is already known to
-//! report the right thing.
+//! **The hub's own requests need no split.** Every class request in this file is addressed to the HUB,
+//! which sits directly on the root port at high speed - so they are all direct transfers on a path
+//! already proven by 1b. Splits are needed only to reach a full- or low-speed device BEHIND the hub,
+//! which `enumerate_downstream` (the last piece of Slice 1, at the end of this file) does. Getting the
+//! topology first meant that when splits were attempted, the port they were attempted through was
+//! already known to report the right thing.
 
 use godspeed as gs;
 use godspeed::driver::delay;
@@ -195,7 +195,6 @@ pub fn reset_tt(
     ok
 }
 
-/// Read one downstream port's status. `None` if the request failed.
 /// Ask the hub which ports have changed - without asking about the ports.
 ///
 /// The hub reports changes on an interrupt IN endpoint as a bitmap: bit N set means port N changed,
@@ -300,6 +299,7 @@ pub fn clear_changes(
     Some(st)
 }
 
+/// Read one downstream port's status. `None` if the request failed.
 pub fn port_status(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, port: u8,
 ) -> Option<PortStatus> {
@@ -462,10 +462,10 @@ pub fn visit_order(status: &[u16; 8], n_status: usize) -> ([u8; 8], usize) {
 
 /// Reset a port, then address and identify the device behind it - THROUGH a split transaction.
 ///
-/// This is the first transfer in the port that reaches past the hub, and every device on this board
-/// needs it (the survey says all four are full or low speed). A downstream device is addressed at 0
-/// with MPS 8 exactly as a root device is; what differs is that every stage rides the hub's
-/// transaction translator.
+/// This is the first transfer in the port that reaches past the hub. A downstream device is addressed
+/// at 0 with MPS 8 exactly as a root device is; what differs, for a full- or low-speed device, is that
+/// every stage rides the hub's transaction translator. A high-speed device is addressed directly (see
+/// the body: the survey's "all four need a split" was wrong, and only the keyboard does).
 pub fn enumerate_downstream(
     ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, hub: &Target, port: u8, next_addr: &mut u8,
 ) -> Option<(u16, u16, u8, Target, u32)> {
@@ -564,7 +564,7 @@ pub fn enumerate_downstream(
     // needed two tries and a device that is genuinely unreadable do not read the same.
     //
     // WHY `xhci` NEEDS NO EQUIVALENT, so nobody adds one and nobody removes this for symmetry: every
-    // endpoint context that driver programs carries CErr = 3 (`(3 << 1)` in dword 1, at five sites), so
+    // endpoint context that driver programs carries CErr = 3 (`(3 << 1)` in dword 1, at every site - seven today), so
     // the xHCI CONTROLLER retries a transaction three times in hardware before it reports a Transaction
     // Error at all. The failure this retry exists for never reaches its `control()`. The rule is "retry
     // where the controller does not", NOT "every USB driver retries" - and the evidence is on this very

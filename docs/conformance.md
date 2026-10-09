@@ -1,9 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # Conformance: `osdev conform`, and the Python question
 
-**Status:** BUILT as `scripts/conform.py`; the `osdev conform` shim is not written yet (it needs a
-Rust edit, and this branch deliberately touches none). Branch `feat/osdev-conformance`. Trails
-`CLAUDE.md`, which wins on any conflict.
+**Status:** BUILT as `scripts/conform.py`, with the `osdev conform` shim in front of it
+(`cmd_conform`, `osdev/src/main.rs`, which forwards and passes the exit code through). Branch
+`feat/osdev-conformance`. Trails `CLAUDE.md`, which wins on any conflict.
+
+*(Checked 2026-10-09. The counts below were measured on 2026-09-26 and are kept as that day's
+record: the tree now has 48 scripts and 12,948 lines under `scripts/`, `EXTRA_CHECKS` lists 23,
+`tests/conformance/ui/` holds 24 `.case` files rather than three, and `python_floor_check.py` has
+left `scripts/CONFORM-EXTRA.txt` for `EXTRA_CHECKS`, so that file is empty.)*
 
     py scripts/conform.py            fix what is decidable, report what needs judgement
     py scripts/conform.py --check    report both, change nothing (what CI wants)
@@ -117,7 +122,7 @@ person can redo it:
 
 | feature | needs | found |
 |---|---|---|
-| walrus `:=` | 3.8 | `commandments.py:1107` - **this is the floor** |
+| walrus `:=` | 3.8 | `commandments.py`, the `named :=` match - **this is the floor** |
 | `subprocess` `capture_output=` / `text=` | 3.7 | 5 scripts |
 | f-strings | 3.6 | 23 scripts |
 | `match` statement | 3.10 | none |
@@ -495,7 +500,8 @@ makes the same function-local-annotation distinction the measurement did: at mod
 It cannot go in `EXTRA_CHECKS` without a Rust edit, so it is listed in `scripts/CONFORM-EXTRA.txt` -
 checkers `conform` runs that a LOCAL build does not - and `conform` prints the count every run
 (`18 checks ran ... 1 of them not yet on the build path`). CI runs it, since that is YAML. A visible
-gap gets closed; an invisible one does not. `build.yml` also now pins Python to 3.8 rather than taking
+gap gets closed; an invisible one does not. (It was closed: `python_floor_check.py` is in
+`EXTRA_CHECKS` now and `CONFORM-EXTRA.txt` is empty.) `build.yml` also now pins Python to 3.8 rather than taking
 whatever the runner ships, which was an unpinned dependency on the enforcement layer itself.
 
 ### What to do with the manual break anyway

@@ -25,8 +25,18 @@ Ok
 read: not found: /lsr/nope
 > result
 Err(FileNotFound)
-run: ran 4, failed 1
+--- summary ---
+PASS  read /lsr/big.txt
+PASS  result
+FAIL  read /lsr/nope
+PASS  result
+--- failures ---
+FAIL  read /lsr/nope
+run: ran 4, failed 1, skipped 0
 ```
+
+`run <path> <args...>` passes the words after the path to the script as `$arg1`.., `$args` and
+`$argcount` (`$self` is the path); `run <path> save <out>` also writes the run report to a file.
 
 Each command is **echoed** (`> cmd`) before it runs, so the serial transcript is
 self-documenting - exactly what you want when eyeballing a run on the T630.
@@ -34,10 +44,10 @@ self-documenting - exactly what you want when eyeballing a run on the T630.
 ## 2. The script format (`.gsh`)
 
 - **Lines** are split on newline; a non-comment line is further split on **`;`** into commands.
-  So a script is either real multi-line, *or* `cmd ; cmd ; cmd` on one line - the latter is how
-  scripts are authored today (the shell can't yet type a newline into a file; a host-side editor
-  / image-baked `.gsh` is the companion step).
-- **`#` comments** - a line whose first non-blank character is `#` is skipped. Annotate freely.
+  So a script is either real multi-line, *or* `cmd ; cmd ; cmd` on one line. On-device, `edit`
+  (`36_edit.md`) writes real multi-line scripts; `osdev script-disk` bakes one host-side.
+- **`#` comments** - a `#` that starts a line, or follows whitespace outside quotes, starts a
+  comment to the end of the line. Annotate freely.
 - **Blank lines** are skipped.
 - `.gsh` is a naming **convention** (GodspeedOS shell; `.gs` is reserved for the future
   general-purpose Godspeed language), not a mechanism - `run` does not care about the extension
@@ -46,26 +56,30 @@ self-documenting - exactly what you want when eyeballing a run on the T630.
 ## 3. Result and the summary
 
 `run` uses the command **`Result`** model (`32_result.md`): after every command it tracks
-`Ok`/`Err`, and prints a summary -
+`Ok`/`Err`, and prints a summary - a `--- summary ---` list of `PASS`/`FAIL` per statement, a
+`--- failures ---` list (and `--- skipped ---` when anything declined to run), then the tally -
 
 ```
-run: ran N, failed M
+run: ran N, failed M, skipped K
 ```
 
 `run` itself is `Ok` iff **every** command was `Ok` (so `result` after a `run` tells you whether
 the whole script passed). Today a failing line is one that *errors* (a missing file, a bad
-column, …). Verifying *correct output* (not just "didn't error") is the job of a future
-**`assert`** - `… | assert contains X`, `assert fails read /nope` - which reads the same `Result`.
+column, …). Verifying *correct output* (not just "didn't error") is the job of **`assert`**
+(`34_assert.md`) - `… | assert contains X`, `assert fails read /nope` - which reads the same
+`Result`.
 
 ## 4. Bounds & safety (loud, never silent - §26.6 / §3.12)
 
-- A script is one `fs` file, buffered whole; over `SCRIPT_MAX` (7112 bytes = 2 x `IO_CHUNK`) is reported, not silently
-  truncated.
+- A script is one `fs` file, streamed in and **minified** as it loads (comments, blank lines and
+  indentation stripped), so `SCRIPT_MAX` (7112 bytes = 2 x `IO_CHUNK`) bounds the CODE, not the
+  raw file. Code past it is reported (`run: script CODE exceeds 7112 bytes - truncated ...`), and
+  the truncated script still runs.
 - **Scripts cannot nest.** A `run` inside a script is refused (`run` at depth > 0). This is a
   hard rule, not a nicety: unbounded `run`-calls-`run` recursion would overflow the bounded user
   stack (`execute`/`pipe_run` are `#[inline(never)]` so the per-line nesting stays shallow - the
   same stack discipline the record builders needed).
-- A missing script is `Err(FileNotFound)`; storage unavailable is `Err(Unknown)`.
+- A missing or empty script is `run: not found or empty: <path>` and `Err(FileNotFound)`.
 
 ## 5. Later (separate so it can grow)
 
@@ -74,12 +88,14 @@ column, …). Verifying *correct output* (not just "didn't error") is the job of
 - **Image-baked `.gsh`** - **built**: `osdev script-disk <out> <script>` bakes a script into a
   GSFS data disk host-side (`gsfs_add_file`); `dd` it to the data drive and `run /suite.gsh` on
   hardware, no on-device authoring. `osdev test script` proves the loop (incl. piped asserts).
-- Multi-line authoring on-device (a tiny editor, or newline-capable write).
+- Multi-line authoring on-device - **done**: `edit` (`36_edit.md`).
 
 ## 6. Implementation shape & conformance
 
-A shell built-in: reads the file via `fs` (op 11, like `read`), copies it off the `fs` reply,
-then runs each command through the same `execute()` the prompt uses - so pipes, record verbs,
+A shell built-in: streams the file in with `READ_AT` (op 26, like `read`), minifying as it goes,
+resolves `import` / `from ... import` at load time, then runs each statement through the gsh
+interpreter (`run_lines`), which hands each command to the same `execute()` the prompt uses - so
+pipes, record verbs,
 everything compose for free. Threads the per-line `Result` as local state (no global, §3.9).
 Conforms to `0_conventions.md`: its own `run help` / `run version` via the shared `help_block`,
 listed under **Console** in the top-level `help`.

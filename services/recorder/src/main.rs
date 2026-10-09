@@ -22,8 +22,8 @@
 //! what happened. The dependency points the right way: `recorder` needs `events` and `fs`, and neither
 //! of them needs `recorder`.
 //!
-//! **Spawned on demand**, never at boot, and deliberately NOT restarted on death. It is absent from
-//! the kernel's managed-service lists, which is what keeps this feature a zero-kernel-change one. A
+//! **Spawned on demand**, never at boot, and deliberately NOT restarted on death: it is absent from
+//! the supervisor's `MANAGED` set (the kernel keeps no list of names). A
 //! respawned recorder would not know its target path, so it would be alive and writing nothing while
 //! `status` said "running" - worse than dead. Instead the capture opens with a header line and closes
 //! with a footer, so a file with no footer says plainly that it died.
@@ -31,7 +31,7 @@
 //! **Bounded by construction.** `fs` allocates a file's whole extent up front (`OP_WRITE_NEW`), so a
 //! capture has a fixed size chosen when it starts. It cannot grow until the disk is full and take the
 //! filesystem down with it - the failure that would turn a troubleshooting tool into an outage. Full
-//! means stop, and say so.
+//! means ROTATE to the next of `PIECES` files (see there and `CLAUDE.md`), never grow.
 
 use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
@@ -44,7 +44,6 @@ pub const REC_OP_STATUS: u8 = 3; // [3]
 pub const REC_OK: u8 = 0;
 pub const REC_ERR: u8 = 1;
 
-/// `fs` opcodes. Wire format is [tag, op, path_len, path.., data..].
 /// Correlation tag for this service's own `fs` requests. Distinct from 0, which is both what an
 /// unthinking caller sends and the value of `FS_OK` - a collision that has hidden a bug before.
 const FS_TAG: u8 = 0xE1;
@@ -61,7 +60,7 @@ const IO_CHUNK: usize = 7 * 508;
 const DEFAULT_CAPACITY: u64 = 8 * 1024 * 1024;
 
 /// How long to wait for a control message before draining anyway. The loop must serve requests AND
-/// drain on a timer; `recv_timeout` does both without a second task.
+/// drain on a timer; a timed receive (`gs::ipc::recv_within_ms`) does both without a second task.
 const DRAIN_MS: u64 = 2000;
 
 /// How many files a capture is spread over. The budget is divided among them, so the guaranteed
@@ -413,9 +412,9 @@ fn drain(ctx: &ServiceContext, cap: &mut Capture) {
     // capture just stops growing, which is the silent failure §26.7 forbids and the hardest kind to
     // notice in a file that already exists.
     //
-    // The distinction matters here too: `Ok(None)` is a busy `events` and the next tick retries,
-    // which is correct and must NOT reacquire. `Err` is a dead endpoint, which never recovers on its
-    // own.
+    // `gs::call::request_within` meets it: a send that fails on a dead endpoint is reacquired by name
+    // and sent once more inside the call. Every failure that comes back - `Busy`, `OutcomeUnknown`,
+    // `PeerDied`, `Unreachable` - waits for the next tick.
     // The reacquire-and-retry loop that was written out here is `gs::call`'s job, and it is not
     // filesystem-specific - the same eleven lines appeared for `fs` a few hundred lines up and in
     // four other services. Reading a ring is idempotent, so every failure here is simply "try on the
@@ -516,10 +515,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("recorder: ready (idle - `events persist start` begins a capture)");
 
     loop {
-        // WHILE PREPARING, DO NOT SLEEP. `recv_timeout` parks for two seconds between messages, which
-        // is right when idle or recording and hopeless while filling: it capped the pre-fill at one
-        // slice per tick - about 85 KB every two seconds - so a megabyte took half a minute and a
-        // capture that was stopped before it finished left an unfilled tail that `read` refuses.
+        // WHILE PREPARING, DO NOT SLEEP. `gs::ipc::recv_within_ms` parks for two seconds between
+        // messages, which is right when idle or recording and hopeless while filling: it capped the
+        // pre-fill at one slice per tick - about 85 KB every two seconds - so a megabyte took half a
+        // minute and a capture that was stopped before it finished left an unfilled tail that `read` refuses.
         //
         // Non-blocking here instead, so the fill runs as fast as the device allows while control
         // messages are still served every iteration.

@@ -22,7 +22,9 @@ WHAT THIS FIXES, as rules rather than habits:
 
   1. A BOARD IMAGE IS ALWAYS RELEASE. There is no flag to ask for debug, because nobody wants a
      debug board image and two ports have now proven what one does.
-  2. EVERY PORT TAKES THE SAME FLAGS. `--crash-window` works on all four.
+  2. EVERY PORT TAKES THE SAME FLAGS. `--crash-window` is the only flag; it builds on the three
+     non-x86 ports and is REFUSED, loudly, on x86 (whose crash-window image `osdev test fs-window`
+     stages for itself).
   3. EVERY BUILD ENDS THE SAME WAY: the artifact, its size, and exactly what to copy where -
      including the renames, which are per-port and are what a person gets wrong.
   4. THE ARTIFACT MUST BE NEWER THAN THIS RUN. A build that silently leaves yesterday's image is

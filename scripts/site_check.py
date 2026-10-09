@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Hold the five HAND-WRITTEN site pages to the repository they describe.
 
-WHY THIS EXISTS. 70 of the site's 74 pages are `{{#include}}` views of real files, so they cannot
-drift - that is the whole design, and it works. Four pages have no source to be a view of:
+WHY THIS EXISTS. 83 of the site's 89 pages (2026-10-09, `SUMMARY.md` among the other six) are
+`{{#include}}` views of real files, so they cannot drift - that is the whole design, and it works.
+Five pages have no source to be a view of:
 
     introduction.md   the front door
     gallery.md        captures of the running system
@@ -10,7 +11,7 @@ drift - that is the whole design, and it works. Four pages have no source to be 
     utilities.md      the index of every utility
     stdlib.md         the standard library's front door (points at /api and the design report)
 
-Those four are prose someone wrote, and prose someone wrote is prose that goes stale. The question
+Those five are prose someone wrote, and prose someone wrote is prose that goes stale. The question
 asked was whether they could be GENERATED instead. Mostly they should not be: the spec files carry
 inconsistent headers (`# Utility Spec: observe` in one, `# trace - what the kernel is doing` in the
 next), so a generated table would have to invent its own descriptions, and generated prose would be
@@ -20,7 +21,7 @@ What CAN be mechanised is the part that actually rots: whether the pages still d
 that exists. A missing row for a new utility, a service that gained a peer, a page that quietly
 became hand-written. So this checks facts and completeness, and leaves the writing alone.
 
-Exit 0 when the four pages match the repository, 1 otherwise.
+Exit 0 when the five pages match the repository, 1 otherwise.
 """
 
 import glob

@@ -8,14 +8,15 @@
 #![deny(unsafe_code)]
 //! driver-skeleton - an ANNOTATED TEMPLATE for "how do I write a device driver on
 //! Godspeed?". It is illustrative, not runnable: the kernel wires a driver's
-//! MMIO/DMA/IRQ per recognised driver at spawn, so a real one needs a small
-//! kernel-side hook. See `examples/e1000` for a real, runnable driver, and
+//! MMIO/DMA/IRQ at spawn for the device CLASS its spawn row names, and this one's
+//! row names none. See `examples/e1000` for a concrete register-reading driver, and
 //! `services/block-driver` (AHCI) / `services/xhci` (USB) for production drivers.
 //! Read this top to bottom alongside `CLAUDE.md` in this folder.
 //!
 //! The whole point: a driver is just a SERVICE that holds three extra
-//! capabilities - an MMIO window, a DMA arena, and an IRQ line - all declared in
-//! its contract and granted by the kernel (Commandment VII). It writes NO
+//! capabilities - an MMIO window, a DMA arena, and an IRQ line - stated in its
+//! contract for review and granted by the kernel for the device class its spawn
+//! row names (Commandment VII). It writes NO
 //! `unsafe`: every register and DMA access goes through the SDK's audited
 //! `Mmio`/`Dma` wrappers (§18.1, Commandment X).
 
@@ -46,7 +47,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("driver-skeleton: starting");
 
     // 1. Acquire the kernel-granted hardware capabilities. At spawn the kernel
-    //    mapped our MMIO window (`hw_mmio`) and a physically-contiguous DMA arena;
+    //    mapped our device class's MMIO window and a physically-contiguous DMA arena;
     //    we reach them through the SDK, never a raw pointer and never `unsafe`.
     //    If the device is absent we DEGRADE (a service is never special,
     //    Commandment V) instead of panicking.
@@ -109,8 +110,8 @@ fn bring_up(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> bool {
     mmio.write32(REG_RING_LO, ring_phys as u32);
     mmio.write32(REG_RING_HI, (ring_phys >> 32) as u32);
 
-    // Enable the device and its interrupt, then unmask our IRQ line so the kernel
-    // routes the device's interrupt to our endpoint (§12.2). The line is the one the
+    // Enable the device and its interrupt, then re-arm our IRQ line (unmask a level
+    // line; a no-op for MSI) so the kernel delivers it to our endpoint (§12.2). The line is the one the
     // kernel GRANTED at spawn (`Irq::granted`); a driver never names a vector itself,
     // because routing a vector is authority the kernel keeps.
     mmio.write32(REG_CTRL, CTRL_ENABLE | CTRL_IRQ_EN);

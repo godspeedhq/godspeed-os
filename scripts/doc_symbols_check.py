@@ -19,6 +19,13 @@ trace design notes). A hand-kept allowlist of those would rot exactly like the c
 having to re-take. A baseline ratchets instead: whatever is accepted today is recorded, anything NEW
 fails, and the file may shrink freely. Same shape as `SHARED-SURFACE.baseline.txt`.
 
+WHAT IS SCANNED, so a pass is not read as wider: the docs in DOC_DIRS and DOC_FILES below only - not
+`services/*/CLAUDE.md`, `examples/**`, `kernel/CLAUDE.md`, `website/src/`, `GETTING_STARTED.md` or
+`CONTRIBUTING.md`. A name RESOLVES if it occurs as a SUBSTRING anywhere in the source text, comments
+and Python included, so a dead name contained in a longer live one passes (the weakness
+`comment_symbol_check.py` removed for itself on 2026-10-05). With no baseline file the checker writes
+one and exits 0.
+
 NOT SCANNED: `audits/` and `milestones/`. Those are append-only EVIDENCE and dated history (CLAUDE.md
 §5) - a symbol that existed when the audit ran is CORRECT there, and rewriting it would falsify the
 record. Same reason `backlog/29` keeps the serial capture it quotes verbatim.
@@ -67,7 +74,7 @@ def read(p):
 
 
 def source_text():
-    """Every byte of Rust in the tree, and the set of names DEFINED in it."""
+    """(the raw text of every .rs and .py file under SRC_DIRS, comments included; the file count)."""
     files = []
     for d in SRC_DIRS:
         for dirpath, _, names in os.walk(os.path.join(ROOT, d)):

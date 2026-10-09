@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The contract is the first thing to read, not the last. It is the whole answer to "what can this
-# program do", and the kernel mints exactly what is below - not one capability more (CLAUDE.md
+# program do": the spawn request should grant exactly what is below - not one capability more (CLAUDE.md
 # §13.6: authority comes from the SPAWN REQUEST, and this file is the reviewable statement of it).
 #
 # Compare it with `examples/00-hello`, which declares `log_write` alone. This program reads a file

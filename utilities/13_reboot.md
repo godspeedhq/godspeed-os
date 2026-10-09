@@ -16,25 +16,33 @@ sole member of the **Power** category.
 | Command | Meaning |
 |---|---|
 | `reboot` | Print `rebooting...` and reset the machine. |
-| **Ctrl+Alt+Del** (USB keyboard) | Reset the machine immediately, from any context. |
+| **Ctrl+Alt+Del** (USB keyboard, at the shell prompt) | Reset the machine, as `reboot` does. |
 
 ## 3. Behaviour
 
 Prints a final `rebooting...` line, then invokes the `Reboot` syscall (18), which
-performs a hardware reset. Does not return. There is no confirmation prompt in v1
-(an interactive guard could be added later).
+performs a hardware reset. Does not return on success. There is no confirmation
+prompt in v1 (an interactive guard could be added later). A refused reboot (a caller
+without the `REBOOT` capability) is reported rather than hung on
+(`ServiceContext::reboot`).
 
-**Ctrl+Alt+Del** is a hardware *secure-attention* reset: the USB keyboard drivers
-(`xhci`/`ehci`) recognise the chord (either Ctrl + either Alt + Delete) directly in
-the HID report and invoke the same `Reboot` syscall - so it works from *any* context,
-including inside a full-screen app like `edit` or at a wedged prompt, not just at the
-shell. Detection is `godspeed_sdk::hid::is_ctrl_alt_del`, checked per poll for keyboard
-devices only (a mouse button byte can alias the modifier bits). Like the `reboot`
-command, it does not prompt - it resets immediately.
+**Ctrl+Alt+Del** is routed through the shell (CLAUDE.md §6.4, SEC-2 follow-up). The
+USB keyboard drivers (`xhci`, `ehci`) recognise the chord (either Ctrl + either Alt +
+Delete) in the HID report with `godspeed_sdk::hid::is_ctrl_alt_del`, checked for
+keyboard devices only (a mouse button byte can alias the modifier bits), and only
+**signal** it: they push `hid::CTRL_ALT_DEL_SIGNAL` (`0x80`, a byte no typed key
+produces) onto the console stream. The shell, which holds `REBOOT`, sees that byte at
+its prompt and runs `reboot`. The drivers hold no `REBOOT` capability and cannot reset
+the machine themselves. So the chord works at the shell prompt; while a full-screen app
+such as `edit` owns the console the shell is not reading, so quit it first. The Pi 2's
+`dwc2` driver does not signal the chord. Like the `reboot` command, it does not
+prompt.
 
 ## 4. Capabilities
 
-- **Console output** for the `rebooting...` line, then the `Reboot` syscall.
+- **`REBOOT`** (resource 8), held by the shell; the kernel refuses the `Reboot`
+  syscall (18) to anyone without it.
+- **Console output** for the `rebooting...` line.
 
 ## 5. Non-goals
 

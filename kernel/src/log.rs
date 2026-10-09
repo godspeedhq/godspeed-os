@@ -77,9 +77,10 @@ static RING: SpinLock<RingBuffer> = SpinLock::new(RingBuffer::new());
 /// message flushes in chunks of this size (still far better than per-byte).
 const SERIAL_STAGE: usize = 512;
 
-/// `fmt::Write` sink for one log message: appends every byte to the ring buffer (the
-/// drain-to-events sink) and stages it for serial, flushing the staged bytes to COM1 in a
-/// **single `SERIAL_LOCK` hold** so a concurrent console write (the shell prompt, `observe`)
+/// `fmt::Write` sink for one log message: appends every byte to the ring buffer (and the boot
+/// record while it has room) and stages it for serial, flushing the staged bytes to the serial
+/// port in a **single `SERIAL_LOCK` hold** (the arch's spin for it is capped, and a flush that
+/// cannot get it writes unlocked rather than hang) so a concurrent console write (the shell prompt, `observe`)
 /// cannot split the message mid-character. Previously the serial mirror was per-byte, taking
 /// and releasing the lock for each byte, which let console output interleave into the gaps
 /// and garble the boot log.
@@ -113,8 +114,9 @@ impl fmt::Write for LogSink<'_> {
 }
 
 pub fn write_fmt(args: fmt::Arguments) {
-    // RING is taken from BOTH task context and interrupt context (the timer ISR's control-channel
-    // drains log lines like "control: KILL supervisor"), so its hold MUST mask interrupts - the
+    // RING is taken from BOTH task context and interrupt context (the timer ISR logs - the liveness
+    // watchdog, IOMMU fault reports; it once logged the in-kernel control channel's commands too,
+    // before that moved to the `control` service), so its hold MUST mask interrupts - the
     // `smp::without_interrupts` contract. Without it, a task preempted mid-kprintln holds RING, and any
     // code that then takes RING with preemption suppressed deadlocks forever waiting on the unreschedulable
     // holder. That is exactly the supervisor respawn (Path C / Phase 6): it pins Core 0 (no context

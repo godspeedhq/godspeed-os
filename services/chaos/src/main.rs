@@ -51,18 +51,18 @@ const SHELL_SETTLE_YIELDS: u32 = 200_000; // hard cap on that beat if the clock 
 // keeps a spin cap next to its time bound).
 const HANDOFF_MAX_YIELDS: u32 = 200_000;  // the post-run wait for a live shell to hand the console to
 const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's argument message
-/// The between-rounds beat, in SECONDS - because a yield COUNT is not a duration.
-///
-/// This was `3000` yields, tuned where a yield is cheap. A yield costs a full scheduler quantum whenever
+// The between-rounds beat - bounded by the clock, because a yield COUNT is not a duration.
+//
+// This was `3000` yields, tuned where a yield is cheap. A yield costs a full scheduler quantum whenever
 /// the yielding task is the only runnable one - which is exactly the state chaos creates, with every
 /// service killed and mid-restart - so on the Pi 2 (100 Hz) those 3000 yields are 30.03 SECONDS, and
-/// only on the rounds where everything else happens to be blocked. That is why the pauses looked random,
-/// why they clustered on exactly 30.0 s, and why the operator repeatedly took a healthy machine for a
-/// wedged one and reached for the power switch.
-///
-/// The harness was measuring itself in units whose cost it does not control (Commandment VIII: a proxy
-/// is not the truth). The beat is now bounded by the CLOCK, so it is the same beat on every arch, with
-/// `PACE_YIELDS` kept only as the hard cap that stops a stuck clock spinning forever (§26.6).
+// only on the rounds where everything else happens to be blocked. That is why the pauses looked random,
+// why they clustered on exactly 30.0 s, and why the operator repeatedly took a healthy machine for a
+// wedged one and reached for the power switch.
+//
+// The harness was measuring itself in units whose cost it does not control (Commandment VIII: a proxy
+// is not the truth). The beat is now bounded by the CLOCK, so it is the same beat on every arch. (It is
+// SLEPT in `PACE_CHUNK_MS` chunks; `PACE_YIELDS` below is declared but no longer read.)
 /// The beat between rounds, in MILLISECONDS.
 ///
 /// This was one SECOND, which made a 100-round run take 100 seconds of almost pure waiting. Seconds
@@ -77,7 +77,7 @@ const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's ar
 const PACE_MS: u64 = 250;
 /// Slept in chunks so `q` still lands promptly - the abort must not wait out a whole beat.
 const PACE_CHUNK_MS: u64 = 25;
-const PACE_YIELDS: u32 = 200_000;   // hard cap on the beat if the clock never advances
+const PACE_YIELDS: u32 = 200_000;   // was the hard cap on a yielded beat; unread since the beat is slept
 const MEMP_CHUNK: usize = 64 * 1024; // one mem-pressure round allocs this (held; chaos's limit bounds it)
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; // matches the `date` utility
 
@@ -131,9 +131,9 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 }
 
 /// A bounded frame buffer. The whole panel is built into one of these, then flushed in a couple of
-/// `console_write`s (not one per line), in <=240-byte chunks broken AT A NEWLINE: `console_write` caps at
-/// 256 bytes (BOTH the SDK wrapper and the kernel syscall), and a chunk must never split a CSI escape /
-/// line across two writes. NOTE: do NOT collapse this to one whole-panel write to "stop flicker" - the
+/// `gs::io::print`s (not one per line), in <=240-byte chunks broken AT A NEWLINE: `gs::io::print`
+/// caps at 256 bytes (BOTH the SDK `console_write` under it and the kernel syscall), and a chunk must
+/// never split a CSI escape / line across two writes. NOTE: do NOT collapse this to one whole-panel write to "stop flicker" - the
 /// per-round redraw showing the counters change IS the intended feedback, not a rendering bug, and a
 /// >256B write is silently dropped by the SDK cap so the panel vanishes (tried 2026-06-27, reverted).
 struct FrameBuf { buf: [u8; 2048], len: usize }
@@ -160,9 +160,6 @@ impl core::fmt::Write for FrameBuf {
     }
 }
 
-/// Write a compact, bounded duration ("45s", "1m23s", "2h05m", "3d04h") into the frame: a chaos run can
-/// span days, so cascade d/h/m/s and show the two most-significant units. Seconds come from the RTC
-/// (year-guarded), so the value is plausible by construction.
 /// When this run STARTED, in wall-clock terms, worked out after the fact.
 ///
 /// A chaos run usually begins before the clock is known: this board has no RTC, so the time only
@@ -186,7 +183,7 @@ impl core::fmt::Write for FrameBuf {
 /// in that order. Reading the raw RTC here would be a second, worse answer to a question somebody else
 /// already owns (Commandment III).
 fn learn_wall_offset(ctx: &ServiceContext) -> Option<i64> {
-    // ACQUIRE BY NAME FIRST. Chaos declares NO `ipc_send` peers at all - it reaches every service
+    // ACQUIRE BY NAME FIRST. Chaos's only declared peer is `supervisor` - it reaches every other service
     // through the kernel's name directory, which is how it can kill things it was never wired to. So a
     // name-addressed request finds nothing until the cap is acquired, and the first version of this
     // silently failed on every call: the report kept saying the clock was not set while `date` was
@@ -215,6 +212,9 @@ fn learn_wall_offset(ctx: &ServiceContext) -> Option<i64> {
     if now >= 1_577_836_800 { Some(now - gs::task::epoch_secs_monotonic(ctx)) } else { None }
 }
 
+/// Write a compact, bounded duration ("45s", "1m23s", "2h05m", "3d04h") into the frame: a chaos run can
+/// span days, so cascade d/h/m/s and show the two most-significant units. The seconds are a monotonic
+/// elapsed (or an extrapolation of one), so the value is plausible by construction.
 fn write_dur(f: &mut FrameBuf, secs: u64) {
     if secs >= 86400 { let _ = write!(f, "{}d{:02}h", secs / 86400, (secs % 86400) / 3600); }
     else if secs >= 3600 { let _ = write!(f, "{}h{:02}m", secs / 3600, (secs % 3600) / 60); }
@@ -442,11 +442,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         round += 1;
 
-        // ONE ROUND = ONE SWEEP over EVERY live service, not one random victim. So `all-services N` hits
-        // every service N times over, evenly, instead of N scattered pokes landing on a random few (the old
-        // behaviour: at N=10 only ~2 services were ever touched). Snapshot the live set: for "all-services"
-        // every live task except chaos, the mem-pressure tasks it spawns, and transient observe-*; for a
-        // specific target, just that one service.
+        // Pick this round's victims. For "all-services", a coin flip per live task (about half, at least
+        // one), skipping only chaos's own apparatus (`is_transient`: chaos and its mem-pressure tasks -
+        // `observe*` is NOT skipped, see the C2-1 note there); for a comma list, every listed service; for
+        // a single target, that one. (This said "one sweep over EVERY live service, evenly", which the
+        // random subset below contradicts.)
         let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
         let mut ncand = 0usize;
         if target_random {
@@ -490,11 +490,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             cand[0].0[..l].copy_from_slice(&tb[..l]); cand[0].1 = l; ncand = 1;
         }
 
-        // Per sweep: FLOOD every floodable service and KILL every reply-style one (shell/fs can't be flooded
-        // - it corrupts their reply stream - so a kill is how they get hit). PLUS kill ONE rotating floodable
-        // service, walking the set across rounds, so the floodable ones are RESTART-tested too (the other
-        // resilience axis), not only drain-tested. cand order can shift as services respawn into new slots,
-        // but the rotor still spreads those kills across the floodable set over the run.
+        // Per sweep: FLOOD every floodable victim and KILL every reply-style one (shell/fs can't be flooded
+        // - it corrupts their reply stream - so a kill is how they get hit). A floodable victim is then
+        // killed too: always in a random or list run, and in a single-target run whenever the rotor
+        // `kill_pick` lands on it - which, with one candidate, is every round.
         let kill_pick = if ncand > 0 { ((round - 1) % ncand as u64) as usize } else { usize::MAX };
         let (mut sweep_killed, mut sweep_flooded) = (0u64, 0u64);
         for c in 0..ncand {
@@ -531,9 +530,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     Some(_) => { flooded += 1; sv_flooded[s] += 1; sweep_flooded += 1; sv_flood_na[s] = 0; }
                     None    => { if sv_flood_na[s] == 0 { sv_flood_na[s] = 2; } } // no endpoint right now
                 }
-                // ...and KILL it: when the rotor lands here (all-services / single target), OR always in a
-                // multi-target list run (semantics B) or the RANDOM storm (every service the round PICKED
-                // goes down this round).
+                // ...and KILL it: when the rotor lands here (a single target - every round, as it is the
+                // only candidate), OR always in a multi-target list run (semantics B) or the RANDOM storm
+                // (every service the round PICKED goes down this round).
                 if c == kill_pick || target_list || target_random {
                     let _ = ctx.kill(name);
                     killed += 1; sv_killed[s] += 1; sweep_killed += 1;
@@ -631,8 +630,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // Pace the round. With the recovery wait gone the loop would otherwise spin in milliseconds,
         // flooding the serial log and outrunning the eye. Yield a modest beat, still polling `q` (from the
         // SERIAL console - the keyboard is a chaos target) so an abort lands promptly.
-        // Bounded by the clock, capped by the yield count - the same shape as the handoff wait above.
-        // The clock read is a syscall, so it is sampled every POLL_EVERY yields rather than every one.
         // SLEEP the beat, do not spin it. The old loop yielded up to 200 000 times to burn one second,
         // which pegs a core for the whole run and inflates CORE_TOTAL_TICKS - the observer distorting
         // what it observes, the same trap the shell's muted branch documents. Sleeping in short chunks

@@ -127,7 +127,8 @@ check would report the name free.
 | Raspberry Pi 4 B (AArch64) | selfcheck 377/0 twice, chaos 100 rounds / 568 kills, 0 panics |
 
 **2,233 real service kills, zero kernel panics, zero liveness wedges.** Every service-level panic on
-every machine came from the one designed site (`service_context.rs:571`, `recv` panicking on
+every machine came from the one designed site (`ServiceContext::recv` in `service_context.rs` - line
+571 then - panicking on
 `EndpointDead` so the supervisor restarts it). A second panic site anywhere in that tally would have
 been the tell; there was none.
 
@@ -197,6 +198,10 @@ Number 3 is the one that matters. The other two are bugs; that one is why they s
 
 The supervisor passes what a service **is**: the image, memory limit, core, peers, and - for a driver
 - the hardware facts (MMIO base and length, IRQ line, DMA arena size, BDF, whether to confine it).
+*(Note 2026-10-09: not as built. A driver's request names a device CLASS (`hwclass`), a DMA arena
+SIZE, a confine flag and at most a BDF; the kernel REFUSES raw MMIO addresses and raw interrupt
+vectors and resolves the window and vector from its own bus scan - CLAUDE.md 14.1, the step C
+amendment, and 9.1 below.)*
 
 ### Why the kernel's name-based authority table cannot survive this
 
@@ -1674,7 +1679,9 @@ does the service still call the syscall?
   path. The two walks agree device-for-device on QEMU q35, the Wyse and the Pi 4.
 - **Step 2's key management** has no design yet, and it is process as much as code.
 - **A9-4, the BSP idle wedge**, is unrelated to this work and remains open and deferred. It did not
-  recur on any of the four hardware runs.
+  recur on any of the four hardware runs. *(2026-10-09: since diagnosed and fixed - the idle path
+  restarted a periodic LAPIC countdown before it could fire, `bdc7adaa`; `audits/kernel-audit.md`
+  records it FIXED after its T630 card.)*
 
 - **DONE: `probe` moved (pin 1).** The two authorities that kept it in the kernel both found homes in
   the existing model - the IRQ route as a device CLASS (`hwclass::TEST_IRQ`, the kernel still states

@@ -105,9 +105,11 @@ pub enum SyscallNumber {
     CpuClock               = 55,
 }
 
-/// Raw syscall dispatcher - called from the SYSCALL/SYSENTER IDT stub.
+/// Raw syscall dispatcher - the one neutral entry every port's trap path calls (`arch/<isa>/`:
+/// the x86-64 `syscall_entry.rs` stubs, and the ARM, AArch64 and RISC-V syscall handlers).
 ///
-/// Registers: rax = syscall number, rdi/rsi/rdx = arguments.
+/// Each arch moves its own registers into `(number, arg0, arg1, arg2)` before calling, so nothing
+/// here knows which ISA the trap came from (x86-64: rax, then rdi/rsi/rdx).
 ///
 /// # Safety
 /// Called from ring 3 → ring 0 transition; must validate all user-supplied
@@ -375,11 +377,6 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     }
 }
 
-/// arg0 = cap_slot, arg1 = out_buf_ptr (user VA), arg2 = out_buf_len.
-///
-/// Blocks until a message is dequeued from the endpoint, then copies the
-/// payload into the caller-supplied buffer.  Returns the number of bytes
-/// written on success, or a negative error code.
 /// SEC-7: narrow an embedded cap for its RECEIVER before installing it. A DELEGATED-resource cap
 /// (a file/socket, §7.10) is installed WITHOUT GRANT - the owning service (e.g. fs) mints it with
 /// GRANT only so it can transfer it (§8.5 rule 1: an embedded cap must be grantable), but the
@@ -395,6 +392,12 @@ fn narrow_embedded_for_receiver(cap: crate::capability::cap::Capability) -> crat
     }
 }
 
+/// arg0 = cap_slot, arg1 = out_buf_ptr (user VA), arg2 = out_buf_len.
+///
+/// Blocks until a message is dequeued from the endpoint, then copies the
+/// payload into the caller-supplied buffer. A payload longer than the buffer is
+/// TRUNCATED to it (unlike `Call`, which refuses). Returns the number of bytes
+/// written on success, or a negative error code.
 fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
         Ok(c)  => c,
@@ -740,17 +743,10 @@ const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
 // Syscall: Spawn (7) / Kill (8) / AcquireSendCap (10).
 // ---------------------------------------------------------------------------
 
-/// arg0 = (core_id << 16) | spawn_cap_slot, arg1 = name_ptr, arg2 = name_len.
-///
-/// Validates the spawn capability, reads the service name from user space,
-/// then calls `task::spawn_service_by_name`.
-///
-/// core_id encoding:
-///   - 0x0000 = core 0, 0x0001 = core 1, …
-///   - 0xFFFF = let the kernel choose (preferred_core from service_config).
-/// Probe parameters ride in the UPPER 32 bits of `arg0`, which `Spawn` never used:
-/// `[55..48] flags  [47..32] probe mode  [31..16] core  [15..0] spawn cap slot`.
-/// No new syscall and no change in arity - see `docs/probe-params-design.md`.
+/// UNUSED. These were the probe parameters `Spawn` carried in the UPPER 32 bits of `arg0`
+/// (`[55..48] flags  [47..32] probe mode  [31..16] core  [15..0] spawn cap slot`,
+/// `docs/probe-params-design.md`). The probe path is gone (see `handle_spawn`) and nothing reads
+/// these three constants any more.
 const SPAWN_FLAG_HAS_RECV:  u64 = 1 << 48;
 const SPAWN_FLAG_SMALL_MEM: u64 = 1 << 49;
 const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
@@ -777,7 +773,8 @@ const SPAWN_PAYLOAD_MAX: usize = 128;
 struct SpawnRequest {
     /// Must equal `SPAWN_REQUEST_VERSION`. A spawner built against a different kernel is refused.
     version:      u32,
-    /// bit0 has_recv_endpoint, bit1 has_console_read.
+    /// bit0 has_recv_endpoint, bit1 has_console_read, bit2 strict core, bit3 peers with GRANT,
+    /// bit4 watched (the `SPAWN_FLAG_*` constants below).
     flags:        u32,
     image_ptr:    u64,
     image_len:    u64,
@@ -787,7 +784,8 @@ struct SpawnRequest {
     core:         u32,
     memory_limit: u64,
     /// Privilege bitmask (SPAWN, CONSOLE_PUSH, INTROSPECT, SERVICE_CONTROL, RESOURCE_MINT, REBOOT,
-    /// ACQUIRE_ANY, ...). NOT honoured yet - must be 0.
+    /// ACQUIRE_ANY, ...; `task::privbits`). Honoured: each bit must be one the CALLER may delegate
+    /// (`privileges_caller_lacks`), or the request is refused.
     privileges:   u32,
     /// The DEVICE CLASS this service drives (`task::hw_class_of`), or 0 for none.
     ///
@@ -797,10 +795,11 @@ struct SpawnRequest {
     /// so the request has to identify the DEVICE - an address cannot express it. The kernel resolves
     /// the class to what its own bus scan found; moving the SCAN is step D.
     hw_flags:     u32,
-    /// Device MMIO window to grant. NOT honoured yet - must be 0.
+    /// Device MMIO window. REFUSED unless 0: the kernel resolves the window from the class.
     mmio_base:    u64,
     mmio_len:     u64,
-    /// DMA arena size in pages, PCI BDF, and IRQ lines. NOT honoured yet - must be 0.
+    /// DMA arena size in pages (honoured, at most `MAX_DMA_PAGES`), PCI BDF (honoured for a PCI
+    /// class), and IRQ lines (REFUSED unless `irq_count` is 0: vectors come from the class).
     dma_pages:    u32,
     bdf:          u32,
     irq_count:    u32,
@@ -883,8 +882,9 @@ impl SpawnRequest {
     }
 }
 
-/// Bumped to 2 when `installs` was added. The version field exists for exactly this: a spawner
-/// built against a different kernel is REFUSED loudly rather than misparsing a shorter struct.
+/// Bumped to 2 when `installs` was added, and to 3 when `probe_mode` was. The version field exists for
+/// exactly this: a spawner built against a different kernel is REFUSED loudly rather than misparsing a
+/// shorter struct.
 const SPAWN_REQUEST_VERSION:  u32 = 3;
 const SPAWN_FLAG_REQ_RECV:    u32 = 1 << 0;
 const SPAWN_FLAG_REQ_CONSOLE: u32 = 1 << 1;
@@ -957,9 +957,9 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         return -1;
     }
 
-    // NOT-YET-HONOURED FIELDS ARE REFUSED, NOT IGNORED (invariant 12). A spawner asking for an MMIO
-    // window or a privilege this kernel does not yet grant must hear so, rather than receive a task
-    // that silently lacks what it needs and fails later somewhere unrelated.
+    // NOT-HONOURED FIELDS ARE REFUSED, NOT IGNORED (invariant 12). A spawner asking for something
+    // this kernel does not grant must hear so, rather than receive a task that silently lacks what it
+    // needs and fails later somewhere unrelated.
     // `hw_flags` (the device class) is honoured below. The RAW address fields are still refused, and
     // refusing rather than ignoring is the rule (invariant 12): a spawner asking for an MMIO window
     // this kernel will not grant must hear so, not receive a task that silently lacks it and fails
@@ -1022,8 +1022,9 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // This is the whole security content of the privileges field, and it is the same rule
     // `SpawnWithCaps` applies to an installed cap (8.5, 7.3): a spawner may hand a child only what it
     // could already hand it. So each requested privilege is checked against the CALLER's own holdings
-    // - the supervisor holds SPAWN and SERVICE_CONTROL and may therefore pass them on; it does not
-    // hold REBOOT, so it cannot mint one for a child no matter what it asks for.
+    // with GRANT - the supervisor holds GRANT-only caps for the `SUPERVISOR_DELEGATABLE` set and may
+    // pass those on (without being able to use them); a bit outside what the caller holds is refused
+    // no matter what it asks for.
     //
     // Without this the field would be exactly the ambient authority 3.1 forbids: "ask and receive".
     if req.privileges != 0 {
@@ -1163,6 +1164,19 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     }
 }
 
+/// arg0 = (core_id << 16) | spawn_cap_slot, arg1 = name_ptr, arg2 = name_len.
+///
+/// Validates the spawn capability, reads the service name from user space,
+/// then calls `task::spawn_service_by_name`.
+///
+/// core_id encoding:
+///   - 0x0000 = core 0, 0x0001 = core 1, ...
+///   - 0xFFFF = let the kernel choose (the catalogue row's `preferred_core`).
+///
+/// The kernel catalogue (`task::service_config`) now holds `supervisor` alone, so a by-name spawn
+/// here (and in `SpawnReturningEndpoint`, `SpawnWithCaps` and `SpawnPipe`, which share the catalogue)
+/// is refused with `NotFound` for every other name, and with `AlreadyRunning` for `supervisor` while
+/// it is live. Starting a service is `SpawnImage`, by the supervisor.
 fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
@@ -1206,8 +1220,9 @@ fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
 /// The old name-wiring path is unchanged; this is purely additive.
 ///
 /// arg0 = packed (spawn_cap_slot in low 16, core in next 16; core 0xFFFF = round-robin).
-/// arg1 = name ptr, arg2 = name len. Returns the endpoint cap slot (≥0), or a negative error
-/// (cap error, or -1 if the spawn failed / the service has no recv endpoint to hand back).
+/// arg1 = name ptr, arg2 = name len. Returns the endpoint cap slot PLUS ONE (so >= 1), 0 if the
+/// service spawned but has no recv endpoint to hand back, or a negative error (a cap error, or -1 if
+/// the spawn failed).
 fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
@@ -1268,7 +1283,9 @@ fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u6
 /// arg1 = ptr, arg2 = len of a descriptor: `[name_len:u8, name…, count:u8,
 ///        {label_len:u8, label…, slot_lo:u8, slot_hi:u8} × count]` (count ≤ MAX_SEND_PEERS).
 /// Each `slot` names a cap the CALLER holds; the kernel copies it (GRANT-validated, non-escalating
-/// §7.3) into the child under `label`. Returns the endpoint cap slot (≥0), or a negative error.
+/// §7.3) into the child under `label`. Returns the endpoint cap slot (>= 0, NOT plus one as in
+/// `SpawnReturningEndpoint`), -2 if the service spawned with no recv endpoint, -1 if the spawn
+/// failed, or a cap error - and -2 is also `CapNotHeld`, so the two cannot be told apart.
 fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
@@ -1418,12 +1435,11 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     // *casual* `kill supervisor`/`restart supervisor` at the command layer (CORE_SERVICES); deliberate
     // chaos goes through `chaos kill-storm supervisor`.
     if crate::task::kill_by_name(name) {
-        // A kill bumps the dead endpoint's generation and could (if a bug let it
-        // target a trusted service) take down the TCB. Now that the kill has
-        // completed and no kernel locks are held, verify the two invariants a
-        // kill is most likely to break:
-        //   §6.2 - every TCB service (the supervisor) is still alive;
-        //          TCB death is a loud, unrecoverable failure, not a silent one.
+        // Now that the kill has completed and no kernel locks are held, verify the two
+        // invariants a kill is most likely to break:
+        //   §6.2 - no non-restartable task has died. That set is EMPTY since Phase 6 (the
+        //          supervisor is restartable), so `assert_tcb_alive` checks nothing today;
+        //          it stays as the hook should the set ever be non-empty again.
         //   §7.8 - the cap table is still consistent (no cap carries a generation
         //          beyond its resource's current generation). The generation bump
         //          only ever moves resources forward, so all surviving caps stay
@@ -1443,14 +1459,6 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     } else { -1 }
 }
 
-/// arg0 = name_ptr, arg1 = name_len, arg2 = include_grant (0 = SEND only, 1 = SEND|GRANT).
-///
-/// Looks up `name` in the kernel name directory, mints a SEND (or SEND|GRANT)
-/// cap to that endpoint in the calling task's cap table, and returns the slot.
-///
-/// Reacquire a fresh SEND cap to a named service (§14.2). **Gated (§3.1, see the in-body comment):**
-/// the caller must hold `ACQUIRE_ANY` (operator/test) or declare `name` as a contract send-peer
-/// (recovery). `arg2=1` also requests the GRANT right (cap-transfer tests, P3).
 /// Has this name already been reported as absent from the directory? Records it if not.
 ///
 /// Bounded and heap-free (§26.6.1): a fixed table of names already warned about. When it fills, no new
@@ -1460,7 +1468,8 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 ///
 /// **THIS IS NOT A SERVICE CATALOGUE, and the distinction matters because the kernel is under standing
 /// orders to shrink one.** `I-service-table` pins the kernel's per-service POLICY - memory limits,
-/// placement, what a named service may hold - and records 218 entries as debt against a target of one.
+/// placement, what a named service may hold - as debt against a target of one entry, which it has
+/// now reached (`supervisor`).
 /// Nothing here is policy: this table changes no service's behaviour, grants nothing, is consulted by
 /// no decision, and its entire effect is to suppress a duplicate LOG LINE. It is a dedup cache for
 /// diagnostics that happens to be keyed by a string the caller supplied.
@@ -1490,6 +1499,14 @@ fn warn_once_for(name: &str) -> bool {
     true
 }
 
+/// arg0 = name_ptr, arg1 = name_len, arg2 = include_grant (1 asks for SEND|GRANT; honoured only for
+/// an `ACQUIRE_ANY` holder, SEC-6 below).
+///
+/// Reacquire a fresh SEND cap to a named service (§14.2): looks up `name` in the kernel name
+/// directory, mints the cap into the calling task's table, and returns the slot. **Gated (§3.1, see
+/// the in-body comment):** the caller must hold `ACQUIRE_ANY` (operator/test) or have been spawned
+/// with `name` as a send-peer (recovery). Returns -1 for a malformed name, `CapNotHeld` (-2) for a
+/// caller with neither, `ACQUIRE_NAME_NOT_REGISTERED` (-20) or `ACQUIRE_CAP_TABLE_FULL` (-21).
 fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
     if len == 0 || len > 64 { return -1; }
@@ -1506,7 +1523,8 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
     // authority (any task could acquire send rights to any service). Allowed only if the caller holds
     // the ACQUIRE_ANY capability (the operator/test instruments - shell, supervisor, probes - that
     // legitimately reach arbitrary services, e.g. chaos flooding / pipe sinks), OR `name` is one of the
-    // caller's contract-declared send-peers (recovery: reacquiring a peer after it restarted, §13/§14.2).
+    // send-peers the caller was SPAWNED with (`task_declares_peer` reads what the spawn path recorded,
+    // §13.6; recovery: reacquiring a peer after it restarted, §14.2).
     let broad = scheduler::current_task_holds_resource(
         crate::capability::ACQUIRE_ANY_RESOURCE, Rights::WRITE);
     if !broad && !crate::task::current_task_declares_peer(name) {
@@ -1739,7 +1757,8 @@ fn do_call(
     crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
     // 2. The buffer is in/out: read the request from it now, write the reply back into it later, so
-    //    validate it for the full reply capacity (the SDK always passes a MAX_MESSAGE_SIZE buffer).
+    //    validate it for MAX_MESSAGE_SIZE. That is the `Call` (41) SDK's buffer; a `CallDeadline`
+    //    caller may declare a smaller one (`reply_buf_cap`), and is still validated for the full size.
     if req_len as usize > MAX_MESSAGE_SIZE { return ipc_err_to_i64(IpcError::MessageTooLarge); }
     if !validate_user_ptr(buf_ptr, MAX_MESSAGE_SIZE) { return -1; }
 
@@ -2034,7 +2053,7 @@ fn handle_take_pending_cap() -> i64 {
 /// arg0 = size in bytes to allocate (must be > 0).
 ///
 /// No capability required - the task's budget is implicitly granted at spawn
-/// from the memory limit in its contract (§10.2, implicit authority).
+/// from the memory limit in its spawn request (§10.2, §13.6; implicit authority).
 ///
 /// Returns the virtual address of the newly-mapped region on success, or a
 /// negative error code:
@@ -2066,7 +2085,7 @@ fn handle_alloc_mem(size: u64) -> i64 {
         // and AllocMem needs no capability, so an un-zeroed page would leak stale cross-task memory.
         // `zero_frame` keeps the `unsafe` in the permitted memory/ layer (§18.5); this stays safe.
         zero_frame(phys);
-        // SAFETY: va is in the task heap range (0x1_0000_0000+); phys is from the
+        // SAFETY: va is in the task heap range (`TASK_HEAP_VA_START`+); phys is from the
         // allocator; the task's page table is the active CR3 during this syscall.
         if unsafe { map_in_active_tables(va, phys, flags) }.is_err() {
             return -1;
@@ -2092,8 +2111,8 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // THE LIST BELOW IS THE UNGATED SET, and it is written that way round on purpose: a query added
     // without thought lands on the GATED side, which is the safe default (§3.1). Ungated are
     // self-state (0 = own alloc bytes, 13 = do I own the console foreground), the cycle counter (3),
-    // and task-neutral board/transport facts that disclose nobody's state: the RTC and timing reads
-    // (10, 11, 12, 16, 17), NIC identity and BAR, driver-presence bits, a hardware random word, the
+    // and task-neutral board/transport facts that disclose nobody's state: the input-ready flag (10),
+    // the RTC and timing reads (11, 12, 16, 17), NIC identity and BAR, driver-presence bits, a hardware random word, the
     // EMMC base clock, one byte off the COM2 operator channel and the board MAC (14, 15, 18, 19, 20,
     // 21, 23). Every other query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (docs/introspection-capability.md).
@@ -2115,8 +2134,8 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // safe-area inset, the cell size and the font-scale rule, which now live in the `console`
         // SERVICE - so the kernel cannot answer it without keeping a second copy of facts it does not
         // own. The shell asks the service. docs/console-service.md 9.7.)
-        // Input-ready flag - set by the xHCI driver when it finishes setup (the
-        // last boot step). The shell watches it to auto-clear the boot screen.
+        // Input-ready flag - set through `SignalInputReady` (27) by the `xhci` SERVICE when it
+        // finishes setup (the last boot step). The shell watches it to auto-clear the boot screen.
         10 => crate::arch::imp::input_ready() as i64,
         // Wall-clock date/time from the hardware RTC, packed (see rtc.rs). Ungated
         // - the time of day is task-neutral hardware info, like the TSC (query 3).
@@ -2164,12 +2183,13 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
             let nic = (pci::nic().is_some() || crate::arch::imp::soc_nic_present()) as i64;
             x | (e << 1) | (nic << 2)
         }
-        // A hardware-random u32 (the SoC RNG on ARM, RDRAND on x86), or -1 if this build has no hardware
-        // RNG. Ungated: reading entropy confers no authority (like the raw TSC, query 3). The `random`
-        // shell utility consumes it. A u32 is always 0..2^32, so it never collides with the -1 sentinel.
+        // A hardware-random u32 (the SoC RNG on the Pis, the TRNG on the VisionFive), or -1 where there is
+        // no hardware RNG (x86 today: its `hw_random` answers None). Ungated: reading entropy confers no
+        // authority (like the raw TSC, query 3). The `random` shell utility and the WPA2 supplicant's
+        // SNonce consume it. A u32 is always 0..2^32, so it never collides with the -1 sentinel.
         19 => match crate::arch::imp::hw_random() { Some(v) => v as i64, None => -1 },
         // 20 = the SD/EMMC controller's base clock in Hz, learned from the platform at boot. Task-neutral
-        // hardware info like the console geometry (9) and the RTC (10/11), so ungated. The block driver
+        // hardware info like the RTC (11), so ungated. The block driver
         // needs it to compute its clock divider: the controller's own capability register reports this
         // wrongly on the BCM283x, and a guessed divider runs the card's identification clock at the wrong
         // speed - which fails silently on hardware and not at all under emulation. 0 = unknown, and the
@@ -2189,10 +2209,6 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // same MAC. The alternative to this query is granting the driver a second, much wider MMIO
         // window for one identity fact, which is authority out of all proportion to the need.
         23 => match crate::arch::imp::board_mac_packed() { Some(v) => v as i64, None => -1 },
-        // Clock PROVENANCE, packed: bits 0-7 = source (0 unset / 1 rtc / 2 ntp), bits 8.. = seconds since
-        // the network last set it (0 if never). Ungated task-neutral timing info like the RTC (11) itself.
-        // `date` reports this so a displayed time says where it came from - a fallback chain is only
-        // mechanism, not magic, while its choice is visible (§26.4/§26.9).
         // 21: pop one byte from the COM2 operator channel, -1 when empty. TRANSPORT ONLY - the kernel
         // owns the UART (§11.4 sanctions it owning a serial console) and hands bytes out; the `control`
         // SERVICE decides what they mean (C1-6). This is the whole of what replaced a 123-line command
@@ -2201,9 +2217,8 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // 22 REMOVED (clock slice 3): the wall clock's provenance, sync age and floor belong to
         // the `time` service now. The kernel still answers 11 (the raw RTC register read, which no
         // service can perform) and 17 (monotonic seconds, which paces deadlines) - transport and
-        // scheduling. What it no longer answers is what the reading MEANS.
-        // The persisted clock FLOOR in epoch seconds (0 = none known). A "we ran at least this late" bound,
-        // never a reading - `date` shows it only when the time is unknown, explicitly labelled.
+        // scheduling. What it no longer answers is what the reading MEANS. (22 was the clock
+        // PROVENANCE word: source, and seconds since the network last set it.)
         4 => crate::memory::allocator::free_frame_count() as i64,
         5 => crate::memory::allocator::total_frame_count() as i64,
         6 => scheduler::core_active_ticks(arg1 as usize) as i64,
@@ -2541,11 +2556,11 @@ fn handle_console_boot_complete(cap_slot: u64) -> i64 {
 // Syscall: SignalInputReady (27) - input driver reports setup complete.
 // ---------------------------------------------------------------------------
 
-/// The USB keyboard driver (xHCI) calls this once it finishes setup, in every
+/// The `xhci` keyboard-driver SERVICE calls this once it finishes setup, in every
 /// terminal path. As the last subsystem to come up, its report is the
 /// deterministic end-of-boot signal the shell uses to auto-clear the boot screen.
-/// Gated by CONSOLE_PUSH (held only by the input driver, §12) so no other service
-/// can fake "boot done".
+/// Gated by CONSOLE_PUSH (held only by the USB host drivers `xhci`, `ehci` and `dwc2`,
+/// from their spawn requests, §12) so no other service can fake "boot done".
 fn handle_signal_input_ready(cap_slot: u64) -> i64 {
     use crate::capability::CONSOLE_PUSH_RESOURCE;
 
@@ -2604,8 +2619,8 @@ fn handle_task_caps(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 
 // ---------------------------------------------------------------------------
 // Syscall: ConsolePush (20) - inject a byte into the console input ring.
-// Gated by CONSOLE_PUSH_RESOURCE (held only by the USB keyboard driver, §12)
-// so an arbitrary service cannot forge keystrokes into the shell.
+// Gated by CONSOLE_PUSH_RESOURCE (held only by the USB host drivers `xhci`, `ehci`
+// and `dwc2`, §12) so an arbitrary service cannot forge keystrokes into the shell.
 // ---------------------------------------------------------------------------
 
 fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
@@ -2623,17 +2638,9 @@ fn handle_console_push(cap_slot: u64, byte: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall: Reboot (18) - hardware reset via keyboard controller CPU reset line.
+// Syscall: Reboot (18) - hardware reset (`arch::imp::hardware_reset`) / FireIrq (51).
 // ---------------------------------------------------------------------------
 
-/// No arguments. Does not return (on success).
-///
-/// A hardware reset is a denial-of-service, so it is gated by the `REBOOT` capability (§3.1) - held
-/// only by the legitimate rebooters: the `shell` (its `reboot` command) and the USB drivers
-/// `xhci`/`ehci` (the Ctrl+Alt+Del secure-attention reboot). Any other caller gets `CapNotHeld`,
-/// closing the ambient-authority gap this syscall used to have. Validated by holdings (no arguments →
-/// no slot to pass, same form as `kill`/8). Logs to serial before resetting so the operator sees
-/// confirmation before the line goes silent.
 /// FireIrq (51): inject a test interrupt on `irq`. Gated by FIRE_IRQ, held only by the control service.
 ///
 /// Exists so the COM2 command interpreter can leave the kernel (C1-6): `KILL` and `RESTART` were always
@@ -2650,6 +2657,14 @@ fn handle_fire_irq(irq: u64) -> i64 {
     0
 }
 
+/// No arguments. Does not return (on success).
+///
+/// A hardware reset is a denial-of-service, so it is gated by the `REBOOT` capability (§3.1) - held
+/// only by the `shell` (its `reboot` command, and the Ctrl+Alt+Del chord the USB drivers SIGNAL to it;
+/// SEC-2 removed REBOOT from the drivers themselves). Any other caller gets `CapNotHeld`, closing the
+/// ambient-authority gap this syscall used to have. Validated by holdings (no arguments -> no slot to
+/// pass, same form as `kill`/8). Logs to serial before resetting so the operator sees confirmation
+/// before the line goes silent.
 fn handle_reboot() -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::REBOOT_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
@@ -2662,11 +2677,11 @@ fn handle_reboot() -> i64 {
 /// Largest ethernet frame the USB-net bridge moves (matches nic-driver's FRAME_MAX).
 const NET_FRAME_MAX: usize = 1600;
 
-/// NetFrameTx (42): transmit a raw ethernet frame via the in-kernel USB-net device. `arg0` = frame ptr,
 // ---------------------------------------------------------------------------
-// PORT I/O (step D2) - the mechanism a userspace hardware enumerator needs.
+// DevicePower (54), CpuClock (55), and PciCfgRead (53) - the last is step D2's configuration
+// read, the mechanism a userspace hardware enumerator needs.
 //
-// The kernel knows how to PERFORM an authorised port operation. It does not know what the operation
+// The kernel knows how to PERFORM an authorised configuration read. It does not know what the operation
 // MEANS - that 0xCF8 selects a PCI configuration register, how to walk a bus, what a class code
 // identifies, or how to read a BAR. That knowledge is hardware semantics and lives in the service
 // (§26.10, docs/service-ownership.md D2). This is the whole of the kernel's involvement.
@@ -2754,8 +2769,10 @@ fn handle_pci_cfg_read(sel: u64, offset: u64) -> i64 {
     }
 }
 
+/// NetFrameTx (42): transmit a raw ethernet frame via an in-kernel network device. `arg0` = frame ptr,
 /// `arg1` = length. Gated by NET_DEVICE (validated by holdings - the args fill the ABI, no slot to pass).
-/// Returns 0 on success, -1 on error. On non-ARM arches `net_frame_tx` is a stub returning false.
+/// Returns 0 on success, -1 on error. No port has an in-kernel network device any more: every arch's
+/// `net_frame_tx` is a stub returning false, and nothing is granted NET_DEVICE (`task::service_privileges`).
 fn handle_net_frame_tx(ptr: u64, len: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
@@ -2783,8 +2800,8 @@ fn handle_net_frame_rx(ptr: u64, max: u64) -> i64 {
     n as i64
 }
 
-/// NetInfo (44): write `[mac(6), link(1)]` (7 bytes) of the USB-net device to `arg0`. Gated by NET_DEVICE.
-/// Returns 1 if a net device is up, 0 if none, -1 on error.
+/// NetInfo (44): write `[mac(6), link(1)]` (7 bytes) of the in-kernel net device to `arg0`. Gated by
+/// NET_DEVICE. Returns 1 if a net device is up, 0 if none (every port today), -1 on error.
 fn handle_net_info(ptr: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
@@ -2802,7 +2819,8 @@ fn handle_net_info(ptr: u64) -> i64 {
 
 /// Gpio (45): drive a SoC GPIO pin. `op` = 0 input / 1 output / 2 set-high / 3 set-low / 4 read; `pin` =
 /// 0..53. Gated by GPIO_DEVICE (validated by holdings - the args fill the ABI). Returns the level (0/1) for
-/// a read, 0 on success, -1 on a bad pin / unsupported arch. On non-ARM `gpio_op` is an inert `-1` stub.
+/// a read, 0 on success, -1 on a bad pin / unsupported arch. Only arm32 implements `gpio_op`; every
+/// other port's is an inert `-1` stub.
 fn handle_gpio(op: u64, pin: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::GPIO_DEVICE_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
@@ -2819,7 +2837,8 @@ fn handle_gpio(op: u64, pin: u64) -> i64 {
 const USB_DISK_BLOCK: usize = 512;
 
 /// UsbDiskInfo (46): capacity of the attached USB mass-storage device in 512-byte sectors, 0 if none.
-/// Gated by USB_DISK (validated by holdings - no slot to pass). On non-ARM arches this is always 0.
+/// Gated by USB_DISK (validated by holdings - no slot to pass). Always 0 on every port now (see
+/// `USB_DISK_BLOCK`).
 fn handle_usb_disk_info() -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
@@ -2855,8 +2874,8 @@ const USB_DISK_BUSY: i64 = -20;
 const USB_DISK_ABSENT: i64 = -21;
 
 /// UsbDiskRead (47): read the 512-byte block at `arg0` (LBA) into the user buffer at `arg1`.
-/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_BUSY` if the device NAKed (re-ask), -1 on a real
-/// failure (no device, LBA past the end, I/O error).
+/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_ABSENT` if no device is attached,
+/// `USB_DISK_BUSY` if the device NAKed (re-ask), -1 on a real failure (LBA past the end, I/O error).
 fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
@@ -2877,7 +2896,8 @@ fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
 }
 
 /// UsbDiskWrite (48): write the 512-byte block at the user buffer `arg1` to LBA `arg0`.
-/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_BUSY` if the device NAKed, -1 on a real failure.
+/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_ABSENT` if no device is attached, `USB_DISK_BUSY`
+/// if the device NAKed, -1 on a real failure.
 fn handle_usb_disk_write(lba: u64, ptr: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);

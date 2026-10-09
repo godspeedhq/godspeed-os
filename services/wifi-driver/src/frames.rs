@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! The frame interface, served to `nic-driver`: ops `0x10` INFO, `0x11` TX and `0x12` RX - the three
-//! `dwc2` serves it on the Pi 2, and the three it serves `net-stack` upward (`docs/wifi.md` 2). Once a
+//! `dwc2` serves it on the Pi 2 (`docs/wifi.md` 2); `nic-driver` turns them into its own ops 3, 4 and 9
+//! for `net-stack`. Once a
 //! station is associated the radio is a frame source, `nic-driver` is the link front end, and this is its
 //! fifth backend. Nothing above it changes shape.
 //!

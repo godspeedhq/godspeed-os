@@ -32,6 +32,7 @@
 //! Everything is fixed-size and stack-resident - no heap, loud on overflow: at most
 //! [`REC_MAX_COLS`] columns, [`REC_MAX_ROWS`] rows, a [`REC_ARENA`]-byte string arena, and
 //! [`REC_COL_NAME`]-byte column names. Overflowing any bound sets [`Table::overflow`].
+//! One input is ignored WITHOUT setting it: values past the column count in an `add_row` call.
 
 use core::cmp::Ordering;
 
@@ -501,7 +502,7 @@ impl Table {
     /// ```text
     /// magic "GSR1" | ncols:u8 | nrows:u8
     /// per column:  name_len:u8 | name bytes
-    /// per cell:    tag:u8 (0=empty 1=int 2=str)
+    /// per cell:    tag:u8 (0=empty 1=int 2=str 3=signed)
     ///              int → val:u64-le ; str → len:u16-le | bytes ; empty → (nothing)
     /// ```
     ///

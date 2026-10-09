@@ -138,8 +138,10 @@ its timings on `gs::driver::wait`. It holds no hardware, so it touches no hardwa
 appears only as the `ServiceContext` and `Message` types every `gs` call takes, and `ctx.log`, which is the
 one way every service logs (CLAUDE.md 11.4). `dwc2`'s new notification is on `gs::ipc::try_send` and
 `gs::cap::reacquire`, and its reply to `wifi-usb` is `gs::ipc::reply` too (`rtl::serve`); the block and
-network servers beside it in `dwc2`'s dispatch are still raw - converting those is the stdlib-dogfood
-branch's work, not this one's.
+network servers beside it in `dwc2`'s dispatch were still raw when this was written - converting those
+was the stdlib-dogfood branch's work, not this one's. (2026-10-09: done. Every service is on `gs` now,
+`dwc2`'s block and network servers included, and `scripts/one_way_check.py` holds every crate at zero;
+`docs/stdlib-design.md` section 25.)
 
 **Three gates fixed on the way, each found by doing the consistent thing:**
 
@@ -2345,6 +2347,8 @@ single-descriptor transmit fix was found on). The rule is unchanged: the cable a
   radio's held requests carry a raw capability handle, and `gs` has no way to make a `gs` capability
   from one, so the loop answers by handle; `nic-driver`'s raw-SDK count fell from 94 to 82 rather than
   rising (`one_way_check.py`).
+  *(2026-10-09: no longer so. `gs` gained `impl From<CapHandle> for Cap`, and `answer` now takes a `gs`
+  capability and replies with `gs::ipc::reply`; `nic-driver`'s count, like every crate's, is zero.)*
 
 **The supervisor** gives `nic-driver` `wifi-usb` as a peer on the PCs (`NIC_PEERS`, its own branch keyed
 on `has_wifi_usb`). The contract already declared it.

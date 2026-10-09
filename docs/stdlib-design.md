@@ -6,8 +6,9 @@
 `services/recorder` migrated. Option A was taken (services only, no kernel change); the terminating
 task of §1 remains open and unimplemented, which is the point of recording it here.
 
-What follows is the report as written before any code, kept as it was argued. §7 at the end records
-what building it changed.
+What follows is the report as written before any code, kept as it was argued. §7 onwards records
+what building it changed, section by dated section; §25 (2026-10-09) is the latest, every service
+moved onto `gs`.
 
 ---
 
@@ -767,7 +768,10 @@ remains wherever else a delegated resource cap is invoked:
 - **`net-stack`'s socket and listener caps** carry no tag, so `sock` still relies on draining.
 - **`examples/holder`** still does a bare `ctx.recv()` and hangs forever if its owner dies - hole 2,
   the missing `ReplyDead`, which a tag does NOT fix. That one is genuinely about the mechanism, not
-  the protocol, and is left recorded rather than papered over.
+  the protocol, and is left recorded rather than papered over. *(Since corrected: its wait after a
+  `resource_invoke` is bounded by `recv_abortable_deadline`, so a dead owner costs a deadline, not a
+  hang. It still hand-rolls the invoke rather than using `gs::resource::invoke`, which is
+  `pub(crate)` - §24 and §25.)*
 
 ## 15. The target-side tests, and the error the restart found
 
@@ -791,7 +795,7 @@ count) and the absence of both error lines, which makes it an assertion rather t
 
 ### `gs::cap` across a real restart: `fcap gsreuse`
 
-A new command holds a `gs::cap::File` across a real `fs` kill and reads through it afterwards.
+A new command holds a `gs::cap::File` (now `gs::file::File`) across a real `fs` kill and reads through it afterwards.
 Pinned by four named assertions in `osdev test fs-reuse`, which went from 8 cases to 12.
 
 **Scope, stated rather than quietly narrowed.** `fcap reuse` additionally deletes the original and
@@ -1170,6 +1174,13 @@ there; it is just a different shape, and this library does not fit it.
 
 **Five migrations, and the sixth candidate correctly refused.** `recorder`, the shell's `tcp`, `dir`,
 `fcap`, `sock` and `copier` all shrank and all found defects. `time` would have grown a bug.
+
+> **2026-10-09: `time`'s CALLS are on `gs` now; its SHAPE is not, and the refusal above still holds.**
+> When every service moved onto the standard library (§25), `time`'s sends, replies, peer lookups,
+> reacquires and clock reads went to `gs::ipc`, `gs::cap` and `gs::task` like everyone's. What did not
+> move is what this section is about: it still never waits for a reply, still tags its requests and
+> demultiplexes the answers in its own loop, and still uses no `gs::fs` or `gs::net` - which remain
+> send-then-wait. The gap is unchanged.
 
 ## 21. TCP listen and accept, and the objection that was wrong
 
@@ -1704,6 +1715,16 @@ flags, so `gs::cap::READ` at an `fs.open` call site reads correctly and no call 
 > different totals have been published across two days (93, 130, 143) precisely because nobody fixed
 > the method first. It is fixed now, and stated in the README next to the figure so the next person
 > can re-derive it instead of trusting it.
+>
+> **Recounted 2026-10-09: 164 items across the 13 modules, plus the `gs::driver` tier's 33.** By the
+> README's rule - free functions, constants, types, the methods on those types, and every re-export -
+> applied to each module's own file, so the crate root's re-exports of `Error` and `ServiceContext` and
+> its `prelude` are not counted a second time. The 13 EXCLUDE `driver`, a 14th public module: its
+> `wait`, `delay` and `irq` are counted separately because `backlog/71` puts that tier outside the
+> first covered surface. The same count on the 2026-09-26 tree gives 151 where 149 was published, so
+> two of the gap are method; the other 13 are the surface growing (`call::request_once`,
+> `task::sleep_quantum`/`sleep_us`/`sleep_ticks`, `ipc::reply`, `ipc::recv_within_ms`, the five-call
+> `ipc::exact` module and its two error-type re-exports, `IpcError` and `CapError`).
 
 ### `gs::record` is a re-export and that is a decision, not laziness
 

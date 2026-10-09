@@ -74,6 +74,12 @@ A **raw** (unformatted) drive has **no label yet** - flashing is what names it -
 drive is addressable only by **index** (its sole honest handle). While exactly one disk is
 attached, `<drive>` defaults to that disk, so the index can be omitted entirely.
 
+> **As built (checked 2026-10-09): one drive, and the selector is barely checked.** The shell
+> addresses drive 0 only (`drive_sel_ok`). An index other than `0` is refused (`drives: no drive
+> N - only drive 0 is attached`); **any non-numeric selector is accepted as a label without being
+> compared with the drive's label**, so a mistyped label still selects drive 0. The ambiguous-label
+> refusal shown above is the multi-drive design (step 4, §8) and is not built.
+
 ### 3.1 There is no `mount` (and why)
 
 A POSIX reflex says "you flash a disk, then you *mount* it." GodspeedOS has **no `mount`**,
@@ -153,10 +159,10 @@ from the boot default - you might boot off drive 0 yet work on drive 1.)
 
 | Command | Effect | Persists? | Step |
 |---------|--------|-----------|------|
-| `drives` | list every drive: index, label, status, size, current/default | - | **3** |
-| `drives flash <drive> [label]` | format `<drive>` as a GSFS data drive (asks `[y/N]` - it ERASES); optional label; usable at once | data: yes | **3** |
+| `drives` | list every drive: index, label, status (`GSFS` or `raw`), size, and free space when formatted | - | **3** |
+| `drives flash [drive] [label] [force]` | format the drive as a GSFS data drive (asks `[y/N]` - it ERASES); optional label; usable at once. `fs` REFUSES a disk whose block 0 holds a partition table or boot sector; the word `force` formats it anyway | data: yes | **3** |
 | `drives label <drive> <name>` | name / rename a drive - rewrites the superblock (duplicates allowed, §3) | data: yes | **3** |
-| `drives reset <drive>` | un-format a drive back to raw (asks `[y/N]` - it ERASES the GSFS marker); the inverse of `flash`. NOT a secure wipe (data blocks remain) - a quick clean slate, mainly for re-testing the raw→flash path | data: yes | **3** |
+| `drives reset [drive] [force]` | un-format a drive back to raw (asks `[y/N]` - it ERASES the GSFS marker); the inverse of `flash`. NOT a secure wipe (data blocks remain) - a quick clean slate, mainly for re-testing the raw→flash path | data: yes | **3** |
 | `drives check [drive]` | verify (fsck): rebuild the bitmap/free count, report CRC failures | data: yes | **3** |
 | `drives scrub [drive]` | read-only integrity sweep: verify every block's CRC, change nothing | - | **3** |
 | `drives godspeed install <drive>` | install bootable GodspeedOS onto the drive (Prime) | **yes** | 6 |
@@ -242,19 +248,19 @@ drives 0.4.0 - manage attached disks (records when piped)
 
 usage:
   drives                        list attached drive(s)
-  drives flash <drive> [label]  format <drive> as a GSFS data drive (ERASES; asks y/N)
-  drives label <drive> <name>   name / rename a drive
+  drives | <verb>               piped: records index/label/status/size_mib/free_mib
+  drives flash [drive] [label]  format a drive as GSFS (ERASES)
+  drives label [drive] <name>   name / rename a drive
+  drives reset [drive]          un-format a drive back to raw
+  drives check [drive]          verify (fsck): rebuild bitmap/free, report CRC failures
+  drives scrub [drive]          read-only integrity sweep: verify every block's CRC, report (changes nothing)
   drives version                print the version
   drives help                   print this message
-
-drive selector:
-  <drive> = index | label | index:label   (e.g. 0, data, 1:data)
-            an ambiguous label refuses and prints the disambiguated commands
-
-subcommand help:
-  drives flash help
-  drives label help
 ```
+
+(Each row is followed by a real example in the shell's own output, `help_block`.) Every
+subcommand has its own help: `drives flash help`, `drives label help`, `drives reset help`,
+`drives check help`, `drives scrub help`.
 
 > **Conformance note (honest, per `0_conventions.md` §3).** `drives` is being built
 > spec-first against the conventions, so it implements its own `help` / `version` and
