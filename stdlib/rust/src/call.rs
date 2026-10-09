@@ -75,9 +75,14 @@ use crate::error::Error;
 /// say so with [`request_within`] rather than raising this for everyone.
 pub const DEFAULT_SECS: i64 = 5;
 
+// EVERY REQUEST HERE IS `#[inline]`, as the SDK calls under them are, and for their reason: a `Message`
+// is 4 KiB by value, so a request that is its own frame costs its caller a second copy of the reply on
+// the stack. The shell, whose stack is tight on pipe paths, calls these.
+
 /// Ask `peer` for something and wait up to [`DEFAULT_SECS`] for the answer.
 ///
 /// See [`request_within`]; this is that, with the common deadline.
+#[inline]
 pub fn request(ctx: &ServiceContext, peer: &str, msg: &Message) -> Result<Message, Error> {
     request_within(ctx, peer, msg, DEFAULT_SECS)
 }
@@ -101,6 +106,7 @@ pub const NOTICE_AFTER_SECS: i64 = 2;
 ///
 /// Without it the shell cannot move onto this library without losing that affordance, which would
 /// have been a real regression dressed up as a migration.
+#[inline]
 pub fn request_within_notice(
     ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64, notice: Option<&dyn Fn()>,
 ) -> Result<Message, Error> {
@@ -138,6 +144,7 @@ pub fn request_within_notice(
 ///
 /// Prefer [`request_within`], which does the one safe retry for you. This exists so that a caller with
 /// a different, deliberate policy does not have to leave the library to keep it.
+#[inline]
 pub fn request_once(
     ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64,
 ) -> Result<Message, Error> {
@@ -171,6 +178,7 @@ pub fn request_once(
 /// - [`Error::PeerDied`] - the request reached the peer and it died before answering (`ReplyDead`).
 ///   **It may have happened.** Not retried here; a caller whose operation is safe to repeat
 ///   reacquires and asks again itself.
+#[inline]
 pub fn request_within(
     ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64,
 ) -> Result<Message, Error> {

@@ -1839,4 +1839,17 @@ tick's worth. Two log lines print `gs::Error` names (`Busy`) where they printed 
 
 ### Validated on
 
-QEMU, x86: see the commit that closes this section. Hardware: not yet.
+**QEMU, 2026-10-09, on the branch as committed.** x86: identity 24/24; the embedded `selfcheck` 539/0,
+twice in one boot (`osdev test script`); shell 246/0; files 245/0; examples 11/0; reply-server,
+reply-dead (`HANG woke with no reply after 129 ms (the service died before answering ...)`), counter,
+resource-server, file-cap 15/0, fs-restart 11/0, trace 10/10, adv 15/15, chaos 8/8, property 10/10.
+RISC-V `virt` with a USB stick behind xHCI - the `block-driver` -> `xhci` path this work changed -
+`selfcheck` 541/0, 4 skipped. Pi 4 (`raspi4b`, which emulates no disk): every one of selfcheck's 241
+checks that does not need storage passed. Pi 2 (`raspi2b`): `chaos max-carnage all-services` to round
+18 of 20 inside the run's window, supervisor respawned 8 times, no kernel panic.
+
+`osdev test trace` failed 3 checks here and on unmodified `main` alike - a harness race, fixed in the
+same branch (the test now syncs on a prompt it asked for).
+
+**Hardware: not yet.** Owed on each of the five boards: boot, `selfcheck`, and a chaos soak, because
+four drivers' waits and replies changed call shape even though their timing did not.
