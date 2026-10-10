@@ -196,11 +196,6 @@ fn log_idle_tick_config() {
 // The linker places this in .bss, so it costs nothing in the image.
 static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
 
-#[no_mangle]
-// NOTE: these two attributes were written for `kernel_main` below, but the `banner` doc comment and
-// fn now sit between them and it, so they apply to `banner`. `kernel_main` is reached as a Rust
-// path from x86's `_start` (`arch/x86_64/mod.rs`), not by symbol name, so it builds either way.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
 /// Which image, and which MACHINE - the first thing every boot log says about itself.
 ///
 /// It used to be printed by `bootcon::init`, where it was the genuinely first line - but
@@ -251,6 +246,11 @@ fn banner() {
     }
 }
 
+// These two attributes are `kernel_main`'s. A doc comment and `banner` were once inserted between
+// them and it, so they applied to `banner` until 2026-10-10 (`backlog/80` K13). `kernel_main` is
+// reached as a Rust path from x86's `_start` (`arch/x86_64/mod.rs`), so it built either way.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // Switch from Limine's tiny boot stack to our own 512 KiB stack before
     // any locals are allocated.  boot_info_ptr is in RDI (a register) so it
