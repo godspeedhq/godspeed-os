@@ -74,11 +74,13 @@ A **raw** (unformatted) drive has **no label yet** - flashing is what names it -
 drive is addressable only by **index** (its sole honest handle). While exactly one disk is
 attached, `<drive>` defaults to that disk, so the index can be omitted entirely.
 
-> **As built (checked 2026-10-09): one drive, and the selector is barely checked.** The shell
+> **As built (2026-10-10): one drive, and the selector is checked against it.** The shell
 > addresses drive 0 only (`drive_sel_ok`). An index other than `0` is refused (`drives: no drive
-> N - only drive 0 is attached`); **any non-numeric selector is accepted as a label without being
-> compared with the drive's label**, so a mistyped label still selects drive 0. The ambiguous-label
-> refusal shown above is the multi-drive design (step 4, §8) and is not built.
+> N - only drive 0 is attached`), and a word selector must be drive 0's own label, read from `fs`:
+> `drives flash typo data` answers `drives: no drive labelled 'typo' - drive 0 is labelled 'data'
+> (or select it as 0)` and erases nothing. Until 2026-10-10 any word was accepted unread, so a
+> mistyped label selected drive 0 and, after the `[y/N]`, erased it. The ambiguous-label refusal
+> shown above is the multi-drive design (step 4, §8) and is not built.
 
 ### 3.1 There is no `mount` (and why)
 

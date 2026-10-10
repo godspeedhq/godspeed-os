@@ -364,7 +364,7 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
                 {
                     pending.ate_client_said = true;
                     ctx.log_fmt(format_args!(
-                        "net-stack: took a capless message beginning {} as the driver's answer - if a                          client is blocked right now, THIS is where its request went (said once)",
+                        "net-stack: took a capless message beginning {} as the driver's answer - if a client is blocked right now, THIS is where its request went (said once)",
                         m.payload_bytes().first().copied().unwrap_or(0)));
                 }
                 true
@@ -637,7 +637,7 @@ impl Displaced {
                         // NOT "the client has re-sent" - that asserted something this service
                         // cannot know, and on the Pi 2 it was false: the client was still waiting,
                         // and this line was the only trace of why its request vanished.
-                        "net-stack: dropped a held client request (op {}) after its client's own {} ms                          of patience - it is still waiting and will now time out (drop #{})",
+                        "net-stack: dropped a held client request (op {}) after its client's own {} ms of patience - it is still waiting and will now time out (drop #{})",
                         h.body.get(2).copied().unwrap_or(0), h.hold_ms, self.n));
                 }
                 continue;
@@ -660,7 +660,7 @@ impl Displaced {
         self.n = self.n.saturating_add(1);
         if self.n <= 8 || self.n % 8 == 0 {
             ctx.log_fmt(format_args!(
-                "net-stack: a client request met mid-question to nic-driver was dropped                  because {} - it times out and retries (drop #{})", why, self.n));
+                "net-stack: a client request met mid-question to nic-driver was dropped because {} - it times out and retries (drop #{})", why, self.n));
         }
     }
 }
@@ -1251,7 +1251,9 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
         // receive, which is the coupling this change removed: answering somebody else's ARP is not a
         // reason to consume a frame, and when the caller ignored it that frame was destroyed.
         if answer_arp {
-            let _ = ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS);
+            // Through `nic_req`, so a CLIENT's request that arrives while we wait is held for the serve
+            // loop, not consumed here as if it were the driver's answer (backlog/80 D4).
+            let _ = nic_req(ctx, pending, &Message::from_bytes(&arp_out), DANCE_SECS);
         }
         // PACE THE POLL, or this loop does not wait at all.
         //
@@ -1267,7 +1269,7 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
         // pacing for the same reason - a poll is a question, and asking it twelve times in a row does
         // not make the answer arrive sooner.
         deadline.pause();
-        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, LINK_SECS);
+        reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
     }
 }
 
@@ -1311,6 +1313,9 @@ const LOP_ACCEPT: u8 = 0;
 const LOP_CLOSE: u8 = 1;
 
 /// Connection: read whatever has been delivered in order and not yet taken.
+/// The first byte of an op 21 (TCP transaction) reply (`backlog/80` D5).
+const TCP_OK: u8 = 0;
+const TCP_FAILED: u8 = 1;
 const COP_RECV: u8 = 0;
 /// Connection: queue the rest of the payload for sending.
 const COP_SEND: u8 = 1;
@@ -1461,7 +1466,6 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
         t.stat_sent = t.stat_sent.saturating_add(1);
         let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
         t.note_tx(&frame[..n], r.is_some());
-        feed_tx(ctx, pending, t, net, r);
     }
 
     let mut wrote = false;
@@ -1486,7 +1490,6 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
             t.stat_sent = t.stat_sent.saturating_add(1);
             let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
             t.note_tx(&frame[..n], r.is_some());
-            feed_tx(ctx, pending, t, net, r);
             empty = 0;
         } else {
             // Nothing to send: ask for received frames explicitly, or a peer that is talking while
@@ -1763,7 +1766,7 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
                 t.poll_tx_slow = t.poll_tx_slow.saturating_add(1);
                 if t.poll_tx_slow == 1 || t.poll_tx_slow % 64 == 0 {
                     ctx.log_fmt(format_args!(
-                        "net-stack: a polled frame was not taken by the driver within {} ms                          ({} so far) - the peer will retransmit, but POLL_TX_MS may be too tight                          for this board", POLL_TX_MS, t.poll_tx_slow));
+                        "net-stack: a polled frame was not taken by the driver within {} ms ({} so far) - the peer will retransmit, but POLL_TX_MS may be too tight for this board", POLL_TX_MS, t.poll_tx_slow));
                 }
             }
             any = true;
@@ -1796,17 +1799,6 @@ fn feed_batch(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
         pos += fl;
     }
     any
-}
-
-/// Feed the reply to a TRANSMISSION into the state machine. (Note 2026-10-09: that reply carried at
-/// most one raw frame when this was written; `nic-driver` now answers a transmit with one status byte,
-/// so this feeds nothing - a frame arrives only through the drain, `feed_batch`.)
-#[inline(never)]
-fn feed_tx(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
-    match reply {
-        Some(m) => feed_frame(ctx, pending, t, net, m.payload_bytes()),
-        None => false,
-    }
 }
 
 /// How long to leave between automatic re-DHCP and gateway-ARP retries while the stack is unconfigured.
@@ -2347,7 +2339,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
                 // now". So this was a full second spent waiting for an acknowledgement with no content,
                 // in the one place that could least afford it.
                 arp_for_us += 1;
-                let _ = ctx.request_with_reply_ms("nic-driver", &Message::from_bytes(&arp_out), ARP_ACK_MS);
+                let _ = nic_req_ms(ctx, pending, &Message::from_bytes(&arp_out), ARP_ACK_MS);
                 }
             }
         }
@@ -3341,7 +3333,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Reading takes READ; sending takes WRITE. The kernel has already checked the
                     // cap carries `right`; this enforces that the OPERATION is within it, which is
                     // the `op <= right` check `fs` makes for files.
-                    COP_RECV if right & RIGHT_READ != 0 => tcpst.read(rid, &mut resp),
+                    // The caller may say how much it can take (`[COP_RECV, max:u16]`), and is given
+                    // no more: bytes read here leave the connection, so handing over more than the
+                    // caller's buffer holds would lose them (`backlog/80` G3). No length: all of it.
+                    COP_RECV if right & RIGHT_READ != 0 => {
+                        let max = match body {
+                            [lo, hi, ..] => (u16::from_le_bytes([*lo, *hi]) as usize).min(resp.len()),
+                            _ => resp.len(),
+                        };
+                        tcpst.read(rid, &mut resp[..max])
+                    }
                     COP_SEND if right & RIGHT_WRITE != 0 => {
                         let took = tcpst.write(rid, body);
                         // SHORT WRITES ARE REPORTED, not silently truncated. The send arena is
@@ -3387,7 +3388,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // how a release that never happened looked like one that did (§26.7).
             if !sockets.iter().any(|sk| sk.rid == rid && sk.rid != 0) {
                 ctx.log_fmt(format_args!(
-                    "net-stack: a capability invocation named resource {} which is not a listener,                      a connection or a socket here - answering empty", rid));
+                    "net-stack: a capability invocation named resource {} which is not a listener, a connection or a socket here - answering empty", rid));
             }
 
             // Socket-cap invocation: transmit a UDP datagram through this socket. Payload =
@@ -3471,10 +3472,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         } else if pl.first() == Some(&21) {
             // TCP TRANSACT (op 21): [21, ip(4), port_hi, port_lo, request bytes...].
-            // Connect, send, read until the peer closes or the budget expires, close. Reply carries
-            // whatever came back, or is EMPTY on failure - and the failure is logged with its reason
-            // rather than folded into "nothing came back" (§26.7: a reported failure beats a
-            // detected one).
+            // Connect, send, read until the peer closes or the budget expires, close. Reply is
+            // `[status, bytes...]`: `TCP_OK` and whatever came back, or `TCP_FAILED` alone - and the
+            // failure is logged with its reason rather than folded into "nothing came back" (§26.7).
+            //
+            // The status byte is new on 2026-10-10 (`backlog/80` D5). A failure answered with an EMPTY
+            // message, which `Reply::send` `debug_assert!`s against and three ports refuse outright
+            // (`backlog/66`), so on those boards a failed transaction left the caller waiting out its
+            // deadline instead of hearing "failed".
             //
             // Driven inside the request, not from a background poll, because
             // `docs/net-tags-design.md` forbids unsolicited driver traffic until its phase 2/3 land.
@@ -3484,7 +3489,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // 3 KiB, not 1.4 KiB: a reply that fits in ONE segment never exercises the receive
             // path's reassembly, window updates or ACK-driven advancement. The Message ceiling is
             // 4 KiB (§8.5), so this leaves headroom while guaranteeing more than one segment.
-            let mut resp = [0u8; 3072];
+            let mut resp = [0u8; 1 + 3072];
             let n = if pl.len() >= 7 && gw_known {
                 let dip = [pl[1], pl[2], pl[3], pl[4]];
                 let dport = ((pl[5] as u16) << 8) | pl[6] as u16;
@@ -3522,7 +3527,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 };
                 let net = tcp::Net { our_mac, peer_mac, our_ip };
-                match tcp_transact(&ctx, pending, &mut tcpst, &net, dip, dport, &pl[7..], &mut resp, 8_000) {
+                match tcp_transact(&ctx, pending, &mut tcpst, &net, dip, dport, &pl[7..], &mut resp[1..], 8_000) {
                     // A SUCCESSFUL-BUT-EMPTY transaction used to log NOTHING, while the shell told
                     // the user to "see its log for the reason". A message that points at an absent
                     // explanation is worse than silence: it sends the reader looking for something
@@ -3590,7 +3595,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if !gw_known { ctx.log("net-stack: tcp asked for before the stack is configured"); }
                 0
             };
-            reply.send(&ctx, &resp[..n]);
+            // Nothing back is a failure to the caller, whatever stage it ended at: every arm above
+            // that returns 0 has already said why in the log.
+            resp[0] = if n > 0 { TCP_OK } else { TCP_FAILED };
+            reply.send(&ctx, &resp[..1 + n]);
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
             // Try the DHCP-learned server, then a public fallback (8.8.8.8). A home router may do DHCP +
@@ -3689,6 +3697,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             our_mac = d.our_mac;
             gw_mac = d.gw_mac;
             gw_known = d.gw_known;
+            // `leased` too, as every other dance does. It was left at its old value until 2026-10-10,
+            // so a renew that lost (or won) the lease left the re-DHCP and gateway-retry decisions
+            // working from the previous dance's answer (backlog/80 D3).
+            leased = d.leased;
             dns_server = d.dns_server;
             status = d.status;
             reply.send(&ctx, &status);

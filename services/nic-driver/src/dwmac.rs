@@ -579,11 +579,18 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
                 // into a console flood.
                 tx_reports += 1;
                 let (tgb, tg, tuf, tce, rgb, rcrc, _rocts, dbg) = d.mac_counters();
+                // And the MAC's own reason, if it has one, for counting a frame not good: the fault
+                // counters `tx_fault_counters` reads, beside the counts they explain. Read nowhere until
+                // 2026-10-10 (backlog/80 D11), so the question they answer stayed open.
+                let (sc, mc, def, late, xcol, xdef, ogb, og) = d.tx_fault_counters();
                 ctx.log_fmt(format_args!(
                     "nic-driver: dwmac sent {} bytes | tdes3 0x{:08x} = {} | MAC tx {}/{} good, underflow {}, carrier {}, rx {} crc-err {} | dma 0x{:08x} debug 0x{:08x}",
                     p.len(), d.last_tx_status, d.tx_error_name(),
                     tg, tgb, tuf, tce, rgb, rcrc,
                     d.dma_status(), dbg));
+                ctx.log_fmt(format_args!(
+                    "nic-driver: dwmac tx faults - single-collision {} multi-collision {} deferred {} late {} excess-collision {} excess-deferral {} | octets {}/{} good",
+                    sc, mc, def, late, xcol, xdef, og, ogb));
             }
             crate::note_reply(godspeed::ipc::try_send_to(ctx, reply_cap, &Message::from_bytes(&[0u8])), ctx, &mut fails);
         }

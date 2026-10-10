@@ -228,6 +228,8 @@ pub struct Fs<'a> {
     reason: [u8; REASON_MAX],
     reason_len: u8,
     notice: Option<&'a dyn Fn()>,
+    /// Where the keys a noticing wait reads (and does not act on) go - see [`Fs::keeping`].
+    keep: Option<&'a dyn Fn(u8)>,
     /// How long ORDINARY operations wait. `None` means [`call::DEFAULT_SECS`].
     ///
     /// The operations with a budget of their own - a subtree delete walks a tree, so it carries
@@ -250,7 +252,7 @@ impl<'a> Fs<'a> {
     ///
     /// Cheap, allocates nothing, and grants nothing. See the type's authority note.
     pub fn new(ctx: &'a ServiceContext) -> Fs<'a> {
-        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None, patience: None }
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None, keep: None, patience: None }
     }
 
     /// A handle that calls `notice` when a request has been waiting a while.
@@ -266,7 +268,7 @@ impl<'a> Fs<'a> {
     /// request the operator then aborts returns [`Error::Cancelled`], which is NOT a fault - report
     /// it as the deliberate act it was.
     pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Fs<'a> {
-        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice),
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice), keep: None,
              patience: None }
     }
 
@@ -306,7 +308,7 @@ impl<'a> Fs<'a> {
     /// not a loud rejection - it is a stale reply silently accepted as the answer to the current
     /// question. See [`TAG_START`](self).
     pub fn from_tag(ctx: &'a ServiceContext, tag: u8) -> Fs<'a> {
-        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None, patience: None }
+        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None, keep: None, patience: None }
     }
 
     /// Lend this handle a waiting-notice, as [`with_notice`](Fs::with_notice) describes.
@@ -316,6 +318,15 @@ impl<'a> Fs<'a> {
     /// combinations multiply faster than the constructors are worth.
     pub fn noticing(mut self, notice: &'a dyn Fn()) -> Fs<'a> {
         self.notice = Some(notice);
+        self
+    }
+
+    /// Hand every key a noticing wait reads, other than a quit key, to `keep` - in order - instead of
+    /// discarding it. A wait that watches the console for `q` takes what is typed; without this,
+    /// typing ahead while a command waits loses those keys (`backlog/80` H16). Only matters with a
+    /// notice, since only a noticing wait reads the console.
+    pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Fs<'a> {
+        self.keep = Some(keep);
         self
     }
 
@@ -386,7 +397,7 @@ impl<'a> Fs<'a> {
         req[3 + path.len()..n].copy_from_slice(tail);
 
         let reply = call::request_within_notice(
-            self.ctx, "fs", &Message::from_bytes(&req[..n]), secs, self.notice)?;
+            self.ctx, "fs", &Message::from_bytes(&req[..n]), secs, self.notice, self.keep)?;
         let body = reply.payload_bytes();
 
         // The tag must match, or this is an answer to a question we already gave up on.
@@ -592,9 +603,9 @@ impl<'a> Fs<'a> {
     ///
     /// `rights` is a mask of [`cap::READ`](crate::cap::READ), [`cap::WRITE`](crate::cap::WRITE) and
     /// [`cap::APPEND`](crate::cap::APPEND). **Check
-    /// [`File::rights`](crate::file::File::rights) on the result**: `fs` narrows rather than refuses
-    /// in one case - it will not mint a writable capability to a SEALED file, and hands back a
-    /// read-only one instead of a capability it could not honour.
+    /// [`File::rights`](crate::file::File::rights) on the result**: it is what the capability
+    /// carries, read from the kernel. `fs` narrows rather than refuses in one case - it will not mint
+    /// a writable capability to a SEALED file, and hands back a read-only one instead.
     ///
     /// # Why this borrows the handle
     ///
@@ -619,7 +630,14 @@ impl<'a> Fs<'a> {
         // The capability rode the reply as an EMBEDDED cap, not as payload bytes; the kernel placed
         // it in our table on receipt and it is ours to claim or leak.
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
-        Ok(crate::file::File::new(self, ctx, cap, rights))
+        // Record what the capability CARRIES, not what was asked: `fs` narrows a sealed file to
+        // read-only, and APPEND is a request flag that never becomes a kernel right. A slot the
+        // kernel cannot describe is no capability we can use (`backlog/80` G2).
+        let granted = match ctx.query_cap_rights(cap) {
+            Some(r) => (r as u8) & (crate::cap::READ | crate::cap::WRITE),
+            None => return Err(Error::Failed),
+        };
+        Ok(crate::file::File::new(self, ctx, cap, granted))
     }
 
     /// Rebuild the free-space bitmap from the file tree, and report what was found.

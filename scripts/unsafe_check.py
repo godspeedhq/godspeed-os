@@ -20,6 +20,7 @@ the audit's top table are not compared against the source.
 Exit: 0 if no failures, 1 if any.
 """
 
+from __future__ import annotations  # signatures use dict[...] (3.9); this keeps the 3.8 floor true
 import re
 import sys
 from pathlib import Path
@@ -32,7 +33,13 @@ SDK         = REPO_ROOT / "sdk"
 # 18.1 names the SDK files where `unsafe` is PERMITTED: the syscall ABI, the MMIO/DMA accessors a
 # userspace driver cannot do without, and the adversarial test module. Everything else under `sdk/`
 # is forbidden by 18.2 exactly as a service is.
-SDK_PERMITTED = {"syscall.rs", "mmio.rs", "dma.rs", "adversarial.rs"}
+#
+# By FULL PATH. This was a set of file NAMES matched with `rs_file.name in SDK_PERMITTED`, so any
+# `mmio.rs` anywhere under `sdk/` - a new crate's, say - was waved through uncounted. And a permitted
+# file's count was never compared with anything: the audit's table says how many each holds, and a
+# new `unsafe` in `mmio.rs` changed no number this script looked at (backlog/80 T6).
+SDK_PERMITTED = {"sdk/rust/src/syscall.rs", "sdk/rust/src/mmio.rs", "sdk/rust/src/dma.rs",
+                 "sdk/rust/src/adversarial.rs"}
 
 # ...and the files that hold `unsafe` anyway, frozen at their counts (18.5's grandfathering, applied
 # to the SDK). These are NOT 90 separate defects: 86 of the 90 are `unsafe { raw_syscall(..) }` call
@@ -63,6 +70,20 @@ def count_unsafe(path: Path) -> int:
         if re.search(r'\bunsafe\b', line):
             count += 1
     return count
+
+
+# The audit's SDK table: | `sdk/rust/src/mmio.rs` | 9 | ... - a count possibly in bold.
+SDK_ROW = re.compile(r"^\|\s*`(sdk/[^`]+\.rs)`\s*\|\s*\**(\d+)\**\s*\|")
+
+
+def parse_sdk_table() -> dict[str, int]:
+    """{path: count} from the SDK table at the top of the audit - the record an SDK count is held to."""
+    rows = {}
+    for line in AUDIT_FILE.read_text(encoding="utf-8").splitlines():
+        m = SDK_ROW.match(line)
+        if m:
+            rows[m.group(1)] = int(m.group(2))
+    return rows
 
 
 def parse_audit() -> dict[str, int]:
@@ -243,12 +264,38 @@ def main() -> int:
     # and services, so `sdk/`'s ~125 unsafe lines were audited by no tool at all - while 18.4 says
     # "CI checks the file matches source" and the audit's own header implied the SDK's unsafe lived
     # only in the four permitted files. It does not (backlog/18).
+    sdk_table = parse_sdk_table()
+    # Every SDK file the audit's table or this script names must exist, and the two must agree on a
+    # grandfathered floor: the audit is the record, and a script holding a different number is a
+    # second truth.
+    for rel in sorted(set(sdk_table) | SDK_PERMITTED | set(SDK_GRANDFATHERED)):
+        if not (REPO_ROOT / rel).exists():
+            failures.append(f"  FAIL  {rel}: named by the audit's SDK table or this script, but the "
+                            f"file does not exist - remove the row (the audit must match the source, 18.4)")
+        elif rel not in sdk_table:
+            failures.append(f"  FAIL  {rel}: permitted or grandfathered here, but it has no row in the "
+                            f"SDK table of audits/unsafe-audit.md - add one with its count")
+    for rel, frozen in SDK_GRANDFATHERED.items():
+        if rel in sdk_table and sdk_table[rel] != frozen:
+            failures.append(f"  FAIL  {rel}: frozen at {frozen} here and {sdk_table[rel]} in the audit's "
+                            f"SDK table - one floor, stated twice, must be one number")
+
     for rs_file in sorted(SDK.rglob("*.rs")):
         rel = rs_file.relative_to(REPO_ROOT).as_posix()
         if "target" in rel.split("/"):
             continue
         n = count_unsafe(rs_file)
-        if n == 0 or rs_file.name in SDK_PERMITTED:
+        if rel in SDK_PERMITTED:
+            recorded = sdk_table.get(rel)
+            if recorded is not None and n > recorded:
+                failures.append(
+                    f"  FAIL  {rel}: unsafe count grew {recorded} -> {n} - add // SAFETY: comment(s) "
+                    f"and update the SDK table in audits/unsafe-audit.md")
+            elif recorded is not None and n < recorded:
+                infos.append(f"  INFO  {rel}: unsafe count shrank {recorded} -> {n} "
+                             f"(update the audit's SDK table to lock in the reduction)")
+            continue
+        if n == 0:
             continue
         frozen = SDK_GRANDFATHERED.get(rel)
         if frozen is None:

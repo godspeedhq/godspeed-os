@@ -36,6 +36,7 @@ is covered the moment its directory exists and nobody has to remember this file.
 Exit: 0 if the neutral layers are arch-clean, 1 otherwise.
 """
 
+from __future__ import annotations  # signatures use list[...] (3.9); this keeps the 3.8 floor true
 import re
 import sys
 from pathlib import Path

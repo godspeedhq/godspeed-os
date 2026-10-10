@@ -123,6 +123,19 @@ RULES = {
         help="Implement the named members in your `arch/<isa>/`. A stub is fine, but a stub that "
              "returns a number a watchdog reads must say whether zero means disabled or unlimited."),
 
+    "port_scope_check.py": dict(
+        code="GS0204", fixable=False, commandment="I", section="CLAUDE.md 4.1, docs/porting.md",
+        title="a port edits a file outside `arch/<isa>/` and the ones `docs/porting.md` marks `+`",
+        why="The other boundary checks ask whether a RULE was broken, and an ordinary edit to a neutral "
+            "kernel file breaks none of them. The bar is that a port is complete when neutral code no "
+            "longer knows the ISA was added, so on a one-ISA branch every edit outside the guide's "
+            "tree is a finding. The allowed set is stated here and in the guide, and each is checked "
+            "against the other.",
+        help="Add an `arch::imp` primitive instead of editing the neutral file. If the edit is truly "
+             "unavoidable, make it and write the reason in a commit trailer: "
+             "`Port-Scope: <path> - <why>`. If the script and the guide disagree, fix whichever is "
+             "wrong - both, together."),
+
     "contract_check.py": dict(
         code="GS0301", fixable=False, commandment="IV", section="CLAUDE.md 13.6",
         title="a service contract disagrees with what the spawn request actually grants",
@@ -858,9 +871,13 @@ def _run_case(meta, plant):
     # half-applied multi-plant left behind is worse than a single one, because a contributor would not
     # know how many files to go and look at.
     undos = []
+    # Where each APPENDED plant begins, so a site inside it can be written relative to that point.
+    starts = {}
     try:
         try:
             for tgt, mode, body in spec:
+                if mode == "append" and os.path.isfile(os.path.join(ROOT, tgt)):
+                    starts[tgt] = _line_count(os.path.join(ROOT, tgt))
                 undos.append(_apply(tgt, mode, body))
         except ValueError as e:
             return None, str(e)
@@ -870,10 +887,35 @@ def _run_case(meta, plant):
             return None, out
         if rc == 0:
             return "", None
-        return render(checker, out, [rel for rel, _ in fix_decidable(apply=False)]), None
+        return _relative_sites(render(checker, out, [rel for rel, _ in fix_decidable(apply=False)]),
+                               starts), None
     finally:
         for undo in reversed(undos):
             undo()
+
+
+def _line_count(path):
+    """Lines in a file as an editor numbers them: a final line without a newline still counts."""
+    data = io.open(path, "rb").read()
+    return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+
+
+def _relative_sites(text, starts):
+    """Rewrite `target:N` inside an appended plant as `target:END+k`, k lines into the plant.
+
+    WHY. An appended plant lands after the target's last line, so the line a finding cites is the
+    target's LENGTH plus a little - and every edit to that file then moved it. Five cases failed at
+    once on 2026-10-10 because `docs/pipes.md` and `services/observe` had grown, each expecting the
+    same finding five lines higher. The case measured the file's length, not the gate. Relative to
+    the plant, the site is a property of the case alone. A site before the plant is left as it is:
+    that is the gate pointing at the real file, and it must not be hidden.
+    """
+    for tgt, base in starts.items():
+        def sub(m, base=base, tgt=tgt):
+            n = int(m.group(1))
+            return "%s:END+%d" % (tgt, n - base) if n > base else m.group(0)
+        text = re.sub(re.escape(tgt) + r":(\d+)", sub, text)
+    return text
 
 
 def _guard(parsed):
@@ -956,6 +998,7 @@ NO_CASE_REASON = {
     "GS0008": "Commandment VIII has NO mechanical check at all, so this code can never fire. It is in "
               "the not-mechanised list as \"[static heuristic, not built] Wait on truth\". Listed here "
               "rather than quietly absent, because a code nothing can produce reads as coverage.",
+    "GS0204": "Fires only on a BRANCH whose diff against main works on one ISA, so a case needs a git history, not a planted file - the corpus plants files into one tree. Its guide cross-check fails on a planted row, but that is the script disagreeing with `docs/porting.md`, not a port leaving its scope, so it would catalogue the wrong failure.",
     "GS0203": "Needs a NEW `arch::imp` member CALLED from neutral code, so every one of the seven arch directories then fails to answer it. Multi-file plants exist now and would express the call site, but the case would have to stay correct as arches are added - it would assert a fact about how many exist. Left out rather than made fragile.",
     "GS0405": "`facts_check` needs a doc that restates a number the code owns. Picking one means "
               "hard-coding a pairing the checker DISCOVERS, so the case would rot exactly as the "

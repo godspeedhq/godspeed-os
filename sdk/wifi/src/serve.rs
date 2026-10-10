@@ -785,9 +785,15 @@ pub fn serve<'s>(
             // radio that is down must still know it is not the one to rejoin.
             (wire::OP_USE, _) => {
                 if let Some(&len) = payload.get(1) {
+                    // A name over 16 bytes is no radio's, as `keyfile` reads `/wifi.radio`: it was cut
+                    // to 16 and compared, so a long name that began like this radio's chose it
+                    // (`backlog/80` S8).
+                    let long = len as usize > 16;
                     let len = (len as usize).min(16);
                     let name = payload.get(2..2 + len).unwrap_or(&[]);
-                    choice_use = if name.is_empty() {
+                    choice_use = if long {
+                        wire::USE_NOT
+                    } else if name.is_empty() {
                         wire::USE_DEFAULT
                     } else if name == wire::radio_name(who).as_bytes() {
                         wire::USE_THIS

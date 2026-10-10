@@ -109,13 +109,14 @@ impl<'f, 'a: 'f> File<'f, 'a> {
         File { fs, ctx, cap, right, held: Held::new(), closed: false }
     }
 
-    /// The rights you ASKED [`Fs::open`](crate::fs::Fs::open) for.
+    /// The rights this capability CARRIES - [`cap::READ`](crate::cap::READ) and
+    /// [`cap::WRITE`](crate::cap::WRITE) - as the kernel reported them when the file was opened.
     ///
-    /// **Not necessarily what the capability carries (known defect, 2026-10-09).** `fs` refuses a
-    /// writable capability to a sealed file and hands back a read-only one rather than minting a
-    /// cap it cannot honour (7.3 - rights narrow), but `open` records the mask it sent, not what
-    /// came back, so this does not show the narrowing. A write through a narrowed capability is
-    /// refused by the kernel with [`Error::PermissionDenied`].
+    /// Not necessarily what you asked [`Fs::open`](crate::fs::Fs::open) for: `fs` narrows a sealed
+    /// file to read-only rather than mint a cap it cannot honour (7.3 - rights narrow), and
+    /// [`cap::APPEND`](crate::cap::APPEND) is a request to `fs`, never a kernel right, so it is not
+    /// here. (Until 2026-10-10 this was the mask asked for, and a close under it was refused -
+    /// `backlog/80` G2.)
     pub fn rights(&self) -> u8 {
         self.right
     }
@@ -210,11 +211,8 @@ impl<'f, 'a: 'f> File<'f, 'a> {
     /// this also closes it, but a `Drop` cannot report a failure - so close explicitly wherever the
     /// outcome matters.
     ///
-    /// **Known defect (2026-10-09):** the close is invoked under the mask [`rights`](File::rights)
-    /// reports, which the kernel checks against the capability. Where the two differ - an
-    /// [`APPEND`](crate::cap::APPEND)-only open (the APPEND bit is never in the minted capability),
-    /// or a sealed file narrowed to read-only - the kernel refuses the close with
-    /// [`Error::PermissionDenied`], `fs` never hears it, and its open-file slot stays taken.
+    /// The close is invoked under a right the capability carries ([`rights`](File::rights)), so a
+    /// read-only, a narrowed or an [`APPEND`](crate::cap::APPEND)-only file closes like any other.
     pub fn close(mut self) -> Result<(), Error> {
         self.close_inner()
     }
@@ -224,9 +222,11 @@ impl<'f, 'a: 'f> File<'f, 'a> {
             return Ok(());
         }
         self.closed = true;
-        // CLOSE is permitted to any holder, so it is invoked under whatever right we hold rather
-        // than under WRITE - a read-only holder must still be able to let go.
-        let r = self.invoke(self.right, &[FOP_CLOSE]).map(|_| ());
+        // CLOSE is permitted to any holder, so it is invoked under ONE right the capability holds
+        // (READ if it has it) - a read-only holder must still be able to let go, and the kernel
+        // checks the right asked for against the capability.
+        let right = if self.right & READ != 0 { READ } else { self.right };
+        let r = self.invoke(right, &[FOP_CLOSE]).map(|_| ());
         self.ctx.remove_cap(self.cap);
         r
     }

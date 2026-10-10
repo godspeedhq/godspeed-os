@@ -409,7 +409,10 @@ fn clean_supervisor() {
 /// committed and shipped from here, and only the ARM build refused it - days later, by accident.
 ///
 /// Listed explicitly rather than discovered from the directory, so that ADDING a checker is a
-/// decision each build path makes, not something that silently changes what a build enforces.
+/// decision, not something that silently changes what a build enforces. It is ONE decision: the board
+/// builds read this list (`scripts/build_gates.py`), as `conform.py` does. They each carried their own
+/// copy of seven until 2026-10-10, and every checker added since had been added here alone
+/// (backlog/80 T8).
 const EXTRA_CHECKS: &[&str] = &[
     "scripts/dash_check.py",
     "scripts/unsafe_check.py",
@@ -503,6 +506,19 @@ const EXTRA_CHECKS: &[&str] = &[
     // This was in `scripts/CONFORM-EXTRA.txt` while the branch that wrote it touched no Rust. That
     // file exists to make such a gap VISIBLE rather than silent, and it is empty again now.
     "scripts/python_floor_check.py",
+    // The port's SCOPE: on a branch that works on one ISA, every path it edits must be `arch/<isa>/`
+    // or a file `docs/porting.md` marks `+`. It ran only in the paused `build.yml`, so its own
+    // cross-check against the guide failed on EVERY branch for six days (the guide gained the radio's
+    // `wifi-driver/build.rs` row and the script did not) and nothing said so - `backlog/80` T2. On
+    // any other branch it is silent by design, so it costs nothing here but the guide cross-check.
+    "scripts/port_scope_check.py",
+    // Every service the supervisor MANAGES is embedded in its image, on every arch. Each board build ran
+    // it for its own arch and `osdev build` for none, so x86 - which has no `_built` list in
+    // kernel/build.rs - was never checked at all (backlog/80 T7). With no arguments it checks all four.
+    "scripts/service_embed_check.py",
+    // Every tracked `.rs` file carries an SPDX licence tag, and it is its tree's licence
+    // (docs/licensing.md). Thirteen carried none and nothing noticed (backlog/80 R1).
+    "scripts/spdx_check.py",
 ];
 
 /// `osdev conform` - forward to `scripts/conform.py` and pass its exit code through.
@@ -1673,7 +1689,12 @@ fn cmd_test(suite: &str) {
         "big-script"   => run_big_script_test(),
         "fmt-demo"     => run_fmt_demo_test(),
         "fmt-idem"     => run_fmt_idem_test(),
-        other => eprintln!("unknown test suite: {}", other),
+        // A typo is a failure, not a pass. This printed the line and exited 0, so a script or a CI
+        // step naming a suite that does not exist reported success having run nothing (backlog/80 T3).
+        other => {
+            eprintln!("unknown test suite: {} - nothing was run", other);
+            std::process::exit(2);
+        }
     }
 }
 
@@ -1799,27 +1820,6 @@ fn run_iommu_test() {
         println!("\n  [12]  confined_driver_dma_faults  (§22 Test 12)  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
-}
-
-/// Boot the blockdev image once with `persist` on the ATA secondary channel,
-/// capture the serial log, and return it. The persist disk is NOT recreated -
-/// the caller controls its lifecycle (key for the reboot-survival test).
-fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> String {
-    let _ = std::fs::remove_file(serial);
-    let mut cmd = std::process::Command::new(qemu::qemu_binary());
-    cmd.args([
-        "-m", "512M", "-smp", "2",
-        "-drive", &format!("format=raw,file={img_str},if=ide,index=0"),
-        "-drive", &format!("format=raw,file={persist_str},if=ide,index=2"),
-        "-serial", &format!("file:{serial}"),
-        "-serial", "null",
-        "-display", "none", "-no-reboot", "-no-shutdown",
-    ]);
-    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("blockdev: failed to launch QEMU: {e}"); std::process::exit(1); });
-    std::thread::sleep(std::time::Duration::from_secs(secs));
-    let _ = child.kill();
-    let _ = child.wait();
-    std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "")
 }
 
 /// Build the AHCI block-driver variant: block-driver with its `ahci` feature,

@@ -140,7 +140,8 @@ pub fn derive_ptk(pmk: &[u8; 32], aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32]
     ctx[12..44].copy_from_slice(if a_first { anonce } else { snonce });
     ctx[44..76].copy_from_slice(if a_first { snonce } else { anonce });
     let mut out = [0u8; 48];
-    crate::crypto::prf_sha1(pmk, b"Pairwise key expansion\0", &ctx, &mut out);
+    // 23 + 76 bytes, inside the PRF's input by construction.
+    assert!(crate::crypto::prf_sha1(pmk, b"Pairwise key expansion\0", &ctx, &mut out), "PTK PRF input");
     let mut ptk = Ptk { kck: [0; 16], kek: [0; 16], tk: [0; 16] };
     ptk.kck.copy_from_slice(&out[0..16]);
     ptk.kek.copy_from_slice(&out[16..32]);

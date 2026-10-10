@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK's audited ABI.
 // `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a grep cannot
 // - unsafe produced by a macro, or spelled across lines. `deny` rather than `forbid` for exactly one
@@ -899,7 +900,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     cores.report(&ctx);
                 }
                 None => ctx.log(
-                    "wifi-driver: the core table could not be walked, so phase 2 has no address to                      write firmware to. Everything through stage 7 stands - the chip is identified and                      its backplane reads",
+                    "wifi-driver: the core table could not be walked, so phase 2 has no address to write firmware to. Everything through stage 7 stands - the chip is identified and its backplane reads",
                 ),
             }
 

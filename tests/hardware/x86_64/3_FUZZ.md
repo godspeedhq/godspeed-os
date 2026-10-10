@@ -2,7 +2,7 @@
 
 Mirrors §22 Fuzz Tests (F1-F8). Crash resistance under adversarial inputs.
 
-**Reference:** `tests/qemu/fuzz/CLAUDE.md` for full spec.
+**Reference:** the `TestSpec` table in `osdev/src/validator.rs` is the full spec (there is no `tests/qemu/fuzz/` directory).
 
 ## Hardware applicability
 

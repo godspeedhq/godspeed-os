@@ -21,11 +21,14 @@ remaining gap, (1) against (2).
 
 NOTE 2026-10-09: on every port the kernel now `include_bytes!`s only the supervisor
 (`SVC_SUPERVISOR_ELF`, kernel/src/task/mod.rs); the supervisor embeds the rest. The `arm_built` and
-`aarch64_built` lists in kernel/build.rs still name ~25 services, but they only decide which
-`SVC_*_ELF` paths point at real files, and no kernel code reads those beyond the supervisor and the
-arm bring-up scaffolding. So for arm and aarch64 this check still compares MANAGED against a list that
-no longer decides what boots; only riscv64 (whose list is `["supervisor"]`) is checked against the
-supervisor's own roster below, and x86_64 has no `_built` list and is not checked at all.
+`aarch64_built` lists in kernel/build.rs still name ~25 services, but they decide nothing a boot
+depends on.
+
+FIXED 2026-10-10 (backlog/80 T7): this compared arm and aarch64 against those kernel lists, and
+x86_64 - which has none - not at all. Every arch the supervisor builds for is now checked against the
+supervisor's own roster (services/supervisor/build.rs), x86_64 included, and the arches come from that
+file. Shown: with `time` removed from `EMBEDDED` the old check passed arm and aarch64; with x86's
+`audio-driver` removed it passed outright.
 
 A name may be absent from an arch's list only by being named here, with a reason. That is the whole
 design: an exemption is a sentence someone wrote, not a silence.
@@ -45,6 +48,15 @@ import re
 # Anything not listed here must be embedded for that arch. A new exemption is a sentence someone
 # writes, not a silence.
 ARCH_EXEMPT = {
+    # Checked from 2026-10-10. This file read only the kernel's `<arch>_built` lists, and x86_64 has
+    # none, so the arch where most services run was never compared at all (backlog/80 T7).
+    "x86_64": {
+        "dwc2": "arm32-only (Pi 2) USB host driver; a PC's USB hosts are xhci and ehci",
+        "wifi-driver": "the onboard SDIO radios of the Pi 4 and the VisionFive; a PC has no SD-host "
+                       "radio, and its WiFi is the USB dongle's driver, `wifi-usb` (docs/wifi-usb.md)",
+        "pwm-audio": "the Pis' PWM-driven 3.5 mm jack; a PC's sound is HD Audio, `audio-driver` "
+                     "(docs/audio.md)",
+    },
     "arm": {
         "ehci": "x86-only USB2 controller driver; the Pi 2 has no EHCI",
         "xhci": "the Pi 2 has no PCIe and no xHCI controller; its USB host is dwc2",
@@ -205,6 +217,17 @@ def _supervisor_embedded(root, arch):
         if any(h in names for h in hosts):
             names += re.findall(NAME, rest)
 
+    # The audio group, a per-arch `match` like `usb` - its arms can name two arches at once
+    # (`"arm" | "aarch64" => ...`), which the line scan handles because it asks only whether this
+    # arch is named on the arm's line. Read since 2026-10-10: before, riscv64 was the only arch read
+    # from this file and it exempts both audio drivers, so nothing it embedded was missed - but every
+    # other arch is read here now (backlog/80 T7), and without this all three would miss their driver.
+    audio = _block(src, "let audio: &[&str] = ", "`audio`", "services/supervisor/build.rs")
+    for line in _strip_comments(audio).split(chr(10)):
+        if (chr(34) + arch + chr(34)) in line and "=>" in line:
+            names += re.findall(NAME, line.split("=>", 1)[1])
+            break
+
     seen, out = set(), []
     for n in names:
         if n not in seen:
@@ -225,23 +248,39 @@ def embedded(root, arch):
 
 
 def arches(root):
-    """Every arch that declares an embed list in kernel/build.rs, in source order."""
-    src = io.open(os.path.join(root, "kernel", "build.rs"), encoding="utf-8").read()
-    return re.findall(r"let ([a-z0-9_]+)_built: &\[&str\] = ", src)
+    """Every arch the SUPERVISOR builds an image for, from the arms of its per-arch `usb` table.
+
+    This read the `<arch>_built` lists in kernel/build.rs, and so checked arm, aarch64 and riscv64
+    and never x86_64, which has no such list - while x86 is where most services run. Those lists no
+    longer decide what boots anywhere (the kernel embeds only the supervisor on every port), so the
+    arches are the ones the supervisor's own build script knows (backlog/80 T7).
+    """
+    src = io.open(os.path.join(root, "services", "supervisor", "build.rs"), encoding="utf-8").read()
+    usb = _block(src, "let usb: &[&str] = ", "`usb`", "services/supervisor/build.rs")
+    return re.findall(r"^\s*" + chr(34) + r"([a-z0-9_]+)" + chr(34) + r"\s*=>", usb, re.M)
 
 
 def check(root, arch):
-    """Return a list of failure lines; empty means every arm embeds every managed service."""
+    """Return a list of failure lines; empty means the supervisor embeds every managed service.
+
+    THE SUPERVISOR'S ROSTER, ON EVERY ARCH. The kernel `include_bytes!`s only the supervisor on every
+    port (kernel/src/task/mod.rs, `SVC_SUPERVISOR_ELF`), and the supervisor embeds the rest - so what a
+    machine can spawn is decided in services/supervisor/build.rs. This compared arm and aarch64 against
+    their `_built` lists in kernel/build.rs, which name ~25 services and decide nothing a boot depends
+    on, and so passed or failed on a list that is not the truth (backlog/80 T7).
+    """
     names = managed(root)
     bad = []
-    for label, have in embedded_arms(root, arch):
+    roster = [(arch + " (the supervisor's roster - the kernel embeds only `supervisor`)",
+               _supervisor_embedded(root, arch))]
+    for label, have in roster:
         have = set(have)
         exempt = ARCH_EXEMPT.get(arch, {})
         # NAME THE FILE THAT IS ACTUALLY SHORT. On a port that has finished step C the roster comes
         # from the supervisor, so telling the reader to edit `<arch>_built` in kernel/build.rs sends
         # them to a list that is correct at one entry. A checker that reports the wrong location is
         # only marginally better than one that says nothing.
-        via_supervisor = "via the supervisor" in label
+        via_supervisor = "the supervisor" in label
         if via_supervisor:
             where = ("`EMBEDDED` (or the `usb` / `enumerator` arm for this arch) in "
                      "services/supervisor/build.rs")

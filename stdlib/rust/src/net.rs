@@ -164,6 +164,8 @@ pub struct Net<'a> {
     tag: u8,
     /// Fired once when a request lingers. See [`Net::with_notice`].
     notice: Option<&'a dyn Fn()>,
+    /// Where the keys a noticing wait reads (and does not act on) go - see [`Net::keeping`].
+    keep: Option<&'a dyn Fn(u8)>,
 }
 
 impl<'a> Net<'a> {
@@ -224,7 +226,7 @@ impl<'a> Net<'a> {
 
     /// Take a network handle. Cheap, allocates nothing, grants nothing.
     pub fn new(ctx: &'a ServiceContext) -> Net<'a> {
-        Net { ctx, tag: TAG_BASE, notice: None }
+        Net { ctx, tag: TAG_BASE, notice: None, keep: None }
     }
 
     /// A network handle that tells you when a call is taking a while.
@@ -239,7 +241,14 @@ impl<'a> Net<'a> {
     /// unreachable host waits the full deadline in silence. Losing that would have been a
     /// regression dressed up as a migration.
     pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Net<'a> {
-        Net { ctx, tag: TAG_BASE, notice: Some(notice) }
+        Net { ctx, tag: TAG_BASE, notice: Some(notice), keep: None }
+    }
+
+    /// Hand every key a noticing wait reads, other than a quit key, to `keep`, in order, instead of
+    /// discarding it - as [`Fs::keeping`](crate::fs::Fs::keeping) does (`backlog/80` H16).
+    pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Net<'a> {
+        self.keep = Some(keep);
+        self
     }
 
     /// Send `[tag, patience, body..]` and return the reply with the tag checked and stripped.
@@ -264,7 +273,7 @@ impl<'a> Net<'a> {
         req[1] = secs.clamp(0, 255) as u8;
         req[2..2 + body.len()].copy_from_slice(body);
         let r = call::request_within_notice(
-            self.ctx, "net-stack", &Message::from_bytes(&req[..2 + body.len()]), secs, self.notice)?;
+            self.ctx, "net-stack", &Message::from_bytes(&req[..2 + body.len()]), secs, self.notice, self.keep)?;
         // A reply whose tag does not match is the answer to a request we already gave up on. Reading
         // it as this one's is how a channel goes "out of step" and every later exchange answers the
         // question before.
@@ -370,13 +379,14 @@ impl<'a> Net<'a> {
         req[6] = port as u8;
         req[head..head + request.len()].copy_from_slice(request);
         let r = self.call(&req[..head + request.len()], TCP_SECS)?;
-        let b = body(&r);
-        // `net-stack` answers an unreachable peer with nothing at all, and the shell's own `tcp`
-        // command reads that as "connected to nothing". Reported as a failure rather than as an
-        // empty success, because an empty buffer is what a caller would otherwise act on.
-        if b.is_empty() {
-            return Err(Error::Failed);
-        }
+        // `[status, bytes...]`: 0 and what came back, or 1 alone for a transaction that failed (its
+        // reason is in `net-stack`'s log). A failure was an EMPTY reply until 2026-10-10, which three
+        // ports refuse to deliver at all (`backlog/80` D5, `backlog/66`).
+        let b = match body(&r) {
+            [0, rest @ ..] => rest,
+            [1, ..] => return Err(Error::Failed),
+            _ => return Err(Error::Malformed),
+        };
         // Checked BEFORE copying, so `BufferTooSmall` leaves the buffer untouched - the same
         // contract `fs::read_into` gives. A partially-filled buffer plus an error is the worst of
         // both: the caller cannot tell how much of it is real.
@@ -598,19 +608,25 @@ impl<'c, 'n: 'c, 'a: 'n> Conn<'c, 'n, 'a> {
     /// a caller that wants more loops. Nothing here tells "nothing yet" from "the peer has gone":
     /// [`is_closed`](Conn::is_closed) reports only whether THIS handle was closed.
     ///
-    /// **Pass a buffer of at least 2048 bytes (known defect, 2026-10-09).** `net-stack` hands over
-    /// up to 2048 bytes per call and has already taken them off the connection; anything past
-    /// `buf.len()` is dropped here without an error.
+    /// Any buffer size works: the request tells `net-stack` how much `buf` holds, and it takes no
+    /// more than that off the connection, so nothing is read and then lost. One call moves at most
+    /// 2048 bytes. (Until 2026-10-10 it asked for everything and dropped what did not fit -
+    /// `backlog/80` G3.)
     ///
     /// **Authority:** this connection's `READ` right.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let cap = self.cap;
-        let r = self.lis.call(cap, RIGHT_READ, &[COP_RECV])?;
+        let max = buf.len().min(u16::MAX as usize) as u16;
+        let [lo, hi] = max.to_le_bytes();
+        let r = self.lis.call(cap, RIGHT_READ, &[COP_RECV, lo, hi])?;
         let b = r.payload_bytes();
         let data = if b.len() > 1 { &b[1..] } else { &[][..] };
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        Ok(n)
+        // More than was asked for is a peer that did not keep its side - said, not trimmed.
+        if data.len() > buf.len() {
+            return Err(Error::Malformed);
+        }
+        buf[..data.len()].copy_from_slice(data);
+        Ok(data.len())
     }
 
     /// Send bytes. Returns how many were ACCEPTED, which may be fewer than offered.

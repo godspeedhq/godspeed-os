@@ -199,9 +199,9 @@ pub fn try_recv(ctx: &ServiceContext) -> Option<Message> {
 
 /// Block for a message, giving up after `secs`.
 ///
-/// `None` is almost always the deadline passing - a fact about time, not a failure of the peer. It is
-/// also what a failed receive on this task's own endpoint returns (the SDK's `recv_timeout` folds its
-/// error into `None`), so `None` means "no message", not provably "the time ran out". Prefer this to
+/// `None` is the deadline passing - a fact about time, not a failure of the peer. A failed receive on
+/// this task's own endpoint is not folded into it: the task dies loudly, as a plain [`recv`] does,
+/// and the supervisor restarts it (`backlog/80` S5). Prefer this to
 /// a bare [`recv`] anywhere a missing message would otherwise hang the service forever, which is
 /// every place a peer can die (CLAUDE.md 26.6).
 #[inline(always)]

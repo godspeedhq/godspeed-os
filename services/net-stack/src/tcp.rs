@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! TCP over IPv4, bounded and heap-free.
 //!
 //! `docs/tcp-design.md` is the argument; this is the implementation. The two properties that shape
@@ -71,12 +72,6 @@ pub const RTO_MAX_MS: u64 = 8_000;
 /// Retransmissions of one segment before the connection is declared dead. Bounded on purpose: a
 /// retry loop with no limit is an unbounded wait wearing a disguise (§26.6).
 pub const MAX_RETX: u8 = 6;
-/// Frames drained and connections advanced per poll step. One busy connection must not starve the
-/// serve path, so the poll step's cost has a ceiling like everything else. (Note 2026-10-09: nothing
-/// reads this constant. `poll_step` in main.rs is bounded instead by one drain - at most the driver's
-/// batch of eight frames - and by `POLL_BUDGET_MS`.)
-pub const POLL_FRAMES: usize = 8;
-
 // ── Wire constants ─────────────────────────────────────────────────────────────────────────────
 
 pub const FIN: u8 = 0x01;
@@ -658,11 +653,6 @@ impl Tcp {
         self.tx_n += 1;
     }
 
-    /// Any connection not closed. (Note 2026-10-09: written for the serve loop to decide whether it
-    /// may block in `recv()`; nothing calls it now - the loop blocks only while unconfigured or
-    /// without a clock, and otherwise polls every `POLL_MS`.)
-    pub fn active(&self) -> bool { self.conns.iter().any(|c| c.state != State::Closed) }
-
     pub fn by_rid(&mut self, rid: u64) -> Option<&mut Conn> {
         self.conns.iter_mut().find(|c| c.rid == rid && c.rid != 0)
     }
@@ -1230,7 +1220,7 @@ impl Tcp {
                 // "nobody called" and "somebody called and we had no room" (§26.7).
                 None => {
                     ctx.log_fmt(format_args!(
-                        "net-stack: refused a connection from {}.{}.{}.{}:{} on port {} - the                          connection table is full",
+                        "net-stack: refused a connection from {}.{}.{}.{}:{} on port {} - the connection table is full",
                         rip[0], rip[1], rip[2], rip[3], rp, lp));
                     return 0;
                 }

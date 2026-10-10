@@ -71,13 +71,12 @@ pub enum DeadlineOutcomeInto {
     Reply(usize),
     /// The send never left: the peer's cap is stale or its name does not currently resolve. Nothing
     /// is in flight. Reacquire by name and retry ONCE - this is the only safe retry.
-    ///
-    /// **One exception, recorded rather than hidden (26.7):** this rides `CallDeadline`, and every
-    /// `Err` from it lands here - INCLUDING `ReplyDead`, where the request WAS delivered and the peer
-    /// died holding it (8.6), so the work may have been done. A retry is then safe only for an
-    /// operation that is safe to repeat (a block read, a rewrite of the same sector). `gs::call`
-    /// keeps the two apart: `Error::PeerDied`, never re-sent, against `Error::Unreachable`.
     SendFailed,
+    /// The request WAS delivered, and the peer died holding it (`ReplyDead`, 8.6), so the work may
+    /// have been done. Re-send only an operation that is safe to repeat (a block read, a rewrite of
+    /// the same sector). It was folded into `SendFailed` until 2026-10-10 (`backlog/80` S3); `gs::call`
+    /// has kept the two apart all along, as `Error::PeerDied` against `Error::Unreachable`.
+    PeerDied,
     /// The peer's queue was full. The request did not leave either, but the peer is alive and busy.
     QueueFull,
     /// The request was delivered and no reply came in time. Do NOT re-send.
@@ -485,7 +484,9 @@ impl SpawnRequest {
         let mut n = 0usize;
         for (label, cap) in pairs {
             let lb = label.as_bytes();
-            if lb.is_empty() || lb.len() > 32 { return false; }
+            // The kernel's limit, `PEER_NAME_BYTES` (24): this accepted 32, and the kernel refused
+            // the spawn for a label it had been told was fine (`backlog/80` S5).
+            if lb.is_empty() || lb.len() > PEER_NAME_BYTES { return false; }
             if n + 1 + lb.len() + 2 > buf.len() { return false; }
             buf[n] = lb.len() as u8; n += 1;
             buf[n..n + lb.len()].copy_from_slice(lb); n += lb.len();
@@ -1057,22 +1058,30 @@ impl ServiceContext {
 
     /// Non-blocking receive on this service's primary recv endpoint: `Some(msg)` if a
     /// message was waiting, `None` if the queue is empty. A busy-polling driver uses this
-    /// to drain interrupt events (§12) each loop iteration without blocking. A receive ERROR
-    /// (a dead endpoint, a refused cap) also reads as `None`.
+    /// to drain interrupt events (§12) each loop iteration without blocking.
+    ///
+    /// A receive ERROR on this service's OWN endpoint (it is dead, or the cap was refused) is not an
+    /// empty queue: the service dies loudly, exactly as [`Self::recv`] does, so the supervisor
+    /// restarts it. It read as `None` until 2026-10-10, and a loop polling a dead endpoint spun on it
+    /// forever (`backlog/80` S5).
     pub fn try_recv(&self) -> Option<Message> {
         self.note_listening();
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return None; }
         let slot = data.recv_slot;
         if slot == u32::MAX { return None; }
-        let m = crate::ipc::try_recv(CapHandle(slot)).ok().flatten();
+        let m = match crate::ipc::try_recv(CapHandle(slot)) {
+            Ok(m) => m,
+            Err(e) => panic!("try_recv failed: {:?} - endpoint is gone; dying so the supervisor restarts us", e),
+        };
         if m.is_some() { self.count_recv(); }
         m
     }
 
     /// Block on this service's recv endpoint until a message arrives or `timeout_cycles`
     /// (cycle-counter ticks, the unit of `read_tsc` - convert with `duration_cycles`) elapse:
-    /// `Some(msg)` = message, `None` = timed out OR a receive error (the error is discarded).
+    /// `Some(msg)` = message, `None` = timed out. A receive ERROR on this service's own endpoint dies
+    /// loudly, as [`Self::recv`] and [`Self::try_recv`] do (`backlog/80` S5).
     /// `timeout_cycles == 0` blocks forever. The kernel turns the count into whole scheduler ticks
     /// (at least one), so the bound is never finer than one quantum. A driver uses this to idle on
     /// its hardware interrupt while still waking on a timer for auto-repeat (§12 timed-wait).
@@ -1086,7 +1095,10 @@ impl ServiceContext {
         if data.magic != SERVICE_CTX_MAGIC { return None; }
         let slot = data.recv_slot;
         if slot == u32::MAX { return None; }
-        let m = crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles).ok().flatten();
+        let m = match crate::ipc::recv_timeout(CapHandle(slot), timeout_cycles) {
+            Ok(m) => m,
+            Err(e) => panic!("recv_timeout failed: {:?} - endpoint is gone; dying so the supervisor restarts us", e),
+        };
         if m.is_some() { self.count_recv(); }
         m
     }
@@ -1106,8 +1118,10 @@ impl ServiceContext {
     /// needs no capability. A sleep under one quantum (10 ms) uses the arch's sub-tick timer where it
     /// has one (`hires_arm`), with a tick backstop; otherwise granularity is one scheduler quantum.
     /// Use for UI repaint pacing and "wait for child" loops - not for precise timing. On a 32-bit
-    /// target `cycles` is NOT clamped to the 32-bit ABI (see the note in `syscall.rs`).
+    /// target `cycles` is clamped to what one register carries, so a long sleep is shortened to the
+    /// longest the ABI can express rather than wrapping to a short one (`backlog/80` S5).
     pub fn sleep(&self, cycles: u64) {
+        let cycles = cycles.min(usize::MAX as u64);
         // SAFETY: syscall(37) = Sleep; sleeping your own task is unprivileged (like yield).
         let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
     }
@@ -1318,11 +1332,21 @@ impl ServiceContext {
         // yield more than 16, so this terminates without needing to trust the peer.
         for _ in 0..16 {
             match crate::ipc::try_recv(recv) {
-                Ok(Some(_)) => n += 1,
+                Ok(Some(_)) => { self.release_discarded_cap(); n += 1 }
                 _ => break,
             }
         }
         n
+    }
+
+    /// Give back a capability a DISCARDED message may have carried. A received `Message` does not
+    /// record its caps; the kernel queues them for `take_pending_cap`. Every caller claims a cap
+    /// straight after its own receive, so what is pending while a drain runs came with the message it
+    /// is discarding - and was leaked one table slot at a time until 2026-10-10 (`backlog/80` S5).
+    fn release_discarded_cap(&self) {
+        if let Some(c) = self.take_pending_cap() {
+            self.remove_cap(c);
+        }
     }
 
     /// Wait, bounded by `max_ms`, for up to `owed` replies to arrive in the reply MAILBOX, and discard
@@ -1337,7 +1361,7 @@ impl ServiceContext {
         let mut n = 0usize;
         while n < owed {
             match crate::ipc::try_recv(recv) {
-                Ok(Some(_)) => n += 1,
+                Ok(Some(_)) => { self.release_discarded_cap(); n += 1 }
                 _ => {
                     if self.read_tsc().wrapping_sub(t0) >= limit {
                         break;
@@ -1710,9 +1734,12 @@ impl ServiceContext {
     {
         let op = self.trace_in(peer, msg);
         let out = self.request_with_reply_call_err_inner(peer, msg, max_secs);
+        // A full queue is a busy peer, not a lost one - the ring said PEER_LOST for both until
+        // 2026-10-10, so `gs::trace` showed `gs::call`'s `Busy` as a lost peer (`backlog/80` S2).
         self.trace_out(peer, op, match &out {
             Ok(Some(_)) => crate::trace::KIND_REPLY,
             Ok(None)    => crate::trace::KIND_TIMEOUT,
+            Err(crate::ipc::IpcError::QueueFull) => crate::trace::KIND_QUEUE_FULL,
             Err(_)      => crate::trace::KIND_PEER_LOST,
         });
         out
@@ -1882,6 +1909,28 @@ impl ServiceContext {
         self.request_with_reply_keyhint(peer, msg, hint_after_secs, max_secs, Self::QUIT_KEYS, on_linger)
     }
 
+    /// [`Self::request_with_reply_qhint`] that HANDS BACK every key it reads that is not a quit key.
+    ///
+    /// A wait that watches the console for `q` has to read what is typed, and a key read is a key
+    /// taken: the plain form discards the rest, so whatever the operator typed ahead while it waited
+    /// was lost (`backlog/80` H16). This passes each one to `keep`, in order, for the caller to put
+    /// where its own input reader will find it first.
+    #[inline]
+    pub fn request_with_reply_qhint_keeping(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        on_linger: impl FnOnce(), keep: &dyn Fn(u8),
+    ) -> ReqOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_qhint_inner(
+            peer, msg, hint_after_secs, max_secs, Self::QUIT_KEYS, on_linger, |_| true, Some(keep));
+        self.trace_out(peer, op, match &out {
+            ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
+            ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
+            ReqOutcome::Timeout  => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
     /// The keys [`Self::request_with_reply_qhint`] leaves on: `q`, `Q` and Escape.
     pub const QUIT_KEYS: &'static [u8] = &[b'q', b'Q', 0x1b];
 
@@ -1896,7 +1945,7 @@ impl ServiceContext {
         leave_keys: &[u8], on_linger: impl FnOnce(),
     ) -> ReqOutcome {
         let op = self.trace_in(peer, msg);
-        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, |_| true);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, |_| true, None);
         self.trace_out(peer, op, match &out {
             ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
             ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
@@ -1921,7 +1970,7 @@ impl ServiceContext {
         mine: impl FnMut(&crate::ipc::Message) -> bool,
     ) -> ReqOutcome {
         let op = self.trace_in(peer, msg);
-        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine, None);
         self.trace_out(peer, op, match &out {
             ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
             ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
@@ -2006,8 +2055,9 @@ impl ServiceContext {
     /// `CallDeadline` does not have that failure: `call_dequeue` matches the reply BY ITS SENDER and
     /// leaves every other message queued, which is the entire reason §8.2 added it - hand-rolling the
     /// bounded wait out of send + recv is what lost messages. No new kernel surface: syscall 50 and
-    /// its semantics are existing, ratified law. `max_secs <= 0` reaches the kernel as 0, which
-    /// `CallDeadline` reads as NO deadline.
+    /// its semantics are existing, ratified law. `max_secs <= 0` is a one-second
+    /// bound, never none: the kernel reads a 0 as NO deadline, and a bounded call turning into an
+    /// unbounded one by a unit slip is the hang it exists to prevent (`backlog/80` S5).
     pub fn request_with_reply_call(&self, peer: &str, msg: &crate::ipc::Message, max_secs: i64)
         -> Option<crate::ipc::Message>
     {
@@ -2038,7 +2088,7 @@ impl ServiceContext {
             Some(c) => c,
             None    => return Err(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld)),
         };
-        let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
+        let secs = deadline_secs(max_secs);
         let mut buf = [0u8; crate::ipc::MAX_PAYLOAD];
         let n = msg.payload_bytes().len().min(buf.len());
         buf[..n].copy_from_slice(&msg.payload_bytes()[..n]);
@@ -2065,6 +2115,7 @@ impl ServiceContext {
         self.trace_out(peer, op, match &out {
             DeadlineOutcomeInto::Reply(_)   => crate::trace::KIND_REPLY,
             DeadlineOutcomeInto::SendFailed => crate::trace::KIND_PEER_LOST,
+            DeadlineOutcomeInto::PeerDied   => crate::trace::KIND_PEER_LOST,
             DeadlineOutcomeInto::QueueFull  => crate::trace::KIND_QUEUE_FULL,
             DeadlineOutcomeInto::Timeout    => crate::trace::KIND_TIMEOUT,
         });
@@ -2094,7 +2145,7 @@ impl ServiceContext {
             Some(c) => c,
             None => return DeadlineOutcomeInto::SendFailed,
         };
-        let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
+        let secs = deadline_secs(max_secs);
         let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
         // The kernel consumes the reply cap on a delivered call - and `Ok(None)` is a delivered call
         // whose deadline passed, so it is the peer's then too (backlog/67). On a failed send it is ours
@@ -2106,13 +2157,15 @@ impl ServiceContext {
                 self.remove_cap(reply_cap);
                 DeadlineOutcomeInto::QueueFull
             }
+            // Delivered: the reply cap went with the request, as on `Ok(None)` - nothing to reclaim.
+            Err(crate::ipc::IpcError::ReplyDead) => DeadlineOutcomeInto::PeerDied,
             Err(_) => { self.remove_cap(reply_cap); DeadlineOutcomeInto::SendFailed }
         }
     }
 
     /// Send `req` to `peer` and receive the reply into `buf`, bounded by `max_secs`; returns the
-    /// reply's length. `max_secs <= 0` is passed to the kernel as 0, which `CallDeadline` reads as NO
-    /// deadline - the wait is then unbounded.
+    /// reply's length. `max_secs <= 0` is a one-second bound, never an unbounded wait (see
+    /// `request_with_reply_call`).
     ///
     /// The by-value path costs 4 KiB for the request `Message`, 4 KiB for the reply `Message`, and
     /// 4 KiB again at every wrapper that forwards it. This costs none of that: the caller owns both
@@ -2168,7 +2221,7 @@ impl ServiceContext {
             None => (self.recv_handle()?, self.self_grant_handle()?),
         };
         let reply_cap = self.derive_cap(grant)?;
-        let secs = if max_secs <= 0 { 0 } else { max_secs as u64 };
+        let secs = deadline_secs(max_secs);
         let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
         // The kernel consumes the reply cap on a delivered call - and `Ok(None)` is a delivered call
         // whose deadline passed, so it is the peer's then too (backlog/67). On a failed send it is ours
@@ -2564,6 +2617,7 @@ impl ServiceContext {
         leave_keys: &[u8],
         on_linger: impl FnOnce(),
         mut mine: impl FnMut(&crate::ipc::Message) -> bool,
+        keep: Option<&dyn Fn(u8)>,
     ) -> ReqOutcome {
         // Drain any stale reply a prior INSTANT-abort left in our endpoint (see the abortable variant).
         while self.try_recv().is_some() {}
@@ -2606,6 +2660,8 @@ impl ServiceContext {
             }
             while let Some(b) = self.try_console_read() {
                 if leave_keys.contains(&b) { return ReqOutcome::Aborted; }
+                // Not a leave key: the operator's typing, handed back when the caller can keep it.
+                if let Some(k) = keep { k(b); }
             }
             let elapsed = self.epoch_secs_monotonic() - t0;
             if elapsed >= hint_after_secs {
@@ -3064,7 +3120,10 @@ impl ServiceContext {
     pub fn inspect_core_count(&self) -> u32 {
         // SAFETY: syscall(13) = InspectKernel; query_id=8.
         let ret = unsafe { raw_syscall(13, 8, 0, 0) };
-        if ret <= 0 { 1 } else { ret as u32 }
+        // A refusal or an error is NOT "one core": it said 1 until 2026-10-10, so a caller without
+        // INTROSPECT reported a one-core machine (`backlog/80` H20). 0 is "the kernel did not say", and
+        // a caller must not present it as a count.
+        if ret <= 0 { 0 } else { ret as u32 }
     }
 
     /// Terminal geometry as `(rows, cols)` text cells, or `(0, 0)` if it cannot be determined.
@@ -3942,36 +4001,31 @@ impl ServiceContext {
 
     /// Write a string to serial WITHOUT a trailing newline (syscall 22, requires the
     /// log_write cap). For inline output such as the shell prompt, where `log`'s newline
-    /// would push the user's typed echo to the next line. A string over 256 bytes is
-    /// DROPPED whole, with no marker (unlike `log`, which truncates).
+    /// would push the user's typed echo to the next line. A string longer than the kernel's 256-byte
+    /// limit is written in pieces, each ending on a character boundary - it was dropped whole, with
+    /// no marker, until 2026-10-10 (`backlog/80` S5).
     pub fn print(&self, msg: &str) {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return; }
         let slot = data.log_write_slot;
         if slot == u32::MAX { return; }
-
-        let bytes = msg.as_bytes();
-        let len   = bytes.len();
-        if len == 0 || len > 256 { return; }
-
-        // SAFETY: syscall(22) = Print; bytes is a valid slice within user space.
-        unsafe {
-            raw_syscall(22, slot as u64, bytes.as_ptr() as u64, len as u64);
+        for piece in Pieces::new(msg, CONSOLE_WRITE_MAX) {
+            // SAFETY: syscall(22) = Print; `piece` is a valid slice within user space, at most
+            // CONSOLE_WRITE_MAX bytes.
+            unsafe {
+                raw_syscall(22, slot as u64, piece.as_ptr() as u64, piece.len() as u64);
+            }
         }
     }
 
-    /// Log a formatted message, rendered into a 256-byte stack buffer. Output past 256 bytes is
-    /// cut WITHOUT a marker, and a cut that splits a UTF-8 character logs `(fmt error)` instead of
-    /// the message.
+    /// Log a formatted message, rendered into a 256-byte stack buffer. A message longer than that is
+    /// cut on a character boundary and ends `...`, so the cut is visible (`backlog/80` S5: it was cut
+    /// with no marker, and a cut through a character logged `(fmt error)` instead of the message).
     pub fn log_fmt(&self, args: core::fmt::Arguments) {
-        let mut buf    = [0u8; 256];
-        let mut cursor = 0usize;
-        let _ = core::fmt::write(
-            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
-            args,
-        );
-        if cursor > 0 {
-            self.log(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
+        let mut buf = [0u8; FMT_MAX];
+        let s = render(&mut buf, args);
+        if !s.is_empty() {
+            self.log(s);
         }
     }
 
@@ -3986,13 +4040,14 @@ impl ServiceContext {
         let slot = data.log_write_slot;
         if slot == u32::MAX { return; }
 
-        let bytes = msg.as_bytes();
-        let len   = bytes.len();
-        if len == 0 || len > 256 { return; }
-
-        // SAFETY: syscall(23) = ConsoleWrite; bytes is a valid slice within user space.
-        unsafe {
-            raw_syscall(23, slot as u64, bytes.as_ptr() as u64, len as u64);
+        // Longer than the kernel takes in one call: written in pieces on character boundaries, never
+        // dropped (`backlog/80` S5).
+        for piece in Pieces::new(msg, CONSOLE_WRITE_MAX) {
+            // SAFETY: syscall(23) = ConsoleWrite; `piece` is a valid slice within user space, at
+            // most CONSOLE_WRITE_MAX bytes.
+            unsafe {
+                raw_syscall(23, slot as u64, piece.as_ptr() as u64, piece.len() as u64);
+            }
         }
     }
 
@@ -4005,28 +4060,14 @@ impl ServiceContext {
     /// Write a formatted message to the interactive console, with **no** trailing
     /// newline (e.g. a pager status line the cursor should park on).
     pub fn console_write_fmt(&self, args: core::fmt::Arguments) {
-        let mut buf    = [0u8; 256];
-        let mut cursor = 0usize;
-        let _ = core::fmt::write(
-            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
-            args,
-        );
-        if cursor > 0 {
-            self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
-        }
+        let mut buf = [0u8; FMT_MAX];
+        self.console_write(render(&mut buf, args));
     }
 
     /// Write a formatted message to the interactive console, followed by a newline.
     pub fn console_writeln_fmt(&self, args: core::fmt::Arguments) {
-        let mut buf    = [0u8; 256];
-        let mut cursor = 0usize;
-        let _ = core::fmt::write(
-            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
-            args,
-        );
-        if cursor > 0 {
-            self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
-        }
+        let mut buf = [0u8; FMT_MAX];
+        self.console_write(render(&mut buf, args));
         self.console_write("\n");
     }
 
@@ -4042,15 +4083,8 @@ impl ServiceContext {
 
     /// Formatted variant of [`Self::console_line`].
     pub fn console_line_fmt(&self, clear_eol: bool, args: core::fmt::Arguments) {
-        let mut buf    = [0u8; 256];
-        let mut cursor = 0usize;
-        let _ = core::fmt::write(
-            &mut StackWriter { buf: &mut buf, pos: &mut cursor },
-            args,
-        );
-        if cursor > 0 {
-            self.console_write(core::str::from_utf8(&buf[..cursor]).unwrap_or("(fmt error)"));
-        }
+        let mut buf = [0u8; FMT_MAX];
+        self.console_write(render(&mut buf, args));
         self.console_write(if clear_eol { "\x1b[K\n" } else { "\n" });
     }
 
@@ -4075,7 +4109,12 @@ impl ServiceContext {
     /// can still spawn anything the kernel still owns - which is `supervisor` alone now.
     pub fn spawn_on(&self, name: &str, core: u32) -> Result<(), crate::Error> {
         if self.find_send_slot("supervisor").is_some() {
-            return self.spawn_via_supervisor(name, core, &[]).map(|_| ());
+            // The supervisor hands back a cap to the new service's endpoint. This path does not keep
+            // it, so it is released here - `map(|_| ())` dropped the handle and leaked one table slot per
+            // spawn (`backlog/80`, found during H20).
+            return self.spawn_via_supervisor(name, core, &[]).map(|cap| {
+                if let Some(c) = cap { self.remove_cap(c); }
+            });
         }
         self.spawn_on_kernel(name, core)
     }
@@ -4084,15 +4123,11 @@ impl ServiceContext {
     /// the service has no recv endpoint, or the cap could not be taken).
     ///
     /// The supervisor is RESTARTABLE (6.2), so a cached cap to it goes stale on every respawn. This
-    /// reacquires by name and retries ONCE on `Err` - usually the send itself failed, so the peer is
-    /// gone - and never on `Ok(None)`, where the deadline passed and the request may well have landed
-    /// (retrying a possibly-delivered spawn would start the service twice).
-    ///
-    /// **Not yet true of every `Err`, recorded rather than hidden (26.7):** `Err(ReplyDead)` means the
-    /// supervisor received the request and died before answering, so the spawn may have happened, and
-    /// the retry below re-sends it anyway. That is the double spawn the sentence above refuses, in the
-    /// narrow window of a supervisor dying mid-spawn. `gs::call` already separates the two
-    /// (`Error::PeerDied`); this path does not yet.
+    /// reacquires by name and retries ONCE when the send NEVER LEFT - a stale cap - and never when it
+    /// was delivered: not on `Ok(None)`, where the deadline passed, and not on `ReplyDead`, where the
+    /// supervisor died holding it. Either may have started the service, and retrying would start it
+    /// twice. (`ReplyDead` was retried until 2026-10-10, `backlog/80` S1.) A full queue is not retried
+    /// either: the supervisor is alive and busy, and the caller decides whether to ask again.
     pub fn spawn_via_supervisor(&self, name: &str, core: u32, peers: &[&str])
         -> Result<Option<CapHandle>, crate::Error>
     {
@@ -4111,6 +4146,8 @@ impl ServiceContext {
                     return Err(crate::Error::InvalidArgument);
                 }
                 Ok(None) => return Err(crate::Error::InvalidArgument),
+                Err(crate::ipc::IpcError::ReplyDead) | Err(crate::ipc::IpcError::QueueFull) =>
+                    return Err(crate::Error::InvalidArgument),
                 Err(_) if attempt == 0 => { let _ = self.reacquire_by_name("supervisor"); }
                 Err(_) => return Err(crate::Error::InvalidArgument),
             }
@@ -4299,28 +4336,29 @@ impl ServiceContext {
         let ret = unsafe {
             raw_syscall(8, bytes.as_ptr() as u64, bytes.len() as u64, 0)
         };
-        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
+        // The kernel says which failure it was, and so does this (`backlog/80` S4): -2 is the
+        // `SERVICE_CONTROL` refusal, anything else is no running service of that name (or a name
+        // the kernel could not read). Every one used to come back as `InvalidArgument`.
+        match ret {
+            0 => Ok(()),
+            -2 => Err(crate::Error::Cap(CapError::CapNotHeld)),
+            _ => Err(crate::Error::NotFound),
+        }
     }
 
-    /// Kill then respawn a service with optional core override (§14.4). The kill's result is
-    /// DISCARDED, including a `SERVICE_CONTROL` refusal, so the spawn runs either way.
+    /// Kill then respawn a service with optional core override (§14.4).
+    ///
+    /// A service that is not running is simply started - that is `NotFound` from the kill, and the
+    /// one kill failure that is passed over. A refusal (no `SERVICE_CONTROL`) is returned, and
+    /// nothing is spawned: until 2026-10-10 the kill's result was discarded, so a caller without the
+    /// authority to kill went on to spawn a second copy (`backlog/80` S4, CLAUDE.md 13.6).
     pub fn restart(&self, name: &str, core_override: Option<u32>) -> Result<(), crate::Error> {
-        let _ = self.kill(name); // ignore error if service is already dead
+        match self.kill(name) {
+            Ok(()) | Err(crate::Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
         let core = core_override.unwrap_or(0xFFFF);
         self.spawn_on(name, core)
-    }
-
-    /// Does nothing, and nothing calls it. §11.4 makes non-drainage of the kernel ring the design:
-    /// every log line is already on serial, and logging must not depend on a service being up.
-    pub fn drain_kernel_ring_buffer(&self) {
-        // Ring buffer is already mirrored to serial at all times (§11.4).
-        // Nothing additional needed until `events` has a dedicated drain syscall.
-    }
-
-    /// `recv` under an older name; nothing calls it. No log line travels over IPC (§11.4), so what
-    /// arrives is whatever the next message on this service's endpoint is.
-    pub fn recv_log_message(&self) -> Message {
-        self.recv()
     }
 
     // ---------------------------------------------------------------------------
@@ -4371,17 +4409,87 @@ impl ServiceContext {
 struct StackWriter<'a> {
     buf: &'a mut [u8],
     pos: &'a mut usize,
+    /// Set when something did not fit, so the result can say it was cut.
+    cut: bool,
 }
 
 impl<'a> core::fmt::Write for StackWriter<'a> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
         let space = self.buf.len().saturating_sub(*self.pos);
-        let n     = bytes.len().min(space);
-        self.buf[*self.pos .. *self.pos + n].copy_from_slice(&bytes[..n]);
+        // Never split a character: what is kept is always valid UTF-8.
+        let mut n = s.len().min(space);
+        while n > 0 && !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        if n < s.len() {
+            self.cut = true;
+        }
+        self.buf[*self.pos .. *self.pos + n].copy_from_slice(&s.as_bytes()[..n]);
         *self.pos += n;
         Ok(())
     }
+}
+
+/// The most one formatted line renders to, on the stack.
+const FMT_MAX: usize = 256;
+/// The most the kernel takes in one `Print` or `ConsoleWrite` call.
+const CONSOLE_WRITE_MAX: usize = 256;
+
+/// Render `args` into `buf`. A rendering that did not fit ends `...` in place of its last bytes, on a
+/// character boundary, so a reader can see it was cut.
+fn render<'b>(buf: &'b mut [u8; FMT_MAX], args: core::fmt::Arguments) -> &'b str {
+    let mut pos = 0usize;
+    let cut = {
+        let mut w = StackWriter { buf: &mut buf[..], pos: &mut pos, cut: false };
+        let _ = core::fmt::write(&mut w, args);
+        w.cut
+    };
+    if cut {
+        let mut end = FMT_MAX - 3;
+        while end > 0 && core::str::from_utf8(&buf[..end]).is_err() {
+            end -= 1;
+        }
+        buf[end..end + 3].copy_from_slice(b"...");
+        pos = end + 3;
+    }
+    core::str::from_utf8(&buf[..pos]).unwrap_or("")
+}
+
+/// A string in pieces of at most `max` bytes, each ending on a character boundary.
+struct Pieces<'s> {
+    rest: &'s str,
+    max: usize,
+}
+
+impl<'s> Pieces<'s> {
+    fn new(s: &'s str, max: usize) -> Self {
+        Pieces { rest: s, max }
+    }
+}
+
+impl<'s> Iterator for Pieces<'s> {
+    type Item = &'s [u8];
+    fn next(&mut self) -> Option<&'s [u8]> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let mut n = self.rest.len().min(self.max);
+        while n > 0 && !self.rest.is_char_boundary(n) {
+            n -= 1;
+        }
+        if n == 0 {
+            return None;
+        }
+        let (head, tail) = self.rest.split_at(n);
+        self.rest = tail;
+        Some(head.as_bytes())
+    }
+}
+
+/// The seconds a `CallDeadline` is given for a caller's `max_secs`. Never 0, which the kernel reads
+/// as NO deadline: a non-positive bound is the shortest real one, not the absence of one.
+fn deadline_secs(max_secs: i64) -> u64 {
+    if max_secs <= 0 { 1 } else { max_secs as u64 }
 }
 
 // ---------------------------------------------------------------------------

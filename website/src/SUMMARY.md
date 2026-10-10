@@ -65,6 +65,7 @@
   - [`wifi`](utilities/wifi.md)
   - [`audio`](utilities/audio.md)
   - [`hardware`](utilities/hardware.md)
+  - [`spawncap`](utilities/spawncap.md)
   - [`sock`](utilities/sock.md)
   - [`tcp`](utilities/tcp.md)
   - [`serve`](utilities/serve.md)

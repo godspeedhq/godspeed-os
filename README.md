@@ -100,7 +100,7 @@ module serves none of the six.
 ## Portability
 
 One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in
-`arch/<isa>/`. Adding an ISA is bounded to that directory plus the eleven registration files
+`arch/<isa>/`. Adding an ISA is bounded to that directory plus the twelve registration files
 `docs/porting.md` marks; every `osdev build` refuses neutral code that reaches hardware outside the seam.
 
 | target | status |
@@ -272,7 +272,7 @@ py scripts/conform.py --explain GS0403
 py scripts/conform.py --list
 ```
 
-A clean tree says `0 would be fixed, 0 need a decision - 24 checks ran, 24 passed`. The count of checks
+A clean tree says `0 would be fixed, 0 need a decision - N checks ran, N passed`. The count of checks
 that RAN is there on purpose: a run that silently skipped twelve of them and printed a clean verdict is
 the failure the whole thing exists to prevent.
 
@@ -369,7 +369,7 @@ API references under `/api`:
 Two sections worth knowing about:
 [**the services**](https://godspeedhq.github.io/godspeed-os/services.html) - what each one is, what it
 may *not* do, and diagrams of how they reach each other over endpoints - and
-[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), all 58 of them, each with
+[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), all 59 of them, each with
 its full specification.
 
 The docs in this repo also render as a browsable site built with

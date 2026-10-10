@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The test-probe parameter table - 193 probes, ONE program.
 //!
 //! This table used to live in `kernel/src/task/mod.rs`, as 193 `service_config` rows: the same
