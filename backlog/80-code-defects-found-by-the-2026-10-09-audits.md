@@ -98,7 +98,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
 - **K17. x86 `route_ehci_intx` always targets the BSP while `EHCI_CORE` is 3**, so each wake crosses cores
   (unverified on hardware). **Possible:** a line masked at a driver's death is not unmasked by `register`;
   whether a respawned level-triggered `ehci` unmasks before its first interrupt is unverified.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** every spawn of `ehci` re-aims its INTx candidates' IOAPIC entries at the spawned core (`ioapic::set_dest`, the destination only). Needs a T630 card: the back-port keyboard must still type, and the boot log says the candidates were re-aimed.
+  **FIXED on `fix/backlog-80`, 2026-10-10:** every spawn of `ehci` re-aims its INTx candidates' IOAPIC entries at the spawned core (`ioapic::set_dest`, the destination only). **T630 card 2026-10-10:** the back-port keyboard types, and `ehci: legacy INTx candidates re-aimed at core 3` is logged at boot and on each of eight respawns (`chaos kill-storm ehci 4`, twice, 8 of 8 recovered); `selfcheck` 534 passed, 0 failed. The interrupt itself is still not seen on this board - `ehci` falls back to polling, as `backlog/11` already records - so the card shows the re-aim does no harm, not that INTx now arrives.
 - **K18. InspectKernel's ungated list still names deleted queries 9 and 22**, and INTROSPECT refusals return
   data-like zeros. Harmless today, wrong in an authority list.
   **FIXED on `fix/backlog-80`, 2026-10-10:** the ungated list names only queries that exist; the seven gated figures (frames, a core's ticks, a task's endpoints, the endpoint count) are `Option` in the SDK, and the shell and `observe` say "unknown" or refuse instead of drawing zeroes.
@@ -243,7 +243,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   Linux's QH_HUBPORT mask (0x3f800000) put Port Number at [29:23] and Hub Address at [22:16], so port 1 sets the
   hub address's top bit and reads as port 0. Its keyboard is recorded as hardware-verified, so which port
   that run used matters. Fix: `<< 23`.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** port number in bits 29:23, as Linux writes it. Needs a T630 card: a keyboard on an odd and an even hub port.
+  **FIXED on `fix/backlog-80`, 2026-10-10:** port number in bits 29:23, as Linux writes it. **T630 card 2026-10-10, half:** a keyboard on hub port 4 (even) enumerates and types (`ehci: SPLIT device (hub port 4)`), across eight respawns. An odd port is still owed.
 - **D2. `nic-driver` drives any class-0x020000 NIC that is not an RTL8168 as an e1000**, with no vendor or
   device check. Fix: check the e1000 IDs; refuse with a status otherwise.
   **FIXED on `fix/backlog-80`, 2026-10-10:** drives only the 82540EM (`8086:100e`) and names any other NIC; no new arch-conditional site.
