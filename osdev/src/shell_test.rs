@@ -1730,6 +1730,31 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("drives flash") && r.contains("drives flash 0 data"), "subcommand help: drives flash help + example"),
         None    => { println!("shell-test: FAIL - timed out after `drives flash help`"); fail += 1; }
     }
+    // backlog/80 H8: seven commands answered a command and not `help` / `version`. `fmt help` read
+    // "help" as a PATH, `tcp version` printed the usage, and `whatis` called all seven unknown.
+    send(&mut write_half, b"fmt help\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("fmt check <path>") && !r.contains("not found"), "fmt help: the help block, not a path called help (H8)"),
+        None    => { println!("shell-test: FAIL - timed out after `fmt help`"); fail += 1; }
+    }
+    send(&mut write_half, b"tcp version\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("tcp {ver}")) && !r.contains("usage: tcp"), "tcp version: the version, not the usage (H8)"),
+        None    => { println!("shell-test: FAIL - timed out after `tcp version`"); fail += 1; }
+    }
+    send(&mut write_half, b"whatis spawncap\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("spawncap: shell built-in"), "whatis spawncap: a shell built-in, not unknown (H8)"),
+        None    => { println!("shell-test: FAIL - timed out after `whatis spawncap`"); fail += 1; }
+    }
+    // backlog/80 H2: the refusal named three targets while the gate held eleven.
+    send(&mut write_half, b"chaos kill-storm nosuch\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("not a kill-storm target") && r.contains("net-stack") && r.contains("dwc2")
+                          && !r.contains("only supervisor/block-driver/fs"),
+                          "chaos kill-storm: a refused target lists the real targets, from the array (H2)"),
+        None    => { println!("shell-test: FAIL - timed out after `chaos kill-storm nosuch`"); fail += 1; }
+    }
     // Record-pipe verbs self-document too (utilities/31_records.md): they are pipe-only
     // stages, but `<verb> help` / `<verb> version` still resolve via the UTILS intercept.
     send(&mut write_half, b"where help\r");
@@ -2210,6 +2235,22 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
             check!(r.contains("data"), "drives: label 'data' shown");
         }
         None => { println!("drives-test: FAIL - timed out after `drives` (2)  [×2]"); fail += 2; }
+    }
+
+    // 3b. A word selector must BE the drive's label (backlog/80 H15). `drives flash typo data` used to
+    //     take `typo` unread as drive 0's label and, after the [y/N], erase it. It must be refused
+    //     before the confirm, naming the label the drive really has; the real label still selects it.
+    send(&mut write_half, b"drives flash typo data\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("no drive labelled 'typo' - drive 0 is labelled 'data'") && !r.contains("[y/N]"),
+                          "flash: a word that is not the drive's label is refused, before the erase confirm"),
+        None    => { println!("drives-test: FAIL - timed out after `drives flash typo data`"); fail += 1; }
+    }
+    send(&mut write_half, b"drives check data\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => check!(!r.contains("no drive labelled") && r.contains("check: ") && r.contains("files"),
+                          "check: the drive's own label still selects it"),
+        None    => { println!("drives-test: FAIL - timed out after `drives check data`"); fail += 1; }
     }
 
     // 4. `drives label archive` - rename, then confirm it stuck.
@@ -4113,6 +4154,27 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     match run!(b"assert fails delete /nowhere\r", 10) {
         Some(r) => check!(r.contains("assert: ok"), "result: delete of a missing path is Err"),
         None    => { println!("files-test: FAIL - assert fails delete timeout"); fail += 1; }
+    }
+    // backlog/80 H10/H20: a comma list returned Ok whatever its items did, and dropped items past 16.
+    match run!(b"assert fails delete /nowhere1,/nowhere2\r", 10) {
+        Some(r) => check!(r.contains("assert: ok") && r.contains("2 of 2 failed"), "comma list: failing items make the list an Err, counted (H10)"),
+        None    => { println!("files-test: FAIL - comma-list delete timeout"); fail += 1; }
+    }
+    match run!(b"mkdir /l1,/l2,/l3,/l4,/l5,/l6,/l7,/l8,/l9,/l10,/l11,/l12,/l13,/l14,/l15,/l16,/l17\r", 10) {
+        Some(r) => check!(r.contains("17 items") && r.contains("nothing was done") && !r.contains("created /l1"),
+                          "comma list: 17 items refused before anything runs (H10)"),
+        None    => { println!("files-test: FAIL - 17-item mkdir timeout"); fail += 1; }
+    }
+    // backlog/80 H19: a missing start path was "INCOMPLETE ... too large", 0 matches, and Ok.
+    match run!(b"assert fails find x /no/such/start\r", 10) {
+        Some(r) => check!(r.contains("assert: ok") && r.contains("not a directory") && !r.contains("too large"),
+                          "find: a missing start path is refused as such (H19)"),
+        None    => { println!("files-test: FAIL - find missing start timeout"); fail += 1; }
+    }
+    // backlog/80 H21: `read` on a directory said "not found".
+    match run!(b"read /\r", 10) {
+        Some(r) => check!(r.contains("is a directory") && !r.contains("not found"), "read: a directory is named as one (H21)"),
+        None    => { println!("files-test: FAIL - read / timeout"); fail += 1; }
     }
     // and `result` reflects a converted command directly.
     let _ = run!(b"dir /nowhere\r", 10);
