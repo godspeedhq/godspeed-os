@@ -423,6 +423,25 @@ def lost(name, source):
     MISSING.append((name, source))
 
 
+def limine_version_problems():
+    """Every workflow fetches the Limine release.yml ships. Three pinned v12.2.0 while the release built
+    with v12.3.1, so the QEMU suites in CI tested a bootloader nobody ships (backlog/80 T9)."""
+    import glob
+    wf = os.path.join(ROOT, ".github", "workflows")
+    m = re.search(r"(?m)^\s*LIMINE_VERSION:\s*(v[0-9.]+)", read(".github/workflows/release.yml"))
+    if not m:
+        return ["limine: no LIMINE_VERSION in .github/workflows/release.yml - the shipped version is "
+                "what every other workflow is held to, so it must be readable"]
+    want = m.group(1)
+    out = []
+    for p in sorted(glob.glob(os.path.join(wf, "*.yml"))):
+        rel = os.path.relpath(p, ROOT).replace(os.sep, "/")
+        for v in sorted(set(re.findall(r"limine/releases/download/(v[0-9.]+)/", read(rel)))):
+            if v != want:
+                out.append("limine: %s fetches %s, release.yml ships %s" % (rel, v, want))
+    return out
+
+
 def facts():
     out = []
 
@@ -666,7 +685,8 @@ def main():
     tree = (porting_tree_problems() + budget_ordering_problems() + wire_format_problems()
             + help_coverage_problems() + util_help_coverage_problems()
             + dispatch_utils_problems()
-            + help_philosophy_problems())
+            + help_philosophy_problems()
+            + limine_version_problems())
     for name, truth, source, pats in facts():
         if not pats:
             bad.append((name, source, "", "", ""))
