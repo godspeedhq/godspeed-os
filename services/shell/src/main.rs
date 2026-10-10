@@ -22977,9 +22977,13 @@ fn split_drive_value<'a>(args: &[&'a str], argc: usize) -> (&'a str, &'a str) {
     }
 }
 
-/// Validate a drive selector for the single attached drive (step 3). Accepts empty,
-/// `0`, or a label; rejects a numeric index other than 0 with a teaching message.
-fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
+/// Validate a drive selector for the single attached drive (step 3). Accepts empty, `0`, or
+/// the drive's OWN label; rejects any other number or word with a sentence.
+///
+/// A word selector is COMPARED with the label `fs` reports. It used to be accepted unread, so
+/// `drives flash typo data` - a mistyped label - selected drive 0 and, after the `[y/N]`, erased it
+/// (`backlog/80` H15). A destructive command must not act on a name nothing matched.
+fn drive_sel_ok(ctx: &ShellCtx, sel: &str) -> bool {
     if sel.is_empty() || sel == "0" {
         return true;
     }
@@ -22987,7 +22991,49 @@ fn drive_sel_ok(ctx: &ServiceContext, sel: &str) -> bool {
         gs::io::println_fmt(ctx, format_args!("drives: no drive {} - only drive 0 is attached", sel));
         return false;
     }
-    true // a label selector - single drive, accept
+    let mut lbuf = [0u8; LABEL_MAX];
+    match drive0_label(ctx, &mut lbuf) {
+        Some(Some(n)) if &lbuf[..n] == sel.as_bytes() => true,
+        Some(Some(n)) if n > 0 => {
+            gs::io::println_fmt(ctx, format_args!(
+                "drives: no drive labelled '{}' - drive 0 is labelled '{}' (or select it as 0)",
+                sel, core::str::from_utf8(&lbuf[..n]).unwrap_or("?")));
+            false
+        }
+        Some(Some(_)) => {
+            gs::io::println_fmt(ctx, format_args!(
+                "drives: no drive labelled '{}' - drive 0 has no label (select it as 0)", sel));
+            false
+        }
+        Some(None) => {
+            gs::io::println_fmt(ctx, format_args!(
+                "drives: no drive labelled '{}' - drive 0 is not formatted, so it has no label (select it as 0)", sel));
+            false
+        }
+        None => {
+            gs::io::println_fmt(ctx, format_args!(
+                "drives: cannot check that '{}' is drive 0's label - storage did not answer; nothing was done", sel));
+            false
+        }
+    }
+}
+
+/// Drive 0's label as `fs` reports it (`OP_DRIVES_INFO`): `Some(Some(len))` with the label in `out`
+/// when the drive is formatted, `Some(None)` when it is not (or absent), `None` when `fs` gave no
+/// usable answer.
+fn drive0_label(ctx: &ShellCtx, out: &mut [u8; LABEL_MAX]) -> Option<Option<usize>> {
+    drain_stale_fs_replies(ctx);
+    let reply = fs_raw(ctx, &[OP_DRIVES_INFO], FS_ANSWER_SECS)?;
+    let p = reply.payload_bytes();
+    if p.first() != Some(&FS_OK) || p.len() < 28 {
+        return None;
+    }
+    if p[1] == 0 || u64_le(&p[2..10]) == 0 {
+        return Some(None);
+    }
+    let ll = (p[27] as usize).min(LABEL_MAX).min(p.len() - 28);
+    out[..ll].copy_from_slice(&p[28..28 + ll]);
+    Some(Some(ll))
 }
 
 

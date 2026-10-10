@@ -2195,6 +2195,22 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("drives-test: FAIL - timed out after `drives` (2)  [×2]"); fail += 2; }
     }
 
+    // 3b. A word selector must BE the drive's label (backlog/80 H15). `drives flash typo data` used to
+    //     take `typo` unread as drive 0's label and, after the [y/N], erase it. It must be refused
+    //     before the confirm, naming the label the drive really has; the real label still selects it.
+    send(&mut write_half, b"drives flash typo data\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
+        Some(r) => check!(r.contains("no drive labelled 'typo' - drive 0 is labelled 'data'") && !r.contains("[y/N]"),
+                          "flash: a word that is not the drive's label is refused, before the erase confirm"),
+        None    => { println!("drives-test: FAIL - timed out after `drives flash typo data`"); fail += 1; }
+    }
+    send(&mut write_half, b"drives check data\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(20)) {
+        Some(r) => check!(!r.contains("no drive labelled") && r.contains("check: ") && r.contains("files"),
+                          "check: the drive's own label still selects it"),
+        None    => { println!("drives-test: FAIL - timed out after `drives check data`"); fail += 1; }
+    }
+
     // 4. `drives label archive` - rename, then confirm it stuck.
     send(&mut write_half, b"drives label archive\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)) {
