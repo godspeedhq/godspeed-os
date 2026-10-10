@@ -655,7 +655,7 @@ impl Dwmac {
         // temporary experiment becomes a permanent setting nobody remembers choosing - and this one
         // disables the very mechanism whose innocence it is testing.
         if self.m.read32(GMAC_PACKET_FILTER) & GMAC_PACKET_FILTER_PR != 0 {
-            ctx.log("nic-driver: dwmac PROMISCUOUS - the address filter is OFF for this image only, to                      settle whether it is what drops our unicast. This is NOT a setting.");
+            ctx.log("nic-driver: dwmac PROMISCUOUS - the address filter is OFF for this image only, to settle whether it is what drops our unicast. This is NOT a setting.");
         }
     }
 
@@ -709,7 +709,8 @@ impl Dwmac {
     /// every fault counter is zero AND `OCTETCOUNT_G` is zero while `OCTETCOUNT_GB` counts, the
     /// good-side counters are unpopulated in this part and the whole thread closes for good.
     ///
-    /// Read-only. (Note 2026-10-09: nothing calls this today, so it is reported nowhere.)
+    /// Read-only. Reported beside the first transmits' counters (`dwmac.rs`); nothing called it until
+    /// 2026-10-10 (backlog/80 D11).
     pub fn tx_fault_counters(&self) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
         (
             self.m.read32(MMC_TX_SINGLECOL_G),

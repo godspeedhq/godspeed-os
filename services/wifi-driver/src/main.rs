@@ -899,7 +899,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     cores.report(&ctx);
                 }
                 None => ctx.log(
-                    "wifi-driver: the core table could not be walked, so phase 2 has no address to                      write firmware to. Everything through stage 7 stands - the chip is identified and                      its backplane reads",
+                    "wifi-driver: the core table could not be walked, so phase 2 has no address to write firmware to. Everything through stage 7 stands - the chip is identified and its backplane reads",
                 ),
             }
 

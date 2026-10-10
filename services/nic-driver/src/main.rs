@@ -832,6 +832,24 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
 /// Serve the frame interface. A 1-byte `[3]` STATUS query gets `sreply` ([ok, mac(6), link]) back - the
 /// `net` nic-mac diagnostic. Every other request (a frame from net-stack) gets a one-byte `[1]`, so
 /// net-stack degrades rather than hangs (§26.7). Never returns.
+/// The one e1000 this driver knows, as `nic_vendor_device` reports it (device << 16 | vendor): the
+/// Intel 82540EM, QEMU's `e1000`.
+const E1000_82540EM: u32 = 0x100E_8086;
+
+/// The granted register window, if the controller behind it is the e1000 this driver knows - and,
+/// when it is not, a line naming what it is instead (backlog/80 D2). It asks the DEVICE, so it needs
+/// no ISA test: only x86 reaches the e1000 path, every other port's backend having diverged first.
+fn known_e1000(ctx: &ServiceContext, mmio: Option<godspeed_sdk::Mmio>) -> Option<godspeed_sdk::Mmio> {
+    let vd = ctx.nic_vendor_device();
+    if mmio.is_some() && vd != E1000_82540EM {
+        ctx.log_fmt(format_args!(
+            "nic-driver: the network controller is {:04x}:{:04x}, which this driver does not know (it drives the Intel 82540EM, 8086:100e, and the Realtek RTL8168, 10ec:8168) - not driving it",
+            vd & 0xFFFF, vd >> 16));
+        return None;
+    }
+    mmio
+}
+
 fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
@@ -1290,8 +1308,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //   * The x86 arm asks the DEVICE (`nic_vendor_device()`, a PCI identity the kernel discovered at
     //     runtime). Put a third NIC in that machine and the kernel hands it to this service without a
     //     rebuild - the shape `hw_pci_class = "020000"` in the contract exists to enable (step D). This
-    //     service then drives it only if it is one of the two it knows: anything that is not the
-    //     RTL8168 is driven as an e1000, unchecked (see the e1000 path below).
+    //     service then drives it only if it is one of the two it knows, and says so for anything
+    //     else (see the e1000 path below).
     //   * The other three ask the ISA, because their MAC is on the SoC and there is nothing to ask.
     //     A SoC MAC has no enumerable identity: no bus to scan, no vendor/device pair, and probing a
     //     version register means reading an address that may not be a register at all on the next
@@ -1331,10 +1349,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 
     // --- Intel e1000 path. The kernel maps the BAR + DMA arena of whatever ethernet controller
-    // (PCI class 0x020000) it found, and this path drives it as an e1000 WITHOUT checking the identity:
-    // anything that is not the RTL8168 above lands here. With no window or arena we still SERVE the
-    // frame interface - with empty replies - so net-stack degrades instead of hanging on a reply (§26.7).
-    let mmio  = ctx.mmio();
+    // (PCI class 0x020000) it found, and this path drives it ONLY if it is the part this code was
+    // written and tested against: the 82540EM, `8086:100E`, QEMU's `e1000`. Until 2026-10-10 anything
+    // that was not the RTL8168 above was driven as an e1000 unchecked (backlog/80 D2) - an e1000e or a
+    // NIC of another maker would have been programmed with registers it does not have. Anything else
+    // is now NOT driven, and said so with its identity. With no window, no arena or an unknown part we
+    // still SERVE the frame interface - with empty replies, link down - so net-stack degrades instead of
+    // hanging on a reply (§26.7).
+    let mmio = known_e1000(&ctx, ctx.mmio());
     let arena = ctx.dma_region();
 
     // NOTE: there is deliberately no `active` boolean here any more. It was a second copy of a fact
