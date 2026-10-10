@@ -35,6 +35,12 @@ so you learn the *rule*, see it enforced in code, and learn the failure it preve
 | `driver-skeleton` | A userspace driver (MMIO/DMA/IRQ), `unsafe`-free | **I** + **X** (a driver is a service; `unsafe` isolated to the SDK), **VII** (only the granted MMIO + IRQ), **VI** (an owned DMA arena), **V** + **IX** (restartable, re-inits on spawn), **VIII** (wait on the interrupt, not a sleep) |
 | `e1000` | A real minimal NIC driver, read-only: reports link state and the MAC | same as `driver-skeleton`. Its DEGRADE path is proven by `osdev test examples`; its MMIO path is not (see the table below) |
 
+**Past the examples, the real thing.** An example teaches one pattern in isolation. When you need to
+see one at full size - a driver that keeps a DMA ring fed (`services/pwm-audio`), support for a new
+codec in an existing driver (`services/audio-driver`), a kernel change, a utility, a gate - the
+table in [`CONTRIBUTING.md`, "Learn from a real change"](../CONTRIBUTING.md#learn-from-a-real-change)
+points at the code in the tree and the merged commit that did it.
+
 ## How each example is PROVEN to run
 
 An example that has never been executed is a claim this folder cannot back. Every one of the fifteen

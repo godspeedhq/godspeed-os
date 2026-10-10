@@ -38,6 +38,40 @@ there and why, so when in doubt, open the one nearest the code you are editing.
 | Check my change against the anti-patterns before I open a PR | [`docs/anti-patterns.md`](docs/anti-patterns.md) - the field guide to constitutional violations, each paired with the correct pattern |
 | Find something to work on, or check a bug is not already known | [`backlog/`](backlog/README.md) - open items, each with its evidence, what is RULED OUT, and the next step |
 
+## Learn from a real change
+
+Every kind of contribution below has already been made here, by the people who wrote the rules, and
+passed the same gates yours will. So do not start from a description: start from the real thing. Each
+row names code you can read and run in the tree today, and a merged commit that made exactly that kind
+of change - its message says what was found, what was done and how it was verified, and its diff shows
+every file that kind of change has to touch. Nothing here is a toy written for the purpose.
+
+| I want to ... | Read and run this | Then read this commit | What to copy from it |
+|---|---|---|---|
+| **Write a service** | [`examples/counter`](examples/counter/) (restart with state), then [`services/power`](services/power/src/main.rs) - 247 lines, a whole real service on `gs` | [`7dfe3fbd`](https://github.com/godspeedhq/godspeed-os/commit/7dfe3fbd) - every service moved onto `gs` | Use `gs` and nothing under it: `scripts/one_way_check.py` holds every crate at zero raw SDK calls that `gs` covers |
+| **Write a driver that streams** (a DMA ring kept fed) | [`services/pwm-audio`](services/pwm-audio/src/main.rs) - the Pis' jack, about 950 lines | [`13be2d55`](https://github.com/godspeedhq/godspeed-os/commit/13be2d55), then [`3ac042c2`](https://github.com/godspeedhq/godspeed-os/commit/3ac042c2) - the Pi 4's one underrun per tone | Measure before fixing: a one-line instrument first, the fix second, each with a prediction, each tested on the board |
+| **Support new hardware in a driver** | [`services/audio-driver`](services/audio-driver/src/main.rs) - Intel HD Audio, its `PLAYABLE` table of verified codecs | [`3787e6dc`](https://github.com/godspeedhq/godspeed-os/commit/3787e6dc) (a new codec, and the mixer its path needs), [`533003cd`](https://github.com/godspeedhq/godspeed-os/commit/533003cd) (the vendor's bring-up, as Linux does it) | Copy what the reference driver writes, never a value built from bit names (`kernel/src/arch/CLAUDE.md`); read every register back and log it |
+| **Write a driver from scratch** | [`examples/driver-skeleton`](examples/driver-skeleton/) and [`examples/e1000`](examples/e1000/) | - | The grant, the interrupt, the re-arm, the serve loop, restart from cold |
+| **Change the kernel** | [`kernel/src/task/mod.rs`](kernel/src/task/mod.rs) `pci_dev`, [`kernel/src/arch/x86_64/pci.rs`](kernel/src/arch/x86_64/pci.rs) `bar_len` | [`7956c174`](https://github.com/godspeedhq/godspeed-os/commit/7956c174) (K1, a driver's window is its BAR), [`39746569`](https://github.com/godspeedhq/godspeed-os/commit/39746569) (K2, the device the supervisor names) | New `unsafe` only in `arch/`, recorded in `audits/unsafe-audit.md`; every other port answers the new seam member; QEMU first, then a board |
+| **Add or change a shell utility** | [`utilities/57_audio.md`](utilities/57_audio.md) (the spec) and [`utilities/0_conventions.md`](utilities/0_conventions.md) | [`0c31c4d4`](https://github.com/godspeedhq/godspeed-os/commit/0c31c4d4) - Ctrl+Alt+Up, Down and M | Spec first, then the shell, its help, its test and the docs in one change |
+| **Add a test scenario** | [`osdev/src/shell_test.rs`](osdev/src/shell_test.rs) `boot_audio`, run by `osdev test audio` | [`39746569`](https://github.com/godspeedhq/godspeed-os/commit/39746569) - a decoy controller placed FIRST on the bus, so the test fails if the wrong device is granted | Build the situation that would expose the bug, not the one that passes |
+| **Fix documentation** | [`audits/documentation-audit.md`](audits/documentation-audit.md) | [`fc95b1d7`](https://github.com/godspeedhq/godspeed-os/commit/fc95b1d7) (an audit of one area), [`72188226`](https://github.com/godspeedhq/godspeed-os/commit/72188226) (a sweep of code comments) | Read each claim against the code and the hardware; a dated record stays as history and gets a dated note |
+| **Improve a gate** (`scripts/`) | [`scripts/docs_index_check.py`](scripts/docs_index_check.py), [`scripts/commandments_redteam.py`](scripts/commandments_redteam.py) | [`ae1b6fc4`](https://github.com/godspeedhq/godspeed-os/commit/ae1b6fc4) (two new checkers, from an audit), [`576e7e85`](https://github.com/godspeedhq/godspeed-os/commit/576e7e85) (a rule found false, the gate and the docs corrected together) | A new check comes with a probe that breaks it on purpose; a gate may only get stronger (below) |
+
+### Chaos finds
+
+`chaos max-carnage all-services <rounds> yes` kills services at random, round after round, under memory
+and spawn pressure, and the system must recover every time. Run it on your board and read the log, not
+only the summary line - most of what it finds is in the counters. Four real bugs it found, each fixed
+and each commit saying how it was caught:
+
+| Commit | What chaos exposed |
+|---|---|
+| [`c51245c6`](https://github.com/godspeedhq/godspeed-os/commit/c51245c6) | A fresh `xhci` on the T630 stopped completing commands. Looking for why found that every IOMMU-confined device shared one domain ID, which the hardware caches translations by; the commit says plainly that this was found, not proven to be the whole cause |
+| [`bdc7adaa`](https://github.com/godspeedhq/godspeed-os/commit/bdc7adaa) | On the T630 the idle path kept restarting a timer countdown, so a core could go without a tick until the liveness watchdog panicked, 6 s after a 1000-round run |
+| [`6737ae52`](https://github.com/godspeedhq/godspeed-os/commit/6737ae52) | On the Pi 2 the kernel's page-table arena ran out with RAM free: after a 1000-round run every new program was refused |
+| [`b2a54655`](https://github.com/godspeedhq/godspeed-os/commit/b2a54655) | The supervisor was refused a reply mailbox at every one of its 13 respawns in a chaos run: the kernel gave a dead task's mailbox back only to the services the supervisor restarts, never to the supervisor itself |
+
 ## Building and testing
 
 See the [README](README.md) "Getting started". It is the same `cargo run -p osdev -- ...` flow on
