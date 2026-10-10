@@ -1479,3 +1479,8 @@ run only; an `all-services` run was not in this log.
 **The same on the Pi 2 (same day, `8d1d437d`):** `chaos max-carnage pwm-audio 100 yes`, 100 rounds, 100
 kills, the kernel alive; `Pi 2 jack up` 101 times and the settings read back 101 times; a 5 s tone
 afterwards 0 underruns.
+
+**The Wyse 5070 (same day, the x86 image of `9189f1d3`, unchanged for x86 since):** `chaos max-carnage
+audio-driver 100 yes`, 100 rounds, 100 kills, the kernel alive; `audio-driver: ready` 101 times and the
+settings read back 101 times, the ALC225 re-surveyed on every respawn. Tones before and after: 5 s each,
+0 underruns, 59 interrupts, identical to the boot's.
