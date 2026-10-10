@@ -152,13 +152,24 @@ pub fn disable(id: u32) {
 /// interface tracks an active priority per acknowledged interrupt, and skipping the EOI leaves that
 /// priority active forever, silently blocking every later interrupt of equal or lower priority. That
 /// failure looks like "interrupts stopped happening" with nothing to point at.
+///
+/// Returns the RAW `GICC_IAR` value, not just the interrupt ID (backlog/80 K22). For a Software
+/// Generated Interrupt, bits [12:10] carry the CPUID of the core that raised it, and the GICv2
+/// architecture requires the EOIR write to carry the same value IAR returned - an SGI from core 2
+/// EOI'd with bare ID 0 names a different (source, ID) pair than the one that is active. So the
+/// value goes back to [`eoi`] whole, and [`irq_id`] is how a handler reads the ID out of it. For
+/// every other interrupt those bits are zero and the two values are the same.
 pub fn acknowledge() -> u32 {
     // SAFETY: GICC_IAR is a Device-mapped read with the architectural side effect of acknowledging.
-    unsafe { GICC_IAR.read_volatile() & 0x3FF }
+    unsafe { GICC_IAR.read_volatile() }
 }
 
-/// Signal end-of-interrupt for an ID previously returned by [`acknowledge`].
-pub fn eoi(id: u32) {
-    // SAFETY: GICC_EOIR is Device-mapped; writing an acknowledged ID retires it.
-    unsafe { GICC_EOIR.write_volatile(id) };
+/// The interrupt ID inside a value [`acknowledge`] returned: bits [9:0].
+pub fn irq_id(iar: u32) -> u32 { iar & 0x3FF }
+
+/// Signal end-of-interrupt for a value previously returned by [`acknowledge`] - the raw IAR value,
+/// source CPUID and all, never the bare ID.
+pub fn eoi(iar: u32) {
+    // SAFETY: GICC_EOIR is Device-mapped; writing an acknowledged IAR value retires it.
+    unsafe { GICC_EOIR.write_volatile(iar) };
 }

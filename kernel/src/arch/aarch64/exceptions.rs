@@ -406,7 +406,10 @@ pub fn core_irq_debug(core: u32) -> (u32, u32) {
 /// it was never raised, so it is not EOI'd.
 #[no_mangle]
 extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
-    let id = super::gic::acknowledge();
+    // The raw IAR value goes back to `eoi` unchanged (an SGI's source CPUID is in it); `id` is only for
+    // deciding what to do.
+    let iar = super::gic::acknowledge();
+    let id = super::gic::irq_id(iar);
     if id == super::gic::SPURIOUS {
         return; // nothing pending - do NOT EOI an ID that was never raised
     }
@@ -428,7 +431,7 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     // improvement rather than a correctness requirement. (This once said the 32-bit port ran with its
     // IPI senders stubbed; it has had a real mailbox doorbell since, `arch/arm/irq.rs::ring_doorbell`.)
     if id < 16 {
-        super::gic::eoi(id);
+        super::gic::eoi(iar);
         return;
     }
     // DEVICE interrupts (GIC Shared Peripheral Interrupts, ID 32 and up) go to USERSPACE.
@@ -458,7 +461,7 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
     if id == GENET_SPI {
         // SAFETY: in the IRQ handler with interrupts masked - `deliver`'s documented contract.
         unsafe { crate::interrupt::route::deliver(GENET_VECTOR) };
-        super::gic::eoi(id);
+        super::gic::eoi(iar);
         return;
     }
     if id == PCIE_MSI_SPI {
@@ -467,7 +470,7 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
             // SAFETY: in the IRQ handler with interrupts masked - `deliver`'s documented contract.
             unsafe { crate::interrupt::route::deliver(XHCI_MSI_VECTOR) };
         }
-        super::gic::eoi(id);
+        super::gic::eoi(iar);
         return;
     }
     if id >= 32 {
@@ -479,7 +482,7 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
             crate::kprintln!(
                 "gic: SPI {} is above the routing table's u8 range - not deliverable to userspace", id);
         }
-        super::gic::eoi(id);
+        super::gic::eoi(iar);
         return;
     }
     if id == super::timer::TIMER_PPI {
@@ -499,7 +502,7 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
         //
         // Retiring first is safe because the timer is already re-armed above: the interrupt this call
         // retires is finished with, and the next one is a fresh assertion.
-        super::gic::eoi(id);
+        super::gic::eoi(iar);
 
         if NEUTRAL_SCHED.load(core::sync::atomic::Ordering::Relaxed) {
             // Drives the neutral round-robin: it picks the next task and switches to it. Arguments are
@@ -509,7 +512,7 @@ extern "C" fn aarch64_irq_dispatch(_vector: u64, _frame: *mut TrapFrame) {
         }
         return;
     }
-    super::gic::eoi(id);
+    super::gic::eoi(iar);
 }
 
 /// Set once the neutral scheduler owns preemption.
