@@ -649,16 +649,6 @@ pub(crate) const TRB_STATUS_STAGE: u32 = 4;
 pub(crate) const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
-/// Consecutive hub-probe failures across ALL ports of a hub. A halt is a property of the shared EP0
-/// endpoint, so every port's probe fails together - which makes any of them evidence, and makes the
-/// count meaningful only when unbroken (a single success resets it).
-static PROBE_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// Whether the fixed explanatory command-failure hint has already been said. See its use in
-/// `hc_wedged_now`: the sentence is the same every time, so repeating it is serial bandwidth the
-/// keystroke echo has to wait behind. Owned by this service, like `PROBE_FAILS` above.
-static DIAG_HINT_SAID: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 /// Reset Endpoint (xHCI 4.6.8) - clears the HALTED state an errored transfer left on an endpoint.
 const TRB_RESET_ENDPOINT: u32 = 14;
 /// Stop Endpoint (xHCI 4.6.9) - moves a RUNNING endpoint to Stopped, which is the state Set TR
@@ -1227,6 +1217,11 @@ fn hub_port_status(
     abandoned: &mut bool,
     // Latch so a FAILED transfer completion is reported once per hub rather than once per probe.
     cc_logged: &mut bool,
+    // Consecutive hub-probe failures across ALL ports of a hub. A halt is a property of the shared
+    // EP0 endpoint, so every port's probe fails together - which makes any of them evidence, and the
+    // count meaningful only when unbroken (a single success resets it). Owned above `'reenum`, not a
+    // static (Invariant 9, backlog/80 D9).
+    probe_fails: &mut u32,
 ) -> Option<bool> {
     const RING: usize = 0x1000;
     let base = ep0_tr_off(hub_dev);
@@ -1409,7 +1404,7 @@ fn hub_port_status(
                 // which is positive evidence, so the wait buys nothing. Arming the counter one short
                 // of its threshold makes the caller's existing check fire on this very probe -
                 // reusing the proven repair rather than adding a second path to the same place.
-                PROBE_FAILS.store(199, core::sync::atomic::Ordering::Relaxed);
+                *probe_fails = 199;
                 return None;
             }
             // A transfer event that is NOT this probe's. Two kinds land here now:
@@ -2165,6 +2160,8 @@ fn serve_if_block(
     // `'reenum`; this belongs with them, and now the code that REPORTS it and the code that
     // INCREMENTS it are looking at one variable rather than two views of a hidden one.
     no_cap: &mut u64,
+    // Whether "no disk is bound" has been said since a disk was last served (`msc::serve_block`).
+    no_disk_said: &mut bool,
     // `false` = the disk stopped answering a DATA operation, so the caller should drop it and
     // re-scan. Returning this rather than swallowing it is what turns an unplugged stick from "the
     // machine hangs" into "the disk went away".
@@ -2240,7 +2237,7 @@ fn serve_if_block(
     let mut out = [0u8; 520];
     let n = msc::serve_block(
         ctx,
-        dma, mmio, dboff, ir0, disk, msg.payload_bytes(), &mut out, ev_idx, ev_cycle, eaten,
+        dma, mmio, dboff, ir0, disk, msg.payload_bytes(), &mut out, ev_idx, ev_cycle, eaten, no_disk_said,
     );
     // A9-1: TRY_send the reply, and do NOT discard the verdict.
     //
@@ -2557,7 +2554,7 @@ fn dump_ring_state(
 /// caller must poison the offending port and re-initialise the controller rather than issue more doomed
 /// commands. Pure diagnosis when it returns false (e.g. a device-level Transaction Error with the HC
 /// still running); the log is the breadcrumb that tells us, on the Wyse, which case a port hit.
-fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize) -> bool {
+fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize, hint_said: &mut bool) -> bool {
     let sts = mmio.read32(op + OP_USBSTS);
     let wedged = sts & STS_WEDGED != 0;
     // ONCE. This is 200 characters of FIXED explanatory text - it says what the numbers below mean,
@@ -2567,7 +2564,7 @@ fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize) -> bool {
     //
     // The USBSTS line below is NOT gated: it carries the actual per-failure state, which differs.
     // Bounding the explanation is not hiding the failure (26.7) - each failure still reports itself.
-    if !DIAG_HINT_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+    if !core::mem::replace(hint_said, true) {
         ctx.log_fmt(format_args!("xhci: {}", DIAG_HINT));
     }
     ctx.log_fmt(format_args!(
@@ -2670,6 +2667,9 @@ fn enumerate_one(
     // poisons the port at once, while this is a port that simply will not come up - which must still
     // be BOUNDED, because retrying it forever is what produces the ~1 s re-enumeration every ~12 s.
     enum_failed: &mut bool,
+    // Whether the fixed command-failure hint has been said (`hc_wedged_now`). Owned above `'reenum`
+    // with `diag_dumped`, not a static (Invariant 9, backlog/80 D9).
+    hint_said: &mut bool,
 ) {
     *hc_wedged = false;
     *enum_failed = false;
@@ -2742,7 +2742,7 @@ fn enumerate_one(
                 *diag_dumped = true;
                 dump_ring_state(ctx, dma, mmio, op, ir0, cmd_off, *ev_idx, *ev_cycle);
             }
-            *hc_wedged = hc_wedged_now(ctx, mmio, op);
+            *hc_wedged = hc_wedged_now(ctx, mmio, op, hint_said);
             sa.free(dev_idx);
             return;
         }
@@ -2753,7 +2753,7 @@ fn enumerate_one(
             "xhci: Enable Slot failed (completion={})",
             comp
         ));
-        *hc_wedged = hc_wedged_now(ctx, mmio, op);
+        *hc_wedged = hc_wedged_now(ctx, mmio, op, hint_said);
         sa.free(dev_idx);
         return;
     }
@@ -2807,7 +2807,7 @@ fn enumerate_one(
         None => {
             ctx.log("xhci: Address Device - no completion");
             *enum_failed = true;
-            let wedged = hc_wedged_now(ctx, mmio, op);
+            let wedged = hc_wedged_now(ctx, mmio, op, hint_said);
             sa.free(dev_idx);
             // Only try to disable the slot if the HC is still executing; on a wedged HC the command
             // would just be another doomed "no completion". The re-init reclaims the slot anyway.
@@ -2824,7 +2824,7 @@ fn enumerate_one(
             "xhci: Address Device failed (completion={})",
             comp
         ));
-        let wedged = hc_wedged_now(ctx, mmio, op);
+        let wedged = hc_wedged_now(ctx, mmio, op, hint_said);
         sa.free(dev_idx);
         if !wedged {
             disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
@@ -3584,6 +3584,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // this loop and lent to `serve_if_block`, which is what a service's state looks like when it is
     // not a `static` (Invariant 9).
     let mut no_cap_drops: u64 = 0;
+    // Whether the block path has said "no disk is bound" since a disk was last served; a static
+    // until 2026-10-10 (Invariant 9, backlog/80 D9). Here for `no_cap_drops`'s reason.
+    let mut no_disk_said = false;
     let mut work_cycles: u64 = 0;
     let mut work_t0: u64 = 0;
     // Where the per-pass time actually goes, split three ways: serving (block requests + HID
@@ -3626,7 +3629,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Fixing that (16243569) did not cause this loop; it uncovered it.
     //
     // Third instance of one class in this driver: state whose lifetime is shorter than `events` it
-    // must remember (`eaten` re-zeroed per pass, PROBE_FAILS reset per re-enumeration, now this).
+    // must remember (`eaten` re-zeroed per pass, the probe-failure count reset per re-enumeration, now this).
     // A latch that resets when the thing it latches happens is not a latch.
     // Consecutive CONNECTED reads per hub port, so an arrival needs CONFIRMING.
     //
@@ -3657,6 +3660,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // behind every one of those lines. The failure itself is still reported loudly every time;
     // only the fixed explanatory dump is said once (26.7 - visible failure, bounded output).
     let mut diag_dumped = false;
+    // The two latches that were statics (Invariant 9, backlog/80 D9), here for `diag_dumped`'s reason:
+    // a re-enumeration must not reset them, and a respawn - a fresh instance - does.
+    let mut diag_hint_said = false;
+    let mut probe_fails: u32 = 0;
     let mut hub_posted: u64 = 0;
     let mut hub_ok: u64 = 0;
     let mut hub_late: u64 = 0;
@@ -3955,6 +3962,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut hc_wedged,
                     &mut diag_dumped,
                     &mut enum_failed,
+                    &mut diag_hint_said,
                 );
                 // BOUND THE RETRY, AND SPEND THE ATTEMPTS IN THIS PASS.
                 //
@@ -3979,7 +3987,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         enumerate_one(
                             &ctx, &dma, &mmio, dboff, ir0, op, ctx_size, p, &mut sa, &mut devs,
                             &mut ndev, &mut saw_hub, &mut disk, &mut radio, &mut ev_idx, &mut ev_cycle,
-                            &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed,
+                            &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed, &mut diag_hint_said,
                         );
                         if !enum_failed { break; }
                         strikes += 1;
@@ -4737,7 +4745,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     radio::Served::Done => {}
                     radio::Served::NotOurs => {
-                        if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops) {
+                        if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops, &mut no_disk_said) {
                             ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
                             notify(&ctx, "storage disconnected (xhci)");
                             disk = None;
@@ -4799,7 +4807,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     radio::Served::Done => {}
                     radio::Served::NotOurs => {
-                        disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops);
+                        disk_alive &= serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops, &mut no_disk_said);
                     }
                 }
             }
@@ -4971,7 +4979,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         &mut ev_cycle,
                         &mut eaten,
                         &mut abandoned,
-                        &mut hub_cc_logged,
+                        &mut hub_cc_logged, &mut probe_fails,
                     );
                     hub_posted = hub_posted.wrapping_add(1);
                     if st.is_some() && !abandoned {
@@ -5018,7 +5026,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // A9-2: this scan must run to WATCH, not only to BIND.
             //
             // It was gated on `ndev < MAX_HID` because a full HID table cannot bind an arrival. But
-            // the same loop carries the disk-removal watch AND the only increment of `PROBE_FAILS`,
+            // the same loop carries the disk-removal watch AND the only increment of `probe_fails`,
             // which is what triggers the halted-endpoint repair. With `MAX_HID = 2`, a keyboard plus
             // a mouse satisfies neither this nor the `ndev == 0` fallback below, so BOTH went dead:
             // an unplugged stick was never noticed and a wedged endpoint was never repaired. Hardware
@@ -5030,7 +5038,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // watch, and the bind-an-arrival arm carries the `ndev < MAX_HID` check itself.
             // A10-7: `hub_due` ALONE. The `(ndev < MAX_HID || disk.is_some())` qualifier still left the
             // scan dead in one case - a full HID table with NO disk - and that case carries the only
-            // increment of `PROBE_FAILS`, so the halted-endpoint repair could not fire there either.
+            // increment of `probe_fails`, so the halted-endpoint repair could not fire there either.
             // A9-2 fixed the disk half of exactly this and I left the other half standing.
             //
             // There is nothing to gate: the scan's cost is one control transfer per hub port per
@@ -5081,7 +5089,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 &ctx,
                                 &dma, &mmio, dboff, ir0, hub_slot, hub_dev, hp,
                                 &mut c2, &mut p2, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
-                                &mut hub_cc_logged,
+                                &mut hub_cc_logged, &mut probe_fails,
                             );
                             hub_posted = hub_posted.wrapping_add(1);
                             if st.is_some() && !abandoned {
@@ -5266,7 +5274,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &mut ev_cycle,
                             &mut eaten,
                             &mut abandoned,
-                            &mut hub_cc_logged,
+                            &mut hub_cc_logged, &mut probe_fails,
                         );
                         hub_posted = hub_posted.wrapping_add(1);
                         if st.is_some() && !abandoned {
@@ -5298,12 +5306,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // do with this probe. Leaving it in would hold the counter at zero and
                         // silently disable the repair - the guard suppressing the fix it guards.
                         if st.is_none() && !abandoned {
-                            let n = PROBE_FAILS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                            probe_fails = probe_fails.saturating_add(1); let n = probe_fails;
                             if n >= 200 {
                                 ctx.log_fmt(format_args!(
                                     "xhci: hub slot {} unreachable {}x - the ring is not being consumed; repairing (the endpoint state decides how)",
                                     hub_slot, n));
-                                PROBE_FAILS.store(0, core::sync::atomic::Ordering::Relaxed);
+                                probe_fails = 0;
                                 let ok = reset_endpoint(
                                     &ctx, &dma, &mmio, dboff, ir0, hub_slot, 1,
                                     ep0_tr_off(hub_dev), device_ctx_off(hub_dev), ctx_size, &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
@@ -5319,7 +5327,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 }
                             }
                         } else {
-                            PROBE_FAILS.store(0, core::sync::atomic::Ordering::Relaxed);
+                            probe_fails = 0;
                         }
                         // Same rule as the disk-hub scan: connected is not newly-arrived. Without
                         // the retry mask, a port holding something we cannot bind re-enumerates the
@@ -5422,7 +5430,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &ctx,
                             &dma, &mmio, dboff, ir0, hs, hd, hp,
                             &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
-                            &mut hub_cc_logged,
+                            &mut hub_cc_logged, &mut probe_fails,
                         );
                         hub_posted = hub_posted.wrapping_add(1);
                         if st.is_some() && !abandoned {

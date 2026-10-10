@@ -159,10 +159,6 @@ impl Ring {
     }
 }
 
-/// Set once "no disk is bound" has been reported, so the refusal is not logged per request.
-static NO_DISK_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// As `NO_DISK_LOGGED`, for a bound disk whose reads have started failing.
-static READ_FAIL_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// A bound mass-storage device: the coordinates needed to talk to it and the geometry it reported.
 pub struct Disk {
@@ -199,13 +195,14 @@ pub struct Disk {
     pub hub_dev: u32,
     pub hub_nports: u32,
     pub hub_off: usize,
+    /// Whether this disk's first failed read has been reported (further failures are silenced). A
+    /// field of the disk rather than a static (Invariant 9, backlog/80 D9), so a new disk starts
+    /// unsaid by construction.
+    read_fail_said: bool,
 }
 
 impl Disk {
     pub fn new(slot: u32, out_ep: u8, in_ep: u8, port: u32) -> Self {
-        // A disk exists again - let the next absence be reported.
-        NO_DISK_LOGGED.store(false, core::sync::atomic::Ordering::Relaxed);
-        READ_FAIL_LOGGED.store(false, core::sync::atomic::Ordering::Relaxed);
         Disk {
             slot,
             out_dci: (out_ep & 0x0F) as u32 * 2,
@@ -221,6 +218,7 @@ impl Disk {
             hub_dev: 0,
             hub_nports: 0,
             hub_off: 0,
+            read_fail_said: false,
         }
     }
 
@@ -725,6 +723,9 @@ pub fn serve_block(
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     eaten: &mut EvMail,
+    // Whether "no disk is bound" has been reported since a disk was last bound. Owned by the
+    // caller's loop, not a static (Invariant 9, backlog/80 D9).
+    no_disk_said: &mut bool,
 ) -> usize {
     out[0] = STATUS_ERR;
     if req.is_empty() {
@@ -743,12 +744,14 @@ pub fn serve_block(
         // added to diagnose.
         //
         // The fact is worth saying once per drop; saying it ten times a second adds nothing and costs
-        // the thing the user actually notices. Reset when a disk is bound again (see `Disk::new`).
-        if !NO_DISK_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        // the thing the user actually notices. Reset once a request finds a disk bound again (below).
+        if !core::mem::replace(no_disk_said, true) {
             ctx.log("xhci: block request but NO disk is bound - refusing (silenced until one is)");
         }
         return 1;
     };
+    // A disk is bound: the next absence is news again.
+    *no_disk_said = false;
 
     match req[0] {
         OP_CAPACITY => {
@@ -813,7 +816,7 @@ pub fn serve_block(
             if !ok {
                 // Also once. A disk that has stopped answering fails EVERY read `fs` retries, and
                 // one line per failure is the same self-inflicted load as the refusal above.
-                if !READ_FAIL_LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                if !core::mem::replace(&mut d.read_fail_said, true) {
                     ctx.log_fmt(format_args!(
                         "xhci: READ(10) of lba {} FAILED on a bound disk (further failures silenced)", lba));
                 }
