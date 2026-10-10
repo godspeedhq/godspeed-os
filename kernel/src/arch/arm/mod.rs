@@ -2272,7 +2272,6 @@ pub mod boot {
     pub unsafe fn send_ipi_to_lapic(lapic_id: u32, _vector: u8) {
         super::irq::ring_doorbell(lapic_id);
     }
-    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
 }
 

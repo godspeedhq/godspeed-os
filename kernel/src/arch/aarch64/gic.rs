@@ -34,14 +34,15 @@ const GICD_ITARGETSR: *mut u8 = (GICD + 0x800) as *mut u8; // 1 byte per interru
 const GICD_SGIR: *mut u32 = (GICD + 0xF00) as *mut u32;
 
 /// The SGI IDs this kernel uses. IDs 0..15 are the only ones a core may send to another core, so the
-/// neutral layer's x86-style vector numbers (0xF0, 0xF1, 0xF2) have to be mapped into that range
+/// neutral layer's x86-style vector numbers (0xF0, 0xF2) have to be mapped into that range
 /// rather than sent as-is - a vector of 0xF0 written into a 4-bit field is 0, which is a different
 /// interrupt entirely and would silently deliver the wrong thing.
 pub const SGI_WAKE: u32 = 0;
-pub const SGI_TLB: u32 = 1;
+// SGI 1 was the TLB shootdown's id, deleted with the shootdown (`backlog/80` K20). Left unused rather
+// than renumbering SGI_TICK.
 pub const SGI_TICK: u32 = 2;
 
-/// Send a Software Generated Interrupt to one core, or to every core but this one.
+/// Send a Software Generated Interrupt to one core.
 ///
 /// This is the AArch64 equivalent of the x86 IPI the neutral scheduler already depends on, and its
 /// absence is not a missing optimisation: a task blocking on one core is woken by another core sending
@@ -51,8 +52,6 @@ pub const SGI_TICK: u32 = 2;
 pub fn send_sgi(target: SgiTarget, id: u32) {
     let word = match target {
         SgiTarget::Core(c) => ((1u32 << (c & 0x7)) << 16) | (id & 0xF),
-        // Filter 0b01 = "every core except the one sending", so no target list is needed.
-        SgiTarget::AllButSelf => (0b01 << 24) | (id & 0xF),
     };
     // SAFETY: the distributor's SGI register, Device-mapped. Writing it raises an interrupt on the
     // targeted cores and does nothing else.
@@ -64,7 +63,6 @@ pub fn send_sgi(target: SgiTarget, id: u32) {
 
 pub enum SgiTarget {
     Core(u32),
-    AllButSelf,
 }
 
 // CPU interface registers.

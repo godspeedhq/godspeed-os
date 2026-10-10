@@ -13,7 +13,7 @@
 //!
 //! Two flavours by access pattern:
 //!   - [`PerCore<T>`] hands out a shared `&T` (`get`); `T: Sync`, mutation via atomics. Read-mostly
-//!     per-core state that other cores also read (e.g. shootdown slots).
+//!     per-core state that other cores also read (e.g. a core's liveness stamp).
 //!   - [`PerCoreMut<T>`] hands out a raw `*mut T` (`as_mut_ptr`); for state the OWNING core writes
 //!     (saved register contexts, deferred-free lists). Sound under the per-core single-owner invariant.
 //!
@@ -55,8 +55,8 @@ fn alloc_arena<T>(n: usize) -> *mut T {
 
 /// A boot-allocated array of one `T` per core, accessed by SHARED reference ([`get`](PerCore::get)).
 ///
-/// `T: Sync` because a core's slot may be read by *other* cores (e.g. a shootdown address read by the
-/// servicers); per-core *mutation* goes through `T`'s own interior mutability (atomics), never `&mut`.
+/// `T: Sync` because a core's slot may be read by *other* cores (e.g. a liveness stamp read by the
+/// watchdog on another core); per-core *mutation* goes through `T`'s own interior mutability (atomics), never `&mut`.
 pub struct PerCore<T: Sync + 'static> {
     base: AtomicPtr<T>,
 }
@@ -164,21 +164,3 @@ impl<T: 'static> PerCoreMut<T> {
     }
 }
 
-/// Carve a flat `[AtomicU64; n]` from the frame allocator (in the HHDM), every element initialised to
-/// `init`, and return it as a `'static` slice. For per-core state whose *width scales with the core
-/// count* - the TLB-shootdown ack bitmask is `num_cores * ceil(num_cores/64)` words, which no fixed
-/// `PerCore<[_; K]>` can size dynamically. A bounded arena (§26.6.1): one boot carve, never freed.
-/// Panics (loud halt, §26.7) if the allocator cannot back it.
-pub fn alloc_atomic_u64_slice(n: usize, init: u64) -> &'static [portable_atomic::AtomicU64] {
-    use portable_atomic::AtomicU64;
-    let base = alloc_arena::<AtomicU64>(n.max(1));
-    // SAFETY: `base` covers `n` freshly-allocated, page-aligned slots (alloc_arena rounds up); each is
-    // written exactly once here before any reader can reach the slice, so no concurrent access and no
-    // read of uninitialised memory.
-    for i in 0..n {
-        unsafe { ptr::write(base.add(i), AtomicU64::new(init)); }
-    }
-    // SAFETY: `base..base+n` is initialised, never freed, and `AtomicU64: Sync`, so a shared `'static`
-    // slice is sound across cores.
-    unsafe { core::slice::from_raw_parts(base, n) }
-}

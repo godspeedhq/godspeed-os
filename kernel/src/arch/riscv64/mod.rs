@@ -1844,22 +1844,6 @@ pub mod boot {
         super::sbi::send_ipi(1u64 << (lapic_id as u64 & 63), (lapic_id as u64) & !63);
     }
 
-    /// Poke every hart but this one.
-    ///
-    /// # Safety
-    /// Architecturally safe; `unsafe` to match the seam every arch implements.
-    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
-        // SAFETY: reading this hart's own id.
-        let me = unsafe { get_lapic_id() };
-        for core in 0..crate::smp::percpu::num_cores() {
-            let hart = crate::smp::core::core_lapic_id(core as u32);
-            if hart == me {
-                continue;
-            }
-            // SAFETY: as `send_ipi_to_lapic`.
-            unsafe { send_ipi_to_lapic(hart, vector) };
-        }
-    }
     /// x86 tells the HARDWARE where a ring-3 interrupt lands by writing `TSS.rsp0`. The RISC-V
     /// equivalent is `sscratch` - and writing it here would be WRONG.
     ///
@@ -2198,8 +2182,9 @@ pub mod page_tables {
     /// is why it is its own call and not the tail of the walk.
     ///
     /// # Safety
-    /// `root` must belong to a task already marked Dead, after a TLB shootdown, and must not be the
-    /// address space currently in `satp`.
+    /// `root` must belong to a task already marked Dead that no core is running or still leaving
+    /// (`core_still_using`), and must not be the address space currently in `satp`. No hart can walk
+    /// it then: each switched to another root, and `switch_context` issues `sfence.vma` on every switch.
     pub unsafe fn free_page_table_root(root: u64) {
         if root == 0 || !crate::memory::allocator::phys_in_ram(root) {
             return;
@@ -3742,11 +3727,11 @@ static BOOT_TIME: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0
 /// `send_ipi` says only "someone poked you". So the vector travels out of band: the sender sets a
 /// bit here for the target and then pokes it, and the receiver drains whatever it finds. A MASK and
 /// not a single value, because two senders can arrive between one hart's poke and its handler, and
-/// the second must not overwrite the first - which would lose a TLB shootdown and leave its
-/// initiator spinning on an acknowledgement that never comes.
+/// the second must not overwrite the first - which would lose a wake, and leave a task blocked until
+/// that hart's next tick.
 static IPI_PENDING: crate::smp::percpu::PerCore<AtomicU32> = crate::smp::percpu::PerCore::new();
 
-/// Bit position for a vector in `IPI_PENDING`. The three neutral vectors are 0xF0..0xF2.
+/// Bit position for a vector in `IPI_PENDING`. The neutral vectors are 0xF0 and 0xF2.
 #[inline]
 fn ipi_bit(vector: u8) -> u32 {
     1u32 << (vector & 0x0f)
@@ -3946,7 +3931,6 @@ fn drain_ipis() {
     let pending = IPI_PENDING.get(core).swap(0, Ordering::Acquire);
     for vector in [
         crate::smp::ipi::vectors::WAKE_RECEIVER,
-        crate::smp::ipi::vectors::TLB_SHOOTDOWN,
         crate::smp::ipi::vectors::SCHEDULER_TICK,
     ] {
         if pending & ipi_bit(vector) != 0 {

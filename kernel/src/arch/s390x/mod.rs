@@ -175,7 +175,6 @@ pub mod boot {
     pub unsafe fn apic_send_eoi() {}
     pub unsafe fn get_lapic_id() -> u32 { 0 }
     pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {}
-    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {}
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
 }
 
@@ -222,7 +221,7 @@ pub mod page_tables {
     /// Free a task's page-table root and the structure below it, at task death.
     ///
     /// # Safety
-    /// `_root` must belong to a task already marked Dead, after a TLB shootdown.
+    /// `_root` must belong to a task already marked Dead that no core is running or still leaving.
     pub unsafe fn free_page_table_root(_root: u64) {}
 
     use crate::memory::frame::{Frame, PhysAddr};

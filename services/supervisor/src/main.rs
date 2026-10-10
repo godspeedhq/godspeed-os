@@ -127,6 +127,12 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
                     // A TEST PROBE, asked for by a probe respawning its own victim. Its parameters
                     // come from the shared table here rather than off the wire - the caller sends a
                     // name, not a configuration, so a probe cannot ask to be something it is not.
+                    //
+                    // Except WHERE it runs: a core in the request places it, as every other SPAWN's
+                    // core does. Placement is not authority (CLAUDE.md 9.2), and P7 needs its checker
+                    // on the writer's core one time and on another core the next. A probe that
+                    // respawns its own victim sends that row's core, so nothing else moves.
+                    let r = if core == u32::MAX { r } else { (r.0, r.1, r.2, r.3, Some(core), r.5) };
                     spawn_probe_row(ctx, r).is_ok()
                 } else if np > 0 {
                     // Peers supplied. INSTALL them from the name-cap map where we have caps, rather
@@ -2612,12 +2618,12 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = probes::probe(&ctx, "prop-p8");        // P8 controller - starts cycling immediately
 
     // Property-test probes - Milestone 9 Phase 3.
-    // P4 has no victim. P5 and P7 victims must be registered before their
-    // controllers so endpoints exist when the controllers start cycling.
+    // P4 has no victim. P5's victim must be registered before its controller so the endpoint
+    // exists when it starts cycling. P7 spawns its own victims, one at a time, on the cores it
+    // chooses, and tells each what to be (`mode_prop_p7`).
     let _ = probes::probe(&ctx, "prop-p4");
     let _ = probes::probe(&ctx, "prop-p5-victim");
     let _ = probes::probe(&ctx, "prop-p5");
-    let _ = probes::probe(&ctx, "prop-p7-victim");
     let _ = probes::probe(&ctx, "prop-p7");
 
     // --- Brutal property test probes - Milestone 16 ---

@@ -352,8 +352,9 @@ impl PageTable {
             // can read and write a frame that now belongs to another address space - a use-after-free
             // the MMU actively enables, and one no fault reports.
             //
-            // x86 does not need this HERE because its neutral kill path issues a shootdown, and that is
-            // exactly why the omission survives review: the primitive looks complete against the arch
+            // x86's `unmap` does no invalidate at all - only selftests call it, and the kill path frees
+            // whole dead address spaces after every core has switched away - and that is exactly why
+            // the omission survives review here: the primitive looks complete against the arch
             // whose semantics were in mind when it was written. `arch/CLAUDE.md` (SEC-26/27) says a
             // primitive owes its SEMANTIC and not just its signature; this is that debt.
             //
