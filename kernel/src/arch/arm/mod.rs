@@ -1344,16 +1344,25 @@ pub fn usb_disk_absent() -> bool { true }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
 /// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it, and so does the
-/// WPA2 supplicant's SNonce (`sdk/wifi/src/supplicant.rs`, `snonce`, for `wifi-usb` on this board). Still
-/// an unlocked FIFO pop: two cores asking at once can both pass the "word available" check for one word.
+/// WPA2 supplicant's SNonce (`sdk/wifi/src/supplicant.rs`, `snonce`, for `wifi-usb` on this board).
+///
+/// The enable, the "word available" check and the pop are ONE critical section under `RNG_LOCK`
+/// (backlog/80 K28). Unlocked, two cores asking at once could both see one word available and both read
+/// DATA - one getting the word and the other a stale or empty one - and a second caller could read before
+/// the first had finished the one-time enable. A nonce must not be either. `lock_irq`, because a
+/// preempted holder on this core would otherwise leave the next task here spinning on it; the hold is a
+/// word's wait, microseconds, and bounded below in every case.
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
     const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;
     const RNG_STATUS: usize = PERIPHERAL_BASE + 0x10_4004;
     const RNG_DATA:   usize = PERIPHERAL_BASE + 0x10_4008;
     static INIT: AtomicBool = AtomicBool::new(false);
+    static RNG_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+    let _one = RNG_LOCK.lock_irq();
     // SAFETY: the BCM2835 RNG registers are in the already-Device-mapped peripheral window; volatile
     // 32-bit accesses. One-time enable (a warm-up count, then CTRL=1); read once a word is available.
+    // `RNG_LOCK` is held, so no other core is between the check and the pop.
     unsafe {
         if !INIT.swap(true, Ordering::Relaxed) {
             (RNG_STATUS as *mut u32).write_volatile(0x40000);        // warm-up cycles before the first read
@@ -2584,8 +2593,9 @@ pub mod interrupts {
         // one controller, one driver. The hub poll in particular took the exclusive bulk claim and
         // rewrote the shared device selection, which is precisely what must not happen underneath
         // another driver. Slice 5 deleted both with the in-kernel DWC2 driver, which is why the block
-        // below is empty; `services/dwc2` owns the controller now.
-        if !super::irq::usb_owned_by_userspace() {
+        // below is gone too (it was an empty `if` that still did a route lookup on every idle pass,
+        // removed 2026-10-10, `backlog/80` K25); `services/dwc2` owns the controller now.
+        //
         // The ethernet cable was watched here for the same reason, on the same terms. The PHY read was
         // already written and already correct - but nothing CALLED it unless a service asked (`net`,
         // `ping`), so unplugging the cable on an idle machine was silent while unplugging the keyboard
@@ -2594,7 +2604,6 @@ pub mod interrupts {
         // function's exclusive section: it takes the same bulk claim, and nesting would make it stand
         // aside from itself. Both were individually rate-limited to ~1 s and both yielded to storage,
         // so idle stayed cheap.
-        }
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
         unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }
     }

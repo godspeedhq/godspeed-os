@@ -37,8 +37,9 @@ pub struct VirtAddr(pub u64);
 bitflags::bitflags! {
     /// Neutral page flags. The names are x86-flavoured (the documented leak, `arch/CLAUDE.md`); the
     /// ARM encoder below maps them onto short-descriptor bits. `WRITABLE` off = read-only; `NO_EXEC`
-    /// sets XN; `USER` grants PL0 access (`l2_small_page`). `WRITE_COMBINE` is not read by this
-    /// encoder: arm32 selects Normal non-cacheable from `PCD | PWT` (`fb_extra_page_flags`).
+    /// sets XN; `USER` grants PL0 access (`l2_small_page`). arm32 selects Normal non-cacheable
+    /// from `PCD | PWT` (`fb_extra_page_flags`); `WRITE_COMBINE` only drops the shareable bit, so the
+    /// console's framebuffer pages agree with the kernel's non-shareable section (`l2_small_page`).
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct PageFlags: u64 {
         const PRESENT  = 1 << 0;
@@ -94,7 +95,14 @@ fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
         d |= 1 << 3; // C
         d |= 1 << 2; // B
     }
-    d |= 1 << 10; // S (shareable), matching mmu.rs sections
+    // S (shareable), matching mmu.rs's RAM sections - EXCEPT the framebuffer, whose kernel section
+    // (`mmu::section_fb`) is non-shareable. The two map the same physical pages, and ARM leaves
+    // mismatched attributes for one page UNPREDICTABLE, shareability included; the page took S from the
+    // RAM rule while the section deliberately did not (backlog/80 K25). `WRITE_COMBINE` is how the
+    // neutral mapper says "framebuffer", so it is what selects non-shareable here.
+    if !(flags.contains(PageFlags::WRITE_COMBINE) && flags.contains(PageFlags::PCD) && flags.contains(PageFlags::PWT)) {
+        d |= 1 << 10;
+    }
     // AP/APX encode both privilege levels. USER = PL0 gets access; without it PL0 has none (kernel
     // page). AP=0b11 is PL1 RW / PL0 RW; AP=0b10 is PL1 RW / PL0 RO; AP=0b01 is PL1 RW / PL0 none;
     // APX=1 turns the PL1 half read-only. That is the whole security model of a page in two bits.

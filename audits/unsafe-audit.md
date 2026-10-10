@@ -2471,6 +2471,8 @@ A side-effect-free system-register read, valid at any point including early boot
 | `arch/x86_64/syscall_entry.rs` | 16 -> 14 (-2) | **shrank** (2026-10-10, backlog/80 K7): `int80_entry` deleted - the naked `int 0x80` syscall stub and its `#[unsafe(naked)]`. It was still installed at IDT[0x80] with DPL=3, so any service could raise it, and it ran the syscall chain on the top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off. The SDK traps with `ud2` on every x86 machine; nothing used it. |
 | `smp/placement.rs` | 1 -> deleted (-1) | 2026-10-10, backlog/80 K20: the whole file had no callers (`resolve` and its `static mut RR_COUNTER`); the live placement is `task::resolve_spawn_core`. Its one block, the `RR_COUNTER` increment, goes with it. |
 | `arch/x86_64/mod.rs` | 40 -> 38 (-2) | **shrank** (2026-10-10, backlog/80 K20): `uart_rx_enable` deleted - the `unsafe fn` and its port-write block. It had no caller by design (unmasking PIC IRQ 4 jams the PIC on real hardware, which the boot comment in `main.rs` records); COM1 RX is polled from the core-0 timer. |
+| `arch/arm/exceptions.rs` | 24 -> 23 (-1) | **shrank** (2026-10-10, backlog/80 K25): the kernel-fault reporter's closing `wfi` loop is replaced by `halt_all_cores`, so a kernel fault halts every core rather than parking only the one that faulted (CLAUDE.md 6.2, 19). The loop's one `asm!` block goes. |
+| `arch/arm/irq.rs` | 18 -> 17 (-1) | **shrank** (2026-10-10, backlog/80 K25): `route_usb_irq_to_core0` deleted - it had no callers, and its one block (the legacy-controller enable write) never ran. `unmask_usb_irq` is the live enable. |
 | `arch/x86_64/iommu.rs` | 74 -> 79 (+5) | 2026-10-10, backlog/80 K11: a confinement is never left unrecorded. `unconfine` is the one way a confinement is undone (`unsafe fn`, +1, with the four blocks `release_device` had - write the passthrough DTE, `sfence`, invalidate, free the table - moved into it unchanged); `release_device` calls it (+1 for the call, -4 for the blocks that moved). `confine_device` gains three: freeing a partial table when an arena page fails to map (it leaked, root and all), freeing a device's PREVIOUS table when it is confined again (its record was overwritten and the table kept forever), and calling `unconfine` when the last record slot was taken by another core while the table was being built. Each frees or reverts only a table built here and reachable from nothing but this device's DTE, which each SAFETY comment states. |
 | `arch/x86_64/pci.rs` | 20 -> 21 (+1) | `cfg_read_gated` - the one gated configuration read a userspace enumerator needs (step D2). An `out dx, eax` to 0xCF8 and an `in eax, dx` from 0xCFC, held together under the `PCI_CONFIG_LOCK` that already guards this pair.
 
@@ -2661,11 +2663,11 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/genet.rs | 1 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
-| arch/arm/exceptions.rs | 24 | permitted |
+| arch/arm/exceptions.rs | 23 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
-| arch/arm/irq.rs | 18 | permitted |
+| arch/arm/irq.rs | 17 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
