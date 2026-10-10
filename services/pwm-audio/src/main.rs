@@ -388,8 +388,12 @@ impl<'a> Pwm<'a> {
             last: at, begin: at + GUARD, end_at: usize::MAX, underruns: 0, silence: 0,
             started: wait::ticks(self.ctx), looked: wait::ticks(self.ctx), feed: None, sound: false,
         });
-        self.ctx.log_fmt(format_args!("pwm-audio: playing {} Hz for {} ms", hz, ms));
+        // FILL FIRST, LOG AFTER. Only a guard (about 6 ms) is written ahead of the engine until `service`
+        // runs, and on the Pi 4 a log line costs about 10 ms - the caller puts queued lines on the wire
+        // at 115200 baud - so logging first let the engine pass the written end once in every tone
+        // (measured 2026-10-10: `underrun 10 ms into the play`, 464 frames moved, 208 past the end).
         self.service();
+        self.ctx.log_fmt(format_args!("pwm-audio: playing {} Hz for {} ms", hz, ms));
     }
 
     /// A system sound (`wire::OP_SOUND`), written whole a guard ahead of the engine - every one is far
@@ -515,8 +519,8 @@ impl<'a> Pwm<'a> {
             }
         } else {
             if p.played > p.filled {
-                // The Pi 4 counts one in every tone and the Pi 2 none (`docs/audio.md`); the first of a
-                // play says where it fell, so the next boot says why rather than how many.
+                // The first of a play says where it fell, so a log says why rather than how many. It
+                // found the Pi 4's one-a-tone (`start_tone`, `docs/audio.md`).
                 if p.underruns == 0 {
                     ctx.log_fmt(format_args!(
                         "pwm-audio: underrun {} ms into the play - the engine was {} frames past the written end, having moved {} frames (ring position {} -> {}) in the {} us since the last look",

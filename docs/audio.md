@@ -1454,3 +1454,14 @@ on the Pi 4, is open.
 `(no audio driver is running ... so there is none to ask)`, the prompt came back, nothing else in the log
 moved. That is the right answer for a board whose only sound path is HDMI, which nothing here drives. All
 five boards checked on one build: four heard, one refusing in a sentence.
+
+**The Pi 4's underrun, found (same day).** A one-line instrument (`13be2d55`) logged the first underrun
+of each play. Four tones, four identical answers: `underrun 10 ms into the play - the engine was 208
+frames past the written end, having moved 464 frames ... in the 10524 us since the last look`. The
+numbers are exact: 464 frames is 10.5 ms at 44.1 kHz, and 464 less the 256-frame guard is 208. So the
+look 10.5 ms earlier was the moment the tone was set up, and between it and the first refill nothing was
+written past the guard. What sat between them was the driver's own `playing 440 Hz` log line: on the
+Pi 4 a log line costs about 10 ms, consistent with the kernel's serial path, where the logging caller
+puts queued lines on the wire at 115200 baud (an inference from that code, not measured separately).
+The fix is the order - fill first, log after. Why the Pi 2 never showed it was not checked; the same
+order was wrong there, so its log line must cost under the guard's 6 ms.
