@@ -109,7 +109,7 @@ def main():
                 continue
 
             m = NEW_IMPORT.match(line)
-            if m and NEW_MODULES[m.group(1)] > FLOOR and prev.strip() != "try:":
+            if m and NEW_MODULES[m.group(1)] > FLOOR and prev.split("#", 1)[0].strip() != "try:":
                 ver = NEW_MODULES[m.group(1)]
                 problems.append((rel, n, "%d.%d" % ver,
                                  "`%s` is not in the standard library before %d.%d (guard it with "
