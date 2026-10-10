@@ -1449,3 +1449,8 @@ Hz, range 2834`, paced 23102 us, mute `verified`. Each 5 s tone reported **1 und
 on 2026-10-03, while the Pi 2 reports 0. In a tone an underrun means the DMA engine passed the point the
 driver had filled, once, somewhere in the tone. Not heard as a click and not explained: when, and why only
 on the Pi 4, is open.
+
+**The VisionFive 2 Lite, same day:** `audio tone 550 5` answered `no audio hardware on this machine` and
+`(no audio driver is running ... so there is none to ask)`, the prompt came back, nothing else in the log
+moved. That is the right answer for a board whose only sound path is HDMI, which nothing here drives. All
+five boards checked on one build: four heard, one refusing in a sentence.
