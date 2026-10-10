@@ -2,7 +2,7 @@
 
 Mirrors §22 Property Tests (P1-P10). Universal invariants under randomised inputs.
 
-**Reference:** `tests/qemu/property/CLAUDE.md` for full spec.
+**Reference:** the `TestSpec` table in `osdev/src/validator.rs` is the full spec (there is no `tests/qemu/property/` directory).
 
 ## Hardware applicability
 

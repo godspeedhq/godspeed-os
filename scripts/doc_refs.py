@@ -15,14 +15,15 @@ WHAT IS DELIBERATELY EXEMPT, and why it is not a loophole:
                are evidence, CLAUDE.md is law.
 
   CLAUDE.md    Its amendment blocks are ratified history and name files that were REMOVED by the very
-               amendment recording the removal. (Correction 2026-10-09: the BODY is not checked
-               either. The root CLAUDE.md is not in PATTERNS at all - no code here separates an
-               amendment from the body - so a dead path anywhere in the constitution passes.)
+               amendment recording the removal - so they are skipped, and the BODY is checked.
+               (Until 2026-10-10 the root CLAUDE.md was not scanned at all, body included.)
 
 SCOPE, stated so a pass is not read as wider than it is. Paths are checked only in the PATTERNS files
-below (so not COMMANDMENTS.md, CONTRIBUTING.md, SECURITY.md, backlog/*.md, examples/**, tests/**,
-osdev/CLAUDE.md or kernel/CLAUDE.md), only when BACKTICKED, and only with a .rs/.md/.toml/.py/.json/
-.gsh extension - a directory or a `.sh`/`.ps1`/`.txt` path is never checked. `backlog/NN` citations
+below - which include CLAUDE.md's body, COMMANDMENTS.md, CONTRIBUTING.md, SECURITY.md, examples/**,
+tests/** (not tests/conformance/, the fixture corpus), osdev/CLAUDE.md and kernel/CLAUDE.md since
+2026-10-10 (backlog/80 T8), but not backlog/*.md, whose entries are dated records - only when
+BACKTICKED, and only with a .rs/.md/.toml/.py/.json/.gsh extension: a directory or a `.sh`/`.ps1`/
+`.txt` path is never checked. `backlog/NN` citations
 are checked over PATTERNS plus SOURCE_PATTERNS plus backlog/README.md.
 
 Exit 0 when every referenced path resolves, 1 otherwise.
@@ -48,10 +49,32 @@ PATTERNS = [
     "website/src/*.md",
     "README.md",
     "GETTING_STARTED.md",
+    # Added 2026-10-10 (backlog/80 T8): the constitution, the other top-level documents, the two
+    # CLAUDE.md files this list had missed, and every example and test document. A dead path in any of
+    # them passed, though each is read as current. CLAUDE.md's dated amendments are ratified history
+    # that names files they removed, so its blockquoted lines are skipped (`current_text`) and only
+    # its body is checked.
+    "CLAUDE.md",
+    "COMMANDMENTS.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "osdev/CLAUDE.md",
+    "kernel/CLAUDE.md",
+    "examples/**/*.md",
+    "tests/**/*.md",
 ]
 
-# See the module docstring: evidence and ratified history, not stale documentation.
-EXEMPT_PREFIXES = ("audits/", "website/book/", "build/", "target/")
+# See the module docstring: evidence and ratified history, not stale documentation. `tests/conformance/`
+# is the UI-fixture corpus and its generated gallery, which quote dead paths on purpose.
+EXEMPT_PREFIXES = ("audits/", "website/book/", "build/", "target/", "tests/conformance/", ".claude/")
+
+
+def current_text(rel, text):
+    """The part of a document that claims to be current. For CLAUDE.md that is its body: the dated
+    amendments are blockquotes (`> **Amendment ...`), ratified history that may name what they removed."""
+    if rel == "CLAUDE.md":
+        return "\n".join(ln for ln in text.split("\n") if not ln.lstrip().startswith(">"))
+    return text
 
 PATHISH = re.compile(r"`([A-Za-z0-9_./-]+/[A-Za-z0-9_./-]+\.(?:rs|md|toml|py|json|gsh))`")
 
@@ -119,6 +142,11 @@ def check_backlog_refs():
 # the same reason PLANNED is a list. Each entry is a file that was deleted and whose absence is the
 # POINT of the sentence naming it.
 HISTORICAL = {
+    # Named in order to say they do NOT exist: CLAUDE.md A.7 ("was listed here and in §5 but was never
+    # written") and kernel/CLAUDE.md ("`kernel/src/control.rs` **does not exist**"). Both files came into
+    # this scan on 2026-10-10 (backlog/80 T8), and each sentence is the correction, not the drift.
+    "docs/bootstrap.md",
+    "kernel/src/control.rs",
     # The ARM USB stack moved to `services/dwc2`; these three docs are the record of that move, and
     # `kernel/src/arch/arm/CLAUDE.md` says outright "That file no longer exists".
     "arch/arm/dwc2.rs",
@@ -140,6 +168,9 @@ PLANNED = {
     "docs/hardware-findings.md",
     ".cargo/mutants.toml",
     "src/main.rs",  # the scaffolding template path in GETTING_STARTED.md, not a repo file
+    # tests/hardware/x86_64/12_PERFORMANCE_BRUTAL.md: "once all 10 results are collected, commit to"
+    # this file - nine are, BP2 is pending, so it is a file to be written, not one that was lost.
+    "tests/hardware/x86_64/baseline_brutal.json",
 }
 
 
@@ -178,7 +209,7 @@ def main() -> int:
         except OSError:
             continue
         doc_dir = os.path.dirname(rel)
-        for ref in sorted(set(PATHISH.findall(text))):
+        for ref in sorted(set(PATHISH.findall(current_text(rel, text)))):
             if ref.startswith(("http", "build/", "target/", "os/")) or ref in PLANNED or ref in HISTORICAL:
                 continue
             if not resolves(ref, doc_dir):

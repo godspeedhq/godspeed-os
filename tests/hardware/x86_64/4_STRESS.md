@@ -2,7 +2,7 @@
 
 Mirrors §22 Stress Tests (S1-S10). No drift, leak, or corruption under sustained load.
 
-**Reference:** `tests/qemu/stress/CLAUDE.md` for full spec.
+**Reference:** the `TestSpec` table in `osdev/src/validator.rs` is the full spec (there is no `tests/qemu/stress/` directory).
 
 **Status: 8/10** - S1, S2, S4, S5, S6, S7, S8, S10 pass. S3 and S9 not measured (Goldmont+ IPI quirk - same root cause as B2/BP2).
 
