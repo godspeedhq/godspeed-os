@@ -427,6 +427,74 @@ pub struct ShellCtx {
     /// Owned here for the reason `pipe_stack_hwm` and `last_write_err` are - a module-level `static`
     /// is the anonymous singleton invariant 9 forbids.
     jobs: core::cell::RefCell<JobTable>,
+    /// Keys a waiting request read from the console and did not want: the TYPE-AHEAD. A wait that
+    /// offers `[q] quit` has to read the console to see the `q`, and every other key it reads is the
+    /// next thing the person typed. `gs` hands each one to [`ShellCtx::keep_key`] instead of
+    /// discarding it, and every read of a key here drains this first ([`ShellCtx::console_read`]),
+    /// so nothing typed while a command waits is lost (`backlog/80` H16). Bounded (26.6); a full
+    /// buffer says so, once, rather than dropping keys in silence.
+    typeahead: core::cell::RefCell<TypeAhead>,
+    /// True while a SCRIPT runs (`run`, `selfcheck`, a library command): see [`ShellCtx::fs_waiting`].
+    in_script: core::cell::Cell<bool>,
+}
+
+/// The shell's bounded type-ahead (see `ShellCtx::typeahead`): a FIFO of keys, and whether a key has
+/// been dropped since it last emptied (so the drop is said once, not per key).
+const TYPEAHEAD_MAX: usize = 256;
+struct TypeAhead { buf: [u8; TYPEAHEAD_MAX], head: usize, len: usize, dropped: bool }
+impl TypeAhead {
+    const fn new() -> Self { TypeAhead { buf: [0; TYPEAHEAD_MAX], head: 0, len: 0, dropped: false } }
+    /// Append a key; false when full (the key is not kept).
+    fn push(&mut self, b: u8) -> bool {
+        if self.len == TYPEAHEAD_MAX { return false; }
+        self.buf[(self.head + self.len) % TYPEAHEAD_MAX] = b;
+        self.len += 1;
+        true
+    }
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 { self.dropped = false; return None; }
+        let b = self.buf[self.head];
+        self.head = (self.head + 1) % TYPEAHEAD_MAX;
+        self.len -= 1;
+        Some(b)
+    }
+}
+
+impl ShellCtx {
+    /// Keep a key a waiting request read and did not want - the `keep` a noticing `Fs`/`Net`/request
+    /// is given. A full buffer drops the key and says so ONCE until it has emptied.
+    fn keep_key(&self, b: u8) {
+        let first_drop = {
+            let mut t = self.typeahead.borrow_mut();
+            if t.push(b) { false } else { let first = !t.dropped; t.dropped = true; first }
+        };
+        if first_drop {
+            gs::io::println(self, "shell: typed-ahead keys dropped - more were typed during a wait than the shell holds");
+        }
+    }
+    /// The next key: a kept type-ahead key first, then the console (blocking). Shadows the SDK's
+    /// method of the same name for every `ctx: &ShellCtx`, so no reader can skip the buffer.
+    fn console_read(&self) -> u8 {
+        if let Some(b) = self.typeahead.borrow_mut().pop() { return b; }
+        self.inner.console_read()
+    }
+    /// An `fs` handle for a command that may WAIT on `fs`: with the `[q] quit` notice and the
+    /// type-ahead keep at the prompt, and the plain blocking handle inside a script.
+    ///
+    /// Inside a script nobody is typing at the prompt, so a notice has nothing to give - and it costs:
+    /// a noticing wait polls the console and yields for the whole request where a plain one blocks in
+    /// the kernel, so every `fs` read of a long script competed with `fs` itself for the core. That
+    /// was measured: `selfcheck`'s second run in one boot outran its 300 s window once every read in
+    /// it noticed (`backlog/80` H16).
+    fn fs_waiting<'a>(&'a self, notice: &'a dyn Fn(), keep: &'a dyn Fn(u8)) -> gs::fs::Fs<'a> {
+        let g = gs::fs::Fs::from_tag(&self.inner, self.fs_tag.get());
+        if self.in_script.get() { g } else { g.noticing(notice).keeping(keep) }
+    }
+    /// The next key if one is waiting: a kept type-ahead key first, then the console.
+    fn try_console_read(&self) -> Option<u8> {
+        if let Some(b) = self.typeahead.borrow_mut().pop() { return Some(b); }
+        self.inner.try_console_read()
+    }
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -464,6 +532,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         wifi_radio: core::cell::Cell::new(RADIOS[0]),
         audio_tag: core::cell::Cell::new(0),
         jobs: core::cell::RefCell::new(JobTable::new()),
+        typeahead: core::cell::RefCell::new(TypeAhead::new()),
+        in_script: core::cell::Cell::new(false),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -758,7 +828,7 @@ const ESC_WAIT_QUANTA: u32 = 10;
 /// already queued and `try_console_read` returns it at once; a serial terminal may split
 /// the bytes, so we wait a bounded few scheduler quanta (`ESC_WAIT_QUANTA`) before giving
 /// up. `None` ⇒ bare ESC. Returning quickly matters so a held key's repeats stay snappy.
-fn read_escape_byte(ctx: &ServiceContext) -> Option<u8> {
+fn read_escape_byte(ctx: &ShellCtx) -> Option<u8> {
     if let Some(b) = ctx.try_console_read() { return Some(b); }
     for _ in 0..ESC_WAIT_QUANTA {
         gs::task::sleep_quantum(ctx); // exactly one scheduler quantum, on every arch
@@ -1012,7 +1082,7 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
 /// Never the last scan (spec 56_wifi.md 8): completion writes into a line that history records, and a
 /// neighbour's network name has no business there. A driver that does not answer within the bound, or is
 /// not running, leaves `help` alone on offer - a completion is not the place for a loud sentence.
-fn complete_wifi_stored(ctx: &ServiceContext, line: &mut Line, tok_start: usize) -> bool {
+fn complete_wifi_stored(ctx: &ShellCtx, line: &mut Line, tok_start: usize) -> bool {
     /// One record in the reply: `len, ssid[32]`.
     const ENTRY: usize = 1 + 32;
     /// The driver holds at most 64.
@@ -1065,7 +1135,7 @@ fn complete_wifi_stored(ctx: &ServiceContext, line: &mut Line, tok_start: usize)
 /// Offer `cands` plus the word `help`, deduped, at a position below the first. Position 1 appends
 /// `version` and `help` itself; below it only `help` applies (a subcommand has no version of its own,
 /// rule 5), and it applies everywhere because every depth answers it (rule 2).
-fn complete_with_help(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) -> bool {
+fn complete_with_help(ctx: &ShellCtx, line: &mut Line, tok_start: usize, cands: &[&str]) -> bool {
     let mut all: [&str; 40] = [""; 40];
     let mut n = 0usize;
     for &c in cands { if n < all.len() { all[n] = c; n += 1; } }
@@ -1121,7 +1191,7 @@ const SUBCMD_TRAILING: &[(&str, &[&str])] = &[
 /// `seg_start..tok_start` holds the command + any already-typed args, which decide the command and
 /// whether this is the first argument. Returns `true` if it completed/offered a menu, `false` to fall
 /// through to path completion.
-fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok_start: usize) -> bool {
+fn complete_keyword(ctx: &ShellCtx, line: &mut Line, seg_start: usize, tok_start: usize) -> bool {
     let head = &line.bytes()[seg_start..tok_start];           // command + prior args (+ spaces)
     let mut words = head.split(|&b| b == b' ').filter(|w| !w.is_empty());
     let cmd = match words.next() { Some(c) => c, None => return false };
@@ -1352,7 +1422,7 @@ fn complete_keyword(ctx: &ServiceContext, line: &mut Line, seg_start: usize, tok
 /// Match the current token (`tok_start..end`) against `cands`: 0 matches → `false` (no change); 1 →
 /// fill it + a trailing space; several → the numbered menu (digit selects, Tab cycles). The single
 /// completion engine shared by command-name and keyword completion. Returns `true` when it acted.
-fn complete_from_list(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) -> bool {
+fn complete_from_list(ctx: &ShellCtx, line: &mut Line, tok_start: usize, cands: &[&str]) -> bool {
     let token = &line.bytes()[tok_start..];
     let mut matches = [""; 64];
     let mut n = 0usize;
@@ -1382,7 +1452,7 @@ fn fill_keyword(ctx: &ServiceContext, line: &mut Line, tok_start: usize, name: &
 
 /// Numbered menu for keyword candidates: a digit (1-9) commits, Tab cycles, any other key keeps the
 /// line. Mirrors `path_menu`.
-fn keyword_menu(ctx: &ServiceContext, line: &mut Line, tok_start: usize, cands: &[&str]) {
+fn keyword_menu(ctx: &ShellCtx, line: &mut Line, tok_start: usize, cands: &[&str]) {
     let n = cands.len();
     let shown = n.min(9);
     gs::io::print(ctx, "\r\n");
@@ -4042,6 +4112,11 @@ struct Tally { ran: u32, failed: u32, skipped: u32, aborted: bool }
 #[inline(never)]
 fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool,
              tally: Option<&mut Tally>, abortable: bool) -> Result<(), ShellError> {
+    // A script is running: `fs` waits block rather than notice (see `ShellCtx::fs_waiting`). The guard
+    // restores the outer value on every way out, so a nested run leaves its caller's state alone.
+    struct InScript<'c> { flag: &'c core::cell::Cell<bool>, was: bool }
+    impl Drop for InScript<'_> { fn drop(&mut self) { self.flag.set(self.was); } }
+    let _in_script = InScript { flag: &ctx.in_script, was: ctx.in_script.replace(true) };
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
@@ -6143,7 +6218,7 @@ const HELP_FIND_MAX: usize = 32;
 /// It still refuses to open with nobody watching: `depth > 0` means a script, `run`, `assert` or
 /// `selfcheck` is driving, and a browser waiting for a keypress there does not degrade, it HANGS.
 /// The piped form goes through `help_to_out` and never reaches here at all.
-fn help_browser(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, seek: &str) {
+fn help_browser(ctx: &ShellCtx, doc: &'static [HelpRow], title: &str, seek: &str) {
     let total = doc.len() + 1;
     let (rows, cols) = ctx.console_dims();
     let rows = if rows == 0 { 24 } else { rows as usize };
@@ -6312,7 +6387,12 @@ fn help_about(ctx: &ServiceContext, body: usize) {
         drawn += 1;
     }
     // One row per core, listing what the KERNEL says is there. `cores` is the live count.
-    let ncore = ctx.inspect_core_count().max(1);
+    // 0 is "the kernel did not answer" - no rows rather than a made-up core 0 (H20).
+    let ncore = ctx.inspect_core_count();
+    if ncore == 0 && drawn < body {
+        gs::io::print(ctx, "  cores: unknown - the kernel did not answer\x1b[K\n");
+        drawn += 1;
+    }
     for core in 0..ncore {
         if drawn >= body { break; }
         gs::io::print_fmt(ctx, format_args!("  core {}  ", core));
@@ -6331,7 +6411,7 @@ fn help_about(ctx: &ServiceContext, body: usize) {
 }
 
 /// Read a search term at the bottom of the screen. Backspace edits; Enter accepts; Esc cancels.
-fn help_read_find(ctx: &ServiceContext, buf: &mut [u8; HELP_FIND_MAX]) -> usize {
+fn help_read_find(ctx: &ShellCtx, buf: &mut [u8; HELP_FIND_MAX]) -> usize {
     let mut n = 0usize;
     loop {
         gs::io::print_fmt(ctx, format_args!(
@@ -6376,7 +6456,7 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
 enum HelpKey { Up, Down, PageUp, PageDown, Top, End }
 
 /// The body of an escape sequence, as a browser key.
-fn help_csi(ctx: &ServiceContext) -> Option<HelpKey> {
+fn help_csi(ctx: &ShellCtx) -> Option<HelpKey> {
     let mut param: u16 = 0;
     let mut fin = 0u8;
     for _ in 0..8 {
@@ -6728,7 +6808,7 @@ fn scrollback_view(ctx: &ShellCtx, depth: u8, page_back: bool) -> Result<(), She
 const SB_HDR: usize = 4;
 
 /// `help` - a browsable document (see `help_browser`), or a plain dump when nobody is watching.
-fn cmd_help(ctx: &ServiceContext, depth: u8, arg: &str) -> Result<(), ShellError> {
+fn cmd_help(ctx: &ShellCtx, depth: u8, arg: &str) -> Result<(), ShellError> {
     // NOBODY IS THERE TO PRESS A KEY. A script, `run`, `assert` or `selfcheck` is driving, and a
     // browser that waits for one does not degrade - it hangs the run. Same guard `paginate` carries,
     // and the reason paging belongs to things you ask for rather than things a command decides.
@@ -6741,7 +6821,7 @@ fn cmd_help(ctx: &ServiceContext, depth: u8, arg: &str) -> Result<(), ShellError
 }
 
 /// `docs` - the manual. Same browser, different document (see `DOCS`).
-fn cmd_docs(ctx: &ServiceContext, depth: u8, arg: &str) -> Result<(), ShellError> {
+fn cmd_docs(ctx: &ShellCtx, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
         for i in 0..DOCS.len() + 1 { help_render_line_of(ctx, DOCS, "docs", i); }
         return Ok(());
@@ -6772,7 +6852,7 @@ fn help_to_out(ctx: &ServiceContext, out: &mut Out) {
 /// Everything else - the in-place repaint, the key handling, the clamping - is unchanged. Its callers
 /// today are `paginate`'s two forms (`paginate_bytes`, `paginate_table`); `help` moved to
 /// `help_browser`.
-fn line_pager(ctx: &ServiceContext, total: usize, rows: usize,
+fn line_pager(ctx: &ShellCtx, total: usize, rows: usize,
               pinned: &dyn Fn(&ServiceContext) -> usize,
               render: &dyn Fn(&ServiceContext, usize),
               end_frame: &dyn Fn(&ServiceContext)) {
@@ -6873,7 +6953,7 @@ enum PagerKey { LineUp, LineDown, PageUp, PageDown, Top, Bottom, Other }
 
 /// Parse the body of an escape sequence (after `ESC [` or `ESC O`) into a `PagerKey`.
 /// Mirrors `handle_csi`'s reader but maps to scrolling: arrows, Home/End, PageUp/Down.
-fn pager_csi(ctx: &ServiceContext) -> PagerKey {
+fn pager_csi(ctx: &ShellCtx) -> PagerKey {
     const CSI_MAX: usize = 8;
     let mut param: u16 = 0;
     let mut final_byte = 0u8;
@@ -6913,7 +6993,7 @@ const INPUT_MAX: usize = 256;
 /// Read one console line into `buf` (until Enter). Printable chars are echoed UNLESS `secret`
 /// (invisible entry, like `sudo`). Backspace erases the last char (and un-echoes it for a visible
 /// line). Returns bytes read. Blocks for a real user - `input` is interactive (docs/scripting.md §8).
-fn read_input_line(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> usize {
+fn read_input_line(ctx: &ShellCtx, secret: bool, buf: &mut [u8]) -> usize {
     read_input_line_abortable(ctx, secret, buf).unwrap_or(0)
 }
 
@@ -6921,7 +7001,7 @@ fn read_input_line(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> usize 
 /// was typed is zeroed before the return. A secret prompt in particular must be abandonable - the
 /// `wifi` spec says so (`utilities/56_wifi.md` 4) - and the only ways out used to be Enter, which SENDS
 /// what was typed, or a passphrase too short to send.
-fn read_input_line_abortable(ctx: &ServiceContext, secret: bool, buf: &mut [u8]) -> Option<usize> {
+fn read_input_line_abortable(ctx: &ShellCtx, secret: bool, buf: &mut [u8]) -> Option<usize> {
     let mut len = 0usize;
     loop {
         let c = ctx.console_read();
@@ -6949,7 +7029,7 @@ fn read_input_line_abortable(ctx: &ServiceContext, secret: bool, buf: &mut [u8])
 /// (captured by `$( )`, or piped). `secret` = invisible entry; the captured value is tainted at the
 /// `let`/reassign site. Only the typed value goes to `out`, so `$(input …)` captures the reply, not
 /// the prompt.
-fn cmd_input(ctx: &ServiceContext, prompt: &str, out: &mut Out, secret: bool) -> Result<(), ShellError> {
+fn cmd_input(ctx: &ShellCtx, prompt: &str, out: &mut Out, secret: bool) -> Result<(), ShellError> {
     let p = strip_quotes(prompt.trim());
     if !p.is_empty() { gs::io::print(ctx, p); }
     let mut buf = [0u8; INPUT_MAX];
@@ -6960,7 +7040,7 @@ fn cmd_input(ctx: &ServiceContext, prompt: &str, out: &mut Out, secret: bool) ->
 
 /// Parse `input [secret [sealed]] "prompt"` and read one console line into `out`. `sealed` is a
 /// reserved escalation (docs/scripting.md §8); until its consumer exists it is treated as `secret`.
-fn run_input(ctx: &ServiceContext, arg: &str, out: &mut Out) {
+fn run_input(ctx: &ShellCtx, arg: &str, out: &mut Out) {
     let a = arg.trim();
     let (first, rest) = split_first(a);
     let (secret, prompt) = if first == "secret" {
@@ -7018,7 +7098,7 @@ fn cmd_about(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     // what it is, which build, which machine. `version` stays the RAW fact for piping; this is prose.
     out.line_fmt(ctx, format_args!("  Version {} {} ({})",
                                    env!("CARGO_PKG_VERSION"), ARCH, env!("GODSPEED_GIT_SHA")));
-    out.line_fmt(ctx, format_args!("  Running on {} core(s).", ctx.inspect_core_count()));
+    out.line_fmt(ctx, format_args!("  Running on {} core(s).", CoreCount(ctx.inspect_core_count())));
     out.line(ctx, "  Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.");
     Ok(())
 }
@@ -7143,6 +7223,16 @@ fn cmd_reboot(ctx: &ShellCtx) -> ! {
     ctx.reboot()
 }
 
+/// A core count as a person reads it: the number, or `unknown` for the 0 that
+/// `inspect_core_count` returns when the kernel did not answer. 0 is never a machine's core count,
+/// and it used to be 1, which is (`backlog/80` H20).
+struct CoreCount(u32);
+impl core::fmt::Display for CoreCount {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == 0 { f.write_str("unknown") } else { write!(f, "{}", self.0) }
+    }
+}
+
 /// `cores` - how many cores are up. `cores ticks` - each core's SCHEDULER-QUANTUM rate.
 ///
 /// The counter (`CORE_TOTAL_TICKS`) advances on a timer tick **and** on every `yield`, so for an
@@ -7159,8 +7249,12 @@ fn cmd_reboot(ctx: &ShellCtx) -> ! {
 /// Paced by the RTC (`gs::task::epoch_secs_monotonic`), never the TSC: this hardware's TSC-Hz calibration is
 /// unreliable, so a cycle-based interval would report a confidently wrong rate. It `sleep`s between
 /// polls rather than spinning, so the measurement does not perturb what it is measuring.
-fn cmd_cores(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), ShellError> {
+fn cmd_cores(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> {
     let n = ctx.inspect_core_count();
+    if n == 0 {
+        gs::io::println(ctx, "cores: unknown - the kernel did not answer");
+        return Err(ShellError::Unknown);
+    }
     match arg {
         "" => {
             out.line_fmt(ctx, format_args!("cores: {}", n));
@@ -7792,9 +7886,9 @@ fn hw_print(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8, explicit
     if !explicit {
         let mib = f.total_frames / 256;
         if mib >= 1024 {
-            out.line_fmt(ctx, format_args!("{} - {} core(s), {} GiB", ARCH, f.cores, (mib + 512) / 1024));
+            out.line_fmt(ctx, format_args!("{} - {} core(s), {} GiB", ARCH, CoreCount(f.cores), (mib + 512) / 1024));
         } else {
-            out.line_fmt(ctx, format_args!("{} - {} core(s), {} MiB", ARCH, f.cores, mib));
+            out.line_fmt(ctx, format_args!("{} - {} core(s), {} MiB", ARCH, CoreCount(f.cores), mib));
         }
     }
     for (i, sec) in HW_SECTIONS.iter().enumerate() {
@@ -8076,7 +8170,7 @@ fn hw_debug(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
 /// `hardware cpu debug`: what the kernel already reports per core.
 fn hw_cpu_debug(ctx: &ServiceContext, out: &mut Out) {
     let cores = ctx.inspect_core_count();
-    out.line_fmt(ctx, format_args!("cores      {} ready", cores));
+    out.line_fmt(ctx, format_args!("cores      {} ready", CoreCount(cores)));
     for core in 0..cores {
         let active = ctx.inspect_core_active_ticks(core);
         let total = ctx.inspect_core_total_ticks(core);
@@ -8355,7 +8449,7 @@ fn hw_tree(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
     hw_tree_parents(ctx, f, &mut parent);
     let mib = f.total_frames / 256;
     out.line_fmt(ctx, format_args!("machine  {}", ARCH));
-    out.line_fmt(ctx, format_args!("|- cpu       {} core(s)", f.cores));
+    out.line_fmt(ctx, format_args!("|- cpu       {} core(s)", CoreCount(f.cores)));
     out.line_fmt(ctx, format_args!("|- memory    {} MiB", mib));
     // Roots: every device with no parent, grouped under its section.
     for sec in ["pci", "soc", "display", "usb"] {
@@ -8954,7 +9048,7 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 /// The TSC is unreliable for this on some hardware: the AMD T630's CPUID-based TSC calibration is wrong,
 /// so a TSC interval collapsed to ~0 and the ping FLOODED (200 lines in a blink). The RTC second is
 /// portable and never floods - it just waits for the wall-clock second to tick over.
-fn ping_wait_or_quit(ctx: &ServiceContext) -> bool {
+fn ping_wait_or_quit(ctx: &ShellCtx) -> bool {
     // Deglitched monotonic seconds, not the raw RTC: a single CMOS misread (the T630's "4383d" glitch)
     // would otherwise skip or stall a pace interval.
     let start = gs::task::epoch_secs_monotonic(ctx);
@@ -8977,7 +9071,7 @@ const WAIT_MAX_SECS: u32 = 3600;
 /// wall-time on the T630). This is a USER-COMMANDED delay - the user (or their script) chose the
 /// cadence and holds the q escape - not a service coordinating with a peer, so Commandment VIII
 /// (wait on truth, not time) is not in play; services must still never pace dependencies this way.
-fn cmd_wait(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn cmd_wait(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     let secs = match parse_u32(arg) {
         Some(s) if (1..=WAIT_MAX_SECS).contains(&s) => s as i64,
         Some(_) => {
@@ -9136,7 +9230,7 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
 /// the reply is chip-tagged (0 = RTL8168, 1 = e1000). Reads only - shows CR (RE/TE), config, ring
 /// bases, and each RX descriptor's OWN/len, so you can see whether the receiver is even enabled and
 /// whether frames are sitting in the ring.
-fn net_stats_dump(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
+fn net_stats_dump(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let req = Message::from_bytes(&[5u8]);
     let reply = match net_query(ctx, "nic-driver", &req, 3, None) {
         NetQ::Reply(r) => r,
@@ -12546,7 +12640,7 @@ enum NetQ { Reply(Message), Timeout, Aborted }
 /// be escaped back to the prompt. Sends the (idempotent) query once per second, checking the console for
 /// an abort key between tries, up to `max_secs`. Returns the reply, a timeout, or Aborted. (Safe under
 /// the piped shell-test: it waits for the prompt between commands, so no input is pending during `net`.)
-fn net_query(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64, tag: Option<u8>) -> NetQ {
+fn net_query(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64, tag: Option<u8>) -> NetQ {
     // Drain any STALE reply left in our endpoint by a PRIOR command before we send ours - otherwise the
     // request_with_reply below reads that leftover as if it were our answer. A q-aborted continuous `ping`
     // leaves its last net-stack reply (a 4-byte [alive,rtt,ttl]) here; without this drain the next `net`
@@ -13063,7 +13157,10 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     // 1. Ask net-stack to listen. The reply carries a LISTENER capability.
     // Through `gs::net`: the opcodes, the capability lifetimes and the correlation tag are the
     // library's now. What stays here is what `serve` MEANS.
-    let mut gnet = gs::net::Net::new(&**ctx);
+    // A notice, so `q` reaches the `Cancelled` arm below, and a keep, so type-ahead survives (H16).
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);
+    let mut gnet = gs::net::Net::with_notice(&**ctx, &notice).keeping(&keep);
     let mut lis = match gnet.listen(port) {
         Ok(l) => l,
         // The user's own `q` while it was being opened. Nothing was granted, so nothing leaks.
@@ -13250,7 +13347,10 @@ fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         }
     };
 
-    let mut gnet = gs::net::Net::new(&**ctx);
+    // A notice, so `q` quits a wait that can run about 40 s; type-ahead kept (H16).
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);
+    let mut gnet = gs::net::Net::with_notice(&**ctx, &notice).keeping(&keep);
     let r = match gnet.socket() {
         Ok(mut s) => s.send_to(gs::net::Ipv4(dns), 53, &query[..qlen], &mut resp),
         Err(e) => {
@@ -13511,6 +13611,11 @@ fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut t = Table::new(&["name", "type", "size", "sealed"]);
     // `list_dir` owns the page walk and the 15-byte entry stride the comment above used to warn
     // about; this keeps only the mapping from an entry to a row.
+    // NO NOTICE HERE, deliberately. This table feeds a PIPE, and the stage at the end of it may own
+    // the keyboard: in `dir /many | paginate`, a `q` typed ahead is the pager's, and a noticing wait
+    // here took it as "quit this listing" and stopped after one page (`osdev test files`, H16). The
+    // fix that would let a producer notice is in the SDK - honour a quit key only once `[q] quit`
+    // has been shown, and keep it before that. Bare `dir`, which ends at the console, still notices.
     let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
     let walked = g.list_dir(path, |e| {
         let name = t.intern(e.name);
@@ -13697,6 +13802,7 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
     let mut cancelled = false;
+    // No notice: this table feeds a pipe whose last stage may own the keyboard (see `build_dir_table`).
     while let Some(dlen) = stack.pop(&mut dir) {
         let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
         let walked = g.list_dir(&dir[..dlen], |e| {
@@ -13982,7 +14088,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
 ///
 /// `#[inline(never)]`: `pipe_run`'s frame already carries a 16 KiB `Stream`.
 #[inline(never)]
-fn paginate_sink(ctx: &ServiceContext, s: &Stream, out: &mut Out, depth: u8) -> Result<(), ShellError> {
+fn paginate_sink(ctx: &ShellCtx, s: &Stream, out: &mut Out, depth: u8) -> Result<(), ShellError> {
     let interactive = depth == 0 && matches!(out, Out::Console);
     if !interactive {
         match s {
@@ -14507,7 +14613,7 @@ fn cmd_trace(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 /// as a grid on the console, pages when it is taller than the screen, and pipes into the record verbs
 /// (`events ipc | where peer=fs`, `| to json`, `| to yaml`, `| count`). One producer, three uses -
 /// the alternative was a printer plus a separate serialiser that would drift apart.
-fn build_trace_table(ctx: &ServiceContext, failures_only: bool) -> Option<Table> {
+fn build_trace_table(ctx: &ShellCtx, failures_only: bool) -> Option<Table> {
     // Ask for exactly what a record `Table` can hold - not a screenful, and not the whole ring.
     //
     // The ring keeps 192 events and one reply carries at most 110 of them (`events` caps a dump to fit
@@ -14691,7 +14797,7 @@ fn paginate_line(ctx: &ServiceContext, f: &mut FrameBuf, line: &[u8], cols: usiz
 ///
 /// `#[inline(never)]`: called from `pipe_run`, whose frame already carries a 16 KiB `Stream`.
 #[inline(never)]
-fn paginate_bytes(ctx: &ServiceContext, b: &[u8]) {
+fn paginate_bytes(ctx: &ShellCtx, b: &[u8]) {
     let (rows, cols) = ctx.console_dims();
     // UNKNOWN GEOMETRY IS NOT "NO TERMINAL" - the same rule `help` and `edit` follow. A failed
     // lookup returns 0, and treating that as a reason to skip paging would make the feature vanish
@@ -14729,7 +14835,7 @@ fn paginate_bytes(ctx: &ServiceContext, b: &[u8]) {
 ///
 /// `#[inline(never)]`: same frame argument as `paginate_bytes`.
 #[inline(never)]
-fn paginate_table(ctx: &ServiceContext, t: &Table,
+fn paginate_table(ctx: &ShellCtx, t: &Table,
                   pinned_extra: &dyn Fn(&ServiceContext, &mut FrameBuf) -> usize,
                   extra_hint: usize) {
     let (rows, _cols) = ctx.console_dims();
@@ -14919,7 +15025,7 @@ fn trace_op_cell(t: &mut Table, peer: &[u8], op: u8) -> Value {
 /// pipeline's frame - including byte-only ones that never build a record. The shell's user stack is
 /// 256 KiB and `pipe_run` already sits near it.
 #[inline(never)]
-fn build_deps_table(ctx: &ServiceContext, name: &str) -> Option<Table> {
+fn build_deps_table(ctx: &ShellCtx, name: &str) -> Option<Table> {
     if name.is_empty() {
         gs::io::println(ctx, "usage: trace deps <service>");
         return None;
@@ -15176,7 +15282,7 @@ fn trace_legend(ctx: &ServiceContext, f: &mut FrameBuf, n: usize) -> usize {
 /// that must be exact is the PINNED height, and that comes from `trace_legend` itself.
 const TRACE_LEGEND_LINES: usize = 7;
 
-fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellError> {
+fn trace_events(ctx: &ShellCtx, failures_only: bool) -> Result<(), ShellError> {
     let t = match build_trace_table(ctx, failures_only) {
         Some(t) => t,
         None    => return Err(ShellError::Unknown),
@@ -15215,7 +15321,7 @@ fn trace_events(ctx: &ServiceContext, failures_only: bool) -> Result<(), ShellEr
 /// events and control requests on one 16-deep endpoint, so a burst of events can fill it and reject
 /// the reader - which is congestion, not absence, and the two must not be reported the same way
 /// (the same distinction `KIND_QUEUE_FULL` exists for). Bounded: three attempts, then it says so.
-fn trace_ask(ctx: &ServiceContext, req: &[u8]) -> ReqOutcome {
+fn trace_ask(ctx: &ShellCtx, req: &[u8]) -> ReqOutcome {
     // BOUNDED AND `q`-ABORTABLE, for the same reason as `ns_query` and `fs_request` - and with
     // more force here than either. `request_with_reply` parks the caller inside the syscall where it
     // cannot poll the console, so an `events` that is alive but not answering froze the prompt with
@@ -15459,7 +15565,7 @@ fn trace_endpoint_holders(ctx: &ServiceContext, id: u64) -> Result<(), ShellErro
 ///   trace deps shell                      -> the tree
 ///   trace deps shell | where peer=fs      -> the edges into fs
 ///   trace deps shell | to json            -> the graph, machine-readable
-fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+fn trace_deps(ctx: &ShellCtx, name: &str) -> Result<(), ShellError> {
     let t = match build_deps_table(ctx, name) {
         Some(t) => t,
         None    => return Err(ShellError::Unknown),
@@ -15523,7 +15629,7 @@ fn trace_deps(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 /// moment of a crash is indistinguishable from a number being maintained right now, and an instrument
 /// that cannot tell those apart is worse than none.
 #[inline(never)]
-fn build_trace_metrics_table(ctx: &ServiceContext) -> Option<Table> {
+fn build_trace_metrics_table(ctx: &ShellCtx) -> Option<Table> {
     use godspeed_sdk::trace::{MET_LEN, MET_NAME_LEN, PEER_LEN};
     let req = [godspeed_sdk::trace::TRACE_OP_METRICS];
     let reply = match trace_ask(ctx, &req) {
@@ -16024,7 +16130,7 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 /// The sink stores `owner US text NL`. The owner is a FIELD, never a prefix glued to the text, which
 /// also removes the guesswork of deciding where a name ends - `dwc2` logs its lines as `dwc2-svc:`.
 #[inline(never)]
-fn build_events_log_table(ctx: &ServiceContext) -> Option<Table> {
+fn build_events_log_table(ctx: &ShellCtx) -> Option<Table> {
     let req = [godspeed_sdk::trace::TRACE_OP_LOGS];
     let reply = match trace_ask(ctx, &req) {
         ReqOutcome::Reply(r) => r,
@@ -16099,7 +16205,7 @@ fn build_events_log_table(ctx: &ServiceContext) -> Option<Table> {
 /// NO PAGER, deliberately. `events ipc` pages and waits for a keypress, which is right at a prompt and
 /// fatal in a script - a bare `assert ok events ipc` hung the whole selfcheck suite until the harness
 /// timed out. This prints a bounded screenful and returns.
-fn events_log(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
+fn events_log(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // A count, or nothing. Any other word was read as "the default 20" (`backlog/80` H20).
     let a = arg.trim();
     let want = if a.is_empty() { 20 } else {
@@ -16184,7 +16290,7 @@ fn events_log_boot(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError
     Ok(())
 }
 
-fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn trace_metrics(ctx: &ShellCtx) -> Result<(), ShellError> {
     let t = match build_trace_metrics_table(ctx) {
         Some(t) => t,
         None => return Err(ShellError::Unknown),
@@ -16222,7 +16328,7 @@ fn trace_metrics(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// The drop count is the point. A ring that silently discards is the failure this project just fixed
 /// in the x86 keyboard path; one that reports what it lost is an instrument you can trust the rest of
 /// (invariant 12).
-fn trace_status(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn trace_status(ctx: &ShellCtx) -> Result<(), ShellError> {
     let req = [godspeed_sdk::trace::TRACE_OP_STATUS];
     let reply = match trace_ask(ctx, &req) {
         ReqOutcome::Reply(r) => r,
@@ -16551,7 +16657,7 @@ const OBSERVE_QPOLL_MS: u64 = 30;
 /// here (one reader, no race), and both we and the child SLEEP between polls so their cores halt
 /// while `observe` is up - otherwise a busy wait would peg the core and make every task on it
 /// read as ~100% in observe's own display. Then we restore the screen and our read loop resumes.
-fn cmd_observe_live(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn cmd_observe_live(ctx: &ShellCtx) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-live"); // clear any stale instance
     // Pin the painter to a DIFFERENT core than this shell. Its framebuffer-heavy repaint must not
     // share a core with this q-poll loop, or it starves `q` (the "stuck" that showed up once the
@@ -17635,7 +17741,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
 
 /// Yield for up to `secs` of RTC wall-clock, returning true the instant q/Q/ESC is pressed (abort).
 /// Bounded + portable (RTC, not the T630-broken TSC).
-fn hold_or_abort(ctx: &ServiceContext, secs: i64) -> bool {
+fn hold_or_abort(ctx: &ShellCtx, secs: i64) -> bool {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     while gs::task::epoch_secs_monotonic(ctx) - t0 < secs {
         while let Some(b) = ctx.try_console_read() {
@@ -17656,7 +17762,7 @@ fn hold_or_abort(ctx: &ServiceContext, secs: i64) -> bool {
 /// layer event and paces it. q-abortable, and an abort always clears the override. This is the FIRST
 /// service-specific chaos - standard chaos (kill/flood/storm) is universal; a service's own failure surface
 /// (net-stack's link) is its own scenario (do not build a speculative framework, §26.2).
-fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+fn chaos_link_flap(ctx: &ShellCtx, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     if ntok >= 2 && tok[1] == "help" {
         chaos_sub_help(ctx, "link-flap");
         return Ok(());
@@ -17727,7 +17833,7 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
 /// keyboard back + self-terminates. The shell goes "muted" (see the main loop) for the duration. Kill
 /// any prior instance first - one-shot, no graceful self-exit race - exactly like `observe now`.
 fn chaos_launch(
-    ctx: &ServiceContext,
+    ctx: &ShellCtx,
     target: &str,
     rounds: u32,
     // `yes` given on the command line: the operator has already made the decision, so ASK nothing.
@@ -18241,7 +18347,7 @@ fn count_named(ctx: &ServiceContext, name: &str) -> u32 {
 /// memory returned to baseline, and no pre-existing service was lost. Bounded + loud: hard spawn cap,
 /// RTC-bounded reclaim wait, q aborts.
 #[inline(never)]
-fn chaos_spawn_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     const SPAWN_STORM_DEFAULT: u32 = 256;  // aim past most machines' ceilings; the loop stops at the wall
     const SPAWN_STORM_MAX:     u32 = 512;
     const SPAWN_DROP_MIN:      u64 = 4096; // >= 16 MiB dropped = the hog's alloc landed (truth, not a timer)
@@ -19031,9 +19137,10 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 /// already handle: a reply, the user's quit, or no answer in time. `inline(always)`: it returns a 4 KiB
 /// message by value, and as its own frame that would be another 4 KiB of the shell's stack.
 #[inline(always)]
-fn ask_with_quit_notice(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> ReqOutcome {
+fn ask_with_quit_notice(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64) -> ReqOutcome {
     let notice = || gs::io::println(ctx, "  [q] quit");
-    match gs::call::request_within_notice(ctx, peer, msg, max_secs, Some(&notice), None) {
+    let keep = |b: u8| ctx.keep_key(b);   // type-ahead read during the wait is kept (H16)
+    match gs::call::request_within_notice(ctx, peer, msg, max_secs, Some(&notice), Some(&keep)) {
         Ok(r) => ReqOutcome::Reply(r),
         Err(gs::Error::Cancelled) => ReqOutcome::Aborted,
         // With a notice, `gs` answers OutcomeUnknown for the deadline (and for a send that never left,
@@ -19074,7 +19181,11 @@ fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
 /// Stat a path through `gs::fs`, keeping the error: a caller that must tell "absent" from "fs did not
 /// answer" uses this rather than `fs_stat`.
 fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    // `q` quits the wait, as `dir`'s does, and a key typed meanwhile is KEPT for the prompt
+    // (`backlog/80` H16): without a notice the callers' `Cancelled` arms could never fire.
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);
+    let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.stat(path);
     ctx.fs_tag.set(g.tag());
     r
@@ -19083,7 +19194,9 @@ fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise (absent and unanswered alike).
 /// Used by the streaming read/copy paths to learn a file's size before chunking through it.
 fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);   // q quits; type-ahead kept (H16)
+    let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.stat(path);
     ctx.fs_tag.set(g.tag());
     r.ok().map(|st| (st.size, st.is_dir))
@@ -19092,8 +19205,11 @@ fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
 /// Read up to `IO_CHUNK` bytes from `path` at byte `offset` into `out`; returns bytes read
 /// (0 at EOF). One message - the building block for streaming a large file.
 fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
-    // `None` is a failure, never the end of the file (EOF is Some(0)) - every caller must treat it so.
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    // q quits the wait and type-ahead is kept (H16). `None` is then "no answer", as a failure is - so
+    // every caller must treat `None` as a failure, never as the end of the file (EOF is Some(0)).
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);
+    let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.read_at(path, offset, out);
     ctx.fs_tag.set(g.tag());
     r.ok()
@@ -19339,8 +19455,11 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     // The PAGING, the entry layout, the page cap and the did-it-finish answer are the library's.
     // What stays here is what `dir` means by a row.
     let notice = || gs::io::println(ctx, "  [q] quit");
+    // A key typed while the listing waits is the NEXT command, and is kept for it (H16): the notice
+    // reads the console to see `q`, and used to discard everything else it read.
+    let keep = |b: u8| ctx.keep_key(b);
     let listing = {
-        let mut fs = gs::fs::Fs::from_tag(&*ctx, ctx.fs_tag.get()).noticing(&notice);
+        let mut fs = ctx.fs_waiting(&notice, &keep);
         let r = fs.list_dir(str_of(path), |e| {
         if !header_done {
             out.line(ctx, "  NAME                  TYPE       SIZE  MODIFIED");
@@ -22356,10 +22475,12 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
     let mut first = true;
     let mut dir = [0u8; PATH_MAX];
     let mut cancelled = false;
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);   // q quits the walk; type-ahead kept (H16)
     while let Some(dlen) = stack.pop(&mut dir) {
         let is_start = first;
         first = false;
-        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let mut g = ctx.fs_waiting(&notice, &keep);
         let walked = g.list_dir(&dir[..dlen], |e| {
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], e.name, &mut child) {
@@ -22475,7 +22596,9 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
         // second buffer: the entries are already on the stack.
         let base = stack.top;
         let mut nc = 0usize;
-        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let notice = || gs::io::println(ctx, "  [q] quit");   // q quits the walk; type-ahead kept (H16)
+        let keep = |b: u8| ctx.keep_key(b);
+        let mut g = ctx.fs_waiting(&notice, &keep);
         let walked = g.list_dir(&buf[..plen], |e| {
             // THE FAN-OUT CAP IS REPORTED NOW. It used to stop at 64 children of a page and say
             // nothing, so a wide directory was drawn short and read as complete - the same class of
@@ -22688,7 +22811,9 @@ const FILTER_READ_MAX: usize = 8192;
 /// matters is the one the old path could not make: a file that is ABSENT versus one that is merely
 /// bigger than the buffer. Both used to print "not found".
 fn filter_read(ctx: &ShellCtx, verb: &str, path: &[u8], buf: &mut [u8]) -> Result<usize, ()> {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);   // q quits the read (match, count, sort, first, last); type-ahead kept (H16)
+    let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.read_into(path, buf);
     ctx.fs_tag.set(g.tag());
     match r {
@@ -23436,7 +23561,7 @@ fn drives_label(ctx: &ShellCtx, name: &str) -> Result<(), ShellError> {
 /// Read one line from the console and return true iff it begins with y/Y. This function echoes
 /// what is typed (the console read does not), so the user sees their answer; default (empty /
 /// anything else) is No.
-fn read_confirm(ctx: &ServiceContext) -> bool {
+fn read_confirm(ctx: &ShellCtx) -> bool {
     // Line-edited y/N: accept characters with BACKSPACE editing and decide on the FINAL line at Enter,
     // so a mistyped answer can be corrected - `y` then backspace then `n` reads as N, not the committed
     // `y`. console_read does not echo, so we echo each printable char and a destructive backspace erase
