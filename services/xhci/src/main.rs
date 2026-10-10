@@ -4530,7 +4530,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // INTERRUPT-DRIVEN (§12, docs/power.md). Block until the controller's next MSI-X (a
             // device event, e.g. a keypress) or a deadline, instead of busy-yielding, so the core
             // can `hlt` between events and drops to ~0% CPU at rest. The wake is now LOCAL: the
-            // xHCI MSI is co-located to this driver's OWN core (task::XHCI_CORE + pci.rs), so a
+            // xHCI MSI goes to this driver's OWN core (the kernel aims it there at spawn), so a
             // keypress wakes this core directly out of idle rather than paging a halted AP across
             // cores - the destination/placement drift that made the earlier attempt lag
             // (docs/power.md §11). A held key emits no new USB reports, so while one is armed we
@@ -4554,7 +4554,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // nothing programmed the Pi 4 VL805's MSI, so this timeout WAS the polling interval - and
             // 250 ms per keystroke is a quarter-second of lag on every character typed. (Note
             // 2026-10-09: the VL805's MSI is enabled now, by `enable_msi` in arch/aarch64/pcie.rs;
-            // `program_xhci_msi` there is still the `false` stub.)
+            // the dead `false` stub beside it was deleted 2026-10-10, backlog/80 K20.)
             //
             // Rather than shorten it everywhere, which would burn ~100 wakeups/second on boards that
             // are already interrupt-driven and undo the power work, it ADAPTS: if several waits in a
