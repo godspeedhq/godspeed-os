@@ -154,6 +154,8 @@ struct Play {
     underruns: u32,
     silence: usize,
     started: u64,
+    /// When `service` last read the engine's position, for the underrun line.
+    looked: u64,
     feed: Option<Feed>,
     /// A system sound (`OP_SOUND`), written whole before the engine reached it.
     sound: bool,
@@ -384,7 +386,7 @@ impl<'a> Pwm<'a> {
         self.play = Some(Play {
             sine: Sine::new(hz, RATE_DEFAULT), hz, ms, left: frames, frames, filled: at + GUARD, played: at,
             last: at, begin: at + GUARD, end_at: usize::MAX, underruns: 0, silence: 0,
-            started: wait::ticks(self.ctx), feed: None, sound: false,
+            started: wait::ticks(self.ctx), looked: wait::ticks(self.ctx), feed: None, sound: false,
         });
         self.ctx.log_fmt(format_args!("pwm-audio: playing {} Hz for {} ms", hz, ms));
         self.service();
@@ -411,7 +413,7 @@ impl<'a> Pwm<'a> {
         self.play = Some(Play {
             sine: Sine::new(1, RATE_DEFAULT), hz: 0, ms: (frames as u64 * 1000 / RATE_DEFAULT as u64) as u32,
             left: 0, frames, filled: start + frames, played: at, last: at, begin: start, end_at: start + frames,
-            underruns: 0, silence: 0, started: wait::ticks(ctx), feed: None, sound: true,
+            underruns: 0, silence: 0, started: wait::ticks(ctx), looked: wait::ticks(ctx), feed: None, sound: true,
         });
         self.last_sound = Some(wait::ticks(ctx));
         true
@@ -434,7 +436,7 @@ impl<'a> Pwm<'a> {
             // heard, the price of not stuttering at its start.
             frames: frames as usize, filled: at + RING_FRAMES / 2, played: at, last: at, begin: at + RING_FRAMES / 2,
             end_at: usize::MAX, underruns: 0, silence: 0,
-            started: wait::ticks(ctx), feed: Some(Feed { channels, ended: false, last_feed: wait::ticks(ctx) }),
+            started: wait::ticks(ctx), looked: wait::ticks(ctx), feed: Some(Feed { channels, ended: false, last_feed: wait::ticks(ctx) }),
             sound: false,
         });
         ctx.log_fmt(format_args!("pwm-audio: stream opened - {} Hz, {} channel(s), {} frames", rate, channels, frames));
@@ -485,8 +487,15 @@ impl<'a> Pwm<'a> {
         let ctx = self.ctx;
         let pos = self.position();
         let Some(mut p) = self.play.take() else { return };
-        p.played += (pos + RING_FRAMES - p.last) % RING_FRAMES;
+        let moved = (pos + RING_FRAMES - p.last) % RING_FRAMES;
+        let now = wait::ticks(ctx);
+        let gap_us = match wait::ticks_per_10ms(ctx) {
+            0 => 0,
+            per => now.wrapping_sub(p.looked) * 10_000 / per,
+        };
+        p.played += moved;
         p.last = pos;
+        p.looked = now;
         let mut done = false;
         if let Some(f) = p.feed.as_mut() {
             if !f.ended && ms_since(ctx, f.last_feed) > FEED_TIMEOUT_MS {
@@ -506,6 +515,13 @@ impl<'a> Pwm<'a> {
             }
         } else {
             if p.played > p.filled {
+                // The Pi 4 counts one in every tone and the Pi 2 none (`docs/audio.md`); the first of a
+                // play says where it fell, so the next boot says why rather than how many.
+                if p.underruns == 0 {
+                    ctx.log_fmt(format_args!(
+                        "pwm-audio: underrun {} ms into the play - the engine was {} frames past the written end, having moved {} frames (ring position {} -> {}) in the {} us since the last look",
+                        ms_since(ctx, p.started), p.played - p.filled, moved, p.last.wrapping_add(RING_FRAMES - moved) % RING_FRAMES, pos, gap_us));
+                }
                 p.underruns += 1;
                 p.filled = p.played;
             }
