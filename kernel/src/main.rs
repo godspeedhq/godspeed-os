@@ -307,10 +307,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // EHCI interrupt path (§12): program it HERE - before the firmware USB handoff + IOMMU
     // below - which is where it worked in the E2 build; deferring it past the handoff stopped
     // the legacy INTx from delivering on the T630. The EHCI routes to the BSP (available now,
-    // pre-smp::init - only the xHCI's core-1 MSI needs the APs up, so that one stays deferred).
-    // The EHCI driver is pinned to the BSP (task/mod.rs) to match. Interrupters stay off until
-    // each userspace driver enables them, so nothing fires yet.
-    if !arch::imp::pci::program_ehci_msi() {
+    // pre-smp::init). An MSI is re-aimed at the driver's own core when the driver is spawned
+    // (`task::spawn_from_image`, backlog/80 K27); here it can only reach the BSP. Interrupters stay
+    // off until each userspace driver enables them, so nothing fires yet.
+    if !arch::imp::pci::program_ehci_msi(0) {
         arch::imp::pci::route_ehci_intx();
     }
 

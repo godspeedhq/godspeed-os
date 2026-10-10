@@ -11,7 +11,7 @@
 //!
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use portable_atomic::AtomicU64;
 use crate::smp::SpinLock;
 
@@ -1078,7 +1078,7 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
 pub fn msi_dest_lapic(core_id: u32) -> u8 { usb_irq_dest_lapic(core_id) }
 
 /// LAPIC id to deliver a USB controller's interrupt to: the core `driver_core` the owning driver is
-/// is pinned to (the core it was spawned on; `task::EHCI_CORE` for `ehci`). Delivering the IRQ to
+/// is pinned to (the core it was spawned on). Delivering the IRQ to
 /// the driver's OWN core means a device event (a keypress) wakes that core directly out of its idle
 /// `hlt` and the wake stays core-local - no cross-core IPI or BSP scan, which an idle AP on this
 /// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if that core is not
@@ -1097,20 +1097,38 @@ fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
 /// Classic Intel-ICH EHCI exposes neither (legacy INTx only - would need IOAPIC routing);
 /// other EHCIs (e.g. AMD) may have MSI. This both does P1 (when MSI exists) AND tells us at
 /// boot which interrupt path the running machine's EHCI needs.
-pub fn program_ehci_msi() -> bool {
+///
+/// Delivered to `core_id`'s LAPIC. Called twice over a boot's life: once at boot, before any AP is
+/// up, where every destination falls back to the BSP; and again at every spawn of the `ehci` driver,
+/// with the core THAT instance landed on (backlog/80 K27). The second call is what makes the
+/// co-location real: the destination used to be a kernel constant (3) that the
+/// supervisor's spawn row restated by hand, and at boot it resolved to the BSP regardless. Now the
+/// destination is the spawned task's own core, so there is one statement of where the driver runs -
+/// the supervisor's row - and a restart that lands elsewhere is followed.
+///
+/// A controller found at boot to have neither MSI nor MSI-X is remembered as INTx, and a later call
+/// returns false without repeating the boot line: its interrupt is routed through the IOAPIC to the
+/// BSP (`route_ehci_intx`) and there is nothing to aim.
+pub fn program_ehci_msi(core_id: u32) -> bool {
     let Some(dev) = ehci() else { return false };
+    if EHCI_INTX.load(Ordering::Relaxed) { return false; }
     let bdf = dev.bdf;
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
-    let dest = usb_irq_dest_lapic(crate::task::EHCI_CORE);
+    let dest = usb_irq_dest_lapic(core_id);
     // MSI first, MSI-X only as a fallback - see `msi_ordering`.
     let ok = program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest);
     if !ok {
+        EHCI_INTX.store(true, Ordering::Relaxed);
         crate::kprintln!(
             "ehci: no MSI/MSI-X capability - controller uses legacy INTx (IOAPIC routing needed)"
         );
     }
     ok
 }
+
+/// Set when `program_ehci_msi` finds the EHCI has no MSI or MSI-X, so the spawn-time re-aim knows
+/// the controller is on INTx and leaves it there. Written once, at boot, before any spawn.
+static EHCI_INTX: AtomicBool = AtomicBool::new(false);
 
 /// Route the EHCI's legacy INTx pin through the IOAPIC to the kernel's EHCI vector (§12), for
 /// a controller with no MSI.
@@ -1129,9 +1147,9 @@ pub fn route_ehci_intx() {
     // Deliver to the BSP (core 0) - a legacy PCI INTx pin routes through the IOAPIC only to the
     // BSP on this hardware (unlike an MSI, which can target any core). Verified on the T630: INTx
     // delivers to the BSP; routing it to an AP's LAPIC id silently dropped it.
-    // (2026-10-09: this used to say the EHCI driver is pinned to core 0 to match. `task::EHCI_CORE`
-    // is 3, so on a multi-core machine deliver() runs on core 0 and the wake to the driver crosses
-    // cores - the case the MSI path's co-location exists to avoid.)
+    // (2026-10-09: this used to say the EHCI driver is pinned to core 0 to match. The supervisor
+    // places it on core 3, so on a multi-core machine deliver() runs on core 0 and the wake to the
+    // driver crosses cores - the case the MSI path's co-location exists to avoid. `backlog/80` K17.)
     let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
     let legacy = dev_pci.irq_line;
 

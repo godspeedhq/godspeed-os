@@ -749,16 +749,6 @@ impl HwClass {
     }
 }
 
-/// The core each USB host-controller driver is expected on, as the kernel's MSI/INTx destination
-/// routing (`arch::x86_64::pci`) reads it, so a controller interrupt is delivered to the core the
-/// driver runs on (§12). NOT a single source of truth any more: the drivers' placement now comes from
-/// the supervisor's `USB_IMAGES` rows (`services/supervisor/src/main.rs`), which carry the same 2 and 3
-/// as literals, and nothing checks that the two agree. (2026-10-09: this said `ServiceConfig.preferred_core`
-/// read these; the kernel catalogue is `supervisor` alone, so no catalogue row does.) Co-location is required for interrupt-driven USB (docs/power.md):
-/// a keypress MSI must wake the driver's OWN core out of its idle `hlt` locally, because a cross-core
-/// wake to a halted AP is not serviced promptly on this hardware. Both sit on cores 2/3 (off core 1)
-/// because busy-polling two controllers on one core saturated it; when they block, that can relax.
-pub const EHCI_CORE: u32 = 3;
 
 /// Is this a device class this kernel understands? 0 = none.
 ///
@@ -1439,6 +1429,15 @@ pub fn spawn_from_image(
         _ => [0],
     };
     let irqs: &[u8] = if pci_irq[0] != 0 { &pci_irq } else { hw_irqs_for(hw) };
+    // The EHCI's MSI goes to the core THIS instance landed on, so a keypress wakes the driver's own
+    // core out of its idle halt (docs/power.md) - and a restart that lands elsewhere is followed
+    // (§9.2). It used to be aimed at a kernel constant the supervisor's row restated by hand, with
+    // nothing linking the two (backlog/80 K27); the supervisor's row is now the one statement. The
+    // result is not an error either way: false means the controller is on INTx, which boot already
+    // reported and routed to the BSP, and there is nothing to aim.
+    if hw == HwClass::Ehci {
+        crate::arch::imp::pci::program_ehci_msi(core_id);
+    }
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
                                           peers_grant, mem, irqs, has_console_read,
                                           Some(privileges), Some(hw), installs, watched);
