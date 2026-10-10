@@ -108,7 +108,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
             // `name` may carry a NUL-separated PEER LIST after it, exactly as SpawnRequest's payload
             // does: `producer\0sink` is how a pipe arrives. A pipe is not a special kind of spawn -
             // it is a spawn whose producer is given its downstream as a peer, which is precisely what
-            // the kernel's own `spawn_service_pipe` does.
+            // the kernel's by-name pipe spawn did before it was retired (backlog/80 K14).
             Ok(spec) if !spec.is_empty() => {
                 let mut it = spec.split('\0');
                 let name = match it.next() { Some(n) if !n.is_empty() => n, _ => return true };
@@ -146,7 +146,12 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
                         match spawn_by_image(ctx, name, core, &peers[..np], &[]) {
                             Some(Ok(c))  => { spawned_cap = c; true }
                             Some(Err(_)) => false,
-                            None         => ctx.spawn_pipe(name, peers[0]).is_ok(),
+                            // No image here means no way to start it: the kernel's by-name pipe spawn
+                            // (SpawnPipe) was retired, and could only ever refuse (backlog/80 K14).
+                            None         => {
+                                ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
+                                false
+                            }
                         }
                     }
                 } else if core == u32::MAX {
@@ -179,7 +184,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
 
     // The reply carries a SEND|GRANT cap to the new service, when there is one.
     //
-    // This is FORCED by the capability rules, not a convenience. `spawn_with_caps` TRANSFERS a cap
+    // This is FORCED by the capability rules, not a convenience. `spawn_image` TRANSFERS a cap
     // into a child, and a transfer requires GRANT (8.5); only a service's SPAWNER is handed
     // SEND|GRANT to it, `acquire_send_cap` yields SEND alone, and rights never widen (7.3). So once
     // the supervisor owns an image, NOTHING else can ever obtain a grantable cap to that service
@@ -1030,26 +1035,10 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
             }
         };
     }
-    match ctx.spawn_with_caps(name, 0xFFFF, &installs[..n]) {
-        Ok(Some(cap)) => {
-            // Frees the dead instance's cap on a restart (see spawn_mapped) - no cap-table leak.
-            record_name_quiet(ctx, map, name, cap);
-            ctx.log_fmt(format_args!(
-                "supervisor: {} wired from the name-cap map ({} peer(s) provided; rest name-wired)", name, n));
-            true
-        }
-        Ok(None) => { ctx.log_fmt(format_args!("supervisor: {} wired (no endpoint to record)", name)); true }
-        Err(_)   => {
-            // A provided peer cap was stale/dead: the peer respawned under heavy restart churn (e.g.
-            // `chaos max-carnage`), leaving the map cap pointing at a dead instance, so spawn_with_caps
-            // rejected the whole spawn. Retry FULLY NAME-WIRED - the kernel resolves live peers by name
-            // from its directory and the new service reacquires any down peer on EndpointDead (§14.3).
-            // This is what makes fs/shell recover after a storm instead of staying dead on a stale cap.
-            ctx.log_fmt(format_args!(
-                "supervisor: {} cached peer cap stale (peer restarted) - name-wiring instead", name));
-            spawn_mapped(ctx, map, name, 0xFFFF)
-        }
-    }
+    // No image for it: nothing can start it. The kernel's by-name spawn with installs (SpawnWithCaps)
+    // was retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/80 K14).
+    ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
+    false
 }
 
 /// Record `name -> cap` in the map, replacing any previous entry, and REPORT the outcome.
@@ -1111,19 +1100,10 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
             }
         };
     }
-    match ctx.spawn_returning_endpoint(name, core) {
-        Ok(Some(cap)) => {
-            // On a restart the dead instance's cap is freed before the new one is recorded, so a
-            // kill-storm can't leak the supervisor's cap table (`record_name` does both).
-            record_name(ctx, map, name, cap);
-            true
-        }
-        // SPAWNED, and this service simply has no recv endpoint (`mem-pressure`, `greet`, `roster`).
-        // That is a SUCCESS with nothing to record - not a failure. Reading it as one is what made
-        // `chaos spawn-storm` report the task-pool ceiling hit at spawn #1.
-        Ok(None) => true,
-        Err(()) => { ctx.log_fmt(format_args!("supervisor: spawn {} FAILED", name)); false }
-    }
+    // No image for it: nothing can start it. The kernel's by-name spawn (SpawnReturningEndpoint) was
+    // retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/80 K14).
+    ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
+    false
 }
 
 /// Ask `hw-enumerator` which device carries this class code. Zero means "no answer" - the kernel
@@ -1641,7 +1621,7 @@ fn let_go(ctx: &ServiceContext, cap: Option<CapHandle>) {
 
 /// The supervisor's one non-blocking send on a capability it holds in hand - a reply capability, or a
 /// service's cap from the name map. One site: the map keeps raw slots because they flow into the spawn
-/// calls `gs` does not wrap (`spawn_with_caps`, `set_installs`), so the slot is adopted as a `Cap` here.
+/// calls `gs` does not wrap (`spawn_image`, `set_installs`), so the slot is adopted as a `Cap` here.
 fn try_send_slot(ctx: &ServiceContext, cap: CapHandle, msg: &Message) -> bool {
     gs::ipc::try_send_to(ctx, cap.into(), msg).is_ok()
 }

@@ -633,13 +633,9 @@ pub mod usbdev {
 }
 
 
-/// Probe parameters once rode in the upper 32 bits of `Spawn`'s `arg0`:
-/// `[55..48] flags  [47..32] mode  [31..16] core  [15..0] spawn cap slot`.
-/// (2026-10-09) The kernel's probe path is gone - `handle_spawn` reads only the low 32 bits, and a
-/// probe is an ordinary `SpawnImage` now - so these bits are ignored and nothing in the tree sets them.
-pub const SPAWN_FLAG_HAS_RECV:  u64 = 1 << 48;
-pub const SPAWN_FLAG_SMALL_MEM: u64 = 1 << 49;
-pub const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
+// (Three probe-parameter flags that once rode in the upper bits of `Spawn`'s `arg0` sat here. Nothing
+// set them after the kernel's probe path went, and `Spawn` itself was retired 2026-10-10; deleted the
+// same day, `backlog/80` K14 and K20.)
 
 /// Upper bound on a spawn name payload (`name` + NUL-separated peers). Matches the kernel's limit.
 pub const SPAWN_PAYLOAD_MAX: usize = 128;
@@ -4104,9 +4100,10 @@ impl ServiceContext {
     /// rather than by reading. Routing HERE fixes all of them at once, including the ones not yet
     /// found.
     ///
-    /// The condition is exactly right by construction: the SUPERVISOR has no supervisor-peer, so it
-    /// keeps the kernel path it must have; a service with no such peer keeps the old behaviour and
-    /// can still spawn anything the kernel still owns - which is `supervisor` alone now.
+    /// With no supervisor peer there is nothing to ask: the kernel's by-name spawn (syscall 7) was
+    /// retired, because its catalogue holds `supervisor` alone and it could only refuse
+    /// (`backlog/80` K14). So that case is refused here, plainly, rather than sent to a syscall that
+    /// would refuse it less clearly.
     pub fn spawn_on(&self, name: &str, core: u32) -> Result<(), crate::Error> {
         if self.find_send_slot("supervisor").is_some() {
             // The supervisor hands back a cap to the new service's endpoint. This path does not keep
@@ -4116,7 +4113,8 @@ impl ServiceContext {
                 if let Some(c) = cap { self.remove_cap(c); }
             });
         }
-        self.spawn_on_kernel(name, core)
+        let _ = (name, core);
+        Err(crate::Error::NotFound)
     }
 
     /// Ask the supervisor to spawn `name`, returning the `SEND|GRANT` cap it hands back (`None` if
@@ -4153,25 +4151,6 @@ impl ServiceContext {
             }
         }
         Err(crate::Error::InvalidArgument)
-    }
-
-    /// The kernel spawn-by-name path, unrouted. What `spawn_on` used to be.
-    pub fn spawn_on_kernel(&self, name: &str, core: u32) -> Result<(), crate::Error> {
-        let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC {
-            return Err(crate::Error::InvalidArgument);
-        }
-        let slot = data.spawn_slot;
-        if slot == u32::MAX {
-            return Err(crate::Error::Cap(CapError::CapNotHeld));
-        }
-        let bytes = name.as_bytes();
-        let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
-        // SAFETY: syscall(7) = Spawn; slot is from kernel-written page; bytes is valid.
-        let ret = unsafe {
-            raw_syscall(7, packed, bytes.as_ptr() as u64, bytes.len() as u64)
-        };
-        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
     }
 
     /// Spawn a task from an image THIS service supplies (`SpawnImage`, syscall 52).
@@ -4220,113 +4199,6 @@ impl ServiceContext {
         else { Ok(Some(CapHandle(ret as u32 - 1))) }
     }
 
-
-    /// Spawn `name` on `core` (0xFFFF = round-robin) and receive a `SEND|GRANT` cap to its recv
-    /// endpoint. This is the Phase-0 seam for moving naming out of the kernel
-    /// (`docs/naming-design.md`): a spawner (the supervisor) collects a cap to every service it
-    /// starts - a userspace `name → cap` map - instead of the kernel resolving names. Requires the
-    /// SPAWN cap. (2026-10-09) This is spawn BY NAME from the kernel catalogue, which holds only
-    /// `supervisor` now (step C), so it is refused for every other name.
-    ///
-    /// `Err(())` the spawn failed (or the SPAWN cap is not held). `Ok(None)` it spawned but has no recv endpoint. `Ok(Some(cap))`
-    /// it spawned and here is a `SEND|GRANT` cap to its endpoint.
-    ///
-    /// The three-way answer is the point. This returned a bare `Option` and the kernel a bare slot,
-    /// so "no endpoint" and "failed" were the same value - and a caller that spawns a service without
-    /// an endpoint (`mem-pressure`, `greet`, `roster`) read success as failure.
-    pub fn spawn_returning_endpoint(&self, name: &str, core: u32) -> Result<Option<CapHandle>, ()> {
-        let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return Err(()); }
-        let slot = data.spawn_slot;
-        if slot == u32::MAX { return Err(()); }
-        let bytes  = name.as_bytes();
-        let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
-        // SAFETY: syscall(38) = SpawnReturningEndpoint; slot from the kernel-written page; bytes valid.
-        let ret = unsafe { raw_syscall(38, packed, bytes.as_ptr() as u64, bytes.len() as u64) };
-        // slot + 1, so 0 is "spawned, no recv endpoint" and never a real slot.
-        if ret < 0 { Err(()) } else if ret == 0 { Ok(None) } else { Ok(Some(CapHandle(ret as u32 - 1))) }
-    }
-
-    /// Spawn `name` on `core` (0xFFFF = round-robin), wiring its send-peers from caller-supplied
-    /// `(label, cap)` pairs **instead of the kernel name table** (Phase 0b, `docs/naming-design.md`).
-    /// Each cap must be one this task holds with GRANT; the kernel copies it into the child under
-    /// `label`, so the child's `ctx.capability(label)` resolves to it. Returns the new service's
-    /// endpoint cap (`Ok(Some)`), `Ok(None)` if it spawned but has no recv endpoint (a producer like
-    /// `greet`), or `Err(())` if the spawn failed. Requires the SPAWN cap. This is how the supervisor
-    /// wires a dependent from its name→cap map without the kernel resolving names.
-    ///
-    /// (2026-10-09) Two cautions. It spawns BY NAME from the kernel catalogue, which holds only
-    /// `supervisor` now, so every other name is refused. And the kernel answers "spawned, no recv
-    /// endpoint" with -2, the same value as `CapNotHeld`, so an install cap this task does not hold
-    /// also reads here as `Ok(None)`.
-    pub fn spawn_with_caps(&self, name: &str, core: u32, installs: &[(&str, CapHandle)])
-        -> Result<Option<CapHandle>, ()>
-    {
-        let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return Err(()); }
-        let slot = data.spawn_slot;
-        if slot == u32::MAX { return Err(()); }
-        let nb = name.as_bytes();
-        if nb.is_empty() || nb.len() > 64 || installs.len() > 4 { return Err(()); }
-
-        // Build [name_len, name, count, {label_len, label, slot_lo, slot_hi}…] in a stack buffer.
-        let mut buf = [0u8; 256];
-        let mut n = 0usize;
-        buf[n] = nb.len() as u8; n += 1;
-        buf[n..n + nb.len()].copy_from_slice(nb); n += nb.len();
-        buf[n] = installs.len() as u8; n += 1;
-        for (label, cap) in installs {
-            let lb = label.as_bytes();
-            if lb.is_empty() || lb.len() > 24 || n + 1 + lb.len() + 2 > buf.len() { return Err(()); }
-            buf[n] = lb.len() as u8; n += 1;
-            buf[n..n + lb.len()].copy_from_slice(lb); n += lb.len();
-            buf[n] = (cap.0 & 0xFF) as u8; n += 1;
-            buf[n] = ((cap.0 >> 8) & 0xFF) as u8; n += 1;
-        }
-        let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
-        // SAFETY: syscall(39) = SpawnWithCaps; slot from the kernel-written page; buf valid for n bytes.
-        let ret = unsafe { raw_syscall(39, packed, buf.as_ptr() as u64, n as u64) };
-        // slot + 1, so 0 is "spawned, no recv endpoint" and no success value is also an error code
-        // (it returned -2 for that, which is `CapNotHeld` too - `backlog/80` K14).
-        match ret {
-            0 => Ok(None),                               // spawned OK, no recv endpoint
-            r if r > 0 => Ok(Some(CapHandle(r as u32 - 1))),
-            _  => Err(()),                               // spawn failed, or refused
-        }
-    }
-
-    /// Spawn `producer` and delegate it a SEND cap to `sink`'s endpoint
-    /// (`producer | sink`). `sink` must already be spawned. Requires the spawn
-    /// capability. (2026-10-09) `producer` is spawned BY NAME from the kernel catalogue,
-    /// which holds only `supervisor` now, so every other producer is refused.
-    pub fn spawn_pipe(&self, producer: &str, sink: &str) -> Result<(), crate::Error> {
-        self.spawn_pipe_on(producer, sink, 0xFFFF)
-    }
-
-    pub fn spawn_pipe_on(&self, producer: &str, sink: &str, core: u32) -> Result<(), crate::Error> {
-        let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC {
-            return Err(crate::Error::InvalidArgument);
-        }
-        let slot = data.spawn_slot;
-        if slot == u32::MAX {
-            return Err(crate::Error::Cap(CapError::CapNotHeld));
-        }
-        // Build "producer sink" in a fixed stack buffer (no_std, no alloc).
-        let (pb, sb) = (producer.as_bytes(), sink.as_bytes());
-        let mut buf = [0u8; 130];
-        if pb.len() + 1 + sb.len() > buf.len() {
-            return Err(crate::Error::InvalidArgument);
-        }
-        let mut n = 0;
-        buf[n..n + pb.len()].copy_from_slice(pb); n += pb.len();
-        buf[n] = b' '; n += 1;
-        buf[n..n + sb.len()].copy_from_slice(sb); n += sb.len();
-        let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
-        // SAFETY: syscall(19) = SpawnPipe; slot from kernel-written page; buf is valid.
-        let ret = unsafe { raw_syscall(19, packed, buf.as_ptr() as u64, n as u64) };
-        if ret == 0 { Ok(()) } else { Err(crate::Error::InvalidArgument) }
-    }
 
     /// Kill a named service. Requires SERVICE_CONTROL (the kernel refuses with `CapNotHeld`
     /// otherwise); every failure is returned as `InvalidArgument`.

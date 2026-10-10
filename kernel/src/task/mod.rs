@@ -1318,43 +1318,6 @@ fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result
     }
 }
 
-/// Spawn a producer and delegate it a SEND cap to `sink`'s endpoint as its
-/// `send_peers[0]` - the capability-broker primitive behind shell pipes
-/// (`producer | sink`). The pipe peer goes first, followed by the producer's
-/// catalogue send peers (see the comment in the body).
-///
-/// `producer` is looked up in the kernel catalogue, which holds `supervisor` alone,
-/// so this refuses every producer today (`NotFound`). Its one caller is the
-/// supervisor's fallback for a name it holds no image for.
-///
-/// `sink` must already be spawned and have registered its endpoint, so the SEND
-/// cap can be minted against it. The shell spawns the consumer before the producer.
-pub fn spawn_service_pipe(producer: &str, sink: &str, core_override: Option<u32>)
-    -> Result<(), SpawnError>
-{
-    let (static_name, cfg) = service_config(producer).ok_or(SpawnError::NotFound)?;
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
-    // The delegated pipe peer goes FIRST so the producer/filter reaches it via
-    // `send_peer_at(0)` (its "downstream"); the contract's own peers follow, so a filter that
-    // must register its name to receive a stage's input (e.g. `upper`) still can. Bounded by
-    // MAX_SEND_PEERS - extra contract peers past the cap are dropped (the pipe peer is kept).
-    let mut pipe_peers: [&str; MAX_SEND_PEERS] = [""; MAX_SEND_PEERS];
-    pipe_peers[0] = sink;
-    let mut np = 1usize;
-    for &p in cfg.send_peers {
-        if np >= MAX_SEND_PEERS { break; }
-        pipe_peers[np] = p;
-        np += 1;
-    }
-    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
-        cfg.has_recv_endpoint, &pipe_peers[..np], cfg.probe_mode, cfg.send_peers_grant,
-        cfg.memory_limit, cfg.hw_irqs, cfg.has_console_read, None, None, None, false);
-    if let Err(ref e) = result {
-        crate::kprintln!("task: spawn pipe '{}' -> '{}' failed: {:?}", producer, sink, e);
-    }
-    result.map(|_| ())
-}
-
 /// Spawn a task from an image the CALLER supplied (step C, `SpawnImage`).
 ///
 /// This is the path that ends the kernel's service catalogue. It takes no `ServiceConfig` and looks
@@ -1429,12 +1392,12 @@ pub fn spawn_from_image(
         _ => [0],
     };
     let irqs: &[u8] = if pci_irq[0] != 0 { &pci_irq } else { hw_irqs_for(hw) };
-    // The EHCI's MSI goes to the core THIS instance landed on, so a keypress wakes the driver's own
-    // core out of its idle halt (docs/power.md) - and a restart that lands elsewhere is followed
+    // The EHCI's interrupt goes to the core THIS instance landed on, so a keypress wakes the driver's
+    // own core out of its idle halt (docs/power.md) - and a restart that lands elsewhere is followed
     // (§9.2). It used to be aimed at a kernel constant the supervisor's row restated by hand, with
-    // nothing linking the two (backlog/80 K27); the supervisor's row is now the one statement. The
-    // result is not an error either way: false means the controller is on INTx, which boot already
-    // reported and routed to the BSP, and there is nothing to aim.
+    // nothing linking the two (backlog/80 K27); the supervisor's row is now the one statement. An
+    // MSI is reprogrammed; an INTx controller (the T630) has its IOAPIC entries re-aimed instead
+    // (K17). The result is not an error either way: false only says the controller is on INTx.
     if hw == HwClass::Ehci {
         crate::arch::imp::pci::program_ehci_msi(core_id);
     }
@@ -1443,68 +1406,6 @@ pub fn spawn_from_image(
                                           Some(privileges), Some(hw), installs, watched);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
-    }
-    result
-}
-
-/// Spawn the one service the kernel still bootstraps, from the one row it still holds.
-///
-/// This used to start 221 services. What remains is `supervisor`, because nothing is beneath it -
-/// every other image, parameter and privilege now belongs to the supervisor and arrives in a
-/// `SpawnImage` request (`docs/service-ownership.md`).
-///
-/// The last two things to leave were AUTHORITY rather than settings, and are worth recording because
-/// the split they forced is now resolved: a probe's IRQ route and its grantable peer caps were kept
-/// keyed by name here, on the rule "the kernel decides what a service may DO, the caller says what it
-/// IS". Both now travel in the request without weakening that rule - the IRQ as a device CLASS whose
-/// vector the kernel still chooses (`hw_irqs_for`), the grant as a flag checked like any privilege.
-/// The caller still cannot assert an authority; it can only name one the kernel already understood.
-pub fn spawn_service_by_name(name: &str, core_override: Option<u32>) -> Result<Option<EndpointId>, SpawnError> {
-    let (static_name, cfg) = service_config(name).ok_or(SpawnError::NotFound)?;
-
-    // Singleton guard (§6.2, §26.6 bounded behaviour): refuse to spawn a service
-    // whose name is already live. This blocks duplicate instances in general, and
-    // in particular a second supervisor - while it is live, this rejects
-    // spawning another by name (`handle_kill` no longer refuses it: the kernel
-    // respawns the supervisor on death, §6.2). It does NOT block boot: there
-    // each service is spawned exactly once, before any instance is live. Loud
-    // rejection, never silent (§3.12).
-    if scheduler::find_task_by_name(static_name).is_some() {
-        crate::kprintln!("task: spawn '{}' rejected: already running", static_name);
-        return Err(SpawnError::AlreadyRunning);
-    }
-
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
-
-    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
-                              cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
-                              cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, None, None, None, false);
-    if let Err(ref e) = result {
-        crate::kprintln!("task: spawn '{}' failed: {:?}", name, e);
-    }
-    result
-}
-
-/// Phase 0b (`docs/naming-design.md`): spawn `name`, but wire its send-peers from caller-supplied
-/// `installs` (`(label, cap)` pairs) instead of the kernel name table. Same singleton guard +
-/// placement as `spawn_service_by_name`; returns the new task's recv `EndpointId` (`None` if it has
-/// none). The caps in `installs` are copies the caller held (GRANT-validated by the syscall handler).
-pub fn spawn_service_by_name_with_installs(
-    name: &str, core_override: Option<u32>, installs: &[InstallCap],
-) -> Result<Option<EndpointId>, SpawnError> {
-    let (static_name, cfg) = service_config(name).ok_or(SpawnError::NotFound)?;
-    if scheduler::find_task_by_name(static_name).is_some() {
-        crate::kprintln!("task: spawn '{}' rejected: already running", static_name);
-        return Err(SpawnError::AlreadyRunning);
-    }
-    let core_id = resolve_spawn_core(core_override, cfg.preferred_core)?;
-    let result = spawn_service_with_image(static_name, crate::loader::ImageSource::Kernel(cfg.elf), core_id,
-                              cfg.has_recv_endpoint, cfg.send_peers, cfg.probe_mode,
-                              cfg.send_peers_grant, cfg.memory_limit, cfg.hw_irqs,
-                              cfg.has_console_read, None, None, Some(installs), false);
-    if let Err(ref e) = result {
-        crate::kprintln!("task: spawn '{}' (with installs) failed: {:?}", name, e);
     }
     result
 }
