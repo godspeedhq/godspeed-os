@@ -155,14 +155,18 @@ CASES = [
      lambda: strand_pin("introspect_queries"),
      ["COMMANDMENTS.baseline.toml"], []),
 
+    # ANCHORED ON THE ATTRIBUTE LINE, not the bare text. `edit` replaces the FIRST occurrence, and since
+    # the crate gained its `#![deny(unsafe_code)]` note the first `#[no_mangle]` in the file is inside a
+    # comment - so both probes planted their code INSIDE THAT COMMENT, where no check looks, and reported
+    # MISSED for checks that work. Found the first time this script's exit code was read (2026-10-10).
     ("V-no-panic", "a service that can halt the machine",
-     lambda: edit("services/events/src/main.rs", "#[no_mangle]",
-                  "fn boom() { let x: Option<u32> = None; let _ = x.unwrap(); }\n#[no_mangle]"),
+     lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
+                  "\nfn boom() { let x: Option<u32> = None; let _ = x.unwrap(); }\n#[no_mangle]\npub extern"),
      ["services/events/src/main.rs"], []),
 
     ("VI-static-mut", "unowned global mutable state in a service",
-     lambda: edit("services/events/src/main.rs", "#[no_mangle]",
-                  "static mut SNEAK: u32 = 0;\n#[no_mangle]"),
+     lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
+                  "\nstatic mut SNEAK: u32 = 0;\n#[no_mangle]\npub extern"),
      ["services/events/src/main.rs"], []),
 ]
 
