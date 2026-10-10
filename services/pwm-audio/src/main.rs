@@ -35,6 +35,7 @@ use godspeed::driver::irq::{Irq, Woke};
 use godspeed::driver::wait::{self, Budget};
 use godspeed_audio::settings::{self, Settings};
 use godspeed_audio::sine::Sine;
+use godspeed_audio::sounds::{self, Chime};
 use godspeed_audio::wire;
 use godspeed_sdk::mmio::Mmio;
 use godspeed_sdk::{Dma, Message, ServiceContext};
@@ -109,6 +110,11 @@ const FEED_TIMEOUT_MS: u32 = 5000;
 const RATE_DEFAULT: u32 = 44_100;
 const DEFAULT_VOLUME: u8 = 50;
 
+/// The jack, as `audio outputs` lists it: one output, named by the same default-device field an HD Audio
+/// pin carries (2, headphone). It has no node; 0 stands for it in `OP_OUTPUT`.
+const JACK_PIN: u8 = 0;
+const JACK_DEVICE: u8 = 2;
+
 /// What differs between the two boards. Everything else is the same driver.
 #[derive(Clone, Copy)]
 struct Board {
@@ -148,7 +154,11 @@ struct Play {
     underruns: u32,
     silence: usize,
     started: u64,
+    /// When `service` last read the engine's position, for the underrun line.
+    looked: u64,
     feed: Option<Feed>,
+    /// A system sound (`OP_SOUND`), written whole before the engine reached it.
+    sound: bool,
 }
 
 struct Feed {
@@ -172,6 +182,12 @@ struct Pwm<'a> {
     last_silence_ms: u32,
     settings_dirty: bool,
     settings_failing: bool,
+    /// The pacing check at the last start (`start`): how long one period of silence took, and how long a
+    /// PWM at the set rate should take - the measured rate `audio debug stats` shows. `None` before one.
+    paced: Option<(u64, u64)>,
+    /// The system sounds (`audio system sounds on|off`), and when the last one started.
+    system_sounds: bool,
+    last_sound: Option<u64>,
 }
 
 enum Device<'a> {
@@ -310,9 +326,12 @@ impl<'a> Pwm<'a> {
                 m.write32(pwm + PWM_CTL, 0);
                 return false;
             }
-            Ok(us) => ctx.log_fmt(format_args!(
-                "pwm-audio: paced - one period of {} frames took {} us (expected {} us at {} Hz)",
-                PERIOD_BYTES / FRAME, us, expected_us, rate)),
+            Ok(us) => {
+                self.paced = Some((us, expected_us));
+                ctx.log_fmt(format_args!(
+                    "pwm-audio: paced - one period of {} frames took {} us (expected {} us at {} Hz)",
+                    PERIOD_BYTES / FRAME, us, expected_us, rate));
+            }
         }
 
         for i in 0..PERIODS {
@@ -367,10 +386,41 @@ impl<'a> Pwm<'a> {
         self.play = Some(Play {
             sine: Sine::new(hz, RATE_DEFAULT), hz, ms, left: frames, frames, filled: at + GUARD, played: at,
             last: at, begin: at + GUARD, end_at: usize::MAX, underruns: 0, silence: 0,
-            started: wait::ticks(self.ctx), feed: None,
+            started: wait::ticks(self.ctx), looked: wait::ticks(self.ctx), feed: None, sound: false,
         });
-        self.ctx.log_fmt(format_args!("pwm-audio: playing {} Hz for {} ms", hz, ms));
+        // FILL FIRST, LOG AFTER. Only a guard (about 6 ms) is written ahead of the engine until `service`
+        // runs, and on the Pi 4 a log line costs about 10 ms - the caller puts queued lines on the wire
+        // at 115200 baud - so logging first let the engine pass the written end once in every tone
+        // (measured 2026-10-10: `underrun 10 ms into the play`, 464 frames moved, 208 past the end).
         self.service();
+        self.ctx.log_fmt(format_args!("pwm-audio: playing {} Hz for {} ms", hz, ms));
+    }
+
+    /// A system sound (`wire::OP_SOUND`), written whole a guard ahead of the engine - every one is far
+    /// shorter than the ring - then played out by `service` like a tone whose sine has run out. Played only
+    /// when the sounds are on, audio is on, nothing else plays and `SOUND_GAP_MS` has passed.
+    fn start_sound(&mut self, kind: u8) -> bool {
+        let ctx = self.ctx;
+        let frames = sounds::frames(kind, RATE_DEFAULT);
+        let gap_ok = self.last_sound.map_or(true, |t| ms_since(ctx, t) >= wire::SOUND_GAP_MS);
+        if !self.system_sounds || self.power != wire::POWER_ON || self.play.is_some() || !gap_ok
+            || frames == 0 || frames + 2 * GUARD > RING_FRAMES {
+            return false;
+        }
+        let Some(mut chime) = Chime::new(kind, RATE_DEFAULT) else { return false };
+        let at = self.begin(RATE_DEFAULT);
+        let start = at + GUARD;
+        for i in 0..frames {
+            let v = chime.next().unwrap_or(0);
+            self.put(start + i, v, v);
+        }
+        self.play = Some(Play {
+            sine: Sine::new(1, RATE_DEFAULT), hz: 0, ms: (frames as u64 * 1000 / RATE_DEFAULT as u64) as u32,
+            left: 0, frames, filled: start + frames, played: at, last: at, begin: start, end_at: start + frames,
+            underruns: 0, silence: 0, started: wait::ticks(ctx), looked: wait::ticks(ctx), feed: None, sound: true,
+        });
+        self.last_sound = Some(wait::ticks(ctx));
+        true
     }
 
     fn open_stream(&mut self, rate: u32, channels: u8, bits: u8, frames: u32, out: &mut [u8]) -> usize {
@@ -390,7 +440,8 @@ impl<'a> Pwm<'a> {
             // heard, the price of not stuttering at its start.
             frames: frames as usize, filled: at + RING_FRAMES / 2, played: at, last: at, begin: at + RING_FRAMES / 2,
             end_at: usize::MAX, underruns: 0, silence: 0,
-            started: wait::ticks(ctx), feed: Some(Feed { channels, ended: false, last_feed: wait::ticks(ctx) }),
+            started: wait::ticks(ctx), looked: wait::ticks(ctx), feed: Some(Feed { channels, ended: false, last_feed: wait::ticks(ctx) }),
+            sound: false,
         });
         ctx.log_fmt(format_args!("pwm-audio: stream opened - {} Hz, {} channel(s), {} frames", rate, channels, frames));
         out[0] = wire::OK;
@@ -440,8 +491,15 @@ impl<'a> Pwm<'a> {
         let ctx = self.ctx;
         let pos = self.position();
         let Some(mut p) = self.play.take() else { return };
-        p.played += (pos + RING_FRAMES - p.last) % RING_FRAMES;
+        let moved = (pos + RING_FRAMES - p.last) % RING_FRAMES;
+        let now = wait::ticks(ctx);
+        let gap_us = match wait::ticks_per_10ms(ctx) {
+            0 => 0,
+            per => now.wrapping_sub(p.looked) * 10_000 / per,
+        };
+        p.played += moved;
         p.last = pos;
+        p.looked = now;
         let mut done = false;
         if let Some(f) = p.feed.as_mut() {
             if !f.ended && ms_since(ctx, f.last_feed) > FEED_TIMEOUT_MS {
@@ -461,6 +519,13 @@ impl<'a> Pwm<'a> {
             }
         } else {
             if p.played > p.filled {
+                // The first of a play says where it fell, so a log says why rather than how many. It
+                // found the Pi 4's one-a-tone (`start_tone`, `docs/audio.md`).
+                if p.underruns == 0 {
+                    ctx.log_fmt(format_args!(
+                        "pwm-audio: underrun {} ms into the play - the engine was {} frames past the written end, having moved {} frames (ring position {} -> {}) in the {} us since the last look",
+                        ms_since(ctx, p.started), p.played - p.filled, moved, p.last.wrapping_add(RING_FRAMES - moved) % RING_FRAMES, pos, gap_us));
+                }
                 p.underruns += 1;
                 p.filled = p.played;
             }
@@ -491,6 +556,9 @@ impl<'a> Pwm<'a> {
                 Some(_) => ctx.log_fmt(format_args!(
                     "pwm-audio: played a stream of {} frames at {} Hz in {} ms by the clock, {} underrun(s), {} ms of silence",
                     p.frames, self.rate, took, p.underruns, sil)),
+                // A system sound ends without a line: it is a few hundred milliseconds of feedback, and a
+                // line for each would fill the log with every typing mistake.
+                None if p.sound => {}
                 None => ctx.log_fmt(format_args!(
                     "pwm-audio: played {} Hz for {} ms in {} ms by the clock, {} underrun(s)", p.hz, p.ms, took, p.underruns)),
             }
@@ -517,6 +585,63 @@ impl<'a> Pwm<'a> {
         (true, ms)
     }
 
+    /// `audio debug` (`wire::OP_DEBUG`): the jack's account of itself, one page of one view. There is no
+    /// codec and no command trace on a PWM jack, and those views say so in a line rather than failing.
+    fn debug(&self, view: u8, page: u8, out: &mut [u8]) -> usize {
+        use core::fmt::Write;
+        let text_len = wire::DEBUG_PAGE.min(out.len().saturating_sub(2));
+        let (len, more) = {
+            let mut w = wire::Page::new(&mut out[2..2 + text_len], page);
+            let (m, pwm, ch) = (self.m, self.b.pwm, self.ch());
+            match view {
+                wire::DEBUG_STATS => {
+                    let _ = writeln!(w, "device       the 3.5 mm jack on the {}: PWM fed by DMA channel {}", self.b.name, self.b.channel);
+                    let _ = writeln!(w, "clock        {} Hz; range {} steps per sample at {} Hz", self.b.clock_hz, self.range, self.rate);
+                    match self.paced {
+                        Some((us, want)) => {
+                            let pm = if us == 0 { 0 } else { want * 1000 / us };
+                            let _ = writeln!(w, "pacing       one period took {} us, expected {} us - the PWM asks at {}.{}% of the set rate",
+                                us, want, pm / 10, pm % 10);
+                        }
+                        None => { let _ = writeln!(w, "pacing       not measured yet"); }
+                    }
+                    let _ = writeln!(w, "underruns    {} since the driver started", self.underruns_total);
+                    match self.play.as_ref() {
+                        Some(p) => {
+                            let _ = writeln!(w, "playing      {}, {} frame(s) written ahead of the engine",
+                                if p.feed.is_some() { "a stream" } else { "a tone" }, p.filled.saturating_sub(p.played));
+                        }
+                        None => { let _ = writeln!(w, "playing      nothing"); }
+                    }
+                    if !wait::calibrated(self.ctx) {
+                        let _ = writeln!(w, "clock        UNCALIBRATED - the pacing above is a count of looks, not microseconds");
+                    }
+                }
+                wire::DEBUG_CODEC => { let _ = writeln!(w, "no codec: the jack is driven by PWM through the board's filter, not by an HD Audio codec"); }
+                wire::DEBUG_TRACE => { let _ = writeln!(w, "no command trace: a PWM jack takes no codec commands"); }
+                wire::DEBUG_STREAM => {
+                    let cs = m.read32(ch + DMA_CS);
+                    let _ = writeln!(w, "DMA CS       {:#010x}: active {}, error {}", cs, cs & DMA_CS_ACTIVE != 0, cs & DMA_CS_ERROR != 0);
+                    let _ = writeln!(w, "control blk  {:#010x}", m.read32(ch + DMA_CONBLK_AD));
+                    let _ = writeln!(w, "source       {:#010x} - frame {} of the {}-frame ring", m.read32(ch + DMA_SOURCE_AD), self.position(), RING_FRAMES);
+                    let _ = writeln!(w, "ring         {} periods of {} bytes", PERIODS, PERIOD_BYTES);
+                }
+                _ => {
+                    let _ = writeln!(w, "PWM CTL      {:#010x}", m.read32(pwm + PWM_CTL));
+                    let _ = writeln!(w, "PWM STA      {:#010x}", m.read32(pwm + PWM_STA));
+                    let _ = writeln!(w, "PWM DMAC     {:#010x}", m.read32(pwm + PWM_DMAC));
+                    let _ = writeln!(w, "PWM RNG1/2   {} / {}", m.read32(pwm + PWM_RNG1), m.read32(pwm + PWM_RNG2));
+                    let _ = writeln!(w, "DMA CS       {:#010x}", m.read32(ch + DMA_CS));
+                    let _ = writeln!(w, "DMA ENABLE   {:#010x} (channel {})", m.read32(DMA_PAGE + DMA_ENABLE), self.b.channel);
+                }
+            }
+            w.finish()
+        };
+        out[0] = wire::OK;
+        out[1] = more as u8;
+        2 + len
+    }
+
     fn status(&self, out: &mut [u8]) -> usize {
         out[0] = wire::OK;
         out[1] = self.power;
@@ -525,6 +650,7 @@ impl<'a> Pwm<'a> {
         let (playing, hz, len, elapsed, under, sil) = match self.play.as_ref() {
             Some(p) if p.feed.is_some() => (wire::PLAYING_STREAM, 0, p.ms, ms_since(self.ctx, p.started).min(p.ms),
                 p.underruns, (p.silence as u64 * 1000 / self.rate as u64) as u32),
+            Some(p) if p.sound => (wire::PLAYING_SOUND, 0, p.ms, ms_since(self.ctx, p.started).min(p.ms), p.underruns, 0),
             Some(p) => (wire::PLAYING_TONE, p.hz, p.ms, ms_since(self.ctx, p.started).min(p.ms), p.underruns, 0),
             None => (wire::PLAYING_NOTHING, 0, 0, 0, 0, self.last_silence_ms),
         };
@@ -534,8 +660,9 @@ impl<'a> Pwm<'a> {
         wire::put_u32(out, 11, elapsed);
         wire::put_u32(out, 15, self.underruns_total.saturating_add(under));
         out[19] = 0; // no interrupt: the ring is polled
-        out[20] = 2; // the jack: headphones
+        out[20] = JACK_DEVICE;
         wire::put_u32(out, 21, sil);
+        out[25] = self.system_sounds as u8;
         wire::STATUS_LEN
     }
 
@@ -644,6 +771,56 @@ impl<'a> Pwm<'a> {
                 }
                 self.open_stream(wire::get_u32(args, 0), args[4], args[5], wire::get_u32(args, 6), out)
             }
+            // One output, the jack: listed, always selected, and with no way to tell whether anything is
+            // plugged in - the jack has no sense line the SoC can read.
+            wire::OP_SYSTEM_SOUNDS => {
+                let want = args.first().copied().unwrap_or(1) != 0;
+                out[0] = if want == self.system_sounds { wire::ALREADY } else { wire::OK };
+                if want != self.system_sounds {
+                    self.system_sounds = want;
+                    self.settings_dirty = true;
+                }
+                1
+            }
+            wire::OP_SOUND => match args.first() {
+                Some(&kind) if sounds::shape(kind).is_some() => {
+                    out[0] = wire::OK;
+                    out[1] = self.start_sound(kind) as u8;
+                    2
+                }
+                _ => {
+                    out[0] = wire::BAD_ARG;
+                    1
+                }
+            },
+            wire::OP_DEBUG => {
+                let (view, page) = (args.first().copied().unwrap_or(0xFF), args.get(1).copied().unwrap_or(0));
+                if view as usize >= wire::DEBUG_VIEWS.len() || page >= wire::DEBUG_PAGES_MAX {
+                    out[0] = wire::BAD_ARG;
+                    return 1;
+                }
+                self.debug(view, page, out)
+            }
+            wire::OP_OUTPUTS => {
+                out[0] = wire::OK;
+                out[1] = 1;
+                out[2] = JACK_PIN;
+                out[3] = JACK_DEVICE;
+                out[4] = 1;
+                out[5] = wire::PRESENCE_UNKNOWN;
+                6
+            }
+            wire::OP_OUTPUT => match args.first() {
+                Some(&JACK_PIN) => {
+                    out[0] = wire::ALREADY;
+                    out[1] = wire::VERIFIED;
+                    2
+                }
+                _ => {
+                    out[0] = wire::BAD_ARG;
+                    1
+                }
+            },
             wire::OP_PCM => self.feed_pcm(args, out),
             wire::OP_END => self.end_feed(out),
             wire::OP_STOP => {
@@ -706,10 +883,12 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Mmio>, d: Option<&'a Dma>
     let mut p = Pwm {
         ctx, m, d, b, rate: RATE_DEFAULT, range: 0, power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false,
         play: None, underruns_total: 0, last_silence_ms: 0, settings_dirty: false, settings_failing: false,
+        paced: None, system_sounds: true, last_sound: None,
     };
     if let Some(s) = settings::load(ctx, &mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), "pwm-audio", DEFAULT_VOLUME) {
         p.volume = s.volume;
         p.muted = s.muted;
+        p.system_sounds = s.system_sounds;
     }
     if !p.start(RATE_DEFAULT) {
         ctx.log_fmt(format_args!("pwm-audio: the jack did not come up (PWM CTL {:#010x}, STA {:#010x}) - nothing will play",
@@ -729,7 +908,7 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
         Device::Absent(r) => ctx.log_fmt(format_args!(
             "pwm-audio: serving with no device to play on (reason {}) - every request is answered with that", r)),
     }
-    let mut out = [0u8; 64];
+    let mut out = [0u8; 4096];
     loop {
         let playing = matches!(&dev, Device::Ready(p) if p.play.is_some());
         let within = if playing { REFILL_PACE } else { SERVE_WAIT };
@@ -761,7 +940,7 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
             p.service();
             if p.settings_dirty && p.play.is_none() {
                 p.settings_dirty = false;
-                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted }) {
+                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted, output: None, system_sounds: p.system_sounds }) {
                     Ok(()) => p.settings_failing = false,
                     Err(e) if !p.settings_failing => {
                         p.settings_failing = true;

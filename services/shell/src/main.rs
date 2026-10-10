@@ -525,6 +525,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // /.gsh_history (bounded, best-effort) and merges it behind the session; startup touches fs zero times.
     // See `History::load` + the up-arrow arm in `handle_csi`. nav starts at 0 (empty ring = live line).
     let mut nav = hist.len();
+    // The last line above the prompt is an audio shortcut's notice, so the next one overwrites it.
+    let mut notice_above = false;
     // The previous command's result (the Ok/Err model), reported by `result`. Threaded as
     // local session state - no global (services hold no global mutable state, §3.9).
     let mut last_result: Result<(), ShellError> = Ok(());
@@ -703,6 +705,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // the fix; putting it where it belongs is separate work, recorded rather than faked.
         // (Note 2026-10-09: that work is done - `time` loads and persists `/clock.last` itself.)
         let b = ctx.console_read();
+        // Any other key may have moved the screen (Tab lists completions below the prompt), so the next
+        // shortcut writes a fresh notice rather than overwriting what is no longer the line above.
+        if !matches!(b, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+            | gs::io::keys::MUTE_TOGGLE_SIGNAL) {
+            notice_above = false;
+        }
 
         match b {
             // Ctrl+Alt+Del (the SEC-2 follow-up). The USB driver cannot reboot - SEC-2 took REBOOT
@@ -711,11 +719,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // restores the chord's UX without handing the driver back a direct reset from any
             // context, which is what SEC-2 actually removed. The signal byte is outside ASCII, so
             // no typed key produces it, and the chord is a deliberate three-key combination.
-            godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL => {
+            gs::io::keys::CTRL_ALT_DEL_SIGNAL => {
                 gs::io::print(ctx, "\r\n");
                 cmd_reboot(&ctx);
             }
+            // The audio shortcuts (`docs/audio.md`, "Keyboard shortcuts"): the keyboard driver only
+            // signals the chord, as for Ctrl+Alt+Del, and the shell asks the audio driver. The result is
+            // ONE notice line above the prompt, as read back, with the half-typed line put back under it;
+            // a press while that notice is still the line above overwrites it, so holding the keys gives
+            // one line that counts rather than twenty.
+            gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+                | gs::io::keys::MUTE_TOGGLE_SIGNAL => {
+                let notice = audio_shortcut(&ctx, b);
+                if notice_above {
+                    gs::io::print(ctx, "\r\x1b[2K\x1b[A\x1b[2K");
+                } else {
+                    gs::io::print(ctx, "\r\x1b[2K");
+                }
+                gs::io::println(ctx, notice.as_str());
+                line.reprint(&ctx);
+                notice_above = true;
+            }
             b'\r' | b'\n' => {
+                notice_above = false;
                 // We own echo now, so move to a fresh line ourselves (the kernel used
                 // to echo the Enter as "\r\n").
                 gs::io::print(ctx, "\r\n");
@@ -728,6 +754,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
                     }
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
+                    // A typed command that failed makes a system sound - only here, at the prompt, never
+                    // in a script, so fifty errors in a script do not sound fifty times.
+                    match last_result {
+                        Err(ShellError::Denied) => audio_system_sound(&ctx, audio_wire::SOUND_REFUSED),
+                        Err(_) => audio_system_sound(&ctx, audio_wire::SOUND_ERROR),
+                        Ok(()) => {}
+                    }
                     line.len = 0;
                     line.cur = 0;
                 }
@@ -984,7 +1017,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     // Only the verbs that are BUILT: completing one that answers "not built yet" would teach a word
     // the utility cannot act on. `outputs`, `output`, `debug` and `system` join as they land. `play`
     // takes a PATH, which is why `audio` is not in NO_PATH_CMDS: Tab after `audio play ` offers files.
-    ("audio",   &["status", "info", "volume", "mute", "unmute", "on", "off", "tone", "play"]),
+    ("audio",   &["status", "info", "hardware", "outputs", "output", "volume", "mute", "unmute", "on", "off", "tone", "play", "debug", "system"]),
     // The sections that are built; a device name is the other first word, and it is the machine's.
     ("hardware", &["cpu", "memory", "pci", "soc", "display", "usb", "interrupts", "report", "why",
                    "problems", "tree", "firmware", "compare", "events"]),
@@ -1052,6 +1085,8 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     // The radios by name (`wifi_radio_service`), and `use` to choose between them.
     ("wifi",   "hardware",     &["onboard", "usb", "use"]),
     ("audio",  "off",          &["hard"]),
+    ("audio",  "debug",        &audio_wire::DEBUG_VIEWS),
+    ("audio",  "system",       &["sounds"]),
     ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
 ];
 
@@ -5307,11 +5342,17 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio", "this usage (rule 1: a bare utility name teaches its verbs)", "audio"),
             ("audio status", "on or off, volume, muted, output, what is playing, underruns", "audio status"),
             ("audio info", "the detail a fault needs: codec, path, amplifier, format, ring, interrupt or polling", "audio info"),
+            ("audio hardware", "every audio device on this machine, who drives it, and * on the one audio talks to", "audio hardware"),
+            ("audio hardware <device>", "one device in full: why it is or is not driven, its registers and grant", "audio hardware 00:09.2"),
+            ("audio outputs", "the outputs the device has, whether anything is plugged into each, and which plays", "audio outputs"),
+            ("audio output <name>", "play through that output; the names come from audio outputs, and the choice is kept", "audio output headphone"),
             ("audio volume <0-100>", "set the volume; 0 is silent and is NOT mute - each stays as set", "audio volume 60"),
             ("audio mute | unmute", "silence the output, keeping the volume; unmute returns to it", "audio mute"),
             ("audio on | off | off hard", "the codec's power: off powers it down, off hard holds the controller in reset, on brings either back", "audio off"),
             ("audio tone <hz> [seconds]", "play a sine the driver makes itself, 2 s unless told; q stops it", "audio tone 440 2"),
             ("audio play <path>", "play a WAV file: 16-bit PCM, mono or stereo, 44100 or 48000 Hz; q stops it", "audio play /music/test.wav"),
+            ("audio debug [view]", "the driver's own account: stats (bare), codec, stream, trace, registers", "audio debug codec"),
+            ("audio system sounds on | off", "the short sounds the system makes on its own: an error, a refusal, a finished job, a USB plug", "audio system sounds off"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
         "hardware" => help_block(ctx, "hardware", "what this machine is, and what drives each part of it", &[
@@ -5673,6 +5714,28 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("audio", "info") => help_block(ctx, "audio info", "the detail a fault needs", &[
             ("audio info", "controller, codec, path, amplifier step, format, ring, interrupt or polling", "audio info"),
+        ], false),
+        ("audio", "hardware") => help_block(ctx, "audio hardware", "which audio devices this machine has, and which one plays", &[
+            ("audio hardware", "one row each: address, kind, maker, driver, state; * on the one audio talks to", "audio hardware"),
+            ("audio hardware <device>", "one in full, named as audio hardware names it: why it is driven or not, and its grant", "audio hardware 00:09.2"),
+            ("audio hardware | match driver", "a report is data: records with device, kind, made_by, driver, state, in_use", "audio hardware | count"),
+        ], false),
+        ("audio", "system") => help_block(ctx, "audio system", "the system's own sounds", &[
+            ("audio system sounds on | off", "an error, a refusal, a finished background job, a USB device plugged or unplugged; on by default, kept across a reboot", "audio system sounds off"),
+        ], false),
+        ("audio", "debug") => help_block(ctx, "audio debug", "the driver's own account of itself", &[
+            ("audio debug", "stats: verbs sent and unanswered, interrupts, underruns, ring fill, the last sound's rate by the clock", "audio debug"),
+            ("audio debug codec", "the whole widget graph: every node, type, capabilities, connections, pin configuration", "audio debug codec | write /codec.txt"),
+            ("audio debug stream", "the output stream's registers and its buffer descriptors", "audio debug stream"),
+            ("audio debug trace", "the last 64 verbs said to the codec, and their answers", "audio debug trace"),
+            ("audio debug registers", "the controller's global registers - the first look when nothing works", "audio debug registers"),
+        ], false),
+        ("audio", "outputs") => help_block(ctx, "audio outputs", "the outputs the device has", &[
+            ("audio outputs", "each output, whether something is plugged in (where the jack can tell), and * on the one playing", "audio outputs"),
+            ("audio outputs | match plugged", "a report is data: records with output, plugged and in_use", "audio outputs | match plugged"),
+        ], false),
+        ("audio", "output") => help_block(ctx, "audio output", "choose the output", &[
+            ("audio output <name>", "a name from audio outputs; refused while something plays, and kept across a reboot", "audio output headphone"),
         ], false),
         ("audio", "volume") => help_block(ctx, "audio volume", "set the volume, read back from the codec", &[
             ("audio volume <0-100>", "0 is silent and is NOT mute; off, it is kept and set at `audio on`", "audio volume 60"),
@@ -7457,9 +7520,26 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
             (hw & hwclass::PCI != 0 && hw & 0x00FF_FFFF == class) || hw_kind_pci_class(hw) == Some(class)
         })
     };
-    // ONE device per driver: a driver named by class is given the FIRST device of that class on the bus
-    // (`hw-enumerator` op 3, which the supervisor asks at spawn). The T630 has two HD audio controllers
-    // and showed `audio-driver` on both.
+    // ONE device per driver, and WHICH one is the question the supervisor asked at spawn: `hw-enumerator`'s
+    // `BY_CLASS` with `PREFER_OWN` - the first device of the class that is not a display's companion - whose
+    // answer the kernel grants by its BDF. Asked again here, so the row shows the device the driver holds;
+    // the T630 has two HD audio controllers and the first of the class is the HDMI one. 0 when it cannot be
+    // asked, and then the first device of the class, the rule before step D3. A driver named by KIND (`ehci`
+    // asks for `hwclass::EHCI`) is resolved by the kernel's own scan, first of the class, and stays 0.
+    let mut held = [0u32; HW_DRIVERS];
+    if slot_of(ctx, "hw-enumerator").is_some() {
+        for k in 0..nd {
+            let hw = drv_hw[k];
+            if hw & hwclass::PCI == 0 { continue; }
+            let c = (hw & 0x00FF_FFFF).to_le_bytes();
+            if let Some(m) = hw_ask(ctx, "hw-enumerator", &[hwclass::BY_CLASS, c[0], c[1], c[2], hwclass::PREFER_OWN]) {
+                let q = m.payload_bytes();
+                if q.len() >= 8 && u32::from_le_bytes([q[4], q[5], q[6], q[7]]) == hw & 0x00FF_FFFF {
+                    held[k] = u32::from_le_bytes([q[0], q[1], q[2], q[3]]);
+                }
+            }
+        }
+    }
     let mut claimed = [false; HW_DRIVERS];
 
     // pci: the bus as `hw-enumerator` found it (op 1, the count; op 2, each device).
@@ -7496,7 +7576,7 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
                     None => HwText::of(format_args!("class {:#08x}", d.class)),
                 };
                 match driver_for_class(d.class) {
-                    Some(k) if !claimed[k] => {
+                    Some(k) if !claimed[k] && (held[k] == 0 || held[k] == d.bdf) => {
                         claimed[k] = true;
                         let name = drv_name[k].as_str();
                         r.driver = HwText::of(format_args!("{}", name));
@@ -8064,7 +8144,7 @@ fn hw_why(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
             dev, name, name));
     } else if r.hw & hwclass::PCI != 0 {
         out.line_fmt(ctx, format_args!(
-            "{} is driven by {}: the supervisor starts {} for class {:#08x}, and the kernel grants it the first device of that class",
+            "{} is driven by {}: the supervisor starts {} for class {:#08x} on the device hw-enumerator names - the first of that class that is not a display's companion - and the kernel grants it that device",
             dev, name, name, r.hw & 0x00FF_FFFF));
     } else if let Some((_, _, kind)) = hw_kind(r.hw) {
         out.line_fmt(ctx, format_args!(
@@ -9231,7 +9311,7 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
     let rest = rest.trim();
     // Argument shape first: a usage error is not a missing sound card.
     match verb {
-        "status" | "info" | "mute" | "unmute" | "on" if !rest.is_empty() => {
+        "status" | "info" | "mute" | "unmute" | "on" | "outputs" if !rest.is_empty() => {
             out.line_fmt(ctx, format_args!("audio: `audio {}` takes nothing after it", verb));
             return Err(ShellError::Unknown);
         }
@@ -9251,16 +9331,32 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
             out.line_fmt(ctx, format_args!("audio: usage: audio play <path>  (e.g. audio play /music/test.wav)"));
             return Err(ShellError::Unknown);
         }
-        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" => {}
-        // Agreed and not built: said as such, never as a fault (docs/audio.md has the plan).
-        "outputs" | "output" | "debug" | "system" => {
-            out.line_fmt(ctx, format_args!("audio: `audio {}` is not built yet - docs/audio.md has where it comes in", verb));
+        "output" if rest.is_empty() => {
+            out.line_fmt(ctx, format_args!("audio: usage: audio output <name>  (e.g. audio output headphone) - audio outputs lists the names"));
             return Err(ShellError::Unknown);
         }
+        // Every audio device on the machine: asked of `hardware`'s owners, so it answers whether or not an
+        // audio driver runs - which is the point on a machine whose driver holds the wrong one.
+        "hardware" if rest == "use" || rest.starts_with("use ") => {
+            out.line_fmt(ctx, format_args!(
+                "audio: `audio hardware use` is not built - no machine has two audio devices a driver can play on yet (docs/audio.md)"));
+            return Err(ShellError::Unknown);
+        }
+        "hardware" => return audio_hardware(ctx, out, rest),
+        "system" if rest != "sounds on" && rest != "sounds off" => {
+            out.line_fmt(ctx, format_args!("audio: usage: audio system sounds on | off  - which they are now is in `audio status`"));
+            return Err(ShellError::Unknown);
+        }
+        "debug" if rest.contains(' ') => {
+            out.line_fmt(ctx, format_args!("audio: debug takes one view - stats, codec, stream, trace or registers"));
+            return Err(ShellError::Unknown);
+        }
+        "status" | "info" | "mute" | "unmute" | "on" | "off" | "volume" | "tone" | "play" | "outputs" | "output"
+            | "debug" | "system" => {}
         _ => {
             out.line_fmt(ctx, format_args!(
-                "audio: unknown subcommand - try audio status, info, volume <0-100>, mute, unmute, on, off,"));
-            out.line_fmt(ctx, format_args!("       off hard, tone <hz> [seconds], play <path>, or audio help"));
+                "audio: unknown subcommand - try audio status, info, hardware, outputs, output <name>, volume <0-100>, mute,"));
+            out.line_fmt(ctx, format_args!("       unmute, on, off, off hard, tone <hz> [seconds], play <path>, debug, system sounds on|off, or audio help"));
             return Err(ShellError::Unknown);
         }
     }
@@ -9285,6 +9381,10 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
     match verb {
         "status" => audio_status(ctx, out),
         "info" => audio_info(ctx, out),
+        "outputs" => audio_outputs(ctx, out),
+        "debug" => audio_debug(ctx, out, rest),
+        "system" => audio_system_sounds(ctx, out, rest == "sounds on"),
+        "output" => audio_output_select(ctx, out, rest),
         "volume" => audio_volume(ctx, out, volume.unwrap_or(0)),
         "mute" => audio_mute(ctx, out, true),
         "unmute" => audio_mute(ctx, out, false),
@@ -9366,7 +9466,10 @@ fn audio_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     }
     out.line_fmt(ctx, format_args!("muted      {}", if p[2] != 0 { "yes - nothing will be heard" } else { "no" }));
     out.line_fmt(ctx, format_args!("output     {}", device_name(p[20] as u32)));
-    if p[4] != 0 {
+    out.line_fmt(ctx, format_args!("system     sounds {}", if p[25] != 0 { "on" } else { "off" }));
+    if p[4] == PLAYING_SOUND {
+        out.line_fmt(ctx, format_args!("playing    a system sound"));
+    } else if p[4] != 0 {
         let (hz, len, at) = (get_u16(p, 5), get_u32(p, 7), get_u32(p, 11));
         out.line_fmt(ctx, format_args!("playing    {} Hz, {}.{} s of {}.{} s",
             hz, at / 1000, at % 1000 / 100, len / 1000, len % 1000 / 100));
@@ -9409,6 +9512,370 @@ fn audio_info(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         out.line_fmt(ctx, format_args!("refill     by polling - no interrupt was routed to the driver"));
     }
     Ok(())
+}
+
+/// One output as `audio outputs` lists it, named for the user: the pin's device words, numbered when two
+/// share a kind (`line out`, `line out 2`) so every name picks exactly one.
+#[derive(Clone, Copy)]
+struct AudioOutput {
+    pin: u8,
+    device: u8,
+    selected: bool,
+    presence: u8,
+    name: [u8; 16],
+    name_len: usize,
+}
+
+impl AudioOutput {
+    fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?")
+    }
+}
+
+/// The outputs the driver offers, named, in its order - or the sentence that says why there are none,
+/// already printed.
+fn audio_outputs_fetch(ctx: &ShellCtx, out: &mut Out)
+    -> Result<([Option<AudioOutput>; audio_wire::OUTPUTS_MAX], usize), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_OUTPUTS], AUDIO_REPLY_MS), 2)?;
+    let p = r.payload_bytes();
+    let mut rows: [Option<AudioOutput>; OUTPUTS_MAX] = [None; OUTPUTS_MAX];
+    let mut n = 0;
+    for e in p[2..].chunks_exact(4).take((p[1] as usize).min(OUTPUTS_MAX)) {
+        let device = e[1];
+        let words = device_name(device as u32).as_bytes();
+        let mut name = [0u8; 16];
+        let mut len = words.len().min(14);
+        name[..len].copy_from_slice(&words[..len]);
+        let same = rows[..n].iter().flatten().filter(|o| o.device == device).count();
+        if same > 0 {
+            name[len] = b' ';
+            name[len + 1] = b'1' + same as u8;
+            len += 2;
+        }
+        rows[n] = Some(AudioOutput { pin: e[0], device, selected: e[2] != 0, presence: e[3], name, name_len: len });
+        n += 1;
+    }
+    Ok((rows, n))
+}
+
+fn audio_presence_word(p: u8) -> &'static str {
+    match p {
+        audio_wire::PRESENCE_PLUGGED => "plugged in",
+        audio_wire::PRESENCE_EMPTY => "empty",
+        _ => "cannot tell",
+    }
+}
+
+/// `audio outputs` - the outputs the device has, the one in use marked, and whether something is plugged
+/// into each where the jack can tell (`utilities/57_audio.md`).
+fn audio_outputs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
+    let (rows, n) = audio_outputs_fetch(ctx, out)?;
+    if n == 0 {
+        out.line_fmt(ctx, format_args!("audio: the device lists no outputs"));
+        return Err(ShellError::Unknown);
+    }
+    out.line_fmt(ctx, format_args!("{:<12}  {:<12}  {}", "OUTPUT", "PLUGGED", "IN USE"));
+    for o in rows.iter().flatten() {
+        out.line_fmt(ctx, format_args!("{:<12}  {:<12}  {}", o.name(), audio_presence_word(o.presence),
+            if o.selected { "*" } else { "" }));
+    }
+    Ok(())
+}
+
+/// `audio outputs` as records, for a pipe: `output`, `plugged`, `in_use`.
+fn build_audio_outputs_table(ctx: &ShellCtx) -> Option<Table> {
+    let mut t = Table::new(&["output", "plugged", "in_use"]);
+    let (rows, _) = audio_outputs_fetch(ctx, &mut Out::Console).ok()?;
+    for o in rows.iter().flatten() {
+        let row = [
+            t.intern(o.name().as_bytes()),
+            t.intern(audio_presence_word(o.presence).as_bytes()),
+            if o.selected { t.intern(b"yes") } else { Value::Empty },
+        ];
+        t.add_row(&row);
+    }
+    Some(t)
+}
+
+/// `audio output <name>` - play through the output `audio outputs` calls `name`. An unknown name is refused
+/// with the list; the choice is kept in `/audio.settings` by the driver.
+fn audio_output_select(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let (rows, _) = audio_outputs_fetch(ctx, out)?;
+    let Some(o) = rows.iter().flatten().find(|o| o.name() == name).copied() else {
+        out.line_fmt(ctx, format_args!("audio: no output called '{}' - this device has:", name));
+        for o in rows.iter().flatten() {
+            out.line_fmt(ctx, format_args!("  {}", o.name()));
+        }
+        return Err(ShellError::Unknown);
+    };
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_OUTPUT, o.pin], AUDIO_REPLY_MS), 2)?;
+    let p = r.payload_bytes();
+    if p[0] == ALREADY {
+        out.line_fmt(ctx, format_args!("already playing through {}", o.name()));
+        return Ok(());
+    }
+    out.line_fmt(ctx, format_args!("output {} {}", o.name(), audio_verdict(p[1])));
+    if o.presence == PRESENCE_EMPTY {
+        out.line_fmt(ctx, format_args!("  (nothing is plugged into it - nothing will be heard until something is)"));
+    }
+    if p[1] == CONTRADICTED { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+/// Is this `hardware` row an audio device: a multimedia-class (0x04) PCI device, or the Pis' jack.
+fn audio_hw_row(r: &HwRow) -> bool {
+    match r.pci {
+        Some(d) => d.class >> 16 == 0x04,
+        None => r.device.as_str() == "audio-pwm",
+    }
+}
+
+/// The name `audio hardware` gives a device: its PCI address, as `hardware` names it, or `jack`. Never
+/// `analog` or `hdmi` - a controller no driver holds has a codec nobody has asked, and a name would guess.
+fn audio_hw_name(r: &HwRow) -> &str {
+    if r.pci.is_some() { r.device.as_str() } else { "jack" }
+}
+
+/// Who made it, by the bus's own IDs: `AMD 1022:157a`, or the SoC.
+fn audio_hw_maker(r: &HwRow) -> HwText<24> {
+    match r.pci {
+        Some(d) => match hw_vendor(d.vendor) {
+            Some(v) => HwText::of(format_args!("{} {:04x}:{:04x}", v, d.vendor, d.device)),
+            None => HwText::of(format_args!("{:04x}:{:04x}", d.vendor, d.device)),
+        },
+        None => HwText::of(format_args!("the SoC")),
+    }
+}
+
+/// The audio driver's own word on the device it holds, read live (`OP_STATUS`): `ready`, `off`, or the
+/// reason it stopped - which is how a machine whose codec is not one the driver plays on shows that it
+/// surveyed the codec and stopped (A6).
+fn audio_driver_state(ctx: &ShellCtx) -> &'static str {
+    use audio_wire::*;
+    let Some(r) = audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS) else { return "not answering" };
+    let p = r.payload_bytes();
+    match (p.first().copied(), p.get(1).copied()) {
+        (Some(OK), Some(POWER_ON)) => "ready",
+        (Some(OK), Some(_)) => "off",
+        (Some(NO_DEVICE), Some(no_device::NO_CONTROLLER)) => "no controller granted",
+        (Some(NO_DEVICE), Some(no_device::RESET_FAILED)) => "stuck in reset",
+        (Some(NO_DEVICE), Some(no_device::NO_CODEC)) => "no codec answered",
+        (Some(NO_DEVICE), Some(no_device::NO_PATH)) => "no output path",
+        (Some(NO_DEVICE), Some(no_device::UNVERIFIED_CODEC)) => "surveyed, not played (A6)",
+        (Some(NO_DEVICE), Some(no_device::NO_ARENA)) => "no DMA memory",
+        (Some(NO_DEVICE), _) => "bring-up failed",
+        _ => "unexpected answer",
+    }
+}
+
+/// One audio device as `audio hardware` shows it.
+struct AudioHw<'a> {
+    row: &'a HwRow,
+    state: &'static str,
+    in_use: bool,
+}
+
+/// Every audio device `hardware` found, with the driver's word on the one it holds. The device `audio`
+/// talks to is the one the running audio driver was given - `hardware` marks it by the same rule the
+/// supervisor spawns by: the first device of the driver's class.
+fn audio_hw_list<'a>(ctx: &ShellCtx, f: &'a HwFacts, out: &mut [Option<AudioHw<'a>>; 8]) -> usize {
+    let driver = audio_driver(ctx);
+    let mut n = 0;
+    for r in f.rows[..f.n].iter().filter(|r| audio_hw_row(r)) {
+        if n == out.len() {
+            break;
+        }
+        let in_use = driver.is_some_and(|d| r.driver.as_str() == d) && r.state == "running";
+        let state = if in_use { audio_driver_state(ctx) } else { r.state };
+        out[n] = Some(AudioHw { row: r, state, in_use });
+        n += 1;
+    }
+    n
+}
+
+/// `audio hardware [<device>]` - every audio device on this machine, or one in full
+/// (`utilities/57_audio.md`; `docs/audio.md`, "Which device"). Built from `hardware`'s own gathering, so
+/// the two never disagree about what is here or who drives it.
+#[inline(never)]
+fn audio_hardware(ctx: &ShellCtx, out: &mut Out, arg: &str) -> Result<(), ShellError> {
+    let mut f = HwFacts {
+        rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+        pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+    };
+    hw_gather(ctx, &mut f);
+    let mut list: [Option<AudioHw>; 8] = [None, None, None, None, None, None, None, None];
+    let n = audio_hw_list(ctx, &f, &mut list);
+    if n == 0 {
+        out.line_fmt(ctx, format_args!("no audio device on this machine"));
+        out.line_fmt(ctx, format_args!("  (no multimedia-class PCI device, and no audio jack among the SoC's devices)"));
+        return Ok(());
+    }
+    if arg.is_empty() {
+        out.line_fmt(ctx, format_args!("{:<9}  {:<16}  {:<20}  {:<13}  {:<26}  {}",
+            "DEVICE", "KIND", "MADE BY", "DRIVER", "STATE", "IN USE"));
+        for a in list.iter().flatten() {
+            out.line_fmt(ctx, format_args!("{:<9}  {:<16}  {:<20}  {:<13}  {:<26}  {}",
+                audio_hw_name(a.row), a.row.kind.as_str(), audio_hw_maker(a.row).as_str(), a.row.driver.as_str(),
+                a.state, if a.in_use { "*" } else { "" }));
+        }
+        if !f.drivers_known {
+            out.line_fmt(ctx, format_args!("  (the supervisor did not answer, so DRIVER may be incomplete)"));
+        }
+        return Ok(());
+    }
+    let Some(a) = list.iter().flatten().find(|a| audio_hw_name(a.row) == arg) else {
+        out.line_fmt(ctx, format_args!("audio: no audio device called '{}' - audio hardware lists them:", arg));
+        for a in list.iter().flatten() {
+            out.line_fmt(ctx, format_args!("  {}", audio_hw_name(a.row)));
+        }
+        return Err(ShellError::Unknown);
+    };
+    out.line_fmt(ctx, format_args!("device     {} ({})", audio_hw_name(a.row), a.row.kind.as_str()));
+    out.line_fmt(ctx, format_args!("made by    {}", audio_hw_maker(a.row).as_str()));
+    out.line_fmt(ctx, format_args!("state      {}{}", a.state, if a.in_use { " - the device `audio` talks to" } else { "" }));
+    hw_why(ctx, out, a.row);
+    hw_device(ctx, out, a.row);
+    if a.in_use && a.state == "ready" {
+        out.line_fmt(ctx, format_args!("the driver's account (audio info):"));
+        let _ = audio_info(ctx, out);
+    }
+    Ok(())
+}
+
+/// `audio hardware` as records, for a pipe: `device`, `kind`, `made_by`, `driver`, `state`, `in_use`.
+#[inline(never)]
+fn build_audio_hardware_table(ctx: &ShellCtx) -> Table {
+    let mut f = HwFacts {
+        rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
+        pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
+    };
+    hw_gather(ctx, &mut f);
+    let mut list: [Option<AudioHw>; 8] = [None, None, None, None, None, None, None, None];
+    audio_hw_list(ctx, &f, &mut list);
+    let mut t = Table::new(&["device", "kind", "made_by", "driver", "state", "in_use"]);
+    for a in list.iter().flatten() {
+        let row = [
+            t.intern(audio_hw_name(a.row).as_bytes()),
+            t.intern(a.row.kind.as_str().as_bytes()),
+            t.intern(audio_hw_maker(a.row).as_str().as_bytes()),
+            t.intern(a.row.driver.as_str().as_bytes()),
+            t.intern(a.state.as_bytes()),
+            if a.in_use { t.intern(b"yes") } else { Value::Empty },
+        ];
+        t.add_row(&row);
+    }
+    t
+}
+
+/// `audio debug [view]` - the driver's own account of itself (`docs/audio.md`, "`audio debug`"): one view
+/// as labelled lines, fetched a page at a time until the driver says there is no more. A bare `audio
+/// debug` is `stats`. Text, so it pipes like `audio info` - `audio debug codec | write /codec.txt` is how a
+/// new machine's codec is captured.
+fn audio_debug(ctx: &ShellCtx, out: &mut Out, view: &str) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let view = if view.is_empty() { "stats" } else { view };
+    let Some(v) = DEBUG_VIEWS.iter().position(|w| *w == view) else {
+        out.line_fmt(ctx, format_args!("audio: debug takes one of: stats, codec, stream, trace, registers - not '{}'", view));
+        return Err(ShellError::Unknown);
+    };
+    for page in 0..DEBUG_PAGES_MAX {
+        let r = match audio_reply(ctx, out, audio_ask(ctx, &[OP_DEBUG, v as u8, page], AUDIO_REPLY_MS), 2) {
+            Ok(r) => r,
+            Err(e) => {
+                if v as u8 == DEBUG_STATS || v as u8 == DEBUG_STREAM {
+                    out.line_fmt(ctx, format_args!(
+                        "  (with no device to play on, `audio debug codec`, `trace` and `registers` still answer where the driver got as far as the codec)"));
+                }
+                return Err(e);
+            }
+        };
+        let p = r.payload_bytes();
+        for line in p[2..].split(|&b| b == b'\n') {
+            if !line.is_empty() {
+                out.line_fmt(ctx, format_args!("{}", core::str::from_utf8(line).unwrap_or("?")));
+            }
+        }
+        if p[1] == 0 {
+            return Ok(());
+        }
+    }
+    out.line_fmt(ctx, format_args!("audio: the view went past {} pages - the rest is not shown", DEBUG_PAGES_MAX));
+    Err(ShellError::Unknown)
+}
+
+/// One audio shortcut (Ctrl+Alt+Up, Ctrl+Alt+Down, Ctrl+Alt+M), done, and the line that says what it did,
+/// AS READ BACK from the driver - never what was asked for. Volume steps by 5 and stops at 0 and 100; M
+/// mutes, or unmutes if muted. Each is the same request as the typed verb, so the driver writes it to
+/// `/audio.settings` like one. When it cannot be done the line says why - never a silent no-op.
+fn audio_shortcut(ctx: &ShellCtx, sig: u8) -> HwText<64> {
+    use audio_wire::*;
+    if audio_driver(ctx).is_none() {
+        return HwText::of(format_args!("no audio hardware on this machine"));
+    }
+    let Some(st) = audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS) else {
+        return HwText::of(format_args!("audio: the audio driver is not answering"));
+    };
+    let p = st.payload_bytes();
+    if p.first() != Some(&OK) || p.len() < STATUS_LEN {
+        return HwText::of(format_args!("audio: no device to play on - `audio status` says why"));
+    }
+    let (volume, muted) = (p[3], p[2] != 0);
+    let answer = if sig == gs::io::keys::MUTE_TOGGLE_SIGNAL {
+        audio_ask(ctx, &[OP_MUTE, !muted as u8], AUDIO_REPLY_MS)
+    } else {
+        let v = if sig == gs::io::keys::VOLUME_UP_SIGNAL { volume.saturating_add(5).min(VOLUME_MAX) } else { volume.saturating_sub(5) };
+        audio_ask(ctx, &[OP_VOLUME, v], AUDIO_REPLY_MS)
+    };
+    let Some(r) = answer else { return HwText::of(format_args!("audio: the audio driver is not answering")) };
+    let q = r.payload_bytes();
+    if !matches!(q.first(), Some(&OK) | Some(&ALREADY)) || q.len() < 3 {
+        return HwText::of(format_args!("audio: the audio driver refused that"));
+    }
+    let v = q[1];
+    let now_muted = if sig == gs::io::keys::MUTE_TOGGLE_SIGNAL { !muted } else { muted };
+    let bar = |v: u8| -> HwText<24> {
+        let mut t = HwText::<24>::EMPTY;
+        let _ = core::fmt::Write::write_str(&mut t, "[");
+        for i in 0..20u8 {
+            let _ = core::fmt::Write::write_str(&mut t, if i < v / 5 { "#" } else { "-" });
+        }
+        let _ = core::fmt::Write::write_str(&mut t, "]");
+        t
+    };
+    if q[2] == CONTRADICTED {
+        HwText::of(format_args!("audio: the codec reads back something else - the serial log says what"))
+    } else if now_muted {
+        HwText::of(format_args!("muted (volume {})", v))
+    } else if v == 0 {
+        HwText::of(format_args!("volume 0 - silent"))
+    } else {
+        HwText::of(format_args!("volume {}  {}", v, bar(v).as_str()))
+    }
+}
+
+/// `audio system sounds on|off`: the short sounds the system makes on its own (`docs/audio.md`, "System
+/// sounds"). The driver keeps the switch, in `/audio.settings`.
+fn audio_system_sounds(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError> {
+    use audio_wire::*;
+    let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_SYSTEM_SOUNDS, on as u8], AUDIO_REPLY_MS), 1)?;
+    let word = if on { "on" } else { "off" };
+    if r.payload_bytes()[0] == ALREADY {
+        out.line_fmt(ctx, format_args!("system sounds already {}", word));
+    } else {
+        out.line_fmt(ctx, format_args!("system sounds {}", word));
+    }
+    Ok(())
+}
+
+/// Ask for a system sound, and do not wait for it. Sent with no reply capability, so the driver answers
+/// nobody and the shell is never held up: no audio driver, a driver mid-restart, a full queue or sounds
+/// switched off all mean no sound, and the error the user caused has already been printed either way.
+/// The driver decides whether to play it (on, not busy, not within `SOUND_GAP_MS` of the last).
+fn audio_system_sound(ctx: &ShellCtx, kind: u8) {
+    let Some(driver) = audio_driver(ctx) else { return };
+    let msg = Message::from_bytes(&[audio_wire::TAGGED, 0, audio_wire::OP_SOUND, kind]);
+    let _ = gs::ipc::try_send(ctx, driver, &msg);
 }
 
 fn audio_volume(ctx: &ShellCtx, out: &mut Out, v: u8) -> Result<(), ShellError> {
@@ -9530,6 +9997,12 @@ fn audio_tone(ctx: &ShellCtx, out: &mut Out, rest: &str) -> Result<(), ShellErro
                 let played = get_u32(r.payload_bytes(), 2);
                 out.line_fmt(ctx, format_args!("stopped after {}.{} s", played / 1000, played % 1000 / 100));
                 return Ok(());
+            }
+            // An audio shortcut while the tone plays: done at once, and said on its own line - this loop
+            // redraws no status line for the volume to join (the spec's wish; recorded in docs/audio.md).
+            if matches!(k, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+                | gs::io::keys::MUTE_TOGGLE_SIGNAL) {
+                gs::io::println(ctx, audio_shortcut(ctx, k).as_str());
             }
         }
         gs::task::sleep_ms(ctx, 50);
@@ -9708,6 +10181,11 @@ fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(),
             if k == b'q' || k == b'Q' || k == 0x1b {
                 return audio_stop_said(ctx, out);
             }
+            // An audio shortcut while the file plays: done at once, said on its own line.
+            if matches!(k, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+                | gs::io::keys::MUTE_TOGGLE_SIGNAL) {
+                gs::io::println(ctx, audio_shortcut(ctx, k).as_str());
+            }
         }
         if t0.passed(ctx, limit) {
             let _ = audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS);
@@ -9744,6 +10222,11 @@ fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(),
         if let Some(k) = ctx.try_console_read() {
             if k == b'q' || k == b'Q' || k == 0x1b {
                 return audio_stop_said(ctx, out);
+            }
+            // An audio shortcut while the file plays: done at once, said on its own line.
+            if matches!(k, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
+                | gs::io::keys::MUTE_TOGGLE_SIGNAL) {
+                gs::io::println(ctx, audio_shortcut(ctx, k).as_str());
             }
         }
         gs::task::sleep_ms(ctx, 100);
@@ -9794,9 +10277,9 @@ fn audio_say_if_silent(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
 /// Which `audio` verbs may start a pipe: the REPORTS. The actions refuse, naming the reports (rule 12).
 fn audio_pipe_refusal(arg: &str) -> Option<&'static str> {
     match arg.split_whitespace().next().unwrap_or("") {
-        "status" | "info" | "version" => None,
-        "" => Some("pipe: bare 'audio' prints its usage, which is not data - pipe a report: audio status or audio info"),
-        _ => Some("pipe: that 'audio' verb is an action, not a report, so it cannot start a pipe - the reports are: audio status and audio info"),
+        "status" | "info" | "outputs" | "hardware" | "debug" | "version" => None,
+        "" => Some("pipe: bare 'audio' prints its usage, which is not data - pipe a report: audio status, info, hardware or outputs"),
+        _ => Some("pipe: that 'audio' verb is an action, not a report, so it cannot start a pipe - the reports are: audio status, info, hardware and outputs"),
     }
 }
 
@@ -13298,6 +13781,9 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
     let (c0, _) = split_first(stages[0]);
     // `wifi list` and `wifi hardware` are the `wifi` verbs that are tables; `status`, `info` and the rest are labelled lines.
     let wifi_records = c0 == "wifi" && matches!(split_first(stages[0]).1.trim(), "list" | "hardware");
+    // `audio outputs` and `audio hardware` are the `audio` verbs that are tables; `status`, `info` and one
+    // device in full are labelled lines.
+    let audio_records = c0 == "audio" && matches!(split_first(stages[0]).1.trim(), "outputs" | "hardware");
     // `hardware` and `hardware <sections>` are a table; one device is labelled lines.
     let hardware_records = c0 == "hardware" && {
         let a = split_first(stages[0]).1.trim();
@@ -13317,7 +13803,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
         }
         if cap.overflow { gs::io::println(ctx, "pipe: producer output exceeded the pipe buffer (truncated)"); }
         Stream::Bytes(cap)
-    } else if is_record_producer(c0) || wifi_records || hardware_records {
+    } else if is_record_producer(c0) || wifi_records || hardware_records || audio_records {
         let arg = split_first(stages[0]).1;
         let t = match c0 {
             "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -13328,6 +13814,8 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "uptime"  => build_uptime_table(ctx),
             "jobs"    => build_jobs_table(ctx),
             "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
+            "audio" if arg.trim() == "hardware" => build_audio_hardware_table(ctx),
+            "audio" => match build_audio_outputs_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
             "hardware" => match build_hardware_table(ctx, cwd, arg) { Some(t) => t, None => return Err(ShellError::Unknown) },
             "wifi"    => match build_wifi_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
             // `events ipc` / `events failures` are record sources; the other subcommands are readers

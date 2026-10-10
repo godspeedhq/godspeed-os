@@ -148,6 +148,9 @@ pub const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
 pub const XHCI_MMIO_VA:    u64 = 0x1_0000_0000;
 /// Pages of MMIO to map for the xHCI BAR (64 KiB - cap/op/runtime/doorbell regs).
 const XHCI_MMIO_PAGES:     u64 = 16;
+/// The most of one BAR a single grant maps: 16 MiB, so a device with a huge BAR (a GPU's aperture) costs a
+/// bounded number of page-table frames (26.6). Every driver here has a BAR well under it.
+const MMIO_WINDOW_MAX:     u64 = 16 * 1024 * 1024;
 
 /// Master switch for IOMMU confinement of the USB drivers (H1).
 ///
@@ -520,11 +523,49 @@ impl HwClass {
             // Not a device: the software-generated test interrupt (`FireIrq`) that IR1 delivers.
             // Always "present" because the kernel raises it itself - there is nothing to scan for.
             HwClass::TestIrq => true,
-            // Present iff the scan met a device claiming this class code.
-            HwClass::Pci { class_code, .. } =>
-                crate::arch::imp::pci::find_by_class(class_code).is_some(),
+            // Present iff the device this request names is on the bus (`pci_dev`).
+            HwClass::Pci { .. } => self.pci_dev().is_some(),
             HwClass::None => false,
         }
+    }
+
+    /// THE device a PCI spawn request names - the one place that decides it, so the window, the arena,
+    /// the vector, the confinement and the bus mastering cannot each pick a different one.
+    ///
+    /// A supplied BDF selects the device; with none (0), the first device of the class, as before
+    /// step D3. A supplied BDF whose device is NOT of the requested class is refused, loudly, rather than
+    /// granted: the caller asked for a class and named something else, and on the T630 on 2026-10-08 a
+    /// stale answer did exactly that and confined the SATA controller to `xhci`'s arena. Before this, a
+    /// supplied BDF chose only the bus mastering and the confinement while the window, arena and vector
+    /// came from the first device of the class - so on the T630 `audio-driver` was granted the HDMI audio
+    /// controller's registers whatever it was told (docs/audio.md, "Found while preparing", 2).
+    /// The bus device behind `mmio_bar`, for sizing its window: the one `pci_dev` resolves for a class
+    /// request, the scan's for the three legacy names. `None` for anything not on a bus.
+    fn bar_device(self) -> Option<crate::arch::imp::pci::PciDevice> {
+        use crate::arch::imp::pci;
+        match self {
+            HwClass::Pci { .. } => self.pci_dev(),
+            HwClass::Xhci => pci::xhci(),
+            HwClass::Ehci => pci::ehci(),
+            HwClass::Nic => pci::nic(),
+            _ => None,
+        }
+    }
+
+    fn pci_dev(self) -> Option<crate::arch::imp::pci::PciDevice> {
+        use crate::arch::imp::pci;
+        let HwClass::Pci { class_code, bdf, .. } = self else { return None };
+        if bdf == 0 {
+            return pci::find_by_class(class_code);
+        }
+        let d = (0..pci::MAX_DEVICES).filter_map(pci::device_at).find(|d| d.bdf == bdf)?;
+        if d.class_code != class_code {
+            crate::kprintln!(
+                "task: BDF {:#06x} was supplied for class {:#08x} but that device is class {:#08x} - REFUSED, no device granted",
+                bdf, class_code, d.class_code);
+            return None;
+        }
+        Some(d)
     }
     /// The controller's first MMIO BAR base, or 0 if absent (or, for a NIC, not a model we can drive -
     /// an Intel e1000 or a Realtek RTL8168; on any other NIC the driver gets no mapping and idles).
@@ -555,13 +596,12 @@ impl HwClass {
             // e1000 uses BAR0, while the RTL8168 on the Wyse puts I/O ports there and its registers
             // in BAR2. Both are "the first memory BAR". Still not an address - a rule the kernel
             // evaluates over its own scan, exactly as an index is.
-            HwClass::Pci { class_code, bar_ix: BAR_AUTO, .. } =>
-                crate::arch::imp::pci::find_by_class(class_code)
+            HwClass::Pci { bar_ix: BAR_AUTO, .. } =>
+                self.pci_dev()
                     .and_then(|d| d.bar.iter().copied().find(|&b| b != 0))
                     .unwrap_or(0),
-            HwClass::Pci { class_code, bar_ix, .. } =>
-                crate::arch::imp::pci::find_by_class(class_code)
-                    .map_or(0, |d| d.bar[(bar_ix as usize).min(5)]),
+            HwClass::Pci { bar_ix, .. } =>
+                self.pci_dev().map_or(0, |d| d.bar[(bar_ix as usize).min(5)]),
             HwClass::Dwc2 => 0,
             // ZERO for the same reason as the DWC2: not on a bus, so not a BAR. The framebuffer has its
             // own grant path (the `HwClass::Framebuffer` branch in the spawn MMIO block) because it
@@ -629,8 +669,8 @@ impl HwClass {
             // by accident would alias it (TestIrq did, until `needs_dma` was corrected).
             // Per DEVICE, not per class - a device the kernel cannot name still needs its arena
             // handed back on restart. `index` is the scan slot, stable for the boot.
-            HwClass::Pci { class_code, .. } =>
-                match crate::arch::imp::pci::find_by_class(class_code) {
+            HwClass::Pci { .. } =>
+                match self.pci_dev() {
                     Some(d) if d.index < crate::arch::imp::pci::MAX_DEVICES => &PCI_DMA_PHYS[d.index],
                     // Unreachable: `needs_dma()` gates every caller and is false when the device is
                     // absent. Returns a real slot rather than panicking, as the arms below do.
@@ -666,11 +706,16 @@ impl HwClass {
             // with two devices of one class it picks by scan order - which is not a decision the
             // kernel has any basis to make. Zero means "not supplied": fall back to the class.
             HwClass::Pci { class_code, bdf, .. } if bdf != 0 => {
+                // The device `pci_dev` resolved, so the bus mastering and the confinement are the same
+                // device the window, arena and vector came from. One it refused gets none of them.
+                if self.pci_dev().is_none() {
+                    return 0xFFFF;
+                }
                 // Cross-check while both paths exist (step D3 is additive until the scan goes).
                 let by_class = crate::arch::imp::pci::find_by_class(class_code).map_or(0xFFFF, |d| d.bdf);
                 if by_class != 0xFFFF && by_class != bdf {
                     crate::kprintln!(
-                        "task: BDF {:#06x} supplied for class {:#08x}, but the scan says {:#06x} - using the supplied one",
+                        "task: BDF {:#06x} supplied for class {:#08x}, the first of that class is {:#06x} - the supplied one is granted",
                         bdf, class_code, by_class);
                 } else {
                     // SAID OUT LOUD, because agreement and absence look identical otherwise. Without
@@ -760,9 +805,10 @@ static MSI_POOL_NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// Returns 0 when there is nothing to route: no such device, the pool is exhausted, or the device
 /// refused MSI. Every one of those is reported - a driver silently left without interrupts presents
 /// later as a device that never responds, which is the diagnosis this saves (invariant 12).
-fn pci_msi_vector(class_code: u32, core_id: u32) -> u8 {
+fn pci_msi_vector(hw: HwClass, core_id: u32) -> u8 {
     use core::sync::atomic::Ordering;
-    let Some(d) = crate::arch::imp::pci::find_by_class(class_code) else { return 0 };
+    let HwClass::Pci { class_code, .. } = hw else { return 0 };
+    let Some(d) = hw.pci_dev() else { return 0 };
     if d.index >= crate::arch::imp::pci::MAX_DEVICES { return 0; }
 
     // Deliver to the core the driver is pinned to, so a device event wakes that core directly out
@@ -1391,8 +1437,8 @@ pub fn spawn_from_image(
     // programmed into its MSI. Held in a local so it can be passed as a slice - `hw_irqs_for`
     // returns 'static and cannot carry an allocated value.
     let pci_irq: [u8; 1] = match hw {
-        HwClass::Pci { class_code, .. } if hw_class & HW_PCI_IRQ != 0 =>
-            [pci_msi_vector(class_code, core_id)],
+        HwClass::Pci { .. } if hw_class & HW_PCI_IRQ != 0 =>
+            [pci_msi_vector(hw, core_id)],
         _ => [0],
     };
     let irqs: &[u8] = if pci_irq[0] != 0 { &pci_irq } else { hw_irqs_for(hw) };
@@ -2163,14 +2209,36 @@ fn spawn_service_with_image(
                 | PageFlags::NO_EXEC
                 | PageFlags::PCD
                 | PageFlags::PWT;
-            for i in 0..XHCI_MMIO_PAGES {
+            // THE WINDOW IS THE BAR, sized by the arch (backlog/80 K1). It was a fixed 64 KiB whatever
+            // the device had, and on the T630 the audio controller's 64 KiB reached the HDMI audio,
+            // `xhci`, EHCI and AHCI registers - authority the grant never named (CLAUDE.md 3.1). The
+            // pages mapped are whole; the length the driver's `Mmio` is given is the BAR's own, and
+            // `Mmio` checks every access against it, so a sub-page BAR is not widened to the page. A port
+            // that cannot measure a BAR answers 0 and keeps the fixed window, said in the line below.
+            let measured = hw.bar_device()
+                .and_then(|d| d.bar.iter().position(|&b| b == bar).map(|ix| crate::arch::imp::pci::bar_len(&d, ix)))
+                .unwrap_or(0);
+            let len = match measured {
+                0 => XHCI_MMIO_PAGES * PAGE_SIZE as u64,
+                n => n.min(MMIO_WINDOW_MAX),
+            };
+            for i in 0..len.div_ceil(PAGE_SIZE as u64) {
                 let off = i * PAGE_SIZE as u64;
                 page_table
                     .map(VirtAddr(XHCI_MMIO_VA + off), PhysAddr(bar + off), mmio_flags)
                     .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::MapFailed })?;
             }
-            crate::kprintln!("spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}", name, bar, XHCI_MMIO_VA);
-            (XHCI_MMIO_VA, XHCI_MMIO_PAGES * PAGE_SIZE as u64)
+            match measured {
+                0 => crate::kprintln!(
+                    "spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}, {} bytes - the BAR's size is not measured on this port, so the fixed window",
+                    name, bar, XHCI_MMIO_VA, len),
+                n if n > len => crate::kprintln!(
+                    "spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}, the first {} of its {} bytes - the most one grant maps",
+                    name, bar, XHCI_MMIO_VA, len, n),
+                _ => crate::kprintln!(
+                    "spawn[mmio]: '{}' BAR {:#x} -> VA {:#x}, {} bytes, the BAR's own size", name, bar, XHCI_MMIO_VA, len),
+            }
+            (XHCI_MMIO_VA, len)
         } else if hw == HwClass::Framebuffer {
             // The display's framebuffer, for the task that asked for the FRAMEBUFFER kind - the `console`
             // service in practice (docs/console-service.md 9).

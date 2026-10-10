@@ -9,7 +9,8 @@
 //! classes (`docs/driver-library.md`); it is a family's protocol, beside them.
 //!
 //! It also holds what the drivers share beyond the protocol, found repeated when the second driver (the
-//! Pis' PWM jack) arrived: the test tone (`sine`) and the settings file (`settings`).
+//! Pis' PWM jack) arrived: the test tone (`sine`) and the settings file (`settings`); and the system
+//! sounds (`sounds`), so both play the same ones.
 //!
 //! No `unsafe`, and `no_std`.
 #![no_std]
@@ -17,4 +18,5 @@
 
 pub mod settings;
 pub mod sine;
+pub mod sounds;
 pub mod wire;

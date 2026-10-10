@@ -356,6 +356,76 @@ fn config_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
     }
 }
 
+/// Sized BAR lengths, [device][bar] by scan index; 0 = not sized yet. A BAR's size is fixed by the
+/// device, so it is measured once - on the first grant - and reused by every respawn.
+static DEV_BAR_LEN: [AtomicU64; MAX_DEVICES * 6] = [const { AtomicU64::new(0) }; MAX_DEVICES * 6];
+
+/// The length of memory BAR `ix` of `d`, in bytes, or 0 when it cannot be told (an I/O or absent BAR).
+///
+/// The standard probe: with the device's memory decode off, write all ones to the BAR and read back
+/// the mask of the address bits it implements, then put the BAR and the decode back. The whole sequence
+/// runs under `PCI_CONFIG_LOCK`, so a reader on another core (`hw-enumerator`, `hardware ... debug`)
+/// never sees the BAR holding the mask. Only the command half of the command/status dword is written:
+/// the status half is write-1-to-clear, and writing back what was read would clear it.
+///
+/// Called at GRANT time, for the device being granted - never at the boot scan, where it would turn off
+/// decode on a display controller whose BAR the boot console is drawing into. This is what sizes a
+/// driver's register window to its device rather than a fixed 64 KiB, which on the T630 reached from the
+/// audio controller into the HDMI audio, `xhci`, EHCI and AHCI registers (backlog/80 K1).
+pub fn bar_len(d: &PciDevice, ix: usize) -> u64 {
+    if ix >= 6 || d.index >= MAX_DEVICES || d.bar[ix] == 0 { return 0; }
+    let slot = &DEV_BAR_LEN[d.index * 6 + ix];
+    let known = slot.load(Ordering::Relaxed);
+    if known != 0 { return known; }
+    let base = 0x8000_0000u32
+        | (((d.bdf >> 8) & 0xFF) << 16)
+        | (((d.bdf >> 3) & 0x1F) << 11)
+        | ((d.bdf & 0x07) << 8);
+    let off = 0x10 + ix as u32 * 4;
+    let (lo_mask, hi_mask, is64) = {
+        let _g = PCI_CONFIG_LOCK.lock();
+        // SAFETY: mechanism #1 port I/O in ring 0, every address/data pair under PCI_CONFIG_LOCK; the
+        // offsets are the command register and this device's BAR `ix` (and `ix + 1`, its high half,
+        // only for a 64-bit BAR below the last slot). Every value written is restored before the lock
+        // is released, so no other access ever observes the probe.
+        unsafe {
+            outl(CONFIG_ADDRESS, base | 0x04);
+            let cmd = inl(CONFIG_DATA) & 0xFFFF;
+            outl(CONFIG_ADDRESS, base | 0x04);
+            outl(CONFIG_DATA, cmd & !0x2); // memory decode off while the BAR holds a mask
+            outl(CONFIG_ADDRESS, base | off);
+            let lo = inl(CONFIG_DATA);
+            outl(CONFIG_ADDRESS, base | off);
+            outl(CONFIG_DATA, 0xFFFF_FFFF);
+            outl(CONFIG_ADDRESS, base | off);
+            let lo_mask = inl(CONFIG_DATA);
+            outl(CONFIG_ADDRESS, base | off);
+            outl(CONFIG_DATA, lo);
+            let is64 = lo & 0x6 == 0x4 && ix < 5;
+            let mut hi_mask = 0xFFFF_FFFF;
+            if is64 {
+                outl(CONFIG_ADDRESS, base | (off + 4));
+                let hi = inl(CONFIG_DATA);
+                outl(CONFIG_ADDRESS, base | (off + 4));
+                outl(CONFIG_DATA, 0xFFFF_FFFF);
+                outl(CONFIG_ADDRESS, base | (off + 4));
+                hi_mask = inl(CONFIG_DATA);
+                outl(CONFIG_ADDRESS, base | (off + 4));
+                outl(CONFIG_DATA, hi);
+            }
+            outl(CONFIG_ADDRESS, base | 0x04);
+            outl(CONFIG_DATA, cmd);
+            (lo_mask, hi_mask, is64)
+        }
+    };
+    if lo_mask & 0x1 != 0 { return 0; } // an I/O BAR: not a memory window
+    let mask = ((hi_mask as u64) << 32) | (lo_mask & 0xFFFF_FFF0) as u64;
+    if lo_mask & 0xFFFF_FFF0 == 0 && (!is64 || hi_mask == 0) { return 0; }
+    let len = (!mask).wrapping_add(1);
+    slot.store(len, Ordering::Relaxed);
+    len
+}
+
 /// Clear PCI Bus Master Enable (Command register bit 2) for `bdf` - stop the device issuing ANY DMA.
 /// Called on a DMA-capable driver's death BEFORE its frames are reclaimed: a controller whose DMA frames
 /// are about to be freed + reused (e.g. as a page table) would otherwise scribble a stale/in-flight DMA

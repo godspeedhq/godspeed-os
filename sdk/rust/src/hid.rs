@@ -104,6 +104,12 @@ fn emit_key(k: u8, mods: u8, caps: bool, emit: &mut impl FnMut(u8)) -> bool {
         for &b in body { emit(b); }
         true
     }
+    // An audio shortcut is its signal, not the key under it: Ctrl+Alt+Up is not a cursor-up, and
+    // Ctrl+Alt+M is not the Ctrl+M carriage return it would otherwise be. First, so nothing below sees it.
+    if let Some(sig) = audio_chord(k, mods) {
+        emit(sig);
+        return true;
+    }
     match k {
         0x52 => csi(b"A", emit),  // Up
         0x51 => csi(b"B", emit),  // Down
@@ -257,6 +263,34 @@ pub const KEY_CAPS_LOCK: u8 = 0x39;
 /// drift apart.
 pub const CTRL_ALT_DEL_SIGNAL: u8 = 0x80;
 
+/// Console-stream signals for the audio shortcuts (`docs/audio.md`, "Keyboard shortcuts"): Ctrl+Alt+Up,
+/// Ctrl+Alt+Down and Ctrl+Alt+M. The Ctrl+Alt+Del pattern exactly: the keyboard driver only SAYS the chord
+/// happened, on the console stream, and the SHELL - which asks the audio driver - acts. The keyboard
+/// drivers gain no capability and never speak to the audio driver. Outside ASCII, so no typed key
+/// produces them, and read from here by both ends.
+pub const VOLUME_UP_SIGNAL: u8 = 0x81;
+pub const VOLUME_DOWN_SIGNAL: u8 = 0x82;
+pub const MUTE_TOGGLE_SIGNAL: u8 = 0x83;
+
+/// HID usages of the keys the audio shortcuts use.
+const KEY_UP: u8 = 0x52;
+const KEY_DOWN: u8 = 0x51;
+const KEY_M: u8 = 0x10;
+
+/// The audio shortcut a key press is, with these modifiers: either Ctrl (0x01 / 0x10) AND either Alt
+/// (0x04 / 0x40), with Up, Down or M. `None` for every other key, which then means what it always did.
+pub fn audio_chord(key: u8, mods: u8) -> Option<u8> {
+    if mods & 0x11 == 0 || mods & 0x44 == 0 {
+        return None;
+    }
+    match key {
+        KEY_UP => Some(VOLUME_UP_SIGNAL),
+        KEY_DOWN => Some(VOLUME_DOWN_SIGNAL),
+        KEY_M => Some(MUTE_TOGGLE_SIGNAL),
+        _ => None,
+    }
+}
+
 /// True if a **keyboard** boot report is the Ctrl+Alt+Del chord: either Ctrl (left 0x01 / right
 /// 0x10) **and** either Alt (left 0x04 / right 0x40) held, with the Delete key down. This is the
 /// secure-attention combo - a driver checks it each poll for a keyboard device and, when true,
@@ -320,7 +354,10 @@ pub fn decode_keyboard(
                 // re-open help over and over); and Enter/Return (0x28) + keypad Enter
                 // (0x58), commit keys whose repeat spams blank prompts and re-fires a
                 // confirmation's answer (the Wyse `y/N` "multiple gsh>" bug).
-                if k != 0x29 && k != 0x28 && k != 0x58 && !(0x3A..=0x45).contains(&k) {
+                // And Ctrl+Alt+M: held, it would flip the mute on and off for as long as it is down.
+                // Ctrl+Alt+Up and Down DO repeat - holding them is how the volume is swept.
+                if k != 0x29 && k != 0x28 && k != 0x58 && !(0x3A..=0x45).contains(&k)
+                    && audio_chord(k, mods) != Some(MUTE_TOGGLE_SIGNAL) {
                     rep.arm(k, mods, *caps, now);
                 }
             } else if is_typable_code(k) {
@@ -510,5 +547,47 @@ mod tests {
         assert!(!is_ctrl_alt_del(&[0x05, 0, 0, 0, 0, 0, 0, 0]));           // Ctrl+Alt, no Del
         // A stale/invalid report (reserved byte ≠ 0) is rejected even if it otherwise matches.
         assert!(!is_ctrl_alt_del(&[0x05, 0xFF, 0x4C, 0, 0, 0, 0, 0]));
+    }
+
+    // Decode one report with these modifiers and one keycode, from a cold `last`.
+    fn emit_mods(mods: u8, code: u8, rep: &mut KeyRepeat) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut last = [0u8; 6];
+        let mut caps = false;
+        decode_keyboard(&[mods, 0, code, 0, 0, 0, 0, 0], &mut last, rep, &mut caps, 0, |b| out.push(b), |_| {});
+        out
+    }
+
+    #[test]
+    fn audio_shortcuts_are_signals_not_keys() {
+        let mut rep = KeyRepeat::new(0, 0);
+        // Ctrl+Alt+Up / Down / M, either side's modifiers: the signal, and nothing else.
+        assert_eq!(emit_mods(0x01 | 0x04, 0x52, &mut rep), [VOLUME_UP_SIGNAL]);
+        assert_eq!(emit_mods(0x10 | 0x40, 0x51, &mut rep), [VOLUME_DOWN_SIGNAL]);
+        assert_eq!(emit_mods(0x01 | 0x40, 0x10, &mut rep), [MUTE_TOGGLE_SIGNAL]);
+        // Without both Ctrl and Alt they are what they always were: an arrow is still an arrow.
+        assert_eq!(emit_mods(0, 0x52, &mut rep), b"\x1b[A");
+        assert_eq!(emit_mods(0x01, 0x52, &mut rep), b"\x1b[A");
+        assert_eq!(emit_mods(0x04, 0x10, &mut rep), b"m");
+        // Outside ASCII, so no typed key can produce one.
+        for s in [VOLUME_UP_SIGNAL, VOLUME_DOWN_SIGNAL, MUTE_TOGGLE_SIGNAL, CTRL_ALT_DEL_SIGNAL] {
+            assert!(s >= 0x80);
+        }
+    }
+
+    #[test]
+    fn a_held_volume_chord_repeats_and_a_held_mute_does_not() {
+        // Holding Ctrl+Alt+Up sweeps the volume: the key arms auto-repeat, which re-emits the signal.
+        let mut rep = KeyRepeat::new(10, 5);
+        let _ = emit_mods(0x05, 0x52, &mut rep);
+        let mut again = Vec::new();
+        rep.poll(100, |b| again.push(b));
+        assert_eq!(again, [VOLUME_UP_SIGNAL]);
+        // Holding Ctrl+Alt+M must not flip the mute back and forth: it never arms.
+        let mut rep = KeyRepeat::new(10, 5);
+        let _ = emit_mods(0x05, 0x10, &mut rep);
+        let mut again = Vec::new();
+        rep.poll(100, |b| again.push(b));
+        assert!(again.is_empty());
     }
 }

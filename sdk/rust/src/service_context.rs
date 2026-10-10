@@ -402,6 +402,13 @@ pub mod privbits {
 /// what its own bus scan found - a CLASS rather than an address, because the kernel keeps a permanent
 /// physical DMA reservation per device that a respawned driver must get back.
 pub mod hwclass {
+    /// `hw-enumerator`'s which-device question: `[BY_CLASS, class (3 bytes LE), PREFER_OWN]`, answered
+    /// `[bdf u32, class u32]`. The supervisor asks it to choose a PCI driver's device, which the kernel
+    /// then grants by that BDF; `hardware` asks it again to say which device that driver holds. One
+    /// definition, so the two cannot disagree. `PREFER_OWN`: the first device of the class that is not
+    /// a display's companion function, if there is one (the T630's HDMI audio, `docs/audio.md`).
+    pub const BY_CLASS:    u8 = 3;
+    pub const PREFER_OWN:  u8 = 1;
     pub const NONE:        u32 = 0;
     pub const NIC:         u32 = 2;
     pub const XHCI:        u32 = 3;

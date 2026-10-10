@@ -392,6 +392,18 @@ mod board {
     /// the board that has it, `xhci` on the others (U2a).
     pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
 
+    /// `copier`'s send peers: `fs` for the files it copies, and the board's audio driver for the "done"
+    /// sound a finished job makes (`docs/audio.md`, "System sounds") - `audio-driver` on the PCs,
+    /// `pwm-audio` on the Pis, none on the VisionFive, which has no audio output. Flat, for the reason
+    /// `NIC_PEERS` gives.
+    pub const COPIER_PEERS: &[&str] = if cfg!(has_audio_driver) {
+        &["fs", "audio-driver"]
+    } else if cfg!(has_pwm_audio) {
+        &["fs", "pwm-audio"]
+    } else {
+        &["fs"]
+    };
+
     /// `nic-driver`'s send peers: the USB host its NIC sits behind where it has one (only the Pi 2 puts
     /// ethernet on USB, the LAN9514), the radio service or services its bridge reaches, and `events`.
     pub const NIC_PEERS: &[&str] = if cfg!(has_dwc2) {
@@ -468,7 +480,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // told what to copy. Deliberately not restarted on death: a respawned copier would not know
     // what it was copying, so it would be alive and copying nothing while `jobs` said running.
     ("copier", COPIER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
-     u32::MAX, &["fs"], 0, 0, 0),
+     u32::MAX, board::COPIER_PEERS, 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
@@ -1134,7 +1146,11 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
 /// `TRIES` times. Still no matching answer is 0 - the kernel's own scan - never a wrong device.
 #[cfg(has_hw_enumerator)]
 fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
-    const OP_BY_CLASS: u8 = 3;
+    use godspeed_sdk::service_context::hwclass::{BY_CLASS as OP_BY_CLASS, PREFER_OWN};
+    // A driver drives a device that stands for itself, not a display's companion function: the T630
+    // has two HD Audio controllers, the HDMI one at 00:01.1 beside its GPU and the analog one at
+    // 00:09.2, and the first of the class is the HDMI one (docs/audio.md, "Found while preparing", 2).
+    // The reporter says which device is a companion; preferring the other is this decision.
     const ANSWER_SECS: i64 = 2;
     // One stale answer costs one more ask; more than that in a row is a reporter that is not answering
     // this question, and the kernel's scan is the better answer.
@@ -1143,7 +1159,7 @@ fn ask_bdf_for_class(ctx: &ServiceContext, class_code: u32) -> u32 {
     let mut buf = [0u8; 16];
     for _ in 0..TRIES {
         match ctx.request_with_reply_deadline_outcome_into(
-            "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2]], &mut buf, ANSWER_SECS)
+            "hw-enumerator", &[OP_BY_CLASS, c[0], c[1], c[2], PREFER_OWN], &mut buf, ANSWER_SECS)
         {
             DeadlineOutcomeInto::Reply(n) if n >= 8 => {
                 let bdf = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -1447,10 +1463,13 @@ struct UsbState {
     /// A host has reported at least once. Until then `present` is only this supervisor's starting value,
     /// and "absent" must not be told to anyone (`tell_radio_of_dongle`).
     heard: bool,
+    /// Boot is over ("supervisor: ready"). A device a host reports before then was already plugged in,
+    /// not arriving, so it makes no plug sound.
+    ready: bool,
 }
 
 impl UsbState {
-    const fn new() -> Self { UsbState { present: [false; USB_MATCH_MAX], heard: false } }
+    const fn new() -> Self { UsbState { present: [false; USB_MATCH_MAX], heard: false, ready: false } }
 
     /// Should `name` be running? A device's driver only while its device is attached; everything else,
     /// always. What keeps the restart paths (the death arm, `reconcile`, `converge`) from bringing back a
@@ -1518,6 +1537,7 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, ev
                 match ctx.kill(m.driver) {
                     Ok(()) => {
                         events.note(ctx, supcmd::EV_DETACHED, m.driver, m.vid, m.pid);
+                        if usb.ready { usb_sound(ctx, map, godspeed_audio::wire::SOUND_UNPLUGGED); }
                         ctx.log_fmt(format_args!(
                             "supervisor: {} stopped - its USB device {:04x}:{:04x} is not attached", m.driver, m.vid, m.pid))
                     }
@@ -1546,9 +1566,27 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, ev
         r.vid, r.pid, r.gen, m.driver));
     if spawn_wired(ctx, map, m.driver, m.peers) {
         events.note(ctx, supcmd::EV_ATTACHED, m.driver, m.vid, m.pid);
+        if usb.ready { usb_sound(ctx, map, godspeed_audio::wire::SOUND_PLUGGED); }
     } else {
         events.note(ctx, supcmd::EV_START_FAILED, m.driver, m.vid, m.pid);
         ctx.log_fmt(format_args!("supervisor: {} could not be started for its device", m.driver));
+    }
+}
+
+/// A USB device arrived or left: the system sound for it (`docs/audio.md`, "System sounds"), to this
+/// board's audio driver through the cap the name map holds for it. Sent with no reply capability, by
+/// `try_send`, and never waited for - the supervisor is the last thing that may block on a sound. No
+/// audio driver, a full queue, or sounds switched off all mean no sound. Only the USB devices this
+/// supervisor starts a driver for reach here: a keyboard or a disk is bound inside its host and is not
+/// reported, so it makes no sound.
+fn usb_sound(ctx: &ServiceContext, map: &NameCapMap, kind: u8) {
+    use godspeed_audio::wire;
+    let msg = Message::from_bytes(&[wire::TAGGED, 0, wire::OP_SOUND, kind]);
+    for driver in ["audio-driver", "pwm-audio"] {
+        if let Some(slot) = map.get(driver) {
+            let _ = try_send_slot(ctx, CapHandle(slot), &msg);
+            return;
+        }
     }
 }
 
@@ -2192,6 +2230,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut told_radio: Option<(u32, bool)> = None;
 
     ctx.log("supervisor: ready");
+    usb.ready = true;
 
     // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn

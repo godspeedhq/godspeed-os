@@ -45,7 +45,7 @@ block each, and none of them is a neutral kernel file.
 
 ### What the seam actually is
 
-`arch::imp` is **135 members** that the neutral kernel calls. You do not get a hand-written list of
+`arch::imp` is **137 members** that the neutral kernel calls. You do not get a hand-written list of
 them, deliberately: `scripts/arch_seam_check.py` DISCOVERS the set from what neutral code actually
 uses, so it cannot go stale the way a checklist does. Run it and it names every member your arch has
 not answered yet.

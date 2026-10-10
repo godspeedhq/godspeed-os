@@ -654,3 +654,4 @@ TXDESC32_SHORT_GI                  # Linux mac80211 / rtl8xxxu (mlme.c, core.c, 
 WLAN_STATUS_REQUEST_DECLINED       # Linux mac80211 / rtl8xxxu (mlme.c, core.c, rtl8xxxu.h, ieee80211.h), cited by sdk/wifi and wifi-usb for WMM and HT (R12a, R12b) - external, 26.14
 XHCI_TRB_OVERFETCH                 # Linux xhci.h - the quirk (BIT_ULL 45) giving every ring segment a dummy page after it, enabled for the VIA VL805 - external, 26.14
 XHCI_AVOID_DQ_ON_LINK              # Linux xhci.h (Raspberry Pi kernel) - the VL805 cannot have an endpoint dequeue set to a Link TRB - external, 26.14
+alc_fill_eapd_coef                 # Linux patch_realtek.c - the probe-time coefficients audio-driver gives the Wyse's ALC225 (A6) - external, 26.14

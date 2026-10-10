@@ -309,7 +309,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //   op 1        -> device count
     //   op 2 + idx  -> that device's facts
     //   op 4 + idx  -> that device's configuration space, read NOW: [bdf, 256 bytes]
-    //   op 3 + class -> the BDF of the first device with that class code (0 = none), and the class
+    //   op 3 + class [+ prefer] -> the BDF of the first device with that class code (0 = none), and the class;
+    //                  prefer bit 0: the first that is not a display's companion function, if any is
     loop {
         let msg = gs::ipc::recv(&ctx);
         // The caller's one-shot reply cap. No cap means nobody is waiting for an answer, so there is
@@ -337,12 +338,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // record count on the boot path for no gain.
             //
             // FIRST match, and that is the reporter's only judgement: it reports bus order, and which
-            // of two identical devices a driver should drive is the supervisor's decision, not this
-            // service's. When that question arises the answer is a richer query here, not a policy.
+            // of two devices of one class a driver should drive is the supervisor's decision, not this
+            // service's. The richer query that decision needs is an optional fifth byte: bit 0 asks for
+            // the first device of the class that is NOT a display's companion - a function other than 0
+            // whose function 0 is a display controller, like the HDMI audio beside a GPU. If every
+            // device of the class is one, the first is the answer, as without it. That is a fact about
+            // the bus, which this service reports; wanting it is the supervisor's.
             (Some(3), _) if p.len() >= 4 => {
                 let want = u32::from_le_bytes([p[1], p[2], p[3], 0]);
-                let bdf = found.iter().take(n)
-                    .find(|f| f.class_code == want)
+                let prefer_own = p.get(4).is_some_and(|b| b & 1 != 0);
+                let of_class = || found.iter().take(n).filter(|f| f.class_code == want);
+                let companion = |f: &&Found| f.bdf & 7 != 0
+                    && found.iter().take(n).any(|g| g.bdf == f.bdf & !7 && g.class_code >> 16 == 0x03);
+                let bdf = (if prefer_own { of_class().find(|f| !companion(f)) } else { None })
+                    .or_else(|| of_class().next())
                     .map_or(0u32, |f| f.bdf);
                 // `[bdf, class asked]`: the answer NAMES ITS QUESTION. The supervisor waits for this on a
                 // mailbox where an answer that missed its deadline is still there for the next question

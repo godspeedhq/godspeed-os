@@ -31,7 +31,7 @@ Provide typed, safe wrappers around kernel syscalls so service code:
 | `syscall.rs`          | `raw_syscall`, one per ISA (`pub(crate)`, so no service can name it) - the syscall ABI CLAUDE.md 18.1 designates |
 | `mmio.rs`             | `Mmio` and `Framebuffer`: bounds-checked volatile access to a granted register window (18.1) |
 | `dma.rs`              | `Dma`: accessors for a granted DMA arena (18.1) |
-| `hid.rs`              | USB HID boot-protocol decoding (keyboard and mouse), key repeat and the Ctrl+Alt+Del signal, shared by `xhci`, `ehci` and `dwc2` - pure logic, host-tested |
+| `hid.rs`              | USB HID boot-protocol decoding (keyboard and mouse), key repeat, and the Ctrl+Alt+Del and audio-shortcut signals (Ctrl+Alt+Up, Down, M), shared by `xhci`, `ehci` and `dwc2` - pure logic, host-tested |
 | `churn.rs`            | Pure helpers for the `churn` power-cut test's file content |
 | `adversarial.rs`      | The test-only fault and fuzz primitives (18.1): `fuzz_syscall` and the deliberate ring-3 faults; also the panic handler's way to die |
 

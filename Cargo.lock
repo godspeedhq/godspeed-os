@@ -310,6 +310,7 @@ name = "copier"
 version = "0.1.0"
 dependencies = [
  "godspeed",
+ "godspeed-audio",
  "godspeed-sdk",
 ]
 
@@ -546,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "godspeed"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "godspeed-sdk",
 ]
@@ -561,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "godspeed-sdk"
-version = "0.23.0"
+version = "0.24.0"
 
 [[package]]
 name = "godspeed-wifi"
@@ -903,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "bitflags 2.11.1",
  "limine",
@@ -1120,7 +1121,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "osdev"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "clap",
  "fatfs",
@@ -1531,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "godspeed",
  "godspeed-audio",
@@ -1591,6 +1592,7 @@ name = "supervisor"
 version = "0.1.0"
 dependencies = [
  "godspeed",
+ "godspeed-audio",
  "godspeed-sdk",
 ]
 

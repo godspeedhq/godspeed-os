@@ -1,13 +1,16 @@
 # Audio
 
-**Status: steps A1-A5 built and run in QEMU (2026-10-03; A4's outputs, debug and system sounds not built), built on
-`feat/audio` and since merged to `main`. The driver resets an Intel High Definition Audio controller, finds its codec and output
-path, moves codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's
-`audio` sets the volume, mutes, powers the codec down and up and plays tones (`utilities/57_audio.md`),
-each checked against the WAV QEMU wrote; the volume and the mute survive a reboot in `/audio.settings`.
-Interrupt-driven, IOMMU-confined, restartable; `play` streams PCM (A5). The Pis' 3.5 mm jack is driven by
-`pwm-audio` and was HEARD on a Pi 4 (2026-10-03); the Pi 2 is built and not yet heard. Not yet: `outputs`,
-`debug`, system sounds, the shortcuts; the HDA driver not run on hardware past the codec survey (A6).**
+**Status: A1-A6 done; HEARD on every board with an audio output (2026-10-10).** The HDA driver
+(`audio-driver`) resets an Intel High Definition Audio controller, finds its codec and output paths, moves
+codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's `audio` sets the
+volume, mutes, powers the codec down and up, chooses the output, plays tones and WAV files, and shows the
+driver's own account (`utilities/57_audio.md`). Volume, mute, output and system sounds survive a reboot in
+`/audio.settings`. Interrupt-driven where the controller has MSI and polled where it has none (the T630),
+IOMMU-confined where there is one, restartable. Heard on the Dell Wyse 5070 (ALC225, speaker and
+headphones) and the HP T630 (ALC255, speaker and headphones); the Pis' 3.5 mm jack, driven by `pwm-audio`,
+heard on the Pi 4 and the Pi 2; the VisionFive 2 Lite has no audio output and `audio` says so. A 100-round
+`chaos max-carnage` aimed at the audio driver passed on all four boards that have one. Only a codec in the
+driver's `PLAYABLE` table is played on; any other is surveyed and the driver says so.**
 
 Audio is two things at once here. It is the system's first sound, and it is the planned **independent
 test of `gs::driver`** (`docs/driver-library.md`, "Wi-Fi discovers; audio tests"): a second kind of
@@ -26,7 +29,7 @@ to a WAV file - and it is what the HP T630 has.
 | QEMU | `intel-hda` (ICH6, `8086:2668`), codec `hda-output` (`1af4:0012`) | DAC node 2 -> line-out pin node 3. Immediate Command registers implemented. Sound to `build/qemu_audio.wav` (`osdev run`) |
 | HP T630 | `00:09.2` AMD FCH Azalia (`1022:157a`), codec Realtek ALC255 (`10ec:0255`, subsystem `103c:8158`) | internal speaker, front headset jack, rear line-out. Linux: snoop via PCI config 0x42, trust LPIB, 40-bit DMA |
 | HP T630 | `00:01.1` Radeon HDMI audio (`1002:9840`) | a SECOND class-0x0403 controller - see "Found while preparing" |
-| Pi 2 / Pi 4 | 3.5 mm jack driven by PWM, fed by the BCM DMA engine (section "The Pis and the VisionFive") | not HDA. Needs the GPIO pinmux and the clock manager, both SHARED SoC blocks; no QEMU model. BUILT: the kernel prepares both as part of the grant (`pwm-audio`); heard on a Pi 4, the Pi 2 not yet |
+| Pi 2 / Pi 4 | 3.5 mm jack driven by PWM, fed by the BCM DMA engine (section "The Pis and the VisionFive") | not HDA. Needs the GPIO pinmux and the clock manager, both SHARED SoC blocks; no QEMU model. BUILT: the kernel prepares both as part of the grant (`pwm-audio`); heard on the Pi 4 and the Pi 2 |
 | VisionFive 2 Lite | no analog output; HDMI only | confirmed three ways: the board's port list, the vendor device tree disabling its PWM-DAC, and the board's own Linux log (`build/serial_output_risc_v_original.log`): `ALSA device list: No soundcards found` |
 
 Sources: the HDA specification rev 1.0a; QEMU `hw/audio/intel-hda.c`, `hda-codec.c`; Linux
@@ -51,10 +54,10 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A1** | Reset, find the codecs, walk the widget graph, report an output path. Immediate Command registers; no DMA, no interrupt | QEMU - **built** |
 | **A2** | CORB/RIRB, the command rings the spec requires (Immediate Command is optional, and unknown on the T630's FCH). The first DMA - used only on QEMU's codec until A6, for the T630's own reasons | QEMU - **built** |
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
-| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built**; outputs, debug and system sounds to come |
+| **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `hardware`, `outputs`, `output`, `debug`, system sounds and the keyboard shortcuts built 2026-10-09** |
 | **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
-| A6 | The T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD, a person listening | T630 |
-| **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
+| **A6** | Real sound on hardware, a person listening on each. **HEARD**: the Wyse 5070 (2026-10-09, speaker; headphones 2026-10-10) and the T630 (headphones 2026-10-09, speaker 2026-10-10), after the kernel's K1 and K2 and the ALC255's own bring-up; the T630's snoop bit was already on | Wyse, T630 - **done** |
+| **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU, then the Wyse (MSI) and the T630 (confined, polled) |
 
 **Before A3, the library work the process asks for.** Two things audio needs are already written by
 hand in other drivers, so by the rule they are library candidates NOW, and audio is meant to test them
@@ -70,9 +73,9 @@ step that first needs each (A3 for the arena, the interrupt step for the other).
 
 ## The `audio` utility (specification, agreed 2026-10-03)
 
-**Partly built (2026-10-03).** The verbs the shell answers are specified in `utilities/57_audio.md`,
-which is now the authority for them; this section stays the agreed design for the rest - `outputs`,
-`output`, `debug`, `system sounds` and the shortcuts (`play` and `/audio.settings` are built since). What follows was written
+**Built (2026-10-03, the rest 2026-10-09).** The verbs the shell answers are specified in
+`utilities/57_audio.md`, which is the authority for them; this section is the agreed design they were
+built from, kept as the record (only `audio hardware use` is not built). What follows was written
 before any of it existed. It lived here, not in `utilities/`, until the shell answered `audio`: Commandment X fails a `utilities/` spec for a verb the
 shell does not have, and the reverse (`utilities/0_conventions.md` 2a). On the day it is built it moves
 to a numbered spec of its own under `utilities/`, with the shell's eight registration sites. Modelled on `utilities/56_wifi.md`,
@@ -87,6 +90,8 @@ which is the closest device-control utility, and held to the fourteen rules of `
 | `audio info` | report, pipes | the detail a fault needs: controller and codec identity, outputs the codec offers, supported rates, ring size, interrupt or polling, position |
 | `audio outputs` | report, pipes as records | the outputs the codec actually has - speaker, headphone, line out - with which is selected and whether something is plugged into each |
 | `audio output <name>` | action | choose the output: `audio output headphone`. Names come from `audio outputs`; an unknown one is refused with the list |
+| `audio hardware` | report, pipes as records | (agreed and built 2026-10-09) every audio device on the machine, one row each: its PCI address or `jack`, what it is, who made it, its driver or `-`, its state, and `*` on the one `audio` talks to. See "Which device: `audio hardware`" below |
+| `audio hardware <device>` | report, pipes | (agreed 2026-10-09) one device in full: identity, bus address, what was granted, and why it is or is not driven |
 | `audio volume <0-100>` | action | set the volume. Reading it is `audio status` - one way to ask (rule 3) |
 | `audio mute` | action | silence the output, keeping the volume |
 | `audio unmute` | action | restore the volume that was set before `mute` |
@@ -223,6 +228,35 @@ the one `/wifi.keys` already proved (`utilities/56_wifi.md` 6):
 
 An absent, wedged or restarting driver makes `audio` return with a loud unavailable, never hang
 (Commandment VIII at the command layer).
+
+### Which device: `audio hardware` (agreed 2026-10-09)
+
+Asked for by the operator, on the model of `wifi hardware` (`utilities/56_wifi.md` 11). The reason is
+sharper than symmetry: the rest of `audio` assumes a machine has one audio device, and the T630 has two
+class-0x0403 controllers - its analog Azalia with the ALC255, and the Radeon's HDMI audio - of which the
+kernel binds the FIRST, the HDMI one ("Found while preparing" 2, `backlog/80` K2). A report listing both,
+with which one the driver holds, would have shown that on the first boot instead of in an audit.
+
+- **`audio hardware`** is a report, one row per audio device, and pipes as records: its name, what it
+  is (an HD Audio controller, or the PWM jack), who made it by the bus's IDs, the service that drives it
+  or `-`, its state, and `*` on the one every other `audio` verb talks to.
+- **Named by bus address, not `analog` or `hdmi`** (decided while building it, 2026-10-09): a device is
+  named as `hardware` names it - `00:09.2` - or `jack` on the Pis. A controller no driver holds has a
+  codec nobody has asked, so calling it `analog` or `hdmi` would be a guess; the vendor IDs beside it
+  (an AMD GPU's against an AMD chipset's) say which is which without one.
+- **`audio hardware <device>`** is one device in full, as labelled lines: controller and codec identity,
+  the bus address, what the grant gave (window, interrupt, IOMMU confinement) and why it is or is not
+  driven.
+- **`audio hardware use <device>` is NOT agreed yet**: no machine has two audio devices a driver can play
+  on. It comes with A6, if the HDMI audio ever becomes one; until then it is not in the help.
+
+**No kernel change.** The rows come from what the `hardware` utility already gathers - the PCI class-0x04
+devices from `hw-enumerator` and the Pis' jack as a SoC device - and the driver adds what only it knows
+about the one it is bound to.
+
+**Not the same as the other reports.** `audio hardware` is what is on the machine; `audio outputs` the
+jacks on the device in use; `audio info` that device summarised; `audio debug` the driver's own account
+of itself. The same split `wifi` has.
 
 ### Keyboard shortcuts (agreed 2026-10-03)
 
@@ -614,6 +648,11 @@ arena - the Radeon HDMI audio controller, which is the device "Found while prepa
 class-code lookup picks first. So on the T630 the confined audio device is not the analog Azalia at
 `00:09.2`, and what that confinement has been asked to carry is still untested.)*
 
+*(Note 2026-10-10: both superseded. Since K2 the driver is granted `00:09.2`, the analog controller, and
+the T630 confines it and plays through it: the commands, the buffer descriptors and the sound all go
+through the confined domain, heard on the speaker and the headphones, and confined again on every
+respawn of a 100-round chaos run.)*
+
 ## Step A4, first half: the protocol and the `audio` verbs (2026-10-03)
 
 **The protocol** is `sdk/audio`'s `wire`, read by both sides, as `sdk/wifi`'s is for the radio. Every
@@ -922,3 +961,542 @@ Recorded here because they were found on the way and do not belong to audio alon
    refused only by the Pi 2 and VisionFive scripts. All three now run the same checks as `osdev build`,
    each shown to refuse by putting the mismatch back (2026-10-03). The Pi 4 one matters most: it builds
    the images the Wi-Fi work flashes.
+
+## Step A4: `audio outputs` and `audio output` (2026-10-09, `feat/audio-finish`)
+
+**The survey keeps every output, not the first.** It used to return the first pin with a path to a
+converter and forget the rest; it now records every such pin of the first codec that has one (up to
+`wire::OUTPUTS_MAX`, the rest said in the log), and plays through the first until told otherwise. Two
+ops join the protocol: `OP_OUTPUTS` lists each output's pin, its default-device field, whether it is the
+one playing and whether anything is plugged in, and `OP_OUTPUT` chooses one by pin.
+
+**Presence is the pin's own report, or "cannot tell".** A pin whose capabilities say it can sense a jack
+is asked (`GET_PIN_SENSE`, with the `SET_PIN_SENSE` trigger first where the pin needs one); a pin that
+cannot is listed as `cannot tell`, never guessed. QEMU's `hda-output` pin cannot.
+
+**Choosing an output** switches the old pin's output enable and EAPD off, configures the new path exactly
+as bring-up does (power, amplifiers, selections, output enable, EAPD, converter format), puts the volume
+on the new path's amplifier, and reads the new pin back: its output enable set is `verified`. Refused while
+something plays - a path changed under a running stream cuts it mid-sound - and while audio is off.
+
+**Kept across a reboot** as `output <name>` in `/audio.settings`, written only once an output has been
+chosen. At boot the driver restores it if the codec still has an output of that kind, and says either way.
+`pwm-audio` answers the same two ops for the Pis' one jack (`headphone`, `cannot tell`).
+
+**What QEMU can show, and what it cannot.** Its codec has one output, a line out, so `osdev test audio`
+checks the list, the in-use mark, the pipe as records, that choosing the output in use sends nothing, and
+that an output the codec lacks is refused with the list - 46 checks, all passing. Switching between two
+outputs needs a codec with two: the T630's ALC255 has a headphone jack, a speaker and a line out, and is
+A6's.
+
+## Step A4: `audio hardware` (2026-10-09, `feat/audio-finish`)
+
+**Built from `hardware`'s own gathering**, so the two commands can never disagree about what is on the
+machine or who drives it: the rows are `hardware`'s multimedia-class PCI devices and the Pis' jack, and
+the device `audio` talks to is the one the running audio driver was given - which `hardware` marks by the
+rule the supervisor spawns by, the first device of the driver's class. For that one device the state is
+the driver's own word, read live: `ready`, `off`, or why it stopped (`surveyed, not played (A6)` on the
+T630 today). Every other device's state is `hardware`'s: `not driven` with the driver that took the first
+of its class, or `no driver`. `audio hardware <device>` adds `hardware why`'s reason and `hardware
+<device>`'s registers and grant, and `audio info` for the one in use.
+
+**It answers whether or not an audio driver runs**, because the case it exists for is a driver holding
+the wrong device - and a machine with no audio driver at all still has its devices listed.
+
+**QEMU has one controller**, so `osdev test audio` shows the row, the mark, the pipe, one device in full
+and a refused name (50 checks, all passing). The T630 is the machine with two, and is where this shows
+`backlog/80` K2 in one line.
+
+## Step A4: `audio debug` (2026-10-09, `feat/audio-finish`)
+
+**One op, five views, paged.** `OP_DEBUG` takes a view and a page and answers labelled lines of text, at
+most `wire::DEBUG_PAGE` bytes at a time with a flag saying whether more follows. The driver renders the
+WHOLE view for every page and cuts the page from it (`wire::Page`, shared by both drivers), so it holds
+nothing between an asker's pages - an asker that never comes back for page 2 costs nothing. Pages are
+bounded too (`DEBUG_PAGES_MAX`), so a reader looping on "more" cannot loop forever.
+
+**What each view reads, on the HD Audio driver:**
+- `stats` - verbs sent and unanswered (counted in the one place every verb goes, `Hda::send`), how
+  commands travel (rings or immediate), interrupts taken, underruns, what is playing and how far the ring
+  is ahead, and the LAST sound: how much it played against how long that took by the clock, as a percent
+  of real time. That last line is the one that proves the DMA engine and the link clock run at the rate
+  they were set to; QEMU's TCG clock is not the device's, so the test does not assert its value.
+- `codec` - every widget of the codec's audio function group: type, capabilities, output amplifier,
+  connections and the selected one, and for a pin its configuration default, pin capabilities and
+  control, with the pin playing marked. Read live, with verbs.
+- `stream` - the output stream descriptor's control, status, position, length, last valid index and
+  format, the BDL's address and every entry.
+- `trace` - the last 64 verbs and their answers, from a fixed ring in `Hda`, decoded by shape: a 12-bit
+  verb (0x7.. and 0xF..) with an 8-bit payload, or a 4-bit verb (format, amplifier) with a 16-bit one.
+- `registers` - GCAP, the version, GCTL, STATESTS, INTCTL, INTSTS, the wall clock, and the CORB and RIRB.
+
+**The views outlive a stopped bring-up.** On the T630 the driver surveys the ALC255 and stops before
+playback (A6). It used to keep nothing past that point, so the dump A6 begins from was unavailable on
+exactly the machine that needs it. The driver now keeps the surveyed controller (`Device::Surveyed`):
+every request is still answered with why there is no device, except `debug codec`, `trace` and
+`registers`, which answer as on a working one. `audio debug codec | write /codec.txt` on the T630 is the
+first step of A6.
+
+**On the Pis** `pwm-audio` answers all five: `stats` with the clock, the PWM range and the pacing check
+its start-up already measured (kept now, not only logged), `stream` with the DMA channel's control, its
+control block and where in the ring it is reading, `registers` with the PWM's and the channel's, and
+`codec` and `trace` with one line each saying a PWM jack has neither.
+
+`osdev test audio` runs every view and the pipe: 57 checks, all passing.
+
+## Step A4: system sounds (2026-10-09, `feat/audio-finish`)
+
+**Built as the spec above describes, with these decisions made while building it:**
+
+- **The driver decides, every sender only asks.** `OP_SOUND` names a sound; the driver plays it only
+  when the system sounds are on, audio is on, nothing else is playing, and `wire::SOUND_GAP_MS` (500 ms)
+  has passed since the last. The switch and the gap therefore live in ONE place for every sender,
+  rather than in each.
+- **No sender waits.** The request is sent by `try_send` with no reply capability, so the driver answers
+  nobody: no audio driver, a driver mid-restart, a full queue or the sounds switched off all mean no
+  sound, never a delay - an error is printed at once either way.
+- **The sounds are written once** (`sdk/audio`'s `sounds`), as short sequences of our own tones with a
+  3 ms fade at each end, so both drivers play the same sounds and neither clicks. Each is shorter than
+  either driver's ring, so it is rendered whole before it starts and never needs refilling. Mute and the
+  volume apply as to anything else. A finished sound writes no log line.
+- **Three senders, each the one that knows.** The SHELL, after a command typed at the prompt returns an
+  error (`Denied` is the refusal sound, anything else the error sound) - never in a script, because a
+  script's commands do not pass through the prompt. `COPIER`, once per job when it reaches done, wherever
+  the five kinds finish (`board::COPIER_PEERS` gives it the board's audio driver; its contract and
+  `COMMANDMENTS.baseline.toml` pin the grant). The SUPERVISOR, when it starts or stops a USB device's
+  driver because the device arrived or left - and only after boot, since a device reported at boot was
+  already plugged in.
+- **Not built: the `/sounds/<name>.wav` override.** Reading a file on every error is the round trip to
+  `fs` the built-in sounds exist to avoid, and it is not needed for the sounds to be useful. Recorded
+  rather than half-done.
+- **A limit, said:** only USB devices the supervisor starts a driver for make a plug sound - today the
+  WiFi dongle. A keyboard or a disk is bound inside its USB host and is never reported to it.
+
+**What QEMU shows.** `osdev test audio` switches the sounds off for boot 1 (that session types commands
+that fail on purpose, and its capture must hold only the tones asked for), checks the switch, `already
+off`, the status line and that `off` survives the reboot; then in boot 2 switches them on, types a
+refused command, and finds the 220 Hz refusal in that boot's capture. 62 checks, all passing. The "done"
+and plug sounds need a background job and a USB dongle with an audio device present, and are owed a
+hardware check.
+
+## Step A4: the keyboard shortcuts (2026-10-09, `feat/audio-finish`)
+
+**The Ctrl+Alt+Del pattern, as agreed.** The keyboard drivers decode the chord and put a signal byte on
+the console stream (`hid::VOLUME_UP_SIGNAL`, `VOLUME_DOWN_SIGNAL`, `MUTE_TOGGLE_SIGNAL`, 0x81-0x83,
+outside ASCII); the shell, which reads the console, does the same request the typed verb would, so the
+driver reads it back and keeps it in `/audio.settings`. No keyboard driver gains a capability or speaks to
+the audio driver.
+
+**In the decoder, not in each driver.** The chord is recognised inside `hid::emit_key`, which both a fresh
+key press and the auto-repeat pass through - so it works in `xhci`, `ehci` and `dwc2` alike with no change
+to any of them, a held Ctrl+Alt+Up sweeps the volume, and Ctrl+Alt+M is kept out of auto-repeat so a held
+key does not flap the mute. Ctrl+Alt+M is no longer the Ctrl+M carriage return it would otherwise be, and
+Ctrl+Alt+Up no longer a cursor-up; every other key means what it did. Host-tested (`sdk/rust/src/hid.rs`).
+
+**The notice, at the prompt**, is one line above it, as read back - `volume 65  [#############-------]`,
+`volume 0 - silent`, `muted (volume 65)` - with the prompt and the half-typed line put back under it. A
+press while that notice is still the line above overwrites it, so holding the keys gives one line; any
+other key ends that, since it may have moved the screen. When it cannot be done, the line says why: `no
+audio hardware on this machine`, or `audio: the audio driver is not answering`.
+
+**During `audio tone` and `audio play`** the spec has the volume join the status line those commands
+redraw. They redraw none - each prints its line once - so a shortcut there is done at once and said on a
+line of its own. Recorded as the difference from the spec rather than papered over.
+
+**`gs::io::keys`** re-exports the four signal bytes, so the shell names them from the standard library and
+the drivers from the SDK - one definition. It also closed one of the gaps `stdlib_gap_check` counts (the
+shell's Ctrl+Alt+Del byte), and that check's baseline went from 8 to 7.
+
+**What QEMU shows.** It cannot press the chord, so `osdev test audio` sends the signal bytes down the serial
+line - the byte a keyboard driver would put on the console - and checks up, down, mute and unmute as read
+back, and that `audio status` agrees: 67 checks, all passing. The chord itself is owed a hardware check on
+a real keyboard.
+
+## The Dell Wyse 5070's audio, as `audio debug` read it (2026-10-09)
+
+The A4 hardware card on the Wyse, and the first dump `Device::Surveyed` was kept for. The driver
+surveyed the codec and stopped, as it must on a codec playback has not been verified on; `audio
+hardware` showed `00:0e.0  HD audio  Intel 8086:3198  audio-driver  surveyed, not played (A6)`, every
+other verb answered with that reason, and Ctrl+Alt+Up and Down reached the shell from a real keyboard,
+repeating when held. `selfcheck` ran 537 with 0 failed before and after a 100-round `chaos max-carnage
+all-services`. Saved on the Wyse's disk as `/wyse-codec.txt`.
+
+`audio debug codec`:
+
+```
+codec 0 - vendor 10ec device 0225, audio function group 0x01
+widgets      0x02..0x24 (35); function group power D0
+node 0x02  output      caps 0x0000041d  amp-out 0x00025757 (87 steps)
+node 0x03  output      caps 0x0000041d  amp-out 0x00025757 (87 steps)
+node 0x04  vendor      caps 0x00f00000
+node 0x05  vendor      caps 0x00f00000
+node 0x06  output      caps 0x00000411
+node 0x07  input       caps 0x0010051b  from 0x24
+node 0x08  input       caps 0x0010051b  from 0x23
+node 0x09  input       caps 0x0010051b  from 0x22
+node 0x0a  vendor      caps 0x00f00000
+node 0x0b  vendor      caps 0x00f00000
+node 0x0c  vendor      caps 0x00f00000
+node 0x0d  vendor      caps 0x00f00000
+node 0x0e  vendor      caps 0x00f00000
+node 0x0f  vendor      caps 0x00f00000
+node 0x10  vendor      caps 0x00f00000
+node 0x11  vendor      caps 0x00f00000
+node 0x12  pin         caps 0x0040040b  config 0x40000000 (line out, nothing attached)  pincap 0x00000020  control 0x00
+node 0x13  pin         caps 0x0040040b  config 0x411111f0 (speaker, nothing attached)  pincap 0x00000020  control 0x00
+node 0x14  pin         caps 0x0040058d  amp-out 0x80000000 (0 steps)  config 0x90170110 (speaker)  pincap 0x00010014  control 0x00  from 0x02
+node 0x15  vendor      caps 0x00f00000
+node 0x16  pin         caps 0x0040058d  amp-out 0x80000000 (0 steps)  config 0x411111f0 (speaker, nothing attached)  pincap 0x0000001c  control 0x00  from 0x02 0x03 (selected 0)
+node 0x17  pin         caps 0x0040058d  amp-out 0x80000000 (0 steps)  config 0x411111f0 (speaker, nothing attached)  pincap 0x0000001c  control 0x00  from 0x02 0x03 0x06 (selected 0)
+node 0x18  pin         caps 0x0040048b  config 0x411111f0 (speaker, nothing attached)  pincap 0x00000024  control 0x00
+node 0x19  pin         caps 0x0040048b  config 0x411111f0 (speaker, nothing attached)  pincap 0x00003724  control 0x20
+node 0x1a  pin         caps 0x0040048b  config 0x411111f0 (speaker, nothing attached)  pincap 0x00003724  control 0x00
+node 0x1b  pin         caps 0x0040058f  amp-out 0x80000000 (0 steps)  config 0x02011020 (line out)  pincap 0x00013734  control 0x00  from 0x02 0x03 (selected 0)
+node 0x1c  vendor      caps 0x00f00000
+node 0x1d  pin         caps 0x00400400  config 0x40438029 (S/PDIF out, nothing attached)  pincap 0x00000020  control 0x20
+node 0x1e  pin         caps 0x00400501  config 0x411111f0 (speaker, nothing attached)  pincap 0x00000010  control 0x40  from 0x06
+node 0x1f  vendor      caps 0x00f00000
+node 0x20  vendor      caps 0x00f00040
+node 0x21  pin         caps 0x0040058d  amp-out 0x80000000 (0 steps)  config 0x0221101f (headphone)  pincap 0x0001001c  control 0x00  from 0x02 0x03 (selected 1)
+node 0x22  mixer       caps 0x0020010b  from 0x19 0x1a 0x1b 0x1d 0x13 (selected 0)
+node 0x23  mixer       caps 0x0020010b  from 0x19 0x1a 0x1b 0x1d 0x12 (selected 0)
+node 0x24  selector    caps 0x00300101  from 0x12 0x13 0x18 (selected 0)
+```
+
+`audio debug registers`:
+
+```
+GCAP      0x6701: 6 output, 7 input, 0 bidirectional stream(s), 64-bit true
+VMAJ.VMIN 1.0
+GCTL      0x00000001 (bit 0: out of reset)
+STATESTS  0x0005 (a bit per codec that answered)
+INTCTL    0x00000000
+INTSTS    0x40000000
+WALCLK    0x4a633987
+CORB      WP 0x0000 RP 0x0000 CTL 0x00 SIZE 0x42
+RIRB      WP 0x0000 CTL 0x00 STS 0x00 SIZE 0x42 RINTCNT 0
+window    65536 bytes
+```
+
+**What it says, read off the dump rather than a reference:**
+
+- **One audio controller, and it is Intel's** (`hardware` lists one class-0x0403 device, 00:0e.0). So
+  the first-of-class problem (Found while preparing, 2) does not bite here, and the AMD snoop bit is
+  not a question on this machine. Codec 0 is a Realtek 10ec:0225; codec 2, Intel 8086:280d, is the
+  display's audio and offers no path this driver uses.
+- **Immediate Command works on this controller**: the whole survey ran on it with CORB and RIRB
+  stopped (`CTL 0x00`). Across the boot and 25 restarts under chaos, two verbs went unanswered, both
+  while chaos was killing services around a driver that was mid-survey.
+- **Two converters, 0x02 and 0x03**, each with an 87-step output amplifier. The internal speaker, pin
+  0x14, connects only to 0x02. The headphone jack 0x21 and line out 0x1b can take either, and the
+  firmware left 0x21 on 0x03.
+- **Every output pin was left disabled** (`control 0x00`), so whatever plays has to enable the pin it
+  uses - which A3 already does on QEMU's codec.
+- **The speaker, headphone and line-out pins are EAPD-capable** (bit 16 of each pincap), so their
+  external amplifiers have to be switched on too. The pins carry no amplifier steps of their own, only
+  a mute (`amp-out 0x80000000`).
+- **Node 0x20 is a vendor widget.** Whether this codec needs vendor coefficients set before it makes a
+  sound has not been checked against a reference.
+
+**What this changes for A6.** The plan names the T630, which needs the two kernel fixes and the AMD
+snoop bit before its codec is even the question. On the evidence above the Wyse needs neither the
+first-of-class fix nor the snoop bit; what is left is the codec itself - pins, EAPD, and the open
+question of node 0x20. Which machine A6 starts on is the operator's choice; this records that the Wyse
+is the shorter road.
+
+## Step A6 on the Wyse 5070, first image (2026-10-09)
+
+**The change.** The driver played only on QEMU's codec. It now plays on any codec in `PLAYABLE`, a table
+of `(vendor, device, coefficients)`, and the Wyse's Realtek `10ec:0225` is the second row. Nothing else
+about the path is new: the survey, the command rings, power, amplifiers, the pin's output enable and
+EAPD were already applied to whatever path the survey found.
+
+**What Linux does for this machine, read rather than assumed** (`sound/pci/hda/hda_intel.c` and
+`patch_realtek.c`, 6.12):
+
+- The controller, `8086:3198`, is Gemini Lake: `AZX_DRIVER_SKL | AZX_DCAPS_INTEL_BROXTON`. Of what that
+  turns on, two touch configuration space, which this driver cannot write: the snoop bit (`DEVC`, 0x78
+  bit 11, written only if it is not already as wanted) and a clock-gating bit cleared around controller
+  reset (`CGCTL`, 0x48). The reset already works here - the codecs answered - so the second is not in
+  the way. The first is read on the card instead (`hardware 00:0e.0 debug`). `bxt_reduce_dma_latency` is
+  for Apollo Lake only, and the link-clock setup applies only where the clock is still at 6 MHz.
+- The codec, `10ec:0225`, gets three processing coefficients at probe, through vendor widget 0x20
+  (`alc_fill_eapd_coef`): 0x67 bits 15:12 to 3, 0x36 bit 13 clear, 0x10 bit 9 clear. They are set before
+  the path is configured, each read back and logged, and again after a hard off, since a link reset
+  resets the codec. `alc225_init`'s headphone sequence is not done: this image plays through the
+  internal speaker, pin 0x14, the first path the survey finds.
+
+**The prediction, written before the boot:**
+
+- The log says `codec commands now go through the CORB and RIRB`, then names three coefficients, each
+  `read back the same`, then `audio-driver: ready`. `audio hardware` says `ready`, not `surveyed`.
+- `audio tone 440` is HEARD from the Wyse's own speaker, and `audio status` shows it playing with the
+  underrun count at 0.
+- `audio volume 20` and then `audio volume 80` are audibly different; `audio mute` silences it.
+
+**What would falsify it, and what each says:**
+
+- A coefficient `DIFFERENT` or `did not answer`: the vendor widget is not where Linux expects it on this
+  codec, and the bring-up stops there by design.
+- `ready`, the stream running (`audio debug stream`: the link position moving) and SILENCE: the DMA is
+  fine and the sound is lost after the converter - the speaker amplifier, a coefficient, or
+  `alc225_init`'s sequence. If the position does not move, it is the controller: read `DEVC` first.
+- `ready` and noise or clicks instead of a tone: the snoop bit, read from `hardware 00:0e.0 debug`.
+
+## Step A6 on the Wyse 5070: HEARD (2026-10-09)
+
+**The prediction held, all of it except the mute.** The rings came up, the three coefficients were each
+`read back the same` (0x67 and 0x10 already as Linux wants them; 0x36 went 0x77d7 -> 0x57d7), the
+driver said `ready`, and `audio hardware` said `ready`. `audio tone 440` was HEARD from the Wyse's own
+speaker - a clean tone, the operator's words - the first sound this HDA driver has made on hardware.
+`played 440 Hz for 2000 ms in 2028 ms by the clock, 0 underrun(s); 23 interrupt(s), 0 watchdog
+wake(s)`: one interrupt per 85 ms period, so the stream ran on its MSI in real time. A 10 s tone at
+880 Hz stopped on `q`, and volume 20 was quieter.
+
+**The snoop bit was the wrong way and did not matter.** Configuration offset 0x78 read `0x2800`: bit 11
+set, the device permitted to read without snooping, which Linux clears on this controller. The tone was
+clean anyway, so on this machine the controller is not reading stale samples. Recorded rather than
+explained: why it does not matter here is not known, and it is the first thing to look at if a later
+machine plays noise.
+
+**The mute did not work, and the driver said so.** `muted FAILED - the codec reads back something else`,
+with the serial line `node 0x02 amplifier reads 0x11 after 0x91 was set`. The driver muted on the volume
+amplifier, the converter's, and this codec's converter amplifier has no mute: bit 31 of its capabilities
+(`0x00025757`) is clear, so the codec dropped the bit. QEMU's converter amplifier has one, which is why
+QEMU could not show it. The read-back is what caught it.
+
+**The fix:** the mute goes on an amplifier that has one. The volume stays on the converter's amplifier;
+the mute is set there if it can mute, else on the nearest amplifier towards the pin that can - here the
+speaker pin 0x14, `amp-out 0x80000000`, a mute and no steps - and if none on the path can, silence is
+the volume amplifier's lowest step, said in the log. Both are read back. The log says where the mute
+went (`node 0x02 has no mute - muting on node 0x14`).
+
+**Prediction for the next card:** that log line at boot; `audio mute` answers `muted - verified` and a
+tone is silent; `audio unmute` brings it back at the same level; volume 0 is silent too.
+
+**The card (2026-10-09, same day): mute HARDWARE-VERIFIED on the Wyse.** Every line of the prediction
+held: `node 0x02 has no mute - muting on node 0x14` at boot, `muted - verified` and the tone silent,
+`unmuted - volume 50 - verified` and the tone back at the same level, `volume 0 - silent - verified`
+and silent, `volume 50 - verified`. Each tone played 2000 ms in 2028 by the clock, 0 underruns, 23
+interrupts. The operator: "mute works and all the commands too". A6 is done on the Wyse; the T630 is
+what remains of it - the two kernel fixes and the AMD snoop bit come before its codec is the question.
+
+## Step A6 on the T630, K2: the controller the driver is granted (2026-10-09)
+
+**The fault.** A class code picks the FIRST device of the class, and on the T630 that is the HDMI audio
+controller at 00:01.1, beside its GPU at 00:01.0; the analog one with the Realtek is 00:09.2. The
+supervisor already supplied a BDF, but the kernel used it only for bus mastering and confinement - the
+window, the arena and the vector still came from the first of the class.
+
+**Kernel: one device per request.** `HwClass::pci_dev` decides the device a PCI spawn names, and every
+grant goes through it: window, arena, vector, confinement, bus mastering. A supplied BDF selects it; none
+means the first of the class, as before. A supplied BDF whose device is of a different class is refused
+with no device granted, because a stale answer did exactly that on 2026-10-08 and confined the SATA
+controller to `xhci`'s arena. That refusal is built and not yet seen firing.
+
+**Which device: a fact from the reporter, a choice by the supervisor.** `hw-enumerator`'s class question
+takes an optional byte, `PREFER_OWN` (`hwclass` in the SDK, one definition): the first device of the class
+that is not a display's companion - a function other than 0 whose function 0 is a display controller -
+or, if every one is, the first. The supervisor sets it. `hardware` asks the same question to say which
+device a driver holds, so the report cannot show the driver on one controller while the kernel granted
+another; QEMU caught exactly that the first time the suite ran with two.
+
+**Pinned in QEMU.** `osdev test audio` now boots a decoy: an HD Audio controller with no codec as function
+1 of a VGA at 00:06.0, so it is the first of its class, and the real one at 00:08.0. The driver is granted
+00:08.0 (`BDF 0x0040 supplied for class 0x040300, the first of that class is 0x0031 - the supplied one is
+granted`), finds QEMU's codec, plays into the WAV, and `audio hardware` shows the decoy `not driven`: 69
+checks, all passing. The two controllers' registers are 16 KiB apart there, which is K1 in miniature.
+
+## Step A6 on the T630, K1: the window is the BAR (2026-10-09)
+
+**Worse than recorded.** "Found while preparing", 1, said the T630's audio window covers the HDMI audio
+controller. Its BAR is at `0xfeb60000` and the window was 64 KiB, so it also reached `xhci`
+(`0xfeb68000`), EHCI (`0xfeb6c000`) and the AHCI disk controller (`0xfeb6d000`) - and each of those
+drivers' windows reached the ones above it.
+
+**The fix.** x86 `pci::bar_len` measures a memory BAR when it is first granted - memory decode off, all
+ones written, the mask read back, BAR and decode restored, the whole sequence under the configuration
+lock so no other reader sees the mask - and caches it. The window is the BAR: whole pages mapped, the
+`Mmio` length the BAR's exact size, so `Mmio`'s bounds check stops a driver at its device's last byte
+even inside a shared page. At most 16 MiB per grant. Sizing happens at grant time and never at the boot
+scan, where it would turn off a display controller's decode under the boot console.
+
+**What is not fixed.** Only x86 measures. The other ports answer 0 and keep the fixed 64 KiB window,
+and the spawn line says so; the Pi 4's and the VisionFive's `xhci` are PCIe devices this leaves as they
+were.
+
+**QEMU.** `audio-driver` 16384 bytes, `block-driver` (AHCI) 4096, `nic-driver` (e1000) 131072 - the
+e1000's window GREW, because its BAR is 128 KiB and the fixed window had been half of it. The audio suite:
+69 checks, all passing.
+
+## Step A6 on the T630: the K1 and K2 card, and the second image (2026-10-09)
+
+**The card held every line of the prediction.** `task: BDF 0x004a supplied for class 0x040300, the first
+of that class is 0x0009 - the supplied one is granted`; the IOMMU confined 00:09.2, not 00:01.1; and every
+window is its BAR now - audio 16384 bytes, `xhci` 8192, `ehci` 256, AHCI 1024, the RTL8168 4096. The driver
+surveyed a Realtek **10ec:0255** at 00:09.2 and stopped, as it must on a codec not in `PLAYABLE`.
+`selfcheck` ran 537 with 0 failed before and after a 100-round `chaos max-carnage all-services`, every
+service panic in it the expected `EndpointDead`, and no driver faulted in its smaller window.
+
+**Three facts the card added:**
+
+- **The speaker path goes through a mixer**: converter 0x02 -> mixer 0x0c -> pin 0x14, and 0x0c's other
+  input is 0x0b, the loopback mix of the microphones. A mixer has input amplifiers, and the driver set
+  only output ones. Neither QEMU's codec nor the Wyse's has a mixer on its path, so this never arose.
+- **The snoop bit is already on.** Configuration offset 0x42 reads `0x03`; the bit Linux sets for this
+  controller (`ATI_SB450_HDAUDIO_ENABLE_SNOOP`, 0x02) is set. Linux writes the field as exactly 0x02, so
+  it would also clear bit 0, whose meaning is not known here. Recorded, not acted on: the driver cannot
+  write configuration space, and coherence is what the bit is for.
+- **No interrupt at all.** The controller has no MSI capability and no INTx line (255), so the kernel says
+  `accepted neither MSI nor MSI-X - no interrupt, must poll` and the driver refills every 10 ms, as it was
+  built to.
+
+**The second image, one concern: set up this codec's path as Linux does.** `PLAYABLE` gains
+`10ec:0255` with the one coefficient Linux sets at probe (`alc_fill_eapd_coef`: 0x10 bit 9 clear), and
+`configure_path` sets a mixer's input amplifiers: the input from the next node on the path unmuted at
+0 dB (the amplifier's offset), the others muted, the first read back. The gate without the mixer would
+very likely be silent, and the mixer cannot be seen without the gate. QEMU's audio suite: 69, all passing.
+
+**Prediction:** the coefficient line `0x10: ... read back the same`, then `audio-driver: ready - serving
+requests; NO interrupt was routed, so playback refills by polling`, and `node 0x02 has no mute - muting on
+node 0x14`; `audio tone 440` HEARD from the T630's speaker; `audio debug codec` shows pin 0x14 `<- playing`.
+Falsified by: a mixer line (`mixer 0x0c input 0 ... reads`), which says the amplifier would not unmute; or
+`ready` with the link position moving and silence, which points past the mixer at the pin or the speaker
+amplifier; or underruns, which would be the 10 ms polling, not the codec.
+
+## Step A6 on the T630: silent, and the third image (2026-10-09)
+
+**The second image was silent, on the speaker pin and on headphones.** Everything it predicted in the
+log held - the coefficient read back, `ready ... refills by polling`, `node 0x02 has no mute - muting on
+node 0x14`, no mixer line - and four 5-second tones each `played ... in 5003 ms by the clock, 0
+underrun(s)`. Nothing was heard. Three things this does and does not say:
+
+- **The 0 underruns prove less here than on the Wyse.** This controller has no interrupt, so the count
+  is the driver's clock against its own refills; it does not show the controller fetched a sample. The
+  link position during a tone (`audio debug stream`) is what shows that, and it was not read.
+- **The headphones could not have worked.** The driver plays through the first path the survey finds,
+  the speaker pin 0x14; the headphone jack is pin 0x21 and is reached by `audio output headphone`.
+- **Whether the T630 has an internal speaker is not known here.** The pin's default configuration says
+  fixed speaker (`0x90170110`), which is what the firmware claims, not proof one is fitted.
+
+**Linux has no speaker quirk for this board.** Its subsystem id is `103c:8158`, and Linux's one entry for
+it (`ALC256_FIXUP_HP_HEADSET_MIC`) only restarts headset-jack detection. What Linux DOES do for every
+ALC255 is `alc256_init`, the headphone amplifier's power-up, and `PIN_HP` (0xc0) on a pin that can drive
+headphones. Neither was done here.
+
+**The third image, one concern: the ALC255's headphone output as Linux brings it up.** `PLAYABLE` rows can
+carry a codec's own bring-up, and the ALC255's is `alc256_init`: node 0x57 coefficient 0x04 to low power,
+the headphone pin muted and enabled as an output, coefficient 0x46 bits 13:12 cleared, 0x57/0x04 to high
+power, node 0x53 coefficient 0x02 bit 15 pulsed, coefficient 0x36 written as 0x5757 - each read back and
+logged. Coefficients can now be on any vendor node, not only 0x20. A headphone pin that can drive
+headphones is enabled with its headphone amplifier (0xc0 rather than 0x40), on any codec.
+
+**Prediction:** each coefficient line `read back the same`, then `ready`. After `audio output headphone`,
+`audio debug codec` shows pin 0x21 `control 0xc0 <- playing`, and `audio tone 440` is HEARD in the
+headphones. During a tone, `audio debug stream` shows the link position moving.
+
+**What would falsify it, and what each says:** a coefficient `DIFFERENT` or `did not answer` - the hidden
+nodes are not where Linux has them on this part, and bring-up stops there. Silence with the position NOT
+moving - the stream is not running, so the codec was never the question: the controller (and its missing
+interrupt, or the IOMMU) is. Silence with the position moving - the samples reach the codec and are lost
+inside it, which leaves the converter's stream tag and format, read in `audio debug codec`.
+
+**The card (2026-10-09, same day): HEARD on the T630, through headphones.** Every coefficient of
+`alc256_init` read back the same - 0x57/0x04 `0xa09c -> 0xa099` and back, 0x53/0x02 pulsed, 0x36 `0x0004 ->
+0x5757` - then `ready ... refills by polling`. After `audio output headphone` (`output now pin 0x21
+(headphone)`), `audio debug codec` showed pin 0x21 `control 0xc0 <- playing`, and the operator heard the
+tone in the headphones: the HDA driver now plays on both x86 machines, the T630 on a controller with no
+interrupt at all. A 10 s tone through the speaker pin played its full length with 0 underruns; whether the
+T630 has a speaker fitted for it to reach is still not known.
+
+**What this does not cover, recorded:** the Wyse's headphone jack now gets the headphone amplifier too
+(0xc0 on any pin that can drive headphones) and has not been listened to since; the Wyse's ALC225 has its
+own Linux headphone sequence (`alc225_init`), not done; and the T630's speaker remains unexplained.
+
+**And the T630's speaker (same day): HEARD, once the headphones were unplugged.** The silent speaker test
+above ran with the headphones still in the jack; unplugged, the same image played the tone from the
+T630's own speaker. So this board cuts its speaker in HARDWARE while the jack is occupied - the driver
+does nothing to it. HP's spec sheet was not found; reseller spec tables list a built-in speaker.
+
+**It is quiet, at volume 100, and the driver has nothing left to give.** Volume 100 is the converter's
+top step, 87, which its capabilities (`0x00025757`) make 0 dB; mixer 0x0c's input is at its own 0 dB;
+the speaker pin's amplifier is a mute and no steps; the widget graph has no other gain. The test tone is
+half of full scale, 6 dB of deliberate headroom, so a full-scale WAV through `audio play` would be about
+twice as loud and no more. What is left is the speaker itself - an inference, not a measurement.
+
+**`audio` said "nothing is plugged into it" about that speaker.** Its pin can sense presence and read
+nothing there while fitted and playing. A FIXED pin (connectivity `0b10`) is not a jack and its sense
+means nothing, which is why Linux does not consult it; the driver now reports presence unknown for one.
+
+## Step A6: both x86 machines, headphones and speaker (2026-10-10)
+
+**The T630's speaker, on an image with nothing changed for volume:** 440, 880 and 1760 Hz for 5 s each,
+0 underruns, every `alc256_init` coefficient read back the same. The operator found it loud enough this
+time; nothing in the path changed, so the difference is in the listening, not the driver.
+
+**The Wyse's headphones: HEARD.** `audio output headphone` -> `output now pin 0x21 (headphone) - verified`,
+then a 5 s tone, 0 underruns and 59 interrupts, heard in the headphones. Its speaker was heard as well,
+and loud. So the headphone amplifier (`0xc0` on a pin that can drive headphones) works on the ALC225
+without Linux's `alc225_init`; that sequence stays not done, and is not needed for sound.
+
+**The fixed-pin presence fix, on hardware:** the Wyse's `audio outputs` printed `speaker  cannot tell`
+for the built-in speaker, where it used to claim nothing was plugged in.
+
+**What this does not cover:** the Pi 2's jack has still not been heard.
+
+## The Pi 2's jack: HEARD (2026-10-10)
+
+`pwm-audio: Pi 2 jack up - PWM at 44100 Hz, range 5669 (about 12 bits), DMA channel 11 looping a 371 ms
+ring`, paced at 23108 us a period against 23219 expected. `audio tone 440 5` played its full length with
+0 underruns (5010 ms by the clock), `audio mute` read back `muted - verified`, and `q` stopped a tone at
+1419 ms and at 2882 ms. The operator heard it through headphones. Every board with a jack or a codec now
+has its sound heard: the Wyse and the T630 (speaker and headphones), the Pi 4 and the Pi 2.
+
+**The Pi 4 again, same day, on the same branch:** heard through headphones; `Pi 4 jack up - PWM at 44100
+Hz, range 2834`, paced 23102 us, mute `verified`. Each 5 s tone reported **1 underrun**, as the 2 s tone did
+on 2026-10-03, while the Pi 2 reports 0. In a tone an underrun means the DMA engine passed the point the
+driver had filled, once, somewhere in the tone. Not heard as a click and not explained: when, and why only
+on the Pi 4, is open.
+
+**The VisionFive 2 Lite, same day:** `audio tone 550 5` answered `no audio hardware on this machine` and
+`(no audio driver is running ... so there is none to ask)`, the prompt came back, nothing else in the log
+moved. That is the right answer for a board whose only sound path is HDMI, which nothing here drives. All
+five boards checked on one build: four heard, one refusing in a sentence.
+
+**The Pi 4's underrun, found (same day).** A one-line instrument (`13be2d55`) logged the first underrun
+of each play. Four tones, four identical answers: `underrun 10 ms into the play - the engine was 208
+frames past the written end, having moved 464 frames ... in the 10524 us since the last look`. The
+numbers are exact: 464 frames is 10.5 ms at 44.1 kHz, and 464 less the 256-frame guard is 208. So the
+look 10.5 ms earlier was the moment the tone was set up, and between it and the first refill nothing was
+written past the guard. What sat between them was the driver's own `playing 440 Hz` log line: on the
+Pi 4 a log line costs about 10 ms, consistent with the kernel's serial path, where the logging caller
+puts queued lines on the wire at 115200 baud (an inference from that code, not measured separately).
+The fix is the order - fill first, log after. Why the Pi 2 never showed it was not checked; the same
+order was wrong there, so its log line must cost under the guard's 6 ms.
+
+**Confirmed on the Pi 4 (same day, `3ac042c2`):** three tones, 5 s, 5 s and 2 s, each `0 underrun(s)`, and
+no `pwm-audio: underrun` line. Each also finished closer to its length - 5008 ms by the clock where it was
+5017, 2008 where it was 2014 - about the 10 ms the log line cost before the first fill, which is likely but not shown.
+
+**`chaos max-carnage pwm-audio 100 yes` on the Pi 4 (same day, `3ac042c2`):** 100 rounds, 100 kills, each
+under a flood, mem-pressure and a spawn-storm (99 spawns refused, as designed); the kernel alive. All 100
+respawns brought the jack up again (`Pi 4 jack up` 101 times, the boot's included) and all 100 read
+`volume 100, unmuted` back from `/audio.settings`. A 5 s tone afterwards: 0 underruns, heard. The aimed
+run only; an `all-services` run was not in this log.
+
+**The same on the Pi 2 (same day, `8d1d437d`):** `chaos max-carnage pwm-audio 100 yes`, 100 rounds, 100
+kills, the kernel alive; `Pi 2 jack up` 101 times and the settings read back 101 times; a 5 s tone
+afterwards 0 underruns.
+
+**The Wyse 5070 (same day, the x86 image of `9189f1d3`, unchanged for x86 since):** `chaos max-carnage
+audio-driver 100 yes`, 100 rounds, 100 kills, the kernel alive; `audio-driver: ready` 101 times and the
+settings read back 101 times, the ALC225 re-surveyed on every respawn. Tones before and after: 5 s each,
+0 underruns, 59 interrupts, identical to the boot's.
+
+**The HP T630 (same day, same image), operator-accepted:** `chaos max-carnage audio-driver 100 yes`,
+100 rounds, 100 kills, the kernel alive, and the tones after chaos played and were heard, 0 underruns.
+What the log also shows, recorded as seen: most respawns were killed again before reaching `ready` -
+chaos kills about every 0.4 s and the ALC255's bring-up takes longer than the Wyse's - and 9 stopped at
+their first ring command with `rings answered Some(0)`, each beside IOMMU faults from `00:09.2` at an
+address inside its own arena (`0x3d71400`), the same signature `docs/wifi-usb.md` records for `xhci` on
+this machine. The next kill replaced each, and the instance left at the end came up and played.

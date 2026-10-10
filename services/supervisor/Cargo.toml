@@ -125,3 +125,5 @@ godspeed-sdk = { path = "../../sdk/rust" }
 # The standard library: `hardware events` stamps each device event with `gs::task::uptime_secs`, the one
 # way to ask the time (backlog/71, scripts/one_way_check.py).
 godspeed = { path = "../../stdlib/rust" }
+# The audio protocol, for the plug and unplug system sounds (`usb_sound`).
+godspeed-audio = { path = "../../sdk/audio" }

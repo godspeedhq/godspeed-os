@@ -10140,7 +10140,14 @@ fn boot_audio(image_path: &Path, persist_path: &str, wav: &str, smp: u32)
         // The same audio device `osdev run` and `osdev shell` attach (`qemu.rs`): `mixer=on`, so the
         // codec has an amplifier and QEMU applies the volume to the samples the WAV holds.
         "-audiodev", &format!("wav,id=snd0,path={wav},out.frequency=48000,out.channels=2,out.format=s16"),
-        "-device", "intel-hda", "-device", "hda-output,audiodev=snd0,mixer=on",
+        // A DECOY first, shaped like the T630's HDMI audio: an HD Audio controller with no codec, as
+        // function 1 of a display at 00:06.0 (QEMU's own NIC holds slot 2), so it is the FIRST device of its class on the bus. The
+        // driver must be granted the other one - the controller that stands for itself - or it finds
+        // no codec, plays nothing into the WAV, and the checks below fail (docs/audio.md, K2).
+        "-vga", "none",
+        "-device", "VGA,addr=0x6.0,multifunction=on",
+        "-device", "intel-hda,addr=0x6.1,id=decoy",
+        "-device", "intel-hda,addr=0x8.0,id=hda0", "-device", "hda-output,bus=hda0.0,audiodev=snd0,mixer=on",
         "-display", "none", "-no-reboot", "-no-shutdown",
     ])
     .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -10236,10 +10243,21 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(log(&buf).contains("audio-driver: ready - serving requests; playback refills on the stream's interrupt"),
         "the driver refills on its interrupt, not by polling");
     check!(log(&buf).contains("no /audio.settings yet"), "a fresh disk starts at the defaults");
+    // K2: the decoy at 00:06.1 is the first of the class, and the driver was granted the other one -
+    // by the BDF the supervisor supplied, which now selects the window, the arena and the vector too.
+    check!(log(&buf).contains("supplied for class 0x040300, the first of that class is 0x0031 - the supplied one is granted"),
+        "the driver is granted the controller that is not a display's companion, not the first of the class");
+    // System sounds OFF for the rest of boot 1: this session types commands that fail on purpose, and
+    // each would sound into the capture below, which must hold only the tones asked for. Boot 2 turns
+    // them on and plays one.
+    let r = run!(b"audio system sounds off\r");
+    check!(r.contains("system sounds off"), "system sounds switched off");
+    let r = run!(b"audio system sounds off\r");
+    check!(r.contains("already off"), "switching them off again sends nothing");
 
     let r = run!(b"audio status\r");
-    check!(r.contains("audio      on") && r.contains("volume     50") && r.contains("muted      no"),
-        "status: on, volume 50, not muted");
+    check!(r.contains("audio      on") && r.contains("volume     50") && r.contains("muted      no")
+        && r.contains("system     sounds off"), "status: on, volume 50, not muted, system sounds off");
     let r = run!(b"audio info\r");
     check!(r.contains("1af4:0012") && r.contains("on the stream's interrupt"), "info: QEMU's codec, interrupt-driven");
     let r = run!(b"audio tone 1000 1\r");
@@ -10260,6 +10278,52 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(r.contains("cannot start a pipe"), "an action refuses to start a pipe");
     let r = run!(b"audio status | match volume\r");
     check!(r.contains("volume     100"), "status pipes as labelled lines");
+    // QEMU's `hda-output` has ONE output, a line out, so switching between two cannot be shown here; what
+    // can be is the list, the in-use mark, the refusal of a name it does not have, and that choosing the
+    // one in use sends nothing.
+    let r = run!(b"audio outputs\r");
+    check!(r.contains("OUTPUT") && r.contains("line out") && r.contains("*"), "outputs: the line out, marked in use");
+    let r = run!(b"audio outputs | count\r");
+    check!(r.contains('1'), "outputs pipes as records: one row");
+    let r = run!(b"audio output line out\r");
+    check!(r.contains("already playing through line out"), "choosing the output in use sends nothing");
+    let r = run!(b"audio output headphone\r");
+    check!(r.contains("no output called 'headphone'") && r.contains("line out"), "an output it does not have is refused with the list");
+    // TWO controllers, the T630's case: the decoy at 00:06.1 not driven, and the one the driver holds,
+    // 00:08.0, ready and in use. Then its pipe, one device in full and a refused name.
+    let r = run!(b"audio hardware\r");
+    let row = |r: &str, dev: &str| r.lines().find(|l| l.starts_with(dev)).unwrap_or("").to_string();
+    let (held, decoy) = (row(&r, "00:08.0"), row(&r, "00:06.1"));
+    check!(held.contains("HD audio") && held.contains("audio-driver") && held.contains("ready") && held.contains('*'),
+        "hardware: the controller the driver holds, ready, in use");
+    check!(decoy.contains("HD audio") && decoy.contains("not driven") && !decoy.contains('*'),
+        "hardware: the display's companion controller, not driven");
+    let dev = "00:08.0".to_string();
+    let r = run!(b"audio hardware | count\r");
+    check!(r.contains('2'), "hardware pipes as records: two rows");
+    let r = run!(format!("audio hardware {}\r", dev).as_bytes());
+    check!(!dev.is_empty() && r.contains("driven by audio-driver") && r.contains("the driver's account"),
+        "hardware <device>: why it is driven, and the driver's account");
+    let r = run!(b"audio hardware 99:99.9\r");
+    check!(r.contains("no audio device called '99:99.9'"), "an unknown device is refused with the list");
+    // `audio debug`: each view answers from the driver, after a tone has played (so `stats` has a last
+    // sound). The rate it measures is NOT asserted: TCG's clock is not the device's.
+    let r = run!(b"audio debug\r");
+    check!(r.contains("verbs") && r.contains("unanswered") && r.contains("last sound") && r.contains("of real time"),
+        "debug stats: verbs, and the last sound's rate by the clock");
+    let r = run!(b"audio debug codec\r");
+    check!(r.contains("codec 0") && r.contains("pin") && r.contains("<- playing") && r.contains("output"),
+        "debug codec: the widget graph, the playing pin marked");
+    let r = run!(b"audio debug stream\r");
+    check!(r.contains("descriptor") && r.contains("entry 3"), "debug stream: the registers and the four BDL entries");
+    let r = run!(b"audio debug trace\r");
+    check!(r.contains("oldest first") && r.contains(" -> 0x"), "debug trace: verbs and their answers");
+    let r = run!(b"audio debug registers\r");
+    check!(r.contains("GCAP") && r.contains("CORB") && r.contains("RIRB"), "debug registers: the controller's globals");
+    let r = run!(b"audio debug codec | match pin\r");
+    check!(r.contains("pin") && !r.contains("cannot start a pipe"), "debug pipes as text");
+    let r = run!(b"audio debug noise\r");
+    check!(r.contains("debug takes one of"), "an unknown view is refused with the list");
     let r = run!(b"audio off\r");
     check!(r.contains("audio off - the codec is powered down"), "off");
     let r = run!(b"audio tone 440 1\r");
@@ -10320,6 +10384,20 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     }
     let r = run!(b"audio status\r");
     check!(r.contains("volume     30"), "status after the restart says volume 30");
+    // The keyboard shortcuts, from the shell's side: the byte a keyboard driver puts on the console for
+    // Ctrl+Alt+Up, Down and M (`hid::*_SIGNAL`, tested on the host for the driver's side), sent down the
+    // serial line here because QEMU cannot press the chord. Up, down, mute, unmute: back at 30, unmuted,
+    // so boot 2's check of what was kept still holds.
+    let r = run!(&[0x81u8]);
+    check!(r.contains("volume 35  [#######-------------]"), "Ctrl+Alt+Up: volume 35, read back, with the bar");
+    let r = run!(&[0x82u8]);
+    check!(r.contains("volume 30  [######--------------]"), "Ctrl+Alt+Down: volume 30");
+    let r = run!(&[0x83u8]);
+    check!(r.contains("muted (volume 30)"), "Ctrl+Alt+M: muted, the volume kept");
+    let r = run!(&[0x83u8]);
+    check!(r.contains("volume 30  [######"), "Ctrl+Alt+M again: unmuted, back to the volume");
+    let r = run!(b"audio status\r");
+    check!(r.contains("volume     30") && r.contains("muted      no"), "status agrees with what the shortcuts said");
     let _ = std::fs::write("build/tests/audio_test_serial.log", &buf.lock().unwrap()[..]);
     quit_qemu(&mut child, mon_port);
 
@@ -10385,8 +10463,21 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     send(&mut w, b"audio status\r");
     let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
     check!(r.contains("volume     30"), "and status says so");
+    check!(r.contains("system     sounds off"), "system sounds off survived the reboot");
+    // A system sound, from the prompt: sounds on, then a refused command. The driver plays the refusal
+    // (220 Hz for 160 ms, a whole 100 ms block of it), and the capture of THIS boot must hold it.
+    send(&mut w, b"audio system sounds on\r");
+    let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+    check!(r.contains("system sounds on"), "system sounds switched back on");
+    send(&mut w, b"spawn supervisor\r");
+    let _ = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30));
+    thread::sleep(Duration::from_millis(1500));
     let _ = std::fs::write("build/tests/audio_test_boot2_serial.log", &buf.lock().unwrap()[..]);
     quit_qemu(&mut child, mon_port);
+    let b2 = wav_blocks("build/tests/audio_test_boot2.wav");
+    let refused = b2.iter().filter(|(rms, hz)| *rms > 500 && (205..=235).contains(hz)).count();
+    println!("audio-test: boot 2's capture is {} block(s), {} of them the 220 Hz refusal", b2.len(), refused);
+    check!(refused >= 1, "a refused command at the prompt played the refusal sound");
 
     println!("\naudio-test: {pass} passed, {fail} failed (serial: build/tests/audio_test_serial.log, sound: {wav})");
     if fail > 0 { std::process::exit(1); }

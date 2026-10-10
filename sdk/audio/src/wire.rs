@@ -89,17 +89,20 @@ pub const POWER_HARD_OFF: u8 = 2;
 // ---- Ops ----------------------------------------------------------------------------------------------
 
 /// What audio is doing now. Answer `[OK, power, muted, volume, playing, hz u16, length_ms u32,
-/// elapsed_ms u32, underruns u32, interrupts u8, output u8, silence_ms u32]` - `STATUS_LEN` bytes.
+/// elapsed_ms u32, underruns u32, interrupts u8, output u8, silence_ms u32, system_sounds u8]` -
+/// `STATUS_LEN` bytes. `system_sounds` is 1 when they are on (`OP_SYSTEM_SOUNDS`).
 /// `playing` is a `PLAYING_*`; `hz` is the tone's, 0 for a stream. `interrupts` is 1 when the driver
 /// refills on its interrupt, 0 when it polls. `underruns` counts since the driver started, and
 /// `silence_ms` is the silence a stream that ran dry has had written in its place, for the stream
 /// playing or last played. `output` is the output pin's default-device field, as in `OP_INFO`.
 /// Or `[NO_DEVICE, reason]`.
 pub const OP_STATUS: u8 = 1;
-pub const STATUS_LEN: usize = 25;
+pub const STATUS_LEN: usize = 26;
 pub const PLAYING_NOTHING: u8 = 0;
 pub const PLAYING_TONE: u8 = 1;
 pub const PLAYING_STREAM: u8 = 2;
+/// A system sound (`OP_SOUND`).
+pub const PLAYING_SOUND: u8 = 3;
 
 /// The detail a fault needs. Answer `[OK, vendor u16, device u16, codec_addr, dac_node, pin_node,
 /// pin_device, amp_steps, amp_step_now, rate u32, ring_bytes u32, interrupts u8, interrupts_seen u32,
@@ -154,6 +157,107 @@ pub const OP_END: u8 = 10;
 /// The rates a stream may be opened at, where the codec offers them.
 pub const STREAM_RATES: [u32; 2] = [44_100, 48_000];
 
+/// The outputs the device has. Answer `[OK, count, (pin, device, selected, presence) x count]`: `pin` is
+/// the output's node (what `OP_OUTPUT` names), `device` its default-device field as in `OP_INFO`,
+/// `selected` 1 for the one playing, and `presence` a `PRESENCE_*`. At most `OUTPUTS_MAX` entries.
+/// Or `[NO_DEVICE, reason]`.
+pub const OP_OUTPUTS: u8 = 11;
+/// The most outputs one answer lists. A codec offering more is listed up to here and the driver's log
+/// says how many it left out.
+pub const OUTPUTS_MAX: usize = 8;
+/// The output cannot tell whether anything is plugged in (no presence detect).
+pub const PRESENCE_UNKNOWN: u8 = 0;
+/// Something is plugged into it.
+pub const PRESENCE_PLUGGED: u8 = 1;
+/// Nothing is plugged into it.
+pub const PRESENCE_EMPTY: u8 = 2;
+
+/// `[12, pin]` - play through the output whose node is `pin`. Answer `[OK | ALREADY, verify]`; `ALREADY`
+/// sends nothing. `BAD_ARG` when `pin` is not one of `OP_OUTPUTS`'s; `BUSY` while something plays, since
+/// changing the path under a running stream would cut it mid-sound; `AUDIO_OFF` when audio is off.
+pub const OP_OUTPUT: u8 = 12;
+
+/// `[14, on]` - the system sounds on (1) or off (0). Answer `[OK | ALREADY]`. Kept in `/audio.settings`;
+/// on by default.
+pub const OP_SYSTEM_SOUNDS: u8 = 14;
+
+/// `[15, kind]` - play a system sound (`SOUND_*`). SENT WITHOUT A REPLY CAPABILITY and answered by
+/// nobody: whoever asks never waits for a sound, so an absent or restarting driver means no sound, never a
+/// delay. A driver plays it only when the system sounds are on, audio is on, nothing else is playing, and
+/// `SOUND_GAP_MS` has passed since the last - which is what stops a burst of errors machine-gunning.
+/// Mute and the volume apply as to anything else. Answered `[OK, played]` only if a reply capability came.
+pub const OP_SOUND: u8 = 15;
+/// A command was not found, or failed.
+pub const SOUND_ERROR: u8 = 1;
+/// An action was not allowed.
+pub const SOUND_REFUSED: u8 = 2;
+/// A background job finished.
+pub const SOUND_DONE: u8 = 3;
+/// A USB device arrived, or left.
+pub const SOUND_PLUGGED: u8 = 4;
+pub const SOUND_UNPLUGGED: u8 = 5;
+/// At most one system sound in this many milliseconds; a request inside it is dropped, not queued.
+pub const SOUND_GAP_MS: u32 = 500;
+
+/// `[13, view, page]` - the driver's own account of itself (`audio debug`): one `DEBUG_*` view as
+/// labelled lines of text, a page of at most `DEBUG_PAGE` bytes at a time. Answer `[OK, more, text...]`,
+/// `more` 1 when another page follows; the asker fetches pages until it is 0 and joins them. A view this
+/// device does not have is ONE line saying so, never an error - a PWM jack has no codec to dump. `BAD_ARG`
+/// for a view this protocol does not name.
+pub const OP_DEBUG: u8 = 13;
+/// Text in one page. A message carries 4096 bytes; this leaves room for the tag and status around it.
+pub const DEBUG_PAGE: usize = 3800;
+/// Pages one view may take, so a reader looping on `more` is bounded too (CLAUDE.md 26.6).
+pub const DEBUG_PAGES_MAX: u8 = 16;
+pub const DEBUG_STATS: u8 = 0;
+pub const DEBUG_CODEC: u8 = 1;
+pub const DEBUG_STREAM: u8 = 2;
+pub const DEBUG_TRACE: u8 = 3;
+pub const DEBUG_REGISTERS: u8 = 4;
+/// The views by the word `audio debug` takes, in `DEBUG_*` order.
+pub const DEBUG_VIEWS: [&str; 5] = ["stats", "codec", "stream", "trace", "registers"];
+
+/// One page of a debug view, written with `write!` as the whole view is rendered: bytes before the page
+/// are counted and dropped, bytes after it set `more`. Rendering the whole view for every page keeps the
+/// driver stateless between pages - nothing is held for an asker that may never come back for page 2.
+pub struct Page<'a> {
+    buf: &'a mut [u8],
+    skip: usize,
+    at: usize,
+    len: usize,
+    more: bool,
+}
+
+impl<'a> Page<'a> {
+    /// Page `page` (from 0) of a view, into `buf`, whose length is the page size.
+    pub fn new(buf: &'a mut [u8], page: u8) -> Self {
+        let skip = page as usize * buf.len();
+        Page { buf, skip, at: 0, len: 0, more: false }
+    }
+
+    /// The bytes written into the page, and whether the view went on past it.
+    pub fn finish(self) -> (usize, bool) {
+        (self.len, self.more)
+    }
+}
+
+impl core::fmt::Write for Page<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.at >= self.skip {
+                if self.len < self.buf.len() {
+                    self.buf[self.len] = b;
+                    self.len += 1;
+                } else {
+                    self.more = true;
+                }
+            }
+            self.at += 1;
+        }
+        Ok(())
+    }
+}
+
 /// What a pin's default-device field (bits 23:20 of its configuration default) names, as the driver's log
 /// and the shell's `audio` both say it.
 pub fn device_name(dev: u32) -> &'static str {
@@ -168,6 +272,12 @@ pub fn device_name(dev: u32) -> &'static str {
         0xA => "microphone",
         _ => "other",
     }
+}
+
+/// The default-device field a name from [`device_name`] stands for, for reading a name back - from
+/// `/audio.settings` or a typed `audio output headphone`. `None` for a name that table does not produce.
+pub fn device_of(name: &str) -> Option<u32> {
+    (0..16u32).find(|&d| device_name(d) == name && name != "other")
 }
 
 // ---- Byte helpers, so neither side hand-rolls them ----------------------------------------------------

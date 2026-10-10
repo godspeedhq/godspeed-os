@@ -24,6 +24,8 @@
 >    *(2026-10-09: CLAUDE.md §6.4's note of 2026-10-08 records that the T630 confines the
 >    audio controller too - its log shows `xhci` and 00:01.1 each confined with an arena -
 >    so on that board there are two confined devices, each with its own domain ID.)*
+>    *(2026-10-10: since K2 that audio device is `00:09.2`, the analog controller, and it plays
+>    through its confined domain, heard on the speaker and the headphones.)*
 
 This is the narrative behind H1, the flagship trusted-base reduction. The spec
 (`CLAUDE.md`) is the authority; this document explains the *why* and the *how*.
