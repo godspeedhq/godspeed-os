@@ -1452,6 +1452,13 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
                 dst: [u8; 4], dport: u16, req: &[u8], out: &mut [u8],
                 budget_ms: u64) -> Result<usize, tcp::Fault> {
     let mut frame = [0u8; 1600];
+    // No clock, no transaction. Every deadline below reads `now_ms(..).unwrap_or(0)`, so without a
+    // clock the budget never expires and a peer that never answers holds this loop forever. Refused
+    // up front instead, and said, rather than bounded by nothing (26.6).
+    if !t.have_clock() {
+        ctx.log("net-stack: tcp refused - no usable clock, so the transaction could not be bounded");
+        return Err(tcp::Fault::None);
+    }
     let start = t.now_ms(ctx).unwrap_or(0);
     let deadline = start + budget_ms;
 
