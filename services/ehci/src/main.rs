@@ -279,8 +279,8 @@ fn control(
         (ep.addr as u32 & 0x7F) | (ep.speed << 12) | (1 << 14) | (1 << 15)
             | (ep.max_packet << 16) | c);
     // Endpoint capabilities: Mult [31:30], Port Number [29:23], Hub Address [22:16] (EHCI 1.0
-    // 3.6.2; Linux `QH_HUBPORT` 0x3f800000, `QH_HUBADDR` 0x007f0000, and `qh_make` writes
-    // `ttport << 23`). This was `<< 22` until 2026-10-10, which put an odd port's low bit into the
+    // 3.6.2; Linux's ehci.h masks QH_HUBPORT 0x3f800000 and QH_HUBADDR 0x007f0000, and its
+    // qh_make writes ttport << 23). This was `<< 22` until 2026-10-10, which put an odd port's low bit into the
     // hub address's top bit and read every port one low (backlog/80 D1).
     dma.write32(QH_OFF + 0x08,
         (1 << 30) | ((ep.hub_addr as u32 & 0x7F) << 16) | ((ep.port as u32 & 0x7F) << 23));
