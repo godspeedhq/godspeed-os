@@ -49,14 +49,11 @@ pub unsafe extern "C" fn _start() -> ! {
 /// Rust side of boot. Milestone: write to the 16550 UART and halt. Later: Sv32 MMU, S-mode trap vector
 /// (stvec) for ecall/faults/IRQ, PLIC/CLINT, SBI HSM for SMP - toward the neutral `kernel_main`.
 extern "C" fn riscv_boot_main() -> ! {
-    for &b in b"
-GodspeedOS riscv32: _start reached S-mode, 16550 UART alive - the demarcation BOOTS on a 32-bit test.
-" {
+    for &b in b"\nGodspeedOS riscv32: _start reached S-mode, 16550 UART alive - the demarcation BOOTS on a 32-bit test.\n" {
         // SAFETY: UART_THR is QEMU virt NS16550 transmit register.
         unsafe { UART_THR.write_volatile(b); }
     }
-    for &b in b"riscv32: neutral kernel linked; arch/riscv32 stubs pending real bodies. halting.
-" {
+    for &b in b"riscv32: neutral kernel linked; arch/riscv32 stubs pending real bodies. halting.\n" {
         unsafe { UART_THR.write_volatile(b); }
     }
     loop {

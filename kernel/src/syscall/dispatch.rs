@@ -1602,7 +1602,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
             // reacquire anything again, so it stays broken until it is restarted. Naming it is the
             // difference between diagnosing that in one boot and chasing the peer for several.
             crate::kprintln!(
-                "acquire: '{}' resolved, but the caller's capability table is FULL - it cannot hold                  the cap. This service will not recover until it is restarted.", name);
+                "acquire: '{}' resolved, but the caller's capability table is FULL - it cannot hold the cap. This service will not recover until it is restarted.", name);
             ACQUIRE_CAP_TABLE_FULL
         }
     }

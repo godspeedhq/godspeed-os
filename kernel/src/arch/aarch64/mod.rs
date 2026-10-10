@@ -464,11 +464,9 @@ extern "C" fn aarch64_boot_main(dtb: u64, entry_el: u64) -> ! {
             put_hex(phys);
             put_str(b" reads/writes as ");
             put_hex(high);
-            put_str(b"
-");
+            put_str(b"\n");
         }
-        None => put_str(b"aarch64: WARN high half did NOT translate - check TG1/EPD1/TTBR1_EL1
-"),
+        None => put_str(b"aarch64: WARN high half did NOT translate - check TG1/EPD1/TTBR1_EL1\n"),
     }
 
     // --- Move the kernel into the high half --------------------------------------------------
@@ -1096,8 +1094,7 @@ extern "C" fn boot_high() -> ! {
     #[cfg(all(feature = "pi4", not(feature = "pi4-sched-demo")))]
     sched_supervisor::run();
 
-    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
-");
+    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\n");
     loop {
         // SAFETY: WFE is always valid.
         unsafe { core::arch::asm!("wfe") };
@@ -1340,8 +1337,7 @@ fn pwm_probe() {
     } else {
         b"audio: no PWM1 at 0xFE20C800 (this machine has none) - no audio jack" as &[u8]
     });
-    put_str(b"
-");
+    put_str(b"\n");
 }
 
 /// Probe the RNG200 once at boot, inside the probe window, and record whether it is there. Said either
@@ -2399,8 +2395,7 @@ pub fn console_notice_fmt(args: core::fmt::Arguments) {
     use core::fmt::Write;
     let mut nb = NoticeBuf { buf: [0; 160], n: 0 };
     let _ = nb.write_fmt(args);
-    let _ = nb.write_str("
-");
+    let _ = nb.write_str("\n");
     console_notice(&nb.buf[..nb.n]);
 }
 

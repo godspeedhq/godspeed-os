@@ -40,8 +40,7 @@ pub unsafe extern "C" fn _start() -> ! {
 /// Rust side of boot. Milestone (follow-up): drive the SCLP console. For now it reaches Rust and halts;
 /// the compile test already proves the boundary (and that the neutral kernel compiles big-endian).
 extern "C" fn s390_boot_main() -> ! {
-    for &b in b"GodspeedOS s390x: _start reached, neutral kernel linked (big-endian, FIFTH arch). SCLP console TBD.
-" {
+    for &b in b"GodspeedOS s390x: _start reached, neutral kernel linked (big-endian, FIFTH arch). SCLP console TBD.\n" {
         sclp_putc(b);
     }
     loop { core::hint::spin_loop(); }

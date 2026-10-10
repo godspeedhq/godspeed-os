@@ -74,7 +74,7 @@ fn report_evicted(evicted: Option<([u8; NAME_MAX], u8)>, new_name: &str, endpoin
     let Some((buf, n)) = evicted else { return };
     let stale = core::str::from_utf8(&buf[..n as usize]).unwrap_or("<invalid utf8>");
     crate::kprintln!(
-        "ipc::names: endpoint {:?} was still mapped to '{}' when '{}' claimed it - evicted the stale          entry (its owner died without unregistering; a lookup of '{}' would have MISROUTED here)",
+        "ipc::names: endpoint {:?} was still mapped to '{}' when '{}' claimed it - evicted the stale entry (its owner died without unregistering; a lookup of '{}' would have MISROUTED here)",
         endpoint_id, stale, new_name, stale
     );
 }

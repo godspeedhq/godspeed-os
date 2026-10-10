@@ -47,14 +47,11 @@ pub unsafe extern "C" fn _start() -> ! {
 
 /// Rust side of boot. Milestone: write to the 16550 UART and halt.
 extern "C" fn loong_boot_main() -> ! {
-    for &b in b"
-GodspeedOS loongarch64: _start reached, 16550 UART alive - the demarcation BOOTS on a FOURTH arch.
-" {
+    for &b in b"\nGodspeedOS loongarch64: _start reached, 16550 UART alive - the demarcation BOOTS on a FOURTH arch.\n" {
         // SAFETY: UART_THR is QEMU loongarch virt NS16550 transmit register.
         unsafe { UART_THR.write_volatile(b); }
     }
-    for &b in b"loongarch64: neutral kernel linked; arch/loongarch64 stubs pending real bodies. halting.
-" {
+    for &b in b"loongarch64: neutral kernel linked; arch/loongarch64 stubs pending real bodies. halting.\n" {
         unsafe { UART_THR.write_volatile(b); }
     }
     loop {

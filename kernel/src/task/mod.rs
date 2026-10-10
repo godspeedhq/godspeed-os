@@ -2107,7 +2107,7 @@ fn spawn_service_with_image(
     // fixed is correct (26.6); losing data without saying so is the same shape as the x86 input ring.
     if send_peers.len() > MAX_SEND_PEERS {
         crate::kprintln!(
-            "task: '{}' declares {} send peers, limit {} - the extras are NOT wired (raise              MAX_SEND_PEERS in task/mod.rs AND sdk/service_context.rs, and SERVICE_CONTEXT_DATA_SIZE              in both)",
+            "task: '{}' declares {} send peers, limit {} - the extras are NOT wired (raise MAX_SEND_PEERS in task/mod.rs AND sdk/service_context.rs, and SERVICE_CONTEXT_DATA_SIZE in both)",
             name, send_peers.len(), MAX_SEND_PEERS);
     }
     for &peer_name in send_peers {

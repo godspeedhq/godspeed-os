@@ -896,8 +896,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
                     None => break,
                 }
             }
-            super::put_str(b"
-    fill run above SP: byte 0x");
+            super::put_str(b"\n    fill run above SP: byte 0x");
             super::put_hex(fill as u64);
             super::put_str(b" repeats for ");
             super::put_dec(run);
@@ -971,8 +970,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             // SP to the stack top, computed BEFORE the loop - so a scan that broke early on an
             // unreadable page still claimed to have covered all of it, and "no return addresses" read
             // as a fact about the stack when it might only be a fact about the first 512 bytes.
-            super::put_str(b"
-      none found in ");
+            super::put_str(b"\n      none found in ");
             super::put_dec(scanned);
             super::put_str(b" bytes ACTUALLY READ (of ");
             super::put_dec(room);
@@ -1016,8 +1014,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
                 }
                 coff += BITE as u64;
             }
-            super::put_str(b"
-    shell canary (0x5A): longest run ");
+            super::put_str(b"\n    shell canary (0x5A): longest run ");
             super::put_dec(best);
             super::put_str(b" bytes at va ");
             super::put_hex(0x7FFC_0000 + best_at);
@@ -1055,8 +1052,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
                 }
                 coff += BITE as u64;
             }
-            super::put_str(b"
-    execute canary (0xC3): longest run ");
+            super::put_str(b"\n    execute canary (0xC3): longest run ");
             super::put_dec(best);
             super::put_str(b" bytes at va ");
             super::put_hex(0x7FFC_0000 + best_at);
@@ -1076,8 +1072,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             use core::sync::atomic::Ordering::Relaxed;
             let n = super::uaccess::UW_MAX_LEN.load(Relaxed);
             let d = super::uaccess::UW_MAX_DST.load(Relaxed);
-            super::put_str(b"
-    kernel->user writes: ");
+            super::put_str(b"\n    kernel->user writes: ");
             super::put_dec(super::uaccess::UW_COUNT.load(Relaxed));
             super::put_str(b" totalling ");
             super::put_dec(super::uaccess::UW_TOTAL.load(Relaxed));

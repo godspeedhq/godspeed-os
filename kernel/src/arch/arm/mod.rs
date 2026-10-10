@@ -646,7 +646,7 @@ fn hires_timer_selftest() {
             elapsed, WANT_US);
     } else {
         crate::kprintln!(
-            "arm32: hi-res timer selftest FAIL - compare 3 never matched in {} us; sub-tick sleeps              will fall back to the 10 ms tick (correct, just coarse)",
+            "arm32: hi-res timer selftest FAIL - compare 3 never matched in {} us; sub-tick sleeps will fall back to the 10 ms tick (correct, just coarse)",
             elapsed);
     }
 }
@@ -1243,14 +1243,8 @@ pub fn hardware_reset() -> ! {
             if n % 20_000_000 == 0 {
                 if !said {
                     said = true;
-                    serial_write_bytes_lockfree(b"
-
-reset: the SoC did NOT reset - the watchdog poke had no effect.
-
-");
-                    serial_write_bytes_lockfree(b"reset: power-cycle the board. (re-arming slowly in case it takes late)
-
-");
+                    serial_write_bytes_lockfree(b"\n\nreset: the SoC did NOT reset - the watchdog poke had no effect.\n\n");
+                    serial_write_bytes_lockfree(b"reset: power-cycle the board. (re-arming slowly in case it takes late)\n\n");
                 }
                 // A write that genuinely did not land gets another chance; one that did has fired long
                 // before this point.
@@ -1826,8 +1820,7 @@ fn console_fg_lapsed() -> bool {
     if since < CONSOLE_FG_LEASE_US { return false; }
     CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
     wake_console_waiter();
-    pl011_write_no_fb(b"console: the foreground app stopped drawing - its claim lapsed, console returned
-");
+    pl011_write_no_fb(b"console: the foreground app stopped drawing - its claim lapsed, console returned\n");
     true
 }
 pub fn release_console_foreground() {
@@ -2077,8 +2070,7 @@ fn pl011_rx_drain() {
         pl011_write(b" bytes dropped for lack of ring space (last value ");
         timer::write_dec_pub(b as u32);
         pl011_write(
-            b") back to back. This is not a console, and left alone it STARVES the USB keyboard: they               share one input ring, so a line filling it faster than anything drains it means every               keystroke is dropped. Serial RECEIVE is now off (output is unaffected - you are reading               this over it) and the keyboard has the ring to itself. On a Pi this is usually a GPIO HAT               on the UART pins GPIO14/15, or an unconnected/floating RX pin. Reboot to re-enable after               fixing it.
-",
+            b") back to back. This is not a console, and left alone it STARVES the USB keyboard: they share one input ring, so a line filling it faster than anything drains it means every keystroke is dropped. Serial RECEIVE is now off (output is unaffected - you are reading this over it) and the keyboard has the ring to itself. On a Pi this is usually a GPIO HAT on the UART pins GPIO14/15, or an unconnected/floating RX pin. Reboot to re-enable after fixing it.\n",
         );
     }
     let errs = RX_LINE_ERRORS.load(Ordering::Relaxed);
@@ -2185,8 +2177,7 @@ pub fn console_push_byte(b: u8) {
         KBD_DROPPED.fetch_add(1, Ordering::Relaxed);
         if !KBD_DROP_REPORTED.swap(true, Ordering::AcqRel) {
             pl011_write(
-                b"console: input ring FULL - keystrokes are being dropped. Something is producing                   input faster than it is consumed; a stuck serial RX line is the usual cause.
-",
+                b"console: input ring FULL - keystrokes are being dropped. Something is producing input faster than it is consumed; a stuck serial RX line is the usual cause.\n",
             );
         }
     }

@@ -641,8 +641,7 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         // order and the wrong one - it leaves a window where the endpoint can post and nothing acks.
         if enable_msi(1, dev, 0) {
             unmask_msi();
-            put_str(b"pcie: xHCI MSI enabled - the driver waits on interrupts
-");
+            put_str(b"pcie: xHCI MSI enabled - the driver waits on interrupts\n");
         }
 
         let bar_back = cfg_read(1, dev, 0, 0x10) & !0xF;

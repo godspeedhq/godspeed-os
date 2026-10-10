@@ -823,11 +823,9 @@ pub fn mode_set() -> bool {
         p_hex(mmio_read(dss, 0x4) as u64);
         p_str(" 0x8=");
         p_hex(mmio_read(dss, 0x8) as u64);
-        p_str("
-");
+        p_str("\n");
     } else {
-        super::print_str("riscv64: display - NO dssctrl; the controller's output is unrouted
-");
+        super::print_str("riscv64: display - NO dssctrl; the controller's output is unrouted\n");
     }
 
     // The controller's own initialisation, from the vendor driver's per-panel loop.
@@ -1406,8 +1404,7 @@ fn report_input_vsync() {
     p_hex(seen as u64);
     p_str(", mode ");
     p_str(if hdmi_read(HDMI_HDCP_CTRL) & (1 << 1) != 0 { "HDMI" } else { "DVI" });
-    p_str("
-");
+    p_str("\n");
 }
 
 /// Bring the transmitter up and hand it the raster.
@@ -1483,8 +1480,7 @@ pub fn hdmi_on() -> bool {
         p_hex(hdmi_read(off) as u64);
         p_str(" ");
     }
-    p_str("
-");
+    p_str("\n");
 
     // NOTHING IS WRITTEN HERE, and the board is why. Every one of these four was already correct at
     // reset - `ctl1=0x1 ctl2=0x34 ctl=0x1 ctl3=0x8 avmute=0x0`, which is eight bits per component in,

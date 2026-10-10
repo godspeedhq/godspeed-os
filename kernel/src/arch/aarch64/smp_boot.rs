@@ -224,7 +224,7 @@ pub fn report_cores_up() {
     let expected = crate::arch::imp::ap_count() as u32 + 1;
     if crate::smp::core::ready_count() < expected {
         super::console_notice_fmt(format_args!(
-            "smp: only {} of {} cores reached the scheduler (mask {:#x}, progress {}{}{}{};              0=absent 1=parked 2=released 3=scheduling)",
+            "smp: only {} of {} cores reached the scheduler (mask {:#x}, progress {}{}{}{}; 0=absent 1=parked 2=released 3=scheduling)",
             crate::smp::core::ready_count(),
             expected,
             mask,
