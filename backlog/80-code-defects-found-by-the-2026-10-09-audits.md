@@ -243,7 +243,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   Linux's QH_HUBPORT mask (0x3f800000) put Port Number at [29:23] and Hub Address at [22:16], so port 1 sets the
   hub address's top bit and reads as port 0. Its keyboard is recorded as hardware-verified, so which port
   that run used matters. Fix: `<< 23`.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** port number in bits 29:23, as Linux writes it. **T630 card 2026-10-10, half:** a keyboard on hub port 4 (even) enumerates and types (`ehci: SPLIT device (hub port 4)`), across eight respawns. An odd port is still owed.
+  **FIXED on `fix/backlog-80`, 2026-10-10:** port number in bits 29:23, as Linux writes it. **T630 card 2026-10-10, passed:** a keyboard on hub port 4 (even) enumerates and types across eight respawns, and moved to hub port 3 (odd) it enumerates again (`ehci: SPLIT device (hub port 3)`) and types `version`.
 - **D2. `nic-driver` drives any class-0x020000 NIC that is not an RTL8168 as an e1000**, with no vendor or
   device check. Fix: check the e1000 IDs; refuse with a status otherwise.
   **FIXED on `fix/backlog-80`, 2026-10-10:** drives only the 82540EM (`8086:100e`) and names any other NIC; no new arch-conditional site.
