@@ -392,12 +392,56 @@ fn narrow_embedded_for_receiver(cap: crate::capability::cap::Capability) -> crat
     }
 }
 
+/// Install the capabilities a received message carries into the receiver's table, and queue each
+/// slot for `TakePendingCap` - every receive path's one way of doing it.
+///
+/// **Neither failure is silent** (`backlog/80` K4). The sender no longer holds an embedded cap once it
+/// was enqueued, so a cap that cannot be installed is GONE: a full table is logged by name. A cap that
+/// is installed but whose slot cannot be queued - the receiver already has `MAX_PENDING_RECV_CAPS`
+/// unclaimed - is taken back out of the table and logged, rather than left in a slot the service will
+/// never be told about. Both used to happen with no word said.
+fn install_received_caps(msg: &Message) {
+    let n_caps = msg.cap_count.min(msg.caps.len());
+    for i in 0..n_caps {
+        if let Some(embedded_cap) = msg.caps[i] {
+            let who = scheduler::task_name(scheduler::current_task_slot());
+            match scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
+                Ok(new_slot) => {
+                    if !scheduler::push_pending_recv_cap(new_slot as u32) {
+                        scheduler::current_task_remove_cap(new_slot);
+                        crate::kprintln!(
+                            "recv: '{}' already holds the most unclaimed received capabilities - one it was sent is DROPPED, not left in its table unclaimed",
+                            who);
+                    }
+                }
+                Err(_) => crate::kprintln!(
+                    "recv: '{}' was sent a capability and its table is full - the capability is DROPPED (the sender no longer holds it)",
+                    who),
+            }
+        }
+    }
+}
+
+/// `Some(MessageTooLarge)` when a received payload does not fit the caller's buffer, said once on the
+/// log; `None` when it fits. The receive paths refuse rather than truncate, as `Call` does (K5).
+fn refuse_oversized(path: &str, len: usize, buf_len: usize) -> Option<i64> {
+    if len <= buf_len {
+        return None;
+    }
+    crate::kprintln!(
+        "{}: a {}-byte message does not fit the caller's {}-byte buffer - refused (not truncated)",
+        path, len, buf_len);
+    Some(ipc_err_to_i64(IpcError::MessageTooLarge))
+}
+
 /// arg0 = cap_slot, arg1 = out_buf_ptr (user VA), arg2 = out_buf_len.
 ///
 /// Blocks until a message is dequeued from the endpoint, then copies the
 /// payload into the caller-supplied buffer. A payload longer than the buffer is
-/// TRUNCATED to it (unlike `Call`, which refuses). Returns the number of bytes
-/// written on success, or a negative error code.
+/// REFUSED with `MessageTooLarge`, as `Call` refuses one, and logged; it was truncated
+/// silently until 2026-10-10 (`backlog/80` K5). The SDK always passes a full 4 KiB
+/// buffer, so no SDK caller can reach the refusal. Returns the number of bytes written
+/// on success, or a negative error code.
 fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
         Ok(c)  => c,
@@ -427,21 +471,14 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 // Install any embedded capabilities into the receiver's cap table
                 // and push their slot indices into the pending-recv-cap buffer so
                 // the receiver can retrieve them via syscall 12 (TakePendingCap).
-                let n_caps = msg.cap_count.min(msg.caps.len());
-                for i in 0..n_caps {
-                    if let Some(embedded_cap) = msg.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::push_pending_recv_cap(new_slot as u32);
-                        }
-                    }
-                }
+                install_received_caps(&msg);
                 // Copy payload to the caller's user-space buffer.
                 let payload  = msg.payload_bytes();
-                let copy_len = payload.len().min(buf_len);
-                if !copy_out(out_buf, &payload[..copy_len]) {
+                if let Some(e) = refuse_oversized("recv", payload.len(), buf_len) { return e; }
+                if !copy_out(out_buf, payload) {
                     return -1;
                 }
-                return copy_len as i64;
+                return payload.len() as i64;
             }
             Err(IpcError::QueueEmpty) => {
                 let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
@@ -480,20 +517,13 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 scheduler::wake_by_slot(slot, 0);
             }
             scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
-            let n_caps = msg.cap_count.min(msg.caps.len());
-            for i in 0..n_caps {
-                if let Some(embedded_cap) = msg.caps[i] {
-                    if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                        scheduler::push_pending_recv_cap(new_slot as u32);
-                    }
-                }
-            }
+            install_received_caps(&msg);
             let payload  = msg.payload_bytes();
-            let copy_len = payload.len().min(buf_len);
-            if !copy_out(out_buf, &payload[..copy_len]) {
+            if let Some(e) = refuse_oversized("try_recv", payload.len(), buf_len) { return e; }
+            if !copy_out(out_buf, payload) {
                 return -1;
             }
-            copy_len as i64
+            payload.len() as i64
         }
         Err(IpcError::QueueEmpty) => TRY_RECV_EMPTY,
         Err(e) => ipc_err_to_i64(e),
@@ -540,18 +570,11 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                     scheduler::wake_by_slot(slot, 0);
                 }
                 scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
-                let n_caps = msg.cap_count.min(msg.caps.len());
-                for i in 0..n_caps {
-                    if let Some(embedded_cap) = msg.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::push_pending_recv_cap(new_slot as u32);
-                        }
-                    }
-                }
+                install_received_caps(&msg);
                 let payload  = msg.payload_bytes();
-                let copy_len = payload.len().min(buf_len);
-                if !copy_out(out_buf, &payload[..copy_len]) { break -1; }
-                break copy_len as i64;
+                if let Some(e) = refuse_oversized("recv_timeout", payload.len(), buf_len) { break e; }
+                if !copy_out(out_buf, payload) { break -1; }
+                break payload.len() as i64;
             }
             Err(IpcError::QueueEmpty) => {
                 if deadline != 0 && scheduler::monotonic_ticks() >= deadline {
@@ -1829,14 +1852,7 @@ fn do_call(
                     scheduler::wake_by_slot(slot, 0);
                 }
                 scheduler::set_last_recv_badge(reply.badge_id, reply.badge_right);
-                let n_caps = reply.cap_count.min(reply.caps.len());
-                for i in 0..n_caps {
-                    if let Some(embedded_cap) = reply.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::push_pending_recv_cap(new_slot as u32);
-                        }
-                    }
-                }
+                install_received_caps(&reply);
                 let payload  = reply.payload_bytes();
                 // REFUSE, do not truncate. The caller told us how much room it has; a reply that does
                 // not fit is a protocol error the caller must see, and writing what fits would smash

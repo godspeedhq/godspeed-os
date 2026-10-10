@@ -1101,9 +1101,10 @@ pub fn take_last_recv_badge() -> u64 {
 ///
 /// Called by the receive paths when they install an embedded cap into the receiver's
 /// table. The slot is retrieved by the service via syscall 12 (TakePendingCap). Holds at
-/// most `MAX_PENDING_RECV_CAPS`; a slot pushed past that is not recorded (the cap stays
-/// installed in the table, but the service is never told its slot).
-pub fn push_pending_recv_cap(cap_slot: u32) {
+/// most `MAX_PENDING_RECV_CAPS`, and returns whether `cap_slot` was recorded: the caller
+/// takes back a cap whose slot could not be, rather than leave it installed where the
+/// service will never learn of it (`backlog/80` K4).
+pub fn push_pending_recv_cap(cap_slot: u32) -> bool {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
     unsafe {
@@ -1113,9 +1114,11 @@ pub fn push_pending_recv_cap(cap_slot: u32) {
             if count < MAX_PENDING_RECV_CAPS {
                 TASK_PENDING_RECV_CAPS[cur][count] = cap_slot;
                 TASK_PENDING_RECV_CAP_COUNT[cur]   = count + 1;
+                return true;
             }
         }
     }
+    false
 }
 
 /// Pop the next pending cap slot from the current task's buffer.
