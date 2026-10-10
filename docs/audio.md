@@ -1419,3 +1419,19 @@ twice as loud and no more. What is left is the speaker itself - an inference, no
 **`audio` said "nothing is plugged into it" about that speaker.** Its pin can sense presence and read
 nothing there while fitted and playing. A FIXED pin (connectivity `0b10`) is not a jack and its sense
 means nothing, which is why Linux does not consult it; the driver now reports presence unknown for one.
+
+## Step A6: both x86 machines, headphones and speaker (2026-10-10)
+
+**The T630's speaker, on an image with nothing changed for volume:** 440, 880 and 1760 Hz for 5 s each,
+0 underruns, every `alc256_init` coefficient read back the same. The operator found it loud enough this
+time; nothing in the path changed, so the difference is in the listening, not the driver.
+
+**The Wyse's headphones: HEARD.** `audio output headphone` -> `output now pin 0x21 (headphone) - verified`,
+then a 5 s tone, 0 underruns and 59 interrupts, heard in the headphones. Its speaker was heard as well,
+and loud. So the headphone amplifier (`0xc0` on a pin that can drive headphones) works on the ALC225
+without Linux's `alc225_init`; that sequence stays not done, and is not needed for sound.
+
+**The fixed-pin presence fix, on hardware:** the Wyse's `audio outputs` printed `speaker  cannot tell`
+for the built-in speaker, where it used to claim nothing was plugged in.
+
+**What this does not cover:** the Pi 2's jack has still not been heard.
