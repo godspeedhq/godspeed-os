@@ -2240,6 +2240,9 @@ impl ServiceContext {
     /// value for correctness - a message arriving mid-slice wakes the task immediately; the slice only
     /// bounds how often a caller gets to look at anything OTHER than its endpoint.
     const AWAIT_SLICE_MS: u64 = 20;
+    /// The slice a noticing wait blocks for before its notice is due, when it is not reading the
+    /// console and has only the reply and the clock to watch.
+    const PRE_NOTICE_SLICE_MS: u64 = 250;
 
     /// Wait for a message on our own endpoint, BLOCKING, for at most one slice.
     ///
@@ -2634,7 +2637,17 @@ impl ServiceContext {
             // Block, do not spin - see `request_with_reply_abortable`. This is the variant `net`/`ping`
             // actually use (the "[q] quit" hint), so it is the one that kept core 0 permanently
             // busy during a continuous ping and starved the idle-path USB hot-plug watch.
-            if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) {
+            //
+            // THE CONSOLE IS NOT TOUCHED UNTIL `[q] quit` HAS BEEN SHOWN. Before the notice the
+            // operator has been offered nothing to press, so a key typed then is typing ahead, not an
+            // answer: reading it would either lose it or - a `q` meant for the NEXT command, a pager
+            // say - end this wait. And most requests are answered before the notice is due, so they
+            // now block in the kernel for the whole wait instead of polling the console every slice
+            // (`backlog/80` H16: both of those made the shell keep its noticing waits out of scripts
+            // and pipelines).
+            let noticed = on_linger.is_none();
+            let slice = if noticed { Self::AWAIT_SLICE_MS } else { Self::PRE_NOTICE_SLICE_MS };
+            if let Some(r) = self.await_slice(slice) {
                 // DO NOT remove the reply cap on a REPLY. The send already removed it.
                 //
                 // §8.5: a cap embedded in a message "is transferred and REMOVED from sender's table".
@@ -2658,10 +2671,12 @@ impl ServiceContext {
                     return ReqOutcome::Reply(r);
                 }
             }
-            while let Some(b) = self.try_console_read() {
-                if leave_keys.contains(&b) { return ReqOutcome::Aborted; }
-                // Not a leave key: the operator's typing, handed back when the caller can keep it.
-                if let Some(k) = keep { k(b); }
+            if noticed {
+                while let Some(b) = self.try_console_read() {
+                    if leave_keys.contains(&b) { return ReqOutcome::Aborted; }
+                    // Not a leave key: the operator's typing, handed back when the caller can keep it.
+                    if let Some(k) = keep { k(b); }
+                }
             }
             let elapsed = self.epoch_secs_monotonic() - t0;
             if elapsed >= hint_after_secs {
@@ -2670,7 +2685,6 @@ impl ServiceContext {
             if elapsed >= max_secs {
                 return ReqOutcome::Timeout;
             }
-            self.yield_cpu();
         }
     }
 
