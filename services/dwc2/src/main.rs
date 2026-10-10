@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI.
 // `unsafe_check.py` greps for it; this makes the COMPILER refuse it, which catches what a
 // grep cannot - unsafe produced by a macro, or spelled across lines. `deny` rather than

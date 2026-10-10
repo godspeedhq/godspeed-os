@@ -56,15 +56,16 @@ if let Some(granted) = gs::ipc::take_sent_cap(&ctx) {
 ```toml
 [capabilities]
 ipc_receive = ["cap-grant"]   # our own endpoint; the cap we give away points here
-ipc_send    = ["receiver"]    # the peer we transfer the grantable cap to
 log_write   = true
+# no ipc_send: "receiver" is reached BY NAME, through the ACQUIRE_ANY privilege its spawn row grants
 ```
 
 The list is the reviewable statement; the grant is the supervisor's spawn row (CLAUDE.md 13.6). It
-owns an endpoint (so it has a SEND\|GRANT cap to itself to hand out). Note the two differ today: the
-`examples-test` row names no send peer and grants `ACQUIRE_ANY` instead, which is how its lookup of
-`receiver` reaches the name directory, and this contract declares `ipc_send = ["receiver"]` and not
-`ACQUIRE_ANY`. No gate compares an example's peers with its row.
+owns an endpoint (so it has a SEND\|GRANT cap to itself to hand out). It declares no send peer
+because its row wires none: the `examples-test` row grants `ACQUIRE_ANY` instead, which is how its
+lookup of `receiver` reaches the name directory, and no contract key expresses that privilege. The
+contract said `ipc_send = ["receiver"]` until 2026-10-10, when `contract_check.py` began comparing an
+example's peers with its row (backlog/80 T8).
 
 ## What you must NOT do
 

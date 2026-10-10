@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Find and configure a boot-protocol keyboard.
 //!
 //! Slice 2, first part (`docs/arm32-usb-userspace.md`): walk a device's configuration descriptor,

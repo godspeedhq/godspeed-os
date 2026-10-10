@@ -42,8 +42,12 @@ jobs:
         run: |
           mkdir -p tools/limine
           curl -fsSL \
-            https://github.com/limine-bootloader/limine/releases/download/v12.2.0/limine-binary.tar.gz \
-            | tar -xz --strip-components=1 -C tools/limine
+            https://github.com/limine-bootloader/limine/releases/download/v12.3.1/limine-binary.tar.xz \
+            | tar -xJ --strip-components=1 -C tools/limine
+          # v12.3.1, the version release.yml ships and README.md names, and the same .tar.xz asset it
+          # fetches. This said v12.2.0 (.tar.gz) while the release built with 12.3.1, so these suites
+          # tested a different bootloader from the one shipped (backlog/80 T9); facts_check now fails
+          # on any workflow that pins another.
           make -C tools/limine limine
           chmod +x tools/limine/limine
 

@@ -15,7 +15,7 @@ The bounded inter-stage buffer and its overflow behaviour are implemented at
 `services/shell/src/main.rs:12` - see the surrounding pipeline staging code.
 --- expect ---
 error[GS0404]: a `path:line` citation no longer points at what it claims
-   --> docs/pipes.md:271
+   --> docs/pipes.md:END+3
     |
     = rule: CLAUDE.md 26.7
     = why: A line number is the fastest-rotting citation in the repository: every edit above
@@ -29,6 +29,6 @@ error[GS0404]: a `path:line` citation no longer points at what it claims
 
   line_ref_check.py reported:
   | line refs: 1 citation(s) no longer point at what they claim
-  |   docs/pipes.md:271
+  |   docs/pipes.md:END+3
   |       cites services/shell/src/main.rs:12 - nothing within 10 lines matches the citing sentence
   | (4 more lines of explanation, which the frame above covers - `py scripts/line_ref_check.py` for all of it)
