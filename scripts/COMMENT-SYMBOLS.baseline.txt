@@ -230,6 +230,8 @@ SBSDIO_FUNC1_CHIPCLKCSR            # Linux brcmfmac name for function-1 register
 SDIO_CHIP_CLOCK_CSR                # cyw43-driver (Infineon, same chip family) name for the SAME register; both cited so the two references can be compared
 SDIO_PULL_UP                       # cyw43-driver name for function-1 register 0x1000F, which brcmfmac calls SBSDIO_FUNC1_SDIOPULLUP and writes 0
 is_expected_radio                  # REMOVED - it compared the CIS device code, which is not the field that identifies the part. The comment records what went and why, which is exactly what this baseline is for
+PACE_YIELDS                        # REMOVED 2026-10-10 (backlog/80 V9) - chaos's unread yield cap; chaos and xhci/msc.rs name it AS the count-is-not-a-duration lesson, which is what this baseline is for
+BUSY_RETRIES                       # REMOVED 2026-10-10 (backlog/80 V9) - block-driver usbdisk's unreachable busy loop; xhci/msc.rs names it AS the count-is-not-a-duration lesson
 brcmf_chip_dmp_erom_scan           # Linux brcmfmac chip.c - the EROM walk services/wifi-driver/src/erom.rs reimplements - external, 26.14
 brcmf_chip_dmp_get_regaddr         # Linux brcmfmac chip.c - how a core entry yields its register and wrapper bases - external, 26.14
 brcmf_chip_dmp_get_desc            # Linux brcmfmac chip.c - reads one EROM descriptor and advances, skipping EMPTY ones - external, 26.14

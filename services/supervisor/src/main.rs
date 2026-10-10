@@ -916,7 +916,11 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godsp
 // `probe/src/table.rs` - the table that used to be 193 rows of the kernel service catalogue
 // (docs/probe-params-design.md).
 // ───────────────────────────────────────────────────────────────────────────────
-const NAME_MAP_MAX:      usize = 16;  // bounded (§26.6) - real services, not the test probes
+// Bounded (§26.6) - real services, not the test probes. 16 until 2026-10-10, which was EXACTLY full on
+// the Pi 4 and on x86 with the WiFi dongle attached, so the next service a board gained would have been
+// dropped from the map and never rewired after a restart (`backlog/80` V8). 24 gives that headroom;
+// `record_name` still says so loudly if it is ever reached.
+const NAME_MAP_MAX:      usize = 24;
 const NAME_MAP_NAME_MAX: usize = 16;
 
 struct NameCapMap {
@@ -1792,16 +1796,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // once on failure and continue without it (logging never depended on it: `ctx.log()` writes the
     // kernel ring and serial directly, CLAUDE.md 11.4).
     ctx.log("supervisor: spawning events...");
-    if let Ok(cap) = gs::cap::acquire_grantable(&ctx, "events").map(gs::cap::Cap::handle) {
-        // Supervisor RESPAWN: `events` is still alive (only the supervisor died). Adopt it - reacquire
-        // its endpoint by name - instead of trying to spawn a duplicate the kernel's singleton guard
-        // rejects, which used to print a misleading "events spawn failed" on every `kill supervisor`.
-        // The same adopt `ensure_mapped` does, but WITHOUT its `name_alive` gate (see its header): an
-        // `events` that died while the supervisor was down is adopted as a dead cap here, and recovered
-        // only by `converge` below, which checks real liveness.
-        record_name_quiet(&ctx, &mut name_map, "events", cap);
-        ctx.log("supervisor: adopted running events");
-    } else if !spawn_mapped(&ctx, &mut name_map, "events", 0xFFFF) {
+    // On a supervisor RESPAWN `events` is usually still alive, and is ADOPTED rather than spawned a
+    // second time. Through `ensure_mapped`, so the adoption has its `name_alive` gate: this adopted
+    // whatever cap the name directory handed back, so an `events` that died while the supervisor was
+    // down was adopted dead and recovered only later, by `converge` (`backlog/80` V8).
+    if !ensure_mapped(&ctx, &mut name_map, "events", 0xFFFF) {
         // Through the image table: the supervisor carries events's image now, and it does not route
         // through itself (no supervisor-peer), so `ctx.spawn` would take the kernel path and find
         // nothing. Same shape as pong/ping.
@@ -1814,10 +1813,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Like `events` it is not TCB: if it fails to spawn, console output still reaches serial (which
     // is the source of truth) and the kernel's boot floor keeps the display - degraded, never silent.
     ctx.log("supervisor: spawning console...");
-    if let Ok(cap) = gs::cap::acquire_grantable(&ctx, "console").map(gs::cap::Cap::handle) {
-        record_name_quiet(&ctx, &mut name_map, "console", cap);
-        ctx.log("supervisor: adopted running console");
-    } else if !spawn_mapped(&ctx, &mut name_map, "console", 0xFFFF) {
+    // Adopted or spawned through `ensure_mapped`, with its liveness gate, as `events` is above.
+    if !ensure_mapped(&ctx, &mut name_map, "console", 0xFFFF) {
         ctx.log("supervisor: console spawn failed - display stays on the kernel boot floor");
     }
 
@@ -1898,7 +1895,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "perf-brutal-only", feature = "stress-only",
                   feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    let _ = ctx.spawn("observe");
+    // From its own image, as every other service is: `ctx.spawn` asks the supervisor - this task - or
+    // the kernel, whose catalogue holds only the supervisor, and its result was discarded, so this line
+    // started nothing and said nothing (`backlog/80` V6).
+    if !spawn_mapped(&ctx, &mut name_map, "observe", 0xFFFF) {
+        ctx.log("supervisor: observe did not start - see the spawn line above");
+    }
 
     // Persistence (v2; docs/persistence.md) - block-driver + fs, spawned further down. block-driver
     // MUST precede fs (fs's send-peer cap to it is installed from the name-cap map at fs's spawn), and
@@ -1908,14 +1910,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // fs's `block-driver` cap is provided from the map. Clients reacquire names via the kernel directory.
     // `ensure_*` (Phase 6): spawn on a fresh boot, ADOPT the running instance on a supervisor respawn.
     //
-    // NOTE (2026-10-09): the `#[cfg]` just below was written for block-driver ("also spawned in
-    // `identity-only` builds ... giving 22 Test 11 a restartable victim"), but an attribute applies to
-    // the next STATEMENT and comments do not end it - so it gates the `time` spawn, and the
-    // block-driver spawn further down is unconditional. Reported, not changed here.
-    #[cfg(any(feature = "bare-metal", feature = "blockdev", feature = "identity-only"))]
-    // block-driver's placement comes from its IMAGES row (`board::BLOCK_CORE`), which both the boot and
-    // the restart paths read; neither passes an override. An override here once pinned only the BOOT
-    // spawn, so a respawned block-driver silently landed elsewhere. One source of placement.
+    // A `#[cfg(any(bare-metal, blockdev, identity-only))]` sat here until 2026-10-10, written for
+    // block-driver. An attribute applies to the next STATEMENT and comments do not end it, so it gated
+    // `time` instead: the full QEMU build and the perf, stress, adversarial, chaos and fuzz builds never
+    // started the clock. It was removed rather than moved, because every build has started block-driver
+    // all along and its suites run with it (`backlog/77`, `backlog/80` V5). block-driver's placement is
+    // its IMAGES row's `board::BLOCK_CORE`, read by both the boot and the restart paths.
+    //
     // time + control: started BEFORE the shell, because the shell asks `time` for the clock source on
     // its first prompt. Neither holds hardware, so neither can delay the prompt the way a driver
     // bring-up would. (`time` asks net-stack for its own NTP datagram; net-stack never calls `time`.)
@@ -2147,13 +2148,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (`ctx.nic_present()`, query 18 bit2) was parked as low-value. The SDK accessor stays for an easy
     // resume. On a NIC-less / unsupported-NIC box nic-driver + net-stack come up and idle gracefully
     // (nic-driver serves empty replies; net-stack degrades, no hang).
-    #[cfg(not(any(feature = "identity-only", feature = "perf-only",
-                  feature = "perf-brutal-only", feature = "stress-only",
-                  feature = "adv-only", feature = "chaos-only", feature = "fuzz-only",
-                  feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
-    // NOTE (2026-10-09): the `#[cfg(not(any(...)))]` above applies to the next STATEMENT, and the
-    // comments below do not end it - so it gates the `wifi-driver` spawn, and the `nic-driver` spawn
-    // further down is unconditional (it runs in the test builds too). Reported, not changed here.
+    // A `#[cfg(not(any(identity-only, perf-only, ...)))]` sat here until 2026-10-10, meant for
+    // nic-driver; it gated the next STATEMENT, which was the `wifi-driver` spawn far below. Removed: no
+    // x86 test build embeds `wifi-driver`, so it changed nothing there, and `nic-driver` has started in
+    // every build all along (`backlog/80` V5).
     //
     // ADOPT if already running, like every other managed service. These two used `spawn_*`
     // directly, which always tries to SPAWN - so on a supervisor respawn the kernel refused

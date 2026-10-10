@@ -61,6 +61,7 @@ feed_tx                            # backlog/80 - DELETED 2026-10-10, net-stack 
 last_ok                            # backlog/80 - DELETED 2026-10-10, dwc2 hid dead field (D11); a record of a removal must name what was removed
 stale_after                        # backlog/80 - DELETED 2026-10-10, dwc2 hid dead field (D11); a record of a removal must name what was removed
 POLL_FRAMES                        # backlog/80 - DELETED 2026-10-10, net-stack tcp dead constant (D11); a record of a removal must name what was removed
+Q_COM2_BYTE                        # backlog/80 V9 - DELETED 2026-10-10 (control's unread query number); a record of a removal must name what was removed
 NET_TXN_SECS                       # backlog/29 + docs/stdlib-design.md - RETIRED with the shell's hand-rolled net path; both are records of what it did
 drain_stale_net_replies            # backlog/29 post-mortem - REMOVED once the correlation tag made a pre-emptive drain unnecessary; the record must name what went
 fs_request_bounded                 # docs/stdlib-design.md 22 - DELETED by the dogfood; the table says what each commit removed and must name it

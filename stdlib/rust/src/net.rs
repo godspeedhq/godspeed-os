@@ -379,13 +379,14 @@ impl<'a> Net<'a> {
         req[6] = port as u8;
         req[head..head + request.len()].copy_from_slice(request);
         let r = self.call(&req[..head + request.len()], TCP_SECS)?;
-        let b = body(&r);
-        // `net-stack` answers an unreachable peer with nothing at all, and the shell's own `tcp`
-        // command reads that as "connected to nothing". Reported as a failure rather than as an
-        // empty success, because an empty buffer is what a caller would otherwise act on.
-        if b.is_empty() {
-            return Err(Error::Failed);
-        }
+        // `[status, bytes...]`: 0 and what came back, or 1 alone for a transaction that failed (its
+        // reason is in `net-stack`'s log). A failure was an EMPTY reply until 2026-10-10, which three
+        // ports refuse to deliver at all (`backlog/80` D5, `backlog/66`).
+        let b = match body(&r) {
+            [0, rest @ ..] => rest,
+            [1, ..] => return Err(Error::Failed),
+            _ => return Err(Error::Malformed),
+        };
         // Checked BEFORE copying, so `BufferTooSmall` leaves the buffer untouched - the same
         // contract `fs::read_into` gives. A partially-filled buffer plus an error is the worst of
         // both: the caller cannot tell how much of it is real.

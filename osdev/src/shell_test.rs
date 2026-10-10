@@ -506,6 +506,15 @@ pub fn run(image_path: &Path, smp: u32) {
     check!(served.contains("accepted a connection"),
            "serve: the guest accepted the connection through ACCEPT's embedded capability");
 
+    // tcp to a CLOSED host port: the peer resets, and the transaction must be ANSWERED as failed.
+    // `net-stack` answered a failed op 21 with an EMPTY message until 2026-10-10, which this x86
+    // machine refuses to deliver (`backlog/66`), so the caller sat out its deadline and reported an
+    // unknown outcome for a refusal that was known at once (`backlog/80` D5).
+    send(&mut write_half, b"tcp 10.0.2.2 1 hello\r");
+    let t = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
+    check!(t.contains("connected to nothing"),
+           "tcp: a refused connection is answered as failed, not left to time out (backlog/80 D5)");
+
 
 
     // -----------------------------------------------------------------------

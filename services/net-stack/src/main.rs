@@ -1313,6 +1313,9 @@ const LOP_ACCEPT: u8 = 0;
 const LOP_CLOSE: u8 = 1;
 
 /// Connection: read whatever has been delivered in order and not yet taken.
+/// The first byte of an op 21 (TCP transaction) reply (`backlog/80` D5).
+const TCP_OK: u8 = 0;
+const TCP_FAILED: u8 = 1;
 const COP_RECV: u8 = 0;
 /// Connection: queue the rest of the payload for sending.
 const COP_SEND: u8 = 1;
@@ -3469,10 +3472,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         } else if pl.first() == Some(&21) {
             // TCP TRANSACT (op 21): [21, ip(4), port_hi, port_lo, request bytes...].
-            // Connect, send, read until the peer closes or the budget expires, close. Reply carries
-            // whatever came back, or is EMPTY on failure - and the failure is logged with its reason
-            // rather than folded into "nothing came back" (§26.7: a reported failure beats a
-            // detected one).
+            // Connect, send, read until the peer closes or the budget expires, close. Reply is
+            // `[status, bytes...]`: `TCP_OK` and whatever came back, or `TCP_FAILED` alone - and the
+            // failure is logged with its reason rather than folded into "nothing came back" (§26.7).
+            //
+            // The status byte is new on 2026-10-10 (`backlog/80` D5). A failure answered with an EMPTY
+            // message, which `Reply::send` `debug_assert!`s against and three ports refuse outright
+            // (`backlog/66`), so on those boards a failed transaction left the caller waiting out its
+            // deadline instead of hearing "failed".
             //
             // Driven inside the request, not from a background poll, because
             // `docs/net-tags-design.md` forbids unsolicited driver traffic until its phase 2/3 land.
@@ -3482,7 +3489,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // 3 KiB, not 1.4 KiB: a reply that fits in ONE segment never exercises the receive
             // path's reassembly, window updates or ACK-driven advancement. The Message ceiling is
             // 4 KiB (§8.5), so this leaves headroom while guaranteeing more than one segment.
-            let mut resp = [0u8; 3072];
+            let mut resp = [0u8; 1 + 3072];
             let n = if pl.len() >= 7 && gw_known {
                 let dip = [pl[1], pl[2], pl[3], pl[4]];
                 let dport = ((pl[5] as u16) << 8) | pl[6] as u16;
@@ -3520,7 +3527,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 };
                 let net = tcp::Net { our_mac, peer_mac, our_ip };
-                match tcp_transact(&ctx, pending, &mut tcpst, &net, dip, dport, &pl[7..], &mut resp, 8_000) {
+                match tcp_transact(&ctx, pending, &mut tcpst, &net, dip, dport, &pl[7..], &mut resp[1..], 8_000) {
                     // A SUCCESSFUL-BUT-EMPTY transaction used to log NOTHING, while the shell told
                     // the user to "see its log for the reason". A message that points at an absent
                     // explanation is worse than silence: it sends the reader looking for something
@@ -3588,7 +3595,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 if !gw_known { ctx.log("net-stack: tcp asked for before the stack is configured"); }
                 0
             };
-            reply.send(&ctx, &resp[..n]);
+            // Nothing back is a failure to the caller, whatever stage it ended at: every arm above
+            // that returns 0 has already said why in the log.
+            resp[0] = if n > 0 { TCP_OK } else { TCP_FAILED };
+            reply.send(&ctx, &resp[..1 + n]);
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
             // Try the DHCP-learned server, then a public fallback (8.8.8.8). A home router may do DHCP +
