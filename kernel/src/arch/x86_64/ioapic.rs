@@ -197,7 +197,19 @@ static LEVEL_ROUTE_GSI: [AtomicU8; MAX_LEVEL_ROUTES] =
 
 /// Record that IDT `vector` is a level-triggered IOAPIC route on `gsi` (enables mask/unmask).
 /// May be called several times for one vector to register a candidate GSI set.
+///
+/// A route already recorded is not recorded twice: a driver that respawns registers its routes again,
+/// and each respawn used to take a fresh slot. A route that finds the table full is SAID, not dropped:
+/// without its slot the line is never masked while the driver handles it, nor unmasked after
+/// (`backlog/80` K12, 2026-10-10).
 pub fn set_level_route(vector: u8, gsi: u8) {
+    for i in 0..MAX_LEVEL_ROUTES {
+        if LEVEL_ROUTE_VEC[i].load(Ordering::Relaxed) == vector
+            && LEVEL_ROUTE_GSI[i].load(Ordering::Relaxed) == gsi
+        {
+            return;
+        }
+    }
     for i in 0..MAX_LEVEL_ROUTES {
         if LEVEL_ROUTE_VEC[i].load(Ordering::Relaxed) == 0xFF {
             LEVEL_ROUTE_GSI[i].store(gsi, Ordering::Relaxed);
@@ -205,6 +217,9 @@ pub fn set_level_route(vector: u8, gsi: u8) {
             return;
         }
     }
+    crate::kprintln!(
+        "ioapic: level route vector {:#04x} GSI {} NOT recorded - all {} level-route slots are in use, so this line is never masked or unmasked",
+        vector, gsi, MAX_LEVEL_ROUTES);
 }
 
 /// Mask the IOAPIC source(s) for `vector` if it has level route(s) (no-op for edge/MSI vectors).
