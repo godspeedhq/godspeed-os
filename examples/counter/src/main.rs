@@ -156,6 +156,23 @@ fn load_count(ctx: &ServiceContext) -> Option<u64> {
     }
 }
 
+/// Is `fs` in the name directory right now? Acquires a SEND cap to find out, and GIVES IT BACK.
+///
+/// The cap is only the question - `fs_request` uses the one the spawn wired in, or reacquires its own -
+/// and `gs::cap::acquire` mints a FRESH capability into a new table slot on every call. This asked
+/// `gs::cap::acquire(..).is_ok()` once a second while saves failed and dropped the handle, so a long
+/// `fs` outage filled this task's capability table one slot per tick (backlog/80 E2). An example is
+/// what a newcomer copies: a probe that mints must remove what it minted.
+fn fs_reachable(ctx: &ServiceContext) -> bool {
+    match gs::cap::acquire(ctx, "fs") {
+        Ok(probe) => {
+            gs::cap::remove(ctx, probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// SAVE-ON-CHANGE: overwrite `/counter.dat` with the new count (8 LE bytes).
 ///
 /// `true` if `fs` acknowledged the write. A successful write means the value is
@@ -173,12 +190,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("counter: ready");
 
     // Probe whether `fs` is reachable. `gs::cap::acquire` resolves "fs" by name via
-    // the kernel directory and mints a FRESH SEND cap into a new table slot each call
-    // (the handle is discarded here; `fs_request` uses the cap the spawn wired in, or
+    // the kernel directory and mints a FRESH SEND cap into a new table slot each call,
+    // which `fs_reachable` removes again (`fs_request` uses the cap the spawn wired in, or
     // reacquires its own). `Err` means `fs` is not in the directory yet (or we hold no
     // authority to send to it). Either way we keep running - the
     // count just will not persist (graceful, loud degrade, never a silent fallback).
-    let mut persist = gs::cap::acquire(&ctx, "fs").is_ok();
+    let mut persist = fs_reachable(&ctx);
 
     // LOAD-ON-SPAWN. After a restart this is what makes the count survive: the fresh
     // instance reconstructs its state from the durable copy instead of starting over.
@@ -212,12 +229,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // mode and try to reacquire `fs` for the next tick (reacquire + retry,
                 // §14.3). The count keeps advancing; it just isn't durable right now.
                 ctx.log_fmt(format_args!("counter: count={} (save failed - fs degraded)", count));
-                persist = gs::cap::acquire(&ctx, "fs").is_ok();
+                persist = fs_reachable(&ctx);
             }
         } else {
             ctx.log_fmt(format_args!("counter: count={} (in-RAM only)", count));
             // Keep trying to bring fs back; once it answers, future ticks persist again.
-            persist = gs::cap::acquire(&ctx, "fs").is_ok();
+            persist = fs_reachable(&ctx);
         }
 
         // Pace the loop. `sleep` lets the core halt instead of busy-yielding.
