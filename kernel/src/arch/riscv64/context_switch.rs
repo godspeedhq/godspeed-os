@@ -271,7 +271,7 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         // and there is nothing to validate or install.
         if root & 0xfff != 0 || !crate::memory::allocator::phys_in_ram(root) {
             panic!(
-                "switch_context: page-table root {:#x} is not installable (aligned={}, in RAM={}).                  Installing it would leave this hart executing in an address space that does not                  exist, unable to fetch the fault handler that would have reported it.",
+                "switch_context: page-table root {:#x} is not installable (aligned={}, in RAM={}). Installing it would leave this hart executing in an address space that does not exist, unable to fetch the fault handler that would have reported it.",
                 root,
                 root & 0xfff == 0,
                 crate::memory::allocator::phys_in_ram(root)
@@ -307,7 +307,7 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
     let sp = unsafe { (*next).sp };
     if sp & 0xf != 0 || !crate::memory::allocator::phys_in_ram(sp) {
         panic!(
-            "switch_context: kernel stack pointer {:#x} is not usable (16-byte aligned={}, in RAM={}).              Restoring it would make the next trap fault on its own prologue, forever, with nothing              able to report it.",
+            "switch_context: kernel stack pointer {:#x} is not usable (16-byte aligned={}, in RAM={}). Restoring it would make the next trap fault on its own prologue, forever, with nothing able to report it.",
             sp,
             sp & 0xf == 0,
             crate::memory::allocator::phys_in_ram(sp)

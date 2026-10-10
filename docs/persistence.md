@@ -606,7 +606,7 @@ active on every mutation.
 
 **Mechanism (mirrors the kernel name-directory recovery path).**
 - The kernel's death path notifies the supervisor for `fs` and `block-driver`
-  (sending the dead service's name); `assert_tcb_alive` guards only `supervisor`, so
+  (sending the dead service's name); nothing on that path treats them as unkillable, so
   killing `fs`/`block-driver` never panics. *(2026-10-09: no longer by name - the kernel notifies
   for any task the supervisor spawned with `SPAWN_FLAG_WATCHED`, which it sets from its `MANAGED`
   roster; CLAUDE.md 12.3, 2026-10-03.)*

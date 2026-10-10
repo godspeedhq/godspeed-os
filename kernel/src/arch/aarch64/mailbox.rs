@@ -272,8 +272,15 @@ pub fn property_call(req: &mut [u32]) -> Option<()> {
 ///
 /// `dev_addr` is the controller's PCI address in the usual `(bus << 20) | (dev << 15) | (fn << 12)`
 /// encoding.
+///
+/// Takes `MBOX_LOCK` like every other caller after `mmu::enable` (backlog/80 K26). Its one caller,
+/// `pcie::init`, runs after the MMU is on and after the secondaries are started, so another core's
+/// syscall (the expander GPIO, the Arm clock) can be inside the mailbox at the same moment; without
+/// the lock the two requests share the one `MBOX` buffer. The lock cannot be taken with the MMU off
+/// (see `property_call`), which is why this must never move earlier in boot.
 pub fn notify_xhci_reset(dev_addr: u32) -> bool {
     const TAG_NOTIFY_XHCI_RESET: u32 = 0x0003_0058;
+    let _one = MBOX_LOCK.lock();
     let mut req = [0u32; 7];
     req[0] = 7 * 4;
     req[1] = 0;

@@ -247,8 +247,11 @@ pub fn enable() {
     pl011_write(b"arm32: MMU ON (short descriptors, 1 MiB sections, L1 @ ");
     write_hex32(core::ptr::addr_of!(L1) as u32);
     pl011_write(b")\r\n");
-    selftest();
+    // Said BEFORE the selftest, because it is already true: `enable_on_this_core` turns translation
+    // and the caches on together, so the selftest below runs cached. It used to be printed after,
+    // which read as though the selftest had passed with the caches off (backlog/80 K25).
     pl011_write(b"arm32: caches ON (I + D + branch prediction)\r\n");
+    selftest();
 }
 
 /// Enable translation + caches on the CALLING core, using the `L1` table `build_tables` already

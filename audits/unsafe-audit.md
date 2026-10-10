@@ -2468,6 +2468,13 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 
 A side-effect-free system-register read, valid at any point including early boot, which is what makes it safe to take on EVERY log line here. The x86 equivalent is not: core identity there costs an APIC MMIO read with a boot-ordering precondition, and putting it on the serial path was a fix worse than the bug it addressed. Same intent, different cost, different answer. |
 | `arch/x86_64/pci.rs` | 21 -> 22 (+1) | `bar_len` (2026-10-09, backlog/80 K1) - sizes a memory BAR at grant time so a driver's register window is its device's and not a fixed 64 KiB. The standard probe (memory decode off, all ones written to the BAR, the mask read back, BAR and decode restored), as ONE block under `PCI_CONFIG_LOCK`: split across the existing `config_read32`/`config_write32`, each of which takes the lock alone, another core's configuration read could land between the writes and see the BAR holding the mask. Only the command half of the command/status dword is written back, because the status half is write-1-to-clear. Every value written is restored before the lock is released. |
+| `arch/x86_64/syscall_entry.rs` | 16 -> 14 (-2) | **shrank** (2026-10-10, backlog/80 K7): `int80_entry` deleted - the naked `int 0x80` syscall stub and its `#[unsafe(naked)]`. It was still installed at IDT[0x80] with DPL=3, so any service could raise it, and it ran the syscall chain on the top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off. The SDK traps with `ud2` on every x86 machine; nothing used it. |
+| `smp/placement.rs` | 1 -> deleted (-1) | 2026-10-10, backlog/80 K20: the whole file had no callers (`resolve` and its `static mut RR_COUNTER`); the live placement is `task::resolve_spawn_core`. Its one block, the `RR_COUNTER` increment, goes with it. |
+| `arch/x86_64/mod.rs` | 40 -> 38 (-2) | **shrank** (2026-10-10, backlog/80 K20): `uart_rx_enable` deleted - the `unsafe fn` and its port-write block. It had no caller by design (unmasking PIC IRQ 4 jams the PIC on real hardware, which the boot comment in `main.rs` records); COM1 RX is polled from the core-0 timer. |
+| `arch/arm/exceptions.rs` | 24 -> 23 (-1) | **shrank** (2026-10-10, backlog/80 K25): the kernel-fault reporter's closing `wfi` loop is replaced by `halt_all_cores`, so a kernel fault halts every core rather than parking only the one that faulted (CLAUDE.md 6.2, 19). The loop's one `asm!` block goes. |
+| `arch/arm/irq.rs` | 18 -> 17 (-1) | **shrank** (2026-10-10, backlog/80 K25): `route_usb_irq_to_core0` deleted - it had no callers, and its one block (the legacy-controller enable write) never ran. `unmask_usb_irq` is the live enable. |
+| `arch/aarch64/mmu.rs` | 23 -> 24 (+1) | 2026-10-10, backlog/80 K21: `remap_high_nc`, one block. The Pi 4 framebuffer was mapped Normal write-back in the kernel's 2 MiB direct-map blocks and Normal non-cacheable in the `console` service - mismatched attributes for one physical page, which ARM leaves UNPREDICTABLE. The block splits the blocks the framebuffer touches into pages (the same arena and the same attribute-carrying copy as the kstack-guard split) and gives only the framebuffer's pages MAIR slot 2, break-before-make: the range cleaned from the cache first, each L2 entry invalidated and the TLB dropped before its table goes in. Sound because it runs on the BSP before any secondary starts and before the console is up, on this module's own tables, over a range nothing is touching. |
+| `arch/x86_64/iommu.rs` | 74 -> 79 (+5) | 2026-10-10, backlog/80 K11: a confinement is never left unrecorded. `unconfine` is the one way a confinement is undone (`unsafe fn`, +1, with the four blocks `release_device` had - write the passthrough DTE, `sfence`, invalidate, free the table - moved into it unchanged); `release_device` calls it (+1 for the call, -4 for the blocks that moved). `confine_device` gains three: freeing a partial table when an arena page fails to map (it leaked, root and all), freeing a device's PREVIOUS table when it is confined again (its record was overwritten and the table kept forever), and calling `unconfine` when the last record slot was taken by another core while the table was being built. Each frees or reverts only a table built here and reachable from nothing but this device's DTE, which each SAFETY comment states. |
 | `arch/x86_64/pci.rs` | 20 -> 21 (+1) | `cfg_read_gated` - the one gated configuration read a userspace enumerator needs (step D2). An `out dx, eax` to 0xCF8 and an `in eax, dx` from 0xCFC, held together under the `PCI_CONFIG_LOCK` that already guards this pair.
 
 This block replaces FOUR that an earlier revision of the same feature added (`pci_cfg_out32` / `pci_cfg_in32` in both `arch/x86_64/mod.rs` and `arch/aarch64/mod.rs`, +2 each). Those exposed SELECT and READ as separate operations, which was wrong on its own terms: the index/data pair is stateful, and the kernel drives it too on its spawn and kill paths, so a split interface let a service and the kernel interleave and each act on the other's selected register. A lock could not close that, because holding one across two syscalls means the kernel waiting on a service. Folding them into one atomic operation removed the race AND three of the four unsafe lines, and the aarch64 access moved into `pcie.rs` beside the registers it drives rather than reaching in through an exported pointer helper. Both `mod.rs` files return to their pre-branch counts. |
@@ -2648,7 +2655,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 23 | permitted |
+| arch/aarch64/mmu.rs | 24 | permitted |
 | arch/aarch64/ptables.rs | 28 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
@@ -2657,11 +2664,11 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/genet.rs | 1 | permitted |
 | arch/aarch64/pcie.rs | 4 | permitted |
 | arch/aarch64/smp_boot.rs | 9 | permitted |
-| arch/arm/exceptions.rs | 24 | permitted |
+| arch/arm/exceptions.rs | 23 | permitted |
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
-| arch/arm/irq.rs | 18 | permitted |
+| arch/arm/irq.rs | 17 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
@@ -2693,12 +2700,12 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/fb.rs | 2 | permitted |
 | arch/x86_64/interrupts.rs | 26 | permitted |
 | arch/x86_64/ioapic.rs | 8 | permitted |
-| arch/x86_64/iommu.rs | 74 | permitted |
-| arch/x86_64/mod.rs | 40 | permitted |
+| arch/x86_64/iommu.rs | 79 | permitted |
+| arch/x86_64/mod.rs | 38 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 22 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
-| arch/x86_64/syscall_entry.rs | 16 | permitted |
+| arch/x86_64/syscall_entry.rs | 14 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 48 | permitted |
 | memory/frame.rs | 1 | permitted |
@@ -2707,7 +2714,6 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | smp/ipi.rs | 17 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 8 | permitted |
-| smp/placement.rs | 1 | permitted |
 | smp/names.rs | 4 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
@@ -3193,14 +3199,6 @@ for most blocks; a small number need back-fill.
 
 AP startup via `start_all_aps`. Delegates to `arch/x86_64/ap_boot.rs`.
 `// SAFETY:` comment present in source.
-
----
-
-### smp/placement.rs
-
-Round-robin core assignment reads the `READY_CORES` count set by `smp/core.rs`.
-Sound because the count is written before placement is ever called (BSP marks
-core 0 ready before spawning init). `// SAFETY:` comment present in source.
 
 ---
 

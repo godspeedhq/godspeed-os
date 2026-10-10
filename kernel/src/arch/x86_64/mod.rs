@@ -1063,29 +1063,22 @@ pub fn input_ready() -> bool {
     INPUT_READY.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Enable COM1 RX interrupts. **Has no caller, deliberately:** `main.rs` says it must NOT be called -
-/// the PIC stays fully masked and COM1 RX is polled from the core-0 timer tick (`uart_rx_poll`).
-///
-/// # Safety
-/// Must be called after serial_init and after the IDT is loaded with vector 36.
-pub unsafe fn uart_rx_enable() {
-    // Unmask IRQ 4 (COM1) on the master PIC.  mask_pic() left OCW1 = 0xFF.
-    // Clearing bit 4 enables IRQ 4; all other IRQs remain masked.
-    // SAFETY: PIC port I/O; must run after mask_pic() sets OCW1=0xFF.
-    unsafe {
-        let mask = inb(0x21);
-        outb(0x21, mask & 0xEF); // clear bit 4 (IRQ 4 = COM1)
-        outb(COM1 + 1, 0x01);    // IER: enable RX data available interrupt
-    }
-}
+/// Serialises the console input ring's PRODUCERS. There are two, on different cores and in
+/// different contexts: `uart_rx_drain_fifo` from the core-0 timer tick (or `uart_rx_drain_now`), and
+/// `console_push_byte` from a USB driver's syscall on any core. Unserialised, two of them could read
+/// the same tail and one byte be lost or both land in one slot (`backlog/80` K10). Taken with
+/// `lock_irq`, so a syscall holding it on core 0 cannot be interrupted by the timer tick that would
+/// then spin on it; the tick's own acquire nests (IF is already 0 there).
+static COM1_RX_PRODUCER: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
 
 /// Push a byte into the COM1 RX ring buffer.
 ///
 /// # Safety
-/// Single-producer ring: the callers are `uart_rx_drain_fifo` (timer ISR, or `uart_rx_drain_now`
-/// under `cli`) and `console_push_byte` (a syscall). The last is NOT serialized against the other
-/// two - see the note on `console_push_byte`.
+/// The callers are `uart_rx_drain_fifo` (timer ISR, or `uart_rx_drain_now` under `cli`) and
+/// `console_push_byte` (a syscall). Producers are serialised by `COM1_RX_PRODUCER`; the one consumer,
+/// `uart_rx_pop`, needs no lock against them (head and tail are each written by one side).
 pub unsafe fn uart_rx_push(b: u8) {
+    let _producer = COM1_RX_PRODUCER.lock_irq();
     use core::sync::atomic::Ordering;
     let tail = COM1_RX_TAIL.load(Ordering::Relaxed);
     let head = COM1_RX_HEAD.load(Ordering::Acquire);
@@ -1108,7 +1101,8 @@ pub unsafe fn uart_rx_push(b: u8) {
         }
         return;
     }
-    // SAFETY: tail index is within COM1_RX_BUF bounds; only this producer writes to it.
+    // SAFETY: tail index is within COM1_RX_BUF bounds; `COM1_RX_PRODUCER` is held, so this is the
+    // only producer writing it.
     unsafe { COM1_RX_BUF[tail] = b; }
     COM1_RX_TAIL.store(next_tail, Ordering::Release);
 }
@@ -1136,10 +1130,9 @@ pub fn uart_rx_pop() -> Option<u8> {
 /// APIC-only kernels must poll the UART LSR instead.
 pub fn uart_rx_poll() {
     use core::sync::atomic::Ordering;
-    // SAFETY: called from timer ISR with IF=0; uart_rx_drain_fifo is safe
-    // to call here because: (a) timer ISR is IF=0 so no re-entrancy, and
-    // (b) this is the only producer path (uart_rx_isr_stub is dead code
-    // since IRQ 4 is masked).
+    // SAFETY: called from timer ISR with IF=0, so no re-entrancy; the ring's other producer,
+    // `console_push_byte`, is serialised against this one by `COM1_RX_PRODUCER` (uart_rx_isr_stub is
+    // dead code since IRQ 4 is masked).
     unsafe { uart_rx_drain_fifo(); }
     let head = COM1_RX_HEAD.load(Ordering::Acquire);
     let tail = COM1_RX_TAIL.load(Ordering::Acquire);
@@ -1175,9 +1168,8 @@ pub fn uart_rx_drain_now() {
 /// Inject one byte into the console input ring from a userspace input driver
 /// (the USB keyboard, §12), then wake any blocked ConsoleRead. Mirrors the COM1
 /// poll path's push + wake, so USB keystrokes reach the shell exactly like
-/// serial bytes would. On the target hardware COM1 RX is dead, so the driver is
-/// the only producer in practice; a concurrent COM1 poll would race the ring
-/// tail - acceptable while COM1 input is unused (a per-ring lock is future work).
+/// serial bytes would. The COM1 poll is the ring's other producer; the two are serialised by
+/// `COM1_RX_PRODUCER` (until 2026-10-10 they were not, which is `backlog/80` K10).
 pub fn console_push_byte(b: u8) {
     use core::sync::atomic::Ordering;
     // Capture the byte into the input ring + wake any reader FIRST, before the echo.
@@ -1187,7 +1179,7 @@ pub fn console_push_byte(b: u8) {
     // would never become readable, so `q` could not quit the command. Ring-first makes
     // input capture independent of the display: the byte is readable immediately and
     // the echo (display only) happens after and may block harmlessly.
-    // SAFETY: single-producer ring push in practice (see note above).
+    // SAFETY: `uart_rx_push` takes the producer lock itself (see note above).
     unsafe { uart_rx_push(b) };
     let waiter = CONSOLE_READ_WAITER.load(Ordering::Acquire);
     if waiter != u32::MAX {

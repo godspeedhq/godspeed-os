@@ -47,14 +47,11 @@ pub unsafe extern "C" fn _start() -> ! {
 
 /// Rust side of boot. Milestone: write to the 16550 UART and halt.
 extern "C" fn loong_boot_main() -> ! {
-    for &b in b"
-GodspeedOS loongarch64: _start reached, 16550 UART alive - the demarcation BOOTS on a FOURTH arch.
-" {
+    for &b in b"\nGodspeedOS loongarch64: _start reached, 16550 UART alive - the demarcation BOOTS on a FOURTH arch.\n" {
         // SAFETY: UART_THR is QEMU loongarch virt NS16550 transmit register.
         unsafe { UART_THR.write_volatile(b); }
     }
-    for &b in b"loongarch64: neutral kernel linked; arch/loongarch64 stubs pending real bodies. halting.
-" {
+    for &b in b"loongarch64: neutral kernel linked; arch/loongarch64 stubs pending real bodies. halting.\n" {
         unsafe { UART_THR.write_volatile(b); }
     }
     loop {
@@ -92,9 +89,9 @@ pub enum MemoryKind {
 
 // ---- Lifecycle ----
 pub fn ap_count() -> usize { 0 }
-pub fn init(boot_info: &BootInfo) { unimplemented!("aarch64::init") }
-pub fn init_timer() { unimplemented!("aarch64::init_timer") }
-pub fn ap_init(core_id: u32) { unimplemented!("aarch64::ap_init") }
+pub fn init(boot_info: &BootInfo) { unimplemented!("loongarch64::init") }
+pub fn init_timer() { unimplemented!("loongarch64::init_timer") }
+pub fn ap_init(core_id: u32) { unimplemented!("loongarch64::ap_init") }
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
@@ -154,7 +151,7 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 /// Unimplemented on this stub.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
 #[inline(always)]
-pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_to_boot_stack") }
+pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("loongarch64::switch_to_boot_stack") }
 
 /// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (LoongArch, ELFCLASS64).
 /// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
@@ -559,8 +556,7 @@ pub mod pci {
     pub fn set_power_d0(bdf: u32) {}
     pub fn xhci_bios_handoff() {}
     pub fn ehci_flr_probe() {}
-    pub fn program_xhci_msi() -> bool { false }
-    pub fn program_ehci_msi() -> bool { false }
+    pub fn program_ehci_msi(_core_id: u32) -> bool { false }
     pub fn route_ehci_intx() {}
 }
 

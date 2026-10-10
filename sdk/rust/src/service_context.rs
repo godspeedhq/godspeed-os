@@ -4286,10 +4286,12 @@ impl ServiceContext {
         let packed = ((core as u64 & 0xFFFF) << 16) | (slot as u64 & 0xFFFF);
         // SAFETY: syscall(39) = SpawnWithCaps; slot from the kernel-written page; buf valid for n bytes.
         let ret = unsafe { raw_syscall(39, packed, buf.as_ptr() as u64, n as u64) };
+        // slot + 1, so 0 is "spawned, no recv endpoint" and no success value is also an error code
+        // (it returned -2 for that, which is `CapNotHeld` too - `backlog/80` K14).
         match ret {
-            -2 => Ok(None),                              // spawned OK, no recv endpoint
-            r if r >= 0 => Ok(Some(CapHandle(r as u32))),
-            _  => Err(()),                               // spawn failed
+            0 => Ok(None),                               // spawned OK, no recv endpoint
+            r if r > 0 => Ok(Some(CapHandle(r as u32 - 1))),
+            _  => Err(()),                               // spawn failed, or refused
         }
     }
 

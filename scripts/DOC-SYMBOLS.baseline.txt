@@ -100,3 +100,9 @@ ATI_SB450_HDAUDIO_ENABLE_SNOOP     # docs/audio.md - Linux hda_intel.c, EXTERNAL
 ALC256_FIXUP_HP_HEADSET_MIC        # docs/audio.md - Linux patch_realtek.c, EXTERNAL; the one quirk Linux applies to the T630 (103c:8158), headset-jack detection only
 boot_blockdev_qemu                 # backlog/80 R2 - DELETED by 0f7ebce1 (no callers; booted the retired ATA channel); a record of a removal must name what was removed
 
+int80_entry                        # backlog/80 K7 - DELETED 2026-10-10, the x86 int 0x80 syscall stub at IDT[0x80]; a record of a removal must name what was removed
+assert_tcb_alive                   # backlog/80 K20 - DELETED 2026-10-10, an assertion over an empty TCB set; a record of a removal must name what was removed
+uart_rx_enable                     # backlog/80 K20 - DELETED 2026-10-10, the x86 COM1 RX-interrupt enable nothing could call; a record of a removal must name what was removed
+route_usb_irq_to_core0             # backlog/80 K25 - DELETED 2026-10-10, an arm32 USB routing function with no callers; a record of a removal must name what was removed
+EHCI_CORE                          # backlog/80 K27 - DELETED 2026-10-10, the kernel's copy of ehci's core, now the spawned task's own; a record of a removal must name what was removed
+program_xhci_msi                   # backlog/80 K20 - DELETED 2026-10-10, the x86 xHCI MSI programmer with no caller and its false stubs on six ports; a record of a removal must name what was removed

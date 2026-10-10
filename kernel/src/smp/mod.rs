@@ -8,7 +8,6 @@ pub mod core;
 pub mod ipi;
 pub mod names;
 pub mod percpu;
-pub mod placement;
 pub mod spinlock;
 
 pub use spinlock::SpinLock;

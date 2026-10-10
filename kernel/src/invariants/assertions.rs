@@ -5,14 +5,11 @@
 //! fires in a build, the system is no longer the system the spec describes.
 //! They run in both debug and release builds; they are not behind cfg(debug).
 
-/// Assert that a syscall's cap slot is valid before any privileged action.
-/// Panic if not - this is invariant §3.1 (no ambient authority).
-#[inline(always)]
-pub fn assert_cap_validated(result: &Result<(), crate::capability::cap::CapError>) {
-    if let Err(e) = result {
-        panic!("invariant violation: syscall executed without valid capability: {:?}", e);
-    }
-}
+// (A cap-validated assertion sat here. Every call passed it a literal `Ok(())` after the real
+// check had already returned, so it could not fire - a check that cannot fail is an instrument that
+// reports a pass while measuring nothing. Deleted 2026-10-10 with its nine call sites, `backlog/80`
+// K20; the validation it marked is `current_task_lookup_cap` / `current_task_holds_resource` at each
+// handler's head.)
 
 /// Assert that a service's core assignment does not change mid-execution.
 /// Invariant §3.11 (identity is stable; location is not - but location
@@ -25,56 +22,9 @@ pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) 
     );
 }
 
-/// Assert the kernel's non-restartable services are still alive. Called at key checkpoints.
-/// Invariant §6.2.
-///
-/// A DELIBERATE NO-OP TODAY. `TCB` below is empty, so the loop never runs. This doc used to say
-/// "death of any TCB service requires an immediate system reboot", which was true when the set held
-/// `init` + `supervisor` + `registry` and has been false since Path C / Phase 6 made the supervisor
-/// restartable: the non-restartable set is `{kernel}` alone, and nothing above the kernel reboots the
-/// machine. The call sites are kept as the §6.2 checkpoint - if a component ever becomes
-/// unkillable again, this is where it is named.
-pub fn assert_tcb_alive() {
-    // The non-restartable set is now EMPTY (Path C / Phase 6: the supervisor is restartable too -
-    // the kernel respawns it on death, §6.2). `fs`/`block-driver` are restartable (Phase D). The
-    // kernel is the only thing that cannot die, and it is not a task - so no task's death is a
-    // panic-on-death TCB violation.
-    const TCB: &[&str] = &[];
-    const DEAD: u8 = crate::task::state::TaskState::Dead as u8;
-    // §6.2 governs the *death of a service that exists*, not the *omission* of
-    // one: identity-test manifests are minimal and spawn only the subset a given
-    // test needs (e.g. cross-core tests run without `fs`). So a TCB name
-    // that is simply absent from this configuration is skipped - only a service
-    // that exists and is Dead (or whose endpoint was killed) is a violation.
-    //
-    // Should a name ever be added here, this absence-tolerance would be fail-open
-    // unless `handle_kill` were taught to refuse it again: it rejected TCB targets
-    // while the supervisor was one, and has refused nothing since Phase 6. A TCB
-    // service that dies by fault (kill_current) is caught while still
-    // present-and-Dead by the `state == DEAD` check below.
-    'next: for &name in TCB {
-        for slot in 0..crate::task::scheduler::MAX_TASKS {
-            let stat = crate::task::scheduler::task_stat(slot);
-            if stat.valid && stat.name == name {
-                // Found the task. Liveness by task state works uniformly, including for a service
-                // that persists but registers no named IPC endpoint and so cannot be checked by
-                // endpoint. (`init` was the example here; it was removed in Path C / Phase 5.)
-                if stat.state == DEAD {
-                    panic!("invariant violation: TCB service '{}' is Dead (§6.2)", name);
-                }
-                // A TCB service that also exposes a named endpoint must have it
-                // alive - a live task with a killed endpoint is also a §6.2 break.
-                if let Some(ep_id) = crate::ipc::names::lookup(name) {
-                    if !crate::ipc::routing::is_endpoint_alive(ep_id) {
-                        panic!("invariant violation: TCB service '{}' endpoint is dead (§6.2)", name);
-                    }
-                }
-                continue 'next;
-            }
-        }
-        // `name` not present in this configuration - not a §6.2 violation.
-    }
-}
+// (A TCB-alive assertion sat here, over an empty TCB set: since Path C / Phase 6 the only thing that
+// cannot die is the kernel, which is not a task, so it checked nothing. Deleted 2026-10-10,
+// `backlog/80` K20. If a component ever becomes unkillable again, its check is written then.)
 
 /// Assert the capability table is consistent: no cap carries a generation that
 /// exceeds its resource's current generation in the global table. Such a cap

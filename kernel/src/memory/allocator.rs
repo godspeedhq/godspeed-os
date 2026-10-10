@@ -692,7 +692,7 @@ pub fn reserve_no_free(phys: u64, n: usize) -> bool {
     });
     if ok { return true; }
     crate::kprintln!(
-        "reserve_no_free: reservation table full ({}) - {:#x}+{} frames NOT protected; a kill-path          reclaim can free it into the RAM pool",
+        "reserve_no_free: reservation table full ({}) - {:#x}+{} frames NOT protected; a kill-path reclaim can free it into the RAM pool",
         MAX_DMA_RESERVES, phys, n);
     false
 }

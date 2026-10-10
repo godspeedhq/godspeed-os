@@ -646,7 +646,7 @@ fn hires_timer_selftest() {
             elapsed, WANT_US);
     } else {
         crate::kprintln!(
-            "arm32: hi-res timer selftest FAIL - compare 3 never matched in {} us; sub-tick sleeps              will fall back to the 10 ms tick (correct, just coarse)",
+            "arm32: hi-res timer selftest FAIL - compare 3 never matched in {} us; sub-tick sleeps will fall back to the 10 ms tick (correct, just coarse)",
             elapsed);
     }
 }
@@ -1243,14 +1243,8 @@ pub fn hardware_reset() -> ! {
             if n % 20_000_000 == 0 {
                 if !said {
                     said = true;
-                    serial_write_bytes_lockfree(b"
-
-reset: the SoC did NOT reset - the watchdog poke had no effect.
-
-");
-                    serial_write_bytes_lockfree(b"reset: power-cycle the board. (re-arming slowly in case it takes late)
-
-");
+                    serial_write_bytes_lockfree(b"\n\nreset: the SoC did NOT reset - the watchdog poke had no effect.\n\n");
+                    serial_write_bytes_lockfree(b"reset: power-cycle the board. (re-arming slowly in case it takes late)\n\n");
                 }
                 // A write that genuinely did not land gets another chance; one that did has fired long
                 // before this point.
@@ -1350,16 +1344,25 @@ pub fn usb_disk_absent() -> bool { true }
 
 /// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
 /// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it, and so does the
-/// WPA2 supplicant's SNonce (`sdk/wifi/src/supplicant.rs`, `snonce`, for `wifi-usb` on this board). Still
-/// an unlocked FIFO pop: two cores asking at once can both pass the "word available" check for one word.
+/// WPA2 supplicant's SNonce (`sdk/wifi/src/supplicant.rs`, `snonce`, for `wifi-usb` on this board).
+///
+/// The enable, the "word available" check and the pop are ONE critical section under `RNG_LOCK`
+/// (backlog/80 K28). Unlocked, two cores asking at once could both see one word available and both read
+/// DATA - one getting the word and the other a stale or empty one - and a second caller could read before
+/// the first had finished the one-time enable. A nonce must not be either. `lock_irq`, because a
+/// preempted holder on this core would otherwise leave the next task here spinning on it; the hold is a
+/// word's wait, microseconds, and bounded below in every case.
 pub fn hw_random() -> Option<u32> {
     use core::sync::atomic::{AtomicBool, Ordering};
     const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;
     const RNG_STATUS: usize = PERIPHERAL_BASE + 0x10_4004;
     const RNG_DATA:   usize = PERIPHERAL_BASE + 0x10_4008;
     static INIT: AtomicBool = AtomicBool::new(false);
+    static RNG_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+    let _one = RNG_LOCK.lock_irq();
     // SAFETY: the BCM2835 RNG registers are in the already-Device-mapped peripheral window; volatile
     // 32-bit accesses. One-time enable (a warm-up count, then CTRL=1); read once a word is available.
+    // `RNG_LOCK` is held, so no other core is between the check and the pop.
     unsafe {
         if !INIT.swap(true, Ordering::Relaxed) {
             (RNG_STATUS as *mut u32).write_volatile(0x40000);        // warm-up cycles before the first read
@@ -1826,8 +1829,7 @@ fn console_fg_lapsed() -> bool {
     if since < CONSOLE_FG_LEASE_US { return false; }
     CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
     wake_console_waiter();
-    pl011_write_no_fb(b"console: the foreground app stopped drawing - its claim lapsed, console returned
-");
+    pl011_write_no_fb(b"console: the foreground app stopped drawing - its claim lapsed, console returned\n");
     true
 }
 pub fn release_console_foreground() {
@@ -2077,8 +2079,7 @@ fn pl011_rx_drain() {
         pl011_write(b" bytes dropped for lack of ring space (last value ");
         timer::write_dec_pub(b as u32);
         pl011_write(
-            b") back to back. This is not a console, and left alone it STARVES the USB keyboard: they               share one input ring, so a line filling it faster than anything drains it means every               keystroke is dropped. Serial RECEIVE is now off (output is unaffected - you are reading               this over it) and the keyboard has the ring to itself. On a Pi this is usually a GPIO HAT               on the UART pins GPIO14/15, or an unconnected/floating RX pin. Reboot to re-enable after               fixing it.
-",
+            b") back to back. This is not a console, and left alone it STARVES the USB keyboard: they share one input ring, so a line filling it faster than anything drains it means every keystroke is dropped. Serial RECEIVE is now off (output is unaffected - you are reading this over it) and the keyboard has the ring to itself. On a Pi this is usually a GPIO HAT on the UART pins GPIO14/15, or an unconnected/floating RX pin. Reboot to re-enable after fixing it.\n",
         );
     }
     let errs = RX_LINE_ERRORS.load(Ordering::Relaxed);
@@ -2185,8 +2186,7 @@ pub fn console_push_byte(b: u8) {
         KBD_DROPPED.fetch_add(1, Ordering::Relaxed);
         if !KBD_DROP_REPORTED.swap(true, Ordering::AcqRel) {
             pl011_write(
-                b"console: input ring FULL - keystrokes are being dropped. Something is producing                   input faster than it is consumed; a stuck serial RX line is the usual cause.
-",
+                b"console: input ring FULL - keystrokes are being dropped. Something is producing input faster than it is consumed; a stuck serial RX line is the usual cause.\n",
             );
         }
     }
@@ -2593,8 +2593,9 @@ pub mod interrupts {
         // one controller, one driver. The hub poll in particular took the exclusive bulk claim and
         // rewrote the shared device selection, which is precisely what must not happen underneath
         // another driver. Slice 5 deleted both with the in-kernel DWC2 driver, which is why the block
-        // below is empty; `services/dwc2` owns the controller now.
-        if !super::irq::usb_owned_by_userspace() {
+        // below is gone too (it was an empty `if` that still did a route lookup on every idle pass,
+        // removed 2026-10-10, `backlog/80` K25); `services/dwc2` owns the controller now.
+        //
         // The ethernet cable was watched here for the same reason, on the same terms. The PHY read was
         // already written and already correct - but nothing CALLED it unless a service asked (`net`,
         // `ping`), so unplugging the cable on an idle machine was silent while unplugging the keyboard
@@ -2603,7 +2604,6 @@ pub mod interrupts {
         // function's exclusive section: it takes the same bulk claim, and nesting would make it stand
         // aside from itself. Both were individually rate-limited to ~1 s and both yielded to storage,
         // so idle stayed cheap.
-        }
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
         unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }
     }
@@ -2801,8 +2801,7 @@ pub mod pci {
     pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
     /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.
     pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
-    pub fn program_xhci_msi() -> bool { false }
-    pub fn program_ehci_msi() -> bool { false }
+    pub fn program_ehci_msi(_core_id: u32) -> bool { false }
     pub fn route_ehci_intx() {}
 }
 

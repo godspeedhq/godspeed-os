@@ -200,8 +200,7 @@ fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
     // §3.1 (no ambient authority): control reaches the privileged log write only
-    // with a cap the lookup + scope check validated. Executable §3.1 checkpoint.
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    // with a cap the lookup + scope check validated.
 
     let len = msg_len as usize;
     if len == 0 || len > 256 { return -1; }
@@ -354,8 +353,7 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     };
 
     // §3.1 (no ambient authority): the send below requires a validated SEND cap,
-    // which the lookup above enforced. Executable §3.1 checkpoint.
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    // which the lookup above enforced.
 
     let my_slot = scheduler::current_task_slot();
 
@@ -392,20 +390,63 @@ fn narrow_embedded_for_receiver(cap: crate::capability::cap::Capability) -> crat
     }
 }
 
+/// Install the capabilities a received message carries into the receiver's table, and queue each
+/// slot for `TakePendingCap` - every receive path's one way of doing it.
+///
+/// **Neither failure is silent** (`backlog/80` K4). The sender no longer holds an embedded cap once it
+/// was enqueued, so a cap that cannot be installed is GONE: a full table is logged by name. A cap that
+/// is installed but whose slot cannot be queued - the receiver already has `MAX_PENDING_RECV_CAPS`
+/// unclaimed - is taken back out of the table and logged, rather than left in a slot the service will
+/// never be told about. Both used to happen with no word said.
+fn install_received_caps(msg: &Message) {
+    let n_caps = msg.cap_count.min(msg.caps.len());
+    for i in 0..n_caps {
+        if let Some(embedded_cap) = msg.caps[i] {
+            let who = scheduler::task_name(scheduler::current_task_slot());
+            match scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
+                Ok(new_slot) => {
+                    if !scheduler::push_pending_recv_cap(new_slot as u32) {
+                        scheduler::current_task_remove_cap(new_slot);
+                        crate::kprintln!(
+                            "recv: '{}' already holds the most unclaimed received capabilities - one it was sent is DROPPED, not left in its table unclaimed",
+                            who);
+                    }
+                }
+                Err(_) => crate::kprintln!(
+                    "recv: '{}' was sent a capability and its table is full - the capability is DROPPED (the sender no longer holds it)",
+                    who),
+            }
+        }
+    }
+}
+
+/// `Some(MessageTooLarge)` when a received payload does not fit the caller's buffer, said once on the
+/// log; `None` when it fits. The receive paths refuse rather than truncate, as `Call` does (K5).
+fn refuse_oversized(path: &str, len: usize, buf_len: usize) -> Option<i64> {
+    if len <= buf_len {
+        return None;
+    }
+    crate::kprintln!(
+        "{}: a {}-byte message does not fit the caller's {}-byte buffer - refused (not truncated)",
+        path, len, buf_len);
+    Some(ipc_err_to_i64(IpcError::MessageTooLarge))
+}
+
 /// arg0 = cap_slot, arg1 = out_buf_ptr (user VA), arg2 = out_buf_len.
 ///
 /// Blocks until a message is dequeued from the endpoint, then copies the
 /// payload into the caller-supplied buffer. A payload longer than the buffer is
-/// TRUNCATED to it (unlike `Call`, which refuses). Returns the number of bytes
-/// written on success, or a negative error code.
+/// REFUSED with `MessageTooLarge`, as `Call` refuses one, and logged; it was truncated
+/// silently until 2026-10-10 (`backlog/80` K5). The SDK always passes a full 4 KiB
+/// buffer, so no SDK caller can reach the refusal. Returns the number of bytes written
+/// on success, or a negative error code.
 fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::RECV) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
     // §3.1 (no ambient authority): the recv below requires a validated RECV cap,
-    // which the lookup above enforced. Executable §3.1 checkpoint.
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    // which the lookup above enforced.
     let endpoint_id = EndpointId(cap.resource_id.0);
 
     let buf_len = out_len as usize;
@@ -427,21 +468,14 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 // Install any embedded capabilities into the receiver's cap table
                 // and push their slot indices into the pending-recv-cap buffer so
                 // the receiver can retrieve them via syscall 12 (TakePendingCap).
-                let n_caps = msg.cap_count.min(msg.caps.len());
-                for i in 0..n_caps {
-                    if let Some(embedded_cap) = msg.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::push_pending_recv_cap(new_slot as u32);
-                        }
-                    }
-                }
+                install_received_caps(&msg);
                 // Copy payload to the caller's user-space buffer.
                 let payload  = msg.payload_bytes();
-                let copy_len = payload.len().min(buf_len);
-                if !copy_out(out_buf, &payload[..copy_len]) {
+                if let Some(e) = refuse_oversized("recv", payload.len(), buf_len) { return e; }
+                if !copy_out(out_buf, payload) {
                     return -1;
                 }
-                return copy_len as i64;
+                return payload.len() as i64;
             }
             Err(IpcError::QueueEmpty) => {
                 let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
@@ -466,7 +500,6 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
     let endpoint_id = EndpointId(cap.resource_id.0);
 
     let buf_len = out_len as usize;
@@ -480,20 +513,13 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 scheduler::wake_by_slot(slot, 0);
             }
             scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
-            let n_caps = msg.cap_count.min(msg.caps.len());
-            for i in 0..n_caps {
-                if let Some(embedded_cap) = msg.caps[i] {
-                    if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                        scheduler::push_pending_recv_cap(new_slot as u32);
-                    }
-                }
-            }
+            install_received_caps(&msg);
             let payload  = msg.payload_bytes();
-            let copy_len = payload.len().min(buf_len);
-            if !copy_out(out_buf, &payload[..copy_len]) {
+            if let Some(e) = refuse_oversized("try_recv", payload.len(), buf_len) { return e; }
+            if !copy_out(out_buf, payload) {
                 return -1;
             }
-            copy_len as i64
+            payload.len() as i64
         }
         Err(IpcError::QueueEmpty) => TRY_RECV_EMPTY,
         Err(e) => ipc_err_to_i64(e),
@@ -517,7 +543,6 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
     let endpoint_id = EndpointId(cap.resource_id.0);
 
     if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE { return -1; }
@@ -540,18 +565,11 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                     scheduler::wake_by_slot(slot, 0);
                 }
                 scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
-                let n_caps = msg.cap_count.min(msg.caps.len());
-                for i in 0..n_caps {
-                    if let Some(embedded_cap) = msg.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::push_pending_recv_cap(new_slot as u32);
-                        }
-                    }
-                }
+                install_received_caps(&msg);
                 let payload  = msg.payload_bytes();
-                let copy_len = payload.len().min(buf_len);
-                if !copy_out(out_buf, &payload[..copy_len]) { break -1; }
-                break copy_len as i64;
+                if let Some(e) = refuse_oversized("recv_timeout", payload.len(), buf_len) { break e; }
+                if !copy_out(out_buf, payload) { break -1; }
+                break payload.len() as i64;
             }
             Err(IpcError::QueueEmpty) => {
                 if deadline != 0 && scheduler::monotonic_ticks() >= deadline {
@@ -663,8 +681,7 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     };
 
     // §3.1 (no ambient authority): the send below requires a validated SEND cap,
-    // which the lookup above enforced. Executable §3.1 checkpoint.
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    // which the lookup above enforced.
 
     // Pass None for blocked_sender_slot - QueueFull is returned directly.
     match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, None) {
@@ -742,14 +759,6 @@ const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
 
 // Syscall: Spawn (7) / Kill (8) / AcquireSendCap (10).
 // ---------------------------------------------------------------------------
-
-/// UNUSED. These were the probe parameters `Spawn` carried in the UPPER 32 bits of `arg0`
-/// (`[55..48] flags  [47..32] probe mode  [31..16] core  [15..0] spawn cap slot`,
-/// `docs/probe-params-design.md`). The probe path is gone (see `handle_spawn`) and nothing reads
-/// these three constants any more.
-const SPAWN_FLAG_HAS_RECV:  u64 = 1 << 48;
-const SPAWN_FLAG_SMALL_MEM: u64 = 1 << 49;
-const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
 
 /// Upper bound on the name payload (`name` + NUL-separated peer names). It was 64, which held a
 /// name alone; a peer list needs more. Bounded and small (26.6) - the longest real payload is
@@ -1283,9 +1292,10 @@ fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u6
 /// arg1 = ptr, arg2 = len of a descriptor: `[name_len:u8, name…, count:u8,
 ///        {label_len:u8, label…, slot_lo:u8, slot_hi:u8} × count]` (count ≤ MAX_SEND_PEERS).
 /// Each `slot` names a cap the CALLER holds; the kernel copies it (GRANT-validated, non-escalating
-/// §7.3) into the child under `label`. Returns the endpoint cap slot (>= 0, NOT plus one as in
-/// `SpawnReturningEndpoint`), -2 if the service spawned with no recv endpoint, -1 if the spawn
-/// failed, or a cap error - and -2 is also `CapNotHeld`, so the two cannot be told apart.
+/// §7.3) into the child under `label`. Returns the endpoint cap slot PLUS ONE, as
+/// `SpawnReturningEndpoint` does, so 0 is "spawned, but the service has no recv endpoint"; -1 if the
+/// spawn failed, or a cap error. It returned the bare slot and -2 for "no endpoint" until 2026-10-10,
+/// and -2 is also `CapNotHeld`, so a refusal read as a successful spawn (`backlog/80` K14).
 fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
@@ -1347,11 +1357,11 @@ fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
             let rid    = crate::capability::cap::ResourceId::from(ep_id);
             let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
             match scheduler::current_task_insert_cap(ep_cap) {
-                Ok(slot) => slot as i64,
+                Ok(slot) => slot as i64 + 1,
                 Err(e)   => cap_err_to_i64(e),
             }
         }
-        Ok(None) => -2, // spawned OK, but the service has no recv endpoint (a producer like `greet`)
+        Ok(None) => 0,  // spawned OK, but the service has no recv endpoint (a producer like `greet`)
         Err(_)   => -1, // spawn failed
     }
 }
@@ -1435,18 +1445,14 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     // *casual* `kill supervisor`/`restart supervisor` at the command layer (CORE_SERVICES); deliberate
     // chaos goes through `chaos kill-storm supervisor`.
     if crate::task::kill_by_name(name) {
-        // Now that the kill has completed and no kernel locks are held, verify the two
-        // invariants a kill is most likely to break:
-        //   §6.2 - no non-restartable task has died. That set is EMPTY since Phase 6 (the
-        //          supervisor is restartable), so `assert_tcb_alive` checks nothing today;
-        //          it stays as the hook should the set ever be non-empty again.
-        //   §7.8 - the cap table is still consistent (no cap carries a generation
-        //          beyond its resource's current generation). The generation bump
-        //          only ever moves resources forward, so all surviving caps stay
-        //          stale-or-current. This is an O(active-caps) walk; the kill path
-        //          is not a per-syscall hot path, so it is an acceptable home for
-        //          the §7.8 check (see invariants/CLAUDE.md).
-        crate::invariants::assertions::assert_tcb_alive();
+        // Now that the kill has completed and no kernel locks are held, verify the invariant a kill
+        // is most likely to break, §7.8: the cap table is still consistent (no cap carries a
+        // generation beyond its resource's current generation). The generation bump only ever moves
+        // resources forward, so all surviving caps stay stale-or-current. This is an O(active-caps)
+        // walk; the kill path is not a per-syscall hot path, so it is an acceptable home for the
+        // §7.8 check (see invariants/CLAUDE.md). (A §6.2 TCB-alive assertion sat beside it, over an
+        // EMPTY set since Phase 6 made the supervisor restartable - it checked nothing, and was
+        // deleted 2026-10-10, `backlog/80` K20.)
         crate::invariants::assertions::assert_cap_table_consistent();
         // If the caller killed ITSELF (a SERVICE_CONTROL holder self-terminating - e.g. `chaos` at the
         // end of a run, so it does not linger in `observe`), it is now Dead. Do NOT return into the dead
@@ -1579,7 +1585,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
             // reacquire anything again, so it stays broken until it is restarted. Naming it is the
             // difference between diagnosing that in one boot and chasing the peer for several.
             crate::kprintln!(
-                "acquire: '{}' resolved, but the caller's capability table is FULL - it cannot hold                  the cap. This service will not recover until it is restarted.", name);
+                "acquire: '{}' resolved, but the caller's capability table is FULL - it cannot hold the cap. This service will not recover until it is restarted.", name);
             ACQUIRE_CAP_TABLE_FULL
         }
     }
@@ -1754,13 +1760,14 @@ fn do_call(
     let recv_ep = EndpointId(recv_cap.resource_id.0);
 
     // §3.1 (no ambient authority): every leg below required a validated cap (SEND/GRANT/RECV).
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
-    // 2. The buffer is in/out: read the request from it now, write the reply back into it later, so
-    //    validate it for MAX_MESSAGE_SIZE. That is the `Call` (41) SDK's buffer; a `CallDeadline`
-    //    caller may declare a smaller one (`reply_buf_cap`), and is still validated for the full size.
+    // 2. The buffer is in/out: read the request from it now (`req_len` bytes), write the reply back
+    //    into it later (at most `reply_buf_cap`), so validate it for the larger of the two. `Call`
+    //    (41) passes MAX_MESSAGE_SIZE; a `CallDeadline` caller may declare a smaller buffer, which
+    //    was validated for a full 4 KiB anyway until 2026-10-10 - a buffer near the end of the user
+    //    range was refused although nothing would have touched past it (`backlog/80` K15).
     if req_len as usize > MAX_MESSAGE_SIZE { return ipc_err_to_i64(IpcError::MessageTooLarge); }
-    if !validate_user_ptr(buf_ptr, MAX_MESSAGE_SIZE) { return -1; }
+    if !validate_user_ptr(buf_ptr, (req_len as usize).max(reply_buf_cap)) { return -1; }
 
     // 3. Build the request with the reply cap embedded (mirrors SendWithCap).
     let mut msg = match build_message(buf_ptr, req_len) {
@@ -1829,14 +1836,7 @@ fn do_call(
                     scheduler::wake_by_slot(slot, 0);
                 }
                 scheduler::set_last_recv_badge(reply.badge_id, reply.badge_right);
-                let n_caps = reply.cap_count.min(reply.caps.len());
-                for i in 0..n_caps {
-                    if let Some(embedded_cap) = reply.caps[i] {
-                        if let Ok(new_slot) = scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
-                            scheduler::push_pending_recv_cap(new_slot as u32);
-                        }
-                    }
-                }
+                install_received_caps(&reply);
                 let payload  = reply.payload_bytes();
                 // REFUSE, do not truncate. The caller told us how much room it has; a reply that does
                 // not fit is a protocol error the caller must see, and writing what fits would smash
@@ -1910,7 +1910,6 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
     if !scheduler::current_task_holds_resource(RESOURCE_MINT_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
     let owner = match scheduler::current_task_endpoint() {
         Some(e) => e.0, // delegated band tracks the owner endpoint as a raw u64
         None    => return -1, // a service with no endpoint cannot own resources
@@ -1928,6 +1927,11 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
         Err(_) => { delegated::release(id); return -1; } // cap table full - don't leak the id
     };
     if !write_user_bytes(out_id_ptr, &id.0.to_le_bytes()) {
+        // The caller cannot be told the id, so it cannot use or revoke what was minted: take both
+        // back rather than leave a resource and a cap no one will ever release. They leaked until
+        // 2026-10-10 (`backlog/80` K15). The cap was only ever in the caller's table.
+        scheduler::current_task_remove_cap(slot);
+        let _ = delegated::revoke_owned(id, owner);
         return -1;
     }
     slot as i64
@@ -1968,7 +1972,6 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Some(o) => EndpointId(o), // u64 → the owner endpoint to route to
         None    => return ipc_err_to_i64(IpcError::EndpointDead), // resource freed
     };
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
     // 2. Validate the embedded reply cap (GRANT) so the owner can reply (reply-cap pattern).
     let reply_cap = match scheduler::current_task_lookup_cap(reply_slot, Rights::GRANT) {
@@ -2117,10 +2120,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // 21, 23). Every other query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (docs/introspection-capability.md).
     //
-    // 9 and 22 are dead entries: both queries were REMOVED (see the notes at their old arms below),
-    // so they fall through to `_` either way. Kept listed rather than silently dropped because an
-    // allowlist is the wrong place to leave a reader guessing whether an absence was deliberate.
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23)
+    // 9 and 22 are not here: both queries were REMOVED (see the notes at their old arms below). They
+    // were listed until 2026-10-10 as dead entries (`backlog/80` K18), which made an AUTHORITY list
+    // name two things that do not exist; an unknown query now falls on the gated side like any other,
+    // and answers -1 to a holder.
+    if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 23)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -2691,7 +2695,10 @@ const NET_FRAME_MAX: usize = 1600;
 /// `DEVICE_POWER_RESOURCE` + WRITE, which is minted only to a service granted a fixed peripheral window
 /// whose device the arch layer can power - so the device is identified by the GRANT, through the device
 /// KIND this task was granted, never by an argument or a name. Returns 0 only when the pin reads back at
-/// the level asked for, -1 otherwise (no power control for that device, or a request that did not take).
+/// the level asked for, -1 otherwise (no power control for that device, or a request that did not take),
+/// and `CapNotHeld` (-2) without the capability. That refusal returned the enum's discriminant, 0 - the
+/// documented SUCCESS - until 2026-10-10 (`backlog/80` K3); so did CpuClock's (read as 0 Hz) and
+/// PciCfgRead's (read as a config word of 0).
 ///
 /// WHY THIS IS MECHANISM AND NOT A SEVENTH RESPONSIBILITY: the kernel already owns the device grant
 /// (§12.3), and a grant includes power - it powers the Pi 4's SD domain at boot before the radio's
@@ -2700,7 +2707,7 @@ const NET_FRAME_MAX: usize = 1600;
 fn handle_device_power(on: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::DEVICE_POWER_RESOURCE, Rights::WRITE) {
         crate::kprintln!("device-power: refused - caller does not hold DEVICE_POWER");
-        return CapError::CapNotHeld as i64;
+        return cap_err_to_i64(CapError::CapNotHeld);
     }
     // BY THE DEVICE KIND THIS TASK WAS GRANTED, not by its name: this resolved the pin from the caller's
     // name, so any task called `wifi-driver` that held the capability reached the radio's power pin.
@@ -2717,8 +2724,9 @@ fn handle_device_power(on: u64) -> i64 {
 }
 
 /// CpuClock (55): `arg0` = 0 for the platform's minimum Arm clock, 1 for its maximum. Gated by
-/// `CPU_CLOCK_RESOURCE` + WRITE. Returns the rate the cores read back afterwards, in Hz, or -1 where this
-/// machine gives the OS no control over its clock (every port but the Pi 4 today).
+/// `CPU_CLOCK_RESOURCE` + WRITE. Returns the rate the cores read back afterwards, in Hz, -1 where this
+/// machine gives the OS no control over its clock (every port but the Pi 4 today), or `CapNotHeld` (-2)
+/// without the capability.
 ///
 /// MECHANISM, NOT A SEVENTH RESPONSIBILITY: the kernel already owns the firmware mailbox - the SD power,
 /// the GPIO expander, the radio's power cut - and this is one more request on it. Only two rates are on
@@ -2727,7 +2735,7 @@ fn handle_device_power(on: u64) -> i64 {
 fn handle_cpu_clock(max: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::CPU_CLOCK_RESOURCE, Rights::WRITE) {
         crate::kprintln!("cpu-clock: refused - caller does not hold CPU_CLOCK");
-        return CapError::CapNotHeld as i64;
+        return cap_err_to_i64(CapError::CapNotHeld);
     }
     match crate::arch::imp::cpu_clock(max != 0) {
         Some(hz) => hz as i64,
@@ -2753,7 +2761,7 @@ fn handle_pci_cfg_read(sel: u64, offset: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::READ) {
         crate::kprintln!("pci-cfg: read sel {:#010x} refused - caller does not hold PCI_CFG",
                          sel as u32);
-        return CapError::CapNotHeld as i64;
+        return cap_err_to_i64(CapError::CapNotHeld);
     }
     // The access, its lock and its admissibility check live in `arch` beside the registers they
     // guard, so the check and the I/O cannot drift apart and this file needs no `unsafe`

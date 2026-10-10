@@ -361,9 +361,7 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
         }
     }
 
-    for &b in b"
-riscv64: S-mode entered, 16550 UART alive
-" {
+    for &b in b"\nriscv64: S-mode entered, 16550 UART alive\n" {
         putc(b);
     }
     // Report what the firmware handed us, and CHECK the device tree rather than trusting the
@@ -375,14 +373,12 @@ riscv64: S-mode entered, 16550 UART alive
     print_str(", fdt at ");
     print_hex(fdt as u64);
     let Some(tree) = tree else {
-        print_str(" (NO FDT MAGIC - device tree not usable)
-");
+        print_str(" (NO FDT MAGIC - device tree not usable)\n");
         halt();
     };
     print_str(" (valid, ");
     print_dec(tree.total_size() as u64);
-    print_str(" bytes)
-");
+    print_str(" bytes)\n");
 
     // Everything below is READ FROM THE MACHINE. No address here is a constant, which is the whole
     // point: the same code says different, correct things on QEMU `virt` and on the JH7110.
@@ -391,8 +387,7 @@ riscv64: S-mode entered, 16550 UART alive
         print_hex(m.base);
         print_str(" + ");
         print_dec(m.size / (1024 * 1024));
-        print_str(" MiB
-");
+        print_str(" MiB\n");
     }
 
     let (harts, max_hart) = tree.usable_harts();
@@ -404,8 +399,7 @@ riscv64: S-mode entered, 16550 UART alive
         print_str(", fdt says boot cpu ");
         print_dec(c as u64);
     }
-    print_str("
-");
+    print_str("\n");
 
     // THE FOURTH BOOT PATH. `banner()` is the neutral kernel's identity line, and its own comment
     // says who calls it: "`kernel_main` on x86, and the two ARM `*_boot_main`s... three call sites
@@ -444,8 +438,7 @@ riscv64: S-mode entered, 16550 UART alive
         print_dec(props[0].unwrap_or(0) as u64);
         print_str(" width ");
         print_dec(props[1].unwrap_or(1) as u64);
-        print_str("
-");
+        print_str("\n");
     }
 
     let mut none = [];
@@ -454,8 +447,7 @@ riscv64: S-mode entered, 16550 UART alive
     {
         print_str("riscv64: plic ");
         print_hex(p.base);
-        print_str("
-");
+        print_str("\n");
     }
 
     // What the FIRMWARE says is off limits, reported separately from the map it feeds. Printed
@@ -473,8 +465,7 @@ riscv64: S-mode entered, 16550 UART alive
             print_str("+");
             print_hex(e.size);
         }
-        print_str("
-");
+        print_str("\n");
     }
 
     // The memory map the neutral kernel will be handed, printed before it is used. An allocator
@@ -496,8 +487,7 @@ riscv64: S-mode entered, 16550 UART alive
                 });
                 print_str(" (");
                 print_dec(r.len / 1024);
-                print_str(" KiB)
-");
+                print_str(" KiB)\n");
             }
 
             // ONE HART, IF THE BUILD ASKED FOR ONE. Clamped at DISCOVERY rather than anywhere later, so
@@ -542,8 +532,7 @@ riscv64: S-mode entered, 16550 UART alive
             IPI_PENDING.init_with(ap_count() + 1, |_| AtomicU32::new(0));
             print_str("riscv64: percpu arenas sized for ");
             print_dec((ap_count() + 1) as u64);
-            print_str(" core(s)
-");
+            print_str(" core(s)\n");
 
             // Publish this hart's id now the per-core arenas exist, so `current_core_id()` resolves
             // through a value the machine reported rather than a default. The board boots on hart 1,
@@ -595,8 +584,7 @@ riscv64: S-mode entered, 16550 UART alive
 
             crate::capability::init();
             crate::ipc::init();
-            print_str("riscv64: capability table and ipc routing initialised
-");
+            print_str("riscv64: capability table and ipc routing initialised\n");
 
             // EXERCISE THE WALKER BEFORE TRUSTING IT WITH `satp`. Writing that register is the one
             // step where a mistake gives no output at all: translation changes under the program
@@ -610,18 +598,15 @@ riscv64: S-mode entered, 16550 UART alive
             // is arranged so that WHICH LINE IS LAST tells you what failed.
             enable_paging(&bi);
         }
-        None => print_str("riscv64: could not build a memory map from the device tree
-"),
+        None => print_str("riscv64: could not build a memory map from the device tree\n"),
     }
 
     // Install the trap vector as early as there is a UART to report through. Everything before
     // this line faults silently; everything after it names itself.
     if trap::init() {
-        print_str("riscv64: trap vector installed - faults will report
-");
+        print_str("riscv64: trap vector installed - faults will report\n");
     } else {
-        print_str("riscv64: TRAP VECTOR REFUSED - handler address is not 4-byte aligned
-");
+        print_str("riscv64: TRAP VECTOR REFUSED - handler address is not 4-byte aligned\n");
     }
 
     probe_rdcycle();
@@ -835,8 +820,7 @@ riscv64: S-mode entered, 16550 UART alive
         print_str(", timer extension ");
         let has_timer = sbi::probe(sbi::EXT_TIME);
         print_str(if has_timer { "present" } else { "ABSENT" });
-        print_str("
-");
+        print_str("\n");
 
         // Reading `time` is the first thing this port does that the FIRMWARE can refuse: it is
         // permitted from S-mode only if `mcounteren` allows it. If it refuses, the trap vector
@@ -848,9 +832,7 @@ riscv64: S-mode entered, 16550 UART alive
         print_dec(t0);
         print_str(" -> ");
         print_dec(t1);
-        print_str(if t1 > t0 { "  (advancing)
-" } else { "  (NOT ADVANCING)
-" });
+        print_str(if t1 > t0 { "  (advancing)\n" } else { "  (NOT ADVANCING)\n" });
     }
 
 
@@ -861,16 +843,14 @@ riscv64: S-mode entered, 16550 UART alive
         if start_timer(hz) {
             print_str("riscv64: timer started, 10ms quantum from a ");
             print_dec(hz as u64);
-            print_str(" Hz timebase
-");
+            print_str(" Hz timebase\n");
             // Spin briefly so several ticks land before the fault ends the boot. A count, not a
             // duration - it is bounded and its only job is to let interrupts arrive.
             for _ in 0..40_000_000u64 {
                 core::hint::spin_loop();
             }
         } else {
-            print_str("riscv64: TIMER REFUSED - no TIME extension or set_timer failed
-");
+            print_str("riscv64: TIMER REFUSED - no TIME extension or set_timer failed\n");
         }
     }
 
@@ -2963,8 +2943,7 @@ pub fn publish_bsp_lapic_id() {
     set_hart_core(id, 0);
     print_str("riscv64: boot hart is ");
     print_dec(id as u64);
-    print_str(" (core 0)
-");
+    print_str(" (core 0)\n");
 }
 
 /// PCI config read, for the `hw-enumerator` SERVICE - the seam member, not the internal walk.
@@ -3494,8 +3473,7 @@ pub mod pci {
     pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
     /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.
     pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
-    pub fn program_xhci_msi() -> bool { false }
-    pub fn program_ehci_msi() -> bool { false }
+    pub fn program_ehci_msi(_core_id: u32) -> bool { false }
     pub fn route_ehci_intx() {}
 }
 
@@ -3643,8 +3621,7 @@ fn sv39_selftest() {
     use crate::memory::frame::PhysAddr;
 
     let Ok(mut pt) = PageTable::new() else {
-        print_str("riscv64: sv39 SELFTEST FAILED - no frame for a root table
-");
+        print_str("riscv64: sv39 SELFTEST FAILED - no frame for a root table\n");
         return;
     };
     // A virtual address in the user half, far from anything this kernel maps, and a physical frame
@@ -3654,13 +3631,11 @@ fn sv39_selftest() {
     let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER;
 
     if pt.map(va, pa, flags).is_err() {
-        print_str("riscv64: sv39 SELFTEST FAILED - map
-");
+        print_str("riscv64: sv39 SELFTEST FAILED - map\n");
         return;
     }
     let Some(pte) = sv39::translate(pt.cr3_value(), va.0) else {
-        print_str("riscv64: sv39 SELFTEST FAILED - mapped page does not translate
-");
+        print_str("riscv64: sv39 SELFTEST FAILED - mapped page does not translate\n");
         return;
     };
     let ok_addr = sv39::pte_phys(pte) == pa.0;
@@ -3679,8 +3654,7 @@ fn sv39_selftest() {
     print_str(if ok_user { "ok" } else { "BAD" });
     print_str(" unmap=");
     print_str(if ok_unmap { "ok" } else { "BAD" });
-    print_str("
-");
+    print_str("\n");
 }
 
 
@@ -3698,8 +3672,7 @@ fn sv39_selftest() {
 /// would mean the fault came before any of this, which is a different bug entirely.
 fn enable_paging(bi: &BootInfo) {
     let Some(root) = sv39::new_root() else {
-        print_str("riscv64: paging FAILED - no frame for the root table
-");
+        print_str("riscv64: paging FAILED - no frame for the root table\n");
         return;
     };
 
@@ -3719,18 +3692,15 @@ fn enable_paging(bi: &BootInfo) {
 
     print_str("riscv64: building identity map to ");
     print_hex(top);
-    print_str("
-");
+    print_str("\n");
     if sv39::identity_map_gigapages(root, top, bits).is_err() {
-        print_str("riscv64: paging FAILED - could not fill the root table
-");
+        print_str("riscv64: paging FAILED - could not fill the root table\n");
         return;
     }
 
     print_str("riscv64: enabling paging, satp root ");
     print_hex(root);
-    print_str("
-");
+    print_str("\n");
     // SAFETY: the table built above maps every address identically from zero to the top of RAM,
     // which includes the instruction stream executing this write and the stack it runs on. The
     // fence inside `write_page_table_base` discards translations from before the change.
@@ -3741,8 +3711,7 @@ fn enable_paging(bi: &BootInfo) {
     KERNEL_ROOT.store(root, Ordering::Relaxed);
 
     // Reaching here means the UART was reachable THROUGH the new table, not merely before it.
-    print_str("riscv64: paging on, sv39 active
-");
+    print_str("riscv64: paging on, sv39 active\n");
 }
 
 

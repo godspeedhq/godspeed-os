@@ -729,14 +729,6 @@ pub fn enqueue_from_kernel_blocking(
     }
 }
 
-/// Returns `true` if `endpoint` is registered and alive in the routing table.
-///
-/// Used by `invariants::assertions::assert_tcb_alive` (§6.2).
-pub fn is_endpoint_alive(endpoint: EndpointId) -> bool {
-    let table = TABLE.lock_irq();
-    table.iter().any(|e| e.valid && e.id == endpoint && e.liveness == EndpointLiveness::Alive)
-}
-
 /// Return the current queue depth for `endpoint`, or 0 if not found.
 pub fn endpoint_queue_depth(endpoint: EndpointId) -> u8 {
     let table = TABLE.lock_irq();
