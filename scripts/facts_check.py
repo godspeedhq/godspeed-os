@@ -20,10 +20,10 @@ WHAT IS DELIBERATELY NOT CHECKED. Dated evidence. `docs/ahci.md` recording "iden
 statement about a run in the past, and rewriting it would falsify the record - the same exemption
 `doc_refs.py` grants `audits/`. History states what WAS; only present-tense claims are checked.
 
-WHAT A PASS DOES NOT SAY. Each fact is added only when its source is FOUND (`if qd:`, `if ring:`,
-...; the seam size falls to 0 on any exception), so a constant that is renamed or moved silently drops
-its fact from the run instead of failing it. A pass means "every fact whose source still parses
-agrees", and the count printed is of matched doc statements, not of facts. A line carrying a date,
+A FACT WHOSE SOURCE IS GONE FAILS. Until 2026-10-10 each fact was added only when its source was FOUND
+(`if qd:`, `if ring:` ...), so a constant that was renamed or moved silently dropped its own fact and
+the run passed (backlog/80 T8). Now `facts()` records every source it could not read (`MISSING`) and
+the run fails on any. The count printed is of matched doc statements, not of facts. A line carrying a date,
 `Amendment`, `Verified:` or `was ... now` is skipped unless it is a STATUS line. When a code-versus-
 code check fails, its failures are printed and the doc facts are not reported on that run.
 
@@ -412,6 +412,17 @@ def budget_ordering_problems():
     return problems
 
 
+# A FACT WHOSE SOURCE CANNOT BE FOUND IS A FAILURE. Each fact used to be added only `if` its source
+# parsed (`if qd:`, `if ring:` ...), so renaming `QUEUE_DEPTH` removed its own check and the run still
+# passed, printing a smaller count nobody compares (backlog/80 T8). `facts()` records each source it
+# could not read here, and `main` fails on any.
+MISSING = []
+
+
+def lost(name, source):
+    MISSING.append((name, source))
+
+
 def facts():
     out = []
 
@@ -429,6 +440,8 @@ def facts():
         seam = len(_top) + sum(len(v) for v in _moded.values())
     except Exception:
         seam = 0
+    if not seam:
+        lost("arch::imp seam members", "scripts/arch_seam_check.py wanted()")
     if seam:
         out.append(("arch::imp seam members", seam,
                     "scripts/arch_seam_check.py wanted() - discovered from neutral-kernel usage",
@@ -436,6 +449,8 @@ def facts():
                      r"every one of the ([0-9]+) `arch::imp` members"]))
 
     ss_total, ss_kern = shared_surface()
+    if not ss_total:
+        lost("shared surface outside arch/", "SHARED-SURFACE.baseline.txt")
     if ss_total:
         out.append(("shared surface outside arch/", ss_total,
                     "SHARED-SURFACE.baseline.txt (scripts/shared_surface_check.py)",
@@ -459,6 +474,8 @@ def facts():
     #
     # A count nobody can be bothered to re-take is a count that should be derived. These are.
     util = count_files("utilities", "*.md") - 1          # 0_conventions.md is the rules, not a utility
+    if util <= 0:
+        lost("utility specs", "utilities/*.md")
     if util > 0:
         out.append(("utility specs", util, "utilities/*.md minus 0_conventions.md",
                     [r"one file each \(([0-9]+) \+ 0_conventions\)"]))
@@ -467,15 +484,21 @@ def facts():
     # because the first thing it does is send you to "fix" something correct.
     ex = len([d for d in os.listdir(os.path.join(ROOT, "examples"))
               if not d.startswith(".") and os.path.isdir(os.path.join(ROOT, "examples", d))])
+    if ex <= 0:
+        lost("worked examples", "directories under examples/")
     if ex > 0:
         out.append(("worked examples", ex, "directories under examples/",
                     [r"# ([0-9]+) worked services"]))
     dcount = count_files("docs", "*.md")
+    if dcount <= 0:
+        lost("design notes", "docs/*.md")
     if dcount > 0:
         out.append(("design notes", dcount, "docs/*.md",
                     [r"\(([0-9]+) files; the index lists them all\)"]))
 
     qd = const("kernel/src/ipc/queue.rs", "QUEUE_DEPTH")
+    if not qd:
+        lost("IPC queue depth", "kernel/src/ipc/queue.rs QUEUE_DEPTH")
     if qd:
         out.append(("IPC queue depth", qd, "kernel/src/ipc/queue.rs QUEUE_DEPTH",
                     [r"([0-9]+)-deep queue", r"queue depth (?:of|is|=)\s+([0-9]+)",
@@ -483,27 +506,39 @@ def facts():
 
     mm = const("kernel/src/ipc/message.rs", "MAX_MESSAGE_SIZE")
     mp = const("sdk/rust/src/ipc.rs", "MAX_PAYLOAD")
+    if not mm:
+        lost("kernel MAX_MESSAGE_SIZE", "kernel/src/ipc/message.rs MAX_MESSAGE_SIZE")
+    if not mp:
+        lost("SDK MAX_PAYLOAD", "sdk/rust/src/ipc.rs MAX_PAYLOAD")
     if mm and mp and mm != mp:
         out.append(("SDK MAX_PAYLOAD vs kernel MAX_MESSAGE_SIZE", mm,
                     "these two MUST be equal - a smaller SDK buffer is a stack smash", []))
 
     ring = const("services/events/src/main.rs", "RING")
+    if not ring:
+        lost("events trace ring", "services/events/src/main.rs RING")
     if ring:
         out.append(("events trace ring", ring, "services/events/src/main.rs RING",
                     [r"([0-9]+)-event (?:trace )?ring", r"ring of ([0-9]+) events"]))
 
     logb = const("services/events/src/main.rs", "LOG_BYTES")
+    if not logb:
+        lost("events log window", "services/events/src/main.rs LOG_BYTES")
     if logb:
         out.append(("events log window (KiB)", logb // 1024, "services/events/src/main.rs LOG_BYTES",
                     [r"([0-9]+) KiB log window"]))
 
     pieces = const("services/recorder/src/main.rs", "PIECES")
+    if not pieces:
+        lost("recorder rotation pieces", "services/recorder/src/main.rs PIECES")
     if pieces:
         out.append(("recorder rotation pieces", pieces, "services/recorder/src/main.rs PIECES",
                     [r"`?PIECES`? files rotate \(([0-9]+) today", r"rotates? between ([0-9]+) pieces"]))
 
     for nm in ("Log", "Call", "CallDeadline", "AcquireSendCap", "InspectKernel", "Kill"):
         v = enum_value("kernel/src/syscall/dispatch.rs", nm)
+        if not v:
+            lost("syscall %s" % nm, "kernel/src/syscall/dispatch.rs enum")
         if v:
             out.append(("syscall %s" % nm, v, "kernel/src/syscall/dispatch.rs enum",
                         [r"syscall\s+([0-9]+)\s*[-(]?\s*%s" % nm, r"%s\s*\(syscall\s+([0-9]+)\)" % nm]))
@@ -514,6 +549,8 @@ def facts():
     # reader happened to check it against the source. A number a doc restates is exactly what this
     # script is for, so it is pinned rather than merely corrected.
     mc = const("services/net-stack/src/tcp.rs", "MAX_CONNS")
+    if not mc:
+        lost("TCP connection table", "services/net-stack/src/tcp.rs MAX_CONNS")
     if mc:
         out.append(("TCP connection table", mc, "services/net-stack/src/tcp.rs MAX_CONNS",
                     [r"at most \*{0,2}([0-9]+) connections",
@@ -540,6 +577,8 @@ def facts():
     # checking itself.
     m = re.search(r"const\s+SUITES\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
                   read("osdev/src/main.rs"), re.S)
+    if not m:
+        lost("fs-all suites", "osdev/src/main.rs SUITES")
     if m:
         # STRIP THE COMMENTS FIRST. That list is more comment than data - each entry says why it is
         # there - and one of those comments contains the phrase "every fs suite" in quotes, which a
@@ -548,6 +587,8 @@ def facts():
         # records hitting with `.cargo`.
         body = re.sub(r"//[^\n]*", "", m.group(1))
         n_suites = len(re.findall(r'"[^"]+"', body))
+        if not n_suites:
+            lost("fs-all suites", "osdev/src/main.rs SUITES (empty)")
         if n_suites:
             out.append(("fs-all suites", n_suites, "osdev/src/main.rs SUITES",
                         [r"`osdev test fs-all`[^|]*?\(([0-9]+) suites",
@@ -560,6 +601,8 @@ def facts():
     # read as five. Only a construction inside the table counts, so the declaration is excluded
     # rather than the pattern being loosened.
     n_tear = len(re.findall(r"(?<!struct )\bTearCase\s*\{", read("osdev/src/shell_test.rs")))
+    if not n_tear:
+        lost("fs-tear operations", "osdev/src/shell_test.rs TearCase entries")
     if n_tear:
         out.append(("fs-tear operations", n_tear, "osdev/src/shell_test.rs TearCase entries",
                     [r"([0-9]+) operations, [0-9]+ tear points"]))
@@ -642,6 +685,18 @@ def main():
                         got = int(m.group(1))
                         if got != truth:
                             bad.append((name, source, rel, line_no, "says %d, code says %d" % (got, truth)))
+
+    if MISSING:
+        print("facts: %d fact(s) could not be checked - the source each reads from is gone:" % len(MISSING))
+        print()
+        for name, source in MISSING:
+            print("  %s" % name)
+            print("      expected in: %s" % source)
+        print()
+        print("A renamed or moved constant used to drop its fact from the run, and the run still")
+        print("passed. Point the fact at where the number lives now (in facts() in this file), or")
+        print("delete the fact AND every doc sentence that restates the number.")
+        return 1
 
     if tree:
         # NOT a porting.md header. This list collects six unrelated code-versus-code checks, and
