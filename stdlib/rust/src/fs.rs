@@ -592,9 +592,9 @@ impl<'a> Fs<'a> {
     ///
     /// `rights` is a mask of [`cap::READ`](crate::cap::READ), [`cap::WRITE`](crate::cap::WRITE) and
     /// [`cap::APPEND`](crate::cap::APPEND). **Check
-    /// [`File::rights`](crate::file::File::rights) on the result**: `fs` narrows rather than refuses
-    /// in one case - it will not mint a writable capability to a SEALED file, and hands back a
-    /// read-only one instead of a capability it could not honour.
+    /// [`File::rights`](crate::file::File::rights) on the result**: it is what the capability
+    /// carries, read from the kernel. `fs` narrows rather than refuses in one case - it will not mint
+    /// a writable capability to a SEALED file, and hands back a read-only one instead.
     ///
     /// # Why this borrows the handle
     ///
@@ -619,7 +619,14 @@ impl<'a> Fs<'a> {
         // The capability rode the reply as an EMBEDDED cap, not as payload bytes; the kernel placed
         // it in our table on receipt and it is ours to claim or leak.
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
-        Ok(crate::file::File::new(self, ctx, cap, rights))
+        // Record what the capability CARRIES, not what was asked: `fs` narrows a sealed file to
+        // read-only, and APPEND is a request flag that never becomes a kernel right. A slot the
+        // kernel cannot describe is no capability we can use (`backlog/80` G2).
+        let granted = match ctx.query_cap_rights(cap) {
+            Some(r) => (r as u8) & (crate::cap::READ | crate::cap::WRITE),
+            None => return Err(Error::Failed),
+        };
+        Ok(crate::file::File::new(self, ctx, cap, granted))
     }
 
     /// Rebuild the free-space bitmap from the file tree, and report what was found.

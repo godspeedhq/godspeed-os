@@ -598,19 +598,25 @@ impl<'c, 'n: 'c, 'a: 'n> Conn<'c, 'n, 'a> {
     /// a caller that wants more loops. Nothing here tells "nothing yet" from "the peer has gone":
     /// [`is_closed`](Conn::is_closed) reports only whether THIS handle was closed.
     ///
-    /// **Pass a buffer of at least 2048 bytes (known defect, 2026-10-09).** `net-stack` hands over
-    /// up to 2048 bytes per call and has already taken them off the connection; anything past
-    /// `buf.len()` is dropped here without an error.
+    /// Any buffer size works: the request tells `net-stack` how much `buf` holds, and it takes no
+    /// more than that off the connection, so nothing is read and then lost. One call moves at most
+    /// 2048 bytes. (Until 2026-10-10 it asked for everything and dropped what did not fit -
+    /// `backlog/80` G3.)
     ///
     /// **Authority:** this connection's `READ` right.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let cap = self.cap;
-        let r = self.lis.call(cap, RIGHT_READ, &[COP_RECV])?;
+        let max = buf.len().min(u16::MAX as usize) as u16;
+        let [lo, hi] = max.to_le_bytes();
+        let r = self.lis.call(cap, RIGHT_READ, &[COP_RECV, lo, hi])?;
         let b = r.payload_bytes();
         let data = if b.len() > 1 { &b[1..] } else { &[][..] };
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        Ok(n)
+        // More than was asked for is a peer that did not keep its side - said, not trimmed.
+        if data.len() > buf.len() {
+            return Err(Error::Malformed);
+        }
+        buf[..data.len()].copy_from_slice(data);
+        Ok(data.len())
     }
 
     /// Send bytes. Returns how many were ACCEPTED, which may be fewer than offered.

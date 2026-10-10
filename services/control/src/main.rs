@@ -46,7 +46,8 @@ fn execute(ctx: &ServiceContext, line: &str) {
                 ctx.log_fmt(format_args!("control: KILL {}", name));
                 match ctx.kill(name) {
                     Ok(()) => ctx.log_fmt(format_args!("control: {} killed", name)),
-                    Err(_) => ctx.log_fmt(format_args!("control: {} not found", name)),
+                    Err(godspeed_sdk::Error::NotFound) => ctx.log_fmt(format_args!("control: {} not found", name)),
+                    Err(_) => ctx.log_fmt(format_args!("control: {} not killed - refused (no service_control)", name)),
                 }
             }
             None => ctx.log("control: KILL missing name"),

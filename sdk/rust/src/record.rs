@@ -130,6 +130,9 @@ impl Table {
     /// Append a row (values in column order). Loud-bounded: extra rows set [`Table::overflow`].
     pub fn add_row(&mut self, vals: &[Value]) {
         if self.nrows >= REC_MAX_ROWS { self.overflow = true; return; }
+        // More values than columns is a row that does not fit, and says so like every other
+        // bound here; the extras were dropped silently until 2026-10-10 (`backlog/80` S7).
+        if vals.len() > self.ncols { self.overflow = true; }
         for (i, v) in vals.iter().take(self.ncols).enumerate() { self.rows[self.nrows][i] = *v; }
         self.nrows += 1;
     }

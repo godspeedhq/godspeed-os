@@ -20256,6 +20256,21 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             fail(ctx, "fcap: FAIL gs::cap let a READ-only capability write");
             ok = false;
         }
+        // An APPEND-only open: APPEND is a request to `fs`, never a kernel right, so the File must
+        // report WRITE alone and close under it. It recorded the mask ASKED for until 2026-10-10,
+        // and the kernel refused that close - `fs`'s slot stayed taken (`backlog/80` G2).
+        let mut gfs4 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let appended = match gfs4.open(GSCAP_PATH, gs::cap::WRITE | gs::cap::APPEND) {
+            Ok(ap) => ap.rights() == gs::cap::WRITE && ap.close().is_ok(),
+            Err(_) => false,
+        };
+        ctx.fs_tag.set(gfs4.tag());
+        if appended {
+            gs::io::println(ctx, "fcap: gs::cap an append-only file carries WRITE alone, and closes");
+        } else {
+            fail(ctx, "fcap: FAIL gs::cap an append-only file did not report WRITE alone, or would not close");
+            ok = false;
+        }
         let mut gfs3 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
         let _ = gfs3.delete(GSCAP_PATH);
         ctx.fs_tag.set(gfs3.tag());

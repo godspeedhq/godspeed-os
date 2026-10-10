@@ -5441,6 +5441,8 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
                    "gs::cap round-trips a file through the capability");
             check!(r.contains("gs::cap non-escalation holds"),
                    "gs::cap cannot widen rights - a READ cap is refused its write by the kernel");
+            check!(r.contains("gs::cap an append-only file carries WRITE alone, and closes"),
+                   "gs::file records the rights the cap CARRIES, and closes an append-only file (backlog/80 G2)");
             check!(r.contains("all file-capability checks passed"), "every file-cap property held");
         }
         None => { println!("file-cap: FAIL - fcap timed out"); fail += 1; }

@@ -4882,6 +4882,10 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
             }
             // The one worth retrying.
             DeadlineOutcomeInto::SendFailed => { last = "send failed"; }
+            // Delivered, and block-driver died holding it. Its respawn is a fresh instance with no
+            // reply to send late, and a block read, or a rewrite of the same sector, is safe to ask
+            // for twice - so this is retried exactly as `SendFailed` always retried it.
+            DeadlineOutcomeInto::PeerDied => { last = "block-driver died holding the request"; }
         }
     }
     ctx.log_fmt(format_args!(

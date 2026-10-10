@@ -3341,7 +3341,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Reading takes READ; sending takes WRITE. The kernel has already checked the
                     // cap carries `right`; this enforces that the OPERATION is within it, which is
                     // the `op <= right` check `fs` makes for files.
-                    COP_RECV if right & RIGHT_READ != 0 => tcpst.read(rid, &mut resp),
+                    // The caller may say how much it can take (`[COP_RECV, max:u16]`), and is given
+                    // no more: bytes read here leave the connection, so handing over more than the
+                    // caller's buffer holds would lose them (`backlog/80` G3). No length: all of it.
+                    COP_RECV if right & RIGHT_READ != 0 => {
+                        let max = match body {
+                            [lo, hi, ..] => (u16::from_le_bytes([*lo, *hi]) as usize).min(resp.len()),
+                            _ => resp.len(),
+                        };
+                        tcpst.read(rid, &mut resp[..max])
+                    }
                     COP_SEND if right & RIGHT_WRITE != 0 => {
                         let took = tcpst.write(rid, body);
                         // SHORT WRITES ARE REPORTED, not silently truncated. The send arena is
