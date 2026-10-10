@@ -4650,7 +4650,9 @@ impl BlockReply {
 }
 
 /// Latch for the one-shot stack-depth report inside `block_rpc`. Owned by this service and touched
-/// nowhere else, in the same shape `xhci` uses for `PROBE_FAILS`.
+/// nowhere else. (This cited xhci's probe-failure latch as its model; `xhci` moved its latches into loop-owned
+/// state on 2026-10-10, `backlog/80` D9. This one, and the peer-outage latches below, still live in
+/// statics because `block_rpc` is a free function with a dozen callers.)
 static STACK_DEPTH_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

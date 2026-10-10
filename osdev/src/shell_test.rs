@@ -1523,6 +1523,23 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // observe (live) - the full-screen view, which no suite ran until 2026-10-10. The audit read in the
+    // code that it could not start - `ctx.spawn_on("observe-live")`, through a kernel catalogue that
+    // holds only the supervisor (`backlog/80` V1) - and nothing had ever looked. It must paint a frame,
+    // and `q` must give the prompt back.
+    // -----------------------------------------------------------------------
+    send(&mut write_half, b"observe\r");
+    match collect_until(&buf, &mut cursor, b"system state", Duration::from_secs(20)) {
+        Some(r) => check!(!r.contains("failed to spawn"), "observe: the live view started and painted a frame (backlog/80 V1)"),
+        None    => { println!("shell-test: FAIL - observe: no live frame within 20 s (backlog/80 V1)"); fail += 1; }
+    }
+    send(&mut write_half, b"q");
+    match collect_until(&buf, &mut cursor, b"gsh> ", Duration::from_secs(10)) {
+        Some(_) => check!(true, "observe: q quits the live view and the prompt returns"),
+        None    => { println!("shell-test: FAIL - observe: q did not return the prompt"); fail += 1; }
+    }
+
+    // -----------------------------------------------------------------------
     // observe now: the table is ALIGNED.
     //
     // This is here, and not in selfcheck, because it CANNOT be there: `assert` needs a pipe, and

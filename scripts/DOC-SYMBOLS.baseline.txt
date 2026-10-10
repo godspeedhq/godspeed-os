@@ -52,6 +52,15 @@ snapped_by_output                  # backlog/37 post-mortem - DELETED by bbd2447
 take_output_snap                   # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
 drain_kernel_ring_buffer           # backlog/06, backlog/80 S7 - DELETED 2026-10-10 (a no-op stub); a record of a removal must name what was removed
 recv_log_message                   # backlog/06 - DELETED 2026-10-10 with it (unused); a record of a removal must name what was removed
+TIMED_OUT_ONCE                     # backlog/80 - DELETED 2026-10-10, ehci latch, now function-local (D9); a record of a removal must name what was removed
+PROBE_FAILS                        # backlog/80 - DELETED 2026-10-10, xhci latch, now loop-owned (D9); a record of a removal must name what was removed
+DIAG_HINT_SAID                     # backlog/80 - DELETED 2026-10-10, xhci latch, now loop-owned (D9); a record of a removal must name what was removed
+NO_DISK_LOGGED                     # backlog/80 - DELETED 2026-10-10, xhci msc latch, now a field on the disk record (D9); a record of a removal must name what was removed
+READ_FAIL_LOGGED                   # backlog/80 - DELETED 2026-10-10, xhci msc latch, now a field on the disk record (D9); a record of a removal must name what was removed
+feed_tx                            # backlog/80 - DELETED 2026-10-10, net-stack dead code (D11); a record of a removal must name what was removed
+last_ok                            # backlog/80 - DELETED 2026-10-10, dwc2 hid dead field (D11); a record of a removal must name what was removed
+stale_after                        # backlog/80 - DELETED 2026-10-10, dwc2 hid dead field (D11); a record of a removal must name what was removed
+POLL_FRAMES                        # backlog/80 - DELETED 2026-10-10, net-stack tcp dead constant (D11); a record of a removal must name what was removed
 NET_TXN_SECS                       # backlog/29 + docs/stdlib-design.md - RETIRED with the shell's hand-rolled net path; both are records of what it did
 drain_stale_net_replies            # backlog/29 post-mortem - REMOVED once the correlation tag made a pre-emptive drain unnecessary; the record must name what went
 fs_request_bounded                 # docs/stdlib-design.md 22 - DELETED by the dogfood; the table says what each commit removed and must name it
