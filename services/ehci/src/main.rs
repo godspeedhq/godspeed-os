@@ -31,6 +31,7 @@ use godspeed as gs;
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
+use core::cell::Cell;
 
 // EHCI capability registers (at the MMIO base; EHCI spec §2.2).
 const CAP_CAPLENGTH:  usize = 0x00; // u8  - bytes from base to the operational regs
@@ -215,8 +216,6 @@ const DATA_BUF:   usize = 0x200; // control-transfer data buffer
 /// It was `2_000_000_000` raw counter cycles - a duration only on the board it was worked out on, ~1 s
 /// at the T630's ~2 GHz. One second, now on every board (`gs::driver::wait`).
 const CTRL_XFER_WAIT: Budget = Budget::ms(1_000);
-/// One-shot guard for the control-transfer timeout notice.
-static TIMED_OUT_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 // qTD token bits.
 const QTD_ACTIVE: u32 = 1 << 7;
 const QTD_HALTED: u32 = 1 << 6;
@@ -261,7 +260,7 @@ const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
 /// across calls; the single QH is idle between them.
 fn control(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
-    op: usize, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
+    op: usize, said: &Cell<bool>, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
 ) -> Option<usize> {
     dma.zero();
 
@@ -279,8 +278,12 @@ fn control(
     dma.write32(QH_OFF + 0x04,
         (ep.addr as u32 & 0x7F) | (ep.speed << 12) | (1 << 14) | (1 << 15)
             | (ep.max_packet << 16) | c);
+    // Endpoint capabilities: Mult [31:30], Port Number [29:23], Hub Address [22:16] (EHCI 1.0
+    // 3.6.2; Linux `QH_HUBPORT` 0x3f800000, `QH_HUBADDR` 0x007f0000, and `qh_make` writes
+    // `ttport << 23`). This was `<< 22` until 2026-10-10, which put an odd port's low bit into the
+    // hub address's top bit and read every port one low (backlog/80 D1).
     dma.write32(QH_OFF + 0x08,
-        (1 << 30) | ((ep.hub_addr as u32 & 0x7F) << 16) | ((ep.port as u32 & 0x7F) << 22));
+        (1 << 30) | ((ep.hub_addr as u32 & 0x7F) << 16) | ((ep.port as u32 & 0x7F) << 23));
     dma.write32(QH_OFF + 0x0C, 0);
     dma.write32(QH_OFF + 0x10, setup_phys & !0x1F);
     dma.write32(QH_OFF + 0x14, 1);
@@ -365,7 +368,7 @@ fn control(
     // waiting and one that is eating the machine, and nothing in the log distinguished them - which
     // is why this took three attempts to place. Bounded to one line so an unplugged hub cannot
     // flood.
-    if !done && !TIMED_OUT_ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+    if !done && !said.replace(true) {
         ctx.log("ehci: a control transfer ran out its full budget (device gone?) - parking between polls");
     }
     let t_setup  = dma.read32(QTD_SETUP + 0x08);
@@ -396,10 +399,15 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         Some(d) => d,
         None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); return; }
     };
+    // Whether the control-transfer timeout has been said. Owned here, by the function that runs for
+    // the driver's whole life, rather than as a static (invariant 9, backlog/80 D9): a respawn is a
+    // fresh instance and says it again, which it should.
+    let said_cell = Cell::new(false);
+    let said = &said_cell;
 
     // E3b: device descriptor at the default address 0.
     let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
-    if control(ctx, mmio, &dma, op, &Ep::hs(0, 64), &setup, 18, true).is_none() { return; }
+    if control(ctx, mmio, &dma, op, said, &Ep::hs(0, 64), &setup, 18, true).is_none() { return; }
     let class = dma.read8(DATA_BUF + 4);
     let proto = dma.read8(DATA_BUF + 6); // hub: 0/1 = single-TT, 2 = multi-TT
     let mps0  = dma.read8(DATA_BUF + 7) as u32;
@@ -411,7 +419,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 
     // E3c: assign address 1.
     let setup = [0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]; // Set_Address(1)
-    if control(ctx, mmio, &dma, op, &Ep::hs(0, mps0), &setup, 0, false).is_none() {
+    if control(ctx, mmio, &dma, op, said, &Ep::hs(0, mps0), &setup, 0, false).is_none() {
         ctx.log("ehci: Set_Address failed"); return;
     }
     delay::hold_parked(ctx, RECOVERY); // SetAddress recovery (>= 2 ms)
@@ -419,21 +427,21 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 
     // Get the configuration descriptor (first 9 bytes) for bConfigurationValue.
     let setup = [0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x09, 0x00]; // Get_Descriptor(Config), 9
-    if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 9, true).is_none() {
+    if control(ctx, mmio, &dma, op, said, &Ep::hs(1, mps0), &setup, 9, true).is_none() {
         ctx.log("ehci: Get_Config failed"); return;
     }
     let cfgval = dma.read8(DATA_BUF + 5);
 
     // Set configuration.
     let setup = [0x00, 0x09, cfgval, 0x00, 0x00, 0x00, 0x00, 0x00]; // Set_Configuration
-    if control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 0, false).is_none() {
+    if control(ctx, mmio, &dma, op, said, &Ep::hs(1, mps0), &setup, 0, false).is_none() {
         ctx.log("ehci: Set_Configuration failed"); return;
     }
     ctx.log_fmt(format_args!("ehci: hub configured (cfg={})", cfgval));
 
     // Hub class descriptor → number of downstream ports.
     let setup = [0xA0, 0x06, 0x00, 0x29, 0x00, 0x00, 0x40, 0x00]; // Get_Descriptor(Hub 0x29), 64
-    let n = match control(ctx, mmio, &dma, op, &Ep::hs(1, mps0), &setup, 64, true) {
+    let n = match control(ctx, mmio, &dma, op, said, &Ep::hs(1, mps0), &setup, 64, true) {
         Some(n) => n,
         None => { ctx.log("ehci: Get_Hub_Descriptor failed"); return; }
     };
@@ -458,7 +466,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
     let mut failed_rescans = 0u32;
     const MAX_FAILED_RESCANS: u32 = 3;
     loop {
-        let (devs, ndev, any_failed) = scan_devices(ctx, mmio, &dma, op, mps0, nports);
+        let (devs, ndev, any_failed) = scan_devices(ctx, mmio, &dma, op, said, mps0, nports);
         if ndev == 0 {
             // A BOUND, where this used to be a binary choice between two wrong answers.
             //
@@ -482,7 +490,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
                 continue;
             }
             ctx.log("ehci: no boot keyboard/mouse attached - waiting for a connection");
-            wait_for_connection(ctx, mmio, &dma, op, mps0, nports);
+            wait_for_connection(ctx, mmio, &dma, op, said, mps0, nports);
             announce = true; // whatever connects after a wait is a real plug event
             failed_rescans = 0; // a real plug event starts a fresh episode
             continue;
@@ -507,13 +515,13 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 /// before resetting the next port is what lets two devices coexist.
 fn scan_devices(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
-    op: usize, mps0: u32, nports: u8,
+    op: usize, said: &Cell<bool>, mps0: u32, nports: u8,
 ) -> ([HidDev; MAX_HID], usize, bool) {
     // Power every downstream port (the hub does individual power switching), let
     // power settle, then enumerate each connected port.
     for port in 1..=nports {
         let setup = [0x23, 0x03, 0x08, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_POWER)
-        let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 0, false);
+        let _ = control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &setup, 0, false);
     }
     delay::hold_parked(ctx, RESET_HOLD); // power-on-to-power-good settle (generous)
 
@@ -524,7 +532,7 @@ fn scan_devices(
     for port in 1..=nports {
         // Status before reset.
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
-        if control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_none() { continue; }
+        if control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &setup, 4, true).is_none() { continue; }
         let status = dma.read16(DATA_BUF + 0);
         ctx.log_fmt(format_args!(
             "ehci: hub port {}: status={:#06x} connected={} low_speed={}",
@@ -555,14 +563,14 @@ fn scan_devices(
         for attempt in 1..=3u32 {
             delay::hold_parked(ctx, DEBOUNCE); // connect-debounce before reset
             let s = [0x23, 0x03, 0x04, 0x00, port, 0x00, 0x00, 0x00]; // Set_Feature(PORT_RESET)
-            let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 0, false);
+            let _ = control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &s, 0, false);
             delay::hold_parked(ctx, RESET_HOLD);
             let s = [0x23, 0x01, 0x14, 0x00, port, 0x00, 0x00, 0x00]; // Clear_Feature(C_PORT_RESET)
-            let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 0, false);
+            let _ = control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &s, 0, false);
             delay::hold_parked(ctx, RESET_HOLD); // generous post-reset recovery
 
             let s = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
-            let _ = control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &s, 4, true);
+            let _ = control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &s, 4, true);
             let pstat = dma.read16(DATA_BUF + 0);
 
             // A device that enables at high speed (status bit 10) after reset is
@@ -581,7 +589,7 @@ fn scan_devices(
             // Retry the descriptor read several times within this reset before
             // re-resetting: this keyboard's FIRST split SETUP after a reset
             // XactErrs, but a settle-and-retry on the same reset often succeeds.
-            if control_retry(ctx, mmio, dma, op, &kep, &dd, 18, true, 6).is_some() { got = true; break; }
+            if control_retry(ctx, mmio, dma, op, said, &kep, &dd, 18, true, 6).is_some() { got = true; break; }
             ctx.log_fmt(format_args!(
                 "ehci: hub port {} attempt {} failed (post-reset status={:#06x}) - re-resetting",
                 port, attempt, pstat));
@@ -618,7 +626,7 @@ fn scan_devices(
         // rule is "retry where the controller does not", NOT "every USB driver retries" - and the
         // 2026-09-27 evidence is that the same WiFi dongle enumerated cleanly on xhci twice while dwc2
         // needed a retry for it.
-        if control_retry(ctx, mmio, dma, op, &kep, &setup, 64, true, 5).is_none() {
+        if control_retry(ctx, mmio, dma, op, said, &kep, &setup, 64, true, 5).is_none() {
             ctx.log_fmt(format_args!(
                 "ehci: hub port {} config descriptor failed after 5 tries - skipping this device", port));
             any_failed = true;
@@ -665,7 +673,7 @@ fn scan_devices(
         }
         ctx.log_fmt(format_args!(
             "ehci: *** boot {} on hub port {} ***", if is_mouse { "MOUSE" } else { "KEYBOARD" }, port));
-        if setup_hid(ctx, mmio, dma, op, port, next_addr, cfg_val, iface, is_mouse) {
+        if setup_hid(ctx, mmio, dma, op, said, port, next_addr, cfg_val, iface, is_mouse) {
             devs[ndev] = HidDev { addr: next_addr, port, ep_num: ep_addr & 0x0F, is_mouse };
             ndev += 1;
             next_addr += 1;
@@ -692,7 +700,7 @@ fn scan_devices(
 /// transfers while nothing usable is attached.
 fn wait_for_connection(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
-    op: usize, mps0: u32, nports: u8,
+    op: usize, said: &Cell<bool>, mps0: u32, nports: u8,
 ) {
     // Returns Some(true/false) on a successful status read, None if the read
     // itself failed. Distinguishing "read failed (state unknown)" from "read OK,
@@ -702,7 +710,7 @@ fn wait_for_connection(
     // re-scanning forever. On a failed read we leave the snapshot untouched.
     let status = |port: u8| -> Option<bool> {
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
-        if control(ctx, mmio, dma, op, &Ep::hs(1, mps0), &setup, 4, true).is_some() {
+        if control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &setup, 4, true).is_some() {
             Some(dma.read16(DATA_BUF + 0) & 1 != 0)
         } else {
             None
@@ -747,10 +755,10 @@ fn wait_for_connection(
 /// transfers, which must all succeed before the keyboard is usable.
 fn control_retry(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
-    op: usize, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool, tries: u32,
+    op: usize, said: &Cell<bool>, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool, tries: u32,
 ) -> Option<usize> {
     for _ in 0..tries {
-        if let Some(n) = control(ctx, mmio, dma, op, ep, setup, data_len, in_dir) {
+        if let Some(n) = control(ctx, mmio, dma, op, said, ep, setup, data_len, in_dir) {
             return Some(n);
         }
         delay::hold_parked(ctx, RECOVERY); // let the TT settle before retrying
@@ -765,23 +773,23 @@ fn control_retry(
 /// SETUP must not abandon the device.
 fn setup_hid(
     ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
-    op: usize, port: u8, addr: u8, cfg_val: u8, iface: u8, is_mouse: bool,
+    op: usize, said: &Cell<bool>, port: u8, addr: u8, cfg_val: u8, iface: u8, is_mouse: bool,
 ) -> bool {
     let what = if is_mouse { "mouse" } else { "keyboard" };
     // Set_Address(addr) - issued while still at address 0.
     let s = [0x00, 0x05, addr, 0x00, 0x00, 0x00, 0x00, 0x00];
-    if control_retry(ctx, mmio, dma, op, &Ep::low(0, 8, 1, port), &s, 0, false, 5).is_none() {
+    if control_retry(ctx, mmio, dma, op, said, &Ep::low(0, 8, 1, port), &s, 0, false, 5).is_none() {
         ctx.log_fmt(format_args!("ehci: {} Set_Address failed (5 tries)", what)); return false;
     }
     delay::hold_parked(ctx, RECOVERY); // SetAddress recovery
     // Set_Configuration (at the new address).
     let s = [0x00, 0x09, cfg_val, 0x00, 0x00, 0x00, 0x00, 0x00];
-    if control_retry(ctx, mmio, dma, op, &Ep::low(addr, 8, 1, port), &s, 0, false, 5).is_none() {
+    if control_retry(ctx, mmio, dma, op, said, &Ep::low(addr, 8, 1, port), &s, 0, false, 5).is_none() {
         ctx.log_fmt(format_args!("ehci: {} Set_Configuration failed (5 tries)", what)); return false;
     }
     // HID Set_Protocol(boot=0) on the interface (bmRequestType 0x21, bRequest 0x0B).
     let s = [0x21, 0x0B, 0x00, 0x00, iface, 0x00, 0x00, 0x00];
-    if control_retry(ctx, mmio, dma, op, &Ep::low(addr, 8, 1, port), &s, 0, false, 5).is_none() {
+    if control_retry(ctx, mmio, dma, op, said, &Ep::low(addr, 8, 1, port), &s, 0, false, 5).is_none() {
         ctx.log_fmt(format_args!("ehci: {} Set_Protocol(boot) failed (5 tries)", what)); return false;
     }
     ctx.log_fmt(format_args!("ehci: {} configured (addr {}, cfg {}, boot protocol)", what, addr, cfg_val));
@@ -839,7 +847,7 @@ fn poll_devices(
             (devs[i].addr as u32 & 0x7F) | ((devs[i].ep_num as u32) << 8)
                 | (1 << 12) | (1 << 14) | h | (8 << 16)); // low speed, DTC, [head], mps 8, C=0
         dma.write32(qh + 0x08,
-            (1 << 30) | ((1u32 & 0x7F) << 16) | ((devs[i].port as u32 & 0x7F) << 22)); // Mult, hub 1, port
+            (1 << 30) | ((1u32 & 0x7F) << 16) | ((devs[i].port as u32 & 0x7F) << 23)); // Mult, hub 1, port [29:23]
         dma.write32(qh + 0x0C, 0);
         arm_int(dma, qh, 0);
     }
