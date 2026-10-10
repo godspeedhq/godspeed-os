@@ -200,8 +200,7 @@ fn handle_log(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
     // §3.1 (no ambient authority): control reaches the privileged log write only
-    // with a cap the lookup + scope check validated. Executable §3.1 checkpoint.
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    // with a cap the lookup + scope check validated.
 
     let len = msg_len as usize;
     if len == 0 || len > 256 { return -1; }
@@ -354,8 +353,7 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     };
 
     // §3.1 (no ambient authority): the send below requires a validated SEND cap,
-    // which the lookup above enforced. Executable §3.1 checkpoint.
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    // which the lookup above enforced.
 
     let my_slot = scheduler::current_task_slot();
 
@@ -448,8 +446,7 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
         Err(e) => return cap_err_to_i64(e),
     };
     // §3.1 (no ambient authority): the recv below requires a validated RECV cap,
-    // which the lookup above enforced. Executable §3.1 checkpoint.
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    // which the lookup above enforced.
     let endpoint_id = EndpointId(cap.resource_id.0);
 
     let buf_len = out_len as usize;
@@ -503,7 +500,6 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
     let endpoint_id = EndpointId(cap.resource_id.0);
 
     let buf_len = out_len as usize;
@@ -547,7 +543,6 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
     let endpoint_id = EndpointId(cap.resource_id.0);
 
     if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE { return -1; }
@@ -686,8 +681,7 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     };
 
     // §3.1 (no ambient authority): the send below requires a validated SEND cap,
-    // which the lookup above enforced. Executable §3.1 checkpoint.
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
+    // which the lookup above enforced.
 
     // Pass None for blocked_sender_slot - QueueFull is returned directly.
     match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, None) {
@@ -765,14 +759,6 @@ const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
 
 // Syscall: Spawn (7) / Kill (8) / AcquireSendCap (10).
 // ---------------------------------------------------------------------------
-
-/// UNUSED. These were the probe parameters `Spawn` carried in the UPPER 32 bits of `arg0`
-/// (`[55..48] flags  [47..32] probe mode  [31..16] core  [15..0] spawn cap slot`,
-/// `docs/probe-params-design.md`). The probe path is gone (see `handle_spawn`) and nothing reads
-/// these three constants any more.
-const SPAWN_FLAG_HAS_RECV:  u64 = 1 << 48;
-const SPAWN_FLAG_SMALL_MEM: u64 = 1 << 49;
-const SPAWN_FLAG_IS_PROBE:  u64 = 1 << 50;
 
 /// Upper bound on the name payload (`name` + NUL-separated peer names). It was 64, which held a
 /// name alone; a peer list needs more. Bounded and small (26.6) - the longest real payload is
@@ -1459,18 +1445,14 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     // *casual* `kill supervisor`/`restart supervisor` at the command layer (CORE_SERVICES); deliberate
     // chaos goes through `chaos kill-storm supervisor`.
     if crate::task::kill_by_name(name) {
-        // Now that the kill has completed and no kernel locks are held, verify the two
-        // invariants a kill is most likely to break:
-        //   §6.2 - no non-restartable task has died. That set is EMPTY since Phase 6 (the
-        //          supervisor is restartable), so `assert_tcb_alive` checks nothing today;
-        //          it stays as the hook should the set ever be non-empty again.
-        //   §7.8 - the cap table is still consistent (no cap carries a generation
-        //          beyond its resource's current generation). The generation bump
-        //          only ever moves resources forward, so all surviving caps stay
-        //          stale-or-current. This is an O(active-caps) walk; the kill path
-        //          is not a per-syscall hot path, so it is an acceptable home for
-        //          the §7.8 check (see invariants/CLAUDE.md).
-        crate::invariants::assertions::assert_tcb_alive();
+        // Now that the kill has completed and no kernel locks are held, verify the invariant a kill
+        // is most likely to break, §7.8: the cap table is still consistent (no cap carries a
+        // generation beyond its resource's current generation). The generation bump only ever moves
+        // resources forward, so all surviving caps stay stale-or-current. This is an O(active-caps)
+        // walk; the kill path is not a per-syscall hot path, so it is an acceptable home for the
+        // §7.8 check (see invariants/CLAUDE.md). (A §6.2 TCB-alive assertion sat beside it, over an
+        // EMPTY set since Phase 6 made the supervisor restartable - it checked nothing, and was
+        // deleted 2026-10-10, `backlog/80` K20.)
         crate::invariants::assertions::assert_cap_table_consistent();
         // If the caller killed ITSELF (a SERVICE_CONTROL holder self-terminating - e.g. `chaos` at the
         // end of a run, so it does not linger in `observe`), it is now Dead. Do NOT return into the dead
@@ -1778,7 +1760,6 @@ fn do_call(
     let recv_ep = EndpointId(recv_cap.resource_id.0);
 
     // §3.1 (no ambient authority): every leg below required a validated cap (SEND/GRANT/RECV).
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
     // 2. The buffer is in/out: read the request from it now (`req_len` bytes), write the reply back
     //    into it later (at most `reply_buf_cap`), so validate it for the larger of the two. `Call`
@@ -1929,7 +1910,6 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
     if !scheduler::current_task_holds_resource(RESOURCE_MINT_RESOURCE, Rights::WRITE) {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
     let owner = match scheduler::current_task_endpoint() {
         Some(e) => e.0, // delegated band tracks the owner endpoint as a raw u64
         None    => return -1, // a service with no endpoint cannot own resources
@@ -1992,7 +1972,6 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Some(o) => EndpointId(o), // u64 → the owner endpoint to route to
         None    => return ipc_err_to_i64(IpcError::EndpointDead), // resource freed
     };
-    crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
     // 2. Validate the embedded reply cap (GRANT) so the owner can reply (reply-cap pattern).
     let reply_cap = match scheduler::current_task_lookup_cap(reply_slot, Rights::GRANT) {

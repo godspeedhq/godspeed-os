@@ -280,7 +280,7 @@ amendment fixed:
    **What it does NOT buy, which is the part worth recording (§26.7).** Confinement bounds a
    driver's DMA **to memory**. It does not bound its interrupt reach, because the DMA page
    tables are not in that path. Whether a compromised confined driver could retarget its own
-   interrupt therefore depends on where its message lives, and `program_xhci_msi` tries both -
+   interrupt therefore depends on where its message lives, and the kernel's MSI programming at spawn tries both (legacy MSI, then MSI-X) -
    **and on the machine where confinement actually operates, it is the safe one:**
    - **Legacy MSI (capability 0x05)** keeps the address and data in **PCI configuration
      space**, which no service can write: `PCI_CFG` is a read authority and the kernel programs

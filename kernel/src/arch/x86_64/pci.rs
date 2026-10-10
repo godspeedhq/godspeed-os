@@ -45,12 +45,10 @@ const CONFIG_DATA: u16 = 0xCFC;
 /// `clear_bus_master`'s read-modify-write) atomic.
 static PCI_CONFIG_LOCK: SpinLock<()> = SpinLock::new(());
 
-// xHCI is PCI class 0x0C (serial-bus controller), subclass 0x03 (USB),
-// programming interface 0x30 (eXtensible Host Controller Interface).
+// USB host controllers are PCI class 0x0C (serial-bus controller), subclass 0x03 (USB); the
+// programming interface (0x20 EHCI, 0x30 xHCI) is only named in the scan's log line now.
 const CLASS_SERIAL_BUS: u8 = 0x0C;
 const SUBCLASS_USB: u8 = 0x03;
-const PROGIF_XHCI: u8 = 0x30;
-const PROGIF_EHCI: u8 = 0x20;
 
 // ---------------------------------------------------------------------------
 // THE GENERIC DEVICE TABLE (step D1) - what is on the bus, with NO opinion about it.
@@ -203,23 +201,12 @@ pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
 
 
 
-// AHCI is PCI class 0x01 (mass storage), subclass 0x06 (SATA), progif 0x01 (AHCI).
-const CLASS_MASS_STORAGE: u8 = 0x01;
-const SUBCLASS_SATA: u8 = 0x06;
-const PROGIF_AHCI: u8 = 0x01;
 
 
 // Network controller (PCI class 0x02) - the NIC. Networking Phase 0 (docs/networking.md) began as pure
 // identification; the userspace `nic-driver` now receives its MMIO BAR and IRQ at spawn from the
-// generic table (`nic()`), as `block-driver` gets the AHCI ABAR. (The AHCI constants above and
-// `PROGIF_EHCI` have no users left in this file.)
+// generic table (`nic()`), as `block-driver` gets the AHCI ABAR.
 const CLASS_NETWORK: u8 = 0x02;
-
-/// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) - the IOMMU device-table index.
-#[inline]
-pub fn make_bdf(bus: u8, dev: u8, func: u8) -> u32 {
-    ((bus as u32) << 8) | ((dev as u32) << 3) | (func as u32)
-}
 
 /// Write a 32-bit value to an I/O port.
 ///
@@ -1086,30 +1073,12 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
     false
 }
 
-/// Program the xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
-/// (P1, USB interrupts). No-op (returns false) if no xHCI was found. The controller's own
-/// interrupter must be enabled by the driver before any MSI actually fires (P2); this only
-/// sets up the message so it *can*. Call after `init()` and after the local APIC is up.
-///
-/// HAS NO CALLERS today: the xHCI's MSI is programmed at spawn by `task::pci_msi_vector`, through
-/// `msi_dest_lapic`.
-pub fn program_xhci_msi() -> bool {
-    let Some(dev) = xhci() else { return false };
-    let bdf = dev.bdf;
-    let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
-    let dest = usb_irq_dest_lapic(crate::task::XHCI_CORE);
-    // Prefer plain MSI; fall back to MSI-X only when the device offers no MSI (what `qemu-xhci` does).
-    // See `msi_ordering` above for WHY this order - it looks backwards against the usual advice and is
-    // not.
-    program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest)
-}
-
 /// The LAPIC id an allocated pool vector should be delivered to. Same rule as the named USB
 /// vectors: the core the owning driver is pinned to, so a device event wakes that core directly.
 pub fn msi_dest_lapic(core_id: u32) -> u8 { usb_irq_dest_lapic(core_id) }
 
 /// LAPIC id to deliver a USB controller's interrupt to: the core `driver_core` the owning driver is
-/// pinned to (`task::XHCI_CORE` / `task::EHCI_CORE`, the single source of truth). Delivering the IRQ to
+/// is pinned to (the core it was spawned on; `task::EHCI_CORE` for `ehci`). Delivering the IRQ to
 /// the driver's OWN core means a device event (a keypress) wakes that core directly out of its idle
 /// `hlt` and the wake stays core-local - no cross-core IPI or BSP scan, which an idle AP on this
 /// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if that core is not
@@ -1274,10 +1243,6 @@ pub fn init() {
                         "pci: {} at {:02x}:{:02x}.{} vendor={:#06x} MMIO={:#x} IRQ={}",
                         kind, bus, dev, func, vendor, mmio_base, irq
                     );
-                    // An empty branch: it once recorded every xHCI into an array, and the next line
-                    // once recorded the first EHCI. Both now come from the generic table above.
-                    if progif == PROGIF_XHCI {
-                    }
                 }
                 // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
                 // identify what NIC is present. Log EVERY one (recording is the generic table's job).

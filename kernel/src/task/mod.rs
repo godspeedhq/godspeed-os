@@ -758,7 +758,6 @@ impl HwClass {
 /// a keypress MSI must wake the driver's OWN core out of its idle `hlt` locally, because a cross-core
 /// wake to a halted AP is not serviced promptly on this hardware. Both sit on cores 2/3 (off core 1)
 /// because busy-polling two controllers on one core saturated it; when they block, that can relax.
-pub const XHCI_CORE: u32 = 2;
 pub const EHCI_CORE: u32 = 3;
 
 /// Is this a device class this kernel understands? 0 = none.

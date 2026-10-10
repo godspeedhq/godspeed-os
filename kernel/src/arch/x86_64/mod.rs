@@ -1063,22 +1063,6 @@ pub fn input_ready() -> bool {
     INPUT_READY.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Enable COM1 RX interrupts. **Has no caller, deliberately:** `main.rs` says it must NOT be called -
-/// the PIC stays fully masked and COM1 RX is polled from the core-0 timer tick (`uart_rx_poll`).
-///
-/// # Safety
-/// Must be called after serial_init and after the IDT is loaded with vector 36.
-pub unsafe fn uart_rx_enable() {
-    // Unmask IRQ 4 (COM1) on the master PIC.  mask_pic() left OCW1 = 0xFF.
-    // Clearing bit 4 enables IRQ 4; all other IRQs remain masked.
-    // SAFETY: PIC port I/O; must run after mask_pic() sets OCW1=0xFF.
-    unsafe {
-        let mask = inb(0x21);
-        outb(0x21, mask & 0xEF); // clear bit 4 (IRQ 4 = COM1)
-        outb(COM1 + 1, 0x01);    // IER: enable RX data available interrupt
-    }
-}
-
 /// Serialises the console input ring's PRODUCERS. There are two, on different cores and in
 /// different contexts: `uart_rx_drain_fifo` from the core-0 timer tick (or `uart_rx_drain_now`), and
 /// `console_push_byte` from a USB driver's syscall on any core. Unserialised, two of them could read

@@ -459,7 +459,6 @@ pub mod pci {
     pub fn set_power_d0(bdf: u32) {}
     pub fn xhci_bios_handoff() {}
     pub fn ehci_flr_probe() {}
-    pub fn program_xhci_msi() -> bool { false }
     pub fn program_ehci_msi() -> bool { false }
     pub fn route_ehci_intx() {}
 }
