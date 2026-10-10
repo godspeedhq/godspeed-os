@@ -164,6 +164,8 @@ pub struct Net<'a> {
     tag: u8,
     /// Fired once when a request lingers. See [`Net::with_notice`].
     notice: Option<&'a dyn Fn()>,
+    /// Where the keys a noticing wait reads (and does not act on) go - see [`Net::keeping`].
+    keep: Option<&'a dyn Fn(u8)>,
 }
 
 impl<'a> Net<'a> {
@@ -224,7 +226,7 @@ impl<'a> Net<'a> {
 
     /// Take a network handle. Cheap, allocates nothing, grants nothing.
     pub fn new(ctx: &'a ServiceContext) -> Net<'a> {
-        Net { ctx, tag: TAG_BASE, notice: None }
+        Net { ctx, tag: TAG_BASE, notice: None, keep: None }
     }
 
     /// A network handle that tells you when a call is taking a while.
@@ -239,7 +241,14 @@ impl<'a> Net<'a> {
     /// unreachable host waits the full deadline in silence. Losing that would have been a
     /// regression dressed up as a migration.
     pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Net<'a> {
-        Net { ctx, tag: TAG_BASE, notice: Some(notice) }
+        Net { ctx, tag: TAG_BASE, notice: Some(notice), keep: None }
+    }
+
+    /// Hand every key a noticing wait reads, other than a quit key, to `keep`, in order, instead of
+    /// discarding it - as [`Fs::keeping`](crate::fs::Fs::keeping) does (`backlog/80` H16).
+    pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Net<'a> {
+        self.keep = Some(keep);
+        self
     }
 
     /// Send `[tag, patience, body..]` and return the reply with the tag checked and stripped.
@@ -264,7 +273,7 @@ impl<'a> Net<'a> {
         req[1] = secs.clamp(0, 255) as u8;
         req[2..2 + body.len()].copy_from_slice(body);
         let r = call::request_within_notice(
-            self.ctx, "net-stack", &Message::from_bytes(&req[..2 + body.len()]), secs, self.notice)?;
+            self.ctx, "net-stack", &Message::from_bytes(&req[..2 + body.len()]), secs, self.notice, self.keep)?;
         // A reply whose tag does not match is the answer to a request we already gave up on. Reading
         // it as this one's is how a channel goes "out of step" and every later exchange answers the
         // question before.

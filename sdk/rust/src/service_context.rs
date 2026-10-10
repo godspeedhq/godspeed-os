@@ -1909,6 +1909,28 @@ impl ServiceContext {
         self.request_with_reply_keyhint(peer, msg, hint_after_secs, max_secs, Self::QUIT_KEYS, on_linger)
     }
 
+    /// [`Self::request_with_reply_qhint`] that HANDS BACK every key it reads that is not a quit key.
+    ///
+    /// A wait that watches the console for `q` has to read what is typed, and a key read is a key
+    /// taken: the plain form discards the rest, so whatever the operator typed ahead while it waited
+    /// was lost (`backlog/80` H16). This passes each one to `keep`, in order, for the caller to put
+    /// where its own input reader will find it first.
+    #[inline]
+    pub fn request_with_reply_qhint_keeping(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        on_linger: impl FnOnce(), keep: &dyn Fn(u8),
+    ) -> ReqOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_qhint_inner(
+            peer, msg, hint_after_secs, max_secs, Self::QUIT_KEYS, on_linger, |_| true, Some(keep));
+        self.trace_out(peer, op, match &out {
+            ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
+            ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
+            ReqOutcome::Timeout  => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
     /// The keys [`Self::request_with_reply_qhint`] leaves on: `q`, `Q` and Escape.
     pub const QUIT_KEYS: &'static [u8] = &[b'q', b'Q', 0x1b];
 
@@ -1923,7 +1945,7 @@ impl ServiceContext {
         leave_keys: &[u8], on_linger: impl FnOnce(),
     ) -> ReqOutcome {
         let op = self.trace_in(peer, msg);
-        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, |_| true);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, |_| true, None);
         self.trace_out(peer, op, match &out {
             ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
             ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
@@ -1948,7 +1970,7 @@ impl ServiceContext {
         mine: impl FnMut(&crate::ipc::Message) -> bool,
     ) -> ReqOutcome {
         let op = self.trace_in(peer, msg);
-        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine, None);
         self.trace_out(peer, op, match &out {
             ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
             ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
@@ -2595,6 +2617,7 @@ impl ServiceContext {
         leave_keys: &[u8],
         on_linger: impl FnOnce(),
         mut mine: impl FnMut(&crate::ipc::Message) -> bool,
+        keep: Option<&dyn Fn(u8)>,
     ) -> ReqOutcome {
         // Drain any stale reply a prior INSTANT-abort left in our endpoint (see the abortable variant).
         while self.try_recv().is_some() {}
@@ -2637,6 +2660,8 @@ impl ServiceContext {
             }
             while let Some(b) = self.try_console_read() {
                 if leave_keys.contains(&b) { return ReqOutcome::Aborted; }
+                // Not a leave key: the operator's typing, handed back when the caller can keep it.
+                if let Some(k) = keep { k(b); }
             }
             let elapsed = self.epoch_secs_monotonic() - t0;
             if elapsed >= hint_after_secs {
@@ -3095,7 +3120,10 @@ impl ServiceContext {
     pub fn inspect_core_count(&self) -> u32 {
         // SAFETY: syscall(13) = InspectKernel; query_id=8.
         let ret = unsafe { raw_syscall(13, 8, 0, 0) };
-        if ret <= 0 { 1 } else { ret as u32 }
+        // A refusal or an error is NOT "one core": it said 1 until 2026-10-10, so a caller without
+        // INTROSPECT reported a one-core machine (`backlog/80` H20). 0 is "the kernel did not say", and
+        // a caller must not present it as a count.
+        if ret <= 0 { 0 } else { ret as u32 }
     }
 
     /// Terminal geometry as `(rows, cols)` text cells, or `(0, 0)` if it cannot be determined.
@@ -4081,7 +4109,12 @@ impl ServiceContext {
     /// can still spawn anything the kernel still owns - which is `supervisor` alone now.
     pub fn spawn_on(&self, name: &str, core: u32) -> Result<(), crate::Error> {
         if self.find_send_slot("supervisor").is_some() {
-            return self.spawn_via_supervisor(name, core, &[]).map(|_| ());
+            // The supervisor hands back a cap to the new service's endpoint. This path does not keep
+            // it, so it is released here - `map(|_| ())` dropped the handle and leaked one table slot per
+            // spawn (`backlog/80`, found during H20).
+            return self.spawn_via_supervisor(name, core, &[]).map(|cap| {
+                if let Some(c) = cap { self.remove_cap(c); }
+            });
         }
         self.spawn_on_kernel(name, core)
     }

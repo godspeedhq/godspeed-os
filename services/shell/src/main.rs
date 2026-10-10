@@ -19033,7 +19033,7 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 #[inline(always)]
 fn ask_with_quit_notice(ctx: &ServiceContext, peer: &str, msg: &Message, max_secs: i64) -> ReqOutcome {
     let notice = || gs::io::println(ctx, "  [q] quit");
-    match gs::call::request_within_notice(ctx, peer, msg, max_secs, Some(&notice)) {
+    match gs::call::request_within_notice(ctx, peer, msg, max_secs, Some(&notice), None) {
         Ok(r) => ReqOutcome::Reply(r),
         Err(gs::Error::Cancelled) => ReqOutcome::Aborted,
         // With a notice, `gs` answers OutcomeUnknown for the deadline (and for a send that never left,

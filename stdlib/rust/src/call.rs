@@ -133,14 +133,23 @@ pub const NOTICE_AFTER_SECS: i64 = 2;
 /// Without it the shell cannot move onto this library without losing that affordance, which would
 /// have been a real regression dressed up as a migration.
 #[inline]
+///
+/// `keep`, when given, receives every key the wait reads that is not a quit key, in order. A wait
+/// that watches for `q` has to read the console, and without it whatever the operator typed ahead
+/// is lost (`backlog/80` H16).
 pub fn request_within_notice(
     ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64, notice: Option<&dyn Fn()>,
+    keep: Option<&dyn Fn(u8)>,
 ) -> Result<Message, Error> {
     let notice = match notice {
         None => return request_within(ctx, peer, msg, secs),
         Some(f) => f,
     };
-    match ctx.request_with_reply_qhint(peer, msg, NOTICE_AFTER_SECS, secs, || notice()) {
+    let out = match keep {
+        Some(k) => ctx.request_with_reply_qhint_keeping(peer, msg, NOTICE_AFTER_SECS, secs, || notice(), k),
+        None => ctx.request_with_reply_qhint(peer, msg, NOTICE_AFTER_SECS, secs, || notice()),
+    };
+    match out {
         ReqOutcome::Reply(r) => Ok(r),
         // `ReqOutcome` does not separate a failed send from a passed deadline the way
         // `DeadlineOutcome` does, so the retry `request_within` performs cannot be done safely here:
