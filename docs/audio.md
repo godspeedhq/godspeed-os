@@ -1465,3 +1465,7 @@ Pi 4 a log line costs about 10 ms, consistent with the kernel's serial path, whe
 puts queued lines on the wire at 115200 baud (an inference from that code, not measured separately).
 The fix is the order - fill first, log after. Why the Pi 2 never showed it was not checked; the same
 order was wrong there, so its log line must cost under the guard's 6 ms.
+
+**Confirmed on the Pi 4 (same day, `3ac042c2`):** three tones, 5 s, 5 s and 2 s, each `0 underrun(s)`, and
+no `pwm-audio: underrun` line. Each also finished closer to its length - 5008 ms by the clock where it was
+5017, 2008 where it was 2014 - about the 10 ms the log line cost before the first fill, which is likely but not shown.
