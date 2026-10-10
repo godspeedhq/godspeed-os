@@ -2691,7 +2691,10 @@ const NET_FRAME_MAX: usize = 1600;
 /// `DEVICE_POWER_RESOURCE` + WRITE, which is minted only to a service granted a fixed peripheral window
 /// whose device the arch layer can power - so the device is identified by the GRANT, through the device
 /// KIND this task was granted, never by an argument or a name. Returns 0 only when the pin reads back at
-/// the level asked for, -1 otherwise (no power control for that device, or a request that did not take).
+/// the level asked for, -1 otherwise (no power control for that device, or a request that did not take),
+/// and `CapNotHeld` (-2) without the capability. That refusal returned the enum's discriminant, 0 - the
+/// documented SUCCESS - until 2026-10-10 (`backlog/80` K3); so did CpuClock's (read as 0 Hz) and
+/// PciCfgRead's (read as a config word of 0).
 ///
 /// WHY THIS IS MECHANISM AND NOT A SEVENTH RESPONSIBILITY: the kernel already owns the device grant
 /// (§12.3), and a grant includes power - it powers the Pi 4's SD domain at boot before the radio's
@@ -2700,7 +2703,7 @@ const NET_FRAME_MAX: usize = 1600;
 fn handle_device_power(on: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::DEVICE_POWER_RESOURCE, Rights::WRITE) {
         crate::kprintln!("device-power: refused - caller does not hold DEVICE_POWER");
-        return CapError::CapNotHeld as i64;
+        return cap_err_to_i64(CapError::CapNotHeld);
     }
     // BY THE DEVICE KIND THIS TASK WAS GRANTED, not by its name: this resolved the pin from the caller's
     // name, so any task called `wifi-driver` that held the capability reached the radio's power pin.
@@ -2717,8 +2720,9 @@ fn handle_device_power(on: u64) -> i64 {
 }
 
 /// CpuClock (55): `arg0` = 0 for the platform's minimum Arm clock, 1 for its maximum. Gated by
-/// `CPU_CLOCK_RESOURCE` + WRITE. Returns the rate the cores read back afterwards, in Hz, or -1 where this
-/// machine gives the OS no control over its clock (every port but the Pi 4 today).
+/// `CPU_CLOCK_RESOURCE` + WRITE. Returns the rate the cores read back afterwards, in Hz, -1 where this
+/// machine gives the OS no control over its clock (every port but the Pi 4 today), or `CapNotHeld` (-2)
+/// without the capability.
 ///
 /// MECHANISM, NOT A SEVENTH RESPONSIBILITY: the kernel already owns the firmware mailbox - the SD power,
 /// the GPIO expander, the radio's power cut - and this is one more request on it. Only two rates are on
@@ -2727,7 +2731,7 @@ fn handle_device_power(on: u64) -> i64 {
 fn handle_cpu_clock(max: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::CPU_CLOCK_RESOURCE, Rights::WRITE) {
         crate::kprintln!("cpu-clock: refused - caller does not hold CPU_CLOCK");
-        return CapError::CapNotHeld as i64;
+        return cap_err_to_i64(CapError::CapNotHeld);
     }
     match crate::arch::imp::cpu_clock(max != 0) {
         Some(hz) => hz as i64,
@@ -2753,7 +2757,7 @@ fn handle_pci_cfg_read(sel: u64, offset: u64) -> i64 {
     if !scheduler::current_task_holds_resource(crate::capability::PCI_CFG_RESOURCE, Rights::READ) {
         crate::kprintln!("pci-cfg: read sel {:#010x} refused - caller does not hold PCI_CFG",
                          sel as u32);
-        return CapError::CapNotHeld as i64;
+        return cap_err_to_i64(CapError::CapNotHeld);
     }
     // The access, its lock and its admissibility check live in `arch` beside the registers they
     // guard, so the check and the I/O cannot drift apart and this file needs no `unsafe`
