@@ -7182,8 +7182,11 @@ fn cmd_whatis(ctx: &ServiceContext, name: &str, out: &mut Out) -> Result<(), She
 /// The percentage is computed in hundredths (two decimals, integer math) so the
 /// microkernel's tiny footprint shows as e.g. 0.03% rather than rounding to 0%.
 fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    let total = ctx.inspect_kernel_total_frames();
-    let free = ctx.inspect_kernel_free_frames();
+    // Refused is said, never drawn as an empty machine (`backlog/80` K18).
+    let (Some(total), Some(free)) = (ctx.inspect_kernel_total_frames(), ctx.inspect_kernel_free_frames()) else {
+        out.line(ctx, "mem: unknown - the kernel did not answer (this needs INTROSPECT)");
+        return Err(ShellError::Unknown);
+    };
     let used = total.saturating_sub(free);
     let pct_h = if total > 0 { used * 10000 / total } else { 0 }; // 0.01% units
     out.line_fmt(ctx, format_args!(
@@ -7262,7 +7265,13 @@ fn cmd_cores(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     let ncores = (n as usize).min(MAXC);
     let mut before = [0u64; MAXC];
     for c in 0..ncores {
-        before[c] = ctx.inspect_core_total_ticks(c as u32);
+        match ctx.inspect_core_total_ticks(c as u32) {
+            Some(v) => before[c] = v,
+            None => {
+                gs::io::println(ctx, "cores ticks: unknown - the kernel did not answer (this needs INTROSPECT)");
+                return Err(ShellError::Unknown);
+            }
+        }
     }
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     out.line_fmt(ctx, format_args!("sampling {}s (RTC-paced)...  [q] quit", SAMPLE_SECS));
@@ -7282,8 +7291,10 @@ fn cmd_cores(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     // integer division would flatten to a bare "0" and hide the very signal being measured.
     out.line(ctx, "core  quanta/s  sampled   (quantum = timer tick OR yield)");
     for c in 0..ncores {
+        // Answered before the sample, so answered now; `before` again if not, a delta of none.
         let delta = ctx
             .inspect_core_total_ticks(c as u32)
+            .unwrap_or(before[c])
             .saturating_sub(before[c]);
         out.line_fmt(
             ctx,
@@ -7533,8 +7544,10 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
     use godspeed_sdk::service_context::{hwclass, supcmd};
     f.n = 0;
     f.cores = ctx.inspect_core_count();
-    f.total_frames = ctx.inspect_kernel_total_frames();
-    f.free_frames = ctx.inspect_kernel_free_frames();
+    // 0 frames is impossible on a running machine, so a refusal (no INTROSPECT) is recorded as 0 and
+    // every view of it prints "unknown" (`backlog/80` K18).
+    f.total_frames = ctx.inspect_kernel_total_frames().unwrap_or(0);
+    f.free_frames = ctx.inspect_kernel_free_frames().unwrap_or(0);
 
     // cpu: the cores the kernel brought up.
     for c in 0..f.cores.min(16) {
@@ -7555,7 +7568,11 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
     r.kind = HwText::of(format_args!("system RAM"));
     r.driver = HwText::of(format_args!("kernel"));
     r.state = "in use";
-    r.detail = HwText::of(format_args!("{} MiB total, {} MiB free", f.total_frames / 256, f.free_frames / 256));
+    r.detail = if f.total_frames == 0 {
+        HwText::of(format_args!("size unknown - the kernel did not answer (this needs INTROSPECT)"))
+    } else {
+        HwText::of(format_args!("{} MiB total, {} MiB free", f.total_frames / 256, f.free_frames / 256))
+    };
     f.push(r);
 
     // Which service the supervisor runs for which device (`supcmd::DEVICES`).
@@ -7873,7 +7890,9 @@ fn hw_unknown(ctx: &ServiceContext, out: &mut Out, name: &str) -> Result<(), She
 fn hw_print(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8, explicit: bool) {
     if !explicit {
         let mib = f.total_frames / 256;
-        if mib >= 1024 {
+        if mib == 0 {
+            out.line_fmt(ctx, format_args!("{} - {} core(s), memory unknown", ARCH, CoreCount(f.cores)));
+        } else if mib >= 1024 {
             out.line_fmt(ctx, format_args!("{} - {} core(s), {} GiB", ARCH, CoreCount(f.cores), (mib + 512) / 1024));
         } else {
             out.line_fmt(ctx, format_args!("{} - {} core(s), {} MiB", ARCH, CoreCount(f.cores), mib));
@@ -8160,10 +8179,12 @@ fn hw_cpu_debug(ctx: &ServiceContext, out: &mut Out) {
     let cores = ctx.inspect_core_count();
     out.line_fmt(ctx, format_args!("cores      {} ready", CoreCount(cores)));
     for core in 0..cores {
-        let active = ctx.inspect_core_active_ticks(core);
-        let total = ctx.inspect_core_total_ticks(core);
-        let busy = if total > 0 { active * 100 / total } else { 0 };
         let label = HwText::<8>::of(format_args!("core {}", core));
+        let (Some(active), Some(total)) = (ctx.inspect_core_active_ticks(core), ctx.inspect_core_total_ticks(core)) else {
+            out.line_fmt(ctx, format_args!("{:<10} unknown - the kernel did not answer (this needs INTROSPECT)", label.as_str()));
+            continue;
+        };
+        let busy = if total > 0 { active * 100 / total } else { 0 };
         // QUANTA, not time: the kernel counts a timer tick AND every yield, so a core whose tasks yield
         // a lot counts faster. The ratio is what it is for - how much of its scheduling went to a task.
         out.line_fmt(ctx, format_args!("{:<10} {} scheduler quanta, {} given to a task ({}%)", label.as_str(), total, active, busy));
@@ -8438,7 +8459,11 @@ fn hw_tree(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
     let mib = f.total_frames / 256;
     out.line_fmt(ctx, format_args!("machine  {}", ARCH));
     out.line_fmt(ctx, format_args!("|- cpu       {} core(s)", CoreCount(f.cores)));
-    out.line_fmt(ctx, format_args!("|- memory    {} MiB", mib));
+    if mib == 0 {
+        out.line(ctx, "|- memory    unknown");
+    } else {
+        out.line_fmt(ctx, format_args!("|- memory    {} MiB", mib));
+    }
     // Roots: every device with no parent, grouped under its section.
     for sec in ["pci", "soc", "display", "usb"] {
         let roots = (0..f.n).filter(|&i| f.rows[i].section == sec && parent[i].is_none()).count();
@@ -15443,7 +15468,8 @@ fn build_endpoints_table(ctx: &ServiceContext) -> Table {
     for slot in 0u32..256 {
         let st = ctx.task_stat(slot);
         if !st.valid || st.state == 4 { continue; }
-        let ep = ctx.task_own_endpoint(slot);
+        // 0 is "no endpoint"; a refusal (no INTROSPECT) reads the same, and task_stat above is refused too.
+        let ep = ctx.task_own_endpoint(slot).unwrap_or(0);
         if ep == 0 { continue; }   // a task with no endpoint cannot be talked to; nothing to list
         let name  = t.intern(&st.name[..st.name_len.min(31)]);
         let state = t.intern(st.state_str().as_bytes());
@@ -16362,7 +16388,7 @@ fn trace_owner_of(ctx: &ServiceContext, endpoint: u64) -> Option<u32> {
     for slot in 0..TRACE_SLOTS {
         let s = ctx.task_stat(slot);
         if !s.valid { continue; }
-        if ctx.task_own_endpoint(slot) == endpoint { return Some(slot); }
+        if ctx.task_own_endpoint(slot) == Some(endpoint) { return Some(slot); }
     }
     None
 }
@@ -16385,7 +16411,7 @@ fn trace_blocked(ctx: &ServiceContext) -> Result<(), ShellError> {
     for slot in 0..TRACE_SLOTS {
         let s = ctx.task_stat(slot);
         if !s.valid { continue; }
-        let awaits = ctx.task_awaits_endpoint(slot);
+        let awaits = ctx.task_awaits_endpoint(slot).unwrap_or(0);   // 0 = awaits nothing
         // A task blocked on RECV with nothing awaited is IDLE, not stuck - it is waiting for work,
         // which is what a healthy service does all day. Listing those would bury the handful that
         // matter under every service on the machine.
@@ -16433,7 +16459,7 @@ fn trace_chain(ctx: &ServiceContext, root: u32) -> Result<(), ShellError> {
     loop {
         let st = ctx.task_stat(cur);
         if !st.valid { break; }
-        let awaits = ctx.task_awaits_endpoint(cur);
+        let awaits = ctx.task_awaits_endpoint(cur).unwrap_or(0);   // 0 = awaits nothing
         let name = core::str::from_utf8(&st.name[..st.name_len.min(31)]).unwrap_or("?");
         let pad = [b' '; 48];
         let ind = (depth * 3).min(pad.len());
@@ -18238,8 +18264,12 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     }
     let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
 
-    let total    = ctx.inspect_kernel_total_frames();
-    let baseline = ctx.inspect_kernel_free_frames();
+    // The storm's verdict IS a memory measurement, so without the figures it does not run
+    // (`backlog/80` K18: they read as 0, and "0 below baseline" would have passed).
+    let (Some(total), Some(baseline)) = (ctx.inspect_kernel_total_frames(), ctx.inspect_kernel_free_frames()) else {
+        gs::io::println(ctx, "chaos mem-pressure: cannot measure memory - the kernel did not answer (this needs INTROSPECT)");
+        return Err(ShellError::Unknown);
+    };
 
     gs::io::println_fmt(ctx, format_args!(
         "chaos mem-pressure: {} rounds - spawn mem-pressure (allocs to its limit), then kill it and confirm the memory returns...", rounds));
@@ -18257,7 +18287,7 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
         let mut low = baseline;
         loop {
             gs::task::yield_now(ctx);
-            let f = ctx.inspect_kernel_free_frames();
+            let f = ctx.inspect_kernel_free_frames().unwrap_or(0);
             if f < low { low = f; }
             if baseline.saturating_sub(low) >= MEM_DROP_MIN { break; }
             if gs::task::epoch_secs_monotonic(ctx) - t0 >= MEM_WAIT_SECS { break; }
@@ -18271,7 +18301,7 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
         let mut hi = low;
         loop {
             gs::task::yield_now(ctx);
-            let f = ctx.inspect_kernel_free_frames();
+            let f = ctx.inspect_kernel_free_frames().unwrap_or(0);
             if f > hi { hi = f; }
             if hi + MEM_SLACK >= baseline { break; }
             if gs::task::epoch_secs_monotonic(ctx) - t1 >= MEM_WAIT_SECS { break; }
@@ -18350,8 +18380,12 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
     while i < ntok { if let Some(n) = parse_u32(tok[i]) { count = n; } i += 1; }
     let count = count.clamp(1, SPAWN_STORM_MAX);
 
-    let total       = ctx.inspect_kernel_total_frames();
-    let baseline    = ctx.inspect_kernel_free_frames();
+    // The storm's verdict IS a memory measurement, so without the figures it does not run
+    // (`backlog/80` K18: they read as 0, and "0 below baseline" would have passed).
+    let (Some(total), Some(baseline)) = (ctx.inspect_kernel_total_frames(), ctx.inspect_kernel_free_frames()) else {
+        gs::io::println(ctx, "chaos spawn-storm: cannot measure memory - the kernel did not answer (this needs INTROSPECT)");
+        return Err(ShellError::Unknown);
+    };
     let live_before = count_live(ctx);
 
     gs::io::println_fmt(ctx, format_args!(
@@ -18363,7 +18397,7 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
     let mut aborted   = false;
     for n in 0..count {
         if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { aborted = true; break; } }
-        let before = ctx.inspect_kernel_free_frames();   // free frames before this hog allocates
+        let before = ctx.inspect_kernel_free_frames().unwrap_or(0);   // free frames before this hog allocates
         if ctx.spawn("mem-pressure").is_err() {
             refused_at = n + 1;   // the ceiling held - graceful refusal, no panic
             break;
@@ -18374,12 +18408,12 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
         let t = gs::task::epoch_secs_monotonic(ctx);
         loop {
             gs::task::yield_now(ctx);
-            if before.saturating_sub(ctx.inspect_kernel_free_frames()) >= SPAWN_DROP_MIN { break; }
+            if before.saturating_sub(ctx.inspect_kernel_free_frames().unwrap_or(before)) >= SPAWN_DROP_MIN { break; }
             if gs::task::epoch_secs_monotonic(ctx) - t >= SPAWN_SETTLE_SECS { break; }
         }
     }
 
-    let low       = ctx.inspect_kernel_free_frames();   // memory floor under the swarm
+    let low       = ctx.inspect_kernel_free_frames().unwrap_or(0);   // memory floor under the swarm
     let live_peak = count_live(ctx);
     let hogs_peak = count_named(ctx, "mem-pressure");
 
@@ -18403,7 +18437,7 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
     let mut hi = low;
     loop {
         gs::task::yield_now(ctx);
-        let f = ctx.inspect_kernel_free_frames();
+        let f = ctx.inspect_kernel_free_frames().unwrap_or(0);
         if f > hi { hi = f; }
         if hi + RECLAIM_SLACK >= baseline { break; }
         if gs::task::epoch_secs_monotonic(ctx) - t0 >= RECLAIM_SECS { break; }

@@ -2889,10 +2889,12 @@ impl ServiceContext {
     /// Return the count of live endpoints in the kernel routing table.
     ///
     /// Wraps InspectKernel query 1 (INTROSPECT-gated; 0 when refused). Used by property test P5 (§8.3).
-    pub fn inspect_kernel_endpoint_count(&self) -> u32 {
+    pub fn inspect_kernel_endpoint_count(&self) -> Option<u32> {
         // SAFETY: syscall(13) = InspectKernel; query_id=1 = live endpoint count.
         let ret = unsafe { raw_syscall(13, 1, 0, 0) };
-        if ret < 0 { 0 } else { ret as u32 }
+        // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
+        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        if ret < 0 { None } else { Some(ret as u32) }
     }
 
     /// Capacity of the in-kernel USB mass-storage device in 512-byte sectors, 0 if none is attached.
@@ -3024,19 +3026,23 @@ impl ServiceContext {
     ///
     /// Wraps InspectKernel query 4. Queries 4-8 are INTROSPECT-gated, and these wrappers read a
     /// refusal as 0 (or, for the core count, 1) - a value the caller cannot tell from a real one.
-    pub fn inspect_kernel_free_frames(&self) -> u64 {
+    pub fn inspect_kernel_free_frames(&self) -> Option<u64> {
         // SAFETY: syscall(13) = InspectKernel; query_id=4 = free frame count.
         let ret = unsafe { raw_syscall(13, 4, 0, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
+        // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
+        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        if ret < 0 { None } else { Some(ret as u64) }
     }
 
     /// Return the total usable physical frames at boot time.
     ///
     /// Wraps InspectKernel query 5.
-    pub fn inspect_kernel_total_frames(&self) -> u64 {
+    pub fn inspect_kernel_total_frames(&self) -> Option<u64> {
         // SAFETY: syscall(13) = InspectKernel; query_id=5 = total frame count.
         let ret = unsafe { raw_syscall(13, 5, 0, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
+        // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
+        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        if ret < 0 { None } else { Some(ret as u64) }
     }
 
     /// The endpoint task `slot` OWNS, or 0 if it owns none (InspectKernel query 24, INTROSPECT).
@@ -3044,10 +3050,12 @@ impl ServiceContext {
     /// With [`Self::task_awaits_endpoint`] this is the whole of the blocked-chain walk: map the
     /// endpoint a stuck task awaits back to the task that owns it, then ask what THAT one awaits.
     /// See `utilities/47_events.md`.
-    pub fn task_own_endpoint(&self, slot: u32) -> u64 {
+    pub fn task_own_endpoint(&self, slot: u32) -> Option<u64> {
         // SAFETY: syscall(13) = InspectKernel; query_id=24 = the task's own endpoint.
         let ret = unsafe { raw_syscall(13, 24, slot as u64, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
+        // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
+        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        if ret < 0 { None } else { Some(ret as u64) }
     }
 
     /// The endpoint task `slot` is blocked-in-CALL awaiting a reply from, or 0 if no call is in
@@ -3055,10 +3063,12 @@ impl ServiceContext {
     ///
     /// A best-effort snapshot, on the same contract as [`Self::task_stat`]: the kernel reads it
     /// without taking the routing lock, so an observer cannot stall the thing it observes.
-    pub fn task_awaits_endpoint(&self, slot: u32) -> u64 {
+    pub fn task_awaits_endpoint(&self, slot: u32) -> Option<u64> {
         // SAFETY: syscall(13) = InspectKernel; query_id=25 = the endpoint awaited in a CALL.
         let ret = unsafe { raw_syscall(13, 25, slot as u64, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
+        // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
+        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        if ret < 0 { None } else { Some(ret as u64) }
     }
 
     /// The kernel's BOOT RECORD size: `(held, capacity)` in bytes, or `None` without INTROSPECT
@@ -3113,19 +3123,23 @@ impl ServiceContext {
     /// Timer ticks the given core spent running a user task (not idle) since boot.
     ///
     /// Wraps InspectKernel query 6 (arg1 = core index).
-    pub fn inspect_core_active_ticks(&self, core: u32) -> u64 {
+    pub fn inspect_core_active_ticks(&self, core: u32) -> Option<u64> {
         // SAFETY: syscall(13) = InspectKernel; query_id=6, arg1=core.
         let ret = unsafe { raw_syscall(13, 6, core as u64, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
+        // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
+        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        if ret < 0 { None } else { Some(ret as u64) }
     }
 
     /// Total timer ticks seen on the given core since boot.
     ///
     /// Wraps InspectKernel query 7 (arg1 = core index).
-    pub fn inspect_core_total_ticks(&self, core: u32) -> u64 {
+    pub fn inspect_core_total_ticks(&self, core: u32) -> Option<u64> {
         // SAFETY: syscall(13) = InspectKernel; query_id=7, arg1=core.
         let ret = unsafe { raw_syscall(13, 7, core as u64, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
+        // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
+        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        if ret < 0 { None } else { Some(ret as u64) }
     }
 
     /// Number of CPU cores ready since boot.
