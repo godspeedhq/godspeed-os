@@ -7,7 +7,6 @@
 
 pub mod allocator;
 pub mod frame;
-pub mod ownership;
 pub mod page;
 
 use crate::arch::imp::BootInfo;

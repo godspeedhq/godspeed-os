@@ -10,7 +10,6 @@ Multi-core coordination (§9, §11). The IPI protocol lives in `ipi.rs`; the int
 | `core.rs`       | `CoreState` per core; `mark_ready(core_id)`, `ready_count()`, `is_ready(core_id)` |
 | `ipi.rs`        | `send_ipi(core_id, vector)`, `broadcast_tlb_shootdown(virt)`, `ipi_handler(vector)` |
 | `percpu.rs`     | `PerCore<T>` - boot-allocated per-core arenas (§26.6.1), sized to N cores at boot from the frame allocator (not `[_; MAX_CORES]`); all `unsafe` isolated here behind safe `get()` |
-| `placement.rs`  | `resolve(contract_core)` → `Ok(core_id)` or `Err(PlacementInvalid)` - DEAD CODE: the live placement is `task::resolve_spawn_core` |
 | `names.rs`      | `NameTable` / `AtomicNameSet` - fixed-size task-name and peer-name storage, so `task/` needs no `unsafe` for them |
 | `spinlock.rs`   | `SpinLock<T>` / `SpinLockGuard<T>` - RAII spinlock for safe mutable statics throughout the kernel |
 
@@ -64,10 +63,8 @@ This is a synchronous barrier. **Nothing in the kernel calls it today** (`broadc
 
 ## Placement (§9.2)
 
-`resolve` below is dead code; the live rule is `task::resolve_spawn_core` (a strict override, else a preferred core with a loud round-robin fallback, else round-robin). What follows describes `resolve`.
-
-`resolve(contract_core)` returns the core a new service instance should run on:
-- `Some(n)` → requires core `n`; returns `PlacementInvalid` if `!is_ready(n)`.
-- `None` → round-robin via `RR_COUNTER % ready_count`.
-
-On restart, `resolve` is called again with the same contract. The previous core is not remembered (§9.2 "on restart" clause).
+Placement is not in this module. The live rule is `task::resolve_spawn_core`: a strict override,
+else the spawn request's preferred core with a loud round-robin fallback, else round-robin. On restart
+it is asked again from scratch, so the previous core is not remembered (§9.2 "on restart" clause).
+(An `smp::placement::resolve` described here had no callers and was deleted 2026-10-10, `backlog/80`
+K20.)

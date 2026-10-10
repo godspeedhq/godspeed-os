@@ -7,7 +7,6 @@
 pub mod cap;
 pub mod delegated;
 pub mod generation;
-pub mod revoke;
 pub mod rights;
 pub mod table;
 

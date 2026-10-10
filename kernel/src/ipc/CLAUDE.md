@@ -9,7 +9,7 @@ Synchronous message-passing IPC (§8). No unsafe code lives here; physical memor
 | `mod.rs`       | Public API: re-exports, `init()` |
 | `message.rs`   | `Message` (4 KiB max payload, ≤4 embedded caps), `IpcError` |
 | `queue.rs`     | `MessageQueue`: fixed-depth FIFO, 16 messages, `enqueue`/`dequeue`/`drain` |
-| `endpoint.rs`  | `EndpointId`. Also an `Endpoint` struct that nothing constructs - the live per-endpoint state is the routing table's `RoutingEntry` |
+| `endpoint.rs`  | `EndpointId`. The live per-endpoint state is the routing table's `RoutingEntry` |
 | `routing.rs`   | The routing table (`TABLE`): `EndpointId → (CoreId, Generation, Liveness, Queue, blocked receiver/sender)`; `enqueue`, `dequeue`, `call_dequeue`, `kill_endpoint`, `take_call_waiter`. Protected by `SpinLock<[RoutingEntry; MAX_ENDPOINTS]>`, `MAX_ENDPOINTS` = 96. |
 | `names.rs`     | Name → `EndpointId` directory. `register(name, ep)`, `lookup(name)`. Protected by `SpinLock<[NameEntry; MAX_ENTRIES]>`. |
 | `routing_model.rs`, `names_model.rs` | Host-test models of the two tables (`lib.rs`, `#[cfg(test)]`); not in the kernel binary |

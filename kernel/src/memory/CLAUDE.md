@@ -10,7 +10,6 @@ Physical memory management (§10). Unsafe boundary: raw physical addresses appea
 | `frame.rs`      | `Frame` (owned 4 KiB page) and `PhysAddr` types |
 | `page.rs`       | `Page` (virtual page address) - typed index into page tables |
 | `allocator.rs`  | Frame allocator: `alloc_frame()` / `free_frame(frame)` |
-| `ownership.rs`  | `TaskMemoryOwner`: per-task frame set + limit enforcement - DEAD CODE, see the correction below |
 | `bitmap.rs`     | Host-test model of the frame bitmap (`lib.rs`, `#[cfg(test)]`) |
 
 ## Design rules
@@ -20,13 +19,13 @@ Physical memory management (§10). Unsafe boundary: raw physical addresses appea
 - **No TLB shootdown before frame free - a CR3 switch instead.** The kill path (`scheduler::kill_task_by_slot`) first waits until no other core is still running or leaving the dead task, so every core has since loaded a different address space; it then frees the frames with `arch::imp::page_tables::reclaim_user_frames`. The comment at that site says why a shootdown IPI is skipped (a core mid-syscall with interrupts masked cannot acknowledge it).
 - **PML4 frame deferred in self-kill.** The PML4 frame is skipped by `reclaim_user_frames` in the self-kill path (dying task's CR3 still active) and stored in `CORE_PENDING_PML4[core]`. It is freed at the next `drain_pending_kstack` call when a different CR3 is loaded. This prevents a CR3 use-after-free kernel page fault.
 
-> **Doc-drift correction (documentation-audit Audit 2, 2026-07-15; kernel-audit M1).** The
-> `TaskMemoryOwner` / `ownership.rs` / `reclaim_all` names used in this file are **dead code** (zero live
-> callers) pending removal. The **live** paths are: limit enforcement = `task/scheduler.rs`'s
-> `TASK_ALLOC_BYTES` + `current_task_claim_alloc` (returns `None` = `AllocDenied`); kill-path frame
-> reclaim = `arch/x86_64/page_tables.rs::reclaim_user_frames`. The *behaviour* described below
-> (shootdown-before-free, deferred self-kill PML4 via `CORE_PENDING_PML4`) is correct - only the function
-> names are stale. Editing `ownership.rs` will have no effect.
+> **Doc-drift correction (documentation-audit Audit 2, 2026-07-15; kernel-audit M1).** A
+> `TaskMemoryOwner` in `ownership.rs`, with a `reclaim_all`, once stood for what is below, and had no
+> callers; the file was deleted 2026-10-10 (`backlog/80` K20). The **live** paths are: limit enforcement =
+> `task/scheduler.rs`'s `TASK_ALLOC_BYTES` + `current_task_claim_alloc` (returns `None` =
+> `AllocDenied`); kill-path frame reclaim = `arch/x86_64/page_tables.rs::reclaim_user_frames`. The
+> *behaviour* described below (shootdown-before-free, deferred self-kill PML4 via `CORE_PENDING_PML4`)
+> is correct.
 
 ## Limit enforcement flow
 

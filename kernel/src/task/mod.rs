@@ -3,9 +3,7 @@
 
 pub mod scheduler;
 pub mod state;
-pub mod task;
 
-pub use task::{Task, TaskId};
 
 use crate::smp::SpinLock;
 

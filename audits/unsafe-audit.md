@@ -2469,6 +2469,7 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 A side-effect-free system-register read, valid at any point including early boot, which is what makes it safe to take on EVERY log line here. The x86 equivalent is not: core identity there costs an APIC MMIO read with a boot-ordering precondition, and putting it on the serial path was a fix worse than the bug it addressed. Same intent, different cost, different answer. |
 | `arch/x86_64/pci.rs` | 21 -> 22 (+1) | `bar_len` (2026-10-09, backlog/80 K1) - sizes a memory BAR at grant time so a driver's register window is its device's and not a fixed 64 KiB. The standard probe (memory decode off, all ones written to the BAR, the mask read back, BAR and decode restored), as ONE block under `PCI_CONFIG_LOCK`: split across the existing `config_read32`/`config_write32`, each of which takes the lock alone, another core's configuration read could land between the writes and see the BAR holding the mask. Only the command half of the command/status dword is written back, because the status half is write-1-to-clear. Every value written is restored before the lock is released. |
 | `arch/x86_64/syscall_entry.rs` | 16 -> 14 (-2) | **shrank** (2026-10-10, backlog/80 K7): `int80_entry` deleted - the naked `int 0x80` syscall stub and its `#[unsafe(naked)]`. It was still installed at IDT[0x80] with DPL=3, so any service could raise it, and it ran the syscall chain on the top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off. The SDK traps with `ud2` on every x86 machine; nothing used it. |
+| `smp/placement.rs` | 1 -> deleted (-1) | 2026-10-10, backlog/80 K20: the whole file had no callers (`resolve` and its `static mut RR_COUNTER`); the live placement is `task::resolve_spawn_core`. Its one block, the `RR_COUNTER` increment, goes with it. |
 | `arch/x86_64/iommu.rs` | 74 -> 79 (+5) | 2026-10-10, backlog/80 K11: a confinement is never left unrecorded. `unconfine` is the one way a confinement is undone (`unsafe fn`, +1, with the four blocks `release_device` had - write the passthrough DTE, `sfence`, invalidate, free the table - moved into it unchanged); `release_device` calls it (+1 for the call, -4 for the blocks that moved). `confine_device` gains three: freeing a partial table when an arena page fails to map (it leaked, root and all), freeing a device's PREVIOUS table when it is confined again (its record was overwritten and the table kept forever), and calling `unconfine` when the last record slot was taken by another core while the table was being built. Each frees or reverts only a table built here and reachable from nothing but this device's DTE, which each SAFETY comment states. |
 | `arch/x86_64/pci.rs` | 20 -> 21 (+1) | `cfg_read_gated` - the one gated configuration read a userspace enumerator needs (step D2). An `out dx, eax` to 0xCF8 and an `in eax, dx` from 0xCFC, held together under the `PCI_CONFIG_LOCK` that already guards this pair.
 
@@ -2709,7 +2710,6 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | smp/ipi.rs | 17 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 8 | permitted |
-| smp/placement.rs | 1 | permitted |
 | smp/names.rs | 4 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
@@ -3195,14 +3195,6 @@ for most blocks; a small number need back-fill.
 
 AP startup via `start_all_aps`. Delegates to `arch/x86_64/ap_boot.rs`.
 `// SAFETY:` comment present in source.
-
----
-
-### smp/placement.rs
-
-Round-robin core assignment reads the `READY_CORES` count set by `smp/core.rs`.
-Sound because the count is written before placement is ever called (BSP marks
-core 0 ready before spawning init). `// SAFETY:` comment present in source.
 
 ---
 

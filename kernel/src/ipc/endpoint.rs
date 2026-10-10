@@ -5,8 +5,6 @@
 //! that core. Cross-core sends enqueue via the routing table + IPI path.
 
 use crate::capability::cap::ResourceId;
-use crate::ipc::queue::MessageQueue;
-use crate::task::task::TaskId;
 
 /// Kernel-assigned unique identifier for an endpoint.
 /// Used as the key in the routing table and as the `ResourceId` for the cap.
@@ -19,31 +17,6 @@ impl From<EndpointId> for ResourceId {
     }
 }
 
-/// An IPC endpoint with its message queue and owner information.
-///
-/// NOT CONSTRUCTED anywhere in the kernel: the live per-endpoint state (core, generation,
-/// liveness, queue, blocked receiver and sender) is `routing::RoutingEntry`, keyed by
-/// `EndpointId`. This type is only re-exported from `ipc`.
-pub struct Endpoint {
-    pub id: EndpointId,
-    /// The task that owns this endpoint (the receiver).
-    pub owner: TaskId,
-    /// Which core this endpoint is pinned to.
-    pub core_id: u32,
-    pub queue: MessageQueue,
-    /// If a task is blocked on `recv`, its id is stored here so the kernel
-    /// can wake it via IPI when a message arrives.
-    pub blocked_receiver: Option<TaskId>,
-}
-
-impl Endpoint {
-    pub fn new(id: EndpointId, owner: TaskId, core_id: u32) -> Self {
-        Self {
-            id,
-            owner,
-            core_id,
-            queue: MessageQueue::new(),
-            blocked_receiver: None,
-        }
-    }
-}
+// (An `Endpoint` struct sat here that nothing constructed: the live per-endpoint state - core,
+// generation, liveness, queue, blocked receiver and sender - is `routing::RoutingEntry`, keyed by
+// `EndpointId`. It was deleted 2026-10-10 (`backlog/80` K20).)
