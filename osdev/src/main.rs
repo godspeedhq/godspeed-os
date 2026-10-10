@@ -503,6 +503,12 @@ const EXTRA_CHECKS: &[&str] = &[
     // This was in `scripts/CONFORM-EXTRA.txt` while the branch that wrote it touched no Rust. That
     // file exists to make such a gap VISIBLE rather than silent, and it is empty again now.
     "scripts/python_floor_check.py",
+    // The port's SCOPE: on a branch that works on one ISA, every path it edits must be `arch/<isa>/`
+    // or a file `docs/porting.md` marks `+`. It ran only in the paused `build.yml`, so its own
+    // cross-check against the guide failed on EVERY branch for six days (the guide gained the radio's
+    // `wifi-driver/build.rs` row and the script did not) and nothing said so - `backlog/80` T2. On
+    // any other branch it is silent by design, so it costs nothing here but the guide cross-check.
+    "scripts/port_scope_check.py",
 ];
 
 /// `osdev conform` - forward to `scripts/conform.py` and pass its exit code through.

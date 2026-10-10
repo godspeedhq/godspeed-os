@@ -100,7 +100,7 @@ module serves none of the six.
 ## Portability
 
 One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in
-`arch/<isa>/`. Adding an ISA is bounded to that directory plus the eleven registration files
+`arch/<isa>/`. Adding an ISA is bounded to that directory plus the twelve registration files
 `docs/porting.md` marks; every `osdev build` refuses neutral code that reaches hardware outside the seam.
 
 | target | status |

@@ -15,7 +15,7 @@ fn _probe_panic() {
 }
 --- expect ---
 error[GS0005]: no service may halt the machine
-   --> services/observe/src/main.rs:417
+   --> services/observe/src/main.rs:END+3
     |
     = commandment: V - Thou shalt not assume thy service is special. Only the kernel is
                    special.

@@ -10,7 +10,7 @@
 // The scroll view is repainted by `reclaim_view_state`, which returns the row count.
 --- expect ---
 error[GS0403]: a Rust comment names something that exists nowhere in the code
-   --> examples/00-hello/src/main.rs:53
+   --> examples/00-hello/src/main.rs:END+2
     |
     = rule: CLAUDE.md 26.7, 26.14
     = why: A comment is read BEFORE any document, because it sits beside the code being
@@ -25,5 +25,5 @@ error[GS0403]: a Rust comment names something that exists nowhere in the code
 
   comment_symbol_check.py reported:
   | comment symbols: 1 name(s) in Rust comments name nothing in the code:
-  |     `reclaim_view_state`  examples/00-hello/src/main.rs:53
+  |     `reclaim_view_state`  examples/00-hello/src/main.rs:END+2
   | (4 more lines of explanation, which the frame above covers - `py scripts/comment_symbol_check.py` for all of it)

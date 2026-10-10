@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""THE PORT SCOPE CHECK: a new ISA writes `kernel/src/arch/<isa>/` and eleven named files. Anything
+"""THE PORT SCOPE CHECK: a new ISA writes `kernel/src/arch/<isa>/` and twelve named files. Anything
 else it edits is a FINDING, and this is what notices.
 
 `docs/porting.md` states the rule plainly - "If you find yourself editing anything else, stop and ask
@@ -28,7 +28,7 @@ with no checker.
 WHAT IT DOES. It finds the merge base with main, works out whether this branch is ISA work - it adds
 an arch directory, or it touches exactly one - and if it is, classifies every changed path against
 the guide's tree. In scope: the new `arch/<isa>/`
-directory, its linker script, and the eleven files `docs/porting.md` marks `+`. Out of scope:
+directory, its linker script, and the twelve files `docs/porting.md` marks `+`. Out of scope:
 everything else, reported with the guide's own reason where it has one.
 
 IT IS SILENT ON EVERY OTHER BRANCH, deliberately. A branch that touches no arch directory, or that
@@ -70,7 +70,7 @@ WIRING = {
     "rust-toolchain.toml": "your triple, if a shipping build will need it",
 }
 
-# The six files ABOVE the kernel that the guide's tree marks `+`. Every one of these is a place the
+# The seven files ABOVE the kernel that the guide's tree marks `+`. Every one of these is a place the
 # guide says to add ONE ARM; none is an invitation to restructure.
 SEAM_ABOVE = {
     "sdk/rust/src/syscall.rs": "your `raw_syscall` body: the trap instruction and its register convention",
@@ -79,6 +79,10 @@ SEAM_ABOVE = {
     "services/block-driver/build.rs": "one arm: is the disk on USB, and which service owns the host",
     "services/nic-driver/src/main.rs": "one arm, and the guide says this is the worst one (backlog/21)",
     "services/hw-enumerator/src/main.rs": "one arm IF you have PCI (backlog/25)",
+    # The guide gained this row when the VisionFive's radio did (2026-10-04) and this set did not, so
+    # the guide cross-check below failed on every branch - unseen, because only the paused `build.yml`
+    # ran this script (backlog/80 T2). It is on `osdev build` now.
+    "services/wifi-driver/build.rs": "one arm IF your board has a radio: which SD host it sits behind",
 }
 
 ALLOWED = dict(WIRING, **SEAM_ABOVE)
