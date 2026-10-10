@@ -364,7 +364,7 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
                 {
                     pending.ate_client_said = true;
                     ctx.log_fmt(format_args!(
-                        "net-stack: took a capless message beginning {} as the driver's answer - if a                          client is blocked right now, THIS is where its request went (said once)",
+                        "net-stack: took a capless message beginning {} as the driver's answer - if a client is blocked right now, THIS is where its request went (said once)",
                         m.payload_bytes().first().copied().unwrap_or(0)));
                 }
                 true
@@ -637,7 +637,7 @@ impl Displaced {
                         // NOT "the client has re-sent" - that asserted something this service
                         // cannot know, and on the Pi 2 it was false: the client was still waiting,
                         // and this line was the only trace of why its request vanished.
-                        "net-stack: dropped a held client request (op {}) after its client's own {} ms                          of patience - it is still waiting and will now time out (drop #{})",
+                        "net-stack: dropped a held client request (op {}) after its client's own {} ms of patience - it is still waiting and will now time out (drop #{})",
                         h.body.get(2).copied().unwrap_or(0), h.hold_ms, self.n));
                 }
                 continue;
@@ -660,7 +660,7 @@ impl Displaced {
         self.n = self.n.saturating_add(1);
         if self.n <= 8 || self.n % 8 == 0 {
             ctx.log_fmt(format_args!(
-                "net-stack: a client request met mid-question to nic-driver was dropped                  because {} - it times out and retries (drop #{})", why, self.n));
+                "net-stack: a client request met mid-question to nic-driver was dropped because {} - it times out and retries (drop #{})", why, self.n));
         }
     }
 }
@@ -1251,7 +1251,9 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
         // receive, which is the coupling this change removed: answering somebody else's ARP is not a
         // reason to consume a frame, and when the caller ignored it that frame was destroyed.
         if answer_arp {
-            let _ = ctx.request_with_reply_deadline("nic-driver", &Message::from_bytes(&arp_out), DANCE_SECS);
+            // Through `nic_req`, so a CLIENT's request that arrives while we wait is held for the serve
+            // loop, not consumed here as if it were the driver's answer (backlog/80 D4).
+            let _ = nic_req(ctx, pending, &Message::from_bytes(&arp_out), DANCE_SECS);
         }
         // PACE THE POLL, or this loop does not wait at all.
         //
@@ -1267,7 +1269,7 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
         // pacing for the same reason - a poll is a question, and asking it twelve times in a row does
         // not make the answer arrive sooner.
         deadline.pause();
-        reply = ctx.request_with_reply_deadline("nic-driver", &rx_only, LINK_SECS);
+        reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
     }
 }
 
@@ -1763,7 +1765,7 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
                 t.poll_tx_slow = t.poll_tx_slow.saturating_add(1);
                 if t.poll_tx_slow == 1 || t.poll_tx_slow % 64 == 0 {
                     ctx.log_fmt(format_args!(
-                        "net-stack: a polled frame was not taken by the driver within {} ms                          ({} so far) - the peer will retransmit, but POLL_TX_MS may be too tight                          for this board", POLL_TX_MS, t.poll_tx_slow));
+                        "net-stack: a polled frame was not taken by the driver within {} ms ({} so far) - the peer will retransmit, but POLL_TX_MS may be too tight for this board", POLL_TX_MS, t.poll_tx_slow));
                 }
             }
             any = true;
@@ -2347,7 +2349,7 @@ fn ping(ctx: &ServiceContext, pending: &mut Displaced, gw_mac: &[u8; 6], our_ip:
                 // now". So this was a full second spent waiting for an acknowledgement with no content,
                 // in the one place that could least afford it.
                 arp_for_us += 1;
-                let _ = ctx.request_with_reply_ms("nic-driver", &Message::from_bytes(&arp_out), ARP_ACK_MS);
+                let _ = nic_req_ms(ctx, pending, &Message::from_bytes(&arp_out), ARP_ACK_MS);
                 }
             }
         }
@@ -3387,7 +3389,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // how a release that never happened looked like one that did (§26.7).
             if !sockets.iter().any(|sk| sk.rid == rid && sk.rid != 0) {
                 ctx.log_fmt(format_args!(
-                    "net-stack: a capability invocation named resource {} which is not a listener,                      a connection or a socket here - answering empty", rid));
+                    "net-stack: a capability invocation named resource {} which is not a listener, a connection or a socket here - answering empty", rid));
             }
 
             // Socket-cap invocation: transmit a UDP datagram through this socket. Payload =
@@ -3689,6 +3691,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             our_mac = d.our_mac;
             gw_mac = d.gw_mac;
             gw_known = d.gw_known;
+            // `leased` too, as every other dance does. It was left at its old value until 2026-10-10,
+            // so a renew that lost (or won) the lease left the re-DHCP and gateway-retry decisions
+            // working from the previous dance's answer (backlog/80 D3).
+            leased = d.leased;
             dns_server = d.dns_server;
             status = d.status;
             reply.send(&ctx, &status);

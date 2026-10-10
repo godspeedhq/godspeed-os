@@ -1230,7 +1230,7 @@ impl Tcp {
                 // "nobody called" and "somebody called and we had no room" (§26.7).
                 None => {
                     ctx.log_fmt(format_args!(
-                        "net-stack: refused a connection from {}.{}.{}.{}:{} on port {} - the                          connection table is full",
+                        "net-stack: refused a connection from {}.{}.{}.{}:{} on port {} - the connection table is full",
                         rip[0], rip[1], rip[2], rip[3], rp, lp));
                     return 0;
                 }
