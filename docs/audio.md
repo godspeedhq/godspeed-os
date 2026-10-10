@@ -1475,3 +1475,7 @@ under a flood, mem-pressure and a spawn-storm (99 spawns refused, as designed); 
 respawns brought the jack up again (`Pi 4 jack up` 101 times, the boot's included) and all 100 read
 `volume 100, unmuted` back from `/audio.settings`. A 5 s tone afterwards: 0 underruns, heard. The aimed
 run only; an `all-services` run was not in this log.
+
+**The same on the Pi 2 (same day, `8d1d437d`):** `chaos max-carnage pwm-audio 100 yes`, 100 rounds, 100
+kills, the kernel alive; `Pi 2 jack up` 101 times and the settings read back 101 times; a 5 s tone
+afterwards 0 underruns.
