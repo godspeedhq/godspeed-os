@@ -310,11 +310,11 @@ os/
         aarch64/           #   complete - Raspberry Pi 4 (hardware-verified)
         riscv64/           #   complete - QEMU virt + StarFive VisionFive 2 Lite (hardware-verified)
         riscv32/  loongarch64/  s390x/    #   stubs: boot + UART only
-      memory/              # frame.rs, page.rs, allocator.rs, ownership.rs
-      task/                # task.rs, state.rs, scheduler.rs (per-core)
-      ipc/                 # message.rs, endpoint.rs, queue.rs, routing.rs
-      capability/          # cap.rs, table.rs, rights.rs, generation.rs, revoke.rs
-      smp/                 # core.rs, ipi.rs, placement.rs
+      memory/              # frame.rs, page.rs, allocator.rs, bitmap.rs
+      task/                # mod.rs, state.rs, scheduler.rs (per-core)
+      ipc/                 # message.rs, endpoint.rs, queue.rs, routing.rs, names.rs
+      capability/          # cap.rs, table.rs, rights.rs, generation.rs, delegated.rs
+      smp/                 # core.rs, ipi.rs, percpu.rs, spinlock.rs, names.rs
       syscall/dispatch.rs
       interrupt/route.rs
       invariants/assertions.rs
