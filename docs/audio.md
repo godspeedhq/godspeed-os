@@ -1435,3 +1435,11 @@ without Linux's `alc225_init`; that sequence stays not done, and is not needed f
 for the built-in speaker, where it used to claim nothing was plugged in.
 
 **What this does not cover:** the Pi 2's jack has still not been heard.
+
+## The Pi 2's jack: HEARD (2026-10-10)
+
+`pwm-audio: Pi 2 jack up - PWM at 44100 Hz, range 5669 (about 12 bits), DMA channel 11 looping a 371 ms
+ring`, paced at 23108 us a period against 23219 expected. `audio tone 440 5` played its full length with
+0 underruns (5010 ms by the clock), `audio mute` read back `muted - verified`, and `q` stopped a tone at
+1419 ms and at 2882 ms. The operator heard it through headphones. Every board with a jack or a codec now
+has its sound heard: the Wyse and the T630 (speaker and headphones), the Pi 4 and the Pi 2.
