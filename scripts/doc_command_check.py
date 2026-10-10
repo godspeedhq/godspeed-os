@@ -67,7 +67,7 @@ COMMAND_OK = re.compile(r"<!--\s*doc-command-ok\b")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHELL = os.path.join(ROOT, "services", "shell", "src", "main.rs")
 OSDEV = os.path.join(ROOT, "osdev", "src", "main.rs")
-SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", "bugs")
+SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", "bugs", ".claude")  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
 
 # At a gsh prompt ONLY. A backticked pair was tried and produced a flood of false hits - see the
 # header: `` `a` to scan `b` `` reads as `` `to scan` `` to any regex that ignores backtick parity.
@@ -139,7 +139,8 @@ def main():
 
     bad = []
     for root, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS
+                     and not os.path.exists(os.path.join(root, d, ".git"))]
         for name in files:
             if not name.endswith(".md"):
                 continue

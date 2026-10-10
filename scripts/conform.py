@@ -300,7 +300,8 @@ def _eol_lf_paths():
 
     want = set()
     for dirpath, dirnames, filenames in os.walk(ROOT):
-        dirnames[:] = [d for d in dirnames if d not in line_ending_check.SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in line_ending_check.SKIP_DIRS
+                         and not os.path.exists(os.path.join(dirpath, d, ".git"))]
         for n in filenames:
             rel = os.path.relpath(os.path.join(dirpath, n), ROOT).replace(os.sep, "/")
             verdict = None

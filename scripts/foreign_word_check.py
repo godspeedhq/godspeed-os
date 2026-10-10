@@ -60,7 +60,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHELL = os.path.join(ROOT, "services", "shell", "src", "main.rs")
-SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", "bugs")
+SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", "bugs", ".claude")  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
 # `tests/conformance/` is the UI-fixture corpus and the GENERATED gallery, which quote
 # violations VERBATIM - a rotted citation and a POSIX word used as a command are in there on
 # purpose, because that is what they catalogue. Same genre as the `audits/` exemption above:
@@ -111,7 +111,8 @@ def main():
                          "of nothing, which would make this check silently vacuous.")
     bad = []
     for root, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS
+                     and not os.path.exists(os.path.join(root, d, ".git"))]
         if FIXTURE_SUBTREE in os.path.relpath(root, ROOT).replace(os.sep, "/") + "/":
             continue
         for name in files:

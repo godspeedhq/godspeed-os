@@ -37,7 +37,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ATTRS = os.path.join(ROOT, ".gitattributes")
 
 # Where a pattern like `boot/**` is rooted. Anything outside the repository is not ours to police.
-SKIP_DIRS = {".git", "target", "build", "node_modules"}
+SKIP_DIRS = {".git", "target", "build", "node_modules", ".claude"}  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
 
 
 def rules():
@@ -92,7 +92,8 @@ def main():
     checked = 0
 
     for dirpath, dirnames, filenames in os.walk(ROOT):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS
+                         and not os.path.exists(os.path.join(dirpath, d, ".git"))]
         for fn in filenames:
             full = os.path.join(dirpath, fn)
             rel = os.path.relpath(full, ROOT).replace(os.sep, "/")
