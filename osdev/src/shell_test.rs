@@ -4138,6 +4138,27 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("assert: ok"), "result: delete of a missing path is Err"),
         None    => { println!("files-test: FAIL - assert fails delete timeout"); fail += 1; }
     }
+    // backlog/80 H10/H20: a comma list returned Ok whatever its items did, and dropped items past 16.
+    match run!(b"assert fails delete /nowhere1,/nowhere2\r", 10) {
+        Some(r) => check!(r.contains("assert: ok") && r.contains("2 of 2 failed"), "comma list: failing items make the list an Err, counted (H10)"),
+        None    => { println!("files-test: FAIL - comma-list delete timeout"); fail += 1; }
+    }
+    match run!(b"mkdir /l1,/l2,/l3,/l4,/l5,/l6,/l7,/l8,/l9,/l10,/l11,/l12,/l13,/l14,/l15,/l16,/l17\r", 10) {
+        Some(r) => check!(r.contains("17 items") && r.contains("nothing was done") && !r.contains("created /l1"),
+                          "comma list: 17 items refused before anything runs (H10)"),
+        None    => { println!("files-test: FAIL - 17-item mkdir timeout"); fail += 1; }
+    }
+    // backlog/80 H19: a missing start path was "INCOMPLETE ... too large", 0 matches, and Ok.
+    match run!(b"assert fails find x /no/such/start\r", 10) {
+        Some(r) => check!(r.contains("assert: ok") && r.contains("not a directory") && !r.contains("too large"),
+                          "find: a missing start path is refused as such (H19)"),
+        None    => { println!("files-test: FAIL - find missing start timeout"); fail += 1; }
+    }
+    // backlog/80 H21: `read` on a directory said "not found".
+    match run!(b"read /\r", 10) {
+        Some(r) => check!(r.contains("is a directory") && !r.contains("not found"), "read: a directory is named as one (H21)"),
+        None    => { println!("files-test: FAIL - read / timeout"); fail += 1; }
+    }
     // and `result` reflects a converted command directly.
     let _ = run!(b"dir /nowhere\r", 10);
     match run!(b"result\r", 10) {
