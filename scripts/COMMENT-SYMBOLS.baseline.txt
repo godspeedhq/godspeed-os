@@ -50,8 +50,6 @@ SCR_RXUSEDK                        # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c
 SCR_TXUSEDK                        # Linux rtlwifi (cam.c, cam.h, rtl8192ce/hw.c, rtl8192cu/hw.c, rtl8192ce/reg.h), Realtek's driver for the RTL8188CUS family, cited by wifi-usb for its key-store layout (docs/wifi-usb.md 43) - external, 26.14
 SP_EL1
 TCR_EL1
-TLB_ACK
-TLB_SHOOTDOWN_ADDR
 TX_DROPPED
 VIDEO_INPUT_8BITS
 VOUT_AXI

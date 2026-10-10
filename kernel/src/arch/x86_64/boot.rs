@@ -1024,24 +1024,7 @@ pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {
     }
 }
 
-/// Broadcast `vector` as an IPI to all cores EXCEPT this one (xAPIC all-excluding-self shorthand). The
-/// arch seam for a BROADCAST IPI (AArch64: GIC SGI with the broadcast target-list filter).
-///
-/// # Safety
-/// The APIC must be mapped; the caller holds IF=0 (or has saved/disabled it).
-#[inline]
-pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
-    // SAFETY: APIC mapped; IF=0. Shorthand 0b11 (all-excluding-self, ICR_LOW bits 19:18), fixed
-    // delivery, edge, assert (bit 14); DELIVS polled first (SDM 10.6.1).
-    unsafe {
-        write_apic(APIC_VIRT_BASE, APIC_ICR_HIGH, 0);
-        apic_wait_icr_idle();
-        write_apic(APIC_VIRT_BASE, APIC_ICR_LOW, (vector as u32) | (1 << 14) | (0b11 << 18));
-    }
-}
-
-/// Broadcast an NMI to all cores EXCEPT this one. Unlike `broadcast_ipi_all_but_self` (a maskable
-/// fixed-delivery vector), an NMI reaches a core even when it is running with interrupts disabled -
+/// Broadcast an NMI to all cores EXCEPT this one. Unlike a maskable fixed-delivery vector, an NMI reaches a core even when it is running with interrupts disabled -
 /// e.g. spinning on a lock. The panic path (`halt_all_cores`, SEC-18) uses this so a panic on one core
 /// actually stops the machine (§6.2, §19); `idt[2]` routes the NMI to `exception_halt`.
 ///
@@ -1494,7 +1477,8 @@ pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
 ///   while any service could still raise it. An `int 0x80` now finds no gate, faults, and the
 ///   CPL-discriminating handler kills the task that raised it.
 /// - Vector 0xF0 → WAKE_RECEIVER IPI.
-/// - Vector 0xF1 → TLB_SHOOTDOWN IPI.
+/// - Vector 0xF1 is unused: it was the TLB_SHOOTDOWN IPI, deleted with the broadcast it served
+///   (`backlog/80` K20). It now lands on the default `exception_halt`, as any unused vector does.
 /// - Vector 0xF2 → SCHEDULER_TICK IPI.
 ///
 /// # Safety
@@ -1555,7 +1539,6 @@ pub(super) unsafe fn init_idt() {
                 IdtEntry::new(super::interrupts::msi_pool_stub(i));
         }
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
-        idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);
         idt[0xF2] = IdtEntry::new(ipi_tick_stub   as *const () as u64);
         // IDT[0xFF] = the APIC spurious-interrupt vector (SVR = 0x1FF, above). A spurious IRQ is a normal
         // hardware event (an IRQ de-asserted between CPU-ack and vector-read); the architecturally-correct
@@ -1579,7 +1562,8 @@ pub(super) unsafe fn init_idt() {
 // IPI ISR stubs (§9.4) - one naked stub per vector.
 // ---------------------------------------------------------------------------
 
-/// Dispatch target called from all three IPI stubs with the vector number.
+/// Dispatch target called from the tick IPI stub with the vector number (the wake stub goes straight
+/// to `timer_tick_from_irq`).
 ///
 /// # Safety
 /// Called from raw interrupt context (IF=0).
@@ -1630,21 +1614,6 @@ unsafe extern "C" fn ipi_wake_stub() {
         "jz 2f",
         "swapgs",
         "2:",
-        "iretq",
-    )
-}
-
-#[unsafe(naked)]
-unsafe extern "C" fn ipi_tlb_stub() {
-    core::arch::naked_asm!(
-        "push rax", "push rcx", "push rdx",
-        "push rdi", "push rsi", "push r8",
-        "push r9",  "push r10", "push r11",
-        "mov rdi, 0xF1",
-        "call ipi_dispatch",
-        "pop r11", "pop r10", "pop r9",
-        "pop r8",  "pop rsi", "pop rdi",
-        "pop rdx", "pop rcx", "pop rax",
         "iretq",
     )
 }

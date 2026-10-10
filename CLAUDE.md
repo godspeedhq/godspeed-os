@@ -1317,6 +1317,55 @@ A protection violation is **unrecoverable**. The service is in undefined state a
 
 When a page is unmapped (service killed, memory reclaimed), the kernel issues a TLB shootdown via IPI to every core. Operations resume only after acknowledgment from all cores. v1 minimizes unmap frequency by reclaiming memory only at service death.
 
+> **Amendment 2026-10-10 (backlog/80 K20): this section names the guarantee, not a mechanism, and the
+> mechanism it named had not run for some time.** The paragraph above says the kernel "issues a TLB
+> shootdown via IPI to every core" and waits for acknowledgments. It does not. The broadcast that did
+> that had no caller, and has been deleted. What the kernel guarantees, and has guaranteed all along, is
+> this:
+>
+> **No core can use a translation into a frame after that frame has been freed.**
+>
+> - **Reclamation waits for quiescence.** A dead task's stack and page tables are not freed until no core
+>   is running it or still leaving it (`core_still_using`, `CORE_LEAVING` in `task/scheduler.rs`). Nothing
+>   is freed while a task can still execute.
+> - **Every switch invalidates on the core that switches.** x86 writes CR3 (no PCID), ARMv7 issues
+>   `TLBIALL` when TTBR0 changes, RISC-V issues `sfence.vma` after writing `satp`, and AArch64 flushes on
+>   every switch. A core that ran the dead task has dropped its entries before it stops counting as
+>   "leaving" it.
+> - **Where an idle core keeps a dead root installed, the free invalidates everywhere.** On AArch64 an
+>   idle core keeps the last task's root in TTBR0, and the CPU may walk it speculatively, so
+>   `free_page_table_root` issues an inner-shareable invalidate (`tlbi vmalle1is`) before the root goes back
+>   to the allocator. The other ports switch an idle core to the kernel's own root.
+> - **Nothing changes a mapping under a running task.** User mappings are only added while a task lives;
+>   the kernel-stack guard pages are unmapped on the boot core before any other core starts; the Pi 4
+>   framebuffer remap is boot-only and invalidates inner-shareable anyway.
+> - **No address-space identifier is in use on any port** (no PCID, ASID 0 throughout). A port that adopts
+>   one must not reuse it before the invalidation that makes the reuse safe.
+>
+> **What this does NOT change.** Translation coherence is still a kernel responsibility, under memory
+> isolation and SMP routing (4.3); no responsibility is added or removed, and no guarantee is weakened.
+> Removing the broadcast removed no local invalidation. If a future feature changes a live mapping - a
+> remap, a permission downgrade, an unmap a running task can observe - it brings the cross-core
+> invalidation it needs with it, and is recorded here; until then that machinery would be speculative
+> code (26.2).
+>
+> **Two residuals, recorded rather than closed (26.7).** Both concern speculation only; the kernel makes
+> no access through either window. (a) On every port a task that kills ITSELF still has its root installed
+> while its lower tables are freed (the root itself is deferred, `CORE_PENDING_PML4`). (b) An AArch64 idle
+> core walks a root whose lower tables have been freed, until `free_page_table_root`'s invalidate. Whether
+> wrong-path speculation through a recycled table frame can have a visible effect - setting an accessed
+> bit, or a speculative read of a device register through a garbage descriptor - is not checked. The
+> smallest hardening for both, should it ever be needed, is to switch the core to the kernel root before
+> reclaim.
+>
+> Pinned by P7, which no longer stands in for this property with a generation count. A task stamps a
+> pattern into fresh pages and is killed - from another core on even cycles, by its own fault on odd ones -
+> and a checker given the same addresses, on the same core and on another, must read only the zeroes the
+> kernel hands out (`no_stale_translation_after_death`, 32 cycles). Shown to fail when the checker is broken
+> and when the kill path skips both its wait and its wake. **Its limit, recorded:** a kill path that skips
+> ONLY the wait still passes, because the wake stops the victim before its frames are reused. The
+> per-port proof is recorded in `backlog/80` K20.
+
 ---
 
 ## 11. Bootstrap Sequence

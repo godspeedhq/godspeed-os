@@ -194,12 +194,16 @@ with **Acquire** before touching the data. Both are now in the code:
   `TASK_STATE` Release/Acquire publish even before this - the residual hazard was best-effort/
   introspection readers gating a field read on a Relaxed `TASK_VALID`; those are now Acquire too.)
 
-**2. An address-space switch must flush the TLB (SEC-26 / SEC-27).** The neutral kill path *elides* the
-cross-core TLB shootdown for a pinned task ("a CR3 reload flushes non-global TLB entries"). That is an
-**x86 semantic**. On AArch64 a `TTBR0_EL1`+ASID switch does not implicitly flush; RISC-V `satp` needs an
-explicit `sfence.vma`. So the `arch::imp` context-switch / `write_page_table_base` primitive on a weak
-arch MUST either (a) flush the outgoing address space's non-global entries on the switch, or (b) the
-neutral kill path must issue the cross-core shootdown it currently elides. On the **armv7 port** the
+**2. An address-space switch must flush the TLB (SEC-26 / SEC-27).** The neutral kill path issues NO
+cross-core TLB shootdown: it waits until no core is running or still leaving the task
+(`core_still_using`) and relies on each core's switch away having dropped the task's translations. On
+x86 that is a side effect of the CR3 write - an **x86 semantic**. On AArch64 a `TTBR0_EL1`+ASID switch
+does not implicitly flush; RISC-V `satp` needs an explicit `sfence.vma`. So the `arch::imp`
+context-switch primitive on a weak arch MUST flush the outgoing address space's non-global entries on
+the switch. There is no software broadcast to fall back on: the one in `smp/ipi.rs` had no caller and
+was deleted on 2026-10-10 (`backlog/80` K20). And where an IDLE core keeps a dead task's root installed,
+as AArch64's does, the port must also invalidate on every core before freeing that root -
+`free_page_table_root`'s `tlbi vmalle1is` - because the CPU may walk an installed root speculatively. On the **armv7 port** the
 context switch takes route (a): `switch_context` writes TTBR0, `isb`, then `TLBIALL`+`dsb`+`isb` on an
 address-space change, satisfying SEC-26 for the pinned single-core model. Note the arm
 `invalidate_tlb_page` is **local** (`TLBIMVA`, `c8,c7,1`), *not* an inner-shareable broadcast - correct
@@ -216,10 +220,8 @@ the outgoing space's translations. **Where that drop happens differs, and the di
 x86 `write_page_table_base` is a CR3 write that flushes as a side effect, and on riscv64 it is a `satp`
 write followed by `sfence.vma`; on arm32 and aarch64 it is a bare
 `TTBR0` write plus `isb` and flushes NOTHING - those ports flush in `switch_context` instead (aarch64
-writes TTBR0, then `isb`, then `tlbi`, on every switch: `backlog/72`). So `smp/ipi.rs`'s full-flush
-sentinel, which reloads the base through `write_page_table_base`, flushes on x86 and riscv64 only.
-`broadcast_full_tlb_flush` has no callers today; a weak-arch caller must not rely on it until the
-sentinel calls a real flush seam; the atomics keep the ordering item 1 assumes. Matching the x86 *signature* is
+writes TTBR0, then `isb`, then `tlbi`, on every switch: `backlog/72`). So no neutral code may use
+`write_page_table_base` as a flush; today none calls it at all. Matching the x86 *signature* is
 necessary but not sufficient - the seam pins names, and this section pins the semantics behind them.
 
 **3. DMA cache coherence (SEC-28).** The SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) maps the arena

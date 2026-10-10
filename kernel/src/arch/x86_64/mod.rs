@@ -432,7 +432,7 @@ pub fn core_irq_debug(core: u32) -> (u32, u32) {
 /// x86: unchanged from when this lived in the scheduler - 300 quanta of ~10 ms is ~3 s, and it is `0`
 /// only if TSC calibration failed (`boot::calibrate_tsc_ticks_per_10ms`). It calibrates on every
 /// machine now, QEMU included, so the watchdog is on there too.
-/// A normal shootdown or critical section is milliseconds, so ~3 s cannot false-fire.
+/// A normal critical section is milliseconds, so ~3 s cannot false-fire.
 pub fn liveness_deadline_cycles() -> u64 {
     boot::tsc_ticks_per_quantum().saturating_mul(300)
 }

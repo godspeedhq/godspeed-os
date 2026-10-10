@@ -173,7 +173,9 @@ impl PageTable {
     }
 
     /// Unmap the page at `virt` and return the physical frame it pointed to.
-    /// Caller must issue a TLB shootdown before reusing the frame (§10.5).
+    /// Invalidates nothing. Only selftests call it; a caller that unmaps a page another core may have
+    /// cached owes that core an invalidate before the frame is reused (§10.5), and the kernel has no
+    /// cross-core mechanism for that today because nothing unmaps a live mapping (`backlog/80` K20).
     pub fn unmap(&mut self, virt: VirtAddr) -> Result<Frame, MapError> {
         let va = virt.0;
         let root_phys = self.root.phys_addr().0;
@@ -189,7 +191,7 @@ impl PageTable {
             return Err(MapError::NotMapped);
         }
 
-        // SAFETY: clearing present bit; caller responsible for TLB shootdown.
+        // SAFETY: clearing present bit; the caller owns invalidating any TLB that cached it.
         unsafe { write_entry(pt_phys, idx, 0) };
 
         let frame_phys = PhysAddr(entry_phys(pte));
@@ -579,7 +581,8 @@ pub enum MapError {
 /// teardown to free leaf data frames and page-table structure frames.
 ///
 /// # Safety
-/// `phys` must be a frame owned by a task already marked Dead, after a TLB shootdown - i.e. no
+/// `phys` must be a frame owned by a task already marked Dead, after the kill path's wait - no core
+/// running or still leaving the task, so each has written a different CR3 - i.e. no
 /// core's page-walker can still reach it. Freeing a still-reachable frame is a use-after-free.
 #[inline]
 unsafe fn free_phys_frame(phys: u64) {
@@ -596,8 +599,10 @@ unsafe fn free_phys_frame(phys: u64) {
 /// is NOT collected.
 ///
 /// The frames are freed DURING the walk, so before calling, the caller must ensure no core can
-/// still translate through this address space (§10.5). The kill path does that without a
-/// shootdown: it waits until every other core has loaded a different CR3 (`task/scheduler.rs`).
+/// still translate through this address space (§10.5). The kill path does that without any
+/// broadcast: it waits until no other core is running or still leaving the task
+/// (`core_still_using`, `task/scheduler.rs`), and each such core's switch away wrote a different
+/// CR3, which flushes its non-global entries.
 ///
 /// # Safety
 /// - `cr3` must be the root PML4 of a task already marked Dead.
@@ -644,7 +649,7 @@ pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
                     if entry_present(pte) {
                         // Skip device MMIO (uncached BAR) - not an allocator frame, must not be freed.
                         if pte & UNCACHED != 0 { continue; }
-                        // SAFETY: leaf data frame of this dead task, post-shootdown; not read again.
+                        // SAFETY: leaf data frame of this dead task, after the kill path's wait; not read again.
                         unsafe { free_phys_frame(entry_phys(pte)); }
                         freed += 1;
                     }

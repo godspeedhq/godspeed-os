@@ -80,13 +80,12 @@ pub fn booted_at_el3() -> bool {
 
 /// Map a neutral IPI vector onto the GIC's 4-bit SGI id space.
 ///
-/// The neutral layer names its IPIs with x86 vector numbers (0xF0..0xF2). An SGI id is four bits, so
+/// The neutral layer names its IPIs with x86 vector numbers (0xF0 and 0xF2). An SGI id is four bits, so
 /// writing a vector straight into that field truncates 0xF0 to 0 - a different interrupt, delivered
 /// silently. The mapping is explicit for that reason.
 #[cfg(feature = "pi4")]
 pub fn vector_to_sgi(vector: u8) -> u32 {
     match vector {
-        crate::smp::ipi::vectors::TLB_SHOOTDOWN => gic::SGI_TLB,
         crate::smp::ipi::vectors::SCHEDULER_TICK => gic::SGI_TICK,
         _ => gic::SGI_WAKE,
     }
@@ -2547,11 +2546,6 @@ pub mod boot {
         super::gic::send_sgi(super::gic::SgiTarget::Core(lapic_id), super::vector_to_sgi(vector));
     }
 
-    /// # Safety
-    /// As above, for every core but this one.
-    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
-        super::gic::send_sgi(super::gic::SgiTarget::AllButSelf, super::vector_to_sgi(vector));
-    }
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
 }
 
@@ -2737,8 +2731,9 @@ pub mod page_tables {
     /// **No TLB maintenance here, and that is deliberate** (SEC-26, `arch/CLAUDE.md`): on AArch64 a
     /// `TTBR0_EL1` write flushes nothing, so an address-space *change* must invalidate - and it does,
     /// in `context::switch_context`, which is the only path that switches between two task spaces.
-    /// This primitive exists for the shootdown path, which writes back the value already installed to
-    /// force a walk; adding a flush here would be a second, redundant one on every context switch.
+    /// It is a seam member every port answers. No neutral code calls it since the shootdown path that
+    /// reloaded the installed base was deleted (`backlog/80` K20); adding a flush here would be a
+    /// second, redundant one on any switch that used it.
     ///
     /// # Safety
     /// `base` must be a live L1 root for the calling core.
@@ -2752,8 +2747,9 @@ pub mod page_tables {
 
     /// Invalidate one page's translation.
     ///
-    /// `tlbi vaae1is`: by VA, ALL ASIDs, Inner-Shareable (every core), because the neutral shootdown
-    /// path uses this to make an unmap visible machine-wide. The `dsb ish` before it orders the
+    /// `tlbi vaae1is`: by VA, ALL ASIDs, Inner-Shareable (every core), so an invalidate made here is
+    /// visible machine-wide whoever calls it. (The neutral shootdown path that called it was deleted,
+    /// `backlog/80` K20; the seam member stays because every port answers it.) The `dsb ish` before it orders the
     /// page-table write that preceded; the one after waits for the invalidate to complete, and the
     /// `isb` keeps already-fetched instructions from using a stale translation.
     ///
@@ -2817,7 +2813,10 @@ pub mod page_tables {
     /// died, and only show up as the machine slowly running out of memory with nothing to point at.
     ///
     /// # Safety
-    /// `cr3` must belong to a task already Dead, with `TTBR0_EL1` switched away and invalidated.
+    /// `cr3` must belong to a task already Dead that no core is running or still leaving
+    /// (`core_still_using`). An IDLE core may still have this root in `TTBR0_EL1`: it is invalidated
+    /// inner-shareable by `free_page_table_root`, after this walk and before the root is freed, and
+    /// an idle core makes no access through TTBR0 before its next switch, which flushes first.
     #[cfg(feature = "pi4")]
     pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
         // SAFETY: caller's contract.

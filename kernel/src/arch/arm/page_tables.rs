@@ -314,8 +314,9 @@ pub fn read_page_table_base() -> u64 {
 /// Install a new address space (`TTBR0`), then ISB so the next fetch uses it. NO TLB maintenance:
 /// an ARMv7 TTBR0 write does not flush non-global entries (SEC-26/27). Every service now has its own
 /// L1, so the flush is owed - and it is paid in `context_switch.rs`, which issues `TLBIALL` whenever
-/// TTBR0 changes, not here. The one neutral caller of this function, the `!0` reload in
-/// `smp::ipi::invalidate`, therefore flushes nothing on this port (`arch/CLAUDE.md`).
+/// TTBR0 changes, not here. No neutral code calls this now: its one neutral caller was the TLB
+/// shootdown's full-flush reload, deleted on 2026-10-10 with the shootdown (`backlog/80` K20), and it
+/// never flushed anything on this port (`arch/CLAUDE.md`).
 pub unsafe fn write_page_table_base(base: u64) {
     // SAFETY: `mcr p15, 0, _, c2, c0, 0` writes TTBR0 at PL1; ISB ensures the following instruction
     // is fetched under the new tables. Caller guarantees `base` is a valid 16 KiB-aligned L1.

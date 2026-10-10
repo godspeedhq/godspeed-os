@@ -18,7 +18,7 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/syscall.rs` | 8 | permitted (§18.1 - the syscall ABI) |
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
-| `sdk/rust/src/adversarial.rs` | 8 | permitted (§18.1 - the red-team module) |
+| `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
 | `sdk/rust/src/service_context.rs` | **80** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/80 K14) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
@@ -40,6 +40,23 @@ Both floors are enforced: a new `unsafe` in any other `sdk/` file FAILS, and eit
 FAILS. They may decrease freely.
 
 ---
+
+## 2026-10-10 - the unused TLB shootdown deleted; P7 tests the property (backlog/80 K20)
+
+The cross-core software TLB broadcast in `smp/ipi.rs` had no caller. It was deleted after a per-port
+proof that translation coherence holds without it (CLAUDE.md 10.5): nothing unmaps a live user mapping,
+the kill path frees nothing until no core runs or is still leaving the task, every switch invalidates on
+its own core, and AArch64's free invalidates inner-shareable for the idle core that keeps the dead root.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `smp/ipi.rs` | 17 -> 4 (-13) | **shrank**: `broadcast_tlb_shootdown`, `broadcast_full_tlb_flush`, `request_and_wait`, `service_pending`, `handle_tlb_shootdown`, `publish_expected`, `this_core`, `invalidate`, the per-core request slots and their ack and expected arenas. What is left is `send_ipi` and `ipi_handler`. |
+| `smp/percpu.rs` | 8 -> 6 (-2) | **shrank**: `alloc_atomic_u64_slice`, which carved only the shootdown's ack arenas. |
+| `arch/x86_64/boot.rs` | 107 -> 103 (-4) | **shrank**: `broadcast_ipi_all_but_self` (the fn and its ICR block) and the `ipi_tlb_stub` naked stub (attribute and fn) that IDT 0xF1 pointed at; 0xF1 now takes the default `exception_halt`, as any unused vector does. |
+| `arch/aarch64/mod.rs` | 74 -> 73 (-1) | **shrank**: `broadcast_ipi_all_but_self`; the SGI id it used (`SGI_TLB`) is retired with it. |
+| `arch/riscv64/mod.rs` | 67 -> 64 (-3) | **shrank**: `broadcast_ipi_all_but_self` (the fn, its id read and its per-hart send). |
+| `arch/arm/mod.rs`, `arch/loongarch64/mod.rs`, `arch/riscv32/mod.rs`, `arch/s390x/mod.rs` | -1 each | **shrank**: the empty `broadcast_ipi_all_but_self` stub. |
+| `sdk/rust/src/adversarial.rs` | 8 -> 10 (+2) | **The P7 stale-translation test** (permitted module, 18.1). `Region`, a run of pages that can only be built from a successful `AllocMem`, with `stamp` (one `write_volatile` per 32-bit word) and `first_not` (one `read_volatile` per word). Sound because the constructor is the only way to make one: the pages are mapped, writable, private to the task, page-aligned, and no Rust reference points into them. It lets the `probe` service stay `unsafe`-free while P7 stamps a writer's pages and has a checker given the same addresses read them. |
 
 ## 2026-10-10 - the spawn-by-name syscalls retired; EHCI INTx follows its driver (backlog/80 K14, K17)
 
@@ -2655,7 +2672,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 74 | permitted |
+| arch/aarch64/mod.rs | 73 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |
@@ -2691,9 +2708,9 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 15 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 53 | permitted |
-| arch/loongarch64/mod.rs | 25 | permitted |
-| arch/riscv32/mod.rs | 25 | permitted |
+| arch/arm/mod.rs | 52 | permitted |
+| arch/loongarch64/mod.rs | 24 | permitted |
+| arch/riscv32/mod.rs | 24 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
 | arch/riscv64/sbi.rs | 11 | permitted |
 | arch/riscv64/sv39.rs | 29 | permitted |
@@ -2703,10 +2720,10 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/usermode.rs | 17 | permitted |
 | arch/riscv64/uaccess.rs | 7 | permitted |
 | arch/riscv64/display.rs | 6 | permitted |
-| arch/riscv64/mod.rs | 67 | permitted |
-| arch/s390x/mod.rs | 20 | permitted |
+| arch/riscv64/mod.rs | 64 | permitted |
+| arch/s390x/mod.rs | 19 | permitted |
 | arch/x86_64/ap_boot.rs | 3 | permitted |
-| arch/x86_64/boot.rs | 107 | permitted |
+| arch/x86_64/boot.rs | 103 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 2 | permitted |
 | arch/x86_64/interrupts.rs | 26 | permitted |
@@ -2722,9 +2739,9 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
-| smp/ipi.rs | 17 | permitted |
+| smp/ipi.rs | 4 | permitted |
 | smp/mod.rs | 1 | permitted |
-| smp/percpu.rs | 8 | permitted |
+| smp/percpu.rs | 6 | permitted |
 | smp/names.rs | 4 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
@@ -2735,9 +2752,9 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 1157 lines across 72 files  
+**Permitted total:** 1130 lines across 72 files  
 **Grandfathered total:** 50 lines across 6 files  
-**Grand total:** 1207 lines across 78 files
+**Grand total:** 1180 lines across 78 files
 
 > These three lines read 394/22, 53/6 and 447/28 until 2026-09-12 - a tree of 28 files that had not
 > existed for months, and a grand total 2.7x low. They are derived by summing the inventory block

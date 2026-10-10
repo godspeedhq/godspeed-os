@@ -246,6 +246,7 @@ const MODE_ADV_FAULT_GP:    u32 = 210; // ring-3 #GP (non-canonical read) → ke
 const MODE_ADV_FAULT_DE:    u32 = 211; // ring-3 #DE (inline-asm div0)    → kernel kills service
 const MODE_ADV_FAULT_MON:   u32 = 212; // witness: yields then logs pass (system survived both faults)
 const MODE_ADV_FAULT_UC:    u32 = 213; // A15/V1: bad user pointer to `log` → kernel kills caller (USER-COPY PF)
+const MODE_PROP_P7_VICTIM:  u32 = 215; // P7's writer or checker, told which by the P7 driver
 const MODE_ADV_FAULT_UC_MON: u32 = 214; // A15 witness: yields then logs pass (system survived the user-copy fault)
 const MODE_CHAOS_C3:        u32 = 93; // 500 alloc-deny cycles without panic
 const MODE_CHAOS_C5:        u32 = 94; // 100-level recursive yield_now(); stack depth probe
@@ -374,6 +375,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_PROP_P4         => mode_prop_p4(&ctx),
         MODE_PROP_P5         => mode_prop_p5(&ctx),
         MODE_PROP_P7         => mode_prop_p7(&ctx),
+        MODE_PROP_P7_VICTIM  => mode_prop_p7_victim(&ctx),
         MODE_FUZZ_F1         => mode_fuzz_f1(&ctx),
         MODE_FUZZ_F2         => mode_fuzz_f2(&ctx),
         MODE_FUZZ_F5         => mode_fuzz_f5(&ctx),
@@ -976,31 +978,191 @@ fn mode_prop_p5(ctx: &ServiceContext) -> ! {
     idle(ctx)
 }
 
-fn mode_prop_p7(ctx: &ServiceContext) -> ! {
-    // P7 - TLB shootdown leaves no stale mappings (§10.5).
-    // Proxy test: 50 kill/respawn cycles of prop-p7-victim. Each kill runs the
-    // TLB coherence protocol (CORE_CURRENT spin-wait ensures every other core has
-    // loaded a different CR3, flushing non-global TLBs) before frame reclaim.
-    // Generation monotonicity via InspectKernel(2) confirms the full kill lifecycle
-    // completed correctly. No kernel panic over 50 cycles = shootdown protocol
-    // is sound under concurrent SMP activity.
-    //
-    // The generation is read AFTER respawn (the live instance), not after the kill:
-    // unregister-on-death (§14.2, the self-heal) clears the dead service's name, so a
-    // by-name read in the dead window returns 0. The new instance's generation comes
-    // from the global counter, so it strictly increases every cycle (§7.5).
-    let mut prev_gen: u64 = 0;
-    for _ in 0..50u32 {
-        let _ = ctx.kill("prop-p7-victim");
-        let _ = table::probe(ctx, "prop-p7-victim");
-        let gen = ctx.inspect_endpoint_generation("prop-p7-victim");
-        if gen <= prev_gen {
-            ctx.log("prop: P7 FAIL - generation not monotonic across kill/respawn (TLB lifecycle broken)");
-            idle(ctx);
+// P7's victim protocol. The driver spawns `prop-p7-victim` on a core it picks, the victim says READY,
+// and the driver tells it what to be. One row and one name for every role, because the roles never
+// overlap: a writer is dead before its checker is spawned.
+const P7_READY:   u8 = b'r';
+const P7_WRITE:   u8 = b'w'; // stamp, say STAMPED, keep stamping until killed from another core
+const P7_SELF:    u8 = b'f'; // stamp, say STAMPED, then fault: the self-kill path
+const P7_CHECK:   u8 = b'c'; // take fresh pages and report whether any word is not zero
+const P7_STAMPED: u8 = b's';
+const P7_CLEAN:   u8 = b'0';
+const P7_DIRTY:   u8 = b'1';
+const P7_NOMEM:   u8 = b'm';
+/// 64 KiB: enough pages that a stale entry for any of them is seen, few enough that a cycle is quick.
+const P7_PAGES: usize = 16;
+/// The writer's mark. Zero is what a fresh page holds, so any other value read by a checker is wrong;
+/// this one is distinctive enough that a report naming it says where it came from.
+const P7_PATTERN: u32 = 0xD7AD_7A5C;
+const P7_CYCLES: u32 = 32;
+/// The whole run must finish inside this, whatever the cycle count says (a count is not a duration).
+const P7_BUDGET_SECS: i64 = 150;
+
+fn p7_say(ctx: &ServiceContext, bytes: &[u8]) {
+    let _ = gs::ipc::send(ctx, "prop-p7", &Message::from_bytes(bytes));
+}
+
+fn mode_prop_p7_victim(ctx: &ServiceContext) -> ! {
+    p7_say(ctx, &[P7_READY]);
+    let role = match gs::ipc::recv_within(ctx, 20) {
+        Some(m) => m.payload_bytes().first().copied().unwrap_or(0),
+        None => idle(ctx),
+    };
+    let region = match adversarial::Region::alloc(ctx, P7_PAGES) {
+        Some(r) => r,
+        None => { p7_say(ctx, &[P7_NOMEM]); idle(ctx) }
+    };
+    // All eight bytes: on a 64-bit port the heap starts at 4 GiB, which a u32 truncates to 0.
+    let b = region.base().to_le_bytes();
+    match role {
+        P7_WRITE | P7_SELF => {
+            region.stamp(P7_PATTERN);
+            p7_say(ctx, &[P7_STAMPED, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            if role == P7_SELF {
+                // Die in our own address space: the kill path's self-kill branch, which defers the
+                // root and frees the rest while this core still has the root installed.
+                adversarial::fault_null_read();
+            }
+            // Keep the translations HOT on this core, and keep WRITING through them, until another
+            // core kills us mid-stamp. No yield: a writer that is running when the kill lands is the
+            // case that matters, and preemption still takes the core back every quantum.
+            loop {
+                region.stamp(P7_PATTERN);
+            }
         }
-        prev_gen = gen;
+        P7_CHECK => {
+            match region.first_not(0) {
+                None => p7_say(ctx, &[P7_CLEAN, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+                Some((off, w)) => {
+                    let o = (off as u32).to_le_bytes();
+                    let v = w.to_le_bytes();
+                    p7_say(ctx, &[P7_DIRTY, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                                  o[0], o[1], o[2], o[3], v[0], v[1], v[2], v[3]]);
+                }
+            }
+            idle(ctx)
+        }
+        _ => idle(ctx),
     }
-    ctx.log("prop: P7 pass (50/50)");
+}
+
+/// Wait for the next message from a P7 victim. `None` past the deadline.
+fn p7_hear(ctx: &ServiceContext) -> Option<[u8; 24]> {
+    let m = gs::ipc::recv_within(ctx, 15)?;
+    let mut out = [0u8; 24];
+    let p = m.payload_bytes();
+    let n = p.len().min(24);
+    out[..n].copy_from_slice(&p[..n]);
+    Some(out)
+}
+
+/// The base address a victim reported, bytes 1-8 of its message.
+fn p7_base(m: &[u8; 24]) -> u64 {
+    u64::from_le_bytes([m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]])
+}
+
+/// Spawn `prop-p7-victim` on `core`, wait for READY, and tell it its role.
+fn p7_start(ctx: &ServiceContext, core: u32, role: u8) -> Result<(), &'static str> {
+    let r = table::row("prop-p7-victim").ok_or("no prop-p7-victim row")?;
+    spawn_probe_row(ctx, (r.0, r.1, r.2, r.3, Some(core), r.5)).map_err(|_| "victim spawn failed")?;
+    match p7_hear(ctx) {
+        Some(m) if m[0] == P7_READY => {}
+        Some(_) => return Err("victim spoke out of turn"),
+        None => return Err("victim never said ready"),
+    }
+    let cap = gs::cap::acquire(ctx, "prop-p7-victim").map_err(|_| "cannot reach the victim")?;
+    let sent = gs::ipc::send_to(ctx, cap, &Message::from_bytes(&[role]));
+    gs::cap::remove(ctx, cap);
+    sent.map_err(|_| "could not send the victim its role")
+}
+
+/// Wait, bounded by the clock, until the victim's name is gone - it has died and been reclaimed.
+fn p7_wait_dead(ctx: &ServiceContext) -> bool {
+    let until = gs::task::uptime_secs(ctx) + 10;
+    while gs::task::uptime_secs(ctx) <= until {
+        if ctx.inspect_endpoint_generation("prop-p7-victim") == 0 { return true; }
+        gs::task::yield_now(ctx);
+    }
+    false
+}
+
+fn p7_fail(ctx: &ServiceContext, cycle: u32, why: &str) -> ! {
+    ctx.log_fmt(format_args!("prop: P7 FAIL - cycle {} of {}: {}", cycle + 1, P7_CYCLES, why));
+    idle(ctx)
+}
+
+fn mode_prop_p7(ctx: &ServiceContext) -> ! {
+    // P7 - after a task dies, no core can reach its memory through a translation it left behind
+    // (CLAUDE.md 10.5).
+    //
+    // This used to be a proxy: 50 kill/respawn cycles checking that a generation kept rising, which
+    // says nothing about a TLB. Now it tests the property. Each cycle:
+    //   1. a WRITER on core 1 stamps a pattern into 16 fresh pages and says so;
+    //   2. it dies - killed from this core (core 0, the cross-core kill path) on even cycles, by its
+    //      own fault on odd ones (the self-kill path, which frees most of the space while the dying
+    //      core still has its root installed);
+    //   3. a CHECKER is spawned - on core 1, where the writer's translations were hot, on cycles
+    //      0 and 1 mod 4, and on core 2 otherwise - and takes 16 fresh pages. AllocMem grows every task
+    //      from the same base, so it gets the writer's virtual addresses, and the kernel zero-fills
+    //      what it maps. Any word that is not zero was read through a translation the writer left.
+    //
+    // There is no TLB shootdown in this kernel to exercise (it was deleted, `backlog/80` K20); what
+    // keeps a checker honest is the kill path's quiescence wait and the invalidate every switch does
+    // on its own core. This test is what says whether that is enough. The base each side reports is
+    // compared too, so a checker that got DIFFERENT addresses cannot pass vacuously.
+    let start = gs::task::uptime_secs(ctx);
+    for cycle in 0..P7_CYCLES {
+        if gs::task::uptime_secs(ctx) - start > P7_BUDGET_SECS {
+            p7_fail(ctx, cycle, "out of time - the run took longer than its budget");
+        }
+        let self_kill = cycle % 2 == 1;
+        if let Err(why) = p7_start(ctx, 1, if self_kill { P7_SELF } else { P7_WRITE }) {
+            p7_fail(ctx, cycle, why);
+        }
+        let wbase = match p7_hear(ctx) {
+            Some(m) if m[0] == P7_STAMPED => p7_base(&m),
+            Some(m) if m[0] == P7_NOMEM => p7_fail(ctx, cycle, "the writer was refused memory"),
+            Some(_) => p7_fail(ctx, cycle, "the writer said something other than STAMPED"),
+            None => p7_fail(ctx, cycle, "the writer never stamped"),
+        };
+        if !self_kill {
+            let _ = ctx.kill("prop-p7-victim");
+        }
+        if !p7_wait_dead(ctx) {
+            p7_fail(ctx, cycle, if self_kill { "the self-faulting writer did not die" }
+                                else { "the killed writer did not die" });
+        }
+        let core = if cycle % 4 < 2 { 1 } else { 2 };
+        if let Err(why) = p7_start(ctx, core, P7_CHECK) {
+            p7_fail(ctx, cycle, why);
+        }
+        match p7_hear(ctx) {
+            Some(m) if m[0] == P7_CLEAN => {
+                if p7_base(&m) != wbase {
+                    p7_fail(ctx, cycle, "the checker was given different addresses - nothing was tested");
+                }
+            }
+            Some(m) if m[0] == P7_DIRTY => {
+                let off = u32::from_le_bytes([m[9], m[10], m[11], m[12]]);
+                let val = u32::from_le_bytes([m[13], m[14], m[15], m[16]]);
+                ctx.log_fmt(format_args!(
+                    "prop: P7 FAIL - cycle {} of {}: a STALE TRANSLATION - the checker on core {} read \
+                     {:#010x} at offset {:#x} of a page the kernel zero-filled ({} writer, base {:#x})",
+                    cycle + 1, P7_CYCLES, core, val, off,
+                    if self_kill { "self-killed" } else { "cross-core killed" },
+                    wbase));
+                idle(ctx)
+            }
+            Some(m) if m[0] == P7_NOMEM => p7_fail(ctx, cycle, "the checker was refused memory"),
+            Some(_) => p7_fail(ctx, cycle, "the checker answered something else"),
+            None => p7_fail(ctx, cycle, "the checker never answered"),
+        }
+        let _ = ctx.kill("prop-p7-victim");
+        if !p7_wait_dead(ctx) {
+            p7_fail(ctx, cycle, "the checker did not die");
+        }
+    }
+    ctx.log_fmt(format_args!("prop: P7 pass ({}/{})", P7_CYCLES, P7_CYCLES));
     idle(ctx)
 }
 

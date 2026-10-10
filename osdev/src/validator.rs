@@ -269,11 +269,12 @@ static PROPERTY_TESTS: &[TestSpec] = &[
         },
     },
     TestSpec {
-        id: "P7", name: "tlb_shootdown_no_stale_mappings", spec_ref: "§10.5",
+        id: "P7", name: "no_stale_translation_after_death", spec_ref: "§10.5",
         kind: TestKind::WatchSerial {
-            expect:       &["prop: P7 pass (50/50)"],
+            expect:       &["prop: P7 pass (32/32)"],
             fail_on:      &["KERNEL PANIC", "prop: P7 FAIL"],
-            timeout_secs: 60,
+            // 64 spawns through the supervisor's queue, shared with every other property probe.
+            timeout_secs: 180,
         },
     },
     TestSpec {

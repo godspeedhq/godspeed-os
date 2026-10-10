@@ -1395,10 +1395,10 @@ pub fn run(core_id: u32) -> ! {
         drain_pending_kstack(cid);
 
         // Path C / Phase 6: respawn the supervisor here if it died - an IF=1 scheduling point, NOT the
-        // timer ISR. `spawn_supervisor` is a full ~22 ms service spawn that issues all-core TLB
-        // shootdowns; running it from the Core-0 timer ISR (IF=0, where it used to live, via
-        // process_pending) wedged the box under a storm: Core 0 could not ACK other cores' shootdown /
-        // WAKE_RECEIVER IPIs while stuck in the IF=0 spawn - the exact hazard process_pending's own
+        // timer ISR. `spawn_supervisor` is a full ~22 ms service spawn, which when this was written also
+        // issued all-core TLB shootdowns (that broadcast is gone, `backlog/80` K20); running it from the
+        // Core-0 timer ISR (IF=0, where it used to live, via process_pending) wedged the box under a
+        // storm: Core 0 could not take other cores' IPIs while stuck in the IF=0 spawn - the exact hazard process_pending's own
         // comment warns about (it bounds the COM2 drain for the same reason). Here CORE_CURRENT is IDLE
         // and interrupts are enabled (the prior iteration's `sti`/`wait_for_interrupt`), so the spawn
         // participates in cross-core IPI protocols normally. Runs every scheduler iteration on Core 0,
@@ -1629,7 +1629,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // last-resort recovery anchor (§6.3): if it stalls silently nothing recovers it, so it must at
         // minimum fail loud. Armed only once the TSC quantum is calibrated (real hardware, TSC-Deadline
         // mode); QEMU's periodic tick has no calibrated rate (0), so it is skipped - and a normal
-        // shootdown/critical-section is milliseconds, so the ~3 s deadline cannot false-fire.
+        // critical section is milliseconds, so the ~3 s deadline cannot false-fire.
         let now = crate::arch::imp::read_cycle_counter();
         CORE_LAST_TICK_TSC.get(cid).0.store(now, Ordering::Relaxed);
         // What this core had taken at this stamp, so a panic can say what came AFTER it (see
@@ -1821,8 +1821,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
 
         // Path C / Phase 6: if a supervisor respawn is pending, land Core 0 in the SCHEDULER context
         // (run()'s loop) instead of switching to `next`, so the heavy ~22 ms spawn runs from run()'s
-        // loop top with IF=1 - NEVER here in the IF=0 ISR, where it can't ACK other cores' TLB-shootdown
-        // / WAKE_RECEIVER IPIs and wedges the box under a storm (the architectural proof; see
+        // loop top with IF=1 - NEVER here in the IF=0 ISR, where it can't take other cores' IPIs and
+        // wedged the box under a storm (the architectural proof; see
         // scheduler::run). `next` is left untouched (still Ready), so
         // pick_next re-picks it after the respawn. `prev` was set Ready by the CAS above, so it too is
         // rescheduled. This mirrors the is_dead switch above, but saves `prev` (it is live) so it resumes.
@@ -2879,15 +2879,22 @@ pub fn kill_task_by_slot(slot: usize) {
         // Reclaim all user-space frames: walk the page table and return each
         // frame to the allocator (§10.5).
         //
-        // TLB coherence: the spin-wait above guarantees every other core has
-        // loaded a *different* CR3 since last running this task.  A CR3 reload
-        // flushes all non-global TLB entries, so no core retains stale
-        // translations for this task's virtual addresses.  A separate TLB
-        // shootdown IPI would therefore be redundant - and dangerous: if a
-        // remote core is mid-syscall with IF=0 (e.g. loading an ELF for a
-        // concurrent spawn), it cannot ACK the IPI, causing the caller to spin
-        // indefinitely (deadlock).  We skip the broadcast and rely solely on
-        // the spin-wait guarantee.
+        // TLB coherence (§10.5). The spin-wait above guarantees no other core is
+        // running this task or still leaving it (`core_still_using`, which reads
+        // CORE_CURRENT and CORE_LEAVING). Leaving runs the outgoing switch to
+        // the end, and every port's switch invalidates on its own core: x86
+        // writes CR3 (no PCID, no global user pages), ARMv7 issues TLBIALL when
+        // TTBR0 changes, RISC-V issues sfence.vma after writing satp, and
+        // AArch64 flushes on every switch. Idle cores on x86, ARMv7 and RISC-V
+        // run on the kernel root, so no core can still walk this space.
+        //
+        // AArch64 is the exception to that last sentence: an idle core keeps the
+        // dead root in TTBR0 and may walk it speculatively, so its
+        // `free_page_table_root` invalidates inner-shareable (`tlbi vmalle1is`)
+        // before the root goes. No software broadcast exists or is needed; the
+        // one that sat in smp/ipi.rs had no caller and was deleted (`backlog/80`
+        // K20). A broadcast here would also be dangerous: a remote core spinning
+        // IF=0 cannot acknowledge one, and the caller would spin with it.
         let freed_frames: usize;
         if TASK_IS_USER[slot] {
             let cr3 = TASK_CTX[slot].assume_init_ref().cr3;
@@ -2907,7 +2914,9 @@ pub fn kill_task_by_slot(slot: usize) {
                         CORE_PENDING_PML4.get(my_core).store(pml4_phys, Ordering::Release);
                     }
                 } else if pml4_phys != 0 {
-                    // Not a self-kill: no core holds this CR3, so free the page-table root now. Arch-
+                    // Not a self-kill: no core is running or leaving this task, so free the page-table
+                    // root now (AArch64's free invalidates first, for the idle core that still has it
+                    // installed - see the TLB note above). Arch-
                     // neutral: on x86 the root is a general frame (free_frame); on ARM it is an arena L1
                     // slot returned to the arena. Handing an ARM arena L1 to free_frame corrupted the
                     // frame bitmap (the `alloc_frame returned kernel-range frame` panic).
