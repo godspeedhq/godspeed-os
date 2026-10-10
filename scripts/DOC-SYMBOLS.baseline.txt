@@ -86,3 +86,4 @@ alc225_init                        # docs/audio.md - Linux patch_realtek.c, EXTE
 bxt_reduce_dma_latency             # docs/audio.md - Linux hda_intel.c, EXTERNAL; the Apollo Lake DMA quirk A6 checked does not apply to Gemini Lake
 ATI_SB450_HDAUDIO_ENABLE_SNOOP     # docs/audio.md - Linux hda_intel.c, EXTERNAL; the AMD Azalia snoop bit at config 0x42 the T630 card read already set
 ALC256_FIXUP_HP_HEADSET_MIC        # docs/audio.md - Linux patch_realtek.c, EXTERNAL; the one quirk Linux applies to the T630 (103c:8158), headset-jack detection only
+boot_blockdev_qemu                 # backlog/80 R2 - DELETED by 0f7ebce1 (no callers; booted the retired ATA channel); a record of a removal must name what was removed

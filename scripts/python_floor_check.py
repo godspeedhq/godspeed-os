@@ -66,6 +66,14 @@ CHECKS = [
      "signature"),
 ]
 
+# STANDARD-LIBRARY MODULES newer than the floor. `import tomllib` is a ModuleNotFoundError on 3.10,
+# and `scripts/commandments.py` - the first checker of every build - did exactly that while this
+# file reported the floor true, because it looked at syntax and never at imports (backlog/80 T1).
+# An import is fine inside `try:` with an `except ImportError` fallback, which is how
+# `scripts/toml_compat.py` does it; the guard is "the line before it is `try:`".
+NEW_MODULES = {"tomllib": (3, 11), "zoneinfo": (3, 9), "graphlib": (3, 9)}
+NEW_IMPORT = re.compile(r"^\s*(?:import|from)\s+(%s)\b" % "|".join(NEW_MODULES))
+
 # PEP 563: with this import no annotation in the module is evaluated, so the two annotation checks
 # above do not apply to it.
 FUTURE_ANNOTATIONS = re.compile(r"^from __future__ import (?:[\w, ]*\b)?annotations\b", re.M)
@@ -88,6 +96,7 @@ def main():
         text = io.open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace").read()
         postponed = bool(FUTURE_ANNOTATIONS.search(text))
         in_doc = False
+        prev = ""
         for n, line in enumerate(text.split("\n"), 1):
             # Skip docstrings and comments: this file NAMES `match` and `removeprefix` in its own
             # prose, and a checker that fails on its own explanation is the self-reference trap that
@@ -98,6 +107,16 @@ def main():
                 continue
             if in_doc or line.lstrip().startswith("#"):
                 continue
+
+            m = NEW_IMPORT.match(line)
+            if m and NEW_MODULES[m.group(1)] > FLOOR and prev.strip() != "try:":
+                ver = NEW_MODULES[m.group(1)]
+                problems.append((rel, n, "%d.%d" % ver,
+                                 "`%s` is not in the standard library before %d.%d (guard it with "
+                                 "`try:` / `except ImportError`)" % (m.group(1), ver[0], ver[1]),
+                                 line.strip()[:76]))
+            if line.strip():
+                prev = line
 
             for ver, what, pat, context in CHECKS:
                 if ver <= FLOOR:

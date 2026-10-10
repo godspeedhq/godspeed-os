@@ -1,7 +1,8 @@
 # Commandment X: what is enforced, and what is left to judgement
 
-**Status:** the honest boundary of `X-user-vocabulary`, written so that "10 of 10 commandments
-mechanised" is not read as "Commandment X is enforced".
+**Status:** the honest boundary of `X-user-vocabulary`, written so that "Commandment X has a check" is
+not read as "Commandment X is enforced". (The checker reported "10 of 10 commandments mechanised"
+until 2026-10-10; it counted a baseline check as a commandment, and VIII has none. It says 9 now.)
 
 Commandment X is two sentences, and they are different problems.
 
