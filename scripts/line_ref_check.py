@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import conform_ok               # noqa: E402  - the shared `conform-ok` escape marker
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SKIP_DIRS = ('target', '.git', 'build', 'node_modules', 'book', 'audits', 'milestones', 'bugs')
+SKIP_DIRS = ('target', '.git', 'build', 'node_modules', 'book', 'audits', 'milestones', 'bugs', '.claude')  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
 # `tests/conformance/` is the UI-fixture corpus and the GENERATED gallery, which quote
 # violations VERBATIM - a rotted citation and a POSIX word used as a command are in there on
 # purpose, because that is what they catalogue. Same genre as the `audits/` exemption above:
@@ -65,7 +65,8 @@ def main():
     # lets a site say so, naming this rule and giving a reason.
     supp = conform_ok.Suppressions()
     for root, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS
+                     and not os.path.exists(os.path.join(root, d, ".git"))]
         for name in files:
             if not name.endswith(('.md', '.rs', '.py')):
                 continue
