@@ -1505,7 +1505,9 @@ pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 /// Set the Arm cores to the firmware's minimum (`max = false`) or maximum (`max = true`) rate, and return
 /// what they read back in Hz. The two rates are the FIRMWARE'S - `GET_MIN_CLOCK_RATE` and
 /// `GET_MAX_CLOCK_RATE` for the ARM clock - so the caller can only choose between the firmware's own ends
-/// of the range, never name a frequency. `None` when the firmware does not answer.
+/// of the range, never name a frequency. `None` when the firmware does not answer - including the
+/// read-back: the result is the rate the clock READS, never the rate the set call claimed (CLAUDE.md
+/// 12.3; backlog/80 K23 - this returned the set call's answer when the read-back failed).
 ///
 /// Why a board needs this at all: with no OS asking for a rate, the Pi firmware holds the cores at turbo
 /// for `initial_turbo` seconds after boot (60 by default) and then at their minimum for good
@@ -1517,7 +1519,10 @@ pub fn cpu_clock(max: bool) -> Option<u32> {
     let now = mailbox::arm_clock(mailbox::TAG_GET_CLOCK_RATE);
     crate::kprintln!("cpu-clock: {} rate {} Hz asked - the firmware set {} Hz, the clock reads back {:?}",
                      if max { "maximum" } else { "minimum" }, target, set, now);
-    Some(now.unwrap_or(set))
+    if now.is_none() {
+        crate::kprintln!("cpu-clock: the read-back did not answer - reporting failure, not the {} Hz the set claimed", set);
+    }
+    now
 }
 #[cfg(not(feature = "pi4"))]
 pub fn cpu_clock(_max: bool) -> Option<u32> { None }
