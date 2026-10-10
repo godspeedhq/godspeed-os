@@ -1463,7 +1463,6 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
         t.stat_sent = t.stat_sent.saturating_add(1);
         let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
         t.note_tx(&frame[..n], r.is_some());
-        feed_tx(ctx, pending, t, net, r);
     }
 
     let mut wrote = false;
@@ -1488,7 +1487,6 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
             t.stat_sent = t.stat_sent.saturating_add(1);
             let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
             t.note_tx(&frame[..n], r.is_some());
-            feed_tx(ctx, pending, t, net, r);
             empty = 0;
         } else {
             // Nothing to send: ask for received frames explicitly, or a peer that is talking while
@@ -1798,17 +1796,6 @@ fn feed_batch(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
         pos += fl;
     }
     any
-}
-
-/// Feed the reply to a TRANSMISSION into the state machine. (Note 2026-10-09: that reply carried at
-/// most one raw frame when this was written; `nic-driver` now answers a transmit with one status byte,
-/// so this feeds nothing - a frame arrives only through the drain, `feed_batch`.)
-#[inline(never)]
-fn feed_tx(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net, reply: Option<Message>) -> bool {
-    match reply {
-        Some(m) => feed_frame(ctx, pending, t, net, m.payload_bytes()),
-        None => false,
-    }
 }
 
 /// How long to leave between automatic re-DHCP and gateway-ARP retries while the stack is unconfigured.
