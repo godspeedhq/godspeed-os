@@ -1780,11 +1780,13 @@ fn do_call(
     // §3.1 (no ambient authority): every leg below required a validated cap (SEND/GRANT/RECV).
     crate::invariants::assertions::assert_cap_validated(&Ok(()));
 
-    // 2. The buffer is in/out: read the request from it now, write the reply back into it later, so
-    //    validate it for MAX_MESSAGE_SIZE. That is the `Call` (41) SDK's buffer; a `CallDeadline`
-    //    caller may declare a smaller one (`reply_buf_cap`), and is still validated for the full size.
+    // 2. The buffer is in/out: read the request from it now (`req_len` bytes), write the reply back
+    //    into it later (at most `reply_buf_cap`), so validate it for the larger of the two. `Call`
+    //    (41) passes MAX_MESSAGE_SIZE; a `CallDeadline` caller may declare a smaller buffer, which
+    //    was validated for a full 4 KiB anyway until 2026-10-10 - a buffer near the end of the user
+    //    range was refused although nothing would have touched past it (`backlog/80` K15).
     if req_len as usize > MAX_MESSAGE_SIZE { return ipc_err_to_i64(IpcError::MessageTooLarge); }
-    if !validate_user_ptr(buf_ptr, MAX_MESSAGE_SIZE) { return -1; }
+    if !validate_user_ptr(buf_ptr, (req_len as usize).max(reply_buf_cap)) { return -1; }
 
     // 3. Build the request with the reply cap embedded (mirrors SendWithCap).
     let mut msg = match build_message(buf_ptr, req_len) {
@@ -1945,6 +1947,11 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
         Err(_) => { delegated::release(id); return -1; } // cap table full - don't leak the id
     };
     if !write_user_bytes(out_id_ptr, &id.0.to_le_bytes()) {
+        // The caller cannot be told the id, so it cannot use or revoke what was minted: take both
+        // back rather than leave a resource and a cap no one will ever release. They leaked until
+        // 2026-10-10 (`backlog/80` K15). The cap was only ever in the caller's table.
+        scheduler::current_task_remove_cap(slot);
+        let _ = delegated::revoke_owned(id, owner);
         return -1;
     }
     slot as i64
