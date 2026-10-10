@@ -272,7 +272,7 @@ py scripts/conform.py --explain GS0403
 py scripts/conform.py --list
 ```
 
-A clean tree says `0 would be fixed, 0 need a decision - 24 checks ran, 24 passed`. The count of checks
+A clean tree says `0 would be fixed, 0 need a decision - N checks ran, N passed`. The count of checks
 that RAN is there on purpose: a run that silently skipped twelve of them and printed a clean verdict is
 the failure the whole thing exists to prevent.
 

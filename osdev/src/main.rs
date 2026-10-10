@@ -409,7 +409,10 @@ fn clean_supervisor() {
 /// committed and shipped from here, and only the ARM build refused it - days later, by accident.
 ///
 /// Listed explicitly rather than discovered from the directory, so that ADDING a checker is a
-/// decision each build path makes, not something that silently changes what a build enforces.
+/// decision, not something that silently changes what a build enforces. It is ONE decision: the board
+/// builds read this list (`scripts/build_gates.py`), as `conform.py` does. They each carried their own
+/// copy of seven until 2026-10-10, and every checker added since had been added here alone
+/// (backlog/80 T8).
 const EXTRA_CHECKS: &[&str] = &[
     "scripts/dash_check.py",
     "scripts/unsafe_check.py",
@@ -509,6 +512,10 @@ const EXTRA_CHECKS: &[&str] = &[
     // `wifi-driver/build.rs` row and the script did not) and nothing said so - `backlog/80` T2. On
     // any other branch it is silent by design, so it costs nothing here but the guide cross-check.
     "scripts/port_scope_check.py",
+    // Every service the supervisor MANAGES is embedded in its image, on every arch. Each board build ran
+    // it for its own arch and `osdev build` for none, so x86 - which has no `_built` list in
+    // kernel/build.rs - was never checked at all (backlog/80 T7). With no arguments it checks all four.
+    "scripts/service_embed_check.py",
 ];
 
 /// `osdev conform` - forward to `scripts/conform.py` and pass its exit code through.
