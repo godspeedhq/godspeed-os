@@ -34,8 +34,8 @@ pub unsafe extern "C" fn _start() -> ! {
         "la   t1, __bss_end",
         "1:",
         "bgeu t0, t1, 2f",
-        "sd   zero, 0(t0)",
-        "addi t0, t0, 8",
+        "sw   zero, 0(t0)", // RV32: no `sd`, and a 4-byte word (backlog/80 K24)
+        "addi t0, t0, 4",
         "j    1b",
         "2:",
         "call {main}",
@@ -91,9 +91,9 @@ pub enum MemoryKind {
 
 // ---- Lifecycle ----
 pub fn ap_count() -> usize { 0 }
-pub fn init(boot_info: &BootInfo) { unimplemented!("aarch64::init") }
-pub fn init_timer() { unimplemented!("aarch64::init_timer") }
-pub fn ap_init(core_id: u32) { unimplemented!("aarch64::ap_init") }
+pub fn init(boot_info: &BootInfo) { unimplemented!("riscv32::init") }
+pub fn init_timer() { unimplemented!("riscv32::init_timer") }
+pub fn ap_init(core_id: u32) { unimplemented!("riscv32::ap_init") }
 
 pub use interrupts::{disable_interrupts, enable_interrupts, wait_for_interrupt, local_irq_save, local_irq_restore};
 pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tlb_page};
@@ -163,7 +163,7 @@ pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, 
 /// Unimplemented on this stub.
 /// # Safety: caller guarantees `top` is a valid aligned stack top; nothing live is on the old stack.
 #[inline(always)]
-pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("aarch64::switch_to_boot_stack") }
+pub unsafe fn switch_to_boot_stack(top: u64) { unimplemented!("riscv32::switch_to_boot_stack") }
 
 /// The ELF `e_machine` and `EI_CLASS` this arch's service binaries carry (RISC-V, ELFCLASS32).
 /// The neutral loader checks a candidate ELF against these, so it can parse a 32-bit ARM
