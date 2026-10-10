@@ -1713,6 +1713,31 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("drives flash") && r.contains("drives flash 0 data"), "subcommand help: drives flash help + example"),
         None    => { println!("shell-test: FAIL - timed out after `drives flash help`"); fail += 1; }
     }
+    // backlog/80 H8: seven commands answered a command and not `help` / `version`. `fmt help` read
+    // "help" as a PATH, `tcp version` printed the usage, and `whatis` called all seven unknown.
+    send(&mut write_half, b"fmt help\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("fmt check <path>") && !r.contains("not found"), "fmt help: the help block, not a path called help (H8)"),
+        None    => { println!("shell-test: FAIL - timed out after `fmt help`"); fail += 1; }
+    }
+    send(&mut write_half, b"tcp version\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains(&format!("tcp {ver}")) && !r.contains("usage: tcp"), "tcp version: the version, not the usage (H8)"),
+        None    => { println!("shell-test: FAIL - timed out after `tcp version`"); fail += 1; }
+    }
+    send(&mut write_half, b"whatis spawncap\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("spawncap: shell built-in"), "whatis spawncap: a shell built-in, not unknown (H8)"),
+        None    => { println!("shell-test: FAIL - timed out after `whatis spawncap`"); fail += 1; }
+    }
+    // backlog/80 H2: the refusal named three targets while the gate held eleven.
+    send(&mut write_half, b"chaos kill-storm nosuch\r");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("not a kill-storm target") && r.contains("net-stack") && r.contains("dwc2")
+                          && !r.contains("only supervisor/block-driver/fs"),
+                          "chaos kill-storm: a refused target lists the real targets, from the array (H2)"),
+        None    => { println!("shell-test: FAIL - timed out after `chaos kill-storm nosuch`"); fail += 1; }
+    }
     // Record-pipe verbs self-document too (utilities/31_records.md): they are pipe-only
     // stages, but `<verb> help` / `<verb> version` still resolve via the UTILS intercept.
     send(&mut write_half, b"where help\r");

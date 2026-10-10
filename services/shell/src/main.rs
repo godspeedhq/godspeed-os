@@ -163,6 +163,8 @@ const OP_SCRUB: u8 = 29; // scrub: read-only CRC integrity sweep (reports, chang
 // large-file streaming ops (offset-addressed): create a sized file, then write/read chunks.
 const OP_WRITE_NEW: u8 = 24; // [op, plen, path, total:u64]
 const OP_WRITE_AT: u8 = 25;  // [op, plen, path, offset:u64, chunk]
+const OP_WRITE_AT_J: u8 = 28; // as OP_WRITE_AT, journaled - named here for `op_is_mutating`
+const OP_SEAL: u8 = 31;       // seal a file read-only - named here for `op_is_mutating`
 const OP_READ_AT: u8 = 26;   // [op, plen, path, offset:u64, len:u32] -> [FS_OK, n:u32, bytes]
 // One streaming chunk: the most file bytes carried per message (matches fs MAX_FILE_BYTES =
 // 7 data-block payloads). Must be a multiple of the 508-byte data payload so WRITE_AT offsets
@@ -1054,8 +1056,10 @@ const PRODUCER_COLS: &[(&str, &[&str])] = &[
     ("status",  &["slot", "name", "core", "state", "mem", "queue", "restarts"]),
     ("caps",    &["resource", "rights"]),
     ("drives",  &["index", "label", "status", "size_mib", "free_mib"]),
-    ("roster",  &["name", "type", "size"]),
-    ("uptime",  &["owner", "text"]),
+    // `roster` and `uptime` offered columns they do not have (`backlog/80` H9). These are the
+    // columns `examples/roster` and `build_uptime_table` build.
+    ("roster",  &["name", "role", "seat"]),
+    ("uptime",  &["uptime", "seconds"]),
 ];
 
 /// Pipe stages whose first argument is a COLUMN of the row flowing into them.
@@ -4024,7 +4028,6 @@ fn dispatch_call(ctx: &ServiceContext, b: &[u8], stmt: &str, ft: &FnTable, fi: u
     true
 }
 
-#[inline(never)]
 /// Parse `let [mut] <name> = $( inner )` for the `$(fn)` capture fast path: returns (name, mutable,
 /// inner) if the statement is a `let` whose WHOLE value is a `$( )` capture, else None (the ordinary
 /// let / producer-capture path handles it). `name` must be a single bare word.
@@ -4069,8 +4072,9 @@ struct Tally { ran: u32, failed: u32, skipped: u32, aborted: bool }
 /// HW-proven - the shell pipe stack-overflow lesson, `docs/pipes.md`). The `ReportBuf` is a modest bounded buffer, so it +
 /// a sub-pipeline's transient buffers fit the user stack - the whole point of saving directly.
 ///
-/// This block was written for an `#[inline(never)]` ("holds the verdict array and drives `execute`
-/// in a loop"); that attribute now sits on `let_capture_form` above, not here (note 2026-10-09).
+/// `#[inline(never)]` because it holds the verdict array and drives `execute` in a loop, on a tight
+/// stack. The attribute had drifted onto `let_capture_form`, a doc comment and a function having been
+/// inserted between it and this one (`backlog/80` H7); it is back where it was written for.
 ///
 /// `quiet` suppresses the per-statement `> stmt` transcript and the end-of-run summary block - for
 /// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
@@ -4079,6 +4083,7 @@ struct Tally { ran: u32, failed: u32, skipped: u32, aborted: bool }
 ///
 /// `tally`: `None` prints the `run:` line itself (a plain `run`); `Some` adds this script's counts to
 /// the caller's total and leaves the line to it (one part of a bigger suite).
+#[inline(never)]
 fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool,
              tally: Option<&mut Tally>, abortable: bool) -> Result<(), ShellError> {
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
@@ -5108,6 +5113,9 @@ const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "read", "write", "edit", "fcap",
+    // Seven that answered a command and not `<cmd> version` / `<cmd> help` (`backlog/80` H8):
+    // `fmt help` read "help" as a path, and `whatis` called all seven unknown.
+    "fmt", "tcp", "serve", "random", "gpio", "spawncap", "spawnwired",
     // `events` and `trace` were absent, so they alone among the utilities answered neither
     // `<util> version` nor `<util> help` - conventions rule 1, unmet since they shipped. Both already
     // HAD help blocks; nothing referred a reader to them. Safe to add: the intercept fires only on
@@ -5241,6 +5249,28 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("fmt <path>", "format the script IN PLACE - one canonical layout, no options", "fmt /script.gsh"),
             ("fmt check <path>", "Ok if already canonical, else loud + Err; never writes", "fmt check /script.gsh"),
             ("fmt <a>,<b>,...", "format (or check) several files - comma-separated, done one at a time", "fmt /x.gsh,/y.gsh"),
+        ], true),
+        "tcp" => help_block(ctx, "tcp", "one TCP transaction: connect, send, print the reply, close", &[
+            ("tcp <ip> <port> [text]", "connect to an IPv4 address (not a name - `net dns` first), send the text, print what comes back; q quits the wait", "tcp 10.0.2.2 8080 hello"),
+        ], true),
+        "serve" => help_block(ctx, "serve", "answer TCP connections on a port, echoing each, until q", &[
+            ("serve <port>", "accept, read, echo and close each connection, until q", "serve 8080"),
+            ("serve <port> <for>", "the same, bounded: 30s, 5m, 2h, 1d or plain seconds", "serve 8080 5m"),
+        ], true),
+        "random" => help_block(ctx, "random", "words from the hardware random number generator", &[
+            ("random", "one 32-bit word, as hex and decimal", "random"),
+            ("random <n>", "n words, 1 to 64", "random 4"),
+        ], true),
+        "gpio" => help_block(ctx, "gpio", "drive a SoC GPIO pin (Raspberry Pi 2 only) - the pins also carry the console and the SD card", &[
+            ("gpio input|output <pin>", "set a pin's direction, 0 to 53", "gpio output 18"),
+            ("gpio high|low <pin>", "drive an output pin", "gpio high 18"),
+            ("gpio read <pin>", "read a pin's level", "gpio read 18"),
+        ], true),
+        "spawncap" => help_block(ctx, "spawncap", "diagnostic: spawn a service and prove the cap to it routes (docs/naming-design.md)", &[
+            ("spawncap <svc>", "ask the supervisor to spawn it and hand back a cap to its endpoint, then send through that cap", "spawncap pong"),
+        ], true),
+        "spawnwired" => help_block(ctx, "spawnwired", "diagnostic: spawn greet wired to pong by a passed cap (docs/naming-design.md)", &[
+            ("spawnwired", "pong logs greet's lines if the supervisor installed the cap", "spawnwired"),
         ], true),
         "selfcheck" => {
             help_block(ctx, "selfcheck", "run the built-in self-check suite (needs a flashed drive)", &[
@@ -5900,6 +5930,7 @@ static HELP: &[HelpRow] = &[
     Row("run <script> [save <out>]", "run a script (.gsh); `save` writes the report to a file"),
     Row("selfcheck [part] [save <out>]", "run the built-in self-check suite, or one named part of it"),
     Row("fcap", "file-as-capability self-check (diagnostic; fcap help)"),
+    Row("fmt <script>", "format a .gsh script to the standard layout, in place (fmt check: report only)"),
     Row("assert ok|fails <cmd>", "verify success/failure (also: … | assert contains X)"),
     Gap,
     Sec("System"),
@@ -5910,6 +5941,8 @@ static HELP: &[HelpRow] = &[
     Row("hardware [section|device]", "this machine's devices and their drivers (records when piped)"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
+    Row("random [n]", "words from the hardware random number generator"),
+    Row("gpio <verb> <pin>", "drive a SoC GPIO pin (Pi 2 only)"),
     Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - watch is built on it)"),
     Row("whatis <name>", "what a name is: built-in / library script / pipe stage / service"),
     Row("net", "network status: IP, gateway, ping"),
@@ -5930,6 +5963,7 @@ static HELP: &[HelpRow] = &[
     Row("spawn <svc>[,svc,...]", "start a service or a comma-list"),
     Row("kill <svc>[,svc,...] | all-services", "stop a service, a comma-list, or every service"),
     Row("restart <name>[,name,...] [core]", "restart a service or a comma-list"),
+    Row("spawncap <svc> / spawnwired", "naming diagnostics: a cap to a spawned service routes (docs/naming-design.md)"),
     Gap,
     Sec("Storage"),
     Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
@@ -5979,6 +6013,8 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Network"),
     Row("sock", "open a UDP socket as a real capability and send through it"),
+    Row("tcp <ip> <port> [text]", "one TCP transaction: connect, send, print the reply"),
+    Row("serve <port> [for]", "answer TCP connections, echoing each, until q"),
     Gap,
     Sec("Power"),
     Row("reboot", "hardware reset"),
@@ -13399,13 +13435,13 @@ fn cmd_random(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Shel
     let n = if a.is_empty() { 1 } else {
         match a.parse::<u32>() {
             Ok(v) => v.clamp(1, 64),
-            Err(_) => { out.line(ctx, "random: count must be a number 1..64"); return Ok(()); }
+            Err(_) => { out.line(ctx, "random: count must be a number 1..64"); return Err(ShellError::Unknown); }
         }
     };
     for _ in 0..n {
         match ctx.hw_random() {
             Some(v) => out.line_fmt(ctx, format_args!("{:#010x}  {}", v, v)),
-            None => { out.line(ctx, "random: no hardware RNG on this machine"); break; }
+            None => { out.line(ctx, "random: no hardware RNG on this machine"); return Err(ShellError::Unknown); }
         }
     }
     Ok(())
@@ -13421,15 +13457,16 @@ fn cmd_gpio(ctx: &ServiceContext, verb: &str, pin_s: &str) -> Result<(), ShellEr
         "high" | "set" | "on" => 2,
         "low" | "clear" | "off" => 3,
         "read" | "get"        => 4,
-        _ => { gs::io::println(ctx, "usage: gpio <input|output|high|low|read> <pin 0..53>"); return Ok(()); }
+        _ => { gs::io::println(ctx, "usage: gpio <input|output|high|low|read> <pin 0..53>"); return Err(ShellError::Unknown); }
     };
     let pin = match pin_s.trim().parse::<u32>() {
         Ok(p) if p <= 53 => p,
-        _ => { gs::io::println(ctx, "gpio: pin must be 0..53"); return Ok(()); }
+        _ => { gs::io::println(ctx, "gpio: pin must be 0..53"); return Err(ShellError::Unknown); }
     };
     let r = ctx.gpio(op, pin);
     if r < 0 {
         gs::io::println(ctx, "gpio: not available on this machine (Pi 2 only)");
+        return Err(ShellError::Unknown);
     } else if op == 4 {
         gs::io::println_fmt(ctx, format_args!("gpio {} = {}", pin, r));
     } else {
@@ -13643,12 +13680,14 @@ fn build_drives_table(ctx: &ShellCtx) -> Option<Table> {
     // Checked here as well as in the device-first path, because this answer is ALWAYS available: it
     // needs no extra peer and no second query, so it holds even when the direct block-driver query
     // cannot be reached (which is exactly what happened on the Pi 4).
-    // NOTE: a zero capacity means NO DRIVE, and `drives_list` reports it as such. This builder feeds
-    // a different consumer and its Table API is not shaped for a one-line message, so it is left
-    // alone deliberately rather than guessed at - the user-visible `drives` path is the one that was
-    // lying, and that is fixed there.
-    let mib = u64_le(&p[2..10]) / 2048;
+    // A zero capacity means NO DRIVE, so the table has NO ROW: `drives | count` answers 0 rather
+    // than counting a `raw 0 MiB` drive that is not there (`backlog/80` H5). A table needs no
+    // one-line message to say "none" - an empty one is the answer.
     let mut t = Table::new(&["index", "label", "status", "size_mib", "free_mib"]);
+    if u64_le(&p[2..10]) == 0 {
+        return Some(t);
+    }
+    let mib = u64_le(&p[2..10]) / 2048;
     if mounted {
         let total = u64_le(&p[10..18]);
         let next = u64_le(&p[18..26]);
@@ -17386,6 +17425,15 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 /// copy inside the completion tables would have been a fifth statement of the same fact.
 const CHAOS_RESTARTABLE: &[&str] = &["supervisor", "block-driver", "fs", "xhci", "ehci", "events",
                                      "nic-driver", "net-stack", "time", "control", "dwc2"];
+/// Print `CHAOS_RESTARTABLE` after `prefix`, so a help line cannot drift from the gate it describes.
+fn chaos_print_targets(ctx: &ServiceContext, prefix: &str) {
+    gs::io::print(ctx, prefix);
+    for (i, s) in CHAOS_RESTARTABLE.iter().enumerate() {
+        gs::io::print(ctx, if i == 0 { " " } else { " | " });
+        gs::io::print(ctx, s);
+    }
+    gs::io::println(ctx, "");
+}
 const CHAOS_DEFAULT_ROUNDS: u32 = 20;
 const CHAOS_MAX_ROUNDS: u32 = 100;        // bounded (§26.6) - a deliberate cap, not a firehose
 // Per-round recovery wait is bounded by REAL wall-clock time (RTC seconds), not a yield count. A
@@ -17466,7 +17514,10 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
         gs::io::println(ctx, "  max-carnage <all-services|svc|svc,svc,...> <n>  all-services = RANDOM storm, or aim/list; TARGET + ROUNDS required");
         gs::io::println(ctx, "                          ('q' aborts; SERIAL only if the run kills the keyboard)");
         gs::io::println(ctx, "  link-flap         [n]   simulate a cable unplug/replug; net-stack self-configures (net only)");
-        gs::io::println(ctx, "  svc: supervisor | block-driver | fs | events | xhci | ehci | shell | nic-driver | net-stack");
+        // The lists come FROM THE ARRAY (`backlog/80` H3): this line used to name nine services by hand,
+        // `shell` among them, which kill-storm refuses.
+        chaos_print_targets(ctx, "  kill-storm / flood-storm svc:");
+        gs::io::println(ctx, "  max-carnage svc: any live service, `shell` included, or all-services");
         return Ok(());
     }
     match tok[0] {
@@ -17494,7 +17545,8 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                     gs::io::println(ctx, "       chaos max-carnage fs,events 100");
                     gs::io::println(ctx, "  add 'yes' as a 4th word to skip the confirm (unattended runs):");
                     gs::io::println(ctx, "       chaos max-carnage all-services 100 yes");
-                    return Ok(());
+                    // A refusal, so an Err: nothing ran (`backlog/80` H20 - this returned Ok).
+                    return Err(ShellError::Unknown);
                 }
                 // Validate the target(s) before launching (a bad name would storm nothing), loudly (invariant 12).
                 let target = tok[1];
@@ -17505,16 +17557,14 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                         if seg.is_empty() { continue; }
                         if slot_of(ctx, seg).is_none() {
                             gs::io::println_fmt(ctx, format_args!("max-carnage: no live service '{}' in the list", seg));
-                            gs::io::println(ctx, "  every comma-separated target must be a live service");
-                            gs::io::println(ctx, "  (block-driver | fs | events | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
-                            return Ok(());
+                            gs::io::println(ctx, "  every comma-separated target must be a live service - `status` lists them");
+                            return Err(ShellError::Unknown);
                         }
                     }
                 } else if target != "all-services" && slot_of(ctx, target).is_none() {
                     gs::io::println_fmt(ctx, format_args!("max-carnage: no live service '{}'.", target));
-                    gs::io::println(ctx, "  target: all-services, one service, or a comma-separated list");
-                    gs::io::println(ctx, "  (block-driver | fs | events | xhci | ehci | shell | supervisor | nic-driver | net-stack)");
-                    return Ok(());
+                    gs::io::println(ctx, "  target: all-services, one live service, or a comma-separated list - `status` lists them");
+                    return Err(ShellError::Unknown);
                 }
                 // Optional words after the rounds, in either order: `yes` skips the confirm, `seed <n>`
                 // sets the random storm's seed. WORDS, not `-y` - utilities/0_conventions.md 4:
@@ -17585,7 +17635,7 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
     let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };
     if slot_of(ctx, "nic-driver").is_none() {
         gs::io::println(ctx, "chaos link-flap: no live nic-driver (is the NIC up?)");
-        return Ok(());
+        return Err(ShellError::Unknown); // nothing was flapped (`backlog/80` H20)
     }
     // Hold each edge long enough for net-stack's ~1s link poll to catch it - this simulates the duration of
     // a real cable event (whose PHY settle is itself seconds on hardware). net-stack self-configures on its
@@ -17617,10 +17667,9 @@ fn chaos_link_flap(ctx: &ServiceContext, tok: &[&str], ntok: usize) -> Result<()
                 // console. Short literals cannot do that.
                 gs::io::println(ctx, 
                     "chaos link-flap: NOT SUPPORTED by this NIC backend - nothing was forced.");
-                gs::io::println(ctx, 
-                    "  The in-kernel ARM NICs have no link override. Unplug the cable to test link \
-recovery for real.");
-                return Ok(());
+                gs::io::println(ctx, "  This NIC backend has no link override. Unplug the cable to test link");
+                gs::io::println(ctx, "  recovery for real.");
+                return Err(ShellError::Unknown); // nothing was forced, so not a success
             }
             _ => {}
         }
@@ -17776,8 +17825,14 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
     }
     let svc = tok[1];
     if !CHAOS_RESTARTABLE.contains(&svc) {
-        gs::io::println_fmt(ctx, format_args!(
-            "chaos: '{}' is not a recoverable target - only supervisor/block-driver/fs recover on death (the supervisor respawns the services; the kernel respawns the supervisor). The kernel itself cannot be killed.", svc));
+        // The list is PRINTED FROM THE ARRAY, as in the usage above. This said "only
+        // supervisor/block-driver/fs recover on death" while the array held eleven (`backlog/80` H2).
+        gs::io::print_fmt(ctx, format_args!("chaos: '{}' is not a kill-storm target - the targets are", svc));
+        for (i, s) in CHAOS_RESTARTABLE.iter().enumerate() {
+            gs::io::print(ctx, if i == 0 { " " } else { ", " });
+            gs::io::print(ctx, s);
+        }
+        gs::io::println(ctx, ". The supervisor respawns the services and the kernel respawns the supervisor; the kernel itself cannot be killed.");
         return Err(ShellError::Unknown);
     }
     // Parse [rounds] and [save <path>] in any order after the service. `rounds` is a bare number;
@@ -18694,7 +18749,9 @@ fn fs_no_answer(ctx: &ShellCtx, verb: &str) {
 /// moment `fs` is not answering. No checker compares the two yet, so a change to either is a change
 /// to both, by hand.
 fn op_is_mutating(op: u8) -> bool {
-    matches!(op, OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT
+    // `OP_WRITE_AT_J` was missing here though `fs` lists it (`backlog/80` H6), and `OP_SEAL` changes
+    // the file too (`fs`'s own list omits it - V3).
+    matches!(op, OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT | OP_WRITE_AT_J | OP_SEAL
                  | OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE)
 }
 
@@ -22000,13 +22057,13 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             }
         }
         refresh_jobs(ctx);
-        let (st, pct, why) = {
+        let (st, pct, why, kind) = {
             let t = ctx.jobs.borrow();
             match t.rows.iter().find(|r| r.used && r.id == want) {
                 Some(r) => (r.state,
                             if r.total == 0 { 100 } else { (r.copied * 100 / r.total) as u32 },
-                            r.why),
-                None => (ST_LOST, 0, 0),
+                            r.why, r.kind),
+                None => (ST_LOST, 0, 0, 0),
             }
         };
         if st != ST_RUNNING {
@@ -22022,9 +22079,18 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             }
             return Ok(());
         }
-        if pct != shown {
-            shown = pct;
-            gs::io::println_fmt(ctx, format_args!("copying... {}%", pct));
+        // Progress as `jobs` shows it: a percentage only where one is measured. A recursive delete,
+        // a check or a scrub is ONE `fs` operation with nothing to count, and used to print
+        // `copying... 100%` while it ran (`backlog/80` H1).
+        if kind == KIND_COPY || kind == KIND_CHURN {
+            if pct != shown {
+                shown = pct;
+                let verb = if kind == KIND_CHURN { "churning" } else { "copying" };
+                gs::io::println_fmt(ctx, format_args!("{}... {}%", verb, pct));
+            }
+        } else if shown == 101 {
+            shown = 0;
+            gs::io::println(ctx, "running - this kind of job has no measurable progress");
         }
         gs::task::yield_now(ctx);
     }

@@ -139,7 +139,7 @@ all: the segment reached us from that address, which is the one fact that never 
 ## Conventions
 
 Obeys most of `utilities/0_conventions.md`: the argument is a word rather than a flag, raw facts
-without editorialising, and `q` escapes every blocking wait. `serve help` prints a usage from
-`cmd_serve` itself, not a versioned `help_block`, and `serve` is not in the shell's `UTILS` list, so
-`serve version` is read as a port and refused - rules 5 and 6 unmet, a code defect. Its argument is a port,
+without editorialising, and `q` escapes every blocking wait. `serve help` prints its
+`help_block` and `serve version` its version (rules 5 and 6); until 2026-10-10 `serve` was missing from
+the shell's `UTILS` list, so `serve version` was read as a port and refused. Its argument is a port,
 never a path, so it is in the shell's `NO_PATH_CMDS` (rule 9).

@@ -107,7 +107,6 @@ issued immediately after an abort can wait behind the one you abandoned.
 ## Conventions
 
 Obeys most of `utilities/0_conventions.md`: arguments are words rather than flags, and the command
-reports raw facts without editorialising. `tcp help` prints a one-line usage from `cmd_tcp` itself,
-not a versioned `help_block`: `tcp` is not in the shell's `UTILS` list, so `tcp version` prints that
-usage instead of a version - rules 5 and 6 unmet, a code defect. Its arguments are an address and a port,
+reports raw facts without editorialising. `tcp help` prints its `help_block` and `tcp version` its version (rules 5 and 6); until 2026-10-10
+`tcp` was missing from the shell's `UTILS` list, so `tcp version` printed the usage instead. Its arguments are an address and a port,
 never a path, so it is in the shell's `NO_PATH_CMDS` (rule 9). Rule 10: the wait is `q`-escapable.

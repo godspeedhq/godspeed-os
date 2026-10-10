@@ -315,9 +315,9 @@ def dispatch_utils_problems():
     missing = sorted(d for d in dispatched if d not in utils and d not in EXEMPT)
 
     # PINNED. Lower it freely when a command gains its help/version intercept; raising it needs a
-    # reason in the commit message. 7 is the state on 2026-09-26: fmt, tcp, serve, random, gpio,
-    # spawncap, spawnwired - each answers a command and cannot answer `version`.
-    BASELINE = 7
+    # reason in the commit message. 7 on 2026-09-26 (fmt, tcp, serve, random, gpio, spawncap,
+    # spawnwired); 0 since 2026-10-10, when all seven joined UTILS with a help block (backlog/80 H8).
+    BASELINE = 0
     if len(missing) > BASELINE:
         problems.append(
             "dispatch/UTILS: %d command(s) the shell answers are absent from UTILS (baseline %d) - %s. "
