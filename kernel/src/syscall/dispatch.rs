@@ -1306,9 +1306,10 @@ fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u6
 /// arg1 = ptr, arg2 = len of a descriptor: `[name_len:u8, name…, count:u8,
 ///        {label_len:u8, label…, slot_lo:u8, slot_hi:u8} × count]` (count ≤ MAX_SEND_PEERS).
 /// Each `slot` names a cap the CALLER holds; the kernel copies it (GRANT-validated, non-escalating
-/// §7.3) into the child under `label`. Returns the endpoint cap slot (>= 0, NOT plus one as in
-/// `SpawnReturningEndpoint`), -2 if the service spawned with no recv endpoint, -1 if the spawn
-/// failed, or a cap error - and -2 is also `CapNotHeld`, so the two cannot be told apart.
+/// §7.3) into the child under `label`. Returns the endpoint cap slot PLUS ONE, as
+/// `SpawnReturningEndpoint` does, so 0 is "spawned, but the service has no recv endpoint"; -1 if the
+/// spawn failed, or a cap error. It returned the bare slot and -2 for "no endpoint" until 2026-10-10,
+/// and -2 is also `CapNotHeld`, so a refusal read as a successful spawn (`backlog/80` K14).
 fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
     let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
@@ -1370,11 +1371,11 @@ fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
             let rid    = crate::capability::cap::ResourceId::from(ep_id);
             let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
             match scheduler::current_task_insert_cap(ep_cap) {
-                Ok(slot) => slot as i64,
+                Ok(slot) => slot as i64 + 1,
                 Err(e)   => cap_err_to_i64(e),
             }
         }
-        Ok(None) => -2, // spawned OK, but the service has no recv endpoint (a producer like `greet`)
+        Ok(None) => 0,  // spawned OK, but the service has no recv endpoint (a producer like `greet`)
         Err(_)   => -1, // spawn failed
     }
 }
