@@ -2468,6 +2468,7 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 
 A side-effect-free system-register read, valid at any point including early boot, which is what makes it safe to take on EVERY log line here. The x86 equivalent is not: core identity there costs an APIC MMIO read with a boot-ordering precondition, and putting it on the serial path was a fix worse than the bug it addressed. Same intent, different cost, different answer. |
 | `arch/x86_64/pci.rs` | 21 -> 22 (+1) | `bar_len` (2026-10-09, backlog/80 K1) - sizes a memory BAR at grant time so a driver's register window is its device's and not a fixed 64 KiB. The standard probe (memory decode off, all ones written to the BAR, the mask read back, BAR and decode restored), as ONE block under `PCI_CONFIG_LOCK`: split across the existing `config_read32`/`config_write32`, each of which takes the lock alone, another core's configuration read could land between the writes and see the BAR holding the mask. Only the command half of the command/status dword is written back, because the status half is write-1-to-clear. Every value written is restored before the lock is released. |
+| `arch/x86_64/syscall_entry.rs` | 16 -> 14 (-2) | **shrank** (2026-10-10, backlog/80 K7): `int80_entry` deleted - the naked `int 0x80` syscall stub and its `#[unsafe(naked)]`. It was still installed at IDT[0x80] with DPL=3, so any service could raise it, and it ran the syscall chain on the top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off. The SDK traps with `ud2` on every x86 machine; nothing used it. |
 | `arch/x86_64/pci.rs` | 20 -> 21 (+1) | `cfg_read_gated` - the one gated configuration read a userspace enumerator needs (step D2). An `out dx, eax` to 0xCF8 and an `in eax, dx` from 0xCFC, held together under the `PCI_CONFIG_LOCK` that already guards this pair.
 
 This block replaces FOUR that an earlier revision of the same feature added (`pci_cfg_out32` / `pci_cfg_in32` in both `arch/x86_64/mod.rs` and `arch/aarch64/mod.rs`, +2 each). Those exposed SELECT and READ as separate operations, which was wrong on its own terms: the index/data pair is stateful, and the kernel drives it too on its spawn and kill paths, so a split interface let a service and the kernel interleave and each act on the other's selected register. A lock could not close that, because holding one across two syscalls means the kernel waiting on a service. Folding them into one atomic operation removed the race AND three of the four unsafe lines, and the aarch64 access moved into `pcie.rs` beside the registers it drives rather than reaching in through an exported pointer helper. Both `mod.rs` files return to their pre-branch counts. |
@@ -2698,7 +2699,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 22 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
-| arch/x86_64/syscall_entry.rs | 16 | permitted |
+| arch/x86_64/syscall_entry.rs | 14 | permitted |
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 48 | permitted |
 | memory/frame.rs | 1 | permitted |

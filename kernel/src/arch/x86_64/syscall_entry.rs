@@ -360,54 +360,6 @@ pub unsafe extern "C" fn syscall_entry() {
     )
 }
 
-/// INT 0x80 syscall entry - superseded by `ud2_syscall_entry` (the SDK traps with `ud2`
-/// on every x86 machine; int $0x80 stalls on the AMD GX-420GI), but still INSTALLED at
-/// IDT[0x80] with DPL=3, so ring-3 can still reach it. Unlike the `ud2` path it does not
-/// move onto the dedicated syscall stack (`kernel_rsp`).
-///
-/// The CPU pushes a full hardware frame onto the kernel stack (via TSS.rsp0)
-/// before jumping here, so no manual stack switch is needed:
-///   [RSP+0]  saved RIP   (user RIP - return address)
-///   [RSP+8]  saved CS    (0x2b: user code, L=1, DPL=3)
-///   [RSP+16] saved RFLAGS
-///   [RSP+24] saved RSP   (user RSP)
-///   [RSP+32] saved SS    (0x23: user data, DPL=3)
-///
-/// IF is cleared on entry (interrupt gate, type_attr=0xEE).
-/// GS invariant: on entry from ring-3, GS.base=0 (user); swapgs installs
-/// the kernel pointer so any kernel code that needs per-core data via GS works.
-///
-/// IDT entry uses DPL=3 so ring-3 code can raise this vector via `int 0x80`.
-///
-/// # Safety
-/// Called at the ring-3 → ring-0 boundary via `int 0x80`. IF=0 on entry.
-#[unsafe(naked)]
-pub unsafe extern "C" fn int80_entry() {
-    core::arch::naked_asm!(
-        // Install kernel GS so per-core data is accessible.
-        "swapgs",
-        // Mirror the SYSCALL path: save user RSP into PER_CORE_SYSCALL.user_rsp
-        // at gs:[0] so pf_handler diagnostics and any GS-based user-RSP readers
-        // see the correct value.  User RSP is at [RSP+24] in the CPU frame.
-        "mov r10, [rsp + 24]",
-        "mov gs:[0], r10",
-        // Rearrange into syscall_handler(nr, a0, a1, a2) System V convention:
-        //   rdi=nr  rsi=a0  rdx=a1  rcx=a2
-        // On entry from ring-3: rax=nr  rdi=a0  rsi=a1  rdx=a2
-        "mov rcx, rdx",
-        "mov rdx, rsi",
-        "mov rsi, rdi",
-        "mov rdi, rax",
-        "call syscall_handler",
-        // rax = return value (syscall_handler's return value, untouched by iretq).
-        // Restore user GS before returning to ring-3.
-        "swapgs",
-        // iretq pops RIP, CS, RFLAGS, RSP, SS from the CPU-pushed frame and
-        // resumes ring-3 at the instruction after the `int 0x80`.
-        "iretq",
-    )
-}
-
 /// UD2 syscall entry - IDT[6] (#UD hardware exception).
 ///
 /// AMD GX-420GI (Jaguar/Puma+): both `syscall` and `int N` (software interrupt

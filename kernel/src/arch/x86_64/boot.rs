@@ -134,11 +134,6 @@ impl IdtEntry {
             _reserved:   0,
         }
     }
-
-    /// Like `new` but DPL=3 - ring-3 code may invoke this vector via `int N`.
-    fn new_user(handler: u64) -> Self {
-        Self { type_attr: 0xEE, ..Self::new(handler) } // P=1, DPL=3, interrupt gate
-    }
 }
 
 // SAFETY: written only during init_idt before APs start; read-only after.
@@ -1491,8 +1486,13 @@ pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
 ///   kills the task, a ring-0 one halts), except: 2 (NMI) → `exception_halt`, 6 (#UD) → the `ud2`
 ///   syscall entry, 13 → `gpf_stub`, 14 → `pf_stub` (both also kill on ring 3 and halt on ring 0).
 /// - Vector 32  → APIC timer preemption (§9.1).
-/// - Vector 36 (COM1), the xHCI/EHCI MSI vectors and the MSI pool → their stubs; 0x80 → `int80_entry`
-///   (DPL=3); 0xFF → `spurious_stub`.
+/// - Vector 36 (COM1), the xHCI/EHCI MSI vectors and the MSI pool → their stubs; 0xFF →
+///   `spurious_stub`.
+/// - NO gate is DPL=3. The `int 0x80` syscall entry was removed on 2026-10-10 (`backlog/80` K7): the
+///   SDK traps with `ud2` on every x86 machine, and the old gate ran the syscall chain on the
+///   top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off -
+///   while any service could still raise it. An `int 0x80` now finds no gate, faults, and the
+///   CPL-discriminating handler kills the task that raised it.
 /// - Vector 0xF0 → WAKE_RECEIVER IPI.
 /// - Vector 0xF1 → TLB_SHOOTDOWN IPI.
 /// - Vector 0xF2 → SCHEDULER_TICK IPI.
@@ -1554,7 +1554,6 @@ pub(super) unsafe fn init_idt() {
             idt[super::interrupts::MSI_POOL_BASE as usize + i] =
                 IdtEntry::new(super::interrupts::msi_pool_stub(i));
         }
-        idt[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as *const () as u64);
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
         idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);
         idt[0xF2] = IdtEntry::new(ipi_tick_stub   as *const () as u64);
