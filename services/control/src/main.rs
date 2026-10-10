@@ -31,9 +31,6 @@ use godspeed as gs;
 use godspeed_sdk::{ServiceContext, ipc::Message};
 use godspeed_sdk::service_context::supcmd;
 
-/// Kernel introspection query that pops one byte from COM2, or -1 when the port is empty.
-const Q_COM2_BYTE: u64 = 21;
-
 const LINE_MAX: usize = 128;
 
 /// Parse and execute one command line. Unknown input is REPORTED, never ignored: an operator typing a

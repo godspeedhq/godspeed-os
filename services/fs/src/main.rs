@@ -297,7 +297,10 @@ macro_rules! send_res {
             Ok(()) => $send(&[FS_OK]),
             Err(e) => {
                 let mut eb = [0u8; 1 + FS_ERR_REASON_MAX];
-                eb[0] = FS_ERR;
+                // A path that is not there is FS_NOTFOUND whatever the operation, with the reason
+                // still carried: a mutating op answered FS_ERR for it while a read answered
+                // FS_NOTFOUND, so a client could not tell "absent" from "refused" (`backlog/80` V2).
+                eb[0] = if walk_miss(e) { FS_NOTFOUND } else { FS_ERR };
                 let n = e.len().min(FS_ERR_REASON_MAX);
                 eb[1..1 + n].copy_from_slice(&e.as_bytes()[..n]);
                 $send(&eb[..1 + n]);
@@ -313,6 +316,9 @@ const FS_DENIED: u8 = 5;     // op requires a right the file cap lacks (non-esca
                              // DISTINCT value from FS_UNAVAIL(4): a file-cap client must tell "storage
                              // unavailable" apart from "permission denied" (they never shared a code
                              // path, but a shared value invited a future confusion; audit L2)
+const FS_DAMAGED: u8 = 7;    // the file is THERE and a block of it failed its CRC (or could not be read):
+                             // damaged, not missing. Answered FS_NOTFOUND until 2026-10-10, so a damaged
+                             // file read as an absent one (`backlog/80` V2)
 const FS_FOREIGN: u8 = 6;    // the disk carries someone else's partition table / boot sector. Refused
                              // rather than formatted - see `foreign_disk`. Distinct from FS_ERR so the
                              // client can explain WHY and offer the deliberate override.
@@ -467,6 +473,10 @@ struct Fs {
     // the next request rather than trusting them (§14.3 - reacquiring is necessary but not sufficient;
     // everything derived from the previous incarnation must be re-established too).
     io_error_seen: core::cell::Cell<bool>,
+    // Set by a read that found the file and could not read a block of it (a CRC failure or an I/O
+    // error), cleared by every read that starts. The reply then says FS_DAMAGED rather than
+    // FS_NOTFOUND (`backlog/80` V2). Owned state on the struct, like the two cells above.
+    read_damaged: core::cell::Cell<bool>,
     /// Consecutive failed block reads during a tree WALK (check / scrub). Reset by any success.
     ///
     /// A walk that keeps going after a read fails re-asks a device that has stopped answering once
@@ -704,6 +714,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         storage_unreadable = true;
     } else {
         let mut io_attempts = 0u32;
+        // The same CLOCK bound as the capacity wait above, for the same reason (`backlog/80` V7):
+        // `yield_now` returns at once when nothing else is runnable, so 1000 of them measured loop
+        // speed, not how long block-driver was given to come back.
+        let io_started = gs::driver::wait::Since::now(&ctx);
         loop {
             match Fs::mount_into(&ctx, &mut fs) {
                 Ok(()) => {
@@ -731,12 +745,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // (serve storage-unavailable) rather than spinning forever on an unreadable disk.
                         None => {
                             io_attempts += 1;
-                            if io_attempts >= MOUNT_MAX_ATTEMPTS {
+                            let out_of_time = io_started.passed(&ctx, gs::driver::wait::Budget::ms(MOUNT_MAX_MS));
+                            if out_of_time || io_attempts >= MOUNT_MAX_ATTEMPTS {
                                 storage_unreadable = true;
-                                ctx.log("fs: storage unreadable after bounded mount attempts - serving storage-unavailable (data intact; do NOT run 'drives flash', awaiting block-driver recovery)");
+                                ctx.log_fmt(format_args!(
+                                    "fs: storage unreadable after {} - serving storage-unavailable (data intact; do NOT run 'drives flash', awaiting block-driver recovery)",
+                                    if out_of_time { "20 s of mount attempts" } else { "the attempt backstop, inside the 20 s budget" }));
                                 break;
                             }
-                            gs::task::yield_now(&ctx);
+                            gs::task::sleep_ms(&ctx, MOUNT_RETRY_MS);
                         }
                         // block-driver answered yet the read still failed (after its COMRESET + retries):
                         // authoritative. Serve raw, honestly - never invite a data-destroying flash.
@@ -1780,7 +1797,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                     out[5..5 + n].copy_from_slice(&buf[..n]);
                     send(&out[..5 + n]);
                 }
-                None => send(&[FS_NOTFOUND]),
+                None => send(&[if fs.read_damaged.get() { FS_DAMAGED } else { FS_NOTFOUND }]),
             }
         }
         OP_WRITE_NEW => {
@@ -1818,7 +1835,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                     out[5..5 + n].copy_from_slice(&buf[..n]);
                     send(&out[..5 + n]);
                 }
-                None => send(&[FS_NOTFOUND]),
+                None => send(&[if fs.read_damaged.get() { FS_DAMAGED } else { FS_NOTFOUND }]),
             }
         }
         OP_STAT_FILE => {
@@ -1870,8 +1887,12 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 want &= RIGHT_READ;
                 if want == 0 { send(&[FS_DENIED]); return; }
             }
-            if fs.open_file(ctx, path, want, tag, reply).is_err() { send(&[FS_ERR]); }
-            else { *out_len = REPLY_SENT_DIRECTLY; }   // the cap went with it; do not reply twice
+            // A failed open says WHY, as every other refusal does - it answered a bare FS_ERR, so
+            // `gs::fs::Fs::reason` was empty and the cause was in this log only (`backlog/80` V2).
+            match fs.open_file(ctx, path, want, tag, reply) {
+                Ok(()) => *out_len = REPLY_SENT_DIRECTLY,   // the cap went with it; do not reply twice
+                Err(e) => send_res!(send, Err::<(), &str>(e)),
+            }
         }
         _ => send(&[FS_ERR]),
     }
@@ -1942,7 +1963,7 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
                     out[5..5 + n].copy_from_slice(&buf[..n]);
                     send(&out[..5 + n]);
                 }
-                None => send(&[FS_NOTFOUND]),
+                None => send(&[if fs.read_damaged.get() { FS_DAMAGED } else { FS_NOTFOUND }]),
             }
         }
         FOP_WRITE => {
@@ -1975,7 +1996,7 @@ fn serve_filecap(ctx: &ServiceContext, vol: &mut Option<Fs>, rid: u64, right: u8
                 let hwm = fs.open_hwm(rid);
                 if offset < hwm {
                     ctx.log_fmt(format_args!(
-                        "fs: APPEND-only capability refused a write at offset {} - it has already                          written up to {}, and may not go back over it", offset, hwm));
+                        "fs: APPEND-only capability refused a write at offset {} - it has already written up to {}, and may not go back over it", offset, hwm));
                     send(&[FS_DENIED]);
                     return;
                 }
@@ -2130,7 +2151,7 @@ impl Fs {
             read_only,
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
-            io_error_seen: core::cell::Cell::new(false),
+            io_error_seen: core::cell::Cell::new(false), read_damaged: core::cell::Cell::new(false),
             io_fail_streak: core::cell::Cell::new(0),
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
@@ -2786,7 +2807,7 @@ fn replay_window(_ctx: &ServiceContext) {}
             read_only: false,
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
-            io_error_seen: core::cell::Cell::new(false),
+            io_error_seen: core::cell::Cell::new(false), read_damaged: core::cell::Cell::new(false),
             io_fail_streak: core::cell::Cell::new(0),
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
@@ -3383,10 +3404,13 @@ fn replay_window(_ctx: &ServiceContext) {}
     }
 
     fn read_path(&self, ctx: &ServiceContext, path: &[u8], out: &mut [u8]) -> Option<usize> {
+        self.read_damaged.set(false);
         let e = self.walk(ctx, path)?;
         if !is_file(e.itype) { return None; }
         let size = e.size as usize;
         if size > out.len() { return None; }
+        // From here the file exists: a block that cannot be read is DAMAGE, not absence.
+        self.read_damaged.set(true);
         // Resolve the extent list once if fragmented; a contiguous file maps by arithmetic.
         let frag = if e.itype == ITYPE_FILE_FRAG { Some(self.ext_of(ctx, &e)?) } else { None };
         let nblocks = (size + DATA_PAYLOAD - 1) / DATA_PAYLOAD;
@@ -3400,6 +3424,7 @@ fn replay_window(_ctx: &ServiceContext) {}
             let end = (start + DATA_PAYLOAD).min(size);
             out[start..end].copy_from_slice(&blk[..end - start]);
         }
+        self.read_damaged.set(false);
         Some(size)
     }
 
@@ -3537,11 +3562,14 @@ fn replay_window(_ctx: &ServiceContext) {}
     /// file's size and `out.len()`). Returns the number of bytes read (0 at/after EOF). The
     /// offset need not be block-aligned - it reads across block boundaries as needed.
     fn read_at(&self, ctx: &ServiceContext, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Option<usize> {
+        self.read_damaged.set(false);
         let e = self.walk(ctx, path)?;
         if !is_file(e.itype) { return None; }
         let size = e.size;
         if offset >= size { return Some(0); }
         let n = len.min((size - offset) as usize).min(out.len());
+        // From here the file exists: a block that cannot be read is DAMAGE, not absence.
+        self.read_damaged.set(true);
         let frag = if e.itype == ITYPE_FILE_FRAG { Some(self.ext_of(ctx, &e)?) } else { None };
         let mut done = 0;
         while done < n {
@@ -3557,6 +3585,7 @@ fn replay_window(_ctx: &ServiceContext) {}
             out[done..done + take].copy_from_slice(&blk[within..within + take]);
             done += take;
         }
+        self.read_damaged.set(false);
         Some(n)
     }
 
@@ -3923,7 +3952,18 @@ fn replay_window(_ctx: &ServiceContext) {}
         self.revoke_open_subtree(ctx, path); // revoke caps to the deleted entry AND its descendants (SEC-5)
         // Reclaim the unreachable subtree in bounded transactions. A crash here only leaks
         // blocks (nothing references them) - never corruption.
-        self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0)
+        //
+        // The DELETE has happened once the unlink commits, so a failure here is not the delete
+        // failing and is not reported as one: the caller was told "failed" for a tree that was gone,
+        // and a retry then failed again with "not found" (`backlog/80` V4). What failed is the
+        // reclaim, which leaves blocks counted as used that nothing references - said loudly, with
+        // the repair (`drives check` rebuilds the bitmap from the tree).
+        if let Err(why) = self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0) {
+            ctx.log_fmt(format_args!(
+                "fs: deleted, but reclaiming its blocks failed ({}) - they stay counted as used until `drives check` rebuilds the bitmap",
+                why));
+        }
+        Ok(())
     }
 
     /// Free an entry's blocks and, if it is a directory, all of its descendants first
@@ -4570,10 +4610,17 @@ fn is_file(itype: u8) -> bool {
 /// Whether a file-API op writes the filesystem - gated on a READ-ONLY mount (§6.15). The
 /// early-match ops (LABEL/CHECK mutate; FLASH/RESET reformat-or-wipe and are allowed; INFO/SCRUB
 /// read) are guarded inline; this covers the path-addressed ops dispatched below.
+/// The reasons a path walk gives when a component is not there. Each is answered FS_NOTFOUND.
+fn walk_miss(reason: &str) -> bool {
+    matches!(reason, "not found" | "path not found" | "source not found" | "dest path not found" | "entry not found")
+}
+
 fn op_is_mutating(op: u8) -> bool {
+    // OP_SEAL writes too - it flags a file record and so the directory block - and was missing, so a
+    // read-only mount sealed files (`backlog/80` V3).
     matches!(op,
         OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT | OP_WRITE_AT_J |
-        OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE)
+        OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE | OP_SEAL)
 }
 
 /// Map the `n`-th data block of a fragmented file to its LBA by walking the extent runs.
@@ -4650,7 +4697,9 @@ impl BlockReply {
 }
 
 /// Latch for the one-shot stack-depth report inside `block_rpc`. Owned by this service and touched
-/// nowhere else, in the same shape `xhci` uses for `PROBE_FAILS`.
+/// nowhere else. (This cited xhci's probe-failure latch as its model; `xhci` moved its latches into loop-owned
+/// state on 2026-10-10, `backlog/80` D9. This one, and the peer-outage latches below, still live in
+/// statics because `block_rpc` is a free function with a dozen callers.)
 static STACK_DEPTH_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
