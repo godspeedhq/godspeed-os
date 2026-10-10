@@ -26,7 +26,9 @@ pub enum SyscallNumber {
     Yield          = 4,
     Log            = 5,
     AllocMem       = 6,
-    Spawn          = 7,
+    // 7 = removed. Was `Spawn`, by name from the kernel catalogue, which holds `supervisor` alone
+    //     since step C - so it could only answer NotFound or AlreadyRunning. `SpawnImage` (52) is how a
+    //     service starts. Number 7 now falls through to UnknownSyscall (backlog/80 K14).
     Kill           = 8,
     // 9 = removed. Was `Abort`: an UNGATED syscall any task could fire to panic the kernel - the §3.1
     //     hole found by the syscall audit. A service that hits a fatal error dies and is restarted by
@@ -41,7 +43,7 @@ pub enum SyscallNumber {
     TaskStat       = 16,
     ConsoleRead    = 17,
     Reboot         = 18,
-    SpawnPipe      = 19,
+    // 19 = removed (SpawnPipe), for the same reason as 7 (backlog/80 K14).
     ConsolePush    = 20,
     Park           = 21,
     Print          = 22,
@@ -60,8 +62,8 @@ pub enum SyscallNumber {
     RecvTimeout         = 35,
     IrqUnmask           = 36,
     Sleep               = 37,
-    SpawnReturningEndpoint = 38,
-    SpawnWithCaps          = 39,
+    // 38, 39 = removed (SpawnReturningEndpoint, SpawnWithCaps), for the same reason as 7
+    //     (backlog/80 K14). `SpawnImage` returns the endpoint cap and carries the installs.
     ConsoleForeground      = 40,
     Call                   = 41,
     /// `Call` with a DEADLINE. Same reply-cap semantics, bounded wait.
@@ -146,10 +148,7 @@ pub unsafe extern "C" fn syscall_handler(
         }
         n if n == SyscallNumber::Log            as u64 => handle_log(arg0, arg1, arg2),
         n if n == SyscallNumber::AllocMem       as u64 => handle_alloc_mem(arg0),
-        n if n == SyscallNumber::Spawn          as u64 => handle_spawn(arg0, arg1, arg2),
         n if n == SyscallNumber::SpawnImage     as u64 => handle_spawn_image(arg0, arg1, arg2),
-        n if n == SyscallNumber::SpawnReturningEndpoint as u64 => handle_spawn_returning_endpoint(arg0, arg1, arg2),
-        n if n == SyscallNumber::SpawnWithCaps as u64 => handle_spawn_with_caps(arg0, arg1, arg2),
         n if n == SyscallNumber::Kill           as u64 => handle_kill(arg0, arg1),
         n if n == SyscallNumber::AcquireSendCap as u64 => handle_acquire_send_cap(arg0, arg1, arg2),
         n if n == SyscallNumber::DeriveCap      as u64 => handle_derive_cap(arg0, arg1, arg2),
@@ -161,7 +160,6 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::TaskStat       as u64 => handle_task_stat(arg0, arg1, arg2),
         n if n == SyscallNumber::ConsoleRead    as u64 => handle_console_read(arg0),
         n if n == SyscallNumber::Reboot        as u64 => handle_reboot(),
-        n if n == SyscallNumber::SpawnPipe     as u64 => handle_spawn_pipe(arg0, arg1, arg2),
         n if n == SyscallNumber::ConsolePush   as u64 => handle_console_push(arg0, arg1),
         n if n == SyscallNumber::Park          as u64 => scheduler::park_current(),
         n if n == SyscallNumber::Print         as u64 => handle_print(arg0, arg1, arg2),
@@ -757,7 +755,7 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 const ACQUIRE_NAME_NOT_REGISTERED: i64 = -20;
 const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
 
-// Syscall: Spawn (7) / Kill (8) / AcquireSendCap (10).
+// Syscall: Kill (8) / AcquireSendCap (10). (Spawn, 7, was retired 2026-10-10, backlog/80 K14.)
 // ---------------------------------------------------------------------------
 
 /// Upper bound on the name payload (`name` + NUL-separated peer names). It was 64, which held a
@@ -1170,241 +1168,6 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         }
         Ok(None) => 0,
         Err(_)   => -1,
-    }
-}
-
-/// arg0 = (core_id << 16) | spawn_cap_slot, arg1 = name_ptr, arg2 = name_len.
-///
-/// Validates the spawn capability, reads the service name from user space,
-/// then calls `task::spawn_service_by_name`.
-///
-/// core_id encoding:
-///   - 0x0000 = core 0, 0x0001 = core 1, ...
-///   - 0xFFFF = let the kernel choose (the catalogue row's `preferred_core`).
-///
-/// The kernel catalogue (`task::service_config`) now holds `supervisor` alone, so a by-name spawn
-/// here (and in `SpawnReturningEndpoint`, `SpawnWithCaps` and `SpawnPipe`, which share the catalogue)
-/// is refused with `NotFound` for every other name, and with `AlreadyRunning` for `supervisor` while
-/// it is live. Starting a service is `SpawnImage`, by the supervisor.
-fn handle_spawn(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
-    let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
-    let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
-    let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
-
-    // Validate spawn capability.
-    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
-        Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
-    };
-    if cap.resource_id != crate::capability::SPAWN_RESOURCE {
-        return cap_err_to_i64(CapError::CapWrongScope);
-    }
-
-    let len = name_len as usize;
-    if len == 0 || len > SPAWN_PAYLOAD_MAX { return -1; }
-    let payload = match read_user_bytes(name_ptr, len) {
-        Some(b) => b,
-        None    => return -1,
-    };
-    let payload = match core::str::from_utf8(payload) {
-        Ok(s)  => s,
-        Err(_) => return -1,
-    };
-
-    // THE PROBE PATH IS GONE. `Spawn` used to carry a test probe's parameters packed into the
-    // unused upper bits of `arg0` - the kernel supplying the image and looking its two authorities up
-    // by name. The image moved to the supervisor, so there is nothing here to spawn: a probe is now
-    // an ordinary `SpawnImage`, and a probe that needs a victim asks the supervisor for one.
-    match crate::task::spawn_service_by_name(payload, core_override) {
-        Ok(_)  => 0,
-        Err(_) => -1,
-    }
-}
-
-/// Syscall: SpawnReturningEndpoint (38). Like Spawn (7), but on success mints a `SEND|GRANT`
-/// cap to the new service's recv endpoint and inserts it into the **caller's** cap table,
-/// returning the slot. This is the Phase-0 seam for moving naming out of the kernel
-/// (`docs/naming-design.md`): a spawner (the supervisor) can collect a cap to every service it
-/// starts - a userspace `name → cap` map - without the kernel resolving names for third parties.
-/// The old name-wiring path is unchanged; this is purely additive.
-///
-/// arg0 = packed (spawn_cap_slot in low 16, core in next 16; core 0xFFFF = round-robin).
-/// arg1 = name ptr, arg2 = name len. Returns the endpoint cap slot PLUS ONE (so >= 1), 0 if the
-/// service spawned but has no recv endpoint to hand back, or a negative error (a cap error, or -1 if
-/// the spawn failed).
-fn handle_spawn_returning_endpoint(packed_arg0: u64, name_ptr: u64, name_len: u64) -> i64 {
-    let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
-    let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
-    let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
-
-    // Validate the SPAWN capability (same gate as Spawn - §3.1).
-    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
-        Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
-    };
-    if cap.resource_id != crate::capability::SPAWN_RESOURCE {
-        return cap_err_to_i64(CapError::CapWrongScope);
-    }
-
-    let len = name_len as usize;
-    if len == 0 || len > 64 { return -1; }
-    let name_bytes = match read_user_bytes(name_ptr, len) {
-        Some(b) => b,
-        None    => return -1,
-    };
-    let name = match core::str::from_utf8(name_bytes) {
-        Ok(s)  => s,
-        Err(_) => return -1,
-    };
-
-    match crate::task::spawn_service_by_name(name, core_override) {
-        Ok(Some(ep_id)) => {
-            // Mint a SEND|GRANT cap to the new endpoint at its current generation and hand it
-            // to the caller. SEND so the caller can route to it; GRANT so it can delegate copies
-            // into dependents (the supervisor wiring its name→cap map, future phases).
-            let rid    = crate::capability::cap::ResourceId::from(ep_id);
-            let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
-            match scheduler::current_task_insert_cap(ep_cap) {
-                Ok(slot) => slot as i64 + 1,
-                Err(e)   => cap_err_to_i64(e),
-            }
-        }
-        // SLOT + 1 above, so 0 can mean "spawned, but this service has no recv endpoint" without
-        // colliding with slot 0. It used to return -1 here, which is what a FAILED spawn returns -
-        // so a caller could not tell a service that started and has no endpoint (`mem-pressure`,
-        // `greet`, `roster`) from one that did not start at all.
-        //
-        // That was latent while only the shell's `spawncap` used this: it only ever spawned services
-        // that HAVE endpoints. Routing the supervisor's spawns through it surfaced the ambiguity as
-        // "chaos spawn-storm hit the ceiling at spawn #1" - a successful spawn read as a refusal.
-        Ok(None) => 0,
-        Err(_)   => -1,
-    }
-}
-
-/// Syscall: SpawnWithCaps (39) - the full Phase-0 spawn protocol (`docs/naming-design.md`). Spawns
-/// a service whose send-peers are wired from **caller-supplied caps** (not the kernel name table),
-/// then returns a `SEND|GRANT` cap to the new endpoint (like SpawnReturningEndpoint). This is how
-/// the supervisor wires a dependent from its `name → cap` map without the kernel resolving names.
-/// The old name-wiring path is untouched (this is a distinct syscall).
-///
-/// arg0 = packed (spawn_cap_slot low 16, core next 16; 0xFFFF = round-robin).
-/// arg1 = ptr, arg2 = len of a descriptor: `[name_len:u8, name…, count:u8,
-///        {label_len:u8, label…, slot_lo:u8, slot_hi:u8} × count]` (count ≤ MAX_SEND_PEERS).
-/// Each `slot` names a cap the CALLER holds; the kernel copies it (GRANT-validated, non-escalating
-/// §7.3) into the child under `label`. Returns the endpoint cap slot PLUS ONE, as
-/// `SpawnReturningEndpoint` does, so 0 is "spawned, but the service has no recv endpoint"; -1 if the
-/// spawn failed, or a cap error. It returned the bare slot and -2 for "no endpoint" until 2026-10-10,
-/// and -2 is also `CapNotHeld`, so a refusal read as a successful spawn (`backlog/80` K14).
-fn handle_spawn_with_caps(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
-    let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
-    let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
-    let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
-
-    // Validate the SPAWN capability (same gate as Spawn - §3.1). Reuse it as the array filler.
-    let spawn_cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
-        Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
-    };
-    if spawn_cap.resource_id != crate::capability::SPAWN_RESOURCE {
-        return cap_err_to_i64(CapError::CapWrongScope);
-    }
-
-    let len = buf_len as usize;
-    if len < 2 || len > 512 { return -1; }
-    let buf = match read_user_bytes(buf_ptr, len) {
-        Some(b) => b,
-        None    => return -1,
-    };
-
-    // Parse the descriptor with bounds checks at every step (untrusted input).
-    let name_len = buf[0] as usize;
-    let mut p = 1usize;
-    if name_len == 0 || name_len > 64 || p + name_len > len { return -1; }
-    let name = match core::str::from_utf8(&buf[p..p + name_len]) { Ok(s) => s, Err(_) => return -1 };
-    p += name_len;
-    if p >= len { return -1; }
-    let count = buf[p] as usize;
-    p += 1;
-    if count > crate::task::MAX_SEND_PEERS { return -1; }
-
-    // Build the install list - for each entry, copy the caller's cap (GRANT-validated).
-    use crate::task::{InstallCap, PEER_NAME_BYTES, MAX_SEND_PEERS};
-    let mut installs = [InstallCap { name: [0u8; PEER_NAME_BYTES], name_len: 0, cap: spawn_cap }; MAX_SEND_PEERS];
-    for entry in installs.iter_mut().take(count) {
-        if p >= len { return -1; }
-        let label_len = buf[p] as usize;
-        p += 1;
-        if label_len == 0 || label_len > PEER_NAME_BYTES || p + label_len + 2 > len { return -1; }
-        let mut nm = [0u8; PEER_NAME_BYTES];
-        nm[..label_len].copy_from_slice(&buf[p..p + label_len]);
-        p += label_len;
-        let slot = (buf[p] as usize) | ((buf[p + 1] as usize) << 8);
-        p += 2;
-        // The caller must hold this cap WITH GRANT - copying it into the child is then
-        // non-escalating (§7.3): the caller could already transfer the whole cap.
-        let held = match scheduler::current_task_lookup_cap(slot, Rights::GRANT) {
-            Ok(c)  => c,
-            Err(e) => return cap_err_to_i64(e),
-        };
-        entry.name     = nm;
-        entry.name_len = label_len as u8;
-        entry.cap      = held;
-    }
-
-    match crate::task::spawn_service_by_name_with_installs(name, core_override, &installs[..count]) {
-        Ok(Some(ep_id)) => {
-            let rid    = crate::capability::cap::ResourceId::from(ep_id);
-            let ep_cap = crate::capability::mint_cap(rid, Rights::SEND | Rights::GRANT);
-            match scheduler::current_task_insert_cap(ep_cap) {
-                Ok(slot) => slot as i64 + 1,
-                Err(e)   => cap_err_to_i64(e),
-            }
-        }
-        Ok(None) => 0,  // spawned OK, but the service has no recv endpoint (a producer like `greet`)
-        Err(_)   => -1, // spawn failed
-    }
-}
-
-/// arg0 = packed (cap_slot in low 16 bits, core in next 16; core 0xFFFF = round-robin).
-/// arg1 = ptr to a "producer sink" string, arg2 = its length.
-///
-/// Capability-broker pipe spawn (`producer | sink`): spawns `producer` and
-/// delegates it a SEND cap to `sink`'s endpoint as its send_peers[0]
-/// (task::spawn_service_pipe). The shell spawns `sink` first, then calls this.
-fn handle_spawn_pipe(packed_arg0: u64, buf_ptr: u64, buf_len: u64) -> i64 {
-    let spawn_cap_slot = (packed_arg0 & 0xFFFF) as usize;
-    let core_raw       = ((packed_arg0 >> 16) & 0xFFFF) as u32;
-    let core_override  = if core_raw == 0xFFFF { None } else { Some(core_raw) };
-
-    // Same authorization as handle_spawn: the caller must hold the spawn cap.
-    let cap = match scheduler::current_task_lookup_cap(spawn_cap_slot, Rights::WRITE) {
-        Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
-    };
-    if cap.resource_id != crate::capability::SPAWN_RESOURCE {
-        return cap_err_to_i64(CapError::CapWrongScope);
-    }
-
-    let len = buf_len as usize;
-    if len == 0 || len > 130 { return -1; }
-    let bytes = match read_user_bytes(buf_ptr, len) {
-        Some(b) => b,
-        None    => return -1,
-    };
-    let s = match core::str::from_utf8(bytes) {
-        Ok(s)  => s,
-        Err(_) => return -1,
-    };
-
-    // Buffer is "producer sink" (single space). Split into the two names.
-    let mut parts = s.split(' ').filter(|p| !p.is_empty());
-    let producer = match parts.next() { Some(p) => p, None => return -1 };
-    let sink     = match parts.next() { Some(p) => p, None => return -1 };
-
-    match crate::task::spawn_service_pipe(producer, sink, core_override) {
-        Ok(()) => 0,
-        Err(_) => -1,
     }
 }
 

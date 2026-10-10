@@ -1107,11 +1107,22 @@ fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
 /// the supervisor's row - and a restart that lands elsewhere is followed.
 ///
 /// A controller found at boot to have neither MSI nor MSI-X is remembered as INTx, and a later call
-/// returns false without repeating the boot line: its interrupt is routed through the IOAPIC to the
-/// BSP (`route_ehci_intx`) and there is nothing to aim.
+/// returns false without repeating the boot line - but it does not leave the interrupt where boot put
+/// it. Boot routes the INTx candidates to the BSP (`route_ehci_intx`), because no AP is up yet; a
+/// later call re-aims every candidate's IOAPIC entry at `core_id`, as the MSI is re-aimed above
+/// (backlog/80 K17). Recorded rather than assumed: an earlier note in `route_ehci_intx` says routing
+/// INTx to an AP's LAPIC id dropped it on the T630. That was a boot-time route, before the APs were
+/// up; whether a route made after they are delivers is what the T630 card for K17 must show.
 pub fn program_ehci_msi(core_id: u32) -> bool {
     let Some(dev) = ehci() else { return false };
-    if EHCI_INTX.load(Ordering::Relaxed) { return false; }
+    if EHCI_INTX.load(Ordering::Relaxed) {
+        let dest = usb_irq_dest_lapic(core_id);
+        for gsi in ehci_intx_candidates(dev.irq_line) {
+            crate::arch::x86_64::ioapic::set_dest(gsi, dest);
+        }
+        crate::kprintln!("ehci: legacy INTx candidates re-aimed at core {} (dest_apic={})", core_id, dest);
+        return false;
+    }
     let bdf = dev.bdf;
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
     let dest = usb_irq_dest_lapic(core_id);
@@ -1170,22 +1181,25 @@ pub fn route_ehci_intx() {
                 cmd & 0xFFFF, new & 0xFFFF);
         }
     }
-    // Candidate GSIs: the legacy interrupt-line value (usually 11) + the AMD FCH PCI-INTx range.
-    let mut candidates: [u8; 9] = [legacy, 16, 17, 18, 19, 20, 21, 22, 23];
-    for i in 0..candidates.len() {
-        let gsi = candidates[i];
-        // Skip a duplicate if the legacy line already falls in 16..=23.
-        if candidates[..i].contains(&gsi) {
-            continue;
-        }
+    for gsi in ehci_intx_candidates(legacy) {
         crate::arch::x86_64::ioapic::set_redir(gsi, vector, dest, false);
         crate::arch::x86_64::ioapic::set_level_route(vector, gsi);
     }
-    let _ = &mut candidates;
     crate::kprintln!(
         "ehci: legacy INTx routed via IOAPIC candidates [{} ,16..=23] -> vector={:#x} dest_apic={}",
         legacy, vector, dest
     );
+}
+
+/// The GSIs an EHCI's INTx pin may arrive on: the legacy interrupt-line value (usually 11) plus the
+/// AMD FCH PCI-INTx range, without the legacy line twice when it already falls in 16..=23. One list,
+/// so the boot route and the spawn-time re-aim cannot disagree about which entries are the EHCI's.
+fn ehci_intx_candidates(legacy: u8) -> impl Iterator<Item = u8> {
+    let candidates: [u8; 9] = [legacy, 16, 17, 18, 19, 20, 21, 22, 23];
+    (0..candidates.len()).filter_map(move |i| {
+        let gsi = candidates[i];
+        if candidates[..i].contains(&gsi) { None } else { Some(gsi) }
+    })
 }
 
 /// Scan every bus/device/function and record each present function in the generic device table

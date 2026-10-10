@@ -19,7 +19,7 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 8 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **84** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment) |
+| `sdk/rust/src/service_context.rs` | **80** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/80 K14) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
 **The 92 are not 92 defects.** 88 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
@@ -40,6 +40,17 @@ Both floors are enforced: a new `unsafe` in any other `sdk/` file FAILS, and eit
 FAILS. They may decrease freely.
 
 ---
+
+## 2026-10-10 - the spawn-by-name syscalls retired; EHCI INTx follows its driver (backlog/80 K14, K17)
+
+The kernel catalogue holds `supervisor` alone, so `Spawn` (7), `SpawnPipe` (19),
+`SpawnReturningEndpoint` (38) and `SpawnWithCaps` (39) could only answer NotFound or AlreadyRunning.
+They are retired, with their SDK wrappers; `SpawnImage` (52) is how a service starts.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 84 -> 80 (-4) | **shrank**: the four `unsafe { raw_syscall(7 / 19 / 38 / 39, ..) }` call sites went with `spawn_on_kernel`, `spawn_returning_endpoint`, `spawn_with_caps` and `spawn_pipe_on`. `SDK_GRANDFATHERED` in `scripts/unsafe_check.py` is lowered to 80 to lock it in. |
+| `arch/x86_64/ioapic.rs` | 8 -> 9 (+1) | `set_dest`: one write of a redirection entry's HIGH dword, which holds only the destination APIC id, so an EHCI on INTx can be re-aimed at the core its driver was spawned on (K17) without touching the entry's vector, trigger, polarity or mask. Runs at spawn, when the dead instance's line is already masked. |
 
 ## 2026-10-04 - Pi 4: ask the faulting core's own MMU (feat/wifi-driver)
 
@@ -2699,7 +2710,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 2 | permitted |
 | arch/x86_64/interrupts.rs | 26 | permitted |
-| arch/x86_64/ioapic.rs | 8 | permitted |
+| arch/x86_64/ioapic.rs | 9 | permitted |
 | arch/x86_64/iommu.rs | 79 | permitted |
 | arch/x86_64/mod.rs | 38 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |

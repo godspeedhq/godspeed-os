@@ -152,6 +152,22 @@ pub fn set_mask(gsi: u8, masked: bool) {
     }
 }
 
+/// Re-aim redirection entry `gsi` at local APIC `dest_apic`, leaving its vector, trigger, polarity
+/// and MASK exactly as they are: only the high dword, which holds nothing but the destination, is
+/// written. Used to follow a driver to the core it was spawned on (`pci::program_ehci_msi`,
+/// backlog/80 K17). Its caller runs at spawn, when the dead instance's line is already masked
+/// (`interrupt::route::unregister_endpoint`), so no interrupt is in flight to the old destination.
+pub fn set_dest(gsi: u8, dest_apic: u8) {
+    let va = IOAPIC_VA.load(Ordering::Relaxed);
+    if va == 0 {
+        return;
+    }
+    let idx = 0x10 + 2 * gsi as u32;
+    // SAFETY: IOAPIC mapped; the high dword of a redirection entry is the destination field and
+    // nothing else, so writing it changes where the entry delivers and no other property of it.
+    unsafe { write(va, idx + 1, (dest_apic as u32) << 24) };
+}
+
 /// BSP local-APIC id - the destination for level INTx routes. Captured at boot from the
 /// Limine SMP response (`mod.rs`). `0xFF` until set; `bsp_lapic_id()` then falls back to 0 - the
 /// BSP id on QEMU, but NOT on every machine (the T630's BSP is LAPIC id 16).
