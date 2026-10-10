@@ -2141,10 +2141,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // 21, 23). Every other query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (docs/introspection-capability.md).
     //
-    // 9 and 22 are dead entries: both queries were REMOVED (see the notes at their old arms below),
-    // so they fall through to `_` either way. Kept listed rather than silently dropped because an
-    // allowlist is the wrong place to leave a reader guessing whether an absence was deliberate.
-    if !matches!(query_id, 0 | 3 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23)
+    // 9 and 22 are not here: both queries were REMOVED (see the notes at their old arms below). They
+    // were listed until 2026-10-10 as dead entries (`backlog/80` K18), which made an AUTHORITY list
+    // name two things that do not exist; an unknown query now falls on the gated side like any other,
+    // and answers -1 to a holder.
+    if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 23)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
