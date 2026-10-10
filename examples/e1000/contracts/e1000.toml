@@ -10,7 +10,7 @@ version = "0.1.0"
 # request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
 # AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
 request = "8MiB"
-limit   = "16MiB"
+limit   = "32MiB"
 
 [capabilities]
 # Explicit grants only (Commandment VII). The FULL set of declarable capabilities is in
@@ -30,8 +30,10 @@ limit   = "16MiB"
 # device. A driver needs no kernel source change.
 log_write = true   # may write the kernel log ring + serial (syscall 5); NOT to any service
 
-[placement]
-# OPTIONAL (omit -> the supervisor round-robins across cores). A driver usually pins for
-# interrupt locality (§12.2). A pin is STRICT: honored, never rerouted; an unavailable core
-# REJECTS the spawn. core is 0-15. CLAUDE.md §9.2/§13.2.
-core = 1   # a driver pins for interrupt locality (harmless here: this read-only example takes no interrupt)
+# [placement] - OPTIONAL (omit -> the supervisor round-robins across cores). A driver usually pins
+# for interrupt locality (§12.2) with `[placement]` and `core = N`; a pin is STRICT: honored, never
+# rerouted, and an unavailable core REJECTS the spawn. CLAUDE.md §9.2/§13.2.
+#
+# Not pinned here: this read-only example takes no interrupt, and its spawn row (examples-test build)
+# spawns it unpinned. The contract said `core = 1` while the row did not, which `contract_check.py`
+# now catches (backlog/80 T8).

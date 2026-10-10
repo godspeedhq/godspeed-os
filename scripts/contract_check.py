@@ -5,8 +5,8 @@ The kernel is `no_std` and cannot parse TOML at spawn. What a service actually g
 supervisor's spawn table (`IMAGES` in `services/supervisor/src/main.rs`) - since step C every service
 but the supervisor lives there - or, for the supervisor alone, the kernel's `service_config`
 (`kernel/src/task/mod.rs`). This reads the kernel arm first and falls back to the IMAGES row; several
-messages below still say "kernel" for a value read from the supervisor. Only `services/*/contracts/`
-are reconciled here, not `examples/`. The human-facing `.toml` contract is a SECOND declaration - and the two drifted (audit M6: a
+messages below still say "kernel" for a value read from the supervisor. `services/*/contracts/`
+are reconciled against `service_config`/`IMAGES`, and since 2026-10-10 `examples/*/contracts/` against their spawn rows too (backlog/80 T8). The human-facing `.toml` contract is a SECOND declaration - and the two drifted (audit M6: a
 contract that mis-stated the driver's authority; T1 found events/supervisor memory + supervisor peers
 diverged too). Commandment III: what RUNS cannot differ from what is DECLARED.
 
@@ -44,6 +44,35 @@ SERVICES   = REPO_ROOT / "services"
 # no `.toml`, so they are not in this set.)
 CONTRACTED = sorted(d.name for d in SERVICES.iterdir()
                     if (d / "contracts" / f"{d.name}.toml").exists())
+
+# THE EXAMPLES' CONTRACTS TOO, since 2026-10-10 (backlog/80 T8). They are what a newcomer copies, and
+# seven of fifteen disagreed with the spawn row that actually grants them - memory limits, a pinned core
+# no row requested, a peer no row wired - while this file reconciled `services/` alone. An example's
+# directory name is not its service name (`examples/00-hello` is `hello`), so the contract's own `name`
+# is the key.
+EXAMPLES = REPO_ROOT / "examples"
+
+
+def example_contracts():
+    """[(service name, contract path)] for every `examples/*/contracts/*.toml`."""
+    out = []
+    for toml in sorted(EXAMPLES.glob("*/contracts/*.toml")):
+        m = re.search(r'(?m)^name\s*=\s*"([^"]+)"', toml.read_text(encoding="utf-8"))
+        out.append((m.group(1) if m else toml.stem, toml))
+    return out
+
+
+# A field an example's contract cannot state truly, by name and with the reason - the same shape as
+# `service_embed_check.ARCH_EXEMPT`. An exemption is a sentence somebody wrote, never a silence.
+EXAMPLE_EXEMPT = {
+    ("pong", "core"): "its spawn row PREFERS core 1 and falls back to core 0 when 1 is not up (what puts "
+                      "ping and pong on different cores); a contract's `placement.core` is a STRICT pin "
+                      "that rejects the spawn instead (13.2), so neither spelling is true of the other",
+    ("greet", "send"): "two spawn modes, one contract: as a PIPE STAGE (the example's whole lesson) the "
+                       "shell delegates its one peer at spawn and the contract rightly names none; its "
+                       "supervisor row wires `pong` only so the shell's `spawnwired` self-check can prove "
+                       "an installed peer cap",
+}
 
 
 def parse_toml(path: Path) -> dict:
@@ -450,6 +479,21 @@ def main() -> int:
             failures.append(
                 f"  FAIL  {name}: resource_mint {t['resource_mint']} (.toml) != {kmint} (kernel service_hw)")
 
+    examples = example_contracts()
+    for name, toml_path in examples:
+        rel = toml_path.relative_to(REPO_ROOT).as_posix()
+        t = parse_toml(toml_path)
+        k = parse_kernel(name, source) or parse_supervisor_images(name)
+        if k is None:
+            failures.append(f"  FAIL  {name} ({rel}): no spawn row - neither the kernel nor the "
+                            f"supervisor's IMAGES table spawns it, so nothing this contract says is granted")
+            continue
+        for field, tv, kv, what in (("limit", t["limit"], k["limit"], "memory limit"),
+                                    ("core", t["core"], k["core"], "placement.core vs the row's core"),
+                                    ("send", sorted(t["send"]), sorted(k["send"]), "ipc_send vs the row's peers")):
+            if tv != kv and (name, field) not in EXAMPLE_EXEMPT:
+                failures.append(f"  FAIL  {name} ({rel}): {what}: {tv} (.toml) != {kv} (spawn row)")
+
     if failures:
         print("Contract reconcile - FAILURES (a .toml disagrees with the kernel service_config):")
         for f in failures:
@@ -474,7 +518,8 @@ def main() -> int:
         return 1
 
     print(f"Contract reconcile passed - {len(CONTRACTED)} contracts match their kernel service_config "
-          "(memory limit, placement core, ipc_send).")
+          f"(memory limit, placement core, ipc_send), and {len(examples)} example contracts their spawn "
+          f"rows ({len(EXAMPLE_EXEMPT)} field(s) exempt, each with its reason).")
     print("Contract vs code: every crate that prints through `godspeed::io` declares `log_write`, "
           "and every `console_push` declaration is used.")
     return 0
