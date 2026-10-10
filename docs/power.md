@@ -341,7 +341,7 @@ The elegant move is **not** to stop the idle tick (which forces a watchdog exemp
 lost-wake safety net) but to **slow** it:
 
 - **Idle AP** (run queue empty, `cid != 0`, `IDLE_CAN_HALT`): re-arm the timer at a long
-  `IDLE_QUANTUM` (~1 s) instead of the ~10 ms quantum, then `hlt`. The core now wakes ~1x/s instead
+  `IDLE_QUANTUM_MULT` quanta (~1 s) instead of the ~10 ms quantum, then `hlt`. The core now wakes ~1x/s instead
   of ~100x/s - or immediately on real work.
 - **Busy AP** (>=1 runnable task): the normal ~10 ms quantum, unchanged (preemption needs it). The
   transition idle->busy must re-arm the quantum promptly when a task is picked, or a newly-runnable
@@ -352,11 +352,11 @@ lost-wake safety net) but to **slow** it:
   clock (Phase 2b, §14.4). This is why the win is on the APs.
 
 **Why this sidesteps the watchdog entirely (the payoff):** a slow-ticking idle core *still stamps*
-`CORE_LAST_TICK_TSC` every ~1 s. Since `IDLE_QUANTUM` (~1 s) is comfortably under the watchdog
+`CORE_LAST_TICK_TSC` every ~1 s. Since `IDLE_QUANTUM_MULT` quanta (~1 s) is comfortably under the watchdog
 threshold (`tpq * 300` ~ 3 s), every policing core still sees it as alive. **No watchdog change is
-needed** - the stamp and check stay exactly as they are. (Design constraint: `IDLE_QUANTUM` MUST stay
+needed** - the stamp and check stay exactly as they are. (Design constraint: the idle sleep, `IDLE_QUANTUM_MULT` quanta, MUST stay
 below the watchdog threshold, or the watchdog would false-panic an idle core. Couple them, e.g.
-`IDLE_QUANTUM = threshold / 3`, so they can never drift into a false panic.)
+the idle sleep at a third of the threshold, so they can never drift into a false panic.)
 
 **Why the lost-wake safety net survives:** today the 100 Hz timer is not only preemption - it is also
 a 10 ms re-poll of the run queue that *recovers a lost cross-core wake* (a dropped `WAKE_RECEIVER`

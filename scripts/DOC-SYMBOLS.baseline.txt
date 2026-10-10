@@ -100,30 +100,3 @@ ATI_SB450_HDAUDIO_ENABLE_SNOOP     # docs/audio.md - Linux hda_intel.c, EXTERNAL
 ALC256_FIXUP_HP_HEADSET_MIC        # docs/audio.md - Linux patch_realtek.c, EXTERNAL; the one quirk Linux applies to the T630 (103c:8158), headset-jack detection only
 boot_blockdev_qemu                 # backlog/80 R2 - DELETED by 0f7ebce1 (no callers; booted the retired ATA channel); a record of a removal must name what was removed
 
-# ---- SUBSTRING-ONLY DEBT, recorded 2026-10-10 (backlog/80 T8) ---------------------------------------
-# Until then a name resolved if it appeared anywhere as a SUBSTRING, so each of these passed while
-# naming no item: the code has only a LONGER name containing it (shown). Each is a doc to correct -
-# name the real item - and then a line to delete here. Recorded rather than fixed in the change
-# that made the check whole-word, because the docs belong to other work; this list may only shrink.
-DAT_ACTIVE                         # SUBSTRING-ONLY docs/wifi.md - in code only inside ST_DAT_ACTIVE
-DAT_INHIBIT                        # SUBSTRING-ONLY docs/wifi.md - in code only inside SR_DAT_INHIBIT
-GET_RSSI                           # SUBSTRING-ONLY docs/wifi.md - in code only inside BRCMF_C_GET_RSSI, CMD_GET_RSSI
-IDLE_QUANTUM                       # SUBSTRING-ONLY docs/power.md - in code only inside IDLE_QUANTUM_MULT
-MAX_AGGR_NUM                       # SUBSTRING-ONLY docs/wifi-usb.md - in code only inside REG_MAX_AGGR_NUM
-MIC_STRIPPED                       # SUBSTRING-ONLY docs/wifi-usb.md - in code only inside RX_FLAG_MIC_STRIPPED
-MMIO_BASE                          # SUBSTRING-ONLY docs/service-ownership.md - in code only inside EHCI_MMIO_BASE, IOMMU_MMIO_BASE
-PRIMARY_KEY                        # SUBSTRING-ONLY docs/wifi.md - in code only inside BWFM_WSEC_PRIMARY_KEY, WSEC_PRIMARY_KEY
-READ_BLOCK                         # SUBSTRING-ONLY docs/persistence.md - in code only inside OP_READ_BLOCK
-SDIO1_AHB                          # SUBSTRING-ONLY docs/wifi-aic8800.md - in code only inside SYSCLK_SDIO1_AHB, SYSRST_SDIO1_AHB
-SDIO1_SDCARD                       # SUBSTRING-ONLY docs/wifi-aic8800.md - in code only inside SYSCLK_SDIO1_SDCARD
-TREE_SECS                          # SUBSTRING-ONLY docs/stdlib-design.md - in code only inside FS_TREE_SECS
-TRXDMA_CTRL                        # SUBSTRING-ONLY docs/wifi-usb.md - in code only inside REG_TRXDMA_CTRL
-WRITE_BLOCK                        # SUBSTRING-ONLY docs/persistence.md - in code only inside OP_WRITE_BLOCK
-WRITE_ZEROS                        # SUBSTRING-ONLY docs/persistence.md - in code only inside OP_WRITE_ZEROS
-bss_info                           # SUBSTRING-ONLY docs/driver-library.md, docs/wifi.md - in code only inside brcmf_bss_info_le, bss_info_changed
-call_deadline                      # SUBSTRING-ONLY backlog/10-ipc-efficiency.md, docs/ipc-efficiency.md, docs/s - in code only inside call_deadline_into, handle_call_deadline
-scb_val                            # SUBSTRING-ONLY docs/wifi.md - in code only inside brcmf_scb_val_le, scb_val_t
-spawn_probe                        # SUBSTRING-ONLY docs/service-ownership.md - in code only inside spawn_probe_row
-task_alloc_bytes                   # SUBSTRING-ONLY CLAUDE.md - in code only inside current_task_alloc_bytes
-wait_uframe                        # SUBSTRING-ONLY docs/arm32-status.md - in code only inside wait_uframe_abs
-write_file                         # SUBSTRING-ONLY docs/persistence.md - in code only inside fs_write_file

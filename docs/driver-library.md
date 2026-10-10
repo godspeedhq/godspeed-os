@@ -109,7 +109,7 @@ The question for every part of a driver is the one that decides membership:
 | The Broadcom control protocol (BCDC)      | Waiting for hardware, bounded by time (**built: `wait`, polling or paced**) |
 |                                           | Holding still for a set minimum time (**built: `delay::hold`, `delay::hold_parked`**) |
 | BDC framing, firmware command ids         | Interrupt waiting (**built: `irq`**)      |
-| The CLM blob, escan, `bss_info`           | DMA and buffer facilities                |
+| The CLM blob, escan, `brcmf_bss_info_le`           | DMA and buffer facilities                |
 | A chip's recovery sequence                | Bus access                               |
 | A controller's register map and its errata | Power leases and device power/reset authority |
 |                                           | Firmware access                          |

@@ -101,7 +101,7 @@ syscalls, and the fs/block wire protocols.
 |---|---|---|
 | **Entry + runtime** | `service_main(ctx) -> !`, no `std`, **no heap** (§26.6.1: stack arrays and bounded arenas only) | Solid, but ceremonial: 3 crate attributes, a `#[no_mangle]`, and an `#[allow(unsafe_code)]` with a 7-line comment explaining itself |
 | **Authority** | `ServiceContext` is the single door. The contract declares, the SPAWN REQUEST grants (§13.6) | Excellent. Nothing to fix |
-| **IPC** | `send`/`try_send`/`recv`/`call`/`call_deadline` | Good primitives |
+| **IPC** | `send`/`try_send`/`recv`/`call`/`call_deadline_into` | Good primitives |
 | **Request/reply** | **8** `request_with_reply*` variants, **3** outcome enums | See §3.2. The problem area |
 | **Console** | `console_write`, `console_writeln`, `console_write_fmt`, `console_read` | Clean. A stdlib `io` module is mostly a rename |
 | **Filesystem** | An opcode/byte wire protocol over IPC | See §3.1. The other problem area |
@@ -1036,7 +1036,7 @@ deadline shorter than the worst case it waits on, after the UDP socket and the T
 
 copier had already worked this out for its own hand-rolled version, with a comment worth quoting
 because it names the cost exactly: five seconds "was not nearly enough and said so in the worst
-possible way - by blaming the filesystem". Its `TREE_SECS` is 120, which is the number `SWEEP_SECS`
+possible way - by blaming the filesystem". Its `FS_TREE_SECS` is 120, which is the number `SWEEP_SECS`
 already carried, arrived at independently.
 
 **Three times is a pattern, not bad luck.** The rule belongs where an author will meet it: a deadline

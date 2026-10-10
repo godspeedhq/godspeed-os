@@ -188,7 +188,7 @@ and runs BEFORE `rtl92c_download_fw`. Both drivers set the queues up first, so R
 `rtl8xxxu`'s order and before it reached a board: whether the MAC is cold, and which transmit queues the
 dongle's endpoints serve (`NORMAL_SIE_EP_TX`, or the bulk OUT endpoints in its configuration descriptor where
 that reads 0), are asked BEFORE the power-on; after it, a cold MAC gets its 0xF8 pages reserved
-(`RQPN`), every MAC gets the queue priority (`TRXDMA_CTRL`) and the receive FIFO's boundary (0x27FF). The
+(`RQPN`), every MAC gets the queue priority (`REG_TRXDMA_CTRL`) and the receive FIFO's boundary (0x27FF). The
 values are `rtl_queues.rs`, pure and host-tested against `rtl8xxxu`'s own examples (`0x80E9020C`, `0xF5F0`).
 `rtl8xxxu` builds the link-list table after the firmware rather than before it, as `rtlwifi` does; that is
 left to R3 with the rest of the MAC's setup.
@@ -306,7 +306,7 @@ Linux's source between its declaration and its terminator: the MAC defaults (87 
 order, the source files' SHA-256 in its header.
 
 **Written from the source, function by function** - after R2's correction, nothing here rests on a summary:
-`rtl8xxxu_init_mac` (and `MAX_AGGR_NUM`), `rtl8xxxu_gen1_init_phy_bb`, `rtl8xxxu_init_phy_rf` with
+`rtl8xxxu_init_mac` (and `REG_MAX_AGGR_NUM`), `rtl8xxxu_gen1_init_phy_bb`, `rtl8xxxu_init_phy_rf` with
 `rtl8xxxu_init_rf_regs`, `rtl8xxxu_write_rfreg` and `rtl8xxxu_read_rfreg` (path A, LSSI and HSSI), the switch
 words (0x870 = 0x07000760, 0x860), the transmit boundaries, `PBP`, `rtl8xxxu_init_llt_table` (pure and
 host-tested in `rtl_queues.rs`), `rtl8xxxu_gen1_usb_quirks`, the receive configuration (`RCR` without the
@@ -857,7 +857,7 @@ an open network the frame goes plain. It is still at the driver's 1 Mb/s (R5c's 
 (`security` AES and `swdec` clear in the descriptor, `rtl8xxxu_parse_rxdesc16`'s `RX_FLAG_DECRYPTED`)
 becomes the ethernet frame inside it. `llc_payload` steps over the CCMP header, and the 8-byte MIC the chip
 appends (`RCR_APPEND_MIC`) is trimmed, as mac80211 trims it for a frame marked decrypted but not
-`MIC_STRIPPED`, which `rtl8xxxu` never sets. It waits in a queue the receive side and the station share
+`RX_FLAG_MIC_STRIPPED`, which `rtl8xxxu` never sets. It waits in a queue the receive side and the station share
 (`rx::Link`, a `RefCell` `main.rs` owns), and the station's `pull` hands it to the serve loop's frame path.
 A key frame on the joined link is the access point's group rekey: counted and said, not answered (R7).
 

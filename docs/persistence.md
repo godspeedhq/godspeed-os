@@ -1237,7 +1237,7 @@ Test 14).
 
 > **Note (2026-10-09): the proposal, not the protocol.** What shipped is opcode-addressed with a
 > correlation tag at byte 0. `fs` <-> `block-driver`: `[tag, op, lba:u64 LE, ...]` -> `[tag, status,
-> ...]`, ops 1 `READ_BLOCK`, 2 `WRITE_BLOCK`, 3 `CAPACITY`, 4 `WRITE_ZEROS`, 5 `FLUSH` - one block per
+> ...]`, ops 1 `OP_READ_BLOCK`, 2 `OP_WRITE_BLOCK`, 3 `CAPACITY`, 4 `OP_WRITE_ZEROS`, 5 `FLUSH` - one block per
 > request, not a count. Client <-> `fs`: ops 10-31 (`OP_WRITE_FILE` 10, `OP_READ_FILE` 11,
 > `OP_STAT_FILE` 12, directories, rename/move/delete, drives, streaming `OP_WRITE_NEW`/`OP_WRITE_AT`/
 > `OP_READ_AT` 24-26, check, scrub, `OP_OPEN` 30, `OP_SEAL` 31). The constants are the definition:
@@ -1313,7 +1313,7 @@ with that backend; see the note at the head of §5.)*
 4. **Filesystem read/write (name→blob). ✅ done** (`osdev test blockdev`, case P1.4).
    On-disk entry table (16 entries × 32 B, one block) + a bump allocator (next-free-block
    in the superblock; contiguous extents, no reclamation yet). `fs` stores/retrieves named
-   files: `write_file` allocates an extent, writes the data blocks + entry table +
+   files: `write_path` allocates an extent, writes the data blocks + entry table +
    superblock through block-driver `WriteBlock`; `read_file` walks the entry's extent via
    `ReadBlock`. Verified by a mount-time round-trip (`greeting`). `fs` also serves the
    client API (`WriteFile`/`ReadFile`/`StatFile`, ops 10-12) over IPC via the reply-cap

@@ -346,7 +346,7 @@ settle this question, and the probe exists because the register was never read a
 the right parity, but ODDFRM selects odd/even FRAME only. The schedule needs MICROFRAME precision -
 start-split at `(current+1)&7` skipping microframe 6, complete-split at +2, retrying NYET in the
 following microframes - and 125 us resolution is below anything the controller will time for us. So
-`wait_uframe` is not sloppiness; it is supplying timing the hardware has no mechanism to supply.
+`wait_uframe_abs` is not sloppiness; it is supplying timing the hardware has no mechanism to supply.
 
 **What it costs, measured:** `kbd 2063ms` against `sleep 42862ms` = **4.6% of one core**, about 1.1% of
 the machine, for a working keyboard. The outer loop is already interrupt-driven (`recv_timeout` on the

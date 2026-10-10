@@ -381,7 +381,7 @@ os/
                          #   a NEW crate starts at zero. Counts only methods with a `gs` replacement, which
                          #   it names; a gap in `gs` is closed in `gs` (backlog/71, 2026-10-05)
     port_scope_check.py  #   ...and the one the other four cannot answer: did the port EDIT anything
-                         #   outside `arch/<isa>/` and the eleven files `docs/porting.md` marks `+`.
+                         #   outside `arch/<isa>/` and the twelve files `docs/porting.md` marks `+`.
                          #   They all ask whether a RULE was broken; an ordinary edit to a neutral
                          #   kernel file breaks none of them, so five ran green over exactly that
     dash_check.py        #   no em/en dashes anywhere (§21)
@@ -2149,7 +2149,7 @@ Property tests assert *universal* claims over randomized inputs. Identity tests 
 | P1  | Random bytes → `CapNotHeld` or `CapInvalid`; never accepted as a cap           | §7.3 (unforgeable)    |
 | P2  | Generation per service is strictly monotonic across its lifetime               | §7.5                  |
 | P3  | Cap rights never widen during transfer                                         | §7.3 (non-escalating) |
-| P4  | ∑ `task_alloc_bytes` ≡ pages mapped, after any sequence of alloc/free          | §10.3                 |
+| P4  | ∑ `current_task_alloc_bytes` ≡ pages mapped, after any sequence of alloc/free          | §10.3                 |
 | P5  | Every live endpoint has exactly one owning task                                | §8.3                  |
 | P6  | Queue head ≤ tail ≤ head + 16; count consistent with both                      | §8.5                  |
 | P7  | After unmap + TLB shootdown, the page is unreadable from every core            | §10.5                 |
