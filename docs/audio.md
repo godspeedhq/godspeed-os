@@ -1469,3 +1469,9 @@ order was wrong there, so its log line must cost under the guard's 6 ms.
 **Confirmed on the Pi 4 (same day, `3ac042c2`):** three tones, 5 s, 5 s and 2 s, each `0 underrun(s)`, and
 no `pwm-audio: underrun` line. Each also finished closer to its length - 5008 ms by the clock where it was
 5017, 2008 where it was 2014 - about the 10 ms the log line cost before the first fill, which is likely but not shown.
+
+**`chaos max-carnage pwm-audio 100 yes` on the Pi 4 (same day, `3ac042c2`):** 100 rounds, 100 kills, each
+under a flood, mem-pressure and a spawn-storm (99 spawns refused, as designed); the kernel alive. All 100
+respawns brought the jack up again (`Pi 4 jack up` 101 times, the boot's included) and all 100 read
+`volume 100, unmuted` back from `/audio.settings`. A 5 s tone afterwards: 0 underruns, heard. The aimed
+run only; an `all-services` run was not in this log.
