@@ -4,16 +4,16 @@
 Version reported by `audio version`. Implementation shape: **shell built-in**, asking the board's audio
 driver over IPC - `audio-driver` on x86, `pwm-audio` on the Pis. The driver owns the controller; the shell owns the words.
 
-## Status, as built and honest (2026-10-03)
+## Status, as built and honest (2026-10-10)
 
-**Built and run in QEMU only** (`intel-hda` with the `hda-output` codec, `mixer=on`), on branch
-`feat/audio`: every verb in section 1 answered as section 2 says, and the WAV QEMU wrote agrees - the
-level follows the volume, volume 0 and mute are silent, a tone lasts as long as asked and `q` cuts it
-short (`docs/audio.md`, "Step A4, first half"). **On the Pis** the same verbs reach `pwm-audio`, which
-drives the 3.5 mm jack by PWM - built, run in QEMU (which can only show that it refuses an emulator that
-does not pace its DMA), and **heard on a Pi 4** (2026-10-03: tone, volume, mute and unmute through the
-jack); the Pi 2 is built and not yet heard. Not run on hardware on x86: on the T630 the driver surveys the codec and stops before playback, and every verb below
-answers that this codec has not had playback verified yet (`docs/audio.md`, step A6).
+**Built, run in QEMU, and heard on every board with an audio output.** In QEMU (`intel-hda` with the
+`hda-output` codec, `mixer=on`) every verb in section 1 answers as section 2 says, and the WAV QEMU writes
+agrees - the level follows the volume, volume 0 and mute are silent, a tone lasts as long as asked and `q`
+cuts it short (`osdev test audio`). On hardware: the Dell Wyse 5070 and the HP T630 through `audio-driver`,
+speaker and headphones on each; the Pi 4 and the Pi 2 through `pwm-audio`, which drives the 3.5 mm jack
+by PWM. The VisionFive 2 Lite has no audio output, and `audio` answers `no audio hardware on this
+machine`. A codec not in the driver's table of verified codecs is surveyed and not played on, and every
+verb below says so (section 4).
 
 The verbs in section 1 are built, and the volume, the mute and the output survive a reboot (section 5).
 `hardware`, `outputs`, `output`, `debug`, `system sounds` and the keyboard shortcuts were built on 2026-10-09 (`feat/audio-finish`) and run in
@@ -42,7 +42,7 @@ fault.
 | `audio off hard` | action | stop anything playing and hold the whole controller in reset - the closest HD Audio has to cutting the power. `audio on` brings it back |
 | `audio tone <hz> [seconds]` | action | play a sine the driver generates itself, 20 to 20000 Hz, 2 s unless told (tenths allowed: `0.5`, up to 600). Blocks with `[q] quit`; `q` STOPS the tone (rule 11) |
 | `audio play <path>` | action | play a WAV file from disk: 16-bit PCM, mono or stereo, 44100 or 48000 Hz where the codec offers it. Blocks with `[q] quit`; `q` STOPS it. Anything else is refused with the reason |
-| `audio debug [view]` | report, pipes | BUILT: the driver's own account of itself, one view of `stats` (bare), `codec`, `stream`, `trace` or `registers` - verbs sent and unanswered, interrupts, underruns and the last sound's rate by the clock; the whole widget graph; the output stream's registers and buffer descriptors; the last 64 verbs and their answers; the controller's globals. On a driver that surveyed its codec and stopped (the T630 today), `codec`, `trace` and `registers` still answer. The Pis' jack answers every view, `codec` and `trace` with a line saying it has neither |
+| `audio debug [view]` | report, pipes | BUILT: the driver's own account of itself, one view of `stats` (bare), `codec`, `stream`, `trace` or `registers` - verbs sent and unanswered, interrupts, underruns and the last sound's rate by the clock; the whole widget graph; the output stream's registers and buffer descriptors; the last 64 verbs and their answers; the controller's globals. On a driver that surveyed its codec and stopped (a codec not in its table), `codec`, `trace` and `registers` still answer. The Pis' jack answers every view, `codec` and `trace` with a line saying it has neither |
 | `audio system sounds on` / `off` | action | BUILT: the short sounds the system makes on its own - two falling tones for a command that failed at the prompt, one low tone for one that was refused, a rising chirp for a finished background job, a rising or falling pair for a USB device the supervisor starts a driver for arriving or leaving. On by default; kept in `/audio.settings`; `audio status` shows which. Never from a script, at most one in half a second, and the volume and mute apply |
 | Ctrl+Alt+Up / Ctrl+Alt+Down | shortcut | BUILT: volume up or down 5, stopping at 100 and 0; held, it repeats. The result as read back: `volume 65  [#############-------]`, one line above the prompt that a second press overwrites; `volume 0 - silent`; `muted (volume 65)` while muted |
 | Ctrl+Alt+M | shortcut | BUILT: mute, or unmute if muted; held, it does not repeat |
@@ -107,7 +107,7 @@ the adapter (`docs/audio.md`).
 | The controller did not leave reset | `audio: the controller is there and did not come out of reset - the serial log says more` |
 | No codec on the link | `audio: the controller is up but no codec answered` |
 | No usable output path | `audio: the codec offers no output this driver can use` |
-| A codec playback has not been verified on (the T630 today) | `audio: this codec has not had playback verified yet - the driver surveyed it and stopped (docs/audio.md, A6)` |
+| A codec playback has not been verified on (one not in the driver's table) | `audio: this codec has not had playback verified yet - the driver surveyed it and stopped (docs/audio.md, A6)` |
 | A tone still playing five seconds after it should have ended | stopped, and said |
 
 An absent, wedged or restarting driver makes `audio` return with a loud sentence, never hang: every ask

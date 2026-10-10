@@ -9649,7 +9649,8 @@ fn audio_hw_maker(r: &HwRow) -> HwText<24> {
 }
 
 /// The audio driver's own word on the device it holds, read live (`OP_STATUS`): `ready`, `off`, or the
-/// reason it stopped - which is how a T630 shows that it surveyed its codec and stopped (A6).
+/// reason it stopped - which is how a machine whose codec is not one the driver plays on shows that it
+/// surveyed the codec and stopped (A6).
 fn audio_driver_state(ctx: &ShellCtx) -> &'static str {
     use audio_wire::*;
     let Some(r) = audio_ask(ctx, &[OP_STATUS], AUDIO_REPLY_MS) else { return "not answering" };

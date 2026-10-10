@@ -17,15 +17,15 @@
 //!   (the Immediate Command registers are OPTIONAL, HDA 1.0a 3.4, and unknown on the T630's controller).
 //! - **A3** configures the output path and plays a tone the driver generates itself: one output stream,
 //!   a buffer descriptor list, a cyclic ring of sound in the DMA arena. As first built it was refilled by
-//!   polling and played once at start as a self-test; both are gone - the ring is refilled on the stream's
-//!   interrupt (with a watchdog for a lost one), and a tone plays only when a request asks for it (A4).
+//!   polling and played once at start as a self-test. A tone now plays only when a request asks for it
+//!   (A4), and the ring is refilled on the stream's interrupt (with a watchdog for a lost one) where the
+//!   controller has MSI - the Wyse 5070 - and by polling where it has neither MSI nor a line - the T630.
 //!
-//! **DMA is used only on a codec in `PLAYABLE`** - QEMU's (`1af4`), where A2 and A3 were verified, and
-//! the Dell Wyse 5070's Realtek (`10ec:0225`), A6's first machine, with the setup Linux gives that codec
-//! at probe. On any other codec the driver stops after A1's survey and says so: on the T630 the class
-//! lookup hands it the HDMI controller, not the analog one, and the AMD controller needs its snoop bit
-//! set (docs/audio.md, "Found while preparing"). On this driver's death the kernel clears its device's
-//! bus mastering, keyed on the device it was given (`kernel/src/task/scheduler.rs`).
+//! **DMA is used only on a codec in `PLAYABLE`** - QEMU's (`1af4`), where A2 and A3 were verified, the
+//! Dell Wyse 5070's Realtek (`10ec:0225`) and the HP T630's (`10ec:0255`), each with the setup Linux
+//! gives that codec, and each heard (A6). On any other codec the driver stops after A1's survey and says
+//! so. On this driver's death the kernel clears its device's bus mastering, keyed on the device it was
+//! given (`kernel/src/task/scheduler.rs`).
 //!
 //! **Every wait is `gs::driver`'s** - this driver is the library's independent test (docs/driver-library.md,
 //! "Wi-Fi discovers; audio tests"). A wait that has to be bent to fit is a finding about the library, and
@@ -954,8 +954,8 @@ struct LastPlay {
 enum Device<'a> {
     Ready(Player<'a>),
     Absent(u8),
-    /// The codec was surveyed and the driver stopped short of playing - on the T630 today, a codec
-    /// playback has not been verified on (A6). The controller is kept, so `audio debug` can still show
+    /// The codec was surveyed and the driver stopped short of playing - a codec playback has not been
+    /// verified on, one not in `PLAYABLE`. The controller is kept, so `audio debug` can still show
     /// the codec, the verbs and the registers: the dump that finds a real codec's path is needed most
     /// exactly here.
     Surveyed(u8, Hda<'a>, OutPath),

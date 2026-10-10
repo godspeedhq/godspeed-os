@@ -1,13 +1,16 @@
 # Audio
 
-**Status: steps A1-A5 built and run in QEMU (2026-10-03; A4's outputs, debug and system sounds not built), built on
-`feat/audio` and since merged to `main`. The driver resets an Intel High Definition Audio controller, finds its codec and output
-path, moves codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's
-`audio` sets the volume, mutes, powers the codec down and up and plays tones (`utilities/57_audio.md`),
-each checked against the WAV QEMU wrote; the volume and the mute survive a reboot in `/audio.settings`.
-Interrupt-driven, IOMMU-confined, restartable; `play` streams PCM (A5). The Pis' 3.5 mm jack is driven by
-`pwm-audio` and was HEARD on a Pi 4 (2026-10-03); the Pi 2 is built and not yet heard. Not yet: `outputs`,
-`debug`, system sounds, the shortcuts; the HDA driver not run on hardware past the codec survey (A6).**
+**Status: A1-A6 done; HEARD on every board with an audio output (2026-10-10).** The HDA driver
+(`audio-driver`) resets an Intel High Definition Audio controller, finds its codec and output paths, moves
+codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's `audio` sets the
+volume, mutes, powers the codec down and up, chooses the output, plays tones and WAV files, and shows the
+driver's own account (`utilities/57_audio.md`). Volume, mute, output and system sounds survive a reboot in
+`/audio.settings`. Interrupt-driven where the controller has MSI and polled where it has none (the T630),
+IOMMU-confined where there is one, restartable. Heard on the Dell Wyse 5070 (ALC225, speaker and
+headphones) and the HP T630 (ALC255, speaker and headphones); the Pis' 3.5 mm jack, driven by `pwm-audio`,
+heard on the Pi 4 and the Pi 2; the VisionFive 2 Lite has no audio output and `audio` says so. A 100-round
+`chaos max-carnage` aimed at the audio driver passed on all four boards that have one. Only a codec in the
+driver's `PLAYABLE` table is played on; any other is surveyed and the driver says so.**
 
 Audio is two things at once here. It is the system's first sound, and it is the planned **independent
 test of `gs::driver`** (`docs/driver-library.md`, "Wi-Fi discovers; audio tests"): a second kind of
@@ -26,7 +29,7 @@ to a WAV file - and it is what the HP T630 has.
 | QEMU | `intel-hda` (ICH6, `8086:2668`), codec `hda-output` (`1af4:0012`) | DAC node 2 -> line-out pin node 3. Immediate Command registers implemented. Sound to `build/qemu_audio.wav` (`osdev run`) |
 | HP T630 | `00:09.2` AMD FCH Azalia (`1022:157a`), codec Realtek ALC255 (`10ec:0255`, subsystem `103c:8158`) | internal speaker, front headset jack, rear line-out. Linux: snoop via PCI config 0x42, trust LPIB, 40-bit DMA |
 | HP T630 | `00:01.1` Radeon HDMI audio (`1002:9840`) | a SECOND class-0x0403 controller - see "Found while preparing" |
-| Pi 2 / Pi 4 | 3.5 mm jack driven by PWM, fed by the BCM DMA engine (section "The Pis and the VisionFive") | not HDA. Needs the GPIO pinmux and the clock manager, both SHARED SoC blocks; no QEMU model. BUILT: the kernel prepares both as part of the grant (`pwm-audio`); heard on a Pi 4, the Pi 2 not yet |
+| Pi 2 / Pi 4 | 3.5 mm jack driven by PWM, fed by the BCM DMA engine (section "The Pis and the VisionFive") | not HDA. Needs the GPIO pinmux and the clock manager, both SHARED SoC blocks; no QEMU model. BUILT: the kernel prepares both as part of the grant (`pwm-audio`); heard on the Pi 4 and the Pi 2 |
 | VisionFive 2 Lite | no analog output; HDMI only | confirmed three ways: the board's port list, the vendor device tree disabling its PWM-DAC, and the board's own Linux log (`build/serial_output_risc_v_original.log`): `ALSA device list: No soundcards found` |
 
 Sources: the HDA specification rev 1.0a; QEMU `hw/audio/intel-hda.c`, `hda-codec.c`; Linux
@@ -53,8 +56,8 @@ linux-hardware.org probes of the T630. The divergences from Linux are recorded w
 | **A3** | Configure the path (power, amps, pin control, converter format and stream tag) and play a tone the driver generates itself: one output stream, a BDL, a cyclic buffer in the DMA arena, polled LPIB | QEMU - **built**, checked by reading the WAV QEMU wrote |
 | **A4** | A request protocol (tagged, defined once and shared with the shell), the `audio` utility as specified below, and `/audio.settings` | QEMU - **protocol, the first verbs (status, info, volume, mute, unmute, on, off, off hard, tone), `/audio.settings` and `osdev test audio` built; `hardware`, `outputs`, `output`, `debug`, system sounds and the keyboard shortcuts built 2026-10-09** |
 | **A5** | `audio play <path>`: the shell reads the WAV and streams chunks; the driver answers each with the free space left; underruns write silence and are counted | QEMU - **built** |
-| A6 | Real sound on hardware. **HEARD on the Wyse 5070 and, on the T630 through its speaker and headphones (2026-10-09)**, which needs neither kernel fix nor a snoop bit; then the T630: the kernel fixes below, the AMD snoop bit, the ALC255's real path walk with EAPD. A person listening on each | Wyse, then T630 |
-| **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU |
+| **A6** | Real sound on hardware, a person listening on each. **HEARD**: the Wyse 5070 (2026-10-09, speaker; headphones 2026-10-10) and the T630 (headphones 2026-10-09, speaker 2026-10-10), after the kernel's K1 and K2 and the ALC255's own bring-up; the T630's snoop bit was already on | Wyse, T630 - **done** |
+| **later** | Interrupt-driven refill and IOMMU confinement - both **built**. (Restart management was done after A3) | QEMU, then the Wyse (MSI) and the T630 (confined, polled) |
 
 **Before A3, the library work the process asks for.** Two things audio needs are already written by
 hand in other drivers, so by the rule they are library candidates NOW, and audio is meant to test them
@@ -70,9 +73,9 @@ step that first needs each (A3 for the arena, the interrupt step for the other).
 
 ## The `audio` utility (specification, agreed 2026-10-03)
 
-**Partly built (2026-10-03).** The verbs the shell answers are specified in `utilities/57_audio.md`,
-which is now the authority for them; this section stays the agreed design for the rest - `outputs`,
-`output`, `debug`, `system sounds` and the shortcuts (`play` and `/audio.settings` are built since). What follows was written
+**Built (2026-10-03, the rest 2026-10-09).** The verbs the shell answers are specified in
+`utilities/57_audio.md`, which is the authority for them; this section is the agreed design they were
+built from, kept as the record (only `audio hardware use` is not built). What follows was written
 before any of it existed. It lived here, not in `utilities/`, until the shell answered `audio`: Commandment X fails a `utilities/` spec for a verb the
 shell does not have, and the reverse (`utilities/0_conventions.md` 2a). On the day it is built it moves
 to a numbered spec of its own under `utilities/`, with the shell's eight registration sites. Modelled on `utilities/56_wifi.md`,
@@ -644,6 +647,11 @@ driver does not use DMA yet (A6), so confinement there is untested.
 arena - the Radeon HDMI audio controller, which is the device "Found while preparing" item 2 predicts a
 class-code lookup picks first. So on the T630 the confined audio device is not the analog Azalia at
 `00:09.2`, and what that confinement has been asked to carry is still untested.)*
+
+*(Note 2026-10-10: both superseded. Since K2 the driver is granted `00:09.2`, the analog controller, and
+the T630 confines it and plays through it: the commands, the buffer descriptors and the sound all go
+through the confined domain, heard on the speaker and the headphones, and confined again on every
+respawn of a 100-round chaos run.)*
 
 ## Step A4, first half: the protocol and the `audio` verbs (2026-10-03)
 
@@ -1484,3 +1492,11 @@ afterwards 0 underruns.
 audio-driver 100 yes`, 100 rounds, 100 kills, the kernel alive; `audio-driver: ready` 101 times and the
 settings read back 101 times, the ALC225 re-surveyed on every respawn. Tones before and after: 5 s each,
 0 underruns, 59 interrupts, identical to the boot's.
+
+**The HP T630 (same day, same image), operator-accepted:** `chaos max-carnage audio-driver 100 yes`,
+100 rounds, 100 kills, the kernel alive, and the tones after chaos played and were heard, 0 underruns.
+What the log also shows, recorded as seen: most respawns were killed again before reaching `ready` -
+chaos kills about every 0.4 s and the ALC255's bring-up takes longer than the Wyse's - and 9 stopped at
+their first ring command with `rings answered Some(0)`, each beside IOMMU faults from `00:09.2` at an
+address inside its own arena (`0x3d71400`), the same signature `docs/wifi-usb.md` records for `xhci` on
+this machine. The next kill replaced each, and the instance left at the end came up and played.
