@@ -425,10 +425,13 @@ pub unsafe extern "C" fn ud2_syscall_entry() {
         // rax = return value; restore user GS and re-enter ring-3.
         "swapgs",
         "iretq",
-        // --- Kernel ud2 crash path (ring-0 ud2, should never happen) ---
+        // --- Kernel ud2 (ring-0): a Rust trap or abort, never a syscall ---
+        // The same report-and-halt-every-core path as every other ring-0 exception. The #UD frame
+        // has no error code, so it is exactly the frame `exc_stub_noec` expects. This was `cli; hlt`
+        // on one core with nothing printed until 2026-10-10, so a kernel trap was invisible until
+        // the liveness watchdog noticed the dark core (`backlog/80` K8).
         "3:",
-        "cli",
-        "4: hlt",
-        "jmp 4b",
+        "jmp {kernel_exception}",
+        kernel_exception = sym super::boot::exc_stub_noec,
     )
 }

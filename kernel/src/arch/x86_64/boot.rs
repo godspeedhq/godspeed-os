@@ -1932,8 +1932,9 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
 //   No error code: [RSP+0]=RIP  [RSP+8]=CS  [RSP+16]=RFLAGS  [RSP+24]=RSP
 //   Error code:    [RSP+0]=err  [RSP+8]=RIP [RSP+16]=CS      [RSP+24]=RFLAGS
 // The CS value identifies which layout applies: 0x08 for a kernel frame, and for a user frame
-// 0x2B (selector 0x28 with RPL 3, as `context_switch.rs` pushes it). (2026-10-09: the handler
-// below tests for 0x28, which a ring-3 frame never carries, so a user frame prints no RIP.)
+// 0x2B (selector 0x28 with RPL 3, as `context_switch.rs` pushes it). The handler compares the
+// selector with its RPL bits masked off; it compared the raw value with 0x28, which a ring-3 frame
+// never carries, so a user frame printed no RIP until 2026-10-10 (`backlog/80` K9).
 // ---------------------------------------------------------------------------
 
 #[unsafe(naked)]
@@ -1981,8 +1982,9 @@ unsafe extern "C" fn exception_halt() -> ! {
 #[no_mangle]
 unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) {
     // Identify the likely frame layout by finding the CS slot.
-    // CS is zero-extended to 64 bits on the stack: 0x08 (kernel) or 0x2B (user, RPL 3) - the
-    // checks below test 0x28, so only kernel frames are recognised (see the block comment above).
+    // CS is zero-extended to 64 bits on the stack: 0x08 (kernel) or 0x2B (user, RPL 3). The RPL
+    // bits are masked off before comparing, so both are recognised (see the block comment above).
+    let is_cs = |w: u64| w & !3 == 0x08 || w & !3 == 0x28;
     // Take SERIAL_LOCK if it can be taken safely (audits/kernel-audit.md Audit 10). The `_nolck`
     // writers below exist because this fault may have interrupted a `kprintln` ON THIS CORE that
     // holds the lock, where waiting would self-deadlock - and that stays true. But bypassing the
@@ -2000,11 +2002,11 @@ unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) 
         serial_puts_nolck(b"] [");
         serial_hex64_nolck(w3);
         serial_puts_nolck(b"]");
-        if w1 == 0x08 || w1 == 0x28 {
+        if is_cs(w1) {
             // No error code pushed: w0=RIP, w1=CS
             serial_puts_nolck(b" RIP=");
             serial_hex64_nolck(w0);
-        } else if w2 == 0x08 || w2 == 0x28 {
+        } else if is_cs(w2) {
             // Error code pushed by CPU: w0=errcode, w1=RIP, w2=CS
             serial_puts_nolck(b" errcode=");
             serial_hex64_nolck(w0);
@@ -2034,8 +2036,11 @@ unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) 
 // ---------------------------------------------------------------------------
 
 /// No-error-code exception frame: [rsp+0]=RIP [rsp+8]=CS [rsp+16]=RFLAGS [rsp+24]=RSP.
+///
+/// Also where the `ud2` syscall entry sends a RING-0 `ud2` (`syscall_entry::ud2_syscall_entry`): the
+/// #UD frame is this frame, and a kernel trap must be reported and halt every core like any other.
 #[unsafe(naked)]
-unsafe extern "C" fn exc_stub_noec() -> ! {
+pub(super) unsafe extern "C" fn exc_stub_noec() -> ! {
     core::arch::naked_asm!(
         // Raw '?' to COM1, then set the reached-flag BEFORE cli (nothing reads it today).
         "mov dx, 0x3fd",
