@@ -5465,8 +5465,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hs && r.hub_port == hp as u32) => {
                                 radio_absent_seen = 0;
                             }
-                            // Connected AND not already tried: a real arrival.
-                            Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0 => {
+                            // Connected AND not already tried, on two consecutive reads: a real arrival.
+                            // The same confirmation the HID-driven scan has (`hub_seen`) - one connected
+                            // read is a reading, two is an event. This took ONE until 2026-10-10, the
+                            // phantom-arrival hole that scan's comment describes (backlog/80 D8).
+                            Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0
+                                && { hub_seen[hp as usize] = hub_seen[hp as usize].saturating_add(1);
+                                     hub_seen[hp as usize] >= 2 } => {
                                 hub_tried |= 1u64 << hp;
                                 ctx.log_fmt(format_args!(
                                     "xhci: device arrived on hub slot {} port {} - re-enumerating", hs, hp));
@@ -5497,6 +5502,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 hub_seen[hp as usize] = 0;
                                 hub_tried &= !(1u64 << hp);
                             }
+                            // A failed probe resets the confirmation run, for the HID-driven scan's
+                            // reason: the next reading on this hub may be a late answer.
+                            None if hp < 64 => hub_seen[hp as usize] = 0,
                             _ => {}
                         }
                     }
@@ -5539,15 +5547,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 }
             }
-            // New-device detection: while we still have a free device slice, a port
-            // that was NOT connected at poll start becoming connected is a fresh
-            // plug - break and re-enumerate to bind it alongside the existing
-            // device(s). Tracks port leaves so a re-plug into the same port counts.
-            if ndev < MAX_HID {
+            // The root-port scan. New-device detection: while we still have a free device slice, a
+            // port that was NOT connected at poll start becoming connected is a fresh plug - break
+            // and re-enumerate to bind it alongside the existing device(s). Tracks port leaves so a
+            // re-plug into the same port counts.
+            //
+            // ONLY the new-device arm needs a free slice. The whole scan was gated on
+            // `ndev < MAX_HID` until 2026-10-10, so with two HIDs bound a root-port dongle's unplug,
+            // the port-leave tracking and the poison clearing all stopped (backlog/80 D7).
+            {
                 for p in 1..=max_ports {
                     let c =
                         mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0;
-                    if c && present & (1 << p) == 0 {
+                    if c && present & (1 << p) == 0 && ndev < MAX_HID {
                         ctx.log_fmt(format_args!(
                             "xhci: new device on port {} - re-enumerating",
                             p
