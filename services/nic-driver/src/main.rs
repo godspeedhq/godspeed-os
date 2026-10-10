@@ -834,12 +834,11 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
 /// net-stack degrades rather than hangs (§26.7). Never returns.
 /// The one e1000 this driver knows, as `nic_vendor_device` reports it (device << 16 | vendor): the
 /// Intel 82540EM, QEMU's `e1000`.
-#[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
 const E1000_82540EM: u32 = 0x100E_8086;
 
 /// The granted register window, if the controller behind it is the e1000 this driver knows - and,
-/// when it is not, a line naming what it is instead (backlog/80 D2).
-#[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
+/// when it is not, a line naming what it is instead (backlog/80 D2). It asks the DEVICE, so it needs
+/// no ISA test: only x86 reaches the e1000 path, every other port's backend having diverged first.
 fn known_e1000(ctx: &ServiceContext, mmio: Option<godspeed_sdk::Mmio>) -> Option<godspeed_sdk::Mmio> {
     let vd = ctx.nic_vendor_device();
     if mmio.is_some() && vd != E1000_82540EM {
@@ -848,12 +847,6 @@ fn known_e1000(ctx: &ServiceContext, mmio: Option<godspeed_sdk::Mmio>) -> Option
             vd & 0xFFFF, vd >> 16));
         return None;
     }
-    mmio
-}
-
-/// The SoC ports never reach the e1000 path (each backend above diverges); this keeps it compiling.
-#[cfg(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64"))]
-fn known_e1000(_ctx: &ServiceContext, mmio: Option<godspeed_sdk::Mmio>) -> Option<godspeed_sdk::Mmio> {
     mmio
 }
 
