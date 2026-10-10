@@ -1679,7 +1679,12 @@ fn cmd_test(suite: &str) {
         "big-script"   => run_big_script_test(),
         "fmt-demo"     => run_fmt_demo_test(),
         "fmt-idem"     => run_fmt_idem_test(),
-        other => eprintln!("unknown test suite: {}", other),
+        // A typo is a failure, not a pass. This printed the line and exited 0, so a script or a CI
+        // step naming a suite that does not exist reported success having run nothing (backlog/80 T3).
+        other => {
+            eprintln!("unknown test suite: {} - nothing was run", other);
+            std::process::exit(2);
+        }
     }
 }
 
@@ -1805,27 +1810,6 @@ fn run_iommu_test() {
         println!("\n  [12]  confined_driver_dma_faults  (§22 Test 12)  … FAIL\n\n  0 passed  1 failed");
         std::process::exit(1);
     }
-}
-
-/// Boot the blockdev image once with `persist` on the ATA secondary channel,
-/// capture the serial log, and return it. The persist disk is NOT recreated -
-/// the caller controls its lifecycle (key for the reboot-survival test).
-fn boot_blockdev_qemu(img_str: &str, persist_str: &str, serial: &str, secs: u64) -> String {
-    let _ = std::fs::remove_file(serial);
-    let mut cmd = std::process::Command::new(qemu::qemu_binary());
-    cmd.args([
-        "-m", "512M", "-smp", "2",
-        "-drive", &format!("format=raw,file={img_str},if=ide,index=0"),
-        "-drive", &format!("format=raw,file={persist_str},if=ide,index=2"),
-        "-serial", &format!("file:{serial}"),
-        "-serial", "null",
-        "-display", "none", "-no-reboot", "-no-shutdown",
-    ]);
-    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("blockdev: failed to launch QEMU: {e}"); std::process::exit(1); });
-    std::thread::sleep(std::time::Duration::from_secs(secs));
-    let _ = child.kill();
-    let _ = child.wait();
-    std::fs::read_to_string(serial).unwrap_or_default().replace('\r', "")
 }
 
 /// Build the AHCI block-driver variant: block-driver with its `ahci` feature,
