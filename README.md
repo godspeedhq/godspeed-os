@@ -7,6 +7,8 @@ A capability-based microkernel OS written in Rust. Every privileged action requi
 📖 **[Documentation](https://godspeedhq.github.io/godspeed-os/)** · **[Standard library API](https://godspeedhq.github.io/godspeed-os/api/godspeed/)** · **[SDK API](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/)** · **[Releases](https://github.com/godspeedhq/godspeed-os/releases)**
 
 > **New here?** [**GETTING_STARTED.md**](GETTING_STARTED.md) takes you from zero to your first running service in a few minutes.
+>
+> **Contributing?** [**CONTRIBUTING.md, "Learn from a real change"**](CONTRIBUTING.md#learn-from-a-real-change) points every kind of contribution - a service, a driver, the kernel, a utility, a test, the docs, a gate, a chaos find - at code in the tree and a merged commit that did exactly that.
 
 ---
 
@@ -22,7 +24,8 @@ requirement (§26.11), and a diagram you can redraw from memory is the only proo
  services      │ fs  net-stack  console  events  time                   │
                ├────────────────────────────────────────────────────────┤
  DRIVERS       │ block-driver  nic-driver  xhci  ehci  dwc2             │
- (userspace)   │ each one a service, with only what it asked for        │
+ (userspace)   │ wifi-driver  wifi-usb  audio-driver  pwm-audio         │
+               │ each one a service, with only what it asked for        │
                └────────────────────────────────────────────────────────┘
                          ▲
                          │  spawns each, and RESTARTS it when it dies
@@ -102,10 +105,10 @@ One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-s
 
 | target | status |
 |---|---|
-| **x86-64** | **Full OS.** The `os-usb.img` you flash: 4 cores, shell, AHCI storage, networking, USB (xHCI + EHCI), IOMMU-confined drivers. Verified on an HP T630 (AMD GX-420GI) and a Dell Wyse 5070 (Intel J5005). |
-| **AArch64** (Raspberry Pi 4) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4-core SMP, GENET gigabit ethernet, USB keyboard and mass storage through the VL805 xHCI over PCIe, journalled filesystem. |
-| **32-bit ARM** (Raspberry Pi 2) | **Full OS.** Same neutral kernel: 4-core SMP, USB keyboard, USB mass storage and USB ethernet - all three through the one DWC2 controller - plus the filesystem and the shell. |
-| **RISC-V 64** (StarFive VisionFive 2 Lite) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4 harts on a JH7110, 1080p60 HDMI from a cold start, USB keyboard and mass storage through the onboard hub, DWMAC gigabit ethernet at zero packet loss, Sv39 paging, journalled filesystem. The first port finished with **no arch-neutral kernel code naming the ISA**. |
+| **x86-64** | **Full OS.** The `os-usb.img` you flash: 4 cores, shell, AHCI storage, networking, USB (xHCI + EHCI), WiFi through a USB dongle, sound through the HD Audio codec (speaker and headphones), IOMMU-confined drivers. Verified on an HP T630 (AMD GX-420GI) and a Dell Wyse 5070 (Intel J5005). |
+| **AArch64** (Raspberry Pi 4) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4-core SMP, GENET gigabit ethernet, the onboard CYW43455 WiFi (WPA2), USB keyboard and mass storage through the VL805 xHCI over PCIe, sound through the 3.5 mm jack, journalled filesystem. |
+| **32-bit ARM** (Raspberry Pi 2) | **Full OS.** Same neutral kernel: 4-core SMP, USB keyboard, USB mass storage, USB ethernet and a USB WiFi dongle - all through the one DWC2 controller - sound through the 3.5 mm jack, plus the filesystem and the shell. |
+| **RISC-V 64** (StarFive VisionFive 2 Lite) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4 harts on a JH7110, 1080p60 HDMI from a cold start, USB keyboard and mass storage through the onboard hub, DWMAC gigabit ethernet at zero packet loss, the onboard AIC8800 WiFi (WPA2), Sv39 paging, journalled filesystem. It has no audio output, and `audio` says so. The first port finished with **no arch-neutral kernel code naming the ISA**. |
 | RISC-V 32, LoongArch | Compile and boot to their UART. |
 | s390x | Compiles clean (big-endian). |
 
@@ -212,7 +215,7 @@ under a "figures below are from the current tree" line that made three-month-old
 
 | Check | Result |
 |-------|--------|
-| Unsafe confined to permitted layers (§18.1) **(current tree)** | audit passes: 1221 lines across 79 files, no unaccounted additions |
+| Unsafe confined to permitted layers (§18.1) **(current tree)** | audit passes: 1222 lines across 79 files, no unaccounted additions |
 | Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) *(2026-05-31)* | ✅ 0 |
 | Kernel build warnings *(2026-05-31)* | 104 → 57 (remaining are intentional unwired architecture) |
 | Hardware boot regression *(2026-05-31, T630)* | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
@@ -298,6 +301,10 @@ The build is pure Cargo plus the `osdev` CLI - identical on every platform. The 
 
    **Booting in QEMU is not proof the on-hardware image is good - a clean build is.** If the image is built on top of an `osdev run`/`osdev test` (both rebuild the kernel incrementally) without the clean step, you may hand hardware an incremental image that only works under QEMU.
 
+   `py scripts/board.py x86` makes the same image and ends by naming it; the clean step is still yours.
+   The Raspberry Pi and VisionFive images are `py scripts/board.py pi2|pi4|visionfive`, each ending
+   with what to copy where.
+
 2. **Flash the copy** with Rufus (DD Image mode) or `dd if=build/my-hw.img of=/dev/sdX bs=4M`, let the write fully finish, and boot the stick in **UEFI** mode. Serial console is 115200 8N1; a healthy boot prints `smp: N cores ready` then `supervisor: ready`.
 
 ---
@@ -305,14 +312,22 @@ The build is pure Cargo plus the `osdev` CLI - identical on every platform. The 
 ## Repository layout
 
 ```
-kernel/       bare-metal microkernel
-services/     system services (supervisor, events, block-driver, fs, shell, ...)
-sdk/rust/     Rust SDK for service development
+kernel/       bare-metal microkernel; arch/<isa>/ is the only part that knows the machine
+services/     system services and drivers (supervisor, fs, shell, xhci, audio-driver, ...)
+stdlib/rust/  the standard library, `gs` - what every service and example is written against
+sdk/          the layer underneath: syscalls, MMIO and DMA (sdk/rust), and shared protocol crates
 osdev/        build / test / run tooling
-contracts/    service contracts and JSON schema
+scripts/      the enforcement layer (the gates every build runs) and the board image builds
+contracts/    the JSON schema a service contract is validated against
 examples/     annotated, Commandment-grounded teaching examples (start at examples/README.md)
+utilities/    the specification of every shell utility, one file each
 tests/        identity, property, fuzz, stress, chaos suites
 docs/         architecture notes and design docs
+backlog/      open items, each with its evidence, what is ruled out and the next step
+audits/       dated evidence: the unsafe audit, and the kernel, security and documentation audits
+milestones/   what was achieved and when
+boot/         per-board boot configuration (the Pis' config.txt)
+nonfree/      vendor firmware the WiFi chips need, each with its licence and digest
 website/      documentation site (mdBook; renders this repo's docs)
 ```
 
