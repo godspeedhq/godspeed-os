@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! TCP over IPv4, bounded and heap-free.
 //!
 //! `docs/tcp-design.md` is the argument; this is the implementation. The two properties that shape

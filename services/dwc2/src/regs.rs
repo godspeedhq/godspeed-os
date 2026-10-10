@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! DWC2 register offsets and bit definitions, for the Raspberry Pi 2's USB host controller.
 //!
 //! Lifted VERBATIM from `kernel/src/arch/arm/dwc2.rs` (since DELETED - this service replaced it; read

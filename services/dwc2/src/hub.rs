@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Hub downstream ports: power them, read their status, reset one that has a device.
 //!
 //! Slice 1c-ii, first part (`docs/arm32-usb-userspace.md`).

@@ -516,6 +516,9 @@ const EXTRA_CHECKS: &[&str] = &[
     // it for its own arch and `osdev build` for none, so x86 - which has no `_built` list in
     // kernel/build.rs - was never checked at all (backlog/80 T7). With no arguments it checks all four.
     "scripts/service_embed_check.py",
+    // Every tracked `.rs` file carries an SPDX licence tag, and it is its tree's licence
+    // (docs/licensing.md). Thirteen carried none and nothing noticed (backlog/80 R1).
+    "scripts/spdx_check.py",
 ];
 
 /// `osdev conform` - forward to `scripts/conform.py` and pass its exit code through.
