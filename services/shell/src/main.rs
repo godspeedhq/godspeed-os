@@ -434,8 +434,6 @@ pub struct ShellCtx {
     /// so nothing typed while a command waits is lost (`backlog/80` H16). Bounded (26.6); a full
     /// buffer says so, once, rather than dropping keys in silence.
     typeahead: core::cell::RefCell<TypeAhead>,
-    /// True while a SCRIPT runs (`run`, `selfcheck`, a library command): see [`ShellCtx::fs_waiting`].
-    in_script: core::cell::Cell<bool>,
 }
 
 /// The shell's bounded type-ahead (see `ShellCtx::typeahead`): a FIFO of keys, and whether a key has
@@ -478,17 +476,13 @@ impl ShellCtx {
         if let Some(b) = self.typeahead.borrow_mut().pop() { return b; }
         self.inner.console_read()
     }
-    /// An `fs` handle for a command that may WAIT on `fs`: with the `[q] quit` notice and the
-    /// type-ahead keep at the prompt, and the plain blocking handle inside a script.
-    ///
-    /// Inside a script nobody is typing at the prompt, so a notice has nothing to give - and it costs:
-    /// a noticing wait polls the console and yields for the whole request where a plain one blocks in
-    /// the kernel, so every `fs` read of a long script competed with `fs` itself for the core. That
-    /// was measured: `selfcheck`'s second run in one boot outran its 300 s window once every read in
-    /// it noticed (`backlog/80` H16).
+    /// An `fs` handle for a command that may WAIT on `fs`: the `[q] quit` notice and the type-ahead
+    /// keep (`backlog/80` H16). The same at the prompt and in a script: since the SDK's noticing wait
+    /// blocks in the kernel until the notice is due and reads no key before it, it costs a script
+    /// nothing. (It once polled from the start, and `selfcheck`'s second run in one boot outran its
+    /// 300 s window, so scripts were given the plain handle until that was fixed.)
     fn fs_waiting<'a>(&'a self, notice: &'a dyn Fn(), keep: &'a dyn Fn(u8)) -> gs::fs::Fs<'a> {
-        let g = gs::fs::Fs::from_tag(&self.inner, self.fs_tag.get());
-        if self.in_script.get() { g } else { g.noticing(notice).keeping(keep) }
+        gs::fs::Fs::from_tag(&self.inner, self.fs_tag.get()).noticing(notice).keeping(keep)
     }
     /// The next key if one is waiting: a kept type-ahead key first, then the console.
     fn try_console_read(&self) -> Option<u8> {
@@ -533,7 +527,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         audio_tag: core::cell::Cell::new(0),
         jobs: core::cell::RefCell::new(JobTable::new()),
         typeahead: core::cell::RefCell::new(TypeAhead::new()),
-        in_script: core::cell::Cell::new(false),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -4112,11 +4105,6 @@ struct Tally { ran: u32, failed: u32, skipped: u32, aborted: bool }
 #[inline(never)]
 fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out, params: &Params, quiet: bool,
              tally: Option<&mut Tally>, abortable: bool) -> Result<(), ShellError> {
-    // A script is running: `fs` waits block rather than notice (see `ShellCtx::fs_waiting`). The guard
-    // restores the outer value on every way out, so a nested run leaves its caller's state alone.
-    struct InScript<'c> { flag: &'c core::cell::Cell<bool>, was: bool }
-    impl Drop for InScript<'_> { fn drop(&mut self) { self.flag.set(self.was); } }
-    let _in_script = InScript { flag: &ctx.in_script, was: ctx.in_script.replace(true) };
     // Per-run interpreter state: a bounded variable table, allocated once HERE (above `execute`) and
     // threaded by &mut into `run_stmt` - it never reaches `execute`/`pipe_run`'s frame. No heap (§26.6).
     let mut vars = Vars::new();
@@ -13611,12 +13599,12 @@ fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut t = Table::new(&["name", "type", "size", "sealed"]);
     // `list_dir` owns the page walk and the 15-byte entry stride the comment above used to warn
     // about; this keeps only the mapping from an entry to a row.
-    // NO NOTICE HERE, deliberately. This table feeds a PIPE, and the stage at the end of it may own
-    // the keyboard: in `dir /many | paginate`, a `q` typed ahead is the pager's, and a noticing wait
-    // here took it as "quit this listing" and stopped after one page (`osdev test files`, H16). The
-    // fix that would let a producer notice is in the SDK - honour a quit key only once `[q] quit`
-    // has been shown, and keep it before that. Bare `dir`, which ends at the console, still notices.
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    // q quits the wait, as bare `dir`'s does; type-ahead is kept (H16). A `q` typed AHEAD for a stage
+    // later in the pipe (`dir /many | paginate`) is not taken as a quit: the SDK's wait reads no key
+    // before it has shown `[q] quit`, so a quick listing never sees it.
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);
+    let mut g = ctx.fs_waiting(&notice, &keep);
     let walked = g.list_dir(path, |e| {
         let name = t.intern(e.name);
         let kind = t.intern(if e.is_dir { b"dir" } else { b"file" });
@@ -13802,9 +13790,10 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
     let mut cancelled = false;
-    // No notice: this table feeds a pipe whose last stage may own the keyboard (see `build_dir_table`).
+    let notice = || gs::io::println(ctx, "  [q] quit");
+    let keep = |b: u8| ctx.keep_key(b);   // q quits the walk; type-ahead kept (H16, see `build_dir_table`)
     while let Some(dlen) = stack.pop(&mut dir) {
-        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let mut g = ctx.fs_waiting(&notice, &keep);
         let walked = g.list_dir(&dir[..dlen], |e| {
             let mut child = [0u8; PATH_MAX];
             if let Some(clen) = join_path(&dir[..dlen], e.name, &mut child) {
