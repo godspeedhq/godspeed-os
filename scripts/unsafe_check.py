@@ -20,6 +20,7 @@ the audit's top table are not compared against the source.
 Exit: 0 if no failures, 1 if any.
 """
 
+from __future__ import annotations  # signatures use dict[...] (3.9); this keeps the 3.8 floor true
 import re
 import sys
 from pathlib import Path
