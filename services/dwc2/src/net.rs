@@ -26,6 +26,9 @@ const EP_TYPE_BULK: u8 = 0x02;
 /// status-word parse. Each needs a different fix and the log cannot tell them apart without counting.
 #[derive(Default)]
 pub struct Stats {
+    /// Answers to `nic-driver` the kernel would not deliver (its queue full, or it died waiting). The
+    /// first is logged; the count says how many since. Discarded until 2026-10-10 (backlog/80 D11).
+    pub reply_fails: u32,
     pub tx_ok:      u32,
     pub tx_fail:    u32,
     pub rx_bursts:  u32,   // bulk-IN returned >0 bytes
@@ -1489,7 +1492,7 @@ pub fn rx(
                 // three so a persistent mismatch cannot flood the console.
                 if nic.stats.rx_bad <= 3 {
                     ctx.log_fmt(format_args!(
-                        "dwc2-svc: RX burst {} bytes, unparsed at {}: status=0x{:08x} flen={} |                          first 12 bytes {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                        "dwc2-svc: RX burst {} bytes, unparsed at {}: status=0x{:08x} flen={} | first 12 bytes {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
                         got, pos - 4, status, flen,
                         dma.read8(RX_OFF), dma.read8(RX_OFF + 1), dma.read8(RX_OFF + 2),
                         dma.read8(RX_OFF + 3), dma.read8(RX_OFF + 4), dma.read8(RX_OFF + 5),
@@ -1760,6 +1763,12 @@ pub fn serve(
         }
     };
     // `n` is the BODY length; the tag at byte 0 rides in front of it.
-    let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&out[..n + 1]));
+    if let Err(e) = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&out[..n + 1])) {
+        if nic.stats.reply_fails == 0 {
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: an answer to nic-driver was not delivered ({:?}) - it will time out and ask again (further ones counted, not logged)", e));
+        }
+        nic.stats.reply_fails = nic.stats.reply_fails.saturating_add(1);
+    }
     true
 }

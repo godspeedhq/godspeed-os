@@ -453,7 +453,6 @@ pub fn poll(
             } else if state.repeat.armed() {
                 state.repeat.cancel();
             }
-            state.last_ok = now;
         }
         return false; // NAK (idle), NYET, or a rescheduled attempt - all ordinary
     }
@@ -512,14 +511,6 @@ pub struct KeyState {
     pub repeat: godspeed_sdk::hid::KeyRepeat,
     pub caps: bool,
     pub pid: u32,
-    /// Timestamp of the last poll the device actually ANSWERED (data or NAK). Auto-repeat is only
-    /// credible while these keep arriving; a long gap means a release may have been lost unseen.
-    pub last_ok: u64,
-    /// How stale that answer may be before a held key is treated as unproven. Derived from the
-    /// board's own timer rate, never a constant - a cycle count is not a duration. (Note 2026-10-09:
-    /// neither this nor `last_ok` is read any more; repeat is anchored on `last_data` and
-    /// `repeat_window`.)
-    pub stale_after: u64,
     /// Characters emitted by AUTO-REPEAT, and characters emitted by decoding a real report. Two
     /// mechanisms can produce a stream of one character - a repeat that will not stop, or the device
     /// retransmitting its last report because the data toggle disagrees - and they are indistinguishable
@@ -605,7 +596,6 @@ impl KeyState {
             caps: false,
             // An interrupt endpoint starts at DATA0 after configuration.
             pid: chan::PID_DATA0,
-            last_ok: 0,
             emitted_repeat: 0,
             emitted_report: 0,
             last_data: 0,
@@ -616,10 +606,6 @@ impl KeyState {
             // delay and well beyond, short enough that a broken poll path stops within a couple of
             // characters instead of running to the next keypress.
             repeat_window: (wait::ticks_per_10ms(ctx) * 150).max(1),
-            // ~150 ms: comfortably more than the 10 ms poll period (so ordinary jitter and a busy
-            // core do not cancel a legitimate hold) and far less than the 2 s deschedule that loses
-            // a release report.
-            stale_after: (wait::ticks_per_10ms(ctx) * 15).max(1),
         }
     }
 }

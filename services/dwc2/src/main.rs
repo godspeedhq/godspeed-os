@@ -174,6 +174,39 @@ fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
     }
 }
 
+/// Answer one request on a dwc2 granted NO hardware window or arena, which has nothing to serve it with.
+///
+/// The fallback loop used to count such a message and drop it - its reply capability with it - so a
+/// client waited out its whole deadline against a clean log (backlog/80 D6). Each is answered here as
+/// `dispatch` answers it with nothing bound, routed by op the same way: the supervisor's report ask
+/// with an absent device, a radio op `ST_NO_DEVICE` (an `OP_SYNC` only gives its capability back, as
+/// `rtl::serve` does), a net op the empty `[0]`, and a block op the one-byte error.
+fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: &mut bool) {
+    let p = msg.payload_bytes();
+    let Some(&op) = p.first() else { return };
+    if p == [godspeed_sdk::service_context::usbdev::ASK] {
+        rtl::report_device(ctx, None);
+        return;
+    }
+    let Some(reply) = gs::ipc::take_sent_cap(ctx) else {
+        if !*capless {
+            *capless = true;
+            ctx.log("dwc2-svc: request had no reply cap - dropping (cannot answer without one)");
+        }
+        return;
+    };
+    if op == godspeed_wifi::usbfn::OP_SYNC {
+        gs::cap::remove(ctx, reply);
+    } else if (godspeed_wifi::usbfn::OP_INFO..godspeed_wifi::usbfn::OP_SYNC).contains(&op) {
+        let _ = gs::ipc::reply(ctx, reply,
+            &godspeed_sdk::Message::from_bytes(&[op, godspeed_wifi::usbfn::ST_NO_DEVICE]));
+    } else if op >= net::OP_NET_INFO {
+        let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[0u8]));
+    } else {
+        let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
+    }
+}
+
 /// Route one request to the radio, frame or block server.
 ///
 /// ONE endpoint carries three protocols, so the opcode decides. The reply cap is taken HERE, once, so
@@ -946,7 +979,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         recovery_gave_up = true;
                         gave_up_at = Some(wait::Since::now(&ctx));
                         ctx.log_fmt(format_args!(
-                            "dwc2-svc: keyboard re-enumerated {} times without settling - backing off for                              {} s. Input is dead meanwhile; storage and networking are unaffected.",
+                            "dwc2-svc: keyboard re-enumerated {} times without settling - backing off for {} s. Input is dead meanwhile; storage and networking are unaffected.",
                             recoveries_in_a_row, RECOVERY_BACKOFF_MS / 1000));
                     }
                     if gave_up_at.is_some_and(|at| !at.passed(&ctx, Budget::ms(RECOVERY_BACKOFF_MS))) {
@@ -1197,6 +1230,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     }
 
+    // Said once: a request with no reply capability (`answer_ungranted`).
+    let mut capless = false;
     loop {
         // Block until something arrives, with a deadline so the report still lands on a quiet
         // machine. A service that only speaks when the hardware speaks cannot report that the
@@ -1263,6 +1298,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Leaving the line masked costs nothing HERE, because one delivered interrupt is the
                 // entire question: it proves the arm32 route reaches userspace. Counting to a hundred
                 // would prove nothing further and cost the machine.
+            } else {
+                // A REQUEST, which this loop has no hardware to serve: answered, not dropped.
+                answer_ungranted(&ctx, &m, &mut capless);
             }
         }
 
