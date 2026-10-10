@@ -626,10 +626,12 @@ pub fn sync_instruction_cache(va: u64, len: usize) {
 // entry. Everything the block described stays described, byte for byte, except the guard.
 //
 // Tables come from a fixed arena, not a heap (§26.6.1): the kstack pool is 224 slots of 68 KiB, about
-// 14.9 MiB, so it spans at most nine 2 MiB blocks even when badly aligned. Twelve is headroom, and
-// running out is reported rather than silently skipped - a guard page that was not installed is
-// exactly the kind of absent protection that must never pass quietly (invariant 12).
-const SPLIT_TABLES: usize = 12;
+// 14.9 MiB, so it spans at most nine 2 MiB blocks even when badly aligned. The framebuffer's remap
+// (`remap_high_nc`) takes more: a 1920x1080 framebuffer is 8 MiB, at most five blocks, and a 4K one
+// about 32 MiB, seventeen. Thirty-two covers both with headroom, for 128 KiB of `.bss`. Running out is
+// reported rather than silently skipped - a guard page that was not installed, or a framebuffer left
+// cacheable, is exactly the kind of absent protection that must never pass quietly (invariant 12).
+const SPLIT_TABLES: usize = 32;
 static mut L3_SPLIT: [Table; SPLIT_TABLES] = [const { Table([0; ENTRIES]) }; SPLIT_TABLES];
 static SPLIT_USED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -720,6 +722,98 @@ fn unmap_high_4k(va: u64) -> bool {
         (l3_va as *mut u64).add(k).write_volatile(0);
         true
     }
+}
+
+/// Remap `len` bytes of physical memory at `pa` in the high-half direct map as Normal NON-cacheable
+/// (MAIR slot 2), leaving every other page in the blocks it touches exactly as it was.
+///
+/// This is the framebuffer (backlog/80 K21). The `console` service maps those pages Normal
+/// non-cacheable (`WRITE_COMBINE`), and the direct map covered them as Normal write-back in 2 MiB
+/// blocks; ARM leaves mismatched memory attributes for one physical page UNPREDICTABLE. So the blocks
+/// the framebuffer touches are split into pages and only the framebuffer's pages change type - its
+/// neighbours, which may be RAM the allocator owns, keep theirs.
+///
+/// Order, because changing a live mapping's memory type is break-before-make in the architecture:
+/// the range is cleaned and invalidated from the cache while it is still mapped cacheable, so no dirty
+/// line is left to be written back over the GPU's view later; each L2 entry is made invalid and the
+/// TLB invalidated before the table that replaces it is installed; and nothing is touching the range
+/// meanwhile, because the console is not up yet.
+///
+/// Boot-ordering contract: BSP only, before the secondaries start and before `video::start_console`
+/// hands the range to `bootcon`. Returns false, having said why, if a split table runs out; the pages
+/// done so far are already consistent, and the rest stay cacheable.
+pub fn remap_high_nc(pa: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let va = KERNEL_VA_BASE + pa;
+    dma_sync(va, len as usize);
+    let end = pa + len;
+    let mut block = pa & !(BLOCK_SIZE - 1);
+    let mut ok = true;
+    const ATTR_IDX_MASK: u64 = 0b111 << 2;
+    while block < end {
+        // SAFETY: single-threaded boot before any secondary starts (the contract above), so no other
+        // walk or TLB can see these tables. Every pointer is into this module's own statics, and the
+        // range is one nothing is reading or writing while its entries change.
+        unsafe {
+            let Some(e) = high_l2_entry(KERNEL_VA_BASE + block) else {
+                crate::kprintln!("fb: {:#x} is not in the direct map - left as it is", block);
+                return false;
+            };
+            let d = e.read_volatile();
+            let l3: *mut u64 = match d & 0b11 {
+                DESC_BLOCK => {
+                    let Some(t) = take_split_table() else {
+                        crate::kprintln!(
+                            "fb: OUT OF SPLIT TABLES at {:#x} - the framebuffer from here on stays CACHEABLE \
+                             in the kernel's map, mismatched with the console's", block);
+                        ok = false;
+                        break;
+                    };
+                    let attrs = (d & ATTR_LOW) | (d & ATTR_HIGH);
+                    for k in 0..ENTRIES {
+                        (*t).0[k] = (block + (k as u64) * 4096) | attrs | DESC_PAGE_L3;
+                    }
+                    t as *mut u64
+                }
+                DESC_TABLE => ((d & ADDR_MASK_4K) + KERNEL_VA_BASE) as *mut u64,
+                _ => {
+                    crate::kprintln!("fb: nothing mapped at {:#x} - left as it is", block);
+                    return false;
+                }
+            };
+            let was_block = d & 0b11 == DESC_BLOCK;
+            if was_block {
+                // Break: the block goes invalid and every TLB entry for it is dropped before anything
+                // else describes the same addresses.
+                e.write_volatile(0);
+                core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+            }
+            for k in 0..ENTRIES {
+                let page = block + (k as u64) * 4096;
+                if page < pa || page >= end {
+                    continue;
+                }
+                let p = l3.add(k);
+                let old = p.read_volatile();
+                if !was_block {
+                    // Already a table (a guard split this block): break the one entry instead.
+                    p.write_volatile(0);
+                    core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+                }
+                p.write_volatile((old & !ATTR_IDX_MASK) | attr_idx(MAIR_IDX_NORMAL_NC));
+            }
+            core::arch::asm!("dsb ishst", options(nostack));
+            if was_block {
+                // Make: the table goes in only now that it describes the new types.
+                e.write_volatile(virt_to_phys(l3 as u64) | DESC_TABLE);
+            }
+            core::arch::asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack));
+        }
+        block += BLOCK_SIZE;
+    }
+    ok
 }
 
 /// Unmap `count` pages at `base`, `base + stride`, ... - the kernel-stack guard pages.

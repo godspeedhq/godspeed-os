@@ -792,6 +792,12 @@ extern "C" fn boot_high() -> ! {
     // shared console as a slice. Before the jump its only name was a physical address.
     // SAFETY: single-threaded boot; `FB_INFO` was written before the jump and is read exactly once here.
     if let Some(fb) = unsafe { FB_INFO } {
+        // First make the kernel's own map of it Normal non-cacheable, the type the `console` service
+        // maps it with - one physical page, one memory type (backlog/80 K21). Still single-core here.
+        let len = (fb.pitch as u64) * (fb.height as u64);
+        if mmu::remap_high_nc(fb.base, len) {
+            put_str(b"aarch64: framebuffer remapped Normal non-cacheable in the direct map\r\n");
+        }
         video::start_console(fb);
     }
 
@@ -1647,6 +1653,9 @@ pub fn note_user_task(_slot: usize) {}
 // request names the `FRAMEBUFFER` kind - the supervisor's `console` row. The kernel's direct map of
 // those pages is still Normal cacheable, so the mismatch this paragraph warned about is live.
 // Carving the framebuffer out of the blanket block mapping is the open work.)
+// (Note 2026-10-10: carved. `mmu::remap_high_nc` splits the blocks the framebuffer touches and maps its
+// pages Normal non-cacheable before `start_console`, `backlog/80` K21. The clean in `fb_commit` is now
+// a no-op on those pages and is kept because it is correct on either type.)
 #[cfg(feature = "pi4")]
 pub use video::fb_commit;
 
