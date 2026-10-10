@@ -4821,12 +4821,15 @@ pub fn run_examples(image_path: &Path, persist_path: &str, smp: u32) {
     check!(saw("hello: I hold only the log_write capability"),
            "hello: reported its authority - one capability, no ambient anything");
 
-    // 2. stdlib-hello - the `gs::fs` + `gs::io` tour, against a real filesystem. EITHER outcome is a
-    //    pass: it read the file, or it correctly reported the file is absent. What is NOT acceptable
-    //    is silence, which is what a wedged fs client looks like.
+    // 2. stdlib-hello - the `gs::fs` + `gs::io` tour, against a real filesystem (the disk is
+    //    formatted host-side above). It writes 8000 bytes, more than one IPC message, and reads them
+    //    back; only the byte-for-byte match passes. This accepted `stdlib-hello: done` alone until
+    //    2026-10-10, and passed while every call it made came back `Unreachable` (`backlog/80` E1).
     check!(saw("stdlib-hello: starting"), "stdlib-hello: ran (examples/stdlib-hello)");
-    check!(saw("/sc/a.txt") || saw("stdlib-hello: done"),
-           "stdlib-hello: reached a definite outcome through gs::fs (read it, or said it was absent)");
+    check!(saw("wrote /stdlib-hello.txt (8000 bytes)"),
+           "stdlib-hello: gs::fs::write wrote a file larger than one message (backlog/80 G1)");
+    check!(saw("read /stdlib-hello.txt back: 8000 bytes, every one as written"),
+           "stdlib-hello: gs::fs::read_into read it back, every byte as written");
 
     // 3. cap-grant - self_grant + duplicate really happen; the transfer has no receiver to land on.
     check!(saw("cap-grant: starting"), "cap-grant: ran (examples/cap-grant)");

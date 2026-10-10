@@ -822,31 +822,26 @@ impl<'a> Fs<'a> {
     /// to "make sure": read the file back, or report the uncertainty. [`Error::retry_is_safe`]
     /// answers this for you, and says `false` for that case on purpose.
     ///
-    /// # Known defect (2026-10-09): `data` longer than [`IO_CHUNK`] fails
+    /// # Larger than one message
     ///
-    /// The first chunk creates a file sized for that chunk alone, and `services/fs` refuses a
-    /// positional write past a file's extent ("write past extent"), so the second chunk fails with
-    /// [`Error::Failed`] and leaves a file holding only the first [`IO_CHUNK`] bytes. Until this is
-    /// fixed, write a larger file with [`create_sized`](Fs::create_sized) and then
-    /// [`write_at`](Fs::write_at) from offset 0.
+    /// `data` longer than [`IO_CHUNK`] is written as the file at its whole size first
+    /// ([`create_sized`](Fs::create_sized)), then filled chunk by chunk from offset 0. A failure
+    /// part way leaves a file of the full size whose tail is not yet written, and is reported.
+    /// (Until 2026-10-10 the file was created from its first chunk alone, sized for that chunk, so
+    /// `services/fs` refused the second as "write past extent" - `backlog/80` G1.)
     pub fn write(&mut self, path: impl AsRef<[u8]>, data: &[u8]) -> Result<(), Error> {
         if data.len() <= IO_CHUNK {
             self.call(OP_WRITE_FILE, path.as_ref(), data, self.secs())?;
             return Ok(());
         }
-        // Larger than one message: create it, then fill it positionally. `OP_WRITE_AT` at a fixed
+        // Larger than one message: size it, then fill it positionally. `OP_WRITE_AT` at a fixed
         // offset is positionally idempotent - the same bytes at the same offset land the same way
-        // twice - which is what makes a chunked write safe to resume at all. BUT the file created
-        // below is sized for its first chunk only, so `fs` refuses every later chunk as "write past
-        // extent": see the known defect in this function's doc.
-        self.call(OP_WRITE_FILE, path.as_ref(), &data[..IO_CHUNK], self.secs())?;
-        let mut off = IO_CHUNK;
+        // twice - which is what makes a chunked write safe to resume at all.
+        self.create_sized(path.as_ref(), data.len() as u64)?;
+        let mut off = 0;
         while off < data.len() {
             let n = (data.len() - off).min(IO_CHUNK);
-            let mut tail = [0u8; 8 + IO_CHUNK];
-            tail[..8].copy_from_slice(&(off as u64).to_le_bytes());
-            tail[8..8 + n].copy_from_slice(&data[off..off + n]);
-            self.call(OP_WRITE_AT, path.as_ref(), &tail[..8 + n], self.secs())?;
+            self.write_at(path.as_ref(), off as u64, &data[off..off + n])?;
             off += n;
         }
         Ok(())

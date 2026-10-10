@@ -2911,6 +2911,9 @@ fn run_examples_test() {
     let _ = std::fs::create_dir_all("build/tests");
     let persist = "build/tests/persist_examples.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    // Formatted, so `fs` mounts and `stdlib-hello` has somewhere to write. A raw disk left `fs`
+    // with nothing to serve, which the old check could not tell from success.
+    format_superblock(persist);
     crate::shell_test::run_examples(&image_path, persist, 4);
 }
 

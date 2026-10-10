@@ -521,9 +521,12 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // being what it teaches.
     #[cfg(feature = "examples-test")]
     ("hello", HELLO_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
-    // `stdlib-hello` reads a file through `gs::fs`, so it is WIRED to fs like `counter` is.
+    // `stdlib-hello` writes and reads a file through `gs::fs`, so it is WIRED to fs like `counter`
+    // is - and, like `counter`, it needs its OWN endpoint (REQ_RECV) for `fs`'s replies to land on.
+    // It had none until 2026-10-10, so every call came back `Unreachable` and the test passed on
+    // the program saying `done` (`backlog/80` E1).
     #[cfg(feature = "examples-test")]
-    ("stdlib-hello", STDLIB_HELLO_ELF, 0, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0, 0),
+    ("stdlib-hello", STDLIB_HELLO_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0, 0),
     // `cap-grant` needs its OWN endpoint (REQ_RECV) so `gs::cap::self_grant` has something to hand
     // out, and ACQUIRE_ANY so its lookup of "receiver" reaches the name directory. With no such
     // service present the lookup MISSES - which is the documented standalone outcome, and a more

@@ -752,7 +752,7 @@ SpawnImage               = 52
 "ehci" = ["hw:EHCI", "peer:events", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]
-# examples/stdlib-hello, examples-test build only. It reads a file through `gs::fs`, which is
+# examples/stdlib-hello, examples-test build only. It writes and reads a file through `gs::fs`, which is
 # the whole point of the example, so it needs the one peer that serves files - the same single
 # grant `counter` and `copier` carry for the same reason.
 "stdlib-hello" = ["peer:fs"]

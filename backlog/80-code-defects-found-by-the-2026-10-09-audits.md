@@ -15,7 +15,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   `kernel/src/task/mod.rs` (`XHCI_MMIO_PAGES`, the PCI grant). On the T630 the audio grant then also
   covers the HDMI audio controller at `0xfeb64000`: authority beyond what the grant names (CLAUDE.md 3.1).
   Fix: size the window from the BAR.
-  **FIXED in QEMU on `feat/audio-finish`, 2026-10-09, x86 only; T630 card pending.** It was worse than this
+  **FIXED on `feat/audio-finish`, 2026-10-09, x86 only; hardware-verified on the T630 the same day (every window its BAR: audio 16 KiB, xhci 8 KiB, EHCI 256 bytes, AHCI 1 KiB, the RTL8168 4 KiB; `selfcheck` 537/0 before and after a 100-round chaos).** It was worse than this
   says: on the T630 the audio BAR at `0xfeb60000` plus 64 KiB reaches the HDMI audio (`0xfeb64000`), `xhci`
   (`0xfeb68000`), EHCI (`0xfeb6c000`) and AHCI (`0xfeb6d000`). x86 `pci::bar_len` sizes a memory BAR at grant
   time (the standard probe, under the config lock) and the window is the BAR, its pages whole and the `Mmio`
@@ -26,7 +26,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   `kernel/src/arch/x86_64/pci.rs` `find_by_class` returns the FIRST device of a class; the 2026-10-08 log
   shows 00:01.1 (HDMI) confined, not 00:09.2 (Azalia). Fix: finish step D3, so a supplied BDF selects the
   window, arena and vector, not only bus mastering.
-  **FIXED in QEMU on `feat/audio-finish`, 2026-10-09, T630 card pending.** One resolver, `HwClass::pci_dev`,
+  **FIXED on `feat/audio-finish`, 2026-10-09; hardware-verified on the T630 the same day (the driver granted 00:09.2 by the supplied BDF and confined there; heard through the speaker and the headphones).** One resolver, `HwClass::pci_dev`,
   decides the device for the window, the arena, the vector, the confinement and the bus mastering; a supplied
   BDF whose device is of another class is REFUSED (built, not yet seen firing). Which device: `hw-enumerator`
   op 3 takes a `PREFER_OWN` byte - the first device of the class that is not a display's companion function -
@@ -117,6 +117,10 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   first chunk (`OP_WRITE_FILE`), which `fs` sizes for that chunk alone, so the first `OP_WRITE_AT` past it
   is refused "write past extent": `Error::Failed`, and a truncated file left behind. Its own comment now
   says so. Fix: `OP_WRITE_NEW(total)`, then `OP_WRITE_AT` from 0.
+  **FIXED on `fix/backlog-80`, 2026-10-10**, as proposed (`create_sized`, then `write_at` from 0). Nothing in the
+  tree wrote past one chunk, which is how it stayed unseen; `examples/stdlib-hello` now writes 8000 bytes and reads
+  them back, and `osdev test examples` checks every byte - shown to FAIL against the old code (10 passed, 2
+  failed) and pass against the new (12 of 12).
 - **G2. `gs::file::File` records the REQUESTED rights, not the granted ones**, so a sealed file narrowed to
   READ, or an APPEND-only open, closes under rights the cap lacks: the kernel refuses, `fs` never frees the
   slot (64 entries), and `Drop` swallows the error. Fix: record the granted rights; close under them.
@@ -270,6 +274,8 @@ the readers' findings, each with its evidence, and none has been reproduced by r
 - **E1. `stdlib-hello` never reaches `fs`, and its test passes anyway**: its spawn row has flags 0 (no
   `REQ_RECV`), so every `gs::fs` call is `Unreachable`; `build/tests/examples_serial.log` shows "could not be
   reached" while `run_examples` accepts "stdlib-hello: done". Fix: set `REQ_RECV`; assert on the file.
+  **FIXED on `fix/backlog-80`, 2026-10-10**: `REQ_RECV` in its spawn row, the test's disk formatted host-side so
+  `fs` mounts, and the test asserts the write and the byte-for-byte read-back rather than `done` (G1).
 - **E2. `examples/counter` leaks a cap slot per second while saves fail** (`gs::cap::acquire(..).is_ok()`).
 - **E3. `resource-server`'s log cites a by-name grant that does not exist.**
 

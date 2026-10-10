@@ -23,7 +23,7 @@ so you learn the *rule*, see it enforced in code, and learn the failure it preve
 | Example | What it is | Commandments it teaches |
 |---|---|---|
 | `00-hello` | The minimal service, on the standard library | **I** (it is a service, not a kernel change), **IV** (declares its needs via a contract), **VII** (gets only the caps it declares) |
-| `stdlib-hello` | Doing real WORK with the standard library: read a file and print it, with the opcodes, framing, reply tags and streaming all behind `gs::fs` | **VII** (the contract's `ipc_send = ["fs"]` is why the read can work at all), **IX** (a failure is reported, not retried until something looks fine) |
+| `stdlib-hello` | Doing real WORK with the standard library: write a file larger than one IPC message and read it back, with the opcodes, framing, reply tags and streaming all behind `gs::fs` | **VII** (the contract's `ipc_send = ["fs"]` is why the write and the read can work at all), **IX** (a failure is reported, not retried until something looks fine) |
 | `ping` / `pong` | Cross-core one-way IPC + restart/reacquire | **VI** (IPC, not shared memory), **V** (every service is restartable), **VIII** (the generation check settles the restart race, not a sleep), **IX** (reacquire by name when a send comes back `gs::Error::Unreachable`) |
 | `reply-server` / `asker` | Request/reply (RPC) + the deadlock rule - server (`reply-server`) and its client (`asker`), paired like `pong`/`ping` | **VII** (the server replies only via the client's embedded reply cap), **VIII** (a send is queued, not processed; the reply uses non-blocking `try_send`, §8.9), **IX** (the client reacquires the server by name + retries), **X** (request/reply is service policy; the kernel only routes) |
 | `cap-grant` | Transfer a capability over IPC (the GRANT right) | **VII** (authority by capability + the GRANT right), **VI**, **IX**, **X** |
@@ -54,7 +54,7 @@ now runs somewhere, and this is where:
 | `resource-server` / `holder` | `osdev test resource-server` | mint, use, non-escalation refused, `CapRevoked` after revoke |
 | `greet` / `upper` / `roster` | the shell, ON DEMAND, whenever a pipe names them (`spawn_via_supervisor`) - so `osdev test shell` and any `selfcheck` run exercise them | they spawn, reach `ready`, and survive repeated chaos respawns. Observed: `greet` + `upper` in the x86 shell suite; all three on the VisionFive 2, `roster` twenty times across a 1000-round chaos run |
 | `00-hello` | `osdev test examples` | it starts, holds one capability, and yields through `gs::task` |
-| `stdlib-hello` | `osdev test examples` | the `gs::fs` + `gs::io` path reaches a definite outcome. *(2026-10-09: the outcome in `build/tests/examples_serial.log` is "the service could not be reached" - its spawn row asks for no endpoint, so it has nowhere to receive `fs`'s reply - and the test accepts `stdlib-hello: done` alone, so it passes. The file has not actually been read in this test.)* |
+| `stdlib-hello` | `osdev test examples` | it writes 8000 bytes through `gs::fs`, more than one IPC message, and reads them back byte for byte, on a disk the test formats. *(Until 2026-10-10 its spawn row asked for no endpoint, so every call came back "could not be reached", and the test passed on `stdlib-hello: done` alone - `backlog/80` E1. The check was then shown to fail against the old `gs::fs::write`, G1.)* |
 | `cap-grant` | `osdev test examples` | `gs::cap::self_grant` and `gs::cap::duplicate` really succeed |
 | `e1000` | `osdev test examples` | its DEGRADE path: no device, so it logs and idles |
 | `driver-skeleton` | `osdev test examples` | the same, which is the discipline it exists to teach |
@@ -91,7 +91,7 @@ a bug, the bug already existed. Each `CLAUDE.md` notes this; it is the universal
 ## Start here (reading order)
 
 1. **`00-hello`** - the anatomy of a service: `Cargo.toml`, `build.rs`, the contract, `service_main`.
-2. **`stdlib-hello`** - the same anatomy doing actual work: read a file with `gs::fs`. Read its
+2. **`stdlib-hello`** - the same anatomy doing actual work: write a file and read it back with `gs::fs`. Read its
    header for what you no longer need to know (opcodes, framing, reply tags, streaming) and what
    you still do (authority is granted, and a failure is a fact).
 3. **`ping` / `pong`** - one-way IPC and the canonical restart/reacquire pattern (Commandments V, VIII, IX).
