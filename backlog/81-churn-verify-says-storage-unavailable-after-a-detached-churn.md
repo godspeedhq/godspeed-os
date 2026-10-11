@@ -1,7 +1,9 @@
 # 81. `churn verify` says "storage unavailable" right after a detached churn
 
-**Status: OPEN - found 2026-10-09 on `feat/audio-finish`, and present on `main` (1c477970) and on v0.22.0
-too, so it is not new. Not investigated past the first look below.**
+**Status: CLOSED 2026-10-11 (`bf01d20d`, `feat/ask`) - the shell's channel to `fs` was one reply out of
+phase; the SDK now drains abandoned replies before every mailbox request. `osdev test jobs` 60/0.** Found
+2026-10-09 on `feat/audio-finish`; present on `main` (1c477970) and on v0.22.0 too. The record of how it
+was found is kept below; the cause is the last section.
 
 ## What is seen
 
@@ -51,3 +53,32 @@ is how it shipped twice.
    names one of several errors and hides which (CLAUDE.md 26.7: a failure says what failed).
 2. With that, tell a timed-out request (`OutcomeUnknown`, `fs` busy after the churn) from a refused one.
 3. Add `osdev test jobs` to the suites run before a release.
+
+## Cause and fix (2026-10-11)
+
+Step 1 above was done first (`e.as_str()`): the error was `Malformed`. Instrumenting the `fs` client
+showed what that meant - every shell request to `fs` was receiving its PREDECESSOR'S reply (`tag 83 got
+81`, `tag 84 got 82`) and rejecting it on the tag. The channel had fallen one reply behind and stayed
+there:
+
+1. During `background drives check`, `copier`'s sweep held `fs` for about 6 s (the op 27 lines above).
+2. The shell's history save after the next command (`OP_WRITE_FILE`, best-effort, short patience) timed
+   out waiting behind it. Its reply arrived later and stayed in the shell's reply mailbox.
+3. Every later request took the oldest reply in the mailbox - the previous request's - so each failed
+   and left its own reply for the next. `churn verify` and `churn reset` were simply the first commands
+   whose failure the suite checked. Every history save from then on was lost too, silently.
+
+The repair already existed: `drain_stale_replies` describes exactly this desync, and
+`request_with_reply_deadline_into` drained before issuing (`backlog/37`). But the two other paths that
+wait on the reply mailbox did not - `request_with_reply_call_err`, which `gs::call` and therefore every
+`gs::fs` call uses, and `request_with_reply_deadline_outcome_into`. One helper, `drain_before_request`,
+now drains and logs, and all three call it. The log says so when it happens:
+
+```
+sdk: discarded 2 abandoned repl(y/ies) before a request to `fs` - an earlier request timed out
+...
+churn verify: 7 file(s) checked, 0 empty, NONE torn - every file holds one generation end to end
+```
+
+QEMU: `osdev test jobs` 60/0 (was 59/1), shell 272/0/2, identity 24/0, files 249/0. Step 3 above (run
+`jobs` before a release) is still worth doing; it is how this shipped twice.
