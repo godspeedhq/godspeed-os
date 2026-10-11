@@ -45,7 +45,11 @@ SUB_SP_RV = re.compile(r"\baddi\s+sp,\s*sp,\s*-(0x[0-9a-f]+|\d+)")
 # It surfaced when the console gained a 64 KiB scrollback ring and there was no way to ask whether
 # it fit. That the checker REFUSED rather than reporting a pass is the blind-guard doing exactly its
 # job - the answer was "this instrument cannot see here", not "you are fine".
-SUB_SP_X86 = re.compile(r"\bsub\s+\$(0x[0-9a-f]+|\d+),%rsp")
+#
+# Both objdumps' spellings: GNU prints `sub $0x88,%rsp`, LLVM's (`rust-objdump`, which the release
+# workflow uses because it reads every target) prints `subq $0x88, %rsp`. Matching only GNU's left the
+# x86 half blind under LLVM, and the blind-guard refused the v0.25.0 release build on it.
+SUB_SP_X86 = re.compile(r"\bsubq?\s+\$(0x[0-9a-f]+|\d+),\s*%rsp")
 EFFECTIVE = re.compile(r"//\s*=(0x[0-9a-f]+)")
 FUNC = re.compile(r"^[0-9a-f]+\s+<(.+)>:")
 
@@ -110,8 +114,11 @@ PROBE_TARGET = re.compile(r"sub\s+([xw]\d+),\s*sp,\s*#(0x[0-9a-f]+|\d+)(?:,\s*ls
 # build on five `xhci` functions. Unlike ARM, where `sub x9, sp, #N` names `sp` in the same
 # instruction, x86 SEEDS a scratch register from `%rsp` first - so the seed has to be tracked, and
 # only a subtraction from THAT register counts.
-PROBE_SEED_X86 = re.compile(r"\bmov\s+%rsp,%([a-z0-9]+)\b")
-PROBE_SUB_X86 = re.compile(r"\bsub\s+\$(0x[0-9a-f]+|\d+),%([a-z0-9]+)\b")
+# GNU and LLVM spellings both (`mov %rsp,%r11` / `movq %rsp, %r11`), as for SUB_SP_X86 above. Matching
+# only GNU's made LLVM's objdump read a 77,824-byte console frame as 1,304 bytes: the fall-through
+# page was seen and the probe target was not, which is a pass the check had not earned.
+PROBE_SEED_X86 = re.compile(r"\bmovq?\s+%rsp,\s*%([a-z0-9]+)\b")
+PROBE_SUB_X86 = re.compile(r"\bsubq?\s+\$(0x[0-9a-f]+|\d+),\s*%([a-z0-9]+)\b")
 
 
 def _probe_target(line, seed=None):
