@@ -1,8 +1,8 @@
 # 77. A misplaced `#[cfg]` in the supervisor gates `time`'s spawn, not `block-driver`'s
 
-**Status: OPEN - found 2026-10-06 by the documentation audit, read in the code, not yet changed. A change
-to which services a build starts, so left for the operator. Predates this branch: the same attribute is on
-`main`.**
+**Status: CLOSED 2026-10-11 - the attribute was REMOVED on 2026-10-10 (`68922715`, `backlog/80` V5) and
+this entry was left saying OPEN. `time` now starts in every build; verified below.** Found 2026-10-06 by the
+documentation audit.
 
 ## What the code says
 
@@ -37,3 +37,23 @@ Move the attribute and the `block-driver` paragraph to sit directly above `block
 `dwc2` is, 1 elsewhere), read by both the boot and the restart paths. That changes two builds' spawn sets:
 `time` starts in every build, and `block-driver` stops being started in builds outside the gate - which
 is what the gate always said. Each test build that changes should be run once after it.
+
+## Closed (2026-10-11)
+
+The fix was not the one proposed above. The attribute was removed rather than moved (`68922715`, under
+`backlog/80` V5): every build has started `block-driver` all along and its suites run with it, so gating
+it now would have taken it away from builds that use it. The comment where the attribute sat in
+`services/supervisor/src/main.rs` says so, and names `board::BLOCK_CORE` as `block-driver`'s placement,
+which also corrects the stale `preferred_core` paragraph.
+
+Evidence that `time` starts in a build outside the old gate - the adversarial build, run 2026-10-11 on
+`feat/ask` (`build/tests/6_ADVERSARIAL/A10-kernel_addr_as_syscall_arg_no_panic.log`):
+
+```
+task: 'time' spawned OK on core 1 (slot 20)
+supervisor: name-map + time (endpoint cap slot 32)
+supervisor: ready
+```
+
+`osdev test adv` 15/0 on that build. This entry stayed OPEN for a day only because the commit that fixed
+it did not update it.
