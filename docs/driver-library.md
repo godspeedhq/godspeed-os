@@ -37,8 +37,10 @@ the kernel already offers, in the one shape a driver should use; MISCIS (CLAUDE.
 the SDK at hardware. That line is moved, not erased: hardware AUTHORITY still comes only through the
 SDK's audited layer, and `unsafe` still lives only there (18.1). What moves into `gs` is the safe,
 device-neutral machinery a driver builds on - one mechanism at a time, each one found in real drivers
-first. `backlog/71` (the path to a v1 promise) depends on this shape: it puts `gs::driver` OUTSIDE the
-first covered surface, because hardware support keeps growing.
+first. `backlog/71` (the path to a v1 promise) depends on this shape. It first put `gs::driver` OUTSIDE the
+covered surface, because hardware support keeps growing; on 2026-10-11 the operator put it INSIDE,
+grow-only: a mechanism once built does not change, and new ones are added. So a mechanism is a promise
+the day it lands, which is one more reason each one is found in real drivers first.
 
 ## Current state (2026-10-09)
 

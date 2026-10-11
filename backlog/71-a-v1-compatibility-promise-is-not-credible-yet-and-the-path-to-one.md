@@ -2,7 +2,8 @@
 
 **Status: OPEN - a decision recorded 2026-10-02, from the operator's question "can I safely release a v1
 and promise no breaking changes in the future?". The answer was not yet, and why; this item is the plan.
-Nothing is built for it.**
+The bar and the order were settled 2026-10-11 (below). Built so far: the one-way ratchet (step 3, half),
+every service on `gs` (step 2, all but the driver gap).**
 
 ## Why not yet, measured rather than felt
 
@@ -56,7 +57,33 @@ that the earlier draft did not face. The draft leaves `gs::driver` OUT of the co
 contributor works through `gs::driver` and, where it has no mechanism yet, the SDK's `ctx.mmio()` and
 `ctx.dma_region()` (13 and 12 call sites across nine drivers on 2026-10-11). Under this bar, either the
 built `gs::driver` mechanisms are covered, with the set allowed to GROW but not change, or driver
-contributions are named as outside what v1 makes easy. Undecided; it is the operator's call.
+contributions are named as outside what v1 makes easy.
+
+**Decided the same day: `gs::driver` is covered, grow-only.** The mechanisms it has (`wait`, `delay`,
+`irq`) freeze with the rest of the surface; new mechanisms may be added, existing ones may not change.
+That moves the driver gap into step 2: before the freeze, `gs::driver` gains the mechanisms drivers still
+reach the SDK for, found repeated in real drivers as `docs/driver-library.md` requires. Two were found in
+the 2026-10-11 survey:
+
+- **An arena layout.** 107 `phys_at` calls across 17 files carve DMA arenas by hand-kept offset constants
+  (`block-driver`'s `CMD_LIST_OFF`..`DATA_OFF`, `audio-driver`'s `CORB_OFF`, `dwmac`'s `TX_RING_OFF`), with
+  nothing checking that the pieces do not overlap or fit the granted arena. A layout of named, aligned,
+  bounds-checked regions, fixed at start, fails loudly at spawn instead.
+- **Taking the grants.** Nine drivers each handle "no window or arena granted" in their own words. The
+  shared part is taking both and saying plainly what is missing; what to do then stays the driver's.
+
+Register access (`read32`/`write32`, about 850 sites) describes the device and stays as it is; the SDK's
+`Mmio` is already the right shape, and wrapping it would be the re-export this item already declined. No
+userspace cache maintenance exists to extract: arenas are uncached on the ARM boards and x86 DMA is
+coherent. Step 2 is done when no driver calls `ctx.mmio()` or `ctx.dma_region()` directly, which the
+one-way ratchet can then hold at zero.
+
+**The order agreed:** (1) close `fix/backlog-80`; (2) a branch for the two `gs::driver` mechanisms, proved
+on two unlike drivers (AHCI on x86, GENET on the Pi 4) and then the rest one at a time; (3) a v1 groundwork
+branch for steps 1, 3 and 4 below - the covered surface confirmed, a checked-in snapshot of the public `gs`
+surface (including `gs::driver`) and the utility vocabulary with a checker that fails on removal or change,
+and the compatibility policy; (4) the soak, one or two releases in which that checker never has to accept a
+breaking change; then v1.
 
 ## The path to a credible v1
 
@@ -64,7 +91,9 @@ contributions are named as outside what v1 makes easy. Undecided; it is the oper
    errors); the `gsh` language, the utility names and their documented outputs; the on-disk formats (GSFS,
    `/wifi.keys`); the contract schema. Proposed OUT (internal, or separately versioned): the SDK, the syscall
    numbers, service-to-service protocols, and the `gs::driver` tier - hardware support keeps growing, and a
-   promise there would be broken.
+   promise there would be broken. **Amended 2026-10-11: `gs::driver` is IN, grow-only** (the decision
+   above): hardware support grows by adding mechanisms, which the promise allows, and a contributor
+   writing a driver needs the mechanisms it has to hold still.
 2. **Reshape first** (the section above), so the surface frozen is the one meant to be kept.
 3. **Make the promise a gate**, as this project enforces everything else: a checked-in snapshot of the public
    `gs` surface and the utility vocabulary, and a checker that fails the build when something is REMOVED or
