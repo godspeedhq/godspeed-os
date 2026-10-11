@@ -1,9 +1,9 @@
 # 80. Code defects found by the 2026-10-09 documentation audits
 
-**Status: FIXED IN CODE on `fix/backlog-80`, 2026-10-10 - every item below carries a FIXED note - and
-OPEN until the hardware card those notes name has passed: the VisionFive (D11).
-The T630's two (D1, K17) passed on 2026-10-10, the Pi 2's three (G4, K25, K28) and the Pi 4's two (K21, K22) on 2026-10-11. The audits changed documents and comments only; the items
-were fixed separately, and the kernel ones with the operator's go-ahead.**
+**Status: CLOSED on `fix/backlog-80`, 2026-10-11.** Fixed in code on 2026-10-10 - every item below
+carries a FIXED note - and every hardware card those notes name has passed: the T630's two (D1, K17) on
+2026-10-10, and the Pi 2's three (G4, K25, K28), the Pi 4's two (K21, K22) and the VisionFive's (D11) on 2026-10-11. The audits changed documents and comments only; the items
+were fixed separately, and the kernel ones with the operator's go-ahead.
 
 **Seen while closing it, not yet explained:** one `osdev test shell` run on 2026-10-10 went silent at the
 refused-`tcp` step - no further serial output from the kernel or any service for twenty minutes, no panic,
@@ -299,7 +299,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
 - **D11. Smaller**: `dwc2` `net::serve` discards the reply result; `net-stack` `feed_tx` is effectively dead;
   unused `stale_after`/`last_ok` (dwc2 hid), `POLL_FRAMES`/`active()` (tcp), `tx_fault_counters` (dwmac);
   `wifi-usb`'s ST_FAILED message says "has no bulk IN" for a failed repair too.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** `dwc2` logs an undelivered NIC reply; the dead code removed; `wifi-usb`'s ST_FAILED names both causes; the dwmac fault counters are logged after eight transmits (a VisionFive boot to read).
+  **FIXED on `fix/backlog-80`, 2026-10-10:** `dwc2` logs an undelivered NIC reply; the dead code removed; `wifi-usb`'s ST_FAILED names both causes; the dwmac fault counters are logged after eight transmits (a VisionFive boot to read). **Passed on the VisionFive, 2026-10-11:** once the cable was in, the first eight transmits (DHCP, ARP and TCP, every one `tdes3 ... = no-error`, and DHCP answered) each printed both lines. Every fault counter read 0, and so did `tx good` and both transmit octet counters while `tx gb` climbed 1 to 8, which is the unpopulated-counter reading `dwmac_ring.rs` already records for this synthesis. So the zeros say no fault was reported, not that the MAC could have reported one.
 
 ## Shell
 
