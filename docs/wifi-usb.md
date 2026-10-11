@@ -244,6 +244,13 @@ The card (`build/kernel7-R2c.img`) predicts, on a replug where a block's STATUS 
 completed after 1 transaction error(s), re-run as Linux does`, the download `(1 try)`, RUNNING, channel 1.
 Refuted by: `STATUS stage gave up after 3 transaction errors` followed by the same wall of timed-out reads.
 
+**Seen once at boot, 2026-10-11 (the `backlog/80` Pi 2 card, image `38c0d92e`): exactly that.** The dongle
+on hub port 2 verified its firmware, one block's STATUS stage errored three times (`STATUS stage gave up
+after 3 transaction errors`), and every read after it timed out - all six download tries, and again after
+`wifi radio on` restarted the driver. Unplugged and put back on port 4, it came up at once: one try,
+RUNNING, joined WPA2, `ping` answered. So the re-run does not rescue a stage that fails three times running,
+and a chip left that way answers nothing until it loses power, as R2b found. A boot case, not the replug
+case the card was built for. One sighting, not entered in the backlog.
 One more thing the R2 run settled: on the U1b run the third replug came up at full speed through the hub's
 transaction translator, and every vendor read failed. In the R2 run both replugs came up at high speed and
 read the chip at once, so that was the insertion; it is recorded here in case it returns.

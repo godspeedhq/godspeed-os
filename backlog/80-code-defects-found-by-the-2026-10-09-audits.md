@@ -1,8 +1,8 @@
 # 80. Code defects found by the 2026-10-09 documentation audits
 
 **Status: FIXED IN CODE on `fix/backlog-80`, 2026-10-10 - every item below carries a FIXED note - and
-OPEN until the hardware cards those notes name have passed: the Pi 4 (K21, K22), the Pi 2 (G4, K25, K28)
-and the VisionFive (D11). The T630's two (D1, K17) passed on 2026-10-10. The audits changed documents and comments only; the items
+OPEN until the hardware cards those notes name have passed: the Pi 4 (K21, K22) and the VisionFive (D11).
+The T630's two (D1, K17) passed on 2026-10-10, the Pi 2's three (G4, K25, K28) on 2026-10-11. The audits changed documents and comments only; the items
 were fixed separately, and the kernel ones with the operator's go-ahead.**
 
 **Seen while closing it, not yet explained:** one `osdev test shell` run on 2026-10-10 went silent at the
@@ -140,7 +140,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   every idle pass; `route_usb_irq_to_core0` has no callers; `start_tick_ap` has an unreachable branch;
   `mmu::enable` prints "caches ON" after a selftest the caches were already on for; the framebuffer section is
   non-shareable while the console's small-page mapping is shareable (effect unverified).
-  **FIXED on `fix/backlog-80`, 2026-10-10:** the fault line corrected and every core halted; the empty `if`, the uncalled `route_usb_irq_to_core0` and the unreachable branch removed; "caches ON" before the selftest; the console's framebuffer pages non-shareable to match the section. Needs a Pi 2 card.
+  **FIXED on `fix/backlog-80`, 2026-10-10:** the fault line corrected and every core halted; the empty `if`, the uncalled `route_usb_irq_to_core0` and the unreachable branch removed; "caches ON" before the selftest; the console's framebuffer pages non-shareable to match the section. **Pi 2 card 2026-10-11, passed:** `arm32: caches ON` now prints before `MMU selftest PASS`, the console drew the prompt and a full `selfcheck` (527 passed, 0 failed), and no kernel fault was logged.
 - **K27. USB driver placement is stated twice with nothing linking the copies**: x86 MSI destinations use
   `task::XHCI_CORE`/`EHCI_CORE` (2 and 3), and the supervisor's `USB_IMAGES` rows hard-code 2 and 3. Change
   one alone and the interrupts land on the wrong core. Fix: one constant and a check, or derive the
@@ -149,7 +149,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
 - **K28. arm32 `hw_random` is an unlocked FIFO pop**: two cores can both pass the "word available" check and
   read the same or a stale word - and it now feeds the WPA2 SNonce (`sdk/wifi` `supplicant.rs`). Fix: a
   spinlock around the check and the read.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** a lock around the enable, the check and the read. Needs a Pi 2 card (`random`, and a WPA2 join over the dongle).
+  **FIXED on `fix/backlog-80`, 2026-10-10:** a lock around the enable, the check and the read. **Pi 2 card 2026-10-11, passed:** `random 8` gave eight different non-zero words, and the dongle joined a WPA2 network twice (`JOINED - handshake complete, pairwise key installed`), the SNonce coming from this read, then `ping` answered over the radio.
 - **K26. The stubs' `unimplemented!("aarch64::switch_to_boot_stack")` names the wrong arch** (riscv32,
   loongarch64, s390x). **aarch64 `mailbox::notify_xhci_reset` takes no `MBOX_LOCK`** and runs after the
   secondaries start - safe only because nothing calls it from a syscall yet.
@@ -175,7 +175,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
 - **G4. `gs::task::sleep_quantum` returns after about 1 us on a real Pi 2**: the counter is 1 MHz, so
   `sleep(1)` takes the sub-tick path, and loops meant to yield a quantum spin. Fix: sleep one 10 ms
   duration.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** `sleep_quantum` sleeps 10 ms as a duration (one tick on an uncalibrated clock, as before). Needs a Pi 2 to see.
+  **FIXED on `fix/backlog-80`, 2026-10-10:** `sleep_quantum` sleeps 10 ms as a duration (one tick on an uncalibrated clock, as before). **Pi 2 card 2026-10-11:** nothing on this board makes it visible. Its one caller here is the shell's wait after a bare Escape, and the USB keyboard pushes a whole escape sequence at once, so arrows never reach that wait; the card shows only that the shell still answers, with `selfcheck` 527 passed and 0 failed. Closed on reading, not on a measurement.
 
 ## SDK
 
