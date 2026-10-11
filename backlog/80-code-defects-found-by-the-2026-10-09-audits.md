@@ -21,6 +21,12 @@ the night, so the storm leaked no frames. Under the storm `audio-driver` twice l
 dying `fs` and said so ("THE OUTCOME IS UNKNOWN"), then started at the defaults, which is the loud path
 working.
 
+**Pi 2, 2026-10-11, image `38c0d92e`:** `chaos max-carnage all-services 1000`: 6725 kills, 5736 flooded,
+1000 mem-pressure, 1000 spawns, kernel alive, no kernel fault and no liveness report; afterwards `random 4`
+gave four different words and `selfcheck` 526 passed, 0 failed (its `dns` step skipped: the dongle's
+post-storm rejoin was ended by the access point, reason 34, before the handshake, and was not retried in
+the two minutes the capture ran on).
+
 Two audits ran on `feat/dogfood-gs` on 2026-10-09 (`audits/documentation-audit.md`, Audits 14 and 15).
 Reading every comment against the code beside it finds code that does not do what its comment says, and
 some of the time the comment is right. Those are below, with the evidence each reader gave and a proposed
