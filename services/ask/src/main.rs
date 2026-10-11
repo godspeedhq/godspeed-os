@@ -25,7 +25,7 @@ mod know;
 use godspeed::{self as gs, ipc::Message, record::{RecordSink, Table, Value}, ServiceContext};
 use godspeed_sdk::service_context::supcmd;
 use godspeed_wifi::wire;
-use know::{Answer, Drive, Ev, Events, Facts, Got, Kind, Radio, RadioFact, Reading, Task};
+use know::{Answer, Chain, Drive, Ev, Events, Facts, Got, Kind, Radio, RadioFact, Reading, Task};
 
 // The event codes `know` restates must be the supervisor's. A drifted copy would misname every event.
 const _: () = assert!(know::EV_RESTARTED == supcmd::EV_RESTARTED && know::EV_RESTART_FAILED == supcmd::EV_RESTART_FAILED
@@ -43,6 +43,11 @@ const ASK_SECS: i64 = 3;
 const ASK_FS_SECS: i64 = 8;
 /// The radio drivers, by service name. A running one is asked; none running is a fact in itself.
 const RADIOS: [&str; 2] = ["wifi-driver", "wifi-usb"];
+/// The USB hosts a disk can be behind. Which one `block-driver` is behind is read from its capabilities,
+/// never assumed from the board.
+const STORAGE_HOSTS: [&str; 3] = ["xhci", "dwc2", "ehci"];
+/// The block protocol's capacity request, the same op number on every link (`OP_CAPACITY`).
+const OP_CAPACITY: u8 = 3;
 /// End of a stream, as every pipe stage uses it.
 const EOT: u8 = 0x04;
 
@@ -106,6 +111,7 @@ fn first_word(q: &[u8]) -> &str {
 
 /// The live tasks, as the task table holds them.
 struct TaskTable {
+    slots: [u32; TASKS_MAX],
     names: [[u8; 32]; TASKS_MAX],
     lens: [usize; TASKS_MAX],
     restarts: [u64; TASKS_MAX],
@@ -115,8 +121,8 @@ struct TaskTable {
 
 impl TaskTable {
     fn read(ctx: &ServiceContext) -> TaskTable {
-        let mut t = TaskTable { names: [[0; 32]; TASKS_MAX], lens: [0; TASKS_MAX], restarts: [0; TASKS_MAX],
-                                up: [0; TASKS_MAX], n: 0 };
+        let mut t = TaskTable { slots: [0; TASKS_MAX], names: [[0; 32]; TASKS_MAX], lens: [0; TASKS_MAX],
+                                restarts: [0; TASKS_MAX], up: [0; TASKS_MAX], n: 0 };
         for slot in 0..SLOTS {
             let st = ctx.task_stat(slot);
             // 4 = Dead: a slot the kernel could not free stays visible and is not a running service.
@@ -124,6 +130,7 @@ impl TaskTable {
             // This program is not part of the system it describes.
             if st.name_str() == "ask" { continue; }
             let len = st.name_len.min(32);
+            t.slots[t.n] = slot;
             t.names[t.n][..len].copy_from_slice(&st.name[..len]);
             t.lens[t.n] = len;
             t.restarts[t.n] = st.restart_count;
@@ -137,6 +144,9 @@ impl TaskTable {
     }
     fn live(&self, name: &str) -> bool {
         (0..self.n).any(|i| self.name(i) == name)
+    }
+    fn slot(&self, name: &str) -> Option<u32> {
+        (0..self.n).find(|&i| self.name(i) == name).map(|i| self.slots[i])
     }
 }
 
@@ -205,6 +215,52 @@ fn radio_status(ctx: &ServiceContext, driver: &str, keep: &mut [u8; 64], ssid_le
         Some(wire::RADIO_POWERED_OFF) => Got::Yes(Radio::PoweredOff),
         _ => Got::Silent,
     }
+}
+
+/// `block-driver`'s capacity, asked in its TAGGED framing: `[tag, op]` answered `[tag, status, sectors]`.
+fn block_capacity(ctx: &ServiceContext) -> Got<u64> {
+    const TAG: u8 = 0xA7;
+    match gs::call::request_within(ctx, "block-driver", &Message::from_bytes(&[TAG, OP_CAPACITY]), ASK_SECS) {
+        Ok(r) => {
+            let p = r.payload_bytes();
+            if p.len() >= 10 && p[0] == TAG && p[1] == 0 {
+                Got::Yes(u64::from_le_bytes([p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]]))
+            } else { Got::Silent }
+        }
+        Err(_) => Got::Silent,
+    }
+}
+
+/// A USB host's capacity, in ITS framing - untagged: `[op]` answered `[status, sectors]`.
+fn host_capacity(ctx: &ServiceContext, host: &str) -> Got<u64> {
+    match gs::call::request_within(ctx, host, &Message::from_bytes(&[OP_CAPACITY]), ASK_SECS) {
+        Ok(r) => {
+            let p = r.payload_bytes();
+            if p.len() >= 9 && p[0] == 0 {
+                Got::Yes(u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]))
+            } else { Got::Silent }
+        }
+        Err(_) => Got::Silent,
+    }
+}
+
+/// Which USB host `block-driver` holds a SEND capability to - the link its disk is behind - read from
+/// its live capability table (INTROSPECT), as `trace deps` reads it. `(false, None)` when the table
+/// could not be read; `(true, None)` when it holds none, as on a PC whose disk is AHCI.
+fn host_of_block(ctx: &ServiceContext, tt: &TaskTable) -> (bool, Option<&'static str>) {
+    let bd = match tt.slot("block-driver") { Some(s) => s, None => return (false, None) };
+    let mut caps = [godspeed_sdk::CapInfo::default(); 64];
+    let n = ctx.task_caps(bd, &mut caps);
+    if n == 0 { return (false, None); }
+    for host in STORAGE_HOSTS.iter() {
+        let hs = match tt.slot(host) { Some(s) => s, None => continue };
+        let ep = match ctx.task_own_endpoint(hs) { Some(e) => e, None => continue };
+        // Rights: SEND is 4 (sdk `CapInfo`).
+        if caps[..n].iter().any(|c| c.rights & 4 != 0 && c.resource_id == ep) {
+            return (true, Some(host));
+        }
+    }
+    (true, None)
 }
 
 fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], tt: &TaskTable,
@@ -289,7 +345,18 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
         nr += 1;
     }
 
-    let facts = Facts { now, tasks, expected, events, drive, radios: &radios[..nr] };
+    // THE STORAGE CHAIN, only when the filesystem is the question and `fs` has no usable disk: each link
+    // below it is asked the same read-only question in its own framing.
+    let no_disk = matches!(drive, Got::Silent) || matches!(drive, Got::Yes(d) if d.capacity == 0);
+    let chain = if matches!(kind, Kind::Fs) && no_disk {
+        let block = if tt.live("block-driver") { block_capacity(ctx) } else { Got::Absent };
+        let (host_read, host_name) = host_of_block(ctx, tt);
+        let host = host_name.map(|h| (h, if tt.live(h) { host_capacity(ctx, h) } else { Got::Absent }));
+        Some(Chain { block, host, host_read })
+    } else { None };
+
+    let tick = gs::driver::wait::ticks(ctx);
+    let facts = Facts { now, tick, tasks, expected, events, drive, radios: &radios[..nr], chain };
     know::assess(kind, event, known, &facts, a);
 }
 

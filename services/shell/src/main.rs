@@ -14403,8 +14403,10 @@ fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
 /// for `fs` - `services/ask`), so a machine where every one is silent still answers inside this, with
 /// every source named as a hole, rather than this shell giving up first.
 const ASK_WAIT_SECS: i64 = 25;
-/// The services `ask` is wired to when it is started: the shell for its answer, then what it asks.
-const ASK_PEERS: &[&str] = &["shell", "supervisor", "fs", "wifi-driver", "wifi-usb"];
+/// The services `ask` is wired to are the supervisor's row for it (`board::ASK_PEERS`): NONE are passed
+/// from here. A peer named at the moment of starting would be a grant no pin covers - Commandment VII pins
+/// the row - so the board's list, chosen where the board is known, is the only one.
+const ASK_PEERS: &[&str] = &[];
 
 /// `ask "<question>"` / `ask evidence "<question>"` as a record table, one row per line of the answer
 /// (`label`, `source`, `rule`, `text`) and a last row of label `status`. `ask` is a FOREGROUND PROGRAM

@@ -19,6 +19,9 @@ limit   = "8MiB"
 
 [capabilities]
 ipc_receive = ["ask"]
-ipc_send    = ["shell", "supervisor", "fs", "wifi-driver", "wifi-usb"]
+# Every board's list together (`board::ASK_PEERS` in the supervisor picks one per board, at most six -
+# the kernel's MAX_SEND_PEERS): the shell, the supervisor, `fs`, `block-driver`, the USB host the disk is
+# behind (`dwc2` on the Pi 2, `xhci` on the Pi 4 and the VisionFive, none on a PC) and the radio driver.
+ipc_send    = ["shell", "supervisor", "fs", "block-driver", "dwc2", "wifi-usb", "xhci", "wifi-driver"]
 log_write   = true
 

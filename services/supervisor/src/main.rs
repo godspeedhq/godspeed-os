@@ -407,6 +407,22 @@ mod board {
     /// the board that has it, `xhci` on the others (U2a).
     pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
 
+    /// `ask`'s send peers (`docs/ask-design.md`): the shell for its answer, the supervisor for its
+    /// read-only questions, `fs` and `block-driver` for storage, then the ONE USB host this board's disk
+    /// is behind and the ONE radio driver it runs - six at most, the kernel's `MAX_SEND_PEERS`, which is
+    /// why it is chosen per board rather than listing every host and radio. The Pi 2's disk is behind
+    /// `dwc2` and its radio is the dongle; the Pi 4's and the VisionFive's are behind `xhci` with an
+    /// onboard radio; a PC's disk is AHCI, which `block-driver` drives itself, so it needs no host, and
+    /// its radio is the dongle. Where the dongle runs beside an onboard radio (the Pi 4), the onboard one
+    /// is the one asked. Flat, because `contract_check.py` reads this chain as text.
+    pub const ASK_PEERS: &[&str] = if cfg!(has_dwc2) {
+        &["shell", "supervisor", "fs", "block-driver", "dwc2", "wifi-usb"]
+    } else if cfg!(has_wifi_driver) {
+        &["shell", "supervisor", "fs", "block-driver", "xhci", "wifi-driver"]
+    } else {
+        &["shell", "supervisor", "fs", "block-driver", "wifi-usb"]
+    };
+
     /// `copier`'s send peers: `fs` for the files it copies, and the board's audio driver for the "done"
     /// sound a finished job makes (`docs/audio.md`, "System sounds") - `audio-driver` on the PCs,
     /// `pwm-audio` on the Pis, none on the VisionFive, which has no audio output. Flat, for the reason
@@ -497,10 +513,10 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("copier", COPIER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      u32::MAX, board::COPIER_PEERS, 0, 0, 0),
     // NOT in the boot set and not in `MANAGED`: the shell starts it for ONE question and ends it once
-    // the answer is in (`docs/ask-design.md`). It reads only - INTROSPECT for the task table, and send
-    // peers the shell names when it starts it (itself, this supervisor, `fs` and the radio drivers).
+    // the answer is in (`docs/ask-design.md`). It reads only - INTROSPECT for the task table, and the
+    // board's `ASK_PEERS`. The shell passes no peers of its own, so every grant is this row's, pinned.
     ("ask", ASK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX,
-     &["shell", "supervisor", "fs", "wifi-driver", "wifi-usb"],
+     board::ASK_PEERS,
      godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
