@@ -370,3 +370,7 @@ showed an hour later, as the message says it will. Not fixed: whether to shorten
 as progress, or widen the window is a decision for later, and this is the first evidence that the
 window can be shorter than something the kernel does on purpose. The unexercised row above now reads
 **two real firings, both explained by a fault report outlasting the window**.
+
+**A third firing, same shape (Pi 4, 2026-10-11, image `9d0f8e16`).** The next 1000-round run on the Pi 4
+logged one `kill: ABANDONED slot 12`, 4 s into the storm, again `pwm-audio` on core 2 and again spliced
+into that service's own EL0 fault report. Three firings, three fault reports outlasting the window.
