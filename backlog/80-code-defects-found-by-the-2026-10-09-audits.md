@@ -1,8 +1,8 @@
 # 80. Code defects found by the 2026-10-09 documentation audits
 
 **Status: FIXED IN CODE on `fix/backlog-80`, 2026-10-10 - every item below carries a FIXED note - and
-OPEN until the hardware cards those notes name have passed: the T630 (D1, K17), the Pi 4 (K21, K22), the
-Pi 2 (G4, K25, K28) and the VisionFive (D11). The audits changed documents and comments only; the items
+OPEN until the hardware cards those notes name have passed: the Pi 4 (K21, K22), the Pi 2 (G4, K25, K28)
+and the VisionFive (D11). The T630's two (D1, K17) passed on 2026-10-10. The audits changed documents and comments only; the items
 were fixed separately, and the kernel ones with the operator's go-ahead.**
 
 **Seen while closing it, not yet explained:** one `osdev test shell` run on 2026-10-10 went silent at the
@@ -10,6 +10,16 @@ refused-`tcp` step - no further serial output from the kernel or any service for
 no liveness report - and the rerun on the same code passed 253 of 253. A guest-wide silence is not a
 service fault, since a stuck service cannot silence the kernel's own log. One sighting, no reproduction;
 the capture is not committed. Recorded here so the next sighting has a first one to compare with.
+
+**Regression runs of the new kernel, 2026-10-10, image `45fc5dc7`.** No item here is specific to either
+x86 board, so these check that the K14, K18 and K20 changes broke nothing. **T630:** `chaos max-carnage
+all-services 1000`, kernel alive, then `selfcheck` 539 passed and 0 failed before the capture ended at the churn step. **Dell Wyse 5070:** `selfcheck` 533
+passed, 0 failed; then `chaos max-carnage all-services 1000` (seed 219442905004758): 6905 kills, 5932
+flooded, 1000 mem-pressure, 1000 spawns, kernel alive, no panic and no liveness report; then ten hours idle
+and `selfcheck` again, 535 passed, 0 failed. `mem` read 9372 KiB used before the storm and 9372 KiB after
+the night, so the storm leaked no frames. Under the storm `audio-driver` twice lost its settings read to a
+dying `fs` and said so ("THE OUTCOME IS UNKNOWN"), then started at the defaults, which is the loud path
+working.
 
 Two audits ran on `feat/dogfood-gs` on 2026-10-09 (`audits/documentation-audit.md`, Audits 14 and 15).
 Reading every comment against the code beside it finds code that does not do what its comment says, and
