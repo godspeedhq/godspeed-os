@@ -487,7 +487,8 @@ impl Table {
                     return Err("expected ',' or '}'");
                 }
             }
-            t.add_row(&row);
+            // This table's columns only - see the same line in `decode`, which had the same fault.
+            t.add_row(&row[..t.ncols]);
             first_obj = false;
             i = json_ws(b, i);
             if i < b.len() && b[i] == b',' { i += 1; continue; }
@@ -587,7 +588,12 @@ impl Table {
                     _ => return Err("bad record cell tag"),
                 };
             }
-            t.add_row(&row);
+            // THIS TABLE'S COLUMNS, not the whole `REC_MAX_COLS` scratch row. Since `add_row` calls more
+            // values than columns an overflow (`backlog/80` S7, `507c2d55`), passing the scratch row made
+            // every decoded table of fewer than 8 columns report a truncation that did not happen - a
+            // record service piped into anything printed "result exceeded the record bound" over three
+            // rows. Found by `ask`, the first record service whose pipe a test read closely.
+            t.add_row(&row[..ncols]);
         }
         Ok(t)
     }
