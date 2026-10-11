@@ -242,6 +242,12 @@ const OP_WRITE_ZEROS: u8 = 4;
 const OP_FLUSH: u8 = 5;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
+// A flush that reached NO device: the USB host service did not answer, or had no disk bound. `fs`
+// reads `STATUS_ERR` on a flush as the DEVICE refusing the barrier - the evidence CLAUDE.md 6.1 names -
+// so a flush that never got that far must not be reported the same way (`backlog/57`). Only the USB
+// backend can be in that position: AHCI and SDHCI drive their device directly.
+#[cfg(storage_is_usb)]
+const STATUS_UNREACHABLE: u8 = 2;
 
 /// Drive the AHCI controller directly, through the BAR the kernel granted this service.
 #[cfg(not(storage_is_usb))]

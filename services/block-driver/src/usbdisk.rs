@@ -70,7 +70,7 @@ fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 {
     if super::xhciblk::write(ctx, lba, buf) { 0 } else { -1 }
 }
 
-fn dev_flush(ctx: &ServiceContext) -> bool { super::xhciblk::flush(ctx) }
+fn dev_flush(ctx: &ServiceContext) -> super::xhciblk::Flush { super::xhciblk::flush(ctx) }
 
 /// Serve one block-IPC request. Same wire protocol as the AHCI backend - `fs` is unaware of which one
 /// it is talking to.
@@ -81,7 +81,13 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
     if p[0] == OP_FLUSH {
         // The one backend that genuinely needs this: a stick acknowledges a WRITE(10) into its own
         // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just written.
-        let status = if dev_flush(ctx) { STATUS_OK } else { STATUS_ERR };
+        // Unreachable is said as itself: `fs` must not read "the device refused" into a flush that
+        // reached no device (`backlog/57`).
+        let status = match dev_flush(ctx) {
+            super::xhciblk::Flush::Durable => STATUS_OK,
+            super::xhciblk::Flush::Refused => STATUS_ERR,
+            super::xhciblk::Flush::Unreachable => super::STATUS_UNREACHABLE,
+        };
         reply.send(ctx, &[status]);
         return;
     }

@@ -703,6 +703,10 @@ pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
+/// No mass-storage device is bound, so the request reached no device. Distinct from `STATUS_ERR`, which
+/// is a DEVICE that answered and failed: a flush refused by a stick is evidence about the stick
+/// (CLAUDE.md 6.1), and a flush with no stick bound is evidence about nothing (`backlog/57`).
+pub const STATUS_NO_DISK: u8 = 2;
 
 /// Build the reply for one block-IPC request, into `out`, returning how many bytes of it are valid.
 ///
@@ -748,6 +752,7 @@ pub fn serve_block(
         if !core::mem::replace(no_disk_said, true) {
             ctx.log("xhci: block request but NO disk is bound - refusing (silenced until one is)");
         }
+        out[0] = STATUS_NO_DISK;
         return 1;
     };
     // A disk is bound: the next absence is news again.

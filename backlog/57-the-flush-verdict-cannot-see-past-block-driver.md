@@ -1,7 +1,8 @@
 # 57 - `fs` reports "the drive REFUSED the flush" when the drive was never reached
 
-**Status:** OPEN - an instrument defect, reproduced on two boards and two ISAs. It produces false
-evidence for a CONSTITUTIONAL claim (CLAUDE.md 6.1), which is why it is filed rather than noted.
+**Status:** OPEN - fix (1) BUILT 2026-10-11 on `feat/ask`; step (2), the chaos re-run that shows it, needs
+the Pi 4 or the VisionFive (see the last section). An instrument defect that produced false evidence for a
+CONSTITUTIONAL claim (CLAUDE.md 6.1), which is why it is filed rather than noted.
 **Found:** 2026-09-26, during the `feat/stdlib-complete` five-board pass, by following up a warning
 that looked like the evidence 6.1 asks for.
 
@@ -114,3 +115,38 @@ it was looking at. A conflation fixed at one layer reappears at the next one dow
 it happened - a reply that drops a distinction the sender knew - is a shape, not a location. When a
 message is nominated as the evidence for a constitutional claim, the interesting question is not "is
 it wired up" but "what else can make it fire".
+
+## Fix (1) built (2026-10-11) - and wider than (1) said
+
+The unreachable case has TWO routes to `Refused`, and the entry above found one:
+
+- **`block-driver` could not reach its USB host** (`rpc` returns nothing). That is the six sightings.
+- **The USB host answered, with no disk bound.** `xhci` and `dwc2` answer EVERY request `STATUS_ERR`
+  when no mass-storage device is bound - the same byte a stick returns for a refused SYNCHRONIZE CACHE.
+  Right after an `xhci` restart, before the stick re-binds, a flush would have read as the drive
+  refusing just the same.
+
+So the distinction is carried at both layers: `xhci` and `dwc2` answer "no disk bound" with its own
+status (`msc::STATUS_NO_DISK` = 2); `block-driver`'s USB path (`xhciblk::flush`) returns `Durable`,
+`Refused` or `Unreachable`, with a silent host or no bound disk as `Unreachable`, and replies
+`STATUS_UNREACHABLE` (2) for it; `fs` has a fourth `FlushOutcome` and says so:
+
+```
+fs: durability NOT attested - the block driver could not reach the drive (its USB host was restarting, or
+had no disk bound). The barrier did not happen for this transaction; this says NOTHING about whether the
+drive supports a cache flush.
+```
+
+`Refused` now means only "a host reached the device and the flush failed", which is the evidence 6.1
+names. The capacity path is unchanged: `xhciblk::sectors_now` already reads any one-byte reply as "no
+disk bound". AHCI and SDHCI drive their device directly and cannot be in this position.
+
+**What was verified, and what was not.** Every board image builds; on x86 `osdev test files` 249/0 and
+`jobs` 60/0; on the Pi 2 in QEMU a write to a USB stick flushes `Durable` as before. The case itself was
+NOT seen firing: in QEMU the Pi 4 has no USB, and on the Pi 2 a `chaos kill-storm dwc2` under a
+background churn fails `fs`'s next block READ first, so `fs` degrades before it ever reaches a barrier.
+The six sightings were `xhci` under `max-carnage` on the Pi 4 and the VisionFive.
+
+**Step (2) is therefore still open:** re-run `chaos max-carnage` on the Pi 4 or the VisionFive with this
+build. Every durability line should now read "could not reach the drive" where the six read "refused".
+A `Refused` that survives is real, and is the evidence 6.1 asks for.

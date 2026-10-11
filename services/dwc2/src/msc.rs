@@ -491,6 +491,9 @@ pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
+/// No mass-storage device is bound, so the request reached no device - the same value and meaning as
+/// `xhci`'s (`backlog/57`): a refusal by a device and the absence of one are different facts.
+pub const STATUS_NO_DISK: u8 = 2;
 
 /// WRITE(10): one block from the arena's data buffer.
 pub fn write_block(

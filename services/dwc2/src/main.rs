@@ -264,7 +264,7 @@ fn dispatch(
         // EVERY request this way, net and radio included, because the no-disk paths never routed by
         // op: `wifi-usb`'s first QEMU boot got a disk error back to its INFO (2026-10-05).
         None => {
-            let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
+            let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_NO_DISK]));
             true
         }
     }
