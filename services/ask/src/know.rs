@@ -106,6 +106,8 @@ impl Event {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reading {
     One(Kind, Event),
+    /// "What is X?" - a term to define, at `at..at + len` in the question as it was asked.
+    Define { at: usize, len: usize },
     /// Two kinds fit; the answer lists both and asks which (never picks one to have an answer).
     Two(Kind, Kind),
     /// A request to DO something, which `ask` cannot; the verb is the first word.
@@ -231,6 +233,32 @@ pub fn understand(q: &[u8], known: &[&str]) -> Reading {
     if (has_e(&["who", "what"]) && has_e(&["you"]) && has_e(&["are"]) && n <= 4)
         || (has_e(&["what", "who"]) && has_e(&["godspeed"]) && n <= 4) {
         return Reading::One(Kind::Egg(Egg::Who), Event::Unnamed);
+    }
+
+    // A TERM TO DEFINE: "what is X?", "what's X", "what does X mean / stand for?", "define X" - one word,
+    // and not one of ask's own question words ("what is wrong?" is still the health question).
+    {
+        let mut idx = [0usize; WORDS_MAX];
+        let mut m = 0usize;
+        for i in 0..n {
+            if !any(w(i), &["the", "a", "an", "acronym", "abbreviation", "term", "word"]) { idx[m] = i; m += 1; }
+        }
+        let ww = |k: usize| w(idx[k]);
+        // The term is a SPAN of up to three words, because a hyphenated one splits (`amd-vi` is
+        // `amd vi`): (first, last) indices into `idx`.
+        let span = if m >= 3 && m <= 5 && ww(0) == b"what" && any(ww(1), &["is", "s", "are"]) { Some((2, m - 1)) }
+            else if m >= 2 && m <= 4 && any(ww(0), &["whats", "define", "explain"]) { Some((1, m - 1)) }
+            else if m >= 4 && m <= 7 && ww(0) == b"what" && ww(1) == b"does" {
+                (3..m).find(|&k| any(ww(k), &["mean", "stand"])).map(|k| (2, k - 1))
+            } else { None };
+        if let Some((f0, f1)) = span {
+            let ours = (f0..=f1).any(|k| { let x = ww(k);
+                any(x, HEALTH_WORDS) || any(x, FAILED_WORDS) || any(x, SYSTEM_WORDS) || any(x, QUESTION_WORDS) });
+            if f1 >= f0 && !ours {
+                let at = ws[idx[f0]].0;
+                return Reading::Define { at, len: ws[idx[f1]].1 - at };
+            }
+        }
     }
 
     // WHAT CAN BE ASKED - "what to say?", "what can I ask?", "what questions?", "help" - before anything
@@ -1086,11 +1114,109 @@ fn egg(e: Egg, f: &Facts, a: &mut Answer) -> &'static str {
     }
 }
 
+/// Where the glossary is published, for "read more". The machine may be offline, so the definition comes
+/// first and this is an extra.
+pub const GLOSSARY_URL: &str = "https://godspeedhq.github.io/godspeed-os/glossary.html";
+
+/// A term reduced for comparison: ASCII letters and digits, lower case (`AMD-Vi` is `amdvi`).
+fn squash(t: &[u8], out: &mut [u8; 32]) -> usize {
+    let mut n = 0usize;
+    for &c in t {
+        if c.is_ascii_alphanumeric() && n < out.len() { out[n] = c.to_ascii_lowercase(); n += 1; }
+    }
+    n
+}
+
+/// Edit distance, bounded: anything over 2 is reported as 3. Enough to read `immou` as `iommu`.
+fn near(a: &[u8], b: &[u8]) -> usize {
+    if a.len().abs_diff(b.len()) > 2 { return 3; }
+    let mut prev = [0usize; 33];
+    let mut cur = [0usize; 33];
+    for j in 0..=b.len() { prev[j] = j; }
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()].min(3)
+}
+
+/// "What is X?" from the glossary - `GLOSSARY.md`, read at build time, the only source. An exact match
+/// is answered; a near one (one or two letters off, from four letters up) is answered and SAID to be a
+/// reading; two equally near is a question back; nothing near is "not in the glossary", never a guess.
+pub fn define(term: &[u8], glossary: &[(&str, &str, &str)], a: &mut Answer) {
+    let mut t = [0u8; 32];
+    let tn = squash(term, &mut t);
+    let shown = core::str::from_utf8(term).unwrap_or("?");
+    let mut exact = None;
+    let mut best: Option<(usize, usize)> = None; // (index, distance)
+    let mut tie = false;
+    for (i, (abbr, _, _)) in glossary.iter().enumerate() {
+        let mut g = [0u8; 32];
+        let gn = squash(abbr.as_bytes(), &mut g);
+        if gn == 0 { continue; }
+        if t[..tn] == g[..gn] { exact = Some(i); break; }
+        if tn >= 4 {
+            let d = near(&t[..tn], &g[..gn]);
+            if d <= 2 {
+                match best {
+                    Some((_, bd)) if d > bd => {}
+                    Some((_, bd)) if d == bd => tie = true,
+                    _ => { best = Some((i, d)); tie = false; }
+                }
+            }
+        }
+    }
+    let pick = match (exact, best) {
+        (Some(i), _) => Some(i),
+        (None, Some((i, _))) if !tie => {
+            a.note(format_args!("I read `{}` as {} - one or two letters off", shown, glossary[i].0));
+            Some(i)
+        }
+        _ => None,
+    };
+    match pick {
+        Some(i) => {
+            let (abbr, exp, meaning) = glossary[i];
+            let at = a.n;
+            a.verdict(format_args!("{}: {}", abbr, exp));
+            // The verdict leads even when a "read as" note was said first.
+            if at > 0 { a.lines[..=at].rotate_right(1); }
+            // The meaning, wrapped at word boundaries to the line size.
+            let mb = meaning.as_bytes();
+            let mut start = 0usize;
+            while start < mb.len() {
+                let mut end = (start + TEXT_MAX - 8).min(mb.len());
+                if end < mb.len() {
+                    if let Some(sp) = mb[start..end].iter().rposition(|&c| c == b' ') { end = start + sp; }
+                }
+                a.fact("glossary", format_args!("{}", core::str::from_utf8(&mb[start..end]).unwrap_or("")));
+                start = end;
+                while start < mb.len() && mb[start] == b' ' { start += 1; }
+            }
+            a.note(format_args!("read more: {}", GLOSSARY_URL));
+        }
+        None if tie => {
+            a.status = Status::Ambiguous;
+            a.note(format_args!("`{}` is close to more than one term in the glossary - spell it out?", shown));
+        }
+        None => {
+            a.verdict(format_args!("NOT IN THE GLOSSARY"));
+            a.note(format_args!("`{}` is not in GLOSSARY.md, and I do not guess a definition", shown));
+            a.note(format_args!("the glossary: {}", GLOSSARY_URL));
+        }
+    }
+    a.finish();
+}
+
 /// What `ask` can answer, for `ask help` and for a question it did not understand.
 pub fn can_answer(a: &mut Answer) {
     a.note(format_args!("I can answer questions about: system health, what failed, the WiFi restarting, the filesystem"));
     a.note(format_args!("and why a service restarted, failed, crashed or stopped - name it, as in: why did fs restart?"));
-    a.note(format_args!("ask \"what to say?\" lists them with suggestions from this machine"));
+    a.note(format_args!("ask \"what to say?\" lists them with suggestions from this machine; ask \"what is MISCIS?\" defines a term"));
 }
 
 /// Answer a reading that is not one question kind.
@@ -1108,7 +1234,7 @@ pub fn refuse(r: Reading, q_first_word: &str, known: &[&str], a: &mut Answer) {
             a.status = Status::Empty;
             can_answer(a);
         }
-        Reading::NotUnderstood | Reading::One(..) => {
+        Reading::NotUnderstood | Reading::One(..) | Reading::Define { .. } => {
             a.status = Status::NotUnderstood;
             a.note(format_args!("I don't understand that question yet."));
             can_answer(a);
@@ -1526,5 +1652,58 @@ mod tests {
         // A mounted filesystem never walks the chain.
         let f4 = Facts { drive: mounted(), ..f3 };
         assert_eq!(verdict(&ask(Kind::Fs, Event::Unnamed, &f4)), b"MOUNTED - NOT VERIFIED");
+    }
+
+    const GLOSS: &[(&str, &str, &str)] = &[
+        ("IOMMU", "Input/Output Memory Management Unit", "Translates every device DMA through a per-device page table."),
+        ("MISCIS", "Memory isolation, IPC, Scheduling, Capabilities, Interrupts, SMP routing", "The kernel's six responsibilities, said like \"misses\"."),
+        ("MMIO", "Memory-Mapped I/O", "Device registers accessed as memory."),
+        ("MSI", "Message-Signaled Interrupt", "PCI interrupt delivery via a memory write."),
+        ("AMD-Vi", "AMD Virtualization (AMD's IOMMU)", "The IOMMU behind H1."),
+    ];
+    fn def(q: &str) -> Answer {
+        let mut a = Answer::new();
+        match rk(q) {
+            Reading::Define { at, len } => define(&q.as_bytes()[at..at + len], GLOSS, &mut a),
+            // Not a definition: an answer whose verdict no assertion expects, so the test fails by saying so.
+            other => a.verdict(format_args!("MISREAD {} AS {:?}", q, other)),
+        }
+        a
+    }
+
+    #[test]
+    fn what_is_a_term() {
+        let a = def("what is miscis?");
+        assert_eq!(verdict(&a), b"MISCIS: Memory isolation, IPC, Scheduling, Capabilities, Interrupts, SMP routing");
+        assert!(a.has(Label::Fact, "six responsibilities"));
+        assert!(a.has(Label::Note, "read more: https://godspeedhq.github.io/godspeed-os/glossary.html"));
+        // Hyphens and case do not matter.
+        assert!(verdict(&def("what does amd-vi mean?")).starts_with(b"AMD-Vi:"));
+        assert!(verdict(&def("define MMIO")).starts_with(b"MMIO:"));
+    }
+
+    #[test]
+    fn a_typo_is_read_and_said_to_be() {
+        let a = def("what is immou?");
+        assert_eq!(&verdict(&a)[..6], b"IOMMU:");
+        assert!(a.has(Label::Note, "I read `immou` as IOMMU"));
+        // A short word is never stretched to a term.
+        let b = def("what is msx?");
+        assert_eq!(verdict(&b), b"NOT IN THE GLOSSARY");
+    }
+
+    #[test]
+    fn a_term_not_in_the_glossary_is_never_guessed() {
+        let a = def("what is quantumflux?");
+        assert_eq!(verdict(&a), b"NOT IN THE GLOSSARY");
+        assert!(a.has(Label::Note, "I do not guess a definition"));
+    }
+
+    #[test]
+    fn definitions_do_not_take_the_real_questions() {
+        assert_eq!(rk("what is wrong?"), Reading::One(Kind::Health, Event::Unnamed));
+        assert_eq!(rk("what is godspeed?"), Reading::One(Kind::Egg(Egg::Who), Event::Unnamed));
+        assert_eq!(rk("what is the meaning of life?"), Reading::One(Kind::Egg(Egg::Meaning), Event::Unnamed));
+        assert_eq!(rk("what failed?"), Reading::One(Kind::Failed, Event::Unnamed));
     }
 }

@@ -40,6 +40,12 @@ A question it does not understand is said to be, with the list above; a question
 names two services, is answered with both and the question "which?"; a request to DO something (`restart
 fs`) is refused - `ask` reads and changes nothing.
 
+**What a term means** (operator, 2026-10-11): `what is MISCIS?`, `what does AMD-Vi mean?`, `define MMIO`.
+Answered from `GLOSSARY.md`, read when `ask` is built, so there is one copy of every definition. A term one
+or two letters off is answered and the answer says how it was read (`I read 'immou' as IOMMU`); a term the
+glossary does not have is "not in the glossary", never a guess. Each ends with the published glossary's
+address. A question word is never taken for a term: `what is wrong?` is still the health question.
+
 **And a few it was not built to answer, but does** (operator, 2026-10-11): `tell me a joke`, `what is the
 meaning of life?`, `sudo ...`, `rm -rf /`, `are you alive?`, `who are you?` / `what is godspeed?`. Each
 says what it is - a joke's verdict is `A JOKE` - so a script reading verdicts never takes one for an

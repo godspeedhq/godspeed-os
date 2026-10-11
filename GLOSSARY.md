@@ -69,6 +69,7 @@ before inclusion.
 | MADT | Multiple APIC Description Table | The ACPI table that would enumerate cores; *not* parsed in v1 because Limine supplies APIC IDs directly. |
 | MBR | Master Boot Record | BIOS boot sector; `limine bios-install` writes Limine's stage-1 there. |
 | MMIO | Memory-Mapped I/O | Device registers accessed as memory; granted to a driver by an `hw_mmio` capability and used only through the SDK's safe `Mmio` wrappers (section 18.1). |
+| MISCIS | Memory isolation, IPC, Scheduling, Capabilities, Interrupts, SMP routing | The kernel's six responsibilities, said like "misses" (CLAUDE.md 4.3). "Do not expand MISCIS" is the short form of 4.4: a seventh responsibility is a change to what the kernel IS, and `scripts/commandments.py` derives the six from that list. |
 | MSI | Message-Signaled Interrupt | PCI interrupt delivery via a memory write; the current USB drivers use pin-based IRQs, with MSI the basis of the interrupt-driven driver branch. |
 | NIC | Network Interface Controller | The network device in the (design-only) networking stack; an IOMMU-confined e1000 driver for QEMU/Intel (`docs/networking.md`). |
 | PCI | Peripheral Component Interconnect | The device bus enumerated to find controllers (`arch/x86_64/pci.rs`). |
