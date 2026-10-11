@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Enumeration: address the device on the root port, read what it is, and if it is a hub, ask how
 //! many downstream ports it has.
 //!

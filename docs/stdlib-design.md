@@ -101,7 +101,7 @@ syscalls, and the fs/block wire protocols.
 |---|---|---|
 | **Entry + runtime** | `service_main(ctx) -> !`, no `std`, **no heap** (§26.6.1: stack arrays and bounded arenas only) | Solid, but ceremonial: 3 crate attributes, a `#[no_mangle]`, and an `#[allow(unsafe_code)]` with a 7-line comment explaining itself |
 | **Authority** | `ServiceContext` is the single door. The contract declares, the SPAWN REQUEST grants (§13.6) | Excellent. Nothing to fix |
-| **IPC** | `send`/`try_send`/`recv`/`call`/`call_deadline` | Good primitives |
+| **IPC** | `send`/`try_send`/`recv`/`call`/`call_deadline_into` | Good primitives |
 | **Request/reply** | **8** `request_with_reply*` variants, **3** outcome enums | See §3.2. The problem area |
 | **Console** | `console_write`, `console_writeln`, `console_write_fmt`, `console_read` | Clean. A stdlib `io` module is mostly a rename |
 | **Filesystem** | An opcode/byte wire protocol over IPC | See §3.1. The other problem area |
@@ -1036,7 +1036,7 @@ deadline shorter than the worst case it waits on, after the UDP socket and the T
 
 copier had already worked this out for its own hand-rolled version, with a comment worth quoting
 because it names the cost exactly: five seconds "was not nearly enough and said so in the worst
-possible way - by blaming the filesystem". Its `TREE_SECS` is 120, which is the number `SWEEP_SECS`
+possible way - by blaming the filesystem". Its `FS_TREE_SECS` is 120, which is the number `SWEEP_SECS`
 already carried, arrived at independently.
 
 **Three times is a pattern, not bad luck.** The rule belongs where an author will meet it: a deadline
@@ -1720,8 +1720,8 @@ flags, so `gs::cap::READ` at an `fs.open` call site reads correctly and no call 
 > README's rule - free functions, constants, types, the methods on those types, and every re-export -
 > applied to each module's own file, so the crate root's re-exports of `Error` and `ServiceContext` and
 > its `prelude` are not counted a second time. The 13 EXCLUDE `driver`, a 14th public module: its
-> `wait`, `delay` and `irq` are counted separately because `backlog/71` puts that tier outside the
-> first covered surface. The same count on the 2026-09-26 tree gives 151 where 149 was published, so
+> `wait`, `delay` and `irq` are counted separately because `backlog/71` then put that tier outside the
+> first covered surface (since 2026-10-11 it is inside, grow-only). The same count on the 2026-09-26 tree gives 151 where 149 was published, so
 > two of the gap are method; the other 13 are the surface growing (`call::request_once`,
 > `task::sleep_quantum`/`sleep_us`/`sleep_ticks`, `ipc::reply`, `ipc::recv_within_ms`, the five-call
 > `ipc::exact` module and its two error-type re-exports, `IpcError` and `CapError`).

@@ -35,16 +35,15 @@ pub fn sleep_ms(ctx: &ServiceContext, ms: u64) {
 /// Sleep for one scheduler quantum, parked: the shortest sleep there is.
 ///
 /// Not [`yield_now`]. A yield returns at once when nothing else is runnable, so a loop built on it
-/// spins a core; this parks the task until the next tick (CLAUDE.md 9.1) - on every machine but a
-/// real Pi 2, where it currently sleeps about a microsecond (see the note in the body). For a
-/// loop that has nothing to wait on but must not hammer the CPU between looks.
+/// spins a core; this parks the task for one quantum, 10 ms (CLAUDE.md 9.1). For a loop that has
+/// nothing to wait on but must not hammer the CPU between looks.
 pub fn sleep_quantum(ctx: &ServiceContext) {
-    // One counter tick, which the kernel floors to the next scheduler tick: one quantum, calibrated or
-    // not - EXCEPT on a real Pi 2 (known defect, 2026-10-09). Its counter runs at 1 MHz, so one tick
-    // converts to 1 us, which the ARMv7 sub-tick sleep path (`handle_sleep`) takes, and this returns
-    // after about a microsecond instead of a quantum. (QEMU's raspi2b counter is 62.5 MHz, where one
-    // tick rounds to 0 us and the tick path is taken.)
-    ctx.sleep(1);
+    // A quantum AS A DURATION, not one counter tick. One tick was right where the kernel floors a
+    // short sleep to the next scheduler tick, and wrong on a real Pi 2: its counter runs at 1 MHz, so
+    // one tick is 1 us, which the ARMv7 sub-tick sleep path (`handle_sleep`) takes, and this returned
+    // after about a microsecond (`backlog/80` G4). On a clock the kernel could not calibrate,
+    // `sleep_ms` falls back to that one tick - the floor, which is still one quantum there.
+    ctx.sleep_ms(10);
 }
 
 /// Sleep for `us` microseconds, at the kernel's resolution.

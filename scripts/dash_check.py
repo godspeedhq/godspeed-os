@@ -13,6 +13,7 @@ not valid UTF-8 is skipped silently. Commit messages are not checked.
 Exit: 0 if no em/en dash is present in those files, 1 otherwise.
 """
 
+from __future__ import annotations  # signatures use list[...] (3.9); this keeps the 3.8 floor true
 import os
 import subprocess
 import sys

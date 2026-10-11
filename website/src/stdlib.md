@@ -90,7 +90,8 @@ supervisor's spawn table (`IMAGES` in `services/supervisor/src/main.rs`) - for t
 looks authorised on paper and is not (CLAUDE.md 13.6). For services, `scripts/contract_check.py`
 reconciles the two.
 
-`examples/stdlib-hello` is this same program, complete and buildable.
+`examples/stdlib-hello` is the complete, buildable version of this, a step further: it writes a file
+larger than one IPC message and reads it back, and `osdev test examples` checks every byte.
 
 ## The one thing to get right
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! USB mass storage: find the Bulk-Only interface and its two bulk endpoints.
 //!
 //! Slice 3, first part (`docs/arm32-usb-userspace.md`). Same shape as the keyboard binding, and for

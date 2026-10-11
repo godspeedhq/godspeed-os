@@ -12,7 +12,7 @@ observing it pass.
 | 2 | `release.yml` verified 7 of 8 stamp characters | `161930ca` |
 | 3 | `arch_boundary_check.py` blind to two arches | `8aa2e5ed` - list derived from `kernel/src/arch/`, not restated |
 | 4 | `riscv_build.py` ran none of three guards | `442285a6` - two of the three were WRONG for this port; see below |
-| 5 | Dead `if` + its `unsafe` MPIDR read on every ARM tick | `3d43b27a` - `arm/mod.rs` 53 -> 52 unsafe lines |
+| 5 | Dead `if` + its `unsafe` MPIDR read on every ARM tick | `3d43b27a` - `kernel/src/arch/arm/mod.rs` 53 -> 52 unsafe lines |
 | 6 | riscv64 spawned `xhci` after `block-driver` | `db3b800b` - **CONFIRMED ON THE VISIONFIVE 2026-09-13** at `7fa2e2e2`: `xhci` spawns before `block-driver`, no reacquire failure |
 
 **What the work actually found, beyond the six.** Three of the fixes turned out to be shallower than

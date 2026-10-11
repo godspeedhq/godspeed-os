@@ -352,8 +352,9 @@ impl PageTable {
             // can read and write a frame that now belongs to another address space - a use-after-free
             // the MMU actively enables, and one no fault reports.
             //
-            // x86 does not need this HERE because its neutral kill path issues a shootdown, and that is
-            // exactly why the omission survives review: the primitive looks complete against the arch
+            // x86's `unmap` does no invalidate at all - only selftests call it, and the kill path frees
+            // whole dead address spaces after every core has switched away - and that is exactly why
+            // the omission survives review here: the primitive looks complete against the arch
             // whose semantics were in mind when it was written. `arch/CLAUDE.md` (SEC-26/27) says a
             // primitive owes its SEMANTIC and not just its signature; this is that debt.
             //
@@ -508,6 +509,28 @@ pub unsafe fn translate_diag(root: u64, virt: u64) -> Option<u64> {
     }
 }
 
+/// Has a granted-page skip been reported? Said once: skipping is the CORRECT outcome for every driver
+/// death, so it is a fact worth stating rather than an event worth repeating (26.7).
+static RECLAIM_GRANTED_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// AttrIndx, descriptor bits [4:2]: which MAIR slot - and so which memory type - a leaf maps.
+const ATTR_MASK: u64 = 0b111 << 2;
+
+/// Free every leaf page a dead task mapped, returning how many. Only SERVICE RAM is freed: a leaf whose
+/// memory type is anything but Normal write-back cacheable (`ATTR_NORMAL`) was GRANTED to the task -
+/// a device window or a DMA arena (`ATTR_DEVICE`; the arena is uncached on this port, `DMA_ARENA_UNCACHED`)
+/// or the framebuffer (`ATTR_NORMAL_NC`) - and is not an allocator frame of the task's own.
+///
+/// **An allowlist, as on arm32 and x86.** This walk used to free every valid leaf, so each `nic-driver`
+/// or `xhci` death handed the GENET window (0xFD58_0000) and the xHCI BAR (0x6_0000_0000) to
+/// `free_frame` as if they were RAM - 17,813 `IGNORED phantom frame` lines in one 1000-round Pi 4 chaos
+/// run (`audits/kernel-audit.md` A10-8). The allocator's range check refused them, but only because
+/// those windows sit above the top of RAM on the board under test. Where RAM reaches past a device
+/// window, the page would have entered the free pool and been handed to a later task as memory - the
+/// same luck arm32 had with the EMMC block until Audit 8's A8-2. The framebuffer and DMA arenas are also
+/// reservations the allocator refuses (`reserve_no_free`, `alloc_dma_arena`), so skipping them changes
+/// nothing they did; the device windows had no such reservation and now need none. Keying on the type
+/// allowed rather than the types refused means a new memory type is skipped by default: freeing a page
+/// takes deliberately mapping it as cacheable service RAM.
 pub unsafe fn reclaim_pages(root: u64) -> usize {
     let mut freed = 0usize;
     // SAFETY: caller's contract; tables reached through the kernel's direct map.
@@ -524,6 +547,14 @@ pub unsafe fn reclaim_pages(root: u64) -> usize {
                     let l3e = get(l3, k);
                     if l3e & DESC_VALID == 0 { continue; }
                     set(l3, k, 0);
+                    if l3e & ATTR_MASK != ATTR_NORMAL {
+                        if !RECLAIM_GRANTED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                            crate::kprintln!(
+                                "reclaim: skipped granted page pa={:#x} attr {} (not allocator RAM; further skips silent)",
+                                l3e & ADDR_MASK, (l3e & ATTR_MASK) >> 2);
+                        }
+                        continue;
+                    }
                     free_frame(Frame::from_phys(PhysAddr(l3e & ADDR_MASK)));
                     freed += 1;
                 }

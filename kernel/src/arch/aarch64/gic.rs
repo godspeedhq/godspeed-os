@@ -34,14 +34,15 @@ const GICD_ITARGETSR: *mut u8 = (GICD + 0x800) as *mut u8; // 1 byte per interru
 const GICD_SGIR: *mut u32 = (GICD + 0xF00) as *mut u32;
 
 /// The SGI IDs this kernel uses. IDs 0..15 are the only ones a core may send to another core, so the
-/// neutral layer's x86-style vector numbers (0xF0, 0xF1, 0xF2) have to be mapped into that range
+/// neutral layer's x86-style vector numbers (0xF0, 0xF2) have to be mapped into that range
 /// rather than sent as-is - a vector of 0xF0 written into a 4-bit field is 0, which is a different
 /// interrupt entirely and would silently deliver the wrong thing.
 pub const SGI_WAKE: u32 = 0;
-pub const SGI_TLB: u32 = 1;
+// SGI 1 was the TLB shootdown's id, deleted with the shootdown (`backlog/80` K20). Left unused rather
+// than renumbering SGI_TICK.
 pub const SGI_TICK: u32 = 2;
 
-/// Send a Software Generated Interrupt to one core, or to every core but this one.
+/// Send a Software Generated Interrupt to one core.
 ///
 /// This is the AArch64 equivalent of the x86 IPI the neutral scheduler already depends on, and its
 /// absence is not a missing optimisation: a task blocking on one core is woken by another core sending
@@ -51,8 +52,6 @@ pub const SGI_TICK: u32 = 2;
 pub fn send_sgi(target: SgiTarget, id: u32) {
     let word = match target {
         SgiTarget::Core(c) => ((1u32 << (c & 0x7)) << 16) | (id & 0xF),
-        // Filter 0b01 = "every core except the one sending", so no target list is needed.
-        SgiTarget::AllButSelf => (0b01 << 24) | (id & 0xF),
     };
     // SAFETY: the distributor's SGI register, Device-mapped. Writing it raises an interrupt on the
     // targeted cores and does nothing else.
@@ -64,7 +63,6 @@ pub fn send_sgi(target: SgiTarget, id: u32) {
 
 pub enum SgiTarget {
     Core(u32),
-    AllButSelf,
 }
 
 // CPU interface registers.
@@ -152,13 +150,24 @@ pub fn disable(id: u32) {
 /// interface tracks an active priority per acknowledged interrupt, and skipping the EOI leaves that
 /// priority active forever, silently blocking every later interrupt of equal or lower priority. That
 /// failure looks like "interrupts stopped happening" with nothing to point at.
+///
+/// Returns the RAW `GICC_IAR` value, not just the interrupt ID (backlog/80 K22). For a Software
+/// Generated Interrupt, bits [12:10] carry the CPUID of the core that raised it, and the GICv2
+/// architecture requires the EOIR write to carry the same value IAR returned - an SGI from core 2
+/// EOI'd with bare ID 0 names a different (source, ID) pair than the one that is active. So the
+/// value goes back to [`eoi`] whole, and [`irq_id`] is how a handler reads the ID out of it. For
+/// every other interrupt those bits are zero and the two values are the same.
 pub fn acknowledge() -> u32 {
     // SAFETY: GICC_IAR is a Device-mapped read with the architectural side effect of acknowledging.
-    unsafe { GICC_IAR.read_volatile() & 0x3FF }
+    unsafe { GICC_IAR.read_volatile() }
 }
 
-/// Signal end-of-interrupt for an ID previously returned by [`acknowledge`].
-pub fn eoi(id: u32) {
-    // SAFETY: GICC_EOIR is Device-mapped; writing an acknowledged ID retires it.
-    unsafe { GICC_EOIR.write_volatile(id) };
+/// The interrupt ID inside a value [`acknowledge`] returned: bits [9:0].
+pub fn irq_id(iar: u32) -> u32 { iar & 0x3FF }
+
+/// Signal end-of-interrupt for a value previously returned by [`acknowledge`] - the raw IAR value,
+/// source CPUID and all, never the bare ID.
+pub fn eoi(iar: u32) {
+    // SAFETY: GICC_EOIR is Device-mapped; writing an acknowledged IAR value retires it.
+    unsafe { GICC_EOIR.write_volatile(iar) };
 }

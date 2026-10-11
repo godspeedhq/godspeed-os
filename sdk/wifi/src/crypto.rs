@@ -144,14 +144,25 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; SHA1_LEN] {
     s.finish()
 }
 
+/// The longest salt [`pbkdf2_sha1`] takes: one 64-byte block less the 4-byte block index. An SSID is
+/// at most 32 bytes, so a PSK's salt always fits.
+pub const PBKDF2_SALT_MAX: usize = 60;
+
 /// PBKDF2-HMAC-SHA1 (RFC 8018 §5.2) into `out`, whatever its length.
-pub fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+///
+/// Returns `false`, and leaves `out` untouched, for a salt longer than [`PBKDF2_SALT_MAX`]: it was cut
+/// to fit, silently, until 2026-10-10, deriving a key for a different salt (`backlog/80` S8).
+#[must_use = "false means no key was derived"]
+pub fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) -> bool {
+    if salt.len() > PBKDF2_SALT_MAX {
+        return false;
+    }
     let mut block_index: u32 = 1;
     let mut at = 0;
     while at < out.len() {
         // U1 = PRF(P, S || INT(i)); Uj = PRF(P, Uj-1); T = U1 ^ ... ^ Uc.
         let mut salted = [0u8; 64];
-        let n = core::cmp::min(salt.len(), salted.len() - 4);
+        let n = salt.len();
         salted[..n].copy_from_slice(&salt[..n]);
         salted[n..n + 4].copy_from_slice(&block_index.to_be_bytes());
         let mut u = hmac_sha1(password, &salted[..n + 4]);
@@ -167,27 +178,32 @@ pub fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]
         at += take;
         block_index += 1;
     }
+    true
 }
 
 /// The pairwise master key from a passphrase and the network name it is for. IEEE 802.11-2020 §12.7.1.2:
 /// `PSK = PBKDF2(PassPhrase, ssid, ssidLength, 4096, 256)`.
 pub fn psk(passphrase: &[u8], ssid: &[u8]) -> [u8; PMK_LEN] {
     let mut pmk = [0u8; PMK_LEN];
-    pbkdf2_sha1(passphrase, ssid, PSK_ITERATIONS, &mut pmk);
+    // An SSID is at most 32 bytes (IEEE 802.11-2020 9.4.2.2), well inside the salt limit, so this
+    // cannot be refused for a real network; a name that long is not one, and is said so.
+    assert!(pbkdf2_sha1(passphrase, ssid, PSK_ITERATIONS, &mut pmk), "an SSID longer than 60 bytes");
     pmk
 }
 
 /// The 802.11 PRF (IEEE 802.11-2020 §12.7.1.2, `ieee80211_prf`): `HMAC-SHA1(key, label || context || i)`
 /// for i = 0, 1, ... until `out` is full. `label` is passed WITH its terminating NUL, as OpenBSD passes it
 /// (`"Pairwise key expansion", 23 /* PRF uses \0 */`) - the NUL is part of the input, not a C artefact.
-pub fn prf_sha1(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
+///
+/// Returns `false`, and leaves `out` untouched, when `label` and `context` together exceed its 159-byte
+/// input: the PTK's are 23 and 76, so that is a caller error. It zero-filled `out` and returned until
+/// 2026-10-10 - a key of zeroes, which looks like a key (`backlog/80` S8).
+#[must_use = "false means no key was derived"]
+pub fn prf_sha1(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) -> bool {
     let mut msg = [0u8; 160];
     let n = label.len() + context.len() + 1;
     if n > msg.len() {
-        // The PTK context is 76 bytes and the label 23; anything larger is a caller error, and a PRF that
-        // silently truncated its input would derive a key that fails everywhere downstream.
-        out.fill(0);
-        return;
+        return false;
     }
     msg[..label.len()].copy_from_slice(label);
     msg[label.len()..label.len() + context.len()].copy_from_slice(context);
@@ -201,6 +217,7 @@ pub fn prf_sha1(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
         at += take;
         count = count.wrapping_add(1);
     }
+    true
 }
 
 /// AES-128, FIPS 197. Both directions: the key-data unwrap in message 3 of the handshake is the INVERSE
@@ -440,7 +457,7 @@ pub fn selftest(ctx: &ServiceContext, who: &str) -> bool {
 
     // RFC 6070 test case 1: P "password", S "salt", c 1, dkLen 20.
     let mut dk = [0u8; 20];
-    pbkdf2_sha1(b"password", b"salt", 1, &mut dk);
+    assert!(pbkdf2_sha1(b"password", b"salt", 1, &mut dk));
     check(
         "PBKDF2-SHA1 (RFC 6070 case 1)",
         &dk,

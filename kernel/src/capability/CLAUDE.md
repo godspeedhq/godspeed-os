@@ -11,7 +11,6 @@ The capability system (§7). Unsafe boundary: the global resource table uses a r
 | `rights.rs`      | `Rights` bitfield: READ, WRITE, SEND, RECV, GRANT, REVOKE |
 | `generation.rs`  | `Generation` monotonic counter; `bump()` |
 | `table.rs`       | `CapTable` (per-task, 64 slots), `GlobalResourceTable` (kernel-wide) |
-| `revoke.rs`      | `revoke(resource_id)`: bumps generation, lazily invalidates all outstanding caps |
 | `delegated.rs`   | The delegated-resource band (§7.10, file-as-capability): allocate, owner lookup, revoke, release on owner death |
 | `mod.rs`         | Also the well-known kernel resource ids (`LOG_WRITE_RESOURCE` 1 ... `CPU_CLOCK_RESOURCE` 18) |
 

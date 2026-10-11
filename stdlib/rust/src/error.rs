@@ -56,6 +56,10 @@ pub enum Error {
     Unavailable,
     /// The disk holds a foreign partition table. Refused deliberately rather than overwritten.
     Foreign,
+    /// The file is there, and a block of it failed its checksum or could not be read: it is DAMAGED,
+    /// not missing. `drives scrub` names every such block. `fs` answered this as "not found" until
+    /// 2026-10-10 (`backlog/80` V2).
+    Damaged,
     /// The service tried and failed, and said so. A real failure with a real answer behind it.
     Failed,
 
@@ -148,7 +152,7 @@ impl Error {
     pub fn service_answered(self) -> bool {
         matches!(self,
             Error::NotFound | Error::PermissionDenied | Error::NoFilesystem
-            | Error::Unavailable | Error::Foreign | Error::Failed)
+            | Error::Unavailable | Error::Foreign | Error::Damaged | Error::Failed)
     }
 
     /// A short, stable, human-readable phrase. Present tense, no trailing punctuation, no leading
@@ -160,6 +164,7 @@ impl Error {
             Error::NoFilesystem     => "no filesystem on this volume",
             Error::Unavailable      => "storage unavailable",
             Error::Foreign          => "the disk holds a foreign partition table",
+            Error::Damaged          => "the file is damaged - a block failed its checksum (it is not missing)",
             Error::Failed           => "the operation failed",
             Error::Unreachable      => "the service could not be reached (nothing happened)",
             Error::Busy             => "the service is busy (nothing happened)",
@@ -189,6 +194,7 @@ pub(crate) fn from_fs_status(status: u8) -> Result<(), Error> {
         4 => Err(Error::Unavailable),         // FS_UNAVAIL
         5 => Err(Error::PermissionDenied),    // FS_DENIED
         6 => Err(Error::Foreign),             // FS_FOREIGN
+        7 => Err(Error::Damaged),             // FS_DAMAGED
         _ => Err(Error::Malformed),
     }
 }
@@ -210,7 +216,7 @@ mod tests {
 
         // A service that answered told us what happened; there is nothing to retry into.
         for e in [Error::NotFound, Error::PermissionDenied, Error::Failed,
-                  Error::NoFilesystem, Error::Unavailable, Error::Foreign] {
+                  Error::NoFilesystem, Error::Unavailable, Error::Foreign, Error::Damaged] {
             assert!(!e.retry_is_safe(), "{e:?} is an answer, not a lost request");
         }
     }
@@ -226,8 +232,9 @@ mod tests {
         assert_eq!(from_fs_status(4), Err(Error::Unavailable));
         assert_eq!(from_fs_status(5), Err(Error::PermissionDenied));
         assert_eq!(from_fs_status(6), Err(Error::Foreign));
+        assert_eq!(from_fs_status(7), Err(Error::Damaged));
         // A byte outside the protocol is a malformed reply, NOT a success and NOT a guess.
-        assert_eq!(from_fs_status(7),   Err(Error::Malformed));
+        assert_eq!(from_fs_status(8),   Err(Error::Malformed));
         assert_eq!(from_fs_status(255), Err(Error::Malformed));
     }
 

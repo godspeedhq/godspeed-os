@@ -230,10 +230,8 @@ pub fn init() -> bool {
     // controller first read better; that is a reason about the LOG, not about the hardware.
     let syscon = SYSCON_BASE.load(Ordering::Relaxed);
     if syscon == 0 {
-        super::print_str("riscv64: net - no sys-syscon in the device tree, so the interface mode
-");
-        super::print_str("riscv64: net - cannot be selected; the MAC is offered but frames may not move
-");
+        super::print_str("riscv64: net - no sys-syscon in the device tree, so the interface mode\n");
+        super::print_str("riscv64: net - cannot be selected; the MAC is offered but frames may not move\n");
     } else {
         let v = mmio_read(syscon, SYSCON_PHY_INTF);
         let want = (v & !(SYSCON_PHY_INTF_MASK << SYSCON_PHY_INTF_SHIFT))
@@ -246,11 +244,9 @@ pub fn init() -> bool {
         super::print_str("riscv64: net - interface select = ");
         super::print_dec(got as u64);
         if got == PHY_INTF_SEL_RGMII {
-            super::print_str(" (RGMII, as asked)
-");
+            super::print_str(" (RGMII, as asked)\n");
         } else {
-            super::print_str(" but RGMII is 1 - the field did NOT take; frames will not move
-");
+            super::print_str(" but RGMII is 1 - the field did NOT take; frames will not move\n");
         }
     }
 
@@ -305,7 +301,6 @@ pub fn init() -> bool {
         MAC_BASE.store(0, Ordering::Relaxed);
         return false;
     }
-    super::print_str("riscv64: net - controller alive; the window is offered to the driver
-");
+    super::print_str("riscv64: net - controller alive; the window is offered to the driver\n");
     true
 }

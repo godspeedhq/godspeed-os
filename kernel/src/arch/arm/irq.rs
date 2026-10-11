@@ -44,28 +44,13 @@ const GPU_INT_ROUTING: usize = LOCAL_BASE + 0x0C;
 /// `CORE_IRQ_SOURCE` bit 8: a GPU (legacy-controller peripheral) interrupt is pending on this core.
 const CORE_IRQ_GPU: u32 = 1 << 8;
 
-/// Route the DWC2 USB interrupt to core 0 and enable it in the legacy controller.
-///
-/// Two hops, because the Pi 2 has two interrupt controllers (see the module header): the legacy
-/// controller must be told to raise line 9 at all, and the core-local block must be told which core the
-/// resulting GPU funnel lands on. Core 0 takes the GPU funnel, so both point there. The USB
-/// interrupt is level-triggered - it stays asserted until its underlying condition is cleared (an HPRT
-/// change bit, or a channel's HCINT) - so whoever services it MUST clear what it services or the line
-/// re-fires forever. (The `dwc2::init` HAINTMSK gating this cited went with the in-kernel driver; the
-/// `dwc2` service clears the condition and then unmasks through `IrqUnmask`.)
-pub fn route_usb_irq_to_core0() {
-    // GPU IRQ -> core 0 (leave FIQ routing at core 0 too; we do not use USB FIQ).
-    local_write(GPU_INT_ROUTING, 0);
-    // Enable peripheral line 9 (USB) in the legacy controller's bank-1 enable register.
-    // SAFETY: the legacy IC is in the Device-mapped peripheral window; a volatile write that sets one
-    // enable bit. Writing 1s enables; 0s are ignored (the register is not read-modify-write).
-    unsafe { (IC_ENABLE_IRQS_1 as *mut u32).write_volatile(1 << USB_IRQ_LINE); }
-    // NOTE: this whole function has NO CALLERS. USB is enabled through `unmask_usb_irq` from the
-    // IrqUnmask syscall instead, and the GPU funnel reaches core 0 by the routing register's reset
-    // default rather than by the write above. Discovered while wiring the system timer, whose enable
-    // was put here and therefore never ran. Left in place because it documents the intended routing,
-    // but nothing may be added here expecting it to execute.
-}
+// How the DWC2 USB interrupt reaches core 0: two hops, because the Pi 2 has two interrupt controllers
+// (see the module header). The legacy controller raises line 9 only once it is enabled there - which
+// `unmask_usb_irq` does, from the `IrqUnmask` syscall - and the GPU funnel it rides lands on core 0 by
+// the core-local routing register's RESET DEFAULT. The line is level-triggered: it stays asserted until
+// the `dwc2` service clears the underlying HPRT change bit or channel HCINT, which it does before it
+// unmasks. (A function that wrote both hops explicitly sat here with no callers, and the system timer's
+// enable was once put in it and so never ran; it was deleted 2026-10-10, `backlog/80` K25.)
 
 /// The NEUTRAL vector a userspace USB driver is granted for this controller.
 ///
@@ -693,8 +678,8 @@ pub fn start_tick(hz: u32) -> bool {
         super::tx_ring_enable();
     }
     // And the system timer's compare-3 line, which carries the microsecond one-shot through the GPU
-    // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in
-    // `route_usb_irq_to_core0`, which turns out to have no callers, so it silently never happened and
+    // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in a
+    // USB routing function that turned out to have no callers, so it silently never happened and
     // every sub-tick sleep quietly fell back to the 10 ms tick.
     // SAFETY: volatile write of one enable bit to the Device-mapped legacy IC; 0s are ignored, so
     // other lines are undisturbed.
@@ -721,13 +706,12 @@ pub fn start_tick_ap(_core: u32) -> bool {
     // Enabled here, beside the timer routing, because both answer "what may interrupt this core" and
     // splitting them is how one of them ends up forgotten.
     local_write(CORE_MBOX_IRQCNTL + 4 * this_core(), 1);
-    // From here the tick can drain the console ring, so writers may stop blocking on the UART.
-    if this_core() == 0 {
-        super::tx_ring_enable();
-    }
+    // (A `tx_ring_enable` for core 0 sat here, unreachable: this is the SECONDARY path, and a released
+    // core claiming id 0 is parked before it gets here as already-ready. Core 0 enables the ring in
+    // `start_tick`. Removed 2026-10-10, `backlog/80` K25.)
     // And the system timer's compare-3 line, which carries the microsecond one-shot through the GPU
-    // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in
-    // `route_usb_irq_to_core0`, which turns out to have no callers, so it silently never happened and
+    // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in a
+    // USB routing function that turned out to have no callers, so it silently never happened and
     // every sub-tick sleep quietly fell back to the 10 ms tick.
     // SAFETY: volatile write of one enable bit to the Device-mapped legacy IC; 0s are ignored, so
     // other lines are undisturbed.

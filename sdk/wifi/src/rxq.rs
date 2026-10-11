@@ -18,11 +18,13 @@ pub struct RxQueue {
     /// (`wifi debug stats` does not read them).
     pub queued: u32,
     pub handed: u32,
+    /// Frames dropped because the buffer they were asked into could not hold them.
+    pub too_big: u32,
 }
 
 impl RxQueue {
     pub fn new() -> Self {
-        RxQueue { slots: [[0; FRAME_MAX]; RX_SLOTS], lens: [0; RX_SLOTS], head: 0, count: 0, queued: 0, handed: 0 }
+        RxQueue { slots: [[0; FRAME_MAX]; RX_SLOTS], lens: [0; RX_SLOTS], head: 0, count: 0, queued: 0, handed: 0, too_big: 0 }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -52,13 +54,20 @@ impl RxQueue {
         true
     }
 
-    /// The oldest frame, copied into `out`; 0 when nothing is queued or `out` cannot hold it.
+    /// The oldest frame, copied into `out`; 0 when nothing is queued.
+    ///
+    /// A head frame `out` cannot hold is DROPPED and counted in [`RxQueue::too_big`], and 0 returned:
+    /// it used to stay at the head, so every later call returned 0 and the queue never moved again
+    /// (`backlog/80` S8).
     pub fn pop(&mut self, out: &mut [u8]) -> usize {
         if self.count == 0 {
             return 0;
         }
         let n = self.lens[self.head] as usize;
         if n > out.len() {
+            self.head = (self.head + 1) % RX_SLOTS;
+            self.count -= 1;
+            self.too_big = self.too_big.wrapping_add(1);
             return 0;
         }
         out[..n].copy_from_slice(&self.slots[self.head][..n]);

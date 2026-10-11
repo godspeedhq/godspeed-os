@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! An abstract model of a filesystem, written from the SPEC and knowing nothing about GSFS.
 //!
 //! **THE ONE RULE THAT MAKES THIS WORTH BUILDING** (`docs/gsfs-carnage.md` §3.2): this must not

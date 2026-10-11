@@ -310,11 +310,11 @@ os/
         aarch64/           #   complete - Raspberry Pi 4 (hardware-verified)
         riscv64/           #   complete - QEMU virt + StarFive VisionFive 2 Lite (hardware-verified)
         riscv32/  loongarch64/  s390x/    #   stubs: boot + UART only
-      memory/              # frame.rs, page.rs, allocator.rs, ownership.rs
-      task/                # task.rs, state.rs, scheduler.rs (per-core)
-      ipc/                 # message.rs, endpoint.rs, queue.rs, routing.rs
-      capability/          # cap.rs, table.rs, rights.rs, generation.rs, revoke.rs
-      smp/                 # core.rs, ipi.rs, placement.rs
+      memory/              # frame.rs, page.rs, allocator.rs, bitmap.rs
+      task/                # mod.rs, state.rs, scheduler.rs (per-core)
+      ipc/                 # message.rs, endpoint.rs, queue.rs, routing.rs, names.rs
+      capability/          # cap.rs, table.rs, rights.rs, generation.rs, delegated.rs
+      smp/                 # core.rs, ipi.rs, percpu.rs, spinlock.rs, names.rs
       syscall/dispatch.rs
       interrupt/route.rs
       invariants/assertions.rs
@@ -381,7 +381,7 @@ os/
                          #   a NEW crate starts at zero. Counts only methods with a `gs` replacement, which
                          #   it names; a gap in `gs` is closed in `gs` (backlog/71, 2026-10-05)
     port_scope_check.py  #   ...and the one the other four cannot answer: did the port EDIT anything
-                         #   outside `arch/<isa>/` and the eleven files `docs/porting.md` marks `+`.
+                         #   outside `arch/<isa>/` and the twelve files `docs/porting.md` marks `+`.
                          #   They all ask whether a RULE was broken; an ordinary edit to a neutral
                          #   kernel file breaks none of them, so five ran green over exactly that
     dash_check.py        #   no em/en dashes anywhere (§21)
@@ -1317,6 +1317,55 @@ A protection violation is **unrecoverable**. The service is in undefined state a
 
 When a page is unmapped (service killed, memory reclaimed), the kernel issues a TLB shootdown via IPI to every core. Operations resume only after acknowledgment from all cores. v1 minimizes unmap frequency by reclaiming memory only at service death.
 
+> **Amendment 2026-10-10 (backlog/80 K20): this section names the guarantee, not a mechanism, and the
+> mechanism it named had not run for some time.** The paragraph above says the kernel "issues a TLB
+> shootdown via IPI to every core" and waits for acknowledgments. It does not. The broadcast that did
+> that had no caller, and has been deleted. What the kernel guarantees, and has guaranteed all along, is
+> this:
+>
+> **No core can use a translation into a frame after that frame has been freed.**
+>
+> - **Reclamation waits for quiescence.** A dead task's stack and page tables are not freed until no core
+>   is running it or still leaving it (`core_still_using`, `CORE_LEAVING` in `task/scheduler.rs`). Nothing
+>   is freed while a task can still execute.
+> - **Every switch invalidates on the core that switches.** x86 writes CR3 (no PCID), ARMv7 issues
+>   `TLBIALL` when TTBR0 changes, RISC-V issues `sfence.vma` after writing `satp`, and AArch64 flushes on
+>   every switch. A core that ran the dead task has dropped its entries before it stops counting as
+>   "leaving" it.
+> - **Where an idle core keeps a dead root installed, the free invalidates everywhere.** On AArch64 an
+>   idle core keeps the last task's root in TTBR0, and the CPU may walk it speculatively, so
+>   `free_page_table_root` issues an inner-shareable invalidate (`tlbi vmalle1is`) before the root goes back
+>   to the allocator. The other ports switch an idle core to the kernel's own root.
+> - **Nothing changes a mapping under a running task.** User mappings are only added while a task lives;
+>   the kernel-stack guard pages are unmapped on the boot core before any other core starts; the Pi 4
+>   framebuffer remap is boot-only and invalidates inner-shareable anyway.
+> - **No address-space identifier is in use on any port** (no PCID, ASID 0 throughout). A port that adopts
+>   one must not reuse it before the invalidation that makes the reuse safe.
+>
+> **What this does NOT change.** Translation coherence is still a kernel responsibility, under memory
+> isolation and SMP routing (4.3); no responsibility is added or removed, and no guarantee is weakened.
+> Removing the broadcast removed no local invalidation. If a future feature changes a live mapping - a
+> remap, a permission downgrade, an unmap a running task can observe - it brings the cross-core
+> invalidation it needs with it, and is recorded here; until then that machinery would be speculative
+> code (26.2).
+>
+> **Two residuals, recorded rather than closed (26.7).** Both concern speculation only; the kernel makes
+> no access through either window. (a) On every port a task that kills ITSELF still has its root installed
+> while its lower tables are freed (the root itself is deferred, `CORE_PENDING_PML4`). (b) An AArch64 idle
+> core walks a root whose lower tables have been freed, until `free_page_table_root`'s invalidate. Whether
+> wrong-path speculation through a recycled table frame can have a visible effect - setting an accessed
+> bit, or a speculative read of a device register through a garbage descriptor - is not checked. The
+> smallest hardening for both, should it ever be needed, is to switch the core to the kernel root before
+> reclaim.
+>
+> Pinned by P7, which no longer stands in for this property with a generation count. A task stamps a
+> pattern into fresh pages and is killed - from another core on even cycles, by its own fault on odd ones -
+> and a checker given the same addresses, on the same core and on another, must read only the zeroes the
+> kernel hands out (`no_stale_translation_after_death`, 32 cycles). Shown to fail when the checker is broken
+> and when the kill path skips both its wait and its wake. **Its limit, recorded:** a kill path that skips
+> ONLY the wait still passes, because the wake stops the victim before its frames are reused. The
+> per-port proof is recorded in `backlog/80` K20.
+
 ---
 
 ## 11. Bootstrap Sequence
@@ -1992,7 +2041,7 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84 (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/80` K14). A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
 
 > **Amendment 2026-10-08 (the boot record): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
 > `unsafe { raw_syscall(13, 27, ..) }` call site, `boot_record_query`, behind the safe
@@ -2149,7 +2198,7 @@ Property tests assert *universal* claims over randomized inputs. Identity tests 
 | P1  | Random bytes → `CapNotHeld` or `CapInvalid`; never accepted as a cap           | §7.3 (unforgeable)    |
 | P2  | Generation per service is strictly monotonic across its lifetime               | §7.5                  |
 | P3  | Cap rights never widen during transfer                                         | §7.3 (non-escalating) |
-| P4  | ∑ `task_alloc_bytes` ≡ pages mapped, after any sequence of alloc/free          | §10.3                 |
+| P4  | ∑ `current_task_alloc_bytes` ≡ pages mapped, after any sequence of alloc/free          | §10.3                 |
 | P5  | Every live endpoint has exactly one owning task                                | §8.3                  |
 | P6  | Queue head ≤ tail ≤ head + 16; count consistent with both                      | §8.5                  |
 | P7  | After unmap + TLB shootdown, the page is unreadable from every core            | §10.5                 |

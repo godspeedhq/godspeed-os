@@ -92,7 +92,7 @@ Names resolving and numbers matching is not enough - nothing asked whether a doc
 
 ```
 error[GS0407]: a documented invocation does not work
-   --> docs/pipes.md:271
+   --> docs/pipes.md:END+3
     |
     = rule: CLAUDE.md 26.7
     = why: Names resolving and numbers matching is not enough: nothing asked whether a
@@ -104,7 +104,7 @@ error[GS0407]: a documented invocation does not work
 
   doc_command_check.py reported:
   | doc commands: 1 documented invocation(s) the code does not answer
-  |   docs/pipes.md:271
+  |   docs/pipes.md:END+3
   | (5 more lines of explanation, which the frame above covers - `py scripts/doc_command_check.py` for all of it)
 ```
 
@@ -136,7 +136,7 @@ A line number is the fastest-rotting citation in the repository - every edit abo
 
 ```
 error[GS0404]: a `path:line` citation no longer points at what it claims
-   --> docs/pipes.md:271
+   --> docs/pipes.md:END+3
     |
     = rule: CLAUDE.md 26.7
     = why: A line number is the fastest-rotting citation in the repository: every edit above
@@ -150,7 +150,7 @@ error[GS0404]: a `path:line` citation no longer points at what it claims
 
   line_ref_check.py reported:
   | line refs: 1 citation(s) no longer point at what they claim
-  |   docs/pipes.md:271
+  |   docs/pipes.md:END+3
   |       cites services/shell/src/main.rs:12 - nothing within 10 lines matches the citing sentence
   | (4 more lines of explanation, which the frame above covers - `py scripts/line_ref_check.py` for all of it)
 ```
@@ -197,7 +197,7 @@ The shell's vocabulary is fresh - `dir`, `read`, `delete`, `copy`, `match`, `cou
 
 ```
 error[GS0406]: a document shows a POSIX or DOS word being used as a command
-   --> docs/pipes.md:271
+   --> docs/pipes.md:END+3
     |
     = rule: CLAUDE.md Appendix B.4
     = why: The shell's vocabulary is fresh - `dir`, `read`, `delete`, `copy`, `match`,
@@ -210,7 +210,7 @@ error[GS0406]: a document shows a POSIX or DOS word being used as a command
 
   foreign_word_check.py reported:
   | foreign words: 1 example(s) use a word the shell REFUSES
-  |   docs/pipes.md:271
+  |   docs/pipes.md:END+3
   | (5 more lines of explanation, which the frame above covers - `py scripts/foreign_word_check.py` for all of it)
 ```
 
@@ -245,7 +245,7 @@ Commandment V, and the RULE ABOVE THE RULES: nothing above the kernel may halt o
 
 ```
 error[GS0005]: no service may halt the machine
-   --> services/observe/src/main.rs:417
+   --> services/observe/src/main.rs:END+3
     |
     = commandment: V - Thou shalt not assume thy service is special. Only the kernel is
                    special.
@@ -276,7 +276,7 @@ The single highest-value case of the 2026-09-26 sweep. A plausible-looking name 
 
 ```
 error[GS0403]: a Rust comment names something that exists nowhere in the code
-   --> examples/00-hello/src/main.rs:53
+   --> examples/00-hello/src/main.rs:END+2
     |
     = rule: CLAUDE.md 26.7, 26.14
     = why: A comment is read BEFORE any document, because it sits beside the code being
@@ -291,7 +291,7 @@ error[GS0403]: a Rust comment names something that exists nowhere in the code
 
   comment_symbol_check.py reported:
   | comment symbols: 1 name(s) in Rust comments name nothing in the code:
-  |     `reclaim_view_state`  examples/00-hello/src/main.rs:53
+  |     `reclaim_view_state`  examples/00-hello/src/main.rs:END+2
   | (4 more lines of explanation, which the frame above covers - `py scripts/comment_symbol_check.py` for all of it)
 ```
 
@@ -444,7 +444,7 @@ The claim a port depends on: you write `arch/<isa>/` and NOTHING else in the ker
 
 ```
 error[GS0202]: neutral kernel code names an ISA, or contains inline assembly
-   --> kernel/src/ipc/message.rs:154
+   --> kernel/src/ipc/message.rs:END+3
     |
     = commandment: I - CLAUDE.md 4.1
     = why: A port is bounded to `arch/<isa>/`: you write that directory and nothing else in
@@ -457,8 +457,8 @@ error[GS0202]: neutral kernel code names an ISA, or contains inline assembly
 
   arch_boundary_check.py reported:
   | Arch-boundary check - FAILURES (arch-specific code leaked into a neutral kernel layer):
-  |   kernel/src/ipc/message.rs:154: names `arch::x86_64::` directly - use `arch::imp::` (the seam) so a new arch stays a drop-in
-  |   kernel/src/ipc/message.rs:154: uses `core::arch::x86_64::` intrinsics in a neutral file - wrap it in an `arch::imp` primitive in kernel/src/arch/
+  |   kernel/src/ipc/message.rs:END+3: names `arch::x86_64::` directly - use `arch::imp::` (the seam) so a new arch stays a drop-in
+  |   kernel/src/ipc/message.rs:END+3: uses `core::arch::x86_64::` intrinsics in a neutral file - wrap it in an `arch::imp` primitive in kernel/src/arch/
   | 2 violation(s). The neutral layers must reach hardware only through the `arch::imp` seam (docs/aarch64.md); add an `arch::imp` primitive rather than inlining asm or naming a specific arch. This keeps the NEXT port BOUNDED.
 ```
 
@@ -491,7 +491,7 @@ README.md tells a contributor they need Python 3.8. A hand-measured number is ri
 
 ```
 error[GS0103]: a script uses a Python feature newer than the declared floor
-   --> scripts/test_report.py:154
+   --> scripts/test_report.py:END+4
     |
     = rule: README.md, Requirements
     = why: `README.md` tells a contributor they need Python 3.8. That number was measured by
@@ -506,7 +506,7 @@ error[GS0103]: a script uses a Python feature newer than the declared floor
 
   python_floor_check.py reported:
   | python floor: 1 use(s) of a feature newer than the declared floor (3.8):
-  |   scripts/test_report.py:154 needs Python 3.10 - a `match` statement
+  |   scripts/test_report.py:END+4 needs Python 3.10 - a `match` statement
   | (5 more lines of explanation, which the frame above covers - `py scripts/python_floor_check.py` for all of it)
 ```
 
@@ -518,7 +518,7 @@ Commandment VI, and the reason it is absolute: unowned global mutable state in a
 
 ```
 error[GS0006]: no unowned global mutable state in services
-   --> services/observe/src/main.rs:416
+   --> services/observe/src/main.rs:END+2
     |
     = commandment: VI - Thou shalt not introduce shared mutable state.
     = why: unowned global mutable state: give it an owner, or pass it explicitly
@@ -556,7 +556,7 @@ error[GS0201]: the unsafe inventory does not match the source
 
 ## Coverage, and where this catalogue stops
 
-23 of 28 codes have an entry above. The rest are named here with a reason each, and this list is
+23 of 29 codes have an entry above. The rest are named here with a reason each, and this list is
 COMPUTED from the rule set minus what the cases actually rendered - so it cannot go stale when a
 case is added, and an absence nobody explained is reported as a defect rather than left to be
 mistaken for coverage.
@@ -564,6 +564,7 @@ mistaken for coverage.
 - **`GS0000`** - The deliberate FALLBACK for a Commandment failure `conform` cannot attribute. Producing it means breaking `commandments.py`'s report format, which is not a violation of anything - it is a bug in this tool, and the frame says so when it happens.
 - **`GS0008`** - Commandment VIII has NO mechanical check at all, so this code can never fire. It is in the not-mechanised list as "[static heuristic, not built] Wait on truth". Listed here rather than quietly absent, because a code nothing can produce reads as coverage.
 - **`GS0203`** - Needs a NEW `arch::imp` member CALLED from neutral code, so every one of the seven arch directories then fails to answer it. Multi-file plants exist now and would express the call site, but the case would have to stay correct as arches are added - it would assert a fact about how many exist. Left out rather than made fragile.
+- **`GS0204`** - Fires only on a BRANCH whose diff against main works on one ISA, so a case needs a git history, not a planted file - the corpus plants files into one tree. Its guide cross-check fails on a planted row, but that is the script disagreeing with `docs/porting.md`, not a port leaving its scope, so it would catalogue the wrong failure.
 - **`GS0405`** - `facts_check` needs a doc that restates a number the code owns. Picking one means hard-coding a pairing the checker DISCOVERS, so the case would rot exactly as the checker exists to prevent.
 - **`GS0409`** - `site_check` needs a hand-written website page to disagree with the repository - again a two-file relationship.
 

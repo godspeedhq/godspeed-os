@@ -45,7 +45,7 @@ reason from.
 2. **Co-location as a rule, not luck** - cross-core IPC measured **~14x same-core** on the T630
    (1,433,087 vs ~102,600 cycles): an IPI plus cache-line bouncing on the queue indices. Chatty pairs
    are co-located today by round-robin accident, not by contract.
-3. **Keep new code on `call` / `call_deadline`** rather than hand-rolled send-then-recv.
+3. **Keep new code on `call` / `call_deadline_into`** rather than hand-rolled send-then-recv.
 4. **Fewer HOPS, not fewer layers** - the layering is the design; the number of crossings is the cost.
 
 ## What this analysis did NOT cover, and is worth adding

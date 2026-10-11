@@ -12,5 +12,6 @@ request = "8MiB"
 limit   = "32MiB"
 
 [capabilities]
-ipc_receive = ["mem-pressure"]
+# No `ipc_receive`: its spawn row asks for no endpoint and it receives nothing; the line it carried
+# until 2026-10-10 claimed one it never had (`backlog/80` V9).
 log_write   = true

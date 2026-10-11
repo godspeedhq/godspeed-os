@@ -86,8 +86,7 @@ log_write = true
 # the window via ctx.mmio(). A read-only driver needs no DMA arena and no hw_interrupt; a full NIC
 # driver would add both (see examples/driver-skeleton for that shape).
 
-[placement]
-core = 1
+# no [placement]: this read-only example takes no interrupt, and its spawn row spawns it unpinned
 ```
 
 ## How to run it

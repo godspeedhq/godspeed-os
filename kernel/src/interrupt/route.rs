@@ -26,22 +26,35 @@ const MAX_IRQ: usize = 256;
 static IRQ_TABLE: SpinLock<[Option<EndpointId>; MAX_IRQ]> = SpinLock::new([None; MAX_IRQ]);
 
 
-/// Register a driver endpoint to receive interrupts for `irq`.
+/// Register a driver endpoint to receive interrupts for `irq`, and OPEN the line.
 /// Called by the spawn path for each vector the device class resolved to.
+///
+/// A driver's death releases its routes through `unregister_endpoint`, which MASKS each line, so a
+/// level source cannot storm with no one to service it. The respawned driver's registration is the
+/// moment someone can again, so this unmasks: until 2026-10-10 nothing did, and a respawned
+/// level-triggered driver that waited for its first interrupt before calling `IrqUnmask` waited on a
+/// line switched off at the controller (`backlog/80` K17). Whoever holds the route owes the unmask;
+/// a new holder takes the debt on by holding it. `deliver` masks again on the first interrupt, as it
+/// always has, and a no-op for edge and MSI vectors, where masking never applied.
 pub fn register(irq: u8, endpoint: EndpointId) {
-    let mut table = IRQ_TABLE.lock_irq();
-    // SEC-16: never SILENTLY steal an IRQ line. On a clean driver restart the death path calls
-    // `unregister` first, so the slot is None here; a Some for a DIFFERENT endpoint means either a
-    // second driver claiming an already-owned line or a missed unregister - surface it loudly
-    // (invariant 12) rather than a silent overwrite. The new registration still wins (a respawn's
-    // fresh endpoint must take over its line); today it is unreachable (distinct per-device vectors).
-    if let Some(existing) = table[irq as usize] {
-        if existing != endpoint {
-            crate::kprintln!(
-                "interrupt: IRQ {} already routed - overwriting (second claim or a missed unregister?)", irq);
+    {
+        let mut table = IRQ_TABLE.lock_irq();
+        // SEC-16: never SILENTLY steal an IRQ line. On a clean driver restart the death path calls
+        // `unregister_endpoint` first, so the slot is None here; a Some for a DIFFERENT endpoint
+        // means either a second driver claiming an already-owned line or a missed release - surface
+        // it loudly (invariant 12) rather than a silent overwrite. The new registration still wins
+        // (a respawn's fresh endpoint must take over its line); today it is unreachable (distinct
+        // per-device vectors).
+        if let Some(existing) = table[irq as usize] {
+            if existing != endpoint {
+                crate::kprintln!(
+                    "interrupt: IRQ {} already routed - overwriting (second claim or a missed release?)", irq);
+            }
         }
+        table[irq as usize] = Some(endpoint);
     }
-    table[irq as usize] = Some(endpoint);
+    // Touches the interrupt controller, so OUTSIDE the table lock - as `unregister_endpoint` does.
+    crate::arch::imp::ioapic::unmask_vector(irq);
 }
 
 /// Release every IRQ routed to `endpoint`, and mask those lines. Returns how many were released.
@@ -82,38 +95,6 @@ pub fn unregister_endpoint(endpoint: EndpointId) -> usize {
 /// only the driver that owns the route may re-open its IOAPIC gate (§12).
 pub fn registered_endpoint(irq: u8) -> Option<EndpointId> {
     IRQ_TABLE.lock_irq()[irq as usize]
-}
-
-/// Remove the driver endpoint registered for `irq` (driver-death quiesce, §12).
-///
-/// NO CALLERS today: the kill path uses `unregister_endpoint` above, which MASKS each released
-/// line rather than unmasking it as this does. The rationale below for unmasking is therefore not
-/// what a driver death currently does.
-///
-/// Was called on driver death so a route to the dead driver's endpoint is cleared before the
-/// endpoint id is freed and REUSED. `IRQ_TABLE` stores a bare `EndpointId` (no generation),
-/// so a reused id would otherwise inherit the dead driver's interrupts;
-/// `enqueue_from_interrupt`'s liveness check only covers the still-Dead window, not a reused
-/// id. Safe no-op if nothing was registered; the respawned driver re-registers.
-pub fn unregister(irq: u8) {
-    IRQ_TABLE.lock_irq()[irq as usize] = None;
-    // UNMASK on release, or a dead driver leaves the line off FOREVER.
-    //
-    // `deliver` masks a level-triggered source so it cannot re-enter while the driver works, and the
-    // driver unmasks through `IrqUnmask` once it has serviced the device. A driver that dies between
-    // those two points - a fault, a `kill`, a chaos round - never reaches its unmask, and nothing else
-    // was ever going to do it. The line then stays masked across the respawn, so the fresh instance
-    // registers correctly, waits for an interrupt that is switched off at the controller, and looks
-    // like a driver that cannot see its hardware.
-    //
-    // On arm32 nothing falls back: slice 5 deleted the in-kernel stack, and `arch/arm/irq.rs` says
-    // so at the dispatch site. A masked line simply stays masked until the respawned `dwc2` service
-    // registers again and unmasks it - which is why releasing the route must also unmask.
-    //
-    // Releasing the route and releasing the mask are the same act: whoever holds the route owes the
-    // unmask, and if they are gone the debt falls here. Harmless for edge/MSI vectors, where masking
-    // was a no-op to begin with.
-    crate::arch::imp::ioapic::unmask_vector(irq);
 }
 
 /// One bit per IDT vector: has `deliver` ever run for it? Read and set by the one-shot inside

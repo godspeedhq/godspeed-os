@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The test-probe parameter table - 193 probes, ONE program.
 //!
 //! This table used to live in `kernel/src/task/mod.rs`, as 193 `service_config` rows: the same
@@ -182,8 +183,8 @@ const PROBES: &[(&str, u32, bool, u32, Option<u32>, &[&str])] = &[
     ("prop-p5", 28, false, 0, None, &[]),
     ("prop-p5-victim", 0, true, 0, None, &[]),
     ("prop-p6", 25, true, 0, Some(2), &["prop-p6"]),
-    ("prop-p7", 29, false, 0, None, &[]),
-    ("prop-p7-victim", 0, true, 0, None, &[]),
+    ("prop-p7", 29, true, 0, Some(0), &[]),
+    ("prop-p7-victim", 215, true, 0, Some(1), &["prop-p7"]),
     ("prop-p8", 26, false, 0, Some(1), &[]),
     ("prop-p8-victim", 0, true, 0, None, &[]),
     ("prop-p9", 21, false, 0, Some(0), &["prop-p9-victim", "prop-p9-victim", "prop-p9-victim"]),

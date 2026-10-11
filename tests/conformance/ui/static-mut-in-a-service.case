@@ -13,7 +13,7 @@
 static mut PROBE_TICKS: u32 = 0;
 --- expect ---
 error[GS0006]: no unowned global mutable state in services
-   --> services/observe/src/main.rs:416
+   --> services/observe/src/main.rs:END+2
     |
     = commandment: VI - Thou shalt not introduce shared mutable state.
     = why: unowned global mutable state: give it an owner, or pass it explicitly

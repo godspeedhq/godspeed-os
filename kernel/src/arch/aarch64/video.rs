@@ -248,8 +248,7 @@ pub fn init() -> Option<FbInfo> {
     put_hex(req[29] as u64);
     put_str(b" pitch ");
     put_dec(req[33] as u64);
-    put_str(b"
-");
+    put_str(b"\n");
     let bus_base = req[28];
     let pitch = req[33];
     let (w, h) = (req[5], req[6]);

@@ -139,6 +139,15 @@ fn print_state(
     live:             bool,
 ) {
     let num_cores = ctx.inspect_core_count().min(MAX_CORES);
+    // This view is built from INTROSPECT-gated queries. Refused - a spawn that did not grant it - the
+    // kernel answers nothing, and the frame says that rather than drawing a machine of zeroes
+    // (`backlog/80` K18).
+    let (Some(free_frames), Some(total_frames)) =
+        (ctx.inspect_kernel_free_frames(), ctx.inspect_kernel_total_frames())
+    else {
+        ctx.console_line(true, "observe: the kernel refused its figures - this view needs INTROSPECT");
+        return;
+    };
 
     // --- Collect per-core tick deltas ---
     // core_total_delta is kept separately so per-task CPU% uses the same
@@ -168,8 +177,10 @@ fn print_state(
         ((ticks.saturating_mul(quantum_cyc).saturating_mul(100)) / elapsed_cyc).min(100) as u32
     };
     for c in 0..num_cores as usize {
-        let active = ctx.inspect_core_active_ticks(c as u32);
-        let total  = ctx.inspect_core_total_ticks(c as u32);
+        // Answered above for the frame counts, so these are too; a core the kernel does not count
+        // (past `ready_count`) reads as idle, as it did.
+        let active = ctx.inspect_core_active_ticks(c as u32).unwrap_or(prev_core_active[c]);
+        let total  = ctx.inspect_core_total_ticks(c as u32).unwrap_or(prev_core_total[c]);
         let da = active.saturating_sub(prev_core_active[c]);
         core_total_delta[c] = total.saturating_sub(prev_core_total[c]);
         core_pct[c] = pct(da);
@@ -193,9 +204,7 @@ fn print_state(
         if st.valid && !(st.name_str().starts_with("observe") && st.state != 1) { live_count += 1; }
     }
 
-    // --- RAM ---
-    let free_frames  = ctx.inspect_kernel_free_frames();
-    let total_frames = ctx.inspect_kernel_total_frames();
+    // --- RAM --- (`free_frames` and `total_frames` were read, and checked, at the top)
     // `saturating_sub` alone was a SILENT FALLBACK, and it hid a real fault. It was added to stop an
     // underflow printing ~2^44 MiB after a heavy carnage - correct as far as it went, but the result
     // is "0 KiB used / 8 GiB total (0%)", which is not obviously wrong. It is a believable number, so

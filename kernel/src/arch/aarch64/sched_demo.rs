@@ -54,8 +54,7 @@ fn run_task(id: u8) -> ! {
         if id == b'A' && n % 150 == 3 {
             put_str(b"sched: [from a kernel task] EL0 task has reported ");
             put_dec(super::sched_user::el0_ticks());
-            put_str(b" ticks - EL0 and EL1 tasks are sharing the core
-");
+            put_str(b" ticks - EL0 and EL1 tasks are sharing the core\n");
         }
         n += 1;
         // Long enough that the ~10 ms quantum expires several times inside it. If the counters still
@@ -103,11 +102,9 @@ pub fn run(boot_info: &crate::arch::imp::BootInfo) -> ! {
     // `TaskContext::new_user`: an unprivileged task the SCHEDULER enters, rather than a one-shot
     // excursion the boot makes and returns from.
     if super::sched_user::spawn_el0_task() {
-        put_str(b"sched-demo: EL0 task committed - it will be entered by the scheduler and preempted
-");
+        put_str(b"sched-demo: EL0 task committed - it will be entered by the scheduler and preempted\n");
     } else {
-        put_str(b"sched-demo: WARN could not build the EL0 task
-");
+        put_str(b"sched-demo: WARN could not build the EL0 task\n");
     }
 
     // Mask IRQs while arming, so a tick cannot land between setting the flag and entering `run` - at

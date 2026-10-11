@@ -196,11 +196,6 @@ fn log_idle_tick_config() {
 // The linker places this in .bss, so it costs nothing in the image.
 static mut BSP_BOOT_STACK: [u8; 512 * 1024] = [0u8; 512 * 1024];
 
-#[no_mangle]
-// NOTE: these two attributes were written for `kernel_main` below, but the `banner` doc comment and
-// fn now sit between them and it, so they apply to `banner`. `kernel_main` is reached as a Rust
-// path from x86's `_start` (`arch/x86_64/mod.rs`), not by symbol name, so it builds either way.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
 /// Which image, and which MACHINE - the first thing every boot log says about itself.
 ///
 /// It used to be printed by `bootcon::init`, where it was the genuinely first line - but
@@ -251,6 +246,11 @@ fn banner() {
     }
 }
 
+// These two attributes are `kernel_main`'s. A doc comment and `banner` were once inserted between
+// them and it, so they applied to `banner` until 2026-10-10 (`backlog/80` K13). `kernel_main` is
+// reached as a Rust path from x86's `_start` (`arch/x86_64/mod.rs`), so it built either way.
+#[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // Switch from Limine's tiny boot stack to our own 512 KiB stack before
     // any locals are allocated.  boot_info_ptr is in RDI (a register) so it
@@ -307,10 +307,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // EHCI interrupt path (§12): program it HERE - before the firmware USB handoff + IOMMU
     // below - which is where it worked in the E2 build; deferring it past the handoff stopped
     // the legacy INTx from delivering on the T630. The EHCI routes to the BSP (available now,
-    // pre-smp::init - only the xHCI's core-1 MSI needs the APs up, so that one stays deferred).
-    // The EHCI driver is pinned to the BSP (task/mod.rs) to match. Interrupters stay off until
-    // each userspace driver enables them, so nothing fires yet.
-    if !arch::imp::pci::program_ehci_msi() {
+    // pre-smp::init). An MSI is re-aimed at the driver's own core when the driver is spawned
+    // (`task::spawn_from_image`, backlog/80 K27); here it can only reach the BSP. Interrupters stay
+    // off until each userspace driver enables them, so nothing fires yet.
+    if !arch::imp::pci::program_ehci_msi(0) {
         arch::imp::pci::route_ehci_intx();
     }
 
@@ -343,9 +343,10 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     arch::imp::com2_init();
     // COM1 RX is polled from the core-0 timer ISR (uart_rx_poll every 10 ms).
     // IRQ-driven reception was abandoned because the kernel masks all PIC IRQs
-    // globally (APIC-only kernel). uart_rx_enable() must NOT be called: on real
-    // hardware unmasking PIC IRQ 4 without proper PIC EOI in the handler causes
-    // the PIC ISR to jam and lock up the interrupt controller before boot.
+    // globally (APIC-only kernel): on real hardware unmasking PIC IRQ 4 without
+    // proper PIC EOI in the handler jams the PIC ISR and locks up the interrupt
+    // controller before boot. (The RX-enable function that did it was deleted
+    // 2026-10-10, `backlog/80` K20.)
 
     capability::init();
     ipc::init();

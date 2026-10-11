@@ -28,10 +28,12 @@ Do NOT add assertions that:
 
 | Function                            | Invariant pinned               |
 |-------------------------------------|-------------------------------|
-| `assert_cap_validated`              | §3.1 - no ambient authority   |
 | `assert_no_mid_execution_migration` | §3.11 / §9.1                  |
-| `assert_tcb_alive`                  | §6.2 - a no-op today: the non-restartable task set is empty since Phase 6 |
 | `assert_cap_table_consistent`       | §7.8                          |
+
+`assert_cap_validated` (passed a literal `Ok`, so it could not fire) and `assert_tcb_alive` (over an
+empty TCB set since Phase 6) were deleted 2026-10-10, `backlog/80` K20: an assertion that cannot fail
+reports a pass while measuring nothing.
 
 ## Adding a new assertion
 

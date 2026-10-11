@@ -9,6 +9,10 @@ the first 32 KiB ever logged, read by copy through InspectKernel query 27 and sh
 boot` (CLAUDE.md 11.4). The ring itself is still not drainable, and `drain_kernel_ring_buffer` is
 still the stub, with no caller.)*
 
+*(2026-10-10: the stub is gone - `backlog/80` S7 deleted `drain_kernel_ring_buffer` and its twin
+`recv_log_message`, which did nothing and had no caller. What this item records is unchanged: no
+syscall drains the ring.)*
+
 **Severity:** feature. A known, recorded gap - not a defect.
 
 ## What it costs today

@@ -126,3 +126,56 @@ pub fn fault_divide_by_zero() {
         core::arch::asm!("udf #0", options(nostack, nomem));
     }
 }
+
+/// A run of FRESH pages this task was just given by `AllocMem`, for the §22 P7 stale-translation test.
+///
+/// P7 asks whether a dead task's translations can outlive it (CLAUDE.md 10.5): a writer stamps its
+/// pages, is killed, and a checker spawned after it, given the SAME virtual addresses (every task's
+/// `AllocMem` grows from one base), must read the zeroes the kernel filled its new pages with. A
+/// pattern word there means the checker read through a translation that belonged to the dead writer.
+///
+/// Reading and writing that memory needs a raw pointer, which a test SERVICE must not hold (18.2), so
+/// it is wrapped here. The wrapper is sound because a `Region` can only be made from a successful
+/// `AllocMem`: its pages are mapped, writable, private to this task, and referenced by nothing else -
+/// the kernel has just created them, and no Rust object lives there.
+pub struct Region {
+    va: u64,
+    words: usize,
+}
+
+impl Region {
+    /// Ask the kernel for `pages` fresh 4 KiB pages. `None` if it refused.
+    pub fn alloc(ctx: &crate::service_context::ServiceContext, pages: usize) -> Option<Region> {
+        let len = pages.checked_mul(4096)?;
+        let va = ctx.alloc_mem(len).ok()?;
+        Some(Region { va, words: len / 4 })
+    }
+
+    /// The first virtual address of the region (the same in every task that asks first).
+    pub fn base(&self) -> u64 { self.va }
+
+    /// Write `word` into every 32-bit word of the region.
+    pub fn stamp(&self, word: u32) {
+        let p = self.va as *mut u32;
+        for i in 0..self.words {
+            // SAFETY: `p.add(i)` is inside the `words * 4` bytes `AllocMem` mapped for this task (the
+            // constructor is the only way to make a Region), 4-aligned because the base is
+            // page-aligned, and no Rust reference points there. Volatile, so every store is made.
+            unsafe { core::ptr::write_volatile(p.add(i), word) };
+        }
+    }
+
+    /// The byte offset and value of the first word that is not `want`, or `None` if every word is.
+    pub fn first_not(&self, want: u32) -> Option<(usize, u32)> {
+        let p = self.va as *const u32;
+        for i in 0..self.words {
+            // SAFETY: as `stamp`: inside the mapped region, aligned, aliased by no reference. Volatile,
+            // so each word is really read through this task's own translation.
+            let w = unsafe { core::ptr::read_volatile(p.add(i)) };
+            if w != want {
+                return Some((i * 4, w));
+            }
+        }
+        None
+    }
+}

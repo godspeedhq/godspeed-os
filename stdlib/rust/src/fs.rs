@@ -228,6 +228,8 @@ pub struct Fs<'a> {
     reason: [u8; REASON_MAX],
     reason_len: u8,
     notice: Option<&'a dyn Fn()>,
+    /// Where the keys a noticing wait reads (and does not act on) go - see [`Fs::keeping`].
+    keep: Option<&'a dyn Fn(u8)>,
     /// How long ORDINARY operations wait. `None` means [`call::DEFAULT_SECS`].
     ///
     /// The operations with a budget of their own - a subtree delete walks a tree, so it carries
@@ -250,7 +252,7 @@ impl<'a> Fs<'a> {
     ///
     /// Cheap, allocates nothing, and grants nothing. See the type's authority note.
     pub fn new(ctx: &'a ServiceContext) -> Fs<'a> {
-        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None, patience: None }
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None, keep: None, patience: None }
     }
 
     /// A handle that calls `notice` when a request has been waiting a while.
@@ -266,7 +268,7 @@ impl<'a> Fs<'a> {
     /// request the operator then aborts returns [`Error::Cancelled`], which is NOT a fault - report
     /// it as the deliberate act it was.
     pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Fs<'a> {
-        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice),
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice), keep: None,
              patience: None }
     }
 
@@ -306,7 +308,7 @@ impl<'a> Fs<'a> {
     /// not a loud rejection - it is a stale reply silently accepted as the answer to the current
     /// question. See [`TAG_START`](self).
     pub fn from_tag(ctx: &'a ServiceContext, tag: u8) -> Fs<'a> {
-        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None, patience: None }
+        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None, keep: None, patience: None }
     }
 
     /// Lend this handle a waiting-notice, as [`with_notice`](Fs::with_notice) describes.
@@ -316,6 +318,15 @@ impl<'a> Fs<'a> {
     /// combinations multiply faster than the constructors are worth.
     pub fn noticing(mut self, notice: &'a dyn Fn()) -> Fs<'a> {
         self.notice = Some(notice);
+        self
+    }
+
+    /// Hand every key a noticing wait reads, other than a quit key, to `keep` - in order - instead of
+    /// discarding it. A wait that watches the console for `q` takes what is typed; without this,
+    /// typing ahead while a command waits loses those keys (`backlog/80` H16). Only matters with a
+    /// notice, since only a noticing wait reads the console.
+    pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Fs<'a> {
+        self.keep = Some(keep);
         self
     }
 
@@ -386,7 +397,7 @@ impl<'a> Fs<'a> {
         req[3 + path.len()..n].copy_from_slice(tail);
 
         let reply = call::request_within_notice(
-            self.ctx, "fs", &Message::from_bytes(&req[..n]), secs, self.notice)?;
+            self.ctx, "fs", &Message::from_bytes(&req[..n]), secs, self.notice, self.keep)?;
         let body = reply.payload_bytes();
 
         // The tag must match, or this is an answer to a question we already gave up on.
@@ -592,9 +603,9 @@ impl<'a> Fs<'a> {
     ///
     /// `rights` is a mask of [`cap::READ`](crate::cap::READ), [`cap::WRITE`](crate::cap::WRITE) and
     /// [`cap::APPEND`](crate::cap::APPEND). **Check
-    /// [`File::rights`](crate::file::File::rights) on the result**: `fs` narrows rather than refuses
-    /// in one case - it will not mint a writable capability to a SEALED file, and hands back a
-    /// read-only one instead of a capability it could not honour.
+    /// [`File::rights`](crate::file::File::rights) on the result**: it is what the capability
+    /// carries, read from the kernel. `fs` narrows rather than refuses in one case - it will not mint
+    /// a writable capability to a SEALED file, and hands back a read-only one instead.
     ///
     /// # Why this borrows the handle
     ///
@@ -619,7 +630,14 @@ impl<'a> Fs<'a> {
         // The capability rode the reply as an EMBEDDED cap, not as payload bytes; the kernel placed
         // it in our table on receipt and it is ours to claim or leak.
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
-        Ok(crate::file::File::new(self, ctx, cap, rights))
+        // Record what the capability CARRIES, not what was asked: `fs` narrows a sealed file to
+        // read-only, and APPEND is a request flag that never becomes a kernel right. A slot the
+        // kernel cannot describe is no capability we can use (`backlog/80` G2).
+        let granted = match ctx.query_cap_rights(cap) {
+            Some(r) => (r as u8) & (crate::cap::READ | crate::cap::WRITE),
+            None => return Err(Error::Failed),
+        };
+        Ok(crate::file::File::new(self, ctx, cap, granted))
     }
 
     /// Rebuild the free-space bitmap from the file tree, and report what was found.
@@ -822,31 +840,26 @@ impl<'a> Fs<'a> {
     /// to "make sure": read the file back, or report the uncertainty. [`Error::retry_is_safe`]
     /// answers this for you, and says `false` for that case on purpose.
     ///
-    /// # Known defect (2026-10-09): `data` longer than [`IO_CHUNK`] fails
+    /// # Larger than one message
     ///
-    /// The first chunk creates a file sized for that chunk alone, and `services/fs` refuses a
-    /// positional write past a file's extent ("write past extent"), so the second chunk fails with
-    /// [`Error::Failed`] and leaves a file holding only the first [`IO_CHUNK`] bytes. Until this is
-    /// fixed, write a larger file with [`create_sized`](Fs::create_sized) and then
-    /// [`write_at`](Fs::write_at) from offset 0.
+    /// `data` longer than [`IO_CHUNK`] is written as the file at its whole size first
+    /// ([`create_sized`](Fs::create_sized)), then filled chunk by chunk from offset 0. A failure
+    /// part way leaves a file of the full size whose tail is not yet written, and is reported.
+    /// (Until 2026-10-10 the file was created from its first chunk alone, sized for that chunk, so
+    /// `services/fs` refused the second as "write past extent" - `backlog/80` G1.)
     pub fn write(&mut self, path: impl AsRef<[u8]>, data: &[u8]) -> Result<(), Error> {
         if data.len() <= IO_CHUNK {
             self.call(OP_WRITE_FILE, path.as_ref(), data, self.secs())?;
             return Ok(());
         }
-        // Larger than one message: create it, then fill it positionally. `OP_WRITE_AT` at a fixed
+        // Larger than one message: size it, then fill it positionally. `OP_WRITE_AT` at a fixed
         // offset is positionally idempotent - the same bytes at the same offset land the same way
-        // twice - which is what makes a chunked write safe to resume at all. BUT the file created
-        // below is sized for its first chunk only, so `fs` refuses every later chunk as "write past
-        // extent": see the known defect in this function's doc.
-        self.call(OP_WRITE_FILE, path.as_ref(), &data[..IO_CHUNK], self.secs())?;
-        let mut off = IO_CHUNK;
+        // twice - which is what makes a chunked write safe to resume at all.
+        self.create_sized(path.as_ref(), data.len() as u64)?;
+        let mut off = 0;
         while off < data.len() {
             let n = (data.len() - off).min(IO_CHUNK);
-            let mut tail = [0u8; 8 + IO_CHUNK];
-            tail[..8].copy_from_slice(&(off as u64).to_le_bytes());
-            tail[8..8 + n].copy_from_slice(&data[off..off + n]);
-            self.call(OP_WRITE_AT, path.as_ref(), &tail[..8 + n], self.secs())?;
+            self.write_at(path.as_ref(), off as u64, &data[off..off + n])?;
             off += n;
         }
         Ok(())

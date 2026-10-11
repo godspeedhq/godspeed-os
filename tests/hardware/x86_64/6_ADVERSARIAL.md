@@ -2,7 +2,7 @@
 
 Mirrors §22 Adversarial Tests (A1-A10). Capability isolation under direct attack on real silicon.
 
-**Reference:** `tests/qemu/adversarial/CLAUDE.md` for full spec.
+**Reference:** the `TestSpec` table in `osdev/src/validator.rs` is the full spec (there is no `tests/qemu/adversarial/` directory).
 
 **Status: 10/10 PASS** - 2026-05-24, Dell Wyse 5070 (Goldmont+, 4 cores).
 

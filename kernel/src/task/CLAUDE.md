@@ -7,18 +7,15 @@ Task management and per-core scheduler (§9, §14).
 | File            | Responsibility |
 |-----------------|---------------|
 | `mod.rs`        | `spawn_supervisor()` (the kernel's one direct spawn - init removed, Phase 5), `spawn_from_image()` (every other spawn, from the supervisor's `SpawnImage` request), `kill_current()`, the kernel stack pool, `privbits` / `privileges_caller_lacks` / `SUPERVISOR_DELEGATABLE` |
-| `task.rs`       | `TaskId`, and a `Task` struct that nothing constructs - the live per-task state is the scheduler's slot-indexed `TASK_*` arrays |
 | `state.rs`      | `TaskState` enum: Ready, Running, BlockedOnRecv, BlockedOnSend, Dead |
 | `scheduler.rs`  | `run()` (never returns), `timer_tick_from_irq()`, `yield_current()`, `block_and_reschedule()`, `wake_by_slot()`, `kill_task_by_slot()`, `drain_pending_kstack()` |
 
 > **Doc-drift correction (documentation-audit Audit 2, 2026-07-15; kernel-audit M1/M2).** Two mechanisms
-> named below are **dead code** (zero live callers), pending removal: the spawn-flow's
-> `smp::placement::resolve` is dead - the live core placement is `task/mod.rs::resolve_spawn_core` (atomic
-> round-robin); the kill-flow's `memory::ownership::reclaim_all` is dead - the live kill-path reclaim is
-> `arch/x86_64/page_tables.rs::reclaim_user_frames`. The described behaviour is right; the function names
-> are stale.
->
-> *(Note 2026-10-09: both are still dead, and the steps below now name the live functions.)*
+> once named below had no callers: `smp::placement::resolve` (the live core placement is
+> `task/mod.rs::resolve_spawn_core`) and `memory::ownership::reclaim_all` (the live kill-path reclaim is
+> `arch/x86_64/page_tables.rs::reclaim_user_frames`). The steps below name the live functions; the dead
+> ones, with an unconstructed `Task` struct and `TaskId` in `task.rs`, were deleted 2026-10-10
+> (`backlog/80` K20).
 
 ## Static placement invariant (§9.1)
 

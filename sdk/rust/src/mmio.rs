@@ -37,11 +37,21 @@ impl Mmio {
     /// MMIO access would otherwise fault (the window is exactly what the kernel mapped) - this turns
     /// that into a loud, explicit panic naming the cause instead of a bare page fault (§26.7).
     /// `checked_add` so a wrapping `off` cannot slip past.
+    ///
+    /// It also refuses an access that is not aligned to its own size. An unaligned volatile access is
+    /// undefined behaviour in Rust, and on Device memory an alignment fault on Arm; this "must be
+    /// aligned" was a comment until 2026-10-10, so a safe call could reach it (`backlog/80` S6). The
+    /// ADDRESS is checked, not only the offset, so a window that does not start on a boundary is
+    /// caught too.
     #[inline]
     fn check(&self, off: usize, size: usize) {
         assert!(
             off.checked_add(size).map_or(false, |end| end <= self.len),
             "Mmio access out of window bounds",
+        );
+        assert!(
+            (self.base as usize).wrapping_add(off) % size == 0,
+            "Mmio access not aligned to its size",
         );
     }
 
@@ -58,7 +68,7 @@ impl Mmio {
     #[inline]
     pub fn read16(&self, off: usize) -> u16 {
         self.check(off, 2);
-        // SAFETY: as `read8`; aligned 16-bit access within the mapped region.
+        // SAFETY: as `read8`; check() bounded the access and proved it 2-byte aligned.
         unsafe { core::ptr::read_volatile(self.base.add(off) as *const u16) }
     }
 
@@ -66,7 +76,7 @@ impl Mmio {
     #[inline]
     pub fn read32(&self, off: usize) -> u32 {
         self.check(off, 4);
-        // SAFETY: as `read8`; aligned 32-bit access within the mapped region.
+        // SAFETY: as `read8`; check() bounded the access and proved it 4-byte aligned.
         unsafe { core::ptr::read_volatile(self.base.add(off) as *const u32) }
     }
 
@@ -82,7 +92,7 @@ impl Mmio {
     #[inline]
     pub fn write16(&self, off: usize, val: u16) {
         self.check(off, 2);
-        // SAFETY: as `read8`; aligned 16-bit write.
+        // SAFETY: as `read8`; check() bounded the write and proved it 2-byte aligned.
         unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u16, val) }
     }
 
@@ -90,7 +100,7 @@ impl Mmio {
     #[inline]
     pub fn write32(&self, off: usize, val: u32) {
         self.check(off, 4);
-        // SAFETY: as `read8`; aligned 32-bit write.
+        // SAFETY: as `read8`; check() bounded the write and proved it 4-byte aligned.
         unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u32, val) }
     }
 
@@ -99,7 +109,7 @@ impl Mmio {
     #[inline]
     pub fn read64(&self, off: usize) -> u64 {
         self.check(off, 8);
-        // SAFETY: as `read8`; aligned 64-bit access within the mapped region.
+        // SAFETY: as `read8`; check() bounded the access and proved it 8-byte aligned.
         unsafe { core::ptr::read_volatile(self.base.add(off) as *const u64) }
     }
 
@@ -107,7 +117,7 @@ impl Mmio {
     #[inline]
     pub fn write64(&self, off: usize, val: u64) {
         self.check(off, 8);
-        // SAFETY: as `read8`; aligned 64-bit write.
+        // SAFETY: as `read8`; check() bounded the write and proved it 8-byte aligned.
         unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u64, val) }
     }
 }

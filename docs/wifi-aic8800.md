@@ -52,10 +52,10 @@ speed" at up to 50 MHz (49.5 MHz in practice), no UHS and no tuning. PLIC interr
 system GPIO block at `0x1304_0000`), so the kernel does them as part of the grant, the way it routes the
 Pi's audio pins (CLAUDE.md 12.3, the 2026-10-03 amendment):
 
-- clocks: `SDIO1_AHB` at `0x1302_0170` (gate, bit 31) and `SDIO1_SDCARD` at `0x1302_0178` (gate bit 31,
+- clocks: `SYSCLK_SDIO1_AHB` at `0x1302_0170` (gate, bit 31) and `SYSCLK_SDIO1_SDCARD` at `0x1302_0178` (gate bit 31,
   divider bits 23:0); the device tree assigns the card clock 50 MHz and the log's arithmetic (div 62 ->
   399,193 Hz) says the controller sees 49.5 MHz;
-- reset `SDIO1_AHB` (id 65): assert register `0x1302_0300` bit 1, status `0x1302_0310` bit 1 (reads 1
+- reset `SYSRST_SDIO1_AHB` (id 65): assert register `0x1302_0300` bit 1, status `0x1302_0310` bit 1 (reads 1
   when released). Clocks on BEFORE the release - the reset driver notes a release can otherwise hang;
 - pins: GPIO 10 CLK, 9 CMD, 11/12/7/8 D0-D3, function numbers in the table the SDIO-host research
   produced (CLK 55; CMD out 57, OE 19, in 44; D0 58/20/45; D1 59/21/46; D2 60/22/47; D3 61/23/48),

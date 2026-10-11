@@ -365,8 +365,8 @@ pub fn identify_once(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<Card> {
             ));
             ctx.log(
                 "wifi-driver:   nothing is on this bus. The controller is ours (its version register \
-                 answered), so suspect the two things the KERNEL reports at boot: the SD power domain \
-                 (`sdio: SET_POWER_STATE`) and the GPIO34-39 mux (`sdio: GPIO34-39 fsel=`)",
+                 answered), so suspect the two things the KERNEL sets up for the radio at boot and \
+                 reports in its log: the radio's power, and the pins routed to this host",
             );
             return None;
         }
@@ -543,6 +543,15 @@ pub fn read_extended(
         Some(n) => (1u32 << 27, n, true),
         None => (0, (words.len() * 4) as u32, false),
     };
+    // The count field is 9 bits: up to 511 blocks, or up to 512 bytes (512 is encoded as 0, per the
+    // SDIO specification). A count past that was masked into a different, smaller transfer with no
+    // word said until 2026-10-10 (`backlog/80` S8); it is refused, loudly, instead.
+    if count == 0 || count > if block_bit != 0 { 0x1FF } else { 0x200 } {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a CMD53 of {} {} does not fit the 9-bit count field - refused, not truncated",
+            count, if block_bit != 0 { "block(s)" } else { "byte(s)" }));
+        return false;
+    }
     let arg = ((func as u32 & 0x7) << 28)
         | block_bit
         | (1 << 26)
@@ -593,6 +602,15 @@ pub fn write_extended(
         Some(n) => (1u32 << 27, n, true),
         None => (0, (words.len() * 4) as u32, false),
     };
+    // The count field is 9 bits: up to 511 blocks, or up to 512 bytes (512 is encoded as 0, per the
+    // SDIO specification). A count past that was masked into a different, smaller transfer with no
+    // word said until 2026-10-10 (`backlog/80` S8); it is refused, loudly, instead.
+    if count == 0 || count > if block_bit != 0 { 0x1FF } else { 0x200 } {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a CMD53 of {} {} does not fit the 9-bit count field - refused, not truncated",
+            count, if block_bit != 0 { "block(s)" } else { "byte(s)" }));
+        return false;
+    }
     let arg = (1 << 31)
         | ((func as u32 & 0x7) << 28)
         | block_bit
@@ -645,6 +663,15 @@ fn fifo_xfer(h: &dyn SdioHost, func: u8, addr: u32, words: &mut [u32], block: u3
     } else {
         (1u32 << 27, bytes / block, blk_block_mode(bytes / block, block), true)
     };
+    // The count field is 9 bits: up to 511 blocks, or up to 512 bytes (512 is encoded as 0, per the
+    // SDIO specification). A count past that was masked into a different, smaller transfer with no
+    // word said until 2026-10-10 (`backlog/80` S8); it is refused, loudly, instead.
+    if count == 0 || count > if block_bit != 0 { 0x1FF } else { 0x200 } {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: a CMD53 of {} {} does not fit the 9-bit count field - refused, not truncated",
+            count, if block_bit != 0 { "block(s)" } else { "byte(s)" }));
+        return false;
+    }
     let arg = if write { 1u32 << 31 } else { 0 }
         | ((func as u32 & 0x7) << 28)
         | block_bit
@@ -1105,12 +1132,12 @@ pub fn walk_cis(h: &dyn SdioHost, start: u32, ctx: &ServiceContext) -> Option<Ma
         } else if code == cistpl::FUNCID && len >= 1 {
             if let Some(f) = read_reg(h, 0, body) {
                 // 0x0C is the function code the SDIO specification gives every SDIO card in this tuple -
-                // it says "SDIO", not "network adapter" (the log line below says otherwise). Logged
-                // as a raw byte with the note rather than decoded into a table, because one value is
-                // all this phase needs and a lookup table nobody reads is the kind of speculative
-                // machinery §26.2 asks not to build.
+                // it says "SDIO", not "network adapter", which is what this line said until
+                // 2026-10-10 (`backlog/80` S8). Logged as a raw byte with the note rather than decoded
+                // into a table, because one value is all this phase needs and a lookup table nobody
+                // reads is the kind of speculative machinery §26.2 asks not to build.
                 ctx.log_fmt(format_args!(
-                    "wifi-driver: CIS FUNCID {:#04x} (0x0c = network adapter)",
+                    "wifi-driver: CIS FUNCID {:#04x} (0x0c = an SDIO card)",
                     f
                 ));
             }

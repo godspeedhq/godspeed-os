@@ -21,10 +21,11 @@ fails, and the file may shrink freely. Same shape as `SHARED-SURFACE.baseline.tx
 
 WHAT IS SCANNED, so a pass is not read as wider: the docs in DOC_DIRS and DOC_FILES below only - not
 `services/*/CLAUDE.md`, `examples/**`, `kernel/CLAUDE.md`, `website/src/`, `GETTING_STARTED.md` or
-`CONTRIBUTING.md`. A name RESOLVES if it occurs as a SUBSTRING anywhere in the source text, comments
-and Python included, so a dead name contained in a longer live one passes (the weakness
-`comment_symbol_check.py` removed for itself on 2026-10-05). With no baseline file the checker writes
-one and exits 0.
+`CONTRIBUTING.md`. A name RESOLVES if it occurs as a WHOLE IDENTIFIER anywhere in the source text,
+comments and Python included. (Until 2026-10-10 a SUBSTRING was enough, so a dead name contained in a
+longer live one passed; the 22 names that passed only that way are recorded in the baseline as
+SUBSTRING-ONLY debt, backlog/80 T8.) With no baseline file the checker FAILS; `--write-baseline`
+creates one deliberately.
 
 NOT SCANNED: `audits/` and `milestones/`. Those are append-only EVIDENCE and dated history (CLAUDE.md
 §5) - a symbol that existed when the audit ran is CORRECT there, and rewriting it would falsify the
@@ -99,8 +100,13 @@ def docs():
 
 
 def unknown():
-    """{token: [docs that name it]} for tokens that appear NOWHERE in the source."""
+    """{token: [docs that name it]} for tokens that appear NOWHERE in the source AS A WHOLE NAME."""
     text, nfiles = source_text()
+    # WHOLE IDENTIFIERS, not substrings. This asked `tok not in text`, so a doc naming `STAT_FILE`
+    # resolved against `OP_STAT_FILE` and `read_file` against `fs_read_file_streaming`: a dead or
+    # wrong name contained in a longer live one passed (backlog/80 T8). `comment_symbol_check.py`
+    # removed the same weakness from itself on 2026-10-05.
+    names = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text))
     found = {}
     for rel in docs():
         s = read(os.path.join(ROOT, rel))
@@ -109,7 +115,7 @@ def unknown():
             # Present anywhere in the source - as a definition, a call, or a comment - is enough.
             # This is a DANGLING-reference check, not a "is it public API" check, and being stricter
             # would report every private helper a doc legitimately mentions.
-            if tok not in text:
+            if tok not in names:
                 found.setdefault(tok, set()).add(rel)
     return {k: sorted(v) for k, v in found.items()}, nfiles
 
@@ -129,9 +135,17 @@ def main():
     found, nfiles = unknown()
     base = load_baseline()
     if base is None:
-        print("doc symbols: no baseline at %s - writing one" % os.path.relpath(BASELINE, ROOT))
-        write_baseline(found)
-        return 0
+        # A MISSING BASELINE IS A FAILURE. This wrote one and exited 0, so deleting the file made
+        # every unknown name pass that run and baselined them all for the next (backlog/80 T8).
+        # Writing one is now a deliberate act: `--write-baseline`.
+        if "--write-baseline" in sys.argv:
+            write_baseline(found)
+            return 0
+        print("doc symbols: no baseline at %s. Refusing to pass: without it every unknown name is"
+              % os.path.relpath(BASELINE, ROOT))
+        print("unchecked. Restore it from git, or - only for a new repository - create it with")
+        print("`py scripts/doc_symbols_check.py --write-baseline` and READ what it baselined.")
+        return 1
 
     new = sorted(k for k in found if k not in base)
     gone = sorted(k for k in base if k not in found)

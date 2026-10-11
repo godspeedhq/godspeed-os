@@ -643,6 +643,21 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
     }
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
 
+    // NOWHERE TO RECORD IT, NO CONFINEMENT. `release_device` frees a domain only through its record,
+    // and a confinement it cannot find is an I/O page table leaked for good and a DTE never reverted.
+    // That happened silently when the table was full, until 2026-10-10 (`backlog/80` K11). Refused
+    // here, before anything is built, and said: the device stays in passthrough, exactly as on a
+    // machine with no IOMMU, and its driver is therefore NOT confined.
+    {
+        let tbl = CONFINED_TABLE.lock();
+        if !tbl.iter().any(|e| e.is_none() || matches!(e, Some(c) if c.bdf == bdf)) {
+            crate::kprintln!(
+                "iommu: confine REFUSED for BDF {:02x}:{:02x}.{} - all {} confinement records are in use; it stays in passthrough, NOT confined",
+                (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7, tbl.len());
+            return false;
+        }
+    }
+
     // Build the I/O page table: a fresh level-4 root mapping only the arena.
     let l4 = match crate::memory::allocator::alloc_contiguous(1) {
         Some(p) => p,
@@ -670,7 +685,10 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
         while pa <= last {
             // SAFETY: l4 is the zeroed root we just allocated; pa is page-aligned.
             if !unsafe { io_map_page(l4, pa, hhdm) } {
-                crate::kprintln!("iommu: confine WARN failed mapping arena page {:#x}", pa);
+                crate::kprintln!("iommu: confine WARN failed mapping arena page {:#x} - the partial table is freed", pa);
+                // SAFETY: `l4` was built here and never written to a DTE, so no device can reach it.
+                // It leaked, root and every table under it, until 2026-10-10 (K11).
+                unsafe { free_io_table(l4, 4, hhdm) };
                 return false;
             }
             pa += 0x1000;
@@ -694,14 +712,38 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
     unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_va_phys, hhdm), bdf, domain_of(bdf)) };
 
     // Record so release_device can reclaim this on driver death.
-    {
+    let (recorded, previous) = {
         let mut tbl = CONFINED_TABLE.lock();
         // Replace any stale entry for this BDF, else take a free slot.
         if let Some(e) = tbl.iter_mut().find(|e| matches!(e, Some(c) if c.bdf == bdf)) {
+            let previous = e.map(|c| c.l4_phys);
             *e = Some(Confined { bdf, l4_phys: l4 });
+            (true, previous)
         } else if let Some(e) = tbl.iter_mut().find(|e| e.is_none()) {
             *e = Some(Confined { bdf, l4_phys: l4 });
+            (true, None)
+        } else {
+            (false, None)
         }
+    };
+    // A device confined again (a driver respawned before its release ran) had its old table's
+    // record overwritten and the table itself kept forever, until 2026-10-10 (K11).
+    if let Some(old) = previous {
+        if old != l4 {
+            // SAFETY: the DTE now names `l4` and was invalidated above, so the device can no longer
+            // reach `old`; it was built by an earlier `confine_device` and its record is gone.
+            unsafe { free_io_table(old, 4, hhdm) };
+        }
+    }
+    // The last slot was taken by a confinement on another core between the check above and here:
+    // undo this one rather than leave it unrecorded.
+    if !recorded {
+        // SAFETY: `l4` is the table just written to this device's DTE, and nothing else holds it.
+        unsafe { unconfine(mmio_va, dt_va, cmd_va_phys, bdf, l4, hhdm) };
+        crate::kprintln!(
+            "iommu: confine REFUSED for BDF {:02x}:{:02x}.{} - the last confinement record was taken while it was being built; reverted to passthrough, NOT confined",
+            (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7);
+        return false;
     }
 
     let pages = (last - first) / 0x1000 + 1;
@@ -740,6 +782,26 @@ unsafe fn free_io_table(table_phys: u64, level: u32, hhdm: u64) {
     };
 }
 
+/// Revert `bdf`'s DTE to the canonical passthrough encoding (V|TV|mode=0|IR|IW), order and invalidate
+/// it so the device no longer reaches its I/O page table, then free that table. The one way a
+/// confinement is undone: `release_device` on a driver's death, and `confine_device` when it could not
+/// record what it built.
+///
+/// # Safety
+/// The IOMMU is up (`mmio_va`, `dt_va` and `cmd_phys` are the live statics), and `l4` is the root of an
+/// I/O page table `confine_device` built for `bdf` that nothing but this device's DTE refers to.
+unsafe fn unconfine(mmio_va: u64, dt_va: u64, cmd_phys: u64, bdf: u32, l4: u64, hhdm: u64) {
+    // SAFETY: dt_va is the mapped device table; bdf < 65536.
+    unsafe { write_dte(dt_va, bdf, DTE_V | DTE_TV | DTE_IR | DTE_IW, 0) };
+    // SAFETY: order the DTE write before invalidation/free.
+    unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)) };
+    // SAFETY: IOMMU enabled; command buffer programmed.
+    unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_phys, hhdm), bdf, domain_of(bdf)) };
+    // Now safe to free the I/O page-table frames (the device can't reach them).
+    // SAFETY: per this function's contract, `l4` is now unreachable.
+    unsafe { free_io_table(l4, 4, hhdm) };
+}
+
 /// Reclaim a confined device's IOMMU resources on driver death: revert its DTE
 /// to passthrough, invalidate the cached entry, and free its I/O page-table
 /// frames. Makes confined DMA drivers restartable (no leak across restart).
@@ -776,18 +838,8 @@ pub fn release_device(bdf: u32) -> bool {
     }
     let hhdm = crate::arch::x86_64::page_tables::get_hhdm_offset();
 
-    // Revert the DTE to the canonical passthrough encoding (V|TV|mode=0|IR|IW),
-    // order it, then invalidate so the device no longer reaches the freed table.
-    // SAFETY: dt_va is the mapped device table; bdf < 65536.
-    unsafe { write_dte(dt_va, bdf, DTE_V | DTE_TV | DTE_IR | DTE_IW, 0) };
-    // SAFETY: order the DTE write before invalidation/free.
-    unsafe { core::arch::asm!("sfence", options(nostack, nomem, preserves_flags)) };
-    // SAFETY: IOMMU enabled; command buffer programmed.
-    unsafe { invalidate_device(mmio_va, phys_to_virt(cmd_phys, hhdm), bdf, domain_of(bdf)) };
-
-    // Now safe to free the I/O page-table frames (device can't reach them).
-    // SAFETY: rec.l4_phys was built by confine_device and is now unreachable.
-    unsafe { free_io_table(rec.l4_phys, 4, hhdm) };
+    // SAFETY: rec.l4_phys was built by confine_device for this device, and its record is removed.
+    unsafe { unconfine(mmio_va, dt_va, cmd_phys, bdf, rec.l4_phys, hhdm) };
 
     crate::kprintln!(
         "iommu: released BDF {:02x}:{:02x}.{} -> DTE back to passthrough, I/O page table freed",

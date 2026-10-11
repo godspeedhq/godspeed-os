@@ -106,12 +106,12 @@ core **is** a concurrency primitive, and belongs beside `SpinLock`. `task/schedu
 
 ### The new authority step A created, and how it was closed
 
-`spawn_probe` binds a **caller-supplied** name to the probe binary, and every service holds a spawn
+`spawn_probe_row` binds a **caller-supplied** name to the probe binary, and every service holds a spawn
 cap (22 Test A9 asserts exactly that). A compromised service could wait for `fs` to die and register
 the probe binary under the name `fs`; clients reacquiring by name (14.3) would wire straight to it.
 
 The kernel name directory is the recovery anchor, and an anchor that can be squatted is not one. So
-`spawn_probe` refuses any name in the real catalogue - **the whole catalogue, not the live set**,
+`spawn_probe_row` refuses any name in the real catalogue - **the whole catalogue, not the live set**,
 because a name is dangerous precisely while its service is DEAD, which is exactly when a liveness
 check would report the name free.
 
@@ -291,7 +291,7 @@ Adding a driver used to take four kernel edits, and all four are closed:
 | `service_config` row | image, memory, core, peers | **step C** |
 | `service_privileges(name)` | which caps it may hold | **step C** |
 | `service_hw(name)` + an `HwClass` variant | MMIO base, DMA size, BDF, IOMMU policy | **step C** (passed at spawn) |
-| `pci::XXX_FOUND` / `MMIO_BASE` / `BDF` statics | what the kernel's PCI scan found | **step D** (D3c-D3e) |
+| `pci::XXX_FOUND` / `EHCI_MMIO_BASE` / `BDF` statics | what the kernel's PCI scan found | **step D** (D3c-D3e) |
 
 `HwClass::Xhci` never decided anything. It read the per-class statics the kernel's PCI scanner filled
 in, and those are gone: the scan records into one generic device table and `pci::xhci()` / `pci::nic()`
@@ -1647,7 +1647,7 @@ does the service still call the syscall?
   before C it could not, and that nothing before step 2 prevents it.** The IRQ-routing half is closed
   (see 9.1). The code-introduction half stands, is now recorded in the constitution rather than only
   here, and is the reason step 2 exists.
-- **CLOSED: the name-squatting regression this work caused.** `spawn_probe` let a SPAWN holder choose
+- **CLOSED: the name-squatting regression this work caused.** `spawn_probe_row` let a SPAWN holder choose
   the NAME of the task it started while the KERNEL supplied the probe image, and refused "a real
   service's name" by asking the kernel's service catalogue - which step C emptied, silently shrinking
   the refusal set to `{supervisor, probe}`. It mattered because the name directory is the recovery

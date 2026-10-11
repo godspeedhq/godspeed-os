@@ -8,9 +8,8 @@ Multi-core coordination (§9, §11). The IPI protocol lives in `ipi.rs`; the int
 |-----------------|---------------|
 | `mod.rs`        | `init(boot_info)`: init per-core state, start APs; `percpu_init(boot_info)`: size the per-core arenas to N |
 | `core.rs`       | `CoreState` per core; `mark_ready(core_id)`, `ready_count()`, `is_ready(core_id)` |
-| `ipi.rs`        | `send_ipi(core_id, vector)`, `broadcast_tlb_shootdown(virt)`, `ipi_handler(vector)` |
+| `ipi.rs`        | `send_ipi(core_id, vector)`, `ipi_handler(vector)` |
 | `percpu.rs`     | `PerCore<T>` - boot-allocated per-core arenas (§26.6.1), sized to N cores at boot from the frame allocator (not `[_; MAX_CORES]`); all `unsafe` isolated here behind safe `get()` |
-| `placement.rs`  | `resolve(contract_core)` → `Ok(core_id)` or `Err(PlacementInvalid)` - DEAD CODE: the live placement is `task::resolve_spawn_core` |
 | `names.rs`      | `NameTable` / `AtomicNameSet` - fixed-size task-name and peer-name storage, so `task/` needs no `unsafe` for them |
 | `spinlock.rs`   | `SpinLock<T>` / `SpinLockGuard<T>` - RAII spinlock for safe mutable statics throughout the kernel |
 
@@ -32,42 +31,42 @@ Cores discovered at boot are fixed for the system lifetime. No hotplug. The core
 
 ## IPI vectors
 
-Three distinct vectors, defined in `ipi::vectors`:
+Two vectors, defined in `ipi::vectors`:
 
 | Vector              | Value | Purpose |
 |---------------------|-------|---------|
 | `WAKE_RECEIVER`     | 0xF0  | Wake a task blocked on `recv` (cross-core send) |
-| `TLB_SHOOTDOWN`     | 0xF1  | Invalidate a page on remote TLBs (unmap) |
 | `SCHEDULER_TICK`    | 0xF2  | Force a scheduling point (timer overflow broadcast) |
 
-## TLB shootdown protocol (§10.5)
+0xF1 was `TLB_SHOOTDOWN`. It is unused now, and is not renumbered.
 
-```mermaid
-sequenceDiagram
-    participant C0 as Core 0 (unmapping)
-    participant C1 as Core 1
-    participant C2 as Core 2
+## TLB coherence (§10.5) - no shootdown, and why
 
-    C0->>C0: disable interrupts
-    C0->>C1: IPI TLB_SHOOTDOWN(virt_addr)
-    C0->>C2: IPI TLB_SHOOTDOWN(virt_addr)
-    C1->>C1: invlpg(virt_addr), increment ack
-    C2->>C2: invlpg(virt_addr), increment ack
-    C0->>C0: spin until ack_count == ready_count - 1
-    C0->>C0: re-enable interrupts
-    C0->>C0: free_frame(reclaimed_frame)
-```
+There is no cross-core TLB shootdown in this kernel. A software broadcast (a per-initiator request
+slot and ack bitmask, serviced from the IPI handler and from the waiting core's own spin so that two
+initiators could not deadlock) lived in `ipi.rs` with no caller, and was deleted on 2026-10-10
+(`backlog/80` K20) after a per-port proof that translation coherence holds without it:
 
-This is a synchronous barrier. **Nothing in the kernel calls it today** (`broadcast_tlb_shootdown` and `broadcast_full_tlb_flush` have no callers): memory is reclaimed only at service death, and the kill path relies on every other core having switched to a different address space first (its spin-wait) rather than on a shootdown - see the reclaim comment in `scheduler::kill_task_by_slot`. The protocol below is kept for the day an unmap happens while a task lives.
+- **Nothing unmaps a live user mapping.** Memory is reclaimed only at task death; the only other
+  unmaps are boot-time (the kernel-stack guards, before any other core starts) and selftests.
+- **Reclaim waits for quiescence.** `kill_task_by_slot` frees nothing until no core is running the
+  task or still leaving it (`core_still_using`: `CORE_CURRENT` and `CORE_LEAVING`).
+- **Every switch invalidates on its own core.** x86 writes CR3 (no PCID), ARMv7 issues `TLBIALL`
+  when TTBR0 changes, RISC-V issues `sfence.vma` after writing `satp`, and AArch64 flushes on every
+  switch. No port uses ASIDs or PCIDs, and no user mapping is global.
+- **AArch64's idle core keeps the dead root installed**, and the Cortex-A72 may walk it
+  speculatively, so its `free_page_table_root` invalidates inner-shareable (`tlbi vmalle1is`)
+  before the root is freed. The other ports' idle cores run on the kernel root.
 
-**Concurrent shootdowns are safe (per-core requests).** Each *initiating* core has its own request slot in `ipi.rs` - `SHOOTDOWN_ADDR[core]` plus a per-initiator ack **bitmask** (`SHOOTDOWN_ACK_MASK[core]`: bit *y* = receiver *y* has serviced this request; one bit per core-pair, `N²/8` bytes) - and a core waiting for its own acks also services every other core's pending request (`service_pending`, called from both the IPI handler and the ack-wait spin). So two cores unmapping at the same time ack each other instead of deadlocking. The single-global `TLB_ACK`/`TLB_SHOOTDOWN_ADDR` counter this replaced **deadlocked** under concurrent reclaims: each initiator spun IF=0 waiting for the other's ack while being a target of the other's all-excluding-self broadcast, so neither could ack - the `chaos max-carnage` 71K-round wedge on the T630. The diagram above is still the single-unmapper common case; the per-core slots generalise it to N simultaneous unmappers.
+A future feature that unmaps or downgrades a mapping a LIVE task can reach is a new requirement and
+brings its own coherence mechanism with it. Property test P7 checks the property itself: a fresh
+task given the same addresses as a killed one must read its own zeroed pages, never the dead
+task's.
 
 ## Placement (§9.2)
 
-`resolve` below is dead code; the live rule is `task::resolve_spawn_core` (a strict override, else a preferred core with a loud round-robin fallback, else round-robin). What follows describes `resolve`.
-
-`resolve(contract_core)` returns the core a new service instance should run on:
-- `Some(n)` → requires core `n`; returns `PlacementInvalid` if `!is_ready(n)`.
-- `None` → round-robin via `RR_COUNTER % ready_count`.
-
-On restart, `resolve` is called again with the same contract. The previous core is not remembered (§9.2 "on restart" clause).
+Placement is not in this module. The live rule is `task::resolve_spawn_core`: a strict override,
+else the spawn request's preferred core with a loud round-robin fallback, else round-robin. On restart
+it is asked again from scratch, so the previous core is not remembered (§9.2 "on restart" clause).
+(An `smp::placement::resolve` described here had no callers and was deleted 2026-10-10, `backlog/80`
+K20.)

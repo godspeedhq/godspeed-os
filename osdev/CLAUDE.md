@@ -48,7 +48,7 @@ Host-side developer CLI (§17). Builds for the developer's machine, not the kern
 | `osdev script-disk <out> <script.gsh>` | Build a flashable GSFS data disk with `<script>` baked in as `/<basename>` - `dd` it to the data drive, boot, `run /<basename>` (the hardware self-check) |
 | `osdev validate`            | Validate all contracts against the JSON schema |
 | `osdev conform [--check] [--selftest] [--list] [--explain CODE]` | The front door to the enforcement layer: fix what is decidable, report the rest (`docs/conformance.md`) |
-| `osdev test <other>`        | This table is not the whole list: `cmd_test` in `src/main.rs` also dispatches `iommu` (§22 Test 12), `blockdev`, `fs-all` and the other `fs-*` suites, `reply-dead`, `trace`, `examples`, `counter`, `jobs`, `chaos-repro[:rounds[:iters]]`, `cross-isa` and more. An unknown name prints `unknown test suite` |
+| `osdev test <other>`        | This table is not the whole list: `cmd_test` in `src/main.rs` also dispatches `iommu` (§22 Test 12), `blockdev`, `fs-all` and the other `fs-*` suites, `reply-dead`, `trace`, `examples`, `counter`, `jobs`, `chaos-repro[:rounds[:iters]]`, `cross-isa` and more. An unknown name prints `unknown test suite` and exits 2, having run nothing |
 | `osdev shell [--smp N]`     | Boot in QEMU with the interactive shell on stdin/stdout (bare-metal build - no probe services; type `help` at `gsh>` prompt; Ctrl-A X to quit) |
 | `osdev image`               | Build with `bare-metal` supervisor + create UEFI-bootable `build/os-usb.img` (GPT + ESP + BOOTX64.EFI) |
 | `osdev image --mode perf`   | Same image, `perf-only` supervisor (B1-B10 probes) |

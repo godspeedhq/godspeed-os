@@ -156,8 +156,8 @@ selftest:
 arm32: exception vectors installed (VBAR = 0x000080a0)
 arm32: DTB memory node - base 0x00000000, size 0x3b400000 (948 MiB), end 0x3b400000
 arm32: MMU ON (short descriptors, 1 MiB sections, L1 @ 0x00020000)
-arm32: MMU selftest PASS (RAM + MMIO identity, unmapped faults)
 arm32: caches ON (I + D + branch prediction)
+arm32: MMU selftest PASS (RAM + MMIO identity, unmapped faults)
 arm32: generic timer CNTFRQ = 19200000 Hz  ... measured 1000000 Hz  (BCM2836 quirk, using MEASURED)
 arm32: tick selftest PASS (timer IRQ fires at the requested rate)
 arm32: context selftest PASS (two kernel contexts switch and resume)

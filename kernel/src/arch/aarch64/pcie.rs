@@ -507,7 +507,7 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
                 if raw & 0x1 == 0 { *b = (raw & !0xF) as u64; }   // memory BAR; I/O BARs are not usable here
             }
             let irq_line = (cfg_read(1, dev, 0, 0x3C) & 0xFF) as u8;
-            let bdf = ((1u32) << 8) | ((dev as u32) << 3);        // bus 1, func 0 - same encoding as x86's make_bdf
+            let bdf = ((1u32) << 8) | ((dev as u32) << 3);        // bus 1, func 0 - the standard bus<<8 | dev<<3 | func encoding
             crate::arch::aarch64::pci::record_device(bdf, class, bars, irq_line, vendor, device);
         }
 
@@ -641,8 +641,7 @@ fn enumerate(cpu_base: u64, cpu_size: u64) -> Option<Device> {
         // order and the wrong one - it leaves a window where the endpoint can post and nothing acks.
         if enable_msi(1, dev, 0) {
             unmask_msi();
-            put_str(b"pcie: xHCI MSI enabled - the driver waits on interrupts
-");
+            put_str(b"pcie: xHCI MSI enabled - the driver waits on interrupts\n");
         }
 
         let bar_back = cfg_read(1, dev, 0, 0x10) & !0xF;

@@ -148,8 +148,7 @@ pub(super) fn set_pinctrl_base(base: u64) {
 fn configure_pins() {
     let base = PINCTRL_BASE.load(Ordering::Relaxed);
     if base == 0 {
-        super::print_str("riscv64: usb - no sys pinctrl; the ports cannot be powered
-");
+        super::print_str("riscv64: usb - no sys pinctrl; the ports cannot be powered\n");
         return;
     }
     // The GPIO block's own enable, which the reference driver writes once at probe.
@@ -170,8 +169,7 @@ fn configure_pins() {
             (e & !(PIN_DOEN_MASK << shift)) | (doen << shift),
         );
     }
-    p_str("riscv64: usb - port power and the usb2/3 switch driven
-");
+    p_str("riscv64: usb - port power and the usb2/3 switch driven\n");
 }
 
 pub(super) fn set_bases(stgcrg: u64, syscon: u64, xhci: u64, syscrg: u64, sys_syscon: u64, phy: u64) {
@@ -238,8 +236,7 @@ pub fn init() -> bool {
     p_str(if app { "on" } else { "FAIL" });
     p_str(" split=");
     p_hex(mmio_read(sys_syscon, SYSCON_USB_SPLIT) as u64);
-    p_str("
-");
+    p_str("\n");
 
     // TRY THEM ALL, THEN DECIDE - the same rule the display's clocks follow, for the same reason: a
     // board boot is the expensive thing here, and stopping at the first failure spends one to learn

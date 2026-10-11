@@ -771,7 +771,7 @@ def _contracts():
     it would be the defect this whole file exists to catch: a check that quietly reads nothing and
     then reports a pass.
     """
-    import tomllib
+    import toml_compat as tomllib  # tomllib on 3.11+, the subset parser below it (README: 3.8)
     out = {}
     for base in ("services", "examples"):
         root = os.path.join(ROOT, base)
@@ -1799,27 +1799,47 @@ CHECKS = [
          ]),
 ]
 
-# Commandments with no mechanical check yet. Printed on EVERY report so the gap cannot be forgotten.
+# What the checks above do NOT cover, per commandment. Printed on EVERY report so the gap cannot be
+# forgotten. Each line names the part left to a human - most commandments now have a check, and none
+# is covered whole, so a commandment with a check is listed here too, for its uncovered half.
+#
+# Rewritten 2026-10-10 (backlog/80 T4). The list said IV, V, VII and IX were "not built" while
+# IV-contract-authority, V-managed-watched, V-no-panic, VII-service-grants and two IX checks ran on
+# every build, and the summary line counted the `-` of `integrity-baseline` as a commandment, so it
+# said 10/10 mechanised with VIII uncovered.
 UNMECHANISED = [
-    ("II", "runtime - HALF built", "Chaos. Who is EXCLUDED from the storm is pinned; whether the "
-                                   "storm was ever run and passed is not. `chaos max-carnage` needs "
-                                   "to become a gate with a threshold, not an operator's good "
+    ("II", "runtime - half built", "Chaos. Who is EXCLUDED from the storm is pinned (II-chaos-exclusions); "
+                                   "whether the storm was ever run and passed is not. `chaos max-carnage` "
+                                   "needs to become a gate with a threshold, not an operator's good "
                                    "intentions."),
-    ("III", "judgment", "One irreducible truth. Whether a stored value is a derived view or a second "
-                        "truth is a design question: does it reduce to one source, and does that "
-                        "source win?"),
-    ("IV", "static, not built", "Contracts. scripts/contract_check.py already reconciles declared "
-                                "capabilities against kernel grants; fold it in here."),
-    ("V", "runtime, not built", "The other half of V: a service must not HANG. Kill each dependency "
-                                "and assert every caller still answers."),
-    ("VII", "static, not built", "Ambient authority. Every capability-taking syscall must validate a "
-                                 "capability before acting, and by-name kernel grants must be listed."),
-    ("VIII", "static heuristic, not built", "Wait on truth. A bound expressed in ITERATIONS rather "
+    ("III", "judgment - half built", "One irreducible truth. A constant declared twice in a crate is caught "
+                                     "(III-duplicate-constants); whether a stored value is a derived view or "
+                                     "a second truth is a design question: does it reduce to one source, and "
+                                     "does that source win?"),
+    ("IV", "static - half built", "Contracts. IV-contract-authority reconciles a contract's claimed authority "
+                                  "with what is granted, and scripts/contract_check.py its peers, memory and "
+                                  "core; neither proves a binary uses only what it declares (CLAUDE.md 13.4)."),
+    ("V", "runtime - half built", "Restartable. Watched and not halting are checked (V-managed-watched, "
+                                  "V-no-panic); a service must also not HANG - kill each dependency and "
+                                  "assert every caller still answers."),
+    ("VII", "static - half built", "Ambient authority. What each service may reach is pinned "
+                                   "(VII-service-grants); that every capability-taking syscall validates a "
+                                   "capability before acting is reviewed, not checked."),
+    ("VIII", "static heuristic, not built", "Wait on truth. NO CHECK. A bound expressed in ITERATIONS rather "
                                             "than a clock, and a sleep in a loop whose exit never "
                                             "reads the thing awaited."),
-    ("IX", "runtime, not built", "Recovery. If recovery cannot be tested, it does not exist."),
-    ("X", "judgment", "Complexity in the layer that owns it. No machine decides this."),
+    ("IX", "runtime - half built", "Recovery. That a peer can be reacquired, and that the library a service "
+                                   "leans on recovers, is checked (IX-peer-reacquire, IX-stdlib-delegates); "
+                                   "that recovery WORKS needs it run. If it cannot be tested, it does not exist."),
+    ("X", "judgment - half built", "Complexity in the layer that owns it. The user vocabulary is checked "
+                                   "(X-user-vocabulary); where complexity belongs is not a machine's call."),
 ]
+
+
+def covered_commandments():
+    """The commandments at least one check covers. `-` is a check of the baseline itself, not a
+    commandment, and counting it is how this said 10/10 with VIII uncovered."""
+    return {c["commandment"] for c in CHECKS} - {"-"}
 
 
 def run_check(check, pins):
@@ -1829,7 +1849,7 @@ def run_check(check, pins):
 # --------------------------------------------------------------------------------------------------
 
 def load_baseline():
-    import tomllib
+    import toml_compat as tomllib  # tomllib on 3.11+, the subset parser below it (README: 3.8)
     if not os.path.exists(BASELINE):
         return {}, []
     try:
@@ -1899,6 +1919,28 @@ def selftest():
             if not ok:
                 print(f"      {RED}this check no longer does what it claims. Was it weakened?{OFF}")
     total = sum(len(c["probes"]) for c in CHECKS)
+
+    # The TOML this file reads must parse the same on every supported Python. 3.11+ has `tomllib`;
+    # below it `toml_compat` falls back to a parser for the subset these files use, and a hand parser
+    # is only right until somebody writes a construct it lacks. So where both exist they must agree on
+    # every file this script reads - and a contract using new TOML fails HERE, on the developer's
+    # 3.11+, before it can mislead a build on 3.8.
+    import toml_compat
+    tomls = [BASELINE] + [os.path.join(ROOT, rel) for rel, _caps in _contracts().values()]
+    disagree = toml_compat.self_check(sorted(set(tomls)))
+    total += 1
+    if disagree is None:
+        print(f"  {DIM}--{OFF}                 toml           no tomllib on this Python: the subset parser IS "
+              f"the reader, so there is nothing to compare it with")
+    elif disagree:
+        failed += 1
+        for p, why in disagree:
+            print(f"  {RED}BROKEN{OFF}             toml           {os.path.relpath(p, ROOT)}: {why}")
+        print(f"      {RED}scripts/toml_compat.py would read this wrong on Python 3.8-3.10. Extend the "
+              f"parser, or keep the file inside its subset.{OFF}")
+    else:
+        print(f"  {GREEN}ok{OFF}                 toml           the 3.8 fallback reads all {len(set(tomls))} TOML "
+              f"file(s) exactly as tomllib does")
     if failed:
         print(f"\n{RED}{BOLD}  {failed}/{total} probes BROKEN - the enforcement layer is damaged.{OFF}")
         print(f"  A weakened check is worse than no check: it reports PASS over code it stopped "
@@ -1931,17 +1973,23 @@ def report(pins, exemptions):
     print(f"  {BOLD}What the numbers in these checks MEAN - they are not all the same claim:{OFF}")
     print(f"    {BOLD}rule{OFF}    ({kinds.get('rule', 0)})  a fixed truth. Any deviation is a FAILURE. "
           f"§4.3 says six responsibilities; the kernel spawns exactly one service; nothing escapes Chaos.")
-    print(f"    {BOLD}record{OFF}  ({kinds.get('record', 0)})  a snapshot, NOT an endorsement. 49 syscalls "
-          f"is not a claim that 49 is right - only that a 50th must be deliberate. A pass here means "
-          f"UNCHANGED, never correctly-sized.")
+    # Read from the baseline, never typed in: these said 49 syscalls and 218 service configs long
+    # after the pins held 54 and 1 (backlog/80 T4).
+    nsys = len(pins.get("syscalls", {}))
+    nconf = len(pins.get("service_configs", []))
+    print(f"    {BOLD}record{OFF}  ({kinds.get('record', 0)})  a snapshot, NOT an endorsement. {nsys} syscalls "
+          f"is not a claim that {nsys} is right - only that the next one must be deliberate. A pass here "
+          f"means UNCHANGED, never correctly-sized.")
     print(f"    {BOLD}debt{OFF}    ({kinds.get('debt', 0)})  a distance from where it should be, which may "
-          f"only shrink. 218 kernel service configs against a target of one." + chr(10))
+          f"only shrink. {nconf} kernel service config(s) against a target of one." + chr(10))
     print(f"  {BOLD}Not mechanised - human review, every time:{OFF}")
     for num, bucket, why in UNMECHANISED:
         print(f"  {num:>4}  {DIM}[{bucket}]{OFF} {why}")
-    covered = len({c["commandment"] for c in CHECKS})
-    print(f"\n  {len(CHECKS)} checks cover {covered} of 10 commandments. The rest are NOT covered, "
-          f"and a green build does not claim otherwise.\n")
+    covered = covered_commandments()
+    missing = [n for n in ("I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X") if n not in covered]
+    print(f"\n  {len(CHECKS)} checks touch {len(covered)} of 10 commandments (none for: "
+          f"{', '.join(missing) or '-'}), and cover none of them whole. A green build does not claim "
+          f"otherwise.\n")
 
 
 def main():
@@ -1959,9 +2007,10 @@ def main():
         ratchets += ratchet
 
     if not failures and not ratchets:
-        covered = len({c["commandment"] for c in CHECKS})
+        covered = covered_commandments()
         print(f"{GREEN}commandments: {len(CHECKS)} checks pass{OFF} "
-              f"({covered}/10 mechanised, {len(UNMECHANISED)} need human review - see --report)")
+              f"({len(covered)}/10 have a check, none whole; {len(UNMECHANISED)} need human review "
+              f"for what is left - see --report)")
         return 0
 
     print(f"\n{RED}{BOLD}{'=' * 94}{OFF}")

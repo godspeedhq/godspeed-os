@@ -4,12 +4,14 @@
 /// `osdev build` compiles the service crates BEFORE the kernel so these
 /// paths exist by the time the kernel's `include_bytes!` macros run.
 ///
-/// ONLY FOUR ARE READ. Since step C the kernel embeds one image it spawns, `SVC_SUPERVISOR_ELF`
-/// (`task/mod.rs`); `SVC_EVENTS_ELF`, `SVC_PING_ELF` and `SVC_PONG_ELF` are read by the arm32
-/// bring-up scaffolding (`arch/arm/loadtest.rs`, `arch/arm/sched_ipc.rs`). Every other service image
-/// is embedded by the SUPERVISOR (`services/supervisor/build.rs`), so the rest of this list, and the
-/// per-arch `*_built` lists, decide nothing the kernel uses - their notes below about `LoadFailed`
-/// describe the time before the images moved.
+/// FOUR, because four are read. Since step C the kernel embeds one image it spawns,
+/// `SVC_SUPERVISOR_ELF` (`task/mod.rs`); `SVC_EVENTS_ELF`, `SVC_PING_ELF` and `SVC_PONG_ELF` are read by
+/// the arm32 bring-up scaffolding (`arch/arm/loadtest.rs`, `arch/arm/sched_ipc.rs`). Every other
+/// service image is embedded by the SUPERVISOR (`services/supervisor/build.rs`). This list emitted 29
+/// until 2026-10-10, 25 of which nothing included (`backlog/80` K16). The per-arch `*_built` lists
+/// below still name the services each port builds - `scripts/service_embed_check.py` reads them - but
+/// for the kernel they now decide only these four; their notes about `LoadFailed` describe the time
+/// before the images moved.
 fn main() {
     // Stamp the short git SHA into the KERNEL, so the very first boot line identifies the image.
     //
@@ -63,8 +65,27 @@ fn main() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".into());
     let arch = if arch == "arm" { "arm32".to_string() } else { arch };
     println!("cargo:rustc-env=GODSPEED_TARGET_ARCH={arch}");
-    if std::path::Path::new(".git/logs/HEAD").exists() {
-        println!("cargo:rerun-if-changed=.git/logs/HEAD");
+    // WHERE git keeps that log, asked of git. This looked for `.git/logs/HEAD` relative to the build
+    // script's directory, `kernel/`, where it never is, so the trigger was never registered and the
+    // stamp went stale until something else rebuilt the kernel (`backlog/80` K16). `--git-path`
+    // also answers in a worktree, where `.git` is a file and the log lives elsewhere.
+    if let Some(head_log) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "logs/HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| std::path::PathBuf::from(s.trim()))
+    {
+        // Relative paths are relative to this script's directory, where cargo runs it.
+        let head_log = if head_log.is_absolute() {
+            head_log
+        } else {
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join(head_log)
+        };
+        if head_log.exists() {
+            println!("cargo:rerun-if-changed={}", head_log.display());
+        }
     }
 
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -136,42 +157,12 @@ fn main() {
     let use_placeholder = is_loongarch64 || is_s390x || is_riscv32 || is_arm || is_aarch64 || is_riscv64;
     let placeholder = workspace.join("kernel").join("svc-placeholder.bin");
 
-    // (env-var suffix, binary name in target dir)
-/// Services that exist only on one architecture, so their absence from another target's build is a
-/// FACT rather than an omission. `dwc2` drives the BCM283x USB controller: there is no such device on
-/// x86, and no reason to carry the driver there.
-const ARM_ONLY: &[&str] = &["dwc2"];
-
+    // (env-var suffix, binary name in target dir) - every `SVC_*_ELF` some kernel code includes.
     let services: &[(&str, &str)] = &[
         ("SUPERVISOR", "supervisor"),
-        ("DWC2",       "dwc2"),
         ("EVENTS",     "events"),
-        ("RECORDER",   "recorder"),
-        ("COPIER",     "copier"),
-        ("CONSOLE",    "console"),
-        ("TIME",       "time"),
-        ("CONTROL",    "control"),
-        ("MEM_PRESSURE",    "mem-pressure"),
-        ("CHAOS",      "chaos"),
         ("PING",       "ping"),
         ("PONG",       "pong"),
-        ("GREET",      "greet"),
-        ("UPPER",      "upper"),
-        ("ROSTER",     "roster"),
-        ("PROBE",      "probe"),
-        ("OBSERVE",    "observe"),
-        ("SHELL",      "shell"),
-        ("XHCI",       "xhci"),
-        ("EHCI",       "ehci"),
-        ("BLOCK_DRIVER", "block-driver"),
-        ("NIC_DRIVER",  "nic-driver"),
-        ("NET_STACK",   "net-stack"),
-        ("FS",         "fs"),
-        ("COUNTER",    "counter"),  // examples/counter: stateful service, survives its own restart
-        ("REPLY_SERVER", "reply-server"), // examples/reply-server: request/reply (RPC) server
-        ("ASKER",      "asker"),    // examples/asker: the request/reply CLIENT that exercises reply-server
-        ("RESOURCE_SERVER", "resource-server"), // examples/resource-server: MINTs a delegated resource cap (§7.10)
-        ("HOLDER",     "holder"),   // examples/holder: the CLIENT that USEs the granted resource cap
     ];
 
     // (Note 2026-10-09: read the two lists below with the riscv64 note further down. Since step C the
@@ -333,14 +324,6 @@ const ARM_ONLY: &[&str] = &["dwc2"];
                        bin_name, rv_bin.display());
             }
         } else if use_placeholder {
-            placeholder.clone()
-        } else if ARM_ONLY.contains(bin_name) {
-            // An ARM-ONLY driver on an x86 build. The placeholder is the right answer and this branch
-            // is explicit rather than a fallback-if-missing, because "the binary is not there" has two
-            // causes with opposite fixes: a service that does not APPLY to this target (fine, embed
-            // the placeholder) and a service that was left out of the build list (a bug, and one that
-            // surfaces as `LoadFailed(TooSmall)` - which reads like a broken binary, exactly the trap
-            // the comment above warns about). Silently accepting a missing file would merge the two.
             placeholder.clone()
         } else {
             target_dir.join(bin_name)

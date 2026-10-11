@@ -48,7 +48,6 @@ assert ok version
 assert ok cores
 assert ok mem
 assert ok date
-assert ok date epoch
 # wait: the q-abortable pacing pause (the library watch loop is built on it)
 assert ok wait 1
 assert fails wait
@@ -80,10 +79,10 @@ mem | assert contains used
 # effect. That is a repair wearing a probe's face, it costs time on every run, and a test that changes
 # the system has stopped measuring it.
 #
-# `date epoch` yields 0 when the clock is unset, so iterating its output (`for line in (producer)`,
-# section 6 of the language part, `00-language.gsh`) gives a testable value without touching anything. `assert contains` cannot serve as
-# the probe because it FAILS the suite rather than returning a boolean, and there is no bare
-# `contains` - that dead end is what made an earlier attempt invent syntax.
+# `date epoch` FAILS when the clock is unset (it printed 0 until 2026-10-10, `backlog/80` H20, and the
+# probe iterated that 0), so `if date epoch` is the probe: it reads the clock and changes nothing.
+# `assert contains` cannot serve as the probe because it FAILS the suite rather than returning a
+# boolean - that dead end is what made an earlier attempt invent syntax.
 #
 # When the clock IS set the format is still asserted properly, so a broken `date` still fails. Only
 # "this machine cannot know the time" is skipped, and it is skipped OUT LOUD, because a silent skip is
@@ -92,9 +91,7 @@ mem | assert contains used
 # (An earlier version of this hung the whole suite: it used `$var = ...`, which is not an assignment,
 # so a counter never incremented and a `wait 1` loop ran forever. Real grammar is in section 1 of
 # `00-language.gsh`: `let mut` to declare, `name = $name + 1` to assign. Test script changes on hardware before shipping.)
-let mut clockset = 0
-for line in (date epoch) { if $line > 0 { clockset = 1 } }
-if $clockset > 0 {
+if date epoch {
     date | assert contains :
 } else {
     skip 'date - the clock is not set on this machine (no RTC, no network); not a failure'

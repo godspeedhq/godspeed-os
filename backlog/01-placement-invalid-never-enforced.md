@@ -23,12 +23,15 @@ be exactly the kind of reinterpretation a capability-based system is designed to
 
 ## What actually happens
 
-The compiler says it without being asked:
+The compiler said it without being asked (the warning pointed at line 12 of `smp/placement.rs`):
 
 ```
 warning: struct `PlacementInvalid` is never constructed
-  --> kernel/src/smp/placement.rs:12:12
+  --> smp/placement.rs, line 12
 ```
+
+(2026-10-10: `smp/placement.rs` was deleted, `backlog/80` K20 - it had no callers. The live placement
+is `task::resolve_spawn_core`.)
 
 And a single-core boot shows the consequence:
 

@@ -8,7 +8,7 @@ version = "0.1.0"
 # request = the minimum to START; limit = the most it may ever allocate. Past `limit` ->
 # AllocDenied (recoverable); touching unmapped memory -> page fault (fatal). CLAUDE.md §10.2-§10.4.
 request = "32MiB"
-limit   = "64MiB"
+limit   = "32MiB"
 
 [capabilities]
 # Explicit grants only - this service can do ONLY what is listed (Commandment VII, no ambient
@@ -17,7 +17,10 @@ limit   = "64MiB"
 # ipc_receive, log_write, the authority keys
 # (console_push, resource_mint, service_control, cpu_clock, pci_cfg) and the driver hw_* keys.
 ipc_receive = ["cap-grant"]   # OWNS its endpoint - the grantable SEND|GRANT cap it hands out points here
-ipc_send    = ["receiver"]    # the peer it transfers the grantable cap to
+# No `ipc_send`. It reaches "receiver" BY NAME, through the kernel's name directory, which its spawn
+# row allows with the ACQUIRE_ANY privilege - not through a peer the supervisor wires in, and no
+# contract key expresses that privilege. This said `ipc_send = ["receiver"]`, a peer its row never
+# granted, and `contract_check.py` compares an example's peers with its row now (backlog/80 T8).
 log_write   = true            # may write the kernel log ring + serial (syscall 5); NOT to any service
 
 # No [placement] section - omit it (as here) and the supervisor ROUND-ROBINS this service across

@@ -134,11 +134,6 @@ impl IdtEntry {
             _reserved:   0,
         }
     }
-
-    /// Like `new` but DPL=3 - ring-3 code may invoke this vector via `int N`.
-    fn new_user(handler: u64) -> Self {
-        Self { type_attr: 0xEE, ..Self::new(handler) } // P=1, DPL=3, interrupt gate
-    }
 }
 
 // SAFETY: written only during init_idt before APs start; read-only after.
@@ -1029,24 +1024,7 @@ pub unsafe fn send_ipi_to_lapic(lapic_id: u32, vector: u8) {
     }
 }
 
-/// Broadcast `vector` as an IPI to all cores EXCEPT this one (xAPIC all-excluding-self shorthand). The
-/// arch seam for a BROADCAST IPI (AArch64: GIC SGI with the broadcast target-list filter).
-///
-/// # Safety
-/// The APIC must be mapped; the caller holds IF=0 (or has saved/disabled it).
-#[inline]
-pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
-    // SAFETY: APIC mapped; IF=0. Shorthand 0b11 (all-excluding-self, ICR_LOW bits 19:18), fixed
-    // delivery, edge, assert (bit 14); DELIVS polled first (SDM 10.6.1).
-    unsafe {
-        write_apic(APIC_VIRT_BASE, APIC_ICR_HIGH, 0);
-        apic_wait_icr_idle();
-        write_apic(APIC_VIRT_BASE, APIC_ICR_LOW, (vector as u32) | (1 << 14) | (0b11 << 18));
-    }
-}
-
-/// Broadcast an NMI to all cores EXCEPT this one. Unlike `broadcast_ipi_all_but_self` (a maskable
-/// fixed-delivery vector), an NMI reaches a core even when it is running with interrupts disabled -
+/// Broadcast an NMI to all cores EXCEPT this one. Unlike a maskable fixed-delivery vector, an NMI reaches a core even when it is running with interrupts disabled -
 /// e.g. spinning on a lock. The panic path (`halt_all_cores`, SEC-18) uses this so a panic on one core
 /// actually stops the machine (§6.2, §19); `idt[2]` routes the NMI to `exception_halt`.
 ///
@@ -1491,10 +1469,16 @@ pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
 ///   kills the task, a ring-0 one halts), except: 2 (NMI) → `exception_halt`, 6 (#UD) → the `ud2`
 ///   syscall entry, 13 → `gpf_stub`, 14 → `pf_stub` (both also kill on ring 3 and halt on ring 0).
 /// - Vector 32  → APIC timer preemption (§9.1).
-/// - Vector 36 (COM1), the xHCI/EHCI MSI vectors and the MSI pool → their stubs; 0x80 → `int80_entry`
-///   (DPL=3); 0xFF → `spurious_stub`.
+/// - Vector 36 (COM1), the xHCI/EHCI MSI vectors and the MSI pool → their stubs; 0xFF →
+///   `spurious_stub`.
+/// - NO gate is DPL=3. The `int 0x80` syscall entry was removed on 2026-10-10 (`backlog/80` K7): the
+///   SDK traps with `ud2` on every x86 machine, and the old gate ran the syscall chain on the
+///   top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off -
+///   while any service could still raise it. An `int 0x80` now finds no gate, faults, and the
+///   CPL-discriminating handler kills the task that raised it.
 /// - Vector 0xF0 → WAKE_RECEIVER IPI.
-/// - Vector 0xF1 → TLB_SHOOTDOWN IPI.
+/// - Vector 0xF1 is unused: it was the TLB_SHOOTDOWN IPI, deleted with the broadcast it served
+///   (`backlog/80` K20). It now lands on the default `exception_halt`, as any unused vector does.
 /// - Vector 0xF2 → SCHEDULER_TICK IPI.
 ///
 /// # Safety
@@ -1554,9 +1538,7 @@ pub(super) unsafe fn init_idt() {
             idt[super::interrupts::MSI_POOL_BASE as usize + i] =
                 IdtEntry::new(super::interrupts::msi_pool_stub(i));
         }
-        idt[0x80] = IdtEntry::new_user(super::syscall_entry::int80_entry as *const () as u64);
         idt[0xF0] = IdtEntry::new(ipi_wake_stub   as *const () as u64);
-        idt[0xF1] = IdtEntry::new(ipi_tlb_stub    as *const () as u64);
         idt[0xF2] = IdtEntry::new(ipi_tick_stub   as *const () as u64);
         // IDT[0xFF] = the APIC spurious-interrupt vector (SVR = 0x1FF, above). A spurious IRQ is a normal
         // hardware event (an IRQ de-asserted between CPU-ack and vector-read); the architecturally-correct
@@ -1580,7 +1562,8 @@ pub(super) unsafe fn init_idt() {
 // IPI ISR stubs (§9.4) - one naked stub per vector.
 // ---------------------------------------------------------------------------
 
-/// Dispatch target called from all three IPI stubs with the vector number.
+/// Dispatch target called from the tick IPI stub with the vector number (the wake stub goes straight
+/// to `timer_tick_from_irq`).
 ///
 /// # Safety
 /// Called from raw interrupt context (IF=0).
@@ -1631,21 +1614,6 @@ unsafe extern "C" fn ipi_wake_stub() {
         "jz 2f",
         "swapgs",
         "2:",
-        "iretq",
-    )
-}
-
-#[unsafe(naked)]
-unsafe extern "C" fn ipi_tlb_stub() {
-    core::arch::naked_asm!(
-        "push rax", "push rcx", "push rdx",
-        "push rdi", "push rsi", "push r8",
-        "push r9",  "push r10", "push r11",
-        "mov rdi, 0xF1",
-        "call ipi_dispatch",
-        "pop r11", "pop r10", "pop r9",
-        "pop r8",  "pop rsi", "pop rdi",
-        "pop rdx", "pop rcx", "pop rax",
         "iretq",
     )
 }
@@ -1933,8 +1901,9 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
 //   No error code: [RSP+0]=RIP  [RSP+8]=CS  [RSP+16]=RFLAGS  [RSP+24]=RSP
 //   Error code:    [RSP+0]=err  [RSP+8]=RIP [RSP+16]=CS      [RSP+24]=RFLAGS
 // The CS value identifies which layout applies: 0x08 for a kernel frame, and for a user frame
-// 0x2B (selector 0x28 with RPL 3, as `context_switch.rs` pushes it). (2026-10-09: the handler
-// below tests for 0x28, which a ring-3 frame never carries, so a user frame prints no RIP.)
+// 0x2B (selector 0x28 with RPL 3, as `context_switch.rs` pushes it). The handler compares the
+// selector with its RPL bits masked off; it compared the raw value with 0x28, which a ring-3 frame
+// never carries, so a user frame printed no RIP until 2026-10-10 (`backlog/80` K9).
 // ---------------------------------------------------------------------------
 
 #[unsafe(naked)]
@@ -1982,8 +1951,9 @@ unsafe extern "C" fn exception_halt() -> ! {
 #[no_mangle]
 unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) {
     // Identify the likely frame layout by finding the CS slot.
-    // CS is zero-extended to 64 bits on the stack: 0x08 (kernel) or 0x2B (user, RPL 3) - the
-    // checks below test 0x28, so only kernel frames are recognised (see the block comment above).
+    // CS is zero-extended to 64 bits on the stack: 0x08 (kernel) or 0x2B (user, RPL 3). The RPL
+    // bits are masked off before comparing, so both are recognised (see the block comment above).
+    let is_cs = |w: u64| w & !3 == 0x08 || w & !3 == 0x28;
     // Take SERIAL_LOCK if it can be taken safely (audits/kernel-audit.md Audit 10). The `_nolck`
     // writers below exist because this fault may have interrupted a `kprintln` ON THIS CORE that
     // holds the lock, where waiting would self-deadlock - and that stays true. But bypassing the
@@ -2001,11 +1971,11 @@ unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) 
         serial_puts_nolck(b"] [");
         serial_hex64_nolck(w3);
         serial_puts_nolck(b"]");
-        if w1 == 0x08 || w1 == 0x28 {
+        if is_cs(w1) {
             // No error code pushed: w0=RIP, w1=CS
             serial_puts_nolck(b" RIP=");
             serial_hex64_nolck(w0);
-        } else if w2 == 0x08 || w2 == 0x28 {
+        } else if is_cs(w2) {
             // Error code pushed by CPU: w0=errcode, w1=RIP, w2=CS
             serial_puts_nolck(b" errcode=");
             serial_hex64_nolck(w0);
@@ -2035,8 +2005,11 @@ unsafe extern "C" fn exception_halt_handler(w0: u64, w1: u64, w2: u64, w3: u64) 
 // ---------------------------------------------------------------------------
 
 /// No-error-code exception frame: [rsp+0]=RIP [rsp+8]=CS [rsp+16]=RFLAGS [rsp+24]=RSP.
+///
+/// Also where the `ud2` syscall entry sends a RING-0 `ud2` (`syscall_entry::ud2_syscall_entry`): the
+/// #UD frame is this frame, and a kernel trap must be reported and halt every core like any other.
 #[unsafe(naked)]
-unsafe extern "C" fn exc_stub_noec() -> ! {
+pub(super) unsafe extern "C" fn exc_stub_noec() -> ! {
     core::arch::naked_asm!(
         // Raw '?' to COM1, then set the reached-flag BEFORE cli (nothing reads it today).
         "mov dx, 0x3fd",

@@ -80,8 +80,9 @@ log_write    = true
 # A DMA arena is granted at spawn when the spawn row names a device CLASS; reach it via
 # ctx.dma_region(). A new driver needs a spawn row, not a kernel change (see "How to adapt this").
 
-[placement]
-core = 1   # the device's interrupt routes to the core the driver runs on; pinning keeps it deterministic
+# [placement]
+# core = 1   # a REAL driver pins: its interrupt routes to the core it runs on. Commented out
+#             # here, because this one's spawn row grants no device and spawns it unpinned.
 ```
 
 ## What you must NOT do

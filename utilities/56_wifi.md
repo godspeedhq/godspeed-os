@@ -425,15 +425,15 @@ driver is alive but its radio is not up, at boot or after a respawn - the driver
 wifi: the radio is down - its firmware trapped at start (the chip came up warm); `wifi radio powercycle` cuts its power and tries again
 wifi: the radio is down - the driver found no working radio on its bus; `wifi radio powercycle` restores the chip's power and tries again
 wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again
-wifi: this board's radio is there, but its driver is not written yet (the AIC8800 - docs/wifi-aic8800.md); nothing here can bring it up
+wifi: the radio is there, but its driver stops at a stage that is not built (the serial log names it); nothing here can bring it further
 ```
 
 The fourth is reason 4 (`DOWN_NOT_BUILT`). **Corrected 2026-10-08:** this described the VisionFive 2
 Lite's radio before its driver existed. The AIC8800 now runs to a station (`docs/wifi-aic8800.md`, V0-V6),
 and `wifi-driver` sends reason 4 only when that bring-up stops before a station interface exists - so the
-shell's sentence, "its driver is not written yet ... nothing here can bring it up", is now untrue, and
-whether `radio on` and `powercycle` should retry on this reason is an open decision (`audits/documentation-audit.md`
-Audit 12). As written before: the VisionFive 2 Lite's radio, which this driver identifies and cannot yet
+shell's old sentence, "its driver is not written yet ... nothing here can bring it up", was untrue; since
+2026-10-10 it names a stage that is not built instead (`backlog/80` H13). Whether `radio on` and
+`powercycle` should retry on this reason is an open decision (`audits/documentation-audit.md` Audit 12). As written before: the VisionFive 2 Lite's radio, which this driver identifies and cannot yet
 run. `wifi radio on` and `wifi radio powercycle` print the same sentence there and restart
 nothing, since a restart would identify the same chip and stop at the same place. `wifi radio off hard` does
 cut its power, and `wifi radio on` after it restores the power, restarts the driver and ends with this
@@ -475,9 +475,9 @@ Every number is a raw count the driver keeps in its `Session` (rule 7); nothing 
 | View | What it prints |
 |---|---|
 | `wifi debug stats` | the control channel: requests sent, accepted, refused (and the last refusal's command and status), unanswered; the session's age on the driver's own clock |
-| `wifi debug transport` | the SDIO side: function and block sizes, bytes each way, frames read by channel (control, event, data, glommed, flow-control, other), and the frames read during a control wait and lost to the scan |
+| `wifi debug transport` | the bus side, named for the radio that answers (`sdio` onboard, `usb` for a dongle): bytes each way, frames read by channel (control, event, data, glommed, flow-control, other), and the frames read during a control wait and lost to the scan. It printed the CYW43455's SDIO function and block sizes for every radio until 2026-10-10 (`backlog/80` H13); the chip's own layout is in its driver's docs |
 | `wifi debug events` | how many of each firmware event this driver names has arrived, and the last one's code and status |
-| `wifi debug firmware` | the chip, the image and its provenance, the running firmware's own version string and capability words (asked of it now, not remembered), its MAC, and the supplicant fact from `docs/wifi.md` §37 |
+| `wifi debug firmware` | the radio's driver, the running firmware's own version string and capability words (asked of it now, not remembered), its MAC, and that the host runs the handshake. It printed the CYW43455 and its image for every radio until 2026-10-10 (`backlog/80` H13); the chip, the image and its provenance are `wifi hardware` and the driver's docs |
 | `wifi debug trace` | the last 64 frames on the bus, oldest first |
 
 ```
@@ -525,7 +525,7 @@ look like "no internet":
 | Driver running, firmware trapped at start | `wifi: the radio is down - its firmware trapped at start (the chip came up warm); `wifi radio powercycle` cuts its power and tries again` |
 | Driver running, no working radio on its bus | `wifi: the radio is down - the driver found no working radio on its bus; `wifi radio powercycle` restores the chip's power and tries again` |
 | Driver running, bring-up stopped early | `wifi: the radio is down - the driver's bring-up stopped before it was up (the serial log names the stage); `wifi radio powercycle` tries again` |
-| Driver running, the radio's driver not written yet (the VisionFive 2 Lite's AIC8800) | `wifi: this board's radio is there, but its driver is not written yet (the AIC8800 - docs/wifi-aic8800.md); nothing here can bring it up` |
+| Driver running, the radio's bring-up stops at a stage that is not built (reason 4) | `wifi: the radio is there, but its driver stops at a stage that is not built (the serial log names it); nothing here can bring it further` |
 | Chip powered down by `wifi radio off hard` | `radio off (hard - the chip is powered down; wifi radio on powers it up)` |
 | Radio switched off by `wifi radio off` | `radio off (soft - the firmware's switch; the chip stays powered; wifi radio on turns it back on)` |
 | SSID not found in a scan | `not joined - no network named <ssid> in range` - naming what was searched for |

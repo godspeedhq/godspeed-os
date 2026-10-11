@@ -15,7 +15,7 @@ def _probe(x):
     return None
 --- expect ---
 error[GS0103]: a script uses a Python feature newer than the declared floor
-   --> scripts/test_report.py:154
+   --> scripts/test_report.py:END+4
     |
     = rule: README.md, Requirements
     = why: `README.md` tells a contributor they need Python 3.8. That number was measured by
@@ -30,5 +30,5 @@ error[GS0103]: a script uses a Python feature newer than the declared floor
 
   python_floor_check.py reported:
   | python floor: 1 use(s) of a feature newer than the declared floor (3.8):
-  |   scripts/test_report.py:154 needs Python 3.10 - a `match` statement
+  |   scripts/test_report.py:END+4 needs Python 3.10 - a `match` statement
   | (5 more lines of explanation, which the frame above covers - `py scripts/python_floor_check.py` for all of it)

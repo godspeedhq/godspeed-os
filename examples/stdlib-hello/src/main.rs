@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Read a file and print it, using the standard library.
+//! Write a file, read it back and check it, using the standard library.
 //!
 //! This is the whole program. Read `contracts/stdlib-hello.toml` next to it and you know
 //! everything this thing can do - there is nothing else, because there is no ambient authority to
@@ -17,7 +17,7 @@
 //! # What you DO still need to know, because pretending otherwise would be a lie
 //!
 //! That authority is granted, not taken: the `ipc_send = ["fs"]` line in the contract is why the
-//! read below can work at all. And that a failure is a fact rather than a nuisance - which is why
+//! write and the read below can work at all. And that a failure is a fact rather than a nuisance - which is why
 //! the error arm below prints what happened instead of retrying until something looks fine.
 
 #![deny(unsafe_code)]
@@ -30,10 +30,11 @@
 // it as the thing most likely to stop its program compiling - so the library re-exports it now.
 use godspeed::{self as gs, Error, ServiceContext};
 
-/// Where the text comes from. `selfcheck`'s files part (`scripts/selfcheck/50-files.gsh`) writes this
-/// file, so the program has something to find - but a FULL `selfcheck` ends with its cleanup part,
-/// which deletes `/sc` again, so after one the honest answer is "not there".
-const PATH: &str = "/sc/a.txt";
+/// The file this program writes and reads back. At 8000 bytes it is larger than one IPC message
+/// (`gs::fs::IO_CHUNK`, 3556 bytes), so `write` and `read_into` each stream it in three pieces - and
+/// the program cannot tell, which is the point of a library.
+const PATH: &str = "/stdlib-hello.txt";
+const SIZE: usize = 8000;
 
 #[allow(unsafe_code)] // the exported entry symbol; see `stdlib/rust/src/lib.rs` on why `fn main` is not available yet
 #[no_mangle]
@@ -41,43 +42,59 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("stdlib-hello: starting");
 
     // The filesystem handle. This grants NOTHING - it borrows the context, and the context can only
-    // reach what the spawn request granted (the contract is its reviewable statement). A program without `ipc_send = ["fs"]` gets this same
-    // handle and every call through it fails with `Unreachable`.
+    // reach what the spawn request granted (the contract is its reviewable statement). A program
+    // without `ipc_send = ["fs"]` gets this same handle and every call through it fails with
+    // `Unreachable`.
     let mut disk = gs::fs::Fs::new(&ctx);
 
-    // The caller owns the buffer. There is no heap on this machine (CLAUDE.md §26.6.1), so the
-    // maximum this program can use is readable right here rather than hidden in an allocator.
-    let mut buf = [0u8; 4096];
+    // The caller owns the buffers. There is no heap on this machine (CLAUDE.md 26.6.1), so the most
+    // this program can use is readable right here rather than hidden in an allocator.
+    let mut text = [0u8; SIZE];
+    for (i, b) in text.iter_mut().enumerate() {
+        *b = if i % 64 == 63 { b'\n' } else { b'a' + (i % 26) as u8 };
+    }
 
-    match disk.read_into(PATH, &mut buf) {
+    match disk.write(PATH, &text) {
+        Ok(()) => gs::io::println_fmt(&ctx, format_args!("wrote {} ({} bytes)", PATH, SIZE)),
+        Err(e) => {
+            // `gs::io::report` phrases it, so every program says the same thing about the same
+            // failure - including the one that matters most, where the write MAY have happened.
+            gs::io::report(&ctx, "write", e);
+            // A write CHANGES STATE. When no answer came - or `fs` died holding the request - the
+            // honest reply is that the file may be there, and writing it again is not the way to
+            // find out. (A plain failure is not that case: `fs` answered, and said no.)
+            if matches!(e, Error::OutcomeUnknown | Error::PeerDied) {
+                gs::io::println(&ctx, "write: it may have happened - read the file to find out, do not write it again");
+            }
+            finish(&ctx);
+        }
+    }
+
+    let mut back = [0u8; SIZE + 1]; // one spare byte, so a file LONGER than written is seen
+    match disk.read_into(PATH, &mut back) {
+        Ok(n) if n == SIZE && back[..n] == text[..] => {
+            gs::io::println_fmt(&ctx, format_args!("read {} back: {} bytes, every one as written", PATH, n));
+        }
         Ok(n) => {
-            let text = core::str::from_utf8(&buf[..n]).unwrap_or("<not valid utf-8>");
-            gs::io::println_fmt(&ctx, format_args!("{} ({} bytes):", PATH, n));
-            gs::io::println(&ctx, text);
+            gs::io::println_fmt(&ctx, format_args!("read {} back: {} bytes, NOT what was written", PATH, n));
         }
-
-        // A file that is not there is not a malfunction, and is worth telling apart from one.
-        Err(Error::NotFound) => {
-            gs::io::println_fmt(&ctx, format_args!("{} is not there - run `selfcheck` to create it", PATH));
-        }
-
-        // Everything else prints what actually happened. `gs::io::report` phrases it, so every program
-        // says the same thing about the same failure - including the one that matters most, where
-        // the operation MAY have completed and the honest answer is to say so.
+        // A file that is not there right after writing it is a fact worth saying plainly.
+        Err(Error::NotFound) => gs::io::println_fmt(&ctx, format_args!("{} is not there after writing it", PATH)),
         Err(e) => {
             gs::io::report(&ctx, "read", e);
-
-            // A read is idempotent, so retrying any no-answer failure is safe here. `retry_is_safe`
-            // is asked rather than assumed, because for a WRITE the answer would be different and
-            // this is the habit worth forming.
+            // A read is idempotent, so retrying it IS safe - and still asked, because for the write
+            // above the answer was different and this is the habit worth forming.
             if e.retry_is_safe() {
                 gs::io::println(&ctx, "read: nothing happened, so this one is safe to try again");
             }
         }
     }
+    finish(&ctx);
+}
 
+fn finish(ctx: &ServiceContext) -> ! {
     ctx.log("stdlib-hello: done");
     loop {
-        gs::task::yield_now(&ctx);
+        gs::task::yield_now(ctx);
     }
 }

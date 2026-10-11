@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Host channels and control transfers.
 //!
 //! Slice 1b of the port (`docs/arm32-usb-userspace.md`): program a host channel, run a DMA transfer,

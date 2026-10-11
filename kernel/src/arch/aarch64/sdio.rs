@@ -244,11 +244,9 @@ fn route_pins_to_arasan() {
             if f != 7 { all3 = false; }
         }
         super::put_str(if all3 {
-            b" (ALT3 = Arasan SD1, the firmware already routed the radio to us)
-" as &[u8]
+            b" (ALT3 = Arasan SD1, the firmware already routed the radio to us)\n" as &[u8]
         } else {
-            b" (NOT all ALT3 - the radio was muxed away from the Arasan; routing it back)
-"
+            b" (NOT all ALT3 - the radio was muxed away from the Arasan; routing it back)\n"
         });
 
         let mut v = before;
@@ -336,18 +334,14 @@ fn power_on() {
             // bit0 = on, bit1 = "no such device".
             let state = req[6];
             if state & 2 != 0 {
-                super::put_str(b"the firmware says NO SUCH DEVICE
-");
+                super::put_str(b"the firmware says NO SUCH DEVICE\n");
             } else if state & 1 != 0 {
-                super::put_str(b"on
-");
+                super::put_str(b"on\n");
             } else {
-                super::put_str(b"OFF - the firmware accepted the tag and left it off
-");
+                super::put_str(b"OFF - the firmware accepted the tag and left it off\n");
             }
         }
-        None => super::put_str(b"the firmware REJECTED the tag (QEMU stubs it)
-"),
+        None => super::put_str(b"the firmware REJECTED the tag (QEMU stubs it)\n"),
     }
 }
 
@@ -372,15 +366,13 @@ fn read_base_clock() {
         Some(()) if req[6] != 0 => {
             BASE_CLOCK.store(req[6], Ordering::Release);
             super::put_dec(req[6] as u64);
-            super::put_str(b" Hz
-");
+            super::put_str(b" Hz\n");
         }
         _ => {
             // Left at 0 on purpose. The driver refuses rather than guessing, because a divider computed
             // from a wrong base is a silent hardware-only failure (`sdhci.rs`, the same lesson).
             super::put_str(
-                b"UNKNOWN - the firmware gave no rate, so the driver will REFUSE to set a card                   clock rather than guess one
-",
+                b"UNKNOWN - the firmware gave no rate, so the driver will REFUSE to set a card clock rather than guess one\n",
             );
         }
     }

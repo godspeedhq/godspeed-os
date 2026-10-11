@@ -91,17 +91,13 @@ def run(cmd, **kw):
 
 
 def gates():
-    """The same set `arm_build.py` runs. Listed explicitly, not discovered, so ADDING a checker is a
-    decision each build path makes rather than something that silently changes what a build enforces."""
-    for check in ("commandments.py", "dash_check.py", "unsafe_check.py",
-                  "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py",
-                  "line_ending_check.py"):
-        r = subprocess.run([sys.executable, os.path.join("scripts", check)],
-                           cwd=ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
-            print(r.stdout + r.stderr)
-            sys.exit("BUILD REFUSED: %s failed. Fix the violation, or amend CLAUDE.md and cite\n"
-                     "the amendment - those are the only two ways past this, by design." % check)
+    """The same list `osdev build` runs, read from it (scripts/build_gates.py). This was "the same
+    set `arm_build.py` runs", seven checkers listed by hand "so ADDING a checker is a decision each
+    build path makes" - and every checker added since was added to one path only, so a VisionFive image
+    skipped seventeen of `osdev build`'s gates (backlog/80 T8)."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import build_gates
+    build_gates.run_all()
     # Is every service the supervisor spawns actually EMBEDDED for this arch? On this port the kernel
     # embeds one image - the supervisor - so the roster lives in services/supervisor/build.rs, and the
     # checker asks that file rather than `riscv64_built`. `xhci` missing from it is the whole of
@@ -109,7 +105,7 @@ def gates():
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import service_embed_check
     service_embed_check.enforce(ROOT, "riscv64")
-    print("commandments + dash + unsafe + arch-boundary + arch-seam + contracts + service-embed: pass")
+    print("build gates + service-embed (riscv64): pass")
 
 
 def main():

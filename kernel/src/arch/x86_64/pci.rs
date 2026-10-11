@@ -11,7 +11,7 @@
 //!
 //! Port I/O is hardware access, so this lives in the arch layer (§18.1).
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use portable_atomic::AtomicU64;
 use crate::smp::SpinLock;
 
@@ -45,12 +45,10 @@ const CONFIG_DATA: u16 = 0xCFC;
 /// `clear_bus_master`'s read-modify-write) atomic.
 static PCI_CONFIG_LOCK: SpinLock<()> = SpinLock::new(());
 
-// xHCI is PCI class 0x0C (serial-bus controller), subclass 0x03 (USB),
-// programming interface 0x30 (eXtensible Host Controller Interface).
+// USB host controllers are PCI class 0x0C (serial-bus controller), subclass 0x03 (USB); the
+// programming interface (0x20 EHCI, 0x30 xHCI) is only named in the scan's log line now.
 const CLASS_SERIAL_BUS: u8 = 0x0C;
 const SUBCLASS_USB: u8 = 0x03;
-const PROGIF_XHCI: u8 = 0x30;
-const PROGIF_EHCI: u8 = 0x20;
 
 // ---------------------------------------------------------------------------
 // THE GENERIC DEVICE TABLE (step D1) - what is on the bus, with NO opinion about it.
@@ -203,23 +201,12 @@ pub fn nic() -> Option<PciDevice> { find_by_class(0x02_00_00) }
 
 
 
-// AHCI is PCI class 0x01 (mass storage), subclass 0x06 (SATA), progif 0x01 (AHCI).
-const CLASS_MASS_STORAGE: u8 = 0x01;
-const SUBCLASS_SATA: u8 = 0x06;
-const PROGIF_AHCI: u8 = 0x01;
 
 
 // Network controller (PCI class 0x02) - the NIC. Networking Phase 0 (docs/networking.md) began as pure
 // identification; the userspace `nic-driver` now receives its MMIO BAR and IRQ at spawn from the
-// generic table (`nic()`), as `block-driver` gets the AHCI ABAR. (The AHCI constants above and
-// `PROGIF_EHCI` have no users left in this file.)
+// generic table (`nic()`), as `block-driver` gets the AHCI ABAR.
 const CLASS_NETWORK: u8 = 0x02;
-
-/// Build a 16-bit PCI BDF (bus<<8 | dev<<3 | func) - the IOMMU device-table index.
-#[inline]
-pub fn make_bdf(bus: u8, dev: u8, func: u8) -> u32 {
-    ((bus as u32) << 8) | ((dev as u32) << 3) | (func as u32)
-}
 
 /// Write a 32-bit value to an I/O port.
 ///
@@ -1086,30 +1073,12 @@ pub fn program_msix(bdf: u32, vector: u8, dest_apic: u8) -> bool {
     false
 }
 
-/// Program the xHCI controller's MSI to deliver to the kernel's xHCI MSI vector
-/// (P1, USB interrupts). No-op (returns false) if no xHCI was found. The controller's own
-/// interrupter must be enabled by the driver before any MSI actually fires (P2); this only
-/// sets up the message so it *can*. Call after `init()` and after the local APIC is up.
-///
-/// HAS NO CALLERS today: the xHCI's MSI is programmed at spawn by `task::pci_msi_vector`, through
-/// `msi_dest_lapic`.
-pub fn program_xhci_msi() -> bool {
-    let Some(dev) = xhci() else { return false };
-    let bdf = dev.bdf;
-    let vector = crate::arch::x86_64::interrupts::XHCI_MSI_VECTOR;
-    let dest = usb_irq_dest_lapic(crate::task::XHCI_CORE);
-    // Prefer plain MSI; fall back to MSI-X only when the device offers no MSI (what `qemu-xhci` does).
-    // See `msi_ordering` above for WHY this order - it looks backwards against the usual advice and is
-    // not.
-    program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest)
-}
-
 /// The LAPIC id an allocated pool vector should be delivered to. Same rule as the named USB
 /// vectors: the core the owning driver is pinned to, so a device event wakes that core directly.
 pub fn msi_dest_lapic(core_id: u32) -> u8 { usb_irq_dest_lapic(core_id) }
 
 /// LAPIC id to deliver a USB controller's interrupt to: the core `driver_core` the owning driver is
-/// pinned to (`task::XHCI_CORE` / `task::EHCI_CORE`, the single source of truth). Delivering the IRQ to
+/// is pinned to (the core it was spawned on). Delivering the IRQ to
 /// the driver's OWN core means a device event (a keypress) wakes that core directly out of its idle
 /// `hlt` and the wake stays core-local - no cross-core IPI or BSP scan, which an idle AP on this
 /// hardware (ARAT `hlt` idle) does not service promptly (§12). Falls back to the BSP if that core is not
@@ -1128,20 +1097,49 @@ fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
 /// Classic Intel-ICH EHCI exposes neither (legacy INTx only - would need IOAPIC routing);
 /// other EHCIs (e.g. AMD) may have MSI. This both does P1 (when MSI exists) AND tells us at
 /// boot which interrupt path the running machine's EHCI needs.
-pub fn program_ehci_msi() -> bool {
+///
+/// Delivered to `core_id`'s LAPIC. Called twice over a boot's life: once at boot, before any AP is
+/// up, where every destination falls back to the BSP; and again at every spawn of the `ehci` driver,
+/// with the core THAT instance landed on (backlog/80 K27). The second call is what makes the
+/// co-location real: the destination used to be a kernel constant (3) that the
+/// supervisor's spawn row restated by hand, and at boot it resolved to the BSP regardless. Now the
+/// destination is the spawned task's own core, so there is one statement of where the driver runs -
+/// the supervisor's row - and a restart that lands elsewhere is followed.
+///
+/// A controller found at boot to have neither MSI nor MSI-X is remembered as INTx, and a later call
+/// returns false without repeating the boot line - but it does not leave the interrupt where boot put
+/// it. Boot routes the INTx candidates to the BSP (`route_ehci_intx`), because no AP is up yet; a
+/// later call re-aims every candidate's IOAPIC entry at `core_id`, as the MSI is re-aimed above
+/// (backlog/80 K17). Recorded rather than assumed: an earlier note in `route_ehci_intx` says routing
+/// INTx to an AP's LAPIC id dropped it on the T630. That was a boot-time route, before the APs were
+/// up; whether a route made after they are delivers is what the T630 card for K17 must show.
+pub fn program_ehci_msi(core_id: u32) -> bool {
     let Some(dev) = ehci() else { return false };
+    if EHCI_INTX.load(Ordering::Relaxed) {
+        let dest = usb_irq_dest_lapic(core_id);
+        for gsi in ehci_intx_candidates(dev.irq_line) {
+            crate::arch::x86_64::ioapic::set_dest(gsi, dest);
+        }
+        crate::kprintln!("ehci: legacy INTx candidates re-aimed at core {} (dest_apic={})", core_id, dest);
+        return false;
+    }
     let bdf = dev.bdf;
     let vector = crate::arch::x86_64::interrupts::EHCI_MSI_VECTOR;
-    let dest = usb_irq_dest_lapic(crate::task::EHCI_CORE);
+    let dest = usb_irq_dest_lapic(core_id);
     // MSI first, MSI-X only as a fallback - see `msi_ordering`.
     let ok = program_msi(bdf, vector, dest) || program_msix(bdf, vector, dest);
     if !ok {
+        EHCI_INTX.store(true, Ordering::Relaxed);
         crate::kprintln!(
             "ehci: no MSI/MSI-X capability - controller uses legacy INTx (IOAPIC routing needed)"
         );
     }
     ok
 }
+
+/// Set when `program_ehci_msi` finds the EHCI has no MSI or MSI-X, so the spawn-time re-aim knows
+/// the controller is on INTx and leaves it there. Written once, at boot, before any spawn.
+static EHCI_INTX: AtomicBool = AtomicBool::new(false);
 
 /// Route the EHCI's legacy INTx pin through the IOAPIC to the kernel's EHCI vector (§12), for
 /// a controller with no MSI.
@@ -1160,9 +1158,9 @@ pub fn route_ehci_intx() {
     // Deliver to the BSP (core 0) - a legacy PCI INTx pin routes through the IOAPIC only to the
     // BSP on this hardware (unlike an MSI, which can target any core). Verified on the T630: INTx
     // delivers to the BSP; routing it to an AP's LAPIC id silently dropped it.
-    // (2026-10-09: this used to say the EHCI driver is pinned to core 0 to match. `task::EHCI_CORE`
-    // is 3, so on a multi-core machine deliver() runs on core 0 and the wake to the driver crosses
-    // cores - the case the MSI path's co-location exists to avoid.)
+    // (2026-10-09: this used to say the EHCI driver is pinned to core 0 to match. The supervisor
+    // places it on core 3, so on a multi-core machine deliver() runs on core 0 and the wake to the
+    // driver crosses cores - the case the MSI path's co-location exists to avoid. `backlog/80` K17.)
     let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
     let legacy = dev_pci.irq_line;
 
@@ -1183,22 +1181,25 @@ pub fn route_ehci_intx() {
                 cmd & 0xFFFF, new & 0xFFFF);
         }
     }
-    // Candidate GSIs: the legacy interrupt-line value (usually 11) + the AMD FCH PCI-INTx range.
-    let mut candidates: [u8; 9] = [legacy, 16, 17, 18, 19, 20, 21, 22, 23];
-    for i in 0..candidates.len() {
-        let gsi = candidates[i];
-        // Skip a duplicate if the legacy line already falls in 16..=23.
-        if candidates[..i].contains(&gsi) {
-            continue;
-        }
+    for gsi in ehci_intx_candidates(legacy) {
         crate::arch::x86_64::ioapic::set_redir(gsi, vector, dest, false);
         crate::arch::x86_64::ioapic::set_level_route(vector, gsi);
     }
-    let _ = &mut candidates;
     crate::kprintln!(
         "ehci: legacy INTx routed via IOAPIC candidates [{} ,16..=23] -> vector={:#x} dest_apic={}",
         legacy, vector, dest
     );
+}
+
+/// The GSIs an EHCI's INTx pin may arrive on: the legacy interrupt-line value (usually 11) plus the
+/// AMD FCH PCI-INTx range, without the legacy line twice when it already falls in 16..=23. One list,
+/// so the boot route and the spawn-time re-aim cannot disagree about which entries are the EHCI's.
+fn ehci_intx_candidates(legacy: u8) -> impl Iterator<Item = u8> {
+    let candidates: [u8; 9] = [legacy, 16, 17, 18, 19, 20, 21, 22, 23];
+    (0..candidates.len()).filter_map(move |i| {
+        let gsi = candidates[i];
+        if candidates[..i].contains(&gsi) { None } else { Some(gsi) }
+    })
 }
 
 /// Scan every bus/device/function and record each present function in the generic device table
@@ -1274,10 +1275,6 @@ pub fn init() {
                         "pci: {} at {:02x}:{:02x}.{} vendor={:#06x} MMIO={:#x} IRQ={}",
                         kind, bus, dev, func, vendor, mmio_base, irq
                     );
-                    // An empty branch: it once recorded every xHCI into an array, and the next line
-                    // once recorded the first EHCI. Both now come from the generic table above.
-                    if progif == PROGIF_XHCI {
-                    }
                 }
                 // Network controller (PCI class 0x02) - networking Phase 0 (docs/networking.md):
                 // identify what NIC is present. Log EVERY one (recording is the generic table's job).

@@ -44,10 +44,6 @@ pub const REC_OP_STATUS: u8 = 3; // [3]
 pub const REC_OK: u8 = 0;
 pub const REC_ERR: u8 = 1;
 
-/// Correlation tag for this service's own `fs` requests. Distinct from 0, which is both what an
-/// unthinking caller sends and the value of `FS_OK` - a collision that has hidden a bug before.
-const FS_TAG: u8 = 0xE1;
-
 /// One streaming chunk, matching the `fs` `MAX_FILE_BYTES` (7 data-block payloads of 508 bytes).
 ///
 /// Offsets handed to `OP_WRITE_AT` must stay block-aligned or `fs` has to read-modify-write, so this

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """One escape marker for every checker to share: `conform-ok`.
 
-WHO HONOURS IT TODAY (2026-10-09): `line_ref_check.py` (GS0404) and nothing else. Every other checker
-ignores the marker, so a `conform-ok` naming any other code suppresses NOTHING - and is not reported
-as unhonoured either. "One marker" is the design; one consumer is the state.
+WHO HONOURS IT TODAY: `line_ref_check.py` (GS0404) and nothing else - `HONOURED` below. A
+`conform-ok` naming any other code suppresses NOTHING, and since 2026-10-10 it is REFUSED and fails
+the build, reported by `line_ref_check.py`, which reads every marker in the tree (backlog/80 T8).
+Before, it was silently ignored. "One marker" is the design; one consumer is the state.
 
 WHY THIS EXISTS. A document that writes ABOUT a violation contains one, and there was no way to say
 so. Writing `docs/conformance.md` failed four gates for exactly that reason, each time correctly in
@@ -47,6 +48,13 @@ import io
 import re
 
 MARKER = re.compile(r"<!--\s*conform-ok:\s*([A-Za-z0-9 ,]+?)\s*-\s*(.*?)\s*-->")
+
+# THE CODES SOME CHECKER ACTUALLY HONOURS, and which one. A marker naming any other code suppresses
+# nothing, and until 2026-10-10 it was not reported either (backlog/80 T8): a contributor writing
+# `conform-ok: GS0402` would believe a site exempt that is still checked - or worse, one that passes for
+# another reason and would be read as excused. Such a marker is now REFUSED like one with no reason.
+# A checker that starts honouring markers adds its code here.
+HONOURED = {"GS0404": "scripts/line_ref_check.py"}
 FENCE = re.compile(r"^\s*(```|~~~)")
 
 
@@ -82,6 +90,14 @@ def scan(path):
         if not codes:
             problems.append((here, "a `conform-ok` marker naming no rule - blanket suppression is "
                                    "not allowed; name the code(s) it covers"))
+            i += 1
+            continue
+        dead = sorted(c for c in codes if c not in HONOURED)
+        if dead:
+            problems.append((here, "a `conform-ok` marker naming %s, which no checker honours - it "
+                                   "suppresses NOTHING. Only %s read(s) this marker; reword the site, "
+                                   "or make that checker honour it and add it to HONOURED in "
+                                   "scripts/conform_ok.py" % (", ".join(dead), ", ".join(sorted(HONOURED)))))
             i += 1
             continue
 

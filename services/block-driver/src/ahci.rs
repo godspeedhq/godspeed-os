@@ -584,7 +584,7 @@ impl<'a> Ahci<'a> {
 
     /// Commit everything held, then let the caller issue the real device flush.
     #[cfg(feature = "volatile-cache-test")]
-    fn cache_commit(&self, ctx: &ServiceContext) {
+    fn cache_commit(&self, ctx: &ServiceContext) -> bool {
         // THE DRIVE THAT ACCEPTS THE BARRIER AND DOES NOTHING - `CLAUDE.md` §6.1's unguaranteed
         // case. No device in this project is known to behave this way; the Pi 2's stick was named
         // here and does NOT (§6.1, amendment 2026-09-23 - it accepts the flush, and an unassisted
@@ -603,18 +603,27 @@ impl<'a> Ahci<'a> {
                 self.lied.set(true);
                 ctx.log("block-driver: [lying-flush] this drive ACCEPTS the barrier and commits NOTHING - durability is by eviction only");
             }
-            return;
+            return true;
         }
         #[cfg(not(feature = "lying-flush-test"))]
         {
         let n = self.cache.n.get();
-        if n == 0 { return; }
+        if n == 0 { return true; }
+        // A block that did not reach the medium is a barrier that did not hold: counted and said, and
+        // the flush answers ERR. The results were discarded until 2026-10-10 (`backlog/80` V9).
+        let mut failed = 0usize;
         for i in 0..n {
             let (lba, blk) = { (self.cache.lba.borrow()[i], self.cache.blk.borrow()[i]) };
-            let _ = self.write_block(ctx, lba, &blk);
+            if self.write_block(ctx, lba, &blk).is_err() { failed += 1; }
         }
         self.cache.n.set(0);
+        if failed > 0 {
+            ctx.log_fmt(format_args!(
+                "block-driver: [volatile-cache] barrier - {} of {} cached block(s) FAILED to commit", failed, n));
+            return false;
+        }
         ctx.log_fmt(format_args!("block-driver: [volatile-cache] barrier - {} cached block(s) committed", n));
+        true
         }
     }
 
@@ -645,10 +654,12 @@ impl<'a> Ahci<'a> {
             // THE BARRIER IS WHERE THE CACHE BECOMES DURABLE, which is the whole model: everything
             // acknowledged since the last one reaches the medium here and nowhere else.
             #[cfg(feature = "volatile-cache-test")]
-            self.cache_commit(ctx);
+            let committed = self.cache_commit(ctx);
+            #[cfg(not(feature = "volatile-cache-test"))]
+            let committed = true;
             let st = match self.issue_io(ctx, "flush", ATA_FLUSH_EXT, 0, 0, false, 0) {
-                Ok(()) => STATUS_OK,
-                Err(_) => STATUS_ERR,
+                Ok(()) if committed => STATUS_OK,
+                _ => STATUS_ERR,
             };
             reply.send(ctx, &[st]);
             return;

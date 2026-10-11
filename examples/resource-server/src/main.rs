@@ -60,7 +60,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let (resource_id, cap) = match gs::resource::mint(&ctx, gs::cap::READ | gs::cap::GRANT) {
         Ok(minted) => minted,
         Err(_) => {
-            ctx.log("resource-server: no RESOURCE_MINT cap (gated, §7.10) - idling. fs is the real resource server; see examples/e1000 for the by-name kernel grant.");
+            ctx.log("resource-server: no RESOURCE_MINT cap (gated, §7.10) - idling. It arrives as a privilege bit in the supervisor's spawn row for this service; fs is the real resource server.");
             gs::ipc::park(&ctx)
         }
     };

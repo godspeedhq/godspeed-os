@@ -12,7 +12,7 @@ gsh> ls /data
 ```
 --- expect ---
 error[GS0406]: a document shows a POSIX or DOS word being used as a command
-   --> docs/pipes.md:271
+   --> docs/pipes.md:END+3
     |
     = rule: CLAUDE.md Appendix B.4
     = why: The shell's vocabulary is fresh - `dir`, `read`, `delete`, `copy`, `match`,
@@ -25,5 +25,5 @@ error[GS0406]: a document shows a POSIX or DOS word being used as a command
 
   foreign_word_check.py reported:
   | foreign words: 1 example(s) use a word the shell REFUSES
-  |   docs/pipes.md:271
+  |   docs/pipes.md:END+3
   | (5 more lines of explanation, which the frame above covers - `py scripts/foreign_word_check.py` for all of it)

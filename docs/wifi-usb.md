@@ -188,7 +188,7 @@ and runs BEFORE `rtl92c_download_fw`. Both drivers set the queues up first, so R
 `rtl8xxxu`'s order and before it reached a board: whether the MAC is cold, and which transmit queues the
 dongle's endpoints serve (`NORMAL_SIE_EP_TX`, or the bulk OUT endpoints in its configuration descriptor where
 that reads 0), are asked BEFORE the power-on; after it, a cold MAC gets its 0xF8 pages reserved
-(`RQPN`), every MAC gets the queue priority (`TRXDMA_CTRL`) and the receive FIFO's boundary (0x27FF). The
+(`RQPN`), every MAC gets the queue priority (`REG_TRXDMA_CTRL`) and the receive FIFO's boundary (0x27FF). The
 values are `rtl_queues.rs`, pure and host-tested against `rtl8xxxu`'s own examples (`0x80E9020C`, `0xF5F0`).
 `rtl8xxxu` builds the link-list table after the firmware rather than before it, as `rtlwifi` does; that is
 left to R3 with the rest of the MAC's setup.
@@ -244,6 +244,13 @@ The card (`build/kernel7-R2c.img`) predicts, on a replug where a block's STATUS 
 completed after 1 transaction error(s), re-run as Linux does`, the download `(1 try)`, RUNNING, channel 1.
 Refuted by: `STATUS stage gave up after 3 transaction errors` followed by the same wall of timed-out reads.
 
+**Seen once at boot, 2026-10-11 (the `backlog/80` Pi 2 card, image `38c0d92e`): exactly that.** The dongle
+on hub port 2 verified its firmware, one block's STATUS stage errored three times (`STATUS stage gave up
+after 3 transaction errors`), and every read after it timed out - all six download tries, and again after
+`wifi radio on` restarted the driver. Unplugged and put back on port 4, it came up at once: one try,
+RUNNING, joined WPA2, `ping` answered. So the re-run does not rescue a stage that fails three times running,
+and a chip left that way answers nothing until it loses power, as R2b found. A boot case, not the replug
+case the card was built for. One sighting, not entered in the backlog.
 One more thing the R2 run settled: on the U1b run the third replug came up at full speed through the hub's
 transaction translator, and every vendor read failed. In the R2 run both replugs came up at high speed and
 read the chip at once, so that was the insertion; it is recorded here in case it returns.
@@ -306,7 +313,7 @@ Linux's source between its declaration and its terminator: the MAC defaults (87 
 order, the source files' SHA-256 in its header.
 
 **Written from the source, function by function** - after R2's correction, nothing here rests on a summary:
-`rtl8xxxu_init_mac` (and `MAX_AGGR_NUM`), `rtl8xxxu_gen1_init_phy_bb`, `rtl8xxxu_init_phy_rf` with
+`rtl8xxxu_init_mac` (and `REG_MAX_AGGR_NUM`), `rtl8xxxu_gen1_init_phy_bb`, `rtl8xxxu_init_phy_rf` with
 `rtl8xxxu_init_rf_regs`, `rtl8xxxu_write_rfreg` and `rtl8xxxu_read_rfreg` (path A, LSSI and HSSI), the switch
 words (0x870 = 0x07000760, 0x860), the transmit boundaries, `PBP`, `rtl8xxxu_init_llt_table` (pure and
 host-tested in `rtl_queues.rs`), `rtl8xxxu_gen1_usb_quirks`, the receive configuration (`RCR` without the
@@ -857,7 +864,7 @@ an open network the frame goes plain. It is still at the driver's 1 Mb/s (R5c's 
 (`security` AES and `swdec` clear in the descriptor, `rtl8xxxu_parse_rxdesc16`'s `RX_FLAG_DECRYPTED`)
 becomes the ethernet frame inside it. `llc_payload` steps over the CCMP header, and the 8-byte MIC the chip
 appends (`RCR_APPEND_MIC`) is trimmed, as mac80211 trims it for a frame marked decrypted but not
-`MIC_STRIPPED`, which `rtl8xxxu` never sets. It waits in a queue the receive side and the station share
+`RX_FLAG_MIC_STRIPPED`, which `rtl8xxxu` never sets. It waits in a queue the receive side and the station share
 (`rx::Link`, a `RefCell` `main.rs` owns), and the station's `pull` hands it to the serve loop's frame path.
 A key frame on the joined link is the access point's group rekey: counted and said, not answered (R7).
 

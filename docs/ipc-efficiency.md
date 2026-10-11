@@ -68,7 +68,7 @@ cache-line bouncing on the queue's head/tail. Already true of the chatty pairs b
 statement a contract can make - but note §3.11: contracted placement is deployment-coupled by design,
 and a pair pinned together is a pair that cannot be separated when a core is missing.
 
-### 3. Keep new code on `call` / `call_deadline`
+### 3. Keep new code on `call` / `call_deadline_into`
 
 They fuse send-and-await into ONE syscall and one block, against two syscalls and a separate wait.
 Already the norm; the thing to watch for in review is new code hand-rolling `send` + `recv`, which

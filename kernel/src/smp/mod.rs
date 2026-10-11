@@ -8,7 +8,6 @@ pub mod core;
 pub mod ipi;
 pub mod names;
 pub mod percpu;
-pub mod placement;
 pub mod spinlock;
 
 pub use spinlock::SpinLock;
@@ -31,7 +30,6 @@ pub fn percpu_init(boot_info: &BootInfo) {
     // this - that flag existed, found its bug, and was deleted (backlog/02).
     let n = crate::arch::imp::ap_count() + 1; // BSP + every AP Limine enumerated (live count)
     percpu::set_num_cores(n);
-    ipi::init_arenas(n);
     core::init_arenas(n);
     // Per-core user-copy arenas (the V1 read-scratch + copy-in-progress flag), sized to N.
     crate::arch::imp::syscall_entry::init_percore_arenas(n);

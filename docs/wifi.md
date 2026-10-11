@@ -1505,7 +1505,7 @@ controller that has already been cleaned up. Reading meaning into it was the sam
 stale counter.
 
 The registers that would answer the question were already being collected - `seen()` is the OR of every bit
-ever seen in `INTERRUPT` and `STATUS` during the wait, and `dat_window()` records whether `DAT_ACTIVE` was
+ever seen in `INTERRUPT` and `STATUS` during the wait, and `dat_window()` records whether `ST_DAT_ACTIVE` was
 ever observed - and **neither was ever printed**. They were also never reset between transfers, so they
 described every transfer since boot at once, which reads as an answer and is not one. Both are fixed: reset
 per transfer, printed on failure. `dat=(0, 0)` will say, in one line, that no data phase ever began.
@@ -1586,7 +1586,7 @@ CMD53 write of 1 word(s) to function 1 address 0x08000 failed - the data moved a
 ```
 
 `INT 0x00000010` is `WRITE_RDY`. `STATUS 0x0506` carries `BUFFER_WRITE_ENABLE` (bit 10),
-`WRITE_TRANSFER_ACTIVE` (bit 8), `DAT_ACTIVE` (bit 2) and `DAT_INHIBIT` (bit 1). So the data phase started,
+`WRITE_TRANSFER_ACTIVE` (bit 8), `ST_DAT_ACTIVE` (bit 2) and `SR_DAT_INHIBIT` (bit 1). So the data phase started,
 the FIFO was ready, the word went in, and `TRANSFER_COMPLETE` never arrived.
 
 **All three candidates the ladder was built to separate are eliminated at once** - block size, the `MULTI`
@@ -2183,7 +2183,7 @@ struct bwfm_escan_results {
 };
 ```
 
-so `buflen` at 0, `bss_count` at **10**, and the first `bss_info` at **12**.
+so `buflen` at 0, `bss_count` at **10**, and the first `brcmf_bss_info_le` at **12**.
 
 And each result, with offsets computed from the quoted declaration (`BWFM_MAX_SSID_LEN 32`,
 `BWFM_MCSSET_LEN 16`):
@@ -2285,7 +2285,7 @@ here - the event framing offsets, the escan request layout, and the result parsi
 |---|---|---|
 | **A** | An event frame can be received and its header parsed at all - print `event_type`, `status`, `datalen` for **any** event | the §30.2 offsets only |
 | **B** | `escan` is accepted and the firmware answers with `BWFM_E_ESCAN_RESULT` (69) events - count them | the §30.3 layout |
-| **C** | Results parse - print SSID, BSSID, channel, RSSI | the `bss_info` offsets |
+| **C** | Results parse - print SSID, BSSID, channel, RSSI | the `brcmf_bss_info_le` offsets |
 
 Rung A is worth its own flash: it needs no scan at all, and a `BWFM_E_SET_SSID` or link event may well arrive
 unprompted. **A `datalen` consistent with the frame length is the self-check** - if the offsets are wrong,
@@ -2931,7 +2931,7 @@ point it is used:
   | SECURE`, empty, MIC'd (`ieee80211_send_4way_msg4`).
 - **Install** (`ctrl::install_key`), from `bwfm_set_key_cb`: `struct bwfm_wsec_key`, **164** bytes as
   `bwfmreg.h` lays it out - the pairwise key at index 0 with the access point's address in `ea`, the group
-  key at its key id with `PRIMARY_KEY` and no address - through the `wsec_key` iovar, then `wsec`
+  key at its key id with `WSEC_PRIMARY_KEY` and no address - through the `wsec_key` iovar, then `wsec`
   re-asserted with AES. *This said 162 when first written, and the driver sent 162: the fields sum to 162,
   the struct is not packed, and `sizeof` rounds to the 4-byte alignment. See "The first run" below.*
 
@@ -2970,7 +2970,7 @@ compiler rather than a page. Confirmed against `bwfmreg.h` (no `__packed`) befor
 associated with no keys, so `wifi status` read the link live and reported `joined 5 min ago` to a
 `(hidden)` network with `security open` - the driver's memory said not joined and the firmware said joined,
 and status believed the firmware. A join that fails after association now disassociates, so the two agree.
-And `signal excellent 0 dBm`: the firmware refused `GET_RSSI` (`BCME_BADARG`) and the shell turned the 0 it
+And `signal excellent 0 dBm`: the firmware refused `BRCMF_C_GET_RSSI` (`BCME_BADARG`) and the shell turned the 0 it
 was handed into the best word it has. A zero RSSI is not a reading and now prints `unknown`.
 
 The trace also showed the two transmitted frames as `RX other`, because the shell's name table stopped at
@@ -3057,9 +3057,9 @@ is the silent substitution 26.4 names.
 (`frames::pairwise_rekey`); what remains is seeing either on hardware.*
 - Data frames that arrive DURING A SWEEP are still dropped by the sweep's own reader; RX answers zero
   frames while a sweep runs. A sweep is a moment of no link either way.
-- `GET_RSSI` is refused (`BCME_BADARG`) even when joined, so `wifi status` says `signal unknown`. Honest,
+- `BRCMF_C_GET_RSSI` is refused (`BCME_BADARG`) even when joined, so `wifi status` says `signal unknown`. Honest,
   not blocking; the Linux driver's form of the query is the next thing to read. *Read, 2026-09-30: Linux
-  sends the same zeroed `scb_val` - but `sizeof` it, which is twelve bytes, not the ten its fields add up
+  sends the same zeroed `brcmf_scb_val_le` - but `sizeof` it, which is twelve bytes, not the ten its fields add up
   to (`int32` and a six-byte address, 4-aligned). The same padding lesson as `wsec_key` (section 40), one
   struct later; the driver sends twelve now.*
 

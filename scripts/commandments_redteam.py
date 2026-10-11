@@ -18,14 +18,18 @@ Only the green checks are exercised. When this was written three checks were fai
 2026-10-09: all three pass now and have no CASES row here except II, which has its own block below; the
 case labels "52nd syscall", "23rd query" and "14th authority" are the counts of that time, not today's.)
 
-It does not gate anything: it is in no build path and exits 0 whatever it prints. Read the table - a
-MISSED or ANCHOR? row, or a RESTORED count unequal to the baseline, is the failure.
+It does not gate a build: it mutates the tree, so it runs alone, on a committed tree. Its EXIT CODE is
+its verdict since 2026-10-10 (backlog/80 T8) - it exited 0 whatever it printed - so a MISSED or ANCHOR?
+row, a WRONG Commandment II case, or a RESTORED count unequal to the baseline exits 1.
 """
 import io, os, re, subprocess, sys
 
 ANSI = re.compile(chr(27) + r'\[[0-9;]*m')
 
-ROOT = r"C:\Downloads\Bankole\GodspeedOS\github\godspeed"
+# THE TREE THIS SCRIPT IS IN. This was the literal path of one machine's checkout, so running the copy
+# in any other checkout - a worktree, a contributor's clone - INJECTED VIOLATIONS INTO THAT ONE, a tree
+# the caller was not looking at, and on any other machine it did not run at all (backlog/80 T8).
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
 def run():
@@ -151,14 +155,18 @@ CASES = [
      lambda: strand_pin("introspect_queries"),
      ["COMMANDMENTS.baseline.toml"], []),
 
+    # ANCHORED ON THE ATTRIBUTE LINE, not the bare text. `edit` replaces the FIRST occurrence, and since
+    # the crate gained its `#![deny(unsafe_code)]` note the first `#[no_mangle]` in the file is inside a
+    # comment - so both probes planted their code INSIDE THAT COMMENT, where no check looks, and reported
+    # MISSED for checks that work. Found the first time this script's exit code was read (2026-10-10).
     ("V-no-panic", "a service that can halt the machine",
-     lambda: edit("services/events/src/main.rs", "#[no_mangle]",
-                  "fn boom() { let x: Option<u32> = None; let _ = x.unwrap(); }\n#[no_mangle]"),
+     lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
+                  "\nfn boom() { let x: Option<u32> = None; let _ = x.unwrap(); }\n#[no_mangle]\npub extern"),
      ["services/events/src/main.rs"], []),
 
     ("VI-static-mut", "unowned global mutable state in a service",
-     lambda: edit("services/events/src/main.rs", "#[no_mangle]",
-                  "static mut SNEAK: u32 = 0;\n#[no_mangle]"),
+     lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
+                  "\nstatic mut SNEAK: u32 = 0;\n#[no_mangle]\npub extern"),
      ["services/events/src/main.rs"], []),
 ]
 
@@ -237,11 +245,13 @@ print()
 print("=" * 100)
 print("COMMANDMENT II - the derived check, both directions")
 print("=" * 100)
+WRONG_II = []
 for name, what, inject, paths, created, should_catch in CASES_II:
     try:
         inject()
     except AssertionError as e:
-        print("%-24s %-52s ANCHOR? %s" % (name, what, e)); restore(paths, created); continue
+        print("%-24s %-52s ANCHOR? %s" % (name, what, e)); restore(paths, created)
+        WRONG_II.append(name + " (anchor not found)"); continue
     out = run()
     n = out.count("  Commandment")
     changed = violations(out) - base_v
@@ -251,7 +261,27 @@ for name, what, inject, paths, created, should_catch in CASES_II:
     ok = caught if should_catch else not caught
     print("%-24s %-52s %-6s %s" % (name, what, "CAUGHT" if caught else "silent",
                                    "OK" if ok else "*** WRONG ***"))
+    if not ok:
+        WRONG_II.append(name)
     restore(paths, created)
 
 print()
-print("RESTORED: %d violations (baseline %d)" % (run().count("  Commandment"), n_base))
+restored_ii = run().count("  Commandment")
+print("RESTORED: %d violations (baseline %d)" % (restored_ii, n_base))
+
+# THE VERDICT IS THE EXIT CODE. This printed its table and exited 0 whatever it said, so a MISSED row - a
+# check that no longer fires on the real tree - passed every script that ran it (backlog/80 T8). It
+# still gates no build (it mutates the tree, so it must run alone, on a committed tree), but a caller
+# can now trust its status.
+failures = []
+failures += ["%s: %s" % (name, verdict) for name, _what, verdict, _msg in rows if verdict != "CAUGHT"]
+failures += ["II %s: *** WRONG ***" % name for name in WRONG_II]
+if after.count("  Commandment") != n_base or restored_ii != n_base:
+    failures.append("the tree did not restore to its baseline (%d, then %d, against %d)"
+                    % (after.count("  Commandment"), restored_ii, n_base))
+if failures:
+    print("\nRED TEAM: %d failure(s) - a check that does not fire on the real tree is not a check:" % len(failures))
+    for f in failures:
+        print("  " + f)
+    sys.exit(1)
+print("\nRED TEAM: every injected violation was caught, every negative case stayed silent, the tree restored")

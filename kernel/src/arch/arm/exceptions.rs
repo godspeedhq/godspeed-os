@@ -97,11 +97,15 @@ extern "C" fn arm_exception_report(kind: u32, pc: u32, status: u32, addr: u32) -
         pl011_write(b")\r\n");
     }
 
-    pl011_write(b"  halting - the arm32 port cannot yet kill a task and continue.\r\n\r\n");
-    loop {
-        // SAFETY: WFI is always valid. Halt rather than return into a faulted context.
-        unsafe { core::arch::asm!("wfi") }
-    }
+    // Only a KERNEL fault reaches here: a task's fault kills that task (`task::kill_current`, the user
+    // branches of the vector stubs) and the kernel carries on. This line used to say the port could
+    // not yet kill a task, which stopped being true and sent a reader after the wrong problem.
+    pl011_write(b"  a fault in the kernel itself - halting every core.\r\n\r\n");
+    // Every core, not just this one (CLAUDE.md 6.2, 19): the others would otherwise go on running
+    // against whatever state this fault was about. `halt_all_cores` is a flag store and a park, so it
+    // is safe to call from a fault path that can assume nothing (backlog/80 K25; the riscv64 port's
+    // same fix is K6).
+    super::halt_all_cores()
 }
 
 /// The vector table: eight entries, one instruction each, in architectural order.

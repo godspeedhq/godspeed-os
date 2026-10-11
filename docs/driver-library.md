@@ -37,8 +37,14 @@ the kernel already offers, in the one shape a driver should use; MISCIS (CLAUDE.
 the SDK at hardware. That line is moved, not erased: hardware AUTHORITY still comes only through the
 SDK's audited layer, and `unsafe` still lives only there (18.1). What moves into `gs` is the safe,
 device-neutral machinery a driver builds on - one mechanism at a time, each one found in real drivers
-first. `backlog/71` (the path to a v1 promise) depends on this shape: it puts `gs::driver` OUTSIDE the
-first covered surface, because hardware support keeps growing.
+first. `backlog/71` (the path to a v1 promise) depends on this shape. It first put `gs::driver` OUTSIDE the
+covered surface, because hardware support keeps growing; on 2026-10-11 the operator put it INSIDE,
+grow-only: a mechanism once built does not change, and new ones are added. So a mechanism is a promise
+the day it lands, which is one more reason each one is found in real drivers first. The same decision settled the
+line between the two layers: the SDK is what the kernel can do, `gs` is how a program is written, and the
+test for `gs` is whether a contributor must NAME a thing and rely on it. A driver must name its register
+window and its DMA arena, so those types come through `gs::driver` too, over the SDK's `Mmio` and `Dma`;
+the end state is no service or driver crate depending on the SDK directly (`backlog/71`).
 
 ## Current state (2026-10-09)
 
@@ -109,7 +115,7 @@ The question for every part of a driver is the one that decides membership:
 | The Broadcom control protocol (BCDC)      | Waiting for hardware, bounded by time (**built: `wait`, polling or paced**) |
 |                                           | Holding still for a set minimum time (**built: `delay::hold`, `delay::hold_parked`**) |
 | BDC framing, firmware command ids         | Interrupt waiting (**built: `irq`**)      |
-| The CLM blob, escan, `bss_info`           | DMA and buffer facilities                |
+| The CLM blob, escan, `brcmf_bss_info_le`           | DMA and buffer facilities                |
 | A chip's recovery sequence                | Bus access                               |
 | A controller's register map and its errata | Power leases and device power/reset authority |
 |                                           | Firmware access                          |

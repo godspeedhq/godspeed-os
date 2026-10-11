@@ -141,17 +141,12 @@ rel = ["--release"] if PROFILE == "release" else []
 # Every Pi 4 image came from here ungated: on 2026-10-03 a contract that disagreed with its spawn row
 # built a Pi 4 image cleanly and was refused only by the Pi 2 and VisionFive scripts. A rule enforced
 # on one build path and not another is enforced on neither, because work flows down the ungated path.
-for check in ("commandments.py", "dash_check.py", "unsafe_check.py",
-              "arch_boundary_check.py", "arch_seam_check.py", "contract_check.py",
-              "line_ending_check.py"):
-    r = subprocess.run([sys.executable, os.path.join("scripts", check)],
-                       cwd=ROOT, capture_output=True, text=True)
-    if r.returncode != 0:
-        sys.stdout.write(r.stdout)
-        sys.stderr.write(r.stderr)
-        raise SystemExit(
-            "\nBUILD REFUSED: %s failed. Fix the violation, or amend CLAUDE.md and cite\n"
-            "the amendment - those are the only two ways past this, by design." % check)
+#
+# THE SAME LIST `osdev build` RUNS, read from it (scripts/build_gates.py) rather than copied - the copy
+# here was seven checkers against `osdev build`'s twenty-four (backlog/80 T8).
+sys.path.insert(0, str(ROOT / "scripts"))
+import build_gates
+build_gates.run_all()
 
 # Refuse to build an image whose supervisor spawns a service the kernel embeds as a placeholder.
 # This is the gate for the failure that produced `LoadFailed(TooSmall)` on this port twice.

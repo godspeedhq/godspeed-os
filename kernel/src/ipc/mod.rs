@@ -10,7 +10,7 @@ pub mod names;
 pub mod queue;
 pub mod routing;
 
-pub use endpoint::{Endpoint, EndpointId};
+pub use endpoint::EndpointId;
 pub use message::{IpcError, Message};
 
 use core::sync::atomic::{Ordering};

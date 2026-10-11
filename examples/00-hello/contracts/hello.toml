@@ -13,7 +13,7 @@ version = "0.1.0"
 # degrade). Touching UNMAPPED memory is a page fault (FATAL: the service is killed).
 # CLAUDE.md §10.2-§10.4.
 request = "32MiB"
-limit   = "64MiB"
+limit   = "32MiB"
 
 [capabilities]
 # Each line is an explicit grant - `hello` can do ONLY what is listed (Commandment VII,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Core bring-up: soft reset, host mode, FIFO sizing, root-port power and reset.
 //!
 //! Slice 1a of the port (`docs/arm32-usb-userspace.md`). This is `dwc2::init()`'s first half, moved

@@ -139,10 +139,26 @@ def _probe_target(line, seed=None):
 
 
 def frames(objdump, elf):
-    """{function: total bytes of stack it subtracts}. Empty if the ELF cannot be read."""
-    r = subprocess.run([objdump, "-d", elf], capture_output=True, text=True)
+    """{function: total bytes of stack it subtracts}. Raises SystemExit if the ELF cannot be read.
+
+    It returned `{}` when objdump failed, and an empty result measures nothing and so passes: a
+    host objdump that cannot read the target's ELF, or one that is not installed, gave a green gate
+    over binaries nobody looked at (backlog/80 T5). An ELF that exists and cannot be disassembled is
+    a failure of the instrument, and it is said as one.
+    """
+    try:
+        r = subprocess.run([objdump, "-d", elf], capture_output=True, text=True)
+    except OSError as e:
+        raise SystemExit(
+            "\nSTACK-FIT CHECK CANNOT RUN: `%s` could not be started (%s).\n"
+            "Install binutils' objdump, or set OBJDUMP to one that reads this target's ELF. A check that\n"
+            "cannot run has not passed." % (objdump, e))
     if r.returncode != 0:
-        return {}
+        raise SystemExit(
+            "\nSTACK-FIT CHECK IS BLIND: `%s -d %s` failed (exit %d):\n  %s\n"
+            "Nothing in this binary was measured. Set OBJDUMP to an objdump that reads this target's ELF\n"
+            "(llvm-objdump reads every target). A check that measured nothing has not passed."
+            % (objdump, elf, r.returncode, (r.stderr or r.stdout).strip()[:300]))
     out, cur, total, probes, seed = {}, None, 0, 0, None
     for line in r.stdout.splitlines():
         m = FUNC.match(line)
@@ -179,7 +195,8 @@ def check(objdump, root, target, profile, services, stack_limit, top=5):
         # not one this file matches, which is exactly how an unsupported arch earns a pass. The
         # instrument must report that it is blind rather than report a zero it did not earn
         # (invariant 12). This guard is the general fix; SUB_SP_RV above is the specific one.
-        if f and not any(f.values()):
+        # An ELF in which objdump found no function at all is the same blindness by another route.
+        if not f or not any(f.values()):
             mute.append(svc)
         for name, size in f.items():
             if size > stack_limit:

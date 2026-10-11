@@ -80,13 +80,12 @@ pub fn booted_at_el3() -> bool {
 
 /// Map a neutral IPI vector onto the GIC's 4-bit SGI id space.
 ///
-/// The neutral layer names its IPIs with x86 vector numbers (0xF0..0xF2). An SGI id is four bits, so
+/// The neutral layer names its IPIs with x86 vector numbers (0xF0 and 0xF2). An SGI id is four bits, so
 /// writing a vector straight into that field truncates 0xF0 to 0 - a different interrupt, delivered
 /// silently. The mapping is explicit for that reason.
 #[cfg(feature = "pi4")]
 pub fn vector_to_sgi(vector: u8) -> u32 {
     match vector {
-        crate::smp::ipi::vectors::TLB_SHOOTDOWN => gic::SGI_TLB,
         crate::smp::ipi::vectors::SCHEDULER_TICK => gic::SGI_TICK,
         _ => gic::SGI_WAKE,
     }
@@ -464,11 +463,9 @@ extern "C" fn aarch64_boot_main(dtb: u64, entry_el: u64) -> ! {
             put_hex(phys);
             put_str(b" reads/writes as ");
             put_hex(high);
-            put_str(b"
-");
+            put_str(b"\n");
         }
-        None => put_str(b"aarch64: WARN high half did NOT translate - check TG1/EPD1/TTBR1_EL1
-"),
+        None => put_str(b"aarch64: WARN high half did NOT translate - check TG1/EPD1/TTBR1_EL1\n"),
     }
 
     // --- Move the kernel into the high half --------------------------------------------------
@@ -794,6 +791,12 @@ extern "C" fn boot_high() -> ! {
     // shared console as a slice. Before the jump its only name was a physical address.
     // SAFETY: single-threaded boot; `FB_INFO` was written before the jump and is read exactly once here.
     if let Some(fb) = unsafe { FB_INFO } {
+        // First make the kernel's own map of it Normal non-cacheable, the type the `console` service
+        // maps it with - one physical page, one memory type (backlog/80 K21). Still single-core here.
+        let len = (fb.pitch as u64) * (fb.height as u64);
+        if mmu::remap_high_nc(fb.base, len) {
+            put_str(b"aarch64: framebuffer remapped Normal non-cacheable in the direct map\r\n");
+        }
         video::start_console(fb);
     }
 
@@ -1096,8 +1099,7 @@ extern "C" fn boot_high() -> ! {
     #[cfg(all(feature = "pi4", not(feature = "pi4-sched-demo")))]
     sched_supervisor::run();
 
-    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.
-");
+    put_str(b"aarch64: neutral kernel linked; arch/aarch64 stubs pending real bodies. halting.\n");
     loop {
         // SAFETY: WFE is always valid.
         unsafe { core::arch::asm!("wfe") };
@@ -1155,6 +1157,9 @@ pub(crate) fn put_str(s: &[u8]) {
     for &b in s {
         put_byte(b);
     }
+    // The EL0 fault report is written through here with IRQs masked; this is how a kill waiting on
+    // this core knows it is printing rather than wedged (`note_output_progress`, backlog/48).
+    crate::task::scheduler::note_output_progress();
     #[cfg(feature = "pi4")]
     release_serial(claim);
     // Serial first, then the display: serial is the source of truth, and a mirror that ran first would
@@ -1340,8 +1345,7 @@ fn pwm_probe() {
     } else {
         b"audio: no PWM1 at 0xFE20C800 (this machine has none) - no audio jack" as &[u8]
     });
-    put_str(b"
-");
+    put_str(b"\n");
 }
 
 /// Probe the RNG200 once at boot, inside the probe window, and record whether it is there. Said either
@@ -1509,7 +1513,9 @@ pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 /// Set the Arm cores to the firmware's minimum (`max = false`) or maximum (`max = true`) rate, and return
 /// what they read back in Hz. The two rates are the FIRMWARE'S - `GET_MIN_CLOCK_RATE` and
 /// `GET_MAX_CLOCK_RATE` for the ARM clock - so the caller can only choose between the firmware's own ends
-/// of the range, never name a frequency. `None` when the firmware does not answer.
+/// of the range, never name a frequency. `None` when the firmware does not answer - including the
+/// read-back: the result is the rate the clock READS, never the rate the set call claimed (CLAUDE.md
+/// 12.3; backlog/80 K23 - this returned the set call's answer when the read-back failed).
 ///
 /// Why a board needs this at all: with no OS asking for a rate, the Pi firmware holds the cores at turbo
 /// for `initial_turbo` seconds after boot (60 by default) and then at their minimum for good
@@ -1521,7 +1527,10 @@ pub fn cpu_clock(max: bool) -> Option<u32> {
     let now = mailbox::arm_clock(mailbox::TAG_GET_CLOCK_RATE);
     crate::kprintln!("cpu-clock: {} rate {} Hz asked - the firmware set {} Hz, the clock reads back {:?}",
                      if max { "maximum" } else { "minimum" }, target, set, now);
-    Some(now.unwrap_or(set))
+    if now.is_none() {
+        crate::kprintln!("cpu-clock: the read-back did not answer - reporting failure, not the {} Hz the set claimed", set);
+    }
+    now
 }
 #[cfg(not(feature = "pi4"))]
 pub fn cpu_clock(_max: bool) -> Option<u32> { None }
@@ -1646,6 +1655,9 @@ pub fn note_user_task(_slot: usize) {}
 // request names the `FRAMEBUFFER` kind - the supervisor's `console` row. The kernel's direct map of
 // those pages is still Normal cacheable, so the mismatch this paragraph warned about is live.
 // Carving the framebuffer out of the blanket block mapping is the open work.)
+// (Note 2026-10-10: carved. `mmu::remap_high_nc` splits the blocks the framebuffer touches and maps its
+// pages Normal non-cacheable before `start_console`, `backlog/80` K21. The clean in `fb_commit` is now
+// a no-op on those pages and is kept because it is correct on either type.)
 #[cfg(feature = "pi4")]
 pub use video::fb_commit;
 
@@ -2399,8 +2411,7 @@ pub fn console_notice_fmt(args: core::fmt::Arguments) {
     use core::fmt::Write;
     let mut nb = NoticeBuf { buf: [0; 160], n: 0 };
     let _ = nb.write_fmt(args);
-    let _ = nb.write_str("
-");
+    let _ = nb.write_str("\n");
     console_notice(&nb.buf[..nb.n]);
 }
 
@@ -2538,11 +2549,6 @@ pub mod boot {
         super::gic::send_sgi(super::gic::SgiTarget::Core(lapic_id), super::vector_to_sgi(vector));
     }
 
-    /// # Safety
-    /// As above, for every core but this one.
-    pub unsafe fn broadcast_ipi_all_but_self(vector: u8) {
-        super::gic::send_sgi(super::gic::SgiTarget::AllButSelf, super::vector_to_sgi(vector));
-    }
     pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {}
 }
 
@@ -2728,8 +2734,9 @@ pub mod page_tables {
     /// **No TLB maintenance here, and that is deliberate** (SEC-26, `arch/CLAUDE.md`): on AArch64 a
     /// `TTBR0_EL1` write flushes nothing, so an address-space *change* must invalidate - and it does,
     /// in `context::switch_context`, which is the only path that switches between two task spaces.
-    /// This primitive exists for the shootdown path, which writes back the value already installed to
-    /// force a walk; adding a flush here would be a second, redundant one on every context switch.
+    /// It is a seam member every port answers. No neutral code calls it since the shootdown path that
+    /// reloaded the installed base was deleted (`backlog/80` K20); adding a flush here would be a
+    /// second, redundant one on any switch that used it.
     ///
     /// # Safety
     /// `base` must be a live L1 root for the calling core.
@@ -2743,8 +2750,9 @@ pub mod page_tables {
 
     /// Invalidate one page's translation.
     ///
-    /// `tlbi vaae1is`: by VA, ALL ASIDs, Inner-Shareable (every core), because the neutral shootdown
-    /// path uses this to make an unmap visible machine-wide. The `dsb ish` before it orders the
+    /// `tlbi vaae1is`: by VA, ALL ASIDs, Inner-Shareable (every core), so an invalidate made here is
+    /// visible machine-wide whoever calls it. (The neutral shootdown path that called it was deleted,
+    /// `backlog/80` K20; the seam member stays because every port answers it.) The `dsb ish` before it orders the
     /// page-table write that preceded; the one after waits for the invalidate to complete, and the
     /// `isb` keeps already-fetched instructions from using a stale translation.
     ///
@@ -2808,7 +2816,10 @@ pub mod page_tables {
     /// died, and only show up as the machine slowly running out of memory with nothing to point at.
     ///
     /// # Safety
-    /// `cr3` must belong to a task already Dead, with `TTBR0_EL1` switched away and invalidated.
+    /// `cr3` must belong to a task already Dead that no core is running or still leaving
+    /// (`core_still_using`). An IDLE core may still have this root in `TTBR0_EL1`: it is invalidated
+    /// inner-shareable by `free_page_table_root`, after this walk and before the root is freed, and
+    /// an idle core makes no access through TTBR0 before its next switch, which flushes first.
     #[cfg(feature = "pi4")]
     pub unsafe fn reclaim_user_frames(cr3: u64) -> usize {
         // SAFETY: caller's contract.
@@ -3384,8 +3395,7 @@ pub mod pci {
     pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
     /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.
     pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
-    pub fn program_xhci_msi() -> bool { false }
-    pub fn program_ehci_msi() -> bool { false }
+    pub fn program_ehci_msi(_core_id: u32) -> bool { false }
     pub fn route_ehci_intx() {}
 }
 

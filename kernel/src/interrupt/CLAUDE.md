@@ -35,7 +35,7 @@ Hardware interrupt routing to userspace driver services (§12).
 
 ## Registration
 
-`register(irq, endpoint)` is called from the spawn path for each vector the kernel derived from the device CLASS the spawn request names (`task::hw_irqs_for`, or an allocated PCI MSI vector) - never a vector the spawner or a contract names (§12.3, §14.1). A driver's death releases its routes with `unregister_endpoint` (which masks each released line), and its respawn registers again.
+`register(irq, endpoint)` is called from the spawn path for each vector the kernel derived from the device CLASS the spawn request names (`task::hw_irqs_for`, or an allocated PCI MSI vector) - never a vector the spawner or a contract names (§12.3, §14.1). A driver's death releases its routes with `unregister_endpoint` (which masks each released line), and its respawn registers again - which UNMASKS the line, because the new holder is ready to service it (`backlog/80` K17, 2026-10-10; before that nothing unmasked a line its driver died holding masked).
 
 `IRQ_TABLE` is a `SpinLock<[Option<EndpointId>; 256]>`. `register()` is a safe function. `deliver()` is `pub unsafe fn` because it is called from the IDT with IF=0 - the `unsafe` communicates the interrupt-context calling convention, not a memory-safety obligation.
 

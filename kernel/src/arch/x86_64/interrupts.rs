@@ -177,7 +177,7 @@ unsafe extern "C" fn uart_rx_irq_handler() {
 // leaving a driver without interrupts.
 //
 // The range is clear of everything the IDT already installs: 0-31 CPU exceptions, 32 timer, 33 the
-// FireIrq test vector, 36 COM1, 0x28/0x29 the two named MSIs, 0x80 syscall, 0xF0-0xF2 IPIs, 0xFF.
+// FireIrq test vector, 36 COM1, 0x28/0x29 the two named MSIs, 0xF0-0xF2 IPIs, 0xFF.
 pub const MSI_POOL_BASE: u8 = 0x30;
 pub const MSI_POOL_LEN:  usize = 8;
 
@@ -269,7 +269,7 @@ pub fn hires_release(_slot: u32) {}
 /// IDT vector AND `IRQ_TABLE` index for the xHCI controller's MSI. MSI lets us pick the
 /// vector freely (it is written into the device's message-data register), so vector and
 /// the route's pseudo-irq are the same number - no PCI interrupt-line / IOAPIC GSI mapping.
-/// Chosen clear of the timer (32), COM1 (36), syscall (0x80), and the IPIs (0xF0-0xF2).
+/// Chosen clear of the timer (32), COM1 (36), and the IPIs (0xF0-0xF2).
 pub const XHCI_MSI_VECTOR: u8 = 0x28;
 
 /// Vectors for a device class this arch's kernel actually routes, `&[]` where the controller

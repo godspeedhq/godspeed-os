@@ -4,8 +4,8 @@
 # program do": the spawn request should grant exactly what is below - not one capability more (CLAUDE.md
 # §13.6: authority comes from the SPAWN REQUEST, and this file is the reviewable statement of it).
 #
-# Compare it with `examples/00-hello`, which declares `log_write` alone. This program reads a file
-# and prints, so it asks for one more thing, BY NAME:
+# Compare it with `examples/00-hello`, which declares `log_write` alone. This program writes a file,
+# reads it back and prints, so it asks for one more thing, BY NAME:
 #
 #   ipc_send = ["fs"]     it may talk to the filesystem service. Without this line,
 #                         `godspeed::fs::Fs::new(&ctx)` still compiles and still returns a

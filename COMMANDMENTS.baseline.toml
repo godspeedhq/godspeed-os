@@ -569,7 +569,9 @@ CPU_CLOCK          = 18
 # Every expansion of what the kernel does for userspace arrives as a syscall, so this list IS the
 # kernel's authority surface. Adding a line is adding a kernel responsibility: answer "why isn't this a
 # service?" first. The numbers are the ABI every built service binary depends on, so they are pinned by
-# VALUE, not merely by name. (9 is absent by history, not by accident.)
+# VALUE, not merely by name. (9 is absent by history, not by accident. So are 7, 19, 38 and 39: the four
+# spawn-by-name syscalls, retired 2026-10-10 because the kernel catalogue holds `supervisor` alone and
+# they could only refuse - `SpawnImage`, 52, is how a service starts. backlog/80 K14.)
 [kernel.syscalls]
 Send                     = 1
 Recv                     = 2
@@ -577,7 +579,6 @@ TrySend                  = 3
 Yield                    = 4
 Log                      = 5
 AllocMem                 = 6
-Spawn                    = 7
 Kill                     = 8
 AcquireSendCap           = 10
 SendWithCap              = 11
@@ -588,7 +589,6 @@ RemoveCap                = 15
 TaskStat                 = 16
 ConsoleRead              = 17
 Reboot                   = 18
-SpawnPipe                = 19
 ConsolePush              = 20
 Park                     = 21
 Print                    = 22
@@ -607,8 +607,6 @@ TryRecv                  = 34
 RecvTimeout              = 35
 IrqUnmask                = 36
 Sleep                    = 37
-SpawnReturningEndpoint   = 38
-SpawnWithCaps            = 39
 ConsoleForeground        = 40
 Call                     = 41
 CallDeadline             = 50
@@ -752,7 +750,7 @@ SpawnImage               = 52
 "ehci" = ["hw:EHCI", "peer:events", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]
-# examples/stdlib-hello, examples-test build only. It reads a file through `gs::fs`, which is
+# examples/stdlib-hello, examples-test build only. It writes and reads a file through `gs::fs`, which is
 # the whole point of the example, so it needs the one peer that serves files - the same single
 # grant `counter` and `copier` carry for the same reason.
 "stdlib-hello" = ["peer:fs"]

@@ -11,7 +11,7 @@ Syscall entry point and dispatch (§8.2, §7.5).
 
 ## Invariant: cap before action
 
-Every syscall that performs a privileged action must call `CapTable::get(slot, required_right)` (through `scheduler::current_task_lookup_cap`) before doing anything with the resource. This is invariant §3.1. Several handlers then call `invariants::assertions::assert_cap_validated(&Ok(()))` as a marked checkpoint; it is passed a literal `Ok`, so it documents the point rather than re-checking it.
+Every syscall that performs a privileged action must call `CapTable::get(slot, required_right)` (through `scheduler::current_task_lookup_cap`) before doing anything with the resource. This is invariant §3.1. (An `assert_cap_validated(&Ok(()))` checkpoint after it was passed a literal `Ok` and could not fire; it was deleted 2026-10-10, `backlog/80` K20.)
 
 If you are adding a syscall:
 1. Assign it a number in `SyscallNumber`.
