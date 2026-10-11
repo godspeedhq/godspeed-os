@@ -188,9 +188,15 @@ private structures, no new syscall). Measured against that, three answers are th
 be, and each gap is a missing **contract**, closed in the service that owns the fact - never in the
 kernel for `ask`'s sake:
 
-1. **Why a service died.** The supervisor records THAT a driver died and was restarted, not why. The
-   kernel knows how a task ended (a fault, a kill, a panic in the service); a death record that carried
-   it is what would let 3.2 and 3.3 name a cause.
+1. **Why a service died - CLOSED 2026-10-11, how it ended.** The kernel's death notice now says how a
+   task ended - killed, and by which task, or a CPU fault, its kind and address - and the supervisor keeps
+   the newest per name (`supcmd::DEATH`; CLAUDE.md 6.2, amendment 2026-10-11). So "why did fs restart?"
+   says `fs` WAS KILLED BY `shell`, or that it CRASHED on a memory fault at 0x0, and a kill is not called
+   a failure. What stays UNKNOWN is the layer above: why the killer killed it, and which bug faulted -
+   though a fault at address 0 is said to be a null pointer or a panic, which ends exactly that way. Only
+   the newest death per service is kept, and the record starts again when the supervisor restarts. This
+   is the one gap closed in the kernel, because the kernel owns the fact - it decides every death - and it
+   is closed on the notice the kernel already sent, with nothing added for `ask`'s sake.
 2. **That a journal was replayed.** `fs` logs it at mount and reports it through no request. A field in
    the drive report saying "recovered N blocks at the last mount" makes 3.4's history a fact.
 3. **The network's health.** `net-stack` answers status (address, lease, link), not "healthy"; a

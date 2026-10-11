@@ -393,7 +393,14 @@ fn user_fault_kill(pc: u32, addr: u32, dfsr: u32, sp_usr: u32, kind: &str) -> ! 
             _ => "see ARM ARM B3.13.3",
         }
     );
-    crate::task::kill_current();
+    use crate::task::death::*;
+    let (fk, fa) = match (kind, status) {
+        ("undefined-instruction", _) => (F_ILLEGAL, pc),
+        (_, 0b00001) => (F_ALIGNMENT, addr),
+        ("prefetch", _) => (F_INSTRUCTION, addr),
+        _ => (F_MEMORY, addr),
+    };
+    crate::task::kill_current(fk, fa as u64);
     // kill_current does not return for a Dead task; if it somehow does, halt rather than resume a corpse.
     loop {
         // SAFETY: WFI is always valid; halt rather than return into a dead task's context.

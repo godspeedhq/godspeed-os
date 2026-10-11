@@ -926,6 +926,18 @@ pub fn run(image_path: &Path, smp: u32) {
         let piped = ask(b"ask \"what failed?\" | where label=verdict\r", 40);
         check!(piped.contains("verdict") && !piped.contains("exceeded the record bound"),
                "ask: piped, the answer is records - and a three-row table is not reported truncated");
+        // HOW A SERVICE ENDED is the kernel's to say: a kill names who called it (CLAUDE.md 6.2,
+        // amendment 2026-10-11). `time` is restartable and nothing here depends on it.
+        let _ = ask(b"kill time\r", 10);
+        std::thread::sleep(Duration::from_secs(3));
+        let killed = ask(b"ask \"why did time restart?\"\r", 40);
+        check!(killed.contains("`time` WAS KILLED BY `shell`") && killed.contains("not a failure of `time` itself"),
+               "ask: a kill is named from the kernel's death notice - who called it, and that it was no failure");
+        // Curly quotes, as a phone types them. Their middle byte is 0x80, the keyboard's Ctrl+Alt+Del
+        // signal, and this line used to REBOOT the machine.
+        let curly = ask("ask \u{201c}tell me a joke\u{201d}\r".as_bytes(), 40);
+        check!(curly.contains("A JOKE") && !curly.contains("rebooting"),
+               "ask: curly quotes quote - and a UTF-8 character is never read as the reboot signal");
         let help = ask(b"ask help\r", 10);
         check!(help.contains("why did <service> <event>"), "ask help: lists the general question");
         let after = ask(b"observe now\r", 30);

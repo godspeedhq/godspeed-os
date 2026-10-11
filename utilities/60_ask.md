@@ -59,10 +59,15 @@ uptime second.
 - **INFERENCE** - concluded from facts by a written rule. The rule is named.
 - **UNKNOWN** - not established by anything available.
 
-**Why something happened is usually UNKNOWN.** The supervisor records THAT a service died and was
-restarted, not why, so `ask "why did fs fail?"` says when and how often, and that the cause is not
-recorded. A restart is not reported as a failure: a deliberate `kill` restarts a service too, and the
-record does not say which (`docs/ask-design.md` 6).
+**How a service ended is a fact; why is usually UNKNOWN.** The kernel's death notice says how a task
+ended and the supervisor keeps the newest per service (`supcmd::DEATH`), so `ask "why did fs fail?"`
+says `fs` WAS KILLED BY `shell` - and that a kill is not a failure - or that it CRASHED on a memory fault
+at an address. Why `shell` killed it, or which bug faulted, is not recorded anywhere, and the answer says
+so; a fault at address 0 is said to be a null pointer or a panic, which ends exactly that way. Only the
+newest death per service is kept (`docs/ask-design.md` 6).
+
+Curly quotes count as quotes. At the prompt the shell reads a curly quote as `"`, so a question typed on
+a phone or pasted from a document is quoted exactly as a straight one, pipes included.
 
 Each answer carries the uptime it was taken at. A source that did not answer is a hole the answer names,
 never a pass: `HEALTHY` is said only when every required check ran.

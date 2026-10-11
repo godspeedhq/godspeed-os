@@ -28,6 +28,45 @@
 
 use godspeed as gs;
 
+/// A UTF-8 character assembled from console bytes, so a continuation byte is never mistaken for one of
+/// the keyboard driver's signal bytes (`0x80`-`0x83`, which are continuation values). Bounded: four bytes.
+struct Utf8In { buf: [u8; 4], have: usize, need: usize }
+
+enum Utf8Feed {
+    /// Not part of a character: the byte as it came, signals included.
+    Byte(u8),
+    /// Inside a character; more to come.
+    Pending,
+    /// A whole character (an invalid one is U+FFFD).
+    Char(char),
+}
+
+impl Utf8In {
+    fn new() -> Self { Utf8In { buf: [0; 4], have: 0, need: 0 } }
+
+    fn feed(&mut self, b: u8) -> Utf8Feed {
+        if self.need > 0 {
+            if (0x80..=0xBF).contains(&b) {
+                self.buf[self.have] = b;
+                self.have += 1;
+                if self.have < self.need { return Utf8Feed::Pending; }
+                let n = self.need;
+                self.need = 0;
+                return Utf8Feed::Char(core::str::from_utf8(&self.buf[..n]).ok()
+                    .and_then(|t| t.chars().next()).unwrap_or('\u{fffd}'));
+            }
+            // A character cut short: abandoned, and this byte read on its own.
+            self.need = 0;
+        }
+        let need = match b { 0xC2..=0xDF => 2, 0xE0..=0xEF => 3, 0xF0..=0xF4 => 4, _ => 0 };
+        if need == 0 { return Utf8Feed::Byte(b); }
+        self.buf[0] = b;
+        self.have = 1;
+        self.need = need;
+        Utf8Feed::Pending
+    }
+}
+
 /// `ask`'s own reading of a question, compiled in here from the SAME file, so the shell can start the
 /// row that question needs (`ask` or `ask-net`) and the two can never disagree about which question it
 /// is. Pure `core` - it is the file `scripts/host_test_check.py` tests on the host.
@@ -590,6 +629,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::io::print(ctx, "(F1=help or type 'help')\ngsh> ");
 
     let mut line = Line::new();
+    // A UTF-8 character arriving a byte at a time (see where it is fed).
+    let mut utf8 = Utf8In::new();
     // Current location on the (single) drive: the directory bare/relative paths target,
     // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
     let mut cwd = Cwd::root();
@@ -689,6 +730,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // the fix; putting it where it belongs is separate work, recorded rather than faked.
         // (Note 2026-10-09: that work is done - `time` loads and persists `/clock.last` itself.)
         let b = ctx.console_read();
+        // A CHARACTER, NOT A BYTE. A byte above ASCII is either one of the keyboard driver's signals
+        // (Ctrl+Alt+Del, the audio keys - `0x80`-`0x83`) or part of a UTF-8 character typed over serial
+        // or pasted, and those signal values are UTF-8 CONTINUATION bytes: a curly quote is `E2 80 9C`,
+        // so its middle byte read as Ctrl+Alt+Del and REBOOTED THE MACHINE (found 2026-10-11 typing
+        // `ask "..."` with curly quotes in QEMU). A continuation byte inside a character is text; only
+        // one standing alone is a signal, which is how a keyboard driver sends it.
+        let b = match utf8.feed(b) {
+            Utf8Feed::Byte(b) => b,
+            Utf8Feed::Pending => continue,
+            Utf8Feed::Char(c) => match c {
+                // Curly quotes are quotes: the line holds ASCII, and a quote a phone or a word processor
+                // typed should quote exactly as `"` does - pipes and arguments included.
+                '\u{201c}' | '\u{201d}' => b'"',
+                '\u{2018}' | '\u{2019}' => b'\'',
+                // Any other character is dropped whole, as non-ASCII always was at this prompt - never
+                // in pieces, whose bytes would be read as something else.
+                _ => continue,
+            },
+        };
         // Any other key may have moved the screen (Tab lists completions below the prompt), so the next
         // shortcut writes a fresh notice rather than overwriting what is no longer the line above.
         if !matches!(b, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
@@ -14428,10 +14488,17 @@ fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
     // (`evidence`), inside is the question: a question that begins with a mode's word cannot be
     // misread as one, a later mode needs no new rule, and the characters the shell gives a meaning -
     // `|`, `'` - are plain text inside. Refused with the line to type, not guessed at.
-    let q = match q.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+    //
+    // CURLY QUOTES COUNT. A phone or a word processor types the curly pair where a keyboard types `"`,
+    // and a question pasted from one was refused as unquoted (operator, 2026-10-11). Accepted here,
+    // for `ask`; the shell's tokenizer still treats them as ordinary characters elsewhere, so a `|`
+    // inside curly quotes is still a pipe. Straight quotes are the safe form, and the refusal shows them.
+    let q = match q.strip_prefix('"').and_then(|x| x.strip_suffix('"'))
+        .or_else(|| q.strip_prefix('\u{201c}').and_then(|x| x.strip_suffix('\u{201d}'))) {
         Some(inner) => inner,
         None => {
-            gs::io::println_fmt(ctx, format_args!("ask: put the question in quotes: ask \"{}\"", q.trim_matches('"')));
+            gs::io::println_fmt(ctx, format_args!("ask: put the question in quotes: ask \"{}\"",
+                q.trim_matches(|c| c == '"' || c == '\u{201c}' || c == '\u{201d}')));
             return None;
         }
     };

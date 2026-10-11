@@ -36,7 +36,7 @@
 use godspeed as gs;
 use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
 use godspeed_sdk::service_context::DeadlineOutcomeInto;
-use godspeed_sdk::service_context::supcmd;
+use godspeed_sdk::service_context::{death, supcmd};
 use godspeed_sdk::service_context::usbdev;
 
 // The probe parameter table is ONE file, shared by source with the other principal that spawns probes
@@ -88,6 +88,10 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
         supcmd::OK
     } else if payload.len() == 2 && payload[1] == supcmd::EVENTS {
         body_len = events.answer(&mut body);
+        supcmd::OK
+    } else if payload.len() > 2 && payload[1] == supcmd::DEATH {
+        let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        body_len = events.death_answer(name, &mut body);
         supcmd::OK
     } else if payload.len() == 2 && payload[1] == supcmd::MANAGED {
         body_len = managed_answer(map, usb, &mut body);
@@ -1413,12 +1417,99 @@ struct DevEvents {
     ring: [DevEvent; DEV_EVENTS],
     recorded: u32,
     since: u32,
+    /// How each watched service last ended, as the kernel said in its death notice - the newest per
+    /// name, for `supcmd::DEATH`. Bounded (26.6): `DEATHS` names; when full, the oldest entry goes.
+    deaths: [Death; DEATHS],
+}
+
+/// How many services' last deaths are kept - more than the `MANAGED` roster, so it does not cycle.
+const DEATHS: usize = 32;
+
+/// One service's newest death notice: when, how many, and how (the kernel's words, `death`).
+#[derive(Clone, Copy)]
+struct Death {
+    name: [u8; 16],
+    nlen: u8,
+    count: u32,
+    secs: u32,
+    how: u8,
+    kind: u8,
+    addr: u64,
+    by: [u8; 16],
+    blen: u8,
 }
 
 impl DevEvents {
     fn new(ctx: &ServiceContext) -> Self {
         let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; 16], nlen: 0 };
-        DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32 }
+        let none = Death { name: [0; 16], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32,
+                    deaths: [none; DEATHS] }
+    }
+
+    /// Keep how `name` ended: `how` is the notice after its NUL - `K` and the killer's name, or `F`, a
+    /// fault kind and the address. A notice without it (none should arrive) is kept as `how` 0.
+    fn note_death(&mut self, ctx: &ServiceContext, name: &str, how: &[u8]) {
+        let nb = name.as_bytes();
+        let nl = nb.len().min(16);
+        let secs = gs::task::uptime_secs(ctx).max(0) as u32;
+        // This name's entry, else an empty one, else the oldest.
+        let i = match self.deaths.iter().position(|d| d.nlen as usize == nl && d.name[..nl] == nb[..nl]) {
+            Some(i) => i,
+            None => match self.deaths.iter().position(|d| d.nlen == 0) {
+                Some(i) => i,
+                None => {
+                    let mut o = 0usize;
+                    for (k, d) in self.deaths.iter().enumerate() { if d.secs < self.deaths[o].secs { o = k; } }
+                    self.deaths[o].count = 0;
+                    o
+                }
+            },
+        };
+        let d = &mut self.deaths[i];
+        d.name = [0; 16];
+        d.name[..nl].copy_from_slice(&nb[..nl]);
+        d.nlen = nl as u8;
+        d.count = d.count.wrapping_add(1);
+        d.secs = secs;
+        d.how = 0; d.kind = 0; d.addr = 0; d.blen = 0;
+        match how.first() {
+            Some(&death::KILLED) => {
+                d.how = death::KILLED;
+                let b = &how[1..];
+                let bl = b.len().min(16);
+                d.by = [0; 16];
+                d.by[..bl].copy_from_slice(&b[..bl]);
+                d.blen = bl as u8;
+            }
+            Some(&death::FAULT) if how.len() >= 10 => {
+                d.how = death::FAULT;
+                d.kind = how[1];
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&how[2..10]);
+                d.addr = u64::from_le_bytes(a);
+            }
+            _ => {}
+        }
+    }
+
+    /// `[OK, since, deaths, secs, how, kind, addr, by_len, by...]`, as `supcmd::DEATH` documents.
+    fn death_answer(&self, name: &str, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+        let nb = name.as_bytes();
+        let nl = nb.len().min(16);
+        let none = Death { name: [0; 16], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        let d = self.deaths.iter().find(|d| d.nlen != 0 && d.nlen as usize == nl && d.name[..nl] == nb[..nl])
+            .copied().unwrap_or(none);
+        out[0] = supcmd::OK;
+        out[1..5].copy_from_slice(&self.since.to_le_bytes());
+        out[5..9].copy_from_slice(&d.count.to_le_bytes());
+        out[9..13].copy_from_slice(&d.secs.to_le_bytes());
+        out[13] = d.how;
+        out[14] = d.kind;
+        out[15..23].copy_from_slice(&d.addr.to_le_bytes());
+        out[23] = d.blen;
+        out[24..24 + d.blen as usize].copy_from_slice(&d.by[..d.blen as usize]);
+        24 + d.blen as usize
     }
 
     /// Note an event for `name`, if `name` drives a device - every other service's life is not a
@@ -2326,6 +2417,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 }
 
+/// How a task ended, for the "died, restarting" line: ` - killed by <task>` or ` - <kind> fault at <addr>`.
+struct How<'a>(&'a [u8]);
+impl core::fmt::Display for How<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self.0.first() {
+            Some(&death::KILLED) => write!(f, " - killed by {}", core::str::from_utf8(&self.0[1..]).unwrap_or("?")),
+            Some(&death::FAULT) if self.0.len() >= 10 => {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&self.0[2..10]);
+                let kind = match self.0[1] {
+                    death::F_MEMORY => "memory", death::F_INSTRUCTION => "instruction fetch",
+                    death::F_ILLEGAL => "illegal instruction", death::F_PROTECTION => "protection",
+                    death::F_ALIGNMENT => "alignment", _ => "CPU",
+                };
+                write!(f, " - {} fault at {:#x}", kind, u64::from_le_bytes(a))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// One message on the supervisor's endpoint: an operator command, or a death notification. Taken out of
 /// the main loop so the loop can drain its queue before the reconcile sweep (see there).
 fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, msg: &Message) {
@@ -2337,7 +2449,12 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
     }
     // A command, or a death notification? The first byte decides (see supcmd::MARKER).
     if handle_command(ctx, name_map, usb, events, msg.payload_bytes()) { return; }
-    let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
+    // The notice is the name, a NUL, and how the task ended (`death`): the kernel says how; this keeps the
+    // newest per name for `supcmd::DEATH`, whatever happens to the restart below.
+    let p = msg.payload_bytes();
+    let (nb, how) = match p.iter().position(|&b| b == 0) { Some(z) => (&p[..z], &p[z + 1..]), None => (p, &p[p.len()..]) };
+    let name = core::str::from_utf8(nb).unwrap_or("");
+    if !name.is_empty() && is_watched(name) { events.note_death(ctx, name, how); }
     // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
     // ALREADY respawned this service before its queued death notification reached us. If it is
     // already alive, a restart here hits the kernel singleton guard ("already running") and logs a
@@ -2378,7 +2495,7 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
         return;
     }
     if !name.is_empty() && is_watched(name) {
-        ctx.log_fmt(format_args!("supervisor: {} died, restarting", name));
+        ctx.log_fmt(format_args!("supervisor: {} died, restarting{}", name, How(how)));
         if respawn_retry(ctx, name_map, name) {
             ctx.log_fmt(format_args!("supervisor: {} restarted", name));
             events.note(ctx, supcmd::EV_RESTARTED, name, 0, 0);

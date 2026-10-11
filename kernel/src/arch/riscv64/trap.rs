@@ -283,7 +283,18 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         // space and reschedules. Only one of those can plausibly stall that long, and the dump had
         // no way to say which.
         super::note_stage(super::stage::KILL);
-        crate::task::kill_current();
+        use crate::task::death::*;
+        let kind = match code {
+            1 | 12 => F_INSTRUCTION,
+            5 | 7 | 13 | 15 => F_MEMORY,
+            2 => F_ILLEGAL,
+            0 | 4 | 6 => F_ALIGNMENT,
+            _ => F_OTHER,
+        };
+        // `stval` is the faulting address for an access or misaligned fault; for an illegal instruction
+        // it is the instruction bits (or zero), so the pc is the address that means something.
+        let addr = if kind == F_ILLEGAL || kind == F_OTHER { frame.sepc } else { stval };
+        crate::task::kill_current(kind, addr);
         // `kill_current` marks the task Dead and reschedules, so it does not come back for a corpse.
         // If it somehow does, halting beats returning into a task that no longer exists.
         super::print_str("riscv64: kill_current RETURNED for a dead task - halting rather than resuming it\n");

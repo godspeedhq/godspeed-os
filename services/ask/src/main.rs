@@ -28,12 +28,19 @@ include!(concat!(env!("OUT_DIR"), "/glossary.rs"));
 use godspeed::{self as gs, ipc::Message, record::{RecordSink, Table, Value}, ServiceContext};
 use godspeed_sdk::service_context::supcmd;
 use godspeed_wifi::wire;
-use know::{Answer, Chain, Drive, Ev, Events, Facts, Got, Kind, NetStatus, Radio, RadioFact, Reading, Task};
+use know::{Answer, Chain, Death, Drive, Ev, Events, Facts, Got, Kind, NetStatus, Radio, RadioFact, Reading, Task};
 
 // The event codes `know` restates must be the supervisor's. A drifted copy would misname every event.
 const _: () = assert!(know::EV_RESTARTED == supcmd::EV_RESTARTED && know::EV_RESTART_FAILED == supcmd::EV_RESTART_FAILED
     && know::EV_ATTACHED == supcmd::EV_ATTACHED && know::EV_DETACHED == supcmd::EV_DETACHED
     && know::EV_SWEPT == supcmd::EV_SWEPT && know::EV_START_FAILED == supcmd::EV_START_FAILED);
+const _: () = {
+    use godspeed_sdk::service_context::death as d;
+    assert!(know::D_KILLED == d::KILLED && know::D_FAULT == d::FAULT && know::F_OTHER == d::F_OTHER
+        && know::F_MEMORY == d::F_MEMORY && know::F_INSTRUCTION == d::F_INSTRUCTION
+        && know::F_ILLEGAL == d::F_ILLEGAL && know::F_PROTECTION == d::F_PROTECTION
+        && know::F_ALIGNMENT == d::F_ALIGNMENT);
+};
 const _: () = assert!(know::DOWN_TRAPPED == wire::DOWN_TRAPPED && know::DOWN_BRINGUP == wire::DOWN_BRINGUP
     && know::DOWN_NO_RADIO == wire::DOWN_NO_RADIO && know::DOWN_NOT_BUILT == wire::DOWN_NOT_BUILT);
 
@@ -159,6 +166,22 @@ fn supervisor(ctx: &ServiceContext, op: u8) -> Option<Message> {
     let r = gs::call::request_within(ctx, "supervisor", &Message::from_bytes(&[supcmd::MARKER, op]), ASK_SECS).ok()?;
     if r.payload_bytes().first() != Some(&supcmd::OK) { return None; }
     Some(r)
+}
+
+/// `[OK, since u32, deaths u32, secs u32, how, kind, addr u64, by_len, by...]` (`supcmd::DEATH`).
+fn parse_death(p: &[u8]) -> Option<Death<'_>> {
+    if p.first() != Some(&supcmd::OK) { return None; }
+    let u32_at = |i: usize| -> Option<u32> { Some(u32::from_le_bytes(p.get(i..i + 4)?.try_into().ok()?)) };
+    let blen = *p.get(23)? as usize;
+    Some(Death {
+        since: u32_at(1)?,
+        deaths: u32_at(5)?,
+        secs: u32_at(9)?,
+        how: *p.get(13)?,
+        kind: *p.get(14)?,
+        addr: u64::from_le_bytes(p.get(15..23)?.try_into().ok()?),
+        by: core::str::from_utf8(p.get(24..24 + blen)?).ok()?,
+    })
 }
 
 /// `[OK, count, (len, name)*]` - the services the supervisor keeps running on this machine now.
@@ -369,7 +392,28 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
     };
 
     let tick = gs::driver::wait::ticks(ctx);
-    let facts = Facts { now, tick, tasks, expected, events, drive, radios: &radios[..nr], chain, net };
+    // How the service asked about last ended (`supcmd::DEATH`): the kernel's notice, kept by the supervisor.
+    let death_msg = match kind {
+        Kind::Service(i) if tt.live("supervisor") => known.get(i).and_then(|n| {
+            let mut q = [0u8; 2 + 64];
+            q[0] = supcmd::MARKER;
+            q[1] = supcmd::DEATH;
+            let nb = n.as_bytes();
+            let l = nb.len().min(64);
+            q[2..2 + l].copy_from_slice(&nb[..l]);
+            gs::call::request_within(ctx, "supervisor", &Message::from_bytes(&q[..2 + l]), ASK_SECS).ok()
+        }),
+        _ => None,
+    };
+    let death = match kind {
+        Kind::Service(_) if !tt.live("supervisor") => Got::Absent,
+        Kind::Service(_) => match death_msg.as_ref().and_then(|m| parse_death(m.payload_bytes())) {
+            Some(d) => Got::Yes(d),
+            None => Got::Silent,
+        },
+        _ => Got::Absent,
+    };
+    let facts = Facts { now, tick, tasks, expected, events, drive, radios: &radios[..nr], chain, net, death };
     know::assess(kind, event, known, &facts, a);
 }
 

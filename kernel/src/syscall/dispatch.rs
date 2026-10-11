@@ -1207,7 +1207,8 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     // restartable too.) The shell still refuses a
     // *casual* `kill supervisor`/`restart supervisor` at the command layer (CORE_SERVICES); deliberate
     // chaos goes through `chaos kill-storm supervisor`.
-    if crate::task::kill_by_name(name) {
+    // The caller is named in the death notice: the cause is part of the kill, not a guess made later.
+    if crate::task::kill_by_name(name, crate::task::Cause::Killed { by: scheduler::current_task_slot() }) {
         // Now that the kill has completed and no kernel locks are held, verify the invariant a kill
         // is most likely to break, §7.8: the cap table is still consistent (no cap carries a
         // generation beyond its resource's current generation). The generation bump only ever moves

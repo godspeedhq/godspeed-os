@@ -1225,7 +1225,16 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
 
     if from_el0 && slot < crate::task::scheduler::MAX_TASKS {
         super::put_str(b"\r\n    EL0 fault - killing the task; the kernel and every other service continue.\r\n");
-        crate::task::kill_current();
+        use crate::task::death::*;
+        let (kind, addr) = match ec {
+            0b100000 | 0b100001 => (F_INSTRUCTION, far),
+            0b100100 | 0b100101 => (F_MEMORY, far),
+            0b000000 | 0b001110 => (F_ILLEGAL, f.elr),
+            0b100010 => (F_ALIGNMENT, f.elr),
+            0b100110 => (F_ALIGNMENT, far),
+            _ => (F_OTHER, f.elr),
+        };
+        crate::task::kill_current(kind, addr);
         // `kill_current` marks the task Dead and reschedules, so it does not come back. If it ever
         // does, falling through to the halt below is right: resuming a corpse's context is worse
         // than stopping, and the line above will be in the log to say what happened.

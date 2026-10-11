@@ -653,6 +653,31 @@ os/
 > the TCB via H11 (then the service was retired, Phase 4); `block-driver` + `fs` via the Phase D
 > amendment (§6.1). Only their *boot-time* spawn failure is fatal (§11.3).
 
+> **Amendment 2026-10-11 (`ask`): the death notice says HOW the task ended, because the kernel already
+> decides it and was throwing it away.** A task ends in exactly two ways: the `kill` syscall, or a CPU
+> fault in user mode (a service that panics ends as the second - its panic handler reads address 0). The
+> kernel takes that path every time, and then told the supervisor only the name, so "why did `fs`
+> restart?" could be answered nowhere in the system: a deliberate `kill` and a crash looked the same.
+>
+> The notice now carries it: the name, a NUL, then `K` and the name of the task that called `kill`, or
+> `F`, a fault kind (memory, instruction fetch, illegal instruction, protection, alignment, or one the
+> port does not classify) and the address the port has for it (`task::death`, the SDK's `death`). Each
+> port's user-fault path names the kind; x86's shared exception stub does not know its vector and says
+> so rather than guessing. The supervisor keeps the newest per name and answers `supcmd::DEATH`; its
+> "died, restarting" line now ends ` - killed by shell` or ` - memory fault at 0x0`.
+>
+> **What this does NOT add, which is why it is an amendment and not a seventh responsibility.** No
+> syscall, no capability, no new authority and no record held by the kernel: the cause rides the notice
+> the kernel already sends, to the one task that already receives it, for exactly the tasks it already
+> reports. The kernel learns nothing about any service; it reports a fact about its own kill path. The
+> record - bounded, newest per name, volatile across a supervisor restart - is the supervisor's, which
+> already recorded THAT the service died. Mechanism, not policy (26.10): whether a kill was justified is
+> the killer's to say, and nothing here tries to.
+>
+> Verified in QEMU on all four ports (a kill named on each; a fault on AArch64 through `net-stack`'s
+> `el0-fault-test`); `osdev test identity` 24/0 and `adv` 15/0. `docs/ask-design.md` 6 recorded this
+> as the missing contract.
+
 > **Failure on any core that corrupts shared kernel state (capability table, routing table) results in kernel panic on all cores.**
 
 Silent recovery of TCB state risks undefined system state. Loud failure plus clean restart is the only safe v1 option.

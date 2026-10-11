@@ -613,6 +613,49 @@ pub struct Facts<'a> {
     pub chain: Option<Chain<'a>>,
     /// `net-stack`'s status, when the network was the question.
     pub net: Got<NetStatus>,
+    /// How the service asked about last ended, as the kernel said in its death notice and the supervisor
+    /// kept (`supcmd::DEATH`), when a service was the question.
+    pub death: Got<Death<'a>>,
+}
+
+/// The newest death notice the supervisor read for one service.
+#[derive(Clone, Copy)]
+pub struct Death<'a> {
+    /// When the supervisor began its record, in seconds of uptime.
+    pub since: u32,
+    /// Notices it has read for this service since then; 0 means none, and the rest is empty.
+    pub deaths: u32,
+    /// The newest one's uptime second.
+    pub secs: u32,
+    /// `D_KILLED` or `D_FAULT`, or 0 for a notice that did not say.
+    pub how: u8,
+    /// `F_*`, for a fault.
+    pub kind: u8,
+    pub addr: u64,
+    /// The task that called `kill`, for a kill.
+    pub by: &'a str,
+}
+
+/// How a task ended (`death::*` in the SDK, `task::death` in the kernel), restated so this file names
+/// nothing outside `core`. `main.rs` asserts at compile time that they match.
+pub const D_KILLED: u8 = b'K';
+pub const D_FAULT: u8 = b'F';
+pub const F_OTHER: u8 = 0;
+pub const F_MEMORY: u8 = 1;
+pub const F_INSTRUCTION: u8 = 2;
+pub const F_ILLEGAL: u8 = 3;
+pub const F_PROTECTION: u8 = 4;
+pub const F_ALIGNMENT: u8 = 5;
+
+fn fault_words(kind: u8) -> &'static str {
+    match kind {
+        F_MEMORY => "a memory fault - a load or store its page tables do not allow",
+        F_INSTRUCTION => "an instruction-fetch fault - it jumped where it may not execute",
+        F_ILLEGAL => "an illegal instruction",
+        F_PROTECTION => "a general protection fault",
+        F_ALIGNMENT => "an alignment fault",
+        _ => "a CPU exception the port does not classify",
+    }
 }
 
 /// What `net-stack` says it believes about the network (`gs::net::Status`), reduced to what the answer
@@ -794,11 +837,56 @@ fn service(name: &str, event: Event, f: &Facts, a: &mut Answer, v: &mut TextBuf)
         Got::Absent => {}
     }
     let restarts = task.map(|t| t.restarts).unwrap_or(0);
-    if restarts > 0 || recorded > 0 || task.is_none() {
+    // HOW IT ENDED, from the kernel's death notice as the supervisor kept it - the newest one only.
+    let mut how: Option<Death> = None;
+    match f.death {
+        Got::Yes(d) if d.deaths > 0 && d.how == D_KILLED => {
+            a.fact("supervisor", format_args!("the kernel's notice of its newest death, at uptime {}s: `{}` was KILLED - `{}` called `kill`", d.secs, name, d.by));
+            a.infer("killed-not-failed", format_args!("a kill is asked for, so that death was not a failure of `{}` itself", name));
+            a.unknown(format_args!("why `{}` killed it is `{}`'s to say; the kernel records who, not why", d.by, d.by));
+            how = Some(d);
+        }
+        Got::Yes(d) if d.deaths > 0 && d.how == D_FAULT => {
+            a.fact("supervisor", format_args!("the kernel's notice of its newest death, at uptime {}s: `{}` ended on {}, at address {:#x}", d.secs, name, fault_words(d.kind), d.addr));
+            if d.kind == F_MEMORY && d.addr < 0x1000 {
+                a.infer("null-page", format_args!("an access in the first page is a null pointer - and a service that PANICS ends exactly this way: its panic handler reads address 0 so the kernel kills it"));
+                a.note(format_args!("a panic prints `PANIC in service:` and its reason on the serial console just before the fault"));
+            } else {
+                a.infer("crashed", format_args!("a CPU fault in the service's own code is a crash: nothing asked for it"));
+            }
+            how = Some(d);
+        }
+        Got::Yes(d) if d.deaths > 0 => {
+            a.fact("supervisor", format_args!("the supervisor read a death notice for `{}` at uptime {}s that did not say how it ended", name, d.secs));
+        }
+        Got::Yes(d) => {
+            a.fact("supervisor", format_args!("no death notice for `{}` since uptime {}s, when this supervisor began its record", name, d.since));
+        }
+        Got::Silent => hole(a, "the supervisor"),
+        Got::Absent => {}
+    }
+    if let (Got::Yes(d), true) = (f.death, how.is_some()) {
+        if (d.deaths as u64) < restarts {
+            a.note(format_args!("that is the newest of {} restart(s); the supervisor keeps how each service last ended, and its record began at uptime {}s", restarts, d.since));
+        } else if d.deaths > 1 {
+            a.note(format_args!("it has died {} time(s) since uptime {}s; only the newest is kept", d.deaths, d.since));
+        }
+    }
+    if how.is_none() && (restarts > 0 || recorded > 0 || task.is_none()) {
         a.unknown(format_args!("why `{}` died is not recorded anywhere this can read", name));
         if matches!(event, Event::Fail | Event::Crash) {
             a.unknown(format_args!("so whether it FAILED cannot be said: a deliberate `kill` restarts a service too, and the record does not say which"));
         }
+    }
+    if let Some(d) = how {
+        let crashed = d.how == D_FAULT;
+        let _ = match (crashed, task.is_some()) {
+            (false, true) => write!(v, "`{}` WAS KILLED BY `{}`, AND IS RUNNING AGAIN", name, d.by),
+            (false, false) => write!(v, "`{}` WAS KILLED BY `{}`", name, d.by),
+            (true, true) => write!(v, "`{}` CRASHED, AND IS RUNNING AGAIN", name),
+            (true, false) => write!(v, "`{}` CRASHED", name),
+        };
+        return;
     }
     let _ = match (task, restarts) {
         (None, _) if expected => write!(v, "`{}` IS DOWN NOW", name),
@@ -1420,7 +1508,7 @@ mod tests {
     #[test]
     fn healthy_only_when_every_required_check_ran() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"HEALTHY");
         assert_eq!(a.status, Status::Answered);
@@ -1430,7 +1518,7 @@ mod tests {
     #[test]
     fn a_silent_source_is_a_hole_not_a_pass() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Silent, events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Silent, events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"UNKNOWN");
         assert_eq!(a.status, Status::SourceSilent);
@@ -1441,7 +1529,7 @@ mod tests {
     #[test]
     fn a_required_service_down_is_unhealthy() {
         let t = [Task { name: "supervisor", restarts: 0, up_secs: 100 }, Task { name: "shell", restarts: 0, up_secs: 9 }];
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"UNHEALTHY");
         assert!(a.has(Label::Fact, "`fs` is a service the supervisor runs, and it is not running now"));
@@ -1452,7 +1540,7 @@ mod tests {
     fn a_restart_is_degraded_and_never_called_a_crash() {
         let mut t = tasks_ok();
         t[2].restarts = 2;
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"DEGRADED");
         assert!(a.has(Label::Fact, "`fs` has restarted 2 time(s)"));
@@ -1464,7 +1552,7 @@ mod tests {
     fn no_disk_is_said_and_is_not_a_fault() {
         let t = tasks_ok();
         let f = Facts { now: 1, tick: 1, tasks: &t, expected: Got::Yes(ALL), events: ev_none(),
-                        drive: Got::Yes(Drive { capacity: 0, mounted: false, total_blocks: 0, used_blocks: 0, label: "" }), radios: &[], chain: None, net: Got::Absent };
+                        drive: Got::Yes(Drive { capacity: 0, mounted: false, total_blocks: 0, used_blocks: 0, label: "" }), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"HEALTHY");
         assert!(a.has(Label::Fact, "no storage device is attached"));
@@ -1478,7 +1566,7 @@ mod tests {
                   Ev { at: 60, code: EV_ATTACHED, name: "wifi-usb" }];
         let t = tasks_ok();
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(&["supervisor", "fs", "nic-driver"]),
-                        events: Got::Yes(Events { since: 5, recorded: 40, list: &ev }), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+                        events: Got::Yes(Events { since: 5, recorded: 40, list: &ev }), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Failed, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"SOMETHING IS DOWN NOW");
         assert!(a.has(Label::Fact, "at uptime 40s `xhci` died and was restarted"));
@@ -1494,7 +1582,7 @@ mod tests {
     #[test]
     fn nothing_recorded_is_not_nothing_wrong() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Failed, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"NOTHING RECORDED");
         assert!(a.has(Label::Inference, "not proof nothing went wrong"));
@@ -1503,7 +1591,7 @@ mod tests {
     #[test]
     fn wifi_with_no_radio_says_so() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Wifi, Event::Restart, &f);
         assert_eq!(verdict(&a), b"NO RADIO");
         assert!(a.has(Label::Fact, "no radio driver"));
@@ -1515,7 +1603,7 @@ mod tests {
         let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_TRAPPED)) }];
         let ev = [Ev { at: 70, code: EV_RESTARTED, name: "wifi-driver" }];
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(&["wifi-driver"]),
-                        events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: Got::Absent, radios: &radios, chain: None, net: Got::Absent };
+                        events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: Got::Absent, radios: &radios, chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Wifi, Event::Restart, &f);
         assert_eq!(verdict(&a), b"THE RADIO DRIVER RESTARTED");
         assert!(a.has(Label::Fact, "trapped at start"));
@@ -1530,7 +1618,7 @@ mod tests {
     fn a_link_drop_with_no_restart_is_not_a_restart() {
         let t = [Task { name: "wifi-usb", restarts: 0, up_secs: 900 }];
         let radios = [RadioFact { driver: "wifi-usb", status: Got::Yes(Radio::Up { associated: false, ssid: "", joined_secs: 0 }) }];
-        let f = Facts { now: 900, tick: 900, tasks: &t, expected: Got::Yes(&["wifi-usb"]), events: ev_none(), drive: Got::Absent, radios: &radios, chain: None, net: Got::Absent };
+        let f = Facts { now: 900, tick: 900, tasks: &t, expected: Got::Yes(&["wifi-usb"]), events: ev_none(), drive: Got::Absent, radios: &radios, chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Wifi, Event::Disconnect, &f);
         assert_eq!(verdict(&a), b"NO RESTART RECORDED");
         assert!(a.has(Label::Fact, "has not restarted since boot"));
@@ -1541,7 +1629,7 @@ mod tests {
     #[test]
     fn a_mounted_filesystem_is_not_called_healthy() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Fs, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"MOUNTED - NOT VERIFIED");
         assert!(a.has(Label::Unknown, "journal was replayed"));
@@ -1572,7 +1660,7 @@ mod tests {
     fn an_answer_that_overflows_says_it_is_partial() {
         let mut t = [Task { name: "x", restarts: 1, up_secs: 1 }; 80];
         for (i, x) in t.iter_mut().enumerate() { x.restarts = i as u64 + 1; }
-        let f = Facts { now: 1, tick: 1, tasks: &t, expected: Got::Yes(&[]), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 1, tick: 1, tasks: &t, expected: Got::Yes(&[]), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert!(a.lines().len() <= LINES_MAX);
         assert!(a.has(Label::Note, "PARTIAL"));
@@ -1605,7 +1693,7 @@ mod tests {
         t[2].restarts = 3;
         let ev = [Ev { at: 70, code: EV_RESTARTED, name: "fs" }];
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL),
-                        events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+                        events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Service(2), Event::Fail, &f);
         assert_eq!(verdict(&a), b"`fs` HAS RESTARTED 3 TIME(S) - WHY IS NOT RECORDED");
         assert!(a.has(Label::Fact, "`fs` has restarted 3 time(s) since boot"));
@@ -1618,12 +1706,12 @@ mod tests {
     #[test]
     fn a_named_service_that_is_down_or_never_restarted() {
         let t = [Task { name: "supervisor", restarts: 0, up_secs: 100 }];
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Service(2), Event::Restart, &f);
         assert_eq!(verdict(&a), b"`fs` IS DOWN NOW");
         assert!(a.has(Label::Fact, "should be up"));
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Service(0), Event::Restart, &f);
         assert_eq!(verdict(&a), b"`supervisor` HAS NOT RESTARTED SINCE BOOT");
         assert!(!a.has(Label::Unknown, "why"));
@@ -1632,7 +1720,7 @@ mod tests {
     #[test]
     fn a_slow_fs_is_a_hole_not_unhealthy() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Silent, radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Silent, radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"UNKNOWN");
         assert_eq!(a.status, Status::SourceSilent);
@@ -1643,7 +1731,7 @@ mod tests {
     fn no_radio_answering_is_not_called_a_fault() {
         let t = tasks_ok();
         let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_NO_RADIO)) }];
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &radios, chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &radios, chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"HEALTHY");
         assert!(a.has(Label::Unknown, "whether this machine has a radio fitted"));
@@ -1668,7 +1756,7 @@ mod tests {
         t[2].restarts = 4; // fs
         t[3].restarts = 1; // shell
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(&["supervisor", "events", "fs", "shell", "block-driver"]),
-                        events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+                        events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Guide, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"YOU CAN ASK");
         assert!(a.has(Label::Note, "try: ask \"why did fs restart?\"  - it has restarted 4 time(s)"));
@@ -1695,7 +1783,7 @@ mod tests {
         assert_eq!(rk("restart fs"), Reading::Action);
         // A joke's verdict says it is one, and two seconds give two jokes.
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Egg(Egg::Joke), Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"A JOKE");
         assert!(a.has(Label::Note, "not an observation"));
@@ -1712,7 +1800,7 @@ mod tests {
         let none = Got::Yes(Drive { capacity: 0, mounted: false, total_blocks: 0, used_blocks: 0, label: "" });
         // QEMU on the Pi 4: block-driver answers 0, and xhci - the host it is behind - is silent.
         let f = Facts { now: 9, tick: 9, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: none, radios: &[],
-                        chain: Some(Chain { block: Got::Yes(0), host: Some(("xhci", Got::Silent)), host_read: true }), net: Got::Absent };
+                        chain: Some(Chain { block: Got::Yes(0), host: Some(("xhci", Got::Silent)), host_read: true }), net: Got::Absent, death: Got::Absent };
         let a = ask(Kind::Fs, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"STORAGE STOPS AT xhci");
         assert!(a.has(Label::Fact, "`block-driver` reaches its disk through `xhci`"));
@@ -1807,7 +1895,7 @@ mod tests {
     fn on_a_network_is_not_the_internet_works() {
         let t = tasks_ok();
         let f = Facts { now: 9, tick: 9, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[],
-                        chain: None, net: Got::Yes(net_ok()) };
+                        chain: None, net: Got::Yes(net_ok()), death: Got::Absent };
         let a = ask(Kind::Network, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"ON A NETWORK");
         assert!(a.has(Label::Fact, "address 192.168.4.98 (leased), gateway 192.168.4.1"));
@@ -1823,5 +1911,53 @@ mod tests {
         assert!(c.has(Label::Unknown, "why no lease was granted is not reported"));
         let f4 = Facts { net: Got::Silent, ..f3 };
         assert_eq!(ask(Kind::Network, Event::Unnamed, &f4).status, Status::SourceSilent);
+    }
+
+    fn death(how: u8, kind: u8, addr: u64, by: &'static str, deaths: u32) -> Got<Death<'static>> {
+        Got::Yes(Death { since: 5, deaths, secs: 90, how, kind, addr, by })
+    }
+
+    #[test]
+    fn a_kill_is_named_and_is_not_a_failure() {
+        let mut t = tasks_ok();
+        t[2].restarts = 1;
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[],
+                        chain: None, net: Got::Absent, death: death(D_KILLED, 0, 0, "shell", 1) };
+        let a = ask(Kind::Service(2), Event::Fail, &f);
+        assert_eq!(verdict(&a), b"`fs` WAS KILLED BY `shell`, AND IS RUNNING AGAIN");
+        assert!(a.has(Label::Fact, "`fs` was KILLED - `shell` called `kill`"));
+        assert!(a.has(Label::Inference, "was not a failure of `fs` itself"));
+        assert!(a.has(Label::Unknown, "why `shell` killed it"));
+        assert!(!a.has(Label::Unknown, "why `fs` died is not recorded"));
+    }
+
+    #[test]
+    fn a_fault_is_a_crash_and_a_null_read_may_be_a_panic() {
+        let mut t = tasks_ok();
+        t[2].restarts = 4;
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[],
+                        chain: None, net: Got::Absent, death: death(D_FAULT, F_MEMORY, 0, "", 4) };
+        let a = ask(Kind::Service(2), Event::Crash, &f);
+        assert_eq!(verdict(&a), b"`fs` CRASHED, AND IS RUNNING AGAIN");
+        assert!(a.has(Label::Fact, "ended on a memory fault"));
+        assert!(a.has(Label::Inference, "a service that PANICS ends exactly this way"));
+        assert!(a.has(Label::Note, "died 4 time(s) since uptime 5s; only the newest is kept"));
+        let f2 = Facts { death: death(D_FAULT, F_ILLEGAL, 0x4000_1234, "", 1), ..f };
+        let b = ask(Kind::Service(2), Event::Crash, &f2);
+        assert!(b.has(Label::Fact, "an illegal instruction, at address 0x40001234"));
+        assert!(b.has(Label::Inference, "is a crash: nothing asked for it"));
+        assert!(b.has(Label::Note, "the newest of 4 restart(s)"));
+    }
+
+    #[test]
+    fn no_notice_and_a_silent_supervisor_are_said() {
+        let t = tasks_ok();
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[],
+                        chain: None, net: Got::Absent, death: death(0, 0, 0, "", 0) };
+        let a = ask(Kind::Service(2), Event::Restart, &f);
+        assert_eq!(verdict(&a), b"`fs` HAS NOT RESTARTED SINCE BOOT");
+        assert!(a.has(Label::Fact, "no death notice for `fs` since uptime 5s"));
+        let f2 = Facts { death: Got::Silent, ..f };
+        assert_eq!(ask(Kind::Service(2), Event::Restart, &f2).status, Status::SourceSilent);
     }
 }

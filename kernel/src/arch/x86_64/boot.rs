@@ -1785,7 +1785,7 @@ unsafe extern "C" fn gpf_handler(error_code: u64, fault_rip: u64, saved_cs: u64)
     // Ring-3 #GP: the service misbehaved, not the kernel - kill it and reschedule (kill_current does
     // not return for a ring-3 fault). Only a ring-0 #GP (or a defensive fall-through) halts all cores.
     if saved_cs & 3 != 0 {
-        crate::task::kill_current();
+        crate::task::kill_current(crate::task::death::F_PROTECTION, fault_rip);
     }
     crate::arch::x86_64::halt_all_cores()
 }
@@ -1885,7 +1885,9 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
     // ever return) halts all cores - halt is the fail-safe outcome, never a resume of a killed task.
     // Mirrors gpf_handler / exc_dispatch.
     if error_code & (1 << 2) != 0 || user_copy_fault {
-        crate::task::kill_current();
+        // An instruction fetch sets error-code bit 4 (I/D); the address is CR2 either way.
+        let kind = if error_code & (1 << 4) != 0 { crate::task::death::F_INSTRUCTION } else { crate::task::death::F_MEMORY };
+        crate::task::kill_current(kind, cr2);
     }
     crate::arch::x86_64::halt_all_cores()
 }
@@ -2116,7 +2118,10 @@ unsafe extern "C" fn exc_dispatch(w0: u64, w1: u64, w2: u64, w3: u64, cs: u64) -
     }
     crate::arch::x86_64::serial_fault_lock_release(__fault_lock);
     if cs & 3 != 0 {
-        crate::task::kill_current(); // ring-3: task dies, reschedule (does not return for a ring-3 fault)
+        // The shared stub does not know its vector, so the kind is OTHER and the address is the RIP:
+        // w0 for a frame without an error code (where w1 is CS), w1 for one with.
+        let rip = if w1 == cs { w0 } else { w1 };
+        crate::task::kill_current(crate::task::death::F_OTHER, rip); // ring-3: task dies, reschedule (does not return for a ring-3 fault)
     }
     crate::arch::x86_64::halt_all_cores() // ring-0, or a defensive fall-through
 }

@@ -2366,8 +2366,39 @@ fn drain_pending_kstack(cid: usize) {
     }
 }
 
-/// Kill a task by slot: mark Dead, kill its endpoint (if any), notify blocked tasks.
-pub fn kill_task_by_slot(slot: usize) {
+/// The longest death notice: a name, NUL, `K` and the killer's name (each name at most 64 bytes).
+const DEATH_NOTE_MAX: usize = 2 * 64 + 16;
+
+/// Build the death notice for `name` into `note`, returning its length: the name, a NUL, then how
+/// it ended - `K` and the name of the task that called `kill`, or `F`, the fault kind and the address
+/// (8 bytes LE). The supervisor reads the name up to the NUL (CLAUDE.md 6.2, amendment 2026-10-11).
+fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_MAX]) -> usize {
+    let nb = name.as_bytes();
+    let mut n = nb.len().min(64);
+    note[..n].copy_from_slice(&nb[..n]);
+    note[n] = 0;
+    n += 1;
+    match cause {
+        crate::task::Cause::Killed { by } => {
+            note[n] = crate::task::death::KILLED;
+            n += 1;
+            let kb = task_name(by).as_bytes();
+            let k = kb.len().min(64);
+            note[n..n + k].copy_from_slice(&kb[..k]);
+            n + k
+        }
+        crate::task::Cause::Fault { kind, addr } => {
+            note[n] = crate::task::death::FAULT;
+            note[n + 1] = kind;
+            note[n + 2..n + 10].copy_from_slice(&addr.to_le_bytes());
+            n + 10
+        }
+    }
+}
+
+/// Kill a task by slot: mark Dead, kill its endpoint (if any), notify blocked tasks. `cause` is how it
+/// ended, said in the death notice when the supervisor watches it (`task::death`).
+pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
     // Serialize the TASK_VALID check against concurrent kills and spawns.
     // Two cores calling kill_task_by_slot(slot) simultaneously would otherwise
     // both pass the !TASK_VALID guard, both reach free_kstack, and double-free
@@ -2654,10 +2685,16 @@ pub fn kill_task_by_slot(slot: usize) {
         }
         // Reported to the supervisor because the supervisor ASKED, at spawn, to hear of this task's death -
         // not because its name is on a list here. See the restart counter above.
+        //
+        // HOW IT ENDED rides the same notice, after the name and a NUL: `K` and the name of the task that
+        // called `kill`, or `F`, the fault kind and the address (8 bytes LE). The supervisor reads the
+        // name up to the NUL, as it always read the whole notice (CLAUDE.md 6.2, amendment 2026-10-11).
         if task_watched(slot) {
+            let mut note = [0u8; DEATH_NOTE_MAX];
+            let n = death_note(task_name, cause, &mut note);
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
-                crate::ipc::message::Message::new(task_name.as_bytes()),
+                crate::ipc::message::Message::new(&note[..n]),
             ) {
                 match crate::ipc::routing::enqueue_from_interrupt(sup_ep, msg) {
                     crate::ipc::routing::Enqueue::Woke(sup_slot) => wake_by_slot(sup_slot, 0),

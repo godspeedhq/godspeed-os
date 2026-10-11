@@ -18,7 +18,7 @@ one must not hold `kill`, so the shell - which started it and holds `kill` - end
   fixtures of source replies with what each answer must and must not say. Changing a rule here is changing
   what `ask` is willing to claim; the tests are the contract.
 - `src/main.rs` - asking the system: the task table (INTROSPECT), the supervisor's read-only questions
-  (`supcmd::MANAGED`, `supcmd::EVENTS`), `fs`'s drive report (`gs::fs::Fs::drive`) and each running radio
+  (`supcmd::MANAGED`, `supcmd::EVENTS`, `supcmd::DEATH`), `fs`'s drive report (`gs::fs::Fs::drive`) and each running radio
   driver's status (tagged `wire::OP_STATUS`), each bounded. Then the answer as records to `send_peers[0]`.
 
 ## The rules it keeps
@@ -26,5 +26,6 @@ one must not hold `kill`, so the shell - which started it and holds `kill` - end
 Read only. Defined requests only - no log line is parsed as if it were a contract. Every line is a FACT,
 an INFERENCE (by a named rule) or an UNKNOWN. A source that did not answer is a hole the answer names,
 never a pass and never a fault. A service is named from what the machine knows, not from a word list, so
-a new service needs no new vocabulary. "Why" is usually UNKNOWN: the supervisor records that a service
-died, not why (`docs/ask-design.md` 6).
+a new service needs no new vocabulary. HOW a service ended is a fact - the kernel's death notice says
+killed (by whom) or a CPU fault (kind, address), and the supervisor keeps the newest per name
+(`supcmd::DEATH`); WHY is usually UNKNOWN, and the answer says so (`docs/ask-design.md` 6).

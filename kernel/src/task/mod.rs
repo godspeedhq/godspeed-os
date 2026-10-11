@@ -2650,25 +2650,63 @@ pub fn supervisor_respawn_in_progress() -> bool {
     SUPERVISOR_RESPAWN_IN_PROGRESS.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// HOW A TASK ENDED, said with its death notice (CLAUDE.md 6.2, amendment 2026-10-11).
+///
+/// The kernel already decides how every task dies - a `kill` syscall or a CPU fault, nothing else ends a
+/// task - and it used to throw that fact away and tell the supervisor only the name. This keeps it. It
+/// is not a new responsibility: no new syscall, no new authority, no new record kept by the kernel. The
+/// cause rides the notice the kernel already sends, and the supervisor, which already records the death,
+/// records how. The byte values are the SDK's `death` module, which says so beside them.
+pub mod death {
+    /// Ended by the `kill` syscall: the notice names the task that called it.
+    pub const KILLED: u8 = b'K';
+    /// Ended by a CPU fault in user mode: the notice carries the kind below and the address.
+    pub const FAULT: u8 = b'F';
+
+    /// A fault the port does not classify (x86's shared exception stub does not know its vector).
+    pub const F_OTHER: u8 = 0;
+    /// A load or store the task's page tables do not allow - nothing mapped there, or not for it.
+    /// The address is the data address.
+    pub const F_MEMORY: u8 = 1;
+    /// An instruction fetch the page tables do not allow. The address is the fetch address.
+    pub const F_INSTRUCTION: u8 = 2;
+    /// An instruction the CPU does not have, or will not run here. The address is the instruction's.
+    pub const F_ILLEGAL: u8 = 3;
+    /// x86's general protection fault. The address is the instruction's.
+    pub const F_PROTECTION: u8 = 4;
+    /// A misaligned access the CPU refuses. The address is the access's where the port has one.
+    pub const F_ALIGNMENT: u8 = 5;
+}
+
+/// How a task is being ended - carried down the kill path to the death notice.
+#[derive(Clone, Copy)]
+pub enum Cause {
+    /// The `kill` syscall, called by the task in this slot (the caller, alive while the kill runs).
+    Killed { by: usize },
+    /// A user-mode CPU fault, `death::F_*`, and the address the port has for it.
+    Fault { kind: u8, addr: u64 },
+}
+
 /// Kill all running tasks with the given name.
 ///
 /// Loops until no live task with `name` remains, so duplicate instances
 /// (e.g. from a spurious early-boot spawn) are all killed before respawn.
 /// Marks each task Dead, kills its endpoint, and marks the resource dead.
-pub fn kill_by_name(name: &str) -> bool {
+pub fn kill_by_name(name: &str, cause: Cause) -> bool {
     let mut found = false;
     while let Some(slot) = scheduler::find_task_by_name(name) {
-        scheduler::kill_task_by_slot(slot);
+        scheduler::kill_task_by_slot(slot, cause);
         found = true;
     }
     found
 }
 
-/// Kill the currently-running task (called from page-fault handler - §10.3).
-pub fn kill_current() {
+/// Kill the currently-running task for a user-mode CPU fault (§10.3). Each port names the KIND of fault
+/// (`death::F_*`) and the address it has for it, so the death notice can say how the task ended.
+pub fn kill_current(kind: u8, addr: u64) {
     let slot = scheduler::current_task_slot();
     if slot < scheduler::MAX_TASKS {
-        scheduler::kill_task_by_slot(slot);
+        scheduler::kill_task_by_slot(slot, Cause::Fault { kind, addr });
     }
     // Reschedule - kill_task_by_slot already sets state to Dead; the scheduler
     // will skip this task on the next pick_next pass.

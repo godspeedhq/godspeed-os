@@ -508,13 +508,35 @@ impl SpawnRequest {
 /// The supervisor's endpoint receives two kinds of message, told apart by the first byte:
 ///
 /// ```text
-///   death notice   "pong"                        <- kernel-generated; a name, [a-z0-9-]
+///   death notice   "pong" 0 how...               <- kernel-generated; a name, [a-z0-9-], then how it
+///                                                   ended (`death`, CLAUDE.md 6.2 amendment 2026-10-11)
 ///   command        0x01 op <core u32 LE> name    <- 0x01 cannot begin a name
 ///                                    name may be followed by NUL-separated PEER names
 /// ```
 ///
 /// Choosing an impossible first byte means the kernel's death-notification format does not change at
 /// all: the two are unambiguous without the kernel learning anything about commands.
+/// How a task ended, as the kernel says it in the death notice (`name`, NUL, then one of these). The
+/// kernel's `task::death` holds the same values; `ask` asserts its copy against these.
+pub mod death {
+    /// Ended by the `kill` syscall; the name of the task that called it follows.
+    pub const KILLED: u8 = b'K';
+    /// Ended by a user-mode CPU fault; the kind below and the address (u64 LE) follow.
+    pub const FAULT: u8 = b'F';
+    /// A fault the port does not classify.
+    pub const F_OTHER: u8 = 0;
+    /// A load or store its page tables do not allow; the address is the data address.
+    pub const F_MEMORY: u8 = 1;
+    /// An instruction fetch its page tables do not allow; the address is the fetch address.
+    pub const F_INSTRUCTION: u8 = 2;
+    /// An instruction the CPU will not run; the address is the instruction's.
+    pub const F_ILLEGAL: u8 = 3;
+    /// x86's general protection fault; the address is the instruction's.
+    pub const F_PROTECTION: u8 = 4;
+    /// A misaligned access the CPU refuses.
+    pub const F_ALIGNMENT: u8 = 5;
+}
+
 pub mod supcmd {
     /// First byte of a command. Not a legal first byte of a service name.
     pub const MARKER:  u8 = 0x01;
@@ -544,6 +566,13 @@ pub mod supcmd {
     /// now (a USB device's driver only while its device is attached). The question `ask`'s health
     /// answer turns on: a service on this list that is not running is down when it should be up.
     pub const MANAGED: u8 = b'M';
+    /// How did this service last end? Read only: `[MARKER, DEATH, name...]`, answered with `[OK, since
+    /// u32 LE, deaths u32 LE, secs u32 LE, how, kind, addr u64 LE, by_len, by...]` - since: when this
+    /// supervisor began its record; deaths: the notices it has read for this name since then (0 = none,
+    /// and the rest is zero); then the newest one: its uptime second, how it ended (`death::KILLED`,
+    /// `death::FAULT`), the fault kind and address, and the name of the task that called `kill`. The
+    /// kernel says how, in the death notice; the supervisor only keeps the newest per name. `ask`.
+    pub const DEATH:   u8 = b'X';
     /// A device's driver died and was restarted.
     pub const EV_RESTARTED: u8 = 1;
     /// A device's driver died and its restart failed.
