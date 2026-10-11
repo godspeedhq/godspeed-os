@@ -539,6 +539,11 @@ pub mod supcmd {
     /// were overwritten; per entry the uptime second (u32 LE), an `EV_*` code, the USB vid and pid (u16
     /// LE each, 0 for a driver event), and the driver's name (length byte, bytes). `hardware events`.
     pub const EVENTS:  u8 = b'E';
+    /// Which services does this supervisor keep running right now? Read only: `[MARKER, MANAGED]`,
+    /// answered with `[OK, count, (len, name)*]` - the `MANAGED` services this build carries and wants
+    /// now (a USB device's driver only while its device is attached). The question `ask`'s health
+    /// answer turns on: a service on this list that is not running is down when it should be up.
+    pub const MANAGED: u8 = b'M';
     /// A device's driver died and was restarted.
     pub const EV_RESTARTED: u8 = 1;
     /// A device's driver died and its restart failed.
@@ -2699,12 +2704,22 @@ impl ServiceContext {
     /// deadline wait. Does NOT drain a stale reply first - a caller that can be re-entered after an
     /// abort should `while self.try_recv().is_some() {}` before it sends (as the request variants do).
     pub fn recv_abortable_deadline(&self, max_secs: i64) -> ReqOutcome {
+        self.recv_abortable_deadline_keeping(max_secs, &|_| {})
+    }
+
+    /// [`Self::recv_abortable_deadline`] that HANDS BACK every key it reads that is not a quit key, in
+    /// order, as [`Self::request_with_reply_qhint_keeping`] does for a request. The plain form reads the
+    /// console to see a `q` and discards everything else, so what the operator typed while a pipe stage
+    /// ran was lost: `ask`'s answer takes seconds, and the next command typed during it vanished in QEMU
+    /// (the receive-side half of `backlog/80` H16).
+    pub fn recv_abortable_deadline_keeping(&self, max_secs: i64, keep: &dyn Fn(u8)) -> ReqOutcome {
         let t0 = self.epoch_secs_monotonic();
         loop {
             // Block, do not spin - see `await_slice`.
             if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) { return ReqOutcome::Reply(r); }
             while let Some(b) = self.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
+                keep(b);
             }
             if self.epoch_secs_monotonic() - t0 >= max_secs {
                 return ReqOutcome::Timeout;

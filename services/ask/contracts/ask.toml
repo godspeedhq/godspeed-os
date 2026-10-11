@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# `ask` - Assisted System Knowledge (`docs/ask-design.md`, `utilities/60_ask.md`).
+#
+# A FOREGROUND PROGRAM FOR ONE QUESTION, not a service. The shell starts it wired to send to the shell,
+# hands it the question, reads the answer back and ends it. Not in the boot set and not in `MANAGED`:
+# nothing restarts it, and nothing of it is left running once the prompt returns.
+#
+# READ ONLY, AND THAT IS THE POINT. INTROSPECT for the task table (a privilege its spawn row carries, as
+# `observe`'s does - the schema has no field for it); send peers to the services it asks
+# (the supervisor's read-only questions, `fs`'s drive report, each radio's status) and to the shell for
+# the answer. No spawn, no kill, no console input, no file writes: a question is data, never a grant
+# (CLAUDE.md 3.1), so nothing it is asked can widen what it can do.
+name    = "ask"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["ask"]
+ipc_send    = ["shell", "supervisor", "fs", "wifi-driver", "wifi-usb"]
+log_write   = true
+

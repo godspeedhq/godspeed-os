@@ -713,7 +713,7 @@ fn stack_fit_check(services: &[&str]) {
 /// records: a MISSING binary is caught by a guard, and a STALE one is not, because a stale file is
 /// not missing. `scripts/embed_order_check.py` catches the ordering; nothing caught the omission.
 const SERVICE_CRATES: &[&str] = &[
-    "events", "recorder", "copier", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
+    "events", "recorder", "copier", "ask", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
     "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
     "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
     "resource-server", "holder", "power", "audio-driver", "wifi-usb",

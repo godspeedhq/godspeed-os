@@ -583,7 +583,7 @@ fn render_verdict(out: &mut [u8; 160], files: u32, dirs: u32, bad: u32,
 
 /// [CP_OK, CP_OP_STATUS, state, why, kind, copied:u64, total:u64, elapsed:u64, slen, src.., dlen, dst..]
 fn reply_status(ctx: &ServiceContext, job: &Job) {
-    let mut out = [0u8; 4 + 24 + 2 + 2 * PATH_MAX];
+    let mut out = [0u8; 4 + 24 + 2 + 2 * PATH_MAX + 4];
     out[0] = CP_OK;
     out[1] = CP_OP_STATUS;
     out[2] = job.state;
@@ -606,6 +606,11 @@ fn reply_status(ctx: &ServiceContext, job: &Job) {
     n += 1;
     out[n..n + job.dlen].copy_from_slice(&job.dst[..job.dlen]);
     n += job.dlen;
+    // How many bytes of transcript this job holds, after the paths. The shell ends this service once a
+    // finished job's transcript is empty or has been read, and asking for the length with a separate
+    // request put a second reply in flight that could be read as the answer to the next question.
+    out[n..n + 4].copy_from_slice(&(job.out.len as u32).to_le_bytes());
+    n += 4;
     reply(ctx, &out[..n]);
 }
 

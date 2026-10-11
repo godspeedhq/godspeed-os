@@ -2448,7 +2448,17 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     // THE NEGATIVE HALF. An explicit stop must delete the marker, or the one command meaning "enough"
     // is the one that did not take - and the capture would return at every boot forever.
     send(&mut write2, b"events persist stop\r");
-    let _ = collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30));
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
+        // A stopped capture leaves nothing running: the shell ends the recorder at the stop.
+        Some(r) => check!(r.contains("shell: ended `recorder` - its capture is closed"),
+                          "stop ENDED the recorder - a closed capture leaves no task behind"),
+        None => { println!("sticky-test: FAIL - timed out on stop"); fail += 1; }
+    }
+    send(&mut write2, b"events persist status\r");
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => check!(r.contains("not running"), "and `status` then says so, from the task table"),
+        None => { println!("sticky-test: FAIL - timed out on status after stop"); fail += 1; }
+    }
     send(&mut write2, b"read /persist.conf\r");
     match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
         Some(r) => check!(!r.contains("/cap.log"), "stop DELETED the sticky marker (it will not come back)"),
@@ -2457,7 +2467,7 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     child2.kill().ok();
     let _ = child2.wait();
 
-    let passed = 6usize.saturating_sub(fail);
+    let passed = 8usize.saturating_sub(fail);
     println!("\n  {passed} passed  {fail} failed");
     if fail > 0 {
         std::process::exit(1);
@@ -8211,6 +8221,11 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     // to see a tear at all.
     let ch_verify = run!(b"churn verify\r", 120).unwrap_or_default();
     let _ = run!(b"churn reset\r", 120);
+    // ---- `copier` IS NOT A SERVICE. Every job above has ended and been read back, so the shell
+    //      must have ended every `copier` it started - it used to stay up until reboot, waking twice
+    //      a second. One more command for the last tidy, then the task table must not hold one.
+    let _ = run!(b"dir /\r", 90);
+    let tasks_after = run!(b"observe now\r", 90).unwrap_or_default();
 
     let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     child.kill().ok(); child.wait().ok();
@@ -8285,6 +8300,13 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
            "and it RENAMED - writing only would exercise one transaction shape while claiming three");
     check!(ch_verify.contains("NONE torn") && count_before(&ch_verify, " file(s) checked") > 0,
            "`churn verify` recognised what the detached writer wrote, over a NON-EMPTY set - `NONE torn` across zero files is the vacuous pass this refactor exists to prevent");
+
+    let started = w.matches("task: 'copier' spawned OK").count();
+    let ended = w.matches("shell: ended `copier`").count();
+    check!(started >= 2 && ended == started,
+           &format!("every `copier` the shell started was ended once its job was over and read back ({started} started, {ended} ended)"));
+    check!(!tasks_after.contains(" copier "),
+           "no `copier` is left in the task table once every job is collected");
 
     println!("\njobs: {pass} passed, {fail} failed");
     if fail > 0 { std::process::exit(1); }

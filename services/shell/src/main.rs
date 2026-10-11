@@ -434,6 +434,9 @@ pub struct ShellCtx {
     /// so nothing typed while a command waits is lost (`backlog/80` H16). Bounded (26.6); a full
     /// buffer says so, once, rather than dropping keys in silence.
     typeahead: core::cell::RefCell<TypeAhead>,
+    /// Whether this shell has started `copier` and not yet ended it - so [`tidy_helpers`] looks for it
+    /// only when there can be one, rather than walking every task slot after every command.
+    copier_started: core::cell::Cell<bool>,
 }
 
 /// The shell's bounded type-ahead (see `ShellCtx::typeahead`): a FIFO of keys, and whether a key has
@@ -527,6 +530,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         audio_tag: core::cell::Cell::new(0),
         jobs: core::cell::RefCell::new(JobTable::new()),
         typeahead: core::cell::RefCell::new(TypeAhead::new()),
+        copier_started: core::cell::Cell::new(false),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -736,6 +740,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     line.len = 0;
                     line.cur = 0;
+                    // A helper whose work that command finished is ended before the prompt returns.
+                    tidy_helpers(&ctx);
                 }
                 nav = hist.len();
                 gs::io::print(ctx, PROMPT);
@@ -959,6 +965,8 @@ const NO_PATH_CMDS: &[&str] = &[
     "wifi",
     // Sections and device names, never a path.
     "hardware",
+    // A question, never a path.
+    "ask",
     // `paginate` takes NO arguments at all, so Tab after it must offer nothing rather than a
     // directory listing for a position that accepts neither a path nor a keyword.
     "paginate",
@@ -982,6 +990,7 @@ const _: () = assert!(
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
+    ("ask",     &["evidence"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -2111,6 +2120,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "wifi"    => cmd_wifi(ctx, s["wifi".len()..].trim(), out),
         "audio"   => cmd_audio(ctx, cwd, s["audio".len()..].trim(), out),
         "hardware" => cmd_hardware(ctx, cwd, s["hardware".len()..].trim(), out),
+        "ask"     => cmd_ask(ctx, s["ask".len()..].trim()),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -5145,6 +5155,7 @@ const UTILS: &[&str] = &[
     "wifi",
     "audio",
     "hardware",
+    "ask",
     "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -5403,6 +5414,15 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio debug [view]", "the driver's own account: stats (bare), codec, stream, trace, registers", "audio debug codec"),
             ("audio system sounds on | off", "the short sounds the system makes on its own: an error, a refusal, a finished job, a USB plug", "audio system sounds off"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
+        ], true),
+        "ask" => help_block(ctx, "ask", "plain questions about this machine, answered from what its services know", &[
+            ("ask \"<question>\"", "the answer: a verdict, and what it rests on", "ask \"is my system healthy?\""),
+            ("ask \"what failed?\"", "restarts and failed restarts the supervisor recorded, and what is down now", "ask \"what failed?\""),
+            ("ask \"why did <service> <event>?\"", "a service by name, and one event: restart, fail, crash, stop", "ask \"why did fs restart?\""),
+            ("ask \"why did the wifi restart?\"", "the radio driver and the radio's own status", "ask \"why did the wifi restart?\""),
+            ("ask \"is the filesystem healthy?\"", "what fs reports; a scrub is offered, not run", "ask \"is the filesystem healthy?\""),
+            ("ask evidence \"<question>\"", "the same answer with every line labelled FACT, INFERENCE or UNKNOWN, and its source", "ask evidence \"is my system healthy?\""),
+            ("ask \"<question>\" | where label=verdict", "the answer is records: label, source, rule, text", "ask \"what failed?\" | where label=fact"),
         ], true),
         "hardware" => help_block(ctx, "hardware", "what this machine is, and what drives each part of it", &[
             ("hardware", "every section: cpu, memory, pci, soc, display, usb - only the ones this machine has", "hardware"),
@@ -5703,6 +5723,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi radio off hard", "cut the CHIP's power and stay powered down; `wifi radio on` brings it back cold (~20 s)", "wifi radio off hard"),
             ("wifi radio powercycle", "cut and restore the CHIP's power and restart the driver on it - the radio comes back from power-on and rejoins", "wifi radio powercycle"),
         ], false),
+        ("ask", "evidence") => help_block(ctx, "ask evidence", "the same answer, with every line labelled and its source named", &[
+            ("ask evidence \"<question>\"", "FACT: a source said it; INFERENCE: concluded by the named rule; UNKNOWN: nothing available establishes it", "ask evidence \"what failed?\""),
+        ], false),
         ("hardware", "cpu") => help_block(ctx, "hardware cpu", "the cores the kernel brought up", &[
             ("hardware cpu", "this section; on a machine without it, says so", "hardware cpu"),
             ("hardware cpu | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware cpu | count"),
@@ -5967,6 +5990,7 @@ static HELP: &[HelpRow] = &[
     Row("cores", "CPU core count"),
     Row("mem", "physical memory usage"),
     Row("hardware [section|device]", "this machine's devices and their drivers (records when piped)"),
+    Row("ask \"<question>\"", "plain questions about this machine: health, what failed, why a service restarted"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("random [n]", "words from the hardware random number generator"),
@@ -13601,7 +13625,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// (search hits), `observe now`, `uptime`, `jobs` and the record views of `events` and `trace` are
 /// built in the shell, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs")
+    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs" | "ask")
 }
 
 /// `dir` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -13946,6 +13970,12 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
             "jobs"    => build_jobs_table(ctx),
+            // `ask "<q>" | where label=verdict`: the answer's lines as records; `evidence` is a way of
+            // SHOWING an answer, so in a pipe it is the same table.
+            "ask"     => {
+                let q = match split_first(arg) { ("evidence", rest) if !rest.is_empty() => rest, _ => arg };
+                match build_ask_table(ctx, q) { Some(t) => t, None => return Err(ShellError::Unknown) }
+            }
             "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
             "audio" if arg.trim() == "hardware" => build_audio_hardware_table(ctx),
             "audio" => match build_audio_outputs_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -14366,6 +14396,113 @@ fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
             Err(ShellError::Unknown)
         }
     }
+}
+
+/// How long `ask` may take to send its answer. It asks up to five sources, each bounded (3 s, and 8 s
+/// for `fs` - `services/ask`), so a machine where every one is silent still answers inside this, with
+/// every source named as a hole, rather than this shell giving up first.
+const ASK_WAIT_SECS: i64 = 25;
+/// The services `ask` is wired to when it is started: the shell for its answer, then what it asks.
+const ASK_PEERS: &[&str] = &["shell", "supervisor", "fs", "wifi-driver", "wifi-usb"];
+
+/// `ask "<question>"` / `ask evidence "<question>"` as a record table, one row per line of the answer
+/// (`label`, `source`, `rule`, `text`) and a last row of label `status`. `ask` is a FOREGROUND PROGRAM
+/// FOR ONE QUESTION (`docs/ask-design.md` 1): started here, handed the question, read back, and ended
+/// by `drain_service_with` before this returns, so nothing of it is left running.
+#[inline(never)]
+fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
+    let q = question.trim();
+    // THE QUESTION IS ALWAYS QUOTED (`utilities/60_ask.md` 1). Outside the quotes is a mode word
+    // (`evidence`), inside is the question: a question that begins with a mode's word cannot be
+    // misread as one, a later mode needs no new rule, and the characters the shell gives a meaning -
+    // `|`, `'` - are plain text inside. Refused with the line to type, not guessed at.
+    let q = match q.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        Some(inner) => inner,
+        None => {
+            gs::io::println_fmt(ctx, format_args!("ask: put the question in quotes: ask \"{}\"", q.trim_matches('"')));
+            return None;
+        }
+    };
+    let mut cap = Cap::new();
+    let keep = |b: u8| ctx.keep_key(b);
+    if !drain_service_with(ctx, "ask", ASK_PEERS, Some(q.as_bytes()), &mut cap, ASK_WAIT_SECS, Some(&keep)) {
+        return None;
+    }
+    match Table::decode(cap.bytes()) {
+        Ok(t) => Some(t),
+        Err(why) => { gs::io::println_fmt(ctx, format_args!("ask: bad answer - {}", why)); None }
+    }
+}
+
+/// The answer's `status` row: `answered` is a success whatever the answer says; the rest are failures
+/// (`docs/ask-design.md` 2), and the row says which.
+fn ask_status(t: &Table) -> Option<String8> {
+    for r in 0..t.nrows() {
+        if t.cell_bytes(r, 0) == b"status" {
+            return Some(String8::from(t.cell_bytes(r, 3)));
+        }
+    }
+    None
+}
+
+/// `ask` - Assisted System Knowledge (`utilities/60_ask.md`). Prints the verdict and what the answer
+/// rests on; `ask evidence` prints every line with its label (FACT, INFERENCE, UNKNOWN) and source.
+/// One assessment either way - `evidence` changes how much is SHOWN, not what was asked.
+#[inline(never)]
+fn cmd_ask(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        gs::io::println(ctx, "usage: ask \"<question>\" | ask evidence \"<question>\" - `ask help` lists what it can answer");
+        return Err(ShellError::Unknown);
+    }
+    let (evidence, question) = match split_first(arg) {
+        ("evidence", rest) if !rest.is_empty() => (true, rest),
+        _ => (false, arg),
+    };
+    let t = match build_ask_table(ctx, question) { Some(t) => t, None => return Err(ShellError::Unknown) };
+    for r in 0..t.nrows() {
+        let label = t.cell_bytes(r, 0);
+        let text = str_of(t.cell_bytes(r, 3));
+        match label {
+            b"status" => {}
+            b"verdict" => gs::io::println(ctx, text),
+            b"note" => gs::io::println_fmt(ctx, format_args!("  {}", text)),
+            // The summary leaves out the FACT lines and keeps what they amount to; `evidence` shows all.
+            b"fact" if !evidence => {}
+            _ if evidence => {
+                let up = match label { b"fact" => "FACT", b"inference" => "INFERENCE", b"unknown" => "UNKNOWN", _ => "" };
+                let src = str_of(t.cell_bytes(r, 1));
+                let rule = str_of(t.cell_bytes(r, 2));
+                if label == b"inference" {
+                    gs::io::println_fmt(ctx, format_args!("  {:<9} {} (rule {})", up, text, rule));
+                } else if src != "-" {
+                    gs::io::println_fmt(ctx, format_args!("  {:<9} {} [{}]", up, text, src));
+                } else {
+                    gs::io::println_fmt(ctx, format_args!("  {:<9} {}", up, text));
+                }
+            }
+            b"inference" => gs::io::println_fmt(ctx, format_args!("  {}", text)),
+            b"unknown" => gs::io::println_fmt(ctx, format_args!("  unknown: {}", text)),
+            _ => gs::io::println_fmt(ctx, format_args!("  {}", text)),
+        }
+    }
+    match ask_status(&t) {
+        Some(st) if st.as_bytes() == b"answered" => Ok(()),
+        Some(_) => Err(ShellError::Unknown),
+        None => { gs::io::println(ctx, "ask: the answer had no status - treat it as incomplete"); Err(ShellError::Unknown) }
+    }
+}
+
+/// A fixed-size copy of a short cell, so a status can outlive the table it was read from.
+struct String8 { b: [u8; 24], n: usize }
+impl String8 {
+    fn from(s: &[u8]) -> String8 {
+        let mut b = [0u8; 24];
+        let n = s.len().min(24);
+        b[..n].copy_from_slice(&s[..n]);
+        String8 { b, n }
+    }
+    fn as_bytes(&self) -> &[u8] { &self.b[..self.n] }
 }
 
 /// Task slots to scan. Matches the other slot-scanning commands in this file.
@@ -15816,7 +15953,8 @@ fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, budget: u64) -> Resul
     // SPAWN ON DEMAND. Not at boot, so the recorder costs nothing until a capture is wanted - and
     // staying out of the boot set and the supervisor's `MANAGED` roster is what keeps this feature free
     // of a kernel change (the kernel keeps no list of service names; `services/CLAUDE.md`).
-    if slot_of(ctx, "recorder").is_none() && ctx.spawn("recorder").is_err() {
+    let spawned_here = slot_of(ctx, "recorder").is_none();
+    if spawned_here && ctx.spawn("recorder").is_err() {
         gs::io::println(ctx, "events persist: could not spawn `recorder`");
         return Err(ShellError::Unknown);
     }
@@ -15852,10 +15990,15 @@ fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, budget: u64) -> Resul
         }
         Some(_) => {
             gs::io::println(ctx, "events persist: recorder refused (no filesystem, or a bad path)");
+            // Started for this capture and refused it, so it holds nothing.
+            if spawned_here { end_helper(ctx, "recorder", "the capture it was started for was refused"); }
             Err(ShellError::Unknown)
         }
         None => {
             gs::io::println(ctx, "events persist: recorder did not answer");
+            // Whether it began is unknown. Ending the one started for this request makes the state
+            // KNOWN - nothing recording - instead of leaving a task that may or may not be capturing.
+            if spawned_here { end_helper(ctx, "recorder", "it did not answer the start it was spawned for"); }
             Err(ShellError::Unknown)
         }
     }
@@ -16091,6 +16234,9 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
                     // that means "enough" the one that did not take.
                     sticky_clear(ctx);
                     gs::io::println(ctx, "events persist: stopped (the capture file has its footer, so it reads as complete)");
+                    // The footer is written, so the recorder holds nothing: `status` answers "not
+                    // running" from the task table, which is now the truth rather than an idle task.
+                    end_helper(ctx, "recorder", "its capture is closed");
                     Ok(())
                 }
                 None => {
@@ -16579,6 +16725,71 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
+/// End a helper this shell started on demand, now that it holds nothing anybody still needs.
+///
+/// `recorder`, `copier` and `ask` are started when a command wants them and are not services: nothing
+/// restarts them, nothing else talks to them, and once their work is collected they are only a task
+/// slot, an IPC route and their memory - `copier` also woke every 500 ms, forever. They used to stay up
+/// until the machine rebooted, because nothing ended them; ending them is this shell's job, since it
+/// started them and it is the one that holds `kill` (a task cannot end itself in v1, and these must not
+/// hold the authority to try).
+///
+/// Said on the LOG, not the console: it is housekeeping, and the kernel's own `kill_task` line beside it
+/// records what was freed. A helper already gone is the outcome wanted, so `NotFound` is not a failure;
+/// any other refusal is said, because a helper this shell believes it ended and did not would be the
+/// silent kind of leak this exists to stop.
+fn end_helper(ctx: &ServiceContext, name: &str, why: &str) {
+    match ctx.kill(name) {
+        Ok(()) => ctx.log_fmt(format_args!("shell: ended `{}` - {}", name, why)),
+        Err(godspeed_sdk::Error::NotFound) => {}
+        Err(e) => ctx.log_fmt(format_args!(
+            "shell: could not end `{}` ({:?}) - it stays running, holding nothing", name, e)),
+    }
+}
+
+/// After every command typed at the prompt: end any helper whose work is over (see [`end_helper`]).
+///
+/// Only `copier` needs looking for here, and only once this shell has started it. `recorder` is ended
+/// where its capture is (`events persist stop`), and `ask` where its answer is - each at the one point
+/// that knows. `copier`'s end is not one point, because a job runs on after the command that began it:
+/// it is over when its row has stopped running AND what it said has been read, since the service holds
+/// the newest job's transcript and nothing else does (`replay_transcript`). A job that said nothing has
+/// nothing to collect, so it ends as soon as the job does.
+///
+/// It runs after a command, not while the prompt sits idle, and it asks `copier` nothing (see the body),
+/// so a job that finishes while nobody looks keeps `copier` until the next `jobs` or `foreground` sees it
+/// end. That is a bound in commands rather than time, stated rather than hidden; a timer here would make
+/// the prompt wake when nobody asked it to.
+fn tidy_helpers(ctx: &ShellCtx) {
+    if !ctx.copier_started.get() {
+        return;
+    }
+    if slot_of(ctx, "copier").is_none() {
+        ctx.copier_started.set(false);
+        return;
+    }
+    // NO REQUEST TO `copier` HERE. The rows are as `jobs`, `foreground` and `background` last learned
+    // them, and that is all this reads. Asking for status after every command doubled the questions a
+    // busy `copier` answers late - a scrub holds it inside one `fs` request for its whole sweep - and a
+    // late answer is read as the reply to whichever question comes next: in QEMU it turned the scrub's
+    // replay into nothing and the next `background churn` into a refusal. So a job that finishes
+    // unobserved keeps `copier` until the next `jobs` or `foreground` sees it finish.
+    let (live, held) = {
+        let t = ctx.jobs.borrow();
+        let live = t.rows.iter().any(|r| r.used && r.live);
+        // The newest job is the only one whose transcript `copier` still has. Held while it is unread
+        // and not empty; no row at all means the service was started and its job refused.
+        let held = t.rows.iter().filter(|r| r.used).max_by_key(|r| r.id)
+            .map_or(false, |r| !r.collected && r.out_len > 0);
+        (live, held)
+    };
+    if live || held {
+        return;
+    }
+    end_helper(ctx, "copier", "its job is over and nothing it said is left unread");
+    ctx.copier_started.set(false);
+}
+
 /// The restart count of the live service named `name` (None if not running). A respawn increments it
 /// (a fresh instance reads previous + 1), so a value strictly greater than a pre-kill reading proves a
 /// NEW instance came up - the recovery signal `chaos kill-storm` waits on.
@@ -16938,6 +17149,18 @@ const MAX_STAGES: usize = 8;
 /// shell's endpoint until the service sends an EOT (0x04), then the service is reaped. Whole-
 /// buffer messaging (≤ one message each way) keeps the bounded queues deadlock-free (§8.9).
 fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mut Cap) -> bool {
+    drain_service_with(ctx, svc, &["shell"], input, out, FILTER_WAIT_SECS, None)
+}
+
+/// [`drain_service`] with the stage's send peers and the wait between its messages stated by the
+/// caller. A pipe stage needs only the shell; `ask` also names the services it asks, and waits longer
+/// for its first message, because it answers only after asking them (`ASK_WAIT_SECS`).
+/// `keep`, when given, receives every key typed during the wait that is not `q`, so a command typed
+/// while the stage runs reaches the prompt instead of vanishing. `None` keeps a plain pipe stage's
+/// behaviour, which still drops type-ahead - the shell's other drains take a `&ServiceContext` and
+/// cannot reach the type-ahead buffer (recorded, `backlog/80` H16's receive side).
+fn drain_service_with(ctx: &ServiceContext, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
+                      wait_secs: i64, keep: Option<&dyn Fn(u8)>) -> bool {
     // A stage crossing a service boundary is one IPC message until streaming chunks across
     // many. Refuse a larger buffer LOUDLY rather than silently clipping it to 4 KiB (§3.12).
     if let Some(inp) = input {
@@ -16951,7 +17174,7 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
     // Wire the service to send its output to the SHELL's own endpoint.
     // Through the SUPERVISOR, which owns every service image now (step C; the kernel's catalogue is the
     // supervisor alone). A pipe stage is a spawn wired to send to the shell's own endpoint.
-    if ctx.spawn_via_supervisor(svc, 0xFFFF, &["shell"]).is_err() {
+    if ctx.spawn_via_supervisor(svc, 0xFFFF, peers).is_err() {
         gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
         return false;
     }
@@ -16992,7 +17215,11 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
     // output) must not hang the prompt forever with the keyboard dead. Timeout => it died mid-stream;
     // Aborted => the user pressed q. Both stop the drain loudly (§26.7) rather than blocking.
     for _ in 0..512 {
-        match ctx.recv_abortable_deadline(FILTER_WAIT_SECS) {
+        let got = match keep {
+            Some(k) => ctx.recv_abortable_deadline_keeping(wait_secs, k),
+            None => ctx.recv_abortable_deadline(wait_secs),
+        };
+        match got {
             ReqOutcome::Reply(msg) => {
                 let p = msg.payload_bytes();
                 if p == [PIPE_EOT] { break; }
@@ -17003,7 +17230,7 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
             ReqOutcome::Timeout => {
                 gs::io::println_fmt(ctx, format_args!(
                     "pipe: '{}' stopped sending without EOT (waited ~{}s) - it may have failed mid-stream",
-                    svc, FILTER_WAIT_SECS));
+                    svc, wait_secs));
                 break;
             }
         }
@@ -21763,13 +21990,18 @@ struct JobRow {
     slen: usize,
     dst: [u8; PATH_MAX],
     dlen: usize,
+    /// Whether what this job said has been read back (`foreground` replayed its transcript). Until it
+    /// has, `copier` is the only holder of that text and is kept; once it has, `tidy_helpers` ends it.
+    collected: bool,
+    /// Bytes of transcript `copier` reported holding for this job, from its last status answer.
+    out_len: u32,
 }
 
 impl JobRow {
     const fn empty() -> Self {
         JobRow { used: false, kind: KIND_COPY, live: false, id: 0, state: ST_IDLE, why: 0,
                  copied: 0, total: 0, elapsed: 0,
-                 src: [0u8; PATH_MAX], slen: 0, dst: [0u8; PATH_MAX], dlen: 0 }
+                 src: [0u8; PATH_MAX], slen: 0, dst: [0u8; PATH_MAX], dlen: 0, collected: false, out_len: 0 }
     }
 }
 
@@ -21816,7 +22048,7 @@ fn why_words(why: u8) -> &'static str {
 /// delete is exactly that - it reads no messages at all. Reporting that as `lost` would declare a
 /// job dead precisely while it is doing its work.
 enum Ask {
-    Answer(u8, u8, u8, u64, u64, u64), // state, why, kind, copied, total, elapsed
+    Answer(u8, u8, u8, u64, u64, u64, u32), // state, why, kind, copied, total, elapsed, transcript bytes
     Busy,                              // alive, did not answer in time
     Gone,                              // the service is not running
 }
@@ -21844,7 +22076,15 @@ fn copier_status(ctx: &ShellCtx) -> Ask {
     let copied = u64::from_le_bytes([p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12]]);
     let total = u64::from_le_bytes([p[13], p[14], p[15], p[16], p[17], p[18], p[19], p[20]]);
     let elapsed = u64::from_le_bytes([p[21], p[22], p[23], p[24], p[25], p[26], p[27], p[28]]);
-    Ask::Answer(st, why, kind, copied, total, elapsed)
+    // The transcript's length, after the two length-prefixed paths. An older reply without it reads as
+    // `u32::MAX` - "holds something" - so the shell keeps a `copier` it cannot account for.
+    let mut i = 29usize;
+    let slen = p.get(i).copied().unwrap_or(0) as usize;
+    i += 1 + slen;
+    let dlen = p.get(i).copied().unwrap_or(0) as usize;
+    i += 1 + dlen;
+    let out_len = if p.len() >= i + 4 { u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]) } else { u32::MAX };
+    Ask::Answer(st, why, kind, copied, total, elapsed, out_len)
 }
 
 /// Bring the live row up to date from the service, and FREEZE it if the job has ended.
@@ -21860,9 +22100,10 @@ fn refresh_jobs(ctx: &ShellCtx) {
     };
     let i = match live_idx { Some(i) => i, None => return };
     match copier_status(ctx) {
-        Ask::Answer(st, why, kind, copied, total, elapsed) => {
+        Ask::Answer(st, why, kind, copied, total, elapsed, out_len) => {
             let mut t = ctx.jobs.borrow_mut();
             let row = &mut t.rows[i];
+            row.out_len = out_len;
             row.state = st;
             row.why = why;
             row.kind = kind;
@@ -21998,6 +22239,9 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
         gs::io::println(ctx, "background: could not spawn `copier`");
         return Err(ShellError::Unknown);
     }
+    // From here `tidy_helpers` looks for it after each command, and ends it once its job is over and
+    // collected - including when the start below is refused, which leaves it holding nothing.
+    ctx.copier_started.set(true);
     let _ = gs::cap::reacquire(ctx, "copier");
 
     let mut req = [0u8; 4 + 2 * PATH_MAX + 8];
@@ -22027,7 +22271,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     };
     if !ok {
         // The service records WHY it refused before it answers, so ask rather than print a shrug.
-        let why = match copier_status(ctx) { Ask::Answer(_, w, _, _, _, _) => w, _ => 0 };
+        let why = match copier_status(ctx) { Ask::Answer(_, w, _, _, _, _, _) => w, _ => 0 };
         gs::io::println_fmt(ctx, format_args!("background: refused - {}", why_words(why)));
         return Err(ShellError::Unknown);
     }
@@ -22235,7 +22479,16 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         // replaying a transcript IS attaching, so a second word for it would be a second way to
         // say `foreground` (§26.2).
         if is_newest(ctx, want) {
-            replay_transcript(ctx);
+            if slot_of(ctx, "copier").is_some() {
+                replay_transcript(ctx);
+                // READ, SO NO LONGER HELD FOR ANYBODY: `tidy_helpers` ends `copier` after this command.
+                if let Some(r) = ctx.jobs.borrow_mut().rows.iter_mut().find(|r| r.used && r.id == want) {
+                    r.collected = true;
+                }
+            } else if ctx.jobs.borrow().rows.iter().any(|r| r.used && r.id == want && r.collected) {
+                // Said rather than left blank: an empty reply here would read as "it said nothing".
+                gs::io::println(ctx, "  (what it said was shown when it was first read back, and is not kept after that)");
+            }
         }
         return Ok(());
     }

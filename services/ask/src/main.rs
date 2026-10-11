@@ -1,0 +1,359 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI. `deny` rather
+// than `forbid` for exactly one reason: the exported `service_main` symbol needs `#[allow(unsafe_code)]`.
+#![deny(unsafe_code)]
+//! `ask` - Assisted System Knowledge (`docs/ask-design.md`, `utilities/60_ask.md`).
+//!
+//! A FOREGROUND PROGRAM FOR ONE QUESTION, not a service. The shell starts it wired to send to the shell,
+//! hands it the question and an end-of-stream byte, reads the answer back as one record table, and ends
+//! it. Nothing of it is left running, and nothing restarts it (it is in no `MANAGED` list).
+//!
+//! What it does between those: read the question (`know::understand`), ask the services that already
+//! know - the task table, the supervisor, `fs`, the radio drivers - each with a bounded request, and turn
+//! what they said into lines that are each a FACT, an INFERENCE or an UNKNOWN (`know::assess`). It
+//! changes nothing: every request below is a read.
+//!
+//! The answer is a record table, one row per line - `label`, `source`, `rule`, `text`, then one row of
+//! label `status` - so the shell renders it as text at the prompt and passes it on as records into a
+//! pipe (`ask "is my system healthy?" | where label=verdict`).
+
+#![no_std]
+#![no_main]
+
+mod know;
+
+use godspeed::{self as gs, ipc::Message, record::{RecordSink, Table, Value}, ServiceContext};
+use godspeed_sdk::service_context::supcmd;
+use godspeed_wifi::wire;
+use know::{Answer, Drive, Ev, Events, Facts, Got, Kind, Radio, RadioFact, Reading, Task};
+
+// The event codes `know` restates must be the supervisor's. A drifted copy would misname every event.
+const _: () = assert!(know::EV_RESTARTED == supcmd::EV_RESTARTED && know::EV_RESTART_FAILED == supcmd::EV_RESTART_FAILED
+    && know::EV_ATTACHED == supcmd::EV_ATTACHED && know::EV_DETACHED == supcmd::EV_DETACHED
+    && know::EV_SWEPT == supcmd::EV_SWEPT && know::EV_START_FAILED == supcmd::EV_START_FAILED);
+const _: () = assert!(know::DOWN_TRAPPED == wire::DOWN_TRAPPED && know::DOWN_BRINGUP == wire::DOWN_BRINGUP
+    && know::DOWN_NO_RADIO == wire::DOWN_NO_RADIO && know::DOWN_NOT_BUILT == wire::DOWN_NOT_BUILT);
+
+/// Every request this program makes waits at most this long. A dead or wedged source ends one line of
+/// the answer ("did not answer"), never the command (design section 7).
+const ASK_SECS: i64 = 3;
+/// `fs` is given longer: its drive report re-derives the device's size from `block-driver` on every ask,
+/// and that can wait 2 s on a USB host before `fs` answers anything (seen in QEMU on the Pi 4). Shorter,
+/// and `ask` reported a slow `fs` as one that did not answer.
+const ASK_FS_SECS: i64 = 8;
+/// The radio drivers, by service name. A running one is asked; none running is a fact in itself.
+const RADIOS: [&str; 2] = ["wifi-driver", "wifi-usb"];
+/// End of a stream, as every pipe stage uses it.
+const EOT: u8 = 0x04;
+
+/// Task slots read from the task table.
+const SLOTS: u32 = 256;
+const TASKS_MAX: usize = 64;
+
+#[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
+#[no_mangle]
+pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
+    gs::trace::as_name(&ctx, "ask");
+    // The question arrives as one message, then the end-of-stream byte. Bounded: a shell that never
+    // sends one leaves this waiting only until it ends this program, which it does on its own deadline.
+    let mut q = [0u8; know::QUESTION_MAX];
+    let mut qlen = 0usize;
+    loop {
+        let m = gs::ipc::recv(&ctx);
+        let p = m.payload_bytes();
+        if p == [EOT] { break; }
+        let take = p.len().min(q.len() - qlen);
+        q[qlen..qlen + take].copy_from_slice(&p[..take]);
+        qlen += take;
+    }
+    let question = &q[..qlen];
+
+    // WHAT THIS MACHINE KNOWS BY NAME, read before the question is: a question may name any service on
+    // it ("why did fs restart?") without the vocabulary listing it. The live tasks, and the services the
+    // supervisor keeps running - which includes one that is down now, the case most worth asking about.
+    let tt = TaskTable::read(&ctx);
+    let managed_msg = supervisor(&ctx, supcmd::MANAGED);
+    let mut managed = [""; 32];
+    let nmanaged = managed_msg.as_ref().and_then(|m| parse_managed(m.payload_bytes(), &mut managed));
+    let mut known = [""; TASKS_MAX + 32];
+    let mut nk = 0usize;
+    for i in 0..tt.n { known[nk] = tt.name(i); nk += 1; }
+    for n in managed[..nmanaged.unwrap_or(0)].iter() {
+        if !known[..nk].contains(n) && nk < known.len() { known[nk] = n; nk += 1; }
+    }
+    let known = &known[..nk];
+
+    let mut a = Answer::new();
+    let reading = know::understand(question, known);
+    match reading {
+        Reading::One(kind, event) => answer(&ctx, kind, event, known, &tt, &managed[..nmanaged.unwrap_or(0)],
+                                            nmanaged.is_some(), &mut a),
+        other => {
+            let first = first_word(question);
+            know::refuse(other, first, known, &mut a);
+        }
+    }
+    send_answer(&ctx, &a);
+    // DONE. The shell ends this program once it has the end-of-stream byte; until then, wait without
+    // using the core.
+    gs::ipc::park(&ctx);
+}
+
+fn first_word(q: &[u8]) -> &str {
+    let s = core::str::from_utf8(q).unwrap_or("");
+    s.split(|c: char| !c.is_ascii_alphanumeric()).find(|w| !w.is_empty()).unwrap_or("")
+}
+
+/// The live tasks, as the task table holds them.
+struct TaskTable {
+    names: [[u8; 32]; TASKS_MAX],
+    lens: [usize; TASKS_MAX],
+    restarts: [u64; TASKS_MAX],
+    up: [u64; TASKS_MAX],
+    n: usize,
+}
+
+impl TaskTable {
+    fn read(ctx: &ServiceContext) -> TaskTable {
+        let mut t = TaskTable { names: [[0; 32]; TASKS_MAX], lens: [0; TASKS_MAX], restarts: [0; TASKS_MAX],
+                                up: [0; TASKS_MAX], n: 0 };
+        for slot in 0..SLOTS {
+            let st = ctx.task_stat(slot);
+            // 4 = Dead: a slot the kernel could not free stays visible and is not a running service.
+            if !st.valid || st.state == 4 || t.n == TASKS_MAX { continue; }
+            // This program is not part of the system it describes.
+            if st.name_str() == "ask" { continue; }
+            let len = st.name_len.min(32);
+            t.names[t.n][..len].copy_from_slice(&st.name[..len]);
+            t.lens[t.n] = len;
+            t.restarts[t.n] = st.restart_count;
+            t.up[t.n] = st.uptime_secs;
+            t.n += 1;
+        }
+        t
+    }
+    fn name(&self, i: usize) -> &str {
+        core::str::from_utf8(&self.names[i][..self.lens[i]]).unwrap_or("?")
+    }
+    fn live(&self, name: &str) -> bool {
+        (0..self.n).any(|i| self.name(i) == name)
+    }
+}
+
+/// Ask the supervisor one read-only question. `None` if it did not answer in the right shape.
+fn supervisor(ctx: &ServiceContext, op: u8) -> Option<Message> {
+    let r = gs::call::request_within(ctx, "supervisor", &Message::from_bytes(&[supcmd::MARKER, op]), ASK_SECS).ok()?;
+    if r.payload_bytes().first() != Some(&supcmd::OK) { return None; }
+    Some(r)
+}
+
+/// `[OK, count, (len, name)*]` - the services the supervisor keeps running on this machine now.
+fn parse_managed<'b>(p: &'b [u8], out: &mut [&'b str; 32]) -> Option<usize> {
+    let count = *p.get(1)? as usize;
+    let mut at = 2usize;
+    let mut n = 0usize;
+    for _ in 0..count {
+        let len = *p.get(at)? as usize;
+        let name = core::str::from_utf8(p.get(at + 1..at + 1 + len)?).ok()?;
+        if n < out.len() { out[n] = name; n += 1; }
+        at += 1 + len;
+    }
+    Some(n)
+}
+
+/// `[OK, since u32, recorded u32, count, (secs u32, what, vid u16, pid u16, len, name)*]`.
+fn parse_events<'b>(p: &'b [u8], out: &mut [Ev<'b>; 32]) -> Option<(u32, u32, usize)> {
+    let since = u32::from_le_bytes(p.get(1..5)?.try_into().ok()?);
+    let recorded = u32::from_le_bytes(p.get(5..9)?.try_into().ok()?);
+    let count = *p.get(9)? as usize;
+    let mut at = 10usize;
+    let mut n = 0usize;
+    for _ in 0..count {
+        let secs = u32::from_le_bytes(p.get(at..at + 4)?.try_into().ok()?);
+        let what = *p.get(at + 4)?;
+        let len = *p.get(at + 9)? as usize;
+        let name = core::str::from_utf8(p.get(at + 10..at + 10 + len)?).ok()?;
+        if n < out.len() { out[n] = Ev { at: secs, code: what, name }; n += 1; }
+        at += 10 + len;
+    }
+    Some((since, recorded, n))
+}
+
+/// A radio driver's status, asked TAGGED so a late answer to an earlier question cannot be read as this
+/// one (`wire::TAGGED`).
+fn radio_status(ctx: &ServiceContext, driver: &str, keep: &mut [u8; 64], ssid_len: &mut usize) -> Got<Radio<'static>> {
+    const TAG: u8 = 0xA5;
+    let r = match gs::call::request_within(ctx, driver, &Message::from_bytes(&[wire::TAGGED, TAG, wire::OP_STATUS]), ASK_SECS) {
+        Ok(r) => r,
+        Err(_) => return Got::Silent,
+    };
+    let p = r.payload_bytes();
+    if p.len() < 3 || p[0] != wire::TAGGED || p[1] != TAG { return Got::Silent; }
+    let b = &p[2..];
+    match b.first().copied() {
+        Some(wire::OK) if b.len() >= 62 => {
+            if b[61] == 0 { return Got::Yes(Radio::PoweredOff); }
+            let associated = b[10] != 0;
+            let joined_secs = u32::from_le_bytes([b[24], b[25], b[26], b[27]]);
+            let len = (b[28] as usize).min(32);
+            keep[..len].copy_from_slice(&b[29..29 + len]);
+            *ssid_len = len;
+            Got::Yes(Radio::Up { associated, ssid: "", joined_secs })
+        }
+        Some(wire::RADIO_DOWN) => Got::Yes(Radio::Down(b.get(1).copied().unwrap_or(0))),
+        Some(wire::RADIO_OFF) => Got::Yes(Radio::Off),
+        Some(wire::RADIO_POWERED_OFF) => Got::Yes(Radio::PoweredOff),
+        _ => Got::Silent,
+    }
+}
+
+fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], tt: &TaskTable,
+          managed: &[&str], managed_answered: bool, a: &mut Answer) {
+    let now = gs::task::uptime_secs(ctx).max(0) as u64;
+    let mut tasks = [Task { name: "", restarts: 0, up_secs: 0 }; TASKS_MAX];
+    for i in 0..tt.n {
+        tasks[i] = Task { name: tt.name(i), restarts: tt.restarts[i], up_secs: tt.up[i] };
+    }
+    let tasks = &tasks[..tt.n];
+
+    let need_expected = matches!(kind, Kind::Health | Kind::Failed | Kind::Service(_));
+    let need_events = matches!(kind, Kind::Failed | Kind::Wifi | Kind::Service(_));
+    let need_drive = matches!(kind, Kind::Health | Kind::Fs);
+    let need_radios = matches!(kind, Kind::Health | Kind::Wifi);
+
+    // The supervisor's two answers: what it keeps running (asked once, before the question was read)
+    // and its record of what happened to them.
+    let expected = if !need_expected { Got::Absent }
+        else if managed_answered { Got::Yes(managed) }
+        else if tt.live("supervisor") { Got::Silent } else { Got::Absent };
+    let events_msg = if need_events { supervisor(ctx, supcmd::EVENTS) } else { None };
+    let mut evs = [Ev { at: 0, code: 0, name: "" }; 32];
+    let events = if !need_events { Got::Absent } else {
+        match events_msg.as_ref().and_then(|m| parse_events(m.payload_bytes(), &mut evs)) {
+            Some((since, recorded, n)) => Got::Yes(Events { since, recorded, list: &evs[..n] }),
+            None => Got::Silent,
+        }
+    };
+
+    // `fs`'s drive report.
+    let mut label = [0u8; 64];
+    let mut label_len = 0usize;
+    let drive = if !need_drive { Got::Absent } else if !tt.live("fs") { Got::Absent } else {
+        let mut fsh = gs::fs::Fs::new(ctx).patience_secs(ASK_FS_SECS);
+        match fsh.drive() {
+            Ok(d) => {
+                let l = d.label();
+                label_len = l.len().min(label.len());
+                label[..label_len].copy_from_slice(&l[..label_len]);
+                Got::Yes(Drive { capacity: d.capacity_sectors, mounted: d.mounted, total_blocks: d.total_blocks,
+                                 used_blocks: d.used_blocks, label: "" })
+            }
+            Err(_) => Got::Silent,
+        }
+    };
+    let drive = match drive {
+        Got::Yes(mut d) => { d.label = core::str::from_utf8(&label[..label_len]).unwrap_or(""); Got::Yes(d) }
+        other => other,
+    };
+
+    // Each running radio driver's status.
+    let mut ssids = [[0u8; 64]; 2];
+    let mut ssid_lens = [0usize; 2];
+    let mut statuses = [Got::<Radio>::Absent, Got::<Radio>::Absent];
+    let mut present = [false; 2];
+    if need_radios {
+        let (s0, s1) = ssids.split_at_mut(1);
+        let bufs = [&mut s0[0], &mut s1[0]];
+        let mut i = 0usize;
+        for buf in bufs {
+            if tt.live(RADIOS[i]) {
+                present[i] = true;
+                statuses[i] = radio_status(ctx, RADIOS[i], buf, &mut ssid_lens[i]);
+            }
+            i += 1;
+        }
+    }
+    let mut radios = [RadioFact { driver: "", status: Got::Absent }; 2];
+    let mut nr = 0usize;
+    for i in 0..2 {
+        if !present[i] { continue; }
+        let status = match statuses[i] {
+            Got::Yes(Radio::Up { associated, joined_secs, .. }) =>
+                Got::Yes(Radio::Up { associated, joined_secs, ssid: core::str::from_utf8(&ssids[i][..ssid_lens[i]]).unwrap_or("") }),
+            other => other,
+        };
+        radios[nr] = RadioFact { driver: RADIOS[i], status };
+        nr += 1;
+    }
+
+    let facts = Facts { now, tasks, expected, events, drive, radios: &radios[..nr] };
+    know::assess(kind, event, known, &facts, a);
+}
+
+/// The answer as one record table, sent to the shell (`send_peers[0]`) and then the end-of-stream byte.
+fn send_answer(ctx: &ServiceContext, a: &Answer) {
+    let mut t = Table::new(&["label", "source", "rule", "text"]);
+    // Labels, sources and rules repeat; each is interned once so the text gets the arena.
+    let mut cache: [(&str, Value); 24] = [("", Value::Empty); 24];
+    let mut nc = 0usize;
+    let mut word = |t: &mut Table, s: &'static str| -> Value {
+        if let Some(&(_, v)) = cache[..nc].iter().find(|(k, _)| *k == s) { return v; }
+        let v = t.intern(s.as_bytes());
+        if nc < cache.len() { cache[nc] = (s, v); nc += 1; }
+        v
+    };
+    // Room kept for the status row and a PARTIAL note: an answer that runs out of space says so.
+    const RESERVE: usize = 96;
+    let mut used = 0usize;
+    let mut cut = 0usize;
+    for l in a.lines() {
+        // Every cell counts: the shell DECODES this table, and decoding interns each string again, so the
+        // words shared here are paid for once per row on the other side.
+        let cost = l.text().len() + l.label.word().len() + l.source.len() + l.rule.len();
+        if used + cost + RESERVE > godspeed::record::REC_ARENA || t.nrows() + 2 >= godspeed::record::REC_MAX_ROWS {
+            cut += 1;
+            continue;
+        }
+        used += cost;
+        let label = word(&mut t, l.label.word());
+        let source = word(&mut t, l.source);
+        let rule = word(&mut t, l.rule);
+        let text = t.intern(l.text());
+        t.add_row(&[label, source, rule, text]);
+    }
+    if cut > 0 {
+        let note = word(&mut t, "note");
+        let dash = word(&mut t, "-");
+        let text = t.intern(b"this answer is PARTIAL - lines did not fit in one record table");
+        t.add_row(&[note, dash, dash, text]);
+    }
+    let status = word(&mut t, "status");
+    let dash = word(&mut t, "-");
+    let st = word(&mut t, a.status.word());
+    t.add_row(&[status, dash, dash, st]);
+
+    let mut sink = BufSink { buf: [0u8; 12 * 1024], len: 0, overflow: false };
+    t.encode(&mut sink);
+    let dst = match gs::ipc::peer_at(ctx, 0) { Some(d) => d, None => return };
+    let mut off = 0usize;
+    while off < sink.len {
+        let mut n = (sink.len - off).min(4000);
+        // A chunk that is a lone 0x04 would read as the end of the stream; send one byte less before it.
+        if sink.len - off - n == 1 && sink.buf[sink.len - 1] == EOT { n -= 1; }
+        if n == 1 && sink.buf[off] == EOT && off + 1 < sink.len { n = 2; }
+        let _ = gs::ipc::send_to(ctx, dst, &Message::from_bytes(&sink.buf[off..off + n]));
+        off += n;
+    }
+    let _ = gs::ipc::send_to(ctx, dst, &Message::from_bytes(&[EOT]));
+}
+
+struct BufSink { buf: [u8; 12 * 1024], len: usize, overflow: bool }
+impl RecordSink for BufSink {
+    fn put(&mut self, b: &[u8]) {
+        let end = (self.len + b.len()).min(self.buf.len());
+        let n = end - self.len;
+        self.buf[self.len..end].copy_from_slice(&b[..n]);
+        if n < b.len() { self.overflow = true; }
+        self.len = end;
+    }
+}

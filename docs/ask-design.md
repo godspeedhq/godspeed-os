@@ -1,8 +1,10 @@
 # ask - Assisted System Knowledge (design, not built)
 
-> **Status: DESIGN, proposed by the operator on 2026-10-10 and adapted here to this system. Nothing is
-> built.** The shell does not answer `ask`, so its surface lives here and moves to `utilities/` the day
-> it does (`utilities/0_conventions.md` section 2a: a spec there asserts the shell answers the verb).
+> **Status: v0.1 BUILT on `feat/ask`, 2026-10-11, QEMU-verified only.** Proposed by the operator on
+> 2026-10-10. The command surface moved to `utilities/60_ask.md` when the shell began answering it; this
+> stays the design. Three things changed while building it, each recorded where it applies: the general
+> question "why did <service> <event>" beside the four (section 4), the question always in quotes
+> (section 2), and the supervisor gained the read-only question it needed (`supcmd::MANAGED`, section 6).
 
 **Know what your system knows.**
 
@@ -50,6 +52,11 @@ ask evidence "<question>"   the same assessment, with every observation behind i
 ask help                    what it can be asked, with one real example per question kind
 ask version
 ```
+
+**The question is always in quotes** (operator, 2026-10-11). Outside the quotes is a mode word, inside is
+the question, so a question that begins with a mode's word cannot be misread as one, a later mode needs no
+new rule, and the characters the shell gives a meaning - `|`, `'` - are plain text inside. An unquoted
+question is refused with the line to type.
 
 A bare `ask` prints its usage (rule 1). `ask evidence` runs the SAME evaluation as `ask` and changes
 only how much of it is shown: within one invocation the summary and the evidence come from one
@@ -117,6 +124,15 @@ says so (section 6). A scrub is offered rather than run, because it reads the wh
 
 ## 4. Understanding the question
 
+**Beside the four, one general question: "why did (did, has) <service> <event>".** Asked for by the
+operator on 2026-10-11 ("why did fs service restart", "why did fs service fail"). It is composed, not
+listed: the SUBJECT is any name the machine knows - the task table's and the supervisor's - so a new
+service needs no new word; the EVENT is a small closed set kept apart (restart, fail, crash, stop). What a
+later release adds is an event word or a source, never a sentence. A named service with an event decides
+the reading over a subsystem word ("why did fs restart" asks about the `fs` service, not the filesystem);
+two services named is ambiguous; the WiFi words stay an alias, because "the wifi" names no service. It
+answers when and how often, and that WHY is not recorded - the first gap in section 6.
+
 Deterministic, versioned and small. No model.
 
 ```
@@ -162,6 +178,10 @@ What sources return is DATA. A log line or a device name that reads like an inst
 text, never acted on.
 
 ## 6. What v0.1 would need first - recorded here, not opened as backlog items
+
+**One was closed while building it:** which services must be running. The health answer turns on it and no
+request said; the supervisor knew (`MANAGED`, and which of them it wants now) and now answers
+`supcmd::MANAGED`, read only - closed in the owner, as below says every gap must be.
 
 `ask` may use only defined requests (no parsing a service's log lines as if they were a contract, no
 private structures, no new syscall). Measured against that, three answers are thinner than they should

@@ -39,6 +39,9 @@ FILES = [
     "sdk/wifi/src/mgmt.rs",
     # An 802.11 data frame and the ethernet frame it carries, both ways (moved from aic_wire.rs, R5c).
     "sdk/wifi/src/data.rs",
+    # `ask`'s vocabulary and every truthfulness rule: what a question is read as, and what each answer
+    # must and must not say for fixtures of source replies (docs/ask-design.md 8).
+    "services/ask/src/know.rs",
 ]
 
 

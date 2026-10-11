@@ -89,6 +89,9 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     } else if payload.len() == 2 && payload[1] == supcmd::EVENTS {
         body_len = events.answer(&mut body);
         supcmd::OK
+    } else if payload.len() == 2 && payload[1] == supcmd::MANAGED {
+        body_len = managed_answer(map, usb, &mut body);
+        supcmd::OK
     } else if payload.len() > 2 && payload[1] == supcmd::WHY {
         let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
         match DEVICE_WHY.iter().find(|(n, _)| *n == name) {
@@ -284,6 +287,7 @@ static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
 static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
 static RECORDER_ELF: &[u8] = include_bytes!(env!("SVC_RECORDER_ELF"));
 static COPIER_ELF: &[u8] = include_bytes!(env!("SVC_COPIER_ELF"));
+static ASK_ELF: &[u8] = include_bytes!(env!("SVC_ASK_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -492,6 +496,12 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // what it was copying, so it would be alive and copying nothing while `jobs` said running.
     ("copier", COPIER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      u32::MAX, board::COPIER_PEERS, 0, 0, 0),
+    // NOT in the boot set and not in `MANAGED`: the shell starts it for ONE question and ends it once
+    // the answer is in (`docs/ask-design.md`). It reads only - INTROSPECT for the task table, and send
+    // peers the shell names when it starts it (itself, this supervisor, `fs` and the radio drivers).
+    ("ask", ASK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX,
+     &["shell", "supervisor", "fs", "wifi-driver", "wifi-usb"],
+     godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
@@ -1416,6 +1426,27 @@ impl DevEvents {
         out[9] = count;
         n
     }
+}
+
+/// The `MANAGED` services this supervisor keeps running now: `[OK, count, (len, name)*]`
+/// (`supcmd::MANAGED`). Exactly the set the reconcile sweep restarts - a name it has an image and a cap
+/// for, and wants (a USB device's driver only while its device is attached) - so `ask` calls a service
+/// down by the same rule the supervisor would bring it back by.
+fn managed_answer(map: &NameCapMap, usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+    out[0] = supcmd::OK;
+    let mut n = 2usize;
+    let mut count = 0u8;
+    for name in MANAGED.iter() {
+        if map.get(name).is_none() || !usb.wanted(name) { continue; }
+        let b = name.as_bytes();
+        if n + 1 + b.len() > out.len() { break; }
+        out[n] = b.len() as u8;
+        out[n + 1..n + 1 + b.len()].copy_from_slice(b);
+        n += 1 + b.len();
+        count += 1;
+    }
+    out[1] = count;
+    n
 }
 
 /// Does `name` drive a device - a spawn row that names one, or a USB device's driver?

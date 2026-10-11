@@ -715,6 +715,10 @@ SpawnImage               = 52
 # arguments for the sharp ones live in CLAUDE.md 6.4 (SEC-2: a CONSOLE_PUSH holder is inside the
 # shell's trust perimeter, because keystrokes are commands).
 [kernel.service_grants]
+# ask (2026-10-11, docs/ask-design.md): a foreground program for one question, READ ONLY. INTROSPECT for
+# the task table; the shell for its answer; the supervisor's read-only questions (MANAGED, EVENTS); `fs`'s
+# drive report; each radio driver's status. No spawn, kill, console or write authority of any kind.
+"ask" = ["peer:fs", "peer:shell", "peer:supervisor", "peer:wifi-driver", "peer:wifi-usb", "priv:INTROSPECT"]
 "asker" = ["peer:reply-server"]
 # audio-driver: its HD Audio controller, WITH an interrupt (docs/audio.md, "Interrupt-driven refill"):
 # the stream interrupts as each period plays and the driver refills then. The kernel picks the vector.

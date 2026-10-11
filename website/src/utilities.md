@@ -81,6 +81,7 @@ fails.
 | [`mem`](utilities/mem.md) | memory |
 | [`cores`](utilities/cores.md) | the cores that came up |
 | [`hardware`](utilities/hardware.md) | this machine's devices, and what drives each |
+| [`ask`](utilities/ask.md) | plain questions about this machine, answered from what its services know |
 | [`spawncap`](utilities/spawncap.md) | diagnostic: spawn a service and prove the capability to it routes |
 | [`uptime`](utilities/uptime.md) | how long since boot |
 | [`date`](utilities/date.md) | the wall clock |
