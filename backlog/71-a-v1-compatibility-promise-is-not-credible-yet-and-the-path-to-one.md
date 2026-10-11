@@ -72,13 +72,38 @@ the 2026-10-11 survey:
 - **Taking the grants.** Nine drivers each handle "no window or arena granted" in their own words. The
   shared part is taking both and saying plainly what is missing; what to do then stays the driver's.
 
-Register access (`read32`/`write32`, about 850 sites) describes the device and stays as it is; the SDK's
-`Mmio` is already the right shape, and wrapping it would be the re-export this item already declined. No
-userspace cache maintenance exists to extract: arenas are uncached on the ARM boards and x86 DMA is
-coherent. Step 2 is done when no driver calls `ctx.mmio()` or `ctx.dma_region()` directly, which the
-one-way ratchet can then hold at zero.
+**The principle that decides what goes in `gs` (settled 2026-10-11).** The SDK answers *what can this
+kernel do, and how is it reached safely*: the syscall ABI and the audited `unsafe` (CLAUDE.md 18.1),
+mirroring the kernel and changing when it changes (this branch retired four syscalls and their wrappers,
+`backlog/80` K14). `gs` answers *how a Godspeed program is written*: the vocabulary a contributor learns,
+shaped so the easy path keeps the model, and the part that must hold still. Two layers so the kernel can
+move without moving contributors. So the test for `gs` is not "is it safe?" - the SDK's types already are -
+but **"must a contributor name it and rely on it?"**
 
-**The order agreed:** (1) close `fix/backlog-80`; (2) a branch for the two `gs::driver` mechanisms, proved
+Applied to registers, that reverses what this paragraph first said ("register access stays on the SDK's
+`Mmio`; wrapping it would be the re-export already declined"). A driver must hold its register window and
+its DMA arena, so **the window and arena TYPES come through `gs::driver`, frozen**: the taking-the-grants
+mechanism hands them back, with the calls drivers already make (`read32`, `write32`, `len`, and for DMA
+what the arena layout leaves), built on the SDK's `Mmio` and `Dma` underneath. The ~850 register sites keep
+their shape and change their import. This is not the wholesale re-export declined above: it is two types a
+contributor cannot avoid naming, reached through the mechanism that hands them out, while the SDK beneath
+stays free to change. It adds no safety - `Mmio` already bounds- and alignment-checks every access - and is
+not meant to: it is about what a contributor depends on. **Typed registers** (each register declared once
+with its width and access, named bit fields) would add readability and compile-time checks, but they are a
+large API frozen the day it lands; they wait until after v1, to be judged by the found-in-real-drivers test
+once the arena conversion has shown what one costs. No userspace cache maintenance exists to extract:
+arenas are uncached on the ARM boards and x86 DMA is coherent.
+
+**Step 2 is done when no service or driver crate depends on the SDK directly** - only `gs` and the domain
+libraries (`sdk/wifi`, `sdk/audio`) do, and the SDK is an internal layer. That is the finished form of the
+one-way ratchet, and a gate can check it from the `Cargo.toml` files. Measured on 2026-10-11: **all 25
+service crates** list `godspeed-sdk` (2 of the 15 examples do), and what they name from it is mostly an
+import path `gs` already re-exports (`service_context`, 108 uses) plus `hid` (20), `trace` (18), `churn`
+(5), `record`, `mmio` and `ipc` (2 each) and `adversarial` (2, `probe` only). Each is either moved behind
+`gs`, or - like `adversarial`, the test-only fault module 18.1 designates - named as an exception with its
+reason where the gate can see it.
+
+**The order agreed:** (1) close `fix/backlog-80`; (2) a branch for the two `gs::driver` mechanisms and the window and arena types they hand back, proved
 on two unlike drivers (AHCI on x86, GENET on the Pi 4) and then the rest one at a time; (3) a v1 groundwork
 branch for steps 1, 3 and 4 below - the covered surface confirmed, a checked-in snapshot of the public `gs`
 surface (including `gs::driver`) and the utility vocabulary with a checker that fails on removal or change,
