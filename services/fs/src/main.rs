@@ -1418,7 +1418,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         f.blk_cycles.set(0);
     }
     let c_start = gs::driver::wait::ticks(ctx);
-    serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
+    serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len, false);
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
     // A DESYNC IS NOT A DYING DISK, and must not reach the re-mount path below.
@@ -1440,7 +1440,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         match Fs::mount_into(ctx, vol) {
             Ok(()) => {
                 len = 0;
-                serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
+                serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len, false);
             }
             // The retry is best-effort: a re-mount that fails leaves the FIRST attempt's reply in the
             // buffer, so the caller still gets the honest error rather than silence. Said out loud,
@@ -1518,7 +1518,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
 /// with no suite typing `flash` at all. If an arm needs a fresher capacity, refresh it at the CALLER
 /// (see the serve loop), where the selftest is not involved.
 fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
-              tag: u8, reply: gs::cap::Cap, out: &mut [u8], out_len: &mut usize) {
+              tag: u8, reply: gs::cap::Cap, out: &mut [u8], out_len: &mut usize, quiet: bool) {
     let mut send = |bytes: &[u8]| {
         let n = bytes.len().min(out.len());
         // TRUNCATION MUST NOT BE SILENT. The clamp is a bounds guard, not a policy: every reply this
@@ -1593,8 +1593,10 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             // mounted 15 GB volume is a contradiction between two of our own statements, and neither side
             // said enough to tell which was wrong. This is the producing side (§26.4 - where the answer
             // came from must be answerable).
-            ctx.log_fmt(format_args!("fs: drives-info - capacity {} sectors, mounted {}",
-                                     capacity, vol.is_some()));
+            if !quiet {
+                ctx.log_fmt(format_args!("fs: drives-info - capacity {} sectors, mounted {}",
+                                         capacity, vol.is_some()));
+            }
             let mut out = [0u8; 28 + LABEL_MAX];
             out[0] = FS_OK;
             out[2..10].copy_from_slice(&capacity.to_le_bytes());
@@ -1614,12 +1616,16 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             return;
         }
         OP_FLASH => {
-            ctx.log_fmt(format_args!("fs: flash requested (capacity {} sectors, forced {})", capacity, forced));
+            if !quiet {
+                ctx.log_fmt(format_args!("fs: flash requested (capacity {} sectors, forced {})", capacity, forced));
+            }
             if capacity == 0 {
                 // Named, not silent: this was one of two OP_FLASH paths that replied FS_ERR without a
                 // word, so "drives: flash FAILED (no disk, or disk too small)" was the only thing an
                 // operator saw - on hardware that was actively misleading (§26.7).
-                ctx.log("fs: flash REFUSED - block-driver reports 0 capacity (no disk, or the driver is mid-revival). Retry once storage settles.");
+                if !quiet {
+                    ctx.log("fs: flash REFUSED - block-driver reports 0 capacity (no disk, or the driver is mid-revival). Retry once storage settles.");
+                }
                 send(&[FS_ERR]);
                 return;
             }
@@ -4381,14 +4387,19 @@ fn protocol_selftest(ctx: &ServiceContext) {
     let mut checked = 0u32;
     let mut empty = 0u32;
     let mut worst = 0u8;
+    // The flash requests among the probes (21, and 149 forced). Each is refused on the zero capacity
+    // this test injects, and that refusal is what stops it formatting the real disk - so it is counted
+    // and said ONCE below, not logged per probe (`backlog/56`).
+    let flashes = core::cell::Cell::new(0u32);
 
     let mut run = |vol: &mut Option<Fs>, p: &[u8], out: &mut [u8; 4096], checked: &mut u32,
                    empty: &mut u32, worst: &mut u8| {
         let mut len = 0usize;
+        if matches!(p.first(), Some(&o) if o & 0x7F == OP_FLASH) { flashes.set(flashes.get() + 1); }
         // A capability handle that names nothing. Safe because no arm can reach a mint or a send
         // without a mounted volume, and every one of those is behind the `None => no filesystem`
         // guard this runs under.
-        serve_once(ctx, vol, 0, false, p, 0, gs::cap::Cap::from(CapHandle(0)), &mut out[..], &mut len);
+        serve_once(ctx, vol, 0, false, p, 0, gs::cap::Cap::from(CapHandle(0)), &mut out[..], &mut len, true);
         *checked += 1;
         if len == 0 {
             *empty += 1;
@@ -4436,7 +4447,9 @@ fn protocol_selftest(ctx: &ServiceContext) {
 
     if empty == 0 {
         ctx.log_fmt(format_args!(
-            "fs: protocol selftest PASS - {} malformed requests, every one answered", checked));
+            "fs: protocol selftest PASS - {} malformed requests, every one answered ({} of them flash \
+             requests, each refused on the zero capacity the test injects - no disk was touched)",
+            checked, flashes.get()));
     } else {
         // LOUD, because the failure is invisible from the other end: the caller does not see a bad
         // reply it can name, it sees an empty one it cannot read.

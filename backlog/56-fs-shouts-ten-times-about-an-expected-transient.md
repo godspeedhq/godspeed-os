@@ -1,6 +1,7 @@
 # 56 - `fs` announces an EXPECTED transient ten times at every boot
 
-**Status:** OPEN - correct behaviour, wrong volume. Cosmetic, but it erodes a real warning channel.
+**Status:** CLOSED 2026-10-11 (`feat/ask`) - the ten lines were `fs`'s own boot protocol selftest, not a
+retry; they are counted in its PASS line now. The diagnosis below was wrong, and the last section says how.
 **Found:** 2026-09-26, on the Dell Wyse and the Raspberry Pi 2, during the `feat/stdlib-complete`
 hardware pass. Not new, and not caused by that branch.
 
@@ -60,3 +61,34 @@ mount are all long-standing.
 
 (3) is the honest fix and the largest. (1) is a latch and closes the erosion today. They are not
 exclusive - (1) now, (3) when the block path is next opened.
+
+## Closed (2026-10-11) - it was never a retry
+
+The explanation above - `fs` asking `block-driver` repeatedly while IDENTIFY finishes - was a plausible
+story and it was wrong. Logging the raw request in the flash arm on a Pi 4 boot showed every one of the
+ten carried tag 0 and one of the shapes `protocol_selftest` builds:
+
+```
+DEBUG56 flash tag 0 p [21]
+DEBUG56 flash tag 0 p [149]
+DEBUG56 flash tag 0 p [21, 255]
+DEBUG56 flash tag 0 p [21, 4, 47, 97, 98, 99]   (the "/abc" probes)
+```
+
+That selftest walks every opcode through `serve_once` with `capacity = 0`, and the zero is what stops it
+formatting the real disk (the comment on `serve_once` records the boot on which it did not). Each flash
+probe was refused on that zero and logged the refusal exactly as a real "no disk" would - ten flash and
+ten `drives-info` lines on every boot, on every board, indistinguishable from the case the line exists
+for. Nothing was formatting anything and no retry loop exists.
+
+So the options above do not apply. `serve_once` takes a `quiet` flag that only the selftest sets, the
+three lines it was producing are gated on it, and the selftest says what it did once:
+
+```
+fs: protocol selftest PASS - 599 malformed requests, every one answered (10 of them flash requests, each
+refused on the zero capacity the test injects - no disk was touched)
+```
+
+A real `drives flash` with no disk still logs the refusal, and a disk that never reports a capacity still
+logs `block-driver did not report capacity within 20s` - the line that means "no disk". Pi 4 QEMU: 20
+lines to 1. `osdev test files` 249/0 with zero `flash REFUSED` lines in its log.
