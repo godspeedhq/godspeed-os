@@ -36,6 +36,11 @@ AArch64 reclaim frees a dead driver's device pages, and only the allocator's ran
 the two `kill: ABANDONED slot` lines are the first real firings of the path `backlog/48` records as
 unexercised, written up there.
 
+**VisionFive 2 Lite, 2026-10-11, image `105c06af`:** `chaos max-carnage all-services 1000`: 6972 kills, 5985
+flooded, 1000 mem-pressure, 1000 spawns (999 refused because the first `mem-pressure` task was still
+parked, which is the designed outcome), kernel alive, no kernel fault, no liveness report and no abandoned
+kill; then `selfcheck` ran 536, failed 0, skipped 0.
+
 Two audits ran on `feat/dogfood-gs` on 2026-10-09 (`audits/documentation-audit.md`, Audits 14 and 15).
 Reading every comment against the code beside it finds code that does not do what its comment says, and
 some of the time the comment is right. Those are below, with the evidence each reader gave and a proposed
