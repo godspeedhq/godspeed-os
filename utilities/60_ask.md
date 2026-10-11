@@ -34,6 +34,7 @@ invocation the summary and the evidence are one assessment.
 | `why did <service> <event>?` | that service in the task table and the supervisor's record. `<service>` is any name the machine knows - the task table's and the supervisor's - so a new service needs no new word; `<event>` is one of restart, fail, crash, stop, kept apart |
 | `why did the wifi restart?` | the radio driver that is running, its restarts, and the radio's own status. "The WiFi" is an alias, not a service |
 | `is the filesystem healthy?` | `fs`'s drive report; a scrub is offered, not run |
+| `is the network up?` (`why can't I reach the internet?`, `am I online?`) | `net-stack`'s status - the address, whether DHCP leased it, whether the gateway answers ARP - and the radio where the link is wireless. An address and a gateway mean this machine is on a network, NOT that anything beyond the gateway answers: nothing is sent to find out, and the commands that would test it are offered. Started as the `ask-net` row (below) |
 | `what to say?` (or `what can I ask?`, `help`) | the forms above, each with an example, then suggestions from this machine as it is: a service that has restarted (most first), one that should be running and is not, the WiFi where a radio driver runs, the filesystem where `fs` does. Nothing is suggested that this machine could not answer |
 
 A question it does not understand is said to be, with the list above; a question that fits two kinds, or
@@ -81,7 +82,16 @@ gsh> ask "what failed?" | where label=fact
 gsh> ask "is my system healthy?" | where label=verdict
 ```
 
-## 5. Bounds
+## 5. Two rows, one program
+
+The kernel gives a task at most six send peers, and one row for every question would need eight. So the
+supervisor carries two rows for the one program, as it does for `observe`: `ask` (the supervisor, `fs`,
+`block-driver`, the board's USB host and radio) and `ask-net` (the supervisor, `net-stack`, the radio).
+The shell picks the row by reading the question with `ask`'s own `know.rs`, compiled into the shell from
+the same file, so the two cannot disagree about which question it is. Each row's grants are pinned
+(Commandment VII).
+
+## 6. Bounds
 
 A question is read to 512 bytes; an answer holds at most 48 lines and one record table's text, and one
 that runs out of either says it is PARTIAL. Every request `ask` makes waits at most 3 s, and the shell

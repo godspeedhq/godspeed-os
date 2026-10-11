@@ -423,6 +423,20 @@ mod board {
         &["shell", "supervisor", "fs", "block-driver", "wifi-usb"]
     };
 
+    /// `ask-net`'s send peers: the same program as `ask`, started for a NETWORK question, so it gets the
+    /// peers that question needs - the shell, the supervisor, `net-stack`, and the board's radio driver -
+    /// instead of the storage chain's. Two rows because the kernel gives a task at most six send peers
+    /// (`MAX_SEND_PEERS`) and one row for every question would need eight; `observe`, `observe-now` and
+    /// `observe-live` are the same shape. The shell chooses the row by reading the question with `ask`'s
+    /// own `know.rs`, so the two cannot disagree about which question it is.
+    pub const ASK_NET_PEERS: &[&str] = if cfg!(has_dwc2) {
+        &["shell", "supervisor", "net-stack", "wifi-usb"]
+    } else if cfg!(has_wifi_driver) {
+        &["shell", "supervisor", "net-stack", "wifi-driver"]
+    } else {
+        &["shell", "supervisor", "net-stack", "wifi-usb"]
+    };
+
     /// `copier`'s send peers: `fs` for the files it copies, and the board's audio driver for the "done"
     /// sound a finished job makes (`docs/audio.md`, "System sounds") - `audio-driver` on the PCs,
     /// `pwm-audio` on the Pis, none on the VisionFive, which has no audio output. Flat, for the reason
@@ -515,6 +529,8 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // NOT in the boot set and not in `MANAGED`: the shell starts it for ONE question and ends it once
     // the answer is in (`docs/ask-design.md`). It reads only - INTROSPECT for the task table, and the
     // board's `ASK_PEERS`. The shell passes no peers of its own, so every grant is this row's, pinned.
+    ("ask-net", ASK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX,
+     board::ASK_NET_PEERS, godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
     ("ask", ASK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX,
      board::ASK_PEERS,
      godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),

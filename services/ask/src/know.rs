@@ -35,6 +35,9 @@ pub enum Kind {
     Wifi,
     /// Is the filesystem healthy?
     Fs,
+    /// Is the network up? Why can't I reach the internet? Answered from `net-stack`'s status - the
+    /// address, the lease, the gateway - and the radio where the link is wireless.
+    Network,
     /// Why did (did, has) this service <event>? The SUBJECT is not vocabulary: it is an index into the
     /// names the machine itself knows (`understand`'s `known`), so a new service needs no new word.
     Service(usize),
@@ -65,6 +68,7 @@ impl Kind {
             Kind::Failed => "what failed",
             Kind::Wifi => "the WiFi",
             Kind::Fs => "the filesystem",
+            Kind::Network => "the network",
             Kind::Service(i) => known.get(i).copied().unwrap_or("a service"),
             Kind::Guide => "what can be asked",
             Kind::Egg(_) => "an Easter egg",
@@ -163,7 +167,11 @@ const QUESTION_WORDS: &[&str] = &["why", "what", "is", "are", "did", "does", "ha
 /// A first word that asks for an action. `ask` reads; it never does.
 const ACTION_WORDS: &[&str] = &["restart", "reboot", "kill", "stop", "start", "fix", "repair", "format",
                                 "delete", "reset", "join", "connect", "disconnect", "flash", "scrub", "run"];
-const WIFI_WORDS: &[&str] = &["wifi", "wireless", "wlan", "radio", "network"];
+const WIFI_WORDS: &[&str] = &["wifi", "wireless", "wlan", "radio"];
+/// The network as a whole - addresses, the lease, the way out. "network" was a WiFi word, which made
+/// "is the network up?" a question about the radio; a cable is a network too.
+const NET_WORDS: &[&str] = &["network", "internet", "online", "offline", "connection", "connected", "ip", "dhcp",
+                             "lease", "dns", "gateway", "ethernet", "net"];
 const FS_WORDS: &[&str] = &["filesystem", "fs", "disk", "drive", "storage", "volume", "gsfs"];
 const FS_PAIR: (&str, &str) = ("file", "system");
 const HEALTH_WORDS: &[&str] = &["healthy", "health", "ok", "okay", "fine", "working", "well", "alright",
@@ -275,13 +283,14 @@ pub fn understand(q: &[u8], known: &[&str]) -> Reading {
         return Reading::Action;
     }
 
-    let (mut wifi, mut fs, mut health, mut failed, mut system) = (false, false, false, false, false);
+    let (mut wifi, mut fs, mut health, mut failed, mut system, mut net) = (false, false, false, false, false, false);
     let mut event = Event::Unnamed;
     let mut questioned = false;
     for i in 0..n {
         let x = w(i);
         if any(x, QUESTION_WORDS) { questioned = true; }
         if any(x, WIFI_WORDS) { wifi = true; }
+        if any(x, NET_WORDS) { net = true; }
         if any(x, FS_WORDS) { fs = true; }
         if x == FS_PAIR.0.as_bytes() && i + 1 < n && w(i + 1) == FS_PAIR.1.as_bytes() { fs = true; }
         if any(x, HEALTH_WORDS) { health = true; }
@@ -316,6 +325,11 @@ pub fn understand(q: &[u8], known: &[&str]) -> Reading {
     // A SUBSYSTEM WORD DECIDES THE KIND: "is the filesystem healthy" asks about the filesystem, and
     // "why did the wifi fail" about the WiFi - neither is the system-wide question. Two subsystems
     // named at once is the ambiguity this must not settle by itself.
+    // The network, unless the radio is named: "why did the wifi drop?" is about the radio, and "can I
+    // reach the internet over wifi?" about the network - the event decides.
+    if net && !fs && (!wifi || event == Event::Unnamed) {
+        return Reading::One(Kind::Network, Event::Unnamed);
+    }
     match (wifi, fs) {
         (true, true) => return Reading::Two(Kind::Wifi, Kind::Fs),
         (true, false) => return Reading::One(Kind::Wifi, event),
@@ -597,6 +611,23 @@ pub struct Facts<'a> {
     pub radios: &'a [RadioFact<'a>],
     /// The storage chain, when it was asked.
     pub chain: Option<Chain<'a>>,
+    /// `net-stack`'s status, when the network was the question.
+    pub net: Got<NetStatus>,
+}
+
+/// What `net-stack` says it believes about the network (`gs::net::Status`), reduced to what the answer
+/// uses.
+#[derive(Clone, Copy)]
+pub struct NetStatus {
+    pub ip: [u8; 4],
+    pub gateway: [u8; 4],
+    pub dns: [u8; 4],
+    /// DHCP granted the address, as opposed to it being unconfigured.
+    pub leased: bool,
+    /// ARP has resolved the gateway, so traffic can leave this machine.
+    pub gateway_resolved: bool,
+    /// A ping has succeeded at least once since `net-stack` started - history, not now.
+    pub ping_ok: bool,
 }
 
 impl<'a> Facts<'a> {
@@ -708,6 +739,7 @@ pub fn assess(kind: Kind, event: Event, known: &[&str], f: &Facts, a: &mut Answe
             Kind::Failed => { let _ = v.write_str(failed(f, a)); }
             Kind::Wifi => { let _ = v.write_str(wifi(event, f, a)); }
             Kind::Fs => { let _ = v.write_str(fs(f, a)); }
+            Kind::Network => { let _ = v.write_str(network(f, a)); }
             Kind::Service(i) => service(known.get(i).copied().unwrap_or("?"), event, f, a, &mut v),
             Kind::Guide => { let _ = v.write_str(guide(f, a)); }
             Kind::Egg(e) => { let _ = v.write_str(egg(e, f, a)); }
@@ -1017,6 +1049,57 @@ fn fs(f: &Facts, a: &mut Answer) -> &'static str {
             "MOUNTED - NOT VERIFIED"
         }
     }
+}
+
+struct Ip([u8; 4]);
+impl core::fmt::Display for Ip {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(f, "{}.{}.{}.{}", self.0[0], self.0[1], self.0[2], self.0[3])
+    }
+}
+
+/// Is the network up? What `net-stack` believes, and - kept apart - what that does NOT establish: an
+/// address and a resolved gateway mean traffic can leave this machine, not that anything beyond the
+/// gateway answers. Nothing is sent to find out; the commands that would test it are offered.
+fn network(f: &Facts, a: &mut Answer) -> &'static str {
+    let s = match f.net {
+        Got::Yes(s) => s,
+        Got::Silent => { hole(a, "`net-stack`"); return "UNKNOWN - net-stack did not answer"; }
+        Got::Absent => { a.fact("task table", format_args!("`net-stack` is not running")); return "NO NETWORK SERVICE"; }
+    };
+    if let Some(t) = f.task("net-stack") {
+        if t.restarts > 0 {
+            a.fact("task table", format_args!("`net-stack` has restarted {} time(s) since boot; each restart asks for a lease again", t.restarts));
+        }
+    }
+    for r in f.radios {
+        match r.status {
+            Got::Yes(Radio::Up { associated: true, ssid, .. }) => a.fact(r.driver_src(), format_args!("`{}` is joined to `{}`", r.driver, ssid)),
+            Got::Yes(Radio::Up { associated: false, .. }) => a.fact(r.driver_src(), format_args!("`{}` is up and not joined to any network", r.driver)),
+            Got::Yes(Radio::Down(why)) => a.fact(r.driver_src(), format_args!("`{}` says the radio is down: {}", r.driver, down_words(why))),
+            Got::Yes(Radio::Off) | Got::Yes(Radio::PoweredOff) => a.fact(r.driver_src(), format_args!("`{}` says the radio is switched off", r.driver)),
+            Got::Silent => hole(a, r.driver),
+            Got::Absent => {}
+        }
+    }
+    if s.ip == [0, 0, 0, 0] || !s.leased {
+        a.fact("net-stack", format_args!("`net-stack` holds no leased address{}", if s.ip == [0, 0, 0, 0] { "" } else { " (it has one it was not leased)" }));
+        a.unknown(format_args!("why no lease was granted is not reported - no link, no DHCP server answering, or the answer lost; `net` shows what it has"));
+        return "NO ADDRESS";
+    }
+    a.fact("net-stack", format_args!("address {} (leased), gateway {}, DNS {}", Ip(s.ip), Ip(s.gateway), Ip(s.dns)));
+    if !s.gateway_resolved {
+        a.fact("net-stack", format_args!("the gateway {} has not answered ARP, so nothing can leave this machine yet", Ip(s.gateway)));
+        return "ADDRESS, BUT NO WAY OUT";
+    }
+    a.fact("net-stack", format_args!("the gateway answers ARP, so traffic can leave this machine"));
+    if s.ping_ok {
+        a.fact("net-stack", format_args!("a ping has succeeded since `net-stack` started - which says the path worked then, not now"));
+    }
+    a.infer("configured", format_args!("a leased address and a gateway that answers mean this machine is on a network"));
+    a.unknown(format_args!("whether anything beyond the gateway answers was not tested - nothing is sent to find out"));
+    a.note(format_args!("to test it now: `ping {}`, or `net dns <name>`", Ip(s.gateway)));
+    "ON A NETWORK"
 }
 
 /// "What to say?" - the forms `ask` understands, each with an example, then suggestions from THIS machine:
@@ -1337,7 +1420,7 @@ mod tests {
     #[test]
     fn healthy_only_when_every_required_check_ran() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"HEALTHY");
         assert_eq!(a.status, Status::Answered);
@@ -1347,7 +1430,7 @@ mod tests {
     #[test]
     fn a_silent_source_is_a_hole_not_a_pass() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Silent, events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Silent, events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"UNKNOWN");
         assert_eq!(a.status, Status::SourceSilent);
@@ -1358,7 +1441,7 @@ mod tests {
     #[test]
     fn a_required_service_down_is_unhealthy() {
         let t = [Task { name: "supervisor", restarts: 0, up_secs: 100 }, Task { name: "shell", restarts: 0, up_secs: 9 }];
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"UNHEALTHY");
         assert!(a.has(Label::Fact, "`fs` is a service the supervisor runs, and it is not running now"));
@@ -1369,7 +1452,7 @@ mod tests {
     fn a_restart_is_degraded_and_never_called_a_crash() {
         let mut t = tasks_ok();
         t[2].restarts = 2;
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"DEGRADED");
         assert!(a.has(Label::Fact, "`fs` has restarted 2 time(s)"));
@@ -1381,7 +1464,7 @@ mod tests {
     fn no_disk_is_said_and_is_not_a_fault() {
         let t = tasks_ok();
         let f = Facts { now: 1, tick: 1, tasks: &t, expected: Got::Yes(ALL), events: ev_none(),
-                        drive: Got::Yes(Drive { capacity: 0, mounted: false, total_blocks: 0, used_blocks: 0, label: "" }), radios: &[], chain: None };
+                        drive: Got::Yes(Drive { capacity: 0, mounted: false, total_blocks: 0, used_blocks: 0, label: "" }), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"HEALTHY");
         assert!(a.has(Label::Fact, "no storage device is attached"));
@@ -1395,7 +1478,7 @@ mod tests {
                   Ev { at: 60, code: EV_ATTACHED, name: "wifi-usb" }];
         let t = tasks_ok();
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(&["supervisor", "fs", "nic-driver"]),
-                        events: Got::Yes(Events { since: 5, recorded: 40, list: &ev }), drive: mounted(), radios: &[], chain: None };
+                        events: Got::Yes(Events { since: 5, recorded: 40, list: &ev }), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Failed, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"SOMETHING IS DOWN NOW");
         assert!(a.has(Label::Fact, "at uptime 40s `xhci` died and was restarted"));
@@ -1411,7 +1494,7 @@ mod tests {
     #[test]
     fn nothing_recorded_is_not_nothing_wrong() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Failed, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"NOTHING RECORDED");
         assert!(a.has(Label::Inference, "not proof nothing went wrong"));
@@ -1420,7 +1503,7 @@ mod tests {
     #[test]
     fn wifi_with_no_radio_says_so() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Wifi, Event::Restart, &f);
         assert_eq!(verdict(&a), b"NO RADIO");
         assert!(a.has(Label::Fact, "no radio driver"));
@@ -1432,7 +1515,7 @@ mod tests {
         let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_TRAPPED)) }];
         let ev = [Ev { at: 70, code: EV_RESTARTED, name: "wifi-driver" }];
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(&["wifi-driver"]),
-                        events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: Got::Absent, radios: &radios, chain: None };
+                        events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: Got::Absent, radios: &radios, chain: None, net: Got::Absent };
         let a = ask(Kind::Wifi, Event::Restart, &f);
         assert_eq!(verdict(&a), b"THE RADIO DRIVER RESTARTED");
         assert!(a.has(Label::Fact, "trapped at start"));
@@ -1447,7 +1530,7 @@ mod tests {
     fn a_link_drop_with_no_restart_is_not_a_restart() {
         let t = [Task { name: "wifi-usb", restarts: 0, up_secs: 900 }];
         let radios = [RadioFact { driver: "wifi-usb", status: Got::Yes(Radio::Up { associated: false, ssid: "", joined_secs: 0 }) }];
-        let f = Facts { now: 900, tick: 900, tasks: &t, expected: Got::Yes(&["wifi-usb"]), events: ev_none(), drive: Got::Absent, radios: &radios, chain: None };
+        let f = Facts { now: 900, tick: 900, tasks: &t, expected: Got::Yes(&["wifi-usb"]), events: ev_none(), drive: Got::Absent, radios: &radios, chain: None, net: Got::Absent };
         let a = ask(Kind::Wifi, Event::Disconnect, &f);
         assert_eq!(verdict(&a), b"NO RESTART RECORDED");
         assert!(a.has(Label::Fact, "has not restarted since boot"));
@@ -1458,7 +1541,7 @@ mod tests {
     #[test]
     fn a_mounted_filesystem_is_not_called_healthy() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Fs, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"MOUNTED - NOT VERIFIED");
         assert!(a.has(Label::Unknown, "journal was replayed"));
@@ -1489,7 +1572,7 @@ mod tests {
     fn an_answer_that_overflows_says_it_is_partial() {
         let mut t = [Task { name: "x", restarts: 1, up_secs: 1 }; 80];
         for (i, x) in t.iter_mut().enumerate() { x.restarts = i as u64 + 1; }
-        let f = Facts { now: 1, tick: 1, tasks: &t, expected: Got::Yes(&[]), events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 1, tick: 1, tasks: &t, expected: Got::Yes(&[]), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert!(a.lines().len() <= LINES_MAX);
         assert!(a.has(Label::Note, "PARTIAL"));
@@ -1522,7 +1605,7 @@ mod tests {
         t[2].restarts = 3;
         let ev = [Ev { at: 70, code: EV_RESTARTED, name: "fs" }];
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL),
-                        events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: mounted(), radios: &[], chain: None };
+                        events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Service(2), Event::Fail, &f);
         assert_eq!(verdict(&a), b"`fs` HAS RESTARTED 3 TIME(S) - WHY IS NOT RECORDED");
         assert!(a.has(Label::Fact, "`fs` has restarted 3 time(s) since boot"));
@@ -1535,12 +1618,12 @@ mod tests {
     #[test]
     fn a_named_service_that_is_down_or_never_restarted() {
         let t = [Task { name: "supervisor", restarts: 0, up_secs: 100 }];
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Service(2), Event::Restart, &f);
         assert_eq!(verdict(&a), b"`fs` IS DOWN NOW");
         assert!(a.has(Label::Fact, "should be up"));
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Service(0), Event::Restart, &f);
         assert_eq!(verdict(&a), b"`supervisor` HAS NOT RESTARTED SINCE BOOT");
         assert!(!a.has(Label::Unknown, "why"));
@@ -1549,7 +1632,7 @@ mod tests {
     #[test]
     fn a_slow_fs_is_a_hole_not_unhealthy() {
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Silent, radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Silent, radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"UNKNOWN");
         assert_eq!(a.status, Status::SourceSilent);
@@ -1560,7 +1643,7 @@ mod tests {
     fn no_radio_answering_is_not_called_a_fault() {
         let t = tasks_ok();
         let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_NO_RADIO)) }];
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &radios, chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &radios, chain: None, net: Got::Absent };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"HEALTHY");
         assert!(a.has(Label::Unknown, "whether this machine has a radio fitted"));
@@ -1585,7 +1668,7 @@ mod tests {
         t[2].restarts = 4; // fs
         t[3].restarts = 1; // shell
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(&["supervisor", "events", "fs", "shell", "block-driver"]),
-                        events: ev_none(), drive: mounted(), radios: &[], chain: None };
+                        events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Guide, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"YOU CAN ASK");
         assert!(a.has(Label::Note, "try: ask \"why did fs restart?\"  - it has restarted 4 time(s)"));
@@ -1612,7 +1695,7 @@ mod tests {
         assert_eq!(rk("restart fs"), Reading::Action);
         // A joke's verdict says it is one, and two seconds give two jokes.
         let t = tasks_ok();
-        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None };
+        let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[], chain: None, net: Got::Absent };
         let a = ask(Kind::Egg(Egg::Joke), Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"A JOKE");
         assert!(a.has(Label::Note, "not an observation"));
@@ -1629,7 +1712,7 @@ mod tests {
         let none = Got::Yes(Drive { capacity: 0, mounted: false, total_blocks: 0, used_blocks: 0, label: "" });
         // QEMU on the Pi 4: block-driver answers 0, and xhci - the host it is behind - is silent.
         let f = Facts { now: 9, tick: 9, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: none, radios: &[],
-                        chain: Some(Chain { block: Got::Yes(0), host: Some(("xhci", Got::Silent)), host_read: true }) };
+                        chain: Some(Chain { block: Got::Yes(0), host: Some(("xhci", Got::Silent)), host_read: true }), net: Got::Absent };
         let a = ask(Kind::Fs, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"STORAGE STOPS AT xhci");
         assert!(a.has(Label::Fact, "`block-driver` reaches its disk through `xhci`"));
@@ -1705,5 +1788,40 @@ mod tests {
         assert_eq!(rk("what is godspeed?"), Reading::One(Kind::Egg(Egg::Who), Event::Unnamed));
         assert_eq!(rk("what is the meaning of life?"), Reading::One(Kind::Egg(Egg::Meaning), Event::Unnamed));
         assert_eq!(rk("what failed?"), Reading::One(Kind::Failed, Event::Unnamed));
+    }
+
+    fn net_ok() -> NetStatus {
+        NetStatus { ip: [192, 168, 4, 98], gateway: [192, 168, 4, 1], dns: [192, 168, 4, 1], leased: true, gateway_resolved: true, ping_ok: false }
+    }
+
+    #[test]
+    fn the_network_question() {
+        assert_eq!(rk("is the network up?"), Reading::One(Kind::Network, Event::Unnamed));
+        assert_eq!(rk("why can't I reach the internet?"), Reading::One(Kind::Network, Event::Unnamed));
+        assert_eq!(rk("am I online?"), Reading::One(Kind::Network, Event::Unnamed));
+        // The radio stays the radio when an event is named.
+        assert_eq!(rk("why did the wifi drop?"), Reading::One(Kind::Wifi, Event::Disconnect));
+    }
+
+    #[test]
+    fn on_a_network_is_not_the_internet_works() {
+        let t = tasks_ok();
+        let f = Facts { now: 9, tick: 9, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: Got::Absent, radios: &[],
+                        chain: None, net: Got::Yes(net_ok()) };
+        let a = ask(Kind::Network, Event::Unnamed, &f);
+        assert_eq!(verdict(&a), b"ON A NETWORK");
+        assert!(a.has(Label::Fact, "address 192.168.4.98 (leased), gateway 192.168.4.1"));
+        assert!(a.has(Label::Unknown, "beyond the gateway answers was not tested"));
+        assert!(a.has(Label::Note, "ping 192.168.4.1"));
+        let mut n = net_ok(); n.gateway_resolved = false;
+        let f2 = Facts { net: Got::Yes(n), ..f };
+        assert_eq!(verdict(&ask(Kind::Network, Event::Unnamed, &f2)), b"ADDRESS, BUT NO WAY OUT");
+        let mut n = net_ok(); n.leased = false; n.ip = [0; 4];
+        let f3 = Facts { net: Got::Yes(n), ..f2 };
+        let c = ask(Kind::Network, Event::Unnamed, &f3);
+        assert_eq!(verdict(&c), b"NO ADDRESS");
+        assert!(c.has(Label::Unknown, "why no lease was granted is not reported"));
+        let f4 = Facts { net: Got::Silent, ..f3 };
+        assert_eq!(ask(Kind::Network, Event::Unnamed, &f4).status, Status::SourceSilent);
     }
 }

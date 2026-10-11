@@ -28,7 +28,7 @@ include!(concat!(env!("OUT_DIR"), "/glossary.rs"));
 use godspeed::{self as gs, ipc::Message, record::{RecordSink, Table, Value}, ServiceContext};
 use godspeed_sdk::service_context::supcmd;
 use godspeed_wifi::wire;
-use know::{Answer, Chain, Drive, Ev, Events, Facts, Got, Kind, Radio, RadioFact, Reading, Task};
+use know::{Answer, Chain, Drive, Ev, Events, Facts, Got, Kind, NetStatus, Radio, RadioFact, Reading, Task};
 
 // The event codes `know` restates must be the supervisor's. A drifted copy would misname every event.
 const _: () = assert!(know::EV_RESTARTED == supcmd::EV_RESTARTED && know::EV_RESTART_FAILED == supcmd::EV_RESTART_FAILED
@@ -131,8 +131,8 @@ impl TaskTable {
             let st = ctx.task_stat(slot);
             // 4 = Dead: a slot the kernel could not free stays visible and is not a running service.
             if !st.valid || st.state == 4 || t.n == TASKS_MAX { continue; }
-            // This program is not part of the system it describes.
-            if st.name_str() == "ask" { continue; }
+            // This program is not part of the system it describes, under either of its row names.
+            if st.name_str() == "ask" || st.name_str() == "ask-net" { continue; }
             let len = st.name_len.min(32);
             t.slots[t.n] = slot;
             t.names[t.n][..len].copy_from_slice(&st.name[..len]);
@@ -279,7 +279,7 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
     let need_expected = matches!(kind, Kind::Health | Kind::Failed | Kind::Service(_) | Kind::Guide);
     let need_events = matches!(kind, Kind::Failed | Kind::Wifi | Kind::Service(_));
     let need_drive = matches!(kind, Kind::Health | Kind::Fs);
-    let need_radios = matches!(kind, Kind::Health | Kind::Wifi | Kind::Guide);
+    let need_radios = matches!(kind, Kind::Health | Kind::Wifi | Kind::Guide | Kind::Network);
     // "What to say?" needs only to know a radio driver is RUNNING to suggest the WiFi question; asking
     // its status would cost a request and say nothing the suggestion uses.
     let ask_radio_status = !matches!(kind, Kind::Guide);
@@ -359,8 +359,17 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
         Some(Chain { block, host, host_read })
     } else { None };
 
+    // `net-stack`'s status, when the network is the question (`ask-net`'s row is the one with the peer).
+    let net = if !matches!(kind, Kind::Network) { Got::Absent } else if !tt.live("net-stack") { Got::Absent } else {
+        match gs::net::Net::new(ctx).status() {
+            Ok(s) => Got::Yes(NetStatus { ip: s.ip.0, gateway: s.gateway.0, dns: s.dns.0, leased: s.leased,
+                                          gateway_resolved: s.gateway_resolved, ping_ok: s.ping_ok }),
+            Err(_) => Got::Silent,
+        }
+    };
+
     let tick = gs::driver::wait::ticks(ctx);
-    let facts = Facts { now, tick, tasks, expected, events, drive, radios: &radios[..nr], chain };
+    let facts = Facts { now, tick, tasks, expected, events, drive, radios: &radios[..nr], chain, net };
     know::assess(kind, event, known, &facts, a);
 }
 

@@ -27,6 +27,13 @@
 //! fresh prompt, losing the in-flight command but not the session (§6.2).
 
 use godspeed as gs;
+
+/// `ask`'s own reading of a question, compiled in here from the SAME file, so the shell can start the
+/// row that question needs (`ask` or `ask-net`) and the two can never disagree about which question it
+/// is. Pure `core` - it is the file `scripts/host_test_check.py` tests on the host.
+#[allow(dead_code)]
+#[path = "../../ask/src/know.rs"]
+mod ask_know;
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
@@ -5421,7 +5428,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("ask \"what failed?\"", "restarts and failed restarts the supervisor recorded, and what is down now", "ask \"what failed?\""),
             ("ask \"why did <service> <event>?\"", "a service by name, and one event: restart, fail, crash, stop", "ask \"why did fs restart?\""),
             ("ask \"why did the wifi restart?\"", "the radio driver and the radio's own status", "ask \"why did the wifi restart?\""),
-            ("ask \"is the filesystem healthy?\"", "what fs reports; a scrub is offered, not run", "ask \"is the filesystem healthy?\""),
+            ("ask \"is the filesystem healthy?\"", "what fs reports; with no disk, where in the storage chain it stops", "ask \"is the filesystem healthy?\""),
+            ("ask \"is the network up?\"", "the address, the lease and the gateway - and what was not tested", "ask \"is the network up?\""),
+            ("ask \"what is <term>?\"", "a term from the glossary; a typo is read and said to be", "ask \"what is MISCIS?\""),
             ("ask evidence \"<question>\"", "the same answer with every line labelled FACT, INFERENCE or UNKNOWN, and its source", "ask evidence \"is my system healthy?\""),
             ("ask \"<question>\" | where label=verdict", "the answer is records: label, source, rule, text", "ask \"what failed?\" | where label=fact"),
         ], true),
@@ -14428,7 +14437,12 @@ fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
     };
     let mut cap = Cap::new();
     let keep = |b: u8| ctx.keep_key(b);
-    if !drain_service_with(ctx, "ask", ASK_PEERS, Some(q.as_bytes()), &mut cap, ASK_WAIT_SECS, Some(&keep)) {
+    // Which row: a network question needs `net-stack`, and `ask-net`'s row is the one granted it.
+    let row = match ask_know::understand(q.as_bytes(), &[]) {
+        ask_know::Reading::One(ask_know::Kind::Network, _) => "ask-net",
+        _ => "ask",
+    };
+    if !drain_service_with(ctx, row, ASK_PEERS, Some(q.as_bytes()), &mut cap, ASK_WAIT_SECS, Some(&keep)) {
         return None;
     }
     match Table::decode(cap.bytes()) {

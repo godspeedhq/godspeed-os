@@ -909,6 +909,14 @@ pub fn run(image_path: &Path, smp: u32) {
         let guide = ask(b"ask \"what to say?\"\r", 40);
         check!(guide.contains("YOU CAN ASK") && guide.contains("why did <service> <event>"),
                "ask: \"what to say?\" lists the questions it understands");
+        // QEMU's user-mode network hands out a lease, so this machine IS on a network - and the answer
+        // must still not claim the internet works, because nothing was sent to find out.
+        let net = ask(b"ask \"is the network up?\"\r", 40);
+        check!(net.contains("ON A NETWORK") && net.contains("was not tested"),
+               "ask: the network question answers from net-stack's status, and says what it did not test");
+        let def = ask(b"ask \"what is immou?\"\r", 40);
+        check!(def.contains("IOMMU: Input/Output Memory Management Unit") && def.contains("I read `immou` as IOMMU"),
+               "ask: a term is defined from GLOSSARY.md, and a typo is read and said to be");
         let joke = ask(b"ask \"tell me a joke\"\r", 40);
         check!(joke.contains("A JOKE") && joke.contains("not an observation"),
                "ask: an Easter egg says what it is - a joke is never mistaken for an answer");
