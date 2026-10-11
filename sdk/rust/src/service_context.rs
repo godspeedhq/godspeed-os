@@ -1397,6 +1397,30 @@ impl ServiceContext {
         n
     }
 
+    /// [`Self::drain_stale_replies`] at the top of a request, and SAID when it found anything - the one
+    /// thing every request path that waits on the reply mailbox must do before it issues.
+    ///
+    /// It was done by ONE of the three such paths. `request_with_reply_deadline_into` drained (it is
+    /// where `backlog/37` was fixed); `request_with_reply_call_err`, which `gs::call` and so every `gs::fs`
+    /// call goes through, and `request_with_reply_deadline_outcome_into` did not. So the exact failure
+    /// [`Self::drain_stale_replies`] describes was still live for every service on the standard library:
+    /// in the jobs suite the shell's history save timed out while a background `drives check` held `fs`
+    /// for five seconds, its reply arrived late, and from then on every shell request to `fs` received
+    /// its predecessor's reply and rejected it as malformed - `churn verify` failing as "storage
+    /// unavailable" and every later history save lost (2026-10-11). One helper now, so a path cannot
+    /// have the drain without the log or the log without the drain.
+    fn drain_before_request(&self, peer: &str) {
+        let dropped = self.drain_stale_replies();
+        if dropped > 0 {
+            // LOUD, because it means a previous request was abandoned and this one would have
+            // inherited its reply. Silent self-repair is how the fs desync stayed invisible for so
+            // long (§26.7 - a recovery that hides what it recovered from is a silent fallback).
+            self.log_fmt(format_args!(
+                "sdk: discarded {} abandoned repl(y/ies) before a request to `{}` - an earlier request timed out",
+                dropped, peer));
+        }
+    }
+
     /// Give back a capability a DISCARDED message may have carried. A received `Message` does not
     /// record its caps; the kernel queues them for `take_pending_cap`. Every caller claims a cap
     /// straight after its own receive, so what is pending while a drain runs came with the message it
@@ -2135,6 +2159,8 @@ impl ServiceContext {
             Some(s) => CapHandle(s),
             None    => return Err(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld)),
         };
+        // Abandoned replies out first, or this request takes one of them (`drain_before_request`).
+        self.drain_before_request(peer);
         let (recv, grant) = match self.reply_mailbox() {
             Some((r, g)) => (r, g),
             None => match (self.recv_handle(), self.self_grant_handle()) {
@@ -2192,6 +2218,8 @@ impl ServiceContext {
             Some(s) => CapHandle(s),
             None => return DeadlineOutcomeInto::SendFailed,
         };
+        // Abandoned replies out first, or this request takes one of them (`drain_before_request`).
+        self.drain_before_request(peer);
         let (recv, grant) = match self.reply_mailbox() {
             Some((r, g)) => (r, g),
             None => match (self.recv_handle(), self.self_grant_handle()) {
@@ -2262,15 +2290,7 @@ impl ServiceContext {
         //
         // Cheap: a non-blocking `try_recv` that finds nothing in the healthy case, bounded by the
         // endpoint depth.
-        let dropped = self.drain_stale_replies();
-        if dropped > 0 {
-            // LOUD, because it means a previous request was abandoned and this one would have
-            // inherited its reply. Silent self-repair is how the fs desync stayed invisible for so
-            // long (§26.7 - a recovery that hides what it recovered from is a silent fallback).
-            self.log_fmt(format_args!(
-                "sdk: discarded {} abandoned repl(y/ies) before a request to `{}` - an earlier request timed out",
-                dropped, peer));
-        }
+        self.drain_before_request(peer);
         // Reply mailbox when the task has one, shared endpoint when it does not. The reply cap and the
         // endpoint waited on must name the SAME endpoint, or the kernel's reply-matched dequeue waits
         // for something that will never be delivered there.
