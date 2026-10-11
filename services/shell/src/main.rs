@@ -5417,6 +5417,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "ask" => help_block(ctx, "ask", "plain questions about this machine, answered from what its services know", &[
             ("ask \"<question>\"", "the answer: a verdict, and what it rests on", "ask \"is my system healthy?\""),
+            ("ask \"what to say?\"", "what it can be asked, with suggestions from this machine as it is now", "ask \"what to say?\""),
             ("ask \"what failed?\"", "restarts and failed restarts the supervisor recorded, and what is down now", "ask \"what failed?\""),
             ("ask \"why did <service> <event>?\"", "a service by name, and one event: restart, fail, crash, stop", "ask \"why did fs restart?\""),
             ("ask \"why did the wifi restart?\"", "the radio driver and the radio's own status", "ask \"why did the wifi restart?\""),

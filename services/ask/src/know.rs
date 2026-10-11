@@ -38,6 +38,9 @@ pub enum Kind {
     /// Why did (did, has) this service <event>? The SUBJECT is not vocabulary: it is an index into the
     /// names the machine itself knows (`understand`'s `known`), so a new service needs no new word.
     Service(usize),
+    /// What can be asked? ("what to say?", "what can I ask?") Answered with the question forms and
+    /// suggestions taken from this machine as it is - never a question about something it lacks.
+    Guide,
 }
 
 impl Kind {
@@ -49,6 +52,7 @@ impl Kind {
             Kind::Wifi => "the WiFi",
             Kind::Fs => "the filesystem",
             Kind::Service(i) => known.get(i).copied().unwrap_or("a service"),
+            Kind::Guide => "what can be asked",
         }
     }
 }
@@ -200,6 +204,15 @@ pub fn understand(q: &[u8], known: &[&str]) -> Reading {
         return Reading::Empty;
     }
     let w = |i: usize| &buf[ws[i].0..ws[i].1];
+
+    // WHAT CAN BE ASKED - "what to say?", "what can I ask?", "what questions?", "help" - before anything
+    // else, because "what" and "ask" would otherwise be read as part of some other question.
+    let has = |set: &[&str]| (0..n).any(|i| any(w(i), set));
+    if (n == 1 && any(w(0), &["help", "suggestions", "examples"]))
+        || (has(&["what", "which"]) && has(&["say", "ask", "questions", "question"]))
+        || (has(&["help"]) && has(&["me", "ask", "questions"])) {
+        return Reading::One(Kind::Guide, Event::Unnamed);
+    }
 
     // A request to DO something: an action word first, and no question word anywhere before it.
     if any(w(0), ACTION_WORDS) {
@@ -559,6 +572,7 @@ pub fn assess(kind: Kind, event: Event, known: &[&str], f: &Facts, a: &mut Answe
             Kind::Wifi => { let _ = v.write_str(wifi(event, f, a)); }
             Kind::Fs => { let _ = v.write_str(fs(f, a)); }
             Kind::Service(i) => service(known.get(i).copied().unwrap_or("?"), event, f, a, &mut v),
+            Kind::Guide => { let _ = v.write_str(guide(f, a)); }
         }
     }
     a.fact("ask", format_args!("taken at uptime {}s; another question is another observation", f.now));
@@ -865,10 +879,55 @@ fn fs(f: &Facts, a: &mut Answer) -> &'static str {
     }
 }
 
+/// "What to say?" - the forms `ask` understands, each with an example, then suggestions from THIS machine:
+/// the services that have restarted, the ones that should be running and are not, the radio and the
+/// storage where there are any. Every suggestion is a question `ask` would answer here, so none of them
+/// asks about something the machine does not have.
+fn guide(f: &Facts, a: &mut Answer) -> &'static str {
+    a.note(format_args!("ask \"is my system healthy?\"  - a verdict, and what it rests on"));
+    a.note(format_args!("ask \"what failed?\"  - what restarted, what failed to, what is down now"));
+    a.note(format_args!("ask \"why did <service> <event>?\"  - a service by name; restart, fail, crash or stop"));
+    a.note(format_args!("ask evidence \"<question>\"  - the same answer, every line labelled and its source named"));
+    // Suggestions from what is true now, most-restarted first, at most three.
+    let mut picked: [Option<&Task>; 3] = [None; 3];
+    for t in f.tasks.iter().filter(|t| t.restarts > 0) {
+        let slot = picked.iter().position(|p| p.map_or(true, |q| t.restarts > q.restarts));
+        if let Some(i) = slot {
+            let mut j = picked.len() - 1;
+            while j > i { picked[j] = picked[j - 1]; j -= 1; }
+            picked[i] = Some(t);
+        }
+    }
+    let mut suggested = 0u32;
+    for t in picked.iter().flatten() {
+        suggested += 1;
+        a.note(format_args!("try: ask \"why did {} restart?\"  - it has restarted {} time(s)", t.name, t.restarts));
+    }
+    if let Got::Yes(names) = f.expected {
+        for n in names.iter().filter(|n| f.task(n).is_none()).take(2) {
+            suggested += 1;
+            a.note(format_args!("try: ask \"why did {} stop?\"  - it should be running and is not", n));
+        }
+    }
+    if !f.radios.is_empty() {
+        suggested += 1;
+        a.note(format_args!("try: ask \"why did the wifi restart?\"  - a radio driver is running"));
+    }
+    if f.task("fs").is_some() {
+        suggested += 1;
+        a.note(format_args!("try: ask \"is the filesystem healthy?\""));
+    }
+    if suggested == 0 {
+        a.note(format_args!("nothing here has restarted, so there is no restart to ask about yet"));
+    }
+    "YOU CAN ASK"
+}
+
 /// What `ask` can answer, for `ask help` and for a question it did not understand.
 pub fn can_answer(a: &mut Answer) {
     a.note(format_args!("I can answer questions about: system health, what failed, the WiFi restarting, the filesystem"));
     a.note(format_args!("and why a service restarted, failed, crashed or stopped - name it, as in: why did fs restart?"));
+    a.note(format_args!("ask \"what to say?\" lists them with suggestions from this machine"));
 }
 
 /// Answer a reading that is not one question kind.
@@ -1219,5 +1278,34 @@ mod tests {
         let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_TRAPPED)) }];
         let f = Facts { radios: &radios, ..f };
         assert_eq!(verdict(&ask(Kind::Health, Event::Unnamed, &f)), b"DEGRADED");
+    }
+
+    #[test]
+    fn what_to_say() {
+        for q in ["what to say?", "what can I ask?", "what questions can I ask", "help", "help me"] {
+            assert_eq!(rk(q), Reading::One(Kind::Guide, Event::Unnamed), "{}", q);
+        }
+        // Still the questions they were.
+        assert_eq!(rk("what failed?"), Reading::One(Kind::Failed, Event::Unnamed));
+        assert_eq!(rk("why did fs restart"), Reading::One(Kind::Service(2), Event::Restart));
+    }
+
+    #[test]
+    fn suggestions_come_from_this_machine() {
+        let mut t = tasks_ok();
+        t[2].restarts = 4; // fs
+        t[3].restarts = 1; // shell
+        let f = Facts { now: 100, tasks: &t, expected: Got::Yes(&["supervisor", "events", "fs", "shell", "block-driver"]),
+                        events: ev_none(), drive: mounted(), radios: &[] };
+        let a = ask(Kind::Guide, Event::Unnamed, &f);
+        assert_eq!(verdict(&a), b"YOU CAN ASK");
+        assert!(a.has(Label::Note, "try: ask \"why did fs restart?\"  - it has restarted 4 time(s)"));
+        assert!(a.has(Label::Note, "why did shell restart?"));
+        assert!(a.has(Label::Note, "why did block-driver stop?"));
+        // No radio here, so no WiFi suggestion.
+        assert!(!a.any_text("wifi restart?\"  - a radio"));
+        // The most-restarted comes first.
+        let pos = |n: &str| a.lines().iter().position(|l| contains(l.text(), n.as_bytes()));
+        assert!(matches!((pos("why did fs restart"), pos("why did shell restart")), (Some(x), Some(y)) if x < y));
     }
 }

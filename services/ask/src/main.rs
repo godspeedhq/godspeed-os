@@ -216,10 +216,13 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
     }
     let tasks = &tasks[..tt.n];
 
-    let need_expected = matches!(kind, Kind::Health | Kind::Failed | Kind::Service(_));
+    let need_expected = matches!(kind, Kind::Health | Kind::Failed | Kind::Service(_) | Kind::Guide);
     let need_events = matches!(kind, Kind::Failed | Kind::Wifi | Kind::Service(_));
     let need_drive = matches!(kind, Kind::Health | Kind::Fs);
-    let need_radios = matches!(kind, Kind::Health | Kind::Wifi);
+    let need_radios = matches!(kind, Kind::Health | Kind::Wifi | Kind::Guide);
+    // "What to say?" needs only to know a radio driver is RUNNING to suggest the WiFi question; asking
+    // its status would cost a request and say nothing the suggestion uses.
+    let ask_radio_status = !matches!(kind, Kind::Guide);
 
     // The supervisor's two answers: what it keeps running (asked once, before the question was read)
     // and its record of what happened to them.
@@ -268,7 +271,7 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
         for buf in bufs {
             if tt.live(RADIOS[i]) {
                 present[i] = true;
-                statuses[i] = radio_status(ctx, RADIOS[i], buf, &mut ssid_lens[i]);
+                if ask_radio_status { statuses[i] = radio_status(ctx, RADIOS[i], buf, &mut ssid_lens[i]); }
             }
             i += 1;
         }

@@ -906,6 +906,9 @@ pub fn run(image_path: &Path, smp: u32) {
                "ask: the general question names the service it was asked about");
         let act = ask(b"ask \"restart fs\"\r", 40);
         check!(act.contains("I cannot restart anything"), "ask: a request to act is refused - ask reads, it changes nothing");
+        let guide = ask(b"ask \"what to say?\"\r", 40);
+        check!(guide.contains("YOU CAN ASK") && guide.contains("why did <service> <event>"),
+               "ask: \"what to say?\" lists the questions it understands");
         let huh = ask(b"ask \"why is my computer sad?\"\r", 40);
         check!(huh.contains("I don't understand that question yet") && huh.contains("system health"),
                "ask: a question it does not understand says so, and what it can answer");

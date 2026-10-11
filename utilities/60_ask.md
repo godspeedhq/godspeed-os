@@ -34,6 +34,7 @@ invocation the summary and the evidence are one assessment.
 | `why did <service> <event>?` | that service in the task table and the supervisor's record. `<service>` is any name the machine knows - the task table's and the supervisor's - so a new service needs no new word; `<event>` is one of restart, fail, crash, stop, kept apart |
 | `why did the wifi restart?` | the radio driver that is running, its restarts, and the radio's own status. "The WiFi" is an alias, not a service |
 | `is the filesystem healthy?` | `fs`'s drive report; a scrub is offered, not run |
+| `what to say?` (or `what can I ask?`, `help`) | the forms above, each with an example, then suggestions from this machine as it is: a service that has restarted (most first), one that should be running and is not, the WiFi where a radio driver runs, the filesystem where `fs` does. Nothing is suggested that this machine could not answer |
 
 A question it does not understand is said to be, with the list above; a question that fits two kinds, or
 names two services, is answered with both and the question "which?"; a request to DO something (`restart
