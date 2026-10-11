@@ -40,6 +40,12 @@ A question it does not understand is said to be, with the list above; a question
 names two services, is answered with both and the question "which?"; a request to DO something (`restart
 fs`) is refused - `ask` reads and changes nothing.
 
+**And a few it was not built to answer, but does** (operator, 2026-10-11): `tell me a joke`, `what is the
+meaning of life?`, `sudo ...`, `rm -rf /`, `are you alive?`, `who are you?` / `what is godspeed?`. Each
+says what it is - a joke's verdict is `A JOKE` - so a script reading verdicts never takes one for an
+answer, and every line is true or is a joke. The jokes are fixed in the program and rotate with the
+uptime second.
+
 ## 3. What every line is
 
 - **FACT** - a source said it, or recorded it. The source is named.

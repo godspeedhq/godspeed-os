@@ -41,6 +41,20 @@ pub enum Kind {
     /// What can be asked? ("what to say?", "what can I ask?") Answered with the question forms and
     /// suggestions taken from this machine as it is - never a question about something it lacks.
     Guide,
+    /// An Easter egg (operator, 2026-10-11). Still honest: its verdict says what it is - `A JOKE` - so a
+    /// script reading verdicts cannot take one for an answer, and every line is true or is a joke.
+    Egg(Egg),
+}
+
+/// The Easter eggs. Deterministic and fixed in the program; a joke rotates with the uptime second.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Egg {
+    Joke,
+    Meaning,
+    Sudo,
+    RmRf,
+    Alive,
+    Who,
 }
 
 impl Kind {
@@ -53,6 +67,7 @@ impl Kind {
             Kind::Fs => "the filesystem",
             Kind::Service(i) => known.get(i).copied().unwrap_or("a service"),
             Kind::Guide => "what can be asked",
+            Kind::Egg(_) => "an Easter egg",
         }
     }
 }
@@ -204,6 +219,19 @@ pub fn understand(q: &[u8], known: &[&str]) -> Reading {
         return Reading::Empty;
     }
     let w = |i: usize| &buf[ws[i].0..ws[i].1];
+
+    // THE EASTER EGGS, before anything else reads their words as something they are not ("sudo" is no
+    // action word here, and "what is godspeed" is not the health question).
+    if any(w(0), &["sudo"]) { return Reading::One(Kind::Egg(Egg::Sudo), Event::Unnamed); }
+    if w(0) == b"rm" && (0..n).any(|i| w(i) == b"rf" || w(i) == b"r") { return Reading::One(Kind::Egg(Egg::RmRf), Event::Unnamed); }
+    let has_e = |set: &[&str]| (0..n).any(|i| any(w(i), set));
+    if has_e(&["joke", "jokes", "funny", "laugh"]) { return Reading::One(Kind::Egg(Egg::Joke), Event::Unnamed); }
+    if has_e(&["meaning"]) && has_e(&["life", "universe", "everything"]) { return Reading::One(Kind::Egg(Egg::Meaning), Event::Unnamed); }
+    if has_e(&["alive", "sentient", "conscious"]) && has_e(&["you"]) { return Reading::One(Kind::Egg(Egg::Alive), Event::Unnamed); }
+    if (has_e(&["who", "what"]) && has_e(&["you"]) && has_e(&["are"]) && n <= 4)
+        || (has_e(&["what", "who"]) && has_e(&["godspeed"]) && n <= 4) {
+        return Reading::One(Kind::Egg(Egg::Who), Event::Unnamed);
+    }
 
     // WHAT CAN BE ASKED - "what to say?", "what can I ask?", "what questions?", "help" - before anything
     // else, because "what" and "ask" would otherwise be read as part of some other question.
@@ -573,6 +601,7 @@ pub fn assess(kind: Kind, event: Event, known: &[&str], f: &Facts, a: &mut Answe
             Kind::Fs => { let _ = v.write_str(fs(f, a)); }
             Kind::Service(i) => service(known.get(i).copied().unwrap_or("?"), event, f, a, &mut v),
             Kind::Guide => { let _ = v.write_str(guide(f, a)); }
+            Kind::Egg(e) => { let _ = v.write_str(egg(e, f, a)); }
         }
     }
     a.fact("ask", format_args!("taken at uptime {}s; another question is another observation", f.now));
@@ -921,6 +950,54 @@ fn guide(f: &Facts, a: &mut Answer) -> &'static str {
         a.note(format_args!("nothing here has restarted, so there is no restart to ask about yet"));
     }
     "YOU CAN ASK"
+}
+
+/// Godspeed jokes. Each is about the system, and the punchline is true.
+const JOKES: &[&str] = &[
+    "How many Godspeed services does it take to change a light bulb? None. The bulb holds no capability, so nobody may touch it.",
+    "Knock knock. - Who's there? - EndpointDead. - EndpointDead who? - Reacquire me by name and ask again.",
+    "Why is the kernel so calm? It has exactly six jobs, and it refuses a seventh.",
+    "A UNIX process walks into a bar and says it is root. The barman asks to see its capability.",
+    "Why did the service restart? It lost its capability to cope. The supervisor brought it back anyway.",
+    "I would tell you a UDP joke, but I cannot promise net-stack delivers it.",
+    "Why do Godspeed services never gossip? Every message needs a SEND right, and the kernel checks.",
+];
+
+/// An Easter egg. The verdict says what it is; the lines are a joke or are true.
+fn egg(e: Egg, f: &Facts, a: &mut Answer) -> &'static str {
+    match e {
+        Egg::Joke => {
+            let j = JOKES[(f.now as usize) % JOKES.len()];
+            a.note(format_args!("{}", j));
+            a.note(format_args!("(a joke, not an observation - ask again in a second for another)"));
+            "A JOKE"
+        }
+        Egg::Meaning => {
+            a.note(format_args!("42."));
+            a.unknown(format_args!("why is not recorded anywhere this can read"));
+            "42"
+        }
+        Egg::Sudo => {
+            a.note(format_args!("There is no sudo. Authority here is a capability you hold, not a user you become (CLAUDE.md 3.1)."));
+            a.note(format_args!("And I hold nothing that changes the system: I only read."));
+            "NO SUDO HERE"
+        }
+        Egg::RmRf => {
+            a.note(format_args!("Nothing here holds the ambient authority to do that, and I hold none at all (CLAUDE.md Appendix D.4)."));
+            "NOT HERE"
+        }
+        Egg::Alive => {
+            a.note(format_args!("No. I am a program started for one question, and I end when this answer does."));
+            a.note(format_args!("`observe now` after this prompt will not find me."));
+            "NO"
+        }
+        Egg::Who => {
+            a.note(format_args!("I am `ask`: I answer plain questions about this machine from what its services already know, and I change nothing."));
+            a.note(format_args!("Godspeed is a capability microkernel small enough to explain on a whiteboard in thirty minutes (CLAUDE.md 26.11)."));
+            a.note(format_args!("ask \"what to say?\" lists what I can answer."));
+            "ASK, ON GODSPEED"
+        }
+    }
 }
 
 /// What `ask` can answer, for `ask help` and for a question it did not understand.
@@ -1307,5 +1384,30 @@ mod tests {
         // The most-restarted comes first.
         let pos = |n: &str| a.lines().iter().position(|l| contains(l.text(), n.as_bytes()));
         assert!(matches!((pos("why did fs restart"), pos("why did shell restart")), (Some(x), Some(y)) if x < y));
+    }
+
+    #[test]
+    fn easter_eggs_are_found_and_say_what_they_are() {
+        assert_eq!(rk("tell me a joke"), Reading::One(Kind::Egg(Egg::Joke), Event::Unnamed));
+        assert_eq!(rk("what is the meaning of life?"), Reading::One(Kind::Egg(Egg::Meaning), Event::Unnamed));
+        assert_eq!(rk("sudo make me a sandwich"), Reading::One(Kind::Egg(Egg::Sudo), Event::Unnamed));
+        assert_eq!(rk("rm -rf /"), Reading::One(Kind::Egg(Egg::RmRf), Event::Unnamed));
+        assert_eq!(rk("are you alive?"), Reading::One(Kind::Egg(Egg::Alive), Event::Unnamed));
+        assert_eq!(rk("who are you?"), Reading::One(Kind::Egg(Egg::Who), Event::Unnamed));
+        assert_eq!(rk("what is godspeed?"), Reading::One(Kind::Egg(Egg::Who), Event::Unnamed));
+        // The real questions are untouched.
+        assert_eq!(rk("is my system healthy?"), Reading::One(Kind::Health, Event::Unnamed));
+        assert_eq!(rk("restart fs"), Reading::Action);
+        // A joke's verdict says it is one, and two seconds give two jokes.
+        let t = tasks_ok();
+        let f = Facts { now: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[] };
+        let a = ask(Kind::Egg(Egg::Joke), Event::Unnamed, &f);
+        assert_eq!(verdict(&a), b"A JOKE");
+        assert!(a.has(Label::Note, "not an observation"));
+        let f2 = Facts { now: 101, ..f };
+        let b = ask(Kind::Egg(Egg::Joke), Event::Unnamed, &f2);
+        assert!(a.lines()[1].text() != b.lines()[1].text());
+        let m = ask(Kind::Egg(Egg::Meaning), Event::Unnamed, &f);
+        assert!(m.has(Label::Unknown, "why is not recorded"));
     }
 }

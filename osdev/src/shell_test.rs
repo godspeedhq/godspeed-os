@@ -909,6 +909,9 @@ pub fn run(image_path: &Path, smp: u32) {
         let guide = ask(b"ask \"what to say?\"\r", 40);
         check!(guide.contains("YOU CAN ASK") && guide.contains("why did <service> <event>"),
                "ask: \"what to say?\" lists the questions it understands");
+        let joke = ask(b"ask \"tell me a joke\"\r", 40);
+        check!(joke.contains("A JOKE") && joke.contains("not an observation"),
+               "ask: an Easter egg says what it is - a joke is never mistaken for an answer");
         let huh = ask(b"ask \"why is my computer sad?\"\r", 40);
         check!(huh.contains("I don't understand that question yet") && huh.contains("system health"),
                "ask: a question it does not understand says so, and what it can answer");
