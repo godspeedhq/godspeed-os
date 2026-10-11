@@ -350,3 +350,23 @@ microseconds against a 0.75 s budget, so even a real 1000x cut leaves ~750x marg
 
 The unexercised row is unchanged and now stands at **zero firings in 35,748 kills across five boards
 and four instruction sets**. The wait has never once reached its budget outside a forced probe.
+
+### The abandon path fired for real, twice (Pi 4, 2026-10-11)
+
+A `chaos max-carnage all-services 1000` on the Pi 4 (image `1b85ffa3`, `backlog/80`'s regression run)
+logged `kill: ABANDONED slot 12` at 09:15:45 and `kill: ABANDONED slot 13` at 09:36:15. Both name
+`pwm-audio` on core 2, both say the core took no interrupts in the 135,000,000-tick window (2.5 s at the
+Pi 4's 54 MHz counter), and both conclude that the core "is wedged rather than slow". The kernel stayed
+alive and every service on core 2 kept running, so abandoning did what this entry says it should.
+
+**The observation was right and the conclusion was not.** Each line is spliced into the middle of a
+`pwm-audio` EL0 fault report that core 2 was printing at the time (the service had panicked and was
+faulting so it would be restarted). AArch64 masks IRQs on exception entry, and those two reports took
+about 2.6 s each on the serial line, a little longer than the window. So core 2 was busy in the kernel
+with interrupts off, not wedged, and the IRQ-progress test cannot tell the two apart.
+
+**What it cost:** 117 frames leaked per abandon, and two `Dead` `pwm-audio` rows that `observe` still
+showed an hour later, as the message says it will. Not fixed: whether to shorten the report, count it
+as progress, or widen the window is a decision for later, and this is the first evidence that the
+window can be shorter than something the kernel does on purpose. The unexercised row above now reads
+**two real firings, both explained by a fault report outlasting the window**.

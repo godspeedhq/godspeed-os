@@ -1,8 +1,8 @@
 # 80. Code defects found by the 2026-10-09 documentation audits
 
 **Status: FIXED IN CODE on `fix/backlog-80`, 2026-10-10 - every item below carries a FIXED note - and
-OPEN until the hardware cards those notes name have passed: the Pi 4 (K21, K22) and the VisionFive (D11).
-The T630's two (D1, K17) passed on 2026-10-10, the Pi 2's three (G4, K25, K28) on 2026-10-11. The audits changed documents and comments only; the items
+OPEN until the hardware card those notes name has passed: the VisionFive (D11).
+The T630's two (D1, K17) passed on 2026-10-10, the Pi 2's three (G4, K25, K28) and the Pi 4's two (K21, K22) on 2026-10-11. The audits changed documents and comments only; the items
 were fixed separately, and the kernel ones with the operator's go-ahead.**
 
 **Seen while closing it, not yet explained:** one `osdev test shell` run on 2026-10-10 went silent at the
@@ -26,6 +26,15 @@ working.
 gave four different words and `selfcheck` 526 passed, 0 failed (its `dns` step skipped: the dongle's
 post-storm rejoin was ended by the access point, reason 34, before the handshake, and was not retried in
 the two minutes the capture ran on).
+
+**Pi 4, 2026-10-11, image `1b85ffa3`:** `chaos max-carnage all-services 1000`: 7483 kills, 6517 flooded,
+1000 mem-pressure, 1000 spawns, kernel alive, no kernel fault and no liveness report; an hour later `random 5`
+and `random 50` gave distinct words, `observe now` showed every service up, and `selfcheck` ran 536, failed
+0, skipped 0, `dns` included. Two things in the storm are recorded where they belong rather than here as
+new items: the 17,813 `free_frame: IGNORED phantom frame` lines are `audits/kernel-audit.md` A10-8 (the
+AArch64 reclaim frees a dead driver's device pages, and only the allocator's range check stops them), and
+the two `kill: ABANDONED slot` lines are the first real firings of the path `backlog/48` records as
+unexercised, written up there.
 
 Two audits ran on `feat/dogfood-gs` on 2026-10-09 (`audits/documentation-audit.md`, Audits 14 and 15).
 Reading every comment against the code beside it finds code that does not do what its comment says, and
@@ -130,11 +139,11 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   non-cacheable (MAIR slot 2) while the kernel's direct map still covers the same pages as Normal
   write-back cacheable - mismatched attributes ARM leaves UNPREDICTABLE. Fix: map the range non-cacheable
   in the direct map (split the 2 MiB block), or withhold the grant.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** the framebuffer's pages are split out of their 2 MiB blocks in the direct map and remapped non-cacheable, break-before-make; the split-table pool 12 -> 32. Needs a Pi 4 card.
+  **FIXED on `fix/backlog-80`, 2026-10-10:** the framebuffer's pages are split out of their 2 MiB blocks in the direct map and remapped non-cacheable, break-before-make; the split-table pool 12 -> 32. Needs a Pi 4 card. **Passed on the Pi 4, 2026-10-11:** the boot log printed `aarch64: framebuffer remapped Normal non-cacheable in the direct map` and no `fb:` failure line, and the console drew through a 1000-round chaos run and a full `selfcheck`.
 - **K22. GICv2 EOI drops the SGI source CPU**: `gic::acknowledge` returns `IAR & 0x3FF` and `eoi` writes only
   the ID, but an SGI's EOIR value must carry IAR's CPUID bits [12:10], so an SGI from cores 1-3 is EOI'd with
   a mismatched value (effect on hardware unverified). Fix: EOI with the raw IAR value.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** EOI is written with the raw IAR value. Needs a Pi 4 chaos run.
+  **FIXED on `fix/backlog-80`, 2026-10-10:** EOI is written with the raw IAR value. Needs a Pi 4 chaos run. **Passed on the Pi 4, 2026-10-11:** 1000 rounds of `chaos max-carnage all-services`, 7483 kills, kernel alive, no liveness report, then `selfcheck` 536/0.
 - **K23. aarch64 `cpu_clock` returns a rate it did not read back** (`now.unwrap_or(set)`); CLAUDE.md 12.3
   says the result is the read-back. Fix: `None`, or log, when the read-back fails.
   **FIXED on `fix/backlog-80`, 2026-10-10:** returns the read-back rate, or `None` with a log line.
