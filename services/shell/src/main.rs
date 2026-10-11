@@ -14467,8 +14467,13 @@ fn cmd_ask(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             b"status" => {}
             b"verdict" => gs::io::println(ctx, text),
             b"note" => gs::io::println_fmt(ctx, format_args!("  {}", text)),
-            // The summary leaves out the FACT lines and keeps what they amount to; `evidence` shows all.
-            b"fact" if !evidence => {}
+            // The summary shows the facts as plain sentences - for "what failed?" the facts ARE the
+            // answer, and the first cut, which hid them, answered that question with a verdict and two
+            // caveats. Only the observation stamp is left to `evidence`, which adds every label, source
+            // and rule.
+            b"fact" if !evidence => {
+                if !text.starts_with("taken at uptime") { gs::io::println_fmt(ctx, format_args!("  {}", text)); }
+            }
             _ if evidence => {
                 let up = match label { b"fact" => "FACT", b"inference" => "INFERENCE", b"unknown" => "UNKNOWN", _ => "" };
                 let src = str_of(t.cell_bytes(r, 1));

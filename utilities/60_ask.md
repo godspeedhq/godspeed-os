@@ -16,7 +16,7 @@ tests (`services/ask/src/know.rs`, run by `scripts/host_test_check.py`).
 ## 1. The command
 
 ```
-ask "<question>"            the verdict, and what it rests on
+ask "<question>"            the verdict, then what it rests on, as plain sentences
 ask evidence "<question>"   the same answer, every line labelled FACT, INFERENCE or UNKNOWN, with its source
 ask help                    what it can be asked, with an example of each
 ask version
