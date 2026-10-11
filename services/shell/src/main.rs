@@ -20111,7 +20111,10 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             return Ok(());
         }
         Err(gs::Error::Cancelled) => return Ok(()),
-        Err(_) => { gs::io::println(ctx, "churn verify: storage unavailable"); return Err(ShellError::Unknown); }
+        // NAMED, not a bare "storage unavailable": a reply that never came, one that came malformed and
+        // a filesystem that is not mounted are different faults, and the jobs suite could not tell them
+        // apart when this failed in QEMU after a churn job.
+        Err(e) => { gs::io::println_fmt(ctx, format_args!("churn verify: storage unavailable ({})", e.as_str())); return Err(ShellError::Unknown); }
     }
 
     for k in 0..nn {

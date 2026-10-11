@@ -881,6 +881,44 @@ pub fn run(image_path: &Path, smp: u32) {
     }
 
     // -----------------------------------------------------------------------
+    // ask (utilities/60_ask.md): a foreground program for one question. Answered from the services
+    // that know, every line labelled, records when piped, refusals that say what to do - and nothing
+    // of it left running once the prompt returns.
+    // -----------------------------------------------------------------------
+    {
+        let mut ask = |cmd: &[u8], secs: u64| -> String {
+            send(&mut write_half, cmd);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(secs)).unwrap_or_default()
+        };
+        let bare = ask(b"ask\r", 10);
+        check!(bare.contains("usage: ask"), "ask: bare `ask` prints its usage");
+        let unquoted = ask(b"ask is my system healthy\r", 10);
+        check!(unquoted.contains("put the question in quotes: ask \"is my system healthy\""),
+               "ask: an unquoted question is refused with the line to type");
+        let health = ask(b"ask \"is my system healthy?\"\r", 40);
+        check!(["HEALTHY", "DEGRADED", "UNHEALTHY", "UNKNOWN"].iter().any(|v| health.contains(v)) && !health.contains("pipe:"),
+               "ask: the health question gets a verdict");
+        let ev = ask(b"ask evidence \"is my system healthy?\"\r", 40);
+        check!(ev.contains("FACT") && ev.contains("[task table]") && ev.contains("taken at uptime"),
+               "ask evidence: every line labelled, its source named, the moment it was taken");
+        let svc = ask(b"ask \"why did fs restart?\"\r", 40);
+        check!(svc.contains("`fs` HAS NOT RESTARTED") || svc.contains("`fs` HAS RESTARTED"),
+               "ask: the general question names the service it was asked about");
+        let act = ask(b"ask \"restart fs\"\r", 40);
+        check!(act.contains("I cannot restart anything"), "ask: a request to act is refused - ask reads, it changes nothing");
+        let huh = ask(b"ask \"why is my computer sad?\"\r", 40);
+        check!(huh.contains("I don't understand that question yet") && huh.contains("system health"),
+               "ask: a question it does not understand says so, and what it can answer");
+        let piped = ask(b"ask \"what failed?\" | where label=verdict\r", 40);
+        check!(piped.contains("verdict") && !piped.contains("exceeded the record bound"),
+               "ask: piped, the answer is records - and a three-row table is not reported truncated");
+        let help = ask(b"ask help\r", 10);
+        check!(help.contains("why did <service> <event>"), "ask help: lists the general question");
+        let after = ask(b"observe now\r", 30);
+        check!(!after.contains(" ask "), "ask: no `ask` task is left once the prompt returns");
+    }
+
+    // -----------------------------------------------------------------------
     // hardware (utilities/58_hardware.md): the overview from its owners - the kernel, hw-enumerator
     // and the supervisor - one record shape for every section, and the words not built yet.
     // -----------------------------------------------------------------------
