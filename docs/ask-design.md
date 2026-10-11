@@ -15,11 +15,21 @@ the first command that EXPLAINS rather than reports, and its one rule is the pro
 It is not a chatbot, an administrator, a monitor or a repair agent. It runs no model, needs no network,
 keeps nothing running between questions, and changes nothing.
 
-## 1. Shape: a short-lived program, not a shell built-in
+## 1. Shape: a foreground program for one question, not a service and not a shell built-in
 
-`ask` is a program the shell starts for one question and that exits when it has answered, as
-`copier` and `recorder` are started on demand (`services/CLAUDE.md`). Two reasons decide it, and both
-are about authority rather than convenience:
+`ask` is a FOREGROUND program whose whole life is one question: the shell starts it, `ask` answers, and
+it is gone before the next prompt. Nothing of it stays running. It is NOT like `copier` and `recorder`,
+which this section first named as its model: they are started on demand too, but they stay up afterwards
+and serve later requests, which is a background service, and `ask` is not one.
+
+How it ends, stated because v1 has no way for a task to end itself: the only call that ends a task is
+`kill`, and `ask` must not hold the authority to kill. So the SHELL, which does, ends it as soon as the
+answer is in, and on a bounded deadline if the answer never comes - which a dead or wedged source cannot
+cause, since each request inside `ask` is bounded too (section 7). `observe now` is the nearest existing
+shape, and also the difference: it parks after its frame and lingers until the next `observe now`;
+`ask` does not linger.
+
+Two reasons decide that it is a program at all, and both are about authority rather than convenience:
 
 - **It holds only what it reads.** A shell built-in would answer with the shell's whole authority,
   which includes killing services and formatting disks. A separate program is granted, in its spawn
