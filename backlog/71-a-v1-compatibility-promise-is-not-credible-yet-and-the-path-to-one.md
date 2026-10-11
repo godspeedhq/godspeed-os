@@ -45,6 +45,19 @@ than by re-export. Domain libraries like `sdk/wifi` stay outside the standard li
 `gs::driver`. The `stdlib-design.md` section it moves is marked superseded in part, which is a recorded
 design change, not a constitutional amendment: no `unsafe` moves.
 
+## The bar, in the operator's words (2026-10-11)
+
+> I want contributions to be easily grokable from api interfaces and stdlibs that don't change. Once it's
+> robust enough then I can release v1.
+
+So the promise is for the CONTRIBUTOR: someone should be able to write a service, a utility or a driver by
+reading stable interfaces, without reading the kernel or the SDK. That has one consequence for step 1 below
+that the earlier draft did not face. The draft leaves `gs::driver` OUT of the covered surface, but a driver
+contributor works through `gs::driver` and, where it has no mechanism yet, the SDK's `ctx.mmio()` and
+`ctx.dma_region()` (13 and 12 call sites across nine drivers on 2026-10-11). Under this bar, either the
+built `gs::driver` mechanisms are covered, with the set allowed to GROW but not change, or driver
+contributions are named as outside what v1 makes easy. Undecided; it is the operator's call.
+
 ## The path to a credible v1
 
 1. **Decide the covered surface, explicitly.** Proposed IN: the `gs` core (files, IPC, records, `net`,
