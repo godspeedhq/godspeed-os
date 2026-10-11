@@ -2,9 +2,9 @@
 
 **Severity:** low today, structural. Nothing is broken on any of the five machines (four ports); what
 is recorded here is an axis that is wrong and a kernel surface that is now unused.
-**Status: OPEN, one of three steps done.** Item 1 needs a new kernel query and is untouched. Item 2's
-first step - stop GRANTING NET_DEVICE - landed on `portability-hardening` and is hardware-confirmed;
-the SDK wrappers and the syscalls themselves remain.
+**Status: OPEN, two of three steps done.** Item 1 needs a new kernel query and is untouched. Item 2's
+first step - stop GRANTING NET_DEVICE - landed on `portability-hardening` and is hardware-confirmed; its
+second - the SDK wrappers - went on 2026-10-11 (`feat/ask`). The syscalls themselves remain.
 
 ---
 
@@ -67,7 +67,9 @@ one.
 
 What remains is the other end of it:
 
-- `sdk/rust/src/service_context.rs` still exposes `net_info`, `net_frame_tx`, `net_frame_rx`.
+- ~~`sdk/rust/src/service_context.rs` still exposes `net_info`, `net_frame_tx`, `net_frame_rx`.~~
+  **DONE 2026-10-11.** Removed with no caller anywhere in the tree; every port's image builds and the
+  x86 suites pass (the SDK's `unsafe` floor fell 80 -> 77).
 - ~~The kernel still grants NET_DEVICE by name on `arm` and `aarch64`.~~ **DONE 2026-09-13.** The
   supervisor stopped requesting it (`10d3b43e`) and the kernel's by-name arm is `net_device: false`
   (`3c75638e`). Confirmed on all five machines: the Pi 4 and both x86 boxes boot with DHCP, ARP,

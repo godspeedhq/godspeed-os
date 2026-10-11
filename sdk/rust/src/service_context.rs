@@ -1184,30 +1184,9 @@ impl ServiceContext {
         let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
     }
 
-    /// Transmit one raw ethernet frame via an in-kernel network device. Gated by the NET_DEVICE cap.
-    /// Returns true if it was sent. Both args are pointer + length, so they fit the 32-bit ABI
-    /// without truncation. No port has an in-kernel network device any more (every arch's
-    /// `net_frame_tx` is a stub returning false), so this always returns false; no service calls it.
-    #[must_use = "the frame is NOT on the wire if this is false"]
-    pub fn net_frame_tx(&self, frame: &[u8]) -> bool {
-        // SAFETY: syscall(42) = NetFrameTx; the kernel range-checks (ptr, len) before copying.
-        unsafe { raw_syscall(42, frame.as_ptr() as u64, frame.len() as u64, 0) >= 0 }
-    }
-
-    /// Receive one raw ethernet frame into `dst` (a single bulk-IN poll). Returns the frame length, or 0
-    /// if none is available. Gated by the NET_DEVICE cap.
-    pub fn net_frame_rx(&self, dst: &mut [u8]) -> usize {
-        // SAFETY: syscall(43) = NetFrameRx; the kernel range-checks (ptr, len) before writing.
-        let r = unsafe { raw_syscall(43, dst.as_mut_ptr() as u64, dst.len() as u64, 0) };
-        if r > 0 { r as usize } else { 0 }
-    }
-
-    /// Query the in-kernel net device: writes `[mac(6), link(1)]` (7 bytes) into `out`. Returns true if
-    /// a net device is up - never, on any port today. Gated by the NET_DEVICE cap.
-    pub fn net_info(&self, out: &mut [u8; 7]) -> bool {
-        // SAFETY: syscall(44) = NetInfo; the kernel writes exactly 7 range-checked bytes.
-        unsafe { raw_syscall(44, out.as_mut_ptr() as u64, 0, 0) == 1 }
-    }
+    // `net_frame_tx`, `net_frame_rx` and `net_info` (syscalls 42-44, NET_DEVICE) were here until
+    // 2026-10-11: no port has an in-kernel network device, nothing is granted NET_DEVICE, and nothing
+    // called them (`backlog/21` step 2). The syscalls themselves are the last step, a kernel change.
 
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {

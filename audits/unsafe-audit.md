@@ -19,7 +19,7 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **80** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/80 K14) |
+| `sdk/rust/src/service_context.rs` | **77** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
 **The 92 are not 92 defects.** 88 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
@@ -57,6 +57,15 @@ its own core, and AArch64's free invalidates inner-shareable for the idle core t
 | `arch/riscv64/mod.rs` | 67 -> 64 (-3) | **shrank**: `broadcast_ipi_all_but_self` (the fn, its id read and its per-hart send). |
 | `arch/arm/mod.rs`, `arch/loongarch64/mod.rs`, `arch/riscv32/mod.rs`, `arch/s390x/mod.rs` | -1 each | **shrank**: the empty `broadcast_ipi_all_but_self` stub. |
 | `sdk/rust/src/adversarial.rs` | 8 -> 10 (+2) | **The P7 stale-translation test** (permitted module, 18.1). `Region`, a run of pages that can only be built from a successful `AllocMem`, with `stamp` (one `write_volatile` per 32-bit word) and `first_not` (one `read_volatile` per word). Sound because the constructor is the only way to make one: the pages are mapped, writable, private to the task, page-aligned, and no Rust reference points into them. It lets the `probe` service stay `unsafe`-free while P7 stamps a writer's pages and has a checker given the same addresses read them. |
+
+## 2026-10-11 - the NET_DEVICE wrappers removed (backlog/21 step 2)
+
+No port has an in-kernel network device, and nothing has been granted NET_DEVICE since 2026-09-13, so
+the SDK's three wrappers for syscalls 42-44 had no caller anywhere in the tree.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 80 -> 77 (-3) | **shrank**: the `unsafe { raw_syscall(42 / 43 / 44, ..) }` call sites went with `net_frame_tx`, `net_frame_rx` and `net_info`. `SDK_GRANDFATHERED` in `scripts/unsafe_check.py` is lowered to 77 to lock it in. The syscalls stay in the kernel for now; removing them is a kernel change and the entry's last step. |
 
 ## 2026-10-10 - the spawn-by-name syscalls retired; EHCI INTx follows its driver (backlog/80 K14, K17)
 
