@@ -55,6 +55,10 @@ jobs:
           # two independent stamps of the same fact), so an artefact built from a later
           # commit would contradict its own release notes.
           ref: ${{ github.event.inputs.tag || github.ref }}
+          # The whole history, as build.yml has: port_scope_check.py diffs against the merge base
+          # with main and, since backlog/80 T2, reports NOT RUN and fails on a shallow clone rather
+          # than passing over a tree it never checked. v0.25.0's first tag run failed on exactly that.
+          fetch-depth: 0
 
       - name: Resolve the version and commit under build
         id: v
@@ -63,7 +67,7 @@ jobs:
           echo "tag=$TAG"                          >> "$GITHUB_OUTPUT"
           # --short=8, MATCHING THE STAMPERS. A bare `--short` auto-sizes to the shortest
           # unambiguous prefix, so the width follows the CLONE rather than the commit: this
-          # runner checks out at fetch-depth 1 and gets 7; a full local clone gets 8. The verify
+          # runner checked out at fetch-depth 1 and got 7; a full local clone gets 8. The verify
           # step below greps this value INSIDE each image, so a 7-character value checked 7 of
           # the 8 characters the binaries actually carry - it passed only because a prefix
           # matches a prefix. Same width on both sides, or the gate is weaker than it reads.
