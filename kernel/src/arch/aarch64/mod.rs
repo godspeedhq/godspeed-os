@@ -1157,6 +1157,9 @@ pub(crate) fn put_str(s: &[u8]) {
     for &b in s {
         put_byte(b);
     }
+    // The EL0 fault report is written through here with IRQs masked; this is how a kill waiting on
+    // this core knows it is printing rather than wedged (`note_output_progress`, backlog/48).
+    crate::task::scheduler::note_output_progress();
     #[cfg(feature = "pi4")]
     release_serial(claim);
     // Serial first, then the display: serial is the source of truth, and a mirror that ran first would

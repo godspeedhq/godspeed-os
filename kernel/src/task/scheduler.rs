@@ -576,6 +576,9 @@ static WEDGE_PANICKED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// killer waits for either. Cleared on re-entry to the scheduler, which is the first moment the core
 /// is provably off the old stack and out of the old address space.
 static CORE_LEAVING: PerCore<CachePaddedU64> = PerCore::new();
+/// Kernel output each core has written with interrupts off, the kill-path wait's second sign of life.
+/// See `note_output_progress`.
+static CORE_OUTPUT: PerCore<CachePaddedU64> = PerCore::new();
 
 static CORE_LAST_TICK_TSC: PerCore<CachePaddedU64> = PerCore::new();
 /// This core's interrupt count and idle-halt count AT its last progress stamp (`CORE_LAST_TICK_TSC`).
@@ -751,6 +754,7 @@ pub fn init_arenas(n: usize) {
     CORE_IRQS_AT_STAMP.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_HALTS_AT_STAMP.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LEAVING.init_with(n, |_| CachePaddedU64(AtomicU64::new(IDLE as u64)));
+    CORE_OUTPUT.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_IDLE_HALTS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_RR_SLOT.init_with(n, |_| AtomicUsize::new(0));
     CORE_WAKE_HINT.init_with(n, |_| AtomicUsize::new(MAX_TASKS));
@@ -778,6 +782,27 @@ pub fn current_core_id() -> usize {
 
 /// Return the calling core's ID (0-based).
 pub fn current_core() -> usize { current_core_id() }
+
+/// Count one piece of kernel output written by the calling core, for the kill-path wait.
+///
+/// That wait decides whether a core that has not released a slot is slow or wedged by watching its
+/// interrupt tally, and a core printing a long report with interrupts masked moves no tally. An AArch64
+/// EL0 fault report is that case: it goes out on the raw UART from the exception handler, IRQs off, and
+/// on the Pi 4 it takes about 2.6 s against a 2.5 s window. Three times in two chaos runs a kill of the
+/// faulting task abandoned its slot while that core was still printing the report and said the core
+/// was "wedged" (`backlog/48`). A core writing output is executing, so the wait counts this as progress
+/// too. Still bounded by `MAX_WAIT_EXTENSIONS`: a core that prints forever without scheduling is
+/// abandoned after the last window, as before.
+///
+/// Safe to call from any context: a relaxed add on the caller's own slot, and nothing before the
+/// per-core arenas exist or on a core index outside them.
+pub fn note_output_progress() {
+    if !CORE_OUTPUT.initialised() { return; }
+    let c = current_core_id();
+    if c < crate::smp::percpu::num_cores() {
+        CORE_OUTPUT.get(c).0.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 // SMP spinlock for the task-slot table - concurrent spawns on different cores
 // (e.g. supervisor on Core 0 and a prop-p2 respawn on Core 3) both scan
@@ -2769,6 +2794,9 @@ pub fn kill_task_by_slot(slot: usize) {
                 // longer, not to declare it wedged. `core_irq_debug` is the same seam member the
                 // liveness watchdog reads.
                 let (mut irqs_at_window, _) = crate::arch::imp::core_irq_debug(cid as u32);
+                // And its OUTPUT tally: a core printing a fault report with interrupts masked moves no
+                // interrupt count but is plainly running (`note_output_progress`).
+                let mut output_at_window = CORE_OUTPUT.get(cid).0.load(Ordering::Relaxed);
                 let mut extensions: u32 = 0;
                 let mut spins: u32 = 0;
                 // Test-only, decided ONCE per cross-core wait and NOT dependent on the race it
@@ -2802,7 +2830,9 @@ pub fn kill_task_by_slot(slot: usize) {
 
                     if forced || (budget > 0 && crate::arch::imp::read_cycle_counter().wrapping_sub(t0) > budget) {
                         let (irqs_now, last_src) = crate::arch::imp::core_irq_debug(cid as u32);
-                        if !forced && irqs_now != irqs_at_window && extensions < MAX_WAIT_EXTENSIONS {
+                        let output_now = CORE_OUTPUT.get(cid).0.load(Ordering::Relaxed);
+                        let progressing = irqs_now != irqs_at_window || output_now != output_at_window;
+                        if !forced && progressing && extensions < MAX_WAIT_EXTENSIONS {
                             // ALIVE AND SLOW. It has taken interrupts inside this window, so it is
                             // running - it simply has not reached a scheduling point yet. Open a fresh
                             // window rather than condemning it. Bounded by MAX_WAIT_EXTENSIONS so this
@@ -2813,11 +2843,12 @@ pub fn kill_task_by_slot(slot: usize) {
                             // them. Bounded by MAX_WAIT_EXTENSIONS, and silent whenever the first
                             // window suffices, which is nearly always.
                             crate::kprintln!(
-                                "kill: waiting longer for core {} to release slot {} - it IS progressing (irqs {}->{}), window {} of {}",
-                                cid, slot, irqs_at_window, irqs_now,
+                                "kill: waiting longer for core {} to release slot {} - it IS progressing (irqs {}->{}, output {}->{}), window {} of {}",
+                                cid, slot, irqs_at_window, irqs_now, output_at_window, output_now,
                                 extensions + 2, MAX_WAIT_EXTENSIONS + 1,
                             );
                             irqs_at_window = irqs_now;
+                            output_at_window = output_now;
                             t0 = crate::arch::imp::read_cycle_counter();
                             extensions += 1;
                             continue;
@@ -2842,15 +2873,15 @@ pub fn kill_task_by_slot(slot: usize) {
                         // not say - whether that core was taking interrupts at all, so a reader can
                         // tell a wedged core from a slow one without re-deriving it.
                         crate::kprintln!(
-                            "kill: ABANDONED slot {} - core {} still using it after {} ticks x{} window(s) (CORE_CURRENT={}, CORE_LEAVING={}, its irqs {}->{} last_src={}). {}. The task is Dead and unreachable; its frames are LEAKED and the slot stays visible in `status`. The machine continues - a kill that cannot finish fails the kill, not the kernel.",
+                            "kill: ABANDONED slot {} - core {} still using it after {} ticks x{} window(s) (CORE_CURRENT={}, CORE_LEAVING={}, its irqs {}->{} last_src={}, output {}->{}). {}. The task is Dead and unreachable; its frames are LEAKED and the slot stays visible in `status`. The machine continues - a kill that cannot finish fails the kill, not the kernel.",
                             slot, cid, budget, extensions + 1,
                             CORE_CURRENT.get(cid).load(Ordering::SeqCst),
                             CORE_LEAVING.get(cid).0.load(Ordering::SeqCst),
-                            irqs_at_window, irqs_now, last_src,
-                            if irqs_now == irqs_at_window {
-                                "That core took NO interrupts in the last window, so it is wedged rather than slow"
+                            irqs_at_window, irqs_now, last_src, output_at_window, output_now,
+                            if !progressing {
+                                "That core took NO interrupts and wrote no output in the last window, so it is wedged rather than slow"
                             } else {
-                                "That core is still taking interrupts, so it is alive but never reached a scheduling point"
+                                "That core is still taking interrupts or writing output, so it is alive but never reached a scheduling point"
                             },
                         );
                         return;
