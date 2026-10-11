@@ -374,3 +374,21 @@ window can be shorter than something the kernel does on purpose. The unexercised
 **A third firing, same shape (Pi 4, 2026-10-11, image `9d0f8e16`).** The next 1000-round run on the Pi 4
 logged one `kill: ABANDONED slot 12`, 4 s into the storm, again `pwm-audio` on core 2 and again spliced
 into that service's own EL0 fault report. Three firings, three fault reports outlasting the window.
+
+**Fixed, and seen working (Pi 4, 2026-10-11, image `9a873348` with `1df56716`).** Per the operator, the
+wait now counts kernel output as progress beside interrupts (`note_output_progress`, bumped by aarch64
+`put_str`, which the EL0 fault report is written through). The next 1000-round run - 7420 kills, kernel
+alive, no liveness report, `selfcheck` 536/0 - abandoned nothing, and twice took the path that had never
+been watched working outside a forced probe:
+
+```
+kill: waiting longer for core 2 to release slot 12 - it IS progressing (irqs 1348968->1348968, output 119->368), window 2 of 5
+kill: waiting longer for core 2 to release slot 12 - it IS progressing (irqs 1392544->1392544, output 492->741), window 2 of 5
+```
+
+Both are `pwm-audio` on core 2, printing its own fault report: no interrupts in the window, 249 pieces of
+output, and the kill completed in the second window (`kill_task: slot=12 'pwm-audio' freed 79 frames`).
+`mem` read 13004 KiB used afterwards against 13000 KiB at the start of the previous run, so no slot leaked.
+The extension path's "unexercised" row is closed by this: it has now fired for real, for the reason it
+exists, and ended the way it should.
+
