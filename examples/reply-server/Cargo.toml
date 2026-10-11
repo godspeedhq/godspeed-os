@@ -1,5 +1,6 @@
 [package]
 name = "reply-server"
+description = "Example: answers each request on the reply capability it carries"
 version = "0.1.0"
 edition = "2021"
 

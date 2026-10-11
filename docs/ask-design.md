@@ -1,6 +1,8 @@
 # ask - Assisted System Knowledge (design, not built)
 
-> **Status: v0.1 BUILT on `feat/ask`, 2026-10-11, QEMU-verified only.** Proposed by the operator on
+> **Status: v0.1 BUILT on `feat/ask`, 2026-10-11, QEMU-verified only.** Since then: how a service ended
+> (the kernel's death notice, 6), "what is <service>?" from each crate's own `description`, and "what can
+> <service> do?" / "who can reboot?" from the capabilities the kernel holds for each task. Proposed by the operator on
 > 2026-10-10. The command surface moved to `utilities/60_ask.md` when the shell began answering it; this
 > stays the design. Three things changed while building it, each recorded where it applies: the general
 > question "why did <service> <event>" beside the four (section 4), the question always in quotes

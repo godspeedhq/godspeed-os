@@ -1,6 +1,7 @@
 [package]
 name = "mem-pressure"
 version = "0.1.0"
+description = "Test service: allocates memory up to its limit to exercise the allocator"
 edition = "2021"
 
 [[bin]]

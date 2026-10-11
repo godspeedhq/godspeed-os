@@ -14,6 +14,8 @@
 use godspeed_sdk::service_context::ServiceContext;
 
 pub use godspeed_sdk::service_context::{ClockSource, Datetime};
+/// The kernel's fixed authorities: (resource id, contract name, what it allows) - for naming a capability.
+pub use godspeed_sdk::service_context::AUTHORITIES;
 
 /// Give up the rest of this quantum.
 ///

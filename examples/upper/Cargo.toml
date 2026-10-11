@@ -1,5 +1,6 @@
 [package]
 name = "upper"
+description = "Example: a pipe stage that upper-cases what it receives"
 version = "0.1.0"
 edition = "2021"
 

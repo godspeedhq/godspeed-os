@@ -1,5 +1,6 @@
 [package]
 name = "time"
+description = "The wall clock: the hardware clock, the network time and the saved floor"
 version = "0.1.0"
 edition = "2021"
 

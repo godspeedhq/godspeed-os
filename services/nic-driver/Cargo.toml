@@ -1,6 +1,7 @@
 [package]
 name = "nic-driver"
 version = "0.1.0"
+description = "The link front end: the ethernet driver, and the bridge to the radio when the cable is out"
 edition = "2021"
 
 [[bin]]

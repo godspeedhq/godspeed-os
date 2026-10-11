@@ -19,7 +19,9 @@ one must not hold `kill`, so the shell - which started it and holds `kill` - end
   what `ask` is willing to claim; the tests are the contract.
 - `src/main.rs` - asking the system: the task table (INTROSPECT), the supervisor's read-only questions
   (`supcmd::MANAGED`, `supcmd::EVENTS`, `supcmd::DEATH`), `fs`'s drive report (`gs::fs::Fs::drive`) and each running radio
-  driver's status (tagged `wire::OP_STATUS`), each bounded. Then the answer as records to `send_peers[0]`.
+  driver's status (tagged `wire::OP_STATUS`), each task's capabilities (INTROSPECT, named from
+  `gs::task::AUTHORITIES`, the table the shell's `caps` uses), each bounded. What a service IS comes from
+  its crate's own `description`, read by `build.rs` as the glossary is. Then the answer as records to `send_peers[0]`.
 
 ## The rules it keeps
 

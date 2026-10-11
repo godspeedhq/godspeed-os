@@ -1,6 +1,7 @@
 [package]
 name = "recorder"
 version = "0.1.0"
+description = "Writes the events log to a file for `events persist`"
 edition = "2021"
 
 [[bin]]

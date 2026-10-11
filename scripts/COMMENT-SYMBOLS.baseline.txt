@@ -579,7 +579,6 @@ EFUSE_TEST                         # Realtek register names by their datasheet n
 SYS_CLKR                           # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
 SYS_FUNC                           # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
 rtl8723a_cck_rssi                  # Linux rtl8xxxu (8723a.c), cited by wifi-usb for the CCK signal (R3b) - external, 26.14
-sort_unstable                      # Rust core slice method, cited by the shell for its ordering - external, 26.14
 atomic64_inc_return                # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 BSS_CHANGED_BSSID                  # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 bss_info_changed                   # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14

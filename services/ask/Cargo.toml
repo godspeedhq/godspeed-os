@@ -1,6 +1,7 @@
 [package]
 name = "ask"
 version = "0.1.0"
+description = "Answers one question about this machine from the services that know, then ends"
 edition = "2021"
 
 [[bin]]

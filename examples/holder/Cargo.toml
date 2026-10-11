@@ -1,5 +1,6 @@
 [package]
 name = "holder"
+description = "Example: receives a read-only resource capability and proves it cannot be forged, widened or kept after revoke"
 version = "0.1.0"
 edition = "2021"
 

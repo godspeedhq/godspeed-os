@@ -1,6 +1,7 @@
 [package]
 name = "block-driver"
 version = "0.1.0"
+description = "Block storage: serves sectors from the AHCI disk or a USB host's mass storage"
 edition = "2021"
 
 [[bin]]

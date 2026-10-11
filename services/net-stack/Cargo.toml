@@ -1,6 +1,7 @@
 [package]
 name = "net-stack"
 version = "0.1.0"
+description = "The network stack: ARP, ICMP, DHCP, DNS, UDP and TCP"
 edition = "2021"
 
 [[bin]]

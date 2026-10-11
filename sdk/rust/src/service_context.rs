@@ -872,6 +872,34 @@ pub struct CapInfo {
     pub rights: u8,
 }
 
+/// THE KERNEL'S FIXED AUTHORITIES, by resource id: (id, the name a contract uses, what it lets a task do).
+///
+/// One table for everything that names them - the shell's `caps` and `ask "who can reboot?"` - so what a
+/// service is observed to HOLD reads the same everywhere, and in the words its contract DECLARES
+/// (`pci_cfg = true`). The ids are `kernel/src/capability/mod.rs`'s `*_RESOURCE`; anything above 18 is an
+/// IPC endpoint. A resource added there and not here would be shown as an endpoint, which names the
+/// wrong kind of thing (26.9), so the two move together.
+pub const AUTHORITIES: &[(u64, &str, &str)] = &[
+    (1, "log_write", "write to the kernel log and serial"),
+    (2, "spawn", "start services"),
+    (3, "console_read", "read the keyboard"),
+    (4, "console_push", "type into the console as if at the keyboard"),
+    (5, "introspect", "see every task, its capabilities and the kernel's counters"),
+    (6, "service_control", "kill and restart services"),
+    (7, "resource_mint", "mint capabilities for resources it owns, as fs does for files"),
+    (8, "reboot", "reboot the machine"),
+    (9, "acquire_any", "reach any service by name, not only its declared peers"),
+    (10, "net_device", "move raw ethernet frames on the ARM USB network device"),
+    (11, "gpio_device", "drive the GPIO pins"),
+    (12, "usb_disk", "read and write any sector of the ARM USB disk"),
+    (13, "set_clock", "set the wall clock (granted to nothing now)"),
+    (14, "fire_irq", "inject a test interrupt"),
+    (15, "image_spawn", "start a program from an image it supplies"),
+    (16, "pci_cfg", "read and write PCI configuration space"),
+    (17, "device_power", "cut and restore the power of the device it was granted"),
+    (18, "cpu_clock", "set the Arm clock"),
+];
+
 // ---------------------------------------------------------------------------
 // AllocError - returned by ServiceContext::alloc_mem.
 // ---------------------------------------------------------------------------

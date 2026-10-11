@@ -13790,28 +13790,12 @@ fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
     // and what it is observed to HOLD read the same and can be compared directly.
     //
     // Ids 1-18 are the kernel's fixed set (`capability::*_RESOURCE`); anything above is a real
-    // endpoint, and only those reach the fallback. Adding a resource without adding it here puts it
-    // straight back into the lie, so keep the two in step.
-    match id {
-        1  => write_bytes(buf, &mut p, b"log_write"),
-        2  => write_bytes(buf, &mut p, b"spawn"),
-        3  => write_bytes(buf, &mut p, b"console_read"),
-        4  => write_bytes(buf, &mut p, b"console_push"),
-        5  => write_bytes(buf, &mut p, b"introspect"),
-        6  => write_bytes(buf, &mut p, b"service_control"),
-        7  => write_bytes(buf, &mut p, b"resource_mint"),
-        8  => write_bytes(buf, &mut p, b"reboot"),
-        9  => write_bytes(buf, &mut p, b"acquire_any"),
-        10 => write_bytes(buf, &mut p, b"net_device"),
-        11 => write_bytes(buf, &mut p, b"gpio_device"),
-        12 => write_bytes(buf, &mut p, b"usb_disk"),
-        13 => write_bytes(buf, &mut p, b"set_clock"),
-        14 => write_bytes(buf, &mut p, b"fire_irq"),
-        15 => write_bytes(buf, &mut p, b"image_spawn"),
-        16 => write_bytes(buf, &mut p, b"pci_cfg"),
-        17 => write_bytes(buf, &mut p, b"device_power"),
-        18 => write_bytes(buf, &mut p, b"cpu_clock"),
-        other => { write_bytes(buf, &mut p, b"endpoint#"); write_u32(buf, &mut p, other as u32); }
+    // endpoint, and only those reach the fallback. Adding a resource without adding it to
+    // `AUTHORITIES` puts it straight back into the lie, so keep the two in step.
+    // The names are `gs::task::AUTHORITIES`, the one table `ask "who can reboot?"` reads too.
+    match gs::task::AUTHORITIES.iter().find(|(r, _, _)| *r == id) {
+        Some((_, name, _)) => write_bytes(buf, &mut p, name.as_bytes()),
+        None => { write_bytes(buf, &mut p, b"endpoint#"); write_u32(buf, &mut p, id as u32); }
     }
     p
 }

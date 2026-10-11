@@ -938,6 +938,17 @@ pub fn run(image_path: &Path, smp: u32) {
         let curly = ask("ask \u{201c}tell me a joke\u{201d}\r".as_bytes(), 40);
         check!(curly.contains("A JOKE") && !curly.contains("rebooting"),
                "ask: curly quotes quote - and a UTF-8 character is never read as the reboot signal");
+        // What a service IS, from its own crate's description; what it CAN do and who can do a thing,
+        // from the capabilities the kernel holds for each task.
+        let what = ask(b"ask \"what is fs?\"\r", 40);
+        check!(what.contains("`fs`: The filesystem") && what.contains("the supervisor keeps `fs` running"),
+               "ask: \"what is fs?\" answers from fs's own description and the supervisor");
+        let can = ask(b"ask evidence \"what can fs do?\"\r", 40);
+        check!(can.contains("`fs` HOLDS") && can.contains("`resource_mint`") && can.contains("block-driver"),
+               "ask: \"what can fs do?\" lists its authorities and the services it can send to");
+        let who = ask(b"ask \"who can reboot?\"\r", 40);
+        check!(who.contains("CAN REBOOT THE MACHINE") && who.contains("`shell` holds `reboot`"),
+               "ask: \"who can reboot?\" names the tasks holding the authority");
         let help = ask(b"ask help\r", 10);
         check!(help.contains("why did <service> <event>"), "ask help: lists the general question");
         let after = ask(b"observe now\r", 30);

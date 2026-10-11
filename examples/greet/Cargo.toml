@@ -1,5 +1,6 @@
 [package]
 name = "greet"
+description = "Example: a pipe producer - emits a few lines into a pipe, as in `greet | upper`"
 version = "0.1.0"
 edition = "2021"
 

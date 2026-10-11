@@ -110,7 +110,9 @@ Pong and ping start communicating within ~10 s of boot. `"supervisor: ready"` ap
 ## Adding a new service
 
 1. Copy `examples/00-hello` - `osdev new` is not implemented (CLAUDE.md 17).
-2. Write `contracts/<name>.toml` - declare only what the service actually needs.
+2. Write `contracts/<name>.toml` - declare only what the service actually needs - and give the crate a
+   one-line `description` in its `Cargo.toml`. It is the one place a service says what it is: `ask "what is
+   <name>?"` answers from it, and `services/ask/build.rs` fails the build for a service without one.
 3. Implement `service_main(ctx: ServiceContext)` on `gs` (`stdlib/rust`) - `scripts/one_way_check.py`
    holds a new crate at zero raw SDK calls. Authority comes from the spawn request, not from anything
    the service asks for at runtime (CLAUDE.md 13.6).

@@ -1,6 +1,7 @@
 [package]
 name = "power"
 version = "0.1.0"
+description = "Power policy: leases the Arm clock to services that need the cores fast"
 edition = "2021"
 
 [[bin]]

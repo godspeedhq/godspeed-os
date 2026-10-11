@@ -1,5 +1,6 @@
 [package]
 name = "asker"
+description = "Example: a client that asks reply-server a question and waits for the answer"
 version = "0.1.0"
 edition = "2021"
 

@@ -1,5 +1,6 @@
 [package]
 name = "driver-skeleton"
+description = "Example: the shape of a device driver on the standard library"
 version = "0.1.0"
 edition = "2021"
 

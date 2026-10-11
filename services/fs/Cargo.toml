@@ -1,6 +1,7 @@
 [package]
 name = "fs"
 version = "0.1.0"
+description = "The filesystem: files and directories on the disk, crash-consistent through its journal"
 edition = "2021"
 
 [[bin]]

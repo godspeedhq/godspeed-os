@@ -1,6 +1,7 @@
 [package]
 name = "chaos"
 version = "0.1.0"
+description = "Fault injection: kills and storms services to prove they recover"
 edition = "2021"
 
 [[bin]]

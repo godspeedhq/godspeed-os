@@ -1,5 +1,6 @@
 [package]
 name = "ping"
+description = "Example: sends a message to pong every second, across cores"
 version = "0.1.0"
 edition = "2021"
 
