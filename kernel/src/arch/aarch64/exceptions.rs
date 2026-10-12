@@ -1230,8 +1230,9 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             0b100000 | 0b100001 => (F_INSTRUCTION, far),
             0b100100 | 0b100101 => (F_MEMORY, far),
             0b000000 | 0b001110 => (F_ILLEGAL, f.elr),
-            0b100010 => (F_ALIGNMENT, f.elr),
-            0b100110 => (F_ALIGNMENT, far),
+            // PC and SP alignment: the architecture leaves FAR UNKNOWN for an SP alignment fault, so
+            // both name the instruction that took it rather than an address that may be garbage.
+            0b100010 | 0b100110 => (F_ALIGNMENT, f.elr),
             _ => (F_OTHER, f.elr),
         };
         crate::task::kill_current(kind, addr);

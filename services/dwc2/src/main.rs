@@ -181,7 +181,9 @@ fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
 /// client waited out its whole deadline against a clean log (backlog/80 D6). Each is answered here as
 /// `dispatch` answers it with nothing bound, routed by op the same way: the supervisor's report ask
 /// with an absent device, a radio op `ST_NO_DEVICE` (an `OP_SYNC` only gives its capability back, as
-/// `rtl::serve` does), a net op the empty `[0]`, and a block op the one-byte error.
+/// `rtl::serve` does), a net op the empty `[0]`, and a block op `STATUS_NO_DISK` - no disk can be bound to
+/// a host with no hardware, and a flush answered `STATUS_ERR` would read as the drive refusing it
+/// (`backlog/57`).
 fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: &mut bool) {
     let p = msg.payload_bytes();
     let Some(&op) = p.first() else { return };
@@ -204,7 +206,7 @@ fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: 
     } else if op >= net::OP_NET_INFO {
         let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[0u8]));
     } else {
-        let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
+        let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_NO_DISK]));
     }
 }
 
@@ -698,22 +700,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // budget is spent before the first look. Requests are then served by the timed wait at
                 // the bottom of the pass, ONE per pass and only on a pass that served nothing else.
                 while !t_pass.passed(&ctx, Budget::ms(PASS_BUDGET_MS)) {
+                    // THE COUNT BOUND IS TESTED BEFORE TAKING, like the time bound above it. Testing it
+                    // after `try_recv` meant answering a request it had already CONSUMED - first by
+                    // dropping it (its owner waited forever), then with `answer_no_disk`'s
+                    // `STATUS_ERR`, which on a flush reads to `fs` as the DRIVE refusing the barrier
+                    // while a disk was bound and no device had been asked (`backlog/57`). Declining to
+                    // take leaves the request queued for the next pass, which is true.
+                    if drained >= MSG_DRAIN_MAX {
+                        ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");
+                        break;
+                    }
                     let msg = match gs::ipc::try_recv(&ctx) {
                         Some(m) => m,
                         None => break,
                     };
                     drained += 1;
-                    if drained >= MSG_DRAIN_MAX {
-                        // ANSWER THIS ONE BEFORE BREAKING. `try_recv` above already CONSUMED it, so
-                        // breaking here retired a request and threw it away - and its owner
-                        // (block-driver, then fs, then the shell) waited forever for a reply that was
-                        // never coming. The no-disk drain twenty lines up gets this right; this arm
-                        // was the storm bound, and a storm is exactly when a dropped reply is least
-                        // likely to be noticed.
-                        answer_no_disk(&ctx, &mut capless);
-                        ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");
-                        break;
-                    }
                     // THE INTERRUPT, HANDLED WHERE THE HARDWARE IS.
                     //
                     // This arm existed only in the fallback loop below - the one entered when there
@@ -1247,12 +1248,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut first = gs::ipc::recv_within_ms(&ctx, REPORT_MS);
 
         let mut drained = 0u32;
-        while let Some(m) = first.take().or_else(|| gs::ipc::try_recv(&ctx)) {
-            drained += 1;
+        loop {
+            // Bounded BEFORE taking: a message taken and then dropped at the bound took its reply
+            // capability with it, and its sender waited out its whole deadline (the block drain above).
             if drained >= MSG_DRAIN_MAX {
                 ctx.log("dwc2-svc: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
                 break;
             }
+            let Some(m) = first.take().or_else(|| gs::ipc::try_recv(&ctx)) else { break };
+            drained += 1;
             msgs = msgs.wrapping_add(1);
             let p = m.payload_bytes();
             if p.len() == 1 && p[0] == USB_VECTOR {

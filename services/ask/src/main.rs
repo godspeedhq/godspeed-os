@@ -31,7 +31,7 @@ include!(concat!(env!("OUT_DIR"), "/services.rs"));
 use godspeed::{self as gs, ipc::Message, record::{RecordSink, Table, Value}, ServiceContext};
 use godspeed_sdk::service_context::supcmd;
 use godspeed_wifi::wire;
-use know::{Answer, Caps, Chain, Death, Drive, Ev, Events, Facts, Got, Kind, NetStatus, Radio, RadioFact, Reading, Task};
+use know::{Answer, Caps, Chain, Death, Drive, Ev, Events, Facts, Got, Holders, Kind, NetStatus, Radio, RadioFact, Reading, Task};
 
 // The event codes `know` restates must be the supervisor's. A drifted copy would misname every event.
 const _: () = assert!(know::EV_RESTARTED == supcmd::EV_RESTARTED && know::EV_RESTART_FAILED == supcmd::EV_RESTART_FAILED
@@ -57,8 +57,9 @@ const ASK_FS_SECS: i64 = 8;
 /// The radio drivers, by service name. A running one is asked; none running is a fact in itself.
 const RADIOS: [&str; 2] = ["wifi-driver", "wifi-usb"];
 /// The USB hosts a disk can be behind. Which one `block-driver` is behind is read from its capabilities,
-/// never assumed from the board.
-const STORAGE_HOSTS: [&str; 3] = ["xhci", "dwc2", "ehci"];
+/// never assumed from the board. Only the hosts some board's `block-driver` peers with (`board::STORAGE_PEERS`)
+/// and `ask` is given (`board::ASK_PEERS`): `ehci` is neither, so it is not asked (`backlog/82` A6).
+const STORAGE_HOSTS: [&str; 2] = ["xhci", "dwc2"];
 /// The block protocol's capacity request, the same op number on every link (`OP_CAPACITY`).
 const OP_CAPACITY: u8 = 3;
 /// End of a stream, as every pipe stage uses it.
@@ -479,19 +480,24 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
         _ => Got::Absent,
     };
     // WHO CAN: every running task holding the authority (this program left out; it is not the system).
+    // A table that comes back empty was not read - every task holds at least its own endpoint - so it is
+    // listed apart rather than counted as holding nothing (as `capabilities` above treats it).
     let mut held = [""; TASKS_MAX];
-    let mut nh = 0usize;
+    let mut unread = [""; TASKS_MAX];
+    let (mut nh, mut nu) = (0usize, 0usize);
     let holders = match kind {
         Kind::WhoCan(rid) if rid != 0 => {
             for i in 0..tt.n {
                 let mut c = [godspeed_sdk::CapInfo::default(); 64];
                 let k = ctx.task_caps(tt.slots[i], &mut c);
-                if c[..k].iter().any(|x| x.resource_id == rid) && nh < held.len() {
+                if k == 0 {
+                    if nu < unread.len() { unread[nu] = tt.name(i); nu += 1; }
+                } else if c[..k].iter().any(|x| x.resource_id == rid) && nh < held.len() {
                     held[nh] = tt.name(i);
                     nh += 1;
                 }
             }
-            Got::Yes(&held[..nh])
+            Got::Yes(Holders { held: &held[..nh], unread: &unread[..nu] })
         }
         _ => Got::Absent,
     };

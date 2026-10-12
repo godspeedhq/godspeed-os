@@ -141,12 +141,18 @@ drive supports a cache flush.
 names. The capacity path is unchanged: `xhciblk::sectors_now` already reads any one-byte reply as "no
 disk bound". AHCI and SDHCI drive their device directly and cannot be in this position.
 
-**Two `dwc2` paths still answer `STATUS_ERR`, found by the 2026-10-12 comment audit and not yet
-fixed.** `answer_ungranted` (a `dwc2` granted no hardware) answers every block op `STATUS_ERR`, and the
+**Two `dwc2` paths answered `STATUS_ERR`, found by the 2026-10-12 comment audit (fixed the same day,
+below).** `answer_ungranted` (a `dwc2` granted no hardware) answers every block op `STATUS_ERR`, and the
 bounded drain in the main loop answers the request it consumed at `MSG_DRAIN_MAX` with `answer_no_disk`'s
 `STATUS_ERR` while a disk IS bound - so a flush caught there would still read as `Refused` though no
 device was asked. The second is the one that can happen under a storm; both want `STATUS_NO_DISK`, or
 for the drain, a status that says "not attempted".
+
+**Both fixed 2026-10-12, in code after that audit.** `answer_ungranted` answers a block op `STATUS_NO_DISK`
+(a host with no hardware has no disk). The drain no longer answers at its bound at all: the bound is tested
+BEFORE `try_recv`, as the time bound beside it already was, so the request it would have refused stays
+queued for the next pass and is served by the device. The fallback loop had the same shape - it took a
+message at its bound and dropped it unanswered - and is bounded before taking too.
 
 **What was verified, and what was not.** Every board image builds; on x86 `osdev test files` 249/0 and
 `jobs` 60/0; on the Pi 2 in QEMU a write to a USB stick flushes `Durable` as before. The case itself was

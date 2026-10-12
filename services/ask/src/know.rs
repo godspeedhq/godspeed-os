@@ -15,14 +15,8 @@
 use core::fmt::Write;
 
 // ---------------------------------------------------------------------------------------------
-// Understanding the question (design section 4). Deterministic, versioned, small, no model.
+// Understanding the question (design section 4). Deterministic, small, no model; pinned by the tests below.
 // ---------------------------------------------------------------------------------------------
-
-/// The vocabulary's version, meant to be bumped when a word is added or a reading changes. Nothing reads
-/// it yet, and it is still 1 although words have been added since (the network, what is, what can, who
-/// can, what to say, the eggs). What actually pins the vocabulary is the tests below: every question an
-/// earlier reading understood stays understood.
-pub const VOCABULARY: u32 = 1;
 
 /// The question kinds (design sections 3 and 4): the four of v0.1, the general "why did <service> <event>"
 /// beside them, and those added since - the network, what a service is and what it can do, who holds an
@@ -675,10 +669,20 @@ pub struct Facts<'a> {
     pub about: Option<&'a str>,
     /// The capabilities of the service asked about, for "what can it do?".
     pub caps: Got<Caps<'a>>,
-    /// The tasks that hold the authority asked about, for "who can?".
-    pub holders: Got<&'a [&'a str]>,
+    /// The tasks that hold the authority asked about, for "who can?", and those whose table could not be read.
+    pub holders: Got<Holders<'a>>,
     /// The kernel's fixed authorities: (resource id, name, what it allows) - `godspeed_sdk::service_context::AUTHORITIES`.
     pub authorities: &'a [(u64, &'a str, &'a str)],
+}
+
+/// Who holds one authority. A task whose capability table could not be read is listed apart, because
+/// "holds nothing" and "could not be asked" are different facts (`backlog/82` A2).
+#[derive(Clone, Copy)]
+pub struct Holders<'a> {
+    /// Running tasks that hold it.
+    pub held: &'a [&'a str],
+    /// Running tasks whose capability table came back empty - unread, not empty.
+    pub unread: &'a [&'a str],
 }
 
 /// What one task's capabilities give it, sorted by the kernel's resource ids.
@@ -1077,17 +1081,23 @@ fn who_can(rid: u64, f: &Facts, a: &mut Answer, v: &mut TextBuf) {
             let _ = write!(v, "UNKNOWN - who holds `{}` could not be read", n);
             return;
         }
-        Got::Absent => &[][..],
+        Got::Absent => Holders { held: &[], unread: &[] },
     };
     a.fact("kernel", format_args!("`{}` lets a task {}", n, m));
-    for h in holders {
+    for h in holders.held {
         a.fact("kernel", format_args!("`{}` holds `{}`", h, n));
     }
+    // A table that could not be read is a hole, never "holds nothing" (a hole is never a pass).
+    for u in holders.unread {
+        a.unknown(format_args!("`{}`'s capabilities could not be read, so whether it holds `{}` is not known", u, n));
+    }
     a.note(format_args!("a capability is what a task CAN do, not what it has done; this leaves out `ask` itself"));
-    if holders.is_empty() {
-        let _ = write!(v, "NO RUNNING TASK HOLDS `{}`", n);
-    } else {
-        let _ = write!(v, "{} TASK(S) CAN {} (`{}`)", holders.len(), Upper(m), n);
+    let unread = holders.unread.len();
+    match (holders.held.len(), unread) {
+        (0, 0) => { let _ = write!(v, "NO RUNNING TASK HOLDS `{}`", n); }
+        (0, u) => { let _ = write!(v, "NO TASK THAT COULD BE READ HOLDS `{}` ({} COULD NOT BE READ)", n, u); }
+        (k, 0) => { let _ = write!(v, "{} TASK(S) CAN {} (`{}`)", k, Upper(m), n); }
+        (k, u) => { let _ = write!(v, "AT LEAST {} TASK(S) CAN {} (`{}`; {} COULD NOT BE READ)", k, Upper(m), n, u); }
     }
 }
 
@@ -1134,7 +1144,7 @@ fn health(f: &Facts, a: &mut Answer) -> &'static str {
     if restarted > 0 {
         a.infer("restarted-live", format_args!("a service that restarted and is running again works now, but something made it restart, so the system is DEGRADED"));
         worst = worst.max(Sev::Degraded);
-        a.unknown(format_args!("why each restart happened is not recorded anywhere this can read; a deliberate `kill` restarts a service too"));
+        a.unknown(format_args!("why each restart happened is not asked here, and a deliberate `kill` restarts a service too; `ask \"why did <service> fail?\"` reads how one last ended"));
     }
     match f.drive {
         Got::Yes(d) if d.capacity == 0 => {
@@ -1227,8 +1237,8 @@ fn failed(f: &Facts, a: &mut Answer) -> &'static str {
         }
     }
     if seen + restarted + down > 0 {
-        a.unknown(format_args!("why any of these died is not recorded anywhere this can read"));
-        a.unknown(format_args!("a restart is not proof of a crash: a deliberate `kill` restarts a service too, and the record does not say which"));
+        a.unknown(format_args!("how each of these ended is not asked here; `ask \"why did <service> fail?\"` reads the kernel's notice for one"));
+        a.unknown(format_args!("a restart is not proof of a crash: a deliberate `kill` restarts a service too, and this answer does not say which"));
     }
     if down > 0 { "SOMETHING IS DOWN NOW" }
     else if seen + restarted > 0 { "RESTARTS RECORDED - everything that restarted is running again" }
@@ -1297,7 +1307,7 @@ fn wifi(event: Event, f: &Facts, a: &mut Answer) -> &'static str {
             Got::Absent => {}
         }
         if restarts > 0 {
-            a.unknown(format_args!("why `{}` died is not recorded anywhere this can read", r.driver));
+            a.unknown(format_args!("how `{}` last ended is not asked here; `ask \"why did {} fail?\"` reads it", r.driver, r.driver));
         }
     }
     verdict
@@ -1401,6 +1411,8 @@ fn guide(f: &Facts, a: &mut Answer) -> &'static str {
     a.note(format_args!("ask \"why did <service> <event>?\"  - a service by name; restart, fail, crash or stop"));
     a.note(format_args!("ask \"what is <service>?\" / \"what can <service> do?\"  - what it is, and what it holds"));
     a.note(format_args!("ask \"who can reboot?\"  - the tasks that hold an authority (kill, spawn, type, ...)"));
+    a.note(format_args!("ask \"is the network up?\"  - the address, the lease and the gateway, and what was not tested"));
+    a.note(format_args!("ask \"what is <term>?\"  - a term from the glossary, as in: what is MISCIS?"));
     a.note(format_args!("ask evidence \"<question>\"  - the same answer, every line labelled and its source named"));
     // Suggestions from what is true now, most-restarted first, at most three.
     let mut picked: [Option<&Task>; 3] = [None; 3];
@@ -1589,8 +1601,9 @@ pub fn define(term: &[u8], glossary: &[(&str, &str, &str)], a: &mut Answer) {
 /// What `ask` can answer, for an empty question and one it did not understand. (`ask help` is the shell's
 /// help block, not this.)
 pub fn can_answer(a: &mut Answer) {
-    a.note(format_args!("I can answer questions about: system health, what failed, the WiFi restarting, the filesystem"));
+    a.note(format_args!("I can answer questions about: system health, what failed, the WiFi restarting, the filesystem, the network"));
     a.note(format_args!("and why a service restarted, failed, crashed or stopped - name it, as in: why did fs restart?"));
+    a.note(format_args!("and what a service is, what it can do, and who can do something: what is fs? what can shell do? who can reboot?"));
     a.note(format_args!("ask \"what to say?\" lists them with suggestions from this machine; ask \"what is MISCIS?\" defines a term"));
 }
 
@@ -1815,7 +1828,7 @@ mod tests {
         assert!(a.has(Label::Fact, "trapped at start"));
         assert!(a.has(Label::Fact, "at uptime 70s `wifi-driver` died and was restarted"));
         assert!(a.has(Label::Note, "nothing records that it caused the restart"));
-        assert!(a.has(Label::Unknown, "why `wifi-driver` died is not recorded"));
+        assert!(a.has(Label::Unknown, "how `wifi-driver` last ended is not asked here"));
         // NEVER: "the firmware caused it".
         assert!(!a.any_text("caused the restart because") && !a.any_text("because the firmware"));
     }
@@ -2001,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_chain_names_the_first_link_that_stops() {
+    fn storage_chain_names_the_deepest_link_that_stops() {
         let t = tasks_ok();
         let none = Got::Yes(Drive { capacity: 0, mounted: false, total_blocks: 0, used_blocks: 0, label: "" });
         // QEMU on the Pi 4: block-driver answers 0, and xhci - the host it is behind - is silent.
@@ -2188,17 +2201,25 @@ mod tests {
         let t = tasks_ok();
         let h = ["shell", "supervisor"];
         let f = Facts { now: 100, tick: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &[],
-                        chain: None, net: Got::Absent, death: Got::Absent, about: None, caps: Got::Absent, holders: Got::Yes(&h), authorities: AUTH };
+                        chain: None, net: Got::Absent, death: Got::Absent, about: None, caps: Got::Absent, holders: Got::Yes(Holders { held: &h, unread: &[] }), authorities: AUTH };
         let a = ask(Kind::WhoCan(8), Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"2 TASK(S) CAN REBOOT THE MACHINE (`reboot`)");
         assert!(a.has(Label::Fact, "`shell` holds `reboot`"));
         assert!(a.has(Label::Note, "not what it has done"));
         let none: [&str; 0] = [];
-        let f2 = Facts { holders: Got::Yes(&none), ..f };
+        let f2 = Facts { holders: Got::Yes(Holders { held: &none, unread: &[] }), ..f };
         assert_eq!(verdict(&ask(Kind::WhoCan(6), Event::Unnamed, &f2)), b"NO RUNNING TASK HOLDS `service_control`");
         let b = ask(Kind::WhoCan(0), Event::Unnamed, &f2);
         assert_eq!(verdict(&b), b"WHICH AUTHORITY?");
         assert_eq!(b.status, Status::Ambiguous);
+        // A task whose table could not be read is a hole, not a task that holds nothing.
+        let u = ["net-stack"];
+        let f3 = Facts { holders: Got::Yes(Holders { held: &h, unread: &u }), ..f };
+        let c = ask(Kind::WhoCan(8), Event::Unnamed, &f3);
+        assert_eq!(verdict(&c), b"AT LEAST 2 TASK(S) CAN REBOOT THE MACHINE (`reboot`; 1 COULD NOT BE READ)");
+        assert!(c.has(Label::Unknown, "`net-stack`'s capabilities could not be read"));
+        let f4 = Facts { holders: Got::Yes(Holders { held: &none, unread: &u }), ..f };
+        assert_eq!(verdict(&ask(Kind::WhoCan(8), Event::Unnamed, &f4)), b"NO TASK THAT COULD BE READ HOLDS `reboot` (1 COULD NOT BE READ)");
     }
 
     #[test]

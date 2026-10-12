@@ -123,7 +123,7 @@ before**, not as **why**, unless the source says it caused it.
 ```
 gsh> ask "why did wifi restart?"
 wifi-driver restarted after its previous instance died - the supervisor recorded the restart.
-Why it died is not recorded anywhere this can read.
+How wifi-driver last ended is not asked here; `ask "why did wifi-driver fail?"` reads it.
 ```
 
 ### 3.4 Is the filesystem healthy?
@@ -183,7 +183,7 @@ The order a question is read in, first match wins: the Easter eggs; "who can ...
 ..."; "what is <service>"; a term to define; "what to say"; a request to act; then a named service with
 an event, the network, the WiFi or the filesystem, and health or what failed.
 
-Deterministic, versioned and small. No model.
+Deterministic and small. No model.
 
 ```
 question -> normalise -> look up words -> choose a question kind -> take its target and time -> ask the sources
@@ -204,8 +204,9 @@ gsh> ask "why is my computer sad?"
   ask "what to say?" lists them with suggestions from this machine; ask "what is MISCIS?" defines a term
 ```
 
-The vocabulary is read-only data compiled into the program, versioned apart from the diagnostics, and
-pinned by regression tests: a question that was understood stays understood unless its first reading
+The vocabulary is read-only data compiled into the program, kept apart from the diagnostics, and
+pinned by regression tests rather than a version number (a `VOCABULARY` constant nothing read was removed
+on 2026-10-12, `backlog/82` A4): a question that was understood stays understood unless its first reading
 was wrong. A request to DO something - "restart the wifi driver" - is answered with what `ask` is:
 
 ```
