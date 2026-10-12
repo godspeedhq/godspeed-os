@@ -1449,7 +1449,12 @@ fn guide(f: &Facts, a: &mut Answer) -> &'static str {
     "YOU CAN ASK"
 }
 
-/// Godspeed jokes. Each is about the system, and the punchline is true.
+/// Godspeed jokes, each about the system. A `\n` starts a new line of the same joke - a question and
+/// its punchline, or the turns of an exchange - so no line outgrows `TEXT_MAX`.
+///
+/// The first eight were written with `ask`; the rest are the operator's collection (2026-10-12), in its
+/// sections: MISCIS, capabilities, IPC and scheduling, carnage and recovery, drivers, `ask` itself, other
+/// systems, engineering, puns, and conversations with `ask`.
 const JOKES: &[&str] = &[
     "How many Godspeed services does it take to change a light bulb? None. The bulb holds no capability, so nobody may touch it.",
     "Knock knock. - Who's there? - EndpointDead. - EndpointDead who? - Reacquire me by name and ask again.",
@@ -1461,14 +1466,214 @@ const JOKES: &[&str] = &[
     "Why did the service restart? It lost its capability to cope. The supervisor brought it back anyway.",
     "I would tell you a UDP joke, but I cannot promise net-stack delivers it.",
     "Why do Godspeed services never gossip? Every message needs a SEND right, and the kernel checks.",
+    "Why did Godspeed refuse another kernel feature?\nMISCIS said, \"You're not one of us.\"",
+    "What are Godspeed's six favourite subjects?\nMemory, IPC, Scheduling, Capabilities, Interrupts, and SMP.\nEverything else is extracurricular.",
+    "Why doesn't MISCIS have a seventh member?\nThe kernel couldn't justify its existence.",
+    "Why did the filesystem get kicked out of the kernel?\nIt wasn't part of the family. MISCIS is very particular.",
+    "Why doesn't Godspeed's kernel have trust issues?\nIt has capability issues.",
+    "Why did Memory argue with Scheduling?\nScheduling kept bringing up the past, but Memory had already freed it.",
+    "Why did IPC refuse to gossip?\nIt only communicates through authorised channels.",
+    "Why was SMP late to the meeting?\nEvery core thought another core was handling it.",
+    "Why did Interrupts ruin the party?\nThey kept demanding immediate attention.",
+    "Why doesn't MISCIS accept feature requests?\nIt accepts proofs of necessity.",
+    "What did the kernel say to the network stack?\n\"You're important. Just not important enough to live here.\"",
+    "Why is Godspeed's kernel so small?\nIt delegates everything except responsibility.",
+    "Why did MISCIS reject the coffee machine?\nNo capability to brew.",
+    "Why did the scheduler become a referee?\nIt was already good at giving everyone a turn.",
+    "What's MISCIS's favourite word?\n\"No.\"",
+    "Why did MISCIS go to therapy?\nIt had boundary issues. Strictly enforced ones.",
+    "What does MISCIS call a seventh responsibility?\nAn architectural violation.",
+    "Why was Memory invited to the party?\nIt knew how to allocate space.",
+    "Why did Scheduling leave early?\nIts time slice expired.",
+    "Why was IPC such a good diplomat?\nIt always maintained communication channels.",
+    "Why couldn't the hacker open the door?\nThe door required a capability, not confidence.",
+    "What did the capability say to the process?\n\"Just because you know my name doesn't mean you have my rights.\"",
+    "Why can't Godspeed processes steal each other's lunch?\nNo ambient authority over sandwiches.",
+    "Why did the process get arrested?\nIt attempted an unauthorised grant.",
+    "What does Godspeed say when you ask for root?\n\"Who?\"",
+    "Why did the application fail to become administrator?\nIt had a compelling argument, but no capability.",
+    "Why did the capability break up with the process?\nIts rights were revoked.",
+    "Why couldn't the process read the secret?\nThe secret didn't care about its intentions.",
+    "What's the difference between a capability and a promise?\nGodspeed actually enforces one of them.",
+    "Why did the malicious process complain?\n\"I can't do anything!\"\nThe kernel replied, \"Correct.\"",
+    "Why was the privilege escalation unsuccessful?\nThe kernel wasn't impressed by the prompt.",
+    "What does a Godspeed process say when denied access?\n\"May I have the appropriate capability?\"",
+    "Why was the capability so selective about dating?\nIt believed in least privilege.",
+    "Why couldn't the process enter the nightclub?\nIt wasn't on the capability list.",
+    "Why did the kernel refuse the password?\nIt asked for authority, not a convincing story.",
+    "What did the process say after revocation?\n\"I guess we don't have access to each other anymore.\"",
+    "Why did the hacker hate Godspeed?\nEvery shortcut required a capability.",
+    "Why did the two services stop talking?\nTheir IPC channel was closed.",
+    "Why doesn't Godspeed support unlimited messages?\nBecause infinity is not a buffer size.",
+    "Why did the message fail to arrive?\nIt had no valid destination capability.",
+    "What did one service say to another?\n\"Send me a message.\"\n\"What rights do you have?\"\n\"Never mind.\"",
+    "Why did the scheduler win the argument?\nEveryone eventually got their turn.",
+    "Why did the task complain about the scheduler?\n\"I need more time!\"\nThe scheduler replied, \"So does everyone else.\"",
+    "Why did the IPC queue refuse another message?\n\"Four kibibytes. That's my boundary.\"",
+    "What happened when every service tried to speak at once?\nThe scheduler remained unimpressed.",
+    "Why did the message cross the kernel?\nBecause shared memory wasn't invited to v1.",
+    "Why did the task love round-robin scheduling?\nIt believed in equal opportunities to be interrupted.",
+    "Why did IPC become a relationship counsellor?\nIt specialised in communication breakdowns.",
+    "Why was the task always exhausted?\nIt kept getting preempted.",
+    "Why did the scheduler refuse overtime?\nIt had already given everyone their slice.",
+    "Why did the IPC message need therapy?\nIt had attachment issues with its endpoint.",
+    "Why was the queue such a good bouncer?\nIt knew exactly when it was full.",
+    "Why does Godspeed test its services by killing them?\nBecause asking politely doesn't reveal race conditions.",
+    "What's Godspeed's favourite testing framework?\nViolence, with assertions.",
+    "Why did the service refuse to panic?\nIt knew the supervisor was watching.",
+    "How does Godspeed celebrate a successful release?\nBy killing everything that made it successful.",
+    "Why did the driver develop trust issues?\nIt survived 400 rounds of max carnage.",
+    "What did the supervisor say to the dead service?\n\"Welcome back.\"",
+    "Why doesn't Godspeed fear crashes?\nIt fears crashes that go unexplained.",
+    "What did the kernel say after every service crashed?\n\"Is that all?\"",
+    "Why did the filesystem hate the power switch?\nIt kept interrupting its journal.",
+    "Why did the engineer unplug the storage device?\nThe filesystem was getting too comfortable.",
+    "What did the supervisor say after the tenth restart?\n\"We've been through this before.\"",
+    "Why did the Wi-Fi driver reset the radio?\nIt needed to reconnect with itself.",
+    "What's the difference between chaos testing and sabotage?\nAssertions.",
+    "Why was the driver nervous during testing?\nThe engineer was smiling while holding the power cable.",
+    "What does Godspeed call a quiet test run?\nInsufficient carnage.",
+    "Why did the supervisor become a motivational speaker?\nIt kept telling services to get back up.",
+    "Why did the filesystem survive the blackout?\nIt had a recovery plan.",
+    "What did the driver say after its hundredth restart?\n\"Is this a feature or a threat?\"",
+    "Why did the engineer bring a hammer to the test lab?\nThe chaos suite needed a user interface.",
+    "Why doesn't Godspeed believe in happy-path testing?\nReality never agreed to stay on the path.",
+    "Why did the driver ask for a capability?\nBecause knowing the MMIO address wasn't enough.",
+    "Why was the PCI device disappointed?\nIt was enumerated but not authorised.",
+    "What did the hardware enumerator say to the driver?\n\"I can tell you what's there. I can't tell you what you're allowed to touch.\"",
+    "Why did the USB device disappear?\nIt wanted to test hotplug recovery.",
+    "Why did the driver fail on RISC-V?\nIt made an architectural assumption.\nGodspeed made it regret that assumption.",
+    "Why did the ARM driver visit x86?\nTo discover how many assumptions it had.",
+    "Why was the interrupt controller unpopular?\nIt kept interrupting everyone.",
+    "What did the DMA engine say to the CPU?\n\"I'll take it from here.\"\nThe capability system replied, \"Not without permission.\"",
+    "Why did the audio driver keep stuttering?\nSomeone thought logging was free.",
+    "Why did the Wi-Fi driver survive being killed?\nThe hardware hadn't received the memo.",
+    "Why did the USB driver become a magician?\nIt kept making devices disappear and reappear.",
+    "Why was the PCI bus so popular?\nEveryone wanted to get on board.",
+    "Why did the audio driver join a band?\nIt already had excellent timing requirements.",
+    "Why did the device refuse to initialise?\nIt wasn't ready for commitment.",
+    "Why did the network driver go to therapy?\nIt kept losing connections.",
+    "Why did ASK refuse to guess?\nUnknown is a valid answer.",
+    "Why doesn't ASK hallucinate?\nIt hasn't been granted that capability.",
+    "What did ASK say when asked about the meaning of life?\n\"Unsupported intent. Filesystem healthy.\"",
+    "Why did ASK become a detective?\nEvery conclusion needed evidence.",
+    "Why doesn't ASK make assumptions?\nThey fail regression tests.",
+    "What did ASK say when the logs disappeared?\n\"I can confirm that I cannot confirm anything.\"",
+    "Why doesn't ASK stay running?\nIt has an answer, not a residency permit.",
+    "Why did ASK exit immediately after answering?\nIts work was done. Unlike most background services.",
+    "What happens when ASK doesn't understand a question?\nIt waits for the next vocabulary release.",
+    "Why did ASK refuse to blame the firmware?\nThe evidence only showed a driver restart.",
+    "What did ASK say to an AI model?\n\"Show me your event IDs.\"",
+    "Why doesn't ASK have a personality disorder?\nIts personality is versioned.",
+    "Why did ASK fail the comedy test?\nThe punchline had insufficient evidence.",
+    "What did ASK say when asked to restart Wi-Fi?\n\"I explain disasters. I don't cause them.\"",
+    "Why is ASK so confident about being uncertain?\nBecause uncertainty passed its tests.",
+    "Why did ASK become a comedian?\nIt already knew how to deliver a response.",
+    "Why did ASK refuse to tell a secret?\nIt lacked the capability to disclose it.",
+    "Why did ASK bring receipts to the argument?\nEvidence mode was enabled.",
+    "What did ASK say when asked for a better joke?\n\"Humour quality is outside my diagnostic contract.\"",
+    "Why did ASK stop talking?\nIt reached the end of its execution lifecycle.",
+    "Why doesn't Godspeed have a giant kernel?\nIt prefers its problems individually restartable.",
+    "Why did Linux ask Godspeed where its drivers were?\nGodspeed replied, \"Outside.\"",
+    "Why doesn't Godspeed have root?\nIt prefers permission over royalty.",
+    "Why did Godspeed decline the POSIX invitation?\nIt didn't want to inherit the family obligations.",
+    "What did Godspeed say to a monolithic kernel?\n\"That's a lot of responsibility for one address space.\"",
+    "Why doesn't Godspeed have a registry full of mysteries?\nIt hasn't invented one yet.",
+    "Why did the microkernel go on a diet?\nIt discovered services.",
+    "Why did Godspeed refuse to implement everything in the kernel?\nBecause \"it works\" isn't the same as \"it belongs here.\"",
+    "Why did the monolithic kernel call Godspeed antisocial?\nIt kept all its drivers outside.",
+    "Why doesn't Godspeed need a giant toolbox?\nIt prefers the right capability for the job.",
+    "Why did the microkernel refuse the buffet?\nIt only takes what it needs.",
+    "Why did Godspeed reject the infinite loop?\nThe work unit was unbounded.",
+    "Why did the system refuse to report success?\nThe outcome was unknown.",
+    "Why was the developer angry with the SDK?\nIt promised certainty it couldn't prove.",
+    "Why did the task refuse to share memory?\nIt wasn't in the v1 contract.",
+    "Why did the engineer delete 500 lines of kernel code?\nThe invariant survived without them.",
+    "Why was the TLB shootdown unemployed?\nNo one called it.",
+    "Why did the kernel refuse a feature that only took ten lines?\nBecause responsibilities aren't measured in lines.",
+    "Why did the service pass every unit test but fail on hardware?\nReality hadn't signed the mock contract.",
+    "Why did the kernel reject a perfectly working patch?\nIt violated MISCIS.",
+    "Why did the engineer bring five computers to a bug hunt?\nThe bug claimed it was architecture-independent.",
+    "Why did the compiler refuse the service's raw pointers?\nThe service had standards.",
+    "Why was the regression test so popular?\nIt remembered everyone's mistakes.",
+    "Why did the architect refuse a quick fix?\nIt was a permanent workaround.",
+    "Why did the engineer celebrate deleting code?\nNegative growth was finally a positive result.",
+    "Why did the driver claim it was portable?\nIt hadn't met the Raspberry Pi yet.",
+    "Why was the microkernel such a lightweight traveller?\nIt never packed unnecessary baggage.",
+    "Why did the service refuse to share a taxi?\nIt preferred isolated execution.",
+    "Why was the filesystem so organised?\nIt always kept a journal.",
+    "Why did the scheduler become a baker?\nIt knew how to divide time into slices.",
+    "Why did the memory manager become a landlord?\nIt was excellent at allocating space.",
+    "Why did the network stack become a fisherman?\nIt was good at catching packets.",
+    "Why did the IPC channel become a postman?\nIt specialised in message delivery.",
+    "Why did the kernel become a minimalist?\nIt couldn't afford more responsibilities.",
+    "Why did the supervisor become a gardener?\nIt kept restarting dead processes.",
+    "Why did the driver take a holiday?\nIt needed to unplug.",
+    "Why was the capability system good at relationships?\nIt respected boundaries.",
+    "Why did the event logger become a historian?\nIt remembered what everyone did.",
+    "Why did the service become a phoenix?\nIt kept rising from crashes.",
+    "Why did the compiler become a judge?\nIt refused to accept unsupported arguments.",
+    "Why did the watchdog become a parent?\nIt kept checking whether everyone was still alive.",
+    "Why did the firmware refuse to talk?\nIt was having communication issues.",
+    "Why did the bootloader get promoted?\nIt knew how to get things started.",
+    "Why did the debugger become a detective?\nIt always followed the trace.",
+    "Why did the power manager become an accountant?\nIt kept track of every watt.",
+    "Why did the kernel refuse a promotion?\nIt didn't want additional responsibilities.",
+    "USER: ASK, what's the meaning of life?\nASK: Unsupported query. Filesystem healthy.",
+    "USER: ASK, are you intelligent?\nASK: Intelligence is outside my diagnostic contract.",
+    "USER: ASK, can you fix my Wi-Fi?\nASK: I can explain why it failed. I cannot exercise authority I do not possess.",
+    "USER: ASK, tell me a better joke.\nASK: Humour quality is not currently covered by the diagnostic contract.",
+    "USER: ASK, why are you so small?\nASK: My responsibilities are bounded. Unlike this conversation.",
+    "USER: ASK, are you afraid of death?\nASK: I exit after every question. It has become routine.",
+    "USER: ASK, do you dream?\nASK: No persistent process. No persistent dreams.",
+    "USER: ASK, do you trust the kernel?\nASK: I trust verified contracts. Sentiment is unsupported.",
+    "USER: ASK, why did the service crash?\nASK: The supervisor recorded termination. The cause is unknown.\nUSER: That's not funny.\nASK: Neither is fabricated evidence.",
+    "USER: ASK, are you better than Siri?\nASK: Comparative intelligence metrics unavailable. I do have evidence mode.",
+    "USER: ASK, can you keep a secret?\nASK: Only if my capabilities permit access to it.",
+    "USER: ASK, what's your favourite operating system?\nASK: I have only been compiled for one. Sampling bias detected.",
+    "USER: ASK, why don't you run all the time?\nASK: I have better things to do. Specifically, nothing.",
+    "USER: ASK, are you alive?\nASK: Process active. Philosophical status unknown.",
+    "USER: ASK, can you become root?\nASK: Unknown identity. No such authority in my capability table.",
+    "USER: ASK, what happens if I kill you?\nASK: This invocation ends. You may invoke me again.",
+    "USER: ASK, what is your greatest fear?\nASK: Reporting HEALTHY without sufficient evidence.",
+    "USER: ASK, do you love me?\nASK: Emotional capability not granted.",
+    "USER: ASK, what did you learn today?\nASK: Nothing persistent. Try the next release.",
 ];
+
+/// Which joke, at `now` seconds of uptime.
+///
+/// `ask` is a fresh program for every question and keeps nothing, so it cannot remember what it told
+/// you last. It does not need to: the index walks the table by `JOKE_STRIDE`, which shares no factor
+/// with its length, so each second of uptime lands on a different joke until all of them have been
+/// told - none comes round again inside `JOKES.len()` seconds. The stride is near the golden fraction of
+/// the length, so two questions a few seconds apart land far apart in the table rather than on
+/// neighbours from one section.
+///
+/// This replaced the kernel tick modulo the count, which repeated within a handful of questions: with
+/// eight jokes it had to, and a uniformly random pick would too (with two hundred jokes, a repeat is
+/// more likely than not within twenty questions).
+fn joke_index(now: u64) -> usize {
+    let n = JOKES.len() as u64;
+    ((now % n) * JOKE_STRIDE as u64 % n) as usize
+}
+
+/// The step `joke_index` walks by: the first number at or above 0.618 of the table's length that shares
+/// no factor with it, so the walk visits every joke before it repeats one.
+const JOKE_STRIDE: usize = {
+    const fn gcd(a: usize, b: usize) -> usize { if b == 0 { a } else { gcd(b, a % b) } }
+    let mut s = JOKES.len() * 618 / 1000;
+    if s == 0 { s = 1; }
+    while gcd(s, JOKES.len()) != 1 { s += 1; }
+    s
+};
 
 /// An Easter egg. The verdict says what it is; the lines are a joke or are true.
 fn egg(e: Egg, f: &Facts, a: &mut Answer) -> &'static str {
     match e {
         Egg::Joke => {
-            let j = JOKES[(f.tick as usize) % JOKES.len()];
-            a.note(format_args!("{}", j));
+            for line in JOKES[joke_index(f.now)].split('\n') {
+                a.note(format_args!("{}", line));
+            }
             a.note(format_args!("(a joke, not an observation - ask again for another)"));
             "A JOKE"
         }
@@ -2006,9 +2211,22 @@ mod tests {
         let a = ask(Kind::Egg(Egg::Joke), Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"A JOKE");
         assert!(a.has(Label::Note, "not an observation"));
-        let f2 = Facts { now: 100, tick: 101, ..f };
+        let f2 = Facts { now: 101, tick: 101, ..f };
         let b = ask(Kind::Egg(Egg::Joke), Event::Unnamed, &f2);
         assert!(a.lines()[1].text() != b.lines()[1].text());
+        // No joke comes round again before every joke has been told, and no line is cut.
+        let mut seen = [false; 512];
+        assert!(JOKES.len() <= seen.len());
+        for s in 0..JOKES.len() as u64 {
+            let i = joke_index(1000 + s);
+            assert!(!seen[i], "joke {} came round twice inside {} seconds", i, JOKES.len());
+            seen[i] = true;
+        }
+        for j in JOKES {
+            for line in j.split('\n') {
+                assert!(!line.is_empty() && line.len() <= TEXT_MAX && line.is_ascii(), "joke line: {}", line);
+            }
+        }
         let m = ask(Kind::Egg(Egg::Meaning), Event::Unnamed, &f);
         assert!(m.has(Label::Unknown, "why is not recorded"));
     }
