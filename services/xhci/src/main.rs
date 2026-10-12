@@ -3522,7 +3522,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The outer `None` is "nothing said yet": the FIRST pass reports what it found, the dongle or nothing,
     // so the supervisor learns either way (`usbdev`).
     let mut radio_was_bound: Option<Option<u32>> = None;
-    // Every pass that found the dongle, counted: the report's binding generation.
+    // The gen of the dongle's last bind (`usbfn::next_gen`): the report's binding generation and `OP_INFO`'s,
+    // different for every pass that found it, a restarted host's included.
     let mut radio_binds: u32 = 0;
     let mut signaled = false; // signal_input_ready (boot-screen clear) exactly once
     let mut prev_sigs: [u32; MAX_HID] = [u32::MAX; MAX_HID]; // per-device position sigs bound last pass (u32::MAX = empty)
@@ -4034,8 +4035,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         disk_was_bound = disk.is_some();
         // The radio's binding changed: tell `wifi-usb`, which asks `OP_INFO` (U2a). Compared with the
         // previous pass, as the disk's announce is, so a pass that rebinds the same dongle says nothing.
+        // A gen this instance's successor cannot repeat (`usbfn::next_gen`): a count from 1 started over on
+        // every restart, so `wifi-usb` could not tell a fresh binding from the one it was serving.
         if let Some(r) = radio.as_mut() {
-            radio_binds = radio_binds.wrapping_add(1);
+            radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
             r.gen = radio_binds;
         }
         let radio_now = radio.as_ref().map(|r| r.ids);

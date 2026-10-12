@@ -130,6 +130,15 @@ pub fn ticks(ctx: &ServiceContext) -> u64 {
     ctx.read_tsc()
 }
 
+/// The machine's counter in milliseconds: a reading every task shares, that only goes forward, so two taken
+/// by two instances of one service - the second after the first died - are in order. For telling one
+/// instance's events from the next one's, not for a date, and not time since boot on every board (the
+/// counter's origin is the board's). 0 when the counter is uncalibrated, where it cannot be known.
+#[cfg(not(test))]
+pub fn counter_ms(ctx: &ServiceContext) -> u64 {
+    us_for(ctx.tsc_ticks_per_10ms(), ctx.read_tsc()) / 1000
+}
+
 /// How many [`ticks`] make 10 ms on this machine, or 0 if the kernel could not calibrate the counter.
 ///
 /// For converting a measurement in ticks into time for a report, and for configuring a domain library

@@ -34,7 +34,7 @@ is due when a scan exists, not before.
 
 | Op | Request | Reply |
 |---|---|---|
-| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`) |
+| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2), gen(4)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`). `gen` names the binding and differs for every bind, a restarted host's included (`usbfn::next_gen`); the driver compares it, not only the IDs |
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
 | `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |

@@ -340,7 +340,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // and its receive, and the port it came from so a removal can drop it.
     let mut radio: Option<rtl::Radio> = None;
     let mut radio_port: u8 = 0;
-    // Every bind of the dongle on this host, counted: the report's generation (`usbdev`).
+    // The gen of the dongle's last bind on this host (`usbfn::next_gen`): the report's generation
+    // (`usbdev`) and `OP_INFO`'s, different for every bind, a restarted host's included.
     let mut radio_binds: u32 = 0;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
@@ -490,7 +491,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // Bound whether or not the reads answered - the
                                                 // driver asks again and says what it got.
                                                 radio_port = p;
-                                                radio_binds = radio_binds.wrapping_add(1);
+                                                radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
                                                 radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver did:
@@ -790,7 +791,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             {
                                 if hvid == rtl::VID && hpid == rtl::PID {
                                     // The radio, plugged in after boot: bound as at boot, and said.
-                                    radio_binds = radio_binds.wrapping_add(1);
+                                    radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
                                     radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
                                     notify(&ctx, format_args!("usb: WiFi dongle connected (port {})", port));
                                     radio_port = port;

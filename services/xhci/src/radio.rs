@@ -541,6 +541,7 @@ pub fn serve(
             out[1] = usbfn::ST_OK;
             out[2..4].copy_from_slice(&r.vid().to_le_bytes());
             out[4..6].copy_from_slice(&r.pid().to_le_bytes());
+            out[usbfn::INFO_GEN_AT..usbfn::INFO_GEN_AT + 4].copy_from_slice(&r.gen.to_le_bytes());
             // Where the dongle is, for `wifi hardware usb` (`usbfn::OP_INFO`'s optional part). An endpoint's
             // address follows from its DCI: IN is odd, `0x80 | dci / 2`; OUT is even, `dci / 2`.
             let w = usbfn::INFO_WHERE_AT;
