@@ -22,16 +22,16 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/service_context.rs` | **77** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
-**The 92 are not 92 defects.** 88 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
+**The 85 (77 + 8) are not 85 defects.** 82 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
 is an `unsafe fn` because it issues the trap instruction, so every caller must open a block - and
 these two files *are* the wrapper layer whose whole purpose is to keep services `unsafe`-free. That
 worked: `services/` is at **zero**. The isolation simply stopped one layer short of itself.
 
-The remaining 4 are genuinely different and are the ones to look at first: three bare `unsafe {`
-blocks and one raw-pointer deref (`&*(SERVICE_CTX_ADDR as *const ServiceContextData)`).
+The remaining 3 are genuinely different and are the ones to look at first: two bare `unsafe {`
+blocks (the `SEND_CAP_CACHE` walks) and one raw-pointer deref (`&*(SERVICE_CTX_ADDR as *const ServiceContextData)`).
 
 **The real fix, recorded rather than done:** give `raw_syscall` a SAFE wrapper. The kernel validates
-every user pointer, so passing integers to a validating callee is sound, and ~86 of these would
+every user pointer, so passing integers to a validating callee is sound, and ~82 of these would
 collapse to nothing - taking the SDK to roughly the 35 lines §18.1 actually sanctions. It is an SDK
 redesign on every service's call path and wants hardware validation, so it is written down here
 instead of attempted in the same change that made it visible (§26.7).

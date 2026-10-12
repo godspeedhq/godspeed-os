@@ -50,7 +50,7 @@
 //! # Where the unsafe lives
 //!
 //! Service code contains none. §18.1 designates `syscall.rs`, `mmio.rs`, `dma.rs` and
-//! `adversarial.rs`; in practice the largest holder is `service_context.rs` (84 lines) with `ipc.rs`
+//! `adversarial.rs`; in practice the largest holder is `service_context.rs` (77 lines) with `ipc.rs`
 //! (8), both recorded as GRANDFATHERED FLOORS by §18.5's 2026-09-12 amendment and the three
 //! amendments after it (`audits/unsafe-audit.md` has the counts) - nearly all of them are
 //! `unsafe { raw_syscall(..) }` call sites, and they may rise only by a §18.5 amendment. Every block carries a SAFETY

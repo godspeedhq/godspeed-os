@@ -498,24 +498,6 @@ impl SpawnRequest {
     }
 }
 
-/// The supervisor's command channel wire format.
-///
-/// ONE definition. This lived in three services at once (`supervisor`, `control`, `shell`) - three
-/// copies of a protocol, which is the second-truth problem this project rejects everywhere else
-/// (26.4, Commandment III). A drifted copy would not fail loudly; it would send a byte the supervisor
-/// reads as a different opcode.
-///
-/// The supervisor's endpoint receives two kinds of message, told apart by the first byte:
-///
-/// ```text
-///   death notice   "pong" 0 how...               <- kernel-generated; a name, [a-z0-9-], then how it
-///                                                   ended (`death`, CLAUDE.md 6.2 amendment 2026-10-11)
-///   command        0x01 op <core u32 LE> name    <- 0x01 cannot begin a name
-///                                    name may be followed by NUL-separated PEER names
-/// ```
-///
-/// Choosing an impossible first byte means the kernel's death-notification format does not change at
-/// all: the two are unambiguous without the kernel learning anything about commands.
 /// How a task ended, as the kernel says it in the death notice (`name`, NUL, then one of these). The
 /// kernel's `task::death` holds the same values; `ask` asserts its copy against these.
 pub mod death {
@@ -537,6 +519,25 @@ pub mod death {
     pub const F_ALIGNMENT: u8 = 5;
 }
 
+/// The supervisor's command channel wire format.
+///
+/// ONE definition. This lived in three services at once (`supervisor`, `control`, `shell`) - three
+/// copies of a protocol, which is the second-truth problem this project rejects everywhere else
+/// (26.4, Commandment III). A drifted copy would not fail loudly; it would send a byte the supervisor
+/// reads as a different opcode.
+///
+/// The supervisor's endpoint receives two kinds of message, told apart by the first byte:
+///
+/// ```text
+///   death notice   "pong" 0 how...               <- kernel-generated; a name, [a-z0-9-], then how it
+///                                                   ended (`death`, CLAUDE.md 6.2 amendment 2026-10-11)
+///   command        0x01 op <core u32 LE> name    <- 0x01 cannot begin a name
+///                                    name may be followed by NUL-separated PEER names
+/// ```
+///
+/// Choosing an impossible first byte means a death notice needs nothing to set it apart: it still
+/// begins with the name, as it always has (what follows the NUL is `death`'s, added 2026-10-11), so
+/// the two are unambiguous without the kernel learning anything about commands.
 pub mod supcmd {
     /// First byte of a command. Not a legal first byte of a service name.
     pub const MARKER:  u8 = 0x01;

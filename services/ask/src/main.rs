@@ -9,7 +9,8 @@
 //! it. Nothing of it is left running, and nothing restarts it (it is in no `MANAGED` list).
 //!
 //! What it does between those: read the question (`know::understand`), ask the services that already
-//! know - the task table, the supervisor, `fs`, the radio drivers - each with a bounded request, and turn
+//! know - the task table and each task's capabilities, the supervisor, `fs` and, when it has no disk, the
+//! storage chain below it, `net-stack`, the radio drivers - each with a bounded request, and turn
 //! what they said into lines that are each a FACT, an INFERENCE or an UNKNOWN (`know::assess`). It
 //! changes nothing: every request below is a read.
 //!

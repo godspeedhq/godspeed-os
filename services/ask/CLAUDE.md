@@ -11,6 +11,10 @@ record table, and ends it before the prompt returns. It is in no boot set and no
 nothing restarts it, and nothing of it stays running. v1 has no way for a task to end itself, and this
 one must not hold `kill`, so the shell - which started it and holds `kill` - ends it.
 
+The supervisor carries TWO rows for this one program, because the kernel gives a task at most six send
+peers: `ask` (storage and the radio) and `ask-net` (`net-stack` and the radio). The shell picks the row by
+reading the question with this crate's own `know.rs` (`utilities/60_ask.md` 5).
+
 ## The two files, and why there are two
 
 - `src/know.rs` - what a question MEANS and what an answer may SAY. Names nothing outside `core`, so
@@ -18,10 +22,13 @@ one must not hold `kill`, so the shell - which started it and holds `kill` - end
   fixtures of source replies with what each answer must and must not say. Changing a rule here is changing
   what `ask` is willing to claim; the tests are the contract.
 - `src/main.rs` - asking the system: the task table (INTROSPECT), the supervisor's read-only questions
-  (`supcmd::MANAGED`, `supcmd::EVENTS`, `supcmd::DEATH`), `fs`'s drive report (`gs::fs::Fs::drive`) and each running radio
-  driver's status (tagged `wire::OP_STATUS`), each task's capabilities (INTROSPECT, named from
+  (`supcmd::MANAGED`, `supcmd::EVENTS`, `supcmd::DEATH`), `fs`'s drive report (`gs::fs::Fs::drive`), the
+  storage chain below `fs` when it has no disk (`block-driver`'s and its USB host's capacity),
+  `net-stack`'s status (`gs::net::Net::status`, on the `ask-net` row), each running radio driver's status
+  (tagged `wire::OP_STATUS`), and each task's capabilities (INTROSPECT, named from
   `gs::task::AUTHORITIES`, the table the shell's `caps` uses), each bounded. What a service IS comes from
-  its crate's own `description`, read by `build.rs` as the glossary is. Then the answer as records to `send_peers[0]`.
+  its crate's own `description`, and what a term means from `GLOSSARY.md`'s table, both read by
+  `build.rs` at build time. Then the answer as records to `send_peers[0]`.
 
 ## The rules it keeps
 

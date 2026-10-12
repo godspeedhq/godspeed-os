@@ -259,8 +259,9 @@ fn dispatch(
     }
     match disk {
         Some((dk, dt, sectors)) => msc::serve(ctx, m, d, dt, dk, msg, *sectors, reply, capless),
-        // A BLOCK request with no disk bound: the one-byte error `answer_no_disk` gives, on the cap this
-        // function already took. Only block requests reach here now - before, a diskless dwc2 answered
+        // A BLOCK request with no disk bound: one byte, `STATUS_NO_DISK` (`backlog/57`), on the cap this
+        // function already took - not `answer_no_disk`'s `STATUS_ERR`, so a flush here reads as "no
+        // device reached" rather than as a stick refusing it. Only block requests reach here now - before, a diskless dwc2 answered
         // EVERY request this way, net and radio included, because the no-disk paths never routed by
         // op: `wifi-usb`'s first QEMU boot got a disk error back to its INFO (2026-10-05).
         None => {

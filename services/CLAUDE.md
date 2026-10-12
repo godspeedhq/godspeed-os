@@ -65,14 +65,15 @@ not individually watched; a supervisor respawn re-runs its boot sequence and re-
 | Service | Notes |
 |---------|-------|
 | `recorder/` | Drains the `events` log to a file (`events persist`). The shell spawns it on demand; it is absent from the boot set AND from the supervisor's `MANAGED`, so nothing restarts it, and the whole persistence feature needed no kernel change. It is not restarted on death **on purpose**: a respawned recorder would not know its target path, so it would be alive and writing nothing while `status` said "running" - worse than dead. The capture file opens with a header and closes with a footer, so one without a footer says it died. See `services/recorder/CLAUDE.md` |
-| `ask/` | Not a service: a FOREGROUND PROGRAM FOR ONE QUESTION (`utilities/60_ask.md`, `docs/ask-design.md`). The shell starts it wired to send to the shell, hands it the question, reads the answer back as one record table and ends it before the prompt returns. Read only: INTROSPECT for the task table, and send peers to the supervisor (`supcmd::MANAGED`, `EVENTS`), `fs` (its drive report) and the radio drivers. Nothing restarts it and nothing of it stays running. See `services/ask/CLAUDE.md` |
+| `ask/` | Not a service: a FOREGROUND PROGRAM FOR ONE QUESTION (`utilities/60_ask.md`, `docs/ask-design.md`). The shell starts it wired to send to the shell, hands it the question, reads the answer back as one record table and ends it before the prompt returns. Read only: INTROSPECT for the task table, and send peers to the supervisor (`supcmd::MANAGED`, `EVENTS`, `DEATH`), `fs` (its drive report) and the radio drivers. Nothing restarts it and nothing of it stays running. See `services/ask/CLAUDE.md` |
 | `copier/` | The service behind `background` (`utilities/55_background.md`). The shell spawns it on `background copy ...` or `background delete ... recursive` and it idles until told what to do; it holds `fs` and its log and **no `console_push`**, so it cannot inject keystrokes. It CAN write to the console, as every task can through `log_write`; it stays off a prompt somebody is typing at by convention - it never calls `gs::io` - not because a capability stops it. Not restarted on death for the recorder's reason: a respawned copier would not know what it was copying, so it would be alive and doing nothing while `jobs` said `running`. The shell reports that death as the job being `lost`. See `services/copier/CLAUDE.md` |
 
 **Ended when its work is done, since 2026-10-11.** `recorder` and `copier` used to stay up until reboot once
 started - nothing ended them, and an idle `copier` woke every 500 ms. The shell, which started them and holds
 `kill`, now ends each at the point it knows its work is over (`end_helper` in `services/shell`): `recorder` at
 `events persist stop`, `copier` once its job has ended and what it said has been read back. `ask`, new the same
-day, is ended the same way as soon as its answer is in.
+day, is ended as soon as its answer is in, by the drain that read it (`drain_service_with`), as every pipe
+stage is.
 
 ## Supervisor spawn order
 

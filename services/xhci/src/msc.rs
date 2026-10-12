@@ -710,8 +710,9 @@ pub const STATUS_NO_DISK: u8 = 2;
 
 /// Build the reply for one block-IPC request, into `out`, returning how many bytes of it are valid.
 ///
-/// Returns `STATUS_ERR` rather than nothing whenever the request cannot be honoured - a malformed
-/// request, no disk attached, or a device that failed. A caller blocked awaiting a reply must always
+/// Returns an error status rather than nothing whenever the request cannot be honoured: `STATUS_ERR`
+/// for a malformed request or a device that failed, `STATUS_NO_DISK` when no disk is bound (`backlog/57`
+/// - a refusal by a device and the absence of one are different facts). A caller blocked awaiting a reply must always
 /// get one; silently dropping the request would hang `fs` on a disk that merely returned an error
 /// (§26.7 - a failure has to be visible, and an answer that never comes is the least visible kind).
 #[allow(clippy::too_many_arguments)]
@@ -790,7 +791,7 @@ pub fn serve_block(
             // Reaching `d` at all already means a disk is bound, and that binding IS the reconciled
             // truth now: removal is detected by the port probes and drops it (`disk = None`), which
             // is what puts "device REMOVED" on screen. With no disk bound this function returned
-            // STATUS_ERR long before this match, so absence needs no probe here either.
+            // STATUS_NO_DISK long before this match, so absence needs no probe here either.
             //
             // So the honest answer is the fast one, and the window where it can be stale is the
             // window before removal is noticed - which is bounded by the probe interval and visible.

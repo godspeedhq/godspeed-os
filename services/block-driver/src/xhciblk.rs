@@ -260,8 +260,9 @@ pub fn sectors_now(ctx: &ServiceContext) -> Capacity {
         // `fs` got STATUS_ERR instead of "0 sectors", treated it as transient exactly as intended, and
         // retried forever without ever reaching `serving file API`.
         //
-        // The peer ANSWERED. On both ARM ports a one-byte reply is `[STATUS_ERR]`, which the USB host
-        // service sends when it has no mass-storage device bound - so this is an empty bay reported
+        // The peer ANSWERED. A one-byte reply is what the USB host service sends when it has no
+        // mass-storage device bound - `[STATUS_NO_DISK]` (2) from `xhci` and from `dwc2`'s dispatch since
+        // `backlog/57`, `[STATUS_ERR]` from `dwc2`'s other no-disk paths - so this is an empty bay reported
         // tersely, not a protocol mismatch, and the old comment saying otherwise was wrong. Publishing
         // zero lets a diskless machine come up diskless, which is the correct outcome and the one it
         // had before.

@@ -198,8 +198,8 @@ def check(objdump, root, target, profile, services, stack_limit, top=5):
             continue
         f = frames(objdump, elf)
         # MEASURED NOTHING, SAID NOTHING. A binary full of functions, not one of which adjusts the
-        # stack pointer, does not mean "no deep frames" - it means the prologue form on this target is
-        # not one this file matches, which is exactly how an unsupported arch earns a pass. The
+        # stack pointer, does not mean "no deep frames" - it can mean the prologue form on this target
+        # is not one this file matches, which is exactly how an unsupported arch earns a pass. The
         # instrument must report that it is blind rather than report a zero it did not earn
         # (invariant 12). This guard is the general fix; SUB_SP_RV above is the specific one.
         # An ELF in which objdump found no function at all is the same blindness by another route.

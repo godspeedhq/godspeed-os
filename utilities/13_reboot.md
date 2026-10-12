@@ -31,8 +31,10 @@ USB keyboard drivers (`xhci`, `ehci`) recognise the chord (either Ctrl + either 
 Delete) in the HID report with `godspeed_sdk::hid::is_ctrl_alt_del`, checked for
 keyboard devices only (a mouse button byte can alias the modifier bits), and only
 **signal** it: they push `hid::CTRL_ALT_DEL_SIGNAL` (`0x80`, a byte no typed key
-produces) onto the console stream. The shell, which holds `REBOOT`, sees that byte at
-its prompt and runs `reboot`. The drivers hold no `REBOOT` capability and cannot reset
+produces on its own) onto the console stream. The shell, which holds `REBOOT`, sees that byte at
+its prompt and runs `reboot`. Only a `0x80` standing alone is the chord: inside a UTF-8
+character typed over serial or pasted it is a continuation byte, and the shell decodes such a
+character whole (a curly quote, `E2 80 9C`, rebooted the machine until 2026-10-11). The drivers hold no `REBOOT` capability and cannot reset
 the machine themselves. So the chord works at the shell prompt; while a full-screen app
 such as `edit` owns the console the shell is not reading, so quit it first. The Pi 2's
 `dwc2` driver does not signal the chord. Like the `reboot` command, it does not

@@ -2450,7 +2450,8 @@ fn boot_shell(
 /// anything.
 ///
 /// Boot 2 also checks the negative half, which is the part that makes sticky safe rather than a trap:
-/// an explicit `stop` deletes the marker, so a capture that was told to end does NOT come back.
+/// an explicit `stop` deletes the marker, so a capture that was told to end does NOT come back - and
+/// it ends the `recorder` task, so `events persist status` then says `not running`.
 pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     println!("sticky-test: two boots on one disk - a capture must survive a reboot");
     let mut fail = 0usize;

@@ -18,12 +18,15 @@ use core::fmt::Write;
 // Understanding the question (design section 4). Deterministic, versioned, small, no model.
 // ---------------------------------------------------------------------------------------------
 
-/// The vocabulary's version. Bumped when a word is added or a reading changes; the tests below pin
-/// every question an earlier version understood, so a question understood stays understood.
+/// The vocabulary's version, meant to be bumped when a word is added or a reading changes. Nothing reads
+/// it yet, and it is still 1 although words have been added since (the network, what is, what can, who
+/// can, what to say, the eggs). What actually pins the vocabulary is the tests below: every question an
+/// earlier reading understood stays understood.
 pub const VOCABULARY: u32 = 1;
 
-/// The question kinds of v0.1 (design section 3): the four specific ones, and the general one they sit
-/// beside - "why did <service> <event>".
+/// The question kinds (design sections 3 and 4): the four of v0.1, the general "why did <service> <event>"
+/// beside them, and those added since - the network, what a service is and what it can do, who holds an
+/// authority, what can be asked, and the Easter eggs. A term to define is a `Reading`, not a kind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     /// Is the system healthy?
@@ -229,11 +232,9 @@ fn find_service(buf: &[u8], ws: &[(usize, usize)], n: usize, known: &[&str]) -> 
     (best.map(|b| b.0), second)
 }
 
-/// Read a question about this machine. `known` is the names of its services - the task table's and the
-/// supervisor's - so a question may name any of them without the vocabulary listing it.
 /// The words that name a kernel authority, for "who can ...?" - a verb a person would use, and the
-/// authority's own name. Resource ids are the kernel's fixed set (`godspeed_sdk::AUTHORITIES`, which
-/// `main.rs` hands in as `Facts::authorities`); a word missing here is answered "which authority?",
+/// authority's own name. Resource ids are the kernel's fixed set (`godspeed_sdk::service_context::AUTHORITIES`,
+/// re-exported as `gs::task::AUTHORITIES`, which `main.rs` hands in as `Facts::authorities`); a word missing here is answered "which authority?",
 /// never guessed. No clock words: `set_clock` is granted to nothing, and the clock is the `time`
 /// service's, so "who can set the clock?" would be answered wrongly by the kernel's table.
 const CAN_WORDS: &[(&str, u64)] = &[
@@ -254,6 +255,8 @@ const CAN_WORDS: &[(&str, u64)] = &[
     ("cpu", 18),
 ];
 
+/// Read a question about this machine. `known` is the names of its services - the task table's and the
+/// supervisor's - so a question may name any of them without the vocabulary listing it.
 pub fn understand(q: &[u8], known: &[&str]) -> Reading {
     let mut buf = [0u8; QUESTION_MAX];
     let mut ws = [(0usize, 0usize); WORDS_MAX];
@@ -674,7 +677,7 @@ pub struct Facts<'a> {
     pub caps: Got<Caps<'a>>,
     /// The tasks that hold the authority asked about, for "who can?".
     pub holders: Got<&'a [&'a str]>,
-    /// The kernel's fixed authorities: (resource id, name, what it allows) - `godspeed_sdk::AUTHORITIES`.
+    /// The kernel's fixed authorities: (resource id, name, what it allows) - `godspeed_sdk::service_context::AUTHORITIES`.
     pub authorities: &'a [(u64, &'a str, &'a str)],
 }
 
@@ -833,7 +836,7 @@ fn down_words(reason: u8) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The four assessments (design section 3). Each states its facts, then its inferences by named rule,
+// The assessments (design section 3). Each states its facts, then its inferences by named rule,
 // then what it cannot know - and only then the verdict, which is placed FIRST in the answer.
 // ---------------------------------------------------------------------------------------------
 
@@ -871,8 +874,9 @@ pub fn assess(kind: Kind, event: Event, known: &[&str], f: &Facts, a: &mut Answe
     a.finish();
 }
 
-/// Why did (did, has) `name` <event>? From the same sources as the specific kinds: the task table, the
-/// supervisor's record, and the supervisor's list of what it keeps running.
+/// Why did (did, has) `name` <event>? From the task table, the supervisor's record and its list of what it
+/// keeps running, and - for how it last ended - the kernel's death notice as the supervisor kept it
+/// (`supcmd::DEATH`).
 fn service(name: &str, event: Event, f: &Facts, a: &mut Answer, v: &mut TextBuf) {
     let asked = event.word();
     if !asked.is_empty() {
@@ -1582,7 +1586,8 @@ pub fn define(term: &[u8], glossary: &[(&str, &str, &str)], a: &mut Answer) {
     a.finish();
 }
 
-/// What `ask` can answer, for `ask help` and for a question it did not understand.
+/// What `ask` can answer, for an empty question and one it did not understand. (`ask help` is the shell's
+/// help block, not this.)
 pub fn can_answer(a: &mut Answer) {
     a.note(format_args!("I can answer questions about: system health, what failed, the WiFi restarting, the filesystem"));
     a.note(format_args!("and why a service restarted, failed, crashed or stopped - name it, as in: why did fs restart?"));

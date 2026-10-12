@@ -2267,7 +2267,7 @@ fn serve_if_block(
         Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS));
     // ... AND only while a disk is still bound.
     //
-    // Once it has been dropped, `serve_block` answers STATUS_ERR for the honest reason "no disk" -
+    // Once it has been dropped, `serve_block` answers STATUS_NO_DISK for the honest reason "no disk" -
     // and reading THAT as "the disk just stopped answering" restarts the whole enumeration again.
     // `fs` retries, so every retry triggered another re-init: a storm every ~450 ms that tore down
     // and rebound the KEYBOARD each time, which is how an unplugged stick presented as typing going

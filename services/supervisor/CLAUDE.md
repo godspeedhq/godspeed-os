@@ -16,6 +16,12 @@ unkillable thing. Spawned directly by the kernel (init removed, Phase 5).
 - Keep a bounded record of what happens to the devices it drives - a driver's death and restart, a USB
   device attached or removed (`DevEvents`, the newest 32) - and answer it as `supcmd::EVENTS` for
   `hardware events`. Volatile: a respawned supervisor starts an empty record and says from when.
+- Keep how each watched service last ended, from the kernel's death notice (`name NUL 'K' killer` or
+  `name NUL 'F' kind addr`, CLAUDE.md 6.2 amendment 2026-10-11) - the newest per name, in `DevEvents`
+  beside the device record - and answer it as `supcmd::DEATH` for `ask`. Volatile, like that record.
+  The "died, restarting" line ends with the cause (` - killed by shell`, ` - memory fault at 0x0`).
+- Answer `supcmd::MANAGED` with the services it keeps running now (`managed_answer`), so `ask` calls a
+  service down by the same rule the reconcile sweep would bring it back by.
 
 ## Build features
 

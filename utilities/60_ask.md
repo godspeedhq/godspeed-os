@@ -9,7 +9,9 @@ do yet, is `docs/ask-design.md`.
 ## Status, as built and honest (2026-10-11)
 
 Built on `feat/ask`: the four questions of the design (system health, what failed, the WiFi restarting,
-the filesystem), the general question **why did `<service>` `<event>`**, `ask evidence`, records when
+the filesystem, with the storage chain walked when there is no disk), the general question **why did
+`<service>` `<event>`** with how the service last ended, the network, what a service is and what it can
+do, who holds an authority, what to say, glossary terms, the Easter eggs, `ask evidence`, and records when
 piped. QEMU-verified only; no board has run it yet. The vocabulary and every truthfulness rule are host
 tests (`services/ask/src/know.rs`, run by `scripts/host_test_check.py`).
 
@@ -31,17 +33,17 @@ invocation the summary and the evidence are one assessment.
 |---|---|
 | `is my system healthy?` | the task table, the services the supervisor keeps running (`supcmd::MANAGED`), `fs`'s drive report, each radio's status |
 | `what failed?` | the supervisor's record of driver deaths and restarts (`supcmd::EVENTS`, the newest 32), the task table's restart counts, what is down now |
-| `why did <service> <event>?` | that service in the task table and the supervisor's record. `<service>` is any name the machine knows - the task table's and the supervisor's - so a new service needs no new word; `<event>` is one of restart, fail, crash, stop, kept apart |
+| `why did <service> <event>?` | that service in the task table, the supervisor's record, and how it last ended (`supcmd::DEATH`, section 3). `<service>` is any name the machine knows - the task table's and the supervisor's - so a new service needs no new word; `<event>` is one of restart, fail, crash, stop, kept apart |
 | `why did the wifi restart?` | the radio driver that is running, its restarts, and the radio's own status. "The WiFi" is an alias, not a service |
 | `is the filesystem healthy?` | `fs`'s drive report; a scrub is offered, not run |
 | `is the network up?` (`why can't I reach the internet?`, `am I online?`) | `net-stack`'s status - the address, whether DHCP leased it, whether the gateway answers ARP - and the radio where the link is wireless. An address and a gateway mean this machine is on a network, NOT that anything beyond the gateway answers: nothing is sent to find out, and the commands that would test it are offered. Started as the `ask-net` row (below) |
-| `what is <service>?` (`what does xhci do?`) | the service's own description - the `description` in its crate's `Cargo.toml`, read when `ask` is built, the one place a service says what it is - and whether it is running and kept running by the supervisor |
+| `what is <service>?` (`what does xhci do?`) | the service's own description - the `description` in its crate's `Cargo.toml`, read when `ask` is built, the one place a service says what it is - and whether it is running and kept running by the supervisor. A name is a service here only while it is running or the supervisor keeps it running; any other word is looked up as a term (below) |
 | `what can <service> do?` (`what can fs reach?`, `what capabilities does shell have?`) | the capabilities the kernel holds for that task (INTROSPECT): each kernel authority by the name a contract uses and what it allows, and the running services it can send to. What it CAN do, never what it has done |
 | `who can <do this>?` (`who can reboot?`, `which services can kill?`) | every running task holding that kernel authority. The words are the authorities' names and the verbs for them (reboot, kill, restart, spawn, type, introspect, mint, power, pci, ...); a word that names none is answered "which authority?", never guessed. `ask` itself is left out |
 | `what to say?` (or `what can I ask?`, `help`) | the forms above, each with an example, then suggestions from this machine as it is: a service that has restarted (most first), one that should be running and is not, the WiFi where a radio driver runs, the filesystem where `fs` does. Nothing is suggested that this machine could not answer |
 
-A question it does not understand is said to be, with the list above; a question that fits two kinds, or
-names two services, is answered with both and the question "which?"; a request to DO something (`restart
+A question it does not understand is said to be, with a short list of what it can answer; a question that
+fits two kinds, or names two services, is not answered - both readings are named and it asks "which?"; a request to DO something (`restart
 fs`) is refused - `ask` reads and changes nothing.
 
 **What a term means** (operator, 2026-10-11): `what is MISCIS?`, `what does AMD-Vi mean?`, `define MMIO`.
@@ -92,7 +94,7 @@ gsh> ask "is my system healthy?" | where label=verdict
 
 ## 5. Two rows, one program
 
-The kernel gives a task at most six send peers, and one row for every question would need eight. So the
+The kernel gives a task at most six send peers, and one row for every question would need seven. So the
 supervisor carries two rows for the one program, as it does for `observe`: `ask` (the supervisor, `fs`,
 `block-driver`, the board's USB host and radio) and `ask-net` (the supervisor, `net-stack`, the radio).
 The shell picks the row by reading the question with `ask`'s own `know.rs`, compiled into the shell from
@@ -102,6 +104,7 @@ the same file, so the two cannot disagree about which question it is. Each row's
 ## 6. Bounds
 
 A question is read to 512 bytes; an answer holds at most 48 lines and one record table's text, and one
-that runs out of either says it is PARTIAL. Every request `ask` makes waits at most 3 s, and the shell
-waits at most 20 s for the answer, so a dead source ends one line ("did not answer") and never the
+that runs out of either says it is PARTIAL. Every request `ask` makes waits at most 3 s - `fs`'s drive
+report 8 s, because it re-asks `block-driver` for the device's size - and the shell waits at most 25 s
+for the answer, so a dead source ends one line ("did not answer") and never the
 command.

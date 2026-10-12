@@ -65,8 +65,13 @@ OP_WRITE_BLOCK  = 2  [lba:u64 LE, 512 data bytes]    -> [status]
 OP_CAPACITY     = 3  []                              -> [STATUS_OK, sectors:u64 LE]
 OP_WRITE_ZEROS  = 4  [lba:u64 LE, count:u64 LE]      -> [status]
 OP_FLUSH        = 5  []                              -> [status]
-STATUS_OK = 0, STATUS_ERR = 1
+STATUS_OK = 0, STATUS_ERR = 1, STATUS_UNREACHABLE = 2 (USB backend, OP_FLUSH only)
 ```
+
+`STATUS_UNREACHABLE` answers a flush that reached NO device: the USB host service did not answer, or
+had no disk bound (it says so with its own `STATUS_NO_DISK` = 2). `fs` reads `STATUS_ERR` on a flush as
+the DEVICE refusing the barrier, the evidence `CLAUDE.md` 6.1 names, so the two must not share a byte
+(`backlog/57`). AHCI drives its device directly and never sends it.
 
 The **tag** is a correlation byte `fs` puts at byte 0 of every request and block-driver echoes at byte
 0 of the reply (`Reply` in `main.rs`), so a reply that arrives out of order is detected rather than

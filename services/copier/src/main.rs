@@ -581,7 +581,8 @@ fn render_verdict(out: &mut [u8; 160], files: u32, dirs: u32, bad: u32,
     sink.n
 }
 
-/// [CP_OK, CP_OP_STATUS, state, why, kind, copied:u64, total:u64, elapsed:u64, slen, src.., dlen, dst..]
+/// [CP_OK, CP_OP_STATUS, state, why, kind, copied:u64, total:u64, elapsed:u64, slen, src.., dlen, dst..,
+///  transcript_len:u32]
 fn reply_status(ctx: &ServiceContext, job: &Job) {
     let mut out = [0u8; 4 + 24 + 2 + 2 * PATH_MAX + 4];
     out[0] = CP_OK;

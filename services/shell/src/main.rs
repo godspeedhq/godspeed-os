@@ -762,7 +762,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // made HERE because the shell is the principal that legitimately holds REBOOT. This
             // restores the chord's UX without handing the driver back a direct reset from any
             // context, which is what SEC-2 actually removed. The signal byte is outside ASCII, so
-            // no typed key produces it, and the chord is a deliberate three-key combination.
+            // no typed key produces it ALONE - inside a UTF-8 character it is a continuation byte, and
+            // `Utf8In` above consumes those whole - and the chord is a deliberate three-key combination.
             gs::io::keys::CTRL_ALT_DEL_SIGNAL => {
                 gs::io::print(ctx, "\r\n");
                 cmd_reboot(&ctx);
@@ -14474,9 +14475,11 @@ fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
     // `|`, `'` - are plain text inside. Refused with the line to type, not guessed at.
     //
     // CURLY QUOTES COUNT. A phone or a word processor types the curly pair where a keyboard types `"`,
-    // and a question pasted from one was refused as unquoted (operator, 2026-10-11). Accepted here,
-    // for `ask`; the shell's tokenizer still treats them as ordinary characters elsewhere, so a `|`
-    // inside curly quotes is still a pipe. Straight quotes are the safe form, and the refusal shows them.
+    // and a question pasted from one was refused as unquoted (operator, 2026-10-11). At the prompt they
+    // never reach here: the input loop turns a curly quote into `"` as it is typed (`Utf8In`), so there
+    // they quote everywhere, pipes and arguments included. This acceptance is for a line that did not
+    // come through the prompt - a script - where the tokenizer still treats them as ordinary characters,
+    // so a `|` inside curly quotes is still a pipe. Straight quotes are the safe form, and the refusal shows them.
     let q = match q.strip_prefix('"').and_then(|x| x.strip_suffix('"'))
         .or_else(|| q.strip_prefix('\u{201c}').and_then(|x| x.strip_suffix('\u{201d}'))) {
         Some(inner) => inner,
@@ -16800,7 +16803,8 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 
 /// End a helper this shell started on demand, now that it holds nothing anybody still needs.
 ///
-/// `recorder`, `copier` and `ask` are started when a command wants them and are not services: nothing
+/// `recorder`, `copier` and `ask` are started when a command wants them and are not services (`ask` is
+/// ended by the drain that reads its answer, `drain_service_with`, as every pipe stage is): nothing
 /// restarts them, nothing else talks to them, and once their work is collected they are only a task
 /// slot, an IPC route and their memory - `copier` also woke every 500 ms, forever. They used to stay up
 /// until the machine rebooted, because nothing ended them; ending them is this shell's job, since it

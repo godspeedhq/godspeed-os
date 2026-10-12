@@ -2915,7 +2915,8 @@ At boot: `not rejoining yet - ... the supervisor's to say`, then 32 ms later `th
 is out - the radio carries the link`, a DHCP lease and the gateway answering a ping. The keyboard and the
 USB stick came up on `xhci` as before. (The twelve `fs: flash requested ... REFUSED` lines at boot are
 `fs`'s own protocol selftest walking every opcode with a zero capacity injected so it cannot format -
-documented beside the code that logs them, not a request from anywhere.) Steps 2 to 4 not yet run.
+documented beside the code that logs them, not a request from anywhere. Since 2026-10-11 they are not
+logged per probe at all: the selftest's PASS line counts them, `backlog/56`.) Steps 2 to 4 not yet run.
 
 **Steps 2 to 4 (same boot).**
 - **`wifi radio powercycle`:** the respawned driver was told again (`the USB radio is not attached`), stood

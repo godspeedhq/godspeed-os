@@ -23,7 +23,7 @@
 //!   5. Runs the main loop - death notices, operator commands, USB device reports - forever.
 //!
 //! This header said "Non-restartable" and "Yields indefinitely (death-notification restart loop
-//! deferred to Phase 6)". Phase 6 shipped: the loop is ~1,400 lines below, and the supervisor is the
+//! deferred to Phase 6)". Phase 6 shipped: the loop is near the end of `service_main`, and the supervisor is the
 //! worked example of §6.2. Someone reading this file to learn the restart model was told the opposite
 //! of the system.
 //!
@@ -49,7 +49,8 @@ use godspeed_sdk::service_context::usbdev;
 //
 // The supervisor's endpoint now receives TWO kinds of message, told apart by the first byte:
 //
-//   death notice   "pong"                        <- kernel-generated; a service name, [a-z0-9-]
+//   death notice   "pong" 0x00 'K' "shell"       <- kernel-generated; a service name, [a-z0-9-], a NUL,
+//                  "pong" 0x00 'F' <kind> <addr>    then how it ended (`death`; addr is u64 LE)
 //   command        0x01 'R' <core u32 LE> "pong" <- 0x01 cannot begin a name, so this is unambiguous
 //
 // Why a command channel exists at all: `control` used to do `kill` then `spawn` ITSELF, asking the
@@ -430,7 +431,7 @@ mod board {
     /// `ask-net`'s send peers: the same program as `ask`, started for a NETWORK question, so it gets the
     /// peers that question needs - the shell, the supervisor, `net-stack`, and the board's radio driver -
     /// instead of the storage chain's. Two rows because the kernel gives a task at most six send peers
-    /// (`MAX_SEND_PEERS`) and one row for every question would need eight; `observe`, `observe-now` and
+    /// (`MAX_SEND_PEERS`) and one row for every question would need seven; `observe`, `observe-now` and
     /// `observe-live` are the same shape. The shell chooses the row by reading the question with `ask`'s
     /// own `know.rs`, so the two cannot disagree about which question it is.
     pub const ASK_NET_PEERS: &[&str] = if cfg!(has_dwc2) {
@@ -1401,6 +1402,9 @@ fn is_watched(name: &str) -> bool {
 ///
 /// Bounded (26.6): the newest `DEV_EVENTS` are kept, `recorded` counts every one, so a reader knows how
 /// many were overwritten. Volatile: a respawned supervisor starts an empty record, and says from when.
+///
+/// The same struct also keeps `deaths`, which is NOT device-only: the newest death notice of every
+/// watched service, for `supcmd::DEATH` (2026-10-11). It shares `since`, so both answers say from when.
 const DEV_EVENTS: usize = 32;
 
 #[derive(Clone, Copy)]

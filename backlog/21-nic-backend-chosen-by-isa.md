@@ -74,7 +74,7 @@ What remains is the other end of it:
   supervisor stopped requesting it (`10d3b43e`) and the kernel's by-name arm is `net_device: false`
   (`3c75638e`). Confirmed on all five machines: the Pi 4 and both x86 boxes boot with DHCP, ARP,
   ping and SNTP working, and the Pi 2 and VisionFive likewise.
-- The kernel still IMPLEMENTS syscalls 42-44, and the SDK still exposes the wrappers. Nothing holds
+- The kernel still IMPLEMENTS syscalls 42-44 (the SDK wrappers are gone, above). Nothing holds
   the capability, so nothing can call them.
 - `nic-driver`'s contract already says the aarch64 grant "simply goes unused".
 
@@ -86,6 +86,6 @@ is that it not be there.
 **Deliberately not done here** because removing a syscall is a kernel change and this branch is about
 bounding what a new ISA has to touch, not about shrinking the kernel. The order matters too: the
 grant went first (done - see above, and it was provable by boot exactly as predicted); the SDK
-wrappers are second and the syscalls last, each wanting a boot behind it. Two steps remain, not
-three. Note that the Pi 2 path does **not**
+wrappers are second (done 2026-10-11) and the syscalls last, each wanting a boot behind it. One step
+remains: the syscalls. Note that the Pi 2 path does **not**
 use these syscalls either - it reaches `dwc2` by IPC - so this is all four ports, not three.

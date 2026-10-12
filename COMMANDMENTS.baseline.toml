@@ -717,9 +717,10 @@ SpawnImage               = 52
 [kernel.service_grants]
 # ask (2026-10-11, docs/ask-design.md): a foreground program for one question, READ ONLY. INTROSPECT for
 # the task table and `block-driver`'s capabilities; the shell for its answer; the supervisor's read-only
-# questions (MANAGED, EVENTS); `fs`'s drive report; the storage chain's capacity question to
-# `block-driver` and the USB host its disk is behind (`xhci`, or `dwc2` on the Pi 2, which the shell
-# names at runtime); each radio driver's status. No spawn, kill, console or write authority of any kind.
+# questions (MANAGED, EVENTS, DEATH); `fs`'s drive report; the storage chain's capacity question to
+# `block-driver` and the USB host its disk is behind (`xhci`, or `dwc2` on the Pi 2); each radio
+# driver's status. The peers are chosen per BOARD at build time (`board::ASK_PEERS`, at most six), so
+# this line is their union across boards. No spawn, kill, console or write authority of any kind.
 "ask" = ["peer:block-driver", "peer:dwc2", "peer:fs", "peer:shell", "peer:supervisor", "peer:wifi-driver", "peer:wifi-usb", "peer:xhci", "priv:INTROSPECT"]
 # ask-net: the same program, started for a network question, with that question's peers instead
 # (`board::ASK_NET_PEERS`): the shell, the supervisor, `net-stack` (its status) and the board's radio.

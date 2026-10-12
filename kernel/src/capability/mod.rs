@@ -83,6 +83,11 @@ pub const ACQUIRE_ANY_RESOURCE: ResourceId = ResourceId(9);
 /// bridges those frames to the frame IPC net-stack speaks. On non-ARM arches the NIC is a userspace PCIe
 /// driver and these syscalls return unsupported, so nothing holds this there. A frame is raw wire bytes,
 /// so - like a DMA-capable driver (§6.4) - this is real reach; it is granted explicitly, never ambient.
+///
+/// (Note 2026-10-12: the paragraph above is history. No port has an in-kernel network device - every
+/// arch's `net_frame_*` answers "no device" - nothing has been granted this since 2026-09-13, and the
+/// SDK wrappers for 42-44 were removed 2026-10-11. The id and the syscalls remain until `backlog/21`'s
+/// last step retires them.)
 pub const NET_DEVICE_RESOURCE: ResourceId = ResourceId(10);
 
 /// Authority to drive the SoC GPIO pins (the ARM `Gpio` syscall: set a pin's direction, drive it high/low,

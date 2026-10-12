@@ -1590,7 +1590,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 Some(n) => n,
                 None => capacity, // unknown - say what we last knew rather than invent an absence
             };
-            // [FS_OK, mounted, capacity:u64, used:u64, flags:u8, label_len:u8, label…]
+            // [FS_OK, mounted, capacity:u64, total:u64, used:u64, flags:u8, label_len:u8, label…]
             // Report what this answer is made of. `drives` reporting "no disk" while the boot log shows a
             // mounted 15 GB volume is a contradiction between two of our own statements, and neither side
             // said enough to tell which was wrong. This is the producing side (§26.4 - where the answer

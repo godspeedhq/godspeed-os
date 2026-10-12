@@ -235,7 +235,7 @@ const OP_CAPACITY: u8 = 3;
 // it to zero the free bitmap at format time so `drives flash` stays fast on a big disk.
 const OP_WRITE_ZEROS: u8 = 4;
 // Flush: [OP_FLUSH] → make every previously acknowledged write durable on the medium, reply
-// [STATUS_OK] or [STATUS_ERR]. A write completing does NOT mean the bytes reached the disk - a
+// [STATUS_OK] or [STATUS_ERR] - or, on the USB backend only, [STATUS_UNREACHABLE] (below). A write completing does NOT mean the bytes reached the disk - a
 // USB stick acknowledges into its own volatile buffer - so `fs` asks for durability explicitly at
 // the points where it promises it (format, journal commit). Backends that cannot flush say so
 // once at startup rather than quietly implying the data is safe (§26.7).

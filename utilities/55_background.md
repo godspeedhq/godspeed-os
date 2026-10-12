@@ -204,6 +204,13 @@ when the next starts. `foreground` on an older finished job reports its outcome 
 rather than replaying a different job's text under the right job's heading - a lie that would read
 perfectly.
 
+**Read once, then `copier` is ended (2026-10-11).** `copier` is not a service, and it used to stay up
+until reboot. The shell now ends it after the command that finishes its work: once the job has stopped
+running and its transcript has been replayed by `foreground` - or was empty, so there was nothing to
+collect. A later `foreground` on that job says the text was shown when it was first read back and is
+not kept after that. The shell learns that a job ended only when `jobs` or `foreground` asks, so a job
+that finishes while nobody looks keeps `copier` until then.
+
 ## 4. What a job can reach
 
 The `copier` service holds `fs` and its log. **It has no `console_push`**, so a detached job cannot

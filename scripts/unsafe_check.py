@@ -42,14 +42,14 @@ SDK_PERMITTED = {"sdk/rust/src/syscall.rs", "sdk/rust/src/mmio.rs", "sdk/rust/sr
                  "sdk/rust/src/adversarial.rs"}
 
 # ...and the files that hold `unsafe` anyway, frozen at their counts (18.5's grandfathering, applied
-# to the SDK). These are NOT 90 separate defects: 86 of the 90 are `unsafe { raw_syscall(..) }` call
+# to the SDK). These are NOT 85 separate defects: 82 of the 85 are `unsafe { raw_syscall(..) }` call
 # sites. `raw_syscall` is an `unsafe fn` because it issues the trap instruction, so every caller must
 # open a block - and these two files ARE the wrapper layer that exists to keep services unsafe-free.
 # The isolation 18.1 describes worked (services/ is at ZERO) and stopped one layer short of itself.
 #
 # Freezing them makes the debt visible and bounded. The real fix is a SAFE `raw_syscall` wrapper -
 # the kernel validates every user pointer, so passing integers to a validating callee is sound - which
-# would collapse ~86 of these to nothing. That is an SDK redesign on every service's call path, so it
+# would collapse ~82 of these to nothing. That is an SDK redesign on every service's call path, so it
 # is recorded rather than done here.
 SDK_GRANDFATHERED = {
     "sdk/rust/src/service_context.rs": 77,
