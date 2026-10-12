@@ -167,7 +167,7 @@ fn build_tables() {
 /// the physical address it produced. `PAR` bit 0 is the fault flag; on success the PA is in `[31:12]`.
 ///
 /// Returns `None` if translation faulted - which is the *expected* answer for an unmapped address.
-fn translate(va: u32) -> Option<u32> {
+pub(super) fn translate(va: u32) -> Option<u32> {
     let par: u32;
     // SAFETY: ATS1CPR (`c7, c8, 0`) is a PL1 address-translation op with no side effects on memory -
     // it walks the tables and writes the result to PAR (`c7, c4, 0`). The ISB orders the walk before

@@ -2710,7 +2710,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/bootcon.rs | 2 | permitted |
-| arch/arm/page_tables.rs | 32 | permitted |
+| arch/arm/page_tables.rs | 35 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |
 | arch/arm/spawn.rs | 4 | permitted |
@@ -2761,9 +2761,9 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 1130 lines across 72 files  
+**Permitted total:** 1133 lines across 72 files  
 **Grandfathered total:** 50 lines across 6 files  
-**Grand total:** 1180 lines across 78 files
+**Grand total:** 1183 lines across 78 files
 
 > These three lines read 394/22, 53/6 and 447/28 until 2026-09-12 - a tree of 28 files that had not
 > existed for months, and a grand total 2.7x low. They are derived by summing the inventory block
@@ -3674,3 +3674,34 @@ the bound still visible per 26.6.1), and a rate-limited line naming an exhausted
 known - the failure reaches the spawner as `FrameAllocFailed`, which named a frame when no frame was
 short. Found by a Pi 2 chaos run whose spawns were refused with 9 MiB of 921 in use
 (`docs/wifi-usb.md` 47).
+
+## `arch/arm/page_tables.rs` 32 -> 35 (2026-10-12): kernel-stack guard pages, and no user page over kernel memory
+
+**Two blocks for one fault, and the first is not its cause.** `ask` and `recorder` died whenever they ran
+in task slot 15 on the Pi 2. The cause was LAYOUT: the kernel reaches its own memory at its physical
+address, every service is linked at 0x400000 with its context page at 0x3ff000, and in a task's table its
+own pages replace the kernel's view of those addresses. The kernel's BSS started right after its data and
+covered that range, so kernel stack slot 15 (0x3ff000..0x40f000) was, while the slot-15 task's table was
+installed, that task's code: its first entry pushed onto `ask`'s entry page. Measured, not inferred - the
+page changed between publish and first entry with no kernel store through the identity map and no user
+mapping writing it. `kernel-arm.ld` now starts BSS at 8 MiB, above every image (the largest ends at
+0x6aa034), and asserts that text, rodata and data end below 0x3ff000.
+
+**Block 1 (+1): the body of `unmap_4k_strided`, which was an empty stub here.** It was written while a
+stack overflow was the suspect, and the guard never fired, so it fixed nothing in this fault. It stays as
+the hardening every other port already has: the arm32 boot never called `task::install_kstack_guards`, so
+the Pi 2 had no guard pages at all. It splits each section the pool spans into a kernel-owned L2 table that
+maps every page exactly as the section did (`l2_small_page` with PRESENT|WRITABLE is the section's own
+attributes), then clears the guard entries. Sound because: it runs once on core 0 at boot with IRQs masked,
+before any other core or task exists; the tables are a dedicated static nothing else references, cleaned
+to the point of coherency before any L1 entry points at them (the walker reads non-cacheable); and every
+non-guard page keeps its physical address and attributes, so an access in the window before the TLBIALL
+reaches the same memory whichever descriptor it uses. The tables are outside the L2 arena, so
+`reclaim_user_frames` never frees one. `entry_for_va` asks the CPU's table walker (`mmu::translate`, ATS1CPR,
+already audited) and adds no `unsafe`. Proven in QEMU: a write to a guard page takes a translation fault.
+
+**Blocks 2 and 3 (+2): `kernel_ranges`, the addresses of three linker symbols** (the `unsafe extern`
+declaring them, and the `addr_of!` of each), so `PageTable::map` can refuse a USER page that lies on kernel
+memory - the same fault arriving another way, when an image grows into BSS. Sound because nothing is read
+through the symbols; only their addresses are taken. Proven in QEMU: a user page at 0x00900000 is refused
+with a line naming the kernel's ranges.

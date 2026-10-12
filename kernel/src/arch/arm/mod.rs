@@ -985,6 +985,11 @@ extern "C" fn arm_boot_main() -> ! {
     context_switch::selftest();
     let reserve_end = meminit::init(ram_end);
     meminit::selftest();
+    // Guard pages under every kernel stack, while this is still the only core and before any task
+    // exists (the neutral contract). x86 does this in `kernel_main` and the Pi 4 in its own boot path;
+    // this one never did, so on the Pi 2 a kernel stack that overflowed would have written silently into
+    // the saved registers of the task below it (`page_tables::unmap_4k_strided`).
+    crate::task::install_kstack_guards();
     syscall::selftest();
     usermode::selftest();
     loadtest::selftest();
