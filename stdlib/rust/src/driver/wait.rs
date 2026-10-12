@@ -131,7 +131,9 @@ pub fn ticks(ctx: &ServiceContext) -> u64 {
 }
 
 /// The machine's counter in milliseconds: a reading every task shares, that only goes forward, so two taken
-/// by two instances of one service - the second after the first died - are in order. For telling one
+/// by two instances of one service - the second after the first died - are in order. Until the counter passes
+/// about 1.8e15 ticks (`us_for` saturates; about 10 days on a 2 GHz TSC), after which it stops advancing -
+/// a defect, `backlog/84`. For telling one
 /// instance's events from the next one's, not for a date, and not time since boot on every board (the
 /// counter's origin is the board's). 0 when the counter is uncalibrated, where it cannot be known.
 #[cfg(not(test))]

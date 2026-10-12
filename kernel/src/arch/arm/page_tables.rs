@@ -556,10 +556,11 @@ pub unsafe fn fill_kernel_identity(pt_root: u32) {
                 // 0x3ff000, so both L1 entries are TABLEs. The two branches above assume the SOURCE is a
                 // kernel SECTION; when a *service* spawns another service (the shell spawning
                 // observe-now), the spawner ALSO split this megabyte, so its kernel pages live in its L2
-                // - and neither branch above fires. Left unfixed, the kernel data this 1 MiB holds (an
-                // embedded service ELF at 0x34xxxx - .rodata is ~21 MiB of include_bytes! - and the
-                // per-core arenas) is unmapped in the child, and the child's ELF loader faults reading
-                // the ELF magic (0x34eb68). Fill the child L2's HOLES from the source L2's present
+                // - and neither branch above fires. Left unfixed, the kernel data this 1 MiB holds is
+                // unmapped in the child. When the kernel still embedded the service ELFs (one sat at
+                // 0x34xxxx, in ~21 MiB of include_bytes!), the child's ELF loader faulted reading the ELF
+                // magic (0x34eb68); the kernel embeds none now (step C), and `kernel-arm.ld` keeps its data
+                // below 0x3ff000. Fill the child L2's HOLES from the source L2's present
                 // entries; the child's own ctx page is already non-zero, so it is never overwritten.
                 let dl2 = (d & 0xFFFF_FC00) as *mut u32;
                 let sl2 = (s & 0xFFFF_FC00) as *const u32;
@@ -769,7 +770,8 @@ pub fn entry_for_va(virt: u64) -> Option<u64> {
 // top of the stack below it, which on this port is where a BLOCKED task's saved user registers sit
 // (`srsdb` onto its SVC stack). Added 2026-10-12 while that was the suspect for `ask` and `recorder` dying
 // in slot 15; it was not the cause - the guard never fired, and the cause was the kernel's BSS lying under
-// the services' own pages (`kernel-arm.ld`). It stays because every other port already has it.
+// the services' own pages (`kernel-arm.ld`). It stays because x86 and the Pi 4 have it (RISC-V 64's `unmap_4k_strided` is still a
+// stub).
 //
 // So the sections the pool spans are split into 4 KiB pages here, once, at boot, with exactly the
 // attributes the section had (`l2_small_page` with PRESENT|WRITABLE is the section's own Normal
@@ -819,7 +821,7 @@ pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
             if e & 0b11 != 0b10 {
                 // Not a section: something already split it (or it is unmapped), and these tables were
                 // not built for it. Leave it alone and say so - a guard the walker would not honour is
-                // worse than none, because the check below would then believe it.
+                // worse than none, because `install_kstack_guards`' check (slot 0) would then believe it.
                 pl011_write(b"arm32: kstack guards - a pool section was not a plain section; left as it was\r\n");
                 continue;
             }

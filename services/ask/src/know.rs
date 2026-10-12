@@ -647,8 +647,8 @@ pub struct Facts<'a> {
     /// When these facts were taken, in seconds of uptime. Every answer carries it (design 5: two
     /// invocations are two observations).
     pub now: u64,
-    /// A fine-grained moment (the kernel's tick counter), used only to choose which joke: two questions
-    /// in the same second would otherwise get the same one.
+    /// A fine-grained moment (the kernel's tick counter). No longer read: it chose the joke until
+    /// `joke_index`, which picks from `now` (`backlog/84`).
     pub tick: u64,
     /// The live tasks. Always available: `ask` holds `INTROSPECT` for it.
     pub tasks: &'a [Task<'a>],

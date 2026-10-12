@@ -45,13 +45,17 @@ count goes in one: `repeat count 4 <command>`.
 - **Runs inside a script** as well as at the prompt. It is a built-in for that reason: a library script
   cannot be run from another script, and gsh cannot tell a number from a word, so `watch` could neither
   serve a script nor read a count.
+- **Each run is a script line.** The command runs one level down (`execute` at depth + 1), so `run`,
+  `selfcheck` and the library scripts are refused inside it, with a message about scripts, and full-screen
+  views (`help`, `docs`) print instead of opening (`backlog/84`).
 - **No screen clearing.** Clearing was there to make `watch` a live view; repeating is not that. For a live
   view of the system, `observe`.
 
 ## 4. Pipes (rule 12)
 
-`repeat` does not pipe: it runs commands, and each prints what it prints. `repeat count 3 status | ...` is
-the shell's pipe of the whole line, not of the runs. Recorded under rule 12 as an action.
+`repeat` does not pipe: it runs commands, and each prints what it prints. `repeat ... | ...` is refused
+(`'repeat' cannot start a pipe`), so a pipeline cannot be repeated either. Recorded under rule 12 as an
+action.
 
 ## 5. Capabilities
 

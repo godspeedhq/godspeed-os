@@ -34,7 +34,7 @@ is due when a scan exists, not before.
 
 | Op | Request | Reply |
 |---|---|---|
-| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2), gen(4)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`). `gen` names the binding and differs for every bind, a restarted host's included (`usbfn::next_gen`); the driver compares it, not only the IDs |
+| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2), gen(4)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`). `gen` names the binding: it differs from the previous bind, and from a restarted host's where the counter is calibrated and running (`usbfn::next_gen` says where it is not); the driver compares it, not only the IDs |
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
 | `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |
@@ -591,7 +591,8 @@ replugged. Both were on the next card, R4b.
 bound against not bound - the same test `main.rs` made since U1b. A dongle pulled and put back before
 `wifi-usb` reads the first notice reads as unchanged, and is not brought up again. The R2 and R3b replugs
 were seconds apart and never met it. Closing it needs the host to say WHICH insertion is bound (its USB
-address, which changes on every insertion), in `OP_INFO`.
+address, which changes on every insertion), in `OP_INFO`. *(Closed 2026-10-12 by `2e3c4052`: `OP_INFO`
+carries a gen and `wifi-usb` compares it, section 52.)*
 
 **Two sentences that are the shared loop's, and read wrong for a dongle.** `wifi radio off` logs "the
 firmware refused DOWN" after the dongle's own line says the off is not built. And the shell answers a

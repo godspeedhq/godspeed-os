@@ -30,9 +30,11 @@ pub const INFO_GEN_AT: usize = 6;
 pub const INFO_WHERE_AT: usize = 10;
 
 /// The gen for a new binding, given the host's `gs::driver::wait::counter_ms` now and the gen it gave last:
-/// the counter, so a host that restarted cannot repeat a gen its previous instance gave (a count from 1 did,
-/// on every restart), and always more than the last one this instance gave, so two binds in one millisecond
-/// - or an uncalibrated counter, which reads 0 - still differ. Never 0, which a report reads as absent.
+/// the counter, so a restarted host does not repeat a gen its previous instance gave (a count from 1 did, on
+/// every restart), and otherwise one more than the last this instance gave, so two binds in one millisecond
+/// still differ. Never 0, which a report reads as absent. Across a restart this holds only where the counter
+/// is calibrated and running: an uncalibrated one reads 0, so each instance counts from 1 again; the low 32
+/// bits wrap every ~49.7 days; and `counter_ms` stops after ~10 days on x86 (`backlog/84`).
 pub fn next_gen(now_ms: u64, last: u32) -> u32 {
     let t = now_ms as u32;
     if t > last { t } else { last.wrapping_add(1).max(1) }

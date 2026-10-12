@@ -44,12 +44,12 @@ supervisor (8.9):
 - `ATTACHED [host, port, vid, pid, class, binding generation]`
 - `DETACHED [host, port, binding generation]`
 
-The **binding generation** counts every bind on that host. It is meant to be returned by `usbfn::OP_INFO`
-as well, so the started driver - and a driver comparing after any re-enumeration - can tell "the same
-dongle, still bound" from "the same kind of dongle, bound again" (a replug, or a host re-scan that reset
-it); that half is not built (below). On `xhci` a re-enumeration of the same dongle reads as unchanged
-(`docs/wifi-usb.md` 25); on the Pi 2 a replug is seen, because the unplug's report stops the driver and the
-plug's starts a new one (`docs/wifi-usb.md` 10, 26).
+The **binding generation** names one bind on that host. `usbfn::OP_INFO` returns it as well (built
+2026-10-12, `2e3c4052`), so the started driver - and a driver comparing after any re-enumeration - can tell
+"the same dongle, still bound" from "the same kind of dongle, bound again" (a replug, or a host re-scan that
+reset it). It is taken from the machine's counter (`usbfn::next_gen`), so a restarted host does not repeat
+its previous instance's, where that counter is calibrated and running. Before it, on `xhci` a
+re-enumeration of the same dongle read as unchanged (`docs/wifi-usb.md` 25).
 
 Supervisor to host, for the reconcile: `ASK` (`usbdev::ASK`, one byte, no reply capability). The host
 answers with its ordinary report rather than a reply, so a late answer can never be mistaken for one of
@@ -58,8 +58,9 @@ the supervisor's commands, and there is one message carrying the state instead o
 **As built (Pi 2, `docs/wifi-usb.md` 26):** `sdk/rust/src/service_context.rs` `usbdev`. One message,
 `REPORT` - present or not, the binding count, VID:PID - instead of separate attached and detached
 messages: each report is the host's whole state for its device, so a duplicate is harmless. The host and
-port are not in it yet; two hosts report (`dwc2` and `xhci`), each with one such device. The binding count restarts with
-each host instance. `OP_INFO` does not carry it yet.
+port are not in it yet; two hosts report (`dwc2` and `xhci`), each with one such device. The binding
+generation was a count restarting with each host instance until 2026-10-12; it is now the gen above, and
+`OP_INFO` carries it.
 
 ## 3. What it changes
 
@@ -80,8 +81,8 @@ each host instance. `OP_INFO` does not carry it yet.
 
 | Host | Today | For a driver it does not run itself |
 |---|---|---|
-| `dwc2` (Pi 2) | binds the dongle, serves `usbfn` in full, tells `wifi-usb`, and REPORTS it (`usbdev`, 2026-10-06) | the generation in `OP_INFO` |
-| `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers; REPORTS it and watches its root or hub port (`docs/wifi-usb.md` 27). U2b and U2c, the bulk IN and OUTs, hardware-verified on the Pi 4: the dongle joins WPA2 through the VL805 (28-32) | the generation in `OP_INFO` |
+| `dwc2` (Pi 2) | binds the dongle, serves `usbfn` in full, tells `wifi-usb`, and REPORTS it (`usbdev`, 2026-10-06); the gen in `OP_INFO` (2026-10-12) | nothing |
+| `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers; REPORTS it and watches its root or hub port (`docs/wifi-usb.md` 27). U2b and U2c, the bulk IN and OUTs, hardware-verified on the Pi 4: the dongle joins WPA2 through the VL805 (28-32); the gen in `OP_INFO` (2026-10-12) | nothing |
 | `ehci` (the T630's second controller) - **limitation, not planned** | one topology: the AMD hub on its root port, low-speed keyboards and mice behind it; **skips every high-speed device** on a hub port | everything `xhci` needed, and bulk transfers from scratch |
 
 **`ehci` - A RECORDED LIMITATION, not planned work (operator, 2026-10-06).** A dongle in a socket that

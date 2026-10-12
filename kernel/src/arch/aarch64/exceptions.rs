@@ -1231,7 +1231,8 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             0b100100 | 0b100101 => (F_MEMORY, far),
             0b000000 | 0b001110 => (F_ILLEGAL, f.elr),
             // PC and SP alignment: the architecture leaves FAR UNKNOWN for an SP alignment fault, so
-            // both name the instruction that took it rather than an address that may be garbage.
+            // both report ELR rather than an address that may be garbage - the faulting instruction for
+            // SP alignment, the misaligned PC itself for PC alignment.
             0b100010 | 0b100110 => (F_ALIGNMENT, f.elr),
             _ => (F_OTHER, f.elr),
         };

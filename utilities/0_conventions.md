@@ -143,7 +143,10 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     (`ServiceContext::recv_abortable_deadline_noticing`, the receive-side twin of the request's
     `request_with_reply_qhint`) and the shell the words, because a task with no prompt has nothing
     to print. A new receive wait in the shell gets it by going through that helper. Not yet covered:
-    the fs handles listed in the note above, which are request waits, not receive waits.)*
+    the request waits made through plain `request_with_reply_abortable` (`fs_request`, `fs_raw` -
+    `drives`, `drives flash`, `reset`, `label` - and `ns_abortable`), the re-waits after an overtaken
+    reply in `fs_take_tagged` and `ns_take_tagged`, and the fs handles listed in the note above
+    (`backlog/84`).)*
 
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,

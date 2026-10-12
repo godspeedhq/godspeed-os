@@ -6192,7 +6192,7 @@ fn help_render_line(ctx: &ServiceContext, idx: usize) {
     help_render_line_of(ctx, HELP, "help", idx)
 }
 
-/// One line of `doc` as a PLAIN dump - a script, `run`, `assert` or `selfcheck` (no screen width).
+/// One line of `doc` as a PLAIN dump - a script, `run`, `assert`, `repeat` or `selfcheck` (no screen width).
 fn help_render_line_of(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, idx: usize) {
     let mut lb = LineBuf::new();
     help_line_text(doc, title, idx, help_term_width_at(doc, idx), &mut lb);
@@ -6906,7 +6906,7 @@ const SB_HDR: usize = 4;
 
 /// `help` - a browsable document (see `help_browser`), or a plain dump when nobody is watching.
 fn cmd_help(ctx: &ShellCtx, depth: u8, arg: &str) -> Result<(), ShellError> {
-    // NOBODY IS THERE TO PRESS A KEY. A script, `run`, `assert` or `selfcheck` is driving, and a
+    // NOBODY IS THERE TO PRESS A KEY. A script, `run`, `assert`, `repeat` or `selfcheck` is driving, and a
     // browser that waits for one does not degrade - it hangs the run. Same guard `paginate` carries,
     // and the reason paging belongs to things you ask for rather than things a command decides.
     if depth > 0 {
@@ -14276,7 +14276,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
 /// TWO CONDITIONS MUST BOTH HOLD before a key is ever waited for, and between them they are the
 /// reason this is safe where a built-in pager was not:
 ///
-///  - **`depth == 0`** - not inside a script, `run`, `assert` or `selfcheck`. A pager with nobody at
+///  - **`depth == 0`** - not inside a script, `run`, `assert`, `repeat` or `selfcheck`. A pager with nobody at
 ///    the keyboard does not degrade, it HANGS, and it hangs a run that may have been started
 ///    precisely because no one was going to watch it.
 ///  - **the output is the console** - not `$( )` capture, not `save <path>`, not a function-body
@@ -14604,7 +14604,9 @@ fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
         Ok(t) => Some(t),
         // The decoder's reason ("bad magic") is about the wire format, which is not what the operator
         // needs: an answer that does not decode is almost always one whose sender stopped mid-stream,
-        // and the drain above has already said so on serial.
+        // and the drain above has already said why (aborted, or no EOT) on the console. The two lines
+        // below then say "stopped" even when it was the operator's `q` or the shell's own timeout that
+        // ended it (`backlog/84`).
         Err(_) if cap.bytes().is_empty() => {
             gs::io::println(ctx, "ask: no answer - `ask` stopped before it replied");
             None
@@ -17205,8 +17207,8 @@ fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
 
 /// The most items one comma list takes (`spawn a,b,c`, `delete /a,/b`, ...).
 const LIST_MAX: usize = 16;
-/// The most names `kill all-services` holds: the supervisor's `MANAGED` set (32 at most in its answer)
-/// plus the supervisor and the shell.
+/// The most names `kill all-services` holds: room for the supervisor's `MANAGED` set (18 today) with
+/// headroom, plus the supervisor and the shell. Names past it are dropped without a word (`backlog/84`).
 const ALL_SERVICES_MAX: usize = 34;
 
 /// Run `one` for every item of a comma list, in order, and say how it went.
@@ -17830,10 +17832,11 @@ fn pipe_write(ctx: &ShellCtx, cwd: &Cwd, arg: &str, data: &[u8]) {
     }
 }
 
-/// Look up a just-spawned service's endpoint via the kernel name directory, retrying while it registers.
 /// What [`lookup_sink`] came back with.
 enum Sink { Found(gs::cap::Cap), TimedOut, Aborted }
 
+/// Look up a just-spawned service's endpoint via the kernel name directory, retrying while it registers.
+///
 /// The wait is quittable and says so, as every shell wait is (conventions rule 10): once it has run
 /// `gs::call::NOTICE_AFTER_SECS` it prints `[q] quit` (once per `noticed`, which the stage's drain
 /// shares) and from then on reads the console, `q` ending it and any other key going to `keep`. It
@@ -17882,7 +17885,7 @@ fn line_reads_secret(line: &[u8]) -> bool {
 }
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
-    // `kill all-services` (nuke every service but this shell) or `kill a,b,c` (a comma list) are
+    // `kill all-services` (every managed service, then the supervisor, then this shell) or `kill a,b,c` (a comma list) are
     // multi-target; a single name behaves EXACTLY as before. Per-service guards live in kill_one.
     if name == "all-services" || name.contains(',') {
         return kill_list(ctx, name);
@@ -17890,9 +17893,10 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     kill_one(ctx, name)
 }
 
-/// Kill a bounded set: the `all-services` keyword (every service the supervisor runs, `supcmd::MANAGED`,
-/// plus the supervisor and the shell: a complete system reset where everything dies and recovers, only
-/// the kernel never dies) or a comma-separated list. The set is ASKED of the supervisor, not written
+/// Kill a bounded set: the `all-services` keyword (every service the supervisor keeps running, its
+/// `supcmd::MANAGED` set, plus the supervisor and the shell: a reset of everything that is restarted, only
+/// the kernel never dying - what the supervisor starts for one job, `ask`, `recorder`, `copier`, `observe`
+/// and the probes, is not in that set) or a comma-separated list. The set is ASKED of the supervisor, not written
 /// here: a list kept in the shell (`CHAOS_RESTARTABLE`) was the set once and fell behind it - console,
 /// power, the audio and radio drivers, `wifi-usb` and `hw-enumerator` were all left running, so a
 /// "complete reset" killed a USB host and left the dongle's driver holding a chip the restart had reset. Each
@@ -18037,8 +18041,9 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
 // kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/events are
 // directly-restartable so max-carnage can't leave them dead.)
-// `time`, `control` and `dwc2` were MISSING here, and this list is not cosmetic: it is the expansion
-// of `kill all-services` and a hard refusal gate for `chaos kill-storm`. So the storm skipped them
+// `time`, `control` and `dwc2` were MISSING here, and this list is not cosmetic: it is a hard refusal
+// gate for `chaos kill-storm` (and, until 2026-10-12, it was the expansion of `kill all-services`, which
+// now asks the supervisor). So the storm skipped them
 // and `chaos kill-storm time` was refused outright - Commandment II ("nothing escapes") silently
 // false for the three services whose omission from a DIFFERENT list was the C5-1 finding.
 //
@@ -20515,9 +20520,11 @@ fn fc_invoke(ctx: &ShellCtx, file: gs::cap::Cap, right: u8, payload: &[u8]) -> O
 
 /// The shell's receive wait, quittable AND saying so: once nothing has come for
 /// `gs::call::NOTICE_AFTER_SECS` it prints `[q] quit`, once per `noticed` - a drain that waits for
-/// many messages says it once, not on every slow one. Every receive the shell waits on at the prompt
-/// goes through here, so a new one gets the notice without remembering it (utilities/0_conventions.md
-/// rule 10). Keys other than `q` go to `keep`.
+/// many messages says it once, not on every slow one. Every receive the shell waits on directly for a
+/// peer's answer goes through here, so a new one gets the notice without remembering it
+/// (utilities/0_conventions.md rule 10) - except the re-waits after an overtaken fs or net-stack reply
+/// (`fs_take_tagged`, `ns_take_tagged`), and the request waits made through plain
+/// `request_with_reply_abortable` (`backlog/84`). Keys other than `q` go to `keep`.
 fn recv_quittable(ctx: &ServiceContext, secs: i64, noticed: &core::cell::Cell<bool>, keep: &dyn Fn(u8)) -> ReqOutcome {
     let after = if noticed.get() { i64::MAX } else { gs::call::NOTICE_AFTER_SECS };
     ctx.recv_abortable_deadline_noticing(secs, after, &|| {

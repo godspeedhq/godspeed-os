@@ -142,11 +142,11 @@ names. The capacity path is unchanged: `xhciblk::sectors_now` already reads any 
 disk bound". AHCI and SDHCI drive their device directly and cannot be in this position.
 
 **Two `dwc2` paths answered `STATUS_ERR`, found by the 2026-10-12 comment audit (fixed the same day,
-below).** `answer_ungranted` (a `dwc2` granted no hardware) answers every block op `STATUS_ERR`, and the
-bounded drain in the main loop answers the request it consumed at `MSG_DRAIN_MAX` with `answer_no_disk`'s
-`STATUS_ERR` while a disk IS bound - so a flush caught there would still read as `Refused` though no
-device was asked. The second is the one that can happen under a storm; both want `STATUS_NO_DISK`, or
-for the drain, a status that says "not attempted".
+below).** `answer_ungranted` (a `dwc2` granted no hardware) answered every block op `STATUS_ERR`. The
+bounded drain in the main loop answered the request it consumed at `MSG_DRAIN_MAX` with `answer_no_disk`'s
+`STATUS_ERR` while a disk WAS bound, so a flush caught there would have read as `Refused` though no device
+was asked. The second was the one that could happen under a storm. Both wanted `STATUS_NO_DISK`, or, for
+the drain, a status that says "not attempted".
 
 **Both fixed 2026-10-12, in code after that audit.** `answer_ungranted` answers a block op `STATUS_NO_DISK`
 (a host with no hardware has no disk). The drain no longer answers at its bound at all: the bound is tested

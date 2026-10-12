@@ -147,7 +147,9 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     ctx.console_push(10);
 }
 
-/// Answer a block request when there is NO DISK, instead of consuming the message and going quiet.
+/// Answer a request `dispatch` could not route (an empty payload) with `STATUS_ERR`, instead of consuming
+/// the message and going quiet. A BLOCK request with no disk no longer comes here: `dispatch` answers it
+/// `STATUS_NO_DISK` (`backlog/57`). The history below is why this exists at all.
 ///
 /// `recv_timeout` CONSUMES. The two call sites below used to take a message and then drop it whenever
 /// `disk` was None, so a client blocked in request/reply waited forever for an answer that was never
@@ -341,7 +343,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut radio: Option<rtl::Radio> = None;
     let mut radio_port: u8 = 0;
     // The gen of the dongle's last bind on this host (`usbfn::next_gen`): the report's generation
-    // (`usbdev`) and `OP_INFO`'s, different for every bind, a restarted host's included.
+    // (`usbdev`) and `OP_INFO`'s: different from the last bind, and from a restarted host's where the
+    // counter is calibrated and running (`usbfn::next_gen` says where it is not).
     let mut radio_binds: u32 = 0;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
@@ -827,8 +830,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             }
                         } else {
                             // REMOVED. Drop the binding so requests are ANSWERED rather than sent to a
-                            // device that is not there: `answer_no_disk` and the net path both already
-                            // reply "unavailable", which is what a client needs to hear (§26.7).
+                            // device that is not there: `dispatch` answers a block request `STATUS_NO_DISK`
+                            // and a net request empty, so a client hears "unavailable" (§26.7).
                             ctx.log_fmt(format_args!("dwc2-svc: port {} - device REMOVED", port));
                             if kbd.is_some() && kbd_port == port {
                                 kbd = None;

@@ -309,7 +309,8 @@ impl Radio {
         let mut r = self.rpc(ctx, &Message::from_bytes(&[0x10]));
         // FOLLOW THE RADIO IN USE (`wifi hardware use`). Each radio says in this reply whether it is the
         // one the operator chose; this driver holds no choice of its own. While the current radio says
-        // another is in use, or does not answer, the other is asked (bounded, `OTHER_EVERY_MS`), and the
+        // another is in use, or does not answer, or - with no choice recorded - is not the default radio,
+        // the other is asked (bounded, `OTHER_EVERY_MS`), and the
         // frames move to it when it says it is the one - or when the current one is gone and the other
         // answers, because a saved choice is a preference and a missing radio must not leave the machine
         // without the one that is there (`utilities/56_wifi.md` 11).

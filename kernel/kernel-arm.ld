@@ -35,7 +35,7 @@ SECTIONS {
      * landed on the image of whatever ran in slot 15 - `ask`'s entry page was the top of its own
      * kernel stack, and the first push on it rewrote `ask`'s code (Pi 2, 2026-10-12). So BSS starts
      * above the window, and nothing of the kernel's is below it but text, rodata and data, which end
-     * before the context page. `page_tables::map` refuses a user page that would land on kernel memory,
+     * before the context page. `PageTable::map` (`arch/arm/page_tables.rs`) refuses a user page that would land on kernel memory,
      * so an image that grows past the window fails its spawn loudly rather than corrupting this. */
     ASSERT(__kernel_data_end <= 0x003FF000, "arm32: kernel text+rodata+data reach the service context page at 0x3ff000")
     . = MAX(ALIGN(8), 0x00800000);

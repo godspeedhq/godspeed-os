@@ -413,7 +413,7 @@ fn firmware(ctx: &ServiceContext) -> bool {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "wifi-usb");
     ctx.log("wifi-usb: starting - the USB WiFi dongle's driver; asks its USB host once whether a dongle is bound, then waits to be told");
-    // What was last said, so each change is said once: none yet, bound (vid, pid), gone, or a host fault.
+    // What was last said, so each change is said once: none yet, bound (vid, pid, gen), gone, or a host fault.
     let mut said: Option<Result<Option<(u16, u16, u32)>, &'static str>> = None;
     // The dongle as a station, once a bring-up has made one; `None` while there is no dongle or its
     // bring-up stopped - and then the loop below answers `radio down`, with why.
