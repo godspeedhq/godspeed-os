@@ -22,7 +22,7 @@ graceful-shutdown mechanism.
 |---|---|
 | `kill <name>` | Stop the running service named `<name>`. |
 | `kill <a>,<b>,...` | Stop each named service (comma list, no spaces, at most 16 names; a refused or absent one does not stop the rest). `supervisor` goes after the others and `shell` last. |
-| `kill all-services` | Stop every service the supervisor restarts (`CHAOS_RESTARTABLE`), then the supervisor, then this shell - a whole-system recycle in which only the kernel survives. |
+| `kill all-services` | Stop every service the supervisor runs, then the supervisor, then this shell - a whole-system recycle in which only the kernel survives. The set is the supervisor's own `MANAGED` list, asked at the moment of the command (`supcmd::MANAGED`, the list `ask` reads), so a service added to the system is in it without anyone editing the shell. If the supervisor does not answer, nothing is killed and the shell says so. |
 | `kill` (no name) | Prints `usage: kill <svc> \| <svc>,<svc>,... \| all-services   ('help kill' for detail)`. |
 
 ## 3. Behaviour & guards

@@ -17108,6 +17108,9 @@ fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
 
 /// The most items one comma list takes (`spawn a,b,c`, `delete /a,/b`, ...).
 const LIST_MAX: usize = 16;
+/// The most names `kill all-services` holds: the supervisor's `MANAGED` set (32 at most in its answer)
+/// plus the supervisor and the shell.
+const ALL_SERVICES_MAX: usize = 34;
 
 /// Run `one` for every item of a comma list, in order, and say how it went.
 ///
@@ -17790,14 +17793,21 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     kill_one(ctx, name)
 }
 
-/// Kill a bounded set: the `all-services` keyword (-> CHAOS_RESTARTABLE + the shell: a complete system
-/// reset where everything dies and recovers, only the kernel never dies) or a comma-separated list. Each
+/// Kill a bounded set: the `all-services` keyword (every service the supervisor runs, `supcmd::MANAGED`,
+/// plus the supervisor and the shell: a complete system reset where everything dies and recovers, only
+/// the kernel never dies) or a comma-separated list. The set is ASKED of the supervisor, not written
+/// here: a list kept in the shell (`CHAOS_RESTARTABLE`) was the set once and fell behind it - console,
+/// power, the audio and radio drivers, `wifi-usb` and `hw-enumerator` were all left running, so a
+/// "complete reset" killed a USB host and left the dongle's driver holding a chip the restart had reset. Each
 /// segment runs the full kill_one guard path; a denied / dead / absent one does NOT abort the rest. ORDER:
 /// everything except supervisor and shell first, then supervisor (so the kernel-respawned supervisor
 /// reconciles AFTER the nuke and respawns the fresh prompt, not mid-storm), then the shell LAST via its
 /// self-kill (it never returns), so every per-service report has printed before the session re-inits.
 fn kill_list(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
-    let mut segs: [&str; LIST_MAX] = [""; LIST_MAX];
+    use godspeed_sdk::service_context::supcmd;
+    // Asked first so the names it carries outlive `segs`, which borrows them.
+    let managed = if name == "all-services" { hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::MANAGED]) } else { None };
+    let mut segs: [&str; ALL_SERVICES_MAX] = [""; ALL_SERVICES_MAX];
     let mut n = 0usize;
     let items = name.split(',').filter(|s| !s.is_empty()).count();
     if name != "all-services" && items > LIST_MAX {
@@ -17806,9 +17816,26 @@ fn kill_list(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         return Err(ShellError::Unknown);
     }
     if name == "all-services" {
-        gs::io::println(ctx, "kill all-services: nuking every service - including this shell (a fresh prompt returns)");
-        for &s in CHAOS_RESTARTABLE.iter() { if n < segs.len() { segs[n] = s; n += 1; } }
-        if n < segs.len() { segs[n] = "shell"; n += 1; }   // shell dies LAST (the third pass below)
+        let names = match managed.as_ref().map(|m| m.payload_bytes()) {
+            Some(p) if p.first() == Some(&supcmd::OK) => p,
+            _ => {
+                gs::io::println(ctx, "kill all-services: the supervisor did not say which services it runs - nothing was done");
+                return Err(ShellError::Unknown);
+            }
+        };
+        // `[OK, count, (len, name)*]`. The supervisor and the shell are added below, in their own passes.
+        let count = names.get(1).copied().unwrap_or(0) as usize;
+        let mut at = 2usize;
+        for _ in 0..count {
+            let len = match names.get(at) { Some(&l) => l as usize, None => break };
+            let Some(s) = names.get(at + 1..at + 1 + len).and_then(|b| core::str::from_utf8(b).ok()) else { break };
+            at += 1 + len;
+            if s != "supervisor" && s != "shell" && n < segs.len() - 2 { segs[n] = s; n += 1; }
+        }
+        segs[n] = "supervisor"; n += 1;   // the second pass below
+        segs[n] = "shell"; n += 1;        // and LAST, the third
+        gs::io::println_fmt(ctx, format_args!(
+            "kill all-services: nuking all {} services the supervisor runs, then the supervisor and this shell (a fresh prompt returns)", n - 2));
     } else {
         for s in name.split(',') { if !s.is_empty() && n < segs.len() { segs[n] = s; n += 1; } }
     }
