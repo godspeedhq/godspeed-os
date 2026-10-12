@@ -98,6 +98,10 @@ pub(crate) struct Radio {
     other: Option<&'static str>,
     /// When the other radio was last asked whether it is the one in use: at most every `OTHER_EVERY_MS`.
     other_asked: Option<wait::Since>,
+    /// The radio the default order picks when no choice is recorded (`wire::USE_DEFAULT`: the onboard radio,
+    /// else the dongle) - the first one this bridge was built with. `name` and `other` swap as the bridge
+    /// follows the choice; this does not.
+    default: &'static str,
 }
 
 /// How often the other radio is asked whether it is the one in use, while the current one says it is
@@ -106,6 +110,7 @@ const OTHER_EVERY_MS: u64 = 5_000;
 /// `wire::USE_*` (`sdk/wifi`), as literals for the reason the op numbers are: this crate does not link it.
 const USE_NOT: u8 = 0;
 const USE_THIS: u8 = 1;
+const USE_DEFAULT: u8 = 2;
 /// Where `[0x10]`'s reply carries the radio's `USE_*` value.
 const INFO_USE_AT: usize = 15;
 
@@ -119,7 +124,7 @@ impl Radio {
             answered: 0, slow: 0, timeouts: 0, silent_run: 0, mismatch: 0, sendfail: 0, restale: 0,
             down_until: 0, backoffs: 0,
             held: [None, None], rescued: 0, held_dropped: 0,
-            other: None, other_asked: None,
+            other: None, other_asked: None, default: name,
         }
     }
 
@@ -310,17 +315,25 @@ impl Radio {
         // without the one that is there (`utilities/56_wifi.md` 11).
         let use_now = r.as_ref().and_then(|m| m.payload_bytes().get(INFO_USE_AT).copied());
         if let Some(other) = self.other {
-            let want_other = r.is_none() || use_now == Some(USE_NOT);
+            // `USE_DEFAULT` from the radio that is NOT the default is "not me" too. `wifi hardware use onboard`
+            // removes `/wifi.radio`, so both radios answer `USE_DEFAULT`; reading only `USE_NOT` as a reason
+            // to look, this stayed on a dongle that had just left the network while the onboard radio joined
+            // it, and the machine had no link (Pi 4, 2026-10-12).
+            let not_mine = use_now == Some(USE_NOT) || (use_now == Some(USE_DEFAULT) && self.name != self.default);
+            let want_other = r.is_none() || not_mine;
             let due = self.other_asked.as_ref().map_or(true, |t| t.passed(ctx, Budget::ms(OTHER_EVERY_MS)));
             if want_other && due {
                 self.other_asked = Some(wait::Since::now(ctx));
                 if let Some(o) = self.ask_other(ctx, other) {
                     let o_use = o.payload_bytes().get(INFO_USE_AT).copied();
-                    if o_use == Some(USE_THIS) || r.is_none() {
+                    let default_wins = o_use == Some(USE_DEFAULT) && other == self.default;
+                    if o_use == Some(USE_THIS) || default_wins || r.is_none() {
                         ctx.log_fmt(format_args!(
                             "nic-driver: the radio bridge now goes to {} ({}) - {} {}",
                             other,
-                            if o_use == Some(USE_THIS) { "the radio in use, /wifi.radio" } else { "the one that answers" },
+                            if o_use == Some(USE_THIS) { "the radio in use, /wifi.radio" }
+                            else if default_wins { "the default radio - no choice is recorded" }
+                            else { "the one that answers" },
                             self.name,
                             if r.is_none() { "does not answer" } else { "is not the one in use" }));
                         self.other = Some(self.name);
