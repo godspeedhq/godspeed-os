@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 1 of 9: the gsh language itself: bindings, arithmetic, control flow, functions, capture
+# GodspeedOS self-check, part 1 of 10: the gsh language itself: bindings, arithmetic, control flow, functions, capture
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck language` runs THIS part alone; `selfcheck` runs them all

@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 5 of 9: events persist: capture to disk, through a service that is NOT events
+# GodspeedOS self-check, part 5 of 10: events persist: capture to disk, through a service that is NOT events
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck persist` runs THIS part alone; `selfcheck` runs them all
@@ -105,7 +105,9 @@ read /sc/tiny.log | assert contains recorder: capture started
 read /sc/tiny.log | assert contains recorder: capture ended
 
 # The footer is what makes a capture readable as COMPLETE. A file with a header and no footer died.
-events persist status | assert contains idle
+# And `stop` ENDS the recorder (since 2026-10-11 the shell ends a helper once its work is over,
+# `services/CLAUDE.md`): status says `not running`, where it said `idle` while the recorder stayed up.
+events persist status | assert contains not running
 
 # NOT asserted here: filtering for a SPECIFIC owner. Which services have logged inside the 8 KiB
 # window varies by machine and by how far it has wrapped, so any such assertion is a coin flip on

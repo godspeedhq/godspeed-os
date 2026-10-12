@@ -6146,13 +6146,15 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     // tally says it stopped and NAMES what never ran. `failed 0` is what this very suite greens on,
     // so a quit that printed only a tally would pass while half the machine went unchecked.
     send(&mut write_half, b"selfcheck\r");
-    if collect_until(&buf, &mut cursor, b"part 3/9", Duration::from_secs(180)).is_some() {
+    // `part 3/` and not `part 3/9`: the total is the length of SELFCHECK_PARTS, and pinning it here
+    // failed this case, and the one after it, the day a tenth part was added.
+    if collect_until(&buf, &mut cursor, b"part 3/", Duration::from_secs(180)).is_some() {
         send(&mut write_half, b"q");
         match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
             Some(r) => {
                 let stopped = r.contains("STOPPED at your request");
                 let not_pass = r.contains("NOT a pass");
-                let named = r.contains("never run:") && r.contains("network");
+                let named = r.contains("never run:") && r.contains("network") && r.contains("ask");
                 if stopped && not_pass && named {
                     println!("script-test: PASS - `q` stops the run, and it refuses to look like a pass");
                     pass += 1;

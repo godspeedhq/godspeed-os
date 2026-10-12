@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 2 of 9: the assert forms, self-documentation, system info, introspection, observe
+# GodspeedOS self-check, part 2 of 10: the assert forms, self-documentation, system info, introspection, observe
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck meta` runs THIS part alone; `selfcheck` runs them all

@@ -4150,7 +4150,7 @@ const PROGRESS_BAR_W: usize = 22;
 /// What a run counted, so a caller running SEVERAL scripts can report one total.
 ///
 /// `run_lines`'s counters used to be locals that printed themselves, which is right for a single
-/// script and wrong for `selfcheck`, whose nine parts are one suite. `run: ran N, failed M` is an
+/// script and wrong for `selfcheck`, whose parts are one suite. `run: ran N, failed M` is an
 /// interface - nineteen harness checks match `failed 0` against it - so it must be printed once, by
 /// whoever knows the run is over.
 #[derive(Default, Clone, Copy)]
@@ -4700,7 +4700,7 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         }
         // APPENDED, never reshaped: the harness matches `run: ran N, failed M` exactly, and a tally
         // line is an interface. A part of a larger suite does not print it - its caller does, ONCE,
-        // after the last part, or nine parts would be nine suites as far as any reader is concerned.
+        // after the last part, or ten parts would be ten suites as far as any reader is concerned.
         if tally.is_none() {
             out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
         }
@@ -4880,6 +4880,7 @@ const SELFCHECK_PARTS: &[(&str, &str)] = &[
     ("data",     include_str!("../../../scripts/selfcheck/60-data.gsh")),
     ("cleanup",  include_str!("../../../scripts/selfcheck/70-cleanup.gsh")),
     ("network",  include_str!("../../../scripts/selfcheck/80-network.gsh")),
+    ("ask",      include_str!("../../../scripts/selfcheck/90-ask.gsh")),
 ];
 
 /// The whole suite's size, for the line `selfcheck` prints before it starts.
@@ -17213,9 +17214,14 @@ fn cmd_spawnwired(ctx: &ServiceContext) -> Result<(), ShellError> {
     // service's spawner holds a grantable cap to it (8.5, 7.3), and `pong`'s spawner is the
     // supervisor. It is also the shape every wired service gets at boot, so the diagnostic now
     // exercises the real path instead of a shell-only one.
-    let _ = ctx.spawn_via_supervisor("pong", 0xFFFF, &[]);   // may already be running
+    // Each spawn hands back a cap to the new service's endpoint; this diagnostic sends on neither, so
+    // both are released rather than leaked (the pipe stages' leak, above).
+    if let Ok(Some(c)) = ctx.spawn_via_supervisor("pong", 0xFFFF, &[]) {   // may already be running
+        gs::cap::remove(ctx, gs::cap::Cap::from(c));
+    }
     match ctx.spawn_via_supervisor("greet", 0xFFFF, &["pong"]) {
-        Ok(_)  => { gs::io::println(ctx, "spawnwired: greet wired to pong via a passed cap (watch for pong: received)"); Ok(()) }
+        Ok(cap)  => {
+            if let Some(c) = cap { gs::cap::remove(ctx, gs::cap::Cap::from(c)); } gs::io::println(ctx, "spawnwired: greet wired to pong via a passed cap (watch for pong: received)"); Ok(()) }
         Err(_) => { gs::io::println(ctx, "spawnwired: supervisor could not spawn greet wired to pong"); Err(ShellError::Unknown) }
     }
 }
@@ -17254,9 +17260,17 @@ fn drain_service_with(ctx: &ServiceContext, svc: &str, peers: &[&str], input: Op
     // Wire the service to send its output to the SHELL's own endpoint.
     // Through the SUPERVISOR, which owns every service image now (step C; the kernel's catalogue is the
     // supervisor alone). A pipe stage is a spawn wired to send to the shell's own endpoint.
-    if ctx.spawn_via_supervisor(svc, 0xFFFF, peers).is_err() {
-        gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
-        return false;
+    // The supervisor hands back a cap to the new stage's endpoint. Nothing here sends on it - a filter's
+    // input goes through `lookup_sink` below - so it is released at once. `.is_err()` dropped it and
+    // leaked one table slot per stage: about sixty `ask`s and pipe stages into a boot, the shell's table
+    // was full and every later lookup failed (found by `selfcheck ask` run twice in one boot; the same
+    // leak `spawn_on` closed for `backlog/80`).
+    match ctx.spawn_via_supervisor(svc, 0xFFFF, peers) {
+        Ok(cap) => { if let Some(c) = cap { gs::cap::remove(ctx, gs::cap::Cap::from(c)); } }
+        Err(_) => {
+            gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
+            return false;
+        }
     }
     if let Some(inp) = input {
         // Filter/sink: resolve the service's input endpoint (it must register) and feed it.
