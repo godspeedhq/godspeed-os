@@ -73,6 +73,7 @@
   - [`ping`](utilities/ping.md)
   - [`version`](utilities/version.md)
   - [`wait`](utilities/wait.md)
+  - [`repeat`](utilities/repeat.md)
   - [`whatis`](utilities/whatis.md)
   - [`trace`](utilities/trace.md)
   - [`events`](utilities/events.md)

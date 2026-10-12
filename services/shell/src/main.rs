@@ -1026,7 +1026,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve", "cores", "fcap",
+    "wait", "repeat", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve", "cores", "fcap",
     // An SSID is not a path. Completing one from the filesystem would be nonsense, and
     // completing it from the last scan would leak the names of networks in range into a shell
     // that records its history - so `wifi` offers keywords and nothing else.
@@ -1225,7 +1225,7 @@ const SUBCMD_THIRD: &[(&str, &str, &str, &[&str])] = &[
 /// Commands whose FIRST argument is a command name rather than a path or a keyword.
 ///
 /// `assert ok d⇥` should offer `dir`/`date`/`delete`, not the contents of the current directory.
-/// `watch` and `whatis` already had this; `assert` takes a command after its verb, which is one
+/// `repeat` and `whatis` already had this; `assert` takes a command after its verb, which is one
 /// level deeper and so was never reached.
 const CMDNAME_AFTER: &[(&str, &str)] = &[
     ("assert", "ok"),
@@ -1241,7 +1241,7 @@ const INFO_CMDS: &[&str] = &[
     "about", "version", "mem", "sock", "uptime", "status", "roster", "clear", "reboot",
     "result", "selfcheck", "caps", "help",
     // Library scripts whose only first-arg subcommands are the universal version/help ("size" is
-    // absent on purpose - its argument is a path, so it keeps path completion; "watch" has its own
+    // absent on purpose - its argument is a path, so it keeps path completion; "repeat" has its own
     // command-name completion case; "busiest" completes its column keywords via SUBCMD_FIRST).
     "health", "online",
 ];
@@ -1313,11 +1313,13 @@ fn complete_keyword(ctx: &ShellCtx, line: &mut Line, seg_start: usize, tok_start
         return complete_from_list(ctx, line, seg_start, SPAWN_TARGETS);
     }
 
-    // `watch <command ...>` / `whatis <name>`: the first argument IS a command name, so complete
-    // it from the same set the command position uses (built-ins + library scripts).
-    if ("watch".as_bytes() == cmd || "whatis".as_bytes() == cmd) && prior == 0 {
+    // `repeat <command ...>` / `whatis <name>`: the first argument IS a command name, so complete
+    // it from the same set the command position uses (built-ins + library scripts) - and for
+    // `repeat`, its two option words.
+    if ("repeat".as_bytes() == cmd || "whatis".as_bytes() == cmd) && prior == 0 {
         let mut names: [&str; 96] = [""; 96];
         let mut n = 0usize;
+        if "repeat".as_bytes() == cmd { names[0] = "count"; names[1] = "wait"; n = 2; }
         for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
         for &(lib, _) in LIBRARY { if n < names.len() { names[n] = lib; n += 1; } }
         return complete_from_list(ctx, line, tok_start, &names[..n]);
@@ -1433,7 +1435,7 @@ fn complete_keyword(ctx: &ShellCtx, line: &mut Line, seg_start: usize, tok_start
     if prior == 1 {
         if let Some(a1) = first_arg {
             // A COMMAND NAME, where the surface takes one - `assert ok d<tab>` must offer `dir`,
-            // `date`, `delete`, not the contents of the current directory. `watch` and `whatis`
+            // `date`, `delete`, not the contents of the current directory. `repeat` and `whatis`
             // already had this at position 1; nothing had it at position 2.
             if CMDNAME_AFTER.iter().any(|(c, f)| c.as_bytes() == cmd && f.as_bytes() == a1) {
                 let mut names: [&str; 96] = [""; 96];
@@ -2134,6 +2136,9 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         // `assert ok/fails <cmd>` - the result form (the content form `… | assert contains X` is
         // a pipe sink, handled in pipe_run). `s` is the trimmed whole line.
         "assert" => return cmd_assert(ctx, cwd, s["assert".len()..].trim(), depth),
+        // `repeat [count N] [wait S] <command ...>` - run a command again; `s` is the whole line, so the
+        // command after the options keeps its quoting.
+        "repeat" => return cmd_repeat(ctx, cwd, s["repeat".len()..].trim(), depth),
         "run" => {
             if depth > 0 {
                 gs::io::println(ctx, "run: a script cannot run another script (no nesting)");
@@ -4902,7 +4907,6 @@ const fn selfcheck_bytes() -> usize {
 /// script - two nested interpreter frames would blow the bounded user stack, the shell pipe stack-overflow lesson, `docs/pipes.md`).
 const LIBRARY: &[(&str, &str)] = &[
     ("health",  include_str!("../../../scripts/lib/health.gsh")),
-    ("watch",   include_str!("../../../scripts/lib/watch.gsh")),
     ("size",    include_str!("../../../scripts/lib/size.gsh")),
     ("online",  include_str!("../../../scripts/lib/online.gsh")),
     ("busiest", include_str!("../../../scripts/lib/busiest.gsh")),
@@ -5193,6 +5197,7 @@ const FOREIGN_HINTS: &[(&str, &str)] = &[
     ("uname", "about"),
     ("man",   "help"),
     ("which", "whatis"),
+    ("watch", "repeat"),    // names one reason to run a command again; this names what it does
     // Sound (utilities/57_audio.md).
     ("aplay", "audio play"),
     ("beep",  "audio tone"),
@@ -5209,7 +5214,7 @@ fn foreign_hint(cmd: &str) -> Option<&'static str> {
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "repeat", "whatis", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "read", "write", "edit", "fcap",
     // Seven that answered a command and not `<cmd> version` / `<cmd> help` (`backlog/80` H8):
     // `fmt help` read "help" as a path, and `whatis` called all seven unknown.
@@ -5422,6 +5427,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "wait" => help_block(ctx, "wait", "do nothing for N seconds (q aborts)", &[
             ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
+        ], true),
+        "repeat" => help_block(ctx, "repeat", "run a command again and again (q stops it)", &[
+            ("repeat <command ...>", "run it, then again, until q", "repeat mem"),
+            ("repeat wait <seconds> <command ...>", "the same, with that pause between runs", "repeat wait 2 status"),
+            ("repeat count <n> [wait <seconds>] <command ...>", "n runs, then the count of runs and failures; Err if any failed", "repeat count 4 wait 20 kill xhci"),
         ], true),
         "whatis" => help_block(ctx, "whatis", "what runs when a name is typed (kind + origin)", &[
             ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis dir"),
@@ -6070,7 +6080,8 @@ static HELP: &[HelpRow] = &[
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("random [n]", "words from the hardware random number generator"),
     Row("gpio <verb> <pin>", "drive a SoC GPIO pin (Pi 2 only)"),
-    Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - watch is built on it)"),
+    Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - repeat is built on it)"),
+    Row("repeat [count N] [wait S] <command>", "run a command again and again, q stops it (repeat count 4 wait 20 kill xhci)"),
     Row("whatis <name>", "what a name is: built-in / library script / pipe stage / service"),
     Row("net", "network status: IP, gateway, ping"),
     Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
@@ -6149,7 +6160,6 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Library (gsh scripts, baked in - type the name to run)"),
     Row("health", "one-shot health dashboard (cores, mem, uptime, net, drives)"),
-    Row("watch <command>", "re-run a command every 2s until q (watch mem)"),
     Row("size [path]", "total bytes of the files under a tree (size /docs)"),
     Row("online", "probe the network live: DNS + internet, ok/FAIL per layer"),
     Row("busiest [column]", "service table ranked by mem (or restarts / queue)"),
@@ -9178,7 +9188,7 @@ fn ping_wait_or_quit(ctx: &ShellCtx) -> bool {
 const WAIT_MAX_SECS: u32 = 3600;
 
 /// `wait <seconds>` - do nothing for N wall-clock seconds; `q`/`Q`/`Esc` aborts (returns `Err`, so a
-/// script can `if !wait 2 { break }`). The pacing primitive the library's `watch` loop is built on
+/// script can `if !wait 2 { break }`). The pacing primitive `repeat` is built on
 /// (generalising `ping_wait_or_quit` above): RTC-monotonic seconds, never the TSC (miscalibrated for
 /// wall-time on the T630). This is a USER-COMMANDED delay - the user (or their script) chose the
 /// cadence and holds the q escape - not a service coordinating with a peer, so Commandment VIII
@@ -9192,19 +9202,106 @@ fn cmd_wait(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         None => { gs::io::println(ctx, "usage: wait <seconds>   (q aborts)   e.g. wait 2"); return Err(ShellError::Unknown); }
     };
+    if pause_quittable(ctx, secs) { Ok(()) } else { Err(ShellError::Unknown) } // Err: aborted
+}
+
+/// The pause `wait` and `repeat` make: `secs` seconds, `false` the moment `q`/`Q`/Esc is pressed.
+fn pause_quittable(ctx: &ShellCtx, secs: i64) -> bool {
     // Whole-second granularity: waits until the monotonic epoch has advanced by `secs` (so `wait 1`
     // ends at the next second boundary - up to a second early, never late).
     let start = gs::task::epoch_secs_monotonic(ctx);
     loop {
         if let Some(b) = ctx.try_console_read() {
-            if b == b'q' || b == b'Q' || b == 0x1b { return Err(ShellError::Unknown); } // aborted
+            if b == b'q' || b == b'Q' || b == 0x1b { return false; }
         }
-        if gs::task::epoch_secs_monotonic(ctx) - start >= secs { return Ok(()); }
+        if gs::task::epoch_secs_monotonic(ctx) - start >= secs { return true; }
         // SLEEP, not yield: a yield loop kept this core busy for the whole wait (`backlog/80` H21).
         // 50 ms is short enough that `q` still answers at once.
         gs::task::sleep_ms(ctx, 50);
     }
 }
+
+/// `repeat [count N] [wait S] <command ...>` - run a command again and again (`utilities/61_repeat.md`).
+///
+/// `count N` bounds the runs (1..=`REPEAT_MAX`); without it the runs go on until `q`. `wait S` puts S
+/// seconds between runs (the `wait` utility's bounds and its `q`). Each run is announced, and the end says
+/// how many ran and how many failed - a failure in the middle of a long run is a count, not a line that
+/// scrolled away - and is an Err when any did, so a script can branch on it. `q` between runs stops it;
+/// a command that waits has its own `q` (rule 10).
+///
+/// Built in rather than a library script, unlike the `watch` it replaced: a script cannot tell a number
+/// from a word, and a library script cannot be run from another script, so it could neither read its own
+/// count nor serve a script. The name says what it does; `watch` names one reason to use it, and the shell
+/// answers that reflex with this word (`FOREIGN_HINTS`).
+fn cmd_repeat(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8) -> Result<(), ShellError> {
+    let usage = "usage: repeat [count N] [wait S] <command ...>   e.g. repeat count 4 wait 20 kill xhci   (q stops it)";
+    let mut count: Option<u32> = None;
+    let mut wait: u32 = 0;
+    let mut cmd = rest;
+    loop {
+        let (word, after) = split_first(cmd);
+        match word {
+            "count" => {
+                let (n, after) = split_first(after);
+                match parse_u32(n) {
+                    Some(v) if (1..=REPEAT_MAX).contains(&v) => { count = Some(v); cmd = after; }
+                    _ => {
+                        gs::io::println_fmt(ctx, format_args!("repeat: count is a number of runs, 1..{}", REPEAT_MAX));
+                        return Err(ShellError::Unknown);
+                    }
+                }
+            }
+            "wait" => {
+                let (n, after) = split_first(after);
+                match parse_u32(n) {
+                    Some(v) if (1..=WAIT_MAX_SECS).contains(&v) => { wait = v; cmd = after; }
+                    _ => {
+                        gs::io::println_fmt(ctx, format_args!("repeat: wait is seconds between runs, 1..{}", WAIT_MAX_SECS));
+                        return Err(ShellError::Unknown);
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        gs::io::println(ctx, usage);
+        return Err(ShellError::Unknown);
+    }
+    if split_first(cmd).0 == "repeat" {
+        gs::io::println(ctx, "repeat: a repeat of a repeat is refused - say the whole count in one: repeat count N <command>");
+        return Err(ShellError::Unknown);
+    }
+    let (mut ran, mut failed) = (0u32, 0u32);
+    let mut stopped = false;
+    loop {
+        ran += 1;
+        match count {
+            Some(n) => gs::io::println_fmt(ctx, format_args!("repeat {} of {}: {}   [q] quit", ran, n, cmd)),
+            None => gs::io::println_fmt(ctx, format_args!("repeat {}: {}   [q] quit", ran, cmd)),
+        }
+        if execute(ctx, cmd.as_bytes(), cwd, Ok(()), depth + 1, &mut Out::Console).is_err() {
+            failed += 1;
+        }
+        if count.is_some_and(|n| ran >= n) { break; }
+        // Between runs: `q` stops it. With a wait, for that long (the `wait` utility, so the same bound
+        // and the same keys); without one, a look at the keys and on to the next run.
+        let quit = if wait > 0 {
+            !pause_quittable(ctx, wait as i64)
+        } else {
+            matches!(ctx.try_console_read(), Some(b'q') | Some(b'Q') | Some(0x1b))
+        };
+        if quit { stopped = true; break; }
+    }
+    gs::io::println_fmt(ctx, format_args!("repeat: {} run(s), {} failed{}", ran, failed,
+        if stopped { " - stopped by q" } else { "" }));
+    if failed > 0 { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+/// The most runs `repeat count` takes. A bound, as every count in the shell has one (26.6); a longer
+/// run is `repeat` with no count, ended by `q`.
+const REPEAT_MAX: u32 = 10_000;
 
 /// `ping [bytes N] [count N] <ip>` - a Windows-style continuous ICMP echo to a raw IPv4, via net-stack.
 /// One `Reply from ...` line per echo (round-trip time + TTL), `q` quits, then a statistics summary.

@@ -121,6 +121,7 @@ fails.
 | [`assert`](utilities/assert.md) | verify a result or output (the test verb) |
 | [`result`](utilities/result.md) | the previous command's result (Ok / Err) |
 | [`wait`](utilities/wait.md) | wait |
+| [`repeat`](utilities/repeat.md) | run a command again and again |
 | [`fmt`](utilities/fmt.md) | format a script to the GodspeedOS standard |
 
 ### The shared contract

@@ -192,9 +192,9 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     | Not a pipe source | Why |
     |---|---|
     | `run`, `selfcheck` | Orchestrators: they run their own sub-pipelines, so capturing one nests a pipe inside a pipe on a 256 KiB stack - a hardware-proven crash. They write their own output with `save <path>` instead |
-    | `health`, `online`, `size`, `busiest`, `watch` (the library) | Scripts, run by the interpreter: the same class as `run`, refused inside another script for the same stack reason. Their contents pipe directly - `busiest` IS `status \| sort reverse mem` |
+    | `health`, `online`, `size`, `busiest` (the library) | Scripts, run by the interpreter: the same class as `run`, refused inside another script for the same stack reason. Their contents pipe directly - `busiest` IS `status \| sort reverse mem` |
     | `docs`, `scrollback`, `edit`, bare `observe` | Full-screen: a pipe cannot carry a screen you scroll. `scrollback save` and `observe now` are the capturable forms |
-    | `clear`, `wait`, `cd`, `mkdir`, `copy`, `move`, `rename`, `delete`, `seal`, `spawn`, `kill`, `restart`, `reboot`, `background`, `foreground` | Actions: the value is the effect, and what they print is a confirmation, not data |
+    | `clear`, `wait`, `repeat`, `cd`, `mkdir`, `copy`, `move`, `rename`, `delete`, `seal`, `spawn`, `kill`, `restart`, `reboot`, `background`, `foreground` | Actions: the value is the effect, and what they print is a confirmation, not data |
     | `wifi scan`, `join`, `leave`, `forget`, `radio ...` | Actions; `join` also reads a passphrase from the console, and piped its prompt would vanish. Refused with a sentence naming the reports |
     | `churn <seconds>`, `churn tear`, `churn reset` | Actions; `churn verify` is the report and pipes |
     | `chaos`, `fcap` | Exercisers whose value is what they prove while running; `chaos` writes its report with `save` |

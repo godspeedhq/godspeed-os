@@ -48,13 +48,25 @@ assert ok version
 assert ok cores
 assert ok mem
 assert ok date
-# wait: the q-abortable pacing pause (the library watch loop is built on it)
+# wait: the q-abortable pacing pause (repeat's pause is built on it)
 assert ok wait 1
 assert fails wait
 assert fails wait 0
 assert fails wait 99999
 assert ok wait help
 assert ok wait version
+# repeat: run a command again - a counted run holds, one whose runs fail is Err, and the refusals
+assert ok repeat count 2 echo repeated
+assert ok repeat count 2 wait 1 echo repeated
+assert fails repeat count 2 assert fails echo repeated
+assert fails repeat count 0 echo repeated
+assert fails repeat wait 0 echo repeated
+assert fails repeat count 2
+assert fails repeat repeat echo repeated
+assert ok repeat help
+assert ok repeat version
+# watch is the POSIX word for it: a hint to `repeat`, never run
+assert fails watch mem
 # whatis: a name's kind + origin (the honest which - no $PATH here, so kind IS the answer)
 assert ok whatis dir
 whatis dir | assert contains built-in
