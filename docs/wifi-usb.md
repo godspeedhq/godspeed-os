@@ -3113,3 +3113,16 @@ machine with no AMD-Vi table, so it says nothing about the T630's open `xhci` IO
 are unconfined and stay in the TCB (CLAUDE.md 6.4), as its boot line reports. During and just after
 chaos, `net-stack` logged four link queries that `nic-driver` did not answer in time; each says it is
 a timeout and not a reading, and the wired port had no cable.
+
+## 52. `feat/ask` on the Pi 4 (2026-10-12): the binding gen and the radio choice verified; the download fault, and once a bus that did not come back
+
+**Verified.** `xhci` restarted (`kill xhci`): `wifi-usb: xhci bound the dongle afresh (binding 0x37659, was
+0x13266) - the chip was reset, so it is brought up again from cold` (`2e3c4052`: `OP_INFO`
+now carries the binding's gen). `wifi hardware use onboard` and `use usb`: `nic-driver` moved its bridge
+each way, link up and a lease each time (`ce7feea2`; before it, `use onboard` left the bridge on a dongle
+that had just left the network, because `/wifi.radio` removed makes both radios answer `USE_DEFAULT`).
+
+**The download fault (sections 27, 33) again, in 6 of 9 bring-ups.** And once it was worse than recorded:
+after `kill all-services` the dongle's download failed, and for over three minutes every re-scan failed
+Address Device on hub ports 1 and 2 (the disk's port among them), so the run ended with no disk. Recorded
+as `backlog/83`, with what the gen change does and does not have to do with it.
