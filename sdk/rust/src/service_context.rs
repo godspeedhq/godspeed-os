@@ -2770,7 +2770,18 @@ impl ServiceContext {
     /// ran was lost: `ask`'s answer takes seconds, and the next command typed during it vanished in QEMU
     /// (the receive-side half of `backlog/80` H16).
     pub fn recv_abortable_deadline_keeping(&self, max_secs: i64, keep: &dyn Fn(u8)) -> ReqOutcome {
+        self.recv_abortable_deadline_noticing(max_secs, i64::MAX, &|| {}, keep)
+    }
+
+    /// [`Self::recv_abortable_deadline_keeping`] that calls `on_linger` ONCE when no message has come
+    /// after `hint_after_secs` - the receive-side twin of [`Self::request_with_reply_qhint`]. The SDK
+    /// supplies the timing and the caller the words, as there: a task with no prompt has nothing to
+    /// print, so this never writes to the console itself.
+    pub fn recv_abortable_deadline_noticing(
+        &self, max_secs: i64, hint_after_secs: i64, on_linger: &dyn Fn(), keep: &dyn Fn(u8),
+    ) -> ReqOutcome {
         let t0 = self.epoch_secs_monotonic();
+        let mut lingered = false;
         loop {
             // Block, do not spin - see `await_slice`.
             if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) { return ReqOutcome::Reply(r); }
@@ -2778,7 +2789,12 @@ impl ServiceContext {
                 if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
                 keep(b);
             }
-            if self.epoch_secs_monotonic() - t0 >= max_secs {
+            let elapsed = self.epoch_secs_monotonic() - t0;
+            if !lingered && elapsed >= hint_after_secs {
+                lingered = true;
+                on_linger();
+            }
+            if elapsed >= max_secs {
                 return ReqOutcome::Timeout;
             }
         }

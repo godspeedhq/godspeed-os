@@ -14505,7 +14505,17 @@ fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
     }
     match Table::decode(cap.bytes()) {
         Ok(t) => Some(t),
-        Err(why) => { gs::io::println_fmt(ctx, format_args!("ask: bad answer - {}", why)); None }
+        // The decoder's reason ("bad magic") is about the wire format, which is not what the operator
+        // needs: an answer that does not decode is almost always one whose sender stopped mid-stream,
+        // and the drain above has already said so on serial.
+        Err(_) if cap.bytes().is_empty() => {
+            gs::io::println(ctx, "ask: no answer - `ask` stopped before it replied");
+            None
+        }
+        Err(_) => {
+            gs::io::println(ctx, "ask: the answer arrived incomplete - `ask` stopped partway through it");
+            None
+        }
     }
 }
 
@@ -17272,10 +17282,12 @@ fn drain_service_with(ctx: &ServiceContext, svc: &str, peers: &[&str], input: Op
             return false;
         }
     }
+    // One `[q] quit` for the whole stage: the registration wait below and the drain after it share it.
+    let noticed = core::cell::Cell::new(false);
     if let Some(inp) = input {
         // Filter/sink: resolve the service's input endpoint (it must register) and feed it.
-        match lookup_sink(ctx, svc) {
-            Some(h) => {
+        match lookup_sink(ctx, svc, &noticed, keep.unwrap_or(&|_| {})) {
+            Sink::Found(h) => {
                 // Report a failed feed loudly rather than silently draining nothing (§26.7): if the
                 // filter died after registering, the user must see it, not get a silent empty result.
                 let fed = gs::ipc::send_to(ctx, h, &Message::from_bytes(inp)).is_ok()
@@ -17291,7 +17303,12 @@ fn drain_service_with(ctx: &ServiceContext, svc: &str, peers: &[&str], input: Op
                     return false;
                 }
             }
-            None => {
+            Sink::Aborted => {
+                gs::io::println(ctx, "pipe: aborted");
+                let _ = ctx.kill(svc);
+                return false;
+            }
+            Sink::TimedOut => {
                 // Distinct, honest wording: a registration TIMEOUT (filter never became ready) is
                 // not "not a filter". The new phrasing also tells stale-image runs apart - if this
                 // text ever changes on hardware, the new shell is running (§26.7 loud failure).
@@ -17309,10 +17326,7 @@ fn drain_service_with(ctx: &ServiceContext, svc: &str, peers: &[&str], input: Op
     // output) must not hang the prompt forever with the keyboard dead. Timeout => it died mid-stream;
     // Aborted => the user pressed q. Both stop the drain loudly (§26.7) rather than blocking.
     for _ in 0..512 {
-        let got = match keep {
-            Some(k) => ctx.recv_abortable_deadline_keeping(wait_secs, k),
-            None => ctx.recv_abortable_deadline(wait_secs),
-        };
+        let got = recv_quittable(ctx, wait_secs, &noticed, keep.unwrap_or(&|_| {}));
         match got {
             ReqOutcome::Reply(msg) => {
                 let p = msg.payload_bytes();
@@ -17717,7 +17731,14 @@ fn pipe_write(ctx: &ShellCtx, cwd: &Cwd, arg: &str, data: &[u8]) {
 }
 
 /// Look up a just-spawned service's endpoint via the kernel name directory, retrying while it registers.
-fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<gs::cap::Cap> {
+/// What [`lookup_sink`] came back with.
+enum Sink { Found(gs::cap::Cap), TimedOut, Aborted }
+
+/// The wait is quittable and says so, as every shell wait is (conventions rule 10): once it has run
+/// `gs::call::NOTICE_AFTER_SECS` it prints `[q] quit` (once per `noticed`, which the stage's drain
+/// shares) and from then on reads the console, `q` ending it and any other key going to `keep`. It
+/// reads no key before the notice, so a key typed ahead is not taken from the next command.
+fn lookup_sink(ctx: &ServiceContext, sink: &str, noticed: &core::cell::Cell<bool>, keep: &dyn Fn(u8)) -> Sink {
     // A freshly-spawned filter registers its input endpoint only once it actually RUNS - which on
     // real multi-core hardware is up to ~1 s after spawn (it's on another core and hasn't been
     // scheduled yet). Retry until it appears, bounded by REAL wall-clock time (the RTC).
@@ -17731,8 +17752,19 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<gs::cap::Cap> {
     // normally succeeds on the first iteration - the bounded wait is just a guard.
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     loop {
-        if let Ok(h) = gs::cap::acquire_grantable(ctx, sink) { return Some(h); }
-        if gs::task::epoch_secs_monotonic(ctx) - t0 >= FILTER_WAIT_SECS { return None; }
+        if let Ok(h) = gs::cap::acquire_grantable(ctx, sink) { return Sink::Found(h); }
+        let elapsed = gs::task::epoch_secs_monotonic(ctx) - t0;
+        if !noticed.get() && elapsed >= gs::call::NOTICE_AFTER_SECS {
+            noticed.set(true);
+            gs::io::println(ctx, "  [q] quit");
+        }
+        if noticed.get() {
+            while let Some(b) = ctx.try_console_read() {
+                if b == b'q' || b == b'Q' || b == 0x1b { return Sink::Aborted; }
+                keep(b);
+            }
+        }
+        if elapsed >= FILTER_WAIT_SECS { return Sink::TimedOut; }
         gs::task::yield_now(ctx);
     }
 }
@@ -20344,7 +20376,7 @@ fn fc_invoke(ctx: &ShellCtx, file: gs::cap::Cap, right: u8, payload: &[u8]) -> O
     // whatever the kernel has since placed in that slot - which is how the file cap was being deleted.
     // That holds on EVERY outcome below, an abort or a timeout included: they are waits after a
     // delivered invoke, not sends that failed. Only the failed invoke above reclaims (backlog/67).
-    let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
+    let outcome = recv_quittable(ctx, FILTER_WAIT_SECS, &core::cell::Cell::new(false), &|_| {});
     match outcome {
         ReqOutcome::Reply(m) => {
             let b = m.payload_bytes();
@@ -20355,6 +20387,19 @@ fn fc_invoke(ctx: &ShellCtx, file: gs::cap::Cap, right: u8, payload: &[u8]) -> O
         }
         _ => None,
     }
+}
+
+/// The shell's receive wait, quittable AND saying so: once nothing has come for
+/// `gs::call::NOTICE_AFTER_SECS` it prints `[q] quit`, once per `noticed` - a drain that waits for
+/// many messages says it once, not on every slow one. Every receive the shell waits on at the prompt
+/// goes through here, so a new one gets the notice without remembering it (utilities/0_conventions.md
+/// rule 10). Keys other than `q` go to `keep`.
+fn recv_quittable(ctx: &ServiceContext, secs: i64, noticed: &core::cell::Cell<bool>, keep: &dyn Fn(u8)) -> ReqOutcome {
+    let after = if noticed.get() { i64::MAX } else { gs::call::NOTICE_AFTER_SECS };
+    ctx.recv_abortable_deadline_noticing(secs, after, &|| {
+        noticed.set(true);
+        gs::io::println(ctx, "  [q] quit");
+    }, keep)
 }
 
 /// The largest file-cap request the shell builds, plus its tag. Every `fcap` request is a short

@@ -135,6 +135,16 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     bounded at `gs::call::DEFAULT_SECS` but cannot be ended with `q` - a code defect against this
     rule, recorded in each utility's own spec.)*
 
+    *(Note 2026-10-12: the advertisement is now AUTOMATIC on the shell's receive waits, at the
+    operator's standing rule - "for every request that takes time, there should automatically be a
+    `[q] to quit`". A pipe stage's drain (`drain_service_with`, which `ask` also goes through) and a
+    file-cap reply wait through `recv_quittable` in `services/shell`, which prints `  [q] quit` once
+    nothing has come for `gs::call::NOTICE_AFTER_SECS`, once per wait. The SDK gives the timing
+    (`ServiceContext::recv_abortable_deadline_noticing`, the receive-side twin of the request's
+    `request_with_reply_qhint`) and the shell the words, because a task with no prompt has nothing
+    to print. A new receive wait in the shell gets it by going through that helper. Not yet covered:
+    the fs handles listed in the note above, which are request waits, not receive waits.)*
+
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,
     `sock` and `serve`'s listen all go through - used a bare `request_with_reply`, which parks the

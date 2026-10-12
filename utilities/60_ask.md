@@ -109,3 +109,9 @@ that runs out of either says it is PARTIAL. Every request `ask` makes waits at m
 report 8 s, because it re-asks `block-driver` for the device's size - and the shell waits at most 25 s
 for the answer, so a dead source ends one line ("did not answer") and never the
 command.
+
+That wait is quittable and says so: once 2 s pass with nothing from `ask`, the shell prints `[q] quit`,
+and `q` ends it (conventions rule 10). If `ask` stops before its answer is whole, the shell says which
+of two things happened: `ask: no answer - ask stopped before it replied`, or `ask: the answer arrived
+incomplete - ask stopped partway through it`. It does not print the record decoder's reason, which is
+about the wire format and not about what the operator asked.
