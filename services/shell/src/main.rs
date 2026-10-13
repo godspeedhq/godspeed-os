@@ -125,7 +125,7 @@ const DIR_PAGE_MAX: u16 = 512;
 /// Where a `LIST_DIR` walk has reached, across the several round trips a long directory needs.
 ///
 /// One reply block carries about twenty entries, so a bigger directory arrives in pages
-/// (`backlog/33`). Before this, every caller read one page and stopped: `dir` said TRUNCATED, but
+/// (`backlog/fixed/33`). Before this, every caller read one page and stopped: `dir` said TRUNCATED, but
 /// `find`, `tree` and `copy` just walked what they could see and reported success - a recursive
 /// copy that silently skipped files and said it had copied the directory.
 ///
@@ -4915,7 +4915,7 @@ const LIBRARY: &[(&str, &str)] = &[
 // audit U6: baked scripts must stay under the u16 offset ceiling `prescan_fns` uses (64 KiB), or the
 // fn/summary offsets wrap silently and dispatch the wrong bodies. Fail the build, not at runtime.
 //
-// PER PART, which is the point of there being parts (`backlog/47`). The suite reached 65,139 bytes of
+// PER PART, which is the point of there being parts (`backlog/fixed/47`). The suite reached 65,139 bytes of
 // this ceiling as one file, with 397 to spare; nine parts put the largest at about a fifth of it. The
 // same u16 bound applies twice over - `prescan_fns` indexes `fn` definitions with it, and
 // `run_lines`' own `soff`/`fail_off`/`skip_off` index the same buffer - and splitting satisfies both,
@@ -6593,7 +6593,7 @@ const _: () = assert!(SB_FETCH.is_power_of_two(),
 /// The WHOLE scrollback, held for the life of one viewing.
 ///
 /// **FETCHED ONCE WHEN THE VIEW OPENS, SO A KEYPRESS COSTS NO IPC AT ALL.** That is the property
-/// this arena exists to buy, and it is what finally ends `backlog/37` rather than mitigating it.
+/// this arena exists to buy, and it is what finally ends `backlog/fixed/37` rather than mitigating it.
 ///
 /// The console is both the service this reads FROM and the service it draws TO - one service, one
 /// 16-deep queue - so any request made mid-frame can queue behind painting this very utility just
@@ -6743,7 +6743,7 @@ fn cmd_scrollback(ctx: &ShellCtx, cwd: &Cwd, depth: u8, arg: &str) -> Result<(),
 /// of those made the console `paint_view` + `present` BEFORE it could reply - a full repaint of a
 /// 3840x2160 framebuffer, inside the caller's deadline, on the core the caller was blocked on. Hold
 /// PgUp and you issue one of those per key repeat; the shell then declared a console that was merely
-/// busy to be dead (`backlog/37`).
+/// busy to be dead (`backlog/fixed/37`).
 ///
 /// Here the console is only ever asked for BYTES, which is a bounded memcpy out of its ring, and this
 /// paints its own screen with ordinary output - a send, with no deadline on it. A keypress costs no
@@ -9560,7 +9560,7 @@ mod audio_wire {
 ///
 /// Every audio answer is IMMEDIATE by design (`sdk/audio`'s `wire`): a tone is started and answered, then
 /// followed with status. So the radio's machinery for answers it is owed does not apply - but the TAG does,
-/// for the reason it exists (backlog/70): a receive takes what is next, and an answer to a request this
+/// for the reason it exists (backlog/fixed/70): a receive takes what is next, and an answer to a request this
 /// shell gave up on must never be read as the answer to the next one. The wait takes only the reply
 /// carrying this request's tag; a late audio answer is passed over, and anything else that arrives is
 /// dropped with any capability it carries released, as `wifi_sift` does.
@@ -10786,7 +10786,7 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // asks one thing at a time and reads keys from the kernel ring, so anything queued before a request
     // is stale by construction (`wifi_drain_stale`).
     //
-    // AND EVERY ANSWER IS RECOGNISED BY ITS TAG (backlog/70). The drain could not clear an answer still in
+    // AND EVERY ANSWER IS RECOGNISED BY ITS TAG (backlog/fixed/70). The drain could not clear an answer still in
     // flight, so the shell COUNTED what it was owed and skipped that many - and counted them by watching
     // its reply mailbox, which takes every peer's replies: a late `time` or `fs` answer cancelled an owed
     // radio answer, and the next request read the old one (reproduced in QEMU, 2026-10-02). The tag is a
@@ -10995,7 +10995,7 @@ fn wifi_no_answer(ctx: &ShellCtx, out: &mut Out, outcome: &ReqOutcome, doing: &s
 /// its endpoint, and a late `net-stack` reply is discarded by its own tag check either way.
 ///
 /// Returns `(late, other)`: late radio answers - recognised by their tag, and counted off `wifi_owed` by
-/// `wifi_sift` - and everything else. Until the tag (backlog/70) the count was set against every reply in
+/// `wifi_sift` - and everything else. Until the tag (backlog/fixed/70) the count was set against every reply in
 /// the mailbox, which takes EVERY peer's replies: in QEMU a stray `[1, 4]` from another service cancelled
 /// an owed radio answer, the next `wifi status` was sent behind it, and it read the first one's answer.
 fn wifi_drain_stale(ctx: &ShellCtx) -> (u32, u32) {

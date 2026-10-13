@@ -64,7 +64,7 @@ names the wrong cause.
 
   **What the stale line cost.** Before a chaos soak on that board, the kill-path budget
   (`tsc_ticks_per_quantum * 75`) was predicted to be ~1000x short, making the T630 the board most
-  likely to exercise `backlog/48`'s new abandon path. It fired nothing in 6,485 kills, because the
+  likely to exercise `backlog/fixed/48`'s new abandon path. It fired nothing in 6,485 kills, because the
   budget is a correct 0.75 s. The prediction rested on this line, and on misreading the code comment
   above as a statement of the PROBLEM when it is a statement of the FIX. An entry that records a
   defect and outlives it produces exactly the wrong confidence, which is this entry's own thesis

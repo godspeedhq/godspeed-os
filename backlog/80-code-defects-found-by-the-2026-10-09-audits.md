@@ -33,7 +33,7 @@ and `random 50` gave distinct words, `observe now` showed every service up, and 
 0, skipped 0, `dns` included. Two things in the storm are recorded where they belong rather than here as
 new items: the 17,813 `free_frame: IGNORED phantom frame` lines are `audits/kernel-audit.md` A10-8 (the
 AArch64 reclaim frees a dead driver's device pages, and only the allocator's range check stops them), and
-the two `kill: ABANDONED slot` lines are the first real firings of the path `backlog/48` records as
+the two `kill: ABANDONED slot` lines are the first real firings of the path `backlog/fixed/48` records as
 unexercised, written up there.
 
 **VisionFive 2 Lite, 2026-10-11, image `105c06af`:** `chaos max-carnage all-services 1000`: 6972 kills, 5985
@@ -128,7 +128,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
 - **K17. x86 `route_ehci_intx` always targets the BSP while `EHCI_CORE` is 3**, so each wake crosses cores
   (unverified on hardware). **Possible:** a line masked at a driver's death is not unmasked by `register`;
   whether a respawned level-triggered `ehci` unmasks before its first interrupt is unverified.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** every spawn of `ehci` re-aims its INTx candidates' IOAPIC entries at the spawned core (`ioapic::set_dest`, the destination only). **T630 card 2026-10-10:** the back-port keyboard types, and `ehci: legacy INTx candidates re-aimed at core 3` is logged at boot and on each of eight respawns (`chaos kill-storm ehci 4`, twice, 8 of 8 recovered); `selfcheck` 534 passed, 0 failed. The interrupt itself is still not seen on this board - `ehci` falls back to polling, as `backlog/11` already records - so the card shows the re-aim does no harm, not that INTx now arrives.
+  **FIXED on `fix/backlog-80`, 2026-10-10:** every spawn of `ehci` re-aims its INTx candidates' IOAPIC entries at the spawned core (`ioapic::set_dest`, the destination only). **T630 card 2026-10-10:** the back-port keyboard types, and `ehci: legacy INTx candidates re-aimed at core 3` is logged at boot and on each of eight respawns (`chaos kill-storm ehci 4`, twice, 8 of 8 recovered); `selfcheck` 534 passed, 0 failed. The interrupt itself is still not seen on this board - `ehci` falls back to polling, as `backlog/fixed/11` already records - so the card shows the re-aim does no harm, not that INTx now arrives.
 - **K18. InspectKernel's ungated list still names deleted queries 9 and 22**, and INTROSPECT refusals return
   data-like zeros. Harmless today, wrong in an authority list.
   **FIXED on `fix/backlog-80`, 2026-10-10:** the ungated list names only queries that exist; the seven gated figures (frames, a core's ticks, a task's endpoints, the endpoint count) are `Option` in the SDK, and the shell and `observe` say "unknown" or refuse instead of drawing zeroes.
@@ -247,9 +247,9 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   with a leak warning. **An `fs` log string (the APPEND refusal) has a run of spaces.**
   **FIXED on `fix/backlog-80`, 2026-10-10:** a reclaim failure after the unlink committed is logged with the repair (`drives check`) and the delete reports success; the APPEND string rejoined.
 - **V5. The supervisor's misplaced `#[cfg]` attributes** gate `time` instead of `block-driver`, and stack a
-  second onto `ensure_wired("wifi-driver")` - already open as backlog/77; the audit confirms it, unchanged
+  second onto `ensure_wired("wifi-driver")` - already open as backlog/fixed/77; the audit confirms it, unchanged
   since `c6473b55`.
-  **FIXED on `fix/backlog-80`, 2026-10-10:** both misplaced attributes removed rather than moved: every build has started `block-driver` and `nic-driver` all along, so `time` now starts in every build and nothing else changes (`backlog/77`).
+  **FIXED on `fix/backlog-80`, 2026-10-10:** both misplaced attributes removed rather than moved: every build has started `block-driver` and `nic-driver` all along, so `time` now starts in every build and nothing else changes (`backlog/fixed/77`).
 - **V6. `let _ = ctx.spawn("observe")` in the supervisor probably fails silently**: it takes the kernel's
   by-name path, whose catalogue holds only `supervisor` - the trap the supervisor's own comments warn about at
   the `events` and `ping` spawns (runtime unverified). Fix: `spawn_mapped`.

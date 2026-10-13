@@ -548,20 +548,20 @@ Kill and restart `block-driver` with requests outstanding; simulate hot-unplug, 
 error and device disappearance mid-write; inject late, duplicate, missing and out-of-order
 completions.
 
-**And there is already evidence this one matters.** `backlog/31` records a confirmed case of a reply
+**And there is already evidence this one matters.** `backlog/fixed/31` records a confirmed case of a reply
 stream running behind - a service reading replies that belonged to earlier requests - in the network
 stack, where a correlation tag proved the fault and was then REVERTED because rejecting a stale reply
 is not the same as recovering from one. The fs/block channel has the same shape and the same tag
 design. A completion from an old driver instance acknowledging a newer request is not hypothetical
 here; it is the thing that already happened one layer over.
 
-**BUILT: the completion stream, which is the half `backlog/31` warned about.** `io-error-test` makes
+**BUILT: the completion stream, which is the half `backlog/fixed/31` warned about.** `io-error-test` makes
 the DEVICE fail and `fs` answers that by retrying; `completion-chaos` corrupts the REPLY instead -
 one duplicate, one missing, one carrying somebody else's tag - injected into ordinary `churn` traffic
 after a measured 800-completion warm-up, so boot and mount are untouched.
 
 Every detection assertion is paired with a recovery one, because that is the distinction that got
-`backlog/31`'s tag reverted. A run where `fs` spots every bad completion and then cannot write a file
+`backlog/fixed/31`'s tag reverted. A run where `fs` spots every bad completion and then cannot write a file
 has failed this gate. What the machine actually did:
 
 | injected | `fs` said | and then |
@@ -857,7 +857,7 @@ could reach:
   has none either, so only the T630 could run it. It hit the hard case on the first try: the
   firmware held the controller (`USBLEGSUP` bit 16 set) and REFUSED to release it, so ownership was
   forced - and the keyboard behind the hub kept working, which was the stated fear.
-  (`backlog/11`, closed.)
+  (`backlog/fixed/11`, closed.)
 * **`reboot` on riscv64 was `loop { spin_loop() }`** that printed `reboot: hardware reset` first.
   It wedged a hart inside syscall 18 and the liveness watchdog panicked ten seconds later, exactly
   as designed. Now SBI SRST, warm before cold - because a cold reboot power-cycles through the PMIC
@@ -949,7 +949,7 @@ two writes, and the suite that reported it is the same one an operator runs for 
 matters because the automation is easy to mistake for coverage.
 
 **Two `selfcheck` runs in one boot, both clean** (`ran 501, failed 0` then `ran 500, failed 0`),
-which closes `backlog/36` on hardware rather than in QEMU. That entry existed because the second run
+which closes `backlog/fixed/36` on hardware rather than in QEMU. That entry existed because the second run
 in a boot failed intermittently on `events persist status` - a fixed `wait 3` racing a variable
 extent pre-fill. The state it waited for (`preparing`) never appeared in this capture and the poll's
 30-attempt bound was never approached, so the fix reaches the real state immediately rather than the
@@ -972,7 +972,7 @@ Filled in from what has actually been run. NOT RUN means not run.
 | Data/metadata exhaustion | **PASSES (QEMU)** | 3.4 - `fs-full` 14/0 and `fs-metafull` 9/0. The second fills a DIRECTORY until a create is refused and found a real leak: one block stranded per refused create, with a control attributing it to the refusal rather than the writing. Fixed. Metadata and data are not separate pools here, so exhausting one independently is unreachable. Per-allocation-point injection is still not covered. |
 | Concurrency and retry ordering | **PASSES (QEMU)** | 3.5 - `fs-dupop` 5/0, `fs-lostreq` 10/0, `fs-twoclient` 8/0. Timeouts on BOTH sides of the commit, and two real clients on one directory. The ordering guarantee is documented in `docs/persistence.md` 6.18. The duplicate-request gap is still real and still recorded: closing it needs a client-supplied op id plus a bounded reply cache in `fs`. |
 | Stale-handle and identity tests | **PASSES (QEMU)** | `file-cap` 13/0 covers revocation on delete/close/rename. `fs-reuse` 8/0 covers the case none of those could: a capability minted BEFORE an `fs` restart, with the blocks it named handed to a different file afterwards. The stale cap resolved to nothing - not to the replacement, not to anything. That would have been a leak of AUTHORITY rather than space, which no fsck can see (3.6). |
-| Block-driver completion stream (duplicate / missing / out-of-order) | **`fs-blockchaos` 10/0** | 3.7. The `backlog/31` shape, detected AND recovered |
+| Block-driver completion stream (duplicate / missing / out-of-order) | **`fs-blockchaos` 10/0** | 3.7. The `backlog/fixed/31` shape, detected AND recovered |
 | Block-driver killed WITH REQUESTS OUTSTANDING | **`fs-blockdeath` 11/0** | 3.7. Noticed in 201 ms against a 30 s deadline - woken, not timed out |
 | Hot-unplug / device disappearance mid-write | **PASSES (QEMU)** | 3.7 - `py scripts/fs_unplug.py` 8/0. The stick is pulled with `churn` writing; no panic, no wedge, reported 12.5 s after the unplug and no stale content served. On riscv64 because QEMU's AHCI refuses `device_del` outright - USB is the only bus that can be unplugged, and the more honest one. |
 | A destructive op whose REPLY is lost, then retried | **`fs-dupop` 5/0** | 3.5. Found a live gap: a succeeded `move` reported as failed. Fixed at the client |

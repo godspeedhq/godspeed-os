@@ -87,7 +87,7 @@ service and it cost a day.
 
 *(2026-10-11: the line now goes on to count the flash requests among them - "(10 of them flash
 requests, each refused on the zero capacity the test injects - no disk was touched)" - which used to
-log one `flash REFUSED` each and read as a real no-disk, `backlog/56`.)*
+log one `flash REFUSED` each and read as a real no-disk, `backlog/fixed/56`.)*
 
 **What it deliberately does NOT cover**, so the claim is not read too widely: it runs BEFORE the
 volume is mounted, so every path-addressed op short-circuits to "no filesystem" and the operations

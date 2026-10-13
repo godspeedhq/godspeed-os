@@ -424,7 +424,7 @@ const EXTRA_CHECKS: &[&str] = &[
     // four had rotted when this was written, including one in CLAUDE.md pointing at a file an
     // amendment in the same document had deleted.
     "scripts/doc_symbols_check.py",
-    // A CRLF `extlinux.conf` boots nothing while showing a perfect menu (backlog/26). x86 does not
+    // A CRLF `extlinux.conf` boots nothing while showing a perfect menu (backlog/fixed/26). x86 does not
     // use extlinux, but this path is where an image is built on the machine that PRODUCES the CRLF,
     // and the rule above is the whole reason this list exists: a checker on one build path is a
     // checker on none.
@@ -1628,7 +1628,7 @@ fn cmd_test(suite: &str) {
         "chaos-brutal" => crate::validator::run_chaos_brutal_tests(),
         "shell"        => run_shell_test(),
         // `chaos-repro`, `chaos-repro:<rounds>`, `chaos-repro:<rounds>:<iters>` - the same shape
-        // `fs-model:<seed>:<ops>` uses. See `backlog/48`.
+        // `fs-model:<seed>:<ops>` uses. See `backlog/fixed/48`.
         s if s == "chaos-repro" || s.starts_with("chaos-repro:") => run_chaos_repro_test(s),
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
@@ -3166,7 +3166,7 @@ fn run_fs_all_tests() {
         "fs-churn",
         // §3.7. The other two attack the DEVICE (a power cut, an I/O error); this one attacks the
         // COMPLETION STREAM - duplicate, missing and out-of-order replies - which is the failure
-        // `backlog/31` recorded one layer up and which no suite reached until now.
+        // `backlog/fixed/31` recorded one layer up and which no suite reached until now.
         "fs-blockchaos",
         // ...and the driver dying mid-request, which is a different recovery path: `SendFailed`
         // plus a reacquire, rather than a wrong answer that has to be detected.
@@ -3909,7 +3909,7 @@ fn run_fs_blockdeath_test() {
 
 /// Carnage §3.7: corrupt the COMPLETION STREAM and require the filesystem to survive it.
 ///
-/// The device-failure half is `fs-ioretry`. This is the protocol half `backlog/31` warned about:
+/// The device-failure half is `fs-ioretry`. This is the protocol half `backlog/fixed/31` warned about:
 /// duplicate, missing and out-of-order completions, injected into ordinary churn traffic. See
 /// `run_fs_blockchaos` for why every detection assertion is paired with a recovery one.
 fn run_fs_blockchaos_test() {
@@ -3969,7 +3969,7 @@ fn run_fs_ioretry_test() {
     }
 }
 
-/// `osdev test chaos-repro[:rounds[:iters]]` - loop `chaos max-carnage` in one boot (`backlog/48`).
+/// `osdev test chaos-repro[:rounds[:iters]]` - loop `chaos max-carnage` in one boot (`backlog/fixed/48`).
 fn run_chaos_repro_test(spec: &str) {
     let mut it = spec.split(':').skip(1);
     let rounds: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(5);

@@ -152,7 +152,7 @@ const _: () = assert!(DIR_TIMES_OFF >= DIR_CRC_OFF + 4,
 ///    the mutual-send shape §8.9 forbids, which the kernel will neither detect nor recover.
 /// 2. `fs` serves its clients on the very endpoint it would have to await the reply on, so a
 ///    request/reply wait here could DEQUEUE A CLIENT'S REQUEST and mistake it for the answer. That
-///    is not hypothetical - it is `backlog/31`, one service over, and it cost days.
+///    is not hypothetical - it is `backlog/fixed/31`, one service over, and it cost days.
 ///
 /// A push has neither problem: nothing is awaited, so nothing can be eaten and nothing can block.
 /// It arrives with no reply capability, which is what distinguishes it from every real request and
@@ -3607,7 +3607,7 @@ fn replay_window(_ctx: &ServiceContext) {}
     /// incompletely and `count` reported only what fit. `dir` on a directory of thirty files printed
     /// twenty and said `(20 entries)` as though that were the whole truth, with nothing in the reply
     /// a client could have used to tell the difference. That is not a ceiling, it is a WRONG ANSWER,
-    /// and it reached `find`, `tree`, `delete recursive` and tab completion alike (`backlog/33`).
+    /// and it reached `find`, `tree`, `delete recursive` and tab completion alike (`backlog/fixed/33`).
     ///
     /// The flag does not remove the ceiling - a continuation cursor is what does that, and it is
     /// recorded rather than done. It converts a silent wrong answer into a loud partial one, which
@@ -3621,13 +3621,13 @@ fn replay_window(_ctx: &ServiceContext) {}
     /// The `mtime` is Phase O's, and `TIME_UNKNOWN` (0) on a volume that does not record one - a
     /// client renders that as "unknown" rather than as a date. Four bytes per entry is the cost, out
     /// of a one-block reply: a listing that used to fit ~30 entries fits ~26, and a directory with
-    /// more than that was already being truncated by this bound. `backlog/33` records that ceiling,
+    /// more than that was already being truncated by this bound. `backlog/fixed/33` records that ceiling,
     /// which predates this change and is not made materially worse by it.
     /// List a directory, RESUMABLY. One reply block carries roughly twenty entries; `from` says
     /// which entry to start at, and the reply says where to ask next.
     ///
     /// **This used to stop at one block and set a `more` flag, which made a long directory a
-    /// question nobody could finish asking** (`backlog/33`). The flag turned a silent wrong answer
+    /// question nobody could finish asking** (`backlog/fixed/33`). The flag turned a silent wrong answer
     /// into a loud partial one; it did not make the listing obtainable. It is obtainable now: a
     /// caller loops until `more` is 0.
     ///
@@ -4394,7 +4394,7 @@ fn protocol_selftest(ctx: &ServiceContext) {
     let mut worst = 0u8;
     // The flash requests among the probes (21, and 149 forced). Each is refused on the zero capacity
     // this test injects, and that refusal is what stops it formatting the real disk - so it is counted
-    // and said ONCE below, not logged per probe (`backlog/56`).
+    // and said ONCE below, not logged per probe (`backlog/fixed/56`).
     let flashes = core::cell::Cell::new(0u32);
 
     let mut run = |vol: &mut Option<Fs>, p: &[u8], out: &mut [u8; 4096], checked: &mut u32,

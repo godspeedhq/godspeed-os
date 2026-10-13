@@ -36,7 +36,7 @@ thing that says so.
 boot on every board trains the reader that `flash REFUSED` is noise. The one boot where it means "your
 stick is not plugged in" reads identically to the nine hundred where it meant "wait 300 ms".
 
-This is the same argument `backlog/54` makes about `stack_fit_check` crying wolf on `00-hello`, and
+This is the same argument `backlog/fixed/54` makes about `stack_fit_check` crying wolf on `00-hello`, and
 the same one the 2026-09-23 amendment in CLAUDE.md 6.1 makes about an instrument that could not tell a
 refusing device from a dead driver. A correct message at the wrong volume is an instrument problem.
 

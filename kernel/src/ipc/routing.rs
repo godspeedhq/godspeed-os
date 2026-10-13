@@ -423,7 +423,7 @@ fn enqueue_locked(
                 // to `.ok()` the failed enqueue and return `Ok` - the message dropped, the sender told it
                 // was delivered, the receiver woken for nothing. That is a silent fallback at the kernel
                 // boundary (invariant 12; §21), seen on the Pi 4 as `nic-driver BlockRecv 16/16!` with
-                // every exchange timing out at exactly its bound (`backlog/65`). The interrupt path
+                // every exchange timing out at exactly its bound (`backlog/fixed/65`). The interrupt path
                 // (`enqueue_from_interrupt`) already put the receiver back and reported the loss; this,
                 // the path every userspace `send` takes, did not. The receiver is still waiting, so it
                 // stays recorded as blocked; the sender is refused exactly as it is below, and recorded
@@ -710,7 +710,7 @@ pub fn enqueue_from_kernel_blocking(
             Ok(()) => return Ok(Some(slot)),
             Err(msg) => {
                 // A blocked receiver whose queue is full - a `Call` waiting behind a full inbox (see
-                // `enqueue_locked`, `backlog/65`). The receiver keeps waiting; the writer is blocked
+                // `enqueue_locked`, `backlog/fixed/65`). The receiver keeps waiting; the writer is blocked
                 // exactly as it is on the plain full path below.
                 table[idx].blocked_receiver = Some(slot);
                 table[idx].blocked_sender = Some(sender_slot);

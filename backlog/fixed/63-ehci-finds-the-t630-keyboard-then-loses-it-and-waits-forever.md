@@ -2,7 +2,7 @@
 
 **Status: CLOSED 2026-09-27 - FIXED AND CONFIRMED ON THE HP T630 THE SAME DAY.** The cause
 turned out to be one line, and one of the two "defects" was not a defect at all. It still puts the
-sentence that CLOSED `backlog/11` in doubt, and that part stands.
+sentence that CLOSED `backlog/fixed/11` in doubt, and that part stands.
 **Found:** 2026-09-27 on the HP T630, by the operator: *"ehci with the keyboard didn't work. hotplug
 didn't work. I had to connect it to xhci (in front)."* Serial evidence below, from a boot that was
 otherwise clean.
@@ -100,9 +100,9 @@ the operator finding that replugging changed nothing.
 **Confidence:** defect 1 is observed on hardware. Defect 2 is read from the source and matches the
 symptom; it has not been instrumented, and it should be before anyone changes the loop.
 
-## And it puts `backlog/11`'s closing evidence in doubt
+## And it puts `backlog/fixed/11`'s closing evidence in doubt
 
-`backlog/11` (the EHCI BIOS handoff) was **closed on 2026-09-21** having been executed on this same T630,
+`backlog/fixed/11` (the EHCI BIOS handoff) was **closed on 2026-09-21** having been executed on this same T630,
 and its closing text says: *"The keyboard behind the hub still works afterwards, which was the stated
 fear."* Six days later, on the same board and the same hub, it does not.
 
@@ -126,7 +126,7 @@ re-scan lines will show three more whole attempts - at which point it IS `bugs/3
 sequencing and this entry should be reopened with that evidence. The two fixes are deliberately
 distinguishable in the log for exactly that reason.
 
-**The `backlog/11` doubt stands** and is not closed by this. That entry's collateral claim - "the keyboard
+**The `backlog/fixed/11` doubt stands** and is not closed by this. That entry's collateral claim - "the keyboard
 behind the hub still works afterwards" - did not reproduce, and whether 2026-09-21 was a lucky pass or a
 regression is still unmeasured. If the confirming boot works, the most likely reading is that the single
 attempt sometimes succeeded and sometimes did not, which is what the code always said about this hub.
@@ -165,7 +165,7 @@ USB: keyboard connected (ehci)
 An unplug is a real connection change, so `wait_for_connection` returns as designed and the re-scan now
 configures the device instead of losing it. The park was never the problem; the abandoned enumeration was.
 
-**The `backlog/11` doubt is resolved by this, in the most likely direction.** Its closing claim held on
+**The `backlog/fixed/11` doubt is resolved by this, in the most likely direction.** Its closing claim held on
 2026-09-21 and failed on 2026-09-27 on unchanged code, which is what an intermittent single-attempt
 transfer does. Not a regression - the code always said this endpoint was flaky, and one attempt was a coin
 toss. It is five attempts now.

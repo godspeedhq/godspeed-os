@@ -53,7 +53,7 @@ def expected_hand_written():
         # file: it points at the rustdoc under /api (generated from the crate, not from docs/)
         # and at the design report, and shows the shortest program that does something. An
         # `{{#include}}` of stdlib-design.md would put a DESIGN REPORT in front of someone who
-        # came to write a program - which is what backlog/45 and the Stranger Test (22.7) are
+        # came to write a program - which is what backlog/fixed/45 and the Stranger Test (22.7) are
         # about.
         "stdlib.md",
     }

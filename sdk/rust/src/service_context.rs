@@ -1381,7 +1381,7 @@ impl ServiceContext {
     /// thing every request path that waits on the reply mailbox must do before it issues.
     ///
     /// It was done by ONE of the three such paths. `request_with_reply_deadline_into` drained (it is
-    /// where `backlog/37` was fixed); `request_with_reply_call_err`, which `gs::call` and so every `gs::fs`
+    /// where `backlog/fixed/37` was fixed); `request_with_reply_call_err`, which `gs::call` and so every `gs::fs`
     /// call goes through, and `request_with_reply_deadline_outcome_into` did not. So the exact failure
     /// [`Self::drain_stale_replies`] describes was still live for every service on the standard library:
     /// in the jobs suite the shell's history save timed out while a background `drives check` held `fs`
@@ -2259,7 +2259,7 @@ impl ServiceContext {
         // a single scroll request that timed out left its reply queued, and from that moment every
         // request waited out its full deadline and failed, for the rest of the boot. Observed on a
         // Dell Wyse as `scrollback: the console did not answer` once a second, indefinitely, with the
-        // console sitting idle at `BlockRecv, queue 0` the whole time (`backlog/37`).
+        // console sitting idle at `BlockRecv, queue 0` the whole time (`backlog/fixed/37`).
         //
         // **It is safe here for the reason that function already gives**, and that reason is exactly
         // why this belongs in the SDK rather than at each call site: `request_with_reply*` enforces
@@ -3324,7 +3324,7 @@ impl ServiceContext {
     //
     // Dropping the retry costs little. It exists so a client survives the peer RESTARTING, and a
     // console that has just restarted is rebuilding the screen anyway; the next `console_dims`
-        // `console_scroll` IS GONE, and it is the mechanism `backlog/37` was about.
+        // `console_scroll` IS GONE, and it is the mechanism `backlog/fixed/37` was about.
     //
     // It asked the console to move its own view, and the console could not answer until it had
     // repainted the framebuffer - `paint_view` + `present`, synchronously, inside the request. On a
@@ -3346,7 +3346,7 @@ impl ServiceContext {
     /// **The replacement for the deleted `console_scroll`, which could not be made cheap.**
     /// Moving the terminal's own view forces a full repaint before the console can reply - on a
     /// 3840x2160 panel the most expensive thing it does, paid inside the caller's blocking request,
-    /// from the same core (`backlog/37`). This asks for BYTES: the console copies out of its ring
+    /// from the same core (`backlog/fixed/37`). This asks for BYTES: the console copies out of its ring
     /// and replies, and the caller paints its own screen through ordinary output, which is a send
     /// rather than a call and carries no deadline at all.
     ///

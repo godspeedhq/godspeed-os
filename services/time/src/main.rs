@@ -513,7 +513,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // A PUSH, not an answer to a question, and the direction is the whole design. `fs` serves
         // clients on the endpoint it would have to await a reply on, so a request/reply the other
-        // way could dequeue a client's request and mistake it for the answer (`backlog/31`, one
+        // way could dequeue a client's request and mistake it for the answer (`backlog/fixed/31`, one
         // service over, days of debugging). And this service already sends to `fs`, so a call back
         // from `fs` would be the mutual-send shape §8.9 forbids.
         //

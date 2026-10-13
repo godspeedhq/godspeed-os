@@ -34,7 +34,7 @@ pub const DATA_BLOCK: u16 = 512;
 /// CMD5 means the card is listening and the bus is marginal.
 pub fn identify(h: &dyn SdioHost, ctx: &ServiceContext) -> Option<Card> {
     // A CARD AN EARLIER INSTANCE LEFT RUNNING IS ADOPTED, NOT RESET. Six host-side resets were tried
-    // on such a chip (`docs/wifi.md` 45, `backlog/69`) and each ended the same way: a firmware started
+    // on such a chip (`docs/wifi.md` 45, `backlog/fixed/69`) and each ended the same way: a firmware started
     // on a chip the host reset traps in the chip's ROM before it has a stack. Only a power cycle is a
     // power-on for this part, and only the kernel can drive that. But a kill of this SERVICE does
     // nothing to the CHIP - the firmware the dead instance loaded is still running, associated, alive -

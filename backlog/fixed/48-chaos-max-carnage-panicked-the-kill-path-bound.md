@@ -290,7 +290,7 @@ coverage rather than a reason to suspect x86 specifically.
 
 ### Disposition
 
-`backlog/48` - **CLOSED.** It is this bug, this is the fix its own "The fix" section specifies, the
+`backlog/fixed/48` - **CLOSED.** It is this bug, this is the fix its own "The fix" section specifies, the
 panic is gone by construction, and the replacement behaviour is observed. The unexercised extension
 path is recorded above rather than papered over.
 

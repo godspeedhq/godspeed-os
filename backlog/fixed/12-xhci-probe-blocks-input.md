@@ -15,7 +15,7 @@
 > Two hid it: QEMU's BSP really IS id 0, so the wrong value was accidentally right on the only
 > machine the suite runs on; and a multi-core boot takes the other branch entirely. It could only
 > exist on the configuration nobody ran until single-core support was added - which is the whole
-> argument of backlog/02, demonstrated rather than asserted.
+> argument of backlog/fixed/02, demonstrated rather than asserted.
 >
 > Kept, not deleted: the reasoning below is a fair record of a theory measurement refuted, and §26.7
 > says a refuted theory is recorded rather than tidied away. Read it as history.

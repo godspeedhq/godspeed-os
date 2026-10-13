@@ -2058,7 +2058,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // block-driver. An attribute applies to the next STATEMENT and comments do not end it, so it gated
     // `time` instead: the full QEMU build and the perf, stress, adversarial, chaos and fuzz builds never
     // started the clock. It was removed rather than moved, because every build has started block-driver
-    // all along and its suites run with it (`backlog/77`, `backlog/80` V5). block-driver's placement is
+    // all along and its suites run with it (`backlog/fixed/77`, `backlog/80` V5). block-driver's placement is
     // its IMAGES row's `board::BLOCK_CORE`, read by both the boot and the restart paths.
     //
     // time + control: started BEFORE the shell, because the shell asks `time` for the clock source on

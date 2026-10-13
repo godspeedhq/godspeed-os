@@ -187,7 +187,7 @@ tree. Co-ownership - which this entry establishes "was never safe, it was surviv
 the machine that demonstrated the danger.
 
 **Does not:** reproduce the original SINGLE-CORE platform reset. That symptom needs a one-core boot,
-and the build flag that produced one was removed when `backlog/02` closed. It is also no longer the
+and the build flag that produced one was removed when `backlog/fixed/02` closed. It is also no longer the
 interesting test: the reset happened *because* the firmware took an SMI over a controller it still
 owned, and it no longer owns one. The fix removes the cause rather than surviving the effect.
 

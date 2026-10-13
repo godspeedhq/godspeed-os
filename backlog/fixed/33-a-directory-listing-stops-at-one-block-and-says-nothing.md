@@ -33,7 +33,7 @@ filesystem - or a copy of the directory, which is unbounded.
 
 *What follows is the entry as written when it was open.*
 
-Found by a code comment citing `backlog/33` when no such file existed. `scripts/doc_refs.py` checks
+Found by a code comment citing `backlog/fixed/33` when no such file existed. `scripts/doc_refs.py` checks
 documents, not code comments, so a dangling reference in a `///` block is caught by nothing.
 
 ## What happens

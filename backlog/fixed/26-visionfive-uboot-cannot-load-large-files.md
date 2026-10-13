@@ -149,7 +149,7 @@ blob as text, which git would eventually have "normalized". Both fixed in the sa
 ## What stays blocked
 
 `db3b800b` (riscv64 spawns the USB host before the disk that lives on it) is verified in QEMU and
-still wants a board boot, as `backlog/20` item 6 records. So does everything else on
+still wants a board boot, as `backlog/fixed/20` item 6 records. So does everything else on
 `portability-hardening` that riscv64 has never executed on hardware: the single `USB_IMAGES` table,
 `has_hw_enumerator`, `has_ehci` being false on this port, the `storage_is_usb` board table, the TSC
 floor this port's 4 MHz counter needs, and the seam members added in `b78c8d79` and `3c75638e`.

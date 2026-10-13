@@ -11,7 +11,7 @@ it fails on ANY `unsafe` line - §18.2 forbids service `unsafe`).
 
 **`sdk/` IS NOW SCANNED** (2026-09-12). It was scanned by nothing: the script defined two roots,
 `kernel/src` and `services`, so ~125 `unsafe` lines went through no tool at all while §18.4 said "CI
-checks the file matches source". `backlog/18` recorded the gap; this closes it.
+checks the file matches source". `backlog/fixed/18` recorded the gap; this closes it.
 
 | File | Lines | Status |
 |------|-------|--------|
@@ -741,7 +741,7 @@ is one flag away if a hardware fault ever needs bisecting against it.
 *(Correction, 2026-09-07: no longer true THROUGH THE BUILD SCRIPT. `pi4_build.py --features` became
 ADDITIVE - it prepends `pi4,pi4-smp` to whatever is passed - so the script cannot produce a build
 without `pi4-smp`; that now needs a direct `cargo` invocation. The `--single-core` option that did it
-was removed with the `single-core` feature (backlog/02), on the reasoning that one artefact should
+was removed with the `single-core` feature (backlog/fixed/02), on the reasoning that one artefact should
 boot on any core count. The feature itself still exists and is still pinned.)*
 
 No new `unsafe`.

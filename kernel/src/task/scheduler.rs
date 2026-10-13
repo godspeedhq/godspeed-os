@@ -679,10 +679,10 @@ static CORE_WAKE_HINT: PerCore<AtomicUsize> = PerCore::new();
 /// How often, in spin iterations, the kill-path wait re-sends its WAKE_RECEIVER IPI.
 ///
 /// It used to be sent once before the loop and never again, so a core that missed it was never
-/// poked a second time (`backlog/48`). Re-poking a core that is merely slow costs one IPI.
+/// poked a second time (`backlog/fixed/48`). Re-poking a core that is merely slow costs one IPI.
 /// Test-only: fire the kill-path ABANDON exactly once, so that path is observed rather than assumed.
 ///
-/// The abandon path replaced a `panic!` (`backlog/48`). The race that reaches it needs a core wedged
+/// The abandon path replaced a `panic!` (`backlog/fixed/48`). The race that reaches it needs a core wedged
 /// inside a masked window and does not occur under QEMU, so without this the code shipped having
 /// never run. `iommu-fault-test` exists for the same reason and is the precedent.
 ///
@@ -790,7 +790,7 @@ pub fn current_core() -> usize { current_core_id() }
 /// EL0 fault report is that case: it goes out on the raw UART from the exception handler, IRQs off, and
 /// on the Pi 4 it takes about 2.6 s against a 2.5 s window. Three times in two chaos runs a kill of the
 /// faulting task abandoned its slot while that core was still printing the report and said the core
-/// was "wedged" (`backlog/48`). A core writing output is executing, so the wait counts this as progress
+/// was "wedged" (`backlog/fixed/48`). A core writing output is executing, so the wait counts this as progress
 /// too. Still bounded by `MAX_WAIT_EXTENSIONS`: a core that prints forever without scheduling is
 /// abandoned after the last window, as before.
 ///
@@ -2897,7 +2897,7 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                         // would not let go of one slot - reachable from userspace through an ordinary
                         // supervisor kill, which CLAUDE.md 22 forbids absolutely: nothing above the
                         // kernel may panic the kernel. Reproduced on a Raspberry Pi 4 at chaos round
-                        // 943 of 1000 with no host load (backlog/48).
+                        // 943 of 1000 with no host load (backlog/fixed/48).
                         //
                         // So: abandon the reclaim and leave the slot un-freed. The task is already
                         // Dead and its endpoints are already torn down, so it cannot run and cannot be

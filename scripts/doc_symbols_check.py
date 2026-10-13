@@ -32,7 +32,7 @@ NOT SCANNED: `audits/` and `milestones/`. Those are append-only EVIDENCE and dat
 record. Same reason `backlog/29` keeps the serial capture it quotes verbatim.
 
 A RECURRING CASE, recorded so the next person does not re-argue it from scratch: a CLOSED backlog
-entry's post-mortem names the code it deleted, and naming it is the point - `backlog/37` explains a
+entry's post-mortem names the code it deleted, and naming it is the point - `backlog/fixed/37` explains a
 bug by listing the five functions removed to fix it. That is the same "dated history" argument the
 paragraph above makes for `audits/`, and it will happen again every time a removal is written up.
 It is baselined per-symbol for now rather than exempting closed entries wholesale, because the

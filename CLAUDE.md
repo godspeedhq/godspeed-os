@@ -2044,7 +2044,7 @@ safety + necessity rationale.
 > Neither is new `unsafe` - both are the state of the tree being written down for the first time.
 > `scripts/unsafe_check.py` scanned only `kernel/src/` and `services/`, so the SDK's ~125 `unsafe`
 > lines were audited by nothing at all while §18.4 claimed CI checks the audit against source
-> (`backlog/18`). The scan now covers `sdk/`, which is what makes these floors enforceable rather
+> (`backlog/fixed/18`). The scan now covers `sdk/`, which is what makes these floors enforceable rather
 > than merely stated.
 >
 > **They are one design consequence, not 90 violations.** 86 of the 90 are `unsafe { raw_syscall(..) }`

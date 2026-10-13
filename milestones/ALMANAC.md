@@ -1724,7 +1724,7 @@ boot; the stack's polling reached it in seconds. The same shape exposed two more
 a one-second bound on the radio lets a caller's inbox fill behind the call, so it is a hundred
 milliseconds now; and the kernel, handed a message for a blocked receiver whose queue is full, drops it
 and says it was delivered - a silent fallback in the IPC path, held for the next kernel change (and fixed
-that afternoon: it returns `QueueFull` now, `backlog/65`).
+that afternoon: it returns `QueueFull` now, `backlog/fixed/65`).
 
 ### Works beautifully
 

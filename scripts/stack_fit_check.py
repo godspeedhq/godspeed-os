@@ -204,7 +204,7 @@ def check(objdump, root, target, profile, services, stack_limit, top=5):
         # (invariant 12). This guard is the general fix; SUB_SP_RV above is the specific one.
         # An ELF in which objdump found no function at all is the same blindness by another route.
         #
-        # BLINDNESS IS A PROPERTY OF THE TARGET, NOT OF ONE BINARY (`backlog/54`). What a zero frame
+        # BLINDNESS IS A PROPERTY OF THE TARGET, NOT OF ONE BINARY (`backlog/fixed/54`). What a zero frame
         # cannot tell apart is "this prologue form is not matched" from "this binary really has no
         # frames", and `examples/00-hello` is the second: 43 lines that inline completely, zero `sub
         # rsp` in `objdump -d`. The two differ in what the REST of the target shows - an unmatched

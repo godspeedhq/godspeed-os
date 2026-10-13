@@ -555,7 +555,7 @@ This service used to answer `REQ_SCROLL`: move your view, and report where it no
 `console_scroll(action)` was how a holder of the keyboard asked, the shell drove it from a mode of
 its own, and output arriving snapped the view back to live.
 
-**All of it is deleted, and the reason is `backlog/37`.**
+**All of it is deleted, and the reason is `backlog/fixed/37`.**
 
 To answer "move your view" this service had to `paint_view` and `present` BEFORE it could compute
 the reply - a full repaint of the framebuffer, synchronously, inside the caller's request. On a

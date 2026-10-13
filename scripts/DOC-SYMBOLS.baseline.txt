@@ -10,7 +10,7 @@
 HMB_DATA_FWHALT                    # docs/wifi.md - Linux brcmfmac, EXTERNAL; the to-host mailbox bit that triggers its automatic recovery
 force_turbo                        # docs/wifi.md - Raspberry Pi firmware config.txt option, EXTERNAL; holds the Arm cores at turbo, used 2026-10-01 and replaced by the power service (wifi.md 55, 57)
 CONSOLE_RENDER                     # docs/console-service.md
-FILE_FLAG_NO_BUFFERING             # backlog/26-visionfive-uboot-cannot-load-large-files.md
+FILE_FLAG_NO_BUFFERING             # backlog/fixed/26-visionfive-uboot-cannot-load-large-files.md
 MAX_FILES                          # docs/persistence.md
 mmc_io_rw_extended                 # docs/wifi.md - Linux mmc core, EXTERNAL; cited for the CMD53 argument this driver reimplements
 USE_FUA                            # CLAUDE.md, docs/arm32-usb-userspace.md, docs/pi2-deploy.md
@@ -45,11 +45,11 @@ registry_lookup                    # docs/naming-design.md
 size_bytes                         # docs/persistence.md
 spawn_pong                         # docs/service-ownership.md
 write_hfnum                        # docs/arm32-usb-userspace.md
-in_view                            # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-paint_view_indicator               # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-put_num                            # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-snapped_by_output                  # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-take_output_snap                   # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+in_view                            # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+paint_view_indicator               # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+put_num                            # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+snapped_by_output                  # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+take_output_snap                   # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
 drain_kernel_ring_buffer           # backlog/06, backlog/80 S7 - DELETED 2026-10-10 (a no-op stub); a record of a removal must name what was removed
 recv_log_message                   # backlog/06 - DELETED 2026-10-10 with it (unused); a record of a removal must name what was removed
 TIMED_OUT_ONCE                     # backlog/80 - DELETED 2026-10-10, ehci latch, now function-local (D9); a record of a removal must name what was removed
@@ -82,9 +82,9 @@ brcmf_fwcap_map                    # Linux brcmfmac feature.c - the table the `c
 sae_ext                            # a word in the firmware `cap` string (and brcmf_fwcap_map): WPA3 authentication done by the HOST; read off this board 2026-09-29 - external, 26.14
 bwfm_sdio_rx_glom                  # OpenBSD if_bwfm_sdio.c - reads one chunk per descriptor entry, strips the superframe header from the first, then parses each sub-frame by its own header; ctrl::subframes does the parsing half - external, 26.14
 aic8800_sdio                       # docs/wifi.md 44 - the AICSemi vendor Linux module for the VisionFive 2 Lite radio, named as the executable datasheet a riscv64 port would read - external, 26.14
-brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
-mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
-si_watchdog                        # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/fixed/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/fixed/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+si_watchdog                        # Linux/Broadcom recovery path cited by backlog/fixed/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 CHIP_REV_U03                       # docs/wifi-aic8800.md - AICSemi aic8800_bsp chip_rev enum, EXTERNAL; revision 7
 set_pmk                            # docs/wifi-aic8800.md - Linux cfg80211 op, EXTERNAL; cited as the handshake offload this firmware lacks
 dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXTERNAL; the second init order compared

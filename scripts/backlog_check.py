@@ -34,8 +34,13 @@ def main():
         print('backlog check: no backlog/ directory')
         return 0
 
+    # The open items, then the fixed ones in `fixed/` (2026-10-13), which keep their old numbers and
+    # so are numbered apart: a number may be used once in each folder.
     entries = sorted(f for f in os.listdir(BACKLOG)
                      if f.endswith('.md') and f != 'README.md')
+    fixed_dir = os.path.join(BACKLOG, 'fixed')
+    if os.path.isdir(fixed_dir):
+        entries += sorted('fixed/' + f for f in os.listdir(fixed_dir) if f.endswith('.md'))
     if not entries:
         print('backlog check: no entries')
         return 0
@@ -53,11 +58,12 @@ def main():
     # 2. no number used twice
     seen = {}
     for name in entries:
-        num = name.split('-', 1)[0]
+        folder, _, base = name.rpartition('/')
+        num = base.split('-', 1)[0]
         if not num.isdigit():
             failures.append('BAD NAME: backlog/%s does not begin with a number' % name)
             continue
-        key = str(int(num))
+        key = folder + str(int(num))
         if key in seen:
             failures.append('DUPLICATE NUMBER %s: %s and %s' % (key, seen[key], name))
         seen[key] = name

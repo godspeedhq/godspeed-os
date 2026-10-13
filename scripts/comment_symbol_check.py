@@ -43,7 +43,7 @@ can be tightened rather than quietly carried.
 
 SCOPE. Rust under `kernel/src`, `services`, `sdk/rust/src`, `sdk/wifi/src`, `stdlib/rust/src`, `osdev/src` and
 `examples`. Names are matched only in backticks: snake_case or SCREAMING_CASE with an underscore, CamelCase
-(backlog/58), and the last segment of an `a::b` path; each must equal a whole identifier in code. A
+(backlog/fixed/58), and the last segment of an `a::b` path; each must equal a whole identifier in code. A
 single bare word in a comment is prose far more often than it is an identifier - the same rule
 `doc_symbols_check` settled on for the same reason.
 """
@@ -81,7 +81,7 @@ PATH_TOKEN = re.compile(r"`(?:[A-Za-z_][A-Za-z0-9_]*::)+([A-Za-z_][A-Za-z0-9_]*)
 #
 # Enabled in a SEPARATE change from the widening above, and the separation was the point: turning it
 # on and seeding the result in one step would have put FINDINGS into the baseline to keep the gate
-# green, which is the one thing a ratchet must not be used for. It was `backlog/58` for exactly as
+# green, which is the one thing a ratchet must not be used for. It was `backlog/fixed/58` for exactly as
 # long as it took to triage all 23 sites by hand - about half were ARM/DWC2 register FIELDS
 # (`AttrIndx`, `DminLine`, `HubAddr`, `SplEna`) and a CPUID vendor string, which are outward
 # references and belong in the baseline forever; the rest were real.

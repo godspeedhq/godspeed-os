@@ -263,7 +263,7 @@ def main() -> int:
     # 18.1/18.2 for the SDK. THIS WAS SCANNED BY NOTHING: the script defined two roots, kernel/src
     # and services, so `sdk/`'s ~125 unsafe lines were audited by no tool at all - while 18.4 says
     # "CI checks the file matches source" and the audit's own header implied the SDK's unsafe lived
-    # only in the four permitted files. It does not (backlog/18).
+    # only in the four permitted files. It does not (backlog/fixed/18).
     sdk_table = parse_sdk_table()
     # Every SDK file the audit's table or this script names must exist, and the two must agree on a
     # grandfathered floor: the audit is the record, and a script holding a different number is a

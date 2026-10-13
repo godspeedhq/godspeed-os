@@ -17,7 +17,7 @@ normalizes on comparison.
 
 **A file whose SIZE is asserted must have deterministic bytes on every platform.** Fixed with
 `*.gsh text eol=lf` (and `*.gs`), the rule `*.sh` and `boot/**` already carry - the latter for the
-same class of bug, where a trailing CR became part of a U-Boot filename (`backlog/26`).
+same class of bug, where a trailing CR became part of a U-Boot filename (`backlog/fixed/26`).
 `line_ending_check.py` only inspects files under an `eol=lf` rule, so `*.gsh` was invisible to it
 and is now covered.
 
@@ -77,7 +77,7 @@ is a long argument for why those differ.
 ## Closed 2026-09-24, and the "what not to do" below is why
 
 Nothing was shaved. The suite is nine files under `scripts/selfcheck/`, each under its own copy of the
-same ceiling, and the same 509 checks run. `backlog/47` carries the treatment.
+same ceiling, and the same 509 checks run. `backlog/fixed/47` carries the treatment.
 
 The CRLF half of this entry stands as ratified history and its fix is still load-bearing: `*.gsh text
 eol=lf` is what makes a size assert mean the same thing on every platform, and it now applies to nine

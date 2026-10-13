@@ -79,7 +79,7 @@ jobs:
           # v0.19.0 and never again, and nothing compared the two. rustdoc prints the crate version on
           # every published API page and the README sends newcomers to those pages, so the first fact
           # a reader met was a superseded version. Twelve checkers passed and were right to - no
-          # DOCUMENT restates the version, so `facts_check.py` had nothing to reconcile (backlog/55).
+          # DOCUMENT restates the version, so `facts_check.py` had nothing to reconcile (backlog/fixed/55).
           #
           # Fail here, before anything is published, rather than discovering it an audit later.
           # Only the leading vMAJOR.MINOR.PATCH is compared, so `v0.21.0-rc1` still matches a 0.21.0
@@ -89,7 +89,7 @@ jobs:
           if [ "$MANIFEST" != "$TAGVER" ]; then
             echo "::error::tag $TAG says $TAGVER but Cargo.toml says $MANIFEST." \
                  "Bump [workspace.package] version in Cargo.toml to match the tag, or retag." \
-                 "See backlog/55 - this is the check that exists because v0.20.0 shipped as 0.19.0."
+                 "See backlog/fixed/55 - this is the check that exists because v0.20.0 shipped as 0.19.0."
             exit 1
           fi
           echo "version: tag $TAG agrees with Cargo.toml ($MANIFEST)"

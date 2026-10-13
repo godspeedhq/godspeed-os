@@ -5,7 +5,7 @@
 # and prints one tally for the whole suite.
 #
 # They are separate files because a baked script is indexed with u16 offsets and the single file had
-# reached 65,139 bytes of a 65,536 ceiling (`backlog/47`). Each part now carries its own budget - and
+# reached 65,139 bytes of a 65,536 ceiling (`backlog/fixed/47`). Each part now carries its own budget - and
 # its own 256-statement detail budget, so the report no longer stops naming statements part way.
 #
 # No part may declare a `fn` or a `let` another part uses: each is interpreted on its own, with a
@@ -31,7 +31,7 @@ assert ok events persist start /sc/cap.log 256KiB
 # where filling 4 MiB over USB took longer than the caller was willing to wait.
 #
 # SO WAIT ON THE TRUTH, NOT ON A CLOCK (Commandment VIII). This was `wait 3` racing a variable
-# pre-fill and it lost intermittently - `backlog/36` has the post-mortem. Staged through a file
+# pre-fill and it lost intermittently - `backlog/fixed/36` has the post-mortem. Staged through a file
 # because gsh refuses to capture a pipeline (see the hw-enumerator probe in `20-hardware.gsh`); `count` counts DATA
 # rows, so a match is 1 and no match is 0.
 let mut capready = 0

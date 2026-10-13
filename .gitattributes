@@ -31,7 +31,7 @@
 #
 # The ceiling is not decoration: `prescan_fns` uses u16 offsets, so a script past 64 KiB makes the
 # interpreter dispatch the WRONG FUNCTION BODY silently. The assert exists because the failure it
-# replaces is invisible (`backlog/40`).
+# replaces is invisible (`backlog/fixed/40`).
 *.gsh    text eol=lf
 *.gs     text eol=lf
 
@@ -56,7 +56,7 @@
 # every entry failed with `Failed to load '/godspeed-riscv64-visionfive.img'` - while
 # the MENU still rendered perfectly, because a trailing `\r` in a display string just
 # returns the cursor and is invisible. That cost two card reflashes and two wrong
-# theories (`backlog/26`).
+# theories (`backlog/fixed/26`).
 #
 # The boot directory is the whole rule rather than a list of extensions, because the
 # next board will bring a file type nobody thought to add.

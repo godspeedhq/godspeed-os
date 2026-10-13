@@ -58,7 +58,7 @@ none was marked. They are now, each pointing at the section that changed it.
   `smp/ipi.rs`'s full-flush sentinel a no-op there (latent: nothing calls it; recorded below).
 - **Shipped but documented as not** (HIGH): `utilities/57_audio.md` said the Pis' jack was never heard (the
   Pi 4 was) and that only x86 has an audio driver; `docs/audio.md` said `play` and the Pi grant were not
-  built; the website said the `audio` command was not built; `backlog/65` still waited on closing
+  built; the website said the `audio` command was not built; `backlog/fixed/65` still waited on closing
   conditions both of which had been met.
 - **The `wifi` utility spec described an architecture that was never built** (HIGH): standalone services
   holding an introspection-only capability, and a hidden network joinable by BSSID. Every verb is a shell
@@ -168,7 +168,7 @@ them.** `CLAUDE.md` §6.4 cited `kernel/src/task/mod.rs:593` for the IOMMU passt
 line had become a closing brace, the comment having moved to 596. `docs/ahci.md`, `docs/iommu.md`
 and `docs/networking.md` cited the same dead line - the citation had been copied between documents,
 never re-checked. `docs/ahci.md` also cited a supervisor spawn row that had moved,
-`docs/probe-params-design.md` an SDK site, `backlog/20` an ARM guard. FIXED by re-pointing, and
+`docs/probe-params-design.md` an SDK site, `backlog/fixed/20` an ARM guard. FIXED by re-pointing, and
 mostly by citing the NAME instead (`the `confine` flag on `DeviceSpec::Pci`", "the `block-driver`
 row of the supervisor spawn table") - a name greps and does not drift. **Gated**:
 `scripts/line_ref_check.py` is new and now the sixteenth checker. `audits/`, `milestones/` and
@@ -194,7 +194,7 @@ reader counting commands from it would be two short. FIXED in §9.
 
 ### What this audit did not find
 
-No claim in `docs/gsfs-carnage.md`, `docs/gsfs-hardware-pass.md` or `backlog/40-43` was wrong at the
+No claim in `docs/gsfs-carnage.md`, `docs/gsfs-hardware-pass.md` or `backlog/fixed/40-43` was wrong at the
 time of audit - they had been corrected repeatedly during the session that produced them, three
 times by hardware contradicting a number. `utilities/55_background.md` was accurate on every
 detachable command and every refusal, which is what `commandments.py` Commandment X buys. The 33
@@ -1086,7 +1086,7 @@ administered and stands as an invented example.
 (25/100/2000, 800) against their comments; `xhci`'s `MAX_SLICES` 6, the input-context clear, the protocol
 test and Set Hub Depth; no live comment still describes section 38's reverted per-port rebind or ring wrap;
 every `usbfn` opcode and size in the doc's table; the 54 arch-conditional sites in `CLAUDE.md` and
-`docs/porting.md`; `backlog/79` against the code.
+`docs/porting.md`; `backlog/fixed/79` against the code.
 
 **Left as they are:** `docs/wifi-aic8800.md`'s "`serve_radio` waits at most 250 ms" is in dated text and was
 true then (the loop moved to `godspeed_wifi::serve` since). `install_key`'s group arm in `station.rs` still
@@ -1183,7 +1183,7 @@ form, the restarted set as a fixed list, and a note that `events`, `xhci` and `e
 they are, as `MANAGED` members (`services/CLAUDE.md`); section 8 named a test command `osdev test shell`
 does not send. All corrected, and the sample is now marked as the old form beside a real report from the
 T630. `docs/wifi-usb.md` carried the bare form five times in this branch's own records (sections 47 and
-50) and `backlog/02` once as an instruction; every `max-carnage` panel in this session's logs reads
+50) and `backlog/fixed/02` once as an instruction; every `max-carnage` panel in this session's logs reads
 `target: all-services`, and the shell refuses the bare form, so they now say `all-services`. Found while
 writing the T630 test instructions, which gave the bare form and were refused. **A gate finding:**
 `doc_command_check` asks whether a documented subcommand exists, not whether its arguments are ones the
@@ -1207,8 +1207,8 @@ against `utilities/56_wifi.md` (`REJOIN_MIN_SECS` 60, once per drop, through `au
 `Notice::Changed`, and `said` is cleared only with no station up); section 50's counts against its commits.
 
 **Left as they are:** dated records that use the bare form before `0cb8985b` or whose target cannot be
-recovered (`backlog/03`'s 2026-09-06 sighting, `backlog/14`, `backlog/48`, `backlog/57`, and CLAUDE.md's
-2026-08-09 amendment, which is prose, not a command), and `backlog/31`'s `DNS_RX_TRIES`, history of the
+recovered (`backlog/03`'s 2026-09-06 sighting, `backlog/14`, `backlog/fixed/48`, `backlog/57`, and CLAUDE.md's
+2026-08-09 amendment, which is prose, not a command), and `backlog/fixed/31`'s `DNS_RX_TRIES`, history of the
 fix before this one.
 
 ## Audit 12 - the whole branch, documents and code comments, `feat/wifi-driver` since it left `main` (2026-10-08)

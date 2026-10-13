@@ -41,7 +41,7 @@ one echo a second. The 16:32 boot shows the switch happening at the instant of `
 
 - **The radio.** `nic-driver`'s own query to `wifi-driver` logs `answered 0x10 in 0 ms` throughout, no
   mismatched reply was ever recorded, and the stall is between two services on core 1.
-- **The IPC change (`backlog/65`).** A bisect image with only that change reverted (16:49 boot) showed
+- **The IPC change (`backlog/fixed/65`).** A bisect image with only that change reverted (16:49 boot) showed
   the identical cadence.
 - **The idle lost-wakeup window** (`183088a1`'s class; the aarch64 port answered "no" to that fix for a
   reason that has since gone). Closing it on the Pi 4 (`ce36b929`: mask, re-check, `wfi`, unmask) changed

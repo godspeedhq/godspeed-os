@@ -2625,11 +2625,11 @@ enables read back as written - and every frame back `did not decrypt (protected 
 true)`, `ping` 0 of 5. So it is **not `xhci`'s and not the key file's**: it happens behind `dwc2`, and to a
 hand-made join as well as a rejoin. What every failure so far shares is a fresh `wifi-usb` instance on a
 chip that has just been brought up; what separates a failing one from a working one is still unknown. In
-this session's cards: four failures in about fifteen fresh joins, on two hosts. `backlog/79` carries it.
+this session's cards: four failures in about fifteen fresh joins, on two hosts. `backlog/fixed/79` carries it.
 
-## 43. The key store laid out as Realtek's own driver lays it out (2026-10-07) - for `backlog/79`; hardware-verified on the Pi 2 (sections 45, 46)
+## 43. The key store laid out as Realtek's own driver lays it out (2026-10-07) - for `backlog/fixed/79`; hardware-verified on the Pi 2 (sections 45, 46)
 
-`backlog/79`: a fresh `wifi-usb` sometimes joins and every frame back comes up `security 0`. Section 40
+`backlog/fixed/79`: a fresh `wifi-usb` sometimes joins and every frame back comes up `security 0`. Section 40
 showed the two security enables read back as written, and the CAM could not be read back (rtlwifi has no
 CAM read either - `build/rtl/cam.c`, fetched for this). So the question became what the CAM layout
 should be, read from the driver Realtek wrote for this chip family, rtlwifi, rather than from rtl8xxxu
@@ -2716,7 +2716,7 @@ two replugs of the dongle - each said `pairwise key 0 in CAM entry 4`, `group ke
 one `did not decrypt`**, to us or to a group, in the whole session - where section 42's Pi 2 card had one
 failing join in four and every working join had refused at least one group frame. One powercycle, not
 the five asked for; the four fresh instances are the evidence, and more joins on the next cards add to
-it. `backlog/79` stays open until they do.
+it. `backlog/fixed/79` stays open until they do.
 
 **What the card found instead: `dwc2-svc: port 2 - device REMOVED`, about 9,200 times.** The operator
 moved the dongle from hub port 2 to port 4. As it came out, port 2 read connected once more: `device
@@ -2917,7 +2917,7 @@ is out - the radio carries the link`, a DHCP lease and the gateway answering a p
 USB stick came up on `xhci` as before. (The twelve `fs: flash requested ... REFUSED` lines at boot are
 `fs`'s own protocol selftest walking every opcode with a zero capacity injected so it cannot format -
 documented beside the code that logs them, not a request from anywhere. Since 2026-10-11 they are not
-logged per probe at all: the selftest's PASS line counts them, `backlog/56`.) Steps 2 to 4 not yet run.
+logged per probe at all: the selftest's PASS line counts them, `backlog/fixed/56`.) Steps 2 to 4 not yet run.
 
 **Steps 2 to 4 (same boot).**
 - **`wifi radio powercycle`:** the respawned driver was told again (`the USB radio is not attached`), stood

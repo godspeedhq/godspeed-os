@@ -179,14 +179,14 @@ not. Re-run on the two x86 boards after the fix:
 
 | board | `tcp ... big`, dispatch to reply | queue wait before dispatch | selfcheck |
 |---|---|---|---|
-| Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | **ran 461, failed 0** (see `backlog/31`) |
+| Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | **ran 461, failed 0** (see `backlog/fixed/31`) |
 | HP T630 | 159 ms | under 20 ms | **ran 461, failed 0** |
 | StarFive VisionFive 2 Lite | 204 / 78 / 174 / 205 ms (4 runs) | under 20 ms | **ran 461, failed 0** |
 | Raspberry Pi 4 | **31 / 47 / 32 ms** (3 runs) | under 40 ms | **ran 461, failed 0** |
 | Raspberry Pi 2 | 47 to 236 ms, median ~95 ms (8 runs) | under 20 ms | **ran 452, failed 0** |
 
 The Wyse cell was filled afterwards and took two runs: `ran 462, failed 1`, then `ran 461, failed 0`
-after a `kill net-stack`. The failure was real and is `backlog/31` - net-stack blocked for 48 seconds
+after a `kill net-stack`. The failure was real and is `backlog/fixed/31` - net-stack blocked for 48 seconds
 inside one serve pass, waiting on a `nic-driver` that was alive and not answering, so DNS resolution
 and `ping` both failed until its client was restarted. **A green second run does not retire that**, and
 the entry says what is and is not established about it.

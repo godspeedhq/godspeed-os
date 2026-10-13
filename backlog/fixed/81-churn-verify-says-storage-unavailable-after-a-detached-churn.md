@@ -69,7 +69,7 @@ there:
    whose failure the suite checked. Every history save from then on was lost too, silently.
 
 The repair already existed: `drain_stale_replies` describes exactly this desync, and
-`request_with_reply_deadline_into` drained before issuing (`backlog/37`). But the two other paths that
+`request_with_reply_deadline_into` drained before issuing (`backlog/fixed/37`). But the two other paths that
 wait on the reply mailbox did not - `request_with_reply_call_err`, which `gs::call` and therefore every
 `gs::fs` call uses, and `request_with_reply_deadline_outcome_into`. One helper, `drain_before_request`,
 now drains and logs, and all three call it. The log says so when it happens:

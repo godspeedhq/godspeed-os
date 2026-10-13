@@ -160,7 +160,7 @@ name out of this one's timestamp, which looks like garbage in a listing rather t
 **`ls` is now `dir`**, `long` and `human` are gone, and `dir bytes` replaces them. The selfcheck suite
 was updated in 34 places, so a selfcheck failure naming a missing command is a rename that was missed.
 (It was a single baked script when this was written; it is the ten parts under `scripts/selfcheck/`
-now - `backlog/47`.)
+now - `backlog/fixed/47`.)
 
 **`fs` now sends a failure REASON on the wire** and the shell prints it. The reply grew; byte 0 is
 unchanged, so an unchanged consumer is unaffected.

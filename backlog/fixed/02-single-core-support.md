@@ -126,7 +126,7 @@ exactly the reasoning the check had raised in the first place. The check was rig
 **Checking the log (historical).** While the flag existed, a single-core kernel announced itself:
 
 ```
-smp: SINGLE-CORE BUILD - APs deliberately not started (backlog/02)
+smp: SINGLE-CORE BUILD - APs deliberately not started (backlog/fixed/02)
 smp: 1 cores ready
 ```
 
@@ -169,7 +169,7 @@ took 43 s against 26 s on four. Predictable degradation, no correctness cliff.
 
 **HP T630 (x86_64, AMD), 2026-09-06:** 460/0 x3 through selfcheck + 100 chaos rounds + selfcheck +
 hotplug, zero panics, zero wedges, zero silent resets - **with `ehci` running**, once the EHCI BIOS
-handoff was fixed (backlog/11).
+handoff was fixed (backlog/fixed/11).
 
 **Raspberry Pi 2 (arm32), 2026-09-06:** 452/0 x3 through the same sweep. The most demanding of the
 four for this question: storage, keyboard AND networking all ride one `dwc2` controller with no
@@ -198,7 +198,7 @@ between polls, matching the pattern `xhci` already used.
 **2. `PlacementInvalid` is never constructed (backlog/01).** Every service ran on core 0 whatever its
 contract asked for. That defect was found by this experiment on its first boot.
 
-**3. ROOT-CAUSED (now backlog/11): `ehci` resets a controller the BIOS still owns.** The step
+**3. ROOT-CAUSED (now backlog/fixed/11): `ehci` resets a controller the BIOS still owns.** The step
 logging named the exact fatal instruction - the `HCRESET` write - and the registers showed the
 firmware actively running the controller (`RS=1`, periodic schedule live) with a USBLEGSUP capability
 present at `eecp=0xa0` that this driver has never honoured. An SMI is serviced on the core that

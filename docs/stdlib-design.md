@@ -546,7 +546,7 @@ reference (`request_within_notice`) failed. Fixed; the scan now covers the crate
 baseline entry could be dropped as a result.
 
 **Still owed, unchanged:** target-side tests against a service that really restarts, and `gs::cap`.
-Newly recorded: `backlog/45`, the published book has no standard-library section, which blocks the
+Newly recorded: `backlog/fixed/45`, the published book has no standard-library section, which blocks the
 Stranger Test from an honest first run.
 
 ## 12. `gs::cap` is NOT built, and the reason is a gap in the kernel surface
@@ -1418,7 +1418,7 @@ having and touches neither.
 
 ### Open items that are not about this branch
 
-- `backlog/48` and `backlog/49` - the userspace-reachable kernel panic class. A genuine violation of
+- `backlog/fixed/48` and `backlog/49` - the userspace-reachable kernel panic class. A genuine violation of
   an absolute bar (§22: the kernel must never panic on user-controllable input), and the kernel is
   zero-diff here, so this branch neither causes it nor worsens it.
 - `backlog/50` - `nic-driver` read 100% on the T630. One sighting, one machine, not root-caused;
@@ -1662,7 +1662,7 @@ third time.
 
 ### What hardware does NOT close
 
-The `backlog/48` / `backlog/49` class - a userspace-reachable kernel panic, reproduced under load -
+The `backlog/fixed/48` / `backlog/49` class - a userspace-reachable kernel panic, reproduced under load -
 is untouched by any of this and is a violation of an absolute bar (CLAUDE.md 22: the kernel must
 never panic on user-controllable input). It is not caused or worsened by this branch, whose kernel
 diff is comments only, and the operator has already scheduled it for after this work.

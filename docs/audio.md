@@ -366,7 +366,7 @@ WAV; per-application volume; HDMI audio.
 
 The verbs above define the driver's request protocol at A4, defined ONCE in a shared module the shell and
 the driver both use, as `sdk/wifi/src/wire.rs` is for `wifi`, and TAGGED so a late reply can never be
-taken for the answer to a later question (`backlog/70`). One request per verb above - status, info,
+taken for the answer to a later question (`backlog/fixed/70`). One request per verb above - status, info,
 outputs, set output, set volume, mute, unmute, power on / off / hard, tone - and for `play` a stream: open
 with the format, PCM chunks of at most 4 KiB each answered at once with the free space left, then end. The
 names are A4's to choose.
@@ -657,7 +657,7 @@ respawn of a 100-round chaos run.)*
 
 **The protocol** is `sdk/audio`'s `wire`, read by both sides, as `sdk/wifi`'s is for the radio. Every
 request is tagged (`[TAGGED, tag, op, ...]`, answered `[TAGGED, tag, status, ...]`), so a late answer is
-never read as the next request's (backlog/70) - in the protocol from its first byte rather than added
+never read as the next request's (backlog/fixed/70) - in the protocol from its first byte rather than added
 after. And **every answer is immediate**: `tone` starts the sound and answers, the shell follows it with
 `status` every 200 ms, and `q` sends `stop`. The driver can do that because its one wait is
 `gs::driver::irq`'s, which hands a request back mid-tone, so the radio's machinery for answers the shell is

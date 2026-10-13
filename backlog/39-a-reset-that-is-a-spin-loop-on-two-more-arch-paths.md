@@ -8,7 +8,7 @@ port.
 
 ## Why this is written down rather than fixed
 
-It is the SAME defect found on riscv64 on 2026-09-21 (`backlog/11`'s neighbour in spirit, though
+It is the SAME defect found on riscv64 on 2026-09-21 (`backlog/fixed/11`'s neighbour in spirit, though
 unrelated in mechanism). There, `reboot` printed `reboot: hardware reset` and then hung the calling
 hart forever; ten seconds later the liveness watchdog panicked, correctly, and the operator was
 handed a `LIVENESS WEDGE` with no indication that the reset itself was never implemented.
@@ -46,7 +46,7 @@ PSCI to start secondary cores, so the mechanism is present and the call site is 
 
 It is NOT done here for one reason worth stating: it cannot be tested. Every aarch64 build we make
 sets `pi4` and therefore takes the other path, so a PSCI reset would be written, audited, and never
-executed - which is the exact state `backlog/11` sat in for a fortnight and which this project has
+executed - which is the exact state `backlog/fixed/11` sat in for a fortnight and which this project has
 now twice found to be worth less than it looks. When a second aarch64 target exists, this is a small
 job with a test attached.
 

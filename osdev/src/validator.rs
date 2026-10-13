@@ -644,7 +644,7 @@ static CHAOS_TESTS: &[TestSpec] = &[
     // take. If these two are ever consolidated, keep the one in the DEFAULT suite.
     //
     // This replaces the `single-core` kernel feature, which was deleted once it had done its job
-    // (backlog/02). That flag forced the state on hardware that has more cores; this asserts the
+    // (backlog/fixed/02). That flag forced the state on hardware that has more cores; this asserts the
     // state §11.3 actually defines - "if zero APs come up, system runs as single-core" - by giving
     // QEMU one core and checking the machine reaches steady state on it.
     //

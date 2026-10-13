@@ -106,12 +106,12 @@ impl Chaos {
     ///
     /// **THIS ATTACKS THE PROTOCOL, NOT THE DEVICE, AND THAT IS THE GAP IT FILLS.** `io-error-test`
     /// makes the disk fail, which `fs` already handles by retrying. Carnage §3.7 asks for the other
-    /// half - late, duplicate, missing and out-of-order COMPLETIONS - and names why: `backlog/31`
+    /// half - late, duplicate, missing and out-of-order COMPLETIONS - and names why: `backlog/fixed/31`
     /// recorded exactly that one layer up, a service reading replies that belonged to earlier
     /// requests. The fs/block channel has the same shape, carries the same correlation tag, and
     /// gained a drain-before-request repair that nothing had ever exercised adversarially.
     ///
-    /// **The bar is RECOVERY, not detection** - `backlog/31`'s tag was reverted precisely because
+    /// **The bar is RECOVERY, not detection** - `backlog/fixed/31`'s tag was reverted precisely because
     /// rejecting a stale reply is not the same as surviving one.
     ///
     /// One of each shape and no more: a MISSING completion costs the caller its full 30 s deadline

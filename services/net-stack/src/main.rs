@@ -1112,7 +1112,7 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
 /// caller's patience on the wire (`ns_build` puts it at byte 1), and this service already reads it to
 /// age out stashed requests - it just never used it to bound its OWN work. It could therefore spend
 /// far longer on a lookup than the caller would wait: twelve polls of two seconds, twice (once per
-/// DNS server), is 48 seconds against a client waiting 8. That is the 48 in `backlog/31`'s title.
+/// DNS server), is 48 seconds against a client waiting 8. That is the 48 in `backlog/fixed/31`'s title.
 ///
 /// Why a late answer is worse than no answer: the caller has already given up, so the reply lands as
 /// a STALE one. The next request receives the previous one's answer, the correlation tag rejects it,

@@ -96,7 +96,7 @@ config points at.
 
 ## The 2026-09-13 incident: `Failed to load`, and what it is not
 
-Recorded here rather than only in `backlog/26` because this file is where somebody looks when a card
+Recorded here rather than only in `backlog/fixed/26` because this file is where somebody looks when a card
 will not boot, and because `build/` is gitignored - the captures below do not survive a clean.
 
 **The failure.** Deploying `db32b674`, by the five steps above, with the deploy log reporting every

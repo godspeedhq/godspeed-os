@@ -528,7 +528,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // per keypress. Each of those made the console `paint_view` + `present` before it could reply: a
     // full repaint of the framebuffer, inside the caller's deadline, on the core the caller was
     // blocked on. Against a 3840x2160 panel that overran one second and the shell declared a console
-    // that was merely busy to be dead (`backlog/37`).
+    // that was merely busy to be dead (`backlog/fixed/37`).
     //
     // **AND THIS SUITE RAN GREEN THROUGH ALL OF IT**, which is the part worth keeping in mind: the
     // cost that broke it is a repaint, QEMU has no such panel, so the tests could not have caught it
@@ -590,7 +590,7 @@ pub fn run(image_path: &Path, smp: u32) {
     let s6 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
     check!(s6.is_some(), "scrollback: Esc also leaves");
 
-    // THE SOAK THAT `backlog/37` LEFT BEHIND. Open it, touch nothing for 8 seconds, then page. The
+    // THE SOAK THAT `backlog/fixed/37` LEFT BEHIND. Open it, touch nothing for 8 seconds, then page. The
     // old failure was the view going permanently deaf; the fingerprint was the shell printing that
     // the console had stopped answering, so waiting for its ABSENCE is immune to how the success
     // path happens to be worded.
@@ -600,7 +600,7 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"\x1b[6~");   // PgDn
     let soak = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
     check!(!soak.contains("stopped answering") && !soak.contains("did not answer"),
-           "scrollback: still answers after 8s open with no keystrokes (backlog/37)");
+           "scrollback: still answers after 8s open with no keystrokes (backlog/fixed/37)");
     send(&mut write_half, b"q");
     let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
 
@@ -6470,7 +6470,7 @@ fn retry_tcp_connect(port: u16, timeout: Duration) -> Option<TcpStream> {
 
 /// `osdev test chaos-repro[:rounds[:iters]]` - hammer `chaos max-carnage` inside one boot.
 ///
-/// Written for `backlog/48`: a kernel panic on the kill path's progress bound, seen once in four
+/// Written for `backlog/fixed/48`: a kernel panic on the kill path's progress bound, seen once in four
 /// `osdev test shell` runs. That rate is unusable for an investigation - each of those runs costs
 /// minutes and spends nearly all of them on things that are not carnage - so this does nothing but
 /// carnage, in a loop, in one boot.
@@ -6506,7 +6506,7 @@ pub fn run_chaos_repro(image_path: &Path, smp: u32, rounds: u32, iters: u32) {
         std::process::exit(1);
     });
     // 90s, not 10: under a deliberately loaded host QEMU may not get enough CPU to open its
-    // listening socket for tens of seconds, and the loaded phase of `backlog/48` died here before it
+    // listening socket for tens of seconds, and the loaded phase of `backlog/fixed/48` died here before it
     // ran a single round.
     let stream = match retry_tcp_connect(shell_port, Duration::from_secs(90)) {
         Some(s) => s,
@@ -7369,7 +7369,7 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!listing.contains("[2J"),
            "`dir` did not emit a raw ESC sequence that came from a FILENAME");
 
-    // ---- A DIRECTORY BIGGER THAN ONE REPLY BLOCK IS LISTED IN FULL (backlog/33) ----
+    // ---- A DIRECTORY BIGGER THAN ONE REPLY BLOCK IS LISTED IN FULL (backlog/fixed/33) ----
     //
     // `list_dir` builds each answer into a single 512-byte block, so roughly twenty entries fit per
     // reply. THIS CASE USED TO ASSERT THE OPPOSITE OF WHAT IT ASSERTS NOW, and the history is worth
@@ -8895,11 +8895,11 @@ pub fn run_fs_blockdeath(image_path: &Path, persist_path: &str, smp: u32) {
 ///
 /// `fs-ioretry` already makes the disk fail, and `fs` handles that by retrying. §3.7 asks for the
 /// other half - late, duplicate, missing and out-of-order completions - and names why it matters:
-/// `backlog/31` recorded exactly that failure one layer up, a service reading replies that belonged
+/// `backlog/fixed/31` recorded exactly that failure one layer up, a service reading replies that belonged
 /// to earlier requests. The fs/block channel has the same shape, carries the same correlation tag,
 /// and gained a drain-before-request repair that had never been adversarially exercised.
 ///
-/// **THE BAR IS RECOVERY, NOT DETECTION.** `backlog/31`'s tag was reverted precisely because
+/// **THE BAR IS RECOVERY, NOT DETECTION.** `backlog/fixed/31`'s tag was reverted precisely because
 /// rejecting a stale reply is not the same as surviving one, so every assertion below that merely
 /// proves a fault was NOTICED is paired with one proving the filesystem still worked afterwards.
 /// A run where `fs` spots every bad completion and then cannot write a file has failed this gate.
@@ -8982,7 +8982,7 @@ pub fn run_fs_blockchaos(image_path: &Path, persist_path: &str, smp: u32) {
     check!(w.contains("discarded a block reply for tag") || w.contains("orphaned block reply"),
            "fs detected a mis-correlated completion rather than believing it");
 
-    // ---- AND RECOVERED, which is the gate. §3.7 exists because `backlog/31` proved detection
+    // ---- AND RECOVERED, which is the gate. §3.7 exists because `backlog/fixed/31` proved detection
     // without recovery is not enough.
     check!(w.contains("survived-the-completion-chaos"),
            "a file written AFTER the faults reads back correctly (recovery, not just rejection)");
