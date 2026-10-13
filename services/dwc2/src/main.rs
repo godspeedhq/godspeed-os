@@ -662,7 +662,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // either way.
             if disk.is_none() {
                 let mut drained = 0u32;
-                while let Some(msg) = gs::ipc::try_recv(&ctx) {
+                loop {
+                    // Bounded BEFORE taking, as the two drains below are: what is not taken stays
+                    // queued for the next pass (`backlog/84` C3).
+                    if drained >= MSG_DRAIN_MAX {
+                        ctx.log("dwc2-svc: no-disk drain hit its bound - a sender is enqueuing as fast as we retire");
+                        break;
+                    }
+                    let Some(msg) = gs::ipc::try_recv(&ctx) else { break };
                     drained += 1;
                     if is_usb_irq(&msg) {
                         usb_irq(&ctx, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
@@ -672,10 +679,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // need a disk (see `dispatch`).
                     if !dispatch(&ctx, &m, &d, None, nic.as_mut(), radio.as_mut(), &msg, &mut capless) {
                         answer_no_disk(&ctx, &mut capless);
-                    }
-                    if drained >= MSG_DRAIN_MAX {
-                        ctx.log("dwc2-svc: no-disk drain hit its bound - a sender is enqueuing as fast as we retire");
-                        break;
                     }
                 }
             }

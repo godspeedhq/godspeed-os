@@ -3657,6 +3657,23 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         }
         None => { println!("files-test: FAIL - gsh let timeout"); fail += 2; }
     }
+    // `repeat` writes to its CALLER's output (backlog/84 S2): in a function whose output is captured,
+    // `$(f)`, its runs and verdict land in the variable, as `echo`'s do in the cf tests below. It wrote
+    // to the console before, so the variable held none of them. (`$(repeat ...)` itself is refused - a
+    // capture takes a producer - and `run ... save` saves only the run's report, for every command.)
+    let _ = run!(b"write /gsh_rep.gsh fn f { repeat count 2 echo hi } ; let r = $(f) ; echo got=[$r]\r", 10);
+    match run!(b"run /gsh_rep.gsh\r", 16) {
+        Some(r) => {
+            check!(r.contains("got=[repeat 1 of 2: echo hi"), "repeat: its runs go to a function capture, not the console");
+            check!(r.contains("repeat: 2 run(s), 0 failed"), "repeat: its verdict goes to the capture too");
+        }
+        None => { println!("files-test: FAIL - repeat capture timeout"); fail += 2; }
+    }
+    // A refusal inside `repeat` names `repeat`, not only scripts (backlog/84 S1).
+    match run!(b"repeat count 1 run /gsh_a.gsh\r", 12) {
+        Some(r) => check!(r.contains("neither can `repeat`"), "repeat: a nested run's refusal names repeat"),
+        None => { println!("files-test: FAIL - repeat nested run timeout"); fail += 1; }
+    }
     // undefined variable is a LOUD error (not a silent empty string) and fails the statement.
     let _ = run!(b"write /gsh_u.gsh echo $missing\r", 10);
     match run!(b"run /gsh_u.gsh\r", 14) {

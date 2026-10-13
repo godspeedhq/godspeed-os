@@ -108,8 +108,18 @@ pub(crate) fn paced_looks(budget_us: u64, pace_us: u64) -> u32 {
 }
 
 /// Microseconds in `ticks` at `per_10ms` ticks per 10 ms. 0 when uncalibrated, which is "unknown".
+///
+/// Divided before it is multiplied, so it is exact for any `ticks`: multiplying first saturated at about
+/// 1.8e15 ticks, about 10 days on a 2 GHz TSC, and `counter_ms` then stopped advancing (`backlog/84` C1).
+/// The remainder's product cannot overflow, because the remainder is below `per_10ms` and no counter
+/// runs at 1.8e17 ticks per second.
 pub(crate) fn us_for(per_10ms: u64, ticks: u64) -> u64 {
-    if per_10ms == 0 { 0 } else { ticks.saturating_mul(10_000) / per_10ms }
+    if per_10ms == 0 {
+        return 0;
+    }
+    let whole = ticks / per_10ms;
+    let part = ticks % per_10ms;
+    whole.saturating_mul(10_000).saturating_add(part.saturating_mul(10_000) / per_10ms)
 }
 
 /// Does this machine have a calibrated clock, so that a [`Budget`] is a real duration?
@@ -131,9 +141,7 @@ pub fn ticks(ctx: &ServiceContext) -> u64 {
 }
 
 /// The machine's counter in milliseconds: a reading every task shares, that only goes forward, so two taken
-/// by two instances of one service - the second after the first died - are in order. Until the counter passes
-/// about 1.8e15 ticks (`us_for` saturates; about 10 days on a 2 GHz TSC), after which it stops advancing -
-/// a defect, `backlog/84`. For telling one
+/// by two instances of one service - the second after the first died - are in order. For telling one
 /// instance's events from the next one's, not for a date, and not time since boot on every board (the
 /// counter's origin is the board's). 0 when the counter is uncalibrated, where it cannot be known.
 #[cfg(not(test))]
@@ -359,5 +367,18 @@ mod tests {
     fn elapsed_round_trips() {
         assert_eq!(us_for(540_000, ticks_for(540_000, 123_000)), 123_000);
         assert_eq!(us_for(0, 999), 0);
+    }
+
+    #[test]
+    fn elapsed_does_not_stop_after_ten_days() {
+        // backlog/84 C1: a 2 GHz TSC at 2e15 ticks (about 11.6 days) is 1e12 us. Multiplying first
+        // saturated at about 1.8e15 ticks and froze `counter_ms` from then on.
+        assert_eq!(us_for(20_000_000, 2_000_000_000_000_000), 1_000_000_000_000);
+        assert!(us_for(20_000_000, 2_000_000_000_000_001) >= us_for(20_000_000, 2_000_000_000_000_000));
+        assert!(us_for(20_000_000, 4_000_000_000_000_000) > us_for(20_000_000, 2_000_000_000_000_000));
+        // The whole range: u64::MAX ticks is 9.2e15 us, not a saturated constant.
+        assert_eq!(us_for(20_000_000, u64::MAX), u64::MAX / 20_000_000 * 10_000 + (u64::MAX % 20_000_000) * 10_000 / 20_000_000);
+        // Exact below a whole 10 ms too.
+        assert_eq!(us_for(20_000_000, 19_999_999), 9_999);
     }
 }

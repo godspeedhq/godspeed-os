@@ -34,7 +34,7 @@ pub const INFO_WHERE_AT: usize = 10;
 /// every restart), and otherwise one more than the last this instance gave, so two binds in one millisecond
 /// still differ. Never 0, which a report reads as absent. Across a restart this holds only where the counter
 /// is calibrated and running: an uncalibrated one reads 0, so each instance counts from 1 again; the low 32
-/// bits wrap every ~49.7 days; and `counter_ms` stops after ~10 days on x86 (`backlog/84`).
+/// bits wrap every ~49.7 days (`backlog/84` C2).
 pub fn next_gen(now_ms: u64, last: u32) -> u32 {
     let t = now_ms as u32;
     if t > last { t } else { last.wrapping_add(1).max(1) }

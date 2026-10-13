@@ -142,11 +142,12 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     nothing has come for `gs::call::NOTICE_AFTER_SECS`, once per wait. The SDK gives the timing
     (`ServiceContext::recv_abortable_deadline_noticing`, the receive-side twin of the request's
     `request_with_reply_qhint`) and the shell the words, because a task with no prompt has nothing
-    to print. A new receive wait in the shell gets it by going through that helper. Not yet covered:
-    the request waits made through plain `request_with_reply_abortable` (`fs_request`, `fs_raw` -
-    `drives`, `drives flash`, `reset`, `label` - and `ns_abortable`), the re-waits after an overtaken
-    reply in `fs_take_tagged` and `ns_take_tagged`, and the fs handles listed in the note above
-    (`backlog/84`).)*
+    to print. A new receive wait in the shell gets it by going through that helper. Since 2026-10-13
+    the request waits that used plain `request_with_reply_abortable` (`fs_request`, `fs_raw` -
+    `drives`, `drives flash`, `reset`, `label` - and `ns_abortable`) go through
+    `ask_with_quit_notice`, and the re-waits after an overtaken reply (`fs_take_tagged`,
+    `ns_take_tagged`) through `recv_quittable` (`backlog/84` S6). Not yet covered: the fs handles
+    listed in the note above.)*
 
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,

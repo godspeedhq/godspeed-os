@@ -111,8 +111,15 @@ for the answer, so a dead source ends one line ("did not answer") and never the
 command.
 
 That wait is quittable and says so: once 2 s pass with nothing from `ask`, the shell prints `[q] quit`,
-and `q` ends it (conventions rule 10). If the answer is not whole, the shell says which of two things it
-got: `ask: no answer - ask stopped before it replied`, or `ask: the answer arrived incomplete - ask stopped
-partway through it`. The line before it says why the wait ended (`q`, or no end-of-stream). Today the two
-lines say "stopped" in all three cases, `q` and the shell's own 25 s bound included (`backlog/84`). It does not print the record decoder's reason, which is
-about the wire format and not about what the operator asked.
+and `q` ends it (conventions rule 10). If the answer is not whole, the shell says who ended it (`backlog/84` S5):
+
+- `q`: only `pipe: aborted`, since the operator knows why it stopped;
+- the shell's 25 s bound: `ask: no answer - nothing came for ~25s, so the shell ended ask`, or `ask: the
+  answer arrived incomplete - nothing more came for ~25s, so the shell ended ask` when part of it came;
+- `ask` itself, ending its stream: `ask: ask ended without an answer`, or `ask: ask ended, and what it sent
+  does not read as an answer`;
+- an answer larger than the shell holds: `ask: the answer was larger than the shell holds, so what arrived
+  does not read as one`.
+
+It does not print the record decoder's reason, which is about the wire format and not about what the
+operator asked.

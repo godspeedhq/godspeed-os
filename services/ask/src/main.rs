@@ -442,7 +442,6 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
         }
     };
 
-    let tick = gs::driver::wait::ticks(ctx);
     // How the service asked about last ended (`supcmd::DEATH`): the kernel's notice, kept by the supervisor.
     let death_msg = match kind {
         Kind::Service(i) if tt.live("supervisor") => known.get(i).and_then(|n| {
@@ -501,7 +500,7 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
         }
         _ => Got::Absent,
     };
-    let facts = Facts { now, tick, tasks, expected, events, drive, radios: &radios[..nr], chain, net, death,
+    let facts = Facts { now, tasks, expected, events, drive, radios: &radios[..nr], chain, net, death,
                         about, caps, holders, authorities: gs::task::AUTHORITIES };
     know::assess(kind, event, known, &facts, a);
 }
