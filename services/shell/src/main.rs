@@ -466,6 +466,14 @@ pub struct ShellCtx {
     /// nothing, so "not answering" is not said about a wait the operator ended; and by a command that asks
     /// several times in a row (`wifi hardware`) to stop asking. Set false at the start of every ask.
     quit: core::cell::Cell<bool>,
+    /// THE COMMAND CLOCK (`audits/2026-10-13-quit-audit.md` 7a): a command is running, when it started
+    /// (monotonic seconds), and whether its `[q] quit` has been shown. The shell is the observer: every wait
+    /// a command makes reads these through `gs::call::Watch`, so the notice is per COMMAND - a copy made of
+    /// a thousand fast requests says `[q] quit` at 2 s like a single slow one - and a `q` stops the command
+    /// at its next request. `quit` above is the command's quit, cleared when the next command starts.
+    cmd_active: core::cell::Cell<bool>,
+    cmd_start: core::cell::Cell<i64>,
+    cmd_noticed: core::cell::Cell<bool>,
     /// The radio request correlation tag (see `next_wifi_tag`).
     wifi_tag: core::cell::Cell<u8>,
     /// Byte 1 of the last `radio down` answer - WHY the driver says it is down (0 = it did not say).
@@ -537,13 +545,61 @@ impl ShellCtx {
     /// nothing. (It once polled from the start, and `selfcheck`'s second run in one boot outran its
     /// 300 s window, so scripts were given the plain handle until that was fixed.)
     fn fs_waiting<'a>(&'a self, notice: &'a dyn Fn(), keep: &'a dyn Fn(u8)) -> gs::fs::Fs<'a> {
-        gs::fs::Fs::from_tag(&self.inner, self.fs_tag.get()).noticing(notice).keeping(keep)
+        gs::fs::Fs::from_tag(&self.inner, self.fs_tag.get()).noticing(notice).keeping(keep).watching(self)
+    }
+    /// An `fs` handle under the command's watch, sharing the shell's one tag counter: what every file
+    /// operation the shell makes is built on, so none of them can wait silently past 2 s.
+    fn fs<'a>(&'a self) -> gs::fs::Fs<'a> {
+        gs::fs::Fs::from_tag(&self.inner, self.fs_tag.get()).watching(self)
+    }
+    /// A command starts: the clock runs from now, nothing has been shown, nothing has been quit.
+    fn begin_command(&self) {
+        self.quit.set(false);
+        self.cmd_noticed.set(false);
+        self.cmd_start.set(gs::task::epoch_secs_monotonic(&self.inner));
+        self.cmd_active.set(true);
+    }
+    /// The command is over: waits are plain again until the next one.
+    fn end_command(&self) {
+        self.cmd_active.set(false);
     }
     /// The next key if one is waiting: a kept type-ahead key first, then the console.
     fn try_console_read(&self) -> Option<u8> {
         if let Some(b) = self.typeahead.borrow_mut().pop() { return Some(b); }
         self.inner.try_console_read()
     }
+}
+
+/// The shell is the observer of every wait a command makes (`audits/2026-10-13-quit-audit.md` 7a).
+impl gs::call::Watch for ShellCtx {
+    fn active(&self) -> bool { self.cmd_active.get() }
+    fn stopped(&self) -> bool {
+        if self.quit.get() { return true; }
+        if self.notice_due_in() > 0 { return false; }
+        self.notice();
+        // BETWEEN requests, once `[q] quit` has been offered: a command made of many fast requests never sits
+        // in one long enough for the wait to read a key, so the key is read here, before the next is sent.
+        while let Some(b) = self.inner.try_console_read() {
+            if ServiceContext::QUIT_KEYS.contains(&b) {
+                self.quit.set(true);
+                return true;
+            }
+            self.keep_key(b);
+        }
+        false
+    }
+    fn notice_due_in(&self) -> i64 {
+        if self.cmd_noticed.get() { return 0; }
+        let ran = gs::task::epoch_secs_monotonic(&self.inner) - self.cmd_start.get();
+        (gs::call::NOTICE_AFTER_SECS - ran).max(0)
+    }
+    fn notice(&self) {
+        if !self.cmd_noticed.replace(true) {
+            gs::io::println(self, "  [q] quit");
+        }
+    }
+    fn keep(&self, key: u8) { self.keep_key(key); }
+    fn quit(&self) { self.quit.set(true); }
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -578,6 +634,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         wifi_owed_since: core::cell::Cell::new(0),
         wifi_unsent: core::cell::Cell::new(0),
         quit: core::cell::Cell::new(false),
+        cmd_active: core::cell::Cell::new(false),
+        cmd_start: core::cell::Cell::new(0),
+        cmd_noticed: core::cell::Cell::new(false),
         wifi_tag: core::cell::Cell::new(0),
         wifi_down_reason: core::cell::Cell::new(0),
         wifi_radio: core::cell::Cell::new(RADIOS[0]),
@@ -808,7 +867,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         hist.push(line.bytes());
                         hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
                     }
+                    // The command clock runs from Enter to the prompt (`begin_command`): every wait the
+                    // command makes says `[q] quit` once it has run 2 s, and stops at the next request
+                    // after a `q`.
+                    ctx.begin_command();
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
+                    ctx.end_command();
                     // A typed command that failed makes a system sound - only here, at the prompt, never
                     // in a script, so fifty errors in a script do not sound fifty times.
                     match last_result {
@@ -874,7 +938,9 @@ fn run_help_key(
     line: &mut Line,
 ) {
     gs::io::print(ctx, "\r\n");
+    ctx.begin_command();
     *last_result = execute(ctx, b"help", cwd, *last_result, 0, &mut Out::Console);
+    ctx.end_command();
     gs::io::print(ctx, PROMPT);
     line.cur = line.len; // cursor at end after the reprint
     if line.len > 0 {
@@ -1613,7 +1679,7 @@ fn complete_path(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd, tok_start: usize) {
     // which names it can offer. A failed listing means no menu - there is nothing useful to say at a
     // half-typed prompt, and a completion that interrupts to complain is worse than one that does
     // nothing.
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let walked = g.list_dir(dirpath, |e| {
         if e.name.starts_with(leaf) && n < hits.len() && w + e.name.len() <= rbuf.len() {
             rbuf[w..w + e.name.len()].copy_from_slice(e.name);
@@ -5000,7 +5066,7 @@ const SELFCHECK_REMNANTS: &[(&str, bool)] = &[
 fn selfcheck_tidy(ctx: &ShellCtx) {
     let mut removed = 0u32;
     for &(path, tree) in SELFCHECK_REMNANTS {
-        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let mut g = ctx.fs();
         // ASK FIRST. `fs` answers a delete of an absent path with FS_ERR, not FS_NOTFOUND, so
         // deleting blind and reading the status cannot tell "there was nothing there" from "the disk
         // refused". On a clean T630 that printed three "a previous run's files may remain" lines
@@ -9034,7 +9100,7 @@ impl core::fmt::Display for HumanSecs {
 /// `read_into` also STREAMS, so the 3556-byte one-message ceiling that made a larger file look
 /// ABSENT is gone - it fills `dst` however many messages that takes.
 fn fs_read_file(ctx: &ShellCtx, path: &[u8], dst: &mut [u8], max_secs: i64) -> Option<usize> {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let mut g = ctx.fs().patience_secs(max_secs);
     let r = g.read_into(path, dst);
     ctx.fs_tag.set(g.tag());
     r.ok()
@@ -9660,8 +9726,13 @@ fn audio_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // A send that fails at once is a stale capability (the driver restarted since this shell wired it),
     // never a deadline: reacquire by name and send ONCE. A real timeout is never re-sent.
     let driver = audio_driver(ctx)?;
-    // With the `[q] quit` notice once it lingers (`ask_sifted_quittable`).
-    ctx.quit.set(false);
+    // With the `[q] quit` notice once it lingers (`ask_sifted_quittable`). A quit belongs to the command;
+    // see `wifi_ask`.
+    if ctx.cmd_active.get() {
+        if ctx.quit.get() { return None; }
+    } else {
+        ctx.quit.set(false);
+    }
     let noticed = core::cell::Cell::new(false);
     let (mut got, left) = ask_sifted_quittable(ctx, driver, &msg, max_ms, &noticed, sift);
     if got.is_none() && !left && !ctx.quit.get() {
@@ -10875,7 +10946,14 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // by `wifi_sift`, which is now exact. The wait is the sifted one on the main endpoint, not the Call:
     // a Call can only take the oldest reply FROM the driver, which is the very thing that is wrong.
     ctx.wifi_unsent.set(0);
-    ctx.quit.set(false);
+    // A quit belongs to the COMMAND (`begin_command` clears it), so an ask inside a command must not clear
+    // it: this did, and a `q` during `wifi hardware`'s first ask was erased by its second. A command
+    // already quit asks nothing more. Between commands (a shortcut key) it starts clean.
+    if ctx.cmd_active.get() {
+        if ctx.quit.get() { return None; }
+    } else {
+        ctx.quit.set(false);
+    }
     // One `[q] quit` for the whole ask: the wait for owed answers and the request share it.
     let noticed = core::cell::Cell::new(false);
     let (late, other) = wifi_drain_stale(ctx);
@@ -17886,7 +17964,7 @@ fn read_file_exact_bounded(ctx: &ShellCtx, path: &[u8], off: usize, out: &mut [u
 /// streamed write_at chunks (so a piped payload up to the capture buffer reaches the file).
 fn stream_overwrite(ctx: &ShellCtx, p: &[u8], data: &[u8]) {
     if data.len() <= IO_CHUNK {
-        let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let mut g = ctx.fs();
         let r = g.write(p, data);
         match r {
             Ok(()) => gs::io::println_fmt(ctx, format_args!("piped {} bytes → {}", data.len(), str_of(p))),
@@ -19400,7 +19478,7 @@ const FL_TEMP_MAX: usize = 48;
 /// outside `SCRATCH`.
 fn ensure_scratch(ctx: &ShellCtx) -> bool {
     if ctx.scratch_ready.get() { return true; }
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let emptied = match g.delete_all(SCRATCH) {
         Ok(()) | Err(gs::Error::NotFound) => true,
         Err(_) => false,
@@ -19413,14 +19491,14 @@ fn ensure_scratch(ctx: &ShellCtx) -> bool {
 
 /// Make a folder and its parents, bounded by `secs`. `true` when it is there afterwards.
 fn sh_mkdir_within(ctx: &ShellCtx, path: &[u8], secs: i64) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(secs);
+    let mut g = ctx.fs().patience_secs(secs);
     let ok = g.create_dir_all(path).is_ok();
     ctx.fs_tag.set(g.tag());
     ok
 }
 
 fn sh_write_within(ctx: &ShellCtx, path: &[u8], data: &[u8], secs: i64) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(secs);
+    let mut g = ctx.fs().patience_secs(secs);
     let ok = g.write(path, data).is_ok();
     ctx.fs_tag.set(g.tag());
     ok
@@ -19428,7 +19506,7 @@ fn sh_write_within(ctx: &ShellCtx, path: &[u8], data: &[u8], secs: i64) -> bool 
 
 /// Write a whole (small) file, borrowing the shell's one tag counter. `true` if it went.
 fn sh_write(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let ok = g.write(path, data).is_ok();
     ctx.fs_tag.set(g.tag());
     ok
@@ -19436,7 +19514,7 @@ fn sh_write(ctx: &ShellCtx, path: &[u8], data: &[u8]) -> bool {
 
 /// Move a path, borrowing the shell's one tag counter. `true` if it went.
 fn sh_move(ctx: &ShellCtx, from: &[u8], to: &[u8]) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let ok = g.move_to(from, to).is_ok();
     ctx.fs_tag.set(g.tag());
     ok
@@ -19444,7 +19522,7 @@ fn sh_move(ctx: &ShellCtx, from: &[u8], to: &[u8]) -> bool {
 
 /// Rename within a directory, borrowing the shell's one tag counter. `true` if it went.
 fn sh_rename(ctx: &ShellCtx, path: &[u8], newname: &[u8]) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let ok = g.rename(path, newname).is_ok();
     ctx.fs_tag.set(g.tag());
     ok
@@ -19461,7 +19539,7 @@ fn sh_rename(ctx: &ShellCtx, path: &[u8], newname: &[u8]) -> bool {
 /// The old code asked it as `fs_request(..).is_some()`, which is true for a NOTFOUND reply too.
 /// `Error::service_answered` is that question with a name.
 fn sh_fs_answered(ctx: &ShellCtx, path: &[u8]) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let answered = match g.stat(path) {
         Ok(_) => true,
         Err(e) => e.service_answered(),
@@ -19480,7 +19558,7 @@ fn sh_fs_answered(ctx: &ShellCtx, path: &[u8]) -> bool {
 /// colliding tag is not rejected loudly - it lets a stale reply be accepted as the current answer.
 /// That is the bug this branch fixed in `services/copier`, which had a CONSTANT tag.
 fn sh_delete(ctx: &ShellCtx, path: &[u8]) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let ok = g.delete(path).is_ok();
     ctx.fs_tag.set(g.tag());
     ok
@@ -19934,7 +20012,13 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 fn ask_with_quit_notice(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64) -> ReqOutcome {
     let notice = || gs::io::println(ctx, "  [q] quit");
     let keep = |b: u8| ctx.keep_key(b);   // type-ahead read during the wait is kept (H16)
-    match gs::call::request_within_notice(ctx, peer, msg, max_secs, Some(&notice), Some(&keep)) {
+    // Inside a command the command's watch is the observer; between commands, the request's own notice.
+    let r = if ctx.cmd_active.get() {
+        gs::call::request_watched(ctx, peer, msg, max_secs, ctx)
+    } else {
+        gs::call::request_within_notice(ctx, peer, msg, max_secs, Some(&notice), Some(&keep))
+    };
+    match r {
         Ok(r) => ReqOutcome::Reply(r),
         Err(gs::Error::Cancelled) => ReqOutcome::Aborted,
         // With a notice, `gs` answers OutcomeUnknown for the deadline (and for a send that never left,
@@ -20013,7 +20097,7 @@ fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Optio
 /// `max_secs`, so an alive-but-not-serving fs (respawned, still re-mounting) cannot hang the prompt.
 /// `None` on timeout/miss/absent, treated as "no file".
 fn fs_stat_bounded(ctx: &ShellCtx, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let mut g = ctx.fs().patience_secs(max_secs);
     let r = g.stat(path);
     ctx.fs_tag.set(g.tag());
     r.ok().map(|st| (st.size, st.is_dir))
@@ -20022,7 +20106,7 @@ fn fs_stat_bounded(ctx: &ShellCtx, path: &[u8], max_secs: i64) -> Option<(u64, b
 /// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
 /// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
 fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(max_secs);
+    let mut g = ctx.fs().patience_secs(max_secs);
     let r = g.read_at(path, offset, out);
     ctx.fs_tag.set(g.tag());
     r.ok()
@@ -20065,7 +20149,7 @@ impl LastWriteErr {
 /// Create/truncate `path` to hold `total` bytes (allocates the whole extent). Pairs with
 /// `fs_write_at` to stream a large file.
 fn fs_write_new(ctx: &ShellCtx, path: &[u8], total: u64) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let r = g.create_sized(path, total);
     let ok = r.is_ok();
     if !ok {
@@ -20092,7 +20176,7 @@ fn fs_write_at(ctx: &ShellCtx, path: &[u8], offset: u64, chunk: &[u8]) -> bool {
     // The offset packing and the chunk cap are the library's; the IO_CHUNK clamp stays here because
     // a caller handing over more than one message carries is this layer's business to notice.
     let n = chunk.len().min(IO_CHUNK);
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let r = g.write_at(path, offset, &chunk[..n]);
     let ok = r.is_ok();
     if !ok {
@@ -20399,7 +20483,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     // ONE handle for the whole run. The correlation tag then advances across thousands of
     // transactions instead of restarting at each call, which is the property that lets a late reply
     // be recognised rather than believed.
-    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut gfs = ctx.fs();
     let _ = gfs.create_dir_all(DIR);
     out.line_fmt(ctx, format_args!(
         "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT  [q] quit", secs));
@@ -20577,7 +20661,7 @@ fn cmd_churn_tear(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // `delete_all` carries the SWEEP budget itself - removing a subtree walks it, and the ordinary
     // request deadline is shorter than that walk on a full directory.
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let r = g.delete_all(CHURN_DIR);
     let why = g.reason();
     let answer = match r {
@@ -20638,7 +20722,7 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let mut nn = 0usize;
     let mut overfull = false;
 
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let walked = g.list_dir(DIR, |e| {
         if e.is_dir {
             return true;
@@ -20727,7 +20811,7 @@ fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), Shell
             return Ok(());
         }
     }
-    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut gfs = ctx.fs();
     let r = gfs.seal(path);
     let out = match r {
         Ok(()) => {
@@ -20966,7 +21050,7 @@ fn cmd_fcap_reuse(ctx: &ShellCtx) -> Result<(), ShellError> {
 /// (the block-reuse confused-deputy case, which `fcap reuse` pins).
 fn cmd_fcap_gsreuse(ctx: &ShellCtx) -> Result<(), ShellError> {
     const OLDP: &str = "/gsru_old.txt";
-    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut gfs = ctx.fs();
     let _ = gfs.delete(OLDP);
     let created = gfs.write(OLDP, b"OLDDATA").is_ok();
     // Recorded BEFORE the kill: the generation `fs` is serving on now. A restart bumps it (14.2),
@@ -21226,7 +21310,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // else's answer instead of "gsdata".
     const GSCAP_PATH: &str = "/system/scratch/shell/fcap-gs";
     {
-        let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let mut gfs = ctx.fs();
         let r = (|| -> Result<(), gs::Error> {
             gfs.create_sized(GSCAP_PATH, 32)?;
             let mut f = gfs.open(GSCAP_PATH, gs::cap::READ | gs::cap::WRITE)?;
@@ -21249,7 +21333,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         // A READ-only capability must be refused its write by the KERNEL, before fs is reached.
         // Same non-escalation assertion as above, made through the library.
-        let mut gfs2 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let mut gfs2 = ctx.fs();
         let denied = match gfs2.open(GSCAP_PATH, gs::cap::READ) {
             Ok(mut ro2) => {
                 let e = ro2.write_at(0, b"nope");
@@ -21268,7 +21352,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         // An APPEND-only open: APPEND is a request to `fs`, never a kernel right, so the File must
         // report WRITE alone and close under it. It recorded the mask ASKED for until 2026-10-10,
         // and the kernel refused that close - `fs`'s slot stayed taken (`backlog/fixed/80` G2).
-        let mut gfs4 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let mut gfs4 = ctx.fs();
         let appended = match gfs4.open(GSCAP_PATH, gs::cap::WRITE | gs::cap::APPEND) {
             Ok(ap) => ap.rights() == gs::cap::WRITE && ap.close().is_ok(),
             Err(_) => false,
@@ -21280,7 +21364,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             fail(ctx, "fcap: FAIL gs::cap an append-only file did not report WRITE alone, or would not close");
             ok = false;
         }
-        let mut gfs3 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+        let mut gfs3 = ctx.fs();
         let _ = gfs3.delete(GSCAP_PATH);
         ctx.fs_tag.set(gfs3.tag());
     }
@@ -21939,7 +22023,7 @@ fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
     }
     // Through `gs::fs`. The handle stays alive across the match because `reason()` - the service's
     // own sentence about what went wrong - belongs to it.
-    let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut gfs = ctx.fs();
     let r = gfs.write(p, content.as_bytes());
     let out = match r {
         Ok(()) => {
@@ -22125,7 +22209,7 @@ fn cmd_mkdir(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), 
 fn mkdir_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, parents: bool) -> Result<(), ShellError> {
     let mut buf = [0u8; PATH_MAX];
     let path = match resolve_or_err(ctx, cwd, arg, &mut buf) { Some(p) => p, None => return Err(ShellError::Unknown) };
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let r = if parents { g.create_dir_all(path) } else { g.create_dir(path) };
     let why = g.reason();
     let answer = match r {
@@ -22392,7 +22476,7 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
 
 /// Stat a path: `Some(is_dir)` if it exists, `None` if not (or storage is down).
 fn stat_kind(ctx: &ShellCtx, path: &[u8]) -> Option<bool> {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let r = g.stat(path);
     ctx.fs_tag.set(g.tag());
     r.ok().map(|st| st.is_dir)
@@ -22400,7 +22484,7 @@ fn stat_kind(ctx: &ShellCtx, path: &[u8]) -> Option<bool> {
 
 /// `mkdir <path>` via fs, treating success as true. Used by recursive copy to recreate dirs.
 fn mkdir_at(ctx: &ShellCtx, path: &[u8]) -> bool {
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let ok = g.create_dir(path).is_ok();
     ctx.fs_tag.set(g.tag());
     ok
@@ -23131,7 +23215,7 @@ fn cmd_rename(ctx: &ShellCtx, cwd: &Cwd, path: &str, newname: &str) -> Result<()
     let pl = abspath.len();
     pp[..pl].copy_from_slice(abspath);
     // `gs::fs::rename` sends `newname` after the path - exactly the OP_RENAME wire format.
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let r = g.rename(&pp[..pl], newname.as_bytes());
     let out = match r {
         Ok(()) => {
@@ -23194,7 +23278,7 @@ fn delete_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(
     pp[..pl].copy_from_slice(path);
     // `delete_all` carries the SWEEP budget, because a tree delete walks the tree and the ordinary
     // request deadline is shorter than that walk.
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let r = if recursive { g.delete_all(&pp[..pl]) } else { g.delete(&pp[..pl]) };
     let why = g.reason();
     let answer = match r {
@@ -23263,7 +23347,7 @@ fn cmd_move(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
         gs::io::println(ctx, "move: cannot move into itself");
         return Err(ShellError::Unknown);
     }
-    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let mut g = ctx.fs();
     let r = g.move_to(&sp[..sl], &dp[..dl]);
     let out = match r {
         Ok(()) => {

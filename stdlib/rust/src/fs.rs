@@ -253,6 +253,9 @@ pub struct Fs<'a> {
     notice: Option<&'a dyn Fn()>,
     /// Where the keys a noticing wait reads (and does not act on) go - see [`Fs::keeping`].
     keep: Option<&'a dyn Fn(u8)>,
+    /// The command's watch (`call::Watch`): when lent, every request shows the command's `[q] quit` and
+    /// honours it, and the notice and keep above are not used.
+    watch: Option<&'a dyn call::Watch>,
     /// How long ORDINARY operations wait. `None` means [`call::DEFAULT_SECS`].
     ///
     /// The operations with a budget of their own - a subtree delete walks a tree, so it carries
@@ -275,7 +278,7 @@ impl<'a> Fs<'a> {
     ///
     /// Cheap, allocates nothing, and grants nothing. See the type's authority note.
     pub fn new(ctx: &'a ServiceContext) -> Fs<'a> {
-        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None, keep: None, patience: None }
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: None, keep: None, watch: None, patience: None }
     }
 
     /// A handle that calls `notice` when a request has been waiting a while.
@@ -291,7 +294,7 @@ impl<'a> Fs<'a> {
     /// request the operator then aborts returns [`Error::Cancelled`], which is NOT a fault - report
     /// it as the deliberate act it was.
     pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Fs<'a> {
-        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice), keep: None,
+        Fs { ctx, tag: TAG_START, reason: [0; REASON_MAX], reason_len: 0, notice: Some(notice), keep: None, watch: None,
              patience: None }
     }
 
@@ -331,7 +334,7 @@ impl<'a> Fs<'a> {
     /// not a loud rejection - it is a stale reply silently accepted as the answer to the current
     /// question. See [`TAG_START`](self).
     pub fn from_tag(ctx: &'a ServiceContext, tag: u8) -> Fs<'a> {
-        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None, keep: None, patience: None }
+        Fs { ctx, tag, reason: [0; REASON_MAX], reason_len: 0, notice: None, keep: None, watch: None, patience: None }
     }
 
     /// Lend this handle a waiting-notice, as [`with_notice`](Fs::with_notice) describes.
@@ -350,6 +353,14 @@ impl<'a> Fs<'a> {
     /// notice, since only a noticing wait reads the console.
     pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Fs<'a> {
         self.keep = Some(keep);
+        self
+    }
+
+    /// Lend this handle the command's watch ([`call::Watch`]): every request then shows the command's
+    /// `[q] quit` once the COMMAND has run 2 s, and stops at the next request after a quit. Takes
+    /// precedence over a notice; a watch that is not active gives the plain wait.
+    pub fn watching(mut self, watch: &'a dyn call::Watch) -> Fs<'a> {
+        self.watch = Some(watch);
         self
     }
 
@@ -419,8 +430,11 @@ impl<'a> Fs<'a> {
         req[3..3 + path.len()].copy_from_slice(path);
         req[3 + path.len()..n].copy_from_slice(tail);
 
-        let reply = call::request_within_notice(
-            self.ctx, "fs", &Message::from_bytes(&req[..n]), secs, self.notice, self.keep)?;
+        let msg = Message::from_bytes(&req[..n]);
+        let reply = match self.watch {
+            Some(w) if w.active() => call::request_watched(self.ctx, "fs", &msg, secs, w)?,
+            _ => call::request_within_notice(self.ctx, "fs", &msg, secs, self.notice, self.keep)?,
+        };
         let body = reply.payload_bytes();
 
         // The tag must match, or this is an answer to a question we already gave up on.

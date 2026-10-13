@@ -74,7 +74,7 @@
 //! it never acquires: a task holding `ACQUIRE_ANY` can reach any named service through it.
 
 use godspeed_sdk::ipc::{IpcError, Message};
-use godspeed_sdk::service_context::{ReqOutcome, ServiceContext};
+use godspeed_sdk::service_context::{DeadlineOutcome, ReqOutcome, ServiceContext};
 
 use crate::error::Error;
 
@@ -162,6 +162,92 @@ pub fn request_within_notice(
         // exists to stop the SDK's `Option` making.
         ReqOutcome::Aborted => Err(Error::Cancelled),
     }
+}
+
+/// A COMMAND's watch over its waits, lent by the program the operator is typing at (the shell).
+///
+/// **Why the watch belongs to the caller and not to the wait** (`audits/2026-10-13-quit-audit.md` 7a). A
+/// person waits on a COMMAND, not on one request: a `copy` of a large file is hundreds of requests that each
+/// answer in milliseconds, and a notice timed per request never fires for it, however long the copy runs. So
+/// the clock, the `[q] quit` words and the record of whether the operator has quit live in the shell, once per
+/// command, and every wait the command makes reads them. A program that is not at a prompt lends no watch and
+/// gets the plain bounded wait.
+///
+/// The library still knows nothing about consoles: these are questions, and the answers are the caller's.
+pub trait Watch {
+    /// A command is running. When it is not (between commands, before the first prompt), a wait is plain:
+    /// nothing is shown and no key is read.
+    fn active(&self) -> bool;
+    /// The operator has asked to stop. Asked before every request, so a command made of many fast
+    /// requests stops at the next one - nothing further is sent.
+    fn stopped(&self) -> bool;
+    /// Seconds until the command's notice is due: 0 once it is due or has been shown.
+    fn notice_due_in(&self) -> i64;
+    /// The notice is due. The watch shows it once per command; a wait may call this more than once.
+    fn notice(&self);
+    /// A key a wait read that is not a quit key, kept for the command line that follows.
+    fn keep(&self, key: u8);
+    /// A wait was ended by the operator's quit key.
+    fn quit(&self);
+}
+
+/// A bounded request under a command's [`Watch`]: [`request_within`] when the watch is not active, and
+/// otherwise a request that shows the command's `[q] quit` and honours it.
+///
+/// - **[`Error::Cancelled`]** - the operator quit. If the watch had already stopped, NOTHING was sent; if the
+///   quit came during the wait, the request was delivered and **it may have happened** - a caller reporting a
+///   mutation says so.
+/// - The rest are [`request_within`]'s, including its one safe retry: the quittable SDK wait answers a passed
+///   deadline and a send that never left with the same `Timeout`, but it can only report the deadline once the
+///   deadline has passed, so a `Timeout` sooner than `secs` is a send that never left - nothing happened -
+///   and is retried once after reacquiring the peer.
+/// - Like every noticing wait, it takes the next reply rather than a reply matched to this request, so it is
+///   for a caller that tags its requests (`gs::fs`, `gs::net` do) and does not serve clients of its own.
+pub fn request_watched(
+    ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64, watch: &dyn Watch,
+) -> Result<Message, Error> {
+    if !watch.active() {
+        return request_within(ctx, peer, msg, secs);
+    }
+    let secs = secs.max(1);
+    for attempt in 0..2 {
+        if watch.stopped() {
+            return Err(Error::Cancelled);
+        }
+        let due = watch.notice_due_in().max(0);
+        if due == 0 {
+            watch.notice();
+        }
+        let t0 = ctx.epoch_secs_monotonic();
+        let out = ctx.request_with_reply_qhint_keeping(
+            peer, msg, due, secs, || watch.notice(), &|k| watch.keep(k));
+        // Name the outcome before acting on it. The quittable SDK wait answers a passed deadline and a send
+        // that never left with the same `Timeout`, but it reports the deadline only once it has passed - so a
+        // `Timeout` sooner than `secs` is a send that never left, and nothing else.
+        let outcome = match out {
+            ReqOutcome::Reply(r) => DeadlineOutcome::Reply(r),
+            ReqOutcome::Aborted => {
+                watch.quit();
+                return Err(Error::Cancelled);
+            }
+            ReqOutcome::Timeout if ctx.epoch_secs_monotonic().saturating_sub(t0) >= secs => DeadlineOutcome::Timeout,
+            ReqOutcome::Timeout => DeadlineOutcome::SendFailed,
+        };
+        match outcome {
+            DeadlineOutcome::Reply(r) => return Ok(r),
+            // A live peer that is slow: never re-sent (it may have happened).
+            DeadlineOutcome::Timeout => return Err(Error::OutcomeUnknown),
+            // The send never left: the one safe retry, as `request_within`.
+            DeadlineOutcome::SendFailed => {
+                if attempt == 0 && ctx.reacquire_cap(peer).is_ok() {
+                    continue;
+                }
+                return Err(Error::Unreachable);
+            }
+            DeadlineOutcome::QueueFull => return Err(Error::Busy),
+        }
+    }
+    Err(Error::Unreachable)
 }
 
 /// [`request_within`] with NO retry: one send, one bounded wait, and the reason it failed.
