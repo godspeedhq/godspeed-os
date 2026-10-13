@@ -65,7 +65,7 @@ owns an endpoint (so it has a SEND\|GRANT cap to itself to hand out). It declare
 because its row wires none: the `examples-test` row grants `ACQUIRE_ANY` instead, which is how its
 lookup of `receiver` reaches the name directory, and no contract key expresses that privilege. The
 contract said `ipc_send = ["receiver"]` until 2026-10-10, when `contract_check.py` began comparing an
-example's peers with its row (backlog/80 T8).
+example's peers with its row (backlog/fixed/80 T8).
 
 ## What you must NOT do
 

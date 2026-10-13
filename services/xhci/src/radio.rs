@@ -387,7 +387,7 @@ fn ep0_state(hc: &Hc, r: &Radio) -> u32 {
 }
 
 /// `OP_CONTROL` / `OP_CONTROL_ONCE`, as `dwc2` answers them: `p` is `[op, setup(8), data out...]`, the
-/// reply `[op, status, data in...]` into `out`. `Err(())` asks the caller to re-enumerate: the endpoint
+/// reply `[op, status, data in...]` into `out`. `Err(())` asks the caller to contain the dongle (`contain_radio`): the endpoint
 /// could not be repaired.
 #[allow(clippy::too_many_arguments)]
 fn control(
@@ -463,7 +463,8 @@ pub enum Served {
     NotOurs,
     /// Answered (or, for `OP_SYNC`, deliberately not).
     Done,
-    /// Answered `ST_FAILED`, and the dongle's EP0 could not be repaired: re-enumerate.
+    /// Answered `ST_FAILED`, and the dongle's EP0 could not be repaired: the caller contains it to its port
+    /// (`contain_radio`), leaving every other device as it is. The name is older than that.
     Reenumerate,
 }
 
@@ -541,6 +542,7 @@ pub fn serve(
             out[1] = usbfn::ST_OK;
             out[2..4].copy_from_slice(&r.vid().to_le_bytes());
             out[4..6].copy_from_slice(&r.pid().to_le_bytes());
+            out[usbfn::INFO_GEN_AT..usbfn::INFO_GEN_AT + 4].copy_from_slice(&r.gen.to_le_bytes());
             // Where the dongle is, for `wifi hardware usb` (`usbfn::OP_INFO`'s optional part). An endpoint's
             // address follows from its DCI: IN is odd, `0x80 | dci / 2`; OUT is even, `dci / 2`.
             let w = usbfn::INFO_WHERE_AT;

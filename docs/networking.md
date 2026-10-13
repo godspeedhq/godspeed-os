@@ -372,7 +372,7 @@ half of the same restartability story the storage stack tells (`docs/persistence
 
 **Status:** fixed in code; passed the x86 shell suite 215/0 and a Pi 4 QEMU boot. NOT yet run on Pi 4
 hardware - the card carries the old `net-stack`. *(Run on Pi 4 hardware 2026-10-02 at `5dd1f1b8`, the boot
-`backlog/66` records: `ping` over the radio at one echo a second, 19 of 19.)*
+`backlog/fixed/66` records: `ping` over the radio at one echo a second, 19 of 19.)*
 
 **The coupling.** `net-stack` fetched the wall clock (SNTP: a DNS resolve, then up to three
 send-and-drain tries, up to about fifteen seconds when the server or resolver was silent) INSIDE its single serve loop, and started it three
@@ -412,12 +412,12 @@ appeared to cure it only because a success latched the clock and quietened the n
 
 **What this does not fix, recorded rather than smoothed over.** Two things still hold the serve loop.
 The dance itself (DHCP and ARP) blocks it while the network is being configured - `backlog/28` and
-`backlog/29` describe the incremental dance that would fix that. And on the Pi 4 every exchange with
-`nic-driver` can cost a second: `backlog/66`, then read as a lost wake-up in the kernel's blocked-receiver
+`backlog/fixed/29` describe the incremental dance that would fix that. And on the Pi 4 every exchange with
+`nic-driver` can cost a second: `backlog/fixed/66`, then read as a lost wake-up in the kernel's blocked-receiver
 path. **Corrected 2026-10-08:** no wake was ever shown lost. What later failed `net dns` over the radio was
 `nic-driver` answering a drain that found no frame with an empty message, which the kernel refused on
 every port but ARM32 (fixed in `e3fcf7ed`); the one-second STATUS tax itself had stopped appearing by
-2026-10-04, unexplained (`backlog/66`). The decoupling should remove the multi-second
+2026-10-04, unexplained (`backlog/fixed/66`). The decoupling should remove the multi-second
 stalls the clock caused - not yet run on hardware; it does not touch that one-second tax, and a slow `ping` after this change is that.
 
 ### 16.1 Later the same day: the clock leaves `net-stack` entirely

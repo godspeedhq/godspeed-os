@@ -60,6 +60,14 @@ results beside it."
 That reasoning applies to the harness as much as to one assertion. Right now this suite cannot be used as
 a merge gate, because a red run means nothing until it is run again.
 
+## A different shape, seen once (2026-10-10)
+
+One `osdev test shell` run went silent at the refused-`tcp` step: no serial output from the kernel or any
+service for twenty minutes, no panic, no liveness report; the rerun on the same code passed 253 of 253.
+A guest-wide silence is not a failing test and not a service fault, so it may not belong to this entry;
+it is pointed at from here because this is where the next person looking at the suite will read.
+The sighting is `backlog/fixed/80`, "Seen while closing it". The capture was not kept.
+
 ## Next step
 
 1. **Establish whether it predates today.** Four runs at the commit before `1602f3df`, same machine, same

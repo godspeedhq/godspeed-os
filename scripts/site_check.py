@@ -53,7 +53,7 @@ def expected_hand_written():
         # file: it points at the rustdoc under /api (generated from the crate, not from docs/)
         # and at the design report, and shows the shortest program that does something. An
         # `{{#include}}` of stdlib-design.md would put a DESIGN REPORT in front of someone who
-        # came to write a program - which is what backlog/45 and the Stranger Test (22.7) are
+        # came to write a program - which is what backlog/fixed/45 and the Stranger Test (22.7) are
         # about.
         "stdlib.md",
     }
@@ -96,7 +96,7 @@ def check_intro_counts():
              "eighty-one": 81, "eighty-two": 82, "eighty-three": 83,
              "eighty-four": 84, "eighty-five": 85, "eighty-six": 86,
              "eighty-seven": 87, "eighty-eight": 88, "eighty-nine": 89,
-             "ninety": 90, "four": 4, "five": 5}
+             "ninety": 90, "ninety-one": 91, "ninety-two": 92, "four": 4, "five": 5}
     page = read(os.path.join(SITE, "introduction.md"))
     total = inc = 0
     for p in glob.glob(os.path.join(SITE, "**", "*.md"), recursive=True):

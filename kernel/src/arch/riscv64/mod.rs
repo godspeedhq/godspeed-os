@@ -3237,7 +3237,7 @@ pub mod pci {
     /// maps and then fails in a way that looks like a broken device.
     /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
     /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
-    /// backlog/80 K1).
+    /// backlog/fixed/80 K1).
     pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(d: &PciDevice) -> u64 {
         let mut i = 0;

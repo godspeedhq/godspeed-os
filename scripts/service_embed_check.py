@@ -24,7 +24,7 @@ NOTE 2026-10-09: on every port the kernel now `include_bytes!`s only the supervi
 `aarch64_built` lists in kernel/build.rs still name ~25 services, but they decide nothing a boot
 depends on.
 
-FIXED 2026-10-10 (backlog/80 T7): this compared arm and aarch64 against those kernel lists, and
+FIXED 2026-10-10 (backlog/fixed/80 T7): this compared arm and aarch64 against those kernel lists, and
 x86_64 - which has none - not at all. Every arch the supervisor builds for is now checked against the
 supervisor's own roster (services/supervisor/build.rs), x86_64 included, and the arches come from that
 file. Shown: with `time` removed from `EMBEDDED` the old check passed arm and aarch64; with x86's
@@ -49,7 +49,7 @@ import re
 # writes, not a silence.
 ARCH_EXEMPT = {
     # Checked from 2026-10-10. This file read only the kernel's `<arch>_built` lists, and x86_64 has
-    # none, so the arch where most services run was never compared at all (backlog/80 T7).
+    # none, so the arch where most services run was never compared at all (backlog/fixed/80 T7).
     "x86_64": {
         "dwc2": "arm32-only (Pi 2) USB host driver; a PC's USB hosts are xhci and ehci",
         "wifi-driver": "the onboard SDIO radios of the Pi 4 and the VisionFive; a PC has no SD-host "
@@ -221,7 +221,7 @@ def _supervisor_embedded(root, arch):
     # (`"arm" | "aarch64" => ...`), which the line scan handles because it asks only whether this
     # arch is named on the arm's line. Read since 2026-10-10: before, riscv64 was the only arch read
     # from this file and it exempts both audio drivers, so nothing it embedded was missed - but every
-    # other arch is read here now (backlog/80 T7), and without this all three would miss their driver.
+    # other arch is read here now (backlog/fixed/80 T7), and without this all three would miss their driver.
     audio = _block(src, "let audio: &[&str] = ", "`audio`", "services/supervisor/build.rs")
     for line in _strip_comments(audio).split(chr(10)):
         if (chr(34) + arch + chr(34)) in line and "=>" in line:
@@ -253,7 +253,7 @@ def arches(root):
     This read the `<arch>_built` lists in kernel/build.rs, and so checked arm, aarch64 and riscv64
     and never x86_64, which has no such list - while x86 is where most services run. Those lists no
     longer decide what boots anywhere (the kernel embeds only the supervisor on every port), so the
-    arches are the ones the supervisor's own build script knows (backlog/80 T7).
+    arches are the ones the supervisor's own build script knows (backlog/fixed/80 T7).
     """
     src = io.open(os.path.join(root, "services", "supervisor", "build.rs"), encoding="utf-8").read()
     usb = _block(src, "let usb: &[&str] = ", "`usb`", "services/supervisor/build.rs")
@@ -267,7 +267,7 @@ def check(root, arch):
     port (kernel/src/task/mod.rs, `SVC_SUPERVISOR_ELF`), and the supervisor embeds the rest - so what a
     machine can spawn is decided in services/supervisor/build.rs. This compared arm and aarch64 against
     their `_built` lists in kernel/build.rs, which name ~25 services and decide nothing a boot depends
-    on, and so passed or failed on a list that is not the truth (backlog/80 T7).
+    on, and so passed or failed on a list that is not the truth (backlog/fixed/80 T7).
     """
     names = managed(root)
     bad = []

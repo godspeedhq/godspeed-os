@@ -10,7 +10,7 @@
 HMB_DATA_FWHALT                    # docs/wifi.md - Linux brcmfmac, EXTERNAL; the to-host mailbox bit that triggers its automatic recovery
 force_turbo                        # docs/wifi.md - Raspberry Pi firmware config.txt option, EXTERNAL; holds the Arm cores at turbo, used 2026-10-01 and replaced by the power service (wifi.md 55, 57)
 CONSOLE_RENDER                     # docs/console-service.md
-FILE_FLAG_NO_BUFFERING             # backlog/26-visionfive-uboot-cannot-load-large-files.md
+FILE_FLAG_NO_BUFFERING             # backlog/fixed/26-visionfive-uboot-cannot-load-large-files.md
 MAX_FILES                          # docs/persistence.md
 mmc_io_rw_extended                 # docs/wifi.md - Linux mmc core, EXTERNAL; cited for the CMD53 argument this driver reimplements
 USE_FUA                            # CLAUDE.md, docs/arm32-usb-userspace.md, docs/pi2-deploy.md
@@ -45,27 +45,27 @@ registry_lookup                    # docs/naming-design.md
 size_bytes                         # docs/persistence.md
 spawn_pong                         # docs/service-ownership.md
 write_hfnum                        # docs/arm32-usb-userspace.md
-in_view                            # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-paint_view_indicator               # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-put_num                            # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-snapped_by_output                  # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-take_output_snap                   # backlog/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
-drain_kernel_ring_buffer           # backlog/06, backlog/80 S7 - DELETED 2026-10-10 (a no-op stub); a record of a removal must name what was removed
-recv_log_message                   # backlog/06 - DELETED 2026-10-10 with it (unused); a record of a removal must name what was removed
-TIMED_OUT_ONCE                     # backlog/80 - DELETED 2026-10-10, ehci latch, now function-local (D9); a record of a removal must name what was removed
-PROBE_FAILS                        # backlog/80 - DELETED 2026-10-10, xhci latch, now loop-owned (D9); a record of a removal must name what was removed
-DIAG_HINT_SAID                     # backlog/80 - DELETED 2026-10-10, xhci latch, now loop-owned (D9); a record of a removal must name what was removed
-NO_DISK_LOGGED                     # backlog/80 - DELETED 2026-10-10, xhci msc latch, now a field on the disk record (D9); a record of a removal must name what was removed
-READ_FAIL_LOGGED                   # backlog/80 - DELETED 2026-10-10, xhci msc latch, now a field on the disk record (D9); a record of a removal must name what was removed
-feed_tx                            # backlog/80 - DELETED 2026-10-10, net-stack dead code (D11); a record of a removal must name what was removed
-last_ok                            # backlog/80 - DELETED 2026-10-10, dwc2 hid dead field (D11); a record of a removal must name what was removed
-stale_after                        # backlog/80 - DELETED 2026-10-10, dwc2 hid dead field (D11); a record of a removal must name what was removed
-POLL_FRAMES                        # backlog/80 - DELETED 2026-10-10, net-stack tcp dead constant (D11); a record of a removal must name what was removed
-Q_COM2_BYTE                        # backlog/80 V9 - DELETED 2026-10-10 (control's unread query number); a record of a removal must name what was removed
-NET_TXN_SECS                       # backlog/29 + docs/stdlib-design.md - RETIRED with the shell's hand-rolled net path; both are records of what it did
-drain_stale_net_replies            # backlog/29 post-mortem - REMOVED once the correlation tag made a pre-emptive drain unnecessary; the record must name what went
+in_view                            # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+paint_view_indicator               # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+put_num                            # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+snapped_by_output                  # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+take_output_snap                   # backlog/fixed/37 post-mortem - DELETED by bbd24478; a record of a removal must name what was removed
+drain_kernel_ring_buffer           # backlog/fixed/06, backlog/fixed/80 S7 - DELETED 2026-10-10 (a no-op stub); a record of a removal must name what was removed
+recv_log_message                   # backlog/fixed/06 - DELETED 2026-10-10 with it (unused); a record of a removal must name what was removed
+TIMED_OUT_ONCE                     # backlog/fixed/80 - DELETED 2026-10-10, ehci latch, now function-local (D9); a record of a removal must name what was removed
+PROBE_FAILS                        # backlog/fixed/80 - DELETED 2026-10-10, xhci latch, now loop-owned (D9); a record of a removal must name what was removed
+DIAG_HINT_SAID                     # backlog/fixed/80 - DELETED 2026-10-10, xhci latch, now loop-owned (D9); a record of a removal must name what was removed
+NO_DISK_LOGGED                     # backlog/fixed/80 - DELETED 2026-10-10, xhci msc latch, now a field on the disk record (D9); a record of a removal must name what was removed
+READ_FAIL_LOGGED                   # backlog/fixed/80 - DELETED 2026-10-10, xhci msc latch, now a field on the disk record (D9); a record of a removal must name what was removed
+feed_tx                            # backlog/fixed/80 - DELETED 2026-10-10, net-stack dead code (D11); a record of a removal must name what was removed
+last_ok                            # backlog/fixed/80 - DELETED 2026-10-10, dwc2 hid dead field (D11); a record of a removal must name what was removed
+stale_after                        # backlog/fixed/80 - DELETED 2026-10-10, dwc2 hid dead field (D11); a record of a removal must name what was removed
+POLL_FRAMES                        # backlog/fixed/80 - DELETED 2026-10-10, net-stack tcp dead constant (D11); a record of a removal must name what was removed
+Q_COM2_BYTE                        # backlog/fixed/80 V9 - DELETED 2026-10-10 (control's unread query number); a record of a removal must name what was removed
+NET_TXN_SECS                       # backlog/fixed/29 + docs/stdlib-design.md - RETIRED with the shell's hand-rolled net path; both are records of what it did
+drain_stale_net_replies            # backlog/fixed/29 post-mortem - REMOVED once the correlation tag made a pre-emptive drain unnecessary; the record must name what went
 fs_request_bounded                 # docs/stdlib-design.md 22 - DELETED by the dogfood; the table says what each commit removed and must name it
-ns_request                         # backlog/29 + docs/stdlib-design.md + utilities/0_conventions.md - DELETED by 00b273ea when `tcp`/`sock`/`serve` moved onto gs::net; all three are records of what it did
+ns_request                         # backlog/fixed/29 + docs/stdlib-design.md + utilities/0_conventions.md - DELETED by 00b273ea when `tcp`/`sock`/`serve` moved onto gs::net; all three are records of what it did
 sock_invoke                        # docs/stdlib-design.md 16 - DELETED by 00b273ea, replaced by gs::resource's held-not-drained invoke; the section records the design it had
 split_txn                          # docs/arm32-usb-userspace.md - the IN-KERNEL dwc2 driver's split path, deleted with arch/arm/dwc2.rs; the port journal names what it was read against
 split_txn_periodic                 # docs/arm32-usb-userspace.md - ditto; `periodic_split_in` in services/dwc2 is what it became
@@ -82,9 +82,9 @@ brcmf_fwcap_map                    # Linux brcmfmac feature.c - the table the `c
 sae_ext                            # a word in the firmware `cap` string (and brcmf_fwcap_map): WPA3 authentication done by the HOST; read off this board 2026-09-29 - external, 26.14
 bwfm_sdio_rx_glom                  # OpenBSD if_bwfm_sdio.c - reads one chunk per descriptor entry, strips the superframe header from the first, then parses each sub-frame by its own header; ctrl::subframes does the parsing half - external, 26.14
 aic8800_sdio                       # docs/wifi.md 44 - the AICSemi vendor Linux module for the VisionFive 2 Lite radio, named as the executable datasheet a riscv64 port would read - external, 26.14
-brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
-mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
-si_watchdog                        # Linux/Broadcom recovery path cited by backlog/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+brcmf_sdio_bus_reset               # Linux/Broadcom recovery path cited by backlog/fixed/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+mmc_hw_reset                       # Linux/Broadcom recovery path cited by backlog/fixed/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
+si_watchdog                        # Linux/Broadcom recovery path cited by backlog/fixed/69 and docs/wifi.md 45 as the reference remedy - external, 26.14
 CHIP_REV_U03                       # docs/wifi-aic8800.md - AICSemi aic8800_bsp chip_rev enum, EXTERNAL; revision 7
 set_pmk                            # docs/wifi-aic8800.md - Linux cfg80211 op, EXTERNAL; cited as the handshake offload this firmware lacks
 dwmci_init                         # docs/wifi-aic8800.md - U-Boot dw_mmc.c, EXTERNAL; the second init order compared
@@ -98,19 +98,19 @@ alc225_init                        # docs/audio.md - Linux patch_realtek.c, EXTE
 bxt_reduce_dma_latency             # docs/audio.md - Linux hda_intel.c, EXTERNAL; the Apollo Lake DMA quirk A6 checked does not apply to Gemini Lake
 ATI_SB450_HDAUDIO_ENABLE_SNOOP     # docs/audio.md - Linux hda_intel.c, EXTERNAL; the AMD Azalia snoop bit at config 0x42 the T630 card read already set
 ALC256_FIXUP_HP_HEADSET_MIC        # docs/audio.md - Linux patch_realtek.c, EXTERNAL; the one quirk Linux applies to the T630 (103c:8158), headset-jack detection only
-boot_blockdev_qemu                 # backlog/80 R2 - DELETED by 0f7ebce1 (no callers; booted the retired ATA channel); a record of a removal must name what was removed
+boot_blockdev_qemu                 # backlog/fixed/80 R2 - DELETED by 0f7ebce1 (no callers; booted the retired ATA channel); a record of a removal must name what was removed
 
-int80_entry                        # backlog/80 K7 - DELETED 2026-10-10, the x86 int 0x80 syscall stub at IDT[0x80]; a record of a removal must name what was removed
-assert_tcb_alive                   # backlog/80 K20 - DELETED 2026-10-10, an assertion over an empty TCB set; a record of a removal must name what was removed
-uart_rx_enable                     # backlog/80 K20 - DELETED 2026-10-10, the x86 COM1 RX-interrupt enable nothing could call; a record of a removal must name what was removed
-route_usb_irq_to_core0             # backlog/80 K25 - DELETED 2026-10-10, an arm32 USB routing function with no callers; a record of a removal must name what was removed
-EHCI_CORE                          # backlog/80 K27 - DELETED 2026-10-10, the kernel's copy of ehci's core, now the spawned task's own; a record of a removal must name what was removed
-program_xhci_msi                   # backlog/80 K20 - DELETED 2026-10-10, the x86 xHCI MSI programmer with no caller and its false stubs on six ports; a record of a removal must name what was removed
-handle_spawn                       # backlog/80 K14 - DELETED 2026-10-10, the Spawn (7) handler; syscall retired, the catalogue holds supervisor alone; a record of a removal must name what was removed
-handle_spawn_pipe                  # backlog/80 K14 - DELETED 2026-10-10, the SpawnPipe (19) handler; syscall retired; a record of a removal must name what was removed
-spawn_returning_endpoint           # backlog/80 K14 - DELETED 2026-10-10, the SDK wrapper for SpawnReturningEndpoint (38); syscall retired; a record of a removal must name what was removed
-spawn_service_pipe                 # backlog/80 K14 - DELETED 2026-10-10, the kernel's by-name pipe spawn behind SpawnPipe (19); a record of a removal must name what was removed
-spawn_with_caps                    # backlog/80 K14 - DELETED 2026-10-10, the SDK wrapper for SpawnWithCaps (39); syscall retired; a record of a removal must name what was removed
-spawn_on_kernel                    # backlog/80 K14 - DELETED 2026-10-10, the SDK wrapper for Spawn (7); syscall retired; a record of a removal must name what was removed
-spawn_pipe                         # backlog/80 K14 - DELETED 2026-10-10, the SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed
-spawn_pipe_on                      # backlog/80 K14 - DELETED 2026-10-10, the per-core SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed
+int80_entry                        # backlog/fixed/80 K7 - DELETED 2026-10-10, the x86 int 0x80 syscall stub at IDT[0x80]; a record of a removal must name what was removed
+assert_tcb_alive                   # backlog/fixed/80 K20 - DELETED 2026-10-10, an assertion over an empty TCB set; a record of a removal must name what was removed
+uart_rx_enable                     # backlog/fixed/80 K20 - DELETED 2026-10-10, the x86 COM1 RX-interrupt enable nothing could call; a record of a removal must name what was removed
+route_usb_irq_to_core0             # backlog/fixed/80 K25 - DELETED 2026-10-10, an arm32 USB routing function with no callers; a record of a removal must name what was removed
+EHCI_CORE                          # backlog/fixed/80 K27 - DELETED 2026-10-10, the kernel's copy of ehci's core, now the spawned task's own; a record of a removal must name what was removed
+program_xhci_msi                   # backlog/fixed/80 K20 - DELETED 2026-10-10, the x86 xHCI MSI programmer with no caller and its false stubs on six ports; a record of a removal must name what was removed
+handle_spawn                       # backlog/fixed/80 K14 - DELETED 2026-10-10, the Spawn (7) handler; syscall retired, the catalogue holds supervisor alone; a record of a removal must name what was removed
+handle_spawn_pipe                  # backlog/fixed/80 K14 - DELETED 2026-10-10, the SpawnPipe (19) handler; syscall retired; a record of a removal must name what was removed
+spawn_returning_endpoint           # backlog/fixed/80 K14 - DELETED 2026-10-10, the SDK wrapper for SpawnReturningEndpoint (38); syscall retired; a record of a removal must name what was removed
+spawn_service_pipe                 # backlog/fixed/80 K14 - DELETED 2026-10-10, the kernel's by-name pipe spawn behind SpawnPipe (19); a record of a removal must name what was removed
+spawn_with_caps                    # backlog/fixed/80 K14 - DELETED 2026-10-10, the SDK wrapper for SpawnWithCaps (39); syscall retired; a record of a removal must name what was removed
+spawn_on_kernel                    # backlog/fixed/80 K14 - DELETED 2026-10-10, the SDK wrapper for Spawn (7); syscall retired; a record of a removal must name what was removed
+spawn_pipe                         # backlog/fixed/80 K14 - DELETED 2026-10-10, the SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed
+spawn_pipe_on                      # backlog/fixed/80 K14 - DELETED 2026-10-10, the per-core SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed

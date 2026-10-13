@@ -41,5 +41,5 @@ nothing.
 
 ## Not to be confused with
 
-`backlog/28` and `backlog/29`, which are net-stack. This is the USB host driver under a deliberate
+`backlog/28` and `backlog/fixed/29`, which are net-stack. This is the USB host driver under a deliberate
 message flood, and no change on `feat/tcp` touches it.

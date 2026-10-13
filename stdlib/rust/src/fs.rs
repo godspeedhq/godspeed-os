@@ -85,6 +85,28 @@ pub struct Scrub {
     pub scanned: u64,
 }
 
+/// What [`Fs::drive`] reports about the storage `fs` serves.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Drive {
+    /// The device's size in 512-byte sectors, as `fs` re-derives it from the block driver on each ask.
+    /// ZERO means there is no storage device at all - not a device of size zero.
+    pub capacity_sectors: u64,
+    /// Whether a GSFS volume is mounted on it.
+    pub mounted: bool,
+    /// Blocks in the volume, and blocks in use (zero when nothing is mounted).
+    pub total_blocks: u64,
+    pub used_blocks: u64,
+    label: [u8; 31],
+    label_len: u8,
+}
+
+impl Drive {
+    /// The volume's label, as bytes; empty when it has none or nothing is mounted.
+    pub fn label(&self) -> &[u8] {
+        &self.label[..self.label_len as usize]
+    }
+}
+
 /// The longest path `services/fs` accepts. A longer one is [`Error::InvalidInput`] and is never
 /// sent, rather than being silently truncated into a request for a DIFFERENT file.
 ///
@@ -124,6 +146,7 @@ const OP_RENAME: u8 = 15;
 const OP_WRITE_NEW: u8 = 24;
 const OP_WRITE_AT: u8 = 25;
 const OP_READ_AT: u8 = 26;
+const OP_DRIVES_INFO: u8 = 20;
 
 /// The tag a fresh handle starts from. Any non-zero value would do; what matters is that
 /// consecutive requests on one channel differ.
@@ -323,7 +346,7 @@ impl<'a> Fs<'a> {
 
     /// Hand every key a noticing wait reads, other than a quit key, to `keep` - in order - instead of
     /// discarding it. A wait that watches the console for `q` takes what is typed; without this,
-    /// typing ahead while a command waits loses those keys (`backlog/80` H16). Only matters with a
+    /// typing ahead while a command waits loses those keys (`backlog/fixed/80` H16). Only matters with a
     /// notice, since only a noticing wait reads the console.
     pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Fs<'a> {
         self.keep = Some(keep);
@@ -632,7 +655,7 @@ impl<'a> Fs<'a> {
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
         // Record what the capability CARRIES, not what was asked: `fs` narrows a sealed file to
         // read-only, and APPEND is a request flag that never becomes a kernel right. A slot the
-        // kernel cannot describe is no capability we can use (`backlog/80` G2).
+        // kernel cannot describe is no capability we can use (`backlog/fixed/80` G2).
         let granted = match ctx.query_cap_rights(cap) {
             Some(r) => (r as u8) & (crate::cap::READ | crate::cap::WRITE),
             None => return Err(Error::Failed),
@@ -668,6 +691,31 @@ impl<'a> Fs<'a> {
             free: u64::from_le_bytes([b[20], b[21], b[22], b[23], b[24], b[25], b[26], b[27]]),
             free_before: u64::from_le_bytes([b[28], b[29], b[30], b[31], b[32], b[33], b[34], b[35]]),
         })
+    }
+
+    /// What storage `fs` is serving: the device's size, whether a volume is mounted, how full it is
+    /// and its label (`OP_DRIVES_INFO`, the request behind the shell's `drives`). **Changes nothing**,
+    /// except that `fs` drops a mount whose device has gone - which is it noticing, not this asking.
+    ///
+    /// # Errors
+    /// [`Error::Malformed`] on a reply too short to be one; the no-answer errors of every request.
+    pub fn drive(&mut self) -> Result<Drive, Error> {
+        let secs = self.secs();
+        let r = self.call(OP_DRIVES_INFO, &[], &[], secs)?;
+        // [mounted, capacity u64, total u64, used u64, flags, label_len, label..]
+        let b = r.body();
+        if b.len() < 27 {
+            return Err(Error::Malformed);
+        }
+        let u = |i: usize| u64::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3], b[i + 4], b[i + 5], b[i + 6], b[i + 7]]);
+        let mut d = Drive { capacity_sectors: u(1), mounted: b[0] != 0, total_blocks: u(9), used_blocks: u(17),
+                            label: [0; 31], label_len: 0 };
+        if d.mounted {
+            let ll = (b[26] as usize).min(31).min(b.len().saturating_sub(27));
+            d.label[..ll].copy_from_slice(&b[27..27 + ll]);
+            d.label_len = ll as u8;
+        }
+        Ok(d)
     }
 
     /// Verify every referenced block's CRC and report. **Changes nothing.**
@@ -846,7 +894,7 @@ impl<'a> Fs<'a> {
     /// ([`create_sized`](Fs::create_sized)), then filled chunk by chunk from offset 0. A failure
     /// part way leaves a file of the full size whose tail is not yet written, and is reported.
     /// (Until 2026-10-10 the file was created from its first chunk alone, sized for that chunk, so
-    /// `services/fs` refused the second as "write past extent" - `backlog/80` G1.)
+    /// `services/fs` refused the second as "write past extent" - `backlog/fixed/80` G1.)
     pub fn write(&mut self, path: impl AsRef<[u8]>, data: &[u8]) -> Result<(), Error> {
         if data.len() <= IO_CHUNK {
             self.call(OP_WRITE_FILE, path.as_ref(), data, self.secs())?;

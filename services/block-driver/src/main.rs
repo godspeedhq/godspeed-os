@@ -106,12 +106,12 @@ impl Chaos {
     ///
     /// **THIS ATTACKS THE PROTOCOL, NOT THE DEVICE, AND THAT IS THE GAP IT FILLS.** `io-error-test`
     /// makes the disk fail, which `fs` already handles by retrying. Carnage §3.7 asks for the other
-    /// half - late, duplicate, missing and out-of-order COMPLETIONS - and names why: `backlog/31`
+    /// half - late, duplicate, missing and out-of-order COMPLETIONS - and names why: `backlog/fixed/31`
     /// recorded exactly that one layer up, a service reading replies that belonged to earlier
     /// requests. The fs/block channel has the same shape, carries the same correlation tag, and
     /// gained a drain-before-request repair that nothing had ever exercised adversarially.
     ///
-    /// **The bar is RECOVERY, not detection** - `backlog/31`'s tag was reverted precisely because
+    /// **The bar is RECOVERY, not detection** - `backlog/fixed/31`'s tag was reverted precisely because
     /// rejecting a stale reply is not the same as surviving one.
     ///
     /// One of each shape and no more: a MISSING completion costs the caller its full 30 s deadline
@@ -235,13 +235,19 @@ const OP_CAPACITY: u8 = 3;
 // it to zero the free bitmap at format time so `drives flash` stays fast on a big disk.
 const OP_WRITE_ZEROS: u8 = 4;
 // Flush: [OP_FLUSH] → make every previously acknowledged write durable on the medium, reply
-// [STATUS_OK] or [STATUS_ERR]. A write completing does NOT mean the bytes reached the disk - a
+// [STATUS_OK] or [STATUS_ERR] - or, on the USB backend only, [STATUS_UNREACHABLE] (below). A write completing does NOT mean the bytes reached the disk - a
 // USB stick acknowledges into its own volatile buffer - so `fs` asks for durability explicitly at
 // the points where it promises it (format, journal commit). Backends that cannot flush say so
 // once at startup rather than quietly implying the data is safe (§26.7).
 const OP_FLUSH: u8 = 5;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
+// A flush that reached NO device: the USB host service did not answer, or had no disk bound. `fs`
+// reads `STATUS_ERR` on a flush as the DEVICE refusing the barrier - the evidence CLAUDE.md 6.1 names -
+// so a flush that never got that far must not be reported the same way (`backlog/57`). Only the USB
+// backend can be in that position: AHCI and SDHCI drive their device directly.
+#[cfg(storage_is_usb)]
+const STATUS_UNREACHABLE: u8 = 2;
 
 /// Drive the AHCI controller directly, through the BAR the kernel granted this service.
 #[cfg(not(storage_is_usb))]

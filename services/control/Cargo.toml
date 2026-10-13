@@ -1,6 +1,7 @@
 [package]
 name = "control"
 version = "0.1.0"
+description = "The operator control channel on the second serial port, used by the test harness"
 edition = "2021"
 
 [[bin]]

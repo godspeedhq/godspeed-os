@@ -27,7 +27,7 @@ pub fn percpu_init(boot_info: &BootInfo) {
     let _ = boot_info;
     // Size every per-core arena from the LIVE core count the machine reports. A machine with one
     // core gets arenas for one; the same binary on four gets four. There is no build that decides
-    // this - that flag existed, found its bug, and was deleted (backlog/02).
+    // this - that flag existed, found its bug, and was deleted (backlog/fixed/02).
     let n = crate::arch::imp::ap_count() + 1; // BSP + every AP Limine enumerated (live count)
     percpu::set_num_cores(n);
     core::init_arenas(n);

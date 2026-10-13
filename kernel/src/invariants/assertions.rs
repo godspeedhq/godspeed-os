@@ -7,7 +7,7 @@
 
 // (A cap-validated assertion sat here. Every call passed it a literal `Ok(())` after the real
 // check had already returned, so it could not fire - a check that cannot fail is an instrument that
-// reports a pass while measuring nothing. Deleted 2026-10-10 with its nine call sites, `backlog/80`
+// reports a pass while measuring nothing. Deleted 2026-10-10 with its nine call sites, `backlog/fixed/80`
 // K20; the validation it marked is `current_task_lookup_cap` / `current_task_holds_resource` at each
 // handler's head.)
 
@@ -24,7 +24,7 @@ pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) 
 
 // (A TCB-alive assertion sat here, over an empty TCB set: since Path C / Phase 6 the only thing that
 // cannot die is the kernel, which is not a task, so it checked nothing. Deleted 2026-10-10,
-// `backlog/80` K20. If a component ever becomes unkillable again, its check is written then.)
+// `backlog/fixed/80` K20. If a component ever becomes unkillable again, its check is written then.)
 
 /// Assert the capability table is consistent: no cap carries a generation that
 /// exceeds its resource's current generation in the global table. Such a cap

@@ -89,7 +89,7 @@ RULES = {
              "Box-drawing characters are fine and are left alone."),
 
     "line_ending_check.py": dict(
-        code="GS0102", fixable=True, commandment=None, section="backlog/26",
+        code="GS0102", fixable=True, commandment=None, section="backlog/fixed/26",
         title="a tracked text file carries CRLF line endings",
         help="`conform` fixes this by rewriting the file with LF endings.",
         why="A CRLF in a boot config boots NOTHING while showing a perfect menu: U-Boot reads the "

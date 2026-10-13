@@ -1,5 +1,6 @@
 [package]
 name = "cap-grant"
+description = "Example: passing a capability to another service in a message"
 version = "0.1.0"
 edition = "2021"
 

@@ -6,7 +6,7 @@ WHY. `docs/licensing.md` puts the OS under GPL-2.0-only and the SDK (`sdk/rust`)
 (`stdlib/rust`) and `examples/` under Apache-2.0, and says per-file SPDX tags mark every file. Thirteen
 did not carry one - nine in `services/dwc2`, `net-stack`'s `tcp.rs`, `probe`'s `table.rs`,
 `wifi-driver`'s `main.rs`, `osdev`'s `fs_model.rs` - and nothing would have noticed a fourteenth
-(backlog/80 R1). A file with no tag is a file whose terms a reader must guess, and the guess matters
+(backlog/fixed/80 R1). A file with no tag is a file whose terms a reader must guess, and the guess matters
 most where the two licences meet: the Apache crates are what a service links, so a GPL file inside one
 is the case the split exists to prevent.
 

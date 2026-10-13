@@ -135,6 +135,32 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     bounded at `gs::call::DEFAULT_SECS` but cannot be ended with `q` - a code defect against this
     rule, recorded in each utility's own spec.)*
 
+    *(Note 2026-10-12: the advertisement is now AUTOMATIC on the shell's receive waits, at the
+    operator's standing rule - "for every request that takes time, there should automatically be a
+    `[q] to quit`". A pipe stage's drain (`drain_service_with`, which `ask` also goes through) and a
+    file-cap reply wait through `recv_quittable` in `services/shell`, which prints `  [q] quit` once
+    nothing has come for `gs::call::NOTICE_AFTER_SECS`, once per wait. The SDK gives the timing
+    (`ServiceContext::recv_abortable_deadline_noticing`, the receive-side twin of the request's
+    `request_with_reply_qhint`) and the shell the words, because a task with no prompt has nothing
+    to print. A new receive wait in the shell gets it by going through that helper. Since 2026-10-13
+    the request waits that used plain `request_with_reply_abortable` (`fs_request`, `fs_raw` -
+    `drives`, `drives flash`, `reset`, `label` - and `ns_abortable`) go through
+    `ask_with_quit_notice`, and the re-waits after an overtaken reply (`fs_take_tagged`,
+    `ns_take_tagged`) through `recv_quittable` (`backlog/84` S6). Not yet covered: the fs handles
+    listed in the note above.)*
+
+    *(Note 2026-10-13: and the radio's and audio driver's asks. `wifi_ask` and `audio_ask` - every
+    `wifi` and `audio` verb, `wifi hardware` among them, which asks each radio twice and could sit for
+    12 s silent - wait through `ask_sifted_quittable` (the SDK's
+    `request_with_reply_keyhint_sifted_keeping`), and `wifi_ask`'s wait for answers the driver still owes
+    says it too; `q` there prints `stopped by q` rather than "not answering". `observe now`'s wait for its
+    frame and `date sync` say `[q] quit` as well. **Still silent, and why:** the waits on a kernel `Call`
+    - `recorder` and `copier` (8 to 12 s), `time` and the `ns_deadline` path to `net-stack` (each at its
+    caller's deadline), and the 2 s spawn request to the supervisor. A task blocked in a `Call` cannot read the console, and the
+    noticing form that can takes whatever reply lands next, which is what the `Call` is there to prevent:
+    giving them `[q]` needs a reply-matched wait that returns to the caller between slices, which does not
+    exist yet.)*
+
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,
     `sock` and `serve`'s listen all go through - used a bare `request_with_reply`, which parks the
@@ -182,9 +208,9 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     | Not a pipe source | Why |
     |---|---|
     | `run`, `selfcheck` | Orchestrators: they run their own sub-pipelines, so capturing one nests a pipe inside a pipe on a 256 KiB stack - a hardware-proven crash. They write their own output with `save <path>` instead |
-    | `health`, `online`, `size`, `busiest`, `watch` (the library) | Scripts, run by the interpreter: the same class as `run`, refused inside another script for the same stack reason. Their contents pipe directly - `busiest` IS `status \| sort reverse mem` |
+    | `health`, `online`, `size`, `busiest` (the library) | Scripts, run by the interpreter: the same class as `run`, refused inside another script for the same stack reason. Their contents pipe directly - `busiest` IS `status \| sort reverse mem` |
     | `docs`, `scrollback`, `edit`, bare `observe` | Full-screen: a pipe cannot carry a screen you scroll. `scrollback save` and `observe now` are the capturable forms |
-    | `clear`, `wait`, `cd`, `mkdir`, `copy`, `move`, `rename`, `delete`, `seal`, `spawn`, `kill`, `restart`, `reboot`, `background`, `foreground` | Actions: the value is the effect, and what they print is a confirmation, not data |
+    | `clear`, `wait`, `repeat`, `cd`, `mkdir`, `copy`, `move`, `rename`, `delete`, `seal`, `spawn`, `kill`, `restart`, `reboot`, `background`, `foreground` | Actions: the value is the effect, and what they print is a confirmation, not data |
     | `wifi scan`, `join`, `leave`, `forget`, `radio ...` | Actions; `join` also reads a passphrase from the console, and piped its prompt would vanish. Refused with a sentence naming the reports |
     | `churn <seconds>`, `churn tear`, `churn reset` | Actions; `churn verify` is the report and pipes |
     | `chaos`, `fcap` | Exercisers whose value is what they prove while running; `chaos` writes its report with `save` |

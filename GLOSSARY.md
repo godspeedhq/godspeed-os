@@ -14,6 +14,10 @@ itself. Where this file and `CLAUDE.md` disagree, `CLAUDE.md` wins.
 Only abbreviations the repository genuinely uses are listed. Each was verified by grep
 before inclusion.
 
+The table below is also read by a program: `ask "what is MISCIS?"` answers from it, read
+when `ask` is built (`services/ask/build.rs`), so a row's shape - three cells, the
+abbreviation first - is load-bearing, and a definition has one copy, this one.
+
 ---
 
 ## Alphabetical list
@@ -68,6 +72,7 @@ before inclusion.
 | LBA | Logical Block Address | A disk block index; the block-IPC LBA field is `u64` (`docs/persistence.md`). |
 | MADT | Multiple APIC Description Table | The ACPI table that would enumerate cores; *not* parsed in v1 because Limine supplies APIC IDs directly. |
 | MBR | Master Boot Record | BIOS boot sector; `limine bios-install` writes Limine's stage-1 there. |
+| MISCIS | Memory isolation, IPC, Scheduling, Capabilities, Interrupts, SMP routing | The kernel's six responsibilities, said like "misses" (CLAUDE.md 4.3). "Do not expand MISCIS" is the short form of 4.4: a seventh responsibility is a change to what the kernel IS, and `scripts/commandments.py` derives the six from that list. |
 | MMIO | Memory-Mapped I/O | Device registers accessed as memory; granted to a driver by an `hw_mmio` capability and used only through the SDK's safe `Mmio` wrappers (section 18.1). |
 | MSI | Message-Signaled Interrupt | PCI interrupt delivery via a memory write; the current USB drivers use pin-based IRQs, with MSI the basis of the interrupt-driven driver branch. |
 | NIC | Network Interface Controller | The network device in the (design-only) networking stack; an IOMMU-confined e1000 driver for QEMU/Intel (`docs/networking.md`). |

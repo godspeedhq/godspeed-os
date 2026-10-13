@@ -79,12 +79,19 @@ pub(crate) struct Radio {
     down_until: u64,
     /// How many backoff windows this instance has entered, for the log and nothing else.
     backoffs: u32,
+    /// THE RADIO'S NAME DID NOT RESOLVE at the last reacquire: its service is not running (`wifi-usb` once
+    /// its dongle has gone). Until a lookup finds it again, a probe LOOKS THE NAME UP and sends nothing.
+    /// Sending was what happened before: the failed reacquire left the named-peer cache holding the dead
+    /// instance's cap, every probe went out on it, and the kernel logged a gen mismatch for each one - a
+    /// line a second for as long as the dongle was absent (`backlog/88`). A lookup finds a respawned radio
+    /// as fast as a probe did, and costs no message.
+    gone: bool,
     /// CLIENT REQUESTS THAT ARRIVED WHILE THIS DRIVER WAS WAITING ON THE RADIO. The wait in `rpc`
     /// used to take whatever landed next as the radio's answer, and a request from net-stack that
     /// landed in that window was checked against the op it was not, discarded, and its reply cap
     /// with it. net-stack waited out its whole deadline, reacquired and retried, and over the radio -
     /// where net-stack sends back to back - that collision repeated every cycle, and was taken for the
-    /// three-second ping of `backlog/66` (whose later DNS failure turned out to be an empty reply the
+    /// three-second ping of `backlog/fixed/66` (whose later DNS failure turned out to be an empty reply the
     /// kernel refused, `e3fcf7ed`). The collision was real either way. A message with a reply cap is a request, never
     /// the radio's reply, so it
     /// is kept here and served before the next `recv`. Two slots, because one `serve` iteration can
@@ -98,6 +105,10 @@ pub(crate) struct Radio {
     other: Option<&'static str>,
     /// When the other radio was last asked whether it is the one in use: at most every `OTHER_EVERY_MS`.
     other_asked: Option<wait::Since>,
+    /// The radio the default order picks when no choice is recorded (`wire::USE_DEFAULT`: the onboard radio,
+    /// else the dongle) - the first one this bridge was built with. `name` and `other` swap as the bridge
+    /// follows the choice; this does not.
+    default: &'static str,
 }
 
 /// How often the other radio is asked whether it is the one in use, while the current one says it is
@@ -106,6 +117,7 @@ const OTHER_EVERY_MS: u64 = 5_000;
 /// `wire::USE_*` (`sdk/wifi`), as literals for the reason the op numbers are: this crate does not link it.
 const USE_NOT: u8 = 0;
 const USE_THIS: u8 = 1;
+const USE_DEFAULT: u8 = 2;
 /// Where `[0x10]`'s reply carries the radio's `USE_*` value.
 const INFO_USE_AT: usize = 15;
 
@@ -117,9 +129,9 @@ impl Radio {
         Radio {
             name,
             answered: 0, slow: 0, timeouts: 0, silent_run: 0, mismatch: 0, sendfail: 0, restale: 0,
-            down_until: 0, backoffs: 0,
+            down_until: 0, backoffs: 0, gone: false,
             held: [None, None], rescued: 0, held_dropped: 0,
-            other: None, other_asked: None,
+            other: None, other_asked: None, default: name,
         }
     }
 
@@ -144,15 +156,17 @@ impl Radio {
         if !godspeed::cap::reacquire(ctx, other) {
             return None;
         }
-        let (name, run, until, offs) = (self.name, self.silent_run, self.down_until, self.backoffs);
+        let (name, run, until, offs, gone) = (self.name, self.silent_run, self.down_until, self.backoffs, self.gone);
         self.name = other;
         self.silent_run = 0;
         self.down_until = 0;
+        self.gone = false;   // just resolved, above
         let r = self.rpc(ctx, &Message::from_bytes(&[0x10]));
         self.name = name;
         self.silent_run = run;
         self.down_until = until;
         self.backoffs = offs;
+        self.gone = gone;
         r
     }
 
@@ -174,6 +188,23 @@ impl Radio {
                 return None;
             }
             self.down_until = 0;
+        }
+        // NOT RUNNING at the last look: look again, and send only if it is there now (see `gone`). Still
+        // gone, it is held down for another window, as a silent radio is, and counted as before.
+        if self.gone {
+            if !godspeed::cap::reacquire(ctx, self.name) {
+                self.down_until = godspeed::driver::wait::ticks(ctx).wrapping_add(crate::cycles(ctx, RADIO_BACKOFF_MS));
+                self.sendfail = self.sendfail.saturating_add(1);
+                if self.sendfail % 16 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: {} is still not running - looked up, nothing sent (x{})",
+                        self.name, self.sendfail));
+                }
+                return None;
+            }
+            self.gone = false;
+            ctx.log_fmt(format_args!(
+                "nic-driver: {} is running again - its name resolves, probing it", self.name));
         }
         let t0 = godspeed::driver::wait::ticks(ctx);
         // SIFTED, not the first thing that lands. A message carrying a reply cap is a client's
@@ -273,9 +304,10 @@ impl Radio {
                         // Once, then every sixteenth, as the comment above says: on a PC with no dongle
                         // and the cable out this is every probe, a line a second for as long as it lasts.
                         self.sendfail = self.sendfail.saturating_add(1);
+                        self.gone = true;
                         if self.sendfail == 1 || self.sendfail % 16 == 0 {
                             ctx.log_fmt(format_args!(
-                                "nic-driver: the radio was silent and its name does not resolve - {} is not running (x{})",
+                                "nic-driver: the radio was silent and its name does not resolve - {} is not running (x{}); nothing is sent to it until it does",
                                 self.name, self.sendfail));
                         }
                     }
@@ -304,23 +336,32 @@ impl Radio {
         let mut r = self.rpc(ctx, &Message::from_bytes(&[0x10]));
         // FOLLOW THE RADIO IN USE (`wifi hardware use`). Each radio says in this reply whether it is the
         // one the operator chose; this driver holds no choice of its own. While the current radio says
-        // another is in use, or does not answer, the other is asked (bounded, `OTHER_EVERY_MS`), and the
+        // another is in use, or does not answer, or - with no choice recorded - is not the default radio,
+        // the other is asked (bounded, `OTHER_EVERY_MS`), and the
         // frames move to it when it says it is the one - or when the current one is gone and the other
         // answers, because a saved choice is a preference and a missing radio must not leave the machine
         // without the one that is there (`utilities/56_wifi.md` 11).
         let use_now = r.as_ref().and_then(|m| m.payload_bytes().get(INFO_USE_AT).copied());
         if let Some(other) = self.other {
-            let want_other = r.is_none() || use_now == Some(USE_NOT);
+            // `USE_DEFAULT` from the radio that is NOT the default is "not me" too. `wifi hardware use onboard`
+            // removes `/wifi.radio`, so both radios answer `USE_DEFAULT`; reading only `USE_NOT` as a reason
+            // to look, this stayed on a dongle that had just left the network while the onboard radio joined
+            // it, and the machine had no link (Pi 4, 2026-10-12).
+            let not_mine = use_now == Some(USE_NOT) || (use_now == Some(USE_DEFAULT) && self.name != self.default);
+            let want_other = r.is_none() || not_mine;
             let due = self.other_asked.as_ref().map_or(true, |t| t.passed(ctx, Budget::ms(OTHER_EVERY_MS)));
             if want_other && due {
                 self.other_asked = Some(wait::Since::now(ctx));
                 if let Some(o) = self.ask_other(ctx, other) {
                     let o_use = o.payload_bytes().get(INFO_USE_AT).copied();
-                    if o_use == Some(USE_THIS) || r.is_none() {
+                    let default_wins = o_use == Some(USE_DEFAULT) && other == self.default;
+                    if o_use == Some(USE_THIS) || default_wins || r.is_none() {
                         ctx.log_fmt(format_args!(
                             "nic-driver: the radio bridge now goes to {} ({}) - {} {}",
                             other,
-                            if o_use == Some(USE_THIS) { "the radio in use, /wifi.radio" } else { "the one that answers" },
+                            if o_use == Some(USE_THIS) { "the radio in use, /wifi.radio" }
+                            else if default_wins { "the default radio - no choice is recorded" }
+                            else { "the one that answers" },
                             self.name,
                             if r.is_none() { "does not answer" } else { "is not the one in use" }));
                         self.other = Some(self.name);
@@ -328,6 +369,7 @@ impl Radio {
                         self.silent_run = 0;
                         self.down_until = 0;
                         self.backoffs = 0;
+                        self.gone = false;   // `other` answered, so it is running
                         r = Some(o);
                     }
                 }

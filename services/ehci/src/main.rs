@@ -281,7 +281,7 @@ fn control(
     // Endpoint capabilities: Mult [31:30], Port Number [29:23], Hub Address [22:16] (EHCI 1.0
     // 3.6.2; Linux's ehci.h masks QH_HUBPORT 0x3f800000 and QH_HUBADDR 0x007f0000, and its
     // qh_make writes ttport << 23). This was `<< 22` until 2026-10-10, which put an odd port's low bit into the
-    // hub address's top bit and read every port one low (backlog/80 D1).
+    // hub address's top bit and read every port one low (backlog/fixed/80 D1).
     dma.write32(QH_OFF + 0x08,
         (1 << 30) | ((ep.hub_addr as u32 & 0x7F) << 16) | ((ep.port as u32 & 0x7F) << 23));
     dma.write32(QH_OFF + 0x0C, 0);
@@ -400,7 +400,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
         None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); return; }
     };
     // Whether the control-transfer timeout has been said. Owned here, by the function that runs for
-    // the driver's whole life, rather than as a static (invariant 9, backlog/80 D9): a respawn is a
+    // the driver's whole life, rather than as a static (invariant 9, backlog/fixed/80 D9): a respawn is a
     // fresh instance and says it again, which it should.
     let said_cell = Cell::new(false);
     let said = &said_cell;

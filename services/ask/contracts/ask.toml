@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# `ask` - Assisted System Knowledge (`docs/ask-design.md`, `utilities/60_ask.md`).
+#
+# A FOREGROUND PROGRAM FOR ONE QUESTION, not a service. The shell starts it wired to send to the shell,
+# hands it the question, reads the answer back and ends it. Not in the boot set and not in `MANAGED`:
+# nothing restarts it, and nothing of it is left running once the prompt returns.
+#
+# READ ONLY, AND THAT IS THE POINT. INTROSPECT for the task table (a privilege its spawn row carries, as
+# `observe`'s does - the schema has no field for it); send peers to the services it asks
+# (the supervisor's read-only questions, `fs`'s drive report, `block-driver` and its USB host for the
+# storage chain, each radio's status) and to the shell for the answer. No spawn, no kill, no console input, no file writes: a question is data, never a grant
+# (CLAUDE.md 3.1), so nothing it is asked can widen what it can do.
+name    = "ask"
+version = "0.1.0"
+
+[resources.memory]
+request = "4MiB"
+limit   = "8MiB"
+
+[capabilities]
+ipc_receive = ["ask"]
+# Every board's list together (`board::ASK_PEERS` in the supervisor picks one per board, at most six -
+# the kernel's MAX_SEND_PEERS): the shell, the supervisor, `fs`, `block-driver`, the USB host the disk is
+# behind (`dwc2` on the Pi 2, `xhci` on the Pi 4 and the VisionFive, none on a PC) and the radio driver.
+# `ask-net`, the same program started for a network question, is a second spawn row with no contract of
+# its own: its peers are `board::ASK_NET_PEERS` (the shell, the supervisor, `net-stack`, the radio).
+ipc_send    = ["shell", "supervisor", "fs", "block-driver", "dwc2", "wifi-usb", "xhci", "wifi-driver"]
+log_write   = true
+

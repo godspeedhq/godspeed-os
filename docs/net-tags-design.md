@@ -515,7 +515,7 @@ Then the transaction path (`tcp`, `sock`, `serve`'s listen) was given a 20 s bou
 quietly became a defect. net-stack threw a request away at 1.5 s while its client sat patiently for
 another 18.5, the client timed out, reacquired, re-sent, and the re-send was answered in
 milliseconds. Measured as 19.67 s and 19.99 s to dispatch, twice, with the arrival receipt showing the
-served copy arriving "from the queue" - the retry, not the original (`backlog/29`).
+served copy arriving "from the queue" - the retry, not the original (`backlog/fixed/29`).
 
 **A constant cannot know a client's deadline, so it stops guessing: the client says.** Byte 1 of a
 tagged request is how many seconds that client will wait, saturating into one byte. `Displaced::note`

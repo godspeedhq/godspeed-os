@@ -1,5 +1,6 @@
 [package]
 name = "pong"
+description = "Example: receives ping's messages and answers them"
 version = "0.1.0"
 edition = "2021"
 

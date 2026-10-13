@@ -141,7 +141,7 @@ fn print_state(
     let num_cores = ctx.inspect_core_count().min(MAX_CORES);
     // This view is built from INTROSPECT-gated queries. Refused - a spawn that did not grant it - the
     // kernel answers nothing, and the frame says that rather than drawing a machine of zeroes
-    // (`backlog/80` K18).
+    // (`backlog/fixed/80` K18).
     let (Some(free_frames), Some(total_frames)) =
         (ctx.inspect_kernel_free_frames(), ctx.inspect_kernel_total_frames())
     else {

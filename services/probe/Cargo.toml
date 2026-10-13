@@ -1,6 +1,7 @@
 [package]
 name = "probe"
 version = "0.1.0"
+description = "Test probes for the property, fuzz, stress, adversarial and chaos suites"
 edition = "2021"
 
 [[bin]]

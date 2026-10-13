@@ -1,5 +1,6 @@
 [package]
 name = "counter"
+description = "Example: a counter that survives its own restart by saving to a file"
 version = "0.1.0"
 edition = "2021"
 

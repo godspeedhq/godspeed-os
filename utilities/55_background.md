@@ -119,7 +119,7 @@ the list above is a work queue and everything reaches it eventually. It is not.
 
 The obvious way to detach `selfcheck` and `run` is to spawn a SECOND, throwaway shell to run them
 and capture its output. That was designed and costed - about two days, and none of it hard - and
-then **rejected on security**, which is `backlog/41`:
+then **rejected on security**, which is `backlog/fixed/41`:
 
 A service whose job is to execute whatever command arrives on its endpoint must hold the authority
 to execute ANY command. Its power is then exercisable by **whoever can send to it**, rather than by
@@ -203,6 +203,13 @@ job"; replaying what it said IS attaching. A second word for it would be a secon
 when the next starts. `foreground` on an older finished job reports its outcome and stays silent
 rather than replaying a different job's text under the right job's heading - a lie that would read
 perfectly.
+
+**Read once, then `copier` is ended (2026-10-11).** `copier` is not a service, and it used to stay up
+until reboot. The shell now ends it after the command that finishes its work: once the job has stopped
+running and its transcript has been replayed by `foreground` - or was empty, so there was nothing to
+collect. A later `foreground` on that job says the text was shown when it was first read back and is
+not kept after that. The shell learns that a job ended only when `jobs` or `foreground` asks, so a job
+that finishes while nobody looks keeps `copier` until then.
 
 ## 4. What a job can reach
 

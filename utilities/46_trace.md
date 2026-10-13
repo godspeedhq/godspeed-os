@@ -493,4 +493,4 @@ the wait lingers past 2 s (`trace_ask`, through `gs::call::request_within_notice
 retried twice, reacquiring `events` by name between attempts). That matters more here than for an ordinary command: `events failures` is what you
 reach for WHEN something is wedged, so an instrument that can itself wedge takes the prompt with it
 and leaves you with a power button. It used to use a bare `request_with_reply`, which parks the shell
-inside the syscall where it cannot read the keyboard (`backlog/29`, conventions rule 10).
+inside the syscall where it cannot read the keyboard (`backlog/fixed/29`, conventions rule 10).

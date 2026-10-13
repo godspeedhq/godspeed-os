@@ -9,7 +9,7 @@
 # why: kind of record, so nothing fired. Correct behaviour, wrong test. This case pins that on purpose.
 --- plant ---
 
-// `paint_view` IS GONE, deleted with the scroll-request mechanism (backlog/37). It repainted the
+// `paint_view` IS GONE, deleted with the scroll-request mechanism (backlog/fixed/37). It repainted the
 // whole grid per message, which jammed the 16-deep queue and ate the shell's keystroke echo.
 --- expect ---
 NOTHING

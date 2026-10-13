@@ -27,6 +27,52 @@
 //! fresh prompt, losing the in-flight command but not the session (§6.2).
 
 use godspeed as gs;
+
+/// A UTF-8 character assembled from console bytes, so a continuation byte is never mistaken for one of
+/// the keyboard driver's signal bytes (`0x80`-`0x83`, which are continuation values). Bounded: four bytes.
+struct Utf8In { buf: [u8; 4], have: usize, need: usize }
+
+enum Utf8Feed {
+    /// Not part of a character: the byte as it came, signals included.
+    Byte(u8),
+    /// Inside a character; more to come.
+    Pending,
+    /// A whole character (an invalid one is U+FFFD).
+    Char(char),
+}
+
+impl Utf8In {
+    fn new() -> Self { Utf8In { buf: [0; 4], have: 0, need: 0 } }
+
+    fn feed(&mut self, b: u8) -> Utf8Feed {
+        if self.need > 0 {
+            if (0x80..=0xBF).contains(&b) {
+                self.buf[self.have] = b;
+                self.have += 1;
+                if self.have < self.need { return Utf8Feed::Pending; }
+                let n = self.need;
+                self.need = 0;
+                return Utf8Feed::Char(core::str::from_utf8(&self.buf[..n]).ok()
+                    .and_then(|t| t.chars().next()).unwrap_or('\u{fffd}'));
+            }
+            // A character cut short: abandoned, and this byte read on its own.
+            self.need = 0;
+        }
+        let need = match b { 0xC2..=0xDF => 2, 0xE0..=0xEF => 3, 0xF0..=0xF4 => 4, _ => 0 };
+        if need == 0 { return Utf8Feed::Byte(b); }
+        self.buf[0] = b;
+        self.have = 1;
+        self.need = need;
+        Utf8Feed::Pending
+    }
+}
+
+/// `ask`'s own reading of a question, compiled in here from the SAME file, so the shell can start the
+/// row that question needs (`ask` or `ask-net`) and the two can never disagree about which question it
+/// is. Pure `core` - it is the file `scripts/host_test_check.py` tests on the host.
+#[allow(dead_code)]
+#[path = "../../ask/src/know.rs"]
+mod ask_know;
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
@@ -79,7 +125,7 @@ const DIR_PAGE_MAX: u16 = 512;
 /// Where a `LIST_DIR` walk has reached, across the several round trips a long directory needs.
 ///
 /// One reply block carries about twenty entries, so a bigger directory arrives in pages
-/// (`backlog/33`). Before this, every caller read one page and stopped: `dir` said TRUNCATED, but
+/// (`backlog/fixed/33`). Before this, every caller read one page and stopped: `dir` said TRUNCATED, but
 /// `find`, `tree` and `copy` just walked what they could see and reported success - a recursive
 /// copy that silently skipped files and said it had copied the directory.
 ///
@@ -414,6 +460,10 @@ pub struct ShellCtx {
     /// Non-zero when the last `wifi_ask` returned nothing WITHOUT SENDING, because the driver still owed
     /// this many earlier answers. `wifi_not_answering` reads it to say so instead of "not answering".
     wifi_unsent: core::cell::Cell<u32>,
+    /// The operator pressed `q` during the last `wifi_ask` or `audio_ask`. Read straight after one returns
+    /// nothing, so "not answering" is not said about a wait the operator ended; and by a command that asks
+    /// several times in a row (`wifi hardware`) to stop asking. Set false at the start of every ask.
+    quit: core::cell::Cell<bool>,
     /// The radio request correlation tag (see `next_wifi_tag`).
     wifi_tag: core::cell::Cell<u8>,
     /// Byte 1 of the last `radio down` answer - WHY the driver says it is down (0 = it did not say).
@@ -431,9 +481,12 @@ pub struct ShellCtx {
     /// offers `[q] quit` has to read the console to see the `q`, and every other key it reads is the
     /// next thing the person typed. `gs` hands each one to [`ShellCtx::keep_key`] instead of
     /// discarding it, and every read of a key here drains this first ([`ShellCtx::console_read`]),
-    /// so nothing typed while a command waits is lost (`backlog/80` H16). Bounded (26.6); a full
+    /// so nothing typed while a command waits is lost (`backlog/fixed/80` H16). Bounded (26.6); a full
     /// buffer says so, once, rather than dropping keys in silence.
     typeahead: core::cell::RefCell<TypeAhead>,
+    /// Whether this shell has started `copier` and not yet ended it - so [`tidy_helpers`] looks for it
+    /// only when there can be one, rather than walking every task slot after every command.
+    copier_started: core::cell::Cell<bool>,
 }
 
 /// The shell's bounded type-ahead (see `ShellCtx::typeahead`): a FIFO of keys, and whether a key has
@@ -477,7 +530,7 @@ impl ShellCtx {
         self.inner.console_read()
     }
     /// An `fs` handle for a command that may WAIT on `fs`: the `[q] quit` notice and the type-ahead
-    /// keep (`backlog/80` H16). The same at the prompt and in a script: since the SDK's noticing wait
+    /// keep (`backlog/fixed/80` H16). The same at the prompt and in a script: since the SDK's noticing wait
     /// blocks in the kernel until the notice is due and reads no key before it, it costs a script
     /// nothing. (It once polled from the start, and `selfcheck`'s second run in one boot outran its
     /// 300 s window, so scripts were given the plain handle until that was fixed.)
@@ -521,12 +574,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         wifi_owed: core::cell::Cell::new(0),
         wifi_owed_since: core::cell::Cell::new(0),
         wifi_unsent: core::cell::Cell::new(0),
+        quit: core::cell::Cell::new(false),
         wifi_tag: core::cell::Cell::new(0),
         wifi_down_reason: core::cell::Cell::new(0),
         wifi_radio: core::cell::Cell::new(RADIOS[0]),
         audio_tag: core::cell::Cell::new(0),
         jobs: core::cell::RefCell::new(JobTable::new()),
         typeahead: core::cell::RefCell::new(TypeAhead::new()),
+        copier_started: core::cell::Cell::new(false),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -579,6 +634,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::io::print(ctx, "(F1=help or type 'help')\ngsh> ");
 
     let mut line = Line::new();
+    // A UTF-8 character arriving a byte at a time (see where it is fed).
+    let mut utf8 = Utf8In::new();
     // Current location on the (single) drive: the directory bare/relative paths target,
     // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
     let mut cwd = Cwd::root();
@@ -615,7 +672,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // THE CLOCK FLOOR IS `time`'S. This loop used to probe `time` for the clock source on every pass
         // and, once it read NTP, write `/clock.last` itself - a second writer of a file `time` already
         // writes when the clock is set and refreshes on its own (`FLOOR_REFRESH_SECS`), and an RPC on
-        // the input path ahead of the keyboard read (`backlog/80` H12). Both are gone: the shell reads
+        // the input path ahead of the keyboard read (`backlog/fixed/80` H12). Both are gone: the shell reads
         // the floor where it uses it (`date sync`) and never writes it.
 
         if !ctx.is_console_foreground() {
@@ -678,6 +735,25 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // the fix; putting it where it belongs is separate work, recorded rather than faked.
         // (Note 2026-10-09: that work is done - `time` loads and persists `/clock.last` itself.)
         let b = ctx.console_read();
+        // A CHARACTER, NOT A BYTE. A byte above ASCII is either one of the keyboard driver's signals
+        // (Ctrl+Alt+Del, the audio keys - `0x80`-`0x83`) or part of a UTF-8 character typed over serial
+        // or pasted, and those signal values are UTF-8 CONTINUATION bytes: a curly quote is `E2 80 9C`,
+        // so its middle byte read as Ctrl+Alt+Del and REBOOTED THE MACHINE (found 2026-10-11 typing
+        // `ask "..."` with curly quotes in QEMU). A continuation byte inside a character is text; only
+        // one standing alone is a signal, which is how a keyboard driver sends it.
+        let b = match utf8.feed(b) {
+            Utf8Feed::Byte(b) => b,
+            Utf8Feed::Pending => continue,
+            Utf8Feed::Char(c) => match c {
+                // Curly quotes are quotes: the line holds ASCII, and a quote a phone or a word processor
+                // typed should quote exactly as `"` does - pipes and arguments included.
+                '\u{201c}' | '\u{201d}' => b'"',
+                '\u{2018}' | '\u{2019}' => b'\'',
+                // Any other character is dropped whole, as non-ASCII always was at this prompt - never
+                // in pieces, whose bytes would be read as something else.
+                _ => continue,
+            },
+        };
         // Any other key may have moved the screen (Tab lists completions below the prompt), so the next
         // shortcut writes a fresh notice rather than overwriting what is no longer the line above.
         if !matches!(b, gs::io::keys::VOLUME_UP_SIGNAL | gs::io::keys::VOLUME_DOWN_SIGNAL
@@ -691,7 +767,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // made HERE because the shell is the principal that legitimately holds REBOOT. This
             // restores the chord's UX without handing the driver back a direct reset from any
             // context, which is what SEC-2 actually removed. The signal byte is outside ASCII, so
-            // no typed key produces it, and the chord is a deliberate three-key combination.
+            // no typed key produces it ALONE - inside a UTF-8 character it is a continuation byte, and
+            // `Utf8In` above consumes those whole - and the chord is a deliberate three-key combination.
             gs::io::keys::CTRL_ALT_DEL_SIGNAL => {
                 gs::io::print(ctx, "\r\n");
                 cmd_reboot(&ctx);
@@ -736,6 +813,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     line.len = 0;
                     line.cur = 0;
+                    // A helper whose work that command finished is ended before the prompt returns.
+                    tidy_helpers(&ctx);
                 }
                 nav = hist.len();
                 gs::io::print(ctx, PROMPT);
@@ -952,13 +1031,15 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 /// same commit; a path-taking utility is left out. Opting out of path completion is explicit + per-command.
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
-    "wait", "watch", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve", "cores", "fcap",
+    "wait", "repeat", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve", "cores", "fcap",
     // An SSID is not a path. Completing one from the filesystem would be nonsense, and
     // completing it from the last scan would leak the names of networks in range into a shell
     // that records its history - so `wifi` offers keywords and nothing else.
     "wifi",
     // Sections and device names, never a path.
     "hardware",
+    // A question, never a path.
+    "ask",
     // `paginate` takes NO arguments at all, so Tab after it must offer nothing rather than a
     // directory listing for a position that accepts neither a path nor a keyword.
     "paginate",
@@ -968,7 +1049,7 @@ const NO_PATH_CMDS: &[&str] = &[
 /// entries past it were silently dropped - a command that quietly stops completing because a list
 /// grew, which is the shape of failure this shell keeps removing elsewhere. Now it does not build.
 /// (Its message named complete_command, which is no function here; the array is in `complete_tab` -
-/// backlog/80 H13.)
+/// backlog/fixed/80 H13.)
 const _: () = assert!(
     UTILS.len() + LIBRARY.len() <= 96,
     "the command-name completion array in `complete_tab` is too small for UTILS + LIBRARY - grow it, do not let names fall off the end"
@@ -982,7 +1063,8 @@ const _: () = assert!(
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
-    // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/80` H21).
+    ("ask",     &["evidence"]),
+    // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
     ("events",  &["failures", "ipc", "log", "metrics", "persist", "status"]),
@@ -1032,7 +1114,7 @@ const PRODUCER_COLS: &[(&str, &[&str])] = &[
     ("status",  &["slot", "name", "core", "state", "mem", "queue", "restarts"]),
     ("caps",    &["resource", "rights"]),
     ("drives",  &["index", "label", "status", "size_mib", "free_mib"]),
-    // `roster` and `uptime` offered columns they do not have (`backlog/80` H9). These are the
+    // `roster` and `uptime` offered columns they do not have (`backlog/fixed/80` H9). These are the
     // columns `examples/roster` and `build_uptime_table` build.
     ("roster",  &["name", "role", "seat"]),
     ("uptime",  &["uptime", "seconds"]),
@@ -1148,7 +1230,7 @@ const SUBCMD_THIRD: &[(&str, &str, &str, &[&str])] = &[
 /// Commands whose FIRST argument is a command name rather than a path or a keyword.
 ///
 /// `assert ok d⇥` should offer `dir`/`date`/`delete`, not the contents of the current directory.
-/// `watch` and `whatis` already had this; `assert` takes a command after its verb, which is one
+/// `repeat` and `whatis` already had this; `assert` takes a command after its verb, which is one
 /// level deeper and so was never reached.
 const CMDNAME_AFTER: &[(&str, &str)] = &[
     ("assert", "ok"),
@@ -1164,7 +1246,7 @@ const INFO_CMDS: &[&str] = &[
     "about", "version", "mem", "sock", "uptime", "status", "roster", "clear", "reboot",
     "result", "selfcheck", "caps", "help",
     // Library scripts whose only first-arg subcommands are the universal version/help ("size" is
-    // absent on purpose - its argument is a path, so it keeps path completion; "watch" has its own
+    // absent on purpose - its argument is a path, so it keeps path completion; "repeat" has its own
     // command-name completion case; "busiest" completes its column keywords via SUBCMD_FIRST).
     "health", "online",
 ];
@@ -1236,11 +1318,13 @@ fn complete_keyword(ctx: &ShellCtx, line: &mut Line, seg_start: usize, tok_start
         return complete_from_list(ctx, line, seg_start, SPAWN_TARGETS);
     }
 
-    // `watch <command ...>` / `whatis <name>`: the first argument IS a command name, so complete
-    // it from the same set the command position uses (built-ins + library scripts).
-    if ("watch".as_bytes() == cmd || "whatis".as_bytes() == cmd) && prior == 0 {
+    // `repeat <command ...>` / `whatis <name>`: the first argument IS a command name, so complete
+    // it from the same set the command position uses (built-ins + library scripts) - and for
+    // `repeat`, its two option words.
+    if ("repeat".as_bytes() == cmd || "whatis".as_bytes() == cmd) && prior == 0 {
         let mut names: [&str; 96] = [""; 96];
         let mut n = 0usize;
+        if "repeat".as_bytes() == cmd { names[0] = "count"; names[1] = "wait"; n = 2; }
         for &u in UTILS { if n < names.len() { names[n] = u; n += 1; } }
         for &(lib, _) in LIBRARY { if n < names.len() { names[n] = lib; n += 1; } }
         return complete_from_list(ctx, line, tok_start, &names[..n]);
@@ -1256,7 +1340,7 @@ fn complete_keyword(ctx: &ShellCtx, line: &mut Line, seg_start: usize, tok_start
         // `restart` accept any name and the only refusals are `supervisor`, `shell` and the `observe`
         // variants - so an omission costs discoverability, never capability.
         // NOT `supervisor` or `shell`: `restart` refuses both, so offering them completed a command
-        // into a refusal (`backlog/80` H14).
+        // into a refusal (`backlog/fixed/80` H14).
         const RESTART_TARGETS: &[&str] = &["block-driver", "fs", "events", "xhci",
             "ehci", "nic-driver", "net-stack", "time", "ping", "pong", "version", "help"];
         return complete_from_list(ctx, line, tok_start, RESTART_TARGETS);
@@ -1266,7 +1350,7 @@ fn complete_keyword(ctx: &ShellCtx, line: &mut Line, seg_start: usize, tok_start
     // complete them at ANY position where the token prefix-matches one not already used (not just first).
     if "ping".as_bytes() == cmd {
         const PING_OPTS: &[&str] = &["count", "bytes", "version", "help"];
-        // Room for every option: a 2-slot array dropped `version` and `help` (`backlog/80` H14).
+        // Room for every option: a 2-slot array dropped `version` and `help` (`backlog/fixed/80` H14).
         let mut avail = [""; PING_OPTS.len()];
         let mut a = 0usize;
         for &k in PING_OPTS {
@@ -1356,7 +1440,7 @@ fn complete_keyword(ctx: &ShellCtx, line: &mut Line, seg_start: usize, tok_start
     if prior == 1 {
         if let Some(a1) = first_arg {
             // A COMMAND NAME, where the surface takes one - `assert ok d<tab>` must offer `dir`,
-            // `date`, `delete`, not the contents of the current directory. `watch` and `whatis`
+            // `date`, `delete`, not the contents of the current directory. `repeat` and `whatis`
             // already had this at position 1; nothing had it at position 2.
             if CMDNAME_AFTER.iter().any(|(c, f)| c.as_bytes() == cmd && f.as_bytes() == a1) {
                 let mut names: [&str; 96] = [""; 96];
@@ -2057,9 +2141,12 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         // `assert ok/fails <cmd>` - the result form (the content form `… | assert contains X` is
         // a pipe sink, handled in pipe_run). `s` is the trimmed whole line.
         "assert" => return cmd_assert(ctx, cwd, s["assert".len()..].trim(), depth),
+        // `repeat [count N] [wait S] <command ...>` - run a command again; `s` is the whole line, so the
+        // command after the options keeps its quoting.
+        "repeat" => return cmd_repeat(ctx, cwd, s["repeat".len()..].trim(), depth, out),
         "run" => {
             if depth > 0 {
-                gs::io::println(ctx, "run: a script cannot run another script (no nesting)");
+                gs::io::println(ctx, "run: a script cannot run another script, and neither can `repeat` or `assert` (no nesting)");
                 return Err(ShellError::Unknown);
             }
             if argc < 2 {
@@ -2111,6 +2198,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "wifi"    => cmd_wifi(ctx, s["wifi".len()..].trim(), out),
         "audio"   => cmd_audio(ctx, cwd, s["audio".len()..].trim(), out),
         "hardware" => cmd_hardware(ctx, cwd, s["hardware".len()..].trim(), out),
+        "ask"     => cmd_ask(ctx, s["ask".len()..].trim()),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -2226,7 +2314,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             if let Some(src) = library_script(other) {
                 if depth > 0 {
                     gs::io::println_fmt(ctx, format_args!(
-                        "{}: a library command runs a script - not available inside another script", other));
+                        "{}: a library command runs a script - not available inside another script, `repeat` or `assert`", other));
                     return Err(ShellError::Unknown);
                 }
                 return run_lines(ctx, cwd, src.as_bytes(), depth + 1, out, &parse_params(ctx, s, other, 1), true, None, false);
@@ -2378,7 +2466,7 @@ fn cmd_run(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&st
     let (mut code, truncated, unread) = stream_minify(ctx, path, &mut script);
     if unread && code > 0 {
         // A read that failed part way is NOT the end of the file. It used to be taken as one, so a
-        // storage error ran the first part of a script as if it were the whole (`backlog/80` H11).
+        // storage error ran the first part of a script as if it were the whole (`backlog/fixed/80` H11).
         gs::io::println_fmt(ctx, format_args!(
             "run: could not read all of {} - storage failed part way, so none of it was run", str_of(path)));
         return Err(ShellError::Unknown);
@@ -2421,7 +2509,7 @@ fn stream_minify(ctx: &ShellCtx, path: &[u8], dst: &mut [u8]) -> (usize, bool, b
         let n = match fs_read_at(ctx, path, raw_off, &mut dst[region..region + IO_CHUNK]) {
             Some(n) => n,
             // At offset 0 this is "not there" (or not readable at all), which the caller reports as
-            // not found. Past it, the file was there and the read failed (`backlog/80` H11).
+            // not found. Past it, the file was there and the read failed (`backlog/fixed/80` H11).
             None => { unread = raw_off > 0; 0 }
         };
         raw_off += n as u64;
@@ -2501,7 +2589,7 @@ fn resolve_one_import(ctx: &ShellCtx, stmt: &[u8], is_from: bool, script: &mut [
     let (liblen, lib_truncated, lib_unread) = stream_minify(ctx, &path[..plen], &mut script[libstart..]);
     if liblen == 0 { gs::io::println_fmt(ctx, format_args!("import: cannot load '{}'", str_of(&path[..plen]))); return; }
     // A library that did not load WHOLE is not imported: a function cut off at the end of the buffer,
-    // or past a failed read, would be imported broken. The truncation flag was ignored (`backlog/80` H11).
+    // or past a failed read, would be imported broken. The truncation flag was ignored (`backlog/fixed/80` H11).
     if lib_truncated || lib_unread {
         gs::io::println_fmt(ctx, format_args!("import: '{}' {} - not imported", str_of(&path[..plen]),
             if lib_unread { "could not be read whole (storage failed part way)" } else { "does not fit the script buffer whole" }));
@@ -3749,7 +3837,7 @@ fn fmt_stream_pass(ctx: &ShellCtx, path: &[u8], emit: &mut dyn FnMut(&[u8]) -> b
     let mut src_off = 0u64;
     loop {
         // A FAILED READ IS NOT THE END OF THE FILE. It was taken as one, so a storage error mid-file
-        // formatted the first part, and `fmt` then replaced the original with it (`backlog/80` H11).
+        // formatted the first part, and `fmt` then replaced the original with it (`backlog/fixed/80` H11).
         let got = fs_read_at(ctx, path, src_off, &mut work[hold..hold + FMT_RCHUNK]).ok_or(FmtErr::Read)?;
         src_off += got as u64;
         let avail = hold + got;
@@ -4072,7 +4160,7 @@ const PROGRESS_BAR_W: usize = 22;
 /// What a run counted, so a caller running SEVERAL scripts can report one total.
 ///
 /// `run_lines`'s counters used to be locals that printed themselves, which is right for a single
-/// script and wrong for `selfcheck`, whose nine parts are one suite. `run: ran N, failed M` is an
+/// script and wrong for `selfcheck`, whose parts are one suite. `run: ran N, failed M` is an
 /// interface - nineteen harness checks match `failed 0` against it - so it must be printed once, by
 /// whoever knows the run is over.
 #[derive(Default, Clone, Copy)]
@@ -4093,7 +4181,7 @@ struct Tally { ran: u32, failed: u32, skipped: u32, aborted: bool }
 ///
 /// `#[inline(never)]` because it holds the verdict array and drives `execute` in a loop, on a tight
 /// stack. The attribute had drifted onto `let_capture_form`, a doc comment and a function having been
-/// inserted between it and this one (`backlog/80` H7); it is back where it was written for.
+/// inserted between it and this one (`backlog/fixed/80` H7); it is back where it was written for.
 ///
 /// `quiet` suppresses the per-statement `> stmt` transcript and the end-of-run summary block - for
 /// a LIBRARY command (`health`), whose user asked for a dashboard, not a test report. Errors still
@@ -4622,7 +4710,7 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         }
         // APPENDED, never reshaped: the harness matches `run: ran N, failed M` exactly, and a tally
         // line is an interface. A part of a larger suite does not print it - its caller does, ONCE,
-        // after the last part, or nine parts would be nine suites as far as any reader is concerned.
+        // after the last part, or ten parts would be ten suites as far as any reader is concerned.
         if tally.is_none() {
             out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
         }
@@ -4802,6 +4890,7 @@ const SELFCHECK_PARTS: &[(&str, &str)] = &[
     ("data",     include_str!("../../../scripts/selfcheck/60-data.gsh")),
     ("cleanup",  include_str!("../../../scripts/selfcheck/70-cleanup.gsh")),
     ("network",  include_str!("../../../scripts/selfcheck/80-network.gsh")),
+    ("ask",      include_str!("../../../scripts/selfcheck/90-ask.gsh")),
 ];
 
 /// The whole suite's size, for the line `selfcheck` prints before it starts.
@@ -4823,7 +4912,6 @@ const fn selfcheck_bytes() -> usize {
 /// script - two nested interpreter frames would blow the bounded user stack, the shell pipe stack-overflow lesson, `docs/pipes.md`).
 const LIBRARY: &[(&str, &str)] = &[
     ("health",  include_str!("../../../scripts/lib/health.gsh")),
-    ("watch",   include_str!("../../../scripts/lib/watch.gsh")),
     ("size",    include_str!("../../../scripts/lib/size.gsh")),
     ("online",  include_str!("../../../scripts/lib/online.gsh")),
     ("busiest", include_str!("../../../scripts/lib/busiest.gsh")),
@@ -4832,7 +4920,7 @@ const LIBRARY: &[(&str, &str)] = &[
 // audit U6: baked scripts must stay under the u16 offset ceiling `prescan_fns` uses (64 KiB), or the
 // fn/summary offsets wrap silently and dispatch the wrong bodies. Fail the build, not at runtime.
 //
-// PER PART, which is the point of there being parts (`backlog/47`). The suite reached 65,139 bytes of
+// PER PART, which is the point of there being parts (`backlog/fixed/47`). The suite reached 65,139 bytes of
 // this ceiling as one file, with 397 to spare; nine parts put the largest at about a fifth of it. The
 // same u16 bound applies twice over - `prescan_fns` indexes `fn` definitions with it, and
 // `run_lines`' own `soff`/`fail_off`/`skip_off` index the same buffer - and splitting satisfies both,
@@ -4919,7 +5007,7 @@ fn selfcheck_tidy(ctx: &ShellCtx) {
 #[inline(never)]
 fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
-        gs::io::println(ctx, "selfcheck: not available inside a script (it runs one)");
+        gs::io::println(ctx, "selfcheck: not available inside a script, `repeat` or `assert` (it runs one)");
         return Err(ShellError::Unknown);
     }
     // `selfcheck [<part>] [save <path>]`. The part name is checked against the table rather than
@@ -5114,6 +5202,7 @@ const FOREIGN_HINTS: &[(&str, &str)] = &[
     ("uname", "about"),
     ("man",   "help"),
     ("which", "whatis"),
+    ("watch", "repeat"),    // names one reason to run a command again; this names what it does
     // Sound (utilities/57_audio.md).
     ("aplay", "audio play"),
     ("beep",  "audio tone"),
@@ -5130,9 +5219,9 @@ fn foreign_hint(cmd: &str) -> Option<&'static str> {
 /// Utilities that self-document (gates the `help`/`version` intercept in `execute`).
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
-    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "whatis", "status", "observe", "caps", "roster",
+    "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "repeat", "whatis", "status", "observe", "caps", "roster",
     "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "read", "write", "edit", "fcap",
-    // Seven that answered a command and not `<cmd> version` / `<cmd> help` (`backlog/80` H8):
+    // Seven that answered a command and not `<cmd> version` / `<cmd> help` (`backlog/fixed/80` H8):
     // `fmt help` read "help" as a path, and `whatis` called all seven unknown.
     "fmt", "tcp", "serve", "random", "gpio", "spawncap", "spawnwired",
     // `events` and `trace` were absent, so they alone among the utilities answered neither
@@ -5145,6 +5234,7 @@ const UTILS: &[&str] = &[
     "wifi",
     "audio",
     "hardware",
+    "ask",
     "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -5343,6 +5433,11 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "wait" => help_block(ctx, "wait", "do nothing for N seconds (q aborts)", &[
             ("wait <seconds>", "pause for N wall-clock seconds; q/Esc aborts with Err", "wait 2"),
         ], true),
+        "repeat" => help_block(ctx, "repeat", "run a command again and again (q stops it)", &[
+            ("repeat <command ...>", "run it, then again, until q", "repeat mem"),
+            ("repeat wait <seconds> <command ...>", "the same, with that pause between runs", "repeat wait 2 status"),
+            ("repeat count <n> [wait <seconds>] <command ...>", "n runs, then the count of runs and failures; Err if any failed", "repeat count 4 wait 20 kill xhci"),
+        ], true),
         "whatis" => help_block(ctx, "whatis", "what runs when a name is typed (kind + origin)", &[
             ("whatis <name>", "built-in / library script / pipe stage / service (live task+core)", "whatis dir"),
             // The one collision in the vocabulary: whatis's argument domain CONTAINS the words
@@ -5403,6 +5498,21 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio debug [view]", "the driver's own account: stats (bare), codec, stream, trace, registers", "audio debug codec"),
             ("audio system sounds on | off", "the short sounds the system makes on its own: an error, a refusal, a finished job, a USB plug", "audio system sounds off"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
+        ], true),
+        "ask" => help_block(ctx, "ask", "plain questions about this machine, answered from what its services know", &[
+            ("ask \"<question>\"", "the answer: a verdict, and what it rests on", "ask \"is my system healthy?\""),
+            ("ask \"what to say?\"", "what it can be asked, with suggestions from this machine as it is now", "ask \"what to say?\""),
+            ("ask \"what failed?\"", "restarts and failed restarts the supervisor recorded, and what is down now", "ask \"what failed?\""),
+            ("ask \"why did <service> <event>?\"", "a service by name, and one event: restart, fail, crash, stop", "ask \"why did fs restart?\""),
+            ("ask \"why did the wifi restart?\"", "the radio driver and the radio's own status", "ask \"why did the wifi restart?\""),
+            ("ask \"is the filesystem healthy?\"", "what fs reports; with no disk, where in the storage chain it stops", "ask \"is the filesystem healthy?\""),
+            ("ask \"is the network up?\"", "the address, the lease and the gateway - and what was not tested", "ask \"is the network up?\""),
+            ("ask \"what is <term>?\"", "a term from the glossary; a typo is read and said to be", "ask \"what is MISCIS?\""),
+            ("ask \"what is <service>?\"", "what a running or managed service is, in its own crate's words", "ask \"what is fs?\""),
+            ("ask \"what can <service> do?\"", "the authorities it holds and the services it can send to", "ask \"what can shell do?\""),
+            ("ask \"who can <do it>?\"", "the running tasks that hold one authority: reboot, kill, spawn, type, ...", "ask \"who can reboot?\""),
+            ("ask evidence \"<question>\"", "the same answer with every line labelled FACT, INFERENCE or UNKNOWN, and its source", "ask evidence \"is my system healthy?\""),
+            ("ask \"<question>\" | where label=verdict", "the answer is records: label, source, rule, text", "ask \"what failed?\" | where label=fact"),
         ], true),
         "hardware" => help_block(ctx, "hardware", "what this machine is, and what drives each part of it", &[
             ("hardware", "every section: cpu, memory, pci, soc, display, usb - only the ones this machine has", "hardware"),
@@ -5703,6 +5813,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi radio off hard", "cut the CHIP's power and stay powered down; `wifi radio on` brings it back cold (~20 s)", "wifi radio off hard"),
             ("wifi radio powercycle", "cut and restore the CHIP's power and restart the driver on it - the radio comes back from power-on and rejoins", "wifi radio powercycle"),
         ], false),
+        ("ask", "evidence") => help_block(ctx, "ask evidence", "the same answer, with every line labelled and its source named", &[
+            ("ask evidence \"<question>\"", "FACT: a source said it; INFERENCE: concluded by the named rule; UNKNOWN: nothing available establishes it", "ask evidence \"what failed?\""),
+        ], false),
         ("hardware", "cpu") => help_block(ctx, "hardware cpu", "the cores the kernel brought up", &[
             ("hardware cpu", "this section; on a machine without it, says so", "hardware cpu"),
             ("hardware cpu | where <col><op><val>", "a report is records: section, device, kind, driver, state, detail", "hardware cpu | count"),
@@ -5967,11 +6080,13 @@ static HELP: &[HelpRow] = &[
     Row("cores", "CPU core count"),
     Row("mem", "physical memory usage"),
     Row("hardware [section|device]", "this machine's devices and their drivers (records when piped)"),
+    Row("ask \"<question>\"", "plain questions about this machine: health, what failed, why a service restarted"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("random [n]", "words from the hardware random number generator"),
     Row("gpio <verb> <pin>", "drive a SoC GPIO pin (Pi 2 only)"),
-    Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - watch is built on it)"),
+    Row("wait <seconds>", "pause N seconds, q aborts (paces scripts - repeat is built on it)"),
+    Row("repeat [count N] [wait S] <command>", "run a command again and again, q stops it (repeat count 4 wait 20 kill xhci)"),
     Row("whatis <name>", "what a name is: built-in / library script / pipe stage / service"),
     Row("net", "network status: IP, gateway, ping"),
     Row("ping", "continuous ICMP echo (q quits): ping 8.8.8.8"),
@@ -6050,7 +6165,6 @@ static HELP: &[HelpRow] = &[
     Gap,
     Sec("Library (gsh scripts, baked in - type the name to run)"),
     Row("health", "one-shot health dashboard (cores, mem, uptime, net, drives)"),
-    Row("watch <command>", "re-run a command every 2s until q (watch mem)"),
     Row("size [path]", "total bytes of the files under a tree (size /docs)"),
     Row("online", "probe the network live: DNS + internet, ok/FAIL per layer"),
     Row("busiest [column]", "service table ranked by mem (or restarts / queue)"),
@@ -6083,7 +6197,7 @@ fn help_render_line(ctx: &ServiceContext, idx: usize) {
     help_render_line_of(ctx, HELP, "help", idx)
 }
 
-/// One line of `doc` as a PLAIN dump - a script, `run`, `assert` or `selfcheck` (no screen width).
+/// One line of `doc` as a PLAIN dump - a script, `run`, `assert`, `repeat` or `selfcheck` (no screen width).
 fn help_render_line_of(ctx: &ServiceContext, doc: &'static [HelpRow], title: &str, idx: usize) {
     let mut lb = LineBuf::new();
     help_line_text(doc, title, idx, help_term_width_at(doc, idx), &mut lb);
@@ -6484,7 +6598,7 @@ const _: () = assert!(SB_FETCH.is_power_of_two(),
 /// The WHOLE scrollback, held for the life of one viewing.
 ///
 /// **FETCHED ONCE WHEN THE VIEW OPENS, SO A KEYPRESS COSTS NO IPC AT ALL.** That is the property
-/// this arena exists to buy, and it is what finally ends `backlog/37` rather than mitigating it.
+/// this arena exists to buy, and it is what finally ends `backlog/fixed/37` rather than mitigating it.
 ///
 /// The console is both the service this reads FROM and the service it draws TO - one service, one
 /// 16-deep queue - so any request made mid-frame can queue behind painting this very utility just
@@ -6634,7 +6748,7 @@ fn cmd_scrollback(ctx: &ShellCtx, cwd: &Cwd, depth: u8, arg: &str) -> Result<(),
 /// of those made the console `paint_view` + `present` BEFORE it could reply - a full repaint of a
 /// 3840x2160 framebuffer, inside the caller's deadline, on the core the caller was blocked on. Hold
 /// PgUp and you issue one of those per key repeat; the shell then declared a console that was merely
-/// busy to be dead (`backlog/37`).
+/// busy to be dead (`backlog/fixed/37`).
 ///
 /// Here the console is only ever asked for BYTES, which is a bounded memcpy out of its ring, and this
 /// paints its own screen with ordinary output - a send, with no deadline on it. A keypress costs no
@@ -6797,7 +6911,7 @@ const SB_HDR: usize = 4;
 
 /// `help` - a browsable document (see `help_browser`), or a plain dump when nobody is watching.
 fn cmd_help(ctx: &ShellCtx, depth: u8, arg: &str) -> Result<(), ShellError> {
-    // NOBODY IS THERE TO PRESS A KEY. A script, `run`, `assert` or `selfcheck` is driving, and a
+    // NOBODY IS THERE TO PRESS A KEY. A script, `run`, `assert`, `repeat` or `selfcheck` is driving, and a
     // browser that waits for one does not degrade - it hangs the run. Same guard `paginate` carries,
     // and the reason paging belongs to things you ask for rather than things a command decides.
     if depth > 0 {
@@ -7182,7 +7296,7 @@ fn cmd_whatis(ctx: &ServiceContext, name: &str, out: &mut Out) -> Result<(), She
 /// The percentage is computed in hundredths (two decimals, integer math) so the
 /// microkernel's tiny footprint shows as e.g. 0.03% rather than rounding to 0%.
 fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
-    // Refused is said, never drawn as an empty machine (`backlog/80` K18).
+    // Refused is said, never drawn as an empty machine (`backlog/fixed/80` K18).
     let (Some(total), Some(free)) = (ctx.inspect_kernel_total_frames(), ctx.inspect_kernel_free_frames()) else {
         out.line(ctx, "mem: unknown - the kernel did not answer (this needs INTROSPECT)");
         return Err(ShellError::Unknown);
@@ -7216,7 +7330,7 @@ fn cmd_reboot(ctx: &ShellCtx) -> ! {
 
 /// A core count as a person reads it: the number, or `unknown` for the 0 that
 /// `inspect_core_count` returns when the kernel did not answer. 0 is never a machine's core count,
-/// and it used to be 1, which is (`backlog/80` H20).
+/// and it used to be 1, which is (`backlog/fixed/80` H20).
 struct CoreCount(u32);
 impl core::fmt::Display for CoreCount {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -7252,7 +7366,7 @@ fn cmd_cores(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
             return Ok(());
         }
         "ticks" => {}
-        // A word it does not know is refused, not read as "no word" (`backlog/80` H20 - `cores junk`
+        // A word it does not know is refused, not read as "no word" (`backlog/fixed/80` H20 - `cores junk`
         // printed the count).
         other => {
             gs::io::println_fmt(ctx, format_args!("cores: no view '{}' - the views are: cores, cores ticks", other));
@@ -7276,7 +7390,7 @@ fn cmd_cores(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     out.line_fmt(ctx, format_args!("sampling {}s (RTC-paced)...  [q] quit", SAMPLE_SECS));
     while gs::task::epoch_secs_monotonic(ctx) - t0 < SAMPLE_SECS {
-        // q quits the 5 s wait (conventions rule 10; `backlog/80` H21 - it had no way out).
+        // q quits the 5 s wait (conventions rule 10; `backlog/fixed/80` H21 - it had no way out).
         if let Some(b) = ctx.try_console_read() {
             if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
                 gs::io::println(ctx, "cores ticks: stopped - no rate measured");
@@ -7545,7 +7659,7 @@ fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
     f.n = 0;
     f.cores = ctx.inspect_core_count();
     // 0 frames is impossible on a running machine, so a refusal (no INTROSPECT) is recorded as 0 and
-    // every view of it prints "unknown" (`backlog/80` K18).
+    // every view of it prints "unknown" (`backlog/fixed/80` K18).
     f.total_frames = ctx.inspect_kernel_total_frames().unwrap_or(0);
     f.free_frames = ctx.inspect_kernel_free_frames().unwrap_or(0);
 
@@ -8892,7 +9006,7 @@ fn clock_floor_seed(ctx: &ShellCtx) {
         if let Some(v) = parse_u32(s.trim()) {
             if !time_floor_set(ctx, v as i64) {
                 // `time` keeps the higher floor and never refuses one, so false means it did not
-                // answer (`backlog/80` H12 - this said "refused").
+                // answer (`backlog/fixed/80` H12 - this said "refused").
                 gs::io::println(ctx, "shell: the time service did not answer with the recorded clock floor - not seeded");
             }
         }
@@ -8931,7 +9045,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         const SYNC_POLL_MS: u64 = 250;
         match time_rpc(ctx, &[5]) {                  // OP_SYNC -> [1] query on its way, [0] could not send
             Some(r) if r.payload_bytes().first() == Some(&1) => {}
-            // Every way the sync did not happen is an Err - all of them returned Ok (`backlog/80` H10).
+            // Every way the sync did not happen is an Err - all of them returned Ok (`backlog/fixed/80` H10).
             Some(_) => {
                 out.line_fmt(ctx, format_args!("date sync: the clock service could not send the query (is net-stack running?)"));
                 return Err(ShellError::Unknown);
@@ -8943,6 +9057,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         }
         let t0 = gs::task::epoch_secs_monotonic(ctx);
         let mut synced = false;
+        let mut sync_noticed = false;
         loop {
             let waited = gs::task::epoch_secs_monotonic(ctx) - t0;
             // Synced SINCE WE ASKED: an age no older than the wait so far. An older sync is not this one.
@@ -8951,12 +9066,20 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
                 break;
             }
             if waited >= SYNC_WAIT_SECS { break; }
-            if let Some(b) = ctx.try_console_read() {
+            // Say it once the wait lingers (rule 10): `q` was always taken here, and never offered.
+            if !sync_noticed && waited >= gs::call::NOTICE_AFTER_SECS {
+                sync_noticed = true;
+                gs::io::println(ctx, "  [q] quit");
+            }
+            // The console itself, not the type-ahead: a key that is not `q` is KEPT for the prompt, and
+            // reading the buffer it goes into would hand it straight back.
+            if let Some(b) = ctx.inner.try_console_read() {
                 // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
                 if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
                     out.line_fmt(ctx, format_args!("date sync: aborted (the clock service may still finish the sync)"));
                     return Err(ShellError::Unknown);
                 }
+                ctx.keep_key(b);
             }
             gs::task::sleep_ms(ctx, SYNC_POLL_MS);
         }
@@ -8971,7 +9094,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     let dt = Datetime::from_epoch_secs(time_now(ctx).unwrap_or(0));
     let source = time_source(ctx);
     if arg == "epoch" && source == ClockSource::Unset {
-        // No number to give. It printed `0`, a pipeable value that reads as 1970 (`backlog/80` H20).
+        // No number to give. It printed `0`, a pipeable value that reads as 1970 (`backlog/fixed/80` H20).
         gs::io::println(ctx, "date: the clock is not set - there is no epoch to give (`date` says why)");
         return Err(ShellError::Unknown);
     }
@@ -9079,7 +9202,7 @@ fn ping_wait_or_quit(ctx: &ShellCtx) -> bool {
 const WAIT_MAX_SECS: u32 = 3600;
 
 /// `wait <seconds>` - do nothing for N wall-clock seconds; `q`/`Q`/`Esc` aborts (returns `Err`, so a
-/// script can `if !wait 2 { break }`). The pacing primitive the library's `watch` loop is built on
+/// script can `if !wait 2 { break }`). The pacing primitive `repeat` is built on
 /// (generalising `ping_wait_or_quit` above): RTC-monotonic seconds, never the TSC (miscalibrated for
 /// wall-time on the T630). This is a USER-COMMANDED delay - the user (or their script) chose the
 /// cadence and holds the q escape - not a service coordinating with a peer, so Commandment VIII
@@ -9093,19 +9216,118 @@ fn cmd_wait(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         None => { gs::io::println(ctx, "usage: wait <seconds>   (q aborts)   e.g. wait 2"); return Err(ShellError::Unknown); }
     };
+    if pause_quittable(ctx, secs) { Ok(()) } else { Err(ShellError::Unknown) } // Err: aborted
+}
+
+/// One look at the console for `q`, `Q` or Esc; any other key is KEPT for the prompt rather than dropped,
+/// so a command typed ahead during `wait` or between `repeat`'s runs is still there afterwards
+/// (`backlog/84` S3). It reads the console itself, not the type-ahead buffer: a key it kept would
+/// otherwise be the next thing it read, on every look.
+fn quit_key_or_keep(ctx: &ShellCtx) -> bool {
+    match ctx.inner.try_console_read() {
+        Some(b'q') | Some(b'Q') | Some(0x1b) => true,
+        Some(b) => { ctx.keep_key(b); false }
+        None => false,
+    }
+}
+
+/// The pause `wait` and `repeat` make: `secs` seconds, `false` the moment `q`/`Q`/Esc is pressed.
+fn pause_quittable(ctx: &ShellCtx, secs: i64) -> bool {
     // Whole-second granularity: waits until the monotonic epoch has advanced by `secs` (so `wait 1`
     // ends at the next second boundary - up to a second early, never late).
     let start = gs::task::epoch_secs_monotonic(ctx);
     loop {
-        if let Some(b) = ctx.try_console_read() {
-            if b == b'q' || b == b'Q' || b == 0x1b { return Err(ShellError::Unknown); } // aborted
-        }
-        if gs::task::epoch_secs_monotonic(ctx) - start >= secs { return Ok(()); }
-        // SLEEP, not yield: a yield loop kept this core busy for the whole wait (`backlog/80` H21).
+        if quit_key_or_keep(ctx) { return false; }
+        if gs::task::epoch_secs_monotonic(ctx) - start >= secs { return true; }
+        // SLEEP, not yield: a yield loop kept this core busy for the whole wait (`backlog/fixed/80` H21).
         // 50 ms is short enough that `q` still answers at once.
         gs::task::sleep_ms(ctx, 50);
     }
 }
+
+/// `repeat [count N] [wait S] <command ...>` - run a command again and again (`utilities/61_repeat.md`).
+///
+/// `count N` bounds the runs (1..=`REPEAT_MAX`); without it the runs go on until `q`. `wait S` puts S
+/// seconds between runs (the `wait` utility's bounds and its `q`). Each run is announced, and the end says
+/// how many ran and how many failed - a failure in the middle of a long run is a count, not a line that
+/// scrolled away - and is an Err when any did, so a script can branch on it. `q` between runs stops it;
+/// a command that waits has its own `q` (rule 10).
+///
+/// Built in rather than a library script, unlike the `watch` it replaced: a script cannot tell a number
+/// from a word, and a library script cannot be run from another script, so it could neither read its own
+/// count nor serve a script. The name says what it does; `watch` names one reason to use it, and the shell
+/// answers that reflex with this word (`FOREIGN_HINTS`).
+fn cmd_repeat(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8, out: &mut Out) -> Result<(), ShellError> {
+    let usage = "usage: repeat [count N] [wait S] <command ...>   e.g. repeat count 4 wait 20 kill xhci   (q stops it)";
+    let mut count: Option<u32> = None;
+    let mut wait: u32 = 0;
+    let mut cmd = rest;
+    loop {
+        let (word, after) = split_first(cmd);
+        match word {
+            "count" => {
+                let (n, after) = split_first(after);
+                match parse_u32(n) {
+                    Some(v) if (1..=REPEAT_MAX).contains(&v) => { count = Some(v); cmd = after; }
+                    _ => {
+                        gs::io::println_fmt(ctx, format_args!("repeat: count is a number of runs, 1..{}", REPEAT_MAX));
+                        return Err(ShellError::Unknown);
+                    }
+                }
+            }
+            "wait" => {
+                let (n, after) = split_first(after);
+                match parse_u32(n) {
+                    Some(v) if (1..=WAIT_MAX_SECS).contains(&v) => { wait = v; cmd = after; }
+                    _ => {
+                        gs::io::println_fmt(ctx, format_args!("repeat: wait is seconds between runs, 1..{}", WAIT_MAX_SECS));
+                        return Err(ShellError::Unknown);
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        gs::io::println(ctx, usage);
+        return Err(ShellError::Unknown);
+    }
+    if split_first(cmd).0 == "repeat" {
+        gs::io::println(ctx, "repeat: a repeat of a repeat is refused - say the whole count in one: repeat count N <command>");
+        return Err(ShellError::Unknown);
+    }
+    let (mut ran, mut failed) = (0u32, 0u32);
+    let mut stopped = false;
+    loop {
+        ran += 1;
+        match count {
+            Some(n) => out.line_fmt(ctx, format_args!("repeat {} of {}: {}   [q] quit", ran, n, cmd)),
+            None => out.line_fmt(ctx, format_args!("repeat {}: {}   [q] quit", ran, cmd)),
+        }
+        // Into the caller's output, so a function capture, `$(f)`, holds the runs and the verdict as it
+        // would any other command's (`backlog/84` S2). Refusals above still go to the console.
+        if execute(ctx, cmd.as_bytes(), cwd, Ok(()), depth + 1, out).is_err() {
+            failed += 1;
+        }
+        if count.is_some_and(|n| ran >= n) { break; }
+        // Between runs: `q` stops it. With a wait, for that long (the `wait` utility, so the same bound
+        // and the same keys); without one, a look at the keys and on to the next run.
+        let quit = if wait > 0 {
+            !pause_quittable(ctx, wait as i64)
+        } else {
+            quit_key_or_keep(ctx)
+        };
+        if quit { stopped = true; break; }
+    }
+    out.line_fmt(ctx, format_args!("repeat: {} run(s), {} failed{}", ran, failed,
+        if stopped { " - stopped by q" } else { "" }));
+    if failed > 0 { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+/// The most runs `repeat count` takes. A bound, as every count in the shell has one (26.6); a longer
+/// run is `repeat` with no count, ended by `q`.
+const REPEAT_MAX: u32 = 10_000;
 
 /// `ping [bytes N] [count N] <ip>` - a Windows-style continuous ICMP echo to a raw IPv4, via net-stack.
 /// One `Reply from ...` line per echo (round-trip time + TTL), `q` quits, then a statistics summary.
@@ -9118,7 +9340,7 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     let mut toks = arg.split_whitespace();
     while let Some(t) = toks.next() {
         match t {
-            // ONE word each (rule 3): `size` and `n` were hidden synonyms (`backlog/80` H21). A usage
+            // ONE word each (rule 3): `size` and `n` were hidden synonyms (`backlog/fixed/80` H21). A usage
             // error and a bad address are refusals, so an Err - they returned Ok (H10).
             "bytes" => match toks.next().and_then(|s| s.parse::<usize>().ok()) {
                 Some(v) => bytes = v,
@@ -9168,7 +9390,7 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
                     recv += 1;
                     // us under a millisecond (LAN), ms.d above it (WAN). 0 = below the clock's resolution.
                     // net-stack carries the round trip as u16 microseconds, saturating at 65535, so
-                    // that value means "65 ms or more" - it was printed as exactly 66 ms (`backlog/80`
+                    // that value means "65 ms or more" - it was printed as exactly 66 ms (`backlog/fixed/80`
                     // H17). Widening the field is net-stack's change; saying what this one means is ours.
                     if rtt == u16::MAX {
                         out.line_fmt(ctx, format_args!("Reply from {}.{}.{}.{}: bytes={} time>=65ms TTL={}", ip[0], ip[1], ip[2], ip[3], b, ttl));
@@ -9247,7 +9469,7 @@ fn net_stats_dump(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     let req = Message::from_bytes(&[5u8]);
     let reply = match net_query(ctx, "nic-driver", &req, 3, None) {
         NetQ::Reply(r) => r,
-        // Neither is a dump, so neither is a success (`backlog/80` H10).
+        // Neither is a dump, so neither is a success (`backlog/fixed/80` H10).
         NetQ::Aborted => { gs::io::println(ctx, "net: aborted"); return Err(ShellError::Unknown); }
         NetQ::Timeout => { gs::io::println(ctx, "net: nic-driver did not answer the register dump"); return Err(ShellError::Unknown); }
     };
@@ -9364,7 +9586,7 @@ mod audio_wire {
 ///
 /// Every audio answer is IMMEDIATE by design (`sdk/audio`'s `wire`): a tone is started and answered, then
 /// followed with status. So the radio's machinery for answers it is owed does not apply - but the TAG does,
-/// for the reason it exists (backlog/70): a receive takes what is next, and an answer to a request this
+/// for the reason it exists (backlog/fixed/70): a receive takes what is next, and an answer to a request this
 /// shell gave up on must never be read as the answer to the next one. The wait takes only the reply
 /// carrying this request's tag; a late audio answer is passed over, and anything else that arrives is
 /// dropped with any capability it carries released, as `wifi_sift` does.
@@ -9390,13 +9612,15 @@ fn audio_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // A send that fails at once is a stale capability (the driver restarted since this shell wired it),
     // never a deadline: reacquire by name and send ONCE. A real timeout is never re-sent.
     let driver = audio_driver(ctx)?;
-    let s0 = gs::driver::wait::Since::now(ctx);
-    let mut got = ctx.request_with_reply_ms_sifted(driver, &msg, max_ms, sift);
-    if got.is_none() && !s0.passed(ctx, gs::driver::wait::Budget::ms(250)) {
+    // With the `[q] quit` notice once it lingers (`ask_sifted_quittable`).
+    ctx.quit.set(false);
+    let noticed = core::cell::Cell::new(false);
+    let (mut got, left) = ask_sifted_quittable(ctx, driver, &msg, max_ms, &noticed, sift);
+    if got.is_none() && !left && !ctx.quit.get() {
         if !gs::cap::reacquire(ctx, driver) {
             return None;
         }
-        got = ctx.request_with_reply_ms_sifted(driver, &msg, max_ms, sift);
+        got = ask_sifted_quittable(ctx, driver, &msg, max_ms, &noticed, sift).0;
     }
     got.map(|r| Message::from_bytes(r.payload_bytes().get(2..).unwrap_or(&[])))
 }
@@ -9507,7 +9731,11 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
 fn audio_reply(ctx: &ShellCtx, out: &mut Out, r: Option<Message>, len: usize) -> Result<Message, ShellError> {
     use audio_wire::*;
     let Some(r) = r else {
-        out.line_fmt(ctx, format_args!("audio: the audio driver is not answering"));
+        if ctx.quit.get() {
+            out.line_fmt(ctx, format_args!("audio: stopped by q - the driver may still act on it; `audio status` shows what it did"));
+        } else {
+            out.line_fmt(ctx, format_args!("audio: the audio driver is not answering"));
+        }
         return Err(ShellError::Unknown);
     };
     let p = r.payload_bytes();
@@ -10590,7 +10818,7 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // asks one thing at a time and reads keys from the kernel ring, so anything queued before a request
     // is stale by construction (`wifi_drain_stale`).
     //
-    // AND EVERY ANSWER IS RECOGNISED BY ITS TAG (backlog/70). The drain could not clear an answer still in
+    // AND EVERY ANSWER IS RECOGNISED BY ITS TAG (backlog/fixed/70). The drain could not clear an answer still in
     // flight, so the shell COUNTED what it was owed and skipped that many - and counted them by watching
     // its reply mailbox, which takes every peer's replies: a late `time` or `fs` answer cancelled an owed
     // radio answer, and the next request read the old one (reproduced in QEMU, 2026-10-02). The tag is a
@@ -10599,6 +10827,9 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // by `wifi_sift`, which is now exact. The wait is the sifted one on the main endpoint, not the Call:
     // a Call can only take the oldest reply FROM the driver, which is the very thing that is wrong.
     ctx.wifi_unsent.set(0);
+    ctx.quit.set(false);
+    // One `[q] quit` for the whole ask: the wait for owed answers and the request share it.
+    let noticed = core::cell::Cell::new(false);
     let (late, other) = wifi_drain_stale(ctx);
     if late + other > 0 {
         ctx.log_fmt(format_args!(
@@ -10619,7 +10850,10 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
             "shell: {} radio answer(s) owed for over {} s never came - forgotten; asking afresh", owed, OWED_MAX_SECS));
         ctx.wifi_owed.set(0);
     }
-    if ctx.wifi_owed.get() > 0 && !wifi_await_owed(ctx, max_ms) {
+    if ctx.wifi_owed.get() > 0 && !wifi_await_owed(ctx, max_ms, &noticed) {
+        if ctx.quit.get() {
+            return None;   // `q`: nothing was sent, and the caller says the operator stopped it
+        }
         // NOTHING WAS SENT, and the caller must not say the driver failed to answer it: the request never
         // left. `wifi_not_answering` reads this and says what happened.
         ctx.wifi_unsent.set(ctx.wifi_owed.get());
@@ -10631,14 +10865,12 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     let t0 = gs::driver::wait::Since::now(ctx);
     // One attempt: the answer, and whether the request LEFT. A `None` that comes back at once is a send
     // that failed (no send slot, or a dead driver), never a deadline.
-    let attempt = || {
-        let s0 = gs::driver::wait::Since::now(ctx);
-        let got = ctx.request_with_reply_ms_sifted(ctx.wifi_radio.get(), &msg, max_ms, |m| wifi_sift(ctx, m, Some(tag)));
-        let left = got.is_some() || s0.passed(ctx, gs::driver::wait::Budget::ms(250));
-        (got, left)
-    };
+    // With the `[q] quit` notice once it lingers (`ask_sifted_quittable`); `q` returns nothing, and the
+    // request is owed like any other that left and was not answered.
+    let attempt = || ask_sifted_quittable(ctx, ctx.wifi_radio.get(), &msg, max_ms, &noticed,
+                                          |m| wifi_sift(ctx, m, Some(tag)));
     let (mut got, mut left) = attempt();
-    if !left {
+    if !left && !ctx.quit.get() {
         // Reacquire and send ONCE - nothing is in flight to a live driver, so this is a first request, not
         // a repeat. A respawned driver owes nothing: its dead predecessor's answers will never come.
         ctx.wifi_owed.set(0);
@@ -10662,7 +10894,7 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
         Some(_) if took_ms >= 1000 => {
             ctx.log_fmt(format_args!("shell: the radio driver answered op {:#04x} after {} ms", req.first().copied().unwrap_or(0), took_ms));
         }
-        None if left => {
+        None if left && !ctx.quit.get() => {
             ctx.log_fmt(format_args!(
                 "shell: the radio driver did not answer op {:#04x} within {} s - its answer is owed ({} owed)",
                 req.first().copied().unwrap_or(0), secs, ctx.wifi_owed.get()));
@@ -10670,6 +10902,28 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
         _ => {}
     }
     got
+}
+
+/// A tagged, sifted request that says `[q] quit` once it lingers past `gs::call::NOTICE_AFTER_SECS` and
+/// ends on `q`, keeping every other key for the prompt (utilities/0_conventions.md rule 10). The radio's
+/// and the audio driver's asks wait here. `noticed` is shared by the waits of one ask, so the notice is
+/// said once; once it is up, a later wait reads keys from its start. Returns the reply, and whether the
+/// request LEFT: a timeout that comes back inside 250 ms is a send that failed, never a deadline.
+/// Sets `ctx.quit` on `q`. The bound is whole seconds, rounded up (`max_ms` 1500 waits 2 s).
+fn ask_sifted_quittable(ctx: &ShellCtx, peer: &str, msg: &Message, max_ms: u64,
+                        noticed: &core::cell::Cell<bool>, mine: impl FnMut(&Message) -> bool) -> (Option<Message>, bool) {
+    let secs = ((max_ms + 999) / 1000).max(1) as i64;
+    let hint = if noticed.get() { 0 } else { gs::call::NOTICE_AFTER_SECS };
+    let s0 = gs::driver::wait::Since::now(ctx);
+    let out = ctx.inner.request_with_reply_keyhint_sifted_keeping(peer, msg, hint, secs,
+        ServiceContext::QUIT_KEYS,
+        || { if !noticed.get() { noticed.set(true); gs::io::println(ctx, "  [q] quit"); } },
+        mine, &|b| ctx.keep_key(b));
+    match out {
+        ReqOutcome::Reply(r) => (Some(r), true),
+        ReqOutcome::Aborted => { ctx.quit.set(true); (None, true) }
+        ReqOutcome::Timeout => (None, s0.passed(ctx, gs::driver::wait::Budget::ms(250))),
+    }
 }
 
 /// The radio request correlation tag. Its own counter in `ShellCtx`, for the reason `fs_tag` and `net_tag`
@@ -10732,13 +10986,26 @@ fn wifi_owe(ctx: &ShellCtx) {
 }
 
 /// Wait up to `max_ms` for the driver's owed answers to arrive, discarding them (`wifi_sift`). `true` when
-/// nothing is owed any more.
-fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64) -> bool {
+/// nothing is owed any more. Says `[q] quit` once it lingers past `gs::call::NOTICE_AFTER_SECS` (shared
+/// `noticed`, so once per ask) and ends on `q`, setting `ctx.quit`; until the notice no key is read, so
+/// typing ahead is not taken for an answer.
+fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64, noticed: &core::cell::Cell<bool>) -> bool {
     let t0 = gs::driver::wait::Since::now(ctx);
     let limit = gs::driver::wait::Budget::ms(max_ms);
+    let notice_at = gs::driver::wait::Budget::ms(gs::call::NOTICE_AFTER_SECS as u64 * 1000);
     while ctx.wifi_owed.get() > 0 && !t0.passed(ctx, limit) {
         if let Some(m) = gs::ipc::recv_within_ms(ctx, 20) {
             wifi_sift(ctx, &m, None);
+        }
+        if !noticed.get() && t0.passed(ctx, notice_at) {
+            noticed.set(true);
+            gs::io::println(ctx, "  [q] quit");
+        }
+        if noticed.get() {
+            while let Some(b) = ctx.inner.try_console_read() {
+                if ServiceContext::QUIT_KEYS.contains(&b) { ctx.quit.set(true); return false; }
+                ctx.keep_key(b);
+            }
         }
     }
     ctx.wifi_owed.get() == 0
@@ -10799,7 +11066,7 @@ fn wifi_no_answer(ctx: &ShellCtx, out: &mut Out, outcome: &ReqOutcome, doing: &s
 /// its endpoint, and a late `net-stack` reply is discarded by its own tag check either way.
 ///
 /// Returns `(late, other)`: late radio answers - recognised by their tag, and counted off `wifi_owed` by
-/// `wifi_sift` - and everything else. Until the tag (backlog/70) the count was set against every reply in
+/// `wifi_sift` - and everything else. Until the tag (backlog/fixed/70) the count was set against every reply in
 /// the mailbox, which takes EVERY peer's replies: in QEMU a stray `[1, 4]` from another service cancelled
 /// an owed radio answer, the next `wifi status` was sent behind it, and it read the first one's answer.
 fn wifi_drain_stale(ctx: &ShellCtx) -> (u32, u32) {
@@ -10920,6 +11187,11 @@ fn wifi_not_answering(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // Unless the request was never SENT: the driver still owed this shell answers to earlier requests, and
     // asking again behind them is how a late answer gets read as a new one (`wifi_ask`). "Not answering"
     // was the wrong sentence for that - the driver had not been asked.
+    if ctx.quit.get() {
+        out.line_fmt(ctx, format_args!(
+            "wifi: stopped by q - the radio driver may still answer, and `wifi status` will show what it did"));
+        return Err(ShellError::Unknown);
+    }
     let owed = ctx.wifi_unsent.get();
     if owed > 0 {
         out.line_fmt(ctx, format_args!(
@@ -11332,7 +11604,15 @@ fn wifi_hardware_rows(ctx: &ShellCtx) -> [Option<WifiHw>; 2] {
                 None => "not answering",
             };
         }
+        // `q` in either ask ends the command, not just that ask: what is known so far is shown.
+        let quit = ctx.quit.get();
+        if quit {
+            row.state = "stopped (q)";
+        }
         rows[i] = Some(row);
+        if quit {
+            break;
+        }
     }
     ctx.wifi_radio.set(RADIOS[0]);
     rows
@@ -11859,7 +12139,7 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
             }
             if sub == "" || sub == "transport" {
                 // The bus is the radio's: a USB dongle's driver is `wifi-usb`, the onboard radios are
-                // on SDIO. The SDIO function layout this printed is one chip's (`backlog/80` H13).
+                // on SDIO. The SDIO function layout this printed is one chip's (`backlog/fixed/80` H13).
                 out.line_fmt(ctx, format_args!("{}", if ctx.wifi_radio.get() == "wifi-usb" { "usb" } else { "sdio" }));
                 out.line_fmt(ctx, format_args!("  tx_bytes  {}", word(p, 10)));
                 out.line_fmt(ctx, format_args!("  rx_bytes  {}", word(p, 11)));
@@ -11910,7 +12190,7 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
             let cap = &p[132..132 + clen];
             let mac = &p[644..650];
             // THE RADIO THAT ANSWERED, not one chip. This printed the Pi 4's CYW43455 over SDIO for
-            // every radio, the VisionFive's AIC8800 and a USB dongle included (`backlog/80` H13). The
+            // every radio, the VisionFive's AIC8800 and a USB dongle included (`backlog/fixed/80` H13). The
             // chip, its image and its provenance are the driver's docs (docs/wifi*.md, nonfree/).
             out.line_fmt(ctx, format_args!("driver      {}", ctx.wifi_radio.get()));
             if vlen == 0 {
@@ -13120,7 +13400,7 @@ fn parse_duration(a: &str) -> Option<i64> {
         if n > 365 * 86_400 { return None; }          // bounds the digits before the multiply can overflow
     }
     // A year is a typo, not a plan - checked on the SECONDS, after the unit. It was checked on the
-    // number alone, so `400d` (34,560,000 s) passed while `400` days is over a year (`backlog/80` H21).
+    // number alone, so `400d` (34,560,000 s) passed while `400` days is over a year (`backlog/fixed/80` H21).
     let secs = n.checked_mul(mult)?;
     if secs > 365 * 86_400 { return None; }
     Some(secs)
@@ -13601,7 +13881,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// (search hits), `observe now`, `uptime`, `jobs` and the record views of `events` and `trace` are
 /// built in the shell, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs")
+    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs" | "ask")
 }
 
 /// `dir` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -13696,28 +13976,12 @@ fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
     // and what it is observed to HOLD read the same and can be compared directly.
     //
     // Ids 1-18 are the kernel's fixed set (`capability::*_RESOURCE`); anything above is a real
-    // endpoint, and only those reach the fallback. Adding a resource without adding it here puts it
-    // straight back into the lie, so keep the two in step.
-    match id {
-        1  => write_bytes(buf, &mut p, b"log_write"),
-        2  => write_bytes(buf, &mut p, b"spawn"),
-        3  => write_bytes(buf, &mut p, b"console_read"),
-        4  => write_bytes(buf, &mut p, b"console_push"),
-        5  => write_bytes(buf, &mut p, b"introspect"),
-        6  => write_bytes(buf, &mut p, b"service_control"),
-        7  => write_bytes(buf, &mut p, b"resource_mint"),
-        8  => write_bytes(buf, &mut p, b"reboot"),
-        9  => write_bytes(buf, &mut p, b"acquire_any"),
-        10 => write_bytes(buf, &mut p, b"net_device"),
-        11 => write_bytes(buf, &mut p, b"gpio_device"),
-        12 => write_bytes(buf, &mut p, b"usb_disk"),
-        13 => write_bytes(buf, &mut p, b"set_clock"),
-        14 => write_bytes(buf, &mut p, b"fire_irq"),
-        15 => write_bytes(buf, &mut p, b"image_spawn"),
-        16 => write_bytes(buf, &mut p, b"pci_cfg"),
-        17 => write_bytes(buf, &mut p, b"device_power"),
-        18 => write_bytes(buf, &mut p, b"cpu_clock"),
-        other => { write_bytes(buf, &mut p, b"endpoint#"); write_u32(buf, &mut p, other as u32); }
+    // endpoint, and only those reach the fallback. Adding a resource without adding it to
+    // `AUTHORITIES` puts it straight back into the lie, so keep the two in step.
+    // The names are `gs::task::AUTHORITIES`, the one table `ask "who can reboot?"` reads too.
+    match gs::task::AUTHORITIES.iter().find(|(r, _, _)| *r == id) {
+        Some((_, name, _)) => write_bytes(buf, &mut p, name.as_bytes()),
+        None => { write_bytes(buf, &mut p, b"endpoint#"); write_u32(buf, &mut p, id as u32); }
     }
     p
 }
@@ -13773,7 +14037,7 @@ fn build_drives_table(ctx: &ShellCtx) -> Option<Table> {
     // needs no extra peer and no second query, so it holds even when the direct block-driver query
     // cannot be reached (which is exactly what happened on the Pi 4).
     // A zero capacity means NO DRIVE, so the table has NO ROW: `drives | count` answers 0 rather
-    // than counting a `raw 0 MiB` drive that is not there (`backlog/80` H5). A table needs no
+    // than counting a `raw 0 MiB` drive that is not there (`backlog/fixed/80` H5). A table needs no
     // one-line message to say "none" - an empty one is the answer.
     let mut t = Table::new(&["index", "label", "status", "size_mib", "free_mib"]);
     if u64_le(&p[2..10]) == 0 {
@@ -13946,6 +14210,12 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             "observe" => match build_observe_table(ctx, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "uptime"  => build_uptime_table(ctx),
             "jobs"    => build_jobs_table(ctx),
+            // `ask "<q>" | where label=verdict`: the answer's lines as records; `evidence` is a way of
+            // SHOWING an answer, so in a pipe it is the same table.
+            "ask"     => {
+                let q = match split_first(arg) { ("evidence", rest) if !rest.is_empty() => rest, _ => arg };
+                match build_ask_table(ctx, q) { Some(t) => t, None => return Err(ShellError::Unknown) }
+            }
             "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
             "audio" if arg.trim() == "hardware" => build_audio_hardware_table(ctx),
             "audio" => match build_audio_outputs_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -14090,7 +14360,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
 /// TWO CONDITIONS MUST BOTH HOLD before a key is ever waited for, and between them they are the
 /// reason this is safe where a built-in pager was not:
 ///
-///  - **`depth == 0`** - not inside a script, `run`, `assert` or `selfcheck`. A pager with nobody at
+///  - **`depth == 0`** - not inside a script, `run`, `assert`, `repeat` or `selfcheck`. A pager with nobody at
 ///    the keyboard does not degrade, it HANGS, and it hangs a run that may have been started
 ///    precisely because no one was going to watch it.
 ///  - **the output is the console** - not `$( )` capture, not `save <path>`, not a function-body
@@ -14303,7 +14573,7 @@ fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) 
                 if sc < 2 { gs::io::println_fmt(ctx, format_args!("usage: … | {} <col>", cmd)); return false; }
                 let op = match cmd { "sum" => AggOp::Sum, "min" => AggOp::Min, "max" => AggOp::Max, _ => AggOp::Avg };
                 // NO ROWS HAS NO MINIMUM, MAXIMUM OR AVERAGE. They answered 0, which reads as a real
-                // value (`backlog/80` H20). The sum of no rows IS 0, so `sum` keeps its answer.
+                // value (`backlog/fixed/80` H20). The sum of no rows IS 0, so `sum` keeps its answer.
                 if t.nrows() == 0 && cmd != "sum" {
                     gs::io::println_fmt(ctx, format_args!("{}: no rows - there is no {} of nothing", cmd,
                         match cmd { "min" => "minimum", "max" => "maximum", _ => "average" }));
@@ -14366,6 +14636,153 @@ fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
             Err(ShellError::Unknown)
         }
     }
+}
+
+/// How long `ask` may take to send its answer. It asks up to five sources, each bounded (3 s, and 8 s
+/// for `fs` - `services/ask`), so a machine where every one is silent still answers inside this, with
+/// every source named as a hole, rather than this shell giving up first.
+const ASK_WAIT_SECS: i64 = 25;
+/// The services `ask` is wired to are the supervisor's row for it (`board::ASK_PEERS`): NONE are passed
+/// from here. A peer named at the moment of starting would be a grant no pin covers - Commandment VII pins
+/// the row - so the board's list, chosen where the board is known, is the only one.
+const ASK_PEERS: &[&str] = &[];
+
+/// `ask "<question>"` / `ask evidence "<question>"` as a record table, one row per line of the answer
+/// (`label`, `source`, `rule`, `text`) and a last row of label `status`. `ask` is a FOREGROUND PROGRAM
+/// FOR ONE QUESTION (`docs/ask-design.md` 1): started here, handed the question, read back, and ended
+/// by `drain_service_with` before this returns, so nothing of it is left running.
+#[inline(never)]
+fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
+    let q = question.trim();
+    // THE QUESTION IS ALWAYS QUOTED (`utilities/60_ask.md` 1). Outside the quotes is a mode word
+    // (`evidence`), inside is the question: a question that begins with a mode's word cannot be
+    // misread as one, a later mode needs no new rule, and the characters the shell gives a meaning -
+    // `|`, `'` - are plain text inside. Refused with the line to type, not guessed at.
+    //
+    // CURLY QUOTES COUNT. A phone or a word processor types the curly pair where a keyboard types `"`,
+    // and a question pasted from one was refused as unquoted (operator, 2026-10-11). At the prompt they
+    // never reach here: the input loop turns a curly quote into `"` as it is typed (`Utf8In`), so there
+    // they quote everywhere, pipes and arguments included. This acceptance is for a line that did not
+    // come through the prompt - a script - where the tokenizer still treats them as ordinary characters,
+    // so a `|` inside curly quotes is still a pipe. Straight quotes are the safe form, and the refusal shows them.
+    let q = match q.strip_prefix('"').and_then(|x| x.strip_suffix('"'))
+        .or_else(|| q.strip_prefix('\u{201c}').and_then(|x| x.strip_suffix('\u{201d}'))) {
+        Some(inner) => inner,
+        None => {
+            gs::io::println_fmt(ctx, format_args!("ask: put the question in quotes: ask \"{}\"",
+                q.trim_matches(|c| c == '"' || c == '\u{201c}' || c == '\u{201d}')));
+            return None;
+        }
+    };
+    let mut cap = Cap::new();
+    let keep = |b: u8| ctx.keep_key(b);
+    // Which row: a network question needs `net-stack`, and `ask-net`'s row is the one granted it.
+    let row = match ask_know::understand(q.as_bytes(), &[]) {
+        ask_know::Reading::One(ask_know::Kind::Network, _) => "ask-net",
+        _ => "ask",
+    };
+    let how = drain_service_with(ctx, row, ASK_PEERS, Some(q.as_bytes()), &mut cap, ASK_WAIT_SECS, Some(&keep));
+    match how {
+        // Already said on the console: "pipe: aborted" for a `q`, the spawn or feed failure otherwise.
+        Drained::Failed | Drained::Aborted => return None,
+        Drained::Eot | Drained::Overflow | Drained::NoEot => {}
+    }
+    match Table::decode(cap.bytes()) {
+        Ok(t) => Some(t),
+        // The decoder's reason ("bad magic") is about the wire format, which is not what the operator
+        // needs. What they need is who ended it, and the drain says (`backlog/84` S5): `ask` itself, the
+        // shell's wait running out, or an answer bigger than the shell holds.
+        Err(_) => {
+            let empty = cap.bytes().is_empty();
+            match (how, empty) {
+                (Drained::NoEot, true) => gs::io::println_fmt(ctx, format_args!(
+                    "ask: no answer - nothing came for ~{}s, so the shell ended `ask`", ASK_WAIT_SECS)),
+                (Drained::NoEot, false) => gs::io::println_fmt(ctx, format_args!(
+                    "ask: the answer arrived incomplete - nothing more came for ~{}s, so the shell ended `ask`", ASK_WAIT_SECS)),
+                (Drained::Overflow, _) => gs::io::println(ctx,
+                    "ask: the answer was larger than the shell holds, so what arrived does not read as one"),
+                (_, true) => gs::io::println(ctx, "ask: `ask` ended without an answer"),
+                _ => gs::io::println(ctx, "ask: `ask` ended, and what it sent does not read as an answer"),
+            }
+            None
+        }
+    }
+}
+
+/// The answer's `status` row: `answered` is a success whatever the answer says; the rest are failures
+/// (`docs/ask-design.md` 2), and the row says which.
+fn ask_status(t: &Table) -> Option<String8> {
+    for r in 0..t.nrows() {
+        if t.cell_bytes(r, 0) == b"status" {
+            return Some(String8::from(t.cell_bytes(r, 3)));
+        }
+    }
+    None
+}
+
+/// `ask` - Assisted System Knowledge (`utilities/60_ask.md`). Prints the verdict and what the answer
+/// rests on; `ask evidence` prints every line with its label (FACT, INFERENCE, UNKNOWN) and source.
+/// One assessment either way - `evidence` changes how much is SHOWN, not what was asked.
+#[inline(never)]
+fn cmd_ask(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        gs::io::println(ctx, "usage: ask \"<question>\" | ask evidence \"<question>\" - `ask help` lists what it can answer");
+        return Err(ShellError::Unknown);
+    }
+    let (evidence, question) = match split_first(arg) {
+        ("evidence", rest) if !rest.is_empty() => (true, rest),
+        _ => (false, arg),
+    };
+    let t = match build_ask_table(ctx, question) { Some(t) => t, None => return Err(ShellError::Unknown) };
+    for r in 0..t.nrows() {
+        let label = t.cell_bytes(r, 0);
+        let text = str_of(t.cell_bytes(r, 3));
+        match label {
+            b"status" => {}
+            b"verdict" => gs::io::println(ctx, text),
+            b"note" => gs::io::println_fmt(ctx, format_args!("  {}", text)),
+            // The summary shows the facts as plain sentences - for "what failed?" the facts ARE the
+            // answer, and the first cut, which hid them, answered that question with a verdict and two
+            // caveats. Only the observation stamp is left to `evidence`, which adds every label, source
+            // and rule.
+            b"fact" if !evidence => {
+                if !text.starts_with("taken at uptime") { gs::io::println_fmt(ctx, format_args!("  {}", text)); }
+            }
+            _ if evidence => {
+                let up = match label { b"fact" => "FACT", b"inference" => "INFERENCE", b"unknown" => "UNKNOWN", _ => "" };
+                let src = str_of(t.cell_bytes(r, 1));
+                let rule = str_of(t.cell_bytes(r, 2));
+                if label == b"inference" {
+                    gs::io::println_fmt(ctx, format_args!("  {:<9} {} (rule {})", up, text, rule));
+                } else if src != "-" {
+                    gs::io::println_fmt(ctx, format_args!("  {:<9} {} [{}]", up, text, src));
+                } else {
+                    gs::io::println_fmt(ctx, format_args!("  {:<9} {}", up, text));
+                }
+            }
+            b"inference" => gs::io::println_fmt(ctx, format_args!("  {}", text)),
+            b"unknown" => gs::io::println_fmt(ctx, format_args!("  unknown: {}", text)),
+            _ => gs::io::println_fmt(ctx, format_args!("  {}", text)),
+        }
+    }
+    match ask_status(&t) {
+        Some(st) if st.as_bytes() == b"answered" => Ok(()),
+        Some(_) => Err(ShellError::Unknown),
+        None => { gs::io::println(ctx, "ask: the answer had no status - treat it as incomplete"); Err(ShellError::Unknown) }
+    }
+}
+
+/// A fixed-size copy of a short cell, so a status can outlive the table it was read from.
+struct String8 { b: [u8; 24], n: usize }
+impl String8 {
+    fn from(s: &[u8]) -> String8 {
+        let mut b = [0u8; 24];
+        let n = s.len().min(24);
+        b[..n].copy_from_slice(&s[..n]);
+        String8 { b, n }
+    }
+    fn as_bytes(&self) -> &[u8] { &self.b[..self.n] }
 }
 
 /// Task slots to scan. Matches the other slot-scanning commands in this file.
@@ -15816,7 +16233,8 @@ fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, budget: u64) -> Resul
     // SPAWN ON DEMAND. Not at boot, so the recorder costs nothing until a capture is wanted - and
     // staying out of the boot set and the supervisor's `MANAGED` roster is what keeps this feature free
     // of a kernel change (the kernel keeps no list of service names; `services/CLAUDE.md`).
-    if slot_of(ctx, "recorder").is_none() && ctx.spawn("recorder").is_err() {
+    let spawned_here = slot_of(ctx, "recorder").is_none();
+    if spawned_here && ctx.spawn("recorder").is_err() {
         gs::io::println(ctx, "events persist: could not spawn `recorder`");
         return Err(ShellError::Unknown);
     }
@@ -15852,10 +16270,15 @@ fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, budget: u64) -> Resul
         }
         Some(_) => {
             gs::io::println(ctx, "events persist: recorder refused (no filesystem, or a bad path)");
+            // Started for this capture and refused it, so it holds nothing.
+            if spawned_here { end_helper(ctx, "recorder", "the capture it was started for was refused"); }
             Err(ShellError::Unknown)
         }
         None => {
             gs::io::println(ctx, "events persist: recorder did not answer");
+            // Whether it began is unknown. Ending the one started for this request makes the state
+            // KNOWN - nothing recording - instead of leaving a task that may or may not be capturing.
+            if spawned_here { end_helper(ctx, "recorder", "it did not answer the start it was spawned for"); }
             Err(ShellError::Unknown)
         }
     }
@@ -16091,6 +16514,9 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
                     // that means "enough" the one that did not take.
                     sticky_clear(ctx);
                     gs::io::println(ctx, "events persist: stopped (the capture file has its footer, so it reads as complete)");
+                    // The footer is written, so the recorder holds nothing: `status` answers "not
+                    // running" from the task table, which is now the truth rather than an idle task.
+                    end_helper(ctx, "recorder", "its capture is closed");
                     Ok(())
                 }
                 None => {
@@ -16221,7 +16647,7 @@ fn build_events_log_table(ctx: &ShellCtx) -> Option<Table> {
 /// fatal in a script - a bare `assert ok events ipc` hung the whole selfcheck suite until the harness
 /// timed out. This prints a bounded screenful and returns.
 fn events_log(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
-    // A count, or nothing. Any other word was read as "the default 20" (`backlog/80` H20).
+    // A count, or nothing. Any other word was read as "the default 20" (`backlog/fixed/80` H20).
     let a = arg.trim();
     let want = if a.is_empty() { 20 } else {
         match a.parse::<usize>() {
@@ -16579,6 +17005,72 @@ fn slot_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
     None
 }
 
+/// End a helper this shell started on demand, now that it holds nothing anybody still needs.
+///
+/// `recorder`, `copier` and `ask` are started when a command wants them and are not services (`ask` is
+/// ended by the drain that reads its answer, `drain_service_with`, as every pipe stage is): nothing
+/// restarts them, nothing else talks to them, and once their work is collected they are only a task
+/// slot, an IPC route and their memory - `copier` also woke every 500 ms, forever. They used to stay up
+/// until the machine rebooted, because nothing ended them; ending them is this shell's job, since it
+/// started them and it is the one that holds `kill` (a task cannot end itself in v1, and these must not
+/// hold the authority to try).
+///
+/// Said on the LOG, not the console: it is housekeeping, and the kernel's own `kill_task` line beside it
+/// records what was freed. A helper already gone is the outcome wanted, so `NotFound` is not a failure;
+/// any other refusal is said, because a helper this shell believes it ended and did not would be the
+/// silent kind of leak this exists to stop.
+fn end_helper(ctx: &ServiceContext, name: &str, why: &str) {
+    match ctx.kill(name) {
+        Ok(()) => ctx.log_fmt(format_args!("shell: ended `{}` - {}", name, why)),
+        Err(godspeed_sdk::Error::NotFound) => {}
+        Err(e) => ctx.log_fmt(format_args!(
+            "shell: could not end `{}` ({:?}) - it stays running, holding nothing", name, e)),
+    }
+}
+
+/// After every command typed at the prompt: end any helper whose work is over (see [`end_helper`]).
+///
+/// Only `copier` needs looking for here, and only once this shell has started it. `recorder` is ended
+/// where its capture is (`events persist stop`), and `ask` where its answer is - each at the one point
+/// that knows. `copier`'s end is not one point, because a job runs on after the command that began it:
+/// it is over when its row has stopped running AND what it said has been read, since the service holds
+/// the newest job's transcript and nothing else does (`replay_transcript`). A job that said nothing has
+/// nothing to collect, so it ends as soon as the job does.
+///
+/// It runs after a command, not while the prompt sits idle, and it asks `copier` nothing (see the body),
+/// so a job that finishes while nobody looks keeps `copier` until the next `jobs` or `foreground` sees it
+/// end. That is a bound in commands rather than time, stated rather than hidden; a timer here would make
+/// the prompt wake when nobody asked it to.
+fn tidy_helpers(ctx: &ShellCtx) {
+    if !ctx.copier_started.get() {
+        return;
+    }
+    if slot_of(ctx, "copier").is_none() {
+        ctx.copier_started.set(false);
+        return;
+    }
+    // NO REQUEST TO `copier` HERE. The rows are as `jobs`, `foreground` and `background` last learned
+    // them, and that is all this reads. Asking for status after every command doubled the questions a
+    // busy `copier` answers late - a scrub holds it inside one `fs` request for its whole sweep - and a
+    // late answer is read as the reply to whichever question comes next: in QEMU it turned the scrub's
+    // replay into nothing and the next `background churn` into a refusal. So a job that finishes
+    // unobserved keeps `copier` until the next `jobs` or `foreground` sees it finish.
+    let (live, held) = {
+        let t = ctx.jobs.borrow();
+        let live = t.rows.iter().any(|r| r.used && r.live);
+        // The newest job is the only one whose transcript `copier` still has. Held while it is unread
+        // and not empty; no row at all means the service was started and its job refused.
+        let held = t.rows.iter().filter(|r| r.used).max_by_key(|r| r.id)
+            .map_or(false, |r| !r.collected && r.out_len > 0);
+        (live, held)
+    };
+    if live || held {
+        return;
+    }
+    end_helper(ctx, "copier", "its job is over and nothing it said is left unread");
+    ctx.copier_started.set(false);
+}
+
 /// The restart count of the live service named `name` (None if not running). A respawn increments it
 /// (a fresh instance reads previous + 1), so a value strictly greater than a pre-kill reading proves a
 /// NEW instance came up - the recovery signal `chaos kill-storm` waits on.
@@ -16598,7 +17090,7 @@ fn gen_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// never the shell's spawn/kill/restart. The shell spawns it; it prints one frame
 /// via its own caps and parks. Kill any parked prior instance first (one-shot
 /// observe has no graceful self-exit in v1), so at most one lingers.
-fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn cmd_observe_now(ctx: &ShellCtx) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-now");
     if ctx.spawn("observe-now").is_err() {
         gs::io::println(ctx, "observe: failed to spawn observe-now");
@@ -16612,14 +17104,29 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
     if let Some(slot) = find_running_slot(ctx, "observe-now") {
         let mut parked = false;
         // Bounded by TIME, not by a count of yields: a million yields is a different wait on every
-        // machine, and a yield loop keeps this core busy for all of it (`backlog/80` H21). 5 s is far
+        // machine, and a yield loop keeps this core busy for all of it (`backlog/fixed/80` H21). 5 s is far
         // longer than a frame takes to print.
         const PARK_WAIT_MS: u64 = 5_000;
         const PARK_POLL_MS: u64 = 10;
         let mut waited = 0u64;
+        // `[q] quit` once it lingers, as every wait that takes time says (rule 10); `q` stops waiting for
+        // the frame and reaps the task below, as the bound running out does.
+        let notice_ms = gs::call::NOTICE_AFTER_SECS as u64 * 1000;
+        let mut noticed = false;
+        let mut quit = false;
         while waited < PARK_WAIT_MS {
             gs::task::sleep_ms(ctx, PARK_POLL_MS);
             waited += PARK_POLL_MS;
+            if !noticed && waited >= notice_ms {
+                noticed = true;
+                gs::io::println(ctx, "  [q] quit");
+            }
+            if noticed {
+                if let Some(b) = ctx.inner.try_console_read() {
+                    if ServiceContext::QUIT_KEYS.contains(&b) { quit = true; break; }
+                    ctx.keep_key(b);
+                }
+            }
             let st = ctx.task_stat(slot);
             // state 2 = BlockedOnRecv → finished printing; invalid → gone.
             if !st.valid || st.state == 2 {
@@ -16642,8 +17149,13 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
         // Only when the park was actually OBSERVED. If the wait timed out, the child is still printing
         // and killing it would truncate the frame the user asked for - so leave it, and the defensive
         // kill at the top of this function reaps it next time. That is the case the old code was for.
-        if parked {
+        // And when the operator pressed `q`: a truncated frame is what they asked for.
+        if parked || quit {
             let _ = ctx.kill("observe-now");
+        }
+        if quit {
+            gs::io::println(ctx, "observe: stopped by q");
+            return Err(ShellError::Unknown);
         }
     }
     Ok(())
@@ -16706,7 +17218,7 @@ fn cmd_observe_live(ctx: &ShellCtx) -> Result<(), ShellError> {
             gs::task::sleep_ms(ctx, OBSERVE_QPOLL_MS);
             let mut quit = false;
             while let Some(b) = ctx.try_console_read() {
-                // Esc as well as q, as every other wait in this shell takes (`backlog/80` H21).
+                // Esc as well as q, as every other wait in this shell takes (`backlog/fixed/80` H21).
                 if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) { quit = true; }
             }
             if quit { break; }
@@ -16730,7 +17242,7 @@ fn cmd_observe_live(ctx: &ShellCtx) -> Result<(), ShellError> {
     // snapshot is the WHOLE frame - top not cut off, a faithful freeze of what you were watching. These
     // two strings are byte-for-byte the painter's (services/observe title bar); \x1b[K clears whatever
     // the partial frame left on these two rows. (The first said `[q] quit` where the painter says
-    // `(q to quit)`, so the frozen frame differed from the one being watched - `backlog/80` H21.)
+    // `(q to quit)`, so the frozen frame differed from the one being watched - `backlog/fixed/80` H21.)
     gs::io::print(ctx, "observe - live                                      (q to quit)\x1b[K\r\n");
     gs::io::print(ctx, "================================================================\x1b[K\r\n");
     let r = cmd_observe_now(ctx);
@@ -16806,13 +17318,17 @@ fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
 
 /// The most items one comma list takes (`spawn a,b,c`, `delete /a,/b`, ...).
 const LIST_MAX: usize = 16;
+/// The most names `kill all-services` holds: room for the supervisor's `MANAGED` set (18 today) with
+/// headroom, plus the supervisor and the shell. A set that outgrows it is REFUSED before anything is killed,
+/// rather than reset in part (`backlog/84` S4).
+const ALL_SERVICES_MAX: usize = 34;
 
 /// Run `one` for every item of a comma list, in order, and say how it went.
 ///
 /// A list longer than [`LIST_MAX`] is REFUSED before anything runs, and the result is an Err when any
 /// item failed. The comma-list forms of `spawn`, `kill`, `restart`, `mkdir`, `delete` and `fmt` each
 /// had their own loop that dropped every item past the sixteenth without a word and returned Ok
-/// whatever happened (`backlog/80` H10, H20) - so `assert ok delete /a,/b` held for a delete that failed.
+/// whatever happened (`backlog/fixed/80` H10, H20) - so `assert ok delete /a,/b` held for a delete that failed.
 fn run_list<F: FnMut(&str) -> Result<(), ShellError>>(ctx: &ServiceContext, verb: &str, list: &str, mut one: F)
     -> Result<(), ShellError>
 {
@@ -16922,9 +17438,14 @@ fn cmd_spawnwired(ctx: &ServiceContext) -> Result<(), ShellError> {
     // service's spawner holds a grantable cap to it (8.5, 7.3), and `pong`'s spawner is the
     // supervisor. It is also the shape every wired service gets at boot, so the diagnostic now
     // exercises the real path instead of a shell-only one.
-    let _ = ctx.spawn_via_supervisor("pong", 0xFFFF, &[]);   // may already be running
+    // Each spawn hands back a cap to the new service's endpoint; this diagnostic sends on neither, so
+    // both are released rather than leaked (the pipe stages' leak, above).
+    if let Ok(Some(c)) = ctx.spawn_via_supervisor("pong", 0xFFFF, &[]) {   // may already be running
+        gs::cap::remove(ctx, gs::cap::Cap::from(c));
+    }
     match ctx.spawn_via_supervisor("greet", 0xFFFF, &["pong"]) {
-        Ok(_)  => { gs::io::println(ctx, "spawnwired: greet wired to pong via a passed cap (watch for pong: received)"); Ok(()) }
+        Ok(cap)  => {
+            if let Some(c) = cap { gs::cap::remove(ctx, gs::cap::Cap::from(c)); } gs::io::println(ctx, "spawnwired: greet wired to pong via a passed cap (watch for pong: received)"); Ok(()) }
         Err(_) => { gs::io::println(ctx, "spawnwired: supervisor could not spawn greet wired to pong"); Err(ShellError::Unknown) }
     }
 }
@@ -16938,6 +17459,35 @@ const MAX_STAGES: usize = 8;
 /// shell's endpoint until the service sends an EOT (0x04), then the service is reaped. Whole-
 /// buffer messaging (≤ one message each way) keeps the bounded queues deadlock-free (§8.9).
 fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mut Cap) -> bool {
+    !matches!(drain_service_with(ctx, svc, &["shell"], input, out, FILTER_WAIT_SECS, None), Drained::Failed)
+}
+
+/// How a [`drain_service_with`] ended. Each way but `Eot` has already been said on the console; the
+/// caller needs it to say the rest truthfully - `ask` used to report "stopped" for a `q` and for the
+/// shell's own timeout alike (`backlog/84` S5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Drained {
+    /// The stage sent its end of output.
+    Eot,
+    /// More output than `out` holds; what fitted is kept.
+    Overflow,
+    /// The operator pressed `q`.
+    Aborted,
+    /// Nothing arrived within the wait, so the shell ended the stage.
+    NoEot,
+    /// It could not be started, or fed its input; nothing was drained.
+    Failed,
+}
+
+/// [`drain_service`] with the stage's send peers and the wait between its messages stated by the
+/// caller. A pipe stage needs only the shell; `ask` also names the services it asks, and waits longer
+/// for its first message, because it answers only after asking them (`ASK_WAIT_SECS`).
+/// `keep`, when given, receives every key typed during the wait that is not `q`, so a command typed
+/// while the stage runs reaches the prompt instead of vanishing. `None` keeps a plain pipe stage's
+/// behaviour, which still drops type-ahead - the shell's other drains take a `&ServiceContext` and
+/// cannot reach the type-ahead buffer (recorded, `backlog/fixed/80` H16's receive side).
+fn drain_service_with(ctx: &ServiceContext, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
+                      wait_secs: i64, keep: Option<&dyn Fn(u8)>) -> Drained {
     // A stage crossing a service boundary is one IPC message until streaming chunks across
     // many. Refuse a larger buffer LOUDLY rather than silently clipping it to 4 KiB (§3.12).
     if let Some(inp) = input {
@@ -16945,20 +17495,30 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
             gs::io::println_fmt(ctx, format_args!(
                 "pipe: stage too large ({} bytes) for the '{}' filter - max {} KiB until pipe streaming",
                 inp.len(), svc, PIPE_MSG_MAX / 1024));
-            return false;
+            return Drained::Failed;
         }
     }
     // Wire the service to send its output to the SHELL's own endpoint.
     // Through the SUPERVISOR, which owns every service image now (step C; the kernel's catalogue is the
     // supervisor alone). A pipe stage is a spawn wired to send to the shell's own endpoint.
-    if ctx.spawn_via_supervisor(svc, 0xFFFF, &["shell"]).is_err() {
-        gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
-        return false;
+    // The supervisor hands back a cap to the new stage's endpoint. Nothing here sends on it - a filter's
+    // input goes through `lookup_sink` below - so it is released at once. `.is_err()` dropped it and
+    // leaked one table slot per stage: about sixty `ask`s and pipe stages into a boot, the shell's table
+    // was full and every later lookup failed (found by `selfcheck ask` run twice in one boot; the same
+    // leak `spawn_on` closed for `backlog/fixed/80`).
+    match ctx.spawn_via_supervisor(svc, 0xFFFF, peers) {
+        Ok(cap) => { if let Some(c) = cap { gs::cap::remove(ctx, gs::cap::Cap::from(c)); } }
+        Err(_) => {
+            gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
+            return Drained::Failed;
+        }
     }
+    // One `[q] quit` for the whole stage: the registration wait below and the drain after it share it.
+    let noticed = core::cell::Cell::new(false);
     if let Some(inp) = input {
         // Filter/sink: resolve the service's input endpoint (it must register) and feed it.
-        match lookup_sink(ctx, svc) {
-            Some(h) => {
+        match lookup_sink(ctx, svc, &noticed, keep.unwrap_or(&|_| {})) {
+            Sink::Found(h) => {
                 // Report a failed feed loudly rather than silently draining nothing (§26.7): if the
                 // filter died after registering, the user must see it, not get a silent empty result.
                 let fed = gs::ipc::send_to(ctx, h, &Message::from_bytes(inp)).is_ok()
@@ -16971,10 +17531,15 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
                     gs::io::println_fmt(ctx, format_args!(
                         "pipe: failed to send input to '{}' (it died after registering?)", svc));
                     let _ = ctx.kill(svc);
-                    return false;
+                    return Drained::Failed;
                 }
             }
-            None => {
+            Sink::Aborted => {
+                gs::io::println(ctx, "pipe: aborted");
+                let _ = ctx.kill(svc);
+                return Drained::Failed;
+            }
+            Sink::TimedOut => {
                 // Distinct, honest wording: a registration TIMEOUT (filter never became ready) is
                 // not "not a filter". The new phrasing also tells stale-image runs apart - if this
                 // text ever changes on hardware, the new shell is running (§26.7 loud failure).
@@ -16982,7 +17547,7 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
                     "pipe: '{}' never registered an input endpoint (waited ~{}s) - not a filter, or it failed to start",
                     svc, FILTER_WAIT_SECS));
                 let _ = ctx.kill(svc);
-                return false;
+                return Drained::Failed;
             }
         }
     }
@@ -16991,26 +17556,29 @@ fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mu
     // a filter that registers its endpoint then wedges or page-faults BEFORE sending EOT (or any
     // output) must not hang the prompt forever with the keyboard dead. Timeout => it died mid-stream;
     // Aborted => the user pressed q. Both stop the drain loudly (§26.7) rather than blocking.
+    // A stage that sends 512 messages and no EOT ends as `NoEot` too: the shell stopped it.
+    let mut how = Drained::NoEot;
     for _ in 0..512 {
-        match ctx.recv_abortable_deadline(FILTER_WAIT_SECS) {
+        let got = recv_quittable(ctx, wait_secs, &noticed, keep.unwrap_or(&|_| {}));
+        match got {
             ReqOutcome::Reply(msg) => {
                 let p = msg.payload_bytes();
-                if p == [PIPE_EOT] { break; }
+                if p == [PIPE_EOT] { how = Drained::Eot; break; }
                 out.push(p);
-                if out.overflow { break; }
+                if out.overflow { how = Drained::Overflow; break; }
             }
-            ReqOutcome::Aborted => { gs::io::println(ctx, "pipe: aborted"); break; }
+            ReqOutcome::Aborted => { gs::io::println(ctx, "pipe: aborted"); how = Drained::Aborted; break; }
             ReqOutcome::Timeout => {
                 gs::io::println_fmt(ctx, format_args!(
                     "pipe: '{}' stopped sending without EOT (waited ~{}s) - it may have failed mid-stream",
-                    svc, FILTER_WAIT_SECS));
+                    svc, wait_secs));
                 break;
             }
         }
     }
     let _ = ctx.kill(svc);
     if out.overflow { gs::io::println(ctx, "pipe: pipe output exceeded the buffer (truncated)"); }
-    true
+    how
 }
 
 /// Split `s` into (first word, rest-trimmed).
@@ -17395,8 +17963,16 @@ fn pipe_write(ctx: &ShellCtx, cwd: &Cwd, arg: &str, data: &[u8]) {
     }
 }
 
+/// What [`lookup_sink`] came back with.
+enum Sink { Found(gs::cap::Cap), TimedOut, Aborted }
+
 /// Look up a just-spawned service's endpoint via the kernel name directory, retrying while it registers.
-fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<gs::cap::Cap> {
+///
+/// The wait is quittable and says so, as every shell wait is (conventions rule 10): once it has run
+/// `gs::call::NOTICE_AFTER_SECS` it prints `[q] quit` (once per `noticed`, which the stage's drain
+/// shares) and from then on reads the console, `q` ending it and any other key going to `keep`. It
+/// reads no key before the notice, so a key typed ahead is not taken from the next command.
+fn lookup_sink(ctx: &ServiceContext, sink: &str, noticed: &core::cell::Cell<bool>, keep: &dyn Fn(u8)) -> Sink {
     // A freshly-spawned filter registers its input endpoint only once it actually RUNS - which on
     // real multi-core hardware is up to ~1 s after spawn (it's on another core and hasn't been
     // scheduled yet). Retry until it appears, bounded by REAL wall-clock time (the RTC).
@@ -17410,8 +17986,19 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str) -> Option<gs::cap::Cap> {
     // normally succeeds on the first iteration - the bounded wait is just a guard.
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     loop {
-        if let Ok(h) = gs::cap::acquire_grantable(ctx, sink) { return Some(h); }
-        if gs::task::epoch_secs_monotonic(ctx) - t0 >= FILTER_WAIT_SECS { return None; }
+        if let Ok(h) = gs::cap::acquire_grantable(ctx, sink) { return Sink::Found(h); }
+        let elapsed = gs::task::epoch_secs_monotonic(ctx) - t0;
+        if !noticed.get() && elapsed >= gs::call::NOTICE_AFTER_SECS {
+            noticed.set(true);
+            gs::io::println(ctx, "  [q] quit");
+        }
+        if noticed.get() {
+            while let Some(b) = ctx.try_console_read() {
+                if b == b'q' || b == b'Q' || b == 0x1b { return Sink::Aborted; }
+                keep(b);
+            }
+        }
+        if elapsed >= FILTER_WAIT_SECS { return Sink::TimedOut; }
         gs::task::yield_now(ctx);
     }
 }
@@ -17429,7 +18016,7 @@ fn line_reads_secret(line: &[u8]) -> bool {
 }
 
 fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
-    // `kill all-services` (nuke every service but this shell) or `kill a,b,c` (a comma list) are
+    // `kill all-services` (every managed service, then the supervisor, then this shell) or `kill a,b,c` (a comma list) are
     // multi-target; a single name behaves EXACTLY as before. Per-service guards live in kill_one.
     if name == "all-services" || name.contains(',') {
         return kill_list(ctx, name);
@@ -17437,14 +18024,22 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
     kill_one(ctx, name)
 }
 
-/// Kill a bounded set: the `all-services` keyword (-> CHAOS_RESTARTABLE + the shell: a complete system
-/// reset where everything dies and recovers, only the kernel never dies) or a comma-separated list. Each
+/// Kill a bounded set: the `all-services` keyword (every service the supervisor keeps running, its
+/// `supcmd::MANAGED` set, plus the supervisor and the shell: a reset of everything that is restarted, only
+/// the kernel never dying - what the supervisor starts for one job, `ask`, `recorder`, `copier`, `observe`
+/// and the probes, is not in that set) or a comma-separated list. The set is ASKED of the supervisor, not written
+/// here: a list kept in the shell (`CHAOS_RESTARTABLE`) was the set once and fell behind it - console,
+/// power, the audio and radio drivers, `wifi-usb` and `hw-enumerator` were all left running, so a
+/// "complete reset" killed a USB host and left the dongle's driver holding a chip the restart had reset. Each
 /// segment runs the full kill_one guard path; a denied / dead / absent one does NOT abort the rest. ORDER:
 /// everything except supervisor and shell first, then supervisor (so the kernel-respawned supervisor
 /// reconciles AFTER the nuke and respawns the fresh prompt, not mid-storm), then the shell LAST via its
 /// self-kill (it never returns), so every per-service report has printed before the session re-inits.
 fn kill_list(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
-    let mut segs: [&str; LIST_MAX] = [""; LIST_MAX];
+    use godspeed_sdk::service_context::supcmd;
+    // Asked first so the names it carries outlive `segs`, which borrows them.
+    let managed = if name == "all-services" { hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::MANAGED]) } else { None };
+    let mut segs: [&str; ALL_SERVICES_MAX] = [""; ALL_SERVICES_MAX];
     let mut n = 0usize;
     let items = name.split(',').filter(|s| !s.is_empty()).count();
     if name != "all-services" && items > LIST_MAX {
@@ -17453,13 +18048,39 @@ fn kill_list(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
         return Err(ShellError::Unknown);
     }
     if name == "all-services" {
-        gs::io::println(ctx, "kill all-services: nuking every service - including this shell (a fresh prompt returns)");
-        for &s in CHAOS_RESTARTABLE.iter() { if n < segs.len() { segs[n] = s; n += 1; } }
-        if n < segs.len() { segs[n] = "shell"; n += 1; }   // shell dies LAST (the third pass below)
+        let names = match managed.as_ref().map(|m| m.payload_bytes()) {
+            Some(p) if p.first() == Some(&supcmd::OK) => p,
+            _ => {
+                gs::io::println(ctx, "kill all-services: the supervisor did not say which services it runs - nothing was done");
+                return Err(ShellError::Unknown);
+            }
+        };
+        // `[OK, count, (len, name)*]`. The supervisor and the shell are added below, in their own passes.
+        let count = names.get(1).copied().unwrap_or(0) as usize;
+        let mut at = 2usize;
+        let mut wanted = 0usize;
+        for _ in 0..count {
+            let len = match names.get(at) { Some(&l) => l as usize, None => break };
+            let Some(s) = names.get(at + 1..at + 1 + len).and_then(|b| core::str::from_utf8(b).ok()) else { break };
+            at += 1 + len;
+            if s == "supervisor" || s == "shell" { continue; }
+            wanted += 1;
+            if n < segs.len() - 2 { segs[n] = s; n += 1; }
+        }
+        // A reset of part of the set is not the reset asked for: say so and do nothing.
+        if wanted > n {
+            gs::io::println_fmt(ctx, format_args!(
+                "kill all-services: the supervisor runs {} services and this command holds {} - nothing was done", wanted, n));
+            return Err(ShellError::Unknown);
+        }
+        segs[n] = "supervisor"; n += 1;   // the second pass below
+        segs[n] = "shell"; n += 1;        // and LAST, the third
+        gs::io::println_fmt(ctx, format_args!(
+            "kill all-services: nuking all {} services the supervisor runs, then the supervisor and this shell (a fresh prompt returns)", n - 2));
     } else {
         for s in name.split(',') { if !s.is_empty() && n < segs.len() { segs[n] = s; n += 1; } }
     }
-    // The verdict counts failures, as `run_list` does (`backlog/80` H20 - this returned Ok always).
+    // The verdict counts failures, as `run_list` does (`backlog/fixed/80` H20 - this returned Ok always).
     let mut failed = 0usize;
     for &s in segs[..n].iter() { if s != "supervisor" && s != "shell" && kill_one(ctx, s).is_err() { failed += 1; } }
     for &s in segs[..n].iter() { if s == "supervisor" && kill_one(ctx, s).is_err() { failed += 1; } }
@@ -17560,8 +18181,9 @@ fn restart_one(ctx: &ServiceContext, name: &str, core: Option<u32>) -> Result<()
 // round + labels them "recovered"; kill-storm may target them. The only unkillable thing is the
 // kernel; the shell is excluded only because chaos runs *inside* it. (xhci/ehci/events are
 // directly-restartable so max-carnage can't leave them dead.)
-// `time`, `control` and `dwc2` were MISSING here, and this list is not cosmetic: it is the expansion
-// of `kill all-services` and a hard refusal gate for `chaos kill-storm`. So the storm skipped them
+// `time`, `control` and `dwc2` were MISSING here, and this list is not cosmetic: it is a hard refusal
+// gate for `chaos kill-storm` (and, until 2026-10-12, it was the expansion of `kill all-services`, which
+// now asks the supervisor). So the storm skipped them
 // and `chaos kill-storm time` was refused outright - Commandment II ("nothing escapes") silently
 // false for the three services whose omission from a DIFFERENT list was the C5-1 finding.
 //
@@ -17664,7 +18286,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
         gs::io::println(ctx, "  max-carnage <all-services|svc|svc,svc,...> <n>  all-services = RANDOM storm, or aim/list; TARGET + ROUNDS required");
         gs::io::println(ctx, "                          ('q' aborts; SERIAL only if the run kills the keyboard)");
         gs::io::println(ctx, "  link-flap         [n]   simulate a cable unplug/replug; net-stack self-configures (net only)");
-        // The lists come FROM THE ARRAY (`backlog/80` H3): this line used to name nine services by hand,
+        // The lists come FROM THE ARRAY (`backlog/fixed/80` H3): this line used to name nine services by hand,
         // `shell` among them, which kill-storm refuses.
         chaos_print_targets(ctx, "  kill-storm / flood-storm svc:");
         gs::io::println(ctx, "  max-carnage svc: any live service, `shell` included, or all-services");
@@ -17695,7 +18317,7 @@ fn cmd_chaos(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
                     gs::io::println(ctx, "       chaos max-carnage fs,events 100");
                     gs::io::println(ctx, "  add 'yes' as a 4th word to skip the confirm (unattended runs):");
                     gs::io::println(ctx, "       chaos max-carnage all-services 100 yes");
-                    // A refusal, so an Err: nothing ran (`backlog/80` H20 - this returned Ok).
+                    // A refusal, so an Err: nothing ran (`backlog/fixed/80` H20 - this returned Ok).
                     return Err(ShellError::Unknown);
                 }
                 // Validate the target(s) before launching (a bad name would storm nothing), loudly (invariant 12).
@@ -17785,7 +18407,7 @@ fn chaos_link_flap(ctx: &ShellCtx, tok: &[&str], ntok: usize) -> Result<(), Shel
     let cycles = if ntok >= 2 { parse_u32(tok[1]).unwrap_or(1).max(1) } else { 1 };
     if slot_of(ctx, "nic-driver").is_none() {
         gs::io::println(ctx, "chaos link-flap: no live nic-driver (is the NIC up?)");
-        return Err(ShellError::Unknown); // nothing was flapped (`backlog/80` H20)
+        return Err(ShellError::Unknown); // nothing was flapped (`backlog/fixed/80` H20)
     }
     // Hold each edge long enough for net-stack's ~1s link poll to catch it - this simulates the duration of
     // a real cable event (whose PHY settle is itself seconds on hardware). net-stack self-configures on its
@@ -17976,7 +18598,7 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
     let svc = tok[1];
     if !CHAOS_RESTARTABLE.contains(&svc) {
         // The list is PRINTED FROM THE ARRAY, as in the usage above. This said "only
-        // supervisor/block-driver/fs recover on death" while the array held eleven (`backlog/80` H2).
+        // supervisor/block-driver/fs recover on death" while the array held eleven (`backlog/fixed/80` H2).
         gs::io::print_fmt(ctx, format_args!("chaos: '{}' is not a kill-storm target - the targets are", svc));
         for (i, s) in CHAOS_RESTARTABLE.iter().enumerate() {
             gs::io::print(ctx, if i == 0 { " " } else { ", " });
@@ -18265,7 +18887,7 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     let rounds = rounds.clamp(1, CHAOS_MAX_ROUNDS);
 
     // The storm's verdict IS a memory measurement, so without the figures it does not run
-    // (`backlog/80` K18: they read as 0, and "0 below baseline" would have passed).
+    // (`backlog/fixed/80` K18: they read as 0, and "0 below baseline" would have passed).
     let (Some(total), Some(baseline)) = (ctx.inspect_kernel_total_frames(), ctx.inspect_kernel_free_frames()) else {
         gs::io::println(ctx, "chaos mem-pressure: cannot measure memory - the kernel did not answer (this needs INTROSPECT)");
         return Err(ShellError::Unknown);
@@ -18381,7 +19003,7 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
     let count = count.clamp(1, SPAWN_STORM_MAX);
 
     // The storm's verdict IS a memory measurement, so without the figures it does not run
-    // (`backlog/80` K18: they read as 0, and "0 below baseline" would have passed).
+    // (`backlog/fixed/80` K18: they read as 0, and "0 below baseline" would have passed).
     let (Some(total), Some(baseline)) = (ctx.inspect_kernel_total_frames(), ctx.inspect_kernel_free_frames()) else {
         gs::io::println(ctx, "chaos spawn-storm: cannot measure memory - the kernel did not answer (this needs INTROSPECT)");
         return Err(ShellError::Unknown);
@@ -18576,7 +19198,7 @@ fn resolve_or_err<'a>(ctx: &ServiceContext, cwd: &Cwd, input: &str, out: &'a mut
 fn time_rpc(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
     // Bounded: a command waiting on `time` (`date`, `date sync`) must not become a dead prompt with
     // no `q` and no hint. (It also ran in the shell's main loop before `console_read` until
-    // 2026-10-10, when that floor probe went - `backlog/80` H12.)
+    // 2026-10-10, when that floor probe went - `backlog/fixed/80` H12.)
     const TIME_SECS: i64 = 2;
     if let Some(r) = ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS) {
         return Some(r);
@@ -18791,7 +19413,8 @@ fn fs_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
                     gs::io::println(ctx, "fs: no reply for this request - the storage protocol is out of step");
                     return ReqOutcome::Timeout;
                 }
-                outcome = ctx.recv_abortable_deadline(left);
+                // Says `[q] quit` if it lingers, as the first wait did (`backlog/84` S6).
+                outcome = recv_quittable(ctx, left, &core::cell::Cell::new(false), &|b| ctx.keep_key(b));
             }
             other => return other,
         }
@@ -18852,7 +19475,8 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     // Every one of those is a command the operator runs precisely when storage is misbehaving, which
     // is exactly when `fs` is most likely to be slow or restarting. The `q` half is fixed here; recovery
     // from a restart still waits for the next `fs_request`.
-    let first = ctx.request_with_reply_abortable("fs", &msg, max_secs);
+    // With the `[q] quit` notice, as every wait that takes time has (`backlog/84` S6).
+    let first = ask_with_quit_notice(ctx, "fs", &msg, max_secs);
     match fs_take_tagged(ctx, tag, first, max_secs) {
         ReqOutcome::Reply(r) => Some(r),
         _ => None,
@@ -18886,7 +19510,7 @@ fn fs_no_answer(ctx: &ShellCtx, verb: &str) {
 /// moment `fs` is not answering. No checker compares the two yet, so a change to either is a change
 /// to both, by hand.
 fn op_is_mutating(op: u8) -> bool {
-    // `OP_WRITE_AT_J` was missing here though `fs` lists it (`backlog/80` H6), and `OP_SEAL` changes
+    // `OP_WRITE_AT_J` was missing here though `fs` lists it (`backlog/fixed/80` H6), and `OP_SEAL` changes
     // the file too (`fs`'s own list omits it - V3).
     matches!(op, OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT | OP_WRITE_AT_J | OP_SEAL
                  | OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE)
@@ -18911,7 +19535,8 @@ fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Messag
     // exit" budget the interactive path used, and it bounds the wait for a REPLACEMENT reply after
     // discarding an overtaken one. Still ABORTABLE, so `q` remains an EARLY exit while `fs` is merely
     // slow - it is no longer the only exit.
-    let first = ctx.request_with_reply_abortable("fs", &msg, secs);
+    // With the `[q] quit` notice (`backlog/84` S6); `q` before it is typing ahead, kept for the prompt.
+    let first = ask_with_quit_notice(ctx, "fs", &msg, secs);
     if matches!(first, ReqOutcome::Aborted) {
         return None; // the user pressed q - that is an answer, not a failure to retry
     }
@@ -18960,7 +19585,7 @@ fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Messag
         req2[0] = tag2;
         let msg2 = Message::from_bytes(&req2[..3 + pl + dn]);
         // Same rule on the retry: never wait out an hour for a reply that was never sent.
-        let second = ctx.request_with_reply_abortable("fs", &msg2, secs);
+        let second = ask_with_quit_notice(ctx, "fs", &msg2, secs);
         if matches!(second, ReqOutcome::Aborted) {
             return None;
         }
@@ -19012,7 +19637,7 @@ const NET_STALE_MAX: usize = 8;
 /// a bound chosen when every client here waited 3 s. The transaction path now waits 20 s, so net-stack
 /// was throwing away requests whose client would happily have waited eighteen seconds longer; the
 /// client then timed out, reacquired, re-sent, and THAT copy was answered in milliseconds. Measured on
-/// a Dell Wyse as 19.67 s and 19.99 s to dispatch, with the re-send served instantly (`backlog/29`).
+/// a Dell Wyse as 19.67 s and 19.99 s to dispatch, with the re-send served instantly (`backlog/fixed/29`).
 ///
 /// Seconds in one byte, saturating: nothing here waits longer than 255 s and a client that wants to be
 /// dropped promptly can say 0. It is stripped in the SAME single place as the tag, so no net-stack op
@@ -19056,7 +19681,8 @@ fn ns_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
                 let spent = gs::task::epoch_secs_monotonic(ctx).saturating_sub(t0);
                 let left = max_secs.saturating_sub(spent);
                 if left <= 0 { return ReqOutcome::Timeout; }
-                outcome = ctx.recv_abortable_deadline(left);
+                // Says `[q] quit` if it lingers, as the first wait did (`backlog/84` S6).
+                outcome = recv_quittable(ctx, left, &core::cell::Cell::new(false), &|b| ctx.keep_key(b));
             }
             other => return other,
         }
@@ -19071,11 +19697,12 @@ fn ns_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
 fn ns_abortable(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> ReqOutcome {
     let mut buf = [0u8; 4096];
     let (n, tag) = ns_build(ctx, body, &mut buf, max_secs);
-    let first = ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&buf[..n]), max_secs);
+    // With the `[q] quit` notice (`backlog/84` S6).
+    let first = ask_with_quit_notice(ctx, "net-stack", &Message::from_bytes(&buf[..n]), max_secs);
     match ns_take_tagged(ctx, tag, first, max_secs) {
         ReqOutcome::Timeout if gs::cap::reacquire(ctx, "net-stack") => {
             let (n2, tag2) = ns_build(ctx, body, &mut buf, max_secs);
-            let again = ctx.request_with_reply_abortable("net-stack", &Message::from_bytes(&buf[..n2]), max_secs);
+            let again = ask_with_quit_notice(ctx, "net-stack", &Message::from_bytes(&buf[..n2]), max_secs);
             ns_take_tagged(ctx, tag2, again, max_secs)
         }
         other => other,
@@ -19205,7 +19832,7 @@ fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
 /// answer" uses this rather than `fs_stat`.
 fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
     // `q` quits the wait, as `dir`'s does, and a key typed meanwhile is KEPT for the prompt
-    // (`backlog/80` H16): without a notice the callers' `Cancelled` arms could never fire.
+    // (`backlog/fixed/80` H16): without a notice the callers' `Cancelled` arms could never fire.
     let notice = || gs::io::println(ctx, "  [q] quit");
     let keep = |b: u8| ctx.keep_key(b);
     let mut g = ctx.fs_waiting(&notice, &keep);
@@ -19884,7 +20511,10 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             return Ok(());
         }
         Err(gs::Error::Cancelled) => return Ok(()),
-        Err(_) => { gs::io::println(ctx, "churn verify: storage unavailable"); return Err(ShellError::Unknown); }
+        // NAMED, not a bare "storage unavailable": a reply that never came, one that came malformed and
+        // a filesystem that is not mounted are different faults, and the jobs suite could not tell them
+        // apart when this failed in QEMU after a churn job.
+        Err(e) => { gs::io::println_fmt(ctx, format_args!("churn verify: storage unavailable ({})", e.as_str())); return Err(ShellError::Unknown); }
     }
 
     for k in 0..nn {
@@ -20020,7 +20650,7 @@ fn fc_invoke(ctx: &ShellCtx, file: gs::cap::Cap, right: u8, payload: &[u8]) -> O
     // whatever the kernel has since placed in that slot - which is how the file cap was being deleted.
     // That holds on EVERY outcome below, an abort or a timeout included: they are waits after a
     // delivered invoke, not sends that failed. Only the failed invoke above reclaims (backlog/67).
-    let outcome = ctx.recv_abortable_deadline(FILTER_WAIT_SECS);
+    let outcome = recv_quittable(ctx, FILTER_WAIT_SECS, &core::cell::Cell::new(false), &|_| {});
     match outcome {
         ReqOutcome::Reply(m) => {
             let b = m.payload_bytes();
@@ -20031,6 +20661,21 @@ fn fc_invoke(ctx: &ShellCtx, file: gs::cap::Cap, right: u8, payload: &[u8]) -> O
         }
         _ => None,
     }
+}
+
+/// The shell's receive wait, quittable AND saying so: once nothing has come for
+/// `gs::call::NOTICE_AFTER_SECS` it prints `[q] quit`, once per `noticed` - a drain that waits for
+/// many messages says it once, not on every slow one. Every receive the shell waits on directly for a
+/// peer's answer goes through here, so a new one gets the notice without remembering it
+/// (utilities/0_conventions.md rule 10), the re-waits after an overtaken fs or net-stack reply
+/// (`fs_take_tagged`, `ns_take_tagged`) included; the requests themselves go through
+/// `ask_with_quit_notice`. Keys other than `q` go to `keep`.
+fn recv_quittable(ctx: &ServiceContext, secs: i64, noticed: &core::cell::Cell<bool>, keep: &dyn Fn(u8)) -> ReqOutcome {
+    let after = if noticed.get() { i64::MAX } else { gs::call::NOTICE_AFTER_SECS };
+    ctx.recv_abortable_deadline_noticing(secs, after, &|| {
+        noticed.set(true);
+        gs::io::println(ctx, "  [q] quit");
+    }, keep)
 }
 
 /// The largest file-cap request the shell builds, plus its tag. Every `fcap` request is a short
@@ -20468,7 +21113,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         // An APPEND-only open: APPEND is a request to `fs`, never a kernel right, so the File must
         // report WRITE alone and close under it. It recorded the mask ASKED for until 2026-10-10,
-        // and the kernel refused that close - `fs`'s slot stayed taken (`backlog/80` G2).
+        // and the kernel refused that close - `fs`'s slot stayed taken (`backlog/fixed/80` G2).
         let mut gfs4 = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
         let appended = match gfs4.open(GSCAP_PATH, gs::cap::WRITE | gs::cap::APPEND) {
             Ok(ap) => ap.rights() == gs::cap::WRITE && ap.close().is_ok(),
@@ -21071,7 +21716,7 @@ fn cmd_read(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
     // big buffer here.
     let size = match fs_stat_r(ctx, path) {
         Ok(st) if !st.is_dir => st.size,
-        // A directory IS found - saying "not found" about it was false (`backlog/80` H21).
+        // A directory IS found - saying "not found" about it was false (`backlog/fixed/80` H21).
         Ok(_) => {
             gs::io::println_fmt(ctx, format_args!("read: {} is a directory - `dir {}` lists it", str_of(path), str_of(path)));
             return Err(ShellError::Unknown);
@@ -21510,7 +22155,7 @@ fn cmd_copy_tree(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), 
     stack.push(&sp[..sl]);
     let (mut dirs, mut files) = (1u32, 0u32);
     let mut short = false;
-    // Everything that was NOT copied, counted so the verdict can say so (`backlog/80` H18): a file
+    // Everything that was NOT copied, counted so the verdict can say so (`backlog/fixed/80` H18): a file
     // whose copy failed, a subdirectory that could not be made, a name too long to join or remap, a
     // directory whose listing failed. Each used to be skipped and the result was Ok.
     let mut skipped = 0u32;
@@ -21619,7 +22264,7 @@ fn copy_file_streaming(ctx: &ShellCtx, src: &[u8], dst: &[u8]) -> Option<u64> {
     while off < size {
         let n = fs_read_at(ctx, src, off, &mut chunk)?;
         // The source ended before the size it stated. That is a short copy, not a complete one - it
-        // used to break here and report `size` bytes copied (`backlog/80` H18).
+        // used to break here and report `size` bytes copied (`backlog/fixed/80` H18).
         if n == 0 {
             gs::io::println_fmt(ctx, format_args!(
                 "copy: {} ended at byte {} of the {} it stated - the copy is short", str_of(src), off, size));
@@ -21763,13 +22408,18 @@ struct JobRow {
     slen: usize,
     dst: [u8; PATH_MAX],
     dlen: usize,
+    /// Whether what this job said has been read back (`foreground` replayed its transcript). Until it
+    /// has, `copier` is the only holder of that text and is kept; once it has, `tidy_helpers` ends it.
+    collected: bool,
+    /// Bytes of transcript `copier` reported holding for this job, from its last status answer.
+    out_len: u32,
 }
 
 impl JobRow {
     const fn empty() -> Self {
         JobRow { used: false, kind: KIND_COPY, live: false, id: 0, state: ST_IDLE, why: 0,
                  copied: 0, total: 0, elapsed: 0,
-                 src: [0u8; PATH_MAX], slen: 0, dst: [0u8; PATH_MAX], dlen: 0 }
+                 src: [0u8; PATH_MAX], slen: 0, dst: [0u8; PATH_MAX], dlen: 0, collected: false, out_len: 0 }
     }
 }
 
@@ -21816,7 +22466,7 @@ fn why_words(why: u8) -> &'static str {
 /// delete is exactly that - it reads no messages at all. Reporting that as `lost` would declare a
 /// job dead precisely while it is doing its work.
 enum Ask {
-    Answer(u8, u8, u8, u64, u64, u64), // state, why, kind, copied, total, elapsed
+    Answer(u8, u8, u8, u64, u64, u64, u32), // state, why, kind, copied, total, elapsed, transcript bytes
     Busy,                              // alive, did not answer in time
     Gone,                              // the service is not running
 }
@@ -21844,7 +22494,15 @@ fn copier_status(ctx: &ShellCtx) -> Ask {
     let copied = u64::from_le_bytes([p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12]]);
     let total = u64::from_le_bytes([p[13], p[14], p[15], p[16], p[17], p[18], p[19], p[20]]);
     let elapsed = u64::from_le_bytes([p[21], p[22], p[23], p[24], p[25], p[26], p[27], p[28]]);
-    Ask::Answer(st, why, kind, copied, total, elapsed)
+    // The transcript's length, after the two length-prefixed paths. An older reply without it reads as
+    // `u32::MAX` - "holds something" - so the shell keeps a `copier` it cannot account for.
+    let mut i = 29usize;
+    let slen = p.get(i).copied().unwrap_or(0) as usize;
+    i += 1 + slen;
+    let dlen = p.get(i).copied().unwrap_or(0) as usize;
+    i += 1 + dlen;
+    let out_len = if p.len() >= i + 4 { u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]) } else { u32::MAX };
+    Ask::Answer(st, why, kind, copied, total, elapsed, out_len)
 }
 
 /// Bring the live row up to date from the service, and FREEZE it if the job has ended.
@@ -21860,9 +22518,10 @@ fn refresh_jobs(ctx: &ShellCtx) {
     };
     let i = match live_idx { Some(i) => i, None => return };
     match copier_status(ctx) {
-        Ask::Answer(st, why, kind, copied, total, elapsed) => {
+        Ask::Answer(st, why, kind, copied, total, elapsed, out_len) => {
             let mut t = ctx.jobs.borrow_mut();
             let row = &mut t.rows[i];
+            row.out_len = out_len;
             row.state = st;
             row.why = why;
             row.kind = kind;
@@ -21998,6 +22657,9 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
         gs::io::println(ctx, "background: could not spawn `copier`");
         return Err(ShellError::Unknown);
     }
+    // From here `tidy_helpers` looks for it after each command, and ends it once its job is over and
+    // collected - including when the start below is refused, which leaves it holding nothing.
+    ctx.copier_started.set(true);
     let _ = gs::cap::reacquire(ctx, "copier");
 
     let mut req = [0u8; 4 + 2 * PATH_MAX + 8];
@@ -22027,7 +22689,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     };
     if !ok {
         // The service records WHY it refused before it answers, so ask rather than print a shrug.
-        let why = match copier_status(ctx) { Ask::Answer(_, w, _, _, _, _) => w, _ => 0 };
+        let why = match copier_status(ctx) { Ask::Answer(_, w, _, _, _, _, _) => w, _ => 0 };
         gs::io::println_fmt(ctx, format_args!("background: refused - {}", why_words(why)));
         return Err(ShellError::Unknown);
     }
@@ -22235,7 +22897,16 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         // replaying a transcript IS attaching, so a second word for it would be a second way to
         // say `foreground` (§26.2).
         if is_newest(ctx, want) {
-            replay_transcript(ctx);
+            if slot_of(ctx, "copier").is_some() {
+                replay_transcript(ctx);
+                // READ, SO NO LONGER HELD FOR ANYBODY: `tidy_helpers` ends `copier` after this command.
+                if let Some(r) = ctx.jobs.borrow_mut().rows.iter_mut().find(|r| r.used && r.id == want) {
+                    r.collected = true;
+                }
+            } else if ctx.jobs.borrow().rows.iter().any(|r| r.used && r.id == want && r.collected) {
+                // Said rather than left blank: an empty reply here would read as "it said nothing".
+                gs::io::println(ctx, "  (what it said was shown when it was first read back, and is not kept after that)");
+            }
         }
         return Ok(());
     }
@@ -22282,7 +22953,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         // Progress as `jobs` shows it: a percentage only where one is measured. A recursive delete,
         // a check or a scrub is ONE `fs` operation with nothing to count, and used to print
-        // `copying... 100%` while it ran (`backlog/80` H1).
+        // `copying... 100%` while it ran (`backlog/fixed/80` H1).
         if kind == KIND_COPY || kind == KIND_CHURN {
             if pct != shown {
                 shown = pct;
@@ -22525,7 +23196,7 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
             Err(gs::Error::Cancelled) => { cancelled = true; break; }
             // A START PATH that is not a directory is a refusal, not a short search. Every listing
             // error used to be reported as "a directory was too large", then `0 match(es)` and Ok
-            // (`backlog/80` H19).
+            // (`backlog/fixed/80` H19).
             Err(gs::Error::NotFound) if is_start => {
                 gs::io::println_fmt(ctx, format_args!("find: not a directory: {}", str_of(&dir[..dlen])));
                 return Err(ShellError::FileNotFound);
@@ -23271,7 +23942,7 @@ fn split_drive_value<'a>(args: &[&'a str], argc: usize) -> (&'a str, &'a str) {
 ///
 /// A word selector is COMPARED with the label `fs` reports. It used to be accepted unread, so
 /// `drives flash typo data` - a mistyped label - selected drive 0 and, after the `[y/N]`, erased it
-/// (`backlog/80` H15). A destructive command must not act on a name nothing matched.
+/// (`backlog/fixed/80` H15). A destructive command must not act on a name nothing matched.
 fn drive_sel_ok(ctx: &ShellCtx, sel: &str) -> bool {
     if sel.is_empty() || sel == "0" {
         return true;

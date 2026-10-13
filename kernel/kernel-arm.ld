@@ -24,8 +24,21 @@ SECTIONS {
 
     .rodata : ALIGN(0x1000) { *(.rodata .rodata.*) }
     .data   : ALIGN(0x1000) { *(.data .data.*) }
+    __kernel_data_end = .;
 
-    . = ALIGN(8);
+    /* KERNEL MEMORY MUST NOT SIT WHERE A SERVICE'S PAGES DO. The kernel reaches its own memory at its
+     * physical address, through the identity map every service's L1 copies - but a service's OWN pages
+     * take precedence in its table, and every service is linked at 0x400000 with its context page at
+     * 0x3ff000. So kernel memory between 0x3ff000 and the top of the largest image is, while that
+     * service's table is installed, not the kernel's: it is the service's code. BSS used to start
+     * right after .data and covered that whole range, and kernel stack slot 15 (0x3ff000..0x40f000)
+     * landed on the image of whatever ran in slot 15 - `ask`'s entry page was the top of its own
+     * kernel stack, and the first push on it rewrote `ask`'s code (Pi 2, 2026-10-12). So BSS starts
+     * above the window, and nothing of the kernel's is below it but text, rodata and data, which end
+     * before the context page. `PageTable::map` (`arch/arm/page_tables.rs`) refuses a user page that would land on kernel memory,
+     * so an image that grows past the window fails its spawn loudly rather than corrupting this. */
+    ASSERT(__kernel_data_end <= 0x003FF000, "arm32: kernel text+rodata+data reach the service context page at 0x3ff000")
+    . = MAX(ALIGN(8), 0x00800000);
     __bss_start = .;
     .bss : { *(.bss .bss.*) *(COMMON) }
     . = ALIGN(8);

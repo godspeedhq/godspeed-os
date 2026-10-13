@@ -59,7 +59,7 @@ console to move its view and report back. To answer, the console had to `paint_v
 **before it could reply** - a full repaint of the framebuffer, inside the caller's deadline. On the
 Dell Wyse that framebuffer is 3840x2160, the console is contracted to core 0, and the shell was
 round-robined onto core 0 too. So the shell blocked for one second on the core that was painting,
-then declared a console that was merely busy to be dead (`backlog/37`).
+then declared a console that was merely busy to be dead (`backlog/fixed/37`).
 
 Holding PgUp issued one of those per key repeat. No deadline makes that shape robust.
 

@@ -58,7 +58,7 @@ pub enum Error {
     Foreign,
     /// The file is there, and a block of it failed its checksum or could not be read: it is DAMAGED,
     /// not missing. `drives scrub` names every such block. `fs` answered this as "not found" until
-    /// 2026-10-10 (`backlog/80` V2).
+    /// 2026-10-10 (`backlog/fixed/80` V2).
     Damaged,
     /// The service tried and failed, and said so. A real failure with a real answer behind it.
     Failed,

@@ -1,5 +1,6 @@
 [package]
 name = "shell"
+description = "gsh, the command shell: the user's interface to the machine"
 version.workspace = true   # inherits the OS version so the `version` command shows it (single source)
 edition = "2021"
 

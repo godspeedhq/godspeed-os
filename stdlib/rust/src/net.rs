@@ -245,7 +245,7 @@ impl<'a> Net<'a> {
     }
 
     /// Hand every key a noticing wait reads, other than a quit key, to `keep`, in order, instead of
-    /// discarding it - as [`Fs::keeping`](crate::fs::Fs::keeping) does (`backlog/80` H16).
+    /// discarding it - as [`Fs::keeping`](crate::fs::Fs::keeping) does (`backlog/fixed/80` H16).
     pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Net<'a> {
         self.keep = Some(keep);
         self
@@ -381,7 +381,7 @@ impl<'a> Net<'a> {
         let r = self.call(&req[..head + request.len()], TCP_SECS)?;
         // `[status, bytes...]`: 0 and what came back, or 1 alone for a transaction that failed (its
         // reason is in `net-stack`'s log). A failure was an EMPTY reply until 2026-10-10, which three
-        // ports refuse to deliver at all (`backlog/80` D5, `backlog/66`).
+        // ports refuse to deliver at all (`backlog/fixed/80` D5, `backlog/fixed/66`).
         let b = match body(&r) {
             [0, rest @ ..] => rest,
             [1, ..] => return Err(Error::Failed),
@@ -611,7 +611,7 @@ impl<'c, 'n: 'c, 'a: 'n> Conn<'c, 'n, 'a> {
     /// Any buffer size works: the request tells `net-stack` how much `buf` holds, and it takes no
     /// more than that off the connection, so nothing is read and then lost. One call moves at most
     /// 2048 bytes. (Until 2026-10-10 it asked for everything and dropped what did not fit -
-    /// `backlog/80` G3.)
+    /// `backlog/fixed/80` G3.)
     ///
     /// **Authority:** this connection's `READ` right.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {

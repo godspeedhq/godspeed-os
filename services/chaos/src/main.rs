@@ -63,7 +63,7 @@ const ARGWAIT_MAX_YIELDS: u32 = 50_000;   // the startup wait for the shell's ar
 // The harness was measuring itself in units whose cost it does not control (Commandment VIII: a proxy
 // is not the truth). The beat is now bounded by the CLOCK, so it is the same beat on every arch. (It is
 // SLEPT in `PACE_CHUNK_MS` chunks. The yield cap it replaced, `PACE_YIELDS`, was left declared and
-// unread until 2026-10-10, `backlog/80` V9.)
+// unread until 2026-10-10, `backlog/fixed/80` V9.)
 /// The beat between rounds, in MILLISECONDS.
 ///
 /// This was one SECOND, which made a 100-round run take 100 seconds of almost pure waiting. Seconds

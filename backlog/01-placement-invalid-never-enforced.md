@@ -30,7 +30,7 @@ warning: struct `PlacementInvalid` is never constructed
   --> smp/placement.rs, line 12
 ```
 
-(2026-10-10: `smp/placement.rs` was deleted, `backlog/80` K20 - it had no callers. The live placement
+(2026-10-10: `smp/placement.rs` was deleted, `backlog/fixed/80` K20 - it had no callers. The live placement
 is `task::resolve_spawn_core`.)
 
 And a single-core boot shows the consequence:

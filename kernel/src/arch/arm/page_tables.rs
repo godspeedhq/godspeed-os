@@ -98,7 +98,7 @@ fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
     // S (shareable), matching mmu.rs's RAM sections - EXCEPT the framebuffer, whose kernel section
     // (`mmu::section_fb`) is non-shareable. The two map the same physical pages, and ARM leaves
     // mismatched attributes for one page UNPREDICTABLE, shareability included; the page took S from the
-    // RAM rule while the section deliberately did not (backlog/80 K25). `WRITE_COMBINE` is how the
+    // RAM rule while the section deliberately did not (backlog/fixed/80 K25). `WRITE_COMBINE` is how the
     // neutral mapper says "framebuffer", so it is what selects non-shareable here.
     if !(flags.contains(PageFlags::WRITE_COMBINE) && flags.contains(PageFlags::PCD) && flags.contains(PageFlags::PWT)) {
         d |= 1 << 10;
@@ -315,7 +315,7 @@ pub fn read_page_table_base() -> u64 {
 /// an ARMv7 TTBR0 write does not flush non-global entries (SEC-26/27). Every service now has its own
 /// L1, so the flush is owed - and it is paid in `context_switch.rs`, which issues `TLBIALL` whenever
 /// TTBR0 changes, not here. No neutral code calls this now: its one neutral caller was the TLB
-/// shootdown's full-flush reload, deleted on 2026-10-10 with the shootdown (`backlog/80` K20), and it
+/// shootdown's full-flush reload, deleted on 2026-10-10 with the shootdown (`backlog/fixed/80` K20), and it
 /// never flushed anything on this port (`arch/CLAUDE.md`).
 pub unsafe fn write_page_table_base(base: u64) {
     // SAFETY: `mcr p15, 0, _, c2, c0, 0` writes TTBR0 at PL1; ISB ensures the following instruction
@@ -375,7 +375,71 @@ pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(
     Ok(())
 }
 
+/// Undo a boot selftest's `map_in_active_tables`: clear the 1 MiB L1 slot holding `virt` in the ACTIVE
+/// table and return its L2 to the arena. The frames it mapped are the caller's to free. Returns false,
+/// touching nothing, if that slot is not an L2 the active root owns.
+///
+/// A SELFTEST MUST LEAVE NO TABLE BEHIND, because every task inherits the kernel L1. `fill_kernel_identity`
+/// copies each kernel L1 entry into the child slots that are empty, so an L2 a boot selftest left in the
+/// kernel L1 ends up in EVERY address space. The user-mode selftest's was at 0x5000_0000, which is
+/// `TASK_HEAP_VA_START` on this port: each task's first heap megabyte was mapped into that one shared,
+/// kernel-owned table. The reclaim, which frees only tables the dying task owns, skipped it (256 frames
+/// leaked per `mem-pressure`, measured in QEMU 2026-10-13), and the dead task's user pages stayed in it
+/// for the next task to inherit - two tasks' heaps in one table, against invariant 2.
+///
+/// # Safety
+/// Single-threaded boot, before any task exists; nothing else uses the slot.
+pub unsafe fn release_active_l2(virt: u32) -> bool {
+    let l1_base = (read_page_table_base() as u32) & 0xFFFF_C000;
+    let l1_index = (virt >> 20) as usize;
+    // SAFETY: the active L1 is identity-mapped; the caller guarantees nothing else uses this slot.
+    unsafe {
+        let l1 = l1_base as *mut u32;
+        let e = l1.add(l1_index).read_volatile();
+        if e & 0b11 != L1_TYPE_TABLE {
+            return false;
+        }
+        let l2_pa = e & 0xFFFF_FC00;
+        match l2_slot(l2_pa) {
+            Some(s) if L2_OWNER[s].load(Ordering::Relaxed) == l1_base => {}
+            _ => return false,
+        }
+        l1.add(l1_index).write_volatile(0);
+        clean_dcache(l1.add(l1_index) as u32, 4);
+        // Every page of the megabyte, not just the ones the caller mapped: the slot is gone.
+        for j in 0..256u32 {
+            invalidate_tlb_page(((virt & 0xFFF0_0000) | (j << 12)) as u64);
+        }
+        free_l2(l2_pa);
+    }
+    true
+}
+
 // ---- Neutral PageTable API (real; exercised by the same encoders the selftest proves) ----
+
+unsafe extern "C" {
+    static __kernel_data_end: u8;
+    static __bss_start: u8;
+    static __fiq_stack_top: u8;
+}
+
+/// The kernel's memory as `(text..data end, bss start, end of the boot and exception stacks)`, from the
+/// linker script. Text, rodata and data start at the load address 0x8000.
+fn kernel_ranges() -> (u32, u32, u32) {
+    // SAFETY: taking the ADDRESS of linker-defined symbols; nothing is read through them.
+    unsafe {
+        (core::ptr::addr_of!(__kernel_data_end) as u32,
+         core::ptr::addr_of!(__bss_start) as u32,
+         core::ptr::addr_of!(__fiq_stack_top) as u32)
+    }
+}
+
+/// True if the 4 KiB page at `va` overlaps the kernel's own memory (see `kernel-arm.ld`).
+fn overlaps_kernel(va: u32) -> bool {
+    let (data_end, bss_start, end) = kernel_ranges();
+    let (lo, hi) = (va, va.saturating_add(0x1000));
+    (lo < data_end && hi > 0x8000) || (lo < end && hi > bss_start)
+}
 
 pub struct PageTable {
     root: u32,
@@ -414,6 +478,16 @@ impl PageTable {
         }
         let va = virt.0 as u32;
         let pa = phys.0 as u32;
+        // A USER page must not cover kernel memory. In this task's table it would replace the kernel's
+        // identity view of that address, so the kernel, running under this table, would read and write
+        // the task's page in place of its own data - which is how kernel stack slot 15 rewrote `ask`'s
+        // code (`kernel-arm.ld` has the layout). Refused, and said, rather than mapped.
+        if flags.contains(PageFlags::USER) && overlaps_kernel(va) {
+            let (data_end, bss_start, end) = kernel_ranges();
+            crate::kprintln!("arm32: REFUSED a user page at {:#010x} - it lies on kernel memory (text..data end {:#010x}, bss {:#010x}..{:#010x}); the image is too big for the user window below the kernel's bss",
+                va, data_end, bss_start, end);
+            return Err(MapError::VirtOutOfRange);
+        }
         let l1_index = (va >> 20) as usize;
         let l2_index = ((va >> 12) & 0xFF) as usize;
 
@@ -522,10 +596,11 @@ pub unsafe fn fill_kernel_identity(pt_root: u32) {
                 // 0x3ff000, so both L1 entries are TABLEs. The two branches above assume the SOURCE is a
                 // kernel SECTION; when a *service* spawns another service (the shell spawning
                 // observe-now), the spawner ALSO split this megabyte, so its kernel pages live in its L2
-                // - and neither branch above fires. Left unfixed, the kernel data this 1 MiB holds (an
-                // embedded service ELF at 0x34xxxx - .rodata is ~21 MiB of include_bytes! - and the
-                // per-core arenas) is unmapped in the child, and the child's ELF loader faults reading
-                // the ELF magic (0x34eb68). Fill the child L2's HOLES from the source L2's present
+                // - and neither branch above fires. Left unfixed, the kernel data this 1 MiB holds is
+                // unmapped in the child. When the kernel still embedded the service ELFs (one sat at
+                // 0x34xxxx, in ~21 MiB of include_bytes!), the child's ELF loader faulted reading the ELF
+                // magic (0x34eb68); the kernel embeds none now (step C), and `kernel-arm.ld` keeps its data
+                // below 0x3ff000. Fill the child L2's HOLES from the source L2's present
                 // entries; the child's own ctx page is already non-zero, so it is never overwritten.
                 let dl2 = (d & 0xFFFF_FC00) as *mut u32;
                 let sl2 = (s & 0xFFFF_FC00) as *const u32;
@@ -716,8 +791,114 @@ pub const BOOTLOADER_PLACED_TABLES: bool = false;
 
 pub fn get_hhdm_offset() -> u64 { 0 }
 pub unsafe fn set_hhdm_offset(_offset: u64) {}
-pub fn entry_for_va(_virt: u64) -> Option<u64> { None }
-pub fn unmap_4k_strided(_base: u64, _stride: u64, _count: usize) {}
+/// Where `virt` translates to in the KERNEL's address space, or `None` if it does not. Asked of the CPU's
+/// own table walker (`mmu::translate`, ATS1CPR), not of the descriptors this file wrote: re-reading them
+/// would only prove they say what was written. `install_kstack_guards` uses it to prove a guard page is
+/// really unmapped and the stack above it really is not, and it runs on the boot core under the kernel's
+/// L1, which is the table that answer is about.
+pub fn entry_for_va(virt: u64) -> Option<u64> {
+    if virt > u32::MAX as u64 { return None; }
+    super::mmu::translate(virt as u32).map(|pa| pa as u64)
+}
+
+// ---- Kernel-stack guard pages (hardening H4, on this port) ----
+//
+// The neutral pool packs every task's kernel stack end to end, one 68 KiB stride each, and leaves the low
+// 4 KiB of each stride for an unmapped guard (`task::install_kstack_guards`). This port maps RAM in 1 MiB
+// SECTIONS, which cannot leave a 4 KiB hole, and `unmap_4k_strided` was an empty stub - so on the Pi 2
+// there were no guards at all: a kernel path that ran one stack too deep would write silently into the
+// top of the stack below it, which on this port is where a BLOCKED task's saved user registers sit
+// (`srsdb` onto its SVC stack). Added 2026-10-12 while that was the suspect for `ask` and `recorder` dying
+// in slot 15; it was not the cause - the guard never fired, and the cause was the kernel's BSS lying under
+// the services' own pages (`kernel-arm.ld`). It stays because x86 and the Pi 4 have it (RISC-V 64's `unmap_4k_strided` is still a
+// stub).
+//
+// So the sections the pool spans are split into 4 KiB pages here, once, at boot, with exactly the
+// attributes the section had (`l2_small_page` with PRESENT|WRITABLE is the section's own Normal
+// write-back, shareable, PL1-only, executable mapping, as `fill_kernel_identity` already relies on), and
+// each guard page is then left unmapped. An overflow now takes a data abort in the kernel, which is
+// reported and halts: loud, where it was silent.
+//
+// The tables are a static of their own, not the L2 arena: they belong to the kernel and live forever, and
+// `reclaim_user_frames` ignores an L2 outside its arena, so no task's death can free one. Every service L1
+// copies the kernel L1's entries (`fill_kernel_identity`), so each service shares these tables and keeps
+// the guards.
+
+/// How many 1 MiB sections the guard tables can split. The pool is 224 stacks of 68 KiB, a little under
+/// 15 MiB, which spans at most 16 sections; one more for headroom. A pool that outgrows this is refused
+/// loudly below rather than left partly guarded.
+const GUARD_L2_TABLES: usize = 17;
+#[repr(align(1024))]
+struct GuardL2([[u32; 256]; GUARD_L2_TABLES]);
+static mut GUARD_L2: GuardL2 = GuardL2([[0; 256]; GUARD_L2_TABLES]);
+
+/// Unmap one 4 KiB page every `stride` bytes from `base`, `count` times, in the kernel's L1 - the guard
+/// below each kernel stack. Boot only: core 0, before any other core or task exists (the neutral
+/// caller's contract), so this core's TLB is the only one that can hold the old sections.
+pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
+    let end = base + stride * count as u64;
+    if end > u32::MAX as u64 || base & 0xFFF != 0 || stride & 0xFFF != 0 {
+        pl011_write(b"arm32: kstack guards NOT installed - the pool is not page-aligned or not below 4 GiB\r\n");
+        return;
+    }
+    let l1 = super::mmu::kernel_l1_root() as *mut u32;
+    let first = (base >> 20) as usize;
+    let last = ((end - 1) >> 20) as usize;
+    if last - first + 1 > GUARD_L2_TABLES {
+        pl011_write(b"arm32: kstack guards NOT installed - the pool spans more sections than the guard tables hold\r\n");
+        return;
+    }
+    // SAFETY: boot, core 0 only, IRQs masked for the whole change; `l1` is the kernel's own live L1 and
+    // `GUARD_L2` is a static nothing else references. Each section is replaced by a table that maps every
+    // page of it exactly as the section did, so an access in the window before the TLB invalidate below
+    // reaches the same physical page with the same attributes whichever entry it uses; the only pages
+    // whose meaning changes are the guards, which nothing touches.
+    unsafe {
+        let saved: u32;
+        core::arch::asm!("mrs {s}, cpsr", "cpsid if", s = out(reg) saved, options(nomem, nostack));
+        for (n, i) in (first..=last).enumerate() {
+            let e = l1.add(i).read_volatile();
+            if e & 0b11 != 0b10 {
+                // Not a section: something already split it (or it is unmapped), and these tables were
+                // not built for it. Leave it alone and say so - a guard the walker would not honour is
+                // worse than none, because `install_kstack_guards`' check (slot 0) would then believe it.
+                pl011_write(b"arm32: kstack guards - a pool section was not a plain section; left as it was\r\n");
+                continue;
+            }
+            let t = core::ptr::addr_of_mut!(GUARD_L2.0[n]) as *mut u32;
+            let sect = e & 0xFFF0_0000;
+            for j in 0..256u32 {
+                t.add(j as usize).write_volatile(l2_small_page(sect | (j << 12), PageFlags::PRESENT | PageFlags::WRITABLE));
+            }
+        }
+        for k in 0..count {
+            let va = (base + stride * k as u64) as u32;
+            let n = (va >> 20) as usize - first;
+            let t = core::ptr::addr_of_mut!(GUARD_L2.0[n]) as *mut u32;
+            t.add(((va >> 12) & 0xFF) as usize).write_volatile(0);
+        }
+        // The tables reach the point of coherency BEFORE any L1 entry points at them: the walker reads
+        // non-cacheable (see `alloc_l2`).
+        clean_dcache(core::ptr::addr_of!(GUARD_L2) as u32, (GUARD_L2_TABLES * 1024) as u32);
+        for (n, i) in (first..=last).enumerate() {
+            if l1.add(i).read_volatile() & 0b11 != 0b10 { continue; }
+            let t = core::ptr::addr_of!(GUARD_L2.0[n]) as u32;
+            l1.add(i).write_volatile(t | L1_TYPE_TABLE);
+        }
+        clean_dcache(l1 as u32, 16384);
+        core::arch::asm!(
+            "dsb",
+            "mcr p15, 0, {z}, c8, c7, 0",  // TLBIALL - drop the sections this core cached
+            "mcr p15, 0, {z}, c7, c5, 6",  // BPIALL
+            "dsb",
+            "isb",
+            "msr cpsr_c, {s}",
+            z = in(reg) 0u32,
+            s = in(reg) saved,
+            options(nostack),
+        );
+    }
+}
 pub fn harden_hhdm_nx() {}
 /// Free every user frame a dying task owns, and return its own L2 tables to the arena; return the count
 /// of frames freed. Mirrors x86's `reclaim_user_frames` for the ARM two-level short-descriptor tables.
@@ -945,15 +1126,12 @@ pub fn selftest() {
         pl011_write(b"arm32: pgtable FAIL - see above\r\n");
     }
 
-    // Leave the tables as we found them: invalidate the two test entries. (They point into the gap,
-    // so leaving them would be harmless, but tidy is better than harmless.)
-    let l1_base = (read_page_table_base() as u32) & 0xFFFF_C000;
-    // SAFETY: clearing the single L1 slot for the test gap (index 0x3C0); it was invalid before us.
-    unsafe {
-        let l1 = l1_base as *mut u32;
-        let slot = l1.add((TEST_VA_RW >> 20) as usize);
-        slot.write_volatile(0);
-        clean_dcache(slot as u32, 4);
-        invalidate_tlb_page(TEST_VA_RW as u64);
+    // Leave the tables as we found them, the L2 included: the kernel L1 is copied into every task
+    // (`release_active_l2`). This cleared the L1 slot and kept the L2, so the arena lost one table for
+    // the life of the machine. Both pages share one megabyte, so one release covers them; the frames
+    // are kernel RAM and stay.
+    // SAFETY: single-threaded boot, before any task exists; the slot is this selftest's own.
+    if !unsafe { release_active_l2(TEST_VA_RW) } {
+        crate::kprintln!("page_tables: selftest - its page table could NOT be released; every task inherits it");
     }
 }

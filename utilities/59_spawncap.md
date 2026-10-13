@@ -8,7 +8,7 @@ that a spawner is handed a capability to the service it started and that the cap
 ## Status, as built and honest (2026-10-10)
 
 Built. It answers `spawncap help` and `spawncap version` since 2026-10-10; before that it was missing
-from the shell's `UTILS` list, so `version` and `help` were read as service names (`backlog/80` H8).
+from the shell's `UTILS` list, so `version` and `help` were read as service names (`backlog/fixed/80` H8).
 Its sibling `spawnwired` (spawn `greet` wired to `pong` by a passed capability) has a `help` block and
 no spec of its own; it is recorded as vocabulary debt in `COMMANDMENTS.baseline.toml`.
 

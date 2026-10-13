@@ -37,22 +37,22 @@ SDK         = REPO_ROOT / "sdk"
 # By FULL PATH. This was a set of file NAMES matched with `rs_file.name in SDK_PERMITTED`, so any
 # `mmio.rs` anywhere under `sdk/` - a new crate's, say - was waved through uncounted. And a permitted
 # file's count was never compared with anything: the audit's table says how many each holds, and a
-# new `unsafe` in `mmio.rs` changed no number this script looked at (backlog/80 T6).
+# new `unsafe` in `mmio.rs` changed no number this script looked at (backlog/fixed/80 T6).
 SDK_PERMITTED = {"sdk/rust/src/syscall.rs", "sdk/rust/src/mmio.rs", "sdk/rust/src/dma.rs",
                  "sdk/rust/src/adversarial.rs"}
 
 # ...and the files that hold `unsafe` anyway, frozen at their counts (18.5's grandfathering, applied
-# to the SDK). These are NOT 90 separate defects: 86 of the 90 are `unsafe { raw_syscall(..) }` call
+# to the SDK). These are NOT 85 separate defects: 82 of the 85 are `unsafe { raw_syscall(..) }` call
 # sites. `raw_syscall` is an `unsafe fn` because it issues the trap instruction, so every caller must
 # open a block - and these two files ARE the wrapper layer that exists to keep services unsafe-free.
 # The isolation 18.1 describes worked (services/ is at ZERO) and stopped one layer short of itself.
 #
 # Freezing them makes the debt visible and bounded. The real fix is a SAFE `raw_syscall` wrapper -
 # the kernel validates every user pointer, so passing integers to a validating callee is sound - which
-# would collapse ~86 of these to nothing. That is an SDK redesign on every service's call path, so it
+# would collapse ~82 of these to nothing. That is an SDK redesign on every service's call path, so it
 # is recorded rather than done here.
 SDK_GRANDFATHERED = {
-    "sdk/rust/src/service_context.rs": 80,
+    "sdk/rust/src/service_context.rs": 77,
     "sdk/rust/src/ipc.rs": 8,
 }
 AUDIT_FILE  = REPO_ROOT / "audits" / "unsafe-audit.md"
@@ -263,7 +263,7 @@ def main() -> int:
     # 18.1/18.2 for the SDK. THIS WAS SCANNED BY NOTHING: the script defined two roots, kernel/src
     # and services, so `sdk/`'s ~125 unsafe lines were audited by no tool at all - while 18.4 says
     # "CI checks the file matches source" and the audit's own header implied the SDK's unsafe lived
-    # only in the four permitted files. It does not (backlog/18).
+    # only in the four permitted files. It does not (backlog/fixed/18).
     sdk_table = parse_sdk_table()
     # Every SDK file the audit's table or this script names must exist, and the two must agree on a
     # grandfathered floor: the audit is the record, and a script holding a different number is a

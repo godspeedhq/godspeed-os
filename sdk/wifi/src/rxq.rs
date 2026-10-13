@@ -58,7 +58,7 @@ impl RxQueue {
     ///
     /// A head frame `out` cannot hold is DROPPED and counted in [`RxQueue::too_big`], and 0 returned:
     /// it used to stay at the head, so every later call returned 0 and the queue never moved again
-    /// (`backlog/80` S8).
+    /// (`backlog/fixed/80` S8).
     pub fn pop(&mut self, out: &mut [u8]) -> usize {
         if self.count == 0 {
             return 0;

@@ -1,11 +1,11 @@
-# GodspeedOS self-check, part 2 of 9: the assert forms, self-documentation, system info, introspection, observe
+# GodspeedOS self-check, part 2 of 10: the assert forms, self-documentation, system info, introspection, observe
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck meta` runs THIS part alone; `selfcheck` runs them all
 # and prints one tally for the whole suite.
 #
 # They are separate files because a baked script is indexed with u16 offsets and the single file had
-# reached 65,139 bytes of a 65,536 ceiling (`backlog/47`). Each part now carries its own budget - and
+# reached 65,139 bytes of a 65,536 ceiling (`backlog/fixed/47`). Each part now carries its own budget - and
 # its own 256-statement detail budget, so the report no longer stops naming statements part way.
 #
 # No part may declare a `fn` or a `let` another part uses: each is interpreted on its own, with a
@@ -48,13 +48,25 @@ assert ok version
 assert ok cores
 assert ok mem
 assert ok date
-# wait: the q-abortable pacing pause (the library watch loop is built on it)
+# wait: the q-abortable pacing pause (repeat's pause is built on it)
 assert ok wait 1
 assert fails wait
 assert fails wait 0
 assert fails wait 99999
 assert ok wait help
 assert ok wait version
+# repeat: run a command again - a counted run holds, one whose runs fail is Err, and the refusals
+assert ok repeat count 2 echo repeated
+assert ok repeat count 2 wait 1 echo repeated
+assert fails repeat count 2 assert fails echo repeated
+assert fails repeat count 0 echo repeated
+assert fails repeat wait 0 echo repeated
+assert fails repeat count 2
+assert fails repeat repeat echo repeated
+assert ok repeat help
+assert ok repeat version
+# watch is the POSIX word for it: a hint to `repeat`, never run
+assert fails watch mem
 # whatis: a name's kind + origin (the honest which - no $PATH here, so kind IS the answer)
 assert ok whatis dir
 whatis dir | assert contains built-in
@@ -79,7 +91,7 @@ mem | assert contains used
 # effect. That is a repair wearing a probe's face, it costs time on every run, and a test that changes
 # the system has stopped measuring it.
 #
-# `date epoch` FAILS when the clock is unset (it printed 0 until 2026-10-10, `backlog/80` H20, and the
+# `date epoch` FAILS when the clock is unset (it printed 0 until 2026-10-10, `backlog/fixed/80` H20, and the
 # probe iterated that 0), so `if date epoch` is the probe: it reads the clock and changes nothing.
 # `assert contains` cannot serve as the probe because it FAILS the suite rather than returning a
 # boolean - that dead end is what made an earlier attempt invent syntax.

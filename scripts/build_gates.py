@@ -7,7 +7,7 @@ and checks. The three board scripts - `arm_build.py`, `pi4_build.py` and `riscv_
 every Pi and VisionFive image - each ran a hand-copied list of SEVEN, and said so as a virtue: "listed
 explicitly, so adding a checker is a decision each build path makes". In practice every checker added
 since was added to one path, so a Pi image skipped the documentation, backlog, one-way, stdlib-gap,
-python-floor and nonfree gates, among others (backlog/80 T8). This project's own rule is that a
+python-floor and nonfree gates, among others (backlog/fixed/80 T8). This project's own rule is that a
 checker on one build path is a checker on none, and it is the reason the list is READ, not copied:
 `EXTRA_CHECKS` in `osdev/src/main.rs` is the one list, exactly as `conform.py` reads it.
 

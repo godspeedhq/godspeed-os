@@ -432,7 +432,7 @@ The fourth is reason 4 (`DOWN_NOT_BUILT`). **Corrected 2026-10-08:** this descri
 Lite's radio before its driver existed. The AIC8800 now runs to a station (`docs/wifi-aic8800.md`, V0-V6),
 and `wifi-driver` sends reason 4 only when that bring-up stops before a station interface exists - so the
 shell's old sentence, "its driver is not written yet ... nothing here can bring it up", was untrue; since
-2026-10-10 it names a stage that is not built instead (`backlog/80` H13). Whether `radio on` and
+2026-10-10 it names a stage that is not built instead (`backlog/fixed/80` H13). Whether `radio on` and
 `powercycle` should retry on this reason is an open decision (`audits/documentation-audit.md` Audit 12). As written before: the VisionFive 2 Lite's radio, which this driver identifies and cannot yet
 run. `wifi radio on` and `wifi radio powercycle` print the same sentence there and restart
 nothing, since a restart would identify the same chip and stop at the same place. `wifi radio off hard` does
@@ -475,9 +475,9 @@ Every number is a raw count the driver keeps in its `Session` (rule 7); nothing 
 | View | What it prints |
 |---|---|
 | `wifi debug stats` | the control channel: requests sent, accepted, refused (and the last refusal's command and status), unanswered; the session's age on the driver's own clock |
-| `wifi debug transport` | the bus side, named for the radio that answers (`sdio` onboard, `usb` for a dongle): bytes each way, frames read by channel (control, event, data, glommed, flow-control, other), and the frames read during a control wait and lost to the scan. It printed the CYW43455's SDIO function and block sizes for every radio until 2026-10-10 (`backlog/80` H13); the chip's own layout is in its driver's docs |
+| `wifi debug transport` | the bus side, named for the radio that answers (`sdio` onboard, `usb` for a dongle): bytes each way, frames read by channel (control, event, data, glommed, flow-control, other), and the frames read during a control wait and lost to the scan. It printed the CYW43455's SDIO function and block sizes for every radio until 2026-10-10 (`backlog/fixed/80` H13); the chip's own layout is in its driver's docs |
 | `wifi debug events` | how many of each firmware event this driver names has arrived, and the last one's code and status |
-| `wifi debug firmware` | the radio's driver, the running firmware's own version string and capability words (asked of it now, not remembered), its MAC, and that the host runs the handshake. It printed the CYW43455 and its image for every radio until 2026-10-10 (`backlog/80` H13); the chip, the image and its provenance are `wifi hardware` and the driver's docs |
+| `wifi debug firmware` | the radio's driver, the running firmware's own version string and capability words (asked of it now, not remembered), its MAC, and that the host runs the handshake. It printed the CYW43455 and its image for every radio until 2026-10-10 (`backlog/fixed/80` H13); the chip, the image and its provenance are `wifi hardware` and the driver's docs |
 | `wifi debug trace` | the last 64 frames on the bus, oldest first |
 
 ```

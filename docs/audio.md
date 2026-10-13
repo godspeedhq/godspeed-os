@@ -234,7 +234,7 @@ An absent, wedged or restarting driver makes `audio` return with a loud unavaila
 Asked for by the operator, on the model of `wifi hardware` (`utilities/56_wifi.md` 11). The reason is
 sharper than symmetry: the rest of `audio` assumes a machine has one audio device, and the T630 has two
 class-0x0403 controllers - its analog Azalia with the ALC255, and the Radeon's HDMI audio - of which the
-kernel binds the FIRST, the HDMI one ("Found while preparing" 2, `backlog/80` K2). A report listing both,
+kernel binds the FIRST, the HDMI one ("Found while preparing" 2, `backlog/fixed/80` K2). A report listing both,
 with which one the driver holds, would have shown that on the first boot instead of in an audit.
 
 - **`audio hardware`** is a report, one row per audio device, and pipes as records: its name, what it
@@ -366,7 +366,7 @@ WAV; per-application volume; HDMI audio.
 
 The verbs above define the driver's request protocol at A4, defined ONCE in a shared module the shell and
 the driver both use, as `sdk/wifi/src/wire.rs` is for `wifi`, and TAGGED so a late reply can never be
-taken for the answer to a later question (`backlog/70`). One request per verb above - status, info,
+taken for the answer to a later question (`backlog/fixed/70`). One request per verb above - status, info,
 outputs, set output, set volume, mute, unmute, power on / off / hard, tone - and for `play` a stream: open
 with the format, PCM chunks of at most 4 KiB each answered at once with the free space left, then end. The
 names are A4's to choose.
@@ -657,7 +657,7 @@ respawn of a 100-round chaos run.)*
 
 **The protocol** is `sdk/audio`'s `wire`, read by both sides, as `sdk/wifi`'s is for the radio. Every
 request is tagged (`[TAGGED, tag, op, ...]`, answered `[TAGGED, tag, status, ...]`), so a late answer is
-never read as the next request's (backlog/70) - in the protocol from its first byte rather than added
+never read as the next request's (backlog/fixed/70) - in the protocol from its first byte rather than added
 after. And **every answer is immediate**: `tone` starts the sound and answers, the shell follows it with
 `status` every 200 ms, and `q` sends `stop`. The driver can do that because its one wait is
 `gs::driver::irq`'s, which hands a request back mid-tone, so the radio's machinery for answers the shell is
@@ -876,7 +876,7 @@ by assumption: its arena is reserved once and never recycled, `start` resets the
 before touching a control block, and every control block's destination is the PWM FIFO, so the engine
 reads only its own arena and writes only to one peripheral register. **Not audio's, and not yet explained.** A
 first hypothesis - the AArch64 context switch skipping its TLB flush when a respawn was handed a recycled
-page-table root - was fixed and tested on the card, and the faults continued. `backlog/72` carries the
+page-table root - was fixed and tested on the card, and the faults continued. `backlog/fixed/72` carries the
 evidence, what is ruled out (the CPU clock, with `force_turbo=1`; this DMA; that TLB flush), and the
 instrument that comes next.
 
@@ -1005,7 +1005,7 @@ the wrong device - and a machine with no audio driver at all still has its devic
 
 **QEMU has one controller**, so `osdev test audio` shows the row, the mark, the pipe, one device in full
 and a refused name (50 checks, all passing). The T630 is the machine with two, and is where this shows
-`backlog/80` K2 in one line.
+`backlog/fixed/80` K2 in one line.
 
 ## Step A4: `audio debug` (2026-10-09, `feat/audio-finish`)
 

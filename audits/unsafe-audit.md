@@ -11,7 +11,7 @@ it fails on ANY `unsafe` line - §18.2 forbids service `unsafe`).
 
 **`sdk/` IS NOW SCANNED** (2026-09-12). It was scanned by nothing: the script defined two roots,
 `kernel/src` and `services`, so ~125 `unsafe` lines went through no tool at all while §18.4 said "CI
-checks the file matches source". `backlog/18` recorded the gap; this closes it.
+checks the file matches source". `backlog/fixed/18` recorded the gap; this closes it.
 
 | File | Lines | Status |
 |------|-------|--------|
@@ -19,19 +19,19 @@ checks the file matches source". `backlog/18` recorded the gap; this closes it.
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **80** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/80 K14) |
+| `sdk/rust/src/service_context.rs` | **77** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
-**The 92 are not 92 defects.** 88 of them are `unsafe { raw_syscall(..) }` CALL SITES. `raw_syscall`
+**The 85 (77 + 8) are not 85 defects.** 82 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
 is an `unsafe fn` because it issues the trap instruction, so every caller must open a block - and
 these two files *are* the wrapper layer whose whole purpose is to keep services `unsafe`-free. That
 worked: `services/` is at **zero**. The isolation simply stopped one layer short of itself.
 
-The remaining 4 are genuinely different and are the ones to look at first: three bare `unsafe {`
-blocks and one raw-pointer deref (`&*(SERVICE_CTX_ADDR as *const ServiceContextData)`).
+The remaining 3 are genuinely different and are the ones to look at first: two bare `unsafe {`
+blocks (the `SEND_CAP_CACHE` walks) and one raw-pointer deref (`&*(SERVICE_CTX_ADDR as *const ServiceContextData)`).
 
 **The real fix, recorded rather than done:** give `raw_syscall` a SAFE wrapper. The kernel validates
-every user pointer, so passing integers to a validating callee is sound, and ~86 of these would
+every user pointer, so passing integers to a validating callee is sound, and ~82 of these would
 collapse to nothing - taking the SDK to roughly the 35 lines §18.1 actually sanctions. It is an SDK
 redesign on every service's call path and wants hardware validation, so it is written down here
 instead of attempted in the same change that made it visible (§26.7).
@@ -41,7 +41,7 @@ FAILS. They may decrease freely.
 
 ---
 
-## 2026-10-10 - the unused TLB shootdown deleted; P7 tests the property (backlog/80 K20)
+## 2026-10-10 - the unused TLB shootdown deleted; P7 tests the property (backlog/fixed/80 K20)
 
 The cross-core software TLB broadcast in `smp/ipi.rs` had no caller. It was deleted after a per-port
 proof that translation coherence holds without it (CLAUDE.md 10.5): nothing unmaps a live user mapping,
@@ -58,7 +58,16 @@ its own core, and AArch64's free invalidates inner-shareable for the idle core t
 | `arch/arm/mod.rs`, `arch/loongarch64/mod.rs`, `arch/riscv32/mod.rs`, `arch/s390x/mod.rs` | -1 each | **shrank**: the empty `broadcast_ipi_all_but_self` stub. |
 | `sdk/rust/src/adversarial.rs` | 8 -> 10 (+2) | **The P7 stale-translation test** (permitted module, 18.1). `Region`, a run of pages that can only be built from a successful `AllocMem`, with `stamp` (one `write_volatile` per 32-bit word) and `first_not` (one `read_volatile` per word). Sound because the constructor is the only way to make one: the pages are mapped, writable, private to the task, page-aligned, and no Rust reference points into them. It lets the `probe` service stay `unsafe`-free while P7 stamps a writer's pages and has a checker given the same addresses read them. |
 
-## 2026-10-10 - the spawn-by-name syscalls retired; EHCI INTx follows its driver (backlog/80 K14, K17)
+## 2026-10-11 - the NET_DEVICE wrappers removed (backlog/21 step 2)
+
+No port has an in-kernel network device, and nothing has been granted NET_DEVICE since 2026-09-13, so
+the SDK's three wrappers for syscalls 42-44 had no caller anywhere in the tree.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 80 -> 77 (-3) | **shrank**: the `unsafe { raw_syscall(42 / 43 / 44, ..) }` call sites went with `net_frame_tx`, `net_frame_rx` and `net_info`. `SDK_GRANDFATHERED` in `scripts/unsafe_check.py` is lowered to 77 to lock it in. The syscalls stay in the kernel for now; removing them is a kernel change and the entry's last step. |
+
+## 2026-10-10 - the spawn-by-name syscalls retired; EHCI INTx follows its driver (backlog/fixed/80 K14, K17)
 
 The kernel catalogue holds `supervisor` alone, so `Spawn` (7), `SpawnPipe` (19),
 `SpawnReturningEndpoint` (38) and `SpawnWithCaps` (39) could only answer NotFound or AlreadyRunning.
@@ -71,7 +80,7 @@ They are retired, with their SDK wrappers; `SpawnImage` (52) is how a service st
 
 ## 2026-10-04 - Pi 4: ask the faulting core's own MMU (feat/wifi-driver)
 
-`backlog/72`: the page walk above came back the same way in four faults - every frame allocated and owned
+`backlog/fixed/72`: the page walk above came back the same way in four faults - every frame allocated and owned
 by the faulting task alone, the leaf valid and executable, and the core had nonetheless taken an L3
 translation fault. The software walk reads the tables through memory and cannot see what the core had
 cached, so the report now also asks the core: `AT S1E0R` on the faulting address at the very top of the
@@ -85,7 +94,7 @@ entry that was briefly invalid succeeds at once.
 
 ## 2026-10-04 - Pi 4: a page walk in the user-fault report (feat/wifi-driver)
 
-`backlog/72`: Pi 4 tasks take instruction aborts and permission faults on their own code - the shell on the
+`backlog/fixed/72`: Pi 4 tasks take instruction aborts and permission faults on their own code - the shell on the
 first instruction of `service_main` - with the TLB flushed on every switch. The fault report now walks the
 faulting address through the table the core had installed and says whether each frame on the way has a
 second owner. Read-only throughout; nothing is written to any table or to the allocator.
@@ -732,7 +741,7 @@ is one flag away if a hardware fault ever needs bisecting against it.
 *(Correction, 2026-09-07: no longer true THROUGH THE BUILD SCRIPT. `pi4_build.py --features` became
 ADDITIVE - it prepends `pi4,pi4-smp` to whatever is passed - so the script cannot produce a build
 without `pi4-smp`; that now needs a direct `cargo` invocation. The `--single-core` option that did it
-was removed with the `single-core` feature (backlog/02), on the reasoning that one artefact should
+was removed with the `single-core` feature (backlog/fixed/02), on the reasoning that one artefact should
 boot on any core count. The feature itself still exists and is still pinned.)*
 
 No new `unsafe`.
@@ -2495,14 +2504,14 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 | `arch/aarch64/mod.rs` | 68 -> 69 (+1) | `claim_serial` reads MPIDR_EL1 (via `boot::get_lapic_id`) to identify the core holding the UART, so a write that re-enters on the SAME core - an ISR logging mid-line, or a panic raised inside a write - is recognised as nested rather than waiting on a claim it already holds.
 
 A side-effect-free system-register read, valid at any point including early boot, which is what makes it safe to take on EVERY log line here. The x86 equivalent is not: core identity there costs an APIC MMIO read with a boot-ordering precondition, and putting it on the serial path was a fix worse than the bug it addressed. Same intent, different cost, different answer. |
-| `arch/x86_64/pci.rs` | 21 -> 22 (+1) | `bar_len` (2026-10-09, backlog/80 K1) - sizes a memory BAR at grant time so a driver's register window is its device's and not a fixed 64 KiB. The standard probe (memory decode off, all ones written to the BAR, the mask read back, BAR and decode restored), as ONE block under `PCI_CONFIG_LOCK`: split across the existing `config_read32`/`config_write32`, each of which takes the lock alone, another core's configuration read could land between the writes and see the BAR holding the mask. Only the command half of the command/status dword is written back, because the status half is write-1-to-clear. Every value written is restored before the lock is released. |
-| `arch/x86_64/syscall_entry.rs` | 16 -> 14 (-2) | **shrank** (2026-10-10, backlog/80 K7): `int80_entry` deleted - the naked `int 0x80` syscall stub and its `#[unsafe(naked)]`. It was still installed at IDT[0x80] with DPL=3, so any service could raise it, and it ran the syscall chain on the top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off. The SDK traps with `ud2` on every x86 machine; nothing used it. |
-| `smp/placement.rs` | 1 -> deleted (-1) | 2026-10-10, backlog/80 K20: the whole file had no callers (`resolve` and its `static mut RR_COUNTER`); the live placement is `task::resolve_spawn_core`. Its one block, the `RR_COUNTER` increment, goes with it. |
-| `arch/x86_64/mod.rs` | 40 -> 38 (-2) | **shrank** (2026-10-10, backlog/80 K20): `uart_rx_enable` deleted - the `unsafe fn` and its port-write block. It had no caller by design (unmasking PIC IRQ 4 jams the PIC on real hardware, which the boot comment in `main.rs` records); COM1 RX is polled from the core-0 timer. |
-| `arch/arm/exceptions.rs` | 24 -> 23 (-1) | **shrank** (2026-10-10, backlog/80 K25): the kernel-fault reporter's closing `wfi` loop is replaced by `halt_all_cores`, so a kernel fault halts every core rather than parking only the one that faulted (CLAUDE.md 6.2, 19). The loop's one `asm!` block goes. |
-| `arch/arm/irq.rs` | 18 -> 17 (-1) | **shrank** (2026-10-10, backlog/80 K25): `route_usb_irq_to_core0` deleted - it had no callers, and its one block (the legacy-controller enable write) never ran. `unmask_usb_irq` is the live enable. |
-| `arch/aarch64/mmu.rs` | 23 -> 24 (+1) | 2026-10-10, backlog/80 K21: `remap_high_nc`, one block. The Pi 4 framebuffer was mapped Normal write-back in the kernel's 2 MiB direct-map blocks and Normal non-cacheable in the `console` service - mismatched attributes for one physical page, which ARM leaves UNPREDICTABLE. The block splits the blocks the framebuffer touches into pages (the same arena and the same attribute-carrying copy as the kstack-guard split) and gives only the framebuffer's pages MAIR slot 2, break-before-make: the range cleaned from the cache first, each L2 entry invalidated and the TLB dropped before its table goes in. Sound because it runs on the BSP before any secondary starts and before the console is up, on this module's own tables, over a range nothing is touching. |
-| `arch/x86_64/iommu.rs` | 74 -> 79 (+5) | 2026-10-10, backlog/80 K11: a confinement is never left unrecorded. `unconfine` is the one way a confinement is undone (`unsafe fn`, +1, with the four blocks `release_device` had - write the passthrough DTE, `sfence`, invalidate, free the table - moved into it unchanged); `release_device` calls it (+1 for the call, -4 for the blocks that moved). `confine_device` gains three: freeing a partial table when an arena page fails to map (it leaked, root and all), freeing a device's PREVIOUS table when it is confined again (its record was overwritten and the table kept forever), and calling `unconfine` when the last record slot was taken by another core while the table was being built. Each frees or reverts only a table built here and reachable from nothing but this device's DTE, which each SAFETY comment states. |
+| `arch/x86_64/pci.rs` | 21 -> 22 (+1) | `bar_len` (2026-10-09, backlog/fixed/80 K1) - sizes a memory BAR at grant time so a driver's register window is its device's and not a fixed 64 KiB. The standard probe (memory decode off, all ones written to the BAR, the mask read back, BAR and decode restored), as ONE block under `PCI_CONFIG_LOCK`: split across the existing `config_read32`/`config_write32`, each of which takes the lock alone, another core's configuration read could land between the writes and see the BAR holding the mask. Only the command half of the command/status dword is written back, because the status half is write-1-to-clear. Every value written is restored before the lock is released. |
+| `arch/x86_64/syscall_entry.rs` | 16 -> 14 (-2) | **shrank** (2026-10-10, backlog/fixed/80 K7): `int80_entry` deleted - the naked `int 0x80` syscall stub and its `#[unsafe(naked)]`. It was still installed at IDT[0x80] with DPL=3, so any service could raise it, and it ran the syscall chain on the top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off. The SDK traps with `ud2` on every x86 machine; nothing used it. |
+| `smp/placement.rs` | 1 -> deleted (-1) | 2026-10-10, backlog/fixed/80 K20: the whole file had no callers (`resolve` and its `static mut RR_COUNTER`); the live placement is `task::resolve_spawn_core`. Its one block, the `RR_COUNTER` increment, goes with it. |
+| `arch/x86_64/mod.rs` | 40 -> 38 (-2) | **shrank** (2026-10-10, backlog/fixed/80 K20): `uart_rx_enable` deleted - the `unsafe fn` and its port-write block. It had no caller by design (unmasking PIC IRQ 4 jams the PIC on real hardware, which the boot comment in `main.rs` records); COM1 RX is polled from the core-0 timer. |
+| `arch/arm/exceptions.rs` | 24 -> 23 (-1) | **shrank** (2026-10-10, backlog/fixed/80 K25): the kernel-fault reporter's closing `wfi` loop is replaced by `halt_all_cores`, so a kernel fault halts every core rather than parking only the one that faulted (CLAUDE.md 6.2, 19). The loop's one `asm!` block goes. |
+| `arch/arm/irq.rs` | 18 -> 17 (-1) | **shrank** (2026-10-10, backlog/fixed/80 K25): `route_usb_irq_to_core0` deleted - it had no callers, and its one block (the legacy-controller enable write) never ran. `unmask_usb_irq` is the live enable. |
+| `arch/aarch64/mmu.rs` | 23 -> 24 (+1) | 2026-10-10, backlog/fixed/80 K21: `remap_high_nc`, one block. The Pi 4 framebuffer was mapped Normal write-back in the kernel's 2 MiB direct-map blocks and Normal non-cacheable in the `console` service - mismatched attributes for one physical page, which ARM leaves UNPREDICTABLE. The block splits the blocks the framebuffer touches into pages (the same arena and the same attribute-carrying copy as the kstack-guard split) and gives only the framebuffer's pages MAIR slot 2, break-before-make: the range cleaned from the cache first, each L2 entry invalidated and the TLB dropped before its table goes in. Sound because it runs on the BSP before any secondary starts and before the console is up, on this module's own tables, over a range nothing is touching. |
+| `arch/x86_64/iommu.rs` | 74 -> 79 (+5) | 2026-10-10, backlog/fixed/80 K11: a confinement is never left unrecorded. `unconfine` is the one way a confinement is undone (`unsafe fn`, +1, with the four blocks `release_device` had - write the passthrough DTE, `sfence`, invalidate, free the table - moved into it unchanged); `release_device` calls it (+1 for the call, -4 for the blocks that moved). `confine_device` gains three: freeing a partial table when an arena page fails to map (it leaked, root and all), freeing a device's PREVIOUS table when it is confined again (its record was overwritten and the table kept forever), and calling `unconfine` when the last record slot was taken by another core while the table was being built. Each frees or reverts only a table built here and reachable from nothing but this device's DTE, which each SAFETY comment states. |
 | `arch/x86_64/pci.rs` | 20 -> 21 (+1) | `cfg_read_gated` - the one gated configuration read a userspace enumerator needs (step D2). An `out dx, eax` to 0xCF8 and an `in eax, dx` from 0xCFC, held together under the `PCI_CONFIG_LOCK` that already guards this pair.
 
 This block replaces FOUR that an earlier revision of the same feature added (`pci_cfg_out32` / `pci_cfg_in32` in both `arch/x86_64/mod.rs` and `arch/aarch64/mod.rs`, +2 each). Those exposed SELECT and READ as separate operations, which was wrong on its own terms: the index/data pair is stateful, and the kernel drives it too on its spawn and kill paths, so a split interface let a service and the kernel interleave and each act on the other's selected register. A lock could not close that, because holding one across two syscalls means the kernel waiting on a service. Folding them into one atomic operation removed the race AND three of the four unsafe lines, and the aarch64 access moved into `pcie.rs` beside the registers it drives rather than reaching in through an exported pointer helper. Both `mod.rs` files return to their pre-branch counts. |
@@ -2701,12 +2710,12 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/bootcon.rs | 2 | permitted |
-| arch/arm/page_tables.rs | 32 | permitted |
+| arch/arm/page_tables.rs | 37 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |
 | arch/arm/spawn.rs | 4 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
-| arch/arm/usermode.rs | 15 | permitted |
+| arch/arm/usermode.rs | 17 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
 | arch/arm/mod.rs | 52 | permitted |
 | arch/loongarch64/mod.rs | 24 | permitted |
@@ -2752,9 +2761,9 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | task/scheduler.rs | 37 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 1130 lines across 72 files  
+**Permitted total:** 1133 lines across 72 files  
 **Grandfathered total:** 50 lines across 6 files  
-**Grand total:** 1180 lines across 78 files
+**Grand total:** 1183 lines across 78 files
 
 > These three lines read 394/22, 53/6 and 447/28 until 2026-09-12 - a tree of 28 files that had not
 > existed for months, and a grand total 2.7x low. They are derived by summing the inventory block
@@ -3104,7 +3113,7 @@ for BIOS release) and USBLEGCTLSTS (disable firmware SMIs). Each access is withi
 the just-mapped 64 KiB MMIO window at a bounded offset (< 0x10000), during
 single-threaded BSP boot. All carry `// SAFETY:` comments.
 
-One more (+1, 2026-10-09) for `bar_len`, the BAR-sizing probe at grant time (backlog/80 K1): the
+One more (+1, 2026-10-09) for `bar_len`, the BAR-sizing probe at grant time (backlog/fixed/80 K1): the
 command register and one BAR (two for a 64-bit BAR) written and read back through the same port pair,
 the whole sequence under `PCI_CONFIG_LOCK` so no other access observes a BAR holding its size mask,
 and every value restored before the lock is released. `// SAFETY:` comment present.
@@ -3665,3 +3674,61 @@ the bound still visible per 26.6.1), and a rate-limited line naming an exhausted
 known - the failure reaches the spawner as `FrameAllocFailed`, which named a frame when no frame was
 short. Found by a Pi 2 chaos run whose spawns were refused with 9 MiB of 921 in use
 (`docs/wifi-usb.md` 47).
+
+## `arch/arm/page_tables.rs` 32 -> 35 (2026-10-12): kernel-stack guard pages, and no user page over kernel memory
+
+**Three blocks for one fault, and the first is not its cause.** `ask` and `recorder` died whenever they ran
+in task slot 15 on the Pi 2. The cause was LAYOUT: the kernel reaches its own memory at its physical
+address, every service is linked at 0x400000 with its context page at 0x3ff000, and in a task's table its
+own pages replace the kernel's view of those addresses. The kernel's BSS started right after its data and
+covered that range, so kernel stack slot 15 (0x3ff000..0x40f000) was, while the slot-15 task's table was
+installed, that task's code: its first entry pushed onto `ask`'s entry page. Measured, not inferred - the
+page changed between publish and first entry with no kernel store through the identity map and no user
+mapping writing it. `kernel-arm.ld` now starts BSS at 8 MiB, above every image (the largest ends at
+0x6aa034), and asserts that text, rodata and data end at or below 0x3ff000.
+
+**Block 1 (+1): the body of `unmap_4k_strided`, which was an empty stub here.** It was written while a
+stack overflow was the suspect, and the guard never fired, so it fixed nothing in this fault. It stays as
+the hardening x86 and the Pi 4 already have (RISC-V 64's is still a stub): the arm32 boot never called `task::install_kstack_guards`, so
+the Pi 2 had no guard pages at all. It splits each section the pool spans into a kernel-owned L2 table that
+maps every page exactly as the section did (`l2_small_page` with PRESENT|WRITABLE is the section's own
+attributes), then clears the guard entries. Sound because: it runs once on core 0 at boot with IRQs masked,
+before any other core or task exists; the tables are a dedicated static nothing else references, cleaned
+to the point of coherency before any L1 entry points at them (the walker reads non-cacheable); and every
+non-guard page keeps its physical address and attributes, so an access in the window before the TLBIALL
+reaches the same memory whichever descriptor it uses. The tables are outside the L2 arena, so
+`reclaim_user_frames` never frees one. `entry_for_va` asks the CPU's table walker (`mmu::translate`, ATS1CPR,
+already audited) and adds no `unsafe`. Proven in QEMU: a write to a guard page takes a translation fault.
+
+**Blocks 2 and 3 (+2): `kernel_ranges`, the addresses of three linker symbols** (the `unsafe extern`
+declaring them, and the one `unsafe` block taking their addresses), so `PageTable::map` can refuse a USER page that lies on kernel
+memory - the same fault arriving another way, when an image grows into BSS. Sound because nothing is read
+through the symbols; only their addresses are taken. Proven in QEMU: a user page at 0x00900000 is refused
+with a line naming the kernel's ranges.
+
+## `arch/arm/page_tables.rs` 35 -> 37 and `arch/arm/usermode.rs` 15 -> 17 (2026-10-13): no boot selftest leaves a table in the kernel L1
+
+**The defect.** The user-mode selftest mapped its code and stack pages at 0x5000_0000 through
+`map_in_active_tables` while the kernel's own L1 was active, and never unmapped them. That left a
+kernel-owned L2 for the megabyte at 0x5000_0000 in the kernel L1, and `fill_kernel_identity` copies every
+kernel L1 entry into each child's empty slots. 0x5000_0000 is `TASK_HEAP_VA_START` on 32-bit ports, so the
+first heap megabyte of EVERY task was mapped into that one shared table. The reclaim frees only tables the
+dying task owns, so it skipped it: measured in QEMU, every `mem-pressure` spawn and kill leaked 256 frames
+(7236 held, 6980 freed), and the dead task's user pages stayed in the table for the next task to inherit -
+two tasks' heaps in one table, against invariant 2. Found by a 1000-round chaos soak on the Pi 2 whose
+memory rose 2 MiB with every service's footprint unchanged.
+
+**page_tables.rs, block 1 (+2): `release_active_l2`, an `unsafe fn` and its block.** It clears the L1 slot
+holding a VA in the ACTIVE table and returns that L2 to the arena, only when the active root owns it.
+Sound because it runs in single-threaded boot before any task exists; the L1 is identity-mapped; the
+entry is cleaned to the point of coherency for the non-cacheable walker before the TLB entries of the
+whole megabyte are invalidated; and an L2 the active root does not own is left untouched (false). The
+page-table selftest's own manual clear (which cleared the L1 slot and kept the L2, losing one arena table
+for the life of the machine) is replaced by a call to it - the call site's `unsafe` replaces the block it
+removes, so the count rises by the new function's two only.
+
+**usermode.rs, block 2 (+2): `release_test_pages`.** One `unsafe` call to `release_active_l2`, and one
+block returning the selftest's two frames to the allocator (`Frame::from_phys` and `free_frame` are both
+`unsafe`). Sound because both frames came from `alloc_frame` in the same selftest and their only mapping
+was the slot just cleared, so each is freed exactly once; it is called on the failure path after mapping
+as well as at the end.

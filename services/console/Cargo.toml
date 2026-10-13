@@ -1,6 +1,7 @@
 [package]
 name = "console"
 version = "0.1.0"
+description = "The terminal: owns the display and draws text, the cursor and scrolling"
 edition = "2021"
 
 [[bin]]

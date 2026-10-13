@@ -610,7 +610,7 @@ impl<'a> Ahci<'a> {
         let n = self.cache.n.get();
         if n == 0 { return true; }
         // A block that did not reach the medium is a barrier that did not hold: counted and said, and
-        // the flush answers ERR. The results were discarded until 2026-10-10 (`backlog/80` V9).
+        // the flush answers ERR. The results were discarded until 2026-10-10 (`backlog/fixed/80` V9).
         let mut failed = 0usize;
         for i in 0..n {
             let (lba, blk) = { (self.cache.lba.borrow()[i], self.cache.blk.borrow()[i]) };

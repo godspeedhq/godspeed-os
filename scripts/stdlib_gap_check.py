@@ -111,6 +111,13 @@ def main():
                 body = re.sub(r'//[^\n]*', '', body)      # prose mentioning a name is not use
                 if 'godspeed_sdk' not in body:
                     continue
+                # A METHOD CALL IS NOT A USE OF A FREE ITEM. Only column-0 items are counted (see the
+                # instrument note), and a free function cannot be called with `.name(` - so `t.encode(..)`
+                # on a `gs::record::Table` is the method `gs` already routes, not the SDK's free
+                # `trace::encode`. Matched by name alone, it counted `ask` as a new user of a free item it
+                # never touched, and the only way past would have been raising the baseline for a gap that
+                # does not exist.
+                body = re.sub(r'\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\(', '.(', body)
                 crate = path.split('/')[1]
                 for name in sdk:
                     if re.search(r'\b%s\b' % re.escape(name), body):

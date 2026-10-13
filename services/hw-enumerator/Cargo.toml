@@ -1,6 +1,7 @@
 [package]
 name = "hw-enumerator"
 version = "0.1.0"
+description = "Walks the PCI bus in userspace and reports the devices it finds"
 edition = "2021"
 
 [[bin]]

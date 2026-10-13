@@ -260,8 +260,9 @@ pub fn sectors_now(ctx: &ServiceContext) -> Capacity {
         // `fs` got STATUS_ERR instead of "0 sectors", treated it as transient exactly as intended, and
         // retried forever without ever reaching `serving file API`.
         //
-        // The peer ANSWERED. On both ARM ports a one-byte reply is `[STATUS_ERR]`, which the USB host
-        // service sends when it has no mass-storage device bound - so this is an empty bay reported
+        // The peer ANSWERED. A one-byte reply is what the USB host service sends when it has no
+        // mass-storage device bound - `[STATUS_NO_DISK]` (2) from `xhci` and from `dwc2`'s dispatch since
+        // `backlog/57`, `[STATUS_ERR]` from `dwc2`'s other no-disk paths - so this is an empty bay reported
         // tersely, not a protocol mismatch, and the old comment saying otherwise was wrong. Publishing
         // zero lets a diskless machine come up diskless, which is the correct outcome and the one it
         // had before.
@@ -310,11 +311,26 @@ pub fn write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> bool {
     !p.is_empty() && p[0] == STATUS_OK
 }
 
+/// What became of a flush. Three answers, because two of them mean different things to CLAUDE.md 6.1.
+pub enum Flush {
+    /// The device made its cache durable.
+    Durable,
+    /// The device was reached and the flush failed: evidence about the DEVICE.
+    Refused,
+    /// No device was reached - the USB host service did not answer, or had no disk bound. Evidence
+    /// about nothing; six chaos sightings of "the drive refused the flush" were this (`backlog/57`).
+    Unreachable,
+}
+
 /// SYNCHRONIZE CACHE. Its result is RETURNED, because a stick acknowledges a write into its own
 /// buffer and only this makes it durable - and because the constitution's crash-recovery guarantee
 /// is explicitly conditional on a backend that can be ordered (§6.1, the 2026-07-25 amendment).
-pub fn flush(ctx: &ServiceContext) -> bool {
-    let Some(r) = rpc(ctx, &[OP_FLUSH]) else { return false };
-    let p = r.payload_bytes();
-    !p.is_empty() && p[0] == STATUS_OK
+pub fn flush(ctx: &ServiceContext) -> Flush {
+    let Some(r) = rpc(ctx, &[OP_FLUSH]) else { return Flush::Unreachable };
+    match r.payload_bytes().first() {
+        Some(&STATUS_OK) => Flush::Durable,
+        // The USB host's "no mass-storage device is bound" (`msc::STATUS_NO_DISK` in xhci and dwc2).
+        Some(&2) => Flush::Unreachable,
+        _ => Flush::Refused,
+    }
 }

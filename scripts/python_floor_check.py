@@ -33,7 +33,7 @@ Verified by running it rather than by reading the PEP:
         return v
 
 AND A FUNCTION SIGNATURE (`def f() -> list[str]:`, `def f(x: dict[str, int])`), which this did not
-check until 2026-10-10 (`backlog/80` T1). Those annotations ARE evaluated, at `def` time, so on 3.8
+check until 2026-10-10 (`backlog/fixed/80` T1). Those annotations ARE evaluated, at `def` time, so on 3.8
 they raise `TypeError` at import. `arch_boundary_check.py`, `dash_check.py` and `unsafe_check.py` each
 carried one while this reported the floor true. A module with `from __future__ import annotations`
 evaluates none of its annotations (PEP 563), so in such a module neither annotation check applies -
@@ -68,7 +68,7 @@ CHECKS = [
 
 # STANDARD-LIBRARY MODULES newer than the floor. `import tomllib` is a ModuleNotFoundError on 3.10,
 # and `scripts/commandments.py` - the first checker of every build - did exactly that while this
-# file reported the floor true, because it looked at syntax and never at imports (backlog/80 T1).
+# file reported the floor true, because it looked at syntax and never at imports (backlog/fixed/80 T1).
 # An import is fine inside `try:` with an `except ImportError` fallback, which is how
 # `scripts/toml_compat.py` does it; the guard is "the line before it is `try:`".
 NEW_MODULES = {"tomllib": (3, 11), "zoneinfo": (3, 9), "graphlib": (3, 9)}

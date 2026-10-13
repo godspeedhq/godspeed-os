@@ -1106,7 +1106,7 @@ fn mode_prop_p7(ctx: &ServiceContext) -> ! {
     //      from the same base, so it gets the writer's virtual addresses, and the kernel zero-fills
     //      what it maps. Any word that is not zero was read through a translation the writer left.
     //
-    // There is no TLB shootdown in this kernel to exercise (it was deleted, `backlog/80` K20); what
+    // There is no TLB shootdown in this kernel to exercise (it was deleted, `backlog/fixed/80` K20); what
     // keeps a checker honest is the kill path's quiescence wait and the invalidate every switch does
     // on its own core. This test is what says whether that is enough. The base each side reports is
     // compared too, so a checker that got DIFFERENT addresses cannot pass vacuously.

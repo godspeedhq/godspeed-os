@@ -412,7 +412,7 @@ fn clean_supervisor() {
 /// decision, not something that silently changes what a build enforces. It is ONE decision: the board
 /// builds read this list (`scripts/build_gates.py`), as `conform.py` does. They each carried their own
 /// copy of seven until 2026-10-10, and every checker added since had been added here alone
-/// (backlog/80 T8).
+/// (backlog/fixed/80 T8).
 const EXTRA_CHECKS: &[&str] = &[
     "scripts/dash_check.py",
     "scripts/unsafe_check.py",
@@ -424,7 +424,7 @@ const EXTRA_CHECKS: &[&str] = &[
     // four had rotted when this was written, including one in CLAUDE.md pointing at a file an
     // amendment in the same document had deleted.
     "scripts/doc_symbols_check.py",
-    // A CRLF `extlinux.conf` boots nothing while showing a perfect menu (backlog/26). x86 does not
+    // A CRLF `extlinux.conf` boots nothing while showing a perfect menu (backlog/fixed/26). x86 does not
     // use extlinux, but this path is where an image is built on the machine that PRODUCES the CRLF,
     // and the rule above is the whole reason this list exists: a checker on one build path is a
     // checker on none.
@@ -509,15 +509,15 @@ const EXTRA_CHECKS: &[&str] = &[
     // The port's SCOPE: on a branch that works on one ISA, every path it edits must be `arch/<isa>/`
     // or a file `docs/porting.md` marks `+`. It ran only in the paused `build.yml`, so its own
     // cross-check against the guide failed on EVERY branch for six days (the guide gained the radio's
-    // `wifi-driver/build.rs` row and the script did not) and nothing said so - `backlog/80` T2. On
+    // `wifi-driver/build.rs` row and the script did not) and nothing said so - `backlog/fixed/80` T2. On
     // any other branch it is silent by design, so it costs nothing here but the guide cross-check.
     "scripts/port_scope_check.py",
     // Every service the supervisor MANAGES is embedded in its image, on every arch. Each board build ran
     // it for its own arch and `osdev build` for none, so x86 - which has no `_built` list in
-    // kernel/build.rs - was never checked at all (backlog/80 T7). With no arguments it checks all four.
+    // kernel/build.rs - was never checked at all (backlog/fixed/80 T7). With no arguments it checks all four.
     "scripts/service_embed_check.py",
     // Every tracked `.rs` file carries an SPDX licence tag, and it is its tree's licence
-    // (docs/licensing.md). Thirteen carried none and nothing noticed (backlog/80 R1).
+    // (docs/licensing.md). Thirteen carried none and nothing noticed (backlog/fixed/80 R1).
     "scripts/spdx_check.py",
 ];
 
@@ -713,7 +713,7 @@ fn stack_fit_check(services: &[&str]) {
 /// records: a MISSING binary is caught by a guard, and a STALE one is not, because a stale file is
 /// not missing. `scripts/embed_order_check.py` catches the ordering; nothing caught the omission.
 const SERVICE_CRATES: &[&str] = &[
-    "events", "recorder", "copier", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
+    "events", "recorder", "copier", "ask", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
     "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
     "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
     "resource-server", "holder", "power", "audio-driver", "wifi-usb",
@@ -1628,7 +1628,7 @@ fn cmd_test(suite: &str) {
         "chaos-brutal" => crate::validator::run_chaos_brutal_tests(),
         "shell"        => run_shell_test(),
         // `chaos-repro`, `chaos-repro:<rounds>`, `chaos-repro:<rounds>:<iters>` - the same shape
-        // `fs-model:<seed>:<ops>` uses. See `backlog/48`.
+        // `fs-model:<seed>:<ops>` uses. See `backlog/fixed/48`.
         s if s == "chaos-repro" || s.starts_with("chaos-repro:") => run_chaos_repro_test(s),
         "iommu"        => run_iommu_test(),
         "blockdev"     => run_blockdev_test(),
@@ -1690,7 +1690,7 @@ fn cmd_test(suite: &str) {
         "fmt-demo"     => run_fmt_demo_test(),
         "fmt-idem"     => run_fmt_idem_test(),
         // A typo is a failure, not a pass. This printed the line and exited 0, so a script or a CI
-        // step naming a suite that does not exist reported success having run nothing (backlog/80 T3).
+        // step naming a suite that does not exist reported success having run nothing (backlog/fixed/80 T3).
         other => {
             eprintln!("unknown test suite: {} - nothing was run", other);
             std::process::exit(2);
@@ -3166,7 +3166,7 @@ fn run_fs_all_tests() {
         "fs-churn",
         // §3.7. The other two attack the DEVICE (a power cut, an I/O error); this one attacks the
         // COMPLETION STREAM - duplicate, missing and out-of-order replies - which is the failure
-        // `backlog/31` recorded one layer up and which no suite reached until now.
+        // `backlog/fixed/31` recorded one layer up and which no suite reached until now.
         "fs-blockchaos",
         // ...and the driver dying mid-request, which is a different recovery path: `SendFailed`
         // plus a reacquire, rather than a wrong answer that has to be detected.
@@ -3909,7 +3909,7 @@ fn run_fs_blockdeath_test() {
 
 /// Carnage §3.7: corrupt the COMPLETION STREAM and require the filesystem to survive it.
 ///
-/// The device-failure half is `fs-ioretry`. This is the protocol half `backlog/31` warned about:
+/// The device-failure half is `fs-ioretry`. This is the protocol half `backlog/fixed/31` warned about:
 /// duplicate, missing and out-of-order completions, injected into ordinary churn traffic. See
 /// `run_fs_blockchaos` for why every detection assertion is paired with a recovery one.
 fn run_fs_blockchaos_test() {
@@ -3969,7 +3969,7 @@ fn run_fs_ioretry_test() {
     }
 }
 
-/// `osdev test chaos-repro[:rounds[:iters]]` - loop `chaos max-carnage` in one boot (`backlog/48`).
+/// `osdev test chaos-repro[:rounds[:iters]]` - loop `chaos max-carnage` in one boot (`backlog/fixed/48`).
 fn run_chaos_repro_test(spec: &str) {
     let mut it = spec.split(':').skip(1);
     let rounds: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(5);

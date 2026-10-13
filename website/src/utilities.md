@@ -81,6 +81,7 @@ fails.
 | [`mem`](utilities/mem.md) | memory |
 | [`cores`](utilities/cores.md) | the cores that came up |
 | [`hardware`](utilities/hardware.md) | this machine's devices, and what drives each |
+| [`ask`](utilities/ask.md) | plain questions about this machine, answered from what its services know |
 | [`spawncap`](utilities/spawncap.md) | diagnostic: spawn a service and prove the capability to it routes |
 | [`uptime`](utilities/uptime.md) | how long since boot |
 | [`date`](utilities/date.md) | the wall clock |
@@ -120,6 +121,7 @@ fails.
 | [`assert`](utilities/assert.md) | verify a result or output (the test verb) |
 | [`result`](utilities/result.md) | the previous command's result (Ok / Err) |
 | [`wait`](utilities/wait.md) | wait |
+| [`repeat`](utilities/repeat.md) | run a command again and again |
 | [`fmt`](utilities/fmt.md) | format a script to the GodspeedOS standard |
 
 ### The shared contract

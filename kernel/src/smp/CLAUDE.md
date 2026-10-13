@@ -45,7 +45,7 @@ Two vectors, defined in `ipi::vectors`:
 There is no cross-core TLB shootdown in this kernel. A software broadcast (a per-initiator request
 slot and ack bitmask, serviced from the IPI handler and from the waiting core's own spin so that two
 initiators could not deadlock) lived in `ipi.rs` with no caller, and was deleted on 2026-10-10
-(`backlog/80` K20) after a per-port proof that translation coherence holds without it:
+(`backlog/fixed/80` K20) after a per-port proof that translation coherence holds without it:
 
 - **Nothing unmaps a live user mapping.** Memory is reclaimed only at task death; the only other
   unmaps are boot-time (the kernel-stack guards, before any other core starts) and selftests.
@@ -68,5 +68,5 @@ task's.
 Placement is not in this module. The live rule is `task::resolve_spawn_core`: a strict override,
 else the spawn request's preferred core with a loud round-robin fallback, else round-robin. On restart
 it is asked again from scratch, so the previous core is not remembered (§9.2 "on restart" clause).
-(An `smp::placement::resolve` described here had no callers and was deleted 2026-10-10, `backlog/80`
+(An `smp::placement::resolve` described here had no callers and was deleted 2026-10-10, `backlog/fixed/80`
 K20.)

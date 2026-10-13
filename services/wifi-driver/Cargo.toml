@@ -1,5 +1,6 @@
 [package]
 name = "wifi-driver"
+description = "The onboard WiFi radio driver: the Pi 4's CYW43455 and the VisionFive's AIC8800"
 version = "0.1.0"
 edition = "2021"
 

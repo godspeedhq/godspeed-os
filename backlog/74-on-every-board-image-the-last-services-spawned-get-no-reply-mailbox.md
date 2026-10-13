@@ -56,7 +56,7 @@ image never comes near that peak, and pays for it with the mailboxes of whatever
 
 ## What it may explain - NOT shown
 
-`backlog/66`'s steady one-second tax is between exactly these two services: the first STATUS of each
+`backlog/fixed/66`'s steady one-second tax is between exactly these two services: the first STATUS of each
 exchange is received by `nic-driver` about a second late, served back to back with the retry. 66 reads that
 as a lost wake-up in the kernel's blocked-receiver path. Neither service had a mailbox in any of those
 boots, so every reply and every request in that exchange shared a queue with the other kind. That is a
@@ -72,7 +72,7 @@ Nothing yet - this entry is the measurement of who is refused, not a diagnosis o
 ## The next step, and the options
 
 **The measurement first, and it is cheap:** one boot of each radio board with the mailboxes granted, then
-`backlog/66`'s exchange timings and the `op 3 ... timed out on the first attempt` lines compared against
+`backlog/fixed/66`'s exchange timings and the `op 3 ... timed out on the first attempt` lines compared against
 the boots above. That needs one of the changes below (all kernel, all the operator's call):
 
 1. **A smaller reserve.** The probe builds are what it protects; a quarter-table reserve was measured to
@@ -109,7 +109,7 @@ then the committed build at 72. The test image refused nothing; the committed on
 and NEITHER logged a NIC exchange of 300 ms or more during the pings. The only slow exchange in each was
 the boot-time link query (748 ms with mailboxes, 840 ms without), one sample each.
 
-So the one-second tax of `backlog/66` does not appear on this board's cable path at all, mailbox or none,
+So the one-second tax of `backlog/fixed/66` does not appear on this board's cable path at all, mailbox or none,
 and this board cannot say whether the mailboxes cause it. The Pi 4, where 66 was found and where
 `pwm-audio` is refused as well, is the board that can.
 

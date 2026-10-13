@@ -60,7 +60,7 @@ use term::Term;
 /// live here - so this is the only party that can answer, and there is one source of truth for it.
 const REQ_DIMS: u8 = 1;
 
-// `REQ_SCROLL` IS GONE - it is the mechanism `backlog/37` was about.
+// `REQ_SCROLL` IS GONE - it is the mechanism `backlog/fixed/37` was about.
 //
 // It moved this terminal's own view, and to answer it the service had to `paint_view` + `present`
 // BEFORE the reply could be computed: a full repaint of the framebuffer, synchronously, inside the
@@ -78,7 +78,7 @@ const REQ_DIMS: u8 = 1;
 /// **The difference from `REQ_SCROLL` is which side does the work, and it is the whole reason this
 /// exists.** `REQ_SCROLL` moves this terminal's view, which forces a full repaint before the reply
 /// can be computed - on a 4K panel that is the most expensive operation here, and the caller waits
-/// on it with a deadline from the same core (`backlog/37`). This hands the caller BYTES and lets it
+/// on it with a deadline from the same core (`backlog/fixed/37`). This hands the caller BYTES and lets it
 /// paint its own screen, so the cost on this side is a bounded memcpy out of the ring.
 ///
 /// `aged` is a flag rather than a count because only its truth matters to a reader: the history is
@@ -326,7 +326,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         // HOW LONG A WHOLE PASS TOOK, reported only when it is long enough to be the reason a client
-        // gave up. `backlog/37`: on a Dell Wyse a scroll request timed out against a 1 s deadline
+        // gave up. `backlog/fixed/37`: on a Dell Wyse a scroll request timed out against a 1 s deadline
         // while this service reported no slow paint at all - so either the request waited in the
         // queue behind work, or a pass ran long for a reason nothing here measures. A pass is
         // drain + paint, which is everything between two blocking `recv`s, so a pass over the

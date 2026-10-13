@@ -912,7 +912,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // firmware is then asked the same first question the boot asks; if it answers, this instance
             // carries on with it, joins from `/wifi.keys` as a fresh one would, and the kill cost
             // seconds. If it does not answer there is nothing left to try on this chip short of cutting
-            // its power (`backlog/69`), and the radio says so rather than restarting a firmware the ROM
+            // its power (`backlog/fixed/69`), and the radio says so rather than restarting a firmware the ROM
             // will not boot.
             if card.warm {
                 ctx.log("wifi-driver: ADOPT - stages 9 to 11 are skipped: no halt, no reset, no upload. The running firmware is asked to answer");

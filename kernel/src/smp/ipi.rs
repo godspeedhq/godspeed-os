@@ -5,7 +5,7 @@
 //!   1. Wake a task blocked on `recv` after a cross-core `send` enqueues.
 //!   2. Cross-core scheduler preemption (timer overflow).
 //!
-//! **There is no TLB shootdown here, and that is deliberate (§10.5, `backlog/80` K20).** A software
+//! **There is no TLB shootdown here, and that is deliberate (§10.5, `backlog/fixed/80` K20).** A software
 //! broadcast - a single-page and a full-flush form, and the per-core request slots behind them -
 //! lived here with no caller, and was deleted on 2026-10-10. Translation coherence does
 //! not need it, because nothing unmaps a live user mapping: memory is reclaimed only after the task

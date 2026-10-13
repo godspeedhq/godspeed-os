@@ -1,6 +1,7 @@
 [package]
 name = "dwc2"
 version = "0.1.0"
+description = "The Raspberry Pi 2's USB host driver: keyboard, mass storage, ethernet and a WiFi dongle"
 edition = "2021"
 
 [[bin]]

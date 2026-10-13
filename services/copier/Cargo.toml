@@ -1,6 +1,7 @@
 [package]
 name = "copier"
 version = "0.1.0"
+description = "Copies and deletes in the background for the shell's `background` command"
 edition = "2021"
 
 [[bin]]

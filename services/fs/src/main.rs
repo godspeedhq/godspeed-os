@@ -152,7 +152,7 @@ const _: () = assert!(DIR_TIMES_OFF >= DIR_CRC_OFF + 4,
 ///    the mutual-send shape §8.9 forbids, which the kernel will neither detect nor recover.
 /// 2. `fs` serves its clients on the very endpoint it would have to await the reply on, so a
 ///    request/reply wait here could DEQUEUE A CLIENT'S REQUEST and mistake it for the answer. That
-///    is not hypothetical - it is `backlog/31`, one service over, and it cost days.
+///    is not hypothetical - it is `backlog/fixed/31`, one service over, and it cost days.
 ///
 /// A push has neither problem: nothing is awaited, so nothing can be eaten and nothing can block.
 /// It arrives with no reply capability, which is what distinguishes it from every real request and
@@ -234,6 +234,8 @@ const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] - zero a run of blocks
 const OP_FLUSH: u8 = 5;       // [op] - make prior writes durable on the medium (see `block_flush`)
 const BLK_OK: u8 = 0;
 const BLK_ERR: u8 = 1;        // the driver's STATUS_ERR - it answered, and said the operation failed
+const BLK_UNREACHABLE: u8 = 2; // on a flush: the driver answered, but reached no device (its USB host was
+                               // silent or had no disk bound) - `backlog/57`
 
 // fs file API (client <-> fs). `[op, path_len, path, (WriteFile: data | Rename/Move: tail)]`.
 const OP_WRITE_FILE: u8 = 10;
@@ -299,7 +301,7 @@ macro_rules! send_res {
                 let mut eb = [0u8; 1 + FS_ERR_REASON_MAX];
                 // A path that is not there is FS_NOTFOUND whatever the operation, with the reason
                 // still carried: a mutating op answered FS_ERR for it while a read answered
-                // FS_NOTFOUND, so a client could not tell "absent" from "refused" (`backlog/80` V2).
+                // FS_NOTFOUND, so a client could not tell "absent" from "refused" (`backlog/fixed/80` V2).
                 eb[0] = if walk_miss(e) { FS_NOTFOUND } else { FS_ERR };
                 let n = e.len().min(FS_ERR_REASON_MAX);
                 eb[1..1 + n].copy_from_slice(&e.as_bytes()[..n]);
@@ -318,7 +320,7 @@ const FS_DENIED: u8 = 5;     // op requires a right the file cap lacks (non-esca
                              // path, but a shared value invited a future confusion; audit L2)
 const FS_DAMAGED: u8 = 7;    // the file is THERE and a block of it failed its CRC (or could not be read):
                              // damaged, not missing. Answered FS_NOTFOUND until 2026-10-10, so a damaged
-                             // file read as an absent one (`backlog/80` V2)
+                             // file read as an absent one (`backlog/fixed/80` V2)
 const FS_FOREIGN: u8 = 6;    // the disk carries someone else's partition table / boot sector. Refused
                              // rather than formatted - see `foreign_disk`. Distinct from FS_ERR so the
                              // client can explain WHY and offer the deliberate override.
@@ -475,7 +477,7 @@ struct Fs {
     io_error_seen: core::cell::Cell<bool>,
     // Set by a read that found the file and could not read a block of it (a CRC failure or an I/O
     // error), cleared by every read that starts. The reply then says FS_DAMAGED rather than
-    // FS_NOTFOUND (`backlog/80` V2). Owned state on the struct, like the two cells above.
+    // FS_NOTFOUND (`backlog/fixed/80` V2). Owned state on the struct, like the two cells above.
     read_damaged: core::cell::Cell<bool>,
     /// Consecutive failed block reads during a tree WALK (check / scrub). Reset by any success.
     ///
@@ -714,7 +716,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         storage_unreadable = true;
     } else {
         let mut io_attempts = 0u32;
-        // The same CLOCK bound as the capacity wait above, for the same reason (`backlog/80` V7):
+        // The same CLOCK bound as the capacity wait above, for the same reason (`backlog/fixed/80` V7):
         // `yield_now` returns at once when nothing else is runnable, so 1000 of them measured loop
         // speed, not how long block-driver was given to come back.
         let io_started = gs::driver::wait::Since::now(&ctx);
@@ -1418,7 +1420,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         f.blk_cycles.set(0);
     }
     let c_start = gs::driver::wait::ticks(ctx);
-    serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
+    serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len, false);
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
     // A DESYNC IS NOT A DYING DISK, and must not reach the re-mount path below.
@@ -1440,7 +1442,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
         match Fs::mount_into(ctx, vol) {
             Ok(()) => {
                 len = 0;
-                serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len);
+                serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len, false);
             }
             // The retry is best-effort: a re-mount that fails leaves the FIRST attempt's reply in the
             // buffer, so the caller still gets the honest error rather than silence. Said out loud,
@@ -1518,7 +1520,7 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
 /// with no suite typing `flash` at all. If an arm needs a fresher capacity, refresh it at the CALLER
 /// (see the serve loop), where the selftest is not involved.
 fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
-              tag: u8, reply: gs::cap::Cap, out: &mut [u8], out_len: &mut usize) {
+              tag: u8, reply: gs::cap::Cap, out: &mut [u8], out_len: &mut usize, quiet: bool) {
     let mut send = |bytes: &[u8]| {
         let n = bytes.len().min(out.len());
         // TRUNCATION MUST NOT BE SILENT. The clamp is a bounds guard, not a policy: every reply this
@@ -1588,13 +1590,15 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 Some(n) => n,
                 None => capacity, // unknown - say what we last knew rather than invent an absence
             };
-            // [FS_OK, mounted, capacity:u64, used:u64, flags:u8, label_len:u8, label…]
+            // [FS_OK, mounted, capacity:u64, total:u64, used:u64, flags:u8, label_len:u8, label…]
             // Report what this answer is made of. `drives` reporting "no disk" while the boot log shows a
             // mounted 15 GB volume is a contradiction between two of our own statements, and neither side
             // said enough to tell which was wrong. This is the producing side (§26.4 - where the answer
             // came from must be answerable).
-            ctx.log_fmt(format_args!("fs: drives-info - capacity {} sectors, mounted {}",
-                                     capacity, vol.is_some()));
+            if !quiet {
+                ctx.log_fmt(format_args!("fs: drives-info - capacity {} sectors, mounted {}",
+                                         capacity, vol.is_some()));
+            }
             let mut out = [0u8; 28 + LABEL_MAX];
             out[0] = FS_OK;
             out[2..10].copy_from_slice(&capacity.to_le_bytes());
@@ -1614,12 +1618,16 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             return;
         }
         OP_FLASH => {
-            ctx.log_fmt(format_args!("fs: flash requested (capacity {} sectors, forced {})", capacity, forced));
+            if !quiet {
+                ctx.log_fmt(format_args!("fs: flash requested (capacity {} sectors, forced {})", capacity, forced));
+            }
             if capacity == 0 {
                 // Named, not silent: this was one of two OP_FLASH paths that replied FS_ERR without a
                 // word, so "drives: flash FAILED (no disk, or disk too small)" was the only thing an
                 // operator saw - on hardware that was actively misleading (§26.7).
-                ctx.log("fs: flash REFUSED - block-driver reports 0 capacity (no disk, or the driver is mid-revival). Retry once storage settles.");
+                if !quiet {
+                    ctx.log("fs: flash REFUSED - block-driver reports 0 capacity (no disk, or the driver is mid-revival). Retry once storage settles.");
+                }
                 send(&[FS_ERR]);
                 return;
             }
@@ -1888,7 +1896,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 if want == 0 { send(&[FS_DENIED]); return; }
             }
             // A failed open says WHY, as every other refusal does - it answered a bare FS_ERR, so
-            // `gs::fs::Fs::reason` was empty and the cause was in this log only (`backlog/80` V2).
+            // `gs::fs::Fs::reason` was empty and the cause was in this log only (`backlog/fixed/80` V2).
             match fs.open_file(ctx, path, want, tag, reply) {
                 Ok(()) => *out_len = REPLY_SENT_DIRECTLY,   // the cap went with it; do not reply twice
                 Err(e) => send_res!(send, Err::<(), &str>(e)),
@@ -2353,6 +2361,9 @@ impl Fs {
                 // THE DEVICE ANSWERED AND SAID NO. This is the case CLAUDE.md 6.1 describes, and the
                 // only one that is evidence about the drive.
                 FlushOutcome::Refused => ctx.log("fs: durability NOT attested - this drive ANSWERED and refused the cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25)."),
+                // THE DRIVER ANSWERED AND REACHED NO DEVICE. Six chaos sightings of the line above were
+                // this, every one with an unreachable `xhci` just before it (`backlog/57`).
+                FlushOutcome::Unreachable => ctx.log("fs: durability NOT attested - the block driver could not reach the drive (its USB host was restarting, or had no disk bound). The barrier did not happen for this transaction; this says NOTHING about whether the drive supports a cache flush."),
                 // NOBODY ANSWERED. The barrier did not happen, so the same risk applies to THIS
                 // transaction - but it says nothing about the device, and must not be read as though
                 // it did. `build/pi2a.log` is what happens otherwise: this fired twice during a chaos
@@ -3596,7 +3607,7 @@ fn replay_window(_ctx: &ServiceContext) {}
     /// incompletely and `count` reported only what fit. `dir` on a directory of thirty files printed
     /// twenty and said `(20 entries)` as though that were the whole truth, with nothing in the reply
     /// a client could have used to tell the difference. That is not a ceiling, it is a WRONG ANSWER,
-    /// and it reached `find`, `tree`, `delete recursive` and tab completion alike (`backlog/33`).
+    /// and it reached `find`, `tree`, `delete recursive` and tab completion alike (`backlog/fixed/33`).
     ///
     /// The flag does not remove the ceiling - a continuation cursor is what does that, and it is
     /// recorded rather than done. It converts a silent wrong answer into a loud partial one, which
@@ -3610,13 +3621,13 @@ fn replay_window(_ctx: &ServiceContext) {}
     /// The `mtime` is Phase O's, and `TIME_UNKNOWN` (0) on a volume that does not record one - a
     /// client renders that as "unknown" rather than as a date. Four bytes per entry is the cost, out
     /// of a one-block reply: a listing that used to fit ~30 entries fits ~26, and a directory with
-    /// more than that was already being truncated by this bound. `backlog/33` records that ceiling,
+    /// more than that was already being truncated by this bound. `backlog/fixed/33` records that ceiling,
     /// which predates this change and is not made materially worse by it.
     /// List a directory, RESUMABLY. One reply block carries roughly twenty entries; `from` says
     /// which entry to start at, and the reply says where to ask next.
     ///
     /// **This used to stop at one block and set a `more` flag, which made a long directory a
-    /// question nobody could finish asking** (`backlog/33`). The flag turned a silent wrong answer
+    /// question nobody could finish asking** (`backlog/fixed/33`). The flag turned a silent wrong answer
     /// into a loud partial one; it did not make the listing obtainable. It is obtainable now: a
     /// caller loops until `more` is 0.
     ///
@@ -3955,7 +3966,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         //
         // The DELETE has happened once the unlink commits, so a failure here is not the delete
         // failing and is not reported as one: the caller was told "failed" for a tree that was gone,
-        // and a retry then failed again with "not found" (`backlog/80` V4). What failed is the
+        // and a retry then failed again with "not found" (`backlog/fixed/80` V4). What failed is the
         // reclaim, which leaves blocks counted as used that nothing references - said loudly, with
         // the repair (`drives check` rebuilds the bitmap from the tree).
         if let Err(why) = self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0) {
@@ -4381,14 +4392,19 @@ fn protocol_selftest(ctx: &ServiceContext) {
     let mut checked = 0u32;
     let mut empty = 0u32;
     let mut worst = 0u8;
+    // The flash requests among the probes (21, and 149 forced). Each is refused on the zero capacity
+    // this test injects, and that refusal is what stops it formatting the real disk - so it is counted
+    // and said ONCE below, not logged per probe (`backlog/fixed/56`).
+    let flashes = core::cell::Cell::new(0u32);
 
     let mut run = |vol: &mut Option<Fs>, p: &[u8], out: &mut [u8; 4096], checked: &mut u32,
                    empty: &mut u32, worst: &mut u8| {
         let mut len = 0usize;
+        if matches!(p.first(), Some(&o) if o & 0x7F == OP_FLASH) { flashes.set(flashes.get() + 1); }
         // A capability handle that names nothing. Safe because no arm can reach a mint or a send
         // without a mounted volume, and every one of those is behind the `None => no filesystem`
         // guard this runs under.
-        serve_once(ctx, vol, 0, false, p, 0, gs::cap::Cap::from(CapHandle(0)), &mut out[..], &mut len);
+        serve_once(ctx, vol, 0, false, p, 0, gs::cap::Cap::from(CapHandle(0)), &mut out[..], &mut len, true);
         *checked += 1;
         if len == 0 {
             *empty += 1;
@@ -4436,7 +4452,9 @@ fn protocol_selftest(ctx: &ServiceContext) {
 
     if empty == 0 {
         ctx.log_fmt(format_args!(
-            "fs: protocol selftest PASS - {} malformed requests, every one answered", checked));
+            "fs: protocol selftest PASS - {} malformed requests, every one answered ({} of them flash \
+             requests, each refused on the zero capacity the test injects - no disk was touched)",
+            checked, flashes.get()));
     } else {
         // LOUD, because the failure is invisible from the other end: the caller does not see a bad
         // reply it can name, it sees an empty one it cannot read.
@@ -4617,7 +4635,7 @@ fn walk_miss(reason: &str) -> bool {
 
 fn op_is_mutating(op: u8) -> bool {
     // OP_SEAL writes too - it flags a file record and so the directory block - and was missing, so a
-    // read-only mount sealed files (`backlog/80` V3).
+    // read-only mount sealed files (`backlog/fixed/80` V3).
     matches!(op,
         OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT | OP_WRITE_AT_J |
         OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE | OP_SEAL)
@@ -4698,7 +4716,7 @@ impl BlockReply {
 
 /// Latch for the one-shot stack-depth report inside `block_rpc`. Owned by this service and touched
 /// nowhere else. (This cited xhci's probe-failure latch as its model; `xhci` moved its latches into loop-owned
-/// state on 2026-10-10, `backlog/80` D9. This one, and the peer-outage latches below, still live in
+/// state on 2026-10-10, `backlog/fixed/80` D9. This one, and the peer-outage latches below, still live in
 /// statics because `block_rpc` is a free function with a dozen callers.)
 static STACK_DEPTH_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -5057,13 +5075,19 @@ enum FlushOutcome {
     Refused,
     /// Nobody answered: the driver is dead, restarting, or too slow. Says nothing about the drive.
     NoAnswer,
+    /// The driver answered, and reached no device: its USB host was silent or had no disk bound. Says
+    /// nothing about the drive either - and it is the case that used to arrive as `Refused`.
+    Unreachable,
 }
 
 fn block_flush_outcome(ctx: &ServiceContext) -> FlushOutcome {
     match block_rpc(ctx, &[OP_FLUSH]) {
         Some(reply) => {
-            if reply.body().first() == Some(&BLK_OK) { FlushOutcome::Durable }
-            else { FlushOutcome::Refused }
+            match reply.body().first() {
+                Some(&BLK_OK) => FlushOutcome::Durable,
+                Some(&BLK_UNREACHABLE) => FlushOutcome::Unreachable,
+                _ => FlushOutcome::Refused,
+            }
         }
         None => FlushOutcome::NoAnswer,
     }

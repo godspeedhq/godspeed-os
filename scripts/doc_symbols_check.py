@@ -24,15 +24,15 @@ WHAT IS SCANNED, so a pass is not read as wider: the docs in DOC_DIRS and DOC_FI
 `CONTRIBUTING.md`. A name RESOLVES if it occurs as a WHOLE IDENTIFIER anywhere in the source text,
 comments and Python included. (Until 2026-10-10 a SUBSTRING was enough, so a dead name contained in a
 longer live one passed; the 22 names that passed only that way are recorded in the baseline as
-SUBSTRING-ONLY debt, backlog/80 T8.) With no baseline file the checker FAILS; `--write-baseline`
+SUBSTRING-ONLY debt, backlog/fixed/80 T8.) With no baseline file the checker FAILS; `--write-baseline`
 creates one deliberately.
 
 NOT SCANNED: `audits/` and `milestones/`. Those are append-only EVIDENCE and dated history (CLAUDE.md
 §5) - a symbol that existed when the audit ran is CORRECT there, and rewriting it would falsify the
-record. Same reason `backlog/29` keeps the serial capture it quotes verbatim.
+record. Same reason `backlog/fixed/29` keeps the serial capture it quotes verbatim.
 
 A RECURRING CASE, recorded so the next person does not re-argue it from scratch: a CLOSED backlog
-entry's post-mortem names the code it deleted, and naming it is the point - `backlog/37` explains a
+entry's post-mortem names the code it deleted, and naming it is the point - `backlog/fixed/37` explains a
 bug by listing the five functions removed to fix it. That is the same "dated history" argument the
 paragraph above makes for `audits/`, and it will happen again every time a removal is written up.
 It is baselined per-symbol for now rather than exempting closed entries wholesale, because the
@@ -104,7 +104,7 @@ def unknown():
     text, nfiles = source_text()
     # WHOLE IDENTIFIERS, not substrings. This asked `tok not in text`, so a doc naming `STAT_FILE`
     # resolved against `OP_STAT_FILE` and `read_file` against `fs_read_file_streaming`: a dead or
-    # wrong name contained in a longer live one passed (backlog/80 T8). `comment_symbol_check.py`
+    # wrong name contained in a longer live one passed (backlog/fixed/80 T8). `comment_symbol_check.py`
     # removed the same weakness from itself on 2026-10-05.
     names = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text))
     found = {}
@@ -136,7 +136,7 @@ def main():
     base = load_baseline()
     if base is None:
         # A MISSING BASELINE IS A FAILURE. This wrote one and exited 0, so deleting the file made
-        # every unknown name pass that run and baselined them all for the next (backlog/80 T8).
+        # every unknown name pass that run and baselined them all for the next (backlog/fixed/80 T8).
         # Writing one is now a deliberate act: `--write-baseline`.
         if "--write-baseline" in sys.argv:
             write_baseline(found)

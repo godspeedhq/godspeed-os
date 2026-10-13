@@ -147,7 +147,9 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     ctx.console_push(10);
 }
 
-/// Answer a block request when there is NO DISK, instead of consuming the message and going quiet.
+/// Answer a request `dispatch` could not route (an empty payload) with `STATUS_ERR`, instead of consuming
+/// the message and going quiet. A BLOCK request with no disk no longer comes here: `dispatch` answers it
+/// `STATUS_NO_DISK` (`backlog/57`). The history below is why this exists at all.
 ///
 /// `recv_timeout` CONSUMES. The two call sites below used to take a message and then drop it whenever
 /// `disk` was None, so a client blocked in request/reply waited forever for an answer that was never
@@ -178,10 +180,12 @@ fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
 /// Answer one request on a dwc2 granted NO hardware window or arena, which has nothing to serve it with.
 ///
 /// The fallback loop used to count such a message and drop it - its reply capability with it - so a
-/// client waited out its whole deadline against a clean log (backlog/80 D6). Each is answered here as
+/// client waited out its whole deadline against a clean log (backlog/fixed/80 D6). Each is answered here as
 /// `dispatch` answers it with nothing bound, routed by op the same way: the supervisor's report ask
 /// with an absent device, a radio op `ST_NO_DEVICE` (an `OP_SYNC` only gives its capability back, as
-/// `rtl::serve` does), a net op the empty `[0]`, and a block op the one-byte error.
+/// `rtl::serve` does), a net op the empty `[0]`, and a block op `STATUS_NO_DISK` - no disk can be bound to
+/// a host with no hardware, and a flush answered `STATUS_ERR` would read as the drive refusing it
+/// (`backlog/57`).
 fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: &mut bool) {
     let p = msg.payload_bytes();
     let Some(&op) = p.first() else { return };
@@ -204,7 +208,7 @@ fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: 
     } else if op >= net::OP_NET_INFO {
         let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[0u8]));
     } else {
-        let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
+        let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_NO_DISK]));
     }
 }
 
@@ -259,12 +263,13 @@ fn dispatch(
     }
     match disk {
         Some((dk, dt, sectors)) => msc::serve(ctx, m, d, dt, dk, msg, *sectors, reply, capless),
-        // A BLOCK request with no disk bound: the one-byte error `answer_no_disk` gives, on the cap this
-        // function already took. Only block requests reach here now - before, a diskless dwc2 answered
+        // A BLOCK request with no disk bound: one byte, `STATUS_NO_DISK` (`backlog/57`), on the cap this
+        // function already took - not `answer_no_disk`'s `STATUS_ERR`, so a flush here reads as "no
+        // device reached" rather than as a stick refusing it. Only block requests reach here now - before, a diskless dwc2 answered
         // EVERY request this way, net and radio included, because the no-disk paths never routed by
         // op: `wifi-usb`'s first QEMU boot got a disk error back to its INFO (2026-10-05).
         None => {
-            let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_ERR]));
+            let _ = gs::ipc::reply(ctx, reply, &godspeed_sdk::Message::from_bytes(&[crate::msc::STATUS_NO_DISK]));
             true
         }
     }
@@ -337,7 +342,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // and its receive, and the port it came from so a removal can drop it.
     let mut radio: Option<rtl::Radio> = None;
     let mut radio_port: u8 = 0;
-    // Every bind of the dongle on this host, counted: the report's generation (`usbdev`).
+    // The gen of the dongle's last bind on this host (`usbfn::next_gen`): the report's generation
+    // (`usbdev`) and `OP_INFO`'s: different from the last bind, and from a restarted host's where the
+    // counter is calibrated and running (`usbfn::next_gen` says where it is not).
     let mut radio_binds: u32 = 0;
     if let Some(m) = ctx.mmio() {
         if core::identify(&ctx, &m).is_some() {
@@ -487,7 +494,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // Bound whether or not the reads answered - the
                                                 // driver asks again and says what it got.
                                                 radio_port = p;
-                                                radio_binds = radio_binds.wrapping_add(1);
+                                                radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
                                                 radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver did:
@@ -655,7 +662,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // either way.
             if disk.is_none() {
                 let mut drained = 0u32;
-                while let Some(msg) = gs::ipc::try_recv(&ctx) {
+                loop {
+                    // Bounded BEFORE taking, as the two drains below are: what is not taken stays
+                    // queued for the next pass (`backlog/84` C3).
+                    if drained >= MSG_DRAIN_MAX {
+                        ctx.log("dwc2-svc: no-disk drain hit its bound - a sender is enqueuing as fast as we retire");
+                        break;
+                    }
+                    let Some(msg) = gs::ipc::try_recv(&ctx) else { break };
                     drained += 1;
                     if is_usb_irq(&msg) {
                         usb_irq(&ctx, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
@@ -665,10 +679,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // need a disk (see `dispatch`).
                     if !dispatch(&ctx, &m, &d, None, nic.as_mut(), radio.as_mut(), &msg, &mut capless) {
                         answer_no_disk(&ctx, &mut capless);
-                    }
-                    if drained >= MSG_DRAIN_MAX {
-                        ctx.log("dwc2-svc: no-disk drain hit its bound - a sender is enqueuing as fast as we retire");
-                        break;
                     }
                 }
             }
@@ -697,22 +707,21 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // budget is spent before the first look. Requests are then served by the timed wait at
                 // the bottom of the pass, ONE per pass and only on a pass that served nothing else.
                 while !t_pass.passed(&ctx, Budget::ms(PASS_BUDGET_MS)) {
+                    // THE COUNT BOUND IS TESTED BEFORE TAKING, like the time bound above it. Testing it
+                    // after `try_recv` meant answering a request it had already CONSUMED - first by
+                    // dropping it (its owner waited forever), then with `answer_no_disk`'s
+                    // `STATUS_ERR`, which on a flush reads to `fs` as the DRIVE refusing the barrier
+                    // while a disk was bound and no device had been asked (`backlog/57`). Declining to
+                    // take leaves the request queued for the next pass, which is true.
+                    if drained >= MSG_DRAIN_MAX {
+                        ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");
+                        break;
+                    }
                     let msg = match gs::ipc::try_recv(&ctx) {
                         Some(m) => m,
                         None => break,
                     };
                     drained += 1;
-                    if drained >= MSG_DRAIN_MAX {
-                        // ANSWER THIS ONE BEFORE BREAKING. `try_recv` above already CONSUMED it, so
-                        // breaking here retired a request and threw it away - and its owner
-                        // (block-driver, then fs, then the shell) waited forever for a reply that was
-                        // never coming. The no-disk drain twenty lines up gets this right; this arm
-                        // was the storm bound, and a storm is exactly when a dropped reply is least
-                        // likely to be noticed.
-                        answer_no_disk(&ctx, &mut capless);
-                        ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");
-                        break;
-                    }
                     // THE INTERRUPT, HANDLED WHERE THE HARDWARE IS.
                     //
                     // This arm existed only in the fallback loop below - the one entered when there
@@ -788,7 +797,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             {
                                 if hvid == rtl::VID && hpid == rtl::PID {
                                     // The radio, plugged in after boot: bound as at boot, and said.
-                                    radio_binds = radio_binds.wrapping_add(1);
+                                    radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
                                     radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
                                     notify(&ctx, format_args!("usb: WiFi dongle connected (port {})", port));
                                     radio_port = port;
@@ -824,8 +833,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             }
                         } else {
                             // REMOVED. Drop the binding so requests are ANSWERED rather than sent to a
-                            // device that is not there: `answer_no_disk` and the net path both already
-                            // reply "unavailable", which is what a client needs to hear (§26.7).
+                            // device that is not there: `dispatch` answers a block request `STATUS_NO_DISK`
+                            // and a net request empty, so a client hears "unavailable" (§26.7).
                             ctx.log_fmt(format_args!("dwc2-svc: port {} - device REMOVED", port));
                             if kbd.is_some() && kbd_port == port {
                                 kbd = None;
@@ -1246,12 +1255,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut first = gs::ipc::recv_within_ms(&ctx, REPORT_MS);
 
         let mut drained = 0u32;
-        while let Some(m) = first.take().or_else(|| gs::ipc::try_recv(&ctx)) {
-            drained += 1;
+        loop {
+            // Bounded BEFORE taking: a message taken and then dropped at the bound took its reply
+            // capability with it, and its sender waited out its whole deadline (the block drain above).
             if drained >= MSG_DRAIN_MAX {
                 ctx.log("dwc2-svc: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
                 break;
             }
+            let Some(m) = first.take().or_else(|| gs::ipc::try_recv(&ctx)) else { break };
+            drained += 1;
             msgs = msgs.wrapping_add(1);
             let p = m.payload_bytes();
             if p.len() == 1 && p[0] == USB_VECTOR {

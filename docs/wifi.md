@@ -3120,7 +3120,7 @@ the rest is so that the next such fault says its name.
   measured and logged from the side that pays it.
 - **The kernel drops a message for a blocked receiver whose queue is full, and says `Ok`.** That is the
   branch the shape above went through, it is a silent fallback at the kernel boundary, and it is
-  `backlog/65` - one branch to fix, held for the next kernel change rather than folded into this flash.
+  `backlog/fixed/65` - one branch to fix, held for the next kernel change rather than folded into this flash.
 
 Also seen and fixed: `net` printed the stack's never-had-a-link sentinel as addresses
 (`ip 108.105.110.107` is the word "link"); and three places said `net status`, which is not a command.
@@ -3373,7 +3373,7 @@ firmware had a stack. The power-on boot never does this, so a watchdog reset is 
 this part - something the ROM sets up from cold is not restored by it - and Broadcom's SDIO driver never
 depends on it because it can cut power. **The radio does not survive a respawn of its driver on this
 board without a power cycle of the WLAN regulator**, which is a GPIO-expander pin behind the firmware
-mailbox that the kernel already drives once at boot. That is `backlog/69`; the five host-side steps above
+mailbox that the kernel already drives once at boot. That is `backlog/fixed/69`; the five host-side steps above
 are each right, each moved the failure one stage later, and each stays.
 
 **One more, before any kernel change - the operator's call.** A power cycle wipes the chip's RAM and a
@@ -3388,7 +3388,7 @@ trap record at `0x0025ff08`, the only change `sp` reading 4 where it read 0. The
 watchdog reset and a power-on is not in the RAM the host can reach. The clear stays, because a warm chip
 should not start on stale data whatever else is wrong, and because it cost one boot to learn that it is
 not the answer. That is the end of the host-side chain: six steps, each a correct reading of the
-reference, each one stage further, and the last one inside the chip's ROM. `backlog/69` is the record
+reference, each one stage further, and the last one inside the chip's ROM. `backlog/fixed/69` is the record
 and the remedy is the power cycle.
 
 ## 46. Adopt, do not restart: a respawn attaches to the firmware that is already running (2026-10-01)
@@ -3420,7 +3420,7 @@ report, interface up - is idempotent on a running firmware and runs either way.
 firmware, skipped the CLM, scanned (12 networks), loaded `/wifi.keys`, joined, and `net` said `up via
 wifi (the cable is out)`; `ping` 5 of 5. The kill cost the link about seven seconds. **The driver's
 restart loop is closed in userspace**, with no reset of any kind and no power cycle: the service is
-volatile, the firmware is not, and a respawn converges on the firmware it finds. `backlog/69` is
+volatile, the firmware is not, and a respawn converges on the firmware it finds. `backlog/fixed/69` is
 resolved by this section. What stays true from section 45: a firmware that has STOPPED - killed
 mid-upload, or trapped - cannot be restarted on this chip without power, and that case is reported
 rather than retried; when this was written it cost a reboot, and section 47 closes that - the driver power-cycles the chip ONCE; if the chip
@@ -3437,7 +3437,7 @@ The rule all four stages obey: a respawn inherits a chip the previous instance l
 step written against the power-on state has to say what it does with a running one.
 
 **What stays open from the same run**, recorded rather than folded in: the console after the storm
-(`backlog/68`), and the parked lag showing through the post-storm ping as expected (`backlog/66`).
+(`backlog/68`), and the parked lag showing through the post-storm ping as expected (`backlog/fixed/66`).
 Section 43's claim that a respawn "rejoins the network last joined" is true only once identification
 succeeds, which this section is the missing half of.
 
@@ -3999,7 +3999,7 @@ every one `flags 0x00000001` and joined, no trap, no lease expired, no panic:
 `power` put the clock at its minimum at start-up - **600 MHz** on this Pi 4 - and each load took a lease,
 ran at **1500 MHz**, and handed it back when the driver started serving, about ten seconds later; the clock
 read back at its minimum again every time. So the radio is fast only while it loads, and every power
-cycle is a power-on. `backlog/69` is closed with this: a respawned driver adopts a running firmware (46),
+cycle is a power-on. `backlog/fixed/69` is closed with this: a respawned driver adopts a running firmware (46),
 and a stopped one is power-cycled cold, every time.
 
 **Still open, and recorded rather than chased:** why a firmware uploaded with the cores at their minimum
@@ -4013,7 +4013,7 @@ answer the shell had stopped waiting for was read as the next request's (section
 boots where that broke `powercycle`). The shell guarded against it by counting what the driver owed and
 skipping that many - and counted them by watching its reply mailbox, which takes every peer's replies.
 In QEMU a stray 2-byte reply from another service cancelled an owed radio answer, and the next `wifi
-status` printed the previous one's answer (`backlog/70`).
+status` printed the previous one's answer (`backlog/fixed/70`).
 
 **The tag.** The shell now sends `[0xE7, tag, op, ...]` (`scan::reply::TAGGED`), and the driver serves
 `[op, ...]` as before and sends its reply back as `[0xE7, tag, status, ...]` - stripped and re-applied in

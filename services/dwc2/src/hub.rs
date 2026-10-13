@@ -559,7 +559,7 @@ pub fn enumerate_downstream(
     // immediately before the failure, so `block-driver` was pushing mass-storage I/O through this one
     // DWC2 core while the SETUP went out. A single transaction error on a contended single-channel
     // controller is flaky, not broken - and `ehci` had the identical defect at its own longest transfer
-    // (`backlog/63`), fixed the same day.
+    // (`backlog/fixed/63`), fixed the same day.
     //
     // Bounded (26.6) and loud: the attempt count is named when it finally gives up, so a device that
     // needed two tries and a device that is genuinely unreadable do not read the same.

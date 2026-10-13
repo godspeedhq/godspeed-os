@@ -1,6 +1,7 @@
 [package]
 name = "observe"
 version = "0.1.0"
+description = "Live view of tasks, cores and memory, like top"
 edition = "2021"
 
 [[bin]]

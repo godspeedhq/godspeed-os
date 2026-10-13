@@ -4,7 +4,7 @@
 # why: A citation of a file that was deleted sends a reader after nothing. A citation of a BACKLOG
 # why: entry that was never written is worse: it reads as though the limitation has been recorded,
 # why: which is the opposite of what 26.7 asks. This gate caught exactly that while `conform` itself
-# why: was being written - a `backlog/58` cited one commit before it existed.
+# why: was being written - a `backlog/fixed/58` cited one commit before it existed.
 --- plant ---
 
 The full treatment is in `docs/pipes-internals-that-do-not-exist.md`.

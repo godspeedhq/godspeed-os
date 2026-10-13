@@ -58,7 +58,7 @@ TARGET = "riscv64imac-unknown-none-elf"
 # it because no non-x86 build asks for `probe` at all, which is a different statement with a different
 # fix. riscv64 bodies are genuinely missing, and what that costs is recorded in `backlog/24`.
 SERVICES = [
-    "events", "recorder", "copier", "console", "shell", "chaos", "observe", "mem-pressure", "time", "control",
+    "events", "recorder", "copier", "ask", "console", "shell", "chaos", "observe", "mem-pressure", "time", "control",
     # `hw-enumerator` joins the build now that this arch answers `pci_cfg_read32`. It was absent
     # because the seam member returned None unconditionally, so the service had nothing to enumerate
     # WITH - not because the board has no PCI (QEMU `virt` has a generic host bridge and this port
@@ -94,7 +94,7 @@ def gates():
     """The same list `osdev build` runs, read from it (scripts/build_gates.py). This was "the same
     set `arm_build.py` runs", seven checkers listed by hand "so ADDING a checker is a decision each
     build path makes" - and every checker added since was added to one path only, so a VisionFive image
-    skipped seventeen of `osdev build`'s gates (backlog/80 T8)."""
+    skipped seventeen of `osdev build`'s gates (backlog/fixed/80 T8)."""
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import build_gates
     build_gates.run_all()

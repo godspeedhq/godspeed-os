@@ -385,7 +385,7 @@ impl Term {
     /// own view, and to do that it must `paint_view` + `present` BEFORE it can return - a full
     /// repaint of the framebuffer, synchronously, inside the caller's blocking request. On a
     /// 3840x2160 panel that is the most expensive thing this service ever does, and the caller was
-    /// giving it one second while sitting on the same core (`backlog/37`). Reading the ring is a
+    /// giving it one second while sitting on the same core (`backlog/fixed/37`). Reading the ring is a
     /// bounded memcpy: it cannot take a framebuffer's worth of time because it never touches one.
     ///
     /// The caller pages the result itself, so a keypress costs no repaint here at all.

@@ -247,7 +247,7 @@ fn banner() {
 }
 
 // These two attributes are `kernel_main`'s. A doc comment and `banner` were once inserted between
-// them and it, so they applied to `banner` until 2026-10-10 (`backlog/80` K13). `kernel_main` is
+// them and it, so they applied to `banner` until 2026-10-10 (`backlog/fixed/80` K13). `kernel_main` is
 // reached as a Rust path from x86's `_start` (`arch/x86_64/mod.rs`), so it built either way.
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -308,7 +308,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // below - which is where it worked in the E2 build; deferring it past the handoff stopped
     // the legacy INTx from delivering on the T630. The EHCI routes to the BSP (available now,
     // pre-smp::init). An MSI is re-aimed at the driver's own core when the driver is spawned
-    // (`task::spawn_from_image`, backlog/80 K27); here it can only reach the BSP. Interrupters stay
+    // (`task::spawn_from_image`, backlog/fixed/80 K27); here it can only reach the BSP. Interrupters stay
     // off until each userspace driver enables them, so nothing fires yet.
     if !arch::imp::pci::program_ehci_msi(0) {
         arch::imp::pci::route_ehci_intx();
@@ -346,7 +346,7 @@ pub extern "C" fn kernel_main(boot_info_ptr: *const arch::imp::BootInfo) -> ! {
     // globally (APIC-only kernel): on real hardware unmasking PIC IRQ 4 without
     // proper PIC EOI in the handler jams the PIC ISR and locks up the interrupt
     // controller before boot. (The RX-enable function that did it was deleted
-    // 2026-10-10, `backlog/80` K20.)
+    // 2026-10-10, `backlog/fixed/80` K20.)
 
     capability::init();
     ipc::init();

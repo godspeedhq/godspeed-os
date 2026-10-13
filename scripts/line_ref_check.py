@@ -82,7 +82,7 @@ def main():
                 continue
             # Read EVERY marker, not only those beside a citation: a file's markers were parsed only
             # when it held a citation, so a refused marker - no reason, no rule, or a rule nothing
-            # honours - in any other file was never seen (backlog/80 T8). This is the one checker
+            # honours - in any other file was never seen (backlog/fixed/80 T8). This is the one checker
             # that reads the marker, so it is the one that reports the markers it cannot honour.
             if 'conform-ok' in text:
                 supp.covers(path, 0, '')

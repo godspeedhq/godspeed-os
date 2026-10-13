@@ -19,4 +19,4 @@ impl From<EndpointId> for ResourceId {
 
 // (An `Endpoint` struct sat here that nothing constructed: the live per-endpoint state - core,
 // generation, liveness, queue, blocked receiver and sender - is `routing::RoutingEntry`, keyed by
-// `EndpointId`. It was deleted 2026-10-10 (`backlog/80` K20).)
+// `EndpointId`. It was deleted 2026-10-10 (`backlog/fixed/80` K20).)

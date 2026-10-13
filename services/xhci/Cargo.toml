@@ -1,5 +1,6 @@
 [package]
 name = "xhci"
+description = "USB 3 host driver: keyboard, mass storage and a WiFi dongle"
 version = "0.1.0"
 edition = "2021"
 

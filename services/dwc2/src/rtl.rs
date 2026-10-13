@@ -597,7 +597,8 @@ pub fn serve(
             out[1] = usbfn::ST_OK;
             out[2..4].copy_from_slice(&r.vid.to_le_bytes());
             out[4..6].copy_from_slice(&r.pid.to_le_bytes());
-            6
+            out[usbfn::INFO_GEN_AT..usbfn::INFO_GEN_AT + 4].copy_from_slice(&r.gen.to_le_bytes());
+            usbfn::INFO_GEN_AT + 4
         }
         (usbfn::OP_CONTROL, Some(r)) => control(ctx, mmio, dma, &r.t, p, CONTROL_TRIES, &mut out),
         (usbfn::OP_CONTROL_ONCE, Some(r)) => control(ctx, mmio, dma, &r.t, p, 1, &mut out),

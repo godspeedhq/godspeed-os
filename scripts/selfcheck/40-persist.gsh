@@ -1,11 +1,11 @@
-# GodspeedOS self-check, part 5 of 9: events persist: capture to disk, through a service that is NOT events
+# GodspeedOS self-check, part 5 of 10: events persist: capture to disk, through a service that is NOT events
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck persist` runs THIS part alone; `selfcheck` runs them all
 # and prints one tally for the whole suite.
 #
 # They are separate files because a baked script is indexed with u16 offsets and the single file had
-# reached 65,139 bytes of a 65,536 ceiling (`backlog/47`). Each part now carries its own budget - and
+# reached 65,139 bytes of a 65,536 ceiling (`backlog/fixed/47`). Each part now carries its own budget - and
 # its own 256-statement detail budget, so the report no longer stops naming statements part way.
 #
 # No part may declare a `fn` or a `let` another part uses: each is interpreted on its own, with a
@@ -31,7 +31,7 @@ assert ok events persist start /sc/cap.log 256KiB
 # where filling 4 MiB over USB took longer than the caller was willing to wait.
 #
 # SO WAIT ON THE TRUTH, NOT ON A CLOCK (Commandment VIII). This was `wait 3` racing a variable
-# pre-fill and it lost intermittently - `backlog/36` has the post-mortem. Staged through a file
+# pre-fill and it lost intermittently - `backlog/fixed/36` has the post-mortem. Staged through a file
 # because gsh refuses to capture a pipeline (see the hw-enumerator probe in `20-hardware.gsh`); `count` counts DATA
 # rows, so a match is 1 and no match is 0.
 let mut capready = 0
@@ -105,7 +105,9 @@ read /sc/tiny.log | assert contains recorder: capture started
 read /sc/tiny.log | assert contains recorder: capture ended
 
 # The footer is what makes a capture readable as COMPLETE. A file with a header and no footer died.
-events persist status | assert contains idle
+# And `stop` ENDS the recorder (since 2026-10-11 the shell ends a helper once its work is over,
+# `services/CLAUDE.md`): status says `not running`, where it said `idle` while the recorder stayed up.
+events persist status | assert contains not running
 
 # NOT asserted here: filtering for a SPECIFIC owner. Which services have logged inside the 8 KiB
 # window varies by machine and by how far it has wrapped, so any such assertion is a coin flip on

@@ -168,7 +168,7 @@ def main():
     #
     # THE SAME LIST `osdev build` RUNS, read from it (scripts/build_gates.py). This was a hand copy of
     # seven checkers while `osdev build` grew to twenty-four, so a Pi 2 image skipped every gate added
-    # after the copy was made (backlog/80 T8).
+    # after the copy was made (backlog/fixed/80 T8).
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import build_gates
     build_gates.run_all()

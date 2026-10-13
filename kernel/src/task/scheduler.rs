@@ -679,10 +679,10 @@ static CORE_WAKE_HINT: PerCore<AtomicUsize> = PerCore::new();
 /// How often, in spin iterations, the kill-path wait re-sends its WAKE_RECEIVER IPI.
 ///
 /// It used to be sent once before the loop and never again, so a core that missed it was never
-/// poked a second time (`backlog/48`). Re-poking a core that is merely slow costs one IPI.
+/// poked a second time (`backlog/fixed/48`). Re-poking a core that is merely slow costs one IPI.
 /// Test-only: fire the kill-path ABANDON exactly once, so that path is observed rather than assumed.
 ///
-/// The abandon path replaced a `panic!` (`backlog/48`). The race that reaches it needs a core wedged
+/// The abandon path replaced a `panic!` (`backlog/fixed/48`). The race that reaches it needs a core wedged
 /// inside a masked window and does not occur under QEMU, so without this the code shipped having
 /// never run. `iommu-fault-test` exists for the same reason and is the precedent.
 ///
@@ -790,7 +790,7 @@ pub fn current_core() -> usize { current_core_id() }
 /// EL0 fault report is that case: it goes out on the raw UART from the exception handler, IRQs off, and
 /// on the Pi 4 it takes about 2.6 s against a 2.5 s window. Three times in two chaos runs a kill of the
 /// faulting task abandoned its slot while that core was still printing the report and said the core
-/// was "wedged" (`backlog/48`). A core writing output is executing, so the wait counts this as progress
+/// was "wedged" (`backlog/fixed/48`). A core writing output is executing, so the wait counts this as progress
 /// too. Still bounded by `MAX_WAIT_EXTENSIONS`: a core that prints forever without scheduling is
 /// abandoned after the last window, as before.
 ///
@@ -1128,7 +1128,7 @@ pub fn take_last_recv_badge() -> u64 {
 /// table. The slot is retrieved by the service via syscall 12 (TakePendingCap). Holds at
 /// most `MAX_PENDING_RECV_CAPS`, and returns whether `cap_slot` was recorded: the caller
 /// takes back a cap whose slot could not be, rather than leave it installed where the
-/// service will never learn of it (`backlog/80` K4).
+/// service will never learn of it (`backlog/fixed/80` K4).
 pub fn push_pending_recv_cap(cap_slot: u32) -> bool {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
@@ -1421,7 +1421,7 @@ pub fn run(core_id: u32) -> ! {
 
         // Path C / Phase 6: respawn the supervisor here if it died - an IF=1 scheduling point, NOT the
         // timer ISR. `spawn_supervisor` is a full ~22 ms service spawn, which when this was written also
-        // issued all-core TLB shootdowns (that broadcast is gone, `backlog/80` K20); running it from the
+        // issued all-core TLB shootdowns (that broadcast is gone, `backlog/fixed/80` K20); running it from the
         // Core-0 timer ISR (IF=0, where it used to live, via process_pending) wedged the box under a
         // storm: Core 0 could not take other cores' IPIs while stuck in the IF=0 spawn - the exact hazard process_pending's own
         // comment warns about (it bounds the COM2 drain for the same reason). Here CORE_CURRENT is IDLE
@@ -2366,8 +2366,39 @@ fn drain_pending_kstack(cid: usize) {
     }
 }
 
-/// Kill a task by slot: mark Dead, kill its endpoint (if any), notify blocked tasks.
-pub fn kill_task_by_slot(slot: usize) {
+/// The longest death notice: a name, NUL, `K` and the killer's name (each name at most 64 bytes).
+const DEATH_NOTE_MAX: usize = 2 * 64 + 16;
+
+/// Build the death notice for `name` into `note`, returning its length: the name, a NUL, then how
+/// it ended - `K` and the name of the task that called `kill`, or `F`, the fault kind and the address
+/// (8 bytes LE). The supervisor reads the name up to the NUL (CLAUDE.md 6.2, amendment 2026-10-11).
+fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_MAX]) -> usize {
+    let nb = name.as_bytes();
+    let mut n = nb.len().min(64);
+    note[..n].copy_from_slice(&nb[..n]);
+    note[n] = 0;
+    n += 1;
+    match cause {
+        crate::task::Cause::Killed { by } => {
+            note[n] = crate::task::death::KILLED;
+            n += 1;
+            let kb = task_name(by).as_bytes();
+            let k = kb.len().min(64);
+            note[n..n + k].copy_from_slice(&kb[..k]);
+            n + k
+        }
+        crate::task::Cause::Fault { kind, addr } => {
+            note[n] = crate::task::death::FAULT;
+            note[n + 1] = kind;
+            note[n + 2..n + 10].copy_from_slice(&addr.to_le_bytes());
+            n + 10
+        }
+    }
+}
+
+/// Kill a task by slot: mark Dead, kill its endpoint (if any), notify blocked tasks. `cause` is how it
+/// ended, said in the death notice when the supervisor watches it (`task::death`).
+pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
     // Serialize the TASK_VALID check against concurrent kills and spawns.
     // Two cores calling kill_task_by_slot(slot) simultaneously would otherwise
     // both pass the !TASK_VALID guard, both reach free_kstack, and double-free
@@ -2654,10 +2685,16 @@ pub fn kill_task_by_slot(slot: usize) {
         }
         // Reported to the supervisor because the supervisor ASKED, at spawn, to hear of this task's death -
         // not because its name is on a list here. See the restart counter above.
+        //
+        // HOW IT ENDED rides the same notice, after the name and a NUL: `K` and the name of the task that
+        // called `kill`, or `F`, the fault kind and the address (8 bytes LE). The supervisor reads the
+        // name up to the NUL, as it always read the whole notice (CLAUDE.md 6.2, amendment 2026-10-11).
         if task_watched(slot) {
+            let mut note = [0u8; DEATH_NOTE_MAX];
+            let n = death_note(task_name, cause, &mut note);
             if let (Some(sup_ep), Ok(msg)) = (
                 crate::ipc::names::lookup("supervisor"),
-                crate::ipc::message::Message::new(task_name.as_bytes()),
+                crate::ipc::message::Message::new(&note[..n]),
             ) {
                 match crate::ipc::routing::enqueue_from_interrupt(sup_ep, msg) {
                     crate::ipc::routing::Enqueue::Woke(sup_slot) => wake_by_slot(sup_slot, 0),
@@ -2860,7 +2897,7 @@ pub fn kill_task_by_slot(slot: usize) {
                         // would not let go of one slot - reachable from userspace through an ordinary
                         // supervisor kill, which CLAUDE.md 22 forbids absolutely: nothing above the
                         // kernel may panic the kernel. Reproduced on a Raspberry Pi 4 at chaos round
-                        // 943 of 1000 with no host load (backlog/48).
+                        // 943 of 1000 with no host load (backlog/fixed/48).
                         //
                         // So: abandon the reclaim and leave the slot un-freed. The task is already
                         // Dead and its endpoints are already torn down, so it cannot run and cannot be
@@ -2923,7 +2960,7 @@ pub fn kill_task_by_slot(slot: usize) {
         // dead root in TTBR0 and may walk it speculatively, so its
         // `free_page_table_root` invalidates inner-shareable (`tlbi vmalle1is`)
         // before the root goes. No software broadcast exists or is needed; the
-        // one that sat in smp/ipi.rs had no caller and was deleted (`backlog/80`
+        // one that sat in smp/ipi.rs had no caller and was deleted (`backlog/fixed/80`
         // K20). A broadcast here would also be dangerous: a remote core spinning
         // IF=0 cannot acknowledge one, and the caller would spin with it.
         let freed_frames: usize;

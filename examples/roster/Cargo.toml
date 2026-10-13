@@ -1,5 +1,6 @@
 [package]
 name = "roster"
+description = "Example: a pipe producer of records - a typed table the shell's record verbs can filter and sort"
 version = "0.1.0"
 edition = "2021"
 

@@ -710,7 +710,7 @@ impl Dwmac {
     /// good-side counters are unpopulated in this part and the whole thread closes for good.
     ///
     /// Read-only. Reported beside the first transmits' counters (`dwmac.rs`); nothing called it until
-    /// 2026-10-10 (backlog/80 D11).
+    /// 2026-10-10 (backlog/fixed/80 D11).
     pub fn tx_fault_counters(&self) -> (u32, u32, u32, u32, u32, u32, u32, u32) {
         (
             self.m.read32(MMC_TX_SINGLECOL_G),

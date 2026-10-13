@@ -43,7 +43,7 @@
     So the card was never at fault, and the apparatus built to prove it was is deleted - a feature is
     pulled into existence by a real problem (CLAUDE.md 26.2), and that problem never existed. What
     survives is the one check that fixes a defect actually demonstrated: the cached-hash gap above.
-    `backlog/26` has the full account, including the reasoning error that produced the wrong theory.
+    `backlog/fixed/26` has the full account, including the reasoning error that produced the wrong theory.
 
     Usage:  pwsh -File scripts\deploy_visionfive.ps1 [-Esp P:] [-Repo <path>] [-Log <path>]
 #>
@@ -124,7 +124,7 @@ try {
     #
     # while the MENU rendered perfectly, because a trailing `\r` in a display string only returns
     # the cursor. So it looked like a load failure and not a config fault, and it cost two card
-    # reflashes and two wrong theories (`backlog/26`).
+    # reflashes and two wrong theories (`backlog/fixed/26`).
     #
     # `.gitattributes` now pins `boot/** text eol=lf`, which fixes the checkout. This does NOT rely
     # on that: whether the board boots must not depend on a contributor's git settings, an editor
@@ -170,7 +170,7 @@ try {
     # This is deliberately ONLY our kernel. An earlier version of this section also re-read the stock
     # Debian initrd, timed both, and printed a verdict about card health, PSUs and reseating - all of
     # it built to test the theory that the card was not returning its data. That theory was WRONG
-    # (the fault was CRLF in the config, `backlog/26`), so the apparatus built for it is gone: a
+    # (the fault was CRLF in the config, `backlog/fixed/26`), so the apparatus built for it is gone: a
     # feature is pulled into existence by a real problem, and this one never existed (26.2). What
     # remains is the check that fixes a defect we actually demonstrated.
     try {

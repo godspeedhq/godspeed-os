@@ -680,7 +680,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // SAFETY: `frame` is the trap frame the vector assembly just built on the current stack; it is
     // valid for the life of this call and nothing else aliases it.
     let f = unsafe { &*frame };
-    // Ask this core's own MMU about the faulting address BEFORE anything else runs (`backlog/72`): every
+    // Ask this core's own MMU about the faulting address BEFORE anything else runs (`backlog/fixed/72`): every
     // line printed below can evict or refill the TLB, and the question is what the core held at the
     // fault. Same gate as the page walk that prints the answer.
     let ec = (esr >> 26) & 0x3F;
@@ -1215,7 +1215,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         }
     }
 
-    // THE PAGE WALK, for an EL0 instruction or data abort (`backlog/72`): what the table the core had
+    // THE PAGE WALK, for an EL0 instruction or data abort (`backlog/fixed/72`): what the table the core had
     // installed says about the faulting address, and whether its frames have a second owner. Skipped for
     // the null page, which is where the DESIGNED faults land - a service panicking on `EndpointDead` faults
     // at address 0 on purpose, dozens of times in a storm, and walking each would bury the faults this is for.
@@ -1225,7 +1225,18 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
 
     if from_el0 && slot < crate::task::scheduler::MAX_TASKS {
         super::put_str(b"\r\n    EL0 fault - killing the task; the kernel and every other service continue.\r\n");
-        crate::task::kill_current();
+        use crate::task::death::*;
+        let (kind, addr) = match ec {
+            0b100000 | 0b100001 => (F_INSTRUCTION, far),
+            0b100100 | 0b100101 => (F_MEMORY, far),
+            0b000000 | 0b001110 => (F_ILLEGAL, f.elr),
+            // PC and SP alignment: the architecture leaves FAR UNKNOWN for an SP alignment fault, so
+            // both report ELR rather than an address that may be garbage - the faulting instruction for
+            // SP alignment, the misaligned PC itself for PC alignment.
+            0b100010 | 0b100110 => (F_ALIGNMENT, f.elr),
+            _ => (F_OTHER, f.elr),
+        };
+        crate::task::kill_current(kind, addr);
         // `kill_current` marks the task Dead and reschedules, so it does not come back. If it ever
         // does, falling through to the halt below is right: resuming a corpse's context is worse
         // than stopping, and the line above will be in the log to say what happened.

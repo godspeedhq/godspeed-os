@@ -8,7 +8,7 @@
 /// `SVC_SUPERVISOR_ELF` (`task/mod.rs`); `SVC_EVENTS_ELF`, `SVC_PING_ELF` and `SVC_PONG_ELF` are read by
 /// the arm32 bring-up scaffolding (`arch/arm/loadtest.rs`, `arch/arm/sched_ipc.rs`). Every other
 /// service image is embedded by the SUPERVISOR (`services/supervisor/build.rs`). This list emitted 29
-/// until 2026-10-10, 25 of which nothing included (`backlog/80` K16). The per-arch `*_built` lists
+/// until 2026-10-10, 25 of which nothing included (`backlog/fixed/80` K16). The per-arch `*_built` lists
 /// below still name the services each port builds - `scripts/service_embed_check.py` reads them - but
 /// for the kernel they now decide only these four; their notes about `LoadFailed` describe the time
 /// before the images moved.
@@ -67,7 +67,7 @@ fn main() {
     println!("cargo:rustc-env=GODSPEED_TARGET_ARCH={arch}");
     // WHERE git keeps that log, asked of git. This looked for `.git/logs/HEAD` relative to the build
     // script's directory, `kernel/`, where it never is, so the trigger was never registered and the
-    // stamp went stale until something else rebuilt the kernel (`backlog/80` K16). `--git-path`
+    // stamp went stale until something else rebuilt the kernel (`backlog/fixed/80` K16). `--git-path`
     // also answers in a worktree, where `.git` is a file and the log lives elsewhere.
     if let Some(head_log) = std::process::Command::new("git")
         .args(["rev-parse", "--git-path", "logs/HEAD"])
@@ -133,6 +133,13 @@ fn main() {
     if target == "armv7a-none-eabi" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld_arm.display());
     }
+    // The riscv32 size study (backlog/fixed/60): a script of its own, since OpenSBI's 32-bit firmware loads
+    // the next stage at a different address from the 64-bit one.
+    let kernel_ld_riscv32 = workspace.join("kernel").join("kernel-riscv32.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_riscv32.display());
+    if target == "riscv32imac-unknown-none-elf" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld_riscv32.display());
+    }
     let kernel_ld_loongarch64 = workspace.join("kernel").join("kernel-loongarch64.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_loongarch64.display());
     if target == "loongarch64-unknown-none-softfloat" {
@@ -179,7 +186,7 @@ fn main() {
     // not, because the Pi 2 has no PCI, so they stay placeholders. `probe` does not build for ARM
     // (x86-only fault module).
     let arm_built: &[&str] = &[
-        "events", "recorder", "copier", "console", "ping", "pong", "supervisor", "shell",
+        "events", "recorder", "copier", "ask", "console", "ping", "pong", "supervisor", "shell",
         "observe", "chaos", "mem-pressure",
         "counter", "greet", "upper", "roster",
         "reply-server", "asker", "resource-server", "holder",
@@ -250,7 +257,7 @@ fn main() {
     // is the only way it learns the wall clock. `control` is inert on a board driven from its own
     // console, and is embedded so the service set does not differ per arch without a reason.
     let aarch64_built: &[&str] = if aarch64_demo {
-        &["events", "recorder", "copier", "console", "time", "control", "ping", "pong", "supervisor", "shell",
+        &["events", "recorder", "copier", "ask", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           // The Pi 4's onboard radio, over SDIO: on aarch64, the board with a WiFi part soldered to an SD
@@ -268,7 +275,7 @@ fn main() {
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
-        &["events", "recorder", "copier", "console", "time", "control", "supervisor", "shell",
+        &["events", "recorder", "copier", "ask", "console", "time", "control", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           // See the demo arm above. Present in BOTH arms because both can ship, which is the trap

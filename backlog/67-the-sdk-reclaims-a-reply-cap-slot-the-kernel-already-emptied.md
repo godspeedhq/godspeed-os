@@ -2,7 +2,7 @@
 
 **Status: FIXED 2026-10-02 in the SDK and the shell, verified in QEMU and on the Pi 4 (the boot after `f82ae9d2`, through a 50-round chaos run, logged no `reply cap is dead`); the Pi 2 and the VisionFive are still owed.** *(2026-10-08: both booted builds carrying the fix, through 1000-round chaos runs, `docs/wifi-usb.md` 50; their logs were not searched for `reply cap is dead`.)* The reclaim is gone from every path where the send succeeded (nine send-then-receive waits, and the three `CallDeadline` `Ok(None)` arms, where it was dead code); the failed-send paths keep it. The `Call` ERROR arms keep it too, and the reason is not the one their comments gave ("idempotent"): during a `Call` the kernel inserts no received cap into the caller's table - it takes only the reply and leaves everything else queued - so the slot holds either the unsent cap or nothing. One more site was found outside the SDK, the shell's `fcap` wait (`resource_invoke`, then `recv_abortable_deadline`), which removed the slot on an abort or a timeout after a DELIVERED invoke. x86 QEMU after the change: shell 215/0, identity 24/24, chaos 8/8, reply-dead 5/5, reply-server 4/4, peer-storm 7/7, adopt-storm 7/7, fs-restart 11/11.
 
-**Previous status: OPEN - found 2026-09-30 while chasing `backlog/66`, by reading; the onset of every slow phase in that item matches it. Not fixed: the change touches thirteen sites on every service's request path and the operator parked the investigation.**
+**Previous status: OPEN - found 2026-09-30 while chasing `backlog/fixed/66`, by reading; the onset of every slow phase in that item matches it. Not fixed: the change touches thirteen sites on every service's request path and the operator parked the investigation.**
 
 ## The two kernel facts
 
@@ -39,7 +39,7 @@ cap was never transferred and must be reclaimed.
 ## The fix, when it is taken
 
 Remove the reclaim on every path where the send succeeded, and only there. The reply cap is then
-owned by the peer, who removes it after answering (`nic-driver` does; `backlog/66`'s reply-cap lesson).
+owned by the peer, who removes it after answering (`nic-driver` does; `backlog/fixed/66`'s reply-cap lesson).
 A late reply after a timeout arrives capless and is sifted or dropped as today. No kernel change.
 
 The alternative - the kernel telling a task which slot a received cap went to, so the SDK could check

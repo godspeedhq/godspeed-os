@@ -50,7 +50,7 @@ const CORE_IRQ_GPU: u32 = 1 << 8;
 // the core-local routing register's RESET DEFAULT. The line is level-triggered: it stays asserted until
 // the `dwc2` service clears the underlying HPRT change bit or channel HCINT, which it does before it
 // unmasks. (A function that wrote both hops explicitly sat here with no callers, and the system timer's
-// enable was once put in it and so never ran; it was deleted 2026-10-10, `backlog/80` K25.)
+// enable was once put in it and so never ran; it was deleted 2026-10-10, `backlog/fixed/80` K25.)
 
 /// The NEUTRAL vector a userspace USB driver is granted for this controller.
 ///
@@ -708,7 +708,7 @@ pub fn start_tick_ap(_core: u32) -> bool {
     local_write(CORE_MBOX_IRQCNTL + 4 * this_core(), 1);
     // (A `tx_ring_enable` for core 0 sat here, unreachable: this is the SECONDARY path, and a released
     // core claiming id 0 is parked before it gets here as already-ready. Core 0 enables the ring in
-    // `start_tick`. Removed 2026-10-10, `backlog/80` K25.)
+    // `start_tick`. Removed 2026-10-10, `backlog/fixed/80` K25.)
     // And the system timer's compare-3 line, which carries the microsecond one-shot through the GPU
     // funnel to core 0. Enabled HERE, in the path that actually runs at boot - it was first put in a
     // USB routing function that turned out to have no callers, so it silently never happened and

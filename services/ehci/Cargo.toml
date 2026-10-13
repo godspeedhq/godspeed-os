@@ -1,6 +1,7 @@
 [package]
 name = "ehci"
 version = "0.1.0"
+description = "USB 2.0 host driver for the PCs"
 edition = "2021"
 
 [[bin]]

@@ -5,7 +5,7 @@
 //! # Every request is TAGGED, and every answer is immediate
 //!
 //! A request is `[TAGGED, tag, op, args...]` and its answer `[TAGGED, tag, status, ...]`, so the asker
-//! takes the answer carrying its own tag and passes over a late one. That is backlog/70's lesson from the
+//! takes the answer carrying its own tag and passes over a late one. That is backlog/fixed/70's lesson from the
 //! radio: a receive takes whatever is next, and an answer the shell had stopped waiting for was read as
 //! the next request's. Here it is in the protocol from the first byte rather than added after.
 //!

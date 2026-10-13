@@ -115,16 +115,21 @@ pub(crate) fn host(ctx: &ServiceContext, body: &[u8]) -> Result<Message, &'stati
 /// Notices taken in place of one answer before `host` gives up on it.
 const SYNC_MAX: u32 = 4;
 
-/// What the host says about the radio: `Some((vid, pid))` when one is bound, `None` when none is or the
-/// host did not answer - the second said once by the caller.
-pub(crate) fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16)>, &'static str> {
+/// What the host says about the radio: `Some((vid, pid, gen))` when one is bound, `None` when none is or the
+/// host did not answer - the second said once by the caller. `gen` names the binding (`usbfn::OP_INFO`): the
+/// same dongle bound afresh - replugged, or enumerated again by a host that restarted, which resets the
+/// chip - reads differently, so comparing this is how a binding the station was not brought up on is seen.
+pub(crate) fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16, u32)>, &'static str> {
     let r = host(ctx, &[usbfn::OP_INFO])?;
     let p = r.payload_bytes();
     if p.len() < 2 || p[0] != usbfn::OP_INFO {
         return Err("answered something other than INFO - not speaking usbfn");
     }
     match p[1] {
-        usbfn::ST_OK if p.len() >= 6 => Ok(Some((u16::from_le_bytes([p[2], p[3]]), u16::from_le_bytes([p[4], p[5]])))),
+        usbfn::ST_OK if p.len() >= usbfn::INFO_GEN_AT + 4 => Ok(Some((
+            u16::from_le_bytes([p[2], p[3]]), u16::from_le_bytes([p[4], p[5]]),
+            u32::from_le_bytes([p[6], p[7], p[8], p[9]])))),
+        usbfn::ST_OK => Err("answered INFO without the binding's gen"),
         usbfn::ST_NO_DEVICE => Ok(None),
         _ => Err("answered INFO with an error"),
     }
@@ -408,8 +413,8 @@ fn firmware(ctx: &ServiceContext) -> bool {
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "wifi-usb");
     ctx.log("wifi-usb: starting - the USB WiFi dongle's driver; asks its USB host once whether a dongle is bound, then waits to be told");
-    // What was last said, so each change is said once: none yet, bound (vid, pid), gone, or a host fault.
-    let mut said: Option<Result<Option<(u16, u16)>, &'static str>> = None;
+    // What was last said, so each change is said once: none yet, bound (vid, pid, gen), gone, or a host fault.
+    let mut said: Option<Result<Option<(u16, u16, u32)>, &'static str>> = None;
     // The dongle as a station, once a bring-up has made one; `None` while there is no dongle or its
     // bring-up stopped - and then the loop below answers `radio down`, with why.
     let mut dongle: Option<station::Dongle> = None;
@@ -425,7 +430,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if said != Some(now) {
             dongle = None;
             match now {
-                Ok(Some((vid, pid))) => {
+                Ok(Some((vid, pid, _))) => {
                     heard = rx::Heard::new(&link, host_name(&ctx));
                     *link.borrow_mut() = rx::Link::new();
                     heard.ids = Some((vid, pid));

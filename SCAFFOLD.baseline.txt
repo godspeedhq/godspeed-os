@@ -3,4 +3,4 @@
 # may never go backwards - a regression means a fresh ISA lost ground, which is
 # the bound eroding.
 loongarch64    1
-riscv32        0
+riscv32        1

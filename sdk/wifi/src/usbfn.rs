@@ -12,15 +12,33 @@
 //! Every reply starts `[op, status]`; the status is one of the `ST_` values, so a reply to the wrong op, or a
 //! host that does not speak this protocol, is told apart from an answer.
 
-/// `[op]` -> `[op, status, vid lo, vid hi, pid lo, pid hi]`: which device is bound as the radio, if any.
+/// `[op]` -> `[op, status, vid lo, vid hi, pid lo, pid hi, gen (4 bytes LE)]`: which device is bound as the
+/// radio, if any, and which BINDING of it this is (`INFO_GEN_AT`, the host's `next_gen`). The same dongle
+/// bound again - a replug, or a host that restarted and enumerated it afresh, resetting the chip - has a
+/// different gen, so a driver compares it and not only the IDs: the IDs alone told a `wifi-usb` whose host
+/// had restarted that nothing had changed, and it went on serving a chip the restart had reset (Pi 2,
+/// 2026-10-12, `kill all-services`).
 ///
 /// A host that knows where the radio is may go on, for `wifi hardware <radio>` (`utilities/56_wifi.md` 11a):
 /// `[root port, hub port (0 = on the root port itself), slot, bulk IN address, bulk IN max packet lo, hi,
 /// bulk OUT count, bulk OUT address...]` (`INFO_WHERE_AT` onwards). `xhci` does; `dwc2` does not yet, and a
 /// driver reads only what the reply carries.
 pub const OP_INFO: u8 = 0x20;
+/// Where an `OP_INFO` answer's gen starts.
+pub const INFO_GEN_AT: usize = 6;
 /// Where the optional part of an `OP_INFO` answer starts.
-pub const INFO_WHERE_AT: usize = 6;
+pub const INFO_WHERE_AT: usize = 10;
+
+/// The gen for a new binding, given the host's `gs::driver::wait::counter_ms` now and the gen it gave last:
+/// the counter, so a restarted host does not repeat a gen its previous instance gave (a count from 1 did, on
+/// every restart), and otherwise one more than the last this instance gave, so two binds in one millisecond
+/// still differ. Never 0, which a report reads as absent. Across a restart this holds only where the counter
+/// is calibrated and running: an uncalibrated one reads 0, so each instance counts from 1 again; the low 32
+/// bits wrap every ~49.7 days (`backlog/84` C2).
+pub fn next_gen(now_ms: u64, last: u32) -> u32 {
+    let t = now_ms as u32;
+    if t > last { t } else { last.wrapping_add(1).max(1) }
+}
 /// `[op, setup(8), data out...]` -> `[op, status, data in...]`. One control transfer to the bound radio: the
 /// 8-byte setup packet as USB defines it; for an OUT transfer the data follows it, `wLength` bytes; for an
 /// IN transfer the reply carries what the device returned.

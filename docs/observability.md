@@ -568,7 +568,7 @@ Read back with `events metrics` (a record source, so it filters and formats like
 
 **And logs became queryable without a kernel change**, which is worth recording because the obvious
 route needed one. No syscall exposes the kernel's 16 KiB ring to userspace (the SDK carried a
-`drain_kernel_ring_buffer()` that did nothing; it was deleted on 2026-10-10, `backlog/80` S7), so `events log` could not be built by draining it. What works instead:
+`drain_kernel_ring_buffer()` that did nothing; it was deleted on 2026-10-10, `backlog/fixed/80` S7), so `events log` could not be built by draining it. What works instead:
 `ctx.log()` performs its syscall FIRST and unconditionally, then offers a best-effort COPY to
 `events`. That is not the re-pointing section 1 forbids - the floor still fires first and a dead
 sink still loses no log output - it is a duplicate kept for querying. The limitation that follows is

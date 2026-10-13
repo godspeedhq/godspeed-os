@@ -1076,7 +1076,9 @@ constitution already describes.
 - `control` needs to reach the supervisor - it has neither a send-peer to it nor `ACQUIRE_ANY` today.
 - The supervisor's endpoint currently receives only DEATH NOTIFICATIONS, whose payload is a bare
   name. A restart command carrying a core override needs to be distinguishable from one, without
-  changing the kernel-generated notification format.
+  changing the kernel-generated notification format. (Note 2026-10-12: since 2026-10-11 the name is
+  followed by a NUL and how the task ended - CLAUDE.md 6.2. It still BEGINS with the name, so the
+  `supcmd::MARKER` first byte that settled this still tells the two apart.)
 - Death-notification respawn alone is not enough: 10A restarts with an explicit core override, and a
   death notice cannot carry one.
 

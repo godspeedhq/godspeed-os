@@ -1,6 +1,7 @@
 [package]
 name = "audio-driver"
 version = "0.1.0"
+description = "Intel High Definition Audio driver for the PCs: plays sound and system sounds"
 edition = "2021"
 
 [[bin]]

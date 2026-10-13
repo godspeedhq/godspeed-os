@@ -1,10 +1,10 @@
 # 49 - five wedge detectors halt the machine on LATENESS, and cannot tell it from a fault
 
 **Opened:** 2026-09-24
-**Status:** OPEN - one instance PROVEN (`backlog/48`), the class audited, no fix attempted.
-*(2026-10-09: the PROVEN instance is fixed - `backlog/48` closed 2026-09-25 by deleting the kill-path
+**Status:** OPEN - one instance PROVEN (`backlog/fixed/48`), the class audited, no fix attempted.
+*(2026-10-09: the PROVEN instance is fixed - `backlog/fixed/48` closed 2026-09-25 by deleting the kill-path
 panic. The other four were not re-checked for this note.)*
-**Raised by:** the operator, ruling on `backlog/48`: *"Nothing above the kernel should have influence
+**Raised by:** the operator, ruling on `backlog/fixed/48`: *"Nothing above the kernel should have influence
 to panic or wedge the kernel. Nothing. If the kernel panics it'll be because of the logic inside the
 kernel itself."*
 
@@ -18,7 +18,7 @@ This is not a new policy. `CLAUDE.md` 22 states it in the strongest language the
 > Bar: every attack returns a defined error. Any attack that succeeds is a security hole; any attack
 > that **panics the kernel is a kernel bug**. Both are **mandatory fixes**.
 
-`backlog/48` was recorded as though the remedy were a design choice for the operator. It is not. The
+`backlog/fixed/48` was recorded as though the remedy were a design choice for the operator. It is not. The
 constitution already decided it; that entry is corrected.
 
 ## The distinction the rule actually draws
@@ -57,9 +57,9 @@ machine on the inference.**
 
 | site | bound | what it waits on |
 |---|---|---|
-| `task/scheduler.rs:2679` | `liveness_deadline_cycles()/4` = 75 quanta ~ 0.75 s | another core releasing a task slot - **PROVEN reachable, `backlog/48`** |
+| `task/scheduler.rs:2679` | `liveness_deadline_cycles()/4` = 75 quanta ~ 0.75 s | another core releasing a task slot - **PROVEN reachable, `backlog/fixed/48`** |
 | `task/scheduler.rs:1616` | 300 quanta ~ 3 s of ticks | another core making any progress |
-| `smp/ipi.rs` (gone) | 500,000,000 **spins** | other cores acknowledging a TLB shootdown - **deleted 2026-10-10**: the shootdown it bounded had no caller, and both went (`backlog/80` K20) |
+| `smp/ipi.rs` (gone) | 500,000,000 **spins** | other cores acknowledging a TLB shootdown - **deleted 2026-10-10**: the shootdown it bounded had no caller, and both went (`backlog/fixed/80` K20) |
 | `smp/spinlock.rs:35` | `LOCK_WATCHDOG_SPINS` **spins** | a lock holder releasing |
 | `memory/allocator.rs:470` | `ALLOC_WATCHDOG_SPINS` **spins** | the frame-allocator lock holder releasing - its own message names "preempted holder" as a cause |
 
@@ -106,7 +106,7 @@ died, and the bar in 22 does not have an "unless the host was busy" clause.
 
 ## Next step
 
-The operator's call on scope. `backlog/48`'s instance is the one with a measurement behind it and the
+The operator's call on scope. `backlog/fixed/48`'s instance is the one with a measurement behind it and the
 smallest fix (fail the kill). The shared instrument - "is that core's IRQ count moving?" - is what
 would retire the whole class, and it is a kernel change, so it belongs on its own branch with its own
 re-verification rather than riding another one.

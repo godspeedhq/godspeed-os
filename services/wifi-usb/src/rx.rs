@@ -136,7 +136,7 @@ pub struct Heard<'l> {
     no_bulk_said: bool,
     /// What the host said was bound when the serve loop was entered (`main.rs`). A `NOTE_RADIO` ends the
     /// loop only when the host now says something else.
-    pub serving: Result<Option<(u16, u16)>, &'static str>,
+    pub serving: Result<Option<(u16, u16, u32)>, &'static str>,
     /// The dongle's own address, once it is a station (R5a): a probe response addressed to it answers OUR
     /// probe request, which is the proof a frame we sent reached the air.
     pub us: [u8; 6],
@@ -207,7 +207,7 @@ fn ask(ctx: &ServiceContext) -> Result<Option<godspeed_sdk::Message>, &'static s
         usbfn::ST_OK => Ok(None),
         usbfn::ST_NO_DEVICE => Err("the dongle is no longer bound"),
         // Two causes reach this one status: no bulk IN was found, or repairing it failed. The host's
-        // log says which; this line used to name only the first (backlog/80 D11).
+        // log says which; this line used to name only the first (backlog/fixed/80 D11).
         usbfn::ST_FAILED => Err("the host could not give this dongle a bulk IN (none found, or its repair failed - its log says which)"),
         _ => Err("the host refused BULK_IN as malformed"),
     }
@@ -279,6 +279,18 @@ impl Host for Heard<'_> {
             // case the repeated auto-join above was about.
             [usbfn::NOTE_RADIO] => {
                 let now = crate::bound(ctx);
+                // THE SAME DONGLE, BOUND AGAIN. The IDs match and the gen does not: the host enumerated it
+                // afresh - a replug, or a host that restarted, whose enumeration reset the chip - so the
+                // firmware, the keys and the association this station holds are the old binding's (14.3).
+                // `kill all-services` on the Pi 2 killed `dwc2` and not this, and this answered "still
+                // joined" over a cold chip until it was restarted by hand.
+                if let (Ok(Some((v, p, g))), Ok(Some((sv, sp, sg)))) = (now, self.serving) {
+                    if (v, p) == (sv, sp) && g != sg {
+                        ctx.log_fmt(format_args!(
+                            "wifi-usb: {} bound the dongle afresh (binding {:#x}, was {:#x}) - the chip was reset, so it is brought up again from cold",
+                            self.host, g, sg));
+                    }
+                }
                 if now != self.serving {
                     Notice::Changed
                 } else if self.chip.is_none() && matches!(now, Ok(Some(_))) {

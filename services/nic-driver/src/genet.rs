@@ -1248,7 +1248,7 @@ fn say_up(ctx: &ServiceContext, g: &Genet, mac: [u8; 6]) {
 /// A reply that could not be sent, said WITH ITS REASON. The two reasons are different faults: a full
 /// queue means the requester is alive and behind, a dead capability means the requester already gave
 /// up (timed out and reclaimed its reply cap) before this driver was scheduled to answer - which is
-/// what backlog/66 was first taken for (its DNS failure turned out to be an empty reply the kernel
+/// what backlog/fixed/66 was first taken for (its DNS failure turned out to be an empty reply the kernel
 /// refused, fixed in `e3fcf7ed`). The old line latched once and named neither. First failure and
 /// every sixteenth after, so a run of them is a count and not a flood.
 fn reply_failed(ctx: &ServiceContext, e: godspeed::Error, n: &mut u32) {

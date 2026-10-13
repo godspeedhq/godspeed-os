@@ -151,7 +151,7 @@ pub const PBKDF2_SALT_MAX: usize = 60;
 /// PBKDF2-HMAC-SHA1 (RFC 8018 §5.2) into `out`, whatever its length.
 ///
 /// Returns `false`, and leaves `out` untouched, for a salt longer than [`PBKDF2_SALT_MAX`]: it was cut
-/// to fit, silently, until 2026-10-10, deriving a key for a different salt (`backlog/80` S8).
+/// to fit, silently, until 2026-10-10, deriving a key for a different salt (`backlog/fixed/80` S8).
 #[must_use = "false means no key was derived"]
 pub fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) -> bool {
     if salt.len() > PBKDF2_SALT_MAX {
@@ -197,7 +197,7 @@ pub fn psk(passphrase: &[u8], ssid: &[u8]) -> [u8; PMK_LEN] {
 ///
 /// Returns `false`, and leaves `out` untouched, when `label` and `context` together exceed its 159-byte
 /// input: the PTK's are 23 and 76, so that is a caller error. It zero-filled `out` and returned until
-/// 2026-10-10 - a key of zeroes, which looks like a key (`backlog/80` S8).
+/// 2026-10-10 - a key of zeroes, which looks like a key (`backlog/fixed/80` S8).
 #[must_use = "false means no key was derived"]
 pub fn prf_sha1(key: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) -> bool {
     let mut msg = [0u8; 160];

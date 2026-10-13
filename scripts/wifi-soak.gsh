@@ -8,8 +8,8 @@
 # usage:   run /wifi-soak.gsh <gateway-ip>        e.g. run /wifi-soak.gsh 192.168.11.1
 # stop:    q (during the minute's wait)
 #
-# Same shape as the `watch` library command, without its screen clearing, so the serial log stays a
-# readable record of every echo.
+# A loop of its own rather than `repeat`: it echoes, pings and judges each minute, which `repeat` cannot.
+# The serial log stays a readable record of every echo.
 if $argcount == 0 {
     fail 'usage: run /wifi-soak.gsh <gateway-ip>   (q stops it)'
 }

@@ -1,5 +1,6 @@
 [package]
 name = "wifi-usb"
+description = "Driver for a Realtek USB WiFi dongle, through the USB host that found it"
 version = "0.1.0"
 edition = "2021"
 

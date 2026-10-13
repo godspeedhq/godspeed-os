@@ -9,9 +9,10 @@
 ## 1. Purpose
 
 `wait` pauses for N wall-clock seconds. It is the shell's **pacing primitive**: the thing a
-script (or a person) uses to space repeated work out in time. The library's `watch` loop is
-built on it - `loop { <cmd>; if !wait 2 { break } }` - which is exactly why it exists
-(pulled into existence by `watch`, §26.2, not added speculatively).
+script (or a person) uses to space repeated work out in time. `repeat wait <seconds>` is built on
+it (`61_repeat.md`), and a script's own loop the same way - `loop { <cmd>; if !wait 2 { break } }`. It
+was pulled into existence by the library script `watch`, which `repeat` replaced (§26.2, not added
+speculatively).
 
 The name is the plain English of what it does. It is **not** POSIX `wait` (wait for a child
 process) - GodspeedOS has no fork and no child processes; here `wait 2` reads as the sentence
@@ -33,12 +34,13 @@ hour-plus wait at the prompt is a typo, not a plan (§26.6 bounded).
   hardware (the T630). `wait 1` ends at the next second boundary, so it can return up to a
   second early, never late.
 - **`q` aborts, and the abort is an `Err`.** That is what makes it compose:
-  `if !wait 2 { break }` ends a watch loop the instant the user quits. At the prompt, an
+  `if !wait 2 { break }` ends a loop the instant the user quits. At the prompt, an
   aborted `wait` shows as `Err` in `result`.
-- **Yields, but does not sleep.** The pause calls `yield_now` between clock checks, so other
-  tasks on the core run - but with nothing else runnable the loop comes straight back, which keeps
-  the core busy for the whole wait. (`cores ticks` and the `observe` painter sleep between polls
-  instead; `wait` doing the same is the fix.)
+- **Sleeps between checks.** The pause sleeps 50 ms between its clock and key checks
+  (`pause_quittable`), so the core is free for the wait and `q` still answers at once. It used to
+  call `yield_now`, which kept an otherwise idle core busy (`backlog/fixed/80` H21).
+- **Other keys are kept.** A key that is not `q`, `Q` or Esc is kept for the prompt, so a command
+  typed during the wait is still there when it ends. They were dropped until `backlog/84` S3.
 
 ## 4. Commandment VIII note (read this before imitating)
 

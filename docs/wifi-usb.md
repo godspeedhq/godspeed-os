@@ -34,7 +34,7 @@ is due when a scan exists, not before.
 
 | Op | Request | Reply |
 |---|---|---|
-| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`) |
+| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2), gen(4)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`). `gen` names the binding: it differs from the previous bind, and from a restarted host's where the counter is calibrated and running (`usbfn::next_gen` says where it is not); the driver compares it, not only the IDs |
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
 | `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |
@@ -244,7 +244,7 @@ The card (`build/kernel7-R2c.img`) predicts, on a replug where a block's STATUS 
 completed after 1 transaction error(s), re-run as Linux does`, the download `(1 try)`, RUNNING, channel 1.
 Refuted by: `STATUS stage gave up after 3 transaction errors` followed by the same wall of timed-out reads.
 
-**Seen once at boot, 2026-10-11 (the `backlog/80` Pi 2 card, image `38c0d92e`): exactly that.** The dongle
+**Seen once at boot, 2026-10-11 (the `backlog/fixed/80` Pi 2 card, image `38c0d92e`): exactly that.** The dongle
 on hub port 2 verified its firmware, one block's STATUS stage errored three times (`STATUS stage gave up
 after 3 transaction errors`), and every read after it timed out - all six download tries, and again after
 `wifi radio on` restarted the driver. Unplugged and put back on port 4, it came up at once: one try,
@@ -591,7 +591,8 @@ replugged. Both were on the next card, R4b.
 bound against not bound - the same test `main.rs` made since U1b. A dongle pulled and put back before
 `wifi-usb` reads the first notice reads as unchanged, and is not brought up again. The R2 and R3b replugs
 were seconds apart and never met it. Closing it needs the host to say WHICH insertion is bound (its USB
-address, which changes on every insertion), in `OP_INFO`.
+address, which changes on every insertion), in `OP_INFO`. *(Closed 2026-10-12 by `2e3c4052`: `OP_INFO`
+carries a gen and `wifi-usb` compares it, section 52.)*
 
 **Two sentences that are the shared loop's, and read wrong for a dongle.** `wifi radio off` logs "the
 firmware refused DOWN" after the dongle's own line says the off is not built. And the shell answers a
@@ -2624,11 +2625,11 @@ enables read back as written - and every frame back `did not decrypt (protected 
 true)`, `ping` 0 of 5. So it is **not `xhci`'s and not the key file's**: it happens behind `dwc2`, and to a
 hand-made join as well as a rejoin. What every failure so far shares is a fresh `wifi-usb` instance on a
 chip that has just been brought up; what separates a failing one from a working one is still unknown. In
-this session's cards: four failures in about fifteen fresh joins, on two hosts. `backlog/79` carries it.
+this session's cards: four failures in about fifteen fresh joins, on two hosts. `backlog/fixed/79` carries it.
 
-## 43. The key store laid out as Realtek's own driver lays it out (2026-10-07) - for `backlog/79`; hardware-verified on the Pi 2 (sections 45, 46)
+## 43. The key store laid out as Realtek's own driver lays it out (2026-10-07) - for `backlog/fixed/79`; hardware-verified on the Pi 2 (sections 45, 46)
 
-`backlog/79`: a fresh `wifi-usb` sometimes joins and every frame back comes up `security 0`. Section 40
+`backlog/fixed/79`: a fresh `wifi-usb` sometimes joins and every frame back comes up `security 0`. Section 40
 showed the two security enables read back as written, and the CAM could not be read back (rtlwifi has no
 CAM read either - `build/rtl/cam.c`, fetched for this). So the question became what the CAM layout
 should be, read from the driver Realtek wrote for this chip family, rtlwifi, rather than from rtl8xxxu
@@ -2715,7 +2716,7 @@ two replugs of the dongle - each said `pairwise key 0 in CAM entry 4`, `group ke
 one `did not decrypt`**, to us or to a group, in the whole session - where section 42's Pi 2 card had one
 failing join in four and every working join had refused at least one group frame. One powercycle, not
 the five asked for; the four fresh instances are the evidence, and more joins on the next cards add to
-it. `backlog/79` stays open until they do.
+it. `backlog/fixed/79` stays open until they do.
 
 **What the card found instead: `dwc2-svc: port 2 - device REMOVED`, about 9,200 times.** The operator
 moved the dongle from hub port 2 to port 4. As it came out, port 2 read connected once more: `device
@@ -2915,7 +2916,8 @@ At boot: `not rejoining yet - ... the supervisor's to say`, then 32 ms later `th
 is out - the radio carries the link`, a DHCP lease and the gateway answering a ping. The keyboard and the
 USB stick came up on `xhci` as before. (The twelve `fs: flash requested ... REFUSED` lines at boot are
 `fs`'s own protocol selftest walking every opcode with a zero capacity injected so it cannot format -
-documented beside the code that logs them, not a request from anywhere.) Steps 2 to 4 not yet run.
+documented beside the code that logs them, not a request from anywhere. Since 2026-10-11 they are not
+logged per probe at all: the selftest's PASS line counts them, `backlog/fixed/56`.) Steps 2 to 4 not yet run.
 
 **Steps 2 to 4 (same boot).**
 - **`wifi radio powercycle`:** the respawned driver was told again (`the USB radio is not attached`), stood
@@ -2927,7 +2929,7 @@ documented beside the code that logs them, not a request from anywhere.) Steps 2
 - **`selfcheck`: 527 run, 1 failed** - `dns: ICMP to 8.8.8.8 works but no name resolves`. `net-stack`'s
   receive and transmit to `nic-driver` (ops 4 and 0) each went unanswered for about 2 s, and `nic-driver`'s
   answers arrived after `net-stack` had given up (`reply cap is dead`), with no slow or missing answer from
-  the radio logged in that window. That is `backlog/66`'s signature on the Pi 4 - `nic-driver` waking late
+  the radio logged in that window. That is `backlog/fixed/66`'s signature on the Pi 4 - `nic-driver` waking late
   on core 1 - recorded there; nothing this branch changed touches that path.
 
 **Two things the dongle's arrivals showed.**
@@ -2949,19 +2951,19 @@ tries: `net-stack`'s receive and transmit requests to `nic-driver` went about 2 
 `nic-driver`'s replies arrived after `net-stack` had given up, while every exchange `nic-driver` logged
 with the radio was answered within 2 ms. With the cable IN, `net dns google.com` and `net dns example.com`
 resolved every time. So the resolver and the UDP path are sound, and what fails is the radio-bridged path
-on the Pi 4: `nic-driver` answering late on core 1 (`backlog/66`) - and, separately, the radio's network
+on the Pi 4: `nic-driver` answering late on core 1 (`backlog/fixed/66`) - and, separately, the radio's network
 is the guest one (`192.168.11.x`, DNS `194.168.4.100`, outside), not the cable's (`192.168.4.x`, DNS the
 router). An earlier draft of this note read the late answers as landing "on a one-second grid"; those
 times are `net-stack`'s own retry boundaries, not `nic-driver`'s wake, and that reading was withdrawn.
 Nothing this branch changed touches `nic-driver`'s GENET path beyond comments.
 
 **And `selfcheck` with the cable in, same boot: 526 run, 0 failed, 0 skipped** (`run: ran 526, failed 0`). The one failure on the
-radio is the radio-bridged path's (`backlog/66`), not anything `selfcheck` checks being broken.
+radio is the radio-bridged path's (`backlog/fixed/66`), not anything `selfcheck` checks being broken.
 
 **Corrected 2026-10-08: `nic-driver` was not waking late.** A kernel flight recorder on the VisionFive
 showed the request answered in milliseconds and the answer refused: a drain that found no frame was
 answered with an empty message, which the kernel refused on every port but ARM32 - which is why the Pi 2
-below resolved on the same network. Fixed in `e3fcf7ed`; `backlog/66` has the account.
+below resolved on the same network. Fixed in `e3fcf7ed`; `backlog/fixed/66` has the account.
 
 **And the Pi 2, the same day, the cable out and the dongle carrying the link** (`nic-driver: the cable is
 out - the radio carries the link`), joined to the SAME guest network the Pi 4's radio was on:
@@ -2979,7 +2981,7 @@ What changed since section 49, all of it on the cards below:
   frame with an empty message, and the kernel refused one on x86, AArch64 and RISC-V; ARM32 accepted it.
   So over the radio, where most drains are empty while an answer is in flight, `net-stack` waited out a
   second per drain and `net dns` ran out of time - on the Pi 4 and the VisionFive, never on the Pi 2,
-  which is what section 49's Pi 2 card was showing. Found with a kernel flight recorder; `backlog/66` has
+  which is what section 49's Pi 2 card was showing. Found with a kernel flight recorder; `backlog/fixed/66` has
   the account, and section 49's correction above.
 - **The instruments that found it are out** (`b77c7dd5`), and `osdev test shell` no longer passes a `net
   dns` that `net-stack` did not answer.
@@ -3112,3 +3114,16 @@ machine with no AMD-Vi table, so it says nothing about the T630's open `xhci` IO
 are unconfined and stay in the TCB (CLAUDE.md 6.4), as its boot line reports. During and just after
 chaos, `net-stack` logged four link queries that `nic-driver` did not answer in time; each says it is
 a timeout and not a reading, and the wired port had no cable.
+
+## 52. `feat/ask` on the Pi 4 (2026-10-12): the binding gen and the radio choice verified; the download fault, and once a bus that did not come back
+
+**Verified.** `xhci` restarted (`kill xhci`): `wifi-usb: xhci bound the dongle afresh (binding 0x37659, was
+0x13266) - the chip was reset, so it is brought up again from cold` (`2e3c4052`: `OP_INFO`
+now carries the binding's gen). `wifi hardware use onboard` and `use usb`: `nic-driver` moved its bridge
+each way, link up and a lease each time (`ce7feea2`; before it, `use onboard` left the bridge on a dongle
+that had just left the network, because `/wifi.radio` removed makes both radios answer `USE_DEFAULT`).
+
+**The download fault (sections 27, 33) again, in 6 of 9 bring-ups.** And once it was worse than recorded:
+after `kill all-services` the dongle's download failed, and for over three minutes every re-scan failed
+Address Device on hub ports 1 and 2 (the disk's port among them), so the run ended with no disk. Recorded
+as `backlog/fixed/83`, with what the gen change does and does not have to do with it.

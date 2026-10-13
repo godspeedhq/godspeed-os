@@ -28,7 +28,7 @@ pub enum SyscallNumber {
     AllocMem       = 6,
     // 7 = removed. Was `Spawn`, by name from the kernel catalogue, which holds `supervisor` alone
     //     since step C - so it could only answer NotFound or AlreadyRunning. `SpawnImage` (52) is how a
-    //     service starts. Number 7 now falls through to UnknownSyscall (backlog/80 K14).
+    //     service starts. Number 7 now falls through to UnknownSyscall (backlog/fixed/80 K14).
     Kill           = 8,
     // 9 = removed. Was `Abort`: an UNGATED syscall any task could fire to panic the kernel - the §3.1
     //     hole found by the syscall audit. A service that hits a fatal error dies and is restarted by
@@ -43,7 +43,7 @@ pub enum SyscallNumber {
     TaskStat       = 16,
     ConsoleRead    = 17,
     Reboot         = 18,
-    // 19 = removed (SpawnPipe), for the same reason as 7 (backlog/80 K14).
+    // 19 = removed (SpawnPipe), for the same reason as 7 (backlog/fixed/80 K14).
     ConsolePush    = 20,
     Park           = 21,
     Print          = 22,
@@ -63,7 +63,7 @@ pub enum SyscallNumber {
     IrqUnmask           = 36,
     Sleep               = 37,
     // 38, 39 = removed (SpawnReturningEndpoint, SpawnWithCaps), for the same reason as 7
-    //     (backlog/80 K14). `SpawnImage` returns the endpoint cap and carries the installs.
+    //     (backlog/fixed/80 K14). `SpawnImage` returns the endpoint cap and carries the installs.
     ConsoleForeground      = 40,
     Call                   = 41,
     /// `Call` with a DEADLINE. Same reply-cap semantics, bounded wait.
@@ -391,7 +391,7 @@ fn narrow_embedded_for_receiver(cap: crate::capability::cap::Capability) -> crat
 /// Install the capabilities a received message carries into the receiver's table, and queue each
 /// slot for `TakePendingCap` - every receive path's one way of doing it.
 ///
-/// **Neither failure is silent** (`backlog/80` K4). The sender no longer holds an embedded cap once it
+/// **Neither failure is silent** (`backlog/fixed/80` K4). The sender no longer holds an embedded cap once it
 /// was enqueued, so a cap that cannot be installed is GONE: a full table is logged by name. A cap that
 /// is installed but whose slot cannot be queued - the receiver already has `MAX_PENDING_RECV_CAPS`
 /// unclaimed - is taken back out of the table and logged, rather than left in a slot the service will
@@ -435,7 +435,7 @@ fn refuse_oversized(path: &str, len: usize, buf_len: usize) -> Option<i64> {
 /// Blocks until a message is dequeued from the endpoint, then copies the
 /// payload into the caller-supplied buffer. A payload longer than the buffer is
 /// REFUSED with `MessageTooLarge`, as `Call` refuses one, and logged; it was truncated
-/// silently until 2026-10-10 (`backlog/80` K5). The SDK always passes a full 4 KiB
+/// silently until 2026-10-10 (`backlog/fixed/80` K5). The SDK always passes a full 4 KiB
 /// buffer, so no SDK caller can reach the refusal. Returns the number of bytes written
 /// on success, or a negative error code.
 fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
@@ -713,7 +713,7 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
     }
     // An EMPTY message is a message, on every port. Each arch's `read_user_bytes` refuses an empty range
     // except arm32's, so a zero-length send failed on x86, AArch64 and RISC-V and worked on the Pi 2 -
-    // and nic-driver answers a drain that found no frame with exactly that (backlog/66): the reply was
+    // and nic-driver answers a drain that found no frame with exactly that (backlog/fixed/66): the reply was
     // refused, net-stack waited out its second, and over the radio, where most drains are empty, `net
     // dns` ran out of time. No bytes are read for no bytes; the pointer is not looked at.
     let bytes: &[u8] = if len == 0 {
@@ -755,7 +755,7 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
 const ACQUIRE_NAME_NOT_REGISTERED: i64 = -20;
 const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
 
-// Syscall: Kill (8) / AcquireSendCap (10). (Spawn, 7, was retired 2026-10-10, backlog/80 K14.)
+// Syscall: Kill (8) / AcquireSendCap (10). (Spawn, 7, was retired 2026-10-10, backlog/fixed/80 K14.)
 // ---------------------------------------------------------------------------
 
 /// Upper bound on the name payload (`name` + NUL-separated peer names). It was 64, which held a
@@ -1207,7 +1207,8 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     // restartable too.) The shell still refuses a
     // *casual* `kill supervisor`/`restart supervisor` at the command layer (CORE_SERVICES); deliberate
     // chaos goes through `chaos kill-storm supervisor`.
-    if crate::task::kill_by_name(name) {
+    // The caller is named in the death notice: the cause is part of the kill, not a guess made later.
+    if crate::task::kill_by_name(name, crate::task::Cause::Killed { by: scheduler::current_task_slot() }) {
         // Now that the kill has completed and no kernel locks are held, verify the invariant a kill
         // is most likely to break, §7.8: the cap table is still consistent (no cap carries a
         // generation beyond its resource's current generation). The generation bump only ever moves
@@ -1215,7 +1216,7 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         // walk; the kill path is not a per-syscall hot path, so it is an acceptable home for the
         // §7.8 check (see invariants/CLAUDE.md). (A §6.2 TCB-alive assertion sat beside it, over an
         // EMPTY set since Phase 6 made the supervisor restartable - it checked nothing, and was
-        // deleted 2026-10-10, `backlog/80` K20.)
+        // deleted 2026-10-10, `backlog/fixed/80` K20.)
         crate::invariants::assertions::assert_cap_table_consistent();
         // If the caller killed ITSELF (a SERVICE_CONTROL holder self-terminating - e.g. `chaos` at the
         // end of a run, so it does not linger in `observe`), it is now Dead. Do NOT return into the dead
@@ -1528,7 +1529,7 @@ fn do_call(
     //    into it later (at most `reply_buf_cap`), so validate it for the larger of the two. `Call`
     //    (41) passes MAX_MESSAGE_SIZE; a `CallDeadline` caller may declare a smaller buffer, which
     //    was validated for a full 4 KiB anyway until 2026-10-10 - a buffer near the end of the user
-    //    range was refused although nothing would have touched past it (`backlog/80` K15).
+    //    range was refused although nothing would have touched past it (`backlog/fixed/80` K15).
     if req_len as usize > MAX_MESSAGE_SIZE { return ipc_err_to_i64(IpcError::MessageTooLarge); }
     if !validate_user_ptr(buf_ptr, (req_len as usize).max(reply_buf_cap)) { return -1; }
 
@@ -1692,7 +1693,7 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
     if !write_user_bytes(out_id_ptr, &id.0.to_le_bytes()) {
         // The caller cannot be told the id, so it cannot use or revoke what was minted: take both
         // back rather than leave a resource and a cap no one will ever release. They leaked until
-        // 2026-10-10 (`backlog/80` K15). The cap was only ever in the caller's table.
+        // 2026-10-10 (`backlog/fixed/80` K15). The cap was only ever in the caller's table.
         scheduler::current_task_remove_cap(slot);
         let _ = delegated::revoke_owned(id, owner);
         return -1;
@@ -1884,7 +1885,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // INTROSPECT capability with READ (docs/introspection-capability.md).
     //
     // 9 and 22 are not here: both queries were REMOVED (see the notes at their old arms below). They
-    // were listed until 2026-10-10 as dead entries (`backlog/80` K18), which made an AUTHORITY list
+    // were listed until 2026-10-10 as dead entries (`backlog/fixed/80` K18), which made an AUTHORITY list
     // name two things that do not exist; an unknown query now falls on the gated side like any other,
     // and answers -1 to a holder.
     if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 23)
@@ -2460,7 +2461,7 @@ const NET_FRAME_MAX: usize = 1600;
 /// KIND this task was granted, never by an argument or a name. Returns 0 only when the pin reads back at
 /// the level asked for, -1 otherwise (no power control for that device, or a request that did not take),
 /// and `CapNotHeld` (-2) without the capability. That refusal returned the enum's discriminant, 0 - the
-/// documented SUCCESS - until 2026-10-10 (`backlog/80` K3); so did CpuClock's (read as 0 Hz) and
+/// documented SUCCESS - until 2026-10-10 (`backlog/fixed/80` K3); so did CpuClock's (read as 0 Hz) and
 /// PciCfgRead's (read as a config word of 0).
 ///
 /// WHY THIS IS MECHANISM AND NOT A SEVENTH RESPONSIBILITY: the kernel already owns the device grant

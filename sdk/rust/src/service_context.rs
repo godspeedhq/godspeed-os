@@ -74,7 +74,7 @@ pub enum DeadlineOutcomeInto {
     SendFailed,
     /// The request WAS delivered, and the peer died holding it (`ReplyDead`, 8.6), so the work may
     /// have been done. Re-send only an operation that is safe to repeat (a block read, a rewrite of
-    /// the same sector). It was folded into `SendFailed` until 2026-10-10 (`backlog/80` S3); `gs::call`
+    /// the same sector). It was folded into `SendFailed` until 2026-10-10 (`backlog/fixed/80` S3); `gs::call`
     /// has kept the two apart all along, as `Error::PeerDied` against `Error::Unreachable`.
     PeerDied,
     /// The peer's queue was full. The request did not leave either, but the peer is alive and busy.
@@ -485,7 +485,7 @@ impl SpawnRequest {
         for (label, cap) in pairs {
             let lb = label.as_bytes();
             // The kernel's limit, `PEER_NAME_BYTES` (24): this accepted 32, and the kernel refused
-            // the spawn for a label it had been told was fine (`backlog/80` S5).
+            // the spawn for a label it had been told was fine (`backlog/fixed/80` S5).
             if lb.is_empty() || lb.len() > PEER_NAME_BYTES { return false; }
             if n + 1 + lb.len() + 2 > buf.len() { return false; }
             buf[n] = lb.len() as u8; n += 1;
@@ -498,6 +498,27 @@ impl SpawnRequest {
     }
 }
 
+/// How a task ended, as the kernel says it in the death notice (`name`, NUL, then one of these). The
+/// kernel's `task::death` holds the same values; `ask` asserts its copy against these.
+pub mod death {
+    /// Ended by the `kill` syscall; the name of the task that called it follows.
+    pub const KILLED: u8 = b'K';
+    /// Ended by a user-mode CPU fault; the kind below and the address (u64 LE) follow.
+    pub const FAULT: u8 = b'F';
+    /// A fault the port does not classify.
+    pub const F_OTHER: u8 = 0;
+    /// A load or store its page tables do not allow; the address is the data address.
+    pub const F_MEMORY: u8 = 1;
+    /// An instruction fetch its page tables do not allow; the address is the fetch address.
+    pub const F_INSTRUCTION: u8 = 2;
+    /// An instruction the CPU will not run; the address is the instruction's.
+    pub const F_ILLEGAL: u8 = 3;
+    /// x86's general protection fault; the address is the instruction's.
+    pub const F_PROTECTION: u8 = 4;
+    /// A misaligned access the CPU refuses.
+    pub const F_ALIGNMENT: u8 = 5;
+}
+
 /// The supervisor's command channel wire format.
 ///
 /// ONE definition. This lived in three services at once (`supervisor`, `control`, `shell`) - three
@@ -508,13 +529,15 @@ impl SpawnRequest {
 /// The supervisor's endpoint receives two kinds of message, told apart by the first byte:
 ///
 /// ```text
-///   death notice   "pong"                        <- kernel-generated; a name, [a-z0-9-]
+///   death notice   "pong" 0 how...               <- kernel-generated; a name, [a-z0-9-], then how it
+///                                                   ended (`death`, CLAUDE.md 6.2 amendment 2026-10-11)
 ///   command        0x01 op <core u32 LE> name    <- 0x01 cannot begin a name
 ///                                    name may be followed by NUL-separated PEER names
 /// ```
 ///
-/// Choosing an impossible first byte means the kernel's death-notification format does not change at
-/// all: the two are unambiguous without the kernel learning anything about commands.
+/// Choosing an impossible first byte means a death notice needs nothing to set it apart: it still
+/// begins with the name, as it always has (what follows the NUL is `death`'s, added 2026-10-11), so
+/// the two are unambiguous without the kernel learning anything about commands.
 pub mod supcmd {
     /// First byte of a command. Not a legal first byte of a service name.
     pub const MARKER:  u8 = 0x01;
@@ -539,6 +562,18 @@ pub mod supcmd {
     /// were overwritten; per entry the uptime second (u32 LE), an `EV_*` code, the USB vid and pid (u16
     /// LE each, 0 for a driver event), and the driver's name (length byte, bytes). `hardware events`.
     pub const EVENTS:  u8 = b'E';
+    /// Which services does this supervisor keep running right now? Read only: `[MARKER, MANAGED]`,
+    /// answered with `[OK, count, (len, name)*]` - the `MANAGED` services this build carries and wants
+    /// now (a USB device's driver only while its device is attached). The question `ask`'s health
+    /// answer turns on: a service on this list that is not running is down when it should be up.
+    pub const MANAGED: u8 = b'M';
+    /// How did this service last end? Read only: `[MARKER, DEATH, name...]`, answered with `[OK, since
+    /// u32 LE, deaths u32 LE, secs u32 LE, how, kind, addr u64 LE, by_len, by...]` - since: when this
+    /// supervisor began its record; deaths: the notices it has read for this name since then (0 = none,
+    /// and the rest is zero); then the newest one: its uptime second, how it ended (`death::KILLED`,
+    /// `death::FAULT`), the fault kind and address, and the name of the task that called `kill`. The
+    /// kernel says how, in the death notice; the supervisor only keeps the newest per name. `ask`.
+    pub const DEATH:   u8 = b'X';
     /// A device's driver died and was restarted.
     pub const EV_RESTARTED: u8 = 1;
     /// A device's driver died and its restart failed.
@@ -635,7 +670,7 @@ pub mod usbdev {
 
 // (Three probe-parameter flags that once rode in the upper bits of `Spawn`'s `arg0` sat here. Nothing
 // set them after the kernel's probe path went, and `Spawn` itself was retired 2026-10-10; deleted the
-// same day, `backlog/80` K14 and K20.)
+// same day, `backlog/fixed/80` K14 and K20.)
 
 /// Upper bound on a spawn name payload (`name` + NUL-separated peers). Matches the kernel's limit.
 pub const SPAWN_PAYLOAD_MAX: usize = 128;
@@ -837,6 +872,34 @@ pub struct CapInfo {
     /// Rights bitfield: READ=1, WRITE=2, SEND=4, RECV=8, GRANT=16, REVOKE=32.
     pub rights: u8,
 }
+
+/// THE KERNEL'S FIXED AUTHORITIES, by resource id: (id, the name a contract uses, what it lets a task do).
+///
+/// One table for everything that names them - the shell's `caps` and `ask "who can reboot?"` - so what a
+/// service is observed to HOLD reads the same everywhere, and in the words its contract DECLARES
+/// (`pci_cfg = true`). The ids are `kernel/src/capability/mod.rs`'s `*_RESOURCE`; anything above 18 is an
+/// IPC endpoint. A resource added there and not here would be shown as an endpoint, which names the
+/// wrong kind of thing (26.9), so the two move together.
+pub const AUTHORITIES: &[(u64, &str, &str)] = &[
+    (1, "log_write", "write to the kernel log and serial"),
+    (2, "spawn", "start services"),
+    (3, "console_read", "read the keyboard"),
+    (4, "console_push", "type into the console as if at the keyboard"),
+    (5, "introspect", "see every task, its capabilities and the kernel's counters"),
+    (6, "service_control", "kill and restart services"),
+    (7, "resource_mint", "mint capabilities for resources it owns, as fs does for files"),
+    (8, "reboot", "reboot the machine"),
+    (9, "acquire_any", "reach any service by name, not only its declared peers"),
+    (10, "net_device", "move raw ethernet frames on an in-kernel network device (none exists; granted to nothing now)"),
+    (11, "gpio_device", "drive the GPIO pins"),
+    (12, "usb_disk", "read and write any sector of an in-kernel USB disk (none exists; granted to nothing now)"),
+    (13, "set_clock", "set the wall clock (granted to nothing now)"),
+    (14, "fire_irq", "inject a test interrupt"),
+    (15, "image_spawn", "start a program from an image it supplies"),
+    (16, "pci_cfg", "read and write PCI configuration space"),
+    (17, "device_power", "cut and restore the power of the device it was granted"),
+    (18, "cpu_clock", "set the Arm clock"),
+];
 
 // ---------------------------------------------------------------------------
 // AllocError - returned by ServiceContext::alloc_mem.
@@ -1059,7 +1122,7 @@ impl ServiceContext {
     /// A receive ERROR on this service's OWN endpoint (it is dead, or the cap was refused) is not an
     /// empty queue: the service dies loudly, exactly as [`Self::recv`] does, so the supervisor
     /// restarts it. It read as `None` until 2026-10-10, and a loop polling a dead endpoint spun on it
-    /// forever (`backlog/80` S5).
+    /// forever (`backlog/fixed/80` S5).
     pub fn try_recv(&self) -> Option<Message> {
         self.note_listening();
         let data = Self::ctx();
@@ -1077,7 +1140,7 @@ impl ServiceContext {
     /// Block on this service's recv endpoint until a message arrives or `timeout_cycles`
     /// (cycle-counter ticks, the unit of `read_tsc` - convert with `duration_cycles`) elapse:
     /// `Some(msg)` = message, `None` = timed out. A receive ERROR on this service's own endpoint dies
-    /// loudly, as [`Self::recv`] and [`Self::try_recv`] do (`backlog/80` S5).
+    /// loudly, as [`Self::recv`] and [`Self::try_recv`] do (`backlog/fixed/80` S5).
     /// `timeout_cycles == 0` blocks forever. The kernel turns the count into whole scheduler ticks
     /// (at least one), so the bound is never finer than one quantum. A driver uses this to idle on
     /// its hardware interrupt while still waking on a timer for auto-repeat (§12 timed-wait).
@@ -1115,37 +1178,16 @@ impl ServiceContext {
     /// has one (`hires_arm`), with a tick backstop; otherwise granularity is one scheduler quantum.
     /// Use for UI repaint pacing and "wait for child" loops - not for precise timing. On a 32-bit
     /// target `cycles` is clamped to what one register carries, so a long sleep is shortened to the
-    /// longest the ABI can express rather than wrapping to a short one (`backlog/80` S5).
+    /// longest the ABI can express rather than wrapping to a short one (`backlog/fixed/80` S5).
     pub fn sleep(&self, cycles: u64) {
         let cycles = cycles.min(usize::MAX as u64);
         // SAFETY: syscall(37) = Sleep; sleeping your own task is unprivileged (like yield).
         let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
     }
 
-    /// Transmit one raw ethernet frame via an in-kernel network device. Gated by the NET_DEVICE cap.
-    /// Returns true if it was sent. Both args are pointer + length, so they fit the 32-bit ABI
-    /// without truncation. No port has an in-kernel network device any more (every arch's
-    /// `net_frame_tx` is a stub returning false), so this always returns false; no service calls it.
-    #[must_use = "the frame is NOT on the wire if this is false"]
-    pub fn net_frame_tx(&self, frame: &[u8]) -> bool {
-        // SAFETY: syscall(42) = NetFrameTx; the kernel range-checks (ptr, len) before copying.
-        unsafe { raw_syscall(42, frame.as_ptr() as u64, frame.len() as u64, 0) >= 0 }
-    }
-
-    /// Receive one raw ethernet frame into `dst` (a single bulk-IN poll). Returns the frame length, or 0
-    /// if none is available. Gated by the NET_DEVICE cap.
-    pub fn net_frame_rx(&self, dst: &mut [u8]) -> usize {
-        // SAFETY: syscall(43) = NetFrameRx; the kernel range-checks (ptr, len) before writing.
-        let r = unsafe { raw_syscall(43, dst.as_mut_ptr() as u64, dst.len() as u64, 0) };
-        if r > 0 { r as usize } else { 0 }
-    }
-
-    /// Query the in-kernel net device: writes `[mac(6), link(1)]` (7 bytes) into `out`. Returns true if
-    /// a net device is up - never, on any port today. Gated by the NET_DEVICE cap.
-    pub fn net_info(&self, out: &mut [u8; 7]) -> bool {
-        // SAFETY: syscall(44) = NetInfo; the kernel writes exactly 7 range-checked bytes.
-        unsafe { raw_syscall(44, out.as_mut_ptr() as u64, 0, 0) == 1 }
-    }
+    // `net_frame_tx`, `net_frame_rx` and `net_info` (syscalls 42-44, NET_DEVICE) were here until
+    // 2026-10-11: no port has an in-kernel network device, nothing is granted NET_DEVICE, and nothing
+    // called them (`backlog/21` step 2). The syscalls themselves are the last step, a kernel change.
 
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
@@ -1335,10 +1377,34 @@ impl ServiceContext {
         n
     }
 
+    /// [`Self::drain_stale_replies`] at the top of a request, and SAID when it found anything - the one
+    /// thing every request path that waits on the reply mailbox must do before it issues.
+    ///
+    /// It was done by ONE of the three such paths. `request_with_reply_deadline_into` drained (it is
+    /// where `backlog/fixed/37` was fixed); `request_with_reply_call_err`, which `gs::call` and so every `gs::fs`
+    /// call goes through, and `request_with_reply_deadline_outcome_into` did not. So the exact failure
+    /// [`Self::drain_stale_replies`] describes was still live for every service on the standard library:
+    /// in the jobs suite the shell's history save timed out while a background `drives check` held `fs`
+    /// for five seconds, its reply arrived late, and from then on every shell request to `fs` received
+    /// its predecessor's reply and rejected it as malformed - `churn verify` failing as "storage
+    /// unavailable" and every later history save lost (2026-10-11). One helper now, so a path cannot
+    /// have the drain without the log or the log without the drain.
+    fn drain_before_request(&self, peer: &str) {
+        let dropped = self.drain_stale_replies();
+        if dropped > 0 {
+            // LOUD, because it means a previous request was abandoned and this one would have
+            // inherited its reply. Silent self-repair is how the fs desync stayed invisible for so
+            // long (§26.7 - a recovery that hides what it recovered from is a silent fallback).
+            self.log_fmt(format_args!(
+                "sdk: discarded {} abandoned repl(y/ies) before a request to `{}` - an earlier request timed out",
+                dropped, peer));
+        }
+    }
+
     /// Give back a capability a DISCARDED message may have carried. A received `Message` does not
     /// record its caps; the kernel queues them for `take_pending_cap`. Every caller claims a cap
     /// straight after its own receive, so what is pending while a drain runs came with the message it
-    /// is discarding - and was leaked one table slot at a time until 2026-10-10 (`backlog/80` S5).
+    /// is discarding - and was leaked one table slot at a time until 2026-10-10 (`backlog/fixed/80` S5).
     fn release_discarded_cap(&self) {
         if let Some(c) = self.take_pending_cap() {
             self.remove_cap(c);
@@ -1731,7 +1797,7 @@ impl ServiceContext {
         let op = self.trace_in(peer, msg);
         let out = self.request_with_reply_call_err_inner(peer, msg, max_secs);
         // A full queue is a busy peer, not a lost one - the ring said PEER_LOST for both until
-        // 2026-10-10, so `gs::trace` showed `gs::call`'s `Busy` as a lost peer (`backlog/80` S2).
+        // 2026-10-10, so `gs::trace` showed `gs::call`'s `Busy` as a lost peer (`backlog/fixed/80` S2).
         self.trace_out(peer, op, match &out {
             Ok(Some(_)) => crate::trace::KIND_REPLY,
             Ok(None)    => crate::trace::KIND_TIMEOUT,
@@ -1909,7 +1975,7 @@ impl ServiceContext {
     ///
     /// A wait that watches the console for `q` has to read what is typed, and a key read is a key
     /// taken: the plain form discards the rest, so whatever the operator typed ahead while it waited
-    /// was lost (`backlog/80` H16). This passes each one to `keep`, in order, for the caller to put
+    /// was lost (`backlog/fixed/80` H16). This passes each one to `keep`, in order, for the caller to put
     /// where its own input reader will find it first.
     #[inline]
     pub fn request_with_reply_qhint_keeping(
@@ -1967,6 +2033,24 @@ impl ServiceContext {
     ) -> ReqOutcome {
         let op = self.trace_in(peer, msg);
         let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine, None);
+        self.trace_out(peer, op, match &out {
+            ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
+            ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
+            ReqOutcome::Timeout  => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
+    /// [`Self::request_with_reply_keyhint_sifted`] that HANDS BACK every key it reads that is not a leave
+    /// key, in order, as [`Self::request_with_reply_qhint_keeping`] does for the unsifted request. For a
+    /// caller whose waits must say `[q] quit` and must not lose what the operator types meanwhile.
+    pub fn request_with_reply_keyhint_sifted_keeping(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        leave_keys: &[u8], on_linger: impl FnOnce(),
+        mine: impl FnMut(&crate::ipc::Message) -> bool, keep: &dyn Fn(u8),
+    ) -> ReqOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine, Some(keep));
         self.trace_out(peer, op, match &out {
             ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
             ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
@@ -2053,7 +2137,7 @@ impl ServiceContext {
     /// bounded wait out of send + recv is what lost messages. No new kernel surface: syscall 50 and
     /// its semantics are existing, ratified law. `max_secs <= 0` is a one-second
     /// bound, never none: the kernel reads a 0 as NO deadline, and a bounded call turning into an
-    /// unbounded one by a unit slip is the hang it exists to prevent (`backlog/80` S5).
+    /// unbounded one by a unit slip is the hang it exists to prevent (`backlog/fixed/80` S5).
     pub fn request_with_reply_call(&self, peer: &str, msg: &crate::ipc::Message, max_secs: i64)
         -> Option<crate::ipc::Message>
     {
@@ -2073,6 +2157,8 @@ impl ServiceContext {
             Some(s) => CapHandle(s),
             None    => return Err(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld)),
         };
+        // Abandoned replies out first, or this request takes one of them (`drain_before_request`).
+        self.drain_before_request(peer);
         let (recv, grant) = match self.reply_mailbox() {
             Some((r, g)) => (r, g),
             None => match (self.recv_handle(), self.self_grant_handle()) {
@@ -2130,6 +2216,8 @@ impl ServiceContext {
             Some(s) => CapHandle(s),
             None => return DeadlineOutcomeInto::SendFailed,
         };
+        // Abandoned replies out first, or this request takes one of them (`drain_before_request`).
+        self.drain_before_request(peer);
         let (recv, grant) = match self.reply_mailbox() {
             Some((r, g)) => (r, g),
             None => match (self.recv_handle(), self.self_grant_handle()) {
@@ -2189,7 +2277,7 @@ impl ServiceContext {
         // a single scroll request that timed out left its reply queued, and from that moment every
         // request waited out its full deadline and failed, for the rest of the boot. Observed on a
         // Dell Wyse as `scrollback: the console did not answer` once a second, indefinitely, with the
-        // console sitting idle at `BlockRecv, queue 0` the whole time (`backlog/37`).
+        // console sitting idle at `BlockRecv, queue 0` the whole time (`backlog/fixed/37`).
         //
         // **It is safe here for the reason that function already gives**, and that reason is exactly
         // why this belongs in the SDK rather than at each call site: `request_with_reply*` enforces
@@ -2200,15 +2288,7 @@ impl ServiceContext {
         //
         // Cheap: a non-blocking `try_recv` that finds nothing in the healthy case, bounded by the
         // endpoint depth.
-        let dropped = self.drain_stale_replies();
-        if dropped > 0 {
-            // LOUD, because it means a previous request was abandoned and this one would have
-            // inherited its reply. Silent self-repair is how the fs desync stayed invisible for so
-            // long (§26.7 - a recovery that hides what it recovered from is a silent fallback).
-            self.log_fmt(format_args!(
-                "sdk: discarded {} abandoned repl(y/ies) before a request to `{}` - an earlier request timed out",
-                dropped, peer));
-        }
+        self.drain_before_request(peer);
         // Reply mailbox when the task has one, shared endpoint when it does not. The reply cap and the
         // endpoint waited on must name the SAME endpoint, or the kernel's reply-matched dequeue waits
         // for something that will never be delivered there.
@@ -2639,7 +2719,7 @@ impl ServiceContext {
             // answer: reading it would either lose it or - a `q` meant for the NEXT command, a pager
             // say - end this wait. And most requests are answered before the notice is due, so they
             // now block in the kernel for the whole wait instead of polling the console every slice
-            // (`backlog/80` H16: both of those made the shell keep its noticing waits out of scripts
+            // (`backlog/fixed/80` H16: both of those made the shell keep its noticing waits out of scripts
             // and pipelines).
             let noticed = on_linger.is_none();
             let slice = if noticed { Self::AWAIT_SLICE_MS } else { Self::PRE_NOTICE_SLICE_MS };
@@ -2699,14 +2779,40 @@ impl ServiceContext {
     /// deadline wait. Does NOT drain a stale reply first - a caller that can be re-entered after an
     /// abort should `while self.try_recv().is_some() {}` before it sends (as the request variants do).
     pub fn recv_abortable_deadline(&self, max_secs: i64) -> ReqOutcome {
+        self.recv_abortable_deadline_keeping(max_secs, &|_| {})
+    }
+
+    /// [`Self::recv_abortable_deadline`] that HANDS BACK every key it reads that is not a quit key, in
+    /// order, as [`Self::request_with_reply_qhint_keeping`] does for a request. The plain form reads the
+    /// console to see a `q` and discards everything else, so what the operator typed while a pipe stage
+    /// ran was lost: `ask`'s answer takes seconds, and the next command typed during it vanished in QEMU
+    /// (the receive-side half of `backlog/fixed/80` H16).
+    pub fn recv_abortable_deadline_keeping(&self, max_secs: i64, keep: &dyn Fn(u8)) -> ReqOutcome {
+        self.recv_abortable_deadline_noticing(max_secs, i64::MAX, &|| {}, keep)
+    }
+
+    /// [`Self::recv_abortable_deadline_keeping`] that calls `on_linger` ONCE when no message has come
+    /// after `hint_after_secs` - the receive-side twin of [`Self::request_with_reply_qhint`]. The SDK
+    /// supplies the timing and the caller the words, as there: a task with no prompt has nothing to
+    /// print, so this never writes to the console itself.
+    pub fn recv_abortable_deadline_noticing(
+        &self, max_secs: i64, hint_after_secs: i64, on_linger: &dyn Fn(), keep: &dyn Fn(u8),
+    ) -> ReqOutcome {
         let t0 = self.epoch_secs_monotonic();
+        let mut lingered = false;
         loop {
             // Block, do not spin - see `await_slice`.
             if let Some(r) = self.await_slice(Self::AWAIT_SLICE_MS) { return ReqOutcome::Reply(r); }
             while let Some(b) = self.try_console_read() {
                 if b == b'q' || b == b'Q' || b == 0x1b { return ReqOutcome::Aborted; }
+                keep(b);
             }
-            if self.epoch_secs_monotonic() - t0 >= max_secs {
+            let elapsed = self.epoch_secs_monotonic() - t0;
+            if !lingered && elapsed >= hint_after_secs {
+                lingered = true;
+                on_linger();
+            }
+            if elapsed >= max_secs {
                 return ReqOutcome::Timeout;
             }
         }
@@ -2889,7 +2995,7 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=1 = live endpoint count.
         let ret = unsafe { raw_syscall(13, 1, 0, 0) };
         // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
-        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        // 2026-10-10, a believable count of nothing (`backlog/fixed/80` K18).
         if ret < 0 { None } else { Some(ret as u32) }
     }
 
@@ -3026,7 +3132,7 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=4 = free frame count.
         let ret = unsafe { raw_syscall(13, 4, 0, 0) };
         // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
-        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        // 2026-10-10, a believable count of nothing (`backlog/fixed/80` K18).
         if ret < 0 { None } else { Some(ret as u64) }
     }
 
@@ -3037,7 +3143,7 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=5 = total frame count.
         let ret = unsafe { raw_syscall(13, 5, 0, 0) };
         // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
-        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        // 2026-10-10, a believable count of nothing (`backlog/fixed/80` K18).
         if ret < 0 { None } else { Some(ret as u64) }
     }
 
@@ -3050,7 +3156,7 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=24 = the task's own endpoint.
         let ret = unsafe { raw_syscall(13, 24, slot as u64, 0) };
         // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
-        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        // 2026-10-10, a believable count of nothing (`backlog/fixed/80` K18).
         if ret < 0 { None } else { Some(ret as u64) }
     }
 
@@ -3063,7 +3169,7 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=25 = the endpoint awaited in a CALL.
         let ret = unsafe { raw_syscall(13, 25, slot as u64, 0) };
         // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
-        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        // 2026-10-10, a believable count of nothing (`backlog/fixed/80` K18).
         if ret < 0 { None } else { Some(ret as u64) }
     }
 
@@ -3123,7 +3229,7 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=6, arg1=core.
         let ret = unsafe { raw_syscall(13, 6, core as u64, 0) };
         // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
-        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        // 2026-10-10, a believable count of nothing (`backlog/fixed/80` K18).
         if ret < 0 { None } else { Some(ret as u64) }
     }
 
@@ -3134,7 +3240,7 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=7, arg1=core.
         let ret = unsafe { raw_syscall(13, 7, core as u64, 0) };
         // A refusal (no INTROSPECT) or an error is `None`, never a value: it read as 0 until
-        // 2026-10-10, a believable count of nothing (`backlog/80` K18).
+        // 2026-10-10, a believable count of nothing (`backlog/fixed/80` K18).
         if ret < 0 { None } else { Some(ret as u64) }
     }
 
@@ -3145,7 +3251,7 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=8.
         let ret = unsafe { raw_syscall(13, 8, 0, 0) };
         // A refusal or an error is NOT "one core": it said 1 until 2026-10-10, so a caller without
-        // INTROSPECT reported a one-core machine (`backlog/80` H20). 0 is "the kernel did not say", and
+        // INTROSPECT reported a one-core machine (`backlog/fixed/80` H20). 0 is "the kernel did not say", and
         // a caller must not present it as a count.
         if ret <= 0 { 0 } else { ret as u32 }
     }
@@ -3236,7 +3342,7 @@ impl ServiceContext {
     //
     // Dropping the retry costs little. It exists so a client survives the peer RESTARTING, and a
     // console that has just restarted is rebuilding the screen anyway; the next `console_dims`
-        // `console_scroll` IS GONE, and it is the mechanism `backlog/37` was about.
+        // `console_scroll` IS GONE, and it is the mechanism `backlog/fixed/37` was about.
     //
     // It asked the console to move its own view, and the console could not answer until it had
     // repainted the framebuffer - `paint_view` + `present`, synchronously, inside the request. On a
@@ -3258,7 +3364,7 @@ impl ServiceContext {
     /// **The replacement for the deleted `console_scroll`, which could not be made cheap.**
     /// Moving the terminal's own view forces a full repaint before the console can reply - on a
     /// 3840x2160 panel the most expensive thing it does, paid inside the caller's blocking request,
-    /// from the same core (`backlog/37`). This asks for BYTES: the console copies out of its ring
+    /// from the same core (`backlog/fixed/37`). This asks for BYTES: the console copies out of its ring
     /// and replies, and the caller paints its own screen through ordinary output, which is a send
     /// rather than a call and carries no deadline at all.
     ///
@@ -4027,7 +4133,7 @@ impl ServiceContext {
     /// log_write cap). For inline output such as the shell prompt, where `log`'s newline
     /// would push the user's typed echo to the next line. A string longer than the kernel's 256-byte
     /// limit is written in pieces, each ending on a character boundary - it was dropped whole, with
-    /// no marker, until 2026-10-10 (`backlog/80` S5).
+    /// no marker, until 2026-10-10 (`backlog/fixed/80` S5).
     pub fn print(&self, msg: &str) {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return; }
@@ -4043,7 +4149,7 @@ impl ServiceContext {
     }
 
     /// Log a formatted message, rendered into a 256-byte stack buffer. A message longer than that is
-    /// cut on a character boundary and ends `...`, so the cut is visible (`backlog/80` S5: it was cut
+    /// cut on a character boundary and ends `...`, so the cut is visible (`backlog/fixed/80` S5: it was cut
     /// with no marker, and a cut through a character logged `(fmt error)` instead of the message).
     pub fn log_fmt(&self, args: core::fmt::Arguments) {
         let mut buf = [0u8; FMT_MAX];
@@ -4065,7 +4171,7 @@ impl ServiceContext {
         if slot == u32::MAX { return; }
 
         // Longer than the kernel takes in one call: written in pieces on character boundaries, never
-        // dropped (`backlog/80` S5).
+        // dropped (`backlog/fixed/80` S5).
         for piece in Pieces::new(msg, CONSOLE_WRITE_MAX) {
             // SAFETY: syscall(23) = ConsoleWrite; `piece` is a valid slice within user space, at
             // most CONSOLE_WRITE_MAX bytes.
@@ -4130,13 +4236,13 @@ impl ServiceContext {
     ///
     /// With no supervisor peer there is nothing to ask: the kernel's by-name spawn (syscall 7) was
     /// retired, because its catalogue holds `supervisor` alone and it could only refuse
-    /// (`backlog/80` K14). So that case is refused here, plainly, rather than sent to a syscall that
+    /// (`backlog/fixed/80` K14). So that case is refused here, plainly, rather than sent to a syscall that
     /// would refuse it less clearly.
     pub fn spawn_on(&self, name: &str, core: u32) -> Result<(), crate::Error> {
         if self.find_send_slot("supervisor").is_some() {
             // The supervisor hands back a cap to the new service's endpoint. This path does not keep
             // it, so it is released here - `map(|_| ())` dropped the handle and leaked one table slot per
-            // spawn (`backlog/80`, found during H20).
+            // spawn (`backlog/fixed/80`, found during H20).
             return self.spawn_via_supervisor(name, core, &[]).map(|cap| {
                 if let Some(c) = cap { self.remove_cap(c); }
             });
@@ -4152,7 +4258,7 @@ impl ServiceContext {
     /// reacquires by name and retries ONCE when the send NEVER LEFT - a stale cap - and never when it
     /// was delivered: not on `Ok(None)`, where the deadline passed, and not on `ReplyDead`, where the
     /// supervisor died holding it. Either may have started the service, and retrying would start it
-    /// twice. (`ReplyDead` was retried until 2026-10-10, `backlog/80` S1.) A full queue is not retried
+    /// twice. (`ReplyDead` was retried until 2026-10-10, `backlog/fixed/80` S1.) A full queue is not retried
     /// either: the supervisor is alive and busy, and the caller decides whether to ask again.
     pub fn spawn_via_supervisor(&self, name: &str, core: u32, peers: &[&str])
         -> Result<Option<CapHandle>, crate::Error>
@@ -4236,7 +4342,7 @@ impl ServiceContext {
         let ret = unsafe {
             raw_syscall(8, bytes.as_ptr() as u64, bytes.len() as u64, 0)
         };
-        // The kernel says which failure it was, and so does this (`backlog/80` S4): -2 is the
+        // The kernel says which failure it was, and so does this (`backlog/fixed/80` S4): -2 is the
         // `SERVICE_CONTROL` refusal, anything else is no running service of that name (or a name
         // the kernel could not read). Every one used to come back as `InvalidArgument`.
         match ret {
@@ -4251,7 +4357,7 @@ impl ServiceContext {
     /// A service that is not running is simply started - that is `NotFound` from the kill, and the
     /// one kill failure that is passed over. A refusal (no `SERVICE_CONTROL`) is returned, and
     /// nothing is spawned: until 2026-10-10 the kill's result was discarded, so a caller without the
-    /// authority to kill went on to spawn a second copy (`backlog/80` S4, CLAUDE.md 13.6).
+    /// authority to kill went on to spawn a second copy (`backlog/fixed/80` S4, CLAUDE.md 13.6).
     pub fn restart(&self, name: &str, core_override: Option<u32>) -> Result<(), crate::Error> {
         match self.kill(name) {
             Ok(()) | Err(crate::Error::NotFound) => {}

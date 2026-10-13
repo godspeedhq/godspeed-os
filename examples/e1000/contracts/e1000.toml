@@ -36,4 +36,4 @@ log_write = true   # may write the kernel log ring + serial (syscall 5); NOT to 
 #
 # Not pinned here: this read-only example takes no interrupt, and its spawn row (examples-test build)
 # spawns it unpinned. The contract said `core = 1` while the row did not, which `contract_check.py`
-# now catches (backlog/80 T8).
+# now catches (backlog/fixed/80 T8).

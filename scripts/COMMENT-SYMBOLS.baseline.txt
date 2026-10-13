@@ -94,6 +94,7 @@ dwc2_update_urb_state_abn          # Linux drivers/usb/dwc2/hcd_intr.c, same cit
 IEEE80211_MAX_FRAME_LEN            # Linux include/linux/ieee80211.h (2352), cited by usbfn::BULK_IN_MAX for the size of one unaggregated receive (R3b) - external, 26.14
 hub_activate                       # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
 hub_is_superspeed                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
+hub_port_connect                   # Linux usbcore (drivers/usb/core/hub.c), cited by xhci for how Linux power-cycles and frees a port whose device will not enumerate (backlog/fixed/83) - external, 26.14
 hub_port_debounce                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by dwc2 for the attach debounce and the port reset bound (docs/wifi-usb.md 46) - external, 26.14
 hub_port_reset                     # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
 rtl8xxxu_parse_usb                 # Linux rtl8xxxu_core.c, cited by dwc2 rtl::bulk_in for taking the one bulk IN endpoint (R3b) - external, 26.14
@@ -169,6 +170,7 @@ umac_sw_rst
 unconditional_panic
 usb_125m
 usb_hub_clear_tt_buffer
+usb_hub_set_port_power             # Linux usbcore (drivers/usb/core/hub.c), cited by xhci for how Linux power-cycles and frees a port whose device will not enumerate (backlog/fixed/83) - external, 26.14
 vout_axi
 vs_dc_enable
 yt8531_link_change_notify
@@ -228,8 +230,8 @@ SBSDIO_FUNC1_CHIPCLKCSR            # Linux brcmfmac name for function-1 register
 SDIO_CHIP_CLOCK_CSR                # cyw43-driver (Infineon, same chip family) name for the SAME register; both cited so the two references can be compared
 SDIO_PULL_UP                       # cyw43-driver name for function-1 register 0x1000F, which brcmfmac calls SBSDIO_FUNC1_SDIOPULLUP and writes 0
 is_expected_radio                  # REMOVED - it compared the CIS device code, which is not the field that identifies the part. The comment records what went and why, which is exactly what this baseline is for
-PACE_YIELDS                        # REMOVED 2026-10-10 (backlog/80 V9) - chaos's unread yield cap; chaos and xhci/msc.rs name it AS the count-is-not-a-duration lesson, which is what this baseline is for
-BUSY_RETRIES                       # REMOVED 2026-10-10 (backlog/80 V9) - block-driver usbdisk's unreachable busy loop; xhci/msc.rs names it AS the count-is-not-a-duration lesson
+PACE_YIELDS                        # REMOVED 2026-10-10 (backlog/fixed/80 V9) - chaos's unread yield cap; chaos and xhci/msc.rs name it AS the count-is-not-a-duration lesson, which is what this baseline is for
+BUSY_RETRIES                       # REMOVED 2026-10-10 (backlog/fixed/80 V9) - block-driver usbdisk's unreachable busy loop; xhci/msc.rs names it AS the count-is-not-a-duration lesson
 brcmf_chip_dmp_erom_scan           # Linux brcmfmac chip.c - the EROM walk services/wifi-driver/src/erom.rs reimplements - external, 26.14
 brcmf_chip_dmp_get_regaddr         # Linux brcmfmac chip.c - how a core entry yields its register and wrapper bases - external, 26.14
 brcmf_chip_dmp_get_desc            # Linux brcmfmac chip.c - reads one EROM descriptor and advances, skipping EMPTY ones - external, 26.14
@@ -579,7 +581,6 @@ EFUSE_TEST                         # Realtek register names by their datasheet n
 SYS_CLKR                           # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
 SYS_FUNC                           # Realtek register names by their datasheet name (code has them as REG_*), cited by wifi-usb - external, 26.14
 rtl8723a_cck_rssi                  # Linux rtl8xxxu (8723a.c), cited by wifi-usb for the CCK signal (R3b) - external, 26.14
-sort_unstable                      # Rust core slice method, cited by the shell for its ordering - external, 26.14
 atomic64_inc_return                # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 BSS_CHANGED_BSSID                  # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14
 bss_info_changed                   # Linux mac80211 / include (mlme.c, wpa.c, key.c, mac80211.h), cited by wifi-usb and sdk/wifi for the join, the CCMP replay check and the keys (R5-R7) - external, 26.14

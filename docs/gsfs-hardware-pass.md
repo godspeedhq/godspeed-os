@@ -49,7 +49,7 @@ What an unaimed cut DOES test, and what the two runs did answer, is REORDERING: 
 the medium before the commit record, which leaves torn metadata with no record to replay from. That
 needs no window and is caught by `churn verify` (content) and `drives check` (structure). Both runs
 came back clean on both. Further cuts are worth doing for that reason and cost ~45 seconds each;
-none of them will reach the journal. `backlog/42` carries the arithmetic and the instrument that
+none of them will reach the journal. `backlog/fixed/42` carries the arithmetic and the instrument that
 would close the ordering question properly.
 
 ## Result so far: Dell Wyse 5070 (x86-64, AHCI, 30 GB SSD)
@@ -159,8 +159,8 @@ name out of this one's timestamp, which looks like garbage in a listing rather t
 
 **`ls` is now `dir`**, `long` and `human` are gone, and `dir bytes` replaces them. The selfcheck suite
 was updated in 34 places, so a selfcheck failure naming a missing command is a rename that was missed.
-(It was a single baked script when this was written; it is the nine parts under `scripts/selfcheck/`
-now - `backlog/47`.)
+(It was a single baked script when this was written; it is the ten parts under `scripts/selfcheck/`
+now - `backlog/fixed/47`.)
 
 **`fs` now sends a failure REASON on the wire** and the shell prints it. The reply grew; byte 0 is
 unchanged, so an unchanged consumer is unaffected.

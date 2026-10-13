@@ -150,7 +150,7 @@ def frames(objdump, elf):
 
     It returned `{}` when objdump failed, and an empty result measures nothing and so passes: a
     host objdump that cannot read the target's ELF, or one that is not installed, gave a green gate
-    over binaries nobody looked at (backlog/80 T5). An ELF that exists and cannot be disassembled is
+    over binaries nobody looked at (backlog/fixed/80 T5). An ELF that exists and cannot be disassembled is
     a failure of the instrument, and it is said as one.
     """
     try:
@@ -191,32 +191,52 @@ def frames(objdump, elf):
 
 def check(objdump, root, target, profile, services, stack_limit, top=5):
     """Report the deepest frames; return the list of (service, function, bytes) that do not fit."""
-    over, census, mute = [], [], []
+    over, census, mute, frameless = [], [], [], []
     for svc in services:
         elf = os.path.join(root, "target", target, profile, svc)
         if not os.path.exists(elf):
             continue
         f = frames(objdump, elf)
         # MEASURED NOTHING, SAID NOTHING. A binary full of functions, not one of which adjusts the
-        # stack pointer, does not mean "no deep frames" - it means the prologue form on this target is
-        # not one this file matches, which is exactly how an unsupported arch earns a pass. The
+        # stack pointer, does not mean "no deep frames" - it can mean the prologue form on this target
+        # is not one this file matches, which is exactly how an unsupported arch earns a pass. The
         # instrument must report that it is blind rather than report a zero it did not earn
         # (invariant 12). This guard is the general fix; SUB_SP_RV above is the specific one.
         # An ELF in which objdump found no function at all is the same blindness by another route.
-        if not f or not any(f.values()):
+        #
+        # BLINDNESS IS A PROPERTY OF THE TARGET, NOT OF ONE BINARY (`backlog/fixed/54`). What a zero frame
+        # cannot tell apart is "this prologue form is not matched" from "this binary really has no
+        # frames", and `examples/00-hello` is the second: 43 lines that inline completely, zero `sub
+        # rsp` in `objdump -d`. The two differ in what the REST of the target shows - an unmatched
+        # prologue form is unmatched in every binary built for that target, so if ANY binary there
+        # shows a frame, the form is matched and an all-zero binary is genuinely frameless. Decided
+        # below, once every binary on the target has been read. An ELF with no function at all is
+        # still blind on its own: that is objdump failing to read it, not a small program.
+        if not f:
             mute.append(svc)
+        elif not any(f.values()):
+            frameless.append(svc)
         for name, size in f.items():
             if size > stack_limit:
                 over.append((svc, name, size))
             census.append((size, svc, name))
+    if frameless and not any(size for size, _, _ in census):
+        # Nothing on this target has a frame: the prologue form is unmatched, so every one is blind.
+        mute.extend(frameless)
+        frameless = []
     if mute:
         raise SystemExit(
             "\nSTACK-FIT CHECK IS BLIND on target %s: %s\n"
-            "Every function in those binaries has a zero frame, which no real service has. The\n"
-            "stack-pointer prologue on this target is a form this checker does not match, so it\n"
-            "measured nothing and would have reported a pass. Add the pattern (see SUB_SP /\n"
-            "SUB_SP_RV) before trusting this gate here."
+            "No function in any binary built for this target has a frame (or objdump found no function\n"
+            "at all), which no real service has. The stack-pointer prologue on this target is a form\n"
+            "this checker does not match, so it measured nothing and would have reported a pass. Add\n"
+            "the pattern (see SUB_SP / SUB_SP_RV) before trusting this gate here."
             % (target, ", ".join(mute)))
+    if frameless:
+        # Said, not hidden: a binary this checker measured as frameless is a fact about the binary,
+        # and a reader should see it - but it is not blindness, because frames ARE read on this target.
+        print("stack fit: %s on %s: no function adjusts the stack pointer - frameless, while other "
+              "binaries on this target show frames, so the prologue form is matched" % (", ".join(frameless), target))
     census.sort(reverse=True)
     if census:
         print("stack fit: deepest single frames (limit %d KiB)" % (stack_limit // 1024))

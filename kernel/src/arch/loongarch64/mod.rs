@@ -516,6 +516,9 @@ pub mod pci {
     /// Find a device by its 24-bit PCI class code - the lookup that replaced per-driver names in
     /// step D1. `None` on a machine with no bus, which is what the caller already handles.
     pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+    /// No bus, so no device at any index. Missing until 2026-10-13, which put this scaffold back at M0
+    /// (`scripts/scaffold_check.py`): the neutral kernel had started asking for it.
+    pub fn device_at(_n: usize) -> Option<PciDevice> { None }
 
     /// Where an MSI should be delivered, as an interrupt-controller destination id.
     ///
@@ -546,7 +549,7 @@ pub mod pci {
     pub fn nic() -> Option<PciDevice> { None }
     /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
     /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
-    /// backlog/80 K1).
+    /// backlog/fixed/80 K1).
     pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
     pub fn init() {}

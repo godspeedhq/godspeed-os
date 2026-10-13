@@ -66,7 +66,7 @@ now held on RTL8168 over PCIe, smsc95xx over USB, and GENET and dwmac on-SoC.
 
 ## What this matrix does NOT cover
 
-- **`backlog/48` / `backlog/49`** - a userspace-reachable kernel panic, reproduced under load. A
+- **`backlog/fixed/48` / `backlog/49`** - a userspace-reachable kernel panic, reproduced under load. A
   violation of an absolute bar (CLAUDE.md §22). Not caused or worsened by this branch, whose kernel
   diff is comments only, and already scheduled for after it.
 - **`backlog/52`** - the QEMU shell suite flaking on `sock` and `serve`. Five green boards do not make
@@ -108,18 +108,18 @@ Not "it survived" - it is in the same state, check for check.
 and re-running its whole bring-up: link settled at 1000 Mbit/s full duplex, DMA reset cleared, MAC
 filter read back and verified, then DHCP OFFER, ACK, ARP for the gateway, and an ICMP echo reply -
 followed by `sock` returning its 94 bytes and `net` reporting lease, gateway and ping. That is
-`backlog/19` ("networking does not recover from a chaos storm") **not reproducing**, with the recovery
+`backlog/fixed/19` ("networking does not recover from a chaos storm") **not reproducing**, with the recovery
 visible line by line rather than inferred from a working prompt.
 
-#### What this does and does NOT say about `backlog/48`
+#### What this does and does NOT say about `backlog/fixed/48`
 
-`backlog/48` is `chaos max-carnage` panicking the kernel on the kill-path bound, and it is a violation
+`backlog/fixed/48` is `chaos max-carnage` panicking the kernel on the kill-path bound, and it is a violation
 of an absolute bar. It **did not reproduce** in these 1000 rounds.
 
 **That is not a refutation, and must not be recorded as one.** The entry's own measurement is 1 panic
 in 170 rounds *under host load*, and 0 in 400 *idle*. A 1000-round idle run on real hardware is
 consistent with the second figure, not evidence against the first. The bug needs a late kill path to
-be preempted, and an unloaded machine is exactly where that does not happen. `backlog/48` stays OPEN
+be preempted, and an unloaded machine is exactly where that does not happen. `backlog/fixed/48` stays OPEN
 at full severity.
 
 What this run DOES establish is that nothing in `feat/stdlib` makes it worse: the branch's kernel diff

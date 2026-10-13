@@ -584,7 +584,7 @@ pub unsafe fn free_frame(frame: Frame) {
 /// A diagnostic read, taken WITHOUT the allocator lock: it runs in a fault report, where taking a lock
 /// another core may hold would turn a dead service into a wedged machine. A racing read can be one
 /// allocation stale, which is fine for its one job - saying whether a frame a live page table points at
-/// has been handed back to the pool (`backlog/72`). A table frame the allocator calls free is a frame two
+/// has been handed back to the pool (`backlog/fixed/72`). A table frame the allocator calls free is a frame two
 /// owners can write.
 pub fn frame_is_free(phys: u64) -> Option<bool> {
     if !phys_in_ram(phys) {

@@ -351,7 +351,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // dependent - slirp forwards to the HOST's resolver - so the DNS SERVER is allowed to fail: a
     // resolved IP ("example.com is a.b.c.d"), no A record, or no reply from the server all pass. What
     // does NOT pass is net-stack failing to answer the shell ("did not answer the resolve"): that is
-    // this machine's own IPC, and accepting it hid backlog/66 - an empty frame reply refused by the
+    // this machine's own IPC, and accepting it hid backlog/fixed/66 - an empty frame reply refused by the
     // kernel on every port but ARM32, so net-stack waited out a second per empty drain.
     send(&mut write_half, b"net dns example.com\r");
     let dns_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
@@ -508,12 +508,12 @@ pub fn run(image_path: &Path, smp: u32) {
 
     // tcp to a CLOSED host port: the peer resets, and the transaction must be ANSWERED as failed.
     // `net-stack` answered a failed op 21 with an EMPTY message until 2026-10-10, which this x86
-    // machine refuses to deliver (`backlog/66`), so the caller sat out its deadline and reported an
-    // unknown outcome for a refusal that was known at once (`backlog/80` D5).
+    // machine refuses to deliver (`backlog/fixed/66`), so the caller sat out its deadline and reported an
+    // unknown outcome for a refusal that was known at once (`backlog/fixed/80` D5).
     send(&mut write_half, b"tcp 10.0.2.2 1 hello\r");
     let t = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
     check!(t.contains("connected to nothing"),
-           "tcp: a refused connection is answered as failed, not left to time out (backlog/80 D5)");
+           "tcp: a refused connection is answered as failed, not left to time out (backlog/fixed/80 D5)");
 
 
 
@@ -528,7 +528,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // per keypress. Each of those made the console `paint_view` + `present` before it could reply: a
     // full repaint of the framebuffer, inside the caller's deadline, on the core the caller was
     // blocked on. Against a 3840x2160 panel that overran one second and the shell declared a console
-    // that was merely busy to be dead (`backlog/37`).
+    // that was merely busy to be dead (`backlog/fixed/37`).
     //
     // **AND THIS SUITE RAN GREEN THROUGH ALL OF IT**, which is the part worth keeping in mind: the
     // cost that broke it is a repaint, QEMU has no such panel, so the tests could not have caught it
@@ -590,7 +590,7 @@ pub fn run(image_path: &Path, smp: u32) {
     let s6 = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
     check!(s6.is_some(), "scrollback: Esc also leaves");
 
-    // THE SOAK THAT `backlog/37` LEFT BEHIND. Open it, touch nothing for 8 seconds, then page. The
+    // THE SOAK THAT `backlog/fixed/37` LEFT BEHIND. Open it, touch nothing for 8 seconds, then page. The
     // old failure was the view going permanently deaf; the fingerprint was the shell printing that
     // the console had stopped answering, so waiting for its ABSENCE is immune to how the success
     // path happens to be worded.
@@ -600,7 +600,7 @@ pub fn run(image_path: &Path, smp: u32) {
     send(&mut write_half, b"\x1b[6~");   // PgDn
     let soak = collect_until(&buf, &mut cursor, FRAME_END, Duration::from_secs(10)).unwrap_or_default();
     check!(!soak.contains("stopped answering") && !soak.contains("did not answer"),
-           "scrollback: still answers after 8s open with no keystrokes (backlog/37)");
+           "scrollback: still answers after 8s open with no keystrokes (backlog/fixed/37)");
     send(&mut write_half, b"q");
     let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
 
@@ -878,6 +878,81 @@ pub fn run(image_path: &Path, smp: u32) {
             println!("shell-test: FAIL - timed out after `cores`");
             fail += 1;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ask (utilities/60_ask.md): a foreground program for one question. Answered from the services
+    // that know, every line labelled, records when piped, refusals that say what to do - and nothing
+    // of it left running once the prompt returns.
+    // -----------------------------------------------------------------------
+    {
+        let mut ask = |cmd: &[u8], secs: u64| -> String {
+            send(&mut write_half, cmd);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(secs)).unwrap_or_default()
+        };
+        let bare = ask(b"ask\r", 10);
+        check!(bare.contains("usage: ask"), "ask: bare `ask` prints its usage");
+        let unquoted = ask(b"ask is my system healthy\r", 10);
+        check!(unquoted.contains("put the question in quotes: ask \"is my system healthy\""),
+               "ask: an unquoted question is refused with the line to type");
+        let health = ask(b"ask \"is my system healthy?\"\r", 40);
+        check!(["HEALTHY", "DEGRADED", "UNHEALTHY", "UNKNOWN"].iter().any(|v| health.contains(v)) && !health.contains("pipe:"),
+               "ask: the health question gets a verdict");
+        let ev = ask(b"ask evidence \"is my system healthy?\"\r", 40);
+        check!(ev.contains("FACT") && ev.contains("[task table]") && ev.contains("taken at uptime"),
+               "ask evidence: every line labelled, its source named, the moment it was taken");
+        let svc = ask(b"ask \"why did fs restart?\"\r", 40);
+        check!(svc.contains("`fs` HAS NOT RESTARTED") || svc.contains("`fs` HAS RESTARTED"),
+               "ask: the general question names the service it was asked about");
+        let act = ask(b"ask \"restart fs\"\r", 40);
+        check!(act.contains("I cannot restart anything"), "ask: a request to act is refused - ask reads, it changes nothing");
+        let guide = ask(b"ask \"what to say?\"\r", 40);
+        check!(guide.contains("YOU CAN ASK") && guide.contains("why did <service> <event>"),
+               "ask: \"what to say?\" lists the questions it understands");
+        // QEMU's user-mode network hands out a lease, so this machine IS on a network - and the answer
+        // must still not claim the internet works, because nothing was sent to find out.
+        let net = ask(b"ask \"is the network up?\"\r", 40);
+        check!(net.contains("ON A NETWORK") && net.contains("was not tested"),
+               "ask: the network question answers from net-stack's status, and says what it did not test");
+        let def = ask(b"ask \"what is immou?\"\r", 40);
+        check!(def.contains("IOMMU: Input/Output Memory Management Unit") && def.contains("I read `immou` as IOMMU"),
+               "ask: a term is defined from GLOSSARY.md, and a typo is read and said to be");
+        let joke = ask(b"ask \"tell me a joke\"\r", 40);
+        check!(joke.contains("A JOKE") && joke.contains("not an observation"),
+               "ask: an Easter egg says what it is - a joke is never mistaken for an answer");
+        let huh = ask(b"ask \"why is my computer sad?\"\r", 40);
+        check!(huh.contains("I don't understand that question yet") && huh.contains("system health"),
+               "ask: a question it does not understand says so, and what it can answer");
+        let piped = ask(b"ask \"what failed?\" | where label=verdict\r", 40);
+        check!(piped.contains("verdict") && !piped.contains("exceeded the record bound"),
+               "ask: piped, the answer is records - and a three-row table is not reported truncated");
+        // HOW A SERVICE ENDED is the kernel's to say: a kill names who called it (CLAUDE.md 6.2,
+        // amendment 2026-10-11). `time` is restartable and nothing here depends on it.
+        let _ = ask(b"kill time\r", 10);
+        std::thread::sleep(Duration::from_secs(3));
+        let killed = ask(b"ask \"why did time restart?\"\r", 40);
+        check!(killed.contains("`time` WAS KILLED BY `shell`") && killed.contains("not a failure of `time` itself"),
+               "ask: a kill is named from the kernel's death notice - who called it, and that it was no failure");
+        // Curly quotes, as a phone types them. Their middle byte is 0x80, the keyboard's Ctrl+Alt+Del
+        // signal, and this line used to REBOOT the machine.
+        let curly = ask("ask \u{201c}tell me a joke\u{201d}\r".as_bytes(), 40);
+        check!(curly.contains("A JOKE") && !curly.contains("rebooting"),
+               "ask: curly quotes quote - and a UTF-8 character is never read as the reboot signal");
+        // What a service IS, from its own crate's description; what it CAN do and who can do a thing,
+        // from the capabilities the kernel holds for each task.
+        let what = ask(b"ask \"what is fs?\"\r", 40);
+        check!(what.contains("`fs`: The filesystem") && what.contains("the supervisor keeps `fs` running"),
+               "ask: \"what is fs?\" answers from fs's own description and the supervisor");
+        let can = ask(b"ask evidence \"what can fs do?\"\r", 40);
+        check!(can.contains("`fs` HOLDS") && can.contains("`resource_mint`") && can.contains("block-driver"),
+               "ask: \"what can fs do?\" lists its authorities and the services it can send to");
+        let who = ask(b"ask \"who can reboot?\"\r", 40);
+        check!(who.contains("CAN REBOOT THE MACHINE") && who.contains("`shell` holds `reboot`"),
+               "ask: \"who can reboot?\" names the tasks holding the authority");
+        let help = ask(b"ask help\r", 10);
+        check!(help.contains("why did <service> <event>"), "ask help: lists the general question");
+        let after = ask(b"observe now\r", 30);
+        check!(!after.contains(" ask "), "ask: no `ask` task is left once the prompt returns");
     }
 
     // -----------------------------------------------------------------------
@@ -1534,13 +1609,13 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // observe (live) - the full-screen view, which no suite ran until 2026-10-10. The audit read in the
     // code that it could not start - `ctx.spawn_on("observe-live")`, through a kernel catalogue that
-    // holds only the supervisor (`backlog/80` V1) - and nothing had ever looked. It must paint a frame,
+    // holds only the supervisor (`backlog/fixed/80` V1) - and nothing had ever looked. It must paint a frame,
     // and `q` must give the prompt back.
     // -----------------------------------------------------------------------
     send(&mut write_half, b"observe\r");
     match collect_until(&buf, &mut cursor, b"system state", Duration::from_secs(20)) {
-        Some(r) => check!(!r.contains("failed to spawn"), "observe: the live view started and painted a frame (backlog/80 V1)"),
-        None    => { println!("shell-test: FAIL - observe: no live frame within 20 s (backlog/80 V1)"); fail += 1; }
+        Some(r) => check!(!r.contains("failed to spawn"), "observe: the live view started and painted a frame (backlog/fixed/80 V1)"),
+        None    => { println!("shell-test: FAIL - observe: no live frame within 20 s (backlog/fixed/80 V1)"); fail += 1; }
     }
     send(&mut write_half, b"q");
     match collect_until(&buf, &mut cursor, b"gsh> ", Duration::from_secs(10)) {
@@ -1739,7 +1814,7 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("drives flash") && r.contains("drives flash 0 data"), "subcommand help: drives flash help + example"),
         None    => { println!("shell-test: FAIL - timed out after `drives flash help`"); fail += 1; }
     }
-    // backlog/80 H8: seven commands answered a command and not `help` / `version`. `fmt help` read
+    // backlog/fixed/80 H8: seven commands answered a command and not `help` / `version`. `fmt help` read
     // "help" as a PATH, `tcp version` printed the usage, and `whatis` called all seven unknown.
     send(&mut write_half, b"fmt help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
@@ -1756,7 +1831,7 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("spawncap: shell built-in"), "whatis spawncap: a shell built-in, not unknown (H8)"),
         None    => { println!("shell-test: FAIL - timed out after `whatis spawncap`"); fail += 1; }
     }
-    // backlog/80 H2: the refusal named three targets while the gate held eleven.
+    // backlog/fixed/80 H2: the refusal named three targets while the gate held eleven.
     send(&mut write_half, b"chaos kill-storm nosuch\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("not a kill-storm target") && r.contains("net-stack") && r.contains("dwc2")
@@ -2246,7 +2321,7 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("drives-test: FAIL - timed out after `drives` (2)  [×2]"); fail += 2; }
     }
 
-    // 3b. A word selector must BE the drive's label (backlog/80 H15). `drives flash typo data` used to
+    // 3b. A word selector must BE the drive's label (backlog/fixed/80 H15). `drives flash typo data` used to
     //     take `typo` unread as drive 0's label and, after the [y/N], erase it. It must be refused
     //     before the confirm, naming the label the drive really has; the real label still selects it.
     send(&mut write_half, b"drives flash typo data\r");
@@ -2375,7 +2450,8 @@ fn boot_shell(
 /// anything.
 ///
 /// Boot 2 also checks the negative half, which is the part that makes sticky safe rather than a trap:
-/// an explicit `stop` deletes the marker, so a capture that was told to end does NOT come back.
+/// an explicit `stop` deletes the marker, so a capture that was told to end does NOT come back - and
+/// it ends the `recorder` task, so `events persist status` then says `not running`.
 pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     println!("sticky-test: two boots on one disk - a capture must survive a reboot");
     let mut fail = 0usize;
@@ -2448,7 +2524,17 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     // THE NEGATIVE HALF. An explicit stop must delete the marker, or the one command meaning "enough"
     // is the one that did not take - and the capture would return at every boot forever.
     send(&mut write2, b"events persist stop\r");
-    let _ = collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30));
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
+        // A stopped capture leaves nothing running: the shell ends the recorder at the stop.
+        Some(r) => check!(r.contains("shell: ended `recorder` - its capture is closed"),
+                          "stop ENDED the recorder - a closed capture leaves no task behind"),
+        None => { println!("sticky-test: FAIL - timed out on stop"); fail += 1; }
+    }
+    send(&mut write2, b"events persist status\r");
+    match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
+        Some(r) => check!(r.contains("not running"), "and `status` then says so, from the task table"),
+        None => { println!("sticky-test: FAIL - timed out on status after stop"); fail += 1; }
+    }
     send(&mut write2, b"read /persist.conf\r");
     match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
         Some(r) => check!(!r.contains("/cap.log"), "stop DELETED the sticky marker (it will not come back)"),
@@ -2457,7 +2543,7 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
     child2.kill().ok();
     let _ = child2.wait();
 
-    let passed = 6usize.saturating_sub(fail);
+    let passed = 8usize.saturating_sub(fail);
     println!("\n  {passed} passed  {fail} failed");
     if fail > 0 {
         std::process::exit(1);
@@ -3571,6 +3657,23 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         }
         None => { println!("files-test: FAIL - gsh let timeout"); fail += 2; }
     }
+    // `repeat` writes to its CALLER's output (backlog/84 S2): in a function whose output is captured,
+    // `$(f)`, its runs and verdict land in the variable, as `echo`'s do in the cf tests below. It wrote
+    // to the console before, so the variable held none of them. (`$(repeat ...)` itself is refused - a
+    // capture takes a producer - and `run ... save` saves only the run's report, for every command.)
+    let _ = run!(b"write /gsh_rep.gsh fn f { repeat count 2 echo hi } ; let r = $(f) ; echo got=[$r]\r", 10);
+    match run!(b"run /gsh_rep.gsh\r", 16) {
+        Some(r) => {
+            check!(r.contains("got=[repeat 1 of 2: echo hi"), "repeat: its runs go to a function capture, not the console");
+            check!(r.contains("repeat: 2 run(s), 0 failed"), "repeat: its verdict goes to the capture too");
+        }
+        None => { println!("files-test: FAIL - repeat capture timeout"); fail += 2; }
+    }
+    // A refusal inside `repeat` names `repeat`, not only scripts (backlog/84 S1).
+    match run!(b"repeat count 1 run /gsh_a.gsh\r", 12) {
+        Some(r) => check!(r.contains("neither can `repeat`"), "repeat: a nested run's refusal names repeat"),
+        None => { println!("files-test: FAIL - repeat nested run timeout"); fail += 1; }
+    }
     // undefined variable is a LOUD error (not a silent empty string) and fails the statement.
     let _ = run!(b"write /gsh_u.gsh echo $missing\r", 10);
     match run!(b"run /gsh_u.gsh\r", 14) {
@@ -4164,7 +4267,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("assert: ok"), "result: delete of a missing path is Err"),
         None    => { println!("files-test: FAIL - assert fails delete timeout"); fail += 1; }
     }
-    // backlog/80 H10/H20: a comma list returned Ok whatever its items did, and dropped items past 16.
+    // backlog/fixed/80 H10/H20: a comma list returned Ok whatever its items did, and dropped items past 16.
     match run!(b"assert fails delete /nowhere1,/nowhere2\r", 10) {
         Some(r) => check!(r.contains("assert: ok") && r.contains("2 of 2 failed"), "comma list: failing items make the list an Err, counted (H10)"),
         None    => { println!("files-test: FAIL - comma-list delete timeout"); fail += 1; }
@@ -4174,13 +4277,13 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
                           "comma list: 17 items refused before anything runs (H10)"),
         None    => { println!("files-test: FAIL - 17-item mkdir timeout"); fail += 1; }
     }
-    // backlog/80 H19: a missing start path was "INCOMPLETE ... too large", 0 matches, and Ok.
+    // backlog/fixed/80 H19: a missing start path was "INCOMPLETE ... too large", 0 matches, and Ok.
     match run!(b"assert fails find x /no/such/start\r", 10) {
         Some(r) => check!(r.contains("assert: ok") && r.contains("not a directory") && !r.contains("too large"),
                           "find: a missing start path is refused as such (H19)"),
         None    => { println!("files-test: FAIL - find missing start timeout"); fail += 1; }
     }
-    // backlog/80 H21: `read` on a directory said "not found".
+    // backlog/fixed/80 H21: `read` on a directory said "not found".
     match run!(b"read /\r", 10) {
         Some(r) => check!(r.contains("is a directory") && !r.contains("not found"), "read: a directory is named as one (H21)"),
         None    => { println!("files-test: FAIL - read / timeout"); fail += 1; }
@@ -4912,10 +5015,10 @@ pub fn run_examples(image_path: &Path, persist_path: &str, smp: u32) {
     // 2. stdlib-hello - the `gs::fs` + `gs::io` tour, against a real filesystem (the disk is
     //    formatted host-side above). It writes 8000 bytes, more than one IPC message, and reads them
     //    back; only the byte-for-byte match passes. This accepted `stdlib-hello: done` alone until
-    //    2026-10-10, and passed while every call it made came back `Unreachable` (`backlog/80` E1).
+    //    2026-10-10, and passed while every call it made came back `Unreachable` (`backlog/fixed/80` E1).
     check!(saw("stdlib-hello: starting"), "stdlib-hello: ran (examples/stdlib-hello)");
     check!(saw("wrote /stdlib-hello.txt (8000 bytes)"),
-           "stdlib-hello: gs::fs::write wrote a file larger than one message (backlog/80 G1)");
+           "stdlib-hello: gs::fs::write wrote a file larger than one message (backlog/fixed/80 G1)");
     check!(saw("read /stdlib-hello.txt back: 8000 bytes, every one as written"),
            "stdlib-hello: gs::fs::read_into read it back, every byte as written");
 
@@ -5530,7 +5633,7 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
             check!(r.contains("gs::cap non-escalation holds"),
                    "gs::cap cannot widen rights - a READ cap is refused its write by the kernel");
             check!(r.contains("gs::cap an append-only file carries WRITE alone, and closes"),
-                   "gs::file records the rights the cap CARRIES, and closes an append-only file (backlog/80 G2)");
+                   "gs::file records the rights the cap CARRIES, and closes an append-only file (backlog/fixed/80 G2)");
             check!(r.contains("all file-capability checks passed"), "every file-cap property held");
         }
         None => { println!("file-cap: FAIL - fcap timed out"); fail += 1; }
@@ -6060,13 +6163,15 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
     // tally says it stopped and NAMES what never ran. `failed 0` is what this very suite greens on,
     // so a quit that printed only a tally would pass while half the machine went unchecked.
     send(&mut write_half, b"selfcheck\r");
-    if collect_until(&buf, &mut cursor, b"part 3/9", Duration::from_secs(180)).is_some() {
+    // `part 3/` and not `part 3/9`: the total is the length of SELFCHECK_PARTS, and pinning it here
+    // failed this case, and the one after it, the day a tenth part was added.
+    if collect_until(&buf, &mut cursor, b"part 3/", Duration::from_secs(180)).is_some() {
         send(&mut write_half, b"q");
         match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
             Some(r) => {
                 let stopped = r.contains("STOPPED at your request");
                 let not_pass = r.contains("NOT a pass");
-                let named = r.contains("never run:") && r.contains("network");
+                let named = r.contains("never run:") && r.contains("network") && r.contains("ask");
                 if stopped && not_pass && named {
                     println!("script-test: PASS - `q` stops the run, and it refuses to look like a pass");
                     pass += 1;
@@ -6382,7 +6487,7 @@ fn retry_tcp_connect(port: u16, timeout: Duration) -> Option<TcpStream> {
 
 /// `osdev test chaos-repro[:rounds[:iters]]` - hammer `chaos max-carnage` inside one boot.
 ///
-/// Written for `backlog/48`: a kernel panic on the kill path's progress bound, seen once in four
+/// Written for `backlog/fixed/48`: a kernel panic on the kill path's progress bound, seen once in four
 /// `osdev test shell` runs. That rate is unusable for an investigation - each of those runs costs
 /// minutes and spends nearly all of them on things that are not carnage - so this does nothing but
 /// carnage, in a loop, in one boot.
@@ -6418,7 +6523,7 @@ pub fn run_chaos_repro(image_path: &Path, smp: u32, rounds: u32, iters: u32) {
         std::process::exit(1);
     });
     // 90s, not 10: under a deliberately loaded host QEMU may not get enough CPU to open its
-    // listening socket for tens of seconds, and the loaded phase of `backlog/48` died here before it
+    // listening socket for tens of seconds, and the loaded phase of `backlog/fixed/48` died here before it
     // ran a single round.
     let stream = match retry_tcp_connect(shell_port, Duration::from_secs(90)) {
         Some(s) => s,
@@ -7281,7 +7386,7 @@ pub fn run_fs_fuzz(image_path: &Path, persist_path: &str, smp: u32) {
     check!(!listing.contains("[2J"),
            "`dir` did not emit a raw ESC sequence that came from a FILENAME");
 
-    // ---- A DIRECTORY BIGGER THAN ONE REPLY BLOCK IS LISTED IN FULL (backlog/33) ----
+    // ---- A DIRECTORY BIGGER THAN ONE REPLY BLOCK IS LISTED IN FULL (backlog/fixed/33) ----
     //
     // `list_dir` builds each answer into a single 512-byte block, so roughly twenty entries fit per
     // reply. THIS CASE USED TO ASSERT THE OPPOSITE OF WHAT IT ASSERTS NOW, and the history is worth
@@ -8211,6 +8316,11 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     // to see a tear at all.
     let ch_verify = run!(b"churn verify\r", 120).unwrap_or_default();
     let _ = run!(b"churn reset\r", 120);
+    // ---- `copier` IS NOT A SERVICE. Every job above has ended and been read back, so the shell
+    //      must have ended every `copier` it started - it used to stay up until reboot, waking twice
+    //      a second. One more command for the last tidy, then the task table must not hold one.
+    let _ = run!(b"dir /\r", 90);
+    let tasks_after = run!(b"observe now\r", 90).unwrap_or_default();
 
     let w = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     child.kill().ok(); child.wait().ok();
@@ -8285,6 +8395,13 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
            "and it RENAMED - writing only would exercise one transaction shape while claiming three");
     check!(ch_verify.contains("NONE torn") && count_before(&ch_verify, " file(s) checked") > 0,
            "`churn verify` recognised what the detached writer wrote, over a NON-EMPTY set - `NONE torn` across zero files is the vacuous pass this refactor exists to prevent");
+
+    let started = w.matches("task: 'copier' spawned OK").count();
+    let ended = w.matches("shell: ended `copier`").count();
+    check!(started >= 2 && ended == started,
+           &format!("every `copier` the shell started was ended once its job was over and read back ({started} started, {ended} ended)"));
+    check!(!tasks_after.contains(" copier "),
+           "no `copier` is left in the task table once every job is collected");
 
     println!("\njobs: {pass} passed, {fail} failed");
     if fail > 0 { std::process::exit(1); }
@@ -8795,11 +8912,11 @@ pub fn run_fs_blockdeath(image_path: &Path, persist_path: &str, smp: u32) {
 ///
 /// `fs-ioretry` already makes the disk fail, and `fs` handles that by retrying. §3.7 asks for the
 /// other half - late, duplicate, missing and out-of-order completions - and names why it matters:
-/// `backlog/31` recorded exactly that failure one layer up, a service reading replies that belonged
+/// `backlog/fixed/31` recorded exactly that failure one layer up, a service reading replies that belonged
 /// to earlier requests. The fs/block channel has the same shape, carries the same correlation tag,
 /// and gained a drain-before-request repair that had never been adversarially exercised.
 ///
-/// **THE BAR IS RECOVERY, NOT DETECTION.** `backlog/31`'s tag was reverted precisely because
+/// **THE BAR IS RECOVERY, NOT DETECTION.** `backlog/fixed/31`'s tag was reverted precisely because
 /// rejecting a stale reply is not the same as surviving one, so every assertion below that merely
 /// proves a fault was NOTICED is paired with one proving the filesystem still worked afterwards.
 /// A run where `fs` spots every bad completion and then cannot write a file has failed this gate.
@@ -8882,7 +8999,7 @@ pub fn run_fs_blockchaos(image_path: &Path, persist_path: &str, smp: u32) {
     check!(w.contains("discarded a block reply for tag") || w.contains("orphaned block reply"),
            "fs detected a mis-correlated completion rather than believing it");
 
-    // ---- AND RECOVERED, which is the gate. §3.7 exists because `backlog/31` proved detection
+    // ---- AND RECOVERED, which is the gate. §3.7 exists because `backlog/fixed/31` proved detection
     // without recovery is not enough.
     check!(w.contains("survived-the-completion-chaos"),
            "a file written AFTER the faults reads back correctly (recovery, not just rejection)");

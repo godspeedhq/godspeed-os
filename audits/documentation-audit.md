@@ -13,7 +13,7 @@
 **Scope:** `feat/wifi-driver` against `main` - 206 files, +34,281 lines, about 9,000 of them documentation:
 the Pi 4 radio end to end, the audio branch merged in (the HD Audio driver and the Pis' PWM jack), the
 kernel learning no service name but the supervisor, the `power` service and the CPU clock lease, the
-`gs::driver` library, the Pi 4 page-table fault (`backlog/72`) and the VisionFive AIC8800 phases V0-V1.
+`gs::driver` library, the Pi 4 page-table fault (`backlog/fixed/72`) and the VisionFive AIC8800 phases V0-V1.
 Docs, per-directory `CLAUDE.md` files, utility specs and CODE COMMENTS. Run while the operator was away.
 The whole range against `main`, so it includes what Audit 8 (2026-10-02, at the end of this file) covered.
 
@@ -58,7 +58,7 @@ none was marked. They are now, each pointing at the section that changed it.
   `smp/ipi.rs`'s full-flush sentinel a no-op there (latent: nothing calls it; recorded below).
 - **Shipped but documented as not** (HIGH): `utilities/57_audio.md` said the Pis' jack was never heard (the
   Pi 4 was) and that only x86 has an audio driver; `docs/audio.md` said `play` and the Pi grant were not
-  built; the website said the `audio` command was not built; `backlog/65` still waited on closing
+  built; the website said the `audio` command was not built; `backlog/fixed/65` still waited on closing
   conditions both of which had been met.
 - **The `wifi` utility spec described an architecture that was never built** (HIGH): standalone services
   holding an introspection-only capability, and a hidden network joinable by BSSID. Every verb is a shell
@@ -77,7 +77,7 @@ none was marked. They are now, each pointing at the section that changed it.
   -> 1 KiB, the website's SNTP in net-stack, `HOLD_MS` described as a fixed hold.
 - **Records**: `docs/wifi.md` gained section 61 (an idle link dropped for inactivity, reason 4, about six
   minutes in; one echo a minute kept it up), the AIC8800 design a "V1 as built" note, the almanac the
-  same-day fix of the IPC silent fallback, and `backlog/66` the honest form of its SNTP line (run on the
+  same-day fix of the IPC silent fallback, and `backlog/fixed/66` the honest form of its SNTP line (run on the
   Pi 4, not yet with an unset clock).
 
 ### Left open, recorded rather than fixed
@@ -168,7 +168,7 @@ them.** `CLAUDE.md` §6.4 cited `kernel/src/task/mod.rs:593` for the IOMMU passt
 line had become a closing brace, the comment having moved to 596. `docs/ahci.md`, `docs/iommu.md`
 and `docs/networking.md` cited the same dead line - the citation had been copied between documents,
 never re-checked. `docs/ahci.md` also cited a supervisor spawn row that had moved,
-`docs/probe-params-design.md` an SDK site, `backlog/20` an ARM guard. FIXED by re-pointing, and
+`docs/probe-params-design.md` an SDK site, `backlog/fixed/20` an ARM guard. FIXED by re-pointing, and
 mostly by citing the NAME instead (`the `confine` flag on `DeviceSpec::Pci`", "the `block-driver`
 row of the supervisor spawn table") - a name greps and does not drift. **Gated**:
 `scripts/line_ref_check.py` is new and now the sixteenth checker. `audits/`, `milestones/` and
@@ -194,7 +194,7 @@ reader counting commands from it would be two short. FIXED in §9.
 
 ### What this audit did not find
 
-No claim in `docs/gsfs-carnage.md`, `docs/gsfs-hardware-pass.md` or `backlog/40-43` was wrong at the
+No claim in `docs/gsfs-carnage.md`, `docs/gsfs-hardware-pass.md` or `backlog/fixed/40-43` was wrong at the
 time of audit - they had been corrected repeatedly during the session that produced them, three
 times by hardware contradicting a number. `utilities/55_background.md` was accurate on every
 detachable command and every refusal, which is what `commandments.py` Commandment X buys. The 33
@@ -1021,7 +1021,7 @@ after it became `cmd_inner` and the trait.
 **Stale after the hardware said otherwise** (documents): `utilities/56_wifi.md` still described a five-second
 power-on wait (300 ms), a ten-second bound (15 s) and warm starts "one in three" (a slow host, gone with the
 clock lease); `services/CLAUDE.md` still said only a power cycle recovers the chip (open, `docs/wifi.md` 56);
-`backlog/66` and `67` still said their fixes were not yet booted; `docs/records.md` counted ten producers
+`backlog/fixed/66` and `67` still said their fixes were not yet booted; `docs/records.md` counted ten producers
 without `wifi list`; `docs/wifi.md` 59 described the `Station` trait as planned rather than as built.
 
 **Recorded, not changed:** the shared crate's log lines say `wifi-driver:`, true while that is the only radio
@@ -1086,7 +1086,7 @@ administered and stands as an invented example.
 (25/100/2000, 800) against their comments; `xhci`'s `MAX_SLICES` 6, the input-context clear, the protocol
 test and Set Hub Depth; no live comment still describes section 38's reverted per-port rebind or ring wrap;
 every `usbfn` opcode and size in the doc's table; the 54 arch-conditional sites in `CLAUDE.md` and
-`docs/porting.md`; `backlog/79` against the code.
+`docs/porting.md`; `backlog/fixed/79` against the code.
 
 **Left as they are:** `docs/wifi-aic8800.md`'s "`serve_radio` waits at most 250 ms" is in dated text and was
 true then (the loop moved to `godspeed_wifi::serve` since). `install_key`'s group arm in `station.rs` still
@@ -1096,7 +1096,7 @@ than an audit.
 ## Audit 10 - documents and code comments, `feat/wifi-driver` since `ff40a6fa` (2026-10-08)
 
 Scope: everything changed since Audit 9 - 14 files: the Pi 2 page-table arena, the radio stand-in, the
-supervisor's name map, `backlog/66` found and fixed, its instruments removed - and everything elsewhere
+supervisor's name map, `backlog/fixed/66` found and fixed, its instruments removed - and everything elsewhere
 those changes made untrue. The second half was the larger. The mechanical gates (`doc_refs`,
 `doc_symbols_check`, `comment_symbol_check`, `facts_check`, `line_ref_check`, `site_check`, `dash_check`,
 `backlog_check`, `docs_index_check`, `foreign_word_check`, `doc_command_check`) were green before and after;
@@ -1117,13 +1117,13 @@ protocol reads a short reply as malformed. `docs/tcp-design.md` is dated text an
 instead of an edit; it also now says the other reason the Pi 2 never showed it - ARM32's check accepted an
 empty range. `nic-driver`'s `serve_status` doc said it answered other requests EMPTY; it answers `[1]`.
 
-**`backlog/66` was read as a lost wake-up for a week, and four documents still said so.**
+**`backlog/fixed/66` was read as a lost wake-up for a week, and four documents still said so.**
 `docs/networking.md`, `backlog/74`, the backlog index row and `docs/wifi-usb.md` section 49 each stated
 or leaned on it; each has a dated correction. `nic-driver`'s `radio.rs` called the held-request collision
-"the three-second ping of `backlog/66`" and `genet.rs` called failed replies "the shape backlog/66 is
+"the three-second ping of `backlog/fixed/66`" and `genet.rs` called failed replies "the shape backlog/fixed/66 is
 chasing"; both now say what 66's DNS failure turned out to be.
 
-**An overclaim of this session's own, caught on the read-back.** `backlog/66`'s status and the first draft
+**An overclaim of this session's own, caught on the read-back.** `backlog/fixed/66`'s status and the first draft
 of these corrections said the empty reply explained the item. It explains what the item had become - `net
 dns` failing over the radio, on drains that found no frame. It does not explain the item's title: a STATUS
 reply is nine bytes and never empty, so the one-second STATUS exchanges of 2026-09-30 had another cause,
@@ -1133,7 +1133,7 @@ entry, the index row and the three corrections that touched it now say exactly t
 **Stale after the code moved (comments):** the supervisor's `record_name_quiet` said an on-demand
 program's cap is "let go here", above the `0a179048` change that holds it until the caller is answered,
 and the reply comment said the supervisor always keeps the original; `docs/wifi-usb.md` section 49 said
-the cap is let go "at once". `net-stack`'s first-attempt log was labelled an INSTRUMENT for `backlog/66`;
+the cap is let go "at once". `net-stack`'s first-attempt log was labelled an INSTRUMENT for `backlog/fixed/66`;
 it is a permanent line that names both halves of an exchange, and says so now.
 
 **Checked and correct, recorded so it is not re-chased:** the Pi 2 arena comments (`L1_TABLES` 32 at 16
@@ -1145,7 +1145,7 @@ supervisor's `tell_radio_of_dongle`; the shell's `UpNotChosen`; the scheduler's 
 is about the idle halt and true; `dispatch.rs`'s `build_message` and `copy_out`.
 
 **Left as they are:** dated narrative that was true when written and is marked as history by its date
-(`docs/wifi.md` 3439, the earlier entries of `backlog/66`). The one-byte replies themselves are left in the
+(`docs/wifi.md` 3439, the earlier entries of `backlog/fixed/66`). The one-byte replies themselves are left in the
 code: they are correct protocol with or without the kernel's refusal, and changing them is a code change,
 not an audit.
 
@@ -1183,7 +1183,7 @@ form, the restarted set as a fixed list, and a note that `events`, `xhci` and `e
 they are, as `MANAGED` members (`services/CLAUDE.md`); section 8 named a test command `osdev test shell`
 does not send. All corrected, and the sample is now marked as the old form beside a real report from the
 T630. `docs/wifi-usb.md` carried the bare form five times in this branch's own records (sections 47 and
-50) and `backlog/02` once as an instruction; every `max-carnage` panel in this session's logs reads
+50) and `backlog/fixed/02` once as an instruction; every `max-carnage` panel in this session's logs reads
 `target: all-services`, and the shell refuses the bare form, so they now say `all-services`. Found while
 writing the T630 test instructions, which gave the bare form and were refused. **A gate finding:**
 `doc_command_check` asks whether a documented subcommand exists, not whether its arguments are ones the
@@ -1207,8 +1207,8 @@ against `utilities/56_wifi.md` (`REJOIN_MIN_SECS` 60, once per drop, through `au
 `Notice::Changed`, and `said` is cleared only with no station up); section 50's counts against its commits.
 
 **Left as they are:** dated records that use the bare form before `0cb8985b` or whose target cannot be
-recovered (`backlog/03`'s 2026-09-06 sighting, `backlog/14`, `backlog/48`, `backlog/57`, and CLAUDE.md's
-2026-08-09 amendment, which is prose, not a command), and `backlog/31`'s `DNS_RX_TRIES`, history of the
+recovered (`backlog/03`'s 2026-09-06 sighting, `backlog/14`, `backlog/fixed/48`, `backlog/57`, and CLAUDE.md's
+2026-08-09 amendment, which is prose, not a command), and `backlog/fixed/31`'s `DNS_RX_TRIES`, history of the
 fix before this one.
 
 ## Audit 12 - the whole branch, documents and code comments, `feat/wifi-driver` since it left `main` (2026-10-08)
@@ -1400,7 +1400,7 @@ index), then one more for findings that crossed areas. About 370 files; document
 
 **The rule this audit ran under, set by the operator mid-pass: an audit of documents and comments
 changes documents and comments.** A code defect it finds is recorded, not fixed. They are in
-`backlog/80` - about ninety, from a kernel syscall that answers a caller without the capability with the
+`backlog/fixed/80` - about ninety, from a kernel syscall that answers a caller without the capability with the
 value for success, to `drives flash` erasing drive 0 on a mistyped label. Verified after the pass: the
 only Rust files whose code tokens differ from HEAD are the six Audit 14 fixes it already records, plus one
 enum variant moved under its own doc in `stdlib/rust/src/error.rs`.
@@ -1418,7 +1418,7 @@ enum variant moved under its own doc in `stdlib/rust/src/error.rs`.
 - **Numbers that drifted** - check counts in `osdev/CLAUDE.md`, buffer sizes in the shell (16 KiB
   where the code says 12), the InspectKernel query count, ring and reply sizes, probe sample counts.
 - **Specs that described the plan, not the build** - the utility specs had samples from before
-  `init`/`registry` were removed, and seven commands claimed a `q` that no longer exists (backlog/80 H16).
+  `init`/`registry` were removed, and seven commands claimed a `q` that no longer exists (backlog/fixed/80 H16).
 
 **Constitution findings, for the operator - not edited** (CLAUDE.md and COMMANDMENTS.md change only by
 amendment with a rationale):
@@ -1438,7 +1438,7 @@ amendment with a rationale):
   every other core having switched CR3.
 - 11.4, 2026-09-04 amendment: "no log line has ever been sent to `events`" - `events` now keeps an 8 KiB
   copy (`TRACE_OP_LOG`, `events log`); the property that logging does not depend on it still holds.
-- 12.3: `DevicePower` answers a caller without the capability with its success value (backlog/80 K3).
+- 12.3: `DevicePower` answers a caller without the capability with its success value (backlog/fixed/80 K3).
 - 19: the NMI broadcast is x86 only (the others use a `PANIC_HALT` flag), and the panic reason also
   reaches the framebuffer and the ring, not serial only.
 - 22: F2's `UnknownSyscall` does not exist (an unknown syscall returns -1); 22.3 says Tests 11 and 15

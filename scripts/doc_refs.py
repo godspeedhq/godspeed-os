@@ -21,7 +21,7 @@ WHAT IS DELIBERATELY EXEMPT, and why it is not a loophole:
 SCOPE, stated so a pass is not read as wider than it is. Paths are checked only in the PATTERNS files
 below - which include CLAUDE.md's body, COMMANDMENTS.md, CONTRIBUTING.md, SECURITY.md, examples/**,
 tests/** (not tests/conformance/, the fixture corpus), osdev/CLAUDE.md and kernel/CLAUDE.md since
-2026-10-10 (backlog/80 T8), but not backlog/*.md, whose entries are dated records - only when
+2026-10-10 (backlog/fixed/80 T8), but not backlog/*.md, whose entries are dated records - only when
 BACKTICKED, and only with a .rs/.md/.toml/.py/.json/.gsh extension: a directory or a `.sh`/`.ps1`/
 `.txt` path is never checked. `backlog/NN` citations
 are checked over PATTERNS plus SOURCE_PATTERNS plus backlog/README.md.
@@ -49,7 +49,7 @@ PATTERNS = [
     "website/src/*.md",
     "README.md",
     "GETTING_STARTED.md",
-    # Added 2026-10-10 (backlog/80 T8): the constitution, the other top-level documents, the two
+    # Added 2026-10-10 (backlog/fixed/80 T8): the constitution, the other top-level documents, the two
     # CLAUDE.md files this list had missed, and every example and test document. A dead path in any of
     # them passed, though each is read as current. CLAUDE.md's dated amendments are ratified history
     # that names files they removed, so its blockquoted lines are skipped (`current_text`) and only
@@ -78,18 +78,20 @@ def current_text(rel, text):
 
 PATHISH = re.compile(r"`([A-Za-z0-9_./-]+/[A-Za-z0-9_./-]+\.(?:rs|md|toml|py|json|gsh))`")
 
-# A BACKLOG CITATION BY NUMBER: `backlog/33`, which is how every one of them is referenced.
+# A BACKLOG CITATION BY NUMBER: `backlog/34`, which is how every one of them is referenced.
 #
 # Two reasons this needs its own pattern and its own scan. It has NO EXTENSION, so `PATHISH` cannot
 # see it - that regex requires one. And it is cited from CODE COMMENTS at least as often as from
 # documents, which nothing scanned at all.
 #
-# Both halves mattered: `services/fs/src/main.rs` cited `backlog/33` for a filesystem limitation, the
+# Both halves mattered: `services/fs/src/main.rs` cited `backlog/fixed/33` for a filesystem limitation, the
 # file did not exist, and the citation read as though the limitation had been recorded. That is the
 # exact failure 26.7 names - a recorded limitation is one the next person can plan around, an
 # unrecorded one is discovered by whoever trusted the document - and it was invisible to every gate
 # this project has.
 BACKLOG_REF = re.compile(r"`?backlog/(\d+)`?")
+# ...and a FIXED entry, moved to `backlog/fixed/` with its number kept (2026-10-13).
+FIXED_REF = re.compile(r"`?backlog/fixed/(\d+)`?")
 
 # Source trees whose COMMENTS cite backlog entries. Only the backlog check runs over these: scanning
 # source for `PATHISH` would match path-shaped string literals and produce noise, and a wrong finding
@@ -106,10 +108,13 @@ SOURCE_PATTERNS = [
 ]
 
 
-def backlog_entries():
-    """The numbers that actually exist: `backlog/29-some-title.md` -> "29"."""
+def backlog_entries(sub=""):
+    """The numbers that actually exist: `backlog/fixed/29-the-wyse-tcp-big-that-never-left-the-shell.md` -> "29"."""
     found = set()
-    for f in os.listdir(os.path.join(ROOT, "backlog")):
+    d = os.path.join(ROOT, "backlog", sub)
+    if not os.path.isdir(d):
+        return found
+    for f in os.listdir(d):
         m = re.match(r"^(\d+)-.*\.md$", f)
         if m:
             found.add(m.group(1))
@@ -119,6 +124,7 @@ def backlog_entries():
 def check_backlog_refs():
     """Every `backlog/NN` cited anywhere must name an entry that exists. Returns a list of misses."""
     have = backlog_entries()
+    have_fixed = backlog_entries("fixed")
     misses = []
     files = []
     for pat in PATTERNS + SOURCE_PATTERNS:
@@ -135,6 +141,9 @@ def check_backlog_refs():
         for n in set(BACKLOG_REF.findall(text)):
             if n not in have:
                 misses.append((rel, n))
+        for n in set(FIXED_REF.findall(text)):
+            if n not in have_fixed:
+                misses.append((rel, "fixed/" + n))
     return misses
 
 # Paths named by prose that is ABOUT their removal. Listed one by one rather than matched by a
@@ -144,7 +153,7 @@ def check_backlog_refs():
 HISTORICAL = {
     # Named in order to say they do NOT exist: CLAUDE.md A.7 ("was listed here and in §5 but was never
     # written") and kernel/CLAUDE.md ("`kernel/src/control.rs` **does not exist**"). Both files came into
-    # this scan on 2026-10-10 (backlog/80 T8), and each sentence is the correction, not the drift.
+    # this scan on 2026-10-10 (backlog/fixed/80 T8), and each sentence is the correction, not the drift.
     "docs/bootstrap.md",
     "kernel/src/control.rs",
     # The ARM USB stack moved to `services/dwc2`; these three docs are the record of that move, and

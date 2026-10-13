@@ -1,5 +1,6 @@
 [package]
 name = "supervisor"
+description = "Starts, watches and restarts every service, and holds their names"
 version = "0.1.0"
 edition = "2021"
 

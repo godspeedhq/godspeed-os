@@ -6,7 +6,7 @@ Task management and per-core scheduler (§9, §14).
 
 | File            | Responsibility |
 |-----------------|---------------|
-| `mod.rs`        | `spawn_supervisor()` (the kernel's one direct spawn - init removed, Phase 5), `spawn_from_image()` (every other spawn, from the supervisor's `SpawnImage` request), `kill_current()`, the kernel stack pool, `privbits` / `privileges_caller_lacks` / `SUPERVISOR_DELEGATABLE` |
+| `mod.rs`        | `spawn_supervisor()` (the kernel's one direct spawn - init removed, Phase 5), `spawn_from_image()` (every other spawn, from the supervisor's `SpawnImage` request), `kill_current(kind, addr)`, `death` / `Cause` (how a task ended), the kernel stack pool, `privbits` / `privileges_caller_lacks` / `SUPERVISOR_DELEGATABLE` |
 | `state.rs`      | `TaskState` enum: Ready, Running, BlockedOnRecv, BlockedOnSend, Dead |
 | `scheduler.rs`  | `run()` (never returns), `timer_tick_from_irq()`, `yield_current()`, `block_and_reschedule()`, `wake_by_slot()`, `kill_task_by_slot()`, `drain_pending_kstack()` |
 
@@ -15,7 +15,7 @@ Task management and per-core scheduler (§9, §14).
 > `task/mod.rs::resolve_spawn_core`) and `memory::ownership::reclaim_all` (the live kill-path reclaim is
 > `arch/x86_64/page_tables.rs::reclaim_user_frames`). The steps below name the live functions; the dead
 > ones, with an unconstructed `Task` struct and `TaskId` in `task.rs`, were deleted 2026-10-10
-> (`backlog/80` K20).
+> (`backlog/fixed/80` K20).
 
 ## Static placement invariant (§9.1)
 
@@ -39,11 +39,11 @@ The 10 ms quantum is enforced by each core's local timer (the local APIC on x86-
 
 ## Kill flow (§14.4)
 
-`kill_current()` (a fault) and the `kill` syscall both reach `scheduler::kill_task_by_slot`, which:
+`kill_current(kind, addr)` (a fault) and the `kill` syscall both reach `scheduler::kill_task_by_slot`, with a `Cause` - the fault's kind and address, or the slot of the task that called `kill` - which:
 1. Sets the task's state to Dead.
 2. Kills its endpoints (`ipc::routing::kill_endpoint`), wakes blocked senders/receivers with `EndpointDead` and blocked `Call`ers with `ReplyDead`, and marks the resources dead in the capability table.
 3. Waits until no other core is still running the task, then reclaims its user frames (`arch::imp::page_tables::reclaim_user_frames`) - **skipping the PML4 frame** on the self-kill path (see below).
-4. Notifies the supervisor via its death-notification endpoint **only if the task was spawned `SPAWN_FLAG_WATCHED`**; if the dead task is the supervisor itself, flags the kernel's respawn of it instead (§6.2).
+4. Notifies the supervisor via its death-notification endpoint **only if the task was spawned `SPAWN_FLAG_WATCHED`** - the name, a NUL, and how it ended (`task::death`, CLAUDE.md 6.2 amendment 2026-10-11); if the dead task is the supervisor itself, flags the kernel's respawn of it instead (§6.2).
 5. Returns to the scheduler, which picks another task.
 
 ## Deferred PML4 free (self-kill path)

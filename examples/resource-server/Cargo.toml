@@ -1,5 +1,6 @@
 [package]
 name = "resource-server"
+description = "Example: mints delegated resource capabilities, as fs does for files"
 version = "0.1.0"
 edition = "2021"
 

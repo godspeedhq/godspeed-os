@@ -160,7 +160,7 @@ Raspberry Pi 2. This item is the residue - the release now exists and usually wo
 ## MEASURED at last: 22 s and 79 s blocks, on an unconfigured stack (2026-09-16)
 
 This item has always described the blocking dance qualitatively - "blocks this service while it runs",
-"seconds". The slow-pass report added for `backlog/29` puts numbers on it, and they are worse than the
+"seconds". The slow-pass report added for `backlog/fixed/29` puts numbers on it, and they are worse than the
 prose suggested. RISC-V under QEMU, which emulates **no NIC at all**, so the stack never configures:
 
 ```
@@ -171,7 +171,7 @@ net-stack: a serve pass took 22482 ms (over 1000) - ...                         
 ```
 
 No panic, no wedge, and no dropped requests - nothing was asking during it. But a client that HAD asked
-would wait out its entire patience and be dropped, correctly and uselessly: **`backlog/29`'s fix cannot
+would wait out its entire patience and be dropped, correctly and uselessly: **`backlog/fixed/29`'s fix cannot
 help here, because no plausible client deadline survives a 79 second block.** That is the honest limit
 of that work, and it is why the incremental dance remains the real fix rather than a nicety.
 

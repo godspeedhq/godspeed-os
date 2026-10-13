@@ -4,7 +4,7 @@
 
 WHO HONOURS IT TODAY: `line_ref_check.py` (GS0404) and nothing else - `HONOURED` below. A
 `conform-ok` naming any other code suppresses NOTHING, and since 2026-10-10 it is REFUSED and fails
-the build, reported by `line_ref_check.py`, which reads every marker in the tree (backlog/80 T8).
+the build, reported by `line_ref_check.py`, which reads every marker in the tree (backlog/fixed/80 T8).
 Before, it was silently ignored. "One marker" is the design; one consumer is the state.
 
 WHY THIS EXISTS. A document that writes ABOUT a violation contains one, and there was no way to say
@@ -50,7 +50,7 @@ import re
 MARKER = re.compile(r"<!--\s*conform-ok:\s*([A-Za-z0-9 ,]+?)\s*-\s*(.*?)\s*-->")
 
 # THE CODES SOME CHECKER ACTUALLY HONOURS, and which one. A marker naming any other code suppresses
-# nothing, and until 2026-10-10 it was not reported either (backlog/80 T8): a contributor writing
+# nothing, and until 2026-10-10 it was not reported either (backlog/fixed/80 T8): a contributor writing
 # `conform-ok: GS0402` would believe a site exempt that is still checked - or worse, one that passes for
 # another reason and would be read as excused. Such a marker is now REFUSED like one with no reason.
 # A checker that starts honouring markers adds its code here.

@@ -272,7 +272,7 @@ fn realtek_main(ctx: ServiceContext) -> ! {
         None => { ctx.log("nic-driver: RTL8168 found but no MMIO mapped - serving empty replies"); serve_status(&ctx, &[0u8; 8]); }
     };
     // STOP THE CHIP BEFORE RESETTING IT, and say why, because this driver did not and it cost a
-    // network that never came back from a chaos storm (backlog/19).
+    // network that never came back from a chaos storm (backlog/fixed/19).
     //
     // A respawned driver does NOT meet an idle controller. The kernel's kill path clears PCI
     // Bus-Master-Enable, which stops NEW DMA but leaves the chip with Rx/Tx still enabled in CR and
@@ -837,7 +837,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
 const E1000_82540EM: u32 = 0x100E_8086;
 
 /// The granted register window, if the controller behind it is the e1000 this driver knows - and,
-/// when it is not, a line naming what it is instead (backlog/80 D2). It asks the DEVICE, so it needs
+/// when it is not, a line naming what it is instead (backlog/fixed/80 D2). It asks the DEVICE, so it needs
 /// no ISA test: only x86 reaches the e1000 path, every other port's backend having diverged first.
 fn known_e1000(ctx: &ServiceContext, mmio: Option<godspeed_sdk::Mmio>) -> Option<godspeed_sdk::Mmio> {
     let vd = ctx.nic_vendor_device();
@@ -1264,7 +1264,7 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             //
             // The kernel rejected a zero-length send outright - `validate_user_ptr` returned false for
             // `len == 0`, so `build_message` failed and the reply never left (it accepts one on every
-            // port since `e3fcf7ed`, `backlog/66`). The caller then waited out its whole deadline for
+            // port since `e3fcf7ed`, `backlog/fixed/66`). The caller then waited out its whole deadline for
             // an answer that was never on the wire. Measured on hardware:
             // every ping cost `nic-driver gave NO ANSWER after 2012 ms (budget 1 s) for op 0 [why -1]`
             // - two attempts timing out - while the ICMP round trip itself took 66 ms. The ping was
@@ -1351,7 +1351,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // --- Intel e1000 path. The kernel maps the BAR + DMA arena of whatever ethernet controller
     // (PCI class 0x020000) it found, and this path drives it ONLY if it is the part this code was
     // written and tested against: the 82540EM, `8086:100E`, QEMU's `e1000`. Until 2026-10-10 anything
-    // that was not the RTL8168 above was driven as an e1000 unchecked (backlog/80 D2) - an e1000e or a
+    // that was not the RTL8168 above was driven as an e1000 unchecked (backlog/fixed/80 D2) - an e1000e or a
     // NIC of another maker would have been programmed with registers it does not have. Anything else
     // is now NOT driven, and said so with its identity. With no window, no arena or an unknown part we
     // still SERVE the frame interface - with empty replies, link down - so net-stack degrades instead of

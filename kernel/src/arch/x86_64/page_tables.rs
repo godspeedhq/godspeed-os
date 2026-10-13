@@ -175,7 +175,7 @@ impl PageTable {
     /// Unmap the page at `virt` and return the physical frame it pointed to.
     /// Invalidates nothing. Only selftests call it; a caller that unmaps a page another core may have
     /// cached owes that core an invalidate before the frame is reused (§10.5), and the kernel has no
-    /// cross-core mechanism for that today because nothing unmaps a live mapping (`backlog/80` K20).
+    /// cross-core mechanism for that today because nothing unmaps a live mapping (`backlog/fixed/80` K20).
     pub fn unmap(&mut self, virt: VirtAddr) -> Result<Frame, MapError> {
         let va = virt.0;
         let root_phys = self.root.phys_addr().0;

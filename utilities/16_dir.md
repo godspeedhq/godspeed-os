@@ -197,7 +197,7 @@ the `name`/`type`/`size`/`sealed` table for the record pipe (`is_record_producer
 
 Both walk the reply through a `DirCursor`, because one reply block carries only about twenty
 entries: the request says which entry to resume at and the reply says where to continue, so a
-directory of any size is listed in full (`backlog/33`). The count `dir` prints is therefore the
+directory of any size is listed in full (`backlog/fixed/33`). The count `dir` prints is therefore the
 number of entries it actually rendered, and it is printed LAST - the total is not known until the
 walk ends, and a header that can disagree with the rows under it is the wrong answer this whole
 mechanism exists to remove. An empty directory prints `(empty)`. The walk is bounded at

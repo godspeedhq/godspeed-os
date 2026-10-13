@@ -23,7 +23,7 @@
 //!   5. Runs the main loop - death notices, operator commands, USB device reports - forever.
 //!
 //! This header said "Non-restartable" and "Yields indefinitely (death-notification restart loop
-//! deferred to Phase 6)". Phase 6 shipped: the loop is ~1,400 lines below, and the supervisor is the
+//! deferred to Phase 6)". Phase 6 shipped: the loop is near the end of `service_main`, and the supervisor is the
 //! worked example of §6.2. Someone reading this file to learn the restart model was told the opposite
 //! of the system.
 //!
@@ -36,7 +36,7 @@
 use godspeed as gs;
 use godspeed_sdk::{ServiceContext, CapHandle, ipc::Message};
 use godspeed_sdk::service_context::DeadlineOutcomeInto;
-use godspeed_sdk::service_context::supcmd;
+use godspeed_sdk::service_context::{death, supcmd};
 use godspeed_sdk::service_context::usbdev;
 
 // The probe parameter table is ONE file, shared by source with the other principal that spawns probes
@@ -49,7 +49,8 @@ use godspeed_sdk::service_context::usbdev;
 //
 // The supervisor's endpoint now receives TWO kinds of message, told apart by the first byte:
 //
-//   death notice   "pong"                        <- kernel-generated; a service name, [a-z0-9-]
+//   death notice   "pong" 0x00 'K' "shell"       <- kernel-generated; a service name, [a-z0-9-], a NUL,
+//                  "pong" 0x00 'F' <kind> <addr>    then how it ended (`death`; addr is u64 LE)
 //   command        0x01 'R' <core u32 LE> "pong" <- 0x01 cannot begin a name, so this is unambiguous
 //
 // Why a command channel exists at all: `control` used to do `kill` then `spawn` ITSELF, asking the
@@ -89,6 +90,13 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     } else if payload.len() == 2 && payload[1] == supcmd::EVENTS {
         body_len = events.answer(&mut body);
         supcmd::OK
+    } else if payload.len() > 2 && payload[1] == supcmd::DEATH {
+        let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        body_len = events.death_answer(name, &mut body);
+        supcmd::OK
+    } else if payload.len() == 2 && payload[1] == supcmd::MANAGED {
+        body_len = managed_answer(map, usb, &mut body);
+        supcmd::OK
     } else if payload.len() > 2 && payload[1] == supcmd::WHY {
         let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
         match DEVICE_WHY.iter().find(|(n, _)| *n == name) {
@@ -108,7 +116,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
             // `name` may carry a NUL-separated PEER LIST after it, exactly as SpawnRequest's payload
             // does: `producer\0sink` is how a pipe arrives. A pipe is not a special kind of spawn -
             // it is a spawn whose producer is given its downstream as a peer, which is precisely what
-            // the kernel's by-name pipe spawn did before it was retired (backlog/80 K14).
+            // the kernel's by-name pipe spawn did before it was retired (backlog/fixed/80 K14).
             Ok(spec) if !spec.is_empty() => {
                 let mut it = spec.split('\0');
                 let name = match it.next() { Some(n) if !n.is_empty() => n, _ => return true };
@@ -153,7 +161,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
                             Some(Ok(c))  => { spawned_cap = c; true }
                             Some(Err(_)) => false,
                             // No image here means no way to start it: the kernel's by-name pipe spawn
-                            // (SpawnPipe) was retired, and could only ever refuse (backlog/80 K14).
+                            // (SpawnPipe) was retired, and could only ever refuse (backlog/fixed/80 K14).
                             None         => {
                                 ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
                                 false
@@ -284,6 +292,7 @@ static HW_ENUMERATOR_ELF: &[u8] = include_bytes!(env!("SVC_HW_ENUMERATOR_ELF"));
 static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
 static RECORDER_ELF: &[u8] = include_bytes!(env!("SVC_RECORDER_ELF"));
 static COPIER_ELF: &[u8] = include_bytes!(env!("SVC_COPIER_ELF"));
+static ASK_ELF: &[u8] = include_bytes!(env!("SVC_ASK_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -403,6 +412,36 @@ mod board {
     /// the board that has it, `xhci` on the others (U2a).
     pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
 
+    /// `ask`'s send peers (`docs/ask-design.md`): the shell for its answer, the supervisor for its
+    /// read-only questions, `fs` and `block-driver` for storage, then the ONE USB host this board's disk
+    /// is behind and the ONE radio driver it runs - six at most, the kernel's `MAX_SEND_PEERS`, which is
+    /// why it is chosen per board rather than listing every host and radio. The Pi 2's disk is behind
+    /// `dwc2` and its radio is the dongle; the Pi 4's and the VisionFive's are behind `xhci` with an
+    /// onboard radio; a PC's disk is AHCI, which `block-driver` drives itself, so it needs no host, and
+    /// its radio is the dongle. Where the dongle runs beside an onboard radio (the Pi 4), the onboard one
+    /// is the one asked. Flat, because `contract_check.py` reads this chain as text.
+    pub const ASK_PEERS: &[&str] = if cfg!(has_dwc2) {
+        &["shell", "supervisor", "fs", "block-driver", "dwc2", "wifi-usb"]
+    } else if cfg!(has_wifi_driver) {
+        &["shell", "supervisor", "fs", "block-driver", "xhci", "wifi-driver"]
+    } else {
+        &["shell", "supervisor", "fs", "block-driver", "wifi-usb"]
+    };
+
+    /// `ask-net`'s send peers: the same program as `ask`, started for a NETWORK question, so it gets the
+    /// peers that question needs - the shell, the supervisor, `net-stack`, and the board's radio driver -
+    /// instead of the storage chain's. Two rows because the kernel gives a task at most six send peers
+    /// (`MAX_SEND_PEERS`) and one row for every question would need seven; `observe`, `observe-now` and
+    /// `observe-live` are the same shape. The shell chooses the row by reading the question with `ask`'s
+    /// own `know.rs`, so the two cannot disagree about which question it is.
+    pub const ASK_NET_PEERS: &[&str] = if cfg!(has_dwc2) {
+        &["shell", "supervisor", "net-stack", "wifi-usb"]
+    } else if cfg!(has_wifi_driver) {
+        &["shell", "supervisor", "net-stack", "wifi-driver"]
+    } else {
+        &["shell", "supervisor", "net-stack", "wifi-usb"]
+    };
+
     /// `copier`'s send peers: `fs` for the files it copies, and the board's audio driver for the "done"
     /// sound a finished job makes (`docs/audio.md`, "System sounds") - `audio-driver` on the PCs,
     /// `pwm-audio` on the Pis, none on the VisionFive, which has no audio output. Flat, for the reason
@@ -492,6 +531,14 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // what it was copying, so it would be alive and copying nothing while `jobs` said running.
     ("copier", COPIER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024,
      u32::MAX, board::COPIER_PEERS, 0, 0, 0),
+    // NOT in the boot set and not in `MANAGED`: the shell starts it for ONE question and ends it once
+    // the answer is in (`docs/ask-design.md`). It reads only - INTROSPECT for the task table, and the
+    // board's `ASK_PEERS`. The shell passes no peers of its own, so every grant is this row's, pinned.
+    ("ask-net", ASK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX,
+     board::ASK_NET_PEERS, godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
+    ("ask", ASK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX,
+     board::ASK_PEERS,
+     godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
@@ -535,7 +582,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // `stdlib-hello` writes and reads a file through `gs::fs`, so it is WIRED to fs like `counter`
     // is - and, like `counter`, it needs its OWN endpoint (REQ_RECV) for `fs`'s replies to land on.
     // It had none until 2026-10-10, so every call came back `Unreachable` and the test passed on
-    // the program saying `done` (`backlog/80` E1).
+    // the program saying `done` (`backlog/fixed/80` E1).
     #[cfg(feature = "examples-test")]
     ("stdlib-hello", STDLIB_HELLO_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0, 0),
     // `cap-grant` needs its OWN endpoint (REQ_RECV) so `gs::cap::self_grant` has something to hand
@@ -929,7 +976,7 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godsp
 // ───────────────────────────────────────────────────────────────────────────────
 // Bounded (§26.6) - real services, not the test probes. 16 until 2026-10-10, which was EXACTLY full on
 // the Pi 4 and on x86 with the WiFi dongle attached, so the next service a board gained would have been
-// dropped from the map and never rewired after a restart (`backlog/80` V8). 24 gives that headroom;
+// dropped from the map and never rewired after a restart (`backlog/fixed/80` V8). 24 gives that headroom;
 // `record_name` still says so loudly if it is ever reached.
 const NAME_MAP_MAX:      usize = 24;
 const NAME_MAP_NAME_MAX: usize = 16;
@@ -1042,7 +1089,7 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
         };
     }
     // No image for it: nothing can start it. The kernel's by-name spawn with installs (SpawnWithCaps)
-    // was retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/80 K14).
+    // was retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/fixed/80 K14).
     ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
     false
 }
@@ -1107,7 +1154,7 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
         };
     }
     // No image for it: nothing can start it. The kernel's by-name spawn (SpawnReturningEndpoint) was
-    // retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/80 K14).
+    // retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/fixed/80 K14).
     ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
     false
 }
@@ -1355,6 +1402,9 @@ fn is_watched(name: &str) -> bool {
 ///
 /// Bounded (26.6): the newest `DEV_EVENTS` are kept, `recorded` counts every one, so a reader knows how
 /// many were overwritten. Volatile: a respawned supervisor starts an empty record, and says from when.
+///
+/// The same struct also keeps `deaths`, which is NOT device-only: the newest death notice of every
+/// watched service, for `supcmd::DEATH` (2026-10-11). It shares `since`, so both answers say from when.
 const DEV_EVENTS: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -1371,12 +1421,99 @@ struct DevEvents {
     ring: [DevEvent; DEV_EVENTS],
     recorded: u32,
     since: u32,
+    /// How each watched service last ended, as the kernel said in its death notice - the newest per
+    /// name, for `supcmd::DEATH`. Bounded (26.6): `DEATHS` names; when full, the oldest entry goes.
+    deaths: [Death; DEATHS],
+}
+
+/// How many services' last deaths are kept - more than the `MANAGED` roster, so it does not cycle.
+const DEATHS: usize = 32;
+
+/// One service's newest death notice: when, how many, and how (the kernel's words, `death`).
+#[derive(Clone, Copy)]
+struct Death {
+    name: [u8; 16],
+    nlen: u8,
+    count: u32,
+    secs: u32,
+    how: u8,
+    kind: u8,
+    addr: u64,
+    by: [u8; 16],
+    blen: u8,
 }
 
 impl DevEvents {
     fn new(ctx: &ServiceContext) -> Self {
         let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; 16], nlen: 0 };
-        DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32 }
+        let none = Death { name: [0; 16], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32,
+                    deaths: [none; DEATHS] }
+    }
+
+    /// Keep how `name` ended: `how` is the notice after its NUL - `K` and the killer's name, or `F`, a
+    /// fault kind and the address. A notice without it (none should arrive) is kept as `how` 0.
+    fn note_death(&mut self, ctx: &ServiceContext, name: &str, how: &[u8]) {
+        let nb = name.as_bytes();
+        let nl = nb.len().min(16);
+        let secs = gs::task::uptime_secs(ctx).max(0) as u32;
+        // This name's entry, else an empty one, else the oldest.
+        let i = match self.deaths.iter().position(|d| d.nlen as usize == nl && d.name[..nl] == nb[..nl]) {
+            Some(i) => i,
+            None => match self.deaths.iter().position(|d| d.nlen == 0) {
+                Some(i) => i,
+                None => {
+                    let mut o = 0usize;
+                    for (k, d) in self.deaths.iter().enumerate() { if d.secs < self.deaths[o].secs { o = k; } }
+                    self.deaths[o].count = 0;
+                    o
+                }
+            },
+        };
+        let d = &mut self.deaths[i];
+        d.name = [0; 16];
+        d.name[..nl].copy_from_slice(&nb[..nl]);
+        d.nlen = nl as u8;
+        d.count = d.count.wrapping_add(1);
+        d.secs = secs;
+        d.how = 0; d.kind = 0; d.addr = 0; d.blen = 0;
+        match how.first() {
+            Some(&death::KILLED) => {
+                d.how = death::KILLED;
+                let b = &how[1..];
+                let bl = b.len().min(16);
+                d.by = [0; 16];
+                d.by[..bl].copy_from_slice(&b[..bl]);
+                d.blen = bl as u8;
+            }
+            Some(&death::FAULT) if how.len() >= 10 => {
+                d.how = death::FAULT;
+                d.kind = how[1];
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&how[2..10]);
+                d.addr = u64::from_le_bytes(a);
+            }
+            _ => {}
+        }
+    }
+
+    /// `[OK, since, deaths, secs, how, kind, addr, by_len, by...]`, as `supcmd::DEATH` documents.
+    fn death_answer(&self, name: &str, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+        let nb = name.as_bytes();
+        let nl = nb.len().min(16);
+        let none = Death { name: [0; 16], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        let d = self.deaths.iter().find(|d| d.nlen != 0 && d.nlen as usize == nl && d.name[..nl] == nb[..nl])
+            .copied().unwrap_or(none);
+        out[0] = supcmd::OK;
+        out[1..5].copy_from_slice(&self.since.to_le_bytes());
+        out[5..9].copy_from_slice(&d.count.to_le_bytes());
+        out[9..13].copy_from_slice(&d.secs.to_le_bytes());
+        out[13] = d.how;
+        out[14] = d.kind;
+        out[15..23].copy_from_slice(&d.addr.to_le_bytes());
+        out[23] = d.blen;
+        out[24..24 + d.blen as usize].copy_from_slice(&d.by[..d.blen as usize]);
+        24 + d.blen as usize
     }
 
     /// Note an event for `name`, if `name` drives a device - every other service's life is not a
@@ -1416,6 +1553,27 @@ impl DevEvents {
         out[9] = count;
         n
     }
+}
+
+/// The `MANAGED` services this supervisor keeps running now: `[OK, count, (len, name)*]`
+/// (`supcmd::MANAGED`). Exactly the set the reconcile sweep restarts - a name it has an image and a cap
+/// for, and wants (a USB device's driver only while its device is attached) - so `ask` calls a service
+/// down by the same rule the supervisor would bring it back by.
+fn managed_answer(map: &NameCapMap, usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+    out[0] = supcmd::OK;
+    let mut n = 2usize;
+    let mut count = 0u8;
+    for name in MANAGED.iter() {
+        if map.get(name).is_none() || !usb.wanted(name) { continue; }
+        let b = name.as_bytes();
+        if n + 1 + b.len() > out.len() { break; }
+        out[n] = b.len() as u8;
+        out[n + 1..n + 1 + b.len()].copy_from_slice(b);
+        n += 1 + b.len();
+        count += 1;
+    }
+    out[1] = count;
+    n
 }
 
 /// Does `name` drive a device - a spawn row that names one, or a USB device's driver?
@@ -1785,7 +1943,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // On a supervisor RESPAWN `events` is usually still alive, and is ADOPTED rather than spawned a
     // second time. Through `ensure_mapped`, so the adoption has its `name_alive` gate: this adopted
     // whatever cap the name directory handed back, so an `events` that died while the supervisor was
-    // down was adopted dead and recovered only later, by `converge` (`backlog/80` V8).
+    // down was adopted dead and recovered only later, by `converge` (`backlog/fixed/80` V8).
     if !ensure_mapped(&ctx, &mut name_map, "events", 0xFFFF) {
         // Through the image table: the supervisor carries events's image now, and it does not route
         // through itself (no supervisor-peer), so `ctx.spawn` would take the kernel path and find
@@ -1883,7 +2041,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     // From its own image, as every other service is: `ctx.spawn` asks the supervisor - this task - or
     // the kernel, whose catalogue holds only the supervisor, and its result was discarded, so this line
-    // started nothing and said nothing (`backlog/80` V6).
+    // started nothing and said nothing (`backlog/fixed/80` V6).
     if !spawn_mapped(&ctx, &mut name_map, "observe", 0xFFFF) {
         ctx.log("supervisor: observe did not start - see the spawn line above");
     }
@@ -1900,7 +2058,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // block-driver. An attribute applies to the next STATEMENT and comments do not end it, so it gated
     // `time` instead: the full QEMU build and the perf, stress, adversarial, chaos and fuzz builds never
     // started the clock. It was removed rather than moved, because every build has started block-driver
-    // all along and its suites run with it (`backlog/77`, `backlog/80` V5). block-driver's placement is
+    // all along and its suites run with it (`backlog/fixed/77`, `backlog/fixed/80` V5). block-driver's placement is
     // its IMAGES row's `board::BLOCK_CORE`, read by both the boot and the restart paths.
     //
     // time + control: started BEFORE the shell, because the shell asks `time` for the clock source on
@@ -2137,7 +2295,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // A `#[cfg(not(any(identity-only, perf-only, ...)))]` sat here until 2026-10-10, meant for
     // nic-driver; it gated the next STATEMENT, which was the `wifi-driver` spawn far below. Removed: no
     // x86 test build embeds `wifi-driver`, so it changed nothing there, and `nic-driver` has started in
-    // every build all along (`backlog/80` V5).
+    // every build all along (`backlog/fixed/80` V5).
     //
     // ADOPT if already running, like every other managed service. These two used `spawn_*`
     // directly, which always tries to SPAWN - so on a supervisor respawn the kernel refused
@@ -2263,6 +2421,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
 }
 
+/// How a task ended, for the "died, restarting" line: ` - killed by <task>` or ` - <kind> fault at <addr>`.
+struct How<'a>(&'a [u8]);
+impl core::fmt::Display for How<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self.0.first() {
+            Some(&death::KILLED) => write!(f, " - killed by {}", core::str::from_utf8(&self.0[1..]).unwrap_or("?")),
+            Some(&death::FAULT) if self.0.len() >= 10 => {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&self.0[2..10]);
+                let kind = match self.0[1] {
+                    death::F_MEMORY => "memory", death::F_INSTRUCTION => "instruction fetch",
+                    death::F_ILLEGAL => "illegal instruction", death::F_PROTECTION => "protection",
+                    death::F_ALIGNMENT => "alignment", _ => "CPU",
+                };
+                write!(f, " - {} fault at {:#x}", kind, u64::from_le_bytes(a))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// One message on the supervisor's endpoint: an operator command, or a death notification. Taken out of
 /// the main loop so the loop can drain its queue before the reconcile sweep (see there).
 fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, msg: &Message) {
@@ -2274,7 +2453,12 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
     }
     // A command, or a death notification? The first byte decides (see supcmd::MARKER).
     if handle_command(ctx, name_map, usb, events, msg.payload_bytes()) { return; }
-    let name = core::str::from_utf8(msg.payload_bytes()).unwrap_or("");
+    // The notice is the name, a NUL, and how the task ended (`death`): the kernel says how; this keeps the
+    // newest per name for `supcmd::DEATH`, whatever happens to the restart below.
+    let p = msg.payload_bytes();
+    let (nb, how) = match p.iter().position(|&b| b == 0) { Some(z) => (&p[..z], &p[z + 1..]), None => (p, &p[p.len()..]) };
+    let name = core::str::from_utf8(nb).unwrap_or("");
+    if !name.is_empty() && is_watched(name) { events.note_death(ctx, name, how); }
     // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
     // ALREADY respawned this service before its queued death notification reached us. If it is
     // already alive, a restart here hits the kernel singleton guard ("already running") and logs a
@@ -2315,7 +2499,7 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
         return;
     }
     if !name.is_empty() && is_watched(name) {
-        ctx.log_fmt(format_args!("supervisor: {} died, restarting", name));
+        ctx.log_fmt(format_args!("supervisor: {} died, restarting{}", name, How(how)));
         if respawn_retry(ctx, name_map, name) {
             ctx.log_fmt(format_args!("supervisor: {} restarted", name));
             events.note(ctx, supcmd::EV_RESTARTED, name, 0, 0);

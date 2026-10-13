@@ -173,20 +173,20 @@ number. That is recorded here rather than discovered later.
 
 ### Re-verified end to end after the queue-latency work (2026-09-16)
 
-All five boards above were measured before `backlog/29` - three defects that made a command take
+All five boards above were measured before `backlog/fixed/29` - three defects that made a command take
 twenty seconds rather than fail, so the transaction numbers were right and the time to START one was
 not. Re-run on the two x86 boards after the fix:
 
 | board | `tcp ... big`, dispatch to reply | queue wait before dispatch | selfcheck |
 |---|---|---|---|
-| Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | **ran 461, failed 0** (see `backlog/31`) |
+| Dell Wyse 5070 | 189 / 252 ms | under 20 ms (was ~20 s) | **ran 461, failed 0** (see `backlog/fixed/31`) |
 | HP T630 | 159 ms | under 20 ms | **ran 461, failed 0** |
 | StarFive VisionFive 2 Lite | 204 / 78 / 174 / 205 ms (4 runs) | under 20 ms | **ran 461, failed 0** |
 | Raspberry Pi 4 | **31 / 47 / 32 ms** (3 runs) | under 40 ms | **ran 461, failed 0** |
 | Raspberry Pi 2 | 47 to 236 ms, median ~95 ms (8 runs) | under 20 ms | **ran 452, failed 0** |
 
 The Wyse cell was filled afterwards and took two runs: `ran 462, failed 1`, then `ran 461, failed 0`
-after a `kill net-stack`. The failure was real and is `backlog/31` - net-stack blocked for 48 seconds
+after a `kill net-stack`. The failure was real and is `backlog/fixed/31` - net-stack blocked for 48 seconds
 inside one serve pass, waiting on a `nic-driver` that was alive and not answering, so DNS resolution
 and `ping` both failed until its client was restarted. **A green second run does not retire that**, and
 the entry says what is and is not established about it.
@@ -236,7 +236,7 @@ block:
 ```
 
 Held, then served, 1.9 s end to end. **That is precisely the case that was dropped at 1.5 s and cost
-twenty seconds before `backlog/29`.** Its three slow passes (3406, 1875, 2006 ms) are the same
+twenty seconds before `backlog/fixed/29`.** Its three slow passes (3406, 1875, 2006 ms) are the same
 configured-stack scale as the x86 boards, with zero drops and zero timeouts beside them.
 
 **What it shows that a green run usually cannot.** Its log carries three genuinely slow serve passes -
@@ -478,7 +478,7 @@ sent. Silent at both ends: the sender discards the failed send, the receiver see
 
 **Corrected 2026-10-08:** that held on x86, AArch64 and RISC-V; ARM32's check accepted an empty range,
 which is the other reason the Pi 2 never showed it. It is gone on every port since `e3fcf7ed`
-(`backlog/66`, where the same refusal cost `net dns` over WiFi). The status bytes below stay, for the
+(`backlog/fixed/66`, where the same refusal cost `net dns` over WiFi). The status bytes below stay, for the
 reason the next paragraph gives.
 
 `COP_CLOSE` replied with nothing, and so did the refusal path and the UDP socket path when a datagram

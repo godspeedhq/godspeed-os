@@ -1066,7 +1066,7 @@ pub fn input_ready() -> bool {
 /// Serialises the console input ring's PRODUCERS. There are two, on different cores and in
 /// different contexts: `uart_rx_drain_fifo` from the core-0 timer tick (or `uart_rx_drain_now`), and
 /// `console_push_byte` from a USB driver's syscall on any core. Unserialised, two of them could read
-/// the same tail and one byte be lost or both land in one slot (`backlog/80` K10). Taken with
+/// the same tail and one byte be lost or both land in one slot (`backlog/fixed/80` K10). Taken with
 /// `lock_irq`, so a syscall holding it on core 0 cannot be interrupted by the timer tick that would
 /// then spin on it; the tick's own acquire nests (IF is already 0 there).
 static COM1_RX_PRODUCER: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
@@ -1169,7 +1169,7 @@ pub fn uart_rx_drain_now() {
 /// (the USB keyboard, §12), then wake any blocked ConsoleRead. Mirrors the COM1
 /// poll path's push + wake, so USB keystrokes reach the shell exactly like
 /// serial bytes would. The COM1 poll is the ring's other producer; the two are serialised by
-/// `COM1_RX_PRODUCER` (until 2026-10-10 they were not, which is `backlog/80` K10).
+/// `COM1_RX_PRODUCER` (until 2026-10-10 they were not, which is `backlog/fixed/80` K10).
 pub fn console_push_byte(b: u8) {
     use core::sync::atomic::Ordering;
     // Capture the byte into the input ring + wake any reader FIRST, before the echo.

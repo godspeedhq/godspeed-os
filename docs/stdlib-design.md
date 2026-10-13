@@ -83,10 +83,10 @@ where §26.10 puts it.
 |---|---|---|
 | **A. Ship the stdlib for SERVICES only** | Nothing in the kernel. The `fn main()` experience does not arrive. | Every finding in §3 below is still fixed. Services are what exist. |
 | **B. Add an `Exit(status)` syscall** | One syscall, one supervisor arm. Needs a CLAUDE.md amendment (§8.2's `CallDeadline` is the precedent: a new syscall is a new kernel responsibility and the surface is pinned). | The `fn main()` model becomes real, and the shell can stop being the only place a utility can live. |
-| **C. Do it in userspace** | A "runner" service spawns the program and kills it when it signals completion over IPC. No kernel change. | Works today. Costs an IPC round trip and a second service holding `service_control`, which is a confused deputy of exactly the shape `backlog/41` was rejected for. |
+| **C. Do it in userspace** | A "runner" service spawns the program and kills it when it signals completion over IPC. No kernel change. | Works today. Costs an IPC round trip and a second service holding `service_control`, which is a confused deputy of exactly the shape `backlog/fixed/41` was rejected for. |
 
 **Recommendation: A now, B as a separate reviewed change, never C.** C reintroduces the security
-objection that killed `backlog/41`: a deputy holding `service_control` on behalf of arbitrary
+objection that killed `backlog/fixed/41`: a deputy holding `service_control` on behalf of arbitrary
 programs. A is honest and immediately useful. B is the real answer and deserves its own discussion
 rather than arriving as a side effect of a convenience library.
 
@@ -546,7 +546,7 @@ reference (`request_within_notice`) failed. Fixed; the scan now covers the crate
 baseline entry could be dropped as a result.
 
 **Still owed, unchanged:** target-side tests against a service that really restarts, and `gs::cap`.
-Newly recorded: `backlog/45`, the published book has no standard-library section, which blocks the
+Newly recorded: `backlog/fixed/45`, the published book has no standard-library section, which blocks the
 Stranger Test from an honest first run.
 
 ## 12. `gs::cap` is NOT built, and the reason is a gap in the kernel surface
@@ -1418,7 +1418,7 @@ having and touches neither.
 
 ### Open items that are not about this branch
 
-- `backlog/48` and `backlog/49` - the userspace-reachable kernel panic class. A genuine violation of
+- `backlog/fixed/48` and `backlog/49` - the userspace-reachable kernel panic class. A genuine violation of
   an absolute bar (§22: the kernel must never panic on user-controllable input), and the kernel is
   zero-diff here, so this branch neither causes it nor worsens it.
 - `backlog/50` - `nic-driver` read 100% on the T630. One sighting, one machine, not root-caused;
@@ -1662,7 +1662,7 @@ third time.
 
 ### What hardware does NOT close
 
-The `backlog/48` / `backlog/49` class - a userspace-reachable kernel panic, reproduced under load -
+The `backlog/fixed/48` / `backlog/49` class - a userspace-reachable kernel panic, reproduced under load -
 is untouched by any of this and is a violation of an absolute bar (CLAUDE.md 22: the kernel must
 never panic on user-controllable input). It is not caused or worsened by this branch, whose kernel
 diff is comments only, and the operator has already scheduled it for after this work.

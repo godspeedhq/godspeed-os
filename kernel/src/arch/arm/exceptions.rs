@@ -103,7 +103,7 @@ extern "C" fn arm_exception_report(kind: u32, pc: u32, status: u32, addr: u32) -
     pl011_write(b"  a fault in the kernel itself - halting every core.\r\n\r\n");
     // Every core, not just this one (CLAUDE.md 6.2, 19): the others would otherwise go on running
     // against whatever state this fault was about. `halt_all_cores` is a flag store and a park, so it
-    // is safe to call from a fault path that can assume nothing (backlog/80 K25; the riscv64 port's
+    // is safe to call from a fault path that can assume nothing (backlog/fixed/80 K25; the riscv64 port's
     // same fix is K6).
     super::halt_all_cores()
 }
@@ -393,7 +393,14 @@ fn user_fault_kill(pc: u32, addr: u32, dfsr: u32, sp_usr: u32, kind: &str) -> ! 
             _ => "see ARM ARM B3.13.3",
         }
     );
-    crate::task::kill_current();
+    use crate::task::death::*;
+    let (fk, fa) = match (kind, status) {
+        ("undefined-instruction", _) => (F_ILLEGAL, pc),
+        (_, 0b00001) => (F_ALIGNMENT, addr),
+        ("prefetch", _) => (F_INSTRUCTION, addr),
+        _ => (F_MEMORY, addr),
+    };
+    crate::task::kill_current(fk, fa as u64);
     // kill_current does not return for a Dead task; if it somehow does, halt rather than resume a corpse.
     loop {
         // SAFETY: WFI is always valid; halt rather than return into a dead task's context.

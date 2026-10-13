@@ -201,7 +201,7 @@ pub fn try_recv(ctx: &ServiceContext) -> Option<Message> {
 ///
 /// `None` is the deadline passing - a fact about time, not a failure of the peer. A failed receive on
 /// this task's own endpoint is not folded into it: the task dies loudly, as a plain [`recv`] does,
-/// and the supervisor restarts it (`backlog/80` S5). Prefer this to
+/// and the supervisor restarts it (`backlog/fixed/80` S5). Prefer this to
 /// a bare [`recv`] anywhere a missing message would otherwise hang the service forever, which is
 /// every place a peer can die (CLAUDE.md 26.6).
 #[inline(always)]

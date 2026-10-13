@@ -11,7 +11,7 @@ The config was CRLF. U-Boot's extlinux parser takes the trailing `\\r` as part o
 tried to open a file whose name ended in a carriage return. The MENU rendered correctly throughout,
 because a stray `\\r` in a display string only returns the cursor and is invisible - which is exactly
 why this read as a load failure rather than a config fault, and why it survived two card reflashes and
-two wrong theories (`backlog/26`).
+two wrong theories (`backlog/fixed/26`).
 
 `.gitattributes` ALREADY HELD THE RULE and it was not enough. The repository stored those files as LF
 the whole time; `boot/** text eol=lf` now keeps a Windows CHECKOUT at LF too. But a rule in
@@ -134,7 +134,7 @@ def main():
         print("These are read by a BOOTLOADER or a shell, not by Windows. U-Boot's extlinux parser")
         print("takes a trailing CR as part of the FILENAME, so every entry fails to load while the")
         print("menu still renders perfectly - a stray CR in a display string only moves the cursor.")
-        print("That cost two card reflashes and two wrong theories on 2026-09-13 (backlog/26).")
+        print("That cost two card reflashes and two wrong theories on 2026-09-13 (backlog/fixed/26).")
         print()
         print("Fix: convert to LF and commit. `.gitattributes` keeps a fresh checkout right; this")
         print("catches the tree you actually have.")
