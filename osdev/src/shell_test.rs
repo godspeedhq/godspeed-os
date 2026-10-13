@@ -3040,6 +3040,15 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("/users/default"), "layout: a bare cd goes home"),
         None    => { println!("files-test: FAIL - bare cd timeout"); fail += 1; }
     }
+    let _ = run!(b"cd /system/shared\r", 10);
+    match run!(b"home\r", 10) {
+        Some(r) => check!(r.contains("/users/default"), "layout: home goes home"),
+        None    => { println!("files-test: FAIL - home timeout"); fail += 1; }
+    }
+    match run!(b"pwd\r", 10) {
+        Some(r) => check!(r.contains("/users/default"), "layout: and pwd agrees"),
+        None    => { println!("files-test: FAIL - pwd after home timeout"); fail += 1; }
+    }
     match run!(b"pwd | write here.txt\r", 10) {
         Some(_) => {}
         None    => { println!("files-test: FAIL - pwd | write timeout"); fail += 1; }

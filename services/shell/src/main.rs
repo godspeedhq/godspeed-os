@@ -1037,8 +1037,8 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
     "wait", "repeat", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve", "cores", "fcap",
-    // Takes no argument at all, so nothing to complete.
-    "pwd",
+    // Take no argument at all, so nothing to complete.
+    "pwd", "home",
     // An SSID is not a path. Completing one from the filesystem would be nonsense, and
     // completing it from the last scan would leak the names of networks in range into a shell
     // that records its history - so `wifi` offers keywords and nothing else.
@@ -2263,6 +2263,14 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             else { cmd_mkdir(ctx, cwd, args[1], argc >= 3 && args[2] == "parents") }
         }
         "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { HOME }),
+        // `home`: the plain word for what a bare `cd` does. Bare `cd` means "go home" on Unix and "say where
+        // I am" on Windows, so a word that cannot be read two ways is the one help advertises.
+        "home"    => if argc > 1 {
+            gs::io::println(ctx, "home: takes no argument - it goes to your home folder, /users/default");
+            Err(ShellError::Unknown)
+        } else {
+            cmd_cd(ctx, cwd, HOME)
+        },
         "pwd"     => if argc > 1 {
             gs::io::println(ctx, "pwd: takes no argument - it prints the folder you are in");
             Err(ShellError::Unknown)
@@ -5250,7 +5258,7 @@ fn foreign_hint(cmd: &str) -> Option<&'static str> {
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "repeat", "whatis", "status", "observe", "caps", "roster",
-    "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "pwd", "read", "write", "edit", "fcap",
+    "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "pwd", "home", "read", "write", "edit", "fcap",
     // Seven that answered a command and not `<cmd> version` / `<cmd> help` (`backlog/fixed/80` H8):
     // `fmt help` read "help" as a path, and `whatis` called all seven unknown.
     "fmt", "tcp", "serve", "random", "gpio", "spawncap", "spawnwired",
@@ -5631,12 +5639,15 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("dir [path] | <verb>", "piped: emits records name/type/size", "dir | where size>0"),
             ("dir | select … / sort …", "project / order the listing", "dir | sort reverse size"),
         ], true),
+        "home" => help_block(ctx, "home", "go to your home folder", &[
+            ("home", "go to /users/default, where a session starts", "home"),
+        ], true),
         "pwd" => help_block(ctx, "pwd", "print the folder you are in", &[
             ("pwd", "print the whole path of the current folder", "pwd"),
         ], true),
         "cd" => help_block(ctx, "cd", "change current directory", &[
             ("cd <path>", "move to <path>", "cd /system/services"),
-            ("cd", "go home, /users/default (in a script, $home)", "cd"),
+            ("cd", "go home, /users/default - the same as `home` (in a script, $home)", "cd"),
             ("cd ..", "go up one folder (`..` works in any path: read ../notes.txt)", "cd .."),
             ("cd -", "move to the previous directory", "cd -"),
         ], true),
@@ -6148,6 +6159,7 @@ static HELP: &[HelpRow] = &[
     Row("dir [path]", "list a directory"),
     Row("cd [path|..|-]", "change directory (.. = up one; - = previous; no path = home)"),
     Row("pwd", "print the folder you are in"),
+    Row("home", "go to your home folder (/users/default)"),
     Row("read <path>", "print a file"),
     Row("write [append|prepend] <path>", "create/overwrite/append/prepend (also: <prod> | write …)"),
     Row("edit <path>", "full-screen text editor (^S save, ^Q quit)"),

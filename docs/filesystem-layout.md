@@ -194,6 +194,8 @@ gsh> cd
   anyone who knows one knows the other, which is the reason L9 asks for. `cd .` was no better on Godspeed's
   own terms - it asks a reader to know that `.` means "this folder", a Unix convention that names nothing.
   `pwd` left `FOREIGN_HINTS` with this change; CLAUDE.md Appendix B.4 records the exception.
+- **`home` goes home** (added the same day, `utilities/63_home.md`). A bare `cd` still does, but it reads two
+  ways - home on Unix, "where am I" on Windows - so help advertises the word that cannot.
 
 **What phase 1 must audit, because a bare name changes meaning:** the `selfcheck` parts, every script under
 `scripts/`, the worked examples in `utilities/` and `docs/`, the shell's tests (`osdev/src/shell_test.rs`),
