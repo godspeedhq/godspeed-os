@@ -11677,7 +11677,9 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
             None => wifi_not_answering(ctx, out),
         },
         ReqOutcome::Aborted => {
-            out.line_fmt(ctx, format_args!("not joined - aborted"));
+            // The request reached the radio, which goes on joining by itself: "not joined" was a guess about a
+            // join still in progress (`backlog/89` Q6).
+            out.line_fmt(ctx, format_args!("join: stopped waiting - the radio may still be joining; `wifi status` says where it got to"));
             Ok(())
         }
         ReqOutcome::Timeout => wifi_not_answering(ctx, out),
@@ -18390,18 +18392,34 @@ fn chaos_save_retry(ctx: &ShellCtx, ppath: &[u8], data: &[u8]) -> bool {
         let _ = gs::cap::reacquire(ctx, "fs");
         if save_report(ctx, ppath, data) { return true; }
         if gs::task::epoch_secs_monotonic(ctx) - t0 >= CHAOS_SAVE_TOTAL_SECS { return false; }
-        for _ in 0..CHAOS_SETTLE_YIELDS { gs::task::yield_now(ctx); }
+        chaos_settle(ctx);
+    }
+}
+
+/// The operator quit the chaos command (`gs::call::Watch`, `backlog/89`): asked at the top of every round and
+/// inside the waits, so a storm stops at the next round with the command's `[q] quit`, not at its end.
+fn chaos_stopped(ctx: &ShellCtx) -> bool {
+    ctx.cmd_active.get() && gs::call::Watch::stopped(ctx)
+}
+
+/// The settle after a storm: a COUNT of yields (the serial drain and the target's re-registration), which
+/// gives up at once on a quit rather than running its length.
+fn chaos_settle(ctx: &ShellCtx) {
+    for i in 0..CHAOS_SETTLE_YIELDS {
+        if i % CHAOS_POLL_EVERY == 0 && chaos_stopped(ctx) { return; }
+        gs::task::yield_now(ctx);
     }
 }
 
 /// Wait (real wall-clock bounded, RTC) for `name` to be ALIVE (present in the task table). Used
 /// before a kill so a round isn't wasted killing a task that is still mid-respawn. Yields cooperatively.
-fn chaos_wait_alive(ctx: &ServiceContext, name: &str) {
+fn chaos_wait_alive(ctx: &ShellCtx, name: &str) {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     let mut k = 0u32;
     while slot_of(ctx, name).is_none() {
         gs::task::yield_now(ctx);
         k += 1;
+        if k % CHAOS_POLL_EVERY == 0 && chaos_stopped(ctx) { break; }
         if k % CHAOS_POLL_EVERY == 0 && gs::task::epoch_secs_monotonic(ctx) - t0 >= CHAOS_RECOVER_SECS { break; }
     }
 }
@@ -18409,7 +18427,7 @@ fn chaos_wait_alive(ctx: &ServiceContext, name: &str) {
 /// Wait (real wall-clock bounded, RTC - not a yield count, which isn't portable across QEMU/hardware)
 /// for `name` to reach a generation different from `og` - proof a fresh instance came up (§7.5). Yields
 /// cooperatively so the recoverer (sharing core 0) runs. Returns true on recovery, false on timeout.
-fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
+fn chaos_wait_recovery(ctx: &ShellCtx, name: &str, og: u32) -> bool {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     let mut k = 0u32;
     loop {
@@ -18417,6 +18435,7 @@ fn chaos_wait_recovery(ctx: &ServiceContext, name: &str, og: u32) -> bool {
         k += 1;
         if k % CHAOS_POLL_EVERY == 0 {
             if let Some(g) = gen_of(ctx, name) { if g != og { return true; } }
+            if chaos_stopped(ctx) { return false; }
             if gs::task::epoch_secs_monotonic(ctx) - t0 >= CHAOS_RECOVER_SECS { return false; }
         }
     }
@@ -18850,7 +18869,9 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
     let mut new_g = [0u32; CHAOS_MAX_ROUNDS as usize];
     let mut ok_r  = [false; CHAOS_MAX_ROUNDS as usize];
     let mut recovered = 0u32;
+    let mut ran = rounds;
     for r in 0..rounds as usize {
+        if chaos_stopped(ctx) { ran = r as u32; break; }
         // Ensure the target is ALIVE before we read its generation and kill it (it may still be
         // mid-respawn from the previous round - esp. the supervisor, Phase 6). Then kill, and wait
         // for a NEW generation (a respawn bumps it, §7.5) - both bounded by real wall-clock time.
@@ -18861,6 +18882,12 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
         if chaos_wait_recovery(ctx, svc, og) {
             new_g[r] = gen_of(ctx, svc).unwrap_or(0); ok_r[r] = true; recovered += 1;
         }
+    }
+    if ran < rounds || ctx.quit.get() {
+        const MODE: &str = "kill-storm";
+        gs::io::println_fmt(ctx, format_args!(
+            "chaos {}: STOPPED at your request after {} of {} round(s) - this is not a pass; the supervisor restarts what was killed", MODE, ran, rounds));
+        return Ok(());
     }
 
     // Build the report in a bounded buffer (at the END - nothing was written to fs during the storm).
@@ -18883,7 +18910,7 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
     // Settle: let the just-restarted target finish re-mounting/re-registering and let its restart
     // log burst drain off the serial line, so the report below survives on the wire (the bounded-THRE
     // serial path drops bytes under a cross-core flood) and an `fs`-target save can reach a live fs.
-    for _ in 0..CHAOS_SETTLE_YIELDS { gs::task::yield_now(ctx); }
+    chaos_settle(ctx);
 
     // Always print to the console - fs-independent, so even an `fs` storm reports cleanly.
     console_write_chunked(ctx, rb.bytes());
@@ -18917,7 +18944,7 @@ fn chaos_kill_storm(ctx: &ShellCtx, cwd: &Cwd, tok: &[&str], ntok: usize) -> Res
 /// command returning at all (a panic reboots). Bounded + loud (§26.6): fixed per-round burst, fixed
 /// rounds, fixed report buffer; console-only (no fs dependency).
 #[inline(never)]
-fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+fn chaos_flood_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     const FLOOD_BURST_MAX:    u32 = 64; // cap per-round sends; > queue depth (16) so saturation shows
     /// How long to let the target drain before re-checking, IN MILLISECONDS.
     ///
@@ -18983,7 +19010,9 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     let mut survived = 0u32;
     let mut died_at: Option<u32> = None;
 
+    let mut ran = rounds;
     for r in 0..rounds as usize {
+        if chaos_stopped(ctx) { ran = r as u32; break; }
         // 1. Burst until the queue saturates (QueueFull) or we hit the cap (the service kept up).
         let mut sent = 0u32;
         let mut died = false;
@@ -19021,6 +19050,13 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     }
 
     // Report - bounded buffer, console-only (flooding needs no fs).
+    if ran < rounds {
+        gs::cap::remove(ctx, handle);   // reclaim the flood handle, as the report path below does
+        const MODE: &str = "flood-storm";
+        gs::io::println_fmt(ctx, format_args!(
+            "chaos {}: STOPPED at your request after {} of {} round(s) - this is not a pass; the supervisor restarts what was killed", MODE, ran, rounds));
+        return Ok(());
+    }
     use core::fmt::Write as _;
     let mut rb = ReportBuf::new();
     let _ = writeln!(rb, "=== chaos flood-storm {}: report ===", svc);
@@ -19061,7 +19097,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
     });
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 
-    for _ in 0..CHAOS_SETTLE_YIELDS { gs::task::yield_now(ctx); }
+    chaos_settle(ctx);
     console_write_chunked(ctx, rb.bytes());
     if pass { Ok(()) } else { Err(ShellError::Unknown) }
 }
@@ -19075,7 +19111,7 @@ fn chaos_flood_storm(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize
 /// fully reclaimed it, and the kernel never panicked. Bounded + loud (§26.6): fixed rounds, RTC-bounded
 /// polls (break early on success), fixed report buffer, console-only.
 #[inline(never)]
-fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
+fn chaos_mem_pressure(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> Result<(), ShellError> {
     const MEM_DROP_MIN:  u64 = 4096; // >= 16 MiB held counts as "allocated" (limit 32 MiB = 8192 frames)
     const MEM_SLACK:     u64 = 1024; // 4 MiB tolerance for "reclaimed to baseline" (absorbs system noise)
     const MEM_WAIT_SECS: i64 = 5;    // per-poll wall-clock bound (RTC); polls break early on success
@@ -19110,7 +19146,9 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     let mut ok_r    = [false; CHAOS_MAX_ROUNDS as usize];
     let mut clean   = 0u32;
 
+    let mut ran = rounds;
     for r in 0..rounds as usize {
+        if chaos_stopped(ctx) { ran = r as u32; break; }
         // 1. Spawn the hog; it allocs to its limit on a round-robin core.
         let _ = ctx.spawn("mem-pressure");
         // 2. Wait for the allocation to land - free frames drop. RTC-bounded; breaks early on success.
@@ -19121,6 +19159,8 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
             let f = ctx.inspect_kernel_free_frames().unwrap_or(0);
             if f < low { low = f; }
             if baseline.saturating_sub(low) >= MEM_DROP_MIN { break; }
+            // A quit: stop waiting; the hog is still killed below, so nothing it holds is left behind.
+            if chaos_stopped(ctx) { break; }
             if gs::task::epoch_secs_monotonic(ctx) - t0 >= MEM_WAIT_SECS { break; }
         }
         let dropped = baseline.saturating_sub(low);
@@ -19143,6 +19183,13 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
         if ok_r[r] { clean += 1; }
     }
 
+    if ran < rounds || ctx.quit.get() {
+        const MODE: &str = "mem-pressure";
+        let ran = ran.min(rounds);
+        gs::io::println_fmt(ctx, format_args!(
+            "chaos {}: STOPPED at your request after {} of {} round(s) - this is not a pass; the supervisor restarts what was killed", MODE, ran, rounds));
+        return Ok(());
+    }
     use core::fmt::Write as _;
     let mut rb = ReportBuf::new();
     let _ = writeln!(rb, "=== chaos mem-pressure: report ===");
@@ -19162,7 +19209,7 @@ fn chaos_mem_pressure(ctx: &ServiceContext, _cwd: &Cwd, tok: &[&str], ntok: usiz
     });
     if rb.overflow { let _ = writeln!(rb, "(report truncated at {} KiB)", REPORT_MAX / 1024); }
 
-    for _ in 0..CHAOS_SETTLE_YIELDS { gs::task::yield_now(ctx); }
+    chaos_settle(ctx);
     console_write_chunked(ctx, rb.bytes());
     if pass { Ok(()) } else { Err(ShellError::Unknown) }
 }
@@ -19227,7 +19274,9 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
     let mut refused_at = 0u32;   // spawn index that got refused (0 = never; reached `count`)
     let mut aborted   = false;
     for n in 0..count {
-        if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { aborted = true; break; } }
+        // The command's quit (`gs::call::Watch`), like every other wait - it was q or Q here only, read before
+        // any `[q]` was offered.
+        if chaos_stopped(ctx) { aborted = true; break; }
         let before = ctx.inspect_kernel_free_frames().unwrap_or(0);   // free frames before this hog allocates
         if ctx.spawn("mem-pressure").is_err() {
             refused_at = n + 1;   // the ceiling held - graceful refusal, no panic
@@ -19248,7 +19297,12 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
     let live_peak = count_live(ctx);
     let hogs_peak = count_named(ctx, "mem-pressure");
 
-    // 2. Kill every hog (loop until none remain, confirmed by the task table). Bounded by a safety cap.
+    // 2. Kill every hog (loop until none remain, confirmed by the task table). Bounded by a safety cap. NOT stopped
+    // by a quit: this is the cleanup, and leaving the hogs would hold the machine's memory.
+    if aborted {
+        gs::io::println_fmt(ctx, format_args!(
+            "chaos spawn-storm: stopping - removing the {} mem-pressure task(s) it started", spawned));
+    }
     let mut killed = 0u32;
     while slot_of(ctx, "mem-pressure").is_some() && killed < SPAWN_STORM_MAX + 16 {
         let remaining = count_named(ctx, "mem-pressure");
@@ -23238,9 +23292,16 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             if b == b'q' || b == b'Q' || b == 0x1b {
                 // `q` STOPS THE TASK, not just this view of it (conventions rule 11). Anything else
                 // would make the key mean two different things depending on what it is pressed in.
-                let _ = ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 8);
+                // Plain, not under the watch: the command is already quit and the cancel must still go.
+                let acked = ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 8).is_some();
                 refresh_jobs(ctx);
-                gs::io::println_fmt(ctx, format_args!("job {} stopped", want));
+                // "stopped" only once copier said so: it printed that for a cancel nobody had answered.
+                if acked {
+                    gs::io::println_fmt(ctx, format_args!("job {} stopped", want));
+                } else {
+                    gs::io::println_fmt(ctx, format_args!(
+                        "job {}: asked to stop, and copier did not answer - `jobs` says whether it did", want));
+                }
                 return Ok(());
             }
         }
@@ -24320,6 +24381,7 @@ fn drives_list(ctx: &ShellCtx) -> Result<(), ShellError> {
     drain_stale_fs_replies(ctx);   // start from a clean channel (see the fn; `fs_raw` drains again, harmlessly)
     let reply = match fs_raw(ctx, &[OP_DRIVES_INFO], FS_ANSWER_SECS) {
         Some(r) => r,
+        None if said_stopped(ctx, "drives", "") => return Ok(()),
         None => { gs::io::println(ctx, "drives: storage unavailable (no fs?)"); return Err(ShellError::Unknown); }
     };
     let p = reply.payload_bytes();
@@ -24407,6 +24469,9 @@ fn drives_flash(ctx: &ShellCtx, label: &str, force: bool) -> Result<(), ShellErr
             Err(ShellError::Unknown)
         }
         Some(_) => { gs::io::println(ctx, "drives: flash FAILED (no disk, or disk too small)"); Err(ShellError::Unknown) }
+        // One request formats the disk, so a quit leaves `fs` still formatting - it said "storage unavailable"
+        // here, a wrong answer about a destructive operation (`backlog/89` Q6).
+        None if said_stopped(ctx, "drives flash", "the format goes on in fs; `drives` says when it is done") => Ok(()),
         None    => { gs::io::println(ctx, "drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }
@@ -24434,6 +24499,7 @@ fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
             Err(ShellError::Unknown)
         }
         Some(_) => { gs::io::println(ctx, "drives: reset FAILED (no disk?)"); Err(ShellError::Unknown) }
+        None if said_stopped(ctx, "drives reset", "the reset goes on in fs; `drives` says when it is done") => Ok(()),
         None    => { gs::io::println(ctx, "drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }
 }

@@ -143,3 +143,13 @@ supervisor would slow every spawn), and the shell's chaos modes, which ran quick
 `selfcheck` (300 s) and every case after it with it; three runs since, on the same code, passed 11/0 and
 `selfcheck` 594/0. The slow `fs` did not leak into it (each suite rebuilt `fs` with its normal features). The
 suite now saves its serial (`build/tests/script_serial.log`), so a repeat leaves something to read.
+
+**The chaos and message slice (2026-10-14):** the shell's chaos modes ask the command's watch at every round and in
+their waits and settle (`chaos_stopped`, `chaos_settle`), and stop with "STOPPED at your request after N of M
+round(s) - this is not a pass"; `spawn-storm` stops spawning on a quit and still removes every task it started.
+Measured: `chaos mem-pressure 10` `[q]` 2.6 s, stopped after 9 of 10; `chaos flood-storm events 20` `[q]` 2.0 s.
+`kill-storm` and `spawn-storm` finished under 2 s in QEMU, so their quit is in the code and not yet seen. The words:
+`drives flash` and `drives reset` say the format goes on in `fs`; `wifi join` says the radio may still be joining;
+`foreground` says "stopped" only when `copier` acknowledged the cancel. None of the three can run in this table
+(a flash would wipe the test disk, QEMU has no radio, `foreground` needs a job number) - shown by the code only.
+Quit table 31 cases, 0 below the bar; files 270/0, shell 272/0, script 11/0.

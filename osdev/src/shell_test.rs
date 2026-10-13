@@ -10912,7 +10912,10 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
         ("!background copy /q/big.txt /q/bg2.txt", ""),
         ("jobs",                              "copier with a job, slowed"),
         ("events persist stop",               "recorder, slowed"),
-        ("chaos kill-storm events 3",         "the shell's own chaos mode"),
+        ("chaos kill-storm events 20",        "the shell's own chaos mode, long enough to quit"),
+        ("chaos flood-storm events 20",       "chaos, flood"),
+        ("chaos mem-pressure 10",             "chaos, memory"),
+        ("chaos spawn-storm 40",              "chaos, spawn to the ceiling (the cleanup is not quittable)"),
         ("selfcheck files",                   "a part of the self-check"),
         // Last: a script that cannot be stopped holds the shell for its whole length (20 s here, so the
         // run ends either way and leaves a prompt behind).
