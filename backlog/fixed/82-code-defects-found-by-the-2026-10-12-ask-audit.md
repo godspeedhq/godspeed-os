@@ -1,6 +1,10 @@
 # 82. Code defects found by the 2026-10-12 `feat/ask` documentation audit
 
-**Status: FIXED IN CODE on `feat/ask`, 2026-10-12; open until the branch's hardware cards pass.** The
+**Status: CLOSED 2026-10-13.** Every item was fixed in code on `feat/ask` on 2026-10-12, and the branch's
+hardware cards have passed: `chaos max-carnage all-services 1000` then `selfcheck` with 0 failed on the
+Pi 4, Pi 2, VisionFive 2 Lite, Dell Wyse 5070 and HP T630 (released as v0.26.0).
+
+*Was:* FIXED IN CODE on `feat/ask`, 2026-10-12; open until the branch's hardware cards pass. The
 2026-10-12 audit of `feat/ask` changed documents and comments only (`9ce5c479`); the code defects it found
 were listed here and fixed separately the same day, as for `backlog/fixed/80`. Every item carries a FIXED note.
 Two `dwc2` paths that answered a block request `STATUS_ERR` while a disk could be bound belong to

@@ -673,7 +673,7 @@ pub struct Facts<'a> {
 }
 
 /// Who holds one authority. A task whose capability table could not be read is listed apart, because
-/// "holds nothing" and "could not be asked" are different facts (`backlog/82` A2).
+/// "holds nothing" and "could not be asked" are different facts (`backlog/fixed/82` A2).
 #[derive(Clone, Copy)]
 pub struct Holders<'a> {
     /// Running tasks that hold it.

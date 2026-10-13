@@ -1,6 +1,13 @@
 # 88. `nic-driver` probes a dead `wifi-usb` capability once a second, and the kernel logs every probe
 
-**Status: OPEN - FIX BUILT 2026-10-13, awaiting the Pi 4 card** (*The fix*, below). Seen on the Pi 4 card run of 2026-10-13 (`feat/ask`, the hub-cut image,
+**Status: CLOSED 2026-10-13, seen working on the Pi 4.** The fix (`364a5d1c`, *The fix* below) ran in the
+Pi 4's 1000-round soak: each time the storm killed the radio the bridge was talking to (the onboard
+`wifi-driver` that run, the same `Radio` path as for `wifi-usb`), it logged `wifi-driver is not running
+(x1); nothing is sent to it until it does` - eleven times - and `wifi-driver is running again - its name
+resolves, probing it` when it came back, and the once-a-second mismatch flood did not appear. Not seen
+with `wifi-usb` itself, which needs the dongle joined and then unplugged; the code path is the same.
+
+*Was:* OPEN - FIX BUILT 2026-10-13, awaiting the Pi 4 card (*The fix*, below). Seen on the Pi 4 card run of 2026-10-13 (`feat/ask`, the hub-cut image,
 `build/serial_output.log`). Nothing failed because of it; the cost is a kernel log line a second for as
 long as the dongle is gone, which on a Pi 4 with no dongle plugged in is normal operation.
 

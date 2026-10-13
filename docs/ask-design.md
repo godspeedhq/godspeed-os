@@ -206,7 +206,7 @@ gsh> ask "why is my computer sad?"
 
 The vocabulary is read-only data compiled into the program, kept apart from the diagnostics, and
 pinned by regression tests rather than a version number (a `VOCABULARY` constant nothing read was removed
-on 2026-10-12, `backlog/82` A4): a question that was understood stays understood unless its first reading
+on 2026-10-12, `backlog/fixed/82` A4): a question that was understood stays understood unless its first reading
 was wrong. A request to DO something - "restart the wifi driver" - is answered with what `ask` is:
 
 ```

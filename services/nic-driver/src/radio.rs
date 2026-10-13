@@ -83,7 +83,7 @@ pub(crate) struct Radio {
     /// its dongle has gone). Until a lookup finds it again, a probe LOOKS THE NAME UP and sends nothing.
     /// Sending was what happened before: the failed reacquire left the named-peer cache holding the dead
     /// instance's cap, every probe went out on it, and the kernel logged a gen mismatch for each one - a
-    /// line a second for as long as the dongle was absent (`backlog/88`). A lookup finds a respawned radio
+    /// line a second for as long as the dongle was absent (`backlog/fixed/88`). A lookup finds a respawned radio
     /// as fast as a probe did, and costs no message.
     gone: bool,
     /// CLIENT REQUESTS THAT ARRIVED WHILE THIS DRIVER WAS WAITING ON THE RADIO. The wait in `rpc`

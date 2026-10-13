@@ -58,7 +58,7 @@ const ASK_FS_SECS: i64 = 8;
 const RADIOS: [&str; 2] = ["wifi-driver", "wifi-usb"];
 /// The USB hosts a disk can be behind. Which one `block-driver` is behind is read from its capabilities,
 /// never assumed from the board. Only the hosts some board's `block-driver` peers with (`board::STORAGE_PEERS`)
-/// and `ask` is given (`board::ASK_PEERS`): `ehci` is neither, so it is not asked (`backlog/82` A6).
+/// and `ask` is given (`board::ASK_PEERS`): `ehci` is neither, so it is not asked (`backlog/fixed/82` A6).
 const STORAGE_HOSTS: [&str; 2] = ["xhci", "dwc2"];
 /// The block protocol's capacity request, the same op number on every link (`OP_CAPACITY`).
 const OP_CAPACITY: u8 = 3;
