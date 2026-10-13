@@ -146,9 +146,11 @@ dir /system | assert contains shared
 dir /system | assert contains scratch
 dir /users | assert contains default
 cd $home
+pwd | assert contains /users/default
 write /users/default/sc-layout.txt home
 read sc-layout.txt | assert contains home
 cd /sc
+pwd | assert contains /sc
 cd
 read sc-layout.txt | assert contains home
 delete $home/sc-layout.txt

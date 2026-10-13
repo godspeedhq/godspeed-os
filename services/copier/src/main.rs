@@ -454,6 +454,12 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
     }
 }
 
+/// Where churn writes: a scratch folder of its own (`docs/filesystem-layout.md`), not the shell's,
+/// because the shell empties `scratch/shell/` at its first use in a session and these files are the
+/// evidence a power cut leaves for `churn verify`. Only `churn reset` empties it. Spelled the same in
+/// `services/shell` and `services/copier`, the two writers.
+const CHURN_DIR: &[u8] = b"/system/scratch/churn";
+
 /// One churn iteration: write a slot, and every fifth one rename it and delete the result.
 ///
 /// ONE ITERATION PER LOOP PASS, for the reason a copy does one chunk: this service is
@@ -464,7 +470,7 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
 /// delete move directory entries and free extents, which is where the interesting interrupted states
 /// live. Writing only files would exercise one transaction shape while claiming three.
 fn churn_step(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
-    const DIR: &[u8] = b"/churn";
+    const DIR: &[u8] = CHURN_DIR;
     const SLOTS: u64 = 8;
     const SIZES: [usize; 4] = [64, 500, 1200, 3000];
 
@@ -690,7 +696,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         job.out.clear();
                         job.out.write(b"churn: writing continuously - CUT THE POWER AT ANY POINT\n");
                         let mut sink = [0u8; 8];
-                        let _ = fs_mkdir(&ctx, &mut gfs, b"/churn");
+                        let _ = fsr(&ctx, "mkdir", gfs.create_dir_all(CHURN_DIR).map(|_| 0));
                         reply_op(&ctx, op_code, CP_OK);
                         continue;
                     }

@@ -2662,7 +2662,7 @@ pub fn run_fs_tear_detect(image_path: &Path, persist_path: &str, smp: u32) {
         // `churn tear` needs a file spanning more than one block (508 bytes of payload), so it tears
         // ACROSS a block boundary - the whole point of the case. Ask the filesystem rather than the
         // clock: a size column above 508 means such a file is there.
-        send(&mut write_half, b"dir /churn\r");
+        send(&mut write_half, b"dir /system/scratch/churn\r");
         let listing = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
         // READ THE FORMAT `dir` ACTUALLY PRINTS. The first version parsed whitespace tokens as
         // integers, and `dir` renders sizes with a unit - `1.1 KiB`, not `1126`. So `1.1` and `KiB`
@@ -2992,10 +2992,11 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
     } else { println!("files-test: FAIL - no flash confirm"); fail += 1; }
 
     // THE STANDARD TREE (`docs/filesystem-layout.md`): a format lays it down, the shell starts at home and
-    // says where it is in the prompt, and the shell's own files land in their folders.
-    match run!(b"\r", 10) {
-        Some(r) => check!(r.contains("/users/default "), "layout: the prompt starts at home, /users/default"),
-        None    => { println!("files-test: FAIL - empty-line prompt timeout"); fail += 1; }
+    // `pwd` says so, and the shell's own files land in their folders.
+    match run!(b"pwd\r", 10) {
+        Some(r) => check!(r.contains("/users/default") && !r.contains("default gsh"),
+                          "layout: the session starts at home, pwd says /users/default, the prompt is plain"),
+        None    => { println!("files-test: FAIL - pwd timeout"); fail += 1; }
     }
     match run!(b"dir /system\r", 10) {
         Some(r) => check!(r.contains("services") && r.contains("utilities") && r.contains("shared") && r.contains("scratch"),
@@ -3028,33 +3029,29 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - tree / timeout"); fail += 1; }
     }
     match run!(b"cd /system/services\r", 10) {
-        Some(r) => check!(r.contains("/system/services gsh"), "layout: the prompt follows cd"),
+        Some(r) => check!(r.contains("/system/services"), "layout: cd prints where it went"),
         None    => { println!("files-test: FAIL - cd /system/services timeout"); fail += 1; }
     }
+    match run!(b"pwd\r", 10) {
+        Some(r) => check!(r.contains("/system/services"), "layout: pwd follows cd"),
+        None    => { println!("files-test: FAIL - pwd after cd timeout"); fail += 1; }
+    }
     match run!(b"cd\r", 10) {
-        Some(r) => check!(r.contains("/users/default gsh"), "layout: a bare cd goes home"),
+        Some(r) => check!(r.contains("/users/default"), "layout: a bare cd goes home"),
         None    => { println!("files-test: FAIL - bare cd timeout"); fail += 1; }
     }
-    match run!(b"mkdir /system/scratch/a-rather-long-folder/and-deeper parents\r", 10) {
-        Some(r) => check!(r.contains("created"), "layout: a deep folder for the prompt"),
-        None    => { println!("files-test: FAIL - deep mkdir timeout"); fail += 1; }
+    match run!(b"pwd | write here.txt\r", 10) {
+        Some(_) => {}
+        None    => { println!("files-test: FAIL - pwd | write timeout"); fail += 1; }
     }
-    match run!(b"cd /system/scratch/a-rather-long-folder/and-deeper\r", 10) {
-        Some(r) => {
-            let tail = r.rsplit('\n').next().unwrap_or("");
-            check!(tail.contains("...") && tail.contains("and-deeper gsh") && !tail.contains("/system/scratch/a-rather"),
-                   "layout: a long folder is shortened from the left in the prompt");
-        }
-        None    => { println!("files-test: FAIL - deep cd timeout"); fail += 1; }
+    match run!(b"read here.txt\r", 10) {
+        Some(r) => check!(r.contains("/users/default"), "layout: pwd is a pipe source"),
+        None    => { println!("files-test: FAIL - read here.txt timeout"); fail += 1; }
     }
-    match run!(b"cd .\r", 10) {
-        Some(r) => check!(r.contains("/system/scratch/a-rather-long-folder/and-deeper\r\n") || r.contains("/system/scratch/a-rather-long-folder/and-deeper\n"),
-                          "layout: cd . prints the whole path"),
-        None    => { println!("files-test: FAIL - cd . timeout"); fail += 1; }
-    }
-    match run!(b"cd\r", 10) {
-        Some(r) => check!(r.contains("/users/default gsh"), "layout: and home again"),
-        None    => { println!("files-test: FAIL - cd home timeout"); fail += 1; }
+    let _ = run!(b"delete here.txt\r", 10);
+    match run!(b"pwd extra\r", 10) {
+        Some(r) => check!(r.contains("takes no argument"), "layout: pwd refuses an argument with a sentence"),
+        None    => { println!("files-test: FAIL - pwd extra timeout"); fail += 1; }
     }
     match run!(b"read /users/default/history\r", 10) {
         Some(r) => check!(r.contains("write notes.txt hi"), "layout: history is kept in /users/default/history"),
@@ -9083,7 +9080,7 @@ pub fn run_fs_blockchaos(image_path: &Path, persist_path: &str, smp: u32) {
     //
     // `fs-churn` requires `NONE torn` because a POWER CUT returns no error - the caller is told
     // nothing, so a mixed file is corruption by any reading. This test deliberately makes writes
-    // FAIL, and the first run found `/churn/f2.bin diverges at byte 1 of 1200` sitting beside
+    // FAIL, and the first run found `/system/scratch/churn/f2.bin diverges at byte 1 of 1200` sitting beside
     // `churn: done - 26 writes ... 2 refused`. The write was refused and the caller was told; a
     // caller that ignores a reported failure and reads back a partial file is not a filesystem bug.
     //

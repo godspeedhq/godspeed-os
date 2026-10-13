@@ -6,7 +6,7 @@ mid-churn, and checks the volume comes back consistent.
     churn <seconds>     write, rename and delete continuously, then stop and report
     churn verify        after a cut: is any file a MIX of two writes?
     churn tear          deliberately make one file a mix, to prove `verify` can say so
-    churn reset         remove /churn and its files
+    churn reset         remove /system/scratch/churn and its files
 
 Press `q` to quit a run early.
 
@@ -22,7 +22,7 @@ disk **host-side, before boot**, which is not available on a machine whose disk 
 
 ```
 gsh> churn tear
-churn tear: /churn/f0.bin now holds generation 12 from byte 0 and generation 49 from byte 508 - a MIX
+churn tear: /system/scratch/churn/f0.bin now holds generation 12 from byte 0 and generation 49 from byte 508 - a MIX
 churn tear: the blocks are well-formed and their CRCs are correct, so `drives check`
 churn tear: and `drives scrub` will BOTH still report clean. Only `churn verify` sees it.
 churn tear: nothing repairs this - detection is the guarantee. `churn reset` removes it.
@@ -54,7 +54,7 @@ bytes and calling them yours.
 ### It does not ask [y/N], deliberately
 
 `seal` asks because there is no unseal; `drives flash` asks because it erases a disk. `churn tear`
-can only ever write to `/churn/fN.bin` - files `churn` itself created, in a directory `churn reset`
+can only ever write to `/system/scratch/churn/fN.bin` - files `churn` itself created, in a directory `churn reset`
 exists to delete. It cannot reach anything else, so a confirm would be ceremony rather than a guard.
 
 Pinned by `osdev test fs-tear-detect`, which asserts the interesting half: `churn verify` says TORN
@@ -77,7 +77,7 @@ later byte is predicted. The first disagreement is the tear point:
 
 ```
 gsh> churn verify
-churn verify: TORN - /churn/f7.bin diverges at byte 1216 of 3000 (block 2, offset 200 within it)
+churn verify: TORN - /system/scratch/churn/f7.bin diverges at byte 1216 of 3000 (block 2, offset 200 within it)
 churn verify: 1 of 8 file(s) are TORN - each holds a mix of two writes.
 ```
 
@@ -113,7 +113,7 @@ looks: a fault that appears only in a build nobody ships is a fault about that b
 
 ## What it actually does
 
-A fixed rotation of eight files in `/churn`, rewritten in place, so the volume **never fills** however
+A fixed rotation of eight files in `/system/scratch/churn`, rewritten in place, so the volume **never fills** however
 long it runs. Four payload sizes - 64, 500, 1200 and 3000 bytes - because the allocator takes
 different paths for a single data block, a partial extent and several blocks, and a one-size churn
 would only ever exercise one of them.
@@ -138,7 +138,7 @@ churn: done - 2840 writes, 355 renames, 355 deletes, 3456120 bytes, 0 refused
 ```
 
 (Counts illustrative.) `<seconds>` is 1 to 3600. A run that finishes also names the two follow-ups
-(`churn verify`, `drives check`) and that `/churn` was left in place. A churn can run detached:
+(`churn verify`, `drives check`) and that `/system/scratch/churn` was left in place. A churn can run detached:
 `background churn <seconds>` (`55_background.md`).
 
 Pull the plug at any point. On the way back up:
@@ -167,7 +167,7 @@ journal barriers, so a bigger number is not a better disk.
 **Not a soak test for the rest of the system.** It hammers storage and nothing else. `chaos` is the
 utility for killing services; this one never kills anything.
 
-**It leaves `/churn` behind, deliberately - after a cut AND after a clean finish.** `churn reset`
+**It leaves `/system/scratch/churn` behind, deliberately - after a cut AND after a clean finish.** `churn reset`
 removes it when you want it gone.
 
 Not automatic, and the reasoning is worth stating because the opposite looks tidier. Those files are

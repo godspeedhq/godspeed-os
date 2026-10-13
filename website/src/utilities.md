@@ -39,6 +39,7 @@ fails.
 |---|---|
 | [`dir`](utilities/dir.md) | list a directory |
 | [`cd`](utilities/cd.md) | change current location |
+| [`pwd`](utilities/pwd.md) | print the folder you are in |
 | [`read`](utilities/read.md) | print a file's contents |
 | [`write`](utilities/write.md) | create, overwrite, append, or prepend a file |
 | [`mkdir`](utilities/mkdir.md) | create a directory |

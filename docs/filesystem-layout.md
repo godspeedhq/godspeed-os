@@ -176,21 +176,24 @@ $home`, `cd $home/scripts` - which the shell sets from the session's home. gsh a
 adds no new syntax, and it cannot collide with a real folder named `home` the way a reserved path word would.
 GSFS never learns the word.
 
-**The prompt shows where you are**, so no new utility is needed:
+**`pwd` says where you are; the prompt stays `gsh> `.** (Decided 2026-10-13, after the first hardware card.
+The design first put the folder in the prompt - `/users/default gsh> `, shortened from the left past 32
+characters - and named `cd .` as the way to print the whole path. It was built and run that way on the T630,
+and the operator chose the plain prompt and a command instead.)
 
 ```text
-/users/default gsh> cd /system/services/time
-/system/services/time gsh> cd
-/users/default gsh> _
+gsh> pwd
+/users/default
+gsh> cd /system/services/time
+/system/services/time
+gsh> cd
+/users/default
 ```
 
-- The path goes BEFORE `gsh> `, and `gsh> ` stays exactly as it is: every test harness and run script waits
-  for that text, so a prefix breaks none of them.
-- It is bounded, because a deep path would push the cursor off a narrow terminal: past about 32 characters it
-  is shortened from the left, `.../long/path/here gsh> `, keeping the end, which is the part that says where
-  you are. (32 is a starting value, not a measurement; the console's width could set it instead.)
-- **The full path is `cd .`**, which already exists: it stays and prints where it is (the shell's answer to
-  `pwd`, in `FOREIGN_HINTS`). A separate utility would be a second way to do the same thing.
+- **Why `pwd`, a Unix word (L9).** `cd` was kept because everyone knows it, and `pwd` is its other half:
+  anyone who knows one knows the other, which is the reason L9 asks for. `cd .` was no better on Godspeed's
+  own terms - it asks a reader to know that `.` means "this folder", a Unix convention that names nothing.
+  `pwd` left `FOREIGN_HINTS` with this change; CLAUDE.md Appendix B.4 records the exception.
 
 **What phase 1 must audit, because a bare name changes meaning:** the `selfcheck` parts, every script under
 `scripts/`, the worked examples in `utilities/` and `docs/`, the shell's tests (`osdev/src/shell_test.rs`),
@@ -321,7 +324,7 @@ Named L1-L10 so they are not confused with the constitution's invariants 1-12 (C
 ## 12. Order of work
 
 1. **Phase 1, the layout.** `fs`'s format writes the tree; each owner moves its file (section 4); the shell
-   starts in `/users/default/`, `cd` goes home, `$home` exists, the prompt shows the folder; the audit in
+   starts in `/users/default/`, `cd` goes home, `$home` exists, `pwd` prints the folder; the audit in
    section 6; the `fs-journal` check on a cross-directory `Move`. No authority changes.
 2. **Phase 2, folder capabilities.** Folder resources, `fs`-local rights, provisioning authority, the re-grant
    protocol after an `fs` restart, each service granted only its own folder, and the CLAUDE.md amendment.
@@ -355,8 +358,9 @@ Named L1-L10 so they are not confused with the constitution's invariants 1-12 (C
 | `/.write.tmp`, `/.edit.tmp`, `/.fcap-*`, `/.fl<id>~` | `/system/scratch/shell/` |
 
 - **The shell starts at `/users/default`**, without asking `fs` anything - the prompt must come up at once,
-  and a home that is missing is said by the first command that uses it. A bare `cd` goes home; `cd .`
-  prints the whole path; the prompt is `<folder> gsh> `, shortened from the left past 32 characters.
+  and a home that is missing is said by the first command that uses it. A bare `cd` goes home, and `pwd`
+  prints where you are (`utilities/62_pwd.md`). The prompt is a plain `gsh> ` - see section 6 for the
+  folder-in-the-prompt version that was built first and replaced the same day.
 - **The shell's scratch** is emptied and made at its first use in a session (`ensure_scratch`), not at
   start, for the same reason the start touches no disk.
 
@@ -382,5 +386,13 @@ the same tree; on the Pi 4 QEMU has no xHCI, so only the prompt (`/users/default
 `cd: storage unavailable` were seen. One defect was found on the way and fixed: `for line in (...)` wrote its
 temp file into the scratch folder without making it first, and `selfcheck` failed three statements until it did.
 
-**Hardware cards pending:** every board's data disk is reflashed with `drives flash`, then `tree /` and
-`selfcheck`.
+**Hardware, 2026-10-13: the T630 passed** on the folder-in-the-prompt build: `drives flash`, `tree /` with every
+owner's folder in place (`services/events`, `services/time/floor`, `services/audio-driver/settings`,
+`scratch/shell`), and `selfcheck` 590/0. Two changes followed from it, verified in QEMU the same day: the
+prompt became a plain `gsh> ` with `pwd` (section 6), and `churn` moved from `/churn` to its own
+`/system/scratch/churn`, which the shell's first-use emptying of `scratch/shell/` does not touch, so its
+files survive a power cut for `churn verify`. `selfcheck` now returns the shell to the folder it started in.
+After them: `files` 265/0, `shell` 272/0, `selfcheck` 594/0, `jobs` 60/0, `fs-tear-detect` 8/0.
+
+**Hardware cards pending:** the other four boards, each reflashed with `drives flash`, then `tree /`, `pwd`
+and `selfcheck`.

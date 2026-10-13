@@ -195,10 +195,10 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
 
     **Which utilities start a pipe, and why the rest do not** (counted 2026-10-02 against the shell's
     `UTILS` and its three producer lists, `is_producer_builtin`, `is_record_producer` and
-    `is_pipe_producer_service`). Of the shell's utilities (its `UTILS` list), 27 start a pipe (two, `wifi` and `churn`, for some verbs only): the record sources (`status`, `dir`,
+    `is_pipe_producer_service`). Of the shell's utilities (its `UTILS` list), 28 start a pipe (two, `wifi` and `churn`, for some verbs only): the record sources (`status`, `dir`,
     `find`, `caps`, `drives`, `observe now`, `uptime`, `events`, `trace`, `jobs`, and `wifi list`), the
     text sources (`echo`, `read`, `tree`, `input`, `about`, `version`, `whatis`, `mem`, `cores`, `date`,
-    `net`, `ping`, `sock`, `help`, `wifi`'s other reports, `churn verify`), and the `roster` service; plus
+    `net`, `ping`, `sock`, `help`, `pwd` (added 2026-10-13), `wifi`'s other reports, `churn verify`), and the `roster` service; plus
     `random` and `tcp` (made sources that day) and the `greet` example, which are not in `UTILS`. Seventeen more are pipe STAGES or SINKS rather than
     sources - `match`, `count`, `sort`, `first`, `last`, `where`, `select`, `to`, `from`, `sum`, `min`,
     `max`, `avg`, `paginate`, `write`, `assert`, `result` - and `result`/`assert` refuse to start a pipe

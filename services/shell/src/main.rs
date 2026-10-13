@@ -435,8 +435,6 @@ pub struct ShellCtx {
     inner: ServiceContext,
     /// The fs request correlation tag (see `next_fs_tag`).
     fs_tag: core::cell::Cell<u8>,
-    /// The prompt as drawn now (`PromptText`): the folder, then `gsh> `.
-    prompt: core::cell::RefCell<PromptText>,
     /// Whether this instance has emptied and made its scratch folder yet (`ensure_scratch`).
     scratch_ready: core::cell::Cell<bool>,
     /// The net-stack request correlation tag (see `next_net_tag`). A SECOND counter, not a shared
@@ -571,7 +569,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let ctx = ShellCtx {
         inner: ctx,
         fs_tag: core::cell::Cell::new(0),
-        prompt: core::cell::RefCell::new(PromptText::new()),
         scratch_ready: core::cell::Cell::new(false),
         net_tag: core::cell::Cell::new(0),
         pipe_stack_hwm: core::cell::Cell::new(0),
@@ -642,8 +639,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (`docs/filesystem-layout.md` 6). Set without asking `fs` anything: the prompt must come up at
     // once, and a home that is missing is said by the first command that uses it.
     let mut cwd = Cwd::home();
-    set_prompt(&ctx, &cwd);
-    gs::io::print_fmt(ctx, format_args!("(F1=help or type 'help')\n{}", ctx.prompt.borrow().as_str()));
+    gs::io::print(ctx, "(F1=help or type 'help')\ngsh> ");
 
     let mut line = Line::new();
     // A UTF-8 character arriving a byte at a time (see where it is fed).
@@ -708,7 +704,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     break;
                 }
             }
-            print_prompt(ctx);
+            gs::io::print(ctx, PROMPT);
             muted = false;
         }
 
@@ -813,7 +809,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
                     }
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
-                    set_prompt(&ctx, &cwd);
                     // A typed command that failed makes a system sound - only here, at the prompt, never
                     // in a script, so fifty errors in a script do not sound fifty times.
                     match last_result {
@@ -827,7 +822,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     tidy_helpers(&ctx);
                 }
                 nav = hist.len();
-                print_prompt(ctx);
+                gs::io::print(ctx, PROMPT);
             }
             0x1B => {
                 // Escape: either a bare ESC (the Escape key → clear the line) or the start
@@ -861,7 +856,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 line.len = 0;
                 line.cur = 0;
                 nav = hist.len();
-                print_prompt(ctx);
+                gs::io::print(ctx, PROMPT);
             }
             b if b >= 0x20 && b < 0x7f => line.insert(&ctx, b),
             _ => {}
@@ -880,7 +875,7 @@ fn run_help_key(
 ) {
     gs::io::print(ctx, "\r\n");
     *last_result = execute(ctx, b"help", cwd, *last_result, 0, &mut Out::Console);
-    print_prompt(ctx);
+    gs::io::print(ctx, PROMPT);
     line.cur = line.len; // cursor at end after the reprint
     if line.len > 0 {
         gs::io::print(ctx, core::str::from_utf8(line.bytes()).unwrap_or(""));
@@ -1042,6 +1037,8 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 const NO_PATH_CMDS: &[&str] = &[
     "chaos", "kill", "spawn", "restart", "ping", "net", "drives", "observe", "date", "uptime",
     "wait", "repeat", "whatis", "busiest", "random", "gpio", "events", "trace", "tcp", "serve", "cores", "fcap",
+    // Takes no argument at all, so nothing to complete.
+    "pwd",
     // An SSID is not a path. Completing one from the filesystem would be nonsense, and
     // completing it from the last scan would leak the names of networks in range into a shell
     // that records its history - so `wifi` offers keywords and nothing else.
@@ -1555,7 +1552,7 @@ fn keyword_menu(ctx: &ShellCtx, line: &mut Line, tok_start: usize, cands: &[&str
     }
     if n > shown { gs::io::print(ctx, "(type more to narrow) "); }
     gs::io::print(ctx, "\r\n");
-    print_prompt(ctx);
+    gs::io::print(ctx, PROMPT);
     gs::io::print(ctx, str_of(line.bytes()));
     let mut idx = usize::MAX;
     loop {
@@ -1692,7 +1689,7 @@ fn path_menu(ctx: &ShellCtx, line: &mut Line, base_len: usize, rbuf: &[u8; 512],
     }
     if n > shown { gs::io::print(ctx, "(type more to narrow) "); }
     gs::io::print(ctx, "\r\n");
-    print_prompt(ctx);
+    gs::io::print(ctx, PROMPT);
     gs::io::print(ctx, str_of(line.bytes()));
 
     let mut idx = usize::MAX; // MAX = no candidate filled yet (showing the common-prefix)
@@ -1717,54 +1714,13 @@ fn path_menu(ctx: &ShellCtx, line: &mut Line, base_len: usize, rbuf: &[u8; 512],
 /// oldest dropped when full). The ring starts empty each boot; `/users/default/history` is written through on
 /// every command and merged back in lazily (see `History::load`).
 const HIST_MAX: usize = 16;
-/// The end of the prompt, which never changes: every test harness and run script waits for exactly this
-/// text, so the folder goes in FRONT of it (`docs/filesystem-layout.md` 6).
+/// The prompt. Its WIDTH sets the column the typed line starts at, so the two are defined
+/// together and checked at compile time - a longer prompt with a stale redraw column would
+/// erase from inside the prompt. It does not show the folder; `pwd` does (`utilities/62_pwd.md`).
 const PROMPT: &str = "gsh> ";
-/// The longest the folder in the prompt may be. A deeper one is shortened from the left, keeping the end,
-/// which is the part that says where you are. A starting value, not a measurement.
-const PROMPT_DIR_MAX: usize = 32;
-const PROMPT_CAP: usize = PROMPT_DIR_MAX + 1 + PROMPT.len();
-
-/// The prompt as it is drawn now: `<folder> gsh> `. Rebuilt when the folder changes, and held by
-/// `ShellCtx` so every place that draws the prompt, or puts the cursor in the column after it, reads the
-/// same one. Its WIDTH is the column the typed line starts at.
-pub struct PromptText {
-    buf: [u8; PROMPT_CAP],
-    len: usize,
-    width: usize,
-}
-
-impl PromptText {
-    fn new() -> Self { PromptText { buf: [0; PROMPT_CAP], len: 0, width: 0 } }
-    fn as_str(&self) -> &str { core::str::from_utf8(&self.buf[..self.len]).unwrap_or(PROMPT) }
-    fn put(&mut self, b: &[u8]) {
-        self.buf[self.len..self.len + b.len()].copy_from_slice(b);
-        self.len += b.len();
-    }
-}
-
-/// Rebuild the prompt from the folder.
-fn set_prompt(ctx: &ShellCtx, cwd: &Cwd) {
-    let dir = cwd.as_str();
-    let mut p = PromptText::new();
-    if dir.len() <= PROMPT_DIR_MAX {
-        p.put(dir.as_bytes());
-    } else {
-        // "..." and the end of the path that fits after it, started on a character boundary.
-        let mut from = dir.len() - (PROMPT_DIR_MAX - 3);
-        while !dir.is_char_boundary(from) { from += 1; }
-        p.put(b"...");
-        p.put(dir[from..].as_bytes());
-    }
-    p.put(b" ");
-    p.put(PROMPT.as_bytes());
-    p.width = p.as_str().chars().count();
-    *ctx.prompt.borrow_mut() = p;
-}
-
-fn print_prompt(ctx: &ShellCtx) {
-    gs::io::print(ctx, ctx.prompt.borrow().as_str());
-}
+/// Cursor to the first column of the typed text (CHA, 1-based), then erase to end of line.
+const REDRAW: &str = "\x1b[6G\x1b[K";
+const _: () = assert!(PROMPT.len() + 1 == 6);
 
 struct History {
     lines: [[u8; MAX_LINE]; HIST_MAX],
@@ -1996,8 +1952,7 @@ impl Line {
         // CHA cannot drift: it names the column outright, so the erase always starts at the true
         // start of the typed text and the prompt itself is preserved (which is why this is not a
         // carriage return + reprint - a second prompt is indistinguishable from a real one).
-        // Cursor to the first column of the typed text (CHA, 1-based), then erase to end of line.
-        gs::io::print_fmt(ctx, format_args!("\x1b[{}G\x1b[K", ctx.prompt.borrow().width + 1));
+        gs::io::print(ctx, REDRAW);
         self.cur = 0;
         let n = new.len().min(MAX_LINE);
         self.buf[..n].copy_from_slice(&new[..n]);
@@ -2015,7 +1970,7 @@ impl Line {
     /// assumes the prompt is still on the screen. It is not - `scrollback` clears on the way out,
     /// the same as `help` and `edit` - so the prompt has to be printed, not jumped to.
     fn reprint(&self, ctx: &ShellCtx) {
-        print_prompt(ctx);
+        gs::io::print(ctx, PROMPT);
         if self.len > 0 {
             gs::io::print(ctx, core::str::from_utf8(&self.buf[..self.len]).unwrap_or(""));
         }
@@ -2308,6 +2263,13 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             else { cmd_mkdir(ctx, cwd, args[1], argc >= 3 && args[2] == "parents") }
         }
         "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { HOME }),
+        "pwd"     => if argc > 1 {
+            gs::io::println(ctx, "pwd: takes no argument - it prints the folder you are in");
+            Err(ShellError::Unknown)
+        } else {
+            gs::io::println(ctx, cwd.as_str());
+            Ok(())
+        },
         "copy"    => {
             if argc < 3 { gs::io::println(ctx, "usage: copy <src> <dst> [recursive]"); Err(ShellError::Unknown) }
             else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]) }
@@ -5009,7 +4971,7 @@ fn library_script(name: &str) -> Option<&'static str> {
 
 /// What `selfcheck` creates at the ROOT, and therefore what it must clear before it starts.
 ///
-/// Everything else it makes lives under `/sc`. `/churn` is deliberately absent: `churn` leaves its
+/// Everything else it makes lives under `/sc`. `/system/scratch/churn` is deliberately absent: `churn` leaves its
 /// files as the evidence a power cut happened, and `churn verify` reads them.
 const SELFCHECK_REMNANTS: &[(&str, bool)] = &[
     ("/sc", true),            // the suite's scratch tree
@@ -5064,7 +5026,17 @@ fn selfcheck_tidy(ctx: &ShellCtx) {
 /// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
 /// its own files). Refused inside a script (it runs one - no nesting).
 #[inline(never)]
+/// `selfcheck`, leaving the operator where they were. Its parts move about the disk and end at `/`, and
+/// the prompt does not show the folder, so without this a bare name typed after a self-check lands
+/// somewhere the operator never chose (found on the T630, 2026-10-13).
 fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
+    let before = cwd.clone();
+    let r = cmd_selfcheck_parts(ctx, cwd, depth, arg);
+    *cwd = before;
+    r
+}
+
+fn cmd_selfcheck_parts(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
         gs::io::println(ctx, "selfcheck: not available inside a script, `repeat` or `assert` (it runs one)");
         return Err(ShellError::Unknown);
@@ -5246,7 +5218,6 @@ const FOREIGN_HINTS: &[(&str, &str)] = &[
     ("head",  "first"),
     ("tail",  "last"),
     ("touch", "write"),
-    ("pwd",   "cd ."),      // `cd .` prints the whole path (the prompt shortens a long one); a bare `cd` goes home, so it is not the hint (H14)
     ("ps",    "status"),
     ("top",   "observe"),
     ("htop",  "observe"),
@@ -5279,7 +5250,7 @@ fn foreign_hint(cmd: &str) -> Option<&'static str> {
 const UTILS: &[&str] = &[
     "help", "result", "run", "assert", "selfcheck",
     "echo", "input", "clear", "about", "version", "mem", "cores", "date", "net", "ping", "sock", "uptime", "wait", "repeat", "whatis", "status", "observe", "caps", "roster",
-    "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "read", "write", "edit", "fcap",
+    "spawn", "kill", "restart", "reboot", "chaos", "drives", "dir", "cd", "pwd", "read", "write", "edit", "fcap",
     // Seven that answered a command and not `<cmd> version` / `<cmd> help` (`backlog/fixed/80` H8):
     // `fmt help` read "help" as a path, and `whatis` called all seven unknown.
     "fmt", "tcp", "serve", "random", "gpio", "spawncap", "spawnwired",
@@ -5660,10 +5631,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("dir [path] | <verb>", "piped: emits records name/type/size", "dir | where size>0"),
             ("dir | select … / sort …", "project / order the listing", "dir | sort reverse size"),
         ], true),
+        "pwd" => help_block(ctx, "pwd", "print the folder you are in", &[
+            ("pwd", "print the whole path of the current folder", "pwd"),
+        ], true),
         "cd" => help_block(ctx, "cd", "change current directory", &[
             ("cd <path>", "move to <path>", "cd /system/services"),
             ("cd", "go home, /users/default (in a script, $home)", "cd"),
-            ("cd .", "print the whole path of where you are", "cd ."),
             ("cd -", "move to the previous directory", "cd -"),
         ], true),
         "read" => help_block(ctx, "read", "print a file", &[
@@ -5720,7 +5693,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "churn" => help_block(ctx, "churn", "hammer the filesystem for N seconds so a power cut lands somewhere", &[
             ("churn <seconds>", "write/rename/delete continuously, then stop", "churn 30"),
             ("churn verify", "after a cut: is any file a MIX of two writes? (content, not structure)", "churn verify"),
-            ("churn reset", "remove /churn and its files (never automatic - they are the evidence)", "churn reset"),
+            ("churn reset", "remove /system/scratch/churn and its files (never automatic - they are the evidence)", "churn reset"),
             ("churn <seconds>", "q quits early; run BOTH `churn verify` and `drives check` after", "churn 120"),
         ], true),
         "seal" => help_block(ctx, "seal", "freeze a file's content, permanently - there is NO unseal", &[
@@ -5814,8 +5787,8 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("churn", "tear") => help_block(ctx, "churn tear", "deliberately tear one file, to prove verify sees it", &[
             ("churn tear", "deliberately make one churn file a MIX of two generations, so `churn verify` can be seen firing - a detector never observed firing is not evidence", "churn tear"),
         ], false),
-        ("churn", "reset") => help_block(ctx, "churn reset", "remove /churn", &[
-            ("churn reset", "remove /churn and its files (never automatic - they are the evidence)", "churn reset"),
+        ("churn", "reset") => help_block(ctx, "churn reset", "remove /system/scratch/churn", &[
+            ("churn reset", "remove /system/scratch/churn and its files (never automatic - they are the evidence)", "churn reset"),
         ], false),
         ("dir", "bytes") => help_block(ctx, "dir bytes", "sizes in exact bytes", &[
             ("dir bytes [path]", "list with sizes as exact byte counts instead of rounded units; may come before or after the path", "dir bytes /"),
@@ -6172,7 +6145,8 @@ static HELP: &[HelpRow] = &[
     Sec("Storage"),
     Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
     Row("dir [path]", "list a directory"),
-    Row("cd [path|-]", "change directory (- = previous)"),
+    Row("cd [path|-]", "change directory (- = previous; no path = home)"),
+    Row("pwd", "print the folder you are in"),
     Row("read <path>", "print a file"),
     Row("write [append|prepend] <path>", "create/overwrite/append/prepend (also: <prod> | write …)"),
     Row("edit <path>", "full-screen text editor (^S save, ^Q quit)"),
@@ -17668,7 +17642,7 @@ fn is_producer_builtin(name: &str) -> bool {
     // loudly as non-producers instead. To capture a big file for `edit`, append a simple producer
     // a few times: `help | write /big.txt; help | write append /big.txt; …`.
     matches!(name, "read" | "echo" | "tree" | "input"
-                 | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help"
+                 | "about" | "version" | "whatis" | "mem" | "cores" | "date" | "net" | "ping" | "sock" | "help" | "pwd"
                  | "wifi" | "audio" | "hardware" | "random" | "tcp" | "churn")
 }
 
@@ -17730,6 +17704,7 @@ fn run_producer(ctx: &ShellCtx, cwd: &Cwd, cmdline: &str, out: &mut Out) -> bool
         "read"         => { let _ = cmd_read(ctx, cwd, arg, out); }
         // "dir" and "find" are record producers (handled on the record path), not text here.
         "tree"         => { let _ = cmd_tree(ctx, cwd, arg, out); }
+        "pwd"          => out.line(ctx, cwd.as_str()),
         // Info/display commands - text emitters, capturable to a file.
         "about"        => { let _ = cmd_about(ctx, out); }
         "version"      => { let _ = cmd_version_os(ctx, out); }
@@ -19171,6 +19146,7 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
 
 /// The current directory on the (single) drive - an absolute path like "/" or "/etc". Also
 /// remembers the *previous* directory so `cd -` can toggle back (both default to root).
+#[derive(Clone)]
 struct Cwd {
     buf: [u8; PATH_MAX],
     len: usize,
@@ -20307,6 +20283,12 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     Ok(())
 }
 
+/// Where churn writes: a scratch folder of its own (`docs/filesystem-layout.md`), not the shell's,
+/// because the shell empties `scratch/shell/` at its first use in a session and these files are the
+/// evidence a power cut leaves for `churn verify`. Only `churn reset` empties it. Spelled the same in
+/// `services/shell` and `services/copier`, the two writers.
+const CHURN_DIR: &[u8] = b"/system/scratch/churn";
+
 /// `churn <seconds>` - keep the filesystem in constant motion so a power cut lands SOMEWHERE.
 ///
 /// **Why this exists.** Three real power cuts on a Dell Wyse produced three clean mounts and not one
@@ -20340,7 +20322,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         Ok(n) if n > 0 && n <= 3600 => n,
         _ => { gs::io::println(ctx, "usage: churn <seconds>   e.g. churn 30   (1 to 3600)"); return Err(ShellError::Unknown); }
     };
-    const DIR: &[u8] = b"/churn";
+    const DIR: &[u8] = CHURN_DIR;
     const SLOTS: usize = 8;
     // Four sizes, so the mix spans a single data block, a partial extent and several blocks - the
     // allocator takes different paths for each, and a one-size churn would only ever exercise one.
@@ -20350,7 +20332,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     // transactions instead of restarting at each call, which is the property that lets a late reply
     // be recognised rather than believed.
     let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
-    let _ = gfs.create_dir(DIR);
+    let _ = gfs.create_dir_all(DIR);
     out.line_fmt(ctx, format_args!(
         "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT  [q] quit", secs));
 
@@ -20430,7 +20412,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         "churn: done - {} writes, {} renames, {} deletes, {} bytes, {} refused",
         writes, renames, deletes, bytes, failures));
     out.line(ctx, "churn: after a cut run `churn verify` (content) and `drives check` (structure) - both, they answer different questions");
-    out.line(ctx, "churn: /churn is left in place (it is the evidence); `churn reset` removes it");
+    out.line(ctx, "churn: /system/scratch/churn is left in place (it is the evidence); `churn reset` removes it");
     ctx.fs_tag.set(gfs.tag());
     Ok(())
 }
@@ -20459,7 +20441,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
 /// derived view of one irreducible source (§26.4); file content has no second source, so there is
 /// nothing to rebuild it from. `churn reset` removes the evidence when you are finished with it.
 fn cmd_churn_tear(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    const DIR: &[u8] = b"/churn";
+    const DIR: &[u8] = CHURN_DIR;
     // 508 bytes of payload per block - the same figure `churn verify` reports its tear point
     // against, so the offset it names will match the offset written here.
     const PAYLOAD: usize = 508;
@@ -20514,7 +20496,7 @@ fn cmd_churn_tear(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     Err(ShellError::Unknown)
 }
 
-/// `churn reset` - remove `/churn` and everything in it.
+/// `churn reset` - remove `/system/scratch/churn` and everything in it.
 ///
 /// **Explicit, never automatic.** `churn` leaves its files behind on purpose: after a power cut they
 /// ARE the evidence, and `churn verify` reads them. A run that finishes without a cut leaves them too
@@ -20528,18 +20510,18 @@ fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // `delete_all` carries the SWEEP budget itself - removing a subtree walks it, and the ordinary
     // request deadline is shorter than that walk on a full directory.
     let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
-    let r = g.delete_all(b"/churn");
+    let r = g.delete_all(CHURN_DIR);
     let why = g.reason();
     let answer = match r {
-        Ok(()) => { out.line(ctx, "churn: /churn removed"); Ok(()) }
+        Ok(()) => { out.line(ctx, "churn: /system/scratch/churn removed"); Ok(()) }
         Err(gs::Error::NotFound) => {
-            out.line(ctx, "churn: nothing to remove - /churn does not exist");
+            out.line(ctx, "churn: nothing to remove - /system/scratch/churn does not exist");
             Ok(())
         }
         // A TREE DELETE IS NOT ONE MUTATION. It frees in batches, so a lost reply, or an fs that died
         // mid-delete (PeerDied), can leave the directory PARTLY removed. "Could not remove" would claim nothing happened.
         Err(gs::Error::OutcomeUnknown | gs::Error::PeerDied) => {
-            out.line(ctx, "churn: OUTCOME UNKNOWN - /churn may be partly removed. Check with `dir /churn`");
+            out.line(ctx, "churn: OUTCOME UNKNOWN - /system/scratch/churn may be partly removed. Check with `dir /system/scratch/churn`");
             Err(ShellError::Unknown)
         }
         Err(gs::Error::Unavailable) | Err(gs::Error::NoFilesystem) => {
@@ -20547,11 +20529,11 @@ fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             Err(ShellError::Unknown)
         }
         Err(_) if !why.is_empty() => {
-            out.line_fmt(ctx, format_args!("churn: could not remove /churn - {}", why));
+            out.line_fmt(ctx, format_args!("churn: could not remove /system/scratch/churn - {}", why));
             Err(ShellError::Unknown)
         }
         Err(_) => {
-            out.line(ctx, "churn: could not remove /churn - see fs's log");
+            out.line(ctx, "churn: could not remove /system/scratch/churn - see fs's log");
             Err(ShellError::Unknown)
         }
     };
@@ -20559,7 +20541,7 @@ fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     answer
 }
 
-/// `churn verify` - is any file in `/churn` a MIX of two generations?
+/// `churn verify` - is any file in `/system/scratch/churn` a MIX of two generations?
 ///
 /// The companion to the load. `drives check` answers "is the structure sound" - the tree, the
 /// bitmap, the CRCs - and until this existed NOTHING answered "is any file's content a torn mix".
@@ -20571,7 +20553,7 @@ fn cmd_churn_reset(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 /// byte 0 and every later byte is predicted. The first byte that disagrees is the tear point, and
 /// its offset says which block boundary it fell on.
 fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    const DIR: &[u8] = b"/churn";
+    const DIR: &[u8] = CHURN_DIR;
     let mut checked = 0u32;
     let mut torn = 0u32;
     let mut empty = 0u32;
@@ -20607,7 +20589,7 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     match walked {
         Ok(l) => { if !l.complete && !overfull { truncated = true; } }
         Err(gs::Error::NotFound) => {
-            gs::io::println(ctx, "churn verify: no /churn directory - nothing to check");
+            gs::io::println(ctx, "churn verify: no /system/scratch/churn directory - nothing to check");
             return Ok(());
         }
         Err(gs::Error::Cancelled) => return Ok(()),
@@ -20639,7 +20621,7 @@ fn cmd_churn_verify(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     }
 
     if truncated {
-        out.line(ctx, "churn verify: NOTE - /churn is larger than the walk could read, so some files were NOT checked");
+        out.line(ctx, "churn verify: NOTE - /system/scratch/churn is larger than the walk could read, so some files were NOT checked");
     }
     if torn == 0 {
         out.line_fmt(ctx, format_args!(
@@ -22686,7 +22668,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
         }
     };
     if kind == KIND_CHURN {
-        // No paths: the job owns /churn. The seconds ride as the trailing parameter.
+        // No paths: the job owns /system/scratch/churn. The seconds ride as the trailing parameter.
     } else if kind == KIND_CHECK || kind == KIND_SCRUB {
         // No paths: the job walks the whole file tree.
     } else if kind == KIND_DELETE_TREE {
