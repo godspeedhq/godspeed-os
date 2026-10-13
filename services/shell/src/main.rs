@@ -5637,6 +5637,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         "cd" => help_block(ctx, "cd", "change current directory", &[
             ("cd <path>", "move to <path>", "cd /system/services"),
             ("cd", "go home, /users/default (in a script, $home)", "cd"),
+            ("cd ..", "go up one folder (`..` works in any path: read ../notes.txt)", "cd .."),
             ("cd -", "move to the previous directory", "cd -"),
         ], true),
         "read" => help_block(ctx, "read", "print a file", &[
@@ -6145,7 +6146,7 @@ static HELP: &[HelpRow] = &[
     Sec("Storage"),
     Row("drives [flash|label|reset|check]", "manage attached disks (drives help)"),
     Row("dir [path]", "list a directory"),
-    Row("cd [path|-]", "change directory (- = previous; no path = home)"),
+    Row("cd [path|..|-]", "change directory (.. = up one; - = previous; no path = home)"),
     Row("pwd", "print the folder you are in"),
     Row("read <path>", "print a file"),
     Row("write [append|prepend] <path>", "create/overwrite/append/prepend (also: <prod> | write …)"),
