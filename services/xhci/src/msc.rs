@@ -196,7 +196,7 @@ pub struct Disk {
     pub hub_nports: u32,
     pub hub_off: usize,
     /// Whether this disk's first failed read has been reported (further failures are silenced). A
-    /// field of the disk rather than a static (Invariant 9, backlog/80 D9), so a new disk starts
+    /// field of the disk rather than a static (Invariant 9, backlog/fixed/80 D9), so a new disk starts
     /// unsaid by construction.
     read_fail_said: bool,
 }
@@ -729,7 +729,7 @@ pub fn serve_block(
     ev_cycle: &mut u32,
     eaten: &mut EvMail,
     // Whether "no disk is bound" has been reported since a disk was last bound. Owned by the
-    // caller's loop, not a static (Invariant 9, backlog/80 D9).
+    // caller's loop, not a static (Invariant 9, backlog/fixed/80 D9).
     no_disk_said: &mut bool,
 ) -> usize {
     out[0] = STATUS_ERR;

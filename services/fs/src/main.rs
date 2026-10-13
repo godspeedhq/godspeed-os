@@ -301,7 +301,7 @@ macro_rules! send_res {
                 let mut eb = [0u8; 1 + FS_ERR_REASON_MAX];
                 // A path that is not there is FS_NOTFOUND whatever the operation, with the reason
                 // still carried: a mutating op answered FS_ERR for it while a read answered
-                // FS_NOTFOUND, so a client could not tell "absent" from "refused" (`backlog/80` V2).
+                // FS_NOTFOUND, so a client could not tell "absent" from "refused" (`backlog/fixed/80` V2).
                 eb[0] = if walk_miss(e) { FS_NOTFOUND } else { FS_ERR };
                 let n = e.len().min(FS_ERR_REASON_MAX);
                 eb[1..1 + n].copy_from_slice(&e.as_bytes()[..n]);
@@ -320,7 +320,7 @@ const FS_DENIED: u8 = 5;     // op requires a right the file cap lacks (non-esca
                              // path, but a shared value invited a future confusion; audit L2)
 const FS_DAMAGED: u8 = 7;    // the file is THERE and a block of it failed its CRC (or could not be read):
                              // damaged, not missing. Answered FS_NOTFOUND until 2026-10-10, so a damaged
-                             // file read as an absent one (`backlog/80` V2)
+                             // file read as an absent one (`backlog/fixed/80` V2)
 const FS_FOREIGN: u8 = 6;    // the disk carries someone else's partition table / boot sector. Refused
                              // rather than formatted - see `foreign_disk`. Distinct from FS_ERR so the
                              // client can explain WHY and offer the deliberate override.
@@ -477,7 +477,7 @@ struct Fs {
     io_error_seen: core::cell::Cell<bool>,
     // Set by a read that found the file and could not read a block of it (a CRC failure or an I/O
     // error), cleared by every read that starts. The reply then says FS_DAMAGED rather than
-    // FS_NOTFOUND (`backlog/80` V2). Owned state on the struct, like the two cells above.
+    // FS_NOTFOUND (`backlog/fixed/80` V2). Owned state on the struct, like the two cells above.
     read_damaged: core::cell::Cell<bool>,
     /// Consecutive failed block reads during a tree WALK (check / scrub). Reset by any success.
     ///
@@ -716,7 +716,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         storage_unreadable = true;
     } else {
         let mut io_attempts = 0u32;
-        // The same CLOCK bound as the capacity wait above, for the same reason (`backlog/80` V7):
+        // The same CLOCK bound as the capacity wait above, for the same reason (`backlog/fixed/80` V7):
         // `yield_now` returns at once when nothing else is runnable, so 1000 of them measured loop
         // speed, not how long block-driver was given to come back.
         let io_started = gs::driver::wait::Since::now(&ctx);
@@ -1896,7 +1896,7 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 if want == 0 { send(&[FS_DENIED]); return; }
             }
             // A failed open says WHY, as every other refusal does - it answered a bare FS_ERR, so
-            // `gs::fs::Fs::reason` was empty and the cause was in this log only (`backlog/80` V2).
+            // `gs::fs::Fs::reason` was empty and the cause was in this log only (`backlog/fixed/80` V2).
             match fs.open_file(ctx, path, want, tag, reply) {
                 Ok(()) => *out_len = REPLY_SENT_DIRECTLY,   // the cap went with it; do not reply twice
                 Err(e) => send_res!(send, Err::<(), &str>(e)),
@@ -3966,7 +3966,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         //
         // The DELETE has happened once the unlink commits, so a failure here is not the delete
         // failing and is not reported as one: the caller was told "failed" for a tree that was gone,
-        // and a retry then failed again with "not found" (`backlog/80` V4). What failed is the
+        // and a retry then failed again with "not found" (`backlog/fixed/80` V4). What failed is the
         // reclaim, which leaves blocks counted as used that nothing references - said loudly, with
         // the repair (`drives check` rebuilds the bitmap from the tree).
         if let Err(why) = self.free_subtree(ctx, e.itype, e.first_block, e.block_count, 0) {
@@ -4635,7 +4635,7 @@ fn walk_miss(reason: &str) -> bool {
 
 fn op_is_mutating(op: u8) -> bool {
     // OP_SEAL writes too - it flags a file record and so the directory block - and was missing, so a
-    // read-only mount sealed files (`backlog/80` V3).
+    // read-only mount sealed files (`backlog/fixed/80` V3).
     matches!(op,
         OP_WRITE_FILE | OP_WRITE_NEW | OP_WRITE_AT | OP_WRITE_AT_J |
         OP_MKDIR | OP_MKDIR_P | OP_RENAME | OP_DELETE | OP_DELETE_TREE | OP_MOVE | OP_SEAL)
@@ -4716,7 +4716,7 @@ impl BlockReply {
 
 /// Latch for the one-shot stack-depth report inside `block_rpc`. Owned by this service and touched
 /// nowhere else. (This cited xhci's probe-failure latch as its model; `xhci` moved its latches into loop-owned
-/// state on 2026-10-10, `backlog/80` D9. This one, and the peer-outage latches below, still live in
+/// state on 2026-10-10, `backlog/fixed/80` D9. This one, and the peer-outage latches below, still live in
 /// statics because `block_rpc` is a free function with a dozen callers.)
 static STACK_DEPTH_REPORTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);

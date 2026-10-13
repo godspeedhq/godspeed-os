@@ -116,7 +116,7 @@ impl<'f, 'a: 'f> File<'f, 'a> {
     /// file to read-only rather than mint a cap it cannot honour (7.3 - rights narrow), and
     /// [`cap::APPEND`](crate::cap::APPEND) is a request to `fs`, never a kernel right, so it is not
     /// here. (Until 2026-10-10 this was the mask asked for, and a close under it was refused -
-    /// `backlog/80` G2.)
+    /// `backlog/fixed/80` G2.)
     pub fn rights(&self) -> u8 {
         self.right
     }

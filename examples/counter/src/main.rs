@@ -161,7 +161,7 @@ fn load_count(ctx: &ServiceContext) -> Option<u64> {
 /// The cap is only the question - `fs_request` uses the one the spawn wired in, or reacquires its own -
 /// and `gs::cap::acquire` mints a FRESH capability into a new table slot on every call. This asked
 /// `gs::cap::acquire(..).is_ok()` once a second while saves failed and dropped the handle, so a long
-/// `fs` outage filled this task's capability table one slot per tick (backlog/80 E2). An example is
+/// `fs` outage filled this task's capability table one slot per tick (backlog/fixed/80 E2). An example is
 /// what a newcomer copies: a probe that mints must remove what it minted.
 fn fs_reachable(ctx: &ServiceContext) -> bool {
     match gs::cap::acquire(ctx, "fs") {

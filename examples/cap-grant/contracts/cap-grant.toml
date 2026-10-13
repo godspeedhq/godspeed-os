@@ -20,7 +20,7 @@ ipc_receive = ["cap-grant"]   # OWNS its endpoint - the grantable SEND|GRANT cap
 # No `ipc_send`. It reaches "receiver" BY NAME, through the kernel's name directory, which its spawn
 # row allows with the ACQUIRE_ANY privilege - not through a peer the supervisor wires in, and no
 # contract key expresses that privilege. This said `ipc_send = ["receiver"]`, a peer its row never
-# granted, and `contract_check.py` compares an example's peers with its row now (backlog/80 T8).
+# granted, and `contract_check.py` compares an example's peers with its row now (backlog/fixed/80 T8).
 log_write   = true            # may write the kernel log ring + serial (syscall 5); NOT to any service
 
 # No [placement] section - omit it (as here) and the supervisor ROUND-ROBINS this service across

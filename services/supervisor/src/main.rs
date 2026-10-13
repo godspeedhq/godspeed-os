@@ -116,7 +116,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
             // `name` may carry a NUL-separated PEER LIST after it, exactly as SpawnRequest's payload
             // does: `producer\0sink` is how a pipe arrives. A pipe is not a special kind of spawn -
             // it is a spawn whose producer is given its downstream as a peer, which is precisely what
-            // the kernel's by-name pipe spawn did before it was retired (backlog/80 K14).
+            // the kernel's by-name pipe spawn did before it was retired (backlog/fixed/80 K14).
             Ok(spec) if !spec.is_empty() => {
                 let mut it = spec.split('\0');
                 let name = match it.next() { Some(n) if !n.is_empty() => n, _ => return true };
@@ -161,7 +161,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
                             Some(Ok(c))  => { spawned_cap = c; true }
                             Some(Err(_)) => false,
                             // No image here means no way to start it: the kernel's by-name pipe spawn
-                            // (SpawnPipe) was retired, and could only ever refuse (backlog/80 K14).
+                            // (SpawnPipe) was retired, and could only ever refuse (backlog/fixed/80 K14).
                             None         => {
                                 ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
                                 false
@@ -582,7 +582,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // `stdlib-hello` writes and reads a file through `gs::fs`, so it is WIRED to fs like `counter`
     // is - and, like `counter`, it needs its OWN endpoint (REQ_RECV) for `fs`'s replies to land on.
     // It had none until 2026-10-10, so every call came back `Unreachable` and the test passed on
-    // the program saying `done` (`backlog/80` E1).
+    // the program saying `done` (`backlog/fixed/80` E1).
     #[cfg(feature = "examples-test")]
     ("stdlib-hello", STDLIB_HELLO_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["fs"], 0, 0, 0),
     // `cap-grant` needs its OWN endpoint (REQ_RECV) so `gs::cap::self_grant` has something to hand
@@ -976,7 +976,7 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godsp
 // ───────────────────────────────────────────────────────────────────────────────
 // Bounded (§26.6) - real services, not the test probes. 16 until 2026-10-10, which was EXACTLY full on
 // the Pi 4 and on x86 with the WiFi dongle attached, so the next service a board gained would have been
-// dropped from the map and never rewired after a restart (`backlog/80` V8). 24 gives that headroom;
+// dropped from the map and never rewired after a restart (`backlog/fixed/80` V8). 24 gives that headroom;
 // `record_name` still says so loudly if it is ever reached.
 const NAME_MAP_MAX:      usize = 24;
 const NAME_MAP_NAME_MAX: usize = 16;
@@ -1089,7 +1089,7 @@ fn spawn_wired(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, peers: &[
         };
     }
     // No image for it: nothing can start it. The kernel's by-name spawn with installs (SpawnWithCaps)
-    // was retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/80 K14).
+    // was retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/fixed/80 K14).
     ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
     false
 }
@@ -1154,7 +1154,7 @@ fn spawn_mapped(ctx: &ServiceContext, map: &mut NameCapMap, name: &str, core: u3
         };
     }
     // No image for it: nothing can start it. The kernel's by-name spawn (SpawnReturningEndpoint) was
-    // retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/80 K14).
+    // retired - its catalogue holds only `supervisor`, so it could only refuse (backlog/fixed/80 K14).
     ctx.log_fmt(format_args!("supervisor: no image for '{}' - cannot spawn it", name));
     false
 }
@@ -1943,7 +1943,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // On a supervisor RESPAWN `events` is usually still alive, and is ADOPTED rather than spawned a
     // second time. Through `ensure_mapped`, so the adoption has its `name_alive` gate: this adopted
     // whatever cap the name directory handed back, so an `events` that died while the supervisor was
-    // down was adopted dead and recovered only later, by `converge` (`backlog/80` V8).
+    // down was adopted dead and recovered only later, by `converge` (`backlog/fixed/80` V8).
     if !ensure_mapped(&ctx, &mut name_map, "events", 0xFFFF) {
         // Through the image table: the supervisor carries events's image now, and it does not route
         // through itself (no supervisor-peer), so `ctx.spawn` would take the kernel path and find
@@ -2041,7 +2041,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                   feature = "b2-only", feature = "bp2-only", feature = "perf-iso")))]
     // From its own image, as every other service is: `ctx.spawn` asks the supervisor - this task - or
     // the kernel, whose catalogue holds only the supervisor, and its result was discarded, so this line
-    // started nothing and said nothing (`backlog/80` V6).
+    // started nothing and said nothing (`backlog/fixed/80` V6).
     if !spawn_mapped(&ctx, &mut name_map, "observe", 0xFFFF) {
         ctx.log("supervisor: observe did not start - see the spawn line above");
     }
@@ -2058,7 +2058,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // block-driver. An attribute applies to the next STATEMENT and comments do not end it, so it gated
     // `time` instead: the full QEMU build and the perf, stress, adversarial, chaos and fuzz builds never
     // started the clock. It was removed rather than moved, because every build has started block-driver
-    // all along and its suites run with it (`backlog/fixed/77`, `backlog/80` V5). block-driver's placement is
+    // all along and its suites run with it (`backlog/fixed/77`, `backlog/fixed/80` V5). block-driver's placement is
     // its IMAGES row's `board::BLOCK_CORE`, read by both the boot and the restart paths.
     //
     // time + control: started BEFORE the shell, because the shell asks `time` for the clock source on
@@ -2295,7 +2295,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // A `#[cfg(not(any(identity-only, perf-only, ...)))]` sat here until 2026-10-10, meant for
     // nic-driver; it gated the next STATEMENT, which was the `wifi-driver` spawn far below. Removed: no
     // x86 test build embeds `wifi-driver`, so it changed nothing there, and `nic-driver` has started in
-    // every build all along (`backlog/80` V5).
+    // every build all along (`backlog/fixed/80` V5).
     //
     // ADOPT if already running, like every other managed service. These two used `spawn_*`
     // directly, which always tries to SPAWN - so on a supervisor respawn the kernel refused

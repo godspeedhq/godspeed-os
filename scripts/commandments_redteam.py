@@ -19,7 +19,7 @@ Only the green checks are exercised. When this was written three checks were fai
 case labels "52nd syscall", "23rd query" and "14th authority" are the counts of that time, not today's.)
 
 It does not gate a build: it mutates the tree, so it runs alone, on a committed tree. Its EXIT CODE is
-its verdict since 2026-10-10 (backlog/80 T8) - it exited 0 whatever it printed - so a MISSED or ANCHOR?
+its verdict since 2026-10-10 (backlog/fixed/80 T8) - it exited 0 whatever it printed - so a MISSED or ANCHOR?
 row, a WRONG Commandment II case, or a RESTORED count unequal to the baseline exits 1.
 """
 import io, os, re, subprocess, sys
@@ -28,7 +28,7 @@ ANSI = re.compile(chr(27) + r'\[[0-9;]*m')
 
 # THE TREE THIS SCRIPT IS IN. This was the literal path of one machine's checkout, so running the copy
 # in any other checkout - a worktree, a contributor's clone - INJECTED VIOLATIONS INTO THAT ONE, a tree
-# the caller was not looking at, and on any other machine it did not run at all (backlog/80 T8).
+# the caller was not looking at, and on any other machine it did not run at all (backlog/fixed/80 T8).
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
@@ -270,7 +270,7 @@ restored_ii = run().count("  Commandment")
 print("RESTORED: %d violations (baseline %d)" % (restored_ii, n_base))
 
 # THE VERDICT IS THE EXIT CODE. This printed its table and exited 0 whatever it said, so a MISSED row - a
-# check that no longer fires on the real tree - passed every script that ran it (backlog/80 T8). It
+# check that no longer fires on the real tree - passed every script that ran it (backlog/fixed/80 T8). It
 # still gates no build (it mutates the tree, so it must run alone, on a committed tree), but a caller
 # can now trust its status.
 failures = []

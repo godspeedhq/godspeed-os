@@ -1,6 +1,9 @@
 # 66. A STATUS exchange between net-stack and nic-driver takes its whole second once net-stack is polling, and two fixes that should have touched it did not
 
-**Status: FIXED 2026-10-08 (`e3fcf7ed`) for what this item had become - `net dns` failing over the radio: an empty reply was refused by the kernel on every port but ARM32 (the last entry below). Verified on the VisionFive over WiFi and over the cable, and on the Pi 4 over WiFi (`9261f7d5`, the same day). The item's FIRST form, a STATUS exchange (op 3) taking its second, is not explained by it - a STATUS reply is never empty - and had stopped appearing by 2026-10-04 (below). Was: PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well.**
+**Status: CLOSED 2026-10-13.** What this item had become is fixed and verified (below). Its first form,
+the slow STATUS exchange, stopped appearing by 2026-10-04 and was never explained; nothing has shown it
+since, so it is recorded here as unexplained rather than kept open as work.
+**Was: FIXED 2026-10-08 (`e3fcf7ed`) for what this item had become - `net dns` failing over the radio: an empty reply was refused by the kernel on every port but ARM32 (the last entry below). Verified on the VisionFive over WiFi and over the cable, and on the Pi 4 over WiFi (`9261f7d5`, the same day). The item's FIRST form, a STATUS exchange (op 3) taking its second, is not explained by it - a STATUS reply is never empty - and had stopped appearing by 2026-10-04 (below). Was: PARKED 2026-09-30 by the operator, for the second time, after the boot that ran well.**
 **Found:** 2026-09-30 on the Pi 4, as `ping` over the radio running at one echo every three seconds.
 
 **2026-10-02, the symptom is mostly gone, and nobody fixed it on purpose.** The boot of commit `5dd1f1b8`

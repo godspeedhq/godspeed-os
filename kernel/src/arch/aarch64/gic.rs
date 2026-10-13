@@ -38,7 +38,7 @@ const GICD_SGIR: *mut u32 = (GICD + 0xF00) as *mut u32;
 /// rather than sent as-is - a vector of 0xF0 written into a 4-bit field is 0, which is a different
 /// interrupt entirely and would silently deliver the wrong thing.
 pub const SGI_WAKE: u32 = 0;
-// SGI 1 was the TLB shootdown's id, deleted with the shootdown (`backlog/80` K20). Left unused rather
+// SGI 1 was the TLB shootdown's id, deleted with the shootdown (`backlog/fixed/80` K20). Left unused rather
 // than renumbering SGI_TICK.
 pub const SGI_TICK: u32 = 2;
 
@@ -151,7 +151,7 @@ pub fn disable(id: u32) {
 /// priority active forever, silently blocking every later interrupt of equal or lower priority. That
 /// failure looks like "interrupts stopped happening" with nothing to point at.
 ///
-/// Returns the RAW `GICC_IAR` value, not just the interrupt ID (backlog/80 K22). For a Software
+/// Returns the RAW `GICC_IAR` value, not just the interrupt ID (backlog/fixed/80 K22). For a Software
 /// Generated Interrupt, bits [12:10] carry the CPUID of the core that raised it, and the GICv2
 /// architecture requires the EOIR write to carry the same value IAR returned - an SGI from core 2
 /// EOI'd with bare ID 0 names a different (source, ID) pair than the one that is active. So the

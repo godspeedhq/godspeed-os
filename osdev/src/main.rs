@@ -412,7 +412,7 @@ fn clean_supervisor() {
 /// decision, not something that silently changes what a build enforces. It is ONE decision: the board
 /// builds read this list (`scripts/build_gates.py`), as `conform.py` does. They each carried their own
 /// copy of seven until 2026-10-10, and every checker added since had been added here alone
-/// (backlog/80 T8).
+/// (backlog/fixed/80 T8).
 const EXTRA_CHECKS: &[&str] = &[
     "scripts/dash_check.py",
     "scripts/unsafe_check.py",
@@ -509,15 +509,15 @@ const EXTRA_CHECKS: &[&str] = &[
     // The port's SCOPE: on a branch that works on one ISA, every path it edits must be `arch/<isa>/`
     // or a file `docs/porting.md` marks `+`. It ran only in the paused `build.yml`, so its own
     // cross-check against the guide failed on EVERY branch for six days (the guide gained the radio's
-    // `wifi-driver/build.rs` row and the script did not) and nothing said so - `backlog/80` T2. On
+    // `wifi-driver/build.rs` row and the script did not) and nothing said so - `backlog/fixed/80` T2. On
     // any other branch it is silent by design, so it costs nothing here but the guide cross-check.
     "scripts/port_scope_check.py",
     // Every service the supervisor MANAGES is embedded in its image, on every arch. Each board build ran
     // it for its own arch and `osdev build` for none, so x86 - which has no `_built` list in
-    // kernel/build.rs - was never checked at all (backlog/80 T7). With no arguments it checks all four.
+    // kernel/build.rs - was never checked at all (backlog/fixed/80 T7). With no arguments it checks all four.
     "scripts/service_embed_check.py",
     // Every tracked `.rs` file carries an SPDX licence tag, and it is its tree's licence
-    // (docs/licensing.md). Thirteen carried none and nothing noticed (backlog/80 R1).
+    // (docs/licensing.md). Thirteen carried none and nothing noticed (backlog/fixed/80 R1).
     "scripts/spdx_check.py",
 ];
 
@@ -1690,7 +1690,7 @@ fn cmd_test(suite: &str) {
         "fmt-demo"     => run_fmt_demo_test(),
         "fmt-idem"     => run_fmt_idem_test(),
         // A typo is a failure, not a pass. This printed the line and exited 0, so a script or a CI
-        // step naming a suite that does not exist reported success having run nothing (backlog/80 T3).
+        // step naming a suite that does not exist reported success having run nothing (backlog/fixed/80 T3).
         other => {
             eprintln!("unknown test suite: {} - nothing was run", other);
             std::process::exit(2);

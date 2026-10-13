@@ -15,7 +15,7 @@ Task management and per-core scheduler (§9, §14).
 > `task/mod.rs::resolve_spawn_core`) and `memory::ownership::reclaim_all` (the live kill-path reclaim is
 > `arch/x86_64/page_tables.rs::reclaim_user_frames`). The steps below name the live functions; the dead
 > ones, with an unconstructed `Task` struct and `TaskId` in `task.rs`, were deleted 2026-10-10
-> (`backlog/80` K20).
+> (`backlog/fixed/80` K20).
 
 ## Static placement invariant (§9.1)
 

@@ -1,6 +1,6 @@
 # 68. After 826 rounds of chaos and a `kill all-services`, the Pi 4's display went black and the console's paint took 595 ms
 
-**Status: OPEN - observed 2026-09-30 on the Pi 4, once, at the end of the first chaos run with the radio in the image. Not investigated; recorded so it is not lost under `backlog/66`.**
+**Status: OPEN - observed 2026-09-30 on the Pi 4, once, at the end of the first chaos run with the radio in the image. Not investigated; recorded so it is not lost under `backlog/fixed/66`.**
 
 ## What the log holds
 

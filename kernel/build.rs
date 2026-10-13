@@ -8,7 +8,7 @@
 /// `SVC_SUPERVISOR_ELF` (`task/mod.rs`); `SVC_EVENTS_ELF`, `SVC_PING_ELF` and `SVC_PONG_ELF` are read by
 /// the arm32 bring-up scaffolding (`arch/arm/loadtest.rs`, `arch/arm/sched_ipc.rs`). Every other
 /// service image is embedded by the SUPERVISOR (`services/supervisor/build.rs`). This list emitted 29
-/// until 2026-10-10, 25 of which nothing included (`backlog/80` K16). The per-arch `*_built` lists
+/// until 2026-10-10, 25 of which nothing included (`backlog/fixed/80` K16). The per-arch `*_built` lists
 /// below still name the services each port builds - `scripts/service_embed_check.py` reads them - but
 /// for the kernel they now decide only these four; their notes about `LoadFailed` describe the time
 /// before the images moved.
@@ -67,7 +67,7 @@ fn main() {
     println!("cargo:rustc-env=GODSPEED_TARGET_ARCH={arch}");
     // WHERE git keeps that log, asked of git. This looked for `.git/logs/HEAD` relative to the build
     // script's directory, `kernel/`, where it never is, so the trigger was never registered and the
-    // stamp went stale until something else rebuilt the kernel (`backlog/80` K16). `--git-path`
+    // stamp went stale until something else rebuilt the kernel (`backlog/fixed/80` K16). `--git-path`
     // also answers in a worktree, where `.git` is a file and the log lives elsewhere.
     if let Some(head_log) = std::process::Command::new("git")
         .args(["rev-parse", "--git-path", "logs/HEAD"])

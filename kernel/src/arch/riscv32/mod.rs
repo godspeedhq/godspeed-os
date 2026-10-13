@@ -34,7 +34,7 @@ pub unsafe extern "C" fn _start() -> ! {
         "la   t1, __bss_end",
         "1:",
         "bgeu t0, t1, 2f",
-        "sw   zero, 0(t0)", // RV32: no `sd`, and a 4-byte word (backlog/80 K24)
+        "sw   zero, 0(t0)", // RV32: no `sd`, and a 4-byte word (backlog/fixed/80 K24)
         "addi t0, t0, 4",
         "j    1b",
         "2:",
@@ -502,7 +502,7 @@ pub mod pci {
     pub fn nic() -> Option<PciDevice> { None }
     /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
     /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
-    /// backlog/80 K1).
+    /// backlog/fixed/80 K1).
     pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
     pub fn init() {}

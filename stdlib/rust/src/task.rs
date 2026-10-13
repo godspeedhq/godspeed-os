@@ -43,7 +43,7 @@ pub fn sleep_quantum(ctx: &ServiceContext) {
     // A quantum AS A DURATION, not one counter tick. One tick was right where the kernel floors a
     // short sleep to the next scheduler tick, and wrong on a real Pi 2: its counter runs at 1 MHz, so
     // one tick is 1 us, which the ARMv7 sub-tick sleep path (`handle_sleep`) takes, and this returned
-    // after about a microsecond (`backlog/80` G4). On a clock the kernel could not calibrate,
+    // after about a microsecond (`backlog/fixed/80` G4). On a clock the kernel could not calibrate,
     // `sleep_ms` falls back to that one tick - the floor, which is still one quantum there.
     ctx.sleep_ms(10);
 }

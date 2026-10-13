@@ -22,7 +22,7 @@ statement about a run in the past, and rewriting it would falsify the record - t
 
 A FACT WHOSE SOURCE IS GONE FAILS. Until 2026-10-10 each fact was added only when its source was FOUND
 (`if qd:`, `if ring:` ...), so a constant that was renamed or moved silently dropped its own fact and
-the run passed (backlog/80 T8). Now `facts()` records every source it could not read (`MISSING`) and
+the run passed (backlog/fixed/80 T8). Now `facts()` records every source it could not read (`MISSING`) and
 the run fails on any. The count printed is of matched doc statements, not of facts. A line carrying a date,
 `Amendment`, `Verified:` or `was ... now` is skipped unless it is a STATUS line. When a code-versus-
 code check fails, its failures are printed and the doc facts are not reported on that run.
@@ -316,7 +316,7 @@ def dispatch_utils_problems():
 
     # PINNED. Lower it freely when a command gains its help/version intercept; raising it needs a
     # reason in the commit message. 7 on 2026-09-26 (fmt, tcp, serve, random, gpio, spawncap,
-    # spawnwired); 0 since 2026-10-10, when all seven joined UTILS with a help block (backlog/80 H8).
+    # spawnwired); 0 since 2026-10-10, when all seven joined UTILS with a help block (backlog/fixed/80 H8).
     BASELINE = 0
     if len(missing) > BASELINE:
         problems.append(
@@ -414,7 +414,7 @@ def budget_ordering_problems():
 
 # A FACT WHOSE SOURCE CANNOT BE FOUND IS A FAILURE. Each fact used to be added only `if` its source
 # parsed (`if qd:`, `if ring:` ...), so renaming `QUEUE_DEPTH` removed its own check and the run still
-# passed, printing a smaller count nobody compares (backlog/80 T8). `facts()` records each source it
+# passed, printing a smaller count nobody compares (backlog/fixed/80 T8). `facts()` records each source it
 # could not read here, and `main` fails on any.
 MISSING = []
 
@@ -425,7 +425,7 @@ def lost(name, source):
 
 def limine_version_problems():
     """Every workflow fetches the Limine release.yml ships. Three pinned v12.2.0 while the release built
-    with v12.3.1, so the QEMU suites in CI tested a bootloader nobody ships (backlog/80 T9)."""
+    with v12.3.1, so the QEMU suites in CI tested a bootloader nobody ships (backlog/fixed/80 T9)."""
     import glob
     wf = os.path.join(ROOT, ".github", "workflows")
     m = re.search(r"(?m)^\s*LIMINE_VERSION:\s*(v[0-9.]+)", read(".github/workflows/release.yml"))

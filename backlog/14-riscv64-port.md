@@ -57,7 +57,7 @@ end; the port itself is not open work.
 >
 > ```
 > VisionFive riscv64  22,872 rounds / 136,906 kills, then 100 rounds on the FINAL binary. 461/0.
-> Wyse (Intel)        100 rounds. backlog/19 fixed and verified: ping recovers with NO reboot.
+> Wyse (Intel)        100 rounds. backlog/fixed/19 fixed and verified: ping recovers with NO reboot.
 > T630 (AMD)          100 rounds / 646 kills. RTL8168 confirmed - it runs the changed path too.
 > Pi 2 (arm32)        100 rounds / 558 kills. selfcheck 452/0 x3. ping 0% loss around the storm.
 > Pi 4 (aarch64)      100 rounds / 583 kills. 61 controller resets, 0 HCRST timeouts. 461/460/463, 0 fails.

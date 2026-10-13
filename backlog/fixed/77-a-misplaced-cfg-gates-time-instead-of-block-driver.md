@@ -1,6 +1,6 @@
 # 77. A misplaced `#[cfg]` in the supervisor gates `time`'s spawn, not `block-driver`'s
 
-**Status: CLOSED 2026-10-11 - the attribute was REMOVED on 2026-10-10 (`68922715`, `backlog/80` V5) and
+**Status: CLOSED 2026-10-11 - the attribute was REMOVED on 2026-10-10 (`68922715`, `backlog/fixed/80` V5) and
 this entry was left saying OPEN. `time` now starts in every build; verified below.** Found 2026-10-06 by the
 documentation audit.
 
@@ -41,7 +41,7 @@ is what the gate always said. Each test build that changes should be run once af
 ## Closed (2026-10-11)
 
 The fix was not the one proposed above. The attribute was removed rather than moved (`68922715`, under
-`backlog/80` V5): every build has started `block-driver` all along and its suites run with it, so gating
+`backlog/fixed/80` V5): every build has started `block-driver` all along and its suites run with it, so gating
 it now would have taken it away from builds that use it. The comment where the attribute sat in
 `services/supervisor/src/main.rs` says so, and names `board::BLOCK_CORE` as `block-driver`'s placement,
 which also corrects the stale `preferred_core` paragraph.

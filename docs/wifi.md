@@ -3437,7 +3437,7 @@ The rule all four stages obey: a respawn inherits a chip the previous instance l
 step written against the power-on state has to say what it does with a running one.
 
 **What stays open from the same run**, recorded rather than folded in: the console after the storm
-(`backlog/68`), and the parked lag showing through the post-storm ping as expected (`backlog/66`).
+(`backlog/68`), and the parked lag showing through the post-storm ping as expected (`backlog/fixed/66`).
 Section 43's claim that a respawn "rejoins the network last joined" is true only once identification
 succeeds, which this section is the missing half of.
 

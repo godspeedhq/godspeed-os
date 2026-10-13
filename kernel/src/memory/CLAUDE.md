@@ -21,7 +21,7 @@ Physical memory management (§10). Unsafe boundary: raw physical addresses appea
 
 > **Doc-drift correction (documentation-audit Audit 2, 2026-07-15; kernel-audit M1).** A
 > `TaskMemoryOwner` in `ownership.rs`, with a `reclaim_all`, once stood for what is below, and had no
-> callers; the file was deleted 2026-10-10 (`backlog/80` K20). The **live** paths are: limit enforcement =
+> callers; the file was deleted 2026-10-10 (`backlog/fixed/80` K20). The **live** paths are: limit enforcement =
 > `task/scheduler.rs`'s `TASK_ALLOC_BYTES` + `current_task_claim_alloc` (returns `None` =
 > `AllocDenied`); kill-path frame reclaim = `arch/x86_64/page_tables.rs::reclaim_user_frames`. The
 > *behaviour* described below (shootdown-before-free, deferred self-kill PML4 via `CORE_PENDING_PML4`)

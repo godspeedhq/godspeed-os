@@ -180,7 +180,7 @@ fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
 /// Answer one request on a dwc2 granted NO hardware window or arena, which has nothing to serve it with.
 ///
 /// The fallback loop used to count such a message and drop it - its reply capability with it - so a
-/// client waited out its whole deadline against a clean log (backlog/80 D6). Each is answered here as
+/// client waited out its whole deadline against a clean log (backlog/fixed/80 D6). Each is answered here as
 /// `dispatch` answers it with nothing bound, routed by op the same way: the supervisor's report ask
 /// with an absent device, a radio op `ST_NO_DEVICE` (an `OP_SYNC` only gives its capability back, as
 /// `rtl::serve` does), a net op the empty `[0]`, and a block op `STATUS_NO_DISK` - no disk can be bound to

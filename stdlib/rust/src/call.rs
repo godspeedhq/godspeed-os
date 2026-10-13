@@ -136,7 +136,7 @@ pub const NOTICE_AFTER_SECS: i64 = 2;
 ///
 /// `keep`, when given, receives every key the wait reads that is not a quit key, in order. A wait
 /// that watches for `q` has to read the console, and without it whatever the operator typed ahead
-/// is lost (`backlog/80` H16).
+/// is lost (`backlog/fixed/80` H16).
 pub fn request_within_notice(
     ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64, notice: Option<&dyn Fn()>,
     keep: Option<&dyn Fn(u8)>,

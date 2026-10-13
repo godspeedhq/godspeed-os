@@ -346,7 +346,7 @@ impl<'a> Fs<'a> {
 
     /// Hand every key a noticing wait reads, other than a quit key, to `keep` - in order - instead of
     /// discarding it. A wait that watches the console for `q` takes what is typed; without this,
-    /// typing ahead while a command waits loses those keys (`backlog/80` H16). Only matters with a
+    /// typing ahead while a command waits loses those keys (`backlog/fixed/80` H16). Only matters with a
     /// notice, since only a noticing wait reads the console.
     pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Fs<'a> {
         self.keep = Some(keep);
@@ -655,7 +655,7 @@ impl<'a> Fs<'a> {
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
         // Record what the capability CARRIES, not what was asked: `fs` narrows a sealed file to
         // read-only, and APPEND is a request flag that never becomes a kernel right. A slot the
-        // kernel cannot describe is no capability we can use (`backlog/80` G2).
+        // kernel cannot describe is no capability we can use (`backlog/fixed/80` G2).
         let granted = match ctx.query_cap_rights(cap) {
             Some(r) => (r as u8) & (crate::cap::READ | crate::cap::WRITE),
             None => return Err(Error::Failed),
@@ -894,7 +894,7 @@ impl<'a> Fs<'a> {
     /// ([`create_sized`](Fs::create_sized)), then filled chunk by chunk from offset 0. A failure
     /// part way leaves a file of the full size whose tail is not yet written, and is reported.
     /// (Until 2026-10-10 the file was created from its first chunk alone, sized for that chunk, so
-    /// `services/fs` refused the second as "write past extent" - `backlog/80` G1.)
+    /// `services/fs` refused the second as "write past extent" - `backlog/fixed/80` G1.)
     pub fn write(&mut self, path: impl AsRef<[u8]>, data: &[u8]) -> Result<(), Error> {
         if data.len() <= IO_CHUNK {
             self.call(OP_WRITE_FILE, path.as_ref(), data, self.secs())?;

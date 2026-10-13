@@ -249,7 +249,7 @@ pub fn enable() {
     pl011_write(b")\r\n");
     // Said BEFORE the selftest, because it is already true: `enable_on_this_core` turns translation
     // and the caches on together, so the selftest below runs cached. It used to be printed after,
-    // which read as though the selftest had passed with the caches off (backlog/80 K25).
+    // which read as though the selftest had passed with the caches off (backlog/fixed/80 K25).
     pl011_write(b"arm32: caches ON (I + D + branch prediction)\r\n");
     selftest();
 }

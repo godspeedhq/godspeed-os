@@ -40,7 +40,7 @@ impl Mmio {
     ///
     /// It also refuses an access that is not aligned to its own size. An unaligned volatile access is
     /// undefined behaviour in Rust, and on Device memory an alignment fault on Arm; this "must be
-    /// aligned" was a comment until 2026-10-10, so a safe call could reach it (`backlog/80` S6). The
+    /// aligned" was a comment until 2026-10-10, so a safe call could reach it (`backlog/fixed/80` S6). The
     /// ADDRESS is checked, not only the offset, so a window that does not start on a boundary is
     /// caught too.
     #[inline]

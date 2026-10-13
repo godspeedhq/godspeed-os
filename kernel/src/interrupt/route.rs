@@ -33,7 +33,7 @@ static IRQ_TABLE: SpinLock<[Option<EndpointId>; MAX_IRQ]> = SpinLock::new([None;
 /// level source cannot storm with no one to service it. The respawned driver's registration is the
 /// moment someone can again, so this unmasks: until 2026-10-10 nothing did, and a respawned
 /// level-triggered driver that waited for its first interrupt before calling `IrqUnmask` waited on a
-/// line switched off at the controller (`backlog/80` K17). Whoever holds the route owes the unmask;
+/// line switched off at the controller (`backlog/fixed/80` K17). Whoever holds the route owes the unmask;
 /// a new holder takes the debt on by holding it. `deliver` masks again on the first interrupt, as it
 /// always has, and a no-op for edge and MSI vectors, where masking never applied.
 pub fn register(irq: u8, endpoint: EndpointId) {

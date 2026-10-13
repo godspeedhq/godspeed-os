@@ -37,7 +37,7 @@ SDK         = REPO_ROOT / "sdk"
 # By FULL PATH. This was a set of file NAMES matched with `rs_file.name in SDK_PERMITTED`, so any
 # `mmio.rs` anywhere under `sdk/` - a new crate's, say - was waved through uncounted. And a permitted
 # file's count was never compared with anything: the audit's table says how many each holds, and a
-# new `unsafe` in `mmio.rs` changed no number this script looked at (backlog/80 T6).
+# new `unsafe` in `mmio.rs` changed no number this script looked at (backlog/fixed/80 T6).
 SDK_PERMITTED = {"sdk/rust/src/syscall.rs", "sdk/rust/src/mmio.rs", "sdk/rust/src/dma.rs",
                  "sdk/rust/src/adversarial.rs"}
 

@@ -94,7 +94,7 @@ def gates():
     """The same list `osdev build` runs, read from it (scripts/build_gates.py). This was "the same
     set `arm_build.py` runs", seven checkers listed by hand "so ADDING a checker is a decision each
     build path makes" - and every checker added since was added to one path only, so a VisionFive image
-    skipped seventeen of `osdev build`'s gates (backlog/80 T8)."""
+    skipped seventeen of `osdev build`'s gates (backlog/fixed/80 T8)."""
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import build_gates
     build_gates.run_all()

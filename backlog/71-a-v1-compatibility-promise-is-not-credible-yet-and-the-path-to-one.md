@@ -75,7 +75,7 @@ the 2026-10-11 survey:
 **The principle that decides what goes in `gs` (settled 2026-10-11).** The SDK answers *what can this
 kernel do, and how is it reached safely*: the syscall ABI and the audited `unsafe` (CLAUDE.md 18.1),
 mirroring the kernel and changing when it changes (this branch retired four syscalls and their wrappers,
-`backlog/80` K14). `gs` answers *how a Godspeed program is written*: the vocabulary a contributor learns,
+`backlog/fixed/80` K14). `gs` answers *how a Godspeed program is written*: the vocabulary a contributor learns,
 shaped so the easy path keeps the model, and the part that must hold still. Two layers so the kernel can
 move without moving contributors. So the test for `gs` is not "is it safe?" - the SDK's types already are -
 but **"must a contributor name it and rely on it?"**

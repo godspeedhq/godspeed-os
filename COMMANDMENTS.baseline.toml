@@ -571,7 +571,7 @@ CPU_CLOCK          = 18
 # service?" first. The numbers are the ABI every built service binary depends on, so they are pinned by
 # VALUE, not merely by name. (9 is absent by history, not by accident. So are 7, 19, 38 and 39: the four
 # spawn-by-name syscalls, retired 2026-10-10 because the kernel catalogue holds `supervisor` alone and
-# they could only refuse - `SpawnImage`, 52, is how a service starts. backlog/80 K14.)
+# they could only refuse - `SpawnImage`, 52, is how a service starts. backlog/fixed/80 K14.)
 [kernel.syscalls]
 Send                     = 1
 Recv                     = 2

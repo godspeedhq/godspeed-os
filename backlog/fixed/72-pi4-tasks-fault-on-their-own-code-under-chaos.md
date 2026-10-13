@@ -1,6 +1,6 @@
 # 72. Pi 4 tasks fault on their own code under `chaos max-carnage`
 
-**Status: FIXED 2026-10-04 (`f587acbe`), verified on the card: a fault-time `AT` showed the core holding a
+**Status: CLOSED 2026-10-13: FIXED 2026-10-04 (`f587acbe`), verified on the card: a fault-time `AT` showed the core holding a
 stale cached translation that a local flush clears, refilled after the switch's flush because no `isb`
 followed the `TTBR0` write. With the `isb`, a 50-round storm and two `selfcheck`s ran with no user fault. One hypothesis (a skipped TLB flush on a recycled page-table root) was tested on hardware and
 FALSIFIED; the change it produced is kept because it is strictly more correct.**
@@ -173,7 +173,9 @@ link comes up") and never did, and something kept using a capability to endpoint
 (`cap::get: ResourceId(104) gen mismatch cap=729 rec=759 liveness=Alive`). A manual `kill net-stack`
 brought DHCP and the gateway back at once, but the shell's `ping 8.8.8.8` still said `net-stack not
 responding`. Both look like the stale-peer-cap class (a client that does not reacquire after a peer
-respawns); they need their own entry.
+respawns); they need their own entry. *(2026-10-13: not seen since. The Pi 4's 1000-round storms of 2026-10-11 ended
+with `selfcheck` 536/0, `dns` included (`backlog/fixed/80`), so the network came back on its own there; the
+shell half was `backlog/fixed/73`'s. No entry was opened.)*
 
 ## Related, latent
 

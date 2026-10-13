@@ -31,7 +31,7 @@ use godspeed_sdk::ServiceContext;
 /// ABSENT arms, written for the in-kernel USB stack whose syscall answered "busy" while a stick's flash
 /// was occupied. That stack is gone, and the service path answers only done or failed (`dev_read`,
 /// `dev_write` below) - the waiting already happens inside the host's Bulk-Only layer - so the loop always
-/// ended on its first attempt and the two arms were never reached (`backlog/80` V9). What is left is
+/// ended on its first attempt and the two arms were never reached (`backlog/fixed/80` V9). What is left is
 /// what it really did.
 fn request(ctx: &ServiceContext, what: &str, lba: u64, mut op: impl FnMut() -> i64) -> bool {
     match op() {

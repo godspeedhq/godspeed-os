@@ -429,7 +429,7 @@ pub unsafe extern "C" fn ud2_syscall_entry() {
         // The same report-and-halt-every-core path as every other ring-0 exception. The #UD frame
         // has no error code, so it is exactly the frame `exc_stub_noec` expects. This was `cli; hlt`
         // on one core with nothing printed until 2026-10-10, so a kernel trap was invisible until
-        // the liveness watchdog noticed the dark core (`backlog/80` K8).
+        // the liveness watchdog noticed the dark core (`backlog/fixed/80` K8).
         "3:",
         "jmp {kernel_exception}",
         kernel_exception = sym super::boot::exc_stub_noec,

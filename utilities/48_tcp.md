@@ -97,7 +97,7 @@ not answer within 20s - see its log`.
 
 **This was not always true, and its absence cost a power cycle.** The request used a bare
 `request_with_reply`, which parks the shell inside the syscall where it cannot read the keyboard - so
-on a Dell Wyse a `tcp` net-stack never answered froze the prompt with no way out (`backlog/29`).
+on a Dell Wyse a `tcp` net-stack never answered froze the prompt with no way out (`backlog/fixed/29`).
 
 What `q` stops is the SHELL'S wait, not net-stack's transaction: net-stack keeps working its own 8 s
 budget out. That is rule 11's concern and it is named here rather than glossed. It does not wedge the

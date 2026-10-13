@@ -1220,7 +1220,7 @@ fn hub_port_status(
     // Consecutive hub-probe failures across ALL ports of a hub. A halt is a property of the shared
     // EP0 endpoint, so every port's probe fails together - which makes any of them evidence, and the
     // count meaningful only when unbroken (a single success resets it). Owned above `'reenum`, not a
-    // static (Invariant 9, backlog/80 D9).
+    // static (Invariant 9, backlog/fixed/80 D9).
     probe_fails: &mut u32,
 ) -> Option<bool> {
     const RING: usize = 0x1000;
@@ -2668,7 +2668,7 @@ fn enumerate_one(
     // be BOUNDED, because retrying it forever is what produces the ~1 s re-enumeration every ~12 s.
     enum_failed: &mut bool,
     // Whether the fixed command-failure hint has been said (`hc_wedged_now`). Owned above `'reenum`
-    // with `diag_dumped`, not a static (Invariant 9, backlog/80 D9).
+    // with `diag_dumped`, not a static (Invariant 9, backlog/fixed/80 D9).
     hint_said: &mut bool,
 ) {
     *hc_wedged = false;
@@ -3586,7 +3586,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // not a `static` (Invariant 9).
     let mut no_cap_drops: u64 = 0;
     // Whether the block path has said "no disk is bound" since a disk was last served; a static
-    // until 2026-10-10 (Invariant 9, backlog/80 D9). Here for `no_cap_drops`'s reason.
+    // until 2026-10-10 (Invariant 9, backlog/fixed/80 D9). Here for `no_cap_drops`'s reason.
     let mut no_disk_said = false;
     let mut work_cycles: u64 = 0;
     let mut work_t0: u64 = 0;
@@ -3661,7 +3661,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // behind every one of those lines. The failure itself is still reported loudly every time;
     // only the fixed explanatory dump is said once (26.7 - visible failure, bounded output).
     let mut diag_dumped = false;
-    // The two latches that were statics (Invariant 9, backlog/80 D9), here for `diag_dumped`'s reason:
+    // The two latches that were statics (Invariant 9, backlog/fixed/80 D9), here for `diag_dumped`'s reason:
     // a re-enumeration must not reset them, and a respawn - a fresh instance - does.
     let mut diag_hint_said = false;
     let mut probe_fails: u32 = 0;
@@ -4557,7 +4557,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // nothing programmed the Pi 4 VL805's MSI, so this timeout WAS the polling interval - and
             // 250 ms per keystroke is a quarter-second of lag on every character typed. (Note
             // 2026-10-09: the VL805's MSI is enabled now, by `enable_msi` in arch/aarch64/pcie.rs;
-            // the dead `false` stub beside it was deleted 2026-10-10, backlog/80 K20.)
+            // the dead `false` stub beside it was deleted 2026-10-10, backlog/fixed/80 K20.)
             //
             // Rather than shorten it everywhere, which would burn ~100 wakeups/second on boards that
             // are already interrupt-driven and undo the power work, it ADAPTS: if several waits in a
@@ -5471,7 +5471,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             // Connected AND not already tried, on two consecutive reads: a real arrival.
                             // The same confirmation the HID-driven scan has (`hub_seen`) - one connected
                             // read is a reading, two is an event. This took ONE until 2026-10-10, the
-                            // phantom-arrival hole that scan's comment describes (backlog/80 D8).
+                            // phantom-arrival hole that scan's comment describes (backlog/fixed/80 D8).
                             Some(true) if hp < 64 && hub_tried & (1u64 << hp) == 0
                                 && { hub_seen[hp as usize] = hub_seen[hp as usize].saturating_add(1);
                                      hub_seen[hp as usize] >= 2 } => {
@@ -5557,7 +5557,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // ONLY the new-device arm needs a free slice. The whole scan was gated on
             // `ndev < MAX_HID` until 2026-10-10, so with two HIDs bound a root-port dongle's unplug,
-            // the port-leave tracking and the poison clearing all stopped (backlog/80 D7).
+            // the port-leave tracking and the poison clearing all stopped (backlog/fixed/80 D7).
             {
                 for p in 1..=max_ports {
                     let c =

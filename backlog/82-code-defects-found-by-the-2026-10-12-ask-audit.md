@@ -2,7 +2,7 @@
 
 **Status: FIXED IN CODE on `feat/ask`, 2026-10-12; open until the branch's hardware cards pass.** The
 2026-10-12 audit of `feat/ask` changed documents and comments only (`9ce5c479`); the code defects it found
-were listed here and fixed separately the same day, as for `backlog/80`. Every item carries a FIXED note.
+were listed here and fixed separately the same day, as for `backlog/fixed/80`. Every item carries a FIXED note.
 Two `dwc2` paths that answered a block request `STATUS_ERR` while a disk could be bound belong to
 `backlog/57` and are recorded (and fixed) there.
 

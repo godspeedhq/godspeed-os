@@ -1,6 +1,8 @@
 # 29. A `tcp ... big` on the Wyse that never reached net-stack, and the unbounded wait behind it
 
-**Status: CLOSED, hardware-verified on a Dell Wyse 2026-09-16.** Three defects, found in this order
+**Status: CLOSED, hardware-verified on a Dell Wyse 2026-09-16; moved to `fixed/` 2026-10-13.** Of the
+"Also still open" list at the end, the echo corruption is `backlog/87`, and the T630 has run this
+branch's work many times since (it merged). Three defects, found in this order
 and each hidden by the one in front of it: an unbounded, unescapable wait in the shell; a held request
 expired against a guessed deadline instead of its client's; and - the actual cause - a wait that slept
 on work already sitting in its own stash. ~20 s per command to ~200 ms.
@@ -275,7 +277,7 @@ line named the victim and its patience.
 Measured effect in `osdev test shell`: patience-expiry drops **2 -> 0**. The one remaining drop is a
 full stash during a burst, which is a different and bounded case.
 
-## Also still open
+## Also still open (as of 2026-09-16; see the status line)
 
 - **The console echo corrupts characters on this box** - duplicated runs, inserted commas - while the
   shell's input buffer is fine. Alongside `xhci: probes 0/2172 ok` (every hub probe failing) and `a

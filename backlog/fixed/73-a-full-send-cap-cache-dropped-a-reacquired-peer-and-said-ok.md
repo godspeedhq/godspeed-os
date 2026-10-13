@@ -1,6 +1,7 @@
 # 73. A full send-cap cache dropped a reacquired peer and said it was reacquired
 
-**Status: FIXED 2026-10-04, verified on the card (one residual recorded below). Found from the first Pi 4 storm that survived (`backlog/72`):
+**Status: CLOSED 2026-10-13: FIXED 2026-10-04, verified on the card; the one residual recorded below is
+`backlog/86` now. Found from the first Pi 4 storm that survived (`backlog/fixed/72`):
 after it, the shell could not reach `net-stack` at all, and killing `net-stack` did not help.**
 
 ## What was seen
@@ -64,7 +65,7 @@ Reply from 8.8.8.8: bytes=32 time=42ms TTL=117
 
 No eviction was logged (`sdk: the send-cap cache is full` never appeared), so 32 holds the shell's peers.
 
-**Residual, not this bug.** After `selfcheck`'s own `chaos kill-storm events`, some client went on sending
+**Residual, not this bug** (`backlog/86` since 2026-10-13). After `selfcheck`'s own `chaos kill-storm events`, some client went on sending
 to the `events` endpoint one generation late for about thirty seconds, in bursts that line up with the
 `events` part of `selfcheck` (`cap::get: ResourceId(116) gen mismatch cap=783 rec=803 liveness=Alive`, 31
 lines), then stopped. The SDK trace path reacquires after a failed send, so the holder is more likely a

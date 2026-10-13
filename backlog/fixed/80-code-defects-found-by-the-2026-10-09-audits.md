@@ -1,6 +1,8 @@
 # 80. Code defects found by the 2026-10-09 documentation audits
 
-**Status: CLOSED on `fix/backlog-80`, 2026-10-11.** Fixed in code on 2026-10-10 - every item below
+**Status: CLOSED on `fix/backlog-80`, 2026-10-11; moved to `fixed/` 2026-10-13.** K1's open part, the
+Pi 4's and VisionFive's PCIe `xhci` window, is `backlog/85` now; the silent shell-suite run below is
+pointed at from `backlog/62`. Fixed in code on 2026-10-10 - every item below
 carries a FIXED note - and every hardware card those notes name has passed: the T630's two (D1, K17) on
 2026-10-10, and the Pi 2's three (G4, K25, K28), the Pi 4's two (K21, K22) and the VisionFive's (D11) on 2026-10-11. The audits changed documents and comments only; the items
 were fixed separately, and the kernel ones with the operator's go-ahead.
@@ -284,7 +286,7 @@ the readers' findings, each with its evidence, and none has been reproduced by r
   poll in the DNS loop, and `ping`'s ARP - so they can consume a client's request. Fix: `nic_req`/`nic_req_ms`.
   **FIXED on `fix/backlog-80`, 2026-10-10:** the ARP replies and the DNS loop's receive poll go through the helpers that set a client's request aside.
 - **D5. `net-stack` op 21's failure reply is empty**, which `Reply::send` `debug_assert!`s against (a debug
-  build panics), and an empty message is refused on three ports (backlog/66). Fix: a status byte.
+  build panics), and an empty message is refused on three ports (backlog/fixed/66). Fix: a status byte.
   **FIXED on `fix/backlog-80`, 2026-10-10:** op 21's reply is `[status, bytes...]` - 0 and the data, or 1 alone - and `gs::net::Net::tcp` reads it; no empty message is sent.
 - **D6. `dwc2`'s fallback loop (no MMIO/DMA grant) takes requests without answering or reclaiming their reply
   caps**, so clients hang to their deadline. Fix: answer through `dispatch`/`answer_no_disk`.

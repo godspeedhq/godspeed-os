@@ -353,7 +353,7 @@ and four instruction sets**. The wait has never once reached its budget outside 
 
 ### The abandon path fired for real, twice (Pi 4, 2026-10-11)
 
-A `chaos max-carnage all-services 1000` on the Pi 4 (image `1b85ffa3`, `backlog/80`'s regression run)
+A `chaos max-carnage all-services 1000` on the Pi 4 (image `1b85ffa3`, `backlog/fixed/80`'s regression run)
 logged `kill: ABANDONED slot 12` at 09:15:45 and `kill: ABANDONED slot 13` at 09:36:15. Both name
 `pwm-audio` on core 2, both say the core took no interrupts in the 135,000,000-tick window (2.5 s at the
 Pi 4's 54 MHz counter), and both conclude that the core "is wedged rather than slow". The kernel stayed

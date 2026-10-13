@@ -645,7 +645,7 @@ pub fn confine_device(bdf: u32, arena_phys: u64, arena_len: u64) -> bool {
 
     // NOWHERE TO RECORD IT, NO CONFINEMENT. `release_device` frees a domain only through its record,
     // and a confinement it cannot find is an I/O page table leaked for good and a DTE never reverted.
-    // That happened silently when the table was full, until 2026-10-10 (`backlog/80` K11). Refused
+    // That happened silently when the table was full, until 2026-10-10 (`backlog/fixed/80` K11). Refused
     // here, before anything is built, and said: the device stays in passthrough, exactly as on a
     // machine with no IOMMU, and its driver is therefore NOT confined.
     {

@@ -1803,7 +1803,7 @@ CHECKS = [
 # forgotten. Each line names the part left to a human - most commandments now have a check, and none
 # is covered whole, so a commandment with a check is listed here too, for its uncovered half.
 #
-# Rewritten 2026-10-10 (backlog/80 T4). The list said IV, V, VII and IX were "not built" while
+# Rewritten 2026-10-10 (backlog/fixed/80 T4). The list said IV, V, VII and IX were "not built" while
 # IV-contract-authority, V-managed-watched, V-no-panic, VII-service-grants and two IX checks ran on
 # every build, and the summary line counted the `-` of `integrity-baseline` as a commandment, so it
 # said 10/10 mechanised with VIII uncovered.
@@ -1974,7 +1974,7 @@ def report(pins, exemptions):
     print(f"    {BOLD}rule{OFF}    ({kinds.get('rule', 0)})  a fixed truth. Any deviation is a FAILURE. "
           f"§4.3 says six responsibilities; the kernel spawns exactly one service; nothing escapes Chaos.")
     # Read from the baseline, never typed in: these said 49 syscalls and 218 service configs long
-    # after the pins held 54 and 1 (backlog/80 T4).
+    # after the pins held 54 and 1 (backlog/fixed/80 T4).
     nsys = len(pins.get("syscalls", {}))
     nconf = len(pins.get("service_configs", []))
     print(f"    {BOLD}record{OFF}  ({kinds.get('record', 0)})  a snapshot, NOT an endorsement. {nsys} syscalls "

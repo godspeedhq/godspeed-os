@@ -273,7 +273,7 @@ pub fn property_call(req: &mut [u32]) -> Option<()> {
 /// `dev_addr` is the controller's PCI address in the usual `(bus << 20) | (dev << 15) | (fn << 12)`
 /// encoding.
 ///
-/// Takes `MBOX_LOCK` like every other caller after `mmu::enable` (backlog/80 K26). Its one caller,
+/// Takes `MBOX_LOCK` like every other caller after `mmu::enable` (backlog/fixed/80 K26). Its one caller,
 /// `pcie::init`, runs after the MMU is on and after the secondaries are started, so another core's
 /// syscall (the expander GPIO, the Arm clock) can be inside the mailbox at the same moment; without
 /// the lock the two requests share the one `MBOX` buffer. The lock cannot be taken with the MMU off

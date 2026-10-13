@@ -244,7 +244,7 @@ The card (`build/kernel7-R2c.img`) predicts, on a replug where a block's STATUS 
 completed after 1 transaction error(s), re-run as Linux does`, the download `(1 try)`, RUNNING, channel 1.
 Refuted by: `STATUS stage gave up after 3 transaction errors` followed by the same wall of timed-out reads.
 
-**Seen once at boot, 2026-10-11 (the `backlog/80` Pi 2 card, image `38c0d92e`): exactly that.** The dongle
+**Seen once at boot, 2026-10-11 (the `backlog/fixed/80` Pi 2 card, image `38c0d92e`): exactly that.** The dongle
 on hub port 2 verified its firmware, one block's STATUS stage errored three times (`STATUS stage gave up
 after 3 transaction errors`), and every read after it timed out - all six download tries, and again after
 `wifi radio on` restarted the driver. Unplugged and put back on port 4, it came up at once: one try,
@@ -2929,7 +2929,7 @@ logged per probe at all: the selftest's PASS line counts them, `backlog/fixed/56
 - **`selfcheck`: 527 run, 1 failed** - `dns: ICMP to 8.8.8.8 works but no name resolves`. `net-stack`'s
   receive and transmit to `nic-driver` (ops 4 and 0) each went unanswered for about 2 s, and `nic-driver`'s
   answers arrived after `net-stack` had given up (`reply cap is dead`), with no slow or missing answer from
-  the radio logged in that window. That is `backlog/66`'s signature on the Pi 4 - `nic-driver` waking late
+  the radio logged in that window. That is `backlog/fixed/66`'s signature on the Pi 4 - `nic-driver` waking late
   on core 1 - recorded there; nothing this branch changed touches that path.
 
 **Two things the dongle's arrivals showed.**
@@ -2951,19 +2951,19 @@ tries: `net-stack`'s receive and transmit requests to `nic-driver` went about 2 
 `nic-driver`'s replies arrived after `net-stack` had given up, while every exchange `nic-driver` logged
 with the radio was answered within 2 ms. With the cable IN, `net dns google.com` and `net dns example.com`
 resolved every time. So the resolver and the UDP path are sound, and what fails is the radio-bridged path
-on the Pi 4: `nic-driver` answering late on core 1 (`backlog/66`) - and, separately, the radio's network
+on the Pi 4: `nic-driver` answering late on core 1 (`backlog/fixed/66`) - and, separately, the radio's network
 is the guest one (`192.168.11.x`, DNS `194.168.4.100`, outside), not the cable's (`192.168.4.x`, DNS the
 router). An earlier draft of this note read the late answers as landing "on a one-second grid"; those
 times are `net-stack`'s own retry boundaries, not `nic-driver`'s wake, and that reading was withdrawn.
 Nothing this branch changed touches `nic-driver`'s GENET path beyond comments.
 
 **And `selfcheck` with the cable in, same boot: 526 run, 0 failed, 0 skipped** (`run: ran 526, failed 0`). The one failure on the
-radio is the radio-bridged path's (`backlog/66`), not anything `selfcheck` checks being broken.
+radio is the radio-bridged path's (`backlog/fixed/66`), not anything `selfcheck` checks being broken.
 
 **Corrected 2026-10-08: `nic-driver` was not waking late.** A kernel flight recorder on the VisionFive
 showed the request answered in milliseconds and the answer refused: a drain that found no frame was
 answered with an empty message, which the kernel refused on every port but ARM32 - which is why the Pi 2
-below resolved on the same network. Fixed in `e3fcf7ed`; `backlog/66` has the account.
+below resolved on the same network. Fixed in `e3fcf7ed`; `backlog/fixed/66` has the account.
 
 **And the Pi 2, the same day, the cable out and the dongle carrying the link** (`nic-driver: the cable is
 out - the radio carries the link`), joined to the SAME guest network the Pi 4's radio was on:
@@ -2981,7 +2981,7 @@ What changed since section 49, all of it on the cards below:
   frame with an empty message, and the kernel refused one on x86, AArch64 and RISC-V; ARM32 accepted it.
   So over the radio, where most drains are empty while an answer is in flight, `net-stack` waited out a
   second per drain and `net dns` ran out of time - on the Pi 4 and the VisionFive, never on the Pi 2,
-  which is what section 49's Pi 2 card was showing. Found with a kernel flight recorder; `backlog/66` has
+  which is what section 49's Pi 2 card was showing. Found with a kernel flight recorder; `backlog/fixed/66` has
   the account, and section 49's correction above.
 - **The instruments that found it are out** (`b77c7dd5`), and `osdev test shell` no longer passes a `net
   dns` that `net-stack` did not answer.

@@ -581,7 +581,7 @@ fn serve(ctx: &ServiceContext, mut w: Wire) -> ! {
                 let (tgb, tg, tuf, tce, rgb, rcrc, _rocts, dbg) = d.mac_counters();
                 // And the MAC's own reason, if it has one, for counting a frame not good: the fault
                 // counters `tx_fault_counters` reads, beside the counts they explain. Read nowhere until
-                // 2026-10-10 (backlog/80 D11), so the question they answer stayed open.
+                // 2026-10-10 (backlog/fixed/80 D11), so the question they answer stayed open.
                 let (sc, mc, def, late, xcol, xdef, ogb, og) = d.tx_fault_counters();
                 ctx.log_fmt(format_args!(
                     "nic-driver: dwmac sent {} bytes | tdes3 0x{:08x} = {} | MAC tx {}/{} good, underflow {}, carrier {}, rx {} crc-err {} | dma 0x{:08x} debug 0x{:08x}",

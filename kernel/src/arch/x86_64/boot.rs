@@ -1471,14 +1471,14 @@ pub unsafe fn set_tss_rsp0(core_id: usize, rsp: u64) {
 /// - Vector 32  → APIC timer preemption (§9.1).
 /// - Vector 36 (COM1), the xHCI/EHCI MSI vectors and the MSI pool → their stubs; 0xFF →
 ///   `spurious_stub`.
-/// - NO gate is DPL=3. The `int 0x80` syscall entry was removed on 2026-10-10 (`backlog/80` K7): the
+/// - NO gate is DPL=3. The `int 0x80` syscall entry was removed on 2026-10-10 (`backlog/fixed/80` K7): the
 ///   SDK traps with `ud2` on every x86 machine, and the old gate ran the syscall chain on the
 ///   top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off -
 ///   while any service could still raise it. An `int 0x80` now finds no gate, faults, and the
 ///   CPL-discriminating handler kills the task that raised it.
 /// - Vector 0xF0 → WAKE_RECEIVER IPI.
 /// - Vector 0xF1 is unused: it was the TLB_SHOOTDOWN IPI, deleted with the broadcast it served
-///   (`backlog/80` K20). It now lands on the default `exception_halt`, as any unused vector does.
+///   (`backlog/fixed/80` K20). It now lands on the default `exception_halt`, as any unused vector does.
 /// - Vector 0xF2 → SCHEDULER_TICK IPI.
 ///
 /// # Safety
@@ -1905,7 +1905,7 @@ unsafe extern "C" fn pf_handler(error_code: u64, fault_rip: u64, hw_user_rsp: u6
 // The CS value identifies which layout applies: 0x08 for a kernel frame, and for a user frame
 // 0x2B (selector 0x28 with RPL 3, as `context_switch.rs` pushes it). The handler compares the
 // selector with its RPL bits masked off; it compared the raw value with 0x28, which a ring-3 frame
-// never carries, so a user frame printed no RIP until 2026-10-10 (`backlog/80` K9).
+// never carries, so a user frame printed no RIP until 2026-10-10 (`backlog/fixed/80` K9).
 // ---------------------------------------------------------------------------
 
 #[unsafe(naked)]

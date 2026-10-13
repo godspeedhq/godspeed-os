@@ -24,7 +24,7 @@ correlation tag was built, proved the fault, and was reverted because rejecting 
 the same as recovering from one. That was correct - the tag is a detector, and the cause was a budget.
 The fix is not: a correlation tag was built, proved the fault, and was REVERTED because rejecting a
 stale reply is not the same as recovering from one. Found on a Dell Wyse 5070, 2026-09-16, by the slow-pass
-instrument added in `backlog/29`. A restart of `net-stack` cleared it.
+instrument added in `backlog/fixed/29`. A restart of `net-stack` cleared it.
 
 ## What happened
 
@@ -71,7 +71,7 @@ not help. Candidates, none separated:
   (`docs/net-tags-design.md` says the tag is "still owed for the case this cannot see");
 - something in `nic-driver` itself that a restart of its client happens to clear.
 
-## A trade-off from `backlog/29` that this exposes, and it may be mine
+## A trade-off from `backlog/fixed/29` that this exposes, and it may be mine
 
 The eight `stash was full` drops are new pressure. Before the patience byte, a displaced request was
 dropped after a fixed 1.5 s, which freed its stash slot quickly. Now a transaction-path request
@@ -92,7 +92,7 @@ reported fact instead of a candidate. It is already named as owed in `docs/net-t
 
 ## Not to be confused with
 
-`backlog/28` (the in-loop dance blocking for seconds) and `backlog/29` (a held request never taken).
+`backlog/28` (the in-loop dance blocking for seconds) and `backlog/fixed/29` (a held request never taken).
 Both are net-stack blocking ITSELF. This is net-stack blocked on a peer that was alive.
 
 ## CONFIRMED: the reply stream runs chronically behind (2026-09-16)
@@ -131,7 +131,7 @@ a constant:
 - or stop creating orphans at all, by not abandoning a driver request whose reply is still coming.
 
 The third is the root: an orphan exists only because a deadline expired on a request the driver later
-answered. That is the same shape as `backlog/29` one hop down.
+answered. That is the same shape as `backlog/fixed/29` one hop down.
 
 **Reverted at `87f1f358`'s state**, which is what all five boards passed, so the branch carries no
 half-built protocol change. The work is described here in enough detail to be redone deliberately.

@@ -84,7 +84,7 @@ pub(crate) struct Radio {
     /// landed in that window was checked against the op it was not, discarded, and its reply cap
     /// with it. net-stack waited out its whole deadline, reacquired and retried, and over the radio -
     /// where net-stack sends back to back - that collision repeated every cycle, and was taken for the
-    /// three-second ping of `backlog/66` (whose later DNS failure turned out to be an empty reply the
+    /// three-second ping of `backlog/fixed/66` (whose later DNS failure turned out to be an empty reply the
     /// kernel refused, `e3fcf7ed`). The collision was real either way. A message with a reply cap is a request, never
     /// the radio's reply, so it
     /// is kept here and served before the next `recv`. Two slots, because one `serve` iteration can

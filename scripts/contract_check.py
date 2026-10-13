@@ -6,7 +6,7 @@ supervisor's spawn table (`IMAGES` in `services/supervisor/src/main.rs`) - since
 but the supervisor lives there - or, for the supervisor alone, the kernel's `service_config`
 (`kernel/src/task/mod.rs`). This reads the kernel arm first and falls back to the IMAGES row; several
 messages below still say "kernel" for a value read from the supervisor. `services/*/contracts/`
-are reconciled against `service_config`/`IMAGES`, and since 2026-10-10 `examples/*/contracts/` against their spawn rows too (backlog/80 T8). The human-facing `.toml` contract is a SECOND declaration - and the two drifted (audit M6: a
+are reconciled against `service_config`/`IMAGES`, and since 2026-10-10 `examples/*/contracts/` against their spawn rows too (backlog/fixed/80 T8). The human-facing `.toml` contract is a SECOND declaration - and the two drifted (audit M6: a
 contract that mis-stated the driver's authority; T1 found events/supervisor memory + supervisor peers
 diverged too). Commandment III: what RUNS cannot differ from what is DECLARED.
 
@@ -45,7 +45,7 @@ SERVICES   = REPO_ROOT / "services"
 CONTRACTED = sorted(d.name for d in SERVICES.iterdir()
                     if (d / "contracts" / f"{d.name}.toml").exists())
 
-# THE EXAMPLES' CONTRACTS TOO, since 2026-10-10 (backlog/80 T8). They are what a newcomer copies, and
+# THE EXAMPLES' CONTRACTS TOO, since 2026-10-10 (backlog/fixed/80 T8). They are what a newcomer copies, and
 # seven of fifteen disagreed with the spawn row that actually grants them - memory limits, a pinned core
 # no row requested, a peer no row wired - while this file reconciled `services/` alone. An example's
 # directory name is not its service name (`examples/00-hello` is `hello`), so the contract's own `name`

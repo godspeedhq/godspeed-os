@@ -121,7 +121,7 @@ fn alloc_table() -> Option<u64> {
     Some(pa)
 }
 
-/// Every live address space's root, for the user-fault instrument (`fault_report`, `backlog/72`).
+/// Every live address space's root, for the user-fault instrument (`fault_report`, `backlog/fixed/72`).
 ///
 /// Recorded where a root is allocated (`PageTable::new`) and cleared where one is freed (`free_all`, which
 /// both `Drop` and `free_page_table_root` go through), so the set is exactly the address spaces that
@@ -637,7 +637,7 @@ fn report_desc(level: &[u8], index: usize, d: u64) {
 ///
 /// The software walk in [`fault_report`] reads the tables through memory; it cannot see what the core
 /// itself had cached. `AT` can: it translates through the TLB and the walk caches exactly as an access
-/// would. So the pair separates the two explanations `backlog/72` has left once the walk says the table
+/// would. So the pair separates the two explanations `backlog/fixed/72` has left once the walk says the table
 /// ALLOWS the access:
 /// - the first fails and the second succeeds: the core held stale translation state, which the flush
 ///   discarded;
@@ -696,7 +696,7 @@ fn report_par(what: &[u8], par: u64) {
 
 /// Walk the faulting address through the table the CPU had installed, and say what the walk found.
 ///
-/// **Why it exists (`backlog/72`).** On the Pi 4, live tasks take instruction aborts and permission
+/// **Why it exists (`backlog/fixed/72`).** On the Pi 4, live tasks take instruction aborts and permission
 /// faults on their OWN code - the shell on the first instruction of `service_main` - with the TLB already
 /// flushed on every switch, so the translation must have come from the task's current tables. Two
 /// explanations were left: a table frame with a second owner (freed by one task's death, or handed out
@@ -716,7 +716,7 @@ pub fn fault_report(far: u64, instruction_fetch: bool, at: (u64, u64)) {
     // SAFETY: reading TTBR0_EL1 at EL1 is a side-effect-free system-register read.
     unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack)) };
     let root = ttbr & ADDR_MASK;
-    super::put_str(b"\r\n    page walk at FAR (backlog/72):");
+    super::put_str(b"\r\n    page walk at FAR (backlog/fixed/72):");
     super::put_str(b"\r\n      TTBR0 root ");
     super::put_hex(root);
     super::put_str(if root_is_live(root) {

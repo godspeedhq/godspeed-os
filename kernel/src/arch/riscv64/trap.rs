@@ -304,7 +304,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     // A KERNEL fault, or an interrupt nothing claimed. There is no task to kill: the thing that
     // faulted IS the thing that would do the killing, so the only honest move is to stop loudly -
     // and to stop the WHOLE machine, as a panic does (6.2). This halted only the faulting hart until
-    // 2026-10-10 (`backlog/80` K6): the others ran on against whatever state the fault was about,
+    // 2026-10-10 (`backlog/fixed/80` K6): the others ran on against whatever state the fault was about,
     // until the liveness watchdog noticed the dark hart about ten seconds later and panicked.
     // `halt_all_cores` prints every hart's stage and stops the rest on their next tick. Stage 20
     // still marks this hart, so the dump points the reader UP at the TRAP line.

@@ -19,7 +19,7 @@ checks the file matches source". `backlog/fixed/18` recorded the gap; this close
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **77** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
+| `sdk/rust/src/service_context.rs` | **77** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
 **The 85 (77 + 8) are not 85 defects.** 82 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
@@ -41,7 +41,7 @@ FAILS. They may decrease freely.
 
 ---
 
-## 2026-10-10 - the unused TLB shootdown deleted; P7 tests the property (backlog/80 K20)
+## 2026-10-10 - the unused TLB shootdown deleted; P7 tests the property (backlog/fixed/80 K20)
 
 The cross-core software TLB broadcast in `smp/ipi.rs` had no caller. It was deleted after a per-port
 proof that translation coherence holds without it (CLAUDE.md 10.5): nothing unmaps a live user mapping,
@@ -67,7 +67,7 @@ the SDK's three wrappers for syscalls 42-44 had no caller anywhere in the tree.
 |------|-------|-----|
 | `sdk/rust/src/service_context.rs` | 80 -> 77 (-3) | **shrank**: the `unsafe { raw_syscall(42 / 43 / 44, ..) }` call sites went with `net_frame_tx`, `net_frame_rx` and `net_info`. `SDK_GRANDFATHERED` in `scripts/unsafe_check.py` is lowered to 77 to lock it in. The syscalls stay in the kernel for now; removing them is a kernel change and the entry's last step. |
 
-## 2026-10-10 - the spawn-by-name syscalls retired; EHCI INTx follows its driver (backlog/80 K14, K17)
+## 2026-10-10 - the spawn-by-name syscalls retired; EHCI INTx follows its driver (backlog/fixed/80 K14, K17)
 
 The kernel catalogue holds `supervisor` alone, so `Spawn` (7), `SpawnPipe` (19),
 `SpawnReturningEndpoint` (38) and `SpawnWithCaps` (39) could only answer NotFound or AlreadyRunning.
@@ -80,7 +80,7 @@ They are retired, with their SDK wrappers; `SpawnImage` (52) is how a service st
 
 ## 2026-10-04 - Pi 4: ask the faulting core's own MMU (feat/wifi-driver)
 
-`backlog/72`: the page walk above came back the same way in four faults - every frame allocated and owned
+`backlog/fixed/72`: the page walk above came back the same way in four faults - every frame allocated and owned
 by the faulting task alone, the leaf valid and executable, and the core had nonetheless taken an L3
 translation fault. The software walk reads the tables through memory and cannot see what the core had
 cached, so the report now also asks the core: `AT S1E0R` on the faulting address at the very top of the
@@ -94,7 +94,7 @@ entry that was briefly invalid succeeds at once.
 
 ## 2026-10-04 - Pi 4: a page walk in the user-fault report (feat/wifi-driver)
 
-`backlog/72`: Pi 4 tasks take instruction aborts and permission faults on their own code - the shell on the
+`backlog/fixed/72`: Pi 4 tasks take instruction aborts and permission faults on their own code - the shell on the
 first instruction of `service_main` - with the TLB flushed on every switch. The fault report now walks the
 faulting address through the table the core had installed and says whether each frame on the way has a
 second owner. Read-only throughout; nothing is written to any table or to the allocator.
@@ -2504,14 +2504,14 @@ write_page_table_base, invalidate_tlb_page}`, `interrupts::{local_irq_save, loca
 | `arch/aarch64/mod.rs` | 68 -> 69 (+1) | `claim_serial` reads MPIDR_EL1 (via `boot::get_lapic_id`) to identify the core holding the UART, so a write that re-enters on the SAME core - an ISR logging mid-line, or a panic raised inside a write - is recognised as nested rather than waiting on a claim it already holds.
 
 A side-effect-free system-register read, valid at any point including early boot, which is what makes it safe to take on EVERY log line here. The x86 equivalent is not: core identity there costs an APIC MMIO read with a boot-ordering precondition, and putting it on the serial path was a fix worse than the bug it addressed. Same intent, different cost, different answer. |
-| `arch/x86_64/pci.rs` | 21 -> 22 (+1) | `bar_len` (2026-10-09, backlog/80 K1) - sizes a memory BAR at grant time so a driver's register window is its device's and not a fixed 64 KiB. The standard probe (memory decode off, all ones written to the BAR, the mask read back, BAR and decode restored), as ONE block under `PCI_CONFIG_LOCK`: split across the existing `config_read32`/`config_write32`, each of which takes the lock alone, another core's configuration read could land between the writes and see the BAR holding the mask. Only the command half of the command/status dword is written back, because the status half is write-1-to-clear. Every value written is restored before the lock is released. |
-| `arch/x86_64/syscall_entry.rs` | 16 -> 14 (-2) | **shrank** (2026-10-10, backlog/80 K7): `int80_entry` deleted - the naked `int 0x80` syscall stub and its `#[unsafe(naked)]`. It was still installed at IDT[0x80] with DPL=3, so any service could raise it, and it ran the syscall chain on the top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off. The SDK traps with `ud2` on every x86 machine; nothing used it. |
-| `smp/placement.rs` | 1 -> deleted (-1) | 2026-10-10, backlog/80 K20: the whole file had no callers (`resolve` and its `static mut RR_COUNTER`); the live placement is `task::resolve_spawn_core`. Its one block, the `RR_COUNTER` increment, goes with it. |
-| `arch/x86_64/mod.rs` | 40 -> 38 (-2) | **shrank** (2026-10-10, backlog/80 K20): `uart_rx_enable` deleted - the `unsafe fn` and its port-write block. It had no caller by design (unmasking PIC IRQ 4 jams the PIC on real hardware, which the boot comment in `main.rs` records); COM1 RX is polled from the core-0 timer. |
-| `arch/arm/exceptions.rs` | 24 -> 23 (-1) | **shrank** (2026-10-10, backlog/80 K25): the kernel-fault reporter's closing `wfi` loop is replaced by `halt_all_cores`, so a kernel fault halts every core rather than parking only the one that faulted (CLAUDE.md 6.2, 19). The loop's one `asm!` block goes. |
-| `arch/arm/irq.rs` | 18 -> 17 (-1) | **shrank** (2026-10-10, backlog/80 K25): `route_usb_irq_to_core0` deleted - it had no callers, and its one block (the legacy-controller enable write) never ran. `unmask_usb_irq` is the live enable. |
-| `arch/aarch64/mmu.rs` | 23 -> 24 (+1) | 2026-10-10, backlog/80 K21: `remap_high_nc`, one block. The Pi 4 framebuffer was mapped Normal write-back in the kernel's 2 MiB direct-map blocks and Normal non-cacheable in the `console` service - mismatched attributes for one physical page, which ARM leaves UNPREDICTABLE. The block splits the blocks the framebuffer touches into pages (the same arena and the same attribute-carrying copy as the kstack-guard split) and gives only the framebuffer's pages MAIR slot 2, break-before-make: the range cleaned from the cache first, each L2 entry invalidated and the TLB dropped before its table goes in. Sound because it runs on the BSP before any secondary starts and before the console is up, on this module's own tables, over a range nothing is touching. |
-| `arch/x86_64/iommu.rs` | 74 -> 79 (+5) | 2026-10-10, backlog/80 K11: a confinement is never left unrecorded. `unconfine` is the one way a confinement is undone (`unsafe fn`, +1, with the four blocks `release_device` had - write the passthrough DTE, `sfence`, invalidate, free the table - moved into it unchanged); `release_device` calls it (+1 for the call, -4 for the blocks that moved). `confine_device` gains three: freeing a partial table when an arena page fails to map (it leaked, root and all), freeing a device's PREVIOUS table when it is confined again (its record was overwritten and the table kept forever), and calling `unconfine` when the last record slot was taken by another core while the table was being built. Each frees or reverts only a table built here and reachable from nothing but this device's DTE, which each SAFETY comment states. |
+| `arch/x86_64/pci.rs` | 21 -> 22 (+1) | `bar_len` (2026-10-09, backlog/fixed/80 K1) - sizes a memory BAR at grant time so a driver's register window is its device's and not a fixed 64 KiB. The standard probe (memory decode off, all ones written to the BAR, the mask read back, BAR and decode restored), as ONE block under `PCI_CONFIG_LOCK`: split across the existing `config_read32`/`config_write32`, each of which takes the lock alone, another core's configuration read could land between the writes and see the BAR holding the mask. Only the command half of the command/status dword is written back, because the status half is write-1-to-clear. Every value written is restored before the lock is released. |
+| `arch/x86_64/syscall_entry.rs` | 16 -> 14 (-2) | **shrank** (2026-10-10, backlog/fixed/80 K7): `int80_entry` deleted - the naked `int 0x80` syscall stub and its `#[unsafe(naked)]`. It was still installed at IDT[0x80] with DPL=3, so any service could raise it, and it ran the syscall chain on the top-of-kstack region the timer switch writes - the Bug 2 class the `ud2` path was moved off. The SDK traps with `ud2` on every x86 machine; nothing used it. |
+| `smp/placement.rs` | 1 -> deleted (-1) | 2026-10-10, backlog/fixed/80 K20: the whole file had no callers (`resolve` and its `static mut RR_COUNTER`); the live placement is `task::resolve_spawn_core`. Its one block, the `RR_COUNTER` increment, goes with it. |
+| `arch/x86_64/mod.rs` | 40 -> 38 (-2) | **shrank** (2026-10-10, backlog/fixed/80 K20): `uart_rx_enable` deleted - the `unsafe fn` and its port-write block. It had no caller by design (unmasking PIC IRQ 4 jams the PIC on real hardware, which the boot comment in `main.rs` records); COM1 RX is polled from the core-0 timer. |
+| `arch/arm/exceptions.rs` | 24 -> 23 (-1) | **shrank** (2026-10-10, backlog/fixed/80 K25): the kernel-fault reporter's closing `wfi` loop is replaced by `halt_all_cores`, so a kernel fault halts every core rather than parking only the one that faulted (CLAUDE.md 6.2, 19). The loop's one `asm!` block goes. |
+| `arch/arm/irq.rs` | 18 -> 17 (-1) | **shrank** (2026-10-10, backlog/fixed/80 K25): `route_usb_irq_to_core0` deleted - it had no callers, and its one block (the legacy-controller enable write) never ran. `unmask_usb_irq` is the live enable. |
+| `arch/aarch64/mmu.rs` | 23 -> 24 (+1) | 2026-10-10, backlog/fixed/80 K21: `remap_high_nc`, one block. The Pi 4 framebuffer was mapped Normal write-back in the kernel's 2 MiB direct-map blocks and Normal non-cacheable in the `console` service - mismatched attributes for one physical page, which ARM leaves UNPREDICTABLE. The block splits the blocks the framebuffer touches into pages (the same arena and the same attribute-carrying copy as the kstack-guard split) and gives only the framebuffer's pages MAIR slot 2, break-before-make: the range cleaned from the cache first, each L2 entry invalidated and the TLB dropped before its table goes in. Sound because it runs on the BSP before any secondary starts and before the console is up, on this module's own tables, over a range nothing is touching. |
+| `arch/x86_64/iommu.rs` | 74 -> 79 (+5) | 2026-10-10, backlog/fixed/80 K11: a confinement is never left unrecorded. `unconfine` is the one way a confinement is undone (`unsafe fn`, +1, with the four blocks `release_device` had - write the passthrough DTE, `sfence`, invalidate, free the table - moved into it unchanged); `release_device` calls it (+1 for the call, -4 for the blocks that moved). `confine_device` gains three: freeing a partial table when an arena page fails to map (it leaked, root and all), freeing a device's PREVIOUS table when it is confined again (its record was overwritten and the table kept forever), and calling `unconfine` when the last record slot was taken by another core while the table was being built. Each frees or reverts only a table built here and reachable from nothing but this device's DTE, which each SAFETY comment states. |
 | `arch/x86_64/pci.rs` | 20 -> 21 (+1) | `cfg_read_gated` - the one gated configuration read a userspace enumerator needs (step D2). An `out dx, eax` to 0xCF8 and an `in eax, dx` from 0xCFC, held together under the `PCI_CONFIG_LOCK` that already guards this pair.
 
 This block replaces FOUR that an earlier revision of the same feature added (`pci_cfg_out32` / `pci_cfg_in32` in both `arch/x86_64/mod.rs` and `arch/aarch64/mod.rs`, +2 each). Those exposed SELECT and READ as separate operations, which was wrong on its own terms: the index/data pair is stateful, and the kernel drives it too on its spawn and kill paths, so a split interface let a service and the kernel interleave and each act on the other's selected register. A lock could not close that, because holding one across two syscalls means the kernel waiting on a service. Folding them into one atomic operation removed the race AND three of the four unsafe lines, and the aarch64 access moved into `pcie.rs` beside the registers it drives rather than reaching in through an exported pointer helper. Both `mod.rs` files return to their pre-branch counts. |
@@ -3113,7 +3113,7 @@ for BIOS release) and USBLEGCTLSTS (disable firmware SMIs). Each access is withi
 the just-mapped 64 KiB MMIO window at a bounded offset (< 0x10000), during
 single-threaded BSP boot. All carry `// SAFETY:` comments.
 
-One more (+1, 2026-10-09) for `bar_len`, the BAR-sizing probe at grant time (backlog/80 K1): the
+One more (+1, 2026-10-09) for `bar_len`, the BAR-sizing probe at grant time (backlog/fixed/80 K1): the
 command register and one BAR (two for a 64-bit BAR) written and read back through the same port pair,
 the whole sequence under `PCI_CONFIG_LOCK` so no other access observes a BAR holding its size mask,
 and every value restored before the lock is released. `// SAFETY:` comment present.

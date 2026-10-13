@@ -592,7 +592,7 @@ os/
 > and ALL FIVE cut UNASSISTED** - Wyse, T630, Pi 2, Pi 4 and VisionFive 2, each landing in the commit
 > window with no held-open pause helping the device. The Pi 4 and VisionFive also had `crash-window`
 > cuts a day earlier; those are superseded, so no result this amendment rests on depends on a window
-> held open for the device's convenience. `docs/gsfs-carnage.md` §4 carries the matrix; `backlog/42` carries the
+> held open for the device's convenience. `docs/gsfs-carnage.md` §4 carries the matrix; `backlog/fixed/42` carries the
 > investigation, including the two earlier Pi 2 cuts that missed the window and what they did and did
 > not measure.
 
@@ -1342,7 +1342,7 @@ A protection violation is **unrecoverable**. The service is in undefined state a
 
 When a page is unmapped (service killed, memory reclaimed), the kernel issues a TLB shootdown via IPI to every core. Operations resume only after acknowledgment from all cores. v1 minimizes unmap frequency by reclaiming memory only at service death.
 
-> **Amendment 2026-10-10 (backlog/80 K20): this section names the guarantee, not a mechanism, and the
+> **Amendment 2026-10-10 (backlog/fixed/80 K20): this section names the guarantee, not a mechanism, and the
 > mechanism it named had not run for some time.** The paragraph above says the kernel "issues a TLB
 > shootdown via IPI to every core" and waits for acknowledgments. It does not. The broadcast that did
 > that had no caller, and has been deleted. What the kernel guarantees, and has guaranteed all along, is
@@ -1389,7 +1389,7 @@ When a page is unmapped (service killed, memory reclaimed), the kernel issues a 
 > kernel hands out (`no_stale_translation_after_death`, 32 cycles). Shown to fail when the checker is broken
 > and when the kill path skips both its wait and its wake. **Its limit, recorded:** a kill path that skips
 > ONLY the wait still passes, because the wake stops the victim before its frames are reused. The
-> per-port proof is recorded in `backlog/80` K20.
+> per-port proof is recorded in `backlog/fixed/80` K20.
 
 ---
 
@@ -1464,7 +1464,7 @@ Because Limine supplies APIC IDs directly, the kernel does not need to probe ACP
 
 ### 11.4 Logging Before Any Service Exists
 
-The kernel maintains a 16 KiB ring buffer (a single shared sink). Anything logged writes to the ring buffer and the serial console - **always**, not only before a service is up. **Nothing drains it**, deliberately: `drain_to_events` has zero callers and `kernel/src/log.rs` says so in its first line. (This body previously said "per-core view" - there is one `static RING` - and that `events` "drains the accumulated buffer once, at its own startup". It never has; `backlog/06` is open, and the 2026-09-04 amendment below establishes non-drainage as the design.)
+The kernel maintains a 16 KiB ring buffer (a single shared sink). Anything logged writes to the ring buffer and the serial console - **always**, not only before a service is up. **Nothing drains it**, deliberately: `drain_to_events` has zero callers and `kernel/src/log.rs` says so in its first line. (This body previously said "per-core view" - there is one `static RING` - and that `events` "drains the accumulated buffer once, at its own startup". It never has; `backlog/fixed/06` is open, and the 2026-09-04 amendment below establishes non-drainage as the design.)
 
 > **Amendment 2026-09-04 (`logger` -> `events`): the service is renamed, and this section's title was
 > wrong in a second way that matters more than the name.** The title read "Logging Before Logger
@@ -2066,7 +2066,7 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`). A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`). A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
 
 > **Amendment 2026-10-08 (the boot record): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
 > `unsafe { raw_syscall(13, 27, ..) }` call site, `boot_record_query`, behind the safe

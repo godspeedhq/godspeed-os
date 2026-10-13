@@ -207,7 +207,7 @@ fn ask(ctx: &ServiceContext) -> Result<Option<godspeed_sdk::Message>, &'static s
         usbfn::ST_OK => Ok(None),
         usbfn::ST_NO_DEVICE => Err("the dongle is no longer bound"),
         // Two causes reach this one status: no bulk IN was found, or repairing it failed. The host's
-        // log says which; this line used to name only the first (backlog/80 D11).
+        // log says which; this line used to name only the first (backlog/fixed/80 D11).
         usbfn::ST_FAILED => Err("the host could not give this dongle a bulk IN (none found, or its repair failed - its log says which)"),
         _ => Err("the host refused BULK_IN as malformed"),
     }

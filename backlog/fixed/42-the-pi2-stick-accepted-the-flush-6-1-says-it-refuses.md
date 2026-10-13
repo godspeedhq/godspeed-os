@@ -1,8 +1,12 @@
 # 42. The Pi 2's stick ACCEPTED a cache flush, and `CLAUDE.md` §6.1 says it refuses
 
-**Status: OPEN - and the machine has now answered BOTH halves of the question. 6.1's Pi 2 example is
+**Status: CLOSED 2026-10-13 - the amendment drafted below is in CLAUDE.md (6.1, Amendment 2026-09-23
+(hardware)), so nothing here is waiting any more: the guarantee stays backend-conditional and the Pi 2
+is no longer its example.** What follows is the entry as it stood before that.
+
+*Was:* OPEN - and the machine has now answered BOTH halves of the question. 6.1's Pi 2 example is
 contradicted on the evidence; the amendment is drafted below and awaits the operator, because a
-constitutional guarantee is not mine to edit.** Measured 2026-09-22 on the Raspberry Pi 2. Recorded rather than acted on, because §6.1 is a
+constitutional guarantee is not mine to edit. Measured 2026-09-22 on the Raspberry Pi 2. Recorded rather than acted on, because §6.1 is a
 guarantee in the constitution and one hardware run is not enough to move one (§26.7).
 
 ## What §6.1 says

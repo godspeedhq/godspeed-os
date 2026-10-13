@@ -83,10 +83,10 @@ where §26.10 puts it.
 |---|---|---|
 | **A. Ship the stdlib for SERVICES only** | Nothing in the kernel. The `fn main()` experience does not arrive. | Every finding in §3 below is still fixed. Services are what exist. |
 | **B. Add an `Exit(status)` syscall** | One syscall, one supervisor arm. Needs a CLAUDE.md amendment (§8.2's `CallDeadline` is the precedent: a new syscall is a new kernel responsibility and the surface is pinned). | The `fn main()` model becomes real, and the shell can stop being the only place a utility can live. |
-| **C. Do it in userspace** | A "runner" service spawns the program and kills it when it signals completion over IPC. No kernel change. | Works today. Costs an IPC round trip and a second service holding `service_control`, which is a confused deputy of exactly the shape `backlog/41` was rejected for. |
+| **C. Do it in userspace** | A "runner" service spawns the program and kills it when it signals completion over IPC. No kernel change. | Works today. Costs an IPC round trip and a second service holding `service_control`, which is a confused deputy of exactly the shape `backlog/fixed/41` was rejected for. |
 
 **Recommendation: A now, B as a separate reviewed change, never C.** C reintroduces the security
-objection that killed `backlog/41`: a deputy holding `service_control` on behalf of arbitrary
+objection that killed `backlog/fixed/41`: a deputy holding `service_control` on behalf of arbitrary
 programs. A is honest and immediately useful. B is the real answer and deserves its own discussion
 rather than arriving as a side effect of a convenience library.
 

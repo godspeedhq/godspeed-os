@@ -38,7 +38,7 @@ hour-plus wait at the prompt is a typo, not a plan (§26.6 bounded).
   aborted `wait` shows as `Err` in `result`.
 - **Sleeps between checks.** The pause sleeps 50 ms between its clock and key checks
   (`pause_quittable`), so the core is free for the wait and `q` still answers at once. It used to
-  call `yield_now`, which kept an otherwise idle core busy (`backlog/80` H21).
+  call `yield_now`, which kept an otherwise idle core busy (`backlog/fixed/80` H21).
 
 ## 4. Commandment VIII note (read this before imitating)
 

@@ -173,7 +173,7 @@ number. That is recorded here rather than discovered later.
 
 ### Re-verified end to end after the queue-latency work (2026-09-16)
 
-All five boards above were measured before `backlog/29` - three defects that made a command take
+All five boards above were measured before `backlog/fixed/29` - three defects that made a command take
 twenty seconds rather than fail, so the transaction numbers were right and the time to START one was
 not. Re-run on the two x86 boards after the fix:
 
@@ -236,7 +236,7 @@ block:
 ```
 
 Held, then served, 1.9 s end to end. **That is precisely the case that was dropped at 1.5 s and cost
-twenty seconds before `backlog/29`.** Its three slow passes (3406, 1875, 2006 ms) are the same
+twenty seconds before `backlog/fixed/29`.** Its three slow passes (3406, 1875, 2006 ms) are the same
 configured-stack scale as the x86 boards, with zero drops and zero timeouts beside them.
 
 **What it shows that a green run usually cannot.** Its log carries three genuinely slow serve passes -
@@ -478,7 +478,7 @@ sent. Silent at both ends: the sender discards the failed send, the receiver see
 
 **Corrected 2026-10-08:** that held on x86, AArch64 and RISC-V; ARM32's check accepted an empty range,
 which is the other reason the Pi 2 never showed it. It is gone on every port since `e3fcf7ed`
-(`backlog/66`, where the same refusal cost `net dns` over WiFi). The status bytes below stay, for the
+(`backlog/fixed/66`, where the same refusal cost `net dns` over WiFi). The status bytes below stay, for the
 reason the next paragraph gives.
 
 `COP_CLOSE` replied with nothing, and so did the refusal path and the UDP socket path when a datagram

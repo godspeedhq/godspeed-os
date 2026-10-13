@@ -1,9 +1,10 @@
 # 19. Networking does not recover from a chaos storm (Wyse / RTL8168)
 
 **Severity:** real, user-visible, and it survives the storm looking healthy - which is the worse half.
-**Status:** FIXED 2026-09-11 (`dd74d4c1`), verified on the machine that showed it. Kept open as a
-record because the fix implements a documented sequence rather than pinpointing the faulty register -
-see *What is NOT established* below, which still stands.
+**Status:** CLOSED 2026-10-13. FIXED 2026-09-11 (`dd74d4c1`), verified on the machine that showed it.
+It was kept open as a record because the fix implements a documented sequence rather than pinpointing
+the faulty register; that is still not established (*What is NOT established* below), and it is a
+question about the RTL8168, not a defect anything shows. Moved to `fixed/` with that said.
 
 ## REPRODUCIBLE 2026-09-13: the first ping of the POST-CHAOS selfcheck loses one packet
 

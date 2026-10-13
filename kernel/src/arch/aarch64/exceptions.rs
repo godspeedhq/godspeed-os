@@ -680,7 +680,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // SAFETY: `frame` is the trap frame the vector assembly just built on the current stack; it is
     // valid for the life of this call and nothing else aliases it.
     let f = unsafe { &*frame };
-    // Ask this core's own MMU about the faulting address BEFORE anything else runs (`backlog/72`): every
+    // Ask this core's own MMU about the faulting address BEFORE anything else runs (`backlog/fixed/72`): every
     // line printed below can evict or refill the TLB, and the question is what the core held at the
     // fault. Same gate as the page walk that prints the answer.
     let ec = (esr >> 26) & 0x3F;
@@ -1215,7 +1215,7 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         }
     }
 
-    // THE PAGE WALK, for an EL0 instruction or data abort (`backlog/72`): what the table the core had
+    // THE PAGE WALK, for an EL0 instruction or data abort (`backlog/fixed/72`): what the table the core had
     // installed says about the faulting address, and whether its frames have a second owner. Skipped for
     // the null page, which is where the DESIGNED faults land - a service panicking on `EndpointDead` faults
     // at address 0 on purpose, dozens of times in a storm, and walking each would bury the faults this is for.

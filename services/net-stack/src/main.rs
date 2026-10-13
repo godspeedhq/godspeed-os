@@ -340,7 +340,7 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
             //
             // `Displaced::take` at the top of the serve loop is the ONLY thing that drains this, so
             // the wait below must not sleep while it holds one - see its `has_work` call site, which
-            // is the bug `backlog/29` was.
+            // is the bug `backlog/fixed/29` was.
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
             // No reply cap: the driver's answer. **THIS IS THE ONE SILENT WAY A CLIENT REQUEST CAN
             // BE LOST, AND IT IS THE LAST ONE LEFT UNINSTRUMENTED.** A driver reply carries no reply
@@ -356,7 +356,7 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
             // request a shell is currently blocked on. Said once, like its siblings.
             //
             // Hunting a Wyse `tcp ... big` that net-stack never logged while it kept answering ping
-            // (backlog/29). Every other candidate was eliminated by reading; this one cannot be, so it
+            // (backlog/fixed/29). Every other candidate was eliminated by reading; this one cannot be, so it
             // is being measured rather than assumed.
             None => {
                 if matches!(m.payload_bytes().first(), Some(&21) | Some(&22))
@@ -402,7 +402,7 @@ impl Reply {
     /// Answering with NOTHING is not allowed.
     ///
     /// Until `e3fcf7ed` the kernel refused a zero-length send on x86, AArch64 and RISC-V
-    /// (`backlog/66`), so the reply never left and the caller waited out its entire deadline. On a
+    /// (`backlog/fixed/66`), so the reply never left and the caller waited out its entire deadline. On a
     /// Pi 4 that was five seconds on every `serve` close, while the close itself had worked (net-stack
     /// reaped the connection 400 ms later). An empty message is delivered on every port now; the
     /// rule stays for the reason below.
@@ -531,7 +531,7 @@ const HELD_BYTES: usize = 1024;
 /// either served promptly or abandoned early enough that only the re-send was served. That was
 /// correct arithmetic against one deadline and became a defect the moment different clients had
 /// different ones: the transaction path waits 20 s, so a fixed 1.5 s threw away requests whose client
-/// would have waited eighteen seconds more (`backlog/29`, measured at 19.67 s and 19.99 s to dispatch
+/// would have waited eighteen seconds more (`backlog/fixed/29`, measured at 19.67 s and 19.99 s to dispatch
 /// on a Dell Wyse, with the re-send answered in milliseconds). A constant cannot know a client's
 /// deadline, so it stopped guessing and the client now says.
 ///
@@ -1252,7 +1252,7 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
         // reason to consume a frame, and when the caller ignored it that frame was destroyed.
         if answer_arp {
             // Through `nic_req`, so a CLIENT's request that arrives while we wait is held for the serve
-            // loop, not consumed here as if it were the driver's answer (backlog/80 D4).
+            // loop, not consumed here as if it were the driver's answer (backlog/fixed/80 D4).
             let _ = nic_req(ctx, pending, &Message::from_bytes(&arp_out), DANCE_SECS);
         }
         // PACE THE POLL, or this loop does not wait at all.
@@ -1313,7 +1313,7 @@ const LOP_ACCEPT: u8 = 0;
 const LOP_CLOSE: u8 = 1;
 
 /// Connection: read whatever has been delivered in order and not yet taken.
-/// The first byte of an op 21 (TCP transaction) reply (`backlog/80` D5).
+/// The first byte of an op 21 (TCP transaction) reply (`backlog/fixed/80` D5).
 const TCP_OK: u8 = 0;
 const TCP_FAILED: u8 = 1;
 const COP_RECV: u8 = 0;
@@ -1650,7 +1650,7 @@ const _: () = assert!(POLL_BUDGET_MS < HOLD_MS,
 // `HOLD_MS < 3_000` - "a held request must be served before the shortest client deadline" - which was
 // true when every client here waited 3 s and became a defect the moment the transaction path waited
 // 20 s: net-stack threw requests away at 1.5 s while their client sat patiently for eighteen seconds
-// more, timed out, re-sent, and had the re-send answered in milliseconds (`backlog/29`, measured at
+// more, timed out, re-sent, and had the re-send answered in milliseconds (`backlog/fixed/29`, measured at
 // 19.67 s and 19.99 s on a Dell Wyse). A constant cannot know a client's deadline, so it no longer
 // guesses: the CLIENT SAYS, in byte 1, and `HOLD_MS` is now only the default for a badged invocation
 // that carries no header. The ordering assertion above still binds, and is the one that matters.
@@ -2934,7 +2934,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // slow dispatch shows up as the next pass being late.
                     //
                     // Measured on a Dell Wyse, where the SAME command took 0.49 s, 4.8 s and 20 s to
-                    // reach dispatch on one boot (backlog/29). Reported rather than counted silently,
+                    // reach dispatch on one boot (backlog/fixed/29). Reported rather than counted silently,
                     // and only when it is genuinely slow, so a healthy service still prints nothing.
                     let now_pass = gs::driver::wait::ticks(&ctx);
                     if last_pass != 0 {
@@ -3017,7 +3017,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // That is precisely what the board showed - `dropped a held client request (op
                     // 21) after its client's own 20000 ms of patience`, with only a 2 s slow pass in
                     // the window, and every successful "from the stash" dispatch landing immediately
-                    // after an unrelated one had woken the loop (`backlog/29`).
+                    // after an unrelated one had woken the loop (`backlog/fixed/29`).
                     //
                     // Going back to the top of the serve loop is the whole fix: `take` is there, and
                     // it is the only thing that drains the stash.
@@ -3104,7 +3104,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // deliberately left silent. Its whole job is to separate "the request never reached dispatch"
         // from "it reached dispatch and the work went wrong", which on a Wyse could not be told apart:
         // net-stack logged nothing for a `tcp ... big` while it went on answering ping, and every
-        // silent loss path was eliminated by reading except one (backlog/29).
+        // silent loss path was eliminated by reading except one (backlog/fixed/29).
         if matches!(pl.first(), Some(&21) | Some(&22)) {
             ctx.log_fmt(format_args!("net-stack: op {} reached dispatch (from the {})",
                                      pl[0], if from_stash { "stash" } else { "queue" }));
@@ -3342,7 +3342,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // the `op <= right` check `fs` makes for files.
                     // The caller may say how much it can take (`[COP_RECV, max:u16]`), and is given
                     // no more: bytes read here leave the connection, so handing over more than the
-                    // caller's buffer holds would lose them (`backlog/80` G3). No length: all of it.
+                    // caller's buffer holds would lose them (`backlog/fixed/80` G3). No length: all of it.
                     COP_RECV if right & RIGHT_READ != 0 => {
                         let max = match body {
                             [lo, hi, ..] => (u16::from_le_bytes([*lo, *hi]) as usize).min(resp.len()),
@@ -3483,9 +3483,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // `[status, bytes...]`: `TCP_OK` and whatever came back, or `TCP_FAILED` alone - and the
             // failure is logged with its reason rather than folded into "nothing came back" (§26.7).
             //
-            // The status byte is new on 2026-10-10 (`backlog/80` D5). A failure answered with an EMPTY
+            // The status byte is new on 2026-10-10 (`backlog/fixed/80` D5). A failure answered with an EMPTY
             // message, which `Reply::send` `debug_assert!`s against and three ports refuse outright
-            // (`backlog/66`), so on those boards a failed transaction left the caller waiting out its
+            // (`backlog/fixed/66`), so on those boards a failed transaction left the caller waiting out its
             // deadline instead of hearing "failed".
             //
             // Driven inside the request, not from a background poll, because
@@ -3706,7 +3706,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             gw_known = d.gw_known;
             // `leased` too, as every other dance does. It was left at its old value until 2026-10-10,
             // so a renew that lost (or won) the lease left the re-DHCP and gateway-retry decisions
-            // working from the previous dance's answer (backlog/80 D3).
+            // working from the previous dance's answer (backlog/fixed/80 D3).
             leased = d.leased;
             dns_server = d.dns_server;
             status = d.status;

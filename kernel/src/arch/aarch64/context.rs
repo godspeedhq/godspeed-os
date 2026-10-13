@@ -242,7 +242,7 @@ pub unsafe fn switch(current: *mut TaskContext, next: *const TaskContext) {
 /// other tasks. A respawn arriving with the same base would then pass the compare as "no change" and run
 /// on those translations.
 ///
-/// **This was a HYPOTHESIS for the Pi 4's chaos faults, and the card falsified it** (`backlog/72`): with
+/// **This was a HYPOTHESIS for the Pi 4's chaos faults, and the card falsified it** (`backlog/fixed/72`): with
 /// this change the shell still faulted on the first instruction of `service_main`. It stays because the
 /// argument above holds on its own - the skip assumed something recycling made false - not because it
 /// fixed anything. The walker only reads here (no hardware access-flag updates in `TCR_EL1`, and the A72
@@ -263,7 +263,7 @@ pub unsafe extern "C" fn switch_context(current: *mut TaskContext, next: *const 
         // replaces - including any a core walked speculatively through a recycled base while it idled,
         // which is why this runs even when the base is unchanged (see above).
         //
-        // The `isb` straight after the write is the one that matters (`backlog/72`). A system-register
+        // The `isb` straight after the write is the one that matters (`backlog/fixed/72`). A system-register
         // write takes effect only at a context synchronization event, and a `dsb` is not one, so without
         // it the core may go on walking SPECULATIVELY through the OUTGOING root while the invalidate runs
         // and after it - refilling its walk cache with the old task's table pointers just after they were

@@ -792,7 +792,7 @@ extern "C" fn boot_high() -> ! {
     // SAFETY: single-threaded boot; `FB_INFO` was written before the jump and is read exactly once here.
     if let Some(fb) = unsafe { FB_INFO } {
         // First make the kernel's own map of it Normal non-cacheable, the type the `console` service
-        // maps it with - one physical page, one memory type (backlog/80 K21). Still single-core here.
+        // maps it with - one physical page, one memory type (backlog/fixed/80 K21). Still single-core here.
         let len = (fb.pitch as u64) * (fb.height as u64);
         if mmu::remap_high_nc(fb.base, len) {
             put_str(b"aarch64: framebuffer remapped Normal non-cacheable in the direct map\r\n");
@@ -1515,7 +1515,7 @@ pub fn device_power(_kind: u32, _on: bool) -> bool { false }
 /// `GET_MAX_CLOCK_RATE` for the ARM clock - so the caller can only choose between the firmware's own ends
 /// of the range, never name a frequency. `None` when the firmware does not answer - including the
 /// read-back: the result is the rate the clock READS, never the rate the set call claimed (CLAUDE.md
-/// 12.3; backlog/80 K23 - this returned the set call's answer when the read-back failed).
+/// 12.3; backlog/fixed/80 K23 - this returned the set call's answer when the read-back failed).
 ///
 /// Why a board needs this at all: with no OS asking for a rate, the Pi firmware holds the cores at turbo
 /// for `initial_turbo` seconds after boot (60 by default) and then at their minimum for good
@@ -1656,7 +1656,7 @@ pub fn note_user_task(_slot: usize) {}
 // those pages is still Normal cacheable, so the mismatch this paragraph warned about is live.
 // Carving the framebuffer out of the blanket block mapping is the open work.)
 // (Note 2026-10-10: carved. `mmu::remap_high_nc` splits the blocks the framebuffer touches and maps its
-// pages Normal non-cacheable before `start_console`, `backlog/80` K21. The clean in `fb_commit` is now
+// pages Normal non-cacheable before `start_console`, `backlog/fixed/80` K21. The clean in `fb_commit` is now
 // a no-op on those pages and is kept because it is correct on either type.)
 #[cfg(feature = "pi4")]
 pub use video::fb_commit;
@@ -2613,7 +2613,7 @@ pub mod page_tables {
     /// `root` must belong to a task already marked Dead, and no core may be RUNNING it. A core that last
     /// ran it may still hold it in `TTBR0_EL1` while it idles and walk it speculatively; that is tolerated
     /// because the flush below drops what it cached, and the next `switch_context` on that core installs
-    /// a live root and flushes again before anything runs (`context.rs`, `backlog/72`).
+    /// a live root and flushes again before anything runs (`context.rs`, `backlog/fixed/72`).
     #[cfg(feature = "pi4")]
     pub unsafe fn free_page_table_root(root: u64) {
         // Invalidate every translation this address space owned, on EVERY core, BEFORE its frames go
@@ -2735,7 +2735,7 @@ pub mod page_tables {
     /// `TTBR0_EL1` write flushes nothing, so an address-space *change* must invalidate - and it does,
     /// in `context::switch_context`, which is the only path that switches between two task spaces.
     /// It is a seam member every port answers. No neutral code calls it since the shootdown path that
-    /// reloaded the installed base was deleted (`backlog/80` K20); adding a flush here would be a
+    /// reloaded the installed base was deleted (`backlog/fixed/80` K20); adding a flush here would be a
     /// second, redundant one on any switch that used it.
     ///
     /// # Safety
@@ -2752,7 +2752,7 @@ pub mod page_tables {
     ///
     /// `tlbi vaae1is`: by VA, ALL ASIDs, Inner-Shareable (every core), so an invalidate made here is
     /// visible machine-wide whoever calls it. (The neutral shootdown path that called it was deleted,
-    /// `backlog/80` K20; the seam member stays because every port answers it.) The `dsb ish` before it orders the
+    /// `backlog/fixed/80` K20; the seam member stays because every port answers it.) The `dsb ish` before it orders the
     /// page-table write that preceded; the one after waits for the invalidate to complete, and the
     /// `isb` keeps already-fetched instructions from using a stale translation.
     ///
@@ -3291,7 +3291,7 @@ pub mod pci {
     pub fn nic() -> Option<PciDevice> { None }
     /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
     /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
-    /// backlog/80 K1).
+    /// backlog/fixed/80 K1).
     pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
 

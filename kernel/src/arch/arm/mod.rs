@@ -1352,7 +1352,7 @@ pub fn usb_disk_absent() -> bool { true }
 /// WPA2 supplicant's SNonce (`sdk/wifi/src/supplicant.rs`, `snonce`, for `wifi-usb` on this board).
 ///
 /// The enable, the "word available" check and the pop are ONE critical section under `RNG_LOCK`
-/// (backlog/80 K28). Unlocked, two cores asking at once could both see one word available and both read
+/// (backlog/fixed/80 K28). Unlocked, two cores asking at once could both see one word available and both read
 /// DATA - one getting the word and the other a stale or empty one - and a second caller could read before
 /// the first had finished the one-time enable. A nonce must not be either. `lock_irq`, because a
 /// preempted holder on this core would otherwise leave the next task here spinning on it; the hold is a
@@ -2598,7 +2598,7 @@ pub mod interrupts {
         // rewrote the shared device selection, which is precisely what must not happen underneath
         // another driver. Slice 5 deleted both with the in-kernel DWC2 driver, which is why the block
         // below is gone too (it was an empty `if` that still did a route lookup on every idle pass,
-        // removed 2026-10-10, `backlog/80` K25); `services/dwc2` owns the controller now.
+        // removed 2026-10-10, `backlog/fixed/80` K25); `services/dwc2` owns the controller now.
         //
         // The ethernet cable was watched here for the same reason, on the same terms. The PHY read was
         // already written and already correct - but nothing CALLED it unless a service asked (`net`,
@@ -2770,7 +2770,7 @@ pub mod pci {
     pub fn nic() -> Option<PciDevice> { None }
     /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
     /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
-    /// backlog/80 K1).
+    /// backlog/fixed/80 K1).
     pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
 

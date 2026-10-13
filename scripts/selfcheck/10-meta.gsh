@@ -91,7 +91,7 @@ mem | assert contains used
 # effect. That is a repair wearing a probe's face, it costs time on every run, and a test that changes
 # the system has stopped measuring it.
 #
-# `date epoch` FAILS when the clock is unset (it printed 0 until 2026-10-10, `backlog/80` H20, and the
+# `date epoch` FAILS when the clock is unset (it printed 0 until 2026-10-10, `backlog/fixed/80` H20, and the
 # probe iterated that 0), so `if date epoch` is the probe: it reads the clock and changes nothing.
 # `assert contains` cannot serve as the probe because it FAILS the suite rather than returning a
 # boolean - that dead end is what made an earlier attempt invent syntax.

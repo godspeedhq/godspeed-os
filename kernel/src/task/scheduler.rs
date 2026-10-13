@@ -1128,7 +1128,7 @@ pub fn take_last_recv_badge() -> u64 {
 /// table. The slot is retrieved by the service via syscall 12 (TakePendingCap). Holds at
 /// most `MAX_PENDING_RECV_CAPS`, and returns whether `cap_slot` was recorded: the caller
 /// takes back a cap whose slot could not be, rather than leave it installed where the
-/// service will never learn of it (`backlog/80` K4).
+/// service will never learn of it (`backlog/fixed/80` K4).
 pub fn push_pending_recv_cap(cap_slot: u32) -> bool {
     let cid = current_core_id();
     // SAFETY: IF=0 in syscall context; single core writer.
@@ -1421,7 +1421,7 @@ pub fn run(core_id: u32) -> ! {
 
         // Path C / Phase 6: respawn the supervisor here if it died - an IF=1 scheduling point, NOT the
         // timer ISR. `spawn_supervisor` is a full ~22 ms service spawn, which when this was written also
-        // issued all-core TLB shootdowns (that broadcast is gone, `backlog/80` K20); running it from the
+        // issued all-core TLB shootdowns (that broadcast is gone, `backlog/fixed/80` K20); running it from the
         // Core-0 timer ISR (IF=0, where it used to live, via process_pending) wedged the box under a
         // storm: Core 0 could not take other cores' IPIs while stuck in the IF=0 spawn - the exact hazard process_pending's own
         // comment warns about (it bounds the COM2 drain for the same reason). Here CORE_CURRENT is IDLE
@@ -2960,7 +2960,7 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         // dead root in TTBR0 and may walk it speculatively, so its
         // `free_page_table_root` invalidates inner-shareable (`tlbi vmalle1is`)
         // before the root goes. No software broadcast exists or is needed; the
-        // one that sat in smp/ipi.rs had no caller and was deleted (`backlog/80`
+        // one that sat in smp/ipi.rs had no caller and was deleted (`backlog/fixed/80`
         // K20). A broadcast here would also be dangerous: a remote core spinning
         // IF=0 cannot acknowledge one, and the caller would spin with it.
         let freed_frames: usize;

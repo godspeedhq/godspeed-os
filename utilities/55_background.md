@@ -119,7 +119,7 @@ the list above is a work queue and everything reaches it eventually. It is not.
 
 The obvious way to detach `selfcheck` and `run` is to spawn a SECOND, throwaway shell to run them
 and capture its output. That was designed and costed - about two days, and none of it hard - and
-then **rejected on security**, which is `backlog/41`:
+then **rejected on security**, which is `backlog/fixed/41`:
 
 A service whose job is to execute whatever command arrives on its endpoint must hold the authority
 to execute ANY command. Its power is then exercisable by **whoever can send to it**, rather than by

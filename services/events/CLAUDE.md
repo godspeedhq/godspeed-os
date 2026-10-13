@@ -89,7 +89,7 @@ No syscall drains the kernel's log ring (the SDK's no-op `drain_kernel_ring_buff
 2026-10-10), so `events log` begins when this service does. The
 boot itself is not lost: `events log boot` reads the kernel's fixed copy of the first 32 KiB logged.
 Tracked, with the reasoning and the cost, in
-[`backlog/06-kernel-ring-not-drainable.md`](../../backlog/06-kernel-ring-not-drainable.md).
+[`backlog/fixed/06-kernel-ring-not-drainable.md`](../../backlog/fixed/06-kernel-ring-not-drainable.md).
 
 ## Supervisor retry (§11.3)
 

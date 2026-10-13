@@ -1395,7 +1395,7 @@ pub fn spawn_from_image(
     // The EHCI's interrupt goes to the core THIS instance landed on, so a keypress wakes the driver's
     // own core out of its idle halt (docs/power.md) - and a restart that lands elsewhere is followed
     // (§9.2). It used to be aimed at a kernel constant the supervisor's row restated by hand, with
-    // nothing linking the two (backlog/80 K27); the supervisor's row is now the one statement. An
+    // nothing linking the two (backlog/fixed/80 K27); the supervisor's row is now the one statement. An
     // MSI is reprogrammed; an INTx controller (the T630) has its IOAPIC entries re-aimed instead
     // (K17). The result is not an error either way: false only says the controller is on INTx.
     if hw == HwClass::Ehci {
@@ -2106,7 +2106,7 @@ fn spawn_service_with_image(
                 | PageFlags::NO_EXEC
                 | PageFlags::PCD
                 | PageFlags::PWT;
-            // THE WINDOW IS THE BAR, sized by the arch (backlog/80 K1). It was a fixed 64 KiB whatever
+            // THE WINDOW IS THE BAR, sized by the arch (backlog/fixed/80 K1). It was a fixed 64 KiB whatever
             // the device had, and on the T630 the audio controller's 64 KiB reached the HDMI audio,
             // `xhci`, EHCI and AHCI registers - authority the grant never named (CLAUDE.md 3.1). The
             // pages mapped are whole; the length the driver's `Mmio` is given is the BAR's own, and

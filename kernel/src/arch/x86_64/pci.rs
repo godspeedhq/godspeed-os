@@ -358,7 +358,7 @@ static DEV_BAR_LEN: [AtomicU64; MAX_DEVICES * 6] = [const { AtomicU64::new(0) };
 /// Called at GRANT time, for the device being granted - never at the boot scan, where it would turn off
 /// decode on a display controller whose BAR the boot console is drawing into. This is what sizes a
 /// driver's register window to its device rather than a fixed 64 KiB, which on the T630 reached from the
-/// audio controller into the HDMI audio, `xhci`, EHCI and AHCI registers (backlog/80 K1).
+/// audio controller into the HDMI audio, `xhci`, EHCI and AHCI registers (backlog/fixed/80 K1).
 pub fn bar_len(d: &PciDevice, ix: usize) -> u64 {
     if ix >= 6 || d.index >= MAX_DEVICES || d.bar[ix] == 0 { return 0; }
     let slot = &DEV_BAR_LEN[d.index * 6 + ix];
@@ -1100,7 +1100,7 @@ fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
 ///
 /// Delivered to `core_id`'s LAPIC. Called twice over a boot's life: once at boot, before any AP is
 /// up, where every destination falls back to the BSP; and again at every spawn of the `ehci` driver,
-/// with the core THAT instance landed on (backlog/80 K27). The second call is what makes the
+/// with the core THAT instance landed on (backlog/fixed/80 K27). The second call is what makes the
 /// co-location real: the destination used to be a kernel constant (3) that the
 /// supervisor's spawn row restated by hand, and at boot it resolved to the BSP regardless. Now the
 /// destination is the spawned task's own core, so there is one statement of where the driver runs -
@@ -1110,7 +1110,7 @@ fn usb_irq_dest_lapic(driver_core: u32) -> u8 {
 /// returns false without repeating the boot line - but it does not leave the interrupt where boot put
 /// it. Boot routes the INTx candidates to the BSP (`route_ehci_intx`), because no AP is up yet; a
 /// later call re-aims every candidate's IOAPIC entry at `core_id`, as the MSI is re-aimed above
-/// (backlog/80 K17). Recorded rather than assumed: an earlier note in `route_ehci_intx` says routing
+/// (backlog/fixed/80 K17). Recorded rather than assumed: an earlier note in `route_ehci_intx` says routing
 /// INTx to an AP's LAPIC id dropped it on the T630. That was a boot-time route, before the APs were
 /// up; whether a route made after they are delivers is what the T630 card for K17 must show.
 pub fn program_ehci_msi(core_id: u32) -> bool {
@@ -1160,7 +1160,7 @@ pub fn route_ehci_intx() {
     // delivers to the BSP; routing it to an AP's LAPIC id silently dropped it.
     // (2026-10-09: this used to say the EHCI driver is pinned to core 0 to match. The supervisor
     // places it on core 3, so on a multi-core machine deliver() runs on core 0 and the wake to the
-    // driver crosses cores - the case the MSI path's co-location exists to avoid. `backlog/80` K17.)
+    // driver crosses cores - the case the MSI path's co-location exists to avoid. `backlog/fixed/80` K17.)
     let dest = crate::arch::x86_64::ioapic::bsp_lapic_id();
     let legacy = dev_pci.irq_line;
 

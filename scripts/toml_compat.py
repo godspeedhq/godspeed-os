@@ -5,7 +5,7 @@
 WHY THIS EXISTS. `README.md` declares Python 3.8 as the floor, and `scripts/commandments.py` - which
 every build runs - read `COMMANDMENTS.baseline.toml` and every service contract with `tomllib`, which
 arrived in 3.11. So on 3.8, 3.9 and 3.10 the first checker of every build failed at import, and the
-declared floor was false while `python_floor_check.py` said it held (backlog/80 T1: it looked at
+declared floor was false while `python_floor_check.py` said it held (backlog/fixed/80 T1: it looked at
 syntax, never at what a script imports).
 
 WHAT IT PARSES. Not TOML: the part of it these files use, which is small and stable - comments,

@@ -155,7 +155,7 @@ pub fn set_mask(gsi: u8, masked: bool) {
 /// Re-aim redirection entry `gsi` at local APIC `dest_apic`, leaving its vector, trigger, polarity
 /// and MASK exactly as they are: only the high dword, which holds nothing but the destination, is
 /// written. Used to follow a driver to the core it was spawned on (`pci::program_ehci_msi`,
-/// backlog/80 K17). Its caller runs at spawn, when the dead instance's line is already masked
+/// backlog/fixed/80 K17). Its caller runs at spawn, when the dead instance's line is already masked
 /// (`interrupt::route::unregister_endpoint`), so no interrupt is in flight to the old destination.
 pub fn set_dest(gsi: u8, dest_apic: u8) {
     let va = IOAPIC_VA.load(Ordering::Relaxed);
@@ -217,7 +217,7 @@ static LEVEL_ROUTE_GSI: [AtomicU8; MAX_LEVEL_ROUTES] =
 /// A route already recorded is not recorded twice: a driver that respawns registers its routes again,
 /// and each respawn used to take a fresh slot. A route that finds the table full is SAID, not dropped:
 /// without its slot the line is never masked while the driver handles it, nor unmasked after
-/// (`backlog/80` K12, 2026-10-10).
+/// (`backlog/fixed/80` K12, 2026-10-10).
 pub fn set_level_route(vector: u8, gsi: u8) {
     for i in 0..MAX_LEVEL_ROUTES {
         if LEVEL_ROUTE_VEC[i].load(Ordering::Relaxed) == vector

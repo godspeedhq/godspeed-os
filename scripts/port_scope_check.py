@@ -81,7 +81,7 @@ SEAM_ABOVE = {
     "services/hw-enumerator/src/main.rs": "one arm IF you have PCI (backlog/25)",
     # The guide gained this row when the VisionFive's radio did (2026-10-04) and this set did not, so
     # the guide cross-check below failed on every branch - unseen, because only the paused `build.yml`
-    # ran this script (backlog/80 T2). It is on `osdev build` now.
+    # ran this script (backlog/fixed/80 T2). It is on `osdev build` now.
     "services/wifi-driver/build.rs": "one arm IF your board has a radio: which SD host it sits behind",
 }
 

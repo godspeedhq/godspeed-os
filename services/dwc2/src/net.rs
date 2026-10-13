@@ -28,7 +28,7 @@ const EP_TYPE_BULK: u8 = 0x02;
 #[derive(Default)]
 pub struct Stats {
     /// Answers to `nic-driver` the kernel would not deliver (its queue full, or it died waiting). The
-    /// first is logged; the count says how many since. Discarded until 2026-10-10 (backlog/80 D11).
+    /// first is logged; the count says how many since. Discarded until 2026-10-10 (backlog/fixed/80 D11).
     pub reply_fails: u32,
     pub tx_ok:      u32,
     pub tx_fail:    u32,

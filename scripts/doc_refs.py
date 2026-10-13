@@ -21,7 +21,7 @@ WHAT IS DELIBERATELY EXEMPT, and why it is not a loophole:
 SCOPE, stated so a pass is not read as wider than it is. Paths are checked only in the PATTERNS files
 below - which include CLAUDE.md's body, COMMANDMENTS.md, CONTRIBUTING.md, SECURITY.md, examples/**,
 tests/** (not tests/conformance/, the fixture corpus), osdev/CLAUDE.md and kernel/CLAUDE.md since
-2026-10-10 (backlog/80 T8), but not backlog/*.md, whose entries are dated records - only when
+2026-10-10 (backlog/fixed/80 T8), but not backlog/*.md, whose entries are dated records - only when
 BACKTICKED, and only with a .rs/.md/.toml/.py/.json/.gsh extension: a directory or a `.sh`/`.ps1`/
 `.txt` path is never checked. `backlog/NN` citations
 are checked over PATTERNS plus SOURCE_PATTERNS plus backlog/README.md.
@@ -49,7 +49,7 @@ PATTERNS = [
     "website/src/*.md",
     "README.md",
     "GETTING_STARTED.md",
-    # Added 2026-10-10 (backlog/80 T8): the constitution, the other top-level documents, the two
+    # Added 2026-10-10 (backlog/fixed/80 T8): the constitution, the other top-level documents, the two
     # CLAUDE.md files this list had missed, and every example and test document. A dead path in any of
     # them passed, though each is read as current. CLAUDE.md's dated amendments are ratified history
     # that names files they removed, so its blockquoted lines are skipped (`current_text`) and only
@@ -109,7 +109,7 @@ SOURCE_PATTERNS = [
 
 
 def backlog_entries(sub=""):
-    """The numbers that actually exist: `backlog/29-some-title.md` -> "29"."""
+    """The numbers that actually exist: `backlog/fixed/29-the-wyse-tcp-big-that-never-left-the-shell.md` -> "29"."""
     found = set()
     d = os.path.join(ROOT, "backlog", sub)
     if not os.path.isdir(d):
@@ -153,7 +153,7 @@ def check_backlog_refs():
 HISTORICAL = {
     # Named in order to say they do NOT exist: CLAUDE.md A.7 ("was listed here and in §5 but was never
     # written") and kernel/CLAUDE.md ("`kernel/src/control.rs` **does not exist**"). Both files came into
-    # this scan on 2026-10-10 (backlog/80 T8), and each sentence is the correction, not the drift.
+    # this scan on 2026-10-10 (backlog/fixed/80 T8), and each sentence is the correction, not the drift.
     "docs/bootstrap.md",
     "kernel/src/control.rs",
     # The ARM USB stack moved to `services/dwc2`; these three docs are the record of that move, and

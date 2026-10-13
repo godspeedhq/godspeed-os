@@ -32,7 +32,7 @@ Do NOT add assertions that:
 | `assert_cap_table_consistent`       | §7.8                          |
 
 `assert_cap_validated` (passed a literal `Ok`, so it could not fire) and `assert_tcb_alive` (over an
-empty TCB set since Phase 6) were deleted 2026-10-10, `backlog/80` K20: an assertion that cannot fail
+empty TCB set since Phase 6) were deleted 2026-10-10, `backlog/fixed/80` K20: an assertion that cannot fail
 reports a pass while measuring nothing.
 
 ## Adding a new assertion

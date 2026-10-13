@@ -108,7 +108,7 @@ Not "it survived" - it is in the same state, check for check.
 and re-running its whole bring-up: link settled at 1000 Mbit/s full duplex, DMA reset cleared, MAC
 filter read back and verified, then DHCP OFFER, ACK, ARP for the gateway, and an ICMP echo reply -
 followed by `sock` returning its 94 bytes and `net` reporting lease, gateway and ping. That is
-`backlog/19` ("networking does not recover from a chaos storm") **not reproducing**, with the recovery
+`backlog/fixed/19` ("networking does not recover from a chaos storm") **not reproducing**, with the recovery
 visible line by line rather than inferred from a working prompt.
 
 #### What this does and does NOT say about `backlog/fixed/48`

@@ -1,6 +1,14 @@
 # 6. No syscall exposes the kernel's 16 KiB log ring to userspace
 
-**Status: OPEN, re-verified 2026-09-20.** `drain_kernel_ring_buffer` is still a no-op whose body
+**Status: CLOSED 2026-10-13, by design rather than by a drain.** CLAUDE.md 11.4 now says the ring is
+not drained, deliberately: no log line may depend on a reader being up, and the 2026-09-04 amendment
+makes non-drainage the design. The need this entry named - what the machine logged before `events` was
+up - is met by the boot record (11.4, Amendment 2026-10-08): `events log boot` reads the first 32 KiB
+by copy. What is still true, and is the design rather than a gap: no syscall drains the ring, and a
+line logged after the boot record fills and after the ring wraps is on serial alone. The entry as it
+stood:
+
+*Was:* OPEN, re-verified 2026-09-20. `drain_kernel_ring_buffer` is still a no-op whose body
 is two comments (`sdk/rust/src/service_context.rs`), so `events log` still begins when `events`
 does and everything logged before that is on serial alone.
 
@@ -9,7 +17,7 @@ the first 32 KiB ever logged, read by copy through InspectKernel query 27 and sh
 boot` (CLAUDE.md 11.4). The ring itself is still not drainable, and `drain_kernel_ring_buffer` is
 still the stub, with no caller.)*
 
-*(2026-10-10: the stub is gone - `backlog/80` S7 deleted `drain_kernel_ring_buffer` and its twin
+*(2026-10-10: the stub is gone - `backlog/fixed/80` S7 deleted `drain_kernel_ring_buffer` and its twin
 `recv_log_message`, which did nothing and had no caller. What this item records is unchanged: no
 syscall drains the ring.)*
 

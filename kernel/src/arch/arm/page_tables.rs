@@ -98,7 +98,7 @@ fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
     // S (shareable), matching mmu.rs's RAM sections - EXCEPT the framebuffer, whose kernel section
     // (`mmu::section_fb`) is non-shareable. The two map the same physical pages, and ARM leaves
     // mismatched attributes for one page UNPREDICTABLE, shareability included; the page took S from the
-    // RAM rule while the section deliberately did not (backlog/80 K25). `WRITE_COMBINE` is how the
+    // RAM rule while the section deliberately did not (backlog/fixed/80 K25). `WRITE_COMBINE` is how the
     // neutral mapper says "framebuffer", so it is what selects non-shareable here.
     if !(flags.contains(PageFlags::WRITE_COMBINE) && flags.contains(PageFlags::PCD) && flags.contains(PageFlags::PWT)) {
         d |= 1 << 10;
@@ -315,7 +315,7 @@ pub fn read_page_table_base() -> u64 {
 /// an ARMv7 TTBR0 write does not flush non-global entries (SEC-26/27). Every service now has its own
 /// L1, so the flush is owed - and it is paid in `context_switch.rs`, which issues `TLBIALL` whenever
 /// TTBR0 changes, not here. No neutral code calls this now: its one neutral caller was the TLB
-/// shootdown's full-flush reload, deleted on 2026-10-10 with the shootdown (`backlog/80` K20), and it
+/// shootdown's full-flush reload, deleted on 2026-10-10 with the shootdown (`backlog/fixed/80` K20), and it
 /// never flushed anything on this port (`arch/CLAUDE.md`).
 pub unsafe fn write_page_table_base(base: u64) {
     // SAFETY: `mcr p15, 0, _, c2, c0, 0` writes TTBR0 at PL1; ISB ensures the following instruction

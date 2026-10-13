@@ -131,7 +131,7 @@ impl Table {
     pub fn add_row(&mut self, vals: &[Value]) {
         if self.nrows >= REC_MAX_ROWS { self.overflow = true; return; }
         // More values than columns is a row that does not fit, and says so like every other
-        // bound here; the extras were dropped silently until 2026-10-10 (`backlog/80` S7).
+        // bound here; the extras were dropped silently until 2026-10-10 (`backlog/fixed/80` S7).
         if vals.len() > self.ncols { self.overflow = true; }
         for (i, v) in vals.iter().take(self.ncols).enumerate() { self.rows[self.nrows][i] = *v; }
         self.nrows += 1;
@@ -589,7 +589,7 @@ impl Table {
                 };
             }
             // THIS TABLE'S COLUMNS, not the whole `REC_MAX_COLS` scratch row. Since `add_row` calls more
-            // values than columns an overflow (`backlog/80` S7, `507c2d55`), passing the scratch row made
+            // values than columns an overflow (`backlog/fixed/80` S7, `507c2d55`), passing the scratch row made
             // every decoded table of fewer than 8 columns report a truncation that did not happen - a
             // record service piped into anything printed "result exceeded the record bound" over three
             // rows. Found by `ask`, the first record service whose pipe a test read closely.

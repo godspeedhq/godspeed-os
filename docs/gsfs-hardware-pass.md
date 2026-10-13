@@ -49,7 +49,7 @@ What an unaimed cut DOES test, and what the two runs did answer, is REORDERING: 
 the medium before the commit record, which leaves torn metadata with no record to replay from. That
 needs no window and is caught by `churn verify` (content) and `drives check` (structure). Both runs
 came back clean on both. Further cuts are worth doing for that reason and cost ~45 seconds each;
-none of them will reach the journal. `backlog/42` carries the arithmetic and the instrument that
+none of them will reach the journal. `backlog/fixed/42` carries the arithmetic and the instrument that
 would close the ordering question properly.
 
 ## Result so far: Dell Wyse 5070 (x86-64, AHCI, 30 GB SSD)

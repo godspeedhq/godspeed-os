@@ -59,7 +59,7 @@ machine on the inference.**
 |---|---|---|
 | `task/scheduler.rs:2679` | `liveness_deadline_cycles()/4` = 75 quanta ~ 0.75 s | another core releasing a task slot - **PROVEN reachable, `backlog/fixed/48`** |
 | `task/scheduler.rs:1616` | 300 quanta ~ 3 s of ticks | another core making any progress |
-| `smp/ipi.rs` (gone) | 500,000,000 **spins** | other cores acknowledging a TLB shootdown - **deleted 2026-10-10**: the shootdown it bounded had no caller, and both went (`backlog/80` K20) |
+| `smp/ipi.rs` (gone) | 500,000,000 **spins** | other cores acknowledging a TLB shootdown - **deleted 2026-10-10**: the shootdown it bounded had no caller, and both went (`backlog/fixed/80` K20) |
 | `smp/spinlock.rs:35` | `LOCK_WATCHDOG_SPINS` **spins** | a lock holder releasing |
 | `memory/allocator.rs:470` | `ALLOC_WATCHDOG_SPINS` **spins** | the frame-allocator lock holder releasing - its own message names "preempted holder" as a cause |
 

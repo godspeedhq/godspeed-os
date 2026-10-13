@@ -103,7 +103,7 @@ extern "C" fn arm_exception_report(kind: u32, pc: u32, status: u32, addr: u32) -
     pl011_write(b"  a fault in the kernel itself - halting every core.\r\n\r\n");
     // Every core, not just this one (CLAUDE.md 6.2, 19): the others would otherwise go on running
     // against whatever state this fault was about. `halt_all_cores` is a flag store and a park, so it
-    // is safe to call from a fault path that can assume nothing (backlog/80 K25; the riscv64 port's
+    // is safe to call from a fault path that can assume nothing (backlog/fixed/80 K25; the riscv64 port's
     // same fix is K6).
     super::halt_all_cores()
 }

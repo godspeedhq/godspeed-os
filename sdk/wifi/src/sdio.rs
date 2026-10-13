@@ -545,7 +545,7 @@ pub fn read_extended(
     };
     // The count field is 9 bits: up to 511 blocks, or up to 512 bytes (512 is encoded as 0, per the
     // SDIO specification). A count past that was masked into a different, smaller transfer with no
-    // word said until 2026-10-10 (`backlog/80` S8); it is refused, loudly, instead.
+    // word said until 2026-10-10 (`backlog/fixed/80` S8); it is refused, loudly, instead.
     if count == 0 || count > if block_bit != 0 { 0x1FF } else { 0x200 } {
         ctx.log_fmt(format_args!(
             "wifi-driver: a CMD53 of {} {} does not fit the 9-bit count field - refused, not truncated",
@@ -604,7 +604,7 @@ pub fn write_extended(
     };
     // The count field is 9 bits: up to 511 blocks, or up to 512 bytes (512 is encoded as 0, per the
     // SDIO specification). A count past that was masked into a different, smaller transfer with no
-    // word said until 2026-10-10 (`backlog/80` S8); it is refused, loudly, instead.
+    // word said until 2026-10-10 (`backlog/fixed/80` S8); it is refused, loudly, instead.
     if count == 0 || count > if block_bit != 0 { 0x1FF } else { 0x200 } {
         ctx.log_fmt(format_args!(
             "wifi-driver: a CMD53 of {} {} does not fit the 9-bit count field - refused, not truncated",
@@ -665,7 +665,7 @@ fn fifo_xfer(h: &dyn SdioHost, func: u8, addr: u32, words: &mut [u32], block: u3
     };
     // The count field is 9 bits: up to 511 blocks, or up to 512 bytes (512 is encoded as 0, per the
     // SDIO specification). A count past that was masked into a different, smaller transfer with no
-    // word said until 2026-10-10 (`backlog/80` S8); it is refused, loudly, instead.
+    // word said until 2026-10-10 (`backlog/fixed/80` S8); it is refused, loudly, instead.
     if count == 0 || count > if block_bit != 0 { 0x1FF } else { 0x200 } {
         ctx.log_fmt(format_args!(
             "wifi-driver: a CMD53 of {} {} does not fit the 9-bit count field - refused, not truncated",
@@ -1133,7 +1133,7 @@ pub fn walk_cis(h: &dyn SdioHost, start: u32, ctx: &ServiceContext) -> Option<Ma
             if let Some(f) = read_reg(h, 0, body) {
                 // 0x0C is the function code the SDIO specification gives every SDIO card in this tuple -
                 // it says "SDIO", not "network adapter", which is what this line said until
-                // 2026-10-10 (`backlog/80` S8). Logged as a raw byte with the note rather than decoded
+                // 2026-10-10 (`backlog/fixed/80` S8). Logged as a raw byte with the note rather than decoded
                 // into a table, because one value is all this phase needs and a lookup table nobody
                 // reads is the kind of speculative machinery §26.2 asks not to build.
                 ctx.log_fmt(format_args!(

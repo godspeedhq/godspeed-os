@@ -143,7 +143,7 @@ rel = ["--release"] if PROFILE == "release" else []
 # on one build path and not another is enforced on neither, because work flows down the ungated path.
 #
 # THE SAME LIST `osdev build` RUNS, read from it (scripts/build_gates.py) rather than copied - the copy
-# here was seven checkers against `osdev build`'s twenty-four (backlog/80 T8).
+# here was seven checkers against `osdev build`'s twenty-four (backlog/fixed/80 T8).
 sys.path.insert(0, str(ROOT / "scripts"))
 import build_gates
 build_gates.run_all()

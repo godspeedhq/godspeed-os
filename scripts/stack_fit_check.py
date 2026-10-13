@@ -150,7 +150,7 @@ def frames(objdump, elf):
 
     It returned `{}` when objdump failed, and an empty result measures nothing and so passes: a
     host objdump that cannot read the target's ELF, or one that is not installed, gave a green gate
-    over binaries nobody looked at (backlog/80 T5). An ELF that exists and cannot be disassembled is
+    over binaries nobody looked at (backlog/fixed/80 T5). An ELF that exists and cannot be disassembled is
     a failure of the instrument, and it is said as one.
     """
     try:

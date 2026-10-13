@@ -351,7 +351,7 @@ pub fn run(image_path: &Path, smp: u32) {
     // dependent - slirp forwards to the HOST's resolver - so the DNS SERVER is allowed to fail: a
     // resolved IP ("example.com is a.b.c.d"), no A record, or no reply from the server all pass. What
     // does NOT pass is net-stack failing to answer the shell ("did not answer the resolve"): that is
-    // this machine's own IPC, and accepting it hid backlog/66 - an empty frame reply refused by the
+    // this machine's own IPC, and accepting it hid backlog/fixed/66 - an empty frame reply refused by the
     // kernel on every port but ARM32, so net-stack waited out a second per empty drain.
     send(&mut write_half, b"net dns example.com\r");
     let dns_out = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(8)).unwrap_or_default();
@@ -508,12 +508,12 @@ pub fn run(image_path: &Path, smp: u32) {
 
     // tcp to a CLOSED host port: the peer resets, and the transaction must be ANSWERED as failed.
     // `net-stack` answered a failed op 21 with an EMPTY message until 2026-10-10, which this x86
-    // machine refuses to deliver (`backlog/66`), so the caller sat out its deadline and reported an
-    // unknown outcome for a refusal that was known at once (`backlog/80` D5).
+    // machine refuses to deliver (`backlog/fixed/66`), so the caller sat out its deadline and reported an
+    // unknown outcome for a refusal that was known at once (`backlog/fixed/80` D5).
     send(&mut write_half, b"tcp 10.0.2.2 1 hello\r");
     let t = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(40)).unwrap_or_default();
     check!(t.contains("connected to nothing"),
-           "tcp: a refused connection is answered as failed, not left to time out (backlog/80 D5)");
+           "tcp: a refused connection is answered as failed, not left to time out (backlog/fixed/80 D5)");
 
 
 
@@ -1609,13 +1609,13 @@ pub fn run(image_path: &Path, smp: u32) {
     // -----------------------------------------------------------------------
     // observe (live) - the full-screen view, which no suite ran until 2026-10-10. The audit read in the
     // code that it could not start - `ctx.spawn_on("observe-live")`, through a kernel catalogue that
-    // holds only the supervisor (`backlog/80` V1) - and nothing had ever looked. It must paint a frame,
+    // holds only the supervisor (`backlog/fixed/80` V1) - and nothing had ever looked. It must paint a frame,
     // and `q` must give the prompt back.
     // -----------------------------------------------------------------------
     send(&mut write_half, b"observe\r");
     match collect_until(&buf, &mut cursor, b"system state", Duration::from_secs(20)) {
-        Some(r) => check!(!r.contains("failed to spawn"), "observe: the live view started and painted a frame (backlog/80 V1)"),
-        None    => { println!("shell-test: FAIL - observe: no live frame within 20 s (backlog/80 V1)"); fail += 1; }
+        Some(r) => check!(!r.contains("failed to spawn"), "observe: the live view started and painted a frame (backlog/fixed/80 V1)"),
+        None    => { println!("shell-test: FAIL - observe: no live frame within 20 s (backlog/fixed/80 V1)"); fail += 1; }
     }
     send(&mut write_half, b"q");
     match collect_until(&buf, &mut cursor, b"gsh> ", Duration::from_secs(10)) {
@@ -1814,7 +1814,7 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("drives flash") && r.contains("drives flash 0 data"), "subcommand help: drives flash help + example"),
         None    => { println!("shell-test: FAIL - timed out after `drives flash help`"); fail += 1; }
     }
-    // backlog/80 H8: seven commands answered a command and not `help` / `version`. `fmt help` read
+    // backlog/fixed/80 H8: seven commands answered a command and not `help` / `version`. `fmt help` read
     // "help" as a PATH, `tcp version` printed the usage, and `whatis` called all seven unknown.
     send(&mut write_half, b"fmt help\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
@@ -1831,7 +1831,7 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("spawncap: shell built-in"), "whatis spawncap: a shell built-in, not unknown (H8)"),
         None    => { println!("shell-test: FAIL - timed out after `whatis spawncap`"); fail += 1; }
     }
-    // backlog/80 H2: the refusal named three targets while the gate held eleven.
+    // backlog/fixed/80 H2: the refusal named three targets while the gate held eleven.
     send(&mut write_half, b"chaos kill-storm nosuch\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("not a kill-storm target") && r.contains("net-stack") && r.contains("dwc2")
@@ -2321,7 +2321,7 @@ pub fn run_drives(image_path: &Path, persist_path: &str, smp: u32) {
         None => { println!("drives-test: FAIL - timed out after `drives` (2)  [×2]"); fail += 2; }
     }
 
-    // 3b. A word selector must BE the drive's label (backlog/80 H15). `drives flash typo data` used to
+    // 3b. A word selector must BE the drive's label (backlog/fixed/80 H15). `drives flash typo data` used to
     //     take `typo` unread as drive 0's label and, after the [y/N], erase it. It must be refused
     //     before the confirm, naming the label the drive really has; the real label still selects it.
     send(&mut write_half, b"drives flash typo data\r");
@@ -4250,7 +4250,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("assert: ok"), "result: delete of a missing path is Err"),
         None    => { println!("files-test: FAIL - assert fails delete timeout"); fail += 1; }
     }
-    // backlog/80 H10/H20: a comma list returned Ok whatever its items did, and dropped items past 16.
+    // backlog/fixed/80 H10/H20: a comma list returned Ok whatever its items did, and dropped items past 16.
     match run!(b"assert fails delete /nowhere1,/nowhere2\r", 10) {
         Some(r) => check!(r.contains("assert: ok") && r.contains("2 of 2 failed"), "comma list: failing items make the list an Err, counted (H10)"),
         None    => { println!("files-test: FAIL - comma-list delete timeout"); fail += 1; }
@@ -4260,13 +4260,13 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
                           "comma list: 17 items refused before anything runs (H10)"),
         None    => { println!("files-test: FAIL - 17-item mkdir timeout"); fail += 1; }
     }
-    // backlog/80 H19: a missing start path was "INCOMPLETE ... too large", 0 matches, and Ok.
+    // backlog/fixed/80 H19: a missing start path was "INCOMPLETE ... too large", 0 matches, and Ok.
     match run!(b"assert fails find x /no/such/start\r", 10) {
         Some(r) => check!(r.contains("assert: ok") && r.contains("not a directory") && !r.contains("too large"),
                           "find: a missing start path is refused as such (H19)"),
         None    => { println!("files-test: FAIL - find missing start timeout"); fail += 1; }
     }
-    // backlog/80 H21: `read` on a directory said "not found".
+    // backlog/fixed/80 H21: `read` on a directory said "not found".
     match run!(b"read /\r", 10) {
         Some(r) => check!(r.contains("is a directory") && !r.contains("not found"), "read: a directory is named as one (H21)"),
         None    => { println!("files-test: FAIL - read / timeout"); fail += 1; }
@@ -4998,10 +4998,10 @@ pub fn run_examples(image_path: &Path, persist_path: &str, smp: u32) {
     // 2. stdlib-hello - the `gs::fs` + `gs::io` tour, against a real filesystem (the disk is
     //    formatted host-side above). It writes 8000 bytes, more than one IPC message, and reads them
     //    back; only the byte-for-byte match passes. This accepted `stdlib-hello: done` alone until
-    //    2026-10-10, and passed while every call it made came back `Unreachable` (`backlog/80` E1).
+    //    2026-10-10, and passed while every call it made came back `Unreachable` (`backlog/fixed/80` E1).
     check!(saw("stdlib-hello: starting"), "stdlib-hello: ran (examples/stdlib-hello)");
     check!(saw("wrote /stdlib-hello.txt (8000 bytes)"),
-           "stdlib-hello: gs::fs::write wrote a file larger than one message (backlog/80 G1)");
+           "stdlib-hello: gs::fs::write wrote a file larger than one message (backlog/fixed/80 G1)");
     check!(saw("read /stdlib-hello.txt back: 8000 bytes, every one as written"),
            "stdlib-hello: gs::fs::read_into read it back, every byte as written");
 
@@ -5616,7 +5616,7 @@ pub fn run_fs_filecap(image_path: &Path, persist_path: &str, smp: u32) {
             check!(r.contains("gs::cap non-escalation holds"),
                    "gs::cap cannot widen rights - a READ cap is refused its write by the kernel");
             check!(r.contains("gs::cap an append-only file carries WRITE alone, and closes"),
-                   "gs::file records the rights the cap CARRIES, and closes an append-only file (backlog/80 G2)");
+                   "gs::file records the rights the cap CARRIES, and closes an append-only file (backlog/fixed/80 G2)");
             check!(r.contains("all file-capability checks passed"), "every file-cap property held");
         }
         None => { println!("file-cap: FAIL - fcap timed out"); fail += 1; }

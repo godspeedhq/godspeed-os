@@ -727,7 +727,7 @@ fn unmap_high_4k(va: u64) -> bool {
 /// Remap `len` bytes of physical memory at `pa` in the high-half direct map as Normal NON-cacheable
 /// (MAIR slot 2), leaving every other page in the blocks it touches exactly as it was.
 ///
-/// This is the framebuffer (backlog/80 K21). The `console` service maps those pages Normal
+/// This is the framebuffer (backlog/fixed/80 K21). The `console` service maps those pages Normal
 /// non-cacheable (`WRITE_COMBINE`), and the direct map covered them as Normal write-back in 2 MiB
 /// blocks; ARM leaves mismatched memory attributes for one physical page UNPREDICTABLE. So the blocks
 /// the framebuffer touches are split into pages and only the framebuffer's pages change type - its
