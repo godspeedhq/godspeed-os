@@ -1,6 +1,13 @@
 # 60 - the riscv32 size study stopped compiling, and `docs/multi-arch.md` still says 0 errors
 
-**Status:** OPEN - two defects in a stub nothing builds, plus the documentation claim that hid them.
+**Status:** CLOSED 2026-10-13. Option 1: the study is brought back to compiling. The 64-bit store was
+fixed on 2026-10-10 (`backlog/fixed/80` K24); the missing seam members are answered with the
+loongarch64 scaffold's no-bus stubs, and a linker script of its own (`kernel/kernel-riscv32.ld`) lets it
+link. In `qemu-system-riscv32 -machine virt` it reaches its UART and prints both boot lines, which also
+runs the `sw` BSS loop. `scripts/scaffold_check.py` now records riscv32 at M1. Found on the way:
+loongarch64 had slipped to M0 (no `pci::device_at`), answered the same day.
+
+*Was:* OPEN - two defects in a stub nothing builds, plus the documentation claim that hid them.
 The claim is CORRECTED on main; the two code defects are recorded here rather than fixed, because
 neither can be verified until the first is.
 **Found:** 2026-09-27, while deleting `wip/riscv32-experiment`. The branch was a weak-model run whose

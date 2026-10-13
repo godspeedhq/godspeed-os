@@ -85,7 +85,7 @@ every ISA that has one (x86/x86-64, ARMv7, all 64-bit arches) and a small lock-b
 | Arch | Rust target | Word | 64-bit atomics? | Status |
 |------|-------------|------|-----------------|--------|
 | **ARM (32-bit)** | `armv7a-none-eabi` | 32 | Native (LDREXD) | **RUNS MULTI-SERVICE IPC ON HARDWARE** (`ping`->`pong`, 6192 messages, 0 faults) - Raspberry Pi 2 Model B v1.1 (BCM2836, Cortex-A7), 2026-07-21. See below. |
-| **RISC-V (32-bit)** | `riscv32imac-unknown-none-elf` | 32 | No (RV32A) → `portable-atomic` shim | **Compiled with 0 errors when measured; it does not today** - the shim path is proven and that conclusion stands, but the stub has fallen behind the seam (`backlog/60`). `scripts/arch_seam_check.py` prints the live gap on every run |
+| **RISC-V (32-bit)** | `riscv32imac-unknown-none-elf` | 32 | No (RV32A) → `portable-atomic` shim | **Compiles, links and reaches its UART in QEMU `virt` under OpenSBI (2026-10-13)** - it had fallen behind the seam and stopped compiling (`backlog/fixed/60`); `scripts/scaffold_check.py` records it at M1, and reports a fall below that when it is run (it is on no build path) |
 | **x86 (32-bit)** | (no upstream `i686-none`) | 32 | Native (CMPXCHG8B) | **Provable, tooling-gated:** the code is word-size-clean (proven by the two above) and has native 64-bit atomics, but rustc ships no bare-metal `i686-none` target; it needs a custom target-spec JSON (a known, small artifact), which hit stable-toolchain friction here. Not a code gap. |
 
 Two 32-bit ISAs compiled with **0 errors** - one native-atomic (ARM), one shim (RISC-V) - covering both
@@ -107,9 +107,17 @@ target spec," not "find out whether the kernel is even word-size-portable."
 > rather than a retraction.** Every one of the 37 is a missing `arch::imp` member the neutral kernel
 > grew later (`PciDevice`, `find_by_class`, `note_irq`, `copy_user_to_kernel`, the MSI pool constants);
 > not one is a word-size failure, and `portable-atomic`'s shim path is untouched. The kernel being
-> 32-bit-clean was established twice, and arm32 went on to run userspace on real hardware. `backlog/60`
+> 32-bit-clean was established twice, and arm32 went on to run userspace on real hardware. `backlog/fixed/60`
 > carries the errors, a 64-bit store still sitting in the riscv32 boot stub, and the decision this now
 > needs: bring the study back to compiling, or retire it and say what it showed.
+>
+> **Brought back, 2026-10-13.** The 64-bit store had been fixed on 2026-10-10 (`backlog/fixed/80` K24);
+> the missing members are answered with the loongarch64 scaffold's no-bus stubs, and the study has a
+> linker script of its own (OpenSBI's 32-bit firmware loads at `0x8040_0000`). It compiles, links, and
+> in `qemu-system-riscv32 -machine virt` prints its two boot lines, which also runs the `sw` BSS loop.
+> `scripts/scaffold_check.py` records riscv32 at M1, the same as loongarch64, and reports a fall below it.
+> It is on no build path, which is how loongarch64 had slipped back to M0 unnoticed (a missing
+> `pci::device_at`, answered the same day).
 
 ### arm32 RUNS USERSPACE on hardware: `logger: ready` (2026-07-21)
 

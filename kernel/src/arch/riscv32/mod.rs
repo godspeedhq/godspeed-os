@@ -437,6 +437,12 @@ pub mod interrupts {
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
     pub fn fire_test_irq(irq: u8) {}
+
+    /// The pool of MSI vectors the kernel may hand to a driver, as (base, length). EMPTY: a scaffold
+    /// with no PCI cannot do message-signalled interrupts, and a pool of zero says so (loongarch64 and
+    /// riscv64 answer the same way).
+    pub const MSI_POOL_BASE: u8 = 0;
+    pub const MSI_POOL_LEN: usize = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +489,34 @@ pub fn fixed_device_present(_kind: u32) -> bool { false }
 pub mod pci {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32};
     use portable_atomic::AtomicU64;
+
+    /// One device as the kernel's PCI scan records it - the shape of the ports that have a bus, so the
+    /// neutral callers compile unchanged. Nothing on this scaffold constructs one.
+    #[derive(Clone, Copy)]
+    pub struct PciDevice {
+        pub index: usize,
+        pub bdf: u32,
+        pub class_code: u32,
+        pub bar: [u64; 6],
+        pub irq_line: u8,
+        pub vendor: u16,
+        pub device: u16,
+    }
+
+    /// ONE, not zero, on a machine with no bus: the neutral kernel indexes `PCI_DMA_PHYS[0]` in an arm
+    /// it never reaches, and a zero-length array refuses the build (the loongarch64 scaffold records the
+    /// finding in full; arm32 pays the same).
+    pub const MAX_DEVICES: usize = 1;
+
+    /// No bus, so no device of any class.
+    pub fn find_by_class(_class_code: u32) -> Option<PciDevice> { None }
+    /// No bus, so no device at any index.
+    pub fn device_at(_n: usize) -> Option<PciDevice> { None }
+    /// The seam's name is x86's (a Local APIC id); no device here is ever given one.
+    pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
+    /// Not programmed, so a caller polls rather than waiting for an interrupt that cannot arrive.
+    pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
 
     /// No PCI on this port - see the x86 originals. `None` is the honest answer, and the callers all
     /// treat it as "this machine has no PCI ethernet controller", which is true.
@@ -535,3 +569,26 @@ pub mod ioapic {
 pub mod ap_boot {
     pub unsafe fn start_all_aps(boot_info: &super::BootInfo) -> u32 { 0 }
 }
+
+// ---------------------------------------------------------------------------
+// Seam members the neutral kernel asks every arch for, answered so the size study COMPILES again
+// (`backlog/fixed/60`). Each returns what is TRUE of a machine with no bus, no interrupts and no userspace
+// yet, as the loongarch64 scaffold's do - never a value invented to satisfy a caller.
+
+/// Refuses: there are no user pages, and refusing is the safe direction.
+pub fn copy_user_to_kernel(_src: u64, _dst: *mut u8, _len: usize) -> bool { false }
+/// `(0, 0)`, acceptable only while this arch takes no interrupts; the moment it does this must be real,
+/// or the first wedge is undiagnosable (the loongarch64 comment has the history).
+pub fn core_irq_debug(_core: u32) -> (u32, u32) { (0, 0) }
+/// No-op: nothing raises an interrupt here yet.
+pub fn note_irq(_vector: u32) {}
+/// `None`: no configuration space on this scaffold.
+pub fn pci_cfg_read32(_sel: u32, _off: u16) -> Option<u32> { None }
+/// No-op until secondary cores exist (the name is x86's; RISC-V has no LAPIC).
+pub fn publish_bsp_lapic_id() {}
+/// Zero until this port has a serial lock to bypass.
+pub fn serial_unlocked_emit_count() -> u64 { 0 }
+/// Nothing here grants a DMA arena, so nothing is mapped uncached.
+pub const DMA_ARENA_UNCACHED: bool = false;
+/// Where a driver's DMA arena would be mapped, the other ports' choice; unused until one is granted.
+pub const DRIVER_DMA_VA: u64 = 0x7000_0000;

@@ -1,6 +1,18 @@
 # 5. Pi 2 never writes `/clock.last`, so every boot starts at 1970
 
-**Status: OPEN.** Unchanged. The loud refusal is the RIGHT half and is working as designed; what
+**Status: CLOSED 2026-10-13, fixed by later work and seen on the Pi 2.** `time` now retries a
+floor write (`FLOOR_STORE_TRIES`, on the loop's timer, so a write whose send failed is retried too)
+and rewrites the floor every `FLOOR_REFRESH_SECS` on its own heartbeat, a failed write included. Pi 2
+boots since then record and adopt it, for example `build/pi2_ondemand_pass.log` (2026-10-06):
+
+```
+time: adopted clock floor 1791298681 from /clock.last
+time: clock floor 1791307113 recorded
+```
+
+and the same pair on 2026-09-27. The entry as it stood:
+
+*Was:* OPEN. Unchanged. The loud refusal is the RIGHT half and is working as designed; what
 is missing is the recovery, and nothing has been built for it.
 
 **Severity:** correctness, degrading gracefully. The failure is LOUD and the clock refuses to lie,

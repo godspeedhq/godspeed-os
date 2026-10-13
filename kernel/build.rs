@@ -133,6 +133,13 @@ fn main() {
     if target == "armv7a-none-eabi" {
         println!("cargo:rustc-link-arg=-T{}", kernel_ld_arm.display());
     }
+    // The riscv32 size study (backlog/fixed/60): a script of its own, since OpenSBI's 32-bit firmware loads
+    // the next stage at a different address from the 64-bit one.
+    let kernel_ld_riscv32 = workspace.join("kernel").join("kernel-riscv32.ld");
+    println!("cargo:rerun-if-changed={}", kernel_ld_riscv32.display());
+    if target == "riscv32imac-unknown-none-elf" {
+        println!("cargo:rustc-link-arg=-T{}", kernel_ld_riscv32.display());
+    }
     let kernel_ld_loongarch64 = workspace.join("kernel").join("kernel-loongarch64.ld");
     println!("cargo:rerun-if-changed={}", kernel_ld_loongarch64.display());
     if target == "loongarch64-unknown-none-softfloat" {
