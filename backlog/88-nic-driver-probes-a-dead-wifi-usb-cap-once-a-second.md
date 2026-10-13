@@ -1,6 +1,6 @@
 # 88. `nic-driver` probes a dead `wifi-usb` capability once a second, and the kernel logs every probe
 
-**Status: OPEN, 2026-10-13.** Seen on the Pi 4 card run of 2026-10-13 (`feat/ask`, the hub-cut image,
+**Status: OPEN - FIX BUILT 2026-10-13, awaiting the Pi 4 card** (*The fix*, below). Seen on the Pi 4 card run of 2026-10-13 (`feat/ask`, the hub-cut image,
 `build/serial_output.log`). Nothing failed because of it; the cost is a kernel log line a second for as
 long as the dongle is gone, which on a Pi 4 with no dongle plugged in is normal operation.
 
@@ -60,3 +60,25 @@ replug it and the bridge must reach the new instance.
 
 Naming the sender in the kernel's mismatch line would settle the inference here and in `backlog/86`
 with one change; that is a kernel change and is recorded there rather than proposed twice.
+
+## The fix (built 2026-10-13, not yet seen on hardware)
+
+`Radio` carries `gone`: set when the reacquire after a silent run fails because the name does not
+resolve. While it is set, a probe at the end of each hold-down window LOOKS THE NAME UP
+(`gs::cap::reacquire`) and sends nothing; a lookup that finds it clears `gone` ("is running again - its
+name resolves, probing it") and the probe goes out on the fresh capability. Still gone, it is held down
+another `RADIO_BACKOFF_MS` and counted, said every sixteenth time ("still not running - looked up,
+nothing sent"). Switching radios clears it, and `ask_other` saves and restores it, since it runs `rpc`
+under the other radio's name. Service-local; no kernel change.
+
+What it leaves: the probes sent BEFORE the first failed lookup (the silent run that triggers it, three
+at most) still go out on the dead capability, so a handful of mismatch lines remain where there were
+271.
+
+Built for all four ports (x86, Pi 2, Pi 4, VisionFive). QEMU cannot reach the path: no QEMU board runs
+`wifi-usb`, and x86 QEMU's link never drops. `osdev test shell` was run as a regression check.
+
+What the card must show: after the dongle's `wifi-usb` ends, at most a few `cap::get ... liveness=Dead`
+lines, then `nic-driver: the radio was silent and its name does not resolve ... nothing is sent to it
+until it does` and no more of them; and after a replug, `nic-driver: wifi-usb is running again` and the
+bridge answering.

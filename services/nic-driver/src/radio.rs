@@ -79,6 +79,13 @@ pub(crate) struct Radio {
     down_until: u64,
     /// How many backoff windows this instance has entered, for the log and nothing else.
     backoffs: u32,
+    /// THE RADIO'S NAME DID NOT RESOLVE at the last reacquire: its service is not running (`wifi-usb` once
+    /// its dongle has gone). Until a lookup finds it again, a probe LOOKS THE NAME UP and sends nothing.
+    /// Sending was what happened before: the failed reacquire left the named-peer cache holding the dead
+    /// instance's cap, every probe went out on it, and the kernel logged a gen mismatch for each one - a
+    /// line a second for as long as the dongle was absent (`backlog/88`). A lookup finds a respawned radio
+    /// as fast as a probe did, and costs no message.
+    gone: bool,
     /// CLIENT REQUESTS THAT ARRIVED WHILE THIS DRIVER WAS WAITING ON THE RADIO. The wait in `rpc`
     /// used to take whatever landed next as the radio's answer, and a request from net-stack that
     /// landed in that window was checked against the op it was not, discarded, and its reply cap
@@ -122,7 +129,7 @@ impl Radio {
         Radio {
             name,
             answered: 0, slow: 0, timeouts: 0, silent_run: 0, mismatch: 0, sendfail: 0, restale: 0,
-            down_until: 0, backoffs: 0,
+            down_until: 0, backoffs: 0, gone: false,
             held: [None, None], rescued: 0, held_dropped: 0,
             other: None, other_asked: None, default: name,
         }
@@ -149,15 +156,17 @@ impl Radio {
         if !godspeed::cap::reacquire(ctx, other) {
             return None;
         }
-        let (name, run, until, offs) = (self.name, self.silent_run, self.down_until, self.backoffs);
+        let (name, run, until, offs, gone) = (self.name, self.silent_run, self.down_until, self.backoffs, self.gone);
         self.name = other;
         self.silent_run = 0;
         self.down_until = 0;
+        self.gone = false;   // just resolved, above
         let r = self.rpc(ctx, &Message::from_bytes(&[0x10]));
         self.name = name;
         self.silent_run = run;
         self.down_until = until;
         self.backoffs = offs;
+        self.gone = gone;
         r
     }
 
@@ -179,6 +188,23 @@ impl Radio {
                 return None;
             }
             self.down_until = 0;
+        }
+        // NOT RUNNING at the last look: look again, and send only if it is there now (see `gone`). Still
+        // gone, it is held down for another window, as a silent radio is, and counted as before.
+        if self.gone {
+            if !godspeed::cap::reacquire(ctx, self.name) {
+                self.down_until = godspeed::driver::wait::ticks(ctx).wrapping_add(crate::cycles(ctx, RADIO_BACKOFF_MS));
+                self.sendfail = self.sendfail.saturating_add(1);
+                if self.sendfail % 16 == 0 {
+                    ctx.log_fmt(format_args!(
+                        "nic-driver: {} is still not running - looked up, nothing sent (x{})",
+                        self.name, self.sendfail));
+                }
+                return None;
+            }
+            self.gone = false;
+            ctx.log_fmt(format_args!(
+                "nic-driver: {} is running again - its name resolves, probing it", self.name));
         }
         let t0 = godspeed::driver::wait::ticks(ctx);
         // SIFTED, not the first thing that lands. A message carrying a reply cap is a client's
@@ -278,9 +304,10 @@ impl Radio {
                         // Once, then every sixteenth, as the comment above says: on a PC with no dongle
                         // and the cable out this is every probe, a line a second for as long as it lasts.
                         self.sendfail = self.sendfail.saturating_add(1);
+                        self.gone = true;
                         if self.sendfail == 1 || self.sendfail % 16 == 0 {
                             ctx.log_fmt(format_args!(
-                                "nic-driver: the radio was silent and its name does not resolve - {} is not running (x{})",
+                                "nic-driver: the radio was silent and its name does not resolve - {} is not running (x{}); nothing is sent to it until it does",
                                 self.name, self.sendfail));
                         }
                     }
@@ -342,6 +369,7 @@ impl Radio {
                         self.silent_run = 0;
                         self.down_until = 0;
                         self.backoffs = 0;
+                        self.gone = false;   // `other` answered, so it is running
                         r = Some(o);
                     }
                 }

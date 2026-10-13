@@ -115,7 +115,7 @@ direction.
 | [85](85-the-pi4-and-visionfive-pcie-xhci-window-is-not-sized-from-its-bar.md) | The Pi 4's and VisionFive's PCIe `xhci` is granted a fixed window, not its BAR; x86 sizes from the BAR since 2026-10-09 (`backlog/fixed/80` K1) | Authority (3.1) | - |
 | [86](86-a-client-sends-to-events-one-generation-late-after-a-kill-storm.md) | After `chaos kill-storm events` some client sends to `events` one generation late for ~30 s; harmless, caller not named (from `backlog/fixed/73`) | Minor | - |
 | [87](87-the-wyse-serial-echo-corrupts-what-was-typed.md) | The Wyse echoed a typed line corrupted (a comma, the tail three times) while the shell received it clean; last seen 2026-09-16 (from `backlog/fixed/29`) | Cosmetic | - |
-| [88](88-nic-driver-probes-a-dead-wifi-usb-cap-once-a-second.md) | After `wifi-usb` ends, `nic-driver`'s radio bridge probes it once a second on the dead instance's cap, and the kernel logs a gen mismatch per probe (271 lines in five minutes on the Pi 4); the sender is inferred, not named | Noise | - |
+| [88](88-nic-driver-probes-a-dead-wifi-usb-cap-once-a-second.md) | FIX BUILT 2026-10-13, awaiting the Pi 4 card: after `wifi-usb` ends, `nic-driver`'s radio bridge probes it once a second on the dead instance's cap, and the kernel logs a gen mismatch per probe (271 lines in five minutes on the Pi 4); the sender is inferred, not named | Noise | - |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.
