@@ -375,6 +375,46 @@ pub unsafe fn map_in_active_tables(virt: u64, phys: u64, flags: u64) -> Result<(
     Ok(())
 }
 
+/// Undo a boot selftest's `map_in_active_tables`: clear the 1 MiB L1 slot holding `virt` in the ACTIVE
+/// table and return its L2 to the arena. The frames it mapped are the caller's to free. Returns false,
+/// touching nothing, if that slot is not an L2 the active root owns.
+///
+/// A SELFTEST MUST LEAVE NO TABLE BEHIND, because every task inherits the kernel L1. `fill_kernel_identity`
+/// copies each kernel L1 entry into the child slots that are empty, so an L2 a boot selftest left in the
+/// kernel L1 ends up in EVERY address space. The user-mode selftest's was at 0x5000_0000, which is
+/// `TASK_HEAP_VA_START` on this port: each task's first heap megabyte was mapped into that one shared,
+/// kernel-owned table. The reclaim, which frees only tables the dying task owns, skipped it (256 frames
+/// leaked per `mem-pressure`, measured in QEMU 2026-10-13), and the dead task's user pages stayed in it
+/// for the next task to inherit - two tasks' heaps in one table, against invariant 2.
+///
+/// # Safety
+/// Single-threaded boot, before any task exists; nothing else uses the slot.
+pub unsafe fn release_active_l2(virt: u32) -> bool {
+    let l1_base = (read_page_table_base() as u32) & 0xFFFF_C000;
+    let l1_index = (virt >> 20) as usize;
+    // SAFETY: the active L1 is identity-mapped; the caller guarantees nothing else uses this slot.
+    unsafe {
+        let l1 = l1_base as *mut u32;
+        let e = l1.add(l1_index).read_volatile();
+        if e & 0b11 != L1_TYPE_TABLE {
+            return false;
+        }
+        let l2_pa = e & 0xFFFF_FC00;
+        match l2_slot(l2_pa) {
+            Some(s) if L2_OWNER[s].load(Ordering::Relaxed) == l1_base => {}
+            _ => return false,
+        }
+        l1.add(l1_index).write_volatile(0);
+        clean_dcache(l1.add(l1_index) as u32, 4);
+        // Every page of the megabyte, not just the ones the caller mapped: the slot is gone.
+        for j in 0..256u32 {
+            invalidate_tlb_page(((virt & 0xFFF0_0000) | (j << 12)) as u64);
+        }
+        free_l2(l2_pa);
+    }
+    true
+}
+
 // ---- Neutral PageTable API (real; exercised by the same encoders the selftest proves) ----
 
 unsafe extern "C" {
@@ -1086,15 +1126,12 @@ pub fn selftest() {
         pl011_write(b"arm32: pgtable FAIL - see above\r\n");
     }
 
-    // Leave the tables as we found them: invalidate the two test entries. (They point into the gap,
-    // so leaving them would be harmless, but tidy is better than harmless.)
-    let l1_base = (read_page_table_base() as u32) & 0xFFFF_C000;
-    // SAFETY: clearing the single L1 slot for the test gap (index 0x3C0); it was invalid before us.
-    unsafe {
-        let l1 = l1_base as *mut u32;
-        let slot = l1.add((TEST_VA_RW >> 20) as usize);
-        slot.write_volatile(0);
-        clean_dcache(slot as u32, 4);
-        invalidate_tlb_page(TEST_VA_RW as u64);
+    // Leave the tables as we found them, the L2 included: the kernel L1 is copied into every task
+    // (`release_active_l2`). This cleared the L1 slot and kept the L2, so the arena lost one table for
+    // the life of the machine. Both pages share one megabyte, so one release covers them; the frames
+    // are kernel RAM and stay.
+    // SAFETY: single-threaded boot, before any task exists; the slot is this selftest's own.
+    if !unsafe { release_active_l2(TEST_VA_RW) } {
+        crate::kprintln!("page_tables: selftest - its page table could NOT be released; every task inherits it");
     }
 }

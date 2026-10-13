@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::pl011_write;
 use super::exceptions::write_hex32;
 use super::context::Context;
-use super::page_tables::{map_in_active_tables, PageFlags};
+use super::page_tables::{map_in_active_tables, release_active_l2, PageFlags};
 
 /// Syscall number the user stub raises to signal "I ran; hand control back". Chosen far outside the
 /// real syscall range so it can never collide with a genuine call.
@@ -191,6 +191,7 @@ pub fn selftest() {
     let m2 = unsafe { map_in_active_tables(USER_STACK_VA as u64, stack_frame as u64, stack_flags.bits()) };
     if m1.is_err() || m2.is_err() {
         pl011_write(b"arm32: usermode FAIL - could not map user pages\r\n");
+        release_test_pages(code_frame, stack_frame);
         return;
     }
 
@@ -230,5 +231,28 @@ pub fn selftest() {
         pl011_write(b"arm32: usermode PASS (code ran at PL0; USER perms enforced; svc back to kernel)\r\n");
     } else {
         pl011_write(b"arm32: usermode FAIL - see above\r\n");
+    }
+    release_test_pages(code_frame, stack_frame);
+}
+
+/// Take the selftest's two pages back out of the kernel's L1, and their frames back to the allocator.
+///
+/// Left in place, the megabyte at `USER_CODE_VA` stayed a kernel-owned table in the kernel L1, and every
+/// task inherits the kernel L1 - it is `TASK_HEAP_VA_START`, so it became the first heap megabyte of
+/// every task, shared (`release_active_l2` has the measurement). Said when it cannot be done, since a
+/// table left behind here is that defect back.
+fn release_test_pages(code_frame: u32, stack_frame: u32) {
+    use crate::memory::allocator::free_frame;
+    use crate::memory::frame::{Frame, PhysAddr};
+    // SAFETY: single-threaded boot, before any task exists; the slot is this selftest's own.
+    if !unsafe { release_active_l2(USER_CODE_VA) } {
+        pl011_write(b"arm32: usermode - its page table could NOT be released; every task inherits it\r\n");
+        return;
+    }
+    // SAFETY: both frames came from `alloc_frame` above and are mapped nowhere now - their only mapping
+    // was the L1 slot just cleared - so each goes back to the allocator exactly once.
+    unsafe {
+        free_frame(Frame::from_phys(PhysAddr(code_frame as u64)));
+        free_frame(Frame::from_phys(PhysAddr(stack_frame as u64)));
     }
 }

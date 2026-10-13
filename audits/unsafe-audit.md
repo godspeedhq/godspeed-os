@@ -2710,12 +2710,12 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/bootcon.rs | 2 | permitted |
-| arch/arm/page_tables.rs | 35 | permitted |
+| arch/arm/page_tables.rs | 37 | permitted |
 | arch/arm/sched_demo.rs | 6 | permitted |
 | arch/arm/sched_ipc.rs | 9 | permitted |
 | arch/arm/spawn.rs | 4 | permitted |
 | arch/arm/syscall.rs | 5 | permitted |
-| arch/arm/usermode.rs | 15 | permitted |
+| arch/arm/usermode.rs | 17 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
 | arch/arm/mod.rs | 52 | permitted |
 | arch/loongarch64/mod.rs | 24 | permitted |
@@ -3705,3 +3705,30 @@ declaring them, and the one `unsafe` block taking their addresses), so `PageTabl
 memory - the same fault arriving another way, when an image grows into BSS. Sound because nothing is read
 through the symbols; only their addresses are taken. Proven in QEMU: a user page at 0x00900000 is refused
 with a line naming the kernel's ranges.
+
+## `arch/arm/page_tables.rs` 35 -> 37 and `arch/arm/usermode.rs` 15 -> 17 (2026-10-13): no boot selftest leaves a table in the kernel L1
+
+**The defect.** The user-mode selftest mapped its code and stack pages at 0x5000_0000 through
+`map_in_active_tables` while the kernel's own L1 was active, and never unmapped them. That left a
+kernel-owned L2 for the megabyte at 0x5000_0000 in the kernel L1, and `fill_kernel_identity` copies every
+kernel L1 entry into each child's empty slots. 0x5000_0000 is `TASK_HEAP_VA_START` on 32-bit ports, so the
+first heap megabyte of EVERY task was mapped into that one shared table. The reclaim frees only tables the
+dying task owns, so it skipped it: measured in QEMU, every `mem-pressure` spawn and kill leaked 256 frames
+(7236 held, 6980 freed), and the dead task's user pages stayed in the table for the next task to inherit -
+two tasks' heaps in one table, against invariant 2. Found by a 1000-round chaos soak on the Pi 2 whose
+memory rose 2 MiB with every service's footprint unchanged.
+
+**page_tables.rs, block 1 (+2): `release_active_l2`, an `unsafe fn` and its block.** It clears the L1 slot
+holding a VA in the ACTIVE table and returns that L2 to the arena, only when the active root owns it.
+Sound because it runs in single-threaded boot before any task exists; the L1 is identity-mapped; the
+entry is cleaned to the point of coherency for the non-cacheable walker before the TLB entries of the
+whole megabyte are invalidated; and an L2 the active root does not own is left untouched (false). The
+page-table selftest's own manual clear (which cleared the L1 slot and kept the L2, losing one arena table
+for the life of the machine) is replaced by a call to it - the call site's `unsafe` replaces the block it
+removes, so the count rises by the new function's two only.
+
+**usermode.rs, block 2 (+2): `release_test_pages`.** One `unsafe` call to `release_active_l2`, and one
+block returning the selftest's two frames to the allocator (`Frame::from_phys` and `free_frame` are both
+`unsafe`). Sound because both frames came from `alloc_frame` in the same selftest and their only mapping
+was the slot just cleared, so each is freed exactly once; it is called on the failure path after mapping
+as well as at the end.
