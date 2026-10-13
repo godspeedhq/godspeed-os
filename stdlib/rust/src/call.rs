@@ -206,6 +206,20 @@ pub trait Watch {
 pub fn request_watched(
     ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64, watch: &dyn Watch,
 ) -> Result<Message, Error> {
+    request_watched_sifted(ctx, peer, msg, secs, watch, &mut |_| true)
+}
+
+/// [`request_watched`] that takes only the reply `mine` accepts, and drops any other while it waits.
+///
+/// **Why a quittable wait needs this.** Quitting abandons a request whose reply is still on its way. The
+/// next request's wait would take that late reply as its own, and the next command fails for nothing -
+/// found by `osdev test quit` on a slow `fs`, where every command after a `q` failed ("storage
+/// unavailable", "see fs's log"). A caller that tags its requests passes a test for its own tag, so a late
+/// answer to a question already given up on is recognised and dropped.
+pub fn request_watched_sifted(
+    ctx: &ServiceContext, peer: &str, msg: &Message, secs: i64, watch: &dyn Watch,
+    mine: &mut dyn FnMut(&Message) -> bool,
+) -> Result<Message, Error> {
     if !watch.active() {
         return request_within(ctx, peer, msg, secs);
     }
@@ -219,8 +233,8 @@ pub fn request_watched(
             watch.notice();
         }
         let t0 = ctx.epoch_secs_monotonic();
-        let out = ctx.request_with_reply_qhint_keeping(
-            peer, msg, due, secs, || watch.notice(), &|k| watch.keep(k));
+        let out = ctx.request_with_reply_keyhint_sifted_keeping(
+            peer, msg, due, secs, ServiceContext::QUIT_KEYS, || watch.notice(), |m| mine(m), &|k| watch.keep(k));
         // Name the outcome before acting on it. The quittable SDK wait answers a passed deadline and a send
         // that never left with the same `Timeout`, but it reports the deadline only once it has passed - so a
         // `Timeout` sooner than `secs` is a send that never left, and nothing else.

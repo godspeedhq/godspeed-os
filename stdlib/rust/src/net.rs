@@ -284,7 +284,9 @@ impl<'a> Net<'a> {
         req[2..2 + body.len()].copy_from_slice(body);
         let msg = Message::from_bytes(&req[..2 + body.len()]);
         let r = match self.watch {
-            Some(w) if w.active() => call::request_watched(self.ctx, "net-stack", &msg, secs, w)?,
+            // Only the reply carrying THIS request's tag (see `call::request_watched_sifted`).
+            Some(w) if w.active() => call::request_watched_sifted(self.ctx, "net-stack", &msg, secs, w,
+                &mut |m| m.payload_bytes().first() == Some(&tag))?,
             _ => call::request_within_notice(self.ctx, "net-stack", &msg, secs, self.notice, self.keep)?,
         };
         // A reply whose tag does not match is the answer to a request we already gave up on. Reading

@@ -1426,6 +1426,8 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     }
     let c_start = gs::driver::wait::ticks(ctx);
     serve_once(ctx, vol, capacity, unreadable, p, tag, reply, &mut out[1..], &mut len, false);
+    #[cfg(feature = "slow-replies")]
+    slow_reply(ctx, p.first().copied().unwrap_or(0));
 
     let errored = vol.as_ref().map_or(false, |f| f.io_error_seen.get());
     // A DESYNC IS NOT A DYING DISK, and must not reach the re-mount path below.
@@ -1524,6 +1526,13 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
 /// That is not hypothetical: it was done on 2026-09-20 and took `fs-all` from 25 of 25 to 2 of 25,
 /// with no suite typing `flash` at all. If an arm needs a fresher capacity, refresh it at the CALLER
 /// (see the serve loop), where the selftest is not involved.
+/// `slow-replies` (TEST BUILDS ONLY): hold the reply, so `osdev test quit` sees a slow disk in QEMU.
+#[cfg(feature = "slow-replies")]
+fn slow_reply(ctx: &ServiceContext, op: u8) {
+    let long = matches!(op & 0x7F, OP_DELETE_TREE | OP_CHECK | OP_SCRUB | OP_FLASH);
+    gs::task::sleep_ms(ctx, if long { 4000 } else { 700 });
+}
+
 fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
               tag: u8, reply: gs::cap::Cap, out: &mut [u8], out_len: &mut usize, quiet: bool) {
     let mut send = |bytes: &[u8]| {

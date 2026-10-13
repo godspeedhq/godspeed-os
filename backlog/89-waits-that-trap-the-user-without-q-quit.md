@@ -61,3 +61,52 @@ separate program, holding no console authority, whose output fits a bounded tran
 The operator chooses: the primitive first (it removes Q1, Q2, Q5 and most of Q4 at once), or the user-facing
 traps first (Q3 `run`, Q3 `chaos kill-storm`, Q4 `delete ... recursive`, Q6 `drives flash`), which are small and
 independent.
+
+## Evidence: `osdev test quit` (QEMU, 2026-10-13)
+
+`fs` built with `slow-replies` (700 ms per reply, 4 s for delete tree, check, scrub and flash); 22 kinds of wait,
+each sent, watched for `[q] quit`, then quit. The bar is rule 10's: `[q]` by 4 s, the prompt back within 3 s.
+
+**Before** (the first slice only, `1395264a`): the first run found a defect of its own - after a `q`, the abandoned
+request's late reply was taken by the NEXT command, so `mkdir`, `rename`, `cd` and the recursive `copy` and
+`delete` failed for nothing ("storage unavailable", "see fs's log"). `run` could not be stopped and held the shell,
+so every row after it measured nothing. `wait 6` said nothing; `help | write` said nothing; every quit was
+reported as a failure ("read: storage error", "copy: failed - fs refused the allocation", "write: append failed").
+
+**After** (the command clock, the tag-sifted watched request, scripts and `selfcheck` stopping on the command's
+quit, `wait` under the watch, the words): every case that runs past 2 s says `[q] quit` by 3.7 s at the latest,
+the prompt is back within 0.3 s, and each says what it did. A stray late reply is dropped by its tag.
+
+| command | verdict | [q] after | [b] | prompt back after q | ran (no q) | last line |
+|---|---|---|---|---|---|---|
+| `dir /q` | QUICK | - | - | - | 1.5 s | 3 entries |
+| `read /q/big.txt` | PASS | 2.0 s | - | 0.2 s | - | edit <path>            fread: stopped |
+| `copy /q/big.txt /q/big2.txt` | PASS | 2.7 s | - | 0.2 s | - | copy: stopped - the destination is incomplete; delete it, or copy again |
+| `find h2.txt /` | PASS | 2.4 s | - | 0.2 s | - | fs: op 14 took 702419 us, 2 block ops, 0% of it inside them |
+| `tree /` | PASS | 2.4 s | - | 0.2 s | - | ├── system/ |
+| `write append /q/big.txt more` | PASS | 2.6 s | - | 0.1 s | - | write: stopped - the file is as it was, or holds the whole change - never half (`read` it) |
+| `help | write /q/h3.txt` | LATE NOTICE | 3.6 s | - | 0.1 s | - | pipe: stopped |
+| `mkdir /q/m1` | QUICK | - | - | - | 1.8 s | created /q/m1 |
+| `rename /q/big2.txt big3.txt` | QUICK | - | - | - | 1.5 s | renamed /q/big2.txt → big3.txt |
+| `copy /q/tree /q/tree2 recursive` | PASS | 2.0 s | - | 0.3 s | - | copy: stopped |
+| `delete /q/tree2 recursive` | PASS | 2.4 s | - | 0.1 s | - | delete: stopped - fs goes on removing the tree; `dir` shows what is left |
+| `drives check` | PASS | 2.0 s | - | 0.1 s | - | drives: aborted (the filesystem finishes its pass in the background) |
+| `drives scrub` | PASS | 2.2 s | - | 0.1 s | - | drives: aborted (the filesystem finishes its pass in the background) |
+| `cd /q/tree/a` | LATE NOTICE | 3.7 s | - | 0.1 s | - |  |
+| `seal /q/big.txt yes` | LATE NOTICE | 3.6 s | - | 0.1 s | - | seal: stopped |
+| `wait 6` | PASS | 2.4 s | - | 0.1 s | - | fs: op 10 took 736586 us, 19 block ops, 4% of it inside them |
+| `hardware` | QUICK | - | - | - | 0.9 s | 3 device(s) with a driver, 5 without - hardware <device> for one in full |
+| `date` | QUICK | - | - | - | 0.8 s | (last known 2026-10-13 21:43:53 UTC from /system/services/time/floor - a floor, not a read |
+| `events persist status` | QUICK | - | - | - | 1.5 s | events persist: lines were LOST - the window wrapped faster than the disk could take them |
+| `chaos kill-storm events 3` | QUICK | - | - | - | 1.6 s | verdict: PASS |
+| `selfcheck files` | PASS | 2.7 s | - | 0.3 s | - | selfcheck: STOPPED at your request after 1 of 1 part(s) - this is NOT a pass. |
+| `run /q/loop.gsh` | PASS | 2.3 s | - | 0.1 s | - | run: STOPPED at your request - the statements after this point did not run |
+
+Not exercised by this table, because QEMU does not slow them: the waits on other services (`hardware`, `date`,
+`events persist`, the radios, the network). They answered in under 2 s here, so the table records them as quick,
+not as passing. The next slice slows those services the same way.
+
+**Seen once, cause unknown (2026-10-13):** one `osdev test script` run on this slice timed out in its first
+`selfcheck` (300 s) and every case after it with it; three runs since, on the same code, passed 11/0 and
+`selfcheck` 594/0. The slow `fs` did not leak into it (each suite rebuilt `fs` with its normal features). The
+suite now saves its serial (`build/tests/script_serial.log`), so a repeat leaves something to read.

@@ -432,7 +432,9 @@ impl<'a> Fs<'a> {
 
         let msg = Message::from_bytes(&req[..n]);
         let reply = match self.watch {
-            Some(w) if w.active() => call::request_watched(self.ctx, "fs", &msg, secs, w)?,
+            // Only the reply carrying THIS request's tag: a late answer to a request already quit is dropped.
+            Some(w) if w.active() => call::request_watched_sifted(self.ctx, "fs", &msg, secs, w,
+                &mut |m| m.payload_bytes().first() == Some(&tag))?,
             _ => call::request_within_notice(self.ctx, "fs", &msg, secs, self.notice, self.keep)?,
         };
         let body = reply.payload_bytes();

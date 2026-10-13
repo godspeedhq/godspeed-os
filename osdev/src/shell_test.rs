@@ -6311,6 +6311,11 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL - unknown-part case timed out"); fail += 1; }
     }
 
+    // The whole serial, so a timed-out case leaves something to read (as `files-test` does).
+    {
+        let g = buf.lock().unwrap();
+        let _ = std::fs::write("build/tests/script_serial.log", &g[..]);
+    }
     child.kill().ok();
     child.wait().ok();
     println!("\nscript-test: {pass} passed, {fail} failed");
@@ -10796,4 +10801,181 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
 
     println!("\naudio-test: {pass} passed, {fail} failed (serial: build/tests/audio_test_serial.log, sound: {wav})");
     if fail > 0 { std::process::exit(1); }
+}
+
+/// `osdev test quit` (`backlog/89`, `audits/2026-10-13-quit-audit.md`): every kind of wait, on an `fs` built
+/// with `slow-replies` (700 ms per reply, 4 s for the long single operations), recording for each command
+/// whether `[q] quit` appeared and when, whether `[b]` did, how long `q` took to bring the prompt back, and
+/// what the command said. The record is `build/tests/quit_report.md`.
+///
+/// The bar, per case (`utilities/0_conventions.md` rule 10, agreed 2026-10-13): a command that runs past 2 s
+/// must say `[q] quit` by 4 s - the shell aims at 2, and its whole-second clock plus a reply already on its way
+/// put the slowest at 3.7 - and `q` must bring the prompt back within 3 s. A command that ends before its
+/// notice is due is recorded as quick, not failed.
+pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
+    // By 4 s (rule 10): aimed at 2.
+    const NOTICE_BAR_SECS: f32 = 4.0;
+    println!("quit-test: booting (smp={smp}) with a slow fs and a RAW AHCI disk");
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("quit-test: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("quit-test: no serial"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        println!("quit-test: FAIL - no first prompt");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+    // Run a command to its end (setup): no q pressed.
+    macro_rules! setup {
+        ($c:expr, $secs:expr) => {{
+            send(&mut write_half, $c);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+        }};
+    }
+    // SETUP, not timed: a disk with a tree, a big file and a script.
+    send(&mut write_half, b"drives flash data\r");
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20));
+    send(&mut write_half, b"y\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
+    let _ = setup!(b"mkdir /q/tree/a/b parents\r", 30);
+    let _ = setup!(b"help | write /q/big.txt\r", 90);
+    let _ = setup!(b"help | write /q/tree/a/h1.txt\r", 90);
+    let _ = setup!(b"help | write /q/tree/a/b/h2.txt\r", 90);
+    let _ = setup!(b"write /q/loop.gsh \"for i in range 20 { wait 1 }\"\r", 30);
+
+    struct Row { cmd: String, notice: Option<f32>, b: bool, back: Option<f32>, total: Option<f32>, said: String, verdict: &'static str }
+    let mut rows: Vec<Row> = Vec::new();
+
+    // Each case: send it, wait up to 8 s for `[q] quit`; if it comes, press q and time the prompt's return.
+    let cases: &[(&str, &str)] = &[
+        ("dir /q",                            "one directory, a few requests"),
+        ("read /q/big.txt",                   "stream a file, many fast requests"),
+        ("copy /q/big.txt /q/big2.txt",       "stream a copy"),
+        ("find h2.txt /",                     "walk the tree"),
+        ("tree /",                            "walk the tree"),
+        ("write append /q/big.txt more",      "stage, append, move"),
+        ("help | write /q/h3.txt",            "a pipe into a file"),
+        ("mkdir /q/m1",                       "one request"),
+        ("rename /q/big2.txt big3.txt",       "one request"),
+        ("copy /q/tree /q/tree2 recursive",   "walk and copy a tree"),
+        ("delete /q/tree2 recursive",         "one long request (4 s)"),
+        ("drives check",                      "one long request (4 s)"),
+        ("drives scrub",                      "one long request (4 s)"),
+        ("cd /q/tree/a",                      "one stat"),
+        ("seal /q/big.txt yes",               "one request"),
+        ("wait 6",                            "a timed wait"),
+        ("hardware",                          "service asks"),
+        ("date",                              "service asks"),
+        ("events persist status",             "service asks"),
+        ("chaos kill-storm events 3",         "the shell's own chaos mode"),
+        ("selfcheck files",                   "a part of the self-check"),
+        // Last: a script that cannot be stopped holds the shell for its whole length (20 s here, so the
+        // run ends either way and leaves a prompt behind).
+        ("run /q/loop.gsh",                   "a script that loops 20 s"),
+    ];
+    for (c, what) in cases {
+        let line = format!("{c}\r");
+        let t0 = Instant::now();
+        send(&mut write_half, line.as_bytes());
+        match collect_until_any(&buf, &mut cursor, &[b"[q] quit", b"gsh>"], Duration::from_secs(8)) {
+            Some((0, before)) => {
+                let tn = t0.elapsed().as_secs_f32();
+                // See whether [b] is offered on the same line, then quit.
+                thread::sleep(Duration::from_millis(300));
+                let tail = { let g = buf.lock().unwrap(); String::from_utf8_lossy(&g[cursor..]).into_owned() };
+                let b = before.contains("[b]") || tail.lines().next().map_or(false, |l| l.contains("[b]"));
+                let tq = Instant::now();
+                send(&mut write_half, b"q");
+                let after = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+                let back = after.as_ref().map(|_| tq.elapsed().as_secs_f32());
+                let said = after.as_deref().unwrap_or("").lines()
+                    .map(|l| l.trim()).filter(|l| !l.is_empty() && !l.contains("gsh>"))
+                    .last().unwrap_or("").chars().take(90).collect::<String>();
+                let verdict = match back {
+                    Some(s) if tn <= NOTICE_BAR_SECS && s <= 3.0 => "PASS",
+                    Some(_) if tn > NOTICE_BAR_SECS => "LATE NOTICE",
+                    Some(_) => "SLOW QUIT",
+                    None => "TRAPPED",
+                };
+                rows.push(Row { cmd: c.to_string(), notice: Some(tn), b, back, total: None, said, verdict });
+            }
+            Some((_, done)) => {
+                let tt = t0.elapsed().as_secs_f32();
+                let said = done.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.contains("gsh>")).last()
+                    .unwrap_or("").chars().take(90).collect::<String>();
+                rows.push(Row { cmd: c.to_string(), notice: None, b: false, back: None, total: Some(tt), said,
+                    verdict: if tt <= NOTICE_BAR_SECS { "QUICK" } else { "NO NOTICE" } });
+            }
+            None => {
+                // No notice in 8 s and no prompt: the case is trapped. Try q anyway, then wait it out.
+                send(&mut write_half, b"q");
+                let r = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(180));
+                let tt = t0.elapsed().as_secs_f32();
+                let _ = r;
+                rows.push(Row { cmd: c.to_string(), notice: None, b: false, back: None, total: Some(tt),
+                    said: String::new(), verdict: "TRAPPED" });
+            }
+        }
+        println!("quit-test: {:<36} {:<12} notice {:>5}  back {:>5}  {}", c, rows.last().unwrap().verdict,
+            rows.last().unwrap().notice.map_or("-".into(), |v| format!("{v:.1}s")),
+            rows.last().unwrap().back.map_or("-".into(), |v| format!("{v:.1}s")), what);
+        // A clean prompt for the next case.
+        send(&mut write_half, b"\r");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
+    }
+
+    let mut md = String::new();
+    md.push_str("# osdev test quit - every wait on a slow fs\n\n");
+    md.push_str("`fs` built with `slow-replies`: 700 ms per reply, 4 s for delete tree, check, scrub, flash. Times are seconds after the command was sent (notice) and after `q` was pressed (back). The bar: `[q]` by 4 s, the prompt back within 3 s of `q` (rule 10).\n\n");
+    md.push_str("| command | verdict | [q] after | [b] | prompt back after q | ran (no q) | last line |\n|---|---|---|---|---|---|---|\n");
+    let mut bad = 0;
+    for r in &rows {
+        if matches!(r.verdict, "TRAPPED" | "NO NOTICE" | "LATE NOTICE" | "SLOW QUIT") { bad += 1; }
+        md.push_str(&format!("| `{}` | {} | {} | {} | {} | {} | {} |\n", r.cmd, r.verdict,
+            r.notice.map_or("-".into(), |v| format!("{v:.1} s")), if r.b { "yes" } else { "-" },
+            r.back.map_or("-".into(), |v| format!("{v:.1} s")), r.total.map_or("-".into(), |v| format!("{v:.1} s")),
+            r.said.replace('|', "/")));
+    }
+    let _ = std::fs::write("build/tests/quit_report.md", &md);
+    {
+        let g = buf.lock().unwrap();
+        let _ = std::fs::write("build/tests/quit_serial.log", &g[..]);
+    }
+    println!("quit-test: {} case(s), {} not meeting the bar - report in build/tests/quit_report.md", rows.len(), bad);
+    child.kill().ok();
+    child.wait().ok();
 }

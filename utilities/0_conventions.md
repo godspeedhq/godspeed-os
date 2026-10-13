@@ -116,7 +116,25 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     the only rule that actually distinguishes them, so the rule is written down rather than left to
     be inferred from two examples that look contradictory.
 
-10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
+10. **Nothing traps the user: every wait says `[q] quit`, by 4 s, and honours it.** (Rewritten
+    2026-10-13 with the operator, `backlog/89`, `audits/2026-10-13-quit-audit.md`.) Any command a
+    person waits on that can run past 2 s says `[q] quit` - aimed at 2 s, and never later than **4 s**
+    on the slowest board, because the shell's clock counts whole seconds and a reply may already be on
+    its way - and `q`/`Q`/ESC brings the prompt back within 3 s, saying truthfully what happened:
+    stopped, still running underneath, or outcome unknown. `[b] background` stands beside it where the
+    work can run detached - a separate program, holding no console authority, whose output fits a
+    transcript - and a command with no `[b]` says nothing about `[b]`. Waits on the person (a confirm,
+    `input`, a full-screen program with its own quit key) are exempt.
+
+    **The shell is the observer.** It starts a COMMAND clock at Enter, and every wait the command makes
+    reads it through `gs::call::Watch` - a `gs::fs` / `gs::net` handle lent `.watching(ctx)` (the shell's
+    `ctx.fs()`), `gs::call::request_watched`, `recv_quittable` - so the notice is per command, a command
+    made of many fast requests is covered as well as one slow request, and `q` stops the command at its
+    next request. A script, a `wait` and `selfcheck` stop on it too. A wait the watch cannot see is a
+    defect to fix, not an exception to record. `osdev test quit` measures every kind of wait on an `fs`
+    built to answer slowly (`slow-replies`) and writes the table to `build/tests/quit_report.md`.
+
+    *The rule as it read before 2026-10-13, kept as history:* **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
     a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
     to the prompt, and a wait of more than a moment advertises `[q] quit`. A command
     that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +

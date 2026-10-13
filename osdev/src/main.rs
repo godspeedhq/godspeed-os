@@ -1748,6 +1748,7 @@ fn cmd_test(suite: &str) {
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
+        "quit"         => run_quit_test(),
         "sticky"       => run_sticky_test(),
         "edit"         => run_edit_test(),
         "script"       => run_script_test(),
@@ -2562,6 +2563,22 @@ fn run_sticky_test() {
     let persist = "build/tests/persist_sticky.img";
     std::fs::write(persist, vec![0u8; 32 * 1024 * 1024]).expect("failed to create persist disk");
     crate::shell_test::run_sticky(&image_path, persist, 4);
+}
+
+/// `osdev test quit` (`backlog/89`): every kind of wait, on a deliberately slow `fs`, recording whether
+/// `[q] quit` (and `[b]`) appeared, when, and what `q` did. The record is `build/tests/quit_report.md`.
+fn run_quit_test() {
+    println!("\n=== quit: every wait on a slow fs - does [q] appear, and does q work? ===");
+    build_blockdev_fs("slow-replies", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_quit.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    crate::shell_test::run_quit(&image_path, persist, 4);
 }
 
 fn run_files_test() {

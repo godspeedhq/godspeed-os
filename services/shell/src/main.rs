@@ -2571,8 +2571,8 @@ fn cmd_run(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&st
         return Err(ShellError::Unknown);
     }
     resolve_imports(ctx, &mut script, &mut code);
-    // NOT abortable: `run` is unchanged by this pass. It has the same shape and arguably wants the
-    // same escape, but changing a second command's behaviour on the way past is not this change.
+    // Stopped by the command's watch between statements (`run_lines`), like every other command: a script
+    // nobody could stop was the worst trap the 2026-10-13 audit found (`backlog/89` Q3).
     run_with_optional_save(ctx, cwd, &[("", &script[..code])], depth, save, params, false)
 }
 
@@ -4745,6 +4745,16 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         // pays one queue check per statement and nothing else. Only where the caller asked for it -
         // a script driven by the harness must not be abortable by whatever happens to be in the
         // input ring.
+        //
+        // AND A QUIT TAKEN INSIDE A STATEMENT. A statement whose own wait read the `q` (a disk request, a
+        // `wait`) records it as the COMMAND's quit (`gs::call::Watch`), so the script stops here rather than
+        // running every later statement into a refusal - `selfcheck files` once reported "ran 150, failed 89"
+        // for one `q`. The watch reads no key before `[q] quit` is showing, so typing ahead is not taken for an
+        // answer, and every script a person runs can now be stopped (`backlog/89` Q3).
+        if ctx.cmd_active.get() && gs::call::Watch::stopped(ctx) {
+            aborted = true;
+            break;
+        }
         if abortable {
             while let Some(k) = ctx.try_console_read() {
                 if k == b'q' || k == b'Q' || k == 0x1b {
@@ -4810,6 +4820,10 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
             out.line_fmt(ctx, format_args!("run: ran {}, failed {}, skipped {}", ran, failed, skipped));
         }
     }
+    // A script stopped with `q` says so; a part of `selfcheck` leaves that to the suite's own line.
+    if aborted && tally.is_none() {
+        out.line(ctx, "run: STOPPED at your request - the statements after this point did not run");
+    }
     if let Some(t) = tally {
         t.ran += ran;
         t.failed += failed;
@@ -4850,6 +4864,7 @@ fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, 
                 "##### [{}] part {}/{}  {:<8}{} #####",
                 str_of(&bar), k + 1, parts.len(), name,
                 if abortable { "   [q] quit" } else { "" }));
+            if abortable { ctx.cmd_noticed.set(true); }
         }
         // The per-part result is discarded ON PURPOSE: `t.failed` is the answer for the suite, and a
         // part that fails must not stop the parts after it. A run that gave up half way would report
@@ -4866,7 +4881,10 @@ fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, 
     // finished - and it is what the harness greens on. Say that it stopped, and NAME what never ran,
     // because "which parts did I skip" is the first thing the operator needs and the one thing a
     // count cannot tell them (26.7).
-    if t.aborted {
+    // `run` shares this with `selfcheck`: one unnamed part is a script, and is called one.
+    if t.aborted && parts.len() == 1 && parts[0].0.is_empty() {
+        out.line(ctx, "run: STOPPED at your request - the statements after this point did not run");
+    } else if t.aborted {
         out.line_fmt(ctx, format_args!(
             "selfcheck: STOPPED at your request after {} of {} part(s) - this is NOT a pass.",
             ran_parts, parts.len()));
@@ -9351,7 +9369,11 @@ fn pause_quittable(ctx: &ShellCtx, secs: i64) -> bool {
     // ends at the next second boundary - up to a second early, never late).
     let start = gs::task::epoch_secs_monotonic(ctx);
     loop {
-        if quit_key_or_keep(ctx) { return false; }
+        // The command's `[q] quit`, once it has run 2 s (`gs::call::Watch`), and a `q` is the COMMAND's: a
+        // `wait` inside a script loop used to end only that `wait`, and the loop went on.
+        if ctx.quit.get() { return false; }
+        if ctx.cmd_active.get() && gs::call::Watch::notice_due_in(ctx) == 0 { gs::call::Watch::notice(ctx); }
+        if quit_key_or_keep(ctx) { ctx.quit.set(true); return false; }
         if gs::task::epoch_secs_monotonic(ctx) - start >= secs { return true; }
         // SLEEP, not yield: a yield loop kept this core busy for the whole wait (`backlog/fixed/80` H21).
         // 50 ms is short enough that `q` still answers at once.
@@ -14601,7 +14623,7 @@ fn console_write_chunked(ctx: &ServiceContext, bytes: &[u8]) {
 /// Apply one non-sink stage to the stream in place. Dispatches by command AND by whether the
 /// stream is currently Bytes or a Table; a mismatch is a loud error (false). `from`/`to` flip
 /// between the two worlds.
-fn pipe_transform(ctx: &ServiceContext, stage: &str, cmd: &str, s: &mut Stream) -> bool {
+fn pipe_transform(ctx: &ShellCtx, stage: &str, cmd: &str, s: &mut Stream) -> bool {
     match cmd {
         // text → records
         "from" => {
@@ -14752,7 +14774,7 @@ fn byte_filter(ctx: &ServiceContext, stage: &str, s: &mut Stream) -> bool {
 /// encode`), decodes it back into a `Table`, and renders the grid. `#[inline(never)]` - it holds a
 /// 16 KiB `Cap` on the user stack (USER_STACK_PAGES is tight; see the shell pipe stack-overflow lesson, `docs/pipes.md`).
 #[inline(never)]
-fn cmd_roster(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn cmd_roster(ctx: &ShellCtx) -> Result<(), ShellError> {
     let mut cap = Cap::new();
     if !drain_service(ctx, "roster", None, &mut cap) { return Err(ShellError::Unknown); }
     match Table::decode(cap.bytes()) {
@@ -17586,7 +17608,7 @@ const MAX_STAGES: usize = 8;
 /// input first (the whole buffer as one ≤4 KiB message + an EOT). Output is drained from the
 /// shell's endpoint until the service sends an EOT (0x04), then the service is reaped. Whole-
 /// buffer messaging (≤ one message each way) keeps the bounded queues deadlock-free (§8.9).
-fn drain_service(ctx: &ServiceContext, svc: &str, input: Option<&[u8]>, out: &mut Cap) -> bool {
+fn drain_service(ctx: &ShellCtx, svc: &str, input: Option<&[u8]>, out: &mut Cap) -> bool {
     !matches!(drain_service_with(ctx, svc, &["shell"], input, out, FILTER_WAIT_SECS, None), Drained::Failed)
 }
 
@@ -17614,7 +17636,7 @@ enum Drained {
 /// while the stage runs reaches the prompt instead of vanishing. `None` keeps a plain pipe stage's
 /// behaviour, which still drops type-ahead - the shell's other drains take a `&ServiceContext` and
 /// cannot reach the type-ahead buffer (recorded, `backlog/fixed/80` H16's receive side).
-fn drain_service_with(ctx: &ServiceContext, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
+fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
                       wait_secs: i64, keep: Option<&dyn Fn(u8)>) -> Drained {
     // A stage crossing a service boundary is one IPC message until streaming chunks across
     // many. Refuse a larger buffer LOUDLY rather than silently clipping it to 4 KiB (§3.12).
@@ -17976,6 +17998,7 @@ fn stream_overwrite(ctx: &ShellCtx, p: &[u8], data: &[u8]) {
             Err(gs::Error::NoFilesystem) => gs::io::println(ctx, "no filesystem - run 'drives flash' first"),
             Err(gs::Error::Unavailable) =>
                 gs::io::println(ctx, "storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)"),
+            Err(_) if said_stopped(ctx, "pipe", "the file may be incomplete") => {}
             Err(_) => {
                 let why = g.reason();
                 if why.is_empty() {
@@ -17989,7 +18012,9 @@ fn stream_overwrite(ctx: &ShellCtx, p: &[u8], data: &[u8]) {
         return;
     }
     if !fs_write_new(ctx, p, data.len() as u64) {
-        gs::io::println(ctx, "pipe: write failed (bad path, or parent missing?)");
+        if !said_stopped(ctx, "pipe", "") {
+            gs::io::println(ctx, "pipe: write failed (bad path, or parent missing?)");
+        }
         return;
     }
     let mut off = 0usize;
@@ -18084,7 +18109,7 @@ fn pipe_write(ctx: &ShellCtx, cwd: &Cwd, arg: &str, data: &[u8]) {
             if fs_stream_combine(ctx, p, data, prepend) {
                 gs::io::println_fmt(ctx, format_args!(
                     "{} {} bytes → {}", if prepend { "prepended" } else { "appended" }, data.len(), str_of(p)));
-            } else {
+            } else if !said_stopped(ctx, "pipe", "the file is as it was, or holds the whole change - never half (`read` it)") {
                 gs::io::println_fmt(ctx, format_args!(
                     "pipe: write {} failed (storage, or bad path?)", if prepend { "prepend" } else { "append" }));
             }
@@ -19714,7 +19739,25 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
 ///
 /// One helper rather than seven hand-written wordings, because the seven sites drifting apart is how
 /// the honest half gets left out of whichever one is touched last.
+/// A command the operator quit says it STOPPED - never "storage error" or "failed" (`backlog/89` Q6), which
+/// sends a person looking for a fault that is not there. `left` says what a half-done command leaves
+/// behind, where that is anything but nothing. `true` when it was a quit, and the line is said.
+fn said_stopped(ctx: &ShellCtx, verb: &str, left: &str) -> bool {
+    if !ctx.quit.get() {
+        return false;
+    }
+    if left.is_empty() {
+        gs::io::println_fmt(ctx, format_args!("{}: stopped", verb));
+    } else {
+        gs::io::println_fmt(ctx, format_args!("{}: stopped - {}", verb, left));
+    }
+    true
+}
+
 fn fs_no_answer(ctx: &ShellCtx, verb: &str) {
+    if said_stopped(ctx, verb, "") {
+        return;
+    }
     if ctx.fs_unknown.get() {
         let why = ctx.last_write_err.borrow();
         gs::io::println_fmt(ctx, format_args!(
@@ -20831,13 +20874,17 @@ fn cmd_seal(ctx: &ShellCtx, cwd: &Cwd, arg: &str, yes: bool) -> Result<(), Shell
             // The fourth command today with this shape, after `write`, `move` and `copy`. The pattern
             // is worth naming: a layer that knows why something failed and answers with a menu of
             // possibilities costs the reader the one thing it could have told them (26.7).
-            let why = gfs.reason();
-            if why.is_empty() {
-                gs::io::println(ctx, "seal: failed - see fs's log");
+            if said_stopped(ctx, "seal", "") {
+                Ok(())
             } else {
-                gs::io::println_fmt(ctx, format_args!("seal: failed - {}", why));
+                let why = gfs.reason();
+                if why.is_empty() {
+                    gs::io::println(ctx, "seal: failed - see fs's log");
+                } else {
+                    gs::io::println_fmt(ctx, format_args!("seal: failed - {}", why));
+                }
+                Err(ShellError::Unknown)
             }
-            Err(ShellError::Unknown)
         }
     };
     ctx.fs_tag.set(gfs.tag());
@@ -20904,7 +20951,20 @@ fn fc_invoke(ctx: &ShellCtx, file: gs::cap::Cap, right: u8, payload: &[u8]) -> O
 /// (utilities/0_conventions.md rule 10), the re-waits after an overtaken fs or net-stack reply
 /// (`fs_take_tagged`, `ns_take_tagged`) included; the requests themselves go through
 /// `ask_with_quit_notice`. Keys other than `q` go to `keep`.
-fn recv_quittable(ctx: &ServiceContext, secs: i64, noticed: &core::cell::Cell<bool>, keep: &dyn Fn(u8)) -> ReqOutcome {
+fn recv_quittable(ctx: &ShellCtx, secs: i64, noticed: &core::cell::Cell<bool>, keep: &dyn Fn(u8)) -> ReqOutcome {
+    // Inside a command the notice is the COMMAND's (`gs::call::Watch`): a second wait after a first one -
+    // a reply that turned out to be a late answer to a request already quit - must not start its own 2 s
+    // clock (`drives scrub` said `[q] quit` at 4.7 s that way, in `osdev test quit`).
+    if ctx.cmd_active.get() {
+        if ctx.quit.get() { return ReqOutcome::Aborted; }
+        let after = gs::call::Watch::notice_due_in(ctx);
+        let out = ctx.recv_abortable_deadline_noticing(secs, after, &|| {
+            noticed.set(true);
+            gs::call::Watch::notice(ctx);
+        }, keep);
+        if let ReqOutcome::Aborted = out { ctx.quit.set(true); }
+        return out;
+    }
     let after = if noticed.get() { i64::MAX } else { gs::call::NOTICE_AFTER_SECS };
     ctx.recv_abortable_deadline_noticing(secs, after, &|| {
         noticed.set(true);
@@ -21976,6 +22036,7 @@ fn cmd_read(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
     while off < size {
         let n = match fs_read_at(ctx, path, off, &mut chunk) {
             Some(n) if n > 0 => n,
+            _ if said_stopped(ctx, "read", "") => return Ok(()),
             _ => { gs::io::println(ctx, "read: storage error"); return Err(ShellError::Unknown); }
         };
         out.put_bytes(ctx, &chunk[..n]);
@@ -22015,6 +22076,10 @@ fn cmd_write(ctx: &ShellCtx, cwd: &Cwd, rest: &str) -> Result<(), ShellError> {
         if fs_stream_combine(ctx, p, content.as_bytes(), prepend) {
             gs::io::println_fmt(ctx, format_args!(
                 "{} {} bytes to {}", if prepend { "prepended" } else { "appended" }, content.len(), str_of(p)));
+            return Ok(());
+        }
+        // The combine stages in scratch and lands with ONE move, so a quit leaves the file whole either way.
+        if said_stopped(ctx, "write", "the file is as it was, or holds the whole change - never half (`read` it)") {
             return Ok(());
         }
         gs::io::println_fmt(ctx, format_args!(
@@ -22341,6 +22406,7 @@ fn cmd_copy(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), Shell
             gs::io::println_fmt(ctx, format_args!("copied {} → {} ({} bytes)", str_of(&sp[..sl]), str_of(&dp[..dl]), bytes));
             Ok(())
         }
+        None if said_stopped(ctx, "copy", "the destination is incomplete; delete it, or copy again") => Ok(()),
         None => {
             match ctx.last_write_err.borrow().get() {
                 Some(why) if ctx.fs_unknown.get() =>
@@ -23317,6 +23383,8 @@ fn delete_one(ctx: &ShellCtx, cwd: &Cwd, arg: &str, recursive: bool) -> Result<(
                 "delete: failed - {} (a non-empty directory needs 'delete <path> recursive')", why));
             Err(ShellError::Unknown)
         }
+        // One request removes the whole tree, so a quit leaves `fs` still removing it.
+        Err(_) if said_stopped(ctx, "delete", "fs goes on removing the tree; `dir` shows what is left") => Ok(()),
         Err(_) if recursive => {
             gs::io::println(ctx, "delete: failed (not found, or tree too deep?)");
             Err(ShellError::Unknown)
