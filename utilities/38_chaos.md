@@ -149,7 +149,8 @@ the run moved into its own service. `chaos` waits for a live shell before it han
 Every service in the supervisor's `MANAGED` set is respawned on its own death; `chaos` does NOT check
 that it came back - asking the supervisor, which is itself being killed, would not be ground truth. The victims are chosen with a tiny `xorshift64` PRNG. (This
 said it was seeded from the TSC; it is not - the TSC is unreliable on the T630 - and the seed mixes the
-hardware random number where there is one, the monotonic counter, and the wall clock when it is set.)
+hardware random number where there is one, the monotonic counter, and the wall clock when it is set. Since
+2026-10-13 the SHELL draws it from those sources and hands it to `chaos`, so it can record it, below.)
 
 **The seed is printed, and can be given.** An `all-services` run says its seed when it starts and again in
 its report, and `chaos max-carnage all-services <rounds> seed <n>` runs on that seed. On a display the
@@ -161,6 +162,24 @@ chaos: seed 4242 (given) - `chaos max-carnage all-services <n> seed 4242` replay
 ...
 === chaos max-carnage: report ===
 seed: 4242
+```
+
+**The seed is also kept on disk, in `/system/utilities/chaos/last-run`** (`docs/filesystem-layout.md`):
+the seed, the target, the rounds and the command that replays the draws, written by the shell BEFORE the
+storm, because the storm kills `fs` and the `chaos` service holds no `fs` at all. One file, the latest
+random run, whether its seed was drawn or given. With no disk, or an `fs` that does not answer within
+3 s, the shell says the seed was NOT recorded and runs anyway - the printed seed is still there.
+
+```
+gsh> chaos max-carnage all-services 3 yes
+ ...
+ Seed 216178474221616 recorded in /system/utilities/chaos/last-run.
+chaos: seed 216178474221616 (drawn) - `chaos max-carnage all-services <n> seed 216178474221616` replays these draws, not this run's timing
+gsh> read /system/utilities/chaos/last-run
+seed 216178474221616
+target all-services
+rounds 3
+replay chaos max-carnage all-services 3 seed 216178474221616
 ```
 
 What that buys, stated so it is not overclaimed: **a seed replays the draws, not the run.** One draw is

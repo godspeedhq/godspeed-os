@@ -356,6 +356,8 @@ Named L1-L10 so they are not confused with the constitution's invariants 1-12 (C
 | `/persist.conf` | `/system/services/events/sticky` |
 | `/.gsh_history` | `/users/default/history` |
 | `/.write.tmp`, `/.edit.tmp`, `/.fcap-*`, `/.fl<id>~` | `/system/scratch/shell/` |
+| `/churn` | `/system/scratch/churn/` (its own: the evidence a power cut leaves, emptied only by `churn reset`) |
+| (none: printed only) | `/system/utilities/chaos/last-run`, a random chaos run's seed, written by the shell before the storm |
 
 - **The shell starts at `/users/default`**, without asking `fs` anything - the prompt must come up at once,
   and a home that is missing is said by the first command that uses it. A bare `cd` goes home, and `pwd`

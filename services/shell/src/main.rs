@@ -18563,6 +18563,26 @@ fn chaos_launch(
             return Ok(());
         }
     }
+    // THE SEED IS DRAWN HERE AND RECORDED BEFORE THE STORM, for a random run. Chaos prints it, but a
+    // printed number survives only if somebody was capturing serial; the record is on the disk. It is
+    // written now because `fs` is certainly up now - a storm kills it, and chaos holds no `fs` at all. The
+    // draw mixes the same three sources chaos used, for the same reason: none of them may be relied on
+    // alone (no RTC reads zero, not every board has a hardware RNG).
+    let (seed, seed_from) = match seed {
+        Some(s) => (Some(s), 1u8),
+        None if target_all => {
+            let dt = gs::task::datetime(ctx);
+            let s = ((dt.minute as u64) << 24) ^ ((dt.second as u64) << 40)
+                ^ ((ctx.hw_random().unwrap_or(0) as u64) << 8)
+                ^ ((gs::task::epoch_secs_monotonic(ctx) as u64) << 17)
+                ^ (gs::task::uptime_secs(ctx) as u64);
+            (Some(if s == 0 { 1 } else { s }), 2u8)
+        }
+        None => (None, 0u8),
+    };
+    if let (true, Some(s)) = (target_all, seed) {
+        chaos_record_seed(ctx, s, rounds);
+    }
     let _ = ctx.kill("chaos");
     if ctx.spawn("chaos").is_err() {
         gs::io::println(ctx, "chaos: failed to spawn the chaos service");
@@ -18577,7 +18597,7 @@ fn chaos_launch(
         let mut buf = [0u8; 13 + 128];
         buf[..4].copy_from_slice(&rounds.to_le_bytes());
         if let Some(s) = seed {
-            buf[4] = 1;
+            buf[4] = seed_from;
             buf[5..13].copy_from_slice(&s.to_le_bytes());
         }
         let tb = target.as_bytes(); let n = tb.len().min(128);
@@ -18605,6 +18625,41 @@ fn chaos_launch(
         if gs::task::epoch_secs_monotonic(ctx) - t0 >= 3 { break; }
     }
     Ok(())
+}
+
+/// Where a random chaos run's seed is kept (`docs/filesystem-layout.md`): the folder of the `chaos`
+/// utility, written by the shell because the `chaos` service holds no `fs`. One file, the latest run.
+const CHAOS_DIR: &[u8] = b"/system/utilities/chaos";
+const CHAOS_LAST_RUN: &[u8] = b"/system/utilities/chaos/last-run";
+/// A record is a convenience beside the printed seed, so a slow or absent `fs` gets this long and no more.
+const CHAOS_RECORD_SECS: i64 = 3;
+
+/// Record a random run's seed before the storm: `seed`, `rounds` and the command that replays the draws.
+/// Said either way - recorded, or why not - and never a reason not to run: the seed is printed regardless.
+fn chaos_record_seed(ctx: &ShellCtx, seed: u64, rounds: u32) {
+    use core::fmt::Write as _;
+    // Four short lines; a fixed buffer, as the rest of the shell does (26.6.1).
+    struct Rec { b: [u8; 192], n: usize }
+    impl core::fmt::Write for Rec {
+        fn write_str(&mut self, t: &str) -> core::fmt::Result {
+            let t = t.as_bytes();
+            if self.n + t.len() > self.b.len() { return Err(core::fmt::Error); }
+            self.b[self.n..self.n + t.len()].copy_from_slice(t);
+            self.n += t.len();
+            Ok(())
+        }
+    }
+    let mut rb = Rec { b: [0; 192], n: 0 };
+    let _ = write!(rb, "seed {}\ntarget all-services\nrounds {}\nreplay chaos max-carnage all-services {} seed {}\n",
+        seed, rounds, rounds, seed);
+    let path = str_of(CHAOS_LAST_RUN);
+    if sh_mkdir_within(ctx, CHAOS_DIR, CHAOS_RECORD_SECS) && sh_write_within(ctx, CHAOS_LAST_RUN, &rb.b[..rb.n], CHAOS_RECORD_SECS) {
+        gs::io::println_fmt(ctx, format_args!(" Seed {} recorded in {}.", seed, path));
+    } else {
+        gs::io::println_fmt(ctx, format_args!(
+            " Seed {} NOT recorded in {} - no filesystem, or it did not answer. The run prints it; note it from there.",
+            seed, path));
+    }
 }
 
 /// `chaos kill-storm <svc> [rounds] [save <path>]` - kill the service `rounds` times; each round,

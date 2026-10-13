@@ -4617,6 +4617,29 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - paginate capture timeout"); fail += 1; }
     }
 
+    // THE CHAOS SEED IS KEPT ON DISK (`docs/filesystem-layout.md` 13): a random run's seed is drawn by the
+    // shell and written to `/system/utilities/chaos/last-run` before the storm, because the storm kills
+    // `fs` and chaos holds none. Last in this suite, because the storm restarts everything.
+    send(&mut write_half, b"chaos max-carnage all-services 3 yes\r");
+    let storm = collect_until(&buf, &mut cursor, b"chaos max-carnage: report", Duration::from_secs(240)).unwrap_or_default();
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    let recorded = storm.split("Seed ").nth(1).and_then(|t| t.split(' ').next()).unwrap_or("").to_string();
+    check!(!recorded.is_empty() && storm.contains("recorded in /system/utilities/chaos/last-run"),
+           "chaos: a random run's seed is recorded before the storm");
+    check!(!recorded.is_empty() && storm.contains(&format!("chaos: seed {} (drawn)", recorded)),
+           "chaos: and chaos runs on that seed, and says it was drawn");
+    // The storm restarted `fs`; give it a moment to answer again.
+    let mut rec = String::new();
+    for _ in 0..6 {
+        if let Some(r) = run!(b"read /system/utilities/chaos/last-run\r", 20) {
+            if r.contains("replay chaos") { rec = r; break; }
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    check!(!recorded.is_empty() && rec.contains(&format!("seed {}", recorded))
+               && rec.contains(&format!("replay chaos max-carnage all-services 3 seed {}", recorded)),
+           "chaos: last-run holds the seed and the command that replays it");
+
     // Save the whole transcript. A check that fails here used to leave NOTHING to look at - the
     // harness printed a label and threw the serial away, so the first move on any failure was to
     // reproduce the whole run by hand. Same treatment `shell-test` already gives itself.
