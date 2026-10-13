@@ -10875,6 +10875,8 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
     let _ = setup!(b"help | write /q/big.txt\r", 90);
     let _ = setup!(b"help | write /q/tree/a/h1.txt\r", 90);
     let _ = setup!(b"help | write /q/tree/a/b/h2.txt\r", 90);
+    // A capture running, so `events persist status` and `stop` ask `recorder` rather than the task table.
+    let _ = setup!(b"events persist start /q/cap.log 64KiB\r", 90);
     let _ = setup!(b"write /q/loop.gsh \"for i in range 20 { wait 1 }\"\r", 30);
 
     struct Row { cmd: String, notice: Option<f32>, b: bool, back: Option<f32>, total: Option<f32>, said: String, verdict: &'static str }
@@ -10905,6 +10907,11 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
         ("net dns example.com",               "net-stack, slowed"),
         ("jobs",                              "copier, slowed"),
         ("background copy /q/big.txt /q/bg.txt", "start a copier job, slowed"),
+        // The case above quits its job, so start one to completion (a `!` case is setup: no q), then `jobs`
+        // asks `copier` about a live job rather than answering that there are none.
+        ("!background copy /q/big.txt /q/bg2.txt", ""),
+        ("jobs",                              "copier with a job, slowed"),
+        ("events persist stop",               "recorder, slowed"),
         ("chaos kill-storm events 3",         "the shell's own chaos mode"),
         ("selfcheck files",                   "a part of the self-check"),
         // Last: a script that cannot be stopped holds the shell for its whole length (20 s here, so the
@@ -10912,6 +10919,10 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
         ("run /q/loop.gsh",                   "a script that loops 20 s"),
     ];
     for (c, what) in cases {
+        if let Some(setup_cmd) = c.strip_prefix('!') {
+            let _ = setup!(format!("{setup_cmd}\r").as_bytes(), 90);
+            continue;
+        }
         let line = format!("{c}\r");
         let t0 = Instant::now();
         send(&mut write_half, line.as_bytes());

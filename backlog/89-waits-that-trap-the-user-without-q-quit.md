@@ -102,9 +102,42 @@ the prompt is back within 0.3 s, and each says what it did. A stray late reply i
 | `selfcheck files` | PASS | 2.7 s | - | 0.3 s | - | selfcheck: STOPPED at your request after 1 of 1 part(s) - this is NOT a pass. |
 | `run /q/loop.gsh` | PASS | 2.3 s | - | 0.1 s | - | run: STOPPED at your request - the statements after this point did not run |
 
-Not exercised by this table, because QEMU does not slow them: the waits on other services (`hardware`, `date`,
-`events persist`, the radios, the network). They answered in under 2 s here, so the table records them as quick,
-not as passing. The next slice slows those services the same way.
+**After the service slice** (`f7a18a97`: every service request under the watch, and `time`, `recorder`, `copier`
+and `net-stack` slowed to 2.5 s per reply): 28 cases, none below the bar. `date`, `events persist status` and
+`stop`, `net lease`, `net dns`, `background copy` and `jobs` with a live job now each say `[q]` by 2.9 s and come
+back within 0.7 s. Still not exercised: `hardware`, whose supervisor and drivers are not slowed (slowing the
+supervisor would slow every spawn), and the shell's chaos modes, which ran quick at 3 rounds.
+
+| command | verdict | [q] after | [b] | prompt back after q | ran (no q) | last line |
+|---|---|---|---|---|---|---|
+| `dir /q` | PASS | 2.7 s | - | 0.0 s | - | 4 entries |
+| `read /q/big.txt` | PASS | 3.3 s | - | 0.1 s | - | read: stopped |
+| `copy /q/big.txt /q/big2.txt` | PASS | 3.6 s | - | 0.1 s | - | copy: stopped - the destination is incomplete; delete it, or copy again |
+| `find h2.txt /` | PASS | 3.4 s | - | 0.1 s | - | fs: op 25 took 716046 us, 2 block ops, 0% of it inside them |
+| `tree /` | PASS | 3.6 s | - | 0.1 s | - |  |
+| `write append /q/big.txt more` | PASS | 3.6 s | - | 0.1 s | - | write: stopped - the file is as it was, or holds the whole change - never half (`read` it) |
+| `help | write /q/h3.txt` | PASS | 3.5 s | - | 0.1 s | - | pipe: stopped |
+| `mkdir /q/m1` | PASS | 2.8 s | - | 0.1 s | - | mkdir: failed (already exists, or parent missing? try 'mkdir <path> parents') |
+| `rename /q/big2.txt big3.txt` | QUICK | - | - | - | 1.5 s | rename: failed - see fs's log |
+| `copy /q/tree /q/tree2 recursive` | PASS | 2.0 s | - | 0.2 s | - | copy: stopped |
+| `delete /q/tree2 recursive` | PASS | 3.6 s | - | 0.1 s | - | delete: stopped - fs goes on removing the tree; `dir` shows what is left |
+| `drives check` | PASS | 2.0 s | - | 1.2 s | - | drives: aborted (the filesystem finishes its pass in the background) |
+| `drives scrub` | PASS | 3.8 s | - | 0.1 s | - | drives: aborted (the filesystem finishes its pass in the background) |
+| `cd /q/tree/a` | PASS | 3.8 s | - | 0.1 s | - | fs: op 29 took 4146556 us, 13 block ops, 0% of it inside them |
+| `seal /q/big.txt yes` | PASS | 2.4 s | - | 0.0 s | - | sealed /q/big.txt |
+| `wait 6` | PASS | 2.0 s | - | 0.1 s | - |  |
+| `hardware` | QUICK | - | - | - | 0.8 s | 3 device(s) with a driver, 5 without - hardware <device> for one in full |
+| `date` | PASS | 2.7 s | - | 0.1 s | - | no network link - plug the cable in and it will set itself, or run 'date sync' |
+| `events persist status` | PASS | 2.9 s | - | 0.1 s | - | events persist: recorder did not answer |
+| `net lease` | PASS | 2.5 s | - | 0.1 s | - |  |
+| `net dns example.com` | PASS | 1.5 s | - | 0.7 s | - | net: aborted |
+| `jobs` | QUICK | - | - | - | 0.8 s | no jobs |
+| `background copy /q/big.txt /q/bg.txt` | PASS | 2.3 s | - | 0.1 s | - | shell: ended `copier` - its job is over and nothing it said is left unread |
+| `jobs` | PASS | 2.9 s | - | 0.1 s | - | 1    running  100%      copy /q/big.txt /q/bg2.txt |
+| `events persist stop` | PASS | 2.6 s | - | 0.0 s | - | block-driver: op 2 spent 7778 us in the driver (slow #3) |
+| `chaos kill-storm events 3` | QUICK | - | - | - | 1.6 s | verdict: PASS |
+| `selfcheck files` | PASS | 2.7 s | - | 0.2 s | - | selfcheck: STOPPED at your request after 1 of 1 part(s) - this is NOT a pass. |
+| `run /q/loop.gsh` | PASS | 2.2 s | - | 0.1 s | - | run: STOPPED at your request - the statements after this point did not run |
 
 **Seen once, cause unknown (2026-10-13):** one `osdev test script` run on this slice timed out in its first
 `selfcheck` (300 s) and every case after it with it; three runs since, on the same code, passed 11/0 and
