@@ -177,7 +177,7 @@ pub const PRESENCE_EMPTY: u8 = 2;
 /// changing the path under a running stream would cut it mid-sound; `AUDIO_OFF` when audio is off.
 pub const OP_OUTPUT: u8 = 12;
 
-/// `[14, on]` - the system sounds on (1) or off (0). Answer `[OK | ALREADY]`. Kept in `/audio.settings`;
+/// `[14, on]` - the system sounds on (1) or off (0). Answer `[OK | ALREADY]`. Kept in `/system/services/<driver>/settings`;
 /// on by default.
 pub const OP_SYSTEM_SOUNDS: u8 = 14;
 
@@ -275,7 +275,7 @@ pub fn device_name(dev: u32) -> &'static str {
 }
 
 /// The default-device field a name from [`device_name`] stands for, for reading a name back - from
-/// `/audio.settings` or a typed `audio output headphone`. `None` for a name that table does not produce.
+/// `/system/services/<driver>/settings` or a typed `audio output headphone`. `None` for a name that table does not produce.
 pub fn device_of(name: &str) -> Option<u32> {
     (0..16u32).find(|&d| device_name(d) == name && name != "other")
 }

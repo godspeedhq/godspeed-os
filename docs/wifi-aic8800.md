@@ -1,5 +1,8 @@
 # WiFi on the VisionFive 2 Lite: the AIC8800D80 (design, 2026-10-04)
 
+> **Note 2026-10-13: the keys moved.** `/wifi.keys`, named in this record, is `/system/shared/wifi/keys`
+> since the filesystem layout (`docs/filesystem-layout.md`).
+
 **Status: phases V0 to V6 DONE and verified on the board (2026-10-04 to 2026-10-05): the grant, the `dw_mmc` host, the upload, the firmware's bring-up, scan, WPA2 join, and the frame path through `nic-driver`'s radio bridge (section 4). V7 (a rekey seen on this radio) is open.** V0 is the kernel's grant (`kernel/src/arch/riscv64/sdio.rs`); V1 is the userspace `dw_mmc` host (`services/wifi-driver/src/dwmmc.rs`) and identification. The driver answers `radio down` with the reason `DOWN_NOT_BUILT` only when the bring-up stops before a station interface exists. This is the plan for the third radio in `docs/wifi.md`'s table and the
 second WiFi driver. `docs/wifi.md` section 44 identified the chip from the board's own boot log; the
 firmware is in `nonfree/aic8800d80/` (byte for byte what the board's vendor image loaded, with its

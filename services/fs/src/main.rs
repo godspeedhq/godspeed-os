@@ -148,7 +148,7 @@ const _: () = assert!(DIR_TIMES_OFF >= DIR_CRC_OFF + 4,
 /// **`fs` must never ASK for the clock, and this is why it is a push.** Two independent reasons, and
 /// either alone would settle it:
 ///
-/// 1. `time` already sends to `fs` (it persists `/clock.last`). A synchronous call the other way is
+/// 1. `time` already sends to `fs` (it persists `/system/services/time/floor`). A synchronous call the other way is
 ///    the mutual-send shape §8.9 forbids, which the kernel will neither detect nor recover.
 /// 2. `fs` serves its clients on the very endpoint it would have to await the reply on, so a
 ///    request/reply wait here could DEQUEUE A CLIENT'S REQUEST and mistake it for the answer. That
@@ -251,6 +251,11 @@ const OP_DELETE_TREE: u8 = 19; // delete a file or a WHOLE subtree (recursive)
 // drives API.
 const OP_DRIVES_INFO: u8 = 20;
 const OP_FLASH: u8 = 21;
+/// The standard tree a format lays down (`docs/filesystem-layout.md`, L1). These are the only
+/// folder names `fs` knows; every folder under them belongs to its owner, who creates it.
+const LAYOUT: [&[u8]; 5] = [
+    b"/system/services", b"/system/utilities", b"/system/shared", b"/system/scratch", b"/users/default",
+];
 const OP_LABEL: u8 = 22;
 const OP_RESET: u8 = 23;
 // Large-file streaming (offset-addressed; stateless - each request is self-contained, §8).
@@ -1649,7 +1654,22 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
             match Fs::format_into(ctx, capacity, label, vol) {
-                Ok(()) => { send(&[FS_OK]); }
+                Ok(()) => {
+                    // A fresh disk carries the standard tree (`docs/filesystem-layout.md`, L1): the
+                    // only folder names `fs` knows. A disk that formatted but could not take the
+                    // tree is reported as a failed flash, never as an ordinary empty one (26.7).
+                    let laid = match vol.as_mut() {
+                        Some(fs) => fs.make_layout(ctx),
+                        None => Err("formatted volume missing"),
+                    };
+                    match laid {
+                        Ok(()) => send(&[FS_OK]),
+                        Err(why) => {
+                            ctx.log_fmt(format_args!("fs: format FAILED - the standard folders: {}", why));
+                            send(&[FS_ERR]);
+                        }
+                    }
+                }
                 Err(why) => {
                     // `format` names the exact step that failed ("backup superblock write failed",
                     // "bitmap init failed", ...). Discarding it left the operator with the shell's
@@ -2858,7 +2878,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         // not the label - so all of that was pure cost.
         //
         // It is paid on the hot path of the whole system, because the shell write-throughs
-        // `/.gsh_history` after EVERY command: type `date` and the superblock is read, rewritten and
+        // `/users/default/history` after EVERY command: type `date` and the superblock is read, rewritten and
         // journalled twice before the clock is consulted. That is what the "stack used at the deepest
         // block call" line - documented as firing "once per mount" - was really reporting when it
         // appeared before every prompt.
@@ -3315,6 +3335,19 @@ fn replay_window(_ctx: &ServiceContext) {}
     /// `mkdir … parents`: create every missing directory along `path`. Walks component by
     /// component from root; descends into existing dirs, creates missing ones. Idempotent
     /// (a fully-existing path is OK); errors only if a component is in the way as a file.
+    /// Create the standard tree on a freshly formatted disk, in one transaction, so a power cut
+    /// leaves either all of it or none of it. Everything below these folders is created by its
+    /// owner at first use (`docs/filesystem-layout.md`).
+    fn make_layout(&mut self, ctx: &ServiceContext) -> Result<(), &'static str> {
+        self.begin_txn();
+        let mut r = Ok(());
+        for dir in LAYOUT {
+            r = self.mkdir_parents(ctx, dir);
+            if r.is_err() { break; }
+        }
+        self.end_txn(ctx, r)
+    }
+
     fn mkdir_parents(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
         let mut cur = self.root_entry();
         for comp in components(path) {

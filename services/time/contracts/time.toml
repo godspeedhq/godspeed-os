@@ -17,7 +17,7 @@ limit   = "8MiB"
 
 [capabilities]
 ipc_receive = ["time"]
-# `fs`, so the clock owns its own floor: read /clock.last at start-up, persist it when the clock is set.
+# `fs`, so the clock owns its own floor: read /system/services/time/floor at start-up, persist it when the clock is set.
 #
 # `net-stack`, for the NTP query (2026-10-01). This service fetches the network time itself: it builds
 # the query and sends it through `net-stack`'s op 12, a UDP datagram whose answer comes back when it

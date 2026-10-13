@@ -76,7 +76,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    (`services/shell/src/main.rs`, beside `complete_tab`), so Tab at one of its argument
    positions does *nothing* instead of offering unrelated files. (The bug this prevents:
    `chaos max-carnage all-services <tab>`, landing on the rounds argument, listed the root
-   directory and offered `/.gsh_history`.) The default is path completion; **opting out is
+   directory and offered `/users/default/history`.) The default is path completion; **opting out is
    explicit and per-command** - a path-taking utility (`dir`, `read`, `write`, `mkdir`, `find`,
    `tree`, `copy`, ...) is simply absent from `NO_PATH_CMDS` and keeps its file completion. So
    when you add a utility: if its args are paths, do nothing; if they are not, add it to

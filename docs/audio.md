@@ -1,5 +1,9 @@
 # Audio
 
+> **Note 2026-10-13: the settings moved.** `/audio.settings`, named throughout this record, is each driver's
+> own file since the filesystem layout (`docs/filesystem-layout.md`): `/system/services/audio-driver/settings`
+> and `/system/services/pwm-audio/settings`. The quoted log lines are as they were printed then.
+
 **Status: A1-A6 done; HEARD on every board with an audio output (2026-10-10).** The HDA driver
 (`audio-driver`) resets an Intel High Definition Audio controller, finds its codec and output paths, moves
 codec commands onto the CORB and RIRB, and serves a tagged request protocol; the shell's `audio` sets the

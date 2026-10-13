@@ -190,6 +190,8 @@ echo "script: $self"               # script: greet.gsh
 - A value is a literal word, a `"string"`, a capture `$( … )`, or an **arithmetic expression** (below).
 - `$x` expands; **undefined `$x` is a loud error** (never a silent empty string).
 - `$arg1 $arg2 …` positional, `$argcount` count, `$args` all, `$self` script name.
+- `$home` is the session's home, `/users/default` (`docs/filesystem-layout.md` 6), so a script can write
+  `cd $home/notes`. Reserved like the others: `let home = ...` is refused.
 
 **Arithmetic.** Integer expressions, evaluated wherever a **value** is expected - the right of a
 `let`/`let mut`/reassignment, and the operands of a comparison. Operators are `+ - * / %`, with bare

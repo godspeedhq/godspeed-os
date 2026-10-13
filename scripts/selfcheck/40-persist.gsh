@@ -73,17 +73,17 @@ assert fails events persist start /sc/bad.log 64MB
 events persist status | to json | assert contains capacity
 dir /sc | assert contains cap.log
 # STICKY: recorded in a plain-text marker the shell reads at the next boot. Plain text on purpose -
-# `read /persist.conf` shows exactly what will happen, which is the difference between a setting and a
+# `read /system/services/events/sticky` shows exactly what will happen, which is the difference between a setting and a
 # surprise. A capture that resumed silently forever because someone forgot is the hazard here.
 assert ok events persist start /sc/sticky.log 256KiB sticky
-read /persist.conf | assert contains /sc/sticky.log
+read /system/services/events/sticky | assert contains /sc/sticky.log
 # Same wait as above: a fresh capture PREPARES before it records.
 wait 3
 events persist status | assert contains recording
 # AN EXPLICIT STOP STAYS STOPPED. Leaving the marker would make the one command that means "enough"
 # the one that did not take, and the capture would return at the next boot.
 assert ok events persist stop
-assert fails read /persist.conf
+assert fails read /system/services/events/sticky
 assert ok events persist stop
 # THE CAPTURE MUST BE READABLE WITH `read`, which is not a given and was not true at first.
 # `OP_WRITE_NEW` allocates the extent but writes no data blocks, so everything past the last chunk

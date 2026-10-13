@@ -25,7 +25,7 @@ hw_device   = "wifi_sdio"
 hw_mmio     = ["0xfe300000+0x1000"]
 ipc_receive = ["wifi-driver"]
 log_write   = true
-# `fs` - ONE peer, for one file: `/wifi.keys`, the credential table on disk (`sdk/wifi/src/keyfile.rs`;
+# `fs` - ONE peer, for one file: `/system/shared/wifi/keys`, the credential table on disk (`sdk/wifi/src/keyfile.rs`;
 # `utilities/56_wifi.md` 6). Read once when the radio comes up, written after every change to the
 # table. Reacquired by name when `fs` restarts (Commandment IX), and every request to it is bounded:
 # an `fs` that is absent or mid-restart costs the driver a line in the log and nothing else - it runs

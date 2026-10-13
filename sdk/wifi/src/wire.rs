@@ -144,9 +144,9 @@ pub const DETAIL_VALUE_MAX: usize = 96;
 /// shell's record and every driver's reply agree on the fields; a driver gives the ones it knows.
 pub const DETAIL_LABELS: [&str; 7] = ["chip", "id", "address", "firmware", "bus", "endpoints", "queues"];
 /// Request op byte: the radio the operator chose (`wifi hardware use`, `utilities/56_wifi.md` 11). `[14]`
-/// asks, `[14, len, name...]` tells - the name the shell wrote to `/wifi.radio`, or an empty name for no
-/// choice. Reply `[OK, use]`, one of the `USE_*` values, for this radio. The radio reads `/wifi.radio`
-/// itself at start, beside `/wifi.keys`; this keeps it current when the choice changes while it runs.
+/// asks, `[14, len, name...]` tells - the name the shell wrote to `/system/shared/wifi/radio`, or an empty name for no
+/// choice. Reply `[OK, use]`, one of the `USE_*` values, for this radio. The radio reads `/system/shared/wifi/radio`
+/// itself at start, beside `/system/shared/wifi/keys`; this keeps it current when the choice changes while it runs.
 pub const OP_USE: u8 = 14;
 /// Another radio is the one in use: this one does not rejoin at start, and `nic-driver` looks elsewhere.
 pub const USE_NOT: u8 = 0;
@@ -163,7 +163,7 @@ pub const USE_STANDIN: u8 = 3;
 /// chosen dongle that is not there, and stand down when it arrives (`docs/wifi-usb.md` 49). Distinct from
 /// the USB hosts' notices (`usbfn::NOTE_*`, 0x2E and 0x2F), which share the capless path.
 pub const NOTE_USB_RADIO: u8 = 0x2D;
-/// The name a radio service goes by in `wifi hardware` and `/wifi.radio`: by what it is, not where.
+/// The name a radio service goes by in `wifi hardware` and `/system/shared/wifi/radio`: by what it is, not where.
 pub fn radio_name(service: &str) -> &'static str {
     if service == "wifi-usb" { "usb" } else { "onboard" }
 }

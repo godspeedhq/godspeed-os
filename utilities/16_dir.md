@@ -120,8 +120,10 @@ gsh> dir bytes /
   5 entries
 ```
 
-Both captured from one boot of `osdev test fs-fuzz`, not written by hand. Three things in them are
-worth pointing at:
+Both captured from one boot of `osdev test fs-fuzz`, not written by hand, on 2026-09-17 - before the
+layout moved the shell's history and the clock floor off the root into their folders
+(`docs/filesystem-layout.md`); the root of a disk flashed since holds `system` and `users`. Three things
+in them are worth pointing at:
 
 **The count is LAST, and it is the number of entries actually printed.** It used to lead, next to the
 path. A directory larger than one reply block arrives in several pages, so the total is not known

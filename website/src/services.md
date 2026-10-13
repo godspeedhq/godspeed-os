@@ -220,7 +220,7 @@ cannot ask a service to report it (§11.4).
 ```
    shell (wifi) ──▶ wifi-driver ──▶ SDIO host ──▶ the radio chip (its own firmware, uploaded at start)
    nic-driver   ──▶ wifi-driver     (frames, once the cable is out - the cable always wins)
-                      ├──▶ fs     (/wifi.keys: the keys a join earned)
+                      ├──▶ fs     (/system/shared/wifi/keys: the keys a join earned)
                       └──▶ power  (a lease on the Arm clock while it loads the chip)
 ```
 
@@ -244,7 +244,7 @@ It holds no hardware: the USB host that enumerated the dongle binds it as the ra
 through `nic-driver` when the cable is out; the supervisor starts it when the host reports the dongle and
 stops it when the dongle leaves (`docs/wifi-usb.md`).
 
-**Peers:** its USB host (`dwc2` or `xhci`), and `fs` for `/wifi.keys`.
+**Peers:** its USB host (`dwc2` or `xhci`), and `fs` for `/system/shared/wifi/keys`.
 
 ### `power` - the machine's power policy
 
@@ -270,20 +270,20 @@ the ring is played and the driver refills it then; its DMA is confined behind th
 one. On its death the kernel stops the controller's DMA and releases the confinement, keyed on the
 device it was given rather than its name.
 
-**Peers:** `fs`, for `/audio.settings`.
+**Peers:** `fs`, for its settings file `/system/services/audio-driver/settings`.
 
 ### `pwm-audio` - sound on the Pis
 
 ```
    shell (audio) ──▶ pwm-audio ──▶ DMA engine ──▶ PWM FIFO ──▶ the 3.5 mm jack
-                         └──▶ fs (/audio.settings)
+                         └──▶ fs (its settings file)
 ```
 
 The same protocol as `audio-driver`, for a different device: the Pis have no codec, so each sample is a
 PWM duty cycle, moved by the DMA engine as the PWM asks. The kernel routes the jack's pins and starts the
 PWM clock when it grants the device, because both live in blocks shared with every other pin and clock.
 
-**Peers:** `fs`, for `/audio.settings`.
+**Peers:** `fs`, for its settings file `/system/services/pwm-audio/settings`.
 
 ### `time` - the wall clock
 

@@ -10,7 +10,7 @@
 # descriptor list and the ring of sound, confined behind the IOMMU where there is one; and an INTERRUPT,
 # because the stream interrupts as each period plays and the driver refills then. On its death the
 # kernel stops the device's bus mastering and releases the confinement. One peer, `fs`, for
-# `/audio.settings`: the volume and the mute, kept across a restart.
+# `/system/services/audio-driver/settings`: the volume and the mute, kept across a restart.
 name    = "audio-driver"
 version = "0.1.0"
 

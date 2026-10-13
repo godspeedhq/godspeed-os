@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! The AICSemi AIC8800D80 as a `Station` (`docs/wifi-aic8800.md`, phases V4 and V5): the serve loop the
 //! Pi 4's Broadcom runs under drives this radio through the same trait, so `wifi scan`, `wifi join`, the
-//! credential table and `/wifi.keys`, and the frame path to `nic-driver` are the loop's, unchanged.
+//! credential table and `/system/shared/wifi/keys`, and the frame path to `nic-driver` are the loop's, unchanged.
 //!
 //! What is the chip's, and lives here, is how each of those is asked of this firmware. The messages are
 //! the vendor runtime driver's (`aic8800_fdrv` at the commit `nonfree/aic8800d80/PROVENANCE` pins), read

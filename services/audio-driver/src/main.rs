@@ -263,7 +263,7 @@ const GUARD: usize = 1024;
 const FRAME_BYTES: usize = 4; // two 16-bit channels
 /// The stream tag the converter listens for. 1..=15; tag 0 is reserved. NOT the descriptor's index.
 const STREAM_TAG: u32 = 1;
-/// The volume at start, until `/audio.settings` keeps one across a restart (A4c).
+/// The volume at start, until `/system/services/audio-driver/settings` keeps one across a restart (A4c).
 const DEFAULT_VOLUME: u8 = 50;
 /// With no interrupt routed, how often the playing stream's position is read and the ring refilled.
 /// The ring holds about 341 ms, so this leaves over thirty refills of margin.
@@ -909,7 +909,7 @@ struct Player<'a> {
     path: OutPath,
     /// Every output the codec offers, for `audio outputs` and `audio output`.
     outputs: Outputs,
-    /// The output chosen with `audio output`, kept in `/audio.settings` as its device field; `None` until
+    /// The output chosen with `audio output`, kept in `/system/services/audio-driver/settings` as its device field; `None` until
     /// one is chosen, so a machine that never chose keeps playing through whatever the survey found first.
     output_chosen: Option<u8>,
     pin_device: u32,
@@ -931,7 +931,7 @@ struct Player<'a> {
     /// took by the clock - the measured play rate, which proves the DMA engine and the link clock run at
     /// the speed they were set to.
     last: Option<LastPlay>,
-    /// A change to the volume or the mute not yet written to `/audio.settings`. Written when nothing is
+    /// A change to the volume or the mute not yet written to `/system/services/audio-driver/settings`. Written when nothing is
     /// playing: an `fs` write blocks the serve loop, and a slow one mid-tone would starve the ring.
     settings_dirty: bool,
     /// The last write failed and said so; the next failure is not said again until one succeeds.
@@ -1583,7 +1583,7 @@ impl<'a> Player<'a> {
             let _ = writeln!(w, "clock        UNCALIBRATED - every time above is a count of looks, not milliseconds");
         }
         if self.settings_failing {
-            let _ = writeln!(w, "settings     the last write of /audio.settings failed");
+            let _ = writeln!(w, "settings     the last write of /system/services/audio-driver/settings failed");
         }
     }
 
@@ -2015,12 +2015,12 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
             match want {
                 Some(o) if o.nodes[0] != p.path.nodes[0] => {
                     let v = p.select_output(o);
-                    ctx.log_fmt(format_args!("audio-driver: output {} restored from /audio.settings - {}",
+                    ctx.log_fmt(format_args!("audio-driver: output {} restored from /system/services/audio-driver/settings - {}",
                         device_name(o.dev), verdict_word(v)));
                 }
                 Some(_) => {}
                 None => ctx.log_fmt(format_args!(
-                    "audio-driver: /audio.settings asks for the {} output and this codec has none - playing through {}",
+                    "audio-driver: /system/services/audio-driver/settings asks for the {} output and this codec has none - playing through {}",
                     device_name(dev as u32), device_name(p.path.dev))),
             }
         }
@@ -2172,12 +2172,12 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
             p.service(irq);
             if p.settings_dirty && p.tone.is_none() {
                 p.settings_dirty = false;
-                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted, output: p.output_chosen, system_sounds: p.system_sounds }) {
+                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), "audio-driver", Settings { volume: p.volume, muted: p.muted, output: p.output_chosen, system_sounds: p.system_sounds }) {
                     Ok(()) => p.settings_failing = false,
                     Err(e) if !p.settings_failing => {
                         p.settings_failing = true;
                         ctx.log_fmt(format_args!(
-                            "audio-driver: could not write /audio.settings ({}) - the setting holds until this driver restarts{}",
+                            "audio-driver: could not write /system/services/audio-driver/settings ({}) - the setting holds until this driver restarts{}",
                             e.as_str(),
                             if e == gs::Error::OutcomeUnknown { "; the file may or may not have it" } else { "" }));
                     }

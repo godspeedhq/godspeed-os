@@ -435,6 +435,10 @@ pub struct ShellCtx {
     inner: ServiceContext,
     /// The fs request correlation tag (see `next_fs_tag`).
     fs_tag: core::cell::Cell<u8>,
+    /// The prompt as drawn now (`PromptText`): the folder, then `gsh> `.
+    prompt: core::cell::RefCell<PromptText>,
+    /// Whether this instance has emptied and made its scratch folder yet (`ensure_scratch`).
+    scratch_ready: core::cell::Cell<bool>,
     /// The net-stack request correlation tag (see `next_net_tag`). A SECOND counter, not a shared
     /// one: the two channels are independent, and a tag only has to be unique against the other
     /// requests on its own channel. Sharing one would also make an fs request advance the net tag,
@@ -567,6 +571,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let ctx = ShellCtx {
         inner: ctx,
         fs_tag: core::cell::Cell::new(0),
+        prompt: core::cell::RefCell::new(PromptText::new()),
+        scratch_ready: core::cell::Cell::new(false),
         net_tag: core::cell::Cell::new(0),
         pipe_stack_hwm: core::cell::Cell::new(0),
         last_write_err: core::cell::RefCell::new(LastWriteErr::new()),
@@ -631,20 +637,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // where to start. Only here, not on every prompt (that would be noise). Sent as ONE
     // console write so a concurrent driver boot-log can't land between the hint and the
     // prompt (it stays one atomic unit on the serial console too).
-    gs::io::print(ctx, "(F1=help or type 'help')\ngsh> ");
+    // Current location on the (single) drive: the directory bare/relative paths target,
+    // moved by `cd` (utilities/17_cd.md). Session state; starts at HOME each boot
+    // (`docs/filesystem-layout.md` 6). Set without asking `fs` anything: the prompt must come up at
+    // once, and a home that is missing is said by the first command that uses it.
+    let mut cwd = Cwd::home();
+    set_prompt(&ctx, &cwd);
+    gs::io::print_fmt(ctx, format_args!("(F1=help or type 'help')\n{}", ctx.prompt.borrow().as_str()));
 
     let mut line = Line::new();
     // A UTF-8 character arriving a byte at a time (see where it is fed).
     let mut utf8 = Utf8In::new();
-    // Current location on the (single) drive: the directory bare/relative paths target,
-    // moved by `cd` (utilities/17_cd.md). Session state; resets to "/" each boot.
-    let mut cwd = Cwd::root();
     // Command history for up/down-arrow recall. `nav == hist.len()` means the live line.
     let mut hist = History::new();
     // History is loaded LAZILY, not here. Touching fs on the startup path would stall the prompt whenever
     // fs is slow/wedged (the shell must come up instantly - history is an enhancement, never a requirement,
     // §26.7), and the only signal the user wants prior history is the up-arrow. So the FIRST up-arrow loads
-    // /.gsh_history (bounded, best-effort) and merges it behind the session; startup touches fs zero times.
+    // /users/default/history (bounded, best-effort) and merges it behind the session; startup touches fs zero times.
     // See `History::load` + the up-arrow arm in `handle_csi`. nav starts at 0 (empty ring = live line).
     let mut nav = hist.len();
     // The last line above the prompt is an audio shortcut's notice, so the next one overwrites it.
@@ -670,7 +679,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // by - the observer distorting what it observes. Park + wake-on-release is still the endgame;
         // this is the cheap 99% of it. Regain latency stays one sleep, imperceptible at the prompt.
         // THE CLOCK FLOOR IS `time`'S. This loop used to probe `time` for the clock source on every pass
-        // and, once it read NTP, write `/clock.last` itself - a second writer of a file `time` already
+        // and, once it read NTP, write `/system/services/time/floor` itself - a second writer of a file `time` already
         // writes when the clock is set and refreshes on its own (`FLOOR_REFRESH_SECS`), and an RPC on
         // the input path ahead of the keyboard read (`backlog/fixed/80` H12). Both are gone: the shell reads
         // the floor where it uses it (`date sync`) and never writes it.
@@ -699,7 +708,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     break;
                 }
             }
-            gs::io::print(ctx, PROMPT);
+            print_prompt(ctx);
             muted = false;
         }
 
@@ -733,7 +742,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // is the wrong owner for it: `time` owns the clock, so `time` should own its floor - reading
         // it at start-up and persisting it when the clock is set. Removing it from the input path is
         // the fix; putting it where it belongs is separate work, recorded rather than faked.
-        // (Note 2026-10-09: that work is done - `time` loads and persists `/clock.last` itself.)
+        // (Note 2026-10-09: that work is done - `time` loads and persists `/system/services/time/floor` itself.)
         let b = ctx.console_read();
         // A CHARACTER, NOT A BYTE. A byte above ASCII is either one of the keyboard driver's signals
         // (Ctrl+Alt+Del, the audio keys - `0x80`-`0x83`) or part of a UTF-8 character typed over serial
@@ -797,13 +806,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 gs::io::print(ctx, "\r\n");
                 if line.len > 0 {
                     // A line that READS a secret (`input secret ...`) never enters the recall ring or
-                    // /.gsh_history (§8 secret taint): a password recovered on up-arrow would defeat the
+                    // /users/default/history (§8 secret taint): a password recovered on up-arrow would defeat the
                     // whole point of invisible entry. It still EXECUTES below; it just isn't remembered.
                     if !line_reads_secret(line.bytes()) {
                         hist.push(line.bytes());
                         hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
                     }
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
+                    set_prompt(&ctx, &cwd);
                     // A typed command that failed makes a system sound - only here, at the prompt, never
                     // in a script, so fifty errors in a script do not sound fifty times.
                     match last_result {
@@ -817,7 +827,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     tidy_helpers(&ctx);
                 }
                 nav = hist.len();
-                gs::io::print(ctx, PROMPT);
+                print_prompt(ctx);
             }
             0x1B => {
                 // Escape: either a bare ESC (the Escape key → clear the line) or the start
@@ -851,7 +861,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 line.len = 0;
                 line.cur = 0;
                 nav = hist.len();
-                gs::io::print(ctx, PROMPT);
+                print_prompt(ctx);
             }
             b if b >= 0x20 && b < 0x7f => line.insert(&ctx, b),
             _ => {}
@@ -870,7 +880,7 @@ fn run_help_key(
 ) {
     gs::io::print(ctx, "\r\n");
     *last_result = execute(ctx, b"help", cwd, *last_result, 0, &mut Out::Console);
-    gs::io::print(ctx, PROMPT);
+    print_prompt(ctx);
     line.cur = line.len; // cursor at end after the reprint
     if line.len > 0 {
         gs::io::print(ctx, core::str::from_utf8(line.bytes()).unwrap_or(""));
@@ -946,7 +956,7 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
             } else if !hist.loaded && hist.len() < HIST_MAX {
                 // At the OLDEST in-memory entry, with room for more: only NOW - the user has run out of
                 // session history - do the bounded disk load (at most once, the `loaded` gate). It merges
-                // /.gsh_history BEHIND the session, so `added` older lines land at the front; step into the
+                // /users/default/history BEHIND the session, so `added` older lines land at the front; step into the
                 // newest of them and continue the up-nav. A wedged/absent/empty file adds nothing -> stay put.
                 // Consequence: startup never touches fs; a session that already fills HIST_MAX never loads
                 // (this arm's guard is false); the disk is read at most once, only on running out of history.
@@ -1004,7 +1014,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
     let is_command = bytes[seg_start..tok_start].iter().all(|&b| b == b' ');
     // Does this segment's command take FILE PATHS as arguments? A service-name / number / keyword
     // command (chaos, kill, ping, ...) never does, so Tab past its keyword must NOT list the
-    // filesystem (which wrongly surfaced /.gsh_history, e.g. `chaos max-carnage all-services <tab>`
+    // filesystem (which wrongly surfaced /users/default/history, e.g. `chaos max-carnage all-services <tab>`
     // landing on the rounds arg). Computed here while `bytes` is borrowed, before any mutating call.
     let seg_cmd = bytes[seg_start..].split(|&b| b == b' ').find(|w| !w.is_empty());
     let is_no_path = seg_cmd.map(|c| NO_PATH_CMDS.iter().any(|k| k.as_bytes() == c)).unwrap_or(false);
@@ -1022,7 +1032,7 @@ fn complete_tab(ctx: &ShellCtx, line: &mut Line, cwd: &Cwd) {
 }
 
 /// Commands whose arguments are service names, numbers, or fixed keywords - NEVER file paths. Tab at
-/// an argument position for these must not list the filesystem (which surfaced /.gsh_history). Their
+/// an argument position for these must not list the filesystem (which surfaced /users/default/history). Their
 /// keyword/target arguments are completed in `complete_keyword`; anything past that has no completion,
 /// rather than falling through to path completion. (Path-taking commands - dir/read/write/mkdir/... -
 /// are absent, so they still path-complete.)
@@ -1516,7 +1526,7 @@ fn complete_from_list(ctx: &ShellCtx, line: &mut Line, tok_start: usize, cands: 
 
 /// Replace the line from `tok_start` to end with `name`; `commit` appends a trailing space (a chosen
 /// completion), else nothing (a Tab-cycle preview).
-fn fill_keyword(ctx: &ServiceContext, line: &mut Line, tok_start: usize, name: &str, commit: bool) {
+fn fill_keyword(ctx: &ShellCtx, line: &mut Line, tok_start: usize, name: &str, commit: bool) {
     let mut tmp = [0u8; MAX_LINE];
     let mut t = tok_start.min(MAX_LINE);
     tmp[..t].copy_from_slice(&line.buf[..t]);
@@ -1545,7 +1555,7 @@ fn keyword_menu(ctx: &ShellCtx, line: &mut Line, tok_start: usize, cands: &[&str
     }
     if n > shown { gs::io::print(ctx, "(type more to narrow) "); }
     gs::io::print(ctx, "\r\n");
-    gs::io::print(ctx, PROMPT);
+    print_prompt(ctx);
     gs::io::print(ctx, str_of(line.bytes()));
     let mut idx = usize::MAX;
     loop {
@@ -1650,7 +1660,7 @@ fn path_lcp(rbuf: &[u8; 512], hits: &[PathHit]) -> usize {
 
 /// Replace the line from `base_len` to end with `name`. `sep` Some(is_dir) appends `/` (dir) or ` `
 /// (file) - a committed completion; None appends nothing - a still-ambiguous common-prefix fill.
-fn fill_path(ctx: &ServiceContext, line: &mut Line, base_len: usize, name: &[u8], sep: Option<bool>) {
+fn fill_path(ctx: &ShellCtx, line: &mut Line, base_len: usize, name: &[u8], sep: Option<bool>) {
     let mut tmp = [0u8; MAX_LINE];
     let mut t = base_len.min(MAX_LINE);
     tmp[..t].copy_from_slice(&line.buf[..t]);
@@ -1682,7 +1692,7 @@ fn path_menu(ctx: &ShellCtx, line: &mut Line, base_len: usize, rbuf: &[u8; 512],
     }
     if n > shown { gs::io::print(ctx, "(type more to narrow) "); }
     gs::io::print(ctx, "\r\n");
-    gs::io::print(ctx, PROMPT);
+    print_prompt(ctx);
     gs::io::print(ctx, str_of(line.bytes()));
 
     let mut idx = usize::MAX; // MAX = no candidate filled yet (showing the common-prefix)
@@ -1704,16 +1714,57 @@ fn path_menu(ctx: &ShellCtx, line: &mut Line, base_len: usize, rbuf: &[u8; 512],
 }
 
 /// A bounded ring of recent command lines for up/down-arrow recall (§26.6: fixed size,
-/// oldest dropped when full). The ring starts empty each boot; `/.gsh_history` is written through on
+/// oldest dropped when full). The ring starts empty each boot; `/users/default/history` is written through on
 /// every command and merged back in lazily (see `History::load`).
 const HIST_MAX: usize = 16;
-/// The prompt. Its WIDTH sets the column the typed line starts at, so the two are defined
-/// together and checked at compile time - a longer prompt with a stale redraw column would
-/// erase from inside the prompt.
+/// The end of the prompt, which never changes: every test harness and run script waits for exactly this
+/// text, so the folder goes in FRONT of it (`docs/filesystem-layout.md` 6).
 const PROMPT: &str = "gsh> ";
-/// Cursor to the first column of the typed text (CHA, 1-based), then erase to end of line.
-const REDRAW: &str = "\x1b[6G\x1b[K";
-const _: () = assert!(PROMPT.len() + 1 == 6);
+/// The longest the folder in the prompt may be. A deeper one is shortened from the left, keeping the end,
+/// which is the part that says where you are. A starting value, not a measurement.
+const PROMPT_DIR_MAX: usize = 32;
+const PROMPT_CAP: usize = PROMPT_DIR_MAX + 1 + PROMPT.len();
+
+/// The prompt as it is drawn now: `<folder> gsh> `. Rebuilt when the folder changes, and held by
+/// `ShellCtx` so every place that draws the prompt, or puts the cursor in the column after it, reads the
+/// same one. Its WIDTH is the column the typed line starts at.
+pub struct PromptText {
+    buf: [u8; PROMPT_CAP],
+    len: usize,
+    width: usize,
+}
+
+impl PromptText {
+    fn new() -> Self { PromptText { buf: [0; PROMPT_CAP], len: 0, width: 0 } }
+    fn as_str(&self) -> &str { core::str::from_utf8(&self.buf[..self.len]).unwrap_or(PROMPT) }
+    fn put(&mut self, b: &[u8]) {
+        self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+        self.len += b.len();
+    }
+}
+
+/// Rebuild the prompt from the folder.
+fn set_prompt(ctx: &ShellCtx, cwd: &Cwd) {
+    let dir = cwd.as_str();
+    let mut p = PromptText::new();
+    if dir.len() <= PROMPT_DIR_MAX {
+        p.put(dir.as_bytes());
+    } else {
+        // "..." and the end of the path that fits after it, started on a character boundary.
+        let mut from = dir.len() - (PROMPT_DIR_MAX - 3);
+        while !dir.is_char_boundary(from) { from += 1; }
+        p.put(b"...");
+        p.put(dir[from..].as_bytes());
+    }
+    p.put(b" ");
+    p.put(PROMPT.as_bytes());
+    p.width = p.as_str().chars().count();
+    *ctx.prompt.borrow_mut() = p;
+}
+
+fn print_prompt(ctx: &ShellCtx) {
+    gs::io::print(ctx, ctx.prompt.borrow().as_str());
+}
 
 struct History {
     lines: [[u8; MAX_LINE]; HIST_MAX],
@@ -1746,7 +1797,7 @@ impl History {
         self.lens[self.n] = l;
         self.n += 1;
     }
-    /// Best-effort persistence to `/.gsh_history` (§15: history is shell-OWNED state, externalized to the
+    /// Best-effort persistence to `/users/default/history` (§15: history is shell-OWNED state, externalized to the
     /// fs so a `kill shell` respawn reconstructs it). History is an ENHANCEMENT, never a requirement, so
     /// neither path may hang the prompt on a slow/down fs (§26.7): the LOAD is lazy (only when the user
     /// runs out of session history) and bounded, the SAVE is deadline-bounded (a true fire-and-forget save
@@ -1765,7 +1816,7 @@ impl History {
     fn load(&mut self, ctx: &ShellCtx) {
         if self.loaded { return; }
         self.loaded = true;
-        let path = b"/.gsh_history";
+        let path = HISTORY;
         let sz = match fs_stat_bounded(ctx, path, HIST_LOAD_SECS) { Some((s, false)) if s > 0 => s as usize, _ => return };
         let sz = sz.min(HIST_MAX * (MAX_LINE + 1));
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
@@ -1782,7 +1833,7 @@ impl History {
         }
         for i in 0..sn { self.push(&sess[i][..sess_len[i]]); }
     }
-    /// Deadline-bounded write-through of the <=16-line ring to `/.gsh_history`. Bounded (HIST_SAVE_SECS)
+    /// Deadline-bounded write-through of the <=16-line ring to `/users/default/history`. Bounded (HIST_SAVE_SECS)
     /// so a mid-restart / slow fs cannot hang the prompt forever, but NOT fire-and-forget: a true
     /// no-reply async write is blocked by an fs-architecture constraint - fs multiplexes client requests
     /// and its block-driver replies on ONE endpoint and relies on clients being synchronous (one in-flight),
@@ -1794,7 +1845,7 @@ impl History {
     /// its buffer off the Enter path (tight user stack).
     #[inline(never)]
     fn save(&self, ctx: &ShellCtx) {
-        let path: &[u8] = b"/.gsh_history";
+        let path: &[u8] = HISTORY;
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
         let mut pos = 0usize;
         for i in 0..self.n {
@@ -1931,7 +1982,7 @@ impl Line {
     /// Erase the visible input and replace it with `new`, cursor at the end. Used by
     /// history recall, tab completion, and the bare-ESC clear. Erases from wherever the
     /// cursor is: step to the input start, `ESC[K` to wipe to end of line, then print.
-    fn set(&mut self, ctx: &ServiceContext, new: &[u8]) {
+    fn set(&mut self, ctx: &ShellCtx, new: &[u8]) {
         // ABSOLUTE, not a walk back. This used to emit `cur` backspaces to return to the start of
         // the typed text, which assumes the cursor is exactly where we last left it - and the
         // console is a SHARED device the shell does not hold a lock on. Anything else that writes
@@ -1945,7 +1996,8 @@ impl Line {
         // CHA cannot drift: it names the column outright, so the erase always starts at the true
         // start of the typed text and the prompt itself is preserved (which is why this is not a
         // carriage return + reprint - a second prompt is indistinguishable from a real one).
-        gs::io::print(ctx, REDRAW);
+        // Cursor to the first column of the typed text (CHA, 1-based), then erase to end of line.
+        gs::io::print_fmt(ctx, format_args!("\x1b[{}G\x1b[K", ctx.prompt.borrow().width + 1));
         self.cur = 0;
         let n = new.len().min(MAX_LINE);
         self.buf[..n].copy_from_slice(&new[..n]);
@@ -1955,15 +2007,15 @@ impl Line {
     }
 
     /// Clear to an empty line (cursor at 0), erasing what was shown.
-    fn clear(&mut self, ctx: &ServiceContext) { self.set(ctx, &[]); }
+    fn clear(&mut self, ctx: &ShellCtx) { self.set(ctx, &[]); }
 
     /// Put the prompt and the half-typed line back after something OWNED the whole screen.
     ///
     /// `set` cannot do this: it starts with an absolute `CHA` to the column after the prompt, which
     /// assumes the prompt is still on the screen. It is not - `scrollback` clears on the way out,
     /// the same as `help` and `edit` - so the prompt has to be printed, not jumped to.
-    fn reprint(&self, ctx: &ServiceContext) {
-        gs::io::print(ctx, PROMPT);
+    fn reprint(&self, ctx: &ShellCtx) {
+        print_prompt(ctx);
         if self.len > 0 {
             gs::io::print(ctx, core::str::from_utf8(&self.buf[..self.len]).unwrap_or(""));
         }
@@ -2255,7 +2307,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             if argc < 2 { gs::io::println(ctx, "usage: mkdir <path> [parents]"); Err(ShellError::Unknown) }
             else { cmd_mkdir(ctx, cwd, args[1], argc >= 3 && args[2] == "parents") }
         }
-        "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { "/" }),
+        "cd"      => cmd_cd(ctx, cwd, if argc >= 2 { args[1] } else { HOME }),
         "copy"    => {
             if argc < 3 { gs::io::println(ctx, "usage: copy <src> <dst> [recursive]"); Err(ShellError::Unknown) }
             else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]) }
@@ -2949,6 +3001,7 @@ fn push_ref(ctx: &ServiceContext, b: &[u8], i: usize, vars: &Vars, params: &Para
         b"args" => { for a in 0..params.argc { if a > 0 { out.push(b' '); } out.push_bytes(params.argv[a].as_bytes()); } return Ok(k); }
         b"argcount" => { out.push_u32(params.argc as u32); return Ok(k); }
         b"self" => { out.push_bytes(params.name.as_bytes()); return Ok(k); }
+        b"home" => { out.push_bytes(HOME.as_bytes()); return Ok(k); }
         _ => {}
     }
     if name.len() == 4 && &name[..3] == b"arg" && (b'1'..=b'9').contains(&name[3]) {
@@ -3015,7 +3068,7 @@ fn expand_val(ctx: &ServiceContext, s: &str, vars: &Vars, params: &Params, out: 
 /// A reserved parameter WORD ($args/$argcount/$self/$arg1..$arg9). These resolve before variables in
 /// `push_ref`, so a binding that shadows one could never be read back - every binding path refuses them.
 fn is_reserved_param_name(b: &[u8]) -> bool {
-    matches!(b, b"args" | b"argcount" | b"self")
+    matches!(b, b"args" | b"argcount" | b"self" | b"home")
         || (b.len() == 4 && &b[..3] == b"arg" && (b'1'..=b'9').contains(&b[3]))
 }
 
@@ -3915,11 +3968,12 @@ fn for_step(ctx: &ShellCtx, b: &[u8], vars: &mut Vars, var: usize, it: ForIter, 
     }
 }
 
-/// The temp-file path for a `for line in (producer)` loop: `/.fl<id>~` (id = the loop's `{` position,
-/// unique + stable). Written into `buf`; returns the used slice.
-fn forlines_temp(id: u32, buf: &mut [u8; 24]) -> &[u8] {
-    buf[..4].copy_from_slice(b"/.fl");
-    let mut n = 4usize;
+/// The temp-file path for a `for line in (producer)` loop: `fl<id>~` in the shell's scratch folder (id =
+/// the loop's `{` position, unique + stable). Written into `buf`; returns the used slice.
+fn forlines_temp(id: u32, buf: &mut [u8; FL_TEMP_MAX]) -> &[u8] {
+    const PRE: &[u8] = b"/system/scratch/shell/fl";
+    buf[..PRE.len()].copy_from_slice(PRE);
+    let mut n = PRE.len();
     let mut d = [0u8; 10];
     let mut di = 0usize;
     let mut v = id;
@@ -3936,7 +3990,7 @@ fn forlines_temp(id: u32, buf: &mut [u8; 24]) -> &[u8] {
 /// a trailing `\n` does not yield an extra empty line.
 #[inline(never)]
 fn forlines_step(ctx: &ShellCtx, vars: &mut Vars, var: usize, off: u32, id: u32) -> Option<ForIter> {
-    let mut tb = [0u8; 24];
+    let mut tb = [0u8; FL_TEMP_MAX];
     let temp = forlines_temp(id, &mut tb);
     let mut rbuf = [0u8; IO_CHUNK];
     let n = match fs_read_at(ctx, temp, off as u64, &mut rbuf) {
@@ -3967,6 +4021,11 @@ fn forlines_step(ctx: &ShellCtx, vars: &mut Vars, var: usize, off: u32, id: u32)
 /// failure.
 #[inline(never)]
 fn forlines_capture(ctx: &ShellCtx, cwd: &Cwd, inner: &str, temp: &[u8]) -> Result<(), ()> {
+    // The temp file lives in the shell's scratch folder, which is made at its first use.
+    if !ensure_scratch(ctx) {
+        gs::io::println(ctx, "gsh: for line: the shell's scratch folder could not be made - storage unavailable?");
+        return Err(());
+    }
     let _ = sh_delete(ctx, temp);
     let mut rb = ReportBuf::new();
     let ok = { let mut o = Out::File(&mut rb); run_captured(ctx, cwd, inner, &mut o) };
@@ -4401,7 +4460,7 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
             let rest = trim_bytes(&b[rest_start..open]);
             let it0 = if rest.len() >= 2 && rest[0] == b'(' && rest[rest.len() - 1] == b')' {
                 let inner = trim_bytes(&rest[1..rest.len() - 1]);
-                let mut tb = [0u8; 24];
+                let mut tb = [0u8; FL_TEMP_MAX];
                 let temp = forlines_temp(open as u32, &mut tb);
                 match forlines_capture(ctx, cwd, str_of(inner), temp) {
                     Ok(()) => ForIter::FileLines { off: 0, id: open as u32 },
@@ -4518,7 +4577,7 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
                         if is_break {
                             // exiting a for-line loop for good -> delete its captured temp file.
                             if let ForIter::FileLines { id, .. } = it {
-                                let mut tb = [0u8; 24];
+                                let mut tb = [0u8; FL_TEMP_MAX];
                                 let t = forlines_temp(id, &mut tb);
                                 let _ = sh_delete(ctx, t);
                             }
@@ -5187,7 +5246,7 @@ const FOREIGN_HINTS: &[(&str, &str)] = &[
     ("head",  "first"),
     ("tail",  "last"),
     ("touch", "write"),
-    ("pwd",   "cd ."),      // `cd .` stays and prints where it is; a bare `cd` goes to `/`, so it is not the hint (H14)
+    ("pwd",   "cd ."),      // `cd .` prints the whole path (the prompt shortens a long one); a bare `cd` goes home, so it is not the hint (H14)
     ("ps",    "status"),
     ("top",   "observe"),
     ("htop",  "observe"),
@@ -5602,7 +5661,9 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("dir | select … / sort …", "project / order the listing", "dir | sort reverse size"),
         ], true),
         "cd" => help_block(ctx, "cd", "change current directory", &[
-            ("cd <path>", "move to <path> (no arg → root)", "cd /docs"),
+            ("cd <path>", "move to <path>", "cd /system/services"),
+            ("cd", "go home, /users/default (in a script, $home)", "cd"),
+            ("cd .", "print the whole path of where you are", "cd ."),
             ("cd -", "move to the previous directory", "cd -"),
         ], true),
         "read" => help_block(ctx, "read", "print a file", &[
@@ -5803,7 +5864,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi info", "bssid, band, channel, signal, security, time joined, scan facts; for the address, type net", "wifi info"),
         ], false),
         ("wifi", "stored") => help_block(ctx, "wifi stored", "which networks a key is held for", &[
-            ("wifi stored", "names only, never a key; kept across reboots in /wifi.keys", "wifi stored"),
+            ("wifi stored", "names only, never a key; kept across reboots in /system/shared/wifi/keys", "wifi stored"),
         ], false),
         ("wifi", "forget") => help_block(ctx, "wifi forget", "drop a held key", &[
             ("wifi forget <ssid>", "the key is wiped; the link, if any, is not touched", "wifi forget Bankole-WiFi"),
@@ -8956,7 +9017,7 @@ fn build_hw_interrupts_table(ctx: &ServiceContext) -> Option<Table> {
 
 /// Where the last-known-good time is recorded. Deliberately a plain visible file, not a hidden one: it is
 /// a fact about this machine an operator may want to read or delete (§26.4 - keep the mechanism visible).
-const CLOCK_FLOOR_PATH: &[u8] = b"/clock.last";
+const CLOCK_FLOOR_PATH: &[u8] = b"/system/services/time/floor";
 /// Budget for the floor's disk I/O. The floor is best-effort by design, so a slow or still-mounting `fs`
 /// must cost a shrug, never a wedge: an UNBOUNDED request here would hang the boot prompt before the
 /// first `gsh>` (the exact hazard the history loader documents) and hang `date` with no q escape.
@@ -9144,7 +9205,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     // nothing here can tell which), so it gets no scale label rather than a guessed one - the same
     // rule as the rest of this command: say what is known, never invent the rest.
     // A FLOOR-DERIVED CLOCK IS NOT AN RTC, and used to be labelled as one. On a board with no RTC the
-    // time can be carried over from `/clock.last` and then advanced correctly, which makes it a genuine
+    // time can be carried over from `/system/services/time/floor` and then advanced correctly, which makes it a genuine
     // reading and a LOWER BOUND: it cannot know how long the machine was powered off, so it is behind by
     // exactly that unknown amount. Calling it `rtc` claims hardware this board does not have; calling it
     // unset denies a time being displayed. It gets its own words.
@@ -9933,7 +9994,7 @@ fn build_audio_outputs_table(ctx: &ShellCtx) -> Option<Table> {
 }
 
 /// `audio output <name>` - play through the output `audio outputs` calls `name`. An unknown name is refused
-/// with the list; the choice is kept in `/audio.settings` by the driver.
+/// with the list; the choice is kept in `/system/services/<driver>/settings` by the driver.
 fn audio_output_select(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), ShellError> {
     use audio_wire::*;
     let (rows, _) = audio_outputs_fetch(ctx, out)?;
@@ -10141,7 +10202,7 @@ fn audio_debug(ctx: &ShellCtx, out: &mut Out, view: &str) -> Result<(), ShellErr
 /// One audio shortcut (Ctrl+Alt+Up, Ctrl+Alt+Down, Ctrl+Alt+M), done, and the line that says what it did,
 /// AS READ BACK from the driver - never what was asked for. Volume steps by 5 and stops at 0 and 100; M
 /// mutes, or unmutes if muted. Each is the same request as the typed verb, so the driver writes it to
-/// `/audio.settings` like one. When it cannot be done the line says why - never a silent no-op.
+/// `/system/services/<driver>/settings` like one. When it cannot be done the line says why - never a silent no-op.
 fn audio_shortcut(ctx: &ShellCtx, sig: u8) -> HwText<64> {
     use audio_wire::*;
     if audio_driver(ctx).is_none() {
@@ -10189,7 +10250,7 @@ fn audio_shortcut(ctx: &ShellCtx, sig: u8) -> HwText<64> {
 }
 
 /// `audio system sounds on|off`: the short sounds the system makes on its own (`docs/audio.md`, "System
-/// sounds"). The driver keeps the switch, in `/audio.settings`.
+/// sounds"). The driver keeps the switch, in `/system/services/<driver>/settings`.
 fn audio_system_sounds(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError> {
     use audio_wire::*;
     let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_SYSTEM_SOUNDS, on as u8], AUDIO_REPLY_MS), 1)?;
@@ -10657,7 +10718,7 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
 
     // Argument shape first, because it does not depend on hardware and a usage error should not be
     // reported as a missing radio. `join` taking no passphrase argument is a SECURITY decision, not
-    // an ergonomic one (it would land in /.gsh_history, where an up-arrow recovers it), so a second
+    // an ergonomic one (it would land in /users/default/history, where an up-arrow recovers it), so a second
     // word here is refused by name rather than ignored.
     match arg {
         "join" => {
@@ -10693,7 +10754,7 @@ fn cmd_wifi(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
                 "wifi: join takes only an SSID - the passphrase is asked for, never typed on the"));
             out.line_fmt(ctx, format_args!(
                 "      command line, because a command line is recalled by up-arrow and written to"));
-            out.line_fmt(ctx, format_args!("      /.gsh_history. Try: wifi join {}", rest.trim().split_whitespace().next().unwrap_or("<ssid>")));
+            out.line_fmt(ctx, format_args!("      /users/default/history. Try: wifi join {}", rest.trim().split_whitespace().next().unwrap_or("<ssid>")));
             return Err(ShellError::Unknown);
         }
     }
@@ -11404,7 +11465,7 @@ fn wifi_read_passphrase(ctx: &ShellCtx, out: &mut Out, pass: &mut [u8; INPUT_MAX
 ///
 /// The passphrase, when the driver asks for one, is read by `wifi_read_passphrase` through
 /// `read_input_line_abortable(.., secret = true, ..)` - the same invisible-entry path
-/// `input secret` uses, which never echoes and is excluded from the recall ring and `/.gsh_history`
+/// `input secret` uses, which never echoes and is excluded from the recall ring and `/users/default/history`
 /// (`utilities/56_wifi.md` 2 says why this is a security decision and not an ergonomic one). It lives in
 /// one stack buffer here and one request buffer in `wifi_join`, both zeroed before they return, and is
 /// never printed.
@@ -11643,7 +11704,7 @@ fn wifi_hardware(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 }
 
 /// The radio every `wifi` verb addresses: the one that says it is in use (`wire::OP_USE`, the operator's
-/// choice in `/wifi.radio`), else the first running one in `RADIOS` order - which is also what a choice of
+/// choice in `/system/shared/wifi/radio`), else the first running one in `RADIOS` order - which is also what a choice of
 /// a radio that is not running falls back to (`utilities/56_wifi.md` 11). With one radio running nothing
 /// is asked.
 fn radio_in_use(ctx: &ShellCtx) -> Option<&'static str> {
@@ -11686,14 +11747,14 @@ fn wifi_joined_to(ctx: &ShellCtx) -> Option<([u8; wifi_wire::SSID_MAX], usize)> 
 
 /// Where the shell keeps the operator's choice (`wifi hardware use`); the radios and, through them,
 /// `nic-driver` read it (`godspeed_wifi::keyfile::RADIO_PATH`).
-const RADIO_FILE: &[u8] = b"/wifi.radio";
+const RADIO_FILE: &[u8] = godspeed_wifi::keyfile::RADIO_PATH;
 
 /// `wifi hardware use <radio>` (`utilities/56_wifi.md` 11): make `radio` the one every `wifi` verb
 /// addresses and the one `nic-driver` carries frames through when the cable is out.
 ///
 /// In this order, so a step that fails loses nothing: the chosen radio joins the network the radio in use
-/// is on (its key from `/wifi.keys`, which both drivers share; asked for if it is not held); only once it
-/// is joined is the choice written to `/wifi.radio` and told to every radio (`wire::OP_USE`); then the radio
+/// is on (its key from `/system/shared/wifi/keys`, which both drivers share; asked for if it is not held); only once it
+/// is joined is the choice written to `/system/shared/wifi/radio` and told to every radio (`wire::OP_USE`); then the radio
 /// that was in use leaves and stays up. `nic-driver` follows on its next look at the radios. Choosing the
 /// default radio - the first running one - removes the file rather than writing it, so no choice is
 /// recorded.
@@ -11737,11 +11798,11 @@ fn wifi_hardware_use(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), Sh
         let mut probe = [0u8; 16];
         sh_delete(ctx, RADIO_FILE) || fs_read_file(ctx, RADIO_FILE, &mut probe, 2).is_none()
     } else {
-        sh_write_within(ctx, RADIO_FILE, name.as_bytes(), 4)
+        godspeed_wifi::keyfile::make_dir(ctx) && sh_write_within(ctx, RADIO_FILE, name.as_bytes(), 4)
     };
     if !recorded {
         ctx.wifi_radio.set(RADIOS[0]);
-        out.line_fmt(ctx, format_args!("wifi: /wifi.radio could not be written - nothing changed; {} is still the radio in use", cur_name));
+        out.line_fmt(ctx, format_args!("wifi: /system/shared/wifi/radio could not be written - nothing changed; {} is still the radio in use", cur_name));
         return Err(ShellError::Unknown);
     }
     let told: &[u8] = if default == Some(svc) { &[] } else { name.as_bytes() };
@@ -11763,7 +11824,7 @@ fn wifi_hardware_use(ctx: &ShellCtx, out: &mut Out, name: &str) -> Result<(), Sh
     ctx.wifi_radio.set(RADIOS[0]);
     out.line_fmt(ctx, format_args!(
         "wifi: {} is the radio in use{} - the wifi verbs address it, and it carries the link when the cable is out (nic-driver follows within a few seconds)",
-        name, if default == Some(svc) { " (the default; /wifi.radio removed)" } else { "" }));
+        name, if default == Some(svc) { " (the default; /system/shared/wifi/radio removed)" } else { "" }));
     Ok(())
 }
 
@@ -12276,7 +12337,7 @@ fn wifi_debug(ctx: &ShellCtx, out: &mut Out, sub: &str) -> Result<(), ShellError
 }
 
 /// `wifi stored` - the networks a key is held for, one per line. Names, never secrets; the table
-/// (`utilities/56_wifi.md` 6) persists in `/wifi.keys`, which the driver reads back when the radio comes up.
+/// (`utilities/56_wifi.md` 6) persists in `/system/shared/wifi/keys`, which the driver reads back when the radio comes up.
 fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     use wifi_wire::*;
     const REPLY_MS: u64 = 3000;
@@ -12290,7 +12351,7 @@ fn wifi_stored(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
             // `[OK, count, (len, ssid[32]) * count]` - one name per line, so it pipes like any list.
             let count = p[1] as usize;
             if count == 0 {
-                out.line_fmt(ctx, format_args!("no stored networks - `wifi join` keeps a passphrase, in /wifi.keys"));
+                out.line_fmt(ctx, format_args!("no stored networks - `wifi join` keeps a passphrase, in /system/shared/wifi/keys"));
                 return Ok(());
             }
             let mut at = 2;
@@ -12328,7 +12389,7 @@ fn wifi_forget(ctx: &ShellCtx, out: &mut Out, ssid: &str) -> Result<(), ShellErr
         Some(r) => r,
         None => return wifi_not_answering(ctx, out),
     };
-    // The other radio too: both read and write `/wifi.keys`, and one that still held the key would put it
+    // The other radio too: both read and write `/system/shared/wifi/keys`, and one that still held the key would put it
     // back in the file on its next save (`godspeed_wifi::keyfile::save`).
     let asked = ctx.wifi_radio.get();
     for &other in RADIOS.iter() {
@@ -12496,7 +12557,7 @@ fn wifi_radio_on_outcome(ctx: &ShellCtx, out: &mut Out, outcome: WatchOutcome) -
 /// when asked (the radio op's third mode), parking its SDIO host for the whole off window. This shell
 /// holds restart authority and kills the driver once the chip is cold; the supervisor's respawn finds a
 /// card that does not answer the CCCR, which is the boot's own path, and the radio comes up from power-on
-/// and rejoins from `/wifi.keys` (docs/wifi.md 47). The order is the point: power first, then the kill - a
+/// and rejoins from `/system/shared/wifi/keys` (docs/wifi.md 47). The order is the point: power first, then the kill - a
 /// respawn onto a chip whose firmware still runs would ADOPT it (46), the opposite of a power cycle.
 ///
 /// BOUNDED, at the operator's word: `MAX_ATTEMPTS` cycles per invocation, then the prompt comes back with
@@ -12610,7 +12671,7 @@ enum WatchOutcome {
     Down,
     /// Nothing conclusive within the bound; said on the way out.
     TimedOut,
-    /// The radio is up and will NOT rejoin, by its own word: `/wifi.radio` names the other radio
+    /// The radio is up and will NOT rejoin, by its own word: `/system/shared/wifi/radio` names the other radio
     /// (`OP_USE` answers `USE_NOT`). A power cycle that succeeded, said with the reason and the remedy,
     /// rather than ninety seconds spent waiting for a join the driver has already decided against.
     UpNotChosen,
@@ -12673,7 +12734,7 @@ fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutc
                 } else if p[9] == 0 {
                     "radio coming up"
                 } else if p[10] == 0 {
-                    // ASK, ONCE, WHETHER IT WILL. A radio that `/wifi.radio` does not choose does not
+                    // ASK, ONCE, WHETHER IT WILL. A radio that `/system/shared/wifi/radio` does not choose does not
                     // rejoin at start (`godspeed_wifi::serve`), and waited on, this read "radio up,
                     // joining" for the whole bound: the Pi 4 with the choice left on `usb` and no dongle
                     // in (`docs/wifi-usb.md` 48). The driver knows; the watch asks rather than waits.
@@ -12683,7 +12744,7 @@ fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutc
                             if u.payload_bytes() == [OK, USE_NOT] {
                                 let me = radio_name(ctx.wifi_radio.get());
                                 out.line_fmt(ctx, format_args!(
-                                    "{} succeeded - the radio is up, and does not rejoin: /wifi.radio chooses the other radio. `wifi hardware use {}` makes this one the one in use",
+                                    "{} succeeded - the radio is up, and does not rejoin: /system/shared/wifi/radio chooses the other radio. `wifi hardware use {}` makes this one the one in use",
                                     verb, me));
                                 return WatchOutcome::UpNotChosen;
                             }
@@ -14879,7 +14940,7 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
         ], false),
         "persist" => help_block(ctx, "events persist", "capture the log to disk, via `recorder`", &[
             ("start <path> <size>", "begin capturing to <path>, rotating at <size>", "events persist start /log.txt 256KiB"),
-            ("start ... sticky", "and resume after a reboot (recorded in /persist.conf)", "events persist start /log.txt 256KiB sticky"),
+            ("start ... sticky", "and resume after a reboot (recorded in /system/services/events/sticky)", "events persist start /log.txt 256KiB sticky"),
             ("stop", "end the capture; the file gets its footer so it reads as complete", "events persist stop"),
             ("status", "what is recording, how much it has taken, and whether lines were LOST", "events persist status"),
             ("lost", "the window wrapped faster than the disk took it - the gap is real", ""),
@@ -16367,10 +16428,12 @@ fn brief_duration(secs: u64, out: &mut [u8; 16]) -> usize {
 
 /// Where a STICKY capture records what to resume. One line: `<bytes> <filter-or-dash> <path>`.
 ///
-/// Plain text on purpose - `read /persist.conf` shows exactly what will happen at the next boot, which
+/// Plain text on purpose - `read /system/services/events/sticky` shows exactly what will happen at the next boot, which
 /// is the difference between a setting and a surprise (§26.4). A capture that resumes silently forever
 /// because someone forgot is the hazard this whole feature has to avoid.
-const STICKY_PATH: &[u8] = b"/persist.conf";
+const STICKY_PATH: &[u8] = b"/system/services/events/sticky";
+/// Its folder: `events`'s, though the shell is what writes the record, because it owns `events persist`.
+const STICKY_DIR: &[u8] = b"/system/services/events";
 /// Seconds allowed for a sticky read or write. Generous: these happen once at boot and once per
 /// `start`, never on a hot path.
 const STICKY_SECS: i64 = 8;
@@ -16391,7 +16454,7 @@ fn sticky_write(ctx: &ShellCtx, budget: u64, filter: &str, path: &str) -> bool {
     for &c in f.as_bytes().iter().take(12) { buf[n] = c; n += 1; }
     buf[n] = b' '; n += 1;
     for &c in path.as_bytes().iter().take(64) { buf[n] = c; n += 1; }
-    sh_write_within(ctx, STICKY_PATH, &buf[..n], STICKY_SECS)
+    sh_mkdir_within(ctx, STICKY_DIR, STICKY_SECS) && sh_write_within(ctx, STICKY_PATH, &buf[..n], STICKY_SECS)
 }
 
 /// Forget a sticky capture. Called on `stop`, so an explicit stop stays stopped across a reboot -
@@ -16442,7 +16505,7 @@ fn sticky_resume(ctx: &ShellCtx) {
     let filter = it.next().unwrap_or("-");
     let path = it.next().unwrap_or("");
     if path.is_empty() || !path.starts_with('/') {
-        ctx.log("events persist: /persist.conf is unreadable - not resuming (delete it to silence this)");
+        ctx.log("events persist: /system/services/events/sticky is unreadable - not resuming (delete it to silence this)");
         return;
     }
     let filter = if filter == "-" { "" } else { filter };
@@ -16452,7 +16515,7 @@ fn sticky_resume(ctx: &ShellCtx) {
         return;
     }
     ctx.log_fmt(format_args!(
-        "events persist: resuming STICKY capture to {} (recorded in /persist.conf; `events persist stop` ends it for good)", path));
+        "events persist: resuming STICKY capture to {} (recorded in /system/services/events/sticky; `events persist stop` ends it for good)", path));
 }
 
 /// `events persist start|stop|status` - capture the event log to a file.
@@ -16491,7 +16554,7 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             if sticky {
                 // RECORDED BEFORE IT IS ANNOUNCED, so the message never claims more than is true.
                 if sticky_write(ctx, budget, filter, path) {
-                    gs::io::println(ctx, "events persist: STICKY - this resumes after a reboot. `events persist stop` ends it for good, and /persist.conf says what will happen.");
+                    gs::io::println(ctx, "events persist: STICKY - this resumes after a reboot. `events persist stop` ends it for good, and /system/services/events/sticky says what will happen.");
                 } else {
                     gs::io::println(ctx, "events persist: capturing, but STICKY could not be recorded - it will NOT resume after a reboot");
                 }
@@ -16541,7 +16604,7 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             }
             f.flush(ctx);
             if sticky_set(ctx) {
-                gs::io::println(ctx, "events persist: STICKY - this resumes after a reboot (/persist.conf). `events persist stop` ends it for good.");
+                gs::io::println(ctx, "events persist: STICKY - this resumes after a reboot (/system/services/events/sticky). `events persist stop` ends it for good.");
             }
             // A CAPTURE WITH A HOLE MUST SAY SO. The window is 8 KiB; a slow disk lets lines fall out
             // before they are read, and a file that silently skips them reads as complete.
@@ -17792,7 +17855,7 @@ fn parse_write_mode(arg: &str) -> (WriteMode, &str) {
     (WriteMode::Overwrite, arg)
 }
 
-const WRITE_TMP: &[u8] = b"/.write.tmp"; // append/prepend staging file (root → no dirname math)
+const WRITE_TMP: &[u8] = b"/system/scratch/shell/write.tmp"; // append/prepend staging file
 
 /// Read exactly `out.len()` bytes from `path` at byte `off`, looping `read_at`. False on short read.
 fn read_file_exact(ctx: &ShellCtx, path: &[u8], off: usize, out: &mut [u8]) -> bool {
@@ -17903,7 +17966,7 @@ fn fs_stream_combine(ctx: &ShellCtx, p: &[u8], new: &[u8], prepend: bool) -> boo
     if total == 0 {
         return sh_write(ctx, p, &[]);
     }
-    if !fs_write_new(ctx, WRITE_TMP, total as u64) { return false; }
+    if !ensure_scratch(ctx) || !fs_write_new(ctx, WRITE_TMP, total as u64) { return false; }
     // Ordered segments: prepend = [new (mem) | old (disk)]; append = [old (disk) | new (mem)].
     let (first_len, first_is_new) = if prepend { (new.len(), true) } else { (old_size, false) };
     let mut off = 0usize;
@@ -18009,7 +18072,7 @@ fn lookup_sink(ctx: &ServiceContext, sink: &str, noticed: &core::cell::Cell<bool
 const FILTER_WAIT_SECS: i64 = 5;
 
 /// Does this line READ a secret (`input secret ...`, incl. `$(input secret ...)`)? Such a line is never
-/// saved to the recall ring or /.gsh_history (§8 secret taint) - a password recovered on up-arrow would
+/// saved to the recall ring or /users/default/history (§8 secret taint) - a password recovered on up-arrow would
 /// defeat invisible entry. Erring toward not-saving is safe: a false positive drops one recall entry.
 fn line_reads_secret(line: &[u8]) -> bool {
     line.windows(12).any(|w| w == b"input secret")
@@ -19116,12 +19179,14 @@ struct Cwd {
 }
 
 impl Cwd {
-    fn root() -> Self {
+    /// Where a session starts, and where a bare `cd` goes.
+    fn home() -> Self {
+        let h = HOME.as_bytes();
         let mut buf = [0u8; PATH_MAX];
-        buf[0] = b'/';
+        buf[..h.len()].copy_from_slice(h);
         let mut prev = [0u8; PATH_MAX];
-        prev[0] = b'/';
-        Cwd { buf, len: 1, prev, prev_len: 1 }
+        prev[..h.len()].copy_from_slice(h);
+        Cwd { buf, len: h.len(), prev, prev_len: h.len() }
     }
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("/")
@@ -19275,6 +19340,41 @@ fn time_synced_secs_ago(ctx: &ShellCtx) -> Option<i64> {
 /// For a write nobody is waiting on - the history file, a marker, a report saved after a chaos storm
 /// has just hammered `fs`. A shorter wait makes [`gs::Error::OutcomeUnknown`] MORE likely, not less,
 /// so this is only right where "it may have landed" is an acceptable answer and hanging is not.
+/// The session's home: where the shell starts and where a bare `cd` goes (`docs/filesystem-layout.md` 6).
+/// `fs` makes it when it formats a disk. In a script it is `$home`.
+const HOME: &str = "/users/default";
+/// Command history, in the operator's folder: it is theirs, not the machine's.
+const HISTORY: &[u8] = b"/users/default/history";
+/// The shell's scratch folder: disposable, emptied by the shell the first time a session needs it.
+const SCRATCH: &[u8] = b"/system/scratch/shell";
+/// Room for `SCRATCH`/fl, a u32 and `~`.
+const FL_TEMP_MAX: usize = 48;
+
+/// Empty and make the scratch folder, once per instance, before the first file goes in it. Scratch belongs
+/// to its owner, who empties it when it starts (`docs/filesystem-layout.md` 7); the shell does it at the
+/// first use rather than at start because start must not touch `fs`. Safe to repeat, and it touches nothing
+/// outside `SCRATCH`.
+fn ensure_scratch(ctx: &ShellCtx) -> bool {
+    if ctx.scratch_ready.get() { return true; }
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
+    let emptied = match g.delete_all(SCRATCH) {
+        Ok(()) | Err(gs::Error::NotFound) => true,
+        Err(_) => false,
+    };
+    let ok = emptied && g.create_dir_all(SCRATCH).is_ok();
+    ctx.fs_tag.set(g.tag());
+    if ok { ctx.scratch_ready.set(true); }
+    ok
+}
+
+/// Make a folder and its parents, bounded by `secs`. `true` when it is there afterwards.
+fn sh_mkdir_within(ctx: &ShellCtx, path: &[u8], secs: i64) -> bool {
+    let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(secs);
+    let ok = g.create_dir_all(path).is_ok();
+    ctx.fs_tag.set(g.tag());
+    ok
+}
+
 fn sh_write_within(ctx: &ShellCtx, path: &[u8], data: &[u8], secs: i64) -> bool {
     let mut g = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get()).patience_secs(secs);
     let ok = g.write(path, data).is_ok();
@@ -19345,7 +19445,7 @@ fn sh_delete(ctx: &ShellCtx, path: &[u8]) -> bool {
 /// The next correlation tag for an fs request.
 ///
 /// Replies were matched to requests by ARRIVAL ORDER alone, which holds only while nothing is ever
-/// overtaken. After a USB stick replug the device is slow, a `.gsh_history` write is still in flight when
+/// overtaken. After a USB stick replug the device is slow, a history write is still in flight when
 /// the next command's request goes out, and the replies come back one behind - so `dir` read the write's
 /// one-byte `[FS_OK]`, saw a reply too short to be a listing, and reported a storage error about a
 /// filesystem that was perfectly fine. The channel then stayed one behind indefinitely, which is why the
@@ -20681,8 +20781,8 @@ fn recv_quittable(ctx: &ServiceContext, secs: i64, noticed: &core::cell::Cell<bo
 /// The largest file-cap request the shell builds, plus its tag. Every `fcap` request is a short
 /// header and a small chunk; a caller needing more is refused rather than silently truncated.
 const FC_REQ_MAX: usize = 512;
-const FCAP_TMP: &[u8] = b"/.fcap-selftest";
-const FCAP_TMP_RENAMED: &[u8] = b"/.fcap-selftest.renamed";
+const FCAP_TMP: &[u8] = b"/system/scratch/shell/fcap-selftest";
+const FCAP_TMP_RENAMED: &[u8] = b"/system/scratch/shell/fcap-selftest.renamed";
 fn cmd_fcap_help(ctx: &ServiceContext) {
     gs::io::println_fmt(ctx, format_args!(
         "fcap {} - file-as-capability self-check (a diagnostic, not a file tool)", UTIL_VERSION));
@@ -20909,6 +21009,10 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         return Err(ShellError::Unknown);
     }
     let path = FCAP_TMP;
+    if !ensure_scratch(ctx) {
+        gs::io::println(ctx, "fcap: FAIL - its scratch folder could not be made (storage unavailable?)");
+        return Err(ShellError::Unknown);
+    }
     let mut ok = true;
     let fail = |ctx: &ServiceContext, m: &str| { gs::io::println(ctx, m); };
 
@@ -20992,7 +21096,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // 9. Revocable on path rebinding (confused-deputy avoidance, §7.10): renaming the file makes
     //    the old path name something else, so fs revokes the still-open `ro` cap - it can never
     //    silently rebind to a different file later created at the old path.
-    let _ = fs_request(ctx, OP_RENAME, path, b".fcap-selftest.renamed");
+    let _ = fs_request(ctx, OP_RENAME, path, b"fcap-selftest.renamed");
     match fc_invoke(ctx, ro, RIGHT_READ, &rbuf) {
         None    => gs::io::println(ctx, "fcap: cap revoked after rename"),
         Some(_) => { fail(ctx, "fcap: FAIL cap usable after rename"); ok = false; }
@@ -21009,7 +21113,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // up front and chunks go in at block-aligned offsets, exactly as `recorder` does it. So the rule
     // is against the resource's own HIGH-WATER MARK, not against end-of-file - the file is its final
     // size from the first moment.
-    const APPEND_PATH: &[u8] = b"/.fcap_append";
+    const APPEND_PATH: &[u8] = b"/system/scratch/shell/fcap_append";
     const BLK: u64 = 508;   // DATA_PAYLOAD - `write_at` demands block-aligned offsets
     let _ = sh_delete(ctx, APPEND_PATH);
     let mut newreq = [0u8; 8];
@@ -21070,7 +21174,7 @@ fn cmd_fcap(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     // counter (the `File` borrows the `Fs` handle precisely so a second counter cannot exist). If
     // the tag is wrong in either direction, or the counters diverge, this read returns somebody
     // else's answer instead of "gsdata".
-    const GSCAP_PATH: &str = "/.fcap-gs";
+    const GSCAP_PATH: &str = "/system/scratch/shell/fcap-gs";
     {
         let mut gfs = gs::fs::Fs::from_tag(&**ctx, ctx.fs_tag.get());
         let r = (|| -> Result<(), gs::Error> {
@@ -21159,7 +21263,7 @@ const EDIT_TAB: usize = 4;                 // Tab inserts this many spaces
 const EDIT_ADD_MAX: usize = 32 * 1024;     // add-buffer: new typed bytes between saves (save resets)
 const EDIT_MAX_PIECES: usize = 1024;       // span-list size (save resets); each edit adds ≤2 spans
 const EDIT_LINE_MAX: usize = 8192;         // bound on a single line's length for nav/render scans
-const EDIT_TMP: &[u8] = b"/.edit.tmp";     // save staging file (root → no dirname math)
+const EDIT_TMP: &[u8] = b"/system/scratch/shell/edit.tmp"; // save staging file
 
 /// One span of the document: `len` bytes starting at `start` in either the original file on disk
 /// (`add == false`) or the in-memory add buffer (`add == true`). The document is the ordered
@@ -21562,7 +21666,7 @@ fn edit_save(ctx: &ShellCtx, ed: &mut Editor) -> bool {
             return false;
         }
     } else {
-        if !fs_write_new(ctx, EDIT_TMP, total as u64) { return false; }
+        if !ensure_scratch(ctx) || !fs_write_new(ctx, EDIT_TMP, total as u64) { return false; }
         let mut off = 0usize;
         let mut chunk = [0u8; IO_CHUNK];
         while off < total {

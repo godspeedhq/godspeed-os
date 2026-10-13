@@ -284,10 +284,10 @@ VIII fix (§6.16): don't wait on a proxy (the tick) for a truth (a keystroke) yo
 The drain is bounded (16-byte FIFO into a fixed ring) and IF-guarded (it never re-enters and never leaves
 interrupts unexpectedly enabled); no new `unsafe` beyond the existing `arch` UART accessors.
 
-**Companion: lazy, bounded shell history.** The shell persists its command history to `/.gsh_history`
+**Companion: lazy, bounded shell history.** The shell persists its command history to `/users/default/history`
 (the §15 monotonic-counter pattern). It used to **read that file back at startup** - an `fs` round-trip
 fired during the shell's own re-init, which is exactly when the storage stack may be mid-recovery (a
-contributing masked race in the §6.16 wedge). The read is now **lazy**: the shell loads `/.gsh_history`
+contributing masked race in the §6.16 wedge). The read is now **lazy**: the shell loads `/users/default/history`
 on the **first up-arrow**, not at spawn. A fresh prompt never blocks on `fs` coming up, and the shell's
 re-init path touches no disk. In-memory history stays bounded (a fixed ring); saving remains best-effort
 (§15). Two small changes, one theme: the interactive path must stay responsive precisely when the rest of

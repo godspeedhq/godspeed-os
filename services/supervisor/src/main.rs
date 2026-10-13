@@ -408,7 +408,7 @@ mod board {
     /// And `supervisor`, for the dongle's report (`usbdev`), as `dwc2` has.
     pub const XHCI_PEERS: &[&str] =
         if cfg!(has_wifi_usb) { &["events", "wifi-usb", "supervisor"] } else { &["events"] };
-    /// The dongle driver's peers: the USB host that serves its dongle, and `fs` for `/wifi.keys`. `dwc2` on
+    /// The dongle driver's peers: the USB host that serves its dongle, and `fs` for `/system/shared/wifi/keys`. `dwc2` on
     /// the board that has it, `xhci` on the others (U2a).
     pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
 
@@ -717,7 +717,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // No DMA arena and no interrupt, deliberately: the firmware upload and every frame move by PIO
     // (the contract says the same, and that it stays true), so neither was ever needed. This said both
     // would arrive with the upload; it came without them (corrected 2026-10-08).
-    // Its send peers are `fs` (for `/wifi.keys`) and `power` (the Arm clock lease), in the row below.
+    // Its send peers are `fs` (for `/system/shared/wifi/keys`) and `power` (the Arm clock lease), in the row below.
     // NOT `events`, though every other driver here has it - the reasoning as written when it had none:
     // it buys exactly one thing, automatic IPC tracing, and this service makes almost no IPC calls in
     // this phase. Everything it reports goes through `ctx.log()`, which is the kernel ring and the
@@ -739,7 +739,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // death the kernel clears its device's bus mastering, keyed on the device it was given
     // (`kernel/src/task/scheduler.rs`). WITH an interrupt (`pci_irq`): the stream interrupts as each
     // period is played and the driver refills then; the kernel picks the vector from its MSI pool.
-    // One peer, `fs`, for `/audio.settings` - the volume and the mute kept across a restart (A4).
+    // One peer, `fs`, for `/system/services/<driver>/settings` - the volume and the mute kept across a restart (A4).
     //
     // CONFINED behind the IOMMU (§6.4), where there is one: every DMA the controller makes - the command
     // rings, the buffer descriptor list, the ring of sound - is inside the arena, so nothing it does
@@ -753,7 +753,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // The Pis' 3.5 mm jack (docs/audio.md, "The Pis"): PWM fed by the SoC's DMA engine. Named by its
     // device kind - the kernel routes the jack's pins and starts the PWM clock as part of the grant,
     // then maps the PWM and DMA pages and grants a DMA arena. `mode` says which Pi. One peer, `fs`, for
-    // `/audio.settings`.
+    // `/system/services/<driver>/settings`.
     #[cfg(has_pwm_audio)]
     ("pwm-audio", PWM_AUDIO_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      16 * 1024 * 1024, 2, &["fs"], 0, PWM_AUDIO_BOARD,
@@ -836,7 +836,7 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // The USB WiFi dongle's driver (docs/wifi-usb.md). NO hardware grant - no window, no arena, no
     // interrupt, no device class: everything it does to the chip is a request to the USB host that bound
     // the dongle, which answers for that one device only (`godspeed_wifi::usbfn`). Its peers are that host
-    // and `fs`, which holds `/wifi.keys` for the serve loop every radio shares (`godspeed_wifi::serve`, R4)
+    // and `fs`, which holds `/system/shared/wifi/keys` for the serve loop every radio shares (`godspeed_wifi::serve`, R4)
     // - the same reason `wifi-driver` has it. Unplaced: it is idle until a dongle is there, and a radio's
     // work is milliseconds at a time.
     #[cfg(has_wifi_usb)]
@@ -1743,7 +1743,7 @@ fn usb_sound(ctx: &ServiceContext, map: &NameCapMap, kind: u8) {
 
 /// TELL THE ONBOARD RADIO WHETHER THE DONGLE IS ATTACHED (`godspeed_wifi::wire::NOTE_USB_RADIO`, 0x2D -
 /// a literal here, as `nic-driver` writes the wire's ops, since this crate does not link `sdk/wifi`).
-/// The fact a radio that `/wifi.radio` does not choose stands in on, for a chosen dongle that is not
+/// The fact a radio that `/system/shared/wifi/radio` does not choose stands in on, for a chosen dongle that is not
 /// there, and stands down on when it arrives (`docs/wifi-usb.md` 49).
 ///
 /// Said when the pair (the onboard driver's endpoint, the dongle attached) differs from the last one told,
@@ -2325,13 +2325,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // fifth backend, docs/wifi.md 2) and a peer already in the name-cap map wires at spawn; one that is
     // not costs a round of failure and reacquire (services/CLAUDE.md, the spawn order is a dependency
     // order). The radio's own bring-up runs in its task and holds nobody up.
-    // Wired to `fs` for `/wifi.keys` (the storage chain is up by here, so the cap wires at spawn).
+    // Wired to `fs` for `/system/shared/wifi/keys` (the storage chain is up by here, so the cap wires at spawn).
     #[cfg(has_wifi_driver)]
     ensure_wired(&ctx, &mut name_map, "wifi-driver", &["fs", "power"]);
 
     // audio-driver (docs/audio.md). MANAGED: the kernel stops a dead driver's bus mastering by the
     // device it was given (not by name), so a death is quiesced and restarted like any other driver's.
-    // Wired to `fs` for `/audio.settings` (the storage chain is up by here, so the cap wires at spawn);
+    // Wired to `fs` for `/system/services/<driver>/settings` (the storage chain is up by here, so the cap wires at spawn);
     // `ensure_wired` adopts a running instance on a supervisor respawn.
     #[cfg(has_audio_driver)]
     ensure_wired(&ctx, &mut name_map, "audio-driver", &["fs"]);

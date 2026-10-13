@@ -1,5 +1,9 @@
 # WiFi on a USB dongle: `wifi-usb` (design, 2026-10-05)
 
+> **Note 2026-10-13: the keys moved.** `/wifi.keys` and `/wifi.radio`, named throughout this record, are
+> `/system/shared/wifi/keys` and `/system/shared/wifi/radio` since the filesystem layout
+> (`docs/filesystem-layout.md`); nothing reads the old names.
+
 The Pi 2 has no radio of its own, and the PCs have none either. A USB WiFi dongle - a Realtek
 RTL8188CUS today, `0bda:8176` - gives every board with a USB host a radio. This is the plan for driving
 one, and the record of each card that does.

@@ -1,4 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
+
+> **Note 2026-10-13: the keys moved.** This record names `/wifi.keys` and `/wifi.radio`, which is where they
+> were when each section was written. Since the filesystem layout (`docs/filesystem-layout.md`) they are
+> `/system/shared/wifi/keys` and `/system/shared/wifi/radio`; nothing reads the old names.
 # WiFi: two problems, one of which is not a driver
 
 **Status:** sections 1-12 are the design, written on `feat/wifi-driver` before any code, deliberately,

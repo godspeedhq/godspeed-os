@@ -24,7 +24,7 @@ when the firmware says the scan is complete rather than when a timer runs out.
 firmware cannot complete without the host handshake (below). The key derivation matched all four published
 vectors at boot (`stage 0`). The cache lives in the driver's memory - not in a file, so it needs no `fs`,
 dies with the driver, and never writes a network name to the card. (That was 2026-09-29. Keys, and the
-names they belong to, have been on disk in `/wifi.keys` since 2026-09-30 - section 6.)
+names they belong to, have been on disk in `/system/shared/wifi/keys` since 2026-09-30 - section 6.)
 
 What every verb does, and what was seen:
 
@@ -100,7 +100,7 @@ What every verb does, and what was seen:
   does not watch `LINK` events on its own.
 - **A drop is rejoined once.** When the access point drops a link that had lasted a minute or more, the
   driver rejoins the same network with the key it holds, through the same path as the boot rejoin - so
-  it honours `/wifi.radio` - and says `joining the network last joined, after the access point dropped
+  it honours `/system/shared/wifi/radio` - and says `joining the network last joined, after the access point dropped
   it`. One attempt per drop: if it fails, `wifi join` brings it back. A link dropped in under a minute
   is NOT rejoined, and the line says so - an access point that drops every join would otherwise be
   rejoined forever. (Seen 2026-10-08: a VisionFive idle for half an hour, disassociated for inactivity,
@@ -152,7 +152,7 @@ because an IP address has one owner and duplicating it here would make two answe
 | `wifi stored` | the networks a key is held for, one per line. Names, never secrets. Sixty-four at most - section 6 |
 | `wifi radio on` / `wifi radio off` | the FIRMWARE's radio switch: the chip stays powered. `off` disconnects first and says so. `on` converges from whichever state the radio is in - soft off, it is the two-second switch below; after `off hard`, it is the cold start described in that row; and with the radio DOWN (its firmware trapped at start, or never ran) it is the hard on: the driver is restarted (the respawn adopts a live firmware or power-cycles a dead one) and watched to `radio on succeeded - joined <name>`, and a chip that comes up warm is reported, not retried: ONE attempt, then the prompt and ``radio on failed - the chip came up warm (...); `wifi radio powercycle` tries once more``. `on` never answers "no control over the radio's power" unless the kernel refused. `on` then REJOINS the network last joined this boot, with the key it holds and without asking, and says `joined <name>` (asked for by the operator 2026-09-30); a `wifi leave` before the `off` cancels that, and a `wifi forget` of the name leaves nothing to rejoin with. Asking for the state it is already in says `radio already on` / `radio already off`, and sends the radio nothing. Both BLOCK and offer no key - no `[q]` since 2026-10-01, because the request is a kernel `Call` and a shell blocked in one cannot read the console - for about two seconds, and up to fifteen when `on` rejoins. `off` is VERIFIED: the driver asks the firmware back (`WLC_GET_UP`) and the shell prints `... - verified: ...` when it reads down, says unverified when it could not ask, and `... FAILED ...` when the firmware still reads up (`docs/wifi.md` 49, 55; hardware-verified 2026-10-01) |
 | `wifi radio off hard` | the CHIP's power, cut and left cut. BLOCKS for about three seconds with NO key, until the driver has left the network, cut the power and the kernel has read the pin back low; the driver then checks the cut on its own bus (a CMD52 50 ms later that nothing should answer) and the shell prints `... - verified: ...`, says unverified when the check could not be made, or `... FAILED ...` when the chip still answered (`docs/wifi.md` 49, 55; hardware-verified 2026-10-01). There is no `q`, because this cannot be stopped once asked, and no `b` either: it offered `[b] background` until 2026-10-01, but the request is a kernel `Call` and a shell blocked in one cannot read the console, so the key could never have been seen in time. The driver stays alive to answer: `wifi status` says `radio off (hard - the chip is powered down; wifi radio on powers it up)`, every other request answers that the chip is powered down. `wifi radio on` from this state restores the power, prints `radio powered up - starting the driver on the cold chip`, restarts the driver, and watches the cold path like `powercycle` does, ending `radio on succeeded - joined <name>`. About twenty seconds; the soft `off`/`on` stay the two-second switch. `on` after `off hard` can still come up WARM - it did at 09:44 and 14:43 on 2026-10-01 - and then, after its one attempt, returns to the prompt saying `wifi radio powercycle` tries once more; `off hard` cuts and verifies the power, it does not produce a cold chip on demand (`docs/wifi.md` 47, 48). **On a USB dongle (`wifi-usb`, `docs/wifi-usb.md` 18) the power is its port's and is not touched.** `off hard` there is the chip's own power-down, Linux's `rtl8192cu_power_off`: the network left, the firmware asked to stop and stopped from the host if it does not answer, the chip suspended. Its check is that no firmware is marked running. `on` and `powercycle` restart the driver, whose bring-up powers the chip on and uploads its firmware. A dongle that no longer answers on USB cannot be powered down this way; the driver says so, and only unplugging it helps |
-| `wifi radio powercycle` | the CHIP's power, not the firmware's radio switch: the driver cuts and restores it through the kernel's `DevicePower` (its own grant, renewable - CLAUDE.md 12.3), and the shell then restarts the driver, which comes up from power-on and rejoins from `/wifi.keys`. The power request itself is bounded at fifteen seconds before the watch begins. Then it says `radio powered down for 2.0 s - restarting the driver on the cold chip` (with ` (the network is left)` before the dash when it was joined), and BLOCKS with `[q] quit  [b] background`, printing each change of state as the driver answers its status question - `waiting for the driver`, `radio coming up`, `radio up, joining` - and ends in one of two lines: `powercycle succeeded - joined <name>`, or `powercycle failed - <why>` (the driver did not answer, this machine has no control over the radio's power, the driver could not be restarted, or the radio did not rejoin within 90 s and where it got to). VERIFIED: success is a join younger than the watch itself, so a stale answer from before the restart cannot pass for one; and a driver that comes back with its radio down means the chip came up warm - its firmware trapped at start - and the shell reports it and stops: ONE cycle per invocation (attempts on the same chip were not independent, so a retry only hid the cause; `docs/wifi.md` 52), re-runnable by hand. The driver waits 300 ms after power-on before its first command (`POWER_ON_SETTLE_MS`; five seconds was tried in section 52, changed nothing, and was reverted). BOUNDED at the operator's word: a warm chip ends `powercycle failed - the chip came up warm (its firmware trapped at start; ...)`, returns the prompt, and can be run again - nothing needs a reboot. The driver parks its SDIO host for the whole off window. The "warm starts" this paragraph once expected were a slow host - the Arm cores at their minimum clock - and with the `power` service's lease every power cycle has come up cold (`docs/wifi.md` 55-57). `q` leaves the watch. `q` and `b` both return to the prompt and say the power cycle continues in the driver: once the power is cut there is nothing to stop (`docs/wifi.md` 47) |
+| `wifi radio powercycle` | the CHIP's power, not the firmware's radio switch: the driver cuts and restores it through the kernel's `DevicePower` (its own grant, renewable - CLAUDE.md 12.3), and the shell then restarts the driver, which comes up from power-on and rejoins from `/system/shared/wifi/keys`. The power request itself is bounded at fifteen seconds before the watch begins. Then it says `radio powered down for 2.0 s - restarting the driver on the cold chip` (with ` (the network is left)` before the dash when it was joined), and BLOCKS with `[q] quit  [b] background`, printing each change of state as the driver answers its status question - `waiting for the driver`, `radio coming up`, `radio up, joining` - and ends in one of two lines: `powercycle succeeded - joined <name>`, or `powercycle failed - <why>` (the driver did not answer, this machine has no control over the radio's power, the driver could not be restarted, or the radio did not rejoin within 90 s and where it got to). VERIFIED: success is a join younger than the watch itself, so a stale answer from before the restart cannot pass for one; and a driver that comes back with its radio down means the chip came up warm - its firmware trapped at start - and the shell reports it and stops: ONE cycle per invocation (attempts on the same chip were not independent, so a retry only hid the cause; `docs/wifi.md` 52), re-runnable by hand. The driver waits 300 ms after power-on before its first command (`POWER_ON_SETTLE_MS`; five seconds was tried in section 52, changed nothing, and was reverted). BOUNDED at the operator's word: a warm chip ends `powercycle failed - the chip came up warm (its firmware trapped at start; ...)`, returns the prompt, and can be run again - nothing needs a reboot. The driver parks its SDIO host for the whole off window. The "warm starts" this paragraph once expected were a slow host - the Arm cores at their minimum clock - and with the `power` service's lease every power cycle has come up cold (`docs/wifi.md` 55-57). `q` leaves the watch. `q` and `b` both return to the prompt and say the power cycle continues in the driver: once the power is cut there is nothing to stop (`docs/wifi.md` 47) |
 | `wifi hardware` | BUILT (section 11): the radios this machine has, one row each - its name, chip, bus, state, network and whether it is the one in use. A report: it pipes |
 | `wifi hardware <radio>` | BUILT (section 11a): one radio in full - the chip as the driver read it, its firmware, its address, and the bus it is reached over down to the port and endpoints. Labelled lines, like `wifi info`: it pipes |
 | `wifi hardware use <radio>` | BUILT (section 11): choose the radio every other `wifi` verb talks to and that carries the frames when the cable is out - `onboard` or `usb` (the `usb-XXXX` names for two dongles are designed, not built - section 11). An action: it does not pipe |
@@ -189,7 +189,7 @@ not answer`; that reply stays in the table so a shell can still name it, and no 
 
 `wifi join` takes **no** passphrase argument, in any position, and that is a security decision
 rather than an ergonomic one: an argument would be recorded in the recall ring and written to
-`/.gsh_history`, where an up-arrow recovers it. The passphrase is only ever read through the shell's
+`/users/default/history`, where an up-arrow recovers it. The passphrase is only ever read through the shell's
 invisible-entry path (`input secret`, `docs/scripting.md` §8), which is already excluded from both.
 
 ## 3. Output is a pipeable structure (rule 12)
@@ -559,7 +559,7 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
   the one JOINED LONGEST AGO is replaced. The number is a bound (CLAUDE.md §26.6) chosen so that nobody
   reaches it, not a fit to the 16 MiB the driver may use - a table that grew to fill what was available
   would be the elastic growth §26.6.1 says to resist, and its limit would be readable nowhere.
-- **On disk since 2026-09-30, in `/wifi.keys`, by the operator's decision** - *"save passphrase on
+- **On disk since 2026-09-30, in `/system/shared/wifi/keys`, by the operator's decision** - *"save passphrase on
   filesystem so that when the machine starts up, if there's wifi, it auto joins ... and ready to go"*,
   with the exposure named and accepted: *"if I were to unplug the usbstick and put it on another machine,
   that machine will have access to wifi passphrase (I'm ok with that for now)."* What the file holds is the
@@ -575,7 +575,7 @@ Decided 2026-09-29, and it supersedes the keyring design `docs/wifi.md` §6 sket
   still governs the CRASH case: nothing above the kernel must survive, and a respawned driver reads the file
   back rather than carrying anything across its own death.
 - **At boot the radio joins the network it last joined**, from the file, without being asked, and the cable
-  still wins for the link. The log says `joining the network last joined, from /wifi.keys`, then the same
+  still wins for the link. The log says `joining the network last joined, from /system/shared/wifi/keys`, then the same
   lines a `wifi join` prints; if that network is out of range or refuses, `not joined` and the prompt is
   yours. `wifi radio on` after `radio off` does the same from memory (section 2).
 - **`wifi join <ssid>` asks for a passphrase only when one is needed.** The shell sends the name
@@ -708,7 +708,7 @@ frames when the cable is out. It is an action and does not pipe.
 - **The default** is today's order: the onboard radio, else the dongle - so on a machine with no onboard
   radio (the PCs) the dongle is the default.
 - **A choice is saved, by its owner.** `nic-driver` holds the choice, so `nic-driver` keeps it, in
-  `/wifi.radio`, as `wifi-driver` keeps `/wifi.keys`, and reads it back at boot and on every respawn. That
+  `/system/shared/wifi/radio`, as `wifi-driver` keeps `/system/shared/wifi/keys`, and reads it back at boot and on every respawn. That
   gives `nic-driver` `fs` as a peer, a grant pinned with this reason. The shell saving it and telling
   `nic-driver` at each start was the alternative, and it splits one fact across two services.
 - **The file holds the full name** (`usb-1a0d`), even while the report shows plain `usb` because there is
@@ -723,9 +723,9 @@ frames when the cable is out. It is an action and does not pipe.
 1. The dongle is already up before anyone types `use`: `wifi-usb` runs while its dongle is attached (on the Pi 2
    the supervisor starts it when the host reports the dongle), and plugging the dongle in is what binds it and brings the chip up (a few seconds). `use` on a radio still coming up waits for
    it, bounded, and says so.
-2. `use usb` records the choice in `nic-driver` and `/wifi.radio`.
+2. `use usb` records the choice in `nic-driver` and `/system/shared/wifi/radio`.
 3. `nic-driver` asks the radio in use what it is joined to, and asks the chosen one to join that network.
-   The key is read from `/wifi.keys`, which both radio drivers share, so nothing is typed.
+   The key is read from `/system/shared/wifi/keys`, which both radio drivers share, so nothing is typed.
 4. Only once the chosen radio reports JOINED do the frames move to it - so a join that fails loses
    nothing: `use` says why, and the other radio keeps the link.
 5. The new radio has its own address, so the stack asks for a lease again: the same second or two a ping
@@ -734,20 +734,20 @@ frames when the cable is out. It is an action and does not pipe.
 
 **What that needs, beyond the report and the choice:**
 - **Only the radio in use auto-joins.** Today each radio driver rejoins the last network from
-  `/wifi.keys` at boot; with two, both would join the same access point. A radio auto-joins only when
+  `/system/shared/wifi/keys` at boot; with two, both would join the same access point. A radio auto-joins only when
   `nic-driver` says it is the one in use.
-- **`/wifi.keys` gets two writers.** Each driver rewrites the file from its own table, so one radio's save
+- **`/system/shared/wifi/keys` gets two writers.** Each driver rewrites the file from its own table, so one radio's save
   could drop a key the other added. A save re-reads the file and merges before writing.
 - **`nic-driver` asks a radio what it is joined to**, which it does not do today.
 
 **As built (2026-10-07), and where it differs from the design above.** Built, checked in QEMU on the
 Pi 4 image (the refusals, and `use` of the radio already in use), and hardware-verified on the Pi 4 with
 both radios (`docs/wifi-usb.md` 37).
-- **The SHELL writes `/wifi.radio`, and nothing else does.** The design gave the choice to `nic-driver`,
+- **The SHELL writes `/system/shared/wifi/radio`, and nothing else does.** The design gave the choice to `nic-driver`,
   but the choice decides which radio the `wifi` verbs address as well, on boards where `nic-driver`
   bridges and where it once did not. So the one writer is the shell; the file holds the radio's name (`onboard`,
   `usb`), and choosing the default radio removes it. One fact, one writer, every other party a reader.
-- **Each radio knows whether it is the one in use**, read from `/wifi.radio` at start beside `/wifi.keys`
+- **Each radio knows whether it is the one in use**, read from `/system/shared/wifi/radio` at start beside `/system/shared/wifi/keys`
   (same bounded retries) and kept current by a new op, `wire::OP_USE` (14), which the shell sends every
   running radio on `use`. The shell asks the radios the same op to find the one in use; with one running,
   it asks nothing.
@@ -758,12 +758,12 @@ both radios (`docs/wifi-usb.md` 37).
   leaves the machine without the one that is there. Its peers on the Pi 4 and the VisionFive gain
   `wifi-usb`, the second radio. A respawned `nic-driver` finds the choice again the same way.
 - **The join is the shell's, before anything moves.** `use` asks the chosen radio to join the network the
-  radio in use is on, by name (its key from `/wifi.keys`, or the passphrase asked for if it does not hold
+  radio in use is on, by name (its key from `/system/shared/wifi/keys`, or the passphrase asked for if it does not hold
   one). Only once it says `JOINED` is the choice written and told to the radios; then the radio that was in
   use leaves and stays up. A join that fails changes nothing and says so.
-- **Only the radio in use rejoins at start**: a radio that `/wifi.radio` says is not the one skips the
+- **Only the radio in use rejoins at start**: a radio that `/system/shared/wifi/radio` says is not the one skips the
   boot rejoin, with a line saying why. With no file, both rejoin as before.
-- **`/wifi.keys` is merged on save** (`keyfile::save`): the file's entries this radio's table lacks are
+- **`/system/shared/wifi/keys` is merged on save** (`keyfile::save`): the file's entries this radio's table lacks are
   kept after its own. A `wifi forget` passes the network to drop, and the shell sends the forget to both
   radios, so the one that did not hold the key does not put it back.
 - **Not done:** the dongle's two-dongle names (`usb-1a0d`) and saving a choice of a radio by its MAC; a

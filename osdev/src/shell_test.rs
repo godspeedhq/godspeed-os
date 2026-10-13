@@ -316,12 +316,12 @@ pub fn run(image_path: &Path, smp: u32) {
            "wifi: asking about wireless on a radioless machine is not an error");
 
     // THE SECURITY ASSERTION, and the one most worth having. A passphrase given as an argument would be
-    // recalled by up-arrow and written to /.gsh_history, so `connect` takes an SSID and nothing else.
+    // recalled by up-arrow and written to /users/default/history, so `connect` takes an SSID and nothing else.
     // If this ever stops refusing, somebody has added a convenience that leaks a secret to disk.
     send(&mut write_half, b"wifi join SomeSSID hunter2\r");
     let wifi_pw = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(wifi_pw.contains("passphrase is asked for"),
-           "wifi: refuses a passphrase on the command line (it would land in /.gsh_history)");
+           "wifi: refuses a passphrase on the command line (it would land in the history file)");
 
     // Usage and unknown-word refusals, which are permanent on every board.
     send(&mut write_half, b"wifi join\r");
@@ -2535,7 +2535,7 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("not running"), "and `status` then says so, from the task table"),
         None => { println!("sticky-test: FAIL - timed out on status after stop"); fail += 1; }
     }
-    send(&mut write2, b"read /persist.conf\r");
+    send(&mut write2, b"read /system/services/events/sticky\r");
     match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
         Some(r) => check!(!r.contains("/cap.log"), "stop DELETED the sticky marker (it will not come back)"),
         None => { println!("sticky-test: FAIL - timed out reading the marker"); fail += 1; }
@@ -2990,6 +2990,82 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
             None    => { println!("files-test: FAIL - flash timeout"); fail += 1; }
         }
     } else { println!("files-test: FAIL - no flash confirm"); fail += 1; }
+
+    // THE STANDARD TREE (`docs/filesystem-layout.md`): a format lays it down, the shell starts at home and
+    // says where it is in the prompt, and the shell's own files land in their folders.
+    match run!(b"\r", 10) {
+        Some(r) => check!(r.contains("/users/default "), "layout: the prompt starts at home, /users/default"),
+        None    => { println!("files-test: FAIL - empty-line prompt timeout"); fail += 1; }
+    }
+    match run!(b"dir /system\r", 10) {
+        Some(r) => check!(r.contains("services") && r.contains("utilities") && r.contains("shared") && r.contains("scratch"),
+                          "layout: a flash made /system/services, utilities, shared and scratch"),
+        None    => { println!("files-test: FAIL - dir /system timeout"); fail += 1; }
+    }
+    match run!(b"dir /users\r", 10) {
+        Some(r) => check!(r.contains("default"), "layout: a flash made /users/default"),
+        None    => { println!("files-test: FAIL - dir /users timeout"); fail += 1; }
+    }
+    match run!(b"write notes.txt hi\r", 10) {
+        Some(r) => check!(r.contains("wrote /users/default/notes.txt"), "layout: a bare name is in the home folder"),
+        None    => { println!("files-test: FAIL - write notes.txt timeout"); fail += 1; }
+    }
+    match run!(b"write append notes.txt more\r", 10) {
+        Some(_) => {}
+        None    => { println!("files-test: FAIL - write append notes.txt timeout"); fail += 1; }
+    }
+    match run!(b"read notes.txt\r", 10) {
+        Some(r) => check!(r.contains("hi") && r.contains("more"), "layout: an append through the shell's scratch folder lands"),
+        None    => { println!("files-test: FAIL - read notes.txt timeout"); fail += 1; }
+    }
+    match run!(b"dir /system/scratch\r", 10) {
+        Some(r) => check!(r.contains("shell"), "layout: the shell made its own scratch folder at first use"),
+        None    => { println!("files-test: FAIL - dir /system/scratch timeout"); fail += 1; }
+    }
+    match run!(b"tree /\r", 15) {
+        Some(r) => check!(r.contains("system") && r.contains("services") && r.contains("users") && r.contains("default") && r.contains("notes.txt"),
+                          "layout: tree / shows the standard tree and the file in home"),
+        None    => { println!("files-test: FAIL - tree / timeout"); fail += 1; }
+    }
+    match run!(b"cd /system/services\r", 10) {
+        Some(r) => check!(r.contains("/system/services gsh"), "layout: the prompt follows cd"),
+        None    => { println!("files-test: FAIL - cd /system/services timeout"); fail += 1; }
+    }
+    match run!(b"cd\r", 10) {
+        Some(r) => check!(r.contains("/users/default gsh"), "layout: a bare cd goes home"),
+        None    => { println!("files-test: FAIL - bare cd timeout"); fail += 1; }
+    }
+    match run!(b"mkdir /system/scratch/a-rather-long-folder/and-deeper parents\r", 10) {
+        Some(r) => check!(r.contains("created"), "layout: a deep folder for the prompt"),
+        None    => { println!("files-test: FAIL - deep mkdir timeout"); fail += 1; }
+    }
+    match run!(b"cd /system/scratch/a-rather-long-folder/and-deeper\r", 10) {
+        Some(r) => {
+            let tail = r.rsplit('\n').next().unwrap_or("");
+            check!(tail.contains("...") && tail.contains("and-deeper gsh") && !tail.contains("/system/scratch/a-rather"),
+                   "layout: a long folder is shortened from the left in the prompt");
+        }
+        None    => { println!("files-test: FAIL - deep cd timeout"); fail += 1; }
+    }
+    match run!(b"cd .\r", 10) {
+        Some(r) => check!(r.contains("/system/scratch/a-rather-long-folder/and-deeper\r\n") || r.contains("/system/scratch/a-rather-long-folder/and-deeper\n"),
+                          "layout: cd . prints the whole path"),
+        None    => { println!("files-test: FAIL - cd . timeout"); fail += 1; }
+    }
+    match run!(b"cd\r", 10) {
+        Some(r) => check!(r.contains("/users/default gsh"), "layout: and home again"),
+        None    => { println!("files-test: FAIL - cd home timeout"); fail += 1; }
+    }
+    match run!(b"read /users/default/history\r", 10) {
+        Some(r) => check!(r.contains("write notes.txt hi"), "layout: history is kept in /users/default/history"),
+        None    => { println!("files-test: FAIL - read history timeout"); fail += 1; }
+    }
+    match run!(b"delete notes.txt\r", 10) {
+        Some(_) => {}
+        None    => { println!("files-test: FAIL - delete notes.txt timeout"); fail += 1; }
+    }
+    // The rest of this suite was written for a shell that started at the root.
+    let _ = run!(b"cd /\r", 10);
 
     // mkdir + write + dir + read (absolute paths).
     match run!(b"mkdir /docs\r", 10) {
@@ -5706,7 +5782,7 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
     // The disk is already formatted (drifted free count); fs auto-mounted it. Run the fsck.
     // **NOT an exact match, and the exactness is what made this test wrong.** `expect_free` is read
     // from the superblock BEFORE boot, but the running system creates files of its own on the way up
-    // - `/clock.last` (the `time` service's persisted floor) and `.gsh_history` - each taking a
+    // - `/system/services/time/floor` (the `time` service's persisted floor) and `.gsh_history` - each taking a
     // block. Both arrived after this test was written, so the pinned figure silently went stale and
     // the suite had been failing 4/1 on `main` with nobody looking: no gate that runs before a merge
     // includes the eleven fs suites. See `backlog/32`.
@@ -10423,7 +10499,7 @@ fn wav_blocks(path: &str) -> Vec<(u32, u32)> {
 /// `utilities/57_audio.md`; kills the driver over the control channel and checks the supervisor brings it
 /// back with the settings it had written; then quits QEMU cleanly and READS THE WAV: the tones must be
 /// there, at the frequency asked, at a level that follows the volume, and silent when muted. Boot 2 checks
-/// the volume came back from `/audio.settings` across a reboot.
+/// the volume came back from `/system/services/audio-driver/settings` across a reboot.
 pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     println!("audio-test: two boots on one disk; the shell on COM1, the control channel on COM2");
     let _ = std::fs::create_dir_all("build/tests");
@@ -10452,7 +10528,7 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     let log = |buf: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     check!(log(&buf).contains("audio-driver: ready - serving requests; playback refills on the stream's interrupt"),
         "the driver refills on its interrupt, not by polling");
-    check!(log(&buf).contains("no /audio.settings yet"), "a fresh disk starts at the defaults");
+    check!(log(&buf).contains("no /system/services/audio-driver/settings yet"), "a fresh disk starts at the defaults");
     // K2: the decoy at 00:06.1 is the first of the class, and the driver was granted the other one -
     // by the BDF the supervisor supplied, which now selects the window, the arena and the vector too.
     check!(log(&buf).contains("supplied for class 0x040300, the first of that class is 0x0031 - the supplied one is granted"),
@@ -10573,8 +10649,8 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(r.contains("stopped after"), "play: q stops the file (rule 11)");
     let r = run!(b"audio volume 30\r");
     check!(r.contains("volume 30 - verified"), "volume 30");
-    let r = run!(b"read /audio.settings\r");
-    check!(r.contains("volume 30") && r.contains("muted no"), "/audio.settings holds what was set");
+    let r = run!(b"read /system/services/audio-driver/settings\r");
+    check!(r.contains("volume 30") && r.contains("muted no"), "the driver's settings file holds what was set");
 
     // The driver killed: the kernel quiesces its DMA, the supervisor restarts it, and it reads its
     // settings back from the file it wrote.
@@ -10584,7 +10660,7 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
             send(&mut ctrl, b"\nKILL audio-driver\n");
             let back = collect_until(&buf, &mut cur, b"supervisor: audio-driver restarted", Duration::from_secs(30));
             check!(back.is_some(), "the supervisor restarted audio-driver after a kill");
-            let read = collect_until(&buf, &mut cur, b"settings read from /audio.settings - volume 30", Duration::from_secs(30));
+            let read = collect_until(&buf, &mut cur, b"settings read from /system/services/audio-driver/settings - volume 30", Duration::from_secs(30));
             check!(read.is_some(), "the restarted driver read its settings back");
             let _ = collect_until(&buf, &mut cur, b"audio-driver: ready", Duration::from_secs(30));
             check!(log(&buf).contains("bus-master DISABLED on driver death"), "the kernel stopped the controller's DMA on the death");
@@ -10668,7 +10744,7 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     let mut cur = 0usize;
     let booted = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(120)).is_some()
         && collect_until(&buf, &mut 0usize, b"audio-driver: ready", Duration::from_secs(60)).is_some();
-    check!(booted && log(&buf).contains("settings read from /audio.settings - volume 30, unmuted"),
+    check!(booted && log(&buf).contains("settings read from /system/services/audio-driver/settings - volume 30, unmuted"),
         "after a reboot the driver reads volume 30 back");
     send(&mut w, b"audio status\r");
     let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();

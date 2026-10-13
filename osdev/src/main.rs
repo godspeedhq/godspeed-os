@@ -267,6 +267,70 @@ fn format_superblock(path: &str) {
 
 fn cmd_mkfs(image: &str) {
     format_superblock(image);
+    gsfs_layout(image);
+}
+
+/// The standard tree `fs` lays down when it formats a disk (`services/fs`, `LAYOUT`;
+/// `docs/filesystem-layout.md`). Kept in step with that list by hand: it is five names.
+const FS_LAYOUT: [&str; 5] = ["system/services", "system/utilities", "system/shared", "system/scratch", "users/default"];
+
+/// Give a freshly formatted image the standard tree, as `drives flash` does on the machine. Only the
+/// operator-facing builders call it (`mkfs`, `script-disk`); the test fixtures keep the bare format, because
+/// several suites count the directories and records on the disk they built.
+fn gsfs_layout(path: &str) {
+    let mut data = std::fs::read(path)
+        .unwrap_or_else(|e| { eprintln!("layout: cannot read {}: {}", path, e); std::process::exit(1); });
+    let rdu = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    let total_blocks = rdu(&data, 16);
+    let bitmap_start = rdu(&data, 24) as usize;
+    let data_start = rdu(&data, 40);
+    let root = rdu(&data, 48);
+    let mut free_blocks = rdu(&data, 64);
+    for dir in FS_LAYOUT {
+        let mut cur = root;
+        for comp in dir.split('/') {
+            // An existing child of that name, or a new directory block for it.
+            let found = (0..FS_RECS_PER_BLOCK).find_map(|slot| {
+                let r = (cur as usize) * 512 + slot * 64;
+                let n = data[r + 1] as usize;
+                (data[r] == FS_ITYPE_DIR && &data[r + 2..r + 2 + n] == comp.as_bytes()).then(|| rdu(&data, r + 48))
+            });
+            cur = match found {
+                Some(b) => b,
+                None => {
+                    let blk = (data_start..total_blocks - 1)
+                        .find(|&b| data[bitmap_start * 512 + (b / 8) as usize] & (1u8 << (b % 8)) == 0)
+                        .unwrap_or_else(|| { eprintln!("layout: image full"); std::process::exit(1); });
+                    data[bitmap_start * 512 + (blk / 8) as usize] |= 1u8 << (blk % 8);
+                    free_blocks -= 1;
+                    let off = (blk as usize) * 512;
+                    for b in &mut data[off..off + 512] { *b = 0; }
+                    fs_dir_stamp_crc(&mut data[off..off + 512]);
+                    let pd = (cur as usize) * 512;
+                    let slot = (0..FS_RECS_PER_BLOCK).find(|&k| data[pd + k * 64] == 0)
+                        .unwrap_or_else(|| { eprintln!("layout: a directory is full"); std::process::exit(1); });
+                    let r = pd + slot * 64;
+                    data[r] = FS_ITYPE_DIR;
+                    data[r + 1] = comp.len() as u8;
+                    data[r + 2..r + 2 + comp.len()].copy_from_slice(comp.as_bytes());
+                    data[r + 40..r + 48].copy_from_slice(&0u64.to_le_bytes());
+                    data[r + 48..r + 56].copy_from_slice(&blk.to_le_bytes());
+                    data[r + 56..r + 64].copy_from_slice(&1u64.to_le_bytes());
+                    fs_dir_stamp_crc(&mut data[pd..pd + 512]);
+                    blk
+                }
+            };
+        }
+    }
+    data[64..72].copy_from_slice(&free_blocks.to_le_bytes());
+    let sb_crc = crc32::crc32(&data[..FS_SB_CRC_OFF]);
+    data[FS_SB_CRC_OFF..FS_SB_CRC_OFF + 4].copy_from_slice(&sb_crc.to_le_bytes());
+    let bk = ((total_blocks - 1) as usize) * 512;
+    let sb_copy: Vec<u8> = data[0..512].to_vec();
+    data[bk..bk + 512].copy_from_slice(&sb_copy);
+    std::fs::write(path, &data)
+        .unwrap_or_else(|e| { eprintln!("layout: cannot write {}: {}", path, e); std::process::exit(1); });
+    println!("layout: /{} into {}", FS_LAYOUT.join(", /"), path);
 }
 
 /// Bake a file into a GSFS0008 image (host-side mirror of the `fs` write path) - used to ship a
@@ -368,6 +432,7 @@ fn cmd_script_disk(out: &str, script: &str) {
     std::fs::write(out, vec![0u8; 16 * 1024 * 1024])
         .unwrap_or_else(|e| { eprintln!("script-disk: cannot create {}: {}", out, e); std::process::exit(1); });
     format_superblock(out);
+    gsfs_layout(out);
     gsfs_add_file(out, name, &content);
     println!("script-disk: {} ready - flash it to the data drive, then `run /{}`", out, name);
 }
@@ -2568,6 +2633,8 @@ fn run_script_test() {
     let disk = "build/tests/script_disk.img";
     std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("failed to create disk");
     format_superblock(disk);
+    // The tree a flash gives, because `selfcheck` checks it (part 50, "layout").
+    gsfs_layout(disk);
     gsfs_add_file(disk, name, &suite);
 
     crate::shell_test::run_script(&image_path, disk, name, 4);
@@ -2820,7 +2887,7 @@ fn run_peer_storm_test() {
 
 /// `osdev test audio` (`utilities/57_audio.md`, `docs/audio.md`): the `audio` utility, the driver behind it
 /// and the sound, on the bare-metal image with QEMU's HD Audio device and a data disk formatted here, so
-/// `/audio.settings` has somewhere to live from the first boot.
+/// `/system/services/<driver>/settings` has somewhere to live from the first boot.
 fn run_audio_test() {
     println!("
 === audio: the utility, the driver, and the sound it makes ===");

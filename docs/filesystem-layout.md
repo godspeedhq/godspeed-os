@@ -1,8 +1,13 @@
 # The filesystem layout, folder capabilities and users
 
-**Status: DESIGN, agreed 2026-10-13, not built.** Phase 1 (the layout) is the next work; phases 2 and 3
-are designed here so phase 1 does not paint them into a corner. Nothing below is implemented yet unless a
-section says otherwise.
+**Status: PHASE 1 BUILT 2026-10-13, QEMU-verified, hardware cards pending; phases 2 and 3 are design.**
+Phases 2 and 3 are designed here so phase 1 does not paint them into a corner. What phase 1 built, and
+the one thing it dropped (moving the old root files, section 4), is section 13. Sections 1 to 7 are the
+design as agreed; where the build differs, section 13 says so.
+
+**Phase 1 needs a reformat.** A disk formatted before it has none of the folders and its old root files
+are not moved: `drives flash` gives a disk the tree. The operator chose that over a migration, because
+every test disk is reflashed anyway (2026-10-13).
 
 **The rule this rests on:** a location expresses organisation, a capability expresses authority, and
 neither a pathname nor a user name grants anything by itself. GSFS keeps its tree and its rules in
@@ -322,3 +327,60 @@ Named L1-L10 so they are not confused with the constitution's invariants 1-12 (C
    protocol after an `fs` restart, each service granted only its own folder, and the CLAUDE.md amendment.
 3. **Phase 3, users and login.** Authentication, sessions, personal folders, programs started with less.
 4. **Phase 4**, only when package management or application spaces need it.
+
+---
+
+## 13. Phase 1 as built (2026-10-13)
+
+**What was built**, each piece where the design put it:
+
+- **`fs` lays down the tree when it formats** (`LAYOUT` and `make_layout` in `services/fs/src/main.rs`): the
+  five folders in one transaction after `format_into`, so a power cut leaves all of them or none. A disk
+  that formatted but could not take the tree is reported as a failed flash. `osdev mkfs` and
+  `osdev script-disk` write the same tree host-side (`gsfs_layout`); the test fixtures keep the bare
+  format, because several suites count what is on the disk they built.
+- **Each owner makes its own folder before it writes**: the WiFi keys and the radio choice
+  (`godspeed_wifi::keyfile::make_dir`, used by both radio drivers and the shell), the clock floor (`time`,
+  a `MkdirP` sent ahead of each write), the audio settings (`sdk/audio`'s `Place`, per driver), and the
+  sticky capture record (the shell).
+- **The paths:**
+
+| Was | Is |
+|---|---|
+| `/wifi.keys`, `/wifi.radio` | `/system/shared/wifi/keys`, `/system/shared/wifi/radio` |
+| `/clock.last` | `/system/services/time/floor` |
+| `/audio.settings` | `/system/services/audio-driver/settings`, `/system/services/pwm-audio/settings` |
+| `/persist.conf` | `/system/services/events/sticky` |
+| `/.gsh_history` | `/users/default/history` |
+| `/.write.tmp`, `/.edit.tmp`, `/.fcap-*`, `/.fl<id>~` | `/system/scratch/shell/` |
+
+- **The shell starts at `/users/default`**, without asking `fs` anything - the prompt must come up at once,
+  and a home that is missing is said by the first command that uses it. A bare `cd` goes home; `cd .`
+  prints the whole path; the prompt is `<folder> gsh> `, shortened from the left past 32 characters.
+- **The shell's scratch** is emptied and made at its first use in a session (`ensure_scratch`), not at
+  start, for the same reason the start touches no disk.
+
+**What was dropped: moving the old files (section 4).** Nothing reads the old root files any more and
+nothing moves them; a disk keeps them as ordinary files until somebody deletes them. Section 4 stays as the
+design should a migration ever be wanted - for instance a disk whose files cannot be lost to a reformat.
+
+**Where it differs from the design:**
+
+- **`$home` is a script word only.** It is reserved beside `$args` and `$self` (`let home = ...` is
+  refused), but a line typed at the prompt is not expanded - variables are a script feature, and the
+  prompt is not a script. At the prompt, plain `cd` goes home.
+- **`/sc`, the self-check's own folder, stays at the root.** It is test data written by the operator's
+  command, so it is the operator's, and moving it changes nothing the layout is for.
+
+**Verified in QEMU (2026-10-13):** `osdev test files` 266 passed, 0 failed, fourteen of them the layout's
+own checks: the tree after a flash, a bare name landing in the home folder, an append through the scratch
+folder, `tree /`, the prompt following `cd`, a bare `cd` going home, a long folder shortened in the prompt,
+`cd .`, and history in `/users/default/history`. The embedded `selfcheck` ran 592, failed 0, with a layout
+part of its own (the script suite, 11/0). `shell` 272/0 (2 skipped, no EHCI), `file-cap` 16/0, `fs-restart`
+11/0, `edit` 15/0, `audio` 69/0. On the Pi 2 and RISC-V `virt` a USB stick flashed with `drives flash` showed
+the same tree; on the Pi 4 QEMU has no xHCI, so only the prompt (`/users/default gsh> `) and the honest
+`cd: storage unavailable` were seen. One defect was found on the way and fixed: `for line in (...)` wrote its
+temp file into the scratch folder without making it first, and `selfcheck` failed three statements until it did.
+
+**Hardware cards pending:** every board's data disk is reflashed with `drives flash`, then `tree /` and
+`selfcheck`.

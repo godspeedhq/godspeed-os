@@ -11,5 +11,5 @@ path = "src/main.rs"
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
 godspeed = { path = "../../stdlib/rust" }
-# The request protocol, the test tone and `/audio.settings`, shared with `audio-driver` (sdk/audio).
+# The request protocol, the test tone and `/system/services/<driver>/settings`, shared with `audio-driver` (sdk/audio).
 godspeed-audio = { path = "../../sdk/audio" }

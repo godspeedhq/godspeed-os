@@ -22,5 +22,5 @@ core = 2
 hw_device   = "audio_pwm"
 ipc_receive = ["pwm-audio"]
 log_write   = true
-# `fs` - one peer, for one file: `/audio.settings`, the volume and the mute kept across a restart.
+# `fs` - one peer, for one file: `/system/services/pwm-audio/settings`, the volume and the mute kept across a restart.
 ipc_send    = ["fs"]

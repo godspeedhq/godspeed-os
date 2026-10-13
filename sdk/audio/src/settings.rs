@@ -1,17 +1,53 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! `/audio.settings`: the volume, the mute and the output, kept across a restart (`utilities/57_audio.md`), written
-//! once for every audio driver - the HD Audio driver on x86 and the PWM jack driver on the Pis keep the
-//! same file in the same words.
+//! A driver's `settings` file: the volume, the mute and the output, kept across a restart
+//! (`utilities/57_audio.md`), written once for every audio driver - the HD Audio driver on x86 and the PWM
+//! jack driver on the Pis keep the same file in the same words, each in its own folder
+//! (`/system/services/<driver>/settings`, `docs/filesystem-layout.md`).
 
 use godspeed as gs;
 use godspeed::driver::delay;
 use godspeed::driver::wait::Budget;
 use godspeed_sdk::ServiceContext;
 
-/// Where the volume and the mute are kept (`utilities/57_audio.md`). Plain labelled lines, readable with
-/// `read /audio.settings`. The driver owns the file: it reads it once when it comes up and writes it after
-/// a change. `on` and `off` are deliberately NOT kept - audio comes up on at every boot.
-pub const SETTINGS_PATH: &str = "/audio.settings";
+/// Where the volume and the mute are kept (`utilities/57_audio.md`): `/system/services/<driver>/settings`,
+/// in plain labelled lines, readable with `read`. The driver owns the file and its folder: it reads the
+/// file once when it comes up, and creates the folder and writes the file after a change. `on` and `off`
+/// are deliberately NOT kept - audio comes up on at every boot.
+pub struct Place {
+    buf: [u8; PLACE_MAX],
+    dir_len: usize,
+    len: usize,
+}
+
+const PLACE_MAX: usize = 64;
+const SERVICES: &str = "/system/services/";
+const FILE: &str = "/settings";
+
+impl Place {
+    /// The folder and file of the driver named `who`. A name too long for the bound gives an empty path,
+    /// which `fs` refuses loudly rather than a cut name writing somewhere else.
+    pub fn of(who: &str) -> Place {
+        let mut p = Place { buf: [0; PLACE_MAX], dir_len: 0, len: 0 };
+        if SERVICES.len() + who.len() + FILE.len() > PLACE_MAX {
+            return p;
+        }
+        let mut n = 0;
+        for part in [SERVICES, who] {
+            p.buf[n..n + part.len()].copy_from_slice(part.as_bytes());
+            n += part.len();
+        }
+        p.dir_len = n;
+        p.buf[n..n + FILE.len()].copy_from_slice(FILE.as_bytes());
+        p.len = n + FILE.len();
+        p
+    }
+    pub fn dir(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.dir_len]).unwrap_or("")
+    }
+    pub fn file(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
 /// The whole file is read in one piece into this many bytes. Two lines need about twenty; a file larger
 /// than this is not one this driver wrote, and is ignored with a line rather than half-read.
 const SETTINGS_MAX: usize = 256;
@@ -41,12 +77,14 @@ pub struct Settings {
 /// also what reacquires `fs` by name when it restarts (Commandment IX).
 pub fn load(ctx: &ServiceContext, fs: &mut gs::fs::Fs, who: &str, default_volume: u8) -> Option<Settings> {
     use gs::Error;
+    let place = Place::of(who);
+    let path = place.file();
     for attempt in 1..=SETTINGS_TRIES {
         let mut buf = [0u8; SETTINGS_MAX];
-        match fs.read_into(SETTINGS_PATH, &mut buf) {
-            Ok(n) => return parse(ctx, who, &buf[..n], default_volume),
+        match fs.read_into(path, &mut buf) {
+            Ok(n) => return parse(ctx, who, path, &buf[..n], default_volume),
             Err(Error::NotFound) => {
-                ctx.log_fmt(format_args!("{}: no /audio.settings yet - starting at the defaults; it is written at the first change", who));
+                ctx.log_fmt(format_args!("{}: no {} yet - starting at the defaults; it is written at the first change", who, path));
                 return None;
             }
             Err(Error::NoFilesystem) => {
@@ -55,8 +93,8 @@ pub fn load(ctx: &ServiceContext, fs: &mut gs::fs::Fs, who: &str, default_volume
             }
             Err(Error::BufferTooSmall) => {
                 ctx.log_fmt(format_args!(
-                    "{}: /audio.settings is larger than {} bytes - not a file this driver wrote; ignored, starting at the defaults",
-                    who, SETTINGS_MAX));
+                    "{}: {} is larger than {} bytes - not a file this driver wrote; ignored, starting at the defaults",
+                    who, path, SETTINGS_MAX));
                 return None;
             }
             Err(e) if attempt < SETTINGS_TRIES && e.retry_is_safe() => {
@@ -64,8 +102,8 @@ pub fn load(ctx: &ServiceContext, fs: &mut gs::fs::Fs, who: &str, default_volume
             }
             Err(e) => {
                 ctx.log_fmt(format_args!(
-                    "{}: could not read /audio.settings ({}) after {} attempt(s) - starting at the defaults",
-                    who, e.as_str(), attempt));
+                    "{}: could not read {} ({}) after {} attempt(s) - starting at the defaults",
+                    who, path, e.as_str(), attempt));
                 return None;
             }
         }
@@ -75,7 +113,7 @@ pub fn load(ctx: &ServiceContext, fs: &mut gs::fs::Fs, who: &str, default_volume
 
 /// `volume N`, `muted yes|no`, `output <name>` and `system sounds on|off`, one per line. A line this driver does not know is ignored and said once;
 /// a value out of range keeps the default for that setting and is said too.
-fn parse(ctx: &ServiceContext, who: &str, text: &[u8], default_volume: u8) -> Option<Settings> {
+fn parse(ctx: &ServiceContext, who: &str, path: &str, text: &[u8], default_volume: u8) -> Option<Settings> {
     let mut s = Settings { volume: default_volume, muted: false, output: None, system_sounds: true };
     let mut ignored = 0u32;
     for line in text.split(|&b| b == b'\n') {
@@ -101,10 +139,10 @@ fn parse(ctx: &ServiceContext, who: &str, text: &[u8], default_volume: u8) -> Op
         }
     }
     if ignored > 0 {
-        ctx.log_fmt(format_args!("{}: /audio.settings has {} line(s) this driver does not understand - ignored", who, ignored));
+        ctx.log_fmt(format_args!("{}: {} has {} line(s) this driver does not understand - ignored", who, path, ignored));
     }
     ctx.log_fmt(format_args!(
-        "{}: settings read from /audio.settings - volume {}, {}{}{}", who, s.volume,
+        "{}: settings read from {} - volume {}, {}{}{}", who, path, s.volume,
         if s.muted { "muted" } else { "unmuted" }, if s.output.is_some() { ", output " } else { "" },
         s.output.map_or("", |d| crate::wire::device_name(d as u32))));
     Some(s)
@@ -131,10 +169,11 @@ impl core::fmt::Write for Line {
     }
 }
 
-/// Write the settings through the driver's `fs` handle (see [`load`]). A failure is returned for the caller
-/// to report; `OutcomeUnknown` means the file may or may not hold them, and is never re-sent as though it
-/// had not happened.
-pub fn save(fs: &mut gs::fs::Fs, s: Settings) -> Result<(), gs::Error> {
+/// Write the settings through the driver's `fs` handle (see [`load`]), creating the driver's folder first
+/// (a folder is made by its owner at first use). A failure is returned for the caller to report;
+/// `OutcomeUnknown` means the file may or may not hold them, and is never re-sent as though it had not
+/// happened.
+pub fn save(fs: &mut gs::fs::Fs, who: &str, s: Settings) -> Result<(), gs::Error> {
     use core::fmt::Write;
     let mut l = Line { buf: [0; 96], len: 0, overflow: false };
     let _ = write!(l, "volume {}\nmuted {}\n", s.volume, if s.muted { "yes" } else { "no" });
@@ -147,6 +186,8 @@ pub fn save(fs: &mut gs::fs::Fs, s: Settings) -> Result<(), gs::Error> {
     if l.overflow {
         return Err(gs::Error::InvalidInput);
     }
-    fs.write(SETTINGS_PATH, &l.buf[..l.len])
+    let place = Place::of(who);
+    fs.create_dir_all(place.dir())?;
+    fs.write(place.file(), &l.buf[..l.len])
 }
 

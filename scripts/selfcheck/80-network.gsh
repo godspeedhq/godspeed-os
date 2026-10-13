@@ -36,7 +36,7 @@ assert fails wifi radio sideways
 assert fails wifi nonsense
 # THE PASSPHRASE MUST NOT BE ACCEPTED AS AN ARGUMENT. This is the assertion that defends a security
 # decision rather than a behaviour: a passphrase on the command line is recalled by up-arrow and
-# written to /.gsh_history, so `join` takes an SSID and nothing else. If this ever starts passing,
+# written to /users/default/history, so `join` takes an SSID and nothing else. If this ever starts passing,
 # somebody has added a convenience that leaks a secret to disk.
 assert fails wifi join SomeSSID hunter2
 # And the radio itself, reported rather than asserted (see the note above). Under `if`, so its words

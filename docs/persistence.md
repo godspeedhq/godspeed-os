@@ -1019,7 +1019,7 @@ back-fills a missing time** - the first write to an old directory block stamps a
 and zero *is* `TIME_UNKNOWN`, so old entries keep reading as unknown while new ones carry real times.
 
 The clock behind it is the `time` service, which owns the wall clock, sets it from SNTP and persists a
-floor across reboots (`/clock.last`); a file stamped on a machine that has never seen the network gets
+floor across reboots (`/system/services/time/floor`); a file stamped on a machine that has never seen the network gets
 the floor rather than zero, and the floor only moves forward.
 
 **SEALED - content frozen, permanently.** A sealed file can be read, listed, renamed, moved and

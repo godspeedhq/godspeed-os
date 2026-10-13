@@ -728,13 +728,13 @@ SpawnImage               = 52
 "asker" = ["peer:reply-server"]
 # audio-driver: its HD Audio controller, WITH an interrupt (docs/audio.md, "Interrupt-driven refill"):
 # the stream interrupts as each period plays and the driver refills then. The kernel picks the vector.
-# peer:fs - `/audio.settings`, the volume and the mute kept across a restart (utilities/57_audio.md).
+# peer:fs - `/system/services/audio-driver/settings`, the volume and the mute kept across a restart (utilities/57_audio.md).
 "audio-driver" = ["hw:pci_irq", "peer:fs"]
 # pwm-audio: the Pis' 3.5 mm jack (docs/audio.md, "The Pis"). hw:AUDIO_PWM - the PWM block and the DMA
 # engine's page, mapped side by side, and a DMA arena; the kernel routes the jack's pins and starts the
 # PWM clock as part of the grant (CLAUDE.md 12.3). The DMA page holds every channel: more than the
 # driver needs, recorded in docs/audio.md, and no more reach than an unconfined driver has on these
-# boards. peer:fs - `/audio.settings`, the volume and the mute kept across a restart.
+# boards. peer:fs - `/system/services/pwm-audio/settings`, the volume and the mute kept across a restart.
 "pwm-audio" = ["hw:AUDIO_PWM", "peer:fs"]
 "block-driver" = ["hw:pci", "peer:dwc2", "peer:events", "peer:xhci"]
 # examples/cap-grant, examples-test build only. ACQUIRE_ANY so its lookup of "receiver" reaches the
@@ -784,7 +784,7 @@ SpawnImage               = 52
 # device KIND since 2026-10-03 (they were granted by NAME before, so the pin did not see them).
 "wifi-driver" = ["hw:WIFI_SDIO", "peer:fs", "peer:power"]
 # wifi-usb: peer:dwc2 - the USB host that bound the dongle and answers `usbfn` for it. peer:fs (R4,
-# 2026-10-06) - `/wifi.keys`, which the serve loop every radio shares (`godspeed_wifi::serve`) loads and
+# 2026-10-06) - `/system/shared/wifi/keys`, which the serve loop every radio shares (`godspeed_wifi::serve`) loads and
 # writes; the same grant wifi-driver carries for the same reason, now that both run that loop.
 # peer:xhci (U2a, 2026-10-06) - the same host role on the boards where `xhci` binds the dongle; one of the
 # two per board (`board::WIFI_USB_PEERS`), and `xhci` answers for that one device only, as `dwc2` does.

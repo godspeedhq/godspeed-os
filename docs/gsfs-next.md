@@ -207,7 +207,7 @@ What is recorded, and why it is the minimum:
 every read into a transaction. The cost is real and the value is low; it is refused on purpose.
 
 **The clock is now good enough for this, and was not before.** The `time` service owns the wall clock,
-sets it from SNTP, and persists a floor across reboots (`/clock.last`). A file stamped on a machine
+sets it from SNTP, and persists a floor across reboots (`/system/services/time/floor`). A file stamped on a machine
 that has never seen the network gets the floor, not zero, and the floor only moves forward.
 
 **Migration, and the version number this section used to claim.** A volume written before times
