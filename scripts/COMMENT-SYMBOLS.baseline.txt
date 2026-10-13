@@ -94,7 +94,7 @@ dwc2_update_urb_state_abn          # Linux drivers/usb/dwc2/hcd_intr.c, same cit
 IEEE80211_MAX_FRAME_LEN            # Linux include/linux/ieee80211.h (2352), cited by usbfn::BULK_IN_MAX for the size of one unaggregated receive (R3b) - external, 26.14
 hub_activate                       # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
 hub_is_superspeed                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
-hub_port_connect                   # Linux usbcore (drivers/usb/core/hub.c), cited by xhci for how Linux power-cycles and frees a port whose device will not enumerate (backlog/83) - external, 26.14
+hub_port_connect                   # Linux usbcore (drivers/usb/core/hub.c), cited by xhci for how Linux power-cycles and frees a port whose device will not enumerate (backlog/fixed/83) - external, 26.14
 hub_port_debounce                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by dwc2 for the attach debounce and the port reset bound (docs/wifi-usb.md 46) - external, 26.14
 hub_port_reset                     # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
 rtl8xxxu_parse_usb                 # Linux rtl8xxxu_core.c, cited by dwc2 rtl::bulk_in for taking the one bulk IN endpoint (R3b) - external, 26.14
@@ -170,7 +170,7 @@ umac_sw_rst
 unconditional_panic
 usb_125m
 usb_hub_clear_tt_buffer
-usb_hub_set_port_power             # Linux usbcore (drivers/usb/core/hub.c), cited by xhci for how Linux power-cycles and frees a port whose device will not enumerate (backlog/83) - external, 26.14
+usb_hub_set_port_power             # Linux usbcore (drivers/usb/core/hub.c), cited by xhci for how Linux power-cycles and frees a port whose device will not enumerate (backlog/fixed/83) - external, 26.14
 vout_axi
 vs_dc_enable
 yt8531_link_change_notify

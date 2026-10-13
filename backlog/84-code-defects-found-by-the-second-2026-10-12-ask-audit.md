@@ -8,7 +8,7 @@ gen that no restart can repeat comes from on a machine whose counter is uncalibr
 *Was:* OPEN, 2026-10-12. The second audit of `feat/ask` covered everything after `9ce5c479` and
 changed documents and comments only. The code defects it found are listed here, to be fixed separately,
 as for `backlog/fixed/80` and `backlog/82`. The defects it found in the uncommitted `xhci` hub cut
-(`backlog/83`) are not here: that work is fixed before it is committed.
+(`backlog/fixed/83`) are not here: that work is fixed before it is committed.
 
 ## The counter and the binding gen
 

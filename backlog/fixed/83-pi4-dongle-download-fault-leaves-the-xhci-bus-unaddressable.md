@@ -1,6 +1,15 @@
 # 83. Pi 4: the dongle's firmware-download fault leaves the bus behind the hub unaddressable, disk included
 
-**Status: OPEN, 2026-10-12; the hub cut is built and ran on the card 2026-10-13** - bounded and safe for
+**Status: CLOSED 2026-10-13, by the operator's decision.** The download fault itself is not pursued: the
+dongle works on the Pi 2 and the PCs, and the Pi 4 and the VisionFive have onboard radios, so nobody needs
+it there. What this entry was really about - one device's fault reaching every device on the hub - is
+fixed in `xhci` (built 2026-10-13, to be seen on the Pi 4 card): a dongle whose control endpoint cannot
+be repaired is CONTAINED to its port (`contain_radio`: its slot released, it is left alone, and nothing
+else is re-scanned or reset), where
+it used to trigger a re-scan of the whole bus. The power cut stays, bounded and harmless; on this hub
+it does not take VBUS off (*The replug*, below). The entry as it stood:
+
+*Was:* OPEN, 2026-10-12; the hub cut is built and ran on the card 2026-10-13 - bounded and safe for
 the disk, and it did not revive the dongle (*The card*, below). Seen on the Pi 4 at `ce7feea2` (`feat/ask`). Not caused by that branch's
 changes: none touches `xhci`'s control-transfer, repair or walk paths. `docs/wifi-usb.md` 52 has the run.
 

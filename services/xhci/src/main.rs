@@ -721,7 +721,7 @@ const PORT_POWER_SETTLE_MS: u64 = 200;
 /// this one reports 100). Paid once per wedge.
 const HUB_CUT_OFF_MS: u64 = 1000;
 
-/// A hub's ports cut and powered again, for a device behind it that no port reset revives (backlog/83).
+/// A hub's ports cut and powered again, for a device behind it that no port reset revives (backlog/fixed/83).
 /// A walk that finds such a device asks for it; the re-scan's walk of that hub does it before addressing
 /// anything; a walk of THAT hub in which every connected port was tried and answered ends the episode.
 /// Kept per hub, by its root port: a second hub walking clean says nothing about the first.
@@ -935,6 +935,54 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
         }
         gs::task::sleep_ms(ctx, IDLE_WAIT_MS);
     }
+}
+
+/// THE DONGLE'S FAULT STAYS AT ITS PORT. Its control endpoint failed and could not be repaired: release
+/// its slot, and leave it alone until it leaves its port or this service restarts.
+///
+/// This used to re-scan the bus. Every re-scan resets the hub the dongle is behind, so one device's fault
+/// dropped the disk and the keyboard with it, and on the Pi 4 the dongle failed its firmware download
+/// again on every pass, which resets them again (backlog/fixed/83). A device that does not answer has
+/// nothing to gain from its neighbours being reset: the rescans of 2026-10-12 and 13 revived it in none
+/// of dozens of passes, and an unplug and replug revived it twice in two tries. Nothing else is touched
+/// here - every other slot, binding and ring stays as it is.
+///
+/// - Disable Slot: the controller schedules nothing more for it.
+/// - On a root port, the port is disabled too (`PORT_PED` is write-1-to-clear; the change bits are
+///   written 0 so none is lost). Behind a hub, the hub's port is left enabled: clearing it is a control
+///   transfer on the hub's EP0, whose ring the HID probes share and track, and with the device's slot
+///   gone nothing reaches it anyway. The port is marked tried, so the hub watchdog does not take a
+///   still-connected dongle for a new arrival; it reading empty, an unplug, clears that as for any port.
+/// - Reported gone, as an unplug is: the supervisor stops its driver, and `wifi-usb` is told.
+///
+/// Retried by unplugging it and plugging it in again, which the watchdog sees as an arrival, or by
+/// `kill xhci`.
+#[allow(clippy::too_many_arguments)]
+fn contain_radio(
+    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, op: usize, dboff: usize, ir0: usize,
+    radio: &mut Option<radio::Radio>, hub_tried: &mut u64,
+    ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
+) {
+    let Some(r) = radio.take() else { return };
+    disable_slot(ctx, dma, mmio, dboff, ir0, r.slot, ev_idx, ev_cycle, cmd_idx);
+    if r.hub_slot == 0 {
+        let off = op + OP_PORTSC_BASE + (r.port as usize - 1) * 0x10;
+        let v = mmio.read32(off);
+        mmio.write32(off, (v & !PORT_RW1C & !PORT_PR) | PORT_PED);
+    } else if r.hub_port < 64 {
+        *hub_tried |= 1u64 << r.hub_port;
+    }
+    if r.hub_slot == 0 {
+        ctx.log_fmt(format_args!(
+            "xhci: the WiFi dongle on root port {} (slot {}) does not answer on its control endpoint - its slot released and its port disabled; nothing else is reset. Unplug it and plug it in again to retry it",
+            r.port, r.slot));
+    } else {
+        ctx.log_fmt(format_args!(
+            "xhci: the WiFi dongle behind hub slot {} port {} (slot {}) does not answer on its control endpoint - its slot released and the port left alone; nothing else is reset. Unplug it and plug it in again to retry it",
+            r.hub_slot, r.hub_port, r.slot));
+    }
+    radio::announce(ctx, None);
+    notify(ctx, "WiFi dongle stopped answering - left alone (xhci)");
 }
 
 /// Print a hot-plug notice on the console, then nudge the shell to redraw its
@@ -3126,7 +3174,7 @@ fn enumerate_one(
             "xhci: Set Hub Depth 0 on the SuperSpeed hub on port {} - {}",
             port, if ok { "OK" } else { "FAILED (its downstream ports may not route)" }));
     }
-    // THE COLD START a previous walk asked for (`HubCut`, backlog/83): cut the power, let it drain, and
+    // THE COLD START a previous walk asked for (`HubCut`, backlog/fixed/83): cut the power, let it drain, and
     // fall through to the power-on below, which every walk does anyway. Done here, before anything on this
     // hub is addressed, so nothing bound this pass is cut from under it, and where the EP0 ring has room.
     if hub_cut.wanted == port {
@@ -3514,7 +3562,7 @@ fn enumerate_one(
                     "xhci: hub port {} connected but downstream Address Device FAILED (route/TT)",
                     dp
                 ));
-                // DIAGNOSTIC (2026-10-12, backlog/83): the hub's state when one of its ports cannot be
+                // DIAGNOSTIC (2026-10-12, backlog/fixed/83): the hub's state when one of its ports cannot be
                 // addressed - the port before and after its reset, the port now, and the hub's own slot
                 // and EP0 as the controller holds them. Says whether the hub, the port or the controller
                 // is in the wrong state after the dongle's download fault.
@@ -3561,7 +3609,7 @@ fn enumerate_one(
             }
         }
     }
-    // A DEVICE THAT NO PORT RESET REVIVES (backlog/83): the RTL8188CUS after a failed firmware download
+    // A DEVICE THAT NO PORT RESET REVIVES (backlog/fixed/83): the RTL8188CUS after a failed firmware download
     // enables at its port and never answers SET_ADDRESS again, re-scan after re-scan, and the disk beside
     // it stopped answering too. A port reset does not reach it; losing its power is expected to, as
     // unplugging it does (not yet seen on hardware). So the next walk starts from cold - this hub's failed ports, or every port where
@@ -3776,7 +3824,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // an already-bound keyboard nor livelock the re-init. One bit per root port (max_ports <= 63 on real
     // HW; a port >= 64 simply is not poison-tracked, never poison-halted).
     let mut poisoned: u64 = 0;
-    // The hub cold start (backlog/83), above `'reenum` for the reason `poisoned` is.
+    // The hub cold start (backlog/fixed/83), above `'reenum` for the reason `poisoned` is.
     let mut hub_cut = HubCut { spent: 0, made: 0, wanted: 0, ports: 0, rescan: false, cold: None };
     // Attempts a root port gets to enumerate before it is poisoned, spent WITHIN one pass.
     //
@@ -4987,8 +5035,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
                 match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
                     radio::Served::Reenumerate => {
-                        ctx.log("xhci: the WiFi dongle's control endpoint could not be repaired - re-scanning (unplugged?)");
-                        continue 'reenum;
+                        // Contained to its port, not a re-scan (`contain_radio`).
+                        contain_radio(&ctx, &dma, &mmio, op, dboff, ir0, &mut radio, &mut hub_tried,
+                                      &mut ev_idx, &mut ev_cycle, &mut cmd_idx);
+                        radio_was_bound = Some(None);
+                        radio_absent_seen = 0;
                     }
                     radio::Served::Done => {}
                     radio::Served::NotOurs => {
@@ -5049,8 +5100,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
                 match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
                     radio::Served::Reenumerate => {
-                        ctx.log("xhci: the WiFi dongle's control endpoint could not be repaired - re-scanning (unplugged?)");
-                        continue 'reenum;
+                        // Contained to its port, not a re-scan (`contain_radio`).
+                        contain_radio(&ctx, &dma, &mmio, op, dboff, ir0, &mut radio, &mut hub_tried,
+                                      &mut ev_idx, &mut ev_cycle, &mut cmd_idx);
+                        radio_was_bound = Some(None);
+                        radio_absent_seen = 0;
                     }
                     radio::Served::Done => {}
                     radio::Served::NotOurs => {

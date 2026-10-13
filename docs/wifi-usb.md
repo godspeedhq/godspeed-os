@@ -3126,4 +3126,4 @@ that had just left the network, because `/wifi.radio` removed makes both radios 
 **The download fault (sections 27, 33) again, in 6 of 9 bring-ups.** And once it was worse than recorded:
 after `kill all-services` the dongle's download failed, and for over three minutes every re-scan failed
 Address Device on hub ports 1 and 2 (the disk's port among them), so the run ended with no disk. Recorded
-as `backlog/83`, with what the gen change does and does not have to do with it.
+as `backlog/fixed/83`, with what the gen change does and does not have to do with it.

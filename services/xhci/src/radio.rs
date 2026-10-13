@@ -387,7 +387,7 @@ fn ep0_state(hc: &Hc, r: &Radio) -> u32 {
 }
 
 /// `OP_CONTROL` / `OP_CONTROL_ONCE`, as `dwc2` answers them: `p` is `[op, setup(8), data out...]`, the
-/// reply `[op, status, data in...]` into `out`. `Err(())` asks the caller to re-enumerate: the endpoint
+/// reply `[op, status, data in...]` into `out`. `Err(())` asks the caller to contain the dongle (`contain_radio`): the endpoint
 /// could not be repaired.
 #[allow(clippy::too_many_arguments)]
 fn control(
@@ -463,7 +463,8 @@ pub enum Served {
     NotOurs,
     /// Answered (or, for `OP_SYNC`, deliberately not).
     Done,
-    /// Answered `ST_FAILED`, and the dongle's EP0 could not be repaired: re-enumerate.
+    /// Answered `ST_FAILED`, and the dongle's EP0 could not be repaired: the caller contains it to its port
+    /// (`contain_radio`), leaving every other device as it is. The name is older than that.
     Reenumerate,
 }
 
