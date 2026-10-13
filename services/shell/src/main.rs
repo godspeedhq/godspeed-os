@@ -7778,15 +7778,15 @@ fn hw_running(ctx: &ServiceContext, name: &str) -> &'static str {
 
 /// Ask, bounded: `request_within` sends again once if the first send failed on a stale capability, and
 /// never repeats a question that timed out. Any failure is no answer.
-fn hw_ask(ctx: &ServiceContext, peer: &str, body: &[u8]) -> Option<Message> {
+fn hw_ask(ctx: &ShellCtx, peer: &str, body: &[u8]) -> Option<Message> {
     const ANSWER_SECS: i64 = 2;
-    gs::call::request_within(ctx, peer, &Message::from_bytes(body), ANSWER_SECS).ok()
+    gs::call::request_watched(ctx, peer, &Message::from_bytes(body), ANSWER_SECS, ctx).ok()
 }
 
 /// Gather every row from its owner. `#[inline(never)]`: the facts are a few KiB, kept off every other
 /// command's frame.
 #[inline(never)]
-fn hw_gather(ctx: &ServiceContext, f: &mut HwFacts) {
+fn hw_gather(ctx: &ShellCtx, f: &mut HwFacts) {
     use godspeed_sdk::service_context::{hwclass, supcmd};
     f.n = 0;
     f.cores = ctx.inspect_core_count();
@@ -8191,7 +8191,7 @@ fn hw_print(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8, explicit
 /// asked for (the supervisor's device word), and what the device itself says it was given (its live
 /// configuration space - the BARs and the interrupt route the kernel programmed). The grant's addresses
 /// as the kernel recorded them are not reported by the kernel, and the view says where they were logged.
-fn hw_device(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
+fn hw_device(ctx: &ShellCtx, out: &mut Out, r: &HwRow) {
     out.line_fmt(ctx, format_args!("device     {}", r.device.as_str()));
     out.line_fmt(ctx, format_args!("section    {}", r.section));
     out.line_fmt(ctx, format_args!("kind       {}", r.kind.as_str()));
@@ -8275,7 +8275,7 @@ fn hw_authority(ctx: &ServiceContext, out: &mut Out, r: &HwRow, name: &str) {
 }
 
 /// The device's configuration space, read now by `hw-enumerator` (its op 4).
-fn hw_config(ctx: &ServiceContext, idx: u8) -> Option<[u8; 256]> {
+fn hw_config(ctx: &ShellCtx, idx: u8) -> Option<[u8; 256]> {
     let m = hw_ask(ctx, "hw-enumerator", &[4, idx])?;
     let p = m.payload_bytes();
     if p.len() < 4 + 256 { return None; }
@@ -8382,7 +8382,7 @@ fn hw_irq_route(c: &[u8; 256]) -> HwText<96> {
 }
 
 /// `hardware <device> debug`: the device as the hardware sees it, read now.
-fn hw_debug(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
+fn hw_debug(ctx: &ShellCtx, out: &mut Out, r: &HwRow) {
     if r.section == "cpu" || r.section == "memory" {
         hw_cpu_debug(ctx, out);
         return;
@@ -8440,7 +8440,7 @@ fn hw_cpu_debug(ctx: &ServiceContext, out: &mut Out) {
 }
 
 /// `hardware <section> debug`.
-fn hw_section_debug(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8) {
+fn hw_section_debug(ctx: &ShellCtx, out: &mut Out, f: &HwFacts, mask: u8) {
     let mut cores_done = false;
     for (i, sec) in HW_SECTIONS.iter().enumerate() {
         if mask & (1 << i) == 0 { continue; }
@@ -8460,7 +8460,7 @@ fn hw_section_debug(ctx: &ServiceContext, out: &mut Out, f: &HwFacts, mask: u8) 
 
 /// `hardware interrupts`: how each PCI device interrupts, from its configuration space, with the
 /// service that drives it. How OFTEN each fires is not counted by the kernel, and the view says so.
-fn hw_interrupts(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+fn hw_interrupts(ctx: &ShellCtx, out: &mut Out, f: &HwFacts) {
     if !f.pci_bus {
         out.line(ctx, "interrupts: no PCI bus the OS can read - a SoC device's interrupt is its driver's to report");
         return;
@@ -8482,7 +8482,7 @@ fn hw_interrupts(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
 /// `hardware why <device>`: why a device is handled the way it is - who drives it and why it was given
 /// to that service, from the same decisions the overview shows, and the reason the supervisor keeps
 /// beside the spawn row (`supcmd::WHY`).
-fn hw_why(ctx: &ServiceContext, out: &mut Out, r: &HwRow) {
+fn hw_why(ctx: &ShellCtx, out: &mut Out, r: &HwRow) {
     use godspeed_sdk::service_context::{hwclass, supcmd};
     let dev = r.device.as_str();
     let name = r.driver.as_str();
@@ -8581,7 +8581,7 @@ fn hw_grid(ctx: &ServiceContext, out: &mut Out, t: &Table, empty: &str) {
 /// `detail`. What only the kernel could tell - IOMMU faults, interrupt counts - is not checked, and the
 /// view says so rather than reporting a clean machine it did not look at.
 #[inline(never)]
-fn build_hw_problems(ctx: &ServiceContext, f: &HwFacts) -> Table {
+fn build_hw_problems(ctx: &ShellCtx, f: &HwFacts) -> Table {
     use godspeed_sdk::service_context::hwclass;
     let mut t = Table::new(&["severity", "device", "problem", "detail"]);
     fn add(t: &mut Table, sev: &str, dev: &str, problem: &str, detail: core::fmt::Arguments) {
@@ -8652,7 +8652,7 @@ fn build_hw_problems(ctx: &ServiceContext, f: &HwFacts) -> Table {
     t
 }
 
-fn hw_problems(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+fn hw_problems(ctx: &ShellCtx, out: &mut Out, f: &HwFacts) {
     let t = build_hw_problems(ctx, f);
     hw_grid(ctx, out, &t, "(nothing wrong found)");
     let mut counts = [0usize; 3];
@@ -8673,7 +8673,7 @@ fn hw_problems(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
 /// that bridge (its configuration space names the bus it leads to); a USB device hangs under the host
 /// that bound it. Records: `device`, `parent`, `kind`, `driver`.
 #[inline(never)]
-fn hw_tree_parents(ctx: &ServiceContext, f: &HwFacts, parent: &mut [Option<usize>; HW_ROWS]) {
+fn hw_tree_parents(ctx: &ShellCtx, f: &HwFacts, parent: &mut [Option<usize>; HW_ROWS]) {
     // Which bridge leads to which bus: a bridge's secondary bus number, from its configuration space.
     let mut buses: [(u8, usize); 16] = [(0, 0); 16];
     let mut nb = 0usize;
@@ -8699,7 +8699,7 @@ fn hw_tree_parents(ctx: &ServiceContext, f: &HwFacts, parent: &mut [Option<usize
     }
 }
 
-fn hw_tree(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
+fn hw_tree(ctx: &ShellCtx, out: &mut Out, f: &HwFacts) {
     let mut parent = [None; HW_ROWS];
     hw_tree_parents(ctx, f, &mut parent);
     let mib = f.total_frames / 256;
@@ -8752,7 +8752,7 @@ fn hw_tree(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) {
 }
 
 #[inline(never)]
-fn build_hw_tree(ctx: &ServiceContext, f: &HwFacts) -> Table {
+fn build_hw_tree(ctx: &ShellCtx, f: &HwFacts) -> Table {
     let mut parent = [None; HW_ROWS];
     hw_tree_parents(ctx, f, &mut parent);
     let mut t = Table::new(&["device", "parent", "kind", "driver"]);
@@ -8923,7 +8923,7 @@ fn hw_compare(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, f: &HwFacts, path: &str)
 /// `event`, `detail`. The kernel's own part - grants, confinement, releases, resets - is not recorded,
 /// because `hardware` makes no kernel change; the view says so, and says from when its record runs.
 #[inline(never)]
-fn build_hw_events(ctx: &ServiceContext, f: &HwFacts) -> Option<(Table, u32, u32)> {
+fn build_hw_events(ctx: &ShellCtx, f: &HwFacts) -> Option<(Table, u32, u32)> {
     use godspeed_sdk::service_context::supcmd;
     let m = hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::EVENTS])?;
     let p = m.payload_bytes();
@@ -8974,7 +8974,7 @@ fn build_hw_events(ctx: &ServiceContext, f: &HwFacts) -> Option<(Table, u32, u32
     Some((t, since, recorded))
 }
 
-fn hw_events(ctx: &ServiceContext, out: &mut Out, f: &HwFacts) -> Result<(), ShellError> {
+fn hw_events(ctx: &ShellCtx, out: &mut Out, f: &HwFacts) -> Result<(), ShellError> {
     let Some((t, since, recorded)) = build_hw_events(ctx, f) else {
         out.line(ctx, "hardware events: the supervisor did not answer - it keeps the record");
         return Err(ShellError::Unknown);
@@ -9060,7 +9060,7 @@ fn build_hardware_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
 
 /// `hardware interrupts` as records: `device`, `route`, `driver`.
 #[inline(never)]
-fn build_hw_interrupts_table(ctx: &ServiceContext) -> Option<Table> {
+fn build_hw_interrupts_table(ctx: &ShellCtx) -> Option<Table> {
     let mut f = HwFacts {
         rows: [HwRow::EMPTY; HW_ROWS], n: 0, cores: 0, total_frames: 0, free_frames: 0,
         pci_bus: false, usb_host: false, drivers_known: false, dropped: 0,
@@ -11356,7 +11356,7 @@ fn wifi_not_answering(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 fn wifi_kill_driver(ctx: &ShellCtx) -> Result<(), ShellError> {
     ctx.wifi_owed.set(0);
     let _ = wifi_drain_stale(ctx);
-    cmd_kill(&**ctx, ctx.wifi_radio.get())
+    cmd_kill(ctx, ctx.wifi_radio.get())
 }
 
 /// The states in which nothing can be asked of the radio (down, off, powered off), said the same way by
@@ -13185,17 +13185,17 @@ fn net_unconfigured_reason(ctx: &ShellCtx) -> Option<&'static str> {
 ///
 /// The two causes need opposite responses (check the cable, versus the driver is unreachable) and
 /// §26.7 forbids a failed query from quietly becoming an answer, so they stay distinguishable here.
-fn net_link_up(ctx: &ServiceContext) -> Option<bool> {
+fn net_link_up(ctx: &ShellCtx) -> Option<bool> {
     let req = Message::from_bytes(&[3u8]);
     // Reacquire and retry ONCE before giving up (§14.3). A cap to a service that has since restarted
     // is stale, and nothing refreshes it on our behalf: the request just fails, for as long as this
     // shell lives. That is consistent with what the Pi 2 showed - net-stack saw the link come up and
     // auto-configured while the shell, asking the same driver a second later, got nothing.
-    if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &req, 2) {
+    if let Some(r) = ask_watched(ctx, "nic-driver", &req, 2) {
         return read_link(r.payload_bytes());
     }
     if gs::cap::reacquire(ctx, "nic-driver") {
-        if let Some(r) = ctx.request_with_reply_deadline("nic-driver", &req, 2) {
+        if let Some(r) = ask_watched(ctx, "nic-driver", &req, 2) {
             return read_link(r.payload_bytes());
         }
     }
@@ -16273,7 +16273,7 @@ const REC_OK: u8 = 0;
 /// first version printed prose and could not be asserted on in a script without a bespoke matcher,
 /// which is the same mistake the log made.
 #[inline(never)]
-fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
+fn build_persist_status_table(ctx: &ShellCtx) -> Option<Table> {
     let mut t = Table::new(&["state", "covers", "kib_day", "capacity_kib", "lines", "rotations", "lost", "path"]);
     if slot_of(ctx, "recorder").is_none() {
         // NOT AN ERROR, and not an empty table either. "Nothing is recording" is a real answer, and a
@@ -16296,7 +16296,7 @@ fn build_persist_status_table(ctx: &ServiceContext) -> Option<Table> {
     // answer is also wrong, something is genuinely out of step and that must be said, not hidden.
     let mut attempt = 0;
     let b = loop {
-        let r = match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STATUS]), 8) {
+        let r = match ask_watched(ctx, "recorder", &Message::from_bytes(&[REC_OP_STATUS]), 8) {
             Some(r) => r,
             None => {
                 gs::io::println(ctx, "events persist: recorder did not answer");
@@ -16402,7 +16402,7 @@ fn persist_begin(ctx: &ShellCtx, path: &str, filter: &str, budget: u64) -> Resul
     req[fo] = fl as u8;
     req[fo + 1..fo + 1 + fl].copy_from_slice(&fb[..fl]);
     let n = fo + 1 + fl;
-    match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&req[..n]), 12) {
+    match ask_watched(ctx, "recorder", &Message::from_bytes(&req[..n]), 12) {
         // The op tag must say START, for the same reason `status` checks it: a stale reply from
         // the recorder is handed to whichever call asks next, and accepting one here would report a
         // capture started that never was.
@@ -16654,7 +16654,7 @@ fn events_persist(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
                 return Ok(());
             }
             let _ = gs::cap::reacquire(ctx, "recorder");
-            match ctx.request_with_reply_deadline("recorder", &Message::from_bytes(&[REC_OP_STOP]), 8) {
+            match ask_watched(ctx, "recorder", &Message::from_bytes(&[REC_OP_STOP]), 8) {
                 // Deliberately NOT tag-checked, unlike `start` and `status`: stop's outcome does not
                 // depend on the payload (the request was delivered either way), and if a straggler
                 // is consumed here the real reply is absorbed by the retry in `status`. Checking it
@@ -18169,7 +18169,7 @@ fn line_reads_secret(line: &[u8]) -> bool {
     line.windows(12).any(|w| w == b"input secret")
 }
 
-fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+fn cmd_kill(ctx: &ShellCtx, name: &str) -> Result<(), ShellError> {
     // `kill all-services` (every managed service, then the supervisor, then this shell) or `kill a,b,c` (a comma list) are
     // multi-target; a single name behaves EXACTLY as before. Per-service guards live in kill_one.
     if name == "all-services" || name.contains(',') {
@@ -18189,7 +18189,7 @@ fn cmd_kill(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
 /// everything except supervisor and shell first, then supervisor (so the kernel-respawned supervisor
 /// reconciles AFTER the nuke and respawns the fresh prompt, not mid-storm), then the shell LAST via its
 /// self-kill (it never returns), so every per-service report has printed before the session re-inits.
-fn kill_list(ctx: &ServiceContext, name: &str) -> Result<(), ShellError> {
+fn kill_list(ctx: &ShellCtx, name: &str) -> Result<(), ShellError> {
     use godspeed_sdk::service_context::supcmd;
     // Asked first so the names it carries outlive `segs`, which borrows them.
     let managed = if name == "all-services" { hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::MANAGED]) } else { None };
@@ -19412,11 +19412,11 @@ fn time_rpc(ctx: &ShellCtx, body: &[u8]) -> Option<Message> {
     // no `q` and no hint. (It also ran in the shell's main loop before `console_read` until
     // 2026-10-10, when that floor probe went - `backlog/fixed/80` H12.)
     const TIME_SECS: i64 = 2;
-    if let Some(r) = ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS) {
+    if let Some(r) = ask_watched(ctx, "time", &Message::from_bytes(body), TIME_SECS) {
         return Some(r);
     }
     let _ = gs::cap::reacquire(ctx, "time");
-    ctx.request_with_reply_deadline("time", &Message::from_bytes(body), TIME_SECS)
+    ask_watched(ctx, "time", &Message::from_bytes(body), TIME_SECS)
 }
 
 /// Where the current wall-clock reading came from, per the `time` service (clock slice 2).
@@ -19978,12 +19978,12 @@ fn ns_abortable(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> ReqOutcome {
 fn ns_deadline(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     let mut buf = [0u8; 4096];
     let (n, tag) = ns_build(ctx, body, &mut buf, max_secs);
-    let first = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&buf[..n]), max_secs)
+    let first = ask_watched(ctx, "net-stack", &Message::from_bytes(&buf[..n]), max_secs)
         .map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
     if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag, first, max_secs) { return Some(r); }
     if gs::cap::reacquire(ctx, "net-stack") {
         let (n2, tag2) = ns_build(ctx, body, &mut buf, max_secs);
-        let again = ctx.request_with_reply_deadline("net-stack", &Message::from_bytes(&buf[..n2]), max_secs)
+        let again = ask_watched(ctx, "net-stack", &Message::from_bytes(&buf[..n2]), max_secs)
             .map_or(ReqOutcome::Timeout, ReqOutcome::Reply);
         if let ReqOutcome::Reply(r) = ns_take_tagged(ctx, tag2, again, max_secs) { return Some(r); }
     }
@@ -20052,6 +20052,18 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 /// already handle: a reply, the user's quit, or no answer in time. `inline(always)`: it returns a 4 KiB
 /// message by value, and as its own frame that would be another 4 KiB of the shell's stack.
 #[inline(always)]
+/// A request to a service under the command's watch (`gs::call::Watch`): it says the command's `[q] quit` and
+/// honours it, and between commands it is the plain bounded request it replaced
+/// (`request_with_reply_deadline`). `None` for no answer, including a quit - the caller's `said_stopped` or
+/// `ctx.quit` tells the two apart. Every service wait in the shell is built on this or on `ctx.fs()`
+/// (`backlog/89`).
+fn ask_watched(ctx: &ShellCtx, peer: &str, msg: &Message, secs: i64) -> Option<Message> {
+    if !ctx.cmd_active.get() {
+        return ctx.request_with_reply_deadline(peer, msg, secs);
+    }
+    gs::call::request_watched(ctx, peer, msg, secs, ctx).ok()
+}
+
 fn ask_with_quit_notice(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64) -> ReqOutcome {
     let notice = || gs::io::println(ctx, "  [q] quit");
     let keep = |b: u8| ctx.keep_key(b);   // type-ahead read during the wait is kept (H16)
@@ -22782,7 +22794,7 @@ fn copier_status(ctx: &ShellCtx) -> Ask {
         return Ask::Gone;
     }
     let _ = gs::cap::reacquire(ctx, "copier");
-    let r = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_STATUS]), 8) {
+    let r = match ask_watched(ctx, "copier", &Message::from_bytes(&[CP_OP_STATUS]), 8) {
         Some(r) => r,
         None => return Ask::Busy,
     };
@@ -22981,7 +22993,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
         n += 8;
     }
 
-    let ok = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&req[..n]), 12) {
+    let ok = match ask_watched(ctx, "copier", &Message::from_bytes(&req[..n]), 12) {
         Some(r) => {
             let p = r.payload_bytes();
             p.first() == Some(&CP_OK) && p.get(1) == Some(&CP_OP_START)
@@ -23060,7 +23072,7 @@ fn cmd_jobs_quit(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         gs::io::println_fmt(ctx, format_args!("jobs quit: job {} is already {}", want, state_word(state)));
         return Err(ShellError::Unknown);
     }
-    match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 12) {
+    match ask_watched(ctx, "copier", &Message::from_bytes(&[CP_OP_CANCEL]), 12) {
         Some(_) => {
             refresh_jobs(ctx);
             gs::io::println_fmt(ctx, format_args!("job {} stopped", want));
@@ -23138,7 +23150,7 @@ fn replay_transcript(ctx: &ShellCtx) {
         let mut req = [0u8; 5];
         req[0] = CP_OP_OUTPUT;
         req[1..5].copy_from_slice(&off.to_le_bytes());
-        let r = match ctx.request_with_reply_deadline("copier", &Message::from_bytes(&req), 8) {
+        let r = match ask_watched(ctx, "copier", &Message::from_bytes(&req), 8) {
             Some(r) => r,
             None => return,
         };

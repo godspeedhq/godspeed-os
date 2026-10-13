@@ -2565,11 +2565,39 @@ fn run_sticky_test() {
     crate::shell_test::run_sticky(&image_path, persist, 4);
 }
 
+/// Rebuild `svcs` with their test-only `slow-replies` feature, then the supervisor that embeds them and the
+/// kernel that embeds it - after `build_blockdev_fs`, which built them plain.
+fn build_slow_services(svcs: &[&str]) {
+    for svc in svcs {
+        let _ = std::process::Command::new("cargo")
+            .args(["clean", "--release", "-p", svc, "--target", "x86_64-unknown-none"]).status();
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", svc, "--target", "x86_64-unknown-none", "--features", "slow-replies"])
+            .status().unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", svc, e));
+        if !status.success() { eprintln!("build: {} (slow-replies) FAILED", svc); std::process::exit(1); }
+        println!("build: {} (slow-replies) OK", svc);
+    }
+    clean_supervisor();
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bare-metal,supervisor/blockdev"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() { eprintln!("build: supervisor FAILED"); std::process::exit(1); }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
+        .status().expect("failed to run cargo build for kernel");
+    if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
+    println!("build: slow services embedded");
+}
+
 /// `osdev test quit` (`backlog/89`): every kind of wait, on a deliberately slow `fs`, recording whether
 /// `[q] quit` (and `[b]`) appeared, when, and what `q` did. The record is `build/tests/quit_report.md`.
 fn run_quit_test() {
     println!("\n=== quit: every wait on a slow fs - does [q] appear, and does q work? ===");
     build_blockdev_fs("slow-replies", "");
+    build_slow_services(&["time", "recorder", "copier", "net-stack"]);
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
     let limine_dir = std::path::Path::new("tools/limine");

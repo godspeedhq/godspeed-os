@@ -94,7 +94,15 @@ fn reply_op(ctx: &ServiceContext, op: u8, status: u8) {
     reply(ctx, &[status, op]);
 }
 
+/// `slow-replies` (TEST BUILDS ONLY): hold the reply, so `osdev test quit` sees a slow service in QEMU.
+#[cfg(feature = "slow-replies")]
+fn slow_reply(ctx: &ServiceContext) {
+    gs::task::sleep_ms(ctx, 2500);
+}
+
 fn reply(ctx: &ServiceContext, out: &[u8]) {
+    #[cfg(feature = "slow-replies")]
+    slow_reply(ctx);
     if let Some(cap) = gs::ipc::take_sent_cap(ctx) {
         // `reply` sends AND reclaims: a reply cap is a one-shot return address handed to us inside the
         // request, and sending on it does not consume it. Leaving it behind burns a cap-table slot per

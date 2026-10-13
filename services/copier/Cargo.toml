@@ -12,3 +12,8 @@ path = "src/main.rs"
 godspeed-sdk = { path = "../../sdk/rust" }
 godspeed = { path = "../../stdlib/rust" }
 godspeed-audio = { path = "../../sdk/audio" }
+
+[features]
+# Hold every client reply 2.5 s, so `osdev test quit` (backlog/89) can watch a person wait on this
+# service in QEMU. TEST BUILDS ONLY.
+slow-replies = []

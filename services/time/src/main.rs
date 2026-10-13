@@ -168,7 +168,15 @@ impl Clock {
     }
 }
 
+/// `slow-replies` (TEST BUILDS ONLY): hold the reply, so `osdev test quit` sees a slow service in QEMU.
+#[cfg(feature = "slow-replies")]
+fn slow_reply(ctx: &ServiceContext) {
+    gs::task::sleep_ms(ctx, 2500);
+}
+
 fn reply(ctx: &ServiceContext, cap: gs::cap::Cap, body: &[u8]) {
+    #[cfg(feature = "slow-replies")]
+    slow_reply(ctx);
     let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(body));
 }
 

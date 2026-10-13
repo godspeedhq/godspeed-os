@@ -412,6 +412,9 @@ impl Reply {
     /// anyway. Padding here would hide the decision instead of forcing it.
     #[inline(never)]
     fn send(&self, ctx: &ServiceContext, body: &[u8]) {
+        // `slow-replies` (TEST BUILDS ONLY): hold the reply, so `osdev test quit` sees a slow service.
+        #[cfg(feature = "slow-replies")]
+        gs::task::sleep_ms(ctx, 2500);
         debug_assert!(!body.is_empty(),
             "a reply carries at least one byte - say nothing with a byte that means it");
         match self.tag {
