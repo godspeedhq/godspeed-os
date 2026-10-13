@@ -102,7 +102,8 @@ When `classify` returns `Hub`:
 1. `Set_Configuration`, then a **Configure/Evaluate Context** command setting the slot's **Hub bit**,
    **Number of Ports**, and **TTT**.
 2. `Get_Descriptor(Hub, 0x29)` -> `nports`; `Set_Feature(PORT_POWER)` each downstream port; settle
-   (the spec's power-on-to-power-good time, a bounded `spin`/`delay`).
+   (a fixed 200 ms, `PORT_POWER_SETTLE_MS`; the hub's own power-on-to-power-good time is read and
+   logged, not waited on).
 3. Per connected downstream port (`Get_Status`): `Set_Feature(PORT_RESET)` ->
    `Clear_Feature(C_PORT_RESET)` -> `Get_Status` for the device's **speed**, then
    `address_device(route = parent_route | (port << 4*(tier-1)), root_port, speed, parent_slot = hub
@@ -160,7 +161,8 @@ device call - the downstream device passing its **route string + parent-TT** so 
 re-supplies a slot context that keeps routing through the hub (the earlier bug: Configure Endpoint wrote a
 slot context with only speed + root-port, dropping route/TT). Slice discipline (5.3): each device allocates
 a slice from the pool; a bound HID and a hub-with-a-HID-behind-it keep theirs, while a non-HID probe and an
-**empty hub** free their slice and `Disable_Slot` their controller slot - so the fixed `MAX_SLICES` pool
+**empty hub** free their slice and `Disable_Slot` their controller slot (an empty hub is KEPT now, so an
+arrival behind it can be seen: `main.rs`, "THE HUB IS KEPT, always") - so the fixed `MAX_SLICES` pool
 never leaks and the step-2 completion=4 cascade (two hubs reusing slice 0) is gone. A tier-2 hub (hub behind
 a hub) is logged and skipped for now (single-tier support). Compiles; awaits the Wyse back-port keyboard
 test. *(2026-10-09: the status line at the top records the Wyse back-port keyboard working; a tier-2 hub

@@ -715,6 +715,44 @@ const RESET_RECOVERY_MS: u64 = 55;
 const PORT_RESET_HOLD_MS: u64 = 60;
 /// How long to let a hub's port power settle before resetting anything on it.
 const PORT_POWER_SETTLE_MS: u64 = 200;
+
+/// The least a hub's ports stay unpowered in a cold start (`HubCut`), for a device's own capacitance to
+/// drain. A hub whose power-good time is longer gets twice that instead (bPwrOn2PwrGood reaches 510 ms;
+/// this one reports 100). Paid once per wedge.
+const HUB_CUT_OFF_MS: u64 = 1000;
+
+/// A hub's ports cut and powered again, for a device behind it that no port reset revives (backlog/83).
+/// A walk that finds such a device asks for it; the re-scan's walk of that hub does it before addressing
+/// anything; a walk of THAT hub in which every connected port was tried and answered ends the episode.
+/// Kept per hub, by its root port: a second hub walking clean says nothing about the first.
+///
+/// One cut per wedge, and no cap on how many wedges. The bound is the truth a cut returns: a wedge that
+/// survives one ends the cutting. A count of cuts would bind only the case where they WORK - a device
+/// revived and wedged again by its next failed download - and giving up there loses the disk beside it,
+/// which fails to address while the dongle is wedged. Unbounded as the supervisor's respawn is (CLAUDE.md
+/// 6.2): each cut costs what the last did and says so with a running count. Should that count climb, the
+/// bound belongs on the device that keeps failing - not starting it - rather than on the cure.
+struct HubCut {
+    /// The root port of the hub a cut was MADE on for the wedge now in progress, 0 for none, so a walk of it
+    /// that still fails asks for no other. Set by the cut, not by the asking: a request whose hub did not
+    /// come back to be cut has spent nothing.
+    spent: u32,
+    /// Cuts this instance has made, reported with each one.
+    made: u32,
+    /// The root port of the hub the next walk cuts, 0 for none. Cleared at the end of every pass, so a
+    /// request whose hub did not appear in the pass that should have consumed it does not linger.
+    wanted: u32,
+    /// The ports that did not answer (bit = port), cut alone where the hub switches ports one at a time.
+    ports: u32,
+    /// Set by the walk that asked: the pass re-scans at once, before anything it bound is used.
+    rescan: bool,
+    /// What the hub reported after the last cut: `Some(true)` when every port it cut read unpowered and
+    /// nothing on them stayed connected, `Some(false)` when it did not, `None` when it could not be read.
+    /// That is the hub's LOGICAL port state (USB 2.0 11.24.2.7.1.6: PORT_POWER "may or may not represent
+    /// whether power is applied"), so `Some(true)` is not proof the power dropped - a hub with VBUS wired on
+    /// reads the same. `Some(false)` IS proof it did not: the hub itself says the port is still powered.
+    cold: Option<bool>,
+}
 /// TRSTRCY - the recovery interval a device is owed AFTER its port reset completes, before it can be
 /// addressed (USB 2.0 §7.1.7.5 gives 10 ms). 20 for margin: the cost is 20 ms per downstream port at
 /// enumeration, and the alternative is a device that never enumerates at all.
@@ -1646,7 +1684,7 @@ fn address_downstream(
     let in_phys = dma.phys_at(INPUT_CTX_OFF);
     let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
-    let (comp, _) = run_command(
+    let (comp, _) = match run_command(
         ctx,
         dma,
         mmio,
@@ -1659,11 +1697,20 @@ fn address_downstream(
         (TRB_ADDRESS_DEVICE << 10) | (slot << 24) | 1,
         ev_idx,
         ev_cycle,
-    )?;
+    ) {
+        Some(r) => r,
+        // No completion at all: the slot Enable Slot gave is still the controller's, as on a failure.
+        None => {
+            ctx.log_fmt(format_args!(
+                "xhci: downstream Address Device got no completion (route={:#x}) - releasing slot {}", route, slot));
+            disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
+            return None;
+        }
+    };
     if comp != 1 {
         ctx.log_fmt(format_args!(
-            "xhci: downstream Address Device failed (completion={}, route={:#x}, speed={}, ep0_mps={})",
-            comp, route, speed, ep0_max_packet(speed)
+            "xhci: downstream Address Device failed (completion={}, route={:#x}, speed={}, ep0_mps={}; releasing slot {})",
+            comp, route, speed, ep0_max_packet(speed), slot
         ));
         // Completion 17 is Parameter Error: the xHC rejected a FIELD, and it does not say which. Dump
         // the context we built so the answer is read off the log rather than reasoned toward. The slot
@@ -1689,6 +1736,11 @@ fn address_downstream(
             (dma.read32(islot + 8) >> 8) & 0xFF,
             (dma.read32(islot + 8) >> 16) & 0x3,
             ttt));
+        // RELEASE THE SLOT. Enable Slot succeeded, so the controller holds one for this device. With three
+        // attempts per port, a failed port held three slots until the next controller reset, and a hub with
+        // several failed ports could run a pass short of them. Linux frees the device, and its slot, each
+        // time a `hub_port_connect` attempt fails.
+        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
         return None;
     }
     // Read the device descriptor over the downstream slice's EP0 ring (offset 0).
@@ -1709,6 +1761,11 @@ fn address_downstream(
         18,
         DATA_BUF_OFF,
     ) {
+        // Addressed but silent: the same slot, released for the same reason.
+        ctx.log_fmt(format_args!(
+            "xhci: downstream device on hub port {} addressed but its device descriptor did not arrive - releasing slot {}",
+            parent_port, slot));
+        disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
         return None;
     }
     let ids = dma.read32(DATA_BUF_OFF + 8);
@@ -2667,6 +2724,9 @@ fn enumerate_one(
     // poisons the port at once, while this is a port that simply will not come up - which must still
     // be BOUNDED, because retrying it forever is what produces the ~1 s re-enumeration every ~12 s.
     enum_failed: &mut bool,
+    // The bounded cold start of a hub's ports (`HubCut`). Owned above `'reenum`, so it outlives the
+    // re-scan it asks for.
+    hub_cut: &mut HubCut,
     // Whether the fixed command-failure hint has been said (`hc_wedged_now`). Owned above `'reenum`
     // with `diag_dumped`, not a static (Invariant 9, backlog/fixed/80 D9).
     hint_said: &mut bool,
@@ -3013,9 +3073,23 @@ fn enumerate_one(
     // Address Device, so both are forced to zero rather than parsed out of wHubCharacteristics.
     let ttt = if ss_hub { 0 } else { ((whubchar >> 5) & 0x3) as u32 };
     let mtt = !ss_hub && dproto == 2; // bDeviceProtocol 2 = multi-TT hub
+    // HOW THIS HUB SWITCHES PORT POWER (wHubCharacteristics bits 1:0, USB 2.0 11.23.2.1): 00 ganged - one
+    // switch for every port; 01 individual - each port its own; 1x none. And bPwrOn2PwrGood (offset 5, in
+    // 2 ms units): how long after power-on a port's power is good. Only an individual hub can cold-start
+    // ONE device without taking the others' power with it, which is what a wedged device needs (below).
+    // A SuperSpeed hub's descriptor has the same two bits, but it is treated as ganged here: its ports are
+    // not cut one at a time until a card has shown how one answers.
+    let per_port_power = !ss_hub && whubchar & 0x3 == 0x1;
+    let pwr_good_ms = dma.read8(DATA_BUF_OFF + 5) as u64 * 2;
     ctx.log_fmt(format_args!(
-        "xhci: USB{} hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={})",
-        if ss_hub { "3 SuperSpeed" } else { "2" }, port, slot, nports, mtt, ttt
+        "xhci: USB{} hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={}, port power {}, power good after {} ms)",
+        if ss_hub { "3 SuperSpeed" } else { "2" }, port, slot, nports, mtt, ttt,
+        match whubchar & 0x3 {
+            0 => "ganged",
+            1 if ss_hub => "per port (treated as ganged: SuperSpeed)",
+            1 => "per port",
+            _ => "not switched",
+        }, pwr_good_ms
     ));
     // Neither descriptor produced a port count. Now it really is unusable.
     if nports == 0 {
@@ -3052,6 +3126,58 @@ fn enumerate_one(
             "xhci: Set Hub Depth 0 on the SuperSpeed hub on port {} - {}",
             port, if ok { "OK" } else { "FAILED (its downstream ports may not route)" }));
     }
+    // THE COLD START a previous walk asked for (`HubCut`, backlog/83): cut the power, let it drain, and
+    // fall through to the power-on below, which every walk does anyway. Done here, before anything on this
+    // hub is addressed, so nothing bound this pass is cut from under it, and where the EP0 ring has room.
+    if hub_cut.wanted == port {
+        hub_cut.wanted = 0;
+        hub_cut.spent = port;
+        let ports = if per_port_power { hub_cut.ports } else { u32::MAX };
+        let mut cut = 0u32;
+        for dp in 1..=nports {
+            if dp >= 32 || ports & (1u32 << dp) == 0 || hoff + 32 > 0xF00 {
+                continue;
+            }
+            if control(
+                dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0x23, 1, 8, dp as u32, 0, 0,
+            ) {
+                // Clear_Feature(PORT_POWER = 8)
+                cut += 1;
+            }
+            hoff += 32;
+        }
+        let off_ms = HUB_CUT_OFF_MS.max(2 * pwr_good_ms);
+        gs::task::sleep_ms(ctx, off_ms);
+        // WHAT THE HUB SAYS NOW: the port's power bit (8 on a USB2 hub, 9 on a USB3 one) and whether a
+        // device is still connected. Both are the hub's LOGICAL port state (`HubCut::cold`), so a hub that
+        // reads its ports still powered has proved the cut did nothing, while one that reads them off has
+        // proved only that it took the request - whether VBUS dropped shows in what comes back.
+        let power_bit = if ss_hub { 1u16 << 9 } else { 1u16 << 8 };
+        let (mut unpowered, mut connected, mut read) = (0u32, 0u32, 0u32);
+        for dp in 1..=nports {
+            if hoff + 64 > 0xF00 {
+                break;
+            }
+            if dp >= 32 || ports & (1u32 << dp) == 0 {
+                continue;
+            }
+            let ok = control(
+                dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0xA3, 0, 0, dp as u32, 4,
+                DATA_BUF_OFF,
+            );
+            hoff += 48;
+            if ok {
+                let st = dma.read16(DATA_BUF_OFF);
+                read += 1;
+                unpowered += (st & power_bit == 0) as u32;
+                connected += (st & 1 != 0) as u32;
+            }
+        }
+        ctx.log_fmt(format_args!(
+            "xhci: hub on port {}: power cut on {} port(s) for {} ms - the hub reports {} of {} read port(s) unpowered and {} still connected (its logical state); powering them again",
+            port, cut, off_ms, unpowered, read, connected));
+        hub_cut.cold = if read == 0 { None } else { Some(unpowered == read && connected == 0) };
+    }
     for dp in 1..=nports {
         if hoff + 32 > 0xF00 {
             break;
@@ -3070,23 +3196,31 @@ fn enumerate_one(
     // enabled" - status 0x0301, exactly what the Pi 4 reported seven times over sixteen seconds
     // before the device finally came up on a later re-scan.
     //
-    // bPwrOn2PwrGood in the hub descriptor gives this in 2 ms units and would be the precise answer;
-    // 200 ms is the reference driver's figure and covers every hub it has met. Paid once per hub at
-    // enumeration.
+    // bPwrOn2PwrGood in the hub descriptor gives this in 2 ms units and is read above (`pwr_good_ms`)
+    // and logged, but this wait does not use it: 200 ms is the reference driver's figure and covers every
+    // hub it has met. Paid once per hub at enumeration.
     gs::task::sleep_ms(ctx, PORT_POWER_SETTLE_MS);
     // For each CONNECTED downstream port: reset it, read its speed, Address Device it with a route
     // string (this hub port, tier 1) + parent-TT into its OWN slice, then read its config and bind it
     // if it's a boot HID - exactly like a root-port device (read_config_and_bind). This is what makes
     // the back-port keyboard work.
     let ndev_before = *ndev;
+    // The ports whose device did not answer Address Device this walk (bit = port number).
+    let mut unanswered = 0u32;
+    // Whether some connected port was NOT tried to the end this walk - its status unread, its reset not
+    // enabling it, the ring or the slices run out, a port past 31. Such a walk does not end a wedge: a port
+    // that was never asked has not answered.
+    let mut inconclusive = false;
     // Whether a disk was already bound BEFORE walking this hub. A disk found behind it counts as
     // "something usable is down there" exactly as a HID does - see the release check below.
     let disk_before = disk.is_some();
     for dp in 1..=nports {
         if *ndev >= MAX_HID {
+            inconclusive = true;
             break;
         }
         if hoff + 48 > 0xD00 {
+            inconclusive = true;
             break;
         }
         let ok = control(
@@ -3112,6 +3246,7 @@ fn enumerate_one(
         if !ok {
             ctx.log_fmt(format_args!(
                 "xhci: hub port {} status read failed - not scanned this pass", dp));
+            inconclusive = true;
         }
         let st = if ok { dma.read16(DATA_BUF_OFF) } else { 0 };
         if st & 1 == 0 {
@@ -3190,6 +3325,7 @@ fn enumerate_one(
             ctx.log_fmt(format_args!(
                 "xhci: hub port {} did not enable after reset (status {:#06x}) - skipping it",
                 dp, pstatus));
+            inconclusive = true;
             continue; // no slice allocated yet at this point - nothing to release
         }
         gs::task::sleep_ms(ctx, PORT_RECOVERY_MS);
@@ -3234,6 +3370,7 @@ fn enumerate_one(
             Some(i) => i,
             None => {
                 ctx.log("xhci: out of DMA slices for a downstream device - stopping hub walk");
+                inconclusive = true;
                 break;
             }
         };
@@ -3377,9 +3514,104 @@ fn enumerate_one(
                     "xhci: hub port {} connected but downstream Address Device FAILED (route/TT)",
                     dp
                 ));
+                // DIAGNOSTIC (2026-10-12, backlog/83): the hub's state when one of its ports cannot be
+                // addressed - the port before and after its reset, the port now, and the hub's own slot
+                // and EP0 as the controller holds them. Says whether the hub, the port or the controller
+                // is in the wrong state after the dongle's download fault.
+                let now = if hoff + 64 <= 0xF00 && control(
+                    dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0xA3, 0, 0, dp as u32, 4,
+                    DATA_BUF_OFF,
+                ) {
+                    hoff += 48;
+                    Some(dma.read16(DATA_BUF_OFF))
+                } else {
+                    None
+                };
+                let hub_ctx = device_ctx_off(dev_idx);
+                struct Now(Option<u16>);
+                impl core::fmt::Display for Now {
+                    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                        match self.0 { Some(s) => write!(f, "{:#06x}", s), None => f.write_str("unread") }
+                    }
+                }
+                ctx.log_fmt(format_args!(
+                    "xhci: DIAG hub port {}: status before reset {:#06x}, after {:#06x}, now {}, speed {}; hub slot {} state {} ports {} hub-flag {} ep0 state {}",
+                    dp, st, pstatus, Now(now), dspeed, slot,
+                    dma.read32(hub_ctx + 12) >> 27,
+                    dma.read32(hub_ctx + 4) >> 24,
+                    (dma.read32(hub_ctx) >> 26) & 1,
+                    dma.read32(hub_ctx + ctx_size) & 0x7));
+                // STOP KNOCKING ON IT. A device that three Address Devices did not reach is left disabled
+                // at its port, so nothing more is sent to it this pass, and named in `unanswered` for the
+                // cold start below. Its slot was released by `address_downstream`. Not on a SuperSpeed hub:
+                // the USB 3 hub class has no PORT_ENABLE feature, so it would STALL the request, and a stall
+                // halts the hub's EP0 for the rest of the walk.
+                if !ss_hub && hoff + 32 <= 0xF00 {
+                    let _ = control(
+                        dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0x23, 1, 1, dp as u32, 0, 0,
+                    ); // Clear_Feature(PORT_ENABLE = 1)
+                    hoff += 32;
+                }
+                if dp < 32 {
+                    unanswered |= 1u32 << dp;
+                } else {
+                    inconclusive = true;
+                }
                 sa.free(d_idx);
             }
         }
+    }
+    // A DEVICE THAT NO PORT RESET REVIVES (backlog/83): the RTL8188CUS after a failed firmware download
+    // enables at its port and never answers SET_ADDRESS again, re-scan after re-scan, and the disk beside
+    // it stopped answering too. A port reset does not reach it; losing its power is expected to, as
+    // unplugging it does (not yet seen on hardware). So the next walk starts from cold - this hub's failed ports, or every port where
+    // the hub switches them together, which takes the disk and the keyboard down with the device that
+    // needed it. Thy service shall fail; plan for recovery: each comes back the way a restarted service
+    // does - the disk re-bound and `fs` recovering through its journal, a write in flight failing loudly
+    // to its writer, the dongle brought up from cold by `wifi-usb` under a new gen.
+    //
+    // Bounded once per wedge, per hub: a walk of a hub already cut does not ask for another, and a walk of
+    // it in which every connected port was tried and answered ends the wedge. There is no cap on wedges
+    // (`HubCut` says why).
+    //
+    // Linux power-cycles the one port half way through its PORT_INIT_TRIES (4) attempts
+    // (`usb_hub_set_port_power`), with no check of how the hub switches power; on a ganged hub that clear
+    // drops nothing, because a gang is off only when every port in it is (USB 2.0 11.11). Cutting every
+    // port is this driver's choice, made because what drops with it has a recovery (CLAUDE.md 26.14).
+    if unanswered != 0 {
+        // AFTER A CUT, WHAT THE HUB SAID DECIDES THE ADVICE, as far as it can. Unplugging a device removes
+        // its power and nothing else, which is what a cut does when the hub really drops it - then a device
+        // that still fails failed from cold, an unplug gives it nothing more, and a second cut would be a
+        // retry on a truth. A hub that read its ports still powered proved the cut was no cold start, and
+        // then unplugging is the one this could not make. A hub that read them off proved only that it took
+        // the request (`HubCut::cold`), so both readings are said.
+        if hub_cut.spent == port {
+            match hub_cut.cold {
+                Some(true) => ctx.log_fmt(format_args!(
+                    "xhci: hub on port {}: port mask {:#x} still does not answer after a cut the hub reported as done - if its power really dropped, the device fails from cold and unplugging will not help; if the hub only said so, unplugging is the cold start this could not make. Not cutting again",
+                    port, unanswered)),
+                Some(false) => ctx.log_fmt(format_args!(
+                    "xhci: hub on port {}: port mask {:#x} still does not answer, and the hub did not drop its power when asked - the cut was no cold start; unplugging the device, or another port, is one",
+                    port, unanswered)),
+                None => ctx.log_fmt(format_args!(
+                    "xhci: hub on port {}: port mask {:#x} still does not answer after the cut, and the hub's port status could not be read to say whether its power dropped; not cutting again",
+                    port, unanswered)),
+            }
+        } else {
+            hub_cut.made = hub_cut.made.saturating_add(1);
+            hub_cut.wanted = port;
+            hub_cut.ports = unanswered;
+            hub_cut.rescan = true;
+            ctx.log_fmt(format_args!(
+                "xhci: hub on port {}: port mask {:#x} does not answer after a reset - cutting the power of {} for a cold start (cut {} of this instance); what is on them drops and comes back",
+                port, unanswered,
+                if per_port_power { "those ports" } else { "ALL its ports (the hub does not switch them one at a time)" },
+                hub_cut.made));
+        }
+    } else if hub_cut.spent == port && !inconclusive {
+        hub_cut.spent = 0;
+        ctx.log_fmt(format_args!(
+            "xhci: hub on port {}: every connected port answered after the power cut - recovered", port));
     }
     // "Nothing usable" has to mean nothing usable - a HID *or* a disk. Counting only HIDs released
     // the hub while the Pi 4's USB stick was hanging off it, and disabling a hub's slot tears down
@@ -3544,6 +3776,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // an already-bound keyboard nor livelock the re-init. One bit per root port (max_ports <= 63 on real
     // HW; a port >= 64 simply is not poison-tracked, never poison-halted).
     let mut poisoned: u64 = 0;
+    // The hub cold start (backlog/83), above `'reenum` for the reason `poisoned` is.
+    let mut hub_cut = HubCut { spent: 0, made: 0, wanted: 0, ports: 0, rescan: false, cold: None };
     // Attempts a root port gets to enumerate before it is poisoned, spent WITHIN one pass.
     //
     // `poisoned` above only arms when a port WEDGES the host controller. A port that merely refuses
@@ -3963,6 +4197,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut hc_wedged,
                     &mut diag_dumped,
                     &mut enum_failed,
+                    &mut hub_cut,
                     &mut diag_hint_said,
                 );
                 // BOUND THE RETRY, AND SPEND THE ATTEMPTS IN THIS PASS.
@@ -3988,7 +4223,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         enumerate_one(
                             &ctx, &dma, &mmio, dboff, ir0, op, ctx_size, p, &mut sa, &mut devs,
                             &mut ndev, &mut saw_hub, &mut disk, &mut radio, &mut ev_idx, &mut ev_cycle,
-                            &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed, &mut diag_hint_said,
+                            &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed, &mut hub_cut,
+                            &mut diag_hint_said,
                         );
                         if !enum_failed { break; }
                         strikes += 1;
@@ -3999,6 +4235,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             "xhci: port {} failed to enumerate {} times in one pass - SKIPPING it until it is replugged (each retry costs a ~1 s pass in which the keyboard is not polled)",
                             p, strikes));
                     }
+                }
+                if hub_cut.rescan {
+                    hub_cut.rescan = false;
+                    ctx.log_fmt(format_args!(
+                        "xhci: re-scanning so the hub on port {} starts from cold", p));
+                    continue 'reenum;
                 }
                 if hc_wedged {
                     ctx.log_fmt(format_args!(
@@ -4012,6 +4254,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
 
+        // A cut asked for and not made - its hub did not come back in this pass - is dropped, not carried.
+        hub_cut.wanted = 0;
         // If this pass bound a disk, prove the bulk path end to end before anything depends on it: a
         // real READ(10) of sector 0, reported with what came back. A driver that reports a disk it
         // has never successfully read from pushes the first failure into the filesystem, where it
