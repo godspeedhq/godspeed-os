@@ -147,7 +147,52 @@ an EP0 the repair could not revive - and then:
 every walk anyway (each walk resets the hub), so they do not show the power dropped, and the hub's port
 status is its logical state. A hub that records the cut and keeps VBUS on reads exactly like this.
 
+## The replug (Pi 4, 2026-10-13, 09:45-09:49, the same image)
+
+The dongle wedged at boot this time (the download fault, then an EP0 the repair could not revive), and
+three cuts (the boot's instance and two `kill xhci`) went as on the first card: the hub reported 4 of 4
+unpowered and 0 connected, and the dongle did not address after any of them. Then the operator unplugged
+it and plugged it into another port of the same hub:
+
+```
+09:47:54.489  xhci: new device on hub slot 1 port 3 - re-enumerating
+09:47:55.273  xhci: hub on port 1: every connected port answered after the power cut - recovered
+09:47:55.289  supervisor: USB 0bda:8176 attached (binding 140343) - starting wifi-usb
+```
+
+It addressed at once - and then failed its firmware download again (`the download stopped ... try 5 of
+6`), wedged, was cut (09:48:07, port mask 0x8), and did not address after the cut. A second replug
+(09:48:18, port 3) addressed, downloaded and joined:
+
+```
+09:48:27.755  wifi-usb: JOINED - handshake complete, pairwise key installed, group key 2 installed
+```
+
+**What this settles, as far as one board can.** An unplug removes the device's power and nothing else
+a cut does not also do: the cut, too, leaves the hub reporting the port disconnected and then
+reconnected. The unplug revived addressing twice in two tries; the cut revived it in none of ten (six
+on the first card, four here). So this hub - the one on the Pi 4's root port 1, 2109:3431 - does not take VBUS
+off when every port is cleared: its PORT_POWER is logical only. The cut costs a second and a rescan here
+and buys nothing, though it does no harm: the disk and keyboard came back after every one.
+
+**What it does not settle.** Why the download fails. It failed on the port the dongle moved to as it
+had on the first, so it is not that port; it succeeded on the second replug. The fault is the dongle's
+first download after a power-up, roughly half the time on this evidence, and it is the cause this entry
+is about; the cut was a remedy for what follows it.
+
+**A message that overclaims:** `every connected port answered after the power cut - recovered` was
+printed after the REPLUG revived the port, because that walk was the first since the cut in which every
+port answered. It is true of the order of events and wrong about the cause.
+
 ## Next step
+
+A decision first: keep the cut on this hub (harmless, useless here, and it may help on a hub that does
+switch VBUS) or skip it where a cut has been shown not to drop power. Then the recovery that remains is
+the operator's (unplug and replug, which the "still does not answer after a cut" line can say plainly
+on this board), or the root port's own power (PORTSC.PP), where the VL805 has port power control -
+not yet checked. Separately, the download fault itself: `docs/wifi-usb.md` 52 has its history.
+
+The earlier step, now done:
 
 Unplug the wedged dongle and plug it back in, on a boot where it has wedged. That is the cold start a
 cut that really drops the power would have been:

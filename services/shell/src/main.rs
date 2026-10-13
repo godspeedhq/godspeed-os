@@ -460,6 +460,10 @@ pub struct ShellCtx {
     /// Non-zero when the last `wifi_ask` returned nothing WITHOUT SENDING, because the driver still owed
     /// this many earlier answers. `wifi_not_answering` reads it to say so instead of "not answering".
     wifi_unsent: core::cell::Cell<u32>,
+    /// The operator pressed `q` during the last `wifi_ask` or `audio_ask`. Read straight after one returns
+    /// nothing, so "not answering" is not said about a wait the operator ended; and by a command that asks
+    /// several times in a row (`wifi hardware`) to stop asking. Set false at the start of every ask.
+    quit: core::cell::Cell<bool>,
     /// The radio request correlation tag (see `next_wifi_tag`).
     wifi_tag: core::cell::Cell<u8>,
     /// Byte 1 of the last `radio down` answer - WHY the driver says it is down (0 = it did not say).
@@ -570,6 +574,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         wifi_owed: core::cell::Cell::new(0),
         wifi_owed_since: core::cell::Cell::new(0),
         wifi_unsent: core::cell::Cell::new(0),
+        quit: core::cell::Cell::new(false),
         wifi_tag: core::cell::Cell::new(0),
         wifi_down_reason: core::cell::Cell::new(0),
         wifi_radio: core::cell::Cell::new(RADIOS[0]),
@@ -9052,6 +9057,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         }
         let t0 = gs::task::epoch_secs_monotonic(ctx);
         let mut synced = false;
+        let mut sync_noticed = false;
         loop {
             let waited = gs::task::epoch_secs_monotonic(ctx) - t0;
             // Synced SINCE WE ASKED: an age no older than the wait so far. An older sync is not this one.
@@ -9060,12 +9066,20 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
                 break;
             }
             if waited >= SYNC_WAIT_SECS { break; }
-            if let Some(b) = ctx.try_console_read() {
+            // Say it once the wait lingers (rule 10): `q` was always taken here, and never offered.
+            if !sync_noticed && waited >= gs::call::NOTICE_AFTER_SECS {
+                sync_noticed = true;
+                gs::io::println(ctx, "  [q] quit");
+            }
+            // The console itself, not the type-ahead: a key that is not `q` is KEPT for the prompt, and
+            // reading the buffer it goes into would hand it straight back.
+            if let Some(b) = ctx.inner.try_console_read() {
                 // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
                 if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
                     out.line_fmt(ctx, format_args!("date sync: aborted (the clock service may still finish the sync)"));
                     return Err(ShellError::Unknown);
                 }
+                ctx.keep_key(b);
             }
             gs::task::sleep_ms(ctx, SYNC_POLL_MS);
         }
@@ -9598,13 +9612,15 @@ fn audio_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // A send that fails at once is a stale capability (the driver restarted since this shell wired it),
     // never a deadline: reacquire by name and send ONCE. A real timeout is never re-sent.
     let driver = audio_driver(ctx)?;
-    let s0 = gs::driver::wait::Since::now(ctx);
-    let mut got = ctx.request_with_reply_ms_sifted(driver, &msg, max_ms, sift);
-    if got.is_none() && !s0.passed(ctx, gs::driver::wait::Budget::ms(250)) {
+    // With the `[q] quit` notice once it lingers (`ask_sifted_quittable`).
+    ctx.quit.set(false);
+    let noticed = core::cell::Cell::new(false);
+    let (mut got, left) = ask_sifted_quittable(ctx, driver, &msg, max_ms, &noticed, sift);
+    if got.is_none() && !left && !ctx.quit.get() {
         if !gs::cap::reacquire(ctx, driver) {
             return None;
         }
-        got = ctx.request_with_reply_ms_sifted(driver, &msg, max_ms, sift);
+        got = ask_sifted_quittable(ctx, driver, &msg, max_ms, &noticed, sift).0;
     }
     got.map(|r| Message::from_bytes(r.payload_bytes().get(2..).unwrap_or(&[])))
 }
@@ -9715,7 +9731,11 @@ fn cmd_audio(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), 
 fn audio_reply(ctx: &ShellCtx, out: &mut Out, r: Option<Message>, len: usize) -> Result<Message, ShellError> {
     use audio_wire::*;
     let Some(r) = r else {
-        out.line_fmt(ctx, format_args!("audio: the audio driver is not answering"));
+        if ctx.quit.get() {
+            out.line_fmt(ctx, format_args!("audio: stopped by q - the driver may still act on it; `audio status` shows what it did"));
+        } else {
+            out.line_fmt(ctx, format_args!("audio: the audio driver is not answering"));
+        }
         return Err(ShellError::Unknown);
     };
     let p = r.payload_bytes();
@@ -10807,6 +10827,9 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     // by `wifi_sift`, which is now exact. The wait is the sifted one on the main endpoint, not the Call:
     // a Call can only take the oldest reply FROM the driver, which is the very thing that is wrong.
     ctx.wifi_unsent.set(0);
+    ctx.quit.set(false);
+    // One `[q] quit` for the whole ask: the wait for owed answers and the request share it.
+    let noticed = core::cell::Cell::new(false);
     let (late, other) = wifi_drain_stale(ctx);
     if late + other > 0 {
         ctx.log_fmt(format_args!(
@@ -10827,7 +10850,10 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
             "shell: {} radio answer(s) owed for over {} s never came - forgotten; asking afresh", owed, OWED_MAX_SECS));
         ctx.wifi_owed.set(0);
     }
-    if ctx.wifi_owed.get() > 0 && !wifi_await_owed(ctx, max_ms) {
+    if ctx.wifi_owed.get() > 0 && !wifi_await_owed(ctx, max_ms, &noticed) {
+        if ctx.quit.get() {
+            return None;   // `q`: nothing was sent, and the caller says the operator stopped it
+        }
         // NOTHING WAS SENT, and the caller must not say the driver failed to answer it: the request never
         // left. `wifi_not_answering` reads this and says what happened.
         ctx.wifi_unsent.set(ctx.wifi_owed.get());
@@ -10839,14 +10865,12 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
     let t0 = gs::driver::wait::Since::now(ctx);
     // One attempt: the answer, and whether the request LEFT. A `None` that comes back at once is a send
     // that failed (no send slot, or a dead driver), never a deadline.
-    let attempt = || {
-        let s0 = gs::driver::wait::Since::now(ctx);
-        let got = ctx.request_with_reply_ms_sifted(ctx.wifi_radio.get(), &msg, max_ms, |m| wifi_sift(ctx, m, Some(tag)));
-        let left = got.is_some() || s0.passed(ctx, gs::driver::wait::Budget::ms(250));
-        (got, left)
-    };
+    // With the `[q] quit` notice once it lingers (`ask_sifted_quittable`); `q` returns nothing, and the
+    // request is owed like any other that left and was not answered.
+    let attempt = || ask_sifted_quittable(ctx, ctx.wifi_radio.get(), &msg, max_ms, &noticed,
+                                          |m| wifi_sift(ctx, m, Some(tag)));
     let (mut got, mut left) = attempt();
-    if !left {
+    if !left && !ctx.quit.get() {
         // Reacquire and send ONCE - nothing is in flight to a live driver, so this is a first request, not
         // a repeat. A respawned driver owes nothing: its dead predecessor's answers will never come.
         ctx.wifi_owed.set(0);
@@ -10870,7 +10894,7 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
         Some(_) if took_ms >= 1000 => {
             ctx.log_fmt(format_args!("shell: the radio driver answered op {:#04x} after {} ms", req.first().copied().unwrap_or(0), took_ms));
         }
-        None if left => {
+        None if left && !ctx.quit.get() => {
             ctx.log_fmt(format_args!(
                 "shell: the radio driver did not answer op {:#04x} within {} s - its answer is owed ({} owed)",
                 req.first().copied().unwrap_or(0), secs, ctx.wifi_owed.get()));
@@ -10878,6 +10902,28 @@ fn wifi_ask(ctx: &ShellCtx, req: &[u8], max_ms: u64) -> Option<Message> {
         _ => {}
     }
     got
+}
+
+/// A tagged, sifted request that says `[q] quit` once it lingers past `gs::call::NOTICE_AFTER_SECS` and
+/// ends on `q`, keeping every other key for the prompt (utilities/0_conventions.md rule 10). The radio's
+/// and the audio driver's asks wait here. `noticed` is shared by the waits of one ask, so the notice is
+/// said once; once it is up, a later wait reads keys from its start. Returns the reply, and whether the
+/// request LEFT: a timeout that comes back inside 250 ms is a send that failed, never a deadline.
+/// Sets `ctx.quit` on `q`. The bound is whole seconds, rounded up (`max_ms` 1500 waits 2 s).
+fn ask_sifted_quittable(ctx: &ShellCtx, peer: &str, msg: &Message, max_ms: u64,
+                        noticed: &core::cell::Cell<bool>, mine: impl FnMut(&Message) -> bool) -> (Option<Message>, bool) {
+    let secs = ((max_ms + 999) / 1000).max(1) as i64;
+    let hint = if noticed.get() { 0 } else { gs::call::NOTICE_AFTER_SECS };
+    let s0 = gs::driver::wait::Since::now(ctx);
+    let out = ctx.inner.request_with_reply_keyhint_sifted_keeping(peer, msg, hint, secs,
+        ServiceContext::QUIT_KEYS,
+        || { if !noticed.get() { noticed.set(true); gs::io::println(ctx, "  [q] quit"); } },
+        mine, &|b| ctx.keep_key(b));
+    match out {
+        ReqOutcome::Reply(r) => (Some(r), true),
+        ReqOutcome::Aborted => { ctx.quit.set(true); (None, true) }
+        ReqOutcome::Timeout => (None, s0.passed(ctx, gs::driver::wait::Budget::ms(250))),
+    }
 }
 
 /// The radio request correlation tag. Its own counter in `ShellCtx`, for the reason `fs_tag` and `net_tag`
@@ -10940,13 +10986,26 @@ fn wifi_owe(ctx: &ShellCtx) {
 }
 
 /// Wait up to `max_ms` for the driver's owed answers to arrive, discarding them (`wifi_sift`). `true` when
-/// nothing is owed any more.
-fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64) -> bool {
+/// nothing is owed any more. Says `[q] quit` once it lingers past `gs::call::NOTICE_AFTER_SECS` (shared
+/// `noticed`, so once per ask) and ends on `q`, setting `ctx.quit`; until the notice no key is read, so
+/// typing ahead is not taken for an answer.
+fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64, noticed: &core::cell::Cell<bool>) -> bool {
     let t0 = gs::driver::wait::Since::now(ctx);
     let limit = gs::driver::wait::Budget::ms(max_ms);
+    let notice_at = gs::driver::wait::Budget::ms(gs::call::NOTICE_AFTER_SECS as u64 * 1000);
     while ctx.wifi_owed.get() > 0 && !t0.passed(ctx, limit) {
         if let Some(m) = gs::ipc::recv_within_ms(ctx, 20) {
             wifi_sift(ctx, &m, None);
+        }
+        if !noticed.get() && t0.passed(ctx, notice_at) {
+            noticed.set(true);
+            gs::io::println(ctx, "  [q] quit");
+        }
+        if noticed.get() {
+            while let Some(b) = ctx.inner.try_console_read() {
+                if ServiceContext::QUIT_KEYS.contains(&b) { ctx.quit.set(true); return false; }
+                ctx.keep_key(b);
+            }
         }
     }
     ctx.wifi_owed.get() == 0
@@ -11128,6 +11187,11 @@ fn wifi_not_answering(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // Unless the request was never SENT: the driver still owed this shell answers to earlier requests, and
     // asking again behind them is how a late answer gets read as a new one (`wifi_ask`). "Not answering"
     // was the wrong sentence for that - the driver had not been asked.
+    if ctx.quit.get() {
+        out.line_fmt(ctx, format_args!(
+            "wifi: stopped by q - the radio driver may still answer, and `wifi status` will show what it did"));
+        return Err(ShellError::Unknown);
+    }
     let owed = ctx.wifi_unsent.get();
     if owed > 0 {
         out.line_fmt(ctx, format_args!(
@@ -11540,7 +11604,15 @@ fn wifi_hardware_rows(ctx: &ShellCtx) -> [Option<WifiHw>; 2] {
                 None => "not answering",
             };
         }
+        // `q` in either ask ends the command, not just that ask: what is known so far is shown.
+        let quit = ctx.quit.get();
+        if quit {
+            row.state = "stopped (q)";
+        }
         rows[i] = Some(row);
+        if quit {
+            break;
+        }
     }
     ctx.wifi_radio.set(RADIOS[0]);
     rows
@@ -17018,7 +17090,7 @@ fn gen_of(ctx: &ServiceContext, name: &str) -> Option<u32> {
 /// never the shell's spawn/kill/restart. The shell spawns it; it prints one frame
 /// via its own caps and parks. Kill any parked prior instance first (one-shot
 /// observe has no graceful self-exit in v1), so at most one lingers.
-fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
+fn cmd_observe_now(ctx: &ShellCtx) -> Result<(), ShellError> {
     let _ = ctx.kill("observe-now");
     if ctx.spawn("observe-now").is_err() {
         gs::io::println(ctx, "observe: failed to spawn observe-now");
@@ -17037,9 +17109,24 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
         const PARK_WAIT_MS: u64 = 5_000;
         const PARK_POLL_MS: u64 = 10;
         let mut waited = 0u64;
+        // `[q] quit` once it lingers, as every wait that takes time says (rule 10); `q` stops waiting for
+        // the frame and reaps the task below, as the bound running out does.
+        let notice_ms = gs::call::NOTICE_AFTER_SECS as u64 * 1000;
+        let mut noticed = false;
+        let mut quit = false;
         while waited < PARK_WAIT_MS {
             gs::task::sleep_ms(ctx, PARK_POLL_MS);
             waited += PARK_POLL_MS;
+            if !noticed && waited >= notice_ms {
+                noticed = true;
+                gs::io::println(ctx, "  [q] quit");
+            }
+            if noticed {
+                if let Some(b) = ctx.inner.try_console_read() {
+                    if ServiceContext::QUIT_KEYS.contains(&b) { quit = true; break; }
+                    ctx.keep_key(b);
+                }
+            }
             let st = ctx.task_stat(slot);
             // state 2 = BlockedOnRecv → finished printing; invalid → gone.
             if !st.valid || st.state == 2 {
@@ -17062,8 +17149,13 @@ fn cmd_observe_now(ctx: &ServiceContext) -> Result<(), ShellError> {
         // Only when the park was actually OBSERVED. If the wait timed out, the child is still printing
         // and killing it would truncate the frame the user asked for - so leave it, and the defensive
         // kill at the top of this function reaps it next time. That is the case the old code was for.
-        if parked {
+        // And when the operator pressed `q`: a truncated frame is what they asked for.
+        if parked || quit {
             let _ = ctx.kill("observe-now");
+        }
+        if quit {
+            gs::io::println(ctx, "observe: stopped by q");
+            return Err(ShellError::Unknown);
         }
     }
     Ok(())

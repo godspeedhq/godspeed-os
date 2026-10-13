@@ -149,6 +149,18 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     `ns_take_tagged`) through `recv_quittable` (`backlog/84` S6). Not yet covered: the fs handles
     listed in the note above.)*
 
+    *(Note 2026-10-13: and the radio's and audio driver's asks. `wifi_ask` and `audio_ask` - every
+    `wifi` and `audio` verb, `wifi hardware` among them, which asks each radio twice and could sit for
+    12 s silent - wait through `ask_sifted_quittable` (the SDK's
+    `request_with_reply_keyhint_sifted_keeping`), and `wifi_ask`'s wait for answers the driver still owes
+    says it too; `q` there prints `stopped by q` rather than "not answering". `observe now`'s wait for its
+    frame and `date sync` say `[q] quit` as well. **Still silent, and why:** the waits on a kernel `Call`
+    - `recorder` and `copier` (8 to 12 s), `time` and the `ns_deadline` path to `net-stack` (each at its
+    caller's deadline), and the 2 s spawn request to the supervisor. A task blocked in a `Call` cannot read the console, and the
+    noticing form that can takes whatever reply lands next, which is what the `Call` is there to prevent:
+    giving them `[q]` needs a reply-matched wait that returns to the caller between slices, which does not
+    exist yet.)*
+
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,
     `sock` and `serve`'s listen all go through - used a bare `request_with_reply`, which parks the

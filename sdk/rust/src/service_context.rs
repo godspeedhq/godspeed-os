@@ -2041,6 +2041,24 @@ impl ServiceContext {
         out
     }
 
+    /// [`Self::request_with_reply_keyhint_sifted`] that HANDS BACK every key it reads that is not a leave
+    /// key, in order, as [`Self::request_with_reply_qhint_keeping`] does for the unsifted request. For a
+    /// caller whose waits must say `[q] quit` and must not lose what the operator types meanwhile.
+    pub fn request_with_reply_keyhint_sifted_keeping(
+        &self, peer: &str, msg: &crate::ipc::Message, hint_after_secs: i64, max_secs: i64,
+        leave_keys: &[u8], on_linger: impl FnOnce(),
+        mine: impl FnMut(&crate::ipc::Message) -> bool, keep: &dyn Fn(u8),
+    ) -> ReqOutcome {
+        let op = self.trace_in(peer, msg);
+        let out = self.request_with_reply_qhint_inner(peer, msg, hint_after_secs, max_secs, leave_keys, on_linger, mine, Some(keep));
+        self.trace_out(peer, op, match &out {
+            ReqOutcome::Reply(_) => crate::trace::KIND_REPLY,
+            ReqOutcome::Aborted  => crate::trace::KIND_ABORTED,
+            ReqOutcome::Timeout  => crate::trace::KIND_TIMEOUT,
+        });
+        out
+    }
+
 
 
     fn request_with_reply_inner(
