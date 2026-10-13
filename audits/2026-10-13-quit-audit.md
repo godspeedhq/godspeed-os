@@ -171,6 +171,50 @@ ticks`, `audio` (every verb, `tone`, `play`), `wifi scan` (with `[q] [b]`), `wif
    without a notice, `gs::call::request*`, raw `request_with_reply_*`, `spawn_via_supervisor`) and refuse any
    rise, as `one_way_check.py` does - until (2) makes the count zero.
 
+## 7a. The route chosen: the shell is the observer (operator, 2026-10-13)
+
+Section 7 puts `[q]` into every wait. The operator flipped it: the user is talking to the shell, so the
+SHELL watches the clock and supplies `[q]`, and "apps can be apps" - a program need not know about `q` at all.
+That works fully for one kind of command and partly for the other, because the shell has one thread.
+
+- **A command that is a separate program** (`ask`, chaos, the copier's jobs, pipe stages, `observe`): the shell
+  is only waiting on it, so it owns the clock - `[q] quit` at 2 s, `q` kills the program - and the program may
+  block however it likes. Killing is the shell's authority already. The wording is the shell's too, and it
+  must be honest: "stopped - its last action may have completed" (the `fs` journal keeps the disk
+  consistent either way). The `ask` drain already works this way.
+- **A command built into the shell** (`dir`, `copy`, `find`, `delete`, `drives`, `wifi`, `date`, most others):
+  no other code is running to watch, so the observer is a COMMAND clock: started when Enter is pressed, read by
+  every wait between its short slices, with the words printed once, by the shell. Waits still have to return
+  between slices - section 7's points 1, 5 and 6 - but it is one mechanism, and it closes section 1's largest
+  gap, the loop of fast requests.
+- **Direction**: every heavy built-in moved out into a program (`find`, `tree`, `copy`, `hardware` first)
+  becomes the first kind and gets `[q]` for free.
+- **A command `q` must not interrupt** (a format part way through) declares it once; the shell then says
+  `[q]` and reports "still running", never "stopped".
+
+### How the shell knows a command can go to the background
+
+Derived from authority, not from a list. A command offers `[b] background` beside `[q] quit` when all three
+hold:
+
+1. **It is a separate program.** A built-in runs on the shell's only thread and cannot continue while the
+   user types; it gains `[b]` only by moving into a program, as the copier's five jobs did.
+2. **It holds no console authority** - no console-read slot, no foreground - so it cannot be waiting on the
+   user. The supervisor's spawn row already says what each program is granted, so the shell asks rather
+   than keeping a list (a hand-kept list is how this repository's tables have drifted before).
+3. **Its output can be held until asked for**: a bounded transcript, as the copier keeps for `foreground`.
+   A program whose product is a live screen fails this.
+
+**One explicit "never"**, recorded in the program's own row with a reason, for a program that passes the test
+but must not be detached: `selfcheck` (an orchestrator) and `chaos` (it kills services, and an unattended
+storm is a decision to be watched). Programs opt out with a reason; nobody opts in.
+
+**The one open design question** is where a detached program's output lives: today only the copier keeps
+transcripts, for its own jobs. Either the shell keeps draining a detached program between keystrokes, or a
+small bounded transcript keeper holds it. The rule above does not depend on which.
+
+A command with no `[b]` shows `[q]` alone and says nothing about `[b]` (the operator's earlier ruling).
+
 ## 8. Not checked
 
 Real durations on a Pi 2 (yield cost, whether `fs` answers while mounting); the kernel `CallDeadline`

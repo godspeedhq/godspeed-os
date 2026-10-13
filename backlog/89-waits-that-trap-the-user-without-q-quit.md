@@ -48,6 +48,14 @@ with honest "still running" wording, and a ratchet checker that refuses a new si
 their own changes either way. Q8 is the rule text, rewritten to say: 2 s, on the slowest board; `[q]` always,
 and `[b]` where the work can run detached; never trapped; and what `q` must say when the work cannot stop.
 
+## The route chosen (2026-10-13)
+
+The operator flipped section 7: **the shell is the observer** (`audits/2026-10-13-quit-audit.md` 7a). For a
+command that is a separate program the shell owns the 2 s clock, the `[q]` words and the kill; for a built-in it
+starts one COMMAND clock at Enter that every wait reads between slices. `[b]` is derived from authority: a
+separate program, holding no console authority, whose output fits a bounded transcript - with a reasoned
+"never" for `selfcheck` and `chaos`.
+
 ## Next step
 
 The operator chooses: the primitive first (it removes Q1, Q2, Q5 and most of Q4 at once), or the user-facing
