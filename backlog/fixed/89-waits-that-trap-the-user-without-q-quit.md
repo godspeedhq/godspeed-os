@@ -1,6 +1,6 @@
 # 89. Waits that trap the user without `[q] quit`
 
-**Status: FIXED 2026-10-14 in QEMU; the T630 and Wyse cards passed, the Pi 2, Pi 4 and VisionFive are pending.** `osdev test quit`, the test the
+**Status: FIXED 2026-10-14 in QEMU; the T630, Wyse and Pi 2 cards passed, the Pi 4 and VisionFive are pending.** `osdev test quit`, the test the
 operator named, shows the rule met: 35 cases, 0 below the bar, `fs` and four services slowed (the tables
 below). Found by
 `audits/2026-10-13-quit-audit.md`, which has the evidence (file:line for every site), what passes and what was not
@@ -286,4 +286,25 @@ task; here it cannot, and the words say so).
   it, so the time a person spends answering `[y/N]` counts toward the 2 s, though rule 10 exempts a wait on
   the user. Harmless (the notice is true, only early); the fix is to restart the clock when `read_confirm`
   returns, and it waits for the cards in hand to finish.
-Still owed: the Pi 2, the Pi 4 and the VisionFive 2 Lite.
+**Raspberry Pi 2, 2026-10-14, passed** (`build/serial_output.log`, the same commit, `3ed46d5a`, the USB stick):
+
+- `drives flash data`, then `y`: the format took 20.7 s in `fs`, with `[q] quit` 1 s after the `y` (the early
+  notice the Wyse showed, here over a wait that earned it).
+- `dir` at the first prompt lists `/users/default` (holding `history`), and after `cd /` the root holds
+  `system` and `users` and nothing else. (`home` was typed and not entered: the echo runs on into `dir` with
+  no Enter between; `selfcheck` covers it.)
+- A typed `drives check`: `[q] quit   [b] background` 2 s after `copier` was spawned, `b` gave
+  `[backgrounded] job 1` 0.9 s later, and the sweep ran on for 34 s in `fs`. `foreground 1` said "job 1 is
+  done" and replayed the four lines once it ended.
+- `selfcheck`: `ran 585, failed 0, skipped 1` (the skip is `hw-enumerator`: no PCI on this board).
+- **Seen, not fixed:** `jobs` while the check ran took 8 s - `[q] quit` at 2 s, then the table with the row as
+  last seen (`running`). `copier` reads nothing while it is inside its one `fs` request, so the status question
+  waits out `copier_status`'s 8 s and comes back `Busy`. The rule is met (a `[q]` past 2 s), but `jobs` is a
+  look and should not take 8 s; for a check, a scrub or a tree delete, which are each one request, it could
+  say "running" from the row without asking. Recorded with the clock edge above, for after the cards.
+- The serial log does not show when Enter was pressed for `foreground 1`, so whether its wait passed 2 s
+  cannot be read off it. The code's bound on it is `copier_status`'s 8 s under the watch, and no `[q]` line
+  appears, so by the code it answered within 2 s of Enter.
+- Not exercised here either: a large `copy` with `q`, `delete <dir> recursive` with `b`, and `q` on
+  `foreground` of a running job.
+Still owed: the Pi 4 and the VisionFive 2 Lite.
