@@ -1,0 +1,3 @@
+# `// quit-ok:` exceptions in services/shell/src (scripts/quit_wait_check.py). MAY FALL, MAY NOT
+# RISE; rewritten by `--bless`, and the commit says why the new exception cannot trap anyone.
+10  services/shell

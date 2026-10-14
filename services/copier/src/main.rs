@@ -303,10 +303,6 @@ fn fs_delete(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8]) -> Fs {
     fsr(ctx, "delete", fs.delete(path).map(|_| 0))
 }
 
-fn fs_mkdir(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8]) -> Fs {
-    fsr(ctx, "mkdir", fs.create_dir(path).map(|_| 0))
-}
-
 fn fs_write_file(ctx: &ServiceContext, fs: &mut gs::fs::Fs, path: &[u8], data: &[u8]) -> Fs {
     fsr(ctx, "write", fs.write(path, data).map(|_| 0))
 }

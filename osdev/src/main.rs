@@ -274,9 +274,10 @@ fn cmd_mkfs(image: &str) {
 /// `docs/filesystem-layout.md`). Kept in step with that list by hand: it is five names.
 const FS_LAYOUT: [&str; 5] = ["system/services", "system/utilities", "system/shared", "system/scratch", "users/default"];
 
-/// Give a freshly formatted image the standard tree, as `drives flash` does on the machine. Only the
-/// operator-facing builders call it (`mkfs`, `script-disk`); the test fixtures keep the bare format, because
-/// several suites count the directories and records on the disk they built.
+/// Give a freshly formatted image the standard tree, as `drives flash` does on the machine. Called by the
+/// operator-facing builders (`mkfs`, `script-disk`) and by the script suite, whose `selfcheck` checks the
+/// tree; the other fixtures keep the bare format, because several suites count the directories and records
+/// on the disk they built.
 fn gsfs_layout(path: &str) {
     let mut data = std::fs::read(path)
         .unwrap_or_else(|e| { eprintln!("layout: cannot read {}: {}", path, e); std::process::exit(1); });
@@ -543,6 +544,10 @@ const EXTRA_CHECKS: &[&str] = &[
     // and radio drivers arrived, because its driver list is hand-kept. Found by the 2026-10-09 audit;
     // the list was corrected the same day. A checker on one build path is a checker on none.
     "scripts/stdlib_gap_check.py",
+    // NO SILENT WAIT IN THE SHELL (backlog/89, conventions rule 10): every wait the shell makes reads the
+    // command's watch, or carries `// quit-ok:` saying why it cannot trap anyone, and those exceptions may
+    // fall and may not rise. On the build path from its first day, for the reason above.
+    "scripts/quit_wait_check.py",
 
     // ---- AND THE COMMENTS, which the audit above could not finish ------------------------------
     //

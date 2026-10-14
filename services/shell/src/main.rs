@@ -462,9 +462,10 @@ pub struct ShellCtx {
     /// Non-zero when the last `wifi_ask` returned nothing WITHOUT SENDING, because the driver still owed
     /// this many earlier answers. `wifi_not_answering` reads it to say so instead of "not answering".
     wifi_unsent: core::cell::Cell<u32>,
-    /// The operator pressed `q` during the last `wifi_ask` or `audio_ask`. Read straight after one returns
-    /// nothing, so "not answering" is not said about a wait the operator ended; and by a command that asks
-    /// several times in a row (`wifi hardware`) to stop asking. Set false at the start of every ask.
+    /// The operator quit the command now running: any watched wait sets it (`gs::call::Watch`), and
+    /// `begin_command` clears it; an ask between commands (a shortcut key) clears it for itself. Read after a
+    /// wait returns nothing, so "not answering" is not said about a wait the operator ended, and by a command
+    /// that asks several times in a row (`wifi hardware`) to stop asking.
     quit: core::cell::Cell<bool>,
     /// THE COMMAND CLOCK (`audits/2026-10-13-quit-audit.md` 7a): a command is running, when it started
     /// (monotonic seconds), and whether its `[q] quit` has been shown. The shell is the observer: every wait
@@ -545,7 +546,8 @@ impl ShellCtx {
         self.inner.console_read()
     }
     /// An `fs` handle for a command that may WAIT on `fs`: the `[q] quit` notice and the type-ahead
-    /// keep (`backlog/fixed/80` H16). The same at the prompt and in a script: since the SDK's noticing wait
+    /// keep (`backlog/fixed/80` H16), for a wait between commands; inside a command the command's watch
+    /// takes over (`watching`). The same at the prompt and in a script: since the SDK's noticing wait
     /// blocks in the kernel until the notice is due and reads no key before it, it costs a script
     /// nothing. (It once polled from the start, and `selfcheck`'s second run in one boot outran its
     /// 300 s window, so scripts were given the plain handle until that was fixed.)
@@ -1252,13 +1254,21 @@ fn complete_wifi_stored(ctx: &ShellCtx, line: &mut Line, tok_start: usize) -> bo
     let msg = wifi_tagged(&[9u8], wifi_wire::COMPLETION_TAG);
     let ours = |m: &Message| wifi_is_answer(m, Some(wifi_wire::COMPLETION_TAG));
     // Completion runs without the shell's state, so it finds the radio itself.
+    // Tab is a key, not a command, so there is no `[q]` to offer: the wait is kept under 2 s instead. The second
+    // ask is for a send that never left (a timeout back inside 250 ms), not for a radio that was slow - two full
+    // waits made Tab silent for 3 s (`backlog/89`).
     let reply = match find_radio(ctx) {
         None => None,
-        Some(radio) => match ctx.request_with_reply_ms_sifted(radio, &msg, 1500, ours) {
-            Some(r) => Some(r),
-            None if gs::cap::reacquire(ctx, radio) => ctx.request_with_reply_ms_sifted(radio, &msg, 1500, ours),
-            None => None,
-        },
+        Some(radio) => {
+            let t0 = gs::driver::wait::Since::now(ctx);
+            // quit-ok: Tab is a key, not a command: 1.5 s at most, and the second ask below only for a send that never left
+            match ctx.request_with_reply_ms_sifted(radio, &msg, 1500, ours) {
+                Some(r) => Some(r),
+                None if !t0.passed(ctx, gs::driver::wait::Budget::ms(250)) && gs::cap::reacquire(ctx, radio) =>
+                    ctx.request_with_reply_ms_sifted(radio, &msg, 1500, ours),
+                None => None,
+            }
+        }
     };
     if let Some(r) = reply {
         let r = wifi_untag(&r);
@@ -5129,15 +5139,11 @@ fn selfcheck_tidy(ctx: &ShellCtx) {
     }
 }
 
-/// `selfcheck` - run the embedded self-check suite IN MEMORY (straight from rodata via
-/// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
-/// checkpoint - flash the boot image, (`drives flash` a drive if it's raw, so the file-command
-/// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
-/// its own files). Refused inside a script (it runs one - no nesting).
-#[inline(never)]
 /// `selfcheck`, leaving the operator where they were. Its parts move about the disk and end at `/`, and
 /// the prompt does not show the folder, so without this a bare name typed after a self-check lands
-/// somewhere the operator never chose (found on the T630, 2026-10-13).
+/// somewhere the operator never chose (found on the T630, 2026-10-13). `inline(never)` keeps the suite's
+/// frame (`cmd_selfcheck_parts` may inline here) off `execute`'s.
+#[inline(never)]
 fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
     let before = cwd.clone();
     let r = cmd_selfcheck_parts(ctx, cwd, depth, arg);
@@ -5145,6 +5151,11 @@ fn cmd_selfcheck(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<
     r
 }
 
+/// `selfcheck` - run the embedded self-check suite IN MEMORY (straight from rodata via
+/// `run_lines`; no file write, so it is not capped by `MAX_FILE_BYTES`). The one-USB hardware
+/// checkpoint - flash the boot image, (`drives flash` a drive if it's raw, so the file-command
+/// tests have somewhere to write), then `selfcheck`. Re-runnable (the suite creates and deletes
+/// its own files). Refused inside a script (it runs one - no nesting).
 fn cmd_selfcheck_parts(ctx: &ShellCtx, cwd: &mut Cwd, depth: u8, arg: &str) -> Result<(), ShellError> {
     if depth > 0 {
         gs::io::println(ctx, "selfcheck: not available inside a script, `repeat` or `assert` (it runs one)");
@@ -11159,6 +11170,7 @@ fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64, noticed: &core::cell::Cell<bool>
     let limit = gs::driver::wait::Budget::ms(max_ms);
     let notice_at = gs::driver::wait::Budget::ms(gs::call::NOTICE_AFTER_SECS as u64 * 1000);
     while ctx.wifi_owed.get() > 0 && !t0.passed(ctx, limit) {
+        // quit-ok: 20 ms a pass of a loop that says `[q] quit` at 2 s and reads `q` after it
         if let Some(m) = gs::ipc::recv_within_ms(ctx, 20) {
             wifi_sift(ctx, &m, None);
         }
@@ -12560,8 +12572,8 @@ fn wifi_radio(ctx: &ShellCtx, out: &mut Out, on: bool) -> Result<(), ShellError>
     // Through `wifi_ask`, like `wifi status` and `wifi scan`: the reply must come from the driver, the reply
     // mailbox is drained and owed answers are waited out first, which keeps a late answer to an earlier,
     // abandoned request from being read as this one's in the cases the shell can see (the matching is by
-    // sender, not by request - see `wifi_ask`). The round trip blocks; the only wait
-    // here that is ever long is the watch below, and it keeps `q`.
+    // sender, not by request - see `wifi_ask`). The round trip says `[q] quit` past 2 s and stops the wait on
+    // `q` (`ask_sifted_quittable`); the driver finishes the request either way.
     const MAX_SECS: i64 = 15;
     let r = match wifi_ask(ctx, &[OP_RADIO, on as u8], (MAX_SECS as u64) * 1000) {
         Some(r) => r,
@@ -12897,8 +12909,8 @@ fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
     // Through `wifi_ask` like the rest of the radio ladder: stale replies drained and owed ones waited out
     // first, since the Call matches by sender, not by request. It blocks until the driver has left the
     // network, cut the power and checked the chip is silent on its bus - about three seconds - and says so
-    // first. There is no [b]: a blocking Call cannot poll the console mid-flight (the kernel dequeue is
-    // welded to the send), and three seconds does not earn a new kernel syscall to make it abortable.
+    // first. `q` stops the wait, not the cut (`ask_sifted_quittable`), and says so; there is no [b], because
+    // three seconds does not earn one.
     const MAX_SECS: i64 = 15;
     // Said as a question, not as what happens: a driver with no power to cut (a USB dongle's is its port's)
     // answers NO_POWER_CONTROL without leaving the network (`serve::Host::can_cut_power`).
@@ -13118,6 +13130,7 @@ fn net_query(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64, tag: Opti
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }
         }
+        // quit-ok: 1 s a pass of a loop that reads `q` before every pass
         if let Some(r) = ctx.request_with_reply_deadline(peer, msg, 1) {
             // A TAGGED channel checks the answer belongs to the question. An overtaken reply is
             // discarded and the poll continues rather than being believed - which is the entire point
@@ -17653,8 +17666,7 @@ enum Drained {
 /// for its first message, because it answers only after asking them (`ASK_WAIT_SECS`).
 /// `keep`, when given, receives every key typed during the wait that is not `q`, so a command typed
 /// while the stage runs reaches the prompt instead of vanishing. `None` keeps a plain pipe stage's
-/// behaviour, which still drops type-ahead - the shell's other drains take a `&ServiceContext` and
-/// cannot reach the type-ahead buffer (recorded, `backlog/fixed/80` H16's receive side).
+/// behaviour, which still drops type-ahead (recorded, `backlog/fixed/80` H16's receive side).
 fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
                       wait_secs: i64, keep: Option<&dyn Fn(u8)>) -> Drained {
     // A stage crossing a service boundary is one IPC message until streaming chunks across
@@ -19387,7 +19399,7 @@ fn chaos_spawn_storm(ctx: &ShellCtx, _cwd: &Cwd, tok: &[&str], ntok: usize) -> R
 // ---------------------------------------------------------------------------
 
 /// The current directory on the (single) drive - an absolute path like "/" or "/etc". Also
-/// remembers the *previous* directory so `cd -` can toggle back (both default to root).
+/// remembers the *previous* directory so `cd -` can toggle back (both start at the session's home, `HOME`).
 #[derive(Clone)]
 struct Cwd {
     buf: [u8; PATH_MAX],
@@ -19553,11 +19565,6 @@ fn time_synced_secs_ago(ctx: &ShellCtx) -> Option<i64> {
     match i64::from_le_bytes(b) { a if a < 0 => None, a => Some(a) }
 }
 
-/// Write a whole (small) file with a SHORTER deadline than the default. `true` if it went.
-///
-/// For a write nobody is waiting on - the history file, a marker, a report saved after a chaos storm
-/// has just hammered `fs`. A shorter wait makes [`gs::Error::OutcomeUnknown`] MORE likely, not less,
-/// so this is only right where "it may have landed" is an acceptable answer and hanging is not.
 /// The session's home: where the shell starts and where a bare `cd` goes (`docs/filesystem-layout.md` 6).
 /// `fs` makes it when it formats a disk. In a script it is `$home`.
 const HOME: &str = "/users/default";
@@ -19593,6 +19600,11 @@ fn sh_mkdir_within(ctx: &ShellCtx, path: &[u8], secs: i64) -> bool {
     ok
 }
 
+/// Write a whole (small) file with a SHORTER deadline than the default. `true` if it went.
+///
+/// For a write nobody is waiting on - the history file, a marker, a report saved after a chaos storm
+/// has just hammered `fs`. A shorter wait makes [`gs::Error::OutcomeUnknown`] MORE likely, not less,
+/// so this is only right where "it may have landed" is an acceptable answer and hanging is not.
 fn sh_write_within(ctx: &ShellCtx, path: &[u8], data: &[u8], secs: i64) -> bool {
     let mut g = ctx.fs().patience_secs(secs);
     let ok = g.write(path, data).is_ok();
@@ -19801,15 +19813,6 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     }
 }
 
-/// Report a mutating command that got no answer - and say WHICH of the two things happened.
-///
-/// "storage unavailable" is true when the request never reached `fs`. It is a LIE when the request
-/// ran and its reply was lost: storage was fine, the operation may well have succeeded, and telling
-/// an operator their `move` did not happen when the file has moved is a confident wrong answer about
-/// a destructive operation (carnage §3.5, §26.7).
-///
-/// One helper rather than seven hand-written wordings, because the seven sites drifting apart is how
-/// the honest half gets left out of whichever one is touched last.
 /// A command the operator quit says it STOPPED - never "storage error" or "failed" (`backlog/89` Q6), which
 /// sends a person looking for a fault that is not there. `left` says what a half-done command leaves
 /// behind, where that is anything but nothing. `true` when it was a quit, and the line is said.
@@ -19825,6 +19828,15 @@ fn said_stopped(ctx: &ShellCtx, verb: &str, left: &str) -> bool {
     true
 }
 
+/// Report a mutating command that got no answer - and say WHICH of the two things happened.
+///
+/// "storage unavailable" is true when the request never reached `fs`. It is a LIE when the request
+/// ran and its reply was lost: storage was fine, the operation may well have succeeded, and telling
+/// an operator their `move` did not happen when the file has moved is a confident wrong answer about
+/// a destructive operation (carnage §3.5, §26.7).
+///
+/// One helper rather than seven hand-written wordings, because the seven sites drifting apart is how
+/// the honest half gets left out of whichever one is touched last.
 fn fs_no_answer(ctx: &ShellCtx, verb: &str) {
     if said_stopped(ctx, verb, "") {
         return;
@@ -20118,23 +20130,28 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
     }
 }
 
-/// A request that prints `[q] quit` once the wait passes `gs::call::NOTICE_AFTER_SECS` and stops on a
-/// quit key, through `gs::call::request_within_notice`, answered in the `ReqOutcome` shape its callers
-/// already handle: a reply, the user's quit, or no answer in time. `inline(always)`: it returns a 4 KiB
-/// message by value, and as its own frame that would be another 4 KiB of the shell's stack.
-#[inline(always)]
 /// A request to a service under the command's watch (`gs::call::Watch`): it says the command's `[q] quit` and
 /// honours it, and between commands it is the plain bounded request it replaced
 /// (`request_with_reply_deadline`). `None` for no answer, including a quit - the caller's `said_stopped` or
-/// `ctx.quit` tells the two apart. Every service wait in the shell is built on this or on `ctx.fs()`
-/// (`backlog/89`).
+/// `ctx.quit` tells the two apart. Every service wait in the shell is built on this, `ask_with_quit_notice`
+/// or `ctx.fs()`, or says beside it why it cannot trap anyone (`// quit-ok:`, `scripts/quit_wait_check.py`;
+/// `backlog/89`). `inline(always)`: it returns a 4 KiB message by value, and as its own frame that would be
+/// another 4 KiB of the shell's stack.
+#[inline(always)]
 fn ask_watched(ctx: &ShellCtx, peer: &str, msg: &Message, secs: i64) -> Option<Message> {
     if !ctx.cmd_active.get() {
+        // quit-ok: between commands, where there is no command to quit; inside one, the watch below
         return ctx.request_with_reply_deadline(peer, msg, secs);
     }
     gs::call::request_watched(ctx, peer, msg, secs, ctx).ok()
 }
 
+/// A request that says `[q] quit` once the wait passes `gs::call::NOTICE_AFTER_SECS` and stops on a quit key,
+/// answered in the `ReqOutcome` shape its callers already handle: a reply, the user's quit, or no answer in
+/// time. Inside a command it is the command's watch (`gs::call::request_watched`); between commands, its own
+/// notice (`gs::call::request_within_notice`). `inline(always)`: it returns a 4 KiB message by value, and as
+/// its own frame that would be another 4 KiB of the shell's stack.
+#[inline(always)]
 fn ask_with_quit_notice(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64) -> ReqOutcome {
     let notice = || gs::io::println(ctx, "  [q] quit");
     let keep = |b: u8| ctx.keep_key(b);   // type-ahead read during the wait is kept (H16)
@@ -22876,7 +22893,7 @@ fn copier_status(ctx: &ShellCtx) -> Ask {
         return Ask::Gone;
     }
     let _ = gs::cap::reacquire(ctx, "copier");
-    let r = match ask_watched(ctx, "copier", &Message::from_bytes(&[CP_OP_STATUS]), 8) {
+    let r = match copier_ask_watched(ctx, &[CP_OP_STATUS], 8) {
         Some(r) => r,
         None => return Ask::Busy,
     };
@@ -23041,7 +23058,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
 
 /// Why a job did not start. `Unavailable` started nothing, so a typed command runs in the shell instead;
 /// `Failed` may have started it and has said so; `Pending` is a typed command's start sent and not yet answered:
-/// its row is written, as job `.0`, and the attach loop reads the answer.
+/// its row is written under the hidden id `Pending` carries, and the attach loop reads the answer.
 enum JobStart { Unavailable, Failed, Pending(u32) }
 
 /// Start a job in `copier` and record its row: `background`'s start, and a typed command's (`run_typed_as_job`).
@@ -23130,7 +23147,8 @@ fn start_job(ctx: &ShellCtx, kind: u8, src: &[u8], dst: &[u8], secs: u64, say: b
     // later, so a `q` or a `b` is read from the moment the command is a job. Waiting for it here held both
     // keys behind a slow `copier`'s answer (up to 5.6 s from the key to the prompt in `osdev test quit`).
     let mut pending = false;
-    let answer = if say { ask_watched(ctx, "copier", &Message::from_bytes(&req[..n]), 12) } else {
+    let answer = if say { copier_ask_watched(ctx, &req[..n], 12) } else {
+        // quit-ok: 1 ms - the start is sent, and `attach_job`'s loop reads its answer between the keys
         match ctx.request_with_reply_ms("copier", &Message::from_bytes(&req[..n]), 1) {
             Some(r) if copier_answers(&r, CP_OP_START) => Some(r),
             _ => { pending = true; None }
@@ -23199,10 +23217,17 @@ fn run_typed_as_job(ctx: &ShellCtx, kind: u8, src: &[u8], dst: &[u8]) -> Option<
     }
 }
 
+/// A job the table believes is still running: a typed command then runs in the shell (one job at a time).
+fn job_believed_live(ctx: &ShellCtx) -> bool {
+    ctx.jobs.borrow().rows.iter().any(|r| r.used && r.live)
+}
+
 /// `copy <src> <dst>` typed: a job when the source is a file. A directory, a missing source or a bad path
 /// is the shell's to explain, so those run there.
 fn copy_typed(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
-    ctx.offer_b.set(true);   // the stat below is a request too, and its notice should say `[b]`
+    // The stat below is a request too, and its notice should say `[b]` - but only where the key will work: with
+    // a job believed live, the command runs in the shell, and a `[b]` shown during the stat would be a lie.
+    ctx.offer_b.set(!job_believed_live(ctx));
     let mut sbuf = [0u8; PATH_MAX];
     let mut dbuf = [0u8; PATH_MAX];
     if let (Some(sl), Some(dl)) = (resolve_path(cwd.as_str(), src, &mut sbuf), resolve_path(cwd.as_str(), dst, &mut dbuf)) {
@@ -23216,7 +23241,7 @@ fn copy_typed(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), She
 
 /// `delete <dir> recursive` typed: a job when the path is a directory; anything else runs in the shell.
 fn delete_typed(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
-    ctx.offer_b.set(true);
+    ctx.offer_b.set(!job_believed_live(ctx));   // as `copy_typed`
     let mut buf = [0u8; PATH_MAX];
     if let Some(n) = resolve_path(cwd.as_str(), arg, &mut buf) {
         if &buf[..n] != b"/" && stat_kind(ctx, &buf[..n]) == Some(true) && !ctx.quit.get() {
@@ -23274,6 +23299,7 @@ fn copier_answers(r: &Message, op: u8) -> bool {
 /// that arrives is a late reply to a question nobody is waiting for, and is dropped. Bounded: eight messages.
 fn copier_recv(ctx: &ShellCtx, op: u8, ms: u64) -> Option<Message> {
     for _ in 0..8 {
+        // quit-ok: `copier_ask`'s bound, below, is this one's
         match gs::ipc::recv_within_ms(ctx, ms) {
             Some(r) if copier_answers(&r, op) => return Some(r),
             Some(_) => continue,
@@ -23283,10 +23309,24 @@ fn copier_recv(ctx: &ShellCtx, op: u8, ms: u64) -> Option<Message> {
     None
 }
 
+/// A question to `copier` under the command's watch, taking only the answer to `op_msg`'s op. `copier`'s replies
+/// carry no tag, so this is what drops a late one: a cancel looked for for 300 ms after a `q` is answered later,
+/// and an unsifted wait took that answer as the next `background` start's (`osdev test jobs`, 21 failures
+/// after the look was shortened from 8 s). Between commands it is the plain sifted `copier_ask`.
+fn copier_ask_watched(ctx: &ShellCtx, op_msg: &[u8], secs: i64) -> Option<Message> {
+    let op = op_msg.first().copied().unwrap_or(0);
+    if !ctx.cmd_active.get() {
+        return copier_ask(ctx, op_msg, (secs.max(1) as u64) * 1000);
+    }
+    gs::call::request_watched_sifted(ctx, "copier", &Message::from_bytes(op_msg), secs, ctx,
+                                     &mut |m| copier_answers(m, op)).ok()
+}
+
 /// A PLAIN question to `copier`, not under the watch: asked while attached, where the console loop reads the
 /// keys itself, and after a `q`, when a watched one would not be sent at all.
 fn copier_ask(ctx: &ShellCtx, op_msg: &[u8], ms: u64) -> Option<Message> {
     let op = op_msg.first().copied().unwrap_or(0);
+    // quit-ok: bounded by its callers: 1 ms in the attach loop, 300 ms before a start, 8 to 12 s only between commands
     match ctx.request_with_reply_ms("copier", &Message::from_bytes(op_msg), ms) {
         Some(r) if copier_answers(&r, op) => Some(r),
         Some(_) => copier_recv(ctx, op, ms),
@@ -23418,6 +23458,7 @@ fn quit_unstarted(ctx: &ShellCtx, id: u32, kind: u8) -> Result<(), ShellError> {
     if kind == KIND_COPY {
         // `copier` reads its messages in order, so a cancel sent now follows the start: a copy that began stops
         // before its first chunk, and removes what it made.
+        // quit-ok: after a `q`: one 300 ms look, inside the 3 s rule 10 gives the prompt
         let _ = ctx.request_with_reply_ms("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 300);
         gs::io::println_fmt(ctx, format_args!(
             "copy: stopped - copier had not yet answered the start, and the cancel goes in behind it; `jobs` says what job {} did",
@@ -23448,6 +23489,7 @@ fn quit_attached(ctx: &ShellCtx, id: u32, kind: u8) -> Result<(), ShellError> {
     // A copy, between its chunks: `copier` cancels it and removes the incomplete destination. ONE short look
     // for its answer and no more: a status question still owed is answered first, and waiting through both
     // took 5.5 s from `q` to the prompt in `osdev test quit`. Unanswered is said as that, with the job's number.
+    // quit-ok: after a `q`: one 300 ms look, inside the 3 s rule 10 gives the prompt
     let acked = matches!(ctx.request_with_reply_ms("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 300),
                          Some(ref r) if copier_answers(r, CP_OP_CANCEL));
     if acked {
@@ -23509,7 +23551,7 @@ fn cmd_jobs_quit(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         gs::io::println_fmt(ctx, format_args!("jobs quit: job {} is already {}", want, state_word(state)));
         return Err(ShellError::Unknown);
     }
-    match ask_watched(ctx, "copier", &Message::from_bytes(&[CP_OP_CANCEL]), 12) {
+    match copier_ask_watched(ctx, &[CP_OP_CANCEL], 12) {
         Some(_) => {
             refresh_jobs(ctx);
             gs::io::println_fmt(ctx, format_args!("job {} stopped", want));
@@ -23587,10 +23629,24 @@ fn replay_transcript(ctx: &ShellCtx, indent: &str) {
         let mut req = [0u8; 5];
         req[0] = CP_OP_OUTPUT;
         req[1..5].copy_from_slice(&off.to_le_bytes());
-        // Plain and sifted (`copier_ask`): a reply left over from a status question is not this page.
-        let r = match copier_ask(ctx, &req, 8000) {
-            Some(r) => r,
-            None => return,
+        // Sifted by op: a reply left over from a status question is not this page. Under the command's watch
+        // when there is one, so a slow `copier` says `[q] quit` here as everywhere else (`backlog/89`); plain
+        // (`copier_ask`) only between commands.
+        let r = if ctx.cmd_active.get() {
+            match gs::call::request_watched_sifted(ctx, "copier", &Message::from_bytes(&req), 8, ctx,
+                                                   &mut |m| copier_answers(m, CP_OP_OUTPUT)) {
+                Ok(r) => r,
+                Err(gs::Error::Cancelled) => {
+                    gs::io::println_fmt(ctx, format_args!("{}(stopped reading what it said)", indent));
+                    return;
+                }
+                Err(_) => return,
+            }
+        } else {
+            match copier_ask(ctx, &req, 8000) {
+                Some(r) => r,
+                None => return,
+            }
         };
         let p = r.payload_bytes();
         if p.len() < 10 || p[0] != CP_OK || p[1] != CP_OP_OUTPUT {
@@ -23676,8 +23732,12 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             if b == b'q' || b == b'Q' || b == 0x1b {
                 // `q` STOPS THE TASK, not just this view of it (conventions rule 11). Anything else
                 // would make the key mean two different things depending on what it is pressed in.
-                // Plain, not under the watch: the command is already quit and the cancel must still go.
-                let acked = ctx.request_with_reply_deadline("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 8).is_some();
+                // Plain, not under the watch: the command is already quit and the cancel must still go. ONE
+                // short look for the answer, as `quit_attached` takes: this waited 8 s, silent, after a `q`
+                // that rule 10 gives 3 s to bring the prompt back. Unanswered is said as that, below.
+                // quit-ok: after a `q`: one 300 ms look, inside the 3 s rule 10 gives the prompt
+                let acked = matches!(ctx.request_with_reply_ms("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 300),
+                                     Some(ref r) if copier_answers(r, CP_OP_CANCEL));
                 refresh_jobs(ctx);
                 // "stopped" only once copier said so: it printed that for a cancel nobody had answered.
                 if acked {
