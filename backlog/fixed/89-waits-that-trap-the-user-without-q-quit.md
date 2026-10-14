@@ -351,8 +351,14 @@ request (one 300 ms question, its answer looked for, a new one at most every 2 s
 wait now stops `foreground`'s loop, which before ran on until the job ended; the command clock runs from Enter,
 and the history save is skipped while a one-request job holds `fs`; `read_confirm` restarts the clock.
 `osdev test quit` 37 cases, 0 below the bar, with two new ones: `foreground` of a live check (`q` back in
-0.1 s) and `jobs` during a live scrub (answered at once). `osdev test jobs` 60/0. The VisionFive card for it
-is pending.
+0.1 s) and `jobs` during a live scrub (answered at once). `osdev test jobs` 60/0.
+
+**VisionFive card for `ca40aa75`, 2026-10-14, passed** ("much quicker this time", the operator): during a
+19.4 s check, `jobs` answered with the row (`running`) as soon as it was typed; `foreground 1` printed
+`[q] quit   [b] background` at once and `b` gave the prompt back; a second `jobs` answered at once; once the
+check ended, `foreground 1` replayed its four lines. `drives flash` printed `[q] quit` 1.3 s after its request
+went to `fs`, a 14.5 s format. `selfcheck`: `ran 593, failed 0, skipped 1` (DNS: no internet on that network).
+The Pi 4 card is next.
 
 **The SBCs were slower than the x86 machines at backgrounding and foregrounding** (the operator, 2026-10-14):
 the Pi 2, Pi 4 and VisionFive each took longer than the T630 and Wyse from Enter to the notice, from `b` to
