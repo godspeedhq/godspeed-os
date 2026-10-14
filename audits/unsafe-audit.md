@@ -53,6 +53,8 @@ boot-only ports answer it with safe stubs.
 | `arch/x86_64/acpi.rs` | new, 5 | ACPI S5. ONE `slice::from_raw_parts` turns a firmware table's address into a slice of its own stated length (bounded at 1 MiB), so every field and the whole `\_S5` scan are bounds-checked indexing; then the port I/O the FADT names: a 16-bit read and write of `PM1a/PM1b_CNT`, the 8-bit `SMI_CMD <- ACPI_ENABLE` handshake, and one `cli`. No kernel memory is written. |
 | `arch/aarch64/mod.rs` | 73 -> 74 (+1) | `power_off` (Pi 4): the BCM2711 power-management registers `hardware_reset` already writes, through the kernel's Device mapping, with the boot partition set to 63 (halt, Linux `bcm2835_power_off`) instead of cleared. Password-gated volatile writes, poked once. |
 | `arch/arm/mod.rs` | 52 -> 53 (+1) | `power_off` (Pi 2): the same for the BCM2836, in the Device-mapped peripheral window. |
+| `arch/aarch64/mod.rs` | 74 -> 75 (+1) | `power_off` (Pi 4), after the Pi 2 card: a bounded wait on the PL011 flag register's BUSY bit before the watchdog is armed, so the last line leaves the UART before the board halts. One volatile read through the Device mapping, as at UART init. |
+| `arch/arm/mod.rs` | 53 -> 54 (+1) | `power_off` (Pi 2): the same wait, after the TX ring is flushed; the Pi 2's last line was cut off mid-sentence without it. |
 | `arch/riscv64/sbi.rs` | 11 -> 12 (+1) | `system_shutdown`: SBI SRST with the specification's shutdown type, probed first; it does not return on success and answers an error otherwise, touching no kernel memory. |
 | `sdk/rust/src/service_context.rs` | 77 -> 79 (+2) | `power_off_call`: one `unsafe { raw_syscall(56, ..) }` call site behind the three safe wrappers `power_off`, `power_off_in` and `power_off_cancel`, two integers to a kernel that checks the capability before acting; and `power_off_pending`, one `unsafe { raw_syscall(13, 28, ..) }` read with no pointer. The single design consequence the `cpu_clock` entry below names. Floor amended at CLAUDE.md 18.5, 2026-10-14. |
 
@@ -2696,7 +2698,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 74 | permitted |
+| arch/aarch64/mod.rs | 75 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |
@@ -2732,7 +2734,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 17 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 53 | permitted |
+| arch/arm/mod.rs | 54 | permitted |
 | arch/loongarch64/mod.rs | 24 | permitted |
 | arch/riscv32/mod.rs | 24 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |

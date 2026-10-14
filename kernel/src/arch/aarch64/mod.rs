@@ -1835,6 +1835,15 @@ pub fn power_off() -> &'static str {
     const PM_RSTS_HALT: u32 = !PM_RSTS_PARTITION;
     crate::kprintln!("power-off: halting through the firmware (boot partition 63); the rails go off only if \
                       the EEPROM sets POWER_OFF_ON_HALT=1");
+    // The watchdog fires about 150 us after it is armed, long before that line has left at 115200 baud (the Pi 2
+    // lost the end of its line this way, 2026-10-14): wait for the UART's FIFO and shift register to empty
+    // (BUSY) first. Bounded, so a wedged UART delays the halt and never stops it.
+    // SAFETY: a volatile read of the PL011 flag register through the kernel's Device mapping, as at init.
+    unsafe {
+        let fr = mmio(PL011_FR as usize) as *const u32;
+        let mut t = 0u32;
+        while fr.read_volatile() & PL011_FR_BUSY != 0 && t < 1_000_000 { t += 1; }
+    }
     // SAFETY: the same BCM2711 power-management registers `hardware_reset` writes, through the kernel's
     // Device mapping; volatile 32-bit writes gated by the 0x5A password. Poked once: re-arming the watchdog
     // restarts its countdown.

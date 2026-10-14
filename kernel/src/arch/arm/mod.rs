@@ -1280,6 +1280,15 @@ pub fn power_off() -> &'static str {
     const PM_RSTS_HALT: u32 = !PM_RSTS_PARTITION;
     const WDOG_TICKS: u32 = 10;
     crate::kprintln!("power-off: halting through the firmware (boot partition 63); the board stays powered");
+    // The watchdog fires about 150 us after it is armed, and that line takes about 8 ms to leave at 115200 baud: it
+    // was cut off mid-sentence on the Pi 2 (2026-10-14). So the UART is emptied first - the ring, then the FIFO and
+    // the shift register (BUSY) - bounded, so a wedged UART delays the halt and never stops it.
+    tx_ring_flush_blocking();
+    // SAFETY: a volatile read of the PL011 flag register, identity-mapped like every other read of it here.
+    unsafe {
+        let mut t = 0u32;
+        while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 && t < 1_000_000 { t += 1; }
+    }
     // SAFETY: the same BCM2835 power-management registers `hardware_reset` writes, in the Device-mapped
     // peripheral window; volatile 32-bit writes gated by the 0x5A password. Poked ONCE and then left to run
     // out - re-arming the watchdog restarts its countdown (see `hardware_reset`).
