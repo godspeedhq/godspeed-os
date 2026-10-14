@@ -343,3 +343,20 @@ the USB stick through `xhci`):
 All five boards have now run this branch's image. Never exercised on any of them, because the job ended
 before the key: `q` on `foreground` of a running job, a large `copy` with `q`, `delete <dir> recursive` with
 `b`. `osdev test quit` and `osdev test jobs` cover each in QEMU.
+
+## After the cards: the three edges fixed (`ca40aa75`), and the SBCs slower
+
+**Fixed in `ca40aa75`, QEMU only so far:** `jobs` and `foreground` no longer wait on a `copier` inside one `fs`
+request (one 300 ms question, its answer looked for, a new one at most every 2 s); a `q` read by the status
+wait now stops `foreground`'s loop, which before ran on until the job ended; the command clock runs from Enter,
+and the history save is skipped while a one-request job holds `fs`; `read_confirm` restarts the clock.
+`osdev test quit` 37 cases, 0 below the bar, with two new ones: `foreground` of a live check (`q` back in
+0.1 s) and `jobs` during a live scrub (answered at once). `osdev test jobs` 60/0. The VisionFive card for it
+is pending.
+
+**The SBCs were slower than the x86 machines at backgrounding and foregrounding** (the operator, 2026-10-14):
+the Pi 2, Pi 4 and VisionFive each took longer than the T630 and Wyse from Enter to the notice, from `b` to
+`[backgrounded]`, and in `jobs` and `foreground`. Part of it is the disk: a USB stick against a SATA SSD, so a
+check runs 19 to 34 s rather than 1.4 to 3.9 s and holds `copier` deaf for that long. Part is spawning
+`copier` on a slower core: 0.7 s to 1.7 s from Enter to `copier: ready` on the boards against about 1 s on
+the T630. Not measured beyond what the five logs show; recorded rather than opened as its own entry.
