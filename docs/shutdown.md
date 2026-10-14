@@ -163,9 +163,14 @@ gate will accept it, and that is the gate working.
    - (b) a narrower right: `power` mints a delegated resource capability for "shut down" (CLAUDE.md 7.10, as `fs`
      mints a file) and the supervisor hands it to the shell alone. No service has two endpoints today, so this is
      the capability-correct route; it costs `power` the `RESOURCE_MINT` authority and the supervisor a hand-over.
-   Recommendation: (b), unless (a)'s simplicity is worth the wider grant for now.
+   **Decided 2026-10-14: (b).** The operator chose the narrower right.
 2. **`reboot`** stays with the shell (`REBOOT`) for now. Whether it should move to `power`, so both ways of ending
-   a session go through one service with one budget, is a separate change.
+   a session go through one service with one budget, is a separate change, discussed with the operator 2026-10-14
+   and not yet decided.
+4. **The name is `shutdown`, decided 2026-10-14.** It is the word other systems use, and it names the act - ending
+   the session - rather than promising a mechanism: on the T630 and the Pi 2 the machine halts and does not lose
+   power, so `poweroff` would claim what did not happen. `poweroff` and `halt` stay hints that answer
+   "try `shutdown`" (step S4).
 3. **Clock time** (`shutdown at 22:00`) is left out: it depends on `time` having a clock, and a durations-only
    first version cannot be wrong about that.
 
