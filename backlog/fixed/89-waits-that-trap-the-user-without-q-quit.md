@@ -1,6 +1,6 @@
 # 89. Waits that trap the user without `[q] quit`
 
-**Status: FIXED 2026-10-14 in QEMU; the T630, Wyse, Pi 2 and Pi 4 cards passed, the VisionFive is pending.** `osdev test quit`, the test the
+**Status: FIXED 2026-10-14 in QEMU; all five hardware cards passed.** `osdev test quit`, the test the
 operator named, shows the rule met: 35 cases, 0 below the bar, `fs` and four services slowed (the tables
 below). Found by
 `audits/2026-10-13-quit-audit.md`, which has the evidence (file:line for every site), what passes and what was not
@@ -327,4 +327,19 @@ through `xhci`):
 - `selfcheck`: `ran 594, failed 0, skipped 0`.
 - Not exercised: `q` on `foreground` of a running job (the job ended first), a large `copy` with `q`,
   `delete <dir> recursive` with `b`.
-Still owed: the VisionFive 2 Lite.
+**StarFive VisionFive 2 Lite, 2026-10-14, passed** (`build/serial_output.log`, the same commit, `3ed46d5a`,
+the USB stick through `xhci`):
+
+- `drives flash` of drive 0, then `y`: 14.6 s in `fs`, `[q] quit` 0.8 s after the `y`.
+- A typed `drives check`: `[q] quit   [b] background` 1.6 s after `copier` was spawned, `b` gave
+  `[backgrounded] job 1` 1.3 s later; the sweep took 19.4 s in `fs`.
+- `jobs` during it: `[q] quit`, then the table about 6 s later, the row as last seen - the third board.
+- `foreground 1` after the sweep ended: "job 1 is done" and its four lines within 0.6 s. Just before it the
+  log shows "sdk: discarded 1 abandoned reply before a request to `fs` - an earlier request timed out": the
+  history save made at `jobs`'s Enter, given up while `fs` was inside the check - the save the Pi 2 and Pi 4
+  explanation above rests on, seen leaving its reply behind on a third board.
+- `selfcheck`: `ran 594, failed 0, skipped 0`.
+
+All five boards have now run this branch's image. Never exercised on any of them, because the job ended
+before the key: `q` on `foreground` of a running job, a large `copy` with `q`, `delete <dir> recursive` with
+`b`. `osdev test quit` and `osdev test jobs` cover each in QEMU.
